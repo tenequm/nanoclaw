@@ -8,6 +8,7 @@ import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
+import { transcribeAudio } from '../transcription.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -312,10 +313,53 @@ export class TelegramChannel implements Channel {
       });
     });
     this.bot.on('message:voice', (ctx) => {
-      storeMedia(ctx, '[Voice message]', {
-        fileId: ctx.message.voice?.file_id,
-        filename: `voice_${ctx.message.message_id}`,
-      });
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+
+      const fileId = ctx.message.voice?.file_id;
+      const msgId = ctx.message.message_id.toString();
+      const filename = `voice_${msgId}`;
+
+      const deliver = (content: string) => {
+        this.opts.onMessage(chatJid, {
+          id: msgId,
+          chat_jid: chatJid,
+          sender: ctx.from?.id?.toString() || '',
+          sender_name: senderName,
+          content,
+          timestamp,
+          is_from_me: false,
+        });
+      };
+
+      if (fileId) {
+        this.downloadFile(fileId, group.folder, filename).then(async (filePath) => {
+          if (filePath) {
+            const transcript = await transcribeAudio(filePath);
+            if (transcript) {
+              deliver(`[Voice: ${transcript}]${caption}`);
+            } else {
+              deliver(`[Voice message] (${filePath})${caption}`);
+            }
+          } else {
+            deliver(`[Voice message]${caption}`);
+          }
+        });
+      } else {
+        deliver(`[Voice message]${caption}`);
+      }
     });
     this.bot.on('message:audio', (ctx) => {
       const name =

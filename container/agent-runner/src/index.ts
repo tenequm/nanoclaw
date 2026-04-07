@@ -484,6 +484,19 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        surf: {
+          command: 'npx',
+          args: [
+            '-y',
+            'x402-proxy',
+            'mcp',
+            '--protocol',
+            'x402',
+            '--network',
+            'solana',
+            'https://surf.cascade.fyi/mcp',
+          ],
+        },
       },
       hooks: {
         PreCompact: [
