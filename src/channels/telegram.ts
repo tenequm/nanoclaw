@@ -326,7 +326,13 @@ export class TelegramChannel implements Channel {
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
       const isGroup =
         ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
 
       const fileId = ctx.message.voice?.file_id;
       const msgId = ctx.message.message_id.toString();
@@ -345,18 +351,20 @@ export class TelegramChannel implements Channel {
       };
 
       if (fileId) {
-        this.downloadFile(fileId, group.folder, filename).then(async (filePath) => {
-          if (filePath) {
-            const transcript = await transcribeAudio(filePath);
-            if (transcript) {
-              deliver(`[Voice: ${transcript}]${caption}`);
+        this.downloadFile(fileId, group.folder, filename).then(
+          async (filePath) => {
+            if (filePath) {
+              const transcript = await transcribeAudio(filePath);
+              if (transcript) {
+                deliver(`[Voice: ${transcript}]${caption}`);
+              } else {
+                deliver(`[Voice message] (${filePath})${caption}`);
+              }
             } else {
-              deliver(`[Voice message] (${filePath})${caption}`);
+              deliver(`[Voice message]${caption}`);
             }
-          } else {
-            deliver(`[Voice message]${caption}`);
-          }
-        });
+          },
+        );
       } else {
         deliver(`[Voice message]${caption}`);
       }
@@ -470,7 +478,12 @@ export class TelegramChannel implements Channel {
     try {
       const numericId = jid.replace(/^tg:/, '');
       const reaction = emoji
-        ? [{ type: 'emoji' as const, emoji } as import('grammy/types').ReactionType]
+        ? [
+            {
+              type: 'emoji' as const,
+              emoji,
+            } as import('grammy/types').ReactionType,
+          ]
         : [];
       await this.bot.api.setMessageReaction(
         numericId,

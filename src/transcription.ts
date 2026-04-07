@@ -28,10 +28,7 @@ export async function transcribeAudio(
       model: 'whisper-1',
       file: fs.createReadStream(filePath),
     });
-    logger.info(
-      { chars: response.text.length },
-      'Transcribed voice message',
-    );
+    logger.info({ chars: response.text.length }, 'Transcribed voice message');
     return response.text;
   } catch (err) {
     logger.error({ err }, 'OpenAI transcription failed');
