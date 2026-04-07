@@ -279,6 +279,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
+  // React with eyes on the last user message to indicate we've seen it
+  const lastMsg = missedMessages[missedMessages.length - 1];
+  await channel.setReaction?.(chatJid, lastMsg.id, '\u{1F440}');
+
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
@@ -311,6 +315,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   });
 
   await channel.setTyping?.(chatJid, false);
+  await channel.setReaction?.(chatJid, lastMsg.id, null);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {

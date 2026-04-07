@@ -417,6 +417,27 @@ export class TelegramChannel implements Channel {
     }
   }
 
+  async setReaction(
+    jid: string,
+    messageId: string,
+    emoji: string | null,
+  ): Promise<void> {
+    if (!this.bot) return;
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      const reaction = emoji
+        ? [{ type: 'emoji' as const, emoji } as import('grammy/types').ReactionType]
+        : [];
+      await this.bot.api.setMessageReaction(
+        numericId,
+        parseInt(messageId, 10),
+        reaction,
+      );
+    } catch (err) {
+      logger.debug({ jid, messageId, err }, 'Failed to set Telegram reaction');
+    }
+  }
+
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     if (!this.bot || !isTyping) return;
     try {
