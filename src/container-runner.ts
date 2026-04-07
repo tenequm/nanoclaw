@@ -4,6 +4,7 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -228,6 +229,16 @@ function buildVolumeMounts(
     containerPath: '/app/src',
     readonly: false,
   });
+
+  // Mount x402-proxy wallet config so it persists across container restarts
+  const x402ConfigDir = path.join(os.homedir(), '.config', 'x402-proxy');
+  if (fs.existsSync(x402ConfigDir)) {
+    mounts.push({
+      hostPath: x402ConfigDir,
+      containerPath: '/home/node/.config/x402-proxy',
+      readonly: false,
+    });
+  }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
