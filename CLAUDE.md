@@ -58,18 +58,24 @@ npm run build        # Compile TypeScript
 ./container/build.sh # Rebuild agent container
 ```
 
-Service management:
-```bash
-# macOS (launchd)
-launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # restart
+## After Changes — Deployment Workflow
 
-# Linux (systemd)
-systemctl --user start nanoclaw
-systemctl --user stop nanoclaw
-systemctl --user restart nanoclaw
+After ANY code or container change, always rebuild AND restart. Running containers/processes use the old code until the service is restarted. This is one atomic workflow — never rebuild without restarting.
+
+```bash
+# Source changes (src/*, config, etc.)
+npm run build && systemctl --user restart nanoclaw          # Linux
+npm run build && launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
+
+# Container changes (Dockerfile, container/*, agent-runner/*)
+./container/build.sh && systemctl --user restart nanoclaw          # Linux
+./container/build.sh && launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
+
+# Both
+npm run build && ./container/build.sh && systemctl --user restart nanoclaw  # Linux
 ```
+
+See `/customize` skill for full details on adding channels, integrations, and behavior changes.
 
 ## Troubleshooting
 
