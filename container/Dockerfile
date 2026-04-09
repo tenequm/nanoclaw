@@ -26,6 +26,26 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+# Install yt-dlp with all recommended dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    atomicparsley \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --break-system-packages \
+    yt-dlp \
+    yt-dlp-ejs \
+    instaloader \
+    mutagen \
+    pycryptodomex \
+    brotli \
+    websockets \
+    requests \
+    certifi \
+    curl_cffi \
+    secretstorage \
+    xattr
+
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
