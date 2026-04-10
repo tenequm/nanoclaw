@@ -2,7 +2,7 @@ import fs from 'fs';
 import https from 'https';
 import path from 'path';
 
-import { Api, Bot, InputFile } from 'grammy';
+import { Api, Bot, InputFile, InputMediaBuilder } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
@@ -465,19 +465,25 @@ export class TelegramChannel implements Channel {
 
     try {
       const numericId = jid.replace(/^tg:/, '');
-      const fileStream = new InputFile(
+      const input = new InputFile(
         fs.createReadStream(filePath),
         path.basename(filePath),
       );
       const ext = path.extname(filePath).toLowerCase();
       const photoExts = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+      const videoExts = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm']);
 
       if (photoExts.has(ext)) {
-        await this.bot.api.sendPhoto(numericId, fileStream, {
+        await this.bot.api.sendPhoto(numericId, input, {
           caption: caption || undefined,
         });
+      } else if (videoExts.has(ext)) {
+        await this.bot.api.sendVideo(numericId, input, {
+          caption: caption || undefined,
+          supports_streaming: true,
+        });
       } else {
-        await this.bot.api.sendDocument(numericId, fileStream, {
+        await this.bot.api.sendDocument(numericId, input, {
           caption: caption || undefined,
         });
       }
@@ -485,6 +491,51 @@ export class TelegramChannel implements Channel {
     } catch (err) {
       if (!(err instanceof Error)) throw err;
       logger.error({ jid, filePath, err }, 'Failed to send Telegram file');
+    }
+  }
+
+  async sendMediaGroup(
+    jid: string,
+    files: { path: string; caption?: string }[],
+  ): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      const photoExts = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+      const videoExts = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm']);
+
+      const media = files.map((f) => {
+        const input = new InputFile(
+          fs.createReadStream(f.path),
+          path.basename(f.path),
+        );
+        const ext = path.extname(f.path).toLowerCase();
+        const opts = f.caption ? { caption: f.caption } : {};
+
+        if (videoExts.has(ext)) {
+          return InputMediaBuilder.video(input, {
+            ...opts,
+            supports_streaming: true,
+          });
+        }
+        if (photoExts.has(ext)) {
+          return InputMediaBuilder.photo(input, opts);
+        }
+        return InputMediaBuilder.document(input, opts);
+      });
+
+      await this.bot.api.sendMediaGroup(numericId, media);
+      logger.info(
+        { jid, count: files.length },
+        'Telegram media group sent',
+      );
+    } catch (err) {
+      if (!(err instanceof Error)) throw err;
+      logger.error({ jid, err }, 'Failed to send Telegram media group');
     }
   }
 

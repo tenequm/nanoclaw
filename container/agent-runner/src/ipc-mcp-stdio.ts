@@ -538,6 +538,49 @@ server.tool(
   },
 );
 
+server.tool(
+  'send_media_group',
+  'Send multiple files as an album/media group (2-10 items). Photos and videos display as a gallery; documents as a file list. All files must exist under /workspace/.',
+  {
+    files: z
+      .array(
+        z.object({
+          path: z.string().describe('Absolute path to the file (must be under /workspace/)'),
+          caption: z.string().optional().describe('Optional caption for this item'),
+        }),
+      )
+      .min(2)
+      .max(10)
+      .describe('Array of files to send as an album (2-10 items)'),
+  },
+  async (args) => {
+    for (const f of args.files) {
+      if (!f.path.startsWith('/workspace/')) {
+        return {
+          content: [{ type: 'text' as const, text: `Error: path must be under /workspace/: ${f.path}` }],
+          isError: true,
+        };
+      }
+      if (!fs.existsSync(f.path)) {
+        return {
+          content: [{ type: 'text' as const, text: `Error: file not found: ${f.path}` }],
+          isError: true,
+        };
+      }
+    }
+
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'send_media_group',
+      chatJid,
+      files: args.files,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { content: [{ type: 'text' as const, text: `Media group (${args.files.length} items) queued for sending.` }] };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

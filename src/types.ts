@@ -93,6 +93,11 @@ export interface Channel {
   disconnect(): Promise<void>;
   // Optional: send a file (document, image, etc.) to a chat.
   sendFile?(jid: string, filePath: string, caption?: string): Promise<void>;
+  // Optional: send multiple files as an album/media group.
+  sendMediaGroup?(
+    jid: string,
+    files: { path: string; caption?: string }[],
+  ): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: emoji reaction on a message.

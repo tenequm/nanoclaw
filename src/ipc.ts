@@ -13,6 +13,10 @@ import { RegisteredGroup } from './types.js';
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   sendFile: (jid: string, filePath: string, caption?: string) => Promise<void>;
+  sendMediaGroup: (
+    jid: string,
+    files: { path: string; caption?: string }[],
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -135,6 +139,62 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC send_file attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'send_media_group' &&
+                data.chatJid &&
+                Array.isArray(data.files)
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  const containerPrefix = '/workspace/group/';
+                  const hostFiles: { path: string; caption?: string }[] = [];
+                  let valid = true;
+
+                  for (const f of data.files) {
+                    if (!f.path?.startsWith(containerPrefix)) {
+                      logger.warn(
+                        { filePath: f.path, sourceGroup },
+                        'IPC send_media_group path not under /workspace/group/',
+                      );
+                      valid = false;
+                      break;
+                    }
+                    const rel = f.path.slice(containerPrefix.length);
+                    const hostPath = path.join(
+                      resolveGroupFolderPath(sourceGroup),
+                      rel,
+                    );
+                    if (!fs.existsSync(hostPath)) {
+                      logger.warn(
+                        { filePath: f.path, hostPath, sourceGroup },
+                        'IPC send_media_group: file not found on host',
+                      );
+                      valid = false;
+                      break;
+                    }
+                    hostFiles.push({ path: hostPath, caption: f.caption });
+                  }
+
+                  if (valid && hostFiles.length > 0) {
+                    await deps.sendMediaGroup(data.chatJid, hostFiles);
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        count: hostFiles.length,
+                      },
+                      'IPC media group sent',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC send_media_group attempt blocked',
                   );
                 }
               }

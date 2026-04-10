@@ -808,6 +808,13 @@ async function main(): Promise<void> {
         throw new Error(`Channel does not support file sending: ${jid}`);
       return channel.sendFile(jid, filePath, caption);
     },
+    sendMediaGroup: (jid, files) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.sendMediaGroup)
+        throw new Error(`Channel does not support media groups: ${jid}`);
+      return channel.sendMediaGroup(jid, files);
+    },
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroups: async (force: boolean) => {

@@ -19,7 +19,9 @@ Your output is sent to the user or group.
 
 You also have `mcp__nanoclaw__send_message` which sends a message immediately while you're still working. This is useful when you want to acknowledge a request before starting longer work.
 
-To send files (reports, CSVs, images, PDFs), use `mcp__nanoclaw__send_file`. Write the file under `/workspace/group/` first (use `/workspace/group/tmp/` for throwaway files), then call `send_file` with the path. Images (.jpg, .png, .gif, .webp) are sent as photos; everything else as documents.
+To send files, use `mcp__nanoclaw__send_file`. Write the file under `/workspace/group/` first (use `/workspace/group/tmp/` for throwaway files), then call `send_file` with the path. Images (.jpg, .png, .gif, .webp) are sent as photos; videos (.mp4, .mov, .avi, .mkv, .webm) as playable videos with streaming; everything else as documents.
+
+To send multiple files as an album, use `mcp__nanoclaw__send_media_group` with an array of 2-10 file paths. Photos and videos display as a gallery; documents as a grouped file list.
 
 ### Internal thoughts
 
