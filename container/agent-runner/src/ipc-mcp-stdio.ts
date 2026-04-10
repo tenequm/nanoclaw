@@ -503,6 +503,41 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+server.tool(
+  'send_file',
+  "Send a file to the user or group. Use this to deliver reports, images, CSVs, PDFs, or any file the user needs. The file must exist under /workspace/.",
+  {
+    file_path: z.string().describe('Absolute path to the file (must be under /workspace/)'),
+    caption: z.string().optional().describe('Optional caption to display with the file'),
+  },
+  async (args) => {
+    if (!args.file_path.startsWith('/workspace/')) {
+      return {
+        content: [{ type: 'text' as const, text: 'Error: file_path must be under /workspace/' }],
+        isError: true,
+      };
+    }
+
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: file not found: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'send_file',
+      chatJid,
+      filePath: args.file_path,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { content: [{ type: 'text' as const, text: 'File queued for sending.' }] };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);
