@@ -46,6 +46,9 @@ RUN apt-get update && apt-get install -y \
     secretstorage \
     xattr
 
+# Install deno for yt-dlp YouTube support
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
