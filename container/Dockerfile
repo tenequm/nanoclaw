@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     atomicparsley \
     python3-pip \
+    unzip \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --break-system-packages \
     yt-dlp \
