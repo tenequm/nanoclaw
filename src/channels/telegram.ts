@@ -529,10 +529,7 @@ export class TelegramChannel implements Channel {
       });
 
       await this.bot.api.sendMediaGroup(numericId, media);
-      logger.info(
-        { jid, count: files.length },
-        'Telegram media group sent',
-      );
+      logger.info({ jid, count: files.length }, 'Telegram media group sent');
     } catch (err) {
       if (!(err instanceof Error)) throw err;
       logger.error({ jid, err }, 'Failed to send Telegram media group');

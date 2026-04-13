@@ -1211,8 +1211,7 @@ describe('TelegramChannel', () => {
       ]);
 
       expect(currentBot().api.sendMediaGroup).toHaveBeenCalledTimes(1);
-      const [chatId, media] =
-        currentBot().api.sendMediaGroup.mock.calls[0];
+      const [chatId, media] = currentBot().api.sendMediaGroup.mock.calls[0];
       expect(chatId).toBe('100200300');
       expect(media).toHaveLength(2);
       expect(media[0].type).toBe('photo');
