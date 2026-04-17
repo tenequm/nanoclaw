@@ -1,349 +1,316 @@
 ---
 name: debug
-description: Debug container agent issues. Use when things aren't working, container fails, authentication problems, or to understand how the container system works. Covers logs, environment variables, mounts, and common issues.
+description: Debug NanoClaw v2 issues — host service not running, container fails, messages not reaching agents, DB inspection, channel auth. Uses systemd/launchctl, two-DB session split, Chat SDK bridge.
 ---
 
-# NanoClaw Container Debugging
+# NanoClaw v2 Debugging
 
-This guide covers debugging the containerized agent execution system.
-
-## Architecture Overview
+## Architecture recap
 
 ```
-Host (macOS)                          Container (Linux VM)
-─────────────────────────────────────────────────────────────
-src/container-runner.ts               container/agent-runner/
-    │                                      │
-    │ spawns container                      │ runs Claude Agent SDK
-    │ with volume mounts                   │ with MCP servers
-    │                                      │
-    ├── data/env/env ──────────────> /workspace/env-dir/env
-    ├── groups/{folder} ───────────> /workspace/group
-    ├── data/ipc/{folder} ────────> /workspace/ipc
-    ├── data/sessions/{folder}/.claude/ ──> /home/node/.claude/ (isolated per-group)
-    └── (main only) project root ──> /workspace/project
+Host (Node, pnpm)                       Container (Bun, one per session)
+─────────────────────────────────────────────────────────────────────────
+src/channels/*           polls           /workspace/inbound.db   (host writes)
+src/router.ts        writes inbound    ▶ /workspace/outbound.db  (container writes)
+src/delivery.ts     polls outbound   ◀ /workspace/outbox/        (outgoing files)
+src/container-runner.ts                 /workspace/.heartbeat    (container touches)
 ```
 
-**Important:** The container runs as user `node` with `HOME=/home/node`. Session files must be mounted to `/home/node/.claude/` (not `/root/.claude/`) for session resumption to work.
+**No IPC, no stdin piping** — the two session DBs are the sole IO surface between host and container. Exactly one writer per file.
 
-## Log Locations
-
-| Log | Location | Content |
-|-----|----------|---------|
-| **Main app logs** | `logs/nanoclaw.log` | Host-side WhatsApp, routing, container spawning |
-| **Main app errors** | `logs/nanoclaw.error.log` | Host-side errors |
-| **Container run logs** | `groups/{folder}/logs/container-*.log` | Per-run: input, mounts, stderr, stdout |
-| **Claude sessions** | `~/.claude/projects/` | Claude Code session history |
-
-## Enabling Debug Logging
-
-Set `LOG_LEVEL=debug` for verbose output:
+## Service management
 
 ```bash
-# For development
-LOG_LEVEL=debug pnpm run dev
+# Linux (systemd user)
+systemctl --user status nanoclaw
+systemctl --user restart nanoclaw
+journalctl --user -u nanoclaw -n 50 --no-pager
 
-# For launchd service (macOS), add to plist EnvironmentVariables:
-<key>LOG_LEVEL</key>
-<string>debug</string>
-# For systemd service (Linux), add to unit [Service] section:
-# Environment=LOG_LEVEL=debug
+# macOS (launchd)
+launchctl kickstart -k gui/$(id -u)/com.nanoclaw
+launchctl list | grep nanoclaw
 ```
 
-Debug level shows:
-- Full mount configurations
-- Container command arguments
-- Real-time container stderr
+## Log locations
 
-## Common Issues
+| Log | Where | What |
+|-----|-------|------|
+| Host main | `logs/nanoclaw.log` | Routing, container spawn, Chat SDK events |
+| Host errors | `logs/nanoclaw.error.log` | Fatal + rolled-back agent errors |
+| Container per-run | `groups/{folder}/logs/container-*.log` | One file per spawn: mounts, stderr, stdout |
 
-### 1. "Claude Code process exited with code 1"
+Host unit uses `append:` redirection — both files grow until rotated manually.
 
-**Check the container log file** in `groups/{folder}/logs/container-*.log`
-
-Common causes:
-
-#### Missing Authentication
+Enable verbose logs:
 ```
-Invalid API key · Please run /login
+# systemd user unit [Service] section:
+Environment=LOG_LEVEL=debug
 ```
-**Fix:** Ensure `.env` file exists with either OAuth token or API key:
+
+## Quick status
+
 ```bash
-cat .env  # Should show one of:
-# CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...  (subscription)
-# ANTHROPIC_API_KEY=sk-ant-api03-...        (pay-per-use)
+echo "=== service ==="
+systemctl --user is-active nanoclaw
+
+echo "=== agent containers ==="
+docker ps --format '{{.Names}} {{.Status}}' | grep -i nanoclaw
+
+echo "=== orphans ==="
+docker ps -a --format '{{.Names}} {{.Status}}' | grep -i nanoclaw
+
+echo "=== image present ==="
+docker images nanoclaw-agent:latest --format '{{.Repository}}:{{.Tag}} {{.CreatedAt}} {{.Size}}'
+
+echo "=== recent errors ==="
+grep -E 'ERROR|FATAL|WARN' logs/nanoclaw.log | tail -10
+
+echo "=== channels connected ==="
+grep -E 'Channel adapter started|polling started|Webhook server started' logs/nanoclaw.log | tail -5
+
+echo "=== entity model populated ==="
+sqlite3 data/v2.db "SELECT 'users:'||count(*) FROM users; \
+  SELECT 'agent_groups:'||count(*) FROM agent_groups; \
+  SELECT 'messaging_groups:'||count(*) FROM messaging_groups; \
+  SELECT 'sessions:'||count(*) FROM sessions;"
 ```
 
-#### Root User Restriction
-```
---dangerously-skip-permissions cannot be used with root/sudo privileges
-```
-**Fix:** Container must run as non-root user. Check Dockerfile has `USER node`.
+## Central DB (`data/v2.db`)
 
-### 2. Environment Variables Not Passing
+Key tables:
 
-**Runtime note:** Environment variables passed via `-e` may be lost when using `-i` (interactive/piped stdin).
+| Table | What |
+|-------|------|
+| `users` | `id="<channel>:<handle>"`, display_name, kind |
+| `user_roles` | owner / admin (global or scoped to an agent_group) |
+| `agent_groups` | workspace + CLAUDE.md + provider. Container config lives on disk at `groups/<folder>/container.json`, not in the DB |
+| `messaging_groups` | one chat/channel on one platform; `unknown_sender_policy` |
+| `messaging_group_agents` | wire-up + `session_mode` + trigger rules |
+| `sessions` | per-session container state; joins agent_group + messaging_group + thread_id |
+| `pending_approvals` | queued approval prompts (OneCLI, self-mod, etc.) |
+| `unregistered_senders` | cold DMs from unknown users |
+| `chat_sdk_*` | Chat SDK bridge state per channel (kv, subs, locks, lists) |
 
-**Workaround:** The system extracts only authentication variables (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`) from `.env` and mounts them for sourcing inside the container. Other env vars are not exposed.
-
-To verify env vars are reaching the container:
+Common queries:
 ```bash
-echo '{}' | docker run -i \
-  -v $(pwd)/data/env:/workspace/env-dir:ro \
-  --entrypoint /bin/bash nanoclaw-agent:latest \
-  -c 'export $(cat /workspace/env-dir/env | xargs); echo "OAuth: ${#CLAUDE_CODE_OAUTH_TOKEN} chars, API: ${#ANTHROPIC_API_KEY} chars"'
+# Who's wired where?
+sqlite3 -header -column data/v2.db "
+  SELECT mg.platform_id, mg.channel_type, ag.name AS agent, mga.session_mode
+  FROM messaging_group_agents mga
+  JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+  JOIN agent_groups ag ON ag.id = mga.agent_group_id;
+"
+
+# Active sessions
+sqlite3 -header -column data/v2.db "
+  SELECT id, agent_group_id, messaging_group_id, thread_id, created_at FROM sessions;
+"
+
+# Pending approvals
+sqlite3 -header -column data/v2.db "SELECT id, reason, requested_at FROM pending_approvals LIMIT 10;"
 ```
 
-### 3. Mount Issues
+## Session DBs (`data/v2-sessions/<session_id>/`)
 
-**Container mount notes:**
-- Docker supports both `-v` and `--mount` syntax
-- Use `:ro` suffix for readonly mounts:
-  ```bash
-  # Readonly
-  -v /path:/container/path:ro
+Per-session there are **two** SQLite files:
 
-  # Read-write
-  -v /path:/container/path
-  ```
+- `inbound.db` — host writes, container reads: `messages_in`, `destinations`, `routing`, `pending_questions`, `processing_ack`
+- `outbound.db` — container writes, host reads: `messages_out`, `session_state`
 
-To check what's mounted inside a container:
+Heartbeat: container touches `/workspace/.heartbeat` (mapped to `<session_dir>/.heartbeat`). Stale = host sweep kills + respawns.
+
+Inspect:
 ```bash
-docker run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c 'ls -la /workspace/'
+SESSION=$(ls -t data/v2-sessions | head -1)
+
+# Inbound (host-written messages)
+sqlite3 -header -column data/v2-sessions/$SESSION/inbound.db "
+  SELECT seq, datetime(created_at/1000,'unixepoch') AS when_, kind, substr(content,1,80) AS content
+  FROM messages_in ORDER BY seq DESC LIMIT 10;
+"
+
+# Outbound (container-written messages)
+sqlite3 -header -column data/v2-sessions/$SESSION/outbound.db "
+  SELECT seq, datetime(created_at/1000,'unixepoch') AS when_, kind, substr(content,1,80) AS content
+  FROM messages_out ORDER BY seq DESC LIMIT 10;
+"
+
+# Session cursor/state
+sqlite3 -header -column data/v2-sessions/$SESSION/outbound.db "SELECT * FROM session_state;"
+
+# Heartbeat age (seconds ago)
+stat -c %Y data/v2-sessions/$SESSION/.heartbeat 2>/dev/null | awk -v now=$(date +%s) '{print now-$1, "s ago"}'
 ```
 
-Expected structure:
+`seq` parity invariant: host uses even numbers, container uses odd. If you see a row with wrong parity on the wrong side, something bypassed the writer.
+
+## Container mounts (v2)
+
 ```
-/workspace/
-├── env-dir/env           # Environment file (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY)
-├── group/                # Current group folder (cwd)
-├── project/              # Project root (main channel only)
-├── global/               # Global CLAUDE.md (non-main only)
-├── ipc/                  # Inter-process communication
-│   ├── messages/         # Outgoing WhatsApp messages
-│   ├── tasks/            # Scheduled task commands
-│   ├── current_tasks.json    # Read-only: scheduled tasks visible to this group
-│   └── available_groups.json # Read-only: WhatsApp groups for activation (main only)
-└── extra/                # Additional custom mounts
+groups/<folder>/                   → /workspace/agent          (rw)
+groups/global/                     → /workspace/global          (ro, optional)
+data/v2-sessions/<id>/             → /workspace                 (rw)
+data/v2-sessions/<id>/.claude-shared/ → /home/node/.claude      (rw)
+data/v2-sessions/<id>/agent-runner-src/ → /app/src              (rw overlay)
+~/.config/x402-proxy/              → /home/node/.config/x402-proxy (rw, only if host dir exists)
 ```
 
-### 4. Permission Issues
+Env vars set in the container:
+- `SESSION_INBOUND_DB_PATH=/workspace/inbound.db`
+- `SESSION_OUTBOUND_DB_PATH=/workspace/outbound.db`
+- `SESSION_HEARTBEAT_PATH=/workspace/.heartbeat`
+- `HOME=/home/node`
+- `ENABLE_SURF_MCP=true` (only if `~/.config/x402-proxy` exists)
 
-The container runs as user `node` (uid 1000). Check ownership:
+Inspect what actually got mounted on the last run:
 ```bash
-docker run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c '
-  whoami
-  ls -la /workspace/
-  ls -la /app/
-'
+grep "Container spawned\|mount" groups/<folder>/logs/container-*.log | tail -20
 ```
 
-All of `/workspace/` and `/app/` should be owned by `node`.
+## Common issues
 
-### 5. Session Not Resuming / "Claude Code process exited with code 1"
+### 1. Service won't start — `EADDRINUSE 0.0.0.0:3000`
+The Chat SDK bridge's local webhook server binds to 3000 by default. Host it next to another `:3000` service and it crashes.
 
-If sessions aren't being resumed (new session ID every time), or Claude Code exits with code 1 when resuming:
+Fix in the systemd unit (`~/.config/systemd/user/nanoclaw.service`):
+```
+Environment=WEBHOOK_PORT=3001
+```
+Then `systemctl --user daemon-reload && systemctl --user restart nanoclaw`.
 
-**Root cause:** The SDK looks for sessions at `$HOME/.claude/projects/`. Inside the container, `HOME=/home/node`, so it looks at `/home/node/.claude/projects/`.
-
-**Check the mount path:**
+### 2. `Container exited with code 125: pull access denied for nanoclaw-agent`
+The image was deleted by Kubernetes/container runtime image GC. Rebuild:
 ```bash
-# In container-runner.ts, verify mount is to /home/node/.claude/, NOT /root/.claude/
-grep -A3 "Claude sessions" src/container-runner.ts
+./container/build.sh
 ```
+Root cause on Rancher Desktop: Kubernetes kubelet GC. `rdctl set --kubernetes-enabled=false` if you don't need k8s.
 
-**Verify sessions are accessible:**
+### 3. Incoming message goes nowhere
+Likely causes and queries:
 ```bash
-docker run --rm --entrypoint /bin/bash \
-  -v ~/.claude:/home/node/.claude \
-  nanoclaw-agent:latest -c '
-echo "HOME=$HOME"
-ls -la $HOME/.claude/projects/ 2>&1 | head -5
-'
+# Is the sender known?
+sqlite3 data/v2.db "SELECT * FROM users WHERE id LIKE '%<handle>%';"
+
+# If unknown — check messaging_group's policy
+sqlite3 data/v2.db "SELECT platform_id, unknown_sender_policy FROM messaging_groups;"
+
+# Was it queued as an unregistered sender?
+sqlite3 -header -column data/v2.db "SELECT * FROM unregistered_senders ORDER BY created_at DESC LIMIT 10;"
+
+# Was it routed into an inbound.db? Check the most recent session
+grep -E 'Routed|routing' logs/nanoclaw.log | tail -10
 ```
 
-**Fix:** Ensure `container-runner.ts` mounts to `/home/node/.claude/`:
-```typescript
-mounts.push({
-  hostPath: claudeDir,
-  containerPath: '/home/node/.claude',  // NOT /root/.claude
-  readonly: false
-});
-```
-
-### 6. MCP Server Failures
-
-If an MCP server fails to start, the agent may exit. Check the container logs for MCP initialization errors.
-
-## Manual Container Testing
-
-### Test the full agent flow:
+### 4. Container spawns but agent never replies
 ```bash
-# Set up env file
-mkdir -p data/env groups/test
-cp .env data/env/env
+SESSION=$(ls -t data/v2-sessions | head -1)
 
-# Run test query
-echo '{"prompt":"What is 2+2?","groupFolder":"test","chatJid":"test@g.us","isMain":false}' | \
-  docker run -i \
-  -v $(pwd)/data/env:/workspace/env-dir:ro \
-  -v $(pwd)/groups/test:/workspace/group \
-  -v $(pwd)/data/ipc:/workspace/ipc \
+# Did the container write anything?
+sqlite3 data/v2-sessions/$SESSION/outbound.db "SELECT count(*) FROM messages_out;"
+
+# Is it still heartbeating?
+stat -c %y data/v2-sessions/$SESSION/.heartbeat
+
+# Container logs
+ls -lt groups/*/logs/container-*.log | head -3 | awk '{print $NF}' | xargs tail -40
+```
+
+### 5. Claude SDK `exit 1` / auth failure
+OAuth/API key flows through OneCLI, not env vars. Check:
+```bash
+# OneCLI reachable?
+curl -s "$ONECLI_URL/health" || echo "OneCLI not responding"
+
+# Agent identity registered?
+onecli agent list | grep <agent-group-folder>
+```
+
+Session continuity lives in `data/v2-sessions/<id>/.claude-shared/` (mounted to `/home/node/.claude`). To reset one session:
+```bash
+rm -rf data/v2-sessions/<session_id>/.claude-shared/
+sqlite3 data/v2.db "DELETE FROM sessions WHERE id='<session_id>';"
+```
+
+### 6. MCP server missing from agent's tool list
+Agent's `settings.json` (per session):
+```bash
+cat data/v2-sessions/<session_id>/.claude-shared/settings.json
+```
+Should have `permissions.allow` including the MCP name (e.g., `mcp__surf__*`). Groups created before an MCP was added need their settings.json updated manually.
+
+For Surf specifically:
+```bash
+# Host side: x402-proxy wallet config present?
+ls ~/.config/x402-proxy/ 2>&1
+
+# Container side: Surf MCP only registers if ENABLE_SURF_MCP=true and wallet dir mounted.
+grep "ENABLE_SURF_MCP\|mcpServers.surf\|surf" logs/nanoclaw.log | tail -5
+```
+
+### 7. Voice message stays silent (no transcript)
+```bash
+# OPENAI_API_KEY in env?
+grep -c "^OPENAI_API_KEY=" .env
+
+# Attachment materialized to host?
+ls groups/<folder>/attachments/ 2>&1 | tail -5
+
+# Whisper errors in logs?
+grep -iE 'transcrib|whisper|openai' logs/nanoclaw.log logs/nanoclaw.error.log | tail -10
+```
+
+## Manual container run (v2 shape)
+
+You **cannot** pipe JSON to stdin — v2 reads from DB. To exercise the image manually:
+
+```bash
+# Interactive shell in the image
+docker run --rm -it --entrypoint /bin/bash nanoclaw-agent:latest
+
+# Binary sanity
+docker run --rm --entrypoint sh nanoclaw-agent:latest -c \
+  'yt-dlp --version; instaloader --version; deno --version; \
+   ffmpeg -version | head -1; which x402-proxy; claude --version; bun --version'
+
+# Spawn a real session container against a fake session dir
+SESS=/tmp/fake-session
+mkdir -p $SESS/.claude-shared
+sqlite3 $SESS/inbound.db  "CREATE TABLE messages_in(seq INT, kind TEXT, content TEXT, created_at INT);"
+sqlite3 $SESS/outbound.db "CREATE TABLE messages_out(seq INT, kind TEXT, content TEXT, created_at INT);"
+docker run --rm -it \
+  -v $SESS:/workspace \
+  -e SESSION_INBOUND_DB_PATH=/workspace/inbound.db \
+  -e SESSION_OUTBOUND_DB_PATH=/workspace/outbound.db \
+  -e SESSION_HEARTBEAT_PATH=/workspace/.heartbeat \
   nanoclaw-agent:latest
 ```
 
-### Test Claude Code directly:
-```bash
-docker run --rm --entrypoint /bin/bash \
-  -v $(pwd)/data/env:/workspace/env-dir:ro \
-  nanoclaw-agent:latest -c '
-  export $(cat /workspace/env-dir/env | xargs)
-  claude -p "Say hello" --dangerously-skip-permissions --allowedTools ""
-'
-```
-
-### Interactive shell in container:
-```bash
-docker run --rm -it --entrypoint /bin/bash nanoclaw-agent:latest
-```
-
-## SDK Options Reference
-
-The agent-runner uses these Claude Agent SDK options:
-
-```typescript
-query({
-  prompt: input.prompt,
-  options: {
-    cwd: '/workspace/group',
-    allowedTools: ['Bash', 'Read', 'Write', ...],
-    permissionMode: 'bypassPermissions',
-    allowDangerouslySkipPermissions: true,  // Required with bypassPermissions
-    settingSources: ['project'],
-    mcpServers: { ... }
-  }
-})
-```
-
-**Important:** `allowDangerouslySkipPermissions: true` is required when using `permissionMode: 'bypassPermissions'`. Without it, Claude Code exits with code 1.
-
-## Rebuilding After Changes
+## Reset / nuke
 
 ```bash
-# Rebuild main app
-pnpm run build
+# Stop service
+systemctl --user stop nanoclaw
 
-# Rebuild container (use --no-cache for clean rebuild)
-./container/build.sh
+# Drop all session state (containers + session DBs + attachments stay in groups/)
+docker ps -a --format '{{.Names}}' | grep -E '^nanoclaw-session-' | xargs -r docker rm -f
+rm -rf data/v2-sessions/
 
-# Or force full rebuild
-docker builder prune -af
-./container/build.sh
+# Nuke the whole central DB (USERS, GROUPS, WIRING all gone — re-run setup afterwards)
+rm data/v2.db data/v2.db-shm data/v2.db-wal
 ```
 
-## Checking Container Image
+## Rebuild
 
 ```bash
-# List images
-docker images
+# Host code change
+pnpm run build && systemctl --user restart nanoclaw
 
-# Check what's in the image
-docker run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c '
-  echo "=== Node version ==="
-  node --version
+# Container change (agent-runner source, Dockerfile, skills)
+./container/build.sh && systemctl --user restart nanoclaw
 
-  echo "=== Claude Code version ==="
-  claude --version
-
-  echo "=== Installed packages ==="
-  ls /app/node_modules/
-'
+# Forced rebuild (clear layer cache)
+docker builder prune -af && ./container/build.sh
 ```
 
-## Session Persistence
-
-Claude sessions are stored per-group in `data/sessions/{group}/.claude/` for security isolation. Each group has its own session directory, preventing cross-group access to conversation history.
-
-**Critical:** The mount path must match the container user's HOME directory:
-- Container user: `node`
-- Container HOME: `/home/node`
-- Mount target: `/home/node/.claude/` (NOT `/root/.claude/`)
-
-To clear sessions:
-
-```bash
-# Clear all sessions for all groups
-rm -rf data/sessions/
-
-# Clear sessions for a specific group
-rm -rf data/sessions/{groupFolder}/.claude/
-
-# Also clear the session ID from NanoClaw's tracking (stored in SQLite)
-sqlite3 store/messages.db "DELETE FROM sessions WHERE group_folder = '{groupFolder}'"
-```
-
-To verify session resumption is working, check the logs for the same session ID across messages:
-```bash
-grep "Session initialized" logs/nanoclaw.log | tail -5
-# Should show the SAME session ID for consecutive messages in the same group
-```
-
-## IPC Debugging
-
-The container communicates back to the host via files in `/workspace/ipc/`:
-
-```bash
-# Check pending messages
-ls -la data/ipc/messages/
-
-# Check pending task operations
-ls -la data/ipc/tasks/
-
-# Read a specific IPC file
-cat data/ipc/messages/*.json
-
-# Check available groups (main channel only)
-cat data/ipc/main/available_groups.json
-
-# Check current tasks snapshot
-cat data/ipc/{groupFolder}/current_tasks.json
-```
-
-**IPC file types:**
-- `messages/*.json` - Agent writes: outgoing WhatsApp messages
-- `tasks/*.json` - Agent writes: task operations (schedule, pause, resume, cancel, refresh_groups)
-- `current_tasks.json` - Host writes: read-only snapshot of scheduled tasks
-- `available_groups.json` - Host writes: read-only list of WhatsApp groups (main only)
-
-## Quick Diagnostic Script
-
-Run this to check common issues:
-
-```bash
-echo "=== Checking NanoClaw Container Setup ==="
-
-echo -e "\n1. Authentication configured?"
-[ -f .env ] && (grep -q "CLAUDE_CODE_OAUTH_TOKEN=sk-" .env || grep -q "ANTHROPIC_API_KEY=sk-" .env) && echo "OK" || echo "MISSING - add CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY to .env"
-
-echo -e "\n2. Env file copied for container?"
-[ -f data/env/env ] && echo "OK" || echo "MISSING - will be created on first run"
-
-echo -e "\n3. Container runtime running?"
-docker info &>/dev/null && echo "OK" || echo "NOT RUNNING - start Docker Desktop (macOS) or sudo systemctl start docker (Linux)"
-
-echo -e "\n4. Container image exists?"
-echo '{}' | docker run -i --entrypoint /bin/echo nanoclaw-agent:latest "OK" 2>/dev/null || echo "MISSING - run ./container/build.sh"
-
-echo -e "\n5. Session mount path correct?"
-grep -q "/home/node/.claude" src/container-runner.ts 2>/dev/null && echo "OK" || echo "WRONG - should mount to /home/node/.claude/, not /root/.claude/"
-
-echo -e "\n6. Groups directory?"
-ls -la groups/ 2>/dev/null || echo "MISSING - run setup"
-
-echo -e "\n7. Recent container logs?"
-ls -t groups/*/logs/container-*.log 2>/dev/null | head -3 || echo "No container logs yet"
-
-echo -e "\n8. Session continuity working?"
-SESSIONS=$(grep "Session initialized" logs/nanoclaw.log 2>/dev/null | tail -5 | awk '{print $NF}' | sort -u | wc -l)
-[ "$SESSIONS" -le 2 ] && echo "OK (recent sessions reusing IDs)" || echo "CHECK - multiple different session IDs, may indicate resumption issues"
-```
+## Container skills (`container/skills/*`)
+These are copied into each session on spawn via `initGroupFilesystem` — **no rebuild needed** for markdown edits. Just restart the service (or wait for the next session spawn) and the new skill is live.
