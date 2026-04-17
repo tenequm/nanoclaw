@@ -26,6 +26,9 @@ const DEFAULT_SETTINGS_JSON =
         CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
         CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
       },
+      permissions: {
+        allow: ['mcp__surf__*'],
+      },
     },
     null,
     2,

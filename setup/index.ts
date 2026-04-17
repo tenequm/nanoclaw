@@ -16,6 +16,7 @@ const STEPS: Record<
   mounts: () => import('./mounts.js'),
   service: () => import('./service.js'),
   verify: () => import('./verify.js'),
+  'pair-telegram': () => import('./pair-telegram.js'),
 };
 
 async function main(): Promise<void> {

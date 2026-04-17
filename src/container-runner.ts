@@ -9,7 +9,9 @@ import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, IDLE_TIMEOUT, ONECLI_URL, TIMEZONE } from './config.js';
+import os from 'os';
+
+import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, IDLE_TIMEOUT, ONECLI_API_KEY, ONECLI_URL, TIMEZONE } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -36,7 +38,7 @@ import {
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
-const onecli = new OneCLI({ url: ONECLI_URL });
+const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
@@ -236,6 +238,13 @@ function buildMounts(
   const groupRunnerDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, 'agent-runner-src');
   mounts.push({ hostPath: groupRunnerDir, containerPath: '/app/src', readonly: false });
 
+  // x402-proxy wallet/state for Surf MCP — mounted rw when the host directory
+  // exists. Persists the funded wallet across container restarts.
+  const x402Dir = path.join(os.homedir(), '.config', 'x402-proxy');
+  if (fs.existsSync(x402Dir)) {
+    mounts.push({ hostPath: x402Dir, containerPath: '/home/node/.config/x402-proxy', readonly: false });
+  }
+
   // Additional mounts from container config (groups/<folder>/container.json)
   const containerConfig = readContainerConfig(agentGroup.folder);
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
@@ -272,6 +281,13 @@ async function buildContainerArgs(
 
   if (agentGroup.name) {
     args.push('-e', `NANOCLAW_ASSISTANT_NAME=${agentGroup.name}`);
+  }
+
+  // Surf MCP opt-in — when the x402-proxy wallet dir exists on the host, the
+  // agent gets the Surf MCP server (web/twitter/reddit/github search). Each
+  // agent group inherits the opt-in from the host config directory.
+  if (fs.existsSync(path.join(os.homedir(), '.config', 'x402-proxy'))) {
+    args.push('-e', 'ENABLE_SURF_MCP=true');
   }
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_NAME=${agentGroup.name}`);

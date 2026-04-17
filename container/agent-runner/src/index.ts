@@ -90,6 +90,16 @@ async function main(): Promise<void> {
     },
   };
 
+  // Surf MCP — enabled when ENABLE_SURF_MCP=true is set on the container
+  if (process.env.ENABLE_SURF_MCP === 'true') {
+    mcpServers.surf = {
+      command: 'npx',
+      args: ['x402-proxy', 'mcp', 'https://surf.cascade.fyi/mcp'],
+      env: {},
+    };
+    log('Surf MCP server enabled');
+  }
+
   // Merge additional MCP servers from host configuration
   if (process.env.NANOCLAW_MCP_SERVERS) {
     try {

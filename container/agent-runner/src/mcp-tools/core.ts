@@ -217,6 +217,72 @@ export const editMessage: McpToolDefinition = {
   },
 };
 
+export const sendMediaGroup: McpToolDefinition = {
+  tool: {
+    name: 'send_media_group',
+    description:
+      'Send 2-10 files as a single album (photos/videos as a gallery, documents as a grouped list). Telegram-first; other channels may fall back to individual sends.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        to: { type: 'string', description: 'Destination name. Optional if you have only one destination.' },
+        items: {
+          type: 'array',
+          minItems: 2,
+          maxItems: 10,
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'File path (relative to /workspace/agent/ or absolute)' },
+              caption: { type: 'string', description: 'Optional per-item caption' },
+            },
+            required: ['path'],
+          },
+        },
+      },
+      required: ['items'],
+    },
+  },
+  async handler(args) {
+    const rawItems = args.items as Array<{ path: string; caption?: string }> | undefined;
+    if (!Array.isArray(rawItems) || rawItems.length < 2 || rawItems.length > 10) {
+      return err('items must contain between 2 and 10 files');
+    }
+
+    const routing = resolveRouting(args.to as string | undefined);
+    if ('error' in routing) return err(routing.error);
+
+    const id = generateId();
+    const outboxDir = path.join('/workspace/outbox', id);
+    fs.mkdirSync(outboxDir, { recursive: true });
+
+    const items: Array<{ path: string; caption?: string }> = [];
+    const filenames: string[] = [];
+    for (const item of rawItems) {
+      const filePath = item.path;
+      if (!filePath) return err('each item must have a path');
+      const resolved = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
+      if (!fs.existsSync(resolved)) return err(`File not found: ${filePath}`);
+      const filename = path.basename(resolved);
+      fs.copyFileSync(resolved, path.join(outboxDir, filename));
+      items.push({ path: filename, caption: item.caption });
+      filenames.push(filename);
+    }
+
+    writeMessageOut({
+      id,
+      kind: 'chat',
+      platform_id: routing.platform_id,
+      channel_type: routing.channel_type,
+      thread_id: routing.thread_id,
+      content: JSON.stringify({ operation: 'send_media_group', items, files: filenames }),
+    });
+
+    log(`send_media_group: ${id} → ${routing.resolvedName} (${filenames.length} files)`);
+    return ok(`Media group sent to ${routing.resolvedName} (id: ${id}, count: ${filenames.length})`);
+  },
+};
+
 export const addReaction: McpToolDefinition = {
   tool: {
     name: 'add_reaction',
@@ -258,4 +324,4 @@ export const addReaction: McpToolDefinition = {
   },
 };
 
-export const coreTools: McpToolDefinition[] = [sendMessage, sendFile, editMessage, addReaction];
+export const coreTools: McpToolDefinition[] = [sendMessage, sendFile, sendMediaGroup, editMessage, addReaction];
