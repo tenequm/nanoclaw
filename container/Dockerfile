@@ -18,6 +18,7 @@ ARG INSTALL_CJK_FONTS=false
 ARG CLAUDE_CODE_VERSION=2.1.112
 ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=latest
+ARG X402_PROXY_VERSION=latest
 ARG BUN_VERSION=1.3.12
 
 # ---- System dependencies -----------------------------------------------------
@@ -52,6 +53,32 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
        fi \
     && rm -rf /var/lib/apt/lists/*
 
+# ---- Media stack: yt-dlp / instaloader / deno -------------------------------
+# Layered after the base apt block so changes here don't bust the main cache.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        atomicparsley \
+        python3-pip \
+    && pip install --break-system-packages --no-cache-dir \
+        yt-dlp \
+        yt-dlp-ejs \
+        instaloader \
+        mutagen \
+        pycryptodomex \
+        brotli \
+        websockets \
+        requests \
+        certifi \
+        curl_cffi \
+        secretstorage \
+        xattr \
+    && rm -rf /var/lib/apt/lists/*
+
+# Deno — required by yt-dlp's modern YouTube signature extractors.
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
@@ -80,6 +107,11 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
         "agent-browser@${AGENT_BROWSER_VERSION}" \
         "vercel@${VERCEL_VERSION}"
+
+# x402-proxy is installed via `npm install -g` to bypass the host pnpm
+# supply-chain policy (minimumReleaseAge) — this global install happens
+# inside the image build, not against the host workspace.
+RUN npm install -g "x402-proxy@${X402_PROXY_VERSION}"
 
 # ---- agent-runner ------------------------------------------------------------
 WORKDIR /app

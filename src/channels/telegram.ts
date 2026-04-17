@@ -299,10 +299,7 @@ function mimeToExt(mime: string): string {
   return '';
 }
 
-function createFeatureInterceptor(
-  next: ChannelSetup['onInbound'],
-  token: string,
-): ChannelSetup['onInbound'] {
+function createFeatureInterceptor(next: ChannelSetup['onInbound'], token: string): ChannelSetup['onInbound'] {
   return async (platformId, threadId, message) => {
     try {
       // Fire 👀 seen-reaction immediately (don't await).
