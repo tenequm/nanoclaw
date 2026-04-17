@@ -44,15 +44,20 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
  * Read the host's `gh` CLI token. Containers are ephemeral so we can't persist
  * `~/.config/gh/` inside them — shell out to the host gh instead.
  *
- * Runs through a login shell so gh installed via Homebrew/linuxbrew/asdf/etc.
- * is reachable even when the systemd service PATH is minimal. Returns null if
- * gh isn't installed or isn't authenticated.
+ * Augments PATH with common install locations so gh resolves even when the
+ * systemd service PATH is minimal (Homebrew/linuxbrew live outside the
+ * default systemd PATH and aren't picked up by `bash -lc` because
+ * `brew shellenv` usually lives in `.bashrc`, not `.profile`). Returns null
+ * if gh isn't installed or isn't authenticated.
  */
+const GH_PATH_EXTRAS = ['/home/linuxbrew/.linuxbrew/bin', '/opt/homebrew/bin', `${os.homedir()}/.local/bin`];
+
 function getHostGhToken(): string | null {
   try {
-    const token = execSync("bash -lc 'gh auth token'", {
+    const token = execSync('gh auth token', {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, PATH: `${GH_PATH_EXTRAS.join(':')}:${process.env.PATH ?? ''}` },
     }).trim();
     return token || null;
   } catch {
