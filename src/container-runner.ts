@@ -42,12 +42,18 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 /**
  * Read the host's `gh` CLI token. Containers are ephemeral so we can't persist
- * `~/.config/gh/` inside them — shell out to the host gh instead. Returns null
- * if gh isn't installed or isn't authenticated.
+ * `~/.config/gh/` inside them — shell out to the host gh instead.
+ *
+ * Runs through a login shell so gh installed via Homebrew/linuxbrew/asdf/etc.
+ * is reachable even when the systemd service PATH is minimal. Returns null if
+ * gh isn't installed or isn't authenticated.
  */
 function getHostGhToken(): string | null {
   try {
-    const token = execSync('gh auth token', { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const token = execSync("bash -lc 'gh auth token'", {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
     return token || null;
   } catch {
     return null;
