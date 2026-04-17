@@ -141,7 +141,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     };
   }
 
-  return {
+  const bridge: ChannelAdapter = {
     name: adapter.name,
     channelType: adapter.name,
     supportsThreads: config.supportsThreads,
@@ -348,22 +348,6 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       await adapter.startTyping(tid);
     },
 
-    /**
-     * Open (or fetch) a DM with a user via Chat SDK's chat.openDM. The
-     * returned Thread's id is encoded platform-specifically (e.g. Discord
-     * encodes @me:channelId:threadId), so we unwrap with
-     * channelIdFromThreadId to get the plain DM channel id — that's what
-     * the rest of NanoClaw uses as `platform_id`.
-     *
-     * Throws if Chat SDK's underlying adapter doesn't implement openDM.
-     * Channels without DM support (Telegram, WhatsApp native) don't go
-     * through chat-sdk-bridge at all, so this path isn't invoked for them.
-     */
-    async openDM(userHandle: string): Promise<string> {
-      const thread = await chat.openDM(userHandle);
-      return adapter.channelIdFromThreadId(thread.id);
-    },
-
     async teardown() {
       gatewayAbort?.abort();
       await chat.shutdown();
@@ -378,6 +362,25 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       conversations = buildConversationMap(configs);
     },
   };
+
+  // Only expose openDM when the underlying Chat SDK adapter implements it.
+  // Delegate straight to adapter.openDM rather than going through chat.openDM:
+  // the latter dispatches via inferAdapterFromUserId, which only recognizes
+  // Discord snowflakes, Slack U-ids, Teams 29:-ids, and gChat users/-ids, and
+  // throws for everything else (Telegram numeric ids, iMessage, Matrix, …).
+  // Calling adapter.openDM directly also preserves the adapter's native
+  // platform_id encoding via channelIdFromThreadId (e.g. "telegram:<chatId>"),
+  // which matches what onInbound stores in messaging_groups — avoiding a
+  // duplicate-row / decode-error cascade at delivery time. See user-dm.ts for
+  // the direct-addressable fallback when the adapter has no openDM at all.
+  if (adapter.openDM) {
+    bridge.openDM = async (userHandle: string): Promise<string> => {
+      const threadId = await adapter.openDM!(userHandle);
+      return adapter.channelIdFromThreadId(threadId);
+    };
+  }
+
+  return bridge;
 }
 
 /**

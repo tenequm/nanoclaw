@@ -193,19 +193,38 @@ describe('pickApprover', () => {
 });
 
 describe('ensureUserDm', () => {
-  it('direct-addressable channels: lazily creates a messaging_group using the handle', async () => {
-    await mountMockAdapter('telegram'); // no openDM → direct-addressable
-    seedUser('telegram:123', 'telegram');
+  it('adapter without openDM: falls through to using the bare handle as platform_id', async () => {
+    await mountMockAdapter('nodm'); // no openDM → direct-addressable fallback
+    seedUser('nodm:123', 'nodm');
 
-    const mg = await ensureUserDm('telegram:123');
+    const mg = await ensureUserDm('nodm:123');
     expect(mg).toBeDefined();
-    expect(mg!.channel_type).toBe('telegram');
+    expect(mg!.channel_type).toBe('nodm');
     expect(mg!.platform_id).toBe('123');
     expect(mg!.is_group).toBe(0);
 
     // Cache row written
-    const cached = getUserDm('telegram:123', 'telegram');
+    const cached = getUserDm('nodm:123', 'nodm');
     expect(cached?.messaging_group_id).toBe(mg!.id);
+  });
+
+  it('Telegram via chat-sdk-bridge: adapter.openDM returns prefixed platform_id', async () => {
+    // Post-fix bridge behavior: the bridged Telegram adapter exposes openDM
+    // that delegates to the underlying @chat-adapter/telegram adapter, whose
+    // channelIdFromThreadId returns "telegram:<chatId>". That's the same
+    // encoding onInbound stores in messaging_groups, so cache hits on repeat.
+    const mock = await mountMockAdapter('telegram', async (handle) => `telegram:${handle}`);
+    seedUser('telegram:6037840640', 'telegram');
+
+    const mg = await ensureUserDm('telegram:6037840640');
+    expect(mg).toBeDefined();
+    expect(mg!.platform_id).toBe('telegram:6037840640');
+    expect(mock.openDMCalls).toEqual(['6037840640']);
+
+    // Second call hits the user_dms cache, not openDM again.
+    const mg2 = await ensureUserDm('telegram:6037840640');
+    expect(mg2!.id).toBe(mg!.id);
+    expect(mock.openDMCalls).toEqual(['6037840640']);
   });
 
   it('resolution-required channels: calls adapter.openDM, uses its result, caches', async () => {
