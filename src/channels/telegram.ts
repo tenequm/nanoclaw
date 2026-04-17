@@ -5,11 +5,13 @@
  *      folder, fires a 👀 reaction on seen, and transcribes voice notes via
  *      Whisper so the agent sees the transcript inline.
  *   3. A wrapped deliver() that routes single-file videos through sendVideo
- *      with supports_streaming:true and handles send_media_group.
+ *      with supports_streaming:true, handles send_media_group, and clears
+ *      the 👀 seen-reaction once the bot replies.
  *
- * All side-channel calls (reactions, sendMediaGroup, sendVideo) go through
- * raw HTTPS fetch against api.telegram.org to avoid a second grammy/Bot
- * dependency alongside @chat-adapter/telegram.
+ * Reactions go through the adapter's own addReaction/removeReaction so the
+ * compound "chatId:messageId" format is decoded correctly. sendMediaGroup
+ * and sendVideo still use raw fetch against api.telegram.org to avoid a
+ * second grammy/Bot dependency alongside @chat-adapter/telegram.
  */
 import fs from 'fs';
 import os from 'os';
@@ -209,6 +211,8 @@ const VOICE_EXTS = new Set(['.ogg', '.oga', '.m4a', '.mp3', '.wav', '.webm']);
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm']);
 
+const SEEN_EMOJI = '👀';
+
 function sanitizeAttachmentName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120) || 'file';
 }
@@ -222,24 +226,6 @@ function resolveGroupFolderForPlatformId(platformId: string): string | null {
   const primary = wirings[0];
   const ag = getAgentGroup(primary.agent_group_id);
   return ag?.folder ?? null;
-}
-
-async function setTelegramReaction(token: string, platformId: string, messageId: string, emoji: string): Promise<void> {
-  const chatId = chatIdFromPlatformId(platformId);
-  if (!chatId) return;
-  try {
-    await fetch(`https://api.telegram.org/bot${token}/setMessageReaction`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_id: Number(messageId),
-        reaction: [{ type: 'emoji', emoji }],
-      }),
-    });
-  } catch (err) {
-    log.debug('Telegram setMessageReaction failed', { err });
-  }
 }
 
 interface InboundAttachment {
@@ -299,12 +285,44 @@ function mimeToExt(mime: string): string {
   return '';
 }
 
-function createFeatureInterceptor(next: ChannelSetup['onInbound'], token: string): ChannelSetup['onInbound'] {
+/**
+ * Track which Telegram messages we've reacted 👀 to so we can clear the
+ * reaction once the bot replies. Keyed by threadId (same encoded string the
+ * adapter expects for add/removeReaction) so forum topics stay isolated —
+ * a reply in topic-B won't clear a 👀 left in topic-A.
+ *
+ * In-memory only. Host crash between add and clear means the 👀 sticks; a
+ * recovery sweep would cost more than it saves for a cosmetic indicator.
+ */
+type ReactionAdapter = {
+  addReaction(threadId: string, messageId: string, emoji: string): Promise<unknown>;
+  removeReaction(threadId: string, messageId: string, emoji: string): Promise<unknown>;
+};
+
+function createFeatureInterceptor(
+  next: ChannelSetup['onInbound'],
+  adapter: ReactionAdapter,
+  pendingSeen: Map<string, Set<string>>,
+): ChannelSetup['onInbound'] {
   return async (platformId, threadId, message) => {
     try {
-      // Fire 👀 seen-reaction immediately (don't await).
+      // Fire 👀 seen-reaction. Fire-and-forget so attachments/materialization
+      // aren't blocked on a Telegram round-trip, but track the message on
+      // success so we can clear it after the agent replies.
       if (message.kind === 'chat-sdk' && message.id) {
-        void setTelegramReaction(token, platformId, message.id, '👀');
+        const reactionKey = threadId ?? platformId;
+        const compoundId = message.id;
+        adapter
+          .addReaction(reactionKey, compoundId, SEEN_EMOJI)
+          .then(() => {
+            let set = pendingSeen.get(reactionKey);
+            if (!set) {
+              set = new Set();
+              pendingSeen.set(reactionKey, set);
+            }
+            set.add(compoundId);
+          })
+          .catch((err) => log.warn('Telegram addReaction failed', { reactionKey, err }));
       }
 
       if (message.kind === 'chat-sdk' && message.content && typeof message.content === 'object') {
@@ -326,6 +344,26 @@ function createFeatureInterceptor(next: ChannelSetup['onInbound'], token: string
 
     await next(platformId, threadId, message);
   };
+}
+
+/** Drain and clear all pending 👀 for a thread after a successful outbound. */
+function clearPendingSeen(
+  adapter: ReactionAdapter,
+  pendingSeen: Map<string, Set<string>>,
+  reactionKey: string,
+): void {
+  const set = pendingSeen.get(reactionKey);
+  if (!set || set.size === 0) return;
+  const drained = [...set];
+  pendingSeen.delete(reactionKey);
+  void Promise.allSettled(
+    drained.map((compoundId) => adapter.removeReaction(reactionKey, compoundId, SEEN_EMOJI)),
+  ).then((results) => {
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    if (failed > 0) {
+      log.warn('Telegram removeReaction partial failure', { reactionKey, failed, total: drained.length });
+    }
+  });
 }
 
 // --- Outbound wrapping: send_media_group + streaming video ---
@@ -438,17 +476,19 @@ registerChannelAdapter('telegram', {
     });
 
     const botUsernamePromise = fetchBotUsername(token);
+    const pendingSeen = new Map<string, Set<string>>();
 
     const wrapped: ChannelAdapter = {
       ...bridge,
       async setup(hostConfig: ChannelSetup) {
         const paired = createPairingInterceptor(botUsernamePromise, hostConfig.onInbound, token);
-        const featured = createFeatureInterceptor(paired, token);
+        const featured = createFeatureInterceptor(paired, telegramAdapter, pendingSeen);
         const intercepted: ChannelSetup = { ...hostConfig, onInbound: featured };
         return withRetry(() => bridge.setup(intercepted), 'bridge.setup');
       },
       async deliver(platformId, threadId, message): Promise<string | undefined> {
         const content = (message.content as Record<string, unknown>) ?? {};
+        const reactionKey = threadId ?? platformId;
 
         // Custom send_media_group operation
         if (content.operation === 'send_media_group' && Array.isArray(content.items)) {
@@ -478,6 +518,7 @@ registerChannelAdapter('telegram', {
           } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
           }
+          clearPendingSeen(telegramAdapter, pendingSeen, reactionKey);
           return;
         }
 
@@ -490,13 +531,16 @@ registerChannelAdapter('telegram', {
             await fs.promises.writeFile(tmp, file.data);
             const chatId = chatIdFromPlatformId(platformId);
             const msgId = await sendVideoRaw(token, chatId, tmp, videoMatch.caption, parseThreadId(threadId));
+            clearPendingSeen(telegramAdapter, pendingSeen, reactionKey);
             return msgId;
           } finally {
             fs.rmSync(path.dirname(tmp), { recursive: true, force: true });
           }
         }
 
-        return bridge.deliver(platformId, threadId, message);
+        const result = await bridge.deliver(platformId, threadId, message);
+        clearPendingSeen(telegramAdapter, pendingSeen, reactionKey);
+        return result;
       },
     };
     return wrapped;
