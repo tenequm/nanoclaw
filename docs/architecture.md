@@ -657,13 +657,13 @@ Three agent groups, one Discord channel (PR Factory), plus an admin channel:
 The central DB handles routing and entity management. All content and execution state lives in per-session DBs.
 
 ```sql
--- Agent workspaces: folder, skills, CLAUDE.md, container config
+-- Agent workspaces: folder, skills, CLAUDE.md. Container config lives in
+-- groups/<folder>/container.json (not in the DB).
 CREATE TABLE agent_groups (
   id               TEXT PRIMARY KEY,
   name             TEXT NOT NULL,
   folder           TEXT NOT NULL UNIQUE,
   agent_provider   TEXT,              -- default for sessions (null = system default)
-  container_config TEXT,              -- JSON: { additionalMounts, timeout }
   created_at       TEXT NOT NULL
 );
 

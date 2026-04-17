@@ -39,7 +39,7 @@ flowchart TB
   end
 
   subgraph Groups["Agent Group Filesystem (groups/*)"]
-    Folder["CLAUDE.md<br/>memory<br/>per-group skills<br/>container_config"]
+    Folder["CLAUDE.md<br/>memory<br/>per-group skills<br/>container.json"]
   end
 
   P1 & P2 & P3 & P4 & P5 --> Bridge
@@ -140,7 +140,6 @@ erDiagram
     string name
     string folder
     string agent_provider
-    json container_config
   }
   messaging_groups {
     int id

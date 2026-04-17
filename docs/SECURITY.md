@@ -46,7 +46,7 @@ The main group's project root is mounted read-only. Writable paths the agent nee
 
 ### 3. Session Isolation
 
-Each group has isolated Claude sessions at `data/sessions/{group}/.claude/`:
+Each session has isolated Claude state at `data/v2-sessions/{session_id}/.claude-shared/`:
 - Groups cannot see other groups' conversation history
 - Session data includes full message history and file contents read
 - Prevents cross-group information disclosure
@@ -78,7 +78,7 @@ Real API credentials **never enter containers**. NanoClaw uses [OneCLI's Agent V
 Each NanoClaw group gets its own OneCLI agent identity. This allows different credential policies per group (e.g. your sales agent vs. support agent). OneCLI supports rate limits, and time-bound access and approval flows are on the roadmap.
 
 **NOT Mounted:**
-- Channel auth sessions (`store/auth/`) — host only
+- Channel auth state (`chat_sdk_*` tables in `data/v2.db`) — host only
 - Mount allowlist — external, never mounted
 - Any credentials matching blocked patterns
 - `.env` is shadowed with `/dev/null` in the project root mount

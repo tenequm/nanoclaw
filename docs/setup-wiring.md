@@ -65,7 +65,7 @@ Added `session_mode: 'agent-shared'` for cross-channel shared sessions (e.g. Git
 
 ### Entity Model
 ```
-agent_groups (id, name, folder, agent_provider, container_config)
+agent_groups (id, name, folder, agent_provider)  -- container.json on disk
     ↕ many-to-many
 messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy)
     via

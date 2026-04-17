@@ -125,7 +125,7 @@ claude
 
 单一 Node.js 进程。渠道通过技能添加，启动时自注册 — 编排器连接具有凭据的渠道。智能体在具有文件系统隔离的 Linux 容器中执行。每个群组的消息队列带有并发控制。通过文件系统进行 IPC。
 
-完整架构详情请见 [docs/SPEC.md](docs/SPEC.md)。
+完整架构详情请见 [docs/architecture.md](docs/architecture.md)。
 
 关键文件：
 - `src/index.ts` - 编排器：状态管理、消息循环、智能体调用
