@@ -79,6 +79,25 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # Deno — required by yt-dlp's modern YouTube signature extractors.
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
+# ---- GitHub CLI (gh) ---------------------------------------------------------
+# Auth is injected by OneCLI gateway (Authorization header on api.github.com).
+# Agents can run `gh pr list`, `gh repo view`, etc. without holding a real PAT.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# gh refuses to run without a token configured. The placeholder satisfies its
+# local auth check; OneCLI's HTTPS_PROXY rewrites Authorization on outbound
+# api.github.com calls with the real token from the vault. Same trick the
+# vercel-cli skill uses with `--token placeholder`.
+ENV GH_TOKEN=placeholder
+
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium

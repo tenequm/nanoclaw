@@ -40,6 +40,20 @@ import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
+/**
+ * Read the host's `gh` CLI token. Containers are ephemeral so we can't persist
+ * `~/.config/gh/` inside them — shell out to the host gh instead. Returns null
+ * if gh isn't installed or isn't authenticated.
+ */
+function getHostGhToken(): string | null {
+  try {
+    const token = execSync('gh auth token', { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return token || null;
+  } catch {
+    return null;
+  }
+}
+
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
 
@@ -291,6 +305,14 @@ async function buildContainerArgs(
   }
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_NAME=${agentGroup.name}`);
+
+  // Host's gh CLI token → container. Overrides the Dockerfile placeholder.
+  // If the host isn't logged in, container keeps the placeholder and gh
+  // commands will fail with "Bad credentials" until the host runs `gh auth login`.
+  const ghToken = getHostGhToken();
+  if (ghToken) {
+    args.push('-e', `GH_TOKEN=${ghToken}`);
+  }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
