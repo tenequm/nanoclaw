@@ -21,6 +21,14 @@ export function sanitizeTelegramLegacyMarkdown(input: string): string {
     return `${PLACEHOLDER_PREFIX}${codeSegments.length - 1}${PLACEHOLDER_SUFFIX}`;
   });
 
+  // Strip CommonMark thematic breaks (---, ***, ___ on their own line, 3+
+  // repeats, with optional spaces). The adapter's markdown re-stringifier
+  // canonicalizes `---` to `***` before sending, which Telegram's legacy
+  // parser treats as an unclosed bold marker.
+  text = text.replace(/^[ \t]*(?:-[ \t]*){3,}[ \t]*$/gm, '');
+  text = text.replace(/^[ \t]*(?:\*[ \t]*){3,}[ \t]*$/gm, '');
+  text = text.replace(/^[ \t]*(?:_[ \t]*){3,}[ \t]*$/gm, '');
+
   // The adapter re-parses and re-stringifies markdown before sending, which
   // rewrites `- item` list bullets into `* item` — injecting unbalanced
   // asterisks that Telegram's legacy Markdown parser then rejects. Replace
