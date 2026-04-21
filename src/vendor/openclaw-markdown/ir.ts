@@ -531,10 +531,14 @@ function renderTableAsCode(state: RenderState) {
 
   const codeStart = state.text.length;
 
+  // DEVIATION from upstream (openclaw): upstream emits outer pipes like
+  // `| cell | cell |`. Those add 4 chars of non-data width per line and push
+  // tables past Telegram's mobile-viewport wrap threshold sooner. We emit
+  // `cell | cell` (no outer pipes) — narrower, still aligned, still clearly a
+  // table in monospace. `renderTableAsBullets` is unchanged.
   const appendRow = (cells: TableCell[]) => {
-    state.text += '|';
     for (let i = 0; i < columnCount; i += 1) {
-      state.text += ' ';
+      if (i > 0) state.text += ' | ';
       const cell = cells[i];
       if (cell) {
         // Use text-only append to avoid overlapping styles with code_block
@@ -544,16 +548,15 @@ function renderTableAsCode(state: RenderState) {
       if (pad > 0) {
         state.text += ' '.repeat(pad);
       }
-      state.text += ' |';
     }
     state.text += '\n';
   };
 
   const appendDivider = () => {
-    state.text += '|';
     for (let i = 0; i < columnCount; i += 1) {
+      if (i > 0) state.text += ' | ';
       const dashCount = Math.max(3, widths[i]);
-      state.text += ` ${'-'.repeat(dashCount)} |`;
+      state.text += '-'.repeat(dashCount);
     }
     state.text += '\n';
   };

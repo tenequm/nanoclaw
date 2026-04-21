@@ -40,6 +40,7 @@ exact sites.
 | `ir.ts` `MarkdownToken` type | adds `markup?: string` | surfaces markdown-it's em delimiter to the walker below |
 | `ir.ts` `em_open` / `em_close` handlers | `*x*` → bold, `_x_` → italic (strict CommonMark treats both as italic) | matches Telegram legacy/MarkdownV2 convention and LLM output assumptions — a user typing `*жирний*` expects bold, not italic |
 | `format.ts` `markdownToTelegramHtml` + `markdownToTelegramChunks` | `headingStyle: 'none'` → `'bold'` | Telegram HTML has no `<h1>..<h6>`; plain text loses the author's visual emphasis intent. Bold is the standard substitute |
+| `ir.ts` `renderTableAsCode` `appendRow` + `appendDivider` | drop outer `|` delimiters (`cell \| cell` instead of `\| cell \| cell \|`) | 4 chars less width per line; pushes the mobile-viewport wrap threshold later. Alignment is still clear in monospace |
 
 These three deltas are semantic ("how should arbitrary Markdown look in a
 Telegram HTML message"), not structural. Upstream openclaw is spec-strict

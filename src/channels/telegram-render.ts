@@ -1,22 +1,27 @@
 /**
  * Markdown → Telegram HTML chunks.
  *
- * Wraps the vendored openclaw pipeline with a local pre-processor that makes
- * a per-table decision: flatten wide pipe-tables in place (to nested bullets),
- * leave narrow ones as GFM so openclaw renders them as `<pre><code>` grids.
+ * Strategy: segment-split + per-table mode.
  *
- * Openclaw itself takes a single `tableMode` for the whole message — so when
- * a message mixes narrow + wide tables, picking one mode is wrong for the
- * other. Pre-flattening per table sidesteps that: after this pass the only
- * remaining pipe-tables are narrow ones, and openclaw's `tableMode: 'code'`
- * does the right thing for them.
+ * Openclaw's `markdownToTelegramHtml` takes a single `tableMode` for the
+ * whole input — which means when a message mixes narrow + wide tables, any
+ * single choice is wrong for the other. We sidestep that by splitting the
+ * source at each pipe-table boundary:
+ *
+ *   - Prose between tables → renders through openclaw with `tableMode: 'off'`.
+ *   - Each individual table → renders through openclaw with its own decision:
+ *     `'code'` (ASCII grid in `<pre><code>`) if the rendered width ≤ 48,
+ *     `'bullets'` (openclaw's native row-labelled nested bullets) if wider.
+ *
+ * Then we concat the HTML fragments and hand the combined string to
+ * `splitTelegramHtmlChunks` for chunk-safe splitting (tags never split).
  *
  * Upstream rejected a width-based heuristic as "too fragile" (openclaw#1495);
  * users in openclaw#36323 have kept asking for it. Our 48-char threshold is
- * empirically measured against a real mobile client, not picked from a hat.
+ * empirically measured against a real mobile client.
  */
 import { parseFenceSpans } from '../vendor/openclaw-markdown/fences.js';
-import { markdownToTelegramChunks } from '../vendor/openclaw-markdown/format.js';
+import { markdownToTelegramHtml, splitTelegramHtmlChunks } from '../vendor/openclaw-markdown/format.js';
 
 /** Empirical mobile-client break point — measured against the user's phone. */
 const TABLE_WIDTH_LIMIT = 48;
@@ -33,9 +38,9 @@ function parseTableRow(line: string): string[] {
 }
 
 /**
- * ASCII-rendered width of `| cell | cell | cell |` after openclaw's
- * `renderTableAsCode` pads each column to its widest cell.
- * Formula: sum(colWidths) + 3*(cols-1) + 4 (leading "| " + trailing " |" + " | " between cells).
+ * ASCII-rendered width of `cell | cell | cell` after our (patched) openclaw
+ * `renderTableAsCode` pads each column and joins with ` | ` (no outer pipes).
+ * Formula: sum(colWidths) + 3*(cols-1).
  */
 function computeRenderedTableWidth(headers: string[], rows: string[][]): number {
   const colCount = Math.max(headers.length, ...rows.map((r) => r.length));
@@ -49,57 +54,38 @@ function computeRenderedTableWidth(headers: string[], rows: string[][]): number 
     }
     total += maxWidth;
   }
-  return total + 3 * (colCount - 1) + 4;
+  return total + 3 * (colCount - 1);
 }
 
-/**
- * Rewrite a wide table as nested bullets in source markdown form. Mirrors
- * openclaw's `renderTableAsBullets` output but emitted as raw markdown
- * (`**label**` + `- key: value`) so the downstream parse treats it as a
- * normal bullet list.
- */
-function renderTableAsBulletsMarkdown(headers: string[], rows: string[][]): string[] {
-  const out: string[] = [];
-  for (const row of rows) {
-    const primary = (row[0] ?? '').trim();
-    if (primary) out.push(`**${primary}**`);
-    for (let k = 1; k < row.length; k++) {
-      const label = (headers[k] ?? '').trim();
-      const value = (row[k] ?? '').trim();
-      if (!label && !value) continue;
-      if (label && value) out.push(`- ${label}: ${value}`);
-      else out.push(`- ${label || value}`);
-    }
-    out.push('');
-  }
-  return out;
-}
+type TableRegion = {
+  /** char offset in source markdown, inclusive */
+  start: number;
+  /** char offset in source markdown, exclusive */
+  end: number;
+  width: number;
+};
 
 /**
- * Walk the markdown line-by-line, flattening only wide pipe-tables. Fenced
- * code blocks are skipped entirely via `parseFenceSpans` so tables inside
- * ```fences``` stay verbatim.
+ * Scan markdown line-by-line; for each GFM pipe-table, record its char range
+ * and computed width. Tables inside fenced code blocks are ignored.
  */
-function flattenWideTablesInPlace(markdown: string): string {
+function findTableRegions(markdown: string): TableRegion[] {
   const fences = parseFenceSpans(markdown);
-  const fenceBreaks = new Set<number>();
-  for (const span of fences) {
-    // Mark every line-start index inside a fence as untouchable.
-    for (let i = span.start; i < span.end; i++) fenceBreaks.add(i);
-  }
+  const isInFence = (offset: number) => fences.some((f) => offset >= f.start && offset < f.end);
 
+  const regions: TableRegion[] = [];
   const lines = markdown.split('\n');
-  const out: string[] = [];
-  let charCursor = 0;
+  let cursor = 0;
   let i = 0;
 
   while (i < lines.length) {
+    const lineStart = cursor;
     const line = lines[i];
-    const lineStart = charCursor;
+    const lineLen = line.length;
+    const afterLine = cursor + lineLen + 1; // +1 for \n (approximate for last line)
 
-    if (fenceBreaks.has(lineStart)) {
-      out.push(line);
-      charCursor += line.length + 1;
+    if (isInFence(lineStart)) {
+      cursor = afterLine;
       i++;
       continue;
     }
@@ -108,39 +94,33 @@ function flattenWideTablesInPlace(markdown: string): string {
     const isTableStart = line.includes('|') && next !== undefined && TABLE_SEPARATOR_PATTERN.test(next);
 
     if (!isTableStart) {
-      out.push(line);
-      charCursor += line.length + 1;
+      cursor = afterLine;
       i++;
       continue;
     }
 
-    // Collect the table: header (i), separator (i+1), then consecutive
-    // pipe-lines outside fences until a non-pipe line.
     const headers = parseTableRow(line);
     let j = i + 2;
-    let cursor = charCursor + line.length + 1 + (lines[i + 1]?.length ?? 0) + 1;
+    // Advance cursor past header and separator lines
+    let tableEndCursor = afterLine + lines[i + 1].length + 1;
     const rows: string[][] = [];
-    while (j < lines.length && lines[j].includes('|') && !fenceBreaks.has(cursor)) {
+    while (j < lines.length && lines[j].includes('|') && !isInFence(tableEndCursor)) {
       rows.push(parseTableRow(lines[j]));
-      cursor += lines[j].length + 1;
+      tableEndCursor += lines[j].length + 1;
       j++;
     }
 
-    const width = computeRenderedTableWidth(headers, rows);
-
-    if (width <= TABLE_WIDTH_LIMIT) {
-      // Narrow: pass through unchanged; openclaw renders as <pre><code>.
-      for (let k = i; k < j; k++) out.push(lines[k]);
-    } else {
-      // Wide: rewrite as bullets; openclaw renders as a normal bullet list.
-      out.push(...renderTableAsBulletsMarkdown(headers, rows));
-    }
-
-    charCursor = cursor;
+    regions.push({
+      start: lineStart,
+      // trim the final \n off so we stop right at end of last table line
+      end: Math.min(tableEndCursor - 1, markdown.length),
+      width: computeRenderedTableWidth(headers, rows),
+    });
+    cursor = tableEndCursor;
     i = j;
   }
 
-  return out.join('\n');
+  return regions;
 }
 
 /**
@@ -150,6 +130,36 @@ function flattenWideTablesInPlace(markdown: string): string {
  */
 export function renderTelegramHtmlChunks(markdown: string, safeLimit: number): string[] {
   if (!markdown) return [];
-  const preFlattened = flattenWideTablesInPlace(markdown);
-  return markdownToTelegramChunks(preFlattened, safeLimit, { tableMode: 'code' }).map((c) => c.html);
+
+  const tables = findTableRegions(markdown);
+  if (tables.length === 0) {
+    // No tables — single render, chunk via HTML-aware splitter.
+    const html = markdownToTelegramHtml(markdown, { tableMode: 'off' });
+    return splitTelegramHtmlChunks(html, safeLimit);
+  }
+
+  // Compose: prose[0] + table[0] + prose[1] + table[1] + ... + prose[n]
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const t of tables) {
+    const prose = markdown.slice(cursor, t.start);
+    if (prose.trim()) {
+      parts.push(markdownToTelegramHtml(prose, { tableMode: 'off' }));
+    }
+    const tableSource = markdown.slice(t.start, t.end);
+    const mode = t.width <= TABLE_WIDTH_LIMIT ? 'code' : 'bullets';
+    parts.push(markdownToTelegramHtml(tableSource, { tableMode: mode }));
+    cursor = t.end;
+  }
+  const tail = markdown.slice(cursor);
+  if (tail.trim()) {
+    parts.push(markdownToTelegramHtml(tail, { tableMode: 'off' }));
+  }
+
+  // Glue fragments with a blank line so consecutive segments aren't visually
+  // fused. Adjacent block-level outputs (e.g. `<pre><code>..</pre>` + prose)
+  // already carry their own trailing whitespace from openclaw; one extra
+  // newline between parts is enough to keep vertical rhythm.
+  const html = parts.join('\n');
+  return splitTelegramHtmlChunks(html, safeLimit);
 }
