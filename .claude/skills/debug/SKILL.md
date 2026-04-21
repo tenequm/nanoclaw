@@ -152,7 +152,6 @@ groups/global/                     → /workspace/global          (ro, optional)
 data/v2-sessions/<id>/             → /workspace                 (rw)
 data/v2-sessions/<id>/.claude-shared/ → /home/node/.claude      (rw)
 data/v2-sessions/<id>/agent-runner-src/ → /app/src              (rw overlay)
-~/.config/x402-proxy/              → /home/node/.config/x402-proxy (rw, only if host dir exists)
 ```
 
 Env vars set in the container:
@@ -160,7 +159,7 @@ Env vars set in the container:
 - `SESSION_OUTBOUND_DB_PATH=/workspace/outbound.db`
 - `SESSION_HEARTBEAT_PATH=/workspace/.heartbeat`
 - `HOME=/home/node`
-- `ENABLE_SURF_MCP=true` (only if `~/.config/x402-proxy` exists)
+- `NANOCLAW_MCP_SERVERS=<json>` (per-group `container.json → mcpServers` passed through)
 
 Inspect what actually got mounted on the last run:
 ```bash
@@ -236,15 +235,19 @@ Agent's `settings.json` (per session):
 ```bash
 cat data/v2-sessions/<session_id>/.claude-shared/settings.json
 ```
-Should have `permissions.allow` including the MCP name (e.g., `mcp__surf__*`). Groups created before an MCP was added need their settings.json updated manually.
+Should have `permissions.allow` including the MCP name (e.g., `mcp__<name>__*`). Groups created before an MCP was added need their settings.json updated manually.
 
-For Surf specifically:
+Per-group MCP servers live in `groups/<folder>/container.json → mcpServers`. The host passes the whole blob to the container via `NANOCLAW_MCP_SERVERS` env; the agent-runner merges it into the SDK's MCP config. Supported transports: stdio (`{command, args, env}`), HTTP (`{type: 'http', url, headers}`), SSE (`{type: 'sse', url, headers}`).
+
 ```bash
-# Host side: x402-proxy wallet config present?
-ls ~/.config/x402-proxy/ 2>&1
+# What's actually declared for a group?
+cat groups/<folder>/container.json | jq .mcpServers
 
-# Container side: Surf MCP only registers if ENABLE_SURF_MCP=true and wallet dir mounted.
-grep "ENABLE_SURF_MCP\|mcpServers.surf\|surf" logs/nanoclaw.log | tail -5
+# What did the container see at boot?
+grep -E "Additional MCP server|mcpServers" groups/<folder>/logs/container-*.log | tail -10
+
+# HTTP/SSE handshake issues? Hit the URL from host to rule out auth/network:
+curl -i -H "Authorization: Bearer $TOKEN" <mcp-url>
 ```
 
 ### 7. Voice message stays silent (no transcript)
@@ -270,7 +273,7 @@ docker run --rm -it --entrypoint /bin/bash nanoclaw-agent:latest
 # Binary sanity
 docker run --rm --entrypoint sh nanoclaw-agent:latest -c \
   'yt-dlp --version; instaloader --version; deno --version; \
-   ffmpeg -version | head -1; which x402-proxy; claude --version; bun --version'
+   ffmpeg -version | head -1; claude --version; bun --version'
 
 # Spawn a real session container against a fake session dir
 SESS=/tmp/fake-session

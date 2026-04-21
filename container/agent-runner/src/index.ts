@@ -90,23 +90,14 @@ async function main(): Promise<void> {
     },
   };
 
-  // Surf MCP — enabled when ENABLE_SURF_MCP=true is set on the container
-  if (process.env.ENABLE_SURF_MCP === 'true') {
-    mcpServers.surf = {
-      command: 'npx',
-      args: ['x402-proxy', 'mcp', 'https://surf.cascade.fyi/mcp'],
-      env: {},
-    };
-    log('Surf MCP server enabled');
-  }
-
   // Merge additional MCP servers from host configuration
   if (process.env.NANOCLAW_MCP_SERVERS) {
     try {
-      const additional = JSON.parse(process.env.NANOCLAW_MCP_SERVERS) as Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+      const additional = JSON.parse(process.env.NANOCLAW_MCP_SERVERS) as Record<string, Record<string, unknown>>;
       for (const [name, config] of Object.entries(additional)) {
-        mcpServers[name] = config;
-        log(`Additional MCP server: ${name} (${config.command})`);
+        mcpServers[name] = config as typeof mcpServers[string];
+        const transport = typeof config.type === 'string' ? config.type : (typeof config.command === 'string' ? `stdio:${config.command}` : 'unknown');
+        log(`Additional MCP server: ${name} (${transport})`);
       }
     } catch (e) {
       log(`Failed to parse NANOCLAW_MCP_SERVERS: ${e}`);

@@ -308,12 +308,6 @@ async function buildContainerArgs(
     args.push('-e', `NANOCLAW_ASSISTANT_NAME=${agentGroup.name}`);
   }
 
-  // Surf MCP opt-in — when the x402-proxy wallet dir exists on the host, the
-  // agent gets the Surf MCP server (web/twitter/reddit/github search). Each
-  // agent group inherits the opt-in from the host config directory.
-  if (fs.existsSync(path.join(os.homedir(), '.config', 'x402-proxy'))) {
-    args.push('-e', 'ENABLE_SURF_MCP=true');
-  }
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_NAME=${agentGroup.name}`);
 
