@@ -568,11 +568,12 @@ registerChannelAdapter('telegram', {
         // "..." instead of splitting. Chunk long text messages here so nothing
         // is lost. Skip chunking when attachments/files are involved — those
         // paths have their own length rules (captions = 1024).
-        const text = typeof content.markdown === 'string'
-          ? (content.markdown as string)
-          : typeof content.text === 'string'
-            ? (content.text as string)
-            : '';
+        const text =
+          typeof content.markdown === 'string'
+            ? (content.markdown as string)
+            : typeof content.text === 'string'
+              ? (content.text as string)
+              : '';
         const hasFiles = !!(message.files && message.files.length > 0);
         if (text.length > TELEGRAM_SAFE_LIMIT && !hasFiles) {
           const chunks = chunkTelegramText(text, TELEGRAM_SAFE_LIMIT);
