@@ -426,6 +426,9 @@ async function sendMessageTextRaw(
     chat_id: chatId,
     text: html,
     parse_mode: 'HTML',
+    // Suppress URL link previews — the bot's replies shouldn't unfurl every
+    // link into a big preview card. Users who want a preview can click through.
+    link_preview_options: { is_disabled: true },
   };
   if (messageThreadId !== undefined) body.message_thread_id = messageThreadId;
   const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {

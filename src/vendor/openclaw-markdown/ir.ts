@@ -22,6 +22,9 @@ type MarkdownToken = {
   children?: MarkdownToken[];
   attrs?: [string, string][];
   attrGet?: (name: string) => string | null;
+  // DEVIATION from upstream (openclaw): exposed so em_open/em_close can
+  // branch on the delimiter character. See em_open case below.
+  markup?: string;
 };
 
 export type MarkdownStyle = 'bold' | 'italic' | 'strikethrough' | 'code' | 'code_block' | 'spoiler' | 'blockquote';
@@ -581,11 +584,17 @@ function renderTokens(tokens: MarkdownToken[], state: RenderState): void {
       case 'text':
         appendText(state, token.content ?? '');
         break;
+      // DEVIATION from upstream (openclaw): in strict CommonMark, `*x*` and
+      // `_x_` both produce em (italic). LLMs and Telegram's own MarkdownV2
+      // spec treat `*x*` as bold (single-star = bold, like legacy Markdown
+      // parse_mode). We honor that: asterisk-delimited em → bold,
+      // underscore-delimited em → italic. Markdown-it sets `markup: '*'` or
+      // `markup: '_'` on em tokens to distinguish.
       case 'em_open':
-        openStyle(state, 'italic');
+        openStyle(state, token.markup === '_' ? 'italic' : 'bold');
         break;
       case 'em_close':
-        closeStyle(state, 'italic');
+        closeStyle(state, token.markup === '_' ? 'italic' : 'bold');
         break;
       case 'strong_open':
         openStyle(state, 'bold');

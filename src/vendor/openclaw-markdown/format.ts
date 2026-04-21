@@ -74,7 +74,12 @@ export function markdownToTelegramHtml(
   const ir = markdownToIR(markdown ?? '', {
     linkify: true,
     enableSpoilers: true,
-    headingStyle: 'none',
+    // DEVIATION from upstream (openclaw): they default to 'none' (strip the
+    // `#` markers and render as plain text). Telegram HTML has no <h1>..<h6>,
+    // but rendering headings as plain text loses the visual emphasis the
+    // author intended. Promoting to bold is the standard Telegram-HTML
+    // convention for `# Heading`.
+    headingStyle: 'bold',
     blockquotePrefix: '',
     tableMode: options.tableMode,
   });
@@ -436,7 +441,12 @@ export function markdownToTelegramChunks(
   const ir = markdownToIR(markdown ?? '', {
     linkify: true,
     enableSpoilers: true,
-    headingStyle: 'none',
+    // DEVIATION from upstream (openclaw): they default to 'none' (strip the
+    // `#` markers and render as plain text). Telegram HTML has no <h1>..<h6>,
+    // but rendering headings as plain text loses the visual emphasis the
+    // author intended. Promoting to bold is the standard Telegram-HTML
+    // convention for `# Heading`.
+    headingStyle: 'bold',
     blockquotePrefix: '',
     tableMode: options.tableMode,
   });

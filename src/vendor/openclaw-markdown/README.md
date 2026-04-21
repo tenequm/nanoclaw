@@ -30,11 +30,28 @@ Consumed by `src/channels/telegram-render.ts`, which calls
 `tableMode` based on an empirical ~48-char width gate that upstream does not
 ship (see openclaw issue #36323).
 
+## Local deviations from upstream
+
+Telegram-specific dialect choices — search `DEVIATION` in the code for the
+exact sites.
+
+| Where | Deviation | Rationale |
+| --- | --- | --- |
+| `ir.ts` `MarkdownToken` type | adds `markup?: string` | surfaces markdown-it's em delimiter to the walker below |
+| `ir.ts` `em_open` / `em_close` handlers | `*x*` → bold, `_x_` → italic (strict CommonMark treats both as italic) | matches Telegram legacy/MarkdownV2 convention and LLM output assumptions — a user typing `*жирний*` expects bold, not italic |
+| `format.ts` `markdownToTelegramHtml` + `markdownToTelegramChunks` | `headingStyle: 'none'` → `'bold'` | Telegram HTML has no `<h1>..<h6>`; plain text loses the author's visual emphasis intent. Bold is the standard substitute |
+
+These three deltas are semantic ("how should arbitrary Markdown look in a
+Telegram HTML message"), not structural. Upstream openclaw is spec-strict
+CommonMark + table mode knobs; we collapse the knobs and bias the dialect
+toward what LLM output looks like in practice.
+
 ## Bumping
 
 1. `git fetch` upstream at a newer commit.
 2. Copy files again, re-flatten imports.
-3. Update the pinned commit SHA above.
-4. Re-run tests.
+3. **Re-apply the three deviations above** (grep `DEVIATION`).
+4. Update the pinned commit SHA above.
+5. Re-run tests.
 
-Do not hand-edit. Fixes belong upstream.
+Do not hand-edit beyond the documented deviations. Fixes belong upstream.
