@@ -23,7 +23,6 @@ import {
   sessionDir,
   inboundDbPath,
   outboundDbPath,
-  sessionsBaseDir,
 } from './session-manager.js';
 import { getSession, findSession } from './db/sessions.js';
 import type { InboundEvent } from './router.js';

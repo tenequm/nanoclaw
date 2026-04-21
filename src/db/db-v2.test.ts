@@ -13,7 +13,6 @@ import {
   createMessagingGroup,
   getMessagingGroup,
   getMessagingGroupByPlatform,
-  getAllMessagingGroups,
   updateMessagingGroup,
   deleteMessagingGroup,
   createMessagingGroupAgent,

@@ -6,17 +6,99 @@
  * delimiter counts, or malformed links are rejected by Telegram and dropped
  * after retries. Remove this once upstream ships real mode-aware conversion
  * (vercel/chat PR #367 adds the knob; a follow-up is needed for the converter).
+ *
+ * Also flattens GFM pipe-tables into nested bullet lists. Telegram has no
+ * native table support in any parse_mode, and the SDK's default of wrapping
+ * tables as `tableToAscii` inside a code fence produces an ASCII grid that
+ * line-wraps catastrophically on narrow mobile viewports. See vercel/chat
+ * `packages/adapter-telegram/src/markdown.ts` — the `isTableNode → code`
+ * rewrite is preserved even in the MarkdownV2 refactor (PR #407).
  */
 
 const CODE_PATTERN = /```[\s\S]*?```|`[^`\n]*`/g;
 const PLACEHOLDER_PREFIX = '\x00CODE';
 const PLACEHOLDER_SUFFIX = '\x00';
 
+const TABLE_SEPARATOR_PATTERN = /^\s*\|?\s*:?-{2,}:?(\s*\|\s*:?-{2,}:?)+\s*\|?\s*$/;
+const FENCE_PATTERN = /^\s*```/;
+
+function parseTableRow(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((cell) => cell.trim());
+}
+
+function flattenMarkdownTables(input: string): string {
+  const lines = input.split('\n');
+  const out: string[] = [];
+  let inFence = false;
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (FENCE_PATTERN.test(line)) {
+      inFence = !inFence;
+      out.push(line);
+      i++;
+      continue;
+    }
+    if (inFence) {
+      out.push(line);
+      i++;
+      continue;
+    }
+
+    const next = lines[i + 1];
+    const isTableStart = line.includes('|') && next !== undefined && TABLE_SEPARATOR_PATTERN.test(next);
+
+    if (!isTableStart) {
+      out.push(line);
+      i++;
+      continue;
+    }
+
+    const headers = parseTableRow(line);
+    let j = i + 2;
+    const rows: string[][] = [];
+    while (j < lines.length && lines[j].includes('|') && !FENCE_PATTERN.test(lines[j])) {
+      rows.push(parseTableRow(lines[j]));
+      j++;
+    }
+
+    for (const row of rows) {
+      const primary = (row[0] ?? '').trim();
+      if (primary) {
+        out.push(`- **${primary}**`);
+      }
+      for (let k = 1; k < row.length; k++) {
+        const label = (headers[k] ?? '').trim();
+        const value = (row[k] ?? '').trim();
+        if (!label && !value) continue;
+        if (label && value) {
+          out.push(`  - ${label}: ${value}`);
+        } else {
+          out.push(`  - ${label || value}`);
+        }
+      }
+    }
+    out.push('');
+    i = j;
+  }
+
+  return out.join('\n');
+}
+
 export function sanitizeTelegramLegacyMarkdown(input: string): string {
   if (!input) return input;
 
+  let text = flattenMarkdownTables(input);
+
   const codeSegments: string[] = [];
-  let text = input.replace(CODE_PATTERN, (m) => {
+  text = text.replace(CODE_PATTERN, (m) => {
     codeSegments.push(m);
     return `${PLACEHOLDER_PREFIX}${codeSegments.length - 1}${PLACEHOLDER_SUFFIX}`;
   });

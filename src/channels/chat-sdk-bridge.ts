@@ -21,7 +21,7 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
-import type { ChannelAdapter, ChannelSetup, ConversationConfig, InboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -71,16 +71,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
-  let conversations: Map<string, ConversationConfig>;
   let gatewayAbort: AbortController | null = null;
-
-  function buildConversationMap(configs: ConversationConfig[]): Map<string, ConversationConfig> {
-    const map = new Map<string, ConversationConfig>();
-    for (const conv of configs) {
-      map.set(conv.platformId, conv);
-    }
-    return map;
-  }
 
   async function messageToInbound(message: ChatMessage): Promise<InboundMessage> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -148,7 +139,6 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     async setup(hostConfig: ChannelSetup) {
       setupConfig = hostConfig;
-      conversations = buildConversationMap(hostConfig.conversations);
 
       state = new SqliteStateAdapter();
 
@@ -360,8 +350,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       return true;
     },
 
-    updateConversations(configs: ConversationConfig[]) {
-      conversations = buildConversationMap(configs);
+    updateConversations() {
+      // No-op: the bridge does not consult a conversation map today.
     },
   };
 

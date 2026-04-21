@@ -19,7 +19,7 @@ import {
   getSession,
   createPendingApproval,
 } from './db/sessions.js';
-import { getAgentGroup, createAgentGroup, updateAgentGroup, getAgentGroupByFolder } from './db/agent-groups.js';
+import { getAgentGroup, createAgentGroup, getAgentGroupByFolder } from './db/agent-groups.js';
 import { createDestination, getDestinationByName, hasDestination, normalizeName } from './db/agent-destinations.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import { pickApprovalDelivery, pickApprover } from './access.js';
@@ -29,12 +29,8 @@ import {
   markDelivered,
   markDeliveryFailed,
   migrateDeliveredTable,
-  insertTask,
-  cancelTask,
-  pauseTask,
-  resumeTask,
-  updateTask,
 } from './db/session-db.js';
+import { insertTask, cancelTask, pauseTask, resumeTask, updateTask } from './modules/scheduling/db.js';
 import { log } from './log.js';
 import { normalizeOptions, type RawOption } from './channels/ask-question.js';
 import {
@@ -42,11 +38,9 @@ import {
   openInboundDb,
   openOutboundDb,
   sessionDir,
-  inboundDbPath,
   resolveSession,
   writeDestinations,
   writeSessionMessage,
-  writeSystemResponse,
 } from './session-manager.js';
 import { resetContainerIdleTimer, wakeContainer } from './container-runner.js';
 import { initGroupFilesystem } from './group-init.js';

@@ -65,4 +65,35 @@ describe('sanitizeTelegramLegacyMarkdown', () => {
   it('preserves indented list structure', () => {
     expect(sanitizeTelegramLegacyMarkdown('  - nested')).toBe('  • nested');
   });
+
+  it('flattens a GFM pipe-table into nested bullets', () => {
+    const input =
+      '| Product | Price | Rating |\n' +
+      '|---------|-------|--------|\n' +
+      '| sleepling | €119.99 | 4.6★ |\n' +
+      '| Welldora | €129.99 | 4.7★ |';
+    const out = sanitizeTelegramLegacyMarkdown(input);
+    expect(out).not.toContain('|');
+    expect(out).toContain('• *sleepling*');
+    expect(out).toContain('  • Price: €119.99');
+    expect(out).toContain('  • Rating: 4.6★');
+    expect(out).toContain('• *Welldora*');
+  });
+
+  it('leaves tables inside fenced code blocks untouched', () => {
+    const input = '```\n| a | b |\n|---|---|\n| 1 | 2 |\n```';
+    expect(sanitizeTelegramLegacyMarkdown(input)).toBe(input);
+  });
+
+  it('skips flattening when the separator row is missing', () => {
+    const input = 'use | as a separator sometimes';
+    expect(sanitizeTelegramLegacyMarkdown(input)).toBe(input);
+  });
+
+  it('drops empty label:value pairs from a row', () => {
+    const input = '| Name | Extra |\n|------|-------|\n| Foo |  |';
+    const out = sanitizeTelegramLegacyMarkdown(input);
+    expect(out).toContain('• *Foo*');
+    expect(out).not.toContain('Extra:');
+  });
 });

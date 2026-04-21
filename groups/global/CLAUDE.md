@@ -66,36 +66,6 @@ When you learn something important:
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
-## Message Formatting
-
-Format messages based on the channel you're responding to. Check your group folder name:
-
-### Slack channels (folder starts with `slack_`)
-
-Use Slack mrkdwn syntax. Run `/slack-formatting` for the full reference. Key rules:
-- `*bold*` (single asterisks)
-- `_italic_` (underscores)
-- `<https://url|link text>` for links (NOT `[text](url)`)
-- `•` bullets (no numbered lists)
-- `:emoji:` shortcodes
-- `>` for block quotes
-- No `##` headings — use `*Bold text*` instead
-
-### WhatsApp/Telegram channels (folder starts with `whatsapp_` or `telegram_`)
-
-- `*bold*` (single asterisks, NEVER **double**)
-- `_italic_` (underscores)
-- `•` bullet points
-- ` ``` ` code blocks
-
-No `##` headings. No `[links](url)`. No `**double stars**`.
-
-### Discord channels (folder starts with `discord_`)
-
-Standard Markdown works: `**bold**`, `*italic*`, `[links](url)`, `# headings`.
-
----
-
 ## Installing Packages & Tools
 
 Your container is ephemeral — anything installed via `apt-get` or `pnpm install -g` is lost on restart. To install packages that persist, use the self-modification tools:

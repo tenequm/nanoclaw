@@ -84,7 +84,7 @@ Skills that run inside the agent container, not on the host. These teach the con
 
 **Location:** `container/skills/<name>/`
 
-**Examples:** `agent-browser` (web browsing), `capabilities` (/capabilities command), `status` (/status command), `slack-formatting` (Slack mrkdwn syntax)
+**Examples:** `agent-browser` (web browsing), `capabilities` (/capabilities command), `status` (/status command)
 
 **Key difference:** These are NOT invoked by the user on the host. They're loaded by Claude Code inside the container and influence how the agent behaves.
 

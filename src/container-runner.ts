@@ -29,7 +29,6 @@ import {
   type VolumeMount,
 } from './providers/provider-container-registry.js';
 import {
-  markContainerIdle,
   markContainerRunning,
   markContainerStopped,
   sessionDir,
@@ -131,15 +130,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
-  const args = await buildContainerArgs(
-    mounts,
-    containerName,
-    session,
-    agentGroup,
-    provider,
-    contribution,
-    agentIdentifier,
-  );
+  const args = await buildContainerArgs(mounts, containerName, agentGroup, provider, contribution, agentIdentifier);
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -288,7 +279,6 @@ function buildMounts(
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
-  session: Session,
   agentGroup: AgentGroup,
   provider: string,
   providerContribution: ProviderContainerContribution,

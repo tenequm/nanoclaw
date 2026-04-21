@@ -206,7 +206,7 @@ describe('channel + router integration', () => {
       factory: () => mockAdapter,
     });
 
-    await initChannelAdapters((adapter) => ({
+    await initChannelAdapters(() => ({
       conversations: [],
       onInbound: () => {},
       onMetadata: () => {},

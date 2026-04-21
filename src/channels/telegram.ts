@@ -568,12 +568,18 @@ registerChannelAdapter('telegram', {
         // "..." instead of splitting. Chunk long text messages here so nothing
         // is lost. Skip chunking when attachments/files are involved — those
         // paths have their own length rules (captions = 1024).
-        const text =
+        //
+        // Sanitize BEFORE chunking: table-flattening expands a single pipe-row
+        // into ~5 lines, so raw length can be under the limit while post-transform
+        // length exceeds it. The transform is idempotent, so the bridge applying
+        // it again on each chunk is a safe no-op.
+        const rawText =
           typeof content.markdown === 'string'
             ? (content.markdown as string)
             : typeof content.text === 'string'
               ? (content.text as string)
               : '';
+        const text = sanitizeTelegramLegacyMarkdown(rawText);
         const hasFiles = !!(message.files && message.files.length > 0);
         if (text.length > TELEGRAM_SAFE_LIMIT && !hasFiles) {
           const chunks = chunkTelegramText(text, TELEGRAM_SAFE_LIMIT);
