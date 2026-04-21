@@ -23,8 +23,19 @@
 import { parseFenceSpans } from '../vendor/openclaw-markdown/fences.js';
 import { markdownToTelegramHtml, splitTelegramHtmlChunks } from '../vendor/openclaw-markdown/format.js';
 
-/** Empirical mobile-client break point — measured against the user's phone. */
-const TABLE_WIDTH_LIMIT = 48;
+/**
+ * Max rendered-table width before we flatten to bullets. Derived from the
+ * Telegram-iOS layout formula: `bubble = screenWidth - 36pt`; code block uses
+ * `fixedFont` (~SF Mono 15pt ≈ 9pt/char) with ~20pt internal padding, so
+ * per-line capacity on an iPhone 14 (390pt) is roughly
+ * `(390 - 36 - 20) / 9 ≈ 37` chars.
+ *
+ * 38 is one char above that floor — middle-ground coverage for iPhone 14+
+ * class devices. Plus/Pro Max (screen ≥ 428pt) fit ~41+ chars comfortably;
+ * iPhone SE (375pt) capacity is ~35 so it may wrap at this limit. If iPhone
+ * 14 users report wrap, drop to 37.
+ */
+const TABLE_WIDTH_LIMIT = 38;
 
 const TABLE_SEPARATOR_PATTERN = /^\s*\|?\s*:?-{2,}:?(\s*\|\s*:?-{2,}:?)+\s*\|?\s*$/;
 
