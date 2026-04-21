@@ -33,7 +33,7 @@ import { grantRole, hasAnyOwner } from '../db/user-roles.js';
 import { upsertUser } from '../db/users.js';
 import { transcribeAudio } from '../transcription.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
-import { flattenTablesForTelegram } from './telegram-markdown-sanitize.js';
+import { renderTelegramHtmlChunks } from './telegram-render.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
 import { tryConsume } from './telegram-pairing.js';
@@ -98,29 +98,6 @@ function chatIdFromPlatformId(platformId: string): string {
  * the ellipsis never triggers and mid-word cuts are unlikely.
  */
 const TELEGRAM_SAFE_LIMIT = 3800;
-
-/**
- * Split long text into chunks under `maxLen` at natural boundaries.
- * Prefers paragraph breaks, falls back to newlines, then spaces, and as a
- * last resort does a hard slice — always yielding at least one chunk.
- */
-export function chunkTelegramText(text: string, maxLen: number): string[] {
-  if (text.length <= maxLen) return [text];
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > maxLen) {
-    // Look for a good split point inside the first maxLen chars, prefer later.
-    const head = remaining.slice(0, maxLen);
-    let splitAt = head.lastIndexOf('\n\n');
-    if (splitAt < maxLen / 2) splitAt = head.lastIndexOf('\n');
-    if (splitAt < maxLen / 2) splitAt = head.lastIndexOf(' ');
-    if (splitAt <= 0) splitAt = maxLen;
-    chunks.push(remaining.slice(0, splitAt).trimEnd());
-    remaining = remaining.slice(splitAt).replace(/^\s+/, '');
-  }
-  if (remaining.length > 0) chunks.push(remaining);
-  return chunks;
-}
 
 interface InboundFields {
   text: string;
@@ -527,7 +504,6 @@ registerChannelAdapter('telegram', {
       concurrency: 'concurrent',
       extractReplyContext,
       supportsThreads: false,
-      transformOutboundText: flattenTablesForTelegram,
     });
 
     const botUsernamePromise = fetchBotUsername(token);
@@ -593,32 +569,27 @@ registerChannelAdapter('telegram', {
           }
         }
 
-        // Telegram's 4096-char limit: the adapter just truncates + appends
-        // "..." instead of splitting. Chunk long text messages here so nothing
-        // is lost. Skip chunking when attachments/files are involved — those
-        // paths have their own length rules (captions = 1024).
+        // Text-only messages: render markdown → Telegram HTML via the vendored
+        // openclaw pipeline, chunk at the HTML level (tags never split), and
+        // send each chunk directly with parse_mode=HTML, bypassing the
+        // vercel/chat adapter's MarkdownV2 path. See src/channels/telegram-render.ts.
         //
-        // Flatten tables BEFORE chunking: a single pipe-row expands into ~5
-        // lines, so raw length can be under the limit while post-transform
-        // length exceeds it. The transform is idempotent, so the bridge applying
-        // it again on each chunk is a safe no-op.
+        // Messages with attachments fall through to the bridge — it handles
+        // media captions (1024-char limit) on its own send path.
         const rawText =
           typeof content.markdown === 'string'
             ? (content.markdown as string)
             : typeof content.text === 'string'
               ? (content.text as string)
               : '';
-        const text = flattenTablesForTelegram(rawText);
         const hasFiles = !!(message.files && message.files.length > 0);
-        if (text.length > TELEGRAM_SAFE_LIMIT && !hasFiles) {
-          const chunks = chunkTelegramText(text, TELEGRAM_SAFE_LIMIT);
+        if (rawText && !hasFiles) {
+          const chunks = renderTelegramHtmlChunks(rawText, TELEGRAM_SAFE_LIMIT);
+          const chatId = chatIdFromPlatformId(platformId);
+          const topicId = parseThreadId(threadId);
           let lastId: string | undefined;
-          for (const chunk of chunks) {
-            const part: OutboundMessage = {
-              ...message,
-              content: { ...(content as Record<string, unknown>), text: chunk, markdown: chunk },
-            };
-            lastId = await bridge.deliver(platformId, threadId, part);
+          for (const html of chunks) {
+            lastId = await sendMessageTextRaw(token, chatId, html, topicId);
           }
           clearPendingSeen(telegramAdapter, pendingSeen, reactionKey);
           return lastId;
