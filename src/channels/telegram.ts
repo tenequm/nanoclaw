@@ -33,7 +33,7 @@ import { grantRole, hasAnyOwner } from '../db/user-roles.js';
 import { upsertUser } from '../db/users.js';
 import { transcribeAudio } from '../transcription.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
-import { sanitizeTelegramLegacyMarkdown } from './telegram-markdown-sanitize.js';
+import { flattenTablesForTelegram } from './telegram-markdown-sanitize.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
 import { tryConsume } from './telegram-pairing.js';
@@ -435,6 +435,35 @@ async function sendMediaGroupRaw(
   }
 }
 
+/**
+ * POST sendMessage with parse_mode=HTML. Used by the direct-send path that
+ * bypasses the vercel/chat adapter for text (see deliver() below).
+ */
+async function sendMessageTextRaw(
+  token: string,
+  chatId: string,
+  html: string,
+  messageThreadId?: number,
+): Promise<string | undefined> {
+  const body: Record<string, unknown> = {
+    chat_id: chatId,
+    text: html,
+    parse_mode: 'HTML',
+  };
+  if (messageThreadId !== undefined) body.message_thread_id = messageThreadId;
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`sendMessage failed: ${res.status} ${errText}`);
+  }
+  const json = (await res.json()) as { ok: boolean; result?: { message_id?: number } };
+  return json.result?.message_id != null ? String(json.result.message_id) : undefined;
+}
+
 async function sendVideoRaw(
   token: string,
   chatId: string,
@@ -498,7 +527,7 @@ registerChannelAdapter('telegram', {
       concurrency: 'concurrent',
       extractReplyContext,
       supportsThreads: false,
-      transformOutboundText: sanitizeTelegramLegacyMarkdown,
+      transformOutboundText: flattenTablesForTelegram,
     });
 
     const botUsernamePromise = fetchBotUsername(token);
@@ -569,8 +598,8 @@ registerChannelAdapter('telegram', {
         // is lost. Skip chunking when attachments/files are involved — those
         // paths have their own length rules (captions = 1024).
         //
-        // Sanitize BEFORE chunking: table-flattening expands a single pipe-row
-        // into ~5 lines, so raw length can be under the limit while post-transform
+        // Flatten tables BEFORE chunking: a single pipe-row expands into ~5
+        // lines, so raw length can be under the limit while post-transform
         // length exceeds it. The transform is idempotent, so the bridge applying
         // it again on each chunk is a safe no-op.
         const rawText =
@@ -579,7 +608,7 @@ registerChannelAdapter('telegram', {
             : typeof content.text === 'string'
               ? (content.text as string)
               : '';
-        const text = sanitizeTelegramLegacyMarkdown(rawText);
+        const text = flattenTablesForTelegram(rawText);
         const hasFiles = !!(message.files && message.files.length > 0);
         if (text.length > TELEGRAM_SAFE_LIMIT && !hasFiles) {
           const chunks = chunkTelegramText(text, TELEGRAM_SAFE_LIMIT);
