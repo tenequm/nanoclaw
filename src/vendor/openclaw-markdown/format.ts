@@ -56,6 +56,7 @@ function renderTelegramHtml(ir: MarkdownIR): string {
     styleMarkers: {
       bold: { open: '<b>', close: '</b>' },
       italic: { open: '<i>', close: '</i>' },
+      underline: { open: '<u>', close: '</u>' },
       strikethrough: { open: '<s>', close: '</s>' },
       code: { open: '<code>', close: '</code>' },
       code_block: { open: '<pre><code>', close: '</code></pre>' },

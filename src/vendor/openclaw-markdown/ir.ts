@@ -27,7 +27,15 @@ type MarkdownToken = {
   markup?: string;
 };
 
-export type MarkdownStyle = 'bold' | 'italic' | 'strikethrough' | 'code' | 'code_block' | 'spoiler' | 'blockquote';
+export type MarkdownStyle =
+  | 'bold'
+  | 'italic'
+  | 'underline'
+  | 'strikethrough'
+  | 'code'
+  | 'code_block'
+  | 'spoiler'
+  | 'blockquote';
 
 export type MarkdownStyleSpan = {
   start: number;
@@ -599,11 +607,16 @@ function renderTokens(tokens: MarkdownToken[], state: RenderState): void {
       case 'em_close':
         closeStyle(state, token.markup === '_' ? 'italic' : 'bold');
         break;
+      // DEVIATION from upstream (openclaw): in strict CommonMark both `**x**`
+      // and `__x__` produce strong (bold). Telegram's MarkdownV2 and LLM
+      // output-for-Telegram use `__x__` for underline — the only markdown
+      // shorthand that exists for it. Consistent with the `*`/`_` em split
+      // above: markup with `*` → bold, with `_` → underline.
       case 'strong_open':
-        openStyle(state, 'bold');
+        openStyle(state, token.markup === '__' ? 'underline' : 'bold');
         break;
       case 'strong_close':
-        closeStyle(state, 'bold');
+        closeStyle(state, token.markup === '__' ? 'underline' : 'bold');
         break;
       case 's_open':
         openStyle(state, 'strikethrough');

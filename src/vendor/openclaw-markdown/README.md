@@ -39,6 +39,7 @@ exact sites.
 | --- | --- | --- |
 | `ir.ts` `MarkdownToken` type | adds `markup?: string` | surfaces markdown-it's em delimiter to the walker below |
 | `ir.ts` `em_open` / `em_close` handlers | `*x*` → bold, `_x_` → italic (strict CommonMark treats both as italic) | matches Telegram legacy/MarkdownV2 convention and LLM output assumptions — a user typing `*жирний*` expects bold, not italic |
+| `ir.ts` `MarkdownStyle` type + `strong_open` / `strong_close` handlers | `**x**` → bold, `__x__` → underline (strict CommonMark treats both as strong/bold) | consistent with the em split above; Telegram MarkdownV2 and LLM output-for-Telegram (Discord too) use `__x__` for underline. Threaded through `render.ts` STYLE_ORDER + `format.ts` styleMarkers (`<u>`/`</u>`) |
 | `format.ts` `markdownToTelegramHtml` + `markdownToTelegramChunks` | `headingStyle: 'none'` → `'bold'` | Telegram HTML has no `<h1>..<h6>`; plain text loses the author's visual emphasis intent. Bold is the standard substitute |
 | `ir.ts` `renderTableAsCode` `appendRow` + `appendDivider` | drop outer `|` delimiters (`cell \| cell` instead of `\| cell \| cell \|`) | 4 chars less width per line; pushes the mobile-viewport wrap threshold later. Alignment is still clear in monospace |
 

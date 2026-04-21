@@ -156,10 +156,26 @@ export function renderTelegramHtmlChunks(markdown: string, safeLimit: number): s
     parts.push(markdownToTelegramHtml(tail, { tableMode: 'off' }));
   }
 
-  // Glue fragments with a blank line so consecutive segments aren't visually
-  // fused. Adjacent block-level outputs (e.g. `<pre><code>..</pre>` + prose)
-  // already carry their own trailing whitespace from openclaw; one extra
-  // newline between parts is enough to keep vertical rhythm.
-  const html = parts.join('\n');
+  // Glue fragments with a blank line so consecutive segments read as
+  // separate paragraphs. `\n\n` matches openclaw's own paragraph-separator
+  // convention; each segment already trims its trailing whitespace in
+  // `markdownToIRWithMeta`, so this never stacks to triple newlines.
+  const html = expandLongBlockquotes(parts.join('\n\n'));
   return splitTelegramHtmlChunks(html, safeLimit);
+}
+
+/**
+ * Telegram's `<blockquote expandable>` renders with a tap-to-expand toggle,
+ * saving vertical scroll on long quotes. Applied post-render so the decision
+ * stays outside the vendored renderer and is cheap to tune.
+ *
+ * Threshold is on text length with tags stripped — empirically, quotes under
+ * ~300 chars feel natural displayed fully; longer ones crowd the screen.
+ */
+const BLOCKQUOTE_EXPAND_THRESHOLD = 300;
+function expandLongBlockquotes(html: string): string {
+  return html.replace(/<blockquote>([\s\S]*?)<\/blockquote>/g, (match, inner: string) => {
+    const textLength = inner.replace(/<[^>]+>/g, '').length;
+    return textLength > BLOCKQUOTE_EXPAND_THRESHOLD ? `<blockquote expandable>${inner}</blockquote>` : match;
+  });
 }
