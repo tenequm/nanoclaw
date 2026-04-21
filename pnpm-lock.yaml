@@ -4,18 +4,13 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-patchedDependencies:
-  '@chat-adapter/telegram@4.26.0':
-    hash: ad76ddc6bcad03632807f1b39fedfbb026f019b6412cb65f6a1ea3650b27a836
-    path: patches/@chat-adapter__telegram@4.26.0.patch
-
 importers:
 
   .:
     dependencies:
       '@chat-adapter/telegram':
         specifier: ^4.26.0
-        version: 4.26.0(patch_hash=ad76ddc6bcad03632807f1b39fedfbb026f019b6412cb65f6a1ea3650b27a836)
+        version: 4.26.0
       '@onecli-sh/sdk':
         specifier: ^0.3.1
         version: 0.3.1
@@ -1533,7 +1528,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  '@chat-adapter/telegram@4.26.0(patch_hash=ad76ddc6bcad03632807f1b39fedfbb026f019b6412cb65f6a1ea3650b27a836)':
+  '@chat-adapter/telegram@4.26.0':
     dependencies:
       '@chat-adapter/shared': 4.26.0
       chat: 4.26.0
