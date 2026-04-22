@@ -82,6 +82,17 @@ A second tier (direct source-level self-edits via a draft/activate flow) is plan
 
 API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway. Secrets are injected into per-agent containers at request time — none are passed in env vars or through chat context. `src/onecli-approvals.ts`, `ensureAgent()` in `container-runner.ts`. Run `onecli --help`.
 
+## Per-agent Claude config (model, effortLevel, autoCompactWindow, …)
+
+Per-agent Claude Agent SDK options live in the agent's **user-level** Claude Code settings file — we do NOT thread them through `container.json` or host code. The SDK loads this file via our existing `settingSources: ['project', 'user']` option.
+
+- Host path: `data/v2-sessions/<agent_group_id>/.claude-shared/settings.json`
+- Container mount: `/home/node/.claude/settings.json` (read-write, `container-runner.ts:268`)
+- Documented precedent: `docs/ollama.md` sets `"model"` here
+- Schema: see the SDK's `Settings` interface in `@anthropic-ai/claude-agent-sdk/sdk.d.ts` — includes `model`, `effortLevel`, `autoCompactWindow`, `alwaysThinkingEnabled`, and many more
+
+To switch one agent: edit that file, wait for the container to respawn (or restart the service). Zero code changes needed — this is Claude Code's native settings mechanism.
+
 ## Skills
 
 Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxonomy.
