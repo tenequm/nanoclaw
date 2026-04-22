@@ -52,13 +52,13 @@ Exactly one writer per file — no cross-mount lock contention. Heartbeat is a f
 | `src/access.ts` | `pickApprover`, `pickApprovalDelivery`, admin resolution for `NANOCLAW_ADMIN_USER_IDS` |
 | `src/onecli-approvals.ts` | OneCLI credentialed-action approval bridge |
 | `src/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
-| `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills, agent-runner-src overlay) |
+| `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.local.md, skills, container.json) |
 | `src/db/` | DB layer — agent_groups, messaging_groups, sessions, user_roles, user_dms, pending_*, migrations |
 | `src/channels/` | Channel adapter infra (registry, Chat SDK bridge); specific channel adapters are skill-installed from the `channels` branch |
 | `src/providers/` | Host-side provider container-config (`claude` baked in; `opencode` etc. installed from the `providers` branch) |
 | `container/agent-runner/src/` | Agent-runner: poll loop, formatter, provider abstraction, MCP tools, destinations |
 | `container/skills/` | Container skills mounted into every agent session |
-| `groups/<folder>/` | Per-agent-group filesystem (CLAUDE.md, skills, per-group `agent-runner-src/` overlay) |
+| `groups/<folder>/` | Per-agent-group filesystem (`CLAUDE.local.md`, skills, `container.json`). Agent-runner source is shared RO from `container/agent-runner/src/` — no per-group overlay. |
 | `scripts/init-first-agent.ts` | Bootstrap the first DM-wired agent (used by `/init-first-agent` skill) |
 
 ## Channels and Providers (skill-installed)
