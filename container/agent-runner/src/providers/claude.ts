@@ -226,8 +226,13 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 /**
  * Claude Code auto-compacts context at this window (tokens). Kept here so
  * the generic bootstrap doesn't need to know about Claude-specific env vars.
+ *
+ * Currently disabled — env var takes priority over settings.json, so setting
+ * this clamps every agent to 165k regardless of their configured model's
+ * native context window. Leaving it unset lets settings.json's
+ * `autoCompactWindow` (or the native model ceiling) take effect.
  */
-const CLAUDE_CODE_AUTO_COMPACT_WINDOW = '165000';
+// const CLAUDE_CODE_AUTO_COMPACT_WINDOW = '165000';
 
 /**
  * Stale-session detection. Matches Claude Code's error text when a
@@ -250,7 +255,7 @@ export class ClaudeProvider implements AgentProvider {
     this.additionalDirectories = options.additionalDirectories;
     this.env = {
       ...(options.env ?? {}),
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+      // CLAUDE_CODE_AUTO_COMPACT_WINDOW,
     };
   }
 
