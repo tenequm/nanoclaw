@@ -153,10 +153,11 @@ Container tools added:
   curl_cffi secretstorage xattr`.
 - **deno:** official installer to `/usr/local`, needed for yt-dlp's modern
   YouTube signature extractors.
-- **x402-proxy:** installed via `npm install -g "x402-proxy@${X402_PROXY_VERSION}"`.
-  Uses npm (not pnpm) to bypass the host's `minimumReleaseAge` supply-chain
-  policy, since the install happens inside the image build, not against the
-  host workspace. New `ARG X402_PROXY_VERSION=latest`.
+
+**Note (2026-04-22):** the original Stage 3 also shipped `x402-proxy` baked
+into the image. Stage 5.4 supersedes that — Surf is now declared per-group
+via `container.json → mcpServers` with HTTP transport, so x402-proxy no
+longer needs to be in the image at all. Do not re-install it.
 
 Container skill added:
 - `container/skills/media-download/SKILL.md` — documents the yt-dlp/instaloader

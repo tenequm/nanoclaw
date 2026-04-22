@@ -8,8 +8,6 @@ The host is a single Node process that orchestrates per-session agent containers
 
 **Everything is a message.** There is no IPC, no file watcher, no stdin piping between host and container. The two session DBs are the sole IO surface.
 
-A `src/v1/` tree exists for historical reference and is not part of the runtime — ignore it unless you're explicitly working on a migration.
-
 ## Entity Model
 
 ```
