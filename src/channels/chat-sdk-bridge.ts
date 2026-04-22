@@ -336,12 +336,17 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // Ask question card — render as Card with buttons
       if (content.type === 'ask_question' && content.questionId && content.options) {
         const questionId = content.questionId as string;
-        const title = content.title as string;
-        const question = content.question as string;
-        if (!title) {
+        const rawTitle = content.title as string;
+        const rawQuestion = content.question as string;
+        if (!rawTitle) {
           log.error('ask_question missing required title — skipping delivery', { questionId });
           return;
         }
+        // Apply the same outbound-text sanitization as normal messages so an
+        // approval question containing `GH_TOKEN` etc. doesn't crash Telegram's
+        // legacy Markdown parser on unmatched `_` / `*`.
+        const title = transformText(rawTitle);
+        const question = transformText(rawQuestion || '');
         const options: NormalizedOption[] = normalizeOptions(content.options as never);
         const card = Card({
           title,

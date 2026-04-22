@@ -56,6 +56,41 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
        fi \
     && rm -rf /var/lib/apt/lists/*
 
+# ---- Media stack (yt-dlp / instaloader / ffmpeg) -----------------------------
+# Used by the media-download container skill. yt-dlp needs Deno for modern
+# YouTube signature extractors; the pip installs go through
+# --break-system-packages since apt-packaged Python on Debian slim is PEP 668
+# managed and pip would otherwise refuse.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        atomicparsley \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --break-system-packages --no-cache-dir \
+        yt-dlp yt-dlp-ejs instaloader mutagen pycryptodomex \
+        brotli websockets requests certifi curl_cffi secretstorage xattr
+
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+
+# ---- GitHub CLI (gh) ---------------------------------------------------------
+# Install gh so agents can run `gh pr list`, `gh repo view`, etc. The
+# Dockerfile ENV placeholder satisfies gh's local auth check when the host
+# isn't authenticated; container-runner.ts overrides GH_TOKEN with the host's
+# real `gh auth token` at spawn when available.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV GH_TOKEN=placeholder
+
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
