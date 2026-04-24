@@ -79,11 +79,7 @@ export class AdapterConfigService extends Context.Service<
   AdapterConfigService,
   {
     readonly token: string;
-    readonly onInbound: (
-      platformId: string,
-      threadId: string | null,
-      message: InboundMessage,
-    ) => Effect.Effect<void>;
+    readonly onInbound: (platformId: string, threadId: string | null, message: InboundMessage) => Effect.Effect<void>;
     readonly onMetadata: ChannelSetup['onMetadata'];
     readonly onAction: ChannelSetup['onAction'];
   }

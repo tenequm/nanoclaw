@@ -23,12 +23,7 @@ import { Effect } from 'effect';
 import { resolveGroupFolderPath } from '../../group-folder.js';
 import { AttachmentFetchFailed, AttachmentTooLarge } from './errors.js';
 import type { InboundAttachment } from './inbound.js';
-import {
-  AdapterConfigService,
-  BotService,
-  GroupFolderService,
-  TranscriptionService,
-} from './services.js';
+import { AdapterConfigService, BotService, GroupFolderService, TranscriptionService } from './services.js';
 
 const MAX_FILE_SIZE_BYTES = 20_000_000;
 
@@ -73,85 +68,85 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
   index: number,
   platformId: string,
 ) {
-    const { bot } = yield* BotService;
-    const folderSvc = yield* GroupFolderService;
-    const config = yield* AdapterConfigService;
-    const transcriber = yield* TranscriptionService;
+  const { bot } = yield* BotService;
+  const folderSvc = yield* GroupFolderService;
+  const config = yield* AdapterConfigService;
+  const transcriber = yield* TranscriptionService;
 
-    // contact / location have no Telegram file — they're pure payload
-    // surfaced via the attachment metadata (name field). Skip download.
-    if (!att.fileId) return att;
+  // contact / location have no Telegram file — they're pure payload
+  // surfaced via the attachment metadata (name field). Skip download.
+  if (!att.fileId) return att;
 
-    const folder = yield* folderSvc.resolveForPlatformId(platformId);
-    if (!folder) {
-      // Pre-pairing — chat isn't wired to an agent yet. Leave the metadata
-      // in place so the pairing flow can inspect it; bytes are intentionally
-      // dropped because we have nowhere to put them.
-      return att;
-    }
-
-    const file = yield* Effect.tryPromise({
-      try: () => bot.api.getFile(att.fileId),
-      catch: (cause) => new AttachmentFetchFailed({ fileId: att.fileId, cause }),
-    });
-
-    const size = file.file_size ?? att.size ?? 0;
-    if (size > MAX_FILE_SIZE_BYTES) {
-      yield* Effect.logWarning('telegram-grammy: attachment exceeds 20MB, keeping metadata only', {
-        fileId: att.fileId,
-        size,
-      });
-      return yield* Effect.fail(new AttachmentTooLarge({ fileId: att.fileId, size }));
-    }
-
-    const remotePath = file.file_path;
-    if (!remotePath) {
-      return yield* Effect.fail(
-        new AttachmentFetchFailed({ fileId: att.fileId, cause: new Error('getFile returned no file_path') }),
-      );
-    }
-
-    const groupDir = resolveGroupFolderPath(folder);
-    const attachDir = path.join(groupDir, 'attachments');
-    yield* Effect.tryPromise({
-      try: () => fs.mkdir(attachDir, { recursive: true }),
-      catch: (cause) => new AttachmentFetchFailed({ fileId: att.fileId, cause }),
-    });
-
-    const fileName = destFilename(att, msgId, index, remotePath);
-    const destPath = path.join(attachDir, fileName);
-    const url = `https://api.telegram.org/file/bot${config.token}/${remotePath}`;
-
-    yield* Effect.acquireUseRelease(
-      Effect.sync(() => createWriteStream(destPath)),
-      (stream) =>
-        Effect.tryPromise({
-          try: async () => {
-            const res = await fetch(url);
-            if (!res.ok || !res.body) {
-              throw new Error(`Telegram file download ${res.status}`);
-            }
-            // Node types ReadableStream differently than the web API; the
-            // Readable.fromWeb cast is the standard way to bridge.
-            await pipeline(Readable.fromWeb(res.body as unknown as WebReadableStream<Uint8Array>), stream);
-          },
-          catch: (cause) => new AttachmentFetchFailed({ fileId: att.fileId, cause }),
-        }),
-      (stream) =>
-        Effect.sync(() => {
-          if (!stream.destroyed) stream.destroy();
-        }),
-    );
-
-    att.localPath = `agent/attachments/${fileName}`;
-
-    const ext = path.extname(fileName).toLowerCase();
-    if (att.type === 'voice' || att.type === 'audio' || VOICE_EXTS.has(ext)) {
-      const transcript = yield* transcriber.transcribe(destPath);
-      if (transcript) att.transcript = transcript;
-    }
-
+  const folder = yield* folderSvc.resolveForPlatformId(platformId);
+  if (!folder) {
+    // Pre-pairing — chat isn't wired to an agent yet. Leave the metadata
+    // in place so the pairing flow can inspect it; bytes are intentionally
+    // dropped because we have nowhere to put them.
     return att;
+  }
+
+  const file = yield* Effect.tryPromise({
+    try: () => bot.api.getFile(att.fileId),
+    catch: (cause) => new AttachmentFetchFailed({ fileId: att.fileId, cause }),
+  });
+
+  const size = file.file_size ?? att.size ?? 0;
+  if (size > MAX_FILE_SIZE_BYTES) {
+    yield* Effect.logWarning('telegram-grammy: attachment exceeds 20MB, keeping metadata only', {
+      fileId: att.fileId,
+      size,
+    });
+    return yield* Effect.fail(new AttachmentTooLarge({ fileId: att.fileId, size }));
+  }
+
+  const remotePath = file.file_path;
+  if (!remotePath) {
+    return yield* Effect.fail(
+      new AttachmentFetchFailed({ fileId: att.fileId, cause: new Error('getFile returned no file_path') }),
+    );
+  }
+
+  const groupDir = resolveGroupFolderPath(folder);
+  const attachDir = path.join(groupDir, 'attachments');
+  yield* Effect.tryPromise({
+    try: () => fs.mkdir(attachDir, { recursive: true }),
+    catch: (cause) => new AttachmentFetchFailed({ fileId: att.fileId, cause }),
+  });
+
+  const fileName = destFilename(att, msgId, index, remotePath);
+  const destPath = path.join(attachDir, fileName);
+  const url = `https://api.telegram.org/file/bot${config.token}/${remotePath}`;
+
+  yield* Effect.acquireUseRelease(
+    Effect.sync(() => createWriteStream(destPath)),
+    (stream) =>
+      Effect.tryPromise({
+        try: async () => {
+          const res = await fetch(url);
+          if (!res.ok || !res.body) {
+            throw new Error(`Telegram file download ${res.status}`);
+          }
+          // Node types ReadableStream differently than the web API; the
+          // Readable.fromWeb cast is the standard way to bridge.
+          await pipeline(Readable.fromWeb(res.body as unknown as WebReadableStream<Uint8Array>), stream);
+        },
+        catch: (cause) => new AttachmentFetchFailed({ fileId: att.fileId, cause }),
+      }),
+    (stream) =>
+      Effect.sync(() => {
+        if (!stream.destroyed) stream.destroy();
+      }),
+  );
+
+  att.localPath = `agent/attachments/${fileName}`;
+
+  const ext = path.extname(fileName).toLowerCase();
+  if (att.type === 'voice' || att.type === 'audio' || VOICE_EXTS.has(ext)) {
+    const transcript = yield* transcriber.transcribe(destPath);
+    if (transcript) att.transcript = transcript;
+  }
+
+  return att;
 });
 
 /**

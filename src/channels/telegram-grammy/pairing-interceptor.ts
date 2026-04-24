@@ -41,50 +41,44 @@ const sendWelcome = Effect.fn('telegram-grammy.sendWelcome')(function* (chatId: 
  * Try to consume an inbound message as a pairing code.
  * Returns true iff the message was consumed and should NOT be forwarded to the router.
  */
-export const tryPair = Effect.fn('telegram-grammy.tryPair')(
-  function* (
-    chatId: number,
-    platformId: string,
-    isGroup: boolean,
-    chatName: string | null,
-    message: InboundMessage,
-  ) {
-    const pairing = yield* PairingService;
-    const { me } = yield* BotService;
+export const tryPair = Effect.fn('telegram-grammy.tryPair')(function* (
+  chatId: number,
+  platformId: string,
+  isGroup: boolean,
+  chatName: string | null,
+  message: InboundMessage,
+) {
+  const pairing = yield* PairingService;
+  const { me } = yield* BotService;
 
-    if (!isInboundContent(message.content)) return false;
-    const text = message.content.text;
-    const authorUserId = message.content.author.userId;
-    const adminUserIdBare = authorUserId.startsWith('telegram:') ? authorUserId.slice('telegram:'.length) : authorUserId;
-    if (!text || !me.username) return false;
+  if (!isInboundContent(message.content)) return false;
+  const text = message.content.text;
+  const authorUserId = message.content.author.userId;
+  const adminUserIdBare = authorUserId.startsWith('telegram:') ? authorUserId.slice('telegram:'.length) : authorUserId;
+  if (!text || !me.username) return false;
 
-    const record = yield* pairing
-      .tryConsume({
-        text,
-        botUsername: me.username,
-        platformId,
-        isGroup,
-        name: chatName,
-        adminUserId: adminUserIdBare,
-      })
-      .pipe(
-        Effect.catch((err) =>
-          Effect.as(Effect.logError('telegram-grammy: tryConsume failed', err), null),
-        ),
-      );
-
-    if (!record) return false;
-
-    yield* pairing
-      .persistConsumed(record, platformId)
-      .pipe(Effect.catch((err) => Effect.logError('telegram-grammy: persistConsumed failed', err)));
-
-    yield* Effect.logInfo('telegram-grammy: pairing accepted', {
+  const record = yield* pairing
+    .tryConsume({
+      text,
+      botUsername: me.username,
       platformId,
-      intent: record.intent,
-    });
+      isGroup,
+      name: chatName,
+      adminUserId: adminUserIdBare,
+    })
+    .pipe(Effect.catch((err) => Effect.as(Effect.logError('telegram-grammy: tryConsume failed', err), null)));
 
-    yield* sendWelcome(chatId);
-    return true;
-  },
-);
+  if (!record) return false;
+
+  yield* pairing
+    .persistConsumed(record, platformId)
+    .pipe(Effect.catch((err) => Effect.logError('telegram-grammy: persistConsumed failed', err)));
+
+  yield* Effect.logInfo('telegram-grammy: pairing accepted', {
+    platformId,
+    intent: record.intent,
+  });
+
+  yield* sendWelcome(chatId);
+  return true;
+});

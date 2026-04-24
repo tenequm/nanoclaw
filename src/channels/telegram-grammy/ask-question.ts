@@ -30,7 +30,10 @@ export interface BuildKeyboardResult {
  * long labels render consistently across mobile/desktop. If a consumer
  * wants side-by-side buttons, they can batch options in the payload.
  */
-export function buildAskQuestionKeyboard(questionId: string, options: readonly NormalizedOption[]): BuildKeyboardResult {
+export function buildAskQuestionKeyboard(
+  questionId: string,
+  options: readonly NormalizedOption[],
+): BuildKeyboardResult {
   const kb = new InlineKeyboard();
   const skippedLabels: string[] = [];
   let first = true;

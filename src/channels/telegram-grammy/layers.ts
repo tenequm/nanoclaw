@@ -15,11 +15,7 @@ import { Effect, Layer, Schedule } from 'effect';
 import { Bot } from 'grammy';
 import { autoRetry } from '@grammyjs/auto-retry';
 
-import {
-  createMessagingGroup,
-  getMessagingGroupByPlatform,
-  updateMessagingGroup,
-} from '../../db/messaging-groups.js';
+import { createMessagingGroup, getMessagingGroupByPlatform, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { resolveGroupFolderForPlatformId } from '../../group-folder.js';
 import { grantRole, hasAnyOwner } from '../../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../../modules/permissions/db/users.js';
@@ -148,6 +144,5 @@ export const TranscriptionLayer = Layer.succeed(TranscriptionService, {
 
 /** Messaging-group → agent-group folder lookup. Purely synchronous DB reads. */
 export const GroupFolderLayer = Layer.succeed(GroupFolderService, {
-  resolveForPlatformId: (platformId) =>
-    Effect.sync(() => resolveGroupFolderForPlatformId('telegram', platformId)),
+  resolveForPlatformId: (platformId) => Effect.sync(() => resolveGroupFolderForPlatformId('telegram', platformId)),
 });

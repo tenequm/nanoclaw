@@ -19,12 +19,7 @@
 import { Effect } from 'effect';
 import type { Context } from 'grammy';
 
-import type {
-  ChannelAdapter,
-  ChannelSetup,
-  ConversationInfo,
-  OutboundMessage,
-} from '../adapter.js';
+import type { ChannelAdapter, ChannelSetup, ConversationInfo, OutboundMessage } from '../adapter.js';
 import { registerChannelAdapter } from '../channel-registry.js';
 import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
@@ -68,50 +63,44 @@ class TelegramGrammyAdapter implements ChannelAdapter {
         const { onInbound, onAction } = yield* AdapterConfigService;
 
         const handleInbound = Effect.fn('telegram-grammy.handleInbound')(function* (ctx: Context) {
-            const envelope = toInboundMessage(ctx, botUsername, botUserId);
-            if (!envelope) return;
+          const envelope = toInboundMessage(ctx, botUsername, botUserId);
+          if (!envelope) return;
 
-            const { platformId, threadId, message } = envelope;
-            const chat = ctx.chat;
-            if (!chat || !ctx.msg) return;
-            const chatId = chat.id;
+          const { platformId, threadId, message } = envelope;
+          const chat = ctx.chat;
+          if (!chat || !ctx.msg) return;
+          const chatId = chat.id;
 
-            // Fire 👀 best-effort in a detached fiber — doesn't block
-            // materialization or the router handoff.
-            yield* Effect.forkDetach(
-              fireSeenReaction(chatId, ctx.msg.message_id, threadId ?? platformId, message.id),
-            );
+          // Fire 👀 best-effort in a detached fiber — doesn't block
+          // materialization or the router handoff.
+          yield* Effect.forkDetach(fireSeenReaction(chatId, ctx.msg.message_id, threadId ?? platformId, message.id));
 
-            // Materialize attachment bytes to the group folder (await so the
-            // agent-runner sees them in the same inbound dispatch).
-            if (isInboundContent(message.content) && message.content.attachments.length > 0) {
-              yield* materializeAll(message.content.attachments, message.id, platformId);
-            }
+          // Materialize attachment bytes to the group folder (await so the
+          // agent-runner sees them in the same inbound dispatch).
+          if (isInboundContent(message.content) && message.content.attachments.length > 0) {
+            yield* materializeAll(message.content.attachments, message.id, platformId);
+          }
 
-            const isGroup = chat.type !== 'private';
-            const chatName = chat.type === 'private' ? null : (chat as { title?: string }).title ?? null;
+          const isGroup = chat.type !== 'private';
+          const chatName = chat.type === 'private' ? null : ((chat as { title?: string }).title ?? null);
 
-            const paired = yield* tryPair(chatId, platformId, isGroup, chatName, message);
-            if (paired) return;
+          const paired = yield* tryPair(chatId, platformId, isGroup, chatName, message);
+          if (paired) return;
 
-            yield* onInbound(platformId, threadId, message);
-          });
+          yield* onInbound(platformId, threadId, message);
+        });
 
         // grammY handlers are sync/void; we fork inbound handling into the
         // runtime so errors go through the Effect error channel.
         const dispatchFromHandler = (ctx: Context): void => {
           void runtime.runPromise(
             handleInbound(ctx).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logError('telegram-grammy: inbound handler failed', { cause }),
-              ),
+              Effect.catchCause((cause) => Effect.logError('telegram-grammy: inbound handler failed', { cause })),
             ),
           );
         };
 
-        const handleCallbackQuery = Effect.fn('telegram-grammy.handleCallbackQuery')(function* (
-          ctx: Context,
-        ) {
+        const handleCallbackQuery = Effect.fn('telegram-grammy.handleCallbackQuery')(function* (ctx: Context) {
           const data = ctx.callbackQuery?.data;
           if (!data) return;
           const parsed = parseCallbackData(data);

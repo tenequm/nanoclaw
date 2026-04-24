@@ -51,7 +51,12 @@ describe('renderFS', () => {
     const fs = renderFS('# Title\n\nbody');
     const bold = fs.entities.find((e) => e.type === 'bold');
     expect(bold).toBeDefined();
-    expect(fs.text.slice((bold as { offset: number }).offset, (bold as { offset: number; length: number }).offset + (bold as { length: number }).length)).toBe('Title');
+    expect(
+      fs.text.slice(
+        (bold as { offset: number }).offset,
+        (bold as { offset: number; length: number }).offset + (bold as { length: number }).length,
+      ),
+    ).toBe('Title');
   });
 
   it('renders unordered list with bullets', () => {

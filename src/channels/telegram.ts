@@ -21,11 +21,7 @@ import { createTelegramAdapter } from '@chat-adapter/telegram';
 
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
-import {
-  createMessagingGroup,
-  getMessagingGroupByPlatform,
-  updateMessagingGroup,
-} from '../db/messaging-groups.js';
+import { createMessagingGroup, getMessagingGroupByPlatform, updateMessagingGroup } from '../db/messaging-groups.js';
 import { resolveGroupFolderForPlatformId, resolveGroupFolderPath } from '../group-folder.js';
 import { grantRole, hasAnyOwner } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';

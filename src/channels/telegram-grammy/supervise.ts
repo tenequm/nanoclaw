@@ -24,17 +24,13 @@ export interface PollingOpts {
  * Returns only when the loop shuts down cleanly (stop signal) or the
  * retry policy exhausts (5 consecutive failures).
  */
-export const runSupervisedPolling = Effect.fn('telegram-grammy.runSupervisedPolling')(
-  function* (opts: PollingOpts) {
-    const { start } = yield* BotService;
+export const runSupervisedPolling = Effect.fn('telegram-grammy.runSupervisedPolling')(function* (opts: PollingOpts) {
+  const { start } = yield* BotService;
 
-    yield* start({
-      allowed_updates: opts.allowedUpdates as never,
-    }).pipe(
-      Effect.retry({ schedule: Schedule.exponential('1 second'), times: 5 }),
-      Effect.tapCause((cause) =>
-        Effect.logError('telegram-grammy: polling gave up after retries', { cause }),
-      ),
-    );
-  },
-);
+  yield* start({
+    allowed_updates: opts.allowedUpdates as never,
+  }).pipe(
+    Effect.retry({ schedule: Schedule.exponential('1 second'), times: 5 }),
+    Effect.tapCause((cause) => Effect.logError('telegram-grammy: polling gave up after retries', { cause })),
+  );
+});

@@ -16,12 +16,7 @@ import { Effect, Layer, ManagedRuntime } from 'effect';
 import type { ChannelSetup } from '../adapter.js';
 
 import type { GrammyNetworkError } from './errors.js';
-import {
-  BotLayer,
-  GroupFolderLayer,
-  PairingLayer,
-  TranscriptionLayer,
-} from './layers.js';
+import { BotLayer, GroupFolderLayer, PairingLayer, TranscriptionLayer } from './layers.js';
 import {
   AdapterConfigService,
   type BotService,
@@ -35,12 +30,7 @@ export interface AdapterRuntimeConfig {
   readonly hostConfig: ChannelSetup;
 }
 
-type AdapterServices =
-  | BotService
-  | PairingService
-  | TranscriptionService
-  | GroupFolderService
-  | AdapterConfigService;
+type AdapterServices = BotService | PairingService | TranscriptionService | GroupFolderService | AdapterConfigService;
 
 /**
  * `BotLayer` fails with `GrammyNetworkError` when cold-start `getMe` can't
@@ -51,9 +41,7 @@ type AdapterServices =
 export type AdapterLayerError = GrammyNetworkError;
 
 /** Build the full layer tree used by the adapter runtime. */
-export function buildAdapterLayer(
-  config: AdapterRuntimeConfig,
-): Layer.Layer<AdapterServices, AdapterLayerError> {
+export function buildAdapterLayer(config: AdapterRuntimeConfig): Layer.Layer<AdapterServices, AdapterLayerError> {
   const configLayer = Layer.succeed(AdapterConfigService, {
     token: config.token,
     // Host callbacks are Promise | void. Wrap them so the rest of the module
@@ -73,13 +61,7 @@ export function buildAdapterLayer(
   // others are flat. Provide config to the ones that need it.
   const botProvided = BotLayer.pipe(Layer.provide(configLayer));
 
-  return Layer.mergeAll(
-    configLayer,
-    botProvided,
-    PairingLayer,
-    TranscriptionLayer,
-    GroupFolderLayer,
-  );
+  return Layer.mergeAll(configLayer, botProvided, PairingLayer, TranscriptionLayer, GroupFolderLayer);
 }
 
 export type AdapterRuntime = ManagedRuntime.ManagedRuntime<AdapterServices, AdapterLayerError>;

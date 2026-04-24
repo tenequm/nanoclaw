@@ -122,9 +122,7 @@ function describeOrigin(origin: MessageOrigin): string {
       const handle = (c as { username?: string }).username;
       const msgId = origin.message_id;
       const sig = origin.author_signature ? `, signed: ${origin.author_signature}` : '';
-      return handle
-        ? `${title} channel (@${handle}, msg ${msgId}${sig})`
-        : `${title} channel (msg ${msgId}${sig})`;
+      return handle ? `${title} channel (@${handle}, msg ${msgId}${sig})` : `${title} channel (msg ${msgId}${sig})`;
     }
   }
 }
@@ -147,9 +145,7 @@ export function extractReplyContext(msg: Message): ReplyContext | null {
   const ext = (msg as { external_reply?: { origin: MessageOrigin; message_id?: number } }).external_reply;
   if (ext) {
     const quoteText = (msg as { quote?: { text: string } }).quote?.text;
-    const body = quoteText && quoteText.length > 0
-      ? quoteText
-      : ((ext as { text?: string }).text ?? '');
+    const body = quoteText && quoteText.length > 0 ? quoteText : ((ext as { text?: string }).text ?? '');
     return {
       id: null,
       sender: `(external) ${describeOrigin(ext.origin)}`,
@@ -301,10 +297,13 @@ export function extractAttachments(msg: Message): InboundAttachment[] {
     const setName = msg.sticker.set_name ?? null;
     const emoji = msg.sticker.emoji ?? null;
     const label =
-      emoji && setName ? `${emoji} sticker (from ${setName})`
-      : emoji ? `${emoji} sticker`
-      : setName ? `sticker (from ${setName})`
-      : null;
+      emoji && setName
+        ? `${emoji} sticker (from ${setName})`
+        : emoji
+          ? `${emoji} sticker`
+          : setName
+            ? `sticker (from ${setName})`
+            : null;
     out.push({
       type: 'sticker',
       fileId: msg.sticker.file_id,
@@ -435,7 +434,7 @@ export function entitiesToMarkdown(text: string, entities: readonly MessageEntit
     markers.push({ pos: e.offset, insert: wrap[0], tie: 1 });
     markers.push({ pos: end, insert: wrap[1], tie: 0 });
   }
-  markers.sort((a, b) => (a.pos - b.pos) || (a.tie - b.tie));
+  markers.sort((a, b) => a.pos - b.pos || a.tie - b.tie);
 
   const chars = Array.from(text); // JS string indexing is UTF-16 — entity offsets are UTF-16 code units, so string indexing is fine
   let out = '';
@@ -466,7 +465,11 @@ export function entitiesToMarkdown(text: string, entities: readonly MessageEntit
  * into messages_in doesn't collide with the original's primary key. The
  * body is prefixed with `[EDITED]` and `replyTo.id` links to the original.
  */
-export function toInboundMessage(ctx: Context, botUsername: string | null, botUserId: number | null): InboundEnvelope | null {
+export function toInboundMessage(
+  ctx: Context,
+  botUsername: string | null,
+  botUserId: number | null,
+): InboundEnvelope | null {
   const chat = ctx.chat;
   const msg = ctx.msg;
   const from = ctx.from;
@@ -491,9 +494,12 @@ export function toInboundMessage(ctx: Context, botUsername: string | null, botUs
   if (fwd) prefixes.push(formatForwardHeader(fwd));
   const albumId = (msg as { media_group_id?: string }).media_group_id;
   if (albumId) prefixes.push(`[album ${albumId}]`);
-  const body = prefixes.length > 0
-    ? (markdown.length > 0 ? `${prefixes.join(' ')}\n\n${markdown}` : prefixes.join(' '))
-    : markdown;
+  const body =
+    prefixes.length > 0
+      ? markdown.length > 0
+        ? `${prefixes.join(' ')}\n\n${markdown}`
+        : prefixes.join(' ')
+      : markdown;
 
   const content: InboundContent = {
     text: body,
@@ -518,9 +524,10 @@ export function toInboundMessage(ctx: Context, botUsername: string | null, botUs
   if (replyTo) content.replyTo = replyTo;
 
   // Edited messages must not collide with the original's primary key.
-  const messageId = isEdit && typeof editDate === 'number'
-    ? `${chat.id}:${msg.message_id}:edit:${editDate}`
-    : compoundMessageId(chat.id, msg.message_id);
+  const messageId =
+    isEdit && typeof editDate === 'number'
+      ? `${chat.id}:${msg.message_id}:edit:${editDate}`
+      : compoundMessageId(chat.id, msg.message_id);
 
   return {
     platformId: platformIdFor(chat.id),
@@ -559,22 +566,35 @@ export interface ReactionUpdatePayload {
 function describeReactions(rs: ReadonlyArray<{ type: string; emoji?: string; custom_emoji_id?: string }>): string {
   if (rs.length === 0) return '(cleared)';
   return rs
-    .map((r) => (r.type === 'emoji' && r.emoji ? r.emoji : r.type === 'custom_emoji' ? `<custom:${r.custom_emoji_id}>` : r.type))
+    .map((r) =>
+      r.type === 'emoji' && r.emoji ? r.emoji : r.type === 'custom_emoji' ? `<custom:${r.custom_emoji_id}>` : r.type,
+    )
     .join(' ');
 }
 
 export function toReactionInbound(upd: ReactionUpdatePayload): InboundEnvelope | null {
   const { chat, message_id, user, new_reaction, old_reaction, date } = upd;
-  const actor = user ?? (upd.actor_chat ? { id: upd.actor_chat.id, first_name: upd.actor_chat.title ?? 'chat', username: undefined, is_bot: false } as User : null);
+  const actor =
+    user ??
+    (upd.actor_chat
+      ? ({
+          id: upd.actor_chat.id,
+          first_name: upd.actor_chat.title ?? 'chat',
+          username: undefined,
+          is_bot: false,
+        } as User)
+      : null);
   if (!actor) return null;
 
   const senderIdNs = `telegram:${actor.id}`;
   const name = displayName(actor) ?? 'anonymous';
 
-  const verb = new_reaction.length === 0 ? 'removed reaction' : old_reaction.length === 0 ? 'reacted' : 'changed reaction';
-  const summary = new_reaction.length === 0
-    ? `${verb} (was ${describeReactions(old_reaction)})`
-    : `${verb}: ${describeReactions(new_reaction)}`;
+  const verb =
+    new_reaction.length === 0 ? 'removed reaction' : old_reaction.length === 0 ? 'reacted' : 'changed reaction';
+  const summary =
+    new_reaction.length === 0
+      ? `${verb} (was ${describeReactions(old_reaction)})`
+      : `${verb}: ${describeReactions(new_reaction)}`;
 
   const content: InboundContent = {
     text: `[${summary}]`,
@@ -641,9 +661,7 @@ export function extractTelegramMessageId(
   const parts = compound.split(':');
   if (parts.length === 1) {
     const messageId = Number(parts[0]);
-    return Number.isFinite(messageId) && String(messageId) === parts[0]
-      ? { chatId: fallbackChatId, messageId }
-      : null;
+    return Number.isFinite(messageId) && String(messageId) === parts[0] ? { chatId: fallbackChatId, messageId } : null;
   }
   const chatId = Number(parts[0]);
   const messageId = Number(parts[1]);
