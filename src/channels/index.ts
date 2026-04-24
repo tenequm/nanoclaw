@@ -7,4 +7,17 @@
 // self-registration import below.
 
 import './cli.js';
-import './telegram.js';
+
+// Telegram adapter — two implementations, one channel_type ('telegram').
+// Uncomment exactly one. Both read TELEGRAM_BOT_TOKEN. Leaving both
+// uncommented causes whichever imports last to silently override in the
+// registry, so keep exactly one active.
+//
+// Legacy implementation — delegates to @chat-adapter/telegram (bridge).
+// Kept as a fallback in case the grammY implementation regresses.
+// import './telegram.js';
+//
+// grammY + Effect-TS v4 implementation — parse-error-immune (entities[]
+// instead of parse_mode). Default since the MarkdownV2 parse-failure
+// incidents in upstream.
+import './telegram-grammy/index.js';

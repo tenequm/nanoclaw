@@ -24,11 +24,9 @@ import { log } from '../log.js';
 import {
   createMessagingGroup,
   getMessagingGroupByPlatform,
-  getMessagingGroupAgents,
   updateMessagingGroup,
 } from '../db/messaging-groups.js';
-import { getAgentGroup } from '../db/agent-groups.js';
-import { resolveGroupFolderPath } from '../group-folder.js';
+import { resolveGroupFolderForPlatformId, resolveGroupFolderPath } from '../group-folder.js';
 import { grantRole, hasAnyOwner } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { transcribeAudio } from '../transcription.js';
@@ -224,17 +222,6 @@ function sanitizeAttachmentName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120) || 'file';
 }
 
-/** Find the group folder for an inbound message via the wiring table. */
-function resolveGroupFolderForPlatformId(platformId: string): string | null {
-  const mg = getMessagingGroupByPlatform('telegram', platformId);
-  if (!mg) return null;
-  const wirings = getMessagingGroupAgents(mg.id);
-  if (wirings.length === 0) return null;
-  const primary = wirings[0];
-  const ag = getAgentGroup(primary.agent_group_id);
-  return ag?.folder ?? null;
-}
-
 interface InboundAttachment {
   type?: string;
   name?: string;
@@ -336,7 +323,7 @@ function createFeatureInterceptor(
         const content = message.content as { attachments?: InboundAttachment[] };
         const attachments = content.attachments;
         if (Array.isArray(attachments) && attachments.length > 0) {
-          const folder = resolveGroupFolderForPlatformId(platformId);
+          const folder = resolveGroupFolderForPlatformId('telegram', platformId);
           if (folder) {
             await Promise.all(attachments.map((att, i) => materializeAttachment(att, folder, message.id, i)));
           } else {
