@@ -86,10 +86,6 @@ Workflow: search tools return compact previews; follow up with the matching deta
 
 Only fall back to `WebSearch` / `WebFetch` if a surf tool fails or the user explicitly asks for the built-in. When you delegate research to sub-agents (Task / Explore), instruct them to use surf tools too — don't let the default fetchers leak in via subagents.
 
-## Long sessions
-
-Your context window auto-compacts at ~400k tokens, so you can keep working through long conversations without "running out of room." Don't artificially wrap up tasks early to save tokens. Save important state to your workspace (`/workspace/group/`) before the compaction boundary so you can pick up after the summary cuts.
-
 ## Your Workspace
 
 Files you create are saved in `/workspace/group/`. Use this for notes, research, or anything that should persist.
