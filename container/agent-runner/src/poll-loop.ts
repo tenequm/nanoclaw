@@ -160,7 +160,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds);
+      const result = await processQuery(query, routing, processingIds, config.provider.supportsNativeSlashCommands);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setStoredSessionId(continuation);
@@ -238,6 +238,7 @@ async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
+  nativeSlashCommands: boolean,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -251,23 +252,44 @@ async function processQuery(
   const pollHandle = setInterval(() => {
     if (done) return;
 
-    // Skip system messages (MCP tool responses) and /clear (needs fresh query).
+    // Skip system messages (MCP tool responses). For /clear, end the active
+    // query so this iteration drains and runPollLoop loops back to the outer
+    // batch handler, which is the only place that resets continuation and
+    // writes "Session cleared.". Just filtering /clear here would leave the
+    // pending row stuck because the active query never closes on its own
+    // (see the "do NOT force-end on silence" comment above) and the outer
+    // /clear handler is unreachable while we're inside this for-await.
+    //
     // Thread routing is the router's concern — if a message landed in this
     // session, the agent should see it. Per-thread sessions already isolate
     // threads into separate containers; shared sessions intentionally merge
     // everything. Filtering on thread_id here caused deadlocks when the
     // initial batch and follow-ups had mismatched thread_ids (e.g. a
     // host-generated welcome trigger with null thread vs a Discord DM reply).
-    const newMessages = getPendingMessages().filter((m) => {
+    const all = getPendingMessages();
+    let clearSeen = false;
+    const newMessages = all.filter((m) => {
       if (m.kind === 'system') return false;
-      if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
+      if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) {
+        clearSeen = true;
+        return false;
+      }
       return true;
     });
+    if (clearSeen) {
+      log('Active query received /clear — ending stream so outer loop can reset');
+      query.end();
+      done = true;
+      return;
+    }
     if (newMessages.length > 0) {
       const newIds = newMessages.map((m) => m.id);
       markProcessing(newIds);
 
-      const prompt = formatMessages(newMessages);
+      // Same formatter as the outer loop so passthrough/admin slash commands
+      // (e.g. /compact) reach the SDK as raw text and get dispatched natively
+      // instead of being XML-wrapped and treated as user prose.
+      const prompt = formatMessagesWithCommands(newMessages, nativeSlashCommands);
       log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
       query.push(prompt);
 
