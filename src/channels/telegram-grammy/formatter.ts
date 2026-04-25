@@ -41,7 +41,7 @@
  * Pure functions only — no Effect, no IO. Kept plain TS so the walker is
  * easy to test and reason about in isolation.
  */
-import type { Content as MdContent, Root as MdRoot } from 'chat';
+import type { Content as MdContent, MdastTable, Root as MdRoot, TableCell as MdTableCell } from 'chat';
 import {
   isBlockquoteNode,
   isCodeNode,
@@ -119,6 +119,21 @@ function isExpandableBlockquoteNode(node: unknown): node is ExpandableBlockquote
   return typeof node === 'object' && node !== null && (node as { type?: string }).type === 'expandableBlockquote';
 }
 
+/**
+ * Synthetic node injected by `convertTables` for tables wider than
+ * `TABLE_WIDTH_LIMIT`. Carries the original mdast `Table` so the walker can
+ * format it as label-then-bullets at render time. Narrow tables become a
+ * `code` block (ASCII grid) before reaching this point.
+ */
+interface TableBulletsNode {
+  readonly type: 'tableBullets';
+  readonly table: MdastTable;
+}
+
+function isTableBulletsNode(node: unknown): node is TableBulletsNode {
+  return typeof node === 'object' && node !== null && (node as { type?: string }).type === 'tableBullets';
+}
+
 /** `||X||` inside a text node → FormattedString.spoiler(X) interleaved with plain text. */
 const SPOILER_RE = /\|\|([^\n|][^\n]*?)\|\|/g;
 function renderTextValue(value: string): FormattedString {
@@ -137,7 +152,7 @@ function renderTextValue(value: string): FormattedString {
   return parts.reduce((acc, cur) => acc.concat(cur), EMPTY());
 }
 
-type RenderableNode = MdContent | UnderlineNode | ExpandableBlockquoteNode;
+type RenderableNode = MdContent | UnderlineNode | ExpandableBlockquoteNode | TableBulletsNode;
 
 /** Render an mdast node to a FormattedString. */
 function renderNode(node: RenderableNode): FormattedString {
@@ -147,6 +162,9 @@ function renderNode(node: RenderableNode): FormattedString {
   if (isExpandableBlockquoteNode(node)) {
     const body = joinFs(node.children.map(renderNode), NL());
     return FormattedString.expandableBlockquote(body);
+  }
+  if (isTableBulletsNode(node)) {
+    return renderTableAsBullets(node.table);
   }
   if (isTextNode(node)) {
     return renderTextValue(node.value);
@@ -479,19 +497,144 @@ function inlineFootnoteRefs(node: MdRoot | MdContent, defs: Map<string, Footnote
 /* ----------------------------------------------------------------------- */
 
 /**
- * Pre-pass: collapse mdast tables into fenced ASCII code blocks so Telegram
- * (which has no native table support) shows them in monospace instead of
- * silently flattening every row into one line.
+ * Max rendered ASCII-table width before we flatten to label-then-bullets.
+ *
+ * Derived from the Telegram-iOS layout formula: `bubble = screenWidth - 36pt`;
+ * a `pre` code block uses `fixedFont` (~SF Mono 15pt ≈ 9pt/char) with ~20pt
+ * internal padding, so per-line capacity on an iPhone 14 (390pt) is roughly
+ * `(390 - 36 - 20) / 9 ≈ 37` chars. 38 is one above that floor — comfortable
+ * on iPhone 14+ class devices; SE (375pt) wraps at ~35 so it may still wrap
+ * at this limit. If iPhone 14 users report wrap, drop to 37.
+ *
+ * Ported from the upstream openclaw renderer (`src/channels/telegram-render.ts`)
+ * — the per-table mode decision openclaw#1495 rejected as "too fragile" but
+ * users in openclaw#36323 keep asking for.
  */
-function collapseTables(ast: MdRoot): MdRoot {
+const TABLE_WIDTH_LIMIT = 38;
+
+/**
+ * `chat.tableToAscii` emits `cell | cell` (no outer pipes — same as the
+ * patched openclaw `renderTableAsCode`), so the rendered width is
+ * `sum(maxColWidth) + 3 * (cols - 1)` (the `' | '` separator is 3 chars).
+ * Cell text is the trimmed plain text of the cell's children — entities are
+ * not rendered into ASCII, only their text content.
+ */
+function computeRenderedTableWidth(table: MdastTable): number {
+  const rows = table.children;
+  if (rows.length === 0) return 0;
+  const colCount = Math.max(...rows.map((r) => r.children.length));
+  if (colCount === 0) return 0;
+  let total = 0;
+  for (let c = 0; c < colCount; c++) {
+    let maxWidth = 0;
+    for (const row of rows) {
+      const cell = row.children[c];
+      const text = cellPlainText(cell);
+      if (text.length > maxWidth) maxWidth = text.length;
+    }
+    total += maxWidth;
+  }
+  return total + 3 * (colCount - 1);
+}
+
+function cellPlainText(cell: MdTableCell | undefined): string {
+  if (!cell) return '';
+  return toPlainText({ type: 'root', children: cell.children as MdContent[] }).trim();
+}
+
+/**
+ * Pre-pass: per table, decide between ASCII grid (narrow, monospace block) and
+ * label-then-bullets (wide; wraps cleanly on mobile). Narrow tables become a
+ * `code` block; wide ones become a synthetic `tableBullets` node that
+ * `renderNode` formats with proper entities.
+ */
+function convertTables(ast: MdRoot): MdRoot {
   return walkAst(ast, (n: MdContent) => {
-    if (isTableNode(n)) {
+    if (!isTableNode(n)) return n;
+    const width = computeRenderedTableWidth(n);
+    if (width <= TABLE_WIDTH_LIMIT) {
       const ascii = tableToAscii(n);
       const replacement: MdContent = { type: 'code', lang: null, meta: null, value: ascii };
       return replacement;
     }
-    return n;
+    const replacement: TableBulletsNode = { type: 'tableBullets', table: n };
+    return replacement as unknown as MdContent;
   });
+}
+
+/**
+ * Wide-table renderer. Two shapes, mirroring the openclaw bullet output:
+ *
+ *  - `headers.length > 1 && rows.length > 0` — first column is treated as a
+ *    row label (bolded), remaining columns become `**header**: value` bullets.
+ *    Blank line between rows so each section reads as its own paragraph.
+ *  - otherwise — flat `header: value` bullets per row, no auto-bolding.
+ *
+ * Empty values are skipped (matches openclaw's `appendCell` early-return on
+ * empty `cell.text`). Cell inlines are rendered via `renderChildren`, so
+ * source-side bold / italic / links / inline code inside cells survive as
+ * proper Telegram entities.
+ */
+function renderTableAsBullets(table: MdastTable): FormattedString {
+  const rows = table.children;
+  if (rows.length === 0) return EMPTY();
+
+  const headerCells = rows[0].children;
+  const dataRows = rows.slice(1);
+  const headers = headerCells.map(cellToFs);
+
+  if (dataRows.length === 0) {
+    const items = headers.filter((h) => h.rawText.length > 0).map((h) => PLAIN('• ').concat(h));
+    return joinFs(items, NL());
+  }
+
+  const useFirstColAsLabel = headers.length > 1;
+
+  if (useFirstColAsLabel) {
+    const sections: FormattedString[] = [];
+    for (const row of dataRows) {
+      const cells = row.children.map(cellToFs);
+      const parts: FormattedString[] = [];
+      const rowLabel = cells[0];
+      if (rowLabel && rowLabel.rawText.length > 0) {
+        parts.push(FormattedString.b(rowLabel));
+      }
+      for (let i = 1; i < cells.length; i++) {
+        const value = cells[i];
+        if (!value || value.rawText.length === 0) continue;
+        const header = headers[i];
+        const bullet =
+          header && header.rawText.length > 0
+            ? PLAIN('• ').concat(header, PLAIN(': '), value)
+            : PLAIN('• ').concat(value);
+        parts.push(bullet);
+      }
+      if (parts.length > 0) sections.push(joinFs(parts, NL()));
+    }
+    return joinFs(sections, NL2());
+  }
+
+  const rowsRendered: FormattedString[] = [];
+  for (const row of dataRows) {
+    const cells = row.children.map(cellToFs);
+    const bullets: FormattedString[] = [];
+    for (let i = 0; i < cells.length; i++) {
+      const value = cells[i];
+      if (!value || value.rawText.length === 0) continue;
+      const header = headers[i];
+      const bullet =
+        header && header.rawText.length > 0
+          ? PLAIN('• ').concat(header, PLAIN(': '), value)
+          : PLAIN('• ').concat(value);
+      bullets.push(bullet);
+    }
+    if (bullets.length > 0) rowsRendered.push(joinFs(bullets, NL()));
+  }
+  return joinFs(rowsRendered, NL2());
+}
+
+function cellToFs(cell: MdTableCell): FormattedString {
+  return renderChildren(cell.children as RenderableNode[]);
 }
 
 /** Render a markdown string to a Telegram FormattedString. */
@@ -501,8 +644,8 @@ export function renderFS(markdown: string): FormattedString {
   // __bold__ vs **bold** and *X* vs _X_ source-delimiter peeks in
   // `applyTelegramDialect`.
   const dialected = applyTelegramDialect(structuredClone(ast), markdown);
-  const collapsed = collapseTables(dialected);
-  return joinFs(collapsed.children.map(renderNode), NL2());
+  const tabled = convertTables(dialected);
+  return joinFs(tabled.children.map(renderNode), NL2());
 }
 
 /**

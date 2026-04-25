@@ -5,9 +5,9 @@
  * produced here are what we send via Telegram's `entities[]` parameter
  * (no server-side parser → no parse-error 400s). These tests verify that
  * the walker produces the expected entities for every node type we
- * render, that table → code ASCII pre-pass fires, that the Telegram
- * dialect deviations from CommonMark hold, and that chunked output
- * preserves entity offsets across slice boundaries.
+ * render, that the per-table width gate picks ASCII vs bullets, that
+ * the Telegram dialect deviations from CommonMark hold, and that
+ * chunked output preserves entity offsets across slice boundaries.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -35,17 +35,60 @@ describe('renderFS', () => {
     expect(fs.entities.some((e) => e.type === 'blockquote')).toBe(true);
   });
 
-  it('collapses tables to ASCII code blocks', () => {
+  it('renders narrow tables (≤38 chars wide) as ASCII code blocks', () => {
     const md = '| a | b |\n|---|---|\n| 1 | 2 |';
     const fs = renderFS(md);
-    // Table becomes a `pre` code block whose text contains the original
-    // cell values and a row separator. Exact formatting is owned by
+    // Width: max('a',1)=1 + max('b',2)=1 + 3*(2-1) = 5 chars. Well below 38,
+    // so we keep the monospace grid. Exact formatting is owned by
     // `chat.tableToAscii` — we only assert the structural contract.
     expect(fs.entities.some((e) => e.type === 'pre')).toBe(true);
     expect(fs.text).toContain('a');
     expect(fs.text).toContain('b');
     expect(fs.text).toContain('1');
     expect(fs.text).toContain('2');
+  });
+
+  it('flattens wide tables (>38 chars) to label-then-bullets', () => {
+    // Width: col0 max=5 ('short'), col1 max=47, total = 5+47+3 = 55 > 38.
+    const md = '| h1 | header2 |\n|---|---|\n| short | this is a much longer value that exceeds limits |';
+    const fs = renderFS(md);
+    // No more monospace grid…
+    expect(fs.entities.some((e) => e.type === 'pre')).toBe(false);
+    // …row label appears as its own bolded line, header on the bullet, then value.
+    expect(fs.text).toContain('short');
+    expect(fs.text).toContain('• header2: this is a much longer value that exceeds limits');
+    // Row-label gets an auto-bold overlay; the column header on the bullet does NOT
+    // (matches openclaw's `appendTableBulletValue` — header carries source styling only).
+    const bold = fs.entities.find((e) => e.type === 'bold') as { offset: number; length: number } | undefined;
+    expect(bold).toBeDefined();
+    expect(fs.text.slice(bold!.offset, bold!.offset + bold!.length)).toBe('short');
+    expect(fs.entities.filter((e) => e.type === 'bold').length).toBe(1);
+  });
+
+  it('preserves cell inline entities (link inside a wide-table cell)', () => {
+    // Width pushed over 38 by the link label so we hit the bullets branch and
+    // exercise the entity-preserving cell renderer.
+    const md =
+      '| col1 | col2 |\n|---|---|\n| row | see [the official docs page available right here](https://example.com) |';
+    const fs = renderFS(md);
+    const link = fs.entities.find((e) => e.type === 'text_link') as
+      | { offset: number; length: number; url: string }
+      | undefined;
+    expect(link).toBeDefined();
+    expect(link!.url).toBe('https://example.com');
+    expect(fs.text.slice(link!.offset, link!.offset + link!.length)).toBe(
+      'the official docs page available right here',
+    );
+  });
+
+  it('renders single-column wide tables as flat header:value bullets (no auto-bold)', () => {
+    // headers.length === 1 → simple branch, even if width > 38.
+    const md = '| header |\n|---|\n| a value that is intentionally long enough to exceed the width gate |';
+    const fs = renderFS(md);
+    expect(fs.entities.some((e) => e.type === 'pre')).toBe(false);
+    expect(fs.text).toContain('• header: a value that is intentionally long enough to exceed the width gate');
+    // No auto-bold overlay on the simple branch.
+    expect(fs.entities.some((e) => e.type === 'bold')).toBe(false);
   });
 
   it('renders a heading as bold (Telegram has no heading support)', () => {
