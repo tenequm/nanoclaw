@@ -34,6 +34,8 @@ Each session has **two** SQLite files under `data/v2-sessions/<session_id>/`:
 
 Exactly one writer per file — no cross-mount lock contention. Heartbeat is a file touch at `/workspace/.heartbeat`, not a DB update. Host uses even `seq` numbers, container uses odd.
 
+**Gating UX on container state.** Heartbeat only fires when the SDK's event loop runs; long pure-thinking gaps (e.g. `effortLevel: xhigh`) make it stale even though the agent is alive. For user-facing signals like typing indicators, gate on `outbound.db` `processing_ack` rows instead — the container clears them on each turn's `ResultMessage`, so the row mirrors the SDK turn lifecycle exactly. See `src/modules/typing/index.ts`.
+
 ## Central DB
 
 `data/v2.db` holds everything that isn't per-session: users, user_roles, agent_groups, messaging_groups, wiring, pending_approvals, user_dms, chat_sdk_* (for the Chat SDK bridge), schema_version. Migrations live at `src/db/migrations/`.
@@ -60,6 +62,18 @@ Exactly one writer per file — no cross-mount lock contention. Heartbeat is a f
 | `container/skills/` | Container skills mounted into every agent session |
 | `groups/<folder>/` | Per-agent-group filesystem (`CLAUDE.local.md`, skills, `container.json`). Agent-runner source is shared RO from `container/agent-runner/src/` — no per-group overlay. |
 | `scripts/init-first-agent.ts` | Bootstrap the first DM-wired agent (used by `/init-first-agent` skill) |
+
+## Per-agent group file layout
+
+`groups/<folder>/` is **per-user, gitignored** — agent personas, group memories, and OneCLI state are local-only. Only the trunk infrastructure is tracked in the repo.
+
+Inside a group folder, three files compose the SDK system context at spawn:
+
+- **`CLAUDE.md`** — auto-composed pointer (just `@./.claude-shared.md`), regenerated on every spawn. Do not hand-edit.
+- **`CLAUDE.local.md`** — the per-group editable file: persona, voice, banned phrases, `About <user>` context. SDK auto-loads it after `CLAUDE.md`.
+- **`.claude-shared.md`** — symlink to `/app/CLAUDE.md`, which resolves inside the container to the host's `container/CLAUDE.md`. This is how global agent instructions reach every group.
+
+Per-group persona edits go in `CLAUDE.local.md`. Global agent instructions go in `container/CLAUDE.md` (no rebuild needed; runtime cpSync picks them up on the next session spawn).
 
 ## Channels and Providers (skill-installed)
 
@@ -133,6 +147,8 @@ cd container/agent-runner && bun test      # Container tests (bun:test)
 ```
 
 Container typecheck is a separate tsconfig — if you edit `container/agent-runner/src/`, run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` from root (or `bun run typecheck` from `container/agent-runner/`).
+
+`pnpm lint` runs ESLint over `src/`. Rule decisions live in `eslint.config.js` with comments. Notable: `no-catch-all/no-catch-all` is disabled — NanoClaw is a long-running daemon where catch-and-log-and-continue at I/O boundaries is the correct pattern; narrowing + rethrowing would crash the host on unknown errors. The Effect-TS island in `src/channels/telegram-grammy/` keeps stricter type-aware promise rules.
 
 Service management:
 ```bash
