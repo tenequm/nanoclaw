@@ -30,7 +30,7 @@ import type { GrammyDeliveryError } from './errors.js';
 import { mapGrammyError } from './errors.js';
 import { renderFS, splitForBody, splitForCaption } from './formatter.js';
 import { extractTelegramMessageId, parseChatId, parseThreadId } from './inbound.js';
-import { clearPendingSeen } from './reactions.js';
+import { canonicalizeReactionEmoji, clearPendingSeen, type TelegramReactionEmoji, untrackSeen } from './reactions.js';
 import { BotService } from './services.js';
 
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
@@ -277,6 +277,7 @@ const editMessage = Effect.fn('telegram-grammy.editMessage')(function* (
 
 const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
   chatId: number,
+  reactionKey: string,
   compound: string,
   emoji: string | undefined,
 ) {
@@ -285,14 +286,42 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
     yield* Effect.logError('telegram-grammy: reaction with invalid compound id', { compound });
     return undefined;
   }
-  const { bot } = yield* BotService;
+  // Translate slug-or-glyph input into Telegram's fixed allowlist before
+  // shipping to the wire. Empty/missing emoji clears any existing reaction;
+  // unknown input is logged + dropped (the alternative is a guaranteed
+  // REACTION_INVALID 400 from the Bot API). See canonicalizeReactionEmoji
+  // for the full slug map and rationale.
+  const reactions: Array<{ type: 'emoji'; emoji: TelegramReactionEmoji }> = [];
+  if (emoji) {
+    const canonical = canonicalizeReactionEmoji(emoji);
+    if (!canonical) {
+      yield* Effect.logWarning('telegram-grammy: dropping reaction with unknown emoji', {
+        input: emoji,
+        chatId,
+        compound,
+      });
+      return undefined;
+    }
+    reactions.push({ type: 'emoji', emoji: canonical });
+  }
+  const { bot, pendingSeen } = yield* BotService;
+  // Discharge the seen-ack tracking BEFORE the API call. Telegram bots
+  // have one reaction slot per message; setting an explicit reaction
+  // replaces whatever was there (typically 👀). If we leave the compound
+  // in `pendingSeen`, the post-delivery `clearPendingSeen` sweep at the
+  // end of `deliver()` will issue setMessageReaction(...empty) and wipe
+  // the reaction we just set. Untracking here is the local expression of
+  // "only clear messages where the bot's reaction is still 👀."
+  //
+  // Important: `fireSeenReaction` stores the 2-part `<chatId>:<msgId>`
+  // form (`message.id` from `toInboundMessage`), but the agent's
+  // `add_reaction` arrives as the 3-part `<chatId>:<msgId>:<agentGroupId>`
+  // form (router-wrapped via `messageIdForAgent`). Normalize to 2-part for
+  // the lookup so the keys actually match.
+  const seenKey = `${parsed.chatId}:${parsed.messageId}`;
+  yield* untrackSeen(pendingSeen, reactionKey, seenKey);
   yield* Effect.tryPromise({
-    try: () =>
-      bot.api.setMessageReaction(
-        parsed.chatId,
-        parsed.messageId,
-        emoji ? [{ type: 'emoji', emoji: emoji as never }] : [],
-      ),
+    try: () => bot.api.setMessageReaction(parsed.chatId, parsed.messageId, reactions),
     catch: (err) => mapGrammyError(err, 'setMessageReaction', String(chatId)),
   });
   return undefined;
@@ -428,7 +457,7 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
   if (view.isEdit && view.editMessageId != null) {
     result = yield* editMessage(chatId, view.editMessageId, view.text);
   } else if (view.isReaction && view.reactionMessageId != null) {
-    result = yield* reactToMessage(chatId, view.reactionMessageId, view.reactionEmoji);
+    result = yield* reactToMessage(chatId, reactionKey, view.reactionMessageId, view.reactionEmoji);
   } else if (view.isMediaGroup && view.mediaGroupItems) {
     result = yield* sendMediaGroup(chatId, threadId, view.mediaGroupItems, files);
   } else if (view.isAskQuestion && view.askQuestionId != null && view.askTitle != null && view.askOptions) {

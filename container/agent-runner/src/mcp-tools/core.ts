@@ -292,7 +292,11 @@ export const addReaction: McpToolDefinition = {
       type: 'object' as const,
       properties: {
         messageId: { type: 'integer', description: 'Message ID (the numeric id shown in messages)' },
-        emoji: { type: 'string', description: 'Emoji name (e.g., thumbs_up, heart, check)' },
+        emoji: {
+          type: 'string',
+          description:
+            'Reaction emoji. Channel adapters translate common slugs (thumbs_up, heart, fire, party, eyes, ok_hand, ...) into the underlying glyph. Unicode glyphs (👍, ❤, 🔥) work too. Channels reject anything outside their allowed set.',
+        },
       },
       required: ['messageId', 'emoji'],
     },
