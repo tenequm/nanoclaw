@@ -182,13 +182,17 @@ class TelegramGrammyAdapter implements ChannelAdapter {
   }
 
   async setTyping(platformId: string, threadId: string | null): Promise<void> {
+    log.info('TYPING_DEBUG adapter.setTyping called', { platformId, threadId, hasRuntime: !!this.runtime });
     const rt = this.runtime;
     if (!rt) return;
     await rt.runPromise(
       Effect.gen(function* () {
         const { bot } = yield* BotService;
         const chatId = Number(platformId.split(':').slice(1).join(':'));
-        if (!Number.isFinite(chatId)) return;
+        if (!Number.isFinite(chatId)) {
+          yield* Effect.sync(() => log.warn('TYPING_DEBUG bad chatId', { platformId }));
+          return;
+        }
         const threadPart = threadId?.split(':').pop();
         const messageThreadId = threadPart ? Number(threadPart) : undefined;
         yield* Effect.tryPromise({
@@ -197,7 +201,12 @@ class TelegramGrammyAdapter implements ChannelAdapter {
               message_thread_id: Number.isFinite(messageThreadId) ? (messageThreadId as number) : undefined,
             }),
           catch: (err) => err,
-        }).pipe(Effect.catch(() => Effect.void));
+        }).pipe(
+          Effect.tap(() => Effect.sync(() => log.info('TYPING_DEBUG sendChatAction OK', { chatId }))),
+          Effect.catch((err) =>
+            Effect.sync(() => log.warn('TYPING_DEBUG sendChatAction failed', { chatId, err: String(err) })),
+          ),
+        );
       }),
     );
   }
