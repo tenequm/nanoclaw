@@ -32,6 +32,7 @@ import { renderFS, splitForBody, splitForCaption } from './formatter.js';
 import { extractTelegramMessageId, parseChatId, parseThreadId } from './inbound.js';
 import { canonicalizeReactionEmoji, clearPendingSeen, type TelegramReactionEmoji, untrackSeen } from './reactions.js';
 import { BotService } from './services.js';
+import { probeMediaMeta } from './media-meta.js';
 
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.mkv', '.webm']);
@@ -147,10 +148,11 @@ const sendSingleFile = (
   bot: { api: import('grammy').Api },
   chatId: number,
   kind: MediaKind,
-  input: InputFile,
+  file: OutboundFile,
   caption: FormattedString | undefined,
   messageThreadId: number | undefined,
 ): Effect.Effect<string, GrammyDeliveryError> => {
+  const input = new InputFile(file.data, file.filename);
   const baseOpts = {
     caption: caption?.text,
     caption_entities: caption?.entities,
@@ -165,25 +167,68 @@ const sendSingleFile = (
         catch: (err) => mapGrammyError(err, method, String(chatId)),
       }).pipe(Effect.map((m) => mapId(m.message_id)));
     case 'video':
-      return Effect.tryPromise({
-        try: () => bot.api.sendVideo(chatId, input, { ...baseOpts, supports_streaming: true }),
-        catch: (err) => mapGrammyError(err, method, String(chatId)),
-      }).pipe(Effect.map((m) => mapId(m.message_id)));
+      // Probe width/height/duration so Telegram renders the correct
+      // aspect ratio (and not a square placeholder for portrait clips).
+      // Probe failure → send without dimensions; delivery still works.
+      return Effect.promise(() => probeMediaMeta(file.data)).pipe(
+        Effect.flatMap((meta) =>
+          Effect.tryPromise({
+            try: () =>
+              bot.api.sendVideo(chatId, input, {
+                ...baseOpts,
+                supports_streaming: true,
+                ...(meta ?? {}),
+              }),
+            catch: (err) => mapGrammyError(err, method, String(chatId)),
+          }),
+        ),
+        Effect.map((m) => mapId(m.message_id)),
+      );
     case 'audio':
-      return Effect.tryPromise({
-        try: () => bot.api.sendAudio(chatId, input, baseOpts),
-        catch: (err) => mapGrammyError(err, method, String(chatId)),
-      }).pipe(Effect.map((m) => mapId(m.message_id)));
+      // Probe duration so the player chrome shows the right length
+      // immediately — without it Telegram displays "0:00" until the
+      // client finishes downloading + parsing the file.
+      return Effect.promise(() => probeMediaMeta(file.data)).pipe(
+        Effect.flatMap((meta) =>
+          Effect.tryPromise({
+            try: () =>
+              bot.api.sendAudio(chatId, input, {
+                ...baseOpts,
+                ...(meta?.duration != null ? { duration: meta.duration } : {}),
+              }),
+            catch: (err) => mapGrammyError(err, method, String(chatId)),
+          }),
+        ),
+        Effect.map((m) => mapId(m.message_id)),
+      );
     case 'voice':
-      return Effect.tryPromise({
-        try: () => bot.api.sendVoice(chatId, input, baseOpts),
-        catch: (err) => mapGrammyError(err, method, String(chatId)),
-      }).pipe(Effect.map((m) => mapId(m.message_id)));
+      return Effect.promise(() => probeMediaMeta(file.data)).pipe(
+        Effect.flatMap((meta) =>
+          Effect.tryPromise({
+            try: () =>
+              bot.api.sendVoice(chatId, input, {
+                ...baseOpts,
+                ...(meta?.duration != null ? { duration: meta.duration } : {}),
+              }),
+            catch: (err) => mapGrammyError(err, method, String(chatId)),
+          }),
+        ),
+        Effect.map((m) => mapId(m.message_id)),
+      );
     case 'animation':
-      return Effect.tryPromise({
-        try: () => bot.api.sendAnimation(chatId, input, baseOpts),
-        catch: (err) => mapGrammyError(err, method, String(chatId)),
-      }).pipe(Effect.map((m) => mapId(m.message_id)));
+      return Effect.promise(() => probeMediaMeta(file.data)).pipe(
+        Effect.flatMap((meta) =>
+          Effect.tryPromise({
+            try: () =>
+              bot.api.sendAnimation(chatId, input, {
+                ...baseOpts,
+                ...(meta ?? {}),
+              }),
+            catch: (err) => mapGrammyError(err, method, String(chatId)),
+          }),
+        ),
+        Effect.map((m) => mapId(m.message_id)),
+      );
     case 'document':
     default:
       return Effect.tryPromise({
@@ -216,8 +261,7 @@ const sendDefault = Effect.fn('telegram-grammy.sendDefault')(function* (
     const file = files[0];
     const kind = mediaKindFromFilename(file.filename);
     const caption = text ? splitForCaption(renderFS(text))[0] : undefined;
-    const input = new InputFile(file.data, file.filename);
-    return yield* sendSingleFile(bot, chatId, kind, input, caption, messageThreadId);
+    return yield* sendSingleFile(bot, chatId, kind, file, caption, messageThreadId);
   }
 
   // Multiple files → sequential sendDocument. Telegram's media group API
@@ -351,8 +395,10 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
     const input = new InputFile(file.data, file.filename);
     const caption = item.caption ? splitForCaption(renderFS(item.caption))[0] : undefined;
     const base = { media: input, caption: caption?.text, caption_entities: caption?.entities };
-    if (kind === 'video') inputs.push({ type: 'video', supports_streaming: true, ...base });
-    else if (kind === 'photo') inputs.push({ type: 'photo', ...base });
+    if (kind === 'video') {
+      const meta = yield* Effect.promise(() => probeMediaMeta(file.data));
+      inputs.push({ type: 'video', supports_streaming: true, ...base, ...(meta ?? {}) });
+    } else if (kind === 'photo') inputs.push({ type: 'photo', ...base });
     else if (kind === 'audio') inputs.push({ type: 'audio', ...base });
     else inputs.push({ type: 'document', ...base });
   }
