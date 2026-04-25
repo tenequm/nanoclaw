@@ -116,11 +116,7 @@ interface ExpandableBlockquoteNode {
 }
 
 function isExpandableBlockquoteNode(node: unknown): node is ExpandableBlockquoteNode {
-  return (
-    typeof node === 'object' &&
-    node !== null &&
-    (node as { type?: string }).type === 'expandableBlockquote'
-  );
+  return typeof node === 'object' && node !== null && (node as { type?: string }).type === 'expandableBlockquote';
 }
 
 /** `||X||` inside a text node → FormattedString.spoiler(X) interleaved with plain text. */
@@ -259,19 +255,11 @@ interface FootnoteReferenceNode {
 }
 
 function isFootnoteDefinitionNode(node: unknown): node is FootnoteDefinitionNode {
-  return (
-    typeof node === 'object' &&
-    node !== null &&
-    (node as { type?: string }).type === 'footnoteDefinition'
-  );
+  return typeof node === 'object' && node !== null && (node as { type?: string }).type === 'footnoteDefinition';
 }
 
 function isFootnoteReferenceNode(node: unknown): node is FootnoteReferenceNode {
-  return (
-    typeof node === 'object' &&
-    node !== null &&
-    (node as { type?: string }).type === 'footnoteReference'
-  );
+  return typeof node === 'object' && node !== null && (node as { type?: string }).type === 'footnoteReference';
 }
 
 /**
@@ -370,10 +358,7 @@ function stripFoldMarker(children: MdContent[]): MdContent[] | null {
   if (trimmedValue.length === 0 && remainingInlines.length === 0) {
     return children.slice(1);
   }
-  const rebuiltPara = mdParagraph([
-    mdText(trimmedValue),
-    ...(remainingInlines as MdContent[]),
-  ]);
+  const rebuiltPara = mdParagraph([mdText(trimmedValue), ...(remainingInlines as MdContent[])]);
   return [rebuiltPara as unknown as MdContent, ...children.slice(1)];
 }
 
@@ -440,10 +425,7 @@ function sliceLastWord(value: string): SlicedWord | null {
  * Mutates `node.children` in place. Recurses into every container node so
  * footnotes nested inside lists, blockquotes, etc. are handled too.
  */
-function inlineFootnoteRefs(
-  node: MdRoot | MdContent,
-  defs: Map<string, FootnoteDefinitionNode>,
-): void {
+function inlineFootnoteRefs(node: MdRoot | MdContent, defs: Map<string, FootnoteDefinitionNode>): void {
   if (!('children' in node) || !Array.isArray(node.children)) return;
 
   const newChildren: MdContent[] = [];
