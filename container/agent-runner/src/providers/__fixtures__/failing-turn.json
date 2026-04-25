@@ -1,0 +1,135 @@
+{
+  "description": "The actual failing turn from 2026-04-25T04:18 — Misha asked to analyze 3 telegram adapters; agent generated 10791-char Ukrainian analysis text-only in AM, then a trailing TodoWrite AM, then an empty ResultMessage. Old translator dropped both AMs and yielded {type:'result', text:null}, so the user saw nothing.",
+  "messages": [
+    {
+      "type": "assistant",
+      "message": {
+        "model": "claude-opus-4-7",
+        "id": "msg_013sxWwLSriBDxw13MotJGXG",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Готово, прочитав усі три. Ось чесний розбір.\n\n## Контекст: дуже різні задачі\n\nСпочатку важливо: ці три адаптери розв'язують **різні проблеми**, і це пояснює більшість архітектурних відмінностей. Без цього порівняння перетворюється на \"у когось гарніше\".\n\n| | **nanoclaw/telegram-grammy** | **vercel/chat adapter-telegram** | **pi-telegram** |\n|---|---|---|---|\n| Тип | Бекенд-адаптер для multi-tenant хоста з контейнерами | Платформенний адаптер у мульти-платформній SDK | Однокористувацьке розширення для CLI |\n| LOC (без тестів) | ~2,500 у 18 файлах | ~1,850 в одному + 631 у markdown/types/cards | 1,130 в одному файлі |\n| LOC тестів | ~1,200 | ~3,000 | 0 |\n| Користувачі | багато груп / DM | багато потоків | один (allowedUserId) |\n| Залежності | `grammy` + `@grammyjs/parse-mode` + `effect` + `chat` (mdast) | `chat` core (тільки) - native fetch | native fetch (тільки) |\n| Транспорт | only polling (з supervisor) | webhook + polling + auto | only polling |\n\nПосилання на код: [nanoclaw/src/channels/telegram-grammy](https://github.com/tenequm/nanoclaw/tree/main/src/channels/telegram-grammy), [vercel/chat adapter-telegram](https://github.com/vercel/chat/tree/main/packages/adapter-telegram), [badlogic/pi-telegram](https://github.com/badlogic/pi-telegram).\n\n## Архітектура\n\n**nanoclaw** - Effect-TS острів усередині Promise-хоста. ManagedRuntime керує життєвим циклом через Layers і Context.Service (BotService, PairingService, TranscriptionService, GroupFolderService, AdapterConfigService). Помилки типізовані через `Schema.TaggedErrorClass`. Усе розкидане по 18 файлах за відповідальностями: `inbound.ts` (Context → InboundMessage), `outbound.ts` (диспатч), `formatter.ts` (mdast → entities[]), `attachments.ts`, `reactions.ts`, `pairing-interceptor.ts`, `supervise.ts` тощо.\n\n**vercel** - один клас `TelegramAdapter implements Adapter<TelegramThreadId, TelegramRawMessage>`. Все в одному файлі (1,850 LOC), бо це частина уніфікованого інтерфейсу разом зі Slack/Teams/GChat. Жодних абстракцій ефектів - класична async/await з типізованими винятками (`NetworkError`, `ValidationError`, `RateLimitError`).\n\n**pi** - єдина `default function (pi)` з замикальним станом. Жодних класів, жодних шарів. Полінг + конфіг у `~/.pi/agent/telegram.json`. Слухає життєвий цикл pi через події (`session_start`, `agent_start`, `message_update`, `agent_end`).\n\n## Спільне у всіх трьох\n\n- Long polling через `getUpdates` (з `offset`)\n- Compound message id: `<chatId>:<messageId>` (vercel і nanoclaw - ідентично; pi - не тримає id явно)\n- Сортування фото за розміром, беремо найбільше\n- Завантаження файлів через `getFile` → bot file URL → fetch → tmp folder\n- Pairing через `/start` від першого користувача\n- Розбивка довгих повідомлень <= 4096 символів\n- typing indicator через `sendChatAction`\n- Дебаунс media groups (album)\n\n## Найцікавіші відмінності\n\n### 1. Markdown / parse_mode\n\nЦе найважливіший вибір.\n\n- **nanoclaw**: рендерить mdast → `FormattedString` (`{ text, entities[] }`) і ніколи не використовує `parse_mode`. Telegram взагалі не запускає парсер коли є entities. Цілий клас багів `GrammyEntityError` через екранування зникає по конструкції. Має `sendWithFallback` що при entity-помилці ретраїть як plain text. Це **технічно найнадійніший підхід**, але вимагає власного walker по AST (formatter.ts ~550 LOC).\n\n- **vercel**: повертає до традиційного `parse_mode: 'MarkdownV2'`, рендерячи через mdast → MarkdownV2 string. Ризик неправильного екранування є (там багатий `escapeMarkdownV2` у markdown.ts), але це загальноприйнятий підхід і він добре протестований (553 LOC тестів на markdown).\n\n- **pi**: жодного markdown. Plain text. Це чесний tradeoff для DM-тільки CLI - LLM-output часто має `*X*`, які Telegram сприйме як італік, але pi цим не переймається.\n\n**Чесний коментар по nanoclaw**: твій підхід тут об'єктивно найкращий з точки зору надійності в продакшені. Це нетривіальна перевага. Але ціна - 550 LOC walker з тестами на ~340 LOC. Якщо Telegram - єдина платформа на яку ти ціляєш, це окупається; якщо ти підтримуєш ще 5 платформ як vercel - ти не можеш писати такий walker під кожну.\n\n### 2. Lifecycle & resource management\n\n- **nanoclaw** використовує `Effect.acquireRelease` для бота: `dispose()` гарантовано викликає `bot.stop()`. Polling запускається через `Effect.forkDetach` зі схемою retry/backoff (Schedule.exponential, 5 спроб). Усі fiber-и інтерраптяться при dispose runtime. Це дає **дуже сильні гарантії** - неможливо забути викликати stop або leak fiber.\n\n- **vercel** має ручний `pollingActive` boolean + `AbortController` + `pollingTask: Promise<void> | null`. `stopPolling()` викликає `abort()` і чекає `pollingTask`. Працює, але імперативний state, який треба тримати в голові. Експоненційний backoff (`MAX_BACKOFF_MS = 30_000`) - але state-машина на boolean-ах.\n\n- **pi** - так само AbortController + Promise. Але scope - сесія pi, не процес.\n\nТут nanoclaw об'єктивно виграє у надійності зупинки. Для vercel це менше важить, бо typically це serverless - хіба зупиняти.\n\n### 3. Інтеграція з системою\n\n- **nanoclaw** має `pairing-interceptor.ts` який перехоплює перші повідомлення для bootstrap-у DM/group у БД, плюс `chat-sdk-bridge` (інший шар) який вивчає, кого з юзерів сприймати як власника. Складна доменна модель: messaging_groups → agent_groups → sessions. Це не stuff адаптера - це правильно винесено за межі.\n\n- **vercel** - адаптер взагалі не знає про користувачів за межами `author`. Стан зберігає лише в `messageCache: Map`, бо Telegram bot API не дає історію - чесно про це сказано в README (\"Telegram does not expose full historical message APIs\").\n\n- **pi** - `allowedUserId` в config. Перший хто напише `/start` - власник. Усі інші отримують \"not authorized\".\n\n### 4. Streaming (фішка pi)\n\npi реалізував **streaming preview через `sendMessageDraft`** - експериментальне Telegram API де бот публікує \"чорновик\" який клієнт показує наживо. Якщо метод не підтримується - падає в режим `sendMessage + editMessageText` з throttle 750ms. Це найцікавіша UX-фіча у трьох. Телеграм-користувач бачить, як LLM \"друкує\" відповідь.\n\nvercel згадує \"Streaming - Post+Edit fallback\" в README, але я не бачив окремого streaming-API в адаптері - схоже, вони just роблять `editMessage` з зовні. nanoclaw не робить стрімінг на рівні адаптера - повідомлення сформовані і доставлені остаточно.\n\n### 5. Attachments\n\nПокриття від найширшого до найвужчого:\n- **nanoclaw**: photo, voice, audio, video, video_note, document, sticker, animation, contact, location + транскрипція голосу через OpenAI Whisper (TranscriptionService). Стікери з emoji+set_name у label.\n- **pi**: photo, doc, video, audio, voice, animation, sticker - усе скачує. Передає `image` content type до AI для зображень.\n- **vercel**: image, video, audio, voice (як audio), document. Стікери, video_note, animation, contact, location - **нема**.\n\n### 6. Edit messages та reactions\n\n- **nanoclaw**: підтримує `edit`, `reaction`, `send_media_group`, `ask_question` (callback keyboard) як окремі operation у OutboundMessage. Має `pendingSeen` Ref-tracker для 👀 reactions, які auto-clear коли бот відповідає. `canonicalizeReactionEmoji` для Telegram allowlist - обробляє 🔥 → перевіряє чи в дозволеному списку, інакше дропає.\n\n- **vercel**: `editMessage`, `deleteMessage`, `addReaction`, `removeReaction` - всі стандартні. Cards рендеряться в inline keyboard. Reactions через `setMessageReaction` без validation на allowlist.\n\n- **pi**: жодного edit/reaction API. Тільки send.\n\n### 7. Поводження з помилками\n\n- **nanoclaw**: tagged errors (`GrammyNetworkError`, `GrammyEntityError`, `PairingFailed`, `GrammyDeliveryError`) через Effect channels. `mapGrammyError` класифікує винятки grammY у typed errors.\n- **vercel**: typed exceptions (`AuthenticationError`, `RateLimitError`, `PermissionError`, `ResourceNotFoundError`, `ValidationError`, `NetworkError`) - throwable. Класифікація за HTTP error_code в `throwTelegramApiError`.\n- **pi**: `throw new Error(data.description)`. Простіше нікуди.\n\n## Чому такі вибори?\n\n- **nanoclaw** - довгоживучий personal-AI хост у тебе на машині. Полишаєш на роки. Ціна неконсистентного teardown - залиплі fiber-и, ratelimit Telegram. Effect/Layer гарантують чистоту. Адаптер - один з кількох (Discord, Slack, etc.), і їх обробляє та сама архітектура.\n- **vercel/chat** - SDK для розробників які роблять чат-боти на Next.js/serverless. Має бути generic (10+ платформ), мати webhook-first природу для Vercel deploys, простий `bot.webhooks.telegram(request)`. parse_mode - бо інакше треба було б писати окремий entity-walker під кожну платформу. Ось чому monolithic клас.\n- **pi** - \"одна людина чатить з pi через телефон\". Полтора користувача на кожен інстанс. Тому single-file, single-user, plain text, drafts streaming - усе налаштоване під цей use-case.\n\n## Мій чесний підсумок по nanoclaw\n\nСильні сторони:\n- **Надійність формату через entities[] - окрема ліга**. Це найрозумніший вибір у трійці.\n- Гарантована очистка ресурсів через ManagedRuntime/acquireRelease - в продакшні це важливо.\n- Розбиття на файли за відповідальністю - dramatically легше навігувати, ніж 1850-рядковий vercel adapter.\n- typed errors через Effect - можна `Effect.catchTag('GrammyEntityError', ...)`, що дає сильну дисципліну fallback-ів.\n- Покриття media-типів (включаючи voice transcription) ширше, ніж у двох інших.\n- Тести в кожному модулі (`*.test.ts` поряд з кожним файлом).\n\nСпірне:\n- 18 файлів на одну платформу - це багато. Особливо `runtime.ts` + `services.ts` + `layers.ts` + `index.ts` - чотири шари тільки для wiring DI. Effect ентузіасту це нормально, новачку - cliff.\n- Cognitive load Effect-TS v4 високий. CLAUDE.md явно це визнає (skill effect-ts/SKILL.md).\n- Тільки polling, без webhook-варіанту. Vercel-style auto mode був би красивим бонусом для self-hosted сетапу за ngrok.\n- `chat-sdk-bridge` ще одне джерело inbound flows - не ясно тут чи це data-flow паралель чи fallback.\n\nСпірне у vercel:\n- 1,850 LOC у одному файлі - попри ультрацит \"keep functions focused\"... сам клас занадто великий.\n- `parse_mode: 'MarkdownV2'` - надійний, але на нижньому рівні crash-prone порівняно з entities approach.\n- `messageCache: Map` як єдина \"history\" - це чесно, але робить fetchMessages напівжартом.\n\nСпірне у pi:\n- 1,130 LOC closures з mutable shared state (typingInterval, activeTelegramTurn, queuedTelegramTurns, previewState) - просто, але коли щось зламається, debug буде непростим.\n- Жодних тестів.\n- Hardcoded single user.\n\nЯкби я мав обирати під твою задачу (multi-channel persistent host) - зробив би ровно те, що зробив ти у nanoclaw. Якщо це 100% твій код - то ти писав максимально технічно міцний варіант. Може бути забагато для proof-of-concept, але якщо мета - довговічний особистий бот, який не падатиме і не буде ламатись на edge cases - це правильна інвестиція."
+          }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "stop_details": null,
+        "usage": {
+          "input_tokens": 1,
+          "cache_creation_input_tokens": 2900,
+          "cache_read_input_tokens": 133071,
+          "output_tokens": 5119,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 2900,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [
+            {
+              "input_tokens": 1,
+              "output_tokens": 5119,
+              "cache_read_input_tokens": 133071,
+              "cache_creation_input_tokens": 2900,
+              "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 2900
+              },
+              "type": "message"
+            }
+          ],
+          "speed": "standard"
+        }
+      },
+      "parent_tool_use_id": null,
+      "uuid": "ba9ebac9-ed42-4b97-b200-10830764f7fb",
+      "session_id": "fbb71a63-22bb-4986-958e-59d8324f342c"
+    },
+    {
+      "type": "assistant",
+      "message": {
+        "model": "claude-opus-4-7",
+        "id": "msg_013sxWwLSriBDxw13MotJGXG",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_01GCASMo98GiB3zzH8xwGyVX",
+            "name": "TodoWrite",
+            "input": {
+              "todos": [
+                {
+                  "content": "Read nanoclaw telegram-grammy adapter files",
+                  "activeForm": "Reading nanoclaw telegram-grammy adapter",
+                  "status": "completed"
+                },
+                {
+                  "content": "Read vercel chat adapter-telegram",
+                  "activeForm": "Reading vercel chat adapter-telegram",
+                  "status": "completed"
+                },
+                {
+                  "content": "Read pi-telegram (badlogic)",
+                  "activeForm": "Reading pi-telegram",
+                  "status": "completed"
+                },
+                {
+                  "content": "Compare approaches and write analysis",
+                  "activeForm": "Comparing approaches and writing analysis",
+                  "status": "completed"
+                }
+              ]
+            },
+            "caller": {
+              "type": "direct"
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "stop_details": null,
+        "usage": {
+          "input_tokens": 1,
+          "cache_creation_input_tokens": 2900,
+          "cache_read_input_tokens": 133071,
+          "output_tokens": 5119,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 2900,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [
+            {
+              "input_tokens": 1,
+              "output_tokens": 5119,
+              "cache_read_input_tokens": 133071,
+              "cache_creation_input_tokens": 2900,
+              "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 2900
+              },
+              "type": "message"
+            }
+          ],
+          "speed": "standard"
+        }
+      },
+      "parent_tool_use_id": null,
+      "uuid": "d18a6acf-c35a-4a5b-a1b2-87466701956e",
+      "session_id": "fbb71a63-22bb-4986-958e-59d8324f342c"
+    }
+  ]
+}
