@@ -213,7 +213,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         log.info('Inbound DM received', {
           adapter: adapter.name,
           channelId,
-          sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
+          sender: message.author.fullName || message.author.userId || 'unknown',
           threadId: thread.id,
         });
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true));

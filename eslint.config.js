@@ -25,7 +25,13 @@ export default [
           ignoreRestSiblings: true,
         },
       ],
-      'no-catch-all/no-catch-all': 'warn',
+      // Disabled: NanoClaw is a long-running daemon with many I/O boundaries
+      // (poll loops, adapter lifecycle, best-effort fs ops, retry-on-anything,
+      // lookup-with-default). Catch-all + log-and-continue is the correct
+      // pattern in nearly every site; narrowing + rethrowing would crash the
+      // host on unknown errors instead of degrading gracefully. Real bugs
+      // surface in logs/nanoclaw.error.log, not as lint warnings.
+      'no-catch-all/no-catch-all': 'off',
       '@typescript-eslint/no-explicit-any': 'warn',
     },
   },
@@ -44,13 +50,11 @@ export default [
     },
     rules: {
       // Catch dropped Effect→Promise boundary mistakes. These are the real
-      // safety rules in an Effect-TS island.
+      // safety rules in an Effect-TS island — failure handling lives in the
+      // typed E channel, so the lint job here is just to make sure no Promise
+      // escapes that boundary unhandled.
       '@typescript-eslint/no-floating-promises': 'error',
       '@typescript-eslint/no-misused-promises': 'error',
-      // no-catch-all stays at global-default (warn). Effect-TS enforces
-      // failure handling via the typed E channel; try/catch at the
-      // Effect→Promise boundary is idiomatic and intentionally swallows
-      // (e.g. bot.stop() when bot never started).
     },
   },
 ]

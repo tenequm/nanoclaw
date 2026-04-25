@@ -26,7 +26,7 @@
  * sender_identity). A retry / rapid second message from the same unknown
  * sender is silently dropped (no duplicate card sent).
  */
-import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
+import { type RawOption } from '../../channels/ask-question.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';

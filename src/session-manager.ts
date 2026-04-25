@@ -19,7 +19,6 @@ import { DATA_DIR } from './config.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import {
   createSession,
-  findSession,
   findSessionByAgentGroup,
   findSessionForAgent,
   getSession,
