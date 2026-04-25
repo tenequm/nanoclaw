@@ -167,3 +167,42 @@ If a user wants tasks running more than ~2x daily and a script can't reduce agen
 - Suggest restructuring with a script that checks the condition first
 - If the user needs an LLM to evaluate data, suggest using an API key with direct Anthropic API calls inside the script
 - Help the user find the minimum viable frequency
+
+## Video Downloads (yt-dlp + Instagram)
+
+### yt-dlp - General Usage
+
+For Instagram reels/video - always use format '1' (native H.264 mp4), NOT DASH:
+
+```
+yt-dlp -f 1 "<URL>" -o ~/Downloads/videos/<filename>.mp4
+```
+
+- Format '1' = H.264, embedded audio, correct SAR, no muxing needed
+- DASH formats (dash-v + dash-a) = VP9, require muxing with ffmpeg, and mess up aspect ratio on mobile
+- After download, send via curl to Telegram Bot API with `width` and `height` parameters
+
+### Instagram - Choosing the Right Tool
+
+| Situation                                    | Tool                          |
+|----------------------------------------------|-------------------------------|
+| Reel / single video                          | `yt-dlp -f 1 "<URL>"`         |
+| yt-dlp returns 0 items or format unavailable | `instaloader -- -<SHORTCODE>` |
+| Carousel (multiple photos/videos)            | `instaloader -- -<SHORTCODE>` |
+
+### How to Get SHORTCODE
+
+From URL: `instagram.com/p/DWs_UtSCG5z/` → shortcode = `DWs_UtSCG5z`
+
+### Carousel Downloads with instaloader
+
+```
+instaloader -- -<SHORTCODE>
+# Files are saved to folder ./-<SHORTCODE>/
+```
+
+Send carousels via `sendMediaGroup` (album), video via `sendVideo`.
+
+### Note
+
+"instagram-saver" (Cobalt V7 API) is dead - shut down November 2024, do not use.
