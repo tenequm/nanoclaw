@@ -17,6 +17,7 @@ import {
   getMessagingGroupByPlatform,
   getMessagingGroupAgentByPair,
 } from '../src/db/messaging-groups.js';
+import { addMember } from '../src/modules/permissions/db/agent-group-members.js';
 import { isValidGroupFolder } from '../src/group-folder.js';
 import { initGroupFilesystem } from '../src/group-init.js';
 import { log } from '../src/log.js';
@@ -167,18 +168,18 @@ export async function run(args: string[]): Promise<void> {
   if (!existing) {
     newlyWired = true;
     const mgaId = generateId('mga');
-    const triggerRules = parsed.trigger
-      ? JSON.stringify({
-          pattern: parsed.trigger,
-          requiresTrigger: parsed.requiresTrigger,
-        })
-      : null;
+    // Mirrors scripts/init-first-agent.ts:167-170. DMs (is_group=0) default
+    // to "respond to everything" via a '.' regex; group chats default to
+    // mention-only (admins upgrade via /manage-channels later). The CLI's
+    // --trigger flag, when set, becomes the DM regex.
     createMessagingGroupAgent({
       id: mgaId,
       messaging_group_id: messagingGroup.id,
       agent_group_id: agentGroup.id,
-      trigger_rules: triggerRules,
-      response_scope: 'all',
+      engage_mode: messagingGroup.is_group === 0 ? 'pattern' : 'mention',
+      engage_pattern: messagingGroup.is_group === 0 ? (parsed.trigger || '.') : null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
       session_mode: parsed.sessionMode,
       priority: 0,
       created_at: new Date().toISOString(),
@@ -188,6 +189,20 @@ export async function run(args: string[]): Promise<void> {
       agentGroup: agentGroup.id,
       messagingGroup: messagingGroup.id,
     });
+
+    // For 1:1 DMs the messaging group's platform_id is also the user's id
+    // (users(id) format is `<channel>:<handle>`, identical to platform_id
+    // for DMs). The pairing flow upserts that user before register runs,
+    // so the FK is satisfied. addMember is INSERT OR IGNORE — no-op for
+    // owners and re-runs. Mirrors init-first-agent.ts:258-267.
+    if (messagingGroup.is_group === 0) {
+      addMember({
+        user_id: messagingGroup.platform_id,
+        agent_group_id: agentGroup.id,
+        added_by: null,
+        added_at: new Date().toISOString(),
+      });
+    }
   }
 
   // 4. Send onboarding message — only on first wiring, not re-registration

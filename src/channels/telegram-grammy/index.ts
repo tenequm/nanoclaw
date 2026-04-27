@@ -110,7 +110,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
           }).pipe(Effect.catchCause(() => Effect.void));
           if (!parsed) return;
           const user = ctx.from;
-          onAction(parsed.questionId, parsed.value, user ? `telegram:${user.id}` : '');
+          onAction(parsed.questionId, parsed.value, user ? String(user.id) : '');
         });
 
         bot.on('message', (ctx) => {
