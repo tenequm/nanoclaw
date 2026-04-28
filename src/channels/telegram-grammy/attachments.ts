@@ -119,9 +119,7 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
       size,
       maxBytes: config.maxFileSizeBytes,
     });
-    return yield* Effect.fail(
-      new AttachmentTooLarge({ fileId: att.fileId, size, maxBytes: config.maxFileSizeBytes }),
-    );
+    return yield* Effect.fail(new AttachmentTooLarge({ fileId: att.fileId, size, maxBytes: config.maxFileSizeBytes }));
   }
 
   const remotePath = file.file_path;

@@ -34,12 +34,7 @@ import {
 } from './services.js';
 import { GrammyNetworkError, LocalFileUntrusted, TelegramConfigInvalid } from './errors.js';
 import type { InboundAttachment } from './inbound.js';
-import {
-  AdapterConfigService,
-  BotService,
-  GroupFolderService,
-  TranscriptionService,
-} from './services.js';
+import { AdapterConfigService, BotService, GroupFolderService, TranscriptionService } from './services.js';
 import { validateApiRoot, validateMaxFileMb } from './runtime.js';
 
 let tmpRoot: string;
