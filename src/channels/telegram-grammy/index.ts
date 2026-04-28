@@ -48,10 +48,21 @@ class TelegramGrammyAdapter implements ChannelAdapter {
   private runtime: AdapterRuntime | null = null;
   private connected = false;
 
-  constructor(private readonly token: string) {}
+  constructor(
+    private readonly token: string,
+    private readonly apiRootRaw: string | undefined,
+    private readonly maxFileMbRaw: string | undefined,
+    private readonly localFilesDirRaw: string | undefined,
+  ) {}
 
   async setup(hostConfig: ChannelSetup): Promise<void> {
-    const runtime = buildRuntime({ token: this.token, hostConfig });
+    const runtime = buildRuntime({
+      token: this.token,
+      apiRootRaw: this.apiRootRaw,
+      maxFileMbRaw: this.maxFileMbRaw,
+      localFilesDirRaw: this.localFilesDirRaw,
+      hostConfig,
+    });
     this.runtime = runtime;
 
     await runtime.runPromise(
@@ -221,9 +232,19 @@ class TelegramGrammyAdapter implements ChannelAdapter {
 
 registerChannelAdapter(CHANNEL_TYPE, {
   factory: () => {
-    const env = readEnvFile(['TELEGRAM_BOT_TOKEN']);
+    const env = readEnvFile([
+      'TELEGRAM_BOT_TOKEN',
+      'TELEGRAM_API_ROOT',
+      'TELEGRAM_MAX_FILE_MB',
+      'TELEGRAM_LOCAL_FILES_DIR',
+    ]);
     if (!env.TELEGRAM_BOT_TOKEN) return null;
-    return new TelegramGrammyAdapter(env.TELEGRAM_BOT_TOKEN);
+    return new TelegramGrammyAdapter(
+      env.TELEGRAM_BOT_TOKEN,
+      env.TELEGRAM_API_ROOT,
+      env.TELEGRAM_MAX_FILE_MB,
+      env.TELEGRAM_LOCAL_FILES_DIR,
+    );
   },
 });
 

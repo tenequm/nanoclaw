@@ -51,11 +51,30 @@ export class GrammyUnknownError extends Schema.TaggedErrorClass<GrammyUnknownErr
 export class AttachmentTooLarge extends Schema.TaggedErrorClass<AttachmentTooLarge>()('AttachmentTooLarge', {
   fileId: Schema.String,
   size: Schema.Number,
+  maxBytes: Schema.Number,
 }) {}
 
 export class AttachmentFetchFailed extends Schema.TaggedErrorClass<AttachmentFetchFailed>()('AttachmentFetchFailed', {
   fileId: Schema.String,
   cause: Schema.Defect,
+}) {}
+
+export class TelegramConfigInvalid extends Schema.TaggedErrorClass<TelegramConfigInvalid>()('TelegramConfigInvalid', {
+  field: Schema.String,
+  value: Schema.String,
+  reason: Schema.String,
+}) {}
+
+/**
+ * Self-hosted Bot API server in `--local` mode returned an absolute
+ * `file_path` that doesn't fall under the trusted container root. Either
+ * the server is misconfigured or someone is attempting a path-traversal
+ * attack. Defense-in-depth on top of the bot-api server's own filesystem
+ * boundary.
+ */
+export class LocalFileUntrusted extends Schema.TaggedErrorClass<LocalFileUntrusted>()('LocalFileUntrusted', {
+  filePath: Schema.String,
+  trustedRoot: Schema.String,
 }) {}
 
 export class PairingFailed extends Schema.TaggedErrorClass<PairingFailed>()('PairingFailed', {

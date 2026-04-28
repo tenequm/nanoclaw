@@ -124,6 +124,39 @@ describe('reply_to + quoted_message rendering', () => {
   });
 });
 
+describe('attachment rendering', () => {
+  it('renders saved-to path when localPath is present', () => {
+    insertMessage('m1', 'chat', {
+      sender: 'Alice',
+      text: 'see attached',
+      attachments: [{ type: 'document', name: 'report.pdf', localPath: 'agent/attachments/report.pdf' }],
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[document: report.pdf — saved to /workspace/agent/attachments/report.pdf]');
+  });
+
+  it('renders failure reason when error is set and localPath is absent', () => {
+    insertMessage('m1', 'chat', {
+      sender: 'Alice',
+      text: 'big file',
+      attachments: [{ type: 'document', name: 'big.pdf', error: 'exceeds 20 MB cap (file is 21 MB)' }],
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[document: big.pdf — failed: exceeds 20 MB cap (file is 21 MB)]');
+    expect(result).not.toContain('saved to');
+  });
+
+  it('XML-escapes the error reason', () => {
+    insertMessage('m1', 'chat', {
+      sender: 'Alice',
+      text: 'oops',
+      attachments: [{ type: 'document', name: 'x.pdf', error: '<bad> & "broken"' }],
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('failed: &lt;bad&gt; &amp; &quot;broken&quot;');
+  });
+});
+
 describe('XML escaping', () => {
   it('escapes <, >, &, " in sender and body', () => {
     insertMessage('m1', 'chat', {

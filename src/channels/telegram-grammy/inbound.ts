@@ -199,6 +199,14 @@ export interface InboundAttachment {
   /** Populated by attachments.ts after successful download, consumed by the agent-runner. */
   localPath?: string;
   transcript?: string;
+  /**
+   * Populated by attachments.ts when materialization fails (e.g. file
+   * exceeds the configured cap, or `getFile` errored). Mutually exclusive
+   * with `localPath`. Rendered into the agent's message context by the
+   * agent-runner formatter so the agent can tell the user *why* the
+   * attachment didn't land.
+   */
+  error?: string;
 }
 
 /**

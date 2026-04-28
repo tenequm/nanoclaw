@@ -227,9 +227,13 @@ function formatAttachments(attachments: any[] | undefined): string {
     const type = a.type || 'file';
     const localPath = a.localPath ? `/workspace/${a.localPath}` : '';
     const url = a.url || '';
+    const error = typeof a.error === 'string' && a.error ? a.error : '';
     const transcriptSuffix = a.transcript ? ` transcript: "${escapeXml(a.transcript)}"` : '';
     if (localPath) {
       return `[${type}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]${transcriptSuffix}`;
+    }
+    if (error) {
+      return `[${type}: ${escapeXml(name)} — failed: ${escapeXml(error)}]`;
     }
     const base = url ? `[${type}: ${escapeXml(name)} (${escapeXml(url)})]` : `[${type}: ${escapeXml(name)}]`;
     return `${base}${transcriptSuffix}`;

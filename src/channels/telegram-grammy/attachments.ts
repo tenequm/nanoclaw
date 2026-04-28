@@ -1,31 +1,53 @@
 /**
  * Inbound attachment materialization.
  *
- * grammY hands us `file_id`s, not bytes. This module resolves each id via
- * `bot.api.getFile`, streams the payload to `<groupFolder>/attachments/`
- * via `Effect.acquireRelease` (guaranteed cleanup of the write stream
- * even on interrupt), and — for voice/audio — transcribes it through the
- * optional TranscriptionService.
+ * grammY hands us `file_id`s. The `@grammyjs/files` plugin (installed in
+ * `BotLayer`) hydrates `bot.api.getFile` results with `download(path)` /
+ * `getUrl()`. `download()` auto-dispatches: HTTP fetch when the server
+ * returned a relative `file_path` (cloud or non-`--local` self-hosted),
+ * `fs.copyFile` when it returned an absolute path (`--local` mode). This
+ * module wraps that single call and runs voice/audio transcription
+ * afterwards.
  *
  * Runs before the pairing + router handoff so the agent-runner sees the
  * `localPath` + `transcript` fields already populated on
  * `message.content.attachments[]`.
  */
-import { createWriteStream } from 'fs';
 import fs from 'fs/promises';
 import path from 'path';
-import { Readable } from 'stream';
-import { pipeline } from 'stream/promises';
-import type { ReadableStream as WebReadableStream } from 'stream/web';
 
 import { Effect } from 'effect';
 
-import { resolveGroupFolderPath } from '../../group-folder.js';
-import { AttachmentFetchFailed, AttachmentTooLarge } from './errors.js';
+import { AttachmentFetchFailed, AttachmentTooLarge, LocalFileUntrusted } from './errors.js';
 import type { InboundAttachment } from './inbound.js';
-import { AdapterConfigService, BotService, GroupFolderService, TranscriptionService } from './services.js';
+import {
+  AdapterConfigService,
+  BotService,
+  CONTAINER_LOCAL_ROOT,
+  GroupFolderService,
+  TranscriptionService,
+} from './services.js';
 
-const MAX_FILE_SIZE_BYTES = 20_000_000;
+/**
+ * Translate a server-returned absolute `file_path` (in `--local` mode)
+ * to the host-side path nanoclaw can read. The bot-api server in the
+ * aiogram image always writes under `/var/lib/telegram-bot-api/...`; we
+ * remap that prefix to the configured `localFilesDir` (the host bind-mount
+ * target). Anything outside the trusted prefix throws `LocalFileUntrusted`
+ * — defense-in-depth against a misconfigured/compromised server returning
+ * traversal paths.
+ *
+ * Synchronous because grammY's `buildFilePath` plugin hook is sync. The
+ * throw lands in `materialize`'s `Effect.tryPromise` catch handler and
+ * gets re-failed as a typed error.
+ */
+export function remapTrustedLocalPath(filePath: string, hostRoot: string): string {
+  if (filePath !== CONTAINER_LOCAL_ROOT && !filePath.startsWith(CONTAINER_LOCAL_ROOT + '/')) {
+    throw new LocalFileUntrusted({ filePath, trustedRoot: CONTAINER_LOCAL_ROOT });
+  }
+  const tail = filePath.slice(CONTAINER_LOCAL_ROOT.length).replace(/^\/+/, '');
+  return path.join(hostRoot, tail);
+}
 
 const VOICE_EXTS = new Set(['.ogg', '.oga', '.m4a', '.mp3', '.wav', '.webm']);
 
@@ -77,8 +99,8 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
   // surfaced via the attachment metadata (name field). Skip download.
   if (!att.fileId) return att;
 
-  const folder = yield* folderSvc.resolveForPlatformId(platformId);
-  if (!folder) {
+  const groupDir = yield* folderSvc.resolveForPlatformId(platformId);
+  if (!groupDir) {
     // Pre-pairing — chat isn't wired to an agent yet. Leave the metadata
     // in place so the pairing flow can inspect it; bytes are intentionally
     // dropped because we have nowhere to put them.
@@ -91,12 +113,15 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
   });
 
   const size = file.file_size ?? att.size ?? 0;
-  if (size > MAX_FILE_SIZE_BYTES) {
-    yield* Effect.logWarning('telegram-grammy: attachment exceeds 20MB, keeping metadata only', {
+  if (size > config.maxFileSizeBytes) {
+    yield* Effect.logWarning('telegram-grammy: attachment exceeds size cap, keeping metadata only', {
       fileId: att.fileId,
       size,
+      maxBytes: config.maxFileSizeBytes,
     });
-    return yield* Effect.fail(new AttachmentTooLarge({ fileId: att.fileId, size }));
+    return yield* Effect.fail(
+      new AttachmentTooLarge({ fileId: att.fileId, size, maxBytes: config.maxFileSizeBytes }),
+    );
   }
 
   const remotePath = file.file_path;
@@ -106,7 +131,6 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
     );
   }
 
-  const groupDir = resolveGroupFolderPath(folder);
   const attachDir = path.join(groupDir, 'attachments');
   yield* Effect.tryPromise({
     try: () => fs.mkdir(attachDir, { recursive: true }),
@@ -115,28 +139,17 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
 
   const fileName = destFilename(att, msgId, index, remotePath);
   const destPath = path.join(attachDir, fileName);
-  const url = `https://api.telegram.org/file/bot${config.token}/${remotePath}`;
 
-  yield* Effect.acquireUseRelease(
-    Effect.sync(() => createWriteStream(destPath)),
-    (stream) =>
-      Effect.tryPromise({
-        try: async () => {
-          const res = await fetch(url);
-          if (!res.ok || !res.body) {
-            throw new Error(`Telegram file download ${res.status}`);
-          }
-          // Node types ReadableStream differently than the web API; the
-          // Readable.fromWeb cast is the standard way to bridge.
-          await pipeline(Readable.fromWeb(res.body as unknown as WebReadableStream<Uint8Array>), stream);
-        },
-        catch: (cause) => new AttachmentFetchFailed({ fileId: att.fileId, cause }),
-      }),
-    (stream) =>
-      Effect.sync(() => {
-        if (!stream.destroyed) stream.destroy();
-      }),
-  );
+  // The `@grammyjs/files` plugin handles both HTTP download (cloud /
+  // proxy) and local-file copy (`--local` mode) under one call. A
+  // `LocalFileUntrusted` thrown synchronously from our `buildFilePath`
+  // hook surfaces here as `cause`; we forward it as-is so `materializeAll`
+  // can match it in `catchTags`.
+  yield* Effect.tryPromise({
+    try: () => file.download(destPath),
+    catch: (cause) =>
+      cause instanceof LocalFileUntrusted ? cause : new AttachmentFetchFailed({ fileId: att.fileId, cause }),
+  });
 
   att.localPath = `agent/attachments/${fileName}`;
 
@@ -151,8 +164,10 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
 
 /**
  * Materialize every attachment on a message. Per-attachment failures are
- * logged and the attachment kept with metadata only — one bad file
- * shouldn't sink the whole inbound.
+ * surfaced on `att.error` (consumed by the agent-runner formatter) and
+ * logged — one bad file shouldn't sink the whole inbound. The
+ * `Effect.catchTags` shape gives us exhaustive narrowing across the
+ * tagged-error union from `materialize`.
  */
 export const materializeAll = Effect.fn('telegram-grammy.materializeAll')(function* (
   attachments: InboundAttachment[],
@@ -163,7 +178,22 @@ export const materializeAll = Effect.fn('telegram-grammy.materializeAll')(functi
     attachments,
     (att, i) =>
       materialize(att, msgId, i, platformId).pipe(
-        Effect.catch((err) => Effect.logWarning('telegram-grammy: attachment materialization failed', err)),
+        Effect.catchTags({
+          AttachmentTooLarge: (err) =>
+            Effect.sync(() => {
+              const fileMb = Math.round(err.size / 1_000_000);
+              const capMb = Math.round(err.maxBytes / 1_000_000);
+              att.error = `exceeds ${capMb} MB cap (file is ${fileMb} MB)`;
+            }),
+          AttachmentFetchFailed: (err) =>
+            Effect.sync(() => {
+              att.error = `download failed: ${String(err.cause)}`;
+            }),
+          LocalFileUntrusted: (err) =>
+            Effect.sync(() => {
+              att.error = `untrusted local file path (${err.filePath} not under ${err.trustedRoot})`;
+            }),
+        }),
       ),
     { concurrency: 3, discard: true },
   );

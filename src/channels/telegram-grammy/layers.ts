@@ -14,9 +14,12 @@
 import { Effect, Layer, Schedule } from 'effect';
 import { Bot } from 'grammy';
 import { autoRetry } from '@grammyjs/auto-retry';
+import { hydrateFiles } from '@grammyjs/files';
+
+import { remapTrustedLocalPath } from './attachments.js';
 
 import { createMessagingGroup, getMessagingGroupByPlatform, updateMessagingGroup } from '../../db/messaging-groups.js';
-import { resolveGroupFolderForPlatformId } from '../../group-folder.js';
+import { resolveGroupFolderForPlatformId, resolveGroupFolderPath } from '../../group-folder.js';
 import { grantRole, hasAnyOwner } from '../../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../../modules/permissions/db/users.js';
 import { transcribeAudio } from '../../transcription.js';
@@ -28,12 +31,14 @@ import { makePendingSeenRef } from './reactions.js';
 import {
   AdapterConfigService,
   BotService,
+  DEFAULT_API_ROOT,
   GroupFolderService,
+  type HydratedBot,
   PairingService,
   TranscriptionService,
 } from './services.js';
 
-const stopBotSafely = (b: Bot): Effect.Effect<void> =>
+const stopBotSafely = (b: { isRunning: () => boolean; stop: () => Promise<void> }): Effect.Effect<void> =>
   Effect.tryPromise({
     try: async () => {
       if (b.isRunning()) await b.stop();
@@ -49,8 +54,30 @@ export const BotLayer = Layer.effect(
 
     const bot = yield* Effect.acquireRelease(
       Effect.sync(() => {
-        const b = new Bot(config.token);
+        // Cloud Bot API is the default; only pass `client` options when
+        // pointing at a self-hosted server. The 15 min `timeoutSeconds`
+        // matches grammY's recommendation for self-hosted file transfers
+        // (default 500 s) — see grammy.dev/ref/core/apiclientoptions.
+        const isSelfHosted = config.apiRoot !== DEFAULT_API_ROOT;
+        const opts = isSelfHosted ? { client: { apiRoot: config.apiRoot, timeoutSeconds: 900 } } : undefined;
+        // The `Bot` constructor returns the unflavored type; downstream we
+        // expose it as `HydratedBot` (with `FileApiFlavor`) once the files
+        // plugin is installed.
+        const b = new Bot(config.token, opts) as unknown as HydratedBot;
         b.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 30 }));
+        // `@grammyjs/files`: hoists `download()` / `getUrl()` onto
+        // `bot.api.getFile` results. `buildFilePath` is only consulted when
+        // the server returns an absolute path (`--local` mode); when
+        // `localFilesDir` is null we never opt into that path and the
+        // plugin falls back to HTTP via `apiRoot`.
+        b.api.config.use(
+          hydrateFiles(config.token, {
+            apiRoot: config.apiRoot,
+            buildFilePath: config.localFilesDir
+              ? (_root, _token, filePath) => remapTrustedLocalPath(filePath, config.localFilesDir as string)
+              : undefined,
+          }),
+        );
         return b;
       }),
       (b) => stopBotSafely(b),
@@ -142,7 +169,16 @@ export const TranscriptionLayer = Layer.succeed(TranscriptionService, {
     }).pipe(Effect.catch(() => Effect.succeed(null))),
 });
 
-/** Messaging-group → agent-group folder lookup. Purely synchronous DB reads. */
+/**
+ * Messaging-group → absolute on-disk attachment dir lookup. Combines the
+ * DB lookup (`resolveGroupFolderForPlatformId`) with `resolveGroupFolderPath`
+ * so callers receive the fully resolved path or null. Synchronous DB reads
+ * + a string join — wrapped in `Effect.sync`.
+ */
 export const GroupFolderLayer = Layer.succeed(GroupFolderService, {
-  resolveForPlatformId: (platformId) => Effect.sync(() => resolveGroupFolderForPlatformId('telegram', platformId)),
+  resolveForPlatformId: (platformId) =>
+    Effect.sync(() => {
+      const folder = resolveGroupFolderForPlatformId('telegram', platformId);
+      return folder ? resolveGroupFolderPath(folder) : null;
+    }),
 });

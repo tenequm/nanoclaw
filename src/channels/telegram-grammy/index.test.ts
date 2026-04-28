@@ -52,7 +52,7 @@ describe('telegram-grammy registration', () => {
     const { TelegramGrammyAdapter } = await import('./index.js');
     // We can't do a real start without hitting Telegram — just assert
     // the class exists and constructs with a token placeholder.
-    const instance: ChannelAdapter = new TelegramGrammyAdapter('0:placeholder');
+    const instance: ChannelAdapter = new TelegramGrammyAdapter('0:placeholder', undefined, undefined, undefined);
     expect(instance.name).toBe('telegram');
     expect(instance.channelType).toBe('telegram');
     expect(instance.supportsThreads).toBe(false);
