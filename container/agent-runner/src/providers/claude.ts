@@ -2,7 +2,14 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import {
+  query as sdkQuery,
+  type HookCallback,
+  type PreCompactHookInput,
+  type SDKAssistantMessage,
+  type SDKMessage,
+  type SDKResultMessage,
+} from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
@@ -309,17 +316,179 @@ function transcriptStartMs(transcriptPath: string): number | null {
   }
 }
 
+// ── SDK message classification (translator helpers) ──
+
+/**
+ * Text + tool-use summary for an `SDKAssistantMessage`. We surface text-only
+ * AMs as `result` events and AMs containing any `tool_use` block as
+ * `progress` events (per Anthropic's documented "AssistantMessage = per-turn
+ * progress, ResultMessage = lifecycle" model).
+ */
+interface AssistantTextSummary {
+  text: string;
+  hasToolUse: boolean;
+}
+
+export function extractAssistantText(message: SDKAssistantMessage): AssistantTextSummary {
+  let text = '';
+  let hasToolUse = false;
+  for (const block of message.message.content) {
+    if (block.type === 'text') text += block.text;
+    else if (block.type === 'tool_use') hasToolUse = true;
+  }
+  return { text: text.trim(), hasToolUse };
+}
+
+export const RESULT_ERROR_MESSAGES: Record<string, string> = {
+  error_max_turns: 'Agent reached the maximum turn limit before finishing.',
+  error_max_budget_usd: 'Agent reached the budget limit before finishing.',
+  error_during_execution: 'Agent execution was interrupted by an error.',
+  error_max_structured_output_retries:
+    'Agent failed to produce valid structured output after retries.',
+};
+
+export type ResultClassification =
+  | { kind: 'success'; text: string }
+  | { kind: 'refusal' }
+  | { kind: 'error'; subtype: string; message: string };
+
+export function classifyResult(message: SDKResultMessage): ResultClassification {
+  if (message.subtype !== 'success') {
+    return {
+      kind: 'error',
+      subtype: message.subtype,
+      message: RESULT_ERROR_MESSAGES[message.subtype] ?? `Agent stopped: ${message.subtype}`,
+    };
+  }
+  // Narrowed to SDKResultSuccess. `result` is `string` (always present).
+  if (message.stop_reason === 'refusal') return { kind: 'refusal' };
+  return { kind: 'success', text: (message as { result: string }).result };
+}
+
+/**
+ * Translate the Claude Agent SDK's message stream into our `ProviderEvent`
+ * stream. Per Anthropic's documented model:
+ *   - `AssistantMessage` is the per-turn progress/final-reply vehicle.
+ *   - `ResultMessage` is the lifecycle/cost/error-classification vehicle.
+ * Exported (rather than inlined into `query()`) so we can replay real JSONL
+ * transcripts through it in tests.
+ */
+export async function* translateSdkMessages(
+  source: AsyncIterable<SDKMessage>,
+  isAborted: () => boolean = () => false,
+): AsyncGenerator<ProviderEvent> {
+  let messageCount = 0;
+  // Last text emitted as a final `result` event from a text-only AM.
+  // Used to de-dup against ResultMessage.result, which mirrors it on success.
+  let lastFinalText: string | null = null;
+
+  for await (const message of source) {
+    if (isAborted()) return;
+    messageCount++;
+
+    // Liveness: every SDK event keeps the heartbeat fresh.
+    yield { type: 'activity' };
+
+    switch (message.type) {
+      case 'system': {
+        // Narrowed to SDKSystemMessage | SDKAPIRetryMessage |
+        // SDKCompactBoundaryMessage | SDKTaskNotificationMessage.
+        switch ((message as { subtype?: string }).subtype) {
+          case 'init':
+            yield { type: 'init', continuation: (message as { session_id: string }).session_id };
+            break;
+          case 'api_retry':
+            yield { type: 'error', message: 'API retry', retryable: true };
+            break;
+          case 'compact_boundary': {
+            const pre = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata?.pre_tokens;
+            const detail = pre ? ` (${pre.toLocaleString()} tokens compacted)` : '';
+            yield { type: 'result', text: `Context compacted${detail}.` };
+            break;
+          }
+          case 'task_notification':
+            yield { type: 'progress', message: (message as { summary?: string }).summary || 'Task notification' };
+            break;
+        }
+        break;
+      }
+
+      case 'rate_limit_event': {
+        // SDKRateLimitEvent is its own top-level type, not a `system` subtype.
+        // Surface only `rejected` status; `allowed` and `allowed_warning` are informational.
+        if ((message as { rate_limit_info?: { status?: string } }).rate_limit_info?.status === 'rejected') {
+          yield {
+            type: 'error',
+            message: 'Rate limit reached.',
+            retryable: false,
+            classification: 'quota',
+          };
+        }
+        break;
+      }
+
+      case 'assistant': {
+        // Skip subagent narration (Task tool spawns these; parent_tool_use_id
+        // is set). We only surface top-level agent output to the user.
+        if ((message as SDKAssistantMessage).parent_tool_use_id != null) break;
+        const { text, hasToolUse } = extractAssistantText(message as SDKAssistantMessage);
+        if (!text) break;
+        if (hasToolUse) {
+          yield { type: 'progress', message: text };
+        } else {
+          lastFinalText = text;
+          yield { type: 'result', text };
+        }
+        break;
+      }
+
+      case 'result': {
+        const classified = classifyResult(message as SDKResultMessage);
+        if (classified.kind === 'error') {
+          yield {
+            type: 'error',
+            message: classified.message,
+            retryable: false,
+            classification: classified.subtype,
+          };
+        } else if (classified.kind === 'refusal') {
+          yield {
+            type: 'error',
+            message: 'Claude declined this request.',
+            retryable: false,
+            classification: 'refusal',
+          };
+        } else if (classified.text && classified.text !== lastFinalText) {
+          // Defensive: RM has text the AM stream didn't surface. Emit it.
+          yield { type: 'result', text: classified.text };
+        }
+        // else: AM stream already delivered the answer; RM is just lifecycle.
+        break;
+      }
+
+      // user, user_replay, partial_assistant, status, hook_*, plugin_install,
+      // tool_progress, auth_status, task_started/updated/progress,
+      // session_state_changed, notification, files_persisted, tool_use_summary,
+      // memory_recall, elicitation_complete, prompt_suggestion,
+      // local_command_output: no user-facing emit. `activity` already yielded.
+    }
+  }
+  log(`Query completed after ${messageCount} SDK messages`);
+}
+
 // ── Provider ──
 
 /**
- * Claude Code auto-compacts context at this window (tokens). Kept here so
- * the generic bootstrap doesn't need to know about Claude-specific env vars.
+ * Currently disabled — the env var takes priority over settings.json, so
+ * forcing a value here clamps every agent regardless of their configured
+ * model's native context window. Leaving it unset lets settings.json's
+ * `autoCompactWindow` (or the native model ceiling) take effect.
  *
  * Operator override: set CLAUDE_CODE_AUTO_COMPACT_WINDOW in the host env to
  * raise or lower the threshold without editing source — useful when running
  * with a 1M-context model variant or when emergency-tuning a deployment.
  */
-const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '165000';
+// const CLAUDE_CODE_AUTO_COMPACT_WINDOW = '165000';
 
 /**
  * Stale-session detection. Matches Claude Code's error text when a
@@ -344,9 +513,16 @@ export class ClaudeProvider implements AgentProvider {
     this.additionalDirectories = options.additionalDirectories;
     this.model = options.model;
     this.effort = options.effort;
+    // Do NOT inject CLAUDE_CODE_AUTO_COMPACT_WINDOW here — the env var takes
+    // priority over settings.json, so a hardcoded fallback would clamp every
+    // agent to 165k regardless of their configured model's context window.
+    // Let settings.json's `autoCompactWindow` (or the native model ceiling)
+    // win. Operators who want a specific value set it in the host env.
     this.env = {
       ...(options.env ?? {}),
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+      ...(process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+        ? { CLAUDE_CODE_AUTO_COMPACT_WINDOW: process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW }
+        : {}),
     };
   }
 
@@ -428,40 +604,10 @@ export class ClaudeProvider implements AgentProvider {
 
     let aborted = false;
 
-    async function* translateEvents(): AsyncGenerator<ProviderEvent> {
-      let messageCount = 0;
-      for await (const message of sdkResult) {
-        if (aborted) return;
-        messageCount++;
-
-        // Yield activity for every SDK event so the poll loop knows the agent is working
-        yield { type: 'activity' };
-
-        if (message.type === 'system' && message.subtype === 'init') {
-          yield { type: 'init', continuation: message.session_id };
-        } else if (message.type === 'result') {
-          const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
-          yield { type: 'result', text };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
-          yield { type: 'error', message: 'API retry', retryable: true };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
-          yield { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
-          const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
-          const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
-          yield { type: 'result', text: `Context compacted${detail}.` };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-          const tn = message as { summary?: string };
-          yield { type: 'progress', message: tn.summary || 'Task notification' };
-        }
-      }
-      log(`Query completed after ${messageCount} SDK messages`);
-    }
-
     return {
       push: (msg) => stream.push(msg),
       end: () => stream.end(),
-      events: translateEvents(),
+      events: translateSdkMessages(sdkResult, () => aborted),
       abort: () => {
         aborted = true;
         stream.end();

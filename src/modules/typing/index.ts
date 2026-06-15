@@ -4,8 +4,16 @@
  * Most platforms expire a typing indicator after 5–10s, so a one-shot
  * call on message arrival goes stale long before the agent finishes
  * thinking. This module keeps it alive by re-firing `setTyping` on a
- * short interval — but only while the agent is actually WORKING, gated
- * on the heartbeat file's mtime after an initial grace period.
+ * short interval, gated on the agent's *turn-in-flight* signal:
+ * `processing_ack` rows in `outbound.db` with status='processing'.
+ *
+ * Why processing_ack and not heartbeat: the container only touches
+ * `.heartbeat` inside the SDK event-stream loop, so during long pure
+ * thinking gaps (especially with `effortLevel='xhigh'`) heartbeat
+ * goes stale even though the agent is alive and working. The Claude
+ * Agent SDK's own contract is that the loop runs until `ResultMessage`
+ * — which corresponds 1:1 with `processing_ack` rows being cleared by
+ * `markCompleted` in container/agent-runner/src/poll-loop.ts.
  *
  * After delivering a user-facing message, the refresh is paused for
  * POST_DELIVERY_PAUSE_MS so the client-side indicator can visually
@@ -17,9 +25,12 @@
  *   - Removing requires editing src/router.ts, src/delivery.ts, and
  *     src/container-runner.ts to drop the calls.
  */
-import fs from 'fs';
+import type Database from 'better-sqlite3';
 
-import { heartbeatPath } from '../../session-manager.js';
+import { openOutboundDb } from '../../session-manager.js';
+import { getProcessingClaims } from '../../db/session-db.js';
+import { isContainerRunning } from '../../container-runner.js';
+import { log } from '../../log.js';
 
 const TYPING_REFRESH_MS = 4000;
 /**
@@ -29,20 +40,21 @@ const TYPING_REFRESH_MS = 4000;
  */
 const TYPING_GRACE_MS = 15000;
 /**
- * After the grace window, a heartbeat must be mtimed within this
- * many ms of now to count as "agent is working." Heartbeats land
- * every few hundred ms during active work, so 6s is well above
- * the working floor and small enough to stop typing quickly when
- * the agent goes idle.
- */
-const HEARTBEAT_FRESH_MS = 6000;
-/**
  * After we deliver a user-facing message, pause typing for this
  * long so the client-side indicator has time to visually clear.
  * Tuned for the longest common expiry (Discord ~10s). The interval
  * stays running; ticks inside the pause just skip the setTyping call.
  */
 const POST_DELIVERY_PAUSE_MS = 10000;
+/**
+ * Absolute ceiling on a single typing-refresher's lifetime. Final
+ * safety net so a forgotten stop / crashed delivery loop can't keep
+ * typing alive indefinitely. Long enough to cover any realistic
+ * single-turn agent loop (xhigh thinking + heavy tool use + 1M
+ * context). The ceiling resets on each new inbound (startedAt is
+ * reset in startTypingRefresh).
+ */
+const TYPING_TTL_MS = 10 * 60 * 1000; // 10 min
 
 interface TypingAdapter {
   setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
@@ -58,6 +70,7 @@ interface TypingTarget {
   interval: NodeJS.Timeout;
   startedAt: number;
   pausedUntil: number; // epoch ms; 0 = not paused
+  outDb: Database.Database | null; // lazily opened on first gating tick
 }
 
 let adapter: TypingAdapter | null = null;
@@ -87,12 +100,42 @@ async function triggerTyping(
   }
 }
 
-function isHeartbeatFresh(agentGroupId: string, sessionId: string): boolean {
-  const hbPath = heartbeatPath(agentGroupId, sessionId);
+/**
+ * Is the agent's turn still in flight for this session?
+ *
+ * Two-stage check:
+ *   1. Container must be running (in-process map, free).
+ *   2. outbound.db must have at least one processing_ack row with
+ *      status='processing'. Container writes these on markProcessing
+ *      (poll-loop.ts:83) and clears via markCompleted on each turn
+ *      boundary (poll-loop.ts:194 — fires after the SDK ResultMessage).
+ *
+ * outbound.db handle is cached on the TypingTarget to avoid open/close
+ * per tick (4s cadence × N sessions adds up). Closed in stopTypingRefresh.
+ */
+function hasInflightWork(entry: TypingTarget, sessionId: string): boolean {
+  if (!isContainerRunning(sessionId)) return false;
+  if (!entry.outDb) {
+    try {
+      entry.outDb = openOutboundDb(entry.agentGroupId, sessionId);
+    } catch {
+      // outbound.db may not exist yet (container hasn't written anything).
+      // Grace window is the right cover for this; treat as "not inflight"
+      // and fall back to grace.
+      return false;
+    }
+  }
   try {
-    const stat = fs.statSync(hbPath);
-    return Date.now() - stat.mtimeMs < HEARTBEAT_FRESH_MS;
+    return getProcessingClaims(entry.outDb).length > 0;
   } catch {
+    // DB handle went bad (file deleted, container restart). Drop and
+    // let the next tick re-open.
+    try {
+      entry.outDb.close();
+    } catch {
+      /* ignore */
+    }
+    entry.outDb = null;
     return false;
   }
 }
@@ -140,15 +183,24 @@ export function startTypingRefresh(
     // expires.
     if (entry.pausedUntil > Date.now()) return;
 
-    const withinGrace = Date.now() - entry.startedAt < TYPING_GRACE_MS;
-    if (withinGrace || isHeartbeatFresh(entry.agentGroupId, sessionId)) {
+    const age = Date.now() - entry.startedAt;
+    // Absolute ceiling — final safety net so a missed stop can't keep
+    // typing alive indefinitely.
+    if (age > TYPING_TTL_MS) {
+      log.warn('Typing refresher hit TTL ceiling, stopping', { sessionId, ageMs: age });
+      stopTypingRefresh(sessionId);
+      return;
+    }
+
+    const withinGrace = age < TYPING_GRACE_MS;
+    if (withinGrace || hasInflightWork(entry, sessionId)) {
       triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
       return;
     }
 
-    // Out of grace AND heartbeat stale — agent is idle, stop refreshing.
-    clearInterval(entry.interval);
-    typingRefreshers.delete(sessionId);
+    // Out of grace AND no inflight processing_ack — agent's turn is
+    // done, stop refreshing.
+    stopTypingRefresh(sessionId);
   }, TYPING_REFRESH_MS);
   // unref so a stale refresher can't hold the event loop alive.
   interval.unref();
@@ -161,6 +213,7 @@ export function startTypingRefresh(
     interval,
     startedAt,
     pausedUntil: 0,
+    outDb: null,
   });
 }
 
@@ -180,5 +233,12 @@ export function stopTypingRefresh(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
   clearInterval(entry.interval);
+  if (entry.outDb) {
+    try {
+      entry.outDb.close();
+    } catch {
+      /* ignore */
+    }
+  }
   typingRefreshers.delete(sessionId);
 }

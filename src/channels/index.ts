@@ -7,3 +7,14 @@
 // self-registration import below.
 
 import './cli.js';
+
+// Telegram — two implementations, one channel_type ('telegram'). Keep exactly
+// one active; whichever imports last wins in the registry.
+//
+// Legacy implementation — delegates to @chat-adapter/telegram (Chat SDK bridge).
+// Kept as a fallback in case the grammY implementation regresses.
+// import './telegram.js';
+//
+// grammY + Effect-TS v4 implementation — parse-error-immune (sends entities[]
+// instead of parse_mode). Default since the MarkdownV2 parse-failure incidents.
+import './telegram-grammy/index.js';

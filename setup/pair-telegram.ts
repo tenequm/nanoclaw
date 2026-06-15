@@ -1,23 +1,17 @@
 /**
  * Step: pair-telegram — issue a one-time pairing code and wait for the
- * operator to send the code from the chat they want to register.
+ * operator to send `@botname CODE` from the chat they want to register.
  *
- * Emits machine-readable status blocks only. The parent driver
- * (`setup:auto`) renders the code / attempt / success UI with clack. Running
- * this step directly will look sparse — that's intentional.
+ * On success, prints platformId / isGroup / pairedUserId / intent. The caller
+ * (skill) can then wire the chat to an agent group (e.g. via /init-first-agent
+ * or setup --step register). telegram.ts's inbound interceptor has already
+ * upserted the paired user and granted owner if no owner existed yet.
  *
- * Blocks emitted:
- *   PAIR_TELEGRAM_CODE       { CODE, REASON=initial|regenerated }
- *   PAIR_TELEGRAM_ATTEMPT    { CANDIDATE }
- *   PAIR_TELEGRAM (final)    { STATUS=success, CODE, INTENT, PLATFORM_ID,
- *                              IS_GROUP, PAIRED_USER_ID }
- *                         or { STATUS=failed, CODE, ERROR }
- *
- * Depends on src/channels/telegram-pairing.js, which setup/add-telegram.sh
- * copies in from the `channels` branch before this step runs. setup/ is
- * excluded from the host tsconfig, so this file's import resolves only at
- * runtime — tsc won't complain on branches that haven't run add-telegram yet.
+ * The service must already be running so the telegram adapter is polling.
  */
+import { initDb } from '../src/db/connection.js';
+import { runMigrations } from '../src/db/migrations/index.js';
+import { DATA_DIR } from '../src/config.js';
 import path from 'path';
 
 import {
@@ -25,25 +19,24 @@ import {
   waitForPairing,
   type PairingIntent,
 } from '../src/channels/telegram-pairing.js';
-import { DATA_DIR } from '../src/config.js';
-import { initDb } from '../src/db/connection.js';
-import { runMigrations } from '../src/db/migrations/index.js';
-
 import { emitStatus } from './status.js';
 
 function parseArgs(args: string[]): PairingIntent {
   let intent: PairingIntent = 'main';
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--intent') {
-      const raw = args[++i] || 'main';
-      if (raw === 'main') {
-        intent = 'main';
-      } else if (raw.startsWith('wire-to:')) {
-        intent = { kind: 'wire-to', folder: raw.slice('wire-to:'.length) };
-      } else if (raw.startsWith('new-agent:')) {
-        intent = { kind: 'new-agent', folder: raw.slice('new-agent:'.length) };
-      } else {
-        throw new Error(`Unknown intent: ${raw}`);
+    switch (args[i]) {
+      case '--intent': {
+        const raw = args[++i] || 'main';
+        if (raw === 'main') {
+          intent = 'main';
+        } else if (raw.startsWith('wire-to:')) {
+          intent = { kind: 'wire-to', folder: raw.slice('wire-to:'.length) };
+        } else if (raw.startsWith('new-agent:')) {
+          intent = { kind: 'new-agent', folder: raw.slice('new-agent:'.length) };
+        } else {
+          throw new Error(`Unknown intent: ${raw}`);
+        }
+        break;
       }
     }
   }
@@ -58,18 +51,20 @@ function intentToString(intent: PairingIntent): string {
 export async function run(args: string[]): Promise<void> {
   const intent = parseArgs(args);
 
-  // Pairing stores state under DATA_DIR; the DB isn't strictly needed for the
-  // pairing primitive itself, but the inbound interceptor running inside the
-  // live service needs migrations applied. Touch it here so a fresh install
-  // doesn't fail on the first code match.
+  // Pairing reads/writes its JSON store under DATA_DIR; the DB isn't strictly
+  // required for the pairing primitive itself, but the inbound interceptor
+  // (running in the live service) needs it. Touch it here so a fresh install
+  // doesn't blow up on the first match.
   const db = initDb(path.join(DATA_DIR, 'v2.db'));
   runMigrations(db);
 
   const MAX_REGENERATIONS = 5;
   let record = await createPairing(intent);
-  emitStatus('PAIR_TELEGRAM_CODE', {
+  emitStatus('PAIR_TELEGRAM_ISSUED', {
     CODE: record.code,
-    REASON: 'initial',
+    INTENT: intentToString(intent),
+    INSTRUCTIONS: `Send "${record.code}" from the Telegram chat you want to register (or "@<botname> ${record.code}" in a group with privacy on).`,
+    REMINDER_TO_ASSISTANT: `Your next user-visible message MUST include this CODE in plain text — the bash tool output this block is in gets collapsed in the UI.`,
   });
 
   for (let regen = 0; regen <= MAX_REGENERATIONS; regen++) {
@@ -77,11 +72,13 @@ export async function run(args: string[]): Promise<void> {
       const consumed = await waitForPairing(record.code, {
         onAttempt: (a) => {
           emitStatus('PAIR_TELEGRAM_ATTEMPT', {
-            CANDIDATE: a.candidate,
+            EXPECTED_CODE: record.code,
+            RECEIVED_CODE: a.candidate,
+            PLATFORM_ID: a.platformId,
+            AT: a.at,
           });
         },
       });
-
       emitStatus('PAIR_TELEGRAM', {
         STATUS: 'success',
         CODE: record.code,
@@ -98,17 +95,20 @@ export async function run(args: string[]): Promise<void> {
       const invalidated = /invalidated by wrong code/.test(message);
       if (invalidated && regen < MAX_REGENERATIONS) {
         record = await createPairing(intent);
-        emitStatus('PAIR_TELEGRAM_CODE', {
+        emitStatus('PAIR_TELEGRAM_NEW_CODE', {
           CODE: record.code,
-          REASON: 'regenerated',
+          INTENT: intentToString(intent),
+          REASON: 'previous code invalidated by wrong attempt',
+          REGENERATIONS_LEFT: MAX_REGENERATIONS - regen - 1,
+          INSTRUCTIONS: `Send "${record.code}" from the Telegram chat you want to register.`,
+          REMINDER_TO_ASSISTANT: `Your next user-visible message MUST include this CODE in plain text — the bash tool output this block is in gets collapsed in the UI.`,
         });
         continue;
       }
-      const reason = invalidated ? 'max-regenerations-exceeded' : message;
       emitStatus('PAIR_TELEGRAM', {
         STATUS: 'failed',
         CODE: record.code,
-        ERROR: reason,
+        ERROR: invalidated ? 'max-regenerations-exceeded' : message,
       });
       process.exit(2);
     }

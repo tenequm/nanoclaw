@@ -46,3 +46,6 @@ AGENTS.md
 docs/maintainer-guide.md
 docs/drafts/
 forks.md
+
+# Claude Code scheduled task lock file (local, not committed)
+.claude/scheduled_tasks.lock

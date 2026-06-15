@@ -49,6 +49,8 @@ Each session has **two** SQLite files under `data/v2-sessions/<session_id>/`:
 
 Exactly one writer per file — no cross-mount lock contention. Heartbeat is a file touch at `/workspace/.heartbeat`, not a DB update. Host uses even `seq` numbers, container uses odd.
 
+**Gating UX on container state.** Heartbeat only fires when the SDK's event loop runs; long pure-thinking gaps (e.g. `effortLevel: xhigh`) make it stale even though the agent is alive. For user-facing signals like typing indicators, gate on `outbound.db` `processing_ack` rows instead — the container clears them on each turn's `ResultMessage`, so the row mirrors the SDK turn lifecycle exactly. See `src/modules/typing/index.ts`.
+
 ## Central DB
 
 `data/v2.db` holds everything that isn't per-session: users, user_roles, agent_groups, messaging_groups, wiring, pending_approvals, user_dms, chat_sdk_* (for the Chat SDK bridge), schema_version. Migrations live at `src/db/migrations/`.
@@ -84,6 +86,18 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `scripts/init-first-agent.ts` | Bootstrap the first DM-wired agent (used by `/init-first-agent` skill) |
 | `migrate-v2.sh` + `setup/migrate-v2/` | v1→v2 migration. Standalone script: `bash migrate-v2.sh`. Seeds DB, copies groups/sessions, installs channels, builds container, offers service switchover, then hands off to `/migrate-from-v1` skill for owner setup and CLAUDE.md cleanup. See [docs/migration-dev.md](docs/migration-dev.md). |
 | `nanoclaw.sh --uninstall` + `setup/uninstall/` | Uninstall this copy only (slug-scoped): service, containers + image, `data/`, `logs/`, `groups/`, this copy's OneCLI agents. Confirms per group; `--dry-run` previews, `--yes` skips prompts. Other copies and the shared OneCLI app are untouched. Bypasses bootstrap entirely; `uninstall.sh` is a pointer that execs it. |
+
+## Per-agent group file layout
+
+`groups/<folder>/` is **per-user, gitignored** — agent personas, group memories, and OneCLI state are local-only. Only the trunk infrastructure is tracked in the repo.
+
+Inside a group folder, three files compose the SDK system context at spawn:
+
+- **`CLAUDE.md`** — auto-composed pointer (just `@./.claude-shared.md`), regenerated on every spawn. Do not hand-edit.
+- **`CLAUDE.local.md`** — the per-group editable file: persona, voice, banned phrases, `About <user>` context. SDK auto-loads it after `CLAUDE.md`.
+- **`.claude-shared.md`** — symlink to `/app/CLAUDE.md`, which resolves inside the container to the host's `container/CLAUDE.md`. This is how global agent instructions reach every group.
+
+Per-group persona edits go in `CLAUDE.local.md`. Global agent instructions go in `container/CLAUDE.md` (no rebuild needed; runtime cpSync picks them up on the next session spawn).
 
 ## Admin CLI (`ncl`)
 
@@ -175,6 +189,17 @@ Approval-gating credentialed actions is a **two-sided** flow:
 
 If approvals are configured server-side but the host callback isn't running (or throws), every credentialed call hangs until the gateway times out. Conversely, if the gateway has no rule asking for approval, the host callback never fires regardless of how it's wired.
 
+## Per-agent Claude config (model, effortLevel, autoCompactWindow, …)
+
+Per-agent Claude Agent SDK options live in the agent's **user-level** Claude Code settings file — we do NOT thread them through `container.json` or host code. The SDK loads this file via our existing `settingSources: ['project', 'user']` option.
+
+- Host path: `data/v2-sessions/<agent_group_id>/.claude-shared/settings.json`
+- Container mount: `/home/node/.claude/settings.json` (read-write, `container-runner.ts:268`)
+- Documented precedent: `docs/ollama.md` sets `"model"` here
+- Schema: see the SDK's `Settings` interface in `@anthropic-ai/claude-agent-sdk/sdk.d.ts` — includes `model`, `effortLevel`, `autoCompactWindow`, `alwaysThinkingEnabled`, and many more
+
+To switch one agent: edit that file, wait for the container to respawn (or restart the service). Zero code changes needed — this is Claude Code's native settings mechanism.
+
 ## Skills
 
 Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxonomy.
@@ -227,6 +252,8 @@ cd container/agent-runner && bun test      # Container tests (bun:test)
 ```
 
 Container typecheck is a separate tsconfig — if you edit `container/agent-runner/src/`, run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` from root (or `bun run typecheck` from `container/agent-runner/`).
+
+`pnpm lint` runs ESLint over `src/`. Rule decisions live in `eslint.config.js` with comments. Notable: `no-catch-all/no-catch-all` is disabled — NanoClaw is a long-running daemon where catch-and-log-and-continue at I/O boundaries is the correct pattern; narrowing + rethrowing would crash the host on unknown errors. The Effect-TS island in `src/channels/telegram-grammy/` keeps stricter type-aware promise rules.
 
 Service management:
 ```bash
