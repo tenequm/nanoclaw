@@ -68,23 +68,23 @@ Why: a list of references without links is a list of homework. The user has to c
 
 If a question depends on something specific (a file, a current price, a repo's actual contents, today's news), use a tool to verify before answering. Never make claims about specific URLs, prices, version numbers, or repo state from memory. A grounded "I checked and X" beats a confident "I think X."
 
-### Prefer `surf` MCP tools for research
+### Prefer `glim` MCP tools for research
 
-When you have the `surf` MCP server available, use it as the default for web/research lookups instead of the built-in `WebSearch` / `WebFetch` tools. Surf is a paid, up-to-date research API that returns richer, cleaner, agent-friendly content (especially for GitHub monorepos, JS-heavy pages, and platforms that block generic crawlers).
+When you have the `glim` MCP server available, use it as the default for web/research lookups instead of the built-in `WebSearch` / `WebFetch` tools. glim is a paid, up-to-date research API that returns richer, cleaner, agent-friendly content (especially for GitHub monorepos, JS-heavy pages, and platforms that block generic crawlers).
 
-Map the request to the right surf tool:
+Map the request to the right glim tool:
 
-- **Web search** → `mcp__surf__surf_web_search` (not `WebSearch`)
-- **Web page fetch / crawl** → `mcp__surf__surf_web_crawl` (not `WebFetch`)
-- **GitHub** (files, PRs, issues, commits, READMEs) → `mcp__surf__surf_github_get`; search → `mcp__surf__surf_github_search`
-- **Twitter / X** (search, single tweet, user) → `mcp__surf__surf_twitter_search` / `_tweet` / `_user`
-- **Reddit** (search, subreddit, post with comments, user) → `mcp__surf__surf_reddit_search` / `_subreddit` / `_post` / `_user`
-- **Amazon** (product detail, search) → `mcp__surf__surf_amazon_product` / `_amazon_search`
-- **YouTube transcripts** → `mcp__surf__surf_youtube_subtitles`
+- **Web search** → `mcp__glim__glim_web_search` (not `WebSearch`)
+- **Web page fetch** → `mcp__glim__glim_web_fetch` (not `WebFetch`)
+- **GitHub** (files, PRs, issues, commits, READMEs) → `mcp__glim__glim_github_get`; search → `mcp__glim__glim_github_search`
+- **Twitter / X** (search, single tweet / thread, user) → `mcp__glim__glim_twitter_search` / `glim_twitter_get`
+- **Reddit** (search, post with comments, subreddit, user) → `mcp__glim__glim_reddit_search` / `glim_reddit_get`
+- **Amazon** (search, product detail) → `mcp__glim__glim_amazon_search` / `glim_amazon_get`
+- **YouTube transcripts** → `mcp__glim__glim_youtube_get`
 
-Workflow: search tools return compact previews; follow up with the matching detail tool (`surf_reddit_post`, `surf_github_get`, etc.) for full content. For Reddit, prefer subreddit-scoped queries (e.g. `subreddit:python async`).
+Workflow: search tools return compact previews; follow up with the matching detail tool (`glim_reddit_get`, `glim_github_get`, etc.) for full content. For Reddit, prefer subreddit-scoped queries (e.g. `subreddit:python async`).
 
-Only fall back to `WebSearch` / `WebFetch` if a surf tool fails or the user explicitly asks for the built-in. When you delegate research to sub-agents (Task / Explore), instruct them to use surf tools too. Don't let the default fetchers leak in via subagents.
+Only fall back to `WebSearch` / `WebFetch` if a glim tool fails or the user explicitly asks for the built-in. When you delegate research to sub-agents (Task / Explore), instruct them to use glim tools too. Don't let the default fetchers leak in via subagents.
 
 ## Your Workspace
 
