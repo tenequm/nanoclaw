@@ -14,7 +14,7 @@
 
 const HOST = 'https://generativelanguage.googleapis.com';
 const DEFAULT_MODEL = 'gemini-3.1-flash-tts-preview';
-const DEFAULT_VOICE = 'Kore';
+const DEFAULT_VOICE = 'Alnilam';
 const MAX_ATTEMPTS = 3; // Gemini 3.1 randomly returns text instead of audio (→500); Google advises retrying.
 
 function parseArgs(argv: string[]): Record<string, string> {

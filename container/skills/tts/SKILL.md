@@ -51,7 +51,7 @@ short caption.
 
 ## Options
 
-- `--voice <name>` — default `Kore`. Other prebuilt voices include `Puck`,
+- `--voice <name>` — default `Alnilam` (firm, masculine). Other voices include `Puck`,
   `Charon`, `Aoede`, `Leda`, `Fenrir`, `Zephyr` (30 total). Pick one that fits
   the persona and keep it consistent.
 - `--model <id>` — default `gemini-3.1-flash-tts-preview` (latest, most
@@ -100,7 +100,7 @@ The list isn't exhaustive — descriptive tags work too (`[reluctantly]`,
 ## Voice matching
 
 Pick a `--voice` whose character reinforces the mood, and keep it consistent
-for a persona. A few of the 30: `Kore` (firm, default), `Puck` (upbeat),
+for a persona. A few of the 30: `Alnilam` (firm — the default), `Puck` (upbeat),
 `Aoede` (breezy), `Enceladus` (breathy — good for tired/intimate), `Achird`
 (friendly), `Sulafat` (warm), `Charon` (informative). The voice and the text's
 tone should agree — don't push a deep firm voice to sound like a giddy child.
