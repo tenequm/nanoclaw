@@ -176,7 +176,12 @@ describe('translateSdkMessages — synthetic scenarios', () => {
       session_id: 'test-session',
     } as unknown as SDKMessage);
 
-  it('emits progress for AM with text+tool_use, then result for final text-only AM', async () => {
+  it('does NOT emit per-AssistantMessage: narration-with-tool is dropped, only the final answer is delivered once', async () => {
+    // A text+tool_use AM ("Reading config…") is per-turn narration, NOT the
+    // answer — it must not be emitted at all. The final text-only AM is the
+    // answer, delivered once at the ResultMessage boundary. Emitting these
+    // per-AM is what caused the duplicate-message bug (see the translator's
+    // "Turn-boundary delivery model" block).
     const messages = [
       sysInit,
       am([{ type: 'text', text: 'Reading config…' }, { type: 'tool_use', id: 't1', name: 'Read', input: {} }]),
@@ -191,10 +196,7 @@ describe('translateSdkMessages — synthetic scenarios', () => {
         if (e.type === 'result') return ['result', e.text] as const;
         return [e.type] as const;
       });
-    expect(sequence).toEqual([
-      ['progress', 'Reading config…'],
-      ['result', 'Here is the answer.'],
-    ]);
+    expect(sequence).toEqual([['result', 'Here is the answer.']]);
   });
 
   it('skips subagent narration (parent_tool_use_id set)', async () => {
@@ -225,6 +227,27 @@ describe('translateSdkMessages — synthetic scenarios', () => {
     }
   });
 
+  it('context compaction emits a user-facing `notice`, never a `result`', async () => {
+    // Compaction must be visible to the user AND must not flow through the
+    // result/dispatch path (where, as bare text, it would trip the false
+    // "not delivered" nudge — same bug class). See claude.ts compact_boundary.
+    const sysCompact = (preTokens: number): SDKMessage =>
+      ({
+        type: 'system',
+        subtype: 'compact_boundary',
+        compact_metadata: { pre_tokens: preTokens },
+        session_id: 'test-session',
+      } as unknown as SDKMessage);
+    const events = await collect(iter([sysInit, sysCompact(120000)]));
+    expect(events.filter((e) => e.type === 'result')).toHaveLength(0);
+    const notices = events.filter((e) => e.type === 'notice');
+    expect(notices).toHaveLength(1);
+    if (notices[0].type === 'notice') {
+      expect(notices[0].message).toContain('compacted');
+      expect(notices[0].message).toContain('120,000');
+    }
+  });
+
   it('yields one activity event per SDK message', async () => {
     const messages = [
       sysInit,
@@ -234,5 +257,74 @@ describe('translateSdkMessages — synthetic scenarios', () => {
     const events = await collect(iter(messages));
     const activity = events.filter((e) => e.type === 'activity');
     expect(activity).toHaveLength(messages.length);
+  });
+});
+
+// ── Duplicate-message regression suite ──────────────────────────────────────
+//
+// These lock in the ONE-result-per-turn invariant that fixes the duplicate
+// messages bug. Root cause: the translator used to emit a `result` for every
+// text-only AssistantMessage; the poll-loop's "not wrapped → not delivered"
+// nudge (which runs once per `result`) then false-fired on intermediate
+// narration and made the agent re-send its answer. See the "Turn-boundary
+// delivery model" block on translateSdkMessages and the agent-loop docs:
+// https://code.claude.com/docs/en/agent-sdk/agent-loop
+//
+// If any of these go red, something reintroduced per-AssistantMessage emission
+// — do NOT "fix" the test by loosening the count; fix the emit logic.
+describe('translateSdkMessages — duplicate-message regression (one result per turn)', () => {
+  const am = (content: unknown[], parentToolUseId: string | null = null): SDKMessage =>
+    ({
+      type: 'assistant',
+      message: { content },
+      parent_tool_use_id: parentToolUseId,
+      session_id: 'test-session',
+    } as unknown as SDKMessage);
+  const txt = (text: string) => am([{ type: 'text', text }]);
+  const textTool = (text: string) =>
+    am([{ type: 'text', text }, { type: 'tool_use', id: 't', name: 'Bash', input: {} }]);
+  const resultTexts = (events: ProviderEvent[]) =>
+    events.flatMap((e) => (e.type === 'result' ? [e.text] : []));
+
+  it('the live repro shape: bare narration mid-turn never becomes its own result', async () => {
+    // Exactly the sequence captured live: a bare-text narration
+    // AM, then a tool, then the final wrapped answer. The narration must NOT
+    // produce a result (which would have false-fired the nudge); only the
+    // final answer is delivered, once.
+    const answer = '<message to="g">Перевірив все покроково: ...</message>';
+    const events = await collect(
+      iter([sysInit, txt('Now let me test the browser.'), textTool('checking…'), txt(answer), sysResultSuccess(answer)]),
+    );
+    expect(resultTexts(events)).toEqual([answer]);
+  });
+
+  it('multi-turn stream: each turn emits exactly one result, buffer resets between turns', async () => {
+    // A warm container processes many turns in one stream. Turn N must not
+    // leak its buffered text into turn N+1, and identical answers across turns
+    // must each be delivered (cross-turn dedup would drop legit repeats).
+    const events = await collect(
+      iter([sysInit, txt('answer A'), sysResultSuccess('answer A'), txt('answer A'), sysResultSuccess('answer A')]),
+    );
+    expect(resultTexts(events)).toEqual(['answer A', 'answer A']);
+  });
+
+  it('empty ResultMessage.result after narration: recovers the ANSWER, not the narration', async () => {
+    // The empty-RM SDK quirk (reason the AM-read exists) combined with mid-turn
+    // narration: the buffered value must be the final answer, never an earlier
+    // narration AM.
+    const events = await collect(
+      iter([sysInit, txt('thinking out loud'), textTool('searching…'), txt('the real answer'), sysResultSuccess('')]),
+    );
+    expect(resultTexts(events)).toEqual(['the real answer']);
+  });
+
+  it('turn with no text answer (tools / send_message only): a single result with null text', async () => {
+    // The agent replied via send_message / only used tools. Exactly one result
+    // event, carrying null — the poll-loop then delivers nothing and does not
+    // nudge. Must not crash or emit extra events.
+    const events = await collect(iter([sysInit, textTool('working…'), sysResultSuccess('')]));
+    const results = events.filter((e) => e.type === 'result');
+    expect(results).toHaveLength(1);
+    expect(resultTexts(events)).toEqual([null]);
   });
 });

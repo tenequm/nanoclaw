@@ -367,20 +367,62 @@ export function classifyResult(message: SDKResultMessage): ResultClassification 
 
 /**
  * Translate the Claude Agent SDK's message stream into our `ProviderEvent`
- * stream. Per Anthropic's documented model:
- *   - `AssistantMessage` is the per-turn progress/final-reply vehicle.
- *   - `ResultMessage` is the lifecycle/cost/error-classification vehicle.
- * Exported (rather than inlined into `query()`) so we can replay real JSONL
- * transcripts through it in tests.
+ * stream. Exported (rather than inlined into `query()`) so we can replay real
+ * JSONL transcripts through it in tests.
+ *
+ * ── Turn-boundary delivery model — READ THIS before changing the emit logic ──
+ *
+ * Anthropic's agent loop defines two distinct message roles
+ * (docs: https://code.claude.com/docs/en/agent-sdk/agent-loop —
+ *  "The SDK yields a final AssistantMessage with the text response (no tool
+ *   calls), followed by a ResultMessage with the final text … ResultMessage
+ *   marks the end of the agent loop."):
+ *   - AssistantMessage — the canonical carrier of the response TEXT
+ *     ("emitted after each Claude response, including the final text-only one").
+ *   - ResultMessage    — the END-OF-TURN lifecycle marker (cost/usage/stop
+ *     reason). It ALSO echoes the final text in `result`, but redundantly.
+ *
+ * We therefore read the answer from the final text-only AssistantMessage and
+ * use the ResultMessage purely as the once-per-turn boundary. We do NOT just
+ * read `ResultMessage.result`, for two reasons:
+ *   1. By design the text lives on the AssistantMessage; the RM copy is
+ *      redundant.
+ *   2. The SDK has historically returned an EMPTY `ResultMessage.result` on
+ *      some turns (fixed upstream in @anthropic-ai/claude-agent-sdk 0.3.176 &
+ *      0.3.179 — both newer than our pinned 0.3.170), which would silently
+ *      drop the whole answer if we trusted only the RM. Reading from the AM is
+ *      the robust choice and the original reason this translator exists. See
+ *      the "replay of the actual failing turn" test in claude.test.ts.
+ *
+ * ⚠ CRITICAL INVARIANT: emit EXACTLY ONE `result` event per turn, at the
+ *     ResultMessage boundary — never one per AssistantMessage.
+ *
+ *     The poll-loop runs its "not wrapped → not delivered" nudge once per
+ *     `result` event (see processQuery → dispatchResultText + the
+ *     `willRetryWrapping` push in poll-loop.ts — upstream-identical code that
+ *     ASSUMES one result per turn). An earlier version of this translator
+ *     emitted a `result` for every intermediate text-only AssistantMessage
+ *     (e.g. bare narration like "Now let me check…"). That made the nudge
+ *     false-fire mid-turn → the agent re-sent an already-delivered answer →
+ *     DUPLICATE messages in chat. Coalescing to one result per turn is the fix.
+ *     Do not reintroduce per-AssistantMessage `result`/`progress` emission.
+ *
+ * TRADE-OFF (intentional): intermediate AssistantMessage text — mid-turn
+ * narration, or a `<message>` block the model emits before the final turn — is
+ * NOT delivered; only the final answer is. Mid-turn updates must use the
+ * `send_message` MCP tool (mcp-tools/core.ts), which is the intended mechanism
+ * and is unaffected by this.
  */
 export async function* translateSdkMessages(
   source: AsyncIterable<SDKMessage>,
   isAborted: () => boolean = () => false,
 ): AsyncGenerator<ProviderEvent> {
   let messageCount = 0;
-  // Last text emitted as a final `result` event from a text-only AM.
-  // Used to de-dup against ResultMessage.result, which mirrors it on success.
-  let lastFinalText: string | null = null;
+  // Buffered text of the latest top-level text-only AssistantMessage for the
+  // CURRENT turn — the answer per Anthropic's loop model. Held (not emitted)
+  // until the ResultMessage boundary, then delivered once and reset. See the
+  // "Turn-boundary delivery model" block on this function.
+  let lastAssistantText: string | null = null;
 
   for await (const message of source) {
     if (isAborted()) return;
@@ -401,9 +443,15 @@ export async function* translateSdkMessages(
             yield { type: 'error', message: 'API retry', retryable: true };
             break;
           case 'compact_boundary': {
+            // The SDK auto-summarized older context to free up the window. This
+            // is a system NOTICE, not agent output — emit it as `notice` so the
+            // poll-loop delivers it directly to chat (visible to the user) and
+            // does NOT run it through the `<message>`-wrapping nudge. (Emitting
+            // it as a bare-text `result` made it both invisible — dropped as
+            // scratchpad — AND trip the false "not delivered" nudge.)
             const pre = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata?.pre_tokens;
-            const detail = pre ? ` (${pre.toLocaleString()} tokens compacted)` : '';
-            yield { type: 'result', text: `Context compacted${detail}.` };
+            const detail = pre ? ` (${pre.toLocaleString()} tokens summarized)` : '';
+            yield { type: 'notice', message: `🗜 Context compacted${detail} — older messages were summarized to free up space.` };
             break;
           }
           case 'task_notification':
@@ -432,17 +480,20 @@ export async function* translateSdkMessages(
         // is set). We only surface top-level agent output to the user.
         if ((message as SDKAssistantMessage).parent_tool_use_id != null) break;
         const { text, hasToolUse } = extractAssistantText(message as SDKAssistantMessage);
-        if (!text) break;
-        if (hasToolUse) {
-          yield { type: 'progress', message: text };
-        } else {
-          lastFinalText = text;
-          yield { type: 'result', text };
-        }
+        // Buffer the answer-style text (text with NO tool_use — the documented
+        // "final AssistantMessage with the text response (no tool calls)").
+        // Do NOT emit here: delivery happens once at the ResultMessage
+        // boundary below. Text that accompanies a tool_use is per-turn
+        // narration, not the answer, so it is neither buffered nor emitted.
+        // See the "Turn-boundary delivery model" block — emitting per-AM here
+        // is exactly what caused the duplicate-message bug.
+        if (text && !hasToolUse) lastAssistantText = text;
         break;
       }
 
       case 'result': {
+        // ResultMessage = end-of-turn boundary. Emit EXACTLY ONE result for
+        // the turn here (or surface a terminal error), then reset the buffer.
         const classified = classifyResult(message as SDKResultMessage);
         if (classified.kind === 'error') {
           yield {
@@ -458,11 +509,17 @@ export async function* translateSdkMessages(
             retryable: false,
             classification: 'refusal',
           };
-        } else if (classified.text && classified.text !== lastFinalText) {
-          // Defensive: RM has text the AM stream didn't surface. Emit it.
-          yield { type: 'result', text: classified.text };
+        } else {
+          // Prefer the buffered AssistantMessage text (canonical carrier; never
+          // empty when there is an answer). Fall back to ResultMessage.result
+          // for the no-text-AM turn and the historical empty-AM/structured
+          // cases. `null` when the turn legitimately produced no text (e.g. the
+          // agent only used send_message / tools) — the poll-loop then delivers
+          // nothing and skips the nudge.
+          const text = lastAssistantText ?? (classified.text || null);
+          yield { type: 'result', text };
         }
-        // else: AM stream already delivered the answer; RM is just lifecycle.
+        lastAssistantText = null; // reset for the next turn in this stream
         break;
       }
 
