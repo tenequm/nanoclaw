@@ -22,8 +22,14 @@ import { applySkill, fullyApplied, type ApplyResult, type Prompter } from '../..
  */
 export function clackPrompter(): Prompter {
   return {
-    async ask(_varName, question, secret) {
-      const ans = secret ? await p.password({ message: question }) : await p.text({ message: question });
+    async ask(_varName, question, secret, validate) {
+      const re = validate ? new RegExp(validate) : undefined;
+      const check = re
+        ? (v: string | undefined) => (re.test((v ?? '').trim()) ? undefined : `That doesn't match the expected format.`)
+        : undefined;
+      const ans = secret
+        ? await p.password({ message: question, validate: check })
+        : await p.text({ message: question, validate: check });
       if (p.isCancel(ans)) return undefined; // cancelled ⇒ defer
       const v = String(ans).trim();
       return v.length ? v : undefined;

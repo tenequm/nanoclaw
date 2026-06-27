@@ -77,10 +77,10 @@ Create the Slack app:
 
 Collect the two secrets and store them (the bridge reads them from `.env`):
 
-```nc:prompt bot_token secret
+```nc:prompt bot_token secret validate:^xoxb-
 Paste the Bot User OAuth Token — OAuth & Permissions, starts with `xoxb-`.
 ```
-```nc:prompt signing_secret secret
+```nc:prompt signing_secret secret validate:^[a-fA-F0-9]{16,}$
 Paste the Signing Secret — Basic Information.
 ```
 ```nc:env-set
@@ -117,7 +117,7 @@ address so the owner-wiring step can target it. You'll need your Slack member ID
 open your profile (your avatar, bottom-left), then **⋮** → **Copy member ID** — it
 starts with `U`.
 
-```nc:prompt owner_handle
+```nc:prompt owner_handle validate:^U[A-Z0-9]{8,}$
 Your Slack member ID (Profile → ⋮ → "Copy member ID"; starts with U).
 ```
 

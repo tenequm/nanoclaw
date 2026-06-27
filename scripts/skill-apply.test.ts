@@ -443,6 +443,19 @@ describe('programmatic apply via inputs', () => {
     expect(res.skipped.some((s) => /run restart: owned by the caller/.test(s))).toBe(true);
   });
 
+  it('threads a prompt validate:<re> through to the prompter', async () => {
+    writeFileSync(join(pskill, 'SKILL.md'), '# v\n\n```nc:prompt token secret validate:^xoxb-\nPaste.\n```\n');
+    let seenValidate: string | undefined;
+    const prompter: Prompter = {
+      async ask(_name, _q, _secret, validate) {
+        seenValidate = validate;
+        return 'xoxb-ok';
+      },
+    };
+    await applySkill(pskill, proot, { prompter, exec: () => {} });
+    expect(seenValidate).toBe('^xoxb-');
+  });
+
   it('exposes resolved non-secret vars (prompt answers + captures) but never secrets', async () => {
     writeFileSync(
       join(pskill, 'SKILL.md'),

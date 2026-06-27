@@ -29,7 +29,9 @@ import { parseDirectives, promptVar, type Directive } from './skill-directives.j
 
 export interface Prompter {
   // Return the value, or undefined to DEFER (headless rebuild collects these).
-  ask(varName: string, question: string, secret: boolean): Promise<string | undefined>;
+  // `validate` is an optional regex (from `nc:prompt … validate:<re>`) the
+  // interactive prompter enforces, re-asking until the answer matches.
+  ask(varName: string, question: string, secret: boolean, validate?: string): Promise<string | undefined>;
   // Show an `nc:operator` block to the human operator (a clack note in setup, a
   // channel message when a coding agent relays). Absent ⇒ no operator present
   // (headless rebuild), so the instructions are simply skipped.
@@ -403,7 +405,8 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
         // Pre-supplied inputs win (fully-programmatic apply); fall back to the
         // interactive prompter; still undefined ⇒ defer (headless, no answer).
         let val = opts.inputs?.[v];
-        if (val === undefined) val = await opts.prompter?.ask(v, d.body.join(' '), secret);
+        const validate = typeof d.attrs.validate === 'string' ? d.attrs.validate : undefined;
+        if (val === undefined) val = await opts.prompter?.ask(v, d.body.join(' '), secret, validate);
         if (val === undefined) res.deferred.push(v);
         else vars.set(v, { value: val, secret });
         continue;
