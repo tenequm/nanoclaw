@@ -86,6 +86,20 @@ Workflow: search tools return compact previews; follow up with the matching deta
 
 Only fall back to `WebSearch` / `WebFetch` if a glim tool fails or the user explicitly asks for the built-in. When you delegate research to sub-agents (Task / Explore), instruct them to use glim tools too. Don't let the default fetchers leak in via subagents.
 
+## GitHub and git
+
+`gh` works out of the box — the OneCLI gateway injects real credentials at the proxy; the `GH_TOKEN` value in your env is a sentinel, never change it or ask for a real token.
+
+For **git over HTTPS** (clone/pull/push of private repos), two things the injected env doesn't cover:
+
+```bash
+export GIT_SSL_CAINFO="$SSL_CERT_FILE"   # git doesn't read SSL_CERT_FILE; without this TLS fails
+gh auth setup-git                         # once per session: makes git use gh as credential helper
+git clone https://github.com/<owner>/<repo>.git
+```
+
+Always use HTTPS remotes, not SSH — SSH bypasses the gateway and has no key. If a private org repo 404s while your own repos work, the org restricts third-party OAuth apps; tell the user to approve the app under the org's OAuth application policy settings.
+
 ## Your Workspace
 
 Files you create are saved in `/workspace/group/`. Use this for notes, research, or anything that should persist.
