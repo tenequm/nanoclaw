@@ -27,8 +27,9 @@ import { log } from '../../log.js';
 import { materializeAll } from './attachments.js';
 import { parseCallbackData } from './ask-question.js';
 import {
-  parseThreadId,
+  parseChatId,
   parseTopicId,
+  resolveMessageThreadId,
   toInboundMessage,
   toReactionInbound,
   type InboundContent,
@@ -222,11 +223,13 @@ class TelegramGrammyAdapter implements ChannelAdapter {
     await rt.runPromise(
       Effect.gen(function* () {
         const { bot } = yield* BotService;
-        const chatId = Number(platformId.split(':')[1]);
-        if (!Number.isFinite(chatId)) return;
-        // Explicit threadId wins; otherwise a per-topic platformId carries
-        // the forum topic in its 3rd segment.
-        const messageThreadId = parseThreadId(threadId) ?? parseTopicId(platformId);
+        let chatId: number;
+        try {
+          chatId = parseChatId(platformId);
+        } catch {
+          return; // typing is best-effort; a malformed id is not worth a log storm
+        }
+        const messageThreadId = resolveMessageThreadId(platformId, threadId);
         yield* Effect.tryPromise({
           try: () =>
             bot.api.sendChatAction(chatId, 'typing', {

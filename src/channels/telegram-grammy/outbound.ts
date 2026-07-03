@@ -29,7 +29,7 @@ import { buildAskQuestionKeyboard } from './ask-question.js';
 import type { GrammyDeliveryError } from './errors.js';
 import { mapGrammyError } from './errors.js';
 import { renderFS, splitForBody, splitForCaption } from './formatter.js';
-import { extractTelegramMessageId, parseChatId, parseThreadId, parseTopicId } from './inbound.js';
+import { extractTelegramMessageId, parseChatId, parseTopicId, resolveMessageThreadId } from './inbound.js';
 import { rememberTopicMessage } from './topic-map.js';
 import { canonicalizeReactionEmoji, clearPendingSeen, type TelegramReactionEmoji, untrackSeen } from './reactions.js';
 import { BotService } from './services.js';
@@ -242,12 +242,11 @@ const sendSingleFile = (
 /** Send a default text+files message. Returns the first chunk's message id. */
 const sendDefault = Effect.fn('telegram-grammy.sendDefault')(function* (
   chatId: number,
-  threadId: string | null,
+  messageThreadId: number | undefined,
   text: string,
   files: ReadonlyArray<OutboundFile>,
 ) {
   const { bot } = yield* BotService;
-  const messageThreadId = parseThreadId(threadId);
 
   if (files.length === 0) {
     if (!text) return undefined;
@@ -374,7 +373,7 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
 
 const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
   chatId: number,
-  threadId: string | null,
+  messageThreadId: number | undefined,
   items: ReadonlyArray<{ path: string; caption?: string }>,
   files: ReadonlyArray<OutboundFile>,
 ) {
@@ -416,7 +415,7 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
       const sent = yield* Effect.tryPromise({
         try: () =>
           bot.api.sendDocument(chatId, m.media as InputFile, {
-            message_thread_id: parseThreadId(threadId),
+            message_thread_id: messageThreadId,
           }),
         catch: (err) => mapGrammyError(err, 'sendDocument-fallback', String(chatId)),
       });
@@ -426,7 +425,7 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
   }
 
   const sent = yield* Effect.tryPromise({
-    try: () => bot.api.sendMediaGroup(chatId, inputs, { message_thread_id: parseThreadId(threadId) }),
+    try: () => bot.api.sendMediaGroup(chatId, inputs, { message_thread_id: messageThreadId }),
     catch: (err) => mapGrammyError(err, 'sendMediaGroup', String(chatId)),
   });
   return sent.length > 0 ? String(sent[0].message_id) : undefined;
@@ -434,7 +433,7 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
 
 const sendAskQuestion = Effect.fn('telegram-grammy.sendAskQuestion')(function* (
   chatId: number,
-  threadId: string | null,
+  messageThreadId: number | undefined,
   questionId: string,
   title: string,
   question: string,
@@ -454,8 +453,6 @@ const sendAskQuestion = Effect.fn('telegram-grammy.sendAskQuestion')(function* (
   const fs = renderFS(body);
   const chunks = splitForBody(fs);
   if (chunks.length === 0) return undefined;
-
-  const messageThreadId = parseThreadId(threadId);
 
   const [head, ...tail] = chunks;
   const headSent = yield* Effect.tryPromise({
@@ -497,12 +494,10 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
   const chatId = parseChatId(platformId);
   const view = viewContent(message);
   // A per-topic platformId (`telegram:<chatId>:<topicId>`) carries the forum
-  // topic in its 3rd segment. When routing gives no explicit threadId, reuse
-  // the platformId as the thread carrier — parseThreadId reads the last
-  // segment, so every send below lands in the right topic.
+  // topic in its 3rd segment — every send below lands in that topic.
+  const messageThreadId = resolveMessageThreadId(platformId, threadId);
   const topicScoped = parseTopicId(platformId) !== undefined;
-  const effectiveThreadId = threadId ?? (topicScoped ? platformId : null);
-  const reactionKey = effectiveThreadId ?? platformId;
+  const reactionKey = threadId ?? platformId;
   const files = message.files ?? [];
 
   let result: string | undefined = undefined;
@@ -512,20 +507,20 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
   } else if (view.isReaction && view.reactionMessageId != null) {
     result = yield* reactToMessage(chatId, reactionKey, view.reactionMessageId, view.reactionEmoji);
   } else if (view.isMediaGroup && view.mediaGroupItems) {
-    result = yield* sendMediaGroup(chatId, effectiveThreadId, view.mediaGroupItems, files);
+    result = yield* sendMediaGroup(chatId, messageThreadId, view.mediaGroupItems, files);
   } else if (view.isAskQuestion && view.askQuestionId != null && view.askTitle != null && view.askOptions) {
     result = yield* sendAskQuestion(
       chatId,
-      effectiveThreadId,
+      messageThreadId,
       view.askQuestionId,
       view.askTitle,
       view.askQuestion ?? '',
       view.askOptions,
     );
   } else if (view.isCard && view.cardFallbackText != null) {
-    result = yield* sendDefault(chatId, effectiveThreadId, view.cardFallbackText, files);
+    result = yield* sendDefault(chatId, messageThreadId, view.cardFallbackText, files);
   } else {
-    result = yield* sendDefault(chatId, effectiveThreadId, view.text, files);
+    result = yield* sendDefault(chatId, messageThreadId, view.text, files);
   }
 
   // Remember which topic the bot's own message went to, so a user reaction

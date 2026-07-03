@@ -524,6 +524,12 @@ export function toInboundMessage(
     attachments: extractAttachments(msg),
   };
 
+  // Service messages (chat photo changed, pins, topic created/renamed) and
+  // unsupported types (polls, dice, stories) produce neither text nor
+  // attachments — there is nothing for an agent to act on, and waking a
+  // container to answer "empty message" is pure noise. Drop at the source.
+  if (body === '' && content.attachments.length === 0 && !msg.reply_to_message) return null;
+
   let replyTo = extractReplyContext(msg);
   if (isEdit && !replyTo) {
     // Link the [EDITED] inbound back to the original message id so the
@@ -662,6 +668,17 @@ export function parseThreadId(threadId: string | null): number | undefined {
   const tail = threadId.split(':').pop() ?? '';
   const n = Number(tail);
   return Number.isFinite(n) && String(n) === tail ? n : undefined;
+}
+
+/**
+ * Effective `message_thread_id` for an outbound Bot API call: an explicit
+ * threadId wins (unused today — the adapter is `supportsThreads: false`),
+ * otherwise a per-topic platformId carries the forum topic in its 3rd
+ * segment. Single source of truth for the precedence rule — used by both
+ * dispatchOutbound and setTyping.
+ */
+export function resolveMessageThreadId(platformId: string, threadId: string | null): number | undefined {
+  return parseThreadId(threadId) ?? parseTopicId(platformId);
 }
 
 /**

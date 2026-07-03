@@ -11,7 +11,15 @@ import type { MessageEntity } from 'grammy/types';
 
 import type { Message } from 'grammy/types';
 
-import { entitiesToMarkdown, extractTelegramMessageId, parseChatId, parseTopicId, platformIdFor } from './inbound.js';
+import {
+  entitiesToMarkdown,
+  extractTelegramMessageId,
+  parseChatId,
+  parseTopicId,
+  platformIdFor,
+  resolveMessageThreadId,
+  toInboundMessage,
+} from './inbound.js';
 
 const e = (obj: unknown): MessageEntity[] => obj as MessageEntity[];
 
@@ -29,6 +37,39 @@ describe('platformIdFor (forum topics become first-class platform ids)', () => {
   it('ignores message_thread_id on non-topic messages (plain reply threads)', () => {
     const msg = { message_id: 7, message_thread_id: 42 } as Message;
     expect(platformIdFor(-100123, msg)).toBe('telegram:-100123');
+  });
+});
+
+describe('toInboundMessage drops content-free service messages', () => {
+  const ctxFor = (msg: Record<string, unknown>) =>
+    ({
+      chat: { id: -1003927289090, type: 'supergroup', title: 'HQ' },
+      msg,
+      from: { id: 95307956, first_name: 'Misha', is_bot: false },
+      update: {},
+    }) as unknown as Parameters<typeof toInboundMessage>[0];
+
+  it('returns null for a service message with no text and no attachments (e.g. new_chat_photo)', () => {
+    expect(toInboundMessage(ctxFor({ message_id: 19, date: 1_700_000_000 }), 'bot', 1)).toBeNull();
+  });
+
+  it('keeps a normal text message', () => {
+    const env = toInboundMessage(ctxFor({ message_id: 20, date: 1_700_000_000, text: 'hi' }), 'bot', 1);
+    expect(env).not.toBeNull();
+    expect(env!.platformId).toBe('telegram:-1003927289090');
+  });
+
+  it('keeps an attachment-only message', () => {
+    const env = toInboundMessage(
+      ctxFor({
+        message_id: 21,
+        date: 1_700_000_000,
+        photo: [{ file_id: 'f', width: 10, height: 10, file_size: 5 }],
+      }),
+      'bot',
+      1,
+    );
+    expect(env).not.toBeNull();
   });
 });
 
@@ -58,6 +99,17 @@ describe('parseTopicId', () => {
 
   it('returns undefined when the 3rd segment is not numeric', () => {
     expect(parseTopicId('telegram:-100123:abc')).toBeUndefined();
+  });
+});
+
+describe('resolveMessageThreadId', () => {
+  it('derives the topic from a per-topic platformId when threadId is null', () => {
+    expect(resolveMessageThreadId('telegram:-1003927289090:42', null)).toBe(42);
+    expect(resolveMessageThreadId('telegram:-1003927289090', null)).toBeUndefined();
+  });
+
+  it('prefers an explicit threadId over the platformId topic', () => {
+    expect(resolveMessageThreadId('telegram:-1003927289090:42', '7')).toBe(7);
   });
 });
 
