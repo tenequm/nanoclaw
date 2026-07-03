@@ -18,7 +18,6 @@ import {
   getMessagingGroupByPlatform,
   getMessagingGroupAgentByPair,
 } from '../src/db/messaging-groups.js';
-import { addMember } from '../src/modules/permissions/db/agent-group-members.js';
 import { isValidGroupFolder } from '../src/group-folder.js';
 import { log } from '../src/log.js';
 import { namespacedPlatformId } from '../src/platform-id.js';
@@ -195,18 +194,6 @@ export async function run(args: string[]): Promise<void> {
       agentGroup: agentGroup.id,
       messagingGroup: messagingGroup.id,
     });
-
-    // For DM channels (is_group=0), seed the paired user into agent_group_members
-    // so the FK constraint is satisfied. addMember is INSERT OR IGNORE — no-op
-    // for groups that have already been registered.
-    if (messagingGroup.is_group === 0) {
-      addMember({
-        user_id: messagingGroup.platform_id,
-        agent_group_id: agentGroup.id,
-        added_by: null,
-        added_at: new Date().toISOString(),
-      });
-    }
   }
 
   // 4. Send onboarding message — only on first wiring, not re-registration
