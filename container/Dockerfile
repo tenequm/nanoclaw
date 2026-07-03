@@ -76,10 +76,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
 # ---- GitHub CLI (gh) ---------------------------------------------------------
-# Install gh so agents can run `gh pr list`, `gh repo view`, etc. The
-# Dockerfile ENV placeholder satisfies gh's local auth check when the host
-# isn't authenticated; container-runner.ts overrides GH_TOKEN with the host's
-# real `gh auth token` at spawn when available.
+# Install gh so agents can run `gh pr list`, `gh repo view`, etc. Auth follows
+# the OneCLI "Pattern D" model (onecli.sh/docs/guides/credential-stubs/general-app):
+# the sentinel env value only satisfies gh's local auth check; real credentials
+# are injected at the network level by the OneCLI gateway (HTTPS_PROXY), matched
+# to api.github.com in the vault. No real token ever enters the container env.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -90,7 +91,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-ENV GH_TOKEN=placeholder
+ENV GH_TOKEN=onecli-managed
 
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium

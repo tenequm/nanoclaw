@@ -5,7 +5,6 @@
  */
 import { ChildProcess, execSync, spawn } from 'child_process';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
@@ -53,30 +52,6 @@ import {
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
-
-// Known Homebrew / linuxbrew / user-local install dirs. The systemd / launchd
-// service PATH is minimal and shell rc files aren't sourced, so `gh` installed
-// via brew or asdf wouldn't resolve otherwise.
-const GH_PATH_EXTRAS = ['/home/linuxbrew/.linuxbrew/bin', '/opt/homebrew/bin', `${os.homedir()}/.local/bin`];
-
-/**
- * Read the host's `gh` CLI token so agent containers can run `gh ...` against
- * the real GitHub API. Containers are ephemeral so we don't persist gh auth
- * inside them — shell out to the host gh instead. Returns null if gh isn't
- * installed or isn't authenticated.
- */
-function getHostGhToken(): string | null {
-  try {
-    const token = execSync('gh auth token', {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      env: { ...process.env, PATH: `${GH_PATH_EXTRAS.join(':')}:${process.env.PATH ?? ''}` },
-    }).trim();
-    return token || null;
-  } catch {
-    return null;
-  }
-}
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
@@ -477,14 +452,6 @@ async function buildContainerArgs(
     for (const [key, value] of Object.entries(providerContribution.env)) {
       args.push('-e', `${key}=${value}`);
     }
-  }
-
-  // Inject the host's GitHub CLI token so agents can run `gh ...` without
-  // storing credentials inside the ephemeral container. No-op when gh isn't
-  // installed or isn't authenticated.
-  const ghToken = getHostGhToken();
-  if (ghToken) {
-    args.push('-e', `GH_TOKEN=${ghToken}`);
   }
 
   // Egress lockdown when enabled — throws if it can't be established, aborting
