@@ -121,6 +121,7 @@ Bucket the upstream changed files:
 - **Host source** (`src/`): may conflict if user modified the same files
 - **Container** (`container/`): triggers container rebuild (+ typecheck if `agent-runner/src/` changed)
 - **Build/config** (`package.json`, `pnpm-lock.yaml`, `tsconfig*.json`): lockfile changes trigger dep install
+- **Version pins** (`versions.json`): a changed `onecli-gateway` / `onecli-cli` value requires upgrading the OneCLI gateway/CLI to match — see Step 5.5
 - **Other**: docs, tests, setup scripts, misc
 
 **Large drift check:** If the upstream commit count and age suggest the user has a lot of catching up to do, mention that `/migrate-nanoclaw` might be a better fit — it extracts customizations and reapplies them on clean upstream instead of merging. Offer it as an option but don't push.
@@ -215,6 +216,11 @@ If build fails:
 - Do not refactor unrelated code.
 - If unclear, ask the user before making changes.
 
+# Step 5.5: OneCLI upgrade (if pins moved)
+The OneCLI gateway and CLI are external components pinned in `versions.json`; when a pin moves, the running version must be upgraded to match or the new code may fail against it.
+
+If `git diff <backup-tag-from-step-1>..HEAD -- versions.json` shows the `onecli-gateway` or `onecli-cli` value changed, follow `docs/onecli-upgrades.md` before the service restart (Step 8). Otherwise skip.
+
 # Step 6: Breaking changes check
 After validation succeeds, check if the update introduced any breaking changes.
 
@@ -240,30 +246,40 @@ If one or more `[BREAKING]` lines are found:
 - For each skill the user selects, invoke it using the Skill tool.
 - After all selected skills complete (or if user chose Skip), proceed to Step 7 (skill updates check).
 
-# Step 7: Check for skill and channel/provider updates
+# Step 7: Skill updates (part of updating NanoClaw)
 
-## 7a: Skill branches
-Check if skills are distributed as branches in this repo:
-- `git branch -r --list 'upstream/skill/*'`
+Updating your installed skills is **part of** updating NanoClaw, not an optional
+extra. Channel and provider code ships on long-lived branches (`channels`,
+`providers`) that the host merge above doesn't touch — so stopping here leaves
+that code on whatever version you installed, which is how an important upstream
+fix gets silently left behind. The default is to continue into `/update-skills`,
+which re-applies your installed channels/providers to pull their latest code.
 
-If any `upstream/skill/*` branches exist:
-- Use AskUserQuestion to ask: "Upstream has skill branches. Would you like to check for skill updates?"
-  - Option 1: "Yes, check for updates" (description: "Runs /update-skills to check for and apply skill branch updates")
-  - Option 2: "No, skip" (description: "You can run /update-skills later any time")
-- If user selects yes, invoke `/update-skills` using the Skill tool.
+Detect whether anything is installed: read `src/channels/index.ts` and
+`src/providers/index.ts`, collecting `import './<name>.js';` lines (excluding
+`cli`).
 
-## 7b: Channel and provider updates
-Detect installed channels by reading `src/channels/index.ts` and collecting all `import './<name>.js';` lines (excluding `cli`). For providers, check `src/providers/index.ts` the same way.
+- If nothing is installed: skip silently and proceed to Step 7.9.
+- If one or more are installed: continue into skill updates.
 
-If any channels/providers are installed AND `upstream/channels` or `upstream/providers` branches exist:
-- List the installed channels/providers.
-- Use AskUserQuestion to ask: "Would you like to update your installed channels/providers? Re-running `/add-<name>` is safe — it only updates code files, credentials and wiring are untouched."
-  - One option per installed channel/provider (e.g., "Update Slack (/add-slack)")
-  - "Skip — I'll update them later"
-  - Set `multiSelect: true`
-- For each selected option, invoke the corresponding `/add-<channel>` or `/add-<provider>` skill.
+**Hand-off — default in, minimal opt-out.** Use AskUserQuestion (single-select).
+Name the installed skills in the question so the choice is concrete:
+- Question: "Skill updates are part of this NanoClaw update — your installed
+  channels/providers (<list the detected ones>) ride separate branches the host
+  update didn't touch. Continue into `/update-skills` to bring them up to date?"
+- Option 1 (Recommended): "Continue into skill updates" — description: "Runs
+  `/update-skills`, which re-applies your installed channels/providers to pull
+  their latest upstream code. You pick which ones there."
+- Option 2: "Skip — I'll run `/update-skills` myself later" — description: "Your
+  installed skill code stays as-is and may be behind upstream."
 
-If no channels/providers are installed, skip silently.
+Keep it to these two options — the per-skill selection lives inside
+`/update-skills`, not here.
+
+- On "Continue": invoke `/update-skills` using the Skill tool. (If the re-apply
+  touches container code, `/update-skills` rebuilds the agent image itself — see
+  its Step 4 — so nothing container-related is owed back here.)
+- On "Skip": note that `/update-skills` can be run anytime, then proceed.
 
 Proceed to Step 7.9.
 

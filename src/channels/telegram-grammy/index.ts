@@ -53,6 +53,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
     private readonly apiRootRaw: string | undefined,
     private readonly maxFileMbRaw: string | undefined,
     private readonly localFilesDirRaw: string | undefined,
+    private readonly noSeenChats: ReadonlySet<number> = new Set(),
   ) {}
 
   async setup(hostConfig: ChannelSetup): Promise<void> {
@@ -64,6 +65,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
       hostConfig,
     });
     this.runtime = runtime;
+    const noSeenChats = this.noSeenChats;
 
     await runtime.runPromise(
       Effect.gen(function* () {
@@ -83,8 +85,12 @@ class TelegramGrammyAdapter implements ChannelAdapter {
           const chatId = chat.id;
 
           // Fire 👀 best-effort in a detached fiber — doesn't block
-          // materialization or the router handoff.
-          yield* Effect.forkDetach(fireSeenReaction(chatId, ctx.msg.message_id, threadId ?? platformId, message.id));
+          // materialization or the router handoff. Suppressed for chats in
+          // TELEGRAM_NO_SEEN_CHATS: in busy groups the eyes only clear on a
+          // bot reply (outbound.ts), so on non-targeted messages they pile up.
+          if (!noSeenChats.has(chatId)) {
+            yield* Effect.forkDetach(fireSeenReaction(chatId, ctx.msg.message_id, threadId ?? platformId, message.id));
+          }
 
           // Materialize attachment bytes to the group folder (await so the
           // agent-runner sees them in the same inbound dispatch).
@@ -225,6 +231,20 @@ class TelegramGrammyAdapter implements ChannelAdapter {
   }
 }
 
+/**
+ * Parse `TELEGRAM_NO_SEEN_CHATS` — a comma-separated list of chat ids where
+ * the 👀 "seen" reaction is suppressed. Non-numeric entries are dropped.
+ */
+function parseNoSeenChats(raw: string | undefined): ReadonlySet<number> {
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n)),
+  );
+}
+
 registerChannelAdapter(CHANNEL_TYPE, {
   factory: () => {
     const env = readEnvFile([
@@ -232,6 +252,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'TELEGRAM_API_ROOT',
       'TELEGRAM_MAX_FILE_MB',
       'TELEGRAM_LOCAL_FILES_DIR',
+      'TELEGRAM_NO_SEEN_CHATS',
     ]);
     if (!env.TELEGRAM_BOT_TOKEN) return null;
     return new TelegramGrammyAdapter(
@@ -239,6 +260,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       env.TELEGRAM_API_ROOT,
       env.TELEGRAM_MAX_FILE_MB,
       env.TELEGRAM_LOCAL_FILES_DIR,
+      parseNoSeenChats(env.TELEGRAM_NO_SEEN_CHATS),
     );
   },
 });
