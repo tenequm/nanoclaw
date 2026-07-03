@@ -29,7 +29,8 @@ import { buildAskQuestionKeyboard } from './ask-question.js';
 import type { GrammyDeliveryError } from './errors.js';
 import { mapGrammyError } from './errors.js';
 import { renderFS, splitForBody, splitForCaption } from './formatter.js';
-import { extractTelegramMessageId, parseChatId, parseThreadId } from './inbound.js';
+import { extractTelegramMessageId, parseChatId, parseThreadId, parseTopicId } from './inbound.js';
+import { rememberTopicMessage } from './topic-map.js';
 import { canonicalizeReactionEmoji, clearPendingSeen, type TelegramReactionEmoji, untrackSeen } from './reactions.js';
 import { BotService } from './services.js';
 import { probeMediaMeta } from './media-meta.js';
@@ -495,7 +496,13 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
 ) {
   const chatId = parseChatId(platformId);
   const view = viewContent(message);
-  const reactionKey = threadId ?? platformId;
+  // A per-topic platformId (`telegram:<chatId>:<topicId>`) carries the forum
+  // topic in its 3rd segment. When routing gives no explicit threadId, reuse
+  // the platformId as the thread carrier — parseThreadId reads the last
+  // segment, so every send below lands in the right topic.
+  const topicScoped = parseTopicId(platformId) !== undefined;
+  const effectiveThreadId = threadId ?? (topicScoped ? platformId : null);
+  const reactionKey = effectiveThreadId ?? platformId;
   const files = message.files ?? [];
 
   let result: string | undefined = undefined;
@@ -505,20 +512,27 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
   } else if (view.isReaction && view.reactionMessageId != null) {
     result = yield* reactToMessage(chatId, reactionKey, view.reactionMessageId, view.reactionEmoji);
   } else if (view.isMediaGroup && view.mediaGroupItems) {
-    result = yield* sendMediaGroup(chatId, threadId, view.mediaGroupItems, files);
+    result = yield* sendMediaGroup(chatId, effectiveThreadId, view.mediaGroupItems, files);
   } else if (view.isAskQuestion && view.askQuestionId != null && view.askTitle != null && view.askOptions) {
     result = yield* sendAskQuestion(
       chatId,
-      threadId,
+      effectiveThreadId,
       view.askQuestionId,
       view.askTitle,
       view.askQuestion ?? '',
       view.askOptions,
     );
   } else if (view.isCard && view.cardFallbackText != null) {
-    result = yield* sendDefault(chatId, threadId, view.cardFallbackText, files);
+    result = yield* sendDefault(chatId, effectiveThreadId, view.cardFallbackText, files);
   } else {
-    result = yield* sendDefault(chatId, threadId, view.text, files);
+    result = yield* sendDefault(chatId, effectiveThreadId, view.text, files);
+  }
+
+  // Remember which topic the bot's own message went to, so a user reaction
+  // on it (whose update carries no topic id) can be routed back here.
+  if (topicScoped && result !== undefined) {
+    const sentId = Number(result);
+    if (Number.isFinite(sentId)) rememberTopicMessage(chatId, sentId, platformId);
   }
 
   yield* clearPendingSeen(chatId, reactionKey);

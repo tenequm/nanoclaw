@@ -16,19 +16,21 @@ import type { Message, MessageEntity, MessageOrigin, User } from 'grammy/types';
 
 import type { InboundMessage } from '../adapter.js';
 
-/** Compose the platform id the router expects for a Telegram chat. */
-export const platformIdFor = (chatId: number): string => `telegram:${chatId}`;
-
 /**
- * Encode a thread id for forum topics. Returns null for plain chats/DMs —
- * the adapter declares supportsThreads: false so the router will strip it
- * anyway, but keeping the encode symmetric with the legacy adapter avoids
- * surprises when topics are later promoted to first-class.
+ * Compose the platform id the router expects for a Telegram chat.
+ *
+ * Forum topics are first-class conversations here: a topic message gets
+ * `telegram:<chatId>:<topicId>` so each topic becomes its own
+ * messaging_group (wireable to a different agent group), while the General
+ * tab and plain chats/DMs keep the 2-part `telegram:<chatId>` id. The
+ * adapter stays `supportsThreads: false` — topics are separate channels,
+ * not sub-threads; outbound derives `message_thread_id` from the 3-part id
+ * (see `parseTopicId`).
  */
-export const threadIdFor = (chatId: number, msg: Message): string | null =>
-  msg.is_topic_message && typeof msg.message_thread_id === 'number'
+export const platformIdFor = (chatId: number, msg?: Message): string =>
+  msg?.is_topic_message && typeof msg.message_thread_id === 'number'
     ? `telegram:${chatId}:${msg.message_thread_id}`
-    : null;
+    : `telegram:${chatId}`;
 
 /** Compound id encoding so outbound `edit`/`reaction` can decode back to (chatId, msgId). */
 export const compoundMessageId = (chatId: number, messageId: number): string => `${chatId}:${messageId}`;
@@ -538,8 +540,8 @@ export function toInboundMessage(
       : compoundMessageId(chat.id, msg.message_id);
 
   return {
-    platformId: platformIdFor(chat.id),
-    threadId: threadIdFor(chat.id, msg),
+    platformId: platformIdFor(chat.id, msg),
+    threadId: null,
     message: {
       id: messageId,
       kind: 'chat-sdk',
@@ -632,14 +634,26 @@ export function toReactionInbound(upd: ReactionUpdatePayload): InboundEnvelope |
   };
 }
 
-/** chatId parser for outbound routing (`telegram:<chatId>` → number). */
+/** chatId parser for outbound routing (`telegram:<chatId>[:<topicId>]` → number). */
 export function parseChatId(platformId: string): number {
-  const tail = platformId.split(':').slice(1).join(':');
-  const n = Number(tail);
-  if (!Number.isFinite(n)) {
+  const part = platformId.split(':')[1] ?? '';
+  const n = Number(part);
+  if (part === '' || !Number.isFinite(n)) {
     throw new Error(`Invalid telegram platformId: ${platformId}`);
   }
   return n;
+}
+
+/**
+ * Forum-topic id embedded in a per-topic platform id
+ * (`telegram:<chatId>:<topicId>`). Returns undefined for the 2-part base
+ * form so plain chats/DMs are unaffected.
+ */
+export function parseTopicId(platformId: string): number | undefined {
+  const parts = platformId.split(':');
+  if (parts.length !== 3) return undefined;
+  const n = Number(parts[2]);
+  return Number.isFinite(n) && String(n) === parts[2] ? n : undefined;
 }
 
 /** threadId → numeric forum topic id (falls back to undefined). */

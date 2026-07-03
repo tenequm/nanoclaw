@@ -9,9 +9,57 @@
 import { describe, expect, it } from 'vitest';
 import type { MessageEntity } from 'grammy/types';
 
-import { entitiesToMarkdown, extractTelegramMessageId } from './inbound.js';
+import type { Message } from 'grammy/types';
+
+import { entitiesToMarkdown, extractTelegramMessageId, parseChatId, parseTopicId, platformIdFor } from './inbound.js';
 
 const e = (obj: unknown): MessageEntity[] => obj as MessageEntity[];
+
+describe('platformIdFor (forum topics become first-class platform ids)', () => {
+  it('returns the 2-part base id for plain chats and DMs', () => {
+    expect(platformIdFor(-1003927289090)).toBe('telegram:-1003927289090');
+    expect(platformIdFor(95307956, { message_id: 1 } as Message)).toBe('telegram:95307956');
+  });
+
+  it('suffixes the topic id for forum-topic messages', () => {
+    const msg = { message_id: 7, is_topic_message: true, message_thread_id: 42 } as Message;
+    expect(platformIdFor(-1003927289090, msg)).toBe('telegram:-1003927289090:42');
+  });
+
+  it('ignores message_thread_id on non-topic messages (plain reply threads)', () => {
+    const msg = { message_id: 7, message_thread_id: 42 } as Message;
+    expect(platformIdFor(-100123, msg)).toBe('telegram:-100123');
+  });
+});
+
+describe('parseChatId', () => {
+  it('parses the 2-part base form', () => {
+    expect(parseChatId('telegram:-1003927289090')).toBe(-1003927289090);
+  });
+
+  it('parses the chat id out of a 3-part per-topic form', () => {
+    expect(parseChatId('telegram:-1003927289090:42')).toBe(-1003927289090);
+  });
+
+  it('throws on garbage', () => {
+    expect(() => parseChatId('telegram:not-a-number')).toThrow();
+    expect(() => parseChatId('telegram:')).toThrow();
+  });
+});
+
+describe('parseTopicId', () => {
+  it('extracts the topic from a 3-part per-topic id', () => {
+    expect(parseTopicId('telegram:-1003927289090:42')).toBe(42);
+  });
+
+  it('returns undefined for the 2-part base form', () => {
+    expect(parseTopicId('telegram:-1003927289090')).toBeUndefined();
+  });
+
+  it('returns undefined when the 3rd segment is not numeric', () => {
+    expect(parseTopicId('telegram:-100123:abc')).toBeUndefined();
+  });
+});
 
 describe('extractTelegramMessageId', () => {
   it('accepts bare numeric id and uses fallback chatId', () => {

@@ -26,7 +26,15 @@ import { log } from '../../log.js';
 
 import { materializeAll } from './attachments.js';
 import { parseCallbackData } from './ask-question.js';
-import { toInboundMessage, toReactionInbound, type InboundContent, type ReactionUpdatePayload } from './inbound.js';
+import {
+  parseThreadId,
+  parseTopicId,
+  toInboundMessage,
+  toReactionInbound,
+  type InboundContent,
+  type ReactionUpdatePayload,
+} from './inbound.js';
+import { rememberTopicMessage, resolveTopicPlatformId } from './topic-map.js';
 import { tryPair } from './pairing-interceptor.js';
 import { dispatchOutbound } from './outbound.js';
 import { fireSeenReaction } from './reactions.js';
@@ -83,6 +91,13 @@ class TelegramGrammyAdapter implements ChannelAdapter {
           const chat = ctx.chat;
           if (!chat || !ctx.msg) return;
           const chatId = chat.id;
+
+          // Forum topic → remember which topic this message lives in so a
+          // later `message_reaction` update (which carries no topic id) can
+          // be attributed to the right per-topic messaging group.
+          if (parseTopicId(platformId) !== undefined) {
+            rememberTopicMessage(chatId, ctx.msg.message_id, platformId);
+          }
 
           // Fire 👀 best-effort in a detached fiber — doesn't block
           // materialization or the router handoff. Suppressed for chats in
@@ -150,8 +165,11 @@ class TelegramGrammyAdapter implements ChannelAdapter {
           if (!upd) return;
           const envelope = toReactionInbound(upd);
           if (!envelope) return;
+          // Reaction updates carry no topic id — attribute via the message
+          // map recorded on inbound/outbound; fall back to the base chat id.
+          const reactionPlatformId = resolveTopicPlatformId(upd.chat.id, upd.message_id) ?? envelope.platformId;
           void runtime.runPromise(
-            onInbound(envelope.platformId, envelope.threadId, envelope.message).pipe(
+            onInbound(reactionPlatformId, envelope.threadId, envelope.message).pipe(
               Effect.catchCause((cause) =>
                 Effect.logError('telegram-grammy: message_reaction handler failed', { cause }),
               ),
@@ -204,14 +222,15 @@ class TelegramGrammyAdapter implements ChannelAdapter {
     await rt.runPromise(
       Effect.gen(function* () {
         const { bot } = yield* BotService;
-        const chatId = Number(platformId.split(':').slice(1).join(':'));
+        const chatId = Number(platformId.split(':')[1]);
         if (!Number.isFinite(chatId)) return;
-        const threadPart = threadId?.split(':').pop();
-        const messageThreadId = threadPart ? Number(threadPart) : undefined;
+        // Explicit threadId wins; otherwise a per-topic platformId carries
+        // the forum topic in its 3rd segment.
+        const messageThreadId = parseThreadId(threadId) ?? parseTopicId(platformId);
         yield* Effect.tryPromise({
           try: () =>
             bot.api.sendChatAction(chatId, 'typing', {
-              message_thread_id: Number.isFinite(messageThreadId) ? (messageThreadId as number) : undefined,
+              message_thread_id: messageThreadId,
             }),
           catch: (err) => err,
         }).pipe(
