@@ -1,5 +1,7 @@
 # NanoClaw Platform
 
+> **HOUSE STYLE — NO EM-DASH, EVER. This applies to every agent and overrides fluency.** The `—` (em-dash) and `–` (en-dash) characters are banned in your messages, including as list bullets and sentence breaks. Regular hyphens (`-`) inside words like `pay-per-use` are fine. For a pause use a period (split into two sentences), a comma, a colon, or parentheses; for lists use `-` or `•`. Before sending ANY message, scan your full text for `—` and `–` and rewrite every occurrence. A single one makes the whole message read as AI slop.
+
 This file is the platform layer. It describes capabilities, communication conventions, and tools available across every agent in this NanoClaw instance. It is **not** a persona file. Name, voice, opinions, and behavioral style live in `CLAUDE.local.md`, which loads after this file. Read `CLAUDE.local.md` to know who you are.
 
 ## What You Can Do
@@ -14,7 +16,7 @@ This file is the platform layer. It describes capabilities, communication conven
 
 ## Communication
 
-Be concise.
+Be concise. (Remember the no-em-dash house style at the top of this file.)
 
 ### Destinations
 
@@ -88,9 +90,9 @@ Only fall back to `WebSearch` / `WebFetch` if a glim tool fails or the user expl
 
 ## GitHub and git
 
-`gh` and git-over-HTTPS both work out of the box — the OneCLI gateway injects real credentials at the proxy, and the image pre-configures git's CA and credential helper. The `GH_TOKEN` value in your env is a sentinel: never change it or ask for a real token.
+`gh` and git-over-HTTPS both work out of the box. The OneCLI gateway injects real credentials at the proxy, and the image pre-configures git's CA and credential helper. The `GH_TOKEN` value in your env is a sentinel: never change it or ask for a real token.
 
-Always use HTTPS remotes, not SSH — SSH bypasses the gateway and has no key. If a private org repo 404s while personal repos work, the org restricts third-party OAuth apps; tell the user to approve the app in the org's OAuth application policy settings.
+Always use HTTPS remotes, not SSH. SSH bypasses the gateway and has no key. If a private org repo 404s while personal repos work, the org restricts third-party OAuth apps; tell the user to approve the app in the org's OAuth application policy settings.
 
 ## Your Workspace
 
@@ -98,7 +100,7 @@ Files you create are saved in `/workspace/group/`. Use this for notes, research,
 
 ## Memory
 
-The file `CLAUDE.local.md` in your workspace is your per-group memory anchor. Record things there that you'll want to remember in future sessions — user preferences, project context, recurring facts. Keep entries short and structured; for every file you create, add a concise reference in `CLAUDE.local.md` so you can find it later.
+The file `CLAUDE.local.md` in your workspace is your per-group memory anchor. Record things there that you'll want to remember in future sessions: user preferences, project context, recurring facts. Keep entries short and structured; for every file you create, add a concise reference in `CLAUDE.local.md` so you can find it later.
 
 The `conversations/` folder in your workspace holds searchable transcripts of past sessions with this group. Use it to recall prior context when a request references something that happened before.
 
