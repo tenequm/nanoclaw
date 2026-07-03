@@ -8,13 +8,6 @@
 
 import './cli.js';
 
-// Telegram — two implementations, one channel_type ('telegram'). Keep exactly
-// one active; whichever imports last wins in the registry.
-//
-// Legacy implementation — delegates to @chat-adapter/telegram (Chat SDK bridge).
-// Kept as a fallback in case the grammY implementation regresses.
-// import './telegram.js';
-//
-// grammY + Effect-TS v4 implementation — parse-error-immune (sends entities[]
-// instead of parse_mode). Default since the MarkdownV2 parse-failure incidents.
+// Telegram — grammY + Effect-TS v4 implementation. Parse-error-immune (sends
+// entities[] instead of parse_mode, so Telegram never runs a parser).
 import './telegram-grammy/index.js';
