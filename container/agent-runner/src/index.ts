@@ -32,6 +32,7 @@ import { ensureMemoryScaffold } from './memory-scaffold.js';
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
+import { pondMcpServers } from './pond-mcp.js';
 import { runPollLoop } from './poll-loop.js';
 
 function log(msg: string): void {
@@ -86,6 +87,8 @@ async function main(): Promise<void> {
     mcpServers[name] = serverConfig;
     log(`Additional MCP server: ${name} (${serverConfig.command})`);
   }
+
+  Object.assign(mcpServers, pondMcpServers());
 
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,

@@ -33,6 +33,7 @@ import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+import { pondMounts } from './pond-mounts.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -359,6 +360,9 @@ export function buildMounts(
   if (providerContribution.mounts) {
     mounts.push(...providerContribution.mounts);
   }
+
+  // Pond recall stores (.claude/skills/add-pond) — read-only, host-decided.
+  mounts.push(...pondMounts(agentGroup.id, DATA_DIR));
 
   return mounts;
 }
