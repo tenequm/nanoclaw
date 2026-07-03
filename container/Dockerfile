@@ -79,8 +79,8 @@ RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 # Install gh so agents can run `gh pr list`, `gh repo view`, etc. Auth follows
 # the OneCLI "Pattern D" model (onecli.sh/docs/guides/credential-stubs/general-app):
 # the sentinel env value only satisfies gh's local auth check; real credentials
-# are injected at the network level by the OneCLI gateway (HTTPS_PROXY), matched
-# to api.github.com in the vault. No real token ever enters the container env.
+# are injected at the network level by the OneCLI gateway (HTTPS_PROXY), via the
+# GitHub OAuth app connection. No real token ever enters the container env.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -92,6 +92,16 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && rm -rf /var/lib/apt/lists/*
 
 ENV GH_TOKEN=onecli-managed
+
+# git-over-HTTPS through the gateway. Two gaps the injected env doesn't cover
+# (verified against @onecli-sh/sdk 2.4.0 / gateway 1.40.0 — re-check on
+# upgrades): git reads GIT_SSL_CAINFO, not SSL_CERT_FILE, for the MITM CA; and
+# the gateway only swaps credentials git actually sends, so gh acts as git's
+# credential helper to supply the sentinel. The CA path is hardcoded in the
+# OneCLI SDK (applyContainerConfig mounts the combined gateway+system bundle
+# there), so public hosts still verify normally.
+ENV GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem
+RUN git config --system credential.helper '!gh auth git-credential'
 
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
