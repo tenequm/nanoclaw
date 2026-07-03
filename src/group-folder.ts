@@ -1,6 +1,6 @@
 import path from 'path';
 
-import { DATA_DIR, GROUPS_DIR } from './config.js';
+import { GROUPS_DIR } from './config.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getMessagingGroupByPlatform, getMessagingGroupAgents } from './db/messaging-groups.js';
 
@@ -52,12 +52,4 @@ export function resolveGroupFolderForPlatformId(channelType: string, platformId:
   const primary = wirings[0];
   const ag = getAgentGroup(primary.agent_group_id);
   return ag?.folder ?? null;
-}
-
-export function resolveGroupIpcPath(folder: string): string {
-  assertValidGroupFolder(folder);
-  const ipcBaseDir = path.resolve(DATA_DIR, 'ipc');
-  const ipcPath = path.resolve(ipcBaseDir, folder);
-  ensureWithinBase(ipcBaseDir, ipcPath);
-  return ipcPath;
 }

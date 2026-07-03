@@ -1,6 +1,6 @@
 {
   "name": "nanoclaw",
-  "version": "2.1.16",
+  "version": "2.1.24",
   "description": "Personal Claude assistant. Lightweight, secure, customizable.",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
@@ -36,7 +36,7 @@
     "@grammyjs/parse-mode": "2.3.0",
     "@onecli-sh/sdk": "2.2.1",
     "better-sqlite3": "11.10.0",
-    "chat": "^4.24.0",
+    "chat": "4.29.0",
     "cron-parser": "5.5.0",
     "effect": "4.0.0-beta.52",
     "grammy": "1.42.0",

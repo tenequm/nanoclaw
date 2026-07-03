@@ -341,6 +341,12 @@ export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'nanoclaw-agent:la
 export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800000', 10); // 30min default
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min — keep container alive after last result
 export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
+// Per-container resource caps → `docker run --cpus/--memory`. Empty default =
+// no flag = unbounded (today's behavior). Opt in to bound a fleet sharing one
+// host: CONTAINER_CPU_LIMIT=2, CONTAINER_MEMORY_LIMIT=8g. Swap is a host concern
+// (run the host swapless to make --memory a hard cap); not managed here.
+export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || '';
+export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || '';
 
 export const TRIGGER_PATTERN = new RegExp(`^@${ASSISTANT_NAME}\\b`, 'i');
 ```

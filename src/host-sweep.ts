@@ -152,6 +152,18 @@ async function sweep(): Promise<void> {
     log.error('Host sweep error', { err });
   }
 
+  // Finalize any "Reject with reason…" holds whose reply window elapsed (admin
+  // ghosted, or the host restarted mid-capture). Central-DB scan, once per tick
+  // — not per session.
+  // MODULE-HOOK:approvals-reason-sweep:start
+  try {
+    const { sweepAwaitingReasonRejects } = await import('./modules/approvals/index.js');
+    await sweepAwaitingReasonRejects();
+  } catch (err) {
+    log.error('Reject-with-reason sweep failed', { err });
+  }
+  // MODULE-HOOK:approvals-reason-sweep:end
+
   setTimeout(sweep, SWEEP_INTERVAL_MS);
 }
 
