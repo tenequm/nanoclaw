@@ -2,14 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import {
-  query as sdkQuery,
-  type HookCallback,
-  type PreCompactHookInput,
-  type SDKAssistantMessage,
-  type SDKMessage,
-  type SDKResultMessage,
-} from '@anthropic-ai/claude-agent-sdk';
+import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
@@ -316,236 +309,17 @@ function transcriptStartMs(transcriptPath: string): number | null {
   }
 }
 
-// ── SDK message classification (translator helpers) ──
-
-/**
- * Text + tool-use summary for an `SDKAssistantMessage`. We surface text-only
- * AMs as `result` events and AMs containing any `tool_use` block as
- * `progress` events (per Anthropic's documented "AssistantMessage = per-turn
- * progress, ResultMessage = lifecycle" model).
- */
-interface AssistantTextSummary {
-  text: string;
-  hasToolUse: boolean;
-}
-
-export function extractAssistantText(message: SDKAssistantMessage): AssistantTextSummary {
-  let text = '';
-  let hasToolUse = false;
-  for (const block of message.message.content) {
-    if (block.type === 'text') text += block.text;
-    else if (block.type === 'tool_use') hasToolUse = true;
-  }
-  return { text: text.trim(), hasToolUse };
-}
-
-export const RESULT_ERROR_MESSAGES: Record<string, string> = {
-  error_max_turns: 'Agent reached the maximum turn limit before finishing.',
-  error_max_budget_usd: 'Agent reached the budget limit before finishing.',
-  error_during_execution: 'Agent execution was interrupted by an error.',
-  error_max_structured_output_retries:
-    'Agent failed to produce valid structured output after retries.',
-};
-
-export type ResultClassification =
-  | { kind: 'success'; text: string }
-  | { kind: 'refusal' }
-  | { kind: 'error'; subtype: string; message: string };
-
-export function classifyResult(message: SDKResultMessage): ResultClassification {
-  if (message.subtype !== 'success') {
-    return {
-      kind: 'error',
-      subtype: message.subtype,
-      message: RESULT_ERROR_MESSAGES[message.subtype] ?? `Agent stopped: ${message.subtype}`,
-    };
-  }
-  // Narrowed to SDKResultSuccess. `result` is `string` (always present).
-  if (message.stop_reason === 'refusal') return { kind: 'refusal' };
-  return { kind: 'success', text: (message as { result: string }).result };
-}
-
-/**
- * Translate the Claude Agent SDK's message stream into our `ProviderEvent`
- * stream. Exported (rather than inlined into `query()`) so we can replay real
- * JSONL transcripts through it in tests.
- *
- * ── Turn-boundary delivery model — READ THIS before changing the emit logic ──
- *
- * Anthropic's agent loop defines two distinct message roles
- * (docs: https://code.claude.com/docs/en/agent-sdk/agent-loop —
- *  "The SDK yields a final AssistantMessage with the text response (no tool
- *   calls), followed by a ResultMessage with the final text … ResultMessage
- *   marks the end of the agent loop."):
- *   - AssistantMessage — the canonical carrier of the response TEXT
- *     ("emitted after each Claude response, including the final text-only one").
- *   - ResultMessage    — the END-OF-TURN lifecycle marker (cost/usage/stop
- *     reason). It ALSO echoes the final text in `result`, but redundantly.
- *
- * We therefore read the answer from the final text-only AssistantMessage and
- * use the ResultMessage purely as the once-per-turn boundary. We do NOT just
- * read `ResultMessage.result`, for two reasons:
- *   1. By design the text lives on the AssistantMessage; the RM copy is
- *      redundant.
- *   2. The SDK has historically returned an EMPTY `ResultMessage.result` on
- *      some turns (fixed upstream in @anthropic-ai/claude-agent-sdk 0.3.176 &
- *      0.3.179 — both newer than our pinned 0.3.170), which would silently
- *      drop the whole answer if we trusted only the RM. Reading from the AM is
- *      the robust choice and the original reason this translator exists. See
- *      the "replay of the actual failing turn" test in claude.test.ts.
- *
- * ⚠ CRITICAL INVARIANT: emit EXACTLY ONE `result` event per turn, at the
- *     ResultMessage boundary — never one per AssistantMessage.
- *
- *     The poll-loop runs its "not wrapped → not delivered" nudge once per
- *     `result` event (see processQuery → dispatchResultText + the
- *     `willRetryWrapping` push in poll-loop.ts — upstream-identical code that
- *     ASSUMES one result per turn). An earlier version of this translator
- *     emitted a `result` for every intermediate text-only AssistantMessage
- *     (e.g. bare narration like "Now let me check…"). That made the nudge
- *     false-fire mid-turn → the agent re-sent an already-delivered answer →
- *     DUPLICATE messages in chat. Coalescing to one result per turn is the fix.
- *     Do not reintroduce per-AssistantMessage `result`/`progress` emission.
- *
- * TRADE-OFF (intentional): intermediate AssistantMessage text — mid-turn
- * narration, or a `<message>` block the model emits before the final turn — is
- * NOT delivered; only the final answer is. Mid-turn updates must use the
- * `send_message` MCP tool (mcp-tools/core.ts), which is the intended mechanism
- * and is unaffected by this.
- */
-export async function* translateSdkMessages(
-  source: AsyncIterable<SDKMessage>,
-  isAborted: () => boolean = () => false,
-): AsyncGenerator<ProviderEvent> {
-  let messageCount = 0;
-  // Buffered text of the latest top-level text-only AssistantMessage for the
-  // CURRENT turn — the answer per Anthropic's loop model. Held (not emitted)
-  // until the ResultMessage boundary, then delivered once and reset. See the
-  // "Turn-boundary delivery model" block on this function.
-  let lastAssistantText: string | null = null;
-
-  for await (const message of source) {
-    if (isAborted()) return;
-    messageCount++;
-
-    // Liveness: every SDK event keeps the heartbeat fresh.
-    yield { type: 'activity' };
-
-    switch (message.type) {
-      case 'system': {
-        // Narrowed to SDKSystemMessage | SDKAPIRetryMessage |
-        // SDKCompactBoundaryMessage | SDKTaskNotificationMessage.
-        switch ((message as { subtype?: string }).subtype) {
-          case 'init':
-            yield { type: 'init', continuation: (message as { session_id: string }).session_id };
-            break;
-          case 'api_retry':
-            yield { type: 'error', message: 'API retry', retryable: true };
-            break;
-          case 'compact_boundary': {
-            // The SDK auto-summarized older context to free up the window. This
-            // is a system NOTICE, not agent output — emit it as `notice` so the
-            // poll-loop delivers it directly to chat (visible to the user) and
-            // does NOT run it through the `<message>`-wrapping nudge. (Emitting
-            // it as a bare-text `result` made it both invisible — dropped as
-            // scratchpad — AND trip the false "not delivered" nudge.)
-            const pre = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata?.pre_tokens;
-            const detail = pre ? ` (${pre.toLocaleString()} tokens summarized)` : '';
-            yield { type: 'notice', message: `🗜 Context compacted${detail} — older messages were summarized to free up space.` };
-            break;
-          }
-          case 'task_notification':
-            yield { type: 'progress', message: (message as { summary?: string }).summary || 'Task notification' };
-            break;
-        }
-        break;
-      }
-
-      case 'rate_limit_event': {
-        // SDKRateLimitEvent is its own top-level type, not a `system` subtype.
-        // Surface only `rejected` status; `allowed` and `allowed_warning` are informational.
-        if ((message as { rate_limit_info?: { status?: string } }).rate_limit_info?.status === 'rejected') {
-          yield {
-            type: 'error',
-            message: 'Rate limit reached.',
-            retryable: false,
-            classification: 'quota',
-          };
-        }
-        break;
-      }
-
-      case 'assistant': {
-        // Skip subagent narration (Task tool spawns these; parent_tool_use_id
-        // is set). We only surface top-level agent output to the user.
-        if ((message as SDKAssistantMessage).parent_tool_use_id != null) break;
-        const { text, hasToolUse } = extractAssistantText(message as SDKAssistantMessage);
-        // Buffer the answer-style text (text with NO tool_use — the documented
-        // "final AssistantMessage with the text response (no tool calls)").
-        // Do NOT emit here: delivery happens once at the ResultMessage
-        // boundary below. Text that accompanies a tool_use is per-turn
-        // narration, not the answer, so it is neither buffered nor emitted.
-        // See the "Turn-boundary delivery model" block — emitting per-AM here
-        // is exactly what caused the duplicate-message bug.
-        if (text && !hasToolUse) lastAssistantText = text;
-        break;
-      }
-
-      case 'result': {
-        // ResultMessage = end-of-turn boundary. Emit EXACTLY ONE result for
-        // the turn here (or surface a terminal error), then reset the buffer.
-        const classified = classifyResult(message as SDKResultMessage);
-        if (classified.kind === 'error') {
-          yield {
-            type: 'error',
-            message: classified.message,
-            retryable: false,
-            classification: classified.subtype,
-          };
-        } else if (classified.kind === 'refusal') {
-          yield {
-            type: 'error',
-            message: 'Claude declined this request.',
-            retryable: false,
-            classification: 'refusal',
-          };
-        } else {
-          // Prefer the buffered AssistantMessage text (canonical carrier; never
-          // empty when there is an answer). Fall back to ResultMessage.result
-          // for the no-text-AM turn and the historical empty-AM/structured
-          // cases. `null` when the turn legitimately produced no text (e.g. the
-          // agent only used send_message / tools) — the poll-loop then delivers
-          // nothing and skips the nudge.
-          const text = lastAssistantText ?? (classified.text || null);
-          yield { type: 'result', text };
-        }
-        lastAssistantText = null; // reset for the next turn in this stream
-        break;
-      }
-
-      // user, user_replay, partial_assistant, status, hook_*, plugin_install,
-      // tool_progress, auth_status, task_started/updated/progress,
-      // session_state_changed, notification, files_persisted, tool_use_summary,
-      // memory_recall, elicitation_complete, prompt_suggestion,
-      // local_command_output: no user-facing emit. `activity` already yielded.
-    }
-  }
-  log(`Query completed after ${messageCount} SDK messages`);
-}
-
 // ── Provider ──
 
 /**
- * Currently disabled — the env var takes priority over settings.json, so
- * forcing a value here clamps every agent regardless of their configured
- * model's native context window. Leaving it unset lets settings.json's
- * `autoCompactWindow` (or the native model ceiling) take effect.
+ * Claude Code auto-compacts context at this window (tokens). Kept here so
+ * the generic bootstrap doesn't need to know about Claude-specific env vars.
  *
  * Operator override: set CLAUDE_CODE_AUTO_COMPACT_WINDOW in the host env to
  * raise or lower the threshold without editing source — useful when running
  * with a 1M-context model variant or when emergency-tuning a deployment.
  */
-// const CLAUDE_CODE_AUTO_COMPACT_WINDOW = '165000';
+const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '165000';
 
 /**
  * Stale-session detection. Matches Claude Code's error text when a
@@ -570,16 +344,9 @@ export class ClaudeProvider implements AgentProvider {
     this.additionalDirectories = options.additionalDirectories;
     this.model = options.model;
     this.effort = options.effort;
-    // Do NOT inject CLAUDE_CODE_AUTO_COMPACT_WINDOW here — the env var takes
-    // priority over settings.json, so a hardcoded fallback would clamp every
-    // agent to 165k regardless of their configured model's context window.
-    // Let settings.json's `autoCompactWindow` (or the native model ceiling)
-    // win. Operators who want a specific value set it in the host env.
     this.env = {
       ...(options.env ?? {}),
-      ...(process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
-        ? { CLAUDE_CODE_AUTO_COMPACT_WINDOW: process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW }
-        : {}),
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW,
     };
   }
 
@@ -661,10 +428,45 @@ export class ClaudeProvider implements AgentProvider {
 
     let aborted = false;
 
+    async function* translateEvents(): AsyncGenerator<ProviderEvent> {
+      let messageCount = 0;
+      for await (const message of sdkResult) {
+        if (aborted) return;
+        messageCount++;
+
+        // Yield activity for every SDK event so the poll loop knows the agent is working
+        yield { type: 'activity' };
+
+        if (message.type === 'system' && message.subtype === 'init') {
+          yield { type: 'init', continuation: message.session_id };
+        } else if (message.type === 'result') {
+          // `result` text exists only on subtype:"success"; error subtypes
+          // (e.g. a non-retryable 403 billing_error) carry their message in
+          // `errors[]` instead. Surface either so the poll-loop can deliver a
+          // billing/quota notice to the user rather than dropping the turn.
+          const m = message as { result?: string; is_error?: boolean; errors?: string[] };
+          const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
+          yield { type: 'result', text, isError: m.is_error === true };
+        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
+          yield { type: 'error', message: 'API retry', retryable: true };
+        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
+          yield { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' };
+        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
+          const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
+          const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
+          yield { type: 'result', text: `Context compacted${detail}.` };
+        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
+          const tn = message as { summary?: string };
+          yield { type: 'progress', message: tn.summary || 'Task notification' };
+        }
+      }
+      log(`Query completed after ${messageCount} SDK messages`);
+    }
+
     return {
       push: (msg) => stream.push(msg),
       end: () => stream.end(),
-      events: translateSdkMessages(sdkResult, () => aborted),
+      events: translateEvents(),
       abort: () => {
         aborted = true;
         stream.end();

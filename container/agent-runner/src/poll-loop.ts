@@ -473,35 +473,6 @@ export async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
-      } else if (event.type === 'progress') {
-        // SDK task_notifications (the only `progress` producer). Same dispatch
-        // path as `result` so any <message to="..."> blocks still route correctly.
-        dispatchResultText(event.message, routing);
-      } else if (event.type === 'error' && !event.retryable && event.classification) {
-        // Surface terminal errors (RM error subtypes, refusal, quota) to the
-        // user. Retryable errors (e.g. api_retry) stay log-only.
-        writeMessageOut({
-          id: generateId(),
-          in_reply_to: routing.inReplyTo,
-          kind: 'chat',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
-          content: JSON.stringify({ text: event.message }),
-        });
-      } else if (event.type === 'notice') {
-        // System-generated notice (e.g. context compaction). Deliver it
-        // directly like an error message — it is not agent output, so it must
-        // NOT go through dispatchResultText's <message>-wrapping nudge.
-        writeMessageOut({
-          id: generateId(),
-          in_reply_to: routing.inReplyTo,
-          kind: 'chat',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
-          content: JSON.stringify({ text: event.message }),
-        });
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
@@ -597,9 +568,6 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       break;
     case 'progress':
       log(`Progress: ${event.message}`);
-      break;
-    case 'notice':
-      log(`Notice: ${event.message}`);
       break;
   }
 }
