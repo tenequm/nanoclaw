@@ -15,12 +15,6 @@ import Database from 'better-sqlite3';
  */
 
 const Q = path.resolve(__dirname, 'q.ts');
-// Invoke tsx directly, NOT via `pnpm exec tsx`. `pnpm exec` scans the whole
-// workspace and prints "field X was found in <nested>/package.json" warnings
-// to stdout for every sub-project under groups/ that carries a `pnpm.*` field.
-// Those warnings pollute the stdout this test asserts on byte-for-byte. Going
-// straight to the binary keeps the test hermetic (it exercises q.ts, not pnpm).
-const TSX = path.resolve(__dirname, '..', 'node_modules', '.bin', 'tsx');
 
 describe('scripts/q.ts', () => {
   let tempDir: string;
@@ -42,7 +36,7 @@ describe('scripts/q.ts', () => {
   });
 
   function run(sql: string): { stdout: string; stderr: string; status: number } {
-    const r = spawnSync(TSX, [Q, dbPath, sql], {
+    const r = spawnSync('pnpm', ['exec', 'tsx', Q, dbPath, sql], {
       encoding: 'utf-8',
       cwd: path.resolve(__dirname, '..'),
     });
@@ -102,7 +96,7 @@ describe('scripts/q.ts', () => {
   });
 
   it('exits 2 with usage when args are missing', () => {
-    const r = spawnSync(TSX, [Q], {
+    const r = spawnSync('pnpm', ['exec', 'tsx', Q], {
       encoding: 'utf-8',
       cwd: path.resolve(__dirname, '..'),
     });
