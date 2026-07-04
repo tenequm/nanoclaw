@@ -2,7 +2,7 @@
 
 ## Trust Model
 
-Privilege in v2 is **user-level**, persisted in the `user_roles` table (owner /
+Privilege is **user-level**, persisted in the `user_roles` table (owner /
 admin, global or scoped to an agent group) plus `agent_group_members` (the
 unprivileged access gate). There is no "main vs non-main" group distinction and
 no `NANOCLAW_ADMIN_USER_IDS` env var — roles live in the central DB only.
