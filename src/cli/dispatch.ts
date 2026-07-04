@@ -14,7 +14,16 @@ import type { CallerContext, ErrorCode, RequestFrame, ResponseFrame } from './fr
 import { getResource } from './crud.js';
 import { lookup } from './registry.js';
 
-export async function dispatch(req: RequestFrame, ctx: CallerContext): Promise<ResponseFrame> {
+type DispatchOptions = {
+  /** True when a command is being replayed after approval. */
+  approved?: boolean;
+};
+
+export async function dispatch(
+  req: RequestFrame,
+  ctx: CallerContext,
+  opts: DispatchOptions = {},
+): Promise<ResponseFrame> {
   let cmd = lookup(req.command);
 
   // Fallback: if the full command isn't registered, trim the last
@@ -101,7 +110,7 @@ export async function dispatch(req: RequestFrame, ctx: CallerContext): Promise<R
     }
   }
 
-  if (ctx.caller !== 'host' && cmd.access === 'approval') {
+  if (ctx.caller !== 'host' && cmd.access === 'approval' && !opts.approved) {
     const session = getSession(ctx.sessionId);
     if (!session) {
       return err(req.id, 'handler-error', 'Session not found.');
@@ -117,7 +126,7 @@ export async function dispatch(req: RequestFrame, ctx: CallerContext): Promise<R
       session,
       agentName,
       action: 'cli_command',
-      payload: { frame: { id: req.id, command: req.command, args: req.args } },
+      payload: { frame: { id: req.id, command: req.command, args: req.args }, callerContext: ctx },
       title: `CLI: ${req.command}`,
       question: `Agent "${agentName}" wants to run:\n\`ncl ${req.command}${argSummary ? ' ' + argSummary : ''}\``,
     });
@@ -178,9 +187,10 @@ export async function dispatch(req: RequestFrame, ctx: CallerContext): Promise<R
   }
 }
 
-registerApprovalHandler('cli_command', async ({ session, payload, userId, notify }) => {
+registerApprovalHandler('cli_command', async ({ payload, notify }) => {
   const frame = payload.frame as RequestFrame;
-  const response = await dispatch(frame, { caller: 'host' });
+  const callerContext = parseCallerContext(payload.callerContext) ?? { caller: 'host' };
+  const response = await dispatch(frame, callerContext, { approved: true });
 
   if (response.ok) {
     const data = typeof response.data === 'string' ? response.data : JSON.stringify(response.data, null, 2);
@@ -189,6 +199,26 @@ registerApprovalHandler('cli_command', async ({ session, payload, userId, notify
     notify(`Your \`ncl ${frame.command}\` request was approved but failed: ${response.error.message}`);
   }
 });
+
+function parseCallerContext(value: unknown): CallerContext | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.caller === 'host') return { caller: 'host' };
+  if (
+    record.caller === 'agent' &&
+    typeof record.sessionId === 'string' &&
+    typeof record.agentGroupId === 'string' &&
+    typeof record.messagingGroupId === 'string'
+  ) {
+    return {
+      caller: 'agent',
+      sessionId: record.sessionId,
+      agentGroupId: record.agentGroupId,
+      messagingGroupId: record.messagingGroupId,
+    };
+  }
+  return undefined;
+}
 
 function err(id: string, code: ErrorCode, message: string): ResponseFrame {
   return { id, ok: false, error: { code, message } };
