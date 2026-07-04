@@ -46,8 +46,8 @@ export const REJECT_WITH_REASON_VALUE = 'reject_with_reason';
  * keep their own two-button set in onecli-approvals.ts.
  */
 const APPROVAL_OPTIONS: RawOption[] = [
-  { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
-  { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+  { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve', style: 'primary' },
+  { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject', style: 'danger' },
   { label: 'Reject with reason…', selectedLabel: '📝 Rejected (awaiting reason)', value: REJECT_WITH_REASON_VALUE },
 ];
 
