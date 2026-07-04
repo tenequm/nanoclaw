@@ -6,7 +6,18 @@ import { getContainerImageBase, getDefaultContainerImage, getInstallSlug } from 
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ONECLI_URL', 'ONECLI_API_KEY', 'TZ']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'ONECLI_URL',
+  'ONECLI_API_KEY',
+  'TZ',
+  'CONTAINER_CPU_LIMIT',
+  'CONTAINER_MEMORY_LIMIT',
+  'NANOCLAW_EGRESS_LOCKDOWN',
+  'NANOCLAW_EGRESS_NETWORK',
+  'ONECLI_GATEWAY_CONTAINER',
+]);
 
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const ASSISTANT_HAS_OWN_NUMBER =
@@ -47,8 +58,16 @@ export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CO
 // Per-container resource caps, passed through to `docker run`. Default empty =
 // no flag added = today's unbounded behavior (don't OOM existing OSS workloads).
 // Operators opt in: CONTAINER_CPU_LIMIT=2, CONTAINER_MEMORY_LIMIT=8g.
-export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || '';
-export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || '';
+export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || envConfig.CONTAINER_CPU_LIMIT || '';
+export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '';
+
+// Egress lockdown — force all agent traffic through the OneCLI gateway on a
+// no-internet Docker network. Off by default; consumed by src/egress-lockdown.ts.
+export const EGRESS_LOCKDOWN = (process.env.NANOCLAW_EGRESS_LOCKDOWN || envConfig.NANOCLAW_EGRESS_LOCKDOWN) === 'true';
+export const EGRESS_NETWORK =
+  process.env.NANOCLAW_EGRESS_NETWORK || envConfig.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
+export const ONECLI_GATEWAY_CONTAINER =
+  process.env.ONECLI_GATEWAY_CONTAINER || envConfig.ONECLI_GATEWAY_CONTAINER || 'onecli';
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
