@@ -223,6 +223,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
 
+    // A native slash-command turn (e.g. /compact, /context, /cost) returns its
+    // output as bare result text with no <message> wrapper. Flag it so the
+    // result handler delivers that text verbatim instead of firing the re-wrap
+    // nudge (which makes the model emit a confused reply about the command).
+    const commandTurn = config.provider.supportsNativeSlashCommands && keep.some((m) => isRunnerCommand(m));
+
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
     const query = config.provider.query({
@@ -247,6 +253,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         config.provider.onExchangeComplete?.bind(config.provider),
         prompt,
         continuation,
+        commandTurn,
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
@@ -331,6 +338,7 @@ export async function processQuery(
   onExchangeComplete: ((exchange: ProviderExchange) => void) | undefined,
   initialPrompt: string,
   initialContinuation: string | undefined,
+  commandTurn = false,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -496,6 +504,20 @@ export async function processQuery(
               status: 'error',
             });
             archivePrompts.shift();
+          } else if (sent === 0 && commandTurn) {
+            // Native slash-command turn (/compact, /context, /cost): the SDK's
+            // result text IS the command output (e.g. "Context compacted
+            // (N tokens)."). It legitimately carries no <message> wrapper, so
+            // deliver it verbatim and skip the re-wrap nudge — the nudge would
+            // otherwise make the model emit a confused reply about the command.
+            deliverCommandResult(event.text, routing);
+            notifyExchangeComplete(onExchangeComplete, {
+              prompt: archivePrompts[0] ?? initialPrompt,
+              result: event.text,
+              continuation: queryContinuation ?? initialContinuation,
+              status: 'completed',
+            });
+            archivePrompts.shift();
           } else {
             const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
             notifyExchangeComplete(onExchangeComplete, {
@@ -589,6 +611,19 @@ function deliverErrorResult(text: string, routing: RoutingContext): void {
     channel_type: routing.channelType,
     thread_id: routing.threadId,
     content: JSON.stringify({ text }),
+  });
+}
+
+function deliverCommandResult(text: string, routing: RoutingContext): void {
+  log('Native slash-command result — delivering verbatim to channel');
+  writeMessageOut({
+    id: generateId(),
+    in_reply_to: routing.inReplyTo,
+    kind: 'chat',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    content: JSON.stringify({ text: text.trim() }),
   });
 }
 

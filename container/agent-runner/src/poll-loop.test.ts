@@ -438,6 +438,23 @@ describe('error result with no <message> envelope', () => {
   });
 });
 
+describe('native slash-command result (commandTurn)', () => {
+  it('delivers the SDK command output verbatim and does not nudge', async () => {
+    const compactText = 'Context compacted (48,462 tokens compacted).';
+    const { query, pushes } = makeResultQuery({ type: 'result', text: compactText });
+
+    // commandTurn=true — this turn's prompt was a native slash command.
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, '/compact', undefined, true);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe(compactText);
+    expect(out[0].platform_id).toBe('chan-1');
+    // No re-wrap nudge — the command output legitimately has no <message>.
+    expect(pushes).toHaveLength(0);
+  });
+});
+
 describe('isCorruptionError', () => {
   it('matches the Docker Desktop macOS torn-read symptom', () => {
     expect(isCorruptionError('database disk image is malformed')).toBe(true);
