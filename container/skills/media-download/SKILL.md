@@ -4,7 +4,7 @@ Download media from URLs and send to chats using yt-dlp and instaloader.
 
 ## Sending Downloaded Media
 
-All downloaded files go under `/workspace/group/` (use `/workspace/group/tmp/` for throwaway files).
+All downloaded files go under `/workspace/agent/` (use `/workspace/agent/tmp/` for throwaway files).
 
 - **Single file** - use `send_file`. Photos (.jpg, .png, .gif, .webp) display inline, videos (.mp4, .mov) play with streaming, everything else is sent as a document.
 - **Multiple files** - use `send_media_group` (2-10 items). Photos and videos display as a gallery album.
@@ -14,13 +14,13 @@ All downloaded files go under `/workspace/group/` (use `/workspace/group/tmp/` f
 General-purpose video downloader. Works with YouTube, Instagram reels, Twitter/X, TikTok, and hundreds of other sites.
 
 ```bash
-yt-dlp "<URL>" -o /workspace/group/tmp/<filename>.mp4
+yt-dlp "<URL>" -o /workspace/agent/tmp/<filename>.mp4
 ```
 
 For Instagram reels/video - always use format '1' (native H.264 mp4), NOT DASH:
 
 ```bash
-yt-dlp -f 1 "<URL>" -o /workspace/group/tmp/<filename>.mp4
+yt-dlp -f 1 "<URL>" -o /workspace/agent/tmp/<filename>.mp4
 ```
 
 - Format '1' = H.264, embedded audio, correct SAR, no muxing needed
@@ -44,7 +44,7 @@ From URL: `instagram.com/p/DWs_UtSCG5z/` -> shortcode = `DWs_UtSCG5z`
 ### Carousel Downloads with instaloader
 
 ```bash
-cd /workspace/group/tmp && instaloader -- -<SHORTCODE>
+cd /workspace/agent/tmp && instaloader -- -<SHORTCODE>
 # Files are saved to folder ./-<SHORTCODE>/
 ```
 
