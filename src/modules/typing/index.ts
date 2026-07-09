@@ -34,12 +34,13 @@ import { log } from '../../log.js';
 
 const TYPING_REFRESH_MS = 4000;
 /**
- * Grace window from startTypingRefresh: fire typing unconditionally
- * for this long regardless of gate state. Covers container spawn/wake
- * latency (image start + OneCLI ensureAgent + agent-runner boot can
- * take well over 15s cold) — once the gate reads false past grace the
- * refresher stops for good, so the window must outlast the slowest
- * cold start.
+ * Grace window from startTypingRefresh: fire typing even when the gate
+ * reads "no work" — but only until the first inflight claim is observed
+ * (`sawWork`). Covers container spawn/wake latency (image start + OneCLI
+ * ensureAgent + agent-runner boot can take well over 15s cold), where the
+ * gate is unreadable or legitimately empty. Once real work has been seen,
+ * the gate is authoritative: a finished turn must stop typing immediately,
+ * not coast on the remainder of the grace window.
  */
 const TYPING_GRACE_MS = 30000;
 /**
@@ -83,6 +84,13 @@ interface TypingTarget {
    * for the rest of the turn.
    */
   gateMisses: number;
+  /**
+   * Whether any tick has observed an inflight claim since this refresher
+   * (re)started. Until then the gate can't distinguish "container still
+   * spawning" from "turn done", so the grace window sends unconditionally;
+   * afterwards the gate is authoritative and grace no longer sends.
+   */
+  sawWork: boolean;
 }
 
 let adapter: TypingAdapter | null = null;
@@ -171,6 +179,8 @@ export function startTypingRefresh(
     existing.startedAt = Date.now();
     existing.pausedUntil = 0;
     existing.gateMisses = 0;
+    // Re-arm the spawn blind spot: this inbound may need a fresh container.
+    existing.sawWork = false;
     // Keep the stored entry self-consistent: a re-trigger can arrive from
     // a different chat address (agent-shared sessions span messaging
     // groups, possibly on different platforms/instances), so the address
@@ -205,16 +215,23 @@ export function startTypingRefresh(
       return;
     }
 
-    const withinGrace = age < TYPING_GRACE_MS;
-    if (withinGrace || hasInflightWork(entry, sessionId)) {
+    if (hasInflightWork(entry, sessionId)) {
+      entry.sawWork = true;
       entry.gateMisses = 0;
       triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
       return;
     }
 
-    // Out of grace AND no inflight processing_ack. First miss: skip the
-    // setTyping call but keep the refresher alive in case the read was
-    // transient. Second consecutive miss: the agent's turn is done, stop.
+    // No inflight work, and none observed yet — the container is (most
+    // likely) still spawning. Grace bridges that blind spot.
+    if (age < TYPING_GRACE_MS && !entry.sawWork) {
+      triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
+      return;
+    }
+
+    // The turn is done (work was seen and is gone) or grace ran out.
+    // First miss: skip the setTyping call but keep the refresher alive in
+    // case the read was transient. Second consecutive miss: stop.
     entry.gateMisses += 1;
     if (entry.gateMisses >= 2) stopTypingRefresh(sessionId);
   }, TYPING_REFRESH_MS);
@@ -231,6 +248,7 @@ export function startTypingRefresh(
     pausedUntil: 0,
     outDb: null,
     gateMisses: 0,
+    sawWork: false,
   });
 }
 

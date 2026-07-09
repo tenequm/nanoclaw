@@ -139,6 +139,35 @@ describe('startTypingRefresh — instance forwarding', () => {
   });
 });
 
+describe('grace window vs observed work', () => {
+  const INFLIGHT = [{ message_id: 'm1', status_changed: '2026-01-01 00:00:00' }];
+
+  it('stops sending once observed work completes, even with grace time left', async () => {
+    const calls = captureAdapter();
+    gate.claims = INFLIGHT;
+    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'tg:1', null);
+    // A few ticks with the turn in flight — work gets observed.
+    await vi.advanceTimersByTimeAsync(8_500);
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    calls.length = 0;
+
+    // Turn completes at ~8s. The 30s grace window has >20s left, but it
+    // must not keep typing alive: the reply already landed in the chat.
+    gate.claims = [];
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('keeps sending through the spawn blind spot while no work was ever observed', async () => {
+    const calls = captureAdapter();
+    gate.claims = []; // container still starting; nothing claimed yet
+    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'tg:1', null);
+    await vi.advanceTimersByTimeAsync(12_500);
+    // Immediate tick + three interval ticks, all inside grace.
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+  });
+});
+
 describe('gate debounce past the grace window', () => {
   const INFLIGHT = [{ message_id: 'm1', status_changed: '2026-01-01 00:00:00' }];
 
