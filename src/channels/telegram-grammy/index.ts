@@ -24,8 +24,11 @@ import { registerChannelAdapter } from '../channel-registry.js';
 import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
 
+import { getAskQuestionRender } from '../../db/sessions.js';
+
 import { materializeAll } from './attachments.js';
-import { parseCallbackData } from './ask-question.js';
+import { composeSelectedCard, parseCallbackData } from './ask-question.js';
+import { renderFS } from './formatter.js';
 import {
   parseChatId,
   parseTopicId,
@@ -142,8 +145,31 @@ class TelegramGrammyAdapter implements ChannelAdapter {
             catch: (err) => err,
           }).pipe(Effect.catchCause(() => Effect.void));
           if (!parsed) return;
+
+          // Resolve render metadata BEFORE dispatching onAction — registered
+          // handlers delete the pending row, and the selected-state labels go
+          // with it. Mirrors chat-sdk-bridge's ordering.
+          const render = getAskQuestionRender(parsed.questionId);
           const user = ctx.from;
           onAction(parsed.questionId, parsed.value, user ? String(user.id) : '');
+
+          // Reflect the choice on the card: rewrite the body to the selected
+          // state and drop the keyboard, so the approver can see the tap
+          // registered. Best-effort — the action above already dispatched.
+          const cbMsg = ctx.callbackQuery?.message;
+          if (!cbMsg) return;
+          const actorName = user?.first_name ?? user?.username ?? '';
+          const currentText = 'text' in cbMsg && typeof cbMsg.text === 'string' ? cbMsg.text : '';
+          const body = composeSelectedCard(render, parsed.value, currentText, actorName);
+          const fs = renderFS(body);
+          yield* Effect.tryPromise({
+            try: () => ctx.api.editMessageText(cbMsg.chat.id, cbMsg.message_id, fs.text, { entities: fs.entities }),
+            catch: (err) => err,
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning('telegram-grammy: failed to update card after action', { cause }),
+            ),
+          );
         });
 
         bot.on('message', (ctx) => {

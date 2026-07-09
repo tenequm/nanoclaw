@@ -9,7 +9,12 @@
 import { describe, expect, it } from 'vitest';
 
 import type { NormalizedOption } from '../ask-question.js';
-import { buildAskQuestionKeyboard, encodeCallbackData, parseCallbackData } from './ask-question.js';
+import {
+  buildAskQuestionKeyboard,
+  composeSelectedCard,
+  encodeCallbackData,
+  parseCallbackData,
+} from './ask-question.js';
 
 describe('buildAskQuestionKeyboard', () => {
   it('builds one row per option when under the 64-byte limit', () => {
@@ -47,5 +52,35 @@ describe('buildAskQuestionKeyboard', () => {
   it('parse returns null for malformed data', () => {
     expect(parseCallbackData('not-a-prefix')).toBeNull();
     expect(parseCallbackData('ncq:')).toBeNull();
+  });
+});
+
+describe('composeSelectedCard', () => {
+  const render = {
+    title: '🔧 Self-modification request',
+    options: [
+      { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+      { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+    ] satisfies NormalizedOption[],
+  };
+
+  it('uses the selectedLabel from render metadata with an actor byline', () => {
+    expect(composeSelectedCard(render, 'approve', 'ignored current text', 'Misha')).toBe(
+      '🔧 Self-modification request\n\n✅ Approved · Misha',
+    );
+  });
+
+  it('omits the byline when no actor name is known', () => {
+    expect(composeSelectedCard(render, 'reject', '', '')).toBe('🔧 Self-modification request\n\n❌ Rejected');
+  });
+
+  it('falls back to a checkmarked value for an option missing from render metadata', () => {
+    expect(composeSelectedCard(render, 'mystery', '', '')).toBe('🔧 Self-modification request\n\n✅ mystery');
+  });
+
+  it('appends to the current card text when render metadata is gone', () => {
+    expect(composeSelectedCard(undefined, 'approve', 'Original question body', 'Misha')).toBe(
+      'Original question body\n\n✅ approve · Misha',
+    );
   });
 });

@@ -50,6 +50,27 @@ export function buildAskQuestionKeyboard(
   return { keyboard: kb, skippedLabels };
 }
 
+/**
+ * Compose the card body shown after an option is tapped: title + the
+ * selected-state label + who acted, mirroring chat-sdk-bridge's onAction
+ * edit. Without render metadata (pending row already resolved/deleted) fall
+ * back to appending the choice to the card's current text so context is
+ * preserved.
+ */
+export function composeSelectedCard(
+  render: { title: string; options: readonly NormalizedOption[] } | undefined,
+  selectedValue: string,
+  currentText: string,
+  actorName: string,
+): string {
+  const matched = render?.options.find((o) => o.value === selectedValue);
+  const selectedLabel = matched?.selectedLabel ?? `✅ ${matched?.label ?? selectedValue}`;
+  const byLine = actorName ? ` · ${actorName}` : '';
+  return render?.title
+    ? `${render.title}\n\n${selectedLabel}${byLine}`
+    : `${currentText}\n\n${selectedLabel}${byLine}`.trim();
+}
+
 /** Parse the `ncq:<questionId>:<value>` callback data produced by the keyboard. */
 export function parseCallbackData(data: string): { questionId: string; value: string } | null {
   if (!data.startsWith('ncq:')) return null;
