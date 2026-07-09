@@ -37,12 +37,15 @@ import {
   deleteOrphanProcessingClaims,
   getContainerState,
   getMessageForRetry,
+  getOldestDueMessageAddress,
   getProcessingClaims,
   markMessageFailed,
   retryWithBackoff,
   syncProcessingAcks,
   type ContainerState,
 } from './db/session-db.js';
+import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
+import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
@@ -206,8 +209,27 @@ async function sweepSession(session: Session): Promise<void> {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
       // wakeContainer never throws — transient spawn failures (OneCLI down,
       // etc.) return false and leave messages pending for the next tick.
-      await wakeContainer(session);
+      const woke = await wakeContainer(session);
       justWoke = true;
+      // Sweep-triggered wakes (scheduled tasks, retried messages) run the
+      // agent just like a fresh inbound does, so they get the same typing
+      // signal in the chat the due message came from. Router-triggered
+      // wakes start their own refresher; this covers the paths that bypass
+      // the router.
+      if (woke) {
+        const addr = getOldestDueMessageAddress(inDb);
+        if (addr) {
+          const mg = getMessagingGroupByPlatform(addr.channel_type, addr.platform_id);
+          startTypingRefresh(
+            session.id,
+            session.agent_group_id,
+            addr.channel_type,
+            addr.platform_id,
+            addr.thread_id,
+            mg?.instance,
+          );
+        }
+      }
     }
 
     const alive = isContainerRunning(session.id);

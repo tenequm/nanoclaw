@@ -492,8 +492,12 @@ export async function processQuery(
         // stale 'processing' claims while the query stays open for
         // follow-up pushes. The agent may have responded via MCP
         // (send_message) mid-turn, or the message may not need a response
-        // at all — either way the turn is finished.
-        markCompleted(initialBatchIds);
+        // at all — either way the turn is finished. The one exception is a
+        // compact boundary: the turn is still running, and the host's
+        // typing indicator is gated on these claims — completing them here
+        // would kill typing for the (long) remainder of the turn. The real
+        // result that follows completes them.
+        if (!event.isCompactBoundary) markCompleted(initialBatchIds);
         if (event.isCompactBoundary && !commandTurn) {
           // Mid-turn auto-compact: this synthetic result is a system notice,
           // not agent output, and answers no queued prompt. Running it through

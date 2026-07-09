@@ -57,8 +57,8 @@ describe('startTypingRefresh — instance forwarding', () => {
     await vi.advanceTimersByTimeAsync(0);
     calls.length = 0;
 
-    // Two 4s ticks — well inside the 15s grace window, so they fire
-    // unconditionally (no heartbeat file needed) from the stored entry.
+    // Two 4s ticks — well inside the grace window, so they fire
+    // unconditionally (no gate check needed) from the stored entry.
     await vi.advanceTimersByTimeAsync(8_500);
     expect(calls.length).toBeGreaterThanOrEqual(2);
     for (const c of calls) {

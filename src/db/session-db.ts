@@ -146,6 +146,28 @@ export function countDueMessages(db: Database.Database): number {
   ).count;
 }
 
+/**
+ * Chat address of the oldest due trigger message, for signaling (typing
+ * indicator) on sweep-triggered wakes. Agent-to-agent rows are excluded —
+ * there is no chat surface to type into.
+ */
+export function getOldestDueMessageAddress(
+  db: Database.Database,
+): { platform_id: string; channel_type: string; thread_id: string | null } | undefined {
+  return db
+    .prepare(
+      `SELECT platform_id, channel_type, thread_id FROM messages_in
+     WHERE status = 'pending'
+       AND trigger = 1
+       AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+       AND platform_id IS NOT NULL
+       AND channel_type IS NOT NULL
+       AND channel_type != 'agent'
+     ORDER BY seq LIMIT 1`,
+    )
+    .get() as { platform_id: string; channel_type: string; thread_id: string | null } | undefined;
+}
+
 export function markMessageFailed(db: Database.Database, messageId: string): void {
   db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = ?").run(messageId);
 }

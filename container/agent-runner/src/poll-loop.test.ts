@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
-import { getPendingMessages, markCompleted } from './db/messages-in.js';
+import { getPendingMessages, markCompleted, markProcessing } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import { isCorruptionError, processQuery } from './poll-loop.js';
@@ -505,6 +505,48 @@ describe('mid-turn auto-compact (isCompactBoundary)', () => {
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe(NOTICE);
     expect(pushes).toHaveLength(0);
+  });
+
+  it('holds the processing claim through the boundary and completes it at the real result', async () => {
+    // The host's typing indicator is gated on 'processing' claims in
+    // processing_ack. Completing them at the compact boundary would kill
+    // typing for the (long) remainder of the turn.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+    insertMessage('m1', 'chat', { sender: 'John', text: 'long task' });
+    markProcessing(['m1']);
+
+    const claimStatus = () =>
+      (
+        getOutboundDb().prepare("SELECT status FROM processing_ack WHERE message_id = 'm1'").get() as {
+          status: string;
+        }
+      ).status;
+
+    let statusAfterBoundary: string | undefined;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'result', text: NOTICE, isCompactBoundary: true };
+      // The loop pulls the next event only after handling the previous one,
+      // so this reads the claim state right after the boundary was handled.
+      statusAfterBoundary = claimStatus();
+      yield { type: 'result', text: '<message to="main">final answer</message>' };
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(statusAfterBoundary).toBe('processing');
+    expect(claimStatus()).toBe('completed');
   });
 });
 

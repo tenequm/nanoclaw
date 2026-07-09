@@ -35,10 +35,13 @@ import { log } from '../../log.js';
 const TYPING_REFRESH_MS = 4000;
 /**
  * Grace window from startTypingRefresh: fire typing unconditionally
- * for this long regardless of heartbeat state. Covers container
- * spawn/wake latency (5–12s on cold start before first heartbeat).
+ * for this long regardless of gate state. Covers container spawn/wake
+ * latency (image start + OneCLI ensureAgent + agent-runner boot can
+ * take well over 15s cold) — once the gate reads false past grace the
+ * refresher stops for good, so the window must outlast the slowest
+ * cold start.
  */
-const TYPING_GRACE_MS = 15000;
+const TYPING_GRACE_MS = 30000;
 /**
  * After we deliver a user-facing message, pause typing for this
  * long so the client-side indicator has time to visually clear.
@@ -49,12 +52,12 @@ const POST_DELIVERY_PAUSE_MS = 10000;
 /**
  * Absolute ceiling on a single typing-refresher's lifetime. Final
  * safety net so a forgotten stop / crashed delivery loop can't keep
- * typing alive indefinitely. Long enough to cover any realistic
- * single-turn agent loop (xhigh thinking + heavy tool use + 1M
- * context). The ceiling resets on each new inbound (startedAt is
- * reset in startTypingRefresh).
+ * typing alive indefinitely. Matches the host sweep's ABSOLUTE_CEILING
+ * for a running container — as long as the sweep considers the agent
+ * alive and working, typing should show. The ceiling resets on each
+ * new inbound (startedAt is reset in startTypingRefresh).
  */
-const TYPING_TTL_MS = 10 * 60 * 1000; // 10 min
+const TYPING_TTL_MS = 30 * 60 * 1000; // 30 min
 
 interface TypingAdapter {
   setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
@@ -222,10 +225,16 @@ export function startTypingRefresh(
  * a user-facing message is delivered so the client-side indicator
  * has a chance to visually clear before the agent's next SDK event
  * pushes it back on. No-op if no refresh is active for this session.
+ *
+ * Telegram is exempt: its client clears the indicator the instant a
+ * message arrives, so there is nothing to wait out — pausing would
+ * just punch a 10s hole into the "agent is working" signal after
+ * every mid-turn update.
  */
 export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
+  if (entry.channelType === 'telegram') return;
   entry.pausedUntil = Date.now() + POST_DELIVERY_PAUSE_MS;
 }
 
