@@ -31,7 +31,7 @@ import { mapGrammyError } from './errors.js';
 import { renderFS, splitForBody, splitForCaption } from './formatter.js';
 import { extractTelegramMessageId, parseChatId, parseTopicId, resolveMessageThreadId } from './inbound.js';
 import { rememberTopicMessage } from './topic-map.js';
-import { canonicalizeReactionEmoji, clearPendingSeen, type TelegramReactionEmoji, untrackSeen } from './reactions.js';
+import { canonicalizeReactionEmoji, type TelegramReactionEmoji } from './reactions.js';
 import { BotService } from './services.js';
 import { probeMediaMeta } from './media-meta.js';
 
@@ -321,7 +321,6 @@ const editMessage = Effect.fn('telegram-grammy.editMessage')(function* (
 
 const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
   chatId: number,
-  reactionKey: string,
   compound: string,
   emoji: string | undefined,
 ) {
@@ -348,22 +347,7 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
     }
     reactions.push({ type: 'emoji', emoji: canonical });
   }
-  const { bot, pendingSeen } = yield* BotService;
-  // Discharge the seen-ack tracking BEFORE the API call. Telegram bots
-  // have one reaction slot per message; setting an explicit reaction
-  // replaces whatever was there (typically 👀). If we leave the compound
-  // in `pendingSeen`, the post-delivery `clearPendingSeen` sweep at the
-  // end of `deliver()` will issue setMessageReaction(...empty) and wipe
-  // the reaction we just set. Untracking here is the local expression of
-  // "only clear messages where the bot's reaction is still 👀."
-  //
-  // Important: `fireSeenReaction` stores the 2-part `<chatId>:<msgId>`
-  // form (`message.id` from `toInboundMessage`), but the agent's
-  // `add_reaction` arrives as the 3-part `<chatId>:<msgId>:<agentGroupId>`
-  // form (router-wrapped via `messageIdForAgent`). Normalize to 2-part for
-  // the lookup so the keys actually match.
-  const seenKey = `${parsed.chatId}:${parsed.messageId}`;
-  yield* untrackSeen(pendingSeen, reactionKey, seenKey);
+  const { bot } = yield* BotService;
   yield* Effect.tryPromise({
     try: () => bot.api.setMessageReaction(parsed.chatId, parsed.messageId, reactions),
     catch: (err) => mapGrammyError(err, 'setMessageReaction', String(chatId)),
@@ -482,9 +466,8 @@ const sendAskQuestion = Effect.fn('telegram-grammy.sendAskQuestion')(function* (
 });
 
 /**
- * Public outbound entrypoint. Switches on content shape, runs the matching
- * sub-effect, and clears pendingSeen on the success branch so the 👀
- * reaction goes away once the bot's reply lands.
+ * Public outbound entrypoint. Switches on content shape and runs the
+ * matching sub-effect.
  */
 export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(function* (
   platformId: string,
@@ -497,7 +480,6 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
   // topic in its 3rd segment — every send below lands in that topic.
   const messageThreadId = resolveMessageThreadId(platformId, threadId);
   const topicScoped = parseTopicId(platformId) !== undefined;
-  const reactionKey = threadId ?? platformId;
   const files = message.files ?? [];
 
   let result: string | undefined = undefined;
@@ -505,7 +487,7 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
   if (view.isEdit && view.editMessageId != null) {
     result = yield* editMessage(chatId, view.editMessageId, view.text);
   } else if (view.isReaction && view.reactionMessageId != null) {
-    result = yield* reactToMessage(chatId, reactionKey, view.reactionMessageId, view.reactionEmoji);
+    result = yield* reactToMessage(chatId, view.reactionMessageId, view.reactionEmoji);
   } else if (view.isMediaGroup && view.mediaGroupItems) {
     result = yield* sendMediaGroup(chatId, messageThreadId, view.mediaGroupItems, files);
   } else if (view.isAskQuestion && view.askQuestionId != null && view.askTitle != null && view.askOptions) {
@@ -530,7 +512,6 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
     if (Number.isFinite(sentId)) rememberTopicMessage(chatId, sentId, platformId);
   }
 
-  yield* clearPendingSeen(chatId, reactionKey);
   return result;
 });
 

@@ -27,7 +27,6 @@ import { tryConsume } from '../telegram-pairing.js';
 import type { PairingRecord } from '../telegram-pairing.js';
 
 import { GrammyNetworkError, PairingFailed } from './errors.js';
-import { makePendingSeenRef } from './reactions.js';
 import {
   AdapterConfigService,
   BotService,
@@ -88,8 +87,6 @@ export const BotLayer = Layer.effect(
       catch: (cause) => new GrammyNetworkError({ method: 'getMe', cause }),
     }).pipe(Effect.retry({ schedule: Schedule.exponential('500 millis'), times: 3 }));
 
-    const pendingSeen = yield* makePendingSeenRef();
-
     return {
       bot,
       me,
@@ -99,7 +96,6 @@ export const BotLayer = Layer.effect(
           catch: (cause) => new GrammyNetworkError({ method: 'bot.start', cause }),
         }),
       stop: () => stopBotSafely(bot),
-      pendingSeen,
     };
   }),
 );

@@ -8,7 +8,7 @@
  * service declare it via the R (requirements) channel — the compiler
  * refuses to run until every requirement has a matching layer.
  */
-import type { Effect, HashMap, HashSet, Ref } from 'effect';
+import type { Effect } from 'effect';
 import { Context } from 'effect';
 import type { FileApiFlavor } from '@grammyjs/files';
 import type { Api, Bot, Context as GrammyContext, PollingOptions } from 'grammy';
@@ -60,12 +60,6 @@ export class BotService extends Context.Service<
     readonly me: UserFromGetMe;
     readonly start: (opts: PollingOptions) => Effect.Effect<void, GrammyNetworkError>;
     readonly stop: () => Effect.Effect<void>;
-    /**
-     * In-memory tracker for the 👀 seen-reaction — keyed by
-     * `threadId ?? platformId`, value is a set of compound `chatId:msgId`
-     * strings we've reacted to and still need to clear on next outbound.
-     */
-    readonly pendingSeen: Ref.Ref<HashMap.HashMap<string, HashSet.HashSet<string>>>;
   }
 >()('telegram-grammy/BotService') {}
 

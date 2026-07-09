@@ -20,7 +20,7 @@ import { copyFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 
-import { Cause, Effect, HashMap, HashSet, Layer, Option, Ref } from 'effect';
+import { Cause, Effect, Layer, Option } from 'effect';
 import type { UserFromGetMe } from 'grammy/types';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -81,19 +81,12 @@ function buildTestLayers(opts: BuildLayersOpts) {
     },
   } as unknown as HydratedBot;
 
-  const botLayer = Layer.effect(
-    BotService,
-    Effect.gen(function* () {
-      const pendingSeen = yield* Ref.make(HashMap.empty<string, HashSet.HashSet<string>>());
-      return {
-        bot: fakeBot,
-        me: { id: 1, is_bot: true, first_name: 'TestBot', username: 'testbot' } as UserFromGetMe,
-        start: () => Effect.fail(new GrammyNetworkError({ method: 'bot.start', cause: 'unused in test' })),
-        stop: () => Effect.void,
-        pendingSeen,
-      };
-    }),
-  );
+  const botLayer = Layer.succeed(BotService, {
+    bot: fakeBot,
+    me: { id: 1, is_bot: true, first_name: 'TestBot', username: 'testbot' } as UserFromGetMe,
+    start: () => Effect.fail(new GrammyNetworkError({ method: 'bot.start', cause: 'unused in test' })),
+    stop: () => Effect.void,
+  });
 
   const configLayer = Layer.succeed(AdapterConfigService, {
     token: 'TEST_TOKEN',
