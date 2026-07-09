@@ -494,7 +494,17 @@ export async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
-        if (event.text) {
+        if (event.isCompactBoundary && !commandTurn) {
+          // Mid-turn auto-compact: this synthetic result is a system notice,
+          // not agent output, and answers no queued prompt. Running it through
+          // dispatchResultText would both drop it as scratchpad AND fire the
+          // false "not delivered" nudge — the model then re-sends an
+          // already-delivered reply, duplicating messages in chat. Deliver the
+          // notice verbatim to the origin channel and leave archivePrompts
+          // alone. A native /compact command turn takes the commandTurn branch
+          // below instead, which delivers the same text as command output.
+          if (event.text) deliverCompactNotice(event.text, routing);
+        } else if (event.text) {
           const { sent, hasUnwrapped } = dispatchResultText(event.text, routing);
           if (sent === 0 && event.isError === true) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
@@ -608,6 +618,19 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  */
 function deliverErrorResult(text: string, routing: RoutingContext): void {
   log('Error result with no <message> envelope — delivering to channel');
+  writeMessageOut({
+    id: generateId(),
+    in_reply_to: routing.inReplyTo,
+    kind: 'chat',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    content: JSON.stringify({ text }),
+  });
+}
+
+function deliverCompactNotice(text: string, routing: RoutingContext): void {
+  log('Auto-compact boundary — delivering compaction notice to channel');
   writeMessageOut({
     id: generateId(),
     in_reply_to: routing.inReplyTo,

@@ -130,8 +130,15 @@ export type ProviderEvent =
    * turn as an error (e.g. a non-retryable Anthropic 403 billing_error). The
    * poll-loop uses it to surface the result text to the user instead of
    * dropping it as un-wrapped scratchpad, and to skip the re-wrap nudge.
+   *
+   * `isCompactBoundary` marks the synthetic "Context compacted" result the
+   * translator emits for an SDK compact_boundary. It is not agent output and
+   * answers no queued prompt: on a normal turn the poll-loop must ignore it
+   * (dispatching it trips the false "not delivered" nudge, which makes the
+   * model re-send an already-delivered reply). On a native slash-command turn
+   * (/compact) it IS the command output and is delivered verbatim.
    */
-  | { type: 'result'; text: string | null; isError?: boolean }
+  | { type: 'result'; text: string | null; isError?: boolean; isCompactBoundary?: boolean }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**

@@ -455,6 +455,59 @@ describe('native slash-command result (commandTurn)', () => {
   });
 });
 
+describe('mid-turn auto-compact (isCompactBoundary)', () => {
+  const NOTICE = '🗜 Context compacted (48,462 tokens summarized). Older messages were summarized to free up space.';
+
+  it('delivers the notice, does not nudge, and the wrapped reply still goes out exactly once', async () => {
+    // Destination so the final wrapped block dispatches.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      // The SDK auto-compacted mid-turn; the translator emits this synthetic
+      // result BEFORE the agent's real answer.
+      yield { type: 'result', text: NOTICE, isCompactBoundary: true };
+      yield { type: 'result', text: '<message to="main">final answer</message>' };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+      },
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+    expect(JSON.parse(out[0].content).text).toBe(NOTICE);
+    expect(JSON.parse(out[1].content).text).toBe('final answer');
+    // The regression: the synthetic compact result used to trip the false
+    // "not delivered" nudge, making the model re-send the already-delivered
+    // reply (duplicate messages in chat).
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('a native /compact command turn still delivers the boundary text as command output', async () => {
+    const { query, pushes } = makeResultQuery({ type: 'result', text: NOTICE, isCompactBoundary: true });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, '/compact', undefined, true);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe(NOTICE);
+    expect(pushes).toHaveLength(0);
+  });
+});
+
 describe('isCorruptionError', () => {
   it('matches the Docker Desktop macOS torn-read symptom', () => {
     expect(isCorruptionError('database disk image is malformed')).toBe(true);
