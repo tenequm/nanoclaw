@@ -2,7 +2,7 @@
 #
 # Install the Slack adapter, persist SLACK_BOT_TOKEN plus the mode-specific
 # secret (SLACK_APP_TOKEN for Socket Mode, SLACK_SIGNING_SECRET for webhook) to
-# .env + data/env/env, and restart the service. Non-interactive — the
+# .env, and restart the service. Non-interactive — the
 # operator-facing app creation walkthrough + credential paste live in
 # setup/channels/slack.ts. Credentials come in via env vars:
 # SLACK_BOT_TOKEN, and SLACK_APP_TOKEN and/or SLACK_SIGNING_SECRET.
@@ -107,10 +107,6 @@ fi
 if [ -n "${SLACK_SIGNING_SECRET:-}" ]; then
   upsert_env SLACK_SIGNING_SECRET "$SLACK_SIGNING_SECRET"
 fi
-
-# Container reads from data/env/env (the host mounts it).
-mkdir -p data/env
-cp .env data/env/env
 
 log "Restarting service so the new adapter picks up the credentials…"
 # shellcheck source=setup/lib/install-slug.sh

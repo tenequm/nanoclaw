@@ -1,5 +1,7 @@
 # NanoClaw Specification
 
+> **⚠️ Historical v1 spec.** This document describes the original NanoClaw v1 architecture — the single `store/messages.db`, the file-based IPC watcher, the `task-scheduler.ts` loop, the `MAX_CONCURRENT_CONTAINERS` cap, and the `groups/{channel}_{name}/` folder convention. **None of these exist in v2.** v2 replaced them with the two-DB session split (`inbound.db`/`outbound.db`), the entity model (users → messaging groups → agent groups → sessions), and the system-action delivery path. Kept for reference only. For the current architecture start at [architecture.md](architecture.md) and the root [CLAUDE.md](../CLAUDE.md); the v1→v2 diff is in [v1-to-v2-changes.md](v1-to-v2-changes.md).
+
 A personal Claude assistant with multi-channel support, persistent memory per conversation, scheduled tasks, and container-isolated agent execution.
 
 ---
@@ -577,12 +579,7 @@ NanoClaw has a built-in scheduler that runs tasks as full agents in their group'
 ```
 User: @Andy remind me every Monday at 9am to review the weekly metrics
 
-Claude: [calls mcp__nanoclaw__schedule_task]
-        {
-          "prompt": "Send a reminder to review weekly metrics. Be encouraging!",
-          "schedule_type": "cron",
-          "schedule_value": "0 9 * * 1"
-        }
+Claude: [runs ncl tasks create --prompt "Send a reminder to review weekly metrics. Be encouraging!" --process-after "2024-02-05T09:00:00" --recurrence "0 9 * * 1"]
 
 Claude: Done! I'll remind you every Monday at 9am.
 ```
@@ -592,12 +589,7 @@ Claude: Done! I'll remind you every Monday at 9am.
 ```
 User: @Andy at 5pm today, send me a summary of today's emails
 
-Claude: [calls mcp__nanoclaw__schedule_task]
-        {
-          "prompt": "Search for today's emails, summarize the important ones, and send the summary to the group.",
-          "schedule_type": "once",
-          "schedule_value": "2024-01-31T17:00:00Z"
-        }
+Claude: [runs ncl tasks create --prompt "Search for today's emails, summarize the important ones, and send the summary to the group." --process-after "2024-01-31T17:00:00"]
 ```
 
 ### Managing Tasks
@@ -618,18 +610,11 @@ From main channel:
 
 ### NanoClaw MCP (built-in)
 
-The `nanoclaw` MCP server is created dynamically per agent call with the current group's context.
+The `nanoclaw` MCP server is created dynamically per agent call with the current group's context. Scheduled task management lives in `ncl tasks`, not MCP.
 
 **Available Tools:**
 | Tool | Purpose |
 |------|---------|
-| `schedule_task` | Schedule a recurring or one-time task |
-| `list_tasks` | Show tasks (group's tasks, or all if main) |
-| `get_task` | Get task details and run history |
-| `update_task` | Modify task prompt or schedule |
-| `pause_task` | Pause a task |
-| `resume_task` | Resume a paused task |
-| `cancel_task` | Delete a task |
 | `send_message` | Send a message to the group via its channel |
 
 ---

@@ -11,8 +11,7 @@
  *
  * Runs on every spawn from `container-runner.buildMounts()`. Deterministic —
  * same inputs produce the same CLAUDE.md, and stale fragments are pruned.
- *
- * See `docs/claude-md-composition.md` for the full design.
+ * The composition order and fragment sources are documented inline above.
  */
 import fs from 'fs';
 import path from 'path';
@@ -81,10 +80,12 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
     }
   }
 
-  // Built-in module fragments — every MCP tool source file that ships a
+  // Built-in module fragments — every MCP/CLI module that ships a
   // sibling `<name>.instructions.md`. These describe how the agent should
-  // use that module's MCP tools (schedule_task, install_packages, etc.).
-  // Skip cli.instructions.md when cli_scope is disabled.
+  // use that module's tools (`ncl tasks`, install_packages, etc.).
+  // Skip ncl-dependent instructions when cli_scope is disabled. `scheduling`
+  // teaches `ncl tasks`, so it is just as dead as `cli` itself when the agent
+  // has no ncl — dispatch rejects every cli_request and ncl is excluded.
   const cliDisabled = configRow?.cli_scope === 'disabled';
   const mcpToolsHostDir = path.join(process.cwd(), MCP_TOOLS_HOST_SUBPATH);
   if (fs.existsSync(mcpToolsHostDir)) {
@@ -92,7 +93,7 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
       const match = entry.match(/^(.+)\.instructions\.md$/);
       if (!match) continue;
       const moduleName = match[1];
-      if (moduleName === 'cli' && cliDisabled) continue;
+      if ((moduleName === 'cli' || moduleName === 'scheduling') && cliDisabled) continue;
       desired.set(`module-${moduleName}.md`, {
         type: 'symlink',
         content: `${SHARED_MCP_TOOLS_CONTAINER_BASE}/${entry}`,
