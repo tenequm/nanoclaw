@@ -24,9 +24,11 @@ import path from 'path';
 import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { ensureContainedInboxDir, isPathInside } from '../../inbox-safety.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getInboundSourceSessionId, getMostRecentPeerSourceSessionId } from '../../db/session-db.js';
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
+import { startTypingRefresh } from '../typing/index.js';
 import { log } from '../../log.js';
 import { openInboundDb, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -343,7 +345,20 @@ export async function performAgentRoute(
     forwardedFileCount: countForwardedFiles(forwardedContent),
   });
   const fresh = getSession(targetSession.id);
-  if (fresh) await wakeContainer(fresh);
+  if (fresh) {
+    const woke = await wakeContainer(fresh);
+    // An a2a message runs the target agent just like a user message does,
+    // and the outcome usually lands in the target's own chat (e.g. a peer's
+    // answer arriving mid-relay) — so that chat gets the same typing signal
+    // a router wake would give it. Sessions without a messaging group
+    // (agent-shared fallback) have no chat surface to type into.
+    if (woke && fresh.messaging_group_id) {
+      const mg = getMessagingGroup(fresh.messaging_group_id);
+      if (mg) {
+        startTypingRefresh(fresh.id, targetAgentGroupId, mg.channel_type, mg.platform_id, fresh.thread_id, mg.instance);
+      }
+    }
+  }
 }
 
 /**

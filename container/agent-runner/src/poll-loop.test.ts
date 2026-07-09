@@ -436,6 +436,51 @@ describe('error result with no <message> envelope', () => {
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
   });
+
+  it('holds the processing claim while the re-wrap retry runs, completes it at the retry result', async () => {
+    // The nudge means the turn is still composing the user's reply — the
+    // claim gates the host's typing indicator, and completing it early
+    // would also mark a crashed (undelivered) retry as done instead of
+    // letting the sweep redeliver.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+    insertMessage('m1', 'chat', { sender: 'John', text: 'hi' });
+    markProcessing(['m1']);
+
+    const claimStatus = () =>
+      (
+        getOutboundDb().prepare("SELECT status FROM processing_ack WHERE message_id = 'm1'").get() as {
+          status: string;
+        }
+      ).status;
+
+    let statusAfterNudge: string | undefined;
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'result', text: 'bare text, no envelope' };
+      statusAfterNudge = claimStatus();
+      yield { type: 'result', text: '<message to="main">wrapped retry</message>' };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+      },
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(pushes).toHaveLength(1);
+    expect(statusAfterNudge).toBe('processing');
+    expect(claimStatus()).toBe('completed');
+  });
 });
 
 describe('native slash-command result (commandTurn)', () => {

@@ -74,6 +74,15 @@ interface TypingTarget {
   startedAt: number;
   pausedUntil: number; // epoch ms; 0 = not paused
   outDb: Database.Database | null; // lazily opened on first gating tick
+  /**
+   * Consecutive ticks where the gate read "no inflight work". The gate
+   * reads outbound.db while the container writes it, so a single read can
+   * transiently fail or miss (SQLITE_BUSY, handle re-open after container
+   * restart). One miss skips the setTyping call; only a second consecutive
+   * miss stops the refresher — a transient misread must not kill typing
+   * for the rest of the turn.
+   */
+  gateMisses: number;
 }
 
 let adapter: TypingAdapter | null = null;
@@ -161,6 +170,7 @@ export function startTypingRefresh(
     triggerTyping(channelType, platformId, threadId, instance).catch(() => {});
     existing.startedAt = Date.now();
     existing.pausedUntil = 0;
+    existing.gateMisses = 0;
     // Keep the stored entry self-consistent: a re-trigger can arrive from
     // a different chat address (agent-shared sessions span messaging
     // groups, possibly on different platforms/instances), so the address
@@ -197,13 +207,16 @@ export function startTypingRefresh(
 
     const withinGrace = age < TYPING_GRACE_MS;
     if (withinGrace || hasInflightWork(entry, sessionId)) {
+      entry.gateMisses = 0;
       triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
       return;
     }
 
-    // Out of grace AND no inflight processing_ack — agent's turn is
-    // done, stop refreshing.
-    stopTypingRefresh(sessionId);
+    // Out of grace AND no inflight processing_ack. First miss: skip the
+    // setTyping call but keep the refresher alive in case the read was
+    // transient. Second consecutive miss: the agent's turn is done, stop.
+    entry.gateMisses += 1;
+    if (entry.gateMisses >= 2) stopTypingRefresh(sessionId);
   }, TYPING_REFRESH_MS);
   // unref so a stale refresher can't hold the event loop alive.
   interval.unref();
@@ -217,6 +230,7 @@ export function startTypingRefresh(
     startedAt,
     pausedUntil: 0,
     outDb: null,
+    gateMisses: 0,
   });
 }
 

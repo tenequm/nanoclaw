@@ -487,17 +487,16 @@ export async function processQuery(
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
-        // A result — with or without text — means the turn is done. Mark
-        // the initial batch completed now so the host sweep doesn't see
-        // stale 'processing' claims while the query stays open for
-        // follow-up pushes. The agent may have responded via MCP
-        // (send_message) mid-turn, or the message may not need a response
-        // at all — either way the turn is finished. The one exception is a
-        // compact boundary: the turn is still running, and the host's
-        // typing indicator is gated on these claims — completing them here
-        // would kill typing for the (long) remainder of the turn. The real
-        // result that follows completes them.
-        if (!event.isCompactBoundary) markCompleted(initialBatchIds);
+        // A result — with or without text — usually means the turn is done,
+        // and the initial batch gets marked completed so the host sweep
+        // doesn't see stale 'processing' claims while the query stays open
+        // for follow-up pushes. Two exceptions keep the turn (and thus the
+        // claims) open: a compact boundary (the SDK keeps running toward
+        // the real result) and a re-wrap nudge (we push a retry into the
+        // same query below). The claims gate the host's typing indicator
+        // and the sweep's crash retry, so they must stay 'processing'
+        // exactly as long as the turn can still produce the user's reply.
+        let turnContinues = event.isCompactBoundary === true;
         if (event.isCompactBoundary && !commandTurn) {
           // Mid-turn auto-compact: this synthetic result is a system notice,
           // not agent output, and answers no queued prompt. Running it through
@@ -546,6 +545,7 @@ export async function processQuery(
               status: hasUnwrapped ? 'undelivered' : 'completed',
             });
             if (willRetryWrapping) {
+              turnContinues = true;
               unwrappedNudged = true;
               const destinations = getAllDestinations();
               const names = destinations.map((d) => d.name).join(', ');
@@ -563,6 +563,7 @@ export async function processQuery(
         } else {
           archivePrompts.shift();
         }
+        if (!turnContinues) markCompleted(initialBatchIds);
       }
     }
   } catch (err) {

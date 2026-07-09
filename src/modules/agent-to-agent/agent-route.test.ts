@@ -7,8 +7,11 @@ import { forwardAttachedFiles, isSafeAttachmentName, routeAgentMessage } from '.
 import { log } from '../../log.js';
 import { createDestination } from './db/agent-destinations.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, updateSession } from '../../db/sessions.js';
 import { initSessionFolder, inboundDbPath, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { wakeContainer } from '../../container-runner.js';
+import { startTypingRefresh } from '../typing/index.js';
 import type { Session } from '../../types.js';
 
 vi.mock('../../container-runner.js', () => ({
@@ -16,6 +19,10 @@ vi.mock('../../container-runner.js', () => ({
   isContainerRunning: vi.fn().mockReturnValue(false),
   getActiveContainerCount: vi.fn().mockReturnValue(0),
   killContainer: vi.fn(),
+}));
+
+vi.mock('../typing/index.js', () => ({
+  startTypingRefresh: vi.fn(),
 }));
 
 vi.mock('../../config.js', async () => {
@@ -592,5 +599,92 @@ describe('routeAgentMessage return-path', () => {
     const targetPath = path.join(sessionDir(B, SB.id), parsed.attachments[0].localPath);
     expect(fs.existsSync(targetPath)).toBe(true);
     expect(fs.readFileSync(targetPath, 'utf-8')).toBe('legit-bytes');
+  });
+});
+
+describe('a2a wake starts typing toward the target chat', () => {
+  const A = 'ag-src';
+  const B = 'ag-dst';
+  const MG = 'mg-dst';
+  let SRC: Session;
+  let DST: Session;
+
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = initTestDb();
+    runMigrations(db);
+
+    createAgentGroup({ id: A, name: 'Src', folder: 'src', agent_provider: null, created_at: now() });
+    createAgentGroup({ id: B, name: 'Dst', folder: 'dst', agent_provider: null, created_at: now() });
+    createMessagingGroup({
+      id: MG,
+      channel_type: 'telegram',
+      platform_id: 'telegram:-100123:42',
+      name: 'Dst topic',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+
+    SRC = {
+      id: 'sess-src',
+      agent_group_id: A,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: now(),
+    };
+    DST = {
+      id: 'sess-dst',
+      agent_group_id: B,
+      messaging_group_id: MG,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: now(),
+    };
+    createSession(SRC);
+    createSession(DST);
+    initSessionFolder(A, SRC.id);
+    initSessionFolder(B, DST.id);
+
+    createDestination({
+      agent_group_id: A,
+      local_name: 'dst',
+      target_type: 'agent',
+      target_id: B,
+      created_at: now(),
+    });
+    vi.mocked(startTypingRefresh).mockClear();
+  });
+
+  afterEach(() => {
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('starts a refresher for the target session addressed at its messaging group', async () => {
+    vi.mocked(wakeContainer).mockResolvedValueOnce(true);
+    await routeAgentMessage(
+      { id: 'msg-1', platform_id: B, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      SRC,
+    );
+    expect(startTypingRefresh).toHaveBeenCalledWith(DST.id, B, 'telegram', 'telegram:-100123:42', null, 'telegram');
+  });
+
+  it('does not start typing when the wake fails', async () => {
+    vi.mocked(wakeContainer).mockResolvedValueOnce(false);
+    await routeAgentMessage(
+      { id: 'msg-2', platform_id: B, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      SRC,
+    );
+    expect(startTypingRefresh).not.toHaveBeenCalled();
   });
 });
