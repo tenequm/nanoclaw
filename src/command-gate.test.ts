@@ -81,3 +81,69 @@ describe('normal messages pass through', () => {
     expect(gateCommand('/whatever', 'telegram:1', 'ag-1')).toEqual({ action: 'pass' });
   });
 });
+
+describe('host commands are claimed for the host', () => {
+  it('classifies /status', () => {
+    expect(gateCommand('/status', 'telegram:1', 'ag-1')).toEqual({ action: 'host', command: 'status', args: '' });
+  });
+
+  it('classifies bare /model', () => {
+    expect(gateCommand('/model', 'telegram:1', 'ag-1')).toEqual({ action: 'host', command: 'model', args: '' });
+  });
+
+  it('classifies /model with an argument', () => {
+    expect(gateCommand('/model opus', 'telegram:1', 'ag-1')).toEqual({
+      action: 'host',
+      command: 'model',
+      args: 'opus',
+    });
+  });
+
+  it('classifies /config (no longer filtered)', () => {
+    expect(gateCommand('/config', 'telegram:1', 'ag-1')).toEqual({ action: 'host', command: 'config', args: '' });
+  });
+
+  it('classifies /config set with a multi-word argument', () => {
+    expect(gateCommand('/config set effort high', 'telegram:1', 'ag-1')).toEqual({
+      action: 'host',
+      command: 'config',
+      args: 'set effort high',
+    });
+  });
+
+  it('classifies /restart', () => {
+    expect(gateCommand('/restart', 'telegram:1', 'ag-1')).toEqual({ action: 'host', command: 'restart', args: '' });
+  });
+
+  it('strips the @botname suffix', () => {
+    expect(gateCommand('/model@opx_cc_bl_bot', 'telegram:1', 'ag-1')).toEqual({
+      action: 'host',
+      command: 'model',
+      args: '',
+    });
+  });
+
+  it('strips the @botname suffix and keeps args', () => {
+    expect(gateCommand('/model@opx_cc_bl_bot sonnet', 'telegram:1', 'ag-1')).toEqual({
+      action: 'host',
+      command: 'model',
+      args: 'sonnet',
+    });
+  });
+
+  it('is case-insensitive on the command token', () => {
+    expect(gateCommand('/STATUS', 'telegram:1', 'ag-1')).toEqual({ action: 'host', command: 'status', args: '' });
+  });
+
+  it('classifies a host command regardless of sender (auth is enforced later)', () => {
+    expect(gateCommand('/model opus', null, 'ag-1')).toEqual({ action: 'host', command: 'model', args: 'opus' });
+  });
+
+  it('classifies host commands wrapped in a JSON content envelope', () => {
+    expect(gateCommand(JSON.stringify({ text: '/status' }), 'telegram:1', 'ag-1')).toEqual({
+      action: 'host',
+      command: 'status',
+      args: '',
+    });
+  });
+});

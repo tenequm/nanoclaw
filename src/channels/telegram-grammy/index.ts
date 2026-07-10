@@ -44,6 +44,7 @@ import { dispatchOutbound } from './outbound.js';
 import { runSupervisedPolling } from './supervise.js';
 import { buildRuntime, type AdapterRuntime } from './runtime.js';
 import { AdapterConfigService, BotService } from './services.js';
+import { installChatCommands } from './commands/index.js';
 
 const CHANNEL_TYPE = 'telegram';
 
@@ -83,6 +84,13 @@ class TelegramGrammyAdapter implements ChannelAdapter {
         const botUserId = me.id;
 
         const { onInbound, onAction } = yield* AdapterConfigService;
+
+        // Native chat-command binding (/status /model /config /restart).
+        // Installs bot.catch FIRST, then bot.use(menu), then bot.use(commandGroup),
+        // then runs the startup scope janitor - all BEFORE the message /
+        // callback_query handlers below so the menu plugin claims its own
+        // callbacks and the `ncq:` handler stays last as the catch-all.
+        yield* installChatCommands(bot, runtime);
 
         const handleInbound = Effect.fn('telegram-grammy.handleInbound')(function* (ctx: Context) {
           const envelope = toInboundMessage(ctx, botUsername, botUserId);

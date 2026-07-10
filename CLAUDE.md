@@ -71,6 +71,8 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `src/modules/permissions/access.ts` | `canAccessAgentGroup` — owner / global admin / scoped admin / member resolution against `user_roles` + `agent_group_members` |
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval`, approval-handler registry |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
+| `src/commands/` | Host command service: `/status` `/model` `/config` `/restart` semantics, model catalog, validation, target resolution, popup grants. Channel-agnostic; returns view-models. Router fallback renderer lives here too (`fallback.ts`). |
+| `src/channels/telegram-grammy/commands/` | Native Telegram binding for the chat commands: `@grammyjs/commands` CommandGroup + `@grammyjs/menu` menus, startup scope janitor, per-tap auth. |
 | `src/modules/approvals/onecli-approvals.ts` | OneCLI credentialed-action approval bridge |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
@@ -125,6 +127,12 @@ ncl help
 | approvals | list, get | Pending approval requests (read-only) |
 
 Key files: `src/cli/dispatch.ts` (dispatcher + approval handler), `src/cli/crud.ts` (generic CRUD registration), `src/cli/resources/` (per-resource definitions).
+
+## Chat Commands
+
+Four host-owned slash commands let an operator inspect and retune an agent group from chat: `/status` (member-runnable, read-only), plus admin-only `/model`, `/config`, `/restart`. The router claims them before the per-agent fan-out (`command-gate.ts` `classifyHostCommand`), so they never leak to the container SDK's native `/model` `/status` handlers. Auth is re-checked server-side on every command and every menu tap.
+
+Architecture is a model/view split: `HostCommandService` (`src/commands/`) owns all semantics and returns view-models; the router fallback (`src/commands/fallback.ts`) renders plain text / `ask_question` cards on any channel; telegram-grammy binds natively (`src/channels/telegram-grammy/commands/`) with menus + an admin-only popup scope janitor. `/model` and `/config` writes are instant-kill + lazy-respawn (apply from the next reply); `/restart` respawns immediately with a wake message. Full reference: [docs/chat-commands.md](docs/chat-commands.md).
 
 ## Channels and Providers (skill-installed)
 
@@ -309,6 +317,7 @@ This project uses pnpm with `minimumReleaseAge: 4320` (3 days) in `pnpm-workspac
 | [docs/skills-model.md](docs/skills-model.md) | The skills model in full: recipes, tests, upgrades, migrations |
 | [docs/skill-guidelines.md](docs/skill-guidelines.md) | Authoritative checklist for writing a skill |
 | [docs/templates.md](docs/templates.md) | Agent templates: what they are, stamping via `ncl groups create --template` + the setup wizard, the OneCLI/MCP-credential model, supported providers, and how to contribute one |
+| [docs/chat-commands.md](docs/chat-commands.md) | Host-owned chat commands (`/status` `/model` `/config` `/restart`): auth, apply semantics, the config surface, model catalog, Telegram popup registration + scope janitor, multi-agent chats, troubleshooting |
 
 ## Container Build Cache
 

@@ -18,6 +18,12 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 
 async function handleInteractiveResponse(payload: ResponsePayload): Promise<boolean> {
+  // Host-command cards ('hcmd-' questionIds) are owned by the host command
+  // fallback handler, which routes the tap without ever waking a container.
+  // Skip them here so registration order between the two handlers never
+  // matters and we never route a spurious question_response into a container
+  // that never asked.
+  if (payload.questionId.startsWith('hcmd-')) return false;
   if (!hasTable(getDb(), 'pending_questions')) return false;
 
   const pq = getPendingQuestion(payload.questionId);

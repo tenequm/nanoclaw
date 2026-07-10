@@ -18,7 +18,8 @@
  * for policy refusals.
  */
 import { getChannelAdapter } from './channels/channel-registry.js';
-import { gateCommand } from './command-gate.js';
+import { classifyHostCommand, gateCommand } from './command-gate.js';
+import { runHostCommand } from './commands/fallback.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
@@ -274,6 +275,33 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   //    we need their actual rows for fan-out).
   const agents = getMessagingGroupAgents(mg.id);
 
+  // 3b. Host chat-commands (/model, /status, /config, /restart) are owned by
+  //     the host and answered ONCE per message, independent of per-agent
+  //     engage rules (a slash command need not @mention the bot to be honored).
+  //     On Telegram, Phase 3 may intercept these natively at the adapter so
+  //     they never reach here; this is the channel-agnostic backstop for every
+  //     other channel, and for Telegram when the native binding is absent. No
+  //     channel-specific branching: the fallback renders uniformly.
+  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+    const host = classifyHostCommand(event.message.content);
+    if (host) {
+      try {
+        runHostCommand({
+          command: host.command,
+          args: host.args,
+          mg,
+          event,
+          userId,
+          agents,
+          adapterSupportsThreads: adapter?.supportsThreads === true,
+        });
+      } catch (err) {
+        log.error('Host command handler threw', { command: host.command, messagingGroupId: mg.id, err });
+      }
+      return;
+    }
+  }
+
   // 4. Fan-out: evaluate each wired agent independently against engage_mode,
   //    sender_scope, and access gate. An agent that engages gets its own
   //    session and container wake. An agent that declines but has
@@ -450,6 +478,17 @@ async function deliverToAgent(
     const gate = gateCommand(event.message.content, userId, agent.agent_group_id);
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
+      return;
+    }
+    if (gate.action === 'host') {
+      // Host commands are intercepted once in routeInbound before fan-out; if
+      // one reaches here the interceptor was bypassed. Claim it for the host
+      // (never leak to the container's native /model /status handlers) rather
+      // than delivering it. The reply, if any, is the interceptor's job.
+      log.debug('Host command reached deliverToAgent; dropped (handled by router interceptor)', {
+        command: gate.command,
+        agentGroupId: agent.agent_group_id,
+      });
       return;
     }
     if (gate.action === 'deny') {
