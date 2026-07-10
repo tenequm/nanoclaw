@@ -26,6 +26,9 @@ function escapeRegex(text: string): string {
  * @param channelKey mg.instance ?? mg.channel_type (getChannelAdapter key discipline)
  * @param isGroup event.message.isGroup ?? mg.is_group === 1 — never derived from threadId
  * @param agentGroupName substituted (regex-escaped) for the `{name}` token in declared patterns
+ * @param channelType mg.channel_type — pass when channelKey may be a named
+ *   instance so a dead instance still resolves its platform's declaration
+ *   (getChannelDefaults' second-arg discipline)
  *
  * mention-sticky is downgraded to mention when the context's declared threads
  * value is false: sticky engagement is keyed on per-thread session existence,
@@ -35,8 +38,9 @@ export function resolveWiringDefaults(
   channelKey: string,
   isGroup: boolean,
   agentGroupName: string,
+  channelType?: string,
 ): { engage_mode: 'pattern' | 'mention' | 'mention-sticky'; engage_pattern: string | null } {
-  const decl = getChannelDefaults(channelKey);
+  const decl = getChannelDefaults(channelKey, channelType);
   const ctx = isGroup ? decl.group : decl.dm;
 
   let mode = ctx.engageMode;
@@ -55,12 +59,15 @@ export function resolveWiringDefaults(
   };
 }
 
-/** unknown_sender_policy for a messaging_groups row created in this context. */
+/** unknown_sender_policy for a messaging_groups row created in this context.
+ *  `channelType` follows the same dead-named-instance discipline as
+ *  resolveWiringDefaults. */
 export function resolveUnknownSenderPolicy(
   channelKey: string,
   isGroup: boolean,
+  channelType?: string,
 ): 'strict' | 'request_approval' | 'public' {
-  const decl = getChannelDefaults(channelKey);
+  const decl = getChannelDefaults(channelKey, channelType);
   return (isGroup ? decl.group : decl.dm).unknownSenderPolicy;
 }
 

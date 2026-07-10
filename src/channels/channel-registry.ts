@@ -153,6 +153,29 @@ export function fallbackChannelDefaults(supportsThreads: boolean): ChannelDefaul
  *     surfaces since the router never sees events for unregistered channels).
  */
 export function getChannelDefaults(key: string, channelType?: string): ChannelDefaults {
+  const { live, decl } = lookupDeclaredDefaults(key, channelType);
+  return decl ?? fallbackChannelDefaults(live?.supportsThreads ?? false);
+}
+
+/**
+ * True iff getChannelDefaults would resolve from an actual declaration (tiers
+ * 1-4) rather than fallbackChannelDefaults. Manual creation surfaces (`ncl`)
+ * gate declaration-derived defaults on this: for stale (undeclared) adapters
+ * they keep the legacy static schema defaults — engage_mode 'mention',
+ * unknown_sender_policy 'strict' — so a trunk update alone changes nothing.
+ * The faithful fallback exists for the ROUTER's auto-create/runtime paths,
+ * whose historical behavior it reproduces; it is not what `ncl` did.
+ */
+export function hasDeclaredChannelDefaults(key: string, channelType?: string): boolean {
+  return lookupDeclaredDefaults(key, channelType).decl !== undefined;
+}
+
+/** Shared tiers 1-4 of getChannelDefaults (see its doc); `decl` undefined
+ *  means only tier 5 (fallback) remains. */
+function lookupDeclaredDefaults(
+  key: string,
+  channelType?: string,
+): { live: ChannelAdapter | undefined; decl: ChannelDefaults | undefined } {
   let live = activeAdapters.get(key);
   if (!live) {
     for (const adapter of activeAdapters.values()) {
@@ -162,14 +185,12 @@ export function getChannelDefaults(key: string, channelType?: string): ChannelDe
       }
     }
   }
-  if (live?.defaults) return live.defaults;
+  if (live?.defaults) return { live, decl: live.defaults };
 
   const typeKey = live?.channelType ?? channelType;
   const registered =
     registry.get(key)?.defaults ?? (typeKey !== undefined ? registry.get(typeKey)?.defaults : undefined);
-  if (registered) return registered;
-
-  return fallbackChannelDefaults(live?.supportsThreads ?? false);
+  return { live, decl: registered };
 }
 
 /** Get all active adapters. */
