@@ -79,6 +79,12 @@ export interface ProviderOptions {
    * through to the underlying SDK. If omitted, the SDK default is used.
    */
   effort?: string;
+  /**
+   * Auto-compact window in tokens. Providers that support it override their
+   * compaction threshold with this value. If omitted, the provider default
+   * applies.
+   */
+  autoCompactWindow?: number;
 }
 
 export interface QueryInput {

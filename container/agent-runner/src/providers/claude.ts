@@ -346,7 +346,11 @@ export class ClaudeProvider implements AgentProvider {
     this.effort = options.effort;
     this.env = {
       ...(options.env ?? {}),
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+      // Per-agent value from container.json (auto_compact_window in the
+      // central DB) wins; otherwise the baked-in/env default applies.
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: options.autoCompactWindow
+        ? String(options.autoCompactWindow)
+        : CLAUDE_CODE_AUTO_COMPACT_WINDOW,
     };
   }
 
