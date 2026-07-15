@@ -28,6 +28,7 @@ import { fileURLToPath } from 'url';
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 import { ensureMemoryScaffold } from './memory-scaffold.js';
+import { pondMcpServers } from './pond-mcp.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -86,6 +87,8 @@ async function main(): Promise<void> {
     mcpServers[name] = serverConfig;
     log(`Additional MCP server: ${name} (${serverConfig.command})`);
   }
+
+  Object.assign(mcpServers, pondMcpServers());
 
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,

@@ -110,6 +110,20 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # ~300MB Chromium. We've already installed the system one above.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
+# ---- pond: cross-session recall (read-only MCP over mounted stores) ----------
+ARG POND_VERSION=0.13.2
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends xz-utils && \
+    ARCH=$(dpkg --print-architecture) && case "$ARCH" in \
+      arm64) POND_TARGET=aarch64-unknown-linux-gnu ;; \
+      amd64) POND_TARGET=x86_64-unknown-linux-gnu ;; \
+      *) echo "unsupported arch: $ARCH" && exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/tenequm/pond/releases/download/v${POND_VERSION}/pond-${POND_TARGET}.tar.xz" \
+    | tar -xJ -C /usr/local/bin pond && \
+    chmod +x /usr/local/bin/pond
+
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
 # the binary to /usr/local/bin so the non-root `node` user can execute it.
