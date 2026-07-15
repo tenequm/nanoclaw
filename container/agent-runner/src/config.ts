@@ -19,6 +19,7 @@ export interface RunnerConfig {
   model?: string;
   effort?: string;
   autoCompactWindow?: number;
+  compactNotices?: boolean;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -49,6 +50,7 @@ export function loadConfig(): RunnerConfig {
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,
     autoCompactWindow: (raw.autoCompactWindow as number) || undefined,
+    compactNotices: raw.compactNotices === false ? false : undefined,
   };
 
   return _config;

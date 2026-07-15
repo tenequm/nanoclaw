@@ -27,6 +27,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     assistant_name: row.assistant_name,
     max_messages_per_prompt: row.max_messages_per_prompt,
     auto_compact_window: row.auto_compact_window,
+    compact_notices: row.compact_notices,
     skills: JSON.parse(row.skills),
     mcp_servers: JSON.parse(row.mcp_servers),
     packages_apt: JSON.parse(row.packages_apt),
@@ -261,6 +262,7 @@ registerResource({
             | 'assistant_name'
             | 'max_messages_per_prompt'
             | 'auto_compact_window'
+            | 'compact_notices'
             | 'cli_scope'
           >
         > = {};
@@ -278,6 +280,13 @@ registerResource({
           }
           updates.auto_compact_window = window;
         }
+        if (args['compact-notices'] !== undefined || args.compact_notices !== undefined) {
+          const val = String(args['compact-notices'] ?? args.compact_notices);
+          if (!['true', 'false'].includes(val)) {
+            throw new Error('--compact-notices must be true or false');
+          }
+          updates.compact_notices = val === 'true' ? 1 : 0;
+        }
         if (args['cli-scope'] !== undefined || args.cli_scope !== undefined) {
           const scope = (args['cli-scope'] ?? args.cli_scope) as string;
           if (!['disabled', 'group', 'global'].includes(scope)) {
@@ -288,7 +297,7 @@ registerResource({
 
         if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --auto-compact-window, --cli-scope',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --auto-compact-window, --compact-notices, --cli-scope',
           );
         }
 

@@ -20,6 +20,7 @@ export interface ContainerConfigRow {
   assistant_name: string | null;
   max_messages_per_prompt: number | null;
   auto_compact_window: number | null;
+  compact_notices: number | null; // 0 = suppress "Context compacted" chat notices; NULL/1 = deliver
   skills: string; // JSON: '"all"' | '["skill1","skill2"]'
   mcp_servers: string; // JSON: Record<string, McpServerConfig>
   packages_apt: string; // JSON: string[]

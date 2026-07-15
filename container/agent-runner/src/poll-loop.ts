@@ -74,6 +74,12 @@ export interface PollLoopConfig {
    * polling forever and stealing messages from the next test's DB.
    */
   signal?: AbortSignal;
+  /**
+   * When false, mid-turn auto-compact notices are logged instead of delivered
+   * to the chat (operator telemetry doesn't belong in public channels).
+   * Undefined/true = deliver, the historical behavior.
+   */
+  compactNotices?: boolean;
 }
 
 /**
@@ -259,6 +265,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         prompt,
         continuation,
         commandTurn,
+        config.compactNotices !== false,
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
@@ -344,6 +351,7 @@ export async function processQuery(
   initialPrompt: string,
   initialContinuation: string | undefined,
   commandTurn = false,
+  compactNotices = true,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -506,7 +514,13 @@ export async function processQuery(
           // notice verbatim to the origin channel and leave archivePrompts
           // alone. A native /compact command turn takes the commandTurn branch
           // below instead, which delivers the same text as command output.
-          if (event.text) deliverCompactNotice(event.text, routing);
+          if (event.text) {
+            if (compactNotices) {
+              deliverCompactNotice(event.text, routing);
+            } else {
+              log('Auto-compact boundary — notice suppressed (compact_notices=0)');
+            }
+          }
         } else if (event.text) {
           const { sent, hasUnwrapped } = dispatchResultText(event.text, routing);
           if (sent === 0 && event.isError === true) {

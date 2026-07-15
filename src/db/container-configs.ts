@@ -9,6 +9,7 @@ const SCALAR_COLUMNS = new Set([
   'assistant_name',
   'max_messages_per_prompt',
   'auto_compact_window',
+  'compact_notices',
   'cli_scope',
 ]);
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
@@ -29,11 +30,11 @@ export function createContainerConfig(config: ContainerConfigRow): void {
     .prepare(
       `INSERT INTO container_configs (
         agent_group_id, provider, model, effort, image_tag, assistant_name,
-        max_messages_per_prompt, auto_compact_window, skills, mcp_servers, packages_apt, packages_npm,
+        max_messages_per_prompt, auto_compact_window, compact_notices, skills, mcp_servers, packages_apt, packages_npm,
         additional_mounts, updated_at
       ) VALUES (
         @agent_group_id, @provider, @model, @effort, @image_tag, @assistant_name,
-        @max_messages_per_prompt, @auto_compact_window, @skills, @mcp_servers, @packages_apt, @packages_npm,
+        @max_messages_per_prompt, @auto_compact_window, @compact_notices, @skills, @mcp_servers, @packages_apt, @packages_npm,
         @additional_mounts, @updated_at
       )`,
     )
@@ -63,6 +64,7 @@ export function updateContainerConfigScalars(
       | 'assistant_name'
       | 'max_messages_per_prompt'
       | 'auto_compact_window'
+      | 'compact_notices'
       | 'cli_scope'
     >
   >,

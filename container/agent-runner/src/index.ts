@@ -111,6 +111,7 @@ async function main(): Promise<void> {
     providerName,
     cwd: CWD,
     systemContext: { instructions },
+    compactNotices: config.compactNotices,
   });
 }
 
