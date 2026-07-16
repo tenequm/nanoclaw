@@ -440,7 +440,12 @@ async function buildContainerArgs(
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
-  const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+  // --init puts docker-init (tini) at PID 1 to reap orphaned subprocesses.
+  // Without it Bun is PID 1 and never reaps children it didn't spawn, so
+  // agent Bash-tool grandchildren (sleep, pkill, ...) accumulate as zombies
+  // for the container's lifetime. tini forwards signals to the exec'd bun,
+  // so the graceful-shutdown path is unchanged.
+  const args: string[] = ['run', '--rm', '--init', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
   // Per-container resource caps (opt-in; empty = unbounded, today's behavior).
   // Only --memory is set. Whether that's a hard cap depends on the host having no
