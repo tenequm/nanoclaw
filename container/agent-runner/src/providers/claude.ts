@@ -611,7 +611,13 @@ export class ClaudeProvider implements AgentProvider {
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
           const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
           const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
-          yield { type: 'result', text: `Context compacted${detail}.` };
+          // Not a `result`: the poll loop treats result text as the agent's turn
+          // output — a synthetic "Context compacted." result has no <message>
+          // block, so it triggers the "response was not delivered — please
+          // re-send" nudge and the agent duplicates its previous message.
+          // Compaction is bookkeeping: log it, count it as activity only.
+          log(`Context compacted${detail}.`);
+          yield { type: 'activity' };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
           const tn = message as { summary?: string };
           yield { type: 'progress', message: tn.summary || 'Task notification' };
