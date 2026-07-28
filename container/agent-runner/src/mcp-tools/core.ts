@@ -206,7 +206,7 @@ export const sendMediaGroup: McpToolDefinition = {
     inputSchema: {
       type: 'object' as const,
       properties: {
-        to: { type: 'string', description: 'Destination name. Optional if you have only one destination.' },
+        to: { type: 'string', description: 'Destination name.' },
         items: {
           type: 'array',
           minItems: 2,
@@ -221,7 +221,7 @@ export const sendMediaGroup: McpToolDefinition = {
           },
         },
       },
-      required: ['items'],
+      required: ['to', 'items'],
     },
   },
   async handler(args) {
