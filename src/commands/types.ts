@@ -60,7 +60,7 @@ export const COMMAND_ORDER: readonly CommandName[] = ['status', 'model', 'config
 export interface ModelCatalogEntry {
   /** Short alias typed in chat, e.g. "opus". */
   alias: string;
-  /** Friendly label shown in cards/menus, e.g. "Opus 4.8". */
+  /** Friendly label shown in cards/menus, e.g. "Opus 5". */
   label: string;
   /** Raw model id persisted to container_configs.model. */
   id: string;
@@ -68,7 +68,7 @@ export interface ModelCatalogEntry {
 
 export const MODEL_CATALOG: readonly ModelCatalogEntry[] = [
   { alias: 'sonnet', label: 'Sonnet 5', id: 'claude-sonnet-5' },
-  { alias: 'opus', label: 'Opus 4.8', id: 'claude-opus-4-8' },
+  { alias: 'opus', label: 'Opus 5', id: 'claude-opus-5' },
   { alias: 'fable', label: 'Fable 5', id: 'claude-fable-5' },
 ] as const;
 

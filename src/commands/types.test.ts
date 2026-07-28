@@ -13,17 +13,17 @@ import {
 
 describe('resolveModelInput', () => {
   it('resolves catalog aliases to ids + labels', () => {
-    expect(resolveModelInput('opus')).toEqual({ ok: true, id: 'claude-opus-4-8', label: 'Opus 4.8' });
+    expect(resolveModelInput('opus')).toEqual({ ok: true, id: 'claude-opus-5', label: 'Opus 5' });
     expect(resolveModelInput('sonnet')).toEqual({ ok: true, id: 'claude-sonnet-5', label: 'Sonnet 5' });
     expect(resolveModelInput('fable')).toEqual({ ok: true, id: 'claude-fable-5', label: 'Fable 5' });
   });
 
   it('is case-insensitive and trims whitespace on aliases', () => {
-    expect(resolveModelInput('  OPUS  ')).toEqual({ ok: true, id: 'claude-opus-4-8', label: 'Opus 4.8' });
+    expect(resolveModelInput('  OPUS  ')).toEqual({ ok: true, id: 'claude-opus-5', label: 'Opus 5' });
   });
 
   it('accepts a catalog id directly and labels it', () => {
-    expect(resolveModelInput('claude-opus-4-8')).toEqual({ ok: true, id: 'claude-opus-4-8', label: 'Opus 4.8' });
+    expect(resolveModelInput('claude-opus-5')).toEqual({ ok: true, id: 'claude-opus-5', label: 'Opus 5' });
   });
 
   it('accepts a sane raw id outside the catalog with a null label', () => {
@@ -102,7 +102,7 @@ describe('MODEL_CATALOG shape', () => {
   it('matches the confirmed catalog exactly', () => {
     expect(MODEL_CATALOG).toEqual([
       { alias: 'sonnet', label: 'Sonnet 5', id: 'claude-sonnet-5' },
-      { alias: 'opus', label: 'Opus 4.8', id: 'claude-opus-4-8' },
+      { alias: 'opus', label: 'Opus 5', id: 'claude-opus-5' },
       { alias: 'fable', label: 'Fable 5', id: 'claude-fable-5' },
     ]);
   });

@@ -170,7 +170,7 @@ describe('getStatus', () => {
   it('returns a view with model label, running state, and active session count', () => {
     makeAgentGroup('ag-1', 'Emma');
     updateContainerConfigScalars('ag-1', {
-      model: 'claude-opus-4-8',
+      model: 'claude-opus-5',
       effort: 'high',
       auto_compact_window: 400000,
       provider: 'claude',
@@ -185,8 +185,8 @@ describe('getStatus', () => {
     expect(res.view).toMatchObject({
       agentName: 'Emma',
       agentGroupId: 'ag-1',
-      model: 'claude-opus-4-8',
-      modelLabel: 'Opus 4.8',
+      model: 'claude-opus-5',
+      modelLabel: 'Opus 5',
       effort: 'high',
       autoCompactWindow: 400000,
       contextWindow: 400000,
@@ -276,8 +276,8 @@ describe('setModel', () => {
     const res = setModel('ag-1', 'opus', OWNER);
     if (!res.ok) throw new Error('expected ok');
     expect(res.view.previous).toEqual({ id: 'claude-sonnet-5', label: 'Sonnet 5' });
-    expect(res.view.current).toEqual({ id: 'claude-opus-4-8', label: 'Opus 4.8' });
-    expect(getContainerConfig('ag-1')?.model).toBe('claude-opus-4-8');
+    expect(res.view.current).toEqual({ id: 'claude-opus-5', label: 'Opus 5' });
+    expect(getContainerConfig('ag-1')?.model).toBe('claude-opus-5');
   });
 
   it('instant-kills running containers with NO respawn (lazy)', () => {
@@ -363,8 +363,8 @@ describe('setConfigValue', () => {
     const res = setConfigValue('ag-1', 'model', 'opus', OWNER);
     if (!res.ok) throw new Error('expected ok');
     expect(res.view.previousLabel).toBe('Fable 5');
-    expect(res.view.currentLabel).toBe('Opus 4.8');
-    expect(res.view.current).toBe('claude-opus-4-8');
+    expect(res.view.currentLabel).toBe('Opus 5');
+    expect(res.view.current).toBe('claude-opus-5');
   });
 
   it('instant-kills running containers with no respawn', () => {

@@ -98,8 +98,8 @@ describe('render text builders', () => {
     const card = statusCard({
       agentName: 'Emma',
       agentGroupId: 'ag-1',
-      model: 'claude-opus-4-8',
-      modelLabel: 'Opus 4.8',
+      model: 'claude-opus-5',
+      modelLabel: 'Opus 5',
       effort: 'high',
       autoCompactWindow: 400000,
       maxMessagesPerPrompt: null,
@@ -116,7 +116,7 @@ describe('render text builders', () => {
       taskCount: 3,
     });
     expect(card).toContain('📊 **Emma**');
-    expect(card).toContain('**Model:** Opus 4.8 (`claude-opus-4-8`), high effort');
+    expect(card).toContain('**Model:** Opus 5 (`claude-opus-5`), high effort');
     expect(card).toContain('**Context:** 113k / 400k (28%)');
     expect(card).toContain('**Session:** 46k out over 214 turns');
     expect(card).toContain('**Activation:** mention, known senders');
