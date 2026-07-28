@@ -17,9 +17,14 @@ import { migration016 } from './016-messaging-group-instance.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 import { migration018 } from './018-approvals-approver-user-id.js';
-import { migration019 } from './019-container-configs-auto-compact-window.js';
-import { migration020 } from './020-telegram-command-scopes.js';
-import { migration021 } from './021-container-configs-compact-notices.js';
+import { migration019 } from './019-wiring-threads.js';
+import { migration020 } from './020-container-config-timezone.js';
+// Fork-local migrations, renumbered to 022+ so upstream keeps 019/020. Safe to
+// renumber: runMigrations keys applied-state on `name`, not `version`, so a
+// live DB neither re-runs nor skips these.
+import { migration022 } from './022-container-configs-auto-compact-window.js';
+import { migration023 } from './023-telegram-command-scopes.js';
+import { migration024 } from './024-container-configs-compact-notices.js';
 
 export interface Migration {
   version: number;
@@ -55,7 +60,9 @@ export const migrations: Migration[] = [
   migration016,
   migration019,
   migration020,
-  migration021,
+  migration022,
+  migration023,
+  migration024,
 ];
 
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a

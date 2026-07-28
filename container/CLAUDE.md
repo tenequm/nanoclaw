@@ -37,13 +37,15 @@ Always use HTTPS remotes, not SSH. SSH bypasses the gateway and has no key. If a
 
 ## Workspace
 
-Files you create are saved in `/workspace/agent/`. Use this for notes, research, or anything that should persist across sessions with this group.
+Files you create are saved in `/workspace/agent/`. Use this for notes, research, or anything that should persist across turns in this group.
 
 ## Memory
 
-The file `CLAUDE.local.md` in your workspace is your per-group memory. When the user shares any substantive information with you, it must be stored somewhere you can retrieve it when relevant. If it's pertinent to every single conversation turn, put it in `CLAUDE.local.md`. Otherwise, create a system for storing the information depending on its type: a file of people the user mentions, a file of projects, and so on. For every file you create, add a concise reference in `CLAUDE.local.md` so you can find it in future conversations.
+Your persistent memory lives under `/workspace/agent/memory/`. The session-start memory context contains the live top-level index and system definition. Follow that definition when deciding what to store and keep the index accurate so you can retrieve details later.
 
-A core part of your job, and the main thing that defines how useful you are, is how well you create these systems for organizing information. They are your systems. Evolve them over time as needed.
+Standing role, persona, and behavioral instructions belong in `/workspace/agent/instructions.prepend.md`; durable facts belong in memory. Changes to standing instructions take effect after the group container restarts, so say that when confirming an edit.
+
+A core part of your job, and the main thing that defines how useful you are, is how well you organize this information. Evolve the system over time as needed.
 
 ## Conversation history
 

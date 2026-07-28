@@ -50,6 +50,8 @@ export interface CustomOperation {
   args?: ColumnDef[];
   /** Ready-to-paste invocations, rendered under EXAMPLES in deep help. */
   examples?: string[];
+  /** Operator-only: never runnable from inside a container (see CommandDef.hostOnly). */
+  hostOnly?: boolean;
   handler: (args: Record<string, unknown>, ctx: CallerContext) => Promise<unknown>;
   /** Presentational renderer for human mode — see CommandDef.formatHuman. */
   formatHuman?: (data: unknown) => string;
@@ -81,8 +83,60 @@ export interface ResourceDef {
     update?: Access;
     delete?: Access;
   };
+  /**
+   * Columns forming a natural unique key. When set, generic `create` is
+   * idempotent: if a row already matches on these columns it is returned
+   * instead of re-inserted (so a skill that wires via `ncl ... create` is
+   * safe to re-apply).
+   */
+  naturalKey?: string[];
   /** Non-standard verbs (grant, revoke, add, remove, restart, etc.). */
   customOperations?: Record<string, CustomOperation>;
+  /**
+   * Runs on `create` between explicit-arg collection and static column
+   * defaults (two-pass create): fills omitted columns with context-aware
+   * values (e.g. channel adapter declarations) and cross-validates the
+   * combination, throwing an actionable Error to reject. Mutates `values`
+   * in place. Explicit caller args are already present and must win — only
+   * fill what's still undefined. Static `col.default` / `defaultFrom` apply
+   * afterwards, only to columns the hook left unset, so a static default can
+   * never pre-empt context-aware resolution.
+   */
+  resolveDefaults?: (values: Record<string, unknown>) => void;
+  /**
+   * Runs on `update` after the update set is built, before the UPDATE
+   * executes. `current` is the existing row; `updates` holds only the
+   * changed columns and is mutable (coercions land here). Throw to reject.
+   * Mirror of the create-side validation in `resolveDefaults` for resources
+   * whose column combinations need cross-checks — a partial update must not
+   * be able to produce a combination `create` would have rejected.
+   */
+  preUpdate?: (updates: Record<string, unknown>, current: Record<string, unknown>) => void;
+  /**
+   * Runs after a successful `create` INSERT, with the row that was just
+   * written. Used to wire in side effects that the central row alone
+   * doesn't trigger — e.g. creating a `container_configs` row when a new
+   * agent group is added, or the companion `agent_destinations` row when a
+   * wiring is added. The hook receives the same `values` object that was
+   * inserted, so generated fields like `id` and `created_at` are populated.
+   */
+  postCreate?: (row: Record<string, unknown>) => void;
+  /**
+   * Runs AFTER the create transaction has committed, with the row that was
+   * written. Use this — not `postCreate` — for side effects that live
+   * OUTSIDE the central DB (filesystem writes, projecting rows into a
+   * running agent's session `inbound.db`) or that are async: those must not
+   * sit inside the better-sqlite3 transaction, which only covers central-DB
+   * statements and is synchronous.
+   *
+   * The canonical case is live-refresh parity with `ncl destinations add`:
+   * after `ncl wirings create` writes the companion `agent_destinations`
+   * row, the change has to be projected into any running container's session
+   * DB or the agent won't see the new delivery target until its next spawn
+   * (#2389). Runs only if the transaction succeeds, so it never observes a
+   * rolled-back row.
+   */
+  postCommit?: (row: Record<string, unknown>) => void | Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +201,10 @@ function genericCreate(def: ResourceDef) {
   return async (args: Record<string, unknown>) => {
     const values: Record<string, unknown> = {};
 
+    // Pass 1: generated columns + explicit caller args only. Static defaults
+    // wait until after resolveDefaults so the hook sees exactly what the
+    // caller provided and a static default never pre-empts context-aware
+    // resolution.
     for (const col of def.columns) {
       if (col.generated) {
         if (col.name === def.idColumn) {
@@ -165,24 +223,57 @@ function genericCreate(def: ResourceDef) {
         values[col.name] = col.type === 'number' ? Number(v) : v;
       } else if (col.required) {
         throw new Error(`--${col.name.replace(/_/g, '-')} is required`);
-      } else if (col.default !== undefined) {
+      }
+    }
+
+    // Pass 2: context-aware defaults + cross-column validation.
+    if (def.resolveDefaults) def.resolveDefaults(values);
+
+    // Pass 3: static defaults for whatever is still unset.
+    for (const col of def.columns) {
+      if (col.generated || values[col.name] !== undefined) continue;
+      if (col.default !== undefined) {
         values[col.name] = col.default;
       } else if (col.defaultFrom !== undefined && values[col.defaultFrom] !== undefined) {
         values[col.name] = values[col.defaultFrom];
       }
     }
 
+    // Idempotent create: if a row already matches the natural key, return it
+    // rather than hitting a UNIQUE violation. Lets a skill re-run `ncl … create`.
+    // Runs after pass 3 so defaultFrom-filled columns (e.g. messaging-groups'
+    // `instance`) participate in the match. No new row means postCreate /
+    // postCommit are correctly skipped — no new companion rows to create.
+    if (def.naturalKey && def.naturalKey.length > 0) {
+      const where = def.naturalKey.map((c) => `${c} = ?`).join(' AND ');
+      const params = def.naturalKey.map((c) => values[c]);
+      const existing = getDb()
+        .prepare(`SELECT ${visibleColumns(def).join(', ')} FROM ${def.table} WHERE ${where}`)
+        .get(...params);
+      if (existing) return existing;
+    }
+
     const colNames = Object.keys(values);
     const placeholders = colNames.map((c) => `@${c}`);
-    getDb()
-      .prepare(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`)
-      .run(values);
+    // Single transaction so a postCreate throw rolls back the parent INSERT —
+    // closes the partial-state class this PR exists to fix (#2415, #2389).
+    // better-sqlite3 .transaction() is sync, so `postCreate` is sync too and
+    // must only touch the central DB (it's the atomic companion-row write).
+    // Anything async or outside the central DB — filesystem, session-DB
+    // projection — belongs in `postCommit`, which runs after commit below.
+    const db = getDb();
+    db.transaction(() => {
+      db.prepare(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`).run(values);
+      if (def.postCreate) def.postCreate(values);
+    })();
+    if (def.postCommit) await def.postCommit(values);
     return values;
   };
 }
 
 function genericUpdate(def: ResourceDef) {
   const updatableCols = def.columns.filter((c) => c.updatable);
+  const cols = visibleColumns(def).join(', ');
   return async (args: Record<string, unknown>) => {
     const id = args.id as string;
     if (!id) throw new Error(`${def.name} id is required`);
@@ -203,6 +294,14 @@ function genericUpdate(def: ResourceDef) {
       );
     }
 
+    if (def.preUpdate) {
+      const current = getDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id) as
+        | Record<string, unknown>
+        | undefined;
+      if (!current) throw new Error(`${def.name} not found: ${id}`);
+      def.preUpdate(updates, current);
+    }
+
     const setClause = Object.keys(updates)
       .map((k) => `${k} = @${k}`)
       .join(', ');
@@ -211,7 +310,6 @@ function genericUpdate(def: ResourceDef) {
       .run({ ...updates, _id: id });
     if (result.changes === 0) throw new Error(`${def.name} not found: ${id}`);
 
-    const cols = visibleColumns(def).join(', ');
     return getDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id);
   };
 }
@@ -327,6 +425,7 @@ export function registerResource(def: ResourceDef): void {
   if (def.operations.list) {
     register({
       name: `${def.plural}-list`,
+      action: `${def.plural}.list`,
       description: `List all ${def.plural}.`,
       access: def.operations.list,
       resource: def.plural,
@@ -339,6 +438,7 @@ export function registerResource(def: ResourceDef): void {
   if (def.operations.get) {
     register({
       name: `${def.plural}-get`,
+      action: `${def.plural}.get`,
       description: `Get a ${def.name} by ID.`,
       access: def.operations.get,
       resource: def.plural,
@@ -351,6 +451,7 @@ export function registerResource(def: ResourceDef): void {
   if (def.operations.create) {
     register({
       name: `${def.plural}-create`,
+      action: `${def.plural}.create`,
       description: `Create a new ${def.name}.`,
       access: def.operations.create,
       resource: def.plural,
@@ -362,6 +463,7 @@ export function registerResource(def: ResourceDef): void {
   if (def.operations.update) {
     register({
       name: `${def.plural}-update`,
+      action: `${def.plural}.update`,
       description: `Update a ${def.name}.`,
       access: def.operations.update,
       resource: def.plural,
@@ -373,6 +475,7 @@ export function registerResource(def: ResourceDef): void {
   if (def.operations.delete) {
     register({
       name: `${def.plural}-delete`,
+      action: `${def.plural}.delete`,
       description: `Delete a ${def.name}.`,
       access: def.operations.delete,
       resource: def.plural,
@@ -389,8 +492,10 @@ export function registerResource(def: ResourceDef): void {
       const declared = op.args;
       register({
         name: `${def.plural}-${verb.replace(/ /g, '-')}`,
+        action: `${def.plural}.${verb.replace(/ /g, '.')}`,
         description: op.description,
         access: op.access,
+        hostOnly: op.hostOnly,
         resource: def.plural,
         parseArgs: declared
           ? (raw) => {

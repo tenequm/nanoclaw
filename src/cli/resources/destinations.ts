@@ -9,13 +9,15 @@ import { registerResource } from '../crud.js';
  * on `hasTable('agent_destinations')` and load `writeDestinations` lazily —
  * same pattern as container-runner.ts on container wake.
  *
- * Called from both `add` and `remove` so the live container picks up the
- * change without waiting for the next spawn. Without this, send_message to
- * the new local_name silently drops with "unknown destination" until restart.
+ * Called from every destination-mutating ncl command — `add` and `remove`
+ * here, plus `wirings create` (which writes a companion destination row in
+ * its postCreate hook) — so the live container picks up the change without
+ * waiting for the next spawn. Without this, send_message to the new
+ * local_name silently drops with "unknown destination" until restart.
  * See the destination-projection invariant in
  * src/modules/agent-to-agent/db/agent-destinations.ts.
  */
-async function projectDestinationsToSessions(agentGroupId: string): Promise<void> {
+export async function projectDestinationsToSessions(agentGroupId: string): Promise<void> {
   if (!hasTable(getDb(), 'agent_destinations')) return;
   const { writeDestinations } = await import('../../modules/agent-to-agent/write-destinations.js');
   for (const session of getSessionsByAgentGroup(agentGroupId)) {
@@ -45,7 +47,7 @@ registerResource({
       name: 'local_name',
       type: 'string',
       description:
-        'Name the agent uses to address this target (e.g. <message to="local_name">). Unique per agent. Lowercase, dash-separated.',
+        'Name the agent uses to address this target (e.g. send_message({ to: "local_name", ... })). Unique per agent. Lowercase, dash-separated.',
     },
     {
       name: 'target_type',
@@ -108,9 +110,9 @@ registerResource({
         getDb()
           .prepare(
             `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-             VALUES (?, ?, ?, ?, datetime('now'))`,
+             VALUES (?, ?, ?, ?, ?)`,
           )
-          .run(agentGroupId, localName, targetType, targetId);
+          .run(agentGroupId, localName, targetType, targetId, new Date().toISOString());
         await projectDestinationsToSessions(agentGroupId);
         return { agent_group_id: agentGroupId, local_name: localName, target_type: targetType, target_id: targetId };
       },
