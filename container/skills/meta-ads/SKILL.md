@@ -49,7 +49,7 @@ For detailed reports (weekly summaries, audits, deep dives), generate an HTML or
 
 1. Collect data via API calls
 2. Write report to `/workspace/agent/reports/` (`mkdir -p /workspace/agent/reports`)
-3. Send via `mcp__nanoclaw__send_file({ file_path: "/workspace/agent/reports/{name}.html", caption: "..." })`
+3. Send via `mcp__nanoclaw__send_file({ to: "<destination>", path: "/workspace/agent/reports/{name}.html", text: "..." })`
 4. Follow up with a brief Telegram message summarizing key takeaways
 
 File naming: `{report-type}-{date}.html` (e.g., `weekly-summary-2026-07-15.html`)

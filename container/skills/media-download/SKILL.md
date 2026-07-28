@@ -6,8 +6,10 @@ Download media from URLs and send to chats using yt-dlp and instaloader.
 
 All downloaded files go under `/workspace/agent/` (use `/workspace/agent/tmp/` for throwaway files).
 
-- **Single file** - use `send_file`. Photos (.jpg, .png, .gif, .webp) display inline, videos (.mp4, .mov) play with streaming, everything else is sent as a document.
-- **Multiple files** - use `send_media_group` (2-10 items). Photos and videos display as a gallery album.
+- **Single file** - use `send_file({ to, path, text? })`. Photos (.jpg, .png, .gif, .webp) display inline, videos (.mp4, .mov) play with streaming, everything else is sent as a document.
+- **Multiple files** - use `send_media_group({ to, items })` (2-10 items). Photos and videos display as a gallery album; each item is `{ path, caption? }`.
+
+Both require an explicit `to` destination. There is no reply-in-place shortcut, even when the group has only one destination. `list_destinations` shows the options.
 
 ## yt-dlp
 

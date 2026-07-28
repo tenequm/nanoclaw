@@ -36,7 +36,8 @@ jq -r '[.steps[] | select(.type=="model_output") | .content[] | select(.type=="i
   | base64 -d > /workspace/agent/images/out.png
 ```
 
-Then send with `mcp__nanoclaw__send_file({ file_path: "/workspace/agent/images/out.png", caption: "..." })`.
+Then send with `mcp__nanoclaw__send_file({ to: "<destination>", path: "/workspace/agent/images/out.png", text: "..." })`.
+Every send tool requires a named `to` destination; `list_destinations` shows the options.
 
 If the jq path returns empty, inspect `/tmp/gen.json` for an `error` object
 or a text-only refusal before retrying.

@@ -42,7 +42,7 @@ The script prints the absolute path of the finished `.ogg` on success. Pass
 that exact path to `send_file`:
 
 ```
-send_file({ path: "<printed absolute path>", text: "(optional caption)" })
+send_file({ to: "<destination>", path: "<printed absolute path>", text: "(optional caption)" })
 ```
 
 Use the printed path rather than a bare filename so it resolves no matter the
