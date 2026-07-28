@@ -136,17 +136,20 @@ export type ProviderEvent =
    * turn as an error (e.g. a non-retryable Anthropic 403 billing_error). The
    * poll-loop uses it to surface the result text to the user instead of
    * dropping it as un-wrapped scratchpad, and to skip the re-wrap nudge.
-   *
-   * `isCompactBoundary` marks the synthetic "Context compacted" result the
-   * translator emits for an SDK compact_boundary. It is not agent output and
-   * answers no queued prompt: on a normal turn the poll-loop must ignore it
-   * (dispatching it trips the false "not delivered" nudge, which makes the
-   * model re-send an already-delivered reply). On a native slash-command turn
-   * (/compact) it IS the command output and is delivered verbatim.
    */
-  | { type: 'result'; text: string | null; isError?: boolean; isCompactBoundary?: boolean }
+  | { type: 'result'; text: string | null; isError?: boolean }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
+  /**
+   * User-facing system notice that is NOT agent output — currently only the
+   * auto-compact boundary. Deliberately its own event rather than a `result`:
+   * a notice answers no queued prompt, so routing it through the result path
+   * would drop it as scratchpad AND fire the false "not delivered" nudge,
+   * making the model re-send an already-delivered reply. As a non-result it
+   * also leaves the turn open, which is correct — the SDK keeps running
+   * toward the real result after a compaction.
+   */
+  | { type: 'notice'; text: string }
   /**
    * Liveness signal. Providers MUST yield this on every underlying SDK
    * event (tool call, thinking, partial message, anything) so the

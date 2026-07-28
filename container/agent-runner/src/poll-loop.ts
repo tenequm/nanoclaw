@@ -498,30 +498,13 @@ export async function processQuery(
         // A result — with or without text — usually means the turn is done,
         // and the initial batch gets marked completed so the host sweep
         // doesn't see stale 'processing' claims while the query stays open
-        // for follow-up pushes. Two exceptions keep the turn (and thus the
-        // claims) open: a compact boundary (the SDK keeps running toward
-        // the real result) and a re-wrap nudge (we push a retry into the
-        // same query below). The claims gate the host's typing indicator
-        // and the sweep's crash retry, so they must stay 'processing'
-        // exactly as long as the turn can still produce the user's reply.
-        let turnContinues = event.isCompactBoundary === true;
-        if (event.isCompactBoundary && !commandTurn) {
-          // Mid-turn auto-compact: this synthetic result is a system notice,
-          // not agent output, and answers no queued prompt. Running it through
-          // dispatchResultText would both drop it as scratchpad AND fire the
-          // false "not delivered" nudge — the model then re-sends an
-          // already-delivered reply, duplicating messages in chat. Deliver the
-          // notice verbatim to the origin channel and leave archivePrompts
-          // alone. A native /compact command turn takes the commandTurn branch
-          // below instead, which delivers the same text as command output.
-          if (event.text) {
-            if (compactNotices) {
-              deliverCompactNotice(event.text, routing);
-            } else {
-              log('Auto-compact boundary — notice suppressed (compact_notices=0)');
-            }
-          }
-        } else if (event.text) {
+        // for follow-up pushes. One exception keeps the turn (and thus the
+        // claims) open: a re-wrap nudge (we push a retry into the same query
+        // below). The claims gate the host's typing indicator and the sweep's
+        // crash retry, so they must stay 'processing' exactly as long as the
+        // turn can still produce the user's reply.
+        let turnContinues = false;
+        if (event.text) {
           const { sent, hasUnwrapped } = dispatchResultText(event.text, routing);
           if (sent === 0 && event.isError === true) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
@@ -578,6 +561,19 @@ export async function processQuery(
           archivePrompts.shift();
         }
         if (!turnContinues) markCompleted(initialBatchIds);
+      } else if (event.type === 'notice') {
+        // System notice (auto-compact boundary), not agent output. Delivered
+        // straight to the origin channel: it never touches archivePrompts, the
+        // result path, or the batch claims, so the turn stays open for the real
+        // result. Suppressed on a native slash-command turn (/compact), where
+        // the SDK's own command result already reports the same compaction.
+        if (!compactNotices) {
+          log('Compaction notice suppressed (compact_notices=0)');
+        } else if (commandTurn) {
+          log('Compaction notice suppressed (native /compact reports it as command output)');
+        } else {
+          deliverCompactNotice(event.text, routing);
+        }
       }
     }
   } catch (err) {
@@ -624,6 +620,9 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       break;
     case 'progress':
       log(`Progress: ${event.message}`);
+      break;
+    case 'notice':
+      log(`Notice: ${event.text}`);
       break;
   }
 }

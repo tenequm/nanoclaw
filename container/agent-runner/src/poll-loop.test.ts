@@ -500,7 +500,7 @@ describe('native slash-command result (commandTurn)', () => {
   });
 });
 
-describe('mid-turn auto-compact (isCompactBoundary)', () => {
+describe('mid-turn auto-compact (notice event)', () => {
   const NOTICE = '🗜 Context compacted (48,462 tokens summarized). Older messages were summarized to free up space.';
 
   it('delivers the notice, does not nudge, and the wrapped reply still goes out exactly once', async () => {
@@ -515,9 +515,9 @@ describe('mid-turn auto-compact (isCompactBoundary)', () => {
     const pushes: string[] = [];
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'sess-1' };
-      // The SDK auto-compacted mid-turn; the translator emits this synthetic
-      // result BEFORE the agent's real answer.
-      yield { type: 'result', text: NOTICE, isCompactBoundary: true };
+      // The SDK auto-compacted mid-turn; the translator emits this notice
+      // BEFORE the agent's real answer.
+      yield { type: 'notice', text: NOTICE };
       yield { type: 'result', text: '<message to="main">final answer</message>' };
     }
     const query: AgentQuery = {
@@ -535,14 +535,30 @@ describe('mid-turn auto-compact (isCompactBoundary)', () => {
     expect(out).toHaveLength(2);
     expect(JSON.parse(out[0].content).text).toBe(NOTICE);
     expect(JSON.parse(out[1].content).text).toBe('final answer');
-    // The regression: the synthetic compact result used to trip the false
+    // The regression: emitting the boundary as a `result` tripped the false
     // "not delivered" nudge, making the model re-send the already-delivered
-    // reply (duplicate messages in chat).
+    // reply (duplicate messages in chat). A notice never enters that path.
     expect(pushes).toHaveLength(0);
   });
 
-  it('a native /compact command turn still delivers the boundary text as command output', async () => {
-    const { query, pushes } = makeResultQuery({ type: 'result', text: NOTICE, isCompactBoundary: true });
+  it('suppresses the notice on a native /compact turn — the command result reports it once', async () => {
+    // A native /compact emits BOTH the boundary notice and the SDK's own
+    // command result carrying the same text. Delivering both would double up
+    // in chat, so the notice yields to the command output.
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'notice', text: NOTICE };
+      yield { type: 'result', text: NOTICE };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+      },
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
 
     await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, '/compact', undefined, true);
 
@@ -550,6 +566,33 @@ describe('mid-turn auto-compact (isCompactBoundary)', () => {
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe(NOTICE);
     expect(pushes).toHaveLength(0);
+  });
+
+  it('suppresses the notice when compact_notices is disabled', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'notice', text: NOTICE };
+      yield { type: 'result', text: '<message to="main">final answer</message>' };
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, false, false);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('final answer');
   });
 
   it('holds the processing claim through the boundary and completes it at the real result', async () => {
