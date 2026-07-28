@@ -600,14 +600,19 @@ export async function processQuery(
         // System notice (auto-compact boundary), not agent output. Delivered
         // straight to the origin channel: it never touches archivePrompts, the
         // result path, or the batch claims, so the turn stays open for the real
-        // result. Suppressed on a native slash-command turn (/compact), where
-        // the SDK's own command result already reports the same compaction.
-        if (!compactNotices) {
-          log('Compaction notice suppressed (compact_notices=0)');
-        } else if (commandTurn) {
-          log('Compaction notice suppressed (native /compact reports it as command output)');
-        } else {
+        // result.
+        //
+        // Delivered on native /compact turns too. A successful /compact returns
+        // EMPTY result text (verified live 2026-07-28: sessions that compacted
+        // produced a compact_boundary and no result text, while sessions with
+        // nothing to compact produced only "Not enough messages to compact.").
+        // So there is no duplicate to guard against — suppressing here made a
+        // successful manual /compact silent, which is the one case the operator
+        // most wants confirmed.
+        if (compactNotices) {
           deliverCompactNotice(event.text, routing);
+        } else {
+          log('Compaction notice suppressed (compact_notices=0)');
         }
       }
     }

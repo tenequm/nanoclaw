@@ -541,15 +541,16 @@ describe('mid-turn auto-compact (notice event)', () => {
     expect(pushes).toHaveLength(0);
   });
 
-  it('suppresses the notice on a native /compact turn — the command result reports it once', async () => {
-    // A native /compact emits BOTH the boundary notice and the SDK's own
-    // command result carrying the same text. Delivering both would double up
-    // in chat, so the notice yields to the command output.
+  it('delivers the notice on a native /compact turn (successful compact returns no result text)', async () => {
+    // Verified live 2026-07-28: a successful /compact emits compact_boundary
+    // and EMPTY result text, so the notice is the only confirmation the
+    // operator gets. Suppressing it here made a successful manual compact
+    // silent.
     const pushes: string[] = [];
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'sess-1' };
       yield { type: 'notice', text: NOTICE };
-      yield { type: 'result', text: NOTICE };
+      yield { type: 'result', text: null };
     }
     const query: AgentQuery = {
       push: (m: string) => {
