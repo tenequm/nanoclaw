@@ -4,6 +4,7 @@ import {
   markProcessing,
   markCompleted,
   markScriptSkipped,
+  releaseClaims,
   type MessageInRow,
 } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
@@ -257,10 +258,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped.map((s) => s.id));
+    // processQuery appends to this array as the follow-up poller claims
+    // mid-turn messages, so the `finally` below acks those too if the query
+    // ends without a result event.
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
+    // The stop signal is only checked at the top of this loop, so on its own it
+    // cannot end a turn that is parked waiting for more provider output. Tear
+    // the query down too, otherwise an aborted loop stays blocked inside
+    // processQuery with its follow-up interval still claiming messages.
+    const abortQuery = () => query.abort();
+    config.signal?.addEventListener('abort', abortQuery, { once: true });
     try {
       const result = await processQuery(
         query,
@@ -305,6 +315,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // followed by a "Completed" line that reads like success.
       log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
     } finally {
+      config.signal?.removeEventListener('abort', abortQuery);
       clearCurrentInReplyTo();
     }
 
@@ -356,7 +367,13 @@ interface QueryResult {
 export async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
-  initialBatchIds: string[],
+  // Live list of message ids whose `processing` claim is still open for this
+  // turn. Seeded with the initial batch and appended to by the follow-up
+  // poller as it pushes messages into the running query; every entry clears at
+  // the next result event. Mutated in place on purpose: the caller passes its
+  // own array, so its `finally` safety net (markCompleted after the loop) also
+  // covers follow-ups that arrived mid-turn.
+  openClaimIds: string[],
   providerName: string,
   onExchangeComplete: ((exchange: ProviderExchange) => void) | undefined,
   initialPrompt: string,
@@ -443,20 +460,45 @@ export async function processQuery(
         }
         // MODULE-HOOK:scheduling-pre-task-followup:end
 
-        if (keep.length === 0) return;
-        // Re-check done — the outer query may have finished while the script
-        // was awaited. Pushing into a closed stream is wasted work; the
-        // claimed messages get released by the host's processing-claim sweep.
-        if (done) return;
+        if (keep.length === 0) {
+          // Everything was script-gated. `markScriptSkipped` acked those rows;
+          // release any claim it did not cover so nothing is stranded.
+          const acked = new Set(skipped.map((s) => s.id));
+          releaseClaims(newIds.filter((id) => !acked.has(id)));
+          return;
+        }
 
         const keptIds = keep.map((m) => m.id);
+
+        // Re-check done — the outer query may have finished while the script
+        // was awaited, and pushing into a closed stream is wasted work. Release
+        // the claim instead of leaving it: the outer loop is about to re-poll
+        // and will pick these up on the next turn. Leaving them claimed made
+        // the container skip them forever, so the message only came back when
+        // the host's stuck-claim sweep killed the container a minute later.
+        if (done) {
+          releaseClaims(keptIds);
+          return;
+        }
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
         query.push(prompt);
         archivePrompts.push(prompt);
-        markCompleted(keptIds);
+        // Push is NOT an answer. The SDK enqueues the prompt and only drains
+        // it at a turn boundary, so a follow-up sent while the model is deep
+        // in a tool batch can sit unanswered for minutes. Acking it completed
+        // here (as this line used to) had two costs: the host saw zero
+        // 'processing' claims and dropped the typing indicator exactly when
+        // the agent was busiest, and a container killed before the boundary
+        // left the message marked done but never answered, so the sweep could
+        // not redeliver it. Join the open claims instead: they clear together
+        // at the next result event, and the host's crash retry stays armed
+        // until then. Long-lived claims are safe here because the sweep only
+        // treats one as stuck when the heartbeat has not moved since the
+        // claim (src/host-sweep.ts:117), and an active turn touches it.
+        openClaimIds.push(...keptIds);
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
         // terminates the container on unhandled-rejection. The initial-batch
@@ -595,7 +637,7 @@ export async function processQuery(
         } else {
           archivePrompts.shift();
         }
-        if (!turnContinues) markCompleted(initialBatchIds);
+        if (!turnContinues) markCompleted(openClaimIds);
       } else if (event.type === 'notice') {
         // System notice (auto-compact boundary), not agent output. Delivered
         // straight to the origin channel: it never touches archivePrompts, the

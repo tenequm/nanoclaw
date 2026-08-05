@@ -637,6 +637,68 @@ describe('mid-turn auto-compact (notice event)', () => {
     expect(statusAfterBoundary).toBe('processing');
     expect(claimStatus()).toBe('completed');
   });
+
+  it('holds a mid-turn follow-up claim until the result, not at push time', async () => {
+    // query.push() is not an answer: the SDK enqueues the prompt and drains it
+    // at the next turn boundary, which can be minutes away when the model is
+    // deep in a tool batch. Acking the follow-up at push time dropped the
+    // host's typing indicator (gated on 'processing' claims) exactly when the
+    // agent was busiest, and lost the message outright if the container died
+    // before the boundary.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+    insertMessage('m1', 'chat', { sender: 'John', text: 'long task' });
+    markProcessing(['m1']);
+
+    const ackStatus = (id: string) =>
+      (
+        getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+          | { status: string }
+          | undefined
+      )?.status;
+
+    let resolvePushed!: () => void;
+    const pushed = new Promise<void>((r) => {
+      resolvePushed = r;
+    });
+    let followUpStatusMidTurn: string | undefined;
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      // The user pokes while the model is still working.
+      insertMessage('m2', 'chat', { sender: 'John', text: '?' });
+      // Resumes on a microtask AFTER the poller's synchronous block finished,
+      // so this observes the claim as the host's typing gate would see it for
+      // the rest of the turn. Reading it inside push() would be too early to
+      // catch an ack that lands right after the push.
+      await pushed;
+      followUpStatusMidTurn = ackStatus('m2');
+      yield { type: 'result', text: '<message to="main">final answer</message>' };
+    }
+
+    const query: AgentQuery = {
+      push: () => resolvePushed(),
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    // Mutated in place by processQuery, mirroring the caller's `processingIds`.
+    const openClaims = ['m1'];
+    await processQuery(query, ERR_ROUTING, openClaims, 'claude', undefined, 'prompt', undefined);
+
+    expect(followUpStatusMidTurn).toBe('processing');
+    expect(openClaims).toContain('m2');
+    expect(ackStatus('m1')).toBe('completed');
+    expect(ackStatus('m2')).toBe('completed');
+    // Timeout: this test waits on the real ACTIVE_POLL_INTERVAL_MS (500ms)
+    // follow-up tick. Under full-suite load (23 files concurrently) that tick
+    // can slip well past bun's 5s default, so the budget is explicit.
+  }, 15000);
 });
 
 describe('isCorruptionError', () => {
@@ -739,5 +801,8 @@ describe('task-run turn wiring (real processQuery)', () => {
     expect(logs[1]).toContain('[undelivered → local-cli] fire two result');
     expect(logs).not.toContain('first delivery decision handled');
     expect(logs).not.toContain('second delivery decision handled');
-  });
+    // Same reason as the follow-up-claim test above: this drives the real
+    // 500ms poll tick and was flaking on bun's 5s default under full-suite
+    // load (it passed in isolation every time).
+  }, 15000);
 });

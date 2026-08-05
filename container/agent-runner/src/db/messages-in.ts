@@ -138,6 +138,27 @@ export function markScriptSkipped(skips: Array<{ id: string; reason: string }>):
   })();
 }
 
+/**
+ * Drop the processing claim on messages we claimed but will NOT handle, so the
+ * next poll sees them as pending again. `getPendingMessages` filters against
+ * every processing_ack row regardless of status, so deleting the row (rather
+ * than acking it) is what actually releases the message.
+ *
+ * Needed because the follow-up poller claims a batch BEFORE it knows whether
+ * the query is still open. When it bails (the query finished while the
+ * pre-task script was awaited), an un-released claim strands the message: the
+ * container skips it forever and the host only notices via the stuck-claim
+ * sweep, which recovers by killing the container a minute later.
+ */
+export function releaseClaims(ids: string[]): void {
+  if (ids.length === 0) return;
+  const db = getOutboundDb();
+  const stmt = db.prepare('DELETE FROM processing_ack WHERE message_id = ?');
+  db.transaction(() => {
+    for (const id of ids) stmt.run(id);
+  })();
+}
+
 /** Mark a single message as failed — writes to processing_ack in outbound.db. */
 export function markFailed(id: string): void {
   getOutboundDb()
