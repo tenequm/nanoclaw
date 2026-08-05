@@ -296,6 +296,33 @@ describe('setModel', () => {
     expect(mockRestartAgentGroupContainers).not.toHaveBeenCalled();
   });
 
+  it('does NOT kill containers when the model is unchanged', () => {
+    // The /model menu shows the current model as a tappable row, so re-picking
+    // it is a normal misclick. Killing on a no-op destroyed the in-flight turn
+    // (and its subagents) for no config change at all.
+    updateContainerConfigScalars('ag-1', { model: 'claude-opus-5' });
+    makeSession('s1', 'ag-1', 'active');
+    mockIsContainerRunning.mockReturnValue(true);
+
+    const res = setModel('ag-1', 'opus', OWNER);
+    if (!res.ok) throw new Error('expected ok');
+    expect(res.view.current.id).toBe('claude-opus-5');
+    expect(res.view.containersKilled).toBe(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+  });
+
+  it('DOES kill when moving off the inherited default to an explicit id', () => {
+    // Stored null means "inherit"; pinning it is a real change even when the
+    // effective model is identical, because the container reads the stored value.
+    expect(getContainerConfig('ag-1')?.model ?? null).toBeNull();
+    makeSession('s1', 'ag-1', 'active');
+    mockIsContainerRunning.mockReturnValue(true);
+
+    const res = setModel('ag-1', 'opus', OWNER);
+    if (!res.ok) throw new Error('expected ok');
+    expect(res.view.containersKilled).toBe(1);
+  });
+
   it('honors a scoped admin over the target group', () => {
     grantRole({ user_id: SCOPED_ADMIN, role: 'admin', agent_group_id: 'ag-1', granted_by: OWNER, granted_at: now() });
     const res = setModel('ag-1', 'opus', SCOPED_ADMIN);
@@ -375,6 +402,18 @@ describe('setConfigValue', () => {
     expect(res.view.containersKilled).toBe(1);
     expect(mockKillContainer).toHaveBeenCalledWith('s1', expect.any(String), undefined);
     expect(mockRestartAgentGroupContainers).not.toHaveBeenCalled();
+  });
+
+  it('does NOT kill containers when the value is unchanged', () => {
+    updateContainerConfigScalars('ag-1', { effort: 'high' });
+    makeSession('s1', 'ag-1', 'active');
+    mockIsContainerRunning.mockReturnValue(true);
+
+    const res = setConfigValue('ag-1', 'effort', 'high', OWNER);
+    if (!res.ok) throw new Error('expected ok');
+    expect(res.view.current).toBe('high');
+    expect(res.view.containersKilled).toBe(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
   });
 });
 

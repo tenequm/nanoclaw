@@ -331,7 +331,18 @@ export function setModel(
     to: resolved.id,
   });
 
-  const containersKilled = killAgentGroupContainersLazy(agentGroupId, 'model changed via chat command');
+  // Only kill when the stored value actually moved. Re-selecting the model a
+  // group is already on (easy to do from the /model menu, which shows the
+  // current model as a tappable row) used to kill the container anyway,
+  // destroying an in-flight turn for no config change at all. Note this
+  // compares the STORED value: null (inherit the default) to an explicit id is
+  // a real change even when the effective model is identical, because the
+  // container reads the stored value.
+  const changed = (before?.model ?? null) !== resolved.id;
+  const containersKilled = changed ? killAgentGroupContainersLazy(agentGroupId, 'model changed via chat command') : 0;
+  if (!changed) {
+    log.debug('Model unchanged, skipping container kill', { agentGroupId, model: resolved.id });
+  }
 
   return {
     ok: true,
@@ -425,7 +436,15 @@ export function setConfigValue(
   updateContainerConfigScalars(agentGroupId, updates);
   log.info('Config changed via chat command', { agentGroupId, actorUserId, field, from: previous, to: current });
 
-  const containersKilled = killAgentGroupContainersLazy(agentGroupId, `config ${field} changed via chat command`);
+  // Same no-op guard as setModel: re-picking the value already stored must not
+  // kill a running container and lose its turn.
+  const changed = previous !== current;
+  const containersKilled = changed
+    ? killAgentGroupContainersLazy(agentGroupId, `config ${field} changed via chat command`)
+    : 0;
+  if (!changed) {
+    log.debug('Config unchanged, skipping container kill', { agentGroupId, field, value: current });
+  }
 
   return {
     ok: true,
