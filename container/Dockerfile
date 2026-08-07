@@ -75,6 +75,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
+
+# ---- uv / uvx ----------------------------------------------------------------
+# General Python capability for agents, and the launcher for Python MCP servers
+# (the `npx -y` equivalent that Debian bookworm has no package for - neither `uv`
+# nor `python3-uv` is in the repos). Copied from Astral's official image rather
+# than piped from an install script: two static binaries, no network fetch at
+# container start, no dependency on the PEP 668 managed system Python.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
 # ---- GitHub CLI (gh) ---------------------------------------------------------
 # Install gh so agents can run `gh pr list`, `gh repo view`, etc. Auth follows
 # the OneCLI "Pattern D" model (onecli.sh/docs/guides/credential-stubs/general-app):
