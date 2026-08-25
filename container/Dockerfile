@@ -120,7 +120,7 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 # ---- pond: cross-session recall (read-only MCP over mounted stores) ----------
-ARG POND_VERSION=0.15.0
+ARG POND_VERSION=0.16.1
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends xz-utils && \
