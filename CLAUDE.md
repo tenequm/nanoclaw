@@ -119,6 +119,12 @@ ncl help
 
 Key files: `src/cli/dispatch.ts` (dispatcher + approval handler), `src/cli/crud.ts` (generic CRUD registration), `src/cli/resources/` (per-resource definitions).
 
+## Chat Commands
+
+Four host-owned slash commands let an operator inspect and retune an agent group from chat: `/status` (member-runnable, read-only), plus admin-only `/model`, `/config`, `/restart`. The router claims them before the per-agent fan-out (`command-gate.ts` `classifyHostCommand`), so they never leak to the container SDK's native `/model` `/status` handlers. Auth is re-checked server-side on every command and every menu tap. On Slack, whose client eats unregistered `/`, type them as `!status` etc. (the gate normalizes the bang prefix).
+
+Architecture is a model/view split: `HostCommandService` (`src/commands/`) owns all semantics and returns view-models; the router fallback (`src/commands/fallback.ts`) renders plain text / `ask_question` cards on any channel; telegram-grammy binds natively (`src/channels/telegram-grammy/commands/`) with menus + an admin-only popup scope janitor. `/model` and `/config` writes are instant-kill + lazy-respawn (apply from the next reply); `/restart` respawns immediately with a wake message. The compact-window field writes `autoCompactWindow` in the group's `.claude-shared/settings.json`, not `container_configs`. Full reference: [docs/chat-commands.md](docs/chat-commands.md).
+
 ## Channels and Providers (skill-installed)
 
 Trunk does not ship any specific channel adapter or non-default agent provider. The codebase is the registry/infra; the actual adapters and providers live on long-lived sibling branches and get copied in by skills:

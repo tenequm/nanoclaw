@@ -1,12 +1,13 @@
 /**
- * Tests for the host-side command gate — filtered commands are dropped
+ * Tests for the host-side command gate: filtered commands are dropped
  * before reaching the container, admin commands are gated against the
- * user_roles table, host commands classify for host execution, and the
+ * user_roles table, the four host commands classify for host execution
+ * regardless of sender (auth lives in the command service), and the
  * bang prefix / alias rewrite normalizes to canonical slash commands.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { applyNormalizedText, gateCommand } from './command-gate.js';
+import { applyNormalizedText, classifyHostCommand, gateCommand } from './command-gate.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
 import { createUser } from './modules/permissions/db/users.js';
 import { grantRole } from './modules/permissions/db/user-roles.js';
@@ -117,7 +118,7 @@ describe('bang prefix on slack', () => {
     expect(await gateCommand('!compact', 'telegram:owner', 'ag-1', 'telegram')).toEqual({ action: 'pass' });
   });
 
-  it('leaves an unknown !word untouched — ! is common in prose', async () => {
+  it('leaves an unknown !word untouched (! is common in prose)', async () => {
     expect(await gateCommand('!foo bar', 'slack:1', 'ag-1', 'slack')).toEqual({ action: 'pass' });
     expect(await gateCommand('!!! urgent', 'slack:1', 'ag-1', 'slack')).toEqual({ action: 'pass' });
   });
@@ -156,37 +157,71 @@ describe('/new alias', () => {
 });
 
 describe('host commands', () => {
-  it('/status passes through to the SDK for any sender (pre-existing behavior)', async () => {
-    expect(await gateCommand('/status', 'telegram:anyone', 'ag-1', 'telegram')).toEqual({ action: 'pass' });
+  it('claims /status for ANY sender (auth is decided in the command service)', async () => {
+    expect(await gateCommand('/status', 'telegram:anyone', 'ag-1', 'telegram')).toEqual({
+      action: 'host',
+      command: 'status',
+      args: '',
+    });
+    expect(await gateCommand('/status', null, 'ag-1', 'telegram')).toEqual({
+      action: 'host',
+      command: 'status',
+      args: '',
+    });
+  });
+
+  it('normalizes !status on slack into the host claim', async () => {
     expect(await gateCommand('!status', 'slack:anyone', 'ag-1', 'slack')).toEqual({
-      action: 'pass',
-      normalizedText: '/status',
+      action: 'host',
+      command: 'status',
+      args: '',
     });
   });
 
   it('carries the argument text for /model', async () => {
-    await seedOwner('slack:owner');
-    expect(await gateCommand('!model claude-opus-5', 'slack:owner', 'ag-1', 'slack')).toEqual({
+    expect(await gateCommand('!model claude-opus-5', 'slack:nobody', 'ag-1', 'slack')).toEqual({
       action: 'host',
-      command: '/model',
-      argText: 'claude-opus-5',
+      command: 'model',
+      args: 'claude-opus-5',
     });
   });
 
-  it('/config is host-handled now, not filtered', async () => {
-    await seedOwner('telegram:owner');
-    expect(await gateCommand('/config', 'telegram:owner', 'ag-1', 'telegram')).toEqual({
+  it('claims /config and /restart', async () => {
+    expect(await gateCommand('/config set effort high', 'telegram:1', 'ag-1', 'telegram')).toEqual({
       action: 'host',
-      command: '/config',
-      argText: '',
+      command: 'config',
+      args: 'set effort high',
+    });
+    expect(await gateCommand('/restart', 'telegram:1', 'ag-1', 'telegram')).toEqual({
+      action: 'host',
+      command: 'restart',
+      args: '',
     });
   });
 
-  it('denies host commands from non-admins', async () => {
-    expect(await gateCommand('/model claude-opus-5', 'slack:nobody', 'ag-1', 'slack')).toEqual({
-      action: 'deny',
-      command: '/model',
+  it('strips a Telegram @botname suffix before matching', async () => {
+    expect(await gateCommand('/model@opx_cc_bl_bot opus', 'telegram:1', 'ag-1', 'telegram')).toEqual({
+      action: 'host',
+      command: 'model',
+      args: 'opus',
     });
+  });
+});
+
+describe('classifyHostCommand (router 3b entry)', () => {
+  it('classifies from a chat-sdk JSON envelope', () => {
+    const content = JSON.stringify({ text: '/status', author: { userId: 'U1' }, id: 'm1' });
+    expect(classifyHostCommand(content, 'telegram')).toEqual({ command: 'status', args: '' });
+  });
+
+  it('classifies a slack bang command with args', () => {
+    expect(classifyHostCommand('!model fable', 'slack')).toEqual({ command: 'model', args: 'fable' });
+  });
+
+  it('returns null for non-host commands and plain text', () => {
+    expect(classifyHostCommand('/clear', 'telegram')).toBeNull();
+    expect(classifyHostCommand('hello', 'telegram')).toBeNull();
+    expect(classifyHostCommand('!status', 'telegram')).toBeNull();
   });
 });
 

@@ -19,8 +19,8 @@
  */
 import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
-import { applyNormalizedText, gateCommand } from './command-gate.js';
-import { handleHostCommand } from './host-commands.js';
+import { applyNormalizedText, classifyHostCommand, gateCommand } from './command-gate.js';
+import { runHostCommand } from './commands/fallback.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
@@ -346,6 +346,34 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   //    we need their actual rows for fan-out).
   const agents = await getMessagingGroupAgents(mg.id);
 
+  // 3b. Host chat-commands (/model, /status, /config, /restart) are owned by
+  //     the host and answered ONCE per message, independent of per-agent
+  //     engage rules (a slash command need not @mention the bot to be
+  //     honored). On Telegram the native binding intercepts these at the
+  //     adapter so they never reach here; this is the channel-agnostic
+  //     backstop for every other channel (Slack types them as `!name`,
+  //     normalized by the gate), and for Telegram when the native binding is
+  //     absent. No channel-specific branching: the fallback renders uniformly.
+  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+    const host = classifyHostCommand(event.message.content, event.channelType);
+    if (host) {
+      try {
+        await runHostCommand({
+          command: host.command,
+          args: host.args,
+          mg,
+          event,
+          userId,
+          agents,
+          adapterSupportsThreads: adapter?.supportsThreads === true,
+        });
+      } catch (err) {
+        log.error('Host command handler threw', { command: host.command, messagingGroupId: mg.id, err });
+      }
+      return;
+    }
+  }
+
   // 4. Fan-out: evaluate each wired agent independently against engage_mode,
   //    sender_scope, and access gate. An agent that engages gets its own
   //    session and container wake. An agent that declines but has
@@ -572,22 +600,10 @@ async function deliverToAgent(
       return;
     }
     if (gate.action === 'host') {
-      // Only an engaged (wake) message executes — an accumulate-branch copy
-      // of a host command is ambient context in some other agent's session,
-      // and running it there would reply from an agent that never engaged.
-      if (wake) {
-        await handleHostCommand({
-          command: gate.command,
-          argText: gate.argText,
-          agentGroup,
-          session,
-          userId,
-          channelType: deliveryAddr.channelType,
-          platformId: deliveryAddr.platformId,
-          threadId: deliveryAddr.threadId,
-          instance: mg.instance ?? null,
-        });
-      }
+      // Host commands are intercepted once per message at the messaging-group
+      // level (step 3b in routeInbound) before the per-agent fan-out; a row
+      // reaching this per-agent gate as 'host' means an alternate entry path
+      // (e.g. CLI replay) - drop it rather than store a host command inbound.
       return;
     }
     if (gate.action === 'pass' && gate.normalizedText !== undefined) {
