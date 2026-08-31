@@ -21,6 +21,8 @@ import path from 'path';
 
 import { Effect } from 'effect';
 
+import { extForMime } from '../../attachment-naming.js';
+import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { AttachmentFetchFailed, AttachmentTooLarge, LocalFileUntrusted } from './errors.js';
 import type { InboundAttachment } from './inbound.js';
 import {
@@ -59,27 +61,14 @@ function sanitizeName(name: string): string {
   return cleaned || 'file';
 }
 
-function extFromMime(mime: string | null): string {
-  if (!mime) return '';
-  const m = mime.toLowerCase();
-  if (m.includes('ogg')) return '.ogg';
-  if (m.includes('mpeg') && m.startsWith('audio/')) return '.mp3';
-  if (m.includes('mp4') && m.startsWith('video/')) return '.mp4';
-  if (m.includes('webm')) return '.webm';
-  if (m.includes('jpeg')) return '.jpg';
-  if (m.includes('png')) return '.png';
-  if (m.includes('gif')) return '.gif';
-  if (m.includes('webp')) return '.webp';
-  return '';
-}
-
 /** Deterministic filename from the attachment's semantics + message context. */
 function destFilename(att: InboundAttachment, msgId: string, index: number, remotePath: string): string {
   const raw = att.name ?? `${att.type}_${msgId}_${index}`;
-  const base = sanitizeName(raw);
+  const base = sanitizeName(isSafeAttachmentName(raw) ? raw : `file_${msgId}_${index}`);
   const hasExt = !!path.extname(base);
   if (hasExt) return base;
-  const guess = extFromMime(att.mimeType) || path.extname(remotePath) || '';
+  const mimeExt = extForMime(att.mimeType);
+  const guess = (mimeExt ? `.${mimeExt}` : '') || path.extname(remotePath) || '';
   return `${base}${guess}`;
 }
 

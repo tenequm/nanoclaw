@@ -11,6 +11,8 @@ import type { MessageEntity } from 'grammy/types';
 
 import type { Message } from 'grammy/types';
 
+import { TIMEZONE } from '../../config.js';
+import { formatLocalTime } from '../../timezone.js';
 import {
   entitiesToMarkdown,
   extractTelegramMessageId,
@@ -90,6 +92,27 @@ describe('toInboundMessage drops content-free service messages', () => {
     expect(content.attachments).toEqual([]);
     expect(content.text).toContain('updated caption');
     expect(content.replyTo?.id).toBe('22');
+  });
+
+  it('renders forwarded-message dates in the install timezone', () => {
+    const forwardedAt = 1_700_000_000;
+    const ctx = ctxFor({
+      message_id: 23,
+      date: forwardedAt + 60,
+      text: 'forwarded body',
+      forward_origin: {
+        type: 'hidden_user',
+        sender_user_name: 'Original Sender',
+        date: forwardedAt,
+      },
+    });
+
+    const env = toInboundMessage(ctx, 'bot', 1)!;
+    const content = env.message.content as InboundContent;
+    const displayed = formatLocalTime(new Date(forwardedAt * 1000).toISOString(), TIMEZONE);
+
+    expect(content.text).toContain(`[forwarded from Original Sender (hidden profile), ${displayed}]`);
+    expect(content.text).not.toContain(' UTC]');
   });
 });
 

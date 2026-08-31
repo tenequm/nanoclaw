@@ -17,7 +17,7 @@ import {
 } from '../../db/index.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 
-import { autowireTopic } from './index.js';
+import { _clearKnownTopicsForTest, autowireTopic } from './index.js';
 
 const BASE = 'telegram:-1000000000001';
 const TOPIC = 'telegram:-1000000000001:9';
@@ -59,6 +59,7 @@ async function seedBase(withWiring = true): Promise<void> {
 }
 
 beforeEach(async () => {
+  _clearKnownTopicsForTest();
   await runMigrations(await initTestDb());
 });
 

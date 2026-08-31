@@ -639,10 +639,7 @@ function cellToFs(cell: MdTableCell): FormattedString {
 /** Render a markdown string to a Telegram FormattedString. */
 export function renderFS(markdown: string): FormattedString {
   const ast = parseMarkdown(markdown);
-  // structuredClone preserves node `position` data we need for the
-  // __bold__ vs **bold** and *X* vs _X_ source-delimiter peeks in
-  // `applyTelegramDialect`.
-  const dialected = applyTelegramDialect(structuredClone(ast), markdown);
+  const dialected = applyTelegramDialect(ast, markdown);
   const tabled = convertTables(dialected);
   return joinFs(tabled.children.map(renderNode), NL2());
 }
@@ -672,8 +669,8 @@ function splitAt(fs: FormattedString, limit: number): FormattedString[] {
     const chunkText = fs.rawText.slice(cursor, windowEnd);
 
     let cut = chunkText.lastIndexOf('\n\n');
-    if (cut === -1 || cursor + cut <= windowStart - cursor) cut = chunkText.lastIndexOf('\n');
-    if (cut === -1 || cursor + cut <= windowStart - cursor) cut = chunkText.lastIndexOf(' ');
+    if (cut === -1 || cursor + cut <= windowStart) cut = chunkText.lastIndexOf('\n');
+    if (cut === -1 || cursor + cut <= windowStart) cut = chunkText.lastIndexOf(' ');
     if (cut === -1) cut = limit;
 
     const absCut = cursor + cut;

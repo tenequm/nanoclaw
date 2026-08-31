@@ -446,9 +446,7 @@ describe('router', () => {
     const { routeInbound, setAccessGate } = await import('./router.js');
     const materialize = vi.fn(async () => {});
     setAccessGate((event) =>
-      event.message.id === 'msg-refused'
-        ? { allowed: false, reason: 'test_refusal' }
-        : { allowed: true },
+      event.message.id === 'msg-refused' ? { allowed: false, reason: 'test_refusal' } : { allowed: true },
     );
 
     await routeInbound({

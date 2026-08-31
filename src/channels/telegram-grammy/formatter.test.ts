@@ -363,6 +363,14 @@ describe('splitForBody', () => {
     }
   });
 
+  it('does not make a short later chunk for an early paragraph break', () => {
+    const md = `${'a'.repeat(4000)}\n\n${'b'.repeat(200)}\n\n${'word '.repeat(1100)}`;
+    const chunks = splitForBody(renderFS(md));
+
+    expect(chunks[0].text).toHaveLength(4000);
+    expect(chunks[1].text.length).toBeGreaterThanOrEqual(TELEGRAM_TEXT_LIMIT - 200);
+  });
+
   it('preserves entities across chunk boundaries', () => {
     // Build a message where a bold span straddles the split.
     const segment = '**bold chunk** and plain text. ';

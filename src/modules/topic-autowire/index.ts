@@ -29,18 +29,35 @@ import { getDb } from '../../db/index.js';
 import { log } from '../../log.js';
 import { registerMessageInterceptor } from '../../router.js';
 
+const MAX_MEMO_ENTRIES = 4096;
+const knownTopics = new Set<string>();
+
+function rememberKnownTopic(key: string): void {
+  if (knownTopics.has(key)) knownTopics.delete(key);
+  knownTopics.add(key);
+  if (knownTopics.size > MAX_MEMO_ENTRIES) {
+    const oldest = knownTopics.values().next().value;
+    if (oldest !== undefined) knownTopics.delete(oldest);
+  }
+}
+
 export async function autowireTopic(event: InboundEvent): Promise<boolean> {
   if (event.channelType !== 'telegram') return false;
   // The adapter owns the per-topic id grammar — reuse its parser rather than
   // keeping a second validator here (this module is telegram-only by design).
   const topicId = parseTopicId(event.platformId);
   if (topicId === undefined) return false;
-  const baseId = event.platformId.slice(0, event.platformId.lastIndexOf(':'));
-
   const instance = event.instance ?? event.channelType;
+  const memoKey = `${instance}:${event.platformId}`;
+  if (knownTopics.has(memoKey)) return false;
+
+  const baseId = event.platformId.slice(0, event.platformId.lastIndexOf(':'));
   // Central-DB access is async now; every read/write below is awaited in
   // sequence (the driver serializes statements — no Promise.all here).
-  if (await getMessagingGroupByPlatform(event.channelType, event.platformId, instance)) return false;
+  if (await getMessagingGroupByPlatform(event.channelType, event.platformId, instance)) {
+    rememberKnownTopic(memoKey);
+    return false;
+  }
 
   const base = await getMessagingGroupByPlatform(event.channelType, baseId, instance);
   if (!base || base.denied_at) return false;
@@ -79,6 +96,7 @@ export async function autowireTopic(event: InboundEvent): Promise<boolean> {
       });
     }
   });
+  rememberKnownTopic(memoKey);
   log.info('Auto-wired new forum topic from base chat', {
     platformId: event.platformId,
     baseMessagingGroupId: base.id,
@@ -86,6 +104,10 @@ export async function autowireTopic(event: InboundEvent): Promise<boolean> {
     wirings: wirings.length,
   });
   return false;
+}
+
+export function _clearKnownTopicsForTest(): void {
+  knownTopics.clear();
 }
 
 registerMessageInterceptor(autowireTopic);

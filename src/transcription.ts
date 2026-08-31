@@ -2,13 +2,14 @@ import fs from 'fs';
 
 import OpenAI from 'openai';
 
+import { envValue } from './env.js';
 import { log } from './log.js';
 
 let client: OpenAI | null = null;
 
 function getClient(): OpenAI | null {
   if (client) return client;
-  const key = process.env.OPENAI_API_KEY;
+  const key = process.env.OPENAI_API_KEY || envValue('OPENAI_API_KEY');
   if (!key) {
     log.warn('OPENAI_API_KEY not set — voice transcription disabled');
     return null;

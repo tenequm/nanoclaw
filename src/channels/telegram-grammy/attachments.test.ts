@@ -237,6 +237,30 @@ describe('materializeAll: happy path via plugin', () => {
     expect(seenDestPaths[0]?.startsWith(tmpRoot)).toBe(true);
   });
 
+  it('replaces an unsafe document name before choosing the destination', async () => {
+    const att = makeDoc('..', 'file_unsafe', 1_000);
+    const seenDestPaths: string[] = [];
+    const layers = buildTestLayers({
+      getFile: () =>
+        Promise.resolve(
+          makeHydratedFile({
+            file_id: 'file_unsafe',
+            file_path: 'documents/source.pdf',
+            file_size: 1_000,
+            download: async (destPath) => {
+              seenDestPaths.push(destPath);
+              return destPath;
+            },
+          }),
+        ),
+    });
+
+    await Effect.runPromise(Effect.provide(materializeAll([att], 'msg-unsafe', 'telegram:123'), layers));
+
+    expect(att.localPath).toBe('agent/attachments/file_msg-unsafe_0.pdf');
+    expect(path.basename(seenDestPaths[0]!)).toBe('file_msg-unsafe_0.pdf');
+  });
+
   it('local mode: copies bytes from a bind-mounted source path', async () => {
     // Simulate `--local` mode: the bot-api server has already written a
     // file under its trusted root; nanoclaw's plugin gets called with a

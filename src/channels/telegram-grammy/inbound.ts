@@ -14,6 +14,8 @@
 import type { Context } from 'grammy';
 import type { Message, MessageEntity, MessageOrigin, User } from 'grammy/types';
 
+import { TIMEZONE } from '../../config.js';
+import { formatLocalTime } from '../../timezone.js';
 import type { InboundMessage } from '../adapter.js';
 
 /**
@@ -131,8 +133,8 @@ function describeOrigin(origin: MessageOrigin): string {
  * forwarded content.
  */
 function formatForwardHeader(origin: MessageOrigin): string {
-  const origDate = new Date(origin.date * 1000).toISOString().replace('T', ' ').slice(0, 16);
-  return `[forwarded from ${describeOrigin(origin)}, ${origDate} UTC]`;
+  const origDate = formatLocalTime(new Date(origin.date * 1000).toISOString(), TIMEZONE);
+  return `[forwarded from ${describeOrigin(origin)}, ${origDate}]`;
 }
 
 export function extractReplyContext(msg: Message): ReplyContext | null {

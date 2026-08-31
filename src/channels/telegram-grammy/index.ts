@@ -14,7 +14,7 @@
  * outside of `Effect.tryPromise`. All errors typed via
  * `Schema.TaggedErrorClass`.
  */
-import { Effect } from 'effect';
+import { Effect, Semaphore } from 'effect';
 import type { Context } from 'grammy';
 
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, ConversationInfo, OutboundMessage } from '../adapter.js';
@@ -41,9 +41,10 @@ import { tryPair } from './pairing-interceptor.js';
 import { dispatchOutbound } from './outbound.js';
 import { runSupervisedPolling } from './supervise.js';
 import { buildRuntime, type AdapterRuntime } from './runtime.js';
-import { AdapterConfigService, BotService, TELEGRAM_DEFAULTS } from './services.js';
+import { AdapterConfigService, BotService, type PairingService, TELEGRAM_DEFAULTS } from './services.js';
 
 const CHANNEL_TYPE = 'telegram';
+const MAX_CONCURRENT_UPDATES = 16;
 
 function isInboundContent(value: unknown): value is InboundContent {
   return typeof value === 'object' && value !== null && 'text' in (value as Record<string, unknown>);
@@ -82,6 +83,11 @@ class TelegramGrammyAdapter implements ChannelAdapter {
         const botUserId = me.id;
 
         const { onInbound, onAction } = yield* AdapterConfigService;
+        const inboundConcurrency = Semaphore.makeUnsafe(MAX_CONCURRENT_UPDATES);
+        const chatSemaphores = new Map<
+          string,
+          { readonly semaphore: ReturnType<typeof Semaphore.makeUnsafe>; pending: number }
+        >();
 
         const handleInbound = Effect.fn('telegram-grammy.handleInbound')(function* (ctx: Context) {
           const envelope = toInboundMessage(ctx, botUsername, botUserId);
@@ -116,14 +122,28 @@ class TelegramGrammyAdapter implements ChannelAdapter {
           yield* onInbound(platformId, threadId, message);
         });
 
-        // grammY handlers are sync/void; we fork inbound handling into the
-        // runtime so errors go through the Effect error channel.
-        const dispatchFromHandler = (ctx: Context): void => {
-          void runtime.runPromise(
-            handleInbound(ctx).pipe(
-              Effect.catchCause((cause) => Effect.logError('telegram-grammy: inbound handler failed', { cause })),
-            ),
+        const dispatchUpdate = (
+          ctx: Context,
+          label: string,
+          effect: Effect.Effect<void, never, BotService | PairingService>,
+        ): void => {
+          const chatKey = ctx.chat ? String(ctx.chat.id) : `update:${ctx.update.update_id}`;
+          let entry = chatSemaphores.get(chatKey);
+          if (!entry) {
+            entry = { semaphore: Semaphore.makeUnsafe(1), pending: 0 };
+            chatSemaphores.set(chatKey, entry);
+          }
+          entry.pending++;
+
+          const handled = effect.pipe(
+            Effect.catchCause((cause) => Effect.logError(`telegram-grammy: ${label} handler failed`, { cause })),
           );
+          const running = runtime.runPromise(entry.semaphore.withPermit(inboundConcurrency.withPermit(handled)));
+          const releaseEntry = () => {
+            entry.pending--;
+            if (entry.pending === 0 && chatSemaphores.get(chatKey) === entry) chatSemaphores.delete(chatKey);
+          };
+          void running.then(releaseEntry, releaseEntry);
         };
 
         const handleCallbackQuery = Effect.fn('telegram-grammy.handleCallbackQuery')(function* (ctx: Context) {
@@ -166,19 +186,13 @@ class TelegramGrammyAdapter implements ChannelAdapter {
         });
 
         bot.on('message', (ctx) => {
-          dispatchFromHandler(ctx);
+          dispatchUpdate(ctx, 'inbound', handleInbound(ctx));
         });
         bot.on('edited_message', (ctx) => {
-          dispatchFromHandler(ctx);
+          dispatchUpdate(ctx, 'inbound', handleInbound(ctx));
         });
         bot.on('callback_query:data', (ctx) => {
-          void runtime.runPromise(
-            handleCallbackQuery(ctx).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logError('telegram-grammy: callback_query handler failed', { cause }),
-              ),
-            ),
-          );
+          dispatchUpdate(ctx, 'callback_query', handleCallbackQuery(ctx));
         });
         bot.on('message_reaction', (ctx) => {
           const upd = (ctx.update as { message_reaction?: ReactionUpdatePayload }).message_reaction;
@@ -188,13 +202,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
           // Reaction updates carry no topic id — attribute via the message
           // map recorded on inbound/outbound; fall back to the base chat id.
           const reactionPlatformId = resolveTopicPlatformId(upd.chat.id, upd.message_id) ?? envelope.platformId;
-          void runtime.runPromise(
-            onInbound(reactionPlatformId, envelope.threadId, envelope.message).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logError('telegram-grammy: message_reaction handler failed', { cause }),
-              ),
-            ),
-          );
+          dispatchUpdate(ctx, 'message_reaction', onInbound(reactionPlatformId, envelope.threadId, envelope.message));
         });
 
         // Fork supervised polling as a detached fiber — lives for the
