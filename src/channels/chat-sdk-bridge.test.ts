@@ -488,3 +488,53 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     expect(msg.markdown).toBe('plain hello');
   });
 });
+
+describe('createChatSdkBridge — typing and reaction primitives', () => {
+  function typingCapture() {
+    const typing: Array<{ threadId: string; status?: string }> = [];
+    const reactions: Array<{ op: string; threadId: string; messageId: string; emoji: string }> = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        startTyping: async (threadId: string, status?: string) => {
+          typing.push({ threadId, status });
+        },
+        addReaction: async (threadId: string, messageId: string, emoji: string) => {
+          reactions.push({ op: 'add', threadId, messageId, emoji });
+        },
+        removeReaction: async (threadId: string, messageId: string, emoji: string) => {
+          reactions.push({ op: 'remove', threadId, messageId, emoji });
+        },
+      }),
+      supportsThreads: true,
+    });
+    return { bridge, typing, reactions };
+  }
+
+  it('forwards the status text through to the adapter', async () => {
+    const { bridge, typing } = typingCapture();
+    await bridge.setTyping!('slack:C1', 'slack:C1:171', 'is thinking...');
+    expect(typing).toEqual([{ threadId: 'slack:C1:171', status: 'is thinking...' }]);
+  });
+
+  it('addresses the channel itself when the session has no thread', async () => {
+    const { bridge, typing } = typingCapture();
+    await bridge.setTyping!('slack:D1', null);
+    expect(typing).toEqual([{ threadId: 'slack:D1', status: undefined }]);
+  });
+
+  it('clears with the empty status string the Chat SDK reads as "no status"', async () => {
+    const { bridge, typing } = typingCapture();
+    await bridge.clearTyping!('slack:C1', 'slack:C1:171');
+    expect(typing).toEqual([{ threadId: 'slack:C1:171', status: '' }]);
+  });
+
+  it('passes reactions straight through, keyed on the channel not the thread', async () => {
+    const { bridge, reactions } = typingCapture();
+    await bridge.addReaction!('slack:D1', '1788.001', 'eyes');
+    await bridge.removeReaction!('slack:D1', '1788.001', 'eyes');
+    expect(reactions).toEqual([
+      { op: 'add', threadId: 'slack:D1', messageId: '1788.001', emoji: 'eyes' },
+      { op: 'remove', threadId: 'slack:D1', messageId: '1788.001', emoji: 'eyes' },
+    ]);
+  });
+});

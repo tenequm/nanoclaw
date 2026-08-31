@@ -949,9 +949,26 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
     },
 
-    async setTyping(platformId: string, threadId: string | null) {
+    async setTyping(platformId: string, threadId: string | null, status?: string) {
       const tid = threadId ?? platformId;
-      await adapter.startTyping(tid);
+      await adapter.startTyping(tid, status);
+    },
+
+    /** Generic clear: an empty status string is the Chat SDK's documented
+     *  "no status" value. Platforms that need a different call (Slack sends
+     *  an empty loading_messages array through this path) override it on the
+     *  returned bridge. */
+    async clearTyping(platformId: string, threadId: string | null) {
+      const tid = threadId ?? platformId;
+      await adapter.startTyping(tid, '');
+    },
+
+    async addReaction(platformId: string, messageId: string, emoji: string) {
+      await adapter.addReaction(platformId, messageId, emoji);
+    },
+
+    async removeReaction(platformId: string, messageId: string, emoji: string) {
+      await adapter.removeReaction(platformId, messageId, emoji);
     },
 
     async teardown() {

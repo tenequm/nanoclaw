@@ -190,6 +190,19 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
       return null;
     }
   };
+  // Slack's assistant status is thread-scoped: startTyping no-ops without a
+  // threadTs, so a shared-session chat never gets one and falls back to the
+  // reaction ack.
+  bridge.typingRequiresThread = true;
+  // Clear through setAssistantStatus rather than the bridge's generic
+  // startTyping(''), which would also send loading_messages: [''] — an empty
+  // rotation entry Slack has no documented handling for. setAssistantStatus
+  // omits the field entirely, leaving the documented empty-status clear.
+  bridge.clearTyping = async (platformId: string, threadId: string | null) => {
+    const [, channel, threadTs] = (threadId ?? platformId).split(':');
+    if (!(channel && threadTs)) return; // nothing was ever painted
+    await slackAdapter.setAssistantStatus(channel, threadTs, '');
+  };
   // Conversation classification closes over THIS identity's adapter, so
   // every instance (default or named) resolves through its own token.
   // ChannelAdapter does not declare resolveConversation yet — the extension

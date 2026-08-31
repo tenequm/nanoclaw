@@ -14,7 +14,7 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
 });
 
-import { setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';
+import { pauseTypingRefreshAfterDelivery, setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';
 
 type Call = { channelType: string; platformId: string; threadId: string | null; instance?: string };
 
@@ -119,5 +119,161 @@ describe('startTypingRefresh — instance forwarding', () => {
         instance: 'telegram',
       });
     }
+  });
+});
+
+/**
+ * The two renderings of the "agent is working" signal, and the teardown
+ * that takes each of them down.
+ *
+ * Slack's assistant status is thread-scoped and persistent: it paints only
+ * inside a thread and clears only when the app next posts. So a turn that
+ * ends without a user-facing reply — mention-sticky wakes the agent on
+ * plenty of messages it reasonably won't answer — leaves a stale indicator
+ * until the platform's own two-minute timeout, and a threadless (shared-
+ * session) chat can never show one at all. Hence the explicit clear on
+ * every teardown path, and the reaction-ack fallback.
+ */
+type Reaction = { op: 'add' | 'remove'; platformId: string; messageId: string; emoji: string; instance?: string };
+
+function signalAdapter(opts: { requiresThread?: boolean } = {}) {
+  const statuses: Array<string | undefined> = [];
+  const clears: Array<{ platformId: string; threadId: string | null }> = [];
+  const reactions: Reaction[] = [];
+  setTypingAdapter({
+    async setTyping(_channelType, _platformId, _threadId, _instance, status) {
+      statuses.push(status);
+    },
+    async clearTyping(_channelType, platformId, threadId) {
+      clears.push({ platformId, threadId });
+    },
+    async addReaction(_channelType, platformId, messageId, emoji, instance) {
+      reactions.push({ op: 'add', platformId, messageId, emoji, instance });
+    },
+    async removeReaction(_channelType, platformId, messageId, emoji, instance) {
+      reactions.push({ op: 'remove', platformId, messageId, emoji, instance });
+    },
+    typingRequiresThread: () => opts.requiresThread === true,
+  });
+  return { statuses, clears, reactions };
+}
+
+describe('status rendering', () => {
+  it('paints a status string rather than the adapter default', async () => {
+    const { statuses } = signalAdapter();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statuses).toEqual(['is thinking...']);
+  });
+
+  it('clears the status when the turn ends with no reply', async () => {
+    const { clears } = signalAdapter();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
+
+    // No heartbeat file exists, so once the 15s grace expires the agent
+    // reads as idle. Nothing was ever delivered, so the platform's own
+    // post-clears-status rule never fires: this teardown is the only
+    // thing that can take the indicator down.
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(clears).toEqual([{ platformId: 'slack:C1', threadId: 'slack:C1:1' }]);
+  });
+
+  it('clears the status when the refresher is stopped externally', async () => {
+    const { clears } = signalAdapter();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    stopTypingRefresh('sess-1');
+    expect(clears).toEqual([{ platformId: 'slack:C1', threadId: 'slack:C1:1' }]);
+  });
+
+  it('does not repaint from the grace window after a delivery (#3400 leg 1)', async () => {
+    const { statuses } = signalAdapter();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    // A follow-up resets grace just before the first reply lands.
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-2');
+    await vi.advanceTimersByTimeAsync(0);
+    pauseTypingRefreshAfterDelivery('sess-1');
+    statuses.length = 0;
+
+    // Past the 10s pause but still inside the reset 15s grace. With no
+    // heartbeat, the agent is idle and nothing should repaint.
+    await vi.advanceTimersByTimeAsync(11_500);
+    expect(statuses).toEqual([]);
+  });
+});
+
+describe('reaction-ack rendering (threadless chat on a thread-only platform)', () => {
+  it('acks the triggering message instead of painting a status', async () => {
+    const { statuses, reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(statuses).toEqual([]);
+    expect(reactions).toEqual([
+      { op: 'add', platformId: 'slack:D1', messageId: 'msg-1', emoji: 'eyes', instance: 'slack-emma' },
+    ]);
+  });
+
+  it('acks once, not on every refresh tick', async () => {
+    const { reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+
+    // Several ticks inside the grace window: a reaction does not expire,
+    // so re-adding it every 4s would be pure API noise.
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(reactions.filter((r) => r.op === 'add')).toHaveLength(1);
+  });
+
+  it('removes the ack when the reply is delivered', async () => {
+    const { reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    pauseTypingRefreshAfterDelivery('sess-1');
+    expect(reactions[reactions.length - 1]).toEqual({
+      op: 'remove',
+      platformId: 'slack:D1',
+      messageId: 'msg-1',
+      emoji: 'eyes',
+      instance: 'slack-emma',
+    });
+    // Already removed — going idle later must not fire a second remove.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(reactions.filter((r) => r.op === 'remove')).toHaveLength(1);
+  });
+
+  it('removes the ack when the turn ends with no reply', async () => {
+    const { reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(reactions.map((r) => r.op)).toEqual(['add', 'remove']);
+  });
+
+  it('moves the ack to the message that re-triggered the session', async () => {
+    const { reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-2');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toEqual([
+      { op: 'add', platformId: 'slack:D1', messageId: 'msg-1', emoji: 'eyes', instance: 'slack-emma' },
+      { op: 'remove', platformId: 'slack:D1', messageId: 'msg-1', emoji: 'eyes', instance: 'slack-emma' },
+      { op: 'add', platformId: 'slack:D1', messageId: 'msg-2', emoji: 'eyes', instance: 'slack-emma' },
+    ]);
+  });
+
+  it('falls back to the status rendering once the chat has a thread', async () => {
+    const { statuses, reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toEqual([]);
+    expect(statuses).toEqual(['is thinking...']);
   });
 });

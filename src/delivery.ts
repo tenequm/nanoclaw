@@ -109,6 +109,22 @@ export interface ChannelDeliveryAdapter {
     status?: string,
     statusKind?: 'auto' | 'agent',
   ): Promise<void>;
+  clearTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
+  addReaction?(
+    channelType: string,
+    platformId: string,
+    messageId: string,
+    emoji: string,
+    instance?: string,
+  ): Promise<void>;
+  removeReaction?(
+    channelType: string,
+    platformId: string,
+    messageId: string,
+    emoji: string,
+    instance?: string,
+  ): Promise<void>;
+  typingRequiresThread?(channelType: string, instance?: string): boolean;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;

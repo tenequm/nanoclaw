@@ -248,6 +248,31 @@ export interface ChannelAdapter {
     status?: string,
     statusKind?: 'auto' | 'agent',
   ): Promise<void>;
+
+  /**
+   * Clear an indicator painted by setTyping.
+   *
+   * Only platforms whose indicator persists implement this. Telegram's chat
+   * action expires on its own after ~5s, so "stop refreshing" and "indicator
+   * gone" are the same event and there is nothing to clear. Slack's assistant
+   * status is the opposite: it clears only when the app next posts to the
+   * thread (or after a two-minute timeout), so a turn that ends without a
+   * user-facing reply leaves a stale "is thinking..." painted.
+   */
+  clearTyping?(platformId: string, threadId: string | null): Promise<void>;
+
+  /**
+   * True when the platform can only paint an indicator inside a thread, so a
+   * threadless (shared-session) chat gets nothing at all. Signals the typing
+   * module to fall back to a reaction ack on the triggering message.
+   */
+  typingRequiresThread?: boolean;
+
+  /** Reaction primitives, used for the threadless activity ack. Present only
+   *  on adapters whose platform has reactions. */
+  addReaction?(platformId: string, messageId: string, emoji: string): Promise<void>;
+  removeReaction?(platformId: string, messageId: string, emoji: string): Promise<void>;
+
   syncConversations?(): Promise<ConversationInfo[]>;
   /** Resolve conversation type and human-readable metadata for host UI. */
   resolveConversation?(platformId: string): Promise<ResolvedConversation | null>;
