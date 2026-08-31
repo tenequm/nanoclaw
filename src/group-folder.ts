@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
+import { getAgentGroup } from './db/agent-groups.js';
+import { getMessagingGroupAgents, getMessagingGroupByPlatform } from './db/messaging-groups.js';
 
 /**
  * Aligned with the runtime label grammar (`labelValueLegal` in
@@ -71,4 +73,21 @@ export function groupFolderExistsOnDisk(folder: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Resolve the on-disk group folder for an inbound platform id on a given
+ * channel type, by looking up the messaging_group → primary agent_group
+ * wiring. Returns null when the platform id is unknown or the messaging
+ * group has no agents wired yet. Shared by channel adapters that need to
+ * stream attachment bytes to the agent's folder.
+ */
+export async function resolveGroupFolderForPlatformId(channelType: string, platformId: string): Promise<string | null> {
+  const mg = await getMessagingGroupByPlatform(channelType, platformId);
+  if (!mg) return null;
+  const wirings = await getMessagingGroupAgents(mg.id);
+  if (wirings.length === 0) return null;
+  const primary = wirings[0];
+  const ag = await getAgentGroup(primary.agent_group_id);
+  return ag?.folder ?? null;
 }
