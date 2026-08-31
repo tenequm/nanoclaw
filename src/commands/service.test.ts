@@ -1,5 +1,4 @@
 import fs from 'fs';
-import path from 'path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // --- Mocks: container primitives must never spawn/kill real containers ---
@@ -24,7 +23,7 @@ vi.mock('../container-restart.js', () => ({
     mockRestartAgentGroupContainers(args[0] as string, args[1] as string, args[2] as string | undefined),
 }));
 
-// Route settings.json reads/writes (auto-compact-window) into the test dir.
+// Isolate transcript reads (sessionsBaseDir) into the test dir.
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-commands' };
@@ -59,16 +58,6 @@ const TEST_DIR = '/tmp/nanoclaw-test-commands';
 
 function now() {
   return new Date().toISOString();
-}
-
-function settingsPath(agentGroupId: string): string {
-  return path.join(TEST_DIR, 'v2-sessions', agentGroupId, '.claude-shared', 'settings.json');
-}
-
-function writeSettings(agentGroupId: string, content: string): void {
-  const p = settingsPath(agentGroupId);
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, content);
 }
 
 async function makeUser(id: string) {
@@ -200,9 +189,9 @@ describe('getStatus', () => {
     await updateContainerConfigScalars('ag-1', {
       model: 'claude-opus-5',
       effort: 'high',
+      auto_compact_window: 400000,
       provider: 'claude',
     });
-    writeSettings('ag-1', JSON.stringify({ autoCompactWindow: 400000 }));
     await makeSession('s-active', 'ag-1', 'active');
     await makeSession('s-closed', 'ag-1', 'closed');
     mockIsContainerRunning.mockImplementation((id) => id === 's-active');
@@ -224,6 +213,14 @@ describe('getStatus', () => {
     });
     // containerRunning was removed from StatusView.
     expect('containerRunning' in res.view).toBe(false);
+  });
+
+  it('falls back to the 165k provider default for contextWindow when unset', async () => {
+    await makeAgentGroup('ag-1', 'Emma');
+    const res = await getStatus('ag-1');
+    if (!res.ok) throw new Error('expected ok');
+    expect(res.view.autoCompactWindow).toBeNull();
+    expect(res.view.contextWindow).toBe(165000);
   });
 
   it('reflects the chat wiring activation when a chat context is supplied', async () => {
@@ -272,14 +269,6 @@ describe('getConfigView', () => {
     expect(res.view.effort).toBe('medium');
     expect(res.view.effortOptions).toContain('xhigh');
     expect(res.view.compactWindowPresets).toContain(165000);
-  });
-
-  it('reads autoCompactWindow from the group settings.json', async () => {
-    await makeAgentGroup('ag-1', 'Emma');
-    writeSettings('ag-1', JSON.stringify({ autoCompactWindow: 165000 }));
-    const res = await getConfigView('ag-1');
-    if (!res.ok) throw new Error('expected ok');
-    expect(res.view.autoCompactWindow).toBe(165000);
   });
 });
 
@@ -414,33 +403,15 @@ describe('setConfigValue', () => {
     expect(bad.detail?.allowed).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
   });
 
-  it('validates auto-compact-window and writes it into settings.json', async () => {
+  it('validates auto-compact-window as a positive integer (ncl rule)', async () => {
     const good = await setConfigValue('ag-1', 'auto-compact-window', '600000', OWNER);
     if (!good.ok) throw new Error('expected ok');
     expect(good.view.current).toBe(600000);
-    const parsed = JSON.parse(fs.readFileSync(settingsPath('ag-1'), 'utf-8')) as { autoCompactWindow?: number };
-    expect(parsed.autoCompactWindow).toBe(600000);
+    expect((await getContainerConfig('ag-1'))?.auto_compact_window).toBe(600000);
 
     expect((await setConfigValue('ag-1', 'auto-compact-window', '0', OWNER)).ok).toBe(false);
     expect((await setConfigValue('ag-1', 'auto-compact-window', '1.5', OWNER)).ok).toBe(false);
     expect((await setConfigValue('ag-1', 'auto-compact-window', 'lots', OWNER)).ok).toBe(false);
-  });
-
-  it('preserves unrelated settings.json keys on a compact-window write', async () => {
-    writeSettings('ag-1', JSON.stringify({ model: 'claude-opus-5', hooks: { PreToolUse: [] } }));
-    const res = await setConfigValue('ag-1', 'auto-compact-window', '165000', OWNER);
-    if (!res.ok) throw new Error('expected ok');
-    const parsed = JSON.parse(fs.readFileSync(settingsPath('ag-1'), 'utf-8')) as Record<string, unknown>;
-    expect(parsed).toEqual({ model: 'claude-opus-5', hooks: { PreToolUse: [] }, autoCompactWindow: 165000 });
-  });
-
-  it('refuses to clobber an existing-but-unparseable settings.json', async () => {
-    writeSettings('ag-1', 'not json{');
-    const res = await setConfigValue('ag-1', 'auto-compact-window', '165000', OWNER);
-    expect(res.ok).toBe(false);
-    if (res.ok) throw new Error('expected failure');
-    expect(res.reason).toBe('invalid-value');
-    expect(fs.readFileSync(settingsPath('ag-1'), 'utf-8')).toBe('not json{');
   });
 
   it('validates max-messages-per-prompt as a positive integer', async () => {

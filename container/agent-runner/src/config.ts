@@ -20,6 +20,7 @@ export interface RunnerConfig {
   mcpServers: Record<string, McpServerConfig>;
   model?: string;
   effort?: string;
+  autoCompactWindow?: number;
   /** API fast serving tier (host-configured; see the host's container-config). */
   fastMode?: boolean;
 }
@@ -51,6 +52,7 @@ export function loadConfig(): RunnerConfig {
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,
+    autoCompactWindow: (raw.autoCompactWindow as number) || undefined,
     fastMode: raw.fastMode === true || undefined,
   };
 

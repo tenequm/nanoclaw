@@ -103,6 +103,13 @@ export type EffortLevel = (typeof EFFORT_LEVELS)[number];
  */
 export const COMPACT_WINDOW_PRESETS = [165000, 200000, 400000, 600000, 800000] as const;
 
+/**
+ * The agent-runner's baked-in compaction threshold (claude provider,
+ * CLAUDE_CODE_AUTO_COMPACT_WINDOW fallback). Display-only mirror so the
+ * status card can show the effective window when no per-agent value is set.
+ */
+export const DEFAULT_AUTO_COMPACT_WINDOW = 165000;
+
 // --- Activation (engage) config, written to the wiring row ---
 
 /** The three engage modes settable from chat (subset == full EngageMode set). */

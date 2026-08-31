@@ -9,6 +9,7 @@ const SCALAR_COLUMNS = new Set([
   'image_tag',
   'assistant_name',
   'max_messages_per_prompt',
+  'auto_compact_window',
   'cli_scope',
   'timezone',
 ]);
@@ -27,11 +28,11 @@ export async function createContainerConfig(config: ContainerConfigRow): Promise
   await getDb().run(
     `INSERT INTO container_configs (
         agent_group_id, provider, model, effort, image_tag, assistant_name,
-        max_messages_per_prompt, skills, mcp_servers, packages_apt, packages_npm,
+        max_messages_per_prompt, auto_compact_window, skills, mcp_servers, packages_apt, packages_npm,
         additional_mounts, cli_scope, timezone, updated_at
       ) VALUES (
         @agent_group_id, @provider, @model, @effort, @image_tag, @assistant_name,
-        @max_messages_per_prompt, @skills, @mcp_servers, @packages_apt, @packages_npm,
+        @max_messages_per_prompt, @auto_compact_window, @skills, @mcp_servers, @packages_apt, @packages_npm,
         @additional_mounts, @cli_scope, @timezone, @updated_at
       )`,
     config,
@@ -84,6 +85,7 @@ export async function updateContainerConfigScalars(
       | 'image_tag'
       | 'assistant_name'
       | 'max_messages_per_prompt'
+      | 'auto_compact_window'
       | 'cli_scope'
       | 'timezone'
     >

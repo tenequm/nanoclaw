@@ -32,8 +32,7 @@ The `/status` card is assembled from three sources, all read-only and best-effor
 
 | Segment | Source |
 |---------|--------|
-| Model + effort, provider, cli_scope, max messages | `container_configs` row for the agent group |
-| Compact window | `autoCompactWindow` in the group's `data/v2-sessions/<agent_group_id>/.claude-shared/settings.json` (the per-agent Claude settings file) |
+| Model + effort, compact window, provider, cli_scope, max messages | `container_configs` row for the agent group; an unset compact window renders the provider's 165k default with a `default` marker |
 | Activation (`mention, known senders`, `pattern /re/`, `always on`) | the wiring row for this (messaging group, agent) pair: `engage_mode` + `engage_pattern` + `sender_scope` |
 | Context `113k / 400k (28%)`, Session `46k out over 214 turns` | the session's SDK transcript (`.claude-shared/projects/*/<sdk-id>.jsonl`), mapped via the session's `outbound.db` `session_state` (`continuation:<provider>`, legacy `sdk_session_id`), newest `.jsonl` as fallback |
 | `Sessions: N`, `Queue: N`, `Tasks: N` | active sessions for the group; `Queue` = undelivered due inbound messages for the resolved session (omitted when 0); `Tasks` = live (pending/paused) task series (omitted when 0) |
@@ -116,7 +115,7 @@ the two per-chat activation fields. Fields writable via chat:
 |-------|-----------------|---------|
 | `model` | A catalog alias (`sonnet`, `opus`, `fable`) or a raw model id | next reply (container config) |
 | `effort` | `low`, `medium`, `high`, `xhigh`, `max` | next reply (container config) |
-| `auto-compact-window` | A positive integer token count (presets: 165k, 200k, 400k, 600k, 800k) | next reply (settings.json) |
+| `auto-compact-window` | A positive integer token count (presets: 165k, 200k, 400k, 600k, 800k) | next reply (container config) |
 | `max-messages-per-prompt` | A positive integer | next reply (container config) |
 | `activation` | `mention`, `mention-sticky`, `pattern` | immediately (wiring row) |
 | `pattern` | A regular expression (switches the mode to `pattern` and sets the source) | immediately (wiring row) |
@@ -129,13 +128,14 @@ pattern <regex>`. The regex is validated with `new RegExp(...)`; an uncompilable
 value is rejected with the compile error. The `.` pattern is the "match every
 message" sentinel and renders as `always on`.
 
-`auto-compact-window` is the one field that does not live in `container_configs`:
-it reads and writes `autoCompactWindow` in the group's
-`data/v2-sessions/<agent_group_id>/.claude-shared/settings.json`, the per-agent
-Claude settings file the SDK loads natively (see "Per-agent Claude config" in
-CLAUDE.md). The write preserves every other key in that file, and an
-existing-but-unparseable settings.json is refused rather than clobbered, since
-it can hold hooks and env config the install depends on.
+`auto-compact-window` is a `container_configs` column threaded into the
+container env at spawn: `auto_compact_window` -> materialized `container.json`
+-> agent-runner -> `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in the Claude provider
+env. It deliberately does NOT use the per-agent `settings.json`
+`autoCompactWindow` key: env beats settings in the SDK's resolution chain, so
+a settings.json value is shadowed by the provider's env pin (the 165k
+default). NULL means that 165k default applies; the status card then shows the
+window with a `default` marker.
 
 The remaining container-config fields are ncl-only and are never reachable from
 chat: `cli_scope`, `provider`, `image_tag`, `mounts`, `packages`,
@@ -175,8 +175,7 @@ The design is a model/view split at the channel-adapter seam.
 
 - **`HostCommandService` (`src/commands/`)** owns ALL semantics: the command
   registry, model catalog, validation, target resolution, authorization, and the
-  domain reads/writes against `container_configs` (and, for the compact
-  window, the per-agent `settings.json`). It is channel-agnostic and
+  domain reads/writes against `container_configs`. It is channel-agnostic and
   returns view-model DATA, never formatted text. `types.ts` defines the view
   models and pure helpers; `service.ts` implements the reads/writes. Popup-grant
   computation is telegram-specific and lives in the adapter (see below).

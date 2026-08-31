@@ -16,18 +16,17 @@
  * getModelPicker, getConfigView, resolveTargets) do not check auth; callers
  * gate member-runnable reads.
  *
- * The compact window is NOT a container_configs column on this tree: upstream
- * moved it to the group's Claude settings file
- * (data/v2-sessions/<agent_group_id>/.claude-shared/settings.json,
- * `autoCompactWindow` - see "Per-agent Claude config" in CLAUDE.md). Reads and
- * writes for the 'auto-compact-window' field go there; the lazy-respawn apply
- * still holds because the SDK loads settings at session start.
+ * The compact window is a container_configs column (auto_compact_window),
+ * threaded into the container env as CLAUDE_CODE_AUTO_COMPACT_WINDOW at spawn
+ * (container.json -> agent-runner -> claude provider). settings.json is NOT
+ * used for it: env beats settings in the SDK's resolution chain, so a
+ * settings.json value would be shadowed. NULL = the provider's 165k default
+ * (DEFAULT_AUTO_COMPACT_WINDOW mirrors it for display).
  *
  * Typography rule for this module: ASCII only in user-facing strings and
  * comments. Emoji are allowed as UI glyphs (none used here).
  */
 import fs from 'fs';
-import path from 'path';
 
 import { restartAgentGroupContainers } from '../container-restart.js';
 import { isContainerRunning, killContainer } from '../container-runner.js';
@@ -48,7 +47,6 @@ import { log } from '../log.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { countDueMessages, openInboundDb } from '../mailbox/sqlite/session-db.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
-import { sessionsBaseDir } from '../session-manager.js';
 import type { ContainerConfigRow, EngageMode, Session } from '../types.js';
 import { readTranscriptStats } from './transcript.js';
 import {
@@ -60,6 +58,7 @@ import {
   MODEL_CATALOG,
   EFFORT_LEVELS,
   COMPACT_WINDOW_PRESETS,
+  DEFAULT_AUTO_COMPACT_WINDOW,
   type ActivationChangeView,
   type ActivationView,
   type CommandFailure,
@@ -82,42 +81,6 @@ const DEFAULT_CLI_SCOPE = 'group';
 
 function fail(reason: CommandFailure['reason'], detail?: CommandFailure['detail']): CommandFailure {
   return { ok: false, reason, detail };
-}
-
-// --- Compact window (per-agent settings.json) ---
-
-function settingsJsonPath(agentGroupId: string): string {
-  return path.join(sessionsBaseDir(), agentGroupId, '.claude-shared', 'settings.json');
-}
-
-/** The group's autoCompactWindow from settings.json, or null when unset/unreadable. */
-function readAutoCompactWindow(agentGroupId: string): number | null {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(settingsJsonPath(agentGroupId), 'utf8')) as {
-      autoCompactWindow?: unknown;
-    };
-    const n = parsed.autoCompactWindow;
-    return typeof n === 'number' && Number.isInteger(n) && n > 0 ? n : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Write autoCompactWindow into the group's settings.json, preserving every
- * other key. Throws when an EXISTING file cannot be parsed: clobbering a
- * malformed-but-present settings file would destroy hooks/env config the
- * install depends on, so that case must surface as a command failure.
- */
-function writeAutoCompactWindow(agentGroupId: string, tokens: number): void {
-  const p = settingsJsonPath(agentGroupId);
-  let parsed: Record<string, unknown> = {};
-  if (fs.existsSync(p)) {
-    parsed = JSON.parse(fs.readFileSync(p, 'utf8')) as Record<string, unknown>;
-  }
-  parsed.autoCompactWindow = tokens;
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, `${JSON.stringify(parsed, null, 2)}\n`);
 }
 
 /**
@@ -271,7 +234,7 @@ export async function getStatus(agentGroupId: string, chatCtx?: StatusChatContex
 
   const cfg = await getContainerConfig(agentGroupId);
   const activeSessions = (await getSessionsByAgentGroup(agentGroupId)).filter((s) => s.status === 'active');
-  const autoCompactWindow = readAutoCompactWindow(agentGroupId);
+  const autoCompactWindow = cfg?.auto_compact_window ?? null;
 
   let activation: ActivationView | null = null;
   let queueDepth: number | null = null;
@@ -298,7 +261,7 @@ export async function getStatus(agentGroupId: string, chatCtx?: StatusChatContex
     configUpdatedAt: cfg?.updated_at ?? null,
     activation,
     contextTokens: stats?.contextTokens ?? null,
-    contextWindow: autoCompactWindow,
+    contextWindow: autoCompactWindow ?? DEFAULT_AUTO_COMPACT_WINDOW,
     sessionOutputTokens: stats?.outputTokens ?? null,
     sessionTurns: stats?.turns ?? null,
     queueDepth,
@@ -342,7 +305,7 @@ export async function getConfigView(
       agentGroupId,
       model: describeModel(cfg?.model ?? null),
       effort: cfg?.effort ?? null,
-      autoCompactWindow: readAutoCompactWindow(agentGroupId),
+      autoCompactWindow: cfg?.auto_compact_window ?? null,
       maxMessagesPerPrompt: cfg?.max_messages_per_prompt ?? null,
       provider: cfg?.provider ?? null,
       cliScope: cfg?.cli_scope ?? DEFAULT_CLI_SCOPE,
@@ -438,12 +401,13 @@ export async function setConfigValue(
 
   const before = await getContainerConfig(agentGroupId);
 
-  const updates: Partial<Pick<ContainerConfigRow, 'model' | 'effort' | 'max_messages_per_prompt'>> = {};
+  const updates: Partial<
+    Pick<ContainerConfigRow, 'model' | 'effort' | 'auto_compact_window' | 'max_messages_per_prompt'>
+  > = {};
   let previous: string | number | null;
   let current: string | number;
   let previousLabel: string | null | undefined;
   let currentLabel: string | null | undefined;
-  let settingsWrite: number | null = null;
 
   switch (field) {
     case 'model': {
@@ -473,9 +437,9 @@ export async function setConfigValue(
       if (parsed === null) {
         return fail('invalid-value', { field, value, allowed: COMPACT_WINDOW_PRESETS });
       }
-      previous = readAutoCompactWindow(agentGroupId);
+      updates.auto_compact_window = parsed;
+      previous = before?.auto_compact_window ?? null;
       current = parsed;
-      settingsWrite = parsed;
       break;
     }
     case 'max-messages-per-prompt': {
@@ -492,21 +456,8 @@ export async function setConfigValue(
       return fail('unknown-field', { field: String(field) });
   }
 
-  if (settingsWrite !== null) {
-    try {
-      writeAutoCompactWindow(agentGroupId, settingsWrite);
-    } catch (err) {
-      // An existing-but-unparseable settings.json must never be clobbered.
-      return fail('invalid-value', {
-        field,
-        value,
-        message: `settings.json unreadable, fix it by hand first (${String(err)})`,
-      });
-    }
-  } else {
-    await ensureContainerConfig(agentGroupId);
-    await updateContainerConfigScalars(agentGroupId, updates);
-  }
+  await ensureContainerConfig(agentGroupId);
+  await updateContainerConfigScalars(agentGroupId, updates);
   log.info('Config changed via chat command', { agentGroupId, actorUserId, field, from: previous, to: current });
 
   // Same no-op guard as setModel: re-picking the value already stored must not

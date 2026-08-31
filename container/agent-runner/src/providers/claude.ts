@@ -498,7 +498,11 @@ export class ClaudeProvider implements AgentProvider {
     this.fastMode = options.fastMode;
     this.env = {
       ...(options.env ?? {}),
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+      // Per-agent value from container.json (auto_compact_window in the
+      // central DB) wins; otherwise the baked-in/env default applies.
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: options.autoCompactWindow
+        ? String(options.autoCompactWindow)
+        : CLAUDE_CODE_AUTO_COMPACT_WINDOW,
       CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
     };
   }

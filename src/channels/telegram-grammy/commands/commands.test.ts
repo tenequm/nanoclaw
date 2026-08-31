@@ -125,6 +125,30 @@ describe('render text builders', () => {
     expect(card).not.toMatch(/[\u2013\u2014\u2026\u2192\u2190\u2022\u00a0]/);
   });
 
+  it('marks the window as default when no per-agent value is set', () => {
+    const card = statusCard({
+      agentName: 'Emma',
+      agentGroupId: 'ag-1',
+      model: 'claude-fable-5',
+      modelLabel: 'Fable 5',
+      effort: 'high',
+      autoCompactWindow: null,
+      maxMessagesPerPrompt: null,
+      provider: 'claude',
+      cliScope: 'group',
+      sessionCount: 1,
+      configUpdatedAt: null,
+      activation: null,
+      contextTokens: 57000,
+      contextWindow: 165000,
+      sessionOutputTokens: 3700,
+      sessionTurns: 13,
+      queueDepth: 0,
+      taskCount: 0,
+    });
+    expect(card).toContain('**Context:** 57k / 165k (35%, default)');
+  });
+
   it('omits empty segments and shows non-default extras', () => {
     const card = statusCard({
       agentName: 'Stan',

@@ -94,6 +94,12 @@ export interface ProviderOptions {
    */
   effort?: string;
   /**
+   * Auto-compact window in tokens. Providers that support it override their
+   * compaction threshold with this value. If omitted, the provider default
+   * applies.
+   */
+  autoCompactWindow?: number;
+  /**
    * API fast serving tier: faster output at a higher per-token price. Passed
    * through to the underlying SDK. If omitted, the SDK default is used.
    */

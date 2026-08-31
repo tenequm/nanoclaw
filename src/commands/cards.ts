@@ -82,8 +82,10 @@ export function statusCardLines(v: StatusView, fmt: CardFmt): string[] {
   if (v.contextTokens != null) {
     if (v.contextWindow) {
       const pct = Math.round((v.contextTokens / v.contextWindow) * 100);
+      // No per-agent window set -> the provider's default is in effect; say so.
+      const marker = v.autoCompactWindow == null ? ', default' : '';
       lines.push(
-        `${fmt.bold('Context:')} ${formatTokens(v.contextTokens)} / ${formatTokens(v.contextWindow)} (${pct}%)`,
+        `${fmt.bold('Context:')} ${formatTokens(v.contextTokens)} / ${formatTokens(v.contextWindow)} (${pct}%${marker})`,
       );
     } else {
       lines.push(`${fmt.bold('Context:')} ${formatTokens(v.contextTokens)}`);

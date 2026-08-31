@@ -247,6 +247,8 @@ export interface ContainerConfig {
   assistantName?: string;
   agentGroupId?: string;
   maxMessagesPerPrompt?: number;
+  /** Auto-compact window in tokens; absent = the provider's 165k default. */
+  autoCompactWindow?: number;
   model?: string;
   effort?: string;
   /** API fast serving tier for this container; absent = the provider default. */
@@ -370,6 +372,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
+    autoCompactWindow: row.auto_compact_window ?? undefined,
     // The group's own model wins; NANOCLAW_DEFAULT_MODEL fills in for groups
     // that have none. Both absent leaves the field out and the SDK decides.
     model: row.model ?? (DEFAULT_MODEL || undefined),
