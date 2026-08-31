@@ -84,18 +84,22 @@ Also excise from the island: `TELEGRAM_NO_SEEN_CHATS` / seen-reaction remnants, 
 - `package.json` deps: `grammy 1.44.0`, `@grammyjs/auto-retry 2.0.2`, `@grammyjs/files 1.2.0`,
   `@grammyjs/parse-mode 2.3.0`, `effect 4.0.0-beta.52`, `markdown-it ^14.1.1`,
   `mediabunny 1.40.1`, `openai ^6.34.0`; dev `@types/markdown-it ^14.1.2`.
-  (`@grammyjs/commands`, `@grammyjs/menu` dropped with the chat commands.)
+  (`@grammyjs/commands` 1.3.2, `@grammyjs/menu` 1.3.1 re-added with the restored chat commands.)
 
-## A3. [DROPPED] Host chat commands
-`src/commands/**`, `src/db/telegram-command-scopes.ts`, migration
-`023-telegram-command-scopes`, `command-gate.ts` `classifyHostCommand`, router hook,
-`interactive/index.ts` `hcmd-` skip, `docs/chat-commands.md`, telegram-grammy `commands/`.
-Replacement: `ncl groups config update --model/--effort`, `ncl groups restart`,
-`NANOCLAW_DEFAULT_MODEL` / `NANOCLAW_FAST_MODE`.
+## A3. [RESTORED 2026-08-31] Host chat commands
+Restored post-migration, adapted to the async DbDriver tree: `2055cfdb` (system),
+`ec9ecf38` (auto_compact_window column threading), `41a32836` (markdown fallback cards).
+Now IN TRUNK: `src/commands/**`, `src/db/telegram-command-scopes.ts` (migration file 025,
+applied name `telegram-command-scopes` unchanged), `command-gate.ts` `classifyHostCommand`
+plus slack `!` prefix and `/new` -> `/clear` alias, router 3b hook, `interactive/index.ts`
+`hcmd-` skip, `docs/chat-commands.md`, telegram-grammy `commands/`, deps
+`@grammyjs/commands` / `@grammyjs/menu`. Treat as regular fork surface on the next
+upgrade (MERGE, not DROP).
 
-## A4. [DROPPED] Typing indicator on processing_ack
-`src/modules/typing/**`, `src/host-sweep.ts`, `src/modules/agent-to-agent/*`,
-`src/db/session-db.ts` changes. Redesign later against `outDb.getProcessingClaims()`.
+## A4. [RESTORED 2026-08-31] Typing indicator
+Redesigned and restored post-migration (`225ce30c` and follow-ups): `src/modules/typing/**`
+with the `painted` flag + idle-path clearSignal. Treat as regular fork surface on the next
+upgrade.
 
 ---
 
@@ -195,9 +199,11 @@ gating note. Keep only: the "Per-agent Claude config (settings.json)" section an
 ---
 
 # E. Dropped host/runner changes (for the record)
-- `auto_compact_window`, `compact_notices` columns (migrations 022, 024, `container-configs.ts`,
-  `container-config.ts`, `backfill`, `cli/resources/groups.ts`, `types.ts`, runner `config.ts`,
-  `providers/claude.ts`) -> per-agent `settings.json` `autoCompactWindow`.
+- `auto_compact_window`: RESTORED 2026-08-31 (`ec9ecf38`, migration file 026 under the
+  original applied name `container-configs-auto-compact-window`). The settings.json
+  replacement was a dead end: env beats settings in the SDK resolution, so the provider's
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW pin shadowed it. `compact_notices` (and the agent-runner
+  compaction-notice delivery below) remain dropped.
 - Agent-runner delivery: notice event for compaction, native `/compact` notice, verbatim
   slash output, hold follow-up claims (`poll-loop.ts`, `providers/types.ts`, `db/messages-in.ts`).
 - `pnpm-workspace.yaml` `packages: ["."]` (not reproducible on current pnpm).
