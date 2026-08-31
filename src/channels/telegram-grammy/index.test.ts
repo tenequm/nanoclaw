@@ -10,8 +10,11 @@ import os from 'os';
 import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { Effect, Layer, ManagedRuntime } from 'effect';
+import type { UserFromGetMe } from 'grammy/types';
 
 import type { ChannelAdapter } from '../adapter.js';
+import { BotService, type HydratedBot } from './services.js';
 
 describe('telegram-grammy registration', () => {
   let originalCwd: string;
@@ -78,5 +81,26 @@ describe('telegram-grammy registration', () => {
     expect(TELEGRAM_DEFAULTS.dm.threads).toBe(false);
     expect(TELEGRAM_DEFAULTS.group.threads).toBe(false);
     expect(TELEGRAM_DEFAULTS.dm.engagePattern).toBe('.');
+  });
+
+  it('rejects delivery when the outbound effect fails', async () => {
+    const { TelegramGrammyAdapter } = await import('./index.js');
+    const instance = new TelegramGrammyAdapter('0:placeholder', undefined, undefined, undefined);
+    const failure = new Error('telegram unavailable');
+    const botLayer = Layer.succeed(BotService, {
+      bot: {
+        api: { sendMessage: () => Promise.reject(failure) },
+      } as unknown as HydratedBot,
+      me: { id: 1, is_bot: true, first_name: 'TestBot', username: 'testbot' } as UserFromGetMe,
+      start: () => Effect.void,
+      stop: () => Effect.void,
+    });
+    const runtime = ManagedRuntime.make(botLayer);
+    (instance as unknown as { runtime: typeof runtime }).runtime = runtime;
+
+    await expect(
+      instance.deliver('telegram:1', null, { kind: 'chat', content: { text: 'hello' } }),
+    ).rejects.toMatchObject({ _tag: 'GrammyNetworkError', method: 'sendMessage', cause: failure });
+    await runtime.dispose();
   });
 });

@@ -16,6 +16,9 @@ import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
+// Read per call so bun tests can point the outbox at a temp dir; the container always uses the default.
+const outboxRoot = (): string => process.env.NANOCLAW_OUTBOX_DIR ?? '/workspace/outbox';
+
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
 }
@@ -138,7 +141,7 @@ export const sendFile: McpToolDefinition = {
     const id = generateId();
     const filename = (args.filename as string) || path.basename(resolvedPath);
 
-    const outboxDir = path.join('/workspace/outbox', id);
+    const outboxDir = path.join(outboxRoot(), id);
     fs.mkdirSync(outboxDir, { recursive: true });
     fs.copyFileSync(resolvedPath, path.join(outboxDir, filename));
 
@@ -195,19 +198,29 @@ export const sendMediaGroup: McpToolDefinition = {
     const routing = resolveRouting(to);
     if ('error' in routing) return err(routing.error);
 
-    const id = generateId();
-    const outboxDir = path.join('/workspace/outbox', id);
-    fs.mkdirSync(outboxDir, { recursive: true });
-
-    const items: Array<{ path: string; caption?: string }> = [];
-    const filenames: string[] = [];
+    const resolvedItems: Array<{ resolved: string; basename: string; caption?: string }> = [];
     for (const item of rawItems) {
       const filePath = item.path;
       if (!filePath) return err('each item must have a path');
       const resolved = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
       if (!fs.existsSync(resolved)) return err(`File not found: ${filePath}`);
-      const filename = path.basename(resolved);
-      fs.copyFileSync(resolved, path.join(outboxDir, filename));
+      resolvedItems.push({ resolved, basename: path.basename(resolved), caption: item.caption });
+    }
+
+    const basenameCounts = new Map<string, number>();
+    for (const item of resolvedItems) {
+      basenameCounts.set(item.basename, (basenameCounts.get(item.basename) ?? 0) + 1);
+    }
+
+    const id = generateId();
+    const outboxDir = path.join(outboxRoot(), id);
+    fs.mkdirSync(outboxDir, { recursive: true });
+
+    const items: Array<{ path: string; caption?: string }> = [];
+    const filenames: string[] = [];
+    for (const [index, item] of resolvedItems.entries()) {
+      const filename = basenameCounts.get(item.basename) === 1 ? item.basename : `${index}-${item.basename}`;
+      fs.copyFileSync(item.resolved, path.join(outboxDir, filename));
       items.push({ path: filename, caption: item.caption });
       filenames.push(filename);
     }

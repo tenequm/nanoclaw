@@ -442,6 +442,95 @@ describe('router', () => {
     expect(wakeContainer).toHaveBeenCalled();
   });
 
+  it('does not materialize a message refused by the access gate', async () => {
+    const { routeInbound, setAccessGate } = await import('./router.js');
+    const materialize = vi.fn(async () => {});
+    setAccessGate((event) =>
+      event.message.id === 'msg-refused'
+        ? { allowed: false, reason: 'test_refusal' }
+        : { allowed: true },
+    );
+
+    await routeInbound({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      threadId: null,
+      materialize,
+      message: {
+        id: 'msg-refused',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'Unknown', text: 'blocked' }),
+        timestamp: now(),
+      },
+    });
+
+    expect(materialize).not.toHaveBeenCalled();
+    expect(await findSession('mg-1', null)).toBeUndefined();
+  });
+
+  it('materializes once across two agent wirings and stores the mutation', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { getSessionsByAgentGroup } = await import('./db/sessions.js');
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Second Agent',
+      folder: 'second-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await createMessagingGroupAgent({
+      id: 'mga-2',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-2',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+
+    const content: { text: string; attachments: Array<{ fileId: string; localPath?: string }> } = {
+      text: 'photo',
+      attachments: [{ fileId: 'photo-1' }],
+    };
+    const runMaterialize = vi.fn(async () => {
+      content.attachments[0] = { ...content.attachments[0], localPath: 'agent/attachments/photo.jpg' };
+    });
+    const event: InboundEvent = {
+      channelType: 'discord',
+      platformId: 'chan-123',
+      threadId: null,
+      message: {
+        id: 'msg-materialize',
+        kind: 'chat',
+        content: JSON.stringify(content),
+        timestamp: now(),
+      },
+    };
+    let materializePromise: Promise<void> | undefined;
+    event.materialize = () => {
+      materializePromise ??= (async () => {
+        await runMaterialize();
+        event.message.content = JSON.stringify(content);
+      })();
+      return materializePromise;
+    };
+
+    await routeInbound(event);
+
+    expect(runMaterialize).toHaveBeenCalledTimes(1);
+    for (const agentGroupId of ['ag-1', 'ag-2']) {
+      const sessions = await getSessionsByAgentGroup(agentGroupId);
+      expect(sessions).toHaveLength(1);
+      const db = new Database(inboundDbPath(agentGroupId, sessions[0].id));
+      const row = db.prepare('SELECT content FROM messages_in LIMIT 1').get() as { content: string };
+      db.close();
+      expect(JSON.parse(row.content).attachments[0].localPath).toBe('agent/attachments/photo.jpg');
+    }
+  });
+
   it('auto-creates messaging group only when the bot is addressed (mention/DM)', async () => {
     // The router's no-mg branch is escalation-gated: plain chatter on an
     // unknown channel stays silent (no DB writes) so a bot that sits in

@@ -2,10 +2,9 @@
  * telegram-grammy channel adapter.
  *
  * Effect-TS v4 island inside the Promise-based host. All internal logic is
- * Effect-native; the public `ChannelAdapter` methods bridge Effect→Promise
- * at the boundary via `ManagedRuntime.runPromise`/`runFork`. Errors are
- * caught before the runPromise call so nothing throws out — matches the
- * host's `delivery.ts` expectation that `deliver` never throws.
+ * Effect-native; the public `ChannelAdapter` methods bridge Effect to Promise
+ * at the boundary via `ManagedRuntime.runPromise`/`runFork`. Delivery errors
+ * are logged and rejected so the host owns retry and terminal failure state.
  *
  * Activated when `TELEGRAM_BOT_TOKEN` is set. Its channel type is `telegram`.
  * It replaces the Chat SDK Telegram adapter installed by `/add-telegram`;
@@ -23,7 +22,7 @@ import { registerChannelAdapter } from '../channel-registry.js';
 import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
 
-import { getAskQuestionRender } from '../../db/sessions.js';
+import { resolveQuestionRender } from '../question-render-registry.js';
 
 import { materializeAll } from './attachments.js';
 import { composeSelectedCard, parseCallbackData } from './ask-question.js';
@@ -100,10 +99,12 @@ class TelegramGrammyAdapter implements ChannelAdapter {
             rememberTopicMessage(chatId, ctx.msg.message_id, platformId);
           }
 
-          // Materialize attachment bytes to the group folder (await so the
-          // agent-runner sees them in the same inbound dispatch).
-          if (isInboundContent(message.content) && message.content.attachments.length > 0) {
-            yield* materializeAll(message.content.attachments, message.id, platformId);
+          if (
+            isInboundContent(message.content) &&
+            message.content.attachments.some((attachment) => attachment.fileId)
+          ) {
+            const content = message.content;
+            message.materialize = () => runtime.runPromise(materializeAll(content.attachments, message.id, platformId));
           }
 
           const isGroup = chat.type !== 'private';
@@ -139,7 +140,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
           // handlers delete the pending row, and the selected-state labels go
           // with it. Mirrors chat-sdk-bridge's ordering.
           const render = yield* Effect.tryPromise({
-            try: () => getAskQuestionRender(parsed.questionId),
+            try: () => resolveQuestionRender(parsed.questionId),
             catch: (err) => err,
           }).pipe(Effect.catchCause(() => Effect.succeed(undefined)));
           const user = ctx.from;
@@ -229,7 +230,10 @@ class TelegramGrammyAdapter implements ChannelAdapter {
     return rt.runPromise(
       dispatchOutbound(platformId, threadId, message).pipe(
         Effect.catch((err) =>
-          Effect.as(Effect.logError('telegram-grammy: deliver failed', { err }), undefined as string | undefined),
+          Effect.gen(function* () {
+            yield* Effect.logError('telegram-grammy: deliver failed', { err });
+            return yield* Effect.fail(err);
+          }),
         ),
       ),
     );

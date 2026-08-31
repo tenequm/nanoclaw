@@ -17,6 +17,7 @@ import path from 'path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { log } from './log.js';
 import { pondStoreMounts } from './pond-stores.js';
 
 interface StoreFixture {
@@ -86,6 +87,14 @@ describe('pondStoreMounts', () => {
   it('skips a granted store whose directory does not exist yet', () => {
     const dataDir = makeDataDir({ mychat: { ingest: ['g1'], read: ['g1'], createDir: false } });
     expect(pondStoreMounts('g1', dataDir)).toEqual([]);
+  });
+
+  it('skips invalid store names that could escape the stores directory', () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const dataDir = makeDataDir({ '../..': { read: ['g1'], createDir: false } });
+
+    expect(pondStoreMounts('g1', dataDir)).toEqual([]);
+    expect(warn).toHaveBeenCalledWith('Skipping pond store with invalid name', { name: '../..' });
   });
 
   it('adds the embedding-model cache mount when the host cache exists', () => {

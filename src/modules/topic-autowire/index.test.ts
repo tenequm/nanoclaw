@@ -113,4 +113,34 @@ describe('autowireTopic', () => {
     await autowireTopic(event('telegram:-1000000000003:abc'));
     expect(await getMessagingGroupByPlatform('telegram', 'telegram:-1000000000003:abc', 'telegram')).toBeUndefined();
   });
+
+  it('rolls back a partial clone and allows a later retry', async () => {
+    await seedBase();
+    const db = (await import('../../db/index.js')).getDb();
+    await db.exec('PRAGMA foreign_keys = OFF');
+    await db.run(
+      `INSERT INTO messaging_group_agents (
+         id, messaging_group_id, agent_group_id, engage_mode, engage_pattern,
+         sender_scope, ignored_message_policy, session_mode, priority, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      'w-invalid',
+      'mg-base',
+      'ag-missing',
+      'pattern',
+      '.',
+      'all',
+      'drop',
+      'shared',
+      -1,
+      't',
+    );
+    await db.exec('PRAGMA foreign_keys = ON');
+
+    await expect(autowireTopic(event(TOPIC))).rejects.toThrow();
+    expect(await getMessagingGroupByPlatform('telegram', TOPIC, 'telegram')).toBeUndefined();
+
+    await db.run('DELETE FROM messaging_group_agents WHERE id = ?', 'w-invalid');
+    await expect(autowireTopic(event(TOPIC))).resolves.toBe(false);
+    expect(await getMessagingGroupByPlatform('telegram', TOPIC, 'telegram')).toBeDefined();
+  });
 });

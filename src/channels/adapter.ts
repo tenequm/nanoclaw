@@ -63,6 +63,12 @@ export interface InboundEvent {
     /** True when the source is a group/channel thread, false for DMs. */
     isGroup?: boolean;
   };
+  /**
+   * The router invokes this once immediately before persisting an accepted
+   * message, so adapters can defer byte downloads or paid work until after
+   * the engage, access, and scope gates have passed.
+   */
+  materialize?: () => Promise<void>;
   replyTo?: DeliveryAddress;
 }
 
@@ -90,6 +96,12 @@ export interface InboundMessage {
   isMention?: boolean;
   /** True when the source is a group/channel thread, false for DMs. */
   isGroup?: boolean;
+  /**
+   * The router invokes this once immediately before persisting an accepted
+   * message, so adapters can defer byte downloads or paid work until after
+   * the engage, access, and scope gates have passed.
+   */
+  materialize?: () => Promise<void>;
 }
 
 /** A file attachment to deliver alongside a message. */

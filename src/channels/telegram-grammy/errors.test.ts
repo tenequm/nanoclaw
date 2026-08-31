@@ -10,15 +10,7 @@
 import { describe, expect, it } from 'vitest';
 import { GrammyError } from 'grammy';
 
-import {
-  GrammyBadRequest,
-  GrammyBlocked,
-  GrammyEntityError,
-  GrammyFloodWait,
-  GrammyNetworkError,
-  GrammyUnknownError,
-  mapGrammyError,
-} from './errors.js';
+import { GrammyApiError, GrammyEntityError, GrammyNetworkError, mapGrammyError } from './errors.js';
 
 /** Construct a GrammyError with minimal required fields for testing. */
 function makeGrammyError(code: number, description: string, parameters?: { retry_after?: number }): GrammyError {
@@ -39,38 +31,32 @@ describe('mapGrammyError', () => {
     expect((out as GrammyEntityError).description).toContain('parse entities');
   });
 
-  it('classifies flood waits (429) with retry_after', () => {
+  it('maps flood waits to GrammyApiError with retry_after', () => {
     const err = makeGrammyError(429, 'Too Many Requests: retry after 7', { retry_after: 7 });
     const out = mapGrammyError(err, 'sendMessage', 'chat1');
-    expect(out).toBeInstanceOf(GrammyFloodWait);
-    expect((out as GrammyFloodWait).retryAfterSeconds).toBe(7);
+    expect(out).toBeInstanceOf(GrammyApiError);
+    expect((out as GrammyApiError).retryAfter).toBe(7);
   });
 
-  it('classifies 403 as GrammyBlocked', () => {
+  it('maps 403 to GrammyApiError', () => {
     const err = makeGrammyError(403, 'Forbidden: bot was blocked by the user');
     const out = mapGrammyError(err, 'sendMessage', 'chat1');
-    expect(out).toBeInstanceOf(GrammyBlocked);
+    expect(out).toBeInstanceOf(GrammyApiError);
+    expect((out as GrammyApiError).errorCode).toBe(403);
   });
 
-  it('classifies a non-entity 400 as GrammyBadRequest', () => {
+  it('maps a non-entity 400 to GrammyApiError', () => {
     const err = makeGrammyError(400, 'Bad Request: chat not found');
     const out = mapGrammyError(err, 'sendMessage', 'chat1');
-    expect(out).toBeInstanceOf(GrammyBlocked);
-    // "chat not found" matches the BLOCKED_RE regex → GrammyBlocked, not BadRequest.
-    // This pins the behavior; if we ever want BadRequest for "chat not found",
-    // update both the regex and this test together.
+    expect(out).toBeInstanceOf(GrammyApiError);
+    expect((out as GrammyApiError).errorCode).toBe(400);
   });
 
-  it('classifies an otherwise-opaque 400 as GrammyBadRequest', () => {
-    const err = makeGrammyError(400, 'Bad Request: bot is not a member of the supergroup chat');
-    const out = mapGrammyError(err, 'sendMessage', 'chat1');
-    expect(out).toBeInstanceOf(GrammyBadRequest);
-  });
-
-  it('classifies 5xx as GrammyUnknownError', () => {
+  it('maps 5xx to GrammyApiError', () => {
     const err = makeGrammyError(502, 'Bad Gateway');
     const out = mapGrammyError(err, 'sendMessage', 'chat1');
-    expect(out).toBeInstanceOf(GrammyUnknownError);
+    expect(out).toBeInstanceOf(GrammyApiError);
+    expect(out).toMatchObject({ chatId: 'chat1', method: 'sendMessage', errorCode: 502, description: 'Bad Gateway' });
   });
 
   it('classifies a non-GrammyError (network) as GrammyNetworkError', () => {

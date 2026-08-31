@@ -25,6 +25,7 @@ import {
   getMessagingGroupAgents,
   getMessagingGroupByPlatform,
 } from '../../db/messaging-groups.js';
+import { getDb } from '../../db/index.js';
 import { log } from '../../log.js';
 import { registerMessageInterceptor } from '../../router.js';
 
@@ -48,34 +49,36 @@ export async function autowireTopic(event: InboundEvent): Promise<boolean> {
 
   const now = new Date().toISOString();
   const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  await createMessagingGroup({
-    id: mgId,
-    channel_type: event.channelType,
-    platform_id: event.platformId,
-    instance,
-    name: `${base.name ?? baseId} · topic ${topicId}`,
-    is_group: 1,
-    unknown_sender_policy: base.unknown_sender_policy,
-    created_at: now,
-  });
-  for (const w of wirings) {
-    await createMessagingGroupAgent({
-      id: randomUUID(),
-      messaging_group_id: mgId,
-      agent_group_id: w.agent_group_id,
-      engage_mode: w.engage_mode,
-      engage_pattern: w.engage_pattern,
-      sender_scope: w.sender_scope,
-      ignored_message_policy: w.ignored_message_policy,
-      session_mode: w.session_mode,
-      // Clone the base wiring's thread-policy override too — a per-topic
-      // wiring that dropped it would silently fall back to the channel
-      // declaration instead of mirroring the chat it was cloned from.
-      threads: w.threads,
-      priority: w.priority,
+  await getDb().transaction(async () => {
+    await createMessagingGroup({
+      id: mgId,
+      channel_type: event.channelType,
+      platform_id: event.platformId,
+      instance,
+      name: `${base.name ?? baseId} · topic ${topicId}`,
+      is_group: 1,
+      unknown_sender_policy: base.unknown_sender_policy,
       created_at: now,
     });
-  }
+    for (const w of wirings) {
+      await createMessagingGroupAgent({
+        id: randomUUID(),
+        messaging_group_id: mgId,
+        agent_group_id: w.agent_group_id,
+        engage_mode: w.engage_mode,
+        engage_pattern: w.engage_pattern,
+        sender_scope: w.sender_scope,
+        ignored_message_policy: w.ignored_message_policy,
+        session_mode: w.session_mode,
+        // Clone the base wiring's thread-policy override too - a per-topic
+        // wiring that dropped it would silently fall back to the channel
+        // declaration instead of mirroring the chat it was cloned from.
+        threads: w.threads,
+        priority: w.priority,
+        created_at: now,
+      });
+    }
+  });
   log.info('Auto-wired new forum topic from base chat', {
     platformId: event.platformId,
     baseMessagingGroupId: base.id,

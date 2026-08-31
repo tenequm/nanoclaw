@@ -586,6 +586,11 @@ async function deliverToAgent(
   }
 
   const messageId = messageIdForAgent(event.message.id, agent.agent_group_id);
+  try {
+    await event.materialize?.();
+  } catch (err) {
+    log.warn('Inbound message materialization failed', { messageId: event.message.id, err });
+  }
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: messageId,
     kind: event.message.kind,

@@ -9,9 +9,12 @@
  * module wraps that single call and runs voice/audio transcription
  * afterwards.
  *
- * Runs before the pairing + router handoff so the agent-runner sees the
- * `localPath` + `transcript` fields already populated on
- * `message.content.attachments[]`.
+ * Runs deferred: the adapter attaches `materializeAll` as the message's
+ * `materialize` hook and the router calls it only after the engage, access
+ * and scope gates pass, so a refused sender never triggers a download or a
+ * transcription. The agent-runner still sees `localPath` + `transcript`
+ * populated on `message.content.attachments[]` because the router awaits
+ * the hook before writing the message.
  */
 import fs from 'fs/promises';
 import path from 'path';

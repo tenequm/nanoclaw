@@ -46,6 +46,7 @@ import os from 'os';
 import path from 'path';
 
 import type { MountClass } from './drivers/types.js';
+import { log } from './log.js';
 import type { VolumeMount } from './providers/provider-container-registry.js';
 
 /** Container-side root for mounted pond stores. */
@@ -89,13 +90,22 @@ function isRemote(store: PondStore): boolean {
  */
 export function pondStoreMounts(agentGroupId: string, dataDir: string): VolumeMount[] {
   const pondDir = path.join(dataDir, 'pond');
+  const storesRoot = path.resolve(pondDir, 'stores');
   const config = readStoresConfig(pondDir);
   const mounts: VolumeMount[] = [];
 
   for (const [name, store] of Object.entries(config.stores ?? {})) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+      log.warn('Skipping pond store with invalid name', { name });
+      continue;
+    }
+    const storeDir = path.join(pondDir, 'stores', name);
+    if (!path.resolve(storeDir).startsWith(storesRoot + path.sep)) {
+      log.warn('Skipping pond store outside the stores directory', { name });
+      continue;
+    }
     if (!store.read?.includes(agentGroupId)) continue;
     if (isRemote(store)) continue; // remote reads go through the gateway, never a mount
-    const storeDir = path.join(pondDir, 'stores', name);
     if (!fs.existsSync(storeDir)) continue;
     mounts.push({
       hostPath: storeDir,

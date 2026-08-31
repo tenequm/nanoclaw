@@ -56,11 +56,30 @@ function attempt(): { pcm: Buffer; rate: string; channels: string } | null {
   // curl honors HTTPS_PROXY + the gateway CA exactly as the onecli-gateway skill
   // documents; the gateway injects the API key for the matching host.
   const curl = Bun.spawnSync(
-    ['curl', '-sS', '-X', 'POST', url, '-H', 'Content-Type: application/json', '--data-binary', '@-'],
+    [
+      'curl',
+      '-sS',
+      '--max-time',
+      '120',
+      '--connect-timeout',
+      '10',
+      '-X',
+      'POST',
+      url,
+      '-H',
+      'Content-Type: application/json',
+      '--data-binary',
+      '@-',
+    ],
     { stdin: Buffer.from(body) },
   );
   if (curl.exitCode !== 0) return null; // transport hiccup — retry
-  const resp = JSON.parse(curl.stdout.toString());
+  let resp: any;
+  try {
+    resp = JSON.parse(curl.stdout.toString());
+  } catch {
+    return null;
+  }
   if (resp.error) {
     const code = Number(resp.error.code) || 0;
     if (code >= 500) return null; // server-side glitch — retry

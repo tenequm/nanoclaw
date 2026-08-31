@@ -19,6 +19,7 @@ import {
   platformIdFor,
   resolveMessageThreadId,
   toInboundMessage,
+  type InboundContent,
 } from './inbound.js';
 
 const e = (obj: unknown): MessageEntity[] => obj as MessageEntity[];
@@ -70,6 +71,25 @@ describe('toInboundMessage drops content-free service messages', () => {
       1,
     );
     expect(env).not.toBeNull();
+  });
+
+  it('omits attachments from edited messages', () => {
+    const ctx = ctxFor({
+      message_id: 22,
+      date: 1_700_000_000,
+      edit_date: 1_700_000_100,
+      caption: 'updated caption',
+      photo: [{ file_id: 'edited-photo', width: 10, height: 10, file_size: 5 }],
+    });
+    (ctx.update as { edited_message?: unknown }).edited_message = ctx.msg;
+
+    const env = toInboundMessage(ctx, 'bot', 1);
+    const content = env!.message.content as InboundContent;
+
+    expect(env).not.toBeNull();
+    expect(content.attachments).toEqual([]);
+    expect(content.text).toContain('updated caption');
+    expect(content.replyTo?.id).toBe('22');
   });
 });
 

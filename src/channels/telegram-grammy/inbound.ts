@@ -512,7 +512,7 @@ export function toInboundMessage(
       fullName: fullName(from),
       userName: from.username ?? null,
     },
-    attachments: extractAttachments(msg),
+    attachments: isEdit ? [] : extractAttachments(msg),
   };
 
   // Service messages (chat photo changed, pins, topic created/renamed) and
