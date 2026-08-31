@@ -10,6 +10,11 @@
 # bind mount at runtime (see src/container-runner.ts). Source-only changes
 # never require an image rebuild.
 
+# uv/uvx are copied out of Astral's image below; a named stage is the only
+# place BuildKit expands a version ARG for an image reference.
+ARG UV_VERSION=0.12.7
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
 FROM node:22-slim
 
 # ---- Build-time arguments ----------------------------------------------------
@@ -136,10 +141,10 @@ RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 # ---- uv / uvx ----------------------------------------------------------------
 # General Python capability for agents, and the launcher for Python MCP servers
 # (the `npx -y` equivalent that Debian bookworm has no package for - neither `uv`
-# nor `python3-uv` is in the repos). Copied from Astral's official image rather
-# than piped from an install script: two static binaries, no network fetch at
+# nor `python3-uv` is in the repos). Copied from Astral's official image (the
+# `uv` stage above) rather than piped from an install script: two static binaries, no network fetch at
 # container start, no dependency on the PEP 668 managed system Python.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 # ---- GitHub CLI (gh) ---------------------------------------------------------
 # Install gh so agents can run `gh pr list`, `gh repo view`, etc. Auth follows
@@ -170,7 +175,7 @@ ENV GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem
 RUN git config --system credential.helper '!gh auth git-credential'
 
 # ---- pond: cross-session recall (read-only MCP over mounted stores) ----------
-ARG POND_VERSION=0.16.1
+ARG POND_VERSION=0.16.3
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends xz-utils && \

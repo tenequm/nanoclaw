@@ -103,11 +103,11 @@ Copy the blocks verbatim from `git show fe64f73f:container/Dockerfile`:
 2. Media stack: ffmpeg, atomicparsley, python3-pip; pip `yt-dlp yt-dlp-ejs instaloader mutagen
    pycryptodomex brotli websockets requests certifi curl_cffi secretstorage xattr`; Deno via
    `deno.land/install.sh`.
-3. uv / uvx: `COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/`.
+3. uv / uvx: `ARG UV_VERSION=<pinned>` + `COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /uvx /usr/local/bin/`.
 4. GitHub CLI `gh` from the official apt repo; `ENV GH_TOKEN=onecli-managed`;
    `ENV GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem`;
    `RUN git config --system credential.helper '!gh auth git-credential'`.
-5. pond binary: `ARG POND_VERSION=0.16.1` block (see C).
+5. pond binary: `ARG POND_VERSION=<pinned>` block (see C).
 Keep upstream's `PNPM_VERSION` / `NPM_VERSION` pins, `USER node`, `ENTRYPOINT`, and the
 provenance `ARG`/`LABEL` block LAST. Do not reintroduce the fork's stale `PNPM_VERSION`.
 

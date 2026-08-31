@@ -5,7 +5,7 @@ description: Add pond cross-session recall. Agents search their own past session
 
 # Add Pond: Cross-Session Recall
 
-Installs [pond](https://github.com/tenequm/pond) so agents can search past sessions. pond ingests the Claude Agent SDK transcripts each group already writes (`data/v2-sessions/<group>/.claude-shared/projects/**/*.jsonl`) into **stores** on the host; each container gets a read-only stdio MCP server (`pond_search`, `pond_get`, `pond_sql_query`) over the stores it was granted. Transcripts NanoClaw rotates away stay recallable: pond is the durable copy.
+Installs [pond](https://github.com/tenequm/pond) so agents can search past sessions. pond ingests the Claude Agent SDK transcripts each group already writes (`data/v2-sessions/<group>/.claude-shared/projects/**/*.jsonl`) into **stores** on the host; each container gets a read-only stdio MCP server (`pond_search`, `pond_get_session`, `pond_get_message`, `pond_sql`) over the stores it was granted. Transcripts NanoClaw rotates away stay recallable: pond is the durable copy.
 
 ## The store model
 
@@ -52,7 +52,7 @@ If not installed (or older than the pin), install the release binary for the hos
 # Homebrew (macOS or Linuxbrew):
 brew install tenequm/tap/pond && pond --version
 # or a release binary (targets: aarch64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu):
-curl -fsSL https://github.com/tenequm/pond/releases/download/v0.16.1/pond-x86_64-unknown-linux-gnu.tar.xz \
+curl -fsSL https://github.com/tenequm/pond/releases/download/v0.16.3/pond-x86_64-unknown-linux-gnu.tar.xz \
   | tar -xJ -C ~/.local/bin && chmod +x ~/.local/bin/pond
 ```
 
@@ -145,7 +145,7 @@ Edit `container/Dockerfile`. Immediately before the `# ---- Bun runtime` section
 
 ```dockerfile
 # ---- pond: cross-session recall (read-only MCP over mounted stores) ----------
-ARG POND_VERSION=0.16.1
+ARG POND_VERSION=0.16.3
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends xz-utils && \
