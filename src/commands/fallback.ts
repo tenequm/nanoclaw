@@ -68,7 +68,7 @@ import {
   CONFIG_FIELDS,
   EFFORT_LEVELS,
   MODEL_ALIASES,
-  PLAIN_FMT,
+  MD_FMT,
   type CommandName,
   type ConfigField,
   type ConfigView,
@@ -273,7 +273,7 @@ async function handleStatus(ctx: HostCommandContext, targets: TargetResolution):
 }
 
 function renderStatus(v: StatusView): string {
-  return statusCardLines(v, PLAIN_FMT).join('\n');
+  return statusCardLines(v, MD_FMT).join('\n');
 }
 
 // --- /model (admin-only) ---
@@ -309,7 +309,7 @@ async function handleModel(ctx: HostCommandContext, targets: TargetResolution): 
   // /model <alias-or-id>: the service re-checks admin and returns 'unauthorized'
   // for non-admins, so a single call covers both auth and the write.
   const res = await setModel(agent.agentGroupId, ctx.args, ctx.userId ?? '');
-  await replyOnFirstTarget(ctx, targets, res.ok ? modelChangeConfirmation(res.view, PLAIN_FMT) : failureMessage(res));
+  await replyOnFirstTarget(ctx, targets, res.ok ? modelChangeConfirmation(res.view, MD_FMT) : failureMessage(res));
 }
 
 /**
@@ -416,13 +416,13 @@ async function handleConfig(ctx: HostCommandContext, targets: TargetResolution):
     await replyOnFirstTarget(
       ctx,
       targets,
-      res.ok ? activationChangeConfirmation(res.view, PLAIN_FMT) : failureMessage(res),
+      res.ok ? activationChangeConfirmation(res.view, MD_FMT) : failureMessage(res),
     );
     return;
   }
 
   const res = await setConfigValue(agent.agentGroupId, parsed.field, parsed.value, ctx.userId ?? '');
-  await replyOnFirstTarget(ctx, targets, res.ok ? configChangeConfirmation(res.view, PLAIN_FMT) : failureMessage(res));
+  await replyOnFirstTarget(ctx, targets, res.ok ? configChangeConfirmation(res.view, MD_FMT) : failureMessage(res));
 }
 
 /** Parse "set <field> <value>" into a settable field + raw value. */
@@ -438,7 +438,7 @@ function parseConfigSet(args: string): { field: ConfigField | 'activation' | 'pa
 function renderConfigView(v: ConfigView): string {
   // The Hermes config card, minus the menu-only trailing 'Pick a setting...'
   // line, plus a fallback-specific set-command cheat sheet.
-  const lines = configRootLines(v, PLAIN_FMT).slice(0, -2);
+  const lines = configRootLines(v, MD_FMT).slice(0, -2);
   lines.push(
     '',
     'Change a value with:',
@@ -467,7 +467,7 @@ async function handleRestart(ctx: HostCommandContext, targets: TargetResolution)
   const agent = targets.agent;
   // The service re-checks admin and returns 'unauthorized' for non-admins.
   const res = await restartAgent(agent.agentGroupId, ctx.userId ?? '');
-  await replyOnFirstTarget(ctx, targets, res.ok ? restartConfirmation(res.view, PLAIN_FMT) : failureMessage(res));
+  await replyOnFirstTarget(ctx, targets, res.ok ? restartConfirmation(res.view, MD_FMT) : failureMessage(res));
 }
 
 // --- Card response handler ('hcmd-' taps) ---
@@ -517,7 +517,7 @@ async function handleHostCommandResponse(payload: ResponsePayload): Promise<bool
   }
 
   const res = await setModel(agentGroupId, payload.value, actor);
-  await reply(res.ok ? modelChangeConfirmation(res.view, PLAIN_FMT) : failureMessage(res));
+  await reply(res.ok ? modelChangeConfirmation(res.view, MD_FMT) : failureMessage(res));
   return true;
 }
 
