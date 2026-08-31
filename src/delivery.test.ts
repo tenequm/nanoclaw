@@ -739,3 +739,62 @@ describe('deliverSessionMessages — post-delivery hooks', () => {
     expect(delivered.has('th-2')).toBe(true);
   });
 });
+
+describe('deliverSessionMessages — agent-scoped message ids', () => {
+  /**
+   * The agent addresses a message by its inbound ROW id, which the router
+   * suffixed with the agent group to keep ids unique across the fan-out. The
+   * platform has never seen that suffix: Slack passed the whole string to
+   * reactions.add as a ts and got message_not_found (live, 2026-08-31).
+   */
+  function insertOperation(agentGroupId: string, sessionId: string, msgId: string, content: unknown): void {
+    const db = new Database(outboundDbPath(agentGroupId, sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+       VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', ?)`,
+    ).run(msgId, JSON.stringify(content));
+    db.close();
+  }
+
+  async function deliveredContent(content: unknown): Promise<Record<string, unknown>> {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOperation('ag-1', session.id, `out-${Math.random().toString(36).slice(2, 8)}`, content);
+
+    let seen = '';
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, delivered) {
+        seen = delivered;
+        return 'plat-msg-1';
+      },
+    });
+    await deliverSessionMessages(session);
+    return JSON.parse(seen) as Record<string, unknown>;
+  }
+
+  it('strips the agent-group suffix from a reaction target', async () => {
+    const payload = await deliveredContent({
+      operation: 'reaction',
+      messageId: '1788196934.001629:ag-1',
+      emoji: 'thumbs_up',
+    });
+    expect(payload.messageId).toBe('1788196934.001629');
+    expect(payload.emoji).toBe('thumbs_up');
+  });
+
+  it('strips it from an edit target too', async () => {
+    const payload = await deliveredContent({ operation: 'edit', messageId: '1788196934.001629:ag-1', text: 'fixed' });
+    expect(payload.messageId).toBe('1788196934.001629');
+    expect(payload.text).toBe('fixed');
+  });
+
+  it('leaves an unscoped id alone', async () => {
+    const payload = await deliveredContent({ operation: 'reaction', messageId: '1788196934.001629', emoji: 'eyes' });
+    expect(payload.messageId).toBe('1788196934.001629');
+  });
+
+  it('leaves a message with no messageId byte-identical', async () => {
+    const payload = await deliveredContent({ text: 'hello' });
+    expect(payload).toEqual({ text: 'hello' });
+  });
+});

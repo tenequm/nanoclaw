@@ -31,6 +31,7 @@ import { findSessionForAgent } from './db/sessions.js';
 import { backfillNewSession, fanInboundMessage } from './modules/cross-session-context/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { agentScopedMessageId } from './platform-id.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
@@ -679,5 +680,6 @@ async function deliverToAgent(
  */
 function messageIdForAgent(baseId: string | undefined, agentGroupId: string): string {
   const id = baseId && baseId.length > 0 ? baseId : generateId();
-  return `${id}:${agentGroupId}`;
+  // Inverse: platformMessageId, applied at delivery.
+  return agentScopedMessageId(id, agentGroupId);
 }

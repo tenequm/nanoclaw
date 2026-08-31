@@ -26,6 +26,7 @@ import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import { platformMessageId } from './platform-id.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
 import type { OutboundMessage } from './mailbox/index.js';
@@ -506,12 +507,23 @@ async function deliverMessage(
       ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
       : undefined;
 
+  // The agent addresses a message by its inbound ROW id, which the router
+  // suffixed with the agent group to keep ids unique across the fan-out
+  // (messageIdForAgent). Adapters need the platform's own id back — Telegram
+  // tolerates the extra segment by accident, Slack hands it to reactions.add
+  // verbatim and gets message_not_found. Re-serialize only when there is an
+  // id to rewrite, so every other message keeps its original bytes.
+  const outboundContent =
+    typeof content.messageId === 'string'
+      ? JSON.stringify({ ...content, messageId: platformMessageId(content.messageId, session.agent_group_id) })
+      : msg.content;
+
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channelType,
     msg.platformId,
     msg.threadId,
     msg.kind,
-    msg.content,
+    outboundContent,
     files,
     deliverInstance,
   );
