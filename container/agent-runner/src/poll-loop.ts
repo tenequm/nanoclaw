@@ -8,7 +8,7 @@ import {
 } from './db/messages-in.js';
 import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
-import { touchHeartbeat } from './heartbeat.js';
+import { createTurnLiveness, touchHeartbeat } from './heartbeat.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import {
   clearContinuation,
@@ -357,6 +357,8 @@ export async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  const turnLiveness = createTurnLiveness();
+  turnLiveness.begin();
   // Once-per-turn guard for the task-run "<message> block was not delivered"
   // nudge — mirrors unwrappedNudged for chat turns.
   let taskBlockNudged = false;
@@ -484,6 +486,7 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
+        turnLiveness.begin();
         query.push(prompt);
         archivePrompts.push(prompt);
         markCompleted(keptIds);
@@ -523,6 +526,7 @@ export async function processQuery(
     for await (const event of query.events) {
       handleEvent(event, routing);
       touchHeartbeat();
+      turnLiveness.noteEvent();
 
       if (event.type === 'init') {
         queryContinuation = event.continuation;
@@ -554,6 +558,7 @@ export async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
+        turnLiveness.end();
         if (event.text) {
           const { sent, hasUnwrapped, taskBlocks, resultBlocks } = await dispatchResultText(event.text, routing, {
             midTurnSent,
@@ -608,6 +613,7 @@ export async function processQuery(
               unwrappedNudged = true;
               const destinations = getAllDestinations();
               const names = destinations.map((d) => d.name).join(', ');
+              turnLiveness.begin();
               query.push(
                 `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
                   `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
@@ -620,6 +626,7 @@ export async function processQuery(
               const names = getAllDestinations()
                 .map((d) => d.name)
                 .join(', ');
+              turnLiveness.begin();
               query.push(buildTaskBlockNudge(taskBlocks, names));
             }
             // A retry result (wrapping or task-block nudge) answers the SAME
@@ -654,6 +661,7 @@ export async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    turnLiveness.dispose();
   }
 
   return { continuation: queryContinuation };

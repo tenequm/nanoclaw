@@ -30,10 +30,11 @@ const TYPING_REFRESH_MS = 4000;
 const TYPING_GRACE_MS = 15000;
 /**
  * After the grace window, a heartbeat must be mtimed within this
- * many ms of now to count as "agent is working." Heartbeats land
- * every few hundred ms during active work, so 6s is well above
- * the working floor and small enough to stop typing quickly when
- * the agent goes idle.
+ * many ms of now to count as "agent is working." The agent-runner
+ * ticks the heartbeat every 2s for the whole of an in-flight turn
+ * (TURN_HEARTBEAT_INTERVAL_MS in container/agent-runner/src/heartbeat.ts),
+ * so 6s is well above the working floor and small enough to stop
+ * typing quickly when the agent goes idle.
  */
 const HEARTBEAT_FRESH_MS = 6000;
 /**
