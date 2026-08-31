@@ -550,6 +550,10 @@ export async function processQuery(
           midTurnSent += scan.delivered;
           midTurnTail = scan.tail;
         }
+      } else if (event.type === 'task-started') {
+        // Settles later as a task_notification, which the SDK answers with a
+        // turn of its own; that turn's result is what ends this count.
+        turnLiveness.begin();
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
@@ -694,6 +698,9 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       break;
     case 'progress':
       log(`Progress: ${event.message}`);
+      break;
+    case 'task-started':
+      log(`Background task started: ${event.description}`);
       break;
   }
 }

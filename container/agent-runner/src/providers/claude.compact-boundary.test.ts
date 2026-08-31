@@ -62,3 +62,29 @@ describe('compact_boundary translation', () => {
     expect(events.filter((e) => e.type === 'activity').length).toBeGreaterThanOrEqual(3);
   });
 });
+
+describe('task_started translation', () => {
+  it('yields task-started for a background task and progress for its notification', async () => {
+    sdkMessages.length = 0;
+    sdkMessages.push(
+      { type: 'system', subtype: 'init', session_id: 'sess-1' },
+      { type: 'system', subtype: 'task_started', task_id: 't1', description: 'sleep 45; date' },
+      { type: 'result', subtype: 'success', result: '<message to="user">on it</message>' },
+      { type: 'system', subtype: 'task_notification', task_id: 't1', status: 'completed', summary: 'done' },
+      { type: 'result', subtype: 'success', result: '<message to="user">finished</message>' },
+    );
+
+    const provider = new ClaudeProvider({});
+    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+    const q = provider.query({ prompt: 'hi', cwd: tmp });
+
+    const events: { type: string; description?: string; message?: string }[] = [];
+    for await (const e of q.events) events.push(e as { type: string; description?: string; message?: string });
+
+    const started = events.filter((e) => e.type === 'task-started');
+    expect(started).toHaveLength(1);
+    expect(started[0]!.description).toBe('sleep 45; date');
+    expect(events.filter((e) => e.type === 'progress').map((e) => e.message)).toEqual(['done']);
+    expect(events.filter((e) => e.type === 'result')).toHaveLength(2);
+  });
+});

@@ -182,6 +182,13 @@ export type ProviderEvent =
   | { type: 'text'; text: string }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
+  /**
+   * The SDK started a background task (a backgrounded Bash command or
+   * subagent). The turn that launched it may end long before the task
+   * settles; when it does, the SDK runs a follow-up turn on its own with no
+   * prompt from the poll-loop, so the loop counts the task as in-flight work.
+   */
+  | { type: 'task-started'; description: string }
   | { type: 'file'; path: string }
   /**
    * Liveness signal. Providers MUST yield this on every underlying SDK

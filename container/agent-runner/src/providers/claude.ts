@@ -674,6 +674,9 @@ export class ClaudeProvider implements AgentProvider {
           // Compaction is bookkeeping: log it, count it as activity only.
           log(`Context compacted${detail}.`);
           yield { type: 'activity' };
+        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_started') {
+          const ts = message as { description?: string };
+          yield { type: 'task-started', description: ts.description ?? '' };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
           const tn = message as { summary?: string };
           yield { type: 'progress', message: tn.summary || 'Task notification' };
