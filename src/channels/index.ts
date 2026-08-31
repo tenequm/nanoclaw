@@ -15,3 +15,4 @@ import './telegram-grammy/index.js';
 // Slack — Chat SDK bridge (/add-slack).
 import './slack.js';
 import './slack-a2a-guard.js';
+import './slack-a2a.js';
