@@ -38,6 +38,9 @@ interface GatewayAdapter extends Adapter {
   ): Promise<Response>;
 }
 
+/** The part of chat-sdk's nested author this bridge reads. */
+type MessageAuthor = { userId?: string; fullName?: string; userName?: string };
+
 /** Reply context extracted from a platform's raw message. */
 export interface ReplyContext {
   text: string;
@@ -525,7 +528,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     // Project chat-sdk's nested author into the flat sender fields the router
     // expects (see src/router.ts extractAndUpsertUser). Native adapters already
     // populate these directly; this brings chat-sdk adapters in line.
-    const author = serialized.author as { userId?: string; fullName?: string; userName?: string } | undefined;
+    const author = serialized.author as MessageAuthor | undefined;
     if (author) {
       const name = author.fullName ?? author.userName;
       serialized.senderId = author.userId;
@@ -610,21 +613,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // sub-threads collapse into the one DM session.
       chat.onDirectMessage(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
+        const author = message.author as MessageAuthor | undefined;
         log.info('Inbound DM received', {
           adapter: adapter.name,
           channelId,
-          sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
+          sender: author?.fullName ?? author?.userId ?? 'unknown',
           threadId: thread.id,
         });
         const inbound = await messageToInbound(message, true, false);
         // Agent-mode app context: DM-only by platform design.
-        attachAppContext(
-          inbound.content as Record<string, unknown>,
-          instanceKey,
-          channelId,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (message.author as any)?.userId,
-        );
+        attachAppContext(inbound.content as Record<string, unknown>, instanceKey, channelId, author?.userId);
         const dmThreadId = normalizeDmThreadId(thread.id, message.id);
         await setupConfig.onInbound(channelId, dmThreadId, inbound);
       });
