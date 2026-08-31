@@ -156,12 +156,11 @@ describe('/new alias', () => {
 });
 
 describe('host commands', () => {
-  it('classifies /status for host execution with the arg text', async () => {
-    await seedOwner('slack:owner');
-    expect(await gateCommand('/status', 'slack:owner', 'ag-1', 'slack')).toEqual({
-      action: 'host',
-      command: '/status',
-      argText: '',
+  it('/status passes through to the SDK for any sender (pre-existing behavior)', async () => {
+    expect(await gateCommand('/status', 'telegram:anyone', 'ag-1', 'telegram')).toEqual({ action: 'pass' });
+    expect(await gateCommand('!status', 'slack:anyone', 'ag-1', 'slack')).toEqual({
+      action: 'pass',
+      normalizedText: '/status',
     });
   });
 

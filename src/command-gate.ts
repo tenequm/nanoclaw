@@ -28,13 +28,26 @@ export type GateResult =
 const FILTERED_COMMANDS = new Set(['/start', '/help', '/login', '/logout', '/doctor', '/remote-control']);
 const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
 /** Admin-gated commands executed by the host (src/host-commands.ts) — never stored inbound. */
-const HOST_COMMANDS = new Set(['/status', '/config', '/model']);
+const HOST_COMMANDS = new Set(['/config', '/model']);
+/**
+ * Known Claude Code commands passed raw to the SDK for ANY sender — the
+ * pre-existing unknown-command behavior, listed here only so the bang
+ * prefix can map them (`!status` on Slack). /status is the Claude CLI's
+ * own status output (model, account, context/token usage) — the host has
+ * none of that data, so it must not intercept.
+ */
+const SDK_PASSTHROUGH_COMMANDS = new Set(['/status']);
 /** Typed name → canonical command. Applied on both prefixes, all channels. */
 const COMMAND_ALIASES: Record<string, string> = { '/new': '/clear' };
 /** Channels whose client eats '/' — '!' is accepted as a command prefix there. */
 const BANG_PREFIX_CHANNELS = new Set(['slack']);
 
-const KNOWN_COMMANDS = new Set([...FILTERED_COMMANDS, ...ADMIN_COMMANDS, ...HOST_COMMANDS]);
+const KNOWN_COMMANDS = new Set([
+  ...FILTERED_COMMANDS,
+  ...ADMIN_COMMANDS,
+  ...HOST_COMMANDS,
+  ...SDK_PASSTHROUGH_COMMANDS,
+]);
 
 /**
  * Rewrite `!name` (bang channels) and aliased names to the canonical
@@ -91,6 +104,10 @@ export async function gateCommand(
   const command = text.split(/\s/)[0].toLowerCase();
 
   if (FILTERED_COMMANDS.has(command)) return { action: 'filter' };
+
+  if (SDK_PASSTHROUGH_COMMANDS.has(command)) {
+    return normalizedText !== null ? { action: 'pass', normalizedText } : { action: 'pass' };
+  }
 
   if (ADMIN_COMMANDS.has(command)) {
     if (await isAdmin(userId, agentGroupId)) {

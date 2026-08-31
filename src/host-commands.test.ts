@@ -95,20 +95,14 @@ afterEach(async () => {
   await closeDb();
 });
 
-describe('/status and /config', () => {
-  it('renders the group config and container state', async () => {
-    await handleHostCommand(ctx('/status'));
+describe('/config', () => {
+  it('renders the group config, container state, and change hints', async () => {
+    await handleHostCommand(ctx('/config'));
     const text = lastReplyText();
     expect(text).toContain('**Emma** (emma)');
     expect(text).toContain('`claude-sonnet-5`');
     expect(text).toContain('**Effort:** high');
     expect(text).toContain('container stopped');
-    expect(text).not.toContain('Change with:');
-  });
-
-  it('/config adds the change hints', async () => {
-    await handleHostCommand(ctx('/config'));
-    const text = lastReplyText();
     expect(text).toContain('Change with:');
     expect(text).toContain('ncl groups config update --id ag-1');
   });
@@ -155,9 +149,7 @@ describe('/model picker', () => {
   it('delivers an ask_question card and applies the clicked model', async () => {
     await handleHostCommand(ctx('/model'));
     const question = deliveredQuestion();
-    expect(question.options.map((o) => o.value)).toEqual(
-      expect.arrayContaining(['claude-fable-5', 'claude-opus-5']),
-    );
+    expect(question.options.map((o) => o.value)).toEqual(expect.arrayContaining(['claude-fable-5', 'claude-opus-5']));
 
     expect(await dispatchClick(question.questionId, 'claude-opus-5', 'U-owner')).toBe(true);
     expect((await getContainerConfig('ag-1'))?.model).toBe('claude-opus-5');

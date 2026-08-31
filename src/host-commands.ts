@@ -1,5 +1,5 @@
 /**
- * Host-executed chat commands: /status, /config, /model.
+ * Host-executed chat commands: /config, /model.
  *
  * These are admin-gated by the command gate (src/command-gate.ts) and run
  * entirely on the host — the sender's admin role IS the authorization, so
@@ -138,10 +138,9 @@ export async function handleHostCommand(ctx: HostCommandContext): Promise<void> 
 
   try {
     switch (ctx.command) {
-      case '/status':
       case '/config': {
         const row = await getContainerConfig(ctx.agentGroup.id);
-        await reply(renderStatus(ctx, row, ctx.command === '/config'));
+        await reply(renderConfig(ctx, row));
         return;
       }
       case '/model': {
@@ -185,25 +184,30 @@ async function applyModel(agentGroupId: string, model: string | null): Promise<v
 }
 
 function modelAppliedText(value: string): string {
-  const target = value === '__default__' ? `the install default${DEFAULT_MODEL ? ` (\`${DEFAULT_MODEL}\`)` : ''}` : `\`${value}\``;
-  return `Model set to ${target}. Container restarting — the next reply may take a few extra seconds.`;
+  const target =
+    value === '__default__' ? `the install default${DEFAULT_MODEL ? ` (\`${DEFAULT_MODEL}\`)` : ''}` : `\`${value}\``;
+  return `Model set to ${target}. Container restarting, the next reply may take a few extra seconds.`;
 }
 
 async function sendModelPicker(ctx: HostCommandContext, reply: (text: string) => Promise<void>): Promise<void> {
   const adapter = getDeliveryAdapter();
   if (!adapter || !ctx.channelType || !ctx.platformId) {
-    await reply('Model picker unavailable here — use /model <model-id> instead.');
+    await reply('Model picker unavailable here, use /model <model-id> instead.');
     return;
   }
 
   sweepPickers();
   if (pendingPickers.size >= PICKER_MAX) {
-    await reply('Too many pending pickers — use /model <model-id> instead.');
+    await reply('Too many pending pickers, use /model <model-id> instead.');
     return;
   }
 
   const row = await getContainerConfig(ctx.agentGroup.id);
-  const current = row?.model ? `\`${row.model}\`` : DEFAULT_MODEL ? `\`${DEFAULT_MODEL}\` (install default)` : 'SDK default';
+  const current = row?.model
+    ? `\`${row.model}\``
+    : DEFAULT_MODEL
+      ? `\`${DEFAULT_MODEL}\` (install default)`
+      : 'SDK default';
   const questionId = `hostq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const options = normalizeOptions(MODEL_OPTIONS);
 
@@ -237,11 +241,11 @@ async function sendModelPicker(ctx: HostCommandContext, reply: (text: string) =>
   } catch (err) {
     pendingPickers.delete(questionId);
     log.error('Failed to deliver model picker', { agentGroupId: ctx.agentGroup.id, err });
-    await reply('Could not deliver the model picker — use /model <model-id> instead.');
+    await reply('Could not deliver the model picker, use /model <model-id> instead.');
   }
 }
 
-function renderStatus(ctx: HostCommandContext, row: ContainerConfigRow | undefined, withHints: boolean): string {
+function renderConfig(ctx: HostCommandContext, row: ContainerConfigRow | undefined): string {
   const provider = row?.provider ?? 'claude';
   const model = row?.model
     ? `\`${row.model}\``
@@ -259,7 +263,7 @@ function renderStatus(ctx: HostCommandContext, row: ContainerConfigRow | undefin
   const p = ctx.channelType === 'slack' ? '!' : '/';
 
   const lines = [
-    `**${ctx.agentGroup.name}** (${ctx.agentGroup.folder}) — container ${running ? 'running' : 'stopped'}`,
+    `**${ctx.agentGroup.name}** (${ctx.agentGroup.folder}), container ${running ? 'running' : 'stopped'}`,
     `**Model:** ${model} · **Effort:** ${effort} · **Provider:** ${provider}`,
     `**Timezone:** ${timezone} · **CLI scope:** ${cliScope}`,
     `**Session:** \`${ctx.session.id}\``,
@@ -267,15 +271,13 @@ function renderStatus(ctx: HostCommandContext, row: ContainerConfigRow | undefin
     `**Packages:** ${apt.length + npm.length > 0 ? `${apt.length} apt, ${npm.length} npm` : 'none'}`,
   ];
 
-  if (withHints) {
-    lines.push(
-      '',
-      '**Change with:**',
-      `- \`${p}model <model-id>\`, or bare \`${p}model\` for a picker`,
-      `- \`ncl groups config update --id ${ctx.agentGroup.id}\` with \`--effort <level>\`, \`--timezone <IANA>\`, or \`--provider <name>\``,
-      `- \`ncl groups config add-mcp-server\` / \`add-package\`, then \`ncl groups restart --id ${ctx.agentGroup.id}\``,
-    );
-  }
+  lines.push(
+    '',
+    '**Change with:**',
+    `- \`${p}model <model-id>\`, or bare \`${p}model\` for a picker`,
+    `- \`ncl groups config update --id ${ctx.agentGroup.id}\` with \`--effort <level>\`, \`--timezone <IANA>\`, or \`--provider <name>\``,
+    `- \`ncl groups config add-mcp-server\` / \`add-package\`, then \`ncl groups restart --id ${ctx.agentGroup.id}\``,
+  );
 
   return lines.join('\n');
 }
