@@ -19,7 +19,8 @@
  */
 import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
-import { gateCommand } from './command-gate.js';
+import { applyNormalizedText, gateCommand } from './command-gate.js';
+import { handleHostCommand } from './host-commands.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
@@ -557,12 +558,40 @@ async function deliverToAgent(
 
   // Command gate: classify slash commands before they reach the container.
   // Filtered commands are dropped silently. Denied admin commands get a
-  // permission-denied response written directly to messages_out.
+  // permission-denied response written directly to messages_out. Host
+  // commands (/status, /config, /model) execute on the host and are never
+  // stored inbound. A bang/alias rewrite (`!compact` on Slack, `/new`)
+  // replaces the stored TEXT so the container only sees canonical slash
+  // commands — applied after materialization below, which owns (and may
+  // replace) the content string.
+  let normalizedText: string | undefined;
   if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
-    const gate = await gateCommand(event.message.content, userId, agent.agent_group_id);
+    const gate = await gateCommand(event.message.content, userId, agent.agent_group_id, event.channelType);
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
       return;
+    }
+    if (gate.action === 'host') {
+      // Only an engaged (wake) message executes — an accumulate-branch copy
+      // of a host command is ambient context in some other agent's session,
+      // and running it there would reply from an agent that never engaged.
+      if (wake) {
+        await handleHostCommand({
+          command: gate.command,
+          argText: gate.argText,
+          agentGroup,
+          session,
+          userId,
+          channelType: deliveryAddr.channelType,
+          platformId: deliveryAddr.platformId,
+          threadId: deliveryAddr.threadId,
+          instance: mg.instance ?? null,
+        });
+      }
+      return;
+    }
+    if (gate.action === 'pass' && gate.normalizedText !== undefined) {
+      normalizedText = gate.normalizedText;
     }
     if (gate.action === 'deny') {
       await writeOutboundDirect(session.agent_group_id, session.id, {
@@ -592,6 +621,8 @@ async function deliverToAgent(
   } catch (err) {
     log.warn('Inbound message materialization failed', { messageId: event.message.id, err });
   }
+  const content =
+    normalizedText !== undefined ? applyNormalizedText(event.message.content, normalizedText) : event.message.content;
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: messageId,
     kind: event.message.kind,
@@ -599,7 +630,7 @@ async function deliverToAgent(
     platformId: deliveryAddr.platformId,
     channelType: deliveryAddr.channelType,
     threadId: deliveryAddr.threadId,
-    content: event.message.content,
+    content,
     trigger: wake,
   });
 
@@ -614,7 +645,7 @@ async function deliverToAgent(
       messageId,
       kind: event.message.kind,
       channelType: deliveryAddr.channelType,
-      content: event.message.content,
+      content,
       timestamp: event.message.timestamp,
     });
   }
@@ -631,7 +662,7 @@ async function deliverToAgent(
       message: {
         id: event.message.id,
         kind: event.message.kind,
-        content: event.message.content,
+        content,
         timestamp: event.message.timestamp,
       },
     });
