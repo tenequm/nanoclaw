@@ -1,7 +1,7 @@
 /**
  * Pairing interceptor.
  *
- * On every inbound text, check whether it's a pending 4-digit pairing code
+ * On every inbound text, check whether it's a pending 6-digit pairing code
  * (optionally prefixed by `@botname`). On match:
  *   1. Mark the pairing consumed (tryConsume),
  *   2. Persist messaging_group + user + optional owner grant,
@@ -65,6 +65,7 @@ export const tryPair = Effect.fn('telegram-grammy.tryPair')(function* (
       isGroup,
       name: chatName,
       adminUserId: adminUserIdBare,
+      instance: 'telegram',
     })
     .pipe(Effect.catch((err) => Effect.as(Effect.logError('telegram-grammy: tryConsume failed', err), null)));
 

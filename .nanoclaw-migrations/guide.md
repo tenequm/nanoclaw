@@ -42,10 +42,14 @@ so reactions resolve to the right topic. No automatic "seen" reactions.
 src/channels/telegram-grammy/   ask-question, attachments, errors, formatter, inbound, index,
                                 layers, media-meta, outbound, pairing-interceptor, reactions,
                                 runtime, services, supervise, topic-map (+ .test.ts)
-src/channels/telegram-pairing.ts (+ .test.ts)
 src/transcription.ts
 src/modules/topic-autowire/index.ts (+ .test.ts)
 ```
+`src/channels/telegram-pairing.ts` now tracks
+`upstream/channels:src/channels/telegram-pairing.ts` verbatim. On the next migration, refresh it
+from `upstream/channels` instead of carrying it from the fork. Refresh its test from upstream too,
+retaining only fork lint adaptations that are still required.
+
 **Do NOT copy** `src/channels/telegram-grammy/commands/**` (host chat commands, dropped) - remove
 every import of it from `index.ts`, and delete any dead helpers that only served it.
 Also excise from the island: `TELEGRAM_NO_SEEN_CHATS` / seen-reaction remnants, and any call into
