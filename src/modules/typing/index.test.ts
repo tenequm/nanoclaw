@@ -9,6 +9,10 @@
  */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 
+vi.mock('../../log.js', () => ({
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
@@ -275,5 +279,27 @@ describe('reaction-ack rendering (threadless chat on a thread-only platform)', (
 
     expect(reactions).toEqual([]);
     expect(statuses).toEqual(['is thinking...']);
+  });
+});
+
+describe('failure reporting', () => {
+  it('logs a failed ack instead of swallowing it, and never throws', async () => {
+    const { log } = (await import('../../log.js')) as unknown as { log: { warn: ReturnType<typeof vi.fn> } };
+    log.warn.mockClear();
+    setTypingAdapter({
+      addReaction: async () => {
+        throw new Error('message_not_found');
+      },
+      typingRequiresThread: () => true,
+    });
+
+    // The signal is decoration: a broken reaction must not reach routing.
+    expect(() => startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1')).not.toThrow();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(log.warn).toHaveBeenCalledWith(
+      'activity signal failed',
+      expect.objectContaining({ op: 'addReaction', messageId: 'msg-1', err: 'Error: message_not_found' }),
+    );
   });
 });

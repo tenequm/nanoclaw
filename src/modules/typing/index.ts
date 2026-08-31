@@ -34,6 +34,7 @@
  */
 import fs from 'fs';
 
+import { log } from '../../log.js';
 import { heartbeatPath } from '../../session-manager.js';
 
 const TYPING_REFRESH_MS = 4000;
@@ -134,6 +135,16 @@ export function setTypingAdapter(a: TypingAdapter): void {
   adapter = a;
 }
 
+/**
+ * Every call here is best-effort: the signal is decoration, and a failure
+ * must never reach delivery or routing. Swallowing silently makes the whole
+ * surface undiagnosable though — a missing scope or a bad message id looks
+ * identical to "working fine" — so failures are logged and then dropped.
+ */
+function signalFailed(op: string, fields: Record<string, unknown>, err: unknown): void {
+  log.warn('activity signal failed', { op, ...fields, err: String(err) });
+}
+
 async function triggerTyping(
   channelType: string,
   platformId: string,
@@ -142,8 +153,8 @@ async function triggerTyping(
 ): Promise<void> {
   try {
     await adapter?.setTyping?.(channelType, platformId, threadId, instance, TYPING_STATUS);
-  } catch {
-    // Typing is best-effort — don't let it fail delivery or routing.
+  } catch (err) {
+    signalFailed('setTyping', { channelType, platformId, threadId, instance }, err);
   }
 }
 
@@ -155,13 +166,31 @@ async function triggerTyping(
 function clearSignal(entry: TypingTarget): void {
   if (entry.mode === 'reaction') {
     if (!(entry.acked && entry.messageId)) return;
+    const messageId = entry.messageId;
     entry.acked = false;
     void adapter
-      ?.removeReaction?.(entry.channelType, entry.platformId, entry.messageId, ACK_EMOJI, entry.instance)
-      .catch(() => {});
+      ?.removeReaction?.(entry.channelType, entry.platformId, messageId, ACK_EMOJI, entry.instance)
+      .catch((err) =>
+        signalFailed(
+          'removeReaction',
+          { channelType: entry.channelType, platformId: entry.platformId, messageId, instance: entry.instance },
+          err,
+        ),
+      );
     return;
   }
-  void adapter?.clearTyping?.(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
+  void adapter?.clearTyping?.(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch((err) =>
+    signalFailed(
+      'clearTyping',
+      {
+        channelType: entry.channelType,
+        platformId: entry.platformId,
+        threadId: entry.threadId,
+        instance: entry.instance,
+      },
+      err,
+    ),
+  );
 }
 
 /** Paint the initial signal for an entry: status, or a one-shot ack. */
@@ -171,10 +200,17 @@ function paintSignal(entry: TypingTarget): void {
     return;
   }
   if (entry.acked || !entry.messageId) return;
+  const messageId = entry.messageId;
   entry.acked = true;
   void adapter
-    ?.addReaction?.(entry.channelType, entry.platformId, entry.messageId, ACK_EMOJI, entry.instance)
-    .catch(() => {});
+    ?.addReaction?.(entry.channelType, entry.platformId, messageId, ACK_EMOJI, entry.instance)
+    .catch((err) =>
+      signalFailed(
+        'addReaction',
+        { channelType: entry.channelType, platformId: entry.platformId, messageId, instance: entry.instance },
+        err,
+      ),
+    );
 }
 
 /**
