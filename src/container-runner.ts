@@ -53,6 +53,7 @@ import { getAgentMailbox } from './mailbox/index.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+import { pondStoreMounts } from './pond-stores.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -911,6 +912,10 @@ export async function buildMounts(
   if (providerContribution.mounts) {
     mounts.push(...providerContribution.mounts.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
   }
+
+  // Pond recall stores (.claude/skills/add-pond): read-only, host-decided.
+  // The module classes them itself - see the rationale in pond-stores.ts.
+  mounts.push(...pondStoreMounts(agentGroup.id, DATA_DIR));
 
   return mounts;
 }

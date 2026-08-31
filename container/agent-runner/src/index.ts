@@ -36,6 +36,7 @@ import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { resolvePluginServer } from './plugin-mcp.js';
+import { pondMcpServers } from './pond-mcp.js';
 import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
@@ -107,6 +108,10 @@ async function main(): Promise<void> {
         : `Additional MCP server: ${name} (${serverConfig.command})`,
     );
   }
+
+  // Pond recall (.claude/skills/add-pond): one read-only stdio server per
+  // store the host mounted under /workspace/extra/pond. No mount, no server.
+  Object.assign(mcpServers, pondMcpServers());
 
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
