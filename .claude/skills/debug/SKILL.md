@@ -140,10 +140,11 @@ Messages marked delivered with a null `platform_message_id` are not automaticall
 
 A spawned container that exits without writing to `outbound.db` shows up in `logs/nanoclaw.log` as a `Container exited` line with a non-zero `code`, often preceded by streamed `container=<folder>` stderr (at debug level).
 
-**Authentication errors:** secrets are injected per request by the OneCLI gateway — none are passed in env vars or chat context. A `401` from an API whose credential is in the vault usually means the agent is in `selective` secret mode and that secret was never assigned:
+**Authentication errors:** secrets are injected per request by the OneCLI gateway — none are passed in env vars or chat context. A `401` from an API whose credential is in the vault means that secret was never attached to the agent (agents are always selective):
 ```bash
-onecli agents list                                        # check secretMode
-onecli agents set-secret-mode --id <agent-id> --mode all  # inject all matching secrets
+onecli agents credentials --id <agent-id>                                   # what the agent can use today
+onecli agents grants attach-secret --id <agent-id> --secret-id <secret-id>  # attach it
+ncl groups restart --id <group-id>                                          # a container that already saw the 401 keeps failing until respawned
 ```
 If the gateway itself is unreachable, the container runner refuses to spawn (`OneCLI gateway not applied — refusing to spawn container without credentials` in the host log). Confirm the gateway is up at `http://127.0.0.1:10254`.
 

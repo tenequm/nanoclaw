@@ -164,17 +164,20 @@ Key files: `src/container-restart.ts`, `src/container-runner.ts` (`killContainer
 
 API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway. Secrets are injected into per-agent containers at request time — none are passed in env vars or through chat context. The container agent sees this via the `onecli-gateway` container skill (`container/skills/onecli-gateway/SKILL.md`), which teaches it how the proxy works, how to handle auth errors, and to never ask for raw credentials. Host-side wiring: `src/modules/approvals/onecli-approvals.ts`, `ensureAgent()` in `container-runner.ts`. Run `onecli --help`.
 
-### Secret modes
+### Credential grants
 
-Auto-created agents default to `all` secret mode — every vault secret whose host pattern matches is injected automatically, so the common case needs no per-agent setup. If an agent is in `selective` mode it gets no secrets until you assign them, which shows up as a `401` from an API whose credential *is* in the vault. The SDK can't change this; use the CLI (or the web UI at `http://127.0.0.1:10254`):
+Agents are always `selective`: an agent can use only the vault secrets and app connections attached to it, and a freshly created OneCLI agent has none. A `401` from an API whose credential *is* in the vault means the grant is missing. `ensureAgent` creates the OneCLI agent but does not attach anything; use the CLI (or the web UI at `http://127.0.0.1:10254`):
 
 ```bash
-onecli agents list                                          # check secretMode
-onecli agents set-secret-mode --id <agent-id> --mode all    # inject all matching secrets
-onecli agents set-secrets --id <agent-id> --secret-ids ...  # or stay selective, assign specific ones
+onecli agents list                                                        # find the agent id (one per agent group)
+onecli secrets list                                                       # find the secret id
+onecli agents grants attach-secret --id <agent-id> --secret-id <secret-id>
+onecli agents grants attach-connection --id <agent-id> --connection-id <id>   # app connections (github, google, ...)
+onecli agents grants list --id <agent-id>                                 # what is attached
+onecli agents credentials --id <agent-id>                                 # what it can actually use, with provenance
 ```
 
-No container restart needed — the gateway looks up secrets per request.
+`agents set-secret-mode`, `agents set-secrets`, `agents secrets`, `agents connections *` and project-scope `policy rules` are retired (`410 Gone` since OneCLI 1.45); project rules are compiled from these grants. The gateway consults grants per request, but a container whose CLI subprocess already received a `401` keeps failing until it is respawned: `ncl groups restart --id <group-id>` after attaching.
 
 ### Requiring approval for credential use
 
