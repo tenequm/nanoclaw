@@ -18,7 +18,11 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
 });
 
+import fsMod from 'fs';
+import pathMod from 'path';
+
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';
+import { heartbeatPath } from '../../session-manager.js';
 
 type Call = { channelType: string; platformId: string; threadId: string | null; instance?: string };
 
@@ -301,5 +305,80 @@ describe('failure reporting', () => {
       'activity signal failed',
       expect.objectContaining({ op: 'addReaction', messageId: 'msg-1', err: 'Error: message_not_found' }),
     );
+  });
+});
+
+/**
+ * The post-delivery idle clear. pauseTypingRefreshAfterDelivery zeroes
+ * startedAt so later ticks must prove work via the heartbeat (#3400 leg 1)
+ * — but the skip that protects a multi-message turn used to skip the CLEAR
+ * too. When the delivered "reply" was a reaction or an edit (not a post),
+ * Slack's persistent status was never cleared by the platform, and the
+ * orphaned indicator sat painted until Slack's own 2-minute timeout.
+ */
+describe('post-delivery idle clear (reaction-only turn leaves status painted)', () => {
+  afterEach(() => {
+    // Don't leave a heartbeat file behind: a rerun within HEARTBEAT_FRESH_MS
+    // real seconds would read it as fresh and flake the idle-path tests.
+    fsMod.rmSync(pathMod.dirname(heartbeatPath('ag-1', 'sess-1')), { recursive: true, force: true });
+  });
+
+  function freshHeartbeatGone() {
+    // A prior test run may have left a heartbeat file whose mtime still
+    // reads as fresh (or in the future) against this run's fake clock.
+    fsMod.rmSync(pathMod.dirname(heartbeatPath('ag-1', 'sess-1')), { recursive: true, force: true });
+  }
+
+  it('clears the status exactly once when the turn goes idle after a delivery', async () => {
+    freshHeartbeatGone();
+    const { clears } = signalAdapter();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The turn's only user-facing output was a reaction — the platform
+    // cleared nothing. The pause zeroes startedAt.
+    pauseTypingRefreshAfterDelivery('sess-1');
+
+    // Past the 10s pause; no heartbeat, so the agent reads as idle. The
+    // startedAt === 0 branch must clear the orphaned status — once.
+    await vi.advanceTimersByTimeAsync(13_000);
+    expect(clears).toEqual([{ platformId: 'slack:C1', threadId: 'slack:C1:1' }]);
+  });
+
+  it('stays cleared over a long idle — one clear total, not one per tick', async () => {
+    freshHeartbeatGone();
+    const { clears } = signalAdapter();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+    pauseTypingRefreshAfterDelivery('sess-1');
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('repaints when work resumes and clears again on the next idle', async () => {
+    freshHeartbeatGone();
+    const { statuses, clears } = signalAdapter();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+    pauseTypingRefreshAfterDelivery('sess-1');
+
+    // Idle clear fires after the pause.
+    await vi.advanceTimersByTimeAsync(13_000);
+    expect(clears).toHaveLength(1);
+    statuses.length = 0;
+
+    // Work resumes: the heartbeat goes fresh, so the tick repaints.
+    const hb = heartbeatPath('ag-1', 'sess-1');
+    fsMod.mkdirSync(pathMod.dirname(hb), { recursive: true });
+    fsMod.writeFileSync(hb, '');
+    const now = new Date(Date.now());
+    fsMod.utimesSync(hb, now, now);
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect(statuses.length).toBeGreaterThanOrEqual(1);
+
+    // Heartbeat goes stale again — the refresher (still alive) clears again.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(clears).toHaveLength(2);
   });
 });

@@ -114,8 +114,16 @@ interface TypingTarget {
   mode: 'status' | 'reaction';
   /** Platform id of the message the ack sits on ('reaction' mode only). */
   messageId?: string;
-  /** Whether the ack reaction is currently on the message. */
-  acked: boolean;
+  /**
+   * Whether this entry's signal is currently painted, across BOTH
+   * renderings. Gates the clear (clearSignal is called from every teardown
+   * and idle path and must not spam the platform), never the status-mode
+   * repaint (the ephemeral rendering re-fires by design). A reaction-only
+   * or edit-only delivery does not clear Slack's persistent status the way
+   * a post does, so the idle path must be able to clear exactly once — see
+   * the startedAt === 0 branch in the interval tick.
+   */
+  painted: boolean;
   interval: NodeJS.Timeout;
   startedAt: number;
   pausedUntil: number; // epoch ms; 0 = not paused
@@ -164,10 +172,11 @@ async function triggerTyping(
  * clear indicator is a no-op everywhere.
  */
 function clearSignal(entry: TypingTarget): void {
+  if (!entry.painted) return;
+  entry.painted = false;
   if (entry.mode === 'reaction') {
-    if (!(entry.acked && entry.messageId)) return;
+    if (!entry.messageId) return;
     const messageId = entry.messageId;
-    entry.acked = false;
     void adapter
       ?.removeReaction?.(entry.channelType, entry.platformId, messageId, ACK_EMOJI, entry.instance)
       .catch((err) =>
@@ -196,12 +205,13 @@ function clearSignal(entry: TypingTarget): void {
 /** Paint the initial signal for an entry: status, or a one-shot ack. */
 function paintSignal(entry: TypingTarget): void {
   if (entry.mode === 'status') {
+    entry.painted = true;
     triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
     return;
   }
-  if (entry.acked || !entry.messageId) return;
+  if (entry.painted || !entry.messageId) return;
   const messageId = entry.messageId;
-  entry.acked = true;
+  entry.painted = true;
   void adapter
     ?.addReaction?.(entry.channelType, entry.platformId, messageId, ACK_EMOJI, entry.instance)
     .catch((err) =>
@@ -290,17 +300,26 @@ export function startTypingRefresh(
       // expire, so the ack is painted once at start and the ticks here
       // exist purely to keep the idle check below running.
       if (entry.mode === 'status') {
+        entry.painted = true;
         triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
       }
       return;
     }
 
-    // startedAt === 0 marks a post-delivery entry: the reply already proved
-    // the container is warm and already cleared the indicator, so a
-    // momentarily stale heartbeat here skips the tick rather than tearing
-    // the refresher down — a teardown would silence the signal for the rest
-    // of a multi-message turn with nothing to re-arm it.
-    if (entry.startedAt === 0) return;
+    // startedAt === 0 marks a post-delivery entry: the reply proved the
+    // container is warm, so a stale heartbeat here must not tear the
+    // refresher down — that would silence the signal for the rest of a
+    // multi-message turn with nothing to re-arm it. But the reply is only
+    // guaranteed to have cleared the indicator when it was a POST — a
+    // reaction-only or edit-only turn clears nothing on Slack, whose
+    // persistent status otherwise sits painted until the platform's own
+    // 2-minute timeout. Clear (idempotent via `painted`) and keep the
+    // refresher alive: if work resumes, the fresh-heartbeat branch above
+    // repaints and re-arms the flag.
+    if (entry.startedAt === 0) {
+      clearSignal(entry);
+      return;
+    }
 
     // Out of grace AND heartbeat stale — agent is idle, stop refreshing.
     // This is the path a turn that produced no user-facing message ends
@@ -321,7 +340,7 @@ export function startTypingRefresh(
     instance,
     mode: resolveMode(channelType, threadId, instance),
     messageId,
-    acked: false,
+    painted: false,
     interval,
     startedAt,
     pausedUntil: 0,
