@@ -166,7 +166,7 @@ describe('extractTelegramMessageId', () => {
   });
 
   it('accepts 3-part compound (agent-wrapped inbound id)', () => {
-    expect(extractTelegramMessageId('1000001:1716:ag-1776438126500-du9io3', 99)).toEqual({
+    expect(extractTelegramMessageId('1000001:1716:ag-1700000000000-abc123', 99)).toEqual({
       chatId: 1000001,
       messageId: 1716,
     });
