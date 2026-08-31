@@ -49,7 +49,7 @@ Both are committed. CI and the Dockerfile run `--frozen-lockfile` variants — a
 ## Session wake (two paths)
 
 1. **Base image ENTRYPOINT** — used for stdin-piped test invocations like the sample in `container/build.sh`: `tini --> entrypoint.sh` captures stdin to `/tmp/input.json`, then `exec bun run src/index.ts`.
-2. **Host-spawned session** — `src/container-runner.ts` at line ~503 uses `--entrypoint bash` with `-c 'exec bun run /app/src/index.ts'`. This bypasses the image's tini ENTRYPOINT, so the spawn args pass `--init` to put Docker's bundled tini back at PID 1 — Docker does *not* reap zombies by default, and Bun as PID 1 never reaps children it didn't spawn, so without `--init` orphaned Bash-tool subprocesses accumulate as defunct processes. Stdin is unused; all IO flows through the mounted session DBs.
+2. **Host-spawned session** — `src/container-runner.ts` at line ~503 uses `--entrypoint bash` with `-c 'exec bun run /app/src/index.ts'`. Bypasses tini (Docker's default PID 1 handling applies). Stdin is unused; all IO flows through the mounted session DBs.
 
 Both paths end with Bun running the same source file from `/app/src/index.ts`.
 
@@ -69,7 +69,7 @@ Any failure fails the PR.
 
 ## Key invariants
 
-- **Session DBs must use `journal_mode=DELETE`.** WAL's `-shm` memory-map doesn't cross VirtioFS between host and guest. See the doc comment at the top of `container/agent-runner/src/db/connection.ts` and `src/session-manager.ts`.
+- **Session DBs must use `journal_mode=DELETE`.** WAL's `-shm` memory-map doesn't cross VirtioFS between host and guest. See `container/agent-runner/src/mailbox/sqlite/connection.ts` and `src/mailbox/sqlite/session-db.ts`.
 - **Named SQL parameters in the container require the prefix in JS object keys.** `bun:sqlite` does not auto-strip `@`/`$`/`:` the way `better-sqlite3` does on the host. Use `$name` in both SQL and keys: `.run({ $id: msg.id })`. Positional `?` params work normally.
 - **Agent-runner tests run under `bun:test`, not vitest.** `vitest.config.ts` excludes the `container/agent-runner/` tree because vitest runs on Node and can't load `bun:sqlite`.
 - **No tsc build step in the container image.** Re-adding one would reintroduce the ~200-500ms per-session-wake cost we removed.

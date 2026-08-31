@@ -37,16 +37,18 @@ export async function autowireTopic(event: InboundEvent): Promise<boolean> {
   const baseId = event.platformId.slice(0, event.platformId.lastIndexOf(':'));
 
   const instance = event.instance ?? event.channelType;
-  if (getMessagingGroupByPlatform(event.channelType, event.platformId, instance)) return false;
+  // Central-DB access is async now; every read/write below is awaited in
+  // sequence (the driver serializes statements — no Promise.all here).
+  if (await getMessagingGroupByPlatform(event.channelType, event.platformId, instance)) return false;
 
-  const base = getMessagingGroupByPlatform(event.channelType, baseId, instance);
+  const base = await getMessagingGroupByPlatform(event.channelType, baseId, instance);
   if (!base || base.denied_at) return false;
-  const wirings = getMessagingGroupAgents(base.id);
+  const wirings = await getMessagingGroupAgents(base.id);
   if (wirings.length === 0) return false;
 
   const now = new Date().toISOString();
   const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  createMessagingGroup({
+  await createMessagingGroup({
     id: mgId,
     channel_type: event.channelType,
     platform_id: event.platformId,
@@ -57,7 +59,7 @@ export async function autowireTopic(event: InboundEvent): Promise<boolean> {
     created_at: now,
   });
   for (const w of wirings) {
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: randomUUID(),
       messaging_group_id: mgId,
       agent_group_id: w.agent_group_id,
@@ -66,6 +68,10 @@ export async function autowireTopic(event: InboundEvent): Promise<boolean> {
       sender_scope: w.sender_scope,
       ignored_message_policy: w.ignored_message_policy,
       session_mode: w.session_mode,
+      // Clone the base wiring's thread-policy override too — a per-topic
+      // wiring that dropped it would silently fall back to the channel
+      // declaration instead of mirroring the chat it was cloned from.
+      threads: w.threads,
       priority: w.priority,
       created_at: now,
     });

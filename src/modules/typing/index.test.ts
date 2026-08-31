@@ -14,22 +14,6 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
 });
 
-// Controllable gate: the refresher reads container liveness + processing
-// claims each tick once past the grace window. `gate.claims` swaps between
-// inflight and empty to simulate turn progress and transient misreads.
-const gate = vi.hoisted(() => ({
-  claims: [] as Array<{ message_id: string; status_changed: string }>,
-}));
-vi.mock('../../container-runner.js', () => ({
-  isContainerRunning: () => true,
-}));
-vi.mock('../../session-manager.js', () => ({
-  openOutboundDb: () => ({}),
-}));
-vi.mock('../../db/session-db.js', () => ({
-  getProcessingClaims: () => gate.claims,
-}));
-
 import { setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';
 
 type Call = { channelType: string; platformId: string; threadId: string | null; instance?: string };
@@ -46,7 +30,6 @@ function captureAdapter() {
 
 beforeEach(() => {
   vi.useFakeTimers();
-  gate.claims = [];
 });
 
 afterEach(() => {
@@ -74,8 +57,8 @@ describe('startTypingRefresh — instance forwarding', () => {
     await vi.advanceTimersByTimeAsync(0);
     calls.length = 0;
 
-    // Two 4s ticks — well inside the grace window, so they fire
-    // unconditionally (no gate check needed) from the stored entry.
+    // Two 4s ticks — well inside the 15s grace window, so they fire
+    // unconditionally (no heartbeat file needed) from the stored entry.
     await vi.advanceTimersByTimeAsync(8_500);
     expect(calls.length).toBeGreaterThanOrEqual(2);
     for (const c of calls) {
@@ -136,75 +119,5 @@ describe('startTypingRefresh — instance forwarding', () => {
         instance: 'telegram',
       });
     }
-  });
-});
-
-describe('grace window vs observed work', () => {
-  const INFLIGHT = [{ message_id: 'm1', status_changed: '2026-01-01 00:00:00' }];
-
-  it('stops sending once observed work completes, even with grace time left', async () => {
-    const calls = captureAdapter();
-    gate.claims = INFLIGHT;
-    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'tg:1', null);
-    // A few ticks with the turn in flight — work gets observed.
-    await vi.advanceTimersByTimeAsync(8_500);
-    expect(calls.length).toBeGreaterThanOrEqual(2);
-    calls.length = 0;
-
-    // Turn completes at ~8s. The 30s grace window has >20s left, but it
-    // must not keep typing alive: the reply already landed in the chat.
-    gate.claims = [];
-    await vi.advanceTimersByTimeAsync(20_000);
-    expect(calls).toHaveLength(0);
-  });
-
-  it('keeps sending through the spawn blind spot while no work was ever observed', async () => {
-    const calls = captureAdapter();
-    gate.claims = []; // container still starting; nothing claimed yet
-    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'tg:1', null);
-    await vi.advanceTimersByTimeAsync(12_500);
-    // Immediate tick + three interval ticks, all inside grace.
-    expect(calls.length).toBeGreaterThanOrEqual(4);
-  });
-});
-
-describe('gate debounce past the grace window', () => {
-  const INFLIGHT = [{ message_id: 'm1', status_changed: '2026-01-01 00:00:00' }];
-
-  it('one transient miss skips the tick but keeps the refresher alive', async () => {
-    const calls = captureAdapter();
-    gate.claims = INFLIGHT;
-    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'tg:1', null);
-    // Get past the 30s grace window; gate reads true throughout.
-    await vi.advanceTimersByTimeAsync(32_000);
-    calls.length = 0;
-
-    // Transient misread: exactly one tick sees no claims — no setTyping,
-    // but the refresher must survive.
-    gate.claims = [];
-    await vi.advanceTimersByTimeAsync(4_000);
-    expect(calls).toHaveLength(0);
-
-    // Gate recovers → typing resumes on the next tick.
-    gate.claims = INFLIGHT;
-    await vi.advanceTimersByTimeAsync(4_000);
-    expect(calls.length).toBeGreaterThanOrEqual(1);
-  });
-
-  it('two consecutive misses stop the refresher for good', async () => {
-    const calls = captureAdapter();
-    gate.claims = INFLIGHT;
-    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'tg:1', null);
-    await vi.advanceTimersByTimeAsync(32_000);
-    calls.length = 0;
-
-    gate.claims = [];
-    await vi.advanceTimersByTimeAsync(8_500); // miss #1 + miss #2 → stopped
-    expect(calls).toHaveLength(0);
-
-    // Claims reappearing later must not resurrect a stopped refresher.
-    gate.claims = INFLIGHT;
-    await vi.advanceTimersByTimeAsync(8_500);
-    expect(calls).toHaveLength(0);
   });
 });

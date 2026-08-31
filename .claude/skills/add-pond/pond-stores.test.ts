@@ -58,6 +58,10 @@ describe('pondStoreMounts', () => {
     expect(store).toBeDefined();
     expect(store?.readonly).toBe(true);
     expect(store?.hostPath).toBe(path.join(dataDir, 'pond', 'stores', 'mychat'));
+    // `data/pond` sits outside every root the pinned classes admit, so the
+    // seam's only legal class here is the vetted-in-tree one - and never rw.
+    expect(store?.mountClass).toBe('allowlisted-extra');
+    expect(store?.scope).toBe('g1');
   });
 
   it('grants nothing to a group that is not on the read list', () => {
@@ -95,8 +99,19 @@ describe('pondStoreMounts', () => {
     const model = mounts.find((m) => m.hostPath === modelDir);
     expect(model).toBeDefined();
     expect(model?.readonly).toBe(true);
+    expect(model?.mountClass).toBe('allowlisted-extra');
     // Only the one model directory: never the whole HF cache (token leak).
     expect(model?.containerPath).toContain('models--intfloat--multilingual-e5-small');
+  });
+});
+
+describe('mount-class policy', () => {
+  it('never emits a writable mount, whatever the store shape', () => {
+    const dataDir = makeDataDir({ own: { ingest: ['g1'], read: ['g1'] }, team: { ingest: ['g1'], read: ['g1'] } });
+    const mounts = pondStoreMounts('g1', dataDir);
+    expect(mounts.length).toBeGreaterThan(0);
+    expect(mounts.every((m) => m.readonly)).toBe(true);
+    expect(mounts.every((m) => m.mountClass === 'allowlisted-extra')).toBe(true);
   });
 });
 

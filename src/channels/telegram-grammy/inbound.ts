@@ -687,7 +687,7 @@ export function resolveMessageThreadId(platformId: string, threadId: string | nu
  *
  * The agent-runner's `getMessageIdBySeq` returns three shapes:
  *   - bare numeric       (e.g. "1710")   — delivered outbound message id
- *   - 2-part `a:b`       (e.g. "95307956:1716")   — legacy inbound compound
+ *   - 2-part `a:b`       (e.g. "1000001:1716")   — legacy inbound compound
  *   - 3-part `a:b:ag-…`  — current inbound, id wrapped by `messageIdForAgent`
  *
  * The chat id for the API call comes from the routing `platform_id`, so the

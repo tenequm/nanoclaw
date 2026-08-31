@@ -14,12 +14,12 @@ afterEach(() => {
 
 describe('topic-map', () => {
   it('resolves a remembered message to its topic platformId', () => {
-    rememberTopicMessage(-1003927289090, 17, 'telegram:-1003927289090:42');
-    expect(resolveTopicPlatformId(-1003927289090, 17)).toBe('telegram:-1003927289090:42');
+    rememberTopicMessage(-1000000000001, 17, 'telegram:-1000000000001:42');
+    expect(resolveTopicPlatformId(-1000000000001, 17)).toBe('telegram:-1000000000001:42');
   });
 
   it('returns null on a miss (falls back to base chat routing)', () => {
-    expect(resolveTopicPlatformId(-1003927289090, 999)).toBeNull();
+    expect(resolveTopicPlatformId(-1000000000001, 999)).toBeNull();
   });
 
   it('keys on both chatId and messageId', () => {

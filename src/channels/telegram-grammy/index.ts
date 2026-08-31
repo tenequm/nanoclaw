@@ -19,7 +19,7 @@
 import { Effect } from 'effect';
 import type { Context } from 'grammy';
 
-import type { ChannelAdapter, ChannelSetup, ConversationInfo, OutboundMessage } from '../adapter.js';
+import type { ChannelAdapter, ChannelDefaults, ChannelSetup, ConversationInfo, OutboundMessage } from '../adapter.js';
 import { registerChannelAdapter } from '../channel-registry.js';
 import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
@@ -43,8 +43,7 @@ import { tryPair } from './pairing-interceptor.js';
 import { dispatchOutbound } from './outbound.js';
 import { runSupervisedPolling } from './supervise.js';
 import { buildRuntime, type AdapterRuntime } from './runtime.js';
-import { AdapterConfigService, BotService } from './services.js';
-import { installChatCommands } from './commands/index.js';
+import { AdapterConfigService, BotService, TELEGRAM_DEFAULTS } from './services.js';
 
 const CHANNEL_TYPE = 'telegram';
 
@@ -56,6 +55,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
   readonly name = CHANNEL_TYPE;
   readonly channelType = CHANNEL_TYPE;
   readonly supportsThreads = false;
+  readonly defaults: ChannelDefaults = TELEGRAM_DEFAULTS;
 
   private runtime: AdapterRuntime | null = null;
   private connected = false;
@@ -84,13 +84,6 @@ class TelegramGrammyAdapter implements ChannelAdapter {
         const botUserId = me.id;
 
         const { onInbound, onAction } = yield* AdapterConfigService;
-
-        // Native chat-command binding (/status /model /config /restart).
-        // Installs bot.catch FIRST, then bot.use(menu), then bot.use(commandGroup),
-        // then runs the startup scope janitor - all BEFORE the message /
-        // callback_query handlers below so the menu plugin claims its own
-        // callbacks and the `ncq:` handler stays last as the catch-all.
-        yield* installChatCommands(bot, runtime);
 
         const handleInbound = Effect.fn('telegram-grammy.handleInbound')(function* (ctx: Context) {
           const envelope = toInboundMessage(ctx, botUsername, botUserId);
@@ -146,7 +139,10 @@ class TelegramGrammyAdapter implements ChannelAdapter {
           // Resolve render metadata BEFORE dispatching onAction — registered
           // handlers delete the pending row, and the selected-state labels go
           // with it. Mirrors chat-sdk-bridge's ordering.
-          const render = getAskQuestionRender(parsed.questionId);
+          const render = yield* Effect.tryPromise({
+            try: () => getAskQuestionRender(parsed.questionId),
+            catch: (err) => err,
+          }).pipe(Effect.catchCause(() => Effect.succeed(undefined)));
           const user = ctx.from;
           onAction(parsed.questionId, parsed.value, user ? String(user.id) : '');
 
@@ -277,6 +273,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
 }
 
 registerChannelAdapter(CHANNEL_TYPE, {
+  defaults: TELEGRAM_DEFAULTS,
   factory: () => {
     const env = readEnvFile([
       'TELEGRAM_BOT_TOKEN',
@@ -294,4 +291,4 @@ registerChannelAdapter(CHANNEL_TYPE, {
   },
 });
 
-export { TelegramGrammyAdapter };
+export { TelegramGrammyAdapter, TELEGRAM_DEFAULTS };

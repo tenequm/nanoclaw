@@ -71,11 +71,9 @@ interface QueryInput {
   systemContext?: { instructions?: string };
 }
 
-interface McpServerConfig {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-}
+type McpServerConfig =
+  | { type?: 'stdio'; command: string; args?: string[]; env?: Record<string, string> }
+  | { type: 'http'; url: string };
 
 interface AgentQuery {
   /** Push a follow-up message into the active query. */
@@ -425,12 +423,18 @@ themselves are never shown.
 
 - **`task`** — a `<task>` element, script output first when present:
   ```xml
-  <task from="scheduler" time="Jan 1, 9:00 AM">Script output:
+  <task from="scheduler" time="Jan 1, 9:00 AM" current_time="Thursday, January 1, 2026 at 9:01 AM">Script output:
   {"data": …}
 
   Instructions:
   Review open PRs</task>
   ```
+
+  `time` is the occurrence's effective scheduled time (`process_after`, falling
+  back to its creation timestamp for legacy rows). `current_time` is generated
+  when the task reaches the agent so relative instructions such as "today" stay
+  correct after pauses or delayed execution. Both render in the agent group's
+  timezone.
 
 - **`webhook`** — a `<webhook>` element wrapping the JSON payload:
   ```xml
@@ -500,7 +504,7 @@ processing_ack: (no row) → processing → completed
 
 The agent-runner runs an MCP server (stdio) that exposes NanoClaw tools to the agent. The
 tool modules use the same two-DB connection layer as the rest of the runner
-(`container/agent-runner/src/db/connection.ts`): they read the host-written `inbound.db`
+(`container/agent-runner/src/mailbox/sqlite/connection.ts`): they read the host-written `inbound.db`
 at `/workspace/inbound.db` **read-only** (destinations, session routing, question
 responses, task lists) and write to the container-owned `outbound.db` at
 `/workspace/outbound.db`. There is no shared single-file connection and no WAL — both files
@@ -758,7 +762,7 @@ The agent-runner receives configuration via:
 
 - **`container.json`:** The provider name, model, assistant name, MCP servers, and other NanoClaw config are read from `/workspace/agent/container.json` (materialized by the host from the `container_configs` table), not from environment variables. See `container/agent-runner/src/config.ts`.
 - **Environment variables:** provider-specific vars only (API keys, model overrides), `TZ`.
-- **Fixed mount paths:** Host-written `inbound.db` (read-only) at `/workspace/inbound.db` and container-owned `outbound.db` at `/workspace/outbound.db`. Agent group folder at `/workspace/agent/`. System prompt from `/workspace/agent/CLAUDE.md` and `/workspace/global/CLAUDE.md`.
+- **Fixed mount paths:** Host-written `inbound.db` (read-only) at `/workspace/inbound.db` and container-owned `outbound.db` at `/workspace/outbound.db`. Agent group folder at `/workspace/agent/`. The project document is a single composed file at `/workspace/agent/CLAUDE.md`.
 
 The agent-runner reads config, creates the provider, and enters the poll loop. No stdin, no initial prompt — messages are already in the session DB.
 
@@ -781,9 +785,9 @@ The provider name comes from the `provider` key in `/workspace/agent/container.j
 
 ## Agent-Runner Properties
 
-- MCP server is a separate Node process spawned by the provider (via `mcpServers` config)
+- MCP servers are local processes or remote Streamable HTTP endpoints managed by the provider via `mcpServers`
 - The MCP server binary is shared across providers — same tools, same DB access
-- CLAUDE.md loading (global + per-group) — agent-runner reads and passes as `systemPrompt`
+- Project-document loading — the host composes `/workspace/agent/CLAUDE.md` and Claude Code loads it via the `project` setting source; the agent-runner contributes only the runtime addendum from `buildSystemPromptAddendum`
 - Additional directories discovery (`/workspace/extra/*`)
 - Logging via stderr (`[agent-runner] ...`)
 

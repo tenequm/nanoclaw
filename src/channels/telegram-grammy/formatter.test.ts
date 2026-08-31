@@ -218,11 +218,11 @@ describe('User mention links (tg://user?id=N)', () => {
   // grammy's `FormattedString.mentionUser(text, id)` is itself just
   // `a(\`tg://user?id=${id}\`)`, so the default link path is sufficient.
   it('preserves tg://user?id=N as a text_link entity', () => {
-    const fs = renderFS('Hi [Misha](tg://user?id=12345)');
+    const fs = renderFS('Hi [Alex](tg://user?id=12345)');
     const link = fs.entities.find((e) => e.type === 'text_link');
     expect(link).toBeDefined();
     expect((link as { url: string }).url).toBe('tg://user?id=12345');
-    expect(fs.text).toContain('Misha');
+    expect(fs.text).toContain('Alex');
   });
 
   it('emits regular text_link for normal URLs', () => {

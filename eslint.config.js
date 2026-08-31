@@ -6,7 +6,19 @@ import noCatchAll from 'eslint-plugin-no-catch-all'
 export default [
   { ignores: ['node_modules/', 'dist/', 'container/', 'groups/'] },
   { files: ['src/**/*.{js,ts}'] },
-  { languageOptions: { globals: globals.node } },
+  {
+    languageOptions: {
+      globals: globals.node,
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    // Upstream silences no-catch-all per file; with the rule off here those
+    // directives would each report as unused. Keeping them untouched avoids
+    // drift in files this fork does not otherwise modify.
+    linterOptions: { reportUnusedDisableDirectives: 'off' },
+  },
   pluginJs.configs.recommended,
   ...tseslint.configs.recommended,
   {
@@ -33,26 +45,20 @@ export default [
       // surface in logs/nanoclaw.error.log, not as lint warnings.
       'no-catch-all/no-catch-all': 'off',
       '@typescript-eslint/no-explicit-any': 'warn',
+      '@typescript-eslint/no-floating-promises': 'error',
+      '@typescript-eslint/no-misused-promises': 'error',
+      '@typescript-eslint/await-thenable': 'error',
     },
   },
-  // telegram-grammy/ is an Effect-TS v4 island. Stricter promise rules so
-  // agents can't silently drop failure paths. Effects are not Promises, but
-  // the `Effect.runPromise` / `Effect.runFork` boundary must be explicit.
-  // no-floating-promises / no-misused-promises need type-aware linting;
-  // projectService: true scopes it to this folder only.
+  // telegram-grammy/ is an Effect-TS v4 island. Effects are not Promises, but
+  // the `Effect.runPromise` / `Effect.runFork` boundary must be explicit, so
+  // the promise rules are pinned to 'error' HERE as well as globally: failure
+  // handling in the island lives in the typed E channel, and a dropped
+  // Effect→Promise boundary is the one class of mistake the types can't catch.
+  // Relaxing the global rules must not silently relax them for this folder.
   {
     files: ['src/channels/telegram-grammy/**/*.ts'],
-    languageOptions: {
-      parserOptions: {
-        projectService: true,
-        tsconfigRootDir: import.meta.dirname,
-      },
-    },
     rules: {
-      // Catch dropped Effect→Promise boundary mistakes. These are the real
-      // safety rules in an Effect-TS island — failure handling lives in the
-      // typed E channel, so the lint job here is just to make sure no Promise
-      // escapes that boundary unhandled.
       '@typescript-eslint/no-floating-promises': 'error',
       '@typescript-eslint/no-misused-promises': 'error',
     },

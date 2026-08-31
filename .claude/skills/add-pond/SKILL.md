@@ -52,7 +52,7 @@ If not installed (or older than the pin), install the release binary for the hos
 # Homebrew (macOS or Linuxbrew):
 brew install tenequm/tap/pond && pond --version
 # or a release binary (targets: aarch64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu):
-curl -fsSL https://github.com/tenequm/pond/releases/download/v0.13.2/pond-x86_64-unknown-linux-gnu.tar.xz \
+curl -fsSL https://github.com/tenequm/pond/releases/download/v0.16.1/pond-x86_64-unknown-linux-gnu.tar.xz \
   | tar -xJ -C ~/.local/bin && chmod +x ~/.local/bin/pond
 ```
 
@@ -85,7 +85,13 @@ cp $S/pond-recall-container-skill.md container/skills/pond-recall/SKILL.md
 
 ### Mount pond stores in the host container runner
 
-Edit `src/container-runner.ts`. Add the import alongside the other local imports:
+The host composes a fully-resolved `SessionSpec` and hands it to a session driver
+(`src/drivers/types.ts`); `buildMounts` in `src/container-runner.ts` is still where the
+group's mounts are assembled, as `VolumeMount[]` that `toMountSpecs` later converts into
+the seam's `MountSpec[]`. That is the one reach-in.
+
+Edit `src/container-runner.ts`. Add the import alongside the other local imports (next to
+`./modules/mount-security/index.js`):
 
 ```ts
 import { pondStoreMounts } from './pond-stores.js';
@@ -95,22 +101,43 @@ Then in `buildMounts`, after the provider-contributed mounts block and before `r
 
 ```ts
   // Pond recall stores (.claude/skills/add-pond): read-only, host-decided.
+  // The module classes them itself - see the rationale in pond-stores.ts.
   mounts.push(...pondStoreMounts(agentGroup.id, DATA_DIR));
 ```
 
+`pondStoreMounts` returns mounts already carrying `mountClass: 'allowlisted-extra'`,
+`scope: <agent group id>` and `readonly: true`, so nothing has to be re-classed at the call
+site. The class is not a style choice: `validateSpec` pins `group-state` to
+`data/v2-sessions/<group>` and the group folder, and `install-surface` to the enumerated
+release surfaces (`mountPolicy` in `src/drivers/index.ts`). A pond store lives at
+`data/pond/stores/<name>` and the query-side model cache under the host user's HuggingFace
+cache, so both would be denied under either of those classes. `allowlisted-extra` is the
+class for host paths vetted in-tree rather than by a path rule - the same lane the
+provider-contributed mounts ride - and this module does that vetting (read-list membership,
+local backend, directory exists) and never emits a writable mount.
+
 ### Register pond MCP servers in the agent-runner
 
-Edit `container/agent-runner/src/index.ts`. Add the import alongside the other local imports:
+Edit `container/agent-runner/src/index.ts`. Add the import alongside the other local imports
+(next to `./plugin-mcp.js`):
 
 ```ts
 import { pondMcpServers } from './pond-mcp.js';
 ```
 
-Then, directly after the loop that copies `config.mcpServers` entries into the `mcpServers` map, add:
+Inside `main()`, `mcpServers` starts as the built-in `nanoclaw` entry and is then filled by a
+loop over `config.mcpServers` that runs each entry through `resolvePluginServer`. Directly
+after that loop, before the `createProvider(...)` call that consumes the map, add:
 
 ```ts
+  // Pond recall (.claude/skills/add-pond): one read-only stdio server per
+  // store the host mounted under /workspace/extra/pond. No mount, no server.
   Object.assign(mcpServers, pondMcpServers());
 ```
+
+The entries are plain stdio `McpServerConfig` values (`command` / `args` / `env`), so they
+need no plugin resolution - `resolvePluginServer` is for plugin-shipped servers with
+`${PLUGIN_ROOT}` expansion, and pond ships in the image.
 
 ### Bake the pond binary into the agent image
 
@@ -118,7 +145,7 @@ Edit `container/Dockerfile`. Immediately before the `# ---- Bun runtime` section
 
 ```dockerfile
 # ---- pond: cross-session recall (read-only MCP over mounted stores) ----------
-ARG POND_VERSION=0.13.2
+ARG POND_VERSION=0.16.1
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends xz-utils && \
@@ -139,7 +166,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 pnpm exec tsc --noEmit
 pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 pnpm exec vitest run src/pond-stores.test.ts src/pond-dockerfile.test.ts
-cd container/agent-runner && bun test pond-registration.test.ts && cd ../..
+cd container/agent-runner && bun test src/pond-registration.test.ts && cd ../..
 ```
 
 ## Phase 3: Configure stores

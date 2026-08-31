@@ -49,13 +49,11 @@ Each session has **two** SQLite files under `data/v2-sessions/<session_id>/`:
 
 Exactly one writer per file — no cross-mount lock contention. Heartbeat is a file touch at `/workspace/.heartbeat`, not a DB update. Host uses even `seq` numbers, container uses odd.
 
-**Gating UX on container state.** Heartbeat only fires when the SDK's event loop runs; long pure-thinking gaps (e.g. `effortLevel: xhigh`) make it stale even though the agent is alive. For user-facing signals like typing indicators, gate on `outbound.db` `processing_ack` rows instead — the container clears them on each turn's `ResultMessage`, so the row mirrors the SDK turn lifecycle exactly. See `src/modules/typing/index.ts`.
-
 ## Central DB
 
-`data/v2.db` holds everything that isn't per-session: users, user_roles, agent_groups, messaging_groups, wiring, pending_approvals, user_dms, chat_sdk_* (for the Chat SDK bridge), schema_version. Migrations live at `src/db/migrations/`.
+The central database holds everything that isn't per-session: users, user_roles, agent_groups, messaging_groups, wiring, pending_approvals, user_dms, chat_sdk_* (for the Chat SDK bridge), schema_version. SQLite at `data/v2.db` is the default; host code uses the async `DbDriver` boundary. Migrations live at `src/db/migrations/`.
 
-For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than the `sqlite3` CLI: `pnpm exec tsx scripts/q.ts <db> "<sql>"`. The host setup intentionally avoids depending on the `sqlite3` binary (`setup/verify.ts:5`); the wrapper goes through the `better-sqlite3` dep that setup already installs and verifies. Default-output format matches `sqlite3 -list` (pipe-separated, no header) so existing skill text reads identically.
+For ad-hoc central queries from skills or scripts, use the in-tree wrapper rather than the `sqlite3` CLI: `pnpm exec tsx scripts/q.ts data/v2.db "<sql>"`. The canonical central path routes through the installed composition; explicit session paths remain direct SQLite. Default output matches `sqlite3 -list` (pipe-separated, no header).
 
 ## Key Files
 
@@ -73,20 +71,19 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `src/modules/permissions/access.ts` | `canAccessAgentGroup` — owner / global admin / scoped admin / member resolution against `user_roles` + `agent_group_members` |
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval`, approval-handler registry |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
-| `src/commands/` | Host command service: `/status` `/model` `/config` `/restart` semantics, model catalog, validation, target resolution, popup grants. Channel-agnostic; returns view-models. Router fallback renderer lives here too (`fallback.ts`). |
-| `src/channels/telegram-grammy/commands/` | Native Telegram binding for the chat commands: `@grammyjs/commands` CommandGroup + `@grammyjs/menu` menus, startup scope janitor, per-tap auth. |
 | `src/modules/approvals/onecli-approvals.ts` | OneCLI credentialed-action approval bridge |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
 | `src/db/container-configs.ts` | CRUD for `container_configs` table (per-group container runtime config) |
 | `src/backfill-container-configs.ts` | Migrates legacy `container.json` files into the DB on startup |
+| `src/project-doc-compose.ts` | Composes each group's project document — every instruction source read on the host and inlined into one flat file, no imports |
 | `src/container-restart.ts` | Kill + on-wake respawn for agent group containers |
 | `src/db/` | DB layer — agent_groups, messaging_groups, sessions, container_configs, user_roles, user_dms, pending_*, migrations |
 | `src/channels/` | Channel adapter infra (registry, Chat SDK bridge); specific channel adapters are skill-installed from the `channels` branch |
 | `src/channels/channel-defaults.ts` | Wiring-creation helpers over adapter-declared channel defaults (`resolveWiringDefaults`, `resolveThreadPolicy`, engage validation) |
 | `src/providers/` | Host-side provider container-config (`claude` baked in; `opencode` etc. installed from the `providers` branch) |
 | `container/agent-runner/src/` | Agent-runner: poll loop, formatter, provider abstraction, MCP tools, destinations |
-| `container/skills/` | Container skills mounted into every agent session (`agent-browser`, `frontend-engineer`, `onecli-gateway`, `self-customize`, `vercel-cli`, `welcome`; channel-specific skills like `slack-formatting` and `whatsapp-formatting` install with their channel) |
+| `container/skills/` | Container skills mounted into every agent session (`agent-browser`, `frontend-engineer`, `onecli-gateway`, `self-customize`, `welcome`; opt-in skills like `vercel-cli`, `slack-formatting` and `whatsapp-formatting` install with the `/add-*` skill that adds their capability) |
 | `groups/<folder>/` | Per-agent-group filesystem (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
 | `scripts/init-first-agent.ts` | Bootstrap the first DM-wired agent (used by `/init-first-agent` skill) |
 | `scripts/skill-apply.ts` | Deterministic SKILL.md applier — executes `nc:` directive fences; declare/emit core, journaled + idempotent |
@@ -94,18 +91,6 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `setup/lib/skill-driver.ts` + `setup/channels/run-channel-skill.ts` | Setup wizard's skill consumer: clack rendering of engine events + the generic channel-install flow |
 | `migrate-v2.sh` + `setup/migrate-v2/` | v1→v2 migration. Standalone script: `bash migrate-v2.sh`. Seeds DB, copies groups/sessions, installs channels, builds container, offers service switchover, then hands off to `/migrate-from-v1` skill for owner setup and CLAUDE.md cleanup. See [docs/migration-dev.md](docs/migration-dev.md). |
 | `nanoclaw.sh --uninstall` + `setup/uninstall/` | Uninstall this copy only (slug-scoped): service, containers + image, `data/`, `logs/`, `groups/`, this copy's OneCLI agents. Confirms per group; `--dry-run` previews, `--yes` skips prompts. Other copies and the shared OneCLI app are untouched. Bypasses bootstrap entirely; `uninstall.sh` is a pointer that execs it. |
-
-## Per-agent group file layout
-
-`groups/<folder>/` is **per-user, gitignored** — agent personas, group memories, and OneCLI state are local-only. Only the trunk infrastructure is tracked in the repo.
-
-Inside a group folder, three files compose the SDK system context at spawn:
-
-- **`CLAUDE.md`** — auto-composed pointer (just `@./.claude-shared.md`), regenerated on every spawn. Do not hand-edit.
-- **`CLAUDE.local.md`** — the per-group editable file: persona, voice, banned phrases, `About <user>` context. SDK auto-loads it after `CLAUDE.md`.
-- **`.claude-shared.md`** — symlink to `/app/CLAUDE.md`, which resolves inside the container to the host's `container/CLAUDE.md`. This is how global agent instructions reach every group.
-
-Per-group persona edits go in `CLAUDE.local.md`. Global agent instructions go in `container/CLAUDE.md` (no rebuild needed; runtime cpSync picks them up on the next session spawn).
 
 ## Admin CLI (`ncl`)
 
@@ -133,12 +118,6 @@ ncl help
 | approvals | list, get | Pending approval requests (read-only) |
 
 Key files: `src/cli/dispatch.ts` (dispatcher + approval handler), `src/cli/crud.ts` (generic CRUD registration), `src/cli/resources/` (per-resource definitions).
-
-## Chat Commands
-
-Four host-owned slash commands let an operator inspect and retune an agent group from chat: `/status` (member-runnable, read-only), plus admin-only `/model`, `/config`, `/restart`. The router claims them before the per-agent fan-out (`command-gate.ts` `classifyHostCommand`), so they never leak to the container SDK's native `/model` `/status` handlers. Auth is re-checked server-side on every command and every menu tap.
-
-Architecture is a model/view split: `HostCommandService` (`src/commands/`) owns all semantics and returns view-models; the router fallback (`src/commands/fallback.ts`) renders plain text / `ask_question` cards on any channel; telegram-grammy binds natively (`src/channels/telegram-grammy/commands/`) with menus + an admin-only popup scope janitor. `/model` and `/config` writes are instant-kill + lazy-respawn (apply from the next reply); `/restart` respawns immediately with a wake message. Full reference: [docs/chat-commands.md](docs/chat-commands.md).
 
 ## Channels and Providers (skill-installed)
 
@@ -171,7 +150,7 @@ Per-agent-group container runtime config (provider, model, packages, MCP servers
 | `group` (default) | Agent can access `groups`, `sessions`, `destinations`, `members`, `tasks` only, scoped to its own agent group. `--id` and group args are auto-filled. Cross-group access rejected. `cli_scope` changes blocked. |
 | `global` | Unrestricted. Set automatically for owner agent groups via `init-first-agent`. |
 
-Key files: `src/db/container-configs.ts`, `src/container-config.ts`, `src/cli/dispatch.ts` (scope enforcement), `src/claude-md-compose.ts` (instructions exclusion).
+Key files: `src/db/container-configs.ts`, `src/container-config.ts`, `src/cli/dispatch.ts` (scope enforcement), `src/project-doc-compose.ts` (instructions exclusion).
 
 ## Container Restart
 
@@ -208,10 +187,10 @@ If approvals are configured server-side but the host callback isn't running (or 
 
 ## Per-agent Claude config (model, effortLevel, autoCompactWindow, …)
 
-Per-agent Claude Agent SDK options live in the agent's **user-level** Claude Code settings file — we do NOT thread them through `container.json` or host code. The SDK loads this file via our existing `settingSources: ['project', 'user']` option.
+Per-agent Claude Agent SDK options live in the agent's **user-level** Claude Code settings file — we do NOT thread them through `container.json` or host code. The SDK loads this file via our existing `settingSources: ['project', 'user', 'local']` option.
 
 - Host path: `data/v2-sessions/<agent_group_id>/.claude-shared/settings.json`
-- Container mount: `/home/node/.claude/settings.json` (read-write, `container-runner.ts:268`)
+- Container mount: `/home/node/.claude/settings.json` (read-write, `container-runner.ts:868`)
 - Documented precedent: `docs/ollama.md` sets `"model"` here
 - Schema: see the SDK's `Settings` interface in `@anthropic-ai/claude-agent-sdk/sdk.d.ts` — includes `model`, `effortLevel`, `autoCompactWindow`, `alwaysThinkingEnabled`, and many more
 
@@ -224,7 +203,7 @@ Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxono
 - **Channel/provider install skills** — copy the relevant module(s) in from the `channels` or `providers` branch, wire imports, install pinned deps (e.g. `/add-discord`, `/add-slack`, `/add-whatsapp`, `/add-opencode`).
 - **Utility skills** — ship code files alongside `SKILL.md` (e.g. a `scripts/` CLI or helper).
 - **Operational skills** — instruction-only workflows (`/setup`, `/debug`, `/customize`, `/init-first-agent`, `/manage-channels`, `/init-onecli`, `/update-nanoclaw`).
-- **Container skills** — loaded inside agent containers at runtime (`container/skills/`: `agent-browser`, `frontend-engineer`, `onecli-gateway`, `self-customize`, `vercel-cli`, `welcome`; channel-specific skills like `slack-formatting` and `whatsapp-formatting` are copied in by their `/add-<channel>` skill).
+- **Container skills** — loaded inside agent containers at runtime (`container/skills/`: `agent-browser`, `frontend-engineer`, `onecli-gateway`, `self-customize`, `welcome`; opt-in skills like `vercel-cli` and the channel formatters are copied in by the `/add-*` skill that adds their capability).
 
 | Skill | When to Use |
 |-------|-------------|
@@ -299,7 +278,7 @@ Note: container logs are lost after the container exits (`--rm` flag). If the ag
 
 Two rules, no exceptions:
 
-- **Storage**: every timestamp written from JS is `new Date().toISOString()` (ISO-8601 UTC with `Z`). Never `datetime('now')` — its naive `YYYY-MM-DD HH:MM:SS` shape is misparsed as local time by `new Date()` and breaks string comparisons against ISO values. In pure-SQL contexts (skill snippets) use `strftime('%Y-%m-%dT%H:%M:%fZ','now')`. SQL-side *comparisons* wrap both sides in `datetime()`.
+- **Storage**: every timestamp written from JS is `new Date().toISOString()` (ISO-8601 UTC with `Z`). Central SQL receives that timestamp as a parameter; never use `datetime('now')` or `strftime(...)` there because they are SQLite-specific and the naive shape is misparsed as local time by `new Date()`. SQLite-only mailbox SQL may use `strftime('%Y-%m-%dT%H:%M:%fZ','now')`. SQLite-only comparisons wrap both sides in `datetime()`.
 - **Display**: anything shown to an agent or a user renders in the install timezone — `formatLocalTime` (prose) or `formatLocalStamp` (log lines) from `src/timezone.ts` / `container/agent-runner/src/timezone.ts`. `--json` output, DB values, and operator logs stay ISO.
 
 An agent group can override the install timezone (`ncl groups config update --timezone <IANA>`, `""` clears; approval-gated for agent callers). The override grounds that group's scheduling (cron interpretation, `--process-after`, run-log stamps — effective immediately) and the container's `TZ` env (effective on respawn). Host-side operator display (`ncl` human output) stays in the install timezone. Resolution: `resolveGroupTimezone` in `src/container-config.ts` — group override → install global.
@@ -336,7 +315,7 @@ This project uses pnpm with `minimumReleaseAge: 4320` (3 days) in `pnpm-workspac
 | [docs/skill-directives.md](docs/skill-directives.md) | `nc:` directive reference: fence grammar, the eight kinds, effects, guards, lint |
 | [docs/skill-engine-seam.md](docs/skill-engine-seam.md) | Skill-engine consumer contract (wizard / pipeline / agent-relay) + boundary-rule rationale |
 | [docs/templates.md](docs/templates.md) | Agent templates: what they are, stamping via `ncl groups create --template` + the setup wizard, the OneCLI/MCP-credential model, supported providers, and how to contribute one |
-| [docs/chat-commands.md](docs/chat-commands.md) | Host-owned chat commands (`/status` `/model` `/config` `/restart`): auth, apply semantics, the config surface, model catalog, Telegram popup registration + scope janitor, multi-agent chats, troubleshooting |
+| [docs/hardened-image.md](docs/hardened-image.md) | Opt-in: pull the agent image from a registry instead of building it |
 
 ## Container Build Cache
 
@@ -354,7 +333,7 @@ The agent container runs on **Bun**; the host runs on **Node** (pnpm). They comm
 - **Adding a test in `container/agent-runner/src/`** → import from `bun:test`, not `vitest`. Vitest runs on Node and can't load `bun:sqlite`. `vitest.config.ts` excludes this tree.
 - **Adding a Node CLI the agent invokes at runtime** (like `agent-browser`, `claude-code`, `vercel`) → put it in the Dockerfile's pnpm global-install block, pinned to an exact version via a new `ARG`. Don't use `bun install -g` — that bypasses the pnpm supply-chain policy.
 - **Changing the Dockerfile entrypoint or the dynamic-spawn command** (`src/container-runner.ts` line ~503) → keep `exec bun ...` so signals forward cleanly. The image has no `/app/dist`; don't reintroduce a tsc build step.
-- **Changing session-DB pragmas** (`container/agent-runner/src/db/connection.ts`) → `journal_mode=DELETE` is load-bearing for cross-mount visibility. Read the comment block at the top of the file first.
+- **Changing session-DB pragmas** (`container/agent-runner/src/mailbox/sqlite/connection.ts`) → `journal_mode=DELETE` is load-bearing for cross-mount visibility. Read the comment block at the top of the file first.
 
 ## CJK font support
 

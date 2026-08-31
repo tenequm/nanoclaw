@@ -1,5 +1,5 @@
 /**
- * Core MCP tools: send_message, send_file, edit_message, add_reaction.
+ * Core MCP tools: send_message, send_file, send_media_group, edit_message, add_reaction.
  *
  * All outbound tools resolve destinations via the local destination map
  * (see destinations.ts). Agents reference destinations by name; the map
@@ -93,7 +93,7 @@ export const sendMessage: McpToolDefinition = {
     if ('error' in routing) return err(routing.error);
 
     const id = generateId();
-    const seq = writeMessageOut({
+    const seq = await writeMessageOut({
       id,
       in_reply_to: getCurrentInReplyTo(),
       kind: 'chat',
@@ -142,7 +142,7 @@ export const sendFile: McpToolDefinition = {
     fs.mkdirSync(outboxDir, { recursive: true });
     fs.copyFileSync(resolvedPath, path.join(outboxDir, filename));
 
-    writeMessageOut({
+    await writeMessageOut({
       id,
       in_reply_to: getCurrentInReplyTo(),
       kind: 'chat',
@@ -154,47 +154,6 @@ export const sendFile: McpToolDefinition = {
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename})`);
     return ok(`File sent to ${routing.resolvedName} (id: ${id}, filename: ${filename})`);
-  },
-};
-
-export const editMessage: McpToolDefinition = {
-  tool: {
-    name: 'edit_message',
-    description: 'Edit a previously sent message. Targets the same destination the original message was sent to.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        messageId: { type: 'integer', description: 'Message ID (the numeric id shown in messages)' },
-        text: { type: 'string', description: 'New message content' },
-      },
-      required: ['messageId', 'text'],
-    },
-  },
-  async handler(args) {
-    const seq = Number(args.messageId);
-    const text = args.text as string;
-    if (!seq || !text) return err('messageId and text are required');
-
-    const platformId = getMessageIdBySeq(seq);
-    if (!platformId) return err(`Message #${seq} not found`);
-
-    const routing = getRoutingBySeq(seq);
-    if (!routing || !routing.channel_type || !routing.platform_id) {
-      return err(`Cannot determine destination for message #${seq}`);
-    }
-
-    const id = generateId();
-    writeMessageOut({
-      id,
-      kind: 'chat',
-      platform_id: routing.platform_id,
-      channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
-      content: JSON.stringify({ operation: 'edit', messageId: platformId, text }),
-    });
-
-    log(`edit_message: #${seq} → ${platformId}`);
-    return ok(`Message edit queued for #${seq}`);
   },
 };
 
@@ -253,8 +212,9 @@ export const sendMediaGroup: McpToolDefinition = {
       filenames.push(filename);
     }
 
-    writeMessageOut({
+    await writeMessageOut({
       id,
+      in_reply_to: getCurrentInReplyTo(),
       kind: 'chat',
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
@@ -264,6 +224,47 @@ export const sendMediaGroup: McpToolDefinition = {
 
     log(`send_media_group: ${id} → ${routing.resolvedName} (${filenames.length} files)`);
     return ok(`Media group sent to ${routing.resolvedName} (id: ${id}, count: ${filenames.length})`);
+  },
+};
+
+export const editMessage: McpToolDefinition = {
+  tool: {
+    name: 'edit_message',
+    description: 'Edit a previously sent message. Targets the same destination the original message was sent to.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        messageId: { type: 'integer', description: 'Message ID (the numeric id shown in messages)' },
+        text: { type: 'string', description: 'New message content' },
+      },
+      required: ['messageId', 'text'],
+    },
+  },
+  async handler(args) {
+    const seq = Number(args.messageId);
+    const text = args.text as string;
+    if (!seq || !text) return err('messageId and text are required');
+
+    const platformId = getMessageIdBySeq(seq);
+    if (!platformId) return err(`Message #${seq} not found`);
+
+    const routing = getRoutingBySeq(seq);
+    if (!routing || !routing.channel_type || !routing.platform_id) {
+      return err(`Cannot determine destination for message #${seq}`);
+    }
+
+    const id = generateId();
+    await writeMessageOut({
+      id,
+      kind: 'chat',
+      platform_id: routing.platform_id,
+      channel_type: routing.channel_type,
+      thread_id: routing.thread_id,
+      content: JSON.stringify({ operation: 'edit', messageId: platformId, text }),
+    });
+
+    log(`edit_message: #${seq} → ${platformId}`);
+    return ok(`Message edit queued for #${seq}`);
   },
 };
 
@@ -298,7 +299,7 @@ export const addReaction: McpToolDefinition = {
     }
 
     const id = generateId();
-    writeMessageOut({
+    await writeMessageOut({
       id,
       kind: 'chat',
       platform_id: routing.platform_id,

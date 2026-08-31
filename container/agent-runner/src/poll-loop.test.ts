@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
-import { getPendingMessages, markCompleted, markProcessing } from './db/messages-in.js';
+import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
+import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { isCorruptionError, processQuery } from './poll-loop.js';
+import { processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -296,10 +296,13 @@ describe('mock provider', () => {
     }
 
     const typed = events.filter((e) => e.type !== 'activity');
-    expect(typed.length).toBeGreaterThanOrEqual(2);
+    expect(typed.length).toBeGreaterThanOrEqual(3);
     expect(typed[0].type).toBe('init');
-    expect(typed[1].type).toBe('result');
-    expect((typed[1] as { text: string }).text).toBe('Echo: Hello');
+    // The mock declares emitsMidTurnText, so the turn's text streams as a
+    // text event before the result repeats it.
+    expect(typed[1].type).toBe('text');
+    expect(typed[2].type).toBe('result');
+    expect((typed[2] as { text: string }).text).toBe('Echo: Hello');
   });
 
   it('should handle push() during active query', async () => {
@@ -354,7 +357,7 @@ describe('end-to-end with mock provider', () => {
 
     for await (const event of query.events) {
       if (event.type === 'result' && event.text) {
-        writeMessageOut({
+        await writeMessageOut({
           id: `out-${Date.now()}`,
           in_reply_to: routing.inReplyTo,
           kind: 'chat',
@@ -411,6 +414,34 @@ const ERR_ROUTING = {
   inReplyTo: 'm1',
 };
 
+it('does not push accumulated-only follow-ups into an active query', async () => {
+  const pushes: string[] = [];
+
+  async function* events(): AsyncGenerator<ProviderEvent> {
+    yield { type: 'init', continuation: 'sess-1' };
+    insertMessage('m1', 'chat', { sender: 'A', text: 'context only' }, { trigger: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 750));
+  }
+
+  await processQuery(
+    {
+      push: (message) => pushes.push(message),
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    },
+    ERR_ROUTING,
+    [],
+    'claude',
+    undefined,
+    'prompt',
+    undefined,
+  );
+
+  expect(pushes).toHaveLength(0);
+  expect(getPendingMessages().map((m) => m.id)).toEqual(['m1']);
+});
+
 describe('error result with no <message> envelope', () => {
   it('delivers a budget/billing error to the triggering channel and does not nudge', async () => {
     const budgetText = 'Spending limit reached. Add your own key at https://example.com/keys';
@@ -435,286 +466,6 @@ describe('error result with no <message> envelope', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
-  });
-
-  it('holds the processing claim while the re-wrap retry runs, completes it at the retry result', async () => {
-    // The nudge means the turn is still composing the user's reply — the
-    // claim gates the host's typing indicator, and completing it early
-    // would also mark a crashed (undelivered) retry as done instead of
-    // letting the sweep redeliver.
-    getInboundDb()
-      .prepare(
-        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
-      )
-      .run();
-    insertMessage('m1', 'chat', { sender: 'John', text: 'hi' });
-    markProcessing(['m1']);
-
-    const claimStatus = () =>
-      (
-        getOutboundDb().prepare("SELECT status FROM processing_ack WHERE message_id = 'm1'").get() as {
-          status: string;
-        }
-      ).status;
-
-    let statusAfterNudge: string | undefined;
-    const pushes: string[] = [];
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 'sess-1' };
-      yield { type: 'result', text: 'bare text, no envelope' };
-      statusAfterNudge = claimStatus();
-      yield { type: 'result', text: '<message to="main">wrapped retry</message>' };
-    }
-    const query: AgentQuery = {
-      push: (m: string) => {
-        pushes.push(m);
-      },
-      end: () => {},
-      events: events(),
-      abort: () => {},
-    };
-
-    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
-
-    expect(pushes).toHaveLength(1);
-    expect(statusAfterNudge).toBe('processing');
-    expect(claimStatus()).toBe('completed');
-  });
-});
-
-describe('native slash-command result (commandTurn)', () => {
-  it('delivers the SDK command output verbatim and does not nudge', async () => {
-    const compactText = 'Context compacted (48,462 tokens compacted).';
-    const { query, pushes } = makeResultQuery({ type: 'result', text: compactText });
-
-    // commandTurn=true — this turn's prompt was a native slash command.
-    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, '/compact', undefined, true);
-
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe(compactText);
-    expect(out[0].platform_id).toBe('chan-1');
-    // No re-wrap nudge — the command output legitimately has no <message>.
-    expect(pushes).toHaveLength(0);
-  });
-});
-
-describe('mid-turn auto-compact (notice event)', () => {
-  const NOTICE = '🗜 Context compacted (48,462 tokens summarized). Older messages were summarized to free up space.';
-
-  it('delivers the notice, does not nudge, and the wrapped reply still goes out exactly once', async () => {
-    // Destination so the final wrapped block dispatches.
-    getInboundDb()
-      .prepare(
-        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
-      )
-      .run();
-
-    const pushes: string[] = [];
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 'sess-1' };
-      // The SDK auto-compacted mid-turn; the translator emits this notice
-      // BEFORE the agent's real answer.
-      yield { type: 'notice', text: NOTICE };
-      yield { type: 'result', text: '<message to="main">final answer</message>' };
-    }
-    const query: AgentQuery = {
-      push: (m: string) => {
-        pushes.push(m);
-      },
-      end: () => {},
-      events: events(),
-      abort: () => {},
-    };
-
-    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
-
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(2);
-    expect(JSON.parse(out[0].content).text).toBe(NOTICE);
-    expect(JSON.parse(out[1].content).text).toBe('final answer');
-    // The regression: emitting the boundary as a `result` tripped the false
-    // "not delivered" nudge, making the model re-send the already-delivered
-    // reply (duplicate messages in chat). A notice never enters that path.
-    expect(pushes).toHaveLength(0);
-  });
-
-  it('delivers the notice on a native /compact turn (successful compact returns no result text)', async () => {
-    // Verified live 2026-07-28: a successful /compact emits compact_boundary
-    // and EMPTY result text, so the notice is the only confirmation the
-    // operator gets. Suppressing it here made a successful manual compact
-    // silent.
-    const pushes: string[] = [];
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 'sess-1' };
-      yield { type: 'notice', text: NOTICE };
-      yield { type: 'result', text: null };
-    }
-    const query: AgentQuery = {
-      push: (m: string) => {
-        pushes.push(m);
-      },
-      end: () => {},
-      events: events(),
-      abort: () => {},
-    };
-
-    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, '/compact', undefined, true);
-
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe(NOTICE);
-    expect(pushes).toHaveLength(0);
-  });
-
-  it('suppresses the notice when compact_notices is disabled', async () => {
-    getInboundDb()
-      .prepare(
-        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
-      )
-      .run();
-
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 'sess-1' };
-      yield { type: 'notice', text: NOTICE };
-      yield { type: 'result', text: '<message to="main">final answer</message>' };
-    }
-    const query: AgentQuery = {
-      push: () => {},
-      end: () => {},
-      events: events(),
-      abort: () => {},
-    };
-
-    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, false, false);
-
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe('final answer');
-  });
-
-  it('holds the processing claim through the boundary and completes it at the real result', async () => {
-    // The host's typing indicator is gated on 'processing' claims in
-    // processing_ack. Completing them at the compact boundary would kill
-    // typing for the (long) remainder of the turn.
-    getInboundDb()
-      .prepare(
-        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
-      )
-      .run();
-    insertMessage('m1', 'chat', { sender: 'John', text: 'long task' });
-    markProcessing(['m1']);
-
-    const claimStatus = () =>
-      (
-        getOutboundDb().prepare("SELECT status FROM processing_ack WHERE message_id = 'm1'").get() as {
-          status: string;
-        }
-      ).status;
-
-    let statusAfterBoundary: string | undefined;
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 'sess-1' };
-      yield { type: 'result', text: NOTICE, isCompactBoundary: true };
-      // The loop pulls the next event only after handling the previous one,
-      // so this reads the claim state right after the boundary was handled.
-      statusAfterBoundary = claimStatus();
-      yield { type: 'result', text: '<message to="main">final answer</message>' };
-    }
-    const query: AgentQuery = {
-      push: () => {},
-      end: () => {},
-      events: events(),
-      abort: () => {},
-    };
-
-    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
-
-    expect(statusAfterBoundary).toBe('processing');
-    expect(claimStatus()).toBe('completed');
-  });
-
-  it('holds a mid-turn follow-up claim until the result, not at push time', async () => {
-    // query.push() is not an answer: the SDK enqueues the prompt and drains it
-    // at the next turn boundary, which can be minutes away when the model is
-    // deep in a tool batch. Acking the follow-up at push time dropped the
-    // host's typing indicator (gated on 'processing' claims) exactly when the
-    // agent was busiest, and lost the message outright if the container died
-    // before the boundary.
-    getInboundDb()
-      .prepare(
-        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
-      )
-      .run();
-    insertMessage('m1', 'chat', { sender: 'John', text: 'long task' });
-    markProcessing(['m1']);
-
-    const ackStatus = (id: string) =>
-      (
-        getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
-          | { status: string }
-          | undefined
-      )?.status;
-
-    let resolvePushed!: () => void;
-    const pushed = new Promise<void>((r) => {
-      resolvePushed = r;
-    });
-    let followUpStatusMidTurn: string | undefined;
-
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 'sess-1' };
-      // The user pokes while the model is still working.
-      insertMessage('m2', 'chat', { sender: 'John', text: '?' });
-      // Resumes on a microtask AFTER the poller's synchronous block finished,
-      // so this observes the claim as the host's typing gate would see it for
-      // the rest of the turn. Reading it inside push() would be too early to
-      // catch an ack that lands right after the push.
-      await pushed;
-      followUpStatusMidTurn = ackStatus('m2');
-      yield { type: 'result', text: '<message to="main">final answer</message>' };
-    }
-
-    const query: AgentQuery = {
-      push: () => resolvePushed(),
-      end: () => {},
-      events: events(),
-      abort: () => {},
-    };
-
-    // Mutated in place by processQuery, mirroring the caller's `processingIds`.
-    const openClaims = ['m1'];
-    await processQuery(query, ERR_ROUTING, openClaims, 'claude', undefined, 'prompt', undefined);
-
-    expect(followUpStatusMidTurn).toBe('processing');
-    expect(openClaims).toContain('m2');
-    expect(ackStatus('m1')).toBe('completed');
-    expect(ackStatus('m2')).toBe('completed');
-    // Timeout: this test waits on the real ACTIVE_POLL_INTERVAL_MS (500ms)
-    // follow-up tick. Under full-suite load (23 files concurrently) that tick
-    // can slip well past bun's 5s default, so the budget is explicit.
-  }, 15000);
-});
-
-describe('isCorruptionError', () => {
-  it('matches the Docker Desktop macOS torn-read symptom', () => {
-    expect(isCorruptionError('database disk image is malformed')).toBe(true);
-  });
-
-  it('matches wrapped SQLite corruption codes', () => {
-    expect(isCorruptionError('SqliteError: SQLITE_CORRUPT_VTAB: ...')).toBe(true);
-    expect(isCorruptionError('file is not a database')).toBe(true);
-  });
-
-  it('returns false for unrelated errors', () => {
-    expect(isCorruptionError('database is locked')).toBe(false);
-    expect(isCorruptionError('no such table: messages_in')).toBe(false);
-    expect(isCorruptionError('')).toBe(false);
   });
 });
 
@@ -768,9 +519,20 @@ describe('task-run turn wiring (real processQuery)', () => {
       // A SECOND task run lands while the query is open — the follow-up poller
       // pushes it and must reset the per-turn correction state.
       insertMessage('t2', 'task', { prompt: 'fire two' });
-      const deadline = Date.now() + 5000;
+      // The poller ticks every ACTIVE_POLL_INTERVAL_MS (500ms), so this
+      // normally resolves in well under a second. The generous deadline is
+      // for slow shared CI runners — and it must stay well below the test's
+      // own timeout (set below), so exhaustion fails on the diagnostic throw
+      // rather than a mute test timeout.
+      const deadline = Date.now() + 15_000;
       while (!pushes.some((p) => p.includes('fire two')) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 50));
+      }
+      if (!pushes.some((p) => p.includes('fire two'))) {
+        throw new Error(
+          `follow-up poller never pushed the second task run within 15s; ` +
+            `pushes seen (${pushes.length}): ${JSON.stringify(pushes.map((p) => p.slice(0, 80)))}`,
+        );
       }
 
       // Turn 2 repeats the mistake. This receives a second independent nudge
@@ -801,8 +563,8 @@ describe('task-run turn wiring (real processQuery)', () => {
     expect(logs[1]).toContain('[undelivered → local-cli] fire two result');
     expect(logs).not.toContain('first delivery decision handled');
     expect(logs).not.toContain('second delivery decision handled');
-    // Same reason as the follow-up-claim test above: this drives the real
-    // 500ms poll tick and was flaking on bun's 5s default under full-suite
-    // load (it passed in isolation every time).
-  }, 15000);
+    // Explicit budget: the default 5s equalled the old inner deadline, so on
+    // slow runners the test died as a mute timeout instead of reaching the
+    // diagnostic throw above (observed consistently on CI-hosted runners).
+  }, 20_000);
 });

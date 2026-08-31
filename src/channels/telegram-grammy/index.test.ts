@@ -62,4 +62,21 @@ describe('telegram-grammy registration', () => {
     expect(typeof instance.deliver).toBe('function');
     expect(instance.isConnected()).toBe(false);
   });
+
+  it('declares its wiring defaults on both the adapter and the registration', async () => {
+    const { TelegramGrammyAdapter, TELEGRAM_DEFAULTS } = await import('./index.js');
+    const instance: ChannelAdapter = new TelegramGrammyAdapter('0:placeholder', undefined, undefined, undefined);
+    expect(instance.defaults).toBe(TELEGRAM_DEFAULTS);
+
+    // Offline creation paths (setup, ncl) read the declaration from the
+    // registry without instantiating the adapter.
+    const { hasDeclaredChannelDefaults, getChannelDefaults } = await import('../channel-registry.js');
+    expect(hasDeclaredChannelDefaults('telegram')).toBe(true);
+    expect(getChannelDefaults('telegram')).toEqual(TELEGRAM_DEFAULTS);
+
+    // supportsThreads is false, so neither context may honor thread ids.
+    expect(TELEGRAM_DEFAULTS.dm.threads).toBe(false);
+    expect(TELEGRAM_DEFAULTS.group.threads).toBe(false);
+    expect(TELEGRAM_DEFAULTS.dm.engagePattern).toBe('.');
+  });
 });

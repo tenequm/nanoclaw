@@ -65,8 +65,8 @@ describe('composeSelectedCard', () => {
   };
 
   it('uses the selectedLabel from render metadata with an actor byline', () => {
-    expect(composeSelectedCard(render, 'approve', 'ignored current text', 'Misha')).toBe(
-      '🔧 Self-modification request\n\n✅ Approved · Misha',
+    expect(composeSelectedCard(render, 'approve', 'ignored current text', 'Alex')).toBe(
+      '🔧 Self-modification request\n\n✅ Approved · Alex',
     );
   });
 
@@ -79,8 +79,8 @@ describe('composeSelectedCard', () => {
   });
 
   it('appends to the current card text when render metadata is gone', () => {
-    expect(composeSelectedCard(undefined, 'approve', 'Original question body', 'Misha')).toBe(
-      'Original question body\n\n✅ approve · Misha',
+    expect(composeSelectedCard(undefined, 'approve', 'Original question body', 'Alex')).toBe(
+      'Original question body\n\n✅ approve · Alex',
     );
   });
 });

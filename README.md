@@ -18,6 +18,19 @@
 
 ---
 
+<div align="center">
+
+### <img src="https://img.shields.io/badge/NEW!-2EB67D?style=for-the-badge" alt="NEW!" valign="middle"> Agents in Slack: one app per agent <img src="assets/slack-icon.svg" alt="" width="22" valign="middle">
+
+Setup provisions each agent its own Slack app: manifest, avatar, and workspace install, no tokens to paste.
+Spawn teammates from chat: every one gets its own bot identity, container, and memory, with shared rooms and canvases.
+
+[![Quick Start](https://img.shields.io/badge/Quick%20Start%20%E2%86%92-4A154B?style=for-the-badge)](#quick-start)
+
+</div>
+
+---
+
 ## Why I Built NanoClaw
 
 [OpenClaw](https://github.com/openclaw/openclaw) is an impressive project, but I wouldn't have been able to sleep if I had given complex software I didn't understand full access to my life. OpenClaw has nearly half a million lines of code, 53 config files, and 70+ dependencies. Its security is at the application level (allowlists, pairing codes) rather than true OS-level isolation. Everything runs in one Node process with shared memory.
@@ -32,7 +45,7 @@ cd nanoclaw-v2
 bash nanoclaw.sh
 ```
 
-`nanoclaw.sh` walks you from a fresh machine to a named agent you can message. It installs Node, pnpm, and Docker if missing, registers your Anthropic credential with OneCLI, builds the agent container, and pairs your first channel (Telegram, Discord, WhatsApp, or a local CLI). If a step fails, Claude Code is invoked automatically to diagnose and resume from where it broke.
+`nanoclaw.sh` walks you from a fresh machine to a named agent you can message. It installs Node, pnpm, and Docker if missing, registers your Anthropic credential with OneCLI, builds the agent container, and pairs your first channel (Slack, Telegram, Discord, WhatsApp, iMessage, or a local CLI). If a step fails, Claude Code is invoked automatically to diagnose and resume from where it broke.
 
 <details>
 <summary><strong>Migrating from NanoClaw v1?</strong></summary>
@@ -84,6 +97,17 @@ See [docs/v1-to-v2-changes.md](docs/v1-to-v2-changes.md) for what's different an
 - **Credential security** — agents never hold raw API keys. Outbound requests route through [OneCLI's Agent Vault](https://github.com/onecli/onecli), which injects credentials at request time and enforces per-agent policies and rate limits.
 - **Agent templates**: stamp a ready-to-run agent (instructions + MCP tools + skills, no secrets) from a reusable bundle via `ncl groups create --template <ref>`. Templates load from the local `templates/` folder; populate it by hand or by copying from the [public library](https://github.com/nanocoai/nanoclaw-templates). See [docs/templates.md](docs/templates.md).
 
+## Accounts and what leaves your machine
+
+NanoClaw has no user accounts. The only thing it reports is anonymous setup diagnostics, and
+`NANOCLAW_NO_DIAGNOSTICS=1` turns those off. Your agents, messages, files and keys never leave
+your machine.
+
+One opt-in exception: you can [fetch a prebuilt agent image](docs/hardened-image.md) instead of
+building it locally. Fetching ours needs a free account, so we see your email address and when
+you ask for an image — nothing about your agents, and nothing after the image lands. Building
+locally needs no account and contacts nothing, and is the default.
+
 ## Usage
 
 Talk to your assistant with the trigger word (default: `@Andy`):
@@ -129,7 +153,7 @@ No channel or provider skills are currently requested — propose one via an iss
 ## Requirements
 
 - macOS or Linux (Windows via WSL2)
-- Node.js 20+ and pnpm 10+ (the installer will install both if missing)
+- Node.js 22+ and pnpm 10+ (the installer will install both if missing)
 - [Docker Desktop](https://docker.com/products/docker-desktop) (macOS/Windows) or Docker Engine (Linux)
 - [Claude Code](https://claude.ai/download) for `/customize`, `/debug`, error recovery during setup, and all `/add-<channel>` skills
 

@@ -34,6 +34,7 @@ import {
   GroupFolderService,
   type HydratedBot,
   PairingService,
+  TELEGRAM_DEFAULTS,
   TranscriptionService,
 } from './services.js';
 
@@ -108,22 +109,28 @@ export const PairingLayer = Layer.succeed(PairingService, {
       catch: (cause) => new PairingFailed({ platformId: input.platformId, cause }),
     }),
   persistConsumed: (record: PairingRecord, platformId: string) =>
-    Effect.try({
-      try: () => {
+    // Central-DB writes are async now: sequential awaits inside one
+    // Effect.tryPromise (never Promise.all — the driver serializes
+    // statements and a parallel batch can deadlock a transaction).
+    Effect.tryPromise({
+      try: async () => {
         const consumed = record.consumed;
         const name = consumed?.name ?? null;
         const isGroup = consumed?.isGroup ?? false;
-        const existing = getMessagingGroupByPlatform('telegram', platformId);
+        const existing = await getMessagingGroupByPlatform('telegram', platformId);
         if (existing) {
-          updateMessagingGroup(existing.id, { is_group: isGroup ? 1 : 0 });
+          await updateMessagingGroup(existing.id, { is_group: isGroup ? 1 : 0 });
         } else {
-          createMessagingGroup({
+          await createMessagingGroup({
             id: `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             channel_type: 'telegram',
             platform_id: platformId,
             name,
             is_group: isGroup ? 1 : 0,
-            unknown_sender_policy: 'strict',
+            // Take the policy from the channel declaration rather than a
+            // second hardcoded literal, so the pairing-created row and
+            // every other creation surface agree.
+            unknown_sender_policy: (isGroup ? TELEGRAM_DEFAULTS.group : TELEGRAM_DEFAULTS.dm).unknownSenderPolicy,
             created_at: new Date().toISOString(),
           });
         }
@@ -136,14 +143,14 @@ export const PairingLayer = Layer.succeed(PairingService, {
         if (!adminUserId) return;
 
         const pairedUserId = `telegram:${adminUserId}`;
-        upsertUser({
+        await upsertUser({
           id: pairedUserId,
           kind: 'telegram',
           display_name: null,
           created_at: new Date().toISOString(),
         });
-        if (!hasAnyOwner()) {
-          grantRole({
+        if (!(await hasAnyOwner())) {
+          await grantRole({
             user_id: pairedUserId,
             role: 'owner',
             agent_group_id: null,
@@ -168,13 +175,22 @@ export const TranscriptionLayer = Layer.succeed(TranscriptionService, {
 /**
  * Messaging-group → absolute on-disk attachment dir lookup. Combines the
  * DB lookup (`resolveGroupFolderForPlatformId`) with `resolveGroupFolderPath`
- * so callers receive the fully resolved path or null. Synchronous DB reads
- * + a string join — wrapped in `Effect.sync`.
+ * so callers receive the fully resolved path or null. The central-DB lookup
+ * is async, so this is `Effect.tryPromise` (not `Effect.sync`); a failed
+ * lookup degrades to "not wired yet" — the caller drops the bytes and keeps
+ * the attachment metadata.
  */
 export const GroupFolderLayer = Layer.succeed(GroupFolderService, {
   resolveForPlatformId: (platformId) =>
-    Effect.sync(() => {
-      const folder = resolveGroupFolderForPlatformId('telegram', platformId);
-      return folder ? resolveGroupFolderPath(folder) : null;
-    }),
+    Effect.tryPromise({
+      try: async () => {
+        const folder = await resolveGroupFolderForPlatformId('telegram', platformId);
+        return folder ? resolveGroupFolderPath(folder) : null;
+      },
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.as(Effect.logWarning('telegram-grammy: group folder lookup failed', { platformId, cause }), null),
+      ),
+    ),
 });

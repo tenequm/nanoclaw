@@ -21,9 +21,49 @@ import type { UserFromGetMe } from 'grammy/types';
  */
 export type HydratedBot = Bot<GrammyContext, FileApiFlavor<Api>>;
 
-import type { ChannelSetup, InboundMessage } from '../adapter.js';
+import type { ChannelDefaults, ChannelSetup, InboundMessage } from '../adapter.js';
 import type { PairingRecord, ConsumeInput } from '../telegram-pairing.js';
 import type { GrammyNetworkError, PairingFailed } from './errors.js';
+
+/**
+ * Wiring-time defaults for this channel (ChannelDefaults contract).
+ *
+ * Lives here rather than in index.ts for the same reason DEFAULT_API_ROOT
+ * does: layers.ts needs it and services.ts is the one module with no
+ * inbound deps, so index.ts → runtime.ts → layers.ts stays acyclic.
+ * index.ts re-exports it and passes it to registerChannelAdapter so the
+ * offline creation paths (setup, ncl) resolve it without a live bot.
+ *
+ * - dm: engage pattern '.' — every DM message engages, no mention needed.
+ * - group: mention-sticky. resolveWiringDefaults downgrades it to 'mention'
+ *   because this context does not honor thread ids; declaring the sticky
+ *   intent keeps the declaration honest if topics ever become sub-threads.
+ * - threads false in BOTH contexts: the adapter is supportsThreads: false.
+ *   Forum topics are modeled as separate messaging groups
+ *   (`telegram:<chatId>:<topicId>`), not as thread ids on one group.
+ * - unknownSenderPolicy 'strict' everywhere: access to a Telegram chat is
+ *   granted by the pairing handshake (telegram-pairing.ts) plus explicit
+ *   `ncl members add`, never by an in-channel approval card.
+ * - mentions 'platform': inbound.ts sets isMention from real Telegram
+ *   signals — a mention/text_mention entity, a reply to one of the bot's
+ *   own messages, or the message being a DM.
+ */
+export const TELEGRAM_DEFAULTS: ChannelDefaults = {
+  dm: {
+    engageMode: 'pattern',
+    engagePattern: '.',
+    threads: false,
+    unknownSenderPolicy: 'strict',
+  },
+  group: {
+    // Forum topics are separate messaging groups, not threads, so there is
+    // nothing for mention-sticky to stick to: declare the effective mode.
+    engageMode: 'mention',
+    threads: false,
+    unknownSenderPolicy: 'strict',
+  },
+  mentions: 'platform',
+};
 
 /**
  * Cloud Bot API root. The default `apiRoot` in `AdapterConfigService`,

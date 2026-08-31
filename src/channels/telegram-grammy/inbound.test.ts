@@ -25,13 +25,13 @@ const e = (obj: unknown): MessageEntity[] => obj as MessageEntity[];
 
 describe('platformIdFor (forum topics become first-class platform ids)', () => {
   it('returns the 2-part base id for plain chats and DMs', () => {
-    expect(platformIdFor(-1003927289090)).toBe('telegram:-1003927289090');
-    expect(platformIdFor(95307956, { message_id: 1 } as Message)).toBe('telegram:95307956');
+    expect(platformIdFor(-1000000000001)).toBe('telegram:-1000000000001');
+    expect(platformIdFor(1000001, { message_id: 1 } as Message)).toBe('telegram:1000001');
   });
 
   it('suffixes the topic id for forum-topic messages', () => {
     const msg = { message_id: 7, is_topic_message: true, message_thread_id: 42 } as Message;
-    expect(platformIdFor(-1003927289090, msg)).toBe('telegram:-1003927289090:42');
+    expect(platformIdFor(-1000000000001, msg)).toBe('telegram:-1000000000001:42');
   });
 
   it('ignores message_thread_id on non-topic messages (plain reply threads)', () => {
@@ -43,9 +43,9 @@ describe('platformIdFor (forum topics become first-class platform ids)', () => {
 describe('toInboundMessage drops content-free service messages', () => {
   const ctxFor = (msg: Record<string, unknown>) =>
     ({
-      chat: { id: -1003927289090, type: 'supergroup', title: 'HQ' },
+      chat: { id: -1000000000001, type: 'supergroup', title: 'Test group' },
       msg,
-      from: { id: 95307956, first_name: 'Misha', is_bot: false },
+      from: { id: 1000001, first_name: 'Sender', is_bot: false },
       update: {},
     }) as unknown as Parameters<typeof toInboundMessage>[0];
 
@@ -56,7 +56,7 @@ describe('toInboundMessage drops content-free service messages', () => {
   it('keeps a normal text message', () => {
     const env = toInboundMessage(ctxFor({ message_id: 20, date: 1_700_000_000, text: 'hi' }), 'bot', 1);
     expect(env).not.toBeNull();
-    expect(env!.platformId).toBe('telegram:-1003927289090');
+    expect(env!.platformId).toBe('telegram:-1000000000001');
   });
 
   it('keeps an attachment-only message', () => {
@@ -75,11 +75,11 @@ describe('toInboundMessage drops content-free service messages', () => {
 
 describe('parseChatId', () => {
   it('parses the 2-part base form', () => {
-    expect(parseChatId('telegram:-1003927289090')).toBe(-1003927289090);
+    expect(parseChatId('telegram:-1000000000001')).toBe(-1000000000001);
   });
 
   it('parses the chat id out of a 3-part per-topic form', () => {
-    expect(parseChatId('telegram:-1003927289090:42')).toBe(-1003927289090);
+    expect(parseChatId('telegram:-1000000000001:42')).toBe(-1000000000001);
   });
 
   it('throws on garbage', () => {
@@ -90,11 +90,11 @@ describe('parseChatId', () => {
 
 describe('parseTopicId', () => {
   it('extracts the topic from a 3-part per-topic id', () => {
-    expect(parseTopicId('telegram:-1003927289090:42')).toBe(42);
+    expect(parseTopicId('telegram:-1000000000001:42')).toBe(42);
   });
 
   it('returns undefined for the 2-part base form', () => {
-    expect(parseTopicId('telegram:-1003927289090')).toBeUndefined();
+    expect(parseTopicId('telegram:-1000000000001')).toBeUndefined();
   });
 
   it('returns undefined when the 3rd segment is not numeric', () => {
@@ -104,27 +104,27 @@ describe('parseTopicId', () => {
 
 describe('resolveMessageThreadId', () => {
   it('derives the topic from a per-topic platformId when threadId is null', () => {
-    expect(resolveMessageThreadId('telegram:-1003927289090:42', null)).toBe(42);
-    expect(resolveMessageThreadId('telegram:-1003927289090', null)).toBeUndefined();
+    expect(resolveMessageThreadId('telegram:-1000000000001:42', null)).toBe(42);
+    expect(resolveMessageThreadId('telegram:-1000000000001', null)).toBeUndefined();
   });
 
   it('prefers an explicit threadId over the platformId topic', () => {
-    expect(resolveMessageThreadId('telegram:-1003927289090:42', '7')).toBe(7);
+    expect(resolveMessageThreadId('telegram:-1000000000001:42', '7')).toBe(7);
   });
 });
 
 describe('extractTelegramMessageId', () => {
   it('accepts bare numeric id and uses fallback chatId', () => {
-    expect(extractTelegramMessageId('1710', 95307956)).toEqual({ chatId: 95307956, messageId: 1710 });
+    expect(extractTelegramMessageId('1710', 1000001)).toEqual({ chatId: 1000001, messageId: 1710 });
   });
 
   it('accepts 2-part compound and prefers the embedded chatId', () => {
-    expect(extractTelegramMessageId('95307956:1710', 99)).toEqual({ chatId: 95307956, messageId: 1710 });
+    expect(extractTelegramMessageId('1000001:1710', 99)).toEqual({ chatId: 1000001, messageId: 1710 });
   });
 
   it('accepts 3-part compound (agent-wrapped inbound id)', () => {
-    expect(extractTelegramMessageId('95307956:1716:ag-1776438126500-du9io3', 99)).toEqual({
-      chatId: 95307956,
+    expect(extractTelegramMessageId('1000001:1716:ag-1776438126500-du9io3', 99)).toEqual({
+      chatId: 1000001,
       messageId: 1716,
     });
   });

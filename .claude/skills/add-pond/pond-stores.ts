@@ -30,15 +30,29 @@
  * Everything mounted is read-only; pond's MCP surface is read-only by design
  * and the ro mount enforces it even against a direct `pond` invocation in
  * the shell.
+ *
+ * Mount class: `allowlisted-extra`. The store root (`data/pond/stores/<name>`)
+ * and the query-side model cache (under the host user's HF cache) are
+ * host-decided paths that sit outside every root the other classes are pinned
+ * to - `group-state` admits only `data/v2-sessions/<group>` and the group
+ * folder, `install-surface` only the enumerated release surfaces - so those
+ * classes would be denied by `validateSpec`. This is the same contract the
+ * provider-contributed mounts ride: vetted in-tree by this module (read-list
+ * membership, local backend, directory exists) rather than by a path rule,
+ * and always read-only.
  */
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import type { MountClass } from './drivers/types.js';
 import type { VolumeMount } from './providers/provider-container-registry.js';
 
 /** Container-side root; `pond-mcp.ts` in the agent-runner probes these paths. */
 export const POND_CONTAINER_ROOT = '/workspace/extra/pond';
+
+/** See the class rationale in the module header. */
+const POND_MOUNT_CLASS: MountClass = 'allowlisted-extra';
 
 /** Embedding model pond embeds queries with; synced stores carry its vectors. */
 const POND_MODEL_CACHE_SUBPATH = path.join('.cache', 'huggingface', 'hub', 'models--intfloat--multilingual-e5-small');
@@ -87,6 +101,8 @@ export function pondStoreMounts(agentGroupId: string, dataDir: string): VolumeMo
       hostPath: storeDir,
       containerPath: `${POND_CONTAINER_ROOT}/${name}`,
       readonly: true,
+      mountClass: POND_MOUNT_CLASS,
+      scope: agentGroupId,
     });
   }
 
@@ -101,6 +117,8 @@ export function pondStoreMounts(agentGroupId: string, dataDir: string): VolumeMo
         hostPath: hostModelCache,
         containerPath: path.join('/home/node', POND_MODEL_CACHE_SUBPATH),
         readonly: true,
+        mountClass: POND_MOUNT_CLASS,
+        scope: agentGroupId,
       });
     }
   }

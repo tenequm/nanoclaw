@@ -24,6 +24,7 @@ and the block in `buildMounts`:
 
 ```ts
   // Pond recall stores (.claude/skills/add-pond): read-only, host-decided.
+  // The module classes them itself - see the rationale in pond-stores.ts.
   mounts.push(...pondStoreMounts(agentGroup.id, DATA_DIR));
 ```
 
@@ -36,6 +37,8 @@ import { pondMcpServers } from './pond-mcp.js';
 and the merge line:
 
 ```ts
+  // Pond recall (.claude/skills/add-pond): one read-only stdio server per
+  // store the host mounted under /workspace/extra/pond. No mount, no server.
   Object.assign(mcpServers, pondMcpServers());
 ```
 
