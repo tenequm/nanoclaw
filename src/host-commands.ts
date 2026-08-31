@@ -45,6 +45,7 @@ export interface HostCommandContext {
 
 /** Curated picker rows. `__default__` clears the per-group override. */
 const MODEL_OPTIONS: Array<{ label: string; value: string }> = [
+  { label: 'Fable 5', value: 'claude-fable-5' },
   { label: 'Opus 5', value: 'claude-opus-5' },
   { label: 'Sonnet 5', value: 'claude-sonnet-5' },
   { label: 'Haiku 4.5', value: 'claude-haiku-4-5-20251001' },
@@ -184,7 +185,7 @@ async function applyModel(agentGroupId: string, model: string | null): Promise<v
 }
 
 function modelAppliedText(value: string): string {
-  const target = value === '__default__' ? `install default${DEFAULT_MODEL ? ` (${DEFAULT_MODEL})` : ''}` : value;
+  const target = value === '__default__' ? `the install default${DEFAULT_MODEL ? ` (\`${DEFAULT_MODEL}\`)` : ''}` : `\`${value}\``;
   return `Model set to ${target}. Container restarting — the next reply may take a few extra seconds.`;
 }
 
@@ -202,7 +203,7 @@ async function sendModelPicker(ctx: HostCommandContext, reply: (text: string) =>
   }
 
   const row = await getContainerConfig(ctx.agentGroup.id);
-  const current = row?.model ?? (DEFAULT_MODEL ? `${DEFAULT_MODEL} (install default)` : 'SDK default');
+  const current = row?.model ? `\`${row.model}\`` : DEFAULT_MODEL ? `\`${DEFAULT_MODEL}\` (install default)` : 'SDK default';
   const questionId = `hostq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const options = normalizeOptions(MODEL_OPTIONS);
 
@@ -242,7 +243,11 @@ async function sendModelPicker(ctx: HostCommandContext, reply: (text: string) =>
 
 function renderStatus(ctx: HostCommandContext, row: ContainerConfigRow | undefined, withHints: boolean): string {
   const provider = row?.provider ?? 'claude';
-  const model = row?.model ?? (DEFAULT_MODEL ? `${DEFAULT_MODEL} (install default)` : 'SDK default');
+  const model = row?.model
+    ? `\`${row.model}\``
+    : DEFAULT_MODEL
+      ? `\`${DEFAULT_MODEL}\` (install default)`
+      : 'SDK default';
   const effort = row?.effort ?? 'default';
   const timezone = row?.timezone ?? `${TIMEZONE} (install default)`;
   const cliScope = row?.cli_scope ?? 'group';
@@ -250,26 +255,25 @@ function renderStatus(ctx: HostCommandContext, row: ContainerConfigRow | undefin
   const apt = safeParse<string[]>(row?.packages_apt, []);
   const npm = safeParse<string[]>(row?.packages_npm, []);
   const running = isContainerRunning(ctx.session.id);
+  // The command prefix the reader can actually type where they are.
+  const p = ctx.channelType === 'slack' ? '!' : '/';
 
   const lines = [
-    `Agent: ${ctx.agentGroup.name} (${ctx.agentGroup.folder})`,
-    `Provider: ${provider}`,
-    `Model: ${model}`,
-    `Effort: ${effort}`,
-    `CLI scope: ${cliScope}`,
-    `Timezone: ${timezone}`,
-    `Session: ${ctx.session.id} — container ${running ? 'running' : 'stopped'}`,
-    `MCP servers: ${mcpServers.length > 0 ? mcpServers.join(', ') : 'none'}`,
-    `Packages: ${apt.length} apt, ${npm.length} npm`,
+    `**${ctx.agentGroup.name}** (${ctx.agentGroup.folder}) — container ${running ? 'running' : 'stopped'}`,
+    `**Model:** ${model} · **Effort:** ${effort} · **Provider:** ${provider}`,
+    `**Timezone:** ${timezone} · **CLI scope:** ${cliScope}`,
+    `**Session:** \`${ctx.session.id}\``,
+    `**MCP servers:** ${mcpServers.length > 0 ? mcpServers.join(', ') : 'none'}`,
+    `**Packages:** ${apt.length + npm.length > 0 ? `${apt.length} apt, ${npm.length} npm` : 'none'}`,
   ];
 
   if (withHints) {
     lines.push(
       '',
-      'Change with:',
-      '- /model <model-id> or bare /model for a picker',
-      `- ncl groups config update --id ${ctx.agentGroup.id} --effort <level> | --timezone <IANA> | --provider <name>`,
-      `- ncl groups config add-mcp-server / add-package (then ncl groups restart --id ${ctx.agentGroup.id})`,
+      '**Change with:**',
+      `- \`${p}model <model-id>\`, or bare \`${p}model\` for a picker`,
+      `- \`ncl groups config update --id ${ctx.agentGroup.id}\` with \`--effort <level>\`, \`--timezone <IANA>\`, or \`--provider <name>\``,
+      `- \`ncl groups config add-mcp-server\` / \`add-package\`, then \`ncl groups restart --id ${ctx.agentGroup.id}\``,
     );
   }
 

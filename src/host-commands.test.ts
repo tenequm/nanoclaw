@@ -99,9 +99,9 @@ describe('/status and /config', () => {
   it('renders the group config and container state', async () => {
     await handleHostCommand(ctx('/status'));
     const text = lastReplyText();
-    expect(text).toContain('Agent: Emma (emma)');
-    expect(text).toContain('Model: claude-sonnet-5');
-    expect(text).toContain('Effort: high');
+    expect(text).toContain('**Emma** (emma)');
+    expect(text).toContain('`claude-sonnet-5`');
+    expect(text).toContain('**Effort:** high');
     expect(text).toContain('container stopped');
     expect(text).not.toContain('Change with:');
   });
@@ -119,7 +119,7 @@ describe('/model with an argument', () => {
     await handleHostCommand(ctx('/model', 'claude-opus-5'));
     expect((await getContainerConfig('ag-1'))?.model).toBe('claude-opus-5');
     expect(captured.restarts).toEqual(['ag-1']);
-    expect(lastReplyText()).toContain('Model set to claude-opus-5');
+    expect(lastReplyText()).toContain('Model set to `claude-opus-5`');
   });
 
   it('clears the override on "default"', async () => {
@@ -155,12 +155,14 @@ describe('/model picker', () => {
   it('delivers an ask_question card and applies the clicked model', async () => {
     await handleHostCommand(ctx('/model'));
     const question = deliveredQuestion();
-    expect(question.options.map((o) => o.value)).toContain('claude-opus-5');
+    expect(question.options.map((o) => o.value)).toEqual(
+      expect.arrayContaining(['claude-fable-5', 'claude-opus-5']),
+    );
 
     expect(await dispatchClick(question.questionId, 'claude-opus-5', 'U-owner')).toBe(true);
     expect((await getContainerConfig('ag-1'))?.model).toBe('claude-opus-5');
     expect(captured.restarts).toEqual(['ag-1']);
-    expect(lastReplyText()).toContain('Model set to claude-opus-5');
+    expect(lastReplyText()).toContain('Model set to `claude-opus-5`');
 
     // Consumed: a second click on the same card is not claimed.
     expect(await dispatchClick(question.questionId, 'claude-opus-5', 'U-owner')).toBe(false);
