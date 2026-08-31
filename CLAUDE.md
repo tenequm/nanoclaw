@@ -185,6 +185,17 @@ Approval-gating credentialed actions is a **two-sided** flow:
 
 If approvals are configured server-side but the host callback isn't running (or throws), every credentialed call hangs until the gateway times out. Conversely, if the gateway has no rule asking for approval, the host callback never fires regardless of how it's wired.
 
+## Per-agent Claude config (model, effortLevel, autoCompactWindow, …)
+
+Per-agent Claude Agent SDK options live in the agent's **user-level** Claude Code settings file — we do NOT thread them through `container.json` or host code. The SDK loads this file via our existing `settingSources: ['project', 'user', 'local']` option.
+
+- Host path: `data/v2-sessions/<agent_group_id>/.claude-shared/settings.json`
+- Container mount: `/home/node/.claude/settings.json` (read-write, `container-runner.ts:868`)
+- Documented precedent: `docs/ollama.md` sets `"model"` here
+- Schema: see the SDK's `Settings` interface in `@anthropic-ai/claude-agent-sdk/sdk.d.ts` — includes `model`, `effortLevel`, `autoCompactWindow`, `alwaysThinkingEnabled`, and many more
+
+To switch one agent: edit that file, wait for the container to respawn (or restart the service). Zero code changes needed — this is Claude Code's native settings mechanism.
+
 ## Skills
 
 Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxonomy.
@@ -237,6 +248,8 @@ cd container/agent-runner && bun test      # Container tests (bun:test)
 ```
 
 Container typecheck is a separate tsconfig — if you edit `container/agent-runner/src/`, run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` from root (or `bun run typecheck` from `container/agent-runner/`).
+
+`pnpm lint` runs ESLint over `src/`. Rule decisions live in `eslint.config.js` with comments. Notable: `no-catch-all/no-catch-all` is disabled — NanoClaw is a long-running daemon where catch-and-log-and-continue at I/O boundaries is the correct pattern; narrowing + rethrowing would crash the host on unknown errors. The Effect-TS island in `src/channels/telegram-grammy/` keeps stricter type-aware promise rules.
 
 Service management:
 ```bash

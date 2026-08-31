@@ -1,10 +1,14 @@
 ## Outbound tools
 
-The runtime system prompt lists your destinations and explains how final output is handled in this session. Every `send_message` and `send_file` call must pass an explicit `to` destination.
+The runtime system prompt lists your destinations and explains how final output is handled in this session. Every `send_message`, `send_file`, and `send_media_group` call must pass an explicit `to` destination.
 
 ### Sending files (`send_file`)
 
 Use `mcp__nanoclaw__send_file({ to, path, text?, filename? })` to deliver a file from your workspace. `path` is absolute or relative to `/workspace/agent/`; `filename` overrides the display name shown in chat (defaults to the file's basename); `text` is an optional accompanying message. Use this for artifacts you produce (charts, PDFs, generated images, reports) rather than dumping contents into chat.
+
+### Sending an album (`send_media_group`)
+
+Use `mcp__nanoclaw__send_media_group({ to, items })` to deliver 2-10 files as one album; each item is `{ path, caption? }` with the same path rules as `send_file`. Photos and videos render as a gallery, other types as a grouped list. Use `send_file` for a single file.
 
 ### Reacting to messages (`add_reaction`)
 
