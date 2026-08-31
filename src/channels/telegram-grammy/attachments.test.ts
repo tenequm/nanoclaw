@@ -94,7 +94,6 @@ function buildTestLayers(opts: BuildLayersOpts) {
     maxFileSizeBytes: opts.maxFileSizeBytes ?? CLOUD_MAX_BYTES,
     localFilesDir: opts.localFilesDir ?? null,
     onInbound: () => Effect.void,
-    onMetadata: () => {},
     onAction: () => {},
   });
 

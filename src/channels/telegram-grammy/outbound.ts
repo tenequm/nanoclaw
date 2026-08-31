@@ -514,8 +514,3 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
 
   return result;
 });
-
-// Test-only re-exports so the smoke test can mount a mock BotService and
-// exercise sendWithFallback directly. Keeps the test surface narrow.
-export const _sendWithFallbackForTest = sendWithFallback;
-export const _sendTextChunksForTest = sendTextChunks;

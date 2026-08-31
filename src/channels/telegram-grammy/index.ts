@@ -7,14 +7,13 @@
  * caught before the runPromise call so nothing throws out — matches the
  * host's `delivery.ts` expectation that `deliver` never throws.
  *
- * Activated only when `TELEGRAM_GRAMMY_BOT_TOKEN` is set. Coexists with
- * the legacy `telegram` adapter — channel_type is distinct so wirings
- * don't collide. Switching between them is `unset`+restart; no DB
- * migration needed.
+ * Activated when `TELEGRAM_BOT_TOKEN` is set. Its channel type is `telegram`.
+ * It replaces the Chat SDK Telegram adapter installed by `/add-telegram`;
+ * the two cannot coexist because both register the same channel type.
  *
  * This folder is Effect-TS v4. Use `Effect.gen`/`Effect.fn`. No try/catch
  * outside of `Effect.tryPromise`. All errors typed via
- * `Schema.TaggedErrorClass`. See ~/.claude/skills/effect-ts/SKILL.md.
+ * `Schema.TaggedErrorClass`.
  */
 import { Effect } from 'effect';
 import type { Context } from 'grammy';

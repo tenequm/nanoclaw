@@ -127,7 +127,7 @@ Use the `ncl` CLI for recurring tasks (run it via Bash):
 
 ```bash
 ncl tasks create --name "daily-ads-report" \
-  --prompt "Run the daily Meta Ads report using the 5 Daily Questions framework. Pull yesterday's data, compare to prior 7-day average. Alert on any anomalies." \
+  --prompt "Run the daily Meta Ads report using the Daily check data points section of the meta-ads skill. Pull yesterday's data, compare to prior 7-day average. Alert on any anomalies." \
   --recurrence "0 9 * * *"
 ```
 

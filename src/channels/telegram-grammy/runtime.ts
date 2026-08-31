@@ -174,7 +174,6 @@ export function buildAdapterLayer(config: AdapterRuntimeConfig): Layer.Layer<Ada
             try: () => Promise.resolve(config.hostConfig.onInbound(platformId, threadId, message)),
             catch: (cause) => cause,
           }).pipe(Effect.catchCause(() => Effect.void)),
-        onMetadata: config.hostConfig.onMetadata,
         onAction: config.hostConfig.onAction,
       };
     }),

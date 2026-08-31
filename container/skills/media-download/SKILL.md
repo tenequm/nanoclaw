@@ -1,3 +1,13 @@
+---
+name: media-download
+description: >-
+  Download media from URLs with yt-dlp or instaloader and send the resulting
+  files to chats.
+metadata:
+  author: nanoclaw
+  version: "1.0.0"
+---
+
 # Media Download
 
 Download media from URLs and send to chats using yt-dlp and instaloader.

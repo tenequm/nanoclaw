@@ -52,10 +52,9 @@ export function buildAskQuestionKeyboard(
 
 /**
  * Compose the card body shown after an option is tapped: title + the
- * selected-state label + who acted, mirroring chat-sdk-bridge's onAction
- * edit. Without render metadata (pending row already resolved/deleted) fall
- * back to appending the choice to the card's current text so context is
- * preserved.
+ * selected label + who acted, matching chat-sdk-bridge's onAction edit.
+ * Without render metadata, fall back to appending the selected value to the
+ * card's current text so context is preserved.
  */
 export function composeSelectedCard(
   render: { title: string; options: readonly NormalizedOption[] } | undefined,
@@ -64,7 +63,7 @@ export function composeSelectedCard(
   actorName: string,
 ): string {
   const matched = render?.options.find((o) => o.value === selectedValue);
-  const selectedLabel = matched?.selectedLabel ?? `✅ ${matched?.label ?? selectedValue}`;
+  const selectedLabel = matched?.selectedLabel ?? selectedValue;
   const byLine = actorName ? ` · ${actorName}` : '';
   return render?.title
     ? `${render.title}\n\n${selectedLabel}${byLine}`

@@ -48,8 +48,8 @@ import path from 'path';
 import type { MountClass } from './drivers/types.js';
 import type { VolumeMount } from './providers/provider-container-registry.js';
 
-/** Container-side root; `pond-mcp.ts` in the agent-runner probes these paths. */
-export const POND_CONTAINER_ROOT = '/workspace/extra/pond';
+/** Container-side root for mounted pond stores. */
+const POND_CONTAINER_ROOT = '/workspace/extra/pond';
 
 /** See the class rationale in the module header. */
 const POND_MOUNT_CLASS: MountClass = 'allowlisted-extra';

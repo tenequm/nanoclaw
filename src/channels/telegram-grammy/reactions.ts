@@ -239,7 +239,7 @@ export function canonicalizeReactionEmoji(input: string): TelegramReactionEmoji 
 
   // Glyph with one or more VS-16 (U+FE0F) selectors — common in LLM output.
   // Telegram's server matches the bare codepoint sequence.
-  const noVs16 = trimmed.replace(/️/g, '');
+  const noVs16 = trimmed.replace(/\uFE0F/g, '');
   if (ALLOWED_GLYPH_SET.has(noVs16)) return noVs16 as TelegramReactionEmoji;
 
   return null;

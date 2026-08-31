@@ -74,13 +74,13 @@ describe('composeSelectedCard', () => {
     expect(composeSelectedCard(render, 'reject', '', '')).toBe('🔧 Self-modification request\n\n❌ Rejected');
   });
 
-  it('falls back to a checkmarked value for an option missing from render metadata', () => {
-    expect(composeSelectedCard(render, 'mystery', '', '')).toBe('🔧 Self-modification request\n\n✅ mystery');
+  it('falls back to the value for an option missing from render metadata', () => {
+    expect(composeSelectedCard(render, 'mystery', '', '')).toBe('🔧 Self-modification request\n\nmystery');
   });
 
   it('appends to the current card text when render metadata is gone', () => {
     expect(composeSelectedCard(undefined, 'approve', 'Original question body', 'Alex')).toBe(
-      'Original question body\n\n✅ approve · Alex',
+      'Original question body\n\napprove · Alex',
     );
   });
 });

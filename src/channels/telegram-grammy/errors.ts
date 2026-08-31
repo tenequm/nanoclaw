@@ -8,13 +8,12 @@
  * etc.). Nothing reaches `unknown` inside this module.
  */
 import { Schema } from 'effect';
-import { GrammyError, HttpError } from 'grammy';
+import { GrammyError } from 'grammy';
 
 export class GrammyEntityError extends Schema.TaggedErrorClass<GrammyEntityError>()('GrammyEntityError', {
   chatId: Schema.String,
   method: Schema.String,
   description: Schema.String,
-  byteOffset: Schema.optional(Schema.Number),
 }) {}
 
 export class GrammyFloodWait extends Schema.TaggedErrorClass<GrammyFloodWait>()('GrammyFloodWait', {
@@ -122,9 +121,6 @@ export function mapGrammyError(err: unknown, method: string, chatId: string): Gr
       return new GrammyBadRequest({ chatId, method, description });
     }
     return new GrammyUnknownError({ chatId, method, errorCode: code, description });
-  }
-  if (err instanceof HttpError) {
-    return new GrammyNetworkError({ method, cause: err });
   }
   return new GrammyNetworkError({ method, cause: err });
 }

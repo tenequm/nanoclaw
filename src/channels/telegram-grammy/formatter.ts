@@ -8,8 +8,7 @@
  * formatting, full stop.
  *
  * Telegram dialect deviations from strict CommonMark (matched to LLM /
- * Telegram-MarkdownV2 author intent — see also
- * `src/vendor/openclaw-markdown/README.md` `DEVIATION` notes and
+ * Telegram-MarkdownV2 author intent - see
  * https://core.telegram.org/bots/api#formatting-options for the entity model):
  *
  *  - `*X*`   → bold       (CommonMark says italic; LLMs and MarkdownV2 say bold)

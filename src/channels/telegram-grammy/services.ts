@@ -35,9 +35,8 @@ import type { GrammyNetworkError, PairingFailed } from './errors.js';
  * offline creation paths (setup, ncl) resolve it without a live bot.
  *
  * - dm: engage pattern '.' — every DM message engages, no mention needed.
- * - group: mention-sticky. resolveWiringDefaults downgrades it to 'mention'
- *   because this context does not honor thread ids; declaring the sticky
- *   intent keeps the declaration honest if topics ever become sub-threads.
+ * - group: engage mode 'mention'. Forum topics are separate messaging groups,
+ *   not threads, so there is no topic thread for mention-sticky to follow.
  * - threads false in BOTH contexts: the adapter is supportsThreads: false.
  *   Forum topics are modeled as separate messaging groups
  *   (`telegram:<chatId>:<topicId>`), not as thread ids on one group.
@@ -140,7 +139,7 @@ export class GroupFolderService extends Context.Service<
 >()('telegram-grammy/GroupFolderService') {}
 
 /**
- * AdapterConfigService — holds the bot token plus the three Promise-shaped
+ * AdapterConfigService — holds the bot token plus the two Promise-shaped
  * callbacks the host hands us via `ChannelSetup`. They are wrapped into
  * Effect-returning functions so the rest of the module never sees raw
  * Promises.
@@ -151,9 +150,8 @@ export class AdapterConfigService extends Context.Service<
     readonly token: string;
     /**
      * Telegram Bot API root. Defaults to the cloud `https://api.telegram.org`.
-     * When the user runs a self-hosted Bot API server, this points at it
-     * (e.g. `http://localhost:8081`) — lifts the cloud's 20 MB download /
-     * 50 MB upload caps to 2 GB. See `/add-telegram-bot-api-server` skill.
+     * The operator runs a self-hosted Bot API server and points
+     * `TELEGRAM_API_ROOT` at it.
      */
     readonly apiRoot: string;
     /**
@@ -172,7 +170,6 @@ export class AdapterConfigService extends Context.Service<
      */
     readonly localFilesDir: string | null;
     readonly onInbound: (platformId: string, threadId: string | null, message: InboundMessage) => Effect.Effect<void>;
-    readonly onMetadata: ChannelSetup['onMetadata'];
     readonly onAction: ChannelSetup['onAction'];
   }
 >()('telegram-grammy/AdapterConfigService') {}

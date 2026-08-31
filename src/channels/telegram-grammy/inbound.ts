@@ -43,11 +43,6 @@ function fullName(user: User | undefined): string | null {
   return combined || user.username || null;
 }
 
-function displayName(user: User | undefined): string | null {
-  if (!user) return null;
-  return fullName(user) ?? user.username ?? null;
-}
-
 /** Platform-confirmed bot-mention signal. */
 export function detectMention(ctx: Context, botUsername: string | null, botUserId: number | null): boolean {
   const chat = ctx.chat;
@@ -446,7 +441,6 @@ export function entitiesToMarkdown(text: string, entities: readonly MessageEntit
   }
   markers.sort((a, b) => a.pos - b.pos || a.tie - b.tie);
 
-  const chars = Array.from(text); // JS string indexing is UTF-16 — entity offsets are UTF-16 code units, so string indexing is fine
   let out = '';
   let cursor = 0;
   for (const m of markers) {
@@ -455,9 +449,6 @@ export function entitiesToMarkdown(text: string, entities: readonly MessageEntit
     cursor = m.pos;
   }
   if (cursor < text.length) out += text.slice(cursor);
-  // Defensive: chars is unused but keeps the tsc happy about unused vars on
-  // older targets — guarantees `text` is valid string. Drop if desired.
-  void chars;
   return out;
 }
 
@@ -487,7 +478,7 @@ export function toInboundMessage(
 
   const senderIdBare = String(from.id);
   const senderIdNs = `telegram:${senderIdBare}`;
-  const name = displayName(from);
+  const name = fullName(from);
 
   const isEdit = Boolean((ctx.update as { edited_message?: unknown }).edited_message);
   const editDate = (msg as { edit_date?: number }).edit_date;
@@ -603,7 +594,7 @@ export function toReactionInbound(upd: ReactionUpdatePayload): InboundEnvelope |
   if (!actor) return null;
 
   const senderIdNs = `telegram:${actor.id}`;
-  const name = displayName(actor) ?? 'anonymous';
+  const name = fullName(actor) ?? 'anonymous';
 
   const verb =
     new_reaction.length === 0 ? 'removed reaction' : old_reaction.length === 0 ? 'reacted' : 'changed reaction';

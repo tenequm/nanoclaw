@@ -190,7 +190,7 @@ If approvals are configured server-side but the host callback isn't running (or 
 Per-agent Claude Agent SDK options live in the agent's **user-level** Claude Code settings file — we do NOT thread them through `container.json` or host code. The SDK loads this file via our existing `settingSources: ['project', 'user', 'local']` option.
 
 - Host path: `data/v2-sessions/<agent_group_id>/.claude-shared/settings.json`
-- Container mount: `/home/node/.claude/settings.json` (read-write, `container-runner.ts:868`)
+- Container mount: `/home/node/.claude/settings.json` (read-write, `buildMounts` in `src/container-runner.ts`)
 - Documented precedent: `docs/ollama.md` sets `"model"` here
 - Schema: see the SDK's `Settings` interface in `@anthropic-ai/claude-agent-sdk/sdk.d.ts` — includes `model`, `effortLevel`, `autoCompactWindow`, `alwaysThinkingEnabled`, and many more
 
