@@ -11,3 +11,7 @@ import './cli.js';
 // Telegram — grammY + Effect-TS v4 implementation. Parse-error-immune (sends
 // entities[] instead of parse_mode, so Telegram never runs a parser).
 import './telegram-grammy/index.js';
+
+// Slack — Chat SDK bridge (/add-slack).
+import './slack.js';
+import './slack-a2a-guard.js';
