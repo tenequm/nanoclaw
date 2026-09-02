@@ -129,8 +129,8 @@ describe('render text builders', () => {
     const card = statusCard({
       agentName: 'Emma',
       agentGroupId: 'ag-1',
-      model: 'claude-fable-5',
-      modelLabel: 'Fable 5',
+      model: 'claude-fable-5-1',
+      modelLabel: 'Fable 5.1',
       effort: 'high',
       autoCompactWindow: null,
       maxMessagesPerPrompt: null,

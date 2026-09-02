@@ -69,7 +69,7 @@ export interface ModelCatalogEntry {
 export const MODEL_CATALOG: readonly ModelCatalogEntry[] = [
   { alias: 'sonnet', label: 'Sonnet 5', id: 'claude-sonnet-5' },
   { alias: 'opus', label: 'Opus 5', id: 'claude-opus-5' },
-  { alias: 'fable', label: 'Fable 5', id: 'claude-fable-5' },
+  { alias: 'fable', label: 'Fable 5.1', id: 'claude-fable-5-1' },
 ] as const;
 
 /** Comma-joined catalog aliases, e.g. "sonnet, opus, fable". For usage hints. */

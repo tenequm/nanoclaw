@@ -49,13 +49,13 @@ export const MD_FMT: CardFmt = {
   code: (s) => `\`${s}\``,
 };
 
-/** The model text alone: 'Fable 5 (`claude-fable-5`)', bare id, or '(default)'. */
+/** The model text alone: 'Fable 5.1 (`claude-fable-5-1`)', bare id, or '(default)'. */
 function modelText(id: string | null, label: string | null, fmt: CardFmt): string {
   if (!id) return '(default)';
   return label ? `${label} (${fmt.code(id)})` : fmt.code(id);
 }
 
-/** 'Fable 5 (`id`), high effort' - the effort segment only when set. */
+/** 'Fable 5.1 (`id`), high effort' - the effort segment only when set. */
 function modelEffortLine(id: string | null, label: string | null, effort: string | null, fmt: CardFmt): string {
   const effortPart = effort ? `, ${effort} effort` : '';
   return `${fmt.bold('Model:')} ${modelText(id, label, fmt)}${effortPart}`;

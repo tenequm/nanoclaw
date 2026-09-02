@@ -162,7 +162,7 @@ Three catalogued models, addressable by short alias:
 |-------|-------|--------|
 | `sonnet` | Sonnet 5 | `claude-sonnet-5` |
 | `opus` | Opus 5 | `claude-opus-5` |
-| `fable` | Fable 5 | `claude-fable-5` |
+| `fable` | Fable 5.1 | `claude-fable-5-1` |
 
 Raw-id escape hatch: `/model <id>` (or `/config set model <id>`) accepts any id
 matching `^[a-z0-9][a-z0-9.-]+$` between 3 and 64 characters, so an operator can
