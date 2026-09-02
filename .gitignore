@@ -51,3 +51,6 @@ forks.md
 
 # Claude Code scheduled task lock file (local, not committed)
 .claude/scheduled_tasks.lock
+
+# Local eval worktrees (never committed)
+.eval-worktrees/
