@@ -29,7 +29,7 @@ export async function transcribeAudio(filePath: string): Promise<string | null> 
       return null;
     }
     const response = await openai.audio.transcriptions.create({
-      model: 'whisper-1',
+      model: 'gpt-transcribe',
       file: fs.createReadStream(filePath),
     });
     log.info('Transcribed voice message', { chars: response.text.length });
