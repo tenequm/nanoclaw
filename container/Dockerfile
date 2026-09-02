@@ -125,7 +125,7 @@ ENV GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem
 RUN git config --system credential.helper '!gh auth git-credential'
 
 # ---- pond: cross-session recall (read-only MCP over mounted stores) ----------
-ARG POND_VERSION=0.16.3
+ARG POND_VERSION=0.17.0
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends xz-utils && \
