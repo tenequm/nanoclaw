@@ -22,6 +22,9 @@ import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { extractSlackRawText } from './slack-raw-text.js';
 
+/** Assistant-status text for plain typing; Slack prefixes the bot's name. */
+const SLACK_TYPING_STATUS = 'is thinking...';
+
 /**
  * Dedicated bot app on a threaded platform. group threads:true keeps
  * mention-sticky bounded — engagement sticks per-thread, not forever.
@@ -194,10 +197,15 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
   // threadTs, so a shared-session chat never gets one and falls back to the
   // reaction ack.
   bridge.typingRequiresThread = true;
-  // Clear through setAssistantStatus rather than the bridge's generic
-  // startTyping(''), which would also send loading_messages: [''] — an empty
-  // rotation entry Slack has no documented handling for. setAssistantStatus
-  // omits the field entirely, leaving the documented empty-status clear.
+  // Plain typing (no runner-supplied status line) gets a short verb phrase
+  // rather than the adapter's generic default.
+  const setTyping = bridge.setTyping!;
+  bridge.setTyping = (platformId, threadId, status, statusKind) =>
+    setTyping(platformId, threadId, status ?? SLACK_TYPING_STATUS, statusKind);
+  // Clear through setAssistantStatus directly: startTyping('') would also
+  // send loading_messages: [''] — an empty rotation entry Slack has no
+  // documented handling for. setAssistantStatus omits the field entirely,
+  // leaving the documented empty-status clear.
   bridge.clearTyping = async (platformId: string, threadId: string | null) => {
     const [, channel, threadTs] = (threadId ?? platformId).split(':');
     if (!(channel && threadTs)) return; // nothing was ever painted

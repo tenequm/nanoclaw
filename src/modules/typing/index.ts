@@ -1,30 +1,33 @@
 /**
- * "Agent is working" signal — default module.
+ * Typing indicator refresh — default module.
  *
  * Most platforms expire a typing indicator after 5–10s, so a one-shot
  * call on message arrival goes stale long before the agent finishes
  * thinking. This module keeps it alive by re-firing `setTyping` on a
- * short interval — but only while the agent is actually WORKING, gated
- * on the heartbeat file's mtime after an initial grace period.
+ * short interval while the agent is actually working.
+ *
+ * "Working" is decided from the runner's own turn report, read on the
+ * delivery poll (`noteTurnState`). The runner writes `working` while a
+ * turn runs and `idle` when it ends, so the host no longer has to guess
+ * from a heartbeat FILE — which is invisible when the delivering process
+ * doesn't share a filesystem with the runner, and never says "stop". A
+ * runner that predates the turn report never calls `noteTurnState`, so
+ * those sessions keep the old heartbeat-file behaviour unchanged.
+ *
+ * When a turn ends (idle, or a `working` report that has gone stale) the
+ * refresh ENDS: the interval is cleared and the adapter's optional
+ * `clearTyping` fires once, for platforms whose indicator does not expire
+ * on its own (Slack's assistant status has no TTL and is only cleared by
+ * a post or an explicit clear).
  *
  * After delivering a user-facing message, the refresh is paused for
  * POST_DELIVERY_PAUSE_MS so the client-side indicator can visually
  * clear.
  *
- * Two platform shapes, two renderings:
- *
- *  - EPHEMERAL indicator (Telegram's chat action): expires on its own,
- *    so the refresh interval IS the lifecycle and teardown needs no
- *    cleanup.
- *  - PERSISTENT, thread-scoped indicator (Slack's assistant status):
- *    paints only inside a thread and clears only when the app next
- *    posts. That needs both halves the ephemeral case never did — an
- *    explicit `clearTyping` on every teardown path (otherwise a turn
- *    that ends without a reply leaves a stale status painted until the
- *    platform's own timeout), and a fallback for threadless chats,
- *    where no status can be painted at all. The fallback is a reaction
- *    ack: 👀 on the triggering message while the agent works, removed
- *    when it replies or goes idle.
+ * Threadless chats on a thread-only platform (Slack's assistant status
+ * paints only inside a thread) get a reaction ack instead: 👀 on the
+ * triggering message while the agent works, removed when it replies or
+ * the refresh ends.
  *
  * Default module status:
  *   - Lives in src/modules/ for signaling (not really core), but ships
@@ -40,19 +43,23 @@ import { heartbeatPath } from '../../session-manager.js';
 const TYPING_REFRESH_MS = 4000;
 /**
  * Grace window from startTypingRefresh: fire typing unconditionally
- * for this long regardless of heartbeat state. Covers container
- * spawn/wake latency (5–12s on cold start before first heartbeat).
+ * for this long regardless of turn/heartbeat state. Covers container
+ * spawn/wake latency (5–12s on cold start before the first turn report).
  */
 const TYPING_GRACE_MS = 15000;
 /**
  * After the grace window, a heartbeat must be mtimed within this
- * many ms of now to count as "agent is working." The agent-runner
- * ticks the heartbeat every 2s for the whole of an in-flight turn
- * (TURN_HEARTBEAT_INTERVAL_MS in container/agent-runner/src/heartbeat.ts),
- * so 6s is well above the working floor and small enough to stop
- * typing quickly when the agent goes idle.
+ * many ms of now to count as "agent is working." Only used for older
+ * runners that never report a turn (see noteTurnState).
  */
 const HEARTBEAT_FRESH_MS = 6000;
+/**
+ * A `working` turn report counts as live only if its stamp is within this
+ * many ms of now. The runner re-marks `working` every 5s, so this is three
+ * re-marks: a report older than that means the runner stopped moving (turn
+ * ended without an idle write, or the runner died) and we stop refreshing.
+ */
+const TURN_STALE_MS = 15000;
 /**
  * After we deliver a user-facing message, pause typing for this
  * long so the client-side indicator has time to visually clear.
@@ -60,13 +67,6 @@ const HEARTBEAT_FRESH_MS = 6000;
  * stays running; ticks inside the pause just skip the setTyping call.
  */
 const POST_DELIVERY_PAUSE_MS = 10000;
-
-/**
- * Status text for platforms that render one. Slack shows it in the thread
- * just above the composer; the platform supplies the agent's identity, so
- * this reads as a continuation of the name rather than a full sentence.
- */
-const TYPING_STATUS = 'is thinking...';
 
 /** Reaction ack for platforms that cannot paint a threadless indicator. */
 const ACK_EMOJI = 'eyes';
@@ -78,7 +78,13 @@ interface TypingAdapter {
     threadId: string | null,
     instance?: string,
     status?: string,
+    statusKind?: 'auto' | 'agent',
   ): Promise<void>;
+  /**
+   * Clear the typing indicator. Only platforms whose indicator does not
+   * expire on its own implement it (e.g. Slack's assistant status); others
+   * omit it and the module no-ops via optional chaining.
+   */
   clearTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
   addReaction?(
     channelType: string,
@@ -97,6 +103,14 @@ interface TypingAdapter {
   typingRequiresThread?(channelType: string, instance?: string): boolean;
 }
 
+/** The runner's latest turn report, as read on the delivery poll. */
+interface TurnReport {
+  /** 'working' | 'idle', or null when the runner never reported (older runner). */
+  turn: 'working' | 'idle' | null;
+  /** container_state.updated_at in epoch ms, or null when there is no record. */
+  updatedAtMs: number | null;
+}
+
 interface TypingTarget {
   agentGroupId: string;
   channelType: string;
@@ -105,8 +119,8 @@ interface TypingTarget {
   /** Adapter instance that owns the chat; undefined = default (= channelType). */
   instance?: string;
   /**
-   * How this session's "working" signal is rendered. Decided once per
-   * refresher from the address it was started on: 'status' is the normal
+   * How this session's "working" signal is rendered. Decided from the
+   * address the refresher was started on: 'status' is the normal
    * indicator, 'reaction' the fallback when the platform needs a thread and
    * this chat has none. A re-trigger re-decides, since an agent-shared
    * session can move between chats.
@@ -114,19 +128,13 @@ interface TypingTarget {
   mode: 'status' | 'reaction';
   /** Platform id of the message the ack sits on ('reaction' mode only). */
   messageId?: string;
-  /**
-   * Whether this entry's signal is currently painted, across BOTH
-   * renderings. Gates the clear (clearSignal is called from every teardown
-   * and idle path and must not spam the platform), never the status-mode
-   * repaint (the ephemeral rendering re-fires by design). A reaction-only
-   * or edit-only delivery does not clear Slack's persistent status the way
-   * a post does, so the idle path must be able to clear exactly once — see
-   * the startedAt === 0 branch in the interval tick.
-   */
+  /** Whether the reaction ack is on, so it is added and removed exactly once. */
   painted: boolean;
   interval: NodeJS.Timeout;
   startedAt: number;
   pausedUntil: number; // epoch ms; 0 = not paused
+  /** Latest runner turn report; undefined until the first noteTurnState. */
+  turnReport?: TurnReport;
 }
 
 let adapter: TypingAdapter | null = null;
@@ -134,8 +142,8 @@ const typingRefreshers = new Map<string, TypingTarget>();
 
 /**
  * Bind the typing module to the channel delivery adapter so it can
- * call `setTyping`. Called once by `src/delivery.ts` inside
- * `setDeliveryAdapter`. Passing a fresh adapter replaces the prior
+ * call `setTyping` and `clearTyping`. Called once by `src/delivery.ts`
+ * inside `setDeliveryAdapter`. Passing a fresh adapter replaces the prior
  * binding and leaves active refreshers in place (they'll use the
  * new adapter on their next tick).
  */
@@ -160,52 +168,38 @@ async function triggerTyping(
   instance?: string,
 ): Promise<void> {
   try {
-    await adapter?.setTyping?.(channelType, platformId, threadId, instance, TYPING_STATUS);
+    await adapter?.setTyping?.(channelType, platformId, threadId, instance);
   } catch (err) {
     signalFailed('setTyping', { channelType, platformId, threadId, instance }, err);
   }
 }
 
-/**
- * Take down whatever this entry painted. Safe to call more than once and on
- * platforms that implement neither half: a redundant clear on an already
- * clear indicator is a no-op everywhere.
- */
-function clearSignal(entry: TypingTarget): void {
-  if (!entry.painted) return;
-  entry.painted = false;
-  if (entry.mode === 'reaction') {
-    if (!entry.messageId) return;
-    const messageId = entry.messageId;
-    void adapter
-      ?.removeReaction?.(entry.channelType, entry.platformId, messageId, ACK_EMOJI, entry.instance)
-      .catch((err) =>
-        signalFailed(
-          'removeReaction',
-          { channelType: entry.channelType, platformId: entry.platformId, messageId, instance: entry.instance },
-          err,
-        ),
-      );
-    return;
+async function triggerClear(
+  channelType: string,
+  platformId: string,
+  threadId: string | null,
+  instance?: string,
+): Promise<void> {
+  try {
+    await adapter?.clearTyping?.(channelType, platformId, threadId, instance);
+  } catch (err) {
+    signalFailed('clearTyping', { channelType, platformId, threadId, instance }, err);
   }
-  void adapter?.clearTyping?.(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch((err) =>
-    signalFailed(
-      'clearTyping',
-      {
-        channelType: entry.channelType,
-        platformId: entry.platformId,
-        threadId: entry.threadId,
-        instance: entry.instance,
-      },
-      err,
-    ),
-  );
 }
 
-/** Paint the initial signal for an entry: status, or a one-shot ack. */
+/**
+ * Which rendering this address supports. A platform that can only paint
+ * inside a thread (Slack) gets the reaction ack when the session is
+ * threadless — which is every shared-session wiring.
+ */
+function resolveMode(channelType: string, threadId: string | null, instance?: string): 'status' | 'reaction' {
+  if (threadId !== null) return 'status';
+  return adapter?.typingRequiresThread?.(channelType, instance) ? 'reaction' : 'status';
+}
+
+/** Paint the entry's signal: a typing tick, or the one-shot reaction ack. */
 function paintSignal(entry: TypingTarget): void {
   if (entry.mode === 'status') {
-    entry.painted = true;
     triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
     return;
   }
@@ -223,14 +217,45 @@ function paintSignal(entry: TypingTarget): void {
     );
 }
 
+/** Take the entry's signal down: clear the status, or remove the ack once. */
+function clearSignal(entry: TypingTarget): void {
+  if (entry.mode === 'status') {
+    triggerClear(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
+    return;
+  }
+  if (!entry.painted || !entry.messageId) return;
+  entry.painted = false;
+  const messageId = entry.messageId;
+  void adapter
+    ?.removeReaction?.(entry.channelType, entry.platformId, messageId, ACK_EMOJI, entry.instance)
+    .catch((err) =>
+      signalFailed(
+        'removeReaction',
+        { channelType: entry.channelType, platformId: entry.platformId, messageId, instance: entry.instance },
+        err,
+      ),
+    );
+}
+
 /**
- * Which rendering this address supports. A platform that can only paint
- * inside a thread (Slack) gets the reaction ack when the session is
- * threadless — which is every shared-session wiring.
+ * One refresh tick. A reaction does not expire, so only the status
+ * rendering re-fires; the ack was painted once at start.
  */
-function resolveMode(channelType: string, threadId: string | null, instance?: string): 'status' | 'reaction' {
-  if (threadId !== null) return 'status';
-  return adapter?.typingRequiresThread?.(channelType, instance) ? 'reaction' : 'status';
+function refresh(entry: TypingTarget): void {
+  if (entry.mode !== 'status') return;
+  triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
+}
+
+/**
+ * End a refresher: stop the interval, drop the entry, and clear the
+ * indicator once. Idempotent per session — the entry is removed first, so a
+ * later tick or a stopTypingRefresh call finds nothing and does not clear
+ * twice.
+ */
+function endRefresh(sessionId: string, entry: TypingTarget): void {
+  clearInterval(entry.interval);
+  typingRefreshers.delete(sessionId);
+  clearSignal(entry);
 }
 
 function isHeartbeatFresh(agentGroupId: string, sessionId: string): boolean {
@@ -262,10 +287,17 @@ export function startTypingRefresh(
     // post-delivery pause: a new inbound means the user expects
     // typing to show immediately.
     //
-    // The signal moves to the new message: take the old ack down first
+    // The signal moves to the new message: take the old one down first
     // (its address fields are still the ones it was painted on), then
-    // re-decide the rendering and paint against the new address.
-    clearSignal(existing);
+    // re-decide the rendering and paint against the new address. A status
+    // at an unchanged address is just repainted — a clear racing the
+    // repaint could land second and blank it.
+    const moved =
+      existing.channelType !== channelType ||
+      existing.platformId !== platformId ||
+      existing.threadId !== threadId ||
+      existing.instance !== instance;
+    if (existing.mode === 'reaction' || moved) clearSignal(existing);
     existing.startedAt = Date.now();
     existing.pausedUntil = 0;
     // Keep the stored entry self-consistent: a re-trigger can arrive from
@@ -289,46 +321,42 @@ export function startTypingRefresh(
     const entry = typingRefreshers.get(sessionId);
     if (!entry) return; // stopped externally since this tick was scheduled
 
+    const now = Date.now();
+
     // Inside a post-delivery pause: skip setTyping but keep the
     // interval running so we resume automatically once the pause
     // expires.
-    if (entry.pausedUntil > Date.now()) return;
+    if (entry.pausedUntil > now) return;
 
-    const withinGrace = Date.now() - entry.startedAt < TYPING_GRACE_MS;
-    if (withinGrace || isHeartbeatFresh(entry.agentGroupId, sessionId)) {
-      // Only the status rendering needs re-firing. A reaction does not
-      // expire, so the ack is painted once at start and the ticks here
-      // exist purely to keep the idle check below running.
-      if (entry.mode === 'status') {
-        entry.painted = true;
-        triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
+    // Within the grace window since the last inbound: fire
+    // unconditionally, covering container spawn/wake latency before the
+    // first turn report lands.
+    if (now - entry.startedAt < TYPING_GRACE_MS) {
+      refresh(entry);
+      return;
+    }
+
+    // The runner reported a turn: follow it. 'working' with a fresh stamp
+    // keeps refreshing; 'idle', or a 'working' report gone stale (runner
+    // stopped re-marking), ends the refresh and clears the indicator.
+    const report = entry.turnReport;
+    if (report && report.turn !== null) {
+      const working =
+        report.turn === 'working' && report.updatedAtMs !== null && now - report.updatedAtMs < TURN_STALE_MS;
+      if (working) {
+        refresh(entry);
+        return;
       }
+      endRefresh(sessionId, entry);
       return;
     }
 
-    // startedAt === 0 marks a post-delivery entry: the reply proved the
-    // container is warm, so a stale heartbeat here must not tear the
-    // refresher down — that would silence the signal for the rest of a
-    // multi-message turn with nothing to re-arm it. But the reply is only
-    // guaranteed to have cleared the indicator when it was a POST — a
-    // reaction-only or edit-only turn clears nothing on Slack, whose
-    // persistent status otherwise sits painted until the platform's own
-    // 2-minute timeout. Clear (idempotent via `painted`) and keep the
-    // refresher alive: if work resumes, the fresh-heartbeat branch above
-    // repaints and re-arms the flag.
-    if (entry.startedAt === 0) {
-      clearSignal(entry);
+    // No turn ever reported (older runner): fall back to the heartbeat file.
+    if (isHeartbeatFresh(entry.agentGroupId, sessionId)) {
+      refresh(entry);
       return;
     }
-
-    // Out of grace AND heartbeat stale — agent is idle, stop refreshing.
-    // This is the path a turn that produced no user-facing message ends
-    // on, so it is the one that has to take the signal down: nothing else
-    // will, and a persistent indicator would sit there until the
-    // platform's own timeout.
-    clearSignal(entry);
-    clearInterval(entry.interval);
-    typingRefreshers.delete(sessionId);
+    endRefresh(sessionId, entry);
   }, TYPING_REFRESH_MS);
   // unref so a stale refresher can't hold the event loop alive.
   interval.unref();
@@ -346,7 +374,21 @@ export function startTypingRefresh(
     pausedUntil: 0,
   };
   typingRefreshers.set(sessionId, entry);
+  // Immediate tick (or ack) + periodic refresh.
   paintSignal(entry);
+}
+
+/**
+ * Record the runner's latest turn report for a session, read on the
+ * delivery poll. Stores it on the active refresher entry; creates no entry
+ * if none is active (typing is only ever started by an inbound message). A
+ * missing record or a null turn (older runner) reads as "not reported" and
+ * leaves the heartbeat-file fallback in charge.
+ */
+export function noteTurnState(sessionId: string, state: TurnReport): void {
+  const entry = typingRefreshers.get(sessionId);
+  if (!entry) return;
+  entry.turnReport = state;
 }
 
 /**
@@ -359,23 +401,14 @@ export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
   // The reply IS the answer to the ack, so the reaction comes off now
-  // rather than waiting for the session to go idle. (The status rendering
-  // needs no equivalent: the platform auto-clears it on the post.)
+  // rather than waiting for the turn to end. (The status rendering needs no
+  // equivalent: the platform auto-clears it on the post.)
   if (entry.mode === 'reaction') clearSignal(entry);
-  // A delivered reply ends the cold-start grace: later ticks must prove
-  // ongoing work via the heartbeat rather than coasting on TYPING_GRACE_MS.
-  // Otherwise a follow-up message that reset grace just before this reply
-  // landed lets a tick fire once the shorter post-delivery pause expires,
-  // repainting a persistent indicator with no work behind it. (Upstream
-  // nanocoai/nanoclaw#3400, leg 1.)
-  entry.startedAt = 0;
   entry.pausedUntil = Date.now() + POST_DELIVERY_PAUSE_MS;
 }
 
 export function stopTypingRefresh(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
-  clearSignal(entry);
-  clearInterval(entry.interval);
-  typingRefreshers.delete(sessionId);
+  endRefresh(sessionId, entry);
 }

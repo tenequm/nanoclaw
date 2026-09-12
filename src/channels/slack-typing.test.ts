@@ -9,11 +9,12 @@
  *    thread (startTyping no-ops without a threadTs), so a shared-session
  *    chat gets no indicator at all and the host must fall back to a
  *    reaction ack. Every other Chat SDK platform leaves the flag unset.
- *  - `clearTyping` via `setAssistantStatus`. The bridge's generic clear is
- *    `startTyping(tid, '')`, which the vendored Slack adapter turns into
- *    `loading_messages: ['']` — an empty rotation entry with no documented
- *    handling. `setAssistantStatus` omits the field, leaving the documented
- *    empty-status clear on its own.
+ *  - `clearTyping` via `setAssistantStatus`. `startTyping(tid, '')` would
+ *    make the vendored Slack adapter send `loading_messages: ['']` — an
+ *    empty rotation entry with no documented handling. `setAssistantStatus`
+ *    omits the field, leaving the documented empty-status clear on its own.
+ *  - The default status line. Plain typing carries no text from the host,
+ *    so the Slack bridge supplies its own ("is thinking...").
  *
  * Own file because it mocks the adapter package at the module edge, which
  * the barrel-importing registration suite must not do.
@@ -21,9 +22,10 @@
 import { describe, it, expect, vi } from 'vitest';
 
 const setAssistantStatus = vi.fn(async () => {});
+const startTyping = vi.fn(async (_threadId: string, _status?: string) => {});
 
 vi.mock('@chat-adapter/slack', () => ({
-  createSlackAdapter: () => ({ name: 'slack', setAssistantStatus }),
+  createSlackAdapter: () => ({ name: 'slack', setAssistantStatus, startTyping }),
 }));
 
 vi.mock('../env.js', () => ({
@@ -37,6 +39,18 @@ const { createSlackBridge } = await import('./slack.js');
 describe('slack typing overrides', () => {
   it('declares that its indicator needs a thread', () => {
     expect(createSlackBridge()!.typingRequiresThread).toBe(true);
+  });
+
+  it('paints plain typing with its own status line', async () => {
+    startTyping.mockClear();
+    await createSlackBridge()!.setTyping!('slack:C1', 'slack:C1:1788198342.001');
+    expect(startTyping).toHaveBeenCalledWith('slack:C1:1788198342.001', 'is thinking...');
+  });
+
+  it('shows a runner-supplied status line instead of the default', async () => {
+    startTyping.mockClear();
+    await createSlackBridge()!.setTyping!('slack:C1', 'slack:C1:1788198342.001', 'reading the docs', 'agent');
+    expect(startTyping).toHaveBeenCalledWith('slack:C1:1788198342.001', 'reading the docs');
   });
 
   it('clears through setAssistantStatus, without an empty loading_messages entry', async () => {

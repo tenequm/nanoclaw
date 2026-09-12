@@ -18,11 +18,17 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
 });
 
-import fsMod from 'fs';
-import pathMod from 'path';
+import fs from 'fs';
+import path from 'path';
 
-import { pauseTypingRefreshAfterDelivery, setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';
 import { heartbeatPath } from '../../session-manager.js';
+import {
+  noteTurnState,
+  pauseTypingRefreshAfterDelivery,
+  setTypingAdapter,
+  startTypingRefresh,
+  stopTypingRefresh,
+} from './index.js';
 
 type Call = { channelType: string; platformId: string; threadId: string | null; instance?: string };
 
@@ -36,12 +42,39 @@ function captureAdapter() {
   return calls;
 }
 
+/** Adapter that records both set and clear calls. */
+function captureSetAndClear() {
+  const sets: Call[] = [];
+  const clears: Call[] = [];
+  setTypingAdapter({
+    async setTyping(channelType, platformId, threadId, instance) {
+      sets.push({ channelType, platformId, threadId, instance });
+    },
+    async clearTyping(channelType, platformId, threadId, instance) {
+      clears.push({ channelType, platformId, threadId, instance });
+    },
+  });
+  return { sets, clears };
+}
+
+/** Write a heartbeat file with an mtime at the current (fake) clock. */
+function touchHeartbeat(agentGroupId: string, sessionId: string): void {
+  const hbPath = heartbeatPath(agentGroupId, sessionId);
+  fs.mkdirSync(path.dirname(hbPath), { recursive: true });
+  fs.writeFileSync(hbPath, '');
+  const seconds = Date.now() / 1000;
+  fs.utimesSync(hbPath, seconds, seconds);
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
 });
 
 afterEach(() => {
   stopTypingRefresh('sess-1');
+  stopTypingRefresh('sess-turn');
+  if (fs.existsSync('/tmp/nanoclaw-test-typing'))
+    fs.rmSync('/tmp/nanoclaw-test-typing', { recursive: true, force: true });
   vi.useRealTimers();
 });
 
@@ -130,6 +163,141 @@ describe('startTypingRefresh — instance forwarding', () => {
   });
 });
 
+describe('typing follows the runner turn state', () => {
+  const SESS = 'sess-turn';
+  const AG = 'ag-turn';
+
+  /** Advance past the 15s grace, keeping a working report live throughout. */
+  async function advancePastGraceWorking(): Promise<void> {
+    for (let elapsed = 0; elapsed < 20_000; elapsed += 4_000) {
+      noteTurnState(SESS, { turn: 'working', updatedAtMs: Date.now() });
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+  }
+
+  it('quiet turn: an idle report with no delivery stops the refresh and clears exactly once', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    await advancePastGraceWorking();
+    const setsWhileWorking = sets.length;
+    expect(setsWhileWorking).toBeGreaterThan(1); // still refreshing past grace
+
+    // Turn ends without delivering anything.
+    noteTurnState(SESS, { turn: 'idle', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    expect(clears).toHaveLength(1);
+    expect(clears[0]).toEqual({ channelType: 'slack', platformId: 'C1', threadId: 'T1', instance: 'slack-inst' });
+
+    // No more refreshes and no second clear once the refresher has ended.
+    const setsAfterEnd = sets.length;
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(sets.length).toBe(setsAfterEnd);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('multi-message turn: two deliveries pause and resume, then a single clear at idle', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+    await advancePastGraceWorking();
+
+    // First delivery pauses the refresh; ticks inside the pause skip setTyping.
+    pauseTypingRefreshAfterDelivery(SESS);
+    let before = sets.length;
+    noteTurnState(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(8_000); // inside the 10s pause
+    expect(sets.length).toBe(before); // no refresh while paused
+
+    // Pause expires; a live working report resumes refreshing.
+    noteTurnState(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(sets.length).toBeGreaterThan(before);
+
+    // Second delivery pauses again.
+    pauseTypingRefreshAfterDelivery(SESS);
+    before = sets.length;
+    noteTurnState(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(sets.length).toBe(before);
+    noteTurnState(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(sets.length).toBeGreaterThan(before);
+
+    // Turn ends: exactly one clear across the whole turn.
+    noteTurnState(SESS, { turn: 'idle', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('dead runner: a working report that stops advancing clears after it goes stale', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+    await advancePastGraceWorking();
+
+    // The runner dies: the last working report stops advancing. It stays live
+    // for TURN_STALE_MS, then the next tick ends the refresh.
+    const setsBeforeDeath = sets.length;
+    noteTurnState(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    // Under the stale window: still refreshing.
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(sets.length).toBeGreaterThan(setsBeforeDeath);
+    expect(clears).toHaveLength(0);
+
+    // Past the 15s stale window with no new report: clear once.
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(clears).toHaveLength(1);
+    const setsAtClear = sets.length;
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(sets.length).toBe(setsAtClear);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('old runner: with no turn ever reported, the heartbeat file still gates the refresh', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Never call noteTurnState. Past grace, a fresh heartbeat keeps typing on.
+    for (let elapsed = 0; elapsed < 20_000; elapsed += 4_000) {
+      touchHeartbeat(AG, SESS);
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    const setsWhileFresh = sets.length;
+    expect(setsWhileFresh).toBeGreaterThan(1);
+    expect(clears).toHaveLength(0);
+
+    // Heartbeat goes stale (no more touches): the refresh ends.
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(clears).toHaveLength(1);
+    const setsAtEnd = sets.length;
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(sets.length).toBe(setsAtEnd);
+  });
+
+  it('stopTypingRefresh clears the indicator once', async () => {
+    const { clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    stopTypingRefresh(SESS);
+    expect(clears).toHaveLength(1);
+    // A second stop finds no refresher — no double clear.
+    stopTypingRefresh(SESS);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('noteTurnState with no active refresher creates none', async () => {
+    const { sets } = captureSetAndClear();
+    noteTurnState('sess-never', { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(sets).toHaveLength(0);
+  });
+});
+
 /**
  * The two renderings of the "agent is working" signal, and the teardown
  * that takes each of them down.
@@ -165,53 +333,6 @@ function signalAdapter(opts: { requiresThread?: boolean } = {}) {
   });
   return { statuses, clears, reactions };
 }
-
-describe('status rendering', () => {
-  it('paints a status string rather than the adapter default', async () => {
-    const { statuses } = signalAdapter();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
-    await vi.advanceTimersByTimeAsync(0);
-    expect(statuses).toEqual(['is thinking...']);
-  });
-
-  it('clears the status when the turn ends with no reply', async () => {
-    const { clears } = signalAdapter();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
-
-    // No heartbeat file exists, so once the 15s grace expires the agent
-    // reads as idle. Nothing was ever delivered, so the platform's own
-    // post-clears-status rule never fires: this teardown is the only
-    // thing that can take the indicator down.
-    await vi.advanceTimersByTimeAsync(20_000);
-    expect(clears).toEqual([{ platformId: 'slack:C1', threadId: 'slack:C1:1' }]);
-  });
-
-  it('clears the status when the refresher is stopped externally', async () => {
-    const { clears } = signalAdapter();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
-    await vi.advanceTimersByTimeAsync(0);
-
-    stopTypingRefresh('sess-1');
-    expect(clears).toEqual([{ platformId: 'slack:C1', threadId: 'slack:C1:1' }]);
-  });
-
-  it('does not repaint from the grace window after a delivery (#3400 leg 1)', async () => {
-    const { statuses } = signalAdapter();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
-    await vi.advanceTimersByTimeAsync(5_000);
-
-    // A follow-up resets grace just before the first reply lands.
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-2');
-    await vi.advanceTimersByTimeAsync(0);
-    pauseTypingRefreshAfterDelivery('sess-1');
-    statuses.length = 0;
-
-    // Past the 10s pause but still inside the reset 15s grace. With no
-    // heartbeat, the agent is idle and nothing should repaint.
-    await vi.advanceTimersByTimeAsync(11_500);
-    expect(statuses).toEqual([]);
-  });
-});
 
 describe('reaction-ack rendering (threadless chat on a thread-only platform)', () => {
   it('acks the triggering message instead of painting a status', async () => {
@@ -282,7 +403,7 @@ describe('reaction-ack rendering (threadless chat on a thread-only platform)', (
     await vi.advanceTimersByTimeAsync(0);
 
     expect(reactions).toEqual([]);
-    expect(statuses).toEqual(['is thinking...']);
+    expect(statuses).toEqual([undefined]);
   });
 });
 
@@ -305,80 +426,5 @@ describe('failure reporting', () => {
       'activity signal failed',
       expect.objectContaining({ op: 'addReaction', messageId: 'msg-1', err: 'Error: message_not_found' }),
     );
-  });
-});
-
-/**
- * The post-delivery idle clear. pauseTypingRefreshAfterDelivery zeroes
- * startedAt so later ticks must prove work via the heartbeat (#3400 leg 1)
- * — but the skip that protects a multi-message turn used to skip the CLEAR
- * too. When the delivered "reply" was a reaction or an edit (not a post),
- * Slack's persistent status was never cleared by the platform, and the
- * orphaned indicator sat painted until Slack's own 2-minute timeout.
- */
-describe('post-delivery idle clear (reaction-only turn leaves status painted)', () => {
-  afterEach(() => {
-    // Don't leave a heartbeat file behind: a rerun within HEARTBEAT_FRESH_MS
-    // real seconds would read it as fresh and flake the idle-path tests.
-    fsMod.rmSync(pathMod.dirname(heartbeatPath('ag-1', 'sess-1')), { recursive: true, force: true });
-  });
-
-  function freshHeartbeatGone() {
-    // A prior test run may have left a heartbeat file whose mtime still
-    // reads as fresh (or in the future) against this run's fake clock.
-    fsMod.rmSync(pathMod.dirname(heartbeatPath('ag-1', 'sess-1')), { recursive: true, force: true });
-  }
-
-  it('clears the status exactly once when the turn goes idle after a delivery', async () => {
-    freshHeartbeatGone();
-    const { clears } = signalAdapter();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
-    await vi.advanceTimersByTimeAsync(0);
-
-    // The turn's only user-facing output was a reaction — the platform
-    // cleared nothing. The pause zeroes startedAt.
-    pauseTypingRefreshAfterDelivery('sess-1');
-
-    // Past the 10s pause; no heartbeat, so the agent reads as idle. The
-    // startedAt === 0 branch must clear the orphaned status — once.
-    await vi.advanceTimersByTimeAsync(13_000);
-    expect(clears).toEqual([{ platformId: 'slack:C1', threadId: 'slack:C1:1' }]);
-  });
-
-  it('stays cleared over a long idle — one clear total, not one per tick', async () => {
-    freshHeartbeatGone();
-    const { clears } = signalAdapter();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
-    await vi.advanceTimersByTimeAsync(0);
-    pauseTypingRefreshAfterDelivery('sess-1');
-
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(clears).toHaveLength(1);
-  });
-
-  it('repaints when work resumes and clears again on the next idle', async () => {
-    freshHeartbeatGone();
-    const { statuses, clears } = signalAdapter();
-    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
-    await vi.advanceTimersByTimeAsync(0);
-    pauseTypingRefreshAfterDelivery('sess-1');
-
-    // Idle clear fires after the pause.
-    await vi.advanceTimersByTimeAsync(13_000);
-    expect(clears).toHaveLength(1);
-    statuses.length = 0;
-
-    // Work resumes: the heartbeat goes fresh, so the tick repaints.
-    const hb = heartbeatPath('ag-1', 'sess-1');
-    fsMod.mkdirSync(pathMod.dirname(hb), { recursive: true });
-    fsMod.writeFileSync(hb, '');
-    const now = new Date(Date.now());
-    fsMod.utimesSync(hb, now, now);
-    await vi.advanceTimersByTimeAsync(4_500);
-    expect(statuses.length).toBeGreaterThanOrEqual(1);
-
-    // Heartbeat goes stale again — the refresher (still alive) clears again.
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(clears).toHaveLength(2);
   });
 });
