@@ -134,7 +134,7 @@ function modelFriendly(ref: ModelRef): string {
 
 /** Confirmation after a /model or /config model switch. */
 export function modelChangeConfirmation(v: ModelChangeView, fmt: CardFmt): string {
-  return `✅ ${fmt.bold(v.agentName)} now runs ${modelFriendly(v.current)}\nApplies from her next reply.`;
+  return `✅ ${fmt.bold(v.agentName)} now runs ${modelFriendly(v.current)}\nApplies from the next reply.`;
 }
 
 /** Confirmation after any /config scalar change (model/effort/window/max). */
@@ -143,16 +143,16 @@ export function configChangeConfirmation(v: ConfigChangeView, fmt: CardFmt): str
   switch (v.field) {
     case 'model': {
       const shown = v.currentLabel ?? String(v.current);
-      return `✅ ${name} now runs ${shown}\nApplies from her next reply.`;
+      return `✅ ${name} now runs ${shown}\nApplies from the next reply.`;
     }
     case 'effort':
-      return `✅ ${name} effort set to ${v.current}\nApplies from her next reply.`;
+      return `✅ ${name} effort set to ${v.current}\nApplies from the next reply.`;
     case 'auto-compact-window':
-      return `✅ ${name} compact window set to ${formatTokens(Number(v.current))}\nApplies from her next reply.`;
+      return `✅ ${name} compact window set to ${formatTokens(Number(v.current))}\nApplies from the next reply.`;
     case 'max-messages-per-prompt':
-      return `✅ ${name} max messages set to ${v.current}\nApplies from her next reply.`;
+      return `✅ ${name} max messages set to ${v.current}\nApplies from the next reply.`;
     default:
-      return `✅ ${name} updated\nApplies from her next reply.`;
+      return `✅ ${name} updated\nApplies from the next reply.`;
   }
 }
 
