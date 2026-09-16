@@ -113,7 +113,7 @@ the two per-chat activation fields. Fields writable via chat:
 
 | Field | Accepted values | Applies |
 |-------|-----------------|---------|
-| `model` | A catalog alias (`sonnet`, `opus`, `fable`) or a raw model id | next reply (container config) |
+| `model` | A catalog alias (`sonnet`, `opus`, `fable`, `fable-5.1`) or a raw model id | next reply (container config) |
 | `effort` | `low`, `medium`, `high`, `xhigh`, `max` | next reply (container config) |
 | `auto-compact-window` | A positive integer token count (presets: 165k, 200k, 400k, 600k, 800k) | next reply (container config) |
 | `max-messages-per-prompt` | A positive integer | next reply (container config) |
@@ -162,7 +162,8 @@ Three catalogued models, addressable by short alias:
 |-------|-------|--------|
 | `sonnet` | Sonnet 5 | `claude-sonnet-5` |
 | `opus` | Opus 5 | `claude-opus-5` |
-| `fable` | Fable 5.1 | `claude-fable-5-1` |
+| `fable` | Fable 5 | `claude-fable-5` |
+| `fable-5.1` | Fable 5.1 | `claude-fable-5-1` |
 
 Raw-id escape hatch: `/model <id>` (or `/config set model <id>`) accepts any id
 matching `^[a-z0-9][a-z0-9.-]+$` between 3 and 64 characters, so an operator can

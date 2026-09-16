@@ -293,7 +293,7 @@ describe('setModel', () => {
     if (res.ok) throw new Error('expected failure');
     expect(res.reason).toBe('invalid-value');
     expect(res.detail?.field).toBe('model');
-    expect(res.detail?.allowed).toEqual(['sonnet', 'opus', 'fable']);
+    expect(res.detail?.allowed).toEqual(['sonnet', 'opus', 'fable', 'fable-5.1']);
   });
 
   it('writes the resolved id and returns old/new labels', async () => {
