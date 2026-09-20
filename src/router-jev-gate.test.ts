@@ -91,7 +91,9 @@ async function seed(): Promise<void> {
     platform_id: 'testchat:C1',
     instance: 'testchat',
     name: 'Pondarium',
-    is_group: 1,
+    // Legacy rows carry NULL here (the real pondarium row does); the gate
+    // must treat that as a group — only an explicit 0 means DM.
+    is_group: null,
     unknown_sender_policy: 'public',
     created_at: now(),
   });

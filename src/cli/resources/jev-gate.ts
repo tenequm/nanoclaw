@@ -46,7 +46,8 @@ registerResource({
       name: 'mode',
       type: 'string',
       enum: ['live', 'shadow'],
-      description: 'shadow judges and annotates but never silences a message.',
+      description:
+        'shadow suppresses every ambient message (the pre-gate baseline) while annotating what live would have done.',
     },
     { name: 'daily_cap', type: 'number', description: 'Max gate-granted wakes per local day. 0 = no cap.' },
     { name: 'cooldown_minutes', type: 'number', description: 'Quiet period after a granted wake. 0 = no cooldown.' },
