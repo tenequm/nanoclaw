@@ -176,6 +176,15 @@ function inboundRow(
   };
 }
 
+/** A host-generated inbound row (session echo, system notice): no author, so it parses isBot=false. */
+function systemRow(text: string, minutesAgo: number): MailboxRow {
+  return {
+    timestamp: new Date(Date.now() - minutesAgo * 60_000).toISOString(),
+    kind: 'system',
+    content: JSON.stringify({ text }),
+  };
+}
+
 const WOKE = '[jev: reply · value=0.90 · veto=0.00]';
 const WOKE_META = { v: 'reply', mode: 'live' };
 
@@ -396,6 +405,30 @@ describe('free levers (derived from stored annotations, no tables)', () => {
     expect(out?.annotation).toBe('[jev: silent · bot_loop_guard 2]');
   });
 
+  it('trips the loop guard across an interleaved system row — no human spoke', async () => {
+    writeConfig({ max_consecutive_bot: 2 });
+    mailboxRows.inbound = [
+      inboundRow(`x\n${WOKE}`, 20, { isBot: true }, WOKE_META),
+      systemRow('session echo: agent started', 15),
+      inboundRow(`y\n${WOKE}`, 10, { isBot: true }, WOKE_META),
+    ];
+    nouls({ direct_invitation: 0.99 });
+    const out = await gate(event('and another thing', { isBot: true }));
+    expect(out?.silence).toBe(true);
+    expect(out?.annotation).toBe('[jev: silent · bot_loop_guard 2]');
+  });
+
+  it('a human chat row between the bot wakes still clears the streak', async () => {
+    writeConfig({ max_consecutive_bot: 2 });
+    mailboxRows.inbound = [
+      inboundRow(`x\n${WOKE}`, 20, { isBot: true }, WOKE_META),
+      inboundRow('hold on, I have this one', 15),
+      inboundRow(`y\n${WOKE}`, 10, { isBot: true }, WOKE_META),
+    ];
+    nouls({ direct_invitation: 0.99 });
+    expect((await gate(event('and another thing', { isBot: true })))?.silence).toBe(false);
+  });
+
   it('does not trip the loop guard for a human message', async () => {
     writeConfig({ max_consecutive_bot: 2 });
     mailboxRows.inbound = [
@@ -497,6 +530,7 @@ describe('derivation helpers', () => {
     return {
       timestamp: new Date().toISOString(),
       direction: 'in',
+      kind: 'chat',
       text: '',
       sender: 'Alex',
       isBot: false,
@@ -530,6 +564,16 @@ describe('derivation helpers', () => {
       row({ isBot: true, jev: woke }),
       row({ isBot: false }),
       row({ isBot: true, jev: woke }),
+      row({ isBot: true, jev: woke }),
+    ];
+    expect(consecutiveBotWakes(rows)).toBe(2);
+  });
+
+  it('skips non-chat rows instead of reading them as a human', () => {
+    const rows = [
+      row({ isBot: true, jev: woke }),
+      row({ kind: 'system', isBot: false }),
+      row({ kind: 'task', isBot: false }),
       row({ isBot: true, jev: woke }),
     ];
     expect(consecutiveBotWakes(rows)).toBe(2);
