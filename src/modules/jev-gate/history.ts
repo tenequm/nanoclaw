@@ -38,12 +38,19 @@ export interface JevMeta {
 export interface GateHistoryRow {
   timestamp: string;
   direction: 'in' | 'out';
+  /** Mailbox row kind: 'chat' | 'chat-sdk' | 'system' | 'task' | … */
+  kind: string;
   text: string;
   sender: string;
   /** True for our own outbound, and for inbound whose author is a bot. */
   isBot: boolean;
   /** Host-written verdict metadata, null for rows the gate never judged. */
   jev: JevMeta | null;
+}
+
+/** Rows written by a real chat participant — the only ones the bot-loop streak walks. */
+function isChatRow(row: GateHistoryRow): boolean {
+  return row.kind === 'chat' || row.kind === 'chat-sdk';
 }
 
 interface ParsedContent {
@@ -101,8 +108,8 @@ export async function readGateHistory(agentGroupId: string, sessionId: string): 
     const limit = HISTORY_LIMITS[i];
     let raw:
       | {
-          inbound: Array<{ timestamp: string; content: string }>;
-          outbound: Array<{ timestamp: string; content: string }>;
+          inbound: Array<{ timestamp: string; kind: string; content: string }>;
+          outbound: Array<{ timestamp: string; kind: string; content: string }>;
         }
       | undefined;
     try {
@@ -136,11 +143,11 @@ export async function readGateHistory(agentGroupId: string, sessionId: string): 
     const rows: GateHistoryRow[] = [];
     for (const r of raw.inbound) {
       const { text, sender, isBot, jev } = parseAuthor(r.content);
-      rows.push({ timestamp: r.timestamp, direction: 'in', text, sender, isBot, jev });
+      rows.push({ timestamp: r.timestamp, direction: 'in', kind: r.kind, text, sender, isBot, jev });
     }
     for (const r of raw.outbound) {
       const { text } = parseAuthor(r.content);
-      rows.push({ timestamp: r.timestamp, direction: 'out', text, sender: '', isBot: true, jev: null });
+      rows.push({ timestamp: r.timestamp, direction: 'out', kind: r.kind, text, sender: '', isBot: true, jev: null });
     }
     rows.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
     return rows;
@@ -189,12 +196,17 @@ export function lastWakeAt(rows: GateHistoryRow[], mode: JevMeta['mode'] = 'live
  * Gate-granted wakes on bot-authored messages since the last human message.
  * A human speaking clears the streak — the guard is about the bot-to-bot
  * spiral, not about how much of the day's traffic came from bots.
+ *
+ * Only real chat rows participate. System-generated inbound (kind 'system',
+ * session echoes, task rows) has no author, so it parses `isBot=false` and
+ * would otherwise read as "a human spoke" and clear a live bot-to-bot loop.
  */
 export function consecutiveBotWakes(rows: GateHistoryRow[], mode: JevMeta['mode'] = 'live'): number {
   let streak = 0;
   for (let i = rows.length - 1; i >= 0; i--) {
     const row = rows[i];
     if (row.direction !== 'in') continue;
+    if (!isChatRow(row)) continue;
     if (!row.isBot) break;
     if (isWake(row, mode)) streak++;
   }
