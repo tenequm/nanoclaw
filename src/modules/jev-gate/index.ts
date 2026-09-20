@@ -16,11 +16,12 @@
  *   exactly what the wiring did before the gate existed. Failing open on a
  *   pattern-everything wiring means a container wake per message.
  *
- *   NO NEW TABLES. The verdict is appended to the stored message text as one
- *   compact `[jev: …]` line. That line is the decision log: it lands in the
- *   session's inbound.db (queryable), reaches the agent's prompt, and shows up
- *   in pond transcripts. The daily cap, the cooldown, and the bot-loop streak
- *   are all re-derived from those annotations — nothing is persisted by us.
+ *   NO NEW TABLES. The verdict lands on the stored message twice: a compact
+ *   `[jev: …]` line appended to the text (the agent's prompt, pond, humans)
+ *   and a host-written `jev` metadata key in the content JSON. The daily cap,
+ *   the cooldown, and the bot-loop streak are re-derived from the METADATA
+ *   only — user text cannot forge a JSON key, so a chat message containing
+ *   the literal marker cannot trip the levers.
  *
  *   NO SHARED-EVENT MUTATION. The router's fan-out loop reuses one `event`
  *   across every wired agent, so the annotation is applied to a per-delivery
@@ -38,6 +39,7 @@ import {
   readGateHistory,
   renderStateLines,
   wakesToday,
+  type JevMeta,
 } from './history.js';
 import { askJev, decide } from './jev.js';
 import type { InboundEvent } from '../../channels/adapter.js';
@@ -72,12 +74,18 @@ export interface JevGateInput {
   threadId: string | null;
 }
 
-/** Append the verdict to this delivery's copy of the content JSON. */
-function annotateContent(raw: string, annotation: string): string {
+/**
+ * Write the verdict onto this delivery's copy of the content JSON: the
+ * human-readable line appended to `text` (prompt + pond), and the `jev`
+ * metadata key the derivation side reads. Only the host writes this key —
+ * user text is a JSON string value and cannot forge it.
+ */
+function annotateContent(raw: string, annotation: string, meta: JevMeta): string {
+  const jev: JevMeta & { at: string } = { ...meta, at: new Date().toISOString() };
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.text === 'string') {
-      return JSON.stringify({ ...parsed, text: `${parsed.text}\n${annotation}` });
+      return JSON.stringify({ ...parsed, text: `${parsed.text}\n${annotation}`, jev });
     }
     return raw;
   } catch {
@@ -92,6 +100,7 @@ function score(value: number): string {
 function outcome(entry: JevGateEntry, event: InboundEvent, wake: boolean, detail: string): JevGateOutcome {
   const verdict = wake ? 'reply' : 'silent';
   const annotation = `[jev: ${entry.mode === 'shadow' ? `shadow-${verdict}` : verdict} · ${detail}]`;
+  const meta: JevMeta = { v: verdict, mode: entry.mode };
   return {
     // Shadow's baseline is the pre-gate wiring (mention-only), not the
     // pattern-everything wiring the gate rides on — so shadow suppresses
@@ -99,16 +108,23 @@ function outcome(entry: JevGateEntry, event: InboundEvent, wake: boolean, detail
     // shadow verdict that wakes would turn calibration mode into one
     // container wake per message the moment the wiring is widened.
     silence: entry.mode === 'shadow' || !wake,
-    event: { ...event, message: { ...event.message, content: annotateContent(event.message.content, annotation) } },
+    event: {
+      ...event,
+      message: { ...event.message, content: annotateContent(event.message.content, annotation, meta) },
+    },
     annotation,
   };
 }
 
 function errorOutcome(entry: JevGateEntry, event: InboundEvent, reason: string): JevGateOutcome {
   const annotation = `[jev: error ${reason}]`;
+  const meta: JevMeta = { v: 'error', mode: entry.mode };
   return {
     silence: true,
-    event: { ...event, message: { ...event.message, content: annotateContent(event.message.content, annotation) } },
+    event: {
+      ...event,
+      message: { ...event.message, content: annotateContent(event.message.content, annotation, meta) },
+    },
     annotation,
   };
 }
@@ -145,18 +161,21 @@ async function judge(
   const now = new Date();
 
   // Free levers first — no reason to pay for a judgment we would override.
+  // Each lever derives from verdicts of the CURRENT mode, so shadow simulates
+  // the cap/cooldown/streak that live would apply, without either mode
+  // consuming the other's quota.
   if (entry.daily_cap > 0) {
-    const used = wakesToday(rows, TIMEZONE, now);
+    const used = wakesToday(rows, TIMEZONE, now, entry.mode);
     if (used >= entry.daily_cap) return outcome(entry, event, false, `daily_cap ${used}/${entry.daily_cap}`);
   }
   if (entry.cooldown_minutes > 0) {
-    const last = lastWakeAt(rows);
+    const last = lastWakeAt(rows, entry.mode);
     if (last && now.getTime() - last.getTime() < entry.cooldown_minutes * 60_000) {
       return outcome(entry, event, false, `cooldown ${entry.cooldown_minutes}m`);
     }
   }
   if (entry.max_consecutive_bot > 0 && message.isBot) {
-    const streak = consecutiveBotWakes(rows);
+    const streak = consecutiveBotWakes(rows, entry.mode);
     if (streak >= entry.max_consecutive_bot) {
       return outcome(entry, event, false, `bot_loop_guard ${streak}`);
     }

@@ -2,23 +2,38 @@
  * The gate's read side: one host-side open of the session's mailbox per
  * judged message, merged in/out, from which everything else is derived.
  *
- * There is no gate table. The verdict annotation appended to each stored
- * message IS the log, so the daily wake count, the cooldown stamp, and the
- * consecutive-bot streak are all re-derived from `messages_in` on every call.
- * Read-only from the host side (the existing open-read-close mailbox helper),
- * so it is safe with a live container.
+ * There is no gate table. The verdict lands on each stored message twice:
+ * a human-readable `[jev: …]` line appended to `text` (for the agent's
+ * prompt and pond), and a host-written `jev` metadata key in the content
+ * JSON. Derivation — the daily wake count, the cooldown stamp, the
+ * consecutive-bot streak — reads ONLY the metadata key. User-authored text
+ * is a JSON string value and cannot forge a key, so a chat message
+ * containing the literal marker cannot trip the levers.
+ *
+ * Read-only from the host side (the existing open-read-close mailbox
+ * helper), so it is safe with a live container.
  */
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { log } from '../../log.js';
 
-/** Marker that identifies a message this gate granted a wake for. */
+/** Human-readable prefix of a granted-wake annotation. Display only — never derivation. */
 export const WAKE_MARKER = '[jev: reply';
 
-/** How many merged rows we pull per judgment — deep enough for a 50/day cap. */
+/** First window per judgment; escalates when a busy day outruns it (see readGateHistory). */
 export const GATE_HISTORY_LIMIT = 200;
+
+/** Escalation ladder: a window is wide enough once it reaches back past 24h. */
+const HISTORY_LIMITS = [GATE_HISTORY_LIMIT, 1000, 4000];
 
 /** Rows rendered into the state we send Jev. */
 export const STATE_HISTORY_LINES = 10;
+
+/** Host-written verdict metadata stored next to `text` in the content JSON. */
+export interface JevMeta {
+  v: 'reply' | 'silent' | 'error';
+  mode: 'live' | 'shadow';
+  at?: string;
+}
 
 export interface GateHistoryRow {
   timestamp: string;
@@ -27,14 +42,25 @@ export interface GateHistoryRow {
   sender: string;
   /** True for our own outbound, and for inbound whose author is a bot. */
   isBot: boolean;
-  /** This row carries a `[jev: reply` annotation — the gate woke on it. */
-  jevWake: boolean;
+  /** Host-written verdict metadata, null for rows the gate never judged. */
+  jev: JevMeta | null;
 }
 
 interface ParsedContent {
   text: string;
   sender: string;
   isBot: boolean;
+  jev: JevMeta | null;
+}
+
+function parseJevMeta(value: unknown): JevMeta | null {
+  if (!value || typeof value !== 'object') return null;
+  const v = (value as { v?: unknown }).v;
+  const mode = (value as { mode?: unknown }).mode;
+  if ((v === 'reply' || v === 'silent' || v === 'error') && (mode === 'live' || mode === 'shadow')) {
+    return { v, mode };
+  }
+  return null;
 }
 
 /**
@@ -47,7 +73,7 @@ export function parseAuthor(raw: string): ParsedContent {
   try {
     parsed = JSON.parse(raw) as Record<string, unknown>;
   } catch {
-    return { text: raw, sender: '', isBot: false };
+    return { text: raw, sender: '', isBot: false, jev: null };
   }
   const author = (parsed.author ?? {}) as Record<string, unknown>;
   const text = typeof parsed.text === 'string' ? parsed.text : '';
@@ -58,45 +84,68 @@ export function parseAuthor(raw: string): ParsedContent {
     '';
   const userName = typeof author.userName === 'string' ? author.userName : '';
   const isBot = author.isBot === true || (author.isBot === undefined && userName.toLowerCase().endsWith('bot'));
-  return { text, sender, isBot };
+  return { text, sender, isBot, jev: parseJevMeta(parsed.jev) };
 }
 
-/** Merged, chronological history for one session. Empty when the session has no mailbox yet. */
-export async function readGateHistory(
-  agentGroupId: string,
-  sessionId: string,
-  limit = GATE_HISTORY_LIMIT,
-): Promise<GateHistoryRow[]> {
-  let raw:
-    | {
-        inbound: Array<{ timestamp: string; content: string }>;
-        outbound: Array<{ timestamp: string; content: string }>;
-      }
-    | undefined;
-  try {
-    raw = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => ({
-      inbound: mailbox.getInboundHistory(limit),
-      outbound: mailbox.getOutboundHistory(limit),
-    }));
-  } catch (err) {
-    // A locked or half-written session DB must not decide a wake — the caller
-    // treats an empty history as "judge on the message alone".
-    log.debug('Jev gate history read failed', { agentGroupId, sessionId, err });
-    return [];
-  }
-  if (!raw) return [];
+/**
+ * Merged, chronological history for one session. Empty when the session has
+ * no mailbox yet. The window starts at GATE_HISTORY_LIMIT rows and escalates
+ * until it reaches back past 24h (which always covers the local day the cap
+ * counts over) or the ladder tops out — a row-capped window on a busy day
+ * would silently undercount `wakesToday` and leak the cap.
+ */
+export async function readGateHistory(agentGroupId: string, sessionId: string): Promise<GateHistoryRow[]> {
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
 
-  const rows: GateHistoryRow[] = [];
-  for (const r of raw.inbound) {
-    const { text, sender, isBot } = parseAuthor(r.content);
-    rows.push({ timestamp: r.timestamp, direction: 'in', text, sender, isBot, jevWake: text.includes(WAKE_MARKER) });
+  for (let i = 0; i < HISTORY_LIMITS.length; i++) {
+    const limit = HISTORY_LIMITS[i];
+    let raw:
+      | {
+          inbound: Array<{ timestamp: string; content: string }>;
+          outbound: Array<{ timestamp: string; content: string }>;
+        }
+      | undefined;
+    try {
+      raw = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => ({
+        inbound: mailbox.getInboundHistory(limit),
+        outbound: mailbox.getOutboundHistory(limit),
+      }));
+    } catch (err) {
+      // A locked or half-written session DB must not decide a wake — the
+      // caller treats an empty history as "judge on the message alone".
+      log.debug('Jev gate history read failed', { agentGroupId, sessionId, err });
+      return [];
+    }
+    if (!raw) return [];
+
+    const windowFull = raw.inbound.length >= limit;
+    const oldestInbound = raw.inbound.reduce<string | null>(
+      (min, r) => (min === null || r.timestamp < min ? r.timestamp : min),
+      null,
+    );
+    const coversDay = !windowFull || (oldestInbound !== null && new Date(oldestInbound).getTime() < dayAgo);
+    if (!coversDay && i < HISTORY_LIMITS.length - 1) continue;
+    if (!coversDay) {
+      log.warn('Jev gate history window exhausted before covering 24h — cap may undercount', {
+        agentGroupId,
+        sessionId,
+        limit,
+      });
+    }
+
+    const rows: GateHistoryRow[] = [];
+    for (const r of raw.inbound) {
+      const { text, sender, isBot, jev } = parseAuthor(r.content);
+      rows.push({ timestamp: r.timestamp, direction: 'in', text, sender, isBot, jev });
+    }
+    for (const r of raw.outbound) {
+      const { text } = parseAuthor(r.content);
+      rows.push({ timestamp: r.timestamp, direction: 'out', text, sender: '', isBot: true, jev: null });
+    }
+    rows.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
+    return rows;
   }
-  for (const r of raw.outbound) {
-    const { text } = parseAuthor(r.content);
-    rows.push({ timestamp: r.timestamp, direction: 'out', text, sender: '', isBot: true, jevWake: false });
-  }
-  rows.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
-  return rows.slice(-limit);
+  return [];
 }
 
 function localDay(timestamp: string, timezone: string): string {
@@ -105,17 +154,30 @@ function localDay(timestamp: string, timezone: string): string {
   return date.toLocaleDateString('en-CA', { timeZone: timezone });
 }
 
-/** Wakes this gate granted today (local day), from the stored annotations. */
-export function wakesToday(rows: GateHistoryRow[], timezone: string, now: Date): number {
-  const today = localDay(now.toISOString(), timezone);
-  return rows.filter((r) => r.direction === 'in' && r.jevWake && localDay(r.timestamp, timezone) === today).length;
+function isWake(row: GateHistoryRow, mode: JevMeta['mode']): boolean {
+  return row.direction === 'in' && row.jev?.v === 'reply' && row.jev.mode === mode;
 }
 
-/** Timestamp of the most recent gate-granted wake, or null. */
-export function lastWakeAt(rows: GateHistoryRow[]): Date | null {
+/**
+ * Wakes this gate granted today (local day), from the stored metadata. In
+ * shadow mode the count is of shadow verdicts, so the levers simulate what
+ * live would do without live and shadow contaminating each other's quota.
+ */
+export function wakesToday(
+  rows: GateHistoryRow[],
+  timezone: string,
+  now: Date,
+  mode: JevMeta['mode'] = 'live',
+): number {
+  const today = localDay(now.toISOString(), timezone);
+  return rows.filter((r) => isWake(r, mode) && localDay(r.timestamp, timezone) === today).length;
+}
+
+/** Timestamp of the most recent gate-granted wake in this mode, or null. */
+export function lastWakeAt(rows: GateHistoryRow[], mode: JevMeta['mode'] = 'live'): Date | null {
   for (let i = rows.length - 1; i >= 0; i--) {
     const row = rows[i];
-    if (row.direction === 'in' && row.jevWake) {
+    if (isWake(row, mode)) {
       const date = new Date(row.timestamp);
       if (!Number.isNaN(date.getTime())) return date;
     }
@@ -128,13 +190,13 @@ export function lastWakeAt(rows: GateHistoryRow[]): Date | null {
  * A human speaking clears the streak — the guard is about the bot-to-bot
  * spiral, not about how much of the day's traffic came from bots.
  */
-export function consecutiveBotWakes(rows: GateHistoryRow[]): number {
+export function consecutiveBotWakes(rows: GateHistoryRow[], mode: JevMeta['mode'] = 'live'): number {
   let streak = 0;
   for (let i = rows.length - 1; i >= 0; i--) {
     const row = rows[i];
     if (row.direction !== 'in') continue;
     if (!row.isBot) break;
-    if (row.jevWake) streak++;
+    if (isWake(row, mode)) streak++;
   }
   return streak;
 }
