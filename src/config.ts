@@ -21,6 +21,7 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
+  'JEV_API_KEY',
 ]);
 
 /**
@@ -112,6 +113,10 @@ export const EGRESS_NETWORK =
   process.env.NANOCLAW_EGRESS_NETWORK || envConfig.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
 export const ONECLI_GATEWAY_CONTAINER =
   process.env.ONECLI_GATEWAY_CONTAINER || envConfig.ONECLI_GATEWAY_CONTAINER || 'onecli';
+
+// Jev (api.typesafe.ai) key for the ambient wake-gate. Empty means the gate
+// fails silent on every message — see src/modules/jev-gate.
+export const JEV_API_KEY = process.env.JEV_API_KEY || envConfig.JEV_API_KEY || '';
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

@@ -22,6 +22,13 @@ import { GROUP_SCOPE_RESOURCES, type CommandDef } from './registry.js';
 const GROUP_WIRING_COMMANDS = new Set(['wirings-get', 'wirings-update']);
 const GROUP_WIRING_UPDATE_ARGS = new Set(['id', 'agent_group_id', 'group', 'help', 'engage_mode', 'engage_pattern']);
 
+// Same precedent as the wiring commands above: a group-scoped agent may read
+// and (with approval) change the ambient wake-gate for its OWN group, though
+// `jev-gate` is not a whitelisted resource. --group is always present for a
+// group-scoped caller (dispatch auto-fills it with the caller's own id); the
+// explicit check keeps the file-wide read/write unreachable if that changes.
+const GROUP_JEV_GATE_COMMANDS = new Set(['jev-gate-get', 'jev-gate-update']);
+
 /** Dotted catalog action name for a command. */
 export function commandGuardAction(cmd: Pick<CommandDef, 'name' | 'action'>): string {
   return cmd.action ?? `cli.${cmd.name}`;
@@ -67,10 +74,15 @@ async function commandDecide(cmd: CommandDef, input: GuardInput) {
 
   if (cliScope === 'group') {
     const groupWiringCommand = cmd.resource === 'wirings' && GROUP_WIRING_COMMANDS.has(cmd.name);
+    const groupJevGateCommand = cmd.resource === 'jev-gate' && GROUP_JEV_GATE_COMMANDS.has(cmd.name);
 
     // Only allow whitelisted resources and general commands (no resource, like help)
-    if (cmd.resource && !GROUP_SCOPE_RESOURCES.has(cmd.resource) && !groupWiringCommand) {
+    if (cmd.resource && !GROUP_SCOPE_RESOURCES.has(cmd.resource) && !groupWiringCommand && !groupJevGateCommand) {
       return DENY(`CLI access is scoped to this agent group. Cannot access "${cmd.resource}".`);
+    }
+
+    if (groupJevGateCommand && args.help !== true && args.group === undefined) {
+      return DENY('Jev-gate commands must name the agent group with --group.');
     }
 
     // Enforce group scope on all agent-group-related args.

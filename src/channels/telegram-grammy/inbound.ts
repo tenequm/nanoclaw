@@ -379,6 +379,8 @@ export interface InboundContent {
     userId: string;
     fullName: string | null;
     userName: string | null;
+    /** Telegram's `from.is_bot`. Absent on rows stored before this field existed. */
+    isBot?: boolean;
   };
   attachments: InboundAttachment[];
   replyTo?: ReplyContext;
@@ -513,6 +515,7 @@ export function toInboundMessage(
       userId: senderIdNs,
       fullName: fullName(from),
       userName: from.username ?? null,
+      isBot: from.is_bot === true,
     },
     attachments: isEdit ? [] : extractAttachments(msg),
   };
@@ -614,6 +617,7 @@ export function toReactionInbound(upd: ReactionUpdatePayload): InboundEnvelope |
       userId: senderIdNs,
       fullName: fullName(actor),
       userName: actor.username ?? null,
+      isBot: actor.is_bot === true,
     },
     attachments: [],
     replyTo: { id: String(message_id), text: '', sender: 'target' },

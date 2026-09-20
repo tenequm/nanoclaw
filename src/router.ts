@@ -30,6 +30,7 @@ import {
 } from './db/messaging-groups.js';
 import { findSessionForAgent } from './db/sessions.js';
 import { backfillNewSession, fanInboundMessage } from './modules/cross-session-context/index.js';
+import { runJevGate } from './modules/jev-gate/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { agentScopedMessageId } from './platform-id.js';
@@ -420,13 +421,31 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     );
     const effectiveThreadId = threadsEnabled ? event.threadId : null;
 
-    const engages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
+    const ruleEngages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
 
-    const accessOk = engages && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);
-    const scopeOk = engages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
+    const accessOk =
+      ruleEngages && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);
+    const scopeOk = ruleEngages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
+
+    // Jev ambient wake-gate (fork) — src/modules/jev-gate. For wirings listed
+    // in data/jev-gate.json, a non-mention group message that engaged is put
+    // to Jev; a silent verdict flips `engages` off so the accumulate branch
+    // below stores it as context, and the verdict is annotated onto a
+    // PER-DELIVERY copy of the event (the loop shares `event` across agents).
+    // Placed after the access/scope gates so an untrusted sender's message is
+    // never judged, annotated, or accumulated — see that branch's comment.
+    let engages = ruleEngages;
+    let deliveryEvent = event;
+    if (ruleEngages && accessOk && scopeOk && !isMention && mg.is_group === 1) {
+      const gated = await runJevGate({ agent, mg, event, threadId: effectiveThreadId });
+      if (gated) {
+        deliveryEvent = gated.event;
+        if (gated.silence) engages = false;
+      }
+    }
 
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, true);
+      await deliverToAgent(agent, agentGroup, mg, deliveryEvent, userId, threadsEnabled, effectiveThreadId, true);
       engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
@@ -450,7 +469,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
           log.warn('adapter.subscribe failed', { channelType: event.channelType, threadId: effectiveThreadId, err });
         });
       }
-    } else if (agent.ignored_message_policy === 'accumulate' && !(engages && (!accessOk || !scopeOk))) {
+    } else if (agent.ignored_message_policy === 'accumulate' && !(ruleEngages && (!accessOk || !scopeOk))) {
       // Accumulate stores the message as silent context. We allow it when
       // engagement simply didn't fire, but NOT when engagement fired and
       // the access/scope gate refused — those refusals are security
@@ -458,7 +477,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       // message (which also stages their attachments to disk via
       // writeSessionMessage → extractAttachmentFiles) is exactly what the
       // gate is meant to prevent.
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, false);
+      await deliverToAgent(agent, agentGroup, mg, deliveryEvent, userId, threadsEnabled, effectiveThreadId, false);
       accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {

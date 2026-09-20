@@ -116,6 +116,28 @@ describe('toInboundMessage drops content-free service messages', () => {
   });
 });
 
+// The ambient wake-gate needs to know whether a message came from another bot
+// (bot-loop guard, and the veto rubric), and Telegram tells us on every `from`.
+describe('toInboundMessage propagates author.isBot', () => {
+  const ctxFor = (isBot: boolean) =>
+    ({
+      chat: { id: -1000000000001, type: 'supergroup', title: 'Test group' },
+      msg: { message_id: 30, date: 1_700_000_000, text: 'hello' },
+      from: { id: 1000002, first_name: 'Levi', username: 'LeviBot', is_bot: isBot },
+      update: {},
+    }) as unknown as Parameters<typeof toInboundMessage>[0];
+
+  it('is true for a bot sender', () => {
+    const content = toInboundMessage(ctxFor(true), 'bot', 1)!.message.content as InboundContent;
+    expect(content.author.isBot).toBe(true);
+  });
+
+  it('is false for a human sender', () => {
+    const content = toInboundMessage(ctxFor(false), 'bot', 1)!.message.content as InboundContent;
+    expect(content.author.isBot).toBe(false);
+  });
+});
+
 describe('parseChatId', () => {
   it('parses the 2-part base form', () => {
     expect(parseChatId('telegram:-1000000000001')).toBe(-1000000000001);
