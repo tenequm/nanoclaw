@@ -230,16 +230,16 @@ describe('routeInbound with the Jev wake-gate', () => {
     expect(wakeContainer).toHaveBeenCalledTimes(2);
   });
 
-  it('shadow mode annotates but still wakes', async () => {
+  it('shadow mode annotates but suppresses the wake (pre-gate baseline)', async () => {
     writeGateConfig({ enabled: true, mode: 'shadow', daily_cap: 0, cooldown_minutes: 0, max_consecutive_bot: 0 });
-    stubJev(0.05);
+    stubJev(0.95);
     await activate();
     await seed();
 
-    await inbound('m1', 'two humans chatting about lunch');
+    await inbound('m1', 'can someone check the deploy?');
 
-    expect((await storedTexts(GATED))[0]).toContain('[jev: shadow-silent');
-    expect(wakeContainer).toHaveBeenCalledTimes(2);
+    expect((await storedTexts(GATED))[0]).toContain('[jev: shadow-reply');
+    expect(wakeContainer).toHaveBeenCalledTimes(1);
   });
 
   it('behaves exactly as upstream when no gate config exists', async () => {

@@ -93,7 +93,12 @@ function outcome(entry: JevGateEntry, event: InboundEvent, wake: boolean, detail
   const verdict = wake ? 'reply' : 'silent';
   const annotation = `[jev: ${entry.mode === 'shadow' ? `shadow-${verdict}` : verdict} · ${detail}]`;
   return {
-    silence: entry.mode === 'live' && !wake,
+    // Shadow's baseline is the pre-gate wiring (mention-only), not the
+    // pattern-everything wiring the gate rides on — so shadow suppresses
+    // every ambient message while logging what live WOULD have done. A
+    // shadow verdict that wakes would turn calibration mode into one
+    // container wake per message the moment the wiring is widened.
+    silence: entry.mode === 'shadow' || !wake,
     event: { ...event, message: { ...event.message, content: annotateContent(event.message.content, annotation) } },
     annotation,
   };
@@ -102,7 +107,7 @@ function outcome(entry: JevGateEntry, event: InboundEvent, wake: boolean, detail
 function errorOutcome(entry: JevGateEntry, event: InboundEvent, reason: string): JevGateOutcome {
   const annotation = `[jev: error ${reason}]`;
   return {
-    silence: entry.mode === 'live',
+    silence: true,
     event: { ...event, message: { ...event.message, content: annotateContent(event.message.content, annotation) } },
     annotation,
   };

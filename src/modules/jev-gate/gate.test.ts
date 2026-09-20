@@ -300,27 +300,28 @@ describe('fail-silent', () => {
   });
 });
 
-describe('shadow mode', () => {
-  it('judges and annotates but never silences', async () => {
+describe('shadow mode (baseline = the pre-gate mention-only wiring: always suppress, log what live would do)', () => {
+  it('annotates the verdict but silences regardless of it', async () => {
     writeConfig({ mode: 'shadow' });
     nouls({ direct_invitation: 0.1 });
     const out = await gate();
-    expect(out?.silence).toBe(false);
+    expect(out?.silence).toBe(true);
     expect(out?.annotation).toBe('[jev: shadow-silent · value=0.10 · veto=0.00 · below_threshold]');
   });
 
-  it('does not let a shadow wake look like a granted one to the cap derivation', async () => {
+  it('silences even on a would-be wake, and the cap derivation does not count it', async () => {
     writeConfig({ mode: 'shadow' });
     nouls({ direct_invitation: 0.99 });
     const out = await gate();
+    expect(out?.silence).toBe(true);
     expect(out?.annotation).toBe('[jev: shadow-reply · value=0.99 · veto=0.00]');
     expect(out?.content).not.toContain(WAKE_MARKER);
   });
 
-  it('does not silence on a Jev error either', async () => {
+  it('silences on a Jev error too', async () => {
     writeConfig({ mode: 'shadow' });
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('boom')));
-    expect((await gate())?.silence).toBe(false);
+    expect((await gate())?.silence).toBe(true);
   });
 });
 
