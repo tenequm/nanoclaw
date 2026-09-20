@@ -93,7 +93,7 @@ async function seed(): Promise<void> {
     name: 'Pondarium',
     // Legacy rows carry NULL here (the real pondarium row does); the gate
     // must treat that as a group — only an explicit 0 means DM.
-    is_group: null,
+    is_group: null as unknown as number, // insert type says number; live legacy rows hold NULL
     unknown_sender_policy: 'public',
     created_at: now(),
   });
