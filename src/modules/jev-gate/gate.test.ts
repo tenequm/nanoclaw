@@ -181,6 +181,10 @@ const WOKE_META = { v: 'reply', mode: 'live' };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Pin the clock mid-day: rows seeded "N minutes ago" must stay inside the
+  // same UTC day as `now`, or the daily-cap derivations legitimately see
+  // yesterday's wakes and these tests flake in the 00:00-05:00 UTC window.
+  vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-06-15T12:00:00Z') });
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   resetGateConfigCache();
@@ -191,6 +195,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
