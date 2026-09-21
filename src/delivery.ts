@@ -24,10 +24,10 @@ import { isUnguarded, type Unguarded } from './guard/index.js';
 import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
+import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { platformMessageId } from './platform-id.js';
-import type { OutboundFile } from './channels/adapter.js';
+import type { OutboundFile, ResolvedReaction } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
 import type { OutboundMessage } from './mailbox/index.js';
 
@@ -125,6 +125,12 @@ export interface ChannelDeliveryAdapter {
     emoji: string,
     instance?: string,
   ): Promise<void>;
+  /**
+   * Measure an outbound reaction against the platform's fixed reaction set.
+   * `undefined` means the platform has no fixed set (or exposes no resolver)
+   * and the agent's emoji is forwarded untouched.
+   */
+  resolveReaction?(channelType: string, emoji: string, instance?: string): ResolvedReaction | undefined;
   typingRequiresThread?(channelType: string, instance?: string): boolean;
 }
 
@@ -335,6 +341,98 @@ async function drainSession(session: Session): Promise<void> {
   }
 }
 
+/**
+ * Tell the agent something about its own outbound message, in the same
+ * session, WITHOUT waking the container.
+ *
+ * The membership-note shape: kind 'chat' + sender 'system' + channel_type
+ * 'agent' + trigger=0 (see slack-room-membership/membership.ts and
+ * canvas-actions/handlers.ts). Deliberately NOT kind 'system' — those rows are
+ * reserved for MCP tool responses and the container poll loop filters them out
+ * of agent batches, so a 'system' note would sit pending forever.
+ *
+ * Loop safety, three ways: trigger=0 means it never wakes anything (it rides
+ * along as context with the next real trigger); channel_type 'agent' with a
+ * null platform id is not a chat surface, so it is never routed, judged or
+ * echo-fanned; and writeSessionMessage never re-enters routeInbound, so no
+ * router hook — jev-gate included — ever sees it.
+ *
+ * Best-effort: a failed note must not fail delivery. The id is derived from
+ * the outbound row so a delivery retry cannot stack duplicates.
+ */
+async function writeOutboundNote(session: Session, messageId: string, text: string): Promise<void> {
+  try {
+    await writeSessionMessage(session.agent_group_id, session.id, {
+      id: `note-${messageId}`,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: null,
+      channelType: 'agent',
+      threadId: null,
+      content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
+      trigger: false,
+    });
+  } catch (err) {
+    log.warn('Failed to write outbound note back to the session', { messageId, sessionId: session.id, err });
+  }
+}
+
+/**
+ * Resolve a reaction operation against the delivering platform's fixed
+ * reaction set, and tell the agent whenever the answer is not "sent as asked".
+ *
+ * `{ drop: true }` — nothing in the allowed set carries the intent: no adapter
+ * call at all (the Bot API would 400 REACTION_INVALID), and the agent gets the
+ * whole allowed set so its next attempt can be legal.
+ * `{ emoji }` — a nearest-allowed substitution: delivered, and named to the
+ * agent so it does not believe it sent the glyph it asked for.
+ * `{}` — exact match, no fixed set, or not a reaction: untouched.
+ */
+async function resolveOutboundReaction(
+  messageId: string,
+  channelType: string,
+  content: Record<string, unknown>,
+  session: Session,
+  instance: string | undefined,
+): Promise<{ drop?: true; emoji?: string }> {
+  // An empty emoji CLEARS the reaction — a legitimate operation, nothing to resolve.
+  if (content.operation !== 'reaction' || typeof content.emoji !== 'string' || !content.emoji) return {};
+  const input = content.emoji;
+  const resolved = deliveryAdapter?.resolveReaction?.(channelType, input, instance);
+  if (!resolved) return {};
+
+  if (resolved.emoji === null) {
+    log.warn('Reaction dropped — outside the platform set, reported back to the agent', {
+      messageId,
+      sessionId: session.id,
+      channelType,
+      input,
+    });
+    await writeOutboundNote(
+      session,
+      messageId,
+      `Your reaction "${input}" was not sent: ${resolved.platform} only allows a fixed reaction set. ` +
+        `Allowed: ${resolved.allowed.join(' ')}.`,
+    );
+    return { drop: true };
+  }
+
+  if (!resolved.substituted) return {};
+
+  log.info('Reaction substituted with the nearest allowed glyph', {
+    messageId,
+    sessionId: session.id,
+    input,
+    sent: resolved.emoji,
+  });
+  await writeOutboundNote(
+    session,
+    messageId,
+    `Your reaction "${input}" is not in ${resolved.platform}'s allowed set; sent ${resolved.emoji} instead.`,
+  );
+  return { emoji: resolved.emoji };
+}
+
 async function deliverMessage(
   msg: {
     id: string;
@@ -499,6 +597,15 @@ async function deliverMessage(
     return;
   }
 
+  // Reaction guard. Platforms with a fixed reaction set reject anything
+  // outside it, and the adapter could only log-and-drop: an agent that reacted
+  // `white_check_mark` (not a legal Telegram reaction for ANY chat member) was
+  // told nothing and went on believing it had reacted — twice, in one day,
+  // live. Resolving here instead means the outcome is decided in the one seam
+  // that can write back into the session.
+  const reaction = await resolveOutboundReaction(msg.id, msg.channelType, content, session, deliverInstance);
+  if (reaction.drop) return;
+
   // Read file attachments from outbox if the content declares files.
   // File I/O lives in session-manager.ts (symmetric with inbound
   // extractAttachmentFiles) — delivery just hands buffers to the adapter.
@@ -512,11 +619,15 @@ async function deliverMessage(
   // (messageIdForAgent). Adapters need the platform's own id back — Telegram
   // tolerates the extra segment by accident, Slack hands it to reactions.add
   // verbatim and gets message_not_found. Re-serialize only when there is an
-  // id to rewrite, so every other message keeps its original bytes.
+  // id to rewrite, so every other message keeps its original bytes (a
+  // substituted reaction glyph is the other reason to re-serialize).
+  const rewritten: Record<string, unknown> = {};
+  if (typeof content.messageId === 'string') {
+    rewritten.messageId = platformMessageId(content.messageId, session.agent_group_id);
+  }
+  if (reaction.emoji) rewritten.emoji = reaction.emoji;
   const outboundContent =
-    typeof content.messageId === 'string'
-      ? JSON.stringify({ ...content, messageId: platformMessageId(content.messageId, session.agent_group_id) })
-      : msg.content;
+    Object.keys(rewritten).length > 0 ? JSON.stringify({ ...content, ...rewritten }) : msg.content;
 
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channelType,

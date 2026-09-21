@@ -17,7 +17,14 @@
 import { Effect, Semaphore } from 'effect';
 import type { Context } from 'grammy';
 
-import type { ChannelAdapter, ChannelDefaults, ChannelSetup, ConversationInfo, OutboundMessage } from '../adapter.js';
+import type {
+  ChannelAdapter,
+  ChannelDefaults,
+  ChannelSetup,
+  ConversationInfo,
+  OutboundMessage,
+  ResolvedReaction,
+} from '../adapter.js';
 import { registerChannelAdapter } from '../channel-registry.js';
 import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
@@ -39,6 +46,7 @@ import {
 import { rememberTopicMessage, resolveTopicPlatformId } from './topic-map.js';
 import { tryPair } from './pairing-interceptor.js';
 import { dispatchOutbound } from './outbound.js';
+import { ALLOWED_REACTION_GLYPHS, resolveReactionEmoji } from './reactions.js';
 import { runSupervisedPolling } from './supervise.js';
 import { buildRuntime, type AdapterRuntime } from './runtime.js';
 import { installChatCommands } from './commands/index.js';
@@ -282,6 +290,16 @@ class TelegramGrammyAdapter implements ChannelAdapter {
         );
       }),
     );
+  }
+
+  /**
+   * Telegram's reaction set is fixed for every chat member, bot or human, so
+   * the host resolves an agent's emoji here before delivery and reports the
+   * outcome into the session. Pure lookup — no runtime, no network.
+   */
+  resolveReaction(emoji: string): ResolvedReaction {
+    const { glyph, substituted } = resolveReactionEmoji(emoji);
+    return { emoji: glyph, substituted, platform: 'Telegram', allowed: ALLOWED_REACTION_GLYPHS };
   }
 
   async syncConversations(): Promise<ConversationInfo[]> {

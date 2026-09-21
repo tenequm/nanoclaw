@@ -1,10 +1,22 @@
 /**
  * Coverage for `canonicalizeReactionEmoji` (slug→glyph) — the
- * canonicalizer stops REACTION_INVALID errors at the wire.
+ * canonicalizer stops REACTION_INVALID errors at the wire — and for
+ * `resolveReactionEmoji`, which adds the nearest-allowed fallback layer so a
+ * reaction Telegram will not accept is substituted (and reported) instead of
+ * silently dropped.
  */
+import fs from 'fs';
+import path from 'path';
+
+import type { ReactionTypeEmoji } from 'grammy/types';
 import { describe, expect, it } from 'vitest';
 
-import { canonicalizeReactionEmoji } from './reactions.js';
+import {
+  ALLOWED_REACTION_GLYPHS,
+  canonicalizeReactionEmoji,
+  resolveReactionEmoji,
+  type TelegramReactionEmoji,
+} from './reactions.js';
 
 describe('canonicalizeReactionEmoji', () => {
   it('translates documented slugs to glyphs', () => {
@@ -65,5 +77,77 @@ describe('canonicalizeReactionEmoji', () => {
     expect(canonicalizeReactionEmoji('')).toBeNull();
     expect(canonicalizeReactionEmoji('   ')).toBeNull();
     expect(canonicalizeReactionEmoji('\n')).toBeNull();
+  });
+});
+
+describe('resolveReactionEmoji', () => {
+  it('reports an exact match as not substituted', () => {
+    expect(resolveReactionEmoji('thumbs_up')).toEqual({ glyph: '👍', substituted: false });
+    expect(resolveReactionEmoji('👀')).toEqual({ glyph: '👀', substituted: false });
+    expect(resolveReactionEmoji('❤️')).toEqual({ glyph: '❤', substituted: false });
+  });
+
+  it('substitutes the nearest allowed glyph for ✅ — the live silent drop', () => {
+    // An agent reacted `white_check_mark` twice in one day; ✅ is not a legal
+    // Telegram reaction for ANY chat member, so both went nowhere unreported.
+    expect(resolveReactionEmoji('white_check_mark')).toEqual({ glyph: '👌', substituted: true });
+    expect(resolveReactionEmoji('✅')).toEqual({ glyph: '👌', substituted: true });
+    expect(resolveReactionEmoji('heavy_check_mark')).toEqual({ glyph: '👌', substituted: true });
+    expect(resolveReactionEmoji('☑')).toEqual({ glyph: '👌', substituted: true });
+  });
+
+  it('substitutes for the other common non-allowed inputs', () => {
+    expect(resolveReactionEmoji('x')).toEqual({ glyph: '👎', substituted: true });
+    expect(resolveReactionEmoji('cross_mark')).toEqual({ glyph: '👎', substituted: true });
+    expect(resolveReactionEmoji('❌')).toEqual({ glyph: '👎', substituted: true });
+    expect(resolveReactionEmoji('💪')).toEqual({ glyph: '🫡', substituted: true });
+    expect(resolveReactionEmoji('😊')).toEqual({ glyph: '😁', substituted: true });
+    expect(resolveReactionEmoji('🙂')).toEqual({ glyph: '😁', substituted: true });
+    // ⚡ over 🎉 for 🚀: speed, not celebration — `party`/`tada` already own 🎉.
+    expect(resolveReactionEmoji('🚀')).toEqual({ glyph: '⚡', substituted: true });
+    expect(resolveReactionEmoji('rocket')).toEqual({ glyph: '⚡', substituted: true });
+    expect(resolveReactionEmoji('star')).toEqual({ glyph: '🏆', substituted: true });
+    expect(resolveReactionEmoji('⭐')).toEqual({ glyph: '🏆', substituted: true });
+    expect(resolveReactionEmoji('eyes_ok')).toEqual({ glyph: '👀', substituted: true });
+  });
+
+  it('normalizes fallback lookup the same way as exact lookup', () => {
+    expect(resolveReactionEmoji('  White_Check_Mark  ')).toEqual({ glyph: '👌', substituted: true });
+    expect(resolveReactionEmoji('❌️')).toEqual({ glyph: '👎', substituted: true });
+  });
+
+  it('every fallback lands on a glyph Telegram actually allows', () => {
+    const allowed = new Set<string>(ALLOWED_REACTION_GLYPHS);
+    for (const input of ['✅', '❌', '💪', '😊', '🚀', '⭐', '👁', '🫶', '😂', '🥳', '💖', '🙁']) {
+      const { glyph, substituted } = resolveReactionEmoji(input);
+      expect(substituted).toBe(true);
+      expect(allowed.has(glyph as string)).toBe(true);
+    }
+  });
+
+  it('still resolves to null for input no fallback covers', () => {
+    // The table maps intent, so an emoji with no clear intent stays a drop —
+    // better a reported drop than a reaction meaning something else.
+    for (const input of ['🍕', '🦖', '🧊', 'rocket_ship', 'zzz_unknown', '', '   ']) {
+      expect(resolveReactionEmoji(input)).toEqual({ glyph: null, substituted: false });
+    }
+  });
+
+  it('stays pinned to grammY: every glyph upstream allows is in our list', () => {
+    // The array declaration carries `satisfies readonly ReactionTypeEmoji['emoji'][]`,
+    // which fails the build if we list a glyph upstream dropped. This is the
+    // other direction — a grammY bump that ADDS a glyph breaks this assignment
+    // instead of leaving the set quietly short.
+    const upstream: TelegramReactionEmoji = '👍' as ReactionTypeEmoji['emoji'];
+    expect(ALLOWED_REACTION_GLYPHS).toContain(upstream);
+    expect(ALLOWED_REACTION_GLYPHS).toHaveLength(73);
+  });
+
+  it('the add_reaction tool schema still names the same allowed set', () => {
+    // The container package cannot import host src, so its tool description
+    // carries a copy of the glyph list. Assert the copy verbatim — a drifted
+    // schema would teach the agent an illegal vocabulary.
+    const toolSrc = fs.readFileSync(path.join(process.cwd(), 'container/agent-runner/src/mcp-tools/core.ts'), 'utf8');
+    expect(toolSrc).toContain(ALLOWED_REACTION_GLYPHS.join(' '));
   });
 });

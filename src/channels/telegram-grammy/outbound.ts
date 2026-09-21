@@ -31,7 +31,7 @@ import { mapGrammyError } from './errors.js';
 import { renderFS, splitForBody, splitForCaption } from './formatter.js';
 import { extractTelegramMessageId, parseChatId, parseTopicId, resolveMessageThreadId } from './inbound.js';
 import { rememberTopicMessage } from './topic-map.js';
-import { canonicalizeReactionEmoji, type TelegramReactionEmoji } from './reactions.js';
+import { resolveReactionEmoji, type TelegramReactionEmoji } from './reactions.js';
 import { BotService } from './services.js';
 import { probeMediaMeta } from './media-meta.js';
 
@@ -331,13 +331,16 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
   }
   // Translate slug-or-glyph input into Telegram's fixed allowlist before
   // shipping to the wire. Empty/missing emoji clears any existing reaction;
-  // unknown input is logged + dropped (the alternative is a guaranteed
-  // REACTION_INVALID 400 from the Bot API). See canonicalizeReactionEmoji
-  // for the full slug map and rationale.
+  // input Telegram would reject is nearest-matched, and only unmappable input
+  // is dropped (the alternative is a guaranteed REACTION_INVALID 400 from the
+  // Bot API). See resolveReactionEmoji for the slug map, the fallback table
+  // and the rationale. The host resolves the same way before it gets here, so
+  // it can tell the agent what happened; this is the last line, for callers
+  // that reach the adapter directly (the typing module's reaction ack).
   const reactions: Array<{ type: 'emoji'; emoji: TelegramReactionEmoji }> = [];
   if (emoji) {
-    const canonical = canonicalizeReactionEmoji(emoji);
-    if (!canonical) {
+    const { glyph, substituted } = resolveReactionEmoji(emoji);
+    if (!glyph) {
       yield* Effect.logWarning('telegram-grammy: dropping reaction with unknown emoji', {
         input: emoji,
         chatId,
@@ -345,7 +348,14 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
       });
       return undefined;
     }
-    reactions.push({ type: 'emoji', emoji: canonical });
+    if (substituted) {
+      yield* Effect.logInfo('telegram-grammy: substituting nearest allowed reaction', {
+        input: emoji,
+        sent: glyph,
+        chatId,
+      });
+    }
+    reactions.push({ type: 'emoji', emoji: glyph });
   }
   const { bot } = yield* BotService;
   yield* Effect.tryPromise({

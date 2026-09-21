@@ -740,6 +740,153 @@ describe('deliverSessionMessages — post-delivery hooks', () => {
   });
 });
 
+/**
+ * A reaction the platform will not accept used to die inside the adapter with
+ * a log line: the agent was told nothing and believed it had reacted (live,
+ * `white_check_mark` twice in one day). Delivery now resolves the emoji
+ * against the adapter's fixed set and reports back into the same session.
+ */
+describe('deliverSessionMessages — reaction fallback and feedback', () => {
+  interface NoteRow {
+    kind: string;
+    channel_type: string | null;
+    platform_id: string | null;
+    thread_id: string | null;
+    trigger: number;
+    content: string;
+  }
+
+  function insertReaction(agentGroupId: string, sessionId: string, msgId: string, emoji: string): void {
+    const db = new Database(outboundDbPath(agentGroupId, sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+       VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', ?)`,
+    ).run(msgId, JSON.stringify({ operation: 'reaction', messageId: '4242', emoji }));
+    db.close();
+  }
+
+  function notes(sessionId: string): NoteRow[] {
+    const db = openInboundDb('ag-1', sessionId);
+    const rows = db
+      .prepare(
+        `SELECT kind, channel_type, platform_id, thread_id, trigger, content FROM messages_in
+          WHERE id LIKE 'note-%' ORDER BY seq ASC`,
+      )
+      .all() as NoteRow[];
+    db.close();
+    return rows;
+  }
+
+  /** Telegram-shaped resolver: ✅ substitutes to 👌, 🍕 has no stand-in. */
+  function reactionAdapter(delivered: string[]): void {
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(content);
+        return 'plat-msg-1';
+      },
+      resolveReaction(_channelType, emoji) {
+        const allowed = ['👍', '👌', '👀'];
+        if (allowed.includes(emoji)) return { emoji, substituted: false, platform: 'Telegram', allowed };
+        if (emoji === '✅' || emoji === 'white_check_mark') {
+          return { emoji: '👌', substituted: true, platform: 'Telegram', allowed };
+        }
+        return { emoji: null, substituted: false, platform: 'Telegram', allowed };
+      },
+    });
+  }
+
+  it('delivers the substituted glyph and tells the agent what went out instead', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-sub', 'white_check_mark');
+
+    const delivered: string[] = [];
+    reactionAdapter(delivered);
+    await deliverSessionMessages(session);
+
+    expect(delivered).toHaveLength(1);
+    expect(JSON.parse(delivered[0]!).emoji).toBe('👌');
+
+    const rows = notes(session.id);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.content).text).toBe(
+      'Your reaction "white_check_mark" is not in Telegram\'s allowed set; sent 👌 instead.',
+    );
+  });
+
+  it('drops an unmappable reaction, delivers nothing, and reports the allowed set', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-drop', '🍕');
+
+    const delivered: string[] = [];
+    reactionAdapter(delivered);
+    await deliverSessionMessages(session);
+
+    expect(delivered).toEqual([]);
+    const rows = notes(session.id);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.content).text).toBe(
+      'Your reaction "🍕" was not sent: Telegram only allows a fixed reaction set. Allowed: 👍 👌 👀.',
+    );
+    // Marked delivered all the same — nothing is retryable about an illegal emoji.
+    const inDb = openInboundDb('ag-1', session.id);
+    expect(getDeliveredIds(inDb).has('out-drop')).toBe(true);
+    inDb.close();
+  });
+
+  it('notes are non-waking context rows, never a chat surface', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-shape', '🍕');
+    reactionAdapter([]);
+    await deliverSessionMessages(session);
+
+    const [row] = notes(session.id);
+    // trigger=0: rides along as context, never wakes a container. channel_type
+    // 'agent' + null platform id: not a chat surface, so it is never routed,
+    // judged or echo-fanned. kind 'chat', NOT 'system' — the container's poll
+    // loop filters 'system' rows out of agent batches.
+    expect(row!.trigger).toBe(0);
+    expect(row!.kind).toBe('chat');
+    expect(row!.channel_type).toBe('agent');
+    expect(row!.platform_id).toBeNull();
+    expect(row!.thread_id).toBeNull();
+    expect(JSON.parse(row!.content).sender).toBe('system');
+  });
+
+  it('an exact match is delivered byte-identical, with no note', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-exact', '👀');
+
+    const delivered: string[] = [];
+    reactionAdapter(delivered);
+    await deliverSessionMessages(session);
+
+    expect(JSON.parse(delivered[0]!).emoji).toBe('👀');
+    expect(notes(session.id)).toEqual([]);
+  });
+
+  it('an adapter with no fixed set forwards the emoji untouched', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-free', '🍕');
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(content);
+        return 'plat-msg-1';
+      },
+    });
+    await deliverSessionMessages(session);
+
+    expect(JSON.parse(delivered[0]!).emoji).toBe('🍕');
+    expect(notes(session.id)).toEqual([]);
+  });
+});
+
 describe('deliverSessionMessages — agent-scoped message ids', () => {
   /**
    * The agent addresses a message by its inbound ROW id, which the router
