@@ -281,6 +281,21 @@ export const editMessage: McpToolDefinition = {
   },
 };
 
+/**
+ * The reaction vocabulary is spelled out in the schema on purpose. Chat
+ * platforms do not let anyone — bot or human — react with an arbitrary emoji;
+ * Telegram allows exactly these 73 glyphs and rejects everything else with
+ * REACTION_INVALID. Naming them here is what keeps an illegal reaction from
+ * being picked in the first place. The host's nearest-allowed fallback and the
+ * note it writes back are the safety net, not the primary path.
+ *
+ * Source of truth: ALLOWED_REACTION_GLYPHS in
+ * src/channels/telegram-grammy/reactions.ts (that file's tests assert this
+ * string still matches it, so the two cannot drift).
+ */
+const TELEGRAM_REACTION_GLYPHS =
+  '👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡';
+
 export const addReaction: McpToolDefinition = {
   tool: {
     name: 'add_reaction',
@@ -292,7 +307,10 @@ export const addReaction: McpToolDefinition = {
         emoji: {
           type: 'string',
           description:
-            'Reaction emoji. Channel adapters translate common slugs (thumbs_up, heart, fire, party, eyes, ok_hand, ...) into the underlying glyph. Unicode glyphs (👍, ❤, 🔥) work too. Channels reject anything outside their allowed set.',
+            'Reaction emoji. Pick one of the glyphs below — chat platforms allow a FIXED reaction set for everyone in the chat, bots and humans alike, and reject anything else. ' +
+            `On Telegram the legal set is: ${TELEGRAM_REACTION_GLYPHS}. ` +
+            'Semantic slugs naming one of those work too (thumbs_up, thumbs_down, heart, fire, party, eyes, ok_hand, salute, trophy, zap, rofl, pray, clap, ...), as do the same glyphs with a variation selector. ' +
+            'Anything outside the set (✅, 🚀, ❌, 💪, ⭐, ...) is nearest-matched to the closest allowed glyph and you are told what was sent instead; if nothing fits, the reaction is not sent and you are told that too.',
         },
       },
       required: ['messageId', 'emoji'],

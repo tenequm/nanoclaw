@@ -117,6 +117,21 @@ export interface OutboundMessage {
   files?: OutboundFile[]; // file attachments from the session outbox
 }
 
+/**
+ * An outbound reaction measured against a platform's fixed reaction set —
+ * see `ChannelAdapter.resolveReaction`.
+ */
+export interface ResolvedReaction {
+  /** Glyph to actually send, or null when the set has no stand-in for the intent. */
+  emoji: string | null;
+  /** true when `emoji` is a nearest-allowed stand-in, not what the agent asked for. */
+  substituted: boolean;
+  /** Platform whose set applied, for the note the host writes back to the agent. */
+  platform: string;
+  /** The full allowed set, spelled out to the agent when nothing maps. */
+  allowed: readonly string[];
+}
+
 /** Discovered conversation info (from syncConversations). */
 export interface ConversationInfo {
   platformId: string;
@@ -272,6 +287,23 @@ export interface ChannelAdapter {
    *  on adapters whose platform has reactions. */
   addReaction?(platformId: string, messageId: string, emoji: string): Promise<void>;
   removeReaction?(platformId: string, messageId: string, emoji: string): Promise<void>;
+
+  /**
+   * Constrain an outbound reaction to the platform's allowed set.
+   *
+   * Only adapters whose platform has a FIXED reaction set implement this
+   * (Telegram: ~73 glyphs — the same ceiling every human in the chat has, not
+   * a restriction nanoclaw invents). Delivery calls it before handing a
+   * reaction operation to `deliver`, so the outcome is decided in the host
+   * seam that CAN write back into the session: a substitution is delivered and
+   * named to the agent, an unresolvable emoji is dropped with the set spelled
+   * out. Left inside the adapter it could only log and drop, which is exactly
+   * the silent failure this exists to end.
+   *
+   * Omitted by adapters that accept arbitrary emoji — delivery then forwards
+   * the agent's input untouched.
+   */
+  resolveReaction?(emoji: string): ResolvedReaction;
 
   syncConversations?(): Promise<ConversationInfo[]>;
   /** Resolve conversation type and human-readable metadata for host UI. */
