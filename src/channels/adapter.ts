@@ -292,7 +292,7 @@ export interface ChannelAdapter {
    * Constrain an outbound reaction to the platform's allowed set.
    *
    * Only adapters whose platform has a FIXED reaction set implement this
-   * (Telegram: ~73 glyphs — the same ceiling every human in the chat has, not
+   * (Telegram: 73 glyphs — the same ceiling every human in the chat has, not
    * a restriction nanoclaw invents). Delivery calls it before handing a
    * reaction operation to `deliver`, so the outcome is decided in the host
    * seam that CAN write back into the session: a substitution is delivered and

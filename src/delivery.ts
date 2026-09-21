@@ -363,7 +363,7 @@ async function drainSession(session: Session): Promise<void> {
 async function writeOutboundNote(session: Session, messageId: string, text: string): Promise<void> {
   try {
     await writeSessionMessage(session.agent_group_id, session.id, {
-      id: `note-${messageId}`,
+      id: `reaction-note-${messageId}`,
       kind: 'chat',
       timestamp: new Date().toISOString(),
       platformId: null,
@@ -379,58 +379,65 @@ async function writeOutboundNote(session: Session, messageId: string, text: stri
 
 /**
  * Resolve a reaction operation against the delivering platform's fixed
- * reaction set, and tell the agent whenever the answer is not "sent as asked".
+ * reaction set. Pure — it decides and phrases, the caller writes, because the
+ * two notes are owed to the agent at different moments:
  *
- * `{ drop: true }` — nothing in the allowed set carries the intent: no adapter
- * call at all (the Bot API would 400 REACTION_INVALID), and the agent gets the
- * whole allowed set so its next attempt can be legal.
- * `{ emoji }` — a nearest-allowed substitution: delivered, and named to the
- * agent so it does not believe it sent the glyph it asked for.
- * `{}` — exact match, no fixed set, or not a reaction: untouched.
+ * `drop` — nothing in the allowed set carries the intent. Nothing is sent (the
+ * Bot API would 400 REACTION_INVALID), so its note is true the moment the
+ * decision is made and is written before the adapter is ever called.
+ * `substituted` — a nearest-allowed stand-in goes out instead. Its note names a
+ * completed send ("sent ⚡ instead"), so it is only true once `deliver` has
+ * returned; writing it earlier would tell the agent about a send that a failed
+ * delivery then never makes.
+ * `untouched` — exact match, no fixed set, or not a reaction.
  */
-async function resolveOutboundReaction(
-  messageId: string,
-  channelType: string,
+type ReactionOutcome =
+  | { kind: 'untouched' }
+  | { kind: 'drop'; note: string }
+  | { kind: 'substituted'; emoji: string; note: string };
+
+function resolveOutboundReaction(
+  msg: { id: string; channelType: string },
   content: Record<string, unknown>,
   session: Session,
-  instance: string | undefined,
-): Promise<{ drop?: true; emoji?: string }> {
+  instance?: string,
+): ReactionOutcome {
   // An empty emoji CLEARS the reaction — a legitimate operation, nothing to resolve.
-  if (content.operation !== 'reaction' || typeof content.emoji !== 'string' || !content.emoji) return {};
+  if (content.operation !== 'reaction' || typeof content.emoji !== 'string' || !content.emoji) {
+    return { kind: 'untouched' };
+  }
   const input = content.emoji;
-  const resolved = deliveryAdapter?.resolveReaction?.(channelType, input, instance);
-  if (!resolved) return {};
+  const resolved = deliveryAdapter?.resolveReaction?.(msg.channelType, input, instance);
+  if (!resolved) return { kind: 'untouched' };
 
   if (resolved.emoji === null) {
     log.warn('Reaction dropped — outside the platform set, reported back to the agent', {
-      messageId,
+      messageId: msg.id,
       sessionId: session.id,
-      channelType,
+      channelType: msg.channelType,
       input,
     });
-    await writeOutboundNote(
-      session,
-      messageId,
-      `Your reaction "${input}" was not sent: ${resolved.platform} only allows a fixed reaction set. ` +
+    return {
+      kind: 'drop',
+      note:
+        `Your reaction "${input}" was not sent: ${resolved.platform} only allows a fixed reaction set. ` +
         `Allowed: ${resolved.allowed.join(' ')}.`,
-    );
-    return { drop: true };
+    };
   }
 
-  if (!resolved.substituted) return {};
+  if (!resolved.substituted) return { kind: 'untouched' };
 
   log.info('Reaction substituted with the nearest allowed glyph', {
-    messageId,
+    messageId: msg.id,
     sessionId: session.id,
     input,
     sent: resolved.emoji,
   });
-  await writeOutboundNote(
-    session,
-    messageId,
-    `Your reaction "${input}" is not in ${resolved.platform}'s allowed set; sent ${resolved.emoji} instead.`,
-  );
-  return { emoji: resolved.emoji };
+  return {
+    kind: 'substituted',
+    emoji: resolved.emoji,
+    note: `Your reaction "${input}" is not in ${resolved.platform}'s allowed set; sent ${resolved.emoji} instead.`,
+  };
 }
 
 async function deliverMessage(
@@ -603,8 +610,16 @@ async function deliverMessage(
   // told nothing and went on believing it had reacted — twice, in one day,
   // live. Resolving here instead means the outcome is decided in the one seam
   // that can write back into the session.
-  const reaction = await resolveOutboundReaction(msg.id, msg.channelType, content, session, deliverInstance);
-  if (reaction.drop) return;
+  const reaction = resolveOutboundReaction(
+    { id: msg.id, channelType: msg.channelType },
+    content,
+    session,
+    deliverInstance,
+  );
+  if (reaction.kind === 'drop') {
+    await writeOutboundNote(session, msg.id, reaction.note);
+    return;
+  }
 
   // Read file attachments from outbox if the content declares files.
   // File I/O lives in session-manager.ts (symmetric with inbound
@@ -625,7 +640,7 @@ async function deliverMessage(
   if (typeof content.messageId === 'string') {
     rewritten.messageId = platformMessageId(content.messageId, session.agent_group_id);
   }
-  if (reaction.emoji) rewritten.emoji = reaction.emoji;
+  if (reaction.kind === 'substituted') rewritten.emoji = reaction.emoji;
   const outboundContent =
     Object.keys(rewritten).length > 0 ? JSON.stringify({ ...content, ...rewritten }) : msg.content;
 
@@ -645,6 +660,10 @@ async function deliverMessage(
     platformMsgId,
     fileCount: files?.length,
   });
+
+  // Only now is "sent X instead" true. A throw above leaves no note, and the
+  // retry re-resolves and writes it if that attempt lands.
+  if (reaction.kind === 'substituted') await writeOutboundNote(session, msg.id, reaction.note);
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
 

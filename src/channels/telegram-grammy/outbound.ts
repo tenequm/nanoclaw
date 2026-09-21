@@ -334,12 +334,13 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
   // input Telegram would reject is nearest-matched, and only unmappable input
   // is dropped (the alternative is a guaranteed REACTION_INVALID 400 from the
   // Bot API). See resolveReactionEmoji for the slug map, the fallback table
-  // and the rationale. The host resolves the same way before it gets here, so
-  // it can tell the agent what happened; this is the last line, for callers
-  // that reach the adapter directly (the typing module's reaction ack).
+  // and the rationale. Delivery resolves the same way before it gets here (so
+  // it can tell the agent what happened, which this seam cannot); resolving
+  // again is the last line against a future caller that reaches `deliver`
+  // without going through the host's reaction guard.
   const reactions: Array<{ type: 'emoji'; emoji: TelegramReactionEmoji }> = [];
   if (emoji) {
-    const { glyph, substituted } = resolveReactionEmoji(emoji);
+    const { glyph } = resolveReactionEmoji(emoji);
     if (!glyph) {
       yield* Effect.logWarning('telegram-grammy: dropping reaction with unknown emoji', {
         input: emoji,
@@ -347,13 +348,6 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
         compound,
       });
       return undefined;
-    }
-    if (substituted) {
-      yield* Effect.logInfo('telegram-grammy: substituting nearest allowed reaction', {
-        input: emoji,
-        sent: glyph,
-        chatId,
-      });
     }
     reactions.push({ type: 'emoji', emoji: glyph });
   }
