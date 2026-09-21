@@ -69,11 +69,15 @@ async function seedAgentAndChannel(): Promise<void> {
 }
 
 function insertOutbound(agentGroupId: string, sessionId: string, msgId: string): void {
+  insertOperation(agentGroupId, sessionId, msgId, { text: 'hello' });
+}
+
+function insertOperation(agentGroupId: string, sessionId: string, msgId: string, content: unknown): void {
   const db = new Database(outboundDbPath(agentGroupId, sessionId));
   db.prepare(
     `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
      VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', ?)`,
-  ).run(msgId, JSON.stringify({ text: 'hello' }));
+  ).run(msgId, JSON.stringify(content));
   db.close();
 }
 
@@ -757,12 +761,7 @@ describe('deliverSessionMessages — reaction fallback and feedback', () => {
   }
 
   function insertReaction(agentGroupId: string, sessionId: string, msgId: string, emoji: string): void {
-    const db = new Database(outboundDbPath(agentGroupId, sessionId));
-    db.prepare(
-      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
-       VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', ?)`,
-    ).run(msgId, JSON.stringify({ operation: 'reaction', messageId: '4242', emoji }));
-    db.close();
+    insertOperation(agentGroupId, sessionId, msgId, { operation: 'reaction', messageId: '4242', emoji });
   }
 
   function notes(sessionId: string): NoteRow[] {
@@ -770,7 +769,7 @@ describe('deliverSessionMessages — reaction fallback and feedback', () => {
     const rows = db
       .prepare(
         `SELECT kind, channel_type, platform_id, thread_id, trigger, content FROM messages_in
-          WHERE id LIKE 'note-%' ORDER BY seq ASC`,
+          WHERE id LIKE 'reaction-note-%' ORDER BY seq ASC`,
       )
       .all() as NoteRow[];
     db.close();
@@ -868,6 +867,29 @@ describe('deliverSessionMessages — reaction fallback and feedback', () => {
     expect(notes(session.id)).toEqual([]);
   });
 
+  it('does not claim a substituted glyph was sent when the send fails', async () => {
+    // The note phrases a completed action ("sent 👌 instead"), so writing it
+    // before deliver() would leave the agent believing in a send that a failed
+    // delivery never made — and after MAX_DELIVERY_ATTEMPTS nothing retracts it.
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-subfail', 'white_check_mark');
+
+    setDeliveryAdapter({
+      deliver() {
+        throw new Error('telegram down');
+      },
+      resolveReaction(_channelType, emoji) {
+        const allowed = ['👍', '👌', '👀'];
+        if (emoji === 'white_check_mark') return { emoji: '👌', substituted: true, platform: 'Telegram', allowed };
+        return { emoji, substituted: false, platform: 'Telegram', allowed };
+      },
+    });
+    await deliverSessionMessages(session);
+
+    expect(notes(session.id)).toEqual([]);
+  });
+
   it('an adapter with no fixed set forwards the emoji untouched', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
@@ -894,15 +916,6 @@ describe('deliverSessionMessages — agent-scoped message ids', () => {
    * platform has never seen that suffix: Slack passed the whole string to
    * reactions.add as a ts and got message_not_found (live, 2026-08-31).
    */
-  function insertOperation(agentGroupId: string, sessionId: string, msgId: string, content: unknown): void {
-    const db = new Database(outboundDbPath(agentGroupId, sessionId));
-    db.prepare(
-      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
-       VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', ?)`,
-    ).run(msgId, JSON.stringify(content));
-    db.close();
-  }
-
   async function deliveredContent(content: unknown): Promise<Record<string, unknown>> {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');

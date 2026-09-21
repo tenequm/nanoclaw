@@ -133,6 +133,16 @@ describe('resolveReactionEmoji', () => {
     }
   });
 
+  it('does not reach Object.prototype through the lookup tables', () => {
+    // Both tables are plain object literals, so a bare `[key]` read returned
+    // the Object constructor for input `constructor` and the prototype itself
+    // for `__proto__` — typed as a glyph, and truthy enough to be "resolved".
+    for (const key of ['constructor', '__proto__', 'hasOwnProperty', 'toString']) {
+      expect(canonicalizeReactionEmoji(key)).toBeNull();
+      expect(resolveReactionEmoji(key)).toEqual({ glyph: null, substituted: false });
+    }
+  });
+
   it('stays pinned to grammY: every glyph upstream allows is in our list', () => {
     // The array declaration carries `satisfies readonly ReactionTypeEmoji['emoji'][]`,
     // which fails the build if we list a glyph upstream dropped. This is the
@@ -142,12 +152,21 @@ describe('resolveReactionEmoji', () => {
     expect(ALLOWED_REACTION_GLYPHS).toContain(upstream);
     expect(ALLOWED_REACTION_GLYPHS).toHaveLength(73);
   });
+});
 
-  it('the add_reaction tool schema still names the same allowed set', () => {
-    // The container package cannot import host src, so its tool description
-    // carries a copy of the glyph list. Assert the copy verbatim — a drifted
-    // schema would teach the agent an illegal vocabulary.
+/**
+ * The container package cannot import host src, so `add_reaction`'s schema
+ * carries a copy of the glyph list. Pin the copy EQUAL, not merely containing:
+ * a `toContain` on the joined host list still passes when the container copy
+ * has extra glyphs appended, which is exactly the drift that would teach the
+ * agent an illegal vocabulary. Same mechanism as
+ * container-config.test.ts's host/container validation parity.
+ */
+describe('host/container reaction-vocabulary parity', () => {
+  it('keeps the add_reaction schema glyph list identical to the host set', () => {
     const toolSrc = fs.readFileSync(path.join(process.cwd(), 'container/agent-runner/src/mcp-tools/core.ts'), 'utf8');
-    expect(toolSrc).toContain(ALLOWED_REACTION_GLYPHS.join(' '));
+    const copied = toolSrc.match(/const TELEGRAM_REACTION_GLYPHS =\s*'([^']+)'/)?.[1];
+    expect(copied).toBeDefined();
+    expect(copied).toBe(ALLOWED_REACTION_GLYPHS.join(' '));
   });
 });

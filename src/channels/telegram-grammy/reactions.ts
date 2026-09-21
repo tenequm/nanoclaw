@@ -367,8 +367,12 @@ export function canonicalizeReactionEmoji(input: string): TelegramReactionEmoji 
   const trimmed = input.trim();
   if (!trimmed) return null;
 
-  // Slug hit (case-insensitive).
-  const slugHit = SLUG_TO_REACTION_EMOJI[trimmed.toLowerCase()];
+  // Slug hit (case-insensitive). `Object.hasOwn` because the table is a plain
+  // object literal, so a bare `[key]` read reaches Object.prototype: input
+  // `constructor` returned the Object constructor and `__proto__` the
+  // prototype itself, both typed as a glyph.
+  const slug = trimmed.toLowerCase();
+  const slugHit = Object.hasOwn(SLUG_TO_REACTION_EMOJI, slug) ? SLUG_TO_REACTION_EMOJI[slug] : undefined;
   if (slugHit) return slugHit;
 
   // Already a canonical glyph.
@@ -399,8 +403,7 @@ export interface ReactionResolution {
 export function resolveReactionEmoji(input: string): ReactionResolution {
   const exact = canonicalizeReactionEmoji(input);
   if (exact) return { glyph: exact, substituted: false };
-  if (!input) return { glyph: null, substituted: false };
   const key = input.trim().replace(/️/g, '').toLowerCase();
-  const fallback = NEAREST_ALLOWED_FALLBACK[key];
+  const fallback = Object.hasOwn(NEAREST_ALLOWED_FALLBACK, key) ? NEAREST_ALLOWED_FALLBACK[key] : undefined;
   return fallback ? { glyph: fallback, substituted: true } : { glyph: null, substituted: false };
 }

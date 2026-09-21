@@ -282,12 +282,16 @@ export const editMessage: McpToolDefinition = {
 };
 
 /**
- * The reaction vocabulary is spelled out in the schema on purpose. Chat
- * platforms do not let anyone — bot or human — react with an arbitrary emoji;
- * Telegram allows exactly these 73 glyphs and rejects everything else with
- * REACTION_INVALID. Naming them here is what keeps an illegal reaction from
- * being picked in the first place. The host's nearest-allowed fallback and the
- * note it writes back are the safety net, not the primary path.
+ * The reaction vocabulary is spelled out in the schema on purpose. Telegram
+ * does not let anyone — bot or human — react with an arbitrary emoji: it allows
+ * exactly these 73 glyphs and rejects everything else with REACTION_INVALID.
+ * Naming them here is what keeps an illegal reaction from being picked in the
+ * first place. The host's nearest-allowed fallback and the note it writes back
+ * are the safety net, not the primary path.
+ *
+ * Telegram-specific, and the description says so: the fallback and the note
+ * come from the adapter's optional `resolveReaction`, which only Telegram
+ * implements. Channels without a fixed set forward the emoji untouched.
  *
  * Source of truth: ALLOWED_REACTION_GLYPHS in
  * src/channels/telegram-grammy/reactions.ts (that file's tests assert this
@@ -307,10 +311,10 @@ export const addReaction: McpToolDefinition = {
         emoji: {
           type: 'string',
           description:
-            'Reaction emoji. Pick one of the glyphs below — chat platforms allow a FIXED reaction set for everyone in the chat, bots and humans alike, and reject anything else. ' +
+            'Reaction emoji. Pick one of the glyphs below — Telegram allows a FIXED reaction set for everyone in the chat, bots and humans alike, and rejects anything else. ' +
             `On Telegram the legal set is: ${TELEGRAM_REACTION_GLYPHS}. ` +
             'Semantic slugs naming one of those work too (thumbs_up, thumbs_down, heart, fire, party, eyes, ok_hand, salute, trophy, zap, rofl, pray, clap, ...), as do the same glyphs with a variation selector. ' +
-            'Anything outside the set (✅, 🚀, ❌, 💪, ⭐, ...) is nearest-matched to the closest allowed glyph and you are told what was sent instead; if nothing fits, the reaction is not sent and you are told that too.',
+            'On Telegram anything outside the set (✅, 🚀, ❌, 💪, ⭐, ...) is nearest-matched to the closest allowed glyph and you are told what was sent instead; if nothing fits, the reaction is not sent and you are told that too. Channels with no fixed set forward your emoji untouched.',
         },
       },
       required: ['messageId', 'emoji'],
