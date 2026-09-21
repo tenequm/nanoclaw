@@ -19,6 +19,11 @@ import type { CallerContext } from './frame.js';
  */
 export const GROUP_SCOPE_RESOURCES = new Set(['groups', 'sessions', 'destinations', 'members', 'tasks']);
 
+// Resources a group-scoped agent may touch only through guard special-cases
+// (own-group wiring engage fields; own-group jev-gate with approval). Help
+// must list them or the agent cannot discover capabilities it actually has.
+export const GROUP_SCOPE_PARTIAL_RESOURCES = new Set(['wirings', 'jev-gate']);
+
 export type Access = 'open' | 'approval' | 'hidden';
 
 export type CommandDef<TArgs = unknown, TData = unknown> = {

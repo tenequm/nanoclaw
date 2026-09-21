@@ -8,7 +8,7 @@ import { getContainerConfig } from '../../db/container-configs.js';
 import { getResources } from '../crud.js';
 import { renderVerbHelp, summaryLine } from '../help-render.js';
 import type { CallerContext } from '../frame.js';
-import { GROUP_SCOPE_RESOURCES, listCommands, register } from '../registry.js';
+import { GROUP_SCOPE_PARTIAL_RESOURCES, GROUP_SCOPE_RESOURCES, listCommands, register } from '../registry.js';
 
 async function getCliScope(ctx: CallerContext): Promise<string | undefined> {
   if (ctx.caller !== 'agent') return undefined;
@@ -24,7 +24,9 @@ register({
     const cliScope = await getCliScope(ctx);
     let resources = getResources();
     if (cliScope === 'group') {
-      resources = resources.filter((r) => GROUP_SCOPE_RESOURCES.has(r.plural));
+      resources = resources.filter(
+        (r) => GROUP_SCOPE_RESOURCES.has(r.plural) || GROUP_SCOPE_PARTIAL_RESOURCES.has(r.plural),
+      );
     }
     const commands = listCommands().filter((c) => !c.resource);
 
