@@ -113,7 +113,7 @@ the two per-chat activation fields. Fields writable via chat:
 
 | Field | Accepted values | Applies |
 |-------|-----------------|---------|
-| `model` | A catalog alias (`sonnet`, `opus`, `fable`, `fable-5.1`) or a raw model id | next reply (container config) |
+| `model` | A catalog alias (`sonnet`, `opus`, `opus-5.5`, `fable`, `fable-5.1`) or a raw model id | next reply (container config) |
 | `effort` | `low`, `medium`, `high`, `xhigh`, `max` | next reply (container config) |
 | `auto-compact-window` | A positive integer token count (presets: 165k, 200k, 400k, 600k, 800k) | next reply (container config) |
 | `max-messages-per-prompt` | A positive integer | next reply (container config) |
@@ -156,12 +156,13 @@ update`.
 
 ## Model catalog
 
-Three catalogued models, addressable by short alias:
+Five catalogued models, addressable by short alias:
 
 | Alias | Label | Raw id |
 |-------|-------|--------|
 | `sonnet` | Sonnet 5 | `claude-sonnet-5` |
 | `opus` | Opus 5 | `claude-opus-5` |
+| `opus-5.5` | Opus 5.5 | `claude-opus-5-5` |
 | `fable` | Fable 5 | `claude-fable-5` |
 | `fable-5.1` | Fable 5.1 | `claude-fable-5-1` |
 
