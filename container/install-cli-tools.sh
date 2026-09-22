@@ -20,10 +20,29 @@ node -e '
   require("fs").writeFileSync("/root/.npmrc", optIns.join("\n") + (optIns.length ? "\n" : ""));
 ' "$MANIFEST"
 
-# Install every tool, pinned. name@version specs never contain spaces, so the
-# unquoted expansion word-splits cleanly into positional args.
-# shellcheck disable=SC2046
-set -- $(node -e 'require(process.argv[1]).forEach((t) => console.log(t.name + "@" + t.version))' "$MANIFEST")
+# Fork: @anthropic-ai/claude-code installs at the version the Agent SDK
+# declares (`claudeCodeVersion`), not the manifest's pin. The runner spawns this
+# global CLI, so an SDK bump that left the pin behind shipped a CLI too old for
+# the SDK's models. The manifest line stays as upstream has it, so upstream
+# bumps merge cleanly; a missing field fails the build instead of falling back.
+SDK_PKG="${2:-/app/node_modules/@anthropic-ai/claude-agent-sdk/package.json}"
+
+# Install every tool, pinned. Captured first: a failing substitution inside
+# `set --` would not trip `set -e` and would silently install nothing.
+SPECS=$(node -e '
+  const sdkVersion = require(process.argv[2]).claudeCodeVersion;
+  if (!/^\d+\.\d+\.\d+/.test(sdkVersion || "")) {
+    console.error("install-cli-tools: no claudeCodeVersion in " + process.argv[2]);
+    process.exit(1);
+  }
+  require(process.argv[1]).forEach((t) =>
+    console.log(t.name + "@" + (t.name === "@anthropic-ai/claude-code" ? sdkVersion : t.version)),
+  );
+' "$MANIFEST" "$SDK_PKG")
+# name@version specs never contain spaces, so the unquoted expansion
+# word-splits cleanly into positional args.
+# shellcheck disable=SC2086
+set -- $SPECS
 if [ "$#" -gt 0 ]; then
   pnpm install -g "$@"
 fi
