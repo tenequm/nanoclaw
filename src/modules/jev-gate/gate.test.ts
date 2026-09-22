@@ -286,6 +286,17 @@ describe('verdicts', () => {
     nouls({ unresolved: 0.9, human_pingpong: 0.85 });
     expect((await gate())?.annotation).toContain('human_pingpong');
   });
+
+  it('sends long messages to Jev whole, history and new message alike', async () => {
+    findSessionForAgent.mockResolvedValue({ id: 'sess-1', agent_group_id: AGENT_GROUP });
+    const longPost = `${'context '.repeat(300)}so what do you think, Dan?`;
+    mailboxRows.inbound = [inboundRow(longPost, 5)];
+    const fetchMock = nouls({ direct_invitation: 0.9 });
+    await gate(event(`${'details '.repeat(300)}can someone check this?`));
+    const { state } = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(state).toContain('so what do you think, Dan?');
+    expect(state).toContain('can someone check this?');
+  });
 });
 
 describe('fail-silent', () => {

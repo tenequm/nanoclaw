@@ -224,6 +224,8 @@ export function renderStateLines(rows: GateHistoryRow[], lines = STATE_HISTORY_L
     .join('\n');
 }
 
+// No length cap: Telegram bounds a message at 4096 chars, so 10 history lines
+// plus the new message stay well inside Jev's 32k-token state budget.
 export function oneLine(text: string): string {
-  return text.replace(/\s+/g, ' ').trim().slice(0, 400);
+  return text.replace(/\s+/g, ' ').trim();
 }
