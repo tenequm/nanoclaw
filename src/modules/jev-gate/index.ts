@@ -80,8 +80,7 @@ export interface JevGateInput {
  * metadata key the derivation side reads. Only the host writes this key —
  * user text is a JSON string value and cannot forge it.
  */
-function annotateContent(raw: string, annotation: string, meta: JevMeta): string {
-  const jev: JevMeta & { at: string } = { ...meta, at: new Date().toISOString() };
+function annotateContent(raw: string, annotation: string, jev: JevMeta): string {
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.text === 'string') {
@@ -91,6 +90,33 @@ function annotateContent(raw: string, annotation: string, meta: JevMeta): string
   } catch {
     return `${raw}\n${annotation}`;
   }
+}
+
+/**
+ * The per-delivery copy. The adapter's deferred `materialize` writes the
+ * downloaded attachment paths into the ORIGINAL event's content, which the
+ * copy's snapshot would never see — so the copy re-annotates from the
+ * original once it has materialized. The original's hook is memoized, so the
+ * download stays shared with every other wiring; `at` is stamped once so the
+ * stored verdict time does not drift by the download.
+ */
+function annotatedCopy(event: InboundEvent, annotation: string, meta: JevMeta): InboundEvent {
+  const jev: JevMeta = { ...meta, at: new Date().toISOString() };
+  const copy: InboundEvent = {
+    ...event,
+    message: { ...event.message, content: annotateContent(event.message.content, annotation, jev) },
+  };
+  const materialize = event.materialize;
+  if (materialize) {
+    copy.materialize = async () => {
+      try {
+        await materialize();
+      } finally {
+        copy.message.content = annotateContent(event.message.content, annotation, jev);
+      }
+    };
+  }
+  return copy;
 }
 
 function score(value: number): string {
@@ -108,10 +134,7 @@ function outcome(entry: JevGateEntry, event: InboundEvent, wake: boolean, detail
     // shadow verdict that wakes would turn calibration mode into one
     // container wake per message the moment the wiring is widened.
     silence: entry.mode === 'shadow' || !wake,
-    event: {
-      ...event,
-      message: { ...event.message, content: annotateContent(event.message.content, annotation, meta) },
-    },
+    event: annotatedCopy(event, annotation, meta),
     annotation,
   };
 }
@@ -121,10 +144,7 @@ function errorOutcome(entry: JevGateEntry, event: InboundEvent, reason: string):
   const meta: JevMeta = { v: 'error', mode: entry.mode };
   return {
     silence: true,
-    event: {
-      ...event,
-      message: { ...event.message, content: annotateContent(event.message.content, annotation, meta) },
-    },
+    event: annotatedCopy(event, annotation, meta),
     annotation,
   };
 }

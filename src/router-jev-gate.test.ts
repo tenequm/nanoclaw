@@ -182,6 +182,56 @@ async function storedTexts(agentGroupId: string): Promise<string[]> {
   return texts;
 }
 
+/**
+ * An inbound photo whose download is deferred, wired the way src/index.ts
+ * wires it: the adapter mutates its own payload, and the memoized hook
+ * re-serializes it into the ORIGINAL event — never into a copy.
+ */
+async function inboundWithPhoto(id: string): Promise<{ download: ReturnType<typeof vi.fn> }> {
+  const payload = {
+    text: 'look at this',
+    sender: 'Alex',
+    senderId: 'testchat:U1',
+    author: { userId: 'testchat:U1', fullName: 'Alex', userName: 'alex', isBot: false },
+    attachments: [{ type: 'photo', fileId: 'F1' } as Record<string, unknown>],
+  };
+  const event: Parameters<typeof routeInbound>[0] = {
+    channelType: 'testchat',
+    platformId: 'testchat:C1',
+    threadId: null,
+    message: { id, kind: 'chat', content: JSON.stringify(payload), timestamp: now(), isMention: false, isGroup: true },
+  };
+  const download = vi.fn(async () => {
+    payload.attachments[0].localPath = 'agent/attachments/photo_0.jpg';
+  });
+  let pending: Promise<void> | undefined;
+  event.materialize = () => {
+    pending ??= (async () => {
+      try {
+        await download();
+      } finally {
+        event.message.content = JSON.stringify(payload);
+      }
+    })();
+    return pending;
+  };
+  await routeInbound(event);
+  return { download };
+}
+
+/** The stored first-attachment localPath and verdict for one agent group's rows. */
+async function storedAttachments(agentGroupId: string): Promise<Array<{ localPath: unknown; jev: unknown }>> {
+  const out: Array<{ localPath: unknown; jev: unknown }> = [];
+  for (const session of await getSessionsByAgentGroup(agentGroupId)) {
+    const rows = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => mailbox.getInboundHistory(50));
+    for (const row of rows ?? []) {
+      const content = JSON.parse(row.content) as { attachments?: Array<{ localPath?: string }>; jev?: { v?: string } };
+      out.push({ localPath: content.attachments?.[0]?.localPath ?? null, jev: content.jev?.v ?? null });
+    }
+  }
+  return out;
+}
+
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -281,4 +331,24 @@ describe('routeInbound with the Jev wake-gate', () => {
     expect((await storedTexts(GATED))[0]).toBe('@bot hello');
     expect(wakeContainer).toHaveBeenCalledTimes(2);
   });
+
+  for (const [verdict, invitation] of [
+    ['silent', 0.1],
+    ['reply', 0.95],
+  ] as const) {
+    it(`stores the downloaded attachment path on a ${verdict} verdict, downloading once`, async () => {
+      writeGateConfig({ enabled: true, mode: 'live', daily_cap: 0, cooldown_minutes: 0, max_consecutive_bot: 0 });
+      stubJev(invitation);
+      await activate();
+      await seed();
+
+      const { download } = await inboundWithPhoto('m1');
+
+      // The gated copy used to keep its pre-download snapshot: fileId only,
+      // no localPath, so the agent was never told where the file landed.
+      expect(await storedAttachments(GATED)).toEqual([{ localPath: 'agent/attachments/photo_0.jpg', jev: verdict }]);
+      expect(await storedAttachments(PLAIN)).toEqual([{ localPath: 'agent/attachments/photo_0.jpg', jev: null }]);
+      expect(download).toHaveBeenCalledTimes(1);
+    });
+  }
 });
