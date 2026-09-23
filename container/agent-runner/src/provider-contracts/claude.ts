@@ -17,7 +17,9 @@ import {
 } from './registry.js';
 
 const provider = 'claude';
-const tone = { default: 'Concise', toSettings: (tone: string) => ({ outputStyle: tone }) };
+// Fork: upstream seeds 'Concise' (#3826); our persona bots keep Claude's
+// stock output style, so seed 'default' instead.
+const tone = { default: 'default', toSettings: (tone: string) => ({ outputStyle: tone }) };
 
 export const claudeRuntimeContract: ProviderRuntimeContract = {
   seamVersion: PROVIDER_RUNTIME_CONTRACT_SEAM_VERSION,
