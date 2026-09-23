@@ -28,7 +28,7 @@ register({
         (r) => GROUP_SCOPE_RESOURCES.has(r.plural) || GROUP_SCOPE_PARTIAL_RESOURCES.has(r.plural),
       );
     }
-    const commands = listCommands().filter((c) => !c.resource);
+    const commands = listCommands().filter((c) => !c.resource && c.access !== 'hidden');
 
     const lines: string[] = [];
 

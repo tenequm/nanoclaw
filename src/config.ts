@@ -22,6 +22,7 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
   'JEV_API_KEY',
+  'WEBHOOK_PORT',
 ]);
 
 /**
@@ -117,6 +118,16 @@ export const ONECLI_GATEWAY_CONTAINER =
 // Jev (api.typesafe.ai) key for the ambient wake-gate. Empty means the gate
 // fails silent on every message — see src/modules/jev-gate.
 export const JEV_API_KEY = process.env.JEV_API_KEY || envConfig.JEV_API_KEY || '';
+
+// Resolve when the listener starts so a late process override still wins.
+export function getWebhookPort(): number {
+  const raw = process.env.WEBHOOK_PORT || envConfig.WEBHOOK_PORT || '3000';
+  const port = Number(raw);
+  if (!/^[1-9]\d*$/.test(raw) || !Number.isInteger(port) || port > 65_535) {
+    throw new Error(`Invalid WEBHOOK_PORT ${JSON.stringify(raw)}: expected an integer from 1 to 65535`);
+  }
+  return port;
+}
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

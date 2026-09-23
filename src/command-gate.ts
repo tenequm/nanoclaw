@@ -25,6 +25,8 @@
  */
 import { COMMANDS, type CommandName } from './commands/types.js';
 import { hasAdminPrivilege } from './modules/permissions/db/user-roles.js';
+import './provider-contracts/index.js';
+import { listProviderHostContracts } from './provider-contracts/registry.js';
 
 export type GateResult =
   | { action: 'pass'; normalizedText?: string }
@@ -32,8 +34,14 @@ export type GateResult =
   | { action: 'deny'; command: string }
   | { action: 'host'; command: CommandName; args: string };
 
-const FILTERED_COMMANDS = new Set(['/start', '/help', '/login', '/logout', '/doctor', '/remote-control']);
-const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
+const FILTERED_COMMANDS = new Set(
+  listProviderHostContracts().flatMap((contract) => contract.commands?.nativeFiltered ?? []),
+);
+const ADMIN_COMMANDS = new Set([
+  '/clear',
+  '/upload-trace',
+  ...listProviderHostContracts().flatMap((contract) => contract.commands?.nativeAdmin ?? []),
+]);
 
 /** Bare command names the host claims (/model, /status, /config, /restart). */
 const HOST_COMMANDS = new Set<string>(Object.keys(COMMANDS));

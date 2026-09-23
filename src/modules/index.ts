@@ -29,3 +29,4 @@ import './slack-room-membership/index.js';
 import './canvas-actions/index.js';
 import './slack-onboarding/index.js';
 import './slack-agent-flow/index.js';
+import './community-portal/index.js';

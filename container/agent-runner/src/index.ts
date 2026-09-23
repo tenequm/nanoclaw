@@ -34,9 +34,15 @@ import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
-import { createProvider, type ProviderName } from './providers/factory.js';
+// Provider-contracts barrel — each provider's runtime contract attaches to its
+// registration on import. Provider skills append imports to
+// provider-contracts/index.ts alongside the providers barrel line.
+import './provider-contracts/index.js';
+import { createProvider } from './providers/factory.js';
+import { getProviderRuntimeContract, requireProviderName } from './providers/provider-registry.js';
 import { resolvePluginServer } from './plugin-mcp.js';
 import { pondMcpServers } from './pond-mcp.js';
+import { registerProviderMemorySessionHook } from './provider-contracts/realize.js';
 import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
@@ -48,7 +54,7 @@ const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const providerName = config.provider.toLowerCase() as ProviderName;
+  const providerName = requireProviderName(config.provider);
   const mailbox = getAgentMailbox();
   await mailbox.start(await readMailboxContext());
 
@@ -121,13 +127,14 @@ async function main(): Promise<void> {
     model: config.model,
     effort: config.effort,
     autoCompactWindow: config.autoCompactWindow,
-    fastMode: config.fastMode,
+    speed: config.speed,
   });
-  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+  registerProviderMemorySessionHook(providerName, provider, MEMORY_SESSION_HOOK);
 
   try {
     await runPollLoop({
       provider,
+      providerContract: getProviderRuntimeContract(providerName),
       providerName,
       cwd: CWD,
       systemContext: { instructions },

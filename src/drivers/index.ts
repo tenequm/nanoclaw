@@ -43,6 +43,8 @@ import { DATA_DIR, GROUPS_DIR } from '../config.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from '../egress-lockdown.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import '../provider-contracts/index.js';
+import { protectedProviderDocumentSourcePaths } from '../provider-contracts/realize.js';
 
 import { DockerSessionDriver, agentContainerName } from './docker-driver.js';
 import {
@@ -109,12 +111,10 @@ export function mountPolicy(env: NodeJS.ProcessEnv = process.env): MountPolicy {
     surfaceRoots: [
       path.join(projectRoot, 'container', 'agent-runner', 'src'),
       path.join(projectRoot, 'container', 'skills'),
-      // Not mounted any more — the composer reads it on the host. The root
-      // stays because it is what forces install-surface (and therefore
-      // read-only) on an operator additionalMount whose allowlisted root
-      // happens to cover the project tree. Without it the agent could get a
-      // writable mount of the base document inlined into its prompt.
-      path.join(projectRoot, 'container', 'CLAUDE.md'),
+      // Base documents are read by the host composer, not mounted. Declared
+      // protected sources stay here so an overlapping operator mount cannot
+      // make prompt-defining install content writable.
+      ...protectedProviderDocumentSourcePaths(projectRoot),
     ],
     // Must resolve to the same path an egress overlay's provisioner writes
     // material to, and a provisioner reads this key from `.env`. Reading it
