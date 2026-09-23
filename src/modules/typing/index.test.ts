@@ -305,6 +305,114 @@ describe('typing follows the runner turn state', () => {
   });
 });
 
+describe('typing guards', () => {
+  const SESS = 'sess-turn';
+  const AG = 'ag-turn';
+
+  it('ceiling: a working report that never changes stops typing after five minutes', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The runner keeps re-marking `working` with fresh stamps — a stuck turn
+    // looks exactly like a long one. Hold it for 5 minutes.
+    for (let elapsed = 0; elapsed < 300_000; elapsed += 4_000) {
+      notePresence(SESS, { turn: 'working', updatedAtMs: Date.now(), status: null });
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(clears).toHaveLength(1);
+
+    // Still working, still fresh: no more painting.
+    const setsAtCap = sets.length;
+    for (let elapsed = 0; elapsed < 40_000; elapsed += 4_000) {
+      notePresence(SESS, { turn: 'working', updatedAtMs: Date.now(), status: null });
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(sets.length).toBe(setsAtCap);
+    expect(clears).toHaveLength(1);
+
+    // A new inbound is a new wake: typing resumes.
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sets.length).toBe(setsAtCap + 1);
+  });
+
+  it("stale idle: a previous run's idle report does not end the first turn's typing", async () => {
+    const { sets, clears } = captureSetAndClear();
+    // The last run left `idle` in its container record a minute ago.
+    const leftoverIdle = { turn: 'idle' as const, updatedAtMs: Date.now() - 60_000, status: null };
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Slow cold start: past grace the runner has not reported this wake, and
+    // the heartbeat file was removed at spawn. The leftover must read as
+    // "not yet reported", not end the refresh.
+    for (let elapsed = 0; elapsed < 24_000; elapsed += 4_000) {
+      notePresence(SESS, leftoverIdle);
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(clears).toHaveLength(0);
+    const setsBeforeTurn = sets.length;
+
+    // The runner's first report of this wake takes over.
+    notePresence(SESS, { turn: 'working', updatedAtMs: Date.now(), status: null });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(sets.length).toBeGreaterThan(setsBeforeTurn);
+    notePresence(SESS, { turn: 'idle', updatedAtMs: Date.now(), status: null });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('stale idle: a runner that never reports this wake stops typing after the leftover budget', async () => {
+    const { clears } = captureSetAndClear();
+    const leftoverIdle = { turn: 'idle' as const, updatedAtMs: Date.now() - 60_000, status: null };
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    for (let elapsed = 0; elapsed < 56_000; elapsed += 4_000) {
+      notePresence(SESS, leftoverIdle);
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(clears).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('ceiling: a delivered reply restarts the ceiling clock', async () => {
+    const { clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    const holdWorking = async (ms: number) => {
+      for (let elapsed = 0; elapsed < ms; elapsed += 4_000) {
+        notePresence(SESS, { turn: 'working', updatedAtMs: Date.now(), status: null });
+        await vi.advanceTimersByTimeAsync(4_000);
+      }
+    };
+    await holdWorking(240_000);
+    pauseTypingRefreshAfterDelivery(SESS);
+    await holdWorking(240_000);
+    expect(clears).toHaveLength(0);
+    await holdWorking(64_000);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('ceiling: a new turn after the cap repaints a status but never re-adds the ack', async () => {
+    const { statuses, reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh(SESS, AG, 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+    for (let elapsed = 0; elapsed < 300_000; elapsed += 4_000) {
+      notePresence(SESS, { turn: 'working', updatedAtMs: Date.now(), status: null });
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(reactions.map((r) => r.op)).toEqual(['add', 'remove']);
+
+    // The turn ends and another starts before a tick sees the idle.
+    notePresence(SESS, { turn: 'idle', updatedAtMs: Date.now(), status: null });
+    notePresence(SESS, { turn: 'working', updatedAtMs: Date.now(), status: null });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(reactions.map((r) => r.op)).toEqual(['add', 'remove']);
+    expect(statuses).toEqual([]);
+  });
+});
+
 describe('presence: runner status text rides on the typing indicator', () => {
   const SESS = 'sess-turn';
   const AG = 'ag-turn';

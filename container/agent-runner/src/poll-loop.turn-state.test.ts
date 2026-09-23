@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { MockProvider } from './providers/mock.js';
-import { runPollLoop } from './poll-loop.js';
+import { processQuery, runPollLoop } from './poll-loop.js';
 import type { AgentQuery, ProviderEvent, QueryInput } from './providers/types.js';
 
 const CONTRACT = { textDelivery: 'mid-turn-complete', commands: { formatting: 'xml' } } as const;
@@ -93,7 +93,76 @@ class HoldingProvider extends MockProvider {
   }
 }
 
+/**
+ * Mirrors the SDK coalescing queued sends: a follow-up pushed mid-turn is
+ * folded into the running turn, so two prompts produce ONE result, which
+ * reports queued_turn_count 0.
+ */
+class CoalescingProvider extends MockProvider {
+  release: () => void = () => {};
+  pushes = 0;
+  private gate = new Promise<void>((r) => (this.release = r));
+  query(_input: QueryInput): AgentQuery {
+    const pending: string[] = [];
+    let waiting: (() => void) | null = null;
+    let aborted = false;
+    const gate = this.gate;
+    const events: AsyncIterable<ProviderEvent> = {
+      async *[Symbol.asyncIterator]() {
+        yield { type: 'init', continuation: 'coalesce-session' };
+        await gate;
+        pending.length = 0;
+        yield { type: 'text', text: '<message to="slack-test">answered both</message>' };
+        yield { type: 'result', text: '<message to="slack-test">answered both</message>', queuedTurnCount: 0 };
+        while (!aborted) {
+          await new Promise<void>((r) => (waiting = r));
+          waiting = null;
+        }
+      },
+    };
+    return {
+      push: (m: string) => {
+        this.pushes += 1;
+        pending.push(m);
+        waiting?.();
+      },
+      end: () => {},
+      abort: () => {
+        aborted = true;
+        waiting?.();
+      },
+      events,
+    };
+  }
+}
+
 describe('runner turn state', () => {
+  it('reports idle when two pushed prompts coalesce into one result', async () => {
+    insertMessage('m-a', 'first question', 'thread-A');
+    const provider = new CoalescingProvider();
+    const controller = new AbortController();
+    const loop = runPollLoop({
+      provider,
+      providerContract: CONTRACT,
+      providerName: 'mock',
+      cwd: '/tmp',
+      signal: controller.signal,
+    });
+
+    await waitFor(() => readTurn() === 'working', 3000);
+    insertMessage('m-b', 'second question', 'thread-A');
+    await waitFor(() => provider.pushes === 1, 3000); // m-b pushed into the running turn
+
+    provider.release();
+    await waitFor(() => getUndeliveredMessages().length >= 1, 3000);
+    // One result for two sends: the queued follow-up never gets a result of
+    // its own, so waiting for the queue to drain would stay working forever.
+    await waitFor(() => readTurn() === 'idle', 3000);
+
+    controller.abort();
+    await loop.catch(() => {});
+  });
+
   it('stays working across a two-message turn and reports idle once it returns to waiting', async () => {
     insertMessage('m-a', 'first question', 'thread-A');
     const provider = new HoldingProvider();
@@ -143,5 +212,47 @@ describe('runner turn state', () => {
 
     controller.abort();
     await loop.catch(() => {});
+  });
+  it('after a coalesced result the next push answers on its own route, not a leftover one', async () => {
+    const pushed: string[] = [];
+    const block = (text: string) => `<message to="slack-test">${text}</message>`;
+    const query: AgentQuery = {
+      push: (prompt) => {
+        pushed.push(prompt);
+      },
+      end() {},
+      abort() {},
+      events: {
+        async *[Symbol.asyncIterator](): AsyncGenerator<ProviderEvent> {
+          // A scheduled task lands mid-turn and the SDK folds it into the
+          // running chat turn: one result, nothing left queued.
+          getInboundDb()
+            .prepare(
+              `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+               VALUES ('m-t', 'task', datetime('now'), 'pending', 'C123', 'slack', NULL, ?)`,
+            )
+            .run(JSON.stringify({ prompt: 'scheduled check' }));
+          await waitFor(() => pushed.length === 1, 3000);
+          yield { type: 'text', text: block('answer A') };
+          yield { type: 'result', text: block('answer A'), queuedTurnCount: 0 };
+          expect(readTurn()).toBe('idle');
+
+          insertMessage('m-c', 'third question', 'thread-C');
+          await waitFor(() => pushed.length === 2, 3000);
+          expect(readTurn()).toBe('working');
+          yield { type: 'text', text: block('answer C') };
+          yield { type: 'result', text: block('answer C'), queuedTurnCount: 0 };
+        },
+      },
+    };
+    const routeA = { platformId: 'C123', channelType: 'slack', threadId: 'thread-A', inReplyTo: 'm-a', taskRun: false };
+    await processQuery(query, routeA, [], 'mock', undefined, 'question A', undefined, true);
+
+    // The leftover task route must not swallow C's reply into a task log.
+    expect(getUndeliveredMessages().map((m) => [m.kind, JSON.parse(m.content).text, m.thread_id])).toEqual([
+      ['chat', 'answer A', 'thread-A'],
+      ['chat', 'answer C', 'thread-C'],
+    ]);
+    expect(readTurn()).toBe('idle');
   });
 });

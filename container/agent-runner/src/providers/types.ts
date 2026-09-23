@@ -166,8 +166,13 @@ export type ProviderEvent =
    * `text` is model output; `error` is an optional user-facing provider error
    * (e.g. a billing/quota notice), kept separate from model scratchpad and
    * raw diagnostics. Failures without `error` receive a generic notice.
+   * `queuedTurnCount` is the provider's count of pushed sends still waiting
+   * when the result was produced (undefined when the provider can't say).
+   * Queued sends may coalesce into fewer turns, so 0 means every send the
+   * provider had received by then is answered, even if more prompts were
+   * pushed than results seen.
    */
-  | { type: 'result'; text: string | null; isError?: boolean; error?: string }
+  | { type: 'result'; text: string | null; isError?: boolean; error?: string; queuedTurnCount?: number }
   /**
    * An assistant text segment emitted mid-turn (e.g. between tool calls).
    * The SDK's final `result` carries only the LAST assistant text, so a
@@ -182,13 +187,6 @@ export type ProviderEvent =
   | { type: 'text'; text: string }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
-  /**
-   * The SDK started a background task (a backgrounded Bash command or
-   * subagent). The turn that launched it may end long before the task
-   * settles; when it does, the SDK runs a follow-up turn on its own with no
-   * prompt from the poll-loop, so the loop counts the task as in-flight work.
-   */
-  | { type: 'task-started'; description: string }
   | { type: 'file'; path: string }
   /**
    * Liveness signal. Providers MUST yield this on every underlying SDK

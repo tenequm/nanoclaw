@@ -230,6 +230,29 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     }
   });
 
+  it('a turn report that fails to parse reads as not reported and never blocks delivery', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    setContainerTurn('ag-1', session.id, 'resting', new Date().toISOString());
+    insertOutbound('ag-1', session.id, 'out-1');
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        calls.push(content);
+        return 'plat-msg-1';
+      },
+    });
+
+    const spy = vi.spyOn(typing, 'notePresence');
+    try {
+      await deliverSessionMessages(session);
+      expect(calls).toHaveLength(1);
+      expect(spy).toHaveBeenCalledWith(session.id, { turn: null, updatedAtMs: null, status: null });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('forwards a not-reported turn (no container_state row) as null', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');

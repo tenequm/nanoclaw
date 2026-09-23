@@ -76,6 +76,21 @@ const TURN_STALE_MS = 15000;
  * stays running; ticks inside the pause just skip the setTyping call.
  */
 const POST_DELIVERY_PAUSE_MS = 10000;
+/**
+ * Longest continuous typing stretch without visible progress. Defense in
+ * depth against a runner stuck re-marking `working` (or any other signal
+ * that never ends): past it the indicator stops until a new turn starts, a
+ * reply is delivered, or a new inbound wakes the session. Generous on
+ * purpose: it bounds leaks, and back-to-back queued turns share one stretch.
+ */
+const TYPING_CEILING_MS = 5 * 60 * 1000;
+/**
+ * How long a report left by a previous run keeps plain typing alive before
+ * the runner reports this wake (slow cold start). The heartbeat file cannot
+ * vouch here: the host removes it at spawn and the runner reports the turn
+ * before its first event touches it.
+ */
+const LEFTOVER_REPORT_BUDGET_MS = 60_000;
 
 /** Reaction ack for platforms that cannot paint a threadless indicator. */
 const ACK_EMOJI = 'eyes';
@@ -151,6 +166,10 @@ interface TypingTarget {
   interval: NodeJS.Timeout;
   startedAt: number;
   pausedUntil: number; // epoch ms; 0 = not paused
+  /** Start of the current typing stretch: the wake, or the last idle->working transition. */
+  typingSince: number;
+  /** The ceiling tripped: nothing is painted until the state changes or a new wake. */
+  capped: boolean;
   /** Latest runner presence report; undefined until the first notePresence. */
   presence?: PresenceReport;
 }
@@ -265,7 +284,7 @@ function clearSignal(entry: TypingTarget): void {
  * not expire, so only the status rendering re-fires.
  */
 function refresh(entry: TypingTarget, showStatus: boolean): void {
-  if (entry.mode !== 'status') return;
+  if (entry.mode !== 'status' || entry.capped) return;
   const text = showStatus ? entry.presence?.status?.text : undefined;
   if (text) {
     triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance, text, 'agent').catch(() => {});
@@ -328,6 +347,8 @@ export function startTypingRefresh(
     if (existing.mode === 'reaction' || moved) clearSignal(existing);
     existing.startedAt = Date.now();
     existing.pausedUntil = 0;
+    existing.typingSince = existing.startedAt;
+    existing.capped = false;
     // Keep the stored entry self-consistent: a re-trigger can arrive from
     // a different chat address (agent-shared sessions span messaging
     // groups, possibly on different platforms/instances), so the address
@@ -351,7 +372,13 @@ export function startTypingRefresh(
 
     const now = Date.now();
     const report = entry.presence;
-    const reported = report !== undefined && report.turn !== null;
+    // A report stamped before this wake is a previous run's leftover (a slow
+    // cold start has not re-marked yet), so it must not end the first turn's
+    // typing: treat it as not yet reported and keep typing for a bounded
+    // budget (LEFTOVER_REPORT_BUDGET_MS).
+    const fromThisWake = report?.updatedAtMs == null || report.updatedAtMs >= entry.startedAt;
+    const reported = report !== undefined && report.turn !== null && fromThisWake;
+    const leftover = report !== undefined && report.turn !== null && !fromThisWake;
     // Status text is shown only while the runner is provably inside this
     // turn: a `working` report with a fresh stamp. Anywhere else (grace on a
     // cold start, the heartbeat fallback) the text could be last turn's.
@@ -362,6 +389,13 @@ export function startTypingRefresh(
     // interval running so we resume automatically once the pause
     // expires.
     if (entry.pausedUntil > now) return;
+
+    // The end rules below still run once capped; only the painting stops.
+    if (!entry.capped && now - entry.typingSince >= TYPING_CEILING_MS) {
+      entry.capped = true;
+      clearSignal(entry);
+      log.warn('typing ceiling reached, indicator stopped', { sessionId, ceilingMs: TYPING_CEILING_MS });
+    }
 
     // Within the grace window since the last inbound: fire
     // unconditionally, covering container spawn/wake latency before the
@@ -383,7 +417,13 @@ export function startTypingRefresh(
       return;
     }
 
-    // No turn ever reported (older runner): fall back to the heartbeat file.
+    if (leftover && now - entry.startedAt < LEFTOVER_REPORT_BUDGET_MS) {
+      refresh(entry, false);
+      return;
+    }
+
+    // No turn reported this wake (older runner, or the leftover budget ran
+    // out): fall back to the heartbeat file.
     if (isHeartbeatFresh(entry.agentGroupId, sessionId)) {
       refresh(entry, false);
       return;
@@ -404,6 +444,8 @@ export function startTypingRefresh(
     interval,
     startedAt,
     pausedUntil: 0,
+    typingSince: startedAt,
+    capped: false,
   };
   typingRefreshers.set(sessionId, entry);
   // Immediate tick (or ack) + periodic refresh.
@@ -421,7 +463,16 @@ export function startTypingRefresh(
 export function notePresence(sessionId: string, report: PresenceReport): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
+  const wasWorking = entry.presence?.turn === 'working';
   entry.presence = report;
+  // A turn starting is a state change: the ceiling clock restarts. A fresh
+  // re-mark of an ongoing `working` turn is not. Only a status repaints (on
+  // the next tick); the ack stays with the inbound that placed it, so a later
+  // turn never re-adds it to an answered message.
+  if (report.turn === 'working' && !wasWorking) {
+    entry.typingSince = Date.now();
+    entry.capped = false;
+  }
 }
 
 /**
@@ -440,6 +491,10 @@ export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
   // equivalent: the platform auto-clears it on the post.)
   if (entry.mode === 'reaction') clearSignal(entry);
   entry.pausedUntil = Date.now() + POST_DELIVERY_PAUSE_MS;
+  // A delivered reply is progress a stuck runner cannot fake: the ceiling
+  // counts from here.
+  entry.typingSince = Date.now();
+  entry.capped = false;
 }
 
 export function stopTypingRefresh(sessionId: string): void {

@@ -262,6 +262,20 @@ export async function deliverToSessions(sessions: readonly Session[]): Promise<v
   });
 }
 
+/**
+ * A presence read only drives the typing indicator, so a runner row that
+ * fails to parse (version skew, a turn state this host does not know) reads
+ * as "not reported" instead of failing the session's whole delivery.
+ */
+function readPresence<T>(sessionId: string, read: () => T): T | undefined {
+  try {
+    return read();
+  } catch (err) {
+    log.debug('Presence read failed', { sessionId, err: String(err) });
+    return undefined;
+  }
+}
+
 export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
@@ -297,8 +311,8 @@ async function drainSession(session: Session): Promise<void> {
         // new poll: its turn report from the container record and the
         // optional status line it publishes under the `live_status` state
         // key. Both drive the typing indicator (see notePresence).
-        containerState: mailbox.getContainerState(),
-        liveStatus: mailbox.getState?.('live_status'),
+        containerState: readPresence(session.id, () => mailbox.getContainerState()),
+        liveStatus: readPresence(session.id, () => mailbox.getState?.('live_status')),
       };
     });
     if (!existing) return;

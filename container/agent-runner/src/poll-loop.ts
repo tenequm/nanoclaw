@@ -433,6 +433,11 @@ export async function processQuery(
   // instead of guessing from the heartbeat file. Best-effort throughout: a
   // failed write logs and never breaks the loop.
   let workingRemark: ReturnType<typeof setInterval> | null = null;
+  // Every provider input (follow-up or retry). A result reporting no queued
+  // sends is trusted to have answered every pushed turn only if nothing was
+  // pushed while it was handled; a push racing the SDK producing the result
+  // is not visible to its queued_turn_count and cannot be told apart.
+  let providerPushes = 0;
   const markTurn = (turn: 'working' | 'idle'): void => {
     try {
       markContainerTurn(turn);
@@ -475,6 +480,7 @@ export async function processQuery(
   // Preserve its original route, prompt and retry guards until it is answered.
   const pushRetry = (prompt: string): void => {
     query.push(prompt);
+    providerPushes += 1;
     queuedTurns.push({ routing: { ...routing }, unwrappedNudged, taskBlockNudged });
     archivePrompts.push(archivePrompts[0] ?? initialPrompt);
   };
@@ -566,6 +572,7 @@ export async function processQuery(
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         query.push(prompt);
+        providerPushes += 1;
         archivePrompts.push(prompt);
         const next: QueuedTurn = {
           routing: extractRouting(keep),
@@ -635,6 +642,7 @@ export async function processQuery(
           midTurnTail = scan.tail;
         }
       } else if (event.type === 'result') {
+        const pushesAtResult = providerPushes;
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
         // stale 'processing' claims while the query stays open for
@@ -721,6 +729,16 @@ export async function processQuery(
         midTurnSent = 0;
         turnStartSeq = maxOutboundSeq();
         midTurnTail = '';
+        // The SDK may coalesce queued sends into fewer turns, so one result can
+        // answer several pushed turns. A result reporting no queued sends, with
+        // nothing pushed while it was handled, answered them all: drop the
+        // leftover routes and prompts so the loop goes idle and the next push
+        // adopts its own route instead of an already-answered one.
+        if (event.queuedTurnCount === 0 && providerPushes === pushesAtResult && queuedTurns.length > 0) {
+          log(`Result reports no queued sends: ${queuedTurns.length + 1} pushed turns coalesced into one result`);
+          queuedTurns.length = 0;
+          archivePrompts.length = 0;
+        }
         const next = queuedTurns.shift();
         if (next) adoptTurn(next);
         else {
@@ -810,9 +828,6 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       break;
     case 'progress':
       log(`Progress: ${event.message}`);
-      break;
-    case 'task-started':
-      log(`Background task started: ${event.description}`);
       break;
   }
 }
