@@ -14,7 +14,8 @@ import {
 describe('resolveModelInput', () => {
   it('resolves catalog aliases to ids + labels', () => {
     expect(resolveModelInput('opus')).toEqual({ ok: true, id: 'claude-opus-5', label: 'Opus 5' });
-    expect(resolveModelInput('sonnet')).toEqual({ ok: true, id: 'claude-sonnet-5', label: 'Sonnet 5' });
+    expect(resolveModelInput('sonnet')).toEqual({ ok: true, id: 'claude-sonnet-5-5', label: 'Sonnet 5.5' });
+    expect(resolveModelInput('sonnet-5')).toEqual({ ok: true, id: 'claude-sonnet-5', label: 'Sonnet 5' });
     expect(resolveModelInput('fable')).toEqual({ ok: true, id: 'claude-fable-5', label: 'Fable 5' });
     expect(resolveModelInput('opus-5.5')).toEqual({ ok: true, id: 'claude-opus-5-5', label: 'Opus 5.5' });
     expect(resolveModelInput('fable-5.1')).toEqual({ ok: true, id: 'claude-fable-5-1', label: 'Fable 5.1' });
@@ -103,7 +104,8 @@ describe('parsePositiveInt (ncl rule: positive integer, shared by window + max-m
 describe('MODEL_CATALOG shape', () => {
   it('matches the confirmed catalog exactly', () => {
     expect(MODEL_CATALOG).toEqual([
-      { alias: 'sonnet', label: 'Sonnet 5', id: 'claude-sonnet-5' },
+      { alias: 'sonnet', label: 'Sonnet 5.5', id: 'claude-sonnet-5-5' },
+      { alias: 'sonnet-5', label: 'Sonnet 5', id: 'claude-sonnet-5' },
       { alias: 'opus', label: 'Opus 5', id: 'claude-opus-5' },
       { alias: 'opus-5.5', label: 'Opus 5.5', id: 'claude-opus-5-5' },
       { alias: 'fable', label: 'Fable 5', id: 'claude-fable-5' },
