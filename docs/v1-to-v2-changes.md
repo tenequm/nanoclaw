@@ -82,7 +82,7 @@ Tasks can exist before a session is awake — the host sweep creates/wakes the c
 
 Note: agents are always selective — a new OneCLI agent has no credentials until secrets or app connections are attached to it. See the "Credential grants" section of the root CLAUDE.md (`onecli agents grants attach-secret`).
 
-**What the automated migration does:** copies every v1 `.env` key verbatim into v2 `.env`, never overwriting existing v2 keys. The OneCLI vault migration is a separate step owned by the `/init-onecli` skill, which knows how to pull from `.env`.
+**What the automated migration does:** copies every v1 `.env` key verbatim into v2 `.env`, never overwriting existing v2 keys. Migrating credentials into the vault is a separate step owned by the gateway's own `/add-<gateway>` skill, which knows how to pull from `.env`.
 
 ---
 

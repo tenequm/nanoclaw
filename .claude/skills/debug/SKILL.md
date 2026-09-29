@@ -91,6 +91,16 @@ Reading the flow:
 - `messages_out` has a reply but the user never received it → a delivery problem (see issue 1 below).
 - `messages_in` is empty → routing never reached this session (check the router log lines and the central wiring with `ncl wirings list`).
 
+## Repairing the gateway
+
+If the installed credential gateway is unreachable, unhealthy, or its containers are missing, re-run its setup step from the checkout:
+
+```bash
+pnpm exec tsx setup/index.ts --step gateway
+```
+
+The step detects the installed gateway and checks it. For a gateway whose setup manages its own services, it also refreshes the payload and reconciles those services; otherwise it only reports whether the gateway is up, so follow that gateway's own start instructions. Don't recreate gateway containers by hand with `docker run`/`docker rm`, and keep the gateway's database volumes and keys together: never generate replacement keys for an existing database. After the step succeeds, retry the failed setup step, or restart the service (see issue 1 below) on a finished install.
+
 ## Common Issues
 
 ### 1. "No adapter for channel type" / Messages silently lost (null platform_message_id)
@@ -146,7 +156,7 @@ onecli agents credentials --id <agent-id>                                   # wh
 onecli agents grants attach-secret --id <agent-id> --secret-id <secret-id>  # attach it
 ncl groups restart --id <group-id>                                          # a container that already saw the 401 keeps failing until respawned
 ```
-If the gateway itself is unreachable, the container runner refuses to spawn (`OneCLI gateway not applied — refusing to spawn container without credentials` in the host log). Confirm the gateway is up at `http://127.0.0.1:10254`.
+If the gateway itself is unreachable, the container runner refuses to spawn (`OneCLI gateway not applied — refusing to spawn container without credentials` in the host log). Confirm the gateway is up at `http://127.0.0.1:10254`. If it isn't, follow [Repairing the gateway](#repairing-the-gateway).
 
 **MCP server failures:** a misconfigured MCP server can abort the agent run. Look for MCP initialization errors in the streamed container stderr (`LOG_LEVEL=debug`).
 
