@@ -14,6 +14,7 @@ import type { Message } from 'grammy/types';
 import { TIMEZONE } from '../../config.js';
 import { formatLocalTime } from '../../timezone.js';
 import {
+  callbackCardAddress,
   entitiesToMarkdown,
   extractTelegramMessageId,
   parseChatId,
@@ -40,6 +41,23 @@ describe('platformIdFor (forum topics become first-class platform ids)', () => {
   it('ignores message_thread_id on non-topic messages (plain reply threads)', () => {
     const msg = { message_id: 7, message_thread_id: 42 } as Message;
     expect(platformIdFor(-100123, msg)).toBe('telegram:-100123');
+  });
+});
+
+describe('callbackCardAddress (a tapped card, in the ids an approval row stores)', () => {
+  it('uses the bare message id outbound returned and the DM platform id', () => {
+    const msg = { message_id: 812, chat: { id: 1000001, type: 'private' } } as Message;
+    expect(callbackCardAddress(msg)).toEqual({ messageId: '812', platformId: 'telegram:1000001' });
+  });
+
+  it('keeps the forum topic in the platform id', () => {
+    const msg = {
+      message_id: 9,
+      chat: { id: -1000000000001, type: 'supergroup' },
+      is_topic_message: true,
+      message_thread_id: 42,
+    } as Message;
+    expect(callbackCardAddress(msg)).toEqual({ messageId: '9', platformId: 'telegram:-1000000000001:42' });
   });
 });
 

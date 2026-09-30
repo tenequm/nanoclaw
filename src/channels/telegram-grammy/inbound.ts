@@ -29,10 +29,21 @@ import type { InboundMessage } from '../adapter.js';
  * not sub-threads; outbound derives `message_thread_id` from the 3-part id
  * (see `parseTopicId`).
  */
-export const platformIdFor = (chatId: number, msg?: Message): string =>
+export const platformIdFor = (chatId: number, msg?: Pick<Message, 'is_topic_message' | 'message_thread_id'>): string =>
   msg?.is_topic_message && typeof msg.message_thread_id === 'number'
     ? `telegram:${chatId}:${msg.message_thread_id}`
     : `telegram:${chatId}`;
+
+/**
+ * Address of a tapped card in the host's terms: the platform id its
+ * messaging group uses and the bare message id outbound returned for it.
+ */
+export const callbackCardAddress = (
+  msg: Pick<Message, 'chat' | 'message_id' | 'is_topic_message' | 'message_thread_id'>,
+): { messageId: string; platformId: string } => ({
+  messageId: String(msg.message_id),
+  platformId: platformIdFor(msg.chat.id, msg),
+});
 
 /** Compound id encoding so outbound `edit`/`reaction` can decode back to (chatId, msgId). */
 export const compoundMessageId = (chatId: number, messageId: number): string => `${chatId}:${messageId}`;

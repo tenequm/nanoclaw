@@ -35,6 +35,7 @@ import { materializeAll } from './attachments.js';
 import { composeSelectedCard, parseCallbackData } from './ask-question.js';
 import { renderFS } from './formatter.js';
 import {
+  callbackCardAddress,
   parseChatId,
   parseTopicId,
   resolveMessageThreadId,
@@ -181,12 +182,20 @@ class TelegramGrammyAdapter implements ChannelAdapter {
             catch: (err) => err,
           }).pipe(Effect.catchCause(() => Effect.succeed(undefined)));
           const user = ctx.from;
-          onAction(parsed.questionId, parsed.value, user ? String(user.id) : '');
+          const cbMsg = ctx.callbackQuery?.message;
+          onAction(
+            parsed.questionId,
+            parsed.value,
+            user ? String(user.id) : '',
+            cbMsg ? callbackCardAddress(cbMsg) : undefined,
+          );
+          // A deferred card (gateway approval) is finalized by core once it has
+          // authorized the click; editing here would show a decision core may refuse.
+          if (render?.deferResolution) return;
 
           // Reflect the choice on the card: rewrite the body to the selected
           // state and drop the keyboard, so the approver can see the tap
           // registered. Best-effort — the action above already dispatched.
-          const cbMsg = ctx.callbackQuery?.message;
           if (!cbMsg) return;
           const actorName = user?.first_name ?? user?.username ?? '';
           const currentText = 'text' in cbMsg && typeof cbMsg.text === 'string' ? cbMsg.text : '';
