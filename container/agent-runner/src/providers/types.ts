@@ -196,6 +196,14 @@ export type ProviderEvent =
    * gets the wrap-nudge instead.
    */
   | { type: 'text'; text: string }
+  /**
+   * A main-thread tool call the model just issued (`name` as the provider
+   * sees it, e.g. `mcp__nanoclaw__send_message`). Optional for providers:
+   * the poll-loop uses it only to tell an early acknowledgment followed by
+   * more work from a finished reply, when deciding whether an unwrapped
+   * final text needs a nudge.
+   */
+  | { type: 'tool_call'; name: string }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   | { type: 'file'; path: string }

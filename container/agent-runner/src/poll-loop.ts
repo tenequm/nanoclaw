@@ -417,6 +417,11 @@ export async function processQuery(
   // never re-matched. Dropped at the turn boundary: a block that never
   // closes anywhere is the wrap-nudge's job, not the buffer's.
   let midTurnTail = '';
+  // True while non-delivery tool work has run since this turn's last reply
+  // (live: an "on it" send_message, research, then the real answer written
+  // unwrapped). Such an unwrapped final text gets its own nudge even though
+  // something already went out. Turn-local, reset at each result.
+  let workSinceDelivery = false;
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt. Retries append the original user prompt at
   // their position in the provider input queue.
@@ -641,6 +646,15 @@ export async function processQuery(
           const scan = await deliverMidTurnBlocks(event.text, routing, turnStartSeq, midTurnTail);
           midTurnSent += scan.delivered;
           midTurnTail = scan.tail;
+          if (scan.delivered > 0) workSinceDelivery = false;
+        }
+      } else if (event.type === 'tool_call') {
+        if (midTurnCompleteDelivery && !routing.taskRun) {
+          const tool = bareToolName(event.name);
+          if (DELIVERY_TOOLS.has(tool)) workSinceDelivery = false;
+          else if (tool !== 'add_reaction' && (midTurnSent > 0 || replyRowWrittenSince(turnStartSeq))) {
+            workSinceDelivery = true;
+          }
         }
       } else if (event.type === 'result') {
         const pushesAtResult = providerPushes;
@@ -662,12 +676,15 @@ export async function processQuery(
         // sees the delivery.
         if (midTurnCompleteDelivery && !failed && event.stopReason === 'end_turn' && OPEN_BLOCK_RE.test(midTurnTail)) {
           const closed = await deliverMidTurnBlocks('</message>', routing, turnStartSeq, midTurnTail);
-          if (closed.delivered > 0) log('Closed an unterminated <message> block at end of turn');
+          if (closed.delivered > 0) {
+            log('Closed an unterminated <message> block at end of turn');
+            workSinceDelivery = false;
+          }
           midTurnSent += closed.delivered;
           midTurnTail = '';
         }
         if (resultText || failed) {
-          const { hasUnwrapped, taskBlocks } = await dispatchResultText(resultText, routing, {
+          const { hasUnwrapped, hasScratchpad, taskBlocks } = await dispatchResultText(resultText, routing, {
             midTurnSent,
             // For mid-turn delivery providers the result door NEVER delivers
             // content: mid-turn streaming is
@@ -675,12 +692,13 @@ export async function processQuery(
             // the nudge decision — see turnDelivered.
             suppressDelivery: midTurnCompleteDelivery,
             // "Did anything user-visible go out this turn?" — door
-            // deliveries (midTurnSent) plus any chat row written since the
+            // deliveries (midTurnSent) plus any reply row written since the
             // turn boundary (which also sees MCP send_message calls the
-            // frame-local count can't). When false and the result still
-            // carries content, the wrap-nudge fires so the model re-sends
-            // and the retry streams through the mid-turn door.
-            turnDelivered: midTurnCompleteDelivery ? midTurnSent > 0 || chatRowWrittenSince(turnStartSeq) : undefined,
+            // frame-local count can't; a reaction is not a reply). When false
+            // and the result still carries content, the wrap-nudge fires so
+            // the model re-sends and the retry streams through the mid-turn
+            // door.
+            turnDelivered: midTurnCompleteDelivery ? midTurnSent > 0 || replyRowWrittenSince(turnStartSeq) : undefined,
           });
           // Completed partial output remains deliverable, but an explicit
           // provider failure must keep its status and never trigger a retry.
@@ -707,12 +725,34 @@ export async function processQuery(
           // turn's mid-turn sent count. If a reply already went out as a
           // mid-turn block, the unwrapped tail stays in the scratchpad log.
           const willRetryWrapping = !failed && hasUnwrapped && !unwrappedNudged;
+          // The exception: when tool work ran after the last reply, what went
+          // out was an acknowledgment and the unwrapped final text may be the
+          // actual answer. Ask once; a mere note-to-self answers <internal>.
+          const willNudgeAfterAck =
+            !failed && !willRetryWrapping && !unwrappedNudged && workSinceDelivery && hasScratchpad;
           notifyExchangeComplete(onExchangeComplete, {
             prompt: archivePrompts[0] ?? initialPrompt,
             result: archivedResult,
             continuation: queryContinuation ?? initialContinuation,
-            status: failed ? 'error' : hasUnwrapped || willRetryTaskBlocks ? 'undelivered' : 'completed',
+            status: failed
+              ? 'error'
+              : hasUnwrapped || willNudgeAfterAck || willRetryTaskBlocks
+                ? 'undelivered'
+                : 'completed',
           });
+          if (willNudgeAfterAck) {
+            unwrappedNudged = true;
+            const names = getAllDestinations()
+              .map((d) => d.name)
+              .join(', ');
+            pushRetry(
+              `<system>A message already went out this turn, but the text you ended with was not delivered: ` +
+                `text outside <message to="name">...</message> blocks is never shown to anyone. ` +
+                `If it was meant for someone, send it now wrapped in <message to="name">. ` +
+                `If it was only a note to yourself, reply with <internal>...</internal> only. ` +
+                `Your destinations: ${names}.</system>`,
+            );
+          }
           if (willRetryWrapping) {
             unwrappedNudged = true;
             const destinations = getAllDestinations();
@@ -748,6 +788,7 @@ export async function processQuery(
         midTurnSent = 0;
         turnStartSeq = maxOutboundSeq();
         midTurnTail = '';
+        workSinceDelivery = false;
         // The SDK may coalesce queued sends into fewer turns, so one result can
         // answer several pushed turns. A result reporting no queued sends, with
         // nothing pushed while it was handled, answered them all: drop the
@@ -1084,21 +1125,41 @@ function maxOutboundSeq(): number {
 }
 
 /**
- * Has ANY chat row been written to outbound.db after `afterSeq`? Feeds the
- * result door's nudge decision: unlike the frame-local midTurnSent count,
- * this also sees MCP send_message / send_file deliveries made this turn, so
- * an agent that already replied via tools is not nudged into repeating
- * itself. Fail-open to false: if the lookup breaks, the nudge may fire
- * spuriously (a repeat coax), never silently swallow an undelivered turn.
+ * Has a reply been written to outbound.db after `afterSeq`? Feeds the result
+ * door's nudge decision: unlike the frame-local midTurnSent count, this also
+ * sees MCP send_message / send_file deliveries made this turn, so an agent
+ * that already replied via tools is not nudged into repeating itself. A
+ * reaction is a chat row but not a reply (live: a reaction followed by an
+ * unwrapped answer lost the answer). Fail-open to false: if the lookup
+ * breaks, the nudge may fire spuriously (a repeat coax), never silently
+ * swallow an undelivered turn.
  */
-function chatRowWrittenSince(afterSeq: number): boolean {
+function replyRowWrittenSince(afterSeq: number): boolean {
   try {
     // ponytail: reuse the existing semantic read; add a cursor operation only if history scans show up in profiles.
-    return getUndeliveredMessages().some((message) => (message.seq ?? 0) > afterSeq && message.kind === 'chat');
+    return getUndeliveredMessages().some(
+      (message) => (message.seq ?? 0) > afterSeq && message.kind === 'chat' && !isReactionRow(message.content),
+    );
   } catch (err) {
-    log(`chatRowWrittenSince failed: ${err instanceof Error ? err.message : String(err)}`);
+    log(`replyRowWrittenSince failed: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
+}
+
+function isReactionRow(content: string): boolean {
+  try {
+    return (JSON.parse(content) as { operation?: unknown }).operation === 'reaction';
+  } catch {
+    return false;
+  }
+}
+
+/** Tools whose call is itself a reply to someone (add_reaction is not). */
+const DELIVERY_TOOLS = new Set(['send_message', 'send_file', 'send_media_group', 'edit_message']);
+
+/** `mcp__nanoclaw__send_message` → `send_message`; plain names pass through. */
+function bareToolName(name: string): string {
+  return name.replace(/^mcp__nanoclaw__/, '');
 }
 
 /**
@@ -1137,7 +1198,7 @@ export async function dispatchResultText(
   text: string,
   routing: RoutingContext,
   options?: ResultDispatchOptions,
-): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[] }> {
+): Promise<{ sent: number; hasUnwrapped: boolean; hasScratchpad: boolean; taskBlocks: TaskMessageBlock[] }> {
   // <internal> spans are not-for-delivery scratchpad. Remove them BEFORE block
   // extraction so a <message> drafted inside one is never delivered from the
   // final text either — the mid-turn seam already guarantees this; without the
@@ -1233,7 +1294,10 @@ export async function dispatchResultText(
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
-  return { sent, hasUnwrapped, taskBlocks };
+  // Undelivered final content regardless of what else went out this turn;
+  // the caller decides whether that alone warrants a nudge.
+  const hasScratchpad = !routing.taskRun && !!scratchpad;
+  return { sent, hasUnwrapped, hasScratchpad, taskBlocks };
 }
 
 /**

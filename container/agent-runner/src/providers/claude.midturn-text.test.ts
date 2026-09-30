@@ -217,4 +217,39 @@ describe('result text is an independent SDK field (divergence surface)', () => {
 
     expect(events.find((e) => e.type === 'result')?.stopReason).toBe('max_tokens');
   });
+
+  it('yields a tool_call per main-thread tool_use block, after that message text, and skips subagent calls', async () => {
+    sdkMessages.length = 0;
+    sdkMessages.push(
+      { type: 'system', subtype: 'init', session_id: 'sess-8' },
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'text', text: 'checking' },
+            { type: 'tool_use', name: 'mcp__nanoclaw__send_message', input: {} },
+          ],
+        },
+      },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: {} }] } },
+      {
+        type: 'assistant',
+        parent_tool_use_id: 'toolu_agent',
+        message: { content: [{ type: 'tool_use', name: 'Grep', input: {} }] },
+      },
+      { type: 'result', subtype: 'success', result: 'done' },
+    );
+
+    const provider = createProvider('claude');
+    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+    const q = provider.query({ prompt: 'hi', cwd: tmp });
+
+    const seen: string[] = [];
+    for await (const e of q.events) {
+      if (e.type === 'text') seen.push(`text:${e.text}`);
+      if (e.type === 'tool_call') seen.push(`tool:${e.name}`);
+    }
+
+    expect(seen).toEqual(['text:checking', 'tool:mcp__nanoclaw__send_message', 'tool:Bash']);
+  });
 });

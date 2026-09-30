@@ -630,3 +630,177 @@ describe('capability=true keeps base result-door handling for door-skipped block
     expect(nudges(pushes)).toHaveLength(1);
   });
 });
+
+// ── Ack-then-work: something went out, then the real answer came out unwrapped ──
+//
+// Live: an "on it" send_message (or a reaction), more tool work, then the
+// actual answer as unwrapped final text. The old "anything delivered this
+// turn" check silently dropped that answer.
+
+describe('unwrapped final text after an acknowledgment', () => {
+  const softNudges = (pushes: string[]): string[] => pushes.filter((p) => p.includes('A message already went out'));
+  const hardNudges = (pushes: string[]): string[] =>
+    pushes.filter((p) => p.includes('Your response was not delivered'));
+
+  async function toolSend(text: string, id: string): Promise<void> {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    await writeMessageOut({
+      id,
+      kind: 'chat',
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ text }),
+    });
+  }
+
+  async function toolReact(id: string): Promise<void> {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    await writeMessageOut({
+      id,
+      kind: 'chat',
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ operation: 'reaction', messageId: 'p-1', emoji: 'heart' }),
+    });
+  }
+
+  async function runTurn(events: AsyncGenerator<ProviderEvent>): Promise<string[]> {
+    const { query, pushes } = makeStubQuery(events);
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+    return pushes;
+  }
+
+  it('send_message ack, more tool work, unwrapped answer: the softer nudge fires once', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'tool_call', name: 'mcp__nanoclaw__send_message' };
+      await toolSend('on it, one minute', 'ack-1');
+      yield { type: 'tool_call', name: 'Bash' };
+      yield { type: 'text', text: 'Here is the full analysis you asked for.' };
+      yield { type: 'result', text: 'Here is the full analysis you asked for.', stopReason: 'end_turn' };
+    }
+    const pushes = await runTurn(events());
+
+    expect(deliveredTexts()).toEqual(['on it, one minute']);
+    expect(softNudges(pushes)).toHaveLength(1);
+    expect(hardNudges(pushes)).toHaveLength(0);
+    expect(softNudges(pushes)[0]).toContain('discord-main');
+  });
+
+  it('a mid-turn <message> ack followed by tool work counts the same way', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">looking into it</message>' };
+      yield { type: 'tool_call', name: 'mcp__glim__glim_web_search' };
+      yield { type: 'text', text: 'The answer, unwrapped.' };
+      yield { type: 'result', text: 'The answer, unwrapped.', stopReason: 'end_turn' };
+    }
+    const pushes = await runTurn(events());
+
+    expect(deliveredTexts()).toEqual(['looking into it']);
+    expect(softNudges(pushes)).toHaveLength(1);
+  });
+
+  it('reply via send_message, then an unwrapped note with no work in between: no nudge', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'tool_call', name: 'Bash' };
+      yield { type: 'tool_call', name: 'mcp__nanoclaw__send_message' };
+      await toolSend('the answer', 'reply-1');
+      yield { type: 'text', text: 'Sent the answer to discord-main.' };
+      yield { type: 'result', text: 'Sent the answer to discord-main.', stopReason: 'end_turn' };
+    }
+    const pushes = await runTurn(events());
+
+    expect(deliveredTexts()).toEqual(['the answer']);
+    expect(nudges(pushes)).toHaveLength(0);
+  });
+
+  it('ack, work, then a wrapped final answer: delivered, no nudge', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'tool_call', name: 'mcp__nanoclaw__send_message' };
+      await toolSend('on it', 'ack-2');
+      yield { type: 'tool_call', name: 'Bash' };
+      yield { type: 'text', text: '<internal>done</internal><message to="discord-main">final answer</message>' };
+      yield {
+        type: 'result',
+        text: '<internal>done</internal><message to="discord-main">final answer</message>',
+        stopReason: 'end_turn',
+      };
+    }
+    const pushes = await runTurn(events());
+
+    expect(deliveredTexts()).toEqual(['on it', 'final answer']);
+    expect(nudges(pushes)).toHaveLength(0);
+  });
+
+  it('ack, work, then only an <internal> note: no nudge', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'tool_call', name: 'mcp__nanoclaw__send_message' };
+      await toolSend('on it', 'ack-3');
+      yield { type: 'tool_call', name: 'Bash' };
+      yield { type: 'text', text: '<internal>nothing more to say</internal>' };
+      yield { type: 'result', text: '<internal>nothing more to say</internal>', stopReason: 'end_turn' };
+    }
+    const pushes = await runTurn(events());
+
+    expect(nudges(pushes)).toHaveLength(0);
+  });
+
+  it('a reaction-only turn with an unwrapped answer gets the regular wrap-nudge', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'tool_call', name: 'mcp__nanoclaw__add_reaction' };
+      await toolReact('react-1');
+      yield { type: 'text', text: 'Good luck with the race!' };
+      yield { type: 'result', text: 'Good luck with the race!', stopReason: 'end_turn' };
+    }
+    const pushes = await runTurn(events());
+
+    expect(hardNudges(pushes)).toHaveLength(1);
+    expect(softNudges(pushes)).toHaveLength(0);
+  });
+
+  it('a reaction followed by tool work is not an acknowledgment: regular wrap-nudge, once', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'tool_call', name: 'mcp__nanoclaw__add_reaction' };
+      await toolReact('react-2');
+      yield { type: 'tool_call', name: 'Bash' };
+      yield { type: 'text', text: 'Unwrapped answer.' };
+      yield { type: 'result', text: 'Unwrapped answer.', stopReason: 'end_turn' };
+    }
+    const pushes = await runTurn(events());
+
+    expect(nudges(pushes)).toHaveLength(1);
+    expect(hardNudges(pushes)).toHaveLength(1);
+  });
+
+  it('task runs never get the acknowledgment nudge', async () => {
+    seedDest();
+    const TASK_ROUTING = { ...CHAT_ROUTING, platformId: null, channelType: null, taskRun: true };
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'tool_call', name: 'mcp__nanoclaw__send_message' };
+      await toolSend('task notice', 'task-1');
+      yield { type: 'tool_call', name: 'Bash' };
+      yield { type: 'result', text: 'run log summary', stopReason: 'end_turn' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+    await processQuery(query, TASK_ROUTING, ['t1'], 'claude', undefined, 'prompt', undefined, true);
+
+    expect(nudges(pushes)).toHaveLength(0);
+    expect(softNudges(pushes)).toHaveLength(0);
+  });
+});
