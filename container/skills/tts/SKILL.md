@@ -63,59 +63,27 @@ short caption.
 
 The model auto-detects the language from your text — **just write in the target
 language**. Ukrainian (`uk`) and English (`en`) are both fully supported, and
-you can mix them. Two rules from Google's docs:
+you can mix them.
 
-- **Audio tags stay in English even when the speech isn't.** Write Ukrainian
-  text with English tags. Example:
-  `--text "[привітно] Привіт! [laughs] Я щойно навчився говорити."`
-  (the `[laughs]` tag is English, the spoken words are Ukrainian).
-- **Accents come from a style instruction, not the language.** To shape an
-  accent, describe it (see below) rather than relying on the language code.
+## Plain text only
 
-## Audio tags (expressive control)
+Pass exactly the words to be spoken, nothing else. The model picks up emotion,
+intonation, pacing and accent from the meaning of the text by itself, and does
+it better unassisted.
 
-Tags are inline `[square-bracket]` cues that steer delivery. The model reads
-the *meaning* of your text, so tags fine-tune emotion, pace, and non-verbal
-sounds. Google's formula:
-
-> `[pacing tag]` spoken text `[expressive tag]` spoken text `[pause tag]` spoken text
-
-**Rules (important — follow exactly):**
-- Tags are **English only**; the spoken text can be any language.
-- Put a tag **exactly** where the change should happen.
-- **Always separate tags with text or punctuation — never place two tags
-  back-to-back** (`[slow][whispers]` errors; `[slow] well… [whispers]` is fine).
-
-**Common tags:**
-- *Emotion:* `[excited]`, `[happy]`, `[serious]`, `[sad]`, `[nervous]`,
-  `[curious]`, `[sarcastic]`, `[angry]`, `[hopeful]`, `[amused]`
-- *Non-verbal:* `[laughs]`, `[sighs]`, `[gasp]`, `[whispers]`, `[shouting]`,
-  `[giggles]`, `[cough]`
-- *Pacing:* `[slow]`, `[fast]`, `[short pause]`, `[long pause]`
-
-The list isn't exhaustive — descriptive tags work too (`[reluctantly]`,
-`[like telling a secret]`). Example:
-`--text "[excited] We did it! [laughs] [short pause] I honestly can't believe it worked."`
+- **No audio tags** — no `[square-bracket]` cues of any kind (emotion, laughs,
+  pauses, pacing). They make the result worse.
+- **No style preambles or directions** — no "Say warmly:", "Read this aloud:",
+  or descriptions of tone, pace or accent. The model may read them aloud.
+- Shape the delivery through the words themselves: natural punctuation and
+  phrasing are enough.
 
 ## Voice matching
 
-Pick a `--voice` whose character reinforces the mood, and keep it consistent
-for a persona. A few of the 30: `Alnilam` (firm — the default), `Puck` (upbeat),
-`Aoede` (breezy), `Enceladus` (breathy — good for tired/intimate), `Achird`
-(friendly), `Sulafat` (warm), `Charon` (informative). The voice and the text's
-tone should agree — don't push a deep firm voice to sound like a giddy child.
-
-## Optional: richer direction
-
-For a more crafted performance you can prepend a short natural-language style
-note, e.g. `--text "Say warmly and slowly: бережи себе сьогодні."` or describe
-style/pacing/accent in a sentence before the line.
-
-**Safety rule when you do this:** the model can occasionally *read your
-directions aloud* if it can't tell instruction from script. So when you add a
-style preamble, make the spoken part unambiguous — phrase it as
-`Read this aloud: "<the exact words>"`. For a plain voice note with inline tags
-only (the common case), no preamble is needed.
+Pick a `--voice` whose character fits the persona, and keep it consistent.
+A few of the 30: `Alnilam` (firm — the default), `Puck` (upbeat),
+`Aoede` (breezy), `Enceladus` (breathy), `Achird` (friendly), `Sulafat`
+(warm), `Charon` (informative).
 
 ## Notes
 
