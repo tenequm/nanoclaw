@@ -200,4 +200,21 @@ describe('result text is an independent SDK field (divergence surface)', () => {
     // 'billing hard-stop' never appeared in a text event — only 'partial progress' did.
     expect(events.filter((e) => e.type === 'text').map((e) => e.text)).toEqual(['partial progress']);
   });
+
+  it("passes the SDK result's stop_reason through as stopReason", async () => {
+    sdkMessages.length = 0;
+    sdkMessages.push(
+      { type: 'system', subtype: 'init', session_id: 'sess-7' },
+      { type: 'result', subtype: 'success', result: 'x', stop_reason: 'max_tokens' },
+    );
+
+    const provider = createProvider('claude');
+    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+    const q = provider.query({ prompt: 'hi', cwd: tmp });
+
+    const events: { type: string; stopReason?: string | null }[] = [];
+    for await (const e of q.events) events.push(e);
+
+    expect(events.find((e) => e.type === 'result')?.stopReason).toBe('max_tokens');
+  });
 });

@@ -171,8 +171,19 @@ export type ProviderEvent =
    * Queued sends may coalesce into fewer turns, so 0 means every send the
    * provider had received by then is answered, even if more prompts were
    * pushed than results seen.
+   * `stopReason` is the model's stop reason for the turn's final response
+   * (e.g. 'end_turn', 'max_tokens'); undefined when the provider can't say.
+   * Only an explicit 'end_turn' lets the poll-loop close a still-open
+   * <message> block at the turn boundary.
    */
-  | { type: 'result'; text: string | null; isError?: boolean; error?: string; queuedTurnCount?: number }
+  | {
+      type: 'result';
+      text: string | null;
+      isError?: boolean;
+      error?: string;
+      queuedTurnCount?: number;
+      stopReason?: string | null;
+    }
   /**
    * An assistant text segment emitted mid-turn (e.g. between tool calls).
    * The SDK's final `result` carries only the LAST assistant text, so a

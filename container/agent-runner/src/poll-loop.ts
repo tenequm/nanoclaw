@@ -653,6 +653,19 @@ export async function processQuery(
         markCompleted(initialBatchIds);
         const resultText = event.text ?? '';
         const failed = event.isError === true;
+        // A clean end_turn that leaves a <message to="…"> block open ends the
+        // block: the model addressed it and finished the turn, only the close
+        // tag is missing (live: long-context turns, where the wrap-nudge made
+        // the model re-send the identical body). Truncation and failures keep
+        // the fragment undelivered; an open <internal> or unknown destination
+        // still delivers nothing. Runs before the nudge decision, which then
+        // sees the delivery.
+        if (midTurnCompleteDelivery && !failed && event.stopReason === 'end_turn' && OPEN_BLOCK_RE.test(midTurnTail)) {
+          const closed = await deliverMidTurnBlocks('</message>', routing, turnStartSeq, midTurnTail);
+          if (closed.delivered > 0) log('Closed an unterminated <message> block at end of turn');
+          midTurnSent += closed.delivered;
+          midTurnTail = '';
+        }
         if (resultText || failed) {
           const { hasUnwrapped, taskBlocks } = await dispatchResultText(resultText, routing, {
             midTurnSent,
@@ -729,8 +742,9 @@ export async function processQuery(
         // this turn (door and error deliveries alike), so the next turn's
         // echo check never reaches back across the boundary — a later turn
         // genuinely re-sending the same body still delivers. The assembly
-        // buffer dies with the turn: a fragment that never closed is not
-        // carried into the next turn — the wrap-nudge owns that case.
+        // buffer dies with the turn: a fragment that never closed (and was
+        // not closed by a clean end_turn above) is not carried into the next
+        // turn — the wrap-nudge owns that case.
         midTurnSent = 0;
         turnStartSeq = maxOutboundSeq();
         midTurnTail = '';
@@ -1012,6 +1026,8 @@ export async function deliverMidTurnBlocks(
 
 const OPEN_INTERNAL_RE = /<internal\b/i;
 const OPEN_MESSAGE_RE = /<message\b/;
+/** A carried tail that is exactly one still-open, addressed <message> block. */
+const OPEN_BLOCK_RE = /^<message\s+to="[^"]+"\s*>/;
 
 /**
  * Index where the UNRESOLVED tail of a mid-turn scan begins — everything

@@ -355,13 +355,20 @@ export class ClaudeProvider implements AgentProvider {
           // (e.g. a non-retryable 403 billing_error) carry their message in
           // `errors[]` instead. Keep that actionable notice separate from
           // model output so the poll-loop can deliver it without scratchpad.
-          const m = message as { result?: string; is_error?: boolean; errors?: string[]; queued_turn_count?: number };
+          const m = message as {
+            result?: string;
+            is_error?: boolean;
+            errors?: string[];
+            queued_turn_count?: number;
+            stop_reason?: string | null;
+          };
           yield {
             type: 'result',
             text: m.result ?? null,
             isError: m.is_error === true,
             error: m.errors?.length ? m.errors.join('\n') : undefined,
             queuedTurnCount: m.queued_turn_count,
+            stopReason: m.stop_reason,
           };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };

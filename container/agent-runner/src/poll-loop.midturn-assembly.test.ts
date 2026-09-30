@@ -237,6 +237,133 @@ describe('cross-segment block assembly', () => {
   });
 });
 
+describe('end_turn closes a still-open block', () => {
+  const nudgesOf = (pushes: string[]): string[] => pushes.filter((p) => p.includes('was not delivered'));
+
+  it('an addressed block left open at a clean end_turn delivers once, with no nudge', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">\nthe whole answer, close tag forgotten' };
+      yield {
+        type: 'result',
+        text: '<message to="discord-main">\nthe whole answer, close tag forgotten',
+        stopReason: 'end_turn',
+      };
+    }
+    const pushes = await run(events());
+
+    expect(deliveredTexts()).toEqual(['the whole answer, close tag forgotten']);
+    expect(nudgesOf(pushes)).toHaveLength(0);
+  });
+
+  it('a reply split across text events is closed at the result, never split mid-turn', async () => {
+    seedDest();
+    let deliveredBeforeResult = -1;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">first half, ' };
+      yield { type: 'text', text: 'second half' };
+      deliveredBeforeResult = getUndeliveredMessages().length;
+      yield { type: 'result', text: 'second half', stopReason: 'end_turn' };
+    }
+    await run(events());
+
+    expect(deliveredBeforeResult).toBe(0);
+    expect(deliveredTexts()).toEqual(['first half, second half']);
+  });
+
+  it('a complete block plus a trailing unclosed one: both delivered, each once', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield {
+        type: 'text',
+        text: '<message to="discord-main">one</message>\n<message to="discord-main">two',
+      };
+      yield {
+        type: 'result',
+        text: '<message to="discord-main">one</message>\n<message to="discord-main">two',
+        stopReason: 'end_turn',
+      };
+    }
+    const pushes = await run(events());
+
+    expect(deliveredTexts()).toEqual(['one', 'two']);
+    expect(nudgesOf(pushes)).toHaveLength(0);
+  });
+
+  it('max_tokens truncation is not auto-closed: nothing delivered, the nudge fires', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">cut off mid-sen' };
+      yield { type: 'result', text: '<message to="discord-main">cut off mid-sen', stopReason: 'max_tokens' };
+    }
+    const pushes = await run(events());
+
+    expect(deliveredTexts()).toEqual([]);
+    expect(nudgesOf(pushes)).toHaveLength(1);
+  });
+
+  it('a failed result is not auto-closed', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">partial before the failure' };
+      yield { type: 'result', text: null, isError: true, error: 'boom', stopReason: 'end_turn' };
+    }
+    await run(events());
+
+    expect(deliveredTexts()).not.toContain('partial before the failure');
+  });
+
+  it('an unknown destination is not delivered', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="nobody-here">addressed to nowhere' };
+      yield { type: 'result', text: '<message to="nobody-here">addressed to nowhere', stopReason: 'end_turn' };
+    }
+    const pushes = await run(events());
+
+    expect(deliveredTexts()).toEqual([]);
+    expect(nudgesOf(pushes)).toHaveLength(1);
+  });
+
+  it('an open <internal> span inside the open block keeps everything undelivered', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">visible part <internal>private note' };
+      yield {
+        type: 'result',
+        text: '<message to="discord-main">visible part <internal>private note',
+        stopReason: 'end_turn',
+      };
+    }
+    await run(events());
+
+    expect(deliveredTexts()).toEqual([]);
+  });
+
+  it('an open <internal> tail on its own is never promoted', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<internal>draft <message to="discord-main">not for sending' };
+      yield {
+        type: 'result',
+        text: '<internal>draft <message to="discord-main">not for sending',
+        stopReason: 'end_turn',
+      };
+    }
+    await run(events());
+
+    expect(deliveredTexts()).toEqual([]);
+  });
+});
+
 describe('unresolvedTailStart', () => {
   it('fully settled text returns input.length', () => {
     for (const s of ['plain prose', '<message to="x">done</message>', 'a < b and 5 > 4', '']) {
