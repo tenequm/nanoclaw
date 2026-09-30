@@ -160,18 +160,24 @@ async function main(): Promise<void> {
         });
       },
       onAction(questionId, selectedOption, userId, address) {
-        dispatchResponse({
-          questionId,
-          value: selectedOption,
-          userId,
-          channelType: adapter.channelType,
-          instance: address?.instance ?? adapter.instance ?? adapter.channelType,
-          messageId: address?.messageId,
-          platformId: address?.platformId ?? '',
-          threadId: address?.threadId ?? null,
-        }).catch((err) => {
-          log.error('Failed to handle question response', { questionId, err });
-        });
+        // Gated like inbound: a click replayed at startup must not wake a session
+        // before adoption, nor reach an approval before the coordinator's handler.
+        inboundReady
+          .then(() =>
+            dispatchResponse({
+              questionId,
+              value: selectedOption,
+              userId,
+              channelType: adapter.channelType,
+              instance: address?.instance ?? adapter.instance ?? adapter.channelType,
+              messageId: address?.messageId,
+              platformId: address?.platformId ?? '',
+              threadId: address?.threadId ?? null,
+            }),
+          )
+          .catch((err) => {
+            log.error('Failed to handle question response', { questionId, err });
+          });
       },
     };
   });

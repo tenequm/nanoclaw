@@ -5,6 +5,8 @@ const state = vi.hoisted(() => ({
   approvalReady: false,
   releaseAdoption: undefined as (() => void) | undefined,
   routeInbound: vi.fn(),
+  respond: vi.fn(),
+  adoptedAtResponse: [] as boolean[],
   startChannels: vi.fn(),
   ready: vi.fn(),
 }));
@@ -55,7 +57,7 @@ vi.mock('./delivery.js', () => ({
 vi.mock('./host-sweep.js', () => ({ startHostSweep: vi.fn(), stopHostSweep: vi.fn() }));
 vi.mock('./host-lifecycle.js', () => ({ startHostModules: vi.fn(), stopHostModules: vi.fn() }));
 vi.mock('./router.js', () => ({ routeInbound: state.routeInbound }));
-vi.mock('./response-registry.js', () => ({ getResponseHandlers: () => [] }));
+vi.mock('./response-registry.js', () => ({ getResponseHandlers: () => [state.respond] }));
 vi.mock('./channels/index.js', () => ({}));
 vi.mock('./modules/index.js', () => ({}));
 vi.mock('./cli/commands/index.js', () => ({}));
@@ -70,23 +72,31 @@ vi.mock('./channels/channel-registry.js', () => ({
 
 afterEach(() => vi.restoreAllMocks());
 
-it('finishes adoption before a channel can route its first inbound message', async () => {
+it('finishes adoption before a channel can route its first inbound message or button click', async () => {
   vi.spyOn(process, 'on').mockReturnValue(process);
   state.routeInbound.mockImplementation(async () => {
     expect(state.adopted).toBe(true);
   });
+  state.respond.mockImplementation(async () => {
+    state.adoptedAtResponse.push(state.adopted);
+    return true;
+  });
   state.startChannels.mockImplementation(async (setup) => {
-    setup({ channelType: 'fixture' }).onInbound('chat', null, {
+    const channel = setup({ channelType: 'fixture' });
+    channel.onInbound('chat', null, {
       id: 'message',
       kind: 'text',
       content: 'hello',
       timestamp: new Date().toISOString(),
     });
+    channel.onAction('question', 'approve', 'fixture:user');
   });
   await import('./index.js');
   await vi.waitFor(() => expect(state.releaseAdoption).toBeDefined());
   expect(state.routeInbound).not.toHaveBeenCalled();
+  expect(state.respond).not.toHaveBeenCalled();
   state.releaseAdoption!();
   await vi.waitFor(() => expect(state.ready).toHaveBeenCalled());
   expect(state.routeInbound).toHaveBeenCalledOnce();
+  expect(state.adoptedAtResponse).toEqual([true]);
 });
