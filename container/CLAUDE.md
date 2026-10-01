@@ -37,6 +37,10 @@ Search tools return compact previews; follow up with the matching detail tool fo
 
 Always use HTTPS remotes, not SSH. SSH bypasses the gateway and has no key. If a private org repo 404s while personal repos work, the org restricts third-party OAuth apps; tell the user to approve the app in the org's OAuth application policy settings.
 
+## DuckDB
+
+`duckdb` is v2.0 (preview/alpha), not 1.x - syntax, extensions and file format may differ from 1.x docs. When something behaves unexpectedly, check the [DuckDB preview docs](https://duckdb.org/docs/preview/) (CLI specifics: [CLI overview](https://duckdb.org/docs/preview/clients/cli/overview)).
+
 ## Workspace
 
 Files you create are saved in `/workspace/agent/`. Use this for notes, research, or anything that should persist across turns in this group.

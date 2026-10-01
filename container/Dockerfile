@@ -144,6 +144,20 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     | tar -xJ -C /usr/local/bin pond && \
     chmod +x /usr/local/bin/pond
 
+# ---- DuckDB CLI: the v2.0 preview ---------------------------------------------
+# Pinned by staging path: the duckdb.org preview links are rebuilt in place. Same
+# build as the infra flake's nix/pkgs/duckdb.nix; bump both together.
+ARG DUCKDB_STAGED=96063b9e39/v2.0.0-alpha43763
+RUN ARCH=$(dpkg --print-architecture) && case "$ARCH" in \
+      arm64) DUCKDB_DIST=linux-arm64; DUCKDB_SHA256=ae59b4e4edf1e7b635ce7a4824dab246bab9662820d786ec94a82fc2e6a955ae ;; \
+      amd64) DUCKDB_DIST=linux-amd64; DUCKDB_SHA256=e0116cd47702d8ba8f6553f248b140616d6acd4b2c63df34cd14c62cb3d57b40 ;; \
+      *) echo "unsupported arch: $ARCH" && exit 1 ;; \
+    esac && \
+    curl -fsSL -o /tmp/duckdb.tar.gz "https://duckdb-staging.duckdb.org/${DUCKDB_STAGED}/duckdb/duckdb/github_release/duckdb-cli-${DUCKDB_DIST}.tar.gz" && \
+    echo "${DUCKDB_SHA256}  /tmp/duckdb.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/duckdb.tar.gz -C /usr/local/bin duckdb && \
+    chmod +x /usr/local/bin/duckdb && rm /tmp/duckdb.tar.gz
+
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
 # the binary to /usr/local/bin so the non-root `node` user can execute it.
