@@ -960,7 +960,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       if (call.ended || calls.get(call.platformId) !== call) return { status: 409, body: 'The call has ended' };
       if (!chat) return { status: 409, body: 'The call has no chat to talk in' };
       const utteranceId = String(++call.utterances);
-      // Always the line's own caller: the person whose /voice minted the link.
+      // Always the line's own caller: the person the link was minted for (the first /voice, or /voice new).
       const sender = call.line.caller;
       const message: InboundEvent['message'] = {
         id: liveKitUtteranceMessageId(call.callId, utteranceId),

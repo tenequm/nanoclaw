@@ -6,16 +6,18 @@
  * src/voice-mode-worker.ts); this module is the channel adapter around it.
  *
  * Shape: native adapter (no Chat SDK bridge). A *voice line* is an agent's call
- * link: `/voice`, run by an owner or admin of the agent, creates it and mints its
- * token (src/channels/voice-mode-command.ts). Its platform id is
- * `voice-mode:<line id>`, a random id; only the token's SHA-256 is stored, so the
- * token itself never reaches the database, the logs or the agent's messages. A
- * call talks in the chat `/voice` was run in. One call is active per line at a
- * time; the newest wins.
+ * link: the first `/voice` run by an owner or admin of the agent creates it and
+ * mints its token, `/voice new` re-mints it (src/channels/voice-mode-command.ts).
+ * Its platform id is `voice-mode:<line id>`, a random id; only the token's SHA-256
+ * is stored, so the token itself never reaches the database, the logs or the
+ * agent's messages. A call talks in the chat `/voice` was last run in. One call
+ * is active per line at a time; the newest wins.
  *
- * The link token gates the HTTP routes: a request without a valid `t` gets a
- * 403 before any room is created. The page is at `/voice?t=<token>` behind a
- * loopback front (or a trusted reverse proxy) that terminates TLS.
+ * The page shell is served to anyone the proxy gate admits and creates nothing;
+ * the routes that tell who answers, open a room or end a call need a valid `t`
+ * and a caller with access, and answer 403 otherwise. The page is at
+ * `/voice?t=<token>` behind a loopback front (or a trusted reverse proxy) that
+ * terminates TLS.
  */
 import http from 'node:http';
 import net, { type AddressInfo } from 'node:net';
@@ -26,7 +28,7 @@ import { linePlatformId, resolveVoiceLine, type ResolveLineOptions, type VoiceLi
 import { createLiveKitVoice, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
 import { DEFAULT_VOICE_MIRROR, parseVoiceLanguages } from './voice-mode-protocol.js';
 import { routeVoiceTurn, stopThinkingWatchers } from './voice-mode-route.js';
-// The /voice chat command, which creates lines and mints their links.
+// The /voice chat command, which creates lines, moves their chat and mints their links.
 import './voice-mode-command.js';
 import { findVoiceModeLineByToken } from '../db/voice-mode-lines.js';
 import { readEnvFile } from '../env.js';
