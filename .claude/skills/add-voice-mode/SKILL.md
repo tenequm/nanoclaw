@@ -390,7 +390,7 @@ empty value reads as unset, so turn a fallback off with `off`.
 | Key | Default | Read by | What |
 | --- | --- | --- | --- |
 | `VOICE_MODE_LANGUAGES` | `en-US` | host | Languages callers speak, BCP-47, comma-separated, the first the default (e.g. `uk-UA,en-US`). The transcription's language hints; unless it is English only, each turn also tells the agent which languages to answer in. With Ukrainian listed and Russian not, a Russian-looking transcript is treated as misheard Ukrainian. The worker's own short lines exist in English and Ukrainian. |
-| `VOICE_MODE_VOCABULARY` | empty | host | Comma-separated names to recognise and spell exactly; merged with the agent's optional `voice.vocabulary.txt` (one per line, in its group folder). At most 60 terms. |
+| `VOICE_MODE_VOCABULARY` | empty | host | Comma-separated names to recognise and spell exactly, for every agent; merged with each agent's vocabulary file (below). At most 60 terms and 1024 bytes together, these first. |
 | `VOICE_MODE_PORT` | `3100` | host | The page server's port. |
 | `VOICE_MODE_MAX_CALL_SECONDS` | `900` | host | Longest call. |
 | `VOICE_MODE_MAX_CALLS_PER_HOUR` | `12` | host | Call starts per line per hour. |
@@ -407,6 +407,16 @@ empty value reads as unset, so turn a fallback off with `off`.
 | `LIVEKIT_HOST_URL` | `http://127.0.0.1:<WEBHOOK_PORT>` | worker | Where the worker reaches the host; a local `http(s)` address, checked at start. |
 | `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | worker | Health check on `127.0.0.1`. |
 | `VOICE_MODE_MAX_SPOKEN_CHARS` | `800` | worker | Longest spoken message; the rest stays in the chat. `0` for no cap. |
+
+### The agent's vocabulary file
+
+`voice.vocabulary.txt` in the agent's group folder (`groups/<folder>/`, which
+the agent sees as `/workspace/agent/`) lists names the transcription should
+spell exactly, one per line. It is read at the start of each call, so changes
+apply from the next call. The agent adds names a transcript got wrong (the
+`voice-mode-formatting` container skill tells it to); you can read and edit
+the file too. Terms over 80 characters are skipped, and the file shares the
+60-term, 1024-byte cap with `VOICE_MODE_VOCABULARY`.
 
 ## Self-hosted LiveKit
 

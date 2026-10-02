@@ -37,6 +37,15 @@ what they said.
 When the note under the turn names the caller's languages, answer in the one
 it tells you to; otherwise answer in the language of the transcript.
 
+## Names the transcript gets wrong
+
+When a transcript misspells a name or term you know (a person, project,
+product or place), add the correct spelling to
+`/workspace/agent/voice.vocabulary.txt`, one term per line. The transcription
+uses it from the next call. Only names and terms, never common words; the file
+counts toward a cap of 60 terms and 1024 bytes (terms over 80 characters are
+skipped), so when it is full, replace stale entries instead of adding.
+
 ## Proactive messages
 
 While a call is active, a message you send to the chat that answers no turn (a
