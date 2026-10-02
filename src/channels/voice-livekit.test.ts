@@ -20,6 +20,7 @@ import {
   type BoundCallChat,
   walkieMessageText,
   WALKIE_CHAT_REPLY_NOTE,
+  WALKIE_LANGUAGE_NOTE,
   WALKIE_REPLY_NOTE,
   type LiveKitServerApi,
   type LiveKitVoiceConfig,
@@ -1302,6 +1303,16 @@ describe('walkie message text', () => {
   it('warns a call in a chat that everything sent there is spoken', () => {
     expect(WALKIE_CHAT_REPLY_NOTE).toContain('every message you send to this chat is read aloud');
     expect(WALKIE_CHAT_REPLY_NOTE).not.toContain('separate written message');
+  });
+
+  it('keeps the transcript as heard and tells the agent Russian spelling is Ukrainian, never to answer in Russian', () => {
+    expect(walkieMessageText('Привет.')).toContain('<voice source="livekit">Привет.</voice>');
+    for (const note of [WALKIE_REPLY_NOTE, WALKIE_CHAT_REPLY_NOTE]) {
+      expect(note).toContain(WALKIE_LANGUAGE_NOTE);
+    }
+    expect(WALKIE_LANGUAGE_NOTE).toContain('looks Russian is Ukrainian misspelled by speech recognition');
+    expect(WALKIE_LANGUAGE_NOTE).toContain('answer in Ukrainian (in English if the caller spoke English)');
+    expect(WALKIE_LANGUAGE_NOTE).toContain('never in Russian');
   });
 });
 

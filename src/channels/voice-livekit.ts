@@ -95,17 +95,22 @@ const MAX_TURN_KEY_LENGTH = 64;
 /** How long the room's end reason may hold up the hangup; past it the page shows a plain "ended". */
 const END_NOTICE_TIMEOUT_MS = 2_000;
 
+/** The transcription takes its language codes as a hint only, so a Ukrainian turn can come out in Russian spelling. */
+export const WALKIE_LANGUAGE_NOTE =
+  'The caller speaks Ukrainian or English; a transcript that looks Russian is Ukrainian misspelled by speech ' +
+  'recognition, so answer in Ukrainian (in English if the caller spoke English), never in Russian.';
+
 /** How the agent learns a message was spoken on a call and how its reply will be heard. */
 export const WALKIE_REPLY_NOTE =
   'Spoken on a live voice call; your reply is read aloud word for word. Answer in a few short spoken ' +
   'sentences: no markdown, no links, no code blocks, numbers written as words. Send longer material ' +
-  'as a separate written message to your chat.';
+  `as a separate written message to your chat. ${WALKIE_LANGUAGE_NOTE}`;
 
 /** The same for a call that talks in a chat, where every message the agent sends there is spoken. */
 export const WALKIE_CHAT_REPLY_NOTE =
   'Spoken on a live voice call; while it lasts, every message you send to this chat is read aloud word for ' +
   'word. Answer in a few short spoken sentences: no markdown, no links, no code blocks, numbers written as ' +
-  'words. Offer longer material for after the call instead of sending it now.';
+  `words. Offer longer material for after the call instead of sending it now. ${WALKIE_LANGUAGE_NOTE}`;
 
 /** The inbound text for one transcribed caller turn. */
 export function walkieMessageText(transcript: string, note: string = WALKIE_REPLY_NOTE): string {
