@@ -25,7 +25,13 @@ import {
   type MirrorApi,
 } from './voice-livekit.js';
 import type { MessagingGroup } from '../types.js';
-import { liveKitCallSecret, type LiveKitHostEvent, type LiveKitJobMetadata } from './voice-livekit-protocol.js';
+import {
+  LIVEKIT_PROTOCOL_VERSION,
+  liveKitCallSecret,
+  WALKIE_THINKING_ATTRIBUTE,
+  type LiveKitHostEvent,
+  type LiveKitJobMetadata,
+} from './voice-livekit-protocol.js';
 import { stopWebhookServer } from '../webhook-server.js';
 
 const LINE = lineIdForToken('tok123');
@@ -390,15 +396,17 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(dispatch.agentName).toBe('nanoclaw-voice');
     const meta = dispatch.metadata;
     expect(meta).toEqual({
-      v: 2,
+      v: LIVEKIT_PROTOCOL_VERSION,
       callId: body.callId,
       lineId: LINE,
       agentName: 'Andy',
       callerName: 'Ethan',
       callerIdentity: expect.stringMatching(/^caller-/),
       vocabulary: ['NanoClaw', 'Stan'],
-      sttModel: 'gemini-3.8-flash',
-      ttsModel: 'gemini-3.1-flash-tts-preview',
+      sttModel: 'gemini-3.5-transcribe-live',
+      sttFallbackModel: 'gemini-3.5-transcribe',
+      ttsModel: 'gemini-3.8-flash-tts',
+      ttsFallbackModel: 'gemini-3.8-flash-lite-tts',
       ttsVoice: 'Alnilam',
       silenceMs: 2500,
       maxDurationMs: 15 * MIN,
@@ -541,6 +549,37 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(worker.events.at(-1)).toEqual({ type: 'end', reason: 'hangup' });
     // The worker's routes are closed for this call now.
     expect((await worker.post('utterance', { text: 'late' })).status).toBe(409);
+  });
+
+  it('turns a fallback model off when it is set to off or empty', async () => {
+    await h.stop();
+    h = await startHarness({ gemini: { apiKey: 'gk-test', apiBase: google.apiBase } }, true, {
+      walkie: { sttFallbackModel: 'off', ttsFallbackModel: ' ', ttsModel: 'gemini-3.8-flash-lite-tts' },
+    });
+    expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
+    expect(h.lk.dispatches[0].metadata).toMatchObject({
+      sttModel: 'gemini-3.5-transcribe-live',
+      sttFallbackModel: '',
+      ttsModel: 'gemini-3.8-flash-lite-tts',
+      ttsFallbackModel: '',
+    });
+  });
+
+  it('names a missing or mismatched worker when the page gives up on it', async () => {
+    const first = await startCall(h);
+    await post(`${h.base}/livekit/end?t=tok123`, { callId: first.call.callId, reason: 'no-agent' });
+    await first.worker.streamClosed;
+    expect(first.worker.events.at(-1)).toEqual({
+      type: 'end',
+      reason: 'no voice worker joined (worker down, or not on this protocol version)',
+    });
+    const second = await startCall(h);
+    await post(`${h.base}/livekit/end?t=tok123`, { callId: second.call.callId, reason: 'updating' });
+    await second.worker.streamClosed;
+    expect(second.worker.events.at(-1)).toEqual({
+      type: 'end',
+      reason: 'the voice worker is on another protocol version',
+    });
   });
 
   it('ends the call when the caller loses access', async () => {
@@ -952,13 +991,20 @@ describe('livekit call page', () => {
   });
 
   it('shows the walkie-talkie states and labels the captions the worker sends', () => {
-    expect(script).toContain("listening: () => 'Listening'");
-    expect(script).toContain("sending: () => 'Sending...'");
-    expect(script).toContain("thinking: () => names.agent + ' is thinking'");
-    expect(script).toContain("speaking: () => names.agent + ' is speaking'");
+    expect(script).toContain("setStatus('Listening')");
+    expect(script).toContain("setStatus(names.agent + ' is thinking')");
+    expect(script).toContain("setStatus(names.agent + ' is speaking')");
+    // Thinking comes from the worker's own attribute, not lk.agent.state.
+    expect(script).toContain(`const THINKING_ATTR = '${WALKIE_THINKING_ATTRIBUTE}'`);
     expect(script).toContain("registerTextStreamHandler('lk.transcription'");
     // The caller's own turns come back from the worker against the caller's track: "You".
     expect(script).toContain("attrs['lk.transcribed_track_id'] === c.localSid");
+  });
+
+  it('says the voice service is updating instead of waiting forever for a worker', () => {
+    expect(script).toContain("hangup(c, UPDATING, false, 'updating')");
+    expect(script).toContain("hangup(c, UPDATING, false, 'no-agent')");
+    expect(script).toContain('The voice service is updating. Try again in a minute.');
   });
 
   it('keeps iOS on relay-only ICE', () => {

@@ -1,391 +1,61 @@
 /**
- * The walkie-talkie worker: turn detection on VAD windows, the call's
- * gating and reply queue against fake Gemini, host and room, the Gemini
- * request shapes against a fake fetch, and runCall end to end with a fake
- * room. Silero and the real room are not loaded here.
+ * The walkie-talkie worker: the walkie rules (turn order, reply gating, thinking, failure
+ * lines) against fake host and voice, the Gemini retry wrappers against fake streams, the
+ * text helpers, and runCall end to end with a fake room and session. The LiveKit session,
+ * Silero and Gemini themselves are not loaded here.
  */
-import { initializeLogger } from '@livekit/agents';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { initializeLogger, tokenize } from '@livekit/agents';
+import { AudioFrame } from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { liveKitCallSecret, type LiveKitJobMetadata } from './channels/voice-livekit-protocol.js';
 import {
-  decodeSpeechAudio,
+  LIVEKIT_PROTOCOL_VERSION,
+  liveKitCallSecret,
+  type LiveKitJobMetadata,
+} from './channels/voice-livekit-protocol.js';
+import {
+  AWAIT_REPLY_MS,
+  FAILURE_LINES,
+  GeminiTranscribeSTT,
   HostLink,
-  HostMonitor,
+  hostLossReason,
+  interactionText,
+  languageOf,
+  MAX_IDLE_WAIT_MS,
+  MAX_VOCABULARY_TERMS,
   parseJobMetadata,
-  pcmToWav,
-  probeHost,
+  pathSegment,
+  pruneRecordings,
+  readJobHeader,
+  recordingDays,
   runCall,
   speakableText,
-  splitForSpeech,
-  synthesize,
-  transcribe,
-  transcriptionPrompt,
-  TurnDetector,
-  WalkieCall,
+  sttVocabulary,
+  TURN_SETTLE_MS,
+  TurnCapture,
+  Walkie,
+  writeTurnRecording,
   type CallJob,
-  type CallMedia,
-  type SpeechAudio,
+  type CallVoice,
+  type CallVoiceEvents,
+  type TurnAudio,
+  type TurnRecord,
+  type TurnTake,
+  type VoiceSettings,
   type WalkieDeps,
-  type WalkieState,
 } from './voice-livekit-worker.js';
 
 initializeLogger({ pretty: false, level: 'error' });
 
-/** One Silero window at 16 kHz: 512 samples, 32 ms. */
-const WINDOW = 512;
-const window = (value: number) => new Int16Array(WINDOW).fill(value);
-const msOf = (windows: number) => (windows * WINDOW * 1000) / 16_000;
 const flush = () => new Promise((r) => setTimeout(r, 5));
+const SILENCE = 2500;
 
-/** Feed `n` windows; speech windows carry 1000, silence 1. Returns the turns completed. */
-function feed(target: { push(pcm: Int16Array, speech: boolean): unknown }, n: number, speech: boolean) {
-  const out: unknown[] = [];
-  for (let i = 0; i < n; i++) {
-    const turn = target.push(window(speech ? 1000 : 1), speech);
-    if (turn) out.push(turn);
-  }
-  return out;
-}
-
-describe('TurnDetector', () => {
-  const detector = (overrides = {}) =>
-    new TurnDetector({ sampleRate: 16_000, silenceMs: 2500, preRollMs: 64, postRollMs: 96, ...overrides });
-
-  it('keeps a turn open through pauses shorter than the silence threshold and ends it after', () => {
-    const d = detector();
-    expect(feed(d, 10, false)).toEqual([]);
-    expect(d.active).toBe(false);
-    expect(feed(d, 20, true)).toEqual([]);
-    expect(d.active).toBe(true);
-    // A 1.5 s pause mid-thought: still one turn.
-    expect(feed(d, 47, false)).toEqual([]);
-    expect(feed(d, 20, true)).toEqual([]);
-    // 2.5 s of silence = 78.1 windows; the 79th ends the turn.
-    expect(feed(d, 78, false)).toEqual([]);
-    const [turn] = feed(d, 1, false) as Array<{ pcm: Int16Array; speechMs: number }>;
-    expect(d.active).toBe(false);
-    expect(turn.speechMs).toBe(msOf(40));
-    // Pre-roll (2 windows) + speech + pause + speech + post-roll (3 windows); the long silence is cut.
-    expect(turn.pcm.length).toBe((2 + 20 + 47 + 20 + 3) * WINDOW);
-    expect(turn.pcm[0]).toBe(1);
-    expect(turn.pcm[2 * WINDOW]).toBe(1000);
-  });
-
-  it('drops a turn with less than 400 ms of speech', () => {
-    const onDrop = vi.fn();
-    const d = detector({ onDrop });
-    feed(d, 12, true); // 384 ms
-    expect(feed(d, 79, false)).toEqual([]);
-    expect(onDrop).toHaveBeenCalledWith(384);
-    expect(d.active).toBe(false);
-    feed(d, 13, true); // 416 ms
-    expect(feed(d, 79, false)).toHaveLength(1);
-  });
-
-  it('ends a turn that runs past the longest turn, and forgets everything on reset', () => {
-    const d = detector({ maxTurnMs: 1000 });
-    const turns = feed(d, 40, true);
-    expect(turns).toHaveLength(1);
-    feed(d, 5, true);
-    expect(d.active).toBe(true);
-    d.reset();
-    expect(d.active).toBe(false);
-    expect(feed(d, 79, false)).toEqual([]);
-  });
-});
-
-/** A WalkieCall over fakes, with every effect recorded in order. */
-function walkieHarness(overrides: Partial<WalkieDeps> = {}) {
-  const effects: string[] = [];
-  const states: WalkieState[] = [];
-  const sent: string[] = [];
-  const played: SpeechAudio[] = [];
-  let transcript = 'hello there';
-  const plays: Array<() => void> = [];
-  let autoPlay = true;
-  const deps: WalkieDeps = {
-    transcribe: vi.fn(async () => {
-      effects.push('transcribe');
-      return transcript;
-    }),
-    send: vi.fn(async (text: string) => {
-      effects.push(`send:${text}`);
-      sent.push(text);
-      return true;
-    }),
-    synthesize: vi.fn(async (text: string) => ({ pcm: new Int16Array([text.length]), sampleRate: 24_000 })),
-    play: vi.fn((audio: SpeechAudio) => {
-      effects.push(`play:${audio.pcm[0]}`);
-      played.push(audio);
-      return autoPlay ? Promise.resolve() : new Promise<void>((r) => plays.push(r));
-    }),
-    caption: vi.fn((role: string, text: string) => effects.push(`caption:${role}:${text}`)),
-    setState: (s) => states.push(s),
-    log: { info: () => undefined, warn: () => undefined },
-    ...overrides,
-  };
-  const call = new WalkieCall(deps, { silenceMs: 2500, playbackTailMs: 0 });
-  const speak = (windows = 20) => {
-    for (let i = 0; i < windows; i++) call.onAudio(window(1000), true);
-  };
-  const silence = (windows = 79) => {
-    for (let i = 0; i < windows; i++) call.onAudio(window(1), false);
-  };
-  return {
-    call,
-    deps,
-    effects,
-    states,
-    sent,
-    played,
-    speak,
-    silence,
-    setTranscript: (t: string) => (transcript = t),
-    holdPlayback: () => (autoPlay = false),
-    finishPlay: () => plays.shift()?.(),
-  };
-}
-
-describe('WalkieCall', () => {
-  afterEach(() => vi.useRealTimers());
-
-  it('sends a finished turn as its transcript and shows sending, then thinking', async () => {
-    const w = walkieHarness();
-    expect(w.states).toEqual(['listening']);
-    w.speak();
-    w.silence(40);
-    expect(w.deps.transcribe).not.toHaveBeenCalled();
-    w.silence(39);
-    await vi.waitFor(() => expect(w.sent).toEqual(['hello there']));
-    expect(w.effects).toEqual(['transcribe', 'caption:caller:hello there', 'send:hello there']);
-    expect(w.states).toEqual(['listening', 'sending', 'thinking']);
-    w.call.close();
-  });
-
-  it('drops a turn whose transcript is empty', async () => {
-    const w = walkieHarness();
-    w.setTranscript('');
-    w.speak();
-    w.silence();
-    await flush();
-    expect(w.deps.transcribe).toHaveBeenCalledTimes(1);
-    expect(w.deps.send).not.toHaveBeenCalled();
-    expect(w.states.at(-1)).toBe('listening');
-  });
-
-  it('ignores the caller while a reply plays, and keeps follow-ups while the agent thinks', async () => {
-    const w = walkieHarness();
-    w.holdPlayback();
-    w.speak();
-    w.silence();
-    await vi.waitFor(() => expect(w.sent).toHaveLength(1));
-    // Still thinking: a follow-up turn is its own message.
-    w.setTranscript('and one more thing');
-    w.speak();
-    w.silence();
-    await vi.waitFor(() => expect(w.sent).toEqual(['hello there', 'and one more thing']));
-
-    w.call.onReply('Sure.');
-    await vi.waitFor(() => expect(w.deps.play).toHaveBeenCalledTimes(1));
-    expect(w.states.at(-1)).toBe('speaking');
-    // The caller talks over the reply: nothing of it is kept.
-    w.speak(40);
-    w.silence();
-    w.finishPlay();
-    await vi.waitFor(() => expect(w.states.at(-1)).toBe('listening'));
-    w.silence();
-    await flush();
-    expect(w.deps.transcribe).toHaveBeenCalledTimes(2);
-  });
-
-  it('holds a reply until the caller finishes the turn in progress', async () => {
-    const w = walkieHarness();
-    w.speak();
-    w.call.onReply('Here it is.');
-    await flush();
-    expect(w.deps.play).not.toHaveBeenCalled();
-    w.silence();
-    await vi.waitFor(() => expect(w.deps.play).toHaveBeenCalledTimes(1));
-    // The caller's turn went out first, then the reply played.
-    expect(w.effects.indexOf('transcribe')).toBeLessThan(w.effects.indexOf('play:11'));
-  });
-
-  it('plays replies whole, one after another, chunk by chunk in order', async () => {
-    const w = walkieHarness();
-    w.holdPlayback();
-    const long = Array.from({ length: 12 }, (_, i) => `Sentence number ${i + 1} is here and it is long enough.`).join(
-      ' ',
-    );
-    w.call.onReply(long);
-    w.call.onReply('Second reply.');
-    await vi.waitFor(() => expect(w.deps.play).toHaveBeenCalledTimes(1));
-    const chunks = splitForSpeech(long);
-    expect(chunks.length).toBeGreaterThan(1);
-    for (let i = 1; i < chunks.length; i++) {
-      w.finishPlay();
-      await vi.waitFor(() => expect(w.deps.play).toHaveBeenCalledTimes(i + 1));
-    }
-    // Never overlapping: the second reply starts only after the first one's last chunk.
-    w.finishPlay();
-    await vi.waitFor(() => expect(w.deps.play).toHaveBeenCalledTimes(chunks.length + 1));
-    expect(w.played.map((a) => a.pcm[0])).toEqual([...chunks.map((c) => c.length), 'Second reply.'.length]);
-    expect(w.effects.filter((e) => e.startsWith('caption:agent'))).toEqual([
-      `caption:agent:${long}`,
-      'caption:agent:Second reply.',
-    ]);
-    w.finishPlay();
-  });
-
-  it('speaks plain text, never the markdown', async () => {
-    const w = walkieHarness();
-    w.call.onReply('**Done.** See [the doc](https://x.example/doc).');
-    await vi.waitFor(() => expect(w.deps.synthesize).toHaveBeenCalled());
-    expect(w.deps.synthesize).toHaveBeenCalledWith('Done. See the doc.');
-  });
-
-  it('skips a chunk that will not synthesize and plays the rest', async () => {
-    let n = 0;
-    const w = walkieHarness({
-      synthesize: vi.fn(async (text: string) => {
-        if (n++ === 0) throw new Error('500');
-        return { pcm: new Int16Array([text.length]), sampleRate: 24_000 };
-      }),
-    });
-    w.call.onReply('One.');
-    w.call.onReply('Two.');
-    await vi.waitFor(() => expect(w.played.map((a) => a.pcm[0])).toEqual([4]));
-  });
-
-  it('shows the agent thinking while the host says it works, and listening once that stops', () => {
-    vi.useFakeTimers();
-    let t = 0;
-    const w = walkieHarness({ now: () => t });
-    w.call.onThinking();
-    expect(w.states.at(-1)).toBe('thinking');
-    t = 10_001;
-    vi.advanceTimersByTime(10_001);
-    expect(w.states.at(-1)).toBe('listening');
-    w.call.close();
-  });
-});
-
-describe('Gemini transcription', () => {
-  const okText = (parts: unknown[]) =>
-    new Response(JSON.stringify({ candidates: [{ content: { parts } }] }), { status: 200 });
-
-  it('sends the turn inline as 16 kHz WAV with a verbatim prompt and the line vocabulary', async () => {
-    const fetchImpl = vi.fn(async () => okText([{ text: 'thinking...', thought: true }, { text: ' Привіт, Stan ' }]));
-    const pcm = new Int16Array([1, -2, 3]);
-    const text = await transcribe(pcm, {
-      apiKey: 'gk-test',
-      model: 'gemini-3.8-flash',
-      vocabulary: ['NanoClaw', 'Stan'],
-      fetchImpl,
-    });
-    expect(text).toBe('Привіт, Stan');
-    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent');
-    expect((init.headers as Record<string, string>)['x-goog-api-key']).toBe('gk-test');
-    expect(url).not.toContain('gk-test');
-    const body = JSON.parse(String(init.body)) as {
-      contents: Array<{ parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> }>;
-      generationConfig: Record<string, unknown>;
-    };
-    const [prompt, audio] = body.contents[0].parts;
-    expect(prompt.text).toBe(transcriptionPrompt(['NanoClaw', 'Stan']));
-    expect(prompt.text).toContain('Ukrainian or English');
-    expect(prompt.text).toContain('no translation');
-    expect(prompt.text).toContain('NanoClaw, Stan');
-    expect(audio.inlineData!.mimeType).toBe('audio/wav');
-    const wav = Buffer.from(audio.inlineData!.data, 'base64');
-    expect(wav.equals(pcmToWav(pcm, 16_000))).toBe(true);
-    expect(wav.subarray(0, 4).toString('ascii')).toBe('RIFF');
-    expect(wav.readUInt32LE(24)).toBe(16_000);
-    expect(wav.readInt16LE(46)).toBe(-2);
-    expect(body.generationConfig).toEqual({ temperature: 0, thinkingConfig: { thinkingLevel: 'low' } });
-  });
-
-  it('leaves vocabulary and thinking out when there are none to give', async () => {
-    const fetchImpl = vi.fn(async () => okText([{ text: 'hi' }]));
-    await transcribe(new Int16Array(4), { apiKey: 'k', model: 'gemini-3.5-transcribe', vocabulary: [], fetchImpl });
-    const body = JSON.parse(String((fetchImpl.mock.calls[0] as unknown as [string, RequestInit])[1].body)) as {
-      contents: Array<{ parts: Array<{ text?: string }> }>;
-      generationConfig: Record<string, unknown>;
-    };
-    expect(body.contents[0].parts[0].text).not.toContain('Names and terms');
-    expect(body.generationConfig).toEqual({ temperature: 0 });
-  });
-
-  it('reads a noise-only answer as no speech, retries a server error once, and surfaces a refusal', async () => {
-    expect(
-      await transcribe(new Int16Array(4), {
-        apiKey: 'k',
-        model: 'm',
-        vocabulary: [],
-        fetchImpl: async () => okText([{ text: '[silence]' }]),
-      }),
-    ).toBe('');
-    let calls = 0;
-    const flaky = vi.fn(async () => (calls++ === 0 ? new Response('{}', { status: 503 }) : okText([{ text: 'ok' }])));
-    expect(await transcribe(new Int16Array(4), { apiKey: 'k', model: 'm', vocabulary: [], fetchImpl: flaky })).toBe(
-      'ok',
-    );
-    const refused = vi.fn(async () => new Response(JSON.stringify({ error: { message: 'bad key' } }), { status: 400 }));
-    await expect(
-      transcribe(new Int16Array(4), { apiKey: 'k', model: 'm', vocabulary: [], fetchImpl: refused }),
-    ).rejects.toThrow('400 bad key');
-    expect(refused).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe('Gemini speech', () => {
-  const audioResponse = (data: Buffer, mimeType: string) =>
-    new Response(
-      JSON.stringify({
-        candidates: [{ content: { parts: [{ inlineData: { mimeType, data: data.toString('base64') } }] } }],
-      }),
-      { status: 200 },
-    );
-
-  it('asks for audio in the configured voice and decodes raw 24 kHz PCM', async () => {
-    const pcm = Buffer.alloc(6);
-    pcm.writeInt16LE(5, 0);
-    pcm.writeInt16LE(-5, 2);
-    const fetchImpl = vi.fn(async () => audioResponse(pcm, 'audio/L16;codec=pcm;rate=24000'));
-    const out = await synthesize('Привіт.', {
-      apiKey: 'gk',
-      model: 'gemini-3.1-flash-tts-preview',
-      voice: 'Alnilam',
-      fetchImpl,
-    });
-    expect(Array.from(out.pcm)).toEqual([5, -5, 0]);
-    expect(out.sampleRate).toBe(24_000);
-    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toContain('/models/gemini-3.1-flash-tts-preview:generateContent');
-    expect(JSON.parse(String(init.body))).toEqual({
-      contents: [{ role: 'user', parts: [{ text: 'Привіт.' }] }],
-      generationConfig: {
-        responseModalities: ['AUDIO'],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Alnilam' } } },
-      },
-    });
-  });
-
-  it('retries an answer without audio and reads WAV from newer models', async () => {
-    let calls = 0;
-    const wav = pcmToWav(new Int16Array([7, 8]), 22_050);
-    const fetchImpl = vi.fn(async () =>
-      calls++ === 0
-        ? new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'sorry' }] } }] }), { status: 200 })
-        : audioResponse(wav, 'audio/wav'),
-    );
-    const out = await synthesize('Hi.', { apiKey: 'gk', model: 'gemini-3.8-flash-tts', voice: 'Kore', fetchImpl });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(Array.from(out.pcm)).toEqual([7, 8]);
-    expect(out.sampleRate).toBe(22_050);
-    expect(decodeSpeechAudio(wav, '').sampleRate).toBe(22_050);
-  });
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe('speakable text', () => {
@@ -410,14 +80,266 @@ describe('speakable text', () => {
     );
   });
 
-  it('cuts long text at sentence ends into TTS-sized chunks', () => {
-    const text = 'One two three. Four five six! Seven eight nine? Ten.';
-    expect(splitForSpeech(text, 30)).toEqual(['One two three. Four five six!', 'Seven eight nine? Ten.']);
-    const runOn = `${'word '.repeat(30).trim()}, ${'more '.repeat(30).trim()}.`;
-    const chunks = splitForSpeech(runOn, 100);
-    expect(chunks.every((c) => c.length <= 100)).toBe(true);
-    expect(chunks.join(' ').replace(/\s+/g, ' ')).toBe(runOn);
-    expect(splitForSpeech('')).toEqual([]);
+  it('keeps comparisons, decimals and abbreviations as written', () => {
+    expect(speakableText('Version 2.4 costs 3.50 dollars, e.g. cheap. If x < 5 and y > 3 then ok.')).toBe(
+      'Version 2.4 costs 3.50 dollars, e.g. cheap. If x < 5 and y > 3 then ok.',
+    );
+    expect(speakableText('Use <code class="x">this</code> or <br/> that')).toBe('Use this or that.');
+  });
+
+  it('reaches the TTS in sentence batches that keep decimals and abbreviations whole', async () => {
+    // The tokenizer the session's StreamAdapter batches with.
+    const stream = new tokenize.basic.SentenceTokenizer({
+      minTokenLength: 250,
+      maxTokenLength: 400,
+      firstTokenLength: 20,
+    }).stream();
+    const text = `Version 2.4 costs 3.50 dollars, e.g. cheap. ${'Then more words follow here. '.repeat(20)}`;
+    stream.pushText(text);
+    stream.endInput();
+    const tokens: string[] = [];
+    for await (const ev of stream) tokens.push(ev.token);
+    expect(tokens[0]).toBe('Version 2.4 costs 3.50 dollars, e.g. cheap.');
+    expect(tokens.length).toBeGreaterThan(1);
+    expect(tokens.length).toBeLessThan(6);
+    expect(tokens.every((t) => t.length <= 400)).toBe(true);
+    expect(tokens.join(' ').replace(/\s+/g, ' ').trim()).toBe(text.replace(/\s+/g, ' ').trim());
+  });
+});
+
+describe('helpers', () => {
+  it('names why the host did not take a turn', () => {
+    expect(hostLossReason({ accepted: false, status: 429 })).toBe('rate_limited');
+    expect(hostLossReason({ accepted: false, status: 409 })).toBe('rejected');
+    expect(hostLossReason({ accepted: false, error: 'The operation was aborted due to timeout' })).toBe('timeout');
+  });
+
+  it('reads the language of a transcript from its script', () => {
+    expect(languageOf('Привіт, як справи?')).toBe('uk');
+    expect(languageOf('check the grafana logs')).toBe('en');
+    expect(languageOf('1, 2, 3')).toBeUndefined();
+  });
+
+  it('dedupes the vocabulary and caps it with a warning', () => {
+    const warn = vi.fn();
+    expect(sttVocabulary([' grafana ', 'Grafana', 'NanoClaw', '', 'nanoclaw'], { warn })).toEqual([
+      'grafana',
+      'NanoClaw',
+    ]);
+    expect(warn).not.toHaveBeenCalled();
+    const many = Array.from({ length: 130 }, (_, i) => `term${i}`);
+    const capped = sttVocabulary(many, { warn });
+    expect(capped).toHaveLength(MAX_VOCABULARY_TERMS);
+    expect(capped[0]).toBe('term0');
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+function audioFrames(ms: number, value = 0) {
+  const samples = (16 * ms) | 0;
+  return new AudioFrame(new Int16Array(samples).fill(value), 16_000, 1, samples);
+}
+
+describe('GeminiTranscribeSTT', () => {
+  const answer = {
+    steps: [
+      {
+        content: [
+          { type: 'thought', text: 'x' },
+          { type: 'text', text: 'Привіт, grafana' },
+        ],
+      },
+    ],
+  };
+
+  it('sends the speech as WAV to the unary model, verbatim, with languages and vocabulary', async () => {
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => Response.json(answer));
+    const onRequest = vi.fn();
+    const unary = new GeminiTranscribeSTT({
+      apiKey: 'gk',
+      model: 'gemini-3.5-transcribe',
+      vocabulary: ['grafana'],
+      shouldServe: () => true,
+      onRequest,
+      fetchImpl,
+    });
+    const ev = await unary.recognize([audioFrames(100), audioFrames(100)]);
+    expect(ev.alternatives?.[0]?.text).toBe('Привіт, grafana');
+    expect(ev.alternatives?.[0]?.language).toBe('uk');
+    expect(onRequest).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe('https://generativelanguage.googleapis.com/v1beta/interactions');
+    expect((init?.headers as Record<string, string>)['x-goog-api-key']).toBe('gk');
+    const body = JSON.parse(String(init?.body)) as {
+      model: string;
+      input: Array<{ type: string; data: string; mime_type: string }>;
+      generation_config: unknown;
+    };
+    expect(body.model).toBe('gemini-3.5-transcribe');
+    expect(body.generation_config).toEqual({
+      transcription_config: { language_codes: ['uk-UA', 'en-US'], custom_vocabulary: ['grafana'], mode: 'verbatim' },
+    });
+    expect(body.input[0]).toMatchObject({ type: 'audio', mime_type: 'audio/wav' });
+    const wav = Buffer.from(body.input[0].data, 'base64');
+    expect(wav.subarray(0, 4).toString()).toBe('RIFF');
+    expect(wav.length).toBe(44 + 2 * 3200);
+  });
+
+  it('sends nothing while the streaming transcription works, and reports refusals', async () => {
+    const fetchImpl = vi.fn(async () => Response.json({ error: { message: 'quota' } }, { status: 429 }));
+    let serve = false;
+    const unary = new GeminiTranscribeSTT({
+      apiKey: 'gk',
+      model: 'gemini-3.5-transcribe',
+      vocabulary: [],
+      shouldServe: () => serve,
+      fetchImpl,
+    });
+    expect((await unary.recognize(audioFrames(100))).alternatives?.[0]?.text).toBe('');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    serve = true;
+    await expect(unary.recognize(audioFrames(100))).rejects.toThrow('Gemini transcribe: 429 quota');
+  });
+
+  it('reads the text parts of an Interactions answer', () => {
+    expect(interactionText(answer)).toBe('Привіт, grafana');
+    expect(interactionText(null)).toBe('');
+  });
+});
+
+function fakeWalkieDeps(overrides: Partial<WalkieDeps> = {}) {
+  const said: string[] = [];
+  const sent: string[] = [];
+  const statuses: boolean[] = [];
+  const deps: WalkieDeps = {
+    send: vi.fn(async (text: string) => {
+      sent.push(text);
+      return { accepted: true, id: String(sent.length) };
+    }),
+    say: vi.fn(async (text: string) => {
+      said.push(text);
+      return true;
+    }),
+    setThinking: (thinking) => statuses.push(thinking),
+    log: { info: () => undefined, warn: () => undefined },
+    ...overrides,
+  };
+  return { deps, said, sent, statuses };
+}
+
+describe('Walkie', () => {
+  it('sends turns in order and shows thinking until a reply, then speaks it as plain text', async () => {
+    vi.useFakeTimers();
+    const { deps, said, sent, statuses } = fakeWalkieDeps();
+    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
+    const results: unknown[] = [];
+    walkie.onTurn('book a table', (r) => results.push(r));
+    walkie.onTurn('for two');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual(['book a table', 'for two']);
+    expect(results).toEqual([{ accepted: true, id: '1' }]);
+    expect(statuses).toEqual([false, true]);
+    walkie.onReply('**Booked** for [eight](https://x.y).');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(said).toEqual(['Booked for eight.']);
+    expect(statuses.at(-1)).toBe(false);
+  });
+
+  it('drops thinking after a while without typing ticks, and holds it while they come', async () => {
+    vi.useFakeTimers();
+    const { deps, statuses } = fakeWalkieDeps();
+    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
+    walkie.onTurn('thanks');
+    await vi.advanceTimersByTimeAsync(AWAIT_REPLY_MS - 1000);
+    walkie.onThinking();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(statuses.at(-1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(statuses.at(-1)).toBe(false);
+  });
+
+  it('holds a reply while the caller talks and until their turn could still be committed', async () => {
+    vi.useFakeTimers();
+    const { deps, said } = fakeWalkieDeps();
+    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
+    walkie.onCallerSpeaking(true);
+    walkie.onReply('First.');
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(said).toEqual([]);
+    walkie.onCallerSpeaking(false);
+    await vi.advanceTimersByTimeAsync(SILENCE);
+    expect(said).toEqual([]);
+    // The committed turn frees the channel at once.
+    walkie.onTurn('and another thing');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(said).toEqual(['First.']);
+
+    // A caller who stops and never gets a turn committed (a cough) frees it after the settle time.
+    walkie.onCallerSpeaking(true);
+    walkie.onCallerSpeaking(false);
+    walkie.onReply('Second.');
+    await vi.advanceTimersByTimeAsync(SILENCE + TURN_SETTLE_MS - 10);
+    expect(said).toEqual(['First.']);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(said).toEqual(['First.', 'Second.']);
+  });
+
+  it('lets a reply take the channel from a caller who never stops', async () => {
+    vi.useFakeTimers();
+    const { deps, said } = fakeWalkieDeps();
+    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
+    walkie.onCallerSpeaking(true);
+    walkie.onReply('Done.');
+    await vi.advanceTimersByTimeAsync(SILENCE + MAX_IDLE_WAIT_MS - 10);
+    expect(said).toEqual([]);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(said).toEqual(['Done.']);
+  });
+
+  it("says it didn't catch a turn the host refused or the STT lost, in the caller's language, once", async () => {
+    const { deps, said } = fakeWalkieDeps({ send: async () => ({ accepted: false, status: 429 }) });
+    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
+    walkie.onTurnLost('no transcript');
+    walkie.onTurnLost('no transcript');
+    await walkie.idle();
+    expect(said).toEqual([FAILURE_LINES.turn.uk]);
+    walkie.onTurn('what about the logs');
+    await walkie.idle();
+    expect(said).toEqual([FAILURE_LINES.turn.uk, FAILURE_LINES.turn.en]);
+  });
+
+  it('says so when a reply could not be synthesized, and keeps speaking after a failure', async () => {
+    const said: string[] = [];
+    let calls = 0;
+    const { deps } = fakeWalkieDeps({
+      say: async (text) => {
+        calls++;
+        if (calls === 1) return false;
+        if (calls === 3) throw new Error('room gone');
+        said.push(text);
+        return true;
+      },
+    });
+    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'en' });
+    walkie.onReply('Reply one.');
+    await walkie.idle();
+    expect(said).toEqual([FAILURE_LINES.reply.en]);
+    walkie.onReply('Reply two.');
+    walkie.onReply('Reply three.');
+    await walkie.idle();
+    expect(said).toEqual([FAILURE_LINES.reply.en, 'Reply three.']);
+  });
+
+  it('stays silent once closed', async () => {
+    const { deps, said, sent } = fakeWalkieDeps();
+    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
+    walkie.close();
+    walkie.onTurn('hello');
+    walkie.onReply('Hi.');
+    walkie.onTurnLost('x');
+    await walkie.idle();
+    expect(sent).toEqual([]);
+    expect(said).toEqual([]);
   });
 });
 
@@ -440,47 +362,61 @@ describe('HostLink', () => {
     expect(fetchImpl.mock.calls[0][0]).toBe('http://127.0.0.1:3001/webhook/voice/livekit/agent/events?call=c1');
     expect(events).toEqual([{ type: 'reply', text: 'hi' }, { type: 'ping' }, { type: 'end', reason: 'hangup' }]);
   });
-
-  it('rejects job metadata that is not a walkie-talkie call', () => {
-    expect(() => parseJobMetadata('{}')).toThrow();
-    expect(() => parseJobMetadata('not json')).toThrow();
-    expect(() => parseJobMetadata(JSON.stringify({ ...META, v: 1 }))).toThrow();
-    expect(parseJobMetadata(JSON.stringify(META)).callId).toBe('call-1');
-  });
 });
 
 const META: LiveKitJobMetadata = {
-  v: 2,
+  v: LIVEKIT_PROTOCOL_VERSION,
   callId: 'call-1',
   lineId: 'voice:abc',
   agentName: 'Andy',
   callerName: 'Ethan',
   callerIdentity: 'caller-1',
   vocabulary: ['NanoClaw'],
-  sttModel: 'gemini-3.8-flash',
-  ttsModel: 'gemini-3.1-flash-tts-preview',
+  sttModel: 'gemini-3.5-transcribe-live',
+  sttFallbackModel: 'gemini-3.5-transcribe',
+  ttsModel: 'gemini-3.8-flash-tts',
+  ttsFallbackModel: 'gemini-3.8-flash-lite-tts',
   ttsVoice: 'Alnilam',
   silenceMs: 2500,
   maxDurationMs: 60_000,
   joinTimeoutMs: 1000,
 };
 
+describe('job metadata', () => {
+  it('takes only a walkie-talkie call of this version as a call to run', () => {
+    expect(() => parseJobMetadata('{}')).toThrow();
+    expect(() => parseJobMetadata('not json')).toThrow();
+    expect(() => parseJobMetadata(JSON.stringify({ ...META, v: 2 }))).toThrow();
+    expect(parseJobMetadata(JSON.stringify(META)).callId).toBe('call-1');
+  });
+
+  it('reads enough of any version to answer it', () => {
+    expect(readJobHeader(JSON.stringify({ ...META, v: 2 }))).toEqual({
+      v: 2,
+      callId: 'call-1',
+      callerIdentity: 'caller-1',
+      agentName: 'Andy',
+    });
+    expect(() => readJobHeader(JSON.stringify({ v: 2 }))).toThrow();
+  });
+});
+
 function fakeJob(meta: Record<string, unknown> = { ...META }) {
-  const shutdownCallbacks: Array<() => Promise<void>> = [];
+  const roomHandlers = new Map<string, (p: { identity: string }) => void>();
   const job = {
     job: { metadata: JSON.stringify(meta) },
-    room: {},
+    room: { on: vi.fn((event: string, fn: (p: { identity: string }) => void) => roomHandlers.set(event, fn)) },
     connect: vi.fn(async () => undefined),
     waitForParticipant: vi.fn(async () => ({ identity: 'caller-1' })),
     deleteRoom: vi.fn(async () => undefined),
     shutdown: vi.fn(),
-    addShutdownCallback: vi.fn((cb: () => Promise<void>) => shutdownCallbacks.push(cb)),
+    addShutdownCallback: vi.fn(),
   };
-  return { job, ctx: job as unknown as CallJob, shutdownCallbacks };
+  return { job, ctx: job as unknown as CallJob, roomHandlers };
 }
 
-/** The host over fetch (routes by path, an NDJSON event stream fed by `emit`) and Gemini behind it. */
-function fakeHostFetch(joinedStatus = 200) {
+/** The host over fetch: routes by path, an NDJSON event stream fed by `emit`. */
+function fakeHostFetch(joinedStatus = 200, utteranceStatus = 202) {
   const calls: Array<{ url: string; auth: string | undefined; body: Record<string, unknown> | null }> = [];
   let push!: (line: string) => void;
   let endStream!: () => void;
@@ -493,38 +429,37 @@ function fakeHostFetch(joinedStatus = 200) {
   const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
-    if (url.includes(':generateContent')) {
-      const config = body?.generationConfig as { responseModalities?: string[] } | undefined;
-      const part = config?.responseModalities
-        ? { inlineData: { mimeType: 'audio/L16;rate=24000', data: Buffer.alloc(960).toString('base64') } }
-        : { text: 'Book a table' };
-      return new Response(JSON.stringify({ candidates: [{ content: { parts: [part] } }] }), { status: 200 });
-    }
     const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
     calls.push({ url, auth, body });
     if (url.includes('/events')) return new Response(stream, { status: 200 });
     if (url.endsWith('/joined')) return new Response('{}', { status: joinedStatus });
-    if (url.endsWith('/utterance')) return new Response(JSON.stringify({ id: '1' }), { status: 202 });
+    if (url.endsWith('/utterance')) return new Response(JSON.stringify({ id: '1' }), { status: utteranceStatus });
     return new Response(null, { status: 204 });
   });
   return { fetchImpl, calls, emit: (e: unknown) => push(JSON.stringify(e)), endStream };
 }
 
-function fakeMedia() {
-  let handlers!: Parameters<CallMedia['start']>[0];
-  const media = {
-    start: vi.fn((h: Parameters<CallMedia['start']>[0]) => {
-      handlers = h;
-    }),
-    play: vi.fn(async () => undefined),
-    caption: vi.fn(),
-    setState: vi.fn(),
+function fakeVoice() {
+  let events!: CallVoiceEvents;
+  const voice = {
+    say: vi.fn(async (_text: string) => true),
+    setThinking: vi.fn(),
+    publishTurn: vi.fn(),
     close: vi.fn(async () => undefined),
-    get handlers() {
-      return handlers;
+  } satisfies CallVoice;
+  const createVoice = vi.fn(
+    async (_ctx: CallJob, _meta: LiveKitJobMetadata, _settings: VoiceSettings, e: CallVoiceEvents) => {
+      events = e;
+      return voice;
+    },
+  );
+  return {
+    voice,
+    createVoice,
+    get events() {
+      return events;
     },
   };
-  return media;
 }
 
 const ENV = {
@@ -533,20 +468,29 @@ const ENV = {
   LIVEKIT_HOST_URL: 'http://127.0.0.1:3555',
 };
 const silentLog = { info: () => undefined, warn: () => undefined };
+const deps = (fetchImpl: typeof fetch, createVoice: ReturnType<typeof fakeVoice>['createVoice'], extra = {}) => ({
+  env: ENV as Record<string, string | undefined>,
+  fetchImpl,
+  createVoice,
+  markUpdating: vi.fn(async () => undefined),
+  log: silentLog,
+  ...extra,
+});
 
 describe('runCall', () => {
   it('runs a call: caller joins, host says yes, turns go out, replies are spoken, host end closes all', async () => {
     const { job, ctx } = fakeJob({ ...META, hostUrl: 'http://169.254.169.254', secret: 'from-dispatch' });
     const host = fakeHostFetch();
-    const media = fakeMedia();
-    const createMedia = vi.fn(async () => media);
-    await runCall(ctx, { env: ENV, fetchImpl: host.fetchImpl, createMedia, log: silentLog });
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
 
     expect(job.waitForParticipant).toHaveBeenCalledWith('caller-1');
-    expect(createMedia).toHaveBeenCalledWith(ctx, expect.objectContaining({ callId: 'call-1' }), {
-      identity: 'caller-1',
-    });
-    expect(media.setState).toHaveBeenCalledWith('listening');
+    expect(v.createVoice).toHaveBeenCalledWith(
+      ctx,
+      expect.objectContaining({ callId: 'call-1' }),
+      { geminiKey: 'gk-test', record: false },
+      v.events,
+    );
     // The host address and secret come from the worker's settings, never from the dispatch.
     const secret = liveKitCallSecret('lk-secret', 'call-1');
     for (const call of host.calls) {
@@ -554,27 +498,42 @@ describe('runCall', () => {
       expect(call.auth).toBe(`Bearer ${secret}`);
     }
 
-    for (let i = 0; i < 20; i++) media.handlers.onWindow(window(1000), true);
-    for (let i = 0; i < 79; i++) media.handlers.onWindow(window(1), false);
+    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
     await vi.waitFor(() =>
       expect(host.calls.find((c) => c.url.endsWith('/utterance'))?.body).toEqual({
         callId: 'call-1',
         text: 'Book a table',
       }),
     );
-    expect(media.caption).toHaveBeenCalledWith('caller', 'Book a table');
+    expect(v.voice.setThinking).toHaveBeenCalledWith(true);
+    expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' });
 
     host.emit({ type: 'reply', text: 'Booked for eight.' });
-    await vi.waitFor(() => expect(media.play).toHaveBeenCalledTimes(1));
-    expect(media.caption).toHaveBeenCalledWith('agent', 'Booked for eight.');
-    expect(media.setState).toHaveBeenCalledWith('speaking');
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked for eight.'));
 
     host.emit({ type: 'end', reason: 'hangup' });
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
-    expect(media.close).toHaveBeenCalled();
+    expect(v.voice.close).toHaveBeenCalled();
     expect(job.deleteRoom).toHaveBeenCalled();
     // The host ended it, so the worker does not report back.
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+  });
+
+  it('speaks the lost-turn line when the host refuses a turn', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch(200, 429);
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    v.events.onTurn('Привіт', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.turn.uk));
+    expect(v.voice.publishTurn).toHaveBeenCalledWith({
+      turn: 1,
+      status: 'lost',
+      reason: 'rate_limited',
+      text: 'Привіт',
+    });
+    v.events.onTurnLost('stt', { speechMs: 1200 }, { sttModel: 'gemini-3.5-transcribe-live' });
+    expect(v.voice.publishTurn).toHaveBeenLastCalledWith({ turn: 2, status: 'lost', reason: 'stt' });
   });
 
   it('names the host URL when the host is unreachable at join', async () => {
@@ -583,7 +542,8 @@ describe('runCall', () => {
     const fetchImpl = vi.fn(async () => {
       throw new TypeError('fetch failed');
     });
-    await runCall(ctx, { env: ENV, fetchImpl, createMedia: vi.fn(), log: { info: () => undefined, warn } });
+    const v = fakeVoice();
+    await runCall(ctx, deps(fetchImpl, v.createVoice, { log: { info: () => undefined, warn } }));
     expect(warn).toHaveBeenCalledWith('voice worker: ending the call', {
       callId: 'call-1',
       hostUrl: 'http://127.0.0.1:3555',
@@ -592,12 +552,12 @@ describe('runCall', () => {
     expect(job.shutdown).toHaveBeenCalledWith('host refused the call (unreachable)');
   });
 
-  it('publishes nothing when the host refuses the call', async () => {
+  it('starts no session when the host refuses the call', async () => {
     const { job, ctx } = fakeJob();
     const host = fakeHostFetch(409);
-    const createMedia = vi.fn(async () => fakeMedia());
-    await runCall(ctx, { env: ENV, fetchImpl: host.fetchImpl, createMedia, log: silentLog });
-    expect(createMedia).not.toHaveBeenCalled();
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    expect(v.createVoice).not.toHaveBeenCalled();
     expect(host.calls.at(-1)).toMatchObject({ body: { callId: 'call-1', reason: 'host refused the call (409)' } });
     expect(job.deleteRoom).toHaveBeenCalled();
     expect(job.shutdown).toHaveBeenCalledWith('host refused the call (409)');
@@ -607,115 +567,210 @@ describe('runCall', () => {
     const { job, ctx } = fakeJob({ ...META, joinTimeoutMs: 20 });
     job.waitForParticipant.mockImplementation(() => new Promise(() => undefined));
     const host = fakeHostFetch();
-    const createMedia = vi.fn(async () => fakeMedia());
-    await runCall(ctx, { env: ENV, fetchImpl: host.fetchImpl, createMedia, log: silentLog });
-    expect(createMedia).not.toHaveBeenCalled();
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    expect(v.createVoice).not.toHaveBeenCalled();
     expect(job.shutdown).toHaveBeenCalledWith('caller never joined');
   });
 
   it('refuses to start without the LiveKit secret it derives the host credential from', async () => {
     const { job, ctx } = fakeJob();
     const host = fakeHostFetch();
-    await runCall(ctx, {
-      env: { ...ENV, LIVEKIT_API_SECRET: undefined },
-      fetchImpl: host.fetchImpl,
-      createMedia: vi.fn(),
-      log: silentLog,
-    });
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice, { env: { ...ENV, LIVEKIT_API_SECRET: undefined } }));
     expect(job.connect).not.toHaveBeenCalled();
     expect(job.shutdown).toHaveBeenCalledWith('LIVEKIT_API_SECRET is not set for the worker');
   });
 
-  it('reports the end to the host when the host link drops or the caller leaves', async () => {
+  it('records each turn with its outcome once the host answered, when recordings are on', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'walkie-rec-'));
+    try {
+      const { ctx } = fakeJob();
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      await runCall(
+        ctx,
+        deps(host.fetchImpl, v.createVoice, {
+          env: { ...ENV, WALKIE_RECORDINGS_DAYS: '7' },
+          recordingsRoot: root,
+        }),
+      );
+      expect(v.createVoice.mock.calls[0][2]).toMatchObject({ record: true });
+      const audio = (startedAt: number, sttModel = 'gemini-3.5-transcribe-live'): TurnTake => ({
+        audio: {
+          pcm: new Int16Array(1600),
+          sampleRate: 16_000,
+          startedAt,
+          endedAt: startedAt + 100,
+          speechMs: 80,
+          truncated: false,
+        },
+        sttModel,
+      });
+      const at = Date.UTC(2026, 9, 2, 12, 0, 0);
+      v.events.onTurn('Book a table', audio(at));
+      v.events.onTurnLost('empty', { speechMs: 900 }, audio(at + 1000, 'gemini-3.5-transcribe'));
+      v.events.onTurnDropped(audio(at + 2000));
+      const dir = path.join(root, 'Andy', '2026-10-02');
+      await vi.waitFor(() => expect(fs.readdirSync(dir).sort()).toHaveLength(6));
+      const first = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-1.json'), 'utf8')) as TurnRecord;
+      expect(first).toMatchObject({
+        callId: 'call-1',
+        lineId: 'voice:abc',
+        agent: 'Andy',
+        turn: 1,
+        startedAt: '2026-10-02T12:00:00.000Z',
+        sttModel: 'gemini-3.5-transcribe-live',
+        transcript: 'Book a table',
+        host: { accepted: true, status: 202, id: '1' },
+      });
+      const lost = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-2.json'), 'utf8')) as TurnRecord;
+      expect(lost).toMatchObject({ turn: 2, transcript: '', reason: 'empty', sttModel: 'gemini-3.5-transcribe' });
+      const noise = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-3.json'), 'utf8')) as TurnRecord;
+      expect(noise).toMatchObject({ turn: 3, reason: 'noise' });
+      expect(fs.readFileSync(path.join(dir, 'call-1-1.wav')).subarray(0, 4).toString()).toBe('RIFF');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('tells the page it is updating when the host speaks another version, then lets the host end it', async () => {
+    vi.useFakeTimers();
+    const { job, ctx } = fakeJob({ ...META, v: 2 });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const d = deps(host.fetchImpl, v.createVoice);
+    const done = runCall(ctx, d);
+    await vi.advanceTimersByTimeAsync(5000);
+    await done;
+    expect(d.markUpdating).toHaveBeenCalledWith(ctx);
+    expect(v.createVoice).not.toHaveBeenCalled();
+    expect(host.calls.at(-1)).toMatchObject({
+      url: 'http://127.0.0.1:3555/webhook/voice/livekit/agent/ended',
+      body: { callId: 'call-1', reason: `protocol mismatch: host sent v2, worker speaks v${LIVEKIT_PROTOCOL_VERSION}` },
+    });
+    expect(job.shutdown).toHaveBeenCalled();
+  });
+
+  it('reports the end to the host when the host link drops, the caller leaves or the session closes', async () => {
     const first = fakeJob();
     const host = fakeHostFetch();
-    await runCall(first.ctx, {
-      env: ENV,
-      fetchImpl: host.fetchImpl,
-      createMedia: async () => fakeMedia(),
-      log: silentLog,
-    });
+    await runCall(first.ctx, deps(host.fetchImpl, fakeVoice().createVoice));
     host.endStream();
     await vi.waitFor(() => expect(first.job.shutdown).toHaveBeenCalledWith('host link closed'));
     expect(host.calls.at(-1)).toMatchObject({ body: { reason: 'host link closed' } });
 
     const second = fakeJob();
-    const media = fakeMedia();
-    await runCall(second.ctx, {
-      env: ENV,
-      fetchImpl: fakeHostFetch().fetchImpl,
-      createMedia: async () => media,
-      log: silentLog,
-    });
-    media.handlers.onCallerLeft();
+    await runCall(second.ctx, deps(fakeHostFetch().fetchImpl, fakeVoice().createVoice));
+    second.roomHandlers.get('participantDisconnected')?.({ identity: 'caller-1' });
     await vi.waitFor(() => expect(second.job.shutdown).toHaveBeenCalledWith('caller left'));
+
+    const third = fakeJob();
+    const v = fakeVoice();
+    await runCall(third.ctx, deps(fakeHostFetch().fetchImpl, v.createVoice));
+    v.events.onClosed('session closed: error');
+    await vi.waitFor(() => expect(third.job.shutdown).toHaveBeenCalledWith('session closed: error'));
+    await flush();
   });
 });
 
-describe('host probe', () => {
-  const HOST = 'http://127.0.0.1:3555';
+describe('turn recordings', () => {
+  const frame = (value: number, ms: number) => {
+    const samples = (16 * ms) | 0;
+    return new AudioFrame(new Int16Array(samples).fill(value), 16_000, 1, samples);
+  };
 
-  it("takes the host's 404 for an uncredentialed events request as a running voice host", async () => {
-    const fetchImpl = vi.fn(async () => new Response('No such call', { status: 404 }));
-    expect(await probeHost(HOST, fetchImpl)).toBeNull();
-    expect(fetchImpl).toHaveBeenCalledWith(`${HOST}/webhook/voice/livekit/agent/events`, expect.anything());
-    const init = (fetchImpl.mock.calls[0] as unknown[])[1] as RequestInit;
-    expect(init.headers).toBeUndefined();
+  it('captures a turn from just before the speech to just after it, and starts over', () => {
+    let now = 10_000;
+    const capture = new TurnCapture(() => now);
+    expect(capture.take()).toBeUndefined();
+    for (let i = 0; i < 10; i++) capture.push(frame(1, 100)); // a second of quiet: only 300 ms kept
+    capture.onSpeaking(true);
+    for (let i = 0; i < 5; i++) capture.push(frame(9, 100));
+    capture.push(frame(1, 550)); // the VAD ends speech after this much silence
+    capture.onSpeaking(false);
+    for (let i = 0; i < 25; i++) capture.push(frame(1, 100)); // the silence that ends the turn
+    now = 20_000;
+    const audio = capture.take()!;
+    expect(audio.sampleRate).toBe(16_000);
+    expect(audio.pcm.length).toBe(16 * (300 + 500 + 300));
+    expect(audio.speechMs).toBe(500);
+    expect(audio.startedAt).toBe(10_000 - 300);
+    expect(audio.endedAt).toBe(10_000 - 300 + 1100);
+    expect(audio.pcm[16 * 300]).toBe(9);
+    expect(capture.take()).toBeUndefined();
   });
 
-  it('names what is wrong otherwise', async () => {
-    const status = (code: number) => async () => new Response('', { status: code });
-    expect(
-      await probeHost(HOST, async () => {
-        throw new TypeError('fetch failed');
-      }),
-    ).toBe('is unreachable (fetch failed)');
-    expect(await probeHost(HOST, status(403))).toContain('GPT_LIVE_ALLOW_NON_LOOPBACK');
-    expect(await probeHost(HOST, status(503))).toContain('not running');
-    expect(await probeHost(HOST, status(200))).toContain('not a NanoClaw voice host');
+  it('turns any input rate into 16 kHz', () => {
+    const capture = new TurnCapture();
+    capture.onSpeaking(true);
+    for (let i = 0; i < 10; i++) {
+      capture.push(new AudioFrame(new Int16Array(480).fill(5), 48_000, 1, 480));
+    }
+    const audio = capture.take()!;
+    // 100 ms in; the resampler holds a little back until more audio comes.
+    expect(audio.pcm.length).toBeGreaterThan(900);
+    expect(audio.pcm.length).toBeLessThanOrEqual(1600);
   });
 
-  it('logs the URL, reports an unreachable host once with the fix, and re-probes until it answers', async () => {
-    vi.useFakeTimers();
+  it('writes owner-only files under agent and day, and prunes old ones with their empty folders', async () => {
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'walkie-rec-')), 'voice-recordings');
     try {
-      let up = false;
-      const fetchImpl = vi.fn(async () => {
-        if (!up) throw new TypeError('fetch failed');
-        return new Response('', { status: 404 });
-      });
-      const log = { info: vi.fn(), error: vi.fn() };
-      const monitor = new HostMonitor(HOST, log, fetchImpl, 30_000);
-      expect(await monitor.start()).toBe(false);
-      expect(log.info).toHaveBeenCalledWith(`voice worker: host URL ${HOST}`);
-      expect(log.error).toHaveBeenCalledTimes(1);
-      expect(log.error.mock.calls[0][0]).toContain(HOST);
-      expect(log.error.mock.calls[0][0]).toContain('set LIVEKIT_HOST_URL in .env');
-      expect(monitor.down).toBe(true);
+      const record: TurnRecord = {
+        callId: 'c/../1',
+        lineId: 'voice:abc',
+        agent: '../Andy Bot',
+        turn: 2,
+        startedAt: '2026-10-02T12:00:00.000Z',
+        endedAt: '2026-10-02T12:00:01.000Z',
+        speechMs: 700,
+        truncated: false,
+        sttModel: 'gemini-3.5-transcribe-live',
+        transcript: 'hello',
+        host: { accepted: true, id: '4', status: 202 },
+      };
+      const audio: TurnAudio = {
+        pcm: new Int16Array(16_000),
+        sampleRate: 16_000,
+        startedAt: 0,
+        endedAt: 1000,
+        speechMs: 700,
+        truncated: false,
+      };
+      const base = await writeTurnRecording(root, record, audio);
+      expect(base).toBe(path.join(root, 'Andy-Bot', '2026-10-02', 'c-1-2'));
+      expect(fs.statSync(`${base}.wav`).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(`${base}.json`).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.dirname(base)).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(root).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(`${base}.wav`).size).toBe(44 + 32_000);
+      expect(JSON.parse(fs.readFileSync(`${base}.json`, 'utf8'))).toEqual(record);
 
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(fetchImpl).toHaveBeenCalledTimes(2);
-      expect(log.error).toHaveBeenCalledTimes(1);
-
-      up = true;
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(monitor.down).toBe(false);
-      expect(log.info).toHaveBeenLastCalledWith(`voice worker: the host at ${HOST} answers again`);
-      await vi.advanceTimersByTimeAsync(120_000);
-      expect(fetchImpl).toHaveBeenCalledTimes(3);
-      monitor.stop();
+      const fresh = await writeTurnRecording(
+        root,
+        { ...record, turn: 3, startedAt: '2026-10-09T12:00:00.000Z' },
+        audio,
+      );
+      const old = Date.now() / 1000 - 10 * 86_400;
+      fs.utimesSync(`${base}.wav`, old, old);
+      fs.utimesSync(`${base}.json`, old, old);
+      expect(await pruneRecordings(root, 7)).toBe(2);
+      expect(fs.existsSync(path.dirname(base))).toBe(false);
+      expect(fs.existsSync(`${fresh}.wav`)).toBe(true);
+      expect(fs.existsSync(root)).toBe(true);
+      expect(await pruneRecordings(path.join(root, 'missing'), 7)).toBe(0);
     } finally {
-      vi.useRealTimers();
+      fs.rmSync(path.dirname(root), { recursive: true, force: true });
     }
   });
 
-  it('shares one probe between concurrent checks', async () => {
-    let answer!: (res: Response) => void;
-    const fetchImpl = vi.fn(() => new Promise<Response>((r) => (answer = r)));
-    const monitor = new HostMonitor(HOST, { info: () => undefined, error: () => undefined }, fetchImpl);
-    const first = monitor.check();
-    const second = monitor.check();
-    answer(new Response('', { status: 404 }));
-    expect(await Promise.all([first, second])).toEqual([true, true]);
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  it('reads the retention setting, off unless a positive whole number of days', () => {
+    expect(recordingDays(undefined)).toBe(0);
+    expect(recordingDays('')).toBe(0);
+    expect(recordingDays('0')).toBe(0);
+    expect(recordingDays('-3')).toBe(0);
+    expect(recordingDays('1.5')).toBe(0);
+    expect(recordingDays(' 14 ')).toBe(14);
+    expect(pathSegment('..')).toBe('unnamed');
   });
 });
