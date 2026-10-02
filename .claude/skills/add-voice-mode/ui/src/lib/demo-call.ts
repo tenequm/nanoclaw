@@ -92,6 +92,7 @@ const REVIEW_SCRIPT: Step[] = [
   { phase: "talking", ms: 2600, review: { draft: { id: 2, state: "ready", text: "Yes, and also remind me to", reason: "agent" } } },
   { phase: "listening", ms: 1800, review: { draft: { id: 2, state: "ready", text: "Yes, and also remind me to", reason: "agent" } } },
   { phase: "listening", ms: 600, review: { draft: { id: 2, state: "ready", text: "Yes, and also remind me to", reason: "agent" }, pending: { op: "discard" } } },
+  { phase: "listening", ms: 900, review: { preparing: true } },
   { phase: "listening", ms: 1500, review: {} },
   { phase: "listening", ms: 1500, review: { draft: { id: 3, state: "recording", text: "" }, micOn: true } },
   { phase: "listening", ms: 2200, review: { draft: { id: 3, state: "empty", text: "" } } },

@@ -34,8 +34,9 @@ Recorded caller turns (`VOICE_RECORDINGS_DAYS`) are under
 
 ## 3. Remove the container skill
 
-`container/skills/` is a read-only mount; the per-group skill symlink is pruned
-on the next spawn:
+`container/skills/` is a read-only mount; the per-group skill symlink and the
+composed `NanoClaw Skill: voice-formatting` section go on each agent's next
+spawn:
 
 ```bash
 rm -rf container/skills/voice-formatting

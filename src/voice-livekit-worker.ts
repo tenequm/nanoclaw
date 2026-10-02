@@ -19,8 +19,8 @@
  *  - each finished turn goes to the host, which hands it to the agent as a
  *    spoken message; nothing in the session answers it;
  *  - each complete agent reply from the host's event stream is spoken with
- *    `session.say()` once the caller is not mid-turn, cut to
- *    VOICE_MAX_SPOKEN_CHARS at a sentence end, uninterruptible: while
+ *    `session.say()` once the caller is not mid-turn, in full (cut at a
+ *    sentence end only when VOICE_MAX_SPOKEN_CHARS sets a cap), uninterruptible: while
  *    it plays, the caller's audio is not transcribed (no barge-in); Gemini
  *    TTS synthesizes the whole reply in one streamed request, through
  *    LiveKit's TTS FallbackAdapter onto a second model.
@@ -151,12 +151,17 @@ const FLUSH_CHUNK_MS = 100;
  */
 export const CLEAR_SETTLE_MS = 300;
 const STALE_STREAM_MS = 2_000;
+/**
+ * The restarted transcription takes no audio until its Gemini session is set up; talk waits for
+ * that, and for no longer than this, so a session that never reports it cannot hold talk shut.
+ */
+export const STT_READY_TIMEOUT_MS = 3_000;
 /** agents-js's session control topic (its TOPIC_SESSION_MESSAGES), served to the caller unless closed. */
 const SESSION_CONTROL_TOPIC = 'lk.agent.session';
 /** Review mode's waits, on the global timers (which tests can fake). */
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-/** VOICE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
-export const DEFAULT_MAX_SPOKEN_CHARS = 800;
+/** VOICE_MAX_SPOKEN_CHARS when unset: 0, no cap; a reply is spoken in full however long it runs. */
+export const DEFAULT_MAX_SPOKEN_CHARS = 0;
 const DAY_MS = 86_400_000;
 
 /** The worker's HTTP client for the host's /webhook/voice/livekit/agent routes. */
@@ -275,7 +280,7 @@ export const CUT_LINES: Record<'chat' | 'no_chat', Record<CallLanguage, string>>
 /** A sentence end earlier than this share of the cap wastes the budget: the cut goes to a word instead. */
 const MIN_SENTENCE_CUT = 0.6;
 
-/** VOICE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default. */
+/** VOICE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default (no cap). */
 export function maxSpokenChars(raw: string | undefined): number {
   const value = raw?.trim();
   if (!value) return DEFAULT_MAX_SPOKEN_CHARS;
@@ -418,6 +423,50 @@ export class GeminiTranscribeSTT extends stt.STT {
 
   stream(): stt.SpeechStream {
     throw new Error('GeminiTranscribeSTT is not streaming; wrap it in a stt.StreamAdapter');
+  }
+}
+
+/**
+ * The streaming transcription, saying when each stream it opens starts taking audio. Gemini's
+ * stream reads its input only once `live.connect` has resolved, which @google/genai holds until the
+ * server's setupComplete; audio pushed before that waits in the stream's queue and reaches the model
+ * late, in a burst. Review talk waits for this so the caller never speaks into a stream still
+ * connecting. `onReading` gets the stream's number (1, 2, ... in opening order) the first time it reads.
+ */
+export class ReadyingGeminiSTT extends google.beta.GeminiSTT {
+  private opened = 0;
+
+  constructor(
+    opts: ConstructorParameters<typeof google.beta.GeminiSTT>[0],
+    private readonly onReading: (stream: number) => void,
+  ) {
+    super(opts);
+  }
+
+  /** Streams opened so far. */
+  get streamsOpened(): number {
+    return this.opened;
+  }
+
+  override stream(options?: Parameters<google.beta.GeminiSTT['stream']>[0]): stt.SpeechStream {
+    const stream = super.stream(options);
+    const number = ++this.opened;
+    // The input queue is the stream's own (protected in agents-js); only its send loop reads it.
+    const input = (stream as unknown as { input?: { next?: (...args: unknown[]) => unknown } }).input;
+    const next = input?.next;
+    if (!input || typeof next !== 'function') {
+      this.onReading(number);
+      return stream;
+    }
+    let told = false;
+    input.next = (...args: unknown[]) => {
+      if (!told) {
+        told = true;
+        this.onReading(number);
+      }
+      return next.apply(input, args);
+    };
+    return stream;
   }
 }
 
@@ -749,8 +798,11 @@ export interface ReviewVoice {
   setInput(enabled: boolean): void;
   /** Feed silence to the transcription, so it finalizes what it has heard. */
   setFlushing(on: boolean): void;
-  /** Drop the session's own open turn; its transcription restarts. Returns the restarted stream's number. */
-  clearTurn(): number;
+  /**
+   * Drop the session's own open turn; its transcription restarts. Returns the restarted stream's
+   * number, and when that stream takes audio (resolved at once when nothing restarts).
+   */
+  clearTurn(): { stream: number; ready: Promise<void> };
   /** How long a flush runs at least. */
   flushMinMs(): number;
   /** The open turn's recording, taken once its text is frozen. */
@@ -1071,6 +1123,10 @@ export class ReviewControl {
   private heardAt = 0;
   private minStream = 0;
   private clearedAt = 0;
+  /** The restarted transcription does not take audio yet: talk waits for `sttReady`. */
+  private preparing = false;
+  private sttReady: Promise<void> = Promise.resolve();
+  private clears = 0;
   private callerSpeaking = false;
   private agentSpeaking = false;
   private sttFailed = false;
@@ -1172,6 +1228,13 @@ export class ReviewControl {
         // An empty draft gives way to a new recording; any other one has to be sent or discarded.
         if (busy && draft?.state !== 'empty') return reply({ error: busy });
         if (this.agentSpeaking) return reply({ error: 'agent_speaking' });
+        // Words spoken before the restarted transcription takes audio are lost: the caller's
+        // microphone opens on this reply, so it comes once the transcription is ready.
+        if (this.preparing) {
+          await this.sttReady;
+          if (this.closed) return reply({ error: 'closed' });
+          if (this.agentSpeaking) return reply({ error: 'agent_speaking' });
+        }
         this.resetHeard();
         this.sttFailed = false;
         this.take = undefined;
@@ -1300,8 +1363,20 @@ export class ReviewControl {
   /** Forget what was heard and clear the session's own open turn, which restarts its transcription. */
   private clear(): void {
     this.resetHeard();
-    this.minStream = this.deps.voice.clearTurn();
+    const { stream, ready } = this.deps.voice.clearTurn();
+    this.minStream = stream;
     this.clearedAt = Date.now();
+    const clear = ++this.clears;
+    this.preparing = true;
+    this.sttReady = Promise.race([ready.then(() => true), pause(STT_READY_TIMEOUT_MS).then(() => false)]).then(
+      (took) => {
+        // A newer clear has its own wait.
+        if (clear !== this.clears) return;
+        if (!took) this.deps.log.warn('voice worker: the restarted transcription did not report ready in time');
+        this.preparing = false;
+        this.publish();
+      },
+    );
   }
 
   private resetHeard(): void {
@@ -1311,7 +1386,12 @@ export class ReviewControl {
 
   private publish(): void {
     if (this.closed) return;
-    this.deps.voice.publishReview({ seq: ++this.seq, mode: this.mode, draft: this.draft });
+    this.deps.voice.publishReview({
+      seq: ++this.seq,
+      mode: this.mode,
+      draft: this.draft,
+      ...(this.preparing ? { preparing: true } : {}),
+    });
   }
 }
 
@@ -1540,13 +1620,24 @@ export function callSession(
   const capture = settings.record ? new TurnCapture() : undefined;
   // The host already trimmed, deduplicated and capped it.
   const vocabulary = meta.vocabulary ?? [];
-  const streaming = new google.beta.GeminiSTT({
-    apiKey,
-    model: meta.sttModel,
-    languageCodes: [...STT_LANGUAGE_CODES],
-    customVocabulary: vocabulary,
-    sampleRate: INPUT_SAMPLE_RATE,
-  });
+  /** Waits for a streaming transcription opened after a clear to take audio. */
+  const readyWaits = new Set<{ after: number; resolve: () => void }>();
+  const streaming = new ReadyingGeminiSTT(
+    {
+      apiKey,
+      model: meta.sttModel,
+      languageCodes: [...STT_LANGUAGE_CODES],
+      customVocabulary: vocabulary,
+      sampleRate: INPUT_SAMPLE_RATE,
+    },
+    (stream) => {
+      for (const wait of readyWaits) {
+        if (wait.after >= stream) continue;
+        readyWaits.delete(wait);
+        wait.resolve();
+      }
+    },
+  );
 
   // The fallback transcribes only while it is the adapter's elected stream. The session goes back
   // to the streaming model once that recovers, or every HAND_BACK_RETRY_MS, always at a pause, so
@@ -1722,6 +1813,8 @@ export function callSession(
   });
   session.on(voice.AgentSessionEventTypes.Close, (ev) => {
     clearInterval(handBackTimer);
+    for (const wait of readyWaits) wait.resolve();
+    readyWaits.clear();
     agent.setFlushing(false);
     countdown.clear();
     // The session closes neither; their recovery probes would run on.
@@ -1752,14 +1845,19 @@ export function callSession(
         agent.setFlushing(on);
       },
       clearTurn() {
+        const opened = streaming.streamsOpened;
         try {
           session.clearUserTurn();
         } catch (err) {
           // Nothing restarts: the stream that runs now stays the current one.
           log.warn('voice worker: could not clear the open turn', { err });
-          return agent.streams;
+          return { stream: agent.streams, ready: Promise.resolve() };
         }
-        return agent.streams + 1;
+        // The fallback transcription takes audio as it comes; the streaming one has to connect first.
+        const ready = fallbackServing()
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => readyWaits.add({ after: opened, resolve }));
+        return { stream: agent.streams + 1, ready };
       },
       flushMinMs: () => (fallbackServing() ? FLUSH_FALLBACK_MIN_MS : FLUSH_MIN_MS),
       takeTurn: take,
@@ -1985,6 +2083,10 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turns = 0;
   /** The newest turn handed to the host. */
   let lastPosted = 0;
+  /** The newest turn the host answered, the newest it took, and the newest the agent picked up or answered. */
+  let lastSettled = 0;
+  let lastAccepted = 0;
+  let pickedUp = 0;
   /** The host's utterance id of each sent turn to its number here, to tell the page what a reply answers. */
   const turnsByHostId = new Map<string, number>();
   /** Turns the host did not confirm, by turn key, until its `turn-stored` says the agent has one after all. */
@@ -2022,6 +2124,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     if (!ending) publish(draft === undefined ? { turn, status: 'sending' } : { turn, status: 'sending', text, draft });
     turnTaking.onTurn(text, (host) => {
       if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
+      lastSettled = Math.max(lastSettled, turn);
+      if (host.accepted) lastAccepted = Math.max(lastAccepted, turn);
       if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {
         unconfirmed.set(host.turnKey, { turn, text });
         for (const key of unconfirmed.keys()) {
@@ -2114,16 +2218,29 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   host
     .events((event) => {
       if (event.type === 'end') void end(`host: ${event.reason}`, false);
-      else if (event.type === 'reply')
+      else if (event.type === 'reply') {
         // A host that sends no turn at all predates reply labels: not known, so no label.
-        turnTaking.onReply(event.text, typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn);
-      else if (event.type === 'thinking') turnTaking.onThinking();
-      else if (event.type === 'chat') turnTaking.onChat(event.chat);
+        const turn = typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn;
+        // Any agent message after the turns the host took answers the "did it get it" question.
+        pickedUp = Math.max(pickedUp, lastAccepted, typeof turn === 'number' ? turn : 0);
+        turnTaking.onReply(event.text, turn);
+      } else if (event.type === 'thinking') turnTaking.onThinking();
+      else if (event.type === 'working') {
+        turnTaking.onThinking();
+        // The runner works on what reached it after the newest turn the host took: the page's
+        // working status, once per turn. While a newer turn awaits the host's answer the pickup could
+        // be read as that one's, so it waits for the next tick.
+        if (lastAccepted > pickedUp && lastSettled === lastPosted) {
+          pickedUp = lastAccepted;
+          publish({ turn: lastAccepted, status: 'working' });
+        }
+      } else if (event.type === 'chat') turnTaking.onChat(event.chat);
       else if (event.type === 'turn-stored') {
         const late = unconfirmed.get(event.turnKey);
         if (!late) return;
         unconfirmed.delete(event.turnKey);
         turnsByHostId.set(event.id, late.turn);
+        lastAccepted = Math.max(lastAccepted, late.turn);
         callLog.info('voice worker: a timed-out turn reached the agent after all', { turn: late.turn });
         // The page's mark for this turn goes from "not confirmed" to "sent".
         publish({ turn: late.turn, status: 'sent', text: late.text });

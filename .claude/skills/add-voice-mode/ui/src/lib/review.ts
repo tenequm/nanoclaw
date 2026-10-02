@@ -26,6 +26,8 @@ export interface ReviewSnapshot {
   seq: number
   mode: TurnMode
   draft: Draft | null
+  /** The worker's transcription restarted after a draft and takes no audio yet; talk waits for it. */
+  preparing?: boolean
 }
 
 export function isReviewSnapshot(v: unknown): v is ReviewSnapshot {
@@ -54,6 +56,8 @@ export interface ReviewState {
   delivery: "sending" | "sent" | "lost" | null
   /** The call ended with this draft unsent: it stays readable until discarded. */
   ended?: boolean
+  /** The worker's transcription is getting ready after a draft (ReviewSnapshot.preparing). */
+  preparing?: boolean
 }
 
 export const INITIAL_REVIEW: ReviewState = {
@@ -75,6 +79,17 @@ export interface KeyView {
   label: string
   action: KeyAction
   disabled: boolean
+}
+
+/**
+ * What a key does, for the page's re-arm guard (a key that just changed what it does ignores taps
+ * for a moment): every hang-up is one thing, so the end key never fades when it keeps ending the
+ * call (cancel becoming end as the call connects, auto's end becoming review's); any other key is
+ * its action on its draft, so a double tap on discard cannot end the call.
+ */
+export function keyIdentity(action: KeyAction | null, draftId?: number): string {
+  if (action === "cancel" || action === "end") return "hangup"
+  return action === null ? "none" : `${action}:${draftId ?? ""}`
 }
 
 export type PanelTone = "hearing" | "finishing" | "draft" | "empty" | "failed" | "long"
@@ -259,6 +274,17 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
     if (!d && !pending) hint = `Tap talk to add a follow-up · waiting ${clock(waited)}`
     else if (d?.state === "recording") hint = "Recording - tap done to review."
     else if (sendable) hint = "Send adds a follow-up."
+  }
+
+  // The worker restarts its transcription after a draft; talk opens once it takes audio again, so
+  // the first words are not lost. The worker holds a talk until then too (at most a few seconds).
+  if (review.preparing && right.action === "talk" && !pending) {
+    right = { ...right, disabled: true }
+    if (phase === "listening") {
+      chip = "Getting ready"
+      tone = ""
+      hint = "Talk opens in a moment."
+    } else if (phase === "thinking") hint = "Talk opens in a moment."
   }
 
   // A switch in flight: the last acknowledged mode stays, nothing else can start.

@@ -281,6 +281,42 @@ describe('composeGroupProjectDoc skill selection', () => {
 
     expect(doc).toContain('# NanoClaw Skill: fixture-gateway');
   });
+
+  // The fork's house style and voice guidance are resident prose, not lazily discovered skills
+  // nor text in the shared base: red if either moves back or stops composing from the real tree.
+  it('composes the shipped house-style and voice-formatting prose, and keeps the base free of it', async () => {
+    const ag = await seed('ag-resident', 'resident-group');
+    const root = fs.mkdtempSync(path.join(TEST_ROOT, 'real-skills-'));
+    fs.mkdirSync(path.join(root, 'container'));
+    for (const entry of ['CLAUDE.md', 'agent-runner', 'skills']) {
+      fs.symlinkSync(path.join(REPO_ROOT, 'container', entry), path.join(root, 'container', entry));
+    }
+    const previousCwd = process.cwd();
+    process.chdir(root);
+
+    try {
+      const doc = await compose(ag);
+      // A composed section runs to the next composed heading; the base has headings of its own.
+      const section = (name: string): string => {
+        const start = doc.indexOf(`# ${name}\n\n`);
+        expect(start).toBeGreaterThanOrEqual(0);
+        const rest = doc.slice(start);
+        const next = rest.slice(1).search(/\n\n# (NanoClaw (Module|Skill): |MCP Server: |Native Runtime Skills\n)/);
+        return next === -1 ? rest : rest.slice(0, next + 1);
+      };
+      const skill = (name: string): string =>
+        fs.readFileSync(path.join(REPO_ROOT, 'container', 'skills', name, 'instructions.md'), 'utf-8').trim();
+
+      expect(section('NanoClaw Skill: house-style')).toContain(skill('house-style'));
+      expect(section('NanoClaw Skill: voice-formatting')).toContain(skill('voice-formatting'));
+      const base = section('NanoClaw Runtime Contract');
+      expect(base).toContain('You are a NanoClaw agent.');
+      expect(base).not.toMatch(/em-dash|house style/i);
+      expect(doc.match(/no em-dash, ever/gi)).toHaveLength(1);
+    } finally {
+      process.chdir(previousCwd);
+    }
+  });
 });
 
 describe('composeGroupProjectDoc cli_scope', () => {

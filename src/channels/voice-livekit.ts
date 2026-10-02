@@ -100,17 +100,27 @@ export const CALL_LANGUAGE_NOTE =
   'The caller speaks Ukrainian or English; a transcript that looks Russian is Ukrainian misspelled by speech ' +
   'recognition, so answer in Ukrainian (in English if the caller spoke English), never in Russian.';
 
+/**
+ * How long a spoken answer runs and how it is shaped for the ear. Every format rule for a spoken reply
+ * lives here, on each turn; the resident voice-formatting instructions carry only what no turn's note can.
+ */
+export const CALL_DEPTH_NOTE =
+  'Match the depth to the question: brief for simple ones; for design, strategy or anything that needs care, ' +
+  'take the time to think and verify, and give the full considered answer in plain speech. Lead with the ' +
+  'answer; for a long one, say how many points there are, then take them one at a time. No markdown, no ' +
+  'links, no code blocks, numbers written as words.';
+
 /** How the agent learns a message was spoken on a call and how its reply will be heard. */
 export const CALL_REPLY_NOTE =
-  'Spoken on a live voice call; your reply is read aloud word for word. Answer in a few short spoken ' +
-  'sentences: no markdown, no links, no code blocks, numbers written as words. Send longer material ' +
-  `as a separate written message to your chat. ${CALL_LANGUAGE_NOTE}`;
+  `Spoken on a live voice call; your reply is read aloud word for word. ${CALL_DEPTH_NOTE} ` +
+  'Send anything meant for reading (code, links, long lists) as a separate written message to your chat. ' +
+  CALL_LANGUAGE_NOTE;
 
 /** The same for a call that talks in a chat, where every message the agent sends there is spoken. */
 export const CALL_CHAT_REPLY_NOTE =
   'Spoken on a live voice call; while it lasts, every message you send to this chat is read aloud word for ' +
-  'word. Answer in a few short spoken sentences: no markdown, no links, no code blocks, numbers written as ' +
-  `words. Offer longer material for after the call instead of sending it now. ${CALL_LANGUAGE_NOTE}`;
+  `word. ${CALL_DEPTH_NOTE} Offer anything meant for reading (code, links, long lists) for after the call ` +
+  `instead of sending it now. ${CALL_LANGUAGE_NOTE}`;
 
 /** The inbound text for one transcribed caller turn. */
 export function turnMessageText(transcript: string, note: string = CALL_REPLY_NOTE): string {
@@ -309,8 +319,12 @@ export interface LiveKitVoice {
     text: string,
     replyTo?: { callId: string; utteranceId: string } | null,
   ): void;
-  /** The agent is working in a chat: tell its live call that talks there. */
-  chatTyping(chat: ChatAddress, agentGroupId: string): void;
+  /**
+   * The agent is working in a chat: tell its live call that talks there. `working`: the runner has
+   * picked up what reached that chat last (the typing module's `TypingTick.working`), which the call
+   * hears whether it talks in that chat or on its own voice line.
+   */
+  chatTyping(chat: ChatAddress, agentGroupId: string, working?: boolean): void;
   /** The running call on a line, for the daily budget. */
   activeCall(platformId: string): { platformId: string; startedAt: number } | undefined;
   teardown(): Promise<void>;
@@ -397,13 +411,13 @@ export function liveKitChatDelivered(
   for (const engine of engines) engine.chatMessage(chat, agentGroupId, text, replyTo);
 }
 
-/** Typing tap: the agent works in a chat; its live call talking there hears it is thinking. */
-export function liveKitChatTyping(chat: ChatAddress, agentGroupId: string): void {
-  for (const engine of engines) engine.chatTyping(chat, agentGroupId);
+/** Typing tap: the agent works in a chat; its live call talking there hears it is thinking, and when it picked a turn up. */
+export function liveKitChatTyping(chat: ChatAddress, agentGroupId: string, working = false): void {
+  for (const engine of engines) engine.chatTyping(chat, agentGroupId, working);
 }
 
 registerPostDeliveryHook((msg, session) => liveKitChatDelivered(msg, session.agent_group_id));
-registerTypingObserver(({ agentGroupId, ...chat }) => liveKitChatTyping(chat, agentGroupId));
+registerTypingObserver(({ agentGroupId, working, ...chat }) => liveKitChatTyping(chat, agentGroupId, working));
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
 
@@ -1144,10 +1158,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       }
     },
 
-    chatTyping(chat, agentGroupId) {
+    chatTyping(chat, agentGroupId, working = false) {
       for (const call of calls.values()) {
         if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
         if (callChatAt(call, chat)) push(call, { type: 'thinking' });
+        // On the voice line itself the adapter's setTyping already says thinking; only the pickup is new.
+        else if (chat.channelType !== 'voice' || chat.platformId !== call.platformId) continue;
+        if (working) push(call, { type: 'working' });
       }
     },
 

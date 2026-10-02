@@ -52,8 +52,8 @@ to say, so it spells them exactly: `VOICE_VOCABULARY` (comma-separated, in
 e.g. `VOICE_VOCABULARY=Acme, Zephyr, k8s`. Both are merged, trimmed and
 deduplicated, and capped at 60 terms and 1 KB. `VOICE_VOCABULARY` is read at
 startup, the file on every call. The agent maintains the file itself: the
-`voice-formatting` container skill tells it to add names a transcript
-misspelled, so read or edit `groups/<folder>/voice.vocabulary.txt` to check
+resident `voice-formatting` instructions (step 3) tell it to add names a
+transcript misspelled, so read or edit `groups/<folder>/voice.vocabulary.txt` to check
 or correct its entries.
 
 The stable channel identifier and URL prefix are `voice`.
@@ -92,14 +92,20 @@ import './voice.js';
 
 ### 3. Teach agents to write for the ear
 
-Replies on this channel are spoken. Mount the formatting skill so every agent
-answers a call in short plain prose. `container/skills/` is mounted read-only
-into every agent container; the skill only changes behaviour when a message
-arrives from a call. Copy it separately so reapplying missing adapter files
-does not overwrite a customized formatting skill:
+Replies on this channel are spoken. The note the host adds under every
+transcribed turn carries the format rules (depth matched to the question, plain
+prose with no markdown, links or code, numbers as words, Ukrainian never
+Russian). What a turn's note cannot carry lives in resident instructions:
+messages that answer no turn, no question cards or attachments, where reading
+material goes, and the vocabulary file. The host composes
+`container/skills/voice-formatting/instructions.md` into every group's
+`CLAUDE.md` at spawn, as the section `NanoClaw Skill: voice-formatting` (a group
+with an explicit skill list needs `voice-formatting` in it), so the agent has it
+before the first call rather than on demand. Copy it separately so reapplying
+missing adapter files does not overwrite customized instructions:
 
 ```nc:copy from-branch:channels
-container/skills/voice-formatting/SKILL.md
+container/skills/voice-formatting/instructions.md
 ```
 
 ### 4. Build
@@ -469,8 +475,9 @@ to the worker with each call:
 | `VOICE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
 | `VOICE_MIRROR` | `telegram` | Channel type of the default call chat, used until `/voice` picks one (see below); `off` keeps calls on the voice line until then. |
 
-The worker itself reads `VOICE_MAX_SPOKEN_CHARS` (default `800`; `0` for no
-cap): an agent message longer than that, after markdown and links are stripped,
+The worker itself reads `VOICE_MAX_SPOKEN_CHARS` (default `0`: no cap, every
+message is spoken in full). Set it to a positive number of characters to cap
+speech: an agent message longer than that, after markdown and links are stripped,
 is spoken up to its last sentence end within the cap when that end is past 60%
 of the cap (else up to its last whole word), followed by "Решта - у чаті." or
 "The rest is in the chat." in the language of the caller's last turn. A call
@@ -527,18 +534,20 @@ TTS, captions and the agent state are the framework's. Then:
   the turn ends; the page shows it as it comes. The worker posts the turn's
   text to `/webhook/voice/livekit/agent/utterance`, and the host hands it to the
   agent in the line's call chat (below) as `<voice source="livekit">…</voice>`
-  plus a line saying the reply is read aloud (short spoken sentences, no
-  markdown, links or code, numbers as words, longer material as a separate
-  written message; in a call chat, that every message sent to the chat during
-  the call is read aloud, so longer material waits for the end of the call).
+  plus a line saying the reply is read aloud (depth matched to the question:
+  brief for simple ones, a full considered answer in plain speech for design,
+  strategy or anything that needs care; no markdown, links or code, numbers as
+  words; anything meant for reading as a separate written message; in a call
+  chat, that every message sent to the chat during the call is read aloud, so
+  anything meant for reading waits for the end of the call).
   Its id is `livekit:<call>:<n>`.
 - Every agent message to the call chat during the call (replies and proactive
   messages; with no call chat, every agent message for the line) goes to the
   worker complete over the host's event stream, and the agent's typing there is
   the worker's "thinking". The worker strips markdown, URLs and tags and speaks
-  it uninterruptibly (`session.say`), cut at `VOICE_MAX_SPOKEN_CHARS` (above),
-  in sentence batches of up to 400
-  characters, two requested at a time: the one playing and the next.
+  it uninterruptibly (`session.say`), in full unless `VOICE_MAX_SPOKEN_CHARS` (above) caps it,
+  synthesized whole in one streamed TTS request (so a very long message waits
+  longer for its first audio).
   Replies never overlap, and a reply waits for a caller who is mid-turn (at most
   `VOICE_SILENCE_MS` plus ten seconds, then it takes the channel).
 - While the agent's audio plays, the caller is not transcribed (no barge-in).
@@ -555,7 +564,11 @@ TTS, captions and the agent state are the framework's. Then:
   is reported on the event stream (`{"type": "turn-stored", "turnKey", "id"}`),
   and the worker corrects the page's mark to "sent". The stream also carries
   `{"type": "chat", "chat": true | false}` when the call starts or stops
-  talking in a chat.
+  talking in a chat, and `{"type": "working"}` on the agent's typing ticks once
+  its runner reports a live `working` turn stamped after the latest message
+  reached its chat (the call chat, or the voice line itself): the agent has
+  picked it up. The first such report goes out at once, not on the next 4 s
+  refresh.
 - When the caller's speech came out as no text the caller hears "Не розчув,
   повтори, будь ласка" or "Sorry, I didn't catch that", in the language of their
   last turn. A turn the host did not confirm (504, or no answer) may still reach
@@ -565,12 +578,17 @@ TTS, captions and the agent state are the framework's. Then:
   one "Too many turns - give it a moment." (and their Ukrainian lines). When a
   reply cannot be synthesized, a line saying so. All of these also show as captions. The
   worker also sends JSON messages per caller turn (noise is not reported) on the text stream topic
-  `nanoclaw.voice.turn`: `{"turn": n, "status": "sending" | "sent" | "lost", "reason"?:
+  `nanoclaw.voice.turn`: `{"turn": n, "status": "sending" | "sent" | "working" | "lost", "reason"?:
   "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
   Every turn handed to the host first gets "sending", once the closing silence
   and the final transcript are in and before the host answers (a turn lost to
   the transcription gets none); "sent" means the agent's session has the turn; a
   504 is "timeout", 429 "rate_limited", any other refusal "rejected".
+  "working" follows "sent" at most once per turn, on the first host `working`
+  after the host took that turn, unless a reply to it came first. When the agent
+  is still busy with an earlier turn, its runner's next re-mark (every 5 s) can
+  stand in for the pickup, so "working" there means "working, with your turn in
+  hand", not "on your turn". The call page takes no action on it.
 - Right before each line it speaks, the worker sends one JSON message on
   `nanoclaw.voice.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
   true, "notice"?: true, "more"?: true}`. `turn` is the caller turn the agent
@@ -701,13 +719,18 @@ draft id it names (a late or repeated one is "stale"), and closes agents-js's
 own session control topic (`lk.agent.session`), which the caller would
 otherwise reach. The worker sends every change of its `CallReviewState` (`{"seq",
 "mode", "draft": {"id", "state": "recording" | "finishing" | "ready" | "empty" |
-"failed", "text", "tooLong"?, "reason"?: "agent" | "switch"}}`) on the topic
-`nanoclaw.voice.review`. In review the session's turn detection is manual and
-its input is off between recordings; after done the transcription gets silence
-until it has finalized what it heard (at most 4 s, past which the rest is
-unverified and the draft cannot be sent), and the draft's text is frozen from
-its final transcripts. Send posts exactly that text through the ordinary turn
-path, and its `sending` status carries the text and the draft id, so the page
+"failed", "text", "tooLong"?, "reason"?: "agent" | "switch"}, "preparing"?:
+true}`) on the topic `nanoclaw.voice.review`. In review the session's turn
+detection is manual and its input is off between recordings; after done the
+transcription gets silence until it has finalized what it heard (at most 4 s,
+past which the rest is unverified and the draft cannot be sent), and the draft's
+text is frozen from its final transcripts. Freezing or discarding an open draft
+clears the session's own turn, which restarts its transcription, and a new
+Gemini Live stream takes no audio until its setup completes: until then the
+state says `"preparing": true`, the page keeps talk off ("getting ready"), and
+the worker answers a talk only once the stream reads audio (at most 3 s), so the
+microphone never opens onto a stream that is still connecting. Send posts
+exactly that text through the ordinary turn path, and its `sending` status carries the text and the draft id, so the page
 shows that text as the turn. A draft over the 8 KB turn limit cannot be sent.
 A reply that waits out a recording (the usual bounded wait) takes the channel
 and turns the recording into a draft ("`<agent>` started speaking - review what

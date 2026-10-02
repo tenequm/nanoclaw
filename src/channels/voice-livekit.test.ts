@@ -19,6 +19,7 @@ import {
   type BoundCallChat,
   turnMessageText,
   CALL_CHAT_REPLY_NOTE,
+  CALL_DEPTH_NOTE,
   CALL_LANGUAGE_NOTE,
   CALL_REPLY_NOTE,
   type LiveKitServerApi,
@@ -522,7 +523,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     });
     const text = (msg.content as { text: string }).text;
     expect(text.startsWith('<voice source="livekit">Що в мене завтра в календарі?</voice>\n')).toBe(true);
-    expect(text).toContain('no markdown, no links, no code blocks, numbers written as words');
+    expect(text).toContain('No markdown, no links, no code blocks, numbers written as words');
     // A follow-up while the agent works is its own message with its own id.
     const second = await worker.utter('And the day after?');
     expect(second).not.toBe(id);
@@ -655,6 +656,16 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     });
     await h.adapter.setTyping!(LINE, null);
     await worker.waitFor((e) => e.type === 'thinking');
+    // The runner's pickup on the line's own chat is the worker's `working`; the adapter already said thinking.
+    const thinking = worker.events.filter((e) => e.type === 'thinking').length;
+    liveKitChatTyping({ channelType: 'voice', platformId: LINE, threadId: null }, 'ag-andy');
+    liveKitChatTyping({ channelType: 'voice', platformId: LINE, threadId: null }, 'ag-other', true);
+    liveKitChatTyping({ channelType: 'voice', platformId: 'voice:other', threadId: null }, 'ag-andy', true);
+    await settle();
+    expect(worker.events.some((e) => e.type === 'working')).toBe(false);
+    liveKitChatTyping({ channelType: 'voice', platformId: LINE, threadId: null }, 'ag-andy', true);
+    await worker.waitFor((e) => e.type === 'working');
+    expect(worker.events.filter((e) => e.type === 'thinking')).toHaveLength(thinking);
     worker.close();
   });
 
@@ -1045,6 +1056,10 @@ describe('livekit call talking in the agent chat', () => {
     expect(worker.events.some((e) => e.type === 'thinking')).toBe(false);
     liveKitChatTyping({ channelType: 'telegram', platformId: 'telegram:100', threadId: null }, 'ag-andy');
     await worker.waitFor((e) => e.type === 'thinking');
+    expect(worker.events.some((e) => e.type === 'working')).toBe(false);
+    // The runner picked up what reached the call chat: thinking, then working.
+    liveKitChatTyping({ channelType: 'telegram', platformId: 'telegram:100', threadId: null }, 'ag-andy', true);
+    await worker.waitFor((e) => e.type === 'working');
     await worker.waitFor((e) => e.type === 'reply');
     expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
       { type: 'reply', text: 'Booked for **eight**.', turn: null },
@@ -1314,6 +1329,19 @@ describe('turn message text', () => {
   it('warns a call in a chat that everything sent there is spoken', () => {
     expect(CALL_CHAT_REPLY_NOTE).toContain('every message you send to this chat is read aloud');
     expect(CALL_CHAT_REPLY_NOTE).not.toContain('separate written message');
+  });
+
+  it('asks for depth that matches the question, not a fixed short length, and keeps the spoken-output rules', () => {
+    for (const note of [CALL_REPLY_NOTE, CALL_CHAT_REPLY_NOTE]) {
+      expect(note).toContain(CALL_DEPTH_NOTE);
+      expect(note).not.toMatch(/few short/i);
+      expect(note).toContain('code, links, long lists');
+    }
+    expect(CALL_DEPTH_NOTE).toContain('Match the depth to the question: brief for simple ones');
+    expect(CALL_DEPTH_NOTE).toContain('take the time to think and verify, and give the full considered answer');
+    expect(CALL_DEPTH_NOTE).toContain('Lead with the answer; for a long one, say how many points there are');
+    expect(CALL_DEPTH_NOTE).toContain('No markdown, no links, no code blocks, numbers written as words.');
+    expect(CALL_CHAT_REPLY_NOTE).toContain('for after the call instead of sending it now');
   });
 
   it('keeps the transcript as heard and tells the agent Russian spelling is Ukrainian, never to answer in Russian', () => {
