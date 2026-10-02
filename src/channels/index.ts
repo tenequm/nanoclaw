@@ -17,5 +17,5 @@ import './slack.js';
 import './slack-a2a-guard.js';
 import './slack-a2a.js';
 
-// Voice — GPT-Live browser call page (/add-voice).
+// Voice — browser calls with the agent over LiveKit (/add-voice).
 import './voice.js';

@@ -1,7 +1,6 @@
 /**
- * LiveKit as the second voice engine for the voice channel, in walkie-talkie
- * mode: the caller talks to the line's real NanoClaw agent, not to a voice
- * model playing it.
+ * The call engine of the voice channel: the caller talks to the line's real
+ * NanoClaw agent, not to a voice model playing it.
  *
  * The caller's browser joins a LiveKit room over WebRTC; a LiveKit Agents
  * worker (`src/voice-livekit-worker.ts`, its own process: agents-js runs every
@@ -44,8 +43,8 @@ import { AccessToken, AgentDispatchClient, RoomServiceClient, TrackSource } from
 
 import type { ChannelAdapter, InboundEvent } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
-import { callPageHtml, type VoiceUiConfig } from './gpt-live-call-page.js';
-import type { ResolveLineOptions, VoiceLine } from './gpt-live-prompt.js';
+import { callPageHtml, type VoiceUiConfig } from './voice-call-page.js';
+import { sameCallerAndAgent, type ResolveLineOptions, type VoiceLine } from './voice-line.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_WALKIE_SILENCE_MS,
@@ -214,13 +213,10 @@ export interface LiveKitVoiceConfig {
 /** What the voice adapter shares with this engine: limits, access, routing. */
 export interface LiveKitHost {
   resolveLine(platformId: string, options?: ResolveLineOptions): Promise<VoiceLine | null>;
-  sameCallerAndAgent(a: VoiceLine, b: VoiceLine): boolean;
   admitStart(platformId: string, t: number): { body: string; retryAfter: string } | null;
-  /** Daily call time left on the line, all engines counted. */
+  /** Daily call time left on the line. */
   remainingTodayMs(platformId: string, t: number): number;
   chargeUsage(call: { platformId: string; startedAt: number }): void;
-  /** Newest wins across engines: end any other engine's call on the line. */
-  endOtherCalls(platformId: string, reason: string): void;
   /**
    * Route a turn through the host's inbound path, into the call chat or onto the voice line. Resolves
    * true once the agent's session stored it (to answer, or as context), false when the router dropped it;
@@ -231,7 +227,7 @@ export interface LiveKitHost {
   now(): number;
   maxCallDurationMs: number;
   accessCheckIntervalMs: number;
-  /** Look of the call page (GPT_LIVE_UI); the walkie-talkie serves the same page as the OpenAI path. */
+  /** Look of the call page (VOICE_UI). */
   ui?: VoiceUiConfig;
 }
 
@@ -295,8 +291,8 @@ export interface LiveKitVoice {
   ): Promise<void>;
   /**
    * Speak an agent message on the line's LiveKit call. `target` is the parsed
-   * livekit reply id, if the message answers one. Returns null when the message
-   * is not this engine's (no call here and no livekit reply id).
+   * livekit reply id, if the message answers one. Returns null when no call runs
+   * on the line and the message answers no livekit turn: nothing could take it.
    */
   deliver(
     platformId: string,
@@ -314,9 +310,8 @@ export interface LiveKitVoice {
   ): void;
   /** The agent is working in a chat: tell its live call that talks there. */
   chatTyping(chat: ChatAddress, agentGroupId: string): void;
-  /** The running call on a line, for the shared daily budget. */
+  /** The running call on a line, for the daily budget. */
   activeCall(platformId: string): { platformId: string; startedAt: number } | undefined;
-  endLine(platformId: string, reason: string, end?: WalkieEndReason): void;
   teardown(): Promise<void>;
 }
 
@@ -691,7 +686,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (call.ended) return false;
     try {
       const current = await host.resolveLine(call.platformId);
-      if (current && host.sameCallerAndAgent(call.line, current) && calls.get(call.platformId) === call && !call.ended)
+      if (current && sameCallerAndAgent(call.line, current) && calls.get(call.platformId) === call && !call.ended)
         return true;
     } catch (err) {
       log.warn('livekit-voice: call access check failed', { platformId: call.platformId, err });
@@ -720,20 +715,18 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
   /** Admit the call, open its room, dispatch the worker and hand the caller a token for that room only. */
   const startCall = async (res: http.ServerResponse, platformId: string): Promise<void> => {
-    const line = await host.resolveLine(platformId, { persona: true });
+    const line = await host.resolveLine(platformId, { forCall: true });
     if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
     const t = host.now();
     const refusal = host.admitStart(platformId, t);
     if (refusal) return reply(res, 429, refusal.body, { 'Retry-After': refusal.retryAfter });
-    // Before ending anything: a refused start must not hang up the caller's running call. The
-    // running calls' time is already in the day's total, so ending them below does not change it.
+    // admitStart refused a day with no minutes left. The running call's time is already in the
+    // day's total, so ending it below does not change what is left.
     const remainingMs = host.remainingTodayMs(platformId, t);
-    if (remainingMs <= 0) return reply(res, 429, 'This voice line has used its call minutes for today.');
     const capMs = Math.min(host.maxCallDurationMs, remainingMs);
-    // Newest wins on the line, whatever engine holds it.
+    // Newest wins on the line.
     const previous = calls.get(platformId);
     if (previous) endCall(previous, 'replaced by a new call', 'newer_call');
-    host.endOtherCalls(platformId, 'replaced by a new call');
     const callId = randomUUID();
     const call: LiveKitCall = {
       callId,
@@ -1091,7 +1084,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       if (route.startsWith('livekit/agent/')) return handleAgent(req, res, route, url);
       if (route === 'livekit') {
         if (req.method !== 'GET') return reply(res, 405, 'GET only');
-        page ??= callPageHtml({ ...host.ui, transport: 'livekit' });
+        page ??= callPageHtml(host.ui);
         res.writeHead(200, pageHeaders());
         res.end(page);
         return;
@@ -1159,11 +1152,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       return call && call.startedAt !== undefined && !call.ended
         ? { platformId, startedAt: call.startedAt }
         : undefined;
-    },
-
-    endLine(platformId, reason, end) {
-      const call = calls.get(platformId);
-      if (call) endCall(call, reason, end);
     },
 
     async teardown() {

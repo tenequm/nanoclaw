@@ -29,8 +29,8 @@ import {
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
- * The browser side of a LiveKit walkie-talkie call, behind the same VoiceCall
- * shape as the GPT-Live hook so the page renders both alike.
+ * The browser side of a LiveKit walkie-talkie call, behind the VoiceCall shape
+ * the page renders (the `?demo=1` script has the same shape).
  *
  * The host's routes next to the page mint the room token (`livekit/token`) and
  * end the call (`livekit/end`). In the room, the worker's AgentSession owns

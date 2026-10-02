@@ -2,15 +2,14 @@
  * The LiveKit path of the voice channel at the host boundary: the real adapter
  * behind the real webhook server, hit over HTTP the way the call page and the
  * worker do. Faked: the LiveKit server API (recorded calls), the mirror's
- * chats and the clock. OpenAI is unreachable, so the GPT-Live engine only
- * shows up where its limits refuse a start before any upstream request.
+ * chats and the clock.
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ChannelAdapter, InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
-import { createGptLiveAdapter, lineIdForToken, type GptLiveConfig, type VoiceChannelAdapter } from './voice.js';
+import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
+import { createVoiceAdapter, lineIdForToken, type VoiceChannelAdapter, type VoiceConfig } from './voice.js';
 import {
   liveKitChatDelivered,
   liveKitChatTyping,
@@ -40,7 +39,7 @@ import {
   WALKIE_UPDATING_ATTRIBUTE,
 } from './voice-livekit-protocol.js';
 import { stopWebhookServer } from '../webhook-server.js';
-import { callPageHtml } from './gpt-live-call-page.js';
+import { callPageHtml } from './voice-call-page.js';
 
 const LINE = lineIdForToken('tok123');
 const MIN = 60_000;
@@ -139,7 +138,7 @@ function mg(overrides: Partial<MessagingGroup>): MessagingGroup {
 }
 
 interface Harness {
-  adapter: ChannelAdapter;
+  adapter: VoiceChannelAdapter;
   /** Turns routed into a call chat. */
   events: InboundEvent[];
   /** Where the worker reaches the host, from its own settings. */
@@ -155,8 +154,7 @@ interface Harness {
 }
 
 async function startHarness(
-  overrides: Partial<GptLiveConfig> = {},
-  livekit = true,
+  overrides: Partial<VoiceConfig> = {},
   lkOverrides: Partial<LiveKitVoiceConfig> = {},
 ): Promise<Harness> {
   const port = await freePort();
@@ -167,34 +165,27 @@ async function startHarness(
   const access = { enabled: true };
   const routing: Harness['routing'] = { mode: 'store', hung: [] };
   const lk = fakeLiveKit();
-  const adapter = createGptLiveAdapter({
-    apiKey: 'sk-test-key',
+  const adapter = createVoiceAdapter({
     publicUrl: `http://127.0.0.1:${port}`,
-    voice: 'marin',
     linkTokens: ['tok123'],
-    apiBase: 'http://127.0.0.1:9/v1',
-    wsBase: 'ws://127.0.0.1:9/v1',
     resolveLine: async (id) =>
       access.enabled
         ? {
             caller: { id, name: 'Ethan' },
             agentGroupId: 'ag-andy',
-            agent: { name: 'Andy', personality: 'Dry humour, precise.', vocabulary: ['NanoClaw', 'Stan'] },
+            agent: { name: 'Andy', vocabulary: ['NanoClaw', 'Stan'] },
           }
         : null,
     now: () => clock.now,
-    requestTimeoutMs: 1000,
-    livekit: livekit
-      ? {
-          url: 'wss://lk.example.ts.net:47880',
-          serverUrl: 'ws://127.0.0.1:7880',
-          apiKey: API_KEY,
-          apiSecret: API_SECRET,
-          api: lk,
-          mirrorApi: fakeMirror([]).api,
-          ...lkOverrides,
-        }
-      : undefined,
+    livekit: {
+      url: 'wss://lk.example.ts.net:47880',
+      serverUrl: 'ws://127.0.0.1:7880',
+      apiKey: API_KEY,
+      apiSecret: API_SECRET,
+      api: lk,
+      mirrorApi: fakeMirror([]).api,
+      ...lkOverrides,
+    },
     ...overrides,
   });
   await adapter.setup({
@@ -338,38 +329,11 @@ async function startCall(h: Harness): Promise<{ call: TokenResponse; worker: Fak
 
 const settle = () => new Promise((r) => setTimeout(r, 30));
 
-/** A GPT-Live start; OpenAI is unreachable here, so only a refusal by the shared limits is meaningful. */
-const offer = (h: Harness): Promise<Response> =>
-  fetch(`${h.base}/sdp?t=tok123`, { method: 'POST', body: 'v=0\r\noffer' });
-
 /** The room of the call a newer one replaced while connecting: the one the newer call was not given. */
 function replacedRoom(h: Harness, newer: TokenResponse): string {
   const newerRoom = h.lk.dispatches.find((d) => d.metadata.callId === newer.callId)!.room;
   return h.lk.rooms.find((r) => r !== newerRoom)!;
 }
-
-describe('livekit voice path without LiveKit settings', () => {
-  let h: Harness;
-  beforeAll(async () => {
-    h = await startHarness({}, false);
-  });
-  afterAll(async () => {
-    await h.stop();
-  });
-
-  it('has no walkie-talkie link to hand out, only the live call link', () => {
-    const adapter = h.adapter as VoiceChannelAdapter;
-    expect(adapter.walkieLink(LINE)).toBeNull();
-    expect(adapter.liveCallLink(LINE)).toBe(`${h.hostUrl}/voice/call?t=tok123`);
-  });
-
-  it('answers 503 on every livekit route and leaves the other engines alone', async () => {
-    expect((await fetch(`${h.base}/livekit?t=tok123`)).status).toBe(503);
-    expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(503);
-    expect((await post(`${h.base}/livekit/agent/utterance`, {})).status).toBe(503);
-    expect((await fetch(`${h.base}/call?t=tok123`)).status).toBe(200);
-  });
-});
 
 describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   let h: Harness;
@@ -381,21 +345,21 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await h.stop();
   });
 
-  it('renders the call links of a line it holds the token for, and no other', () => {
-    const adapter = h.adapter as VoiceChannelAdapter;
-    expect(adapter.walkieLink(LINE)).toBe(`${h.hostUrl}/voice?t=tok123`);
-    expect(adapter.liveCallLink(LINE)).toBe(`${h.hostUrl}/voice/call?t=tok123`);
-    expect(adapter.walkieLink(lineIdForToken('other'))).toBeNull();
-    expect(adapter.liveCallLink(lineIdForToken('other'))).toBeNull();
+  it('renders the call link of a line it holds the token for, and no other', () => {
+    expect(h.adapter.callLink(LINE)).toBe(`${h.hostUrl}/voice?t=tok123`);
+    expect(h.adapter.callLink(lineIdForToken('other'))).toBeNull();
   });
 
-  it('serves the voice call page in its LiveKit transport', async () => {
+  it('serves the voice call page', async () => {
     const res = await fetch(`${h.base}/livekit?t=tok123`);
     expect(res.status).toBe(200);
+    expect(res.headers.get('x-frame-options')).toBe('DENY');
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer');
     const csp = res.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("frame-ancestors 'none'");
     expect(csp).toContain("connect-src 'self' wss://lk.example.ts.net:47880 https://lk.example.ts.net:47880");
     const html = await res.text();
-    expect(html).toBe(callPageHtml({ transport: 'livekit' }));
+    expect(html).toBe(callPageHtml());
     // The page keeps its own copy of the worker's wire names (it cannot import the protocol module).
     for (const name of [
       WALKIE_THINKING_ATTRIBUTE,
@@ -410,9 +374,34 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     ]) {
       expect(html).toContain(name);
     }
-    // The same page as the OpenAI route; only the injected transport differs.
-    const openAi = await (await fetch(`${h.base}/call?t=tok123`)).text();
-    expect(openAi).toContain('window.__VOICE_UI__={}');
+    expect(html).toContain('window.__VOICE_UI__={}');
+  });
+
+  it('tells the page who answers the line, only with a known token and a caller with access', async () => {
+    const ok = await fetch(`${h.hostUrl}/voice/info?t=tok123`);
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ agent: 'Andy', caller: 'Ethan' });
+    expect((await fetch(`${h.base}/info?t=nope`)).status).toBe(403);
+    h.access.enabled = false;
+    expect((await fetch(`${h.base}/info?t=tok123`)).status).toBe(403);
+  });
+
+  it('serves no other page or route under either prefix', async () => {
+    for (const path of ['/voice/call', '/webhook/voice/call', '/voice/sip', '/voicemail']) {
+      expect((await fetch(`${h.hostUrl}${path}?t=tok123`)).status).toBe(404);
+    }
+    for (const route of ['sdp', 'hangup']) {
+      expect((await post(`${h.base}/${route}?t=tok123`)).status).toBe(404);
+    }
+    expect(h.lk.rooms).toEqual([]);
+  });
+
+  it('after teardown every route answers 503 and opens no room', async () => {
+    await h.adapter.teardown();
+    expect((await fetch(`${h.hostUrl}/voice?t=tok123`)).status).toBe(503);
+    expect((await fetch(`${h.base}/info?t=tok123`)).status).toBe(503);
+    expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(503);
+    expect(h.lk.rooms).toEqual([]);
   });
 
   it('refuses unknown links and callers without access before touching LiveKit', async () => {
@@ -422,10 +411,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.rooms).toEqual([]);
   });
 
-  it('serves the walkie page and its routes under the short /voice prefix, never the worker routes', async () => {
+  it('serves the call page and its routes under the short /voice prefix, never the worker routes', async () => {
     const page = await fetch(`${h.hostUrl}/voice?t=tok123`);
     expect(page.status).toBe(200);
-    expect(await page.text()).toBe(callPageHtml({ transport: 'livekit' }));
+    expect(await page.text()).toBe(callPageHtml());
     expect((await fetch(`${h.hostUrl}/voice/?t=tok123`)).status).toBe(200);
     expect((await fetch(`${h.hostUrl}/voice/info?t=tok123`)).status).toBe(200);
     const res = await post(`${h.hostUrl}/voice/livekit/token?t=tok123`);
@@ -568,7 +557,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('answers 202 only once the agent session stored the turn', async () => {
     await h.stop();
-    h = await startHarness({}, true, { routeTimeoutMs: 100 });
+    h = await startHarness({}, { routeTimeoutMs: 100 });
     const { worker } = await startCall(h);
     h.routing.mode = 'drop';
     expect((await worker.post('utterance', { text: 'dropped' })).status).toBe(422);
@@ -584,7 +573,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('tells the worker when a turn it heard 504 for reaches the agent after all', async () => {
     await h.stop();
-    h = await startHarness({}, true, { routeTimeoutMs: 100 });
+    h = await startHarness({}, { routeTimeoutMs: 100 });
     const { worker } = await startCall(h);
     h.routing.mode = 'hang';
     expect((await worker.post('utterance', { text: 'late', turnKey: 'k-late' })).status).toBe(504);
@@ -625,7 +614,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('caps the turns still being routed on one call', async () => {
     await h.stop();
-    h = await startHarness({}, true, { routeTimeoutMs: 300 });
+    h = await startHarness({}, { routeTimeoutMs: 300 });
     const { worker } = await startCall(h);
     h.routing.mode = 'hang';
     const pending = [1, 2, 3].map((i) => worker.post('utterance', { text: `t${i}`, turnKey: `k${i}` }));
@@ -666,6 +655,16 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await h.adapter.setTyping!(LINE, null);
     await worker.waitFor((e) => e.type === 'thinking');
     worker.close();
+  });
+
+  it('refuses question cards, attachments and a reply with no call, instead of reporting them delivered', async () => {
+    const card = { kind: 'chat', content: { type: 'ask_question', question: 'Which one?' } };
+    await expect(h.adapter.deliver(LINE, null, card)).rejects.toThrow('question cards are unsupported');
+    const file = { kind: 'chat', content: { text: 'Here.' }, files: [{ filename: 'a.txt', data: Buffer.from('a') }] };
+    await expect(h.adapter.deliver(LINE, null, file)).rejects.toThrow('attachments cannot be delivered');
+    await expect(h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Hello?' } })).rejects.toThrow(
+      'no active call on this line',
+    );
   });
 
   it('drops a reply for an ended call instead of speaking it into the next one', async () => {
@@ -758,9 +757,12 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('turns a fallback model off when it is set to off or empty', async () => {
     await h.stop();
-    h = await startHarness({}, true, {
-      walkie: { sttFallbackModel: 'off', ttsFallbackModel: ' ', ttsModel: 'gemini-3.8-flash-lite-tts' },
-    });
+    h = await startHarness(
+      {},
+      {
+        walkie: { sttFallbackModel: 'off', ttsFallbackModel: ' ', ttsModel: 'gemini-3.8-flash-lite-tts' },
+      },
+    );
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
     expect(h.lk.dispatches[0].metadata).toMatchObject({
       sttModel: 'gemini-3.5-transcribe-live',
@@ -819,10 +821,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect((await worker.post('joined')).status).toBe(200);
     h.clock.now += 30_000;
     await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId });
-    // The day's minutes are gone for every engine.
+    // The day's minutes are gone.
     const refused = await post(`${h.base}/livekit/token?t=tok123`);
     expect(refused.status).toBe(429);
-    expect((await offer(h)).status).toBe(429);
   });
 
   it('ends a call that runs into the budget cap by deleting its room', async () => {
@@ -835,15 +836,14 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.roomMetadata.at(-1)?.metadata).toEqual({ chat: null, end: 'limit_daily' });
   });
 
-  it('shares the hourly start cap with the GPT-Live engine', async () => {
+  it('refuses starts over the hourly cap with a retry time', async () => {
     await h.stop();
     h = await startHarness({ maxCallsPerHour: 2 });
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
-    const refused = await offer(h);
+    const refused = await post(`${h.base}/livekit/token?t=tok123`);
     expect(refused.status).toBe(429);
     expect(refused.headers.get('retry-after')).toBeTruthy();
-    expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(429);
   });
 
   it('deletes the room of a call that was replaced while it was connecting', async () => {
@@ -908,9 +908,12 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('ends a call whose worker never opens its event stream after reporting the caller in', async () => {
     await h.stop();
-    h = await startHarness({}, true, {
-      workerStreamTimeoutMs: 100,
-    });
+    h = await startHarness(
+      {},
+      {
+        workerStreamTimeoutMs: 100,
+      },
+    );
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
     const meta = h.lk.dispatches[0].metadata;
     const joined = await post(
@@ -982,7 +985,7 @@ describe('livekit call talking in the agent chat', () => {
 
   const start = async (groups: Array<Partial<MessagingGroup>>, mirror = 'telegram', options = {}) => {
     const fake = fakeMirror(groups, options);
-    h = await startHarness({ accessCheckIntervalMs: 60_000 }, true, { mirror, mirrorApi: fake.api });
+    h = await startHarness({ accessCheckIntervalMs: 60_000 }, { mirror, mirrorApi: fake.api });
     return fake;
   };
 
@@ -1247,7 +1250,7 @@ describe('livekit call talking in the agent chat', () => {
       worker.close();
       await h.stop();
     }
-    h = await startHarness({}, false);
+    h = await startHarness();
   });
 
   it('keeps the call on the voice line with WALKIE_MIRROR=off and no /voice chat', async () => {

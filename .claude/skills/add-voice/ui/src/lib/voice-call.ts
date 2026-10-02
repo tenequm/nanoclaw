@@ -1,14 +1,6 @@
-import { voiceEndpoint } from "./voice-endpoint"
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-
 /**
- * The browser side of a Live Voice call, as one hook.
- *
- * Same wire protocol as the hand-written page it replaces: the microphone goes
- * out over WebRTC, the OpenAI events come back on the `oai-events` data
- * channel, and three host routes next to the page do the rest: `info` (who
- * answers), `sdp` (start a session) and `hangup` (end it, with keepalive so a
- * closing tab still reaches the host).
+ * The shape of a call as the page renders it, shared by the LiveKit hook and the
+ * `?demo=1` script, plus the LiveKit hook's error and level helpers.
  */
 
 export type Phase = "idle" | "connecting" | "listening" | "thinking" | "talking" | "ended" | "error"
@@ -19,17 +11,17 @@ export interface Line {
   text: string
   /** Seconds into the call when the turn started. */
   at: number
-  /** Walkie-talkie only: whether this caller turn reached the agent. */
+  /** Whether this caller turn reached the agent. */
   mark?: TurnMark
-  /** Walkie-talkie only: the caller turn's number on this page, once the worker settled it. */
+  /** The caller turn's number on this page, once the worker settled it. */
   turn?: number
-  /** Walkie-talkie only: what an agent line answers ("re: turn 2", "unprompted"), on the first line of a message. */
+  /** What an agent line answers ("re: turn 2", "unprompted"), on the first line of a message. */
   re?: string
-  /** Walkie-talkie only: the spoken message an agent line belongs to; one message's lines read as one. */
+  /** The spoken message an agent line belongs to; one message's lines read as one. */
   group?: number
 }
 
-/** Walkie-talkie only: the caller stopped and the turn goes out once this runs full, unless they speak again. */
+/** The caller stopped and the turn goes out once this runs full, unless they speak again. */
 export interface SendCue {
   id: string
   /** How much of the silence had passed when the worker said so, 0..1. */
@@ -53,11 +45,6 @@ export class CallError extends Error {
     super(message)
     this.kind = kind
   }
-}
-
-interface LiveEvent {
-  type?: string
-  delta?: string
 }
 
 export interface VoiceCall {
@@ -84,30 +71,27 @@ export interface VoiceCall {
   inputLevel: React.RefObject<number>
   outputLevel: React.RefObject<number>
   audioRef: React.RefObject<HTMLAudioElement | null>
-  /** Walkie-talkie only: the chat the call talks in, as the host names it. */
+  /** The chat the call talks in, as the host names it. */
   chat?: string | null
-  /** Walkie-talkie only: the browser holds the agent's audio until the caller allows it. */
+  /** The browser holds the agent's audio until the caller allows it. */
   audioBlocked?: boolean
-  /** Walkie-talkie only: lets the held audio play; call it from a tap. */
+  /** Lets the held audio play; call it from a tap. */
   unlockAudio?: () => void
-  /** Walkie-talkie only: the room lost its connection and is trying to get it back. */
+  /** The room lost its connection and is trying to get it back. */
   reconnecting?: boolean
   /** The last mute or unmute did not take, in a few words. */
   muteError?: string | null
-  /** Walkie-talkie only: the silence that sends a turn, from the host. */
+  /** The silence that sends a turn, from the host. */
   silenceMs?: number | null
-  /** Walkie-talkie only: a caller turn counting down to being sent. */
+  /** A caller turn counting down to being sent. */
   sendCue?: SendCue | null
-  /** Walkie-talkie only: the call is about to hit its time limit. */
+  /** The call is about to hit its time limit. */
   limitNote?: string | null
 }
 
 export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking", "talking"])
 
 export const PAGE_CLOSED = "The call ended when the page was closed."
-
-/** How long a WebRTC "disconnected" may last before the call is treated as dropped. */
-const DISCONNECT_GRACE_MS = 6000
 
 export function statusErrorKind(status: number): ErrorKind {
   if (status === 403) return "link"
@@ -124,28 +108,11 @@ export function errorText(status: number, body: string): string {
   return `Could not start the call (HTTP ${status}).`
 }
 
-function waitForIce(pc: RTCPeerConnection): Promise<void> {
-  return new Promise((resolve) => {
-    if (pc.iceGatheringState === "complete") return resolve()
-    let done = false
-    const finish = () => {
-      if (!done) {
-        done = true
-        resolve()
-      }
-    }
-    pc.addEventListener("icegatheringstatechange", () => {
-      if (pc.iceGatheringState === "complete") finish()
-    })
-    setTimeout(finish, 1500)
-  })
-}
-
 /**
  * Why the caller's own level comes from `getStats()` and not from a Web Audio
  * analyser: on iOS Safari, tapping a captured microphone stream with
  * `createMediaStreamSource` starves the same track on the peer connection, so
- * the model receives silence while the page still looks connected. The sender's
+ * the agent receives silence while the page still looks connected. The sender's
  * `media-source` report gives the same number with nothing attached to the track.
  */
 export function levelsFromStats(report: RTCStatsReport): { mic: number | null; agent: number | null } {
@@ -183,415 +150,4 @@ export function micErrorKind(err: unknown): ErrorKind | null {
   if (name === "NotAllowedError" || name === "SecurityError") return "mic-permission"
   if (name === "NotFoundError" || name === "OverconstrainedError" || name === "NotReadableError") return "mic"
   return null
-}
-
-export function useVoiceCall(token: string, fallbackAgent = "your agent"): VoiceCall {
-  const [phase, setPhaseState] = useState<Phase>(token ? "idle" : "error")
-  const [error, setError] = useState<string | null>(token ? null : "This link is missing its token. Ask for the full call link.")
-  const [errorKind, setErrorKind] = useState<ErrorKind | null>(token ? null : "link")
-  const [endedText, setEndedText] = useState<string | null>(null)
-  const [lines, setLines] = useState<Line[]>([])
-  const [streamingId, setStreamingId] = useState<number | null>(null)
-  const [agentName, setAgentName] = useState(fallbackAgent)
-  const [elapsed, setElapsed] = useState(0)
-  const [muted, setMutedState] = useState(false)
-  const [micStream, setMicStream] = useState<MediaStream | null>(null)
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
-
-  const phaseRef = useRef<Phase>(phase)
-  const mutedRef = useRef(false)
-  const pc = useRef<RTCPeerConnection | null>(null)
-  const activeSession = useRef<string | null>(null)
-  const stream = useRef<MediaStream | null>(null)
-  const micRaw = useRef(0)
-  const agentRaw = useRef(0)
-  const receiver = useRef<RTCRtpReceiver | null>(null)
-  const audioRef = useRef<HTMLAudioElement | null>(null)
-  const startedAt = useRef(0)
-  const lastWho = useRef<Speaker | "">("")
-  const lastLineId = useRef<number | null>(null)
-  const nextId = useRef(1)
-  const lastAgentDelta = useRef(0)
-  // True between a delegation and the reply our host sends back for it. The
-  // voice model speaks its own holding line first ("one moment…"), which ends a
-  // talking run long before the answer exists; without this the page drops to
-  // "listening" and tells the caller to go ahead while the agent is still working.
-  const awaitingAnswer = useRef(false)
-  const lastDeltaAt = useRef(0)
-  const streamingRef = useRef<number | null>(null)
-  const inputLevel = useRef(0)
-  const outputLevel = useRef(0)
-  const generation = useRef(0)
-  const disconnectTimer = useRef<number | null>(null)
-
-  const setPhase = useCallback((p: Phase) => {
-    phaseRef.current = p
-    setPhaseState(p)
-  }, [])
-
-  const setStreaming = useCallback((id: number | null) => {
-    streamingRef.current = id
-    setStreamingId(id)
-  }, [])
-
-  // Who answers this line, so the page can greet by name before the call.
-  useEffect(() => {
-    if (!token) return
-    const ctl = new AbortController()
-    fetch(voiceEndpoint("info", token), { signal: ctl.signal })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((j: { agent?: unknown } | null) => {
-        if (j && typeof j.agent === "string" && j.agent.trim()) setAgentName(j.agent.trim())
-      })
-      .catch(() => {})
-    return () => ctl.abort()
-  }, [token])
-
-  const caption = useCallback(
-    (from: Speaker, delta: string) => {
-      if (!delta) return
-      lastDeltaAt.current = Date.now()
-      const at = Math.max(0, Math.floor((Date.now() - startedAt.current) / 1000))
-      if (from !== lastWho.current || lastLineId.current === null) {
-        const id = nextId.current++
-        lastWho.current = from
-        lastLineId.current = id
-        setLines((prev) => [...prev, { id, from, text: delta, at }])
-        setStreaming(id)
-      } else {
-        const id = lastLineId.current
-        setLines((prev) => prev.map((l) => (l.id === id ? { ...l, text: l.text + delta } : l)))
-        setStreaming(id)
-      }
-    },
-    [setStreaming]
-  )
-
-  const hangupHost = useCallback((sessionId: string | null) => {
-    if (!token || !sessionId) return
-    const url = voiceEndpoint("hangup", token)
-    url.searchParams.set("session", sessionId)
-    fetch(url, { method: "POST", keepalive: true }).catch(() => {})
-  }, [token])
-
-  const teardown = useCallback(
-    (tellHost: boolean) => {
-      generation.current++
-      if (disconnectTimer.current !== null) {
-        window.clearTimeout(disconnectTimer.current)
-        disconnectTimer.current = null
-      }
-      if (tellHost) hangupHost(activeSession.current)
-      activeSession.current = null
-      if (pc.current) {
-        try {
-          pc.current.close()
-        } catch {
-          /* already closed */
-        }
-        pc.current = null
-      }
-      if (stream.current) {
-        stream.current.getTracks().forEach((t) => t.stop())
-        stream.current = null
-      }
-      micRaw.current = 0
-      agentRaw.current = 0
-      inputLevel.current = 0
-      outputLevel.current = 0
-      receiver.current = null
-      if (audioRef.current) audioRef.current.srcObject = null
-      mutedRef.current = false
-      setMutedState(false)
-      setMicStream(null)
-      setRemoteStream(null)
-      setStreaming(null)
-    },
-    [hangupHost, setStreaming]
-  )
-
-  const end = useCallback(
-    (tellHost: boolean, text: string) => {
-      const p = phaseRef.current
-      if (p === "idle" || p === "ended") return
-      awaitingAnswer.current = false
-      teardown(tellHost)
-      setEndedText(text)
-      setPhase("ended")
-    },
-    [teardown, setPhase]
-  )
-
-  const onEvent = useCallback(
-    (raw: string) => {
-      let ev: LiveEvent
-      try {
-        ev = JSON.parse(raw) as LiveEvent
-      } catch {
-        return
-      }
-      const p = phaseRef.current
-      if (ev.type === "session.input_transcript.delta") {
-        caption("user", ev.delta ?? "")
-        // A new question supersedes whatever the agent still owed.
-        awaitingAnswer.current = false
-        if (p === "listening" || p === "talking") setPhase("listening")
-      } else if (ev.type === "session.output_transcript.delta") {
-        caption("assistant", ev.delta ?? "")
-        lastAgentDelta.current = Date.now()
-        if (p !== "thinking" || ev.delta) setPhase("talking")
-      } else if (ev.type === "session.delegation.created") {
-        lastWho.current = ""
-        awaitingAnswer.current = true
-        setPhase("thinking")
-      } else if (ev.type === "session.commentary.appended") {
-        // Commentary is the host's own reply reaching the model, so the
-        // delegation is answered. The model's holding line is not commentary:
-        // it arrives as plain output transcript and must not end the wait.
-        awaitingAnswer.current = false
-        if (p === "thinking") setPhase("listening")
-      } else if (ev.type === "session.closed") {
-        end(false, "The call ended.")
-      }
-    },
-    [caption, setPhase, end]
-  )
-
-  const start = useCallback(async () => {
-    if (!token) return
-    const p = phaseRef.current
-    if (p === "connecting" || LIVE_PHASES.has(p)) return
-    setError(null)
-    setErrorKind(null)
-    setEndedText(null)
-    setLines([])
-    lastWho.current = ""
-    lastLineId.current = null
-    setStreaming(null)
-    setElapsed(0)
-    setPhase("connecting")
-    const mine = ++generation.current
-    const cancelled = () => generation.current !== mine
-    // Inside the click, before any await: iOS only lets an element start playing
-    // from a gesture, and the agent's audio arrives several awaits from here.
-    audioRef.current?.play().catch(() => {})
-    let createdSession: string | null = null
-    try {
-      const s = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
-      if (cancelled()) {
-        s.getTracks().forEach((t) => t.stop())
-        return
-      }
-      stream.current = s
-      setMicStream(s)
-
-      const conn = new RTCPeerConnection()
-      pc.current = conn
-      conn.ontrack = (e) => {
-        if (cancelled()) return
-        const remote = e.streams[0] ?? new MediaStream([e.track])
-        if (audioRef.current) audioRef.current.srcObject = remote
-        receiver.current = e.receiver
-        setRemoteStream(remote)
-        audioRef.current?.play().catch(() => {})
-      }
-      s.getTracks().forEach((t) => conn.addTrack(t, s))
-      const dc = conn.createDataChannel("oai-events")
-      dc.onmessage = (e) => { if (!cancelled()) onEvent(String(e.data)) }
-      dc.onclose = () => {
-        if (!cancelled() && LIVE_PHASES.has(phaseRef.current)) end(true, "The call ended.")
-      }
-      conn.onconnectionstatechange = () => {
-        if (cancelled()) return
-        const state = conn.connectionState
-        if (state === "connected") {
-          if (disconnectTimer.current !== null) {
-            window.clearTimeout(disconnectTimer.current)
-            disconnectTimer.current = null
-          }
-          if (phaseRef.current === "connecting") {
-            startedAt.current = Date.now()
-            setPhase("listening")
-          }
-        } else if (state === "disconnected") {
-          if (disconnectTimer.current === null) {
-            disconnectTimer.current = window.setTimeout(() => {
-              disconnectTimer.current = null
-              end(true, "The connection dropped.")
-            }, DISCONNECT_GRACE_MS)
-          }
-        } else if (state === "failed") {
-          end(true, "The connection dropped.")
-        }
-      }
-      const offer = await conn.createOffer()
-      if (cancelled()) return
-      await conn.setLocalDescription(offer)
-      await waitForIce(conn)
-      if (cancelled()) return
-      const res = await fetch(voiceEndpoint("sdp", token), {
-        method: "POST",
-        headers: { "Content-Type": "application/sdp" },
-        body: conn.localDescription?.sdp ?? "",
-      })
-      createdSession = res.ok ? res.headers.get("x-voice-session") : null
-      if (!cancelled()) activeSession.current = createdSession
-      const body = await res.text()
-      if (cancelled()) {
-        // The host already has a live session for this cancelled attempt; end it.
-        hangupHost(createdSession)
-        return
-      }
-      if (!res.ok) throw new CallError(errorText(res.status, body), statusErrorKind(res.status))
-      if (!createdSession) throw new Error("The host did not return a session ID.")
-      await conn.setRemoteDescription({ type: "answer", sdp: body })
-    } catch (err) {
-      if (cancelled()) { hangupHost(createdSession); return }
-      const msg = micErrorText(err) ?? (err instanceof Error ? err.message : String(err))
-      // If the host answered, it holds a session for us: tell it to hang up.
-      teardown(createdSession !== null)
-      setError(msg)
-      setErrorKind(micErrorKind(err) ?? (err instanceof CallError ? err.kind : "other"))
-      setPhase("error")
-    }
-  }, [token, onEvent, end, teardown, setPhase, setStreaming, hangupHost])
-
-  const endCall = useCallback(() => end(true, "Call ended."), [end])
-
-  const toggleMute = useCallback(() => {
-    const s = stream.current
-    if (!s) return
-    const next = !mutedRef.current
-    mutedRef.current = next
-    s.getAudioTracks().forEach((t) => {
-      t.enabled = !next
-    })
-    setMutedState(next)
-  }, [])
-
-  // Call timer.
-  useEffect(() => {
-    if (!LIVE_PHASES.has(phase)) return
-    const t = window.setInterval(() => setElapsed(Math.floor((Date.now() - startedAt.current) / 1000)), 500)
-    return () => window.clearInterval(t)
-  }, [phase])
-
-  // Levels while a call is live, both read from the peer connection: the agent's
-  // from the receiver (with the inbound report as a fallback), yours from the
-  // sender's media-source report. Nothing taps the microphone track itself — see
-  // levelsFromStats. The smoothing runs on a frame loop; the reports are polled
-  // ten times a second, which is as often as they change. Idle and ended pages
-  // run no loop at all.
-  useEffect(() => {
-    if (!LIVE_PHASES.has(phase) && phase !== "connecting") return
-    let raf = 0
-    let stopped = false
-    const poll = async () => {
-      const conn = pc.current
-      if (!conn || stopped) return
-      try {
-        const { mic, agent } = levelsFromStats(await conn.getStats())
-        if (stopped) return
-        if (mic !== null) micRaw.current = mic
-        if (agent !== null) agentRaw.current = agent
-      } catch {
-        /* the connection closed under us; the next tick decays to zero */
-      }
-    }
-    const step = () => {
-      const p = phaseRef.current
-      const live = LIVE_PHASES.has(p)
-      let out = 0
-      if (live) {
-        const r = receiver.current
-        let got = false
-        try {
-          if (r && typeof r.getSynchronizationSources === "function") {
-            const srcs = r.getSynchronizationSources()
-            if (srcs.length && typeof srcs[0].audioLevel === "number") {
-              out = Math.min(1, srcs[0].audioLevel * 3)
-              got = true
-            }
-          }
-        } catch {
-          got = false
-        }
-        if (!got) out = Math.min(1, agentRaw.current * 3)
-      }
-      outputLevel.current += (out - outputLevel.current) * 0.3
-      const inp = live && !mutedRef.current ? Math.min(1, micRaw.current * 5) : 0
-      inputLevel.current += (inp - inputLevel.current) * 0.35
-      if (live && outputLevel.current > 0.05 && p !== "thinking") {
-        if (p !== "talking") setPhase("talking")
-        lastAgentDelta.current = Date.now()
-      } else if (p === "talking" && Date.now() - lastAgentDelta.current > 900) {
-        setPhase(awaitingAnswer.current ? "thinking" : "listening")
-      }
-      if (streamingRef.current !== null && Date.now() - lastDeltaAt.current > 700) setStreaming(null)
-    }
-    const tick = () => {
-      step()
-      raf = requestAnimationFrame(tick)
-    }
-    raf = requestAnimationFrame(tick)
-    // A wall-clock interval so timeouts still fire while the tab is in the background.
-    const backstop = window.setInterval(step, 250)
-    const stats = window.setInterval(() => void poll(), 100)
-    void poll()
-    return () => {
-      stopped = true
-      cancelAnimationFrame(raf)
-      window.clearInterval(backstop)
-      window.clearInterval(stats)
-      micRaw.current = 0
-      agentRaw.current = 0
-      inputLevel.current = 0
-      outputLevel.current = 0
-    }
-  }, [phase, setPhase, setStreaming])
-
-  // A closing tab still tells the host to hang up. A page the browser keeps and shows again
-  // (back/forward cache) comes back with that call over, so "call" works again.
-  useEffect(() => {
-    const onHide = () => {
-      if (pc.current) end(true, PAGE_CLOSED)
-    }
-    const onShow = (e: PageTransitionEvent) => {
-      const p = phaseRef.current
-      if (e.persisted && !pc.current && (p === "connecting" || LIVE_PHASES.has(p))) end(false, PAGE_CLOSED)
-    }
-    window.addEventListener("pagehide", onHide)
-    window.addEventListener("pageshow", onShow)
-    return () => {
-      window.removeEventListener("pagehide", onHide)
-      window.removeEventListener("pageshow", onShow)
-    }
-  }, [end])
-
-  const startVoid = useCallback(() => {
-    void start()
-  }, [start])
-
-  return useMemo(
-    () => ({
-      phase,
-      lines,
-      streamingId,
-      agentName,
-      elapsed,
-      muted,
-      error,
-      errorKind,
-      endedText,
-      micStream,
-      remoteStream,
-      start: startVoid,
-      end: endCall,
-      toggleMute,
-      inputLevel,
-      outputLevel,
-      audioRef,
-    }),
-    [phase, lines, streamingId, agentName, elapsed, muted, error, errorKind, endedText, micStream, remoteStream, startVoid, endCall, toggleMute]
-  )
 }

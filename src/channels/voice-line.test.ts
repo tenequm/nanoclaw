@@ -6,7 +6,7 @@ import { createMessagingGroup, createMessagingGroupAgent, updateMessagingGroup }
 import { addMember, removeMember } from '../modules/permissions/db/agent-group-members.js';
 import { createUser, updateDisplayName } from '../modules/permissions/db/users.js';
 import { grantRole, isOwner } from '../modules/permissions/db/user-roles.js';
-import { resolveVoiceLine, sessionConfig } from './gpt-live-prompt.js';
+import { resolveVoiceLine } from './voice-line.js';
 
 const stamp = () => new Date().toISOString();
 const ETHAN = 'voice:ethan-test';
@@ -75,17 +75,14 @@ describe('personal voice line access (real central DB)', () => {
       agentGroupId: 'voice-agent',
     });
     expect(await isOwner(ETHAN)).toBe(false);
-    expect(sessionConfig(access!.agent, 'marin', access!.caller).instructions).toContain(
-      JSON.stringify(access!.caller),
-    );
   });
 
   it('lists the startup vocabulary on call setup only, and no names when none are configured', async () => {
     await allow(ETHAN);
-    const setup = await resolveVoiceLine(ETHAN, undefined, { persona: true, vocabulary: 'Acme, k8s' });
+    const setup = await resolveVoiceLine(ETHAN, undefined, { forCall: true, vocabulary: 'Acme, k8s' });
     expect(setup?.agent.vocabulary).toEqual(['Acme', 'k8s']);
     expect((await resolveVoiceLine(ETHAN, undefined, { vocabulary: 'Acme' }))?.agent.vocabulary).toBeUndefined();
-    expect((await resolveVoiceLine(ETHAN, undefined, { persona: true }))?.agent.vocabulary).toBeUndefined();
+    expect((await resolveVoiceLine(ETHAN, undefined, { forCall: true }))?.agent.vocabulary).toBeUndefined();
   });
 
   it('keeps two people distinct when they call the same agent', async () => {

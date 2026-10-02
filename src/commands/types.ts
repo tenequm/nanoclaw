@@ -51,7 +51,7 @@ export const COMMANDS: Record<CommandName, CommandSpec> = {
     memberRunnable: false,
   },
   voice: {
-    description: "Get the agent's voice call links; walkie-talkie calls then talk in this chat",
+    description: "Get the agent's voice call link; calls then talk in this chat",
     memberRunnable: false,
   },
 };
@@ -301,16 +301,8 @@ export interface ActivationChangeView {
 export interface VoiceTargetView {
   agentName: string;
   agentGroupId: string;
-  /** The call pages of each of the agent's voice lines. Secrets: never log them. */
-  links: readonly VoiceLineLinks[];
-}
-
-/** One voice line's call pages; each is null when its engine is off on this host. */
-export interface VoiceLineLinks {
-  /** The LiveKit walkie-talkie page (`/voice?t=`). */
-  walkie: string | null;
-  /** The OpenAI live call page (`/voice/call?t=`). */
-  liveCall: string | null;
+  /** The call page (`/voice?t=`) of each of the agent's voice lines. Secrets: never log them. */
+  links: readonly string[];
 }
 
 /** What /voice did in a chat: nothing to say (unknown sender), a refusal, or one result per agent. */

@@ -241,23 +241,13 @@ export function voiceCommandReply(outcome: VoiceCommandOutcome, fmt: CardFmt): s
   if (outcome.kind === 'drop') return null;
   if (outcome.kind === 'refused') return failureMessage({ ok: false, reason: 'unauthorized' });
   const blocks: string[] = [];
-  let walkie = false;
   for (const { result } of outcome.results) {
     if (!result.ok) continue;
     const { agentName, links } = result.view;
-    for (const link of links) {
-      const lines: string[] = [];
-      if (link.walkie) lines.push(`🎙 Walkie-talkie with ${fmt.bold(agentName)}: ${link.walkie}`);
-      if (link.liveCall) {
-        lines.push(`📞 Live call (OpenAI)${link.walkie ? '' : ` with ${fmt.bold(agentName)}`}: ${link.liveCall}`);
-      }
-      walkie ||= link.walkie !== null;
-      blocks.push(lines.join('\n'));
-    }
+    for (const link of links) blocks.push(`🎙 Voice call with ${fmt.bold(agentName)}: ${link}`);
   }
   if (blocks.length > 0) {
-    // Only LiveKit calls follow the call chat; a live call talks on the line itself.
-    if (walkie) blocks.push('Walkie-talkie calls now talk in this chat, until /voice is run in another one.');
+    blocks.push('Voice calls now talk in this chat, until /voice is run in another one.');
     return blocks.join('\n\n');
   }
   // Nothing linked: say why, once per distinct reason.

@@ -8,7 +8,7 @@ import { ShimmeringText } from "@/components/ui/shimmering-text"
 import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
-import { LIVE_PHASES, useVoiceCall, type ErrorKind, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
+import { LIVE_PHASES, type ErrorKind, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
@@ -66,20 +66,15 @@ const BAR_STATE: Record<Phase, BarState> = {
   error: "listening",
 }
 
+// A turn goes out when the caller pauses, and each reply plays to the end.
 const HINT: Record<Phase, string> = {
   idle: "Allow the microphone when asked.",
   connecting: "Setting up the call.",
-  listening: "Go ahead. I’m listening.",
+  listening: "Go ahead. A pause sends what you said.",
   thinking: "Your agent is working on it.",
   talking: "You can interrupt at any time.",
   ended: "Thanks for calling.",
   error: "Try again, or ask for a fresh link.",
-}
-
-// The walkie-talkie sends a turn when the caller pauses and plays each reply to the end.
-const WALKIE_HINT: Record<Phase, string> = {
-  ...HINT,
-  listening: "Go ahead. A pause sends what you said.",
 }
 
 // The readout names the problem; the hint says what to do about it.
@@ -144,33 +139,6 @@ function useWaitSeconds(active: boolean): number {
     }
   }, [active])
   return seconds
-}
-
-/**
- * A first answer on a call is slower than the ones after it: the host has to
- * create the agent's session and start its container before anything can be
- * asked. That is invisible from here, and a caller who is told only "working on
- * it" assumes the call has stalled. After a few seconds of the first wait the
- * readout says what is actually happening; later waits, which are the agent
- * genuinely thinking, get a plainer note and a longer fuse.
- */
-function useSlowAnswerNote(phase: Phase): string | null {
-  const [slow, setSlow] = useState(false)
-  const waits = useRef(0)
-  useEffect(() => {
-    if (phase === "idle" || phase === "connecting") waits.current = 0
-    if (phase !== "thinking") {
-      setSlow(false)
-      return
-    }
-    waits.current += 1
-    const t = window.setTimeout(() => setSlow(true), waits.current === 1 ? 3500 : 9000)
-    return () => window.clearTimeout(t)
-  }, [phase])
-  if (!slow) return null
-  return waits.current === 1
-    ? "Starting your agent. The first answer on a call takes a moment."
-    : "Still working on it."
 }
 
 function pad(n: number) {
@@ -325,7 +293,7 @@ const Stage = memo(function Stage({
   )
 })
 
-/** The walkie's send countdown: a thin line under the readout filling over what is left of the silence. */
+/** The send countdown: a thin line under the readout filling over what is left of the silence. */
 function SendCueBar({ cue, reduced }: { cue: SendCue; reduced: boolean }) {
   const fill = useRef<HTMLElement | null>(null)
   useEffect(() => {
@@ -360,7 +328,7 @@ const TranscriptLine = memo(function TranscriptLine({
   agentName: string
   showTs: boolean
   mark?: TurnMark
-  /** Walkie only: the caller turn's number, or what an agent line answers. */
+  /** The caller turn's number, or what an agent line answers. */
   note?: string
 }) {
   const lost = mark?.status === "lost"
@@ -396,12 +364,9 @@ export default function App() {
   const params = useMemo(() => new URLSearchParams(location.search), [])
   const token = params.get("t") || ""
   const demo = params.get("demo") === "1"
-  const walkie = cfg.transport === "livekit"
-  const realCall = useVoiceCall(demo || walkie ? "" : token, "your agent")
-  const walkieCall = useLiveKitCall(demo || !walkie ? "" : token, "your agent")
-  const demoCall = useDemoCall(demo, walkie)
-  const call = demo ? demoCall : walkie ? walkieCall : realCall
-  const hints = walkie ? WALKIE_HINT : HINT
+  const liveKitCall = useLiveKitCall(demo ? "" : token, "your agent")
+  const demoCall = useDemoCall(demo)
+  const call = demo ? demoCall : liveKitCall
   const { phase, lines, streamingId, agentName, elapsed, muted, error, endedText } = call
   const errorKind = call.errorKind ?? "other"
   const live = LIVE_PHASES.has(phase)
@@ -471,16 +436,14 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey)
   }, [cfg.shortcuts, toggleMute, endCall])
 
-  const slowNote = useSlowAnswerNote(phase)
-  const waited = useWaitSeconds(walkie && phase === "thinking")
+  const waited = useWaitSeconds(phase === "thinking")
   const reconnecting = live && !!call.reconnecting
   const chipClass =
     phase === "idle" ? "idle" : phase === "ended" ? "ended" : phase === "error" ? "err" : phase === "listening" ? "you" : phase === "thinking" ? "think" : ""
   const endedSummary =
     endedText && endedText !== "Call ended." ? endedText.replace(/\.$/, "").toLowerCase() : "thanks for calling"
-  // A walkie line counts caption segments from both sides, not turns, so its summary leaves the count out.
-  const turnCount = walkie ? "" : `${lines.length} ${lines.length === 1 ? "turn" : "turns"} · `
-  const endedHint = `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${turnCount}${endedSummary}.`
+  // Lines are caption segments from both sides, not turns, so the summary leaves a count out.
+  const endedHint = `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${endedSummary}.`
   const hintText =
     phase === "error"
       ? ERROR_HINT[errorKind]
@@ -488,38 +451,32 @@ export default function App() {
         ? "Wait before speaking."
         : live && call.limitNote
           ? call.limitNote
-          : walkie && phase === "talking"
-          ? `Speech is ignored until ${agentName} finishes.`
-          : walkie && phase === "thinking"
-            ? `${muted ? "Unmute to keep talking" : "You can keep talking"} · waiting ${Math.floor(waited / 60)}:${pad(waited % 60)}`
-            : muted && live
-              ? "Your microphone is muted."
-              : phase === "ended"
-                ? endedHint
-                : phase === "thinking" && slowNote
-                  ? slowNote
-                  : walkie && phase === "listening" && call.silenceMs
+          : phase === "talking"
+            ? `Speech is ignored until ${agentName} finishes.`
+            : phase === "thinking"
+              ? `${muted ? "Unmute to keep talking" : "You can keep talking"} · waiting ${Math.floor(waited / 60)}:${pad(waited % 60)}`
+              : muted && live
+                ? "Your microphone is muted."
+                : phase === "ended"
+                  ? endedHint
+                  : phase === "listening" && call.silenceMs
                     ? `Go ahead. Pause about ${+(call.silenceMs / 1000).toFixed(1)} s to send.`
-                    : hints[phase]
+                    : HINT[phase]
 
   const chipText = reconnecting
     ? "Reconnecting…"
     : phase === "thinking"
-      ? walkie
-        ? `${agentName} is working`
-        : `Asking ${agentName}…`
+      ? `${agentName} is working`
       : phase === "idle"
         ? "Ready"
         : phase === "connecting"
           ? "Connecting…"
           : phase === "listening"
-            ? walkie && muted
+            ? muted
               ? "Mic muted"
               : "Listening"
             : phase === "talking"
-              ? walkie
-                ? `${agentName} is speaking`
-                : "Speaking"
+              ? `${agentName} is speaking`
               : phase === "error"
                 ? ERROR_TITLE[errorKind]
                 : "Call ended"
@@ -564,9 +521,7 @@ export default function App() {
                 : live
                   ? muted
                     ? "Unmute to speak."
-                    : walkie
-                      ? "Speak when ready."
-                      : "Say hello to start."
+                    : "Speak when ready."
                   : phase === "ended"
                     ? "Call again to keep talking."
                     : `Press call to talk to ${agentName}.`
@@ -594,14 +549,12 @@ export default function App() {
     </Conversation>
   )
 
-  // Whether the line hears the caller, apart from the caller's own mute choice: a walkie reply is never listened over.
-  const notListening = walkie && live && phase === "talking" && !muted && !call.muteError
+  // Whether the line hears the caller, apart from the caller's own mute choice: a reply is never listened over.
+  const notListening = live && phase === "talking" && !muted && !call.muteError
   const micLabel = call.muteError
     ? call.muteError
     : muted
-      ? walkie
-        ? "Mic muted"
-        : "Muted"
+      ? "Mic muted"
       : notListening
         ? "Not listening during reply"
         : "Mic on"

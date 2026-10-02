@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-import { callPageHtml, UI_SOURCE_HASH } from './gpt-live-call-page.js';
+import { callPageHtml, UI_SOURCE_HASH } from './voice-call-page.js';
 
 describe('voice call page (generated)', () => {
   it('is one self-contained document: React root, no external scripts or stylesheets', () => {
