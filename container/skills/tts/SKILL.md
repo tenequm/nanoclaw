@@ -57,8 +57,8 @@ short caption.
 - `--model <id>` — default `gemini-3.8-flash-tts`. Don't change unless you
   have a reason.
 - `--fallback-model <id>` — default `gemini-3.8-flash-lite-tts`. Used once when
-  the main model stays overloaded (429/503 after one retry) or keeps returning
-  no audio. Pass the same id as `--model` to disable the fallback.
+  the main model stays overloaded (429/503 after one retry), is not found (404),
+  or keeps returning no audio. Pass the same id as `--model` to disable the fallback.
 - `--out <file>` — output filename (default `voice.ogg`). Must end in `.ogg`
   for a Telegram voice bubble; other audio extensions are sent as music files.
 

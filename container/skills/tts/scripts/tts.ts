@@ -74,11 +74,12 @@ function partPcm(data: Buffer): { pcm: Buffer; rate?: string; channels?: string 
 
 /**
  * One synthesis attempt. Returns the PCM buffer (+ rate/channels) on success,
- * `'busy'` on 429/503 (model overloaded), `null` on any other retryable miss
+ * `'busy'` on 429/503 (model overloaded), `'missing'` on 404 (a preview model
+ * withdrawn or renamed), `null` on any other retryable miss
  * (transport, 5xx, or text instead of audio), or throws on a non-retryable
  * error (bad request / auth).
  */
-function attempt(model: string): Audio | 'busy' | null {
+function attempt(model: string): Audio | 'busy' | 'missing' | null {
   const url = `${HOST}/v1beta/models/${model}:generateContent`;
   // curl honors HTTPS_PROXY + the gateway CA exactly as the onecli-gateway skill
   // documents; the gateway injects the API key for the matching host.
@@ -110,6 +111,7 @@ function attempt(model: string): Audio | 'busy' | null {
   if (resp.error) {
     const code = Number(resp.error.code) || 0;
     if (code === 429 || code === 503) return 'busy'; // "high demand" — retry once, then fall back
+    if (code === 404) return 'missing'; // no such model — fall back at once
     if (code >= 500) return null; // server-side glitch — retry
     throw new Error(`API error ${code}: ${resp.error.message}`); // 4xx — surface it
   }
@@ -133,6 +135,7 @@ for (const m of models) {
   let busy = 0;
   for (let i = 1; i <= MAX_ATTEMPTS && !result; i++) {
     const r = attempt(m);
+    if (r === 'missing') break;
     if (r && r !== 'busy') result = r;
     else if (r === 'busy' && ++busy > 1) break; // still overloaded after one retry — fall back
     else if (i < MAX_ATTEMPTS) await Bun.sleep(500 * i);
