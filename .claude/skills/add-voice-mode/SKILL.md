@@ -496,7 +496,7 @@ server; a call the host does not answer ends at once with the URL in the log).
 Each idle job process loads the Silero models before a call reaches it. On
 SIGTERM it takes no new calls and gives running ones 60 seconds before closing
 them, so a restart cuts a longer call short. The job metadata is versioned
-(`v: 4`). A worker that gets a call of another version joins only to set its
+(`v: 5`). A worker that gets a call of another version joins only to set its
 `nanoclaw.voice.updating` attribute, so the caller's page says "The voice service
 is updating. Try again in a minute.", and leaves; the page says the same when
 no worker joins within 25 seconds (worker down, or an older one that turns such
@@ -560,11 +560,12 @@ TTS, captions and the agent state are the framework's. Then:
   voice-line call). A refused turn gets "That didn't go through.", a rate-limited
   one "Too many turns - give it a moment." (and their Ukrainian lines). When a
   reply cannot be synthesized, a line saying so. All of these also show as captions. The
-  worker also sends one JSON message per caller turn (noise is not reported) on the text stream topic
-  `nanoclaw.voice.turn`: `{"turn": n, "status": "sent" | "lost", "reason"?:
+  worker also sends JSON messages per caller turn (noise is not reported) on the text stream topic
+  `nanoclaw.voice.turn`: `{"turn": n, "status": "sending" | "sent" | "lost", "reason"?:
   "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
-  "sent" means the agent's session has the turn; a 504 is "timeout", 429
-  "rate_limited", any other refusal "rejected".
+  "sending" comes the moment the closing silence ends and the turn goes to the
+  host, before it answers; "sent" means the agent's session has the turn; a 504
+  is "timeout", 429 "rate_limited", any other refusal "rejected".
 - Right before each line it speaks, the worker sends one JSON message on
   `nanoclaw.voice.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
   true, "notice"?: true, "more"?: true}`. `turn` is the caller turn the agent
@@ -662,9 +663,13 @@ token reply carries `silenceMs` and `limit: {ms, kind: "duration" | "daily"}`:
 the listening hint names the pause that sends a turn, a thin line under the
 readout fills while `nanoclaw.voice.pending` counts down, caller lines show
 "turn n" and the first caption of a reply "re: turn n" (or "unprompted"), and a
-minute before the limit the hint says the call is about to end. Soft Web Audio
-tones mark a sent turn and, once the agent is done, the caller's turn;
-`?cues=0` turns them off. Microphone capture runs with echo cancellation, noise
+minute before the limit the hint says the call is about to end. Three short Web
+Audio cues let a caller follow the call without looking: a rising two-note
+(listening) once the worker's session hears the published microphone, a single
+high tick (sent) on a turn's "sending", and a falling two-note (your turn) once
+the agent is done and nothing else is queued. None plays while the agent speaks;
+the later "sent" is the caption mark alone. `?cues=0` turns them off, and
+`?demo=1` plays them too once its Call button is tapped. Microphone capture runs with echo cancellation, noise
 suppression and auto gain; DTX is off because the worker times turns by the
 silence it hears. On iOS Safari the call must be started with the Call button
 (audio unlocks on that tap) and joins relay-only (TURN over TLS; `?relay=1` /

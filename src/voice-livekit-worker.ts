@@ -1520,6 +1520,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       {
         onTurn: (text, take) => {
           const turn = ++turns;
+          // The page's "sent" cue: the turn closed, before the host has answered.
+          if (!ending) publish({ turn, status: 'sending' });
           turnTaking.onTurn(text, (host) => {
             if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
             if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {

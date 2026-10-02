@@ -93,6 +93,50 @@ export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking",
 
 export const PAGE_CLOSED = "The call ended when the page was closed."
 
+/**
+ * The call's sound cues, for a caller who is not looking at the screen: `listening` once the
+ * worker hears the caller, `sent` the moment a turn closes, `turn` when the agent is done and the
+ * microphone is open again.
+ */
+export type Cue = "listening" | "sent" | "turn"
+
+/** Each cue's notes as [Hz, start s, length s], and their peak gain. */
+const CUES: Record<Cue, { notes: ReadonlyArray<readonly [hz: number, at: number, len: number]>; peak: number }> = {
+  // A rising fifth: the line is open.
+  listening: { notes: [[784, 0, 0.09], [1175, 0.1, 0.11]], peak: 0.22 },
+  // One short high tick: the turn is on its way.
+  sent: { notes: [[1760, 0, 0.06]], peak: 0.3 },
+  // A falling third, like a doorbell: over to the caller.
+  turn: { notes: [[1319, 0, 0.09], [1047, 0.11, 0.12]], peak: 0.22 },
+}
+
+/** Call sound cues are on unless the link says `?cues=0`. */
+export function cuesEnabled(): boolean {
+  return new URLSearchParams(location.search).get("cues") !== "0"
+}
+
+/**
+ * Plays a cue on the gesture-unlocked context; nothing without one that runs. Short pure sine
+ * notes, mid-to-high so a phone speaker carries them, and nothing the worker's VAD takes for speech.
+ */
+export function playCue(ctx: AudioContext | null, cue: Cue) {
+  if (!ctx || ctx.state !== "running") return
+  const { notes, peak } = CUES[cue]
+  for (const [hz, at, len] of notes) {
+    const t = ctx.currentTime + at
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.type = "sine"
+    osc.frequency.value = hz
+    gain.gain.setValueAtTime(0.0001, t)
+    gain.gain.linearRampToValueAtTime(peak, t + 0.005)
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + len)
+    osc.connect(gain).connect(ctx.destination)
+    osc.start(t)
+    osc.stop(t + len + 0.01)
+  }
+}
+
 export function statusErrorKind(status: number): ErrorKind {
   if (status === 403) return "link"
   if (status === 429) return "limit"

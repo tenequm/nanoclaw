@@ -635,7 +635,11 @@ describe('runCall', () => {
       }),
     );
     expect(v.voice.setThinking).toHaveBeenCalledWith(true);
-    expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' });
+    // The page hears the turn closed before the host answers, then that the agent has it.
+    expect(v.voice.publishTurn.mock.calls.map(([status]) => status)).toEqual([
+      { turn: 1, status: 'sending' },
+      { turn: 1, status: 'sent', text: 'Book a table' },
+    ]);
 
     host.emit({ type: 'reply', text: 'Booked for eight.', turn: null });
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked for eight.'));
@@ -716,7 +720,8 @@ describe('runCall', () => {
     await vi.waitFor(() =>
       expect(v.voice.publishTurn).toHaveBeenLastCalledWith({ turn: 1, status: 'sent', text: 'Book a table' }),
     );
-    expect(v.voice.publishTurn).toHaveBeenCalledTimes(2);
+    // sending, lost (timeout), then sent once stored.
+    expect(v.voice.publishTurn).toHaveBeenCalledTimes(3);
     // The late turn's answer is labelled with it.
     host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.'));

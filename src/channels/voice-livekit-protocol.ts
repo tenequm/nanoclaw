@@ -18,7 +18,7 @@ export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
  * Wire version of the job metadata and the worker's attribute and topic names; host and worker
  * must agree, so they ship and restart together.
  */
-export const LIVEKIT_PROTOCOL_VERSION = 4;
+export const LIVEKIT_PROTOCOL_VERSION = 5;
 
 /** Streaming transcription over the Gemini Live API, verbatim. */
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
@@ -63,7 +63,7 @@ export interface LiveKitJobMetadata {
 export const CALL_THINKING_ATTRIBUTE = 'nanoclaw.voice.thinking';
 /** The worker's participant attribute: "1" when it cannot serve this host's protocol version. */
 export const CALL_UPDATING_ATTRIBUTE = 'nanoclaw.voice.updating';
-/** Text stream topic the worker sends one JSON `CallTurnStatus` on per caller turn. */
+/** Text stream topic the worker sends JSON `CallTurnStatus` messages on, per caller turn. */
 export const CALL_TURN_TOPIC = 'nanoclaw.voice.turn';
 
 /**
@@ -77,13 +77,14 @@ export interface CallRoomMetadata {
 }
 
 /**
- * What became of a caller turn: sent to the agent, or lost because the transcription failed
- * (`stt`) or heard no words (`empty`), or the host refused it (`rejected`, `rate_limited`) or
- * did not answer (`timeout`).
+ * What became of a caller turn: closed and on its way to the host (`sending`, the moment the
+ * closing silence ended, before the host answers), sent to the agent, or lost because the
+ * transcription failed (`stt`) or heard no words (`empty`), or the host refused it (`rejected`,
+ * `rate_limited`) or did not answer (`timeout`). A turn that is sent says `sending` first.
  */
 export interface CallTurnStatus {
   turn: number;
-  status: 'sent' | 'lost';
+  status: 'sending' | 'sent' | 'lost';
   reason?: 'stt' | 'rejected' | 'rate_limited' | 'timeout' | 'empty';
   /** The final transcript, when there is one. */
   text?: string;

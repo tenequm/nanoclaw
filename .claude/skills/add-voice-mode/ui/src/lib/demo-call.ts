@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { LIVE_PHASES, type Line, type Phase, type SendCue, type Speaker, type VoiceCall } from "./voice-call"
+import { LIVE_PHASES, cuesEnabled, playCue, type Cue, type Line, type Phase, type SendCue, type Speaker, type VoiceCall } from "./voice-call"
 
 /**
  * A scripted call with the same shape as the real one, for `?demo=1`: the page can be
  * tried without a microphone or a wired agent, and every state can be looked at.
- * Nothing here touches the host; the words and the levels are made up.
+ * Nothing here touches the host; the words and the levels are made up. The sound cues play
+ * where a real call plays them, once the Call button has unlocked audio (`?cues=0` silences them).
  */
 
 type Step = {
@@ -14,7 +15,7 @@ type Step = {
   text?: string
   /** The caller pauses at the end of this step and the send countdown runs. */
   cue?: boolean
-  /** The caller's last line was sent. */
+  /** The agent's session has the caller's last line: its sent mark. */
   sent?: boolean
   /** What this agent line answers. */
   re?: string
@@ -25,7 +26,8 @@ type Step = {
 }
 
 const AGENT = "Casa"
-// Walks through every cue: the send countdown, sent marks, what each reply answers, the limit note and an end reason.
+// Walks through every cue: the listening, sent and your-turn sounds, the send countdown, sent
+// marks, what each reply answers, the limit note and an end reason.
 const SCRIPT: Step[] = [
   { phase: "connecting", ms: 1300 },
   { phase: "listening", ms: 3600, from: "user", text: "Hey Casa, what did we decide about the launch date?", cue: true },
@@ -51,6 +53,8 @@ const SCRIPT: Step[] = [
   { phase: "ended", ms: 0, end: "Today's call minutes are used up." },
 ]
 const DEMO_SILENCE_MS = 2500
+/** How long after a turn closes the agent's session confirms it. */
+const DEMO_STORED_MS = 500
 
 export function useDemoCall(enabled: boolean): VoiceCall {
   const [phase, setPhase] = useState<Phase>("idle")
@@ -72,6 +76,7 @@ export function useDemoCall(enabled: boolean): VoiceCall {
   const inputLevel = useRef(0)
   const outputLevel = useRef(0)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const cueCtx = useRef<AudioContext | null>(null)
   phaseRef.current = phase
   mutedRef.current = muted
 
@@ -85,6 +90,10 @@ export function useDemoCall(enabled: boolean): VoiceCall {
 
   const later = useCallback((fn: () => void, ms: number) => {
     timers.current.push(window.setTimeout(fn, ms))
+  }, [])
+
+  const cue = useCallback((kind: Cue) => {
+    if (cuesEnabled()) playCue(cueCtx.current, kind)
   }, [])
 
   const streamLine = useCallback(
@@ -120,28 +129,47 @@ export function useDemoCall(enabled: boolean): VoiceCall {
         setPhase("ended")
         return
       }
+      // As on a real call: listening once connected, your turn once the agent is done.
+      const was = phaseRef.current
+      if (was === "connecting" && step.phase === "listening") cue("listening")
+      if (was === "talking" && step.phase === "listening") cue("turn")
+      phaseRef.current = step.phase
       setPhase(step.phase)
       if (step.text && step.from) streamLine(step.from, step.text, step.ms, step.re)
       if (step.cue) {
         // As the worker reports it: the caller stopped a moment ago, the rest of the silence is left.
         const left = 1600
         later(() => setSendCue({ id: `demo-${i}`, from: 1 - left / DEMO_SILENCE_MS, ms: left }), step.ms - left)
-        later(() => setSendCue(null), step.ms)
+        later(() => {
+          setSendCue(null)
+          cue("sent")
+        }, step.ms)
       }
       if (step.sent) {
         const turn = ++turns.current
-        setLines((prev) => {
-          const last = prev.findLast((l) => l.from === "user")
-          return last ? prev.map((l) => (l === last ? { ...l, mark: { status: "sent" }, turn } : l)) : prev
-        })
+        later(
+          () =>
+            setLines((prev) => {
+              const last = prev.findLast((l) => l.from === "user")
+              return last ? prev.map((l) => (l === last ? { ...l, mark: { status: "sent" }, turn } : l)) : prev
+            }),
+          DEMO_STORED_MS
+        )
       }
       if (step.limit) later(() => setLimitNote("Call ends in 1 min · daily voice limit."), step.ms / 2)
       later(() => runStep(i + 1), step.ms)
     },
-    [later, streamLine, clearTimers]
+    [later, streamLine, clearTimers, cue]
   )
 
   const start = useCallback(() => {
+    // Unlocked only when this runs inside a tap: the scripted first run plays no sound.
+    try {
+      cueCtx.current ??= new AudioContext()
+      void cueCtx.current.resume().catch(() => {})
+    } catch {
+      /* no Web Audio: a silent demo */
+    }
     clearTimers()
     setLines([])
     setMuted(false)
