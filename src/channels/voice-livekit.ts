@@ -55,6 +55,7 @@ import {
   DEFAULT_VOICE_TTS_VOICE,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
+  MAX_TURN_TEXT_BYTES,
   PING_INTERVAL_MS,
   WORKER_REQUEST_TIMEOUT_MS,
   type LiveKitHostEvent,
@@ -82,7 +83,7 @@ const CALLER_TOKEN_TTL_SECONDS = 120;
 /** The worker opens its event stream right after it reports the caller in; without it nothing reaches the caller. */
 const WORKER_STREAM_TIMEOUT_MS = 30_000;
 /** A turn is at most 90 s of speech; Ukrainian runs about 4 KB of UTF-8 for that. */
-const MAX_UTTERANCE_BYTES = 8 * 1024;
+const MAX_UTTERANCE_BYTES = MAX_TURN_TEXT_BYTES;
 const MAX_UTTERANCES_PER_MINUTE = 20;
 /** The router has this long to store a turn in the agent's session, so the worker hears the 504 before it gives up. */
 const ROUTE_TIMEOUT_MS = WORKER_REQUEST_TIMEOUT_MS - 2_000;
@@ -779,7 +780,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         canPublish: true,
         canPublishSources: [TrackSource.MICROPHONE],
         canSubscribe: true,
-        canPublishData: false,
+        // Review mode's RPCs to the worker travel as data packets; LiveKit has no grant for RPC alone.
+        // The worker answers only its own methods, and only from this identity.
+        canPublishData: true,
         canUpdateOwnMetadata: false,
       });
       token = await at.toJwt();

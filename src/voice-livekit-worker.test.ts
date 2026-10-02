@@ -15,6 +15,7 @@ import {
   normalizeLanguage,
   stt,
   tts,
+  voice as agentsVoice,
   type APIConnectOptions,
   type VAD,
 } from '@livekit/agents';
@@ -24,7 +25,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
+  type CallReviewState,
   type LiveKitJobMetadata,
+  type ReviewOp,
+  type ReviewRequest,
 } from './channels/voice-livekit-protocol.js';
 import {
   AWAIT_REPLY_MS,
@@ -52,6 +56,11 @@ import {
   TurnCapture,
   TurnTaking,
   callSession,
+  CLEAR_SETTLE_MS,
+  FLUSH_TIMEOUT_MS,
+  readReviewRequest,
+  ReviewControl,
+  type ReviewDeps,
   wholeReplySpeech,
   writeTurnRecording,
   type CallJob,
@@ -1239,5 +1248,461 @@ describe('SendCountdown', () => {
     vi.advanceTimersByTime(1);
     expect(published).toEqual(['1:500:2500', '']);
     vi.useRealTimers();
+  });
+});
+
+/** Review mode's session controls, recorded; transcripts are fed through `heard`. */
+function fakeReviewVoice() {
+  const states: CallReviewState[] = [];
+  let stream = 1;
+  const voice = {
+    manual: false,
+    input: true,
+    flushing: false,
+    clears: 0,
+    minMs: 0,
+    setManualTurns: vi.fn((manual: boolean) => void (voice.manual = manual)),
+    setInput: vi.fn((enabled: boolean) => void (voice.input = enabled)),
+    setFlushing: vi.fn((on: boolean) => void (voice.flushing = on)),
+    clearTurn: vi.fn(() => {
+      voice.clears++;
+      return ++stream;
+    }),
+    flushMinMs: () => voice.minMs,
+    takeTurn: vi.fn((): TurnTake => ({ sttModel: 'gemini-3.5-transcribe-live' })),
+    publishReview: vi.fn((state: CallReviewState) => void states.push(state)),
+  };
+  return {
+    voice,
+    states,
+    get stream() {
+      return stream;
+    },
+    get last() {
+      return states.at(-1)!;
+    },
+  };
+}
+
+function reviewControl(overrides: Partial<ReviewDeps> = {}) {
+  const r = fakeReviewVoice();
+  const posted: Array<{ text: string; draft: number }> = [];
+  const capture: boolean[] = [];
+  const control = new ReviewControl({
+    voice: r.voice,
+    post: vi.fn((text: string, draft: number) => {
+      posted.push({ text, draft });
+      return posted.length;
+    }),
+    lastPosted: () => posted.length,
+    setCaptureOpen: (open) => capture.push(open),
+    resetCaller: vi.fn(),
+    log: { info: () => undefined, warn: () => undefined },
+    ...overrides,
+  });
+  let gen = 0;
+  const op = (name: ReviewOp, fields: Partial<ReviewRequest> = {}) => control.handle(name, { gen: ++gen, ...fields });
+  /** The draft the page is looking at. */
+  const draft = () => r.last.draft;
+  /** A transcript from the session's transcription, on its current stream unless named. */
+  const heard = (text: string, final: boolean, stream = r.stream) => control.onTranscript(text, final, stream);
+  return { control, r, posted, capture, op, draft, heard };
+}
+
+/** Lets the flush poll run until the quiet time has passed. */
+const settle = () => vi.advanceTimersByTimeAsync(FLUSH_QUIET_MS_FOR_TESTS);
+const FLUSH_QUIET_MS_FOR_TESTS = 600;
+
+describe('review mode', () => {
+  it('talk opens the input, done flushes and freezes the final text, send posts exactly that text', async () => {
+    vi.useFakeTimers();
+    const { r, posted, capture, op, draft, heard } = reviewControl();
+    expect(await op('mode', { mode: 'review', afterTurn: 0 })).toMatchObject({ ok: true });
+    expect(r.voice.manual).toBe(true);
+    expect(r.voice.input).toBe(false);
+    expect(draft()).toBeNull();
+
+    const talk = await op('talk');
+    expect(talk).toMatchObject({ ok: true, draft: 1 });
+    expect(r.voice.input).toBe(true);
+    expect(capture).toEqual([true]);
+    expect(draft()).toEqual({ id: 1, state: 'recording', text: '' });
+
+    heard('Book a', false);
+    heard('Book a table for two.', true);
+    heard('At eight', false);
+    expect(await op('done', { draft: 1 })).toMatchObject({ ok: true });
+    expect(r.voice.input).toBe(false);
+    expect(r.voice.flushing).toBe(true);
+    expect(draft()).toMatchObject({ id: 1, state: 'finishing' });
+    // The flush's silence lets the transcription finalize the last words.
+    await vi.advanceTimersByTimeAsync(200);
+    heard('At eight, please.', true);
+    expect(draft()?.state).toBe('finishing');
+    await settle();
+    expect(r.voice.flushing).toBe(false);
+    expect(draft()).toEqual({ id: 1, state: 'ready', text: 'Book a table for two. At eight, please.' });
+    // The session's own turn is cleared, so nothing of it is ever committed by the session.
+    expect(r.voice.clears).toBe(1);
+    expect(posted).toEqual([]);
+
+    expect(await op('send', { draft: 1 })).toMatchObject({ ok: true, turn: 1 });
+    expect(posted).toEqual([{ text: 'Book a table for two. At eight, please.', draft: 1 }]);
+    expect(draft()).toBeNull();
+    // A repeated send is stale: never a second post.
+    expect(await op('send', { draft: 1 })).toMatchObject({ ok: false, error: 'stale' });
+    expect(posted).toHaveLength(1);
+  });
+
+  it('drops a transcript that arrives after a discard, and keeps the next recording clean', async () => {
+    vi.useFakeTimers();
+    const { r, posted, op, draft, heard } = reviewControl();
+    await op('mode', { mode: 'review' });
+    await op('talk');
+    heard('Cancel my', false);
+    const oldStream = r.stream;
+    const discarding = op('discard', { draft: 1 });
+    // The clear holds the next operation until the restarted transcription settles.
+    const talking = op('talk');
+    let talked = false;
+    void talking.then(() => (talked = true));
+    await vi.advanceTimersByTimeAsync(CLEAR_SETTLE_MS - 10);
+    expect(talked).toBe(false);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(await discarding).toMatchObject({ ok: true });
+    expect(await talking).toMatchObject({ ok: true, draft: 2 });
+    // The old stream's late final for the discarded words is dropped.
+    heard('Cancel my subscription.', true, oldStream);
+    heard('Keep it.', true);
+    await op('done', { draft: 2 });
+    await settle();
+    expect(draft()).toEqual({ id: 2, state: 'ready', text: 'Keep it.' });
+    expect(posted).toEqual([]);
+    // A stale id for an earlier draft changes nothing.
+    expect(await op('send', { draft: 1 })).toMatchObject({ ok: false, error: 'stale' });
+    expect(await op('discard', { draft: 1 })).toMatchObject({ ok: false, error: 'stale' });
+    expect(draft()?.id).toBe(2);
+  });
+
+  it('a discard during the flush wins: the late text never reappears and nothing is sent', async () => {
+    vi.useFakeTimers();
+    const { r, posted, op, draft, heard } = reviewControl();
+    await op('mode', { mode: 'review' });
+    await op('talk');
+    heard('Delete the', false);
+    await op('done', { draft: 1 });
+    const discarding = op('discard', { draft: 1 });
+    await vi.advanceTimersByTimeAsync(CLEAR_SETTLE_MS);
+    expect(await discarding).toMatchObject({ ok: true });
+    expect(draft()).toBeNull();
+    heard('Delete the files.', true);
+    await vi.advanceTimersByTimeAsync(FLUSH_TIMEOUT_MS + 100);
+    expect(draft()).toBeNull();
+    expect(r.voice.flushing).toBe(false);
+    expect(r.states.every((s) => s.draft?.text !== 'Delete the files.')).toBe(true);
+    expect(posted).toEqual([]);
+  });
+
+  it('says nothing was heard, lets talk retry from there, and never posts an empty draft', async () => {
+    vi.useFakeTimers();
+    const { op, draft, posted } = reviewControl();
+    await op('mode', { mode: 'review' });
+    await op('talk');
+    await op('done', { draft: 1 });
+    await settle();
+    expect(draft()).toEqual({ id: 1, state: 'empty', text: '' });
+    expect(await op('send', { draft: 1 })).toMatchObject({ ok: false, error: 'unsendable' });
+    expect(await op('talk')).toMatchObject({ ok: true, draft: 2 });
+    expect(posted).toEqual([]);
+  });
+
+  it('marks an oversize draft too long by its UTF-8 bytes and refuses to send it', async () => {
+    vi.useFakeTimers();
+    const { op, draft, posted, heard } = reviewControl();
+    await op('mode', { mode: 'review' });
+    await op('talk');
+    // 4200 Cyrillic letters: under 8 K characters, over 8 KB.
+    heard('я'.repeat(4200), true);
+    await op('done', { draft: 1 });
+    await settle();
+    expect(draft()).toMatchObject({ state: 'ready', tooLong: true });
+    expect(draft()?.text).toHaveLength(4200);
+    expect(await op('send', { draft: 1 })).toMatchObject({ ok: false, error: 'unsendable' });
+    expect(posted).toEqual([]);
+  });
+
+  it('leaves words the transcription never finalized unverified, and a failed transcription unsendable', async () => {
+    vi.useFakeTimers();
+    const { control, op, draft, heard } = reviewControl();
+    await op('mode', { mode: 'review' });
+    await op('talk');
+    heard('Send it to', true);
+    heard('the whole', false);
+    await op('done', { draft: 1 });
+    await vi.advanceTimersByTimeAsync(FLUSH_TIMEOUT_MS + 100);
+    expect(draft()).toEqual({ id: 1, state: 'failed', text: 'Send it to the whole' });
+    expect(await op('send', { draft: 1 })).toMatchObject({ ok: false, error: 'unsendable' });
+    await op('discard', { draft: 1 });
+    await vi.advanceTimersByTimeAsync(CLEAR_SETTLE_MS);
+
+    await op('talk');
+    heard('Hello.', true);
+    control.onSttError();
+    await op('done', { draft: 2 });
+    await settle();
+    expect(draft()).toMatchObject({ id: 2, state: 'failed', text: 'Hello.' });
+  });
+
+  it('auto to review mid-utterance: the auto commit is cancelled and the words become one draft, unsent', async () => {
+    vi.useFakeTimers();
+    const { control, r, posted, op, draft, heard } = reviewControl();
+    // Auto mode hears a turn in progress: a final, more speech under way.
+    heard('Remind me', true);
+    control.onCallerSpeaking(true);
+    heard('tomorrow at', false);
+    expect(await op('mode', { mode: 'review', afterTurn: 0 })).toEqual({ gen: 1, ok: true, seq: 1 });
+    // Manual turns cancel the pending auto commit; the input stops.
+    expect(r.voice.manual).toBe(true);
+    expect(r.voice.input).toBe(false);
+    expect(draft()).toMatchObject({ id: 1, state: 'finishing', reason: 'switch' });
+    heard('tomorrow at nine.', true);
+    await settle();
+    expect(draft()).toEqual({ id: 1, state: 'ready', text: 'Remind me tomorrow at nine.', reason: 'switch' });
+    expect(posted).toEqual([]);
+    // Back to auto is refused while the draft is open: no send, no discard, no deferred switch.
+    expect(await op('mode', { mode: 'auto' })).toMatchObject({ ok: false, error: 'draft_open' });
+    expect(r.last.mode).toBe('review');
+  });
+
+  it('auto to review after the auto commit won: names the submitted turn and opens no duplicate draft', async () => {
+    vi.useFakeTimers();
+    let lastPosted = 0;
+    const { control, op, draft, heard } = reviewControl({ lastPosted: () => lastPosted });
+    heard('Book a table.', true);
+    // The auto commit fires before the page's request lands.
+    lastPosted = 3;
+    control.onAutoTurnClosed();
+    expect(await op('mode', { mode: 'review', afterTurn: 2 })).toMatchObject({ ok: true, submitted: 3 });
+    expect(draft()).toBeNull();
+    await vi.advanceTimersByTimeAsync(FLUSH_TIMEOUT_MS + 100);
+    expect(draft()).toBeNull();
+    // Already seen by the page: nothing to report.
+    await op('mode', { mode: 'auto' });
+    expect(await op('mode', { mode: 'review', afterTurn: 3 })).not.toHaveProperty('submitted');
+  });
+
+  it('switching modes never posts, and back to auto waits for the draft and keeps the mic off', async () => {
+    vi.useFakeTimers();
+    const { r, posted, op, draft, heard } = reviewControl();
+    await op('mode', { mode: 'review' });
+    await op('talk');
+    heard('Hi.', true);
+    expect(await op('mode', { mode: 'auto' })).toMatchObject({ ok: false, error: 'recording' });
+    await op('done', { draft: 1 });
+    expect(await op('mode', { mode: 'auto' })).toMatchObject({ ok: false, error: 'finishing' });
+    await settle();
+    expect(await op('mode', { mode: 'auto' })).toMatchObject({ ok: false, error: 'draft_open' });
+    await op('discard', { draft: 1 });
+    expect(await op('mode', { mode: 'auto' })).toMatchObject({ ok: true });
+    expect(r.voice.manual).toBe(false);
+    // The worker hears again; the page keeps its microphone muted until the caller unmutes.
+    expect(r.voice.input).toBe(true);
+    expect(draft()).toBeNull();
+    expect(await op('talk')).toMatchObject({ ok: false, error: 'not_review' });
+    expect(posted).toEqual([]);
+    // The same mode again only re-reads the state (after a reconnect).
+    const before = r.states.length;
+    expect(await op('mode', { mode: 'auto' })).toMatchObject({ ok: true });
+    expect(r.states).toHaveLength(before + 1);
+  });
+
+  it('a reply taking the channel stops the recording into a draft, and talk waits for the agent', async () => {
+    vi.useFakeTimers();
+    const { control, r, capture, op, draft, posted, heard } = reviewControl();
+    await op('mode', { mode: 'review' });
+    await op('talk');
+    heard('Order the', true);
+    control.beforeAgentSpeaks();
+    expect(r.voice.input).toBe(false);
+    expect(capture).toEqual([true, false]);
+    expect(draft()).toMatchObject({ state: 'finishing', reason: 'agent' });
+    control.onAgentSpeaking(true);
+    await settle();
+    expect(draft()).toEqual({ id: 1, state: 'ready', text: 'Order the', reason: 'agent' });
+    // Done after the fact asks for nothing more; the capture never resumes by itself.
+    expect(await op('done', { draft: 1 })).toMatchObject({ ok: true });
+    expect(r.voice.input).toBe(false);
+    // A draft open while the agent speaks can still be sent: a follow-up.
+    expect(await op('send', { draft: 1 })).toMatchObject({ ok: true });
+    expect(await op('talk')).toMatchObject({ ok: false, error: 'agent_speaking' });
+    control.onAgentSpeaking(false);
+    expect(await op('talk')).toMatchObject({ ok: true });
+    expect(posted).toEqual([{ text: 'Order the', draft: 1 }]);
+  });
+
+  it('refuses everything once the call ended', async () => {
+    const { control, op, posted } = reviewControl();
+    control.close();
+    expect(await op('mode', { mode: 'review' })).toMatchObject({ ok: false, error: 'closed' });
+    expect(posted).toEqual([]);
+  });
+
+  it('reads only well-formed review requests', () => {
+    expect(readReviewRequest('{"gen":3,"draft":2}')).toEqual({ gen: 3, draft: 2 });
+    expect(readReviewRequest('{"gen":1,"mode":"review","afterTurn":4}')).toEqual({
+      gen: 1,
+      mode: 'review',
+      afterTurn: 4,
+    });
+    expect(readReviewRequest('{"gen":1,"mode":"walkie"}')).toEqual({ gen: 1 });
+    expect(readReviewRequest('{"draft":2}')).toBeNull();
+    expect(readReviewRequest('nope')).toBeNull();
+  });
+});
+
+describe('review mode in a call', () => {
+  /** fakeVoice with review controls; `rpc` calls what the worker serves, as the page would. */
+  function reviewCall() {
+    const v = fakeVoice();
+    const r = fakeReviewVoice();
+    let handle!: (op: ReviewOp, payload: string, callerIdentity: string) => Promise<string>;
+    const serve = vi.fn((h: typeof handle) => void (handle = h));
+    Object.assign(v.voice, { review: { ...r.voice, serve } });
+    let gen = 0;
+    const rpc = async (op: ReviewOp, fields: Partial<ReviewRequest> = {}, caller = 'caller-1') =>
+      JSON.parse(await handle(op, JSON.stringify({ gen: ++gen, ...fields }), caller)) as Record<string, unknown>;
+    return { v, r, serve, rpc };
+  }
+
+  it('posts exactly the sent draft through the turn path, and an auto commit that lost the race posts nothing', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const { v, r, serve, rpc } = reviewCall();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    expect(serve).toHaveBeenCalledOnce();
+
+    // Auto mode first: a turn in progress, then the switch; the session's commit lands after it.
+    v.events.onTranscript?.('Call the', true, 1);
+    expect(await rpc('mode', { mode: 'review', afterTurn: 0 })).toMatchObject({ ok: true });
+    v.events.onTurn('Call the', { sttModel: 'gemini-3.5-transcribe-live' });
+    expect(v.events.reviewing?.()).toBe(true);
+    v.events.onTranscript?.('plumber.', true, 1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(r.last.draft).toEqual({ id: 1, state: 'ready', text: 'Call the plumber.', reason: 'switch' });
+    expect(host.calls.some((c) => c.url.endsWith('/utterance'))).toBe(false);
+
+    expect(await rpc('send', { draft: 1 })).toMatchObject({ ok: true, turn: 1 });
+    vi.useRealTimers();
+    await vi.waitFor(() =>
+      expect(host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text)).toEqual([
+        'Call the plumber.',
+      ]),
+    );
+    // The page shows the sent draft's own text as the turn, then the agent's confirmation.
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn.mock.calls.map(([status]) => status)).toEqual([
+        { turn: 1, status: 'sending', text: 'Call the plumber.', draft: 1 },
+        { turn: 1, status: 'sent', text: 'Call the plumber.' },
+      ]),
+    );
+    // Nothing on a pause in review: a lost or dropped auto turn is not reported either.
+    v.events.onTurnLost('empty', {}, { sttModel: 'gemini-3.5-transcribe-live' });
+    v.events.onTurnDropped({ sttModel: 'gemini-3.5-transcribe-live' });
+    expect(v.voice.publishTurn).toHaveBeenCalledTimes(2);
+    host.endStream();
+  });
+
+  it('answers only the caller, and a reply that waited out a recording stops it into a draft', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const { v, r, rpc } = reviewCall();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    await expect(rpc('mode', { mode: 'review' }, 'someone-else')).rejects.toThrow();
+    await rpc('mode', { mode: 'review' });
+    expect(await rpc('talk')).toMatchObject({ ok: true, draft: 1 });
+    v.events.onTranscript?.('Wait, also', true, 1);
+    host.emit({ type: 'reply', text: 'Booked.', turn: null });
+    // The reply holds while the caller records, for a while.
+    await vi.advanceTimersByTimeAsync(META.silenceMs + MAX_IDLE_WAIT_MS - 100);
+    expect(v.voice.say).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(v.voice.say).toHaveBeenCalledWith('Booked.');
+    expect(r.voice.input).toBe(false);
+    expect(r.states.some((st) => st.draft?.state === 'finishing' && st.draft.reason === 'agent')).toBe(true);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(r.last.draft).toEqual({ id: 1, state: 'ready', text: 'Wait, also', reason: 'agent' });
+    expect(host.calls.some((c) => c.url.endsWith('/utterance'))).toBe(false);
+    host.endStream();
+  });
+});
+
+describe('review mode in the session', () => {
+  it('feeds the flush silence straight to the transcription, and numbers each stream it hears', async () => {
+    const heard: Array<[string, boolean, number]> = [];
+    const events: CallVoiceEvents = {
+      onTurn: () => undefined,
+      onCallerSpeaking: () => undefined,
+      onTurnLost: () => undefined,
+      onTurnDropped: () => undefined,
+      onClosed: () => undefined,
+      onTranscript: (text, final, stream) => void heard.push([text, final, stream]),
+    };
+    const vad = {} as VAD;
+    const { agent, review } = callSession(META, { geminiKey: 'gk-test', record: false }, { vad }, events, {
+      ...silentLog,
+      error: () => undefined,
+    });
+    // The session's own STT node: it reports what audio reached it and transcribes on cue.
+    const reached: number[] = [];
+    const node = vi.spyOn(agentsVoice.Agent.prototype, 'sttNode').mockImplementation(async (audio) => {
+      const frames = audio as ReadableStream<AudioFrame>;
+      return new ReadableStream<stt.SpeechEvent>({
+        async start(controller) {
+          for await (const frame of frames) {
+            reached.push(frame.samplesPerChannel);
+            const said = (frame.data[0] ?? 0) === 7 ? 'hello' : '';
+            if (said) {
+              controller.enqueue({
+                type: stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives: [
+                  { text: said, language: normalizeLanguage('en'), startTime: 0, endTime: 0, confidence: 1 },
+                ],
+              });
+            }
+          }
+          controller.close();
+        },
+      });
+    });
+    try {
+      let push!: (frame: AudioFrame) => void;
+      let endAudio!: () => void;
+      const audio = new ReadableStream<AudioFrame>({
+        start(c) {
+          push = (f) => c.enqueue(f);
+          endAudio = () => c.close();
+        },
+      });
+      const events1 = (await agent.sttNode(audio, {} as never)) as ReadableStream<stt.SpeechEvent>;
+      const reader = events1.getReader();
+      const caller = new Int16Array(160).fill(7);
+      push(new AudioFrame(caller, 16_000, 1, 160));
+      await reader.read();
+      expect(heard).toEqual([['hello', true, 1]]);
+      // With the input off nothing arrives from the room; the flush still feeds 100 ms chunks.
+      review.setFlushing(true);
+      await vi.waitFor(() => expect(reached.filter((n) => n === 1600).length).toBeGreaterThanOrEqual(2));
+      review.setFlushing(false);
+      const fed = reached.length;
+      await new Promise((r) => setTimeout(r, 250));
+      expect(reached).toHaveLength(fed);
+      endAudio();
+      // A restarted transcription is the next stream.
+      expect(review.clearTurn()).toBe(2);
+    } finally {
+      node.mockRestore();
+    }
   });
 });

@@ -476,7 +476,8 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       canPublish: true,
       canPublishSources: ['microphone'],
       canSubscribe: true,
-      canPublishData: false,
+      // Review mode's RPCs to the worker are data packets.
+      canPublishData: true,
     });
     // The worker's secret is not in what the browser holds either.
     expect(body.token).not.toContain(secret);
