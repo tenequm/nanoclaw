@@ -1,7 +1,29 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { createLocalAudioTrack, Room, RoomEvent, Track, type LocalAudioTrack, type RemoteParticipant, type RemoteTrack } from "livekit-client"
+import {
+  createLocalAudioTrack,
+  Room,
+  RoomEvent,
+  Track,
+  TrackEvent,
+  type LocalAudioTrack,
+  type RemoteParticipant,
+  type RemoteTrack,
+} from "livekit-client"
 import { useAudioPlayback, useParticipantAttributes, useRemoteParticipants, useTextStream, useTranscriptions } from "@livekit/components-react"
-import { LIVE_PHASES, errorText, levelsFromStats, micErrorText, type Line, type Phase, type TurnMark, type VoiceCall } from "./voice-call"
+import {
+  CallError,
+  LIVE_PHASES,
+  errorText,
+  levelsFromStats,
+  micErrorKind,
+  micErrorText,
+  statusErrorKind,
+  type ErrorKind,
+  type Line,
+  type Phase,
+  type TurnMark,
+  type VoiceCall,
+} from "./voice-call"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -23,6 +45,7 @@ const TURN_TOPIC = "nanoclaw.walkie.turn"
 /** Without a worker in the room after this long, it is down or mid-update (host and worker restart together). */
 const AGENT_JOIN_MS = 25_000
 const UPDATING = "The voice service is updating. Try again in a minute."
+const NO_AGENT = "The voice service did not answer the call."
 
 interface TurnStatus extends TurnMark {
   turn: number
@@ -39,13 +62,14 @@ function isTurnStatus(v: unknown): v is TurnStatus {
   return !!s && typeof s.turn === "number" && (s.status === "sent" || s.status === "lost")
 }
 
-function tokenErrorText(status: number, body: string): string {
+function tokenError(status: number, body: string): CallError {
   const said = body.trim()
+  const kind = statusErrorKind(status)
   // The host's own words say which limit: the hourly starts or the day's minutes.
-  if (status === 429 && said) return said
-  if (status === 409) return "This call attempt is no longer active. Try again."
-  if (status === 502) return "Could not open the call room. Try again."
-  return errorText(status, said)
+  if (status === 429 && said) return new CallError(said, kind)
+  if (status === 409) return new CallError("This call attempt is no longer active. Try again.", kind)
+  if (status === 502) return new CallError("Could not open the call room. Try again.", kind)
+  return new CallError(errorText(status, said), kind)
 }
 
 /**
@@ -82,7 +106,7 @@ function applyTurn(lines: Line[], covered: Set<number>, status: TurnStatus, newL
   const target =
     (said ? [...open].reverse().find((l) => norm(l.text) !== "" && said.includes(norm(l.text))) : undefined) ?? open[open.length - 1]
   if (!target) {
-    const line = { ...newLine(), text: status.text?.trim() || "…", mark }
+    const line = { ...newLine(), text: status.text?.trim() ?? "", mark }
     covered.add(line.id)
     return [...lines, line]
   }
@@ -96,6 +120,7 @@ function applyTurn(lines: Line[], covered: Set<number>, status: TurnStatus, newL
 export function useLiveKitCall(token: string, fallbackAgent = "your agent"): VoiceCall {
   const [phase, setPhaseState] = useState<Phase>(token ? "idle" : "error")
   const [error, setError] = useState<string | null>(token ? null : "This link is missing its token. Ask for the full call link.")
+  const [errorKind, setErrorKind] = useState<ErrorKind | null>(token ? null : "link")
   const [endedText, setEndedText] = useState<string | null>(null)
   const [lines, setLinesState] = useState<Line[]>([])
   const [streamingId, setStreamingId] = useState<number | null>(null)
@@ -103,6 +128,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const [chat, setChat] = useState<string | null>(null)
   const [elapsed, setElapsed] = useState(0)
   const [muted, setMutedState] = useState(false)
+  const [muteError, setMuteError] = useState<string | null>(null)
+  const [reconnecting, setReconnecting] = useState(false)
   const [micStream, setMicStream] = useState<MediaStream | null>(null)
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
   /** Room connected and the microphone published: from here the agent's state drives the phase. */
@@ -131,6 +158,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const mutedRef = useRef(false)
   const micRaw = useRef(0)
   const agentRaw = useRef(0)
+  const muteBusy = useRef(false)
   const inputLevel = useRef(0)
   const outputLevel = useRef(0)
   const audioRef = useRef<HTMLAudioElement | null>(null)
@@ -217,6 +245,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       outputLevel.current = 0
       mutedRef.current = false
       setMutedState(false)
+      setMuteError(null)
+      setReconnecting(false)
       setMicStream(null)
       setRemoteStream(null)
       setStreaming(null)
@@ -237,9 +267,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   )
 
   const fail = useCallback(
-    (message: string, reason?: string) => {
+    (message: string, kind: ErrorKind, reason?: string) => {
       teardown(true, reason)
       setError(message)
+      setErrorKind(kind)
       setPhase("error")
     },
     [teardown, setPhase]
@@ -259,10 +290,26 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       remote.current = null
       setRemoteStream(null)
     }
+    const onReconnecting = () => {
+      if (active.current) setReconnecting(true)
+    }
+    const onReconnected = () => setReconnecting(false)
+    // The host rewrites the room metadata when a mid-call /voice moves the call (WalkieRoomMetadata).
+    const onMetadata = (metadata: string | undefined) => {
+      if (!active.current || !metadata) return
+      try {
+        const m = JSON.parse(metadata) as { chat?: unknown }
+        if (typeof m.chat === "string") setChat(m.chat || null)
+        else if (m.chat === null) setChat(null)
+      } catch {
+        /* not ours */
+      }
+    }
     const onLeft = (p: RemoteParticipant) => {
       if (active.current && p.isAgent) end(true, `${agentNameRef.current} left the call.`)
     }
     const onDisconnected = () => {
+      setReconnecting(false)
       // Before the caller is in, a failed connect() reports the error itself.
       if (active.current && joinedRef.current) end(true, "The call ended.")
     }
@@ -270,11 +317,17 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     room.on(RoomEvent.TrackUnsubscribed, onUntrack)
     room.on(RoomEvent.ParticipantDisconnected, onLeft)
     room.on(RoomEvent.Disconnected, onDisconnected)
+    room.on(RoomEvent.Reconnecting, onReconnecting)
+    room.on(RoomEvent.Reconnected, onReconnected)
+    room.on(RoomEvent.RoomMetadataChanged, onMetadata)
     return () => {
       room.off(RoomEvent.TrackSubscribed, onTrack)
       room.off(RoomEvent.TrackUnsubscribed, onUntrack)
       room.off(RoomEvent.ParticipantDisconnected, onLeft)
       room.off(RoomEvent.Disconnected, onDisconnected)
+      room.off(RoomEvent.Reconnecting, onReconnecting)
+      room.off(RoomEvent.Reconnected, onReconnected)
+      room.off(RoomEvent.RoomMetadataChanged, onMetadata)
     }
   }, [room, end])
 
@@ -283,7 +336,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (!joined || !agent || !agentAttributes) return
     const p = phaseRef.current
     if (p !== "connecting" && !LIVE_PHASES.has(p)) return
-    if (agentAttributes[UPDATING_ATTR] === "1") return fail(UPDATING, "updating")
+    if (agentAttributes[UPDATING_ATTR] === "1") return fail(UPDATING, "updating", "updating")
     const next = agentPhase(agentAttributes)
     if (!next) return
     if (p === "connecting") {
@@ -352,6 +405,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     const p = phaseRef.current
     if (p === "connecting" || LIVE_PHASES.has(p)) return
     setError(null)
+    setErrorKind(null)
     setEndedText(null)
     commitLines([])
     segmentLine.current.clear()
@@ -385,10 +439,18 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       }
       mic.current = track
       setMicStream(new MediaStream([track.mediaStreamTrack]))
+      // The SDK can mute the track itself (an interruption, a lost device): the key follows it.
+      const follow = () => {
+        if (mic.current !== track || muteBusy.current) return
+        mutedRef.current = track.isMuted
+        setMutedState(track.isMuted)
+      }
+      track.on(TrackEvent.Muted, follow)
+      track.on(TrackEvent.Unmuted, follow)
 
       const res = await fetch(voiceEndpoint("livekit/token", token), { method: "POST" })
       const body = await res.text()
-      if (!res.ok) throw new Error(tokenErrorText(res.status, body))
+      if (!res.ok) throw tokenError(res.status, body)
       const session = JSON.parse(body) as { url: string; token: string; callId: string; agent?: string; chat?: string }
       a.callId = session.callId
       // Cancelled while the host opened the room: it holds a call for us, so end it.
@@ -400,7 +462,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         await room.connect(session.url, session.token, forceRelay() ? { autoSubscribe: true, rtcConfig: { iceTransportPolicy: "relay" } } : { autoSubscribe: true })
       } catch (err) {
         if (cancelled()) return
-        throw new Error(`Could not connect to the call. ${err instanceof Error ? err.message : String(err)}`)
+        throw new CallError(`Could not connect to the call. ${err instanceof Error ? err.message : String(err)}`, "other")
       }
       if (cancelled()) return
       // DTX off: the worker times the caller's turn by the silence it hears, so silence must keep arriving.
@@ -410,24 +472,40 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       setJoined(true)
       agentTimer.current = window.setTimeout(() => {
         agentTimer.current = null
-        if (phaseRef.current === "connecting") fail(UPDATING, "no-agent")
+        if (phaseRef.current === "connecting") fail(NO_AGENT, "offline", "no-agent")
       }, AGENT_JOIN_MS)
     } catch (err) {
       if (cancelled()) return
-      fail(micErrorText(err) ?? (err instanceof Error ? err.message : String(err)))
+      fail(micErrorText(err) ?? (err instanceof Error ? err.message : String(err)), micErrorKind(err) ?? (err instanceof CallError ? err.kind : "other"))
     }
   }, [token, room, commitLines, endOnServer, fail, setPhase, setStreaming, setJoined])
 
   const endCall = useCallback(() => end(true, "Call ended."), [end])
 
+  // The key shows what the track actually did, not what was asked of it.
   const toggleMute = useCallback(() => {
     const track = mic.current
-    if (!track) return
-    const next = !mutedRef.current
-    mutedRef.current = next
-    void (next ? track.mute() : track.unmute()).catch(() => {})
-    setMutedState(next)
+    if (!track || muteBusy.current) return
+    const next = !track.isMuted
+    muteBusy.current = true
+    setMuteError(null)
+    void (next ? track.mute() : track.unmute())
+      .catch(() => {
+        if (mic.current === track) setMuteError(next ? "Mute failed" : "Unmute failed")
+      })
+      .finally(() => {
+        muteBusy.current = false
+        if (mic.current !== track) return
+        mutedRef.current = track.isMuted
+        setMutedState(track.isMuted)
+      })
   }, [])
+
+  useEffect(() => {
+    if (!muteError) return
+    const t = window.setTimeout(() => setMuteError(null), 4000)
+    return () => window.clearTimeout(t)
+  }, [muteError])
 
   const live = LIVE_PHASES.has(phase)
 
@@ -500,25 +578,34 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     }
   }, [live, setStreaming])
 
-  // A browser that still holds the agent's audio plays it on the caller's next tap.
+  // A browser that still holds the agent's audio plays it once the caller taps the page's own button.
   const audioBlocked = live && !canPlayAudio
-  useEffect(() => {
-    if (!audioBlocked) return
-    const unlock = () => {
-      room.startAudio().catch(() => {})
-    }
-    window.addEventListener("pointerdown", unlock)
-    return () => window.removeEventListener("pointerdown", unlock)
-  }, [audioBlocked, room])
+  const unlockAudio = useCallback(() => {
+    room.startAudio().catch(() => {})
+  }, [room])
 
-  // A closing tab still tells the host to hang up.
+  // A closing tab still tells the host to hang up. A page the browser keeps and shows again
+  // (back/forward cache) comes back with that call over, so "call" works again.
   useEffect(() => {
+    const leave = (tellHost: boolean) => {
+      teardown(tellHost, undefined, tellHost)
+      setEndedText("The call ended when the page was closed.")
+      setPhase("ended")
+    }
     const onHide = () => {
-      if (active.current) teardown(true, undefined, true)
+      if (active.current) leave(true)
+    }
+    const onShow = (e: PageTransitionEvent) => {
+      const p = phaseRef.current
+      if (e.persisted && !active.current && (p === "connecting" || LIVE_PHASES.has(p))) leave(false)
     }
     window.addEventListener("pagehide", onHide)
-    return () => window.removeEventListener("pagehide", onHide)
-  }, [teardown])
+    window.addEventListener("pageshow", onShow)
+    return () => {
+      window.removeEventListener("pagehide", onHide)
+      window.removeEventListener("pageshow", onShow)
+    }
+  }, [teardown, setPhase])
 
   const startVoid = useCallback(() => {
     void start()
@@ -533,6 +620,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       elapsed,
       muted,
       error,
+      errorKind,
       endedText,
       micStream,
       remoteStream,
@@ -544,7 +632,30 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       audioRef,
       chat,
       audioBlocked,
+      unlockAudio,
+      reconnecting,
+      muteError,
     }),
-    [phase, lines, streamingId, agentName, elapsed, muted, error, endedText, micStream, remoteStream, startVoid, endCall, toggleMute, chat, audioBlocked]
+    [
+      phase,
+      lines,
+      streamingId,
+      agentName,
+      elapsed,
+      muted,
+      error,
+      errorKind,
+      endedText,
+      micStream,
+      remoteStream,
+      startVoid,
+      endCall,
+      toggleMute,
+      chat,
+      audioBlocked,
+      unlockAudio,
+      reconnecting,
+      muteError,
+    ]
   )
 }

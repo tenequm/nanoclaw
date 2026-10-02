@@ -953,3 +953,36 @@
 }
 .voice-page[data-skin="te"] aside.rail .key-mute { width: 100%; }
 .btn-mute { min-width: 124px; }
+
+/* ---------- walkie UX pass: delivery notice, audio unlock key, wrapping, readable screen states ---------- */
+.transcript-box p, .transcript-box .speaker { overflow-wrap: anywhere; }
+/* A lost turn keeps its full contrast in the history; it is the line the caller has to act on. */
+.transcript-box .is-history.has-lost, .voice-page[data-skin="te"] .console .is-history.has-lost { opacity: 1; }
+/* The screen is black whatever the finish: its marks use the screen grey, like the timestamps beside them. */
+.voice-page[data-skin="te"] .console .turn-mark.sent { color: #8a877f; }
+/* The shimmer's defaults are the card's colors, near black on the screen. */
+.voice-page[data-skin="te"] .screen .state-chip .shimmer { --base-color: var(--te-orange); --shimmer-color: #f1efe9; }
+.delivery-notice { margin: 0; font-size: 13px; color: var(--coral); text-align: center; }
+.voice-page[data-skin="te"] .delivery-notice { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.04em; text-transform: lowercase; }
+.voice-page[data-skin="te"] .screen .delivery-notice { text-align: left; padding: 0 2px; }
+.hear-key {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 2px 10px;
+  border: 1px solid var(--te-orange, var(--teal));
+  border-radius: 4px;
+  background: transparent;
+  color: var(--te-orange, var(--teal));
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+.hear-key::before { content: ""; position: absolute; inset: -9px -4px; }
+.voice-page[data-skin="te"] .hear-key { text-transform: lowercase; }
+.hear-key:focus-visible { outline: 2px solid var(--te-orange, var(--ring)); outline-offset: 2px; }
+/* The mute key's longest state takes two lines; the key itself keeps its width. */
+.voice-page[data-skin="te"] .key-mute .label.wrap { white-space: normal; text-align: center; }
+.voice-page[data-skin="te"] .key-mute .label .led { flex: none; }

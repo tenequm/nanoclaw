@@ -8,7 +8,7 @@ import { ShimmeringText } from "@/components/ui/shimmering-text"
 import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
-import { LIVE_PHASES, useVoiceCall, type Phase, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
+import { LIVE_PHASES, useVoiceCall, type ErrorKind, type Phase, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
@@ -80,21 +80,67 @@ const HINT: Record<Phase, string> = {
 const WALKIE_HINT: Record<Phase, string> = {
   ...HINT,
   listening: "Go ahead. A pause sends what you said.",
-  talking: "Talk once the reply has finished.",
 }
 
-const LOST_REASON: Record<NonNullable<TurnMark["reason"]>, string> = {
-  stt: "not heard",
+// The readout names the problem; the hint says what to do about it.
+const ERROR_TITLE: Record<ErrorKind, string> = {
+  "mic-permission": "Microphone blocked",
+  mic: "Microphone problem",
+  link: "Link not valid",
+  limit: "Limit reached",
+  offline: "Voice service unavailable",
+  updating: "Voice service updating",
+  other: "Something went wrong",
+}
+
+const ERROR_HINT: Record<ErrorKind, string> = {
+  "mic-permission": "Allow microphone access for this site, then call again.",
+  mic: "Check the microphone, then call again.",
+  link: "Reopen the full call link from your agent’s chat.",
+  limit: "Try again once the limit resets.",
+  offline: "Try again shortly.",
+  updating: "Try again in a minute.",
+  other: "Try again.",
+}
+
+type LostReason = NonNullable<TurnMark["reason"]>
+
+const LOST_REASON: Record<LostReason, string> = {
+  stt: "couldn’t transcribe",
   empty: "no words heard",
-  rejected: "refused",
+  rejected: "not accepted",
   rate_limited: "too many turns",
   timeout: "no answer",
 }
 
+// A timeout means the host never confirmed the turn, not that it was dropped: repeating it blindly could ask twice.
+const LOST_NOTICE: Record<LostReason, string> = {
+  stt: "couldn’t transcribe that - please repeat.",
+  empty: "no words heard - please repeat.",
+  rejected: "turn not accepted.",
+  rate_limited: "too many turns - wait before repeating.",
+  timeout: "delivery not confirmed - check the chat before repeating.",
+}
+
 function markLabel(mark: TurnMark): string {
   if (mark.status === "sent") return "sent"
+  if (mark.reason === "timeout") return "not confirmed"
+  // A newer worker may send a reason this page does not know yet.
   const why = mark.reason && LOST_REASON[mark.reason]
   return why ? `not sent · ${why}` : "not sent"
+}
+
+/** Seconds since `active` last turned on: a local clock for the current wait, not a sign of progress. */
+function useWaitSeconds(active: boolean): number {
+  const [seconds, setSeconds] = useState(0)
+  useEffect(() => {
+    if (!active) return
+    const from = Date.now()
+    setSeconds(0)
+    const t = window.setInterval(() => setSeconds(Math.floor((Date.now() - from) / 1000)), 1000)
+    return () => window.clearInterval(t)
+  }, [active])
+  return seconds
 }
 
 /**
@@ -295,16 +341,21 @@ const TranscriptLine = memo(function TranscriptLine({
   showTs: boolean
   mark?: TurnMark
 }) {
+  const lost = mark?.status === "lost"
   return (
-    <Message from={from} className={`py-1.5 ${isLast ? "is-live" : "is-history"}`}>
-      <MessageContent className={`${from === "user" ? "bubble-you" : "bubble-agent"}${isStreaming ? " is-streaming" : ""}`}>
+    <Message from={from} className={`py-1.5 ${isLast ? "is-live" : "is-history"}${lost ? " has-lost" : ""}`}>
+      <MessageContent className={`min-w-0 ${from === "user" ? "bubble-you" : "bubble-agent"}${isStreaming ? " is-streaming" : ""}`}>
         <span className="speaker">
           {from === "user" ? "You" : agentName}
           {showTs && <span className="ts">{`${Math.floor(at / 60)}:${pad(at % 60)}`}</span>}
           {mark && <span className={`turn-mark ${mark.status}`}>{markLabel(mark)}</span>}
         </span>
         <p>
-          <StreamText text={text} />
+          {text ? (
+            <StreamText text={text} />
+          ) : (
+            <span className="ellipsis">{mark?.reason === "stt" || mark?.reason === "empty" ? "Speech could not be transcribed." : "No transcript."}</span>
+          )}
         </p>
       </MessageContent>
     </Message>
@@ -329,6 +380,7 @@ export default function App() {
   const call = demo ? demoCall : walkie ? walkieCall : realCall
   const hints = walkie ? WALKIE_HINT : HINT
   const { phase, lines, streamingId, agentName, elapsed, muted, error, endedText } = call
+  const errorKind = call.errorKind ?? "other"
   const live = LIVE_PHASES.has(phase)
   const skin = cfg.skin
   const rail = skin === "te" && cfg.layout === "rail"
@@ -397,47 +449,75 @@ export default function App() {
   }, [cfg.shortcuts, toggleMute, endCall])
 
   const slowNote = useSlowAnswerNote(phase)
+  const waited = useWaitSeconds(walkie && phase === "thinking")
+  const reconnecting = live && !!call.reconnecting
   const chipClass =
     phase === "idle" ? "idle" : phase === "ended" ? "ended" : phase === "error" ? "err" : phase === "listening" ? "you" : phase === "thinking" ? "think" : ""
+  const endedSummary =
+    endedText && endedText !== "Call ended." ? endedText.replace(/\.$/, "").toLowerCase() : "thanks for calling"
+  // A walkie line counts caption segments from both sides, not turns, so its summary leaves the count out.
+  const endedHint = walkie
+    ? `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${endedSummary}.`
+    : `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${lines.length} ${lines.length === 1 ? "turn" : "turns"} · ${endedSummary}.`
   const hintText =
     phase === "error"
-      ? hints.error
-      : muted && live
-        ? "Your microphone is muted."
-        : call.audioBlocked
-          ? "Tap anywhere to hear the call."
-          : phase === "ended"
-          ? `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${lines.length} ${lines.length === 1 ? "turn" : "turns"} · ${
-              endedText && endedText !== "Call ended." ? endedText.replace(/\.$/, "").toLowerCase() : "thanks for calling"
-            }.`
-          : phase === "thinking" && slowNote
-            ? slowNote
-            : hints[phase]
+      ? ERROR_HINT[errorKind]
+      : reconnecting
+        ? "Wait before speaking."
+        : walkie && phase === "talking"
+          ? `Speech is ignored until ${agentName} finishes.`
+          : walkie && phase === "thinking"
+            ? `${muted ? "Unmute to keep talking" : "You can keep talking"} · waiting ${Math.floor(waited / 60)}:${pad(waited % 60)}`
+            : muted && live
+              ? "Your microphone is muted."
+              : phase === "ended"
+                ? endedHint
+                : phase === "thinking" && slowNote
+                  ? slowNote
+                  : hints[phase]
 
+  const chipText = reconnecting
+    ? "Reconnecting…"
+    : phase === "thinking"
+      ? walkie
+        ? `${agentName} is working`
+        : `Asking ${agentName}…`
+      : phase === "idle"
+        ? "Ready"
+        : phase === "connecting"
+          ? "Connecting…"
+          : phase === "listening"
+            ? walkie && muted
+              ? "Mic muted"
+              : "Listening"
+            : phase === "talking"
+              ? walkie
+                ? `${agentName} is speaking`
+                : "Speaking"
+              : phase === "error"
+                ? ERROR_TITLE[errorKind]
+                : "Call ended"
   const readout = (
     <span className={`state-chip ${chipClass}`} role="status" aria-live="polite">
       {live && phase !== "connecting" && <span className="pulse" aria-hidden="true" />}
-      {phase === "thinking" ? (
-        reduced ? (
-          `Asking ${agentName}…`
-        ) : (
-          <ShimmeringText text={`Asking ${agentName}…`} duration={1.4} />
-        )
-      ) : phase === "idle" ? (
-        "Ready"
-      ) : phase === "connecting" ? (
-        "Connecting…"
-      ) : phase === "listening" ? (
-        "Listening"
-      ) : phase === "talking" ? (
-        "Speaking"
-      ) : phase === "error" ? (
-        "Something went wrong"
-      ) : (
-        "Call ended"
-      )}
+      {phase === "thinking" && !reconnecting && !reduced ? <ShimmeringText className="shimmer" text={chipText} duration={1.4} /> : chipText}
     </span>
   )
+
+  // The newest delivery mark decides: a lost turn stays on screen until a later one is sent.
+  const lastMark = useMemo(() => lines.findLast((l) => l.mark)?.mark, [lines])
+  const deliveryNotice =
+    lastMark?.status === "lost" ? (
+      <p className="delivery-notice" role="status">
+        {`Last turn: ${(lastMark.reason && LOST_NOTICE[lastMark.reason]) || "not sent."}`}
+      </p>
+    ) : null
+  const hearKey =
+    call.audioBlocked && call.unlockAudio ? (
+      <button type="button" className="hear-key" onClick={call.unlockAudio}>
+        {`Tap to hear ${agentName}`}
+      </button>
+    ) : null
 
   const showTs = skin === "te" && cfg.timestamps
   const transcript = (
@@ -449,7 +529,22 @@ export default function App() {
           </p>
         )}
         {lines.length === 0 && !error ? (
-          <ConversationEmptyState title="Nothing said yet" description={live ? "Say hello to start." : phase === "ended" ? "Call again to keep talking." : `Press call to talk to ${agentName}.`} />
+          <ConversationEmptyState
+            title="Nothing said yet"
+            description={
+              phase === "connecting"
+                ? `Connecting to ${agentName}.`
+                : live
+                  ? muted
+                    ? "Unmute to speak."
+                    : walkie
+                      ? "Speak when ready."
+                      : "Say hello to start."
+                  : phase === "ended"
+                    ? "Call again to keep talking."
+                    : `Press call to talk to ${agentName}.`
+            }
+          />
         ) : (
           lines.map((l, i) => (
             <TranscriptLine key={l.id} from={l.from} text={l.text} at={l.at} isLast={i === lines.length - 1} isStreaming={l.id === streamingId} agentName={agentName} showTs={showTs} mark={l.mark} />
@@ -459,6 +554,18 @@ export default function App() {
       <ConversationScrollButton />
     </Conversation>
   )
+
+  // Whether the line hears the caller, apart from the caller's own mute choice: a walkie reply is never listened over.
+  const notListening = walkie && live && phase === "talking" && !muted && !call.muteError
+  const micLabel = call.muteError
+    ? call.muteError
+    : muted
+      ? walkie
+        ? "Mic muted"
+        : "Muted"
+      : notListening
+        ? "Not listening during reply"
+        : "Mic on"
 
   const primaryLabel = live ? "End" : phase === "connecting" ? "Cancel" : phase === "ended" || phase === "error" ? "Call again" : "Call"
   const primaryDisabled = (!token && !demo) || (phase === "connecting" && !cancelArmed)
@@ -480,19 +587,19 @@ export default function App() {
           </button>
           <span className="label">
             <i className={`led${live ? " green" : ""}`} aria-hidden="true" />
-            {live ? "On call" : phase === "connecting" ? "Connecting" : "Ready"}
+            {live ? "On call" : phase === "connecting" ? "Connecting" : phase === "error" ? "Not connected" : "Ready"}
             {cfg.shortcuts && (live || phase === "connecting") && <kbd>esc</kbd>}
           </span>
         </div>
         <div className="key key-mute">
           <button type="button" className={`cap${muted ? " dark" : ""}`} disabled={!live} aria-pressed={muted} onClick={toggleMute}>
             {muted ? <MicOff size={15} aria-hidden="true" /> : <Mic size={15} aria-hidden="true" />}
-            Mute
+            {muted ? "Unmute" : "Mute"}
           </button>
-          <span className="label">
+          <span className={`label${notListening ? " wrap" : ""}`}>
             <i className={`led${muted ? " on" : ""}`} aria-hidden="true" />
-            {muted ? "Muted" : "Mic on"}
-            {cfg.shortcuts && <kbd>space</kbd>}
+            <span>{micLabel}</span>
+            {cfg.shortcuts && !notListening && <kbd>space</kbd>}
           </span>
         </div>
       </>
@@ -528,7 +635,15 @@ export default function App() {
           <div>
             <h1 className="product-name">{cfg.brand}</h1>
             <p className="agent-line">
-              {live ? "On a call with " : phase === "connecting" ? "Calling " : phase === "ended" ? "Call ended with " : "Ready to call "}
+              {live
+                ? "On a call with "
+                : phase === "connecting"
+                  ? "Calling "
+                  : phase === "ended"
+                    ? "Call ended with "
+                    : phase === "error"
+                      ? "Could not call "
+                      : "Ready to call "}
               <strong>{agentName}</strong>
               {call.chat && (live || phase === "connecting" || phase === "ended") && <span>{` → ${call.chat}`}</span>}
             </p>
@@ -544,7 +659,9 @@ export default function App() {
               <div className="screen-readout">
                 {readout}
                 <span className="screen-hint">{hintText}</span>
+                {hearKey}
               </div>
+              {deliveryNotice}
               <div className="console" aria-label="Live transcript">
                 {transcript}
               </div>
@@ -561,6 +678,8 @@ export default function App() {
               </div>
               {readout}
               <p className="hint">{hintText}</p>
+              {hearKey}
+              {deliveryNotice}
             </section>
             <section aria-label="Live transcript">
               <div className="transcript-head">

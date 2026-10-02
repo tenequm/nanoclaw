@@ -616,19 +616,27 @@ OpenAI page (`/call`) always talks on the voice line.
 The LiveKit page is the same React call page as `/call` (one build from `ui/`),
 served with `transport: "livekit"` in its injected config and the same
 `GPT_LIVE_UI` look; `livekit-client` and `@livekit/components-react` are bundled
-into it, no CDN. Its readout follows the worker: Listening, Asking `<agent>`...
-while `nanoclaw.walkie.thinking` is set, and Speaking; captions come from
-`lk.transcription` (the caller's interim text shows live), and each caller turn
-gets a small sent / not-sent mark from the worker's `nanoclaw.walkie.turn`
-stream. The header names the chat the call talks in when it starts (an unnamed
-direct chat shows as `<channel> DM`). Microphone capture runs
+into it, no CDN. Its readout follows the worker: Listening, `<agent>` is working
+(with "you can keep talking" and a local wait clock) while
+`nanoclaw.walkie.thinking` is set, and `<agent>` is speaking (speech is ignored
+until the reply finishes; the mute key says "not listening during reply");
+captions come from `lk.transcription` (the caller's interim text shows live), and
+each caller turn gets a small sent / not-sent mark from the worker's
+`nanoclaw.walkie.turn` stream. A lost turn also stays as a notice above the
+transcript until a later turn is sent; a `timeout` reads "delivery not
+confirmed - check the chat before repeating", since the host may still have it.
+The header names the chat the call talks in when it starts (an unnamed direct
+chat shows as `<channel> DM`); after a mid-call `/voice` the host writes the new
+chat's label into the room metadata (`{"chat": ...}`, `WalkieRoomMetadata`) once
+the next turn moves the call, and the header follows it. Microphone capture runs
 with echo cancellation, noise suppression and auto gain; DTX is off because the
 worker times turns by the silence it hears. On iOS Safari the call must be
 started with the Call button (audio unlocks on that tap) and joins relay-only
 (TURN over TLS; `?relay=1` / `?relay=0` override it); if playback is still
-blocked the hint asks for a tap anywhere. With no worker in the room after 25
-seconds, or a worker on another protocol version, the page says the voice
-service is updating.
+blocked the readout shows a "tap to hear `<agent>`" button. While the SDK
+reconnects the readout says to wait before speaking. With no worker in the room
+after 25 seconds the page says the voice service is unavailable; a worker on
+another protocol version makes it say the service is updating.
 
 ## Channel Info
 
