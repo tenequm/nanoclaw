@@ -38,7 +38,6 @@ function liveCallUrl(): CallUrlFn | null {
   return adapter ? (token) => adapter.callUrl(token) : null;
 }
 
-/** Whether the sender is a known user with an owner or admin role over any agent wired to the chat. */
 /** Whether /voice from this sender would mint a link: `new`, or an administered agent without a line yet. */
 async function mintsAnyLink(mg: MessagingGroup, userId: string, renew: boolean): Promise<boolean> {
   if (!(await getUser(userId))) return false;

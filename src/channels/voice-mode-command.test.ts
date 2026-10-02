@@ -1,6 +1,8 @@
 /**
- * `/voice` against the real core: who may run it is decided by core's owner and admin roles on a
- * real test DB, and a run mints a call link whose token only the skill's table knows by hash.
+ * `/voice` against the real core: core's router hands it to the command (registered through the
+ * real channel barrel) before any agent sees it, who may run it is decided by core's owner and
+ * admin roles on a real test DB, and a run mints a call link whose token only the skill's table
+ * knows by hash.
  */
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -18,6 +20,7 @@ const TEST_DIR = '/tmp/nanoclaw-test-voice-command';
 
 import type { ChannelAdapter, InboundEvent, OutboundMessage } from './adapter.js';
 import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from './channel-registry.js';
+import './index.js'; // the real channel barrel: the voice channel brings the /voice command with it
 import { createAgentGroup } from '../db/agent-groups.js';
 import { closeDb, getDb, initTestDb } from '../db/connection.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../db/messaging-groups.js';
@@ -26,6 +29,8 @@ import { findVoiceModeLineByToken, hashLinkToken, type VoiceModeLine } from '../
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
 import { grantRole } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
+import { getSessionsByAgentGroup } from '../db/sessions.js';
+import { routeInbound } from '../router.js';
 import type { MessagingGroup } from '../types.js';
 import {
   handleVoiceCommand,
@@ -243,7 +248,7 @@ describe('findVoiceModeLineByToken', () => {
 describe('handleVoiceCommand (the interceptor)', () => {
   const delivered: Array<{ platformId: string; threadId: string | null; message: OutboundMessage }> = [];
 
-  async function startChat(supportsThreads: boolean) {
+  async function startChat(supportsThreads: boolean, voiceRunning = false) {
     delivered.length = 0;
     const defaults = {
       dm: {
@@ -271,6 +276,24 @@ describe('handleVoiceCommand (the interceptor)', () => {
       }),
       defaults,
     });
+    if (voiceRunning) {
+      // Stands in for a running voice channel: only its call-link builder is used.
+      registerChannelAdapter('voice-mode', {
+        factory: () =>
+          ({
+            name: 'voice-mode',
+            channelType: 'voice-mode',
+            supportsThreads: false,
+            defaults,
+            setup: async () => {},
+            teardown: async () => {},
+            isConnected: () => true,
+            deliver: async () => undefined,
+            callUrl,
+          }) as ChannelAdapter,
+        defaults,
+      });
+    }
     await initChannelAdapters(() => ({
       onInbound: () => {},
       onInboundEvent: () => {},
@@ -302,6 +325,20 @@ describe('handleVoiceCommand (the interceptor)', () => {
         message: { kind: 'chat', content: { text: expect.stringMatching(/voice\?t=[0-9a-f]{32}/) } },
       },
     ]);
+  });
+
+  it("is claimed from core's routeInbound before any agent session sees it", async () => {
+    await startChat(false, true);
+    await routeInbound(event('/voice', OWNER));
+    expect(delivered).toEqual([
+      {
+        platformId: 'chat:1',
+        threadId: null,
+        message: { kind: 'chat', content: { text: expect.stringMatching(/voice\?t=[0-9a-f]{32}/) } },
+      },
+    ]);
+    expect(await getSessionsByAgentGroup('ag-1')).toEqual([]);
+    expect(await lines()).toHaveLength(1);
   });
 
   it('claims the command silently for an unknown sender or an unwired chat, and leaves other messages alone', async () => {
