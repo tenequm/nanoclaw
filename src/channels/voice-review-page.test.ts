@@ -35,6 +35,7 @@ interface ReviewLib {
   autoBlock(review: ReviewState): string | null;
   refusalNote(error: string | undefined, agent: string): string | null;
   isReviewSnapshot(v: unknown): boolean;
+  keyIdentity(action: string | null, draftId?: number): string;
 }
 
 describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
@@ -135,6 +136,17 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(v.chip).toBe('Review draft');
     // Ready again: talk opens.
     expect(keys(view({ preparing: false, delivery: 'sent' }))).toEqual(['End', 'Talk']);
+  });
+
+  it('re-arms the end key only when it turns into a hang-up from something else', () => {
+    // Connecting, live in auto and live in review are all the same hang-up: the key never fades.
+    expect(lib.keyIdentity('cancel')).toBe(lib.keyIdentity('end'));
+    expect(lib.keyIdentity('end', 3)).toBe(lib.keyIdentity('end'));
+    // Discard on a draft becoming end is a change: a double tap on discard must not hang up.
+    expect(lib.keyIdentity('discard', 3)).not.toBe(lib.keyIdentity('end'));
+    expect(lib.keyIdentity('discard', 3)).not.toBe(lib.keyIdentity('discard', 4));
+    expect(lib.keyIdentity('call')).not.toBe(lib.keyIdentity('cancel'));
+    expect(lib.keyIdentity(null)).not.toBe(lib.keyIdentity('end'));
   });
 
   it('discarding waits for the worker; empty, failed and oversize drafts cannot be sent', () => {

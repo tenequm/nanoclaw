@@ -81,6 +81,16 @@ export interface KeyView {
   disabled: boolean
 }
 
+/**
+ * What a key does, for the page's re-arm guard (a key that just changed what it does ignores taps
+ * for a moment): every hang-up is one thing, so the end key never fades when it keeps ending the
+ * call (cancel becoming end as the call connects, auto's end becoming review's); any other key is
+ * its action on its draft, so a double tap on discard cannot end the call.
+ */
+export function keyIdentity(action: KeyAction | null, draftId?: number): string {
+  if (action === "cancel" || action === "end") return "hangup"
+  return action === null ? "none" : `${action}:${draftId ?? ""}`
+}
 
 export type PanelTone = "hearing" | "finishing" | "draft" | "empty" | "failed" | "long"
 

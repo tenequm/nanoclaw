@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
 import { LIVE_PHASES, type ErrorKind, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
-import { reviewView, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
+import { keyIdentity, reviewView, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
@@ -537,7 +537,7 @@ export default function App() {
   const rs = rc?.state
   const reviewOn = !!rs && (rs.mode === "review" || (!!rs.ended && !!rs.draft))
   const rv = reviewOn && rs ? reviewView({ phase, agentName, reconnecting, waited, review: rs }) : null
-  const leftArmed = useRearm(rv ? `${rv.left.action}:${rs?.draft?.id ?? ""}` : "auto", REARM_MS)
+  const leftArmed = useRearm(keyIdentity(rv ? rv.left.action : live || phase === "connecting" ? "end" : null, rs?.draft?.id), REARM_MS)
   const rightArmed = useRearm(rv ? `${rv.right.action}:${rs?.draft?.id ?? ""}` : "auto", REARM_MS)
   const switchingToReview = !reviewOn && rs?.pending?.op === "mode" && rs.pending.to === "review"
   const runKey = (action: KeyAction) => {
