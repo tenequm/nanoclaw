@@ -65,6 +65,8 @@ src/channels/gpt-live-access.test.ts
 src/channels/gpt-live-keychain.test.ts
 src/channels/gpt-live-sideband.test.ts
 src/channels/gpt-live-call-page.test.ts
+src/channels/gemini-live.ts
+src/channels/gemini-live.test.ts
 ```
 
 ### 2. Register the adapter
@@ -104,7 +106,7 @@ Run the registration test, the session state-machine tests, and the adapter
 integration test (a fake OpenAI behind the real webhook server):
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts
+pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts src/channels/gemini-live.test.ts
 ```
 
 `voice-registration.test.ts` imports the real channel barrel and asserts the
@@ -362,6 +364,30 @@ and do not need a frontend build. The UI has the same three-day release-age gate
 as the host and requires no dependency install scripts. Try the page without a
 microphone or an agent by adding `&demo=1` to any call link: it plays a scripted
 call and connects to nothing.
+
+## Gemini Live (test)
+
+The same lines also take calls through Google's
+[Gemini Live](https://ai.google.dev/gemini-api/docs/live) at
+`…/webhook/voice/gemini?t=<token>`, with the same token, line, agent wiring and
+access checks as the `/call` link. It is off until the key is in `.env`; without
+it the `/gemini` routes answer 503 and the OpenAI path is unchanged:
+
+```
+GEMINI_API_KEY=<Gemini API key>
+```
+
+Optional: `GEMINI_LIVE_MODEL` (default `gemini-3.8-live`) and
+`GEMINI_LIVE_VOICE` (default `Kore`). Restart to load them.
+
+The page talks to Gemini directly: the host mints a one-use ephemeral token
+locked to the model, the composed voice prompt, the voice and one `ask_agent`
+function, and the key never leaves the host. Each `ask_agent` call is sent to
+the agent like a delegation and its reply goes back to Gemini. Both engines
+share the hourly start cap, the daily minutes and the delegation timeout. A
+Gemini call is charged from token mint until the page hangs up or the token
+expires. Agent messages that answer no `ask_agent` call are dropped during a
+Gemini call.
 
 ## Channel Info
 

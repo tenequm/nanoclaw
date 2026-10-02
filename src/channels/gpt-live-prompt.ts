@@ -41,8 +41,8 @@ export interface VoiceLine {
   agentGroupId: string;
 }
 
-/** The fixed part of the voice prompt: talk style and the delegation policy. */
-export function voiceInstructions(agent: VoiceAgent, caller?: VoiceCaller): string {
+/** Who is talking to whom and how: shared by every voice engine's prompt. */
+function identityAndStyle(agent: VoiceAgent, caller?: VoiceCaller): string[] {
   const persona = (agent.personality ?? '').trim().slice(0, MAX_PERSONA_CHARS);
   return [
     `You are ${agent.name}, taking a live voice call for your user.`,
@@ -53,11 +53,32 @@ export function voiceInstructions(agent: VoiceAgent, caller?: VoiceCaller): stri
     'Always speak the language the caller speaks; greet in the language your persona names, if any.',
     'How to talk: short natural sentences, one idea at a time, no markdown or symbols, no lists read aloud.',
     'When the call connects, greet the caller briefly and ask how you can help.',
+  ];
+}
+
+/** The fixed part of the voice prompt: talk style and the delegation policy. */
+export function voiceInstructions(agent: VoiceAgent, caller?: VoiceCaller): string {
+  return [
+    ...identityAndStyle(agent, caller),
     'You have a backend assistant that holds the user’s memory, files, calendar, tools and the ability to take actions.',
     'Delegate to the backend whenever the caller asks for anything about their world, anything that needs a lookup, a calculation, a schedule change, a message sent, or any other action. Never invent those answers.',
     'While the backend works, keep the caller company with a brief acknowledgement, then wait; do not fill the silence with guesses.',
     'Small talk, clarifying questions, and repeating what the backend already told you do not need delegation.',
     'When a backend result arrives, say it in your own words, briefly, and check whether the caller needs more.',
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+/** The Gemini Live system instruction: the same voice, delegating through the ask_agent function. */
+export function geminiInstructions(agent: VoiceAgent, caller?: VoiceCaller): string {
+  return [
+    ...identityAndStyle(agent, caller),
+    'You have a backend assistant that holds the user’s memory, files, calendar, tools and the ability to take actions.',
+    'For anything that needs memory, tools, facts or actions, call ask_agent with the caller’s request in full, including any details they gave, and wait for its answer. Never invent those answers.',
+    'While ask_agent works, say one brief filler such as "one moment", then wait quietly; do not fill the silence with guesses.',
+    'Small talk, clarifying questions, and repeating what the backend already told you do not need ask_agent.',
+    'When an ask_agent answer arrives, say it in your own words, briefly, and check whether the caller needs more.',
   ]
     .filter(Boolean)
     .join(' ');

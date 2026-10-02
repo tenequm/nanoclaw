@@ -15,10 +15,10 @@ sed -i.bak "/^import '\.\/voice\.js';$/d" src/channels/index.ts && rm -f src/cha
 ## 2. Remove the copied files
 
 The adapter, its state machine, prompt composer, call page, sideband, Keychain
-reader, and the seven tests:
+reader, the Gemini Live path, and the eight tests:
 
 ```bash
-rm -f src/channels/voice.ts src/channels/gpt-live-session.ts src/channels/gpt-live-prompt.ts src/channels/gpt-live-call-page.ts src/channels/gpt-live-keychain.ts src/channels/gpt-live-sideband.ts src/channels/voice-adapter.test.ts src/channels/voice-registration.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts
+rm -f src/channels/voice.ts src/channels/gpt-live-session.ts src/channels/gpt-live-prompt.ts src/channels/gpt-live-call-page.ts src/channels/gpt-live-keychain.ts src/channels/gpt-live-sideband.ts src/channels/voice-adapter.test.ts src/channels/voice-registration.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts src/channels/gemini-live.ts src/channels/gemini-live.test.ts
 ```
 
 ## 3. Remove the container skill
