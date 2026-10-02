@@ -430,7 +430,10 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
         // Resolves once the agent's session stored the turn, or with false once routing ended without that.
         routeTurn: (event) =>
           new Promise<boolean>((resolve, reject) => {
-            if (!setup?.routeInboundEvent) return reject(new Error('the voice channel is not running'));
+            if (!setup?.routeInboundEvent) {
+              log.warn('livekit-voice: channel is not running; turn dropped', { platformId: event.platformId });
+              return reject(new Error('the voice channel is not running'));
+            }
             setup.routeInboundEvent({ ...event, onStored: () => resolve(true) }).then(
               () => resolve(false),
               (err: unknown) => {

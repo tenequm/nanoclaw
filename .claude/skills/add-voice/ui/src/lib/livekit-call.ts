@@ -13,6 +13,7 @@ import { useAudioPlayback, useParticipantAttributes, useRemoteParticipants, useT
 import {
   CallError,
   LIVE_PHASES,
+  PAGE_CLOSED,
   errorText,
   levelsFromStats,
   micErrorKind,
@@ -47,6 +48,8 @@ const TURN_TOPIC = "nanoclaw.walkie.turn"
 const AGENT_JOIN_MS = 25_000
 const UPDATING = "The voice service is updating. Try again in a minute."
 const NO_AGENT = "The voice service did not answer the call."
+/** How long a failed mute or unmute shows on the key. */
+const MUTE_ERROR_MS = 4000
 /** "<n>:<elapsedMs>:<silenceMs>" while a stopped caller's turn waits out the silence that sends it. */
 const PENDING_ATTR = "nanoclaw.walkie.pending"
 /** One JSON WalkieReplyInfo right before each line the worker speaks. */
@@ -148,6 +151,12 @@ function agentPhase(attrs: Readonly<Record<string, string>>): Phase | null {
   if (state === "listening" || state === "idle") return "listening"
   return null
 }
+
+/**
+ * The streaming transcription's interim text can run two of its segments together ("test.Please"); its
+ * final text has the space. Restores it after a sentence end, where a letter or digit meets a capital.
+ */
+const spaceSentences = (s: string) => s.replace(/([\p{Ll}\p{N}][.!?…]+)(?=\p{Lu})/gu, "$1 ")
 
 const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
 
@@ -448,15 +457,15 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     for (const t of transcriptions) {
       const attrs = t.streamInfo.attributes ?? {}
       const key = attrs["lk.segment_id"] || t.streamInfo.id
-      const text = t.text.trim()
+      // The worker transcribes the caller against the caller's own track.
+      const mine =
+        (localSid.current !== null && attrs["lk.transcribed_track_id"] === localSid.current) ||
+        t.participantInfo.identity === room.localParticipant.identity
+      const text = mine ? spaceSentences(t.text.trim()) : t.text.trim()
       if (!text || segmentText.current.get(key) === text) continue
       segmentText.current.set(key, text)
       const id = segmentLine.current.get(key)
       if (id === undefined) {
-        // The worker transcribes the caller against the caller's own track.
-        const mine =
-          (localSid.current !== null && attrs["lk.transcribed_track_id"] === localSid.current) ||
-          t.participantInfo.identity === room.localParticipant.identity
         const nid = nextId.current++
         segmentLine.current.set(key, nid)
         // An agent line joins the message being spoken; only its first line says what it answers.
@@ -630,7 +639,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
 
   useEffect(() => {
     if (!muteError) return
-    const t = window.setTimeout(() => setMuteError(null), 4000)
+    const t = window.setTimeout(() => setMuteError(null), MUTE_ERROR_MS)
     return () => window.clearTimeout(t)
   }, [muteError])
 
@@ -756,24 +765,14 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   // A closing tab still tells the host to hang up. A page the browser keeps and shows again
   // (back/forward cache) comes back with that call over, so "call" works again.
   useEffect(() => {
-    const leave = (tellHost: boolean) => {
-      teardown(tellHost, undefined, tellHost)
-      setEndedText("The call ended when the page was closed.")
+    const onHide = () => {
+      if (!active.current) return
+      teardown(true, undefined, true)
+      setEndedText(PAGE_CLOSED)
       setPhase("ended")
     }
-    const onHide = () => {
-      if (active.current) leave(true)
-    }
-    const onShow = (e: PageTransitionEvent) => {
-      const p = phaseRef.current
-      if (e.persisted && !active.current && (p === "connecting" || LIVE_PHASES.has(p))) leave(false)
-    }
     window.addEventListener("pagehide", onHide)
-    window.addEventListener("pageshow", onShow)
-    return () => {
-      window.removeEventListener("pagehide", onHide)
-      window.removeEventListener("pageshow", onShow)
-    }
+    return () => window.removeEventListener("pagehide", onHide)
   }, [teardown, setPhase])
 
   const startVoid = useCallback(() => {

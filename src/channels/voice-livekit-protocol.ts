@@ -11,6 +11,8 @@ export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice';
 export const PING_INTERVAL_MS = 15_000;
 /** The worker drops the host link after this long without a line: three missed pings. */
 export const HOST_SILENCE_MS = 3 * PING_INTERVAL_MS;
+/** How long the worker waits for the host to answer one of its POSTs (a turn included). */
+export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
 
 /** Wire version of the job metadata; host and worker must agree, so they ship and restart together. */
 export const LIVEKIT_PROTOCOL_VERSION = 3;

@@ -110,7 +110,7 @@ const LOST_REASON: Record<LostReason, string> = {
   empty: "no words heard",
   rejected: "not accepted",
   rate_limited: "too many turns",
-  timeout: "no answer",
+  timeout: "not confirmed",
 }
 
 // A timeout means the host never confirmed the turn, not that it was dropped: repeating it blindly could ask twice.
@@ -124,7 +124,7 @@ const LOST_NOTICE: Record<LostReason, string> = {
 
 function markLabel(mark: TurnMark): string {
   if (mark.status === "sent") return "sent"
-  if (mark.reason === "timeout") return "not confirmed"
+  if (mark.reason === "timeout") return LOST_REASON.timeout
   // A newer worker may send a reason this page does not know yet.
   const why = mark.reason && LOST_REASON[mark.reason]
   return why ? `not sent · ${why}` : "not sent"
@@ -136,9 +136,12 @@ function useWaitSeconds(active: boolean): number {
   useEffect(() => {
     if (!active) return
     const from = Date.now()
-    setSeconds(0)
     const t = window.setInterval(() => setSeconds(Math.floor((Date.now() - from) / 1000)), 1000)
-    return () => window.clearInterval(t)
+    // Reset as the wait ends, so the next one does not open on this one's last value.
+    return () => {
+      window.clearInterval(t)
+      setSeconds(0)
+    }
   }, [active])
   return seconds
 }
@@ -476,9 +479,8 @@ export default function App() {
   const endedSummary =
     endedText && endedText !== "Call ended." ? endedText.replace(/\.$/, "").toLowerCase() : "thanks for calling"
   // A walkie line counts caption segments from both sides, not turns, so its summary leaves the count out.
-  const endedHint = walkie
-    ? `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${endedSummary}.`
-    : `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${lines.length} ${lines.length === 1 ? "turn" : "turns"} · ${endedSummary}.`
+  const turnCount = walkie ? "" : `${lines.length} ${lines.length === 1 ? "turn" : "turns"} · `
+  const endedHint = `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${turnCount}${endedSummary}.`
   const hintText =
     phase === "error"
       ? ERROR_HINT[errorKind]
@@ -628,7 +630,7 @@ export default function App() {
           </span>
         </div>
         <div className="key key-mute">
-          <button type="button" className={`cap${muted ? " dark" : ""}`} disabled={!live} aria-pressed={muted} onClick={toggleMute}>
+          <button type="button" className={`cap${muted ? " dark" : ""}`} disabled={!live} onClick={toggleMute}>
             {muted ? <MicOff size={15} aria-hidden="true" /> : <Mic size={15} aria-hidden="true" />}
             {muted ? "Unmute" : "Mute"}
           </button>
@@ -647,7 +649,7 @@ export default function App() {
         <Button size="lg" className={`${live || phase === "connecting" ? "btn-hangup" : "btn-call"} h-12 w-full rounded-full text-[15px] font-semibold`} onClick={onPrimary} disabled={primaryDisabled}>
           {live ? "Hang up" : primaryLabel}
         </Button>
-        <Button size="lg" variant="secondary" className={`btn-mute h-12 rounded-full ${muted ? "on" : ""}`} disabled={!live} aria-pressed={muted} onClick={toggleMute}>
+        <Button size="lg" variant="secondary" className={`btn-mute h-12 rounded-full ${muted ? "on" : ""}`} disabled={!live} onClick={toggleMute}>
           {muted ? <MicOff size={16} aria-hidden="true" /> : <Mic size={16} aria-hidden="true" />}
           {muted ? "Unmute" : "Mute"}
         </Button>

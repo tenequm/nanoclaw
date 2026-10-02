@@ -104,6 +104,8 @@ export interface VoiceCall {
 
 export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking", "talking"])
 
+export const PAGE_CLOSED = "The call ended when the page was closed."
+
 /** How long a WebRTC "disconnected" may last before the call is treated as dropped. */
 const DISCONNECT_GRACE_MS = 6000
 
@@ -552,11 +554,11 @@ export function useVoiceCall(token: string, fallbackAgent = "your agent"): Voice
   // (back/forward cache) comes back with that call over, so "call" works again.
   useEffect(() => {
     const onHide = () => {
-      if (pc.current) end(true, "The call ended when the page was closed.")
+      if (pc.current) end(true, PAGE_CLOSED)
     }
     const onShow = (e: PageTransitionEvent) => {
       const p = phaseRef.current
-      if (e.persisted && !pc.current && (p === "connecting" || LIVE_PHASES.has(p))) end(false, "The call ended when the page was closed.")
+      if (e.persisted && !pc.current && (p === "connecting" || LIVE_PHASES.has(p))) end(false, PAGE_CLOSED)
     }
     window.addEventListener("pagehide", onHide)
     window.addEventListener("pageshow", onShow)

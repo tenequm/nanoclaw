@@ -70,6 +70,7 @@ import {
   WALKIE_THINKING_ATTRIBUTE,
   WALKIE_TURN_TOPIC,
   WALKIE_UPDATING_ATTRIBUTE,
+  WORKER_REQUEST_TIMEOUT_MS,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
   type WalkieReplyInfo,
@@ -145,7 +146,7 @@ export class HostLink {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.link.secret}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ callId: this.link.callId, ...body }),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(WORKER_REQUEST_TIMEOUT_MS),
     });
   }
 
