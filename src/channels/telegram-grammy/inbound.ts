@@ -148,7 +148,24 @@ function formatForwardHeader(origin: MessageOrigin): string {
   return `[forwarded from ${describeOrigin(origin)}, ${origDate}]`;
 }
 
+/** A voice call page link (`/webhook/voice/...?t=<line token>`), wherever it was pasted. */
+const VOICE_LINK = /\S*\/webhook\/voice\/\S*?[?&]t=[^\s&#]+\S*/g;
+
+/**
+ * A voice line's call link is that line's credential. The /voice reply carries
+ * one and is kept out of every agent session, so a reply quoting it must not
+ * hand it over either.
+ */
+export function redactVoiceLinks(text: string): string {
+  return text.replace(VOICE_LINK, '[voice call link]');
+}
+
 export function extractReplyContext(msg: Message): ReplyContext | null {
+  const context = rawReplyContext(msg);
+  return context && { ...context, text: redactVoiceLinks(context.text) };
+}
+
+function rawReplyContext(msg: Message): ReplyContext | null {
   // Case C — reply to a message from a different chat (quote-reply of a
   // channel post, etc.). Telegram delivers this as `external_reply` with
   // an origin describing where the quoted message lived. No local id.

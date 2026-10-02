@@ -16,6 +16,7 @@ import { formatLocalTime } from '../../timezone.js';
 import {
   callbackCardAddress,
   entitiesToMarkdown,
+  extractReplyContext,
   extractTelegramMessageId,
   parseChatId,
   parseTopicId,
@@ -153,6 +154,32 @@ describe('toInboundMessage propagates author.isBot', () => {
   it('is false for a human sender', () => {
     const content = toInboundMessage(ctxFor(false), 'bot', 1)!.message.content as InboundContent;
     expect(content.author.isBot).toBe(false);
+  });
+});
+
+describe('extractReplyContext keeps voice call links out of the agent', () => {
+  it('redacts the link of a quoted /voice reply, whole message or highlighted fragment', () => {
+    const text =
+      '🎙 Walkie-talkie for Emma:\nhttps://host.example/webhook/voice/livekit?t=0123abcd\n\nCalls on this link now talk here.';
+    const reply = { message_id: 9, text, from: { first_name: 'Bot' } };
+    expect(extractReplyContext({ message_id: 10, reply_to_message: reply } as unknown as Message)).toEqual({
+      id: '9',
+      sender: 'Bot',
+      text: '🎙 Walkie-talkie for Emma:\n[voice call link]\n\nCalls on this link now talk here.',
+    });
+    const quoted = {
+      message_id: 10,
+      reply_to_message: reply,
+      quote: { text: 'link: host.example/webhook/voice/call?t=ab12.' },
+    };
+    expect(extractReplyContext(quoted as unknown as Message)?.text).toBe('link: [voice call link]');
+  });
+
+  it('leaves other links alone', () => {
+    const reply = { message_id: 9, text: 'see https://example.com/webhook/other?t=1', from: { first_name: 'A' } };
+    expect(extractReplyContext({ message_id: 10, reply_to_message: reply } as unknown as Message)?.text).toBe(
+      'see https://example.com/webhook/other?t=1',
+    );
   });
 });
 
