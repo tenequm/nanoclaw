@@ -22,7 +22,8 @@
  *    `session.say()` once the caller is not mid-turn, cut to
  *    WALKIE_MAX_SPOKEN_CHARS at a sentence end, uninterruptible: while
  *    it plays, the caller's audio is not transcribed (no barge-in); Gemini
- *    TTS, through LiveKit's TTS FallbackAdapter onto a second model.
+ *    TTS synthesizes the whole reply in one streamed request, through
+ *    LiveKit's TTS FallbackAdapter onto a second model.
  * The session owns the audio, captions and `lk.agent.state`; "thinking" goes
  * on a separate attribute, since a session without an LLM never thinks.
  */
@@ -38,7 +39,6 @@ import {
   APIStatusError,
   AutoSubscribe,
   cli,
-  DEFAULT_API_CONNECT_OPTIONS,
   defineAgent,
   log as agentsLog,
   mergeFrames,
@@ -99,10 +99,6 @@ const TRANSCRIPTION_TIMEOUT_MS = 5_000;
 const MIN_LOST_SPEECH_MS = 800;
 /** Longest wait for the next TTS frame: Gemini 3.8 TTS takes seconds to first audio, and a failover adds a try. */
 const TTS_IDLE_TIMEOUT_MS = 60_000;
-/** How a reply is cut for synthesis: sentences batched up to 400 characters, the first one short so speech starts soon. */
-export const REPLY_CHUNKS = { minTokenLength: 250, maxTokenLength: 400, firstTokenLength: 20 };
-/** Reply chunks synthesized at once: the one playing and the next. */
-export const TTS_CONCURRENCY = 2;
 /** While a speech model is down, it is tried again this often; every try spends its quota. */
 const TTS_RECOVERY_DELAY_MS = 30_000;
 const UNARY_STT_TIMEOUT_MS = 30_000;
@@ -430,99 +426,15 @@ class FallbackTranscription extends stt.StreamAdapter {
 }
 
 /**
- * A TTS that runs at most `limit` syntheses at once, the rest waiting in order. The session's
- * StreamAdapter requests every chunk of a reply together, a burst Gemini answers with 429 or 503.
+ * The session's TTS: each reply goes to the speech model whole, in one request, so it is voiced
+ * with one intonation; Gemini streams the audio back as it is made, so speech still starts within
+ * seconds. The tokenizer never emits before the reply's text ends.
  */
-export class PacedTTS extends tts.TTS {
-  label: string;
-  private running = 0;
-  private readonly waiting: Array<(granted: boolean) => void> = [];
-
-  constructor(
-    readonly inner: tts.TTS,
-    private readonly limit: number,
-  ) {
-    super(inner.sampleRate, inner.numChannels, { streaming: false });
-    this.label = inner.label;
-    // The inner TTS reports its own failures; the session hears them through this one.
-    inner.on('error', (err) => this.emit('error', err));
-  }
-
-  override get model(): string {
-    return this.inner.model;
-  }
-
-  override get provider(): string {
-    return this.inner.provider;
-  }
-
-  synthesize(text: string, connOptions?: APIConnectOptions, abortSignal?: AbortSignal): tts.ChunkedStream {
-    return new PacedStream(this, text, connOptions, abortSignal);
-  }
-
-  stream(): tts.SynthesizeStream {
-    throw new Error('PacedTTS is not streaming; wrap it in a tts.StreamAdapter');
-  }
-
-  /** Waits for a free slot, in order; false when aborted first. */
-  acquire(signal: AbortSignal): Promise<boolean> {
-    if (signal.aborted) return Promise.resolve(false);
-    if (this.running < this.limit) {
-      this.running++;
-      return Promise.resolve(true);
-    }
-    return new Promise((resolve) => {
-      const waiter = (granted: boolean) => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(granted);
-      };
-      const onAbort = () => {
-        this.waiting.splice(this.waiting.indexOf(waiter), 1);
-        waiter(false);
-      };
-      this.waiting.push(waiter);
-      signal.addEventListener('abort', onAbort, { once: true });
-    });
-  }
-
-  release(): void {
-    const next = this.waiting.shift();
-    if (next) next(true);
-    else this.running--;
-  }
-}
-
-class PacedStream extends tts.ChunkedStream {
-  label = 'walkie.PacedStream';
-  private innerError?: Error;
-
-  constructor(
-    private readonly paced: PacedTTS,
-    text: string,
-    private readonly innerConnOptions: APIConnectOptions | undefined,
-    abortSignal?: AbortSignal,
-  ) {
-    // The inner TTS retries; this stream only waits its turn.
-    super(text, paced, { ...DEFAULT_API_CONNECT_OPTIONS, ...innerConnOptions, maxRetry: 0 }, abortSignal);
-  }
-
-  override get error(): Error | undefined {
-    return super.error ?? this.innerError;
-  }
-
-  protected async run(): Promise<void> {
-    if (!(await this.paced.acquire(this.abortSignal))) return;
-    try {
-      const inner = this.paced.inner.synthesize(this.inputText, this.innerConnOptions, this.abortSignal);
-      for await (const audio of inner) {
-        if (this.abortSignal.aborted) return inner.close();
-        this.queue.put(audio);
-      }
-      this.innerError = inner.error;
-    } finally {
-      this.paced.release();
-    }
-  }
+export function wholeReplySpeech(speech: tts.TTS): tts.StreamAdapter {
+  return new tts.StreamAdapter(
+    speech,
+    new tokenize.basic.SentenceTokenizer({ minTokenLength: Number.POSITIVE_INFINITY }),
+  );
 }
 
 /**
@@ -1287,10 +1199,7 @@ export function walkieSession(
   const session = new voice.AgentSession({
     vad: vads.vad,
     stt: transcription,
-    tts: new tts.StreamAdapter(
-      new PacedTTS(speech, TTS_CONCURRENCY),
-      new tokenize.basic.SentenceTokenizer(REPLY_CHUNKS),
-    ),
+    tts: wholeReplySpeech(speech),
     turnHandling: {
       // The turn detector models have no Ukrainian; the default would build one anyway.
       turnDetection: 'vad',

@@ -14,7 +14,6 @@ import {
   initializeLogger,
   normalizeLanguage,
   stt,
-  tokenize,
   tts,
   type APIConnectOptions,
   type VAD,
@@ -41,21 +40,19 @@ import {
   MAX_IDLE_WAIT_MS,
   maxSpokenChars,
   parseJobMetadata,
-  PacedTTS,
   pathSegment,
   pruneRecordings,
   readJobHeader,
   recordingDays,
-  REPLY_CHUNKS,
   runCall,
   SendCountdown,
   speakableText,
-  TTS_CONCURRENCY,
   TtsFallback,
   TURN_SETTLE_MS,
   TurnCapture,
   Walkie,
   walkieSession,
+  wholeReplySpeech,
   writeTurnRecording,
   type CallJob,
   type CallVoice,
@@ -106,19 +103,18 @@ describe('speakable text', () => {
     expect(speakableText('Use <code class="x">this</code> or <br/> that')).toBe('Use this or that.');
   });
 
-  it('reaches the TTS in sentence batches that keep decimals and abbreviations whole', async () => {
-    // The tokenizer the session's StreamAdapter batches with.
-    const stream = new tokenize.basic.SentenceTokenizer(REPLY_CHUNKS).stream();
-    const text = `Version 2.4 costs 3.50 dollars, e.g. cheap. ${'Then more words follow here. '.repeat(20)}`;
-    stream.pushText(text);
+  it('reaches the TTS whole, in one request, decimals and abbreviations as written', async () => {
+    const inner = new CountingTTS();
+    const stream = wholeReplySpeech(inner).stream();
+    const text = `Version 2.4 costs 3.50 dollars, e.g. cheap. ${'Then more words follow here. '.repeat(25)}`.trim();
+    // The session hands a reply over in pieces; none of them may start a request of its own.
+    for (const piece of text.match(/[\s\S]{1,60}/g)!) stream.pushText(piece);
     stream.endInput();
-    const tokens: string[] = [];
-    for await (const ev of stream) tokens.push(ev.token);
-    expect(tokens[0]).toBe('Version 2.4 costs 3.50 dollars, e.g. cheap.');
-    expect(tokens.length).toBeGreaterThan(1);
-    expect(tokens.length).toBeLessThan(6);
-    expect(tokens.every((t) => t.length <= 400)).toBe(true);
-    expect(tokens.join(' ').replace(/\s+/g, ' ').trim()).toBe(text.replace(/\s+/g, ' ').trim());
+    let samples = 0;
+    for await (const ev of stream) if (ev !== tts.SynthesizeStream.END_OF_STREAM) samples += ev.frame.samplesPerChannel;
+    expect(text.length).toBeGreaterThan(700);
+    expect(inner.started).toEqual([text]);
+    expect(samples).toBe(240);
   });
 });
 
@@ -1124,26 +1120,6 @@ class CountingStream extends tts.ChunkedStream {
 }
 
 describe('speech and transcription adapters', () => {
-  it('synthesizes at most the playing chunk and the next at once, in order, and passes failures on', async () => {
-    const inner = new CountingTTS((text) => text === 'c');
-    const paced = new PacedTTS(inner, TTS_CONCURRENCY);
-    const errors: unknown[] = [];
-    paced.on('error', (err) => errors.push(err));
-    const streams = ['a', 'b', 'c', 'd', 'e'].map((text) => paced.synthesize(text));
-    const frames = await Promise.all(
-      streams.map(async (s) => {
-        let samples = 0;
-        for await (const audio of s) samples += audio.frame.samplesPerChannel;
-        return samples;
-      }),
-    );
-    expect(inner.started).toEqual(['a', 'b', 'c', 'd', 'e']);
-    expect(inner.maxRunning).toBe(2);
-    expect(frames).toEqual([240, 240, 0, 240, 240]);
-    expect(streams[2].error).toBeDefined();
-    expect(errors).toHaveLength(1);
-  });
-
   it('keeps one recovery probe going for a speech model that is down, however many requests skip it', async () => {
     const down = new CountingTTS(() => true);
     const adapter = new TtsFallback({
