@@ -729,9 +729,16 @@ describe('runCall', () => {
     host.emit({ type: 'working' });
     // Turn 4 is picked up while its answer is still to come.
     v.events.onTurn('Thanks', { sttModel: 'gemini-3.5-transcribe-live' });
-    await vi.waitFor(() => expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 4, status: 'sent', text: 'Thanks' }));
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 4, status: 'sent', text: 'Thanks' }),
+    );
     host.emit({ type: 'working' });
-    await vi.waitFor(() => expect(working()).toEqual([{ turn: 1, status: 'working' }, { turn: 4, status: 'working' }]));
+    await vi.waitFor(() =>
+      expect(working()).toEqual([
+        { turn: 1, status: 'working' },
+        { turn: 4, status: 'working' },
+      ]),
+    );
     host.endStream();
   });
 

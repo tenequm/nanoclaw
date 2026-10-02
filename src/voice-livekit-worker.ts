@@ -2136,8 +2136,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           pickedUp = lastAccepted;
           publish({ turn: lastAccepted, status: 'working' });
         }
-      }
-      else if (event.type === 'chat') turnTaking.onChat(event.chat);
+      } else if (event.type === 'chat') turnTaking.onChat(event.chat);
       else if (event.type === 'turn-stored') {
         const late = unconfirmed.get(event.turnKey);
         if (!late) return;
