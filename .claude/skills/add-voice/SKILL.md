@@ -67,6 +67,10 @@ src/channels/gpt-live-sideband.test.ts
 src/channels/gpt-live-call-page.test.ts
 src/channels/gemini-live.ts
 src/channels/gemini-live.test.ts
+src/channels/voice-livekit.ts
+src/channels/voice-livekit.test.ts
+src/voice-livekit-worker.ts
+src/voice-livekit-worker.test.ts
 ```
 
 ### 2. Register the adapter
@@ -92,8 +96,10 @@ container/skills/voice-formatting/SKILL.md
 
 ### 4. Build
 
-No new package: the adapter uses Node's built-in `fetch` and WebSocket client
-(Node 22 or later, which NanoClaw already requires). Build first: it guards the
+The OpenAI and browser-direct Gemini paths need no new package: they use Node's
+built-in `fetch` and WebSocket client (Node 22 or later). The LiveKit path adds
+`@livekit/agents`, `@livekit/agents-plugin-google`, `@livekit/rtc-node`,
+`livekit-server-sdk`, `livekit-client` and `zod`. Build first: it guards the
 adapter's typed calls into the channel core.
 
 ```nc:run effect:build
@@ -106,7 +112,7 @@ Run the registration test, the session state-machine tests, and the adapter
 integration test (a fake OpenAI behind the real webhook server):
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts src/channels/gemini-live.test.ts
+pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts src/channels/gemini-live.test.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.test.ts
 ```
 
 `voice-registration.test.ts` imports the real channel barrel and asserts the
@@ -388,6 +394,65 @@ share the hourly start cap, the daily minutes and the delegation timeout. A
 Gemini call is charged from token mint until the page hangs up or the token
 expires. Agent messages that answer no `ask_agent` call are dropped during a
 Gemini call.
+
+## LiveKit + Gemini Live (WebRTC)
+
+The same lines also take calls over WebRTC through a self-hosted
+[LiveKit](https://docs.livekit.io/) server, with Gemini Live as the voice, at
+`…/webhook/voice/livekit?t=<token>` (same token, line, agent wiring and access
+checks as `/call` and `/gemini`). It is off until all four keys are in `.env`;
+without them the `/livekit` routes answer 503 and nothing else changes:
+
+```
+LIVEKIT_URL=wss://<livekit host>:<port>     # signaling URL the caller's browser connects to
+LIVEKIT_API_KEY=<LiveKit API key>
+LIVEKIT_API_SECRET=<LiveKit API secret>
+GEMINI_API_KEY=<Gemini API key>             # read by the worker; the host only checks it is set
+```
+
+Optional: `LIVEKIT_WORKER_URL` (server-side URL for the worker and the host's
+room/dispatch API calls, e.g. `ws://127.0.0.1:7880` when the server runs on the
+same box; defaults to `LIVEKIT_URL`), `LIVEKIT_AGENT_NAME` (dispatch name,
+default `nanoclaw-voice`; set the same value for host and worker),
+`LIVEKIT_HOST_URL` (where the worker reaches this host's webhook server,
+default `http://127.0.0.1:<WEBHOOK_PORT>`), `GEMINI_LIVE_MODEL` (default
+`gemini-3.8-live`), `GEMINI_LIVE_VOICE` (default `Kore`). Restart to load them.
+
+The agent side is a separate process, the LiveKit Agents worker: agents-js
+runs every job in a forked child process of its worker, so it does not live in
+the host. Build, then run it next to the host from the NanoClaw directory (it
+reads the same `.env`):
+
+```bash
+pnpm run build
+pnpm run voice-worker        # node dist/voice-livekit-worker.js start
+```
+
+Its health check listens on `127.0.0.1:8089` (`VOICE_WORKER_HEALTH_PORT`).
+
+How a call runs: the page posts to `/webhook/voice/livekit/token`; the host
+admits the call against the shared hourly and daily limits, ends any other call
+on the line (newest wins, across all three engines), creates a unique room
+`voice-<line id>-<random>`, dispatches the worker to it with the call metadata
+(line, call id, agent name, the composed voice prompt, a per-call secret) and
+returns a two-minute token that can only join that room, publish a microphone
+and subscribe. The worker waits for the caller, tells the host (the daily
+minutes are charged from here until the room ends), then runs Gemini Live with
+one NON_BLOCKING `ask_agent` function. Each `ask_agent` call becomes an inbound
+message for the agent; its replies come back over the host's event stream to
+the worker: the first as the function result (spoken when the model is idle),
+any later reply, interrupted request or proactive agent message as a new turn.
+Requests are capped at 4 KB and 3 open per call; after 90 seconds without a
+reply the caller hears the timeout line. The host rechecks access every five
+seconds and ends a call (hangup, revocation, duration or budget limit, a newer
+call, shutdown) by deleting the room, which disconnects caller and worker.
+
+The page loads `livekit-client` from the host itself (`/webhook/voice/livekit/client.js`),
+no CDN. Microphone capture runs with echo cancellation, noise suppression and
+auto gain; DTX is off because Gemini 3.8 only ends a turn while audio keeps
+arriving. On iOS Safari the call must be started with the Call button (audio
+unlocks on that tap); if playback is still blocked a "Tap to hear the call"
+button appears.
 
 ## Channel Info
 

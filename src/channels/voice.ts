@@ -71,6 +71,8 @@ import {
   type LiveClientEvent,
   type LiveServerEvent,
 } from './gpt-live-session.js';
+import { createLiveKitVoice, type LiveKitVoiceConfig } from './voice-livekit.js';
+import { getWebhookPort } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerWebhookHandler } from '../webhook-server.js';
@@ -169,6 +171,8 @@ export interface GptLiveConfig {
   delegationTimeoutMs?: number;
   /** Enables the Gemini Live path under /webhook/voice/gemini; without it those routes answer 503. */
   gemini?: GeminiLiveConfig;
+  /** Enables the LiveKit + Gemini Live path under /webhook/voice/livekit; without it those routes answer 503. */
+  livekit?: LiveKitVoiceConfig;
 }
 
 export interface GeminiLiveConfig {
@@ -307,10 +311,12 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     const used = usage.get(platformId);
     const active = lines.get(platformId);
     const gemini = geminiCalls.get(platformId);
+    const lk = livekit?.activeCall(platformId);
     return (
       (used?.day === utcDay(t) ? used.usedMs : 0) +
       (active ? elapsedTodayMs(active, t) : 0) +
-      (gemini ? elapsedTodayMs(gemini, t) : 0)
+      (gemini ? elapsedTodayMs(gemini, t) : 0) +
+      (lk ? elapsedTodayMs(lk, t) : 0)
     );
   };
 
@@ -342,6 +348,33 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       usedMs: (used?.day === day ? used.usedMs : 0) + elapsedTodayMs(call, t),
     });
   };
+
+  const livekit = config.livekit
+    ? createLiveKitVoice(config.livekit, {
+        resolveLine,
+        sameCallerAndAgent: (a, b) => sameCallerAndAgent(a, b),
+        admitStart,
+        remainingTodayMs: (platformId, t) => maxCallMsPerDay - usedTodayMs(platformId, t),
+        chargeUsage,
+        endOtherCalls: (platformId, reason) => {
+          const openAi = lines.get(platformId);
+          if (openAi) closeCall(openAi, reason);
+          const gemini = geminiCalls.get(platformId);
+          if (gemini) endGeminiCall(gemini, reason);
+        },
+        onInbound: async (platformId, message) => {
+          if (!setup) throw new Error('livekit-voice: channel is not running');
+          await setup.onInbound(platformId, null, message);
+        },
+        isRunning: () => connected,
+        now,
+        maxCallDurationMs,
+        delegationTimeoutMs,
+        accessCheckIntervalMs: config.accessCheckIntervalMs ?? 5000,
+        thinkIntervalMs: THINK_INTERVAL_MS,
+        delegationTimeoutLine: DELEGATION_TIMEOUT_LINE,
+      })
+    : null;
 
   const clearDelegationTimer = (call: LiveCall, delegationId: string): void => {
     clearTimeout(call.delegationTimers.get(delegationId));
@@ -503,6 +536,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     if (previous) {
       closeCall(previous, 'replaced by a new call');
     }
+    livekit?.endLine(platformId, 'replaced by a new call');
     // Charged after the replaced call above, so its minutes count against this one.
     const remainingMs = maxCallMsPerDay - usedTodayMs(platformId, now());
     const call: LiveCall = {
@@ -667,6 +701,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     // Newest wins, as on the OpenAI path; the replaced page's session runs out on its own token.
     const previous = geminiCalls.get(platformId);
     if (previous) endGeminiCall(previous, 'replaced by a new call');
+    livekit?.endLine(platformId, 'replaced by a new call');
     const call: GeminiCall = {
       callId: randomUUID(),
       platformId,
@@ -821,6 +856,10 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         return;
       }
       if (route === 'gemini' || route.startsWith('gemini/')) return await handleGemini(req, res, route, token);
+      if (route === 'livekit' || route.startsWith('livekit/')) {
+        if (!livekit) return reply(res, 503, 'LiveKit voice is not configured on this host');
+        return await livekit.handleHttp(req, res, route, url, tokens, lineIdForToken);
+      }
       if (route === 'info') {
         // Who answers this line, so the page can greet by name before the call.
         if (req.method !== 'GET') return reply(res, 405, 'GET only');
@@ -935,6 +974,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         lines: tokens.size,
         voice: config.voice,
         gemini: config.gemini ? config.gemini.model || DEFAULT_GEMINI_LIVE_MODEL : 'off',
+        livekit: config.livekit ? config.livekit.url : 'off',
       });
     },
 
@@ -944,6 +984,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         closeCall(call, 'teardown');
       }
       for (const call of [...geminiCalls.values()]) endGeminiCall(call, 'teardown');
+      await livekit?.teardown();
       connected = false;
       setup = null;
       await Promise.all([...cleanups]);
@@ -975,6 +1016,10 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         return message.inReplyTo;
       }
       const target = message.inReplyTo ? parseDelegationMessageId(message.inReplyTo) : null;
+      if (!target && livekit) {
+        const spoken = await livekit.deliver(platformId, message.inReplyTo, text);
+        if (spoken) return spoken.id;
+      }
       const call = lines.get(platformId);
       if (target && target.sessionId !== call?.session.sessionId) {
         // An answer for a call that is over must not be spoken into a later one; retrying cannot help.
@@ -1001,6 +1046,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       // The host re-fires typing every few seconds for as long as the agent works. The voice
       // model needs one quiet note now and then, not a drumbeat: at most one per
       // THINK_INTERVAL_MS while a reply is pending, none once the reply went out.
+      await livekit?.setTyping(platformId, status);
       const call = lines.get(platformId);
       if (!call || call.session.pendingDelegations().length === 0 || !(await checkCallAccess(call))) return;
       const t = now();
@@ -1059,6 +1105,12 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'GEMINI_API_KEY',
       'GEMINI_LIVE_MODEL',
       'GEMINI_LIVE_VOICE',
+      'LIVEKIT_URL',
+      'LIVEKIT_WORKER_URL',
+      'LIVEKIT_API_KEY',
+      'LIVEKIT_API_SECRET',
+      'LIVEKIT_AGENT_NAME',
+      'LIVEKIT_HOST_URL',
     ]);
     const key = resolveOpenAiKey(env);
     if (!key) return null;
@@ -1087,6 +1139,20 @@ registerChannelAdapter(CHANNEL_TYPE, {
       gemini: env.GEMINI_API_KEY
         ? { apiKey: env.GEMINI_API_KEY, model: env.GEMINI_LIVE_MODEL, voice: env.GEMINI_LIVE_VOICE }
         : undefined,
+      // The worker holds the Gemini key; the host only needs to know the engine can run.
+      livekit:
+        env.LIVEKIT_URL && env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.GEMINI_API_KEY
+          ? {
+              url: env.LIVEKIT_URL,
+              serverUrl: env.LIVEKIT_WORKER_URL,
+              apiKey: env.LIVEKIT_API_KEY,
+              apiSecret: env.LIVEKIT_API_SECRET,
+              agentName: env.LIVEKIT_AGENT_NAME,
+              hostUrl: env.LIVEKIT_HOST_URL || `http://127.0.0.1:${getWebhookPort()}`,
+              model: env.GEMINI_LIVE_MODEL,
+              voice: env.GEMINI_LIVE_VOICE,
+            }
+          : undefined,
     });
   },
   defaults: GPT_LIVE_DEFAULTS,
