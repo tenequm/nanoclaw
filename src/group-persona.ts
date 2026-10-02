@@ -25,8 +25,8 @@ export function stageGroupPersona(groupDir: string, instructions: string): boole
 }
 
 /** Read a group's standing instructions without following symlinks. */
-export function readGroupPersona(groupDir: string): string | null {
-  const file = path.join(groupDir, PERSONA_PREPEND_FILE);
+export function readGroupPersona(groupDir: string, fileName: string = PERSONA_PREPEND_FILE): string | null {
+  const file = path.join(groupDir, fileName);
   let fd: number | undefined;
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);

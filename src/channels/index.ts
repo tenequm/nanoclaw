@@ -16,3 +16,6 @@ import './telegram-grammy/index.js';
 import './slack.js';
 import './slack-a2a-guard.js';
 import './slack-a2a.js';
+
+// Voice — GPT-Live browser call page (/add-voice).
+import './voice.js';
