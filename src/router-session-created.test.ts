@@ -367,6 +367,34 @@ describe('an event addressed to one agent group', () => {
     expect(stored).toEqual(['ag-1']);
   });
 
+  it('reports through onStored a turn on a chat whose agent keeps it as context without waking', async () => {
+    await activate();
+    await seedWiring({ engageMode: 'pattern', engagePattern: '^@Stan\\b', ignoredMessagePolicy: 'accumulate' });
+    let stored = 0;
+    const events: SessionCreatedEvent[] = [];
+    registerSessionCreatedHook((event) => {
+      events.push(event);
+    });
+    // Not addressed to the agent and not matching its trigger: stored as context, the agent not woken.
+    await routeInbound({
+      channelType: 'testchat',
+      platformId: 'testchat:C1',
+      threadId: null,
+      message: {
+        id: 'livekit:call-1:1',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text: 'just context' }),
+        timestamp: now(),
+        isMention: true,
+        isGroup: false,
+      },
+      onStored: () => stored++,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(stored).toBe(1);
+    expect(events).toEqual([]);
+  });
+
   it('puts no reaction ack on its host-made message id', async () => {
     await activate();
     await seedWiring({});

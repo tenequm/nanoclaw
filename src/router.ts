@@ -678,7 +678,8 @@ async function deliverToAgent(
     content,
     trigger: wake,
   });
-  if (wake) event.onStored?.();
+  // Stored is what a host-made turn waits for, whether it woke the agent or became context.
+  event.onStored?.();
 
   if (wake && created) {
     // A brand-new engaged session: notify registered modules with the

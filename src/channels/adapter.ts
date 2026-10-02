@@ -94,8 +94,9 @@ export interface InboundEvent {
    */
   agentGroupId?: string;
   /**
-   * Called each time the router stores the message in an agent's session as a
-   * trigger, before the wake. Set only host-side, like `agentGroupId`.
+   * Called each time the router stores the message in an agent's session, as a
+   * trigger (before the wake) or as context under the `accumulate` policy. Set
+   * only host-side, like `agentGroupId`.
    */
   onStored?: () => void;
 }

@@ -427,7 +427,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
           // An OpenAI start still creating its session sees itself superseded and hangs up.
           pendingStarts.delete(platformId);
         },
-        // Resolves once the agent's session stored the turn, or with false once routing ended without that.
+        // Resolves once the agent's session stored the turn (to answer, or as context), or with false once routing ended without that.
         routeTurn: (event) =>
           new Promise<boolean>((resolve, reject) => {
             if (!setup?.routeInboundEvent) {
