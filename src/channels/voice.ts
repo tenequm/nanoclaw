@@ -429,6 +429,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
 
   const livekit = config.livekit
     ? createLiveKitVoice(config.livekit, {
+        ui: config.ui,
         resolveLine,
         sameCallerAndAgent: (a, b) => sameCallerAndAgent(a, b),
         admitStart,

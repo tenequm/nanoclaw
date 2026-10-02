@@ -11,7 +11,6 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { ChannelAdapter, InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
 import { createGptLiveAdapter, lineIdForToken, type GptLiveConfig, type VoiceChannelAdapter } from './voice.js';
 import {
-  liveKitCallPageHtml,
   liveKitChatDelivered,
   liveKitChatTyping,
   pickMirrorTarget,
@@ -28,11 +27,11 @@ import type { MessagingGroup } from '../types.js';
 import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
-  WALKIE_THINKING_ATTRIBUTE,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
 } from './voice-livekit-protocol.js';
 import { stopWebhookServer } from '../webhook-server.js';
+import { callPageHtml } from './gpt-live-call-page.js';
 
 const LINE = lineIdForToken('tok123');
 const MIN = 60_000;
@@ -239,6 +238,8 @@ interface TokenResponse {
   token: string;
   callId: string;
   agent: string;
+  /** The call chat's name, for the page; absent while the call talks on the voice line. */
+  chat?: string;
 }
 
 /** The worker's side of one call: its metadata, an open event stream, and its POSTs. */
@@ -362,18 +363,16 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(adapter.walkieLink(lineIdForToken('other'))).toBeNull();
   });
 
-  it('serves the call page and the same-origin client bundle', async () => {
+  it('serves the voice call page in its LiveKit transport', async () => {
     const res = await fetch(`${h.base}/livekit?t=tok123`);
     expect(res.status).toBe(200);
     const csp = res.headers.get('content-security-policy') ?? '';
     expect(csp).toContain("connect-src 'self' wss://lk.example.ts.net:47880 https://lk.example.ts.net:47880");
     const html = await res.text();
-    expect(html).toContain('<script src="livekit/client.js"></script>');
-    expect(html).not.toContain('innerHTML');
-    const js = await fetch(`${h.base}/livekit/client.js`);
-    expect(js.status).toBe(200);
-    expect(js.headers.get('content-type')).toContain('text/javascript');
-    expect(await js.text()).toContain('LivekitClient');
+    expect(html).toBe(callPageHtml({ transport: 'livekit' }));
+    // The same page as the OpenAI route; only the injected transport differs.
+    const openAi = await (await fetch(`${h.base}/call?t=tok123`)).text();
+    expect(openAi).toContain('window.__VOICE_UI__={}');
   });
 
   it('refuses unknown links and callers without access before touching LiveKit', async () => {
@@ -810,8 +809,12 @@ describe('livekit call talking in the agent chat', () => {
     );
 
   it('routes each turn into the one Telegram chat as the line owner, posts the transcript and speaks the chat replies', async () => {
-    const { posts } = await start([{ platform_id: 'telegram:100' }, { channel_type: 'voice', platform_id: LINE }]);
-    const { worker } = await startCall(h);
+    const { posts } = await start([
+      { platform_id: 'telegram:100', name: 'HQ' },
+      { channel_type: 'voice', platform_id: LINE },
+    ]);
+    const { call, worker } = await startCall(h);
+    expect(call.chat).toBe('HQ');
     const id = await worker.utter('Book a table for two');
     expect(h.inbound).toEqual([]);
     expect(h.events).toHaveLength(1);
@@ -954,7 +957,8 @@ describe('livekit call talking in the agent chat', () => {
 
   it('keeps the call on the voice line with WALKIE_MIRROR=off and no /voice chat', async () => {
     const { posts } = await start([{}], 'off');
-    const { worker } = await startCall(h);
+    const { call, worker } = await startCall(h);
+    expect(call.chat).toBeUndefined();
     await worker.utter('hello');
     expect(h.events).toEqual([]);
     expect(h.inbound).toHaveLength(1);
@@ -979,37 +983,6 @@ describe('spoken text of a delivered message', () => {
     expect(spokenText(msg({ text: 'status' }, { id: 'hcmd-reply-1' }))).toBeNull();
     expect(spokenText(msg({ text: 'x' }, { kind: 'system' }))).toBeNull();
     expect(spokenText({ id: 'm', kind: 'chat', content: 'not json' })).toBeNull();
-  });
-});
-
-describe('livekit call page', () => {
-  const html = liveKitCallPageHtml();
-  const script = html.slice(html.lastIndexOf('<script>') + '<script>'.length, html.lastIndexOf('</script>'));
-
-  it('is valid script', () => {
-    expect(() => new Function(script)).not.toThrow();
-  });
-
-  it('shows the walkie-talkie states and labels the captions the worker sends', () => {
-    expect(script).toContain("setStatus('Listening')");
-    expect(script).toContain("setStatus(names.agent + ' is thinking')");
-    expect(script).toContain("setStatus(names.agent + ' is speaking')");
-    // Thinking comes from the worker's own attribute, not lk.agent.state.
-    expect(script).toContain(`const THINKING_ATTR = '${WALKIE_THINKING_ATTRIBUTE}'`);
-    expect(script).toContain("registerTextStreamHandler('lk.transcription'");
-    // The caller's own turns come back from the worker against the caller's track: "You".
-    expect(script).toContain("attrs['lk.transcribed_track_id'] === c.localSid");
-  });
-
-  it('says the voice service is updating instead of waiting forever for a worker', () => {
-    expect(script).toContain("hangup(c, UPDATING, false, 'updating')");
-    expect(script).toContain("hangup(c, UPDATING, false, 'no-agent')");
-    expect(script).toContain('The voice service is updating. Try again in a minute.');
-  });
-
-  it('keeps iOS on relay-only ICE', () => {
-    expect(script).toContain("rtcConfig: { iceTransportPolicy: 'relay' }");
-    expect(script).toContain('isIOS');
   });
 });
 

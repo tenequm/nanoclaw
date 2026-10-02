@@ -36,15 +36,14 @@
  * or no single chat to pick) the call talks on the voice line itself, and the
  * agent's replies come back through deliver() by their `livekit:` reply id.
  */
-import { createRequire } from 'node:module';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import fs from 'node:fs';
 import type http from 'node:http';
 
 import { AccessToken, AgentDispatchClient, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
 
 import type { ChannelAdapter, InboundEvent, InboundMessage } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
+import { callPageHtml, type VoiceUiConfig } from './gpt-live-call-page.js';
 import type { ResolveLineOptions, VoiceLine } from './gpt-live-prompt.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
@@ -57,8 +56,6 @@ import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   PING_INTERVAL_MS,
-  WALKIE_THINKING_ATTRIBUTE,
-  WALKIE_UPDATING_ATTRIBUTE,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
 } from './voice-livekit-protocol.js';
@@ -204,6 +201,8 @@ export interface LiveKitHost {
   now(): number;
   maxCallDurationMs: number;
   accessCheckIntervalMs: number;
+  /** Look of the call page (GPT_LIVE_UI); the walkie-talkie serves the same page as the OpenAI path. */
+  ui?: VoiceUiConfig;
 }
 
 interface LiveKitCall {
@@ -404,7 +403,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const mirrorChains = new Map<string, Promise<void>>();
   /** The last call-chat note logged per line and topic, so a line logs when it changes, not every turn. */
   const chatNotes = new Map<string, string>();
-  let clientJs: string | undefined;
   let page: string | undefined;
 
   const reply = (res: http.ServerResponse, status: number, body: string, headers: Record<string, string> = {}) => {
@@ -694,6 +692,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       else endCall(call, 'room setup failed');
       return reply(res, 502, 'livekit-voice: could not open the call room');
     }
+    // The chat the call talks in, for the page to show; resolved again when the caller joins.
+    const chatGroup = (await refreshChat(call, false))?.group;
+    const chat = chatGroup ? chatGroup.name || chatGroup.channel_type : undefined;
     if (call.ended || !host.isRunning()) {
       // Replaced or torn down while connecting: that cleanup ran before the room and dispatch
       // existed, so delete them here or they wait for the caller until LiveKit's empty timeout.
@@ -716,7 +717,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       ttsModel: walkie.ttsModel,
       ttsFallbackModel: walkie.ttsFallbackModel,
     });
-    reply(res, 200, JSON.stringify({ url: config.url, token, callId, agent: line.agent.name }), JSON_HEADERS);
+    reply(res, 200, JSON.stringify({ url: config.url, token, callId, agent: line.agent.name, chat }), JSON_HEADERS);
   };
 
   /** The worker saw the caller join: start the clock and the duration / budget cap. */
@@ -860,12 +861,12 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       'Cache-Control': 'no-store',
       'Referrer-Policy': 'no-referrer',
       'X-Frame-Options': 'DENY',
-      // One document plus the same-origin client bundle; signaling to the LiveKit server. WebRTC
-      // media is not governed by connect-src.
+      // The voice page as one self-contained document (inline module script and styles, data: fonts
+      // and images); signaling to the LiveKit server. WebRTC media is not governed by connect-src.
       'Content-Security-Policy':
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; " +
+        "default-src 'self' 'unsafe-inline' blob: data:; " +
         `connect-src 'self' ${lk.protocol}//${lk.host} ${https}; media-src 'self' blob: mediastream:; ` +
-        "worker-src 'self' blob:; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
     };
   };
 
@@ -874,22 +875,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       if (route.startsWith('livekit/agent/')) return handleAgent(req, res, route, url);
       if (route === 'livekit') {
         if (req.method !== 'GET') return reply(res, 405, 'GET only');
-        page ??= liveKitCallPageHtml();
+        page ??= callPageHtml({ ...host.ui, transport: 'livekit' });
         res.writeHead(200, pageHeaders());
         res.end(page);
-        return;
-      }
-      // Also matched from a page opened with a trailing slash, where the relative src gains a segment.
-      if (route === 'livekit/client.js' || route === 'livekit/livekit/client.js') {
-        if (req.method !== 'GET') return reply(res, 405, 'GET only');
-        // The UMD bundle of livekit-client, served same-origin so the page needs no CDN.
-        clientJs ??= fs.readFileSync(createRequire(import.meta.url).resolve('livekit-client'), 'utf8');
-        res.writeHead(200, {
-          'Content-Type': 'text/javascript; charset=utf-8',
-          'Cache-Control': 'public, max-age=3600',
-          'X-Content-Type-Options': 'nosniff',
-        });
-        res.end(clientJs);
         return;
       }
       if (req.method !== 'POST') return reply(res, 405, 'POST only');
@@ -969,211 +957,4 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
   engines.add(engine);
   return engine;
-}
-
-// String.raw keeps the page script's escapes intact; the script avoids backticks and ${.
-const PAGE_SCRIPT = String.raw`
-const LK = window.LivekitClient;
-const linkToken = new URLSearchParams(location.search).get('t') || '';
-const base = location.pathname.replace(/\/livekit\/?$/, '');
-const q = '?t=' + encodeURIComponent(linkToken);
-const btn = document.getElementById('btn');
-const audioBtn = document.getElementById('audio');
-const statusEl = document.getElementById('status');
-const logEl = document.getElementById('log');
-const names = { agent: 'the agent' };
-const THINKING_ATTR = '__THINKING_ATTR__';
-const UPDATING_ATTR = '__UPDATING_ATTR__';
-// Without a worker in the room after this long, it is down or mid-update (host and worker restart together).
-const AGENT_JOIN_MS = 25000;
-const UPDATING = 'The voice service is updating. Try again in a minute.';
-let call = null;
-
-// lk.agent.state (the worker's LiveKit session) says listening or speaking; the worker's own
-// attribute says when the agent is thinking, which a session without an LLM never is.
-function showAgent(c, p) {
-  const attrs = (p && p.attributes) || {};
-  if (attrs[UPDATING_ATTR] === '1') return hangup(c, UPDATING, false, 'updating');
-  const state = attrs['lk.agent.state'];
-  if (state === 'speaking') return setStatus(names.agent + ' is speaking');
-  if (attrs[THINKING_ATTR] === '1') return setStatus(names.agent + ' is thinking');
-  if (state === 'listening' || state === 'idle') return setStatus('Listening');
-  setStatus('Live: talk to ' + names.agent + '.');
-}
-
-function setStatus(text) { statusEl.textContent = text; }
-function captionLine(role, label) {
-  const p = document.createElement('p');
-  p.className = 't ' + role;
-  const b = document.createElement('b');
-  b.textContent = label;
-  const span = document.createElement('span');
-  p.append(b, span);
-  logEl.append(p);
-  while (logEl.childElementCount > 200) logEl.firstElementChild.remove();
-  return span;
-}
-
-// One text stream per transcript segment version; a newer stream for the same segment replaces it.
-async function caption(c, reader, from) {
-  const attrs = (reader.info && reader.info.attributes) || {};
-  const mine = (c.localSid && attrs['lk.transcribed_track_id'] === c.localSid) ||
-    (from && c.room && from.identity === c.room.localParticipant.identity);
-  const key = attrs['lk.segment_id'] || reader.info.id;
-  let entry = c.lines.get(key);
-  if (!entry) {
-    entry = { span: captionLine(mine ? 'caller' : 'agent', mine ? 'You' : names.agent) };
-    c.lines.set(key, entry);
-    if (c.lines.size > 300) c.lines.delete(c.lines.keys().next().value);
-  }
-  let text = '';
-  for await (const chunk of reader) {
-    if (c.ended) return;
-    text += chunk;
-    entry.span.textContent = text.trim();
-    logEl.scrollTop = logEl.scrollHeight;
-  }
-}
-
-function endOnServer(c, beacon, reason) {
-  if (!c.callId || c.endSent) return;
-  c.endSent = true;
-  const url = base + '/livekit/end' + q;
-  const body = JSON.stringify(reason ? { callId: c.callId, reason: reason } : { callId: c.callId });
-  if (beacon && navigator.sendBeacon && navigator.sendBeacon(url, body)) return;
-  fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: true }).catch(() => {});
-}
-
-function hangup(c, message, beacon, reason) {
-  if (c.ended) return;
-  c.ended = true;
-  clearTimeout(c.agentTimer);
-  endOnServer(c, beacon, reason);
-  if (c.room) c.room.disconnect().catch(() => {});
-  if (c.mic) c.mic.stop();
-  for (const el of c.elements) el.remove();
-  if (c.ctx) c.ctx.close().catch(() => {});
-  if (call === c) call = null;
-  audioBtn.hidden = true;
-  setStatus(message);
-  btn.textContent = 'Call';
-  btn.className = '';
-}
-
-function start() {
-  const c = { room: null, mic: null, ctx: null, callId: null, ended: false, endSent: false, localSid: null,
-    lines: new Map(), elements: new Set() };
-  call = c;
-  btn.textContent = 'Hang up';
-  btn.className = 'hang';
-  // Inside the click: browsers (iOS Safari above all) unlock audio output only on a user gesture.
-  c.ctx = new AudioContext();
-  const resumed = c.ctx.resume().catch(() => {});
-  const room = new LK.Room({ adaptiveStream: false, dynacast: false, disconnectOnPageLeave: false });
-  c.room = room;
-  room.startAudio().catch(() => {});
-  run(c, room, resumed).catch((err) => hangup(c, 'Could not start: ' + ((err && err.message) || err)));
-}
-
-async function run(c, room, resumed) {
-  setStatus('Starting the microphone...');
-  c.mic = await LK.createLocalAudioTrack({ echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 });
-  await resumed;
-  if (c.ended) return hangup(c, 'Call ended.');
-  setStatus('Connecting...');
-  const res = await fetch(base + '/livekit/token' + q, { method: 'POST' });
-  if (!res.ok) throw new Error((await res.text()) || 'HTTP ' + res.status);
-  const s = await res.json();
-  c.callId = s.callId;
-  if (s.agent) names.agent = s.agent;
-  if (c.ended) return endOnServer(c, false);
-  room.registerTextStreamHandler('lk.transcription', (reader, from) => { caption(c, reader, from).catch(() => {}); });
-  room.on(LK.RoomEvent.TrackSubscribed, (track) => {
-    if (track.kind !== 'audio') return;
-    const el = track.attach();
-    el.hidden = true;
-    document.body.append(el);
-    c.elements.add(el);
-  });
-  room.on(LK.RoomEvent.TrackUnsubscribed, (track) => {
-    for (const el of track.detach()) { c.elements.delete(el); el.remove(); }
-  });
-  room.on(LK.RoomEvent.AudioPlaybackStatusChanged, () => { audioBtn.hidden = room.canPlaybackAudio; });
-  room.on(LK.RoomEvent.ParticipantConnected, (p) => { if (p.isAgent) { clearTimeout(c.agentTimer); showAgent(c, p); } });
-  room.on(LK.RoomEvent.ParticipantDisconnected, (p) => { if (p.isAgent) hangup(c, names.agent + ' left the call.'); });
-  room.on(LK.RoomEvent.ParticipantAttributesChanged, (changed, p) => { if (p && p.isAgent) showAgent(c, p); });
-  room.on(LK.RoomEvent.Disconnected, () => hangup(c, 'Call ended.'));
-  // iOS Safari binds WebRTC UDP to the Wi-Fi interface, so UDP to a VPN (Tailscale) address
-  // stalls until LiveKit's fallback timers fire; going straight to TURN/TLS (TCP) connects at once.
-  // ?relay=1 / ?relay=0 overrides the iOS default for testing.
-  const relayParam = new URLSearchParams(location.search).get('relay');
-  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  const forceRelay = relayParam === null ? isIOS : relayParam === '1';
-  await room.connect(s.url, s.token, forceRelay ? { autoSubscribe: true, rtcConfig: { iceTransportPolicy: 'relay' } } : { autoSubscribe: true });
-  if (c.ended) return;
-  // DTX off: the worker times the caller's turn by the silence it hears, so silence must keep arriving.
-  const pub = await room.localParticipant.publishTrack(c.mic, { source: LK.Track.Source.Microphone, dtx: false, red: false });
-  c.localSid = pub.trackSid;
-  audioBtn.hidden = room.canPlaybackAudio;
-  const agent = [...room.remoteParticipants.values()].find((p) => p.isAgent);
-  if (agent) return showAgent(c, agent);
-  setStatus('Waiting for ' + names.agent + '...');
-  c.agentTimer = setTimeout(() => hangup(c, UPDATING, false, 'no-agent'), AGENT_JOIN_MS);
-}
-
-btn.addEventListener('click', () => (call ? hangup(call, 'Call ended.') : start()));
-audioBtn.addEventListener('click', () => { if (call && call.room) call.room.startAudio().catch(() => {}); });
-addEventListener('pagehide', () => { if (call) hangup(call, 'Call ended.', true); });
-if (!LK) setStatus('The call client did not load.');
-fetch(base + '/info' + q)
-  .then((res) => (res.ok ? res.json() : null))
-  .then((info) => {
-    if (!info) return setStatus('This call link is not active.');
-    names.agent = info.agent;
-    document.getElementById('title').textContent = 'Call ' + info.agent;
-  })
-  .catch(() => {});
-`;
-
-const PAGE = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="color-scheme" content="light dark" />
-<title>Live Voice</title>
-<style>
-:root{--bg:#f6f5f2;--fg:#1d1d1f;--muted:#6b6b70;--card:#fff;--line:#e3e2de;--accent:#1a73e8;--danger:#c5221f}
-@media (prefers-color-scheme: dark){:root{--bg:#141416;--fg:#ececef;--muted:#9a9aa2;--card:#1d1d21;--line:#2c2c31;--accent:#3b78e7;--danger:#d93025}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;justify-content:center;padding:24px 16px}
-main{width:100%;max-width:560px;display:flex;flex-direction:column;gap:16px}
-h1{font-size:20px;margin:0}
-#status{color:var(--muted);min-height:1.45em}
-.keys{display:flex;gap:12px;flex-wrap:wrap}
-button{font:inherit;font-weight:600;border:0;border-radius:999px;padding:14px 28px;background:var(--accent);color:#fff;cursor:pointer}
-button.hang{background:var(--danger)}
-#audio{background:var(--card);color:var(--fg);border:1px solid var(--line)}
-#log{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;min-height:200px;max-height:60vh;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
-.t{margin:0}.t b{color:var(--muted);font-weight:600;margin-right:6px}
-</style>
-</head>
-<body>
-<main>
-<h1 id="title">Live Voice</h1>
-<div id="status">Press Call to start.</div>
-<div class="keys"><button id="btn" type="button">Call</button><button id="audio" type="button" hidden>Tap to hear the call</button></div>
-<div id="log" aria-live="polite"></div>
-</main>
-<script src="livekit/client.js"></script>
-<script>
-${PAGE_SCRIPT.replace('__THINKING_ATTR__', WALKIE_THINKING_ATTRIBUTE).replace('__UPDATING_ATTR__', WALKIE_UPDATING_ATTRIBUTE)}
-</script>
-</body>
-</html>
-`;
-
-/** The LiveKit call page: one document; livekit-client loads from the same origin. */
-export function liveKitCallPageHtml(): string {
-  return PAGE;
 }
