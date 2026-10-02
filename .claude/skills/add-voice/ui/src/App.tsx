@@ -93,7 +93,8 @@ const LOST_REASON: Record<NonNullable<TurnMark["reason"]>, string> = {
 
 function markLabel(mark: TurnMark): string {
   if (mark.status === "sent") return "sent"
-  return mark.reason ? `not sent · ${LOST_REASON[mark.reason]}` : "not sent"
+  const why = mark.reason && LOST_REASON[mark.reason]
+  return why ? `not sent · ${why}` : "not sent"
 }
 
 /**
@@ -529,7 +530,7 @@ export default function App() {
             <p className="agent-line">
               {live ? "On a call with " : phase === "connecting" ? "Calling " : phase === "ended" ? "Call ended with " : "Ready to call "}
               <strong>{agentName}</strong>
-              {call.chat && (live || phase === "connecting" || phase === "ended") && <span className="call-chat">{` → ${call.chat}`}</span>}
+              {call.chat && (live || phase === "connecting" || phase === "ended") && <span>{` → ${call.chat}`}</span>}
             </p>
           </div>
         </header>

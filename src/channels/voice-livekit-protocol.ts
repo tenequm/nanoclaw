@@ -24,6 +24,8 @@ export const DEFAULT_WALKIE_TTS_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
 export const DEFAULT_WALKIE_TTS_VOICE = 'Alnilam';
 /** Silence that ends the caller's turn; shorter pauses mid-thought keep it open. */
 export const DEFAULT_WALKIE_SILENCE_MS = 2500;
+/** Channel type of the default call chat when `/voice` has not set one (WALKIE_MIRROR). */
+export const DEFAULT_WALKIE_MIRROR = 'telegram';
 
 /** What the worker receives as job metadata. Nothing secret: agents-js logs the whole job on some paths. */
 export interface LiveKitJobMetadata {

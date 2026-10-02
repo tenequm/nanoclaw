@@ -57,6 +57,7 @@ import {
   type LiveServerEvent,
 } from './gpt-live-session.js';
 import { createLiveKitVoice, LIVEKIT_ID_PREFIX, type LiveKitVoiceConfig } from './voice-livekit.js';
+import { DEFAULT_WALKIE_MIRROR } from './voice-livekit-protocol.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerWebhookHandler } from '../webhook-server.js';
@@ -864,7 +865,7 @@ export function parseUiConfig(raw: string | undefined): VoiceUiConfig | undefine
 }
 
 /** WALKIE_SILENCE_MS: how long the caller is silent before their turn ends; nonsense falls back to the default. */
-export function parseWalkieSilenceMs(raw: string | undefined): number | undefined {
+function parseWalkieSilenceMs(raw: string | undefined): number | undefined {
   if (!raw?.trim()) return undefined;
   const ms = Number(raw);
   if (Number.isInteger(ms) && ms >= 300 && ms <= 30_000) return ms;
@@ -945,7 +946,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
                 ttsVoice: env.WALKIE_TTS_VOICE,
                 silenceMs: parseWalkieSilenceMs(env.WALKIE_SILENCE_MS),
               },
-              mirror: (env.WALKIE_MIRROR || 'telegram').trim().toLowerCase(),
+              mirror: (env.WALKIE_MIRROR || DEFAULT_WALKIE_MIRROR).trim().toLowerCase(),
             }
           : undefined,
     });

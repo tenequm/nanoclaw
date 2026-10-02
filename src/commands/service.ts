@@ -30,7 +30,6 @@ import fs from 'fs';
 
 import { resolveThreadPolicy } from '../channels/channel-defaults.js';
 import { getChannelAdapter, getChannelAdapterExact, getChannelDefaults } from '../channels/channel-registry.js';
-import type { VoiceChannelAdapter } from '../channels/voice.js';
 import { restartAgentGroupContainers } from '../container-restart.js';
 import { isContainerRunning, killContainer } from '../container-runner.js';
 import { getAgentGroup } from '../db/agent-groups.js';
@@ -568,8 +567,9 @@ export type VoiceLinkFn = (line: MessagingGroup) => string | null;
 
 /** Asks the live voice adapter, the only holder of the link tokens. */
 const liveVoiceLink: VoiceLinkFn = (line) => {
+  // Structural, not voice.ts's VoiceChannelAdapter: core must still build once add-voice is removed.
   const adapter = getChannelAdapterExact(line.instance ?? line.channel_type) as
-    | Partial<VoiceChannelAdapter>
+    | { walkieLink?(platformId: string): string | null }
     | undefined;
   return adapter?.walkieLink?.(line.platform_id) ?? null;
 };

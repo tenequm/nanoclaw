@@ -30,6 +30,9 @@ import {
   liveKitCallSecret,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
+  WALKIE_THINKING_ATTRIBUTE,
+  WALKIE_TURN_TOPIC,
+  WALKIE_UPDATING_ATTRIBUTE,
 } from './voice-livekit-protocol.js';
 import { stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './gpt-live-call-page.js';
@@ -356,6 +359,16 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(csp).toContain("connect-src 'self' wss://lk.example.ts.net:47880 https://lk.example.ts.net:47880");
     const html = await res.text();
     expect(html).toBe(callPageHtml({ transport: 'livekit' }));
+    // The page keeps its own copy of the worker's wire names (it cannot import the protocol module).
+    for (const name of [
+      WALKIE_THINKING_ATTRIBUTE,
+      WALKIE_UPDATING_ATTRIBUTE,
+      WALKIE_TURN_TOPIC,
+      '"no-agent"',
+      '"updating"',
+    ]) {
+      expect(html).toContain(name);
+    }
     // The same page as the OpenAI route; only the injected transport differs.
     const openAi = await (await fetch(`${h.base}/call?t=tok123`)).text();
     expect(openAi).toContain('window.__VOICE_UI__={}');
@@ -776,7 +789,7 @@ describe('livekit call talking in the agent chat', () => {
       agentGroupId,
     );
 
-  it('routes each turn into the one Telegram chat as the line owner, posts the transcript and speaks the chat replies', async () => {
+  it('routes each turn into the one Telegram chat as the line caller, posts the transcript and speaks the chat replies', async () => {
     const { posts } = await start([
       { platform_id: 'telegram:100', name: 'HQ' },
       { channel_type: 'voice', platform_id: LINE },
@@ -823,6 +836,12 @@ describe('livekit call talking in the agent chat', () => {
     await settle();
     expect(posts).toHaveLength(1);
     worker.close();
+  });
+
+  it('names an unnamed direct chat by its channel for the page header', async () => {
+    await start([{ platform_id: 'telegram:100' }, { channel_type: 'voice', platform_id: LINE }]);
+    const { call } = await startCall(h);
+    expect(call.chat).toBe('telegram DM');
   });
 
   it('talks in the chat /voice was run in, ahead of the default rule, still as the line caller', async () => {

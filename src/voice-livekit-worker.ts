@@ -1507,6 +1507,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'VOICE_WORKER_HEALTH_PORT',
     'WALKIE_RECORDINGS_DAYS',
   ]);
+  // agents-js initializes its logger once the CLI runs a command; console until then.
   console.info(
     `voice worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${liveKitHostUrl(env)} (LIVEKIT_HOST_URL)`,
   );

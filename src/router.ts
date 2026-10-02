@@ -427,7 +427,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     // An event addressed to this one agent by the host (a voice call's turn) engages it whatever
     // the chat's trigger; the access and sender-scope gates below still apply.
     const ruleEngages =
-      event.agentGroupId !== undefined || (await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId));
+      !!event.agentGroupId || (await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId));
 
     const accessOk =
       ruleEngages && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);

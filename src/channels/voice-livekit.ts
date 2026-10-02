@@ -1,5 +1,5 @@
 /**
- * LiveKit as a third voice engine for the voice channel, in walkie-talkie
+ * LiveKit as the second voice engine for the voice channel, in walkie-talkie
  * mode: the caller talks to the line's real NanoClaw agent, not to a voice
  * model playing it.
  *
@@ -78,8 +78,8 @@ const CALLER_TOKEN_TTL_SECONDS = 120;
 /** The worker opens its event stream right after it reports the caller in; without it nothing reaches the caller. */
 const WORKER_STREAM_TIMEOUT_MS = 30_000;
 /** A turn is at most 90 s of speech; Ukrainian runs about 4 KB of UTF-8 for that. */
-export const MAX_UTTERANCE_BYTES = 8 * 1024;
-export const MAX_UTTERANCES_PER_MINUTE = 20;
+const MAX_UTTERANCE_BYTES = 8 * 1024;
+const MAX_UTTERANCES_PER_MINUTE = 20;
 
 /** How the agent learns a message was spoken on a call and how its reply will be heard. */
 export const WALKIE_REPLY_NOTE =
@@ -101,7 +101,7 @@ export function walkieMessageText(transcript: string, note: string = WALKIE_REPL
 /** Inbound ids for caller turns are `livekit:<call>:<n>`; voice.ts parses replies with parseScopedId. */
 export const LIVEKIT_ID_PREFIX = 'livekit:';
 
-export function liveKitUtteranceMessageId(callId: string, utteranceId: string): string {
+function liveKitUtteranceMessageId(callId: string, utteranceId: string): string {
   return `${LIVEKIT_ID_PREFIX}${callId}:${utteranceId}`;
 }
 
@@ -171,7 +171,7 @@ export interface LiveKitVoiceConfig {
   agentName?: string;
   /** Transcription and speech settings the worker gets in the job metadata (WALKIE_*). */
   walkie?: WalkieSettings;
-  /** Channel type of the default call chat (WALKIE_MIRROR) when `/voice` has not set one; off when unset. */
+  /** Channel type of the default call chat when `/voice` has not set one; none when unset or `off`. voice.ts passes WALKIE_MIRROR, default DEFAULT_WALKIE_MIRROR. */
   mirror?: string;
   /** Test seam; defaults to the central DB and the live channel adapters. */
   mirrorApi?: MirrorApi;
@@ -696,7 +696,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     // The chat the call talks in, for the page to show; resolved again when the caller joins.
     const chatGroup = (await refreshChat(call, false))?.group;
-    const chat = chatGroup ? chatGroup.name || chatGroup.channel_type : undefined;
+    const chat = chatGroup
+      ? chatGroup.name || (chatGroup.is_group ? chatGroup.channel_type : `${chatGroup.channel_type} DM`)
+      : undefined;
     if (call.ended || !host.isRunning()) {
       // Replaced or torn down while connecting: that cleanup ran before the room and dispatch
       // existed, so delete them here or they wait for the caller until LiveKit's empty timeout.
@@ -792,6 +794,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (!(await checkAccess(call))) return reply(res, 403, 'Caller access denied');
     if (!host.isRunning()) return reply(res, 503, 'The voice channel is shutting down');
     const chat = await refreshChat(call, true);
+    // The call can end or be replaced while the chat lookups run; its turn must not reach the agent then.
+    if (call.ended || calls.get(call.platformId) !== call) return reply(res, 409, 'The call has ended');
     const utteranceId = String(++call.utterances);
     // Always the line's own caller, wherever the call talks: the line is that person's, not whoever ran /voice.
     const sender = call.line.caller;

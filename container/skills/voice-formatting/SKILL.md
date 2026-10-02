@@ -39,9 +39,12 @@ assistant lines are what the voice model already said; don't repeat them.
 A message wrapped in `<voice source="livekit">…</voice>` is one spoken turn
 from the caller, transcribed. No voice model sits in between: your reply is read
 out word for word by text-to-speech, and the caller hears silence until it
-arrives. The rules above apply as they are. Put anything long (lists, links,
-code, details) in a separate written message to your chat, and say so in one
-spoken sentence. More turns can arrive while you work: the caller adding to
+arrives. The rules above apply as they are. Where anything long (lists, links,
+code, details) goes depends on the note under the turn. A call on the voice line
+itself: put it in a separate written message to your chat, and say so in one
+spoken sentence. A call that talks in a chat: every message you send to that
+chat during the call is read aloud, so offer it for after the call instead.
+More turns can arrive while you work: the caller adding to
 what they said.
 
 ## Proactive messages

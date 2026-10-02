@@ -660,7 +660,7 @@ describe('/voice', () => {
     expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: null });
     const targets = await resolveTargets('mg-dm');
     expect(voiceCommandReply(await runVoiceCommand(targets, chat('mg-dm'), SCOPED_ADMIN, link), MD_FMT)).toBe(
-      'You have no voice line for this agent. The operator names a line owner with `ncl voice-lines set`.',
+      "You have no voice line for this agent. The operator names a line's owner accounts with `ncl voice-lines set` and `add-owner`.",
     );
   });
 

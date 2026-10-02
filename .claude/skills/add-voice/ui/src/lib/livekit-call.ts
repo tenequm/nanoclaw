@@ -51,7 +51,7 @@ function tokenErrorText(status: number, body: string): string {
 /**
  * iOS Safari binds WebRTC UDP to the Wi-Fi interface, so UDP to a VPN address stalls until
  * LiveKit's fallback timers fire; going straight to TURN/TLS connects at once.
- * `?relay=1` / `?relay=0` overrides the iOS default for testing.
+ * `?relay=1` / `?relay=0` overrides the iOS default.
  */
 function forceRelay(): boolean {
   const param = new URLSearchParams(location.search).get("relay")
@@ -110,7 +110,9 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const joinedRef = useRef(false)
 
   const [room] = useState(() => new Room({ adaptiveStream: false, dynacast: false, disconnectOnPageLeave: false }))
-  const agent = useRemoteParticipants({ room }).find((p) => p.isAgent)
+  // Membership changes only: the agent's attributes come through useParticipantAttributes, and the
+  // default event set (active speakers, quality, tracks) would re-render the whole page all call long.
+  const agent = useRemoteParticipants({ room, updateOnlyOn: [] }).find((p) => p.isAgent)
   const { attributes: agentAttributes } = useParticipantAttributes({ participant: agent })
   const transcriptions = useTranscriptions({ room })
   const { textStreams: turnStreams } = useTextStream(TURN_TOPIC, { room })
@@ -128,6 +130,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const agentTimer = useRef<number | null>(null)
   const mutedRef = useRef(false)
   const micRaw = useRef(0)
+  const agentRaw = useRef(0)
   const inputLevel = useRef(0)
   const outputLevel = useRef(0)
   const audioRef = useRef<HTMLAudioElement | null>(null)
@@ -209,6 +212,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       unlockCtx.current = null
       if (audioRef.current) audioRef.current.srcObject = null
       micRaw.current = 0
+      agentRaw.current = 0
       inputLevel.current = 0
       outputLevel.current = 0
       mutedRef.current = false
@@ -435,29 +439,41 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   }, [live])
 
   // Levels from RTP stats, not Web Audio: an analyser on the captured microphone silences the
-  // outgoing track on iOS Safari (see levelsFromStats), so neither track is tapped.
+  // outgoing track on iOS Safari (see levelsFromStats), so neither track is tapped. The agent's
+  // level also comes from its inbound report: the synchronization source carries one only when
+  // the packets have the audio-level header extension, which the agent's audio through the SFU
+  // can lack, and then the page went dark while the agent spoke.
   useEffect(() => {
     if (!live) return
     let raf = 0
     let stopped = false
+    let polling = false
     const poll = async () => {
-      const sender = mic.current?.sender
-      if (!sender || stopped) return
+      if (stopped || polling) return
+      polling = true
       try {
-        const { mic: level } = levelsFromStats(await sender.getStats())
-        if (!stopped && level !== null) micRaw.current = level
+        const sender = mic.current?.sender
+        const receiver = remote.current?.receiver
+        const [sent, received] = await Promise.all([sender?.getStats(), receiver?.getStats()])
+        if (stopped) return
+        const level = sent && levelsFromStats(sent).mic
+        if (level != null) micRaw.current = level
+        agentRaw.current = (received && levelsFromStats(received).agent) ?? 0
       } catch {
         /* the connection closed under us; the next tick decays to zero */
+      } finally {
+        polling = false
       }
     }
     const step = () => {
       let out = 0
       try {
         const srcs = remote.current?.receiver?.getSynchronizationSources?.() ?? []
-        if (srcs.length && typeof srcs[0].audioLevel === "number") out = Math.min(1, srcs[0].audioLevel * 3)
+        if (srcs.length && typeof srcs[0].audioLevel === "number") out = srcs[0].audioLevel
       } catch {
         out = 0
       }
+      out = Math.min(1, Math.max(out, agentRaw.current) * 3)
       outputLevel.current += (out - outputLevel.current) * 0.3
       const inp = mutedRef.current ? 0 : Math.min(1, micRaw.current * 5)
       inputLevel.current += (inp - inputLevel.current) * 0.35
@@ -478,6 +494,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       window.clearInterval(backstop)
       window.clearInterval(stats)
       micRaw.current = 0
+      agentRaw.current = 0
       inputLevel.current = 0
       outputLevel.current = 0
     }
