@@ -1114,7 +1114,13 @@ describe('liveKitHostUrl', () => {
     expect(liveKitHostUrl({ WEBHOOK_PORT: '3555' })).toBe('http://127.0.0.1:3555');
     expect(liveKitHostUrl({ LIVEKIT_HOST_URL: 'http://localhost:3000/' })).toBe('http://localhost:3000');
     expect(liveKitHostUrl({ LIVEKIT_HOST_URL: 'https://[::1]:3000' })).toBe('https://[::1]:3000');
-    for (const bad of ['http://192.168.1.5:3000', 'https://voice.example.com', 'ws://127.0.0.1:3000', 'nonsense']) {
+    for (const bad of [
+      'http://192.168.1.5:3000',
+      'http://127.0.0.2:3000',
+      'https://voice.example.com',
+      'ws://127.0.0.1:3000',
+      'nonsense',
+    ]) {
       expect(() => liveKitHostUrl({ LIVEKIT_HOST_URL: bad })).toThrow('LIVEKIT_HOST_URL must be a local');
     }
   });

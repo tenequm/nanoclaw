@@ -18,7 +18,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { getRegisteredChannelNames } from './channel-registry.js';
-import './index.js'; // the real channel barrel — triggers every channel's self-registration
+import './index.js'; // the real channel barrel: triggers every channel's self-registration
 import '../modules/index.js'; // the real modules barrel, as the host loads it
 import { closeDb, getDb, initTestDb, runMigrations } from '../db/index.js';
 

@@ -1136,7 +1136,16 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const { log } = deps;
   const header = readJobHeader(ctx.job.metadata);
   const callFields = { callId: header.callId };
-  const hostUrl = liveKitHostUrl(deps.env);
+  let hostUrl: string;
+  try {
+    hostUrl = liveKitHostUrl(deps.env);
+  } catch (err) {
+    // No host to tell: the room goes, and the host ends the call when its worker never joins.
+    log.warn('voice worker: ending the call', { ...callFields, reason: (err as Error).message });
+    await ctx.deleteRoom().catch(() => undefined);
+    ctx.shutdown((err as Error).message);
+    return;
+  }
   const host = new HostLink(
     {
       hostUrl,

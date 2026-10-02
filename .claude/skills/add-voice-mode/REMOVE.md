@@ -61,12 +61,13 @@ rm -rf container/skills/voice-mode-formatting
 
 ## 5. Make the router's delivery private again
 
-Apply exported `deliverToAgent` from `src/router.ts`. Undo that unless other
-code now imports it (then the command lists those files and changes nothing):
+Applying the skill exported `deliverToAgent` from `src/router.ts`. Make it
+private again unless other code now imports it (then the command lists those
+files and changes nothing):
 
 ```bash
-if grep -rlq --include='*.ts' --exclude=router.ts 'deliverToAgent' src; then
-  grep -rl --include='*.ts' --exclude=router.ts 'deliverToAgent' src
+if grep -rlqE --include='*.ts' --exclude=router.ts "import .*\bdeliverToAgent\b" src; then
+  grep -rlE --include='*.ts' --exclude=router.ts "import .*\bdeliverToAgent\b" src
 else
   sed -i.bak 's/^export async function deliverToAgent(/async function deliverToAgent(/' src/router.ts && rm -f src/router.ts.bak
 fi
@@ -74,11 +75,17 @@ fi
 
 ## 6. Remove the packages
 
-The LiveKit packages are this skill's alone:
+Remove each LiveKit package unless remaining code still imports it (another
+voice integration, say):
 
 ```bash
 for pkg in @livekit/agents @livekit/agents-plugin-google @livekit/agents-plugin-silero @livekit/rtc-node livekit-server-sdk; do
-  if grep -q "\"$pkg\"" package.json; then pnpm remove "$pkg"; fi
+  grep -q "\"$pkg\"" package.json || continue
+  if grep -rqIE --exclude-dir=node_modules "from ['\"]$pkg['\"/]" src setup scripts container 2>/dev/null; then
+    echo "keeping $pkg: still imported"
+  else
+    pnpm remove "$pkg"
+  fi
 done
 ```
 
@@ -94,6 +101,13 @@ If both show nothing else uses it: `pnpm remove zod`.
 
 ## 7. Remove the environment keys
 
+Keep a private copy of `.env` first; delete it once nothing turned out to need
+a removed key:
+
+```bash
+(umask 077 && cp .env .env.before-voice-mode-remove)
+```
+
 The `VOICE_MODE_*` keys are this skill's alone:
 
 ```bash
@@ -101,15 +115,15 @@ sed -i.bak '/^VOICE_MODE_[A-Z_]*=/d' .env && rm -f .env.bak
 ```
 
 The LiveKit and Gemini keys may serve another integration, so each goes only
-when no remaining code reads it. Keep by hand any you set for something outside
-this checkout:
+when nothing left in the checkout mentions it (code, scripts, compose or
+Docker files). Keep by hand any you set for something outside this checkout:
 
 ```bash
 for key in LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET LIVEKIT_WORKER_URL LIVEKIT_AGENT_NAME LIVEKIT_HOST_URL GEMINI_API_KEY; do
-  if grep -rq --include='*.ts' "$key" src setup container 2>/dev/null; then
-    echo "keeping $key: still read by remaining code"
+  if grep -rqI --exclude-dir={node_modules,.git,dist,data,logs,groups} --exclude='.env*' --exclude='*.md' "$key" . 2>/dev/null; then
+    echo "keeping $key: still mentioned by remaining files"
   else
-    sed -i.bak "/^$key=/d" .env && rm -f .env.bak
+    sed -i.bak "/^$key=/d" .env && rm -f .env.bak && echo "removed $key"
   fi
 done
 ```
@@ -121,6 +135,6 @@ pnpm run build
 bash setup/lib/restart.sh
 ```
 
-Apply adds no git remote; if you added one only to fetch this skill's files,
+Applying the skill adds no git remote; if you added one only to fetch its files,
 remove it with `git remote remove <name>`. A LiveKit Cloud project or a
 self-hosted LiveKit server is yours to delete.

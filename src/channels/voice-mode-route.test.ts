@@ -156,6 +156,8 @@ describe('routeVoiceTurn', () => {
       try {
         const onThinking = vi.fn();
         await routeVoiceTurn(turn(), 'ag-1', onThinking);
+        // The watcher starts off the turn's path, once the session is looked up.
+        for (let i = 0; i < 50 && onThinking.mock.calls.length === 0; i++) await new Promise(setImmediate);
         expect(onThinking).toHaveBeenCalledTimes(1);
         vi.advanceTimersByTime(4_000);
         expect(onThinking).toHaveBeenCalledTimes(2);

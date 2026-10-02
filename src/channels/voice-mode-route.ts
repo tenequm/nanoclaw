@@ -71,7 +71,7 @@ function watchThinking(agentGroupId: string, sessionId: string, onThinking: () =
   thinkingWatchers.set(sessionId, watcher);
 }
 
-/** Stop the session's thinking watcher: its answer was delivered, or the agent could not be woken. */
+/** Stop the session's thinking watcher: its answer was delivered. */
 export function stopThinking(sessionId: string): void {
   const watcher = thinkingWatchers.get(sessionId);
   if (!watcher) return;
@@ -117,17 +117,17 @@ export async function routeVoiceTurn(
   await deliverToAgent(wiring, agentGroup, mg, event, callerId, threadsEnabled, threadId, true);
 
   if (onThinking) {
-    // Read-only: the session the router just resolved for this wiring.
+    // Read-only and off the turn's path: the session the router just resolved for this wiring
+    // (its session-mode rule, which deliverToAgent does not return).
     const perThread = threadsEnabled && wiring.session_mode !== 'agent-shared' && mg.is_group !== 0;
     const session =
       wiring.session_mode === 'agent-shared'
-        ? await findSessionByAgentGroup(agentGroupId)
-        : await findSessionForAgent(
-            agentGroupId,
-            mg.id,
-            perThread || wiring.session_mode === 'per-thread' ? threadId : null,
-          );
-    if (session) watchThinking(agentGroupId, session.id, onThinking);
+        ? findSessionByAgentGroup(agentGroupId)
+        : findSessionForAgent(agentGroupId, mg.id, perThread || wiring.session_mode === 'per-thread' ? threadId : null);
+    void session.then(
+      (found) => found && watchThinking(agentGroupId, found.id, onThinking),
+      (err: unknown) => log.warn('livekit-voice: no session to watch for thinking', { agentGroupId, err }),
+    );
   }
   return true;
 }

@@ -106,6 +106,7 @@ deliverToAgent(`, unless it is exported already:
 
 ```nc:run effect:refresh
 grep -q '^export async function deliverToAgent(' src/router.ts || { sed -i.bak 's/^async function deliverToAgent(/export async function deliverToAgent(/' src/router.ts && rm -f src/router.ts.bak; }
+grep -q '^export async function deliverToAgent(' src/router.ts
 ```
 
 ### 4. Install the packages
@@ -295,7 +296,7 @@ Try it in a terminal first: `node dist/voice-mode-worker.js start`. Its health
 check answers on `127.0.0.1:8089` (`VOICE_MODE_WORKER_HEALTH_PORT`). If the host's
 webhook server is not on `http://127.0.0.1:3000` (`WEBHOOK_PORT`), set
 `LIVEKIT_HOST_URL`; it must be a local `http(s)` address (`localhost`,
-`127.x.x.x` or `[::1]`), since the host serves the worker on loopback only, and
+`127.0.0.1` or `[::1]`), since the host serves the worker on loopback only, and
 the worker refuses to start otherwise.
 
 **Linux, systemd user unit** (`~/.config/systemd/user/nanoclaw-voice-mode-worker.service`;
@@ -361,8 +362,10 @@ owner or admin of it:
   the link cannot be shown again. The sender becomes the line's caller: turns
   are posted as `🎙 <name>: <text>` and handed to the agent as messages from
   that account;
-- later runs only move the call chat: the link, its caller and a live call stay
-  (the call carries on in the new chat).
+- later runs by the line's caller only move the call chat: the link, its
+  caller and a live call stay (the call carries on in the new chat). Another
+  admin's `/voice` moves nothing and says so: their speech never lands in a chat
+  the caller did not pick.
 
 `/voice new` (`!voice new` on Slack) mints a fresh link instead, sent the same
 way: the old link stops working, a call made with it ends, and the sender
@@ -370,8 +373,8 @@ becomes the caller. It is how a lost or leaked link is replaced. The command
 never reaches the agent.
 
 During a call every message the agent sends to that chat is spoken. A call
-also ends when the caller loses their role. If the chat stops being wired to the agent, calls fall back to the
-one chat of the `VOICE_MODE_MIRROR` channel type wired to the agent (or the one
+also ends when the caller loses their role. If the chat stops being wired to
+the agent, calls fall back to the one chat of the `VOICE_MODE_MIRROR` channel type wired to the agent (or the one
 direct chat among several), and are refused when there is none.
 
 ## First call

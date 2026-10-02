@@ -80,7 +80,12 @@ describe('voice line access (real central DB)', () => {
   it('keeps a call going when /voice only moves the line to another chat', async () => {
     const line = await mint(ADMIN);
     const before = (await resolveVoiceLine(line))!;
-    await bindVoiceModeLineChat({ agentGroupId: 'ag-1', messagingGroupId: 'mg-2', threadId: null });
+    await bindVoiceModeLineChat({
+      agentGroupId: 'ag-1',
+      callerUserId: ADMIN,
+      messagingGroupId: 'mg-2',
+      threadId: null,
+    });
     expect(sameCallerAndAgent(before, (await resolveVoiceLine(line))!)).toBe(true);
   });
 

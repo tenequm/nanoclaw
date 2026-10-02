@@ -79,8 +79,8 @@ async function wire(mgId: string, agentGroupId: string) {
 const lines = () => getDb().all<VoiceModeLine>('SELECT * FROM voice_mode_lines ORDER BY agent_group_id');
 const mg = (id: string, isGroup = 0) =>
   ({ id, instance: null, channel_type: 'chat', is_group: isGroup }) as unknown as MessagingGroup;
-const linkFrom = async (who: string, chat = 'mg-dm', threadId: string | null = null, renew = false) => {
-  const outcome = await runVoiceCommand(mg(chat), threadId, who, callUrl, renew);
+const linkFrom = async (who: string, chat = 'mg-dm', threadId: string | null = null) => {
+  const outcome = await runVoiceCommand(mg(chat), threadId, who, callUrl);
   return voiceLinkLines(outcome)[0]?.split(': ').slice(1).join(': ');
 };
 
@@ -159,7 +159,7 @@ describe('runVoiceCommand', () => {
   it('on later runs only moves the call chat: no new link, the old one and its caller stay', async () => {
     const first = tokenOf((await linkFrom(OWNER))!);
     const [before] = await lines();
-    const outcome = await runVoiceCommand(mg('mg-other'), null, SCOPED_ADMIN, callUrl);
+    const outcome = await runVoiceCommand(mg('mg-other'), null, OWNER, callUrl);
     expect(outcome).toEqual({ kind: 'done', results: [{ ok: true, agentName: 'Andy', rebound: true }] });
     expect(voiceLinkLines(outcome)).toEqual([]);
     expect(voiceCommandReply(outcome)).toBe(
@@ -174,6 +174,17 @@ describe('runVoiceCommand', () => {
       token_hash: before.token_hash,
     });
     expect((await findVoiceModeLineByToken(first))?.line_id).toBe(before.line_id);
+  });
+
+  it("never moves another admin's line: it stays put, and the sender is told /voice new takes it over", async () => {
+    await linkFrom(OWNER);
+    const [before] = await lines();
+    const outcome = await runVoiceCommand(mg('mg-other'), null, SCOPED_ADMIN, callUrl);
+    expect(outcome).toEqual({ kind: 'done', results: [{ ok: false, agentName: 'Andy', reason: 'other-caller' }] });
+    expect(voiceCommandReply(outcome, '!voice')).toBe(
+      "Calls with Andy are on another admin's link, so they stay where they talk. Send !voice new to take the line over (that link stops working).",
+    );
+    expect(await lines()).toEqual([before]);
   });
 
   it('with `new` re-mints: the old link stops working, the line and its id stay', async () => {

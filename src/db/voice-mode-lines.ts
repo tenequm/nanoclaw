@@ -58,19 +58,24 @@ export async function getVoiceModeLineForAgent(agentGroupId: string): Promise<Vo
   return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE agent_group_id = ?', agentGroupId);
 }
 
-/** Make another chat the line's call chat; its link and caller stay. Undefined when the agent has no line. */
+/**
+ * Make another chat the line's call chat; its link and caller stay. Only the line's own caller
+ * moves it: undefined when the agent has no line, or `callerUserId` is not its caller.
+ */
 export async function bindVoiceModeLineChat(target: {
   agentGroupId: string;
+  callerUserId: string;
   messagingGroupId: string;
   threadId: string | null;
 }): Promise<VoiceModeLine | undefined> {
   return getDb().get<VoiceModeLine>(
     `UPDATE voice_mode_lines SET messaging_group_id = ?, thread_id = ?, updated_at = ?
-       WHERE agent_group_id = ? RETURNING *`,
+       WHERE agent_group_id = ? AND owner_user_id = ? RETURNING *`,
     target.messagingGroupId,
     target.threadId,
     new Date().toISOString(),
     target.agentGroupId,
+    target.callerUserId,
   );
 }
 

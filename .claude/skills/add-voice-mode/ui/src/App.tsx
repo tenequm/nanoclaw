@@ -48,7 +48,6 @@ const MATRIX_ON: Record<Phase, string> = {
   error: "var(--coral)",
 }
 
-const FOOTER = "Voice mode · answers by {agent}"
 
 // What the readout says when nothing more specific applies; the other phases have their own lines below.
 const HINT: Record<"idle" | "connecting" | "listening", string> = {
@@ -139,8 +138,8 @@ function useReducedMotion(): boolean {
 
 // Level and glow samples ~20 times a second, read from the call's refs. Only the
 // component that calls this re-renders, so the transcript and keys stay still.
-function useLevelTicker(call: VoiceCall, phase: Phase, wantLevels: boolean, reduced: boolean, count = MATRIX_COLS) {
-  const [levels, setLevels] = useState<number[]>(() => Array(count).fill(0))
+function useLevelTicker(call: VoiceCall, phase: Phase, wantLevels: boolean, reduced: boolean) {
+  const [levels, setLevels] = useState<number[]>(() => Array(MATRIX_COLS).fill(0))
   const [glow, setGlow] = useState(1)
   const phaseRef = useRef(phase)
   phaseRef.current = phase
@@ -164,7 +163,7 @@ function useLevelTicker(call: VoiceCall, phase: Phase, wantLevels: boolean, redu
           if (base > 0.001 || !wasZero.current) {
             wasZero.current = base <= 0.001
             setLevels(
-              Array.from({ length: count }, (_, i) => {
+              Array.from({ length: MATRIX_COLS }, (_, i) => {
                 const shape = 0.5 + 0.5 * Math.abs(Math.sin(t * 5.2 + i * 0.9)) * (0.6 + 0.4 * Math.abs(Math.cos(t * 2.3 - i * 0.4)))
                 return Math.max(0, Math.min(1, base * 1.35 * shape))
               })
@@ -185,7 +184,7 @@ function useLevelTicker(call: VoiceCall, phase: Phase, wantLevels: boolean, redu
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
-  }, [call.inputLevel, call.outputLevel, wantLevels, reduced, running, count])
+  }, [call.inputLevel, call.outputLevel, wantLevels, reduced, running])
   return { levels, glow }
 }
 
@@ -514,7 +513,7 @@ export default function App() {
     </>
   )
 
-  const footer = FOOTER.split("{agent}").join(agentName)
+  const footer = `Voice mode · answers by ${agentName}`
 
   return (
     <div className="voice-page">

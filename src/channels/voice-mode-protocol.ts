@@ -194,7 +194,7 @@ export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: 
   } catch {
     // Reported below.
   }
-  const local = url && /^https?:$/.test(url.protocol) && /^(localhost|127(\.\d{1,3}){3}|\[::1\])$/.test(url.hostname);
+  const local = url && /^https?:$/.test(url.protocol) && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(url.hostname);
   if (!local) {
     throw new Error(
       `LIVEKIT_HOST_URL must be a local http(s) address such as http://127.0.0.1:3000 (got "${raw}"): the host serves the worker on loopback only`,

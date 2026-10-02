@@ -75,7 +75,7 @@
   --color-think: var(--think);
 }
 
-/* Light palette: cool mist ground, white card, NanoClaw teal as the one accent. */
+/* Base tokens; the device look below overrides the palette. */
 :root {
   --radius: 0.75rem;
   --background: #eef2f4;
@@ -144,7 +144,6 @@
     --think: #b0a4ff;
     --orb-well: #0e1317;
     --dot-off: #1d252c;
-  --dot-you: var(--amber);
     --dot-you: var(--amber);
     --shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
   }
@@ -431,7 +430,7 @@
   box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--te-cap-edge), 0 1px 0 rgba(255,255,255,0.4);
 }
 
-/* LCD readout replaces the chip */
+/* LCD readout */
 .voice-page .state-chip {
   border-radius: 4px;
   min-height: 26px;
@@ -536,8 +535,8 @@
 .ellipsis { color: var(--muted-foreground); }
 @media (prefers-reduced-motion: reduce) { .transcript-box .is-streaming p:last-child::after { animation: none; } }
 
-/* ---------- TE look, second pass: lowercase everywhere (their rule), light grotesque,
-   monospaced readouts, one radius scale, and a phone layout for the key row. ---------- */
+/* ---------- Type and layout: lowercase everywhere, light grotesque, monospaced
+   readouts, one radius scale, and a phone layout for the key row. ---------- */
 .voice-page {
   --font-sans: "Hanken Grotesk", "Instrument Sans", system-ui, sans-serif;
   --font-display: "Hanken Grotesk", "Instrument Sans", system-ui, sans-serif;

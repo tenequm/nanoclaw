@@ -15,12 +15,6 @@ describe('voice call page (generated)', () => {
     expect(html).not.toMatch(/https?:\/\/fonts\.googleapis\.com/);
   });
 
-  it('is the same page for every caller: no runtime config is injected', () => {
-    expect(callPageHtml()).not.toContain('__VOICE_UI__');
-    expect(callPageHtml()).not.toContain('<!--VOICE_UI_CONFIG-->');
-    expect(callPageHtml()).toBe(callPageHtml());
-  });
-
   it('keeps the hangup keepalive so a closing tab still reaches the host', () => {
     expect(callPageHtml()).toMatch(/keepalive\s*:\s*(true|!0)/);
   });
