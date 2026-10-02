@@ -1,11 +1,15 @@
 # Remove Voice mode
 
-Reverses `/add-voice-mode`. Every step can be re-run, and works on a partial
-install: a step whose target is already gone does nothing.
+Reverses `/add-voice-mode`, with one exception: the emptied `voice_mode_lines`
+table and its migration record stay on purpose, so a reinstall is safe. Do not
+drop the table alone; its recorded migration would then never recreate it.
+Every step can be re-run, and works on a partial install: a step whose target
+is already gone does nothing.
 
 ## 1. Stop the worker
 
-Stop and remove the worker's service, if one was installed:
+If you started the worker in a terminal, stop it there with Ctrl-C. Stop and
+remove the worker's service, if one was installed:
 
 ```bash
 # Linux
@@ -20,8 +24,17 @@ if [ -f ~/Library/LaunchAgents/com.nanoclaw-voice-mode-worker.plist ]; then
 fi
 ```
 
-Remove the `tailscale serve` mount or proxy route for `/voice` (and, with a
-self-hosted LiveKit, for `/rtc` and the TURN name) too.
+Remove the page's front too. With Tailscale Serve, remove only the `/voice`
+mount, keeping any others, and confirm it is gone:
+
+```bash
+tailscale serve --https=443 --set-path=/voice off
+tailscale serve status
+```
+
+With a reverse proxy, remove the `/voice` route. With a self-hosted LiveKit,
+remove only the routes and services you created for it (`/rtc`, the TURN name,
+the `livekit-server` service).
 
 ## 2. Retire the lines
 
@@ -133,6 +146,13 @@ done
 ```bash
 pnpm run build
 bash setup/lib/restart.sh
+```
+
+The build leaves the compiled files of the removed sources in `dist/`; delete
+them:
+
+```bash
+rm -f dist/channels/voice-mode*.* dist/voice-mode-worker*.* dist/db/voice-mode-lines.*
 ```
 
 Applying the skill adds no git remote; if you added one only to fetch its files,
