@@ -11,13 +11,15 @@
  * deleting the room, which disconnects caller and worker alike.
  *
  * The worker reaches the host over HTTP on the webhook server
- * (`/webhook/voice/livekit/agent/*`), authenticated by a per-call secret that
- * travels only in the dispatch metadata (never in the caller's token):
+ * (`/webhook/voice/livekit/agent/*`), at an address from its own settings,
+ * authenticated by a per-call secret both sides derive from the LiveKit API
+ * secret (never in the dispatch metadata, never in the caller's token):
  *  - `GET  agent/events`  an NDJSON stream of what to speak (agent replies,
  *    proactive messages, holding notes) and when to end, with pings;
  *  - `POST agent/joined`  the caller is in the room; the clock starts here;
  *  - `POST agent/ask`     one ask_agent call, fed to the agent as an inbound
  *    message whose id (`livekit:<callId>:<consultId>`) routes the reply back;
+ *    answers 202 with the consultId, which the reply events name;
  *  - `POST agent/ended`   the worker's session is over.
  */
 import { createRequire } from 'node:module';
@@ -30,50 +32,26 @@ import { AccessToken, AgentDispatchClient, RoomServiceClient, TrackSource } from
 import type { InboundMessage } from './adapter.js';
 import { DEFAULT_GEMINI_LIVE_MODEL, DEFAULT_GEMINI_LIVE_VOICE, geminiToolScheduling } from './gemini-live.js';
 import { geminiInstructions, type ResolveLineOptions, type VoiceLine } from './gpt-live-prompt.js';
+import {
+  ANSWER_PREFIX,
+  DEFAULT_LIVEKIT_AGENT_NAME,
+  liveKitCallSecret,
+  PING_INTERVAL_MS,
+  type LiveKitHostEvent,
+  type LiveKitJobMetadata,
+} from './voice-livekit-protocol.js';
 import { log } from '../log.js';
 
-export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice';
 const MINUTE_MS = 60_000;
-const PING_INTERVAL_MS = 15_000;
 const MAX_QUEUED_EVENTS = 50;
 const MAX_AGENT_BODY_BYTES = 8 * 1024;
 const CALLER_TOKEN_TTL_SECONDS = 120;
+/** The worker opens its event stream right after it reports the caller in; without it nothing reaches the caller. */
+const WORKER_STREAM_TIMEOUT_MS = 30_000;
 
 const ASK_AGENT_NOTE =
   'An ask_agent answer arrives as its result, or later as a separate instruction starting with ' +
-  '"Answer from the backend"; more than one can arrive for one request. Until an answer arrives, do not guess it.';
-
-/** What the worker receives as job metadata; the secret authenticates its calls to the host. */
-export interface LiveKitJobMetadata {
-  v: 1;
-  callId: string;
-  lineId: string;
-  agentName: string;
-  callerName: string;
-  callerIdentity: string;
-  instructions: string;
-  model: string;
-  voice: string;
-  /** Function response scheduling; null for models that close the session on it. */
-  scheduling: 'WHEN_IDLE' | null;
-  hostUrl: string;
-  secret: string;
-  /** Upper bound the worker enforces on itself if the host never ends the call. */
-  maxDurationMs: number;
-  /** The host answers an unanswered ask_agent with the timeout line after this long. */
-  delegationTimeoutMs: number;
-  /** What the caller hears then; a later reply is still spoken. */
-  timeoutLine: string;
-  joinTimeoutMs: number;
-}
-
-/** One line of the host-to-worker event stream. */
-export type LiveKitHostEvent =
-  | { type: 'reply'; text: string; timedOut?: boolean }
-  | { type: 'say'; text: string }
-  | { type: 'thinking'; status?: string }
-  | { type: 'end'; reason: string }
-  | { type: 'ping' };
+  `"${ANSWER_PREFIX}"; more than one can arrive for one request. Until an answer arrives, do not guess it.`;
 
 /** Inbound ids for ask_agent calls are `livekit:<call>:<consult>`; voice.ts parses replies with parseScopedId. */
 export const LIVEKIT_ID_PREFIX = 'livekit:';
@@ -103,12 +81,12 @@ export interface LiveKitVoiceConfig {
   apiSecret: string;
   /** Dispatch name the worker registers under. */
   agentName?: string;
-  /** Base URL the worker reaches this host's webhook server at. */
-  hostUrl: string;
   model?: string;
   voice?: string;
   /** How long the caller has to join the room after the token is minted. */
   joinTimeoutMs?: number;
+  /** How long the worker has to open its event stream after reporting the caller in. */
+  workerStreamTimeoutMs?: number;
   /** Test seam; defaults to the livekit-server-sdk clients. */
   api?: LiveKitServerApi;
 }
@@ -154,6 +132,7 @@ interface LiveKitCall {
   ended: boolean;
   consults: Map<string, Consult>;
   joinTimer?: ReturnType<typeof setTimeout>;
+  streamTimer?: ReturnType<typeof setTimeout>;
   expires?: ReturnType<typeof setTimeout>;
   accessTimer?: ReturnType<typeof setInterval>;
   pingTimer?: ReturnType<typeof setInterval>;
@@ -246,6 +225,19 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (call.queue.length > MAX_QUEUED_EVENTS) call.queue.shift();
   };
 
+  /**
+   * The open consults a reply to `consultId` answers: that one, plus those the agent got after it
+   * (map order is forwarding order: a consult is added right before it is forwarded). The agent
+   * batches the messages that queued while it was busy and replies once, in reply to the first, so
+   * the later consults are in that batch; earlier ones belong to an earlier turn and wait for their
+   * own reply or timeout. Same rule as the Gemini path. None when the consult is no longer open.
+   */
+  const answeredConsults = (call: LiveKitCall, consultId: string): string[] => {
+    if (!call.consults.has(consultId)) return [];
+    const ids = [...call.consults.keys()];
+    return ids.slice(ids.indexOf(consultId));
+  };
+
   /** The room going away is what ends the call for caller and worker; retried, a missing room counts as gone. */
   const deleteRoom = async (call: LiveKitCall): Promise<void> => {
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -264,10 +256,18 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     });
   };
 
+  /** Teardown awaits every delete in flight, wherever it started. */
+  const trackedDeleteRoom = (call: LiveKitCall): Promise<void> => {
+    const cleanup = deleteRoom(call).finally(() => cleanups.delete(cleanup));
+    cleanups.add(cleanup);
+    return cleanup;
+  };
+
   const endCall = (call: LiveKitCall, reason: string): void => {
     if (call.ended) return;
     call.ended = true;
     clearTimeout(call.joinTimer);
+    clearTimeout(call.streamTimer);
     clearTimeout(call.expires);
     clearInterval(call.accessTimer);
     clearInterval(call.pingTimer);
@@ -281,9 +281,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       stream.write(`${JSON.stringify({ type: 'end', reason } satisfies LiveKitHostEvent)}\n`);
       stream.end();
     }
-    const cleanup = deleteRoom(call).finally(() => cleanups.delete(cleanup));
-    call.cleanup = cleanup;
-    cleanups.add(cleanup);
+    call.cleanup = trackedDeleteRoom(call);
     log.info('livekit-voice: call ended', { platformId: call.platformId, callId: call.callId, reason });
   };
 
@@ -325,19 +323,21 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const t = host.now();
     const refusal = host.admitStart(platformId, t);
     if (refusal) return reply(res, 429, refusal.body, { 'Retry-After': refusal.retryAfter });
-    // Newest wins on the line, whatever engine holds it; the replaced call is charged first.
+    // Before ending anything: a refused start must not hang up the caller's running call. The
+    // running calls' time is already in the day's total, so ending them below does not change it.
+    const remainingMs = host.remainingTodayMs(platformId, t);
+    if (remainingMs <= 0) return reply(res, 429, 'This voice line has used its call minutes for today.');
+    // Newest wins on the line, whatever engine holds it.
     const previous = calls.get(platformId);
     if (previous) endCall(previous, 'replaced by a new call');
     host.endOtherCalls(platformId, 'replaced by a new call');
-    const remainingMs = host.remainingTodayMs(platformId, host.now());
-    if (remainingMs <= 0) return reply(res, 429, 'This voice line has used its call minutes for today.');
     const callId = randomUUID();
     const call: LiveKitCall = {
       callId,
       platformId,
       line,
       roomName: `voice-${platformId.replace(/^voice:/, '')}-${randomBytes(6).toString('hex')}`,
-      secret: randomBytes(32).toString('base64url'),
+      secret: liveKitCallSecret(config.apiSecret, callId),
       callerIdentity: `caller-${callId.slice(0, 8)}`,
       state: 'connecting',
       ended: false,
@@ -359,12 +359,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       agentName: line.agent.name,
       callerName: line.caller.name,
       callerIdentity: call.callerIdentity,
-      instructions: `${geminiInstructions(line.agent, line.caller)} ${ASK_AGENT_NOTE}`,
+      instructions: `${geminiInstructions(line.agent, line.caller, { agentUpdates: false })} ${ASK_AGENT_NOTE}`,
       model,
       voice,
       scheduling: geminiToolScheduling(model),
-      hostUrl: config.hostUrl.replace(/\/+$/, ''),
-      secret: call.secret,
       maxDurationMs: Math.min(host.maxCallDurationMs, remainingMs),
       delegationTimeoutMs: host.delegationTimeoutMs,
       timeoutLine: host.delegationTimeoutLine,
@@ -391,12 +389,22 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       token = await at.toJwt();
     } catch (err) {
       log.warn('livekit-voice: room setup failed', { platformId, callId, err });
-      endCall(call, 'room setup failed');
+      // Ended meanwhile: its cleanup may have run before the room existed.
+      if (call.ended) await trackedDeleteRoom(call);
+      else endCall(call, 'room setup failed');
       return reply(res, 502, 'livekit-voice: could not open the call room');
     }
     if (call.ended || !host.isRunning()) {
-      endCall(call, 'replaced while connecting');
+      // Replaced or torn down while connecting: that cleanup ran before the room and dispatch
+      // existed, so delete them here or they wait for the caller until LiveKit's empty timeout.
+      if (call.ended) await trackedDeleteRoom(call);
+      else endCall(call, 'replaced while connecting');
       return reply(res, 409, 'This call attempt is no longer active');
+    }
+    if (res.destroyed) {
+      // The page went away during setup and never gets the token, so nobody joins the room.
+      log.info('livekit-voice: page left during call setup', { platformId, callId });
+      return endCall(call, 'page left during call setup');
     }
     log.info('livekit-voice: call started', { platformId, callId, room: call.roomName, model, agent: line.agent.name });
     reply(res, 200, JSON.stringify({ url: config.url, token, callId, agent: line.agent.name }), JSON_HEADERS);
@@ -420,6 +428,12 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       Math.max(1, budgetCaps ? remainingMs : host.maxCallDurationMs),
     );
     call.expires.unref();
+    if (!call.stream) {
+      call.streamTimer = setTimeout(() => {
+        if (!call.stream) endCall(call, 'worker never opened its event stream');
+      }, config.workerStreamTimeoutMs ?? WORKER_STREAM_TIMEOUT_MS);
+      call.streamTimer.unref();
+    }
     log.info('livekit-voice: caller joined', { platformId: call.platformId, callId: call.callId });
     reply(res, 200, JSON.stringify({ ok: true }), JSON_HEADERS);
   };
@@ -430,6 +444,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' });
     res.flushHeaders();
     call.stream = res;
+    clearTimeout(call.streamTimer);
     for (const event of call.queue.splice(0)) res.write(`${JSON.stringify(event)}\n`);
     clearInterval(call.pingTimer);
     call.pingTimer = setInterval(() => push(call, { type: 'ping' }), PING_INTERVAL_MS);
@@ -463,7 +478,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const timer = setTimeout(() => {
       if (!call.consults.delete(consultId) || call.ended) return;
       log.warn('livekit-voice: ask_agent got no reply in time', { callId: call.callId, consultId });
-      push(call, { type: 'reply', text: host.delegationTimeoutLine, timedOut: true });
+      push(call, { type: 'reply', text: host.delegationTimeoutLine, timedOut: true, consultIds: [consultId] });
     }, host.delegationTimeoutMs);
     timer.unref();
     call.consults.set(consultId, { timer });
@@ -589,14 +604,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       }
       if (!call || call.state !== 'live') return target ? { id: undefined } : null;
       if (!text.trim()) throw new Error('livekit-voice: reply contains no speakable text');
-      if (!(await checkAccess(call))) return { id: undefined };
+      if (!(await checkAccess(call))) throw new Error('livekit-voice: caller access has been revoked');
       if (target) {
-        // A batched agent turn replies to its first inbound only, so any reply settles every open
-        // ask_agent on the call. Later replies (an interim "let me check" followed by the answer)
-        // are all spoken.
-        for (const consult of call.consults.values()) clearTimeout(consult.timer);
-        call.consults.clear();
-        push(call, { type: 'reply', text });
+        const consultIds = answeredConsults(call, target.consultId);
+        for (const id of consultIds) {
+          clearTimeout(call.consults.get(id)?.timer);
+          call.consults.delete(id);
+        }
+        // Without consults it answers none (a second reply, or one after the timeout line): still spoken.
+        push(call, consultIds.length > 0 ? { type: 'reply', text, consultIds } : { type: 'reply', text });
         return { id: inReplyTo };
       }
       push(call, { type: 'say', text });
@@ -794,7 +810,7 @@ button{font:inherit;font-weight:600;border:0;border-radius:999px;padding:14px 28
 button.hang{background:var(--danger)}
 #audio{background:var(--card);color:var(--fg);border:1px solid var(--line)}
 #log{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;min-height:200px;max-height:60vh;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
-.t{margin:0}.t b{color:var(--muted);font-weight:600;margin-right:6px}.t.sys{color:var(--muted);font-style:italic}
+.t{margin:0}.t b{color:var(--muted);font-weight:600;margin-right:6px}
 </style>
 </head>
 <body>

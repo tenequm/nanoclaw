@@ -71,7 +71,6 @@ import {
   type LiveServerEvent,
 } from './gpt-live-session.js';
 import { createLiveKitVoice, LIVEKIT_ID_PREFIX, type LiveKitVoiceConfig } from './voice-livekit.js';
-import { getWebhookPort } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerWebhookHandler } from '../webhook-server.js';
@@ -84,9 +83,11 @@ export const THINK_INTERVAL_MS = 20_000;
 /** Spoken for a delegation the agent did not answer within the deadline; a late reply is still spoken. */
 export const DELEGATION_TIMEOUT_LINE = "This is taking longer than expected, I'll tell you as soon as it's done.";
 const MINUTE_MS = 60_000;
+/** How often a running call rechecks that its caller may still use the line, on every engine. */
+const ACCESS_CHECK_INTERVAL_MS = 5000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
-/** ask_agent calls one Gemini call may have waiting on the agent at once. */
+/** ask_agent calls one Gemini or LiveKit call may have waiting on the agent at once. */
 export const MAX_OPEN_CONSULTS = 3;
 export const MAX_CONSULTS_PER_MINUTE = 10;
 export const MAX_CONSULT_REQUEST_BYTES = 4 * 1024;
@@ -189,6 +190,8 @@ export interface GptLiveConfig {
   wsBase?: string;
   /** Resolves the named caller, single wiring and explicit access. Defaults to the central DB. */
   resolveLine?: (platformId: string, options?: ResolveLineOptions) => Promise<VoiceLine | null>;
+  /** GPT_LIVE_VOCABULARY: comma-separated names every call's prompt lists; used by the default resolveLine. */
+  vocabulary?: string;
   accessCheckIntervalMs?: number;
   /** Observability tap: every sideband server event, before the state machine sees it. */
   onSidebandEvent?: (sessionId: string, event: LiveServerEvent) => void;
@@ -275,6 +278,8 @@ interface LiveCall {
 /** An ask_agent call waiting on the agent; settled with the reply, the timeout line, or null when the call is gone. */
 interface GeminiConsult {
   settled: boolean;
+  /** Order the agent got it in; consults are opened before their access check, so map order can differ. */
+  forwardedSeq?: number;
   answer: Promise<string | null>;
   settle: (answer: string | null) => void;
 }
@@ -297,6 +302,7 @@ interface GeminiCall {
   consults: Map<string, GeminiConsult>;
   /** Accepted consult start times (config clock), for the per-minute cap. */
   consultStarts: number[];
+  forwardedConsults: number;
   /** Agent messages for the page that answer no waiting consult. */
   updates: string[];
   updateSeq: number;
@@ -321,14 +327,21 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   const tokens = new Set(config.linkTokens.map((t) => t.trim()).filter(Boolean));
   const resolveLine =
     config.resolveLine ??
-    ((platformId: string, options?: ResolveLineOptions) => resolveVoiceLine(platformId, undefined, options));
+    ((platformId: string, options?: ResolveLineOptions) =>
+      resolveVoiceLine(platformId, undefined, { vocabulary: config.vocabulary, ...options }));
   const now = config.now ?? (() => Date.now());
   const requestTimeoutMs = config.requestTimeoutMs ?? 15_000;
   const maxCallDurationMs = config.maxCallDurationMs ?? 15 * 60_000;
   const maxCallsPerHour = config.maxCallsPerHour ?? 12;
   const delegationTimeoutMs = config.delegationTimeoutMs ?? 90_000;
   const maxCallMsPerDay = config.maxCallMsPerDay ?? 120 * MINUTE_MS;
-  const geminiMaxCallMs = Math.min(maxCallDurationMs, config.gemini?.maxCallDurationMs ?? GEMINI_MAX_CALL_MS);
+  const accessCheckIntervalMs = config.accessCheckIntervalMs ?? ACCESS_CHECK_INTERVAL_MS;
+  // Never past GEMINI_MAX_CALL_MS: Google drops the connection there and the page cannot resume.
+  const geminiMaxCallMs = Math.min(
+    maxCallDurationMs,
+    GEMINI_MAX_CALL_MS,
+    config.gemini?.maxCallDurationMs ?? GEMINI_MAX_CALL_MS,
+  );
   for (const [name, value] of Object.entries({
     requestTimeoutMs,
     maxCallDurationMs,
@@ -362,8 +375,9 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     Math.max(0, t - Math.max(call.startedAt, utcDay(t) * DAY_MS));
 
   /**
-   * Today's call time on a line, including the OpenAI call still running on it. Gemini calls are
-   * charged their whole token lifetime when the token is minted, so they are already in `usage`.
+   * Today's call time on a line, including the OpenAI or LiveKit call still running on it. Gemini
+   * calls are charged their whole token lifetime when the token is minted, so they are already in
+   * `usage`.
    */
   const usedTodayMs = (platformId: string, t: number): number => {
     const used = usage.get(platformId);
@@ -376,7 +390,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     );
   };
 
-  /** Hourly start cap and daily minutes, shared by both engines. Records the start when admitted. */
+  /** Hourly start cap and daily minutes, shared by every engine. Records the start when admitted. */
   const admitStart = (platformId: string, t: number): { body: string; retryAfter: string } | null => {
     const recent = (starts.get(platformId) ?? []).filter((at) => at > t - HOUR_MS);
     if (recent.length >= maxCallsPerHour) {
@@ -430,7 +444,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         now,
         maxCallDurationMs,
         delegationTimeoutMs,
-        accessCheckIntervalMs: config.accessCheckIntervalMs ?? 5000,
+        accessCheckIntervalMs,
         thinkIntervalMs: THINK_INTERVAL_MS,
         delegationTimeoutLine: DELEGATION_TIMEOUT_LINE,
         maxOpenConsults: MAX_OPEN_CONSULTS,
@@ -630,7 +644,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     call.expires.unref();
     call.accessTimer = setInterval(() => {
       void checkCallAccess(call);
-    }, config.accessCheckIntervalMs ?? 5000);
+    }, accessCheckIntervalMs);
     call.accessTimer.unref();
     let socket: SidebandSocket;
     try {
@@ -765,6 +779,11 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     // The token keeps the Google session open for its whole lifetime whatever the host or page does,
     // so the call is charged that much now, before the mint so concurrent starts cannot overspend.
     addUsage(platformId, durationMs, t);
+    // Past midnight the counter belongs to the new day, which this charge never touched.
+    const refund = (): void => {
+      if (utcDay(now()) === utcDay(t)) addUsage(platformId, -durationMs, t);
+    };
+    const expiresAt = t + durationMs;
     const model = gemini.model || DEFAULT_GEMINI_LIVE_MODEL;
     let ephemeral: string;
     try {
@@ -776,12 +795,12 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
           gemini.voice || DEFAULT_GEMINI_LIVE_VOICE,
           geminiInstructions(line.agent, line.caller),
         ),
-        expiresAt: t + durationMs,
+        expiresAt,
         now: t,
         timeoutMs: requestTimeoutMs,
       });
     } catch (err) {
-      addUsage(platformId, -durationMs, t);
+      refund();
       const status = err instanceof GeminiTokenError ? err.status : 502;
       // Google's error body can name the project; the operator reads it in the log.
       log.warn('gemini-live: token mint failed', { platformId, status, err });
@@ -794,10 +813,18 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       );
     }
     if (!connected) {
-      addUsage(platformId, -durationMs, t);
+      refund();
       return reply(res, 503, 'Live Voice is not running');
     }
-    // Newest wins across both engines. A replaced Gemini page's session runs out on its own token.
+    if (res.destroyed) {
+      // The page went away during the mint and never gets the token, so nothing can use it.
+      refund();
+      log.info('gemini-live: page left during the token mint', { platformId });
+      return;
+    }
+    // The mint took a while; the page must hang up before the token dies, not after.
+    const remainingTokenMs = Math.max(1, expiresAt - now());
+    // Newest wins across every engine. A replaced Gemini page's session runs out on its own token.
     const previous = geminiCalls.get(platformId);
     if (previous) endGeminiCall(previous, 'replaced by a new call');
     const openai = lines.get(platformId);
@@ -812,18 +839,19 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       ended: false,
       consults: new Map(),
       consultStarts: [],
+      forwardedConsults: 0,
       updates: [],
       updateSeq: 0,
     };
     geminiCalls.set(platformId, call);
     call.expires = setTimeout(
       () => endGeminiCall(call, budgetCaps ? 'daily minute budget' : 'duration limit'),
-      durationMs,
+      remainingTokenMs,
     );
     call.expires.unref();
     call.accessTimer = setInterval(() => {
       void checkGeminiAccess(call);
-    }, config.accessCheckIntervalMs ?? 5000);
+    }, accessCheckIntervalMs);
     call.accessTimer.unref();
     log.info('gemini-live: call started', { platformId, callId: call.callId, model, agent: line.agent.name });
     reply(
@@ -835,7 +863,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         websocketUrl: GEMINI_LIVE_WS_URL,
         setup: geminiBrowserSetup(model),
         scheduling: geminiToolScheduling(model),
-        durationMs,
+        durationMs: remainingTokenMs,
       }),
       JSON_HEADERS,
     );
@@ -921,6 +949,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       isMention: true,
       isGroup: false,
     };
+    consult.forwardedSeq = ++call.forwardedConsults;
     try {
       await current.onInbound(call.platformId, null, message);
     } catch (err) {
@@ -1151,10 +1180,11 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
 
   /**
    * An agent message for a Gemini call. The first reply to a waiting consult answers it, together
-   * with every other consult of the call still waiting when the reply arrived: the agent batches
-   * inbound messages and replies once, in reply to the first. Everything else (an interim reply
-   * followed by the real one, a reply after the timeout line, a proactive message) is queued for
-   * the page, which speaks it as an agent update.
+   * with the waiting consults the agent got after it: the agent batches the messages that queued
+   * while it was busy and replies once, in reply to the first. Consults it got earlier belong to an
+   * earlier turn and keep waiting for their own reply. Everything else (an interim reply followed
+   * by the real one, a reply after the timeout line, a proactive message) is queued for the page,
+   * which speaks it as an agent update. The LiveKit path applies the same rule.
    */
   const deliverToGemini = async (
     call: GeminiCall,
@@ -1166,7 +1196,8 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     if (!(await checkGeminiAccess(call))) throw new Error('gemini-live: caller access has been revoked');
     const target = functionCallId ? call.consults.get(functionCallId) : undefined;
     if (functionCallId && target && waiting.includes(target)) {
-      for (const consult of waiting) consult.settle(text);
+      const from = target.forwardedSeq ?? 0;
+      for (const consult of waiting) if ((consult.forwardedSeq ?? -1) >= from) consult.settle(text);
       return geminiConsultMessageId(call.callId, functionCallId);
     }
     return queueUpdate(call, text);
@@ -1311,6 +1342,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'GPT_LIVE_MAX_MINUTES_PER_DAY',
       'GPT_LIVE_DELEGATION_TIMEOUT_SECONDS',
       'GPT_LIVE_ALLOW_NON_LOOPBACK',
+      'GPT_LIVE_VOCABULARY',
       'GEMINI_API_KEY',
       'GEMINI_LIVE_MODEL',
       'GEMINI_LIVE_VOICE',
@@ -1320,7 +1352,6 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'LIVEKIT_API_KEY',
       'LIVEKIT_API_SECRET',
       'LIVEKIT_AGENT_NAME',
-      'LIVEKIT_HOST_URL',
     ]);
     const key = resolveOpenAiKey(env);
     if (!key) return null;
@@ -1347,6 +1378,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       maxCallsPerHour: Number(env.GPT_LIVE_MAX_CALLS_PER_HOUR ?? 12),
       maxCallMsPerDay: Number(env.GPT_LIVE_MAX_MINUTES_PER_DAY ?? 120) * 60_000,
       delegationTimeoutMs: Number(env.GPT_LIVE_DELEGATION_TIMEOUT_SECONDS ?? 90) * 1000,
+      vocabulary: env.GPT_LIVE_VOCABULARY,
       gemini: env.GEMINI_API_KEY
         ? {
             apiKey: env.GEMINI_API_KEY,
@@ -1364,7 +1396,6 @@ registerChannelAdapter(CHANNEL_TYPE, {
               apiKey: env.LIVEKIT_API_KEY,
               apiSecret: env.LIVEKIT_API_SECRET,
               agentName: env.LIVEKIT_AGENT_NAME,
-              hostUrl: env.LIVEKIT_HOST_URL || `http://127.0.0.1:${getWebhookPort()}`,
               model: env.GEMINI_LIVE_MODEL,
               voice: env.GEMINI_LIVE_VOICE,
             }

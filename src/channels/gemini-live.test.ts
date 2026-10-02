@@ -4,13 +4,23 @@
  * does. Faked: Google's token endpoint (a local HTTP server) and the clock.
  * OpenAI is never reached; its routes are only used to show the limits are shared.
  */
+import fs from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import os from 'node:os';
+import path from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { ChannelAdapter, InboundMessage } from './adapter.js';
-import { geminiInstructions, LANGUAGE_RULE, sessionConfig } from './gpt-live-prompt.js';
+import {
+  geminiInstructions,
+  LANGUAGE_RULE,
+  MAX_VOCABULARY_BYTES,
+  MAX_VOCABULARY_TERMS,
+  sessionConfig,
+  VOICE_VOCABULARY_FILE,
+  voiceVocabulary,
+} from './gpt-live-prompt.js';
 import {
   createGptLiveAdapter,
   DELEGATION_TIMEOUT_LINE,
@@ -22,6 +32,7 @@ import {
   parseGeminiConsultMessageId,
   type GptLiveConfig,
 } from './voice.js';
+import { readGroupPersona } from '../group-persona.js';
 import { log } from '../log.js';
 import { stopWebhookServer } from '../webhook-server.js';
 
@@ -38,15 +49,29 @@ interface FakeGoogle {
   apiBase: string;
   requests: TokenRequest[];
   failNext: number;
+  /** Requests that have arrived, answered or not. */
+  received: number;
+  /** When set, a request arriving now waits for it before it is answered. */
+  hold: Promise<void> | null;
   close(): Promise<void>;
 }
 
 function startFakeGoogle(): Promise<FakeGoogle> {
-  const fake: FakeGoogle = { apiBase: '', requests: [], failNext: 0, close: async () => {} };
+  const fake: FakeGoogle = {
+    apiBase: '',
+    requests: [],
+    failNext: 0,
+    received: 0,
+    hold: null,
+    close: async () => {},
+  };
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
+    fake.received++;
+    const held = fake.hold;
     req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => {
+    req.on('end', () => void Promise.resolve(held).then(() => answer()));
+    const answer = () => {
       if (req.method !== 'POST' || req.url !== '/v1alpha/auth_tokens') {
         res.writeHead(404);
         res.end();
@@ -65,7 +90,7 @@ function startFakeGoogle(): Promise<FakeGoogle> {
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ name: `auth_tokens/fake${fake.requests.length}` }));
-    });
+    };
   });
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
@@ -193,6 +218,10 @@ async function openConsults(h: Harness, callId: string, ids: string[]): Promise<
   });
   return pending;
 }
+
+/** The batch's first inbound, which the agent replies to: concurrent consults reach it in any order. */
+const firstForwarded = (h: Harness, callId: string, ids: string[]): string =>
+  h.inbound.find((m) => ids.some((id) => m.id === geminiConsultMessageId(callId, id)))!.id;
 
 const reply = (h: Harness, text: string, inReplyTo?: string): Promise<string | undefined> =>
   h.adapter.deliver(LINE, null, { kind: 'chat', content: { text }, inReplyTo });
@@ -488,9 +517,19 @@ describe('gemini agent replies, consult bounds and races', () => {
   it('answers every consult of a batched agent turn with its one reply', async () => {
     const [first, second] = await openConsults(h, call.callId, ['fc-2', 'fc-3']);
     // The agent read both in one turn and replied to the first.
-    await reply(h, 'Booked the table and reminded Dana.', geminiConsultMessageId(call.callId, 'fc-2'));
+    await reply(h, 'Booked the table and reminded Dana.', firstForwarded(h, call.callId, ['fc-2', 'fc-3']));
     expect(await (await first).json()).toEqual({ answer: 'Booked the table and reminded Dana.' });
     expect(await (await second).json()).toEqual({ answer: 'Booked the table and reminded Dana.' });
+  });
+
+  it('answers only the consults the agent got from the replied one on, not an earlier turn', async () => {
+    const [early] = await openConsults(h, call.callId, ['fc-e']);
+    const [later] = await openConsults(h, call.callId, ['fc-l']);
+    await reply(h, 'The later one.', geminiConsultMessageId(call.callId, 'fc-l'));
+    expect(await (await later).json()).toEqual({ answer: 'The later one.' });
+    // The earlier consult still waits for its own reply.
+    await reply(h, 'The earlier one.', geminiConsultMessageId(call.callId, 'fc-e'));
+    expect(await (await early).json()).toEqual({ answer: 'The earlier one.' });
   });
 
   it('caps open consults per call and the size of a request', async () => {
@@ -498,7 +537,7 @@ describe('gemini agent replies, consult bounds and races', () => {
     const open = await openConsults(h, call.callId, ids);
     const over = await post(consultUrl(h), { callId: call.callId, functionCallId: 'open-x', request: 'One more' });
     expect(over.status).toBe(429);
-    await reply(h, 'All done.', geminiConsultMessageId(call.callId, ids[0]));
+    await reply(h, 'All done.', firstForwarded(h, call.callId, ids));
     for (const res of open) expect((await res).status).toBe(200);
 
     const big = await post(consultUrl(h), { callId: call.callId, functionCallId: 'big', request: 'a'.repeat(4097) });
@@ -518,7 +557,7 @@ describe('gemini agent replies, consult bounds and races', () => {
     while (n < MAX_CONSULTS_PER_MINUTE) {
       const ids = Array.from({ length: Math.min(MAX_OPEN_CONSULTS, MAX_CONSULTS_PER_MINUTE - n) }, () => `rate-${n++}`);
       const pending = await openConsults(h, call.callId, ids);
-      await reply(h, 'Done.', geminiConsultMessageId(call.callId, ids[0]));
+      await reply(h, 'Done.', firstForwarded(h, call.callId, ids));
       for (const res of pending) expect((await res).status).toBe(200);
     }
     const limited = await post(consultUrl(h), { callId: call.callId, functionCallId: 'rate-x', request: 'Again' });
@@ -613,7 +652,8 @@ describe('gemini call length and daily budget', () => {
     for (const [overrides, expected] of [
       [{}, 10 * MIN],
       [{ maxCallDurationMs: 4 * MIN }, 4 * MIN],
-      [{ gemini: { apiKey: 'gk', apiBase: google.apiBase, maxCallDurationMs: 20 * MIN } }, 15 * MIN],
+      // GEMINI_LIVE_MAX_CALL_SECONDS never lifts a call past the 10 minutes Google allows.
+      [{ gemini: { apiKey: 'gk', apiBase: google.apiBase, maxCallDurationMs: 20 * MIN } }, 10 * MIN],
       [{ gemini: { apiKey: 'gk', apiBase: google.apiBase, maxCallDurationMs: 5 * MIN } }, 5 * MIN],
     ] as Array<[Partial<GptLiveConfig>, number]>) {
       const h = await startHarness({ gemini: { apiKey: 'gk', apiBase: google.apiBase }, ...overrides });
@@ -645,6 +685,93 @@ describe('gemini call length and daily budget', () => {
       const res = await post(`${h.base}/gemini/token?t=tok123`);
       expect(res.status).toBe(429);
       expect(await res.text()).toMatch(/call minutes for today/);
+    } finally {
+      await h.stop();
+    }
+  });
+});
+
+describe('gemini token mint races', () => {
+  let google: FakeGoogle;
+
+  beforeAll(async () => {
+    google = await startFakeGoogle();
+  });
+  afterAll(async () => {
+    await google.close();
+  });
+
+  const holdGoogle = (): (() => void) => {
+    let release!: () => void;
+    google.hold = new Promise((r) => (release = r));
+    return () => {
+      google.hold = null;
+      release();
+    };
+  };
+
+  it('gives the page the token time left after a slow mint, so it hangs up before the token dies', async () => {
+    const h = await startHarness({ gemini: { apiKey: 'gk', apiBase: google.apiBase } });
+    try {
+      const release = holdGoogle();
+      const before = google.received;
+      const pending = post(`${h.base}/gemini/token?t=tok123`);
+      await vi.waitFor(() => expect(google.received).toBe(before + 1));
+      h.clock.now += 20_000;
+      release();
+      const res = await pending;
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as TokenResponse).durationMs).toBe(10 * MIN - 20_000);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('refunds and registers nothing when the page left during the mint', async () => {
+    const h = await startHarness({ gemini: { apiKey: 'gk', apiBase: google.apiBase }, maxCallMsPerDay: 15 * MIN });
+    try {
+      const release = holdGoogle();
+      const before = google.received;
+      const controller = new AbortController();
+      const pending = fetch(`${h.base}/gemini/token?t=tok123`, { method: 'POST', signal: controller.signal });
+      await vi.waitFor(() => expect(google.received).toBe(before + 1));
+      controller.abort();
+      await expect(pending).rejects.toThrow();
+      await new Promise((r) => setTimeout(r, 30));
+      release();
+      await new Promise((r) => setTimeout(r, 50));
+      // The abandoned mint gave its 10 minutes back: the next call gets them all.
+      expect((await mint(h)).durationMs).toBe(10 * MIN);
+      // And no call was registered for the page that left: nothing waits on it.
+      expect(await reply(h, 'proactive')).toMatch(/^gemini-update:/);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('does not refund a failed mint into the next UTC day', async () => {
+    const h = await startHarness({
+      gemini: { apiKey: 'gk', apiBase: google.apiBase },
+      maxCallMsPerDay: 15 * MIN,
+      maxCallsPerHour: 20,
+    });
+    try {
+      h.clock.now = Date.UTC(2026, 9, 2, 23, 59, 0);
+      const release = holdGoogle();
+      const before = google.received;
+      google.failNext = 500;
+      const failing = post(`${h.base}/gemini/token?t=tok123`);
+      await vi.waitFor(() => expect(google.received).toBe(before + 1));
+      // Past midnight, another call is charged on the new day while the first mint still hangs.
+      h.clock.now = Date.UTC(2026, 9, 3, 0, 0, 5);
+      google.hold = null;
+      google.failNext = 0;
+      expect((await mint(h)).durationMs).toBe(10 * MIN);
+      google.failNext = 500;
+      release();
+      expect((await failing).status).toBe(502);
+      // The new day still carries those 10 minutes: 5 are left.
+      expect((await mint(h)).durationMs).toBe(5 * MIN);
     } finally {
       await h.stop();
     }
@@ -703,5 +830,64 @@ describe('voice prompts lock the language to Ukrainian and English', () => {
       expect(prompt).toContain(LANGUAGE_RULE);
       expect(prompt).not.toMatch(/speak the language the caller speaks/);
     }
+  });
+});
+
+describe('voice vocabulary', () => {
+  const caller = { id: LINE, name: 'Ethan' };
+
+  it('puts the names right after the language rule for every engine, the LiveKit prompt without page updates', () => {
+    const agent = { name: 'Andy', vocabulary: voiceVocabulary('Acme, Zephyr', null) };
+    const line = 'Names you will hear (spell them exactly this way in transcripts and tool requests): Acme, Zephyr.';
+    for (const prompt of [
+      sessionConfig(agent, 'marin', caller).instructions as string,
+      geminiInstructions(agent, caller),
+      geminiInstructions(agent, caller, { agentUpdates: false }),
+    ]) {
+      expect(prompt).toContain(`${LANGUAGE_RULE} ${line}`);
+    }
+    expect(geminiInstructions(agent, caller)).toContain('Agent update:');
+    expect(geminiInstructions(agent, caller, { agentUpdates: false })).not.toContain('Agent update:');
+  });
+
+  it('lists no names when neither the setting nor the file names any', () => {
+    expect(voiceVocabulary(undefined, null)).toEqual([]);
+    expect(voiceVocabulary(' , ,', '\n  \n')).toEqual([]);
+    const agent = { name: 'Andy', vocabulary: voiceVocabulary(undefined, null) };
+    expect(geminiInstructions(agent, caller)).not.toContain('Names you will hear');
+    expect(sessionConfig(agent, 'marin', caller).instructions).not.toContain('Names you will hear');
+  });
+
+  it('merges GPT_LIVE_VOCABULARY with the agent file, trimmed and deduplicated', () => {
+    expect(voiceVocabulary(' Acme ,Zephyr,, k8s', 'zephyr\nLiveKit\r\n  Gemini  Live \nAcme')).toEqual([
+      'Acme',
+      'Zephyr',
+      'k8s',
+      'LiveKit',
+      'Gemini Live',
+    ]);
+  });
+
+  it('reads the agent file with the persona reader, FIFO- and symlink-safe', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-vocab-'));
+    try {
+      fs.writeFileSync(path.join(dir, VOICE_VOCABULARY_FILE), 'Acme\nk8s\n');
+      expect(voiceVocabulary(undefined, readGroupPersona(dir, VOICE_VOCABULARY_FILE))).toEqual(['Acme', 'k8s']);
+      fs.rmSync(path.join(dir, VOICE_VOCABULARY_FILE));
+      fs.symlinkSync('/etc/hosts', path.join(dir, VOICE_VOCABULARY_FILE));
+      expect(voiceVocabulary(undefined, readGroupPersona(dir, VOICE_VOCABULARY_FILE))).toEqual([]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it(`caps the list at ${MAX_VOCABULARY_TERMS} terms and ${MAX_VOCABULARY_BYTES} bytes, and drops overlong terms`, () => {
+    const many = Array.from({ length: 100 }, (_, i) => `t${i}`).join(',');
+    expect(voiceVocabulary(many, null)).toHaveLength(MAX_VOCABULARY_TERMS);
+    const wide = Array.from({ length: 50 }, (_, i) => `${'x'.repeat(40)}${i}`).join(',');
+    const capped = voiceVocabulary(wide, null);
+    expect(Buffer.byteLength(capped.join(', '))).toBeLessThanOrEqual(MAX_VOCABULARY_BYTES);
+    expect(capped.length).toBeLessThan(50);
+    expect(voiceVocabulary(`ok,${'y'.repeat(200)}`, null)).toEqual(['ok']);
   });
 });

@@ -77,6 +77,8 @@ export function chunkForAppend(text: string, max: number = MAX_APPEND_CHARS): st
     if (cut > 0) cut += 1; // keep the punctuation with the sentence
     if (cut < max / 3) cut = window.lastIndexOf(' ');
     if (cut <= 0) cut = max;
+    // A hard cut must not split a surrogate pair (an emoji, say) into two lone halves.
+    if (cut === max && cut > 1 && /[\uD800-\uDBFF]/.test(rest[cut - 1])) cut--;
     out.push(rest.slice(0, cut).trim());
     rest = rest.slice(cut).trim();
   }

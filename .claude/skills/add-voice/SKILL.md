@@ -46,6 +46,18 @@ speaks English, Ukrainian otherwise (speech that sounds like a third language is
 treated as misheard Ukrainian), and the greeting is in Ukrainian unless the
 persona names another language.
 
+Every engine's prompt also lists names the caller is likely to say, so the model
+recognises them and spells them exactly in transcripts and `ask_agent`
+requests: `GPT_LIVE_VOCABULARY` (comma-separated, in `.env`) plus the agent's
+optional `voice.vocabulary.txt` in its group folder (one term per line, read
+like the persona file, symlinks and FIFOs refused), e.g.
+`GPT_LIVE_VOCABULARY=Acme, Zephyr, k8s`. Both are merged, trimmed and
+deduplicated, and capped at 60 terms and 1 KB; when neither names any, the
+prompt lists no names. `GPT_LIVE_VOCABULARY` is read at startup, the file on
+every call. It is prompt-only: `gpt-live-1`
+sessions take no transcription settings, and Gemini documents `customVocabulary`
+for its transcribe model only.
+
 The stable channel identifier and URL prefix are `voice`. The `GPT_LIVE_*`
 settings and adapter module names identify the current voice engine.
 
@@ -74,6 +86,7 @@ src/channels/gpt-live-call-page.test.ts
 src/channels/gemini-live.ts
 src/channels/gemini-live.test.ts
 src/channels/voice-livekit.ts
+src/channels/voice-livekit-protocol.ts
 src/channels/voice-livekit.test.ts
 src/voice-livekit-worker.ts
 src/voice-livekit-worker.test.ts
@@ -403,16 +416,20 @@ GEMINI_API_KEY=<Gemini API key>
 
 Optional: `GEMINI_LIVE_MODEL` (default `gemini-3.8-live`),
 `GEMINI_LIVE_VOICE` (default `Kore`) and `GEMINI_LIVE_MAX_CALL_SECONDS`
-(default `600`, never above `GPT_LIVE_MAX_CALL_SECONDS`; Google drops Live audio
-connections at about 10 minutes and the page does not resume sessions yet).
+(default and maximum `600`, never above `GPT_LIVE_MAX_CALL_SECONDS`; Google drops
+Live audio connections at about 10 minutes and the page does not resume sessions
+yet). The page is told the token's remaining lifetime after the mint, so it hangs
+up before the token expires.
 Restart to load them.
 
 The page talks to Gemini directly: the host mints a one-use ephemeral token
 locked to the model, the composed voice prompt, the voice and one `ask_agent`
 function, and the key never leaves the host. Each `ask_agent` call is sent to
 the agent like a delegation and its first reply goes back to Gemini as the
-function's answer; a batched agent reply answers every `ask_agent` call that was
-waiting. Later agent messages for the call (the real answer after an interim
+function's answer. The agent batches the messages that queued while it was busy
+and replies to the first, so a reply also answers the waiting `ask_agent` calls
+the agent got after the one it names; calls it got earlier wait for their own
+reply. Later agent messages for the call (the real answer after an interim
 one, a reply after the timeout line, a proactive message) are queued; the page
 long-polls `…/gemini/messages` and hands each to Gemini as a further answer,
 spoken when the model is idle. A call may have 3 `ask_agent` calls waiting at
@@ -447,35 +464,71 @@ Optional: `LIVEKIT_WORKER_URL` (server-side URL for the worker and the host's
 room/dispatch API calls, e.g. `ws://127.0.0.1:7880` when the server runs on the
 same box; defaults to `LIVEKIT_URL`), `LIVEKIT_AGENT_NAME` (dispatch name,
 default `nanoclaw-voice`; set the same value for host and worker),
-`LIVEKIT_HOST_URL` (where the worker reaches this host's webhook server,
+`LIVEKIT_HOST_URL` (worker only: where it reaches this host's webhook server,
 default `http://127.0.0.1:<WEBHOOK_PORT>`; it must be a loopback address unless
-`GPT_LIVE_ALLOW_NON_LOOPBACK=1`, like every voice route), `GEMINI_LIVE_MODEL` (default
+`GPT_LIVE_ALLOW_NON_LOOPBACK=1`, like every voice route; the worker never takes
+an address from the dispatch), `GEMINI_LIVE_MODEL` (default
 `gemini-3.8-live`), `GEMINI_LIVE_VOICE` (default `Kore`). Restart to load them.
+LiveKit calls end at `GPT_LIVE_MAX_CALL_SECONDS` (default 15 minutes) or when the
+day's minutes run out, whichever comes first.
 
 The agent side is a separate process, the LiveKit Agents worker: agents-js
 runs every job in a forked child process of its worker, so it does not live in
 the host. Build, then run it next to the host from the NanoClaw directory (it
-reads the same `.env`):
+reads its settings from that directory's `.env` itself, like the host, so no
+secret goes into its environment or its job processes):
 
 ```bash
 pnpm run build
 pnpm run voice-worker        # node dist/voice-livekit-worker.js start
 ```
 
-Its health check listens on `127.0.0.1:8089` (`VOICE_WORKER_HEALTH_PORT`).
+Its health check listens on `127.0.0.1:8089` (`VOICE_WORKER_HEALTH_PORT` in
+`.env`). At startup it logs the host URL it uses and checks the host answers
+there; if not, it logs an error (set `LIVEKIT_HOST_URL` in `.env`), refuses
+calls and checks again every 30 seconds. On SIGTERM it takes no new calls and gives running ones 60 seconds before
+closing them, so a restart cuts a longer call short. As a systemd user unit:
+
+```ini
+# ~/.config/systemd/user/nanoclaw-voice-worker.service
+[Unit]
+Description=NanoClaw LiveKit voice worker
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/nanoclaw
+ExecStart=/usr/bin/env node dist/voice-livekit-worker.js start
+Restart=on-failure
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target
+```
+
+No `EnvironmentFile=`: it would put every `.env` secret into the worker's
+environment and every forked job, and agents-js lets `LIVEKIT_URL` from the
+environment override `LIVEKIT_WORKER_URL`. Set `Environment=LOG_LEVEL=debug`
+for verbose logs.
 
 How a call runs: the page posts to `/webhook/voice/livekit/token`; the host
 admits the call against the shared hourly and daily limits, ends any other call
 on the line (newest wins, across all three engines), creates a unique room
 `voice-<line id>-<random>`, dispatches the worker to it with the call metadata
-(line, call id, agent name, the composed voice prompt, a per-call secret) and
-returns a two-minute token that can only join that room, publish a microphone
+(line, call id, agent name, the composed voice prompt; nothing secret, since
+agents-js logs whole jobs on some paths) and returns a two-minute token that can only join that room, publish a microphone
 and subscribe. The worker waits for the caller, tells the host (the daily
 minutes are charged from here until the room ends), then runs Gemini Live with
-one NON_BLOCKING `ask_agent` function. Each `ask_agent` call becomes an inbound
-message for the agent; its replies come back over the host's event stream to
-the worker: the first as the function result (spoken when the model is idle),
-any later reply, interrupted request or proactive agent message as a new turn.
+one NON_BLOCKING `ask_agent` function. The worker authenticates to the host with
+a per-call secret both derive from `LIVEKIT_API_SECRET`, so the worker needs that
+key too. Each `ask_agent` call becomes an inbound message for the agent; its
+replies come back over the host's event stream naming the call they answer
+(same batching rule as the Gemini path): the reply goes back as the function
+result (spoken when the model is idle); any later reply or proactive agent
+message is spoken as a new turn. When the caller or Gemini interrupts the turn
+that made the call, the call moves to the background: Gemini gets a holding note
+as the function result and the answer is spoken as a new turn when it arrives.
+If the worker does not open its event stream within 30 seconds of the caller
+joining, the host ends the call.
 Requests share the Gemini path's caps (4 KB, 3 open and 10 per minute per call); after 90 seconds without a
 reply the caller hears the timeout line. The host rechecks access every five
 seconds and ends a call (hangup, revocation, duration or budget limit, a newer

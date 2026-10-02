@@ -80,6 +80,14 @@ describe('personal voice line access (real central DB)', () => {
     );
   });
 
+  it('lists the startup vocabulary on call setup only, and no names when none are configured', async () => {
+    await allow(ETHAN);
+    const setup = await resolveVoiceLine(ETHAN, undefined, { persona: true, vocabulary: 'Acme, k8s' });
+    expect(setup?.agent.vocabulary).toEqual(['Acme', 'k8s']);
+    expect((await resolveVoiceLine(ETHAN, undefined, { vocabulary: 'Acme' }))?.agent.vocabulary).toBeUndefined();
+    expect((await resolveVoiceLine(ETHAN, undefined, { persona: true }))?.agent.vocabulary).toBeUndefined();
+  });
+
   it('keeps two people distinct when they call the same agent', async () => {
     await line(LAURA, 'Laura');
     await allow(ETHAN);

@@ -210,4 +210,14 @@ describe('chunkForAppend', () => {
     expect(chunks.every((c) => c.length <= 200 && !c.startsWith(' ') && !c.endsWith(' '))).toBe(true);
     expect(chunks.join(' ')).toBe(words);
   });
+
+  it('never splits a surrogate pair on a hard cut', () => {
+    const emoji = 'a' + '😀'.repeat(20);
+    const chunks = chunkForAppend(emoji, 10);
+    expect(chunks.join('')).toBe(emoji);
+    for (const c of chunks) {
+      expect(c.length).toBeLessThanOrEqual(10);
+      expect(c).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    }
+  });
 });

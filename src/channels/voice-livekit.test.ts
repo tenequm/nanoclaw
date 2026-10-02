@@ -6,11 +6,12 @@
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ChannelAdapter, InboundMessage } from './adapter.js';
 import { createGptLiveAdapter, DELEGATION_TIMEOUT_LINE, lineIdForToken, type GptLiveConfig } from './voice.js';
-import { type LiveKitHostEvent, type LiveKitJobMetadata, type LiveKitServerApi } from './voice-livekit.js';
+import type { LiveKitServerApi, LiveKitVoiceConfig } from './voice-livekit.js';
+import { liveKitCallSecret, type LiveKitHostEvent, type LiveKitJobMetadata } from './voice-livekit-protocol.js';
 import { stopWebhookServer } from '../webhook-server.js';
 
 const LINE = lineIdForToken('tok123');
@@ -22,7 +23,11 @@ interface FakeLiveKit extends LiveKitServerApi {
   rooms: string[];
   deleted: string[];
   dispatches: Array<{ room: string; agentName: string; metadata: LiveKitJobMetadata }>;
+  /** Every room operation in order, as `create:<room>` / `delete:<room>`. */
+  ops: string[];
   failCreate: boolean;
+  /** When set, createRoom waits for it, to widen the connecting window. */
+  createGate: Promise<void> | null;
 }
 
 function fakeLiveKit(): FakeLiveKit {
@@ -30,14 +35,19 @@ function fakeLiveKit(): FakeLiveKit {
     rooms: [],
     deleted: [],
     dispatches: [],
+    ops: [],
     failCreate: false,
+    createGate: null,
     async createRoom(options) {
+      await fake.createGate;
       if (fake.failCreate) throw new Error('connection refused');
       fake.rooms.push(options.name);
+      fake.ops.push(`create:${options.name}`);
       return {};
     },
     async deleteRoom(room) {
       fake.deleted.push(room);
+      fake.ops.push(`delete:${room}`);
     },
     async createDispatch(room, agentName, options) {
       fake.dispatches.push({ room, agentName, metadata: JSON.parse(options.metadata) as LiveKitJobMetadata });
@@ -78,6 +88,8 @@ function startFakeGoogle(): Promise<{ apiBase: string; close(): Promise<void> }>
 
 interface Harness {
   adapter: ChannelAdapter;
+  /** Where the worker reaches the host, from its own settings. */
+  hostUrl: string;
   base: string;
   inbound: InboundMessage[];
   clock: { now: number };
@@ -86,7 +98,11 @@ interface Harness {
   stop(): Promise<void>;
 }
 
-async function startHarness(overrides: Partial<GptLiveConfig> = {}, livekit = true): Promise<Harness> {
+async function startHarness(
+  overrides: Partial<GptLiveConfig> = {},
+  livekit = true,
+  lkOverrides: Partial<LiveKitVoiceConfig> = {},
+): Promise<Harness> {
   const port = await freePort();
   process.env.WEBHOOK_PORT = String(port);
   const inbound: InboundMessage[] = [];
@@ -116,8 +132,8 @@ async function startHarness(overrides: Partial<GptLiveConfig> = {}, livekit = tr
           serverUrl: 'ws://127.0.0.1:7880',
           apiKey: API_KEY,
           apiSecret: API_SECRET,
-          hostUrl: `http://127.0.0.1:${port}`,
           api: lk,
+          ...lkOverrides,
         }
       : undefined,
     ...overrides,
@@ -132,6 +148,7 @@ async function startHarness(overrides: Partial<GptLiveConfig> = {}, livekit = tr
   });
   return {
     adapter,
+    hostUrl: `http://127.0.0.1:${port}`,
     base: `http://127.0.0.1:${port}/webhook/voice`,
     inbound,
     clock,
@@ -164,6 +181,8 @@ interface TokenResponse {
 /** The worker's side of one call: its metadata, an open event stream, and its POSTs. */
 interface FakeWorker {
   meta: LiveKitJobMetadata;
+  /** The consult id from each accepted ask, in order. */
+  ask(request: string): Promise<string>;
   events: LiveKitHostEvent[];
   streamClosed: Promise<void>;
   post(path: string, body?: Record<string, unknown>): Promise<Response>;
@@ -171,12 +190,14 @@ interface FakeWorker {
   close(): void;
 }
 
-async function attachWorker(meta: LiveKitJobMetadata): Promise<FakeWorker> {
+const workerAuth = (callId: string) => ({ Authorization: `Bearer ${liveKitCallSecret(API_SECRET, callId)}` });
+
+async function attachWorker(h: Harness, meta: LiveKitJobMetadata): Promise<FakeWorker> {
   const events: LiveKitHostEvent[] = [];
   const waiters: Array<{ pred: (e: LiveKitHostEvent) => boolean; resolve: (e: LiveKitHostEvent) => void }> = [];
   const controller = new AbortController();
-  const auth = { Authorization: `Bearer ${meta.secret}` };
-  const res = await fetch(`${meta.hostUrl}/webhook/voice/livekit/agent/events?call=${meta.callId}`, {
+  const auth = workerAuth(meta.callId);
+  const res = await fetch(`${h.hostUrl}/webhook/voice/livekit/agent/events?call=${meta.callId}`, {
     headers: auth,
     signal: controller.signal,
   });
@@ -202,12 +223,18 @@ async function attachWorker(meta: LiveKitJobMetadata): Promise<FakeWorker> {
       // aborted by close()
     }
   })();
+  const workerPost = (path: string, body: Record<string, unknown> = {}) =>
+    post(`${h.hostUrl}/webhook/voice/livekit/agent/${path}`, { callId: meta.callId, ...body }, auth);
   return {
     meta,
     events,
     streamClosed,
-    post: (path, body = {}) =>
-      post(`${meta.hostUrl}/webhook/voice/livekit/agent/${path}`, { callId: meta.callId, ...body }, auth),
+    post: workerPost,
+    ask: async (request) => {
+      const res = await workerPost('ask', { request });
+      expect(res.status).toBe(202);
+      return ((await res.json()) as { id: string }).id;
+    },
     waitFor: (pred) => {
       const hit = events.find(pred);
       if (hit) return Promise.resolve(hit);
@@ -222,7 +249,7 @@ async function startCall(h: Harness): Promise<{ call: TokenResponse; worker: Fak
   expect(res.status).toBe(200);
   const call = (await res.json()) as TokenResponse;
   const dispatch = h.lk.dispatches.at(-1)!;
-  const worker = await attachWorker(dispatch.metadata);
+  const worker = await attachWorker(h, dispatch.metadata);
   expect((await worker.post('joined')).status).toBe(200);
   return { call, worker };
 }
@@ -312,7 +339,14 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(meta.instructions).toContain('You are Andy');
     expect(meta.instructions).toContain('Dry humour, precise.');
     expect(meta.instructions).toContain('Answer from the backend');
-    expect(meta.secret.length).toBeGreaterThanOrEqual(40);
+    // The browser path's page-injected turns never reach this engine.
+    expect(meta.instructions).not.toContain('Agent update:');
+    // Nothing secret in the dispatch (agents-js logs jobs), and no host address the worker would trust.
+    expect(meta).not.toHaveProperty('secret');
+    expect(meta).not.toHaveProperty('hostUrl');
+    const secret = liveKitCallSecret(API_SECRET, meta.callId);
+    expect(JSON.stringify(dispatch)).not.toContain(secret);
+    expect(JSON.stringify(dispatch)).not.toContain(API_SECRET);
 
     const claims = jwtPayload(body.token);
     expect(claims.sub).toBe(meta.callerIdentity);
@@ -326,9 +360,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       canSubscribe: true,
       canPublishData: false,
     });
-    // The worker's secret travels only in the dispatch, never in what the browser holds.
-    expect(body.token).not.toContain(meta.secret);
-    expect(JSON.stringify(claims)).not.toContain(meta.secret);
+    // The worker's secret is not in what the browser holds either.
+    expect(body.token).not.toContain(secret);
+    expect(JSON.stringify(claims)).not.toContain(secret);
   });
 
   it('answers 502 and cleans up when the LiveKit server is unreachable', async () => {
@@ -338,18 +372,21 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.deleted).toHaveLength(1);
   });
 
-  it('authenticates the worker routes with the per-call secret', async () => {
+  it('authenticates the worker routes with the per-call secret derived from the API secret', async () => {
     await post(`${h.base}/livekit/token?t=tok123`);
     const meta = h.lk.dispatches[0].metadata;
-    const url = `${meta.hostUrl}/webhook/voice/livekit/agent`;
+    const url = `${h.hostUrl}/webhook/voice/livekit/agent`;
+    const secret = liveKitCallSecret(API_SECRET, meta.callId);
     expect((await post(`${url}/joined`, { callId: meta.callId })).status).toBe(409);
-    expect(
-      (await post(`${url}/joined`, { callId: meta.callId }, { Authorization: `Bearer ${meta.secret}x` })).status,
-    ).toBe(409);
+    expect((await post(`${url}/joined`, { callId: meta.callId }, { Authorization: `Bearer ${secret}x` })).status).toBe(
+      409,
+    );
+    const otherKey = liveKitCallSecret('another-livekit-secret', meta.callId);
+    expect((await post(`${url}/joined`, { callId: meta.callId }, { Authorization: `Bearer ${otherKey}` })).status).toBe(
+      409,
+    );
     expect((await fetch(`${url}/events?call=${meta.callId}`)).status).toBe(404);
-    expect(
-      (await post(`${url}/joined`, { callId: meta.callId }, { Authorization: `Bearer ${meta.secret}` })).status,
-    ).toBe(200);
+    expect((await post(`${url}/joined`, { callId: meta.callId }, workerAuth(meta.callId))).status).toBe(200);
   });
 
   it('routes ask_agent to the agent and speaks every reply to it, interim and final', async () => {
@@ -370,9 +407,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(interim).toBe(msg.id);
     await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Dentist at nine.' }, inReplyTo: msg.id });
     await worker.waitFor((e) => e.type === 'reply' && e.text === 'Dentist at nine.');
-    expect(worker.events.filter((e) => e.type === 'reply').map((e) => (e as { text: string }).text)).toEqual([
-      'Let me check.',
-      'Dentist at nine.',
+    // The first reply answers the consult; the second answers none and is spoken as a new turn.
+    expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
+      { type: 'reply', text: 'Let me check.', consultIds: [id] },
+      { type: 'reply', text: 'Dentist at nine.' },
     ]);
     // The reply settled the consult: no timeout line follows.
     await new Promise((r) => setTimeout(r, 400));
@@ -380,14 +418,39 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     worker.close();
   });
 
-  it('settles every open ask_agent of the call with a batched reply', async () => {
+  it('settles the targeted ask_agent and the ones opened after it with a batched reply', async () => {
     const { worker } = await startCall(h);
-    await worker.post('ask', { request: 'first' });
-    await worker.post('ask', { request: 'second' });
+    const first = await worker.ask('first');
+    const second = await worker.ask('second');
     // The agent's batched turn answers the first inbound only.
     await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Both done.' }, inReplyTo: h.inbound[0].id });
     await new Promise((r) => setTimeout(r, 400));
-    expect(worker.events.filter((e) => e.type === 'reply')).toEqual([{ type: 'reply', text: 'Both done.' }]);
+    expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
+      { type: 'reply', text: 'Both done.', consultIds: [first, second] },
+    ]);
+    worker.close();
+  });
+
+  it('routes out-of-order replies to their own consults and leaves earlier ones open', async () => {
+    const { worker } = await startCall(h);
+    const a = await worker.ask('a');
+    const b = await worker.ask('b');
+    const c = await worker.ask('c');
+    const idOf = (consultId: string) => h.inbound.find((m) => m.id.endsWith(`:${consultId}`))!.id;
+    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'C first.' }, inReplyTo: idOf(c) });
+    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Then B.' }, inReplyTo: idOf(b) });
+    // A second reply to C answers nothing; it must not settle A.
+    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'More on C.' }, inReplyTo: idOf(c) });
+    await worker.waitFor((e) => e.type === 'reply' && e.text === 'More on C.');
+    // A got no reply, so only A hits the timeout line.
+    const timedOut = await worker.waitFor((e) => e.type === 'reply' && e.timedOut === true);
+    expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
+      { type: 'reply', text: 'C first.', consultIds: [c] },
+      { type: 'reply', text: 'Then B.', consultIds: [b] },
+      { type: 'reply', text: 'More on C.' },
+      { type: 'reply', text: DELEGATION_TIMEOUT_LINE, timedOut: true, consultIds: [a] },
+    ]);
+    expect(timedOut).toMatchObject({ consultIds: [a] });
     worker.close();
   });
 
@@ -401,9 +464,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('answers an unanswered ask_agent with the timeout line', async () => {
     const { worker } = await startCall(h);
-    await worker.post('ask', { request: 'slow one' });
+    const id = await worker.ask('slow one');
     const event = await worker.waitFor((e) => e.type === 'reply');
-    expect(event).toEqual({ type: 'reply', text: DELEGATION_TIMEOUT_LINE, timedOut: true });
+    expect(event).toEqual({ type: 'reply', text: DELEGATION_TIMEOUT_LINE, timedOut: true, consultIds: [id] });
     worker.close();
   });
 
@@ -470,7 +533,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const res = await post(`${h.base}/livekit/token?t=tok123`);
     expect(res.status).toBe(200);
     expect(h.lk.dispatches.at(-1)!.metadata.maxDurationMs).toBe(30_000);
-    const worker = await attachWorker(h.lk.dispatches.at(-1)!.metadata);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
     expect((await worker.post('joined')).status).toBe(200);
     h.clock.now += 30_000;
     await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId });
@@ -499,6 +562,107 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const refused = await post(`${h.base}/livekit/token?t=tok123`);
     expect(refused.status).toBe(429);
     expect(refused.headers.get('retry-after')).toBeTruthy();
+  });
+
+  it('deletes the room of a call that was replaced while it was connecting', async () => {
+    let release!: () => void;
+    h.lk.createGate = new Promise((r) => (release = r));
+    const first = post(`${h.base}/livekit/token?t=tok123`);
+    await settle();
+    // A newer call takes the line while the room is still being created.
+    expect((await post(`${h.base}/gemini/token?t=tok123`)).status).toBe(200);
+    h.lk.createGate = null;
+    release();
+    expect((await first).status).toBe(409);
+    const [room] = h.lk.rooms;
+    // The replaced call's own cleanup ran before the room existed; the room still goes.
+    expect(h.lk.ops.indexOf(`create:${room}`)).toBeGreaterThanOrEqual(0);
+    expect(h.lk.ops.lastIndexOf(`delete:${room}`)).toBeGreaterThan(h.lk.ops.indexOf(`create:${room}`));
+  });
+
+  it('deletes the room when the page left while the room was being set up', async () => {
+    let release!: () => void;
+    h.lk.createGate = new Promise((r) => (release = r));
+    const controller = new AbortController();
+    const pending = fetch(`${h.base}/livekit/token?t=tok123`, { method: 'POST', signal: controller.signal });
+    await settle();
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+    await settle();
+    h.lk.createGate = null;
+    release();
+    // Nobody gets the token, so the room would otherwise wait for a caller until the join timeout.
+    await vi.waitFor(() => expect(h.lk.deleted).toHaveLength(1));
+    expect(h.lk.deleted).toEqual(h.lk.rooms);
+  });
+
+  it('teardown awaits the delete of a room replaced while connecting', async () => {
+    let release!: () => void;
+    h.lk.createGate = new Promise((r) => (release = r));
+    const first = post(`${h.base}/livekit/token?t=tok123`);
+    await settle();
+    expect((await post(`${h.base}/gemini/token?t=tok123`)).status).toBe(200);
+    let releaseDelete!: () => void;
+    const deleteGate = new Promise<void>((r) => (releaseDelete = r));
+    const deleteRoom = h.lk.deleteRoom.bind(h.lk);
+    h.lk.deleteRoom = async (room) => {
+      await deleteGate;
+      return deleteRoom(room);
+    };
+    h.lk.createGate = null;
+    release();
+    await settle();
+    let tornDown = false;
+    const teardown = h.adapter.teardown().then(() => (tornDown = true));
+    await settle();
+    expect(tornDown).toBe(false);
+    releaseDelete();
+    await teardown;
+    expect((await first).status).toBe(409);
+    expect(h.lk.deleted).toContain(h.lk.rooms[0]);
+  });
+
+  it('ends a call whose worker never opens its event stream after reporting the caller in', async () => {
+    await h.stop();
+    google = await startFakeGoogle();
+    h = await startHarness({ gemini: { apiKey: 'gk-test', apiBase: google.apiBase } }, true, {
+      workerStreamTimeoutMs: 100,
+    });
+    expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
+    const meta = h.lk.dispatches[0].metadata;
+    const joined = await post(
+      `${h.hostUrl}/webhook/voice/livekit/agent/joined`,
+      { callId: meta.callId },
+      workerAuth(meta.callId),
+    );
+    expect(joined.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 250));
+    expect(h.lk.deleted).toEqual([h.lk.rooms[0]]);
+  });
+
+  it('refuses a delivery once the caller lost access instead of reporting it sent', async () => {
+    await h.stop();
+    google = await startFakeGoogle();
+    h = await startHarness({ accessCheckIntervalMs: 60_000, gemini: { apiKey: 'gk-test', apiBase: google.apiBase } });
+    const { worker } = await startCall(h);
+    h.access.enabled = false;
+    await expect(
+      h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Your taxi is here.' } }),
+    ).rejects.toThrow(/revoked/);
+    await worker.streamClosed;
+  });
+
+  it('refuses a start over the daily minutes without ending the running call', async () => {
+    await h.stop();
+    google = await startFakeGoogle();
+    h = await startHarness({ maxCallMsPerDay: 2 * MIN, gemini: { apiKey: 'gk-test', apiBase: google.apiBase } });
+    const { worker } = await startCall(h);
+    h.clock.now += 2 * MIN;
+    expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(429);
+    await settle();
+    expect(h.lk.deleted).toEqual([]);
+    expect(worker.events.some((e) => e.type === 'end')).toBe(false);
+    worker.close();
   });
 
   it('newest wins across engines on a line', async () => {
