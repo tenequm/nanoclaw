@@ -527,10 +527,12 @@ TTS, captions and the agent state are the framework's. Then:
   the turn ends; the page shows it as it comes. The worker posts the turn's
   text to `/webhook/voice/livekit/agent/utterance`, and the host hands it to the
   agent in the line's call chat (below) as `<voice source="livekit">…</voice>`
-  plus a line saying the reply is read aloud (short spoken sentences, no
-  markdown, links or code, numbers as words, longer material as a separate
-  written message; in a call chat, that every message sent to the chat during
-  the call is read aloud, so longer material waits for the end of the call).
+  plus a line saying the reply is read aloud (depth matched to the question:
+  brief for simple ones, a full considered answer in plain speech for design,
+  strategy or anything that needs care; no markdown, links or code, numbers as
+  words; anything meant for reading as a separate written message; in a call
+  chat, that every message sent to the chat during the call is read aloud, so
+  anything meant for reading waits for the end of the call).
   Its id is `livekit:<call>:<n>`.
 - Every agent message to the call chat during the call (replies and proactive
   messages; with no call chat, every agent message for the line) goes to the
