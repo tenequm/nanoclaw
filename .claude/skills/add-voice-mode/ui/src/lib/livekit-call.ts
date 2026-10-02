@@ -12,16 +12,18 @@ import {
 import { useAudioPlayback, useParticipantAttributes, useRemoteParticipants, useTextStream, useTranscriptions } from "@livekit/components-react"
 import {
   CallError,
+  CuePlayer,
   LIVE_PHASES,
   PAGE_CLOSED,
   TURN_CUE_DELAY_MS,
   errorText,
+  isAppleMobile,
   levelsFromStats,
   micErrorKind,
   micErrorText,
-  playCue,
   statusErrorKind,
   type Cue,
+  type CueReport,
   type ErrorKind,
   type Line,
   type Phase,
@@ -56,6 +58,10 @@ const NO_AGENT = "The voice service did not answer the call."
 const MUTE_ERROR_MS = 4000
 /** "<n>:<elapsedMs>:<silenceMs>" while a stopped caller's turn waits out the silence that sends it. */
 const PENDING_ATTR = "nanoclaw.voice.pending"
+/** The page's JSON CueReport, to the worker only: what became of each sound cue, for its log. */
+const CUE_TOPIC = "nanoclaw.voice.cue"
+/** Cue reports kept while the worker is not in the room yet (the context's first states). */
+const MAX_QUEUED_CUE_REPORTS = 20
 /** One JSON CallReplyInfo right before each line the worker speaks. */
 const REPLY_TOPIC = "nanoclaw.voice.reply"
 /** "1" when the worker runs review mode; the page offers it only then. */
@@ -130,8 +136,11 @@ function endReasonText(metadata: string | undefined): string | null {
 
 /** What became of a caller turn, with its final text when there is one. */
 type SettledTurn = { turn: number; status: "sent" | "lost"; reason?: TurnMark["reason"]; text?: string }
-/** The worker says "sending" the moment a turn closes, before its outcome; a sent review draft's carries its text. */
-type TurnStatus = SettledTurn | { turn: number; status: "sending"; text?: string; draft?: number }
+/**
+ * The worker says "sending" the moment a turn closes, before its outcome (a sent review draft's carries
+ * its text), and "working" once after "sent" when the agent picked the turn up.
+ */
+type TurnStatus = SettledTurn | { turn: number; status: "sending"; text?: string; draft?: number } | { turn: number; status: "working" }
 
 interface Attempt {
   callId: string | null
@@ -140,7 +149,7 @@ interface Attempt {
 
 function isTurnStatus(v: unknown): v is TurnStatus {
   const s = v as { turn?: unknown; status?: unknown } | null
-  return !!s && typeof s.turn === "number" && (s.status === "sending" || s.status === "sent" || s.status === "lost")
+  return !!s && typeof s.turn === "number" && (s.status === "sending" || s.status === "sent" || s.status === "working" || s.status === "lost")
 }
 
 function tokenError(status: number, body: string): CallError {
@@ -161,7 +170,7 @@ function tokenError(status: number, body: string): CallError {
 function forceRelay(): boolean {
   const param = new URLSearchParams(location.search).get("relay")
   if (param !== null) return param === "1"
-  return /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  return isAppleMobile()
 }
 
 /** The worker's session state, with nanoclaw's thinking on top; null while the session is still starting. */
@@ -246,7 +255,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const mic = useRef<LocalAudioTrack | null>(null)
   const localSid = useRef<string | null>(null)
   const remote = useRef<RemoteTrack | null>(null)
-  const unlockCtx = useRef<AudioContext | null>(null)
+  const cues = useRef<CuePlayer | null>(null)
+  const queuedCueReports = useRef<CueReport[]>([])
   const agentTimer = useRef<number | null>(null)
   const mutedRef = useRef(false)
   const micRaw = useRef(0)
@@ -303,8 +313,21 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
 
   // Never over the agent's own speech.
   const cue = useCallback((kind: Cue) => {
-    if (phaseRef.current !== "talking") playCue(unlockCtx.current, kind)
+    cues.current?.play(kind, phaseRef.current === "talking" ? "talking" : undefined)
   }, [])
+
+  /** One cue report to the worker's log; held until the worker is in the room. */
+  const sendCueReport = useCallback(
+    (report: CueReport) => {
+      const id = agentId.current
+      if (!id || !joinedRef.current) {
+        if (queuedCueReports.current.length < MAX_QUEUED_CUE_REPORTS) queuedCueReports.current.push(report)
+        return
+      }
+      room.localParticipant.sendText(JSON.stringify(report), { topic: CUE_TOPIC, destinationIdentities: [id], compress: false }).catch(() => {})
+    },
+    [room]
+  )
 
   const setPhase = useCallback((p: Phase) => {
     phaseRef.current = p
@@ -374,8 +397,9 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       localSid.current = null
       remote.current?.detach()
       remote.current = null
-      unlockCtx.current?.close().catch(() => {})
-      unlockCtx.current = null
+      cues.current?.close()
+      cues.current = null
+      queuedCueReports.current = []
       if (audioRef.current) audioRef.current.srcObject = null
       micRaw.current = 0
       agentRaw.current = 0
@@ -507,6 +531,12 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     }
   }, [room, end, resyncReview])
 
+  // The worker is in the room: the cue reports held until now go to it.
+  useEffect(() => {
+    if (!joined || !agent) return
+    for (const report of queuedCueReports.current.splice(0)) sendCueReport(report)
+  }, [joined, agent, sendCueReport])
+
   // The agent's state drives the phase once the caller is in the room.
   useEffect(() => {
     if (!joined || !agent || !agentAttributes) return
@@ -607,6 +637,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (!active.current) return
     let next = linesRef.current
     let closed = false
+    let working = false
     let delivery: ReviewState["delivery"] = null
     for (const s of turnStreams) {
       if (doneTurns.current.has(s.streamInfo.id)) continue
@@ -619,6 +650,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       doneTurns.current.add(s.streamInfo.id)
       if (!isTurnStatus(status)) continue
       maxTurn.current = Math.max(maxTurn.current, status.turn)
+      // The agent picked a sent turn up: a cue, no change to the turn's mark.
+      if (status.status === "working") {
+        working = true
+        continue
+      }
       let shown = shownTurns.current.get(status.turn)
       if (shown === undefined) shownTurns.current.set(status.turn, (shown = shownTurns.current.size + 1))
       const fromDraft = status.status === "sending" ? typeof status.draft === "number" : reviewTurns.current.has(status.turn)
@@ -645,6 +681,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       updateReview((r) => ({ ...r, delivery: d }))
     }
     if (closed) cue("sent")
+    else if (working) cue("working")
   }, [turnStreams, commitLines, cue, updateReview])
 
   const start = useCallback(async () => {
@@ -689,12 +726,12 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     attempt.current = a
     active.current = true
     // Inside the click, before any await: iOS unlocks audio output only on a user gesture.
-    try {
-      unlockCtx.current = new AudioContext()
-      void unlockCtx.current.resume().catch(() => {})
-    } catch {
-      /* no Web Audio; the element below still unlocks */
-    }
+    queuedCueReports.current = []
+    cues.current?.close()
+    cues.current = new CuePlayer((report) => {
+      if (generation.current === mine) sendCueReport(report)
+    })
+    cues.current.unlock()
     audioRef.current?.play().catch(() => {})
     room.startAudio().catch(() => {})
     try {
@@ -766,7 +803,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       if (cancelled()) return
       fail(micErrorText(err) ?? (err instanceof Error ? err.message : String(err)), micErrorKind(err) ?? (err instanceof CallError ? err.kind : "other"))
     }
-  }, [token, room, commitLines, endOnServer, fail, setPhase, setStreaming, setJoined, updateReview])
+  }, [token, room, commitLines, endOnServer, fail, setPhase, setStreaming, setJoined, updateReview, sendCueReport])
 
   const endCall = useCallback(() => end(true, "Call ended."), [end])
 

@@ -110,10 +110,10 @@ export const PAGE_CLOSED = "The call ended when the page was closed."
 /**
  * The call's sound cues, for a caller who is not looking at the screen: `listening` once the
  * worker hears the caller (in review: once talk opened the microphone), `sent` the moment a turn
- * closes, `turn` when the agent is done and the microphone is open again, `draft` when a review
- * draft is ready to read.
+ * closes, `working` once the agent has picked that turn up, `turn` when the agent is done and the
+ * microphone is open again, `draft` when a review draft is ready to read.
  */
-export type Cue = "listening" | "sent" | "turn" | "draft"
+export type Cue = "listening" | "sent" | "working" | "turn" | "draft"
 
 /** Each cue's notes as [Hz, start s, length s], and their peak gain. */
 const CUES: Record<Cue, { notes: ReadonlyArray<readonly [hz: number, at: number, len: number]>; peak: number }> = {
@@ -121,6 +121,8 @@ const CUES: Record<Cue, { notes: ReadonlyArray<readonly [hz: number, at: number,
   listening: { notes: [[784, 0, 0.09], [1175, 0.1, 0.11]], peak: 0.22 },
   // One short high tick: the turn is on its way.
   sent: { notes: [[1760, 0, 0.06]], peak: 0.3 },
+  // Two soft taps on one note, quieter than the tick: the agent has it and is working.
+  working: { notes: [[698, 0, 0.05], [698, 0.14, 0.05]], peak: 0.13 },
   // A falling third, like a doorbell: over to the caller.
   turn: { notes: [[1319, 0, 0.09], [1047, 0.11, 0.12]], peak: 0.22 },
   // Two soft low notes, quieter than the rest: words to read, nothing sent.
@@ -130,26 +132,202 @@ const CUES: Record<Cue, { notes: ReadonlyArray<readonly [hz: number, at: number,
 /** After a reply, the "your turn" cue waits this long for the next queued line to show up. */
 export const TURN_CUE_DELAY_MS = 600
 
+/** How long a cue waits for a suspended or interrupted context to run again; past it the cue is stale. */
+const CUE_RESUME_MS = 800
+
+type ContextState = "running" | "suspended" | "interrupted" | "closed" | "none"
+
 /**
- * Plays a cue on the gesture-unlocked context; nothing without one that runs, or when the link
- * says `?cues=0`. Short pure sine notes, mid-to-high so a phone speaker carries them.
+ * What became of one cue (`cue` set), or (`cue` absent) the audio context changing state; the
+ * page sends each to the worker's log (`CueReport` in the protocol). Fixed values only.
  */
-export function playCue(ctx: AudioContext | null, cue: Cue) {
-  if (!ctx || ctx.state !== "running" || new URLSearchParams(location.search).get("cues") === "0") return
-  const { notes, peak } = CUES[cue]
-  for (const [hz, at, len] of notes) {
-    const t = ctx.currentTime + at
-    const osc = ctx.createOscillator()
-    const gain = ctx.createGain()
-    osc.type = "sine"
-    osc.frequency.value = hz
-    gain.gain.setValueAtTime(0.0001, t)
-    gain.gain.linearRampToValueAtTime(peak, t + 0.005)
-    gain.gain.exponentialRampToValueAtTime(0.0001, t + len)
-    osc.connect(gain).connect(ctx.destination)
-    osc.start(t)
-    osc.stop(t + len + 0.01)
+export interface CueReport {
+  cue?: Cue
+  result?: "played" | "skipped"
+  reason?: "talking" | "off" | "no-context" | "suspended" | "interrupted" | "closed" | "resume-failed"
+  ctx: ContextState
+  out?: "element" | "direct"
+  resumed?: "suspended" | "interrupted"
+  hidden?: true
+}
+
+/** An iPhone or iPad: an iPad's Safari says MacIntel, with touch. */
+export function isAppleMobile(): boolean {
+  return /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+}
+
+const stateOf = (ctx: AudioContext | null): ContextState => (ctx ? (ctx.state as ContextState) : "none")
+
+/**
+ * The cues' sound, on one context unlocked by the tap that starts the call. Short pure sine notes,
+ * mid-to-high so a phone speaker carries them; nothing with `?cues=0`.
+ *
+ * On iOS the cues go out as a media stream through their own audio element, not straight to the
+ * context's speaker output: while the microphone is captured, iOS Safari turns down Web Audio and
+ * other non-MediaStream audio, and only MediaStreamTrack audio (the agent's voice) keeps its level
+ * (WebKit bug 236219). `?cueout=element` or `?cueout=direct` picks the path anywhere; when the
+ * element is not playing, a cue goes straight out.
+ *
+ * iOS also suspends or interrupts a running context on its own (a call, Siri, the screen): a cue
+ * then asks it to resume and plays only if it runs again within CUE_RESUME_MS, since notes
+ * scheduled on a frozen context would all sound at once when it thaws. Any tap on the page and the
+ * page coming back into view resume it too. `report` hears every cue and every state change.
+ */
+export class CuePlayer {
+  private ctx: AudioContext | null = null
+  private sink: MediaStreamAudioDestinationNode | null = null
+  private el: HTMLAudioElement | null = null
+  private state: ContextState = "none"
+  private readonly report: (r: CueReport) => void
+
+  constructor(report: (r: CueReport) => void = () => {}) {
+    this.report = report
   }
+
+  /** In the tap that starts the call, before any await: iOS unlocks audio output only on a gesture. */
+  unlock(): void {
+    if (!this.ctx || this.ctx.state === "closed") {
+      try {
+        this.ctx = new AudioContext()
+      } catch {
+        this.ctx = null
+        return
+      }
+      this.ctx.addEventListener("statechange", this.onStateChange)
+      document.addEventListener("visibilitychange", this.wake)
+      document.addEventListener("pointerdown", this.wake, true)
+      if (cueOutput() === "element") this.openElement(this.ctx)
+    }
+    const ctx = this.ctx
+    void ctx.resume().catch(() => {})
+    // Older iOS only unlocks output once a source has started inside the gesture.
+    try {
+      const src = ctx.createBufferSource()
+      src.buffer = ctx.createBuffer(1, 1, ctx.sampleRate)
+      src.connect(ctx.destination)
+      src.start()
+    } catch {
+      /* the resume above is the unlock */
+    }
+    void this.el?.play().catch(() => {})
+    // The context's first state, for the log: whether the unlock took.
+    this.onStateChange()
+  }
+
+  /** Play a cue now, or say why not; `skip` is the caller's own reason (the agent is speaking). */
+  play(cue: Cue, skip?: "talking"): void {
+    const ctx = this.ctx
+    const done = (r: Pick<CueReport, "result" | "reason" | "resumed">) => this.report(this.describe({ cue, ...r }))
+    if (skip) return done({ result: "skipped", reason: skip })
+    if (new URLSearchParams(location.search).get("cues") === "0") return done({ result: "skipped", reason: "off" })
+    if (!ctx) return done({ result: "skipped", reason: "no-context" })
+    if (ctx.state === "running") {
+      this.sound(ctx, cue)
+      return done({ result: "played" })
+    }
+    if (ctx.state === "closed") return done({ result: "skipped", reason: "closed" })
+    const from = ctx.state === "interrupted" ? "interrupted" : "suspended"
+    const resumed = ctx.resume().then(
+      () => true,
+      () => false
+    )
+    const late = new Promise<null>((r) => window.setTimeout(() => r(null), CUE_RESUME_MS))
+    void Promise.race([resumed, late]).then((ok) => {
+      if (ok === false) return done({ result: "skipped", reason: "resume-failed" })
+      if (this.ctx !== ctx || ctx.state !== "running") return done({ result: "skipped", reason: ctx.state === "closed" ? "closed" : from })
+      this.sound(ctx, cue)
+      done({ result: "played", resumed: from })
+    })
+  }
+
+  close(): void {
+    document.removeEventListener("visibilitychange", this.wake)
+    document.removeEventListener("pointerdown", this.wake, true)
+    if (this.el) {
+      this.el.pause()
+      this.el.srcObject = null
+      this.el.remove()
+      this.el = null
+    }
+    this.sink = null
+    const ctx = this.ctx
+    this.ctx = null
+    if (ctx) {
+      ctx.removeEventListener("statechange", this.onStateChange)
+      void ctx.close().catch(() => {})
+    }
+  }
+
+  private openElement(ctx: AudioContext) {
+    try {
+      const sink = ctx.createMediaStreamDestination()
+      const el = document.createElement("audio")
+      el.setAttribute("playsinline", "")
+      el.className = "sr-only"
+      el.srcObject = sink.stream
+      document.body.append(el)
+      this.sink = sink
+      this.el = el
+    } catch {
+      this.sink = null
+      this.el = null
+    }
+  }
+
+  private output(): "element" | "direct" {
+    return this.sink && this.el && !this.el.paused ? "element" : "direct"
+  }
+
+  private describe(r: Omit<CueReport, "ctx">): CueReport {
+    return {
+      ...r,
+      ctx: stateOf(this.ctx),
+      ...(this.ctx ? { out: this.output() } : {}),
+      ...(document.visibilityState === "hidden" ? { hidden: true as const } : {}),
+    }
+  }
+
+  private sound(ctx: AudioContext, cue: Cue) {
+    const out: AudioNode = this.output() === "element" && this.sink ? this.sink : ctx.destination
+    const { notes, peak } = CUES[cue]
+    for (const [hz, at, len] of notes) {
+      const t = ctx.currentTime + at
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
+      osc.type = "sine"
+      osc.frequency.value = hz
+      gain.gain.setValueAtTime(0.0001, t)
+      gain.gain.linearRampToValueAtTime(peak, t + 0.005)
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + len)
+      osc.connect(gain).connect(out)
+      osc.start(t)
+      osc.stop(t + len + 0.01)
+    }
+  }
+
+  // iOS can stop the context (or the element) on its own; a tap or the page coming back starts them again.
+  private readonly wake = () => {
+    if (document.visibilityState === "hidden") return
+    const ctx = this.ctx
+    if (ctx && ctx.state !== "running" && ctx.state !== "closed") void ctx.resume().catch(() => {})
+    if (this.el?.paused) void this.el.play().catch(() => {})
+  }
+
+  private readonly onStateChange = () => {
+    const ctx = this.ctx
+    const now = stateOf(ctx)
+    if (now === this.state) return
+    this.state = now
+    this.report(this.describe({}))
+    if (ctx && (now === "suspended" || now === "interrupted")) void ctx.resume().catch(() => {})
+  }
+}
+
+/** Where cues play: `?cueout=element|direct`, else through an element on iOS (see CuePlayer). */
+function cueOutput(): "element" | "direct" {
+  const param = new URLSearchParams(location.search).get("cueout")
+  if (param === "element" || param === "direct") return param
+  return isAppleMobile() ? "element" : "direct"
 }
 
 export function statusErrorKind(status: number): ErrorKind {

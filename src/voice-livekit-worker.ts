@@ -65,6 +65,7 @@ import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   liveKitHostUrl,
+  CALL_CUE_TOPIC,
   CALL_PENDING_ATTRIBUTE,
   CALL_REPLY_TOPIC,
   CALL_REVIEW_ATTRIBUTE,
@@ -75,7 +76,12 @@ import {
   MAX_TURN_TEXT_BYTES,
   REVIEW_RPC,
   WORKER_REQUEST_TIMEOUT_MS,
+  CALL_CUES,
+  CUE_CONTEXT_STATES,
+  CUE_OUTPUTS,
+  CUE_SKIP_REASONS,
   type CallDraft,
+  type CueReport,
   type CallReviewState,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
@@ -153,6 +159,10 @@ export const CLEAR_SETTLE_MS = 300;
 const STALE_STREAM_MS = 2_000;
 /** agents-js's session control topic (its TOPIC_SESSION_MESSAGES), served to the caller unless closed. */
 const SESSION_CONTROL_TOPIC = 'lk.agent.session';
+/** A cue report is a few dozen characters; anything past this is not one. */
+const MAX_CUE_REPORT_CHARS = 512;
+/** Cue reports logged per call; a page gone wrong cannot flood the log. */
+export const MAX_CUE_REPORTS = 500;
 /** Review mode's waits, on the global timers (which tests can fake). */
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 /** VOICE_MAX_SPOKEN_CHARS when unset: 0, no cap; a reply is spoken in full however long it runs. */
@@ -718,6 +728,81 @@ export async function pruneRecordings(root: string, days: number, now = Date.now
   };
   await walk(root);
   return removed;
+}
+
+const oneOf = <T extends string>(set: readonly T[], v: unknown): v is T => set.includes(v as T);
+
+/** A page's cue report, or null for anything that is not exactly one. */
+export function readCueReport(text: string): CueReport | null {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  if (!oneOf(CUE_CONTEXT_STATES, r.ctx)) return null;
+  const report: CueReport = { ctx: r.ctx };
+  if (r.cue !== undefined) {
+    if (!oneOf(CALL_CUES, r.cue) || (r.result !== 'played' && r.result !== 'skipped')) return null;
+    report.cue = r.cue;
+    report.result = r.result;
+    if (r.result === 'skipped') {
+      if (!oneOf(CUE_SKIP_REASONS, r.reason)) return null;
+      report.reason = r.reason;
+    }
+  }
+  if (r.out !== undefined) {
+    if (!oneOf(CUE_OUTPUTS, r.out)) return null;
+    report.out = r.out;
+  }
+  if (r.resumed !== undefined) {
+    if (r.resumed !== 'suspended' && r.resumed !== 'interrupted') return null;
+    report.resumed = r.resumed;
+  }
+  if (r.hidden === true) report.hidden = true;
+  return report;
+}
+
+/** One compact log line for a report: `voice worker: cue sent played ctx=running out=element`. */
+export function cueReportLine(r: CueReport): string {
+  const what = r.cue ? `cue ${r.cue} ${r.result}${r.reason ? ` (${r.reason})` : ''}` : 'cue context changed';
+  const extra = [
+    `ctx=${r.ctx}`,
+    r.out && `out=${r.out}`,
+    r.resumed && `resumed=${r.resumed}`,
+    r.hidden && 'hidden',
+  ].filter(Boolean);
+  return `voice worker: ${what} ${extra.join(' ')}`;
+}
+
+/** A text stream's whole text, or null past `max` characters or on a broken stream. */
+export async function readCueStream(chunks: AsyncIterable<string>, max = MAX_CUE_REPORT_CHARS): Promise<string | null> {
+  let text = '';
+  try {
+    for await (const chunk of chunks) {
+      text += chunk;
+      if (text.length > max) return null;
+    }
+  } catch {
+    return null;
+  }
+  return text;
+}
+
+/** Logs the page's cue reports, one line each, up to MAX_CUE_REPORTS per call. */
+export function cueReportLogger(log: Pick<Console, 'info'>): (text: string | null) => void {
+  let logged = 0;
+  return (text) => {
+    const report = text === null ? null : readCueReport(text);
+    if (!report) return;
+    if (++logged > MAX_CUE_REPORTS) {
+      if (logged === MAX_CUE_REPORTS + 1) log.info('voice worker: further cue reports on this call are not logged');
+      return;
+    }
+    log.info(cueReportLine(report));
+  };
 }
 
 /** VOICE_RECORDINGS_DAYS: 0 (the default) records nothing. */
@@ -1817,6 +1902,15 @@ async function sessionVoice(
   } catch (err) {
     log.warn('voice worker: could not close the session control topic', { err });
   }
+  // The page's cue telemetry: whether each sound cue played on the caller's phone, and why not.
+  const logCue = cueReportLogger(log);
+  try {
+    ctx.room.registerTextStreamHandler(CALL_CUE_TOPIC, (reader, from) => {
+      if (from.identity === meta.callerIdentity) void readCueStream(reader).then(logCue);
+    });
+  } catch (err) {
+    log.warn('voice worker: could not take the page cue reports', { err });
+  }
   return {
     say,
     setThinking(thinking) {
@@ -2133,8 +2227,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           pickedUp = lastAccepted;
           publish({ turn: lastAccepted, status: 'working' });
         }
-      }
-      else if (event.type === 'chat') turnTaking.onChat(event.chat);
+      } else if (event.type === 'chat') turnTaking.onChat(event.chat);
       else if (event.type === 'turn-stored') {
         const late = unconfirmed.get(event.turnKey);
         if (!late) return;

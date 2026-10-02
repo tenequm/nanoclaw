@@ -33,11 +33,16 @@ import {
 import {
   AWAIT_REPLY_MS,
   capSpokenText,
+  cueReportLine,
+  cueReportLogger,
   CUT_LINES,
   DEFAULT_MAX_SPOKEN_CHARS,
   FAILURE_LINES,
   GeminiTranscribeSTT,
   HostLink,
+  MAX_CUE_REPORTS,
+  readCueReport,
+  readCueStream,
   hostLossReason,
   interactionText,
   languageOf,
@@ -196,6 +201,92 @@ function audioFrames(ms: number, value = 0) {
   const samples = (16 * ms) | 0;
   return new AudioFrame(new Int16Array(samples).fill(value), 16_000, 1, samples);
 }
+
+describe('page cue reports', () => {
+  it('reads a cue attempt or a context change, and nothing outside the fixed sets', () => {
+    expect(readCueReport('{"cue":"sent","result":"played","ctx":"running","out":"element"}')).toEqual({
+      cue: 'sent',
+      result: 'played',
+      ctx: 'running',
+      out: 'element',
+    });
+    expect(
+      readCueReport(
+        '{"cue":"working","result":"played","ctx":"running","out":"direct","resumed":"interrupted","hidden":true}',
+      ),
+    ).toEqual({
+      cue: 'working',
+      result: 'played',
+      ctx: 'running',
+      out: 'direct',
+      resumed: 'interrupted',
+      hidden: true,
+    });
+    expect(readCueReport('{"cue":"turn","result":"skipped","reason":"suspended","ctx":"suspended"}')).toEqual({
+      cue: 'turn',
+      result: 'skipped',
+      reason: 'suspended',
+      ctx: 'suspended',
+    });
+    expect(readCueReport('{"ctx":"interrupted","hidden":true,"extra":"dropped"}')).toEqual({
+      ctx: 'interrupted',
+      hidden: true,
+    });
+    for (const bad of [
+      'not json',
+      '[]',
+      'null',
+      '{"cue":"sent","result":"played"}',
+      '{"cue":"sent","result":"played","ctx":"running; rm"}',
+      '{"cue":"hello caller","result":"played","ctx":"running"}',
+      '{"cue":"sent","ctx":"running"}',
+      '{"cue":"sent","result":"skipped","ctx":"running"}',
+      '{"cue":"sent","result":"skipped","reason":"because","ctx":"running"}',
+      '{"ctx":"running","out":"speaker"}',
+      '{"ctx":"running","resumed":"running"}',
+    ]) {
+      expect(readCueReport(bad)).toBeNull();
+    }
+  });
+
+  it('logs one compact line per report', () => {
+    expect(cueReportLine({ cue: 'sent', result: 'played', ctx: 'running', out: 'element' })).toBe(
+      'voice worker: cue sent played ctx=running out=element',
+    );
+    expect(cueReportLine({ cue: 'sent', result: 'skipped', reason: 'talking', ctx: 'running', out: 'direct' })).toBe(
+      'voice worker: cue sent skipped (talking) ctx=running out=direct',
+    );
+    expect(cueReportLine({ cue: 'turn', result: 'played', ctx: 'running', resumed: 'interrupted', hidden: true })).toBe(
+      'voice worker: cue turn played ctx=running resumed=interrupted hidden',
+    );
+    expect(cueReportLine({ ctx: 'interrupted', out: 'element' })).toBe(
+      'voice worker: cue context changed ctx=interrupted out=element',
+    );
+  });
+
+  it('reads a report stream whole, refuses an oversized or broken one, and caps the lines per call', async () => {
+    async function* chunks(...parts: string[]) {
+      yield* parts;
+    }
+    expect(await readCueStream(chunks('{"ctx":', '"running"}'))).toBe('{"ctx":"running"}');
+    expect(await readCueStream(chunks('x'.repeat(300), 'y'.repeat(300)))).toBeNull();
+    async function* broken() {
+      yield '{"ctx"';
+      throw new Error('stream reset');
+    }
+    expect(await readCueStream(broken())).toBeNull();
+
+    const info = vi.fn();
+    const logCue = cueReportLogger({ info });
+    logCue('{"cue":"listening","result":"played","ctx":"running","out":"element"}');
+    logCue('garbage');
+    logCue(null);
+    expect(info.mock.calls).toEqual([['voice worker: cue listening played ctx=running out=element']]);
+    for (let i = 0; i < MAX_CUE_REPORTS + 5; i++) logCue('{"ctx":"running"}');
+    expect(info).toHaveBeenCalledTimes(MAX_CUE_REPORTS + 1);
+    expect(info).toHaveBeenLastCalledWith('voice worker: further cue reports on this call are not logged');
+  });
+});
 
 describe('GeminiTranscribeSTT', () => {
   const answer = {
@@ -721,9 +812,16 @@ describe('runCall', () => {
     host.emit({ type: 'working' });
     // Turn 3 is picked up while its answer is still to come.
     v.events.onTurn('Thanks', { sttModel: 'gemini-3.5-transcribe-live' });
-    await vi.waitFor(() => expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 3, status: 'sent', text: 'Thanks' }));
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 3, status: 'sent', text: 'Thanks' }),
+    );
     host.emit({ type: 'working' });
-    await vi.waitFor(() => expect(working()).toEqual([{ turn: 1, status: 'working' }, { turn: 3, status: 'working' }]));
+    await vi.waitFor(() =>
+      expect(working()).toEqual([
+        { turn: 1, status: 'working' },
+        { turn: 3, status: 'working' },
+      ]),
+    );
     host.endStream();
   });
 

@@ -680,13 +680,30 @@ token reply carries `silenceMs` and `limit: {ms, kind: "duration" | "daily"}`:
 the listening hint names the pause that sends a turn, a thin line under the
 readout fills while `nanoclaw.voice.pending` counts down, caller lines show
 "turn n" and the first caption of a reply "re: turn n" (or "unprompted"), and a
-minute before the limit the hint says the call is about to end. Three short Web
+minute before the limit the hint says the call is about to end. Short Web
 Audio cues let a caller follow the call without looking: a rising two-note
 (listening) once the worker's session hears the published microphone, a single
-high tick (sent) on a turn's "sending", and a falling two-note (your turn) once
-the agent is done and nothing else is queued. None plays while the agent speaks;
-the later "sent" is the caption mark alone. `?cues=0` turns them off, and
-`?demo=1` plays them too once its Call button is tapped. Microphone capture runs
+high tick (sent) on a turn's "sending", two soft taps on one low note (working)
+on its "working", once the agent has picked the turn up, and a falling two-note
+(your turn) once the agent is done and nothing else is queued. None plays while
+the agent speaks; the later "sent" is the caption mark alone. `?cues=0` turns
+them off, and `?demo=1` plays them too once its Call button is tapped. The cues
+run on one context unlocked by the Call tap. On iOS they play as a media stream
+through their own audio element, since iOS Safari turns Web Audio down while the
+microphone is captured and keeps only MediaStreamTrack audio (the agent's voice)
+at its level (WebKit bug 236219); elsewhere they go straight out, and
+`?cueout=element` / `?cueout=direct` picks either path. iOS also suspends or
+interrupts the context on its own (a call, Siri, the screen): a cue then resumes
+it first and plays only if it runs again within 0.8 s (a frozen context would
+play the queued notes all at once later), and a tap or the page coming back
+resumes it too. For every cue it tries and every state change of that context,
+the page sends one JSON `CueReport` (`{"cue"?, "result"?: "played" | "skipped",
+"reason"?, "ctx", "out"?, "resumed"?, "hidden"?}`, fixed values only) to the
+worker on `nanoclaw.voice.cue`, and the worker logs one line each (`voice
+worker: cue sent played ctx=running out=element`, `... cue sent skipped
+(interrupted) ctx=interrupted out=element`, `... cue context changed
+ctx=interrupted`), at most 500 per call and only from the caller.
+Microphone capture runs
 with echo cancellation, noise suppression and auto gain; DTX is off because the
 worker times turns by the silence it hears. On iOS Safari the call must be
 started with the Call button (audio unlocks on that tap) and joins relay-only
@@ -727,7 +744,8 @@ was heard"); talk waits while the agent speaks, but a draft can be sent then as
 a follow-up. Switching auto to review mid-turn cancels the pending auto commit
 and makes the unsent words a draft; if the commit already went, the page says
 "previous turn already submitted". Back to auto needs no open draft and leaves
-the microphone muted. A quiet two-note cue says a draft is ready to read; a call
+the microphone muted. A quiet two-note cue says a draft is ready to read, and a
+sent draft gets the same sent and working cues as an auto turn; a call
 that ends with a draft keeps it readable until discarded, never sent into the
 next call. Auto mode is unchanged.
 

@@ -96,6 +96,43 @@ export interface CallTurnStatus {
   draft?: number;
 }
 
+/**
+ * Text stream topic the page sends one JSON `CueReport` on, to the worker only, for every sound cue
+ * it tries to play and every state change of its audio context, so a silent cue on a real phone
+ * leaves a trace in the worker's log. Additive to v4: an older worker has no handler for it.
+ */
+export const CALL_CUE_TOPIC = 'nanoclaw.voice.cue';
+export const CALL_CUES = ['listening', 'sent', 'working', 'turn', 'draft'] as const;
+/** Why a cue was not played: the agent was speaking, `?cues=0`, no Web Audio, or a context that would not run. */
+export const CUE_SKIP_REASONS = [
+  'talking',
+  'off',
+  'no-context',
+  'suspended',
+  'interrupted',
+  'closed',
+  'resume-failed',
+] as const;
+/** An AudioContext's state as the page saw it; `interrupted` is WebKit's (iOS: a call, Siri, a locked screen). */
+export const CUE_CONTEXT_STATES = ['running', 'suspended', 'interrupted', 'closed', 'none'] as const;
+/** Where a cue's sound went: an audio element playing the context as a media stream, or straight out. */
+export const CUE_OUTPUTS = ['element', 'direct'] as const;
+
+/**
+ * One cue attempt (`cue` with `result`), or (`cue` absent) the page's audio context changing state.
+ * `resumed`: the context was in that state and the cue resumed it first. `hidden`: the page was not
+ * visible. Every field is from a fixed set, so a report can carry nothing about the caller.
+ */
+export interface CueReport {
+  cue?: (typeof CALL_CUES)[number];
+  result?: 'played' | 'skipped';
+  reason?: (typeof CUE_SKIP_REASONS)[number];
+  ctx: (typeof CUE_CONTEXT_STATES)[number];
+  out?: (typeof CUE_OUTPUTS)[number];
+  resumed?: 'suspended' | 'interrupted';
+  hidden?: true;
+}
+
 /** The host takes a caller turn of at most this many UTF-8 bytes; a longer review draft cannot be sent. */
 export const MAX_TURN_TEXT_BYTES = 8 * 1024;
 

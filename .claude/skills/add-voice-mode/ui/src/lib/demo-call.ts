@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { LIVE_PHASES, TURN_CUE_DELAY_MS, playCue, type Line, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "./voice-call"
+import { CuePlayer, LIVE_PHASES, TURN_CUE_DELAY_MS, type Cue, type Line, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "./voice-call"
 import { INITIAL_REVIEW, type ReviewState, type TurnMode } from "./review"
 
 /**
@@ -7,8 +7,9 @@ import { INITIAL_REVIEW, type ReviewState, type TurnMode } from "./review"
  * `?demo=review` (review mode): the page can be tried without a microphone or a wired agent, and
  * every state can be looked at; `&step=<n>` stops the script at step n. Nothing here touches the
  * host; the words and the levels are made up. The sound cues play where a real call plays them
- * (`?cues=0` silences them); a browser that blocks autoplay keeps the self-started first run
- * silent until the Call button is tapped.
+ * (`?cues=0` silences them), and what a real call would report to the worker about each goes to
+ * the console instead; a browser that blocks autoplay keeps the self-started first run silent until
+ * the Call button is tapped.
  */
 
 type Step = {
@@ -32,6 +33,8 @@ type Step = {
   sentDraft?: string
   /** The newest caller line's mark changes to this. */
   mark?: TurnMark
+  /** The agent picks the sent turn up partway through this step: the working cue. */
+  working?: boolean
   muted?: boolean
   reconnecting?: boolean
 }
@@ -42,7 +45,7 @@ const AGENT = "Casa"
 const SCRIPT: Step[] = [
   { phase: "connecting", ms: 1300 },
   { phase: "listening", ms: 3600, from: "user", text: "Hey Casa, what did we decide about the launch date?", pause: true },
-  { phase: "thinking", ms: 1700, sent: true },
+  { phase: "thinking", ms: 1700, sent: true, working: true },
   {
     phase: "talking",
     ms: 4800,
@@ -52,7 +55,7 @@ const SCRIPT: Step[] = [
   },
   { phase: "talking", ms: 3200, from: "assistant", text: "Also, the venue confirmed the booking for Friday.", re: "unprompted" },
   { phase: "listening", ms: 3000, from: "user", text: "Yes, and let Laura know.", pause: true },
-  { phase: "thinking", ms: 2400, sent: true, limit: true },
+  { phase: "thinking", ms: 2400, sent: true, limit: true, working: true },
   {
     phase: "talking",
     ms: 3800,
@@ -77,7 +80,7 @@ const REVIEW_SCRIPT: Step[] = [
   { phase: "listening", ms: 3000, review: { draft: { id: 1, state: "ready", text: DRAFT_1 } } },
   { phase: "listening", ms: 600, review: { draft: { id: 1, state: "ready", text: DRAFT_1 }, pending: { op: "send" } } },
   { phase: "listening", ms: 900, review: { delivery: "sending" }, sentDraft: DRAFT_1 },
-  { phase: "thinking", ms: 2400, review: { delivery: "sent" }, mark: { status: "sent" } },
+  { phase: "thinking", ms: 2400, review: { delivery: "sent" }, mark: { status: "sent" }, working: true },
   { phase: "talking", ms: 4000, from: "assistant", text: "Booked Tavola for eight. Want it on your calendar too?", re: "re: turn 1", review: { delivery: "sent" } },
   { phase: "listening", ms: 2000, review: { delivery: "sent" } },
   { phase: "listening", ms: 2600, review: { draft: { id: 2, state: "recording", text: "" }, micOn: true, provisional: "Yes, and also remind me to" } },
@@ -111,6 +114,8 @@ const REVIEW_SCRIPT: Step[] = [
 const DEMO_SILENCE_MS = 2500
 /** How long after a turn closes the agent's session confirms it. */
 const DEMO_STORED_MS = 500
+/** How far into a working step the agent picks the turn up. */
+const DEMO_PICKUP_MS = 900
 
 export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", stopAt: number | null = null): VoiceCall {
   const [phase, setPhase] = useState<Phase>("idle")
@@ -134,7 +139,8 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
   const inputLevel = useRef(0)
   const outputLevel = useRef(0)
   const audioRef = useRef<HTMLAudioElement | null>(null)
-  const cueCtx = useRef<AudioContext | null>(null)
+  const cues = useRef<CuePlayer | null>(null)
+  const cue = useCallback((kind: Cue) => cues.current?.play(kind), [])
   const script = useRef<Step[]>(initialMode === "review" ? REVIEW_SCRIPT : SCRIPT)
   phaseRef.current = phase
   mutedRef.current = muted
@@ -209,12 +215,12 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
       if (step.sentDraft) {
         const turn = ++turns.current
         setLines((prev) => [...prev, { id: nextId.current++, from: "user", text: step.sentDraft!, at: secondsIn(), turn, mark: { status: "sending" } }])
-        if (!instant) playCue(cueCtx.current, "sent")
+        if (!instant) cue("sent")
       }
       if (step.mark) markLastUser(step.mark)
-      if (!instant && next.draft?.state === "ready" && step.phase !== "talking" && !next.pending && !next.micError) playCue(cueCtx.current, "draft")
+      if (!instant && next.draft?.state === "ready" && step.phase !== "talking" && !next.pending && !next.micError) cue("draft")
     },
-    [later, markLastUser]
+    [later, markLastUser, cue]
   )
 
   const runStep = useCallback(
@@ -232,10 +238,10 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
       }
       // As on a real call: listening once connected, your turn once the agent is done.
       const was = phaseRef.current
-      if (!instant && was === "connecting" && step.phase === "listening") playCue(cueCtx.current, "listening")
+      if (!instant && was === "connecting" && step.phase === "listening") cue("listening")
       if (!instant && was === "talking" && step.phase === "listening") {
         later(() => {
-          if (phaseRef.current === "listening") playCue(cueCtx.current, "turn")
+          if (phaseRef.current === "listening") cue("turn")
         }, TURN_CUE_DELAY_MS)
       }
       phaseRef.current = step.phase
@@ -248,8 +254,13 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
         later(() => setSendCue({ id: `demo-${i}`, from: 1 - left / DEMO_SILENCE_MS, ms: left }), step.ms - left)
         later(() => {
           setSendCue(null)
-          playCue(cueCtx.current, "sent")
+          cue("sent")
         }, step.ms)
+      }
+      if (step.working && !instant) {
+        later(() => {
+          if (phaseRef.current === "thinking") cue("working")
+        }, Math.min(DEMO_PICKUP_MS, step.ms / 2))
       }
       if (step.sent) {
         const turn = ++turns.current
@@ -265,16 +276,12 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
       if (stopAt !== null && i >= stopAt) return
       later(() => runStep(i + 1), step.ms)
     },
-    [later, streamLine, clearTimers, applyReview, stopAt]
+    [later, streamLine, clearTimers, applyReview, stopAt, cue]
   )
 
   const start = useCallback(() => {
-    try {
-      cueCtx.current ??= new AudioContext()
-      void cueCtx.current.resume().catch(() => {})
-    } catch {
-      /* no Web Audio: a silent demo */
-    }
+    cues.current ??= new CuePlayer((report) => console.debug("[cue]", JSON.stringify(report)))
+    cues.current.unlock()
     clearTimers()
     setLines([])
     setMuted(false)
@@ -313,8 +320,8 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
 
   useEffect(
     () => () => {
-      void cueCtx.current?.close().catch(() => {})
-      cueCtx.current = null
+      cues.current?.close()
+      cues.current = null
     },
     []
   )
