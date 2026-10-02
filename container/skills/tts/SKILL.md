@@ -9,7 +9,7 @@ description: >-
   speak when asked or when voice genuinely improves the moment.
 metadata:
   author: nanoclaw
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Text-to-Speech (voice notes)
@@ -54,8 +54,11 @@ short caption.
 - `--voice <name>` — default `Alnilam` (firm, masculine). Other voices include `Puck`,
   `Charon`, `Aoede`, `Leda`, `Fenrir`, `Zephyr` (30 total). Pick one that fits
   the persona and keep it consistent.
-- `--model <id>` — default `gemini-3.1-flash-tts-preview` (latest, most
-  expressive). Don't change unless you have a reason.
+- `--model <id>` — default `gemini-3.8-flash-tts`. Don't change unless you
+  have a reason.
+- `--fallback-model <id>` — default `gemini-3.8-flash-lite-tts`. Used once when
+  the main model stays overloaded (429/503 after one retry), is not found (404),
+  or keeps returning no audio. Pass the same id as `--model` to disable the fallback.
 - `--out <file>` — output filename (default `voice.ogg`). Must end in `.ogg`
   for a Telegram voice bubble; other audio extensions are sent as music files.
 

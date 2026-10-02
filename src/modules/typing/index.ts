@@ -40,7 +40,8 @@
  *
  * Default module status:
  *   - Lives in src/modules/ for signaling (not really core), but ships
- *     on main and is imported directly by core. No registry, no hook.
+ *     on main and is imported directly by core. One observer hook
+ *     (registerTypingObserver) lets the voice channel follow a chat's ticks.
  *   - Removing requires editing src/router.ts, src/delivery.ts, and
  *     src/container-runner.ts to drop the calls.
  */
@@ -198,6 +199,37 @@ function signalFailed(op: string, fields: Record<string, unknown>, err: unknown)
   log.warn('activity signal failed', { op, ...fields, err: String(err) });
 }
 
+/** One working tick of an agent in a chat. */
+export interface TypingTick {
+  agentGroupId: string;
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+}
+
+/**
+ * Sees every working tick, whatever the chat's rendering (a status, or the
+ * one-shot reaction ack), so an agent's activity can be shown elsewhere too
+ * (a live voice call).
+ */
+export type TypingObserver = (tick: TypingTick) => void;
+
+const typingObservers: TypingObserver[] = [];
+
+export function registerTypingObserver(observer: TypingObserver): void {
+  typingObservers.push(observer);
+}
+
+function notifyObservers({ agentGroupId, channelType, platformId, threadId }: TypingTarget): void {
+  for (const observe of typingObservers) {
+    try {
+      observe({ agentGroupId, channelType, platformId, threadId });
+    } catch (err) {
+      signalFailed('typingObserver', { channelType, platformId, threadId }, err);
+    }
+  }
+}
+
 async function triggerTyping(
   channelType: string,
   platformId: string,
@@ -238,6 +270,7 @@ function resolveMode(channelType: string, threadId: string | null, instance?: st
 
 /** Paint the entry's signal: a typing tick, or the one-shot reaction ack. */
 function paintSignal(entry: TypingTarget): void {
+  notifyObservers(entry);
   if (entry.mode === 'status') {
     triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
     return;
@@ -281,10 +314,12 @@ function clearSignal(entry: TypingTarget): void {
  * carrying the status text (and `statusKind: 'agent'`) when there is one to
  * show. The cadence never depends on the text, so channels that cannot
  * show it keep their indicator alive exactly as before. A reaction ack does
- * not expire, so only the status rendering re-fires.
+ * not expire, so only the status rendering re-fires; observers see every tick.
  */
 function refresh(entry: TypingTarget, showStatus: boolean): void {
-  if (entry.mode !== 'status' || entry.capped) return;
+  if (entry.capped) return;
+  notifyObservers(entry);
+  if (entry.mode !== 'status') return;
   const text = showStatus ? entry.presence?.status?.text : undefined;
   if (text) {
     triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance, text, 'agent').catch(() => {});

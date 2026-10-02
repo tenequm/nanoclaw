@@ -1,5 +1,5 @@
 /**
- * Shared authorization helper for the member-runnable read (/status).
+ * Shared authorization helpers for the member-runnable read (/status) and /voice.
  *
  * The router intercepts host commands BEFORE the per-agent fan-out (which is
  * where sender_scope / access gating normally runs), and the telegram adapter
@@ -14,6 +14,7 @@
  * Typography: ASCII only in strings/comments.
  */
 import { canAccessAgentGroup } from '../modules/permissions/access.js';
+import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 
 export type StatusAccessDecision = 'allowed' | 'refuse' | 'drop';
 
@@ -23,4 +24,14 @@ export async function statusAccess(userId: string | null, agentGroupId: string):
   const decision = await canAccessAgentGroup(userId, agentGroupId);
   if (decision.allowed) return 'allowed';
   return decision.reason === 'unknown_user' ? 'drop' : 'refuse';
+}
+
+/**
+ * The same tri-state for /voice, which hands out the agent's call link and so
+ * is admin-only: a member who is not an admin is refused.
+ */
+export async function voiceAccess(userId: string | null, agentGroupId: string): Promise<StatusAccessDecision> {
+  const member = await statusAccess(userId, agentGroupId);
+  if (member !== 'allowed' || !userId) return member;
+  return (await hasAdminPrivilege(userId, agentGroupId)) ? 'allowed' : 'refuse';
 }

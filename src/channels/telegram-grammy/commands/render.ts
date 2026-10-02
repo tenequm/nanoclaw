@@ -31,6 +31,7 @@ import type {
   RestartView,
   StatusView,
   TargetAgent,
+  VoiceCommandOutcome,
 } from '../../../commands/index.js';
 import { renderFS } from '../formatter.js';
 
@@ -150,4 +151,9 @@ export function agentPickerPrompt(command: CommandName, agents: readonly TargetA
 /** Human-readable message for a command failure (data -> prose). */
 export function failureMessage(failure: CommandFailure): string {
   return cards.failureMessage(failure);
+}
+
+/** The /voice reply (the call link), or null when the sender gets no answer. */
+export function voiceCommandReply(outcome: VoiceCommandOutcome): string | null {
+  return cards.voiceCommandReply(outcome, MD_FMT);
 }

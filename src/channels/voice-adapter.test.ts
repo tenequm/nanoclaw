@@ -22,12 +22,18 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { ChannelAdapter, InboundMessage } from './adapter.js';
 import type { ResolveLineOptions } from './gpt-live-prompt.js';
 import {
+  admitsVoicePeer,
   createGptLiveAdapter,
   delegationMessageId,
   DELEGATION_TIMEOUT_LINE,
   lineIdForToken,
+  parseCidrs,
+  voiceRoute,
   type GptLiveConfig,
+  type VoiceProxyPolicy,
 } from './voice.js';
+import type { LiveKitServerApi, MirrorApi } from './voice-livekit.js';
+import type { LiveKitJobMetadata } from './voice-livekit-protocol.js';
 
 /** What NanoClaw calls the line: a hash of the token, never the token. */
 const LINE = lineIdForToken('tok123');
@@ -304,6 +310,24 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     const csp = res.headers.get('content-security-policy') ?? '';
     expect(csp).toContain("frame-ancestors 'none'");
     expect(csp).toContain("connect-src 'self'");
+  });
+
+  it('serves the call page and its routes under the short /voice prefix too', async () => {
+    const root = base.replace(/\/webhook\/voice$/, '');
+    const page = await fetch(`${root}/voice/call?t=tok123`);
+    expect(page.status).toBe(200);
+    expect(page.headers.get('x-frame-options')).toBe('DENY');
+    expect(await page.text()).toContain('RTCPeerConnection');
+    const info = await fetch(`${root}/voice/info?t=tok123`);
+    expect(info.status).toBe(200);
+    expect(await info.json()).toEqual({ agent: 'Andy 🐾', caller: 'Ethan' });
+    expect((await fetch(`${root}/voice/sdp?t=nope`, { method: 'POST', body: 'v=0\r\noffer' })).status).toBe(403);
+    expect((await fetch(`${root}/voice/hangup?t=tok123&session=none`, { method: 'POST' })).status).toBe(204);
+    // The walkie page lives at the bare prefix; LiveKit is off on this host.
+    expect((await fetch(`${root}/voice?t=tok123`)).status).toBe(503);
+    expect((await fetch(`${root}/voice/sip`, { method: 'POST' })).status).toBe(404);
+    expect((await fetch(`${root}/voicemail?t=tok123`)).status).toBe(404);
+    expect(fake.sessionCreates).toHaveLength(0);
   });
 
   it('refuses an SDP offer without a known link token', async () => {
@@ -860,52 +884,56 @@ describe('voice delegation deadlines, daily budget and teardown races', () => {
     await vi.waitFor(() => expect(fake.hangups).toContain(sessionId), { timeout: 2000 });
   });
 
-  it('the newest call wins across engines, and each engine keeps its own charge', async () => {
+  it('the newest call wins across engines, and the daily minutes are shared', async () => {
     const MIN = 60_000;
-    const google = http.createServer((req, res) => {
-      req.resume();
-      req.on('end', () => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ name: 'auth_tokens/fake' }));
-      });
+    const rooms: string[] = [];
+    const deleted: string[] = [];
+    const dispatches: LiveKitJobMetadata[] = [];
+    const api: LiveKitServerApi = {
+      createRoom: async (options) => {
+        rooms.push(options.name);
+        return {};
+      },
+      deleteRoom: async (room) => {
+        deleted.push(room);
+      },
+      createDispatch: async (_room, _agent, options) => {
+        dispatches.push(JSON.parse(options.metadata) as LiveKitJobMetadata);
+        return {};
+      },
+      updateRoomMetadata: async () => ({}),
+    };
+    const mirrorApi: MirrorApi = {
+      groupsFor: async () => [],
+      adapter: () => undefined,
+      boundChat: async () => null,
+      isAdmin: async () => false,
+    };
+    await boot({
+      maxCallMsPerDay: 12 * MIN,
+      livekit: { url: 'wss://lk.example', apiKey: 'APIkey', apiSecret: 'x'.repeat(48), api, mirrorApi },
     });
-    await new Promise<void>((r) => google.listen(0, '127.0.0.1', () => r()));
-    try {
-      await boot({
-        maxCallMsPerDay: 26 * MIN,
-        gemini: { apiKey: 'gk', apiBase: `http://127.0.0.1:${(google.address() as AddressInfo).port}` },
-      });
-      const line = lineIdForToken('tok');
-      const token = async (): Promise<{ callId: string; durationMs: number }> => {
-        const res = await fetch(`${base}/gemini/token?t=tok`, { method: 'POST' });
-        expect(res.status).toBe(200);
-        return (await res.json()) as { callId: string; durationMs: number };
-      };
+    const walkie = async (): Promise<LiveKitJobMetadata> => {
+      expect((await fetch(`${base}/livekit/token?t=tok`, { method: 'POST' })).status).toBe(200);
+      return dispatches.at(-1)!;
+    };
 
-      expect((await offer()).status).toBe(200);
-      clock += 5 * MIN;
-      // A Gemini token hangs up the OpenAI call (5 min charged) and reserves its own 10.
-      const gemini = await token();
-      await vi.waitFor(() => expect(fake.hangups).toEqual(['live_fake1']));
-      await expect(adapter.deliver(line, null, { kind: 'chat', content: { text: 'FYI' } })).resolves.toMatch(
-        /^gemini-update:/,
-      );
-      expect(commentary()).toHaveLength(0);
+    expect((await offer()).status).toBe(200);
+    clock += 5 * MIN;
+    // A walkie call hangs up the OpenAI call, whose 5 minutes leave it 7.
+    expect((await walkie()).maxDurationMs).toBe(7 * MIN);
+    await vi.waitFor(() => expect(fake.hangups).toEqual(['live_fake1']));
 
-      clock += MIN;
-      // An OpenAI call ends the Gemini call's record; its reserved minutes stay spent.
-      const second = await offer();
-      expect(second.status).toBe(200);
-      const poll = await fetch(`${base}/gemini/messages?t=tok&callId=${gemini.callId}`);
-      expect(poll.status).toBe(409);
-      clock += 3 * MIN;
-      const session = second.headers.get('x-voice-session')!;
-      expect((await fetch(`${base}/hangup?t=tok&session=${session}`, { method: 'POST' })).status).toBe(204);
-      // 5 + 10 + 3 of 26 minutes used.
-      expect((await token()).durationMs).toBe(8 * MIN);
-    } finally {
-      await new Promise((r) => google.close(r));
-    }
+    clock += MIN;
+    // An OpenAI call ends the walkie call and deletes its room.
+    const second = await offer();
+    expect(second.status).toBe(200);
+    await vi.waitFor(() => expect(deleted).toEqual(rooms));
+    clock += 3 * MIN;
+    const session = second.headers.get('x-voice-session')!;
+    expect((await fetch(`${base}/hangup?t=tok&session=${session}`, { method: 'POST' })).status).toBe(204);
+    // The walkie caller never joined, so it cost nothing: 5 + 3 of 12 minutes used.
+    expect((await walkie()).maxDurationMs).toBe(4 * MIN);
   });
 
   it('a teardown during the access recheck hangs up the session and never attaches', async () => {
@@ -929,5 +957,73 @@ describe('voice delegation deadlines, daily budget and teardown races', () => {
     await adapter.teardown();
     expect((await pending).status).toBe(503);
     expect(fake.hangups).toEqual(['live_fake1']);
+  });
+});
+
+describe('voice routes and the reverse-proxy gate', () => {
+  it('maps both prefixes to routes, the short one only for browser routes', () => {
+    expect(voiceRoute('/webhook/voice/call')).toBe('call');
+    expect(voiceRoute('/webhook/voice/livekit/agent/events')).toBe('livekit/agent/events');
+    expect(voiceRoute('/voice')).toBe('livekit');
+    expect(voiceRoute('/voice/')).toBe('livekit');
+    expect(voiceRoute('/voice/call/')).toBe('call');
+    expect(voiceRoute('/voice/livekit/token')).toBe('livekit/token');
+    expect(voiceRoute('/voice/livekit/agent/events')).toBeNull();
+    expect(voiceRoute('/voice/livekit%2Fagent%2Fevents')).toBeNull();
+    expect(voiceRoute('/voice//livekit/agent/joined')).toBeNull();
+    expect(voiceRoute('/voice/sip')).toBeNull();
+    expect(voiceRoute('/voicemail')).toBeNull();
+  });
+
+  const policy = (trusted?: string, allowed?: string): VoiceProxyPolicy => ({
+    trustedProxies: parseCidrs(trusted, 'VOICE_TRUSTED_PROXY_CIDRS'),
+    allowedClients: parseCidrs(allowed, 'VOICE_ALLOWED_CLIENT_CIDRS'),
+  });
+  const tailnet = '100.64.0.0/10, fd7a:115c:a1e0::/48';
+
+  it('admits loopback peers and refuses LAN peers with no proxy configured', () => {
+    const p = policy();
+    expect(admitsVoicePeer(p, '127.0.0.1', undefined)).toBe(true);
+    expect(admitsVoicePeer(p, '::1', undefined)).toBe(true);
+    expect(admitsVoicePeer(p, '::ffff:127.0.0.1', '203.0.113.9')).toBe(true);
+    expect(admitsVoicePeer(p, '192.168.1.20', undefined)).toBe(false);
+    expect(admitsVoicePeer(p, '172.18.0.5', '100.100.1.2')).toBe(false);
+    expect(admitsVoicePeer(p, undefined, undefined)).toBe(false);
+  });
+
+  it('admits a trusted proxy forwarding an allowed client, and refuses a disallowed one', () => {
+    const p = policy('172.18.0.0/16', tailnet);
+    expect(admitsVoicePeer(p, '172.18.0.5', '100.100.1.2')).toBe(true);
+    expect(admitsVoicePeer(p, '::ffff:172.18.0.5', 'fd7a:115c:a1e0::1234')).toBe(true);
+    expect(admitsVoicePeer(p, '172.18.0.5', '203.0.113.9')).toBe(false);
+    expect(admitsVoicePeer(p, '172.18.0.5', '192.168.1.20')).toBe(false);
+    expect(admitsVoicePeer(p, '172.18.0.5', undefined)).toBe(false);
+    expect(admitsVoicePeer(p, '172.18.0.5', 'not-an-ip')).toBe(false);
+  });
+
+  it('takes the rightmost hop outside the trusted proxies as the client', () => {
+    const p = policy('172.18.0.0/16', tailnet);
+    // A client cannot prepend its way in: the proxy appends the real peer last.
+    expect(admitsVoicePeer(p, '172.18.0.5', '100.100.1.2, 203.0.113.9')).toBe(false);
+    expect(admitsVoicePeer(p, '172.18.0.5', '203.0.113.9, 100.100.1.2')).toBe(true);
+    expect(admitsVoicePeer(p, '172.18.0.5', ['203.0.113.9', '100.100.1.2, 172.18.0.9'])).toBe(true);
+  });
+
+  it('ignores X-Forwarded-For from a peer outside the trusted proxies', () => {
+    const p = policy('172.18.0.0/16', tailnet);
+    expect(admitsVoicePeer(p, '192.168.1.20', '100.100.1.2')).toBe(false);
+    expect(admitsVoicePeer(p, '172.19.0.5', '100.100.1.2')).toBe(false);
+  });
+
+  it('admits any client a trusted proxy forwards when no client ranges are set', () => {
+    const p = policy('172.18.0.5');
+    expect(admitsVoicePeer(p, '172.18.0.5', '203.0.113.9')).toBe(true);
+    expect(admitsVoicePeer(p, '172.18.0.6', '203.0.113.9')).toBe(false);
+  });
+
+  it('fails closed on invalid ranges', () => {
+    expect(admitsVoicePeer(policy('172.18.0.0/33, nonsense'), '172.18.0.5', undefined)).toBe(false);
+    // A client list whose entries are all invalid admits no client, not every client.
+    expect(admitsVoicePeer(policy('172.18.0.0/16', '100.64.0.0/x'), '172.18.0.5', '100.100.1.2')).toBe(false);
   });
 });

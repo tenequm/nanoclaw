@@ -12,7 +12,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 import type { Chat } from 'chat';
 
-import { getWebhookStatus, registerWebhookAdapter, stopWebhookServer } from './webhook-server.js';
+import {
+  getWebhookStatus,
+  registerRootHandler,
+  registerWebhookAdapter,
+  registerWebhookHandler,
+  stopWebhookServer,
+  type RawWebhookHandler,
+} from './webhook-server.js';
 
 const PORT = 3917;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -107,5 +114,30 @@ describe('registerWebhookAdapter — route/handler split', () => {
     registerWebhookAdapter(chat, 'slack');
     const res = await post('/webhook/nope', 'x');
     expect(res.status).toBe(404);
+  });
+});
+
+describe('registerRootHandler — a short prefix outside /webhook', () => {
+  it('hands /{segment} and every path below it to the handler with the original URL', async () => {
+    const seen: string[] = [];
+    const handler: RawWebhookHandler = (req, res) => {
+      seen.push(req.url ?? '');
+      res.end('ok');
+    };
+    registerWebhookHandler('page', handler);
+    registerRootHandler('page', handler);
+
+    for (const path of ['/page', '/page/', '/page?t=1', '/page/call/info?t=2', '/webhook/page/call']) {
+      expect((await post(path, '')).status).toBe(200);
+    }
+    expect(seen).toEqual(['/page', '/page/', '/page?t=1', '/page/call/info?t=2', '/webhook/page/call']);
+    expect((await post('/pages', '')).status).toBe(404);
+    expect((await post('/', '')).status).toBe(404);
+    expect(getWebhookStatus()?.paths).toEqual(['/webhook/page', '/page']);
+  });
+
+  it('refuses to shadow /webhook or take a nested path', () => {
+    expect(() => registerRootHandler('webhook', () => {})).toThrow();
+    expect(() => registerRootHandler('a/b', () => {})).toThrow();
   });
 });

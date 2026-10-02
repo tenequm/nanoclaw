@@ -118,6 +118,30 @@ describe('computeCommandGrants', () => {
     expect(dm[0].commands).toEqual(COMMAND_ORDER);
   });
 
+  it('adds /voice only in chats with an agent that has a voice line', async () => {
+    await makeAgentGroup('ag-1', 'Emma');
+    await makeAgentGroup('ag-2', 'Stan');
+    await grantRole({ user_id: OWNER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+    await makeMg('mg-dm-owner', OWNER, 0);
+    await makeMg('mg-group', 'telegram:-200', 1);
+    await wire('mg-dm-owner', 'ag-1');
+    await wire('mg-group', 'ag-2');
+    await createMessagingGroup({
+      id: 'mg-line',
+      channel_type: 'voice',
+      platform_id: 'voice:abc',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    await wire('mg-line', 'ag-1');
+
+    const grants = await computeCommandGrants();
+    expect(grants.find((g) => g.chatPlatformId === OWNER)?.commands).toEqual([...COMMAND_ORDER, 'voice']);
+    expect(grants.find((g) => g.chatPlatformId === 'telegram:-200')?.commands).toEqual(COMMAND_ORDER);
+  });
+
   it('does not grant popups in a non-admin DM chat', async () => {
     await makeAgentGroup('ag-1', 'Emma');
     await grantRole({ user_id: OWNER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });

@@ -25,7 +25,7 @@
  */
 import { getAllMessagingGroups, getMessagingGroupAgents } from '../../../db/messaging-groups.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../../../modules/permissions/db/user-roles.js';
-import { COMMAND_ORDER, type CommandName } from '../../../commands/index.js';
+import { COMMAND_ORDER, hasVoiceLine, type CommandName } from '../../../commands/index.js';
 
 const TELEGRAM_CHANNEL = 'telegram';
 
@@ -108,12 +108,25 @@ export async function computeCommandGrants(): Promise<CommandGrant[]> {
     return ids;
   };
 
+  // /voice only where an agent of the chat has a voice line to hand out.
+  const voiceCache = new Map<string, boolean>();
+  const anyVoiceLine = async (agentGroupIds: Iterable<string>): Promise<boolean> => {
+    for (const id of agentGroupIds) {
+      if (!voiceCache.has(id)) voiceCache.set(id, await hasVoiceLine(id));
+      if (voiceCache.get(id)) return true;
+    }
+    return false;
+  };
+
   const grants: CommandGrant[] = [];
   for (const acc of chats.values()) {
     const admins = new Set(globalAdminUserIds);
     for (const agId of acc.agentGroupIds) {
       for (const uid of await scopedAdminsOf(agId)) admins.add(uid);
     }
+    const commands: readonly CommandName[] = (await anyVoiceLine(acc.agentGroupIds))
+      ? [...COMMAND_ORDER, 'voice']
+      : COMMAND_ORDER;
 
     if (acc.isGroup) {
       // One chat_member grant per admin, sorted for a stable diff.
@@ -122,7 +135,7 @@ export async function computeCommandGrants(): Promise<CommandGrant[]> {
           chatPlatformId: acc.chatPlatformId,
           kind: 'chat_member',
           userId,
-          commands: COMMAND_ORDER,
+          commands,
         });
       }
     } else {
@@ -133,7 +146,7 @@ export async function computeCommandGrants(): Promise<CommandGrant[]> {
         grants.push({
           chatPlatformId: acc.chatPlatformId,
           kind: 'chat',
-          commands: COMMAND_ORDER,
+          commands,
         });
       }
     }

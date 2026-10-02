@@ -20,7 +20,13 @@ import {
   createMessagingGroupAgent,
 } from './db/index.js';
 import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from './channels/channel-registry.js';
-import { registerSessionCreatedHook, routeInbound, type SessionCreatedEvent } from './router.js';
+import {
+  registerMessageInterceptor,
+  registerSessionCreatedHook,
+  routeInbound,
+  type SessionCreatedEvent,
+} from './router.js';
+import { setTypingAdapter, stopTypingRefresh } from './modules/typing/index.js';
 import type { ChannelAdapter, ChannelDefaults } from './channels/adapter.js';
 import type { MessagingGroupAgent } from './types.js';
 
@@ -233,5 +239,185 @@ describe('registerSessionCreatedHook', () => {
     // still woke the container.
     expect(after).toHaveLength(1);
     expect(vi.mocked(wakeContainer)).toHaveBeenCalled();
+  });
+});
+
+describe('an event addressed to one agent group', () => {
+  it('reaches only that agent of a chat wired to several', async () => {
+    await activate();
+    await seedWiring({});
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Other',
+      folder: 'other-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await createMessagingGroupAgent({
+      id: 'mga-2',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-2',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'per-thread',
+      priority: 0,
+      threads: 1,
+      created_at: now(),
+    });
+    const events: SessionCreatedEvent[] = [];
+    registerSessionCreatedHook((event) => {
+      events.push(event);
+    });
+    await routeInbound({
+      channelType: 'testchat',
+      platformId: 'testchat:C1',
+      threadId: null,
+      agentGroupId: 'ag-2',
+      message: {
+        id: 'v1',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text: 'spoken' }),
+        timestamp: now(),
+        isMention: true,
+        isGroup: false,
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events.map((e) => e.session.agent_group_id)).toEqual(['ag-2']);
+  });
+
+  /** A voice call's turn: addressed by the host to one agent, under a host-made (non-platform) message id. */
+  const addressed = (text: string, agentGroupId = 'ag-1') =>
+    routeInbound({
+      channelType: 'testchat',
+      platformId: 'testchat:C1',
+      threadId: null,
+      agentGroupId,
+      message: {
+        id: 'livekit:call-1:1',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text }),
+        timestamp: now(),
+        isMention: true,
+        isGroup: false,
+      },
+    });
+
+  it("engages that agent whatever the chat's trigger pattern", async () => {
+    await activate();
+    await seedWiring({ engageMode: 'pattern', engagePattern: '^@Stan\\b' });
+    const events: SessionCreatedEvent[] = [];
+    registerSessionCreatedHook((event) => {
+      events.push(event);
+    });
+    // The same text typed into the chat does not match the trigger.
+    await inbound('m1', null, '<voice source="livekit">book a table</voice>');
+    expect(events).toEqual([]);
+    await addressed('<voice source="livekit">book a table</voice>');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events.map((e) => e.session.agent_group_id)).toEqual(['ag-1']);
+  });
+
+  it('is never taken by a pre-route interceptor (an approval waiting for a typed reason, say)', async () => {
+    await activate();
+    await seedWiring({});
+    const seen: string[] = [];
+    registerMessageInterceptor(async (event) => {
+      const text = (JSON.parse(event.message.content) as { text: string }).text;
+      if (!text.includes('reason?')) return false;
+      seen.push(event.message.id);
+      return true;
+    });
+    const events: SessionCreatedEvent[] = [];
+    registerSessionCreatedHook((event) => {
+      events.push(event);
+    });
+    await inbound('m1', null, 'reason? typed');
+    await addressed('reason? spoken');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(seen).toEqual(['m1']);
+    expect(events).toHaveLength(1);
+  });
+
+  it('reports through onStored that a session took it, and stays silent when nothing did', async () => {
+    await activate();
+    await seedWiring({});
+    const stored: string[] = [];
+    const turn = (agentGroupId: string) =>
+      routeInbound({
+        channelType: 'testchat',
+        platformId: 'testchat:C1',
+        threadId: null,
+        agentGroupId,
+        message: {
+          id: `livekit:call-1:${agentGroupId}`,
+          kind: 'chat',
+          content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text: 'spoken' }),
+          timestamp: now(),
+          isMention: true,
+          isGroup: false,
+        },
+        onStored: () => stored.push(agentGroupId),
+      });
+    await turn('ag-1');
+    // Addressed to an agent the chat is not wired to: routing ends without storing it anywhere.
+    await turn('ag-unwired');
+    expect(stored).toEqual(['ag-1']);
+  });
+
+  it('reports through onStored a turn on a chat whose agent keeps it as context without waking', async () => {
+    await activate();
+    await seedWiring({ engageMode: 'pattern', engagePattern: '^@Stan\\b', ignoredMessagePolicy: 'accumulate' });
+    let stored = 0;
+    const events: SessionCreatedEvent[] = [];
+    registerSessionCreatedHook((event) => {
+      events.push(event);
+    });
+    // Not addressed to the agent and not matching its trigger: stored as context, the agent not woken.
+    await routeInbound({
+      channelType: 'testchat',
+      platformId: 'testchat:C1',
+      threadId: null,
+      message: {
+        id: 'livekit:call-1:1',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text: 'just context' }),
+        timestamp: now(),
+        isMention: true,
+        isGroup: false,
+      },
+      onStored: () => stored++,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(stored).toBe(1);
+    expect(events).toEqual([]);
+  });
+
+  it('puts no reaction ack on its host-made message id', async () => {
+    await activate();
+    await seedWiring({});
+    const reactions: string[] = [];
+    const typing: string[] = [];
+    setTypingAdapter({
+      setTyping: async (_type, platformId) => {
+        typing.push(platformId);
+      },
+      addReaction: async (_type, _platformId, messageId) => {
+        reactions.push(messageId);
+      },
+      typingRequiresThread: () => true,
+    });
+    const events: SessionCreatedEvent[] = [];
+    registerSessionCreatedHook((event) => {
+      events.push(event);
+    });
+    await addressed('hello');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events).toHaveLength(1);
+    stopTypingRefresh(events[0].session.id);
+    expect(reactions).toEqual([]);
+    setTypingAdapter({});
   });
 });

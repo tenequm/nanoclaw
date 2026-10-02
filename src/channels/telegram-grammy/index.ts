@@ -94,7 +94,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
 
         const { onInbound, onAction } = yield* AdapterConfigService;
 
-        // Native chat-command binding (/status /model /config /restart).
+        // Native chat-command binding (/status /model /config /restart /voice).
         // Installs bot.catch FIRST, then bot.use(menu), then bot.use(commandGroup),
         // then runs the startup scope janitor - all BEFORE the message /
         // callback_query handlers below so the menu plugin claims its own

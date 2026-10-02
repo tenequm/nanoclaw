@@ -143,7 +143,8 @@ export const ConversationScrollButton = ({
     !isAtBottom && (
       <Button
         className={cn(
-          "bg-background dark:bg-background absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full shadow-md",
+          // The ring stays 32px; the invisible ::before makes the tap target 44px.
+          "bg-background dark:bg-background absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full shadow-md before:absolute before:-inset-1.5 before:content-['']",
           className
         )}
         onClick={handleScrollToBottom}

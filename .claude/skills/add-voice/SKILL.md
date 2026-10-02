@@ -14,7 +14,7 @@ delegations to inbound messages and agent replies to spoken commentary.
 NanoClaw doesn't ship channels in trunk — this skill copies the adapter and its
 tests in from the `channels` branch.
 
-A **voice line** is one call link, `…/webhook/voice/call?t=<token>`, wired to
+A **voice line** is one call link, `…/voice/call?t=<token>`, wired to
 one agent group. Every call on the link lands in the same agent session, so the
 agent remembers the previous call. Inside NanoClaw the line goes by a _line id_,
 a hash of the token, so the token itself stays in the link and never reaches the
@@ -46,17 +46,17 @@ speaks English, Ukrainian otherwise (speech that sounds like a third language is
 treated as misheard Ukrainian), and the greeting is in Ukrainian unless the
 persona names another language.
 
-Every engine's prompt also lists names the caller is likely to say, so the model
-recognises them and spells them exactly in transcripts and `ask_agent`
-requests: `GPT_LIVE_VOCABULARY` (comma-separated, in `.env`) plus the agent's
+Every engine's prompt (on the LiveKit path, the transcription's custom vocabulary) also lists
+names the caller is likely to say, so the model recognises them and spells them
+exactly in transcripts and delegations: `GPT_LIVE_VOCABULARY` (comma-separated, in `.env`) plus the agent's
 optional `voice.vocabulary.txt` in its group folder (one term per line, read
 like the persona file, symlinks and FIFOs refused), e.g.
 `GPT_LIVE_VOCABULARY=Acme, Zephyr, k8s`. Both are merged, trimmed and
 deduplicated, and capped at 60 terms and 1 KB; when neither names any, the
 prompt lists no names. `GPT_LIVE_VOCABULARY` is read at startup, the file on
-every call. It is prompt-only: `gpt-live-1`
-sessions take no transcription settings, and Gemini documents `customVocabulary`
-for its transcribe model only.
+every call. It is prompt-only on the OpenAI path: `gpt-live-1` sessions take
+no transcription settings. The LiveKit path passes it to Gemini's transcribe
+models as `customVocabulary`.
 
 The stable channel identifier and URL prefix are `voice`. The `GPT_LIVE_*`
 settings and adapter module names identify the current voice engine.
@@ -83,8 +83,6 @@ src/channels/gpt-live-access.test.ts
 src/channels/gpt-live-keychain.test.ts
 src/channels/gpt-live-sideband.test.ts
 src/channels/gpt-live-call-page.test.ts
-src/channels/gemini-live.ts
-src/channels/gemini-live.test.ts
 src/channels/voice-livekit.ts
 src/channels/voice-livekit-protocol.ts
 src/channels/voice-livekit.test.ts
@@ -115,10 +113,13 @@ container/skills/voice-formatting/SKILL.md
 
 ### 4. Build
 
-The OpenAI and browser-direct Gemini paths need no new package: they use Node's
+The OpenAI path needs no new package: it uses Node's
 built-in `fetch` and WebSocket client (Node 22 or later). The LiveKit path adds
-`@livekit/agents`, `@livekit/agents-plugin-google`, `@livekit/rtc-node`,
-`livekit-server-sdk`, `livekit-client` and `zod`. Build first: it guards the
+`@livekit/agents`, `@livekit/agents-plugin-google` (Gemini transcription and
+speech), `@livekit/agents-plugin-silero` (Silero VAD on
+`onnxruntime-node`, whose npm package ships the CPU binaries for linux-x64 and
+macOS; its postinstall only fetches optional CUDA files and pnpm skips it),
+`@livekit/rtc-node`, `livekit-server-sdk` and `zod` (a peer of the agents package). Build first: it guards the
 adapter's typed calls into the channel core.
 
 ```nc:run effect:build
@@ -131,7 +132,7 @@ Run the registration test, the session state-machine tests, and the adapter
 integration test (a fake OpenAI behind the real webhook server):
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts src/channels/gemini-live.test.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.test.ts
+pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.test.ts
 ```
 
 `voice-registration.test.ts` imports the real channel barrel and asserts the
@@ -188,33 +189,93 @@ security find-generic-password -s nanoclaw-openai -a "$USER" -w >/dev/null
 
 ### Public URL
 
-The call page and the SDP handshake are served by the host's webhook server.
-Give the origin a caller's browser reaches it at — `http://localhost:3000` for
-a local try, a tailnet or tunnel URL to call from a phone's browser. Browsers
-allow the microphone only on `localhost` or HTTPS. Set-if-absent, so a re-run
-keeps your value:
-
-On a tailnet, `tailscale serve` gives the host an HTTPS name with a valid
-certificate. Mount the webhook path on it; the target repeats the path because
-serve strips the mount prefix before proxying (run as root or a Tailscale
-operator; an existing mount at `/` for another service is unaffected):
-
-```bash
-tailscale serve --bg --set-path=/webhook http://127.0.0.1:3000/webhook
-```
-
-The origin is then `https://<host>.<tailnet>.ts.net` and the call page lives at
-`…/webhook/voice/call?t=<token>`.
+The call pages and their routes are served by the host's webhook server under
+`/voice`: the OpenAI call page at `…/voice/call?t=<token>`, the LiveKit
+walkie-talkie at `…/voice?t=<token>`, and the routes those pages call next to
+them (`/voice/info`, `/voice/sdp`, `/voice/hangup`, `/voice/livekit/token`,
+`/voice/livekit/end`). The older `…/webhook/voice/…` paths keep working. Give
+the origin a caller's browser reaches it at — `http://localhost:3000` for a
+local try, an HTTPS name to call from a phone's browser. Browsers allow the
+microphone only on `localhost` or HTTPS.
 
 The webhook server listens on every interface, so the voice routes answer only
-loopback peers (403 otherwise, before any token check): a call link must not
-work, or be probed, over plain HTTP from the LAN. A front such as `tailscale
-serve` or a local reverse proxy connects from `127.0.0.1` and passes. For a
-local-development setup whose front connects from elsewhere (a container
-bridge, another machine), set `GPT_LIVE_ALLOW_NON_LOOPBACK=1`.
+loopback peers by default (403 otherwise, before any token check): a call link
+must not work, or be probed, over plain HTTP from the LAN. Put one of these
+fronts in front of it.
+
+**(a) Tailscale Serve.** On a tailnet, `tailscale serve` gives the host an HTTPS
+name with a valid certificate and connects from `127.0.0.1`, so nothing else is
+needed. Mount `/voice`; the target repeats the path because serve strips the
+mount prefix before proxying (run as root or a Tailscale operator; an existing
+mount at `/` for another service is unaffected). Keep a `/webhook` mount only
+if older `…/webhook/voice/…` links are still in use:
+
+```bash
+tailscale serve --bg --set-path=/voice http://127.0.0.1:3000/voice
+```
+
+The origin is then `https://<host>.<tailnet>.ts.net`.
+
+**(b) A reverse proxy in a container** (Traefik, Caddy, nginx on a Docker
+bridge network). It connects from a container address, not loopback, so tell
+the host which proxies to trust and, optionally, which clients they may
+forward:
+
+| Key | Default | What |
+| --- | --- | --- |
+| `VOICE_TRUSTED_PROXY_CIDRS` | empty (loopback only) | Comma-separated CIDRs of the proxy as the host sees it. Use the narrowest range: the proxy's own address (`/32`) or its Docker network's subnet (`docker network inspect <network>`). Any container in a trusted range can claim any client. |
+| `VOICE_ALLOWED_CLIENT_CIDRS` | empty (any client the proxy forwards) | Comma-separated CIDRs the forwarded client must be in. The client is the rightmost `X-Forwarded-For` hop outside the trusted proxies, so a client cannot prepend its way in. For a tailnet-only service: `100.64.0.0/10,fd7a:115c:a1e0::/48`. |
+
+A request is admitted if its peer is loopback, or its peer is in
+`VOICE_TRUSTED_PROXY_CIDRS` and the forwarded client is in
+`VOICE_ALLOWED_CLIENT_CIDRS` (when set). LAN peers outside the trusted ranges
+still get 403, and an `X-Forwarded-For` from them is ignored. The LiveKit
+worker's routes (`/webhook/voice/livekit/agent/…`) never pass through the proxy
+gate: they stay loopback-only and are not served under `/voice` at all. Invalid
+entries are logged and match nothing.
+
+A Traefik example (dynamic file configuration; `voice.example.com`, the
+resolver name and the host gateway address are placeholders):
+
+```yaml
+http:
+  routers:
+    nanoclaw-voice:
+      rule: Host(`voice.example.com`) && PathPrefix(`/voice`)
+      entryPoints: [websecure]
+      tls: { certResolver: letsencrypt }
+      middlewares: [voice-allowlist]
+      service: nanoclaw-voice
+  middlewares:
+    voice-allowlist:
+      ipAllowList:
+        sourceRange: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+  services:
+    nanoclaw-voice:
+      loadBalancer:
+        servers:
+          - url: http://172.18.0.1:3000   # the proxy network's gateway (the Docker host), WEBHOOK_PORT
+```
+
+In `.env`, with the proxy network's subnet (or the proxy's `/32`) as the trusted range:
+
+```
+GPT_LIVE_PUBLIC_URL=https://voice.example.com
+VOICE_TRUSTED_PROXY_CIDRS=172.18.0.0/16
+VOICE_ALLOWED_CLIENT_CIDRS=100.64.0.0/10,fd7a:115c:a1e0::/48
+```
+
+The two allowlists are independent layers: the proxy's middleware refuses
+outsiders at the edge, and the host refuses anything that skipped the proxy or
+came through it from elsewhere. For a local-development setup that needs no
+gate at all, `GPT_LIVE_ALLOW_NON_LOOPBACK=1` serves the voice routes to every
+peer.
+
+The origin to give below is the front's, with no path. Set-if-absent, so a
+re-run keeps your value:
 
 ```nc:prompt public_url validate:^https?://\S+$ normalize:rstrip-slash
-What origin can a caller's browser reach this NanoClaw host at? (e.g. http://localhost:3000 or https://nanoclaw.example.ts.net)
+What origin can a caller's browser reach this NanoClaw host at? (e.g. http://localhost:3000, https://nanoclaw.example.ts.net or https://voice.example.com)
 ```
 
 ```nc:env-set
@@ -312,7 +373,7 @@ seconds during a call; revocation or a changed wiring ends the call.
 Tell the user where to call from:
 
 ```nc:operator
-The call link is {{public_url}}/webhook/voice/call?t={{link_token}} — keep it private, anyone holding it is treated as {{caller_name}} and can talk to {{agent_folder}} on your OpenAI bill. Open it in a browser, allow the microphone, press Call and say hello. Ask something that needs memory ("what did we decide about the launch date?") to see the agent get involved; the page shows captions when the call carries them.
+The call link is {{public_url}}/voice/call?t={{link_token}} — keep it private, anyone holding it is treated as {{caller_name}} and can talk to {{agent_folder}} on your OpenAI bill. Open it in a browser, allow the microphone, press Call and say hello. Ask something that needs memory ("what did we decide about the launch date?") to see the agent get involved; the page shows captions when the call carries them.
 ```
 
 ## Smoke test without a microphone
@@ -360,7 +421,8 @@ To uninstall: see [REMOVE.md](REMOVE.md).
 
 The page callers open is a small React app. Its maintainer sources live at
 `.claude/skills/add-voice/ui/` beside the generated payload (in this fork: vendored
-unchanged from upstream `feat/voice-payload`, PR #3772, at `324d7445`; MIT, see
+from upstream `feat/voice-payload`, PR #3772, at `324d7445`, plus the LiveKit
+walkie-talkie transport in `ui/src/lib/livekit-call.ts`; MIT, see
 `ui/THIRD_PARTY_NOTICES.md`):
 Teenage Engineering inspired, one screen beside a rail of keys, a dot-matrix
 display that shows the caller's voice in white, thinking in orange and the
@@ -388,6 +450,9 @@ GPT_LIVE_UI={"colorway":"field","presence":"matrix","brand":"Casa line"}
 | `timestamps`     | time into the call on each transcript turn              | `true`                                     |
 | `colorwayPicker` | let callers pick a finish from the page                 | `true`                                     |
 
+The LiveKit page (`/livekit`) defaults its footer to `Walkie-talkie over LiveKit · answers by {agent}`;
+a `footer` set here applies to both pages.
+
 Callers can also switch the finish from the three dots under the transcript;
 the choice stays in their browser. To change the components themselves, edit
 `ui/src`, then from `ui/` run
@@ -402,55 +467,17 @@ as the host and requires no dependency install scripts. Try the page without a
 microphone or an agent by adding `&demo=1` to any call link: it plays a scripted
 call and connects to nothing.
 
-## Gemini Live (test)
-
-The same lines also take calls through Google's
-[Gemini Live](https://ai.google.dev/gemini-api/docs/live) at
-`…/webhook/voice/gemini?t=<token>`, with the same token, line, agent wiring and
-access checks as the `/call` link. It is off until the key is in `.env`; without
-it the `/gemini` routes answer 503 and the OpenAI path is unchanged:
-
-```
-GEMINI_API_KEY=<Gemini API key>
-```
-
-Optional: `GEMINI_LIVE_MODEL` (default `gemini-3.8-live`),
-`GEMINI_LIVE_VOICE` (default `Kore`) and `GEMINI_LIVE_MAX_CALL_SECONDS`
-(default and maximum `600`, never above `GPT_LIVE_MAX_CALL_SECONDS`; Google drops
-Live audio connections at about 10 minutes and the page does not resume sessions
-yet). The page is told the token's remaining lifetime after the mint, so it hangs
-up before the token expires.
-Restart to load them.
-
-The page talks to Gemini directly: the host mints a one-use ephemeral token
-locked to the model, the composed voice prompt, the voice and one `ask_agent`
-function, and the key never leaves the host. Each `ask_agent` call is sent to
-the agent like a delegation and its first reply goes back to Gemini as the
-function's answer. The agent batches the messages that queued while it was busy
-and replies to the first, so a reply also answers the waiting `ask_agent` calls
-the agent got after the one it names; calls it got earlier wait for their own
-reply. Later agent messages for the call (the real answer after an interim
-one, a reply after the timeout line, a proactive message) are queued; the page
-long-polls `…/gemini/messages` and hands each to Gemini as a further answer,
-spoken when the model is idle. A call may have 3 `ask_agent` calls waiting at
-once and start 10 a minute; a request is at most 4 KB.
-
-Both engines share the hourly start cap, the daily minutes and the delegation
-timeout, and the newest call on a line wins across engines. The host cannot end
-a Google session: the token works until it expires, and Google enforces that
-expiry. So a Gemini call is charged its whole token lifetime when the token is
-minted, and hanging up early gives nothing back. When access is revoked, the
-line changes or a newer call takes the line, the host stops serving the call
-(its `ask_agent` calls and messages are refused, which makes the page hang
-up), but a page that ignores that keeps talking to Gemini, without the agent,
-until the token expires.
-
-## LiveKit + Gemini Live (WebRTC)
+## LiveKit walkie-talkie (WebRTC)
 
 The same lines also take calls over WebRTC through a self-hosted
-[LiveKit](https://docs.livekit.io/) server, with Gemini Live as the voice, at
-`…/webhook/voice/livekit?t=<token>` (same token, line, agent wiring and access
-checks as `/call` and `/gemini`). It is off until all four keys are in `.env`;
+[LiveKit](https://docs.livekit.io/) server at `…/voice?t=<token>` (the older
+`…/webhook/voice/livekit?t=<token>` still works)
+(same token, line, agent wiring and access checks as `/call`). On
+this path the caller talks to the line's real agent, not to a voice model: each
+spoken turn is transcribed and sent to the agent as a message, and each agent
+reply is read out with Gemini TTS. The worker is a LiveKit Agents `AgentSession`
+with no LLM in it: VAD turns, streaming transcription, TTS, captions and the
+agent state are the framework's. It is off until all four keys are in `.env`;
 without them the `/livekit` routes answer 503 and nothing else changes:
 
 ```
@@ -466,11 +493,44 @@ same box; defaults to `LIVEKIT_URL`), `LIVEKIT_AGENT_NAME` (dispatch name,
 default `nanoclaw-voice`; set the same value for host and worker),
 `LIVEKIT_HOST_URL` (worker only: where it reaches this host's webhook server,
 default `http://127.0.0.1:<WEBHOOK_PORT>`; it must be a loopback address unless
-`GPT_LIVE_ALLOW_NON_LOOPBACK=1`, like every voice route; the worker never takes
-an address from the dispatch), `GEMINI_LIVE_MODEL` (default
-`gemini-3.8-live`), `GEMINI_LIVE_VOICE` (default `Kore`). Restart to load them.
-LiveKit calls end at `GPT_LIVE_MAX_CALL_SECONDS` (default 15 minutes) or when the
-day's minutes run out, whichever comes first.
+`GPT_LIVE_ALLOW_NON_LOOPBACK=1`, like the worker's routes on the host, which no
+trusted proxy opens; the worker never takes
+an address from the dispatch). The walkie-talkie settings, read by the host and
+handed to the worker with each call:
+
+| Key | Default | What |
+| --- | --- | --- |
+| `WALKIE_STT_MODEL` | `gemini-3.5-transcribe-live` | Streams the caller's speech over the Gemini Live API while they talk, verbatim, with the language hints `uk-UA` and `en-US` and the line's vocabulary as custom vocabulary. |
+| `WALKIE_STT_FALLBACK_MODEL` | `gemini-3.5-transcribe` | Unary transcription that takes over while the streaming model fails (LiveKit's STT `FallbackAdapter`). Its quota is small (on some tiers 10 requests a minute and 100 a day), so it sends nothing while the streaming model works, every request it makes is logged at warn, and the call goes back to the streaming model at the next pause once that recovers, or tries it again every minute. `off` for none (an empty value in `.env` reads as unset). |
+| `WALKIE_TTS_MODEL` | `gemini-3.8-flash-tts` | Speaks the agent's replies. |
+| `WALKIE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Speaks when the main model fails (LiveKit's TTS `FallbackAdapter`, one retry each; a failed model is tried again every 30 seconds); `off` for none. |
+| `WALKIE_TTS_VOICE` | `Alnilam` | Prebuilt Gemini voice, for both TTS models. |
+| `WALKIE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
+| `WALKIE_MIRROR` | `telegram` | Channel type of the default call chat, used until `/voice` picks one (see below); `off` keeps calls on the voice line until then. |
+
+The worker itself reads `WALKIE_MAX_SPOKEN_CHARS` (default `800`; `0` for no
+cap): an agent message longer than that, after markdown and links are stripped,
+is spoken up to its last sentence end within the cap when that end is past 60%
+of the cap (else up to its last whole word), followed by "Решта - у чаті." or
+"The rest is in the chat." in the language of the caller's last turn. A call
+that talks on the voice line, with no chat to hold the rest, closes with
+"Скорочую." or "I've cut it short." instead. It applies to every message
+spoken during the call, replies and proactive ones alike, and the captions show
+what was spoken; the full text stays in the chat.
+
+It also reads `WALKIE_RECORDINGS_DAYS` (default `0`, off): with a
+number of days, it saves every caller turn it hears as a 16 kHz mono WAV plus a
+JSON sidecar (call and line id, agent, turn number, start and end, speech
+length, the transcription model that heard it, the transcript or why there was
+none, and the host's answer) under
+`data/voice-recordings/<agent>/<YYYY-MM-DD>/<call id>-<turn>.wav|.json`, owner-only
+(files 0600, folders 0700), and deletes files older than that many days at
+start and once a day. The recordings are the caller's voice: they stay on this
+machine under `data/` (which git ignores), nothing uploads or backs them up, and
+anyone who can read the NanoClaw folder as its user can play them.
+
+Restart the host to load them. LiveKit calls end at `GPT_LIVE_MAX_CALL_SECONDS`
+(default 15 minutes) or when the day's minutes run out, whichever comes first.
 
 The agent side is a separate process, the LiveKit Agents worker: agents-js
 runs every job in a forked child process of its worker, so it does not live in
@@ -484,10 +544,18 @@ pnpm run voice-worker        # node dist/voice-livekit-worker.js start
 ```
 
 Its health check listens on `127.0.0.1:8089` (`VOICE_WORKER_HEALTH_PORT` in
-`.env`). At startup it logs the host URL it uses and checks the host answers
-there; if not, it logs an error (set `LIVEKIT_HOST_URL` in `.env`), refuses
-calls and checks again every 30 seconds. On SIGTERM it takes no new calls and gives running ones 60 seconds before
-closing them, so a restart cuts a longer call short. As a systemd user unit:
+`.env`). At startup it logs its protocol version and the host URL it uses (set
+`LIVEKIT_HOST_URL` in `.env` if that is not this NanoClaw's webhook server; a
+call the host does not answer ends at once with the URL in the log). Each idle
+job process loads the Silero models before a call reaches it. On SIGTERM it takes no new calls and gives running ones 60 seconds before
+closing them, so a restart cuts a longer call short. Host and worker must be
+from the same build, so restart them together: the job metadata is versioned
+(`v: 3`). A worker that gets a call of another version joins only to set its
+`nanoclaw.walkie.updating` attribute, so the caller's page says "The voice service
+is updating. Try again in a minute.", and leaves;
+the page says the same when no worker joins within 25 seconds (worker down, or
+an older one that turns such calls away), and the host logs why the call ended.
+As a systemd user unit:
 
 ```ini
 # ~/.config/systemd/user/nanoclaw-voice-worker.service
@@ -510,36 +578,179 @@ environment and every forked job, and agents-js lets `LIVEKIT_URL` from the
 environment override `LIVEKIT_WORKER_URL`. Set `Environment=LOG_LEVEL=debug`
 for verbose logs.
 
-How a call runs: the page posts to `/webhook/voice/livekit/token`; the host
+How a call runs: the page posts to `/voice/livekit/token`; the host
 admits the call against the shared hourly and daily limits, ends any other call
-on the line (newest wins, across all three engines), creates a unique room
+on the line (newest wins, across both engines), creates a unique room
 `voice-<line id>-<random>`, dispatches the worker to it with the call metadata
-(line, call id, agent name, the composed voice prompt; nothing secret, since
-agents-js logs whole jobs on some paths) and returns a two-minute token that can only join that room, publish a microphone
-and subscribe. The worker waits for the caller, tells the host (the daily
-minutes are charged from here until the room ends), then runs Gemini Live with
-one NON_BLOCKING `ask_agent` function. The worker authenticates to the host with
-a per-call secret both derive from `LIVEKIT_API_SECRET`, so the worker needs that
-key too. Each `ask_agent` call becomes an inbound message for the agent; its
-replies come back over the host's event stream naming the call they answer
-(same batching rule as the Gemini path): the reply goes back as the function
-result (spoken when the model is idle); any later reply or proactive agent
-message is spoken as a new turn. When the caller or Gemini interrupts the turn
-that made the call, the call moves to the background: Gemini gets a holding note
-as the function result and the answer is spoken as a new turn when it arrives.
-If the worker does not open its event stream within 30 seconds of the caller
-joining, the host ends the call.
-Requests share the Gemini path's caps (4 KB, 3 open and 10 per minute per call); after 90 seconds without a
-reply the caller hears the timeout line. The host rechecks access every five
-seconds and ends a call (hangup, revocation, duration or budget limit, a newer
-call, shutdown) by deleting the room, which disconnects caller and worker.
+(line, call id, agent and caller names, vocabulary, the walkie-talkie settings;
+nothing secret, since agents-js logs whole jobs on some paths) and returns a
+two-minute token that can only join that room, publish a microphone and
+subscribe. The worker waits for the caller, tells the host (the daily minutes
+are charged from here until the room ends) and starts its session, which
+publishes the agent's audio track. The worker authenticates to the host with a per-call secret both derive
+from `LIVEKIT_API_SECRET`, so the worker needs that key too. Then, walkie-talkie:
 
-The page loads `livekit-client` from the host itself (`/webhook/voice/livekit/client.js`),
-no CDN. Microphone capture runs with echo cancellation, noise suppression and
-auto gain; DTX is off because Gemini 3.8 only ends a turn while audio keeps
-arriving. On iOS Safari the call must be started with the Call button (audio
-unlocks on that tap); if playback is still blocked a "Tap to hear the call"
-button appears.
+- Silero VAD follows the caller's speech (VAD-only turn detection: LiveKit's
+  turn detector models have no Ukrainian). A turn survives pauses and ends
+  after `WALKIE_SILENCE_MS` of silence.
+- The transcription streams while the caller talks, so the text is ready when
+  the turn ends; the page shows it as it comes. The worker posts the turn's
+  text to `/webhook/voice/livekit/agent/utterance`, and the host hands it to the
+  agent in the line's call chat (below) as `<voice source="livekit">…</voice>`
+  plus a line saying the reply is read aloud (short spoken sentences, no
+  markdown, links or code, numbers as words, longer material as a separate
+  written message; in a call chat, that every message sent to the chat during
+  the call is read aloud, so longer material waits for the end of the call).
+  Its id is `livekit:<call>:<n>`.
+- Every agent message to the call chat during the call (replies and proactive
+  messages; with no call chat, every agent message for the line) goes to the
+  worker complete over the host's event stream, and the agent's typing there is
+  the worker's "thinking". The worker strips markdown, URLs and tags and speaks
+  it uninterruptibly (`session.say`), cut at `WALKIE_MAX_SPOKEN_CHARS` (above),
+  in sentence batches of up to 400
+  characters, two requested at a time: the one playing and the next.
+  Replies never overlap, and a reply waits for a caller who is mid-turn (at most
+  `WALKIE_SILENCE_MS` plus ten seconds, then it takes the channel).
+- While the agent's audio plays, the caller is not transcribed (no barge-in).
+  While the agent works the page says it is thinking; the caller can keep
+  talking, and each finished turn goes to the agent as a follow-up.
+- The host answers a turn 202 once the agent's session has stored it, whether
+  to answer or, on a voice line whose trigger it does not match under the
+  `accumulate` policy, as context. When nothing stored it (access or sender
+  policy, no agent taking it) the host answers 422, when routing throws 500,
+  and when the turn is not stored within 8 seconds 504. Each POST carries a
+  random `turnKey`; the worker posts a turn once more under the same key when
+  the connection drops, and the host answers a repeated key from the first
+  outcome without routing it again. A turn answered 504 that is stored later
+  is reported on the event stream (`{"type": "turn-stored", "turnKey", "id"}`),
+  and the worker corrects the page's mark to "sent". The stream also carries
+  `{"type": "chat", "chat": true | false}` when the call starts or stops
+  talking in a chat.
+- When the caller's speech came out as no text the caller hears "Не розчув,
+  повтори, будь ласка" or "Sorry, I didn't catch that", in the language of their
+  last turn. A turn the host did not confirm (504, or no answer) may still reach
+  the agent, so it is never "repeat": "Не впевнений, що це дійшло - перевір чат."
+  or "Not sure that got through - check the chat." (without the chat part on a
+  voice-line call). A refused turn gets "That didn't go through.", a rate-limited
+  one "Too many turns - give it a moment." (and their Ukrainian lines). When a
+  reply cannot be synthesized, a line saying so. All of these also show as captions. The
+  worker also sends one JSON message per caller turn (noise is not reported) on the text stream topic
+  `nanoclaw.walkie.turn`: `{"turn": n, "status": "sent" | "lost", "reason"?:
+  "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
+  "sent" means the agent's session has the turn; a 504 is "timeout", 429
+  "rate_limited", any other refusal "rejected".
+- Right before each line it speaks, the worker sends one JSON message on
+  `nanoclaw.walkie.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
+  true, "notice"?: true, "more"?: true}`. `turn` is the caller turn the agent
+  message answers (from the host event's `turn`, the utterance id the 202 named;
+  a turn the worker cannot map gets no label), `unprompted` a message answering
+  no turn of this call, `notice` the worker's own lost-turn or failure line, and
+  `more` that another line is already queued behind it.
+- While a finished stretch of caller speech waits out `WALKIE_SILENCE_MS`, the
+  worker sets the attribute `nanoclaw.walkie.pending` to
+  `"<n>:<elapsedMs>:<silenceMs>"` and clears it when the caller speaks again,
+  the turn is sent, dropped or overdue, or the agent speaks.
+
+Turns are capped at 8 KB of text, 20 a minute and 3 still being routed per call. A reply for a call
+that already ended is not spoken. If the worker does not open its event stream
+within 30 seconds of the caller joining, the host ends the call. The host
+rechecks access every five seconds and ends a call (hangup, revocation,
+duration or budget limit, a newer call, shutdown) by deleting the room, which
+disconnects caller and worker.
+
+**The call chat and `/voice`.** A LiveKit call talks in one of the agent's
+chats, so the agent answers with that chat's context and the chat shows both
+sides. A line's caller is its own `voice:<line id>` user, linked to no other
+account, so the operator first names the line's owner, the person's user on a
+chat platform, and then adds the same person's other chat accounts, so `/voice`
+(Telegram) and `!voice` (Slack) both work for the line (`ncl users list` shows
+the ids; operator only, from the host):
+
+```bash
+ncl voice-lines set --line voice:<line id> --owner telegram:<their id>
+ncl voice-lines add-owner --line voice:<line id> --owner slack:<their id>
+ncl voice-lines get voice:<line id>   # owners and the current call chat
+```
+
+`remove-owner --line ... --owner ...` drops one account (never the last;
+`remove --line ...` drops the line's owners and call chat). The owner accounts are one
+person: `set` makes its `--owner` the only one and, when that account did not
+own the line yet, clears the call chat, which is how a line changes hands.
+
+The owner then sends `/voice` from any of those accounts in a chat wired to the
+agent (that account must be an owner or admin of the agent too; on Slack
+`!voice`): the host replies there with the links of their own line(s) of that
+agent, never anyone else's (`Walkie-talkie with <agent>: …/voice?t=…` when
+LiveKit is configured, then `Live call (OpenAI): …/voice/call?t=…`), and makes that chat (and its thread or forum topic;
+on Slack a top-level `!voice` means the channel itself) the line's call chat
+until `/voice` from any of the line's owner accounts names another chat of the
+same agent (the last one wins). Someone who owns no line of the agent is told
+so, and nothing changes. The links never change and the pages work
+without the command; `/voice` only says where walkie-talkie calls talk. In a chat with several agents it does this
+for every agent there the sender administers. The reply goes out with link
+previews off (Telegram) and unfurls off (Slack), and a reply quoting it does not
+pass the links to the agent. The call chat is stored per line in `voice_lines`
+and the owner accounts in `voice_line_owners` (migration 027, applied at host
+start); a new owner starts with no call chat.
+
+During a call each turn is routed into the call chat's session through the
+normal inbound path, as a message from the line's own caller. It is addressed to
+the line's agent alone, whoever else is wired there, and engages it whatever
+the chat's trigger; session mode, access and sender policy apply as for a typed
+message. Once the agent's session has a turn, the bot posts `🎙 <name>: <transcript>`
+into the chat. The agent answers
+in the chat as usual; while the call is live, each message it delivers to that
+chat (and thread) is also spoken, and its typing there shows as thinking. After
+a mid-call `/voice` the call also keeps speaking the chat it left, until a whole
+turn passes with no message or typing from the agent there. A `/voice` chat that
+is no longer wired to the agent, or none of whose owner accounts is still an
+admin of it, is ignored (the host logs it).
+
+Before any `/voice` the default is the `WALKIE_MIRROR` rule: the one live (not
+denied, not detached) chat of that channel type wired to the agent, or the one
+direct chat among several, with the line's own caller as the sender. That chat
+then converses: the caller's turns go into its session and every agent message
+to it is spoken during the call, even when it is not the caller's own chat, so
+run `/voice` where calls should talk when that matters. With none,
+with several and no single direct chat, or with `WALKIE_MIRROR=off`, the call
+talks on the voice line itself as before (replies come back by their
+`livekit:` reply id, nothing is posted) and the host logs why once. The
+OpenAI page (`/call`) always talks on the voice line.
+
+The LiveKit page is the same React call page as `/call` (one build from `ui/`),
+served with `transport: "livekit"` in its injected config and the same
+`GPT_LIVE_UI` look; `livekit-client` and `@livekit/components-react` are bundled
+into it, no CDN. Its readout follows the worker: Listening, `<agent>` is working
+(with "you can keep talking" and a local wait clock) while
+`nanoclaw.walkie.thinking` is set, and `<agent>` is speaking (speech is ignored
+until the reply finishes; the mute key says "not listening during reply");
+captions come from `lk.transcription` (the caller's interim text shows live), and
+each caller turn gets a small sent / not-sent mark from the worker's
+`nanoclaw.walkie.turn` stream. A lost turn also stays as a notice above the
+transcript until a later turn is sent; a `timeout` reads "delivery not
+confirmed - check the chat before repeating", since the host may still have it.
+The header names the chat the call talks in when it starts (an unnamed direct
+chat shows as `<channel> DM`); after a mid-call `/voice` the host writes the new
+chat's label into the room metadata (`{"chat": ...}`, `WalkieRoomMetadata`) once
+the next turn moves the call, and the header follows it. Before it deletes the
+room the host also writes why the call ended (`"end"`: `limit_duration`,
+`limit_daily`, `newer_call`, `revoked`, `shutdown`, `worker_restart` (the
+worker shut down, as in a deploy) or `worker_gone`; a hangup names none), and the page says so. The token reply carries `silenceMs` and
+`limit: {ms, kind: "duration" | "daily"}`: the listening hint names the pause
+that sends a turn, a thin line under the readout fills while
+`nanoclaw.walkie.pending` counts down, caller lines show "turn n" and the first
+caption of a reply "re: turn n" (or "unprompted"), and a minute before the
+limit the hint says the call is about to end. Soft Web Audio tones mark a sent
+turn and, once the agent is done, the caller's turn; `?cues=0` turns them off.
+Microphone capture runs
+with echo cancellation, noise suppression and auto gain; DTX is off because the
+worker times turns by the silence it hears. On iOS Safari the call must be
+started with the Call button (audio unlocks on that tap) and joins relay-only
+(TURN over TLS; `?relay=1` / `?relay=0` override it); if playback is still
+blocked the readout shows a "tap to hear `<agent>`" button. While the SDK
+reconnects the readout says to wait before speaking. With no worker in the room
+after 25 seconds the page says the voice service is unavailable; a worker on
+another protocol version makes it say the service is updating.
 
 ## Channel Info
 

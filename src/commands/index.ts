@@ -12,8 +12,12 @@ export {
   setConfigValue,
   setActivation,
   restartAgent,
+  hasVoiceLine,
+  setVoiceTarget,
+  runVoiceCommand,
+  type VoiceLinkFn,
 } from './service.js';
-export { statusAccess, type StatusAccessDecision } from './auth.js';
+export { statusAccess, voiceAccess, type StatusAccessDecision } from './auth.js';
 export { formatTokens, formatDateRel } from './format.js';
 export { readTranscriptStats, type TranscriptStats } from './transcript.js';
 export {
@@ -29,6 +33,7 @@ export {
   restartPrompt,
   statusCardLines,
   submenuPrompt,
+  voiceCommandReply,
   MD_FMT,
   PLAIN_FMT,
   type CardFmt,

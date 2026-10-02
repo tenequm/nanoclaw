@@ -19,6 +19,40 @@ export interface Line {
   text: string
   /** Seconds into the call when the turn started. */
   at: number
+  /** Walkie-talkie only: whether this caller turn reached the agent. */
+  mark?: TurnMark
+  /** Walkie-talkie only: the caller turn's number on this page, once the worker settled it. */
+  turn?: number
+  /** Walkie-talkie only: what an agent line answers ("re: turn 2", "unprompted"), on the first line of a message. */
+  re?: string
+  /** Walkie-talkie only: the spoken message an agent line belongs to; one message's lines read as one. */
+  group?: number
+}
+
+/** Walkie-talkie only: the caller stopped and the turn goes out once this runs full, unless they speak again. */
+export interface SendCue {
+  id: string
+  /** How much of the silence had passed when the worker said so, 0..1. */
+  from: number
+  /** What is left of it. */
+  ms: number
+}
+
+export interface TurnMark {
+  status: "sent" | "lost"
+  reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty"
+}
+
+/** What kind of problem ended a call, so the page can say what to do about it. */
+export type ErrorKind = "mic-permission" | "mic" | "link" | "limit" | "offline" | "updating" | "other"
+
+/** An error whose message is already in a caller's words, with its kind. */
+export class CallError extends Error {
+  readonly kind: ErrorKind
+  constructor(message: string, kind: ErrorKind) {
+    super(message)
+    this.kind = kind
+  }
 }
 
 interface LiveEvent {
@@ -36,6 +70,8 @@ export interface VoiceCall {
   muted: boolean
   /** Human-readable problem when phase is "error". */
   error: string | null
+  /** What kind of problem `error` is. */
+  errorKind?: ErrorKind | null
   /** Why the last call ended, for the readout. */
   endedText: string | null
   /** The caller's microphone and the agent's audio, for visualisers that analyse a stream. */
@@ -48,14 +84,39 @@ export interface VoiceCall {
   inputLevel: React.RefObject<number>
   outputLevel: React.RefObject<number>
   audioRef: React.RefObject<HTMLAudioElement | null>
+  /** Walkie-talkie only: the chat the call talks in, as the host names it. */
+  chat?: string | null
+  /** Walkie-talkie only: the browser holds the agent's audio until the caller allows it. */
+  audioBlocked?: boolean
+  /** Walkie-talkie only: lets the held audio play; call it from a tap. */
+  unlockAudio?: () => void
+  /** Walkie-talkie only: the room lost its connection and is trying to get it back. */
+  reconnecting?: boolean
+  /** The last mute or unmute did not take, in a few words. */
+  muteError?: string | null
+  /** Walkie-talkie only: the silence that sends a turn, from the host. */
+  silenceMs?: number | null
+  /** Walkie-talkie only: a caller turn counting down to being sent. */
+  sendCue?: SendCue | null
+  /** Walkie-talkie only: the call is about to hit its time limit. */
+  limitNote?: string | null
 }
 
 export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking", "talking"])
 
+export const PAGE_CLOSED = "The call ended when the page was closed."
+
 /** How long a WebRTC "disconnected" may last before the call is treated as dropped. */
 const DISCONNECT_GRACE_MS = 6000
 
-function errorText(status: number, body: string): string {
+export function statusErrorKind(status: number): ErrorKind {
+  if (status === 403) return "link"
+  if (status === 429) return "limit"
+  if (status === 503) return "offline"
+  return "other"
+}
+
+export function errorText(status: number, body: string): string {
   if (status === 403) return "This call link is not valid."
   if (status === 429) return "This line has reached its hourly call limit. Try again later."
   if (status === 503) return "The voice line is offline right now."
@@ -87,7 +148,7 @@ function waitForIce(pc: RTCPeerConnection): Promise<void> {
  * the model receives silence while the page still looks connected. The sender's
  * `media-source` report gives the same number with nothing attached to the track.
  */
-function levelsFromStats(report: RTCStatsReport): { mic: number | null; agent: number | null } {
+export function levelsFromStats(report: RTCStatsReport): { mic: number | null; agent: number | null } {
   let mic: number | null = null
   let agent: number | null = null
   report.forEach((entry) => {
@@ -103,7 +164,7 @@ function levelsFromStats(report: RTCStatsReport): { mic: number | null; agent: n
 }
 
 /** What went wrong reaching the microphone, in words a caller can act on. */
-function micErrorText(err: unknown): string | null {
+export function micErrorText(err: unknown): string | null {
   if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
     return location.protocol === "https:" || location.hostname === "localhost"
       ? "This browser will not give a page access to the microphone."
@@ -116,9 +177,18 @@ function micErrorText(err: unknown): string | null {
   return null
 }
 
+export function micErrorKind(err: unknown): ErrorKind | null {
+  if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) return "mic"
+  const name = err instanceof DOMException ? err.name : ""
+  if (name === "NotAllowedError" || name === "SecurityError") return "mic-permission"
+  if (name === "NotFoundError" || name === "OverconstrainedError" || name === "NotReadableError") return "mic"
+  return null
+}
+
 export function useVoiceCall(token: string, fallbackAgent = "your agent"): VoiceCall {
   const [phase, setPhaseState] = useState<Phase>(token ? "idle" : "error")
   const [error, setError] = useState<string | null>(token ? null : "This link is missing its token. Ask for the full call link.")
+  const [errorKind, setErrorKind] = useState<ErrorKind | null>(token ? null : "link")
   const [endedText, setEndedText] = useState<string | null>(null)
   const [lines, setLines] = useState<Line[]>([])
   const [streamingId, setStreamingId] = useState<number | null>(null)
@@ -292,6 +362,7 @@ export function useVoiceCall(token: string, fallbackAgent = "your agent"): Voice
     const p = phaseRef.current
     if (p === "connecting" || LIVE_PHASES.has(p)) return
     setError(null)
+    setErrorKind(null)
     setEndedText(null)
     setLines([])
     lastWho.current = ""
@@ -371,7 +442,7 @@ export function useVoiceCall(token: string, fallbackAgent = "your agent"): Voice
         hangupHost(createdSession)
         return
       }
-      if (!res.ok) throw new Error(errorText(res.status, body))
+      if (!res.ok) throw new CallError(errorText(res.status, body), statusErrorKind(res.status))
       if (!createdSession) throw new Error("The host did not return a session ID.")
       await conn.setRemoteDescription({ type: "answer", sdp: body })
     } catch (err) {
@@ -380,6 +451,7 @@ export function useVoiceCall(token: string, fallbackAgent = "your agent"): Voice
       // If the host answered, it holds a session for us: tell it to hang up.
       teardown(createdSession !== null)
       setError(msg)
+      setErrorKind(micErrorKind(err) ?? (err instanceof CallError ? err.kind : "other"))
       setPhase("error")
     }
   }, [token, onEvent, end, teardown, setPhase, setStreaming, hangupHost])
@@ -478,14 +550,23 @@ export function useVoiceCall(token: string, fallbackAgent = "your agent"): Voice
     }
   }, [phase, setPhase, setStreaming])
 
-  // A closing tab still tells the host to hang up.
+  // A closing tab still tells the host to hang up. A page the browser keeps and shows again
+  // (back/forward cache) comes back with that call over, so "call" works again.
   useEffect(() => {
     const onHide = () => {
-      if (pc.current) teardown(true)
+      if (pc.current) end(true, PAGE_CLOSED)
+    }
+    const onShow = (e: PageTransitionEvent) => {
+      const p = phaseRef.current
+      if (e.persisted && !pc.current && (p === "connecting" || LIVE_PHASES.has(p))) end(false, PAGE_CLOSED)
     }
     window.addEventListener("pagehide", onHide)
-    return () => window.removeEventListener("pagehide", onHide)
-  }, [teardown])
+    window.addEventListener("pageshow", onShow)
+    return () => {
+      window.removeEventListener("pagehide", onHide)
+      window.removeEventListener("pageshow", onShow)
+    }
+  }, [end])
 
   const startVoid = useCallback(() => {
     void start()
@@ -500,6 +581,7 @@ export function useVoiceCall(token: string, fallbackAgent = "your agent"): Voice
       elapsed,
       muted,
       error,
+      errorKind,
       endedText,
       micStream,
       remoteStream,
@@ -510,6 +592,6 @@ export function useVoiceCall(token: string, fallbackAgent = "your agent"): Voice
       outputLevel,
       audioRef,
     }),
-    [phase, lines, streamingId, agentName, elapsed, muted, error, endedText, micStream, remoteStream, startVoid, endCall, toggleMute]
+    [phase, lines, streamingId, agentName, elapsed, muted, error, errorKind, endedText, micStream, remoteStream, startVoid, endCall, toggleMute]
   )
 }

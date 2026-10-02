@@ -220,7 +220,9 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   // (e.g. free-text DM replies during multi-step approval flows). They run in
   // registration order; the first to claim the message stops routing. The
   // sequential await is intentional — first-to-claim is order-dependent.
-  for (const intercept of messageInterceptors) {
+  // A host-addressed event (agentGroupId: a voice call's turn) is not a typed
+  // reply to anything, so no interceptor may take it (e.g. as a rejection reason).
+  for (const intercept of event.agentGroupId ? [] : messageInterceptors) {
     if (await intercept(event)) return;
   }
 
@@ -347,7 +349,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   //    we need their actual rows for fan-out).
   const agents = await getMessagingGroupAgents(mg.id);
 
-  // 3b. Host chat-commands (/model, /status, /config, /restart) are owned by
+  // 3b. Host chat-commands (/model, /status, /config, /restart, /voice) are owned by
   //     the host and answered ONCE per message, independent of per-agent
   //     engage rules (a slash command need not @mention the bot to be
   //     honored). On Telegram the native binding intercepts these at the
@@ -403,6 +405,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   let subscribed = false;
 
   for (const agent of agents) {
+    if (event.agentGroupId && agent.agent_group_id !== event.agentGroupId) continue;
     const agentGroup = await getAgentGroup(agent.agent_group_id);
     if (!agentGroup) continue;
 
@@ -421,7 +424,10 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     );
     const effectiveThreadId = threadsEnabled ? event.threadId : null;
 
-    const ruleEngages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
+    // An event addressed to this one agent by the host (a voice call's turn) engages it whatever
+    // the chat's trigger; the access and sender-scope gates below still apply.
+    const ruleEngages =
+      !!event.agentGroupId || (await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId));
 
     const accessOk =
       ruleEngages && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);
@@ -672,6 +678,8 @@ async function deliverToAgent(
     content,
     trigger: wake,
   });
+  // Stored is what a host-made turn waits for, whether it woke the agent or became context.
+  event.onStored?.();
 
   if (wake && created) {
     // A brand-new engaged session: notify registered modules with the
@@ -713,7 +721,8 @@ async function deliverToAgent(
       event.platformId,
       effectiveThreadId,
       mg.instance,
-      event.message.id,
+      // A host-addressed event's id (livekit:<call>:<n>) is no platform message to react to.
+      event.agentGroupId ? undefined : event.message.id,
     );
     const freshSession = await getSession(session.id);
     if (freshSession) {

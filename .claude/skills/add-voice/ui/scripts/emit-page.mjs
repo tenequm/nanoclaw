@@ -54,6 +54,8 @@ export interface VoiceUiConfig {
   timestamps?: boolean;
   /** Let the caller pick a colorway from the page (remembered in their browser). */
   colorwayPicker?: boolean;
+  /** Which call the page places: GPT-Live over WebRTC (default) or the LiveKit walkie-talkie. Set by the host per route. */
+  transport?: 'openai' | 'livekit';
 }
 
 /** sha256 over the ui/ sources this module was generated from; the channel tests check it. */

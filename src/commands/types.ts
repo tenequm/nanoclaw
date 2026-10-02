@@ -15,7 +15,7 @@ import type { EngageMode, SenderScope } from '../types.js';
 
 // --- Commands ---
 
-export type CommandName = 'model' | 'status' | 'config' | 'restart';
+export type CommandName = 'model' | 'status' | 'config' | 'restart' | 'voice';
 
 export interface CommandSpec {
   /** Short popup/help description. Safe for setMyCommands (<= 256 chars). */
@@ -30,8 +30,8 @@ export interface CommandSpec {
 }
 
 /**
- * The four chat commands. Order is the canonical popup order: read-only
- * /status first, then the mutating trio.
+ * The chat commands. /voice joins the popup only in chats with an agent that
+ * has a voice line (see the telegram grants module).
  */
 export const COMMANDS: Record<CommandName, CommandSpec> = {
   status: {
@@ -50,9 +50,16 @@ export const COMMANDS: Record<CommandName, CommandSpec> = {
     description: 'Restart the agent container now',
     memberRunnable: false,
   },
+  voice: {
+    description: "Get the agent's voice call links; walkie-talkie calls then talk in this chat",
+    memberRunnable: false,
+  },
 };
 
-/** Canonical command order for popups and pickers (also the admin popup set). */
+/**
+ * Canonical command order for popups and pickers (also the admin popup set):
+ * read-only /status first, then the mutating trio. /voice is appended per chat.
+ */
 export const COMMAND_ORDER: readonly CommandName[] = ['status', 'model', 'config', 'restart'] as const;
 
 // --- Model catalog ---
@@ -141,7 +148,13 @@ export const CONFIG_FIELDS: readonly ConfigField[] = [
 
 // --- Command result union ---
 
-export type CommandFailureReason = 'unauthorized' | 'unknown-agent' | 'invalid-value' | 'unknown-field';
+export type CommandFailureReason =
+  | 'unauthorized'
+  | 'unknown-agent'
+  | 'invalid-value'
+  | 'unknown-field'
+  | 'no-voice-line'
+  | 'voice-unavailable';
 
 /** Message-safe structured detail for a failed command (data, not prose). */
 export interface CommandFailureDetail {
@@ -283,6 +296,28 @@ export interface ActivationChangeView {
   /** The regex source when mode==='pattern', else null. */
   pattern: string | null;
 }
+
+/** /voice for one agent: its line(s) now talk in this chat; the links open the call page. */
+export interface VoiceTargetView {
+  agentName: string;
+  agentGroupId: string;
+  /** The call pages of each of the agent's voice lines. Secrets: never log them. */
+  links: readonly VoiceLineLinks[];
+}
+
+/** One voice line's call pages; each is null when its engine is off on this host. */
+export interface VoiceLineLinks {
+  /** The LiveKit walkie-talkie page (`/voice?t=`). */
+  walkie: string | null;
+  /** The OpenAI live call page (`/voice/call?t=`). */
+  liveCall: string | null;
+}
+
+/** What /voice did in a chat: nothing to say (unknown sender), a refusal, or one result per agent. */
+export type VoiceCommandOutcome =
+  | { kind: 'drop' }
+  | { kind: 'refused' }
+  | { kind: 'done'; results: ReadonlyArray<{ agentName: string; result: CommandResult<VoiceTargetView> }> };
 
 // --- Target resolution ---
 
