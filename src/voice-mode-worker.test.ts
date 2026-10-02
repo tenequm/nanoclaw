@@ -4,9 +4,6 @@
  * text helpers, and runCall end to end with a fake room and session. The LiveKit session,
  * Silero and Gemini themselves are not loaded here.
  */
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 
 import {
   APIConnectionError,
@@ -42,26 +39,18 @@ import {
   MAX_IDLE_WAIT_MS,
   maxSpokenChars,
   parseJobMetadata,
-  pathSegment,
-  pruneRecordings,
   readJobHeader,
-  recordingDays,
   runCall,
   SendCountdown,
   speakableText,
   TtsFallback,
   TURN_SETTLE_MS,
-  TurnCapture,
   TurnTaking,
   callSession,
   wholeReplySpeech,
-  writeTurnRecording,
   type CallJob,
   type CallVoice,
   type CallVoiceEvents,
-  type TurnAudio,
-  type TurnRecord,
-  type TurnTake,
   type SendResult,
   type VoiceSettings,
   type TurnTakingDeps,
@@ -633,7 +622,7 @@ describe('runCall', () => {
     expect(v.createVoice).toHaveBeenCalledWith(
       ctx,
       expect.objectContaining({ callId: 'call-1' }),
-      { geminiKey: 'gk-test', record: false },
+      { geminiKey: 'gk-test' },
       v.events,
     );
     // The host address and secret come from the worker's settings, never from the dispatch.
@@ -643,7 +632,7 @@ describe('runCall', () => {
       expect(call.auth).toBe(`Bearer ${secret}`);
     }
 
-    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    v.events.onTurn('Book a table');
     await vi.waitFor(() =>
       expect(host.calls.find((c) => c.url.endsWith('/utterance'))?.body).toEqual({
         callId: 'call-1',
@@ -672,9 +661,9 @@ describe('runCall', () => {
     const host = fakeHostFetch();
     const v = fakeVoice();
     await runCall(ctx, deps(host.fetchImpl, v.createVoice));
-    // A noise is turn 1 here (it is recorded), so the host's first turn is this worker's second.
-    v.events.onTurnDropped({ sttModel: 'gemini-3.5-transcribe-live' });
-    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    // A lost turn is turn 1 here (the page hears it was lost), so the host's first turn is this worker's second.
+    v.events.onTurnLost('empty', { speechMs: 900 });
+    v.events.onTurn('Book a table');
     await vi.waitFor(() =>
       expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 2, status: 'sent', text: 'Book a table' }),
     );
@@ -682,13 +671,15 @@ describe('runCall', () => {
     host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
     host.emit({ type: 'reply', text: 'Answer to a turn this worker never sent.', turn: '9' });
     host.emit({ type: 'reply', text: 'From a host that names no turns.' });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledTimes(4));
+    // The lost turn's line, then the four replies.
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledTimes(5));
     expect(v.voice.publishReply.mock.calls.map(([{ more: _more, ...info }]) => info)).toEqual([
-      { reply: 1, turn: 2, part: 1 },
-      { reply: 2, turn: 2, part: 2 },
+      { reply: 1, notice: true },
+      { reply: 2, turn: 2, part: 1 },
+      { reply: 3, turn: 2, part: 2 },
       // Not known here, so not labelled at all: never a guessed link.
-      { reply: 3 },
       { reply: 4 },
+      { reply: 5 },
     ]);
     host.endStream();
   });
@@ -698,7 +689,7 @@ describe('runCall', () => {
     const host = fakeHostFetch(200, 429);
     const v = fakeVoice();
     await runCall(ctx, deps(host.fetchImpl, v.createVoice));
-    v.events.onTurn('Привіт', { sttModel: 'gemini-3.5-transcribe-live' });
+    v.events.onTurn('Привіт');
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.rate_limited.uk));
     expect(v.voice.publishTurn).toHaveBeenCalledWith({
       turn: 1,
@@ -706,7 +697,7 @@ describe('runCall', () => {
       reason: 'rate_limited',
       text: 'Привіт',
     });
-    v.events.onTurnLost('stt', { speechMs: 1200 }, { sttModel: 'gemini-3.5-transcribe-live' });
+    v.events.onTurnLost('stt', { speechMs: 1200 });
     expect(v.voice.publishTurn).toHaveBeenLastCalledWith({ turn: 2, status: 'lost', reason: 'stt' });
   });
 
@@ -715,7 +706,7 @@ describe('runCall', () => {
     const host = fakeHostFetch(200, 504);
     const v = fakeVoice();
     await runCall(ctx, deps(host.fetchImpl, v.createVoice));
-    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    v.events.onTurn('Book a table');
     await vi.waitFor(() =>
       expect(v.voice.publishTurn).toHaveBeenCalledWith({
         turn: 1,
@@ -740,7 +731,7 @@ describe('runCall', () => {
     expect(v.voice.publishReply).toHaveBeenLastCalledWith(expect.objectContaining({ turn: 1, part: 1 }));
 
     host.emit({ type: 'chat', chat: true });
-    v.events.onTurn('And a taxi', { sttModel: 'gemini-3.5-transcribe-live' });
+    v.events.onTurn('And a taxi');
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.timeout.en));
     host.endStream();
   });
@@ -759,7 +750,7 @@ describe('runCall', () => {
     });
     const v = fakeVoice();
     await runCall(ctx, deps(fetchImpl, v.createVoice));
-    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    v.events.onTurn('Book a table');
     await vi.waitFor(() =>
       expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' }),
     );
@@ -768,7 +759,7 @@ describe('runCall', () => {
     expect(posts[1].body).toEqual(posts[0].body);
 
     failures = [new DOMException('The operation was aborted due to timeout', 'TimeoutError')];
-    v.events.onTurn('And a taxi', { sttModel: 'gemini-3.5-transcribe-live' });
+    v.events.onTurn('And a taxi');
     await vi.waitFor(() =>
       expect(v.voice.publishTurn).toHaveBeenCalledWith({
         turn: 2,
@@ -847,58 +838,6 @@ describe('runCall', () => {
     expect(job.shutdown).toHaveBeenCalledWith('LIVEKIT_API_SECRET is not set for the worker');
   });
 
-  it('records each turn with its outcome once the host answered, when recordings are on', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-rec-'));
-    try {
-      const { ctx } = fakeJob();
-      const host = fakeHostFetch();
-      const v = fakeVoice();
-      await runCall(
-        ctx,
-        deps(host.fetchImpl, v.createVoice, {
-          env: { ...ENV, VOICE_MODE_RECORDINGS_DAYS: '7' },
-          recordingsRoot: root,
-        }),
-      );
-      expect(v.createVoice.mock.calls[0][2]).toMatchObject({ record: true });
-      const audio = (startedAt: number, sttModel = 'gemini-3.5-transcribe-live'): TurnTake => ({
-        audio: {
-          pcm: new Int16Array(1600),
-          sampleRate: 16_000,
-          startedAt,
-          endedAt: startedAt + 100,
-          speechMs: 80,
-          truncated: false,
-        },
-        sttModel,
-      });
-      const at = Date.UTC(2026, 9, 2, 12, 0, 0);
-      v.events.onTurn('Book a table', audio(at));
-      v.events.onTurnLost('empty', { speechMs: 900 }, audio(at + 1000, 'gemini-3.5-transcribe'));
-      v.events.onTurnDropped(audio(at + 2000));
-      const dir = path.join(root, 'Andy', '2026-10-02');
-      await vi.waitFor(() => expect(fs.readdirSync(dir).sort()).toHaveLength(6));
-      const first = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-1.json'), 'utf8')) as TurnRecord;
-      expect(first).toMatchObject({
-        callId: 'call-1',
-        lineId: 'voice-mode:abc',
-        agent: 'Andy',
-        turn: 1,
-        startedAt: '2026-10-02T12:00:00.000Z',
-        sttModel: 'gemini-3.5-transcribe-live',
-        transcript: 'Book a table',
-        host: { accepted: true, status: 202, id: '1' },
-      });
-      const lost = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-2.json'), 'utf8')) as TurnRecord;
-      expect(lost).toMatchObject({ turn: 2, transcript: '', reason: 'empty', sttModel: 'gemini-3.5-transcribe' });
-      const noise = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-3.json'), 'utf8')) as TurnRecord;
-      expect(noise).toMatchObject({ turn: 3, reason: 'noise' });
-      expect(fs.readFileSync(path.join(dir, 'call-1-1.wav')).subarray(0, 4).toString()).toBe('RIFF');
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
   it('tells the page it is updating when the host speaks another version, then lets the host end it', async () => {
     vi.useFakeTimers();
     const { job, ctx } = fakeJob({ ...META, v: 2 });
@@ -971,95 +910,6 @@ describe('runCall', () => {
       body: { callId: 'call-1', reason: 'job shutdown', restart: true },
     });
     expect(job.shutdown).toHaveBeenCalledWith('job shutdown');
-  });
-});
-
-describe('turn recordings', () => {
-  const frame = (value: number, ms: number) => {
-    const samples = (16 * ms) | 0;
-    return new AudioFrame(new Int16Array(samples).fill(value), 16_000, 1, samples);
-  };
-
-  it('captures a turn from just before the speech to just after it, and starts over', () => {
-    let now = 10_000;
-    const capture = new TurnCapture(() => now);
-    expect(capture.take()).toBeUndefined();
-    for (let i = 0; i < 10; i++) capture.push(frame(1, 100)); // a second of quiet: only 300 ms kept
-    capture.onSpeaking(true);
-    for (let i = 0; i < 5; i++) capture.push(frame(9, 100));
-    capture.push(frame(1, 550)); // the VAD ends speech after this much silence
-    capture.onSpeaking(false);
-    for (let i = 0; i < 25; i++) capture.push(frame(1, 100)); // the silence that ends the turn
-    now = 20_000;
-    const audio = capture.take()!;
-    expect(audio.sampleRate).toBe(16_000);
-    expect(audio.pcm.length).toBe(16 * (300 + 500 + 300));
-    expect(audio.speechMs).toBe(500);
-    expect(audio.startedAt).toBe(10_000 - 300);
-    expect(audio.endedAt).toBe(10_000 - 300 + 1100);
-    expect(audio.pcm[16 * 300]).toBe(9);
-    expect(capture.take()).toBeUndefined();
-  });
-
-  it('writes owner-only files under agent and day, and prunes old ones with their empty folders', async () => {
-    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'voice-rec-')), 'voice-recordings');
-    try {
-      const record: TurnRecord = {
-        callId: 'c/../1',
-        lineId: 'voice-mode:abc',
-        agent: '../Andy Bot',
-        turn: 2,
-        startedAt: '2026-10-02T12:00:00.000Z',
-        endedAt: '2026-10-02T12:00:01.000Z',
-        speechMs: 700,
-        truncated: false,
-        sttModel: 'gemini-3.5-transcribe-live',
-        transcript: 'hello',
-        host: { accepted: true, id: '4', status: 202 },
-      };
-      const audio: TurnAudio = {
-        pcm: new Int16Array(16_000),
-        sampleRate: 16_000,
-        startedAt: 0,
-        endedAt: 1000,
-        speechMs: 700,
-        truncated: false,
-      };
-      const base = await writeTurnRecording(root, record, audio);
-      expect(base).toBe(path.join(root, 'Andy-Bot', '2026-10-02', 'c-1-2'));
-      expect(fs.statSync(`${base}.wav`).mode & 0o777).toBe(0o600);
-      expect(fs.statSync(`${base}.json`).mode & 0o777).toBe(0o600);
-      expect(fs.statSync(path.dirname(base)).mode & 0o777).toBe(0o700);
-      expect(fs.statSync(root).mode & 0o777).toBe(0o700);
-      expect(fs.statSync(`${base}.wav`).size).toBe(44 + 32_000);
-      expect(JSON.parse(fs.readFileSync(`${base}.json`, 'utf8'))).toEqual(record);
-
-      const fresh = await writeTurnRecording(
-        root,
-        { ...record, turn: 3, startedAt: '2026-10-09T12:00:00.000Z' },
-        audio,
-      );
-      const old = Date.now() / 1000 - 10 * 86_400;
-      fs.utimesSync(`${base}.wav`, old, old);
-      fs.utimesSync(`${base}.json`, old, old);
-      expect(await pruneRecordings(root, 7)).toBe(2);
-      expect(fs.existsSync(path.dirname(base))).toBe(false);
-      expect(fs.existsSync(`${fresh}.wav`)).toBe(true);
-      expect(fs.existsSync(root)).toBe(true);
-      expect(await pruneRecordings(path.join(root, 'missing'), 7)).toBe(0);
-    } finally {
-      fs.rmSync(path.dirname(root), { recursive: true, force: true });
-    }
-  });
-
-  it('reads the retention setting, off unless a positive whole number of days', () => {
-    expect(recordingDays(undefined)).toBe(0);
-    expect(recordingDays('')).toBe(0);
-    expect(recordingDays('0')).toBe(0);
-    expect(recordingDays('-3')).toBe(0);
-    expect(recordingDays('1.5')).toBe(0);
-    expect(recordingDays(' 14 ')).toBe(14);
-    expect(pathSegment('..')).toBe('unnamed');
   });
 });
 
@@ -1183,10 +1033,9 @@ describe('speech and transcription adapters', () => {
       onTurn: () => undefined,
       onCallerSpeaking: () => undefined,
       onTurnLost: () => undefined,
-      onTurnDropped: () => undefined,
       onClosed: () => undefined,
     };
-    const { session } = callSession(META, { geminiKey: 'gk-test', record: false }, { vad, fallbackVad: vad }, events, {
+    const { session } = callSession(META, { geminiKey: 'gk-test' }, { vad, fallbackVad: vad }, events, {
       ...silentLog,
       error: () => undefined,
     });

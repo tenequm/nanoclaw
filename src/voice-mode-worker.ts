@@ -29,8 +29,6 @@
  */
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import path from 'node:path';
-import { ReadableStream, TransformStream } from 'node:stream/web';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -57,7 +55,7 @@ import {
 } from '@livekit/agents';
 import * as google from '@livekit/agents-plugin-google';
 import * as silero from '@livekit/agents-plugin-silero';
-import { AudioFrame, RoomEvent } from '@livekit/rtc-node';
+import { RoomEvent } from '@livekit/rtc-node';
 
 import {
   baseLanguage,
@@ -78,7 +76,6 @@ import {
   type CallReplyInfo,
   type CallTurnStatus,
 } from './channels/voice-mode-protocol.js';
-import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 
 /** The worker's duration cap outlasts the host's by this; it only fires when the host is gone. */
@@ -116,17 +113,12 @@ const VAD_SILENCE_MS = 550;
 /** A worker on another protocol version waits this long for the caller, then this long for their page to see why. */
 const MISMATCH_JOIN_WAIT_MS = 30_000;
 const MISMATCH_NOTICE_MS = 3_000;
-/** A turn recording keeps this much audio from before the caller's first speech, and after the last. */
-const RECORDING_PAD_MS = 300;
-/** Longest turn recording; audio past it is not kept. */
-const MAX_RECORDED_TURN_MS = 120_000;
 /** A turn whose POST failed in transit is sent once more, under the same turn key, after this long. */
 const TURN_RETRY_DELAY_MS = 500;
 /** Timed-out turns kept for a late `turn-stored`; the host remembers no more turn keys than this either. */
 const MAX_UNCONFIRMED_TURNS = 32;
 /** VOICE_MODE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
 export const DEFAULT_MAX_SPOKEN_CHARS = 800;
-const DAY_MS = 86_400_000;
 
 /** The worker's HTTP client for the host's /webhook/voice-mode/livekit/agent routes. */
 export class HostLink {
@@ -465,116 +457,6 @@ export class TtsFallback extends tts.FallbackAdapter {
   }
 }
 
-/** One caller turn's audio as the transcription heard it: 16 kHz mono PCM. */
-export interface TurnAudio {
-  pcm: Int16Array;
-  sampleRate: number;
-  startedAt: number;
-  endedAt: number;
-  speechMs: number;
-  truncated: boolean;
-}
-
-const samplesOf = (ms: number): number => Math.round((ms * INPUT_SAMPLE_RATE) / 1000);
-
-/**
- * Keeps the current caller turn's audio, for recordings: from just before the first speech
- * (the session's user state turning to speaking) until the turn is taken at its end. Only the
- * open turn is held, capped at MAX_RECORDED_TURN_MS.
- */
-export class TurnCapture {
-  private preRoll: Int16Array[] = [];
-  private preRollSamples = 0;
-  private chunks: Int16Array[] = [];
-  private samples = 0;
-  private inTurn = false;
-  private speaking = false;
-  private startedAt = 0;
-  private speechFrom = 0;
-  private speechSamples = 0;
-  private lastSpeechEnd = 0;
-  private truncated = false;
-
-  constructor(private readonly now: () => number = () => Date.now()) {}
-
-  push(frame: AudioFrame): void {
-    // The session's room input is 16 kHz mono.
-    if (frame.sampleRate === INPUT_SAMPLE_RATE) this.append(frame.data);
-  }
-
-  onSpeaking(speaking: boolean): void {
-    if (speaking && !this.inTurn) {
-      this.inTurn = true;
-      this.chunks = this.preRoll;
-      this.samples = this.preRollSamples;
-      this.preRoll = [];
-      this.preRollSamples = 0;
-      this.startedAt = this.now() - (this.samples * 1000) / INPUT_SAMPLE_RATE;
-    }
-    if (speaking && !this.speaking) this.speechFrom = this.samples;
-    if (!speaking && this.speaking) this.closeSpeech();
-    this.speaking = speaking;
-  }
-
-  /** The open turn's audio, trimmed shortly after its last speech; the capture starts over. */
-  take(): TurnAudio | undefined {
-    if (!this.inTurn) return undefined;
-    if (this.speaking) this.closeSpeech(true);
-    const length = Math.min(this.samples, this.lastSpeechEnd + samplesOf(RECORDING_PAD_MS));
-    const pcm = new Int16Array(length);
-    let offset = 0;
-    for (const chunk of this.chunks) {
-      if (offset >= length) break;
-      const part = chunk.subarray(0, length - offset);
-      pcm.set(part, offset);
-      offset += part.length;
-    }
-    const audio: TurnAudio = {
-      pcm,
-      sampleRate: INPUT_SAMPLE_RATE,
-      startedAt: this.startedAt,
-      endedAt: this.startedAt + (length * 1000) / INPUT_SAMPLE_RATE,
-      speechMs: Math.round((this.speechSamples * 1000) / INPUT_SAMPLE_RATE),
-      truncated: this.truncated,
-    };
-    const speaking = this.speaking;
-    this.inTurn = false;
-    this.speaking = false;
-    this.chunks = [];
-    this.samples = 0;
-    this.speechSamples = 0;
-    this.lastSpeechEnd = 0;
-    this.truncated = false;
-    // Speech already under way belongs to the next turn.
-    if (speaking) this.onSpeaking(true);
-    return audio;
-  }
-
-  /** Speech ends where the VAD's closing silence began; while still speaking, it ends now. */
-  private closeSpeech(stillSpeaking = false): void {
-    const end = stillSpeaking ? this.samples : Math.max(this.speechFrom, this.samples - samplesOf(VAD_SILENCE_MS));
-    this.speechSamples += end - this.speechFrom;
-    this.lastSpeechEnd = end;
-  }
-
-  private append(pcm: Int16Array): void {
-    if (!this.inTurn) {
-      this.preRoll.push(pcm);
-      this.preRollSamples += pcm.length;
-      while (this.preRoll.length > 1 && this.preRollSamples - this.preRoll[0].length >= samplesOf(RECORDING_PAD_MS)) {
-        this.preRollSamples -= this.preRoll.shift()!.length;
-      }
-      return;
-    }
-    if (this.samples >= samplesOf(MAX_RECORDED_TURN_MS)) {
-      this.truncated = true;
-      return;
-    }
-    this.chunks.push(pcm.slice());
-    this.samples += pcm.length;
-  }
-}
-
 /**
  * The page's send cue: while a stretch of caller speech waits out the closing silence that sends
  * it, the `nanoclaw.voice-mode.pending` attribute says how far into that silence it is; it clears
@@ -630,87 +512,6 @@ function pcmToWav(pcm: Int16Array, sampleRate: number): Buffer {
   return Buffer.concat([header, data]);
 }
 
-/** What a turn recording's sidecar JSON says about it. */
-export interface TurnRecord {
-  callId: string;
-  lineId: string;
-  agent: string;
-  turn: number;
-  startedAt: string;
-  endedAt: string;
-  speechMs: number;
-  truncated: boolean;
-  /** The model that transcribed the turn: the streaming one, the fallback, or both joined by '+'. */
-  sttModel: string;
-  /** The text handed to the host; empty when the turn was dropped or lost, with `reason`. */
-  transcript: string;
-  reason?: string;
-  host?: SendResult;
-}
-
-/** Where turn recordings go: NanoClaw's data directory, which git ignores. */
-export const recordingsRoot = (): string => path.join(DATA_DIR, 'voice-recordings');
-
-export const pathSegment = (name: string): string =>
-  name
-    .normalize('NFKC')
-    .replace(/[^\p{L}\p{N}_-]+/gu, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 64) || 'unnamed';
-
-/** Writes `<root>/<agent>/<YYYY-MM-DD>/<callId>-<turn>.wav` and `.json`, owner-only. */
-export async function writeTurnRecording(root: string, record: TurnRecord, audio: TurnAudio): Promise<string> {
-  const dir = path.join(root, pathSegment(record.agent), record.startedAt.slice(0, 10));
-  await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
-  const base = path.join(dir, `${pathSegment(record.callId)}-${record.turn}`);
-  await fs.promises.writeFile(`${base}.wav`, pcmToWav(audio.pcm, audio.sampleRate), { mode: 0o600 });
-  await fs.promises.writeFile(`${base}.json`, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-  return base;
-}
-
-/** Deletes recordings older than `days`, and the directories that leaves empty; returns how many files went. */
-export async function pruneRecordings(root: string, days: number, now = Date.now()): Promise<number> {
-  const cutoff = now - days * DAY_MS;
-  let removed = 0;
-  const walk = async (dir: string): Promise<boolean> => {
-    let entries: fs.Dirent[];
-    try {
-      entries = await fs.promises.readdir(dir, { withFileTypes: true });
-    } catch {
-      return false;
-    }
-    let left = entries.length;
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (await walk(full)) {
-          await fs.promises.rmdir(full).catch(() => undefined);
-          left--;
-        }
-      } else if (entry.isFile()) {
-        // One file that cannot go must not stop the rest from going.
-        const gone = await fs.promises
-          .stat(full)
-          .then(async (stat) => stat.mtimeMs < cutoff && (await fs.promises.unlink(full), true))
-          .catch(() => false);
-        if (gone) {
-          removed++;
-          left--;
-        }
-      }
-    }
-    return left === 0;
-  };
-  await walk(root);
-  return removed;
-}
-
-/** VOICE_MODE_RECORDINGS_DAYS: 0 (the default) records nothing. */
-export function recordingDays(raw: string | undefined): number {
-  const days = Number(raw?.trim() || 0);
-  return Number.isInteger(days) && days > 0 ? days : 0;
-}
-
 /** The call's voice: what turn-taking needs from the session in the room. Faked in tests. */
 export interface CallVoice {
   /** Speak a line, uninterruptible; resolves after playout with whether all of it was synthesized. */
@@ -724,21 +525,13 @@ export interface CallVoice {
   close(): Promise<void>;
 }
 
-/** What the session reports back. `audio` is the turn's recording, when recordings are on. */
+/** What the session reports back. */
 export interface CallVoiceEvents {
-  onTurn(text: string, turn: TurnTake): void;
+  onTurn(text: string): void;
   onCallerSpeaking(speaking: boolean): void;
   /** The caller spoke but no transcript came of it: the transcription failed, or heard no words. */
-  onTurnLost(reason: 'stt' | 'empty', fields: Record<string, unknown>, turn: TurnTake): void;
-  /** Speech too short to count as a turn, with nothing transcribed (a cough, a noise). */
-  onTurnDropped(turn: TurnTake): void;
+  onTurnLost(reason: 'stt' | 'empty', fields: Record<string, unknown>): void;
   onClosed(reason: string): void;
-}
-
-/** A finished turn's recording, if turns are recorded, and which transcription model heard it. */
-export interface TurnTake {
-  audio?: TurnAudio;
-  sttModel: string;
 }
 
 /** What became of a turn handed to the host. */
@@ -1013,7 +806,6 @@ export type CallJob = Pick<
 /** What a call's session needs besides the job metadata. */
 export interface VoiceSettings {
   geminiKey: string;
-  record: boolean;
 }
 
 export interface RunCallDeps {
@@ -1026,8 +818,6 @@ export interface RunCallDeps {
     settings: VoiceSettings,
     events: CallVoiceEvents,
   ): Promise<CallVoice>;
-  /** Where turn recordings are written; NanoClaw's data directory by default. */
-  recordingsRoot?: string;
   /** Tell the caller's page this worker cannot serve the host's protocol version. */
   markUpdating(ctx: CallJob): Promise<void>;
   log: Pick<Console, 'info' | 'warn'>;
@@ -1055,35 +845,13 @@ const loadFallbackVad = (): Promise<VAD> =>
   });
 
 class CallAgent extends voice.Agent {
-  constructor(
-    private readonly onTurn: (text: string) => void,
-    private readonly tap?: (frame: AudioFrame) => void,
-  ) {
+  constructor(private readonly onTurn: (text: string) => void) {
     super({ instructions: '' });
   }
 
   /** With no LLM in the session, nothing answers after this; the host's agent does, later. */
   override async onUserTurnCompleted(_chatCtx: llm.ChatContext, message: llm.ChatMessage): Promise<void> {
     this.onTurn(message.textContent?.trim() ?? '');
-  }
-
-  /** The audio the transcription gets (silence while the agent speaks), copied for recordings. */
-  override async sttNode(
-    audio: ReadableStream<AudioFrame> | AsyncIterable<AudioFrame>,
-    modelSettings: voice.ModelSettings,
-  ): Promise<ReadableStream<stt.SpeechEvent | string> | null> {
-    const tap = this.tap;
-    if (!tap) return super.sttNode(audio, modelSettings);
-    const source = audio instanceof ReadableStream ? audio : ReadableStream.from(audio);
-    const copied = source.pipeThrough(
-      new TransformStream<AudioFrame, AudioFrame>({
-        transform(frame, controller) {
-          tap(frame);
-          controller.enqueue(frame);
-        },
-      }),
-    );
-    return super.sttNode(copied, modelSettings);
   }
 }
 
@@ -1114,7 +882,6 @@ export function callSession(
 ): { session: voice.AgentSession; agent: voice.Agent; say(text: string): Promise<boolean> } {
   const apiKey = settings.geminiKey;
   const countdown = new SendCountdown(publishPending, meta.silenceMs);
-  const capture = settings.record ? new TurnCapture() : undefined;
   // The host already trimmed, deduplicated and capped it.
   const vocabulary = meta.vocabulary ?? [];
   const languages = callLanguages(meta.languages);
@@ -1182,16 +949,12 @@ export function callSession(
   };
   const handBackTimer = fallback ? setInterval(handBack, HAND_BACK_CHECK_MS) : undefined;
   handBackTimer?.unref();
-  const heardBy = new Set<string>();
-  const take = (): TurnTake => {
-    const models = [...heardBy];
-    heardBy.clear();
+  /** The turn is over (sent, lost or dropped): the next speech opens a new one. */
+  const closeTurn = (): void => {
     turnOpen = false;
     turnSpeechMs = 0;
-    const turn = { audio: capture?.take(), sttModel: models.length > 0 ? models.join('+') : transcription.model };
     countdown.clear();
     handBack();
-    return turn;
   };
 
   const primaryTts = new google.beta.TTS({ apiKey, model: meta.ttsModel, voiceName: meta.ttsVoice, instructions: '' });
@@ -1261,11 +1024,7 @@ export function callSession(
       // Speech heard under the agent's is not transcribed, so it sends nothing to count down to.
       if (turnOpen && !agentSpeaking && agentSpokeAt < speakingSince) countdown.stopped(ev.createdAt - VAD_SILENCE_MS);
     }
-    capture?.onSpeaking(speaking);
     events.onCallerSpeaking(speaking);
-  });
-  session.on(voice.AgentSessionEventTypes.UserInputTranscribed, (ev) => {
-    if (ev.isFinal && ev.transcript.trim()) heardBy.add(transcription.model);
   });
   session.on(voice.AgentSessionEventTypes.AgentStateChanged, (ev) => {
     agentSpeaking = ev.newState === 'speaking';
@@ -1281,12 +1040,13 @@ export function callSession(
   session.on(voice.AgentSessionEventTypes.UserTranscriptionTimeout, (ev) => {
     // Silero reports no speech length at its end of speech, so the session counts it.
     const spokeMs = turnSpeechMs;
-    const turn = take();
+    closeTurn();
     // While the agent speaks the transcription hears silence on purpose: the caller is not heard.
     if (agentSpeaking || agentSpokeAt >= ev.vadSpeechStartedAt) return;
     const sttFailed = sttFailedAt >= ev.vadSpeechStartedAt;
-    if (spokeMs < MIN_LOST_SPEECH_MS && !sttFailed) return events.onTurnDropped(turn);
-    events.onTurnLost(sttFailed ? 'stt' : 'empty', { speechMs: spokeMs }, turn);
+    // Speech too short to count as a turn, with nothing transcribed (a cough, a noise), is dropped.
+    if (spokeMs < MIN_LOST_SPEECH_MS && !sttFailed) return;
+    events.onTurnLost(sttFailed ? 'stt' : 'empty', { speechMs: spokeMs });
   });
   session.on(voice.AgentSessionEventTypes.Close, (ev) => {
     clearInterval(handBackTimer);
@@ -1299,13 +1059,10 @@ export function callSession(
 
   return {
     session,
-    agent: new CallAgent(
-      (text) => {
-        const turn = take();
-        if (text) events.onTurn(text, turn);
-      },
-      capture && ((frame) => capture.push(frame)),
-    ),
+    agent: new CallAgent((text) => {
+      closeTurn();
+      if (text) events.onTurn(text);
+    }),
     async say(text) {
       // Replies are spoken one at a time, so a failure counted meanwhile is this one's.
       const failures = ttsFailures;
@@ -1337,7 +1094,7 @@ async function sessionVoice(
   await session.start({
     agent,
     room: ctx.room,
-    // 16 kHz in: what Silero, the transcription and the recordings all take.
+    // 16 kHz in: what Silero and the transcription take.
     inputOptions: {
       participantIdentity: meta.callerIdentity,
       textEnabled: false,
@@ -1368,13 +1125,7 @@ async function sessionVoice(
 
 function defaultDeps(): RunCallDeps {
   return {
-    env: workerEnv([
-      'GEMINI_API_KEY',
-      'LIVEKIT_API_SECRET',
-      'LIVEKIT_HOST_URL',
-      'VOICE_MODE_RECORDINGS_DAYS',
-      'VOICE_MODE_MAX_SPOKEN_CHARS',
-    ]),
+    env: workerEnv(['GEMINI_API_KEY', 'LIVEKIT_API_SECRET', 'LIVEKIT_HOST_URL', 'VOICE_MODE_MAX_SPOKEN_CHARS']),
     createVoice: (ctx, meta, settings, events) => sessionVoice(ctx as JobContext, meta, settings, events),
     markUpdating: (ctx) => setAttribute(ctx, CALL_UPDATING_ATTRIBUTE, '1'),
     log: workerLog(agentsLog()),
@@ -1425,7 +1176,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   }
   const geminiKey = deps.env.GEMINI_API_KEY;
   if (!geminiKey) return abandon('GEMINI_API_KEY is not set for the worker');
-  const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
 
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
   try {
@@ -1501,45 +1251,20 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     await ctx.deleteRoom().catch(() => undefined);
     ctx.shutdown(reason);
   };
-  // Every caller turn gets a number. The page hears what became of it; a recording, when they are
-  // on, is written once the turn is settled, off the path to the host.
+  // Every caller turn gets a number; the page hears what became of it.
   let turns = 0;
   /** The host's utterance id of each sent turn to its number here, to tell the page what a reply answers. */
   const turnsByHostId = new Map<string, number>();
   /** Turns the host did not confirm, by turn key, until its `turn-stored` says the agent has one after all. */
   const unconfirmed = new Map<string, { turn: number; text: string }>();
   const publish = (status: CallTurnStatus) => callVoice?.publishTurn(status);
-  const saveTurn = (
-    index: number,
-    { audio, sttModel }: TurnTake,
-    transcript: string,
-    outcome: { reason?: string; host?: SendResult },
-  ) => {
-    if (!audio) return;
-    const record: TurnRecord = {
-      callId: meta.callId,
-      lineId: meta.lineId,
-      agent: meta.agentName,
-      turn: index,
-      startedAt: new Date(audio.startedAt).toISOString(),
-      endedAt: new Date(audio.endedAt).toISOString(),
-      speechMs: audio.speechMs,
-      truncated: audio.truncated,
-      sttModel,
-      transcript,
-      ...outcome,
-    };
-    void writeTurnRecording(deps.recordingsRoot ?? recordingsRoot(), record, audio).catch((err: unknown) =>
-      callLog.warn('voice worker: could not save a turn recording', { err, turn: index }),
-    );
-  };
   try {
     callVoice = await deps.createVoice(
       ctx,
       meta,
-      { geminiKey, record },
+      { geminiKey },
       {
-        onTurn: (text, take) => {
+        onTurn: (text) => {
           const turn = ++turns;
           turnTaking.onTurn(text, (host) => {
             if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
@@ -1555,19 +1280,14 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
                 ? { turn, status: 'sent', text }
                 : { turn, status: 'lost', reason: hostLossReason(host), text },
             );
-            saveTurn(turn, take, text, { host });
           });
         },
         onCallerSpeaking: (speaking) => turnTaking.onCallerSpeaking(speaking),
-        onTurnLost: (reason, fields, take) => {
+        onTurnLost: (reason, fields) => {
           if (ending) return;
           const turn = ++turns;
           turnTaking.onTurnLost(reason, fields);
           publish({ turn, status: 'lost', reason });
-          saveTurn(turn, take, '', { reason });
-        },
-        onTurnDropped: (take) => {
-          if (!ending) saveTurn(++turns, take, '', { reason: 'noise' });
         },
         onClosed: (reason) => void end(reason, true),
       },
@@ -1640,7 +1360,6 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'LIVEKIT_AGENT_NAME',
     'LIVEKIT_HOST_URL',
     'VOICE_MODE_WORKER_HEALTH_PORT',
-    'VOICE_MODE_RECORDINGS_DAYS',
     'VOICE_MODE_MAX_SPOKEN_CHARS',
   ]);
   // agents-js initializes its logger once the CLI runs a command; console until then.
@@ -1652,17 +1371,6 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     process.exit(1);
   }
   console.info(`voice worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${hostUrl} (LIVEKIT_HOST_URL)`);
-  const keepDays = recordingDays(env.VOICE_MODE_RECORDINGS_DAYS);
-  if (keepDays > 0) {
-    const prune = () =>
-      void pruneRecordings(recordingsRoot(), keepDays).then(
-        (removed) => removed > 0 && console.info(`voice worker: pruned ${removed} turn recording files`),
-        (err: unknown) => console.warn('voice worker: pruning turn recordings failed', err),
-      );
-    console.info(`voice worker: recording caller turns to ${recordingsRoot()}, kept ${keepDays} days`);
-    prune();
-    setInterval(prune, DAY_MS).unref();
-  }
   cli.runApp(
     new ServerOptions({
       agent: fileURLToPath(import.meta.url),
