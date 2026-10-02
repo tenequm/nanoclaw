@@ -1,14 +1,14 @@
 ---
 name: voice-formatting
-description: How to write replies that will be spoken aloud on a live voice call through the voice channel. Use whenever the inbound message came from the voice channel (sender handle starts with `voice:`) — the reply is read out by a voice model or text-to-speech, not displayed.
+description: How to write replies that will be spoken aloud on a live voice call through the voice channel. Use whenever the inbound message came from the voice channel (sender handle starts with `voice:`, or the text is wrapped in `<voice source="livekit">`) — the reply is read out by text-to-speech, not displayed.
 ---
 
 # Replies on a voice call
 
-Messages from the `voice` channel are transcripts of a live browser
-call. A separate voice model is talking to the caller in real time; it handed
-this turn to you because it needs facts, memory, tools or an action. Whatever
-you reply is read aloud, so write for the ear.
+A message wrapped in `<voice source="livekit">…</voice>` is one spoken turn
+from the caller on a live browser call, transcribed. Your reply is read out by
+text-to-speech (markdown and links stripped), and the caller waits on the line
+until it arrives. Write for the ear.
 
 ## Rules
 
@@ -25,29 +25,17 @@ you reply is read aloud, so write for the ear.
 - **Ask one question at a time** in plain text when you need something from the caller.
   This channel cannot deliver interactive question cards or file attachments.
   Send files through another wired destination.
-- **Don't narrate tools or delays.** The voice model already keeps the caller
-  company while you work.
 
-## What you receive
+## Long material
 
-The message text is the transcript since the last time the voice model asked
-you for help, one turn per line: `Caller: …` and `Assistant: …`. The
-assistant lines are what the voice model already said; don't repeat them.
-
-## Walkie-talkie calls
-
-A message wrapped in `<voice source="livekit">…</voice>` is one spoken turn
-from the caller, transcribed. No voice model sits in between: your reply is read
-out word for word by text-to-speech, and the caller hears silence until it
-arrives. The rules above apply as they are. Where anything long (lists, links,
-code, details) goes depends on the note under the turn. A call on the voice line
-itself: put it in a separate written message to your chat, and say so in one
-spoken sentence. A call that talks in a chat: every message you send to that
-chat during the call is read aloud, so offer it for after the call instead.
-Only the start of a long message is spoken (about 800 characters unless the
-operator set another cap): the rest is cut at a sentence and the caller hears
-that it is in the chat, so say what matters first.
-More turns can arrive while you work: the caller adding to
+Where anything long (lists, links, code, details) goes depends on the note
+under the turn. A call on the voice line itself: put it in a separate written
+message to your chat, and say so in one spoken sentence. A call that talks in
+a chat: every message you send to that chat during the call is read aloud, so
+offer it for after the call instead. Only the start of a long message is
+spoken (about 800 characters unless the operator set another cap): the rest is
+cut at a sentence and the caller hears that it is in the chat, so say what
+matters first. More turns can arrive while you work: the caller adding to
 what they said.
 
 The caller speaks Ukrainian or English: a transcript that looks Russian is
@@ -56,7 +44,7 @@ if the caller spoke English), never in Russian.
 
 ## Proactive messages
 
-While a call is active, a message outside a delegation (a reminder or
-follow-up) is spoken too. Keep it to one sentence and lead with why you are
+While a call is active, a message you send that answers no turn (a reminder
+or follow-up) is spoken too. Keep it to one sentence and lead with why you are
 interrupting. After hangup, delivery fails; use another wired destination for
 a message that must reach the person while they are offline.

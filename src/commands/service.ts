@@ -81,7 +81,6 @@ import {
   type TargetAgent,
   type TargetResolution,
   type VoiceCommandOutcome,
-  type VoiceLineLinks,
   type VoiceTargetView,
 } from './types.js';
 
@@ -563,18 +562,16 @@ export async function restartAgent(agentGroupId: string, actorUserId: string): P
 
 // --- /voice ---
 
-/** A voice line's call links; null when the host has none for it (no voice adapter, or no link token here). */
-export type VoiceLinkFn = (line: MessagingGroup) => VoiceLineLinks | null;
+/** A voice line's call link; null when the host has none for it (no voice adapter, or no link token here). */
+export type VoiceLinkFn = (line: MessagingGroup) => string | null;
 
 /** Asks the live voice adapter, the only holder of the link tokens. */
 const liveVoiceLink: VoiceLinkFn = (line) => {
   // Structural, not voice.ts's VoiceChannelAdapter: core must still build once add-voice is removed.
   const adapter = getChannelAdapterExact(line.instance ?? line.channel_type) as
-    | { walkieLink?(platformId: string): string | null; liveCallLink?(platformId: string): string | null }
+    | { callLink?(platformId: string): string | null }
     | undefined;
-  const walkie = adapter?.walkieLink?.(line.platform_id) ?? null;
-  const liveCall = adapter?.liveCallLink?.(line.platform_id) ?? null;
-  return walkie || liveCall ? { walkie, liveCall } : null;
+  return adapter?.callLink?.(line.platform_id) ?? null;
 };
 
 /** The agent's voice lines: its `voice` messaging groups (a chat is wired to an agent at most once). */
@@ -607,7 +604,7 @@ function callChatThread(wiring: MessagingGroupAgent, mg: MessagingGroup, threadI
  * Make this chat the call chat of the agent's voice line(s) that belong to
  * `actorUserId`, and return their call links. Admin only. A line
  * belongs to the chat accounts voice_line_owners names for it (one person's
- * accounts across channels); another person's line is never bound or linked here. The call chat is where the line's LiveKit
+ * accounts across channels); another person's line is never bound or linked here. The call chat is where the line's
  * calls talk (src/channels/voice-livekit.ts), as the line's own caller, until
  * /voice is run in another chat. The links are secrets: callers send them to
  * this chat only and never log them.

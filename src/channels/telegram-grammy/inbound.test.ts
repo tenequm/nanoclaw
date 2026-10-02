@@ -160,12 +160,12 @@ describe('toInboundMessage propagates author.isBot', () => {
 describe('extractReplyContext keeps voice call links out of the agent', () => {
   it('redacts the link of a quoted /voice reply, whole message or highlighted fragment', () => {
     const text =
-      '🎙 Walkie-talkie with Emma: https://host.example/voice?t=0123abcd\n📞 Live call (OpenAI): https://host.example/voice/call?t=0123abcd\n\nWalkie-talkie calls now talk in this chat.';
+      '🎙 Voice call with Emma: https://host.example/voice?t=0123abcd\n\nVoice calls now talk in this chat, until /voice is run in another one.';
     const reply = { message_id: 9, text, from: { first_name: 'Bot' } };
     expect(extractReplyContext({ message_id: 10, reply_to_message: reply } as unknown as Message)).toEqual({
       id: '9',
       sender: 'Bot',
-      text: '🎙 Walkie-talkie with Emma: [voice call link]\n📞 Live call (OpenAI): [voice call link]\n\nWalkie-talkie calls now talk in this chat.',
+      text: '🎙 Voice call with Emma: [voice call link]\n\nVoice calls now talk in this chat, until /voice is run in another one.',
     });
     const quoted = {
       message_id: 10,

@@ -12,42 +12,21 @@ type Step = {
   ms: number
   from?: Speaker
   text?: string
-  /** Walkie: the caller pauses at the end of this step and the send countdown runs. */
+  /** The caller pauses at the end of this step and the send countdown runs. */
   cue?: boolean
-  /** Walkie: the caller's last line was sent. */
+  /** The caller's last line was sent. */
   sent?: boolean
-  /** Walkie: what this agent line answers. */
+  /** What this agent line answers. */
   re?: string
-  /** Walkie: the call nears its limit. */
+  /** The call nears its limit. */
   limit?: boolean
-  /** Walkie: the call ends here, with this reason. */
+  /** The call ends here, with this reason. */
   end?: string
 }
 
 const AGENT = "Casa"
+// Walks through every cue: the send countdown, sent marks, what each reply answers, the limit note and an end reason.
 const SCRIPT: Step[] = [
-  { phase: "connecting", ms: 1300 },
-  { phase: "listening", ms: 2800, from: "user", text: "Hey Casa, what did we decide about the launch date?" },
-  { phase: "thinking", ms: 1700 },
-  {
-    phase: "talking",
-    ms: 4800,
-    from: "assistant",
-    text: "We settled on the 24th, right after the beta feedback round closes. Want a reminder on Thursday so you can brief the team?",
-  },
-  { phase: "listening", ms: 1900, from: "user", text: "Yes, and let Laura know." },
-  { phase: "thinking", ms: 1400 },
-  {
-    phase: "talking",
-    ms: 3800,
-    from: "assistant",
-    text: "Done. Thursday at nine is on your calendar, and Laura has a note in the family group.",
-  },
-  { phase: "listening", ms: 2200 },
-]
-
-// The walkie-talkie's cues: the send countdown, sent marks, what each reply answers, the limit note and an end reason.
-const WALKIE_SCRIPT: Step[] = [
   { phase: "connecting", ms: 1300 },
   { phase: "listening", ms: 3600, from: "user", text: "Hey Casa, what did we decide about the launch date?", cue: true },
   { phase: "thinking", ms: 1700, sent: true },
@@ -73,8 +52,7 @@ const WALKIE_SCRIPT: Step[] = [
 ]
 const DEMO_SILENCE_MS = 2500
 
-export function useDemoCall(enabled: boolean, walkie = false): VoiceCall {
-  const script = walkie ? WALKIE_SCRIPT : SCRIPT
+export function useDemoCall(enabled: boolean): VoiceCall {
   const [phase, setPhase] = useState<Phase>("idle")
   const [lines, setLines] = useState<Line[]>([])
   const [streamingId, setStreamingId] = useState<number | null>(null)
@@ -133,7 +111,7 @@ export function useDemoCall(enabled: boolean, walkie = false): VoiceCall {
 
   const runStep = useCallback(
     (i: number) => {
-      const step = script[i]
+      const step = SCRIPT[i]
       if (!step) return
       if (step.end) {
         clearTimers()
@@ -160,7 +138,7 @@ export function useDemoCall(enabled: boolean, walkie = false): VoiceCall {
       if (step.limit) later(() => setLimitNote("Call ends in 1 min · daily voice limit."), step.ms / 2)
       later(() => runStep(i + 1), step.ms)
     },
-    [later, streamLine, script, clearTimers]
+    [later, streamLine, clearTimers]
   )
 
   const start = useCallback(() => {
@@ -238,8 +216,10 @@ export function useDemoCall(enabled: boolean, walkie = false): VoiceCall {
       inputLevel,
       outputLevel,
       audioRef,
-      ...(walkie ? { silenceMs: DEMO_SILENCE_MS, sendCue, limitNote } : {}),
+      silenceMs: DEMO_SILENCE_MS,
+      sendCue,
+      limitNote,
     }),
-    [phase, lines, streamingId, elapsed, muted, endedText, start, end, toggleMute, walkie, sendCue, limitNote]
+    [phase, lines, streamingId, elapsed, muted, endedText, start, end, toggleMute, sendCue, limitNote]
   )
 }

@@ -1,4 +1,4 @@
-/** Runtime config the host injects as window.__VOICE_UI__ (see GPT_LIVE_UI in SKILL.md). */
+/** Runtime config the host injects as window.__VOICE_UI__ (see VOICE_UI in SKILL.md). */
 export interface VoiceUiConfig {
   skin?: "te" | "nanoclaw"
   colorway?: "auto" | "ivory" | "field" | "rabbit"
@@ -9,8 +9,6 @@ export interface VoiceUiConfig {
   shortcuts?: boolean
   timestamps?: boolean
   colorwayPicker?: boolean
-  /** Which call the page places: GPT-Live over WebRTC (default) or the LiveKit walkie-talkie. */
-  transport?: "openai" | "livekit"
 }
 
 export const DEFAULTS: Required<VoiceUiConfig> = {
@@ -19,14 +17,11 @@ export const DEFAULTS: Required<VoiceUiConfig> = {
   layout: "rail",
   presence: "matrix",
   brand: "NanoClaw Voice",
-  footer: "Voice by GPT-Live-1 · answers by {agent}",
+  footer: "Walkie-talkie over LiveKit · answers by {agent}",
   shortcuts: true,
   timestamps: true,
   colorwayPicker: true,
-  transport: "openai",
 }
-
-const LIVEKIT_FOOTER = "Walkie-talkie over LiveKit · answers by {agent}"
 
 export function readConfig(): Required<VoiceUiConfig> {
   const raw = (typeof window !== "undefined" && window.__VOICE_UI__) || {}
@@ -40,7 +35,5 @@ export function readConfig(): Required<VoiceUiConfig> {
   if (typeof raw.shortcuts === "boolean") c.shortcuts = raw.shortcuts
   if (typeof raw.timestamps === "boolean") c.timestamps = raw.timestamps
   if (typeof raw.colorwayPicker === "boolean") c.colorwayPicker = raw.colorwayPicker
-  if (raw.transport === "openai" || raw.transport === "livekit") c.transport = raw.transport
-  if (c.transport === "livekit" && typeof raw.footer !== "string") c.footer = LIVEKIT_FOOTER
   return c
 }

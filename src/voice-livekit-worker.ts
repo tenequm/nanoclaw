@@ -1649,7 +1649,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
       port: Number(env.VOICE_WORKER_HEALTH_PORT || 8089),
       numIdleProcesses: 1,
       // On SIGTERM the worker takes no new calls and gives running ones this long before closing
-      // them; a call can run up to GPT_LIVE_MAX_CALL_SECONDS, so a restart cuts longer ones short.
+      // them; a call can run up to VOICE_MAX_CALL_SECONDS, so a restart cuts longer ones short.
       drainTimeout: 60_000,
       // Never throws and always answers: agents-js logs the whole job, metadata included, when a
       // request function fails or leaves the request unanswered. A job of another protocol version

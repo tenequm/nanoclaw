@@ -553,10 +553,7 @@ describe('restartAgent', () => {
 // --- /voice ---
 
 describe('/voice', () => {
-  const link = (line: MessagingGroup) => ({
-    walkie: `https://voice.example/voice?t=tok-${line.platform_id}`,
-    liveCall: `https://voice.example/voice/call?t=tok-${line.platform_id}`,
-  });
+  const link = (line: MessagingGroup) => `https://voice.example/voice?t=tok-${line.platform_id}`;
   const chat = (messagingGroupId: string, threadId: string | null = null) => ({ messagingGroupId, threadId });
 
   async function chatGroup(id: string, platformId: string, channelType = 'telegram', isGroup: 0 | 1 = 0) {
@@ -647,12 +644,7 @@ describe('/voice', () => {
     expect(res).toMatchObject({
       ok: true,
       view: {
-        links: [
-          {
-            walkie: 'https://voice.example/voice?t=tok-voice:abc',
-            liveCall: 'https://voice.example/voice/call?t=tok-voice:abc',
-          },
-        ],
+        links: ['https://voice.example/voice?t=tok-voice:abc'],
       },
     });
     expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-dm' });
@@ -740,24 +732,8 @@ describe('/voice', () => {
 
     const done = await runVoiceCommand(targets, chat('mg-dm'), OWNER, link);
     expect(voiceCommandReply(done, MD_FMT)).toBe(
-      '🎙 Walkie-talkie with **Emma**: https://voice.example/voice?t=tok-voice:abc\n' +
-        '📞 Live call (OpenAI): https://voice.example/voice/call?t=tok-voice:abc\n\n' +
-        'Walkie-talkie calls now talk in this chat, until /voice is run in another one.',
-    );
-    const callOnly = await runVoiceCommand(targets, chat('mg-dm'), OWNER, (line) => ({
-      walkie: null,
-      liveCall: link(line).liveCall,
-    }));
-    expect(voiceCommandReply(callOnly, MD_FMT)).toBe(
-      '📞 Live call (OpenAI) with **Emma**: https://voice.example/voice/call?t=tok-voice:abc',
-    );
-    const walkieOnly = await runVoiceCommand(targets, chat('mg-dm'), OWNER, (line) => ({
-      walkie: link(line).walkie,
-      liveCall: null,
-    }));
-    expect(voiceCommandReply(walkieOnly, MD_FMT)).toBe(
-      '🎙 Walkie-talkie with **Emma**: https://voice.example/voice?t=tok-voice:abc\n\n' +
-        'Walkie-talkie calls now talk in this chat, until /voice is run in another one.',
+      '🎙 Voice call with **Emma**: https://voice.example/voice?t=tok-voice:abc\n\n' +
+        'Voice calls now talk in this chat, until /voice is run in another one.',
     );
     const off = await runVoiceCommand(targets, chat('mg-dm'), OWNER, () => null);
     expect(voiceCommandReply(off, MD_FMT)).toBe(

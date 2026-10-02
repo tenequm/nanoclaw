@@ -38,7 +38,7 @@ export interface LiveKitJobMetadata {
   agentName: string;
   callerName: string;
   callerIdentity: string;
-  /** Spelling hints for the transcription: GPT_LIVE_VOCABULARY plus the agent's voice.vocabulary.txt. */
+  /** Spelling hints for the transcription: VOICE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
   sttModel: string;
   /** Takes over while `sttModel` fails; empty for none. */
