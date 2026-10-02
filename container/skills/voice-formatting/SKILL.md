@@ -42,6 +42,15 @@ The caller speaks Ukrainian or English: a transcript that looks Russian is
 Ukrainian misspelled by speech recognition, so answer in Ukrainian (in English
 if the caller spoke English), never in Russian.
 
+## Names the transcription gets wrong
+
+When a transcript misspells a name or term you know (a person, project,
+product or place), add the correct spelling to
+`/workspace/agent/voice.vocabulary.txt`, one term per line. The
+transcription spells it exactly from the next call. A call takes at most 60
+terms and 1 KB, counting any the operator set, and drops the rest: replace
+stale or rarely used entries to stay within it, and never add common words.
+
 ## Proactive messages
 
 While a call is active, a message you send that answers no turn (a reminder
