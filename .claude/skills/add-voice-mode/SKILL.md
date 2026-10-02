@@ -469,8 +469,9 @@ to the worker with each call:
 | `VOICE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
 | `VOICE_MIRROR` | `telegram` | Channel type of the default call chat, used until `/voice` picks one (see below); `off` keeps calls on the voice line until then. |
 
-The worker itself reads `VOICE_MAX_SPOKEN_CHARS` (default `800`; `0` for no
-cap): an agent message longer than that, after markdown and links are stripped,
+The worker itself reads `VOICE_MAX_SPOKEN_CHARS` (default `0`: no cap, every
+message is spoken in full). Set it to a positive number of characters to cap
+speech: an agent message longer than that, after markdown and links are stripped,
 is spoken up to its last sentence end within the cap when that end is past 60%
 of the cap (else up to its last whole word), followed by "Решта - у чаті." or
 "The rest is in the chat." in the language of the caller's last turn. A call
@@ -538,7 +539,7 @@ TTS, captions and the agent state are the framework's. Then:
   messages; with no call chat, every agent message for the line) goes to the
   worker complete over the host's event stream, and the agent's typing there is
   the worker's "thinking". The worker strips markdown, URLs and tags and speaks
-  it uninterruptibly (`session.say`), cut at `VOICE_MAX_SPOKEN_CHARS` (above),
+  it uninterruptibly (`session.say`), in full unless `VOICE_MAX_SPOKEN_CHARS` (above) caps it,
   in sentence batches of up to 400
   characters, two requested at a time: the one playing and the next.
   Replies never overlap, and a reply waits for a caller who is mid-turn (at most

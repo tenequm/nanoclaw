@@ -176,9 +176,9 @@ describe('helpers', () => {
     expect(CUT_LINES.no_chat).toEqual({ uk: 'Скорочую.', en: "I've cut it short." });
   });
 
-  it('reads VOICE_MAX_SPOKEN_CHARS, with 0 for no cap', () => {
+  it('reads VOICE_MAX_SPOKEN_CHARS, with no cap unless it sets one', () => {
     expect(maxSpokenChars(undefined)).toBe(DEFAULT_MAX_SPOKEN_CHARS);
-    expect(DEFAULT_MAX_SPOKEN_CHARS).toBe(800);
+    expect(DEFAULT_MAX_SPOKEN_CHARS).toBe(0);
     expect(maxSpokenChars(' 400 ')).toBe(400);
     expect(maxSpokenChars('0')).toBe(0);
     expect(maxSpokenChars('-5')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
