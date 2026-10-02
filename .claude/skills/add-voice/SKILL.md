@@ -572,25 +572,35 @@ disconnects caller and worker.
 chats, so the agent answers with that chat's context and the chat shows both
 sides. A line's caller is its own `voice:<line id>` user, linked to no other
 account, so the operator first names the line's owner, the person's user on a
-chat platform (`ncl users list` shows the ids; operator only, from the host):
+chat platform, and then adds the same person's other chat accounts, so `/voice`
+(Telegram) and `!voice` (Slack) both work for the line (`ncl users list` shows
+the ids; operator only, from the host):
 
 ```bash
 ncl voice-lines set --line voice:<line id> --owner telegram:<their id>
+ncl voice-lines add-owner --line voice:<line id> --owner slack:<their id>
+ncl voice-lines get voice:<line id>   # owners and the current call chat
 ```
 
-The owner then sends `/voice` in a chat wired to the agent (owner or admin of
-the agent too; on Slack `!voice`): the host replies there with the link of
-their own line(s) of that agent, never anyone else's, and makes that chat (and
-its thread or forum topic; on Slack a top-level `!voice` means the channel
-itself) the line's call chat until they run `/voice` in another chat of the
-same agent. Someone who owns no line of the agent is told so, and nothing
-changes. The link itself never changes and the page works without the command;
-`/voice` only says where calls talk. In a chat with several agents it does this
+`remove-owner --line ... --owner ...` drops one account (never the last;
+`remove --line ...` drops the line's owners and call chat). The owner accounts are one
+person: `set` makes its `--owner` the only one and, when that account did not
+own the line yet, clears the call chat, which is how a line changes hands.
+
+The owner then sends `/voice` from any of those accounts in a chat wired to the
+agent (that account must be an owner or admin of the agent too; on Slack
+`!voice`): the host replies there with the link of their own line(s) of that
+agent, never anyone else's, and makes that chat (and its thread or forum topic;
+on Slack a top-level `!voice` means the channel itself) the line's call chat
+until `/voice` from any of the line's owner accounts names another chat of the
+same agent (the last one wins). Someone who owns no line of the agent is told
+so, and nothing changes. The link itself never changes and the page works
+without the command; `/voice` only says where calls talk. In a chat with several agents it does this
 for every agent there the sender administers. The reply goes out with link
 previews off (Telegram) and unfurls off (Slack), and a reply quoting it does not
-pass the link to the agent. Owner and binding are stored per line in
-`voice_lines` (migration 027, applied at host start); a new owner starts with no
-call chat.
+pass the link to the agent. The call chat is stored per line in `voice_lines`
+and the owner accounts in `voice_line_owners` (migration 027, applied at host
+start); a new owner starts with no call chat.
 
 During a call each turn is routed into the call chat's session through the
 normal inbound path, as a message from the line's own caller. It is addressed to
@@ -601,8 +611,8 @@ in the chat as usual; while the call is live, each message it delivers to that
 chat (and thread) is also spoken, and its typing there shows as thinking. After
 a mid-call `/voice` the call also keeps speaking the chat it left, until a whole
 turn passes with no message or typing from the agent there. A `/voice` chat that
-is no longer wired to the agent, or whose owner is no longer an admin of it, is
-ignored (the host logs it).
+is no longer wired to the agent, or none of whose owner accounts is still an
+admin of it, is ignored (the host logs it).
 
 Before any `/voice` the default is the `WALKIE_MIRROR` rule: the one live (not
 denied, not detached) chat of that channel type wired to the agent, or the one

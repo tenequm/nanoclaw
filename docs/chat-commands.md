@@ -12,7 +12,7 @@ binding handles them at the adapter.
 | `/model` | Admin only | Bare `/model` opens a model picker (active model checkmarked). `/model <alias-or-id>` switches directly. |
 | `/config` | Admin only | Bare `/config` opens the config menu (Model / Effort / Compact window / Activation / Restart). `/config set <field> <value>` writes one field. |
 | `/restart` | Admin only | Restarts the agent's running container(s) immediately. |
-| `/voice` | Admin only, line owner | Replies with the sender's own LiveKit walkie-talkie link for the agent and makes this chat (and its thread or topic) where that line's calls talk, until `/voice` is run in another chat of the agent. The operator names each line's owner with `ncl voice-lines set`. See the add-voice skill. |
+| `/voice` | Admin only, line owner | Replies with the sender's own LiveKit walkie-talkie link for the agent and makes this chat (and its thread or topic) where that line's calls talk, until `/voice` is run in another chat of the agent. The operator names each line's owner accounts with `ncl voice-lines set` and `add-owner`. See the add-voice skill. |
 
 ## Slack: the `!` prefix
 
@@ -64,8 +64,9 @@ For `/status`, the member gate uses `canAccessAgentGroup`. Unknown senders (no
 `users` row) are dropped silently, mirroring how the router treats their normal
 messages; known non-members get an explicit refusal. `/voice` uses the same
 tri-state with an admin check on top (`voiceAccess`): it hands out a voice
-line's call link, which is a credential, so it acts only on the lines whose
-owner (`voice_lines.owner_user_id`) is the sender. Its reply goes to the
+line's call link, which is a credential, so it acts only on the lines that
+list the sender among their owner accounts (`voice_line_owners`; one person's
+Telegram and Slack users can both own a line). Its reply goes to the
 invoking chat only, straight through the chat's adapter (never a session's
 outbound DB), with link previews and unfurls off; a Telegram reply quoting it
 reaches the agent with the link redacted, and the host logs never carry it.
