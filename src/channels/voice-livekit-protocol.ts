@@ -111,13 +111,18 @@ export interface WalkieReplyInfo {
   more?: boolean;
 }
 
-/** Why the host ended a call, in the room metadata (`WalkieRoomMetadata.end`) right before it deletes the room. */
+/**
+ * Why the host ended a call, in the room metadata (`WalkieRoomMetadata.end`) right before it deletes the room.
+ * `worker_restart`: the worker ended the call while it shut down (its `ended` POST carries `restart: true`);
+ * `worker_gone`: it ended the call for any other reason, or its link to the host dropped.
+ */
 export const WALKIE_END_REASONS = [
   'limit_duration',
   'limit_daily',
   'newer_call',
   'revoked',
   'shutdown',
+  'worker_restart',
   'worker_gone',
 ] as const;
 export type WalkieEndReason = (typeof WALKIE_END_REASONS)[number];

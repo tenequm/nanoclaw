@@ -719,6 +719,13 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.deleted).toEqual([h.lk.rooms[0]]);
   });
 
+  it('names a call the worker ended while shutting down a restart, not a dropped call', async () => {
+    const { worker } = await startCall(h);
+    expect((await worker.post('ended', { reason: 'job shutdown', restart: true })).status).toBe(204);
+    await worker.streamClosed;
+    expect(h.lk.roomMetadata).toEqual([{ room: h.lk.rooms[0], metadata: { chat: null, end: 'worker_restart' } }]);
+  });
+
   it('ends a call the page hung up on without naming it there: nobody is left to read it', async () => {
     const { call, worker } = await startCall(h);
     expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: call.callId })).status).toBe(204);

@@ -1060,7 +1060,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       endCall(
         call,
         typeof body.reason === 'string' ? `worker: ${body.reason.slice(0, 80)}` : 'worker ended',
-        'worker_gone',
+        body.restart === true ? 'worker_restart' : 'worker_gone',
       );
       // The worker deletes the room once answered; the page reads the reason off it first.
       await call.announced;

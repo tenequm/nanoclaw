@@ -734,8 +734,8 @@ chat shows as `<channel> DM`); after a mid-call `/voice` the host writes the new
 chat's label into the room metadata (`{"chat": ...}`, `WalkieRoomMetadata`) once
 the next turn moves the call, and the header follows it. Before it deletes the
 room the host also writes why the call ended (`"end"`: `limit_duration`,
-`limit_daily`, `newer_call`, `revoked`, `shutdown` or `worker_gone`; a hangup
-names none), and the page says so. The token reply carries `silenceMs` and
+`limit_daily`, `newer_call`, `revoked`, `shutdown`, `worker_restart` (the
+worker shut down, as in a deploy) or `worker_gone`; a hangup names none), and the page says so. The token reply carries `silenceMs` and
 `limit: {ms, kind: "duration" | "daily"}`: the listening hint names the pause
 that sends a turn, a thin line under the readout fills while
 `nanoclaw.walkie.pending` counts down, caller lines show "turn n" and the first

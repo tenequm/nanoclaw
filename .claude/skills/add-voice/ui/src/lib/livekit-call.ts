@@ -61,6 +61,7 @@ const END_TEXT: Record<string, string> = {
   newer_call: "A newer call on this line took over.",
   revoked: "Access to this line changed.",
   shutdown: "The voice service restarted.",
+  worker_restart: "The voice service restarted. Call again.",
   worker_gone: "The voice service dropped the call.",
 }
 const LIMIT_NAME: Record<string, string> = { duration: "call time limit", daily: "daily voice limit" }

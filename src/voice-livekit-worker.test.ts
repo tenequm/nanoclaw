@@ -907,6 +907,7 @@ describe('runCall', () => {
     host.endStream();
     await vi.waitFor(() => expect(first.job.shutdown).toHaveBeenCalledWith('host link closed'));
     expect(host.calls.at(-1)).toMatchObject({ body: { reason: 'host link closed' } });
+    expect(host.calls.at(-1)?.body).not.toHaveProperty('restart');
 
     const second = fakeJob();
     await runCall(second.ctx, deps(fakeHostFetch().fetchImpl, fakeVoice().createVoice));
@@ -940,6 +941,19 @@ describe('runCall', () => {
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('session closed: error'));
     expect(openWhenEnded).toBe(true);
     expect(link?.aborted).toBe(true);
+  });
+
+  it('tells the host a call ended by the worker shutting down is a restart', async () => {
+    const { job, ctx } = fakeJob();
+    const host = fakeHostFetch();
+    await runCall(ctx, deps(host.fetchImpl, fakeVoice().createVoice));
+    const onShutdown = job.addShutdownCallback.mock.calls[0][0] as () => Promise<void>;
+    await onShutdown();
+    expect(host.calls.at(-1)).toMatchObject({
+      url: 'http://127.0.0.1:3555/webhook/voice/livekit/agent/ended',
+      body: { callId: 'call-1', reason: 'job shutdown', restart: true },
+    });
+    expect(job.shutdown).toHaveBeenCalledWith('job shutdown');
   });
 });
 

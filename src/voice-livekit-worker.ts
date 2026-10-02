@@ -1461,7 +1461,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       maxSpokenChars: maxSpokenChars(deps.env.WALKIE_MAX_SPOKEN_CHARS),
     },
   );
-  const end = async (reason: string, tellHost: boolean) => {
+  /** `restart`: the worker is shutting down, so the caller's page says the service restarted. */
+  const end = async (reason: string, tellHost: boolean, restart = false) => {
     if (ending) return;
     ending = true;
     walkie.close();
@@ -1470,7 +1471,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     await Promise.all([
       tellHost &&
         host
-          .post('ended', { reason })
+          .post('ended', restart ? { reason, restart } : { reason })
           .then((res) => res.body?.cancel())
           .catch(() => undefined),
       callVoice?.close().catch(() => undefined),
@@ -1562,7 +1563,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   deadline.unref?.();
   ctx.addShutdownCallback(async () => {
     clearTimeout(deadline);
-    await end('job shutdown', true);
+    await end('job shutdown', true, true);
   });
   ctx.room.on(RoomEvent.ParticipantDisconnected, (participant) => {
     if (participant.identity === meta.callerIdentity) void end('caller left', true);
