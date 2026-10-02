@@ -1,375 +1,423 @@
 /**
- * The worker's call bridge: ask_agent executions against a fake host, agent
- * replies against a fake AgentSession. The point is the no-answer-is-dropped
- * guarantee: an answer reaches the caller as the tool result or, when the
- * execution was interrupted or its output never confirmed, as a new turn.
- * The interruption case also runs through agents-js's own ToolExecutor and
- * RunContext, so the update() semantics are the framework's, not a mock's.
+ * The walkie-talkie worker: turn detection on VAD windows, the call's
+ * gating and reply queue against fake Gemini, host and room, the Gemini
+ * request shapes against a fake fetch, and runCall end to end with a fake
+ * room. Silero and the real room are not loaded here.
  */
-import { initializeLogger, llm, voice } from '@livekit/agents';
-import * as google from '@livekit/agents-plugin-google';
+import { initializeLogger } from '@livekit/agents';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ANSWER_PREFIX, liveKitCallSecret, type LiveKitJobMetadata } from './channels/voice-livekit-protocol.js';
+import { liveKitCallSecret, type LiveKitJobMetadata } from './channels/voice-livekit-protocol.js';
 import {
-  CallBridge,
+  decodeSpeechAudio,
   HostLink,
   HostMonitor,
   parseJobMetadata,
+  pcmToWav,
   probeHost,
-  realtimeModelOptions,
   runCall,
+  speakableText,
+  splitForSpeech,
+  synthesize,
+  transcribe,
+  transcriptionPrompt,
+  TurnDetector,
+  WalkieCall,
   type CallJob,
-  type CallSession,
-  type SpeechSession,
+  type CallMedia,
+  type SpeechAudio,
+  type WalkieDeps,
+  type WalkieState,
 } from './voice-livekit-worker.js';
 
 initializeLogger({ pretty: false, level: 'error' });
 
-interface FakeSession extends SpeechSession {
-  replies: string[];
-  idleWaits: number;
-  agentState: string;
-  userState: string;
-  /** Errors the next generateReply calls fail with, in order (a handle whose exception() is set). */
-  failures: unknown[];
-  /** Runs inside each waitForIdle, to change the world while the bridge waits. */
-  onIdleWait?: () => void;
-  /** Resolves the playout of the reply at this index. */
-  finishPlayout(i: number): void;
-}
-
-function fakeSession(autoPlayout = true): FakeSession {
-  const playouts: Array<() => void> = [];
-  const session: FakeSession = {
-    replies: [],
-    idleWaits: 0,
-    agentState: 'listening',
-    userState: 'listening',
-    failures: [],
-    async waitForIdle() {
-      session.idleWaits++;
-      session.onIdleWait?.();
-    },
-    generateReply({ instructions }) {
-      session.replies.push(instructions);
-      const error = session.failures.shift();
-      let done!: () => void;
-      const played = new Promise<void>((r) => (done = r));
-      playouts.push(done);
-      if (autoPlayout) done();
-      return { waitForPlayout: () => played, exception: () => error };
-    },
-    finishPlayout: (i) => playouts[i](),
-  };
-  return session;
-}
-
-function fakeHost(status = 202) {
-  const asks: string[] = [];
-  return {
-    asks,
-    post: vi.fn(async (_path: string, body: Record<string, unknown> = {}) => {
-      asks.push(String(body.request));
-      return new Response(JSON.stringify({ id: `c${asks.length}` }), { status });
-    }),
-  };
-}
-
-const TIMEOUT_LINE = "This is taking longer than expected, I'll tell you as soon as it's done.";
+/** One Silero window at 16 kHz: 512 samples, 32 ms. */
+const WINDOW = 512;
+const window = (value: number) => new Int16Array(WINDOW).fill(value);
+const msOf = (windows: number) => (windows * WINDOW * 1000) / 16_000;
 const flush = () => new Promise((r) => setTimeout(r, 5));
 
-describe('CallBridge', () => {
-  afterEach(() => {
-    vi.useRealTimers();
+/** Feed `n` windows; speech windows carry 1000, silence 1. Returns the turns completed. */
+function feed(target: { push(pcm: Int16Array, speech: boolean): unknown }, n: number, speech: boolean) {
+  const out: unknown[] = [];
+  for (let i = 0; i < n; i++) {
+    const turn = target.push(window(speech ? 1000 : 1), speech);
+    if (turn) out.push(turn);
+  }
+  return out;
+}
+
+describe('TurnDetector', () => {
+  const detector = (overrides = {}) =>
+    new TurnDetector({ sampleRate: 16_000, silenceMs: 2500, preRollMs: 64, postRollMs: 96, ...overrides });
+
+  it('keeps a turn open through pauses shorter than the silence threshold and ends it after', () => {
+    const d = detector();
+    expect(feed(d, 10, false)).toEqual([]);
+    expect(d.active).toBe(false);
+    expect(feed(d, 20, true)).toEqual([]);
+    expect(d.active).toBe(true);
+    // A 1.5 s pause mid-thought: still one turn.
+    expect(feed(d, 47, false)).toEqual([]);
+    expect(feed(d, 20, true)).toEqual([]);
+    // 2.5 s of silence = 78.1 windows; the 79th ends the turn.
+    expect(feed(d, 78, false)).toEqual([]);
+    const [turn] = feed(d, 1, false) as Array<{ pcm: Int16Array; speechMs: number }>;
+    expect(d.active).toBe(false);
+    expect(turn.speechMs).toBe(msOf(40));
+    // Pre-roll (2 windows) + speech + pause + speech + post-roll (3 windows); the long silence is cut.
+    expect(turn.pcm.length).toBe((2 + 20 + 47 + 20 + 3) * WINDOW);
+    expect(turn.pcm[0]).toBe(1);
+    expect(turn.pcm[2 * WINDOW]).toBe(1000);
   });
 
-  it('returns the first agent reply as the tool result, confirmed by the framework', async () => {
-    const session = fakeSession();
-    const host = fakeHost();
-    const bridge = new CallBridge(session, host, {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-      confirmMs: 50,
-    });
-    const result = bridge.ask('What is on my calendar?', 'call_1');
-    await flush();
-    expect(host.post).toHaveBeenCalledWith('ask', { request: 'What is on my calendar?' });
-    bridge.onHostEvent({ type: 'reply', text: 'Dentist at nine.', consultIds: ['c1'] });
-    const answer = await result;
-    expect(answer).toContain(`${ANSWER_PREFIX} (Andy): Dentist at nine.`);
-    bridge.onToolsExecuted(['call_1']);
-    await new Promise((r) => setTimeout(r, 80));
-    expect(session.replies).toEqual([]);
+  it('drops a turn with less than 400 ms of speech', () => {
+    const onDrop = vi.fn();
+    const d = detector({ onDrop });
+    feed(d, 12, true); // 384 ms
+    expect(feed(d, 79, false)).toEqual([]);
+    expect(onDrop).toHaveBeenCalledWith(384);
+    expect(d.active).toBe(false);
+    feed(d, 13, true); // 416 ms
+    expect(feed(d, 79, false)).toHaveLength(1);
   });
 
-  it('speaks the answer as a new turn when the tool output never reached the model', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-      confirmMs: 20,
-    });
-    const result = bridge.ask('q', 'call_1');
-    await flush();
-    bridge.onHostEvent({ type: 'reply', text: 'Done.', consultIds: ['c1'] });
-    await result;
-    await new Promise((r) => setTimeout(r, 60));
-    expect(session.replies).toHaveLength(1);
-    expect(session.replies[0]).toContain('Done.');
-  });
-
-  it('keeps the answer when the execution is interrupted and speaks it once idle', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-    });
-    const abort = new AbortController();
-    const result = bridge.ask('book a table', 'call_1', abort.signal);
-    await flush();
-    abort.abort();
-    await expect(result).resolves.toBeUndefined();
-    bridge.onHostEvent({ type: 'reply', text: 'Booked for eight.', consultIds: ['c1'] });
-    await flush();
-    expect(session.idleWaits).toBe(1);
-    expect(session.replies).toEqual([expect.stringContaining(`${ANSWER_PREFIX} (Andy): Booked for eight.`)]);
-  });
-
-  it('speaks interim and extra replies that no execution is waiting for', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-      confirmMs: 1000,
-    });
-    const result = bridge.ask('q', 'call_1');
-    await flush();
-    bridge.onHostEvent({ type: 'reply', text: 'Let me check.', consultIds: ['c1'] });
-    expect(await result).toContain('Let me check.');
-    bridge.onToolsExecuted(['call_1']);
-    bridge.onHostEvent({ type: 'reply', text: 'It is sunny.' });
-    await flush();
-    expect(session.replies).toEqual([expect.stringContaining('It is sunny.')]);
-  });
-
-  it('settles the consults a batched reply names, and a timeout only its own', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-      confirmMs: 1000,
-    });
-    const a = bridge.ask('first', 'a');
-    const b = bridge.ask('second', 'b');
-    const c = bridge.ask('third', 'c');
-    await flush();
-    bridge.onHostEvent({ type: 'reply', text: TIMEOUT_LINE, timedOut: true, consultIds: ['c1'] });
-    const timedOut = await a;
-    expect(timedOut).toContain(TIMEOUT_LINE);
-    expect(timedOut).not.toContain(`${ANSWER_PREFIX} (Andy)`);
-    bridge.onHostEvent({ type: 'reply', text: 'Both done.', consultIds: ['c2', 'c3'] });
-    expect(await b).toContain('Both done.');
-    expect(await c).toContain('Answered together');
-    bridge.close();
-  });
-
-  it('serializes spoken turns so one never supersedes another', async () => {
-    const session = fakeSession(false);
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-    });
-    bridge.onHostEvent({ type: 'say', text: 'Your taxi is here.' });
-    bridge.onHostEvent({ type: 'reply', text: 'Unasked answer.' });
-    await flush();
-    expect(session.replies).toHaveLength(1);
-    expect(session.replies[0]).toContain('not an answer to a question');
-    session.finishPlayout(0);
-    await flush();
-    expect(session.replies).toHaveLength(2);
-    session.finishPlayout(1);
-  });
-
-  it('adds a holding line only into silence while an answer is pending', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-    });
-    bridge.onHostEvent({ type: 'thinking' });
-    await flush();
-    expect(session.replies).toEqual([]);
-    void bridge.ask('q', 'a');
-    await flush();
-    session.userState = 'speaking';
-    bridge.onHostEvent({ type: 'thinking' });
-    await flush();
-    expect(session.replies).toEqual([]);
-    session.userState = 'listening';
-    bridge.onHostEvent({ type: 'thinking' });
-    await flush();
-    expect(session.replies).toEqual([expect.stringContaining('still working')]);
-    bridge.close();
-  });
-
-  it('tells the model when the host refuses the request', async () => {
-    const bridge = (status: number) =>
-      new CallBridge(fakeSession(), fakeHost(status), {
-        agentName: 'Andy',
-        answerWaitMs: 60_000,
-        timeoutLine: TIMEOUT_LINE,
-      });
-    expect(await bridge(429).ask('q', 'a')).toContain('already open');
-    expect(await bridge(413).ask('q', 'a')).toContain('too long');
-    expect(await bridge(409).ask('q', 'a')).toContain('cannot take requests');
-  });
-
-  it('exposes ask_agent as a tool that passes the call id through', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-    });
-    const tool = bridge.tool();
-    const spy = vi.spyOn(bridge, 'ask').mockResolvedValue('ok');
-    const opts = { ctx: {}, toolCallId: 'fc_9', abortSignal: new AbortController().signal } as unknown as Parameters<
-      typeof tool.execute
-    >[1];
-    await tool.execute({ request: 'hello' }, opts);
-    expect(tool.name).toBe('ask_agent');
-    expect(spy).toHaveBeenCalledWith('hello', 'fc_9', opts.abortSignal, opts.ctx);
-  });
-
-  it('settles replies by consult id, whatever order they arrive in', async () => {
-    const bridge = new CallBridge(fakeSession(), fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-      confirmMs: 1000,
-    });
-    let aDone = false;
-    const a = bridge.ask('first', 'a').then((v) => ((aDone = true), v));
-    const b = bridge.ask('second', 'b');
-    await flush();
-    bridge.onHostEvent({ type: 'reply', text: 'Second answer.', consultIds: ['c2'] });
-    expect(await b).toContain('Second answer.');
-    await flush();
-    expect(aDone).toBe(false);
-    bridge.onHostEvent({ type: 'reply', text: 'First answer.', consultIds: ['c1'] });
-    expect(await a).toContain('First answer.');
-    bridge.close();
-  });
-
-  it('speaks the answer of an aborted execution as a new turn and keeps the others waiting', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-      confirmMs: 1000,
-    });
-    const abort = new AbortController();
-    const a = bridge.ask('first', 'a', abort.signal);
-    const b = bridge.ask('second', 'b');
-    await flush();
-    abort.abort();
-    expect(await a).toBeUndefined();
-    bridge.onHostEvent({ type: 'reply', text: 'First answer.', consultIds: ['c1'] });
-    await flush();
-    expect(session.replies).toEqual([expect.stringContaining('First answer.')]);
-    bridge.onHostEvent({ type: 'reply', text: 'Second answer.', consultIds: ['c2'] });
-    expect(await b).toContain('Second answer.');
-    expect(session.replies).toHaveLength(1);
-    bridge.close();
-  });
-
-  it('drops a holding line whose answer arrived while it waited for the session to go idle', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-      confirmMs: 1000,
-    });
-    const result = bridge.ask('q', 'a');
-    await flush();
-    session.onIdleWait = () => bridge.onHostEvent({ type: 'reply', text: 'Here it is.', consultIds: ['c1'] });
-    bridge.onHostEvent({ type: 'thinking' });
-    await flush();
-    expect(await result).toContain('Here it is.');
-    expect(session.replies).toEqual([]);
-    bridge.close();
-  });
-
-  it('tries a failed turn once more, and gives up after that', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-    });
-    session.failures.push(new Error('realtime session closed'));
-    await bridge.speak('first');
-    expect(session.replies).toEqual(['first', 'first']);
-    session.failures.push(new Error('a'), new Error('b'));
-    await bridge.speak('second');
-    expect(session.replies).toEqual(['first', 'first', 'second', 'second']);
-  });
-
-  it('does not repeat a turn the model only started late, since the late generation is still spoken', async () => {
-    const session = fakeSession();
-    const warn = vi.fn();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-      log: { info: () => undefined, warn },
-    });
-    session.failures.push(new Error('generateReply timed out waiting for generation_created event.'));
-    await bridge.speak('the answer');
-    expect(session.replies).toEqual(['the answer']);
-    expect(warn).toHaveBeenCalledWith(
-      'voice bridge: the model started a turn late; not repeating it',
-      expect.any(Error),
-    );
-    await bridge.speak('next');
-    expect(session.replies).toEqual(['the answer', 'next']);
+  it('ends a turn that runs past the longest turn, and forgets everything on reset', () => {
+    const d = detector({ maxTurnMs: 1000 });
+    const turns = feed(d, 40, true);
+    expect(turns).toHaveLength(1);
+    feed(d, 5, true);
+    expect(d.active).toBe(true);
+    d.reset();
+    expect(d.active).toBe(false);
+    expect(feed(d, 79, false)).toEqual([]);
   });
 });
 
-describe('Gemini Live settings', () => {
-  it('builds the google RealtimeModel without thinkingConfig, NON_BLOCKING and WHEN_IDLE', () => {
-    const model = new google.realtime.RealtimeModel(
-      realtimeModelOptions(
-        { model: 'gemini-3.8-live', voice: 'Kore', instructions: 'You are Andy.', scheduling: 'WHEN_IDLE' },
-        'gk-test',
-      ),
-    );
-    const options = (model as unknown as { _options: Record<string, unknown> })._options;
-    expect(options.model).toBe('gemini-3.8-live');
-    expect(options.voice).toBe('Kore');
-    expect(options.thinkingConfig).toBeUndefined();
-    expect(options.toolBehavior).toBe(google.realtime.Behavior.NON_BLOCKING);
-    expect(options.toolResponseScheduling).toBe(google.realtime.FunctionResponseScheduling.WHEN_IDLE);
-    expect(options.inputAudioTranscription).toEqual({});
-    expect(options.outputAudioTranscription).toEqual({});
+/** A WalkieCall over fakes, with every effect recorded in order. */
+function walkieHarness(overrides: Partial<WalkieDeps> = {}) {
+  const effects: string[] = [];
+  const states: WalkieState[] = [];
+  const sent: string[] = [];
+  const played: SpeechAudio[] = [];
+  let transcript = 'hello there';
+  const plays: Array<() => void> = [];
+  let autoPlay = true;
+  const deps: WalkieDeps = {
+    transcribe: vi.fn(async () => {
+      effects.push('transcribe');
+      return transcript;
+    }),
+    send: vi.fn(async (text: string) => {
+      effects.push(`send:${text}`);
+      sent.push(text);
+      return true;
+    }),
+    synthesize: vi.fn(async (text: string) => ({ pcm: new Int16Array([text.length]), sampleRate: 24_000 })),
+    play: vi.fn((audio: SpeechAudio) => {
+      effects.push(`play:${audio.pcm[0]}`);
+      played.push(audio);
+      return autoPlay ? Promise.resolve() : new Promise<void>((r) => plays.push(r));
+    }),
+    caption: vi.fn((role: string, text: string) => effects.push(`caption:${role}:${text}`)),
+    setState: (s) => states.push(s),
+    log: { info: () => undefined, warn: () => undefined },
+    ...overrides,
+  };
+  const call = new WalkieCall(deps, { silenceMs: 2500, playbackTailMs: 0 });
+  const speak = (windows = 20) => {
+    for (let i = 0; i < windows; i++) call.onAudio(window(1000), true);
+  };
+  const silence = (windows = 79) => {
+    for (let i = 0; i < windows; i++) call.onAudio(window(1), false);
+  };
+  return {
+    call,
+    deps,
+    effects,
+    states,
+    sent,
+    played,
+    speak,
+    silence,
+    setTranscript: (t: string) => (transcript = t),
+    holdPlayback: () => (autoPlay = false),
+    finishPlay: () => plays.shift()?.(),
+  };
+}
+
+describe('WalkieCall', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('sends a finished turn as its transcript and shows sending, then thinking', async () => {
+    const w = walkieHarness();
+    expect(w.states).toEqual(['listening']);
+    w.speak();
+    w.silence(40);
+    expect(w.deps.transcribe).not.toHaveBeenCalled();
+    w.silence(39);
+    await vi.waitFor(() => expect(w.sent).toEqual(['hello there']));
+    expect(w.effects).toEqual(['transcribe', 'caption:caller:hello there', 'send:hello there']);
+    expect(w.states).toEqual(['listening', 'sending', 'thinking']);
+    w.call.close();
   });
 
-  it('leaves response scheduling out for models that reject it', () => {
-    const options = realtimeModelOptions(
-      { model: 'gemini-3.8-live-extended-thinking', voice: 'Kore', instructions: '', scheduling: null },
-      'gk-test',
+  it('drops a turn whose transcript is empty', async () => {
+    const w = walkieHarness();
+    w.setTranscript('');
+    w.speak();
+    w.silence();
+    await flush();
+    expect(w.deps.transcribe).toHaveBeenCalledTimes(1);
+    expect(w.deps.send).not.toHaveBeenCalled();
+    expect(w.states.at(-1)).toBe('listening');
+  });
+
+  it('ignores the caller while a reply plays, and keeps follow-ups while the agent thinks', async () => {
+    const w = walkieHarness();
+    w.holdPlayback();
+    w.speak();
+    w.silence();
+    await vi.waitFor(() => expect(w.sent).toHaveLength(1));
+    // Still thinking: a follow-up turn is its own message.
+    w.setTranscript('and one more thing');
+    w.speak();
+    w.silence();
+    await vi.waitFor(() => expect(w.sent).toEqual(['hello there', 'and one more thing']));
+
+    w.call.onReply('Sure.');
+    await vi.waitFor(() => expect(w.deps.play).toHaveBeenCalledTimes(1));
+    expect(w.states.at(-1)).toBe('speaking');
+    // The caller talks over the reply: nothing of it is kept.
+    w.speak(40);
+    w.silence();
+    w.finishPlay();
+    await vi.waitFor(() => expect(w.states.at(-1)).toBe('listening'));
+    w.silence();
+    await flush();
+    expect(w.deps.transcribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('holds a reply until the caller finishes the turn in progress', async () => {
+    const w = walkieHarness();
+    w.speak();
+    w.call.onReply('Here it is.');
+    await flush();
+    expect(w.deps.play).not.toHaveBeenCalled();
+    w.silence();
+    await vi.waitFor(() => expect(w.deps.play).toHaveBeenCalledTimes(1));
+    // The caller's turn went out first, then the reply played.
+    expect(w.effects.indexOf('transcribe')).toBeLessThan(w.effects.indexOf('play:11'));
+  });
+
+  it('plays replies whole, one after another, chunk by chunk in order', async () => {
+    const w = walkieHarness();
+    w.holdPlayback();
+    const long = Array.from({ length: 12 }, (_, i) => `Sentence number ${i + 1} is here and it is long enough.`).join(
+      ' ',
     );
-    expect(options).not.toHaveProperty('toolResponseScheduling');
+    w.call.onReply(long);
+    w.call.onReply('Second reply.');
+    await vi.waitFor(() => expect(w.deps.play).toHaveBeenCalledTimes(1));
+    const chunks = splitForSpeech(long);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (let i = 1; i < chunks.length; i++) {
+      w.finishPlay();
+      await vi.waitFor(() => expect(w.deps.play).toHaveBeenCalledTimes(i + 1));
+    }
+    // Never overlapping: the second reply starts only after the first one's last chunk.
+    w.finishPlay();
+    await vi.waitFor(() => expect(w.deps.play).toHaveBeenCalledTimes(chunks.length + 1));
+    expect(w.played.map((a) => a.pcm[0])).toEqual([...chunks.map((c) => c.length), 'Second reply.'.length]);
+    expect(w.effects.filter((e) => e.startsWith('caption:agent'))).toEqual([
+      `caption:agent:${long}`,
+      'caption:agent:Second reply.',
+    ]);
+    w.finishPlay();
+  });
+
+  it('speaks plain text, never the markdown', async () => {
+    const w = walkieHarness();
+    w.call.onReply('**Done.** See [the doc](https://x.example/doc).');
+    await vi.waitFor(() => expect(w.deps.synthesize).toHaveBeenCalled());
+    expect(w.deps.synthesize).toHaveBeenCalledWith('Done. See the doc.');
+  });
+
+  it('skips a chunk that will not synthesize and plays the rest', async () => {
+    let n = 0;
+    const w = walkieHarness({
+      synthesize: vi.fn(async (text: string) => {
+        if (n++ === 0) throw new Error('500');
+        return { pcm: new Int16Array([text.length]), sampleRate: 24_000 };
+      }),
+    });
+    w.call.onReply('One.');
+    w.call.onReply('Two.');
+    await vi.waitFor(() => expect(w.played.map((a) => a.pcm[0])).toEqual([4]));
+  });
+
+  it('shows the agent thinking while the host says it works, and listening once that stops', () => {
+    vi.useFakeTimers();
+    let t = 0;
+    const w = walkieHarness({ now: () => t });
+    w.call.onThinking();
+    expect(w.states.at(-1)).toBe('thinking');
+    t = 10_001;
+    vi.advanceTimersByTime(10_001);
+    expect(w.states.at(-1)).toBe('listening');
+    w.call.close();
+  });
+});
+
+describe('Gemini transcription', () => {
+  const okText = (parts: unknown[]) =>
+    new Response(JSON.stringify({ candidates: [{ content: { parts } }] }), { status: 200 });
+
+  it('sends the turn inline as 16 kHz WAV with a verbatim prompt and the line vocabulary', async () => {
+    const fetchImpl = vi.fn(async () => okText([{ text: 'thinking...', thought: true }, { text: ' Привіт, Stan ' }]));
+    const pcm = new Int16Array([1, -2, 3]);
+    const text = await transcribe(pcm, {
+      apiKey: 'gk-test',
+      model: 'gemini-3.8-flash',
+      vocabulary: ['NanoClaw', 'Stan'],
+      fetchImpl,
+    });
+    expect(text).toBe('Привіт, Stan');
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent');
+    expect((init.headers as Record<string, string>)['x-goog-api-key']).toBe('gk-test');
+    expect(url).not.toContain('gk-test');
+    const body = JSON.parse(String(init.body)) as {
+      contents: Array<{ parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> }>;
+      generationConfig: Record<string, unknown>;
+    };
+    const [prompt, audio] = body.contents[0].parts;
+    expect(prompt.text).toBe(transcriptionPrompt(['NanoClaw', 'Stan']));
+    expect(prompt.text).toContain('Ukrainian or English');
+    expect(prompt.text).toContain('no translation');
+    expect(prompt.text).toContain('NanoClaw, Stan');
+    expect(audio.inlineData!.mimeType).toBe('audio/wav');
+    const wav = Buffer.from(audio.inlineData!.data, 'base64');
+    expect(wav.equals(pcmToWav(pcm, 16_000))).toBe(true);
+    expect(wav.subarray(0, 4).toString('ascii')).toBe('RIFF');
+    expect(wav.readUInt32LE(24)).toBe(16_000);
+    expect(wav.readInt16LE(46)).toBe(-2);
+    expect(body.generationConfig).toEqual({ temperature: 0, thinkingConfig: { thinkingLevel: 'low' } });
+  });
+
+  it('leaves vocabulary and thinking out when there are none to give', async () => {
+    const fetchImpl = vi.fn(async () => okText([{ text: 'hi' }]));
+    await transcribe(new Int16Array(4), { apiKey: 'k', model: 'gemini-3.5-transcribe', vocabulary: [], fetchImpl });
+    const body = JSON.parse(String((fetchImpl.mock.calls[0] as unknown as [string, RequestInit])[1].body)) as {
+      contents: Array<{ parts: Array<{ text?: string }> }>;
+      generationConfig: Record<string, unknown>;
+    };
+    expect(body.contents[0].parts[0].text).not.toContain('Names and terms');
+    expect(body.generationConfig).toEqual({ temperature: 0 });
+  });
+
+  it('reads a noise-only answer as no speech, retries a server error once, and surfaces a refusal', async () => {
+    expect(
+      await transcribe(new Int16Array(4), {
+        apiKey: 'k',
+        model: 'm',
+        vocabulary: [],
+        fetchImpl: async () => okText([{ text: '[silence]' }]),
+      }),
+    ).toBe('');
+    let calls = 0;
+    const flaky = vi.fn(async () => (calls++ === 0 ? new Response('{}', { status: 503 }) : okText([{ text: 'ok' }])));
+    expect(await transcribe(new Int16Array(4), { apiKey: 'k', model: 'm', vocabulary: [], fetchImpl: flaky })).toBe(
+      'ok',
+    );
+    const refused = vi.fn(async () => new Response(JSON.stringify({ error: { message: 'bad key' } }), { status: 400 }));
+    await expect(
+      transcribe(new Int16Array(4), { apiKey: 'k', model: 'm', vocabulary: [], fetchImpl: refused }),
+    ).rejects.toThrow('400 bad key');
+    expect(refused).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Gemini speech', () => {
+  const audioResponse = (data: Buffer, mimeType: string) =>
+    new Response(
+      JSON.stringify({
+        candidates: [{ content: { parts: [{ inlineData: { mimeType, data: data.toString('base64') } }] } }],
+      }),
+      { status: 200 },
+    );
+
+  it('asks for audio in the configured voice and decodes raw 24 kHz PCM', async () => {
+    const pcm = Buffer.alloc(6);
+    pcm.writeInt16LE(5, 0);
+    pcm.writeInt16LE(-5, 2);
+    const fetchImpl = vi.fn(async () => audioResponse(pcm, 'audio/L16;codec=pcm;rate=24000'));
+    const out = await synthesize('Привіт.', {
+      apiKey: 'gk',
+      model: 'gemini-3.1-flash-tts-preview',
+      voice: 'Alnilam',
+      fetchImpl,
+    });
+    expect(Array.from(out.pcm)).toEqual([5, -5, 0]);
+    expect(out.sampleRate).toBe(24_000);
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toContain('/models/gemini-3.1-flash-tts-preview:generateContent');
+    expect(JSON.parse(String(init.body))).toEqual({
+      contents: [{ role: 'user', parts: [{ text: 'Привіт.' }] }],
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Alnilam' } } },
+      },
+    });
+  });
+
+  it('retries an answer without audio and reads WAV from newer models', async () => {
+    let calls = 0;
+    const wav = pcmToWav(new Int16Array([7, 8]), 22_050);
+    const fetchImpl = vi.fn(async () =>
+      calls++ === 0
+        ? new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'sorry' }] } }] }), { status: 200 })
+        : audioResponse(wav, 'audio/wav'),
+    );
+    const out = await synthesize('Hi.', { apiKey: 'gk', model: 'gemini-3.8-flash-tts', voice: 'Kore', fetchImpl });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(Array.from(out.pcm)).toEqual([7, 8]);
+    expect(out.sampleRate).toBe(22_050);
+    expect(decodeSpeechAudio(wav, '').sampleRate).toBe(22_050);
+  });
+});
+
+describe('speakable text', () => {
+  it('strips markdown, links, URLs, code and markup to sentences', () => {
+    const md = [
+      '# Plan',
+      'Here is **the plan** for _today_:',
+      '- Call [Anna](https://t.me/anna) at ten',
+      '1. Check https://example.com/x?y=1 later',
+      '```ts',
+      'const x = 1;',
+      '```',
+      'Use `ncl` then <b>rest</b>.',
+      '| a | b |',
+      '|---|---|',
+      '> quoted line',
+      '---',
+      'snake_case_name stays.',
+    ].join('\n');
+    expect(speakableText(md)).toBe(
+      'Plan. Here is the plan for today: Call Anna at ten. Check later. Use ncl then rest. a, b. quoted line. snake_case_name stays.',
+    );
+  });
+
+  it('cuts long text at sentence ends into TTS-sized chunks', () => {
+    const text = 'One two three. Four five six! Seven eight nine? Ten.';
+    expect(splitForSpeech(text, 30)).toEqual(['One two three. Four five six!', 'Seven eight nine? Ten.']);
+    const runOn = `${'word '.repeat(30).trim()}, ${'more '.repeat(30).trim()}.`;
+    const chunks = splitForSpeech(runOn, 100);
+    expect(chunks.every((c) => c.length <= 100)).toBe(true);
+    expect(chunks.join(' ').replace(/\s+/g, ' ')).toBe(runOn);
+    expect(splitForSpeech('')).toEqual([]);
   });
 });
 
@@ -393,113 +441,27 @@ describe('HostLink', () => {
     expect(events).toEqual([{ type: 'reply', text: 'hi' }, { type: 'ping' }, { type: 'end', reason: 'hangup' }]);
   });
 
-  it('rejects job metadata that is not a voice call', () => {
+  it('rejects job metadata that is not a walkie-talkie call', () => {
     expect(() => parseJobMetadata('{}')).toThrow();
     expect(() => parseJobMetadata('not json')).toThrow();
-  });
-});
-
-/** The ToolExecutor every AgentActivity runs function tools through (agents-js does not export the class). */
-interface ToolExecutorLike {
-  execute(args: {
-    tool: ReturnType<CallBridge['tool']>;
-    runCtx: voice.RunContext;
-    rawArguments: Record<string, unknown>;
-    abortSignal?: AbortSignal;
-  }): Promise<unknown>;
-}
-
-function realExecution(bridge: CallBridge, callId: string) {
-  const executor = (llm.AsyncToolset.create({ id: 'test', tools: [] }) as unknown as { _executor: ToolExecutorLike })
-    ._executor;
-  const speechHandle = voice.SpeechHandle.create({ allowInterruptions: true });
-  const functionCall = llm.FunctionCall.create({ callId, name: 'ask_agent', args: '{"request":"book a table"}' });
-  const runCtx = new voice.RunContext({} as voice.AgentSession, speechHandle, functionCall);
-  // The speech's tool task signal: agents-js aborts it 5 s after an interruption of that speech.
-  const speechTask = new AbortController();
-  const output = executor.execute({
-    tool: bridge.tool(),
-    runCtx,
-    rawArguments: { request: 'book a table' },
-    abortSignal: speechTask.signal,
-  });
-  return { output, speechHandle, functionCall, speechTask };
-}
-
-describe('ask_agent under agents-js interruptions (real ToolExecutor and RunContext)', () => {
-  it('returns the answer as the tool output when the turn is not interrupted', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-    });
-    const run = realExecution(bridge, 'fc_1');
-    await flush();
-    bridge.onHostEvent({ type: 'reply', text: 'Booked for eight.', consultIds: ['c1'] });
-    expect(await run.output).toContain(`${ANSWER_PREFIX} (Andy): Booked for eight.`);
-    expect(run.functionCall.extra.__livekit_agents_tool_non_blocking).toBeUndefined();
-    bridge.close();
-  });
-
-  it('moves to the background on interruption, survives the later abort and speaks the answer as a new turn', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-    });
-    const run = realExecution(bridge, 'fc_1');
-    await flush();
-    run.speechHandle.interrupt();
-    // update() resolved the tool's output (Gemini's FunctionResponse for fc_1) with the holding note.
-    const output = String(await run.output);
-    expect(output).toContain('Andy is still working on this request');
-    expect(output).toContain('The task is still running');
-    expect(run.functionCall.extra.__livekit_agents_tool_non_blocking).toBe(true);
-    // The speech's 5 s cancel no longer reaches the execution.
-    run.speechTask.abort();
-    await flush();
-    bridge.onHostEvent({ type: 'reply', text: 'Booked for eight.', consultIds: ['c1'] });
-    await flush();
-    expect(session.replies).toEqual([expect.stringContaining(`${ANSWER_PREFIX} (Andy): Booked for eight.`)]);
-    bridge.close();
-  });
-
-  it('still speaks the answer when the abort lands before any interruption was seen', async () => {
-    const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), {
-      agentName: 'Andy',
-      answerWaitMs: 60_000,
-      timeoutLine: TIMEOUT_LINE,
-    });
-    const run = realExecution(bridge, 'fc_1');
-    await flush();
-    run.speechTask.abort();
-    // The framework drops the output of an aborted execution: Gemini gets no FunctionResponse here.
-    await expect(run.output).rejects.toThrow('tool call was aborted');
-    await flush();
-    bridge.onHostEvent({ type: 'reply', text: 'Booked for eight.', consultIds: ['c1'] });
-    await flush();
-    expect(session.replies).toEqual([expect.stringContaining('Booked for eight.')]);
-    bridge.close();
+    expect(() => parseJobMetadata(JSON.stringify({ ...META, v: 1 }))).toThrow();
+    expect(parseJobMetadata(JSON.stringify(META)).callId).toBe('call-1');
   });
 });
 
 const META: LiveKitJobMetadata = {
-  v: 1,
+  v: 2,
   callId: 'call-1',
   lineId: 'voice:abc',
   agentName: 'Andy',
   callerName: 'Ethan',
   callerIdentity: 'caller-1',
-  instructions: 'You are Andy.',
-  model: 'gemini-3.8-live',
-  voice: 'Kore',
-  scheduling: 'WHEN_IDLE',
+  vocabulary: ['NanoClaw'],
+  sttModel: 'gemini-3.8-flash',
+  ttsModel: 'gemini-3.1-flash-tts-preview',
+  ttsVoice: 'Alnilam',
+  silenceMs: 2500,
   maxDurationMs: 60_000,
-  delegationTimeoutMs: 1000,
-  timeoutLine: TIMEOUT_LINE,
   joinTimeoutMs: 1000,
 };
 
@@ -509,7 +471,7 @@ function fakeJob(meta: Record<string, unknown> = { ...META }) {
     job: { metadata: JSON.stringify(meta) },
     room: {},
     connect: vi.fn(async () => undefined),
-    waitForParticipant: vi.fn(async () => ({})),
+    waitForParticipant: vi.fn(async () => ({ identity: 'caller-1' })),
     deleteRoom: vi.fn(async () => undefined),
     shutdown: vi.fn(),
     addShutdownCallback: vi.fn((cb: () => Promise<void>) => shutdownCallbacks.push(cb)),
@@ -517,7 +479,7 @@ function fakeJob(meta: Record<string, unknown> = { ...META }) {
   return { job, ctx: job as unknown as CallJob, shutdownCallbacks };
 }
 
-/** The host side over fetch: routes by path, an NDJSON event stream fed by `emit`. */
+/** The host over fetch (routes by path, an NDJSON event stream fed by `emit`) and Gemini behind it. */
 function fakeHostFetch(joinedStatus = 200) {
   const calls: Array<{ url: string; auth: string | undefined; body: Record<string, unknown> | null }> = [];
   let push!: (line: string) => void;
@@ -530,26 +492,39 @@ function fakeHostFetch(joinedStatus = 200) {
   });
   const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
+    const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
+    if (url.includes(':generateContent')) {
+      const config = body?.generationConfig as { responseModalities?: string[] } | undefined;
+      const part = config?.responseModalities
+        ? { inlineData: { mimeType: 'audio/L16;rate=24000', data: Buffer.alloc(960).toString('base64') } }
+        : { text: 'Book a table' };
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [part] } }] }), { status: 200 });
+    }
     const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
-    calls.push({ url, auth, body: init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null });
+    calls.push({ url, auth, body });
     if (url.includes('/events')) return new Response(stream, { status: 200 });
     if (url.endsWith('/joined')) return new Response('{}', { status: joinedStatus });
-    if (url.endsWith('/ask')) return new Response(JSON.stringify({ id: 'k1' }), { status: 202 });
+    if (url.endsWith('/utterance')) return new Response(JSON.stringify({ id: '1' }), { status: 202 });
     return new Response(null, { status: 204 });
   });
   return { fetchImpl, calls, emit: (e: unknown) => push(JSON.stringify(e)), endStream };
 }
 
-function fakeCallSession() {
-  const listeners = new Map<string, (ev: unknown) => void>();
-  const base = fakeSession();
-  const session = Object.assign(base, {
-    on: vi.fn((event: string, listener: (ev: unknown) => void) => listeners.set(event, listener)),
-    start: vi.fn(async () => undefined),
+function fakeMedia() {
+  let handlers!: Parameters<CallMedia['start']>[0];
+  const media = {
+    start: vi.fn((h: Parameters<CallMedia['start']>[0]) => {
+      handlers = h;
+    }),
+    play: vi.fn(async () => undefined),
+    caption: vi.fn(),
+    setState: vi.fn(),
     close: vi.fn(async () => undefined),
-    listeners,
-  });
-  return session as typeof session & CallSession;
+    get handlers() {
+      return handlers;
+    },
+  };
+  return media;
 }
 
 const ENV = {
@@ -560,19 +535,18 @@ const ENV = {
 const silentLog = { info: () => undefined, warn: () => undefined };
 
 describe('runCall', () => {
-  it('runs a call: caller joins, host says yes, Gemini starts, host events are spoken, host end closes all', async () => {
+  it('runs a call: caller joins, host says yes, turns go out, replies are spoken, host end closes all', async () => {
     const { job, ctx } = fakeJob({ ...META, hostUrl: 'http://169.254.169.254', secret: 'from-dispatch' });
     const host = fakeHostFetch();
-    const session = fakeCallSession();
-    const createSession = vi.fn(() => session);
-    await runCall(ctx, { env: ENV, fetchImpl: host.fetchImpl, createSession, log: silentLog });
+    const media = fakeMedia();
+    const createMedia = vi.fn(async () => media);
+    await runCall(ctx, { env: ENV, fetchImpl: host.fetchImpl, createMedia, log: silentLog });
 
     expect(job.waitForParticipant).toHaveBeenCalledWith('caller-1');
-    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ callId: 'call-1' }), 'gk-test');
-    expect(session.start).toHaveBeenCalledWith(
-      expect.objectContaining({ inputOptions: { participantIdentity: 'caller-1', closeOnDisconnect: true } }),
-    );
-    expect(session.replies).toEqual(['The call just connected. Greet the caller briefly.']);
+    expect(createMedia).toHaveBeenCalledWith(ctx, expect.objectContaining({ callId: 'call-1' }), {
+      identity: 'caller-1',
+    });
+    expect(media.setState).toHaveBeenCalledWith('listening');
     // The host address and secret come from the worker's settings, never from the dispatch.
     const secret = liveKitCallSecret('lk-secret', 'call-1');
     for (const call of host.calls) {
@@ -580,13 +554,24 @@ describe('runCall', () => {
       expect(call.auth).toBe(`Bearer ${secret}`);
     }
 
-    host.emit({ type: 'say', text: 'Your taxi is here.' });
-    await vi.waitFor(() => expect(session.replies).toHaveLength(2));
-    expect(session.replies[1]).toContain('Your taxi is here.');
+    for (let i = 0; i < 20; i++) media.handlers.onWindow(window(1000), true);
+    for (let i = 0; i < 79; i++) media.handlers.onWindow(window(1), false);
+    await vi.waitFor(() =>
+      expect(host.calls.find((c) => c.url.endsWith('/utterance'))?.body).toEqual({
+        callId: 'call-1',
+        text: 'Book a table',
+      }),
+    );
+    expect(media.caption).toHaveBeenCalledWith('caller', 'Book a table');
+
+    host.emit({ type: 'reply', text: 'Booked for eight.' });
+    await vi.waitFor(() => expect(media.play).toHaveBeenCalledTimes(1));
+    expect(media.caption).toHaveBeenCalledWith('agent', 'Booked for eight.');
+    expect(media.setState).toHaveBeenCalledWith('speaking');
 
     host.emit({ type: 'end', reason: 'hangup' });
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
-    expect(session.close).toHaveBeenCalled();
+    expect(media.close).toHaveBeenCalled();
     expect(job.deleteRoom).toHaveBeenCalled();
     // The host ended it, so the worker does not report back.
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
@@ -598,7 +583,7 @@ describe('runCall', () => {
     const fetchImpl = vi.fn(async () => {
       throw new TypeError('fetch failed');
     });
-    await runCall(ctx, { env: ENV, fetchImpl, createSession: vi.fn(), log: { info: () => undefined, warn } });
+    await runCall(ctx, { env: ENV, fetchImpl, createMedia: vi.fn(), log: { info: () => undefined, warn } });
     expect(warn).toHaveBeenCalledWith('voice worker: ending the call', {
       callId: 'call-1',
       hostUrl: 'http://127.0.0.1:3555',
@@ -607,12 +592,12 @@ describe('runCall', () => {
     expect(job.shutdown).toHaveBeenCalledWith('host refused the call (unreachable)');
   });
 
-  it('opens no Gemini session when the host refuses the call', async () => {
+  it('publishes nothing when the host refuses the call', async () => {
     const { job, ctx } = fakeJob();
     const host = fakeHostFetch(409);
-    const createSession = vi.fn(() => fakeCallSession());
-    await runCall(ctx, { env: ENV, fetchImpl: host.fetchImpl, createSession, log: silentLog });
-    expect(createSession).not.toHaveBeenCalled();
+    const createMedia = vi.fn(async () => fakeMedia());
+    await runCall(ctx, { env: ENV, fetchImpl: host.fetchImpl, createMedia, log: silentLog });
+    expect(createMedia).not.toHaveBeenCalled();
     expect(host.calls.at(-1)).toMatchObject({ body: { callId: 'call-1', reason: 'host refused the call (409)' } });
     expect(job.deleteRoom).toHaveBeenCalled();
     expect(job.shutdown).toHaveBeenCalledWith('host refused the call (409)');
@@ -622,9 +607,9 @@ describe('runCall', () => {
     const { job, ctx } = fakeJob({ ...META, joinTimeoutMs: 20 });
     job.waitForParticipant.mockImplementation(() => new Promise(() => undefined));
     const host = fakeHostFetch();
-    const createSession = vi.fn(() => fakeCallSession());
-    await runCall(ctx, { env: ENV, fetchImpl: host.fetchImpl, createSession, log: silentLog });
-    expect(createSession).not.toHaveBeenCalled();
+    const createMedia = vi.fn(async () => fakeMedia());
+    await runCall(ctx, { env: ENV, fetchImpl: host.fetchImpl, createMedia, log: silentLog });
+    expect(createMedia).not.toHaveBeenCalled();
     expect(job.shutdown).toHaveBeenCalledWith('caller never joined');
   });
 
@@ -634,20 +619,36 @@ describe('runCall', () => {
     await runCall(ctx, {
       env: { ...ENV, LIVEKIT_API_SECRET: undefined },
       fetchImpl: host.fetchImpl,
-      createSession: vi.fn(),
+      createMedia: vi.fn(),
       log: silentLog,
     });
     expect(job.connect).not.toHaveBeenCalled();
     expect(job.shutdown).toHaveBeenCalledWith('LIVEKIT_API_SECRET is not set for the worker');
   });
 
-  it('reports the end to the host when the host link drops', async () => {
-    const { job, ctx } = fakeJob();
+  it('reports the end to the host when the host link drops or the caller leaves', async () => {
+    const first = fakeJob();
     const host = fakeHostFetch();
-    await runCall(ctx, { env: ENV, fetchImpl: host.fetchImpl, createSession: () => fakeCallSession(), log: silentLog });
+    await runCall(first.ctx, {
+      env: ENV,
+      fetchImpl: host.fetchImpl,
+      createMedia: async () => fakeMedia(),
+      log: silentLog,
+    });
     host.endStream();
-    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host link closed'));
+    await vi.waitFor(() => expect(first.job.shutdown).toHaveBeenCalledWith('host link closed'));
     expect(host.calls.at(-1)).toMatchObject({ body: { reason: 'host link closed' } });
+
+    const second = fakeJob();
+    const media = fakeMedia();
+    await runCall(second.ctx, {
+      env: ENV,
+      fetchImpl: fakeHostFetch().fetchImpl,
+      createMedia: async () => media,
+      log: silentLog,
+    });
+    media.handlers.onCallerLeft();
+    await vi.waitFor(() => expect(second.job.shutdown).toHaveBeenCalledWith('caller left'));
   });
 });
 

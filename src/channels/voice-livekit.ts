@@ -1,10 +1,13 @@
 /**
- * LiveKit + Gemini Live as a third voice engine for the voice channel.
+ * LiveKit as a third voice engine for the voice channel, in walkie-talkie
+ * mode: the caller talks to the line's real NanoClaw agent, not to a voice
+ * model playing it.
  *
  * The caller's browser joins a LiveKit room over WebRTC; a LiveKit Agents
  * worker (`src/voice-livekit-worker.ts`, its own process: agents-js runs every
- * job in a forked child process) joins the same room and runs Gemini Live
- * through the google plugin's RealtimeModel. The host owns the call: it
+ * job in a forked child process) joins the same room, cuts the caller's audio
+ * into turns, transcribes each turn and hands the text to the host, then speaks
+ * every agent reply into the room with Gemini TTS. The host owns the call: it
  * admits it against the shared limits, creates a unique room, dispatches the
  * worker to it with the job metadata, mints the caller's token, charges the
  * daily minutes, rechecks access every few seconds and ends the call by
@@ -14,13 +17,17 @@
  * (`/webhook/voice/livekit/agent/*`), at an address from its own settings,
  * authenticated by a per-call secret both sides derive from the LiveKit API
  * secret (never in the dispatch metadata, never in the caller's token):
- *  - `GET  agent/events`  an NDJSON stream of what to speak (agent replies,
- *    proactive messages, holding notes) and when to end, with pings;
- *  - `POST agent/joined`  the caller is in the room; the clock starts here;
- *  - `POST agent/ask`     one ask_agent call, fed to the agent as an inbound
- *    message whose id (`livekit:<callId>:<consultId>`) routes the reply back;
- *    answers 202 with the consultId, which the reply events name;
- *  - `POST agent/ended`   the worker's session is over.
+ *  - `GET  agent/events`     an NDJSON stream of agent replies to speak, the
+ *    agent still working, and when to end, with pings;
+ *  - `POST agent/joined`     the caller is in the room; the clock starts here;
+ *  - `POST agent/utterance`  one transcribed caller turn, fed to the agent as
+ *    an inbound message whose id (`livekit:<callId>:<n>`) routes the reply back;
+ *  - `POST agent/ended`      the worker's session is over.
+ *
+ * Each exchange is also mirrored into the agent's Telegram chat (WALKIE_MIRROR):
+ * the transcript when the agent gets it, the reply once it is handed to the
+ * worker. Voice replies never reach Telegram on their own (delivery follows the
+ * inbound's channel), so nothing is posted twice.
  */
 import { createRequire } from 'node:module';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -29,35 +36,50 @@ import type http from 'node:http';
 
 import { AccessToken, AgentDispatchClient, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
 
-import type { InboundMessage } from './adapter.js';
-import { DEFAULT_GEMINI_LIVE_MODEL, DEFAULT_GEMINI_LIVE_VOICE, geminiToolScheduling } from './gemini-live.js';
-import { geminiInstructions, type ResolveLineOptions, type VoiceLine } from './gpt-live-prompt.js';
+import type { ChannelAdapter, InboundMessage } from './adapter.js';
+import { getChannelAdapterExact } from './channel-registry.js';
+import type { ResolveLineOptions, VoiceLine } from './gpt-live-prompt.js';
 import {
-  ANSWER_PREFIX,
   DEFAULT_LIVEKIT_AGENT_NAME,
+  DEFAULT_WALKIE_SILENCE_MS,
+  DEFAULT_WALKIE_STT_MODEL,
+  DEFAULT_WALKIE_TTS_MODEL,
+  DEFAULT_WALKIE_TTS_VOICE,
   liveKitCallSecret,
   PING_INTERVAL_MS,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
 } from './voice-livekit-protocol.js';
+import { getMessagingGroupsByAgentGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
+import type { MessagingGroup } from '../types.js';
 
 const MINUTE_MS = 60_000;
 const MAX_QUEUED_EVENTS = 50;
-const MAX_AGENT_BODY_BYTES = 8 * 1024;
+const MAX_AGENT_BODY_BYTES = 16 * 1024;
 const CALLER_TOKEN_TTL_SECONDS = 120;
 /** The worker opens its event stream right after it reports the caller in; without it nothing reaches the caller. */
 const WORKER_STREAM_TIMEOUT_MS = 30_000;
+/** A turn is at most 90 s of speech; Ukrainian runs about 4 KB of UTF-8 for that. */
+export const MAX_UTTERANCE_BYTES = 8 * 1024;
+export const MAX_UTTERANCES_PER_MINUTE = 20;
 
-const ASK_AGENT_NOTE =
-  'An ask_agent answer arrives as its result, or later as a separate instruction starting with ' +
-  `"${ANSWER_PREFIX}"; more than one can arrive for one request. Until an answer arrives, do not guess it.`;
+/** How the agent learns a message was spoken on a call and how its reply will be heard. */
+export const WALKIE_REPLY_NOTE =
+  'Spoken on a live voice call; your reply is read aloud word for word. Answer in a few short spoken ' +
+  'sentences: no markdown, no links, no code blocks, numbers written as words. Send longer material ' +
+  'as a separate written message to your chat.';
 
-/** Inbound ids for ask_agent calls are `livekit:<call>:<consult>`; voice.ts parses replies with parseScopedId. */
+/** The inbound text for one transcribed caller turn. */
+export function walkieMessageText(transcript: string): string {
+  return `<voice source="livekit">${transcript}</voice>\n${WALKIE_REPLY_NOTE}`;
+}
+
+/** Inbound ids for caller turns are `livekit:<call>:<n>`; voice.ts parses replies with parseScopedId. */
 export const LIVEKIT_ID_PREFIX = 'livekit:';
 
-export function liveKitConsultMessageId(callId: string, consultId: string): string {
-  return `${LIVEKIT_ID_PREFIX}${callId}:${consultId}`;
+export function liveKitUtteranceMessageId(callId: string, utteranceId: string): string {
+  return `${LIVEKIT_ID_PREFIX}${callId}:${utteranceId}`;
 }
 
 /** The slices of the LiveKit server API the host uses; injectable for tests. */
@@ -72,6 +94,19 @@ export interface LiveKitServerApi {
   createDispatch(room: string, agentName: string, options: { metadata: string }): Promise<unknown>;
 }
 
+/** Where a call's exchange is mirrored; the central DB and live adapters by default, fakes in tests. */
+export interface MirrorApi {
+  groupsFor(agentGroupId: string): Promise<MessagingGroup[]>;
+  adapter(key: string): Pick<ChannelAdapter, 'deliver'> | undefined;
+}
+
+export interface WalkieSettings {
+  sttModel?: string;
+  ttsModel?: string;
+  ttsVoice?: string;
+  silenceMs?: number;
+}
+
 export interface LiveKitVoiceConfig {
   /** Signaling URL the caller's browser connects to (LIVEKIT_URL). */
   url: string;
@@ -81,8 +116,12 @@ export interface LiveKitVoiceConfig {
   apiSecret: string;
   /** Dispatch name the worker registers under. */
   agentName?: string;
-  model?: string;
-  voice?: string;
+  /** Transcription and speech settings the worker gets in the job metadata (WALKIE_*). */
+  walkie?: WalkieSettings;
+  /** Channel type the exchange is mirrored into (WALKIE_MIRROR); off when unset. */
+  mirror?: string;
+  /** Test seam; defaults to the central DB and the live channel adapters. */
+  mirrorApi?: MirrorApi;
   /** How long the caller has to join the room after the token is minted. */
   joinTimeoutMs?: number;
   /** How long the worker has to open its event stream after reporting the caller in. */
@@ -105,18 +144,7 @@ export interface LiveKitHost {
   isRunning(): boolean;
   now(): number;
   maxCallDurationMs: number;
-  delegationTimeoutMs: number;
   accessCheckIntervalMs: number;
-  thinkIntervalMs: number;
-  delegationTimeoutLine: string;
-  /** The ask_agent limits the Gemini path uses, shared so both engines behave alike. */
-  maxOpenConsults: number;
-  maxConsultsPerMinute: number;
-  maxConsultRequestBytes: number;
-}
-
-interface Consult {
-  timer: ReturnType<typeof setTimeout>;
 }
 
 interface LiveKitCall {
@@ -130,7 +158,6 @@ interface LiveKitCall {
   /** Set when the worker reports the caller in the room; the daily budget is charged from here. */
   startedAt?: number;
   ended: boolean;
-  consults: Map<string, Consult>;
   joinTimer?: ReturnType<typeof setTimeout>;
   streamTimer?: ReturnType<typeof setTimeout>;
   expires?: ReturnType<typeof setTimeout>;
@@ -138,9 +165,9 @@ interface LiveKitCall {
   pingTimer?: ReturnType<typeof setInterval>;
   stream?: http.ServerResponse;
   queue: LiveKitHostEvent[];
-  lastThinkAt: number;
-  /** Accepted ask_agent start times (config clock), for the per-minute cap. */
-  consultStarts: number[];
+  /** Accepted utterance times (config clock), for the per-minute cap. */
+  utteranceStarts: number[];
+  utterances: number;
   sent: number;
   cleanup?: Promise<void>;
 }
@@ -162,16 +189,41 @@ export interface LiveKitVoice {
    */
   deliver(
     platformId: string,
-    target: { callId: string; consultId: string } | null,
+    target: { callId: string; utteranceId: string } | null,
     inReplyTo: string | undefined,
     text: string,
   ): Promise<{ id: string | undefined } | null>;
-  setTyping(platformId: string, status?: string): Promise<void>;
+  setTyping(platformId: string): Promise<void>;
   /** The running call on a line, for the shared daily budget. */
   activeCall(platformId: string): { platformId: string; startedAt: number } | undefined;
   endLine(platformId: string, reason: string): void;
   teardown(): Promise<void>;
 }
+
+/**
+ * The one chat of `channelType` wired to the agent that a call is mirrored into: the only live one,
+ * or the only direct chat among several. None when there is no such chat or the choice is ambiguous.
+ */
+export function pickMirrorTarget(
+  groups: readonly MessagingGroup[],
+  channelType: string,
+): { target: MessagingGroup } | { skip: string } {
+  const live = [
+    ...new Map(
+      groups.filter((g) => g.channel_type === channelType && !g.denied_at && !g.detached_at).map((g) => [g.id, g]),
+    ).values(),
+  ];
+  if (live.length === 0) return { skip: `no ${channelType} chat is wired to the agent` };
+  if (live.length === 1) return { target: live[0] };
+  const direct = live.filter((g) => !g.is_group);
+  if (direct.length === 1) return { target: direct[0] };
+  return { skip: `${live.length} ${channelType} chats are wired to the agent and none is the one direct chat` };
+}
+
+const defaultMirrorApi: MirrorApi = {
+  groupsFor: (agentGroupId) => getMessagingGroupsByAgentGroup(agentGroupId),
+  adapter: (key) => getChannelAdapterExact(key),
+};
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
 
@@ -200,11 +252,21 @@ const isNotFound = (err: unknown): boolean => {
 export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost): LiveKitVoice {
   const api = config.api ?? defaultApi(config);
   const agentName = config.agentName || DEFAULT_LIVEKIT_AGENT_NAME;
-  const model = config.model || DEFAULT_GEMINI_LIVE_MODEL;
-  const voice = config.voice || DEFAULT_GEMINI_LIVE_VOICE;
+  const walkie = {
+    sttModel: config.walkie?.sttModel || DEFAULT_WALKIE_STT_MODEL,
+    ttsModel: config.walkie?.ttsModel || DEFAULT_WALKIE_TTS_MODEL,
+    ttsVoice: config.walkie?.ttsVoice || DEFAULT_WALKIE_TTS_VOICE,
+    silenceMs: config.walkie?.silenceMs || DEFAULT_WALKIE_SILENCE_MS,
+  };
+  const mirrorChannel = config.mirror && config.mirror !== 'off' ? config.mirror : null;
+  const mirrorApi = config.mirrorApi ?? defaultMirrorApi;
   const joinTimeoutMs = config.joinTimeoutMs ?? 60_000;
   const calls = new Map<string, LiveKitCall>();
   const cleanups = new Set<Promise<void>>();
+  /** Per line, so a transcript always lands before the reply to it. */
+  const mirrorChains = new Map<string, Promise<void>>();
+  /** The last skip reason logged per agent, so an unmirrorable agent logs once, not every turn. */
+  const mirrorSkips = new Map<string, string>();
   let clientJs: string | undefined;
   let page: string | undefined;
 
@@ -225,17 +287,36 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (call.queue.length > MAX_QUEUED_EVENTS) call.queue.shift();
   };
 
-  /**
-   * The open consults a reply to `consultId` answers: that one, plus those the agent got after it
-   * (map order is forwarding order: a consult is added right before it is forwarded). The agent
-   * batches the messages that queued while it was busy and replies once, in reply to the first, so
-   * the later consults are in that batch; earlier ones belong to an earlier turn and wait for their
-   * own reply or timeout. Same rule as the Gemini path. None when the consult is no longer open.
-   */
-  const answeredConsults = (call: LiveKitCall, consultId: string): string[] => {
-    if (!call.consults.has(consultId)) return [];
-    const ids = [...call.consults.keys()];
-    return ids.slice(ids.indexOf(consultId));
+  const postMirror = async (agentGroupId: string, text: string): Promise<void> => {
+    if (!mirrorChannel) return;
+    const pick = pickMirrorTarget(await mirrorApi.groupsFor(agentGroupId), mirrorChannel);
+    if ('skip' in pick) {
+      if (mirrorSkips.get(agentGroupId) !== pick.skip) {
+        mirrorSkips.set(agentGroupId, pick.skip);
+        log.info('livekit-voice: not mirroring the call', { agentGroupId, reason: pick.skip });
+      }
+      return;
+    }
+    mirrorSkips.delete(agentGroupId);
+    const { target } = pick;
+    const adapter = mirrorApi.adapter(target.instance ?? target.channel_type);
+    if (!adapter) {
+      log.warn('livekit-voice: mirror adapter is offline', { agentGroupId, instance: target.instance });
+      return;
+    }
+    await adapter.deliver(target.platform_id, null, { kind: 'chat', content: { text } });
+  };
+
+  /** Best effort and off the caller's path; ordered per line. */
+  const mirror = (platformId: string, agentGroupId: string, text: string): void => {
+    if (!mirrorChannel) return;
+    const next = (mirrorChains.get(platformId) ?? Promise.resolve())
+      .then(() => postMirror(agentGroupId, text))
+      .catch((err: unknown) => log.warn('livekit-voice: mirror post failed', { platformId, agentGroupId, err }));
+    mirrorChains.set(platformId, next);
+    void next.then(() => {
+      if (mirrorChains.get(platformId) === next) mirrorChains.delete(platformId);
+    });
   };
 
   /** The room going away is what ends the call for caller and worker; retried, a missing room counts as gone. */
@@ -271,8 +352,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     clearTimeout(call.expires);
     clearInterval(call.accessTimer);
     clearInterval(call.pingTimer);
-    for (const consult of call.consults.values()) clearTimeout(consult.timer);
-    call.consults.clear();
     if (call.startedAt !== undefined) host.chargeUsage({ platformId: call.platformId, startedAt: call.startedAt });
     if (calls.get(call.platformId) === call) calls.delete(call.platformId);
     const stream = call.stream;
@@ -341,10 +420,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       callerIdentity: `caller-${callId.slice(0, 8)}`,
       state: 'connecting',
       ended: false,
-      consults: new Map(),
       queue: [],
-      lastThinkAt: 0,
-      consultStarts: [],
+      utteranceStarts: [],
+      utterances: 0,
       sent: 0,
     };
     calls.set(platformId, call);
@@ -353,19 +431,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     call.accessTimer = setInterval(() => void checkAccess(call), host.accessCheckIntervalMs);
     call.accessTimer.unref();
     const metadata: LiveKitJobMetadata = {
-      v: 1,
+      v: 2,
       callId,
       lineId: platformId,
       agentName: line.agent.name,
       callerName: line.caller.name,
       callerIdentity: call.callerIdentity,
-      instructions: `${geminiInstructions(line.agent, line.caller, { agentUpdates: false })} ${ASK_AGENT_NOTE}`,
-      model,
-      voice,
-      scheduling: geminiToolScheduling(model),
+      vocabulary: [...(line.agent.vocabulary ?? [])],
+      ...walkie,
       maxDurationMs: Math.min(host.maxCallDurationMs, remainingMs),
-      delegationTimeoutMs: host.delegationTimeoutMs,
-      timeoutLine: host.delegationTimeoutLine,
       joinTimeoutMs,
     };
     let token: string;
@@ -406,7 +480,14 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       log.info('livekit-voice: page left during call setup', { platformId, callId });
       return endCall(call, 'page left during call setup');
     }
-    log.info('livekit-voice: call started', { platformId, callId, room: call.roomName, model, agent: line.agent.name });
+    log.info('livekit-voice: call started', {
+      platformId,
+      callId,
+      room: call.roomName,
+      agent: line.agent.name,
+      sttModel: walkie.sttModel,
+      ttsModel: walkie.ttsModel,
+    });
     reply(res, 200, JSON.stringify({ url: config.url, token, callId, agent: line.agent.name }), JSON_HEADERS);
   };
 
@@ -455,43 +536,36 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     });
   };
 
-  const onAsk = async (res: http.ServerResponse, call: LiveKitCall, body: Record<string, unknown>): Promise<void> => {
+  /** One transcribed caller turn: the agent gets it as a spoken message, the agent's chat a copy. */
+  const onUtterance = async (
+    res: http.ServerResponse,
+    call: LiveKitCall,
+    body: Record<string, unknown>,
+  ): Promise<void> => {
     if (call.state !== 'live') return reply(res, 409, 'The caller is not in the call');
-    const request = typeof body.request === 'string' ? body.request.trim() : '';
-    if (!request) return reply(res, 400, 'request is required');
-    if (Buffer.byteLength(request) > host.maxConsultRequestBytes) {
-      return reply(res, 413, `ask_agent request is too large (${host.maxConsultRequestBytes / 1024} KB max)`);
-    }
-    if (call.consults.size >= host.maxOpenConsults) {
-      return reply(res, 429, 'Too many ask_agent calls are waiting on the agent');
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) return reply(res, 400, 'text is required');
+    if (Buffer.byteLength(text) > MAX_UTTERANCE_BYTES) {
+      return reply(res, 413, `utterance is too large (${MAX_UTTERANCE_BYTES / 1024} KB max)`);
     }
     const t = host.now();
-    call.consultStarts = call.consultStarts.filter((at) => at > t - MINUTE_MS);
-    if (call.consultStarts.length >= host.maxConsultsPerMinute) {
-      return reply(res, 429, 'Too many ask_agent calls this minute', {
-        'Retry-After': String(Math.max(1, Math.ceil((call.consultStarts[0] + MINUTE_MS - t) / 1000))),
+    call.utteranceStarts = call.utteranceStarts.filter((at) => at > t - MINUTE_MS);
+    if (call.utteranceStarts.length >= MAX_UTTERANCES_PER_MINUTE) {
+      return reply(res, 429, 'Too many utterances this minute', {
+        'Retry-After': String(Math.max(1, Math.ceil((call.utteranceStarts[0] + MINUTE_MS - t) / 1000))),
       });
     }
-    call.consultStarts.push(t);
+    call.utteranceStarts.push(t);
     if (!(await checkAccess(call))) return reply(res, 403, 'Caller access denied');
-    const consultId = randomBytes(6).toString('hex');
-    const timer = setTimeout(() => {
-      if (!call.consults.delete(consultId) || call.ended) return;
-      log.warn('livekit-voice: ask_agent got no reply in time', { callId: call.callId, consultId });
-      push(call, { type: 'reply', text: host.delegationTimeoutLine, timedOut: true, consultIds: [consultId] });
-    }, host.delegationTimeoutMs);
-    timer.unref();
-    call.consults.set(consultId, { timer });
-    // The filler the model speaks for the tool result covers the first stretch of the wait.
-    call.lastThinkAt = host.now();
+    const utteranceId = String(++call.utterances);
     const message: InboundMessage = {
-      id: liveKitConsultMessageId(call.callId, consultId),
+      id: liveKitUtteranceMessageId(call.callId, utteranceId),
       kind: 'chat',
       content: {
-        text: request,
+        text: walkieMessageText(text),
         sender: call.line.caller.name,
         senderId: call.line.caller.id,
-        livekit: { callId: call.callId, consultId },
+        livekit: { callId: call.callId, utteranceId },
       },
       timestamp: new Date().toISOString(),
       isMention: true,
@@ -500,12 +574,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     try {
       await host.onInbound(call.platformId, message);
     } catch (err) {
-      clearTimeout(timer);
-      call.consults.delete(consultId);
       log.error('livekit-voice: onInbound threw', { platformId: call.platformId, err });
       return reply(res, 500, 'Could not reach the agent');
     }
-    reply(res, 202, JSON.stringify({ id: consultId }), JSON_HEADERS);
+    mirror(call.platformId, call.line.agentGroupId, `🎙 ${text}`);
+    reply(res, 202, JSON.stringify({ id: utteranceId }), JSON_HEADERS);
   };
 
   /** /webhook/voice/livekit/agent/*: the worker's side, authenticated by the per-call secret. */
@@ -530,7 +603,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     // Unknown, ended and unauthenticated look alike to the caller of these routes.
     if (!call || call.ended || !secret || !sameSecret(secret, call.secret)) return reply(res, 409, 'No such call');
     if (route === 'livekit/agent/joined') return onJoined(res, call);
-    if (route === 'livekit/agent/ask') return onAsk(res, call, body);
+    if (route === 'livekit/agent/utterance') return onUtterance(res, call, body);
     if (route === 'livekit/agent/ended') {
       endCall(call, typeof body.reason === 'string' ? `worker: ${body.reason.slice(0, 80)}` : 'worker ended');
       return reply(res, 204, '');
@@ -598,35 +671,27 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     async deliver(platformId, target, inReplyTo, text) {
       const call = calls.get(platformId);
       if (target && (!call || call.callId !== target.callId)) {
-        // An answer for a call that is over must not be spoken into a later one; retrying cannot help.
-        log.info('livekit-voice: dropping a reply for an ended call', { platformId, ...target });
+        // An answer for a call that is over must not be spoken into a later one; retrying cannot
+        // help. The agent's chat still gets it, so the caller can read what they missed.
+        log.info('livekit-voice: a reply for an ended call goes to the mirror only', { platformId, ...target });
+        if (mirrorChannel && text.trim()) {
+          const line = await host.resolveLine(platformId).catch(() => null);
+          if (line) mirror(platformId, line.agentGroupId, text);
+        }
         return { id: undefined };
       }
       if (!call || call.state !== 'live') return target ? { id: undefined } : null;
       if (!text.trim()) throw new Error('livekit-voice: reply contains no speakable text');
       if (!(await checkAccess(call))) throw new Error('livekit-voice: caller access has been revoked');
-      if (target) {
-        const consultIds = answeredConsults(call, target.consultId);
-        for (const id of consultIds) {
-          clearTimeout(call.consults.get(id)?.timer);
-          call.consults.delete(id);
-        }
-        // Without consults it answers none (a second reply, or one after the timeout line): still spoken.
-        push(call, consultIds.length > 0 ? { type: 'reply', text, consultIds } : { type: 'reply', text });
-        return { id: inReplyTo };
-      }
-      push(call, { type: 'say', text });
-      return { id: `${LIVEKIT_ID_PREFIX}${call.callId}:out-${++call.sent}` };
+      push(call, { type: 'reply', text });
+      // After the hand-off only: a delivery that threw is retried and would post twice.
+      mirror(platformId, call.line.agentGroupId, text);
+      return { id: target ? inReplyTo : `${LIVEKIT_ID_PREFIX}${call.callId}:out-${++call.sent}` };
     },
 
-    async setTyping(platformId, status) {
+    async setTyping(platformId) {
       const call = calls.get(platformId);
-      if (!call || call.state !== 'live' || call.consults.size === 0) return;
-      const t = host.now();
-      if (t - call.lastThinkAt < host.thinkIntervalMs) return;
-      if (!(await checkAccess(call))) return;
-      call.lastThinkAt = t;
-      push(call, { type: 'thinking', status: status?.trim() || undefined });
+      if (call?.state === 'live' && !call.ended) push(call, { type: 'thinking' });
     },
 
     activeCall(platformId) {
@@ -643,7 +708,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
     async teardown() {
       for (const call of [...calls.values()]) endCall(call, 'teardown');
-      await Promise.all([...cleanups]);
+      await Promise.all([...cleanups, ...mirrorChains.values()]);
     },
   };
 }
@@ -659,7 +724,13 @@ const audioBtn = document.getElementById('audio');
 const statusEl = document.getElementById('status');
 const logEl = document.getElementById('log');
 const names = { agent: 'the agent' };
-const STATES = { listening: 'listening', thinking: 'thinking', speaking: 'speaking' };
+// The worker's lk.agent.state: the caller's turn, its transcript on the way, the agent at work, its reply.
+const STATES = {
+  listening: () => 'Listening',
+  sending: () => 'Sending...',
+  thinking: () => names.agent + ' is thinking',
+  speaking: () => names.agent + ' is speaking',
+};
 let call = null;
 
 function setStatus(text) { statusEl.textContent = text; }
@@ -763,7 +834,7 @@ async function run(c, room, resumed) {
   room.on(LK.RoomEvent.ParticipantDisconnected, (p) => { if (p.isAgent) hangup(c, names.agent + ' left the call.'); });
   room.on(LK.RoomEvent.ParticipantAttributesChanged, (changed, p) => {
     const state = changed && changed['lk.agent.state'];
-    if (p && p.isAgent && STATES[state]) setStatus('Live: ' + names.agent + ' is ' + STATES[state] + '.');
+    if (p && p.isAgent && STATES[state]) setStatus(STATES[state]());
   });
   room.on(LK.RoomEvent.Disconnected, () => hangup(c, 'Call ended.'));
   // iOS Safari binds WebRTC UDP to the Wi-Fi interface, so UDP to a VPN (Tailscale) address
@@ -774,12 +845,13 @@ async function run(c, room, resumed) {
   const forceRelay = relayParam === null ? isIOS : relayParam === '1';
   await room.connect(s.url, s.token, forceRelay ? { autoSubscribe: true, rtcConfig: { iceTransportPolicy: 'relay' } } : { autoSubscribe: true });
   if (c.ended) return;
-  // DTX off: Gemini 3.8 only ends a turn while audio keeps arriving, silence included.
+  // DTX off: the worker times the caller's turn by the silence it hears, so silence must keep arriving.
   const pub = await room.localParticipant.publishTrack(c.mic, { source: LK.Track.Source.Microphone, dtx: false, red: false });
   c.localSid = pub.trackSid;
   audioBtn.hidden = room.canPlaybackAudio;
-  const agentHere = [...room.remoteParticipants.values()].some((p) => p.isAgent);
-  setStatus(agentHere ? 'Live: talk to ' + names.agent + '.' : 'Waiting for ' + names.agent + '...');
+  const agent = [...room.remoteParticipants.values()].find((p) => p.isAgent);
+  const state = agent && agent.attributes && agent.attributes['lk.agent.state'];
+  setStatus(STATES[state] ? STATES[state]() : agent ? 'Live: talk to ' + names.agent + '.' : 'Waiting for ' + names.agent + '...');
 }
 
 btn.addEventListener('click', () => (call ? hangup(call, 'Call ended.') : start()));

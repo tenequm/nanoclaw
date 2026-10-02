@@ -2,15 +2,24 @@
  * The LiveKit path of the voice channel at the host boundary: the real adapter
  * behind the real webhook server, hit over HTTP the way the call page and the
  * worker do. Faked: the LiveKit server API (recorded calls), Google's token
- * endpoint (for the cross-engine test) and the clock.
+ * endpoint (for the cross-engine test), the mirror's chats and the clock.
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ChannelAdapter, InboundMessage } from './adapter.js';
-import { createGptLiveAdapter, DELEGATION_TIMEOUT_LINE, lineIdForToken, type GptLiveConfig } from './voice.js';
-import type { LiveKitServerApi, LiveKitVoiceConfig } from './voice-livekit.js';
+import type { ChannelAdapter, InboundMessage, OutboundMessage } from './adapter.js';
+import { createGptLiveAdapter, lineIdForToken, type GptLiveConfig } from './voice.js';
+import {
+  liveKitCallPageHtml,
+  pickMirrorTarget,
+  walkieMessageText,
+  WALKIE_REPLY_NOTE,
+  type LiveKitServerApi,
+  type LiveKitVoiceConfig,
+  type MirrorApi,
+} from './voice-livekit.js';
+import type { MessagingGroup } from '../types.js';
 import { liveKitCallSecret, type LiveKitHostEvent, type LiveKitJobMetadata } from './voice-livekit-protocol.js';
 import { stopWebhookServer } from '../webhook-server.js';
 
@@ -86,6 +95,35 @@ function startFakeGoogle(): Promise<{ apiBase: string; close(): Promise<void> }>
   });
 }
 
+/** The agent's chats and what was posted into them. */
+function fakeMirror(groups: Array<Partial<MessagingGroup>>) {
+  const posts: Array<{ instance: string; platformId: string; text: string }> = [];
+  const api: MirrorApi = {
+    groupsFor: async () => groups.map((g, i) => mg({ id: `mg-${i}`, ...g })),
+    adapter: (instance) => ({
+      deliver: async (platformId: string, _thread: string | null, message: OutboundMessage) => {
+        posts.push({ instance, platformId, text: (message.content as { text: string }).text });
+        return 'tg-1';
+      },
+    }),
+  };
+  return { api, posts };
+}
+
+function mg(overrides: Partial<MessagingGroup>): MessagingGroup {
+  return {
+    id: 'mg',
+    channel_type: 'telegram',
+    platform_id: 'telegram:100',
+    instance: 'telegram',
+    name: null,
+    is_group: 0,
+    unknown_sender_policy: 'strict',
+    created_at: '2026-10-02T00:00:00Z',
+    ...overrides,
+  };
+}
+
 interface Harness {
   adapter: ChannelAdapter;
   /** Where the worker reaches the host, from its own settings. */
@@ -121,7 +159,7 @@ async function startHarness(
         ? {
             caller: { id, name: 'Ethan' },
             agentGroupId: 'ag-andy',
-            agent: { name: 'Andy', personality: 'Dry humour, precise.' },
+            agent: { name: 'Andy', personality: 'Dry humour, precise.', vocabulary: ['NanoClaw', 'Stan'] },
           }
         : null,
     now: () => clock.now,
@@ -181,8 +219,8 @@ interface TokenResponse {
 /** The worker's side of one call: its metadata, an open event stream, and its POSTs. */
 interface FakeWorker {
   meta: LiveKitJobMetadata;
-  /** The consult id from each accepted ask, in order. */
-  ask(request: string): Promise<string>;
+  /** Post one transcribed turn; resolves the utterance id the host gave it. */
+  utter(text: string): Promise<string>;
   events: LiveKitHostEvent[];
   streamClosed: Promise<void>;
   post(path: string, body?: Record<string, unknown>): Promise<Response>;
@@ -230,8 +268,8 @@ async function attachWorker(h: Harness, meta: LiveKitJobMetadata): Promise<FakeW
     events,
     streamClosed,
     post: workerPost,
-    ask: async (request) => {
-      const res = await workerPost('ask', { request });
+    utter: async (text) => {
+      const res = await workerPost('utterance', { text });
       expect(res.status).toBe(202);
       return ((await res.json()) as { id: string }).id;
     },
@@ -268,7 +306,7 @@ describe('livekit voice path without LiveKit settings', () => {
   it('answers 503 on every livekit route and leaves the other engines alone', async () => {
     expect((await fetch(`${h.base}/livekit?t=tok123`)).status).toBe(503);
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(503);
-    expect((await post(`${h.base}/livekit/agent/ask`, {})).status).toBe(503);
+    expect((await post(`${h.base}/livekit/agent/utterance`, {})).status).toBe(503);
     expect((await fetch(`${h.base}/call?t=tok123`)).status).toBe(200);
   });
 });
@@ -280,7 +318,6 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   beforeEach(async () => {
     google = await startFakeGoogle();
     h = await startHarness({
-      delegationTimeoutMs: 300,
       accessCheckIntervalMs: 50,
       gemini: { apiKey: 'gk-test', apiBase: google.apiBase },
     });
@@ -323,24 +360,21 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(dispatch.room).toBe(room);
     expect(dispatch.agentName).toBe('nanoclaw-voice');
     const meta = dispatch.metadata;
-    expect(meta).toMatchObject({
-      v: 1,
+    expect(meta).toEqual({
+      v: 2,
       callId: body.callId,
       lineId: LINE,
       agentName: 'Andy',
       callerName: 'Ethan',
-      model: 'gemini-3.8-live',
-      voice: 'Kore',
-      scheduling: 'WHEN_IDLE',
-      delegationTimeoutMs: 300,
-      timeoutLine: DELEGATION_TIMEOUT_LINE,
+      callerIdentity: expect.stringMatching(/^caller-/),
+      vocabulary: ['NanoClaw', 'Stan'],
+      sttModel: 'gemini-3.8-flash',
+      ttsModel: 'gemini-3.1-flash-tts-preview',
+      ttsVoice: 'Alnilam',
+      silenceMs: 2500,
       maxDurationMs: 15 * MIN,
+      joinTimeoutMs: 60_000,
     });
-    expect(meta.instructions).toContain('You are Andy');
-    expect(meta.instructions).toContain('Dry humour, precise.');
-    expect(meta.instructions).toContain('Answer from the backend');
-    // The browser path's page-injected turns never reach this engine.
-    expect(meta.instructions).not.toContain('Agent update:');
     // Nothing secret in the dispatch (agents-js logs jobs), and no host address the worker would trust.
     expect(meta).not.toHaveProperty('secret');
     expect(meta).not.toHaveProperty('hostUrl');
@@ -389,94 +423,67 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect((await post(`${url}/joined`, { callId: meta.callId }, workerAuth(meta.callId))).status).toBe(200);
   });
 
-  it('routes ask_agent to the agent and speaks every reply to it, interim and final', async () => {
+  it('hands each transcribed turn to the agent as a spoken message and speaks every reply in full', async () => {
     const { worker } = await startCall(h);
-    const ask = await worker.post('ask', { request: 'What is on my calendar tomorrow?' });
-    expect(ask.status).toBe(202);
-    const { id } = (await ask.json()) as { id: string };
+    const id = await worker.utter('Що в мене завтра в календарі?');
     expect(h.inbound).toHaveLength(1);
     const msg = h.inbound[0];
     expect(msg.id).toBe(`livekit:${worker.meta.callId}:${id}`);
-    expect(msg.content).toMatchObject({ text: 'What is on my calendar tomorrow?', sender: 'Ethan', senderId: LINE });
+    expect(msg.content).toMatchObject({
+      text: walkieMessageText('Що в мене завтра в календарі?'),
+      sender: 'Ethan',
+      senderId: LINE,
+      livekit: { callId: worker.meta.callId, utteranceId: id },
+    });
+    const text = (msg.content as { text: string }).text;
+    expect(text.startsWith('<voice source="livekit">Що в мене завтра в календарі?</voice>\n')).toBe(true);
+    expect(text).toContain('no markdown, no links, no code blocks, numbers written as words');
+    // A follow-up while the agent works is its own message with its own id.
+    const second = await worker.utter('And the day after?');
+    expect(second).not.toBe(id);
 
     const interim = await h.adapter.deliver(LINE, null, {
       kind: 'chat',
-      content: { text: 'Let me check.' },
+      content: { text: 'Checking.' },
       inReplyTo: msg.id,
     });
     expect(interim).toBe(msg.id);
     await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Dentist at nine.' }, inReplyTo: msg.id });
     await worker.waitFor((e) => e.type === 'reply' && e.text === 'Dentist at nine.');
-    // The first reply answers the consult; the second answers none and is spoken as a new turn.
     expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
-      { type: 'reply', text: 'Let me check.', consultIds: [id] },
+      { type: 'reply', text: 'Checking.' },
       { type: 'reply', text: 'Dentist at nine.' },
     ]);
-    // The reply settled the consult: no timeout line follows.
-    await new Promise((r) => setTimeout(r, 400));
-    expect(worker.events.some((e) => e.type === 'reply' && e.timedOut)).toBe(false);
     worker.close();
   });
 
-  it('settles the targeted ask_agent and the ones opened after it with a batched reply', async () => {
+  it('bounds utterance size and rate', async () => {
     const { worker } = await startCall(h);
-    const first = await worker.ask('first');
-    const second = await worker.ask('second');
-    // The agent's batched turn answers the first inbound only.
-    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Both done.' }, inReplyTo: h.inbound[0].id });
-    await new Promise((r) => setTimeout(r, 400));
-    expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
-      { type: 'reply', text: 'Both done.', consultIds: [first, second] },
-    ]);
+    expect((await worker.post('utterance', { text: '   ' })).status).toBe(400);
+    expect((await worker.post('utterance', { text: 'я'.repeat(4200) })).status).toBe(413);
+    for (let i = 0; i < 20; i++) expect((await worker.post('utterance', { text: `t${i}` })).status).toBe(202);
+    const refused = await worker.post('utterance', { text: 'one too many' });
+    expect(refused.status).toBe(429);
+    expect(refused.headers.get('retry-after')).toBeTruthy();
+    h.clock.now += MIN;
+    expect((await worker.post('utterance', { text: 'later' })).status).toBe(202);
     worker.close();
   });
 
-  it('routes out-of-order replies to their own consults and leaves earlier ones open', async () => {
-    const { worker } = await startCall(h);
-    const a = await worker.ask('a');
-    const b = await worker.ask('b');
-    const c = await worker.ask('c');
-    const idOf = (consultId: string) => h.inbound.find((m) => m.id.endsWith(`:${consultId}`))!.id;
-    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'C first.' }, inReplyTo: idOf(c) });
-    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Then B.' }, inReplyTo: idOf(b) });
-    // A second reply to C answers nothing; it must not settle A.
-    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'More on C.' }, inReplyTo: idOf(c) });
-    await worker.waitFor((e) => e.type === 'reply' && e.text === 'More on C.');
-    // A got no reply, so only A hits the timeout line.
-    const timedOut = await worker.waitFor((e) => e.type === 'reply' && e.timedOut === true);
-    expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
-      { type: 'reply', text: 'C first.', consultIds: [c] },
-      { type: 'reply', text: 'Then B.', consultIds: [b] },
-      { type: 'reply', text: 'More on C.' },
-      { type: 'reply', text: DELEGATION_TIMEOUT_LINE, timedOut: true, consultIds: [a] },
-    ]);
-    expect(timedOut).toMatchObject({ consultIds: [a] });
-    worker.close();
+  it('refuses an utterance before the caller is in and after access is gone', async () => {
+    expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
+    const meta = h.lk.dispatches[0].metadata;
+    const url = `${h.hostUrl}/webhook/voice/livekit/agent/utterance`;
+    expect((await post(url, { callId: meta.callId, text: 'hi' }, workerAuth(meta.callId))).status).toBe(409);
+    expect((await post(url, { callId: meta.callId, text: 'hi' })).status).toBe(409);
+    expect(h.inbound).toEqual([]);
   });
 
-  it('bounds open requests and request size', async () => {
-    const { worker } = await startCall(h);
-    expect((await worker.post('ask', { request: 'x'.repeat(5000) })).status).toBe(413);
-    for (let i = 0; i < 3; i++) expect((await worker.post('ask', { request: `q${i}` })).status).toBe(202);
-    expect((await worker.post('ask', { request: 'one too many' })).status).toBe(429);
-    worker.close();
-  });
-
-  it('answers an unanswered ask_agent with the timeout line', async () => {
-    const { worker } = await startCall(h);
-    const id = await worker.ask('slow one');
-    const event = await worker.waitFor((e) => e.type === 'reply');
-    expect(event).toEqual({ type: 'reply', text: DELEGATION_TIMEOUT_LINE, timedOut: true, consultIds: [id] });
-    worker.close();
-  });
-
-  it('speaks proactive agent messages and holding notes on the call', async () => {
+  it('speaks proactive agent messages and tells the worker while the agent works', async () => {
     const { worker } = await startCall(h);
     const id = await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Your taxi is here.' } });
-    expect(id).toMatch(/^livekit:/);
-    await worker.waitFor((e) => e.type === 'say' && e.text === 'Your taxi is here.');
-    await worker.post('ask', { request: 'book a table' });
-    h.clock.now += 25_000;
+    expect(id).toMatch(/^livekit:.*:out-1$/);
+    await worker.waitFor((e) => e.type === 'reply' && e.text === 'Your taxi is here.');
     await h.adapter.setTyping!(LINE, null);
     await worker.waitFor((e) => e.type === 'thinking');
     worker.close();
@@ -484,7 +491,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('drops a reply for an ended call instead of speaking it into the next one', async () => {
     const first = await startCall(h);
-    await first.worker.post('ask', { request: 'old question' });
+    await first.worker.utter('old question');
     const oldId = h.inbound[0].id;
     const second = await startCall(h);
     await expect(
@@ -504,7 +511,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await worker.streamClosed;
     expect(worker.events.at(-1)).toEqual({ type: 'end', reason: 'hangup' });
     // The worker's routes are closed for this call now.
-    expect((await worker.post('ask', { request: 'late' })).status).toBe(409);
+    expect((await worker.post('utterance', { text: 'late' })).status).toBe(409);
   });
 
   it('ends the call when the caller loses access', async () => {
@@ -678,5 +685,142 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await worker.streamClosed;
     expect(worker.events.at(-1)).toEqual({ type: 'end', reason: 'replaced by a new call' });
     expect(h.lk.deleted).toHaveLength(1);
+  });
+});
+
+describe('mirror target', () => {
+  it('picks the one live chat of the channel, or the one direct chat among several', () => {
+    expect(pickMirrorTarget([], 'telegram')).toEqual({ skip: 'no telegram chat is wired to the agent' });
+    expect(
+      pickMirrorTarget(
+        [
+          mg({ id: 'a', denied_at: '2026-01-01' }),
+          mg({ id: 'b', detached_at: '2026-01-01' }),
+          mg({ id: 'c', channel_type: 'slack' }),
+        ],
+        'telegram',
+      ),
+    ).toEqual({ skip: 'no telegram chat is wired to the agent' });
+    const dm = mg({ id: 'dm' });
+    expect(pickMirrorTarget([dm], 'telegram')).toEqual({ target: dm });
+    // The same chat reached through two wirings is one chat.
+    expect(pickMirrorTarget([dm, { ...dm }], 'telegram')).toEqual({ target: dm });
+    const group = mg({ id: 'g', platform_id: 'telegram:-200', is_group: 1 });
+    expect(pickMirrorTarget([group, dm], 'telegram')).toEqual({ target: dm });
+    expect(pickMirrorTarget([group], 'telegram')).toEqual({ target: group });
+    expect(pickMirrorTarget([dm, mg({ id: 'dm2', platform_id: 'telegram:101' })], 'telegram')).toMatchObject({
+      skip: expect.stringContaining('2 telegram chats'),
+    });
+    expect(pickMirrorTarget([group, mg({ id: 'g2', is_group: 1 })], 'telegram')).toHaveProperty('skip');
+  });
+});
+
+describe('livekit voice path mirrored into the agent chat', () => {
+  let h: Harness;
+  afterEach(async () => {
+    await h.stop();
+  });
+
+  const start = async (groups: Array<Partial<MessagingGroup>>, mirror = 'telegram') => {
+    const fake = fakeMirror(groups);
+    h = await startHarness({ accessCheckIntervalMs: 60_000 }, true, { mirror, mirrorApi: fake.api });
+    return fake;
+  };
+
+  it('posts the transcript and the reply once each, in order, to the one Telegram chat', async () => {
+    const { posts } = await start([{ platform_id: 'telegram:100' }, { channel_type: 'voice', platform_id: LINE }]);
+    const { worker } = await startCall(h);
+    await worker.utter('Book a table for two');
+    await h.adapter.deliver(LINE, null, {
+      kind: 'chat',
+      content: { text: 'Booked for **eight**.' },
+      inReplyTo: h.inbound[0].id,
+    });
+    await vi.waitFor(() => expect(posts).toHaveLength(2));
+    await settle();
+    expect(posts).toEqual([
+      { instance: 'telegram', platformId: 'telegram:100', text: '🎙 Book a table for two' },
+      { instance: 'telegram', platformId: 'telegram:100', text: 'Booked for **eight**.' },
+    ]);
+    worker.close();
+  });
+
+  it('mirrors nothing for a reply whose delivery failed, so the retry posts it once', async () => {
+    const { posts } = await start([{}]);
+    const { worker } = await startCall(h);
+    await worker.utter('hello');
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    h.access.enabled = false;
+    await expect(
+      h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Hi.' }, inReplyTo: h.inbound[0].id }),
+    ).rejects.toThrow(/revoked/);
+    await settle();
+    expect(posts).toHaveLength(1);
+    worker.close();
+  });
+
+  it('still mirrors a reply that arrives after the call ended', async () => {
+    const { posts } = await start([{}]);
+    const { call, worker } = await startCall(h);
+    await worker.utter('Remind me later');
+    await post(`${h.base}/livekit/end?t=tok123`, { callId: call.callId });
+    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Done.' }, inReplyTo: h.inbound[0].id });
+    await vi.waitFor(() => expect(posts.map((p) => p.text)).toEqual(['🎙 Remind me later', 'Done.']));
+    expect(worker.events.some((e) => e.type === 'reply')).toBe(false);
+  });
+
+  it('skips mirroring when no chat or more than one could be meant', async () => {
+    for (const groups of [[], [{ platform_id: 'telegram:1' }, { id: 'x', platform_id: 'telegram:2' }]]) {
+      const { posts } = await start(groups);
+      const { worker } = await startCall(h);
+      await worker.utter('hello');
+      await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Hi.' }, inReplyTo: h.inbound[0].id });
+      await settle();
+      expect(posts).toEqual([]);
+      worker.close();
+      await h.stop();
+    }
+    h = await startHarness({}, false);
+  });
+
+  it('is off with WALKIE_MIRROR=off', async () => {
+    const { posts } = await start([{}], 'off');
+    const { worker } = await startCall(h);
+    await worker.utter('hello');
+    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Hi.' }, inReplyTo: h.inbound[0].id });
+    await settle();
+    expect(posts).toEqual([]);
+    worker.close();
+  });
+});
+
+describe('livekit call page', () => {
+  const html = liveKitCallPageHtml();
+  const script = html.slice(html.lastIndexOf('<script>') + '<script>'.length, html.lastIndexOf('</script>'));
+
+  it('is valid script', () => {
+    expect(() => new Function(script)).not.toThrow();
+  });
+
+  it('shows the walkie-talkie states and labels the captions the worker sends', () => {
+    expect(script).toContain("listening: () => 'Listening'");
+    expect(script).toContain("sending: () => 'Sending...'");
+    expect(script).toContain("thinking: () => names.agent + ' is thinking'");
+    expect(script).toContain("speaking: () => names.agent + ' is speaking'");
+    expect(script).toContain("registerTextStreamHandler('lk.transcription'");
+    // The caller's own turns come back from the worker against the caller's track: "You".
+    expect(script).toContain("attrs['lk.transcribed_track_id'] === c.localSid");
+  });
+
+  it('keeps iOS on relay-only ICE', () => {
+    expect(script).toContain("rtcConfig: { iceTransportPolicy: 'relay' }");
+    expect(script).toContain('isIOS');
+  });
+});
+
+describe('walkie message text', () => {
+  it('marks the transcript as spoken and says how to answer', () => {
+    expect(walkieMessageText('Привіт')).toBe(`<voice source="livekit">Привіт</voice>\n${WALKIE_REPLY_NOTE}`);
+    expect(WALKIE_REPLY_NOTE).toContain('separate written message');
   });
 });

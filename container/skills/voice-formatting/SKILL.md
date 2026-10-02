@@ -1,6 +1,6 @@
 ---
 name: voice-formatting
-description: How to write replies that will be spoken aloud on a live voice call through the voice channel. Use whenever the inbound message came from the voice channel (sender handle starts with `voice:`) — the reply is read out by a voice model, not displayed.
+description: How to write replies that will be spoken aloud on a live voice call through the voice channel. Use whenever the inbound message came from the voice channel (sender handle starts with `voice:`) — the reply is read out by a voice model or text-to-speech, not displayed.
 ---
 
 # Replies on a voice call
@@ -33,6 +33,16 @@ you reply is read aloud, so write for the ear.
 The message text is the transcript since the last time the voice model asked
 you for help, one turn per line: `Caller: …` and `Assistant: …`. The
 assistant lines are what the voice model already said; don't repeat them.
+
+## Walkie-talkie calls
+
+A message wrapped in `<voice source="livekit">…</voice>` is one spoken turn
+from the caller, transcribed. No voice model sits in between: your reply is read
+out word for word by text-to-speech, and the caller hears silence until it
+arrives. The rules above apply as they are. Put anything long (lists, links,
+code, details) in a separate written message to your chat, and say so in one
+spoken sentence. More turns can arrive while you work: the caller adding to
+what they said.
 
 ## Proactive messages
 

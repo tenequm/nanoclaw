@@ -87,7 +87,7 @@ const MINUTE_MS = 60_000;
 const ACCESS_CHECK_INTERVAL_MS = 5000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
-/** ask_agent calls one Gemini or LiveKit call may have waiting on the agent at once. */
+/** ask_agent calls one Gemini call may have waiting on the agent at once. */
 export const MAX_OPEN_CONSULTS = 3;
 export const MAX_CONSULTS_PER_MINUTE = 10;
 export const MAX_CONSULT_REQUEST_BYTES = 4 * 1024;
@@ -209,7 +209,7 @@ export interface GptLiveConfig {
   delegationTimeoutMs?: number;
   /** Enables the Gemini Live path under /webhook/voice/gemini; without it those routes answer 503. */
   gemini?: GeminiLiveConfig;
-  /** Enables the LiveKit + Gemini Live path under /webhook/voice/livekit; without it those routes answer 503. */
+  /** Enables the LiveKit walkie-talkie path under /webhook/voice/livekit; without it those routes answer 503. */
   livekit?: LiveKitVoiceConfig;
   /** Serve the voice routes to non-loopback peers too (GPT_LIVE_ALLOW_NON_LOOPBACK); for local development only. */
   allowNonLoopback?: boolean;
@@ -443,13 +443,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         isRunning: () => connected,
         now,
         maxCallDurationMs,
-        delegationTimeoutMs,
         accessCheckIntervalMs,
-        thinkIntervalMs: THINK_INTERVAL_MS,
-        delegationTimeoutLine: DELEGATION_TIMEOUT_LINE,
-        maxOpenConsults: MAX_OPEN_CONSULTS,
-        maxConsultsPerMinute: MAX_CONSULTS_PER_MINUTE,
-        maxConsultRequestBytes: MAX_CONSULT_REQUEST_BYTES,
       })
     : null;
 
@@ -1184,7 +1178,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
    * while it was busy and replies once, in reply to the first. Consults it got earlier belong to an
    * earlier turn and keep waiting for their own reply. Everything else (an interim reply followed
    * by the real one, a reply after the timeout line, a proactive message) is queued for the page,
-   * which speaks it as an agent update. The LiveKit path applies the same rule.
+   * which speaks it as an agent update.
    */
   const deliverToGemini = async (
     call: GeminiCall,
@@ -1258,7 +1252,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       const target = message.inReplyTo ? parseDelegationMessageId(message.inReplyTo) : null;
       if (!target && livekit) {
         const parts = message.inReplyTo ? parseScopedId(LIVEKIT_ID_PREFIX, message.inReplyTo) : null;
-        const lkTarget = parts && { callId: parts[0], consultId: parts[1] };
+        const lkTarget = parts && { callId: parts[0], utteranceId: parts[1] };
         const spoken = await livekit.deliver(platformId, lkTarget, message.inReplyTo, text);
         if (spoken) return spoken.id;
       }
@@ -1282,10 +1276,10 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     },
 
     async setTyping(platformId: string, _threadId: string | null, status?: string): Promise<void> {
+      await livekit?.setTyping(platformId);
       // The host re-fires typing every few seconds for as long as the agent works. The voice
       // model needs one quiet note now and then, not a drumbeat: at most one per
       // THINK_INTERVAL_MS while a reply is pending, none once the reply went out.
-      await livekit?.setTyping(platformId, status);
       const call = lines.get(platformId);
       if (!call || call.session.pendingDelegations().length === 0 || !(await checkCallAccess(call))) return;
       const t = now();
@@ -1327,6 +1321,15 @@ export function parseUiConfig(raw: string | undefined): VoiceUiConfig | undefine
   return undefined;
 }
 
+/** WALKIE_SILENCE_MS: how long the caller is silent before their turn ends; nonsense falls back to the default. */
+export function parseWalkieSilenceMs(raw: string | undefined): number | undefined {
+  if (!raw?.trim()) return undefined;
+  const ms = Number(raw);
+  if (Number.isInteger(ms) && ms >= 300 && ms <= 30_000) return ms;
+  log.warn('gpt-live: WALKIE_SILENCE_MS must be whole milliseconds between 300 and 30000; using the default');
+  return undefined;
+}
+
 registerChannelAdapter(CHANNEL_TYPE, {
   factory: () => {
     const env = readEnvFile([
@@ -1352,6 +1355,11 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'LIVEKIT_API_KEY',
       'LIVEKIT_API_SECRET',
       'LIVEKIT_AGENT_NAME',
+      'WALKIE_STT_MODEL',
+      'WALKIE_TTS_MODEL',
+      'WALKIE_TTS_VOICE',
+      'WALKIE_SILENCE_MS',
+      'WALKIE_MIRROR',
     ]);
     const key = resolveOpenAiKey(env);
     if (!key) return null;
@@ -1396,8 +1404,13 @@ registerChannelAdapter(CHANNEL_TYPE, {
               apiKey: env.LIVEKIT_API_KEY,
               apiSecret: env.LIVEKIT_API_SECRET,
               agentName: env.LIVEKIT_AGENT_NAME,
-              model: env.GEMINI_LIVE_MODEL,
-              voice: env.GEMINI_LIVE_VOICE,
+              walkie: {
+                sttModel: env.WALKIE_STT_MODEL,
+                ttsModel: env.WALKIE_TTS_MODEL,
+                ttsVoice: env.WALKIE_TTS_VOICE,
+                silenceMs: parseWalkieSilenceMs(env.WALKIE_SILENCE_MS),
+              },
+              mirror: (env.WALKIE_MIRROR || 'telegram').trim().toLowerCase(),
             }
           : undefined,
     });

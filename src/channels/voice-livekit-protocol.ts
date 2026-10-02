@@ -12,40 +12,40 @@ export const PING_INTERVAL_MS = 15_000;
 /** The worker drops the host link after this long without a line: three missed pings. */
 export const HOST_SILENCE_MS = 3 * PING_INTERVAL_MS;
 
-/** How an agent reply starts when it reaches the voice model outside a tool result. */
-export const ANSWER_PREFIX = 'Answer from the backend';
+export const DEFAULT_WALKIE_STT_MODEL = 'gemini-3.8-flash';
+export const DEFAULT_WALKIE_TTS_MODEL = 'gemini-3.1-flash-tts-preview';
+export const DEFAULT_WALKIE_TTS_VOICE = 'Alnilam';
+/** Silence that ends the caller's turn; shorter pauses mid-thought keep it open. */
+export const DEFAULT_WALKIE_SILENCE_MS = 2500;
 
 /** What the worker receives as job metadata. Nothing secret: agents-js logs the whole job on some paths. */
 export interface LiveKitJobMetadata {
-  v: 1;
+  /** 2 since the walkie-talkie worker; a worker of another version refuses the job. */
+  v: 2;
   callId: string;
   lineId: string;
   agentName: string;
   callerName: string;
   callerIdentity: string;
-  instructions: string;
-  model: string;
-  voice: string;
-  /** Function response scheduling; null for models that close the session on it. */
-  scheduling: 'WHEN_IDLE' | null;
+  /** Spelling hints for the transcription: GPT_LIVE_VOCABULARY plus the agent's voice.vocabulary.txt. */
+  vocabulary: string[];
+  sttModel: string;
+  ttsModel: string;
+  ttsVoice: string;
+  silenceMs: number;
   /** Upper bound the worker enforces on itself if the host never ends the call. */
   maxDurationMs: number;
-  /** The host answers an unanswered ask_agent with the timeout line after this long. */
-  delegationTimeoutMs: number;
-  /** What the caller hears then; a later reply is still spoken. */
-  timeoutLine: string;
   joinTimeoutMs: number;
 }
 
 /**
- * One line of the host-to-worker event stream. A `reply` carries the ask_agent
- * consults it answers, the targeted one first; without any it answers none and
- * is spoken as a new turn.
+ * One line of the host-to-worker event stream: a complete agent message to
+ * speak, the agent still working (from the host's typing refresh), the end of
+ * the call, or a keepalive.
  */
 export type LiveKitHostEvent =
-  | { type: 'reply'; text: string; consultIds?: string[]; timedOut?: boolean }
-  | { type: 'say'; text: string }
-  | { type: 'thinking'; status?: string }
+  | { type: 'reply'; text: string }
+  | { type: 'thinking' }
   | { type: 'end'; reason: string }
   | { type: 'ping' };
 
