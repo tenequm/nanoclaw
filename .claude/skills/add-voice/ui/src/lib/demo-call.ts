@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { LIVE_PHASES, type Line, type Phase, type Speaker, type VoiceCall } from "./voice-call"
+import { LIVE_PHASES, type Line, type Phase, type SendCue, type Speaker, type VoiceCall } from "./voice-call"
 
 /**
  * A scripted call with the same shape as the real one, for `?demo=1`: the page can be
@@ -7,7 +7,22 @@ import { LIVE_PHASES, type Line, type Phase, type Speaker, type VoiceCall } from
  * Nothing here touches the host; the words and the levels are made up.
  */
 
-type Step = { phase: Phase; ms: number; from?: Speaker; text?: string }
+type Step = {
+  phase: Phase
+  ms: number
+  from?: Speaker
+  text?: string
+  /** Walkie: the caller pauses at the end of this step and the send countdown runs. */
+  cue?: boolean
+  /** Walkie: the caller's last line was sent. */
+  sent?: boolean
+  /** Walkie: what this agent line answers. */
+  re?: string
+  /** Walkie: the call nears its limit. */
+  limit?: boolean
+  /** Walkie: the call ends here, with this reason. */
+  end?: string
+}
 
 const AGENT = "Casa"
 const SCRIPT: Step[] = [
@@ -31,13 +46,44 @@ const SCRIPT: Step[] = [
   { phase: "listening", ms: 2200 },
 ]
 
-export function useDemoCall(enabled: boolean): VoiceCall {
+// The walkie-talkie's cues: the send countdown, sent marks, what each reply answers, the limit note and an end reason.
+const WALKIE_SCRIPT: Step[] = [
+  { phase: "connecting", ms: 1300 },
+  { phase: "listening", ms: 3600, from: "user", text: "Hey Casa, what did we decide about the launch date?", cue: true },
+  { phase: "thinking", ms: 1700, sent: true },
+  {
+    phase: "talking",
+    ms: 4800,
+    from: "assistant",
+    text: "We settled on the 24th, right after the beta feedback round closes. Want a reminder on Thursday so you can brief the team?",
+    re: "re: turn 1",
+  },
+  { phase: "talking", ms: 3200, from: "assistant", text: "Also, the venue confirmed the booking for Friday.", re: "unprompted" },
+  { phase: "listening", ms: 3000, from: "user", text: "Yes, and let Laura know.", cue: true },
+  { phase: "thinking", ms: 2400, sent: true, limit: true },
+  {
+    phase: "talking",
+    ms: 3800,
+    from: "assistant",
+    text: "Done. Thursday at nine is on your calendar, and Laura has a note in the family group.",
+    re: "re: turn 2",
+  },
+  { phase: "listening", ms: 2200 },
+  { phase: "ended", ms: 0, end: "Today's call minutes are used up." },
+]
+const DEMO_SILENCE_MS = 2500
+
+export function useDemoCall(enabled: boolean, walkie = false): VoiceCall {
+  const script = walkie ? WALKIE_SCRIPT : SCRIPT
   const [phase, setPhase] = useState<Phase>("idle")
   const [lines, setLines] = useState<Line[]>([])
   const [streamingId, setStreamingId] = useState<number | null>(null)
   const [elapsed, setElapsed] = useState(0)
   const [muted, setMuted] = useState(false)
   const [endedText, setEndedText] = useState<string | null>(null)
+  const [sendCue, setSendCue] = useState<SendCue | null>(null)
+  const [limitNote, setLimitNote] = useState<string | null>(null)
+  const turns = useRef(0)
 
   const phaseRef = useRef<Phase>("idle")
   const mutedRef = useRef(false)
@@ -56,6 +102,7 @@ export function useDemoCall(enabled: boolean): VoiceCall {
     timers.current = []
     streamingRef.current = false
     setStreamingId(null)
+    setSendCue(null)
   }, [])
 
   const later = useCallback((fn: () => void, ms: number) => {
@@ -63,12 +110,12 @@ export function useDemoCall(enabled: boolean): VoiceCall {
   }, [])
 
   const streamLine = useCallback(
-    (from: Speaker, text: string, ms: number) => {
+    (from: Speaker, text: string, ms: number, re?: string) => {
       const id = nextId.current++
       const words = text.split(" ")
       const interval = Math.max(70, Math.min(160, (ms * 0.8) / words.length))
       const at = Math.max(0, Math.floor((Date.now() - startedAt.current) / 1000))
-      setLines((prev) => [...prev, { id, from, text: "", at }])
+      setLines((prev) => [...prev, { id, from, text: "", at, ...(re ? { re, group: id } : {}) }])
       streamingRef.current = true
       setStreamingId(id)
       words.forEach((word, i) => {
@@ -86,13 +133,34 @@ export function useDemoCall(enabled: boolean): VoiceCall {
 
   const runStep = useCallback(
     (i: number) => {
-      const step = SCRIPT[i]
+      const step = script[i]
       if (!step) return
+      if (step.end) {
+        clearTimers()
+        setLimitNote(null)
+        setEndedText(step.end)
+        setPhase("ended")
+        return
+      }
       setPhase(step.phase)
-      if (step.text && step.from) streamLine(step.from, step.text, step.ms)
+      if (step.text && step.from) streamLine(step.from, step.text, step.ms, step.re)
+      if (step.cue) {
+        // As the worker reports it: the caller stopped a moment ago, the rest of the silence is left.
+        const left = 1600
+        later(() => setSendCue({ id: `demo-${i}`, from: 1 - left / DEMO_SILENCE_MS, ms: left }), step.ms - left)
+        later(() => setSendCue(null), step.ms)
+      }
+      if (step.sent) {
+        const turn = ++turns.current
+        setLines((prev) => {
+          const last = prev.findLast((l) => l.from === "user")
+          return last ? prev.map((l) => (l === last ? { ...l, mark: { status: "sent" }, turn } : l)) : prev
+        })
+      }
+      if (step.limit) later(() => setLimitNote("Call ends in 1 min · daily voice limit."), step.ms / 2)
       later(() => runStep(i + 1), step.ms)
     },
-    [later, streamLine]
+    [later, streamLine, script, clearTimers]
   )
 
   const start = useCallback(() => {
@@ -100,6 +168,8 @@ export function useDemoCall(enabled: boolean): VoiceCall {
     setLines([])
     setMuted(false)
     setEndedText(null)
+    setLimitNote(null)
+    turns.current = 0
     startedAt.current = Date.now()
     setElapsed(0)
     runStep(0)
@@ -108,6 +178,7 @@ export function useDemoCall(enabled: boolean): VoiceCall {
   const end = useCallback(() => {
     if (phaseRef.current === "idle" || phaseRef.current === "ended") return
     clearTimers()
+    setLimitNote(null)
     setEndedText("Call ended.")
     setPhase("ended")
   }, [clearTimers])
@@ -167,7 +238,8 @@ export function useDemoCall(enabled: boolean): VoiceCall {
       inputLevel,
       outputLevel,
       audioRef,
+      ...(walkie ? { silenceMs: DEMO_SILENCE_MS, sendCue, limitNote } : {}),
     }),
-    [phase, lines, streamingId, elapsed, muted, endedText, start, end, toggleMute]
+    [phase, lines, streamingId, elapsed, muted, endedText, start, end, toggleMute, walkie, sendCue, limitNote]
   )
 }

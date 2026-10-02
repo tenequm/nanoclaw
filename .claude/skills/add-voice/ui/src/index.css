@@ -986,3 +986,11 @@
 /* The mute key's longest state takes two lines; the key itself keeps its width. */
 .voice-page[data-skin="te"] .key-mute .label.wrap { white-space: normal; text-align: center; }
 .voice-page[data-skin="te"] .key-mute .label .led { flex: none; }
+
+/* Walkie cues: the send countdown along the readout's rule, and what a caption line answers. */
+.turn-ref { margin-left: 8px; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.04em; text-transform: none; color: var(--muted-foreground); }
+.voice-page[data-skin="te"] .console .turn-ref { color: #8a877f; }
+.send-cue { display: block; width: 120px; height: 2px; margin: 6px auto 0; overflow: hidden; border-radius: 1px; background: var(--border); }
+.send-cue i { display: block; height: 100%; background: var(--te-orange, var(--teal)); transform-origin: left center; }
+.voice-page[data-skin="te"] .screen-readout { position: relative; }
+.voice-page[data-skin="te"] .screen-readout .send-cue { position: absolute; left: 0; right: 0; bottom: -1px; width: auto; margin: 0; border-radius: 0; background: transparent; }

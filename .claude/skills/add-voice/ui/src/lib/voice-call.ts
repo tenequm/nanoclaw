@@ -21,6 +21,21 @@ export interface Line {
   at: number
   /** Walkie-talkie only: whether this caller turn reached the agent. */
   mark?: TurnMark
+  /** Walkie-talkie only: the caller turn's number on this page, once the worker settled it. */
+  turn?: number
+  /** Walkie-talkie only: what an agent line answers ("re: turn 2", "unprompted"), on the first line of a message. */
+  re?: string
+  /** Walkie-talkie only: the spoken message an agent line belongs to; one message's lines read as one. */
+  group?: number
+}
+
+/** Walkie-talkie only: the caller stopped and the turn goes out once this runs full, unless they speak again. */
+export interface SendCue {
+  id: string
+  /** How much of the silence had passed when the worker said so, 0..1. */
+  from: number
+  /** What is left of it. */
+  ms: number
 }
 
 export interface TurnMark {
@@ -79,6 +94,12 @@ export interface VoiceCall {
   reconnecting?: boolean
   /** The last mute or unmute did not take, in a few words. */
   muteError?: string | null
+  /** Walkie-talkie only: the silence that sends a turn, from the host. */
+  silenceMs?: number | null
+  /** Walkie-talkie only: a caller turn counting down to being sent. */
+  sendCue?: SendCue | null
+  /** Walkie-talkie only: the call is about to hit its time limit. */
+  limitNote?: string | null
 }
 
 export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking", "talking"])

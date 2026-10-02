@@ -8,7 +8,7 @@ import { ShimmeringText } from "@/components/ui/shimmering-text"
 import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
-import { LIVE_PHASES, useVoiceCall, type ErrorKind, type Phase, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
+import { LIVE_PHASES, useVoiceCall, type ErrorKind, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
@@ -322,6 +322,22 @@ const Stage = memo(function Stage({
   )
 })
 
+/** The walkie's send countdown: a thin line under the readout filling over what is left of the silence. */
+function SendCueBar({ cue, reduced }: { cue: SendCue; reduced: boolean }) {
+  const fill = useRef<HTMLElement | null>(null)
+  useEffect(() => {
+    const el = fill.current
+    if (!el || reduced || typeof el.animate !== "function") return
+    const run = el.animate([{ transform: `scaleX(${cue.from})` }, { transform: "scaleX(1)" }], { duration: cue.ms, easing: "linear", fill: "forwards" })
+    return () => run.cancel()
+  }, [cue, reduced])
+  return (
+    <span className="send-cue" aria-hidden="true">
+      <i ref={fill} style={reduced ? { opacity: 0.6 } : { transform: `scaleX(${cue.from})` }} />
+    </span>
+  )
+}
+
 const TranscriptLine = memo(function TranscriptLine({
   from,
   text,
@@ -331,6 +347,7 @@ const TranscriptLine = memo(function TranscriptLine({
   agentName,
   showTs,
   mark,
+  note,
 }: {
   from: Speaker
   text: string
@@ -340,6 +357,8 @@ const TranscriptLine = memo(function TranscriptLine({
   agentName: string
   showTs: boolean
   mark?: TurnMark
+  /** Walkie only: the caller turn's number, or what an agent line answers. */
+  note?: string
 }) {
   const lost = mark?.status === "lost"
   return (
@@ -348,6 +367,7 @@ const TranscriptLine = memo(function TranscriptLine({
         <span className="speaker">
           {from === "user" ? "You" : agentName}
           {showTs && <span className="ts">{`${Math.floor(at / 60)}:${pad(at % 60)}`}</span>}
+          {note && <span className="turn-ref">{note}</span>}
           {mark && <span className={`turn-mark ${mark.status}`}>{markLabel(mark)}</span>}
         </span>
         <p>
@@ -376,7 +396,7 @@ export default function App() {
   const walkie = cfg.transport === "livekit"
   const realCall = useVoiceCall(demo || walkie ? "" : token, "your agent")
   const walkieCall = useLiveKitCall(demo || !walkie ? "" : token, "your agent")
-  const demoCall = useDemoCall(demo)
+  const demoCall = useDemoCall(demo, walkie)
   const call = demo ? demoCall : walkie ? walkieCall : realCall
   const hints = walkie ? WALKIE_HINT : HINT
   const { phase, lines, streamingId, agentName, elapsed, muted, error, endedText } = call
@@ -464,7 +484,9 @@ export default function App() {
       ? ERROR_HINT[errorKind]
       : reconnecting
         ? "Wait before speaking."
-        : walkie && phase === "talking"
+        : live && call.limitNote
+          ? call.limitNote
+          : walkie && phase === "talking"
           ? `Speech is ignored until ${agentName} finishes.`
           : walkie && phase === "thinking"
             ? `${muted ? "Unmute to keep talking" : "You can keep talking"} · waiting ${Math.floor(waited / 60)}:${pad(waited % 60)}`
@@ -474,7 +496,9 @@ export default function App() {
                 ? endedHint
                 : phase === "thinking" && slowNote
                   ? slowNote
-                  : hints[phase]
+                  : walkie && phase === "listening" && call.silenceMs
+                    ? `Go ahead. Pause about ${+(call.silenceMs / 1000).toFixed(1)} s to send.`
+                    : hints[phase]
 
   const chipText = reconnecting
     ? "Reconnecting…"
@@ -547,7 +571,19 @@ export default function App() {
           />
         ) : (
           lines.map((l, i) => (
-            <TranscriptLine key={l.id} from={l.from} text={l.text} at={l.at} isLast={i === lines.length - 1} isStreaming={l.id === streamingId} agentName={agentName} showTs={showTs} mark={l.mark} />
+            <TranscriptLine
+              key={l.id}
+              from={l.from}
+              text={l.text}
+              at={l.at}
+              // The lines of the message being spoken read as one: none of them dims yet.
+              isLast={i === lines.length - 1 || (l.group !== undefined && l.group === lines[lines.length - 1].group)}
+              isStreaming={l.id === streamingId}
+              agentName={agentName}
+              showTs={showTs}
+              mark={l.mark}
+              note={l.from === "user" ? (l.turn ? `turn ${l.turn}` : undefined) : l.re}
+            />
           ))
         )}
       </ConversationContent>
@@ -660,6 +696,7 @@ export default function App() {
                 {readout}
                 <span className="screen-hint">{hintText}</span>
                 {hearKey}
+                {call.sendCue && <SendCueBar key={call.sendCue.id} cue={call.sendCue} reduced={reduced} />}
               </div>
               {deliveryNotice}
               <div className="console" aria-label="Live transcript">
@@ -678,6 +715,7 @@ export default function App() {
               </div>
               {readout}
               <p className="hint">{hintText}</p>
+              {call.sendCue && <SendCueBar key={call.sendCue.id} cue={call.sendCue} reduced={reduced} />}
               {hearKey}
               {deliveryNotice}
             </section>
