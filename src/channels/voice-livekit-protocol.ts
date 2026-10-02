@@ -18,7 +18,7 @@ export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
  * Wire version of the job metadata and the worker's attribute and topic names; host and worker
  * must agree, so they ship and restart together.
  */
-export const LIVEKIT_PROTOCOL_VERSION = 5;
+export const LIVEKIT_PROTOCOL_VERSION = 4;
 
 /** Streaming transcription over the Gemini Live API, verbatim. */
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
@@ -77,10 +77,12 @@ export interface CallRoomMetadata {
 }
 
 /**
- * What became of a caller turn: closed and on its way to the host (`sending`, the moment the
- * closing silence ended, before the host answers), sent to the agent, or lost because the
- * transcription failed (`stt`) or heard no words (`empty`), or the host refused it (`rejected`,
- * `rate_limited`) or did not answer (`timeout`). A turn that is sent says `sending` first.
+ * What became of a caller turn: closed and on its way to the host (`sending`, once the closing
+ * silence and the final transcript are in, before the host answers), sent to the agent, or lost
+ * because the transcription failed (`stt`) or heard no words (`empty`), or the host refused it
+ * (`rejected`, `rate_limited`) or did not answer (`timeout`). Every turn handed to the host says
+ * `sending` first; one lost to the transcription does not. A page that does not know `sending`
+ * ignores it, so it needs no version bump.
  */
 export interface CallTurnStatus {
   turn: number;

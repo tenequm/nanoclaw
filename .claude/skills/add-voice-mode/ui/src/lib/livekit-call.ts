@@ -14,7 +14,7 @@ import {
   CallError,
   LIVE_PHASES,
   PAGE_CLOSED,
-  cuesEnabled,
+  TURN_CUE_DELAY_MS,
   errorText,
   levelsFromStats,
   micErrorKind,
@@ -45,7 +45,7 @@ import { voiceEndpoint } from "./voice-endpoint"
 const THINKING_ATTR = "nanoclaw.voice.thinking"
 /** "1" when the worker cannot serve this host's protocol version. */
 const UPDATING_ATTR = "nanoclaw.voice.updating"
-/** JSON CallTurnStatus messages per caller turn: "sending" the moment it closes, then "sent" or "lost". */
+/** JSON CallTurnStatus messages per caller turn: "sending" as one goes to the host, then "sent" or "lost". */
 const TURN_TOPIC = "nanoclaw.voice.turn"
 /** Without a worker in the room after this long, it is down or mid-update (host and worker restart together). */
 const AGENT_JOIN_MS = 25_000
@@ -71,8 +71,6 @@ const LIMIT_NAME: Record<string, string> = { duration: "call time limit", daily:
 const LIMIT_WARN_MS = 60_000
 /** Shown later than this before the limit, the warning says "under a minute", not "1 min". */
 const LIMIT_WARN_LATE_MS = LIMIT_WARN_MS - 5_000
-/** After a reply, the "your turn" cue waits this long for the next queued line to show up. */
-const TURN_CUE_DELAY_MS = 600
 
 interface ReplyInfo {
   reply: number
@@ -247,11 +245,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const labelledReplies = useRef(new Set<number>())
   const limit = useRef<{ ms: number; kind: string } | null>(null)
   const joinedAt = useRef(0)
-  const cuesOn = useRef(cuesEnabled())
 
   // Never over the agent's own speech.
   const cue = useCallback((kind: Cue) => {
-    if (cuesOn.current && phaseRef.current !== "talking") playCue(unlockCtx.current, kind)
+    if (phaseRef.current !== "talking") playCue(unlockCtx.current, kind)
   }, [])
 
   const setPhase = useCallback((p: Phase) => {

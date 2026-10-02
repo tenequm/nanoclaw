@@ -13,7 +13,7 @@ export interface Line {
   at: number
   /** Whether this caller turn reached the agent. */
   mark?: TurnMark
-  /** The caller turn's number on this page, once the worker settled it. */
+  /** The caller turn's number on this page, counted from when the turn closed. */
   turn?: number
   /** What an agent line answers ("re: turn 2", "unprompted"), on the first line of a message. */
   re?: string
@@ -110,17 +110,15 @@ const CUES: Record<Cue, { notes: ReadonlyArray<readonly [hz: number, at: number,
   turn: { notes: [[1319, 0, 0.09], [1047, 0.11, 0.12]], peak: 0.22 },
 }
 
-/** Call sound cues are on unless the link says `?cues=0`. */
-export function cuesEnabled(): boolean {
-  return new URLSearchParams(location.search).get("cues") !== "0"
-}
+/** After a reply, the "your turn" cue waits this long for the next queued line to show up. */
+export const TURN_CUE_DELAY_MS = 600
 
 /**
- * Plays a cue on the gesture-unlocked context; nothing without one that runs. Short pure sine
- * notes, mid-to-high so a phone speaker carries them, and nothing the worker's VAD takes for speech.
+ * Plays a cue on the gesture-unlocked context; nothing without one that runs, or when the link
+ * says `?cues=0`. Short pure sine notes, mid-to-high so a phone speaker carries them.
  */
 export function playCue(ctx: AudioContext | null, cue: Cue) {
-  if (!ctx || ctx.state !== "running") return
+  if (!ctx || ctx.state !== "running" || new URLSearchParams(location.search).get("cues") === "0") return
   const { notes, peak } = CUES[cue]
   for (const [hz, at, len] of notes) {
     const t = ctx.currentTime + at
