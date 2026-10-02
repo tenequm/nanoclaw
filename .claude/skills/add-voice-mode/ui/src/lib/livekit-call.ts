@@ -29,6 +29,7 @@ import {
   type TurnMark,
   type VoiceCall,
 } from "./voice-call"
+import { INITIAL_REVIEW, autoBlock, isReviewSnapshot, refusalNote, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -57,6 +58,33 @@ const MUTE_ERROR_MS = 4000
 const PENDING_ATTR = "nanoclaw.voice.pending"
 /** One JSON CallReplyInfo right before each line the worker speaks. */
 const REPLY_TOPIC = "nanoclaw.voice.reply"
+/** "1" when the worker runs review mode; the page offers it only then. */
+const REVIEW_ATTR = "nanoclaw.voice.review"
+/** JSON CallReviewState from the worker whenever its review state changes. */
+const REVIEW_TOPIC = "nanoclaw.voice.review"
+/** The worker's review RPCs (REVIEW_RPC in the protocol). */
+const REVIEW_RPC: Record<ReviewOp, string> = {
+  mode: "nanoclaw.voice.mode",
+  talk: "nanoclaw.voice.talk",
+  done: "nanoclaw.voice.done",
+  send: "nanoclaw.voice.send",
+  discard: "nanoclaw.voice.discard",
+}
+const REVIEW_RPC_TIMEOUT_MS = 10_000
+/** A worker in review mode sets its attribute right after its session starts; this long, then the page runs auto. */
+const AGENT_ATTR_GRACE_MS = 3000
+/** How long a note under the mode row stays. */
+const REVIEW_NOTE_MS = 5000
+
+interface ReviewReply {
+  gen: number
+  ok: boolean
+  seq: number
+  draft?: number
+  turn?: number
+  submitted?: number
+  error?: string
+}
 /** What the page says for each CallRoomMetadata.end the host sets before it deletes the room. */
 const END_TEXT: Record<string, string> = {
   limit_duration: "The call reached its time limit.",
@@ -101,9 +129,9 @@ function endReasonText(metadata: string | undefined): string | null {
 }
 
 /** What became of a caller turn, with its final text when there is one. */
-type SettledTurn = TurnMark & { turn: number; text?: string }
-/** The worker says "sending" the moment a turn closes, before its outcome. */
-type TurnStatus = SettledTurn | { turn: number; status: "sending" }
+type SettledTurn = { turn: number; status: "sent" | "lost"; reason?: TurnMark["reason"]; text?: string }
+/** The worker says "sending" the moment a turn closes, before its outcome; a sent review draft's carries its text. */
+type TurnStatus = SettledTurn | { turn: number; status: "sending"; text?: string; draft?: number }
 
 interface Attempt {
   callId: string | null
@@ -246,6 +274,31 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const limit = useRef<{ ms: number; kind: string } | null>(null)
   const joinedAt = useRef(0)
 
+  // Review mode. The worker owns the draft; the page shows its newest state and asks for changes.
+  const [review, setReviewState] = useState<ReviewState>(INITIAL_REVIEW)
+  const reviewRef = useRef<ReviewState>(INITIAL_REVIEW)
+  const { textStreams: reviewStreams } = useTextStream(REVIEW_TOPIC, { room })
+  const doneReviewStreams = useRef(new Set<string>())
+  const reviewSeq = useRef(0)
+  /** The reply to the operation in flight named this state; it ends when that state is here. */
+  const awaitSeq = useRef<number | null>(null)
+  const opGen = useRef(0)
+  /** The newest worker turn number seen, so a switch to review hears of a turn sent meanwhile. */
+  const maxTurn = useRef(0)
+  /** Caption segments of review recordings: never history, whatever arrives for them later. */
+  const reviewSegments = useRef(new Set<string>())
+  /** The open recording's segments, as the transcription has them so far. */
+  const provisionalSegs = useRef(new Map<string, string>())
+  /** Segments of recordings before the open one: a late update to one never shows as heard now. */
+  const closedSegs = useRef(new Set<string>())
+  /** Worker turns that are sent review drafts. */
+  const reviewTurns = useRef(new Set<number>())
+  /** This call already asked the worker for the review mode it was started in. */
+  const reviewAsked = useRef(false)
+  const agentId = useRef<string | null>(null)
+  agentId.current = agent?.identity ?? null
+  const reviewAvailable = agentAttributes?.[REVIEW_ATTR] === "1"
+
   // Never over the agent's own speech.
   const cue = useCallback((kind: Cue) => {
     if (phaseRef.current !== "talking") playCue(unlockCtx.current, kind)
@@ -269,6 +322,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const commitLines = useCallback((next: Line[]) => {
     linesRef.current = next
     setLinesState(next)
+  }, [])
+
+  const updateReview = useCallback((fn: (r: ReviewState) => ReviewState) => {
+    reviewRef.current = fn(reviewRef.current)
+    setReviewState(reviewRef.current)
   }, [])
 
   const secondsIn = () => Math.max(0, Math.floor((Date.now() - (startedAt.current || Date.now())) / 1000))
@@ -325,12 +383,21 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       setMutedState(false)
       setMuteError(null)
       setReconnecting(false)
+      // An unsent draft stays readable after the call, never submitted into another one.
+      awaitSeq.current = null
+      updateReview((r) => {
+        const d = r.draft
+        const open = d && (d.state === "recording" || d.state === "finishing")
+        const kept: Draft | null =
+          d && (d.state === "ready" || d.state === "failed") ? d : open && r.provisional.trim() ? { ...d, state: "failed", text: r.provisional.trim() } : null
+        return { ...INITIAL_REVIEW, mode: r.mode, available: r.available, draft: kept, ended: !!kept }
+      })
       setMicStream(null)
       setRemoteStream(null)
       setStreaming(null)
       setJoined(false)
     },
-    [room, endOnServer, setStreaming, setJoined]
+    [room, endOnServer, setStreaming, setJoined, updateReview]
   )
 
   const end = useCallback(
@@ -371,7 +438,15 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     const onReconnecting = () => {
       if (active.current) setReconnecting(true)
     }
-    const onReconnected = () => setReconnecting(false)
+    const onReconnected = () => {
+      setReconnecting(false)
+      // The worker's review state may have moved on meanwhile: ask for it again.
+      const id = agentId.current
+      if (!active.current || !id || reviewSeq.current === 0) return
+      void room.localParticipant
+        .performRpc({ destinationIdentity: id, method: REVIEW_RPC.mode, payload: JSON.stringify({ gen: ++opGen.current, mode: reviewRef.current.mode }), responseTimeout: REVIEW_RPC_TIMEOUT_MS })
+        .catch(() => {})
+    }
     // The host rewrites the room metadata when a mid-call /voice moves the call (CallRoomMetadata).
     const onMetadata = (metadata: string | undefined) => {
       const m = readRoomMetadata(metadata)
@@ -451,6 +526,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (!active.current) return
     let next = linesRef.current
     let touched: number | null = null
+    let provisional: string | null = null
     for (const t of transcriptions) {
       const attrs = t.streamInfo.attributes ?? {}
       const key = attrs["lk.segment_id"] || t.streamInfo.id
@@ -461,6 +537,18 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       const text = mine ? spaceSentences(t.text.trim()) : t.text.trim()
       if (!text || segmentText.current.get(key) === text) continue
       segmentText.current.set(key, text)
+      const r = reviewRef.current
+      if (mine && (reviewSegments.current.has(key) || (r.mode === "review" && !segmentLine.current.has(key)) || r.pending?.to === "review")) {
+        reviewSegments.current.add(key)
+        const state = r.draft?.state
+        // Only an open recording shows what is heard; a frozen draft shows the worker's text.
+        const open = state === "recording" || state === "finishing" || r.pending?.op === "talk" || r.pending?.to === "review"
+        if (open && !closedSegs.current.has(key)) {
+          provisionalSegs.current.set(key, text)
+          provisional = [...provisionalSegs.current.values()].join(" ")
+        }
+        continue
+      }
       const id = segmentLine.current.get(key)
       if (id === undefined) {
         const nid = nextId.current++
@@ -477,17 +565,22 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         touched = id
       }
     }
+    if (provisional !== null) {
+      const heard = provisional
+      updateReview((r) => ({ ...r, provisional: heard }))
+    }
     if (touched === null) return
     commitLines(next)
     lastDeltaAt.current = Date.now()
     setStreaming(touched)
-  }, [transcriptions, room, commitLines, setStreaming])
+  }, [transcriptions, room, commitLines, setStreaming, updateReview])
 
   // Per-turn delivery marks from the worker.
   useEffect(() => {
     if (!active.current) return
     let next = linesRef.current
     let closed = false
+    let delivery: ReviewState["delivery"] = null
     for (const s of turnStreams) {
       if (doneTurns.current.has(s.streamInfo.id)) continue
       let status: unknown
@@ -498,23 +591,50 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       }
       doneTurns.current.add(s.streamInfo.id)
       if (!isTurnStatus(status)) continue
+      maxTurn.current = Math.max(maxTurn.current, status.turn)
       let shown = shownTurns.current.get(status.turn)
       if (shown === undefined) shownTurns.current.set(status.turn, (shown = shownTurns.current.size + 1))
+      const fromDraft = status.status === "sending" ? typeof status.draft === "number" : reviewTurns.current.has(status.turn)
       // The sent cue sounds as the turn closes; the agent's "sent" later is the mark alone.
       if (status.status === "sending") {
         closed = true
+        if (fromDraft && status.text) {
+          // A sent draft enters the history once, with exactly the text the caller approved.
+          reviewTurns.current.add(status.turn)
+          const line: Line = { id: nextId.current++, from: "user", text: status.text, at: secondsIn(), turn: shown, mark: { status: "sending" } }
+          coveredLines.current.add(line.id)
+          next = [...next, line]
+          delivery = "sending"
+        }
         continue
       }
       next = applyTurn(next, coveredLines.current, status, () => ({ id: nextId.current++, from: "user", text: "", at: secondsIn() }), shown)
+      if (fromDraft && status.turn === Math.max(...reviewTurns.current)) delivery = status.status
     }
     if (next !== linesRef.current) commitLines(next)
+    if (delivery) {
+      const d = delivery
+      updateReview((r) => ({ ...r, delivery: d }))
+    }
     if (closed) cue("sent")
-  }, [turnStreams, commitLines, cue])
+  }, [turnStreams, commitLines, cue, updateReview])
 
   const start = useCallback(async () => {
     if (!token) return
     const p = phaseRef.current
     if (p === "connecting" || LIVE_PHASES.has(p)) return
+    // A draft from the last call is discarded first, never carried into this one.
+    if (reviewRef.current.ended && reviewRef.current.draft) return
+    updateReview((r) => ({ ...INITIAL_REVIEW, mode: r.mode }))
+    reviewSeq.current = 0
+    reviewAsked.current = false
+    awaitSeq.current = null
+    maxTurn.current = 0
+    doneReviewStreams.current.clear()
+    reviewSegments.current.clear()
+    provisionalSegs.current.clear()
+    closedSegs.current.clear()
+    reviewTurns.current.clear()
     setError(null)
     setErrorKind(null)
     setEndedText(null)
@@ -554,6 +674,16 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         track.stop()
         return
       }
+      // Review mode never opens the microphone before talk: the track is published muted.
+      if (reviewRef.current.mode === "review") {
+        await track.mute()
+        mutedRef.current = true
+        setMutedState(true)
+      }
+      if (cancelled()) {
+        track.stop()
+        return
+      }
       mic.current = track
       setMicStream(new MediaStream([track.mediaStreamTrack]))
       // The SDK can mute the track itself (an interruption, a lost device): the key follows it.
@@ -561,6 +691,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         if (mic.current !== track || muteBusy.current) return
         mutedRef.current = track.isMuted
         setMutedState(track.isMuted)
+        updateReview((r) => ({ ...r, micOn: !track.isMuted }))
       }
       track.on(TrackEvent.Muted, follow)
       track.on(TrackEvent.Unmuted, follow)
@@ -607,7 +738,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       if (cancelled()) return
       fail(micErrorText(err) ?? (err instanceof Error ? err.message : String(err)), micErrorKind(err) ?? (err instanceof CallError ? err.kind : "other"))
     }
-  }, [token, room, commitLines, endOnServer, fail, setPhase, setStreaming, setJoined])
+  }, [token, room, commitLines, endOnServer, fail, setPhase, setStreaming, setJoined, updateReview])
 
   const endCall = useCallback(() => end(true, "Call ended."), [end])
 
@@ -635,6 +766,210 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     const t = window.setTimeout(() => setMuteError(null), MUTE_ERROR_MS)
     return () => window.clearTimeout(t)
   }, [muteError])
+
+  /** Mute or unmute the microphone for review mode; true once the track did it. */
+  const setMic = useCallback(
+    async (on: boolean): Promise<boolean> => {
+      const track = mic.current
+      if (!track) return false
+      muteBusy.current = true
+      try {
+        await (on ? track.unmute() : track.mute())
+      } catch {
+        /* the state below says what took */
+      } finally {
+        muteBusy.current = false
+      }
+      if (mic.current !== track) return false
+      mutedRef.current = track.isMuted
+      setMutedState(track.isMuted)
+      updateReview((r) => ({ ...r, micOn: !track.isMuted }))
+      return track.isMuted !== on
+    },
+    [updateReview]
+  )
+
+  const rpc = useCallback(
+    async (op: ReviewOp, fields: { draft?: number; mode?: TurnMode; afterTurn?: number } = {}): Promise<ReviewReply | null> => {
+      const id = agentId.current
+      if (!id) return null
+      try {
+        const raw = await room.localParticipant.performRpc({
+          destinationIdentity: id,
+          method: REVIEW_RPC[op],
+          payload: JSON.stringify({ gen: ++opGen.current, ...fields }),
+          responseTimeout: REVIEW_RPC_TIMEOUT_MS,
+        })
+        const reply = JSON.parse(raw) as ReviewReply
+        return typeof reply?.ok === "boolean" && typeof reply.seq === "number" ? reply : null
+      } catch {
+        return null
+      }
+    },
+    [room]
+  )
+
+  /** The operation is over once the state its reply named has arrived (it may already have). */
+  const settleOp = useCallback(
+    (reply: ReviewReply | null, extra: Partial<ReviewState> = {}) => {
+      if (reply && reply.ok && reply.seq > reviewSeq.current) {
+        awaitSeq.current = reply.seq
+        updateReview((r) => ({ ...r, ...extra }))
+        return
+      }
+      awaitSeq.current = null
+      const refused = reply && !reply.ok ? refusalNote(reply.error, agentNameRef.current) : null
+      updateReview((r) => ({ ...r, pending: null, ...(refused ? { note: refused } : {}), ...(!reply ? { note: "The voice service did not answer - try again." } : {}), ...extra }))
+    },
+    [updateReview]
+  )
+
+  // The worker's review state: the newest one wins.
+  useEffect(() => {
+    if (!active.current) return
+    let newest: ReviewSnapshot | null = null
+    for (const s of reviewStreams) {
+      if (doneReviewStreams.current.has(s.streamInfo.id)) continue
+      let state: unknown
+      try {
+        state = JSON.parse(s.text)
+      } catch {
+        continue // not all of it yet
+      }
+      doneReviewStreams.current.add(s.streamInfo.id)
+      if (isReviewSnapshot(state) && state.seq > (newest?.seq ?? reviewSeq.current)) newest = state
+    }
+    if (!newest) return
+    const snap = newest
+    reviewSeq.current = snap.seq
+    const prev = reviewRef.current
+    const d = snap.draft
+    let provisional = prev.provisional
+    if (d && d.id !== prev.draft?.id && d.reason === "switch") {
+      // The open auto turn's words move from the history into the draft; they were never sent.
+      const moved = linesRef.current.filter((l) => l.from === "user" && !coveredLines.current.has(l.id) && !l.mark)
+      const ids = new Set(moved.map((l) => l.id))
+      // A segment that kept growing during the switch is already heard in full.
+      const grown = new Set<number>()
+      for (const [k, id] of segmentLine.current) {
+        if (!ids.has(id)) continue
+        reviewSegments.current.add(k)
+        if (provisionalSegs.current.has(k)) grown.add(id)
+      }
+      if (moved.length) commitLines(linesRef.current.filter((l) => !ids.has(l.id)))
+      provisional = [...moved.filter((l) => !grown.has(l.id)).map((l) => l.text), ...provisionalSegs.current.values()].join(" ")
+    }
+    const done = awaitSeq.current !== null && snap.seq >= awaitSeq.current
+    if (done) awaitSeq.current = null
+    updateReview((r) => ({ ...r, mode: snap.mode, draft: d, provisional, ...(done ? { pending: null } : {}) }))
+    // The worker stopped the recording (a reply took the channel): the microphone follows it.
+    if (snap.mode === "review" && (!d || d.state !== "recording") && mic.current && !mic.current.isMuted && prev.pending?.op !== "talk") void setMic(false)
+    if (d?.state === "ready" && !d.tooLong && d.text && !(prev.draft?.id === d.id && prev.draft.state === "ready")) cue("draft")
+  }, [reviewStreams, commitLines, updateReview, setMic, cue])
+
+  const setTurnMode = useCallback(
+    async (to: TurnMode) => {
+      const r = reviewRef.current
+      const p = phaseRef.current
+      if (!LIVE_PHASES.has(p)) {
+        // Before a call (or after one): only the pick, kept for the next call.
+        if (p !== "connecting" && !r.ended) updateReview((x) => ({ ...x, mode: to, note: null }))
+        return
+      }
+      if (r.pending || r.mode === to || !joinedRef.current) return
+      if (to === "auto") {
+        const block = autoBlock(r)
+        if (block) return updateReview((x) => ({ ...x, note: block }))
+      } else if (!r.available) return
+      updateReview((x) => ({ ...x, pending: { op: "mode", to }, note: null, micError: null }))
+      // Review starts with the microphone off: it stops here, before the worker is asked.
+      if (to === "review" && mic.current && !mic.current.isMuted) await setMic(false)
+      const reply = await rpc("mode", { mode: to, afterTurn: maxTurn.current })
+      settleOp(reply, reply?.ok && reply.submitted !== undefined ? { note: "Previous turn already submitted." } : {})
+    },
+    [updateReview, setMic, rpc, settleOp]
+  )
+
+  const talk = useCallback(async () => {
+    const r = reviewRef.current
+    if (r.pending || r.mode !== "review" || phaseRef.current === "talking" || !LIVE_PHASES.has(phaseRef.current)) return
+    if (r.draft && r.draft.state !== "empty") return
+    for (const k of reviewSegments.current) closedSegs.current.add(k)
+    provisionalSegs.current.clear()
+    updateReview((x) => ({ ...x, pending: { op: "talk" }, note: null, micError: null, delivery: null, provisional: "" }))
+    const reply = await rpc("talk")
+    if (!reply?.ok || reply.draft === undefined) return settleOp(reply)
+    // The worker hears now; the microphone opens, and only then the caller is told to speak.
+    if (await setMic(true)) {
+      cue("listening")
+      return settleOp(reply)
+    }
+    updateReview((x) => ({ ...x, micError: "start" }))
+    settleOp(await rpc("discard", { draft: reply.draft }))
+  }, [updateReview, rpc, setMic, settleOp, cue])
+
+  const done = useCallback(async () => {
+    const r = reviewRef.current
+    const d = r.draft
+    if (r.pending || !d || d.state !== "recording") return
+    updateReview((x) => ({ ...x, pending: { op: "done" } }))
+    const stopped = await setMic(false)
+    if (!stopped) updateReview((x) => ({ ...x, micError: "stop" }))
+    settleOp(await rpc("done", { draft: d.id }))
+  }, [updateReview, setMic, rpc, settleOp])
+
+  const send = useCallback(async () => {
+    const r = reviewRef.current
+    const d = r.draft
+    if (r.pending || !d || d.state !== "ready" || d.tooLong || r.micError === "stop" || r.ended) return
+    updateReview((x) => ({ ...x, pending: { op: "send" }, note: null }))
+    const reply = await rpc("send", { draft: d.id })
+    if (reply?.ok && reply.turn !== undefined) reviewTurns.current.add(reply.turn)
+    settleOp(reply, reply?.ok ? { delivery: "sending" } : {})
+  }, [updateReview, rpc, settleOp])
+
+  const discard = useCallback(async () => {
+    const r = reviewRef.current
+    const d = r.draft
+    if (!d || r.pending) return
+    // After the call only the page holds it.
+    if (r.ended || !LIVE_PHASES.has(phaseRef.current)) return updateReview((x) => ({ ...x, draft: null, ended: false, provisional: "" }))
+    updateReview((x) => ({ ...x, pending: { op: "discard" }, note: null }))
+    if (mic.current && !mic.current.isMuted) await setMic(false)
+    const reply = await rpc("discard", { draft: d.id })
+    settleOp(reply, { provisional: "" })
+  }, [updateReview, setMic, rpc, settleOp])
+
+  // A call picked in review mode switches the worker once it is up. A worker without review runs auto.
+  const reviewLive = joined && LIVE_PHASES.has(phase) && !!agent
+  useEffect(() => {
+    if (!reviewLive || review.mode !== "review" || reviewSeq.current > 0 || review.pending || reviewAsked.current) return
+    if (reviewAvailable) {
+      reviewAsked.current = true
+      updateReview((x) => ({ ...x, pending: { op: "mode", to: "review" } }))
+      void rpc("mode", { mode: "review", afterTurn: maxTurn.current }).then((reply) =>
+        // The worker stays in auto: so does the page, with the microphone still muted.
+        settleOp(reply, reply?.ok ? {} : { mode: "auto", note: "Review didn't start - the call is in auto." })
+      )
+      return
+    }
+    // The attribute can trail the session's first state by a moment.
+    const t = window.setTimeout(() => {
+      if (reviewSeq.current > 0) return
+      updateReview((x) => ({ ...x, mode: "auto", available: false, note: "Review isn't available on this line." }))
+    }, AGENT_ATTR_GRACE_MS)
+    return () => window.clearTimeout(t)
+  }, [reviewLive, review.mode, review.pending, reviewAvailable, updateReview, rpc, settleOp])
+
+  useEffect(() => {
+    if (reviewLive) updateReview((x) => (x.available === reviewAvailable ? x : { ...x, available: reviewAvailable }))
+  }, [reviewLive, reviewAvailable, updateReview])
+
+  useEffect(() => {
+    if (!review.note) return
+    const t = window.setTimeout(() => updateReview((x) => ({ ...x, note: null })), REVIEW_NOTE_MS)
+    return () => window.clearTimeout(t)
+  }, [review.note, updateReview])
 
   const live = LIVE_PHASES.has(phase)
 
@@ -776,6 +1111,18 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     void start()
   }, [start])
 
+  const reviewControls = useMemo(
+    () => ({
+      state: review,
+      setMode: (m: TurnMode) => void setTurnMode(m),
+      talk: () => void talk(),
+      done: () => void done(),
+      send: () => void send(),
+      discard: () => void discard(),
+    }),
+    [review, setTurnMode, talk, done, send, discard]
+  )
+
   return useMemo(
     () => ({
       phase,
@@ -803,6 +1150,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       silenceMs,
       sendCue,
       limitNote,
+      review: reviewControls,
     }),
     [
       phase,
@@ -827,6 +1175,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       silenceMs,
       sendCue,
       limitNote,
+      reviewControls,
     ]
   )
 }

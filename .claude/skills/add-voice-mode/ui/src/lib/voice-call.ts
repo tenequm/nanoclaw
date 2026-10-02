@@ -1,3 +1,5 @@
+import type { ReviewState, TurnMode } from "./review"
+
 /**
  * The shape of a call as the page renders it, shared by the LiveKit hook and the
  * `?demo=1` script, plus the LiveKit hook's error and level helpers.
@@ -31,7 +33,8 @@ export interface SendCue {
 }
 
 export interface TurnMark {
-  status: "sent" | "lost"
+  /** `sending`: a sent review draft the agent has not confirmed yet (auto turns show no mark until then). */
+  status: "sending" | "sent" | "lost"
   reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty"
 }
 
@@ -87,6 +90,17 @@ export interface VoiceCall {
   sendCue?: SendCue | null
   /** The call is about to hit its time limit. */
   limitNote?: string | null
+  /** Review mode: its state and the caller's operations on it. */
+  review?: ReviewControls
+}
+
+export interface ReviewControls {
+  state: ReviewState
+  setMode: (mode: TurnMode) => void
+  talk: () => void
+  done: () => void
+  send: () => void
+  discard: () => void
 }
 
 export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking", "talking"])
@@ -95,10 +109,11 @@ export const PAGE_CLOSED = "The call ended when the page was closed."
 
 /**
  * The call's sound cues, for a caller who is not looking at the screen: `listening` once the
- * worker hears the caller, `sent` the moment a turn closes, `turn` when the agent is done and the
- * microphone is open again.
+ * worker hears the caller (in review: once talk opened the microphone), `sent` the moment a turn
+ * closes, `turn` when the agent is done and the microphone is open again, `draft` when a review
+ * draft is ready to read.
  */
-export type Cue = "listening" | "sent" | "turn"
+export type Cue = "listening" | "sent" | "turn" | "draft"
 
 /** Each cue's notes as [Hz, start s, length s], and their peak gain. */
 const CUES: Record<Cue, { notes: ReadonlyArray<readonly [hz: number, at: number, len: number]>; peak: number }> = {
@@ -108,6 +123,8 @@ const CUES: Record<Cue, { notes: ReadonlyArray<readonly [hz: number, at: number,
   sent: { notes: [[1760, 0, 0.06]], peak: 0.3 },
   // A falling third, like a doorbell: over to the caller.
   turn: { notes: [[1319, 0, 0.09], [1047, 0.11, 0.12]], peak: 0.22 },
+  // Two soft low notes, quieter than the rest: words to read, nothing sent.
+  draft: { notes: [[523, 0, 0.08], [659, 0.1, 0.1]], peak: 0.14 },
 }
 
 /** After a reply, the "your turn" cue waits this long for the next queued line to show up. */
