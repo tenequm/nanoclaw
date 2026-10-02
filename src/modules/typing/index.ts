@@ -207,7 +207,8 @@ export interface TypingTick {
   threadId: string | null;
   /**
    * The runner reports a live `working` turn stamped after the inbound that started this stretch:
-   * it has picked the message up. False in the wake's grace window and on the heartbeat fallback.
+   * it has picked the message up. False until such a report arrives, and always for a runner that
+   * never reports a turn (the heartbeat fallback).
    */
   working: boolean;
 }
@@ -522,7 +523,8 @@ export function notePresence(sessionId: string, report: PresenceReport): void {
   const pickedUp = workingSinceInbound(entry);
   entry.presence = report;
   // Observers hear the pickup at once, not on the next refresh tick; nothing is painted.
-  if (!pickedUp && !entry.capped && workingSinceInbound(entry)) notifyObservers(entry);
+  if (!pickedUp && !entry.capped && entry.pausedUntil <= Date.now() && workingSinceInbound(entry))
+    notifyObservers(entry);
   // A turn starting is a state change: the ceiling clock restarts. A fresh
   // re-mark of an ongoing `working` turn is not. Only a status repaints (on
   // the next tick); the ack stays with the inbound that placed it, so a later

@@ -313,7 +313,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
 
   // Never over the agent's own speech.
   const cue = useCallback((kind: Cue) => {
-    cues.current?.play(kind, phaseRef.current === "talking" ? "talking" : undefined)
+    cues.current?.play(kind, () => (phaseRef.current === "talking" ? "talking" : undefined))
   }, [])
 
   /** One cue report to the worker's log; held until the worker is in the room. */

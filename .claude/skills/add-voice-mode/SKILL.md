@@ -540,8 +540,8 @@ TTS, captions and the agent state are the framework's. Then:
   worker complete over the host's event stream, and the agent's typing there is
   the worker's "thinking". The worker strips markdown, URLs and tags and speaks
   it uninterruptibly (`session.say`), in full unless `VOICE_MAX_SPOKEN_CHARS` (above) caps it,
-  in sentence batches of up to 400
-  characters, two requested at a time: the one playing and the next.
+  synthesized whole in one streamed TTS request (so a very long message waits
+  longer for its first audio).
   Replies never overlap, and a reply waits for a caller who is mid-turn (at most
   `VOICE_SILENCE_MS` plus ten seconds, then it takes the channel).
 - While the agent's audio plays, the caller is not transcribed (no barge-in).
@@ -702,7 +702,8 @@ the page sends one JSON `CueReport` (`{"cue"?, "result"?: "played" | "skipped",
 worker on `nanoclaw.voice.cue`, and the worker logs one line each (`voice
 worker: cue sent played ctx=running out=element`, `... cue sent skipped
 (interrupted) ctx=interrupted out=element`, `... cue context changed
-ctx=interrupted`), at most 500 per call and only from the caller.
+ctx=interrupted`). It reads them only from the caller, four streams at a
+time, each closed after 2 s, and stops taking them after 500 on a call.
 Microphone capture runs
 with echo cancellation, noise suppression and auto gain; DTX is off because the
 worker times turns by the silence it hears. On iOS Safari the call must be

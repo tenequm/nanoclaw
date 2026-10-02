@@ -187,6 +187,7 @@ export class CuePlayer {
   /** In the tap that starts the call, before any await: iOS unlocks audio output only on a gesture. */
   unlock(): void {
     if (!this.ctx || this.ctx.state === "closed") {
+      this.close()
       try {
         this.ctx = new AudioContext()
       } catch {
@@ -214,10 +215,14 @@ export class CuePlayer {
     this.onStateChange()
   }
 
-  /** Play a cue now, or say why not; `skip` is the caller's own reason (the agent is speaking). */
-  play(cue: Cue, skip?: "talking"): void {
+  /**
+   * Play a cue now, or say why not. `blocked` is the caller's own reason not to (the agent is
+   * speaking), asked again before a cue that waited for its context.
+   */
+  play(cue: Cue, blocked: () => "talking" | undefined = () => undefined): void {
     const ctx = this.ctx
     const done = (r: Pick<CueReport, "result" | "reason" | "resumed">) => this.report(this.describe({ cue, ...r }))
+    const skip = blocked()
     if (skip) return done({ result: "skipped", reason: skip })
     if (new URLSearchParams(location.search).get("cues") === "0") return done({ result: "skipped", reason: "off" })
     if (!ctx) return done({ result: "skipped", reason: "no-context" })
@@ -235,6 +240,8 @@ export class CuePlayer {
     void Promise.race([resumed, late]).then((ok) => {
       if (ok === false) return done({ result: "skipped", reason: "resume-failed" })
       if (this.ctx !== ctx || ctx.state !== "running") return done({ result: "skipped", reason: ctx.state === "closed" ? "closed" : from })
+      const now = blocked()
+      if (now) return done({ result: "skipped", reason: now })
       this.sound(ctx, cue)
       done({ result: "played", resumed: from })
     })
@@ -250,6 +257,7 @@ export class CuePlayer {
       this.el = null
     }
     this.sink = null
+    this.state = "none"
     const ctx = this.ctx
     this.ctx = null
     if (ctx) {
@@ -319,7 +327,8 @@ export class CuePlayer {
     if (now === this.state) return
     this.state = now
     this.report(this.describe({}))
-    if (ctx && (now === "suspended" || now === "interrupted")) void ctx.resume().catch(() => {})
+    // A hidden page is left alone; `wake` resumes it once it shows again.
+    if (ctx && (now === "suspended" || now === "interrupted") && document.visibilityState !== "hidden") void ctx.resume().catch(() => {})
   }
 }
 

@@ -163,6 +163,10 @@ const SESSION_CONTROL_TOPIC = 'lk.agent.session';
 const MAX_CUE_REPORT_CHARS = 512;
 /** Cue reports logged per call; a page gone wrong cannot flood the log. */
 export const MAX_CUE_REPORTS = 500;
+/** A cue report stream still open after this long is closed unread. */
+const CUE_STREAM_TIMEOUT_MS = 2_000;
+/** Cue report streams read at once; more are closed unread. */
+const MAX_OPEN_CUE_STREAMS = 4;
 /** Review mode's waits, on the global timers (which tests can fake). */
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 /** VOICE_MAX_SPOKEN_CHARS when unset: 0, no cap; a reply is spoken in full however long it runs. */
@@ -791,17 +795,20 @@ export async function readCueStream(chunks: AsyncIterable<string>, max = MAX_CUE
   return text;
 }
 
-/** Logs the page's cue reports, one line each, up to MAX_CUE_REPORTS per call. */
-export function cueReportLogger(log: Pick<Console, 'info'>): (text: string | null) => void {
+/**
+ * Logs the page's cue reports, one line each, up to MAX_CUE_REPORTS per call; returns false once
+ * that is reached, so the caller can stop taking them.
+ */
+export function cueReportLogger(log: Pick<Console, 'info'>): (text: string | null) => boolean {
   let logged = 0;
   return (text) => {
+    if (logged >= MAX_CUE_REPORTS) return false;
     const report = text === null ? null : readCueReport(text);
-    if (!report) return;
-    if (++logged > MAX_CUE_REPORTS) {
-      if (logged === MAX_CUE_REPORTS + 1) log.info('voice worker: further cue reports on this call are not logged');
-      return;
-    }
+    if (!report) return true;
     log.info(cueReportLine(report));
+    if (++logged < MAX_CUE_REPORTS) return true;
+    log.info('voice worker: further cue reports on this call are not logged');
+    return false;
   };
 }
 
@@ -1903,10 +1910,26 @@ async function sessionVoice(
     log.warn('voice worker: could not close the session control topic', { err });
   }
   // The page's cue telemetry: whether each sound cue played on the caller's phone, and why not.
+  // Only the caller's, a few at a time, each for a moment; any other stream is closed unread.
   const logCue = cueReportLogger(log);
+  let openCueStreams = 0;
   try {
     ctx.room.registerTextStreamHandler(CALL_CUE_TOPIC, (reader, from) => {
-      if (from.identity === meta.callerIdentity) void readCueStream(reader).then(logCue);
+      if (from.identity !== meta.callerIdentity || openCueStreams >= MAX_OPEN_CUE_STREAMS) {
+        void reader.close().catch(() => undefined);
+        return;
+      }
+      openCueStreams++;
+      const timer = setTimeout(() => void reader.close().catch(() => undefined), CUE_STREAM_TIMEOUT_MS);
+      void readCueStream(reader)
+        .then((text) => {
+          if (!logCue(text)) ctx.room.unregisterTextStreamHandler(CALL_CUE_TOPIC);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          clearTimeout(timer);
+          openCueStreams--;
+        });
     });
   } catch (err) {
     log.warn('voice worker: could not take the page cue reports', { err });
@@ -2079,7 +2102,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turns = 0;
   /** The newest turn handed to the host. */
   let lastPosted = 0;
-  /** The newest turn the host took, and the newest the page heard the agent pick up or answer. */
+  /** The newest turn the host answered, the newest it took, and the newest the agent picked up or answered. */
+  let lastSettled = 0;
   let lastAccepted = 0;
   let pickedUp = 0;
   /** The host's utterance id of each sent turn to its number here, to tell the page what a reply answers. */
@@ -2119,6 +2143,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     if (!ending) publish(draft === undefined ? { turn, status: 'sending' } : { turn, status: 'sending', text, draft });
     turnTaking.onTurn(text, (host) => {
       if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
+      lastSettled = Math.max(lastSettled, turn);
       if (host.accepted) lastAccepted = Math.max(lastAccepted, turn);
       if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {
         unconfirmed.set(host.turnKey, { turn, text });
@@ -2215,15 +2240,16 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       else if (event.type === 'reply') {
         // A host that sends no turn at all predates reply labels: not known, so no label.
         const turn = typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn;
-        // An answered turn needs no "working" any more.
-        if (typeof turn === 'number') pickedUp = Math.max(pickedUp, turn);
+        // Any agent message after the turns the host took answers the "did it get it" question.
+        pickedUp = Math.max(pickedUp, lastAccepted, typeof turn === 'number' ? turn : 0);
         turnTaking.onReply(event.text, turn);
       } else if (event.type === 'thinking') turnTaking.onThinking();
       else if (event.type === 'working') {
         turnTaking.onThinking();
         // The runner works on what reached it after the newest turn the host took: the page's
-        // working cue, once per turn. A pickup heard before that turn's 202 waits for the next tick.
-        if (lastAccepted > pickedUp) {
+        // working cue, once per turn. While a newer turn awaits the host's answer the pickup could
+        // be read as that one's, so it waits for the next tick.
+        if (lastAccepted > pickedUp && lastSettled === lastPosted) {
           pickedUp = lastAccepted;
           publish({ turn: lastAccepted, status: 'working' });
         }

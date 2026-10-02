@@ -745,4 +745,15 @@ describe('typing observers', () => {
     expect(seen.at(-1)).toEqual(expect.objectContaining({ working: true }));
     stopTypingRefresh('sess-pick');
   });
+
+  it('stay quiet about a pickup inside the post-delivery pause, like the refresh ticks', async () => {
+    captureAdapter();
+    startTypingRefresh('sess-pause', 'ag-1', 'voice', 'voice:line', null);
+    await vi.advanceTimersByTimeAsync(1);
+    pauseTypingRefreshAfterDelivery('sess-pause');
+    seen.length = 0;
+    notePresence('sess-pause', { turn: 'working', updatedAtMs: Date.now(), status: null });
+    expect(seen).toEqual([]);
+    stopTypingRefresh('sess-pause');
+  });
 });
