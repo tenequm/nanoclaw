@@ -48,15 +48,15 @@ persona names another language.
 
 Every engine's prompt (on the LiveKit path, the transcription's custom vocabulary) also lists
 names the caller is likely to say, so the model recognises them and spells them
-exactly in transcripts and `ask_agent` requests: `GPT_LIVE_VOCABULARY` (comma-separated, in `.env`) plus the agent's
+exactly in transcripts and delegations: `GPT_LIVE_VOCABULARY` (comma-separated, in `.env`) plus the agent's
 optional `voice.vocabulary.txt` in its group folder (one term per line, read
 like the persona file, symlinks and FIFOs refused), e.g.
 `GPT_LIVE_VOCABULARY=Acme, Zephyr, k8s`. Both are merged, trimmed and
 deduplicated, and capped at 60 terms and 1 KB; when neither names any, the
 prompt lists no names. `GPT_LIVE_VOCABULARY` is read at startup, the file on
-every call. It is prompt-only on the OpenAI and Gemini Live paths: `gpt-live-1`
-sessions take no transcription settings, and Gemini documents `customVocabulary`
-for its transcribe models only, which the LiveKit path uses.
+every call. It is prompt-only on the OpenAI path: `gpt-live-1` sessions take
+no transcription settings. The LiveKit path passes it to Gemini's transcribe
+models as `customVocabulary`.
 
 The stable channel identifier and URL prefix are `voice`. The `GPT_LIVE_*`
 settings and adapter module names identify the current voice engine.
@@ -83,8 +83,6 @@ src/channels/gpt-live-access.test.ts
 src/channels/gpt-live-keychain.test.ts
 src/channels/gpt-live-sideband.test.ts
 src/channels/gpt-live-call-page.test.ts
-src/channels/gemini-live.ts
-src/channels/gemini-live.test.ts
 src/channels/voice-livekit.ts
 src/channels/voice-livekit-protocol.ts
 src/channels/voice-livekit.test.ts
@@ -115,7 +113,7 @@ container/skills/voice-formatting/SKILL.md
 
 ### 4. Build
 
-The OpenAI and browser-direct Gemini paths need no new package: they use Node's
+The OpenAI path needs no new package: they use Node's
 built-in `fetch` and WebSocket client (Node 22 or later). The LiveKit path adds
 `@livekit/agents`, `@livekit/agents-plugin-google` (Gemini transcription and
 speech), `@livekit/agents-plugin-silero` (Silero VAD on
@@ -134,7 +132,7 @@ Run the registration test, the session state-machine tests, and the adapter
 integration test (a fake OpenAI behind the real webhook server):
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts src/channels/gemini-live.test.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.test.ts
+pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.test.ts
 ```
 
 `voice-registration.test.ts` imports the real channel barrel and asserts the
@@ -409,54 +407,11 @@ as the host and requires no dependency install scripts. Try the page without a
 microphone or an agent by adding `&demo=1` to any call link: it plays a scripted
 call and connects to nothing.
 
-## Gemini Live (test)
-
-The same lines also take calls through Google's
-[Gemini Live](https://ai.google.dev/gemini-api/docs/live) at
-`…/webhook/voice/gemini?t=<token>`, with the same token, line, agent wiring and
-access checks as the `/call` link. It is off until the key is in `.env`; without
-it the `/gemini` routes answer 503 and the OpenAI path is unchanged:
-
-```
-GEMINI_API_KEY=<Gemini API key>
-```
-
-Optional: `GEMINI_LIVE_MODEL` (default `gemini-3.8-live`),
-`GEMINI_LIVE_VOICE` (default `Kore`) and `GEMINI_LIVE_MAX_CALL_SECONDS`
-(default and maximum `600`, never above `GPT_LIVE_MAX_CALL_SECONDS`; Google drops
-Live audio connections at about 10 minutes and the page does not resume sessions
-yet). The page is told the token's remaining lifetime after the mint, so it hangs
-up before the token expires.
-Restart to load them.
-
-The page talks to Gemini directly: the host mints a one-use ephemeral token
-locked to the model, the composed voice prompt, the voice and one `ask_agent`
-function, and the key never leaves the host. Each `ask_agent` call is sent to
-the agent like a delegation and its first reply goes back to Gemini as the
-function's answer. The agent batches the messages that queued while it was busy
-and replies to the first, so a reply also answers the waiting `ask_agent` calls
-the agent got after the one it names; calls it got earlier wait for their own
-reply. Later agent messages for the call (the real answer after an interim
-one, a reply after the timeout line, a proactive message) are queued; the page
-long-polls `…/gemini/messages` and hands each to Gemini as a further answer,
-spoken when the model is idle. A call may have 3 `ask_agent` calls waiting at
-once and start 10 a minute; a request is at most 4 KB.
-
-Both engines share the hourly start cap, the daily minutes and the delegation
-timeout, and the newest call on a line wins across engines. The host cannot end
-a Google session: the token works until it expires, and Google enforces that
-expiry. So a Gemini call is charged its whole token lifetime when the token is
-minted, and hanging up early gives nothing back. When access is revoked, the
-line changes or a newer call takes the line, the host stops serving the call
-(its `ask_agent` calls and messages are refused, which makes the page hang
-up), but a page that ignores that keeps talking to Gemini, without the agent,
-until the token expires.
-
 ## LiveKit walkie-talkie (WebRTC)
 
 The same lines also take calls over WebRTC through a self-hosted
 [LiveKit](https://docs.livekit.io/) server at `…/webhook/voice/livekit?t=<token>`
-(same token, line, agent wiring and access checks as `/call` and `/gemini`). On
+(same token, line, agent wiring and access checks as `/call`). On
 this path the caller talks to the line's real agent, not to a voice model: each
 spoken turn is transcribed and sent to the agent as a message, and each agent
 reply is read out with Gemini TTS. The worker is a LiveKit Agents `AgentSession`
@@ -553,7 +508,7 @@ for verbose logs.
 
 How a call runs: the page posts to `/webhook/voice/livekit/token`; the host
 admits the call against the shared hourly and daily limits, ends any other call
-on the line (newest wins, across all three engines), creates a unique room
+on the line (newest wins, across both engines), creates a unique room
 `voice-<line id>-<random>`, dispatches the worker to it with the call metadata
 (line, call id, agent and caller names, vocabulary, the walkie-talkie settings;
 nothing secret, since agents-js logs whole jobs on some paths) and returns a
@@ -656,7 +611,7 @@ run `/voice` where calls should talk when that matters. With none,
 with several and no single direct chat, or with `WALKIE_MIRROR=off`, the call
 talks on the voice line itself as before (replies come back by their
 `livekit:` reply id, nothing is posted) and the host logs why once. The
-OpenAI (`/call`) and Gemini Live (`/gemini`) pages always talk on the voice line.
+OpenAI page (`/call`) always talks on the voice line.
 
 The LiveKit page is the same React call page as `/call` (one build from `ui/`),
 served with `transport: "livekit"` in its injected config and the same

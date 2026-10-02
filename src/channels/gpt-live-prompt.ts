@@ -10,7 +10,6 @@
  */
 import path from 'node:path';
 
-import { AGENT_UPDATE_PREFIX, ASK_AGENT_TOOL } from './gemini-live.js';
 import { GROUPS_DIR } from '../config.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
@@ -81,8 +80,8 @@ export function voiceVocabulary(envList: string | undefined, fileText: string | 
   return out;
 }
 
-/** Who is talking to whom and how: shared by every voice engine's prompt. */
-function identityAndStyle(agent: VoiceAgent, caller?: VoiceCaller): string[] {
+/** The fixed part of the voice prompt: talk style and the delegation policy. */
+export function voiceInstructions(agent: VoiceAgent, caller?: VoiceCaller): string {
   const persona = (agent.personality ?? '').trim().slice(0, MAX_PERSONA_CHARS);
   return [
     `You are ${agent.name}, taking a live voice call for your user.`,
@@ -92,49 +91,17 @@ function identityAndStyle(agent: VoiceAgent, caller?: VoiceCaller): string[] {
       : '',
     LANGUAGE_RULE,
     // Prompt only: gpt-live-1 sessions take no transcription settings (keywords and prompt exist on
-    // gpt-live-transcribe sessions), and Gemini documents customVocabulary for its transcribe model only.
+    // gpt-live-transcribe sessions).
     agent.vocabulary?.length
       ? `Names you will hear (spell them exactly this way in transcripts and tool requests): ${agent.vocabulary.join(', ')}.`
       : '',
     'How to talk: short natural sentences, one idea at a time, no markdown or symbols, no lists read aloud.',
     'When the call connects, greet the caller briefly and ask how you can help.',
-  ];
-}
-
-/** The fixed part of the voice prompt: talk style and the delegation policy. */
-export function voiceInstructions(agent: VoiceAgent, caller?: VoiceCaller): string {
-  return [
-    ...identityAndStyle(agent, caller),
     'You have a backend assistant that holds the user’s memory, files, calendar, tools and the ability to take actions.',
     'Delegate to the backend whenever the caller asks for anything about their world, anything that needs a lookup, a calculation, a schedule change, a message sent, or any other action. Never invent those answers.',
     'While the backend works, keep the caller company with a brief acknowledgement, then wait; do not fill the silence with guesses.',
     'Small talk, clarifying questions, and repeating what the backend already told you do not need delegation.',
     'When a backend result arrives, say it in your own words, briefly, and check whether the caller needs more.',
-  ]
-    .filter(Boolean)
-    .join(' ');
-}
-
-/**
- * The Gemini Live system instruction: the same voice, delegating through the ask_agent function.
- * `agentUpdates: false` leaves out the rule for the browser page's "Agent update:" turns, which
- * only the browser-direct path sends.
- */
-export function geminiInstructions(
-  agent: VoiceAgent,
-  caller?: VoiceCaller,
-  { agentUpdates = true }: { agentUpdates?: boolean } = {},
-): string {
-  return [
-    ...identityAndStyle(agent, caller),
-    'You have a backend assistant that holds the user’s memory, files, calendar, tools and the ability to take actions.',
-    `For anything that needs memory, tools, facts or actions, call ${ASK_AGENT_TOOL} with the caller’s request in full, including any details they gave, and wait for its answer. Never invent those answers.`,
-    `While ${ASK_AGENT_TOOL} works, say one brief filler such as "one moment", then wait quietly; do not fill the silence with guesses.`,
-    `Small talk, clarifying questions, and repeating what the backend already told you do not need ${ASK_AGENT_TOOL}.`,
-    `When an ${ASK_AGENT_TOOL} answer arrives, say it in your own words, briefly, and check whether the caller needs more.`,
-    agentUpdates
-      ? `A ${ASK_AGENT_TOOL} call can get more than one answer, and text that starts with "${AGENT_UPDATE_PREFIX}" comes from the backend, not the caller: say each new one in your own words, briefly.`
-      : '',
   ]
     .filter(Boolean)
     .join(' ');
