@@ -879,6 +879,7 @@ describe('voice delegation deadlines, daily budget and teardown races', () => {
         dispatches.push(JSON.parse(options.metadata) as LiveKitJobMetadata);
         return {};
       },
+      updateRoomMetadata: async () => ({}),
     };
     const mirrorApi: MirrorApi = {
       groupsFor: async () => [],

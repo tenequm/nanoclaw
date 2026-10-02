@@ -62,6 +62,14 @@ export const WALKIE_UPDATING_ATTRIBUTE = 'nanoclaw.walkie.updating';
 export const WALKIE_TURN_TOPIC = 'nanoclaw.walkie.turn';
 
 /**
+ * The room metadata the host sets when a mid-call `/voice` moves the call to another chat, so the
+ * page's header follows it: the new call chat's label, or null once the call talks on the voice line.
+ */
+export interface WalkieRoomMetadata {
+  chat: string | null;
+}
+
+/**
  * What became of a caller turn: sent to the agent, or lost because the transcription failed
  * (`stt`) or heard no words (`empty`), or the host refused it (`rejected`, `rate_limited`) or
  * did not answer (`timeout`).

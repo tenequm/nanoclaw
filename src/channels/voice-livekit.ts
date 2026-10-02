@@ -58,6 +58,7 @@ import {
   PING_INTERVAL_MS,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
+  type WalkieRoomMetadata,
 } from './voice-livekit-protocol.js';
 import {
   getMessagingGroup,
@@ -115,6 +116,7 @@ export interface LiveKitServerApi {
   }): Promise<unknown>;
   deleteRoom(room: string): Promise<void>;
   createDispatch(room: string, agentName: string, options: { metadata: string }): Promise<unknown>;
+  updateRoomMetadata(room: string, metadata: string): Promise<unknown>;
 }
 
 /** The `/voice` binding of a line, as stored; checked against the line before use. */
@@ -305,6 +307,10 @@ const defaultMirrorApi: MirrorApi = {
   isAdmin: (userId, agentGroupId) => hasAdminPrivilege(userId, agentGroupId),
 };
 
+/** How the page names the chat a call talks in. */
+const chatLabel = (group: MessagingGroup): string =>
+  group.name || (group.is_group ? group.channel_type : `${group.channel_type} DM`);
+
 /** A call talks in `chat`, and `to` is that chat: the same thread, or the chat itself when delivery drops the thread. */
 const isCallChat = (chat: CallChat, to: ChatAddress): boolean =>
   chat.group.channel_type === to.channelType &&
@@ -364,6 +370,7 @@ function defaultApi(config: LiveKitVoiceConfig): LiveKitServerApi {
     createRoom: (options) => rooms.createRoom(options),
     deleteRoom: (room) => rooms.deleteRoom(room),
     createDispatch: (room, agentName, options) => dispatch.createDispatch(room, agentName, options),
+    updateRoomMetadata: (room, metadata) => rooms.updateRoomMetadata(room, metadata),
   };
 }
 
@@ -477,6 +484,16 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const sameChat = (a: CallChat | null, b: CallChat | null): boolean =>
     a?.group.id === b?.group.id && a?.threadId === b?.threadId;
 
+  const showChat = (call: LiveKitCall, chat: CallChat | null): void => {
+    if (call.ended) return;
+    const metadata: WalkieRoomMetadata = { chat: chat ? chatLabel(chat.group) : null };
+    api
+      .updateRoomMetadata(call.roomName, JSON.stringify(metadata))
+      .catch((err: unknown) =>
+        log.warn('livekit-voice: could not show the new call chat on the page', { callId: call.callId, err }),
+      );
+  };
+
   /**
    * Re-resolve where the call talks; `turn` marks a caller turn, where a chat
    * left behind by a mid-call `/voice` ages out once it went quiet.
@@ -502,6 +519,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (!sameChat(call.chat, chat)) {
       call.previousChat = call.chat ? { chat: call.chat, active: false } : null;
       call.chat = chat;
+      // The token reply named the first chat; a later move (a mid-call `/voice`) reaches the page here.
+      if (refresh > 1) showChat(call, chat);
     }
     if (chat) {
       const { group, threadId, source } = chat;
@@ -696,9 +715,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     // The chat the call talks in, for the page to show; resolved again when the caller joins.
     const chatGroup = (await refreshChat(call, false))?.group;
-    const chat = chatGroup
-      ? chatGroup.name || (chatGroup.is_group ? chatGroup.channel_type : `${chatGroup.channel_type} DM`)
-      : undefined;
+    const chat = chatGroup ? chatLabel(chatGroup) : undefined;
     if (call.ended || !host.isRunning()) {
       // Replaced or torn down while connecting: that cleanup ran before the room and dispatch
       // existed, so delete them here or they wait for the caller until LiveKit's empty timeout.

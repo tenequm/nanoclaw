@@ -46,6 +46,8 @@ interface FakeLiveKit extends LiveKitServerApi {
   rooms: string[];
   deleted: string[];
   dispatches: Array<{ room: string; agentName: string; metadata: LiveKitJobMetadata }>;
+  /** Room metadata writes, in order. */
+  roomMetadata: Array<{ room: string; metadata: unknown }>;
   /** Every room operation in order, as `create:<room>` / `delete:<room>`. */
   ops: string[];
   failCreate: boolean;
@@ -58,6 +60,7 @@ function fakeLiveKit(): FakeLiveKit {
     rooms: [],
     deleted: [],
     dispatches: [],
+    roomMetadata: [],
     ops: [],
     failCreate: false,
     createGate: null,
@@ -74,6 +77,10 @@ function fakeLiveKit(): FakeLiveKit {
     },
     async createDispatch(room, agentName, options) {
       fake.dispatches.push({ room, agentName, metadata: JSON.parse(options.metadata) as LiveKitJobMetadata });
+      return {};
+    },
+    async updateRoomMetadata(room, metadata) {
+      fake.roomMetadata.push({ room, metadata: JSON.parse(metadata) });
       return {};
     },
   };
@@ -928,6 +935,22 @@ describe('livekit call talking in the agent chat', () => {
       'Answer to two.',
       'Answer to four.',
     ]);
+    worker.close();
+  });
+
+  it('tells the page when a mid-call /voice moves the call to another chat', async () => {
+    const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1, name: 'Ops' };
+    const fake = await start([{ platform_id: 'telegram:100', name: 'HQ' }, topic], 'telegram', {
+      admins: ['telegram:42'],
+    });
+    const { call, worker } = await startCall(h);
+    expect(call.chat).toBe('HQ');
+    await worker.utter('one');
+    // The token reply named the first chat; nothing more is written while the call stays there.
+    expect(h.lk.roomMetadata).toEqual([]);
+    fake.state.bound = { group: topic, threadId: null, ownerIds: ['telegram:42'] };
+    await worker.utter('two');
+    expect(h.lk.roomMetadata).toEqual([{ room: h.lk.rooms[0], metadata: { chat: 'Ops' } }]);
     worker.close();
   });
 
