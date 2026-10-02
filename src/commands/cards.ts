@@ -227,7 +227,7 @@ export function failureMessage(failure: CommandFailure): string {
     case 'no-voice-line':
       return "You have no voice line for this agent. The operator names a line's owner accounts with `ncl voice-lines set` and `add-owner`.";
     case 'voice-unavailable':
-      return 'Walkie-talkie calls are off on this host (LiveKit is not configured).';
+      return 'Voice calls are off on this host (the voice channel is not configured).';
     default:
       return 'That did not work.';
   }
@@ -241,13 +241,24 @@ export function voiceCommandReply(outcome: VoiceCommandOutcome, fmt: CardFmt): s
   if (outcome.kind === 'drop') return null;
   if (outcome.kind === 'refused') return failureMessage({ ok: false, reason: 'unauthorized' });
   const blocks: string[] = [];
+  let walkie = false;
   for (const { result } of outcome.results) {
     if (!result.ok) continue;
     const { agentName, links } = result.view;
-    blocks.push([`🎙 Walkie-talkie for ${fmt.bold(agentName)}:`, ...links].join('\n'));
+    for (const link of links) {
+      const lines: string[] = [];
+      if (link.walkie) lines.push(`🎙 Walkie-talkie with ${fmt.bold(agentName)}: ${link.walkie}`);
+      if (link.liveCall) {
+        lines.push(`📞 Live call (OpenAI)${link.walkie ? '' : ` with ${fmt.bold(agentName)}`}: ${link.liveCall}`);
+      }
+      walkie ||= link.walkie !== null;
+      blocks.push(lines.join('\n'));
+    }
   }
   if (blocks.length > 0) {
-    return [...blocks, 'Calls on this link now talk in this chat, until /voice is run in another one.'].join('\n\n');
+    // Only LiveKit calls follow the call chat; a live call talks on the line itself.
+    if (walkie) blocks.push('Walkie-talkie calls now talk in this chat, until /voice is run in another one.');
+    return blocks.join('\n\n');
   }
   // Nothing linked: say why, once per distinct reason.
   const reasons = new Set(

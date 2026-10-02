@@ -81,6 +81,7 @@ import {
   type TargetAgent,
   type TargetResolution,
   type VoiceCommandOutcome,
+  type VoiceLineLinks,
   type VoiceTargetView,
 } from './types.js';
 
@@ -562,16 +563,18 @@ export async function restartAgent(agentGroupId: string, actorUserId: string): P
 
 // --- /voice ---
 
-/** A voice line's walkie-talkie link; null when LiveKit is off or the line has no link here. */
-export type VoiceLinkFn = (line: MessagingGroup) => string | null;
+/** A voice line's call links; null when the host has none for it (no voice adapter, or no link token here). */
+export type VoiceLinkFn = (line: MessagingGroup) => VoiceLineLinks | null;
 
 /** Asks the live voice adapter, the only holder of the link tokens. */
 const liveVoiceLink: VoiceLinkFn = (line) => {
   // Structural, not voice.ts's VoiceChannelAdapter: core must still build once add-voice is removed.
   const adapter = getChannelAdapterExact(line.instance ?? line.channel_type) as
-    | { walkieLink?(platformId: string): string | null }
+    | { walkieLink?(platformId: string): string | null; liveCallLink?(platformId: string): string | null }
     | undefined;
-  return adapter?.walkieLink?.(line.platform_id) ?? null;
+  const walkie = adapter?.walkieLink?.(line.platform_id) ?? null;
+  const liveCall = adapter?.liveCallLink?.(line.platform_id) ?? null;
+  return walkie || liveCall ? { walkie, liveCall } : null;
 };
 
 /** The agent's voice lines: its `voice` messaging groups (a chat is wired to an agent at most once). */
@@ -602,7 +605,7 @@ function callChatThread(wiring: MessagingGroupAgent, mg: MessagingGroup, threadI
 
 /**
  * Make this chat the call chat of the agent's voice line(s) that belong to
- * `actorUserId`, and return their walkie-talkie links. Admin only. A line
+ * `actorUserId`, and return their call links. Admin only. A line
  * belongs to the chat accounts voice_line_owners names for it (one person's
  * accounts across channels); another person's line is never bound or linked here. The call chat is where the line's LiveKit
  * calls talk (src/channels/voice-livekit.ts), as the line's own caller, until

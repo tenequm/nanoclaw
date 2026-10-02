@@ -553,7 +553,10 @@ describe('restartAgent', () => {
 // --- /voice ---
 
 describe('/voice', () => {
-  const link = (line: MessagingGroup) => `https://voice.example/webhook/voice/livekit?t=tok-${line.platform_id}`;
+  const link = (line: MessagingGroup) => ({
+    walkie: `https://voice.example/voice?t=tok-${line.platform_id}`,
+    liveCall: `https://voice.example/voice/call?t=tok-${line.platform_id}`,
+  });
   const chat = (messagingGroupId: string, threadId: string | null = null) => ({ messagingGroupId, threadId });
 
   async function chatGroup(id: string, platformId: string, channelType = 'telegram', isGroup: 0 | 1 = 0) {
@@ -611,7 +614,7 @@ describe('/voice', () => {
     expect(res.view).toEqual({
       agentName: 'Emma',
       agentGroupId: 'ag-1',
-      links: ['https://voice.example/webhook/voice/livekit?t=tok-voice:abc'],
+      links: [link({ platform_id: 'voice:abc' } as MessagingGroup)],
     });
     expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-dm', thread_id: null });
     // Another admin's line is neither bound nor linked.
@@ -623,7 +626,7 @@ describe('/voice', () => {
     const other = await setVoiceTarget('ag-1', chat('mg-dm'), SCOPED_ADMIN, link);
     expect(other).toMatchObject({
       ok: true,
-      view: { links: ['https://voice.example/webhook/voice/livekit?t=tok-voice:def'] },
+      view: { links: [link({ platform_id: 'voice:def' } as MessagingGroup)] },
     });
     expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-topic' });
   });
@@ -643,7 +646,14 @@ describe('/voice', () => {
     const res = await setVoiceTarget('ag-1', chat('mg-dm'), SLACK_OWNER, link);
     expect(res).toMatchObject({
       ok: true,
-      view: { links: ['https://voice.example/webhook/voice/livekit?t=tok-voice:abc'] },
+      view: {
+        links: [
+          {
+            walkie: 'https://voice.example/voice?t=tok-voice:abc',
+            liveCall: 'https://voice.example/voice/call?t=tok-voice:abc',
+          },
+        ],
+      },
     });
     expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-dm' });
     expect(await getVoiceLine('mg-line-2')).toMatchObject({ target_messaging_group_id: null });
@@ -664,7 +674,7 @@ describe('/voice', () => {
     );
   });
 
-  it('refuses non-admins, unwired chats, agents without a line, and hosts without LiveKit', async () => {
+  it('refuses non-admins, unwired chats, agents without a line, and hosts without the voice channel', async () => {
     expect(await setVoiceTarget('ag-1', chat('mg-dm'), NON_ADMIN, link)).toMatchObject({ reason: 'unauthorized' });
     await chatGroup('mg-other', 'telegram:7');
     expect(await setVoiceTarget('ag-1', chat('mg-other'), OWNER, link)).toMatchObject({ reason: 'unknown-agent' });
@@ -730,12 +740,28 @@ describe('/voice', () => {
 
     const done = await runVoiceCommand(targets, chat('mg-dm'), OWNER, link);
     expect(voiceCommandReply(done, MD_FMT)).toBe(
-      '🎙 Walkie-talkie for **Emma**:\nhttps://voice.example/webhook/voice/livekit?t=tok-voice:abc\n\n' +
-        'Calls on this link now talk in this chat, until /voice is run in another one.',
+      '🎙 Walkie-talkie with **Emma**: https://voice.example/voice?t=tok-voice:abc\n' +
+        '📞 Live call (OpenAI): https://voice.example/voice/call?t=tok-voice:abc\n\n' +
+        'Walkie-talkie calls now talk in this chat, until /voice is run in another one.',
+    );
+    const callOnly = await runVoiceCommand(targets, chat('mg-dm'), OWNER, (line) => ({
+      walkie: null,
+      liveCall: link(line).liveCall,
+    }));
+    expect(voiceCommandReply(callOnly, MD_FMT)).toBe(
+      '📞 Live call (OpenAI) with **Emma**: https://voice.example/voice/call?t=tok-voice:abc',
+    );
+    const walkieOnly = await runVoiceCommand(targets, chat('mg-dm'), OWNER, (line) => ({
+      walkie: link(line).walkie,
+      liveCall: null,
+    }));
+    expect(voiceCommandReply(walkieOnly, MD_FMT)).toBe(
+      '🎙 Walkie-talkie with **Emma**: https://voice.example/voice?t=tok-voice:abc\n\n' +
+        'Walkie-talkie calls now talk in this chat, until /voice is run in another one.',
     );
     const off = await runVoiceCommand(targets, chat('mg-dm'), OWNER, () => null);
     expect(voiceCommandReply(off, MD_FMT)).toBe(
-      'Walkie-talkie calls are off on this host (LiveKit is not configured).',
+      'Voice calls are off on this host (the voice channel is not configured).',
     );
   });
 });

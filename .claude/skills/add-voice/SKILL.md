@@ -668,16 +668,17 @@ own the line yet, clears the call chat, which is how a line changes hands.
 
 The owner then sends `/voice` from any of those accounts in a chat wired to the
 agent (that account must be an owner or admin of the agent too; on Slack
-`!voice`): the host replies there with the link of their own line(s) of that
-agent, never anyone else's, and makes that chat (and its thread or forum topic;
+`!voice`): the host replies there with the links of their own line(s) of that
+agent, never anyone else's (`Walkie-talkie with <agent>: …/voice?t=…` when
+LiveKit is configured, then `Live call (OpenAI): …/voice/call?t=…`), and makes that chat (and its thread or forum topic;
 on Slack a top-level `!voice` means the channel itself) the line's call chat
 until `/voice` from any of the line's owner accounts names another chat of the
 same agent (the last one wins). Someone who owns no line of the agent is told
-so, and nothing changes. The link itself never changes and the page works
-without the command; `/voice` only says where calls talk. In a chat with several agents it does this
+so, and nothing changes. The links never change and the pages work
+without the command; `/voice` only says where walkie-talkie calls talk. In a chat with several agents it does this
 for every agent there the sender administers. The reply goes out with link
 previews off (Telegram) and unfurls off (Slack), and a reply quoting it does not
-pass the link to the agent. The call chat is stored per line in `voice_lines`
+pass the links to the agent. The call chat is stored per line in `voice_lines`
 and the owner accounts in `voice_line_owners` (migration 027, applied at host
 start); a new owner starts with no call chat.
 

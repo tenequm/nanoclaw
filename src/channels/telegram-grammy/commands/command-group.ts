@@ -233,7 +233,7 @@ export function buildCommandGroup(runtime: AdapterRuntime, menus: CommandMenus):
       yield* reply(ctx, 'This chat has multiple agents. Restart each from its own topic, or via /config -> Restart.');
     });
 
-  // /voice - admin only: replies with the agent's walkie-talkie link and makes this chat (topic) the
+  // /voice - admin only: replies with the agent's call links and makes this chat (topic) the
   // line's call chat. Every agent of the chat the actor administers, like /status.
   const onVoice = (ctx: Context): Effect.Effect<void> =>
     Effect.gen(function* () {

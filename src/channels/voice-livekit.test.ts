@@ -356,8 +356,10 @@ describe('livekit voice path without LiveKit settings', () => {
     await h.stop();
   });
 
-  it('has no walkie-talkie link to hand out', () => {
-    expect((h.adapter as VoiceChannelAdapter).walkieLink(LINE)).toBeNull();
+  it('has no walkie-talkie link to hand out, only the live call link', () => {
+    const adapter = h.adapter as VoiceChannelAdapter;
+    expect(adapter.walkieLink(LINE)).toBeNull();
+    expect(adapter.liveCallLink(LINE)).toBe(`${h.hostUrl}/voice/call?t=tok123`);
   });
 
   it('answers 503 on every livekit route and leaves the other engines alone', async () => {
@@ -378,10 +380,12 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await h.stop();
   });
 
-  it('renders the walkie-talkie link of a line it holds the token for, and no other', () => {
+  it('renders the call links of a line it holds the token for, and no other', () => {
     const adapter = h.adapter as VoiceChannelAdapter;
     expect(adapter.walkieLink(LINE)).toBe(`${h.hostUrl}/voice?t=tok123`);
+    expect(adapter.liveCallLink(LINE)).toBe(`${h.hostUrl}/voice/call?t=tok123`);
     expect(adapter.walkieLink(lineIdForToken('other'))).toBeNull();
+    expect(adapter.liveCallLink(lineIdForToken('other'))).toBeNull();
   });
 
   it('serves the voice call page in its LiveKit transport', async () => {

@@ -320,10 +320,12 @@ export function lineIdForToken(token: string): string {
   return `${CHANNEL_TYPE}:${createHash('sha256').update(token).digest('hex').slice(0, 12)}`;
 }
 
-/** The voice adapter, plus the walkie-talkie link of one of its lines for the `/voice` command. */
+/** The voice adapter, plus the call links of one of its lines for the `/voice` command. */
 export interface VoiceChannelAdapter extends ChannelAdapter {
   /** The line's LiveKit call page URL, or null when LiveKit is off or the line has no link token here. */
   walkieLink(platformId: string): string | null;
+  /** The line's OpenAI live call page URL, or null when the line has no link token here. */
+  liveCallLink(platformId: string): string | null;
 }
 
 export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter {
@@ -850,6 +852,11 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
     }
   };
 
+  const lineLink = (platformId: string, path: string): string | null => {
+    const token = [...tokens].find((t) => lineIdForToken(t) === platformId);
+    return token ? `${config.publicUrl.replace(/\/+$/, '')}${path}?t=${encodeURIComponent(token)}` : null;
+  };
+
   return {
     name: CHANNEL_TYPE,
     channelType: CHANNEL_TYPE,
@@ -857,9 +864,11 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
     defaults: GPT_LIVE_DEFAULTS,
 
     walkieLink(platformId: string): string | null {
-      if (!livekit) return null;
-      const token = [...tokens].find((t) => lineIdForToken(t) === platformId);
-      return token ? `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}` : null;
+      return livekit ? lineLink(platformId, '/voice') : null;
+    },
+
+    liveCallLink(platformId: string): string | null {
+      return lineLink(platformId, '/voice/call');
     },
 
     async setup(cfg: ChannelSetup): Promise<void> {

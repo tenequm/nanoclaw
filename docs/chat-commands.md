@@ -12,7 +12,7 @@ binding handles them at the adapter.
 | `/model` | Admin only | Bare `/model` opens a model picker (active model checkmarked). `/model <alias-or-id>` switches directly. |
 | `/config` | Admin only | Bare `/config` opens the config menu (Model / Effort / Compact window / Activation / Restart). `/config set <field> <value>` writes one field. |
 | `/restart` | Admin only | Restarts the agent's running container(s) immediately. |
-| `/voice` | Admin only, line owner | Replies with the sender's own LiveKit walkie-talkie link for the agent and makes this chat (and its thread or topic) where that line's calls talk, until `/voice` is run in another chat of the agent. The operator names each line's owner accounts with `ncl voice-lines set` and `add-owner`. See the add-voice skill. |
+| `/voice` | Admin only, line owner | Replies with the sender's own call links for the agent (the LiveKit walkie-talkie when LiveKit is configured, and the OpenAI live call) and makes this chat (and its thread or topic) where that line's walkie-talkie calls talk, until `/voice` is run in another chat of the agent. The operator names each line's owner accounts with `ncl voice-lines set` and `add-owner`. See the add-voice skill. |
 
 ## Slack: the `!` prefix
 
