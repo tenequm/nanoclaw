@@ -459,7 +459,7 @@ empty value reads as unset, so turn a fallback off with `off`.
 | `LIVEKIT_AGENT_NAME` | `nanoclaw-voice` | both | Dispatch name; the same value for host and worker. |
 | `LIVEKIT_HOST_URL` | `http://127.0.0.1:<WEBHOOK_PORT>` | worker | Where the worker reaches the host; a local `http(s)` address, checked at start. |
 | `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | worker | Health check on `127.0.0.1`. |
-| `VOICE_MODE_MAX_SPOKEN_CHARS` | `800` | worker | Longest spoken message; the rest stays in the chat. `0` for no cap. |
+| `VOICE_MODE_MAX_SPOKEN_CHARS` | `0` | worker | Longest spoken message, cut at a sentence end; the rest stays in the chat. `0` speaks every message in full. |
 
 ### The agent's vocabulary file
 

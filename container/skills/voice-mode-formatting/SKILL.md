@@ -29,9 +29,9 @@ until it arrives. Write for the ear.
 
 Every message you send to the call's chat during the call is read aloud, so
 offer anything long (lists, links, code, details) for after the call instead.
-Only the start of a long message is spoken (about 800 characters unless the operator set another cap): the rest is
-cut at a sentence and the caller hears that it is in the chat, so say what
-matters first. More turns can arrive while you work: the caller adding to
+Messages are spoken in full unless the operator set a length cap: then the
+rest is cut at a sentence and the caller hears that it is in the chat, so say
+what matters first. More turns can arrive while you work: the caller adding to
 what they said.
 
 When the note under the turn names the caller's languages, answer in the one

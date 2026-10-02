@@ -159,7 +159,7 @@ describe('helpers', () => {
 
   it('reads VOICE_MODE_MAX_SPOKEN_CHARS, with 0 for no cap', () => {
     expect(maxSpokenChars(undefined)).toBe(DEFAULT_MAX_SPOKEN_CHARS);
-    expect(DEFAULT_MAX_SPOKEN_CHARS).toBe(800);
+    expect(DEFAULT_MAX_SPOKEN_CHARS).toBe(0);
     expect(maxSpokenChars(' 400 ')).toBe(400);
     expect(maxSpokenChars('0')).toBe(0);
     expect(maxSpokenChars('-5')).toBe(DEFAULT_MAX_SPOKEN_CHARS);

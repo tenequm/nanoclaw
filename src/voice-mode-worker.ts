@@ -19,8 +19,8 @@
  *  - each finished turn goes to the host, which hands it to the agent as a
  *    spoken message; nothing in the session answers it;
  *  - each complete agent reply from the host's event stream is spoken with
- *    `session.say()` once the caller is not mid-turn, cut to
- *    VOICE_MODE_MAX_SPOKEN_CHARS at a sentence end, uninterruptible: while
+ *    `session.say()` once the caller is not mid-turn, in full unless
+ *    VOICE_MODE_MAX_SPOKEN_CHARS cuts it at a sentence end, uninterruptible: while
  *    it plays, the caller's audio is not transcribed (no barge-in); Gemini
  *    TTS synthesizes the whole reply in one streamed request, through
  *    LiveKit's TTS FallbackAdapter onto a second model.
@@ -117,8 +117,8 @@ const MISMATCH_NOTICE_MS = 3_000;
 const TURN_RETRY_DELAY_MS = 500;
 /** Timed-out turns kept for a late `turn-stored`; the host remembers no more turn keys than this either. */
 const MAX_UNCONFIRMED_TURNS = 32;
-/** VOICE_MODE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
-export const DEFAULT_MAX_SPOKEN_CHARS = 800;
+/** VOICE_MODE_MAX_SPOKEN_CHARS when unset: no cap, every message is spoken in full. */
+export const DEFAULT_MAX_SPOKEN_CHARS = 0;
 
 /** The worker's HTTP client for the host's /webhook/voice-mode/livekit/agent routes. */
 export class HostLink {
