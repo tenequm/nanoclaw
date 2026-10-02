@@ -544,6 +544,7 @@ export default function App() {
         {`Tap to hear ${agentName}`}
       </button>
     ) : null
+  const sendCueBar = call.sendCue && <SendCueBar key={call.sendCue.id} cue={call.sendCue} reduced={reduced} />
 
   const showTs = skin === "te" && cfg.timestamps
   const transcript = (
@@ -698,7 +699,7 @@ export default function App() {
                 {readout}
                 <span className="screen-hint">{hintText}</span>
                 {hearKey}
-                {call.sendCue && <SendCueBar key={call.sendCue.id} cue={call.sendCue} reduced={reduced} />}
+                {sendCueBar}
               </div>
               {deliveryNotice}
               <div className="console" aria-label="Live transcript">
@@ -717,7 +718,7 @@ export default function App() {
               </div>
               {readout}
               <p className="hint">{hintText}</p>
-              {call.sendCue && <SendCueBar key={call.sendCue.id} cue={call.sendCue} reduced={reduced} />}
+              {sendCueBar}
               {hearKey}
               {deliveryNotice}
             </section>

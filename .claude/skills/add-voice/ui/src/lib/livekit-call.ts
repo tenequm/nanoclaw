@@ -56,7 +56,6 @@ const PENDING_ATTR = "nanoclaw.walkie.pending"
 const REPLY_TOPIC = "nanoclaw.walkie.reply"
 /** What the page says for each WalkieRoomMetadata.end the host sets before it deletes the room. */
 const END_TEXT: Record<string, string> = {
-  hangup: "Call ended.",
   limit_duration: "The call reached its time limit.",
   limit_daily: "Today's call minutes are used up.",
   newer_call: "A newer call on this line took over.",
@@ -66,6 +65,8 @@ const END_TEXT: Record<string, string> = {
 }
 const LIMIT_NAME: Record<string, string> = { duration: "call time limit", daily: "daily voice limit" }
 const LIMIT_WARN_MS = 60_000
+/** Shown later than this before the limit, the warning says "under a minute", not "1 min". */
+const LIMIT_WARN_LATE_MS = LIMIT_WARN_MS - 5_000
 /** After a reply, the "your turn" cue waits this long for the next queued line to show up. */
 const TURN_CUE_DELAY_MS = 600
 
@@ -81,13 +82,20 @@ function isReplyInfo(v: unknown): v is ReplyInfo {
   return !!v && typeof (v as ReplyInfo).reply === "number"
 }
 
-function endReasonText(metadata: string | undefined): string | null {
+/** The host's WalkieRoomMetadata, or null when the room carries none of ours. */
+function readRoomMetadata(metadata: string | undefined): { chat?: unknown; end?: unknown } | null {
+  if (!metadata) return null
   try {
-    const end = (JSON.parse(metadata || "{}") as { end?: unknown }).end
-    return typeof end === "string" ? (END_TEXT[end] ?? null) : null
+    const m: unknown = JSON.parse(metadata)
+    return m && typeof m === "object" ? m : null
   } catch {
     return null
   }
+}
+
+function endReasonText(metadata: string | undefined): string | null {
+  const end = readRoomMetadata(metadata)?.end
+  return typeof end === "string" ? (END_TEXT[end] ?? null) : null
 }
 
 /** A short soft tone pair on the gesture-unlocked context: quiet and brief, so the worker's VAD does not take it for speech. */
@@ -137,6 +145,11 @@ function tokenError(status: number, body: string): CallError {
  * LiveKit's fallback timers fire; going straight to TURN/TLS connects at once.
  * `?relay=1` / `?relay=0` overrides the iOS default.
  */
+/** Walkie sound cues are on unless the link says `?cues=0`. */
+function cuesEnabled(): boolean {
+  return new URLSearchParams(location.search).get("cues") !== "0"
+}
+
 function forceRelay(): boolean {
   const param = new URLSearchParams(location.search).get("relay")
   if (param !== null) return param === "1"
@@ -166,17 +179,16 @@ const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
  * segments. A turn with no caption at all (nothing transcribed) gets a line of its own. A second
  * status for a turn (a timed-out one the agent got after all) replaces the mark on its line.
  */
-function applyTurn(lines: Line[], covered: Set<number>, status: TurnStatus, newLine: () => Line, shown?: number): Line[] {
+function applyTurn(lines: Line[], covered: Set<number>, status: TurnStatus, newLine: () => Line, turn: number): Line[] {
   const mark: TurnMark = status.reason ? { status: status.status, reason: status.reason } : { status: status.status }
-  const marked = shown === undefined ? undefined : lines.find((l) => l.from === "user" && l.turn === shown)
+  const marked = lines.find((l) => l.from === "user" && l.turn === turn)
   if (marked) return lines.map((l) => (l.id === marked.id ? { ...l, mark } : l))
-  const turn = shown === undefined ? {} : { turn: shown }
   const open = lines.filter((l) => l.from === "user" && !covered.has(l.id))
   const said = norm(status.text ?? "")
   const target =
     (said ? [...open].reverse().find((l) => norm(l.text) !== "" && said.includes(norm(l.text))) : undefined) ?? open[open.length - 1]
   if (!target) {
-    const line = { ...newLine(), text: status.text?.trim() ?? "", mark, ...turn }
+    const line = { ...newLine(), text: status.text?.trim() ?? "", mark, turn }
     covered.add(line.id)
     return [...lines, line]
   }
@@ -184,7 +196,7 @@ function applyTurn(lines: Line[], covered: Set<number>, status: TurnStatus, newL
     covered.add(l.id)
     if (l.id === target.id) break
   }
-  return lines.map((l) => (l.id === target.id ? { ...l, mark, ...turn } : l))
+  return lines.map((l) => (l.id === target.id ? { ...l, mark, turn } : l))
 }
 
 export function useLiveKitCall(token: string, fallbackAgent = "your agent"): VoiceCall {
@@ -253,7 +265,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const labelledReplies = useRef(new Set<number>())
   const limit = useRef<{ ms: number; kind: string } | null>(null)
   const joinedAt = useRef(0)
-  const cuesOn = useRef(typeof location === "undefined" || new URLSearchParams(location.search).get("cues") !== "0")
+  const cuesOn = useRef(cuesEnabled())
 
   const setPhase = useCallback((p: Phase) => {
     phaseRef.current = p
@@ -378,14 +390,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     const onReconnected = () => setReconnecting(false)
     // The host rewrites the room metadata when a mid-call /voice moves the call (WalkieRoomMetadata).
     const onMetadata = (metadata: string | undefined) => {
-      if (!active.current || !metadata) return
-      try {
-        const m = JSON.parse(metadata) as { chat?: unknown }
-        if (typeof m.chat === "string") setChat(m.chat || null)
-        else if (m.chat === null) setChat(null)
-      } catch {
-        /* not ours */
-      }
+      const m = readRoomMetadata(metadata)
+      if (!active.current || !m) return
+      if (typeof m.chat === "string") setChat(m.chat || null)
+      else if (m.chat === null) setChat(null)
     }
     // The host names why it ended the call on the room before it deletes it.
     const onLeft = (p: RemoteParticipant) => {
@@ -594,6 +602,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       if (session.chat) setChat(session.chat)
       if (typeof session.silenceMs === "number" && session.silenceMs > 0) setSilenceMs(session.silenceMs)
       if (session.limit && typeof session.limit.ms === "number") limit.current = session.limit
+      // The host's clock (and the limit) starts once the worker sees the caller in, after this.
+      joinedAt.current = Date.now()
 
       try {
         await room.connect(session.url, session.token, forceRelay() ? { autoSubscribe: true, rtcConfig: { iceTransportPolicy: "relay" } } : { autoSubscribe: true })
@@ -606,8 +616,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       const pub = await room.localParticipant.publishTrack(track, { source: Track.Source.Microphone, dtx: false, red: false })
       if (cancelled()) return
       localSid.current = pub.trackSid
-      // The host's clock (and the limit) starts once the worker sees the caller in, a little after this.
-      joinedAt.current = Date.now()
       setJoined(true)
       agentTimer.current = window.setTimeout(() => {
         agentTimer.current = null
@@ -650,11 +658,13 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
 
   // The worker's countdown to sending the caller's turn; never shown over the agent's speech.
   const pending = agentAttributes?.[PENDING_ATTR] ?? ""
-  const sendCue = useMemo<SendCue | null>(() => {
+  // Parsed apart from the phase, so a phase change mid-countdown keeps the same cue and its animation.
+  const pendingCue = useMemo<SendCue | null>(() => {
     const [, elapsed, silence] = pending.split(":").map(Number)
-    if (!live || phase === "talking" || !(silence > 0) || !(elapsed >= 0)) return null
+    if (!(silence > 0) || !(elapsed >= 0)) return null
     return { id: pending, from: Math.min(1, elapsed / silence), ms: Math.max(0, silence - elapsed) }
-  }, [pending, live, phase])
+  }, [pending])
+  const sendCue = live && phase !== "talking" ? pendingCue : null
   const sendCueRef = useRef(sendCue)
   sendCueRef.current = sendCue
 
@@ -668,7 +678,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     const endsAt = joinedAt.current + l.ms
     const show = () => {
       const left = endsAt - Date.now()
-      setLimitNote(`Call ends in ${left >= 55_000 ? "1 min" : "under a minute"} · ${LIMIT_NAME[l.kind] ?? "call limit"}.`)
+      setLimitNote(`Call ends in ${left >= LIMIT_WARN_LATE_MS ? "1 min" : "under a minute"} · ${LIMIT_NAME[l.kind] ?? "call limit"}.`)
     }
     const wait = endsAt - LIMIT_WARN_MS - Date.now()
     if (wait <= 0) return show()
@@ -684,8 +694,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (was !== "talking" || phase !== "listening" || currentReply.current?.more) return
     const group = currentReply.current?.group
     const t = window.setTimeout(() => {
-      // A next line announced meanwhile is about to play: still the agent's turn.
-      if (phaseRef.current === "listening" && !sendCueRef.current && currentReply.current?.group === group) playCue("turn")
+      // A next line announced (before the phase change or since) and not spoken yet: still the agent's turn.
+      const next = currentReply.current
+      const unspoken = !!next && !labelledReplies.current.has(next.group)
+      if (phaseRef.current === "listening" && !sendCueRef.current && next?.group === group && !unspoken) playCue("turn")
     }, TURN_CUE_DELAY_MS)
     return () => window.clearTimeout(t)
   }, [phase, playCue])

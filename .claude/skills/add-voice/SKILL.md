@@ -639,6 +639,17 @@ from `LIVEKIT_API_SECRET`, so the worker needs that key too. Then, walkie-talkie
   "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
   "sent" means the agent's session has the turn; a 504 is "timeout", 429
   "rate_limited", any other refusal "rejected".
+- Right before each line it speaks, the worker sends one JSON message on
+  `nanoclaw.walkie.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
+  true, "notice"?: true, "more"?: true}`. `turn` is the caller turn the agent
+  message answers (from the host event's `turn`, the utterance id the 202 named;
+  a turn the worker cannot map gets no label), `unprompted` a message answering
+  no turn of this call, `notice` the worker's own lost-turn or failure line, and
+  `more` that another line is already queued behind it.
+- While a finished stretch of caller speech waits out `WALKIE_SILENCE_MS`, the
+  worker sets the attribute `nanoclaw.walkie.pending` to
+  `"<n>:<elapsedMs>:<silenceMs>"` and clears it when the caller speaks again,
+  the turn is sent, dropped or overdue, or the agent speaks.
 
 Turns are capped at 8 KB of text, 20 a minute and 3 still being routed per call. A reply for a call
 that already ended is not spoken. If the worker does not open its event stream
@@ -721,7 +732,17 @@ confirmed - check the chat before repeating", since the host may still have it.
 The header names the chat the call talks in when it starts (an unnamed direct
 chat shows as `<channel> DM`); after a mid-call `/voice` the host writes the new
 chat's label into the room metadata (`{"chat": ...}`, `WalkieRoomMetadata`) once
-the next turn moves the call, and the header follows it. Microphone capture runs
+the next turn moves the call, and the header follows it. Before it deletes the
+room the host also writes why the call ended (`"end"`: `limit_duration`,
+`limit_daily`, `newer_call`, `revoked`, `shutdown` or `worker_gone`; a hangup
+names none), and the page says so. The token reply carries `silenceMs` and
+`limit: {ms, kind: "duration" | "daily"}`: the listening hint names the pause
+that sends a turn, a thin line under the readout fills while
+`nanoclaw.walkie.pending` counts down, caller lines show "turn n" and the first
+caption of a reply "re: turn n" (or "unprompted"), and a minute before the
+limit the hint says the call is about to end. Soft Web Audio tones mark a sent
+turn and, once the agent is done, the caller's turn; `?cues=0` turns them off.
+Microphone capture runs
 with echo cancellation, noise suppression and auto gain; DTX is off because the
 worker times turns by the silence it hears. On iOS Safari the call must be
 started with the Call button (audio unlocks on that tap) and joins relay-only
