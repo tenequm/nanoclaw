@@ -45,7 +45,7 @@ describe('voice call page (generated)', () => {
 
   it('was generated from the ui/ sources in this tree', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
-    const uiRoot = path.resolve(here, '../../.claude/skills/add-voice/ui');
+    const uiRoot = path.resolve(here, '../../.claude/skills/add-voice-mode/ui');
     if (!existsSync(path.join(uiRoot, 'source-files.json'))) return; // Installed payloads do not need the maintainer build tree.
     const inputs = JSON.parse(readFileSync(path.join(uiRoot, 'source-files.json'), 'utf8')) as string[];
     const files = ['source-files.json', ...inputs].sort();

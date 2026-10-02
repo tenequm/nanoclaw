@@ -1,14 +1,14 @@
 ---
-name: add-voice
-description: Add voice calls with a NanoClaw agent - talk to your real agent from a browser. Each spoken turn is transcribed and sent to the agent as a message, and the agent's own reply is spoken back, over a self-hosted LiveKit server with Gemini transcription and speech. Use when the user wants to talk to an agent by voice. Browser client only today.
+name: add-voice-mode
+description: Add voice mode to a NanoClaw agent - talk to your real agent from a browser. Each spoken turn is transcribed and sent to the agent as a message, and the agent's own reply is spoken back, over a self-hosted LiveKit server with Gemini transcription and speech. Use when the user wants to talk to an agent by voice. Browser client only today.
 ---
 
-# Add voice calls
+# Add voice mode
 
-Adds browser voice calls with your NanoClaw agent. The caller talks to the
-real agent, not to a voice model standing in for it: each spoken turn is
-transcribed and handed to the agent as a message, and every reply the agent
-sends is read out. The call runs over WebRTC through a self-hosted
+Voice mode: talk to your real agent. Adds browser voice calls with your
+NanoClaw agent. The caller talks to the real agent, not to a voice model
+standing in for it: each spoken turn is transcribed and handed to the agent as
+a message, and every reply the agent sends is read out. The call runs over WebRTC through a self-hosted
 [LiveKit](https://docs.livekit.io/) server; a LiveKit Agents worker next to
 the host cuts the caller's audio into turns, transcribes them with Gemini and
 speaks the agent's replies with Gemini TTS. Native adapter: the host owns the
@@ -397,7 +397,7 @@ To uninstall: see [REMOVE.md](REMOVE.md).
 ## The call page
 
 The page callers open is a small React app. Its maintainer sources live at
-`.claude/skills/add-voice/ui/` beside the generated payload (in this fork:
+`.claude/skills/add-voice-mode/ui/` beside the generated payload (in this fork:
 vendored from upstream `feat/voice-payload`, PR #3772, at `324d7445`, with the
 LiveKit call in `ui/src/lib/livekit-call.ts`; MIT, see
 `ui/THIRD_PARTY_NOTICES.md`): Teenage Engineering inspired, one screen beside a
@@ -422,7 +422,7 @@ VOICE_UI={"colorway":"field","presence":"matrix","brand":"Casa line"}
 | `layout`         | `rail` (screen beside keys), `stack`                    | `rail`                                             |
 | `presence`       | `matrix`, `bars`                                        | `matrix`                                           |
 | `brand`          | header name, up to 60 characters                        | `NanoClaw Voice`                                   |
-| `footer`         | footer line; `{agent}` becomes the wired agent's name   | `Walkie-talkie over LiveKit · answers by {agent}` |
+| `footer`         | footer line; `{agent}` becomes the wired agent's name   | `Voice mode · answers by {agent}`                  |
 | `shortcuts`      | print `esc` and `space` on the keys (desktop)           | `true`                                             |
 | `timestamps`     | time into the call on each transcript turn              | `true`                                             |
 | `colorwayPicker` | let callers pick a finish from the page                 | `true`                                             |

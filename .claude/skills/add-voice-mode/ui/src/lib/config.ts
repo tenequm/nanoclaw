@@ -17,7 +17,7 @@ export const DEFAULTS: Required<VoiceUiConfig> = {
   layout: "rail",
   presence: "matrix",
   brand: "NanoClaw Voice",
-  footer: "Walkie-talkie over LiveKit · answers by {agent}",
+  footer: "Voice mode · answers by {agent}",
   shortcuts: true,
   timestamps: true,
   colorwayPicker: true,
