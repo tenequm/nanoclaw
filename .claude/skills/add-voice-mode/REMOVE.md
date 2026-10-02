@@ -1,6 +1,6 @@
-# Remove voice calls
+# Remove voice mode
 
-Reverses `/add-voice`. Every step is idempotent — safe to re-run, and safe
+Reverses `/add-voice-mode`. Every step is idempotent — safe to re-run, and safe
 when only partially installed (skip any step whose target is already absent).
 
 ## 1. Delete the barrel import

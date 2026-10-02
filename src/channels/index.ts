@@ -17,5 +17,5 @@ import './slack.js';
 import './slack-a2a-guard.js';
 import './slack-a2a.js';
 
-// Voice — browser calls with the agent over LiveKit (/add-voice).
+// Voice — browser calls with the agent over LiveKit (/add-voice-mode).
 import './voice.js';

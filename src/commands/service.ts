@@ -567,7 +567,7 @@ export type VoiceLinkFn = (line: MessagingGroup) => string | null;
 
 /** Asks the live voice adapter, the only holder of the link tokens. */
 const liveVoiceLink: VoiceLinkFn = (line) => {
-  // Structural, not voice.ts's VoiceChannelAdapter: core must still build once add-voice is removed.
+  // Structural, not voice.ts's VoiceChannelAdapter: core must still build once add-voice-mode is removed.
   const adapter = getChannelAdapterExact(line.instance ?? line.channel_type) as
     | { callLink?(platformId: string): string | null }
     | undefined;
