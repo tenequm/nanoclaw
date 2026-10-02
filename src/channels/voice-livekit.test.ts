@@ -100,13 +100,13 @@ function startFakeGoogle(): Promise<{ apiBase: string; close(): Promise<void> }>
   });
 }
 
-/** The agent's chats, the /voice binding, who may use the agent, and what was posted into the chats. */
+/** The agent's chats, the /voice binding, who administers the agent, and what was posted into the chats. */
 function fakeMirror(
   groups: Array<Partial<MessagingGroup>>,
-  options: { bound?: Omit<BoundCallChat, 'group'> & { group: Partial<MessagingGroup> }; members?: string[] } = {},
+  options: { bound?: Omit<BoundCallChat, 'group'> & { group: Partial<MessagingGroup> }; admins?: string[] } = {},
 ) {
   const posts: Array<{ instance: string; platformId: string; threadId?: string | null; text: string }> = [];
-  const state = { bound: options.bound, members: new Set(options.members ?? []) };
+  const state = { bound: options.bound, admins: new Set(options.admins ?? []) };
   const api: MirrorApi = {
     groupsFor: async () => groups.map((g, i) => mg({ id: `mg-${i}`, ...g })),
     adapter: (instance) => ({
@@ -117,7 +117,7 @@ function fakeMirror(
       },
     }),
     boundChat: async () => (state.bound ? { ...state.bound, group: mg(state.bound.group) } : null),
-    canAccess: async (userId) => state.members.has(userId),
+    isAdmin: async (userId) => state.admins.has(userId),
   };
   return { api, posts, state };
 }
@@ -801,7 +801,11 @@ describe('livekit call talking in the agent chat', () => {
     delivered('telegram:100', 'Booked for **eight**.');
     delivered('telegram:200', 'Another chat.');
     delivered('telegram:100', 'Another agent.', null, 'ag-other');
-    liveKitChatTyping({ channelType: 'telegram', platformId: 'telegram:100', threadId: null });
+    // Thinking is this agent's typing in the call chat; another agent's typing there is not.
+    liveKitChatTyping({ channelType: 'telegram', platformId: 'telegram:100', threadId: null }, 'ag-other');
+    await settle();
+    expect(worker.events.some((e) => e.type === 'thinking')).toBe(false);
+    liveKitChatTyping({ channelType: 'telegram', platformId: 'telegram:100', threadId: null }, 'ag-andy');
     await worker.waitFor((e) => e.type === 'thinking');
     await worker.waitFor((e) => e.type === 'reply');
     expect(worker.events.filter((e) => e.type === 'reply')).toEqual([{ type: 'reply', text: 'Booked for **eight**.' }]);
@@ -811,19 +815,19 @@ describe('livekit call talking in the agent chat', () => {
     worker.close();
   });
 
-  it('talks in the chat /voice was run in, as whoever ran it, ahead of the default rule', async () => {
+  it('talks in the chat /voice was run in, ahead of the default rule, still as the line caller', async () => {
     const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
     const { posts } = await start([{ platform_id: 'telegram:100' }, topic], 'telegram', {
-      bound: { group: topic, threadId: 'th-1', senderId: 'telegram:42', senderName: 'Dana' },
-      members: ['telegram:42'],
+      bound: { group: topic, threadId: 'th-1', ownerId: 'telegram:42' },
+      admins: ['telegram:42'],
     });
     const { worker } = await startCall(h);
     await worker.utter('hello');
     expect(h.events[0]).toMatchObject({ platformId: 'telegram:-300:7', threadId: 'th-1', message: { isGroup: true } });
-    expect(JSON.parse(h.events[0].message.content)).toMatchObject({ sender: 'Dana', senderId: 'telegram:42' });
+    expect(JSON.parse(h.events[0].message.content)).toMatchObject({ sender: 'Ethan', senderId: LINE });
     await vi.waitFor(() =>
       expect(posts).toEqual([
-        { instance: 'telegram', platformId: 'telegram:-300:7', threadId: 'th-1', text: '🎙 Dana: hello' },
+        { instance: 'telegram', platformId: 'telegram:-300:7', threadId: 'th-1', text: '🎙 Ethan: hello' },
       ]),
     );
     delivered('telegram:-300:7', 'In the thread.', 'th-1');
@@ -843,27 +847,52 @@ describe('livekit call talking in the agent chat', () => {
     worker.close();
   });
 
-  it('ignores a /voice chat that is no longer the agent, or whose sender lost access', async () => {
+  it('ignores a /voice chat that is no longer the agent, or whose owner is no longer its admin', async () => {
     const gone = { id: 'mg-gone', platform_id: 'telegram:-9' };
-    const fake = await start([{ platform_id: 'telegram:100' }], 'telegram', {
-      bound: { group: gone, threadId: null, senderId: 'telegram:42', senderName: 'Dana' },
-      members: ['telegram:42'],
+    const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
+    const fake = await start([{ platform_id: 'telegram:100' }, topic], 'telegram', {
+      bound: { group: gone, threadId: null, ownerId: 'telegram:42' },
+      admins: ['telegram:42'],
     });
     const { worker } = await startCall(h);
     await worker.utter('one');
     expect(h.events[0].platformId).toBe('telegram:100');
-    fake.state.bound = {
-      group: { id: 'mg-0', platform_id: 'telegram:100' },
-      threadId: null,
-      senderId: 'telegram:42',
-      senderName: 'Dana',
-    };
-    fake.state.members.clear();
+    fake.state.bound = { group: topic, threadId: null, ownerId: 'telegram:42' };
+    fake.state.admins.clear();
     await worker.utter('two');
-    expect(JSON.parse(h.events[1].message.content)).toMatchObject({ sender: 'Ethan', senderId: LINE });
-    fake.state.members.add('telegram:42');
+    expect(h.events[1].platformId).toBe('telegram:100');
+    fake.state.admins.add('telegram:42');
     await worker.utter('three');
-    expect(JSON.parse(h.events[2].message.content)).toMatchObject({ sender: 'Dana', senderId: 'telegram:42' });
+    expect(h.events[2].platformId).toBe('telegram:-300:7');
+    for (const event of h.events) {
+      expect(JSON.parse(event.message.content)).toMatchObject({ sender: 'Ethan', senderId: LINE });
+    }
+    worker.close();
+  });
+
+  it('still speaks the answer in flight in the chat a mid-call /voice left, until that chat goes quiet for a turn', async () => {
+    const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
+    const fake = await start([{ platform_id: 'telegram:100' }, topic], 'telegram', { admins: ['telegram:42'] });
+    const { worker } = await startCall(h);
+    await worker.utter('one');
+    expect(h.events[0].platformId).toBe('telegram:100');
+    fake.state.bound = { group: topic, threadId: null, ownerId: 'telegram:42' };
+    await worker.utter('two');
+    expect(h.events[1].platformId).toBe('telegram:-300:7');
+    delivered('telegram:100', 'Answer to one.');
+    delivered('telegram:-300:7', 'Answer to two.');
+    await worker.utter('three');
+    // A whole turn without anything from the agent in the old chat: it is no longer spoken.
+    await worker.utter('four');
+    delivered('telegram:100', 'Unrelated, later.');
+    delivered('telegram:-300:7', 'Answer to four.');
+    await worker.waitFor((e) => e.type === 'reply' && e.text === 'Answer to four.');
+    await settle();
+    expect(worker.events.filter((e) => e.type === 'reply').map((e) => (e as { text: string }).text)).toEqual([
+      'Answer to one.',
+      'Answer to two.',
+      'Answer to four.',
+    ]);
     worker.close();
   });
 

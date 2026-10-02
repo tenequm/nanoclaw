@@ -12,7 +12,7 @@ binding handles them at the adapter.
 | `/model` | Admin only | Bare `/model` opens a model picker (active model checkmarked). `/model <alias-or-id>` switches directly. |
 | `/config` | Admin only | Bare `/config` opens the config menu (Model / Effort / Compact window / Activation / Restart). `/config set <field> <value>` writes one field. |
 | `/restart` | Admin only | Restarts the agent's running container(s) immediately. |
-| `/voice` | Admin only | Replies with the agent's LiveKit walkie-talkie link and makes this chat (and its thread or topic) where the line's calls talk, until `/voice` is run in another chat of the agent. See the add-voice skill. |
+| `/voice` | Admin only, line owner | Replies with the sender's own LiveKit walkie-talkie link for the agent and makes this chat (and its thread or topic) where that line's calls talk, until `/voice` is run in another chat of the agent. The operator names each line's owner with `ncl voice-lines set`. See the add-voice skill. |
 
 ## Slack: the `!` prefix
 
@@ -63,10 +63,12 @@ explicit alert, never silently ignored.
 For `/status`, the member gate uses `canAccessAgentGroup`. Unknown senders (no
 `users` row) are dropped silently, mirroring how the router treats their normal
 messages; known non-members get an explicit refusal. `/voice` uses the same
-tri-state with an admin check on top (`voiceAccess`): it hands out the voice
-line's call link, which is a credential. Its reply goes to the invoking chat
-only, straight through the chat's adapter (never a session's outbound DB, so the
-agent never sees the link), and the host logs never carry it.
+tri-state with an admin check on top (`voiceAccess`): it hands out a voice
+line's call link, which is a credential, so it acts only on the lines whose
+owner (`voice_lines.owner_user_id`) is the sender. Its reply goes to the
+invoking chat only, straight through the chat's adapter (never a session's
+outbound DB), with link previews and unfurls off; a Telegram reply quoting it
+reaches the agent with the link redacted, and the host logs never carry it.
 
 The pressing user is authoritative on a menu tap: the handler re-checks the
 tapper's privilege, NOT the original requester's. Someone who opened a picker
@@ -274,9 +276,9 @@ sorted order.
 - **Fallback:** `/status` shows all wired agents' statuses in one reply. Writes
   (`/model`, `/config`, `/restart`) refuse politely with a hint to run the
   command in the agent's own topic or use `ncl` from the host.
-- **`/voice`** (both paths) acts like `/status`: every agent of the chat that
-  the sender administers and that has a voice line gets the chat as its call
-  chat, and the reply lists each agent's link.
+- **`/voice`** (both paths) acts like `/status`: for every agent of the chat
+  that the sender administers, the sender's own voice line(s) of it get the
+  chat as their call chat, and the reply lists each agent's link.
 
 ## Troubleshooting
 

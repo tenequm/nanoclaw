@@ -28,19 +28,21 @@
  */
 import fs from 'fs';
 
-import { getChannelAdapterExact } from '../channels/channel-registry.js';
+import { resolveThreadPolicy } from '../channels/channel-defaults.js';
+import { getChannelAdapter, getChannelAdapterExact, getChannelDefaults } from '../channels/channel-registry.js';
 import type { VoiceChannelAdapter } from '../channels/voice.js';
 import { restartAgentGroupContainers } from '../container-restart.js';
 import { isContainerRunning, killContainer } from '../container-runner.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../db/container-configs.js';
 import {
+  getMessagingGroup,
   getMessagingGroupAgentByPair,
   getMessagingGroupAgents,
   getMessagingGroupsByAgentGroup,
   updateMessagingGroupAgent,
 } from '../db/messaging-groups.js';
-import { setVoiceCallTarget } from '../db/voice-call-targets.js';
+import { getVoiceLine, setVoiceLineTarget } from '../db/voice-lines.js';
 import {
   findSessionByAgentGroup,
   findSessionForAgent,
@@ -51,7 +53,7 @@ import { log } from '../log.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { countDueMessages, openInboundDb } from '../mailbox/sqlite/session-db.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
-import type { ContainerConfigRow, EngageMode, MessagingGroup, Session } from '../types.js';
+import type { ContainerConfigRow, EngageMode, MessagingGroup, MessagingGroupAgent, Session } from '../types.js';
 import { voiceAccess } from './auth.js';
 import { readTranscriptStats } from './transcript.js';
 import {
@@ -572,12 +574,9 @@ const liveVoiceLink: VoiceLinkFn = (line) => {
   return adapter?.walkieLink?.(line.platform_id) ?? null;
 };
 
-/** The agent's voice lines: its `voice` messaging groups. */
+/** The agent's voice lines: its `voice` messaging groups (a chat is wired to an agent at most once). */
 async function voiceLinesOf(agentGroupId: string): Promise<MessagingGroup[]> {
-  const lines = (await getMessagingGroupsByAgentGroup(agentGroupId)).filter(
-    (g) => g.channel_type === 'voice' && !g.denied_at,
-  );
-  return [...new Map(lines.map((g) => [g.id, g])).values()];
+  return (await getMessagingGroupsByAgentGroup(agentGroupId)).filter((g) => g.channel_type === 'voice' && !g.denied_at);
 }
 
 export async function hasVoiceLine(agentGroupId: string): Promise<boolean> {
@@ -585,11 +584,30 @@ export async function hasVoiceLine(agentGroupId: string): Promise<boolean> {
 }
 
 /**
- * Make this chat the call chat of the agent's voice line(s) and return their
- * walkie-talkie links. Admin only. The call chat is where the line's LiveKit
- * calls talk (src/channels/voice-livekit.ts), as `actorUserId`, until /voice is
- * run in another chat. The links are secrets: callers send them to this chat
- * only and never log them.
+ * The thread a call should talk in for this wiring: none when the wiring keeps
+ * no threads (its turns would land in the chat's shared session anyway), else
+ * the one /voice was run in.
+ */
+function callChatThread(wiring: MessagingGroupAgent, mg: MessagingGroup, threadId: string | null): string | null {
+  if (threadId === null) return null;
+  const adapter = getChannelAdapter(mg.instance ?? mg.channel_type);
+  const threads = resolveThreadPolicy(
+    wiring.threads ?? null,
+    getChannelDefaults(mg.instance ?? mg.channel_type, mg.channel_type),
+    mg.is_group === 1,
+    adapter?.supportsThreads === true,
+  );
+  return threads ? threadId : null;
+}
+
+/**
+ * Make this chat the call chat of the agent's voice line(s) that belong to
+ * `actorUserId`, and return their walkie-talkie links. Admin only. A line
+ * belongs to the user its voice_lines row names as owner; another person's
+ * line is never bound or linked here. The call chat is where the line's LiveKit
+ * calls talk (src/channels/voice-livekit.ts), as the line's own caller, until
+ * /voice is run in another chat. The links are secrets: callers send them to
+ * this chat only and never log them.
  */
 export async function setVoiceTarget(
   agentGroupId: string,
@@ -600,32 +618,42 @@ export async function setVoiceTarget(
   const ag = await getAgentGroup(agentGroupId);
   if (!ag) return fail('unknown-agent');
   if (!(await hasAdminPrivilege(actorUserId, agentGroupId))) return fail('unauthorized');
-  if (!(await getMessagingGroupAgentByPair(chat.messagingGroupId, agentGroupId))) return fail('unknown-agent');
+  const wiring = await getMessagingGroupAgentByPair(chat.messagingGroupId, agentGroupId);
+  const mg = wiring && (await getMessagingGroup(chat.messagingGroupId));
+  if (!wiring || !mg) return fail('unknown-agent');
 
-  const lines = await voiceLinesOf(agentGroupId);
-  if (lines.length === 0) return fail('no-voice-line');
-  const linked = lines.flatMap((line) => {
+  const owned: MessagingGroup[] = [];
+  for (const line of await voiceLinesOf(agentGroupId)) {
+    if ((await getVoiceLine(line.id))?.owner_user_id === actorUserId) owned.push(line);
+  }
+  if (owned.length === 0) return fail('no-voice-line');
+  const linked = owned.flatMap((line) => {
     const link = linkFor(line);
     return link ? [{ line, link }] : [];
   });
   if (linked.length === 0) return fail('voice-unavailable');
 
-  for (const { line } of linked) {
-    await setVoiceCallTarget({
-      line_messaging_group_id: line.id,
-      target_messaging_group_id: chat.messagingGroupId,
-      thread_id: chat.threadId,
-      sender_user_id: actorUserId,
+  const threadId = callChatThread(wiring, mg, chat.threadId);
+  const bound: typeof linked = [];
+  for (const entry of linked) {
+    const ok = await setVoiceLineTarget({
+      lineMessagingGroupId: entry.line.id,
+      ownerUserId: actorUserId,
+      targetMessagingGroupId: chat.messagingGroupId,
+      threadId,
     });
+    // The owner changed since the read above: that line is no longer theirs to hand out.
+    if (ok) bound.push(entry);
   }
+  if (bound.length === 0) return fail('no-voice-line');
   log.info('Voice call chat set via chat command', {
     agentGroupId,
-    lines: linked.map(({ line }) => line.platform_id),
+    lines: bound.map(({ line }) => line.platform_id),
     messagingGroupId: chat.messagingGroupId,
-    threadId: chat.threadId,
+    threadId,
     actorUserId,
   });
-  return { ok: true, view: { agentName: ag.name, agentGroupId, links: linked.map(({ link }) => link) } };
+  return { ok: true, view: { agentName: ag.name, agentGroupId, links: bound.map(({ link }) => link) } };
 }
 
 /**

@@ -28,7 +28,7 @@ import { migration024 } from './024-host-coordination.js';
 import { migration025 } from './025-container-config-speed.js';
 import { migration025 as migration025TelegramCommandScopes } from './025-telegram-command-scopes.js';
 import { migration026 as migration026AutoCompactWindow } from './026-auto-compact-window.js';
-import { migration027 as migration027VoiceCallTargets } from './027-voice-call-targets.js';
+import { migration027 as migration027VoiceLines } from './027-voice-lines.js';
 
 interface MigrationBase {
   version: number;
@@ -98,7 +98,7 @@ export const migrations: Migration[] = [
   migration025,
   migration025TelegramCommandScopes,
   migration026AutoCompactWindow,
-  migration027VoiceCallTargets,
+  migration027VoiceLines,
 ];
 
 /**

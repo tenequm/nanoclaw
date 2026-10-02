@@ -478,8 +478,18 @@ async function handleRestart(ctx: HostCommandContext, targets: TargetResolution)
 
 // --- /voice (admin-only) ---
 
+/**
+ * The chat /voice binds. Slack gives every top-level message a thread of its own
+ * (its ts); a top-level /voice means the chat itself, not a thread under the command.
+ */
+export function voiceChatContext(ctx: HostCommandContext): StatusChatContext {
+  const { threadId, platformId, message } = ctx.event;
+  const topLevel = threadId !== null && threadId === `${platformId}:${message.id}`;
+  return { messagingGroupId: ctx.mg.id, threadId: topLevel ? null : threadId };
+}
+
 async function handleVoice(ctx: HostCommandContext, targets: TargetResolution): Promise<void> {
-  const text = voiceCommandReply(await runVoiceCommand(targets, chatContext(ctx), ctx.userId), MD_FMT);
+  const text = voiceCommandReply(await runVoiceCommand(targets, voiceChatContext(ctx), ctx.userId), MD_FMT);
   if (text === null) {
     log.info('/voice from unknown sender or unwired chat dropped', { messagingGroupId: ctx.mg.id, userId: ctx.userId });
     return;

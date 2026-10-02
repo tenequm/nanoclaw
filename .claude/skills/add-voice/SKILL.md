@@ -570,27 +570,46 @@ disconnects caller and worker.
 
 **The call chat and `/voice`.** A LiveKit call talks in one of the agent's
 chats, so the agent answers with that chat's context and the chat shows both
-sides. Send `/voice` in a chat wired to the agent (owner or admin only; on Slack
-`!voice`): the host replies there with the line's walkie-talkie link and makes
-that chat (and its thread or forum topic) the line's call chat until `/voice` is
-run in another chat of the same agent. The link itself never changes and the
-page works without the command; `/voice` only says where calls talk. In a chat
-with several agents it does this for every agent there the sender administers.
-The binding is stored per line in `voice_call_targets` (migration 027, applied
-at host start), with the user who ran `/voice`.
+sides. A line's caller is its own `voice:<line id>` user, linked to no other
+account, so the operator first names the line's owner, the person's user on a
+chat platform (`ncl users list` shows the ids; operator only, from the host):
+
+```bash
+ncl voice-lines set --line voice:<line id> --owner telegram:<their id>
+```
+
+The owner then sends `/voice` in a chat wired to the agent (owner or admin of
+the agent too; on Slack `!voice`): the host replies there with the link of
+their own line(s) of that agent, never anyone else's, and makes that chat (and
+its thread or forum topic; on Slack a top-level `!voice` means the channel
+itself) the line's call chat until they run `/voice` in another chat of the
+same agent. Someone who owns no line of the agent is told so, and nothing
+changes. The link itself never changes and the page works without the command;
+`/voice` only says where calls talk. In a chat with several agents it does this
+for every agent there the sender administers. The reply goes out with link
+previews off (Telegram) and unfurls off (Slack), and a reply quoting it does not
+pass the link to the agent. Owner and binding are stored per line in
+`voice_lines` (migration 027, applied at host start); a new owner starts with no
+call chat.
 
 During a call each turn is routed into the call chat's session through the
-normal inbound path, as a message from the user who ran `/voice` (only the
-line's agent gets it, whoever else is wired there; session mode and sender
-policy apply as for a typed message), and the bot posts `🎙 <name>: <transcript>`
-into the chat. The agent answers in the chat as usual; while the call is live,
-each message it delivers to that chat (and thread) is also spoken, and its typing
-there shows as thinking. A `/voice` chat that is no longer wired to the agent,
-or whose sender lost access, is ignored (the host logs it).
+normal inbound path, as a message from the line's own caller. It is addressed to
+the line's agent alone, whoever else is wired there, and engages it whatever
+the chat's trigger; session mode, access and sender policy apply as for a typed
+message. The bot posts `🎙 <name>: <transcript>` into the chat. The agent answers
+in the chat as usual; while the call is live, each message it delivers to that
+chat (and thread) is also spoken, and its typing there shows as thinking. After
+a mid-call `/voice` the call also keeps speaking the chat it left, until a whole
+turn passes with no message or typing from the agent there. A `/voice` chat that
+is no longer wired to the agent, or whose owner is no longer an admin of it, is
+ignored (the host logs it).
 
 Before any `/voice` the default is the `WALKIE_MIRROR` rule: the one live (not
 denied, not detached) chat of that channel type wired to the agent, or the one
-direct chat among several, with the line's own caller as the sender. With none,
+direct chat among several, with the line's own caller as the sender. That chat
+then converses: the caller's turns go into its session and every agent message
+to it is spoken during the call, even when it is not the caller's own chat, so
+run `/voice` where calls should talk when that matters. With none,
 with several and no single direct chat, or with `WALKIE_MIRROR=off`, the call
 talks on the voice line itself as before (replies come back by their
 `livekit:` reply id, nothing is posted) and the host logs why once. The

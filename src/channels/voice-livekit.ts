@@ -25,13 +25,14 @@
  *  - `POST agent/ended`      the worker's session is over.
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
- * line: the chat `/voice` was last run in (voice_call_targets), else the one
- * chat of the WALKIE_MIRROR channel type wired to the agent (pickMirrorTarget).
- * Each turn is routed into that chat's session through the normal inbound path
- * as a message from the person who owns the line, the transcript is posted into
- * the chat, and the agent answers there as it always does. While the call is
- * live, every message the agent delivers to that chat is also spoken, and its
- * typing there is the worker's `thinking`. With no call chat (WALKIE_MIRROR off,
+ * line: the chat the line's owner last ran `/voice` in (voice_lines), else the
+ * one chat of the WALKIE_MIRROR channel type wired to the agent
+ * (pickMirrorTarget). Each turn is routed into that chat's session through the
+ * normal inbound path as a message from the line's own caller, addressed to
+ * the line's agent only; the transcript is posted into the chat, and the agent
+ * answers there as it always does. While the call is live, every message the
+ * agent delivers to that chat is also spoken, and its typing there is the
+ * worker's `thinking`. With no call chat (WALKIE_MIRROR off,
  * or no single chat to pick) the call talks on the voice line itself, and the
  * agent's replies come back through deliver() by their `livekit:` reply id.
  */
@@ -61,11 +62,10 @@ import {
   getMessagingGroupByPlatform,
   getMessagingGroupsByAgentGroup,
 } from '../db/messaging-groups.js';
-import { getVoiceCallTarget } from '../db/voice-call-targets.js';
+import { getVoiceLine } from '../db/voice-lines.js';
 import { registerPostDeliveryHook } from '../delivery.js';
 import { log } from '../log.js';
-import { canAccessAgentGroup } from '../modules/permissions/access.js';
-import { getUser } from '../modules/permissions/db/users.js';
+import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { registerTypingObserver } from '../modules/typing/index.js';
 import type { MessagingGroup } from '../types.js';
 
@@ -119,9 +119,8 @@ export interface LiveKitServerApi {
 export interface BoundCallChat {
   group: MessagingGroup;
   threadId: string | null;
-  senderId: string;
-  /** The sender's display name, when the users row has one. */
-  senderName: string | null;
+  /** The line's owner, the only one who can set the binding. */
+  ownerId: string;
 }
 
 /** The agent's chats a call can talk in; the central DB and live adapters by default, fakes in tests. */
@@ -130,7 +129,7 @@ export interface MirrorApi {
   adapter(key: string): Pick<ChannelAdapter, 'deliver'> | undefined;
   /** The chat `/voice` last pointed the line at, if any. */
   boundChat(lineId: string): Promise<BoundCallChat | null>;
-  canAccess(userId: string, agentGroupId: string): Promise<boolean>;
+  isAdmin(userId: string, agentGroupId: string): Promise<boolean>;
 }
 
 /** A chat address as delivery and typing see it. */
@@ -140,11 +139,10 @@ export interface ChatAddress {
   threadId: string | null;
 }
 
-/** The chat a call talks in, and who the caller is there. */
+/** The chat a call talks in. The caller there is always the line's own caller. */
 export interface CallChat {
   group: MessagingGroup;
   threadId: string | null;
-  sender: { id: string; name: string };
   /** Set by `/voice`, or picked by the WALKIE_MIRROR rule. */
   source: 'voice-command' | 'default';
 }
@@ -189,9 +187,10 @@ export interface LiveKitHost {
   chargeUsage(call: { platformId: string; startedAt: number }): void;
   /** Newest wins across engines: end any other engine's call on the line. */
   endOtherCalls(platformId: string, reason: string): void;
-  onInbound(platformId: string, message: InboundMessage): Promise<void>;
+  /** Hand a turn to the router; fire and forget, so a routing failure is logged there, not reported here. */
+  onInbound(platformId: string, message: InboundMessage): void;
   /** Route a turn into the call chat, through the same inbound path the chat's own messages take. */
-  onInboundEvent(event: InboundEvent): Promise<void>;
+  onInboundEvent(event: InboundEvent): void;
   isRunning(): boolean;
   now(): number;
   maxCallDurationMs: number;
@@ -222,6 +221,14 @@ interface LiveKitCall {
   sent: number;
   /** Where the call talks; null while it talks on the voice line. Refreshed on join and every turn. */
   chat: CallChat | null;
+  /** Orders chat refreshes: only the latest one started may set `chat`. */
+  chatRefreshes: number;
+  /**
+   * The chat the call talked in before `/voice` moved it mid-call, still spoken
+   * so an answer in flight there is heard. Dropped at a turn once a whole turn
+   * went by with no agent message or typing there.
+   */
+  previousChat: { chat: CallChat; active: boolean } | null;
   cleanup?: Promise<void>;
 }
 
@@ -249,8 +256,8 @@ export interface LiveKitVoice {
   setTyping(platformId: string): Promise<void>;
   /** An agent message reached a chat: speak it on the live call that talks there. */
   chatMessage(chat: ChatAddress, agentGroupId: string, text: string): void;
-  /** The agent is working in a chat: tell the live call that talks there. */
-  chatTyping(chat: ChatAddress): void;
+  /** The agent is working in a chat: tell its live call that talks there. */
+  chatTyping(chat: ChatAddress, agentGroupId: string): void;
   /** The running call on a line, for the shared daily budget. */
   activeCall(platformId: string): { platformId: string; startedAt: number } | undefined;
   endLine(platformId: string, reason: string): void;
@@ -282,18 +289,12 @@ const defaultMirrorApi: MirrorApi = {
   adapter: (key) => getChannelAdapterExact(key),
   async boundChat(lineId) {
     const line = await getMessagingGroupByPlatform('voice', lineId);
-    const row = line && (await getVoiceCallTarget(line.id));
-    const group = row && (await getMessagingGroup(row.target_messaging_group_id));
+    const row = line && (await getVoiceLine(line.id));
+    const group = row?.target_messaging_group_id && (await getMessagingGroup(row.target_messaging_group_id));
     if (!row || !group) return null;
-    const user = await getUser(row.sender_user_id);
-    return {
-      group,
-      threadId: row.thread_id,
-      senderId: row.sender_user_id,
-      senderName: user?.display_name?.trim() || null,
-    };
+    return { group, threadId: row.thread_id, ownerId: row.owner_user_id };
   },
-  canAccess: async (userId, agentGroupId) => (await canAccessAgentGroup(userId, agentGroupId)).allowed,
+  isAdmin: (userId, agentGroupId) => hasAdminPrivilege(userId, agentGroupId),
 };
 
 /** A call talks in `chat`, and `to` is that chat: the same thread, or the chat itself when delivery drops the thread. */
@@ -337,13 +338,13 @@ export function liveKitChatDelivered(
   for (const engine of engines) engine.chatMessage(chat, agentGroupId, text);
 }
 
-/** Typing tap: the agent works in a chat; a live call talking there hears it is thinking. */
-export function liveKitChatTyping(chat: ChatAddress): void {
-  for (const engine of engines) engine.chatTyping(chat);
+/** Typing tap: the agent works in a chat; its live call talking there hears it is thinking. */
+export function liveKitChatTyping(chat: ChatAddress, agentGroupId: string): void {
+  for (const engine of engines) engine.chatTyping(chat, agentGroupId);
 }
 
 registerPostDeliveryHook((msg, session) => liveKitChatDelivered(msg, session.agent_group_id));
-registerTypingObserver((channelType, platformId, threadId) => liveKitChatTyping({ channelType, platformId, threadId }));
+registerTypingObserver(({ agentGroupId, ...chat }) => liveKitChatTyping(chat, agentGroupId));
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
 
@@ -424,7 +425,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     log.info(`livekit-voice: ${note}`, { platformId: call.platformId, callId: call.callId, ...fields });
   };
 
-  /** The `/voice` chat if it is still the agent's and its sender may still use the agent, else the WALKIE_MIRROR pick. */
+  /** The `/voice` chat if it is still the agent's and the line's owner still administers the agent, else the WALKIE_MIRROR pick. */
   const resolveChat = async (call: LiveKitCall): Promise<CallChat | null> => {
     const { line } = call;
     const groups = await mirrorApi.groupsFor(line.agentGroupId);
@@ -436,18 +437,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         noteChat(call, 'binding', 'the /voice chat is no longer wired to the agent; using the default', {
           chat: g.id,
         });
-      } else if (!(await mirrorApi.canAccess(bound.senderId, line.agentGroupId))) {
-        noteChat(call, 'binding', 'whoever ran /voice can no longer use the agent; using the default', {
+      } else if (!(await mirrorApi.isAdmin(bound.ownerId, line.agentGroupId))) {
+        noteChat(call, 'binding', 'the line owner is no longer an admin of the agent; using the default', {
           chat: g.id,
         });
       } else {
         noteChat(call, 'binding', null);
-        return {
-          group: g,
-          threadId: bound.threadId,
-          sender: { id: bound.senderId, name: bound.senderName ?? line.caller.name },
-          source: 'voice-command',
-        };
+        return { group: g, threadId: bound.threadId, source: 'voice-command' };
       }
     }
     if (!mirrorChannel) {
@@ -459,25 +455,53 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       noteChat(call, 'choice', `call talks on the voice line: no /voice chat and ${pick.skip}`);
       return null;
     }
-    // The line's own caller: a known member of the agent by construction (resolveVoiceLine).
-    return { group: pick.target, threadId: null, sender: line.caller, source: 'default' };
+    return { group: pick.target, threadId: null, source: 'default' };
   };
 
-  const refreshChat = async (call: LiveKitCall): Promise<CallChat | null> => {
+  const sameChat = (a: CallChat | null, b: CallChat | null): boolean =>
+    a?.group.id === b?.group.id && a?.threadId === b?.threadId;
+
+  /**
+   * Re-resolve where the call talks; `turn` marks a caller turn, where a chat
+   * left behind by a mid-call `/voice` ages out once it went quiet.
+   */
+  const refreshChat = async (call: LiveKitCall, turn: boolean): Promise<CallChat | null> => {
+    const refresh = ++call.chatRefreshes;
+    let chat: CallChat | null;
     try {
-      call.chat = await resolveChat(call);
+      chat = await resolveChat(call);
     } catch (err) {
       log.warn('livekit-voice: could not resolve the call chat; the call talks on the voice line', {
         platformId: call.platformId,
         err,
       });
-      call.chat = null;
+      chat = null;
     }
-    if (call.chat) {
-      const { group, threadId, source } = call.chat;
+    // A slower, older refresh (the join's, say) must not undo a newer one.
+    if (refresh !== call.chatRefreshes) return chat;
+    if (turn && call.previousChat) {
+      if (call.previousChat.active) call.previousChat.active = false;
+      else call.previousChat = null;
+    }
+    if (!sameChat(call.chat, chat)) {
+      call.previousChat = call.chat ? { chat: call.chat, active: false } : null;
+      call.chat = chat;
+    }
+    if (chat) {
+      const { group, threadId, source } = chat;
       noteChat(call, 'choice', 'call talks in the agent chat', { chat: group.id, threadId, source });
     }
-    return call.chat;
+    return chat;
+  };
+
+  /** The chat the call talks in, or the one it just left, that `to` addresses; marks the left one as still in use. */
+  const callChatAt = (call: LiveKitCall, to: ChatAddress): boolean => {
+    if (call.chat && isCallChat(call.chat, to)) return true;
+    if (call.previousChat && isCallChat(call.previousChat.chat, to)) {
+      call.previousChat.active = true;
+      return true;
+    }
+    return false;
   };
 
   const postToChat = async (chat: CallChat, text: string): Promise<void> => {
@@ -608,6 +632,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       utterances: 0,
       sent: 0,
       chat: null,
+      chatRefreshes: 0,
+      previousChat: null,
     };
     calls.set(platformId, call);
     call.joinTimer = setTimeout(() => endCall(call, 'caller never joined'), joinTimeoutMs);
@@ -701,7 +727,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     log.info('livekit-voice: caller joined', { platformId: call.platformId, callId: call.callId });
     // Known before the first turn, so the agent's messages to that chat are spoken from the start.
-    void refreshChat(call);
+    void refreshChat(call, false);
     reply(res, 200, JSON.stringify({ ok: true }), JSON_HEADERS);
   };
 
@@ -743,9 +769,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     call.utteranceStarts.push(t);
     if (!(await checkAccess(call))) return reply(res, 403, 'Caller access denied');
-    const chat = await refreshChat(call);
+    if (!host.isRunning()) return reply(res, 503, 'The voice channel is shutting down');
+    const chat = await refreshChat(call, true);
     const utteranceId = String(++call.utterances);
-    const sender = chat?.sender ?? call.line.caller;
+    // Always the line's own caller, wherever the call talks: the line is that person's, not whoever ran /voice.
+    const sender = call.line.caller;
     const message: InboundMessage = {
       id: liveKitUtteranceMessageId(call.callId, utteranceId),
       kind: 'chat',
@@ -759,25 +787,20 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       isMention: true,
       isGroup: chat ? chat.group.is_group !== 0 : false,
     };
-    try {
-      if (chat) {
-        await host.onInboundEvent({
-          channelType: chat.group.channel_type,
-          instance: chat.group.instance ?? chat.group.channel_type,
-          platformId: chat.group.platform_id,
-          threadId: chat.threadId,
-          // Only the line's agent hears its call, whoever else is wired to the chat.
-          agentGroupId: call.line.agentGroupId,
-          message: { ...message, content: JSON.stringify(message.content) },
-        });
-      } else {
-        await host.onInbound(call.platformId, message);
-      }
-    } catch (err) {
-      log.error('livekit-voice: onInbound threw', { platformId: call.platformId, err });
-      return reply(res, 500, 'Could not reach the agent');
+    if (chat) {
+      host.onInboundEvent({
+        channelType: chat.group.channel_type,
+        instance: chat.group.instance ?? chat.group.channel_type,
+        platformId: chat.group.platform_id,
+        threadId: chat.threadId,
+        // Addressed to the line's agent only, whoever else is wired to the chat and whatever its trigger.
+        agentGroupId: call.line.agentGroupId,
+        message: { ...message, content: JSON.stringify(message.content) },
+      });
+      mirror(call.platformId, chat, `🎙 ${sender.name}: ${text}`);
+    } else {
+      host.onInbound(call.platformId, message);
     }
-    if (chat) mirror(call.platformId, chat, `🎙 ${sender.name}: ${text}`);
     reply(res, 202, JSON.stringify({ id: utteranceId }), JSON_HEADERS);
   };
 
@@ -889,16 +912,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
     chatMessage(chat, agentGroupId, text) {
       for (const call of calls.values()) {
-        if (call.state !== 'live' || call.ended || !call.chat || call.line.agentGroupId !== agentGroupId) continue;
-        if (isCallChat(call.chat, chat)) push(call, { type: 'reply', text });
+        if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
+        if (callChatAt(call, chat)) push(call, { type: 'reply', text });
       }
     },
 
-    chatTyping(chat) {
+    chatTyping(chat, agentGroupId) {
       for (const call of calls.values()) {
-        if (call.state === 'live' && !call.ended && call.chat && isCallChat(call.chat, chat)) {
-          push(call, { type: 'thinking' });
-        }
+        if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
+        if (callChatAt(call, chat)) push(call, { type: 'thinking' });
       }
     },
 

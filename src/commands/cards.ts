@@ -225,7 +225,7 @@ export function failureMessage(failure: CommandFailure): string {
       return `❌ Invalid ${field} value "${value}".${hint}`;
     }
     case 'no-voice-line':
-      return 'This agent has no voice line. Set one up with the add-voice skill.';
+      return 'You have no voice line for this agent. The operator names a line owner with `ncl voice-lines set`.';
     case 'voice-unavailable':
       return 'Walkie-talkie calls are off on this host (LiveKit is not configured).';
     default:
