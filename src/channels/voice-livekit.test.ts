@@ -147,8 +147,8 @@ interface Harness {
   inbound: InboundMessage[];
   clock: { now: number };
   access: { enabled: boolean };
-  /** What the router does with the next turns: store them, drop them, never finish, or throw. */
-  routing: { mode: 'store' | 'drop' | 'hang' | 'throw' };
+  /** What the router does with the next turns: store them, drop them, hang until `hung` is called, or throw. */
+  routing: { mode: 'store' | 'drop' | 'hang' | 'throw'; hung: Array<() => void> };
   lk: FakeLiveKit;
   stop(): Promise<void>;
 }
@@ -164,7 +164,7 @@ async function startHarness(
   const events: InboundEvent[] = [];
   const clock = { now: Date.UTC(2026, 9, 2, 1, 0, 0) };
   const access = { enabled: true };
-  const routing: Harness['routing'] = { mode: 'store' };
+  const routing: Harness['routing'] = { mode: 'store', hung: [] };
   const lk = fakeLiveKit();
   const adapter = createGptLiveAdapter({
     apiKey: 'sk-test-key',
@@ -207,7 +207,7 @@ async function startHarness(
     routeInboundEvent: async ({ onStored, ...event }) => {
       if (event.channelType !== 'voice') events.push(event);
       else inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
-      if (routing.mode === 'hang') return new Promise<void>(() => {});
+      if (routing.mode === 'hang') return new Promise<void>((resolve) => routing.hung.push(resolve));
       if (routing.mode === 'throw') throw new Error('router exploded');
       if (routing.mode === 'store') onStored?.();
     },
@@ -584,7 +584,11 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const retried = worker.post('utterance', { text: 't1', turnKey: 'k1' });
     expect((await Promise.all([...pending, retried])).map((r) => r.status)).toEqual([504, 504, 504, 504]);
     h.routing.mode = 'store';
-    expect((await worker.post('utterance', { text: 't5' })).status).toBe(202);
+    // A 504 does not free the slot: the router is still working on those turns.
+    expect((await worker.post('utterance', { text: 't5' })).status).toBe(429);
+    for (const finish of h.routing.hung) finish();
+    await settle();
+    expect((await worker.post('utterance', { text: 't6' })).status).toBe(202);
     expect(h.inbound).toHaveLength(4);
     worker.close();
   });
