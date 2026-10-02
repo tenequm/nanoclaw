@@ -766,7 +766,13 @@ async function run(c, room, resumed) {
     if (p && p.isAgent && STATES[state]) setStatus('Live: ' + names.agent + ' is ' + STATES[state] + '.');
   });
   room.on(LK.RoomEvent.Disconnected, () => hangup(c, 'Call ended.'));
-  await room.connect(s.url, s.token, { autoSubscribe: true });
+  // iOS Safari binds WebRTC UDP to the Wi-Fi interface, so UDP to a VPN (Tailscale) address
+  // stalls until LiveKit's fallback timers fire; going straight to TURN/TLS (TCP) connects at once.
+  // ?relay=1 / ?relay=0 overrides the iOS default for testing.
+  const relayParam = new URLSearchParams(location.search).get('relay');
+  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const forceRelay = relayParam === null ? isIOS : relayParam === '1';
+  await room.connect(s.url, s.token, forceRelay ? { autoSubscribe: true, rtcConfig: { iceTransportPolicy: 'relay' } } : { autoSubscribe: true });
   if (c.ended) return;
   // DTX off: Gemini 3.8 only ends a turn while audio keeps arriving, silence included.
   const pub = await room.localParticipant.publishTrack(c.mic, { source: LK.Track.Source.Microphone, dtx: false, red: false });
