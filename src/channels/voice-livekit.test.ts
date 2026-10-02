@@ -17,10 +17,10 @@ import {
   pickMirrorTarget,
   spokenText,
   type BoundCallChat,
-  walkieMessageText,
-  WALKIE_CHAT_REPLY_NOTE,
-  WALKIE_LANGUAGE_NOTE,
-  WALKIE_REPLY_NOTE,
+  turnMessageText,
+  CALL_CHAT_REPLY_NOTE,
+  CALL_LANGUAGE_NOTE,
+  CALL_REPLY_NOTE,
   type LiveKitServerApi,
   type LiveKitVoiceConfig,
   type MirrorApi,
@@ -31,12 +31,12 @@ import {
   liveKitCallSecret,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
-  WALKIE_END_REASONS,
-  WALKIE_PENDING_ATTRIBUTE,
-  WALKIE_REPLY_TOPIC,
-  WALKIE_THINKING_ATTRIBUTE,
-  WALKIE_TURN_TOPIC,
-  WALKIE_UPDATING_ATTRIBUTE,
+  CALL_END_REASONS,
+  CALL_PENDING_ATTRIBUTE,
+  CALL_REPLY_TOPIC,
+  CALL_THINKING_ATTRIBUTE,
+  CALL_TURN_TOPIC,
+  CALL_UPDATING_ATTRIBUTE,
 } from './voice-livekit-protocol.js';
 import { stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './voice-call-page.js';
@@ -362,13 +362,13 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(html).toBe(callPageHtml());
     // The page keeps its own copy of the worker's wire names (it cannot import the protocol module).
     for (const name of [
-      WALKIE_THINKING_ATTRIBUTE,
-      WALKIE_UPDATING_ATTRIBUTE,
-      WALKIE_TURN_TOPIC,
-      WALKIE_PENDING_ATTRIBUTE,
-      WALKIE_REPLY_TOPIC,
+      CALL_THINKING_ATTRIBUTE,
+      CALL_UPDATING_ATTRIBUTE,
+      CALL_TURN_TOPIC,
+      CALL_PENDING_ATTRIBUTE,
+      CALL_REPLY_TOPIC,
       // The end reasons it names, as keys of its own table.
-      ...WALKIE_END_REASONS,
+      ...CALL_END_REASONS,
       '"no-agent"',
       '"updating"',
     ]) {
@@ -514,7 +514,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const msg = h.inbound[0];
     expect(msg.id).toBe(`livekit:${worker.meta.callId}:${id}`);
     expect(msg.content).toMatchObject({
-      text: walkieMessageText('Що в мене завтра в календарі?'),
+      text: turnMessageText('Що в мене завтра в календарі?'),
       sender: 'Ethan',
       senderId: LINE,
       livekit: { callId: worker.meta.callId, utteranceId: id },
@@ -760,7 +760,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     h = await startHarness(
       {},
       {
-        walkie: { sttFallbackModel: 'off', ttsFallbackModel: ' ', ttsModel: 'gemini-3.8-flash-lite-tts' },
+        speech: { sttFallbackModel: 'off', ttsFallbackModel: ' ', ttsModel: 'gemini-3.8-flash-lite-tts' },
       },
     );
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
@@ -1023,7 +1023,7 @@ describe('livekit call talking in the agent chat', () => {
       message: { id: `livekit:${worker.meta.callId}:${id}`, kind: 'chat', isMention: true, isGroup: false },
     });
     expect(JSON.parse(event.message.content)).toEqual({
-      text: walkieMessageText('Book a table for two', WALKIE_CHAT_REPLY_NOTE),
+      text: turnMessageText('Book a table for two', CALL_CHAT_REPLY_NOTE),
       sender: 'Ethan',
       senderId: LINE,
       livekit: { callId: worker.meta.callId, utteranceId: id },
@@ -1253,7 +1253,7 @@ describe('livekit call talking in the agent chat', () => {
     h = await startHarness();
   });
 
-  it('keeps the call on the voice line with WALKIE_MIRROR=off and no /voice chat', async () => {
+  it('keeps the call on the voice line with VOICE_MIRROR=off and no /voice chat', async () => {
     const { posts } = await start([{}], 'off');
     const { call, worker } = await startCall(h);
     expect(call.chat).toBeUndefined();
@@ -1304,25 +1304,25 @@ describe('spoken text of a delivered message', () => {
   });
 });
 
-describe('walkie message text', () => {
+describe('turn message text', () => {
   it('marks the transcript as spoken and says how to answer', () => {
-    expect(walkieMessageText('Привіт')).toBe(`<voice source="livekit">Привіт</voice>\n${WALKIE_REPLY_NOTE}`);
-    expect(WALKIE_REPLY_NOTE).toContain('separate written message');
+    expect(turnMessageText('Привіт')).toBe(`<voice source="livekit">Привіт</voice>\n${CALL_REPLY_NOTE}`);
+    expect(CALL_REPLY_NOTE).toContain('separate written message');
   });
 
   it('warns a call in a chat that everything sent there is spoken', () => {
-    expect(WALKIE_CHAT_REPLY_NOTE).toContain('every message you send to this chat is read aloud');
-    expect(WALKIE_CHAT_REPLY_NOTE).not.toContain('separate written message');
+    expect(CALL_CHAT_REPLY_NOTE).toContain('every message you send to this chat is read aloud');
+    expect(CALL_CHAT_REPLY_NOTE).not.toContain('separate written message');
   });
 
   it('keeps the transcript as heard and tells the agent Russian spelling is Ukrainian, never to answer in Russian', () => {
-    expect(walkieMessageText('Привет.')).toContain('<voice source="livekit">Привет.</voice>');
-    for (const note of [WALKIE_REPLY_NOTE, WALKIE_CHAT_REPLY_NOTE]) {
-      expect(note).toContain(WALKIE_LANGUAGE_NOTE);
+    expect(turnMessageText('Привет.')).toContain('<voice source="livekit">Привет.</voice>');
+    for (const note of [CALL_REPLY_NOTE, CALL_CHAT_REPLY_NOTE]) {
+      expect(note).toContain(CALL_LANGUAGE_NOTE);
     }
-    expect(WALKIE_LANGUAGE_NOTE).toContain('looks Russian is Ukrainian misspelled by speech recognition');
-    expect(WALKIE_LANGUAGE_NOTE).toContain('answer in Ukrainian (in English if the caller spoke English)');
-    expect(WALKIE_LANGUAGE_NOTE).toContain('never in Russian');
+    expect(CALL_LANGUAGE_NOTE).toContain('looks Russian is Ukrainian misspelled by speech recognition');
+    expect(CALL_LANGUAGE_NOTE).toContain('answer in Ukrainian (in English if the caller spoke English)');
+    expect(CALL_LANGUAGE_NOTE).toContain('never in Russian');
   });
 });
 

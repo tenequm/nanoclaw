@@ -954,7 +954,7 @@
 .voice-page[data-skin="te"] aside.rail .key-mute { width: 100%; }
 .btn-mute { min-width: 124px; }
 
-/* ---------- walkie UX pass: delivery notice, audio unlock key, wrapping, readable screen states ---------- */
+/* ---------- call UX: delivery notice, audio unlock key, wrapping, readable screen states ---------- */
 .transcript-box p, .transcript-box .speaker { overflow-wrap: anywhere; }
 /* A lost turn keeps its full contrast in the history; it is the line the caller has to act on. */
 .transcript-box .is-history.has-lost, .voice-page[data-skin="te"] .console .is-history.has-lost { opacity: 1; }
@@ -987,7 +987,7 @@
 .voice-page[data-skin="te"] .key-mute .label.wrap { white-space: normal; text-align: center; }
 .voice-page[data-skin="te"] .key-mute .label .led { flex: none; }
 
-/* Walkie cues: the send countdown along the readout's rule, and what a caption line answers. */
+/* Call cues: the send countdown along the readout's rule, and what a caption line answers. */
 .voice-page[data-skin="te"] .console .turn-ref { color: #8a877f; }
 .send-cue { display: block; width: 120px; height: 2px; margin: 6px auto 0; overflow: hidden; border-radius: 1px; background: var(--border); }
 .send-cue i { display: block; height: 100%; background: var(--te-orange, var(--teal)); transform-origin: left center; }

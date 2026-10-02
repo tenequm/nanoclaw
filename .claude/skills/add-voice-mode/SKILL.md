@@ -457,15 +457,15 @@ to the worker with each call:
 
 | Key | Default | What |
 | --- | --- | --- |
-| `WALKIE_STT_MODEL` | `gemini-3.5-transcribe-live` | Streams the caller's speech over the Gemini Live API while they talk, verbatim, with the language hints `uk-UA` and `en-US` and the line's vocabulary as custom vocabulary. |
-| `WALKIE_STT_FALLBACK_MODEL` | `gemini-3.5-transcribe` | Unary transcription that takes over while the streaming model fails (LiveKit's STT `FallbackAdapter`). Its quota is small (on some tiers 10 requests a minute and 100 a day), so it sends nothing while the streaming model works, every request it makes is logged at warn, and the call goes back to the streaming model at the next pause once that recovers, or tries it again every minute. `off` for none (an empty value in `.env` reads as unset). |
-| `WALKIE_TTS_MODEL` | `gemini-3.8-flash-tts` | Speaks the agent's replies. |
-| `WALKIE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Speaks when the main model fails (LiveKit's TTS `FallbackAdapter`, one retry each; a failed model is tried again every 30 seconds); `off` for none. |
-| `WALKIE_TTS_VOICE` | `Alnilam` | Prebuilt Gemini voice, for both TTS models. |
-| `WALKIE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
-| `WALKIE_MIRROR` | `telegram` | Channel type of the default call chat, used until `/voice` picks one (see below); `off` keeps calls on the voice line until then. |
+| `VOICE_STT_MODEL` | `gemini-3.5-transcribe-live` | Streams the caller's speech over the Gemini Live API while they talk, verbatim, with the language hints `uk-UA` and `en-US` and the line's vocabulary as custom vocabulary. |
+| `VOICE_STT_FALLBACK_MODEL` | `gemini-3.5-transcribe` | Unary transcription that takes over while the streaming model fails (LiveKit's STT `FallbackAdapter`). Its quota is small (on some tiers 10 requests a minute and 100 a day), so it sends nothing while the streaming model works, every request it makes is logged at warn, and the call goes back to the streaming model at the next pause once that recovers, or tries it again every minute. `off` for none (an empty value in `.env` reads as unset). |
+| `VOICE_TTS_MODEL` | `gemini-3.8-flash-tts` | Speaks the agent's replies. |
+| `VOICE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Speaks when the main model fails (LiveKit's TTS `FallbackAdapter`, one retry each; a failed model is tried again every 30 seconds); `off` for none. |
+| `VOICE_TTS_VOICE` | `Alnilam` | Prebuilt Gemini voice, for both TTS models. |
+| `VOICE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
+| `VOICE_MIRROR` | `telegram` | Channel type of the default call chat, used until `/voice` picks one (see below); `off` keeps calls on the voice line until then. |
 
-The worker itself reads `WALKIE_MAX_SPOKEN_CHARS` (default `800`; `0` for no
+The worker itself reads `VOICE_MAX_SPOKEN_CHARS` (default `800`; `0` for no
 cap): an agent message longer than that, after markdown and links are stripped,
 is spoken up to its last sentence end within the cap when that end is past 60%
 of the cap (else up to its last whole word), followed by "Решта - у чаті." or
@@ -475,7 +475,7 @@ that talks on the voice line, with no chat to hold the rest, closes with
 spoken during the call, replies and proactive ones alike, and the captions show
 what was spoken; the full text stays in the chat.
 
-It also reads `WALKIE_RECORDINGS_DAYS` (default `0`, off): with a
+It also reads `VOICE_RECORDINGS_DAYS` (default `0`, off): with a
 number of days, it saves every caller turn it hears as a 16 kHz mono WAV plus a
 JSON sidecar (call and line id, agent, turn number, start and end, speech
 length, the transcription model that heard it, the transcript or why there was
@@ -496,8 +496,8 @@ server; a call the host does not answer ends at once with the URL in the log).
 Each idle job process loads the Silero models before a call reaches it. On
 SIGTERM it takes no new calls and gives running ones 60 seconds before closing
 them, so a restart cuts a longer call short. The job metadata is versioned
-(`v: 3`). A worker that gets a call of another version joins only to set its
-`nanoclaw.walkie.updating` attribute, so the caller's page says "The voice service
+(`v: 4`). A worker that gets a call of another version joins only to set its
+`nanoclaw.voice.updating` attribute, so the caller's page says "The voice service
 is updating. Try again in a minute.", and leaves; the page says the same when
 no worker joins within 25 seconds (worker down, or an older one that turns such
 calls away), and the host logs why the call ended.
@@ -518,7 +518,7 @@ TTS, captions and the agent state are the framework's. Then:
 
 - Silero VAD follows the caller's speech (VAD-only turn detection: LiveKit's
   turn detector models have no Ukrainian). A turn survives pauses and ends
-  after `WALKIE_SILENCE_MS` of silence.
+  after `VOICE_SILENCE_MS` of silence.
 - The transcription streams while the caller talks, so the text is ready when
   the turn ends; the page shows it as it comes. The worker posts the turn's
   text to `/webhook/voice/livekit/agent/utterance`, and the host hands it to the
@@ -532,11 +532,11 @@ TTS, captions and the agent state are the framework's. Then:
   messages; with no call chat, every agent message for the line) goes to the
   worker complete over the host's event stream, and the agent's typing there is
   the worker's "thinking". The worker strips markdown, URLs and tags and speaks
-  it uninterruptibly (`session.say`), cut at `WALKIE_MAX_SPOKEN_CHARS` (above),
+  it uninterruptibly (`session.say`), cut at `VOICE_MAX_SPOKEN_CHARS` (above),
   in sentence batches of up to 400
   characters, two requested at a time: the one playing and the next.
   Replies never overlap, and a reply waits for a caller who is mid-turn (at most
-  `WALKIE_SILENCE_MS` plus ten seconds, then it takes the channel).
+  `VOICE_SILENCE_MS` plus ten seconds, then it takes the channel).
 - While the agent's audio plays, the caller is not transcribed (no barge-in).
   While the agent works the page says it is thinking; the caller can keep
   talking, and each finished turn goes to the agent as a follow-up.
@@ -561,19 +561,19 @@ TTS, captions and the agent state are the framework's. Then:
   one "Too many turns - give it a moment." (and their Ukrainian lines). When a
   reply cannot be synthesized, a line saying so. All of these also show as captions. The
   worker also sends one JSON message per caller turn (noise is not reported) on the text stream topic
-  `nanoclaw.walkie.turn`: `{"turn": n, "status": "sent" | "lost", "reason"?:
+  `nanoclaw.voice.turn`: `{"turn": n, "status": "sent" | "lost", "reason"?:
   "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
   "sent" means the agent's session has the turn; a 504 is "timeout", 429
   "rate_limited", any other refusal "rejected".
 - Right before each line it speaks, the worker sends one JSON message on
-  `nanoclaw.walkie.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
+  `nanoclaw.voice.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
   true, "notice"?: true, "more"?: true}`. `turn` is the caller turn the agent
   message answers (from the host event's `turn`, the utterance id the 202 named;
   a turn the worker cannot map gets no label), `unprompted` a message answering
   no turn of this call, `notice` the worker's own lost-turn or failure line, and
   `more` that another line is already queued behind it.
-- While a finished stretch of caller speech waits out `WALKIE_SILENCE_MS`, the
-  worker sets the attribute `nanoclaw.walkie.pending` to
+- While a finished stretch of caller speech waits out `VOICE_SILENCE_MS`, the
+  worker sets the attribute `nanoclaw.voice.pending` to
   `"<n>:<elapsedMs>:<silenceMs>"` and clears it when the caller speaks again,
   the turn is sent, dropped or overdue, or the agent speaks.
 
@@ -632,35 +632,35 @@ turn passes with no message or typing from the agent there. A `/voice` chat that
 is no longer wired to the agent, or none of whose owner accounts is still an
 admin of it, is ignored (the host logs it).
 
-Before any `/voice` the default is the `WALKIE_MIRROR` rule: the one live (not
+Before any `/voice` the default is the `VOICE_MIRROR` rule: the one live (not
 denied, not detached) chat of that channel type wired to the agent, or the one
 direct chat among several, with the line's own caller as the sender. That chat
 then converses: the caller's turns go into its session and every agent message
 to it is spoken during the call, even when it is not the caller's own chat, so
 run `/voice` where calls should talk when that matters. With none,
-with several and no single direct chat, or with `WALKIE_MIRROR=off`, the call
+with several and no single direct chat, or with `VOICE_MIRROR=off`, the call
 talks on the voice line itself (replies come back by their `livekit:` reply
 id, nothing is posted) and the host logs why once.
 
 The page's readout follows the worker: Listening, `<agent>` is working (with
-"you can keep talking" and a local wait clock) while `nanoclaw.walkie.thinking`
+"you can keep talking" and a local wait clock) while `nanoclaw.voice.thinking`
 is set, and `<agent>` is speaking (speech is ignored until the reply finishes;
 the mute key says "not listening during reply"); captions come from
 `lk.transcription` (the caller's interim text shows live), and each caller turn
-gets a small sent / not-sent mark from the worker's `nanoclaw.walkie.turn`
+gets a small sent / not-sent mark from the worker's `nanoclaw.voice.turn`
 stream. A lost turn also stays as a notice above the transcript until a later
 turn is sent; a `timeout` reads "delivery not confirmed - check the chat before
 repeating", since the host may still have it. The header names the chat the
 call talks in when it starts (an unnamed direct chat shows as `<channel> DM`);
 after a mid-call `/voice` the host writes the new chat's label into the room
-metadata (`{"chat": ...}`, `WalkieRoomMetadata`) once the next turn moves the
+metadata (`{"chat": ...}`, `CallRoomMetadata`) once the next turn moves the
 call, and the header follows it. Before it deletes the room the host also
 writes why the call ended (`"end"`: `limit_duration`, `limit_daily`,
 `newer_call`, `revoked`, `shutdown`, `worker_restart` (the worker shut down, as
 in a deploy) or `worker_gone`; a hangup names none), and the page says so. The
 token reply carries `silenceMs` and `limit: {ms, kind: "duration" | "daily"}`:
 the listening hint names the pause that sends a turn, a thin line under the
-readout fills while `nanoclaw.walkie.pending` counts down, caller lines show
+readout fills while `nanoclaw.voice.pending` counts down, caller lines show
 "turn n" and the first caption of a reply "re: turn n" (or "unprompted"), and a
 minute before the limit the hint says the call is about to end. Soft Web Audio
 tones mark a sent turn and, once the agent is done, the caller's turn;

@@ -176,10 +176,10 @@ describe('extractReplyContext keeps voice call links out of the agent', () => {
   });
 
   it('redacts the short /voice links too', () => {
-    const text = 'walkie https://host.example/voice?t=0123abcd call https://host.example/voice/call/?t=0123abcd';
+    const text = 'talk https://host.example/voice?t=0123abcd call https://host.example/voice/call/?t=0123abcd';
     const reply = { message_id: 9, text, from: { first_name: 'Bot' } };
     expect(extractReplyContext({ message_id: 10, reply_to_message: reply } as unknown as Message)?.text).toBe(
-      'walkie [voice call link] call [voice call link]',
+      'talk [voice call link] call [voice call link]',
     );
   });
 

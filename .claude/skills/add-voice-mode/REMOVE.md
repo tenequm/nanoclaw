@@ -29,7 +29,7 @@ systemctl --user disable --now nanoclaw-voice-worker.service
 rm -f ~/.config/systemd/user/nanoclaw-voice-worker.service && systemctl --user daemon-reload
 ```
 
-Recorded caller turns (`WALKIE_RECORDINGS_DAYS`) are under
+Recorded caller turns (`VOICE_RECORDINGS_DAYS`) are under
 `data/voice-recordings/`; delete that directory if you do not want to keep them.
 
 ## 3. Remove the container skill
@@ -48,7 +48,7 @@ rm -rf container/skills/voice-formatting
 
 ```bash
 sed -i.bak '/^VOICE_[A-Z_]*=/d' .env && rm -f .env.bak
-sed -i.bak '/^LIVEKIT_URL=/d;/^LIVEKIT_WORKER_URL=/d;/^LIVEKIT_API_KEY=/d;/^LIVEKIT_API_SECRET=/d;/^LIVEKIT_AGENT_NAME=/d;/^LIVEKIT_HOST_URL=/d;/^WALKIE_[A-Z_]*=/d' .env && rm -f .env.bak
+sed -i.bak '/^LIVEKIT_URL=/d;/^LIVEKIT_WORKER_URL=/d;/^LIVEKIT_API_KEY=/d;/^LIVEKIT_API_SECRET=/d;/^LIVEKIT_AGENT_NAME=/d;/^LIVEKIT_HOST_URL=/d' .env && rm -f .env.bak
 # only if no other consumer:
 # sed -i.bak '/^GEMINI_API_KEY=/d' .env && rm -f .env.bak
 ```

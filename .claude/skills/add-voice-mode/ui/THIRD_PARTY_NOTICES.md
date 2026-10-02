@@ -30,5 +30,5 @@ The button and avatar primitives come from shadcn/ui (MIT, https://ui.shadcn.com
 Fonts under `src/assets/fonts`: Hanken Grotesk and IBM Plex Mono, SIL Open Font License 1.1.
 
 The page bundles `livekit-client` and `@livekit/components-react` (with `@livekit/components-core`)
-for the LiveKit walkie-talkie transport: Apache License 2.0, Copyright LiveKit, Inc.
+for the LiveKit call transport: Apache License 2.0, Copyright LiveKit, Inc.
 (https://github.com/livekit/client-sdk-js, https://github.com/livekit/components-js).
