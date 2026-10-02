@@ -1,6 +1,6 @@
 /**
  * The walkie-talkie worker: the walkie rules (turn order, reply gating, thinking, failure
- * lines) against fake host and voice, the Gemini retry wrappers against fake streams, the
+ * lines) against fake host and voice, the unary Gemini transcription against a fake fetch, the
  * text helpers, and runCall end to end with a fake room and session. The LiveKit session,
  * Silero and Gemini themselves are not loaded here.
  */
@@ -8,7 +8,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { initializeLogger, tokenize } from '@livekit/agents';
+import {
+  APIConnectionError,
+  APIStatusError,
+  initializeLogger,
+  normalizeLanguage,
+  stt,
+  tokenize,
+  tts,
+  type APIConnectOptions,
+  type VAD,
+} from '@livekit/agents';
 import { AudioFrame } from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -26,18 +36,21 @@ import {
   interactionText,
   languageOf,
   MAX_IDLE_WAIT_MS,
-  MAX_VOCABULARY_TERMS,
   parseJobMetadata,
+  PacedTTS,
   pathSegment,
   pruneRecordings,
   readJobHeader,
   recordingDays,
+  REPLY_CHUNKS,
   runCall,
   speakableText,
-  sttVocabulary,
+  TTS_CONCURRENCY,
+  TtsFallback,
   TURN_SETTLE_MS,
   TurnCapture,
   Walkie,
+  walkieSession,
   writeTurnRecording,
   type CallJob,
   type CallVoice,
@@ -89,11 +102,7 @@ describe('speakable text', () => {
 
   it('reaches the TTS in sentence batches that keep decimals and abbreviations whole', async () => {
     // The tokenizer the session's StreamAdapter batches with.
-    const stream = new tokenize.basic.SentenceTokenizer({
-      minTokenLength: 250,
-      maxTokenLength: 400,
-      firstTokenLength: 20,
-    }).stream();
+    const stream = new tokenize.basic.SentenceTokenizer(REPLY_CHUNKS).stream();
     const text = `Version 2.4 costs 3.50 dollars, e.g. cheap. ${'Then more words follow here. '.repeat(20)}`;
     stream.pushText(text);
     stream.endInput();
@@ -118,20 +127,6 @@ describe('helpers', () => {
     expect(languageOf('Привіт, як справи?')).toBe('uk');
     expect(languageOf('check the grafana logs')).toBe('en');
     expect(languageOf('1, 2, 3')).toBeUndefined();
-  });
-
-  it('dedupes the vocabulary and caps it with a warning', () => {
-    const warn = vi.fn();
-    expect(sttVocabulary([' grafana ', 'Grafana', 'NanoClaw', '', 'nanoclaw'], { warn })).toEqual([
-      'grafana',
-      'NanoClaw',
-    ]);
-    expect(warn).not.toHaveBeenCalled();
-    const many = Array.from({ length: 130 }, (_, i) => `term${i}`);
-    const capped = sttVocabulary(many, { warn });
-    expect(capped).toHaveLength(MAX_VOCABULARY_TERMS);
-    expect(capped[0]).toBe('term0');
-    expect(warn).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -185,7 +180,7 @@ describe('GeminiTranscribeSTT', () => {
     expect(wav.length).toBe(44 + 2 * 3200);
   });
 
-  it('sends nothing while the streaming transcription works, and reports refusals', async () => {
+  it('sends nothing while the streaming transcription works, reports refusals, and backs off when rate limited', async () => {
     const fetchImpl = vi.fn(async () => Response.json({ error: { message: 'quota' } }, { status: 429 }));
     let serve = false;
     const unary = new GeminiTranscribeSTT({
@@ -199,6 +194,8 @@ describe('GeminiTranscribeSTT', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
     serve = true;
     await expect(unary.recognize(audioFrames(100))).rejects.toThrow('Gemini transcribe: 429 quota');
+    expect((await unary.recognize(audioFrames(100))).alternatives?.[0]?.text).toBe('');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it('reads the text parts of an Interactions answer', () => {
@@ -299,8 +296,8 @@ describe('Walkie', () => {
   it("says it didn't catch a turn the host refused or the STT lost, in the caller's language, once", async () => {
     const { deps, said } = fakeWalkieDeps({ send: async () => ({ accepted: false, status: 429 }) });
     const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
-    walkie.onTurnLost('no transcript');
-    walkie.onTurnLost('no transcript');
+    walkie.onTurnLost('empty');
+    walkie.onTurnLost('empty');
     await walkie.idle();
     expect(said).toEqual([FAILURE_LINES.turn.uk]);
     walkie.onTurn('what about the logs');
@@ -336,7 +333,7 @@ describe('Walkie', () => {
     walkie.close();
     walkie.onTurn('hello');
     walkie.onReply('Hi.');
-    walkie.onTurnLost('x');
+    walkie.onTurnLost('empty');
     await walkie.idle();
     expect(sent).toEqual([]);
     expect(said).toEqual([]);
@@ -405,14 +402,17 @@ function fakeJob(meta: Record<string, unknown> = { ...META }) {
   const roomHandlers = new Map<string, (p: { identity: string }) => void>();
   const job = {
     job: { metadata: JSON.stringify(meta) },
-    room: { on: vi.fn((event: string, fn: (p: { identity: string }) => void) => roomHandlers.set(event, fn)) },
+    room: {
+      on: vi.fn((event: string, fn: (p: { identity: string }) => void) => roomHandlers.set(event, fn)),
+      remoteParticipants: new Map([['caller-1', {}]]),
+    },
     connect: vi.fn(async () => undefined),
     waitForParticipant: vi.fn(async () => ({ identity: 'caller-1' })),
     deleteRoom: vi.fn(async () => undefined),
     shutdown: vi.fn(),
     addShutdownCallback: vi.fn(),
   };
-  return { job, ctx: job as unknown as CallJob, roomHandlers };
+  return { job, ctx: job as unknown as CallJob, roomHandlers, room: job.room };
 }
 
 /** The host over fetch: routes by path, an NDJSON event stream fed by `emit`. */
@@ -573,6 +573,25 @@ describe('runCall', () => {
     expect(job.shutdown).toHaveBeenCalledWith('caller never joined');
   });
 
+  it('ends the call when the caller left while it was being set up', async () => {
+    const { job, ctx, room } = fakeJob();
+    room.remoteParticipants.clear();
+    const host = fakeHostFetch();
+    await runCall(ctx, deps(host.fetchImpl, fakeVoice().createVoice));
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('caller left'));
+    expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(true);
+  });
+
+  it('ends a job of this version that is not a whole walkie-talkie call, and tells the host', async () => {
+    const { job, ctx } = fakeJob({ ...META, agentName: '' });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    expect(v.createVoice).not.toHaveBeenCalled();
+    expect(host.calls.at(-1)?.url.endsWith('/ended')).toBe(true);
+    expect(job.deleteRoom).toHaveBeenCalled();
+  });
+
   it('refuses to start without the LiveKit secret it derives the host credential from', async () => {
     const { job, ctx } = fakeJob();
     const host = fakeHostFetch();
@@ -701,18 +720,6 @@ describe('turn recordings', () => {
     expect(capture.take()).toBeUndefined();
   });
 
-  it('turns any input rate into 16 kHz', () => {
-    const capture = new TurnCapture();
-    capture.onSpeaking(true);
-    for (let i = 0; i < 10; i++) {
-      capture.push(new AudioFrame(new Int16Array(480).fill(5), 48_000, 1, 480));
-    }
-    const audio = capture.take()!;
-    // 100 ms in; the resampler holds a little back until more audio comes.
-    expect(audio.pcm.length).toBeGreaterThan(900);
-    expect(audio.pcm.length).toBeLessThanOrEqual(1600);
-  });
-
   it('writes owner-only files under agent and day, and prunes old ones with their empty folders', async () => {
     const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'walkie-rec-')), 'voice-recordings');
     try {
@@ -772,5 +779,185 @@ describe('turn recordings', () => {
     expect(recordingDays('1.5')).toBe(0);
     expect(recordingDays(' 14 ')).toBe(14);
     expect(pathSegment('..')).toBe('unnamed');
+  });
+});
+
+/** A streaming STT whose streams the test fails, feeds or closes. */
+class ControlledSTT extends stt.STT {
+  readonly streams: ControlledStream[] = [];
+  constructor(readonly label: string) {
+    super({ streaming: true, interimResults: false });
+  }
+  protected async _recognize(): Promise<stt.SpeechEvent> {
+    throw new Error('not used');
+  }
+  stream(options?: { connOptions?: APIConnectOptions }): ControlledStream {
+    const stream = new ControlledStream(this, options?.connOptions);
+    this.streams.push(stream);
+    return stream;
+  }
+}
+
+class ControlledStream extends stt.SpeechStream {
+  label = 'controlled';
+  private finish!: (err?: Error) => void;
+  private readonly done = new Promise<Error | undefined>((resolve) => (this.finish = resolve));
+  constructor(owner: stt.STT, connOptions?: APIConnectOptions) {
+    super(owner, undefined, connOptions);
+  }
+  say(text: string): void {
+    this.queue.put({
+      type: stt.SpeechEventType.FINAL_TRANSCRIPT,
+      alternatives: [{ text, language: normalizeLanguage('en'), startTime: 0, endTime: 1, confidence: 1 }],
+    });
+  }
+  fail(): void {
+    this.finish(new APIConnectionError({ message: 'down' }));
+  }
+  protected async run(): Promise<void> {
+    void (async () => {
+      for await (const _ of this.input);
+      this.finish();
+    })();
+    this.abortSignal.addEventListener('abort', () => this.finish(), { once: true });
+    const err = await this.done;
+    if (err) throw err;
+  }
+}
+
+/** A TTS that counts the syntheses running at once; text that `fails` fails for good. */
+class CountingTTS extends tts.TTS {
+  label = 'counting';
+  running = 0;
+  maxRunning = 0;
+  readonly started: string[] = [];
+  constructor(readonly fails: (text: string) => boolean = () => false) {
+    super(24_000, 1, { streaming: false });
+  }
+  synthesize(text: string, connOptions?: APIConnectOptions, abortSignal?: AbortSignal): tts.ChunkedStream {
+    return new CountingStream(this, text, connOptions, abortSignal);
+  }
+  stream(): tts.SynthesizeStream {
+    throw new Error('not used');
+  }
+}
+
+class CountingStream extends tts.ChunkedStream {
+  label = 'counting';
+  constructor(
+    private readonly owner: CountingTTS,
+    text: string,
+    connOptions?: APIConnectOptions,
+    abortSignal?: AbortSignal,
+  ) {
+    super(text, owner, connOptions, abortSignal);
+  }
+  protected async run(): Promise<void> {
+    const owner = this.owner;
+    owner.started.push(this.inputText);
+    owner.maxRunning = Math.max(owner.maxRunning, ++owner.running);
+    try {
+      await new Promise((r) => setTimeout(r, 10));
+      if (owner.fails(this.inputText)) {
+        throw new APIStatusError({ message: 'refused', options: { statusCode: 400, retryable: false } });
+      }
+      const frame = new AudioFrame(new Int16Array(240), 24_000, 1, 240);
+      this.queue.put({ requestId: 'r', segmentId: 's', frame, final: true });
+    } finally {
+      owner.running--;
+    }
+  }
+}
+
+describe('speech and transcription adapters', () => {
+  it('synthesizes at most the playing chunk and the next at once, in order, and passes failures on', async () => {
+    const inner = new CountingTTS((text) => text === 'c');
+    const paced = new PacedTTS(inner, TTS_CONCURRENCY);
+    const errors: unknown[] = [];
+    paced.on('error', (err) => errors.push(err));
+    const streams = ['a', 'b', 'c', 'd', 'e'].map((text) => paced.synthesize(text));
+    const frames = await Promise.all(
+      streams.map(async (s) => {
+        let samples = 0;
+        for await (const audio of s) samples += audio.frame.samplesPerChannel;
+        return samples;
+      }),
+    );
+    expect(inner.started).toEqual(['a', 'b', 'c', 'd', 'e']);
+    expect(inner.maxRunning).toBe(2);
+    expect(frames).toEqual([240, 240, 0, 240, 240]);
+    expect(streams[2].error).toBeDefined();
+    expect(errors).toHaveLength(1);
+  });
+
+  it('keeps one recovery probe going for a speech model that is down, however many requests skip it', async () => {
+    const down = new CountingTTS(() => true);
+    const adapter = new TtsFallback({
+      ttsInstances: [down, new CountingTTS()],
+      maxRetryPerTTS: 0,
+      recoveryDelayMs: 100,
+    });
+    const probes = () => down.started.filter((text) => text.startsWith('Hello world')).length;
+    const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    try {
+      for (let i = 0; i < 20; i++) {
+        for await (const _ of adapter.synthesize(`reply ${i}`));
+        await pause(30);
+      }
+      const before = probes();
+      await pause(1100);
+      // One chain probes about every 110 ms; LiveKit's own adapter forks one per skipping request.
+      expect(probes() - before).toBeLessThanOrEqual(12);
+    } finally {
+      await adapter.close();
+    }
+    const closed = probes();
+    await pause(300);
+    expect(probes()).toBe(closed);
+  });
+
+  it('hands the transcription back without stopping it: a failed stream ends so the session opens a new one', async () => {
+    const vad = {} as VAD;
+    const events: CallVoiceEvents = {
+      onTurn: () => undefined,
+      onCallerSpeaking: () => undefined,
+      onTurnLost: () => undefined,
+      onTurnDropped: () => undefined,
+      onClosed: () => undefined,
+    };
+    const { session } = walkieSession(
+      META,
+      { geminiKey: 'gk-test', record: false },
+      { vad, fallbackVad: vad },
+      events,
+      { ...silentLog, error: () => undefined },
+    );
+    const primary = new ControlledSTT('primary');
+    const fallback = new ControlledSTT('fallback');
+    const adapter = new stt.FallbackAdapter({ sttInstances: [primary, fallback] });
+    adapter.on('error', () => undefined);
+    const parent = adapter.stream({ connOptions: session.connOptions.sttConnOptions });
+    const feed = setInterval(() => {
+      try {
+        parent.pushFrame(new AudioFrame(new Int16Array(160), 16_000, 1, 160));
+      } catch {
+        clearInterval(feed);
+      }
+    }, 5);
+    try {
+      await vi.waitFor(() => expect(primary.streams).toHaveLength(1));
+      primary.streams[0].fail();
+      await vi.waitFor(() => expect(fallback.streams).toHaveLength(1));
+      // The adapter's probe hears the streaming model again; the walkie hands back at a pause.
+      await vi.waitFor(() => expect(primary.streams).toHaveLength(2));
+      primary.streams[1].say('back');
+      await vi.waitFor(() => expect(adapter.status[0].available).toBe(true));
+      fallback.streams[0].close();
+      for await (const _ of parent);
+      expect(parent.terminalError).toBeDefined();
+    } finally {
+      clearInterval(feed);
+      await adapter.close();
+    }
   });
 });

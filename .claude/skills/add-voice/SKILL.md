@@ -479,10 +479,10 @@ handed to the worker with each call:
 
 | Key | Default | What |
 | --- | --- | --- |
-| `WALKIE_STT_MODEL` | `gemini-3.5-transcribe-live` | Streams the caller's speech over the Gemini Live API while they talk, verbatim, with the language hints `uk-UA` and `en-US` and the line's vocabulary (deduplicated, at most 100 terms) as custom vocabulary. |
+| `WALKIE_STT_MODEL` | `gemini-3.5-transcribe-live` | Streams the caller's speech over the Gemini Live API while they talk, verbatim, with the language hints `uk-UA` and `en-US` and the line's vocabulary as custom vocabulary. |
 | `WALKIE_STT_FALLBACK_MODEL` | `gemini-3.5-transcribe` | Unary transcription that takes over while the streaming model fails (LiveKit's STT `FallbackAdapter`). Its quota is small (on some tiers 10 requests a minute and 100 a day), so it sends nothing while the streaming model works, every request it makes is logged at warn, and the call goes back to the streaming model at the next pause once that recovers, or tries it again every minute. `off` for none (an empty value in `.env` reads as unset). |
 | `WALKIE_TTS_MODEL` | `gemini-3.8-flash-tts` | Speaks the agent's replies. |
-| `WALKIE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Speaks when the main model fails (LiveKit's TTS `FallbackAdapter`, one retry each); `off` for none. |
+| `WALKIE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Speaks when the main model fails (LiveKit's TTS `FallbackAdapter`, one retry each; a failed model is tried again every 30 seconds); `off` for none. |
 | `WALKIE_TTS_VOICE` | `Alnilam` | Prebuilt Gemini voice, for both TTS models. |
 | `WALKIE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
 | `WALKIE_MIRROR` | `telegram` | Channel type each exchange is copied into; `off` disables. |
@@ -583,7 +583,7 @@ from `LIVEKIT_API_SECRET`, so the worker needs that key too. Then, walkie-talkie
   or not answering the turn) the caller hears "Не розчув, повтори, будь ласка" or
   "Sorry, I didn't catch that", in the language of their last turn; when a reply
   cannot be synthesized, a line saying so. Both also show as captions. The
-  worker also sends one JSON message per caller turn on the text stream topic
+  worker also sends one JSON message per caller turn (noise is not reported) on the text stream topic
   `nanoclaw.walkie.turn`: `{"turn": n, "status": "sent" | "lost", "reason"?:
   "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
 

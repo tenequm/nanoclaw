@@ -6,7 +6,7 @@
  * job in a forked child process of its worker and owns that process's signals
  * and logging; the host dispatches it to each call's room (explicit dispatch
  * by agent name) and the two talk over the host's webhook server, see
- * `src/channels/voice-livekit.ts` for the protocol. The host's address and the
+ * `src/channels/voice-livekit-protocol.ts` for the protocol. The host's address and the
  * call's secret come from the worker's own settings, never from the dispatch.
  *
  * Per job: join the room, wait for the caller named in the metadata, tell the
@@ -28,6 +28,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ReadableStream, TransformStream } from 'node:stream/web';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -35,6 +36,7 @@ import {
   APIStatusError,
   AutoSubscribe,
   cli,
+  DEFAULT_API_CONNECT_OPTIONS,
   defineAgent,
   log as agentsLog,
   mergeFrames,
@@ -53,7 +55,7 @@ import {
 } from '@livekit/agents';
 import * as google from '@livekit/agents-plugin-google';
 import * as silero from '@livekit/agents-plugin-silero';
-import { AudioFrame, AudioResampler, RoomEvent } from '@livekit/rtc-node';
+import { AudioFrame, RoomEvent } from '@livekit/rtc-node';
 
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
@@ -74,11 +76,9 @@ import { readEnvFile } from './env.js';
 /** The worker's duration cap outlasts the host's by this; it only fires when the host is gone. */
 const WORKER_DEADLINE_GRACE_MS = 30_000;
 /** Silero and the transcription both run at 16 kHz. */
-export const INPUT_SAMPLE_RATE = 16_000;
+const INPUT_SAMPLE_RATE = 16_000;
 /** Language hints for the transcription; the call's language for the worker's own lines. */
-export const STT_LANGUAGE_CODES = ['uk-UA', 'en-US'] as const;
-/** Gemini's custom vocabulary works best up to this many terms. */
-export const MAX_VOCABULARY_TERMS = 100;
+const STT_LANGUAGE_CODES = ['uk-UA', 'en-US'] as const;
 /** One typing tick from the host keeps "thinking" up this long; the host re-fires every 4 s. */
 const THINKING_HOLD_MS = 10_000;
 /** After a turn went out, "thinking" holds this long without a reply or a typing tick. */
@@ -90,37 +90,35 @@ export const MAX_IDLE_WAIT_MS = 10_000;
 /** Speech that produced no transcript within this long after it ended is a lost turn. */
 const TRANSCRIPTION_TIMEOUT_MS = 5_000;
 /** Shorter untranscribed speech is a cough or a noise, not a lost turn, unless the STT failed. */
-export const MIN_LOST_SPEECH_MS = 800;
+const MIN_LOST_SPEECH_MS = 800;
 /** Longest wait for the next TTS frame: Gemini 3.8 TTS takes seconds to first audio, and a failover adds a try. */
 const TTS_IDLE_TIMEOUT_MS = 60_000;
+/** How a reply is cut for synthesis: sentences batched up to 400 characters, the first one short so speech starts soon. */
+export const REPLY_CHUNKS = { minTokenLength: 250, maxTokenLength: 400, firstTokenLength: 20 };
+/** Reply chunks synthesized at once: the one playing and the next. */
+export const TTS_CONCURRENCY = 2;
+/** While a speech model is down, it is tried again this often; every try spends its quota. */
+const TTS_RECOVERY_DELAY_MS = 30_000;
 const UNARY_STT_TIMEOUT_MS = 30_000;
-/** The fallback transcription cuts speech at pauses this long: fewer, longer requests on a small quota. */
+/** The fallback transcription cuts speech at pauses this long, and skips sounds shorter than the other: fewer requests on a small quota. */
 const FALLBACK_MIN_SILENCE_MS = 1_000;
+const FALLBACK_MIN_SPEECH_MS = 300;
+/** After the fallback transcription is rate limited, it sends nothing for this long. */
+const UNARY_STT_BACKOFF_MS = 60_000;
 /** While the fallback transcribes, the streaming model is tried again this often, at a pause. */
 const HAND_BACK_RETRY_MS = 60_000;
+/** While the fallback transcribes, whether to hand back is checked this often. */
+const HAND_BACK_CHECK_MS = 10_000;
 /** Silero's default: its end-of-speech comes this long after the speech stopped. */
 const VAD_SILENCE_MS = 550;
-/** A worker on another protocol version waits this long for the caller's page to see why. */
+/** A worker on another protocol version waits this long for the caller, then this long for their page to see why. */
+const MISMATCH_JOIN_WAIT_MS = 30_000;
 const MISMATCH_NOTICE_MS = 3_000;
 /** A turn recording keeps this much audio from before the caller's first speech, and after the last. */
 const RECORDING_PAD_MS = 300;
 /** Longest turn recording; audio past it is not kept. */
-export const MAX_RECORDED_TURN_MS = 120_000;
+const MAX_RECORDED_TURN_MS = 120_000;
 const DAY_MS = 86_400_000;
-
-const agentRoute = (hostUrl: string, path: string): string => `${hostUrl}/webhook/voice/livekit/agent/${path}`;
-
-const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
-  new Promise((resolve) => {
-    if (signal?.aborted) return resolve();
-    const done = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', done);
-      resolve();
-    };
-    const timer = setTimeout(done, ms);
-    signal?.addEventListener('abort', done, { once: true });
-  });
 
 /** The worker's HTTP client for the host's /webhook/voice/livekit/agent routes. */
 export class HostLink {
@@ -130,7 +128,7 @@ export class HostLink {
   ) {}
 
   private url(path: string): string {
-    return agentRoute(this.link.hostUrl, path);
+    return `${this.link.hostUrl}/webhook/voice/livekit/agent/${path}`;
   }
 
   post(path: 'joined' | 'utterance' | 'ended', body: Record<string, unknown> = {}): Promise<Response> {
@@ -212,7 +210,7 @@ export function speakableText(message: string): string {
 
 export type CallLanguage = 'uk' | 'en';
 /** Until the caller says something, the worker's own lines use the first transcription language. */
-const DEFAULT_CALL_LANGUAGE: CallLanguage = STT_LANGUAGE_CODES[0].startsWith('uk') ? 'uk' : 'en';
+const DEFAULT_CALL_LANGUAGE: CallLanguage = 'uk';
 
 /** What the worker says itself when the exchange breaks, in the call's language. */
 export const FAILURE_LINES: Record<'turn' | 'reply', Record<CallLanguage, string>> = {
@@ -225,26 +223,6 @@ export function languageOf(text: string): CallLanguage | undefined {
   if (/\p{Script=Cyrillic}/u.test(text)) return 'uk';
   if (/[A-Za-z]/.test(text)) return 'en';
   return undefined;
-}
-
-/** The line's vocabulary for Gemini: trimmed, deduplicated ignoring case, and capped. */
-export function sttVocabulary(terms: readonly string[], log: Pick<Console, 'warn'>): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const raw of terms) {
-    const term = raw.trim();
-    const key = term.toLowerCase();
-    if (!term || seen.has(key)) continue;
-    seen.add(key);
-    out.push(term);
-  }
-  if (out.length > MAX_VOCABULARY_TERMS) {
-    log.warn(
-      `voice worker: the line's vocabulary has ${out.length} terms; the transcription gets the first ${MAX_VOCABULARY_TERMS}`,
-    );
-    return out.slice(0, MAX_VOCABULARY_TERMS);
-  }
-  return out;
 }
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
@@ -268,6 +246,7 @@ export function interactionText(body: unknown): string {
  */
 export class GeminiTranscribeSTT extends stt.STT {
   label = 'walkie.GeminiTranscribe';
+  private blockedUntil = 0;
 
   constructor(
     private readonly opts: {
@@ -291,9 +270,9 @@ export class GeminiTranscribeSTT extends stt.STT {
   }
 
   protected async _recognize(buffer: AudioBuffer, abortSignal?: AbortSignal): Promise<stt.SpeechEvent> {
-    const frame = mergeFrames(buffer);
     // An empty result, not an error: the adapter's recovery probe then idles quietly.
-    if (!this.opts.shouldServe()) return this.final('');
+    if (!this.opts.shouldServe() || Date.now() < this.blockedUntil) return this.final('');
+    const frame = mergeFrames(buffer);
     this.opts.onRequest?.();
     const body = {
       model: this.opts.model,
@@ -323,6 +302,7 @@ export class GeminiTranscribeSTT extends stt.STT {
     }
     const json: unknown = await res.json().catch(() => null);
     if (!res.ok) {
+      if (res.status === 429) this.blockedUntil = Date.now() + UNARY_STT_BACKOFF_MS;
       const message = (json as { error?: { message?: string } } | null)?.error?.message ?? '';
       throw new APIStatusError({
         message: `Gemini transcribe: ${res.status} ${message.slice(0, 200)}`.trim(),
@@ -357,7 +337,7 @@ export class GeminiTranscribeSTT extends stt.STT {
  * at its own VAD's pauses. `handBack()` ends its streams, which the adapter takes as a failure
  * and moves the session back to the first available instance, the recovered streaming one.
  */
-export class FallbackTranscription extends stt.StreamAdapter {
+class FallbackTranscription extends stt.StreamAdapter {
   private readonly streams = new Set<stt.SpeechStream>();
 
   constructor(
@@ -384,6 +364,114 @@ export class FallbackTranscription extends stt.StreamAdapter {
   handBack(): void {
     for (const stream of this.streams) stream.close();
     this.streams.clear();
+  }
+}
+
+/**
+ * A TTS that runs at most `limit` syntheses at once, the rest waiting in order. The session's
+ * StreamAdapter requests every chunk of a reply together, a burst Gemini answers with 429 or 503.
+ */
+export class PacedTTS extends tts.TTS {
+  label: string;
+  private running = 0;
+  private readonly waiting: Array<(granted: boolean) => void> = [];
+
+  constructor(
+    readonly inner: tts.TTS,
+    private readonly limit: number,
+  ) {
+    super(inner.sampleRate, inner.numChannels, { streaming: false });
+    this.label = inner.label;
+    // The inner TTS reports its own failures; the session hears them through this one.
+    inner.on('error', (err) => this.emit('error', err));
+  }
+
+  override get model(): string {
+    return this.inner.model;
+  }
+
+  override get provider(): string {
+    return this.inner.provider;
+  }
+
+  synthesize(text: string, connOptions?: APIConnectOptions, abortSignal?: AbortSignal): tts.ChunkedStream {
+    return new PacedStream(this, text, connOptions, abortSignal);
+  }
+
+  stream(): tts.SynthesizeStream {
+    throw new Error('PacedTTS is not streaming; wrap it in a tts.StreamAdapter');
+  }
+
+  /** Waits for a free slot, in order; false when aborted first. */
+  acquire(signal: AbortSignal): Promise<boolean> {
+    if (signal.aborted) return Promise.resolve(false);
+    if (this.running < this.limit) {
+      this.running++;
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      const waiter = (granted: boolean) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(granted);
+      };
+      const onAbort = () => {
+        this.waiting.splice(this.waiting.indexOf(waiter), 1);
+        waiter(false);
+      };
+      this.waiting.push(waiter);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  release(): void {
+    const next = this.waiting.shift();
+    if (next) next(true);
+    else this.running--;
+  }
+}
+
+class PacedStream extends tts.ChunkedStream {
+  label = 'walkie.PacedStream';
+  private innerError?: Error;
+
+  constructor(
+    private readonly paced: PacedTTS,
+    text: string,
+    private readonly innerConnOptions: APIConnectOptions | undefined,
+    abortSignal?: AbortSignal,
+  ) {
+    // The inner TTS retries; this stream only waits its turn.
+    super(text, paced, { ...DEFAULT_API_CONNECT_OPTIONS, ...innerConnOptions, maxRetry: 0 }, abortSignal);
+  }
+
+  override get error(): Error | undefined {
+    return super.error ?? this.innerError;
+  }
+
+  protected async run(): Promise<void> {
+    if (!(await this.paced.acquire(this.abortSignal))) return;
+    try {
+      const inner = this.paced.inner.synthesize(this.inputText, this.innerConnOptions, this.abortSignal);
+      for await (const audio of inner) {
+        if (this.abortSignal.aborted) return inner.close();
+        this.queue.put(audio);
+      }
+      this.innerError = inner.error;
+    } finally {
+      this.paced.release();
+    }
+  }
+}
+
+/**
+ * LiveKit's TTS FallbackAdapter without its probe leak: a request that skips a down model starts
+ * another recovery probe even while the last one waits to retry, and each such chain probes for
+ * the rest of the process. One chain per model is enough.
+ */
+export class TtsFallback extends tts.FallbackAdapter {
+  override markUnAvailable(index: number): void {
+    if ((this as unknown as { _recoveryTimeouts: Map<number, unknown> })._recoveryTimeouts.has(index)) return;
+    super.markUnAvailable(index);
   }
 }
 
@@ -416,12 +504,12 @@ export class TurnCapture {
   private speechSamples = 0;
   private lastSpeechEnd = 0;
   private truncated = false;
-  private resampler?: { rate: number; resampler: AudioResampler };
 
   constructor(private readonly now: () => number = () => Date.now()) {}
 
   push(frame: AudioFrame): void {
-    for (const pcm of this.to16k(frame)) this.append(pcm);
+    // The session's room input is 16 kHz mono.
+    if (frame.sampleRate === INPUT_SAMPLE_RATE) this.append(frame.data);
   }
 
   onSpeaking(speaking: boolean): void {
@@ -495,22 +583,9 @@ export class TurnCapture {
     this.chunks.push(pcm.slice());
     this.samples += pcm.length;
   }
-
-  private to16k(frame: AudioFrame): Int16Array[] {
-    if (frame.sampleRate === INPUT_SAMPLE_RATE) return [frame.data];
-    if (this.resampler?.rate !== frame.sampleRate) {
-      this.resampler?.resampler.close();
-      this.resampler = {
-        rate: frame.sampleRate,
-        resampler: new AudioResampler(frame.sampleRate, INPUT_SAMPLE_RATE, frame.channels),
-      };
-    }
-    return this.resampler.resampler.push(frame).map((f) => f.data);
-  }
 }
 
-/** 16-bit mono PCM as a WAV file. */
-export function pcmToWav(pcm: Int16Array, sampleRate: number): Buffer {
+function pcmToWav(pcm: Int16Array, sampleRate: number): Buffer {
   const data = Buffer.alloc(pcm.length * 2);
   for (let i = 0; i < pcm.length; i++) data.writeInt16LE(pcm[i], i * 2);
   const header = Buffer.alloc(44);
@@ -551,7 +626,6 @@ export interface TurnRecord {
 /** Where turn recordings go: NanoClaw's data directory, which git ignores. */
 export const recordingsRoot = (): string => path.join(DATA_DIR, 'voice-recordings');
 
-/** A name as one safe path segment. */
 export const pathSegment = (name: string): string =>
   name
     .normalize('NFKC')
@@ -588,10 +662,16 @@ export async function pruneRecordings(root: string, days: number, now = Date.now
           await fs.promises.rmdir(full).catch(() => undefined);
           left--;
         }
-      } else if (entry.isFile() && (await fs.promises.stat(full)).mtimeMs < cutoff) {
-        await fs.promises.unlink(full);
-        removed++;
-        left--;
+      } else if (entry.isFile()) {
+        // One file that cannot go must not stop the rest from going.
+        const gone = await fs.promises
+          .stat(full)
+          .then(async (stat) => stat.mtimeMs < cutoff && (await fs.promises.unlink(full), true))
+          .catch(() => false);
+        if (gone) {
+          removed++;
+          left--;
+        }
       }
     }
     return left === 0;
@@ -619,7 +699,6 @@ export interface CallVoice {
 
 /** What the session reports back. `audio` is the turn's recording, when recordings are on. */
 export interface CallVoiceEvents {
-  /** The caller finished a turn; this is its transcript. */
   onTurn(text: string, turn: TurnTake): void;
   onCallerSpeaking(speaking: boolean): void;
   /** The caller spoke but no transcript came of it: the transcription failed, or heard no words. */
@@ -645,7 +724,6 @@ export interface SendResult {
 }
 
 export interface WalkieDeps {
-  /** Hand a transcript to the host. */
   send(text: string): Promise<SendResult>;
   say(text: string): Promise<boolean>;
   setThinking(thinking: boolean): void;
@@ -696,7 +774,7 @@ export class Walkie {
       .catch((err: unknown) => this.deps.log.warn('walkie: sending a turn failed', { err }));
   }
 
-  onTurnLost(reason: string, fields: Record<string, unknown> = {}): void {
+  onTurnLost(reason: 'stt' | 'empty', fields: Record<string, unknown> = {}): void {
     if (this.closed) return;
     this.deps.log.warn(`walkie: a turn was lost (${reason})`, fields);
     this.feedback('turn');
@@ -898,9 +976,13 @@ interface WorkerUserData {
   fallbackVad?: VAD;
 }
 
-export const loadVad = (): Promise<VAD> => silero.VAD.load({ sampleRate: INPUT_SAMPLE_RATE });
-export const loadFallbackVad = (): Promise<VAD> =>
-  silero.VAD.load({ sampleRate: INPUT_SAMPLE_RATE, minSilenceDuration: FALLBACK_MIN_SILENCE_MS });
+const loadVad = (): Promise<VAD> => silero.VAD.load({ sampleRate: INPUT_SAMPLE_RATE });
+const loadFallbackVad = (): Promise<VAD> =>
+  silero.VAD.load({
+    sampleRate: INPUT_SAMPLE_RATE,
+    minSilenceDuration: FALLBACK_MIN_SILENCE_MS,
+    minSpeechDuration: FALLBACK_MIN_SPEECH_MS,
+  });
 
 class WalkieAgent extends voice.Agent {
   constructor(
@@ -912,8 +994,7 @@ class WalkieAgent extends voice.Agent {
 
   /** With no LLM in the session, nothing answers after this; the host's agent does, later. */
   override async onUserTurnCompleted(_chatCtx: llm.ChatContext, message: llm.ChatMessage): Promise<void> {
-    const text = message.textContent?.trim();
-    if (text) this.onTurn(text);
+    this.onTurn(message.textContent?.trim() ?? '');
   }
 
   /** The audio the transcription gets (silence while the agent speaks), copied for recordings. */
@@ -942,9 +1023,16 @@ const setAttribute = async (ctx: CallJob, key: string, value: string): Promise<v
 
 type WorkerLog = Pick<Console, 'info' | 'warn' | 'error'>;
 
+/** The agents-js logger as `(message, fields)`, the shape the walkie code logs in. */
+const workerLog = (logger: ReturnType<typeof agentsLog>): WorkerLog => ({
+  info: (msg: string, fields?: unknown) => logger.info(fields ?? {}, msg),
+  warn: (msg: string, fields?: unknown) => logger.warn(fields ?? {}, msg),
+  error: (msg: string, fields?: unknown) => logger.error(fields ?? {}, msg),
+});
+
 /**
  * The call's AgentSession: VAD turns, streaming STT, Gemini TTS, no LLM, wired to `events`. Not
- * started; `sessionVoice` starts it in the room (a smoke test can start it on its own audio IO).
+ * started; `sessionVoice` starts it in the room.
  */
 export function walkieSession(
   meta: LiveKitJobMetadata,
@@ -955,7 +1043,8 @@ export function walkieSession(
 ): { session: voice.AgentSession; agent: voice.Agent; say(text: string): Promise<boolean> } {
   const apiKey = settings.geminiKey;
   const capture = settings.record ? new TurnCapture() : undefined;
-  const vocabulary = sttVocabulary(meta.vocabulary ?? [], log);
+  // The host already trimmed, deduplicated and capped it.
+  const vocabulary = meta.vocabulary ?? [];
   const streaming = new google.beta.GeminiSTT({
     apiKey,
     model: meta.sttModel,
@@ -1017,34 +1106,30 @@ export function walkieSession(
     fallbackSince = 0;
     fallback?.handBack();
   };
-  const handBackTimer = fallback ? setInterval(handBack, 10_000) : undefined;
+  const handBackTimer = fallback ? setInterval(handBack, HAND_BACK_CHECK_MS) : undefined;
   handBackTimer?.unref();
-  /** The models that transcribed the open turn. */
   const heardBy = new Set<string>();
-  const take = (): TurnTake & { speechMs: number } => {
+  const take = (): TurnTake => {
     const models = [...heardBy];
     heardBy.clear();
     turnOpen = false;
-    const speechMs = turnSpeechMs;
     turnSpeechMs = 0;
-    const turn = {
-      audio: capture?.take(),
-      sttModel: models.length > 0 ? models.join('+') : fallbackServing() ? (fallbackModel ?? '') : meta.sttModel,
-      speechMs,
-    };
+    const turn = { audio: capture?.take(), sttModel: models.length > 0 ? models.join('+') : transcription.model };
     handBack();
     return turn;
   };
 
   const primaryTts = new google.beta.TTS({ apiKey, model: meta.ttsModel, voiceName: meta.ttsVoice, instructions: '' });
   let speech: tts.TTS = primaryTts;
+  let ttsAdapter: tts.FallbackAdapter | undefined;
   if (meta.ttsFallbackModel) {
-    const ttsAdapter = new tts.FallbackAdapter({
+    ttsAdapter = new TtsFallback({
       ttsInstances: [
         primaryTts,
         new google.beta.TTS({ apiKey, model: meta.ttsFallbackModel, voiceName: meta.ttsVoice, instructions: '' }),
       ],
       maxRetryPerTTS: 1,
+      recoveryDelayMs: TTS_RECOVERY_DELAY_MS,
     });
     (ttsAdapter as unknown as NodeJS.EventEmitter).on(
       'tts_availability_changed',
@@ -1060,16 +1145,15 @@ export function walkieSession(
   const session = new voice.AgentSession({
     vad: vads.vad,
     stt: transcription,
-    // Sentences batch into chunks of up to 400 characters, the first one short so speech starts
-    // soon. Every chunk is requested at once, so the next one is ready while one plays.
     tts: new tts.StreamAdapter(
-      speech,
-      new tokenize.basic.SentenceTokenizer({ minTokenLength: 250, maxTokenLength: 400, firstTokenLength: 20 }),
+      new PacedTTS(speech, TTS_CONCURRENCY),
+      new tokenize.basic.SentenceTokenizer(REPLY_CHUNKS),
     ),
     turnHandling: {
       // The turn detector models have no Ukrainian; the default would build one anyway.
       turnDetection: 'vad',
-      endpointing: { mode: 'fixed', minDelay: meta.silenceMs, maxDelay: Math.max(meta.silenceMs, 3000) },
+      // maxDelay is a turn detector's, and there is none.
+      endpointing: { mode: 'fixed', minDelay: meta.silenceMs, maxDelay: meta.silenceMs },
       interruption: { enabled: false, mode: 'vad', discardAudioIfUninterruptible: true },
       preemptiveGeneration: { enabled: false },
     },
@@ -1082,14 +1166,18 @@ export function walkieSession(
     connOptions: {
       // The defaults close the session on the 4th STT or TTS failure, however long the call.
       maxUnrecoverableErrors: 50,
-      sttConnOptions: { maxRetry: 3 },
+      // A fallback adapter retries each model itself. Its STT stream cannot be retried in place
+      // (the first attempt closes its input, so a retry ends silently and the session stops
+      // transcribing): a failure must end it, and the session then opens a new one.
+      sttConnOptions: { maxRetry: adapter ? 0 : 3 },
+      ttsConnOptions: { maxRetry: ttsAdapter ? 0 : 3 },
     },
   });
 
   let agentSpeaking = false;
   let agentSpokeAt = 0;
   let sttFailedAt = 0;
-  let saying: { failed: boolean } | undefined;
+  let ttsFailures = 0;
   session.on(voice.AgentSessionEventTypes.UserStateChanged, (ev) => {
     const speaking = ev.newState === 'speaking';
     if (speaking) {
@@ -1102,7 +1190,7 @@ export function walkieSession(
     events.onCallerSpeaking(speaking);
   });
   session.on(voice.AgentSessionEventTypes.UserInputTranscribed, (ev) => {
-    if (ev.isFinal && ev.transcript.trim()) heardBy.add(fallbackServing() ? (fallbackModel ?? '') : meta.sttModel);
+    if (ev.isFinal && ev.transcript.trim()) heardBy.add(transcription.model);
   });
   session.on(voice.AgentSessionEventTypes.AgentStateChanged, (ev) => {
     agentSpeaking = ev.newState === 'speaking';
@@ -1112,20 +1200,23 @@ export function walkieSession(
     const err = ev.error;
     if (err.recoverable) return;
     if (err.type === 'stt_error') sttFailedAt = Date.now();
-    if (err.type === 'tts_error' && saying) saying.failed = true;
+    if (err.type === 'tts_error') ttsFailures++;
   });
   session.on(voice.AgentSessionEventTypes.UserTranscriptionTimeout, (ev) => {
-    const { speechMs, ...turn } = take();
+    // Silero reports no speech length at its end of speech, so the session counts it.
+    const spokeMs = turnSpeechMs;
+    const turn = take();
     // While the agent speaks the transcription hears silence on purpose: the caller is not heard.
     if (agentSpeaking || agentSpokeAt >= ev.vadSpeechStartedAt) return;
     const sttFailed = sttFailedAt >= ev.vadSpeechStartedAt;
-    // Silero reports no speech length at its end of speech, so the session's own count is taken too.
-    const spokeMs = Math.max(ev.speechDuration, speechMs);
     if (spokeMs < MIN_LOST_SPEECH_MS && !sttFailed) return events.onTurnDropped(turn);
     events.onTurnLost(sttFailed ? 'stt' : 'empty', { speechMs: spokeMs }, turn);
   });
   session.on(voice.AgentSessionEventTypes.Close, (ev) => {
     clearInterval(handBackTimer);
+    // The session closes neither; their recovery probes would run on.
+    void adapter?.close().catch(() => undefined);
+    void ttsAdapter?.close().catch(() => undefined);
     events.onClosed(`session closed: ${ev.reason}`);
   });
 
@@ -1133,20 +1224,16 @@ export function walkieSession(
     session,
     agent: new WalkieAgent(
       (text) => {
-        const { speechMs: _speechMs, ...turn } = take();
-        events.onTurn(text, turn);
+        const turn = take();
+        if (text) events.onTurn(text, turn);
       },
       capture && ((frame) => capture.push(frame)),
     ),
     async say(text) {
-      const state = { failed: false };
-      saying = state;
-      try {
-        await session.say(text, { allowInterruptions: false, addToChatCtx: false }).waitForPlayout();
-      } finally {
-        if (saying === state) saying = undefined;
-      }
-      return !state.failed;
+      // Replies are spoken one at a time, so a failure counted meanwhile is this one's.
+      const failures = ttsFailures;
+      await session.say(text, { allowInterruptions: false, addToChatCtx: false }).waitForPlayout();
+      return ttsFailures === failures;
     },
   };
 }
@@ -1158,12 +1245,7 @@ async function sessionVoice(
   settings: VoiceSettings,
   events: CallVoiceEvents,
 ): Promise<CallVoice> {
-  const logger = agentsLog().child({ callId: meta.callId });
-  const log: WorkerLog = {
-    info: (msg: string, fields?: unknown) => logger.info(fields ?? {}, msg),
-    warn: (msg: string, fields?: unknown) => logger.warn(fields ?? {}, msg),
-    error: (msg: string, fields?: unknown) => logger.error(fields ?? {}, msg),
-  };
+  const log = workerLog(agentsLog().child({ callId: meta.callId }));
   const userData = ctx.proc.userData as WorkerUserData;
   userData.vad ??= await loadVad();
   if (meta.sttFallbackModel) userData.fallbackVad ??= await loadFallbackVad();
@@ -1193,7 +1275,7 @@ async function sessionVoice(
     publishTurn(status) {
       void ctx.room.localParticipant
         ?.sendText(JSON.stringify(status), { topic: WALKIE_TURN_TOPIC })
-        .catch((err: unknown) => logger.warn({ err }, 'voice worker: could not publish a turn status'));
+        .catch((err: unknown) => log.warn('voice worker: could not publish a turn status', { err }));
     },
     async close() {
       await session.close().catch(() => undefined);
@@ -1202,15 +1284,11 @@ async function sessionVoice(
 }
 
 function defaultDeps(): RunCallDeps {
-  const logger = agentsLog();
   return {
     env: workerEnv(['GEMINI_API_KEY', 'LIVEKIT_API_SECRET', 'LIVEKIT_HOST_URL', 'WALKIE_RECORDINGS_DAYS']),
     createVoice: (ctx, meta, settings, events) => sessionVoice(ctx as JobContext, meta, settings, events),
     markUpdating: (ctx) => setAttribute(ctx, WALKIE_UPDATING_ATTRIBUTE, '1'),
-    log: {
-      info: (msg: string, fields?: unknown) => logger.info(fields ?? {}, msg),
-      warn: (msg: string, fields?: unknown) => logger.warn(fields ?? {}, msg),
-    } as Pick<Console, 'info' | 'warn'>,
+    log: workerLog(agentsLog()),
   };
 }
 
@@ -1229,7 +1307,10 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   );
   const abandon = async (reason: string, fields: Record<string, unknown> = {}) => {
     log.warn('voice worker: ending the call', { ...callFields, ...fields, reason });
-    await host.post('ended', { reason }).catch(() => undefined);
+    await host
+      .post('ended', { reason })
+      .then((res) => res.body?.cancel())
+      .catch(() => undefined);
     await ctx.deleteRoom().catch(() => undefined);
     ctx.shutdown(reason);
   };
@@ -1239,13 +1320,20 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     // Host and worker were not restarted together. Tell the caller's page, then let the host end it.
     await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
     await deps.markUpdating(ctx).catch(() => undefined);
-    await withTimeout(ctx.waitForParticipant(header.callerIdentity), 30_000, 'caller never joined').catch(
-      () => undefined,
-    );
+    await withTimeout(
+      ctx.waitForParticipant(header.callerIdentity),
+      MISMATCH_JOIN_WAIT_MS,
+      'caller never joined',
+    ).catch(() => undefined);
     await sleep(MISMATCH_NOTICE_MS);
     return abandon(`protocol mismatch: host sent v${String(header.v)}, worker speaks v${LIVEKIT_PROTOCOL_VERSION}`);
   }
-  const meta = parseJobMetadata(ctx.job.metadata);
+  let meta: LiveKitJobMetadata;
+  try {
+    meta = parseJobMetadata(ctx.job.metadata);
+  } catch (err) {
+    return abandon((err as Error).message);
+  }
   const geminiKey = deps.env.GEMINI_API_KEY;
   if (!geminiKey) return abandon('GEMINI_API_KEY is not set for the worker');
   const record = recordingDays(deps.env.WALKIE_RECORDINGS_DAYS) > 0;
@@ -1291,8 +1379,14 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     ending = true;
     walkie.close();
     hostLink.abort();
-    if (tellHost) await host.post('ended', { reason }).catch(() => undefined);
-    await callVoice?.close().catch(() => undefined);
+    await Promise.all([
+      tellHost &&
+        host
+          .post('ended', { reason })
+          .then((res) => res.body?.cancel())
+          .catch(() => undefined),
+      callVoice?.close().catch(() => undefined),
+    ]);
     await ctx.deleteRoom().catch(() => undefined);
     ctx.shutdown(reason);
   };
@@ -1343,12 +1437,15 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         },
         onCallerSpeaking: (speaking) => walkie.onCallerSpeaking(speaking),
         onTurnLost: (reason, fields, take) => {
+          if (ending) return;
           const turn = ++turns;
           walkie.onTurnLost(reason, fields);
           publish({ turn, status: 'lost', reason });
           saveTurn(turn, take, '', { reason });
         },
-        onTurnDropped: (take) => saveTurn(++turns, take, '', { reason: 'noise' }),
+        onTurnDropped: (take) => {
+          if (!ending) saveTurn(++turns, take, '', { reason: 'noise' });
+        },
         onClosed: (reason) => void end(reason, true),
       },
     );
@@ -1369,6 +1466,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   ctx.room.on(RoomEvent.ParticipantDisconnected, (participant) => {
     if (participant.identity === meta.callerIdentity) void end('caller left', true);
   });
+  // The caller may have left while the call was being set up.
+  if (!ctx.room.remoteParticipants.has(meta.callerIdentity)) void end('caller left', true);
 
   host
     .events((event) => {
