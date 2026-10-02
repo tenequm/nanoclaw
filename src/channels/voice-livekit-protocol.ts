@@ -78,15 +78,17 @@ export interface CallRoomMetadata {
 
 /**
  * What became of a caller turn: closed and on its way to the host (`sending`, once the closing
- * silence and the final transcript are in, before the host answers), sent to the agent, or lost
+ * silence and the final transcript are in, before the host answers), sent to the agent, picked up
+ * by it (`working`: after `sent`, at most once per turn, when the host's `working` event says the
+ * agent's runner works on what reached it after that turn, and no reply to it came first), or lost
  * because the transcription failed (`stt`) or heard no words (`empty`), or the host refused it
  * (`rejected`, `rate_limited`) or did not answer (`timeout`). Every turn handed to the host says
  * `sending` first; one lost to the transcription does not. A page that does not know `sending`
- * ignores it, so it needs no version bump.
+ * ignores it (and `working`), so neither needs a version bump.
  */
 export interface CallTurnStatus {
   turn: number;
-  status: 'sending' | 'sent' | 'lost';
+  status: 'sending' | 'sent' | 'working' | 'lost';
   reason?: 'stt' | 'rejected' | 'rate_limited' | 'timeout' | 'empty';
   /** The final transcript, when there is one; on `sending` only for a sent review draft. */
   text?: string;
@@ -219,7 +221,9 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * One line of the host-to-worker event stream: a complete agent message to
  * speak (`turn`: the host's utterance id of the caller turn it answers, null
  * when it answers none of this call's turns), the agent still working (from the
- * host's typing refresh), whether the call now talks in a chat (`chat`; none
+ * host's typing refresh), the agent's runner working on what reached it since
+ * the call's latest turn (`working`, from the same refresh: the runner's own
+ * turn report, stamped after that turn landed), whether the call now talks in a chat (`chat`; none
  * until it does), a turn answered 504 that the agent's session stored after all
  * (`turn-stored`: its `turnKey` and the host's utterance id), the end of the
  * call, or a keepalive. A worker ignores a type it does not know, so new types
@@ -228,6 +232,7 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
 export type LiveKitHostEvent =
   | { type: 'reply'; text: string; turn?: string | null }
   | { type: 'thinking' }
+  | { type: 'working' }
   | { type: 'chat'; chat: boolean }
   | { type: 'turn-stored'; turnKey: string; id: string }
   | { type: 'end'; reason: string }

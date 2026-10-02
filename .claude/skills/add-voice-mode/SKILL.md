@@ -558,7 +558,11 @@ TTS, captions and the agent state are the framework's. Then:
   is reported on the event stream (`{"type": "turn-stored", "turnKey", "id"}`),
   and the worker corrects the page's mark to "sent". The stream also carries
   `{"type": "chat", "chat": true | false}` when the call starts or stops
-  talking in a chat.
+  talking in a chat, and `{"type": "working"}` on the agent's typing ticks once
+  its runner reports a live `working` turn stamped after the latest message
+  reached its chat (the call chat, or the voice line itself): the agent has
+  picked it up. The first such report goes out at once, not on the next 4 s
+  refresh.
 - When the caller's speech came out as no text the caller hears "Не розчув,
   повтори, будь ласка" or "Sorry, I didn't catch that", in the language of their
   last turn. A turn the host did not confirm (504, or no answer) may still reach
@@ -568,12 +572,17 @@ TTS, captions and the agent state are the framework's. Then:
   one "Too many turns - give it a moment." (and their Ukrainian lines). When a
   reply cannot be synthesized, a line saying so. All of these also show as captions. The
   worker also sends JSON messages per caller turn (noise is not reported) on the text stream topic
-  `nanoclaw.voice.turn`: `{"turn": n, "status": "sending" | "sent" | "lost", "reason"?:
+  `nanoclaw.voice.turn`: `{"turn": n, "status": "sending" | "sent" | "working" | "lost", "reason"?:
   "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
   Every turn handed to the host first gets "sending", once the closing silence
   and the final transcript are in and before the host answers (a turn lost to
   the transcription gets none); "sent" means the agent's session has the turn; a
   504 is "timeout", 429 "rate_limited", any other refusal "rejected".
+  "working" follows "sent" at most once per turn, on the first host `working`
+  after the host took that turn, unless a reply to it came first. When the agent
+  is still busy with an earlier turn, its runner's next re-mark (every 5 s) can
+  stand in for the pickup, so "working" there means "working, with your turn in
+  hand", not "on your turn".
 - Right before each line it speaks, the worker sends one JSON message on
   `nanoclaw.voice.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
   true, "notice"?: true, "more"?: true}`. `turn` is the caller turn the agent

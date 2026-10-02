@@ -315,8 +315,12 @@ export interface LiveKitVoice {
     text: string,
     replyTo?: { callId: string; utteranceId: string } | null,
   ): void;
-  /** The agent is working in a chat: tell its live call that talks there. */
-  chatTyping(chat: ChatAddress, agentGroupId: string): void;
+  /**
+   * The agent is working in a chat: tell its live call that talks there. `working`: the runner has
+   * picked up what reached that chat last (the typing module's `TypingTick.working`), which the call
+   * hears whether it talks in that chat or on its own voice line.
+   */
+  chatTyping(chat: ChatAddress, agentGroupId: string, working?: boolean): void;
   /** The running call on a line, for the daily budget. */
   activeCall(platformId: string): { platformId: string; startedAt: number } | undefined;
   teardown(): Promise<void>;
@@ -403,13 +407,13 @@ export function liveKitChatDelivered(
   for (const engine of engines) engine.chatMessage(chat, agentGroupId, text, replyTo);
 }
 
-/** Typing tap: the agent works in a chat; its live call talking there hears it is thinking. */
-export function liveKitChatTyping(chat: ChatAddress, agentGroupId: string): void {
-  for (const engine of engines) engine.chatTyping(chat, agentGroupId);
+/** Typing tap: the agent works in a chat; its live call talking there hears it is thinking, and when it picked a turn up. */
+export function liveKitChatTyping(chat: ChatAddress, agentGroupId: string, working = false): void {
+  for (const engine of engines) engine.chatTyping(chat, agentGroupId, working);
 }
 
 registerPostDeliveryHook((msg, session) => liveKitChatDelivered(msg, session.agent_group_id));
-registerTypingObserver(({ agentGroupId, ...chat }) => liveKitChatTyping(chat, agentGroupId));
+registerTypingObserver(({ agentGroupId, working, ...chat }) => liveKitChatTyping(chat, agentGroupId, working));
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
 
@@ -1150,10 +1154,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       }
     },
 
-    chatTyping(chat, agentGroupId) {
+    chatTyping(chat, agentGroupId, working = false) {
       for (const call of calls.values()) {
         if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
         if (callChatAt(call, chat)) push(call, { type: 'thinking' });
+        // On the voice line itself the adapter's setTyping already says thinking; only the pickup is new.
+        else if (chat.channelType !== 'voice' || chat.platformId !== call.platformId) continue;
+        if (working) push(call, { type: 'working' });
       }
     },
 
