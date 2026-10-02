@@ -22,6 +22,7 @@ import {
   FAILURE_LINES,
   GeminiTranscribeSTT,
   HostLink,
+  hostLossReason,
   interactionText,
   languageOf,
   MAX_IDLE_WAIT_MS,
@@ -107,6 +108,12 @@ describe('speakable text', () => {
 });
 
 describe('helpers', () => {
+  it('names why the host did not take a turn', () => {
+    expect(hostLossReason({ accepted: false, status: 429 })).toBe('rate_limited');
+    expect(hostLossReason({ accepted: false, status: 409 })).toBe('rejected');
+    expect(hostLossReason({ accepted: false, error: 'The operation was aborted due to timeout' })).toBe('timeout');
+  });
+
   it('reads the language of a transcript from its script', () => {
     expect(languageOf('Привіт, як справи?')).toBe('uk');
     expect(languageOf('check the grafana logs')).toBe('en');
@@ -203,7 +210,7 @@ describe('GeminiTranscribeSTT', () => {
 function fakeWalkieDeps(overrides: Partial<WalkieDeps> = {}) {
   const said: string[] = [];
   const sent: string[] = [];
-  const statuses: string[] = [];
+  const statuses: boolean[] = [];
   const deps: WalkieDeps = {
     send: vi.fn(async (text: string) => {
       sent.push(text);
@@ -213,7 +220,7 @@ function fakeWalkieDeps(overrides: Partial<WalkieDeps> = {}) {
       said.push(text);
       return true;
     }),
-    setStatus: (s) => statuses.push(s),
+    setThinking: (thinking) => statuses.push(thinking),
     log: { info: () => undefined, warn: () => undefined },
     ...overrides,
   };
@@ -231,11 +238,11 @@ describe('Walkie', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['book a table', 'for two']);
     expect(results).toEqual([{ accepted: true, id: '1' }]);
-    expect(statuses).toEqual(['idle', 'thinking']);
+    expect(statuses).toEqual([false, true]);
     walkie.onReply('**Booked** for [eight](https://x.y).');
     await vi.advanceTimersByTimeAsync(1);
     expect(said).toEqual(['Booked for eight.']);
-    expect(statuses.at(-1)).toBe('idle');
+    expect(statuses.at(-1)).toBe(false);
   });
 
   it('drops thinking after a while without typing ticks, and holds it while they come', async () => {
@@ -246,9 +253,9 @@ describe('Walkie', () => {
     await vi.advanceTimersByTimeAsync(AWAIT_REPLY_MS - 1000);
     walkie.onThinking();
     await vi.advanceTimersByTimeAsync(5000);
-    expect(statuses.at(-1)).toBe('thinking');
+    expect(statuses.at(-1)).toBe(true);
     await vi.advanceTimersByTimeAsync(6000);
-    expect(statuses.at(-1)).toBe('idle');
+    expect(statuses.at(-1)).toBe(false);
   });
 
   it('holds a reply while the caller talks and until their turn could still be committed', async () => {
@@ -436,7 +443,8 @@ function fakeVoice() {
   let events!: CallVoiceEvents;
   const voice = {
     say: vi.fn(async (_text: string) => true),
-    setStatus: vi.fn(),
+    setThinking: vi.fn(),
+    publishTurn: vi.fn(),
     close: vi.fn(async () => undefined),
   } satisfies CallVoice;
   const createVoice = vi.fn(
@@ -464,7 +472,7 @@ const deps = (fetchImpl: typeof fetch, createVoice: ReturnType<typeof fakeVoice>
   env: ENV as Record<string, string | undefined>,
   fetchImpl,
   createVoice,
-  setStatus: vi.fn(async () => undefined),
+  markUpdating: vi.fn(async () => undefined),
   log: silentLog,
   ...extra,
 });
@@ -497,7 +505,8 @@ describe('runCall', () => {
         text: 'Book a table',
       }),
     );
-    expect(v.voice.setStatus).toHaveBeenCalledWith('thinking');
+    expect(v.voice.setThinking).toHaveBeenCalledWith(true);
+    expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' });
 
     host.emit({ type: 'reply', text: 'Booked for eight.' });
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked for eight.'));
@@ -517,6 +526,14 @@ describe('runCall', () => {
     await runCall(ctx, deps(host.fetchImpl, v.createVoice));
     v.events.onTurn('Привіт', { sttModel: 'gemini-3.5-transcribe-live' });
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.turn.uk));
+    expect(v.voice.publishTurn).toHaveBeenCalledWith({
+      turn: 1,
+      status: 'lost',
+      reason: 'rate_limited',
+      text: 'Привіт',
+    });
+    v.events.onTurnLost('stt', { speechMs: 1200 }, { sttModel: 'gemini-3.5-transcribe-live' });
+    expect(v.voice.publishTurn).toHaveBeenLastCalledWith({ turn: 2, status: 'lost', reason: 'stt' });
   });
 
   it('names the host URL when the host is unreachable at join', async () => {
@@ -592,24 +609,26 @@ describe('runCall', () => {
       });
       const at = Date.UTC(2026, 9, 2, 12, 0, 0);
       v.events.onTurn('Book a table', audio(at));
-      v.events.onTurnLost('no transcript', { speechMs: 900 }, audio(at + 1000, 'gemini-3.5-transcribe'));
-      v.events.onTurnDropped('too little speech', audio(at + 2000));
+      v.events.onTurnLost('empty', { speechMs: 900 }, audio(at + 1000, 'gemini-3.5-transcribe'));
+      v.events.onTurnDropped(audio(at + 2000));
       const dir = path.join(root, 'Andy', '2026-10-02');
       await vi.waitFor(() => expect(fs.readdirSync(dir).sort()).toHaveLength(6));
-      const first = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-3.json'), 'utf8')) as TurnRecord;
+      const first = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-1.json'), 'utf8')) as TurnRecord;
       expect(first).toMatchObject({
         callId: 'call-1',
         lineId: 'voice:abc',
         agent: 'Andy',
-        turn: 3,
+        turn: 1,
         startedAt: '2026-10-02T12:00:00.000Z',
         sttModel: 'gemini-3.5-transcribe-live',
         transcript: 'Book a table',
         host: { accepted: true, status: 202, id: '1' },
       });
-      const lost = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-1.json'), 'utf8')) as TurnRecord;
-      expect(lost).toMatchObject({ transcript: '', reason: 'no transcript', sttModel: 'gemini-3.5-transcribe' });
-      expect(fs.readFileSync(path.join(dir, 'call-1-3.wav')).subarray(0, 4).toString()).toBe('RIFF');
+      const lost = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-2.json'), 'utf8')) as TurnRecord;
+      expect(lost).toMatchObject({ turn: 2, transcript: '', reason: 'empty', sttModel: 'gemini-3.5-transcribe' });
+      const noise = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-3.json'), 'utf8')) as TurnRecord;
+      expect(noise).toMatchObject({ turn: 3, reason: 'noise' });
+      expect(fs.readFileSync(path.join(dir, 'call-1-1.wav')).subarray(0, 4).toString()).toBe('RIFF');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -624,7 +643,7 @@ describe('runCall', () => {
     const done = runCall(ctx, d);
     await vi.advanceTimersByTimeAsync(5000);
     await done;
-    expect(d.setStatus).toHaveBeenCalledWith(ctx, 'updating');
+    expect(d.markUpdating).toHaveBeenCalledWith(ctx);
     expect(v.createVoice).not.toHaveBeenCalled();
     expect(host.calls.at(-1)).toMatchObject({
       url: 'http://127.0.0.1:3555/webhook/voice/livekit/agent/ended',

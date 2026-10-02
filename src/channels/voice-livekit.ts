@@ -50,7 +50,8 @@ import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   PING_INTERVAL_MS,
-  WALKIE_STATUS_ATTRIBUTE,
+  WALKIE_THINKING_ATTRIBUTE,
+  WALKIE_UPDATING_ATTRIBUTE,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
 } from './voice-livekit-protocol.js';
@@ -748,7 +749,8 @@ const audioBtn = document.getElementById('audio');
 const statusEl = document.getElementById('status');
 const logEl = document.getElementById('log');
 const names = { agent: 'the agent' };
-const STATUS_ATTR = '__STATUS_ATTR__';
+const THINKING_ATTR = '__THINKING_ATTR__';
+const UPDATING_ATTR = '__UPDATING_ATTR__';
 // Without a worker in the room after this long, it is down or mid-update (host and worker restart together).
 const AGENT_JOIN_MS = 25000;
 const UPDATING = 'The voice service is updating. Try again in a minute.';
@@ -758,10 +760,10 @@ let call = null;
 // attribute says when the agent is thinking, which a session without an LLM never is.
 function showAgent(c, p) {
   const attrs = (p && p.attributes) || {};
-  if (attrs[STATUS_ATTR] === 'updating') return hangup(c, UPDATING, false, 'updating');
+  if (attrs[UPDATING_ATTR] === '1') return hangup(c, UPDATING, false, 'updating');
   const state = attrs['lk.agent.state'];
   if (state === 'speaking') return setStatus(names.agent + ' is speaking');
-  if (attrs[STATUS_ATTR] === 'thinking') return setStatus(names.agent + ' is thinking');
+  if (attrs[THINKING_ATTR] === '1') return setStatus(names.agent + ' is thinking');
   if (state === 'listening' || state === 'idle') return setStatus('Listening');
   setStatus('Live: talk to ' + names.agent + '.');
 }
@@ -932,7 +934,7 @@ button.hang{background:var(--danger)}
 </main>
 <script src="livekit/client.js"></script>
 <script>
-${PAGE_SCRIPT.replace('__STATUS_ATTR__', WALKIE_STATUS_ATTRIBUTE)}
+${PAGE_SCRIPT.replace('__THINKING_ATTR__', WALKIE_THINKING_ATTRIBUTE).replace('__UPDATING_ATTR__', WALKIE_UPDATING_ATTRIBUTE)}
 </script>
 </body>
 </html>

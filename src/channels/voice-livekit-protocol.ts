@@ -50,12 +50,27 @@ export interface LiveKitJobMetadata {
 }
 
 /**
- * The worker's own participant attribute, for what `lk.agent.state` cannot say: `thinking`
- * while the agent works on a turn (there is no LLM in the worker's session), `idle` otherwise,
- * `updating` when the worker cannot serve this host's protocol version.
+ * The worker's participant attribute for what `lk.agent.state` cannot say (its session has no
+ * LLM, so it never thinks): "1" while the host says the agent works on a turn, "" otherwise.
  */
-export const WALKIE_STATUS_ATTRIBUTE = 'nanoclaw.walkie';
-export type WalkieStatus = 'idle' | 'thinking' | 'updating';
+export const WALKIE_THINKING_ATTRIBUTE = 'nanoclaw.walkie.thinking';
+/** The worker's participant attribute: "1" when it cannot serve this host's protocol version. */
+export const WALKIE_UPDATING_ATTRIBUTE = 'nanoclaw.walkie.updating';
+/** Text stream topic the worker sends one JSON `WalkieTurnStatus` on per caller turn. */
+export const WALKIE_TURN_TOPIC = 'nanoclaw.walkie.turn';
+
+/**
+ * What became of a caller turn: sent to the agent, or lost because the transcription failed
+ * (`stt`) or heard no words (`empty`), or the host refused it (`rejected`, `rate_limited`) or
+ * did not answer (`timeout`).
+ */
+export interface WalkieTurnStatus {
+  turn: number;
+  status: 'sent' | 'lost';
+  reason?: 'stt' | 'rejected' | 'rate_limited' | 'timeout' | 'empty';
+  /** The final transcript, when there is one. */
+  text?: string;
+}
 
 /**
  * One line of the host-to-worker event stream: a complete agent message to

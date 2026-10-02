@@ -61,10 +61,12 @@ import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   liveKitHostUrl,
-  WALKIE_STATUS_ATTRIBUTE,
+  WALKIE_THINKING_ATTRIBUTE,
+  WALKIE_TURN_TOPIC,
+  WALKIE_UPDATING_ATTRIBUTE,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
-  type WalkieStatus,
+  type WalkieTurnStatus,
 } from './channels/voice-livekit-protocol.js';
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
@@ -608,7 +610,10 @@ export function recordingDays(raw: string | undefined): number {
 export interface CallVoice {
   /** Speak a line, uninterruptible; resolves after playout with whether all of it was synthesized. */
   say(text: string): Promise<boolean>;
-  setStatus(status: WalkieStatus): void;
+  /** The `nanoclaw.walkie.thinking` attribute. */
+  setThinking(thinking: boolean): void;
+  /** One message on the `nanoclaw.walkie.turn` topic. */
+  publishTurn(status: WalkieTurnStatus): void;
   close(): Promise<void>;
 }
 
@@ -617,10 +622,10 @@ export interface CallVoiceEvents {
   /** The caller finished a turn; this is its transcript. */
   onTurn(text: string, turn: TurnTake): void;
   onCallerSpeaking(speaking: boolean): void;
-  /** The caller spoke but no transcript came of it. */
-  onTurnLost(reason: string, fields: Record<string, unknown>, turn: TurnTake): void;
+  /** The caller spoke but no transcript came of it: the transcription failed, or heard no words. */
+  onTurnLost(reason: 'stt' | 'empty', fields: Record<string, unknown>, turn: TurnTake): void;
   /** Speech too short to count as a turn, with nothing transcribed (a cough, a noise). */
-  onTurnDropped(reason: string, turn: TurnTake): void;
+  onTurnDropped(turn: TurnTake): void;
   onClosed(reason: string): void;
 }
 
@@ -643,7 +648,7 @@ export interface WalkieDeps {
   /** Hand a transcript to the host. */
   send(text: string): Promise<SendResult>;
   say(text: string): Promise<boolean>;
-  setStatus(status: WalkieStatus): void;
+  setThinking(thinking: boolean): void;
   log: Pick<Console, 'info' | 'warn'>;
   now?: () => number;
 }
@@ -661,7 +666,7 @@ export class Walkie {
   private speech: Promise<void> = Promise.resolve();
   private readonly wakers = new Set<() => void>();
   private thinkingUntil = 0;
-  private status?: WalkieStatus;
+  private thinking?: boolean;
   private statusTimer?: ReturnType<typeof setTimeout>;
   private feedbackQueued = false;
   private closed = false;
@@ -795,17 +800,23 @@ export class Walkie {
   private refresh(): void {
     if (this.closed) return;
     const t = this.now();
-    const next: WalkieStatus = t < this.thinkingUntil ? 'thinking' : 'idle';
+    const next = t < this.thinkingUntil;
     clearTimeout(this.statusTimer);
-    if (next === 'thinking') {
+    if (next) {
       this.statusTimer = setTimeout(() => this.refresh(), this.thinkingUntil - t + 1);
       this.statusTimer.unref?.();
     }
-    if (next !== this.status) {
-      this.status = next;
-      this.deps.setStatus(next);
+    if (next !== this.thinking) {
+      this.thinking = next;
+      this.deps.setThinking(next);
     }
   }
+}
+
+/** Why the host did not take a turn, as the page's turn status says it. */
+export function hostLossReason(result: SendResult): 'rate_limited' | 'rejected' | 'timeout' {
+  if (result.status === 429) return 'rate_limited';
+  return result.status !== undefined ? 'rejected' : 'timeout';
 }
 
 /** The fields every job carries whatever its version, enough to answer a mismatched one. */
@@ -869,8 +880,8 @@ export interface RunCallDeps {
   ): Promise<CallVoice>;
   /** Where turn recordings are written; NanoClaw's data directory by default. */
   recordingsRoot?: string;
-  /** Mark the worker's participant (the version-mismatch notice for the caller's page). */
-  setStatus(ctx: CallJob, status: WalkieStatus): Promise<void>;
+  /** Tell the caller's page this worker cannot serve the host's protocol version. */
+  markUpdating(ctx: CallJob): Promise<void>;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -925,8 +936,8 @@ class WalkieAgent extends voice.Agent {
   }
 }
 
-const setParticipantStatus = async (ctx: CallJob, status: WalkieStatus): Promise<void> => {
-  await ctx.room.localParticipant?.setAttributes({ [WALKIE_STATUS_ATTRIBUTE]: status });
+const setAttribute = async (ctx: CallJob, key: string, value: string): Promise<void> => {
+  await ctx.room.localParticipant?.setAttributes({ [key]: value });
 };
 
 type WorkerLog = Pick<Console, 'info' | 'warn' | 'error'>;
@@ -1110,8 +1121,8 @@ export function walkieSession(
     const sttFailed = sttFailedAt >= ev.vadSpeechStartedAt;
     // Silero reports no speech length at its end of speech, so the session's own count is taken too.
     const spokeMs = Math.max(ev.speechDuration, speechMs);
-    if (spokeMs < MIN_LOST_SPEECH_MS && !sttFailed) return events.onTurnDropped('too little speech', turn);
-    events.onTurnLost(sttFailed ? 'transcription failed' : 'no transcript', { speechMs: spokeMs }, turn);
+    if (spokeMs < MIN_LOST_SPEECH_MS && !sttFailed) return events.onTurnDropped(turn);
+    events.onTurnLost(sttFailed ? 'stt' : 'empty', { speechMs: spokeMs }, turn);
   });
   session.on(voice.AgentSessionEventTypes.Close, (ev) => {
     clearInterval(handBackTimer);
@@ -1176,8 +1187,13 @@ async function sessionVoice(
   });
   return {
     say,
-    setStatus(status) {
-      void setParticipantStatus(ctx, status).catch(() => undefined);
+    setThinking(thinking) {
+      void setAttribute(ctx, WALKIE_THINKING_ATTRIBUTE, thinking ? '1' : '').catch(() => undefined);
+    },
+    publishTurn(status) {
+      void ctx.room.localParticipant
+        ?.sendText(JSON.stringify(status), { topic: WALKIE_TURN_TOPIC })
+        .catch((err: unknown) => logger.warn({ err }, 'voice worker: could not publish a turn status'));
     },
     async close() {
       await session.close().catch(() => undefined);
@@ -1190,7 +1206,7 @@ function defaultDeps(): RunCallDeps {
   return {
     env: workerEnv(['GEMINI_API_KEY', 'LIVEKIT_API_SECRET', 'LIVEKIT_HOST_URL', 'WALKIE_RECORDINGS_DAYS']),
     createVoice: (ctx, meta, settings, events) => sessionVoice(ctx as JobContext, meta, settings, events),
-    setStatus: setParticipantStatus,
+    markUpdating: (ctx) => setAttribute(ctx, WALKIE_UPDATING_ATTRIBUTE, '1'),
     log: {
       info: (msg: string, fields?: unknown) => logger.info(fields ?? {}, msg),
       warn: (msg: string, fields?: unknown) => logger.warn(fields ?? {}, msg),
@@ -1222,7 +1238,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   if (header.v !== LIVEKIT_PROTOCOL_VERSION) {
     // Host and worker were not restarted together. Tell the caller's page, then let the host end it.
     await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
-    await deps.setStatus(ctx, 'updating').catch(() => undefined);
+    await deps.markUpdating(ctx).catch(() => undefined);
     await withTimeout(ctx.waitForParticipant(header.callerIdentity), 30_000, 'caller never joined').catch(
       () => undefined,
     );
@@ -1265,7 +1281,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         return { accepted: false, status: res.status };
       },
       say: (text) => callVoice?.say(text) ?? Promise.resolve(false),
-      setStatus: (status) => callVoice?.setStatus(status),
+      setThinking: (thinking) => callVoice?.setThinking(thinking),
       log: callLog,
     },
     { silenceMs: meta.silenceMs, language: DEFAULT_CALL_LANGUAGE },
@@ -1280,20 +1296,22 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     await ctx.deleteRoom().catch(() => undefined);
     ctx.shutdown(reason);
   };
-  // Turn recordings are written once the turn is settled, off the path to the host.
+  // Every caller turn gets a number. The page hears what became of it; a recording, when they are
+  // on, is written once the turn is settled, off the path to the host.
   let turns = 0;
+  const publish = (status: WalkieTurnStatus) => callVoice?.publishTurn(status);
   const saveTurn = (
+    index: number,
     { audio, sttModel }: TurnTake,
     transcript: string,
     outcome: { reason?: string; host?: SendResult },
   ) => {
     if (!audio) return;
-    const turn = ++turns;
     const record: TurnRecord = {
       callId: meta.callId,
       lineId: meta.lineId,
       agent: meta.agentName,
-      turn,
+      turn: index,
       startedAt: new Date(audio.startedAt).toISOString(),
       endedAt: new Date(audio.endedAt).toISOString(),
       speechMs: audio.speechMs,
@@ -1303,7 +1321,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       ...outcome,
     };
     void writeTurnRecording(deps.recordingsRoot ?? recordingsRoot(), record, audio).catch((err: unknown) =>
-      callLog.warn('voice worker: could not save a turn recording', { err, turn }),
+      callLog.warn('voice worker: could not save a turn recording', { err, turn: index }),
     );
   };
   try {
@@ -1312,13 +1330,25 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       meta,
       { geminiKey, record },
       {
-        onTurn: (text, turn) => walkie.onTurn(text, (host) => saveTurn(turn, text, { host })),
-        onCallerSpeaking: (speaking) => walkie.onCallerSpeaking(speaking),
-        onTurnLost: (reason, fields, turn) => {
-          walkie.onTurnLost(reason, fields);
-          saveTurn(turn, '', { reason });
+        onTurn: (text, take) => {
+          const turn = ++turns;
+          walkie.onTurn(text, (host) => {
+            publish(
+              host.accepted
+                ? { turn, status: 'sent', text }
+                : { turn, status: 'lost', reason: hostLossReason(host), text },
+            );
+            saveTurn(turn, take, text, { host });
+          });
         },
-        onTurnDropped: (reason, turn) => saveTurn(turn, '', { reason }),
+        onCallerSpeaking: (speaking) => walkie.onCallerSpeaking(speaking),
+        onTurnLost: (reason, fields, take) => {
+          const turn = ++turns;
+          walkie.onTurnLost(reason, fields);
+          publish({ turn, status: 'lost', reason });
+          saveTurn(turn, take, '', { reason });
+        },
+        onTurnDropped: (take) => saveTurn(++turns, take, '', { reason: 'noise' }),
         onClosed: (reason) => void end(reason, true),
       },
     );

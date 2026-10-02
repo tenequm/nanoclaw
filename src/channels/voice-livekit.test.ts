@@ -23,7 +23,7 @@ import type { MessagingGroup } from '../types.js';
 import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
-  WALKIE_STATUS_ATTRIBUTE,
+  WALKIE_THINKING_ATTRIBUTE,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
 } from './voice-livekit-protocol.js';
@@ -846,7 +846,7 @@ describe('livekit call page', () => {
     expect(script).toContain("setStatus(names.agent + ' is thinking')");
     expect(script).toContain("setStatus(names.agent + ' is speaking')");
     // Thinking comes from the worker's own attribute, not lk.agent.state.
-    expect(script).toContain(`const STATUS_ATTR = '${WALKIE_STATUS_ATTRIBUTE}'`);
+    expect(script).toContain(`const THINKING_ATTR = '${WALKIE_THINKING_ATTRIBUTE}'`);
     expect(script).toContain("registerTextStreamHandler('lk.transcription'");
     // The caller's own turns come back from the worker against the caller's track: "You".
     expect(script).toContain("attrs['lk.transcribed_track_id'] === c.localSid");

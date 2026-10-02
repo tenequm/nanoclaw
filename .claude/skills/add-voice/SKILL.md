@@ -519,8 +519,9 @@ call the host does not answer ends at once with the URL in the log). Each idle
 job process loads the Silero models before a call reaches it. On SIGTERM it takes no new calls and gives running ones 60 seconds before
 closing them, so a restart cuts a longer call short. Host and worker must be
 from the same build, so restart them together: the job metadata is versioned
-(`v: 3`). A worker that gets a call of another version joins only to tell the
-caller's page "The voice service is updating. Try again in a minute." and leaves;
+(`v: 3`). A worker that gets a call of another version joins only to set its
+`nanoclaw.walkie.updating` attribute, so the caller's page says "The voice service
+is updating. Try again in a minute.", and leaves;
 the page says the same when no worker joins within 25 seconds (worker down, or
 an older one that turns such calls away), and the host logs why the call ended.
 As a systemd user unit:
@@ -581,7 +582,10 @@ from `LIVEKIT_API_SECRET`, so the worker needs that key too. Then, walkie-talkie
 - When a turn is lost (speech that came out as no text, or the host refusing
   or not answering the turn) the caller hears "Не розчув, повтори, будь ласка" or
   "Sorry, I didn't catch that", in the language of their last turn; when a reply
-  cannot be synthesized, a line saying so. Both also show as captions.
+  cannot be synthesized, a line saying so. Both also show as captions. The
+  worker also sends one JSON message per caller turn on the text stream topic
+  `nanoclaw.walkie.turn`: `{"turn": n, "status": "sent" | "lost", "reason"?:
+  "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
 
 Turns are capped at 8 KB of text and 20 a minute per call. A reply for a call
 that already ended is not spoken. If the worker does not open its event stream
@@ -605,7 +609,8 @@ message it answers), so nothing is posted twice.
 The page loads `livekit-client` from the host itself (`/webhook/voice/livekit/client.js`),
 no CDN. Its status line shows Listening or `<agent>` is speaking (the
 session's `lk.agent.state`) and `<agent>` is thinking (the worker's own
-`nanoclaw.walkie` attribute, from the host's typing refresh), and the captions
+`nanoclaw.walkie.thinking` attribute, `1` while the host's typing refresh says
+the agent works), and the captions
 show `You: <transcript>` while the caller talks and `<agent>: <reply>` in step
 with the speech. Microphone capture runs with echo
 cancellation, noise suppression and auto gain; DTX is off so the VAD keeps
