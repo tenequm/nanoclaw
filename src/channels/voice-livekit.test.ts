@@ -1,8 +1,9 @@
 /**
  * The LiveKit path of the voice channel at the host boundary: the real adapter
  * behind the real webhook server, hit over HTTP the way the call page and the
- * worker do. Faked: the LiveKit server API (recorded calls), Google's token
- * endpoint (for the cross-engine test), the mirror's chats and the clock.
+ * worker do. Faked: the LiveKit server API (recorded calls), the mirror's
+ * chats and the clock. OpenAI is unreachable, so the GPT-Live engine only
+ * shows up where its limits refuse a start before any upstream request.
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -78,25 +79,6 @@ function freePort(): Promise<number> {
       const port = (s.address() as AddressInfo).port;
       s.close(() => resolve(port));
     });
-  });
-}
-
-/** A one-endpoint stand-in for Google's ephemeral token API. */
-function startFakeGoogle(): Promise<{ apiBase: string; close(): Promise<void> }> {
-  const server = http.createServer((req, res) => {
-    req.resume();
-    req.on('end', () => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ name: 'auth_tokens/fake' }));
-    });
-  });
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () =>
-      resolve({
-        apiBase: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
-        close: () => new Promise((r) => server.close(() => r())),
-      }),
-    );
   });
 }
 
@@ -313,6 +295,16 @@ async function startCall(h: Harness): Promise<{ call: TokenResponse; worker: Fak
 
 const settle = () => new Promise((r) => setTimeout(r, 30));
 
+/** A GPT-Live start; OpenAI is unreachable here, so only a refusal by the shared limits is meaningful. */
+const offer = (h: Harness): Promise<Response> =>
+  fetch(`${h.base}/sdp?t=tok123`, { method: 'POST', body: 'v=0\r\noffer' });
+
+/** The room of the call a newer one replaced while connecting: the one the newer call was not given. */
+function replacedRoom(h: Harness, newer: TokenResponse): string {
+  const newerRoom = h.lk.dispatches.find((d) => d.metadata.callId === newer.callId)!.room;
+  return h.lk.rooms.find((r) => r !== newerRoom)!;
+}
+
 describe('livekit voice path without LiveKit settings', () => {
   let h: Harness;
   beforeAll(async () => {
@@ -336,18 +328,12 @@ describe('livekit voice path without LiveKit settings', () => {
 
 describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   let h: Harness;
-  let google: { apiBase: string; close(): Promise<void> };
 
   beforeEach(async () => {
-    google = await startFakeGoogle();
-    h = await startHarness({
-      accessCheckIntervalMs: 50,
-      gemini: { apiKey: 'gk-test', apiBase: google.apiBase },
-    });
+    h = await startHarness({ accessCheckIntervalMs: 50 });
   });
   afterEach(async () => {
     await h.stop();
-    await google.close();
   });
 
   it('renders the walkie-talkie link of a line it holds the token for, and no other', () => {
@@ -560,8 +546,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('charges the daily minutes from join to end and caps a call at the remaining budget', async () => {
     await h.stop();
-    google = await startFakeGoogle();
-    h = await startHarness({ maxCallMsPerDay: 2 * MIN, gemini: { apiKey: 'gk-test', apiBase: google.apiBase } });
+    h = await startHarness({ maxCallMsPerDay: 2 * MIN });
     const first = await startCall(h);
     h.clock.now += 90_000;
     await post(`${h.base}/livekit/end?t=tok123`, { callId: first.call.callId });
@@ -576,28 +561,27 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     // The day's minutes are gone for every engine.
     const refused = await post(`${h.base}/livekit/token?t=tok123`);
     expect(refused.status).toBe(429);
-    expect((await post(`${h.base}/gemini/token?t=tok123`)).status).toBe(429);
+    expect((await offer(h)).status).toBe(429);
   });
 
   it('ends a call that runs into the budget cap by deleting its room', async () => {
     await h.stop();
-    google = await startFakeGoogle();
-    h = await startHarness({ maxCallMsPerDay: 100, gemini: { apiKey: 'gk-test', apiBase: google.apiBase } });
+    h = await startHarness({ maxCallMsPerDay: 100 });
     const { worker } = await startCall(h);
     await worker.streamClosed;
     expect(worker.events.at(-1)).toEqual({ type: 'end', reason: 'daily minute budget' });
     expect(h.lk.deleted).toHaveLength(1);
   });
 
-  it('shares the hourly start cap with the other engines', async () => {
+  it('shares the hourly start cap with the GPT-Live engine', async () => {
     await h.stop();
-    google = await startFakeGoogle();
-    h = await startHarness({ maxCallsPerHour: 2, gemini: { apiKey: 'gk-test', apiBase: google.apiBase } });
-    expect((await post(`${h.base}/gemini/token?t=tok123`)).status).toBe(200);
+    h = await startHarness({ maxCallsPerHour: 2 });
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
-    const refused = await post(`${h.base}/livekit/token?t=tok123`);
+    expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
+    const refused = await offer(h);
     expect(refused.status).toBe(429);
     expect(refused.headers.get('retry-after')).toBeTruthy();
+    expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(429);
   });
 
   it('deletes the room of a call that was replaced while it was connecting', async () => {
@@ -606,11 +590,12 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const first = post(`${h.base}/livekit/token?t=tok123`);
     await settle();
     // A newer call takes the line while the room is still being created.
-    expect((await post(`${h.base}/gemini/token?t=tok123`)).status).toBe(200);
     h.lk.createGate = null;
+    const second = await post(`${h.base}/livekit/token?t=tok123`);
+    expect(second.status).toBe(200);
     release();
     expect((await first).status).toBe(409);
-    const [room] = h.lk.rooms;
+    const room = replacedRoom(h, (await second.json()) as TokenResponse);
     // The replaced call's own cleanup ran before the room existed; the room still goes.
     expect(h.lk.ops.indexOf(`create:${room}`)).toBeGreaterThanOrEqual(0);
     expect(h.lk.ops.lastIndexOf(`delete:${room}`)).toBeGreaterThan(h.lk.ops.indexOf(`create:${room}`));
@@ -637,7 +622,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     h.lk.createGate = new Promise((r) => (release = r));
     const first = post(`${h.base}/livekit/token?t=tok123`);
     await settle();
-    expect((await post(`${h.base}/gemini/token?t=tok123`)).status).toBe(200);
+    h.lk.createGate = null;
+    const second = await post(`${h.base}/livekit/token?t=tok123`);
+    expect(second.status).toBe(200);
     let releaseDelete!: () => void;
     const deleteGate = new Promise<void>((r) => (releaseDelete = r));
     const deleteRoom = h.lk.deleteRoom.bind(h.lk);
@@ -645,7 +632,6 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       await deleteGate;
       return deleteRoom(room);
     };
-    h.lk.createGate = null;
     release();
     await settle();
     let tornDown = false;
@@ -655,13 +641,12 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     releaseDelete();
     await teardown;
     expect((await first).status).toBe(409);
-    expect(h.lk.deleted).toContain(h.lk.rooms[0]);
+    expect(h.lk.deleted).toContain(replacedRoom(h, (await second.json()) as TokenResponse));
   });
 
   it('ends a call whose worker never opens its event stream after reporting the caller in', async () => {
     await h.stop();
-    google = await startFakeGoogle();
-    h = await startHarness({ gemini: { apiKey: 'gk-test', apiBase: google.apiBase } }, true, {
+    h = await startHarness({}, true, {
       workerStreamTimeoutMs: 100,
     });
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(200);
@@ -678,8 +663,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('refuses a delivery once the caller lost access instead of reporting it sent', async () => {
     await h.stop();
-    google = await startFakeGoogle();
-    h = await startHarness({ accessCheckIntervalMs: 60_000, gemini: { apiKey: 'gk-test', apiBase: google.apiBase } });
+    h = await startHarness({ accessCheckIntervalMs: 60_000 });
     const { worker } = await startCall(h);
     h.access.enabled = false;
     await expect(
@@ -690,8 +674,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('refuses a start over the daily minutes without ending the running call', async () => {
     await h.stop();
-    google = await startFakeGoogle();
-    h = await startHarness({ maxCallMsPerDay: 2 * MIN, gemini: { apiKey: 'gk-test', apiBase: google.apiBase } });
+    h = await startHarness({ maxCallMsPerDay: 2 * MIN });
     const { worker } = await startCall(h);
     h.clock.now += 2 * MIN;
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(429);
@@ -699,21 +682,6 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.deleted).toEqual([]);
     expect(worker.events.some((e) => e.type === 'end')).toBe(false);
     worker.close();
-  });
-
-  it('newest wins across engines on a line', async () => {
-    const gemini = (await (await post(`${h.base}/gemini/token?t=tok123`)).json()) as { callId: string };
-    const { worker } = await startCall(h);
-    // The LiveKit call replaced the Gemini one.
-    expect(
-      (await post(`${h.base}/gemini/consult?t=tok123`, { callId: gemini.callId, functionCallId: 'f', request: 'x' }))
-        .status,
-    ).toBe(409);
-    // And a Gemini call replaces the LiveKit one.
-    expect((await post(`${h.base}/gemini/token?t=tok123`)).status).toBe(200);
-    await worker.streamClosed;
-    expect(worker.events.at(-1)).toEqual({ type: 'end', reason: 'replaced by a new call' });
-    expect(h.lk.deleted).toHaveLength(1);
   });
 });
 
