@@ -21,8 +21,12 @@ export const DEFAULT_GEMINI_API_BASE = 'https://generativelanguage.googleapis.co
 export const DEFAULT_GEMINI_LIVE_MODEL = 'gemini-3.8-live';
 export const DEFAULT_GEMINI_LIVE_VOICE = 'Kore';
 /** The token must open its session this soon after minting. */
-export const GEMINI_NEW_SESSION_WINDOW_MS = 60_000;
+const GEMINI_NEW_SESSION_WINDOW_MS = 60_000;
 export const ASK_AGENT_TOOL = 'ask_agent';
+/** Google drops Live audio connections at about 10 minutes and the page has no session resumption yet. */
+export const GEMINI_MAX_CALL_MS = 10 * 60_000;
+/** Prefix of a queued agent message the page injects as a user text turn; the prompt tells the model what it is. */
+export const AGENT_UPDATE_PREFIX = 'Agent update:';
 
 const ASK_AGENT_DECLARATION = {
   name: ASK_AGENT_TOOL,
@@ -61,6 +65,8 @@ export function geminiLiveSetup(model: string, voice: string, instructions: stri
     },
     systemInstruction: { parts: [{ text: instructions }] },
     tools: [{ functionDeclarations: [ASK_AGENT_DECLARATION] }],
+    // No language hint: native-audio models pick the language themselves and take no languageCode, and
+    // inputAudioTranscription.languageCodes is documented only for gemini-3.5-transcribe-live (2026-10).
     inputAudioTranscription: {},
     outputAudioTranscription: {},
   };
@@ -126,28 +132,13 @@ export async function mintGeminiToken(opts: MintGeminiTokenOptions): Promise<str
   return token;
 }
 
-/**
- * The inbound message id for an ask_agent call. The agent's reply carries it
- * back as `in_reply_to`, which is how deliver() finds the waiting consult.
- */
-const CONSULT_ID_PREFIX = 'gemini:';
-
-export function geminiConsultMessageId(callId: string, functionCallId: string): string {
-  return `${CONSULT_ID_PREFIX}${callId}:${functionCallId}`;
-}
-
-export function parseGeminiConsultMessageId(id: string): { callId: string; functionCallId: string } | null {
-  if (!id.startsWith(CONSULT_ID_PREFIX)) return null;
-  const rest = id.slice(CONSULT_ID_PREFIX.length);
-  const sep = rest.indexOf(':');
-  if (sep <= 0 || sep === rest.length - 1) return null;
-  return { callId: rest.slice(0, sep), functionCallId: rest.slice(sep + 1) };
-}
+/** Above this much unsent WebSocket data the page skips microphone frames. */
+const MAX_BUFFERED_BYTES = 256 * 1024;
 
 /** The microphone worklet: resample to 16 kHz mono PCM16 and post 40 ms frames, silence included. */
 const MIC_WORKLET = [
   'class MicPcm16k extends AudioWorkletProcessor {',
-  '  constructor() { super(); this.ratio = sampleRate / 16000; this.pos = 0; this.acc = 0; this.cnt = 0; this.out = new Int16Array(640); this.n = 0; }',
+  '  constructor() { super(); this.ratio = sampleRate / 16000; this.pos = 0; this.acc = 0; this.cnt = 0; this.last = 0; this.out = new Int16Array(640); this.n = 0; }',
   '  push(v) {',
   '    v = Math.max(-1, Math.min(1, v));',
   '    this.out[this.n++] = v < 0 ? v * 0x8000 : v * 0x7fff;',
@@ -158,7 +149,8 @@ const MIC_WORKLET = [
   '    const len = ch ? ch.length : 128;',
   '    for (let i = 0; i < len; i++) {',
   '      this.acc += ch ? ch[i] : 0; this.cnt++; this.pos += 1;',
-  '      if (this.pos >= this.ratio) { this.pos -= this.ratio; this.push(this.acc / this.cnt); this.acc = 0; this.cnt = 0; }',
+  // Below 16 kHz one input sample yields several output samples; they repeat the last average.
+  '      while (this.pos >= this.ratio) { this.pos -= this.ratio; if (this.cnt) this.last = this.acc / this.cnt; this.push(this.last); this.acc = 0; this.cnt = 0; }',
   '    }',
   '    return true;',
   '  }',
@@ -206,6 +198,12 @@ function b64(buffer) {
 function send(c, msg) {
   if (c.ws && c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(msg));
 }
+function sendAudio(c, buffer) {
+  // On a stalled uplink, drop microphone frames rather than queue seconds of stale audio.
+  if (!c.ws || c.ws.readyState !== WebSocket.OPEN || c.ws.bufferedAmount > MAX_BUFFERED_BYTES) return;
+  c.ws.send(JSON.stringify({ realtimeInput: { audio: { data: b64(buffer), mimeType: 'audio/pcm;rate=16000' } } }));
+}
+function pause(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 function play(c, data, mimeType) {
   const m = /rate=(\d+)/.exec(mimeType || '');
@@ -242,8 +240,7 @@ function startMic(c) {
   const node = new AudioWorkletNode(c.ctx, 'mic-pcm16k');
   const mute = c.ctx.createGain();
   mute.gain.value = 0;
-  node.port.onmessage = (ev) =>
-    send(c, { realtimeInput: { audio: { data: b64(ev.data), mimeType: 'audio/pcm;rate=16000' } } });
+  node.port.onmessage = (ev) => sendAudio(c, ev.data);
   src.connect(node);
   node.connect(mute);
   mute.connect(c.ctx.destination);
@@ -257,10 +254,11 @@ function respond(c, fc, response) {
 }
 function consult(c, fc) {
   if (!fc || !fc.id || c.consults.has(fc.id)) return;
-  if (fc.name !== 'ask_agent') return respond(c, fc, { error: 'Unknown function ' + fc.name });
+  if (fc.name !== ASK_AGENT) return respond(c, fc, { error: 'Unknown function ' + fc.name });
   const request = fc.args && typeof fc.args.request === 'string' ? fc.args.request : '';
   const ctl = new AbortController();
   c.consults.set(fc.id, ctl);
+  c.lastCall = { id: fc.id, name: fc.name };
   note('Asking ' + names.agent + ': ' + request);
   fetch(base + '/gemini/consult' + q, {
     method: 'POST',
@@ -277,21 +275,58 @@ function consult(c, fc) {
     });
 }
 
-async function onMessage(c, data) {
+// Later agent messages for this call (see voice.ts). Gemini speaks an extra function response WHEN_IDLE
+// and does not check its id, so they ride on the latest ask_agent call; client text barges in within
+// milliseconds, so it is only the fallback before any ask_agent call, and only while the model is idle.
+function speakUpdates(c) {
+  if (c.ended || !c.ready || !c.updates.length) return;
+  if (c.lastCall) {
+    for (const text of c.updates.splice(0)) respond(c, c.lastCall, { answer: text });
+    return;
+  }
+  if (c.modelBusy) return;
+  send(c, { realtimeInput: { text: c.updates.splice(0).map((text) => AGENT_UPDATE + ' ' + text).join('\n') } });
+}
+async function pollUpdates(c) {
+  while (!c.ended) {
+    let res;
+    try {
+      res = await fetch(base + '/gemini/messages' + q + '&callId=' + encodeURIComponent(c.callId), {
+        signal: c.pollCtl.signal,
+      });
+    } catch {
+      if (c.ended) return;
+      await pause(2000);
+      continue;
+    }
+    if (c.ended) return;
+    // The host ended the call: a newer call took the line, access changed, or time ran out.
+    if (res.status === 403 || res.status === 409) return hangup(c, 'The call was ended by the host.');
+    const body = res.ok ? await res.json().catch(() => null) : null;
+    if (!res.ok) await pause(2000);
+    for (const text of (body && body.messages) || []) {
+      if (typeof text !== 'string' || !text.trim()) continue;
+      note('Update from ' + names.agent + ': ' + text);
+      c.updates.push(text);
+    }
+    speakUpdates(c);
+  }
+}
+
+// Synchronous so frames are handled strictly in arrival order (binaryType is arraybuffer).
+function onMessage(c, data) {
   if (c.ended) return;
-  const text = typeof data === 'string' ? data : data instanceof Blob ? await data.text() : new TextDecoder().decode(data);
   let m;
-  try { m = JSON.parse(text); } catch { return; }
-  if (c.ended) return;
+  try { m = JSON.parse(typeof data === 'string' ? data : new TextDecoder().decode(data)); } catch { return; }
   if (m.setupComplete && !c.ready) {
     c.ready = true;
     startMic(c);
     setStatus('Live: talk to ' + names.agent + '.');
     send(c, { clientContent: { turns: [{ role: 'user', parts: [{ text: '(The call just connected. Greet the caller.)' }] }], turnComplete: true } });
+    void pollUpdates(c);
   }
   const sc = m.serverContent;
   if (sc) {
-    if (sc.interrupted) flush(c);
     if (sc.inputTranscription && sc.inputTranscription.text) {
       c.outLine = null;
       c.inLine = append(c.inLine, 'caller', 'You', sc.inputTranscription.text);
@@ -300,20 +335,25 @@ async function onMessage(c, data) {
       c.inLine = null;
       c.outLine = append(c.outLine, 'agent', names.agent, sc.outputTranscription.text);
     }
-    for (const p of (sc.modelTurn && sc.modelTurn.parts) || []) {
-      if (p.inlineData && p.inlineData.data) play(c, p.inlineData.data, p.inlineData.mimeType);
+    if (sc.interrupted) {
+      // Audio riding on the interruption belongs to the turn being cut off.
+      flush(c);
+      c.modelBusy = false;
+    } else if (sc.modelTurn) {
+      c.modelBusy = true;
+      for (const p of sc.modelTurn.parts || []) {
+        if (p.inlineData && p.inlineData.data) play(c, p.inlineData.data, p.inlineData.mimeType);
+      }
     }
     if (sc.turnComplete || sc.interrupted || sc.generationComplete) c.outLine = null;
-    if (sc.turnComplete) c.inLine = null;
-  }
-  if (m.toolCall) for (const fc of m.toolCall.functionCalls || []) consult(c, fc);
-  if (m.toolCallCancellation) {
-    for (const id of m.toolCallCancellation.ids || []) {
-      const ctl = c.consults.get(id);
-      c.consults.delete(id);
-      if (ctl) ctl.abort();
+    if (sc.turnComplete) {
+      c.inLine = null;
+      c.modelBusy = false;
+      speakUpdates(c);
     }
   }
+  // toolCallCancellation is deliberately ignored: the agent's answer still goes back, WHEN_IDLE.
+  if (m.toolCall) for (const fc of m.toolCall.functionCalls || []) consult(c, fc);
   if (m.goAway) setStatus('The voice service is ending this call soon.');
 }
 
@@ -330,6 +370,7 @@ function hangup(c, message, beacon) {
   if (c.ended) return;
   c.ended = true;
   clearTimeout(c.deadline);
+  c.pollCtl.abort();
   for (const ctl of c.consults.values()) ctl.abort();
   c.consults.clear();
   if (c.ctx) flush(c);
@@ -348,10 +389,12 @@ async function start() {
   // Created inside the click so browsers that gate audio on a gesture let it run.
   const c = { ctx: new AudioContext(), ws: null, stream: null, node: null, callId: null, ready: false, ended: false,
     endSent: false, consults: new Map(), sources: new Set(), playhead: 0, deadline: null, inLine: null, outLine: null,
-    scheduling: null };
+    scheduling: null, updates: [], modelBusy: false, lastCall: null, pollCtl: new AbortController() };
   call = c;
   btn.textContent = 'Hang up';
   btn.className = 'hang';
+  // iOS starts an AudioContext only inside the gesture, so resume before the first await.
+  c.ctx.resume().catch(() => {});
   try {
     setStatus('Starting the microphone...');
     c.stream = await navigator.mediaDevices.getUserMedia({
@@ -365,15 +408,22 @@ async function start() {
     setStatus('Connecting...');
     const res = await fetch(base + '/gemini/token' + q, { method: 'POST' });
     if (!res.ok) throw new Error((await res.text()) || 'HTTP ' + res.status);
-    const s = await res.json();
+    const s = await res.json().catch(() => null);
+    if (!s || typeof s.token !== 'string' || !s.token || typeof s.callId !== 'string') {
+      throw new Error('The host sent no call token.');
+    }
     c.callId = s.callId;
     c.scheduling = s.scheduling;
     if (c.ended) return endOnServer(c, false);
-    c.deadline = setTimeout(() => hangup(c, 'Time limit reached.'), Math.max(1000, s.expiresAt - Date.now()));
+    // Relative to receipt, so a skewed device clock cannot stretch or cut the call.
+    c.deadline = setTimeout(() => hangup(c, 'Time limit reached.'), Math.max(1000, Number(s.durationMs) || 0));
     const ws = new WebSocket(s.websocketUrl + '?access_token=' + encodeURIComponent(s.token));
+    ws.binaryType = 'arraybuffer';
     c.ws = ws;
     ws.onopen = () => send(c, { setup: s.setup });
-    ws.onmessage = (ev) => { onMessage(c, ev.data).catch((err) => console.error(err)); };
+    ws.onmessage = (ev) => {
+      try { onMessage(c, ev.data); } catch (err) { console.error(err); }
+    };
     ws.onclose = (ev) => {
       const why = ev.code && ev.code !== 1000 ? ' (' + ev.code + (ev.reason ? ': ' + ev.reason : '') + ')' : '';
       hangup(c, 'Call closed' + why + '.');
@@ -425,6 +475,9 @@ button.hang{background:var(--danger)}
 </main>
 <script type="module">
 const WORKLET = ${JSON.stringify(MIC_WORKLET)};
+const ASK_AGENT = ${JSON.stringify(ASK_AGENT_TOOL)};
+const AGENT_UPDATE = ${JSON.stringify(AGENT_UPDATE_PREFIX)};
+const MAX_BUFFERED_BYTES = ${MAX_BUFFERED_BYTES};
 ${PAGE_SCRIPT}
 </script>
 </body>

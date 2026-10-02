@@ -801,7 +801,7 @@ describe('voice delegation deadlines, daily budget and teardown races', () => {
     vi.unstubAllEnvs();
   });
 
-  it('tells the caller a delegation failed when the agent misses the deadline', async () => {
+  it('tells the caller a delegation is taking longer when the agent misses the deadline', async () => {
     await boot({ delegationTimeoutMs: 150 });
     expect((await offer()).status).toBe(200);
     delegate('item_1');
@@ -858,6 +858,54 @@ describe('voice delegation deadlines, daily budget and teardown races', () => {
     expect(second.status).toBe(200);
     const sessionId = second.headers.get('x-voice-session')!;
     await vi.waitFor(() => expect(fake.hangups).toContain(sessionId), { timeout: 2000 });
+  });
+
+  it('the newest call wins across engines, and each engine keeps its own charge', async () => {
+    const MIN = 60_000;
+    const google = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ name: 'auth_tokens/fake' }));
+      });
+    });
+    await new Promise<void>((r) => google.listen(0, '127.0.0.1', () => r()));
+    try {
+      await boot({
+        maxCallMsPerDay: 26 * MIN,
+        gemini: { apiKey: 'gk', apiBase: `http://127.0.0.1:${(google.address() as AddressInfo).port}` },
+      });
+      const line = lineIdForToken('tok');
+      const token = async (): Promise<{ callId: string; durationMs: number }> => {
+        const res = await fetch(`${base}/gemini/token?t=tok`, { method: 'POST' });
+        expect(res.status).toBe(200);
+        return (await res.json()) as { callId: string; durationMs: number };
+      };
+
+      expect((await offer()).status).toBe(200);
+      clock += 5 * MIN;
+      // A Gemini token hangs up the OpenAI call (5 min charged) and reserves its own 10.
+      const gemini = await token();
+      await vi.waitFor(() => expect(fake.hangups).toEqual(['live_fake1']));
+      await expect(adapter.deliver(line, null, { kind: 'chat', content: { text: 'FYI' } })).resolves.toMatch(
+        /^gemini-update:/,
+      );
+      expect(commentary()).toHaveLength(0);
+
+      clock += MIN;
+      // An OpenAI call ends the Gemini call's record; its reserved minutes stay spent.
+      const second = await offer();
+      expect(second.status).toBe(200);
+      const poll = await fetch(`${base}/gemini/messages?t=tok&callId=${gemini.callId}`);
+      expect(poll.status).toBe(409);
+      clock += 3 * MIN;
+      const session = second.headers.get('x-voice-session')!;
+      expect((await fetch(`${base}/hangup?t=tok&session=${session}`, { method: 'POST' })).status).toBe(204);
+      // 5 + 10 + 3 of 26 minutes used.
+      expect((await token()).durationMs).toBe(8 * MIN);
+    } finally {
+      await new Promise((r) => google.close(r));
+    }
   });
 
   it('a teardown during the access recheck hangs up the session and never attaches', async () => {

@@ -56,10 +56,10 @@ export interface SessionSink {
 
 /**
  * Conservative character budget for one append. The API caps an append at
- * 500 tokens; English prose runs roughly 4 characters per token, and spoken
- * replies skew short-worded, so 1,500 characters leaves headroom.
+ * 500 tokens; English runs about 4 characters per token but Cyrillic
+ * (Ukrainian) only 2-3, so 600 characters stays under the cap for both.
  */
-export const MAX_APPEND_CHARS = 1500;
+export const MAX_APPEND_CHARS = 600;
 
 const CALLER = 'Caller';
 const ASSISTANT = 'Assistant';
