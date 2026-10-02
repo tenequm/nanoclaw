@@ -11,10 +11,10 @@ standing in for it: each spoken turn is transcribed and handed to the agent as
 a message, and every reply the agent sends is read out. The call runs over
 WebRTC through a self-hosted [LiveKit](https://docs.livekit.io/) server; a
 LiveKit Agents worker next to the host cuts the caller's audio into turns,
-transcribes them with Gemini and speaks the agent's replies with Gemini TTS. Native adapter: the host owns the
-call (admits it, opens its room, dispatches the worker, checks access, ends
-it) and routes turns and replies through its normal inbound and delivery
-paths. NanoClaw doesn't ship channels in trunk — this skill copies the adapter,
+transcribes them with Gemini and speaks the agent's replies with Gemini TTS.
+Native adapter: the host owns the call (admits it, opens its room, dispatches
+the worker, checks access, ends it) and routes turns and replies through its
+normal inbound and delivery paths. NanoClaw doesn't ship channels in trunk — this skill copies the adapter,
 the worker and their tests in from the `channels` branch.
 
 A **voice line** is one call link, `…/voice?t=<token>`, wired to one agent
