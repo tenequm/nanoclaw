@@ -51,7 +51,10 @@ to say, so it spells them exactly: `VOICE_VOCABULARY` (comma-separated, in
 (one term per line, read with a size cap, symlinks and FIFOs refused),
 e.g. `VOICE_VOCABULARY=Acme, Zephyr, k8s`. Both are merged, trimmed and
 deduplicated, and capped at 60 terms and 1 KB. `VOICE_VOCABULARY` is read at
-startup, the file on every call.
+startup, the file on every call. The agent maintains the file itself: the
+`voice-formatting` container skill tells it to add names a transcript
+misspelled, so read or edit `groups/<folder>/voice.vocabulary.txt` to check
+or correct its entries.
 
 The stable channel identifier and URL prefix are `voice`.
 
