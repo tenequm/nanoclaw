@@ -109,8 +109,8 @@ export interface SpeechSession {
 
 interface WaitingCall {
   toolCallId: string;
-  /** Answer the execution with the agent's reply. */
-  settle(text: string): void;
+  /** Answer the execution with these instructions (an agent reply or the timeout line). */
+  settle(instructions: string): void;
   /** End the execution without an answer. */
   cancel(text: string): void;
 }
@@ -119,6 +119,8 @@ export interface CallBridgeOptions {
   agentName: string;
   /** Longest a tool execution waits for its answer; the host's own timeout fires first. */
   answerWaitMs: number;
+  /** The host's line for an ask_agent that got no reply in time (DELEGATION_TIMEOUT_LINE). */
+  timeoutLine: string;
   confirmMs?: number;
   log?: Pick<Console, 'info' | 'warn'>;
 }
@@ -142,6 +144,13 @@ export class CallBridge {
 
   answerInstructions(text: string): string {
     return `${ANSWER_PREFIX} (${this.options.agentName}): ${text}\nTell the caller this now, in your own words, briefly.`;
+  }
+
+  timeoutInstructions(line: string): string {
+    return (
+      `No answer from ${this.options.agentName} yet. Tell the caller, in their language: "${line}" ` +
+      `Do not guess the answer; it still arrives later as an "${ANSWER_PREFIX}" instruction.`
+    );
   }
 
   /** The ask_agent tool for the session's agent. */
@@ -189,16 +198,16 @@ export class CallBridge {
       };
       const entry: WaitingCall = {
         toolCallId,
-        settle: (answer) => {
+        settle: (instructions) => {
           // The framework confirms the output reached the model; if it never does, speak it anyway.
           const fallback = setTimeout(() => {
             this.unconfirmed.delete(toolCallId);
             this.options.log?.warn('ask_agent: tool output never reached the model; speaking it as a new turn');
-            void this.speak(this.answerInstructions(answer));
+            void this.speak(instructions);
           }, this.options.confirmMs ?? TOOL_OUTPUT_CONFIRM_MS);
           fallback.unref?.();
-          this.unconfirmed.set(toolCallId, { text: answer, timer: fallback });
-          finish(this.answerInstructions(answer));
+          this.unconfirmed.set(toolCallId, { text: instructions, timer: fallback });
+          finish(instructions);
         },
         cancel: (value) => finish(value),
       };
@@ -208,7 +217,7 @@ export class CallBridge {
         finish('');
       };
       const timer = setTimeout(
-        () => finish(`${this.options.agentName} has not answered yet. Tell the caller it is taking longer.`),
+        () => finish(this.timeoutInstructions(this.options.timeoutLine)),
         this.options.answerWaitMs,
       );
       timer.unref?.();
@@ -232,16 +241,19 @@ export class CallBridge {
     if (this.closed) return;
     switch (event.type) {
       case 'reply': {
+        const instructions = event.timedOut
+          ? this.timeoutInstructions(event.text)
+          : this.answerInstructions(event.text);
         const first = this.waiting.shift();
         if (!first) {
-          void this.speak(this.answerInstructions(event.text));
+          void this.speak(instructions);
           return;
         }
-        first.settle(event.text);
+        first.settle(instructions);
         // A batched agent turn answers every open request at once; a timeout answers its own.
         if (!event.timedOut) {
           for (const other of this.waiting.splice(0)) {
-            other.settle('(answered together with the previous request; nothing to add)');
+            other.cancel('Answered together with the previous request; nothing to add.');
           }
         }
         return;
@@ -257,7 +269,8 @@ export class CallBridge {
         if (this.waiting.length === 0 || this.pendingSpeech > 0) return;
         if (this.session.userState === 'speaking' || this.session.agentState === 'speaking') return;
         void this.speak(
-          `${this.options.agentName} is still working on it. Say one very short holding line such as "still on it", then wait.`,
+          `${this.options.agentName} is still working on it. Say in one short sentence that it is taking a little ` +
+            'longer and you will tell them as soon as it is done, then wait.',
         );
         return;
       default:
@@ -369,6 +382,7 @@ async function runCall(ctx: JobContext): Promise<void> {
     agentName: meta.agentName,
     // The host answers with the timeout line at delegationTimeoutMs; this is only a backstop.
     answerWaitMs: meta.delegationTimeoutMs + 15_000,
+    timeoutLine: meta.timeoutLine,
     log: {
       info: (msg: string) => logger.info({ callId: meta.callId }, msg),
       warn: (msg: string, err?: unknown) => logger.warn({ callId: meta.callId, err }, msg),

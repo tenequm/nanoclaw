@@ -60,6 +60,7 @@ function fakeHost(status = 202) {
   };
 }
 
+const TIMEOUT_LINE = "This is taking longer than expected, I'll tell you as soon as it's done.";
 const flush = () => new Promise((r) => setTimeout(r, 5));
 
 describe('CallBridge', () => {
@@ -70,7 +71,12 @@ describe('CallBridge', () => {
   it('returns the first agent reply as the tool result, confirmed by the framework', async () => {
     const session = fakeSession();
     const host = fakeHost();
-    const bridge = new CallBridge(session, host, { agentName: 'Andy', answerWaitMs: 60_000, confirmMs: 50 });
+    const bridge = new CallBridge(session, host, {
+      agentName: 'Andy',
+      answerWaitMs: 60_000,
+      timeoutLine: TIMEOUT_LINE,
+      confirmMs: 50,
+    });
     const result = bridge.ask('What is on my calendar?', 'call_1');
     await flush();
     expect(host.post).toHaveBeenCalledWith('ask', { request: 'What is on my calendar?' });
@@ -84,7 +90,12 @@ describe('CallBridge', () => {
 
   it('speaks the answer as a new turn when the tool output never reached the model', async () => {
     const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), { agentName: 'Andy', answerWaitMs: 60_000, confirmMs: 20 });
+    const bridge = new CallBridge(session, fakeHost(), {
+      agentName: 'Andy',
+      answerWaitMs: 60_000,
+      timeoutLine: TIMEOUT_LINE,
+      confirmMs: 20,
+    });
     const result = bridge.ask('q', 'call_1');
     await flush();
     bridge.onHostEvent({ type: 'reply', text: 'Done.' });
@@ -96,7 +107,11 @@ describe('CallBridge', () => {
 
   it('keeps the answer when the execution is interrupted and speaks it once idle', async () => {
     const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), { agentName: 'Andy', answerWaitMs: 60_000 });
+    const bridge = new CallBridge(session, fakeHost(), {
+      agentName: 'Andy',
+      answerWaitMs: 60_000,
+      timeoutLine: TIMEOUT_LINE,
+    });
     const abort = new AbortController();
     const result = bridge.ask('book a table', 'call_1', abort.signal);
     await flush();
@@ -110,7 +125,12 @@ describe('CallBridge', () => {
 
   it('speaks interim and extra replies that no execution is waiting for', async () => {
     const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), { agentName: 'Andy', answerWaitMs: 60_000, confirmMs: 1000 });
+    const bridge = new CallBridge(session, fakeHost(), {
+      agentName: 'Andy',
+      answerWaitMs: 60_000,
+      timeoutLine: TIMEOUT_LINE,
+      confirmMs: 1000,
+    });
     const result = bridge.ask('q', 'call_1');
     await flush();
     bridge.onHostEvent({ type: 'reply', text: 'Let me check.' });
@@ -123,22 +143,33 @@ describe('CallBridge', () => {
 
   it('settles every waiting execution with a batched reply, and a timeout only its own', async () => {
     const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), { agentName: 'Andy', answerWaitMs: 60_000, confirmMs: 1000 });
+    const bridge = new CallBridge(session, fakeHost(), {
+      agentName: 'Andy',
+      answerWaitMs: 60_000,
+      timeoutLine: TIMEOUT_LINE,
+      confirmMs: 1000,
+    });
     const a = bridge.ask('first', 'a');
     const b = bridge.ask('second', 'b');
     const c = bridge.ask('third', 'c');
     await flush();
-    bridge.onHostEvent({ type: 'reply', text: "I couldn't get that done in time.", timedOut: true });
-    expect(await a).toContain("I couldn't get that done in time.");
+    bridge.onHostEvent({ type: 'reply', text: TIMEOUT_LINE, timedOut: true });
+    const timedOut = await a;
+    expect(timedOut).toContain(TIMEOUT_LINE);
+    expect(timedOut).not.toContain(`${ANSWER_PREFIX} (Andy)`);
     bridge.onHostEvent({ type: 'reply', text: 'Both done.' });
     expect(await b).toContain('Both done.');
-    expect(await c).toContain('answered together');
+    expect(await c).toContain('Answered together');
     bridge.close();
   });
 
   it('serializes spoken turns so one never supersedes another', async () => {
     const session = fakeSession(false);
-    const bridge = new CallBridge(session, fakeHost(), { agentName: 'Andy', answerWaitMs: 60_000 });
+    const bridge = new CallBridge(session, fakeHost(), {
+      agentName: 'Andy',
+      answerWaitMs: 60_000,
+      timeoutLine: TIMEOUT_LINE,
+    });
     bridge.onHostEvent({ type: 'say', text: 'Your taxi is here.' });
     bridge.onHostEvent({ type: 'reply', text: 'Unasked answer.' });
     await flush();
@@ -152,7 +183,11 @@ describe('CallBridge', () => {
 
   it('adds a holding line only into silence while an answer is pending', async () => {
     const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), { agentName: 'Andy', answerWaitMs: 60_000 });
+    const bridge = new CallBridge(session, fakeHost(), {
+      agentName: 'Andy',
+      answerWaitMs: 60_000,
+      timeoutLine: TIMEOUT_LINE,
+    });
     bridge.onHostEvent({ type: 'thinking' });
     await flush();
     expect(session.replies).toEqual([]);
@@ -171,7 +206,11 @@ describe('CallBridge', () => {
 
   it('tells the model when the host refuses the request', async () => {
     const bridge = (status: number) =>
-      new CallBridge(fakeSession(), fakeHost(status), { agentName: 'Andy', answerWaitMs: 60_000 });
+      new CallBridge(fakeSession(), fakeHost(status), {
+        agentName: 'Andy',
+        answerWaitMs: 60_000,
+        timeoutLine: TIMEOUT_LINE,
+      });
     expect(await bridge(429).ask('q', 'a')).toContain('already open');
     expect(await bridge(413).ask('q', 'a')).toContain('too long');
     expect(await bridge(409).ask('q', 'a')).toContain('cannot take requests');
@@ -180,7 +219,11 @@ describe('CallBridge', () => {
 
   it('exposes ask_agent as a tool that passes the call id through', async () => {
     const session = fakeSession();
-    const bridge = new CallBridge(session, fakeHost(), { agentName: 'Andy', answerWaitMs: 60_000 });
+    const bridge = new CallBridge(session, fakeHost(), {
+      agentName: 'Andy',
+      answerWaitMs: 60_000,
+      timeoutLine: TIMEOUT_LINE,
+    });
     const tool = bridge.tool();
     const spy = vi.spyOn(bridge, 'ask').mockResolvedValue('ok');
     const opts = { toolCallId: 'fc_9', abortSignal: new AbortController().signal } as unknown as Parameters<

@@ -10,12 +10,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 
 import type { ChannelAdapter, InboundMessage } from './adapter.js';
 import { createGptLiveAdapter, DELEGATION_TIMEOUT_LINE, lineIdForToken, type GptLiveConfig } from './voice.js';
-import {
-  parseLiveKitConsultMessageId,
-  type LiveKitHostEvent,
-  type LiveKitJobMetadata,
-  type LiveKitServerApi,
-} from './voice-livekit.js';
+import { type LiveKitHostEvent, type LiveKitJobMetadata, type LiveKitServerApi } from './voice-livekit.js';
 import { stopWebhookServer } from '../webhook-server.js';
 
 const LINE = lineIdForToken('tok123');
@@ -311,6 +306,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       voice: 'Kore',
       scheduling: 'WHEN_IDLE',
       delegationTimeoutMs: 300,
+      timeoutLine: DELEGATION_TIMEOUT_LINE,
       maxDurationMs: 15 * MIN,
     });
     expect(meta.instructions).toContain('You are Andy');
@@ -365,7 +361,6 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const msg = h.inbound[0];
     expect(msg.id).toBe(`livekit:${worker.meta.callId}:${id}`);
     expect(msg.content).toMatchObject({ text: 'What is on my calendar tomorrow?', sender: 'Ethan', senderId: LINE });
-    expect(parseLiveKitConsultMessageId(msg.id)).toEqual({ callId: worker.meta.callId, consultId: id });
 
     const interim = await h.adapter.deliver(LINE, null, {
       kind: 'chat',

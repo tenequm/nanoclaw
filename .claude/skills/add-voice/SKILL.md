@@ -37,8 +37,14 @@ counters are in memory and reset when the host restarts, so this caps a day's
 spend per line rather than guaranteeing a dollar budget.
 
 When the voice model hands a request to the agent and no reply comes back within
-90 seconds (`GPT_LIVE_DELEGATION_TIMEOUT_SECONDS`), the caller hears that it
-could not be done in time instead of waiting in silence.
+90 seconds (`GPT_LIVE_DELEGATION_TIMEOUT_SECONDS`), the caller hears that it is
+taking longer than expected instead of waiting in silence; a reply that arrives
+later in the same call is still spoken.
+
+The voice prompt speaks only Ukrainian or English: English when the caller
+speaks English, Ukrainian otherwise (speech that sounds like a third language is
+treated as misheard Ukrainian), and the greeting is in Ukrainian unless the
+persona names another language.
 
 The stable channel identifier and URL prefix are `voice`. The `GPT_LIVE_*`
 settings and adapter module names identify the current voice engine.
@@ -186,6 +192,13 @@ tailscale serve --bg --set-path=/webhook http://127.0.0.1:3000/webhook
 
 The origin is then `https://<host>.<tailnet>.ts.net` and the call page lives at
 `…/webhook/voice/call?t=<token>`.
+
+The webhook server listens on every interface, so the voice routes answer only
+loopback peers (403 otherwise, before any token check): a call link must not
+work, or be probed, over plain HTTP from the LAN. A front such as `tailscale
+serve` or a local reverse proxy connects from `127.0.0.1` and passes. For a
+local-development setup whose front connects from elsewhere (a container
+bridge, another machine), set `GPT_LIVE_ALLOW_NON_LOOPBACK=1`.
 
 ```nc:prompt public_url validate:^https?://\S+$ normalize:rstrip-slash
 What origin can a caller's browser reach this NanoClaw host at? (e.g. http://localhost:3000 or https://nanoclaw.example.ts.net)
@@ -383,17 +396,32 @@ it the `/gemini` routes answer 503 and the OpenAI path is unchanged:
 GEMINI_API_KEY=<Gemini API key>
 ```
 
-Optional: `GEMINI_LIVE_MODEL` (default `gemini-3.8-live`) and
-`GEMINI_LIVE_VOICE` (default `Kore`). Restart to load them.
+Optional: `GEMINI_LIVE_MODEL` (default `gemini-3.8-live`),
+`GEMINI_LIVE_VOICE` (default `Kore`) and `GEMINI_LIVE_MAX_CALL_SECONDS`
+(default `600`, never above `GPT_LIVE_MAX_CALL_SECONDS`; Google drops Live audio
+connections at about 10 minutes and the page does not resume sessions yet).
+Restart to load them.
 
 The page talks to Gemini directly: the host mints a one-use ephemeral token
 locked to the model, the composed voice prompt, the voice and one `ask_agent`
 function, and the key never leaves the host. Each `ask_agent` call is sent to
-the agent like a delegation and its reply goes back to Gemini. Both engines
-share the hourly start cap, the daily minutes and the delegation timeout. A
-Gemini call is charged from token mint until the page hangs up or the token
-expires. Agent messages that answer no `ask_agent` call are dropped during a
-Gemini call.
+the agent like a delegation and its first reply goes back to Gemini as the
+function's answer; a batched agent reply answers every `ask_agent` call that was
+waiting. Later agent messages for the call (the real answer after an interim
+one, a reply after the timeout line, a proactive message) are queued; the page
+long-polls `…/gemini/messages` and hands each to Gemini as a further answer,
+spoken when the model is idle. A call may have 3 `ask_agent` calls waiting at
+once and start 10 a minute; a request is at most 4 KB.
+
+Both engines share the hourly start cap, the daily minutes and the delegation
+timeout, and the newest call on a line wins across engines. The host cannot end
+a Google session: the token works until it expires, and Google enforces that
+expiry. So a Gemini call is charged its whole token lifetime when the token is
+minted, and hanging up early gives nothing back. When access is revoked, the
+line changes or a newer call takes the line, the host stops serving the call
+(its `ask_agent` calls and messages are refused, which makes the page hang
+up), but a page that ignores that keeps talking to Gemini, without the agent,
+until the token expires.
 
 ## LiveKit + Gemini Live (WebRTC)
 
@@ -415,7 +443,8 @@ room/dispatch API calls, e.g. `ws://127.0.0.1:7880` when the server runs on the
 same box; defaults to `LIVEKIT_URL`), `LIVEKIT_AGENT_NAME` (dispatch name,
 default `nanoclaw-voice`; set the same value for host and worker),
 `LIVEKIT_HOST_URL` (where the worker reaches this host's webhook server,
-default `http://127.0.0.1:<WEBHOOK_PORT>`), `GEMINI_LIVE_MODEL` (default
+default `http://127.0.0.1:<WEBHOOK_PORT>`; it must be a loopback address unless
+`GPT_LIVE_ALLOW_NON_LOOPBACK=1`, like every voice route), `GEMINI_LIVE_MODEL` (default
 `gemini-3.8-live`), `GEMINI_LIVE_VOICE` (default `Kore`). Restart to load them.
 
 The agent side is a separate process, the LiveKit Agents worker: agents-js
@@ -442,7 +471,7 @@ one NON_BLOCKING `ask_agent` function. Each `ask_agent` call becomes an inbound
 message for the agent; its replies come back over the host's event stream to
 the worker: the first as the function result (spoken when the model is idle),
 any later reply, interrupted request or proactive agent message as a new turn.
-Requests are capped at 4 KB and 3 open per call; after 90 seconds without a
+Requests share the Gemini path's caps (4 KB, 3 open and 10 per minute per call); after 90 seconds without a
 reply the caller hears the timeout line. The host rechecks access every five
 seconds and ends a call (hangup, revocation, duration or budget limit, a newer
 call, shutdown) by deleting the room, which disconnects caller and worker.

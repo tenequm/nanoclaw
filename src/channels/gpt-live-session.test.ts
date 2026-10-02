@@ -195,6 +195,15 @@ describe('chunkForAppend', () => {
     expect(chunkForAppend('   ')).toEqual([]);
   });
 
+  it('keeps a long Ukrainian reply token-safe: at most 600 characters per append', () => {
+    const uk = Array.from({ length: 80 }, (_, i) => `Речення номер ${i + 1} про зустріч у четвер.`).join(' ');
+    const chunks = chunkForAppend(uk);
+    expect(MAX_APPEND_CHARS).toBeLessThanOrEqual(600);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((c) => c.length <= MAX_APPEND_CHARS)).toBe(true);
+    expect(chunks.join(' ')).toBe(uk);
+  });
+
   it('falls back to word boundaries when there is no sentence end', () => {
     const words = Array.from({ length: 400 }, (_, i) => `w${i}`).join(' ');
     const chunks = chunkForAppend(words, 200);

@@ -33,10 +33,7 @@ import { geminiInstructions, type ResolveLineOptions, type VoiceLine } from './g
 import { log } from '../log.js';
 
 export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice';
-/** ask_agent requests longer than this are refused; a spoken request is a few sentences. */
-export const MAX_ASK_REQUEST_BYTES = 4096;
-/** Open ask_agent calls per call; the model is told to wait for answers beyond this. */
-export const MAX_OPEN_CONSULTS = 3;
+const MINUTE_MS = 60_000;
 const PING_INTERVAL_MS = 15_000;
 const MAX_QUEUED_EVENTS = 50;
 const MAX_AGENT_BODY_BYTES = 8 * 1024;
@@ -65,6 +62,8 @@ export interface LiveKitJobMetadata {
   maxDurationMs: number;
   /** The host answers an unanswered ask_agent with the timeout line after this long. */
   delegationTimeoutMs: number;
+  /** What the caller hears then; a later reply is still spoken. */
+  timeoutLine: string;
   joinTimeoutMs: number;
 }
 
@@ -76,18 +75,11 @@ export type LiveKitHostEvent =
   | { type: 'end'; reason: string }
   | { type: 'ping' };
 
-const CONSULT_ID_PREFIX = 'livekit:';
+/** Inbound ids for ask_agent calls are `livekit:<call>:<consult>`; voice.ts parses replies with parseScopedId. */
+export const LIVEKIT_ID_PREFIX = 'livekit:';
 
 export function liveKitConsultMessageId(callId: string, consultId: string): string {
-  return `${CONSULT_ID_PREFIX}${callId}:${consultId}`;
-}
-
-export function parseLiveKitConsultMessageId(id: string): { callId: string; consultId: string } | null {
-  if (!id.startsWith(CONSULT_ID_PREFIX)) return null;
-  const rest = id.slice(CONSULT_ID_PREFIX.length);
-  const sep = rest.indexOf(':');
-  if (sep <= 0 || sep === rest.length - 1) return null;
-  return { callId: rest.slice(0, sep), consultId: rest.slice(sep + 1) };
+  return `${LIVEKIT_ID_PREFIX}${callId}:${consultId}`;
 }
 
 /** The slices of the LiveKit server API the host uses; injectable for tests. */
@@ -139,6 +131,10 @@ export interface LiveKitHost {
   accessCheckIntervalMs: number;
   thinkIntervalMs: number;
   delegationTimeoutLine: string;
+  /** The ask_agent limits the Gemini path uses, shared so both engines behave alike. */
+  maxOpenConsults: number;
+  maxConsultsPerMinute: number;
+  maxConsultRequestBytes: number;
 }
 
 interface Consult {
@@ -164,6 +160,8 @@ interface LiveKitCall {
   stream?: http.ServerResponse;
   queue: LiveKitHostEvent[];
   lastThinkAt: number;
+  /** Accepted ask_agent start times (config clock), for the per-minute cap. */
+  consultStarts: number[];
   sent: number;
   cleanup?: Promise<void>;
 }
@@ -179,10 +177,16 @@ export interface LiveKitVoice {
     lineIdForToken: (token: string) => string,
   ): Promise<void>;
   /**
-   * Speak an agent message on the line's LiveKit call. Returns null when the
-   * message is not this engine's (no call here and no livekit reply id).
+   * Speak an agent message on the line's LiveKit call. `target` is the parsed
+   * livekit reply id, if the message answers one. Returns null when the message
+   * is not this engine's (no call here and no livekit reply id).
    */
-  deliver(platformId: string, inReplyTo: string | undefined, text: string): Promise<{ id: string | undefined } | null>;
+  deliver(
+    platformId: string,
+    target: { callId: string; consultId: string } | null,
+    inReplyTo: string | undefined,
+    text: string,
+  ): Promise<{ id: string | undefined } | null>;
   setTyping(platformId: string, status?: string): Promise<void>;
   /** The running call on a line, for the shared daily budget. */
   activeCall(platformId: string): { platformId: string; startedAt: number } | undefined;
@@ -340,6 +344,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       consults: new Map(),
       queue: [],
       lastThinkAt: 0,
+      consultStarts: [],
       sent: 0,
     };
     calls.set(platformId, call);
@@ -362,6 +367,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       secret: call.secret,
       maxDurationMs: Math.min(host.maxCallDurationMs, remainingMs),
       delegationTimeoutMs: host.delegationTimeoutMs,
+      timeoutLine: host.delegationTimeoutLine,
       joinTimeoutMs,
     };
     let token: string;
@@ -438,9 +444,20 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (call.state !== 'live') return reply(res, 409, 'The caller is not in the call');
     const request = typeof body.request === 'string' ? body.request.trim() : '';
     if (!request) return reply(res, 400, 'request is required');
-    if (Buffer.byteLength(request) > MAX_ASK_REQUEST_BYTES) return reply(res, 413, 'request is too long');
-    if (call.consults.size >= MAX_OPEN_CONSULTS)
-      return reply(res, 429, 'Too many requests are already open on this call');
+    if (Buffer.byteLength(request) > host.maxConsultRequestBytes) {
+      return reply(res, 413, `ask_agent request is too large (${host.maxConsultRequestBytes / 1024} KB max)`);
+    }
+    if (call.consults.size >= host.maxOpenConsults) {
+      return reply(res, 429, 'Too many ask_agent calls are waiting on the agent');
+    }
+    const t = host.now();
+    call.consultStarts = call.consultStarts.filter((at) => at > t - MINUTE_MS);
+    if (call.consultStarts.length >= host.maxConsultsPerMinute) {
+      return reply(res, 429, 'Too many ask_agent calls this minute', {
+        'Retry-After': String(Math.max(1, Math.ceil((call.consultStarts[0] + MINUTE_MS - t) / 1000))),
+      });
+    }
+    call.consultStarts.push(t);
     if (!(await checkAccess(call))) return reply(res, 403, 'Caller access denied');
     const consultId = randomBytes(6).toString('hex');
     const timer = setTimeout(() => {
@@ -563,8 +580,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       reply(res, 404, 'Not found');
     },
 
-    async deliver(platformId, inReplyTo, text) {
-      const target = inReplyTo ? parseLiveKitConsultMessageId(inReplyTo) : null;
+    async deliver(platformId, target, inReplyTo, text) {
       const call = calls.get(platformId);
       if (target && (!call || call.callId !== target.callId)) {
         // An answer for a call that is over must not be spoken into a later one; retrying cannot help.
@@ -584,7 +600,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         return { id: inReplyTo };
       }
       push(call, { type: 'say', text });
-      return { id: `${CONSULT_ID_PREFIX}${call.callId}:out-${++call.sent}` };
+      return { id: `${LIVEKIT_ID_PREFIX}${call.callId}:out-${++call.sent}` };
     },
 
     async setTyping(platformId, status) {
