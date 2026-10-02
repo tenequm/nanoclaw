@@ -719,11 +719,51 @@ describe('runCall', () => {
     host.emit({ type: 'reply', text: 'Taxi on its way.', turn: '1' });
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Taxi on its way.'));
     host.emit({ type: 'working' });
-    // Turn 3 is picked up while its answer is still to come.
-    v.events.onTurn('Thanks', { sttModel: 'gemini-3.5-transcribe-live' });
-    await vi.waitFor(() => expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 3, status: 'sent', text: 'Thanks' }));
+    // A message naming no turn (unprompted, or a chat reply) also answers it: no "working" after it.
+    v.events.onTurn('One more', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 3, status: 'sent', text: 'One more' }),
+    );
+    host.emit({ type: 'reply', text: 'Your taxi is here.', turn: null });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Your taxi is here.'));
     host.emit({ type: 'working' });
-    await vi.waitFor(() => expect(working()).toEqual([{ turn: 1, status: 'working' }, { turn: 3, status: 'working' }]));
+    // Turn 4 is picked up while its answer is still to come.
+    v.events.onTurn('Thanks', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() => expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 4, status: 'sent', text: 'Thanks' }));
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(working()).toEqual([{ turn: 1, status: 'working' }, { turn: 4, status: 'working' }]));
+    host.endStream();
+  });
+
+  it('holds a pickup while a newer turn waits for the host, so it is never read as that one', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let utterances = 0;
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('/utterance') && ++utterances === 2) await held;
+      return host.fetchImpl(input, init);
+    });
+    const v = fakeVoice();
+    await runCall(ctx, deps(fetchImpl, v.createVoice));
+    const working = () => v.voice.publishTurn.mock.calls.filter(([s]) => s.status === 'working').map(([s]) => s);
+    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' }),
+    );
+    v.events.onTurn('For two', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() => expect(utterances).toBe(2));
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(v.voice.setThinking).toHaveBeenCalledWith(true));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(working()).toEqual([]);
+    release();
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 2, status: 'sent', text: 'For two' }),
+    );
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(working()).toEqual([{ turn: 2, status: 'working' }]));
     host.endStream();
   });
 

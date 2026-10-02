@@ -1985,7 +1985,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turns = 0;
   /** The newest turn handed to the host. */
   let lastPosted = 0;
-  /** The newest turn the host took, and the newest the page heard the agent pick up or answer. */
+  /** The newest turn the host answered, the newest it took, and the newest the agent picked up or answered. */
+  let lastSettled = 0;
   let lastAccepted = 0;
   let pickedUp = 0;
   /** The host's utterance id of each sent turn to its number here, to tell the page what a reply answers. */
@@ -2025,6 +2026,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     if (!ending) publish(draft === undefined ? { turn, status: 'sending' } : { turn, status: 'sending', text, draft });
     turnTaking.onTurn(text, (host) => {
       if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
+      lastSettled = Math.max(lastSettled, turn);
       if (host.accepted) lastAccepted = Math.max(lastAccepted, turn);
       if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {
         unconfirmed.set(host.turnKey, { turn, text });
@@ -2121,15 +2123,16 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       else if (event.type === 'reply') {
         // A host that sends no turn at all predates reply labels: not known, so no label.
         const turn = typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn;
-        // An answered turn needs no "working" any more.
-        if (typeof turn === 'number') pickedUp = Math.max(pickedUp, turn);
+        // Any agent message after the turns the host took answers the "did it get it" question.
+        pickedUp = Math.max(pickedUp, lastAccepted, typeof turn === 'number' ? turn : 0);
         turnTaking.onReply(event.text, turn);
       } else if (event.type === 'thinking') turnTaking.onThinking();
       else if (event.type === 'working') {
         turnTaking.onThinking();
         // The runner works on what reached it after the newest turn the host took: the page's
-        // working cue, once per turn. A pickup heard before that turn's 202 waits for the next tick.
-        if (lastAccepted > pickedUp) {
+        // working status, once per turn. While a newer turn awaits the host's answer the pickup could
+        // be read as that one's, so it waits for the next tick.
+        if (lastAccepted > pickedUp && lastSettled === lastPosted) {
           pickedUp = lastAccepted;
           publish({ turn: lastAccepted, status: 'working' });
         }
