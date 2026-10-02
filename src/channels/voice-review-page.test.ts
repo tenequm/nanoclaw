@@ -48,7 +48,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     fields: Partial<ReviewState> = {},
     phase = 'listening',
     extra: { reconnecting?: boolean; waited?: number } = {},
-  ) => lib.reviewView({ phase, agentName: 'Dan', reconnecting: false, waited: 0, ...extra, review: review(fields) });
+  ) => lib.reviewView({ phase, agentName: 'Andy', reconnecting: false, waited: 0, ...extra, review: review(fields) });
   const keys = (v: View) => [
     `${v.left.label}${v.left.disabled ? '(off)' : ''}`,
     `${v.right.label}${v.right.disabled ? '(off)' : ''}`,
@@ -143,15 +143,15 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
   it('the agent speaking: talk waits, a draft can still be sent as a follow-up', () => {
     let v = view({}, 'talking');
     expect(keys(v)).toEqual(['End', 'Talk(off)']);
-    expect(v).toMatchObject({ chip: 'Dan is speaking', hint: 'Tap talk when Dan finishes.' });
+    expect(v).toMatchObject({ chip: 'Andy is speaking', hint: 'Tap talk when Andy finishes.' });
 
     v = view({ draft: draft('empty') }, 'talking');
     expect(keys(v)).toEqual(['Discard', 'Talk(off)']);
 
     v = view({ draft: draft('ready', 'Also this', { reason: 'agent' }) }, 'talking');
     expect(keys(v)).toEqual(['Discard', 'Send']);
-    expect(v).toMatchObject({ chip: 'Dan is speaking', hint: 'Send adds a follow-up.' });
-    expect(v.panel?.note).toBe('Dan started speaking - review what was heard');
+    expect(v).toMatchObject({ chip: 'Andy is speaking', hint: 'Send adds a follow-up.' });
+    expect(v.panel?.note).toBe('Andy started speaking - review what was heard');
 
     v = view({ draft: draft('finishing') }, 'talking');
     expect(keys(v)).toEqual(['Discard', 'Send(off)']);
@@ -160,7 +160,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
 
   it('the agent working: talk adds a follow-up, recording and drafts say so', () => {
     expect(view({}, 'thinking', { waited: 12 })).toMatchObject({
-      chip: 'Dan is working',
+      chip: 'Andy is working',
       hint: 'Tap talk to add a follow-up · waiting 0:12',
     });
     expect(keys(view({}, 'thinking'))).toEqual(['End', 'Talk']);
@@ -203,9 +203,9 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(lib.autoBlock(review({ draft: draft('failed', 'x') }))).toBe('Discard before auto.');
     // A draft leaves the switch usable, so a pick of auto can say why it waits.
     expect(view({ draft: draft('ready', 'x') }).modeDisabled).toBe(false);
-    expect(lib.refusalNote('draft_open', 'Dan')).toBe('Send or discard before auto.');
-    expect(lib.refusalNote('agent_speaking', 'Dan')).toBe('Tap talk when Dan finishes.');
-    expect(lib.refusalNote('stale', 'Dan')).toBeNull();
+    expect(lib.refusalNote('draft_open', 'Andy')).toBe('Send or discard before auto.');
+    expect(lib.refusalNote('agent_speaking', 'Andy')).toBe('Tap talk when Andy finishes.');
+    expect(lib.refusalNote('stale', 'Andy')).toBeNull();
   });
 
   it('a call that ended with a draft keeps it to read: discard first, nothing to send', () => {
