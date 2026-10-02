@@ -46,7 +46,7 @@ speaks English, Ukrainian otherwise (speech that sounds like a third language is
 treated as misheard Ukrainian), and the greeting is in Ukrainian unless the
 persona names another language.
 
-Every engine's prompt (on the LiveKit path, the transcription prompt) also lists
+Every engine's prompt (on the LiveKit path, the transcription's custom vocabulary) also lists
 names the caller is likely to say, so the model recognises them and spells them
 exactly in transcripts and `ask_agent` requests: `GPT_LIVE_VOCABULARY` (comma-separated, in `.env`) plus the agent's
 optional `voice.vocabulary.txt` in its group folder (one term per line, read
@@ -54,9 +54,9 @@ like the persona file, symlinks and FIFOs refused), e.g.
 `GPT_LIVE_VOCABULARY=Acme, Zephyr, k8s`. Both are merged, trimmed and
 deduplicated, and capped at 60 terms and 1 KB; when neither names any, the
 prompt lists no names. `GPT_LIVE_VOCABULARY` is read at startup, the file on
-every call. It is prompt-only: `gpt-live-1`
+every call. It is prompt-only on the OpenAI and Gemini Live paths: `gpt-live-1`
 sessions take no transcription settings, and Gemini documents `customVocabulary`
-for its transcribe model only.
+for its transcribe models only, which the LiveKit path uses.
 
 The stable channel identifier and URL prefix are `voice`. The `GPT_LIVE_*`
 settings and adapter module names identify the current voice engine.
@@ -117,7 +117,8 @@ container/skills/voice-formatting/SKILL.md
 
 The OpenAI and browser-direct Gemini paths need no new package: they use Node's
 built-in `fetch` and WebSocket client (Node 22 or later). The LiveKit path adds
-`@livekit/agents`, `@livekit/agents-plugin-silero` (Silero VAD on
+`@livekit/agents`, `@livekit/agents-plugin-google` (Gemini transcription and
+speech), `@livekit/agents-plugin-silero` (Silero VAD on
 `onnxruntime-node`, whose npm package ships the CPU binaries for linux-x64 and
 macOS; its postinstall only fetches optional CUDA files and pnpm skips it),
 `@livekit/rtc-node`, `livekit-server-sdk`, `livekit-client` and `zod`. Build first: it guards the
@@ -454,7 +455,9 @@ The same lines also take calls over WebRTC through a self-hosted
 (same token, line, agent wiring and access checks as `/call` and `/gemini`). On
 this path the caller talks to the line's real agent, not to a voice model: each
 spoken turn is transcribed and sent to the agent as a message, and each agent
-reply is read out with Gemini TTS. It is off until all four keys are in `.env`;
+reply is read out with Gemini TTS. The worker is a LiveKit Agents `AgentSession`
+with no LLM in it: VAD turns, streaming transcription, TTS, captions and the
+agent state are the framework's. It is off until all four keys are in `.env`;
 without them the `/livekit` routes answer 503 and nothing else changes:
 
 ```
@@ -476,11 +479,24 @@ handed to the worker with each call:
 
 | Key | Default | What |
 | --- | --- | --- |
-| `WALKIE_STT_MODEL` | `gemini-3.8-flash` | Transcribes each turn in one `generateContent` request (verbatim prompt, Ukrainian or English, the line's vocabulary as spelling hints). |
-| `WALKIE_TTS_MODEL` | `gemini-3.1-flash-tts-preview` | Speaks the agent's replies. Raw PCM and WAV answers are both understood, so a 3.8 TTS model also works. |
-| `WALKIE_TTS_VOICE` | `Alnilam` | Prebuilt Gemini voice. |
+| `WALKIE_STT_MODEL` | `gemini-3.5-transcribe-live` | Streams the caller's speech over the Gemini Live API while they talk, verbatim, with the language hints `uk-UA` and `en-US` and the line's vocabulary (deduplicated, at most 100 terms) as custom vocabulary. |
+| `WALKIE_STT_FALLBACK_MODEL` | `gemini-3.5-transcribe` | Unary transcription that takes over while the streaming model fails (LiveKit's STT `FallbackAdapter`). Its quota is small (on some tiers 10 requests a minute and 100 a day), so it sends nothing while the streaming model works, every request it makes is logged at warn, and the call goes back to the streaming model at the next pause once that recovers, or tries it again every minute. `off` for none (an empty value in `.env` reads as unset). |
+| `WALKIE_TTS_MODEL` | `gemini-3.8-flash-tts` | Speaks the agent's replies. |
+| `WALKIE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Speaks when the main model fails (LiveKit's TTS `FallbackAdapter`, one retry each); `off` for none. |
+| `WALKIE_TTS_VOICE` | `Alnilam` | Prebuilt Gemini voice, for both TTS models. |
 | `WALKIE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
 | `WALKIE_MIRROR` | `telegram` | Channel type each exchange is copied into; `off` disables. |
+
+The worker itself reads `WALKIE_RECORDINGS_DAYS` (default `0`, off): with a
+number of days, it saves every caller turn it hears as a 16 kHz mono WAV plus a
+JSON sidecar (call and line id, agent, turn number, start and end, speech
+length, the transcription model that heard it, the transcript or why there was
+none, and the host's answer) under
+`data/voice-recordings/<agent>/<YYYY-MM-DD>/<call id>-<turn>.wav|.json`, owner-only
+(files 0600, folders 0700), and deletes files older than that many days at
+start and once a day. The recordings are the caller's voice: they stay on this
+machine under `data/` (which git ignores), nothing uploads or backs them up, and
+anyone who can read the NanoClaw folder as its user can play them.
 
 Restart the host to load them. LiveKit calls end at `GPT_LIVE_MAX_CALL_SECONDS`
 (default 15 minutes) or when the day's minutes run out, whichever comes first.
@@ -497,13 +513,17 @@ pnpm run voice-worker        # node dist/voice-livekit-worker.js start
 ```
 
 Its health check listens on `127.0.0.1:8089` (`VOICE_WORKER_HEALTH_PORT` in
-`.env`). At startup it logs the host URL it uses and checks the host answers
-there; if not, it logs an error (set `LIVEKIT_HOST_URL` in `.env`), refuses
-calls and checks again every 30 seconds. Each idle job process loads the Silero
-model before a call reaches it. On SIGTERM it takes no new calls and gives running ones 60 seconds before
+`.env`). At startup it logs its protocol version and the host URL it uses (set
+`LIVEKIT_HOST_URL` in `.env` if that is not this NanoClaw's webhook server; a
+call the host does not answer ends at once with the URL in the log). Each idle
+job process loads the Silero models before a call reaches it. On SIGTERM it takes no new calls and gives running ones 60 seconds before
 closing them, so a restart cuts a longer call short. Host and worker must be
-from the same build: the job metadata is versioned and a worker refuses a call
-from a host of another version. As a systemd user unit:
+from the same build, so restart them together: the job metadata is versioned
+(`v: 3`). A worker that gets a call of another version joins only to tell the
+caller's page "The voice service is updating. Try again in a minute." and leaves;
+the page says the same when no worker joins within 25 seconds (worker down, or
+an older one that turns such calls away), and the host logs why the call ended.
+As a systemd user unit:
 
 ```ini
 # ~/.config/systemd/user/nanoclaw-voice-worker.service
@@ -534,28 +554,34 @@ on the line (newest wins, across all three engines), creates a unique room
 nothing secret, since agents-js logs whole jobs on some paths) and returns a
 two-minute token that can only join that room, publish a microphone and
 subscribe. The worker waits for the caller, tells the host (the daily minutes
-are charged from here until the room ends) and publishes the agent's audio
-track. The worker authenticates to the host with a per-call secret both derive
+are charged from here until the room ends) and starts its session, which
+publishes the agent's audio track. The worker authenticates to the host with a per-call secret both derive
 from `LIVEKIT_API_SECRET`, so the worker needs that key too. Then, walkie-talkie:
 
-- Silero VAD scores the caller's audio in 32 ms windows. A turn starts at the
-  first speech, survives pauses, and ends after `WALKIE_SILENCE_MS` of silence
-  (or 90 seconds); a turn with under 400 ms of speech (a cough) is dropped.
-- The turn's audio (16 kHz mono WAV, inline) is transcribed in one Gemini
-  request; an empty transcript is dropped. The worker posts the text to
-  `/webhook/voice/livekit/agent/utterance`, and the host hands it to the agent
+- Silero VAD follows the caller's speech (VAD-only turn detection: LiveKit's
+  turn detector models have no Ukrainian). A turn survives pauses and ends
+  after `WALKIE_SILENCE_MS` of silence.
+- The transcription streams while the caller talks, so the text is ready when
+  the turn ends; the page shows it as it comes. The worker posts the turn's
+  text to `/webhook/voice/livekit/agent/utterance`, and the host hands it to the agent
   as `<voice source="livekit">…</voice>` plus a line saying the reply is read
   aloud (short spoken sentences, no markdown, links or code, numbers as words,
   longer material as a separate written message). Its id is
   `livekit:<call>:<n>`, so the reply routes back to this call.
 - Every agent message for the line during the call (replies and proactive
   messages) goes to the worker complete over the host's event stream. The
-  worker strips markdown and URLs, cuts the text into sentence-sized chunks
-  and plays them in order, synthesizing the next chunk while one plays.
-  Replies never overlap, and a reply waits for a caller who is mid-turn.
-- While the agent's audio plays, the caller's audio is ignored. While the
-  agent works the line stays silent; the caller can keep talking, and each
-  finished turn goes to the agent as a follow-up.
+  worker strips markdown, URLs and tags and speaks it uninterruptibly
+  (`session.say`), in sentence batches of up to 400 characters, all requested at
+  once so the next is ready while one plays. Replies never overlap, and a reply
+  waits for a caller who is mid-turn (at most `WALKIE_SILENCE_MS` plus ten
+  seconds, then it takes the channel).
+- While the agent's audio plays, the caller is not transcribed (no barge-in).
+  While the agent works the page says it is thinking; the caller can keep
+  talking, and each finished turn goes to the agent as a follow-up.
+- When a turn is lost (speech that came out as no text, or the host refusing
+  or not answering the turn) the caller hears "Не розчув, повтори, будь ласка" or
+  "Sorry, I didn't catch that", in the language of their last turn; when a reply
+  cannot be synthesized, a line saying so. Both also show as captions.
 
 Turns are capped at 8 KB of text and 20 a minute per call. A reply for a call
 that already ended is not spoken. If the worker does not open its event stream
@@ -577,11 +603,13 @@ reply never reaches Telegram on its own (delivery follows the channel of the
 message it answers), so nothing is posted twice.
 
 The page loads `livekit-client` from the host itself (`/webhook/voice/livekit/client.js`),
-no CDN. Its status line shows Listening, Sending..., `<agent>` is thinking or
-`<agent>` is speaking, and the captions show `You: <transcript>` and
-`<agent>: <reply>` as the worker sends them. Microphone capture runs with echo
-cancellation, noise suppression and auto gain; DTX is off because the worker
-times turns by the silence it hears. On iOS Safari the call must be started with
+no CDN. Its status line shows Listening or `<agent>` is speaking (the
+session's `lk.agent.state`) and `<agent>` is thinking (the worker's own
+`nanoclaw.walkie` attribute, from the host's typing refresh), and the captions
+show `You: <transcript>` while the caller talks and `<agent>: <reply>` in step
+with the speech. Microphone capture runs with echo
+cancellation, noise suppression and auto gain; DTX is off so the VAD keeps
+hearing the silence between words. On iOS Safari the call must be started with
 the Call button (audio unlocks on that tap) and joins relay-only (TURN over
 TLS); if playback is still blocked a "Tap to hear the call" button appears.
 

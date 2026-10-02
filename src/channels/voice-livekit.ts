@@ -42,11 +42,15 @@ import type { ResolveLineOptions, VoiceLine } from './gpt-live-prompt.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_WALKIE_SILENCE_MS,
+  DEFAULT_WALKIE_STT_FALLBACK_MODEL,
   DEFAULT_WALKIE_STT_MODEL,
+  DEFAULT_WALKIE_TTS_FALLBACK_MODEL,
   DEFAULT_WALKIE_TTS_MODEL,
   DEFAULT_WALKIE_TTS_VOICE,
+  LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   PING_INTERVAL_MS,
+  WALKIE_STATUS_ATTRIBUTE,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
 } from './voice-livekit-protocol.js';
@@ -102,7 +106,11 @@ export interface MirrorApi {
 
 export interface WalkieSettings {
   sttModel?: string;
+  /** Unset for the default; `off` (or empty) for no fallback. */
+  sttFallbackModel?: string;
   ttsModel?: string;
+  /** Unset for the default; `off` (or empty) for no fallback. */
+  ttsFallbackModel?: string;
   ttsVoice?: string;
   silenceMs?: number;
 }
@@ -252,9 +260,16 @@ const isNotFound = (err: unknown): boolean => {
 export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost): LiveKitVoice {
   const api = config.api ?? defaultApi(config);
   const agentName = config.agentName || DEFAULT_LIVEKIT_AGENT_NAME;
+  // .env drops empty values, so `off` is how a fallback is turned off there.
+  const fallbackModel = (raw: string | undefined, fallback: string): string => {
+    const model = (raw ?? fallback).trim();
+    return /^(off|none)$/i.test(model) ? '' : model;
+  };
   const walkie = {
     sttModel: config.walkie?.sttModel || DEFAULT_WALKIE_STT_MODEL,
+    sttFallbackModel: fallbackModel(config.walkie?.sttFallbackModel, DEFAULT_WALKIE_STT_FALLBACK_MODEL),
     ttsModel: config.walkie?.ttsModel || DEFAULT_WALKIE_TTS_MODEL,
+    ttsFallbackModel: fallbackModel(config.walkie?.ttsFallbackModel, DEFAULT_WALKIE_TTS_FALLBACK_MODEL),
     ttsVoice: config.walkie?.ttsVoice || DEFAULT_WALKIE_TTS_VOICE,
     silenceMs: config.walkie?.silenceMs || DEFAULT_WALKIE_SILENCE_MS,
   };
@@ -431,7 +446,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     call.accessTimer = setInterval(() => void checkAccess(call), host.accessCheckIntervalMs);
     call.accessTimer.unref();
     const metadata: LiveKitJobMetadata = {
-      v: 2,
+      v: LIVEKIT_PROTOCOL_VERSION,
       callId,
       lineId: platformId,
       agentName: line.agent.name,
@@ -486,7 +501,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       room: call.roomName,
       agent: line.agent.name,
       sttModel: walkie.sttModel,
+      sttFallbackModel: walkie.sttFallbackModel,
       ttsModel: walkie.ttsModel,
+      ttsFallbackModel: walkie.ttsFallbackModel,
     });
     reply(res, 200, JSON.stringify({ url: config.url, token, callId, agent: line.agent.name }), JSON_HEADERS);
   };
@@ -660,7 +677,14 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         const body = await readJson(req);
         const call = calls.get(platformId);
         if (call && body && call.callId === body.callId) {
-          endCall(call, 'hangup');
+          // The page gave up waiting for the worker, or the worker said it runs another version.
+          const reason =
+            body.reason === 'no-agent'
+              ? 'no voice worker joined (worker down, or not on this protocol version)'
+              : body.reason === 'updating'
+                ? 'the voice worker is on another protocol version'
+                : 'hangup';
+          endCall(call, reason);
           await call.cleanup;
         }
         return reply(res, 204, '');
@@ -724,14 +748,23 @@ const audioBtn = document.getElementById('audio');
 const statusEl = document.getElementById('status');
 const logEl = document.getElementById('log');
 const names = { agent: 'the agent' };
-// The worker's lk.agent.state: the caller's turn, its transcript on the way, the agent at work, its reply.
-const STATES = {
-  listening: () => 'Listening',
-  sending: () => 'Sending...',
-  thinking: () => names.agent + ' is thinking',
-  speaking: () => names.agent + ' is speaking',
-};
+const STATUS_ATTR = '__STATUS_ATTR__';
+// Without a worker in the room after this long, it is down or mid-update (host and worker restart together).
+const AGENT_JOIN_MS = 25000;
+const UPDATING = 'The voice service is updating. Try again in a minute.';
 let call = null;
+
+// lk.agent.state (the worker's LiveKit session) says listening or speaking; the worker's own
+// attribute says when the agent is thinking, which a session without an LLM never is.
+function showAgent(c, p) {
+  const attrs = (p && p.attributes) || {};
+  if (attrs[STATUS_ATTR] === 'updating') return hangup(c, UPDATING, false, 'updating');
+  const state = attrs['lk.agent.state'];
+  if (state === 'speaking') return setStatus(names.agent + ' is speaking');
+  if (attrs[STATUS_ATTR] === 'thinking') return setStatus(names.agent + ' is thinking');
+  if (state === 'listening' || state === 'idle') return setStatus('Listening');
+  setStatus('Live: talk to ' + names.agent + '.');
+}
 
 function setStatus(text) { statusEl.textContent = text; }
 function captionLine(role, label) {
@@ -767,19 +800,20 @@ async function caption(c, reader, from) {
   }
 }
 
-function endOnServer(c, beacon) {
+function endOnServer(c, beacon, reason) {
   if (!c.callId || c.endSent) return;
   c.endSent = true;
   const url = base + '/livekit/end' + q;
-  const body = JSON.stringify({ callId: c.callId });
+  const body = JSON.stringify(reason ? { callId: c.callId, reason: reason } : { callId: c.callId });
   if (beacon && navigator.sendBeacon && navigator.sendBeacon(url, body)) return;
   fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: true }).catch(() => {});
 }
 
-function hangup(c, message, beacon) {
+function hangup(c, message, beacon, reason) {
   if (c.ended) return;
   c.ended = true;
-  endOnServer(c, beacon);
+  clearTimeout(c.agentTimer);
+  endOnServer(c, beacon, reason);
   if (c.room) c.room.disconnect().catch(() => {});
   if (c.mic) c.mic.stop();
   for (const el of c.elements) el.remove();
@@ -830,12 +864,9 @@ async function run(c, room, resumed) {
     for (const el of track.detach()) { c.elements.delete(el); el.remove(); }
   });
   room.on(LK.RoomEvent.AudioPlaybackStatusChanged, () => { audioBtn.hidden = room.canPlaybackAudio; });
-  room.on(LK.RoomEvent.ParticipantConnected, (p) => { if (p.isAgent) setStatus('Live: talk to ' + names.agent + '.'); });
+  room.on(LK.RoomEvent.ParticipantConnected, (p) => { if (p.isAgent) { clearTimeout(c.agentTimer); showAgent(c, p); } });
   room.on(LK.RoomEvent.ParticipantDisconnected, (p) => { if (p.isAgent) hangup(c, names.agent + ' left the call.'); });
-  room.on(LK.RoomEvent.ParticipantAttributesChanged, (changed, p) => {
-    const state = changed && changed['lk.agent.state'];
-    if (p && p.isAgent && STATES[state]) setStatus(STATES[state]());
-  });
+  room.on(LK.RoomEvent.ParticipantAttributesChanged, (changed, p) => { if (p && p.isAgent) showAgent(c, p); });
   room.on(LK.RoomEvent.Disconnected, () => hangup(c, 'Call ended.'));
   // iOS Safari binds WebRTC UDP to the Wi-Fi interface, so UDP to a VPN (Tailscale) address
   // stalls until LiveKit's fallback timers fire; going straight to TURN/TLS (TCP) connects at once.
@@ -850,8 +881,9 @@ async function run(c, room, resumed) {
   c.localSid = pub.trackSid;
   audioBtn.hidden = room.canPlaybackAudio;
   const agent = [...room.remoteParticipants.values()].find((p) => p.isAgent);
-  const state = agent && agent.attributes && agent.attributes['lk.agent.state'];
-  setStatus(STATES[state] ? STATES[state]() : agent ? 'Live: talk to ' + names.agent + '.' : 'Waiting for ' + names.agent + '...');
+  if (agent) return showAgent(c, agent);
+  setStatus('Waiting for ' + names.agent + '...');
+  c.agentTimer = setTimeout(() => hangup(c, UPDATING, false, 'no-agent'), AGENT_JOIN_MS);
 }
 
 btn.addEventListener('click', () => (call ? hangup(call, 'Call ended.') : start()));
@@ -900,7 +932,7 @@ button.hang{background:var(--danger)}
 </main>
 <script src="livekit/client.js"></script>
 <script>
-${PAGE_SCRIPT}
+${PAGE_SCRIPT.replace('__STATUS_ATTR__', WALKIE_STATUS_ATTRIBUTE)}
 </script>
 </body>
 </html>

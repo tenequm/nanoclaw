@@ -12,16 +12,23 @@ export const PING_INTERVAL_MS = 15_000;
 /** The worker drops the host link after this long without a line: three missed pings. */
 export const HOST_SILENCE_MS = 3 * PING_INTERVAL_MS;
 
-export const DEFAULT_WALKIE_STT_MODEL = 'gemini-3.8-flash';
-export const DEFAULT_WALKIE_TTS_MODEL = 'gemini-3.1-flash-tts-preview';
+/** Wire version of the job metadata; host and worker must agree, so they ship and restart together. */
+export const LIVEKIT_PROTOCOL_VERSION = 3;
+
+/** Streaming transcription over the Gemini Live API, verbatim. */
+export const DEFAULT_WALKIE_STT_MODEL = 'gemini-3.5-transcribe-live';
+/** Unary transcription, used only while the streaming model fails: its quota is small. */
+export const DEFAULT_WALKIE_STT_FALLBACK_MODEL = 'gemini-3.5-transcribe';
+export const DEFAULT_WALKIE_TTS_MODEL = 'gemini-3.8-flash-tts';
+export const DEFAULT_WALKIE_TTS_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
 export const DEFAULT_WALKIE_TTS_VOICE = 'Alnilam';
 /** Silence that ends the caller's turn; shorter pauses mid-thought keep it open. */
 export const DEFAULT_WALKIE_SILENCE_MS = 2500;
 
 /** What the worker receives as job metadata. Nothing secret: agents-js logs the whole job on some paths. */
 export interface LiveKitJobMetadata {
-  /** 2 since the walkie-talkie worker; a worker of another version refuses the job. */
-  v: 2;
+  /** LIVEKIT_PROTOCOL_VERSION; a worker of another version tells the page it is updating and leaves. */
+  v: number;
   callId: string;
   lineId: string;
   agentName: string;
@@ -30,13 +37,25 @@ export interface LiveKitJobMetadata {
   /** Spelling hints for the transcription: GPT_LIVE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
   sttModel: string;
+  /** Takes over while `sttModel` fails; empty for none. */
+  sttFallbackModel: string;
   ttsModel: string;
+  /** Takes over while `ttsModel` fails; empty for none. */
+  ttsFallbackModel: string;
   ttsVoice: string;
   silenceMs: number;
   /** Upper bound the worker enforces on itself if the host never ends the call. */
   maxDurationMs: number;
   joinTimeoutMs: number;
 }
+
+/**
+ * The worker's own participant attribute, for what `lk.agent.state` cannot say: `thinking`
+ * while the agent works on a turn (there is no LLM in the worker's session), `idle` otherwise,
+ * `updating` when the worker cannot serve this host's protocol version.
+ */
+export const WALKIE_STATUS_ATTRIBUTE = 'nanoclaw.walkie';
+export type WalkieStatus = 'idle' | 'thinking' | 'updating';
 
 /**
  * One line of the host-to-worker event stream: a complete agent message to
