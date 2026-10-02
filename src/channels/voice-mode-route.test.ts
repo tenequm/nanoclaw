@@ -1,6 +1,8 @@
 /**
  * A caller's turn against the real core: the agent's session for the call chat gets the turn as a
- * waking message, and only the line's agent gets it, whoever else is wired to that chat.
+ * waking message, and only the line's agent gets it, whoever else is wired to that chat. Core's
+ * session-created hooks see a session a turn creates, and core's delivery of the agent's answer
+ * reaches the voice channel's post-delivery hook (registered through the real channel barrel).
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -21,6 +23,8 @@ vi.mock('../config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-voice-route';
 
 import { wakeContainer } from '../container-runner.js';
+import { deliverSessionMessages, setDeliveryAdapter } from '../delivery.js';
+import { registerSessionCreatedHook, type SessionCreatedEvent } from '../router.js';
 import {
   closeDb,
   createAgentGroup,
@@ -30,12 +34,18 @@ import {
   runMigrations,
 } from '../db/index.js';
 import { getSessionsByAgentGroup } from '../db/sessions.js';
-import { inboundDbPath } from '../mailbox/sqlite/paths.js';
+import { inboundDbPath, outboundDbPath } from '../mailbox/sqlite/paths.js';
 import type { InboundEvent } from './adapter.js';
 import { getHostStartCallbacks } from '../host-lifecycle.js';
-import { routeVoiceTurn, stopThinking, stopThinkingWatchers } from './voice-mode-route.js';
+import './index.js'; // the real channel barrel: registers the voice channel and its delivery hook
+import { routeVoiceTurn, stopThinkingWatchers } from './voice-mode-route.js';
 
 const now = () => new Date().toISOString();
+
+const sessionsCreated: SessionCreatedEvent[] = [];
+registerSessionCreatedHook((event) => {
+  sessionsCreated.push(event);
+});
 
 const turn = (platformId = 'chat:G1'): InboundEvent => ({
   channelType: 'chat',
@@ -89,6 +99,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   stopThinkingWatchers();
+  sessionsCreated.length = 0;
   vi.mocked(wakeContainer).mockClear();
   await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
@@ -117,6 +128,22 @@ describe('routeVoiceTurn', () => {
       expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
     });
 
+    it("tells core's session-created hooks about the session a first turn creates, once", async () => {
+      await routeVoiceTurn(turn(), 'ag-1');
+      const [session] = await getSessionsByAgentGroup('ag-1');
+      expect(sessionsCreated).toHaveLength(1);
+      expect(sessionsCreated[0]).toMatchObject({
+        session: { id: session.id, agent_group_id: 'ag-1' },
+        mg: { id: 'mg-1' },
+        platformId: 'chat:G1',
+        threadId: null,
+        sessionMode: 'shared',
+        message: { id: 'livekit:call-1:1' },
+      });
+      await routeVoiceTurn({ ...turn(), message: { ...turn().message, id: 'livekit:call-1:2' } }, 'ag-1');
+      expect(sessionsCreated).toHaveLength(1);
+    });
+
     it('stores nothing when the chat or its wiring to the agent is gone', async () => {
       expect(await routeVoiceTurn(turn('chat:unknown'), 'ag-1')).toBe(false);
       expect(await routeVoiceTurn(turn(), 'ag-unwired')).toBe(false);
@@ -132,8 +159,25 @@ describe('routeVoiceTurn', () => {
         expect(onThinking).toHaveBeenCalledTimes(1);
         vi.advanceTimersByTime(4_000);
         expect(onThinking).toHaveBeenCalledTimes(2);
+        // The agent's answer, delivered by core's own delivery poll.
         const [session] = await getSessionsByAgentGroup('ag-1');
-        stopThinking(session.id);
+        const out = new Database(outboundDbPath('ag-1', session.id));
+        out
+          .prepare(
+            `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+             VALUES ('out-1', datetime('now'), 'chat', 'chat:G1', 'chat', ?)`,
+          )
+          .run(JSON.stringify({ text: 'Booked for eight.' }));
+        out.close();
+        const sent: string[] = [];
+        setDeliveryAdapter({
+          async deliver(_channelType, _platformId, _threadId, _kind, content) {
+            sent.push(content);
+            return 'plat-1';
+          },
+        });
+        await deliverSessionMessages(session);
+        expect(sent).toHaveLength(1);
         vi.advanceTimersByTime(8_000);
         expect(onThinking).toHaveBeenCalledTimes(2);
       } finally {

@@ -1,11 +1,10 @@
 /**
- * How a caller's turn reaches the agent: written straight into the session of the one agent the
- * line belongs to, in the call chat, as a waking message from the
- * line's caller - the same steps the router takes for an engaged message (thread policy, session
- * mode, cross-session backfill and fan-out, typing, wake). The router is not involved because a
- * turn is addressed to one agent whatever else is wired to that chat and whatever its trigger;
- * the caller's access to that agent and the call chat's wiring are checked by the voice engine
- * before every turn.
+ * How a caller's turn reaches the agent: handed to the router's own engaged-message delivery
+ * (`deliverToAgent`: thread policy, session, backfill, command gate, session-created hooks, typing,
+ * wake, fan-out) for the one agent the line belongs to, in the call chat, as a message from the
+ * line's caller. `routeInbound` is not used because a turn is addressed to that agent whatever
+ * else is wired to the chat and whatever its trigger; the caller's access to the agent and the
+ * call chat's wiring are checked by the voice engine before every turn.
  *
  * While the agent works on a turn in a call chat, its live call hears it is thinking: the chat's
  * typing goes to the chat's own platform, so this follows the session's heartbeat the way the
@@ -18,13 +17,11 @@ import { resolveThreadPolicy } from './channel-defaults.js';
 import { getChannelAdapter, getChannelDefaults } from './channel-registry.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
-import { getSession } from '../db/sessions.js';
+import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { log } from '../log.js';
 import { onHostStart } from '../host-lifecycle.js';
-import { backfillSession, fanInboundMessage } from '../modules/cross-session-context/index.js';
-import { startTypingRefresh, stopTypingRefresh } from '../modules/typing/index.js';
-import { requestWake } from '../request-wake.js';
-import { heartbeatPath, resolveSession, writeSessionMessage } from '../session-manager.js';
+import { deliverToAgent } from '../router.js';
+import { heartbeatPath } from '../session-manager.js';
 
 /** The typing module's cadence: a tick every 4 s, 15 s of grace, a heartbeat fresh for 6 s. */
 const THINKING_TICK_MS = 4_000;
@@ -108,6 +105,7 @@ export async function routeVoiceTurn(
     return false;
   }
 
+  // The router's own thread policy and engaged-message delivery, for this one wiring.
   const threadsEnabled = resolveThreadPolicy(
     wiring.threads ?? null,
     getChannelDefaults(instance, mg.channel_type),
@@ -115,36 +113,21 @@ export async function routeVoiceTurn(
     getChannelAdapter(instance)?.supportsThreads === true,
   );
   const threadId = threadsEnabled ? event.threadId : null;
-  const sessionMode =
-    threadsEnabled && wiring.session_mode !== 'agent-shared' && mg.is_group !== 0 ? 'per-thread' : wiring.session_mode;
-  const { session, created } = await resolveSession(agentGroupId, mg.id, threadId, sessionMode);
-  await backfillSession(agentGroup, session, mg, { created });
+  const callerId = (JSON.parse(event.message.content) as { senderId?: string }).senderId ?? null;
+  await deliverToAgent(wiring, agentGroup, mg, event, callerId, threadsEnabled, threadId, true);
 
-  const messageId = `${event.message.id}:${agentGroupId}`;
-  await writeSessionMessage(agentGroupId, session.id, {
-    id: messageId,
-    kind: event.message.kind,
-    timestamp: event.message.timestamp,
-    platformId: event.platformId,
-    channelType: event.channelType,
-    threadId,
-    content: event.message.content,
-    trigger: true,
-  });
-
-  startTypingRefresh(session.id, agentGroupId, event.channelType, event.platformId, threadId, mg.instance);
-  const fresh = await getSession(session.id);
-  const woke = fresh ? await requestWake(fresh, 'inbound-message') : false;
-  if (!woke) stopTypingRefresh(session.id);
-  else if (onThinking) watchThinking(agentGroupId, session.id, onThinking);
-  void fanInboundMessage({
-    session,
-    mg,
-    messageId,
-    kind: event.message.kind,
-    channelType: event.channelType,
-    content: event.message.content,
-    timestamp: event.message.timestamp,
-  });
+  if (onThinking) {
+    // Read-only: the session the router just resolved for this wiring.
+    const perThread = threadsEnabled && wiring.session_mode !== 'agent-shared' && mg.is_group !== 0;
+    const session =
+      wiring.session_mode === 'agent-shared'
+        ? await findSessionByAgentGroup(agentGroupId)
+        : await findSessionForAgent(
+            agentGroupId,
+            mg.id,
+            perThread || wiring.session_mode === 'per-thread' ? threadId : null,
+          );
+    if (session) watchThinking(agentGroupId, session.id, onThinking);
+  }
   return true;
 }

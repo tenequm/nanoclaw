@@ -514,7 +514,7 @@ async function evaluateEngage(
   }
 }
 
-async function deliverToAgent(
+export async function deliverToAgent(
   agent: MessagingGroupAgent,
   agentGroup: AgentGroup,
   mg: MessagingGroup,
