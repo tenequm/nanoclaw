@@ -510,9 +510,11 @@ handed to the worker with each call:
 
 The worker itself reads `WALKIE_MAX_SPOKEN_CHARS` (default `800`; `0` for no
 cap): an agent message longer than that, after markdown and links are stripped,
-is spoken up to its last sentence end within the cap (or its last whole word when
-no sentence ends before it), followed by "Решта - у чаті." or "The rest is in the
-chat." in the language of the caller's last turn. It applies to every message
+is spoken up to its last sentence end within the cap when that end is past 60%
+of the cap (else up to its last whole word), followed by "Решта - у чаті." or
+"The rest is in the chat." in the language of the caller's last turn. A call
+that talks on the voice line, with no chat to hold the rest, closes with
+"Скорочую." or "I've cut it short." instead. It applies to every message
 spoken during the call, replies and proactive ones alike, and the captions show
 what was spoken; the full text stays in the chat.
 
@@ -612,16 +614,26 @@ from `LIVEKIT_API_SECRET`, so the worker needs that key too. Then, walkie-talkie
 - While the agent's audio plays, the caller is not transcribed (no barge-in).
   While the agent works the page says it is thinking; the caller can keep
   talking, and each finished turn goes to the agent as a follow-up.
-- The host answers a turn 202 only once the agent's session has stored it.
-  When the router drops it (access or sender policy, no agent taking it) the
-  host answers 422, when routing throws 500, and when the turn is not stored
-  within 8 seconds 504. Each POST carries a random `turnKey`; the worker posts
-  a turn once more under the same key when the connection drops, and the host
-  answers a repeated key from the first outcome without routing it again.
-- When a turn is lost (speech that came out as no text, or the host refusing
-  or not answering the turn) the caller hears "Не розчув, повтори, будь ласка" or
-  "Sorry, I didn't catch that", in the language of their last turn; when a reply
-  cannot be synthesized, a line saying so. Both also show as captions. The
+- The host answers a turn 202 once the agent's session has stored it, whether
+  to answer or, on a voice line whose trigger it does not match under the
+  `accumulate` policy, as context. When nothing stored it (access or sender
+  policy, no agent taking it) the host answers 422, when routing throws 500,
+  and when the turn is not stored within 8 seconds 504. Each POST carries a
+  random `turnKey`; the worker posts a turn once more under the same key when
+  the connection drops, and the host answers a repeated key from the first
+  outcome without routing it again. A turn answered 504 that is stored later
+  is reported on the event stream (`{"type": "turn-stored", "turnKey", "id"}`),
+  and the worker corrects the page's mark to "sent". The stream also carries
+  `{"type": "chat", "chat": true | false}` when the call starts or stops
+  talking in a chat.
+- When the caller's speech came out as no text the caller hears "Не розчув,
+  повтори, будь ласка" or "Sorry, I didn't catch that", in the language of their
+  last turn. A turn the host did not confirm (504, or no answer) may still reach
+  the agent, so it is never "repeat": "Не впевнений, що це дійшло - перевір чат."
+  or "Not sure that got through - check the chat." (without the chat part on a
+  voice-line call). A refused turn gets "That didn't go through.", a rate-limited
+  one "Too many turns - give it a moment." (and their Ukrainian lines). When a
+  reply cannot be synthesized, a line saying so. All of these also show as captions. The
   worker also sends one JSON message per caller turn (noise is not reported) on the text stream topic
   `nanoclaw.walkie.turn`: `{"turn": n, "status": "sent" | "lost", "reason"?:
   "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.

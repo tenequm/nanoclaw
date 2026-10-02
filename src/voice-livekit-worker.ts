@@ -126,6 +126,8 @@ const RECORDING_PAD_MS = 300;
 const MAX_RECORDED_TURN_MS = 120_000;
 /** A turn whose POST failed in transit is sent once more, under the same turn key, after this long. */
 const TURN_RETRY_DELAY_MS = 500;
+/** Timed-out turns kept for a late `turn-stored`; the host remembers no more turn keys than this either. */
+const MAX_UNCONFIRMED_TURNS = 32;
 /** WALKIE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
 export const DEFAULT_MAX_SPOKEN_CHARS = 800;
 const DAY_MS = 86_400_000;
@@ -222,17 +224,29 @@ export type CallLanguage = 'uk' | 'en';
 /** Until the caller says something, the worker's own lines use the first transcription language. */
 const DEFAULT_CALL_LANGUAGE: CallLanguage = 'uk';
 
-/** What the worker says itself when the exchange breaks, in the call's language. */
-export const FAILURE_LINES: Record<'turn' | 'reply', Record<CallLanguage, string>> = {
+/**
+ * What the worker says itself when the exchange breaks, in the call's language: a turn it did not
+ * hear (`turn`), a turn the host refused or did not confirm (by `hostLossReason`; a turn that timed
+ * out may still reach the agent, so it is never "repeat"), and a reply it could not synthesize.
+ */
+export const FAILURE_LINES: Record<FailureKind, Record<CallLanguage, string>> = {
   turn: { uk: 'Не розчув, повтори, будь ласка.', en: "Sorry, I didn't catch that." },
+  rejected: { uk: 'Не вдалося це передати.', en: "That didn't go through." },
+  rate_limited: { uk: 'Забагато реплік, зачекай трохи.', en: 'Too many turns - give it a moment.' },
+  timeout: { uk: 'Не впевнений, що це дійшло - перевір чат.', en: 'Not sure that got through - check the chat.' },
+  timeout_no_chat: { uk: 'Не впевнений, що це дійшло.', en: 'Not sure that got through.' },
   reply: { uk: 'Не вийшло озвучити відповідь, вона є на екрані.', en: "Sorry, I couldn't read that reply out." },
 };
+export type FailureKind = 'turn' | 'rejected' | 'rate_limited' | 'timeout' | 'timeout_no_chat' | 'reply';
 
-/** Said after a message cut for speech: the full text is in the chat. */
-export const REST_IN_CHAT: Record<CallLanguage, string> = {
-  uk: 'Решта - у чаті.',
-  en: 'The rest is in the chat.',
+/** Said after a message cut for speech: the full text is in the chat, or, on a call with no chat, nowhere to point at. */
+export const CUT_LINES: Record<'chat' | 'no_chat', Record<CallLanguage, string>> = {
+  chat: { uk: 'Решта - у чаті.', en: 'The rest is in the chat.' },
+  no_chat: { uk: 'Скорочую.', en: "I've cut it short." },
 };
+
+/** A sentence end earlier than this share of the cap wastes the budget: the cut goes to a word instead. */
+const MIN_SENTENCE_CUT = 0.6;
 
 /** WALKIE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default. */
 export function maxSpokenChars(raw: string | undefined): number {
@@ -243,11 +257,13 @@ export function maxSpokenChars(raw: string | undefined): number {
 }
 
 /**
- * Speakable text cut to `max` characters for a call: up to the last sentence end within the cap, else
- * the last whole word, then a line saying the rest is in the chat. Unchanged when it fits or `max` is 0.
+ * Speakable text cut to `max` characters for a call: up to the last sentence end within the cap when
+ * that keeps most of it, else the last whole word, then a closing line (CUT_LINES; "the rest is in the
+ * chat" only when `inChat`). Unchanged when it fits or `max` is 0.
  */
-export function capSpokenText(text: string, max: number, language: CallLanguage): string {
+export function capSpokenText(text: string, max: number, language: CallLanguage, inChat: boolean): string {
   if (max <= 0 || text.length <= max) return text;
+  const closing = CUT_LINES[inChat ? 'chat' : 'no_chat'][language];
   // One character past the cap shows whether the text breaks right at it.
   const span = text.slice(0, max + 1);
   let cut = 0;
@@ -255,12 +271,13 @@ export function capSpokenText(text: string, max: number, language: CallLanguage)
     const end = m.index + m[0].length;
     if (end <= max) cut = end;
   }
+  if (cut < max * MIN_SENTENCE_CUT) cut = 0;
   let head = text.slice(0, cut).trim();
   if (!head) {
     const space = span.search(/\s\S*$/);
     head = space > 0 ? `${text.slice(0, space).replace(/[\s,;:–—-]+$/, '')}…` : '';
   }
-  return head ? `${head} ${REST_IN_CHAT[language]}` : REST_IN_CHAT[language];
+  return head ? `${head} ${closing}` : closing;
 }
 
 /** The language a transcript is in, by its script; undefined when it has no letters. */
@@ -797,6 +814,8 @@ export interface SendResult {
   id?: string;
   status?: number;
   error?: string;
+  /** The key the turn went out under, for the host's `turn-stored` when it stores a timed-out turn after all. */
+  turnKey?: string;
 }
 
 export interface WalkieDeps {
@@ -830,6 +849,8 @@ export class Walkie {
   private queued = 0;
   private replies = 0;
   private readonly partsByTurn = new Map<number, number>();
+  /** Whether the call talks in a chat (the host's `chat` event), so its lines can point there. */
+  private inChat = false;
 
   constructor(
     private readonly deps: WalkieDeps,
@@ -878,7 +899,7 @@ export class Walkie {
     }
     this.enqueue(async () => {
       // Cut when spoken, so the closing line is in the language of the caller's latest turn.
-      const spoken = capSpokenText(full, max, this.options.language);
+      const spoken = capSpokenText(full, max, this.options.language, this.inChat);
       if (typeof turn === 'number') {
         const part = (this.partsByTurn.get(turn) ?? 0) + 1;
         this.partsByTurn.set(turn, part);
@@ -891,6 +912,11 @@ export class Walkie {
         this.feedback('reply');
       }
     });
+  }
+
+  /** The host's `chat` event: the call now talks in a chat, or on the voice line. */
+  onChat(inChat: boolean): void {
+    this.inChat = inChat;
   }
 
   /** The agent is still working (the host's typing refresh). */
@@ -923,18 +949,19 @@ export class Walkie {
     });
     onSent?.(result);
     if (this.closed) return;
-    if (!result.accepted) return this.feedback('turn');
+    if (!result.accepted) return this.feedback(hostLossReason(result));
     this.thinkingUntil = Math.max(this.thinkingUntil, this.now() + AWAIT_REPLY_MS);
     this.refresh();
   }
 
-  private feedback(kind: 'turn' | 'reply'): void {
+  private feedback(kind: FailureKind): void {
     if (this.closed || this.feedbackQueued) return;
     this.feedbackQueued = true;
     this.enqueue(async () => {
       this.feedbackQueued = false;
       this.announce({ notice: true });
-      await this.deps.say(FAILURE_LINES[kind][this.options.language]);
+      const line = kind === 'timeout' && !this.inChat ? 'timeout_no_chat' : kind;
+      await this.deps.say(FAILURE_LINES[line][this.options.language]);
     });
   }
 
@@ -1486,19 +1513,26 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       send: async (text) => {
         // The host answers a turn key once, so a retry after a dropped connection cannot reach the agent twice.
         const turnKey = randomUUID();
-        const res = await host.post('utterance', { text, turnKey }).catch(async (err: unknown) => {
-          if ((err as Error | null)?.name === 'TimeoutError') throw err;
-          callLog.warn('voice worker: posting a turn failed; trying once more', { err });
-          await sleep(TURN_RETRY_DELAY_MS);
-          return host.post('utterance', { text, turnKey });
-        });
+        let res: Response;
+        try {
+          res = await host.post('utterance', { text, turnKey }).catch(async (err: unknown) => {
+            if ((err as Error | null)?.name === 'TimeoutError') throw err;
+            callLog.warn('voice worker: posting a turn failed; trying once more', { err });
+            await sleep(TURN_RETRY_DELAY_MS);
+            return host.post('utterance', { text, turnKey });
+          });
+        } catch (err) {
+          // Unanswered, not refused: the host may still store it and say so with `turn-stored`.
+          callLog.warn('voice worker: could not hand the turn to the host', { err });
+          return { accepted: false, turnKey, error: err instanceof Error ? err.message : String(err) };
+        }
         if (res.status === 202) {
           const body = (await res.json().catch(() => null)) as { id?: unknown } | null;
-          return { accepted: true, status: 202, id: typeof body?.id === 'string' ? body.id : undefined };
+          return { accepted: true, status: 202, turnKey, id: typeof body?.id === 'string' ? body.id : undefined };
         }
         void res.body?.cancel().catch(() => {});
         callLog.warn('voice worker: the host refused a turn', { status: res.status });
-        return { accepted: false, status: res.status };
+        return { accepted: false, status: res.status, turnKey };
       },
       say: (text) => callVoice?.say(text) ?? Promise.resolve(false),
       setThinking: (thinking) => callVoice?.setThinking(thinking),
@@ -1532,6 +1566,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turns = 0;
   /** The host's utterance id of each sent turn to its number here, to tell the page what a reply answers. */
   const turnsByHostId = new Map<string, number>();
+  /** Turns the host did not confirm, by turn key, until its `turn-stored` says the agent has one after all. */
+  const unconfirmed = new Map<string, { turn: number; text: string }>();
   const publish = (status: WalkieTurnStatus) => callVoice?.publishTurn(status);
   const saveTurn = (
     index: number,
@@ -1567,6 +1603,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           const turn = ++turns;
           walkie.onTurn(text, (host) => {
             if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
+            if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {
+              unconfirmed.set(host.turnKey, { turn, text });
+              for (const key of unconfirmed.keys()) {
+                if (unconfirmed.size <= MAX_UNCONFIRMED_TURNS) break;
+                unconfirmed.delete(key);
+              }
+            }
             publish(
               host.accepted
                 ? { turn, status: 'sent', text }
@@ -1615,6 +1658,16 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       else if (event.type === 'reply')
         walkie.onReply(event.text, event.turn === undefined ? null : turnsByHostId.get(event.turn));
       else if (event.type === 'thinking') walkie.onThinking();
+      else if (event.type === 'chat') walkie.onChat(event.chat);
+      else if (event.type === 'turn-stored') {
+        const late = unconfirmed.get(event.turnKey);
+        if (!late) return;
+        unconfirmed.delete(event.turnKey);
+        turnsByHostId.set(event.id, late.turn);
+        callLog.info('voice worker: a timed-out turn reached the agent after all', { turn: late.turn });
+        // The page's mark for this turn goes from "not confirmed" to "sent".
+        publish({ turn: late.turn, status: 'sent', text: late.text });
+      }
     }, hostLink.signal)
     .then(
       () => end('host link closed', true),

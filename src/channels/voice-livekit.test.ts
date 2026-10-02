@@ -147,8 +147,8 @@ interface Harness {
   inbound: InboundMessage[];
   clock: { now: number };
   access: { enabled: boolean };
-  /** What the router does with the next turns: store them, drop them, hang until `hung` is called, or throw. */
-  routing: { mode: 'store' | 'drop' | 'hang' | 'throw'; hung: Array<() => void> };
+  /** What the router does with the next turns: store them, drop them, hang until `hung` is called (storing it on `true`), or throw. */
+  routing: { mode: 'store' | 'drop' | 'hang' | 'throw'; hung: Array<(store?: boolean) => void> };
   lk: FakeLiveKit;
   stop(): Promise<void>;
 }
@@ -207,7 +207,14 @@ async function startHarness(
     routeInboundEvent: async ({ onStored, ...event }) => {
       if (event.channelType !== 'voice') events.push(event);
       else inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
-      if (routing.mode === 'hang') return new Promise<void>((resolve) => routing.hung.push(resolve));
+      if (routing.mode === 'hang') {
+        return new Promise<void>((resolve) =>
+          routing.hung.push((store) => {
+            if (store) onStored?.();
+            resolve();
+          }),
+        );
+      }
       if (routing.mode === 'throw') throw new Error('router exploded');
       if (routing.mode === 'store') onStored?.();
     },
@@ -568,6 +575,30 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     h.routing.mode = 'store';
     expect((await worker.post('utterance', { text: 'taken' })).status).toBe(202);
     expect(h.inbound).toHaveLength(4);
+    worker.close();
+  });
+
+  it('tells the worker when a turn it heard 504 for reaches the agent after all', async () => {
+    await h.stop();
+    h = await startHarness({}, true, { routeTimeoutMs: 100 });
+    const { worker } = await startCall(h);
+    h.routing.mode = 'hang';
+    expect((await worker.post('utterance', { text: 'late', turnKey: 'k-late' })).status).toBe(504);
+    expect((await worker.post('utterance', { text: 'never', turnKey: 'k-never' })).status).toBe(504);
+    expect((await worker.post('utterance', { text: 'keyless' })).status).toBe(504);
+    const [late, never, keyless] = h.routing.hung;
+    never(false);
+    keyless(true);
+    late(true);
+    const stored = await worker.waitFor((e) => e.type === 'turn-stored');
+    expect(stored).toEqual({ type: 'turn-stored', turnKey: 'k-late', id: '1' });
+    await settle();
+    // A turn the router dropped in the end, or one with no key to name it by, is not reported.
+    expect(worker.events.filter((e) => e.type === 'turn-stored')).toHaveLength(1);
+    // A retry under that key now hears it was taken.
+    const again = await worker.post('utterance', { text: 'late', turnKey: 'k-late' });
+    expect(again.status).toBe(202);
+    expect(await again.json()).toEqual({ id: '1' });
     worker.close();
   });
 
@@ -1138,6 +1169,8 @@ describe('livekit call talking in the agent chat', () => {
     fake.state.bound = { group: topic, threadId: null, ownerIds: ['telegram:42'] };
     await worker.utter('two');
     expect(h.lk.roomMetadata).toEqual([{ room: h.lk.rooms[0], metadata: { chat: 'Ops' } }]);
+    // The worker hears that the call has a chat once, not again for a move between chats.
+    expect(worker.events.filter((e) => e.type === 'chat')).toEqual([{ type: 'chat', chat: true }]);
     worker.close();
   });
 
@@ -1180,6 +1213,26 @@ describe('livekit call talking in the agent chat', () => {
     expect(h.inbound).toHaveLength(1);
     await settle();
     expect(posts).toEqual([]);
+    // No chat to point the caller at: the worker is never told there is one.
+    expect(worker.events.some((e) => e.type === 'chat')).toBe(false);
+    worker.close();
+  });
+
+  it('tells the worker when the call moves off its chat onto the voice line', async () => {
+    const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
+    const fake = await start([topic], 'off', {
+      bound: { group: topic, threadId: null, ownerIds: ['telegram:42'] },
+      admins: ['telegram:42'],
+    });
+    const { worker } = await startCall(h);
+    await worker.utter('one');
+    fake.state.bound = undefined;
+    await worker.utter('two');
+    await worker.waitFor((e) => e.type === 'chat' && !e.chat);
+    expect(worker.events.filter((e) => e.type === 'chat')).toEqual([
+      { type: 'chat', chat: true },
+      { type: 'chat', chat: false },
+    ]);
     worker.close();
   });
 });

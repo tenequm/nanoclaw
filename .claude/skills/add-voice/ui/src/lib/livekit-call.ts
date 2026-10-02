@@ -163,10 +163,13 @@ const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
 /**
  * Put a turn's mark on the caller line it belongs to: the latest unmarked one its final text
  * contains, else the latest unmarked one. Earlier unmarked lines are the same turn's opening
- * segments. A turn with no caption at all (nothing transcribed) gets a line of its own.
+ * segments. A turn with no caption at all (nothing transcribed) gets a line of its own. A second
+ * status for a turn (a timed-out one the agent got after all) replaces the mark on its line.
  */
 function applyTurn(lines: Line[], covered: Set<number>, status: TurnStatus, newLine: () => Line, shown?: number): Line[] {
   const mark: TurnMark = status.reason ? { status: status.status, reason: status.reason } : { status: status.status }
+  const marked = shown === undefined ? undefined : lines.find((l) => l.from === "user" && l.turn === shown)
+  if (marked) return lines.map((l) => (l.id === marked.id ? { ...l, mark } : l))
   const turn = shown === undefined ? {} : { turn: shown }
   const open = lines.filter((l) => l.from === "user" && !covered.has(l.id))
   const said = norm(status.text ?? "")

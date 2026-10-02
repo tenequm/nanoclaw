@@ -125,11 +125,16 @@ export type WalkieEndReason =
  * One line of the host-to-worker event stream: a complete agent message to
  * speak (`turn`: the host's utterance id of the caller turn it answers, when it
  * answers one of this call), the agent still working (from the host's typing
- * refresh), the end of the call, or a keepalive.
+ * refresh), whether the call now talks in a chat (`chat`; none until it does),
+ * a turn answered 504 that the agent's session stored after all (`turn-stored`:
+ * its `turnKey` and the host's utterance id), the end of the call, or a keepalive.
+ * A worker ignores a type it does not know, so new types need no version bump.
  */
 export type LiveKitHostEvent =
   | { type: 'reply'; text: string; turn?: string }
   | { type: 'thinking' }
+  | { type: 'chat'; chat: boolean }
+  | { type: 'turn-stored'; turnKey: string; id: string }
   | { type: 'end'; reason: string }
   | { type: 'ping' };
 

@@ -247,7 +247,8 @@ export interface LiveKitHost {
   endOtherCalls(platformId: string, reason: string): void;
   /**
    * Route a turn through the host's inbound path, into the call chat or onto the voice line. Resolves
-   * true once the agent's session stored it, false when the router dropped it; rejects when routing threw.
+   * true once the agent's session stored it (to answer, or as context), false when the router dropped it;
+   * rejects when routing threw.
    */
   routeTurn(event: InboundEvent): Promise<boolean>;
   isRunning(): boolean;
@@ -587,6 +588,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       else call.previousChat = null;
     }
     if (!sameChat(call.chat, chat)) {
+      // The worker's own lines say "check the chat" only when there is one.
+      if (!call.chat !== !chat && !call.ended) push(call, { type: 'chat', chat: !!chat });
       call.previousChat = call.chat ? { chat: call.chat, active: false } : null;
       call.chat = chat;
       // The token reply named the first chat; a later move (a mid-call `/voice`) reaches the page here.
@@ -935,7 +938,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     call.utteranceStarts.push(t);
     call.turnsInFlight++;
-    const outcome = takeTurn(call, text, t);
+    const outcome = takeTurn(call, text, t, turnKey);
     if (turnKey) {
       call.turnOutcomes.set(turnKey, outcome);
       for (const key of call.turnOutcomes.keys()) {
@@ -951,10 +954,16 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
   /**
    * The turn keeps its in-flight slot until routing ends, which can be after the 504: the router may
-   * still store the turn then. The route timeout counts from `receivedAt`, so the lookups
-   * before routing cannot push the answer past the worker's own request timeout.
+   * still store the turn then, and the worker hears `turn-stored` for its `turnKey`. The route timeout
+   * counts from `receivedAt`, so the lookups before routing cannot push the answer past the worker's
+   * own request timeout.
    */
-  const takeTurn = async (call: LiveKitCall, text: string, receivedAt: number): Promise<TurnOutcome> => {
+  const takeTurn = async (
+    call: LiveKitCall,
+    text: string,
+    receivedAt: number,
+    turnKey: string | undefined,
+  ): Promise<TurnOutcome> => {
     const release = () => void call.turnsInFlight--;
     let routed: Promise<boolean> | undefined;
     try {
@@ -1011,6 +1020,18 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         const stored = await Promise.race([routed, timedOut]);
         if (stored === 'timeout') {
           log.warn('livekit-voice: a turn did not reach the agent in time', fields);
+          if (turnKey) {
+            void routed.then(
+              (late) => {
+                if (!late) return;
+                log.info('livekit-voice: a timed-out turn reached the agent', fields);
+                const accepted = { status: 202, body: JSON.stringify({ id: utteranceId }) };
+                if (call.turnOutcomes.has(turnKey)) call.turnOutcomes.set(turnKey, Promise.resolve(accepted));
+                if (!call.ended) push(call, { type: 'turn-stored', turnKey, id: utteranceId });
+              },
+              () => undefined,
+            );
+          }
           return { status: 504, body: 'The turn did not reach the agent in time' };
         }
         if (!stored) {

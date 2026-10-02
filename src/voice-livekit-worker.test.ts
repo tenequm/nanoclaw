@@ -30,6 +30,7 @@ import {
 import {
   AWAIT_REPLY_MS,
   capSpokenText,
+  CUT_LINES,
   DEFAULT_MAX_SPOKEN_CHARS,
   FAILURE_LINES,
   GeminiTranscribeSTT,
@@ -47,7 +48,6 @@ import {
   readJobHeader,
   recordingDays,
   REPLY_CHUNKS,
-  REST_IN_CHAT,
   runCall,
   speakableText,
   TTS_CONCURRENCY,
@@ -63,6 +63,7 @@ import {
   type TurnAudio,
   type TurnRecord,
   type TurnTake,
+  type SendResult,
   type VoiceSettings,
   type WalkieDeps,
 } from './voice-livekit-worker.js';
@@ -132,20 +133,41 @@ describe('helpers', () => {
   });
 
   it('cuts long spoken text at the last sentence end within the cap and says the rest is in the chat', () => {
-    expect(capSpokenText('Short. Fine.', 20, 'en')).toBe('Short. Fine.');
-    expect(capSpokenText('x'.repeat(5000), 0, 'en')).toBe('x'.repeat(5000));
+    const rest = CUT_LINES.chat;
+    expect(capSpokenText('Short. Fine.', 20, 'en', true)).toBe('Short. Fine.');
+    expect(capSpokenText('x'.repeat(5000), 0, 'en', true)).toBe('x'.repeat(5000));
     const text = 'First one here. Second sentence is right here! Third goes past the cap.';
-    expect(capSpokenText(text, 50, 'en')).toBe(`First one here. Second sentence is right here! ${REST_IN_CHAT.en}`);
+    expect(capSpokenText(text, 50, 'en', true)).toBe(`First one here. Second sentence is right here! ${rest.en}`);
     // A sentence end that would need the character past the cap does not count.
-    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 10, 'uk')).toBe(`Aaaa bbbb. ${REST_IN_CHAT.uk}`);
-    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 9, 'uk')).toBe(`Aaaa… ${REST_IN_CHAT.uk}`);
+    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 10, 'uk', true)).toBe(`Aaaa bbbb. ${rest.uk}`);
+    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 9, 'uk', true)).toBe(`Aaaa… ${rest.uk}`);
     // Decimals are not sentence ends; with none before the cap the cut is at a word, never inside one.
-    expect(capSpokenText('Version 2.4 of the release, with many words', 30, 'en')).toBe(
-      `Version 2.4 of the release… ${REST_IN_CHAT.en}`,
+    expect(capSpokenText('Version 2.4 of the release, with many words', 30, 'en', true)).toBe(
+      `Version 2.4 of the release… ${rest.en}`,
     );
-    expect(capSpokenText('Слово слово слово слово', 13, 'uk')).toBe(`Слово слово… ${REST_IN_CHAT.uk}`);
-    expect(capSpokenText('a'.repeat(30), 10, 'en')).toBe(REST_IN_CHAT.en);
-    expect(REST_IN_CHAT).toEqual({ uk: 'Решта - у чаті.', en: 'The rest is in the chat.' });
+    expect(capSpokenText('Слово слово слово слово', 13, 'uk', true)).toBe(`Слово слово… ${rest.uk}`);
+    expect(capSpokenText('a'.repeat(30), 10, 'en', true)).toBe(rest.en);
+    expect(rest).toEqual({ uk: 'Решта - у чаті.', en: 'The rest is in the chat.' });
+  });
+
+  it('cuts at a word instead of a sentence end that would drop most of the budget', () => {
+    const long = `Ок. ${'дуже довге речення '.repeat(60)}`;
+    const spoken = capSpokenText(long, 800, 'uk', true);
+    expect(spoken).toMatch(/^Ок\. дуже довге речення .*\S… Решта - у чаті\.$/);
+    expect(spoken.length).toBeGreaterThan(780);
+    // Past 60% of the cap, the sentence end still wins.
+    expect(capSpokenText('Aaaa bbbb ccc. Dddd eeee ffff gggg.', 20, 'en', true)).toBe(
+      `Aaaa bbbb ccc. ${CUT_LINES.chat.en}`,
+    );
+    expect(capSpokenText('Aaaa. Bbbb cccc dddd eeee ffff gggg.', 20, 'en', true)).toBe(
+      `Aaaa. Bbbb cccc dddd… ${CUT_LINES.chat.en}`,
+    );
+  });
+
+  it('closes a cut without pointing at a chat when the call has none', () => {
+    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 10, 'en', false)).toBe(`Aaaa bbbb. ${CUT_LINES.no_chat.en}`);
+    expect(capSpokenText('Слово слово слово слово', 13, 'uk', false)).toBe(`Слово слово… ${CUT_LINES.no_chat.uk}`);
+    expect(CUT_LINES.no_chat).toEqual({ uk: 'Скорочую.', en: "I've cut it short." });
   });
 
   it('reads WALKIE_MAX_SPOKEN_CHARS, with 0 for no cap', () => {
@@ -282,10 +304,15 @@ describe('Walkie', () => {
     const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 20 });
     walkie.onTurn('what is new');
     await vi.advanceTimersByTimeAsync(SILENCE + TURN_SETTLE_MS);
-    walkie.onReply('Two things. A **third** one that is long.');
+    walkie.onReply('Two things now. A **third** one that is long.');
     walkie.onReply('Fits.');
     await vi.advanceTimersByTimeAsync(1);
-    expect(said).toEqual([`Two things. ${REST_IN_CHAT.en}`, 'Fits.']);
+    // No `chat` event yet: the call talks on the voice line, where no chat holds the rest.
+    expect(said).toEqual([`Two things now. ${CUT_LINES.no_chat.en}`, 'Fits.']);
+    walkie.onChat(true);
+    walkie.onReply('Two things now. A third one that is long.');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(said.at(-1)).toBe(`Two things now. ${CUT_LINES.chat.en}`);
     const uncapped = new Walkie(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 0 });
     uncapped.onReply('Two things. A third one that is long.');
     await vi.advanceTimersByTimeAsync(1);
@@ -343,16 +370,47 @@ describe('Walkie', () => {
     expect(said).toEqual(['Done.']);
   });
 
-  it("says it didn't catch a turn the host refused or the STT lost, in the caller's language, once", async () => {
-    const { deps, said } = fakeWalkieDeps({ send: async () => ({ accepted: false, status: 429 }) });
+  it("says it didn't catch a turn the STT lost, in the caller's language, once", async () => {
+    const { deps, said } = fakeWalkieDeps();
     const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
     walkie.onTurnLost('empty');
     walkie.onTurnLost('empty');
     await walkie.idle();
     expect(said).toEqual([FAILURE_LINES.turn.uk]);
-    walkie.onTurn('what about the logs');
+    walkie.onTurnLost('stt');
     await walkie.idle();
-    expect(said).toEqual([FAILURE_LINES.turn.uk, FAILURE_LINES.turn.en]);
+    expect(said).toEqual([FAILURE_LINES.turn.uk, FAILURE_LINES.turn.uk]);
+  });
+
+  it("never asks to repeat a turn the host refused or did not confirm, in the caller's language", async () => {
+    const answers: SendResult[] = [
+      { accepted: false, status: 429 },
+      { accepted: false, status: 422 },
+      { accepted: false, status: 504 },
+      { accepted: false, error: 'The operation was aborted due to timeout' },
+      { accepted: false, status: 504 },
+    ];
+    const { deps, said } = fakeWalkieDeps({ send: async () => answers.shift() ?? { accepted: true } });
+    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
+    for (const text of ['what about the logs', 'and the disk', 'а диск', 'і пам’ять']) {
+      walkie.onTurn(text);
+      await walkie.idle();
+    }
+    walkie.onChat(true);
+    walkie.onTurn('а мережа');
+    await walkie.idle();
+    expect(said).toEqual([
+      FAILURE_LINES.rate_limited.en,
+      FAILURE_LINES.rejected.en,
+      // On the voice line no chat shows the turn, so the line does not send the caller to one.
+      FAILURE_LINES.timeout_no_chat.uk,
+      FAILURE_LINES.timeout_no_chat.uk,
+      FAILURE_LINES.timeout.uk,
+    ]);
+    expect(FAILURE_LINES.timeout).toEqual({
+      uk: 'Не впевнений, що це дійшло - перевір чат.',
+      en: 'Not sure that got through - check the chat.',
+    });
   });
 
   it('says so when a reply could not be synthesized, and keeps speaking after a failure', async () => {
@@ -626,7 +684,7 @@ describe('runCall', () => {
     const v = fakeVoice();
     await runCall(ctx, deps(host.fetchImpl, v.createVoice));
     v.events.onTurn('Привіт', { sttModel: 'gemini-3.5-transcribe-live' });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.turn.uk));
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.rate_limited.uk));
     expect(v.voice.publishTurn).toHaveBeenCalledWith({
       turn: 1,
       status: 'lost',
@@ -635,6 +693,41 @@ describe('runCall', () => {
     });
     v.events.onTurnLost('stt', { speechMs: 1200 }, { sttModel: 'gemini-3.5-transcribe-live' });
     expect(v.voice.publishTurn).toHaveBeenLastCalledWith({ turn: 2, status: 'lost', reason: 'stt' });
+  });
+
+  it('marks a timed-out turn sent once the host says it was stored after all, and points at the chat once there is one', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch(200, 504);
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({
+        turn: 1,
+        status: 'lost',
+        reason: 'timeout',
+        text: 'Book a table',
+      }),
+    );
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.timeout_no_chat.en));
+    const turnKey = host.calls.find((c) => c.url.endsWith('/utterance'))?.body?.turnKey;
+    // Another worker's key, or one already settled, changes nothing.
+    host.emit({ type: 'turn-stored', turnKey: 'not-ours', id: '7' });
+    host.emit({ type: 'turn-stored', turnKey, id: '1' });
+    host.emit({ type: 'turn-stored', turnKey, id: '1' });
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenLastCalledWith({ turn: 1, status: 'sent', text: 'Book a table' }),
+    );
+    expect(v.voice.publishTurn).toHaveBeenCalledTimes(2);
+    // The late turn's answer is labelled with it.
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.'));
+    expect(v.voice.publishReply).toHaveBeenLastCalledWith(expect.objectContaining({ turn: 1, part: 1 }));
+
+    host.emit({ type: 'chat', chat: true });
+    v.events.onTurn('And a taxi', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.timeout.en));
+    host.endStream();
   });
 
   it('posts a turn once more under the same key when the connection drops, but not after a timeout', async () => {
