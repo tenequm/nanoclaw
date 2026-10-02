@@ -90,33 +90,37 @@ export function parseCidrs(raw: string | undefined, key: string): CidrSet {
   };
 }
 
-/** Who may reach the browser-facing voice routes besides loopback peers. */
+/** Who may reach the browser-facing voice routes. */
 export interface VoiceProxyPolicy {
-  /** Reverse proxies whose X-Forwarded-For is believed; empty means none, today's loopback-only behaviour. */
+  /** Reverse proxies whose X-Forwarded-For is believed; empty means none, loopback peers only. */
   trustedProxies: CidrSet;
   /** Clients a trusted proxy may forward; not configured means any client it forwards. */
   allowedClients: CidrSet;
 }
 
 /**
- * Whether a browser-facing voice request is admitted: a loopback peer, or a trusted proxy forwarding
- * an allowed client. The client is the rightmost X-Forwarded-For hop outside the trusted proxies (the
- * leftmost when every hop is one): hops to its left are whatever the client claimed.
+ * Whether a browser-facing voice request is admitted: a trusted proxy forwarding an allowed client,
+ * or any other loopback peer. A loopback proxy (Tailscale Serve, Caddy on this machine) is held to
+ * the allowed clients only once it is listed as trusted and allowed clients are configured; then a
+ * direct local request is checked as its own client too. The client is the rightmost
+ * X-Forwarded-For hop outside the trusted proxies (the leftmost when every hop is one, the peer
+ * when there are none): hops to its left are whatever the client claimed.
  */
 export function admitsVoicePeer(
   policy: VoiceProxyPolicy,
   peer: string | undefined,
   forwardedFor: string | string[] | undefined,
 ): boolean {
-  if (isLoopbackAddress(peer)) return true;
-  if (!policy.trustedProxies.has(peer)) return false;
+  const trusted = policy.trustedProxies.has(peer);
+  if (isLoopbackAddress(peer) && !(trusted && policy.allowedClients.configured)) return true;
+  if (!trusted) return false;
   if (!policy.allowedClients.configured) return true;
   const hops = [forwardedFor ?? []]
     .flat()
     .flatMap((h) => h.split(','))
     .map((h) => h.trim())
     .filter(Boolean);
-  const client = [...hops].reverse().find((h) => !policy.trustedProxies.has(h)) ?? hops[0];
+  const client = [...hops].reverse().find((h) => !policy.trustedProxies.has(h)) ?? hops[0] ?? peer;
   return policy.allowedClients.has(client);
 }
 
@@ -304,8 +308,12 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
     const token = url.searchParams.get('t') ?? '';
     // Before any token check: a link must not be usable, or probed, from the LAN over plain HTTP.
     const peer = req.socket.remoteAddress;
-    if (!config.allowNonLoopback && !isLoopbackAddress(peer)) {
-      if (server === 'worker' || !admitsVoicePeer(proxyPolicy, peer, req.headers['x-forwarded-for'])) {
+    if (!config.allowNonLoopback) {
+      const admitted =
+        server === 'worker'
+          ? isLoopbackAddress(peer)
+          : admitsVoicePeer(proxyPolicy, peer, req.headers['x-forwarded-for']);
+      if (!admitted) {
         if (proxyPolicy.trustedProxies.has(peer)) {
           log.warn('voice-mode: refused a proxied voice request', {
             peer,

@@ -400,6 +400,18 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect((await fetch(`${h.pageUrl}/voice/info?t=tok123`)).status).toBe(403);
   });
 
+  it('serves the page to a trusted loopback proxy only for allowed clients, and the worker routes never through it', async () => {
+    await h.stop();
+    h = await startHarness({ trustedProxyCidrs: '127.0.0.1/32, ::1/128', allowedClientCidrs: '100.64.0.0/10' });
+    const via = (client?: string) => (client ? { 'X-Forwarded-For': client } : undefined);
+    expect((await fetch(`${h.pageUrl}/voice/info?t=tok123`, { headers: via('100.100.1.2') })).status).toBe(200);
+    expect((await fetch(`${h.pageUrl}/voice/info?t=tok123`, { headers: via('203.0.113.9') })).status).toBe(403);
+    expect((await fetch(`${h.pageUrl}/voice?t=tok123`, { headers: via('203.0.113.9') })).status).toBe(403);
+    expect((await fetch(`${h.pageUrl}/voice/info?t=tok123`)).status).toBe(403);
+    // The worker's routes stay loopback-only and ignore the browser policy.
+    expect((await post(`${h.hostUrl}/webhook/voice-mode/livekit/agent/joined`, { callId: 'x' })).status).not.toBe(403);
+  });
+
   it('serves no other page or route under either prefix', async () => {
     for (const path of ['/voice/call', '/webhook/voice-mode/call', '/voice/sip', '/voicemail']) {
       expect((await fetch(`${h.hostUrl}${path}?t=tok123`)).status).toBe(404);

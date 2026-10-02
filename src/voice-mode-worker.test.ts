@@ -24,6 +24,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
+  liveKitHostUrl,
   type LiveKitJobMetadata,
 } from './channels/voice-mode-protocol.js';
 import {
@@ -1250,5 +1251,17 @@ describe('SendCountdown', () => {
     vi.advanceTimersByTime(1);
     expect(published).toEqual(['1:500:2500', '']);
     vi.useRealTimers();
+  });
+});
+
+describe('liveKitHostUrl', () => {
+  it('takes a local http(s) origin only: the host serves the worker on loopback', () => {
+    expect(liveKitHostUrl({})).toBe('http://127.0.0.1:3000');
+    expect(liveKitHostUrl({ WEBHOOK_PORT: '3555' })).toBe('http://127.0.0.1:3555');
+    expect(liveKitHostUrl({ LIVEKIT_HOST_URL: 'http://localhost:3000/' })).toBe('http://localhost:3000');
+    expect(liveKitHostUrl({ LIVEKIT_HOST_URL: 'https://[::1]:3000' })).toBe('https://[::1]:3000');
+    for (const bad of ['http://192.168.1.5:3000', 'https://voice.example.com', 'ws://127.0.0.1:3000', 'nonsense']) {
+      expect(() => liveKitHostUrl({ LIVEKIT_HOST_URL: bad })).toThrow('LIVEKIT_HOST_URL must be a local');
+    }
   });
 });

@@ -1644,9 +1644,14 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'VOICE_MODE_MAX_SPOKEN_CHARS',
   ]);
   // agents-js initializes its logger once the CLI runs a command; console until then.
-  console.info(
-    `voice worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${liveKitHostUrl(env)} (LIVEKIT_HOST_URL)`,
-  );
+  let hostUrl: string;
+  try {
+    hostUrl = liveKitHostUrl(env);
+  } catch (err) {
+    console.error(`voice worker: ${(err as Error).message}`);
+    process.exit(1);
+  }
+  console.info(`voice worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${hostUrl} (LIVEKIT_HOST_URL)`);
   const keepDays = recordingDays(env.VOICE_MODE_RECORDINGS_DAYS);
   if (keepDays > 0) {
     const prune = () =>

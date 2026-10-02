@@ -179,7 +179,24 @@ export function liveKitCallSecret(apiSecret: string, callId: string): string {
   return createHmac('sha256', apiSecret).update(`nanoclaw-voice-call:${callId}`).digest('base64url');
 }
 
-/** Where the worker reaches the host's webhook server; only ever from the worker's own settings. */
+/**
+ * Where the worker reaches the host's webhook server; only ever from the worker's own settings. The
+ * host answers the worker's routes for loopback peers only, so anything but a local HTTP(S) origin
+ * is a misconfiguration and throws.
+ */
 export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: string }): string {
-  return (env.LIVEKIT_HOST_URL || `http://127.0.0.1:${env.WEBHOOK_PORT || '3000'}`).replace(/\/+$/, '');
+  const raw = (env.LIVEKIT_HOST_URL || `http://127.0.0.1:${env.WEBHOOK_PORT || '3000'}`).replace(/\/+$/, '');
+  let url: URL | null = null;
+  try {
+    url = new URL(raw);
+  } catch {
+    // Reported below.
+  }
+  const local = url && /^https?:$/.test(url.protocol) && /^(localhost|127(\.\d{1,3}){3}|\[::1\])$/.test(url.hostname);
+  if (!local) {
+    throw new Error(
+      `LIVEKIT_HOST_URL must be a local http(s) address such as http://127.0.0.1:3000 (got "${raw}"): the host serves the worker on loopback only`,
+    );
+  }
+  return raw;
 }
