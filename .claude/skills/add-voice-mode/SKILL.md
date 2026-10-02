@@ -560,11 +560,13 @@ TTS, captions and the agent state are the framework's. Then:
   voice-line call). A refused turn gets "That didn't go through.", a rate-limited
   one "Too many turns - give it a moment." (and their Ukrainian lines). When a
   reply cannot be synthesized, a line saying so. All of these also show as captions. The
-  worker also sends one JSON message per caller turn (noise is not reported) on the text stream topic
-  `nanoclaw.voice.turn`: `{"turn": n, "status": "sent" | "lost", "reason"?:
+  worker also sends JSON messages per caller turn (noise is not reported) on the text stream topic
+  `nanoclaw.voice.turn`: `{"turn": n, "status": "sending" | "sent" | "lost", "reason"?:
   "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
-  "sent" means the agent's session has the turn; a 504 is "timeout", 429
-  "rate_limited", any other refusal "rejected".
+  Every turn handed to the host first gets "sending", once the closing silence
+  and the final transcript are in and before the host answers (a turn lost to
+  the transcription gets none); "sent" means the agent's session has the turn; a
+  504 is "timeout", 429 "rate_limited", any other refusal "rejected".
 - Right before each line it speaks, the worker sends one JSON message on
   `nanoclaw.voice.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
   true, "notice"?: true, "more"?: true}`. `turn` is the caller turn the agent
@@ -662,17 +664,21 @@ token reply carries `silenceMs` and `limit: {ms, kind: "duration" | "daily"}`:
 the listening hint names the pause that sends a turn, a thin line under the
 readout fills while `nanoclaw.voice.pending` counts down, caller lines show
 "turn n" and the first caption of a reply "re: turn n" (or "unprompted"), and a
-minute before the limit the hint says the call is about to end. Soft Web Audio
-tones mark a sent turn and, once the agent is done, the caller's turn;
-`?cues=0` turns them off. Microphone capture runs with echo cancellation, noise
-suppression and auto gain; DTX is off because the worker times turns by the
-silence it hears. On iOS Safari the call must be started with the Call button
-(audio unlocks on that tap) and joins relay-only (TURN over TLS; `?relay=1` /
-`?relay=0` override it); if playback is still blocked the readout shows a "tap
-to hear `<agent>`" button. While the SDK reconnects the readout says to wait
-before speaking. With no worker in the room after 25 seconds the page says the
-voice service is unavailable; a worker on another protocol version makes it say
-the service is updating.
+minute before the limit the hint says the call is about to end. Three short Web
+Audio cues let a caller follow the call without looking: a rising two-note
+(listening) once the worker's session hears the published microphone, a single
+high tick (sent) on a turn's "sending", and a falling two-note (your turn) once
+the agent is done and nothing else is queued. None plays while the agent speaks;
+the later "sent" is the caption mark alone. `?cues=0` turns them off, and
+`?demo=1` plays them too once its Call button is tapped. Microphone capture runs
+with echo cancellation, noise suppression and auto gain; DTX is off because the
+worker times turns by the silence it hears. On iOS Safari the call must be
+started with the Call button (audio unlocks on that tap) and joins relay-only
+(TURN over TLS; `?relay=1` / `?relay=0` override it); if playback is still
+blocked the readout shows a "tap to hear `<agent>`" button. While the SDK
+reconnects the readout says to wait before speaking. With no worker in the room
+after 25 seconds the page says the voice service is unavailable; a worker on
+another protocol version makes it say the service is updating.
 
 ## Channel Info
 

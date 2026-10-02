@@ -108,7 +108,7 @@ export async function computeCommandGrants(): Promise<CommandGrant[]> {
     return ids;
   };
 
-  // /voice only where an agent of the chat has a voice line to hand out.
+  // /voice only where an agent of the chat has a voice line to hand out, and then first in the popup.
   const voiceCache = new Map<string, boolean>();
   const anyVoiceLine = async (agentGroupIds: Iterable<string>): Promise<boolean> => {
     for (const id of agentGroupIds) {
@@ -125,7 +125,7 @@ export async function computeCommandGrants(): Promise<CommandGrant[]> {
       for (const uid of await scopedAdminsOf(agId)) admins.add(uid);
     }
     const commands: readonly CommandName[] = (await anyVoiceLine(acc.agentGroupIds))
-      ? [...COMMAND_ORDER, 'voice']
+      ? ['voice', ...COMMAND_ORDER]
       : COMMAND_ORDER;
 
     if (acc.isGroup) {

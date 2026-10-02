@@ -58,7 +58,7 @@ export const COMMANDS: Record<CommandName, CommandSpec> = {
 
 /**
  * Canonical command order for popups and pickers (also the admin popup set):
- * read-only /status first, then the mutating trio. /voice is appended per chat.
+ * read-only /status first, then the mutating trio. /voice leads it per chat, where it applies.
  */
 export const COMMAND_ORDER: readonly CommandName[] = ['status', 'model', 'config', 'restart'] as const;
 
