@@ -22,7 +22,6 @@ import net, { type AddressInfo } from 'node:net';
 
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundEvent } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import type { VoiceUiConfig } from './voice-mode-page.js';
 import { linePlatformId, resolveVoiceLine, type ResolveLineOptions, type VoiceLine } from './voice-mode-line.js';
 import { createLiveKitVoice, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
 import { DEFAULT_VOICE_MIRROR, parseVoiceLanguages } from './voice-mode-protocol.js';
@@ -170,8 +169,6 @@ export interface VoiceConfig {
   accessCheckIntervalMs?: number;
   /** Clock, overridable for tests. */
   now?: () => number;
-  /** Look of the browser call page; injected at serve time, no rebuild needed (VOICE_MODE_UI). */
-  ui?: VoiceUiConfig;
   maxCallDurationMs?: number;
   maxCallsPerHour?: number;
   /** Call time one line may use per UTC day. */
@@ -264,7 +261,6 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
   };
 
   const livekit = createLiveKitVoice(config.livekit, {
-    ui: config.ui,
     resolveLine,
     admitStart,
     remainingTodayMs: (platformId, t) => maxCallMsPerDay - usedTodayMs(platformId, t),
@@ -401,37 +397,6 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
   };
 }
 
-const UI_CONFIG_KEYS = [
-  'skin',
-  'colorway',
-  'layout',
-  'presence',
-  'brand',
-  'footer',
-  'shortcuts',
-  'timestamps',
-  'colorwayPicker',
-] as const;
-
-/** VOICE_MODE_UI is a JSON object; anything unparsable falls back to the page defaults with a warning. */
-export function parseUiConfig(raw: string | undefined): VoiceUiConfig | undefined {
-  if (!raw || !raw.trim()) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      // Only the documented keys travel to the page; the page validates values.
-      const src = parsed as Record<string, unknown>;
-      const out: Record<string, unknown> = {};
-      for (const key of UI_CONFIG_KEYS) if (key in src) out[key] = src[key];
-      return out as VoiceUiConfig;
-    }
-    log.warn('voice-mode: VOICE_MODE_UI must be a JSON object; using the default look');
-  } catch (err) {
-    log.warn('voice-mode: VOICE_MODE_UI is not valid JSON; using the default look', { err });
-  }
-  return undefined;
-}
-
 /** VOICE_MODE_SILENCE_MS: how long the caller is silent before their turn ends; nonsense falls back to the default. */
 function parseSilenceMs(raw: string | undefined): number | undefined {
   if (!raw?.trim()) return undefined;
@@ -449,7 +414,6 @@ registerChannelAdapter(CHANNEL_TYPE, {
     const env = readEnvFile([
       'VOICE_MODE_PUBLIC_URL',
       'VOICE_MODE_PORT',
-      'VOICE_MODE_UI',
       'VOICE_MODE_MAX_CALL_SECONDS',
       'VOICE_MODE_MAX_CALLS_PER_HOUR',
       'VOICE_MODE_MAX_MINUTES_PER_DAY',
@@ -482,7 +446,6 @@ registerChannelAdapter(CHANNEL_TYPE, {
     return createVoiceAdapter({
       publicUrl: (env.VOICE_MODE_PUBLIC_URL || `http://localhost:${pagePort}`).replace(/\/+$/, ''),
       pagePort,
-      ui: parseUiConfig(env.VOICE_MODE_UI),
       allowNonLoopback: env.VOICE_MODE_ALLOW_NON_LOOPBACK === '1',
       trustedProxyCidrs: env.VOICE_MODE_TRUSTED_PROXY_CIDRS,
       allowedClientCidrs: env.VOICE_MODE_ALLOWED_CLIENT_CIDRS,

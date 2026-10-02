@@ -388,7 +388,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     ]) {
       expect(html).toContain(name);
     }
-    expect(html).toContain('window.__VOICE_UI__={}');
+    expect(html).not.toContain('__VOICE_UI__');
   });
 
   it('tells the page who answers the line, only with a known token and a caller with access', async () => {

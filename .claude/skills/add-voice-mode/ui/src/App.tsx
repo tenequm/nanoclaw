@@ -1,24 +1,16 @@
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react"
 import { Mic, MicOff } from "lucide-react"
-import { BarVisualizer, type AgentState as BarState } from "@/components/ui/bar-visualizer"
 import { Matrix, digits, loader, wave, type Frame } from "@/components/ui/matrix"
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from "@/components/ui/conversation"
 import { Message, MessageContent } from "@/components/ui/message"
 import { ShimmeringText } from "@/components/ui/shimmering-text"
-import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
-import { readConfig, type VoiceUiConfig } from "@/lib/config"
 import { LIVE_PHASES, type ErrorKind, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
-import logo from "@/assets/nanoclaw-logo.png"
-
-type Colorway = NonNullable<VoiceUiConfig["colorway"]>
-const COLORWAYS: Colorway[] = ["ivory", "field", "rabbit"]
 
 const MATRIX_ROWS = 7
 const MATRIX_COLS = 14
-const BAR_COUNT = 12
 const MATRIX_OFF: Frame = Array.from({ length: MATRIX_ROWS }, () => Array(MATRIX_COLS).fill(0))
 
 // The mascot as a pincer drawn in dots: a disc with a notch that opens while the call is live.
@@ -56,25 +48,13 @@ const MATRIX_ON: Record<Phase, string> = {
   error: "var(--coral)",
 }
 
-const BAR_STATE: Record<Phase, BarState> = {
-  idle: "listening",
-  connecting: "connecting",
-  listening: "listening",
-  thinking: "thinking",
-  talking: "speaking",
-  ended: "listening",
-  error: "listening",
-}
+const FOOTER = "Voice mode · answers by {agent}"
 
-// A turn goes out when the caller pauses, and each reply plays to the end.
-const HINT: Record<Phase, string> = {
+// What the readout says when nothing more specific applies; the other phases have their own lines below.
+const HINT: Record<"idle" | "connecting" | "listening", string> = {
   idle: "Allow the microphone when asked.",
   connecting: "Setting up the call.",
   listening: "Go ahead. A pause sends what you said.",
-  thinking: "Your agent is working on it.",
-  talking: "You can interrupt at any time.",
-  ended: "Thanks for calling.",
-  error: "Try again, or ask for a fresh link.",
 }
 
 // The readout names the problem; the hint says what to do about it.
@@ -244,31 +224,8 @@ const Badge = memo(function Badge({ call, phase, live, reduced }: { call: VoiceC
   )
 })
 
-const Stage = memo(function Stage({
-  call,
-  phase,
-  live,
-  presence,
-  reduced,
-}: {
-  call: VoiceCall
-  phase: Phase
-  live: boolean
-  presence: "matrix" | "bars"
-  reduced: boolean
-}) {
-  const bars = presence === "bars"
-  const { levels, glow } = useLevelTicker(call, phase, true, reduced, bars ? BAR_COUNT : MATRIX_COLS)
-  if (bars) {
-    // The bars read the same metering as the matrix. Handing the component a
-    // MediaStream instead would open an AudioContext on the call's own microphone,
-    // which silences the outgoing track on iOS Safari.
-    return (
-      <div className={`bars-wrap${phase === "listening" ? " you" : ""}`}>
-        <BarVisualizer state={BAR_STATE[phase]} volumeBands={levels} barCount={BAR_COUNT} centerAlign minHeight={12} className="h-full w-full gap-2 rounded-none bg-transparent p-0" />
-      </div>
-    )
-  }
+const Stage = memo(function Stage({ call, phase, live, reduced }: { call: VoiceCall; phase: Phase; live: boolean; reduced: boolean }) {
+  const { levels, glow } = useLevelTicker(call, phase, true, reduced)
   const palette = { on: MATRIX_ON[phase], off: "var(--dot-off)" }
   return (
     <div className="matrix-wrap">
@@ -316,7 +273,6 @@ const TranscriptLine = memo(function TranscriptLine({
   isLast,
   isStreaming,
   agentName,
-  showTs,
   mark,
   note,
 }: {
@@ -326,7 +282,6 @@ const TranscriptLine = memo(function TranscriptLine({
   isLast: boolean
   isStreaming: boolean
   agentName: string
-  showTs: boolean
   mark?: TurnMark
   /** The caller turn's number, or what an agent line answers. */
   note?: string
@@ -337,7 +292,7 @@ const TranscriptLine = memo(function TranscriptLine({
       <MessageContent className={`min-w-0 ${from === "user" ? "bubble-you" : "bubble-agent"}${isStreaming ? " is-streaming" : ""}`}>
         <span className="speaker">
           {from === "user" ? "You" : agentName}
-          {showTs && <span className="ts">{`${Math.floor(at / 60)}:${pad(at % 60)}`}</span>}
+          <span className="ts">{`${Math.floor(at / 60)}:${pad(at % 60)}`}</span>
           {note && <span className="turn-ref">{note}</span>}
           {mark && <span className={`turn-mark ${mark.status}`}>{markLabel(mark)}</span>}
         </span>
@@ -360,7 +315,6 @@ function isTypingTarget(t: EventTarget | null): boolean {
 }
 
 export default function App() {
-  const cfg = useMemo(readConfig, [])
   const params = useMemo(() => new URLSearchParams(location.search), [])
   const token = params.get("t") || ""
   const demo = params.get("demo") === "1"
@@ -370,42 +324,9 @@ export default function App() {
   const { phase, lines, streamingId, agentName, elapsed, muted, error, endedText } = call
   const errorKind = call.errorKind ?? "other"
   const live = LIVE_PHASES.has(phase)
-  const skin = cfg.skin
-  const rail = skin === "te" && cfg.layout === "rail"
   const reduced = useReducedMotion()
   const phaseRef = useRef(phase)
   phaseRef.current = phase
-
-  const [colorway, setColorway] = useState<Colorway>(() => {
-    try {
-      const v = localStorage.getItem("voice-colorway")
-      if (v === "ivory" || v === "field" || v === "rabbit") return v
-    } catch {
-      /* storage may be unavailable */
-    }
-    return cfg.colorway
-  })
-  useEffect(() => {
-    try {
-      if (colorway === cfg.colorway) localStorage.removeItem("voice-colorway")
-      else localStorage.setItem("voice-colorway", colorway)
-    } catch {
-      /* storage may be unavailable */
-    }
-  }, [colorway, cfg.colorway])
-  const onColorwayKey = useCallback(
-    (e: React.KeyboardEvent<HTMLButtonElement>, current: Colorway) => {
-      const i = COLORWAYS.indexOf(current)
-      if (e.key === "ArrowRight" || e.key === "ArrowDown") {
-        e.preventDefault()
-        setColorway(COLORWAYS[(i + 1) % COLORWAYS.length])
-      } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
-        e.preventDefault()
-        setColorway(COLORWAYS[(i - 1 + COLORWAYS.length) % COLORWAYS.length])
-      }
-    },
-    []
-  )
 
   // Right after "call" the same key would read "end"; ignore taps for a moment so a double tap cannot cancel.
   const [cancelArmed, setCancelArmed] = useState(false)
@@ -421,7 +342,6 @@ export default function App() {
   // Keyboard: space toggles the microphone, escape ends the call. Never while a control has focus.
   const { toggleMute, end: endCall, start: startCall } = call
   useEffect(() => {
-    if (!cfg.shortcuts) return
     const onKey = (e: KeyboardEvent) => {
       if (e.repeat || isTypingTarget(e.target)) return
       const p = phaseRef.current
@@ -434,7 +354,7 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [cfg.shortcuts, toggleMute, endCall])
+  }, [toggleMute, endCall])
 
   const waited = useWaitSeconds(phase === "thinking")
   const reconnecting = live && !!call.reconnecting
@@ -461,7 +381,7 @@ export default function App() {
                   ? endedHint
                   : phase === "listening" && call.silenceMs
                     ? `Go ahead. Pause about ${+(call.silenceMs / 1000).toFixed(1)} s to send.`
-                    : HINT[phase]
+                    : HINT[phase as keyof typeof HINT]
 
   const chipText = reconnecting
     ? "Reconnecting…"
@@ -503,7 +423,6 @@ export default function App() {
     ) : null
   const sendCueBar = call.sendCue && <SendCueBar key={call.sendCue.id} cue={call.sendCue} reduced={reduced} />
 
-  const showTs = skin === "te" && cfg.timestamps
   const transcript = (
     <Conversation className="transcript-box">
       <ConversationContent className="flex flex-col gap-1 p-1">
@@ -538,7 +457,6 @@ export default function App() {
               isLast={i === lines.length - 1 || (l.group !== undefined && l.group === lines[lines.length - 1].group)}
               isStreaming={l.id === streamingId}
               agentName={agentName}
-              showTs={showTs}
               mark={l.mark}
               note={l.from === "user" ? (l.turn ? `turn ${l.turn}` : undefined) : l.re}
             />
@@ -563,69 +481,48 @@ export default function App() {
   const primaryDisabled = (!token && !demo) || (phase === "connecting" && !cancelArmed)
   const onPrimary = live || phase === "connecting" ? endCall : startCall
 
-  const keys =
-    skin === "te" ? (
-      <>
-        <div className="key key-time">
-          <SegmentTimer seconds={live || phase === "ended" ? elapsed : 0} live={live} />
-          <span className="label">
-            <i className={`led${live ? " on" : ""}`} aria-hidden="true" />
-            Time
-          </span>
-        </div>
-        <div className="key key-end">
-          <button type="button" className="cap orange" onClick={onPrimary} aria-disabled={primaryDisabled} disabled={primaryDisabled}>
-            {primaryLabel}
-          </button>
-          <span className="label">
-            <i className={`led${live ? " green" : ""}`} aria-hidden="true" />
-            {live ? "On call" : phase === "connecting" ? "Connecting" : phase === "error" ? "Not connected" : "Ready"}
-            {cfg.shortcuts && (live || phase === "connecting") && <kbd>esc</kbd>}
-          </span>
-        </div>
-        <div className="key key-mute">
-          <button type="button" className={`cap${muted ? " dark" : ""}`} disabled={!live} onClick={toggleMute}>
-            {muted ? <MicOff size={15} aria-hidden="true" /> : <Mic size={15} aria-hidden="true" />}
-            {muted ? "Unmute" : "Mute"}
-          </button>
-          <span className={`label${notListening ? " wrap" : ""}`}>
-            <i className={`led${muted ? " on" : ""}`} aria-hidden="true" />
-            <span>{micLabel}</span>
-            {cfg.shortcuts && !notListening && <kbd>space</kbd>}
-          </span>
-        </div>
-      </>
-    ) : (
-      <>
-        <span className="timer" role="timer" aria-label="Call duration">
-          {live ? `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)}` : ""}
+  const keys = (
+    <>
+      <div className="key key-time">
+        <SegmentTimer seconds={live || phase === "ended" ? elapsed : 0} live={live} />
+        <span className="label">
+          <i className={`led${live ? " on" : ""}`} aria-hidden="true" />
+          Time
         </span>
-        <Button size="lg" className={`${live || phase === "connecting" ? "btn-hangup" : "btn-call"} h-12 w-full rounded-full text-[15px] font-semibold`} onClick={onPrimary} disabled={primaryDisabled}>
-          {live ? "Hang up" : primaryLabel}
-        </Button>
-        <Button size="lg" variant="secondary" className={`btn-mute h-12 rounded-full ${muted ? "on" : ""}`} disabled={!live} onClick={toggleMute}>
-          {muted ? <MicOff size={16} aria-hidden="true" /> : <Mic size={16} aria-hidden="true" />}
+      </div>
+      <div className="key key-end">
+        <button type="button" className="cap orange" onClick={onPrimary} aria-disabled={primaryDisabled} disabled={primaryDisabled}>
+          {primaryLabel}
+        </button>
+        <span className="label">
+          <i className={`led${live ? " green" : ""}`} aria-hidden="true" />
+          {live ? "On call" : phase === "connecting" ? "Connecting" : phase === "error" ? "Not connected" : "Ready"}
+          {(live || phase === "connecting") && <kbd>esc</kbd>}
+        </span>
+      </div>
+      <div className="key key-mute">
+        <button type="button" className={`cap${muted ? " dark" : ""}`} disabled={!live} onClick={toggleMute}>
+          {muted ? <MicOff size={15} aria-hidden="true" /> : <Mic size={15} aria-hidden="true" />}
           {muted ? "Unmute" : "Mute"}
-        </Button>
-      </>
-    )
+        </button>
+        <span className={`label${notListening ? " wrap" : ""}`}>
+          <i className={`led${muted ? " on" : ""}`} aria-hidden="true" />
+          <span>{micLabel}</span>
+          {!notListening && <kbd>space</kbd>}
+        </span>
+      </div>
+    </>
+  )
 
-  const footer = cfg.footer.split("{agent}").join(agentName)
+  const footer = FOOTER.split("{agent}").join(agentName)
 
   return (
-    <div className="voice-page" data-skin={skin} data-layout={rail ? "rail" : "stack"} data-colorway={skin === "te" && colorway !== "auto" ? colorway : undefined}>
-      <main className={`call-card${rail ? " layout-rail" : ""}`} aria-label="Voice call">
+    <div className="voice-page">
+      <main className="call-card" aria-label="Voice call">
         <header className="brand-row">
-          {skin === "te" ? (
-            <Badge call={call} phase={phase} live={live} reduced={reduced} />
-          ) : (
-            <div className="tile">
-              <img src={logo} alt="" />
-              <span className={`presence${live ? " live" : ""}`} aria-hidden="true" />
-            </div>
-          )}
+          <Badge call={call} phase={phase} live={live} reduced={reduced} />
           <div>
-            <h1 className="product-name">{cfg.brand}</h1>
+            <h1 className="product-name">NanoClaw Voice</h1>
             <p className="agent-line">
               {live
                 ? "On a call with "
@@ -642,72 +539,29 @@ export default function App() {
           </div>
         </header>
 
-        {rail ? (
-          <div className="device">
-            <section className="screen" aria-label="Screen">
-              <div className="screen-top">
-                <Stage call={call} phase={phase} live={live} presence={cfg.presence} reduced={reduced} />
-              </div>
-              <div className="screen-readout">
-                {readout}
-                <span className="screen-hint">{hintText}</span>
-                {hearKey}
-                {sendCueBar}
-              </div>
-              {deliveryNotice}
-              <div className="console" aria-label="Live transcript">
-                {transcript}
-              </div>
-            </section>
-            <aside className="rail" aria-label="Controls">
-              {keys}
-            </aside>
-          </div>
-        ) : (
-          <>
-            <section className="stage" aria-label="Agent presence">
-              <div className="presence-stage">
-                <Stage call={call} phase={phase} live={live} presence={cfg.presence} reduced={reduced} />
-              </div>
+        <div className="device">
+          <section className="screen" aria-label="Screen">
+            <div className="screen-top">
+              <Stage call={call} phase={phase} live={live} reduced={reduced} />
+            </div>
+            <div className="screen-readout">
               {readout}
-              <p className="hint">{hintText}</p>
-              {sendCueBar}
+              <span className="screen-hint">{hintText}</span>
               {hearKey}
-              {deliveryNotice}
-            </section>
-            <section aria-label="Live transcript">
-              <div className="transcript-head">
-                <p className="eyebrow">Live transcript</p>
-              </div>
+              {sendCueBar}
+            </div>
+            {deliveryNotice}
+            <div className="console" aria-label="Live transcript">
               {transcript}
-            </section>
-            <div className="control-bar">{keys}</div>
-          </>
-        )}
+            </div>
+          </section>
+          <aside className="rail" aria-label="Controls">
+            {keys}
+          </aside>
+        </div>
 
         <div className="foot">
           <p className="footer-line">{demo ? "Demo call. Nothing is connected." : footer}</p>
-          {skin === "te" && cfg.colorwayPicker && (
-            <div className="colorways" role="radiogroup" aria-label="Colorway">
-              {COLORWAYS.map((c) => {
-                const checked = colorway === c
-                return (
-                  <button
-                    key={c}
-                    type="button"
-                    role="radio"
-                    aria-checked={checked}
-                    aria-label={c}
-                    title={c}
-                    tabIndex={checked || (colorway === "auto" && c === COLORWAYS[0]) ? 0 : -1}
-                    className={`swatch ${c}${checked ? " on" : ""}`}
-                    onClick={() => setColorway(c)}
-                    onKeyDown={(e) => onColorwayKey(e, checked ? c : COLORWAYS[0])}
-                  />
-                )
-              })}
-            </div>
-          )}
         </div>
       </main>
       <audio ref={call.audioRef} autoPlay playsInline className="sr-only" />

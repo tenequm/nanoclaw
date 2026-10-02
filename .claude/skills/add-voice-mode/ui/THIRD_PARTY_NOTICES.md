@@ -1,6 +1,6 @@
 # Third-party notices
 
-`src/components/ui/{avatar,bar-visualizer,button,conversation,matrix,message,shimmering-text}.tsx`
+`src/components/ui/{avatar,button,conversation,matrix,message,shimmering-text}.tsx`
 are copied from the ElevenLabs UI registry (https://github.com/elevenlabs/ui) and carry local
 edits (import paths, per-instance SVG ids in matrix.tsx). They are MIT licensed:
 

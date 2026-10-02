@@ -41,7 +41,7 @@ import { AccessToken, AgentDispatchClient, RoomServiceClient, TrackSource } from
 
 import type { ChannelAdapter, InboundEvent } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
-import { callPageHtml, type VoiceUiConfig } from './voice-mode-page.js';
+import { callPageHtml } from './voice-mode-page.js';
 import { sameCallerAndAgent, type ResolveLineOptions, type VoiceLine } from './voice-mode-line.js';
 import { stopThinking } from './voice-mode-route.js';
 import {
@@ -241,8 +241,6 @@ export interface LiveKitHost {
   now(): number;
   maxCallDurationMs: number;
   accessCheckIntervalMs: number;
-  /** Look of the call page (VOICE_MODE_UI). */
-  ui?: VoiceUiConfig;
 }
 
 interface LiveKitCall {
@@ -1092,7 +1090,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       if (route.startsWith('livekit/agent/')) return handleAgent(req, res, route, url);
       if (route === 'livekit') {
         if (req.method !== 'GET') return reply(res, 405, 'GET only');
-        page ??= callPageHtml(host.ui);
+        page ??= callPageHtml();
         res.writeHead(200, pageHeaders());
         res.end(page);
         return;

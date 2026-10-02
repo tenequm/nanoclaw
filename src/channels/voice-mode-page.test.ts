@@ -15,28 +15,10 @@ describe('voice call page (generated)', () => {
     expect(html).not.toMatch(/https?:\/\/fonts\.googleapis\.com/);
   });
 
-  it('injects the host config where the placeholder sat, defaulting to an empty object', () => {
-    expect(callPageHtml()).toContain('<script>window.__VOICE_UI__={}</script>');
+  it('is the same page for every caller: no runtime config is injected', () => {
+    expect(callPageHtml()).not.toContain('__VOICE_UI__');
     expect(callPageHtml()).not.toContain('<!--VOICE_UI_CONFIG-->');
-    const html = callPageHtml({ skin: 'te', colorway: 'rabbit', presence: 'bars', brand: 'Casa line' });
-    expect(html).toContain('"colorway":"rabbit"');
-    expect(html).toContain('"brand":"Casa line"');
-  });
-
-  it('cannot be broken out of the inline script by the config text', () => {
-    const html = callPageHtml({ brand: '</script><img src=x onerror=alert(1)>' });
-    expect(html).not.toContain('</script><img');
-    expect(html).toContain('\\u003c/script>');
-  });
-
-  it('keeps replacement patterns in the config literal', () => {
-    const plain = callPageHtml();
-    for (const brand of ["$'", '$&', '$$', '$`']) {
-      const html = callPageHtml({ brand });
-      expect(html.length).toBeLessThan(plain.length + 200);
-      expect(html).toContain(JSON.stringify(brand));
-      expect(html).not.toContain('<!--VOICE_UI_CONFIG-->');
-    }
+    expect(callPageHtml()).toBe(callPageHtml());
   });
 
   it('keeps the hangup keepalive so a closing tab still reaches the host', () => {
