@@ -25,6 +25,7 @@ import { heartbeatPath } from '../../session-manager.js';
 import {
   notePresence,
   pauseTypingRefreshAfterDelivery,
+  registerTypingObserver,
   setTypingAdapter,
   startTypingRefresh,
   stopTypingRefresh,
@@ -674,5 +675,20 @@ describe('failure reporting', () => {
       'activity signal failed',
       expect.objectContaining({ op: 'addReaction', messageId: 'msg-1', err: 'Error: message_not_found' }),
     );
+  });
+});
+
+describe('typing observers', () => {
+  it('see every tick with its chat address, and a throwing one never stops the adapter call', async () => {
+    const calls = captureAdapter();
+    const seen: Array<[string, string, string | null]> = [];
+    registerTypingObserver(() => {
+      throw new Error('observer down');
+    });
+    registerTypingObserver((channelType, platformId, threadId) => seen.push([channelType, platformId, threadId]));
+    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'telegram:100', null, 'telegram');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual([['telegram', 'telegram:100', null]]);
+    expect(calls).toHaveLength(1);
   });
 });

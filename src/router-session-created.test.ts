@@ -235,3 +235,50 @@ describe('registerSessionCreatedHook', () => {
     expect(vi.mocked(wakeContainer)).toHaveBeenCalled();
   });
 });
+
+describe('an event addressed to one agent group', () => {
+  it('reaches only that agent of a chat wired to several', async () => {
+    await activate();
+    await seedWiring({});
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Other',
+      folder: 'other-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await createMessagingGroupAgent({
+      id: 'mga-2',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-2',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'per-thread',
+      priority: 0,
+      threads: 1,
+      created_at: now(),
+    });
+    const events: SessionCreatedEvent[] = [];
+    registerSessionCreatedHook((event) => {
+      events.push(event);
+    });
+    await routeInbound({
+      channelType: 'testchat',
+      platformId: 'testchat:C1',
+      threadId: null,
+      agentGroupId: 'ag-2',
+      message: {
+        id: 'v1',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text: 'spoken' }),
+        timestamp: now(),
+        isMention: true,
+        isGroup: false,
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events.map((e) => e.session.agent_group_id)).toEqual(['ag-2']);
+  });
+});

@@ -8,12 +8,17 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ChannelAdapter, InboundMessage, OutboundMessage } from './adapter.js';
-import { createGptLiveAdapter, lineIdForToken, type GptLiveConfig } from './voice.js';
+import type { ChannelAdapter, InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
+import { createGptLiveAdapter, lineIdForToken, type GptLiveConfig, type VoiceChannelAdapter } from './voice.js';
 import {
   liveKitCallPageHtml,
+  liveKitChatDelivered,
+  liveKitChatTyping,
   pickMirrorTarget,
+  spokenText,
+  type BoundCallChat,
   walkieMessageText,
+  WALKIE_CHAT_REPLY_NOTE,
   WALKIE_REPLY_NOTE,
   type LiveKitServerApi,
   type LiveKitVoiceConfig,
@@ -95,19 +100,26 @@ function startFakeGoogle(): Promise<{ apiBase: string; close(): Promise<void> }>
   });
 }
 
-/** The agent's chats and what was posted into them. */
-function fakeMirror(groups: Array<Partial<MessagingGroup>>) {
-  const posts: Array<{ instance: string; platformId: string; text: string }> = [];
+/** The agent's chats, the /voice binding, who may use the agent, and what was posted into the chats. */
+function fakeMirror(
+  groups: Array<Partial<MessagingGroup>>,
+  options: { bound?: Omit<BoundCallChat, 'group'> & { group: Partial<MessagingGroup> }; members?: string[] } = {},
+) {
+  const posts: Array<{ instance: string; platformId: string; threadId?: string | null; text: string }> = [];
+  const state = { bound: options.bound, members: new Set(options.members ?? []) };
   const api: MirrorApi = {
     groupsFor: async () => groups.map((g, i) => mg({ id: `mg-${i}`, ...g })),
     adapter: (instance) => ({
-      deliver: async (platformId: string, _thread: string | null, message: OutboundMessage) => {
-        posts.push({ instance, platformId, text: (message.content as { text: string }).text });
+      deliver: async (platformId: string, threadId: string | null, message: OutboundMessage) => {
+        const text = (message.content as { text: string }).text;
+        posts.push(threadId ? { instance, platformId, threadId, text } : { instance, platformId, text });
         return 'tg-1';
       },
     }),
+    boundChat: async () => (state.bound ? { ...state.bound, group: mg(state.bound.group) } : null),
+    canAccess: async (userId) => state.members.has(userId),
   };
-  return { api, posts };
+  return { api, posts, state };
 }
 
 function mg(overrides: Partial<MessagingGroup>): MessagingGroup {
@@ -126,6 +138,8 @@ function mg(overrides: Partial<MessagingGroup>): MessagingGroup {
 
 interface Harness {
   adapter: ChannelAdapter;
+  /** Turns routed into a call chat. */
+  events: InboundEvent[];
   /** Where the worker reaches the host, from its own settings. */
   hostUrl: string;
   base: string;
@@ -144,6 +158,7 @@ async function startHarness(
   const port = await freePort();
   process.env.WEBHOOK_PORT = String(port);
   const inbound: InboundMessage[] = [];
+  const events: InboundEvent[] = [];
   const clock = { now: Date.UTC(2026, 9, 2, 1, 0, 0) };
   const access = { enabled: true };
   const lk = fakeLiveKit();
@@ -171,6 +186,7 @@ async function startHarness(
           apiKey: API_KEY,
           apiSecret: API_SECRET,
           api: lk,
+          mirrorApi: fakeMirror([]).api,
           ...lkOverrides,
         }
       : undefined,
@@ -180,12 +196,15 @@ async function startHarness(
     onInbound: (_platformId, _threadId, message) => {
       inbound.push(message);
     },
-    onInboundEvent: () => {},
+    onInboundEvent: (event) => {
+      events.push(event);
+    },
     onMetadata: () => {},
     onAction: () => {},
   });
   return {
     adapter,
+    events,
     hostUrl: `http://127.0.0.1:${port}`,
     base: `http://127.0.0.1:${port}/webhook/voice`,
     inbound,
@@ -303,6 +322,10 @@ describe('livekit voice path without LiveKit settings', () => {
     await h.stop();
   });
 
+  it('has no walkie-talkie link to hand out', () => {
+    expect((h.adapter as VoiceChannelAdapter).walkieLink(LINE)).toBeNull();
+  });
+
   it('answers 503 on every livekit route and leaves the other engines alone', async () => {
     expect((await fetch(`${h.base}/livekit?t=tok123`)).status).toBe(503);
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(503);
@@ -325,6 +348,12 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   afterEach(async () => {
     await h.stop();
     await google.close();
+  });
+
+  it('renders the walkie-talkie link of a line it holds the token for, and no other', () => {
+    const adapter = h.adapter as VoiceChannelAdapter;
+    expect(adapter.walkieLink(LINE)).toBe(`${h.hostUrl}/webhook/voice/livekit?t=tok123`);
+    expect(adapter.walkieLink(lineIdForToken('other'))).toBeNull();
   });
 
   it('serves the call page and the same-origin client bundle', async () => {
@@ -715,66 +744,138 @@ describe('mirror target', () => {
   });
 });
 
-describe('livekit voice path mirrored into the agent chat', () => {
+describe('livekit call talking in the agent chat', () => {
   let h: Harness;
   afterEach(async () => {
     await h.stop();
   });
 
-  const start = async (groups: Array<Partial<MessagingGroup>>, mirror = 'telegram') => {
-    const fake = fakeMirror(groups);
+  const start = async (groups: Array<Partial<MessagingGroup>>, mirror = 'telegram', options = {}) => {
+    const fake = fakeMirror(groups, options);
     h = await startHarness({ accessCheckIntervalMs: 60_000 }, true, { mirror, mirrorApi: fake.api });
     return fake;
   };
 
-  it('posts the transcript and the reply once each, in order, to the one Telegram chat', async () => {
+  /** What the delivery poll reports once the agent's message reached a chat. */
+  const delivered = (platformId: string, text: string, threadId: string | null = null, agentGroupId = 'ag-andy') =>
+    liveKitChatDelivered(
+      {
+        id: `out-${text.length}`,
+        kind: 'chat',
+        content: JSON.stringify({ text }),
+        channelType: 'telegram',
+        platformId,
+        threadId,
+      },
+      agentGroupId,
+    );
+
+  it('routes each turn into the one Telegram chat as the line owner, posts the transcript and speaks the chat replies', async () => {
     const { posts } = await start([{ platform_id: 'telegram:100' }, { channel_type: 'voice', platform_id: LINE }]);
     const { worker } = await startCall(h);
-    await worker.utter('Book a table for two');
-    await h.adapter.deliver(LINE, null, {
-      kind: 'chat',
-      content: { text: 'Booked for **eight**.' },
-      inReplyTo: h.inbound[0].id,
+    const id = await worker.utter('Book a table for two');
+    expect(h.inbound).toEqual([]);
+    expect(h.events).toHaveLength(1);
+    const event = h.events[0];
+    expect(event).toMatchObject({
+      channelType: 'telegram',
+      instance: 'telegram',
+      platformId: 'telegram:100',
+      threadId: null,
+      agentGroupId: 'ag-andy',
+      message: { id: `livekit:${worker.meta.callId}:${id}`, kind: 'chat', isMention: true, isGroup: false },
     });
-    await vi.waitFor(() => expect(posts).toHaveLength(2));
-    await settle();
-    expect(posts).toEqual([
-      { instance: 'telegram', platformId: 'telegram:100', text: '🎙 Book a table for two' },
-      { instance: 'telegram', platformId: 'telegram:100', text: 'Booked for **eight**.' },
-    ]);
-    worker.close();
-  });
+    expect(JSON.parse(event.message.content)).toEqual({
+      text: walkieMessageText('Book a table for two', WALKIE_CHAT_REPLY_NOTE),
+      sender: 'Ethan',
+      senderId: LINE,
+      livekit: { callId: worker.meta.callId, utteranceId: id },
+    });
+    await vi.waitFor(() =>
+      expect(posts).toEqual([
+        { instance: 'telegram', platformId: 'telegram:100', text: '🎙 Ethan: Book a table for two' },
+      ]),
+    );
 
-  it('mirrors nothing for a reply whose delivery failed, so the retry posts it once', async () => {
-    const { posts } = await start([{}]);
-    const { worker } = await startCall(h);
-    await worker.utter('hello');
-    await vi.waitFor(() => expect(posts).toHaveLength(1));
-    h.access.enabled = false;
-    await expect(
-      h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Hi.' }, inReplyTo: h.inbound[0].id }),
-    ).rejects.toThrow(/revoked/);
+    // The agent answers in the chat; the host speaks what reached it, and only there.
+    delivered('telegram:100', 'Booked for **eight**.');
+    delivered('telegram:200', 'Another chat.');
+    delivered('telegram:100', 'Another agent.', null, 'ag-other');
+    liveKitChatTyping({ channelType: 'telegram', platformId: 'telegram:100', threadId: null });
+    await worker.waitFor((e) => e.type === 'thinking');
+    await worker.waitFor((e) => e.type === 'reply');
+    expect(worker.events.filter((e) => e.type === 'reply')).toEqual([{ type: 'reply', text: 'Booked for **eight**.' }]);
+    // Nothing of the reply is posted by the voice host: the agent's own message is the chat's copy.
     await settle();
     expect(posts).toHaveLength(1);
     worker.close();
   });
 
-  it('still mirrors a reply that arrives after the call ended', async () => {
-    const { posts } = await start([{}]);
-    const { call, worker } = await startCall(h);
-    await worker.utter('Remind me later');
-    await post(`${h.base}/livekit/end?t=tok123`, { callId: call.callId });
-    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Done.' }, inReplyTo: h.inbound[0].id });
-    await vi.waitFor(() => expect(posts.map((p) => p.text)).toEqual(['🎙 Remind me later', 'Done.']));
-    expect(worker.events.some((e) => e.type === 'reply')).toBe(false);
+  it('talks in the chat /voice was run in, as whoever ran it, ahead of the default rule', async () => {
+    const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
+    const { posts } = await start([{ platform_id: 'telegram:100' }, topic], 'telegram', {
+      bound: { group: topic, threadId: 'th-1', senderId: 'telegram:42', senderName: 'Dana' },
+      members: ['telegram:42'],
+    });
+    const { worker } = await startCall(h);
+    await worker.utter('hello');
+    expect(h.events[0]).toMatchObject({ platformId: 'telegram:-300:7', threadId: 'th-1', message: { isGroup: true } });
+    expect(JSON.parse(h.events[0].message.content)).toMatchObject({ sender: 'Dana', senderId: 'telegram:42' });
+    await vi.waitFor(() =>
+      expect(posts).toEqual([
+        { instance: 'telegram', platformId: 'telegram:-300:7', threadId: 'th-1', text: '🎙 Dana: hello' },
+      ]),
+    );
+    delivered('telegram:-300:7', 'In the thread.', 'th-1');
+    delivered('telegram:-300:7', 'Other thread.', 'th-2');
+    await worker.waitFor((e) => e.type === 'reply');
+    await settle();
+    expect(worker.events.filter((e) => e.type === 'reply')).toEqual([{ type: 'reply', text: 'In the thread.' }]);
+    worker.close();
   });
 
-  it('skips mirroring when no chat or more than one could be meant', async () => {
+  it('speaks agent messages to the call chat from the join, before the first turn', async () => {
+    await start([{ platform_id: 'telegram:100' }]);
+    const { worker } = await startCall(h);
+    await settle();
+    delivered('telegram:100', 'Your taxi is here.');
+    await worker.waitFor((e) => e.type === 'reply' && e.text === 'Your taxi is here.');
+    worker.close();
+  });
+
+  it('ignores a /voice chat that is no longer the agent, or whose sender lost access', async () => {
+    const gone = { id: 'mg-gone', platform_id: 'telegram:-9' };
+    const fake = await start([{ platform_id: 'telegram:100' }], 'telegram', {
+      bound: { group: gone, threadId: null, senderId: 'telegram:42', senderName: 'Dana' },
+      members: ['telegram:42'],
+    });
+    const { worker } = await startCall(h);
+    await worker.utter('one');
+    expect(h.events[0].platformId).toBe('telegram:100');
+    fake.state.bound = {
+      group: { id: 'mg-0', platform_id: 'telegram:100' },
+      threadId: null,
+      senderId: 'telegram:42',
+      senderName: 'Dana',
+    };
+    fake.state.members.clear();
+    await worker.utter('two');
+    expect(JSON.parse(h.events[1].message.content)).toMatchObject({ sender: 'Ethan', senderId: LINE });
+    fake.state.members.add('telegram:42');
+    await worker.utter('three');
+    expect(JSON.parse(h.events[2].message.content)).toMatchObject({ sender: 'Dana', senderId: 'telegram:42' });
+    worker.close();
+  });
+
+  it('keeps the call on the voice line when no single chat could be meant', async () => {
     for (const groups of [[], [{ platform_id: 'telegram:1' }, { id: 'x', platform_id: 'telegram:2' }]]) {
       const { posts } = await start(groups);
       const { worker } = await startCall(h);
       await worker.utter('hello');
+      expect(h.events).toEqual([]);
+      expect(h.inbound).toHaveLength(1);
       await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Hi.' }, inReplyTo: h.inbound[0].id });
+      await worker.waitFor((e) => e.type === 'reply' && e.text === 'Hi.');
       await settle();
       expect(posts).toEqual([]);
       worker.close();
@@ -783,14 +884,33 @@ describe('livekit voice path mirrored into the agent chat', () => {
     h = await startHarness({}, false);
   });
 
-  it('is off with WALKIE_MIRROR=off', async () => {
+  it('keeps the call on the voice line with WALKIE_MIRROR=off and no /voice chat', async () => {
     const { posts } = await start([{}], 'off');
     const { worker } = await startCall(h);
     await worker.utter('hello');
-    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Hi.' }, inReplyTo: h.inbound[0].id });
+    expect(h.events).toEqual([]);
+    expect(h.inbound).toHaveLength(1);
     await settle();
     expect(posts).toEqual([]);
     worker.close();
+  });
+});
+
+describe('spoken text of a delivered message', () => {
+  const msg = (content: unknown, extra: Partial<{ id: string; kind: string }> = {}) => ({
+    id: 'm1',
+    kind: 'chat',
+    content: JSON.stringify(content),
+    ...extra,
+  });
+  it('is the text of a plain chat message, and nothing for edits, reactions, cards or host command replies', () => {
+    expect(spokenText(msg({ text: ' Hi. ' }))).toBe('Hi.');
+    expect(spokenText(msg({ text: 'x', operation: 'edit', messageId: 'a' }))).toBeNull();
+    expect(spokenText(msg({ operation: 'reaction', messageId: 'a', emoji: 'ok' }))).toBeNull();
+    expect(spokenText(msg({ type: 'ask_question', text: 'pick' }))).toBeNull();
+    expect(spokenText(msg({ text: 'status' }, { id: 'hcmd-reply-1' }))).toBeNull();
+    expect(spokenText(msg({ text: 'x' }, { kind: 'system' }))).toBeNull();
+    expect(spokenText({ id: 'm', kind: 'chat', content: 'not json' })).toBeNull();
   });
 });
 
@@ -822,5 +942,10 @@ describe('walkie message text', () => {
   it('marks the transcript as spoken and says how to answer', () => {
     expect(walkieMessageText('Привіт')).toBe(`<voice source="livekit">Привіт</voice>\n${WALKIE_REPLY_NOTE}`);
     expect(WALKIE_REPLY_NOTE).toContain('separate written message');
+  });
+
+  it('warns a call in a chat that everything sent there is spoken', () => {
+    expect(WALKIE_CHAT_REPLY_NOTE).toContain('every message you send to this chat is read aloud');
+    expect(WALKIE_CHAT_REPLY_NOTE).not.toContain('separate written message');
   });
 });

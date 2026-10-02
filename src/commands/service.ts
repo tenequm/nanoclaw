@@ -28,6 +28,8 @@
  */
 import fs from 'fs';
 
+import { getChannelAdapterExact } from '../channels/channel-registry.js';
+import type { VoiceChannelAdapter } from '../channels/voice.js';
 import { restartAgentGroupContainers } from '../container-restart.js';
 import { isContainerRunning, killContainer } from '../container-runner.js';
 import { getAgentGroup } from '../db/agent-groups.js';
@@ -35,8 +37,10 @@ import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars
 import {
   getMessagingGroupAgentByPair,
   getMessagingGroupAgents,
+  getMessagingGroupsByAgentGroup,
   updateMessagingGroupAgent,
 } from '../db/messaging-groups.js';
+import { setVoiceCallTarget } from '../db/voice-call-targets.js';
 import {
   findSessionByAgentGroup,
   findSessionForAgent,
@@ -47,7 +51,8 @@ import { log } from '../log.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { countDueMessages, openInboundDb } from '../mailbox/sqlite/session-db.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
-import type { ContainerConfigRow, EngageMode, Session } from '../types.js';
+import type { ContainerConfigRow, EngageMode, MessagingGroup, Session } from '../types.js';
+import { voiceAccess } from './auth.js';
 import { readTranscriptStats } from './transcript.js';
 import {
   describeModel,
@@ -74,6 +79,8 @@ import {
   type StatusView,
   type TargetAgent,
   type TargetResolution,
+  type VoiceCommandOutcome,
+  type VoiceTargetView,
 } from './types.js';
 
 /** Default cli_scope when no container_configs row exists yet. */
@@ -550,4 +557,100 @@ export async function restartAgent(agentGroupId: string, actorUserId: string): P
   log.info('Agent restarted via chat command', { agentGroupId, actorUserId, restarted });
 
   return { ok: true, view: { agentName: ag.name, agentGroupId, restarted } };
+}
+
+// --- /voice ---
+
+/** A voice line's walkie-talkie link; null when LiveKit is off or the line has no link here. */
+export type VoiceLinkFn = (line: MessagingGroup) => string | null;
+
+/** Asks the live voice adapter, the only holder of the link tokens. */
+const liveVoiceLink: VoiceLinkFn = (line) => {
+  const adapter = getChannelAdapterExact(line.instance ?? line.channel_type) as
+    | Partial<VoiceChannelAdapter>
+    | undefined;
+  return adapter?.walkieLink?.(line.platform_id) ?? null;
+};
+
+/** The agent's voice lines: its `voice` messaging groups. */
+async function voiceLinesOf(agentGroupId: string): Promise<MessagingGroup[]> {
+  const lines = (await getMessagingGroupsByAgentGroup(agentGroupId)).filter(
+    (g) => g.channel_type === 'voice' && !g.denied_at,
+  );
+  return [...new Map(lines.map((g) => [g.id, g])).values()];
+}
+
+export async function hasVoiceLine(agentGroupId: string): Promise<boolean> {
+  return (await voiceLinesOf(agentGroupId)).length > 0;
+}
+
+/**
+ * Make this chat the call chat of the agent's voice line(s) and return their
+ * walkie-talkie links. Admin only. The call chat is where the line's LiveKit
+ * calls talk (src/channels/voice-livekit.ts), as `actorUserId`, until /voice is
+ * run in another chat. The links are secrets: callers send them to this chat
+ * only and never log them.
+ */
+export async function setVoiceTarget(
+  agentGroupId: string,
+  chat: StatusChatContext,
+  actorUserId: string,
+  linkFor: VoiceLinkFn = liveVoiceLink,
+): Promise<CommandResult<VoiceTargetView>> {
+  const ag = await getAgentGroup(agentGroupId);
+  if (!ag) return fail('unknown-agent');
+  if (!(await hasAdminPrivilege(actorUserId, agentGroupId))) return fail('unauthorized');
+  if (!(await getMessagingGroupAgentByPair(chat.messagingGroupId, agentGroupId))) return fail('unknown-agent');
+
+  const lines = await voiceLinesOf(agentGroupId);
+  if (lines.length === 0) return fail('no-voice-line');
+  const linked = lines.flatMap((line) => {
+    const link = linkFor(line);
+    return link ? [{ line, link }] : [];
+  });
+  if (linked.length === 0) return fail('voice-unavailable');
+
+  for (const { line } of linked) {
+    await setVoiceCallTarget({
+      line_messaging_group_id: line.id,
+      target_messaging_group_id: chat.messagingGroupId,
+      thread_id: chat.threadId,
+      sender_user_id: actorUserId,
+    });
+  }
+  log.info('Voice call chat set via chat command', {
+    agentGroupId,
+    lines: linked.map(({ line }) => line.platform_id),
+    messagingGroupId: chat.messagingGroupId,
+    threadId: chat.threadId,
+    actorUserId,
+  });
+  return { ok: true, view: { agentName: ag.name, agentGroupId, links: linked.map(({ link }) => link) } };
+}
+
+/**
+ * /voice over a chat's wired agents, gated like /status but admin-only:
+ * unknown senders are dropped silently, known non-admins refused, and every
+ * agent the actor administers gets this chat as its call chat.
+ */
+export async function runVoiceCommand(
+  targets: TargetResolution,
+  chat: StatusChatContext,
+  actorUserId: string | null,
+  linkFor: VoiceLinkFn = liveVoiceLink,
+): Promise<VoiceCommandOutcome> {
+  if (targets.kind === 'none') return { kind: 'drop' };
+  const agents = targets.kind === 'single' ? [targets.agent] : targets.agents;
+  const decided = await Promise.all(
+    agents.map(async (a) => [a, await voiceAccess(actorUserId, a.agentGroupId)] as const),
+  );
+  const allowed = decided.filter(([, d]) => d === 'allowed').map(([a]) => a);
+  if (allowed.length === 0 || !actorUserId) {
+    return decided.some(([, d]) => d === 'refuse') ? { kind: 'refused' } : { kind: 'drop' };
+  }
+  const results = [];
+  for (const a of allowed) {
+    results.push({ agentName: a.agentName, result: await setVoiceTarget(a.agentGroupId, chat, actorUserId, linkFor) });
+  }
+  return { kind: 'done', results };
 }

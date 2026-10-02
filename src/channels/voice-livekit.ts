@@ -21,13 +21,19 @@
  *    agent still working, and when to end, with pings;
  *  - `POST agent/joined`     the caller is in the room; the clock starts here;
  *  - `POST agent/utterance`  one transcribed caller turn, fed to the agent as
- *    an inbound message whose id (`livekit:<callId>:<n>`) routes the reply back;
+ *    an inbound message with the id `livekit:<callId>:<n>`;
  *  - `POST agent/ended`      the worker's session is over.
  *
- * Each exchange is also mirrored into the agent's Telegram chat (WALKIE_MIRROR):
- * the transcript when the agent gets it, the reply once it is handed to the
- * worker. Voice replies never reach Telegram on their own (delivery follows the
- * inbound's channel), so nothing is posted twice.
+ * A call talks in one of the agent's chats (its *call chat*), not on the voice
+ * line: the chat `/voice` was last run in (voice_call_targets), else the one
+ * chat of the WALKIE_MIRROR channel type wired to the agent (pickMirrorTarget).
+ * Each turn is routed into that chat's session through the normal inbound path
+ * as a message from the person who owns the line, the transcript is posted into
+ * the chat, and the agent answers there as it always does. While the call is
+ * live, every message the agent delivers to that chat is also spoken, and its
+ * typing there is the worker's `thinking`. With no call chat (WALKIE_MIRROR off,
+ * or no single chat to pick) the call talks on the voice line itself, and the
+ * agent's replies come back through deliver() by their `livekit:` reply id.
  */
 import { createRequire } from 'node:module';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -36,7 +42,7 @@ import type http from 'node:http';
 
 import { AccessToken, AgentDispatchClient, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
 
-import type { ChannelAdapter, InboundMessage } from './adapter.js';
+import type { ChannelAdapter, InboundEvent, InboundMessage } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
 import type { ResolveLineOptions, VoiceLine } from './gpt-live-prompt.js';
 import {
@@ -50,8 +56,17 @@ import {
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
 } from './voice-livekit-protocol.js';
-import { getMessagingGroupsByAgentGroup } from '../db/messaging-groups.js';
+import {
+  getMessagingGroup,
+  getMessagingGroupByPlatform,
+  getMessagingGroupsByAgentGroup,
+} from '../db/messaging-groups.js';
+import { getVoiceCallTarget } from '../db/voice-call-targets.js';
+import { registerPostDeliveryHook } from '../delivery.js';
 import { log } from '../log.js';
+import { canAccessAgentGroup } from '../modules/permissions/access.js';
+import { getUser } from '../modules/permissions/db/users.js';
+import { registerTypingObserver } from '../modules/typing/index.js';
 import type { MessagingGroup } from '../types.js';
 
 const MINUTE_MS = 60_000;
@@ -70,9 +85,15 @@ export const WALKIE_REPLY_NOTE =
   'sentences: no markdown, no links, no code blocks, numbers written as words. Send longer material ' +
   'as a separate written message to your chat.';
 
+/** The same for a call that talks in a chat, where every message the agent sends there is spoken. */
+export const WALKIE_CHAT_REPLY_NOTE =
+  'Spoken on a live voice call; while it lasts, every message you send to this chat is read aloud word for ' +
+  'word. Answer in a few short spoken sentences: no markdown, no links, no code blocks, numbers written as ' +
+  'words. Offer longer material for after the call instead of sending it now.';
+
 /** The inbound text for one transcribed caller turn. */
-export function walkieMessageText(transcript: string): string {
-  return `<voice source="livekit">${transcript}</voice>\n${WALKIE_REPLY_NOTE}`;
+export function walkieMessageText(transcript: string, note: string = WALKIE_REPLY_NOTE): string {
+  return `<voice source="livekit">${transcript}</voice>\n${note}`;
 }
 
 /** Inbound ids for caller turns are `livekit:<call>:<n>`; voice.ts parses replies with parseScopedId. */
@@ -94,10 +115,38 @@ export interface LiveKitServerApi {
   createDispatch(room: string, agentName: string, options: { metadata: string }): Promise<unknown>;
 }
 
-/** Where a call's exchange is mirrored; the central DB and live adapters by default, fakes in tests. */
+/** The `/voice` binding of a line, as stored; checked against the line before use. */
+export interface BoundCallChat {
+  group: MessagingGroup;
+  threadId: string | null;
+  senderId: string;
+  /** The sender's display name, when the users row has one. */
+  senderName: string | null;
+}
+
+/** The agent's chats a call can talk in; the central DB and live adapters by default, fakes in tests. */
 export interface MirrorApi {
   groupsFor(agentGroupId: string): Promise<MessagingGroup[]>;
   adapter(key: string): Pick<ChannelAdapter, 'deliver'> | undefined;
+  /** The chat `/voice` last pointed the line at, if any. */
+  boundChat(lineId: string): Promise<BoundCallChat | null>;
+  canAccess(userId: string, agentGroupId: string): Promise<boolean>;
+}
+
+/** A chat address as delivery and typing see it. */
+export interface ChatAddress {
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+}
+
+/** The chat a call talks in, and who the caller is there. */
+export interface CallChat {
+  group: MessagingGroup;
+  threadId: string | null;
+  sender: { id: string; name: string };
+  /** Set by `/voice`, or picked by the WALKIE_MIRROR rule. */
+  source: 'voice-command' | 'default';
 }
 
 export interface WalkieSettings {
@@ -118,7 +167,7 @@ export interface LiveKitVoiceConfig {
   agentName?: string;
   /** Transcription and speech settings the worker gets in the job metadata (WALKIE_*). */
   walkie?: WalkieSettings;
-  /** Channel type the exchange is mirrored into (WALKIE_MIRROR); off when unset. */
+  /** Channel type of the default call chat (WALKIE_MIRROR) when `/voice` has not set one; off when unset. */
   mirror?: string;
   /** Test seam; defaults to the central DB and the live channel adapters. */
   mirrorApi?: MirrorApi;
@@ -141,6 +190,8 @@ export interface LiveKitHost {
   /** Newest wins across engines: end any other engine's call on the line. */
   endOtherCalls(platformId: string, reason: string): void;
   onInbound(platformId: string, message: InboundMessage): Promise<void>;
+  /** Route a turn into the call chat, through the same inbound path the chat's own messages take. */
+  onInboundEvent(event: InboundEvent): Promise<void>;
   isRunning(): boolean;
   now(): number;
   maxCallDurationMs: number;
@@ -169,6 +220,8 @@ interface LiveKitCall {
   utteranceStarts: number[];
   utterances: number;
   sent: number;
+  /** Where the call talks; null while it talks on the voice line. Refreshed on join and every turn. */
+  chat: CallChat | null;
   cleanup?: Promise<void>;
 }
 
@@ -194,6 +247,10 @@ export interface LiveKitVoice {
     text: string,
   ): Promise<{ id: string | undefined } | null>;
   setTyping(platformId: string): Promise<void>;
+  /** An agent message reached a chat: speak it on the live call that talks there. */
+  chatMessage(chat: ChatAddress, agentGroupId: string, text: string): void;
+  /** The agent is working in a chat: tell the live call that talks there. */
+  chatTyping(chat: ChatAddress): void;
   /** The running call on a line, for the shared daily budget. */
   activeCall(platformId: string): { platformId: string; startedAt: number } | undefined;
   endLine(platformId: string, reason: string): void;
@@ -223,7 +280,70 @@ export function pickMirrorTarget(
 const defaultMirrorApi: MirrorApi = {
   groupsFor: (agentGroupId) => getMessagingGroupsByAgentGroup(agentGroupId),
   adapter: (key) => getChannelAdapterExact(key),
+  async boundChat(lineId) {
+    const line = await getMessagingGroupByPlatform('voice', lineId);
+    const row = line && (await getVoiceCallTarget(line.id));
+    const group = row && (await getMessagingGroup(row.target_messaging_group_id));
+    if (!row || !group) return null;
+    const user = await getUser(row.sender_user_id);
+    return {
+      group,
+      threadId: row.thread_id,
+      senderId: row.sender_user_id,
+      senderName: user?.display_name?.trim() || null,
+    };
+  },
+  canAccess: async (userId, agentGroupId) => (await canAccessAgentGroup(userId, agentGroupId)).allowed,
 };
+
+/** A call talks in `chat`, and `to` is that chat: the same thread, or the chat itself when delivery drops the thread. */
+const isCallChat = (chat: CallChat, to: ChatAddress): boolean =>
+  chat.group.channel_type === to.channelType &&
+  chat.group.platform_id === to.platformId &&
+  (to.threadId === null || to.threadId === chat.threadId);
+
+/** Every running engine, for the delivery and typing taps below. */
+const engines = new Set<LiveKitVoice>();
+
+/** The words of a delivered chat message, or null for edits, reactions, cards and host command replies. */
+export function spokenText(message: { id: string; kind: string; content: string }): string | null {
+  if (message.kind !== 'chat' && message.kind !== 'chat-sdk') return null;
+  if (message.id.startsWith('hcmd-')) return null;
+  try {
+    const content = JSON.parse(message.content) as Record<string, unknown>;
+    if (content.operation || content.type || typeof content.text !== 'string') return null;
+    return content.text.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Delivery tap: an agent message reached a chat; a live call talking there speaks it. */
+export function liveKitChatDelivered(
+  msg: {
+    id: string;
+    kind: string;
+    content: string;
+    channelType: string | null;
+    platformId: string | null;
+    threadId: string | null;
+  },
+  agentGroupId: string,
+): void {
+  if (engines.size === 0 || !msg.channelType || !msg.platformId) return;
+  const text = spokenText(msg);
+  if (!text) return;
+  const chat = { channelType: msg.channelType, platformId: msg.platformId, threadId: msg.threadId ?? null };
+  for (const engine of engines) engine.chatMessage(chat, agentGroupId, text);
+}
+
+/** Typing tap: the agent works in a chat; a live call talking there hears it is thinking. */
+export function liveKitChatTyping(chat: ChatAddress): void {
+  for (const engine of engines) engine.chatTyping(chat);
+}
+
+registerPostDeliveryHook((msg, session) => liveKitChatDelivered(msg, session.agent_group_id));
+registerTypingObserver((channelType, platformId, threadId) => liveKitChatTyping({ channelType, platformId, threadId }));
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
 
@@ -263,10 +383,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const joinTimeoutMs = config.joinTimeoutMs ?? 60_000;
   const calls = new Map<string, LiveKitCall>();
   const cleanups = new Set<Promise<void>>();
-  /** Per line, so a transcript always lands before the reply to it. */
+  /** Per line, so transcripts land in the order they were spoken. */
   const mirrorChains = new Map<string, Promise<void>>();
-  /** The last skip reason logged per agent, so an unmirrorable agent logs once, not every turn. */
-  const mirrorSkips = new Map<string, string>();
+  /** The last call-chat note logged per line and topic, so a line logs when it changes, not every turn. */
+  const chatNotes = new Map<string, string>();
   let clientJs: string | undefined;
   let page: string | undefined;
 
@@ -287,32 +407,95 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (call.queue.length > MAX_QUEUED_EVENTS) call.queue.shift();
   };
 
-  const postMirror = async (agentGroupId: string, text: string): Promise<void> => {
-    if (!mirrorChannel) return;
-    const pick = pickMirrorTarget(await mirrorApi.groupsFor(agentGroupId), mirrorChannel);
-    if ('skip' in pick) {
-      if (mirrorSkips.get(agentGroupId) !== pick.skip) {
-        mirrorSkips.set(agentGroupId, pick.skip);
-        log.info('livekit-voice: not mirroring the call', { agentGroupId, reason: pick.skip });
+  const noteChat = (
+    call: LiveKitCall,
+    topic: 'binding' | 'choice',
+    note: string | null,
+    fields: Record<string, unknown> = {},
+  ): void => {
+    const key = `${call.platformId}|${topic}`;
+    if (note === null) {
+      chatNotes.delete(key);
+      return;
+    }
+    const value = `${note}|${JSON.stringify(fields)}`;
+    if (chatNotes.get(key) === value) return;
+    chatNotes.set(key, value);
+    log.info(`livekit-voice: ${note}`, { platformId: call.platformId, callId: call.callId, ...fields });
+  };
+
+  /** The `/voice` chat if it is still the agent's and its sender may still use the agent, else the WALKIE_MIRROR pick. */
+  const resolveChat = async (call: LiveKitCall): Promise<CallChat | null> => {
+    const { line } = call;
+    const groups = await mirrorApi.groupsFor(line.agentGroupId);
+    const bound = await mirrorApi.boundChat(call.platformId);
+    if (bound) {
+      const g = bound.group;
+      const wired = !g.denied_at && !g.detached_at && groups.some((w) => w.id === g.id);
+      if (!wired) {
+        noteChat(call, 'binding', 'the /voice chat is no longer wired to the agent; using the default', {
+          chat: g.id,
+        });
+      } else if (!(await mirrorApi.canAccess(bound.senderId, line.agentGroupId))) {
+        noteChat(call, 'binding', 'whoever ran /voice can no longer use the agent; using the default', {
+          chat: g.id,
+        });
+      } else {
+        noteChat(call, 'binding', null);
+        return {
+          group: g,
+          threadId: bound.threadId,
+          sender: { id: bound.senderId, name: bound.senderName ?? line.caller.name },
+          source: 'voice-command',
+        };
       }
-      return;
     }
-    mirrorSkips.delete(agentGroupId);
-    const { target } = pick;
-    const adapter = mirrorApi.adapter(target.instance ?? target.channel_type);
+    if (!mirrorChannel) {
+      noteChat(call, 'choice', 'call talks on the voice line: no /voice chat and WALKIE_MIRROR is off');
+      return null;
+    }
+    const pick = pickMirrorTarget(groups, mirrorChannel);
+    if ('skip' in pick) {
+      noteChat(call, 'choice', `call talks on the voice line: no /voice chat and ${pick.skip}`);
+      return null;
+    }
+    // The line's own caller: a known member of the agent by construction (resolveVoiceLine).
+    return { group: pick.target, threadId: null, sender: line.caller, source: 'default' };
+  };
+
+  const refreshChat = async (call: LiveKitCall): Promise<CallChat | null> => {
+    try {
+      call.chat = await resolveChat(call);
+    } catch (err) {
+      log.warn('livekit-voice: could not resolve the call chat; the call talks on the voice line', {
+        platformId: call.platformId,
+        err,
+      });
+      call.chat = null;
+    }
+    if (call.chat) {
+      const { group, threadId, source } = call.chat;
+      noteChat(call, 'choice', 'call talks in the agent chat', { chat: group.id, threadId, source });
+    }
+    return call.chat;
+  };
+
+  const postToChat = async (chat: CallChat, text: string): Promise<void> => {
+    const adapter = mirrorApi.adapter(chat.group.instance ?? chat.group.channel_type);
     if (!adapter) {
-      log.warn('livekit-voice: mirror adapter is offline', { agentGroupId, instance: target.instance });
+      log.warn('livekit-voice: the call chat adapter is offline', { chat: chat.group.id });
       return;
     }
-    await adapter.deliver(target.platform_id, null, { kind: 'chat', content: { text } });
+    await adapter.deliver(chat.group.platform_id, chat.threadId, { kind: 'chat', content: { text } });
   };
 
   /** Best effort and off the caller's path; ordered per line. */
-  const mirror = (platformId: string, agentGroupId: string, text: string): void => {
-    if (!mirrorChannel) return;
+  const mirror = (platformId: string, chat: CallChat, text: string): void => {
     const next = (mirrorChains.get(platformId) ?? Promise.resolve())
-      .then(() => postMirror(agentGroupId, text))
-      .catch((err: unknown) => log.warn('livekit-voice: mirror post failed', { platformId, agentGroupId, err }));
+      .then(() => postToChat(chat, text))
+      .catch((err: unknown) =>
+        log.warn('livekit-voice: transcript post failed', { platformId, chat: chat.group.id, err }),
+      );
     mirrorChains.set(platformId, next);
     void next.then(() => {
       if (mirrorChains.get(platformId) === next) mirrorChains.delete(platformId);
@@ -424,6 +607,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       utteranceStarts: [],
       utterances: 0,
       sent: 0,
+      chat: null,
     };
     calls.set(platformId, call);
     call.joinTimer = setTimeout(() => endCall(call, 'caller never joined'), joinTimeoutMs);
@@ -516,6 +700,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       call.streamTimer.unref();
     }
     log.info('livekit-voice: caller joined', { platformId: call.platformId, callId: call.callId });
+    // Known before the first turn, so the agent's messages to that chat are spoken from the start.
+    void refreshChat(call);
     reply(res, 200, JSON.stringify({ ok: true }), JSON_HEADERS);
   };
 
@@ -536,7 +722,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     });
   };
 
-  /** One transcribed caller turn: the agent gets it as a spoken message, the agent's chat a copy. */
+  /** One transcribed caller turn: the agent gets it as a spoken message in the call chat, which also shows it. */
   const onUtterance = async (
     res: http.ServerResponse,
     call: LiveKitCall,
@@ -557,27 +743,41 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     call.utteranceStarts.push(t);
     if (!(await checkAccess(call))) return reply(res, 403, 'Caller access denied');
+    const chat = await refreshChat(call);
     const utteranceId = String(++call.utterances);
+    const sender = chat?.sender ?? call.line.caller;
     const message: InboundMessage = {
       id: liveKitUtteranceMessageId(call.callId, utteranceId),
       kind: 'chat',
       content: {
-        text: walkieMessageText(text),
-        sender: call.line.caller.name,
-        senderId: call.line.caller.id,
+        text: walkieMessageText(text, chat ? WALKIE_CHAT_REPLY_NOTE : WALKIE_REPLY_NOTE),
+        sender: sender.name,
+        senderId: sender.id,
         livekit: { callId: call.callId, utteranceId },
       },
       timestamp: new Date().toISOString(),
       isMention: true,
-      isGroup: false,
+      isGroup: chat ? chat.group.is_group !== 0 : false,
     };
     try {
-      await host.onInbound(call.platformId, message);
+      if (chat) {
+        await host.onInboundEvent({
+          channelType: chat.group.channel_type,
+          instance: chat.group.instance ?? chat.group.channel_type,
+          platformId: chat.group.platform_id,
+          threadId: chat.threadId,
+          // Only the line's agent hears its call, whoever else is wired to the chat.
+          agentGroupId: call.line.agentGroupId,
+          message: { ...message, content: JSON.stringify(message.content) },
+        });
+      } else {
+        await host.onInbound(call.platformId, message);
+      }
     } catch (err) {
       log.error('livekit-voice: onInbound threw', { platformId: call.platformId, err });
       return reply(res, 500, 'Could not reach the agent');
     }
-    mirror(call.platformId, call.line.agentGroupId, `🎙 ${text}`);
+    if (chat) mirror(call.platformId, chat, `🎙 ${sender.name}: ${text}`);
     reply(res, 202, JSON.stringify({ id: utteranceId }), JSON_HEADERS);
   };
 
@@ -628,7 +828,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     };
   };
 
-  return {
+  const engine: LiveKitVoice = {
     async handleHttp(req, res, route, url, tokens, lineIdForToken) {
       if (route.startsWith('livekit/agent/')) return handleAgent(req, res, route, url);
       if (route === 'livekit') {
@@ -671,27 +871,35 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     async deliver(platformId, target, inReplyTo, text) {
       const call = calls.get(platformId);
       if (target && (!call || call.callId !== target.callId)) {
-        // An answer for a call that is over must not be spoken into a later one; retrying cannot
-        // help. The agent's chat still gets it, so the caller can read what they missed.
-        log.info('livekit-voice: a reply for an ended call goes to the mirror only', { platformId, ...target });
-        if (mirrorChannel && text.trim()) {
-          const line = await host.resolveLine(platformId).catch(() => null);
-          if (line) mirror(platformId, line.agentGroupId, text);
-        }
+        // An answer for a call that is over must not be spoken into a later one; retrying cannot help.
+        log.info('livekit-voice: dropping a reply for an ended call', { platformId, ...target });
         return { id: undefined };
       }
       if (!call || call.state !== 'live') return target ? { id: undefined } : null;
       if (!text.trim()) throw new Error('livekit-voice: reply contains no speakable text');
       if (!(await checkAccess(call))) throw new Error('livekit-voice: caller access has been revoked');
       push(call, { type: 'reply', text });
-      // After the hand-off only: a delivery that threw is retried and would post twice.
-      mirror(platformId, call.line.agentGroupId, text);
       return { id: target ? inReplyTo : `${LIVEKIT_ID_PREFIX}${call.callId}:out-${++call.sent}` };
     },
 
     async setTyping(platformId) {
       const call = calls.get(platformId);
       if (call?.state === 'live' && !call.ended) push(call, { type: 'thinking' });
+    },
+
+    chatMessage(chat, agentGroupId, text) {
+      for (const call of calls.values()) {
+        if (call.state !== 'live' || call.ended || !call.chat || call.line.agentGroupId !== agentGroupId) continue;
+        if (isCallChat(call.chat, chat)) push(call, { type: 'reply', text });
+      }
+    },
+
+    chatTyping(chat) {
+      for (const call of calls.values()) {
+        if (call.state === 'live' && !call.ended && call.chat && isCallChat(call.chat, chat)) {
+          push(call, { type: 'thinking' });
+        }
+      }
     },
 
     activeCall(platformId) {
@@ -707,10 +915,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     },
 
     async teardown() {
+      engines.delete(engine);
       for (const call of [...calls.values()]) endCall(call, 'teardown');
       await Promise.all([...cleanups, ...mirrorChains.values()]);
     },
   };
+  engines.add(engine);
+  return engine;
 }
 
 // String.raw keeps the page script's escapes intact; the script avoids backticks and ${.

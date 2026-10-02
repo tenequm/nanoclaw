@@ -347,7 +347,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   //    we need their actual rows for fan-out).
   const agents = await getMessagingGroupAgents(mg.id);
 
-  // 3b. Host chat-commands (/model, /status, /config, /restart) are owned by
+  // 3b. Host chat-commands (/model, /status, /config, /restart, /voice) are owned by
   //     the host and answered ONCE per message, independent of per-agent
   //     engage rules (a slash command need not @mention the bot to be
   //     honored). On Telegram the native binding intercepts these at the
@@ -403,6 +403,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   let subscribed = false;
 
   for (const agent of agents) {
+    if (event.agentGroupId && agent.agent_group_id !== event.agentGroupId) continue;
     const agentGroup = await getAgentGroup(agent.agent_group_id);
     if (!agentGroup) continue;
 

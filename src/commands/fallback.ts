@@ -1,7 +1,7 @@
 /**
  * Channel-agnostic renderer for the host-command gate action.
  *
- * The router intercepts /model, /status, /config and /restart once per message
+ * The router intercepts /model, /status, /config, /restart and /voice once per message
  * (see command-gate.classifyHostCommand + router.routeInbound) and hands them
  * here. This module turns the HostCommandService view-models into plain-text
  * replies (or, for the /model bare picker, an ask_question card) and writes
@@ -39,6 +39,7 @@
  * checkmark on the active model is intentional).
  */
 import type { InboundEvent } from '../channels/adapter.js';
+import { getChannelAdapterExact } from '../channels/channel-registry.js';
 import { getDb, hasTable } from '../db/connection.js';
 import { deletePendingQuestion, getPendingQuestion, getSession } from '../db/sessions.js';
 import { log } from '../log.js';
@@ -59,11 +60,13 @@ import {
   resolveTargets,
   restartAgent,
   restartConfirmation,
+  runVoiceCommand,
   setActivation,
   setConfigValue,
   setModel,
   statusAccess,
   statusCardLines,
+  voiceCommandReply,
   ACTIVATION_MODES,
   CONFIG_FIELDS,
   EFFORT_LEVELS,
@@ -119,6 +122,9 @@ export async function runHostCommand(ctx: HostCommandContext): Promise<void> {
       return;
     case 'restart':
       await handleRestart(ctx, targets);
+      return;
+    case 'voice':
+      await handleVoice(ctx, targets);
       return;
     default:
       log.warn('Unknown host command', { command: ctx.command });
@@ -468,6 +474,27 @@ async function handleRestart(ctx: HostCommandContext, targets: TargetResolution)
   // The service re-checks admin and returns 'unauthorized' for non-admins.
   const res = await restartAgent(agent.agentGroupId, ctx.userId ?? '');
   await replyOnFirstTarget(ctx, targets, res.ok ? restartConfirmation(res.view, MD_FMT) : failureMessage(res));
+}
+
+// --- /voice (admin-only) ---
+
+async function handleVoice(ctx: HostCommandContext, targets: TargetResolution): Promise<void> {
+  const text = voiceCommandReply(await runVoiceCommand(targets, chatContext(ctx), ctx.userId), MD_FMT);
+  if (text === null) {
+    log.info('/voice from unknown sender or unwired chat dropped', { messagingGroupId: ctx.mg.id, userId: ctx.userId });
+    return;
+  }
+  // Straight to the chat's adapter, not through a session outbound DB: the reply carries the line's
+  // call link, which the agent's session (and its cross-session echoes) must never hold.
+  const addr = deliveryAddr(ctx);
+  const adapter = getChannelAdapterExact(
+    ctx.event.replyTo ? addr.channelType : (ctx.mg.instance ?? ctx.mg.channel_type),
+  );
+  if (!adapter) {
+    log.warn('/voice reply dropped: the chat adapter is offline', { messagingGroupId: ctx.mg.id });
+    return;
+  }
+  await adapter.deliver(addr.platformId, addr.threadId, { kind: 'chat', content: { text } });
 }
 
 // --- Card response handler ('hcmd-' taps) ---

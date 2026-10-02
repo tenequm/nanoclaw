@@ -39,15 +39,21 @@ import { grantRole } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
 import type { MessagingGroupAgent, Session } from '../types.js';
 import { getMessagingGroupAgentByPair } from '../db/messaging-groups.js';
+import { getVoiceCallTarget } from '../db/voice-call-targets.js';
+import { addMember } from '../modules/permissions/db/agent-group-members.js';
+import type { MessagingGroup } from '../types.js';
+import { MD_FMT, voiceCommandReply } from './cards.js';
 import {
   getConfigView,
   getModelPicker,
   getStatus,
   resolveTargets,
   restartAgent,
+  runVoiceCommand,
   setActivation,
   setConfigValue,
   setModel,
+  setVoiceTarget,
 } from './service.js';
 
 const OWNER = 'telegram:1';
@@ -539,5 +545,88 @@ describe('restartAgent', () => {
     expect(id).toBe('ag-1');
     expect(typeof wake).toBe('string');
     expect((wake as string).length).toBeGreaterThan(0);
+  });
+});
+
+// --- /voice ---
+
+describe('/voice', () => {
+  const link = (line: MessagingGroup) => `https://voice.example/webhook/voice/livekit?t=tok-${line.platform_id}`;
+  const chat = (messagingGroupId: string, threadId: string | null = null) => ({ messagingGroupId, threadId });
+
+  async function chatGroup(id: string, platformId: string, channelType = 'telegram') {
+    await createMessagingGroup({
+      id,
+      channel_type: channelType,
+      platform_id: platformId,
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+  }
+
+  beforeEach(async () => {
+    await makeAgentGroup('ag-1', 'Emma');
+    await grantRole({ user_id: OWNER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+    await addMember({ user_id: NON_ADMIN, agent_group_id: 'ag-1', added_by: null, added_at: now() });
+    await chatGroup('mg-dm', 'telegram:1');
+    await chatGroup('mg-topic', 'telegram:-100:5');
+    await chatGroup('mg-line', 'voice:abc', 'voice');
+    await wire('mg-dm', 'ag-1');
+    await wire('mg-topic', 'ag-1');
+    await wire('mg-line', 'ag-1');
+  });
+
+  it('makes the chat the line call chat for the admin who ran it, and the next chat replaces it', async () => {
+    const res = await setVoiceTarget('ag-1', chat('mg-dm'), OWNER, link);
+    if (!res.ok) throw new Error('expected ok');
+    expect(res.view).toEqual({
+      agentName: 'Emma',
+      agentGroupId: 'ag-1',
+      links: ['https://voice.example/webhook/voice/livekit?t=tok-voice:abc'],
+    });
+    expect(await getVoiceCallTarget('mg-line')).toMatchObject({
+      target_messaging_group_id: 'mg-dm',
+      thread_id: null,
+      sender_user_id: OWNER,
+    });
+    await setVoiceTarget('ag-1', chat('mg-topic', 'th-9'), OWNER, link);
+    expect(await getVoiceCallTarget('mg-line')).toMatchObject({
+      target_messaging_group_id: 'mg-topic',
+      thread_id: 'th-9',
+    });
+  });
+
+  it('refuses non-admins, unwired chats, agents without a line, and hosts without LiveKit', async () => {
+    expect(await setVoiceTarget('ag-1', chat('mg-dm'), NON_ADMIN, link)).toMatchObject({ reason: 'unauthorized' });
+    await chatGroup('mg-other', 'telegram:7');
+    expect(await setVoiceTarget('ag-1', chat('mg-other'), OWNER, link)).toMatchObject({ reason: 'unknown-agent' });
+    expect(await setVoiceTarget('ag-1', chat('mg-dm'), OWNER, () => null)).toMatchObject({
+      reason: 'voice-unavailable',
+    });
+    await makeAgentGroup('ag-2', 'Zed');
+    await wire('mg-dm', 'ag-2');
+    expect(await setVoiceTarget('ag-2', chat('mg-dm'), OWNER, link)).toMatchObject({ reason: 'no-voice-line' });
+    expect(await getVoiceCallTarget('mg-line')).toBeUndefined();
+  });
+
+  it('drops unknown senders, refuses members, and links every agent of the chat the admin runs', async () => {
+    const targets = await resolveTargets('mg-dm');
+    expect(await runVoiceCommand(targets, chat('mg-dm'), null, link)).toEqual({ kind: 'drop' });
+    expect(await runVoiceCommand(targets, chat('mg-dm'), 'telegram:999', link)).toEqual({ kind: 'drop' });
+    const refused = await runVoiceCommand(targets, chat('mg-dm'), NON_ADMIN, link);
+    expect(refused).toEqual({ kind: 'refused' });
+    expect(voiceCommandReply(refused, MD_FMT)).toBe('🚫 Admins only.');
+
+    const done = await runVoiceCommand(targets, chat('mg-dm'), OWNER, link);
+    expect(voiceCommandReply(done, MD_FMT)).toBe(
+      '🎙 Walkie-talkie for **Emma**:\nhttps://voice.example/webhook/voice/livekit?t=tok-voice:abc\n\n' +
+        'Calls on this link now talk in this chat, until /voice is run in another one.',
+    );
+    const off = await runVoiceCommand(targets, chat('mg-dm'), OWNER, () => null);
+    expect(voiceCommandReply(off, MD_FMT)).toBe(
+      'Walkie-talkie calls are off on this host (LiveKit is not configured).',
+    );
   });
 });

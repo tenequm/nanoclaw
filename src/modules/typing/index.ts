@@ -40,7 +40,8 @@
  *
  * Default module status:
  *   - Lives in src/modules/ for signaling (not really core), but ships
- *     on main and is imported directly by core. No registry, no hook.
+ *     on main and is imported directly by core. One observer hook
+ *     (registerTypingObserver) lets the voice channel follow a chat's ticks.
  *   - Removing requires editing src/router.ts, src/delivery.ts, and
  *     src/container-runner.ts to drop the calls.
  */
@@ -198,6 +199,15 @@ function signalFailed(op: string, fields: Record<string, unknown>, err: unknown)
   log.warn('activity signal failed', { op, ...fields, err: String(err) });
 }
 
+/** Sees every typing tick, so a chat's agent activity can be shown elsewhere too (a live voice call). */
+export type TypingObserver = (channelType: string, platformId: string, threadId: string | null) => void;
+
+const typingObservers: TypingObserver[] = [];
+
+export function registerTypingObserver(observer: TypingObserver): void {
+  typingObservers.push(observer);
+}
+
 async function triggerTyping(
   channelType: string,
   platformId: string,
@@ -206,6 +216,13 @@ async function triggerTyping(
   status?: string,
   statusKind?: 'auto' | 'agent',
 ): Promise<void> {
+  for (const observe of typingObservers) {
+    try {
+      observe(channelType, platformId, threadId);
+    } catch (err) {
+      signalFailed('typingObserver', { channelType, platformId, threadId }, err);
+    }
+  }
   try {
     await adapter?.setTyping?.(channelType, platformId, threadId, instance, status, statusKind);
   } catch (err) {

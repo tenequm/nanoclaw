@@ -480,7 +480,7 @@ handed to the worker with each call:
 | `WALKIE_TTS_MODEL` | `gemini-3.1-flash-tts-preview` | Speaks the agent's replies. Raw PCM and WAV answers are both understood, so a 3.8 TTS model also works. |
 | `WALKIE_TTS_VOICE` | `Alnilam` | Prebuilt Gemini voice. |
 | `WALKIE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
-| `WALKIE_MIRROR` | `telegram` | Channel type each exchange is copied into; `off` disables. |
+| `WALKIE_MIRROR` | `telegram` | Channel type of the default call chat, used until `/voice` picks one (see below); `off` keeps calls on the voice line until then. |
 
 Restart the host to load them. LiveKit calls end at `GPT_LIVE_MAX_CALL_SECONDS`
 (default 15 minutes) or when the day's minutes run out, whichever comes first.
@@ -544,12 +544,16 @@ from `LIVEKIT_API_SECRET`, so the worker needs that key too. Then, walkie-talkie
 - The turn's audio (16 kHz mono WAV, inline) is transcribed in one Gemini
   request; an empty transcript is dropped. The worker posts the text to
   `/webhook/voice/livekit/agent/utterance`, and the host hands it to the agent
-  as `<voice source="livekit">…</voice>` plus a line saying the reply is read
-  aloud (short spoken sentences, no markdown, links or code, numbers as words,
-  longer material as a separate written message). Its id is
-  `livekit:<call>:<n>`, so the reply routes back to this call.
-- Every agent message for the line during the call (replies and proactive
-  messages) goes to the worker complete over the host's event stream. The
+  in the line's call chat (below) as `<voice source="livekit">…</voice>` plus a
+  line saying the reply is read aloud (short spoken sentences, no markdown,
+  links or code, numbers as words, longer material as a separate written
+  message; in a call chat, that every message sent to the chat during the call
+  is read aloud, so longer material waits for the end of the call). Its id is
+  `livekit:<call>:<n>`.
+- Every agent message to the call chat during the call (replies and proactive
+  messages; with no call chat, every agent message for the line) goes to the
+  worker complete over the host's event stream, and the agent's typing there is
+  the worker's "thinking". The
   worker strips markdown and URLs, cuts the text into sentence-sized chunks
   and plays them in order, synthesizing the next chunk while one plays.
   Replies never overlap, and a reply waits for a caller who is mid-turn.
@@ -564,17 +568,33 @@ rechecks access every five seconds and ends a call (hangup, revocation,
 duration or budget limit, a newer call, shutdown) by deleting the room, which
 disconnects caller and worker.
 
-**Mirror into the agent's chat.** With `WALKIE_MIRROR=telegram` (the default)
-each exchange also appears in the agent's Telegram chat: the caller's turn as
-`🎙 <transcript>` once the agent has it, the agent's reply as written once it is
-handed to the worker (a reply for an ended call still lands there). The chat is
-the one live (not denied, not detached) Telegram messaging group wired to the
-line's agent group, or the one direct chat among several; with none, or with
-several and no single direct chat, nothing is mirrored and the host logs why
-once. The posts go straight through the Telegram adapter as the bot: they are
-not inbound, so the agent's Telegram session does not see them, and a voice
-reply never reaches Telegram on its own (delivery follows the channel of the
-message it answers), so nothing is posted twice.
+**The call chat and `/voice`.** A LiveKit call talks in one of the agent's
+chats, so the agent answers with that chat's context and the chat shows both
+sides. Send `/voice` in a chat wired to the agent (owner or admin only; on Slack
+`!voice`): the host replies there with the line's walkie-talkie link and makes
+that chat (and its thread or forum topic) the line's call chat until `/voice` is
+run in another chat of the same agent. The link itself never changes and the
+page works without the command; `/voice` only says where calls talk. In a chat
+with several agents it does this for every agent there the sender administers.
+The binding is stored per line in `voice_call_targets` (migration 027, applied
+at host start), with the user who ran `/voice`.
+
+During a call each turn is routed into the call chat's session through the
+normal inbound path, as a message from the user who ran `/voice` (only the
+line's agent gets it, whoever else is wired there; session mode and sender
+policy apply as for a typed message), and the bot posts `🎙 <name>: <transcript>`
+into the chat. The agent answers in the chat as usual; while the call is live,
+each message it delivers to that chat (and thread) is also spoken, and its typing
+there shows as thinking. A `/voice` chat that is no longer wired to the agent,
+or whose sender lost access, is ignored (the host logs it).
+
+Before any `/voice` the default is the `WALKIE_MIRROR` rule: the one live (not
+denied, not detached) chat of that channel type wired to the agent, or the one
+direct chat among several, with the line's own caller as the sender. With none,
+with several and no single direct chat, or with `WALKIE_MIRROR=off`, the call
+talks on the voice line itself as before (replies come back by their
+`livekit:` reply id, nothing is posted) and the host logs why once. The
+OpenAI (`/call`) and Gemini Live (`/gemini`) pages always talk on the voice line.
 
 The page loads `livekit-client` from the host itself (`/webhook/voice/livekit/client.js`),
 no CDN. Its status line shows Listening, Sending..., `<agent>` is thinking or

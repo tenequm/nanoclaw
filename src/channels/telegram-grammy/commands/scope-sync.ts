@@ -19,7 +19,7 @@
  * popup to every user once the commands carry default handlers. Doing the
  * registration here keeps popups admin-only while the CommandGroup handles the
  * commands for everyone. The command set / descriptions still come from the
- * single source of truth (COMMAND_ORDER + COMMANDS).
+ * single source of truth (COMMANDS, in the order each grant lists them).
  *
  * Every Telegram call is individually tolerant: a failure is logged and the
  * janitor moves on. The whole thing is wrapped so a Telegram outage at
@@ -31,7 +31,7 @@ import { Effect } from 'effect';
 import type { Api } from 'grammy';
 import type { BotCommand, BotCommandScope } from 'grammy/types';
 
-import { COMMANDS, COMMAND_ORDER } from '../../../commands/index.js';
+import { COMMANDS, type CommandName } from '../../../commands/index.js';
 import {
   getAppliedCommandScopes,
   replaceAppliedCommandScopes,
@@ -49,9 +49,9 @@ const ALWAYS_PURGE_SCOPES: BotCommandScope[] = [
   { type: 'all_chat_administrators' },
 ];
 
-/** The command list pushed to every admin scope (canonical order + descriptions). */
-function commandList(): BotCommand[] {
-  return COMMAND_ORDER.map((name) => ({ command: name, description: COMMANDS[name].description }));
+/** The command list pushed to one admin scope (the grant's commands, in order, with descriptions). */
+function commandList(names: readonly CommandName[]): BotCommand[] {
+  return names.map((name) => ({ command: name, description: COMMANDS[name].description }));
 }
 
 /** Numeric id out of a `telegram:<id>` platform/user id. NaN-safe (returns null). */
@@ -119,10 +119,10 @@ function parseScopeJson(scopeJson: string): BotCommandScope | null {
 export const syncCommandScopes = (api: Api): Effect.Effect<void> =>
   Effect.gen(function* () {
     const grants = yield* Effect.promise(() => computeCommandGrants());
-    const resolved: ResolvedScope[] = [];
+    const resolved: Array<ResolvedScope & { commands: BotCommand[] }> = [];
     for (const g of grants) {
       const r = grantToScope(g);
-      if (r) resolved.push(r);
+      if (r) resolved.push({ ...r, commands: commandList(g.commands) });
     }
     const currentKeys = new Set(resolved.map((r) => r.scopeKey));
 
@@ -137,9 +137,8 @@ export const syncCommandScopes = (api: Api): Effect.Effect<void> =>
     yield* Effect.all(deletes, { concurrency: 4, discard: true });
 
     // Register current admin scopes. One bounded-parallel batch.
-    const commands = commandList();
     yield* Effect.all(
-      resolved.map((r) => setScope(api, commands, r.scope)),
+      resolved.map((r) => setScope(api, r.commands, r.scope)),
       { concurrency: 4, discard: true },
     );
 

@@ -14,7 +14,7 @@
  *      (the menu plugin claims + auto-answers its own callbacks, then calls
  *      next for everything else, so the island's `ncq:` catch-all stays last
  *      and never double-answers a menu tap).
- *   3. bot.use(commandGroup) handles /status /model /config /restart; non-command
+ *   3. bot.use(commandGroup) handles /status /model /config /restart /voice; non-command
  *      messages fall through to the existing message handler unchanged.
  *
  * Typography: ASCII only ('-', '...', '->').
@@ -30,7 +30,7 @@ import { buildMenus } from './menus.js';
 import { syncCommandScopes } from './scope-sync.js';
 
 /**
- * Install the four chat commands + their menus, then kick off the startup
+ * Install the chat commands + their menus, then kick off the startup
  * scope janitor. Total: the janitor cannot throw out, and the sync wiring is
  * plain grammY registration.
  *

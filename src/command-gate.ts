@@ -2,7 +2,7 @@
  * Host-side command gate. Classifies inbound slash commands and gates
  * them before they reach the container.
  *
- * - Host commands (/model, /status, /config, /restart): claimed by the host.
+ * - Host commands (/model, /status, /config, /restart, /voice): claimed by the host.
  *   The router answers these via the fallback renderer (or, on channels with a
  *   native binding, the adapter). They must NOT leak to the container: the
  *   Claude SDK ships native /model + /status handlers that would shadow ours
@@ -43,7 +43,7 @@ const ADMIN_COMMANDS = new Set([
   ...listProviderHostContracts().flatMap((contract) => contract.commands?.nativeAdmin ?? []),
 ]);
 
-/** Bare command names the host claims (/model, /status, /config, /restart). */
+/** Bare command names the host claims (/model, /status, /config, /restart, /voice). */
 const HOST_COMMANDS = new Set<string>(Object.keys(COMMANDS));
 
 /** Typed name -> canonical command. Applied on both prefixes, all channels. */

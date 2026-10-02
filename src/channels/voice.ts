@@ -321,7 +321,13 @@ export function lineIdForToken(token: string): string {
   return `${CHANNEL_TYPE}:${createHash('sha256').update(token).digest('hex').slice(0, 12)}`;
 }
 
-export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
+/** The voice adapter, plus the walkie-talkie link of one of its lines for the `/voice` command. */
+export interface VoiceChannelAdapter extends ChannelAdapter {
+  /** The line's LiveKit call page URL, or null when LiveKit is off or the line has no link token here. */
+  walkieLink(platformId: string): string | null;
+}
+
+export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter {
   const apiBase = (config.apiBase ?? DEFAULT_API_BASE).replace(/\/+$/, '');
   const wsBase = (config.wsBase ?? DEFAULT_WS_BASE).replace(/\/+$/, '');
   const tokens = new Set(config.linkTokens.map((t) => t.trim()).filter(Boolean));
@@ -439,6 +445,10 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         onInbound: async (platformId, message) => {
           if (!setup) throw new Error('livekit-voice: channel is not running');
           await setup.onInbound(platformId, null, message);
+        },
+        onInboundEvent: async (event) => {
+          if (!setup) throw new Error('livekit-voice: channel is not running');
+          await setup.onInboundEvent(event);
         },
         isRunning: () => connected,
         now,
@@ -1202,6 +1212,14 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     channelType: CHANNEL_TYPE,
     supportsThreads: false,
     defaults: GPT_LIVE_DEFAULTS,
+
+    walkieLink(platformId: string): string | null {
+      if (!livekit) return null;
+      const token = [...tokens].find((t) => lineIdForToken(t) === platformId);
+      return token
+        ? `${config.publicUrl.replace(/\/+$/, '')}/webhook/voice/livekit?t=${encodeURIComponent(token)}`
+        : null;
+    },
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;

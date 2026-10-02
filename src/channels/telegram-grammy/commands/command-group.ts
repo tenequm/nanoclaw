@@ -1,6 +1,6 @@
 /**
- * The @grammyjs/commands CommandGroup that HANDLES the four chat commands
- * (/status /model /config /restart) inside the telegram-grammy adapter.
+ * The @grammyjs/commands CommandGroup that HANDLES the chat commands
+ * (/status /model /config /restart /voice) inside the telegram-grammy adapter.
  *
  * Design note (deviation from a naive plugin reading): each command carries a
  * DEFAULT handler, so it is handled in ANY chat the bot sees. The plugin ties
@@ -31,6 +31,7 @@ import {
   getStatus,
   isActivationMode,
   restartAgent,
+  runVoiceCommand,
   setActivation,
   setConfigValue,
   setModel,
@@ -56,6 +57,7 @@ import {
   reply,
   restartConfirmation,
   statusCard,
+  voiceCommandReply,
 } from './render.js';
 
 /** The telegram adapter is thread-less, so status/config chat context uses a null thread. */
@@ -231,10 +233,25 @@ export function buildCommandGroup(runtime: AdapterRuntime, menus: CommandMenus):
       yield* reply(ctx, 'This chat has multiple agents. Restart each from its own topic, or via /config -> Restart.');
     });
 
+  // /voice - admin only: replies with the agent's walkie-talkie link and makes this chat (topic) the
+  // line's call chat. Every agent of the chat the actor administers, like /status.
+  const onVoice = (ctx: Context): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const actor = actorUserId(ctx);
+      const res = yield* Effect.promise(() => resolveTargetsForContext(ctx));
+      const chatCtx = yield* Effect.promise(() => chatContext(ctx));
+      if (res.kind === 'none' || !chatCtx) return yield* dropNoAgent('voice', ctx);
+      const outcome = yield* Effect.promise(() => runVoiceCommand(res, chatCtx, actor));
+      const text = voiceCommandReply(outcome);
+      if (text === null) return yield* dropNoAgent('voice', ctx);
+      yield* reply(ctx, text);
+    });
+
   group.command('status', COMMANDS.status.description, (ctx) => runtime.runPromise(onStatus(ctx)));
   group.command('model', COMMANDS.model.description, (ctx) => runtime.runPromise(onModel(ctx)));
   group.command('config', COMMANDS.config.description, (ctx) => runtime.runPromise(onConfig(ctx)));
   group.command('restart', COMMANDS.restart.description, (ctx) => runtime.runPromise(onRestart(ctx)));
+  group.command('voice', COMMANDS.voice.description, (ctx) => runtime.runPromise(onVoice(ctx)));
 
   return group;
 }

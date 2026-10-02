@@ -1,6 +1,6 @@
 # Chat Commands
 
-NanoClaw exposes four host-owned slash commands that let an operator inspect and
+NanoClaw exposes host-owned slash commands that let an operator inspect and
 retune an agent group straight from chat, without shelling into the host for
 `ncl`. The commands are answered by the host, never by the container agent: the
 router claims them before the per-agent fan-out, and on Telegram a native
@@ -12,12 +12,13 @@ binding handles them at the adapter.
 | `/model` | Admin only | Bare `/model` opens a model picker (active model checkmarked). `/model <alias-or-id>` switches directly. |
 | `/config` | Admin only | Bare `/config` opens the config menu (Model / Effort / Compact window / Activation / Restart). `/config set <field> <value>` writes one field. |
 | `/restart` | Admin only | Restarts the agent's running container(s) immediately. |
+| `/voice` | Admin only | Replies with the agent's LiveKit walkie-talkie link and makes this chat (and its thread or topic) where the line's calls talk, until `/voice` is run in another chat of the agent. See the add-voice skill. |
 
 ## Slack: the `!` prefix
 
 Slack's client intercepts unregistered `/` commands ("not a valid command") and
-never posts the message, so the four commands cannot be typed with a slash
-there. On Slack, type `!status`, `!model`, `!config`, `!restart` instead: the
+never posts the message, so these commands cannot be typed with a slash
+there. On Slack, type `!status`, `!model`, `!config`, `!restart`, `!voice` instead: the
 gate normalizes `!name` to the canonical `/name` before classification, and the
 router's fallback renderer answers (plain-text cards plus an `ask_question`
 picker for bare `!model`; there is no Telegram-style popup or inline menu). An
@@ -44,8 +45,8 @@ Timestamps render as local `YYYY-MM-DD HH:MM` plus a relative suffix (`formatDat
 Context/Session lines appear only when transcript data exists; the Activation line
 only when the read has a chat context (a wired chat).
 
-Only `/status` is member-runnable; `/model`, `/config`, and `/restart` require
-admin privilege over the target agent group. On Telegram, unprivileged members
+Only `/status` is member-runnable; `/model`, `/config`, `/restart` and `/voice`
+require admin privilege over the target agent group. On Telegram, unprivileged members
 never see the commands in the popup at all (see [Telegram popup
 registration](#telegram-popup-registration)), but a typed `/status` still works.
 
@@ -61,7 +62,11 @@ explicit alert, never silently ignored.
 
 For `/status`, the member gate uses `canAccessAgentGroup`. Unknown senders (no
 `users` row) are dropped silently, mirroring how the router treats their normal
-messages; known non-members get an explicit refusal.
+messages; known non-members get an explicit refusal. `/voice` uses the same
+tri-state with an admin check on top (`voiceAccess`): it hands out the voice
+line's call link, which is a credential. Its reply goes to the invoking chat
+only, straight through the chat's adapter (never a session's outbound DB, so the
+agent never sees the link), and the host logs never carry it.
 
 The pressing user is authoritative on a menu tap: the handler re-checks the
 tapper's privilege, NOT the original requester's. Someone who opened a picker
@@ -225,7 +230,8 @@ messaging-group wirings and emits a grant list:
 
 Grants are per chat, never per topic (Telegram command scopes cannot target a
 forum topic), so multiple topics that share one chat id are folded together and
-their wired-agent admin sets are unioned.
+their wired-agent admin sets are unioned. `/voice` is added to a chat's grants
+only when one of its agents has a voice line.
 
 ### Startup scope janitor
 
@@ -268,6 +274,9 @@ sorted order.
 - **Fallback:** `/status` shows all wired agents' statuses in one reply. Writes
   (`/model`, `/config`, `/restart`) refuse politely with a hint to run the
   command in the agent's own topic or use `ncl` from the host.
+- **`/voice`** (both paths) acts like `/status`: every agent of the chat that
+  the sender administers and that has a voice line gets the chat as its call
+  chat, and the reply lists each agent's link.
 
 ## Troubleshooting
 
