@@ -1,5 +1,5 @@
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Mic, MicOff } from "lucide-react"
+import { ArrowUp, Mic, MicOff, Square } from "lucide-react"
 import { BarVisualizer, type AgentState as BarState } from "@/components/ui/bar-visualizer"
 import { Matrix, digits, loader, wave, type Frame } from "@/components/ui/matrix"
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from "@/components/ui/conversation"
@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
 import { LIVE_PHASES, type ErrorKind, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
+import { reviewView, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
@@ -118,7 +119,7 @@ const LOST_NOTICE: Record<LostReason, string> = {
 }
 
 function markLabel(mark: TurnMark): string {
-  if (mark.status === "sent") return "sent"
+  if (mark.status === "sent" || mark.status === "sending") return mark.status
   if (mark.reason === "timeout") return LOST_REASON.timeout
   // A newer worker may send a reason this page does not know yet.
   const why = mark.reason && LOST_REASON[mark.reason]
@@ -250,12 +251,15 @@ const Stage = memo(function Stage({
   live,
   presence,
   reduced,
+  compact = false,
 }: {
   call: VoiceCall
   phase: Phase
   live: boolean
   presence: "matrix" | "bars"
   reduced: boolean
+  /** A draft shares the screen: the dots shrink before the words do. */
+  compact?: boolean
 }) {
   const bars = presence === "bars"
   const { levels, glow } = useLevelTicker(call, phase, true, reduced, bars ? BAR_COUNT : MATRIX_COLS)
@@ -270,24 +274,26 @@ const Stage = memo(function Stage({
     )
   }
   const palette = { on: MATRIX_ON[phase], off: "var(--dot-off)" }
+  const size = compact ? 6 : 12
+  const gap = compact ? 2 : 3
   return (
     <div className="matrix-wrap">
       {phase === "thinking" ? (
         reduced ? (
-          <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} pattern={loader[0]} size={12} gap={3} palette={palette} ariaLabel="Agent is thinking" />
+          <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} pattern={loader[0]} size={size} gap={gap} palette={palette} ariaLabel="Agent is thinking" />
         ) : (
-          <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} frames={loader} fps={12} size={12} gap={3} palette={palette} ariaLabel="Agent is thinking" />
+          <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} frames={loader} fps={12} size={size} gap={gap} palette={palette} ariaLabel="Agent is thinking" />
         )
       ) : phase === "connecting" ? (
         reduced ? (
-          <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} pattern={wave[0]} size={12} gap={3} brightness={glow} palette={palette} ariaLabel="Connecting" />
+          <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} pattern={wave[0]} size={size} gap={gap} brightness={glow} palette={palette} ariaLabel="Connecting" />
         ) : (
-          <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} frames={wave} fps={20} size={12} gap={3} brightness={glow} palette={palette} ariaLabel="Connecting" />
+          <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} frames={wave} fps={20} size={size} gap={gap} brightness={glow} palette={palette} ariaLabel="Connecting" />
         )
       ) : live ? (
-        <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} mode="vu" levels={levels} size={12} gap={3} palette={palette} ariaLabel="Voice level" />
+        <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} mode="vu" levels={levels} size={size} gap={gap} palette={palette} ariaLabel="Voice level" />
       ) : (
-        <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} pattern={MATRIX_OFF} size={12} gap={3} brightness={glow} palette={palette} ariaLabel="Idle" />
+        <Matrix rows={MATRIX_ROWS} cols={MATRIX_COLS} pattern={MATRIX_OFF} size={size} gap={gap} brightness={glow} palette={palette} ariaLabel="Idle" />
       )}
     </div>
   )
@@ -353,6 +359,108 @@ const TranscriptLine = memo(function TranscriptLine({
   )
 })
 
+/** The turn mode switch: always there, above the keys. */
+function ModeRow({
+  mode,
+  pendingTo,
+  available,
+  disabled,
+  note,
+  onPick,
+}: {
+  mode: TurnMode
+  pendingTo: TurnMode | null
+  available: boolean
+  disabled: boolean
+  note: string | null
+  onPick: (mode: TurnMode) => void
+}) {
+  return (
+    <div className="mode-wrap">
+      <div className="mode-row" role="radiogroup" aria-label="Turn mode">
+        {(["auto", "review"] as const).map((m) => {
+          const on = mode === m
+          return (
+            <button
+              key={m}
+              type="button"
+              role="radio"
+              aria-checked={on}
+              className={`mode-seg${on ? " on" : ""}${pendingTo === m ? " pending" : ""}`}
+              disabled={disabled || (m === "review" && !available && !on)}
+              aria-describedby={`mode-${m}-desc`}
+              onClick={() => onPick(m)}
+            >
+              <i className={`led${on ? " on" : ""}`} aria-hidden="true" />
+              {m}
+              <span id={`mode-${m}-desc`} className="sr-only">
+                {m === "auto" ? "A pause sends what you said." : "Tap talk, then read the words before you send them."}
+              </span>
+            </button>
+          )
+        })}
+      </div>
+      {note && (
+        <p className="mode-note" role="status">
+          {note}
+        </p>
+      )}
+    </div>
+  )
+}
+
+/** The review draft, pinned above the keys: its own scroller, the header outside it. */
+function DraftPanel({ panel }: { panel: PanelView }) {
+  const body = useRef<HTMLDivElement | null>(null)
+  const atBottom = useRef(true)
+  const hearing = panel.tone === "hearing" || panel.tone === "finishing"
+  // A frozen draft opens at its first word; heard words follow the tail only while the reader is there.
+  useEffect(() => {
+    const el = body.current
+    if (!el) return
+    if (!hearing) el.scrollTop = 0
+  }, [hearing, panel.title])
+  useEffect(() => {
+    const el = body.current
+    if (el && hearing && atBottom.current) el.scrollTop = el.scrollHeight
+  }, [hearing, panel.text])
+  return (
+    <section className={`draft-panel tone-${panel.tone}`} aria-label="Review draft">
+      <header className="draft-head">
+        <span className="draft-title" role="status" aria-live="polite">
+          {panel.title}
+        </span>
+        {panel.note && <span className="draft-note">{panel.note}</span>}
+      </header>
+      <div
+        ref={body}
+        className="draft-body"
+        tabIndex={0}
+        aria-label="Draft text"
+        onScroll={(e) => {
+          const el = e.currentTarget
+          atBottom.current = el.scrollHeight - el.clientHeight - el.scrollTop <= 2
+        }}
+      >
+        {panel.text ? <p>{panel.text}</p> : <p className="ellipsis">{panel.tone === "hearing" ? "Speak now…" : panel.tone === "finishing" ? "…" : "No words."}</p>}
+      </div>
+    </section>
+  )
+}
+
+/** False for a moment after a key's action changes, so a second tap cannot hit what it turned into. */
+function useRearm(action: string, ms: number): boolean {
+  const [armed, setArmed] = useState(action)
+  useEffect(() => {
+    if (armed === action) return
+    const t = window.setTimeout(() => setArmed(action), ms)
+    return () => window.clearTimeout(t)
+  }, [action, armed, ms])
+  return armed === action
+}
+
+const REARM_MS = 500
+
 function isTypingTarget(t: EventTarget | null): boolean {
   const el = t as HTMLElement | null
   if (!el || typeof el.closest !== "function") return false
@@ -363,9 +471,12 @@ export default function App() {
   const cfg = useMemo(readConfig, [])
   const params = useMemo(() => new URLSearchParams(location.search), [])
   const token = params.get("t") || ""
-  const demo = params.get("demo") === "1"
+  // `?demo=1` plays an auto mode call, `?demo=review` a review mode one; `&step=<n>` stops at step n.
+  const demoMode = params.get("demo")
+  const demo = demoMode === "1" || demoMode === "review"
+  const demoStep = Number.parseInt(params.get("step") ?? "", 10)
   const liveKitCall = useLiveKitCall(demo ? "" : token, "your agent")
-  const demoCall = useDemoCall(demo)
+  const demoCall = useDemoCall(demo, demoMode === "review" ? "review" : "auto", Number.isInteger(demoStep) && demoStep >= 0 ? demoStep : null)
   const call = demo ? demoCall : liveKitCall
   const { phase, lines, streamingId, agentName, elapsed, muted, error, endedText } = call
   const errorKind = call.errorKind ?? "other"
@@ -418,33 +529,73 @@ export default function App() {
     return () => window.clearTimeout(t)
   }, [phase])
 
-  // Keyboard: space toggles the microphone, escape ends the call. Never while a control has focus.
+  const waited = useWaitSeconds(phase === "thinking")
+  const reconnecting = live && !!call.reconnecting
+
+  // Review mode: its keys, readout and draft panel come from the review view.
+  const rc = call.review
+  const rs = rc?.state
+  const reviewOn = !!rs && (rs.mode === "review" || (!!rs.ended && !!rs.draft))
+  const rv = reviewOn && rs ? reviewView({ phase, agentName, reconnecting, waited, review: rs }) : null
+  const leftArmed = useRearm(rv ? `${rv.left.action}:${rs?.draft?.id ?? ""}` : "auto", REARM_MS)
+  const rightArmed = useRearm(rv ? `${rv.right.action}:${rs?.draft?.id ?? ""}` : "auto", REARM_MS)
+  const switchingToReview = !reviewOn && rs?.pending?.op === "mode" && rs.pending.to === "review"
+  const runKey = (action: KeyAction) => {
+    if (action === "call") call.start()
+    else if (action === "cancel" || action === "end") call.end()
+    else if (action === "discard") rc?.discard()
+    else if (action === "talk") rc?.talk()
+    else if (action === "done") rc?.done()
+    else if (action === "send") rc?.send()
+  }
+  const keysRef = useRef({ rv, rc, rightArmed, draftOpen: false, switching: false })
+  keysRef.current = { rv, rc, rightArmed, draftOpen: !!rs?.draft, switching: switchingToReview }
+
+  // Keyboard: space toggles the microphone (in review: talk and done, never send), escape ends the
+  // call (never while a review draft is open). Never while a control has focus.
   const { toggleMute, end: endCall, start: startCall } = call
   useEffect(() => {
     if (!cfg.shortcuts) return
     const onKey = (e: KeyboardEvent) => {
       if (e.repeat || isTypingTarget(e.target)) return
       const p = phaseRef.current
+      const keys = keysRef.current
       if (e.code === "Space" && LIVE_PHASES.has(p)) {
         e.preventDefault()
-        toggleMute()
-      } else if (e.key === "Escape" && (LIVE_PHASES.has(p) || p === "connecting")) {
+        // Mid-switch the microphone stays as the switch left it, like the disabled key.
+        if (keys.switching) return
+        if (!keys.rv) return toggleMute()
+        const right = keys.rv.right
+        if (right.disabled || !keys.rightArmed) return
+        if (right.action === "talk") keys.rc?.talk()
+        else if (right.action === "done") keys.rc?.done()
+      } else if (e.key === "Escape" && (LIVE_PHASES.has(p) || p === "connecting") && !keys.draftOpen) {
         endCall()
       }
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
   }, [cfg.shortcuts, toggleMute, endCall])
-
-  const waited = useWaitSeconds(phase === "thinking")
-  const reconnecting = live && !!call.reconnecting
-  const chipClass =
-    phase === "idle" ? "idle" : phase === "ended" ? "ended" : phase === "error" ? "err" : phase === "listening" ? "you" : phase === "thinking" ? "think" : ""
+  // The review view speaks for the call while it runs, and for a draft kept after it.
+  const reviewReadout = !!rv && phase !== "error" && (live || phase === "connecting" || phase === "idle" || (!!rs?.ended && !!rs.draft))
+  const chipClass = reviewReadout
+    ? rv.chipTone
+    : phase === "idle"
+      ? "idle"
+      : phase === "ended"
+        ? "ended"
+        : phase === "error"
+          ? "err"
+          : phase === "listening"
+            ? "you"
+            : phase === "thinking"
+              ? "think"
+              : ""
   const endedSummary =
     endedText && endedText !== "Call ended." ? endedText.replace(/\.$/, "").toLowerCase() : "thanks for calling"
   // Lines are caption segments from both sides, not turns, so the summary leaves a count out.
   const endedHint = `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${endedSummary}.`
-  const hintText =
+  const autoHint =
     phase === "error"
       ? ERROR_HINT[errorKind]
       : reconnecting
@@ -462,8 +613,9 @@ export default function App() {
                   : phase === "listening" && call.silenceMs
                     ? `Go ahead. Pause about ${+(call.silenceMs / 1000).toFixed(1)} s to send.`
                     : HINT[phase]
+  const hintText = reviewReadout ? rv.hint : autoHint
 
-  const chipText = reconnecting
+  const autoChip = reconnecting
     ? "Reconnecting…"
     : phase === "thinking"
       ? `${agentName} is working`
@@ -480,12 +632,30 @@ export default function App() {
               : phase === "error"
                 ? ERROR_TITLE[errorKind]
                 : "Call ended"
+  const chipText = reviewReadout ? rv.chip : switchingToReview ? "Switching to review" : autoChip
   const readout = (
     <span className={`state-chip ${chipClass}`} role="status" aria-live="polite">
       {live && phase !== "connecting" && <span className="pulse" aria-hidden="true" />}
-      {phase === "thinking" && !reconnecting && !reduced ? <ShimmeringText className="shimmer" text={chipText} duration={1.4} /> : chipText}
+      {phase === "thinking" && !reconnecting && !reduced && (reviewReadout ? rv.chipTone === "think" : !switchingToReview) ? (
+        <ShimmeringText className="shimmer" text={chipText} duration={1.4} />
+      ) : (
+        chipText
+      )}
     </span>
   )
+  // In review the limit warning keeps its own line: it must not hide why a key is off.
+  const limitLine = reviewReadout && live && call.limitNote ? <p className="limit-note">{call.limitNote}</p> : null
+  const modeRow = rc && (
+    <ModeRow
+      mode={rc.state.mode}
+      pendingTo={rc.state.pending?.op === "mode" ? (rc.state.pending.to ?? null) : null}
+      available={rc.state.available}
+      disabled={phase === "connecting" || (rv ? rv.modeDisabled : !!rc.state.pending || reconnecting)}
+      note={rc.state.note}
+      onPick={rc.setMode}
+    />
+  )
+  const draftPanel = rv?.panel ? <DraftPanel panel={rv.panel} /> : null
 
   // The newest delivery mark decides: a lost turn stays on screen until a later one is sent.
   const lastMark = useMemo(() => lines.findLast((l) => l.mark)?.mark, [lines])
@@ -518,7 +688,9 @@ export default function App() {
             description={
               phase === "connecting"
                 ? `Connecting to ${agentName}.`
-                : live
+                : live && reviewOn
+                  ? "Sent turns show here."
+                  : live
                   ? muted
                     ? "Unmute to speak."
                     : "Speak when ready."
@@ -563,6 +735,29 @@ export default function App() {
   const primaryDisabled = (!token && !demo) || (phase === "connecting" && !cancelArmed)
   const onPrimary = live || phase === "connecting" ? endCall : startCall
 
+  // Review relabels the same two caps; a cap that just changed what it does waits a moment.
+  const primary = rv
+    ? {
+        label: rv.left.label,
+        disabled: rv.left.disabled || !leftArmed || ((rv.left.action === "call" || rv.left.action === "cancel") && primaryDisabled),
+        onClick: () => runKey(rv.left.action),
+        hangup: rv.left.action === "end",
+      }
+    : { label: primaryLabel, disabled: primaryDisabled, onClick: onPrimary, hangup: live }
+  const rightKey = rv && {
+    label: rv.right.label,
+    disabled: rv.right.disabled || !rightArmed,
+    onClick: () => runKey(rv.right.action),
+    icon:
+      rv.right.action === "done" ? (
+        <Square size={13} aria-hidden="true" />
+      ) : rv.right.action === "send" ? (
+        <ArrowUp size={15} aria-hidden="true" />
+      ) : (
+        <Mic size={15} aria-hidden="true" />
+      ),
+  }
+
   const keys =
     skin === "te" ? (
       <>
@@ -573,26 +768,43 @@ export default function App() {
             Time
           </span>
         </div>
+        {modeRow}
         <div className="key key-end">
-          <button type="button" className="cap orange" onClick={onPrimary} aria-disabled={primaryDisabled} disabled={primaryDisabled}>
-            {primaryLabel}
+          <button type="button" className="cap orange" onClick={primary.onClick} aria-disabled={primary.disabled} disabled={primary.disabled}>
+            {primary.label}
           </button>
           <span className="label">
             <i className={`led${live ? " green" : ""}`} aria-hidden="true" />
             {live ? "On call" : phase === "connecting" ? "Connecting" : phase === "error" ? "Not connected" : "Ready"}
-            {cfg.shortcuts && (live || phase === "connecting") && <kbd>esc</kbd>}
+            {cfg.shortcuts && (live || phase === "connecting") && !(rv && rs?.draft) && <kbd>esc</kbd>}
           </span>
         </div>
         <div className="key key-mute">
-          <button type="button" className={`cap${muted ? " dark" : ""}`} disabled={!live} onClick={toggleMute}>
-            {muted ? <MicOff size={15} aria-hidden="true" /> : <Mic size={15} aria-hidden="true" />}
-            {muted ? "Unmute" : "Mute"}
-          </button>
-          <span className={`label${notListening ? " wrap" : ""}`}>
-            <i className={`led${muted ? " on" : ""}`} aria-hidden="true" />
-            <span>{micLabel}</span>
-            {cfg.shortcuts && !notListening && <kbd>space</kbd>}
-          </span>
+          {rightKey && rv ? (
+            <>
+              <button type="button" className={`cap${rv.right.action === "talk" ? " dark" : ""}`} disabled={rightKey.disabled} onClick={rightKey.onClick}>
+                {rightKey.icon}
+                {rightKey.label}
+              </button>
+              <span className="label wrap">
+                <i className={`led${rv.capturing ? " on" : ""}`} aria-hidden="true" />
+                <span>{rv.mic}</span>
+                {cfg.shortcuts && (rv.right.action === "talk" || rv.right.action === "done") && <kbd>space</kbd>}
+              </span>
+            </>
+          ) : (
+            <>
+              <button type="button" className={`cap${muted ? " dark" : ""}`} disabled={!live || switchingToReview} onClick={toggleMute}>
+                {muted ? <MicOff size={15} aria-hidden="true" /> : <Mic size={15} aria-hidden="true" />}
+                {muted ? "Unmute" : "Mute"}
+              </button>
+              <span className={`label${notListening ? " wrap" : ""}`}>
+                <i className={`led${muted ? " on" : ""}`} aria-hidden="true" />
+                <span>{micLabel}</span>
+                {cfg.shortcuts && !notListening && <kbd>space</kbd>}
+              </span>
+            </>
+          )}
         </div>
       </>
     ) : (
@@ -600,20 +812,32 @@ export default function App() {
         <span className="timer" role="timer" aria-label="Call duration">
           {live ? `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)}` : ""}
         </span>
-        <Button size="lg" className={`${live || phase === "connecting" ? "btn-hangup" : "btn-call"} h-12 w-full rounded-full text-[15px] font-semibold`} onClick={onPrimary} disabled={primaryDisabled}>
-          {live ? "Hang up" : primaryLabel}
+        <Button size="lg" className={`${live || phase === "connecting" ? "btn-hangup" : "btn-call"} h-12 w-full rounded-full text-[15px] font-semibold`} onClick={primary.onClick} disabled={primary.disabled}>
+          {primary.hangup ? "Hang up" : primary.label}
         </Button>
-        <Button size="lg" variant="secondary" className={`btn-mute h-12 rounded-full ${muted ? "on" : ""}`} disabled={!live} onClick={toggleMute}>
-          {muted ? <MicOff size={16} aria-hidden="true" /> : <Mic size={16} aria-hidden="true" />}
-          {muted ? "Unmute" : "Mute"}
-        </Button>
+        {rightKey ? (
+          <Button size="lg" variant="secondary" className="btn-mute h-12 rounded-full" disabled={rightKey.disabled} onClick={rightKey.onClick}>
+            {rightKey.icon}
+            {rightKey.label}
+          </Button>
+        ) : (
+          <Button size="lg" variant="secondary" className={`btn-mute h-12 rounded-full ${muted ? "on" : ""}`} disabled={!live || switchingToReview} onClick={toggleMute}>
+            {muted ? <MicOff size={16} aria-hidden="true" /> : <Mic size={16} aria-hidden="true" />}
+            {muted ? "Unmute" : "Mute"}
+          </Button>
+        )}
       </>
     )
 
   const footer = cfg.footer.split("{agent}").join(agentName)
 
   return (
-    <div className="voice-page" data-skin={skin} data-layout={rail ? "rail" : "stack"} data-colorway={skin === "te" && colorway !== "auto" ? colorway : undefined}>
+    <div
+      className={`voice-page${reviewOn && rail ? " review-fit" : ""}`}
+      data-skin={skin}
+      data-layout={rail ? "rail" : "stack"}
+      data-colorway={skin === "te" && colorway !== "auto" ? colorway : undefined}
+    >
       <main className={`call-card${rail ? " layout-rail" : ""}`} aria-label="Voice call">
         <header className="brand-row">
           {skin === "te" ? (
@@ -644,9 +868,9 @@ export default function App() {
 
         {rail ? (
           <div className="device">
-            <section className="screen" aria-label="Screen">
+            <section className={`screen${draftPanel ? " has-draft" : ""}`} aria-label="Screen">
               <div className="screen-top">
-                <Stage call={call} phase={phase} live={live} presence={cfg.presence} reduced={reduced} />
+                <Stage call={call} phase={phase} live={live} presence={cfg.presence} reduced={reduced} compact={!!draftPanel} />
               </div>
               <div className="screen-readout">
                 {readout}
@@ -655,9 +879,11 @@ export default function App() {
                 {sendCueBar}
               </div>
               {deliveryNotice}
+              {limitLine}
               <div className="console" aria-label="Live transcript">
                 {transcript}
               </div>
+              {draftPanel}
             </section>
             <aside className="rail" aria-label="Controls">
               {keys}
@@ -674,6 +900,7 @@ export default function App() {
               {sendCueBar}
               {hearKey}
               {deliveryNotice}
+              {limitLine}
             </section>
             <section aria-label="Live transcript">
               <div className="transcript-head">
@@ -681,6 +908,8 @@ export default function App() {
               </div>
               {transcript}
             </section>
+            {draftPanel}
+            {skin !== "te" && modeRow}
             <div className="control-bar">{keys}</div>
           </>
         )}

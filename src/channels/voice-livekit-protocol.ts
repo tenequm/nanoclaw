@@ -88,8 +88,90 @@ export interface CallTurnStatus {
   turn: number;
   status: 'sending' | 'sent' | 'lost';
   reason?: 'stt' | 'rejected' | 'rate_limited' | 'timeout' | 'empty';
-  /** The final transcript, when there is one. */
+  /** The final transcript, when there is one; on `sending` only for a sent review draft. */
   text?: string;
+  /** On a sent review draft's `sending`: its `CallDraft.id`, so the page shows that text as the turn. */
+  draft?: number;
+}
+
+/** The host takes a caller turn of at most this many UTF-8 bytes; a longer review draft cannot be sent. */
+export const MAX_TURN_TEXT_BYTES = 8 * 1024;
+
+/**
+ * Review mode: the caller taps talk, speaks, taps done, reads the draft and sends or discards it;
+ * nothing goes out on a pause. The worker's participant attribute is "1" when it runs review mode,
+ * and the page offers it only then. The page drives it with the RPCs below on the worker, and the
+ * worker sends every change of its `CallReviewState` on the topic. All of it is additive to v4: an
+ * old page never calls the RPCs, and an old worker sets no attribute.
+ */
+export const CALL_REVIEW_ATTRIBUTE = 'nanoclaw.voice.review';
+/** Text stream topic the worker sends one JSON `CallReviewState` on whenever it changes. */
+export const CALL_REVIEW_TOPIC = 'nanoclaw.voice.review';
+/** The RPC methods the worker registers for the page; each takes a `ReviewRequest` and answers a `ReviewReply`. */
+export const REVIEW_RPC = {
+  mode: 'nanoclaw.voice.mode',
+  talk: 'nanoclaw.voice.talk',
+  done: 'nanoclaw.voice.done',
+  send: 'nanoclaw.voice.send',
+  discard: 'nanoclaw.voice.discard',
+} as const;
+export type ReviewOp = keyof typeof REVIEW_RPC;
+
+export type TurnMode = 'auto' | 'review';
+
+/**
+ * One review turn: `recording` from talk to done (the caller's audio reaches the transcription),
+ * `finishing` while the transcription is flushed, then the frozen text: `ready` to send, `empty`
+ * (nothing heard) or `failed` (the transcription did not finish; `text` is unverified). `tooLong`:
+ * over MAX_TURN_TEXT_BYTES. `reason`: it stopped without done, because a reply took the channel
+ * (`agent`), or it is an open auto turn the caller switched to review (`switch`).
+ */
+export interface CallDraft {
+  id: number;
+  state: 'recording' | 'finishing' | 'ready' | 'empty' | 'failed';
+  text: string;
+  tooLong?: boolean;
+  reason?: 'agent' | 'switch';
+}
+
+/** The worker's review state; `seq` grows with every change, so the page keeps the newest. */
+export interface CallReviewState {
+  seq: number;
+  mode: TurnMode;
+  draft: CallDraft | null;
+}
+
+/** `gen` is the page's own operation counter, echoed back; `draft` names the draft an operation is for. */
+export interface ReviewRequest {
+  gen: number;
+  draft?: number;
+  /** For `mode`: the mode to switch to; absent, the worker only sends its state again. */
+  mode?: TurnMode;
+  /** With `mode`: the newest worker turn number the page had seen, to hear of a turn sent meanwhile. */
+  afterTurn?: number;
+}
+
+/**
+ * What the worker did. `seq`: the state that shows it, which the page waits for on the topic.
+ * `draft`: the draft talk opened. `turn`: the turn number a sent draft got. `submitted`: on a switch
+ * to review, a turn auto mode had already sent after `afterTurn`. `error`: why nothing happened.
+ */
+export interface ReviewReply {
+  gen: number;
+  ok: boolean;
+  seq: number;
+  draft?: number;
+  turn?: number;
+  submitted?: number;
+  error?:
+    | 'stale'
+    | 'recording'
+    | 'finishing'
+    | 'draft_open'
+    | 'agent_speaking'
+    | 'not_review'
+    | 'unsendable'
+    | 'closed';
 }
 
 /**

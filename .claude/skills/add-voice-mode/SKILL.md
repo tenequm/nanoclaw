@@ -443,7 +443,8 @@ and test globs. Ordinary installs copy the generated page
 and do not need a frontend build. The UI has the same three-day release-age gate
 as the host and requires no dependency install scripts. Try the page without a
 microphone or an agent by adding `&demo=1` to any call link: it plays a scripted
-call and connects to nothing.
+call and connects to nothing. `&demo=review` plays a review mode call through
+every review state, and `&step=<n>` stops either script at step n.
 
 ## How a call runs
 
@@ -682,6 +683,41 @@ blocked the readout shows a "tap to hear `<agent>`" button. While the SDK
 reconnects the readout says to wait before speaking. With no worker in the room
 after 25 seconds the page says the voice service is unavailable; a worker on
 another protocol version makes it say the service is updating.
+
+**Review mode.** A segmented `auto | review` switch sits above the keys, before
+and during the call; the pick stays for the next call on the same page. In
+review nothing goes out on a pause: the caller taps talk (the microphone opens,
+then the listening cue plays), speaks with any pauses, taps done, reads the
+draft in a dashed panel pinned above the keys (`draft - not sent`) and taps send
+or discard; after either the microphone stays off until the next talk. The page
+publishes its microphone muted in review and offers the mode only when the
+worker sets the attribute `nanoclaw.voice.review` to "1". It drives the worker
+with RPCs (`nanoclaw.voice.mode`, `.talk`, `.done`, `.send`, `.discard`; JSON
+`ReviewRequest` in, `ReviewReply` out, see `voice-livekit-protocol.ts`; a mode
+request naming no mode only re-reads the state, as the page does after a
+reconnect or an unanswered request), so the caller's token may publish data. The
+worker answers them only from the caller's identity, one at a time, each for the
+draft id it names (a late or repeated one is "stale"), and closes agents-js's
+own session control topic (`lk.agent.session`), which the caller would
+otherwise reach. The worker sends every change of its `CallReviewState` (`{"seq",
+"mode", "draft": {"id", "state": "recording" | "finishing" | "ready" | "empty" |
+"failed", "text", "tooLong"?, "reason"?: "agent" | "switch"}}`) on the topic
+`nanoclaw.voice.review`. In review the session's turn detection is manual and
+its input is off between recordings; after done the transcription gets silence
+until it has finalized what it heard (at most 4 s, past which the rest is
+unverified and the draft cannot be sent), and the draft's text is frozen from
+its final transcripts. Send posts exactly that text through the ordinary turn
+path, and its `sending` status carries the text and the draft id, so the page
+shows that text as the turn. A draft over the 8 KB turn limit cannot be sent.
+A reply that waits out a recording (the usual bounded wait) takes the channel
+and turns the recording into a draft ("`<agent>` started speaking - review what
+was heard"); talk waits while the agent speaks, but a draft can be sent then as
+a follow-up. Switching auto to review mid-turn cancels the pending auto commit
+and makes the unsent words a draft; if the commit already went, the page says
+"previous turn already submitted". Back to auto needs no open draft and leaves
+the microphone muted. A quiet two-note cue says a draft is ready to read; a call
+that ends with a draft keeps it readable until discarded, never sent into the
+next call. Auto mode is unchanged.
 
 ## Channel Info
 

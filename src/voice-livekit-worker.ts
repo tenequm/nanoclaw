@@ -67,14 +67,24 @@ import {
   liveKitHostUrl,
   CALL_PENDING_ATTRIBUTE,
   CALL_REPLY_TOPIC,
+  CALL_REVIEW_ATTRIBUTE,
+  CALL_REVIEW_TOPIC,
   CALL_THINKING_ATTRIBUTE,
   CALL_TURN_TOPIC,
   CALL_UPDATING_ATTRIBUTE,
+  MAX_TURN_TEXT_BYTES,
+  REVIEW_RPC,
   WORKER_REQUEST_TIMEOUT_MS,
+  type CallDraft,
+  type CallReviewState,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
   type CallReplyInfo,
   type CallTurnStatus,
+  type ReviewOp,
+  type ReviewReply,
+  type ReviewRequest,
+  type TurnMode,
 } from './channels/voice-livekit-protocol.js';
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
@@ -124,6 +134,27 @@ const MAX_RECORDED_TURN_MS = 120_000;
 const TURN_RETRY_DELAY_MS = 500;
 /** Timed-out turns kept for a late `turn-stored`; the host remembers no more turn keys than this either. */
 const MAX_UNCONFIRMED_TURNS = 32;
+/** After done, silence goes to the transcription at least this long, so it finalizes the last words. */
+const FLUSH_MIN_MS = 700;
+/** The unary fallback closes speech at its own 1 s pause and then makes a request: a longer flush. */
+const FLUSH_FALLBACK_MIN_MS = 2_500;
+/** The flush ends once no interim text waits for its final and nothing was heard for this long... */
+export const FLUSH_QUIET_MS = 400;
+/** ...or after this long, with what is still interim text left unverified. */
+export const FLUSH_TIMEOUT_MS = 4_000;
+const FLUSH_POLL_MS = 50;
+/** The flush's silence goes to the transcription in chunks this long. */
+const FLUSH_CHUNK_MS = 100;
+/**
+ * Clearing the session's turn restarts its transcription. A discard holds the next operation this
+ * long, and for up to STALE_STREAM_MS words from a stream older than the restart are dropped.
+ */
+export const CLEAR_SETTLE_MS = 300;
+const STALE_STREAM_MS = 2_000;
+/** agents-js's session control topic (its TOPIC_SESSION_MESSAGES), served to the caller unless closed. */
+const SESSION_CONTROL_TOPIC = 'lk.agent.session';
+/** Review mode's waits, on the global timers (which tests can fake). */
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 /** VOICE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
 export const DEFAULT_MAX_SPOKEN_CHARS = 800;
 const DAY_MS = 86_400_000;
@@ -705,7 +736,32 @@ export interface CallVoice {
   publishTurn(status: CallTurnStatus): void;
   /** One message on the `nanoclaw.voice.reply` topic, sent right before the line it describes is spoken. */
   publishReply(info: CallReplyInfo): void;
+  /** Review mode's controls on the session; absent where the session cannot run it. */
+  review?: ReviewSession;
   close(): Promise<void>;
+}
+
+/** What review mode needs from the session in the room. */
+export interface ReviewVoice {
+  /** Manual turn detection: no pause ends a turn. */
+  setManualTurns(manual: boolean): void;
+  /** Whether the caller's audio reaches the session at all (VAD and transcription). */
+  setInput(enabled: boolean): void;
+  /** Feed silence to the transcription, so it finalizes what it has heard. */
+  setFlushing(on: boolean): void;
+  /** Drop the session's own open turn; its transcription restarts. Returns the restarted stream's number. */
+  clearTurn(): number;
+  /** How long a flush runs at least. */
+  flushMinMs(): number;
+  /** The open turn's recording, taken once its text is frozen. */
+  takeTurn(): TurnTake;
+  /** One message on the `nanoclaw.voice.review` topic. */
+  publishReview(state: CallReviewState): void;
+}
+
+export interface ReviewSession extends ReviewVoice {
+  /** Answer the page's review RPCs with `handle`, and tell the page review mode is on offer. */
+  serve(handle: (op: ReviewOp, payload: string, callerIdentity: string) => Promise<string>): void;
 }
 
 /** What the session reports back. `audio` is the turn's recording, when recordings are on. */
@@ -717,6 +773,14 @@ export interface CallVoiceEvents {
   /** Speech too short to count as a turn, with nothing transcribed (a cough, a noise). */
   onTurnDropped(turn: TurnTake): void;
   onClosed(reason: string): void;
+  /** True while review mode runs: pauses end no turn, and the auto turn rules stand aside. */
+  reviewing?(): boolean;
+  /** A transcript from the session's transcription stream number `stream` (it restarts with a new number). */
+  onTranscript?(text: string, final: boolean, stream: number): void;
+  /** The transcription failed for good on a stretch of speech. */
+  onSttError?(): void;
+  /** The agent's audio started or stopped playing. */
+  onAgentSpeaking?(speaking: boolean): void;
 }
 
 /** A finished turn's recording, if turns are recorded, and which transcription model heard it. */
@@ -742,6 +806,8 @@ export interface TurnTakingDeps {
   setThinking(thinking: boolean): void;
   /** What the line about to be spoken is, for the page's caption labels. */
   announce?(info: CallReplyInfo): void;
+  /** Right before a line is spoken: review mode stops a recording the line takes the channel from. */
+  beforeSpeak?(): void;
   log: Pick<Console, 'info' | 'warn'>;
   now?: () => number;
 }
@@ -753,6 +819,8 @@ export interface TurnTakingDeps {
 export class TurnTaking {
   private readonly now: () => number;
   private callerSpeaking = false;
+  /** A review recording is open: like a caller mid-turn, it holds replies for a while. */
+  private captureOpen = false;
   /** Until then, the caller's last speech may still be committed as a turn. */
   private turnOpenUntil = 0;
   private sends: Promise<void> = Promise.resolve();
@@ -781,6 +849,19 @@ export class TurnTaking {
   onCallerSpeaking(speaking: boolean): void {
     this.callerSpeaking = speaking;
     if (!speaking) this.turnOpenUntil = this.now() + this.options.silenceMs + TURN_SETTLE_MS;
+    this.wake();
+  }
+
+  /** Review mode opened or closed a recording. */
+  setCaptureOpen(open: boolean): void {
+    this.captureOpen = open;
+    this.wake();
+  }
+
+  /** Review mode took over: no pause will commit the auto mode's open turn. */
+  resetCaller(): void {
+    this.callerSpeaking = false;
+    this.turnOpenUntil = 0;
     this.wake();
   }
 
@@ -892,7 +973,9 @@ export class TurnTaking {
     this.speech = this.speech
       .then(async () => {
         await this.callerIdle();
-        if (!this.closed) await job();
+        if (this.closed) return;
+        this.deps.beforeSpeak?.();
+        await job();
       })
       .catch((err: unknown) => this.deps.log.warn('voice worker: speaking failed', { err }))
       .finally(() => this.queued--);
@@ -903,12 +986,13 @@ export class TurnTaking {
     const deadline = this.now() + this.options.silenceMs + MAX_IDLE_WAIT_MS;
     while (!this.closed) {
       const t = this.now();
-      if (!this.callerSpeaking && t >= this.turnOpenUntil) return;
+      const busy = this.callerSpeaking || this.captureOpen;
+      if (!busy && t >= this.turnOpenUntil) return;
       if (t >= deadline) {
         this.deps.log.info('voice worker: the caller is still talking; the reply takes the channel');
         return;
       }
-      const until = this.callerSpeaking ? deadline : Math.min(deadline, this.turnOpenUntil);
+      const until = busy ? deadline : Math.min(deadline, this.turnOpenUntil);
       await new Promise<void>((resolve) => {
         const done = () => {
           clearTimeout(timer);
@@ -946,6 +1030,305 @@ export function hostLossReason(result: SendResult): 'rate_limited' | 'rejected' 
   if (result.status === 429) return 'rate_limited';
   // 504: the host could not get the turn into the agent's session in time.
   return result.status !== undefined && result.status !== 504 ? 'rejected' : 'timeout';
+}
+
+export interface ReviewDeps {
+  voice: ReviewVoice;
+  /** Hand a sent draft's text to the host the way a finished auto turn goes; returns its turn number. */
+  post(text: string, draft: number, take: TurnTake): number;
+  /** The newest turn number handed to the host. */
+  lastPosted(): number;
+  /** A review recording holds replies like a caller mid-turn (TurnTaking.setCaptureOpen). */
+  setCaptureOpen(open: boolean): void;
+  /** Entering review: the auto mode's open turn is not waited for any more (TurnTaking.resetCaller). */
+  resetCaller(): void;
+  log: Pick<Console, 'info' | 'warn'>;
+}
+
+/**
+ * Review mode on the worker: the caller's talk, done, send and discard, and switching between auto
+ * and review mid-call. One operation runs at a time, each for the draft it names, so a late or
+ * repeated one is refused as stale. Every change goes to the page as a `CallReviewState`.
+ *
+ * In review the session's turn detection is manual and its input is off between recordings. The
+ * draft's text is built here from the transcription's final transcripts, not from the session's
+ * committed turn: agents-js `commitUserTurn()` takes no STT flush, returns no text, and its turn can
+ * land after a switch back to auto. After done the transcription gets silence until it has
+ * finalized everything it heard (or FLUSH_TIMEOUT_MS passes, leaving the rest unverified); then the
+ * session's own turn is cleared, so nothing of it is ever committed.
+ */
+export class ReviewControl {
+  private mode: TurnMode = 'auto';
+  private draft: CallDraft | null = null;
+  /** The frozen draft's recording, saved with its turn if it is sent. */
+  private take?: TurnTake;
+  private seq = 0;
+  private drafts = 0;
+  private ops: Promise<unknown> = Promise.resolve();
+  /** What the transcription heard since the last turn boundary: its finals, and the interim text after them. */
+  private finals: string[] = [];
+  private interim = '';
+  private heardAt = 0;
+  private minStream = 0;
+  private clearedAt = 0;
+  private callerSpeaking = false;
+  private agentSpeaking = false;
+  private sttFailed = false;
+  private closed = false;
+
+  constructor(private readonly deps: ReviewDeps) {}
+
+  get reviewing(): boolean {
+    return this.mode === 'review';
+  }
+
+  /** One page operation, run after the ones before it. */
+  handle(op: ReviewOp, req: ReviewRequest): Promise<ReviewReply> {
+    const run = this.ops.then(() => this.run(op, req));
+    this.ops = run.catch(() => undefined);
+    return run;
+  }
+
+  onTranscript(text: string, final: boolean, stream: number): void {
+    // A stream from before the last clear can still deliver for a moment: its words were dropped.
+    if (stream < this.minStream && Date.now() - this.clearedAt < STALE_STREAM_MS) return;
+    const state = this.draft?.state;
+    if (this.mode === 'review' && state !== 'recording' && state !== 'finishing') return;
+    this.heardAt = Date.now();
+    const words = text.trim();
+    if (!final) {
+      this.interim = words;
+      return;
+    }
+    if (words) this.finals.push(words);
+    this.interim = '';
+  }
+
+  onSttError(): void {
+    const state = this.draft?.state;
+    if (state === 'recording' || state === 'finishing') this.sttFailed = true;
+  }
+
+  /** The VAD's view of the caller, for whether an auto turn is open when review is asked for. */
+  onCallerSpeaking(speaking: boolean): void {
+    this.callerSpeaking = speaking;
+  }
+
+  onAgentSpeaking(speaking: boolean): void {
+    this.agentSpeaking = speaking;
+    if (speaking) this.beforeAgentSpeaks();
+  }
+
+  /** A reply takes the channel: a recording stops there and becomes a draft; it never resumes by itself. */
+  beforeAgentSpeaks(): void {
+    if (this.draft?.state === 'recording') this.finish(this.draft, 'agent');
+  }
+
+  /** An auto turn was committed, lost or dropped: what was heard so far is no longer open. */
+  onAutoTurnClosed(): void {
+    this.resetHeard();
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  private async run(op: ReviewOp, req: ReviewRequest): Promise<ReviewReply> {
+    const reply = (fields: Partial<ReviewReply> = {}): ReviewReply => ({
+      gen: req.gen,
+      ok: !fields.error,
+      seq: this.seq,
+      ...fields,
+    });
+    if (this.closed) return reply({ error: 'closed' });
+    const draft = this.draft;
+    const busy = draft
+      ? draft.state === 'recording'
+        ? 'recording'
+        : draft.state === 'finishing'
+          ? 'finishing'
+          : 'draft_open'
+      : undefined;
+    switch (op) {
+      case 'mode': {
+        if (req.mode === undefined || req.mode === this.mode) {
+          // Nothing to change: the page re-reads the state, after a reconnect say.
+          this.publish();
+          return reply();
+        }
+        if (req.mode === 'auto') {
+          if (busy) return reply({ error: busy });
+          this.mode = 'auto';
+          this.resetHeard();
+          this.deps.voice.setManualTurns(false);
+          this.deps.voice.setInput(true);
+          this.publish();
+          return reply();
+        }
+        return this.enterReview(req, reply);
+      }
+      case 'talk': {
+        if (this.mode !== 'review') return reply({ error: 'not_review' });
+        // An empty draft gives way to a new recording; any other one has to be sent or discarded.
+        if (busy && draft?.state !== 'empty') return reply({ error: busy });
+        if (this.agentSpeaking) return reply({ error: 'agent_speaking' });
+        this.resetHeard();
+        this.sttFailed = false;
+        this.take = undefined;
+        this.draft = { id: ++this.drafts, state: 'recording', text: '' };
+        this.deps.setCaptureOpen(true);
+        this.deps.voice.setInput(true);
+        this.publish();
+        return reply({ draft: this.draft.id });
+      }
+      case 'done': {
+        if (!draft || draft.id !== req.draft) return reply({ error: 'stale' });
+        // Already stopped (a reply took the channel): done asks for nothing more.
+        if (draft.state === 'recording') this.finish(draft);
+        return reply();
+      }
+      case 'send': {
+        if (!draft || draft.id !== req.draft) return reply({ error: 'stale' });
+        if (draft.state !== 'ready' || draft.tooLong) return reply({ error: 'unsendable' });
+        const take = this.take ?? this.deps.voice.takeTurn();
+        this.draft = null;
+        this.take = undefined;
+        const turn = this.deps.post(draft.text, draft.id, take);
+        this.publish();
+        return reply({ turn });
+      }
+      case 'discard': {
+        if (!draft || draft.id !== req.draft) return reply({ error: 'stale' });
+        this.draft = null;
+        this.take = undefined;
+        const open = draft.state === 'recording' || draft.state === 'finishing';
+        if (draft.state === 'recording') {
+          this.deps.setCaptureOpen(false);
+          this.deps.voice.setInput(false);
+        }
+        // A frozen draft's turn was cleared when it froze; an open one's is cleared now.
+        if (open) {
+          this.deps.voice.takeTurn();
+          this.clear();
+        }
+        this.publish();
+        if (open) await pause(CLEAR_SETTLE_MS);
+        return reply();
+      }
+    }
+  }
+
+  private enterReview(req: ReviewRequest, reply: (fields?: Partial<ReviewReply>) => ReviewReply): ReviewReply {
+    const posted = this.deps.lastPosted();
+    const submitted = typeof req.afterTurn === 'number' && posted > req.afterTurn ? posted : undefined;
+    this.mode = 'review';
+    // Manual turns first: that cancels an auto commit still waiting out its silence.
+    this.deps.voice.setManualTurns(true);
+    this.deps.voice.setInput(false);
+    this.deps.resetCaller();
+    const open = this.finals.length > 0 || this.interim !== '' || this.callerSpeaking;
+    this.callerSpeaking = false;
+    if (open) {
+      // The caller's unsent words become a draft; never sent by the switch itself.
+      this.draft = { id: ++this.drafts, state: 'finishing', text: '', reason: 'switch' };
+      this.publish();
+      this.finalizeSafely(this.draft);
+    } else {
+      this.resetHeard();
+      this.publish();
+    }
+    return reply(submitted !== undefined ? { submitted } : {});
+  }
+
+  /** Stop the recording and freeze its text. */
+  private finish(draft: CallDraft, reason?: CallDraft['reason']): void {
+    this.draft = { ...draft, state: 'finishing', ...(reason ? { reason } : {}) };
+    this.deps.setCaptureOpen(false);
+    this.deps.voice.setInput(false);
+    this.publish();
+    this.finalizeSafely(this.draft);
+  }
+
+  /** A finalize that fails leaves the draft unverified, never stuck finishing. */
+  private finalizeSafely(draft: CallDraft): void {
+    this.finalize(draft).catch((err: unknown) => {
+      this.deps.log.warn('voice worker: finishing a review draft failed', { err });
+      if (this.draft?.id !== draft.id) return;
+      this.draft = { ...draft, state: 'failed', text: this.draft.text };
+      this.publish();
+    });
+  }
+
+  private async finalize(draft: CallDraft): Promise<void> {
+    const startedAt = Date.now();
+    const minMs = this.deps.voice.flushMinMs();
+    this.deps.voice.setFlushing(true);
+    try {
+      for (;;) {
+        await pause(FLUSH_POLL_MS);
+        // Discarded meanwhile, or the call ended: its words go nowhere.
+        if (this.closed || this.draft?.id !== draft.id) return;
+        const t = Date.now();
+        if (t - startedAt >= minMs && !this.interim && t - this.heardAt >= FLUSH_QUIET_MS) break;
+        if (t - startedAt >= FLUSH_TIMEOUT_MS) {
+          this.deps.log.warn('voice worker: the transcription did not finish a review draft in time');
+          break;
+        }
+      }
+    } finally {
+      this.deps.voice.setFlushing(false);
+    }
+    const unverified = this.interim !== '' || this.sttFailed;
+    const text = [...this.finals, this.interim].join(' ').replace(/\s+/g, ' ').trim();
+    this.take = this.deps.voice.takeTurn();
+    this.clear();
+    // A switch with nothing heard leaves no draft behind.
+    if (draft.reason === 'switch' && !text && !unverified) {
+      this.draft = null;
+      this.take = undefined;
+    } else {
+      this.draft = {
+        ...draft,
+        state: unverified ? 'failed' : text ? 'ready' : 'empty',
+        text,
+        ...(Buffer.byteLength(text) > MAX_TURN_TEXT_BYTES ? { tooLong: true } : {}),
+      };
+    }
+    this.publish();
+  }
+
+  /** Forget what was heard and clear the session's own open turn, which restarts its transcription. */
+  private clear(): void {
+    this.resetHeard();
+    this.minStream = this.deps.voice.clearTurn();
+    this.clearedAt = Date.now();
+  }
+
+  private resetHeard(): void {
+    this.finals = [];
+    this.interim = '';
+  }
+
+  private publish(): void {
+    if (this.closed) return;
+    this.deps.voice.publishReview({ seq: ++this.seq, mode: this.mode, draft: this.draft });
+  }
+}
+
+/** A review RPC's payload, or null when it is not one. */
+export function readReviewRequest(payload: string): ReviewRequest | null {
+  try {
+    const req = JSON.parse(payload) as Partial<ReviewRequest> | null;
+    if (!req || typeof req.gen !== 'number') return null;
+    return {
+      gen: req.gen,
+      ...(typeof req.draft === 'number' ? { draft: req.draft } : {}),
+      ...(req.mode === 'auto' || req.mode === 'review' ? { mode: req.mode } : {}),
+      ...(typeof req.afterTurn === 'number' ? { afterTurn: req.afterTurn } : {}),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** The fields every job carries whatever its version, enough to answer a mismatched one. */
@@ -1035,10 +1418,23 @@ const loadFallbackVad = (): Promise<VAD> =>
     minSpeechDuration: FALLBACK_MIN_SPEECH_MS,
   });
 
+const FLUSH_SILENCE = new AudioFrame(
+  new Int16Array(samplesOf(FLUSH_CHUNK_MS)),
+  INPUT_SAMPLE_RATE,
+  1,
+  samplesOf(FLUSH_CHUNK_MS),
+);
+
 class CallAgent extends voice.Agent {
+  /** The session's transcription streams so far; it opens a new one on every restart. */
+  streams = 0;
+  private feed?: TransformStreamDefaultController<AudioFrame>;
+  private flushTimer?: ReturnType<typeof setInterval>;
+
   constructor(
     private readonly onTurn: (text: string) => void,
     private readonly tap?: (frame: AudioFrame) => void,
+    private readonly onTranscript?: (text: string, final: boolean, stream: number) => void,
   ) {
     super({ instructions: '' });
   }
@@ -1048,23 +1444,64 @@ class CallAgent extends voice.Agent {
     this.onTurn(message.textContent?.trim() ?? '');
   }
 
-  /** The audio the transcription gets (silence while the agent speaks), copied for recordings. */
+  /**
+   * Silence straight into the transcription, past the session's input: with the caller's audio
+   * off, it is what lets the streaming model finalize the last words it heard.
+   */
+  setFlushing(on: boolean): void {
+    clearInterval(this.flushTimer);
+    this.flushTimer = undefined;
+    if (!on) return;
+    const feed = () => {
+      try {
+        this.feed?.enqueue(FLUSH_SILENCE);
+      } catch {
+        // The stream closed; its successor gets the next chunk.
+      }
+    };
+    feed();
+    this.flushTimer = setInterval(feed, FLUSH_CHUNK_MS);
+    this.flushTimer.unref?.();
+  }
+
+  /**
+   * The audio the transcription gets (silence while the agent speaks), copied for recordings, with
+   * a way in for the flush's silence; and what it transcribes, numbered by stream.
+   */
   override async sttNode(
     audio: ReadableStream<AudioFrame> | AsyncIterable<AudioFrame>,
     modelSettings: voice.ModelSettings,
   ): Promise<ReadableStream<stt.SpeechEvent | string> | null> {
     const tap = this.tap;
-    if (!tap) return super.sttNode(audio, modelSettings);
+    const stream = ++this.streams;
     const source = audio instanceof ReadableStream ? audio : ReadableStream.from(audio);
-    const copied = source.pipeThrough(
+    const fed = source.pipeThrough(
       new TransformStream<AudioFrame, AudioFrame>({
+        start: (controller) => {
+          this.feed = controller;
+        },
         transform(frame, controller) {
-          tap(frame);
+          tap?.(frame);
           controller.enqueue(frame);
         },
       }),
     );
-    return super.sttNode(copied, modelSettings);
+    const events = await super.sttNode(fed, modelSettings);
+    const heard = this.onTranscript;
+    if (!events || !heard) return events;
+    return events.pipeThrough(
+      new TransformStream<stt.SpeechEvent | string, stt.SpeechEvent | string>({
+        transform(ev, controller) {
+          if (
+            typeof ev !== 'string' &&
+            (ev.type === stt.SpeechEventType.FINAL_TRANSCRIPT || ev.type === stt.SpeechEventType.INTERIM_TRANSCRIPT)
+          ) {
+            heard(ev.alternatives?.[0]?.text ?? '', ev.type === stt.SpeechEventType.FINAL_TRANSCRIPT, stream);
+          }
+          controller.enqueue(ev);
+        },
+      }),
+    );
   }
 }
 
@@ -1092,7 +1529,12 @@ export function callSession(
   events: CallVoiceEvents,
   log: WorkerLog,
   publishPending: (value: string) => void = () => undefined,
-): { session: voice.AgentSession; agent: voice.Agent; say(text: string): Promise<boolean> } {
+): {
+  session: voice.AgentSession;
+  agent: voice.Agent;
+  say(text: string): Promise<boolean>;
+  review: Omit<ReviewVoice, 'publishReview'>;
+} {
   const apiKey = settings.geminiKey;
   const countdown = new SendCountdown(publishPending, meta.silenceMs);
   const capture = settings.record ? new TurnCapture() : undefined;
@@ -1229,6 +1671,7 @@ export function callSession(
   let agentSpokeAt = 0;
   let sttFailedAt = 0;
   let ttsFailures = 0;
+  const reviewing = () => events.reviewing?.() ?? false;
   session.on(voice.AgentSessionEventTypes.UserStateChanged, (ev) => {
     const speaking = ev.newState === 'speaking';
     if (speaking) {
@@ -1237,8 +1680,11 @@ export function callSession(
       countdown.clear();
     } else if (ev.oldState === 'speaking') {
       turnSpeechMs += Math.max(0, Date.now() - speakingSince - VAD_SILENCE_MS);
-      // Speech heard under the agent's is not transcribed, so it sends nothing to count down to.
-      if (turnOpen && !agentSpeaking && agentSpokeAt < speakingSince) countdown.stopped(ev.createdAt - VAD_SILENCE_MS);
+      // Speech heard under the agent's is not transcribed, so it sends nothing to count down to;
+      // in review no pause sends anything.
+      if (turnOpen && !agentSpeaking && agentSpokeAt < speakingSince && !reviewing()) {
+        countdown.stopped(ev.createdAt - VAD_SILENCE_MS);
+      }
     }
     capture?.onSpeaking(speaking);
     events.onCallerSpeaking(speaking);
@@ -1247,17 +1693,24 @@ export function callSession(
     if (ev.isFinal && ev.transcript.trim()) heardBy.add(transcription.model);
   });
   session.on(voice.AgentSessionEventTypes.AgentStateChanged, (ev) => {
+    const was = agentSpeaking;
     agentSpeaking = ev.newState === 'speaking';
     if (ev.oldState === 'speaking' || agentSpeaking) agentSpokeAt = Date.now();
     if (agentSpeaking) countdown.clear();
+    if (agentSpeaking !== was) events.onAgentSpeaking?.(agentSpeaking);
   });
   session.on(voice.AgentSessionEventTypes.Error, (ev) => {
     const err = ev.error;
     if (err.recoverable) return;
-    if (err.type === 'stt_error') sttFailedAt = Date.now();
+    if (err.type === 'stt_error') {
+      sttFailedAt = Date.now();
+      events.onSttError?.();
+    }
     if (err.type === 'tts_error') ttsFailures++;
   });
   session.on(voice.AgentSessionEventTypes.UserTranscriptionTimeout, (ev) => {
+    // Review turns end on done, never on a timeout; the review draft says what was heard.
+    if (reviewing()) return;
     // Silero reports no speech length at its end of speech, so the session counts it.
     const spokeMs = turnSpeechMs;
     const turn = take();
@@ -1269,6 +1722,7 @@ export function callSession(
   });
   session.on(voice.AgentSessionEventTypes.Close, (ev) => {
     clearInterval(handBackTimer);
+    agent.setFlushing(false);
     countdown.clear();
     // The session closes neither; their recovery probes would run on.
     void adapter?.close().catch(() => undefined);
@@ -1276,15 +1730,40 @@ export function callSession(
     events.onClosed(`session closed: ${ev.reason}`);
   });
 
+  const agent = new CallAgent(
+    (text) => {
+      const turn = take();
+      if (text) events.onTurn(text, turn);
+    },
+    capture && ((frame) => capture.push(frame)),
+    events.onTranscript?.bind(events),
+  );
   return {
     session,
-    agent: new CallAgent(
-      (text) => {
-        const turn = take();
-        if (text) events.onTurn(text, turn);
+    agent,
+    review: {
+      setManualTurns(manual) {
+        session.updateOptions({ turnHandling: { turnDetection: manual ? 'manual' : 'vad' } });
       },
-      capture && ((frame) => capture.push(frame)),
-    ),
+      setInput(enabled) {
+        session.input.setAudioEnabled(enabled);
+      },
+      setFlushing(on) {
+        agent.setFlushing(on);
+      },
+      clearTurn() {
+        try {
+          session.clearUserTurn();
+        } catch (err) {
+          // Nothing restarts: the stream that runs now stays the current one.
+          log.warn('voice worker: could not clear the open turn', { err });
+          return agent.streams;
+        }
+        return agent.streams + 1;
+      },
+      flushMinMs: () => (fallbackServing() ? FLUSH_FALLBACK_MIN_MS : FLUSH_MIN_MS),
+      takeTurn: take,
+    },
     async say(text) {
       // Replies are spoken one at a time, so a failure counted meanwhile is this one's.
       const failures = ttsFailures;
@@ -1305,7 +1784,7 @@ async function sessionVoice(
   const userData = ctx.proc.userData as WorkerUserData;
   userData.vad ??= await loadVad();
   if (meta.sttFallbackModel) userData.fallbackVad ??= await loadFallbackVad();
-  const { session, agent, say } = callSession(
+  const { session, agent, say, review } = callSession(
     meta,
     settings,
     { vad: userData.vad, fallbackVad: userData.fallbackVad },
@@ -1313,6 +1792,12 @@ async function sessionVoice(
     log,
     (value) => void setAttribute(ctx, CALL_PENDING_ATTRIBUTE, value).catch(() => undefined),
   );
+  /** One JSON message on a text stream topic; a failure is logged, never thrown. */
+  const sendJson = (topic: string, value: unknown, what: string): void => {
+    void ctx.room.localParticipant
+      ?.sendText(JSON.stringify(value), { topic })
+      .catch((err: unknown) => log.warn(`voice worker: could not publish ${what}`, { err }));
+  };
   await session.start({
     agent,
     room: ctx.room,
@@ -1324,20 +1809,32 @@ async function sessionVoice(
     },
     record: false,
   });
+  // The caller's token may publish data (review mode's RPCs). agents-js also serves remote control
+  // of the session (input on/off, typed turns, forced interrupts) to the linked participant on this
+  // topic; nothing here uses it, so the caller must not reach it.
+  try {
+    ctx.room.unregisterByteStreamHandler(SESSION_CONTROL_TOPIC);
+  } catch (err) {
+    log.warn('voice worker: could not close the session control topic', { err });
+  }
   return {
     say,
     setThinking(thinking) {
       void setAttribute(ctx, CALL_THINKING_ATTRIBUTE, thinking ? '1' : '').catch(() => undefined);
     },
-    publishTurn(status) {
-      void ctx.room.localParticipant
-        ?.sendText(JSON.stringify(status), { topic: CALL_TURN_TOPIC })
-        .catch((err: unknown) => log.warn('voice worker: could not publish a turn status', { err }));
-    },
-    publishReply(info) {
-      void ctx.room.localParticipant
-        ?.sendText(JSON.stringify(info), { topic: CALL_REPLY_TOPIC })
-        .catch((err: unknown) => log.warn('voice worker: could not publish a reply label', { err }));
+    publishTurn: (status) => sendJson(CALL_TURN_TOPIC, status, 'a turn status'),
+    publishReply: (info) => sendJson(CALL_REPLY_TOPIC, info, 'a reply label'),
+    review: {
+      ...review,
+      publishReview: (state) => sendJson(CALL_REVIEW_TOPIC, state, 'the review state'),
+      serve(handle) {
+        const local = ctx.room.localParticipant;
+        if (!local) return;
+        for (const op of Object.keys(REVIEW_RPC) as ReviewOp[]) {
+          local.registerRpcMethod(REVIEW_RPC[op], (data) => handle(op, data.payload, data.callerIdentity));
+        }
+        void setAttribute(ctx, CALL_REVIEW_ATTRIBUTE, '1').catch(() => undefined);
+      },
     },
     async close() {
       await session.close().catch(() => undefined);
@@ -1453,6 +1950,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       say: (text) => callVoice?.say(text) ?? Promise.resolve(false),
       setThinking: (thinking) => callVoice?.setThinking(thinking),
       announce: (info) => callVoice?.publishReply(info),
+      beforeSpeak: () => review?.beforeAgentSpeaks(),
       log: callLog,
     },
     {
@@ -1461,11 +1959,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       maxSpokenChars: maxSpokenChars(deps.env.VOICE_MAX_SPOKEN_CHARS),
     },
   );
+  let review: ReviewControl | undefined;
   /** `restart`: the worker is shutting down, so the caller's page says the service restarted. */
   const end = async (reason: string, tellHost: boolean, restart = false) => {
     if (ending) return;
     ending = true;
     turnTaking.close();
+    review?.close();
     // The host link stays open until the host answered: closed first, it ends the call on its own
     // and answers this at once, before the room carries why the call ended.
     await Promise.all([
@@ -1483,6 +1983,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   // Every caller turn gets a number. The page hears what became of it; a recording, when they are
   // on, is written once the turn is settled, off the path to the host.
   let turns = 0;
+  /** The newest turn handed to the host. */
+  let lastPosted = 0;
   /** The host's utterance id of each sent turn to its number here, to tell the page what a reply answers. */
   const turnsByHostId = new Map<string, number>();
   /** Turns the host did not confirm, by turn key, until its `turn-stored` says the agent has one after all. */
@@ -1512,6 +2014,28 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       callLog.warn('voice worker: could not save a turn recording', { err, turn: index }),
     );
   };
+  /** A finished turn to the host: an auto turn, or a review draft (`draft`) the caller sent. */
+  const sendTurn = (text: string, take: TurnTake, draft?: number): number => {
+    const turn = ++turns;
+    lastPosted = turn;
+    // The page's "sent" cue: the turn closed, before the host has answered.
+    if (!ending) publish(draft === undefined ? { turn, status: 'sending' } : { turn, status: 'sending', text, draft });
+    turnTaking.onTurn(text, (host) => {
+      if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
+      if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {
+        unconfirmed.set(host.turnKey, { turn, text });
+        for (const key of unconfirmed.keys()) {
+          if (unconfirmed.size <= MAX_UNCONFIRMED_TURNS) break;
+          unconfirmed.delete(key);
+        }
+      }
+      publish(
+        host.accepted ? { turn, status: 'sent', text } : { turn, status: 'lost', reason: hostLossReason(host), text },
+      );
+      saveTurn(turn, take, text, { host });
+    });
+    return turn;
+  };
   try {
     callVoice = await deps.createVoice(
       ctx,
@@ -1519,43 +2043,57 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       { geminiKey, record },
       {
         onTurn: (text, take) => {
-          const turn = ++turns;
-          // The page's "sent" cue: the turn closed, before the host has answered.
-          if (!ending) publish({ turn, status: 'sending' });
-          turnTaking.onTurn(text, (host) => {
-            if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
-            if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {
-              unconfirmed.set(host.turnKey, { turn, text });
-              for (const key of unconfirmed.keys()) {
-                if (unconfirmed.size <= MAX_UNCONFIRMED_TURNS) break;
-                unconfirmed.delete(key);
-              }
-            }
-            publish(
-              host.accepted
-                ? { turn, status: 'sent', text }
-                : { turn, status: 'lost', reason: hostLossReason(host), text },
-            );
-            saveTurn(turn, take, text, { host });
-          });
+          // An auto commit that lost the race to a switch: its words are already the review draft.
+          if (review?.reviewing) return;
+          review?.onAutoTurnClosed();
+          sendTurn(text, take);
         },
-        onCallerSpeaking: (speaking) => turnTaking.onCallerSpeaking(speaking),
+        onCallerSpeaking: (speaking) => {
+          review?.onCallerSpeaking(speaking);
+          if (!review?.reviewing) turnTaking.onCallerSpeaking(speaking);
+        },
         onTurnLost: (reason, fields, take) => {
-          if (ending) return;
+          if (ending || review?.reviewing) return;
+          review?.onAutoTurnClosed();
           const turn = ++turns;
           turnTaking.onTurnLost(reason, fields);
           publish({ turn, status: 'lost', reason });
           saveTurn(turn, take, '', { reason });
         },
         onTurnDropped: (take) => {
-          if (!ending) saveTurn(++turns, take, '', { reason: 'noise' });
+          if (ending || review?.reviewing) return;
+          review?.onAutoTurnClosed();
+          saveTurn(++turns, take, '', { reason: 'noise' });
         },
         onClosed: (reason) => void end(reason, true),
+        reviewing: () => review?.reviewing ?? false,
+        onTranscript: (text, final, stream) => review?.onTranscript(text, final, stream),
+        onSttError: () => review?.onSttError(),
+        onAgentSpeaking: (speaking) => review?.onAgentSpeaking(speaking),
       },
     );
   } catch (err) {
     turnTaking.close();
     return abandon('could not set up the call audio', { err });
+  }
+  const reviewVoice = callVoice.review;
+  // A call that ended while its audio was set up gets no review controls.
+  if (reviewVoice && !ending) {
+    const control = new ReviewControl({
+      voice: reviewVoice,
+      post: (text, draft, take) => sendTurn(text, take, draft),
+      lastPosted: () => lastPosted,
+      setCaptureOpen: (open) => turnTaking.setCaptureOpen(open),
+      resetCaller: () => turnTaking.resetCaller(),
+      log: callLog,
+    });
+    review = control;
+    reviewVoice.serve(async (op, payload, callerIdentity) => {
+      const req = callerIdentity === meta.callerIdentity ? readReviewRequest(payload) : null;
+      // Only the caller drives the call; anything else is not an operation at all.
+      if (!req) throw new Error('not a review request from the caller');
+      return JSON.stringify(await control.handle(op, req));
+    });
   }
   // Defense in depth: the host ends the call on time; this stops a worker that lost the host.
   const deadline = setTimeout(

@@ -23,6 +23,7 @@
   "src/lib/config.ts",
   "src/lib/demo-call.ts",
   "src/lib/livekit-call.ts",
+  "src/lib/review.ts",
   "src/lib/utils.ts",
   "src/lib/voice-call.ts",
   "src/lib/voice-endpoint.ts",
