@@ -38,6 +38,7 @@ import {
   interactionText,
   languageOf,
   MAX_IDLE_WAIT_MS,
+  SendCountdown,
   maxSpokenChars,
   parseJobMetadata,
   PacedTTS,
@@ -376,6 +377,29 @@ describe('Walkie', () => {
     expect(said).toEqual([FAILURE_LINES.reply.en, 'Reply three.']);
   });
 
+  it('describes each line before it is spoken: the turn it answers, unprompted, or its own notice', async () => {
+    vi.useFakeTimers();
+    const announced: unknown[] = [];
+    const { deps, said } = fakeWalkieDeps({
+      announce: (info) => announced.push({ ...info, before: said.length }),
+    });
+    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'en' });
+    walkie.onReply('One.', 3);
+    walkie.onReply('Two.', 3);
+    walkie.onReply('Three.', null);
+    await walkie.idle();
+    walkie.onTurnLost('stt');
+    await walkie.idle();
+    expect(said).toEqual(['One.', 'Two.', 'Three.', FAILURE_LINES.turn.en]);
+    expect(announced).toEqual([
+      // Queued together, so each but the last knows another line follows it.
+      { reply: 1, turn: 3, part: 1, more: true, before: 0 },
+      { reply: 2, turn: 3, part: 2, more: true, before: 1 },
+      { reply: 3, unprompted: true, before: 2 },
+      { reply: 4, notice: true, before: 3 },
+    ]);
+  });
+
   it('stays silent once closed', async () => {
     const { deps, said, sent } = fakeWalkieDeps();
     const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
@@ -494,6 +518,7 @@ function fakeVoice() {
     say: vi.fn(async (_text: string) => true),
     setThinking: vi.fn(),
     publishTurn: vi.fn(),
+    publishReply: vi.fn(),
     close: vi.fn(async () => undefined),
   } satisfies CallVoice;
   const createVoice = vi.fn(
@@ -560,6 +585,8 @@ describe('runCall', () => {
 
     host.emit({ type: 'reply', text: 'Booked for eight.' });
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked for eight.'));
+    // No turn from the host: a message nobody asked for, and the page is told so first.
+    expect(v.voice.publishReply).toHaveBeenCalledWith({ reply: 1, unprompted: true });
 
     host.emit({ type: 'end', reason: 'hangup' });
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
@@ -567,6 +594,30 @@ describe('runCall', () => {
     expect(job.deleteRoom).toHaveBeenCalled();
     // The host ended it, so the worker does not report back.
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+  });
+
+  it('tells the page which of its turns a reply answers, by the host id each sent turn got', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    // A noise is turn 1 here (it is recorded), so the host's first turn is this worker's second.
+    v.events.onTurnDropped({ sttModel: 'gemini-3.5-transcribe-live' });
+    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 2, status: 'sent', text: 'Book a table' }),
+    );
+    host.emit({ type: 'reply', text: 'Checking.', turn: '1' });
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    host.emit({ type: 'reply', text: 'Answer to a turn this worker never sent.', turn: '9' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledTimes(3));
+    expect(v.voice.publishReply.mock.calls.map(([info]) => info)).toEqual([
+      expect.objectContaining({ reply: 1, turn: 2, part: 1 }),
+      expect.objectContaining({ reply: 2, turn: 2, part: 2 }),
+      // Not known here, so not labelled at all: never a guessed link.
+      { reply: 3 },
+    ]);
+    host.endStream();
   });
 
   it('speaks the lost-turn line when the host refuses a turn', async () => {
@@ -1046,5 +1097,26 @@ describe('speech and transcription adapters', () => {
       clearInterval(feed);
       await adapter.close();
     }
+  });
+});
+
+describe('SendCountdown', () => {
+  it('says how far into the closing silence a stopped caller is, one wait at a time, and clears once', () => {
+    let now = 10_000;
+    const published: string[] = [];
+    const countdown = new SendCountdown(
+      (value) => published.push(value),
+      2500,
+      () => now,
+    );
+    countdown.clear();
+    expect(published).toEqual([]);
+    countdown.stopped(now - 600);
+    now += 4000;
+    countdown.clear();
+    countdown.clear();
+    // Reported late, it is never past the whole silence.
+    countdown.stopped(now - 9000);
+    expect(published).toEqual(['1:600:2500', '', '2:2500:2500']);
   });
 });

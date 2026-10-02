@@ -60,6 +60,7 @@ import {
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
   type WalkieRoomMetadata,
+  type WalkieEndReason,
 } from './voice-livekit-protocol.js';
 import {
   getMessagingGroup,
@@ -69,6 +70,7 @@ import {
 import { getVoiceLine, getVoiceLineOwners } from '../db/voice-lines.js';
 import { registerPostDeliveryHook } from '../delivery.js';
 import { log } from '../log.js';
+import { platformMessageId } from '../platform-id.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { registerTypingObserver } from '../modules/typing/index.js';
 import type { MessagingGroup } from '../types.js';
@@ -88,6 +90,8 @@ const ROUTE_TIMEOUT_MS = 8_000;
 const MAX_TURNS_IN_FLIGHT = 3;
 /** Outcomes a call keeps by the worker's turn key, so a retried turn is answered, not routed again. */
 const MAX_REMEMBERED_TURNS = 32;
+/** How long the room's end reason may hold up the hangup; past it the page shows a plain "ended". */
+const END_NOTICE_TIMEOUT_MS = 2_000;
 
 /** How the agent learns a message was spoken on a call and how its reply will be heard. */
 export const WALKIE_REPLY_NOTE =
@@ -111,6 +115,41 @@ export const LIVEKIT_ID_PREFIX = 'livekit:';
 
 function liveKitUtteranceMessageId(callId: string, utteranceId: string): string {
   return `${LIVEKIT_ID_PREFIX}${callId}:${utteranceId}`;
+}
+
+/** The call turn a delivered chat message answers, from its in-reply-to id (agent-scoped, as delivery hands it over). */
+export function liveKitTurnOf(
+  inReplyTo: string | null | undefined,
+  agentGroupId: string,
+): { callId: string; utteranceId: string } | null {
+  if (!inReplyTo) return null;
+  const id = platformMessageId(inReplyTo, agentGroupId);
+  if (!id.startsWith(LIVEKIT_ID_PREFIX)) return null;
+  const [callId, utteranceId, ...rest] = id.slice(LIVEKIT_ID_PREFIX.length).split(':');
+  return callId && utteranceId && rest.length === 0 ? { callId, utteranceId } : null;
+}
+
+/** Why a call ended, as the page names it; null for ends no page is there to hear about. */
+export function walkieEndReason(reason: string): WalkieEndReason | null {
+  switch (reason) {
+    case 'hangup':
+      return 'hangup';
+    case 'duration limit':
+      return 'limit_duration';
+    case 'daily minute budget':
+      return 'limit_daily';
+    case 'replaced by a new call':
+      return 'newer_call';
+    case 'caller access revoked or line changed':
+      return 'revoked';
+    case 'teardown':
+      return 'shutdown';
+    case 'worker link closed':
+    case 'worker never opened its event stream':
+    case 'worker ended':
+      return 'worker_gone';
+  }
+  return reason.startsWith('worker: ') ? 'worker_gone' : null;
 }
 
 /** The slices of the LiveKit server API the host uses; injectable for tests. */
@@ -253,6 +292,8 @@ interface LiveKitCall {
    */
   previousChat: { chat: CallChat; active: boolean } | null;
   cleanup?: Promise<void>;
+  /** Settles once the room carries why the call ended (or that failed) and the worker was told. */
+  announced?: Promise<void>;
 }
 
 /** The host's answer to one utterance POST. */
@@ -283,8 +324,13 @@ export interface LiveKitVoice {
     text: string,
   ): Promise<{ id: string | undefined } | null>;
   setTyping(platformId: string): Promise<void>;
-  /** An agent message reached a chat: speak it on the live call that talks there. */
-  chatMessage(chat: ChatAddress, agentGroupId: string, text: string): void;
+  /** An agent message reached a chat: speak it on the live call that talks there. `replyTo`: the call turn it answers. */
+  chatMessage(
+    chat: ChatAddress,
+    agentGroupId: string,
+    text: string,
+    replyTo?: { callId: string; utteranceId: string } | null,
+  ): void;
   /** The agent is working in a chat: tell its live call that talks there. */
   chatTyping(chat: ChatAddress, agentGroupId: string): void;
   /** The running call on a line, for the shared daily budget. */
@@ -361,6 +407,7 @@ export function liveKitChatDelivered(
     channelType: string | null;
     platformId: string | null;
     threadId: string | null;
+    inReplyTo?: string | null;
   },
   agentGroupId: string,
 ): void {
@@ -368,7 +415,8 @@ export function liveKitChatDelivered(
   const text = spokenText(msg);
   if (!text) return;
   const chat = { channelType: msg.channelType, platformId: msg.platformId, threadId: msg.threadId ?? null };
-  for (const engine of engines) engine.chatMessage(chat, agentGroupId, text);
+  const replyTo = liveKitTurnOf(msg.inReplyTo, agentGroupId);
+  for (const engine of engines) engine.chatMessage(chat, agentGroupId, text, replyTo);
 }
 
 /** Typing tap: the agent works in a chat; its live call talking there hears it is thinking. */
@@ -599,11 +647,32 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     });
   };
 
-  /** Teardown awaits every delete in flight, wherever it started. */
-  const trackedDeleteRoom = (call: LiveKitCall): Promise<void> => {
-    const cleanup = deleteRoom(call).finally(() => cleanups.delete(cleanup));
+  /** Teardown awaits every delete in flight, wherever it started. `after` runs first. */
+  const trackedDeleteRoom = (call: LiveKitCall, after: Promise<void> = Promise.resolve()): Promise<void> => {
+    const cleanup = after.then(() => deleteRoom(call)).finally(() => cleanups.delete(cleanup));
     cleanups.add(cleanup);
     return cleanup;
+  };
+
+  /** Room metadata the page reads when it is disconnected, so it can say why; best effort and bounded. */
+  const announceEnd = async (call: LiveKitCall, code: WalkieEndReason): Promise<void> => {
+    // The whole metadata is replaced, so the chat label the page shows goes along.
+    const metadata: WalkieRoomMetadata = { chat: call.chat ? chatLabel(call.chat.group) : null, end: code };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        api.updateRoomMetadata(call.roomName, JSON.stringify(metadata)),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('timed out')), END_NOTICE_TIMEOUT_MS);
+          timer.unref();
+        }),
+      ]);
+    } catch (err) {
+      if (!isNotFound(err))
+        log.info('livekit-voice: could not set the end reason on the room', { callId: call.callId, err });
+    } finally {
+      clearTimeout(timer);
+    }
   };
 
   const endCall = (call: LiveKitCall, reason: string): void => {
@@ -618,11 +687,16 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (calls.get(call.platformId) === call) calls.delete(call.platformId);
     const stream = call.stream;
     call.stream = undefined;
-    if (stream && !stream.writableEnded) {
-      stream.write(`${JSON.stringify({ type: 'end', reason } satisfies LiveKitHostEvent)}\n`);
-      stream.end();
-    }
-    call.cleanup = trackedDeleteRoom(call);
+    const code = walkieEndReason(reason);
+    // The room gets the reason before the worker hears of the end: the worker leaves the room as
+    // soon as it does, and the page would see it go before it could read why.
+    call.announced = (code ? announceEnd(call, code) : Promise.resolve()).then(() => {
+      if (stream && !stream.writableEnded) {
+        stream.write(`${JSON.stringify({ type: 'end', reason } satisfies LiveKitHostEvent)}\n`);
+        stream.end();
+      }
+    });
+    call.cleanup = trackedDeleteRoom(call, call.announced);
     log.info('livekit-voice: call ended', { platformId: call.platformId, callId: call.callId, reason });
   };
 
@@ -760,7 +834,26 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       ttsModel: walkie.ttsModel,
       ttsFallbackModel: walkie.ttsFallbackModel,
     });
-    reply(res, 200, JSON.stringify({ url: config.url, token, callId, agent: line.agent.name, chat }), JSON_HEADERS);
+    // What the page needs for its hints: the silence that sends a turn, and the cap that ends the
+    // call (from join; onJoined recomputes it, never later than this).
+    const limit = {
+      ms: Math.min(host.maxCallDurationMs, remainingMs),
+      kind: remainingMs < host.maxCallDurationMs ? 'daily' : 'duration',
+    };
+    reply(
+      res,
+      200,
+      JSON.stringify({
+        url: config.url,
+        token,
+        callId,
+        agent: line.agent.name,
+        chat,
+        silenceMs: walkie.silenceMs,
+        limit,
+      }),
+      JSON_HEADERS,
+    );
   };
 
   /** The worker saw the caller join: start the clock and the duration / budget cap. */
@@ -946,6 +1039,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (route === 'livekit/agent/utterance') return onUtterance(res, call, body);
     if (route === 'livekit/agent/ended') {
       endCall(call, typeof body.reason === 'string' ? `worker: ${body.reason.slice(0, 80)}` : 'worker ended');
+      // The worker deletes the room once answered; the page reads the reason off it first.
+      await call.announced;
       return reply(res, 204, '');
     }
     reply(res, 404, 'Not found');
@@ -1012,7 +1107,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       if (!call || call.state !== 'live') return target ? { id: undefined } : null;
       if (!text.trim()) throw new Error('livekit-voice: reply contains no speakable text');
       if (!(await checkAccess(call))) throw new Error('livekit-voice: caller access has been revoked');
-      push(call, { type: 'reply', text });
+      push(call, target ? { type: 'reply', text, turn: target.utteranceId } : { type: 'reply', text });
       return { id: target ? inReplyTo : `${LIVEKIT_ID_PREFIX}${call.callId}:out-${++call.sent}` };
     },
 
@@ -1021,10 +1116,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       if (call?.state === 'live' && !call.ended) push(call, { type: 'thinking' });
     },
 
-    chatMessage(chat, agentGroupId, text) {
+    chatMessage(chat, agentGroupId, text, replyTo) {
       for (const call of calls.values()) {
         if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
-        if (callChatAt(call, chat)) push(call, { type: 'reply', text });
+        const turn = replyTo?.callId === call.callId ? replyTo.utteranceId : undefined;
+        if (callChatAt(call, chat)) push(call, turn ? { type: 'reply', text, turn } : { type: 'reply', text });
       }
     },
 

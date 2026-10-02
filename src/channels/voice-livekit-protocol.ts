@@ -67,6 +67,8 @@ export const WALKIE_TURN_TOPIC = 'nanoclaw.walkie.turn';
  */
 export interface WalkieRoomMetadata {
   chat: string | null;
+  /** Set right before the host deletes the room: why the call ended, for the page to say. */
+  end?: WalkieEndReason;
 }
 
 /**
@@ -83,12 +85,48 @@ export interface WalkieTurnStatus {
 }
 
 /**
+ * The worker's participant attribute while a finished stretch of caller speech waits out the
+ * closing silence before it is sent: `"<n>:<elapsedMs>:<silenceMs>"`, where n tells one wait from
+ * the next and elapsedMs is how much of the silence had passed when it was set. "" otherwise:
+ * speech resumed, the turn went out or was dropped, or the agent speaks.
+ */
+export const WALKIE_PENDING_ATTRIBUTE = 'nanoclaw.walkie.pending';
+/** Text stream topic the worker sends one JSON `WalkieReplyInfo` on right before each line it speaks. */
+export const WALKIE_REPLY_TOPIC = 'nanoclaw.walkie.reply';
+
+/**
+ * What the next spoken line is: an agent message answering the caller's turn `turn` (the
+ * `WalkieTurnStatus` number), one answering no turn of this call (`unprompted`), or the worker's
+ * own notice (a lost turn, an unspeakable reply). `part` counts the messages answering that turn
+ * so far; `more` is set when another line is already queued behind this one.
+ */
+export interface WalkieReplyInfo {
+  reply: number;
+  turn?: number;
+  unprompted?: boolean;
+  notice?: boolean;
+  part?: number;
+  more?: boolean;
+}
+
+/** Why the host ended a call, in the room metadata (`WalkieRoomMetadata.end`) right before it deletes the room. */
+export type WalkieEndReason =
+  | 'hangup'
+  | 'limit_duration'
+  | 'limit_daily'
+  | 'newer_call'
+  | 'revoked'
+  | 'shutdown'
+  | 'worker_gone';
+
+/**
  * One line of the host-to-worker event stream: a complete agent message to
- * speak, the agent still working (from the host's typing refresh), the end of
- * the call, or a keepalive.
+ * speak (`turn`: the host's utterance id of the caller turn it answers, when it
+ * answers one of this call), the agent still working (from the host's typing
+ * refresh), the end of the call, or a keepalive.
  */
 export type LiveKitHostEvent =
-  | { type: 'reply'; text: string }
+  | { type: 'reply'; text: string; turn?: string }
   | { type: 'thinking' }
   | { type: 'end'; reason: string }
   | { type: 'ping' };

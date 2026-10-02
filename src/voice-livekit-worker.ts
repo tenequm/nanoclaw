@@ -65,11 +65,14 @@ import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   liveKitHostUrl,
+  WALKIE_PENDING_ATTRIBUTE,
+  WALKIE_REPLY_TOPIC,
   WALKIE_THINKING_ATTRIBUTE,
   WALKIE_TURN_TOPIC,
   WALKIE_UPDATING_ATTRIBUTE,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
+  type WalkieReplyInfo,
   type WalkieTurnStatus,
 } from './channels/voice-livekit-protocol.js';
 import { DATA_DIR } from './config.js';
@@ -626,6 +629,35 @@ export class TurnCapture {
   }
 }
 
+/**
+ * The page's send cue: while a stretch of caller speech waits out the closing silence that sends
+ * it, the `nanoclaw.walkie.pending` attribute says how far into that silence it is; it clears
+ * when the caller speaks again, the turn goes out or is dropped, or the agent speaks.
+ */
+export class SendCountdown {
+  private waits = 0;
+  private shown = false;
+
+  constructor(
+    private readonly publish: (value: string) => void,
+    private readonly silenceMs: number,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  /** The caller's speech ended at `speechEndedAt`; the turn goes out `silenceMs` after that. */
+  stopped(speechEndedAt: number): void {
+    const elapsed = Math.round(Math.max(0, Math.min(this.silenceMs, this.now() - speechEndedAt)));
+    this.shown = true;
+    this.publish(`${++this.waits}:${elapsed}:${this.silenceMs}`);
+  }
+
+  clear(): void {
+    if (!this.shown) return;
+    this.shown = false;
+    this.publish('');
+  }
+}
+
 function pcmToWav(pcm: Int16Array, sampleRate: number): Buffer {
   const data = Buffer.alloc(pcm.length * 2);
   for (let i = 0; i < pcm.length; i++) data.writeInt16LE(pcm[i], i * 2);
@@ -735,6 +767,8 @@ export interface CallVoice {
   setThinking(thinking: boolean): void;
   /** One message on the `nanoclaw.walkie.turn` topic. */
   publishTurn(status: WalkieTurnStatus): void;
+  /** One message on the `nanoclaw.walkie.reply` topic, sent right before the line it describes is spoken. */
+  publishReply(info: WalkieReplyInfo): void;
   close(): Promise<void>;
 }
 
@@ -768,6 +802,8 @@ export interface WalkieDeps {
   send(text: string): Promise<SendResult>;
   say(text: string): Promise<boolean>;
   setThinking(thinking: boolean): void;
+  /** What the line about to be spoken is, for the page's caption labels. */
+  announce?(info: WalkieReplyInfo): void;
   log: Pick<Console, 'info' | 'warn'>;
   now?: () => number;
 }
@@ -789,6 +825,10 @@ export class Walkie {
   private statusTimer?: ReturnType<typeof setTimeout>;
   private feedbackQueued = false;
   private closed = false;
+  /** Spoken lines queued or playing, so a line can say another one follows it. */
+  private queued = 0;
+  private replies = 0;
+  private readonly partsByTurn = new Map<number, number>();
 
   constructor(
     private readonly deps: WalkieDeps,
@@ -821,8 +861,11 @@ export class Walkie {
     this.feedback('turn');
   }
 
-  /** A complete agent message from the host. */
-  onReply(text: string): void {
+  /**
+   * A complete agent message from the host. `turn` is the caller turn it answers, null when it
+   * answers none of this call's turns, undefined when that is not known.
+   */
+  onReply(text: string, turn?: number | null): void {
     if (this.closed) return;
     this.thinkingUntil = 0;
     this.refresh();
@@ -835,6 +878,13 @@ export class Walkie {
     this.enqueue(async () => {
       // Cut when spoken, so the closing line is in the language of the caller's latest turn.
       const spoken = capSpokenText(full, max, this.options.language);
+      if (typeof turn === 'number') {
+        const part = (this.partsByTurn.get(turn) ?? 0) + 1;
+        this.partsByTurn.set(turn, part);
+        this.announce({ turn, part });
+      } else {
+        this.announce(turn === null ? { unprompted: true } : {});
+      }
       if (!(await this.deps.say(spoken)) && !this.closed) {
         this.deps.log.warn('walkie: a reply could not be synthesized');
         this.feedback('reply');
@@ -882,17 +932,24 @@ export class Walkie {
     this.feedbackQueued = true;
     this.enqueue(async () => {
       this.feedbackQueued = false;
+      this.announce({ notice: true });
       await this.deps.say(FAILURE_LINES[kind][this.options.language]);
     });
   }
 
+  private announce(info: Omit<WalkieReplyInfo, 'reply' | 'more'>): void {
+    this.deps.announce?.({ reply: ++this.replies, ...info, ...(this.queued > 1 ? { more: true } : {}) });
+  }
+
   private enqueue(job: () => Promise<void>): void {
+    this.queued++;
     this.speech = this.speech
       .then(async () => {
         await this.callerIdle();
         if (!this.closed) await job();
       })
-      .catch((err: unknown) => this.deps.log.warn('walkie: speaking failed', { err }));
+      .catch((err: unknown) => this.deps.log.warn('walkie: speaking failed', { err }))
+      .finally(() => this.queued--);
   }
 
   /** Resolves when the caller is neither talking nor about to have a turn committed, or after a cap. */
@@ -1088,8 +1145,10 @@ export function walkieSession(
   vads: { vad: VAD; fallbackVad?: VAD },
   events: CallVoiceEvents,
   log: WorkerLog,
+  publishPending: (value: string) => void = () => undefined,
 ): { session: voice.AgentSession; agent: voice.Agent; say(text: string): Promise<boolean> } {
   const apiKey = settings.geminiKey;
+  const countdown = new SendCountdown(publishPending, meta.silenceMs);
   const capture = settings.record ? new TurnCapture() : undefined;
   // The host already trimmed, deduplicated and capped it.
   const vocabulary = meta.vocabulary ?? [];
@@ -1163,6 +1222,7 @@ export function walkieSession(
     turnOpen = false;
     turnSpeechMs = 0;
     const turn = { audio: capture?.take(), sttModel: models.length > 0 ? models.join('+') : transcription.model };
+    countdown.clear();
     handBack();
     return turn;
   };
@@ -1231,8 +1291,11 @@ export function walkieSession(
     if (speaking) {
       turnOpen = true;
       speakingSince = Date.now();
+      countdown.clear();
     } else if (ev.oldState === 'speaking') {
       turnSpeechMs += Math.max(0, Date.now() - speakingSince - VAD_SILENCE_MS);
+      // Speech heard under the agent's is not transcribed, so it sends nothing to count down to.
+      if (turnOpen && !agentSpeaking && agentSpokeAt < speakingSince) countdown.stopped(ev.createdAt - VAD_SILENCE_MS);
     }
     capture?.onSpeaking(speaking);
     events.onCallerSpeaking(speaking);
@@ -1243,6 +1306,7 @@ export function walkieSession(
   session.on(voice.AgentSessionEventTypes.AgentStateChanged, (ev) => {
     agentSpeaking = ev.newState === 'speaking';
     if (ev.oldState === 'speaking' || agentSpeaking) agentSpokeAt = Date.now();
+    if (agentSpeaking) countdown.clear();
   });
   session.on(voice.AgentSessionEventTypes.Error, (ev) => {
     const err = ev.error;
@@ -1303,6 +1367,7 @@ async function sessionVoice(
     { vad: userData.vad, fallbackVad: userData.fallbackVad },
     events,
     log,
+    (value) => void setAttribute(ctx, WALKIE_PENDING_ATTRIBUTE, value).catch(() => undefined),
   );
   await session.start({
     agent,
@@ -1324,6 +1389,11 @@ async function sessionVoice(
       void ctx.room.localParticipant
         ?.sendText(JSON.stringify(status), { topic: WALKIE_TURN_TOPIC })
         .catch((err: unknown) => log.warn('voice worker: could not publish a turn status', { err }));
+    },
+    publishReply(info) {
+      void ctx.room.localParticipant
+        ?.sendText(JSON.stringify(info), { topic: WALKIE_REPLY_TOPIC })
+        .catch((err: unknown) => log.warn('voice worker: could not publish a reply label', { err }));
     },
     async close() {
       await session.close().catch(() => undefined);
@@ -1431,6 +1501,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       },
       say: (text) => callVoice?.say(text) ?? Promise.resolve(false),
       setThinking: (thinking) => callVoice?.setThinking(thinking),
+      announce: (info) => callVoice?.publishReply(info),
       log: callLog,
     },
     {
@@ -1458,6 +1529,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   // Every caller turn gets a number. The page hears what became of it; a recording, when they are
   // on, is written once the turn is settled, off the path to the host.
   let turns = 0;
+  /** The host's utterance id of each sent turn to its number here, to tell the page what a reply answers. */
+  const turnsByHostId = new Map<string, number>();
   const publish = (status: WalkieTurnStatus) => callVoice?.publishTurn(status);
   const saveTurn = (
     index: number,
@@ -1492,6 +1565,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         onTurn: (text, take) => {
           const turn = ++turns;
           walkie.onTurn(text, (host) => {
+            if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
             publish(
               host.accepted
                 ? { turn, status: 'sent', text }
@@ -1537,7 +1611,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   host
     .events((event) => {
       if (event.type === 'end') void end(`host: ${event.reason}`, false);
-      else if (event.type === 'reply') walkie.onReply(event.text);
+      else if (event.type === 'reply')
+        walkie.onReply(event.text, event.turn === undefined ? null : turnsByHostId.get(event.turn));
       else if (event.type === 'thinking') walkie.onThinking();
     }, hostLink.signal)
     .then(

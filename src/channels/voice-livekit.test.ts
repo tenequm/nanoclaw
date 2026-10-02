@@ -14,9 +14,11 @@ import { createGptLiveAdapter, lineIdForToken, type GptLiveConfig, type VoiceCha
 import {
   liveKitChatDelivered,
   liveKitChatTyping,
+  liveKitTurnOf,
   pickMirrorTarget,
   spokenText,
   type BoundCallChat,
+  walkieEndReason,
   walkieMessageText,
   WALKIE_CHAT_REPLY_NOTE,
   WALKIE_REPLY_NOTE,
@@ -30,6 +32,8 @@ import {
   liveKitCallSecret,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
+  WALKIE_PENDING_ATTRIBUTE,
+  WALKIE_REPLY_TOPIC,
   WALKIE_THINKING_ATTRIBUTE,
   WALKIE_TURN_TOPIC,
   WALKIE_UPDATING_ATTRIBUTE,
@@ -244,6 +248,8 @@ interface TokenResponse {
   agent: string;
   /** The call chat's name, for the page; absent while the call talks on the voice line. */
   chat?: string;
+  silenceMs: number;
+  limit: { ms: number; kind: 'duration' | 'daily' };
 }
 
 /** The worker's side of one call: its metadata, an open event stream, and its POSTs. */
@@ -383,6 +389,11 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       WALKIE_THINKING_ATTRIBUTE,
       WALKIE_UPDATING_ATTRIBUTE,
       WALKIE_TURN_TOPIC,
+      WALKIE_PENDING_ATTRIBUTE,
+      WALKIE_REPLY_TOPIC,
+      // The end reasons it names (WalkieEndReason), as keys of its own table.
+      'limit_daily',
+      'worker_gone',
       '"no-agent"',
       '"updating"',
     ]) {
@@ -406,6 +417,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const body = (await res.json()) as TokenResponse;
     expect(body.url).toBe('wss://lk.example.ts.net:47880');
     expect(body.agent).toBe('Andy');
+    // For the page's hints: the silence that sends a turn, and the cap that will end the call.
+    expect(body.silenceMs).toBe(2500);
+    expect(body.limit).toEqual({ ms: 15 * MIN, kind: 'duration' });
     const room = h.lk.rooms[0];
     expect(room).toMatch(new RegExp(`^voice-${LINE.slice(6)}-[0-9a-f]{12}$`));
     const [dispatch] = h.lk.dispatches;
@@ -504,9 +518,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(interim).toBe(msg.id);
     await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Dentist at nine.' }, inReplyTo: msg.id });
     await worker.waitFor((e) => e.type === 'reply' && e.text === 'Dentist at nine.');
+    // Both answer the first turn, and say so: the page labels them with it.
     expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
-      { type: 'reply', text: 'Checking.' },
-      { type: 'reply', text: 'Dentist at nine.' },
+      { type: 'reply', text: 'Checking.', turn: id },
+      { type: 'reply', text: 'Dentist at nine.', turn: id },
     ]);
     worker.close();
   });
@@ -587,7 +602,8 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const { worker } = await startCall(h);
     const id = await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Your taxi is here.' } });
     expect(id).toMatch(/^livekit:.*:out-1$/);
-    await worker.waitFor((e) => e.type === 'reply' && e.text === 'Your taxi is here.');
+    // It answers no turn, so it carries none.
+    expect(await worker.waitFor((e) => e.type === 'reply')).toEqual({ type: 'reply', text: 'Your taxi is here.' });
     await h.adapter.setTyping!(LINE, null);
     await worker.waitFor((e) => e.type === 'thinking');
     worker.close();
@@ -616,6 +632,59 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(worker.events.at(-1)).toEqual({ type: 'end', reason: 'hangup' });
     // The worker's routes are closed for this call now.
     expect((await worker.post('utterance', { text: 'late' })).status).toBe(409);
+  });
+
+  it('puts why the call ended on its room before the worker hears of it or the room goes', async () => {
+    const { call, worker } = await startCall(h);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const setMetadata = h.lk.updateRoomMetadata.bind(h.lk);
+    h.lk.updateRoomMetadata = async (room, metadata) => {
+      await gate;
+      return setMetadata(room, metadata);
+    };
+    const hungUp = post(`${h.base}/livekit/end?t=tok123`, { callId: call.callId });
+    await settle();
+    // The worker leaves the room as soon as it hears; the page must be able to read why first.
+    expect(worker.events.some((e) => e.type === 'end')).toBe(false);
+    expect(h.lk.deleted).toEqual([]);
+    release();
+    expect((await hungUp).status).toBe(204);
+    await worker.streamClosed;
+    expect(h.lk.roomMetadata).toEqual([{ room: h.lk.rooms[0], metadata: { chat: null, end: 'hangup' } }]);
+    expect(h.lk.deleted).toEqual([h.lk.rooms[0]]);
+  });
+
+  it('answers the worker that ended its call once the room says so, and names it a gone worker', async () => {
+    const { worker } = await startCall(h);
+    expect((await worker.post('ended', { reason: 'session closed: error' })).status).toBe(204);
+    expect(h.lk.roomMetadata.at(-1)).toEqual({
+      room: h.lk.rooms[0],
+      metadata: { chat: null, end: 'worker_gone' },
+    });
+    worker.close();
+  });
+
+  it('names a call replaced by a newer one, a duration limit and a shutdown on the room', async () => {
+    const first = await startCall(h);
+    await startCall(h);
+    await vi.waitFor(() =>
+      expect(h.lk.roomMetadata).toContainEqual({
+        room: h.lk.dispatches[0].room,
+        metadata: { chat: null, end: 'newer_call' },
+      }),
+    );
+    first.worker.close();
+    await h.adapter.teardown();
+    expect(h.lk.roomMetadata.at(-1)).toEqual({
+      room: h.lk.dispatches[1].room,
+      metadata: { chat: null, end: 'shutdown' },
+    });
+    await h.stop();
+    h = await startHarness({ maxCallDurationMs: 50 });
+    const { worker } = await startCall(h);
+    await worker.streamClosed;
+    expect(h.lk.roomMetadata).toEqual([{ room: h.lk.rooms[0], metadata: { chat: null, end: 'limit_duration' } }]);
   });
 
   it('turns a fallback model off when it is set to off or empty', async () => {
@@ -655,6 +724,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await worker.streamClosed;
     expect(worker.events.at(-1)).toMatchObject({ type: 'end', reason: 'caller access revoked or line changed' });
     expect(h.lk.deleted).toHaveLength(1);
+    expect(h.lk.roomMetadata.at(-1)?.metadata).toEqual({ chat: null, end: 'revoked' });
   });
 
   it('ends the call when the worker link drops', async () => {
@@ -662,6 +732,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     worker.close();
     await new Promise((r) => setTimeout(r, 100));
     expect(h.lk.deleted).toHaveLength(1);
+    expect(h.lk.roomMetadata.at(-1)?.metadata).toEqual({ chat: null, end: 'worker_gone' });
   });
 
   it('charges the daily minutes from join to end and caps a call at the remaining budget', async () => {
@@ -674,6 +745,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const res = await post(`${h.base}/livekit/token?t=tok123`);
     expect(res.status).toBe(200);
     expect(h.lk.dispatches.at(-1)!.metadata.maxDurationMs).toBe(30_000);
+    expect(((await res.json()) as TokenResponse).limit).toEqual({ ms: 30_000, kind: 'daily' });
     const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
     expect((await worker.post('joined')).status).toBe(200);
     h.clock.now += 30_000;
@@ -691,6 +763,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await worker.streamClosed;
     expect(worker.events.at(-1)).toEqual({ type: 'end', reason: 'daily minute budget' });
     expect(h.lk.deleted).toHaveLength(1);
+    expect(h.lk.roomMetadata.at(-1)?.metadata).toEqual({ chat: null, end: 'limit_daily' });
   });
 
   it('shares the hourly start cap with the GPT-Live engine', async () => {
@@ -907,6 +980,38 @@ describe('livekit call talking in the agent chat', () => {
     worker.close();
   });
 
+  it('says which turn of the call a chat reply answers, and nothing for any other reply', async () => {
+    await start([{ platform_id: 'telegram:100' }]);
+    const { worker } = await startCall(h);
+    const id = await worker.utter('Book a table');
+    const reply = (text: string, inReplyTo: string | null) =>
+      liveKitChatDelivered(
+        {
+          id: `out-${text.length}`,
+          kind: 'chat',
+          content: JSON.stringify({ text }),
+          channelType: 'telegram',
+          platformId: 'telegram:100',
+          threadId: null,
+          inReplyTo,
+        },
+        'ag-andy',
+      );
+    // In the session, the turn's id carries the agent's scope; delivery hands it over like that.
+    reply('Booked.', `livekit:${worker.meta.callId}:${id}:ag-andy`);
+    reply('The dentist called.', null);
+    reply('About the last call.', 'livekit:another-call:1:ag-andy');
+    reply('About what you typed.', 'tg-555:ag-andy');
+    await worker.waitFor((e) => e.type === 'reply' && e.text === 'About what you typed.');
+    expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
+      { type: 'reply', text: 'Booked.', turn: id },
+      { type: 'reply', text: 'The dentist called.' },
+      { type: 'reply', text: 'About the last call.' },
+      { type: 'reply', text: 'About what you typed.' },
+    ]);
+    worker.close();
+  });
+
   it('names an unnamed direct chat by its channel for the page header', async () => {
     await start([{ platform_id: 'telegram:100' }, { channel_type: 'voice', platform_id: LINE }]);
     const { call } = await startCall(h);
@@ -1086,5 +1191,29 @@ describe('walkie message text', () => {
   it('warns a call in a chat that everything sent there is spoken', () => {
     expect(WALKIE_CHAT_REPLY_NOTE).toContain('every message you send to this chat is read aloud');
     expect(WALKIE_CHAT_REPLY_NOTE).not.toContain('separate written message');
+  });
+});
+
+describe('walkie end reasons and reply targets', () => {
+  it('names each way the host ends a call as the page shows it, and nothing for ends no page hears', () => {
+    expect(walkieEndReason('hangup')).toBe('hangup');
+    expect(walkieEndReason('duration limit')).toBe('limit_duration');
+    expect(walkieEndReason('daily minute budget')).toBe('limit_daily');
+    expect(walkieEndReason('replaced by a new call')).toBe('newer_call');
+    expect(walkieEndReason('caller access revoked or line changed')).toBe('revoked');
+    expect(walkieEndReason('teardown')).toBe('shutdown');
+    expect(walkieEndReason('worker link closed')).toBe('worker_gone');
+    expect(walkieEndReason('worker never opened its event stream')).toBe('worker_gone');
+    expect(walkieEndReason('worker: session closed: error')).toBe('worker_gone');
+    expect(walkieEndReason('caller never joined')).toBeNull();
+    expect(walkieEndReason('no voice worker joined (worker down, or not on this protocol version)')).toBeNull();
+  });
+
+  it('reads the call turn a delivered message answers from its agent-scoped in-reply-to id', () => {
+    expect(liveKitTurnOf('livekit:c-1:3:ag-andy', 'ag-andy')).toEqual({ callId: 'c-1', utteranceId: '3' });
+    expect(liveKitTurnOf('livekit:c-1:3', 'ag-andy')).toEqual({ callId: 'c-1', utteranceId: '3' });
+    expect(liveKitTurnOf('livekit:c-1:3:ag-other', 'ag-andy')).toBeNull();
+    expect(liveKitTurnOf('tg-1:ag-andy', 'ag-andy')).toBeNull();
+    expect(liveKitTurnOf(null, 'ag-andy')).toBeNull();
   });
 });
