@@ -19,8 +19,8 @@
  *  - each finished turn goes to the host, which hands it to the agent as a
  *    spoken message; nothing in the session answers it;
  *  - each complete agent reply from the host's event stream is spoken with
- *    `session.say()` once the caller is not mid-turn, cut to
- *    VOICE_MAX_SPOKEN_CHARS at a sentence end, uninterruptible: while
+ *    `session.say()` once the caller is not mid-turn, in full (cut at a
+ *    sentence end only when VOICE_MAX_SPOKEN_CHARS sets a cap), uninterruptible: while
  *    it plays, the caller's audio is not transcribed (no barge-in); Gemini
  *    TTS synthesizes the whole reply in one streamed request, through
  *    LiveKit's TTS FallbackAdapter onto a second model.
@@ -155,8 +155,8 @@ const STALE_STREAM_MS = 2_000;
 const SESSION_CONTROL_TOPIC = 'lk.agent.session';
 /** Review mode's waits, on the global timers (which tests can fake). */
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-/** VOICE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
-export const DEFAULT_MAX_SPOKEN_CHARS = 800;
+/** VOICE_MAX_SPOKEN_CHARS when unset: 0, no cap; a reply is spoken in full however long it runs. */
+export const DEFAULT_MAX_SPOKEN_CHARS = 0;
 const DAY_MS = 86_400_000;
 
 /** The worker's HTTP client for the host's /webhook/voice/livekit/agent routes. */
@@ -275,7 +275,7 @@ export const CUT_LINES: Record<'chat' | 'no_chat', Record<CallLanguage, string>>
 /** A sentence end earlier than this share of the cap wastes the budget: the cut goes to a word instead. */
 const MIN_SENTENCE_CUT = 0.6;
 
-/** VOICE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default. */
+/** VOICE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default (no cap). */
 export function maxSpokenChars(raw: string | undefined): number {
   const value = raw?.trim();
   if (!value) return DEFAULT_MAX_SPOKEN_CHARS;
