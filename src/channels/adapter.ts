@@ -125,6 +125,8 @@ export interface OutboundMessage {
   kind: string;
   content: unknown; // parsed JSON from messages_out
   files?: OutboundFile[]; // file attachments from the session outbox
+  /** The adapter's own id of the inbound message this answers (agent scope stripped), when known. */
+  inReplyTo?: string;
 }
 
 /**

@@ -119,6 +119,8 @@ export interface ChannelDeliveryAdapter {
     /** Delivering adapter instance (defaults to channelType downstream).
      *  Host-internal only — containers never see instance. */
     instance?: string,
+    /** Platform id of the inbound message being answered, agent scope stripped. */
+    inReplyTo?: string,
   ): Promise<string | undefined>;
   setTyping?(
     channelType: string,
@@ -727,6 +729,7 @@ async function deliverMessage(
     outboundContent,
     files,
     deliverInstance,
+    msg.inReplyTo ? platformMessageId(msg.inReplyTo, session.agent_group_id) : undefined,
   );
   log.info('Message delivered', {
     id: msg.id,

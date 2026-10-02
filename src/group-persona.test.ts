@@ -1,3 +1,4 @@
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -47,6 +48,11 @@ describe('readGroupPersona', () => {
       'Could not read group standing instructions; omitting persona',
       expect.objectContaining({ file: path.join(TMP, PERSONA_PREPEND_FILE) }),
     );
+  });
+
+  it.skipIf(process.platform === 'win32')('returns null for a named pipe without blocking on it', () => {
+    execFileSync('mkfifo', [path.join(TMP, PERSONA_PREPEND_FILE)]);
+    expect(readGroupPersona(TMP)).toBeNull();
   });
 });
 

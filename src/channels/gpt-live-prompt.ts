@@ -73,8 +73,17 @@ export function sessionConfig(agent: VoiceAgent, voice: string, caller?: VoiceCa
   };
 }
 
+export interface ResolveLineOptions {
+  /** Read the persona files too. Only call setup needs them; the periodic access checks do not. */
+  persona?: boolean;
+}
+
 /** Resolve a named personal line and its explicit access before reading the agent persona. */
-export async function resolveVoiceLine(platformId: string, instance?: string): Promise<VoiceLine | null> {
+export async function resolveVoiceLine(
+  platformId: string,
+  instance?: string,
+  options: ResolveLineOptions = {},
+): Promise<VoiceLine | null> {
   try {
     const caller = await getUser(platformId);
     if (!caller || caller.kind !== 'voice' || !caller.display_name?.trim()) return null;
@@ -87,7 +96,9 @@ export async function resolveVoiceLine(platformId: string, instance?: string): P
     const group = await getAgentGroup(groupId);
     if (!group) return null;
     const groupDir = path.join(GROUPS_DIR, group.folder);
-    const personality = readGroupPersona(groupDir, VOICE_PERSONA_FILE) ?? readGroupPersona(groupDir);
+    const personality = options.persona
+      ? (readGroupPersona(groupDir, VOICE_PERSONA_FILE) ?? readGroupPersona(groupDir))
+      : null;
     return {
       caller: { id: caller.id, name: caller.display_name.trim() },
       agentGroupId: group.id,

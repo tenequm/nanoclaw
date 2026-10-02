@@ -36,7 +36,7 @@ rm -rf container/skills/voice-formatting
 (check `.env` for other OpenAI consumers first):
 
 ```bash
-sed -i.bak '/^GPT_LIVE_PUBLIC_URL=/d;/^GPT_LIVE_VOICE=/d;/^GPT_LIVE_LINK_TOKEN=/d;/^GPT_LIVE_AGENT_NAME=/d;/^GPT_LIVE_UI=/d;/^GPT_LIVE_MAX_CALL_SECONDS=/d;/^GPT_LIVE_MAX_CALLS_PER_HOUR=/d;/^GPT_LIVE_KEYCHAIN_SERVICE=/d;/^GPT_LIVE_KEYCHAIN_ACCOUNT=/d' .env && rm -f .env.bak
+sed -i.bak '/^GPT_LIVE_PUBLIC_URL=/d;/^GPT_LIVE_VOICE=/d;/^GPT_LIVE_LINK_TOKEN=/d;/^GPT_LIVE_AGENT_NAME=/d;/^GPT_LIVE_UI=/d;/^GPT_LIVE_MAX_CALL_SECONDS=/d;/^GPT_LIVE_MAX_CALLS_PER_HOUR=/d;/^GPT_LIVE_MAX_MINUTES_PER_DAY=/d;/^GPT_LIVE_DELEGATION_TIMEOUT_SECONDS=/d;/^GPT_LIVE_KEYCHAIN_SERVICE=/d;/^GPT_LIVE_KEYCHAIN_ACCOUNT=/d' .env && rm -f .env.bak
 # only if no other consumer:
 # sed -i.bak '/^OPENAI_API_KEY=/d' .env && rm -f .env.bak
 ```

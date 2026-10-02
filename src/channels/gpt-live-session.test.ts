@@ -131,6 +131,20 @@ describe('GptLiveSession', () => {
     expect(session.pendingDelegations()).toEqual(['item_1', 'item_2']);
   });
 
+  it('a reply naming its delegation retires that one, out of order; a null id retires nothing', () => {
+    const { session, sent } = recorder();
+    delegate(session, 'item_1');
+    delegate(session, 'item_2');
+    session.speak('Interim: still looking.', null);
+    expect(sent.at(-1)).toMatchObject({ type: 'session.commentary.append', delegation_id: null });
+    expect(session.pendingDelegations()).toEqual(['item_1', 'item_2']);
+    session.speak('Table for four booked.', 'item_2');
+    expect(sent.at(-1)).toMatchObject({ delegation_id: 'item_2' });
+    expect(session.pendingDelegations()).toEqual(['item_1']);
+    expect(session.isPending('item_1')).toBe(true);
+    expect(session.isPending('item_2')).toBe(false);
+  });
+
   it('an empty reply retires nothing', () => {
     const { session } = recorder();
     delegate(session, 'item_1');

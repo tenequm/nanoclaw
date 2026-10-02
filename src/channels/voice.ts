@@ -45,6 +45,7 @@ import { attachSideband, type SidebandSocket } from './gpt-live-sideband.js';
 import {
   resolveVoiceLine,
   sessionConfig,
+  type ResolveLineOptions,
   type VoiceAgent,
   type VoiceCaller,
   type VoiceLine,
@@ -64,6 +65,39 @@ const DEFAULT_API_BASE = 'https://api.openai.com/v1';
 const DEFAULT_WS_BASE = 'wss://api.openai.com/v1';
 /** Silent "still working" notes to the voice model go out at most this often while a reply is pending. */
 export const THINK_INTERVAL_MS = 20_000;
+/** Spoken for a delegation the agent did not answer within the deadline. */
+export const DELEGATION_TIMEOUT_LINE = "I couldn't get that done in time.";
+const DAY_MS = 86_400_000;
+
+const CALL_PAGE_HEADERS = {
+  'Content-Type': 'text/html; charset=utf-8',
+  'Cache-Control': 'no-store',
+  'Referrer-Policy': 'no-referrer',
+  'X-Frame-Options': 'DENY',
+  // The page is one self-contained document: inline module script and styles, data: fonts and
+  // images, same-origin fetches. WebRTC media to OpenAI is not governed by connect-src.
+  'Content-Security-Policy':
+    "default-src 'self' 'unsafe-inline' blob: data:; connect-src 'self'; media-src 'self' blob: mediastream:; " +
+    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+};
+
+/**
+ * The inbound message id for a delegation. The agent's reply carries it back as
+ * `in_reply_to`, which is how deliver() knows which call and delegation it answers.
+ */
+const DELEGATION_ID_PREFIX = 'gptlive:';
+
+export function delegationMessageId(sessionId: string, delegationId: string): string {
+  return `${DELEGATION_ID_PREFIX}${sessionId}:${delegationId}`;
+}
+
+function parseDelegationMessageId(id: string): { sessionId: string; delegationId: string } | null {
+  if (!id.startsWith(DELEGATION_ID_PREFIX)) return null;
+  const rest = id.slice(DELEGATION_ID_PREFIX.length);
+  const sep = rest.indexOf(':');
+  if (sep <= 0 || sep === rest.length - 1) return null;
+  return { sessionId: rest.slice(0, sep), delegationId: rest.slice(sep + 1) };
+}
 
 /**
  * A voice line is DM-shaped: everything the voice model delegates is for the
@@ -91,7 +125,7 @@ export interface GptLiveConfig {
   /** WebSocket base; overridable for tests. */
   wsBase?: string;
   /** Resolves the named caller, single wiring and explicit access. Defaults to the central DB. */
-  resolveLine?: (platformId: string) => Promise<VoiceLine | null>;
+  resolveLine?: (platformId: string, options?: ResolveLineOptions) => Promise<VoiceLine | null>;
   accessCheckIntervalMs?: number;
   /** Observability tap: every sideband server event, before the state machine sees it. */
   onSidebandEvent?: (sessionId: string, event: LiveServerEvent) => void;
@@ -103,6 +137,10 @@ export interface GptLiveConfig {
   requestTimeoutMs?: number;
   maxCallDurationMs?: number;
   maxCallsPerHour?: number;
+  /** Call time one line may use per UTC day. */
+  maxCallMsPerDay?: number;
+  /** How long a delegation may wait for the agent before the caller hears it failed. */
+  delegationTimeoutMs?: number;
 }
 
 export type { SidebandSocket } from './gpt-live-sideband.js';
@@ -141,6 +179,9 @@ export class CallReplacedError extends Error {
 interface LiveCall {
   platformId: string;
   line: VoiceLine;
+  /** Config clock; the daily budget is charged from here. */
+  startedAt: number;
+  delegationTimers: Map<string, ReturnType<typeof setTimeout>>;
   accessTimer?: ReturnType<typeof setInterval>;
   session: GptLiveSession;
   socket: SidebandSocket | null;
@@ -165,15 +206,27 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   const apiBase = (config.apiBase ?? DEFAULT_API_BASE).replace(/\/+$/, '');
   const wsBase = (config.wsBase ?? DEFAULT_WS_BASE).replace(/\/+$/, '');
   const tokens = new Set(config.linkTokens.map((t) => t.trim()).filter(Boolean));
-  const resolveLine = config.resolveLine ?? ((platformId: string) => resolveVoiceLine(platformId));
+  const resolveLine =
+    config.resolveLine ??
+    ((platformId: string, options?: ResolveLineOptions) => resolveVoiceLine(platformId, undefined, options));
   const now = config.now ?? (() => Date.now());
   const requestTimeoutMs = config.requestTimeoutMs ?? 15_000;
   const maxCallDurationMs = config.maxCallDurationMs ?? 15 * 60_000;
   const maxCallsPerHour = config.maxCallsPerHour ?? 12;
-  for (const [name, value] of Object.entries({ requestTimeoutMs, maxCallDurationMs, maxCallsPerHour })) {
+  const delegationTimeoutMs = config.delegationTimeoutMs ?? 90_000;
+  const maxCallMsPerDay = config.maxCallMsPerDay ?? 120 * 60_000;
+  for (const [name, value] of Object.entries({
+    requestTimeoutMs,
+    maxCallDurationMs,
+    maxCallsPerHour,
+    delegationTimeoutMs,
+  })) {
     if (!Number.isSafeInteger(value) || value <= 0 || value > 2_147_483_647) {
       throw new Error(`gpt-live: ${name} must be a positive bounded integer`);
     }
+  }
+  if (!Number.isSafeInteger(maxCallMsPerDay) || maxCallMsPerDay <= 0) {
+    throw new Error('gpt-live: maxCallMsPerDay must be a positive integer');
   }
   const cleanups = new Set<Promise<void>>();
   const starts = new Map<string, number[]>();
@@ -183,6 +236,50 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   const lines = new Map<string, LiveCall>();
   let setup: ChannelSetup | null = null;
   let connected = false;
+  let callPage: string | undefined;
+  /** Call time already used per line, for the UTC day (epoch day number) it was used on. */
+  const usage = new Map<string, { day: number; usedMs: number }>();
+  const utcDay = (t: number): number => Math.floor(t / DAY_MS);
+  /** Time a call has run today; a call that started before midnight counts from midnight. */
+  const elapsedTodayMs = (call: LiveCall, t: number): number =>
+    Math.max(0, t - Math.max(call.startedAt, utcDay(t) * DAY_MS));
+
+  /** Today's call time on a line, including the call still running on it. */
+  const usedTodayMs = (platformId: string, t: number): number => {
+    const used = usage.get(platformId);
+    const active = lines.get(platformId);
+    return (used?.day === utcDay(t) ? used.usedMs : 0) + (active ? elapsedTodayMs(active, t) : 0);
+  };
+
+  const chargeUsage = (call: LiveCall): void => {
+    const t = now();
+    const day = utcDay(t);
+    const used = usage.get(call.platformId);
+    usage.set(call.platformId, {
+      day,
+      usedMs: (used?.day === day ? used.usedMs : 0) + elapsedTodayMs(call, t),
+    });
+  };
+
+  const clearDelegationTimer = (call: LiveCall, delegationId: string): void => {
+    clearTimeout(call.delegationTimers.get(delegationId));
+    call.delegationTimers.delete(delegationId);
+  };
+
+  const expireDelegation = (call: LiveCall, delegationId: string): void => {
+    call.delegationTimers.delete(delegationId);
+    if (call.ended || !call.session.isPending(delegationId)) return;
+    log.warn('gpt-live: delegation got no reply in time', {
+      platformId: call.platformId,
+      sessionId: call.session.sessionId,
+      delegationId,
+    });
+    try {
+      call.session.speak(DELEGATION_TIMEOUT_LINE, delegationId);
+    } catch (err) {
+      log.warn('gpt-live: could not report the timed-out delegation', { sessionId: call.session.sessionId, err });
+    }
+  };
 
   const sendEvent = (call: LiveCall, event: LiveClientEvent): void => {
     if (!call.socket) {
@@ -196,10 +293,13 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   const onDelegation = (req: DelegationRequest): void => {
     const call = [...lines.values()].find((c) => c.session.sessionId === req.sessionId);
     if (!call || !setup) return;
+    const timer = setTimeout(() => expireDelegation(call, req.delegationId), delegationTimeoutMs);
+    timer.unref();
+    call.delegationTimers.set(req.delegationId, timer);
     void (async () => {
       if (!(await checkCallAccess(call)) || !setup) return;
       const message: InboundMessage = {
-        id: `${req.sessionId}:${req.delegationId}`,
+        id: delegationMessageId(req.sessionId, req.delegationId),
         kind: 'chat',
         content: {
           text: req.transcript,
@@ -219,7 +319,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       // Tell the voice model work has started; the reply lands through deliver(). Later typing
       // ticks are throttled against this note (setTyping below).
       call.lastThinkAt = now();
-      call.session.think('Working on it.');
+      call.session.think('Working on it.', req.delegationId);
       await setup.onInbound(call.platformId, null, message);
     })().catch((err) => {
       log.error('gpt-live: onInbound threw', { platformId: call.platformId, err });
@@ -244,8 +344,11 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   const endCall = (call: LiveCall, reason: string): void => {
     if (call.ended) return;
     call.ended = true;
+    chargeUsage(call);
     clearTimeout(call.expires);
     clearInterval(call.accessTimer);
+    for (const timer of call.delegationTimers.values()) clearTimeout(timer);
+    call.delegationTimers.clear();
     call.attachController.abort();
     if (lines.get(call.platformId) === call) lines.delete(call.platformId);
     const socket = call.socket;
@@ -318,9 +421,13 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     if (previous) {
       closeCall(previous, 'replaced by a new call');
     }
+    // Charged after the replaced call above, so its minutes count against this one.
+    const remainingMs = maxCallMsPerDay - usedTodayMs(platformId, now());
     const call: LiveCall = {
       platformId,
       line,
+      startedAt: now(),
+      delegationTimers: new Map(),
       socket: null,
       session: null as unknown as GptLiveSession,
       lastThinkAt: 0,
@@ -333,7 +440,11 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       onClosed: (reason) => endCall(call, reason),
     });
     lines.set(platformId, call);
-    call.expires = setTimeout(() => closeCall(call, 'duration limit'), maxCallDurationMs);
+    const budgetCaps = remainingMs < maxCallDurationMs;
+    call.expires = setTimeout(
+      () => closeCall(call, budgetCaps ? 'daily minute budget' : 'duration limit'),
+      Math.max(1, budgetCaps ? remainingMs : maxCallDurationMs),
+    );
     call.expires.unref();
     call.accessTimer = setInterval(() => {
       void checkCallAccess(call);
@@ -343,15 +454,20 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     try {
       socket = await connectSideband(call);
     } catch (err) {
-      if (call.ended && connected) throw new CallReplacedError(platformId);
+      // Ended while attaching: replaced by a newer call or closed by teardown, which hung up already.
+      if (call.ended) throw new CallReplacedError(platformId);
       endCall(call, 'sideband attach failed');
       await call.cleanup;
       throw new UpstreamError(502, 'gpt-live: sideband attach failed', { cause: err });
     }
-    if (lines.get(platformId) !== call) {
+    if (lines.get(platformId) !== call || !connected) {
       socket.send(JSON.stringify({ type: 'session.close' }));
       socket.close();
-      log.info('gpt-live: call refused, a newer call took the line while attaching', { platformId, sessionId });
+      if (!call.ended) endCall(call, 'channel stopped while attaching');
+      log.info('gpt-live: call refused, a newer call or teardown took the line while attaching', {
+        platformId,
+        sessionId,
+      });
       throw new CallReplacedError(platformId);
     }
     call.socket = socket;
@@ -376,10 +492,16 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       throw new UpstreamError(502, 'gpt-live: session creation timed out or could not connect', { cause: err });
     });
     if (!res.ok) {
-      throw new UpstreamError(
-        res.status,
-        `gpt-live: session create failed: ${res.status} ${(await res.text()).slice(0, 300)}`,
-      );
+      const detail = (await res.text()).slice(0, 300);
+      if (res.status === 401 || res.status === 403) {
+        // The upstream body names the key and the project; the operator reads it in the log.
+        log.warn('gpt-live: OpenAI refused the host credentials', { status: res.status, detail });
+        throw new UpstreamError(
+          res.status,
+          `gpt-live: session create failed: ${res.status} (check the host's OpenAI key)`,
+        );
+      }
+      throw new UpstreamError(res.status, `gpt-live: session create failed: ${res.status} ${detail}`);
     }
     const body = (await res.json()) as { session?: { id?: string }; transport?: { sdp?: string } };
     if (!body.session?.id || !body.transport?.sdp)
@@ -418,8 +540,9 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       // and must refuse rather than start sessions for a channel that is no longer running.
       if (!connected || !setup) return reply(res, 503, 'Live Voice is not running');
       if (req.method === 'GET' && route === 'call') {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-        res.end(callPageHtml(config.ui));
+        callPage ??= callPageHtml(config.ui);
+        res.writeHead(200, CALL_PAGE_HEADERS);
+        res.end(callPage);
         return;
       }
       if (route === 'info') {
@@ -440,7 +563,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         const offer = await readBody(req);
         if (!offer.trim().startsWith('v=')) return reply(res, 400, 'Body must be an SDP offer');
         const platformId = lineIdForToken(token);
-        const line = await resolveLine(platformId);
+        const line = await resolveLine(platformId, { persona: true });
         if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
         const t = now();
         const recent = (starts.get(platformId) ?? []).filter((at) => at > t - 3_600_000);
@@ -449,21 +572,27 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
             'Retry-After': String(Math.max(1, Math.ceil((recent[0] + 3_600_000 - t) / 1000))),
           });
         }
+        if (usedTodayMs(platformId, t) >= maxCallMsPerDay) {
+          return reply(res, 429, 'This voice line has used its call minutes for today. Try again tomorrow.', {
+            'Retry-After': String(Math.max(1, Math.ceil((DAY_MS - (t % DAY_MS)) / 1000))),
+          });
+        }
         starts.set(platformId, [...recent, t]);
         const attempt = ++nextStart;
         pendingStarts.set(platformId, attempt);
         let sessionId: string;
         let answer: string;
+        const superseded = (): boolean => !connected || res.destroyed || pendingStarts.get(platformId) !== attempt;
         try {
           ({ sessionId, answer } = await createWebRtcSession(offer, line.agent, line.caller));
           log.info('gpt-live: session created', { platformId, sessionId, agent: line.agent.name });
-          // Creation can finish out of order or after teardown / browser cancellation.
-          if (!connected || res.destroyed || pendingStarts.get(platformId) !== attempt) {
+          // Creation and the access recheck can finish out of order or after teardown / browser cancellation.
+          const current = superseded() ? null : await resolveLine(platformId);
+          if (superseded()) {
             await hangupSession(sessionId);
             if (!res.destroyed) reply(res, 409, 'This call attempt is no longer active');
             return;
           }
-          const current = await resolveLine(platformId);
           if (!current || !sameCallerAndAgent(line, current)) {
             await hangupSession(sessionId);
             return reply(res, 403, 'Caller access changed while connecting');
@@ -475,7 +604,11 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
             return;
           }
         } catch (err) {
-          if (err instanceof CallReplacedError) return reply(res, 409, 'A newer call replaced this one');
+          if (err instanceof CallReplacedError) {
+            return connected
+              ? reply(res, 409, 'A newer call replaced this one')
+              : reply(res, 503, 'Live Voice is not running');
+          }
           throw err;
         } finally {
           if (pendingStarts.get(platformId) === attempt) pendingStarts.delete(platformId);
@@ -509,7 +642,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         return reply(res, 413, 'SDP offer too large', { Connection: 'close' });
       }
       if (err instanceof UpstreamError) {
-        // The caller sees why (a 401 or a credit problem is actionable); the log keeps the detail.
+        // The caller sees why (a credit problem is actionable); credential detail stays in the log.
         log.warn('gpt-live: upstream failure on the sdp route', { route, status: err.status, err });
         if (!res.headersSent) return reply(res, 502, err.message.slice(0, 300));
         res.end();
@@ -559,12 +692,22 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         throw new Error('gpt-live: question cards are unsupported; ask the caller in plain text');
       }
       if (message.files?.length) throw new Error('gpt-live: attachments cannot be delivered over a voice call');
+      const target = message.inReplyTo ? parseDelegationMessageId(message.inReplyTo) : null;
       const call = lines.get(platformId);
+      if (target && target.sessionId !== call?.session.sessionId) {
+        // An answer for a call that is over must not be spoken into a later one; retrying cannot help.
+        log.info('gpt-live: dropping a reply for an ended call', { platformId, ...target });
+        return undefined;
+      }
       if (!call || call.session.isClosed() || !call.socket) throw new Error('gpt-live: no active call on this line');
       if (!(await checkCallAccess(call))) throw new Error('gpt-live: caller access has been revoked');
       const text = typeof content === 'string' ? content : typeof content?.text === 'string' ? content.text : '';
       if (!text.trim()) throw new Error('gpt-live: reply contains no speakable text');
-      const ids = call.session.speak(text);
+      // Only the reply to a still-open delegation answers it. Proactive messages, and second or late
+      // replies to a delegation already answered or timed out, are spoken without answering any.
+      const answering = target && call.session.isPending(target.delegationId) ? target.delegationId : null;
+      const ids = call.session.speak(text, answering);
+      if (answering) clearDelegationTimer(call, answering);
       return ids.at(-1);
     },
 
@@ -625,6 +768,8 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'GPT_LIVE_UI',
       'GPT_LIVE_MAX_CALL_SECONDS',
       'GPT_LIVE_MAX_CALLS_PER_HOUR',
+      'GPT_LIVE_MAX_MINUTES_PER_DAY',
+      'GPT_LIVE_DELEGATION_TIMEOUT_SECONDS',
     ]);
     const key = resolveOpenAiKey(env);
     if (!key) return null;
@@ -633,14 +778,23 @@ registerChannelAdapter(CHANNEL_TYPE, {
       return null;
     }
     log.info('gpt-live: OpenAI key loaded', { source: key.source });
+    const linkTokens = env.GPT_LIVE_LINK_TOKEN.split(',');
+    const short = linkTokens.map((t) => t.trim()).filter((t) => t && t.length < 32);
+    if (short.length > 0) {
+      log.warn('gpt-live: link tokens shorter than 32 characters are weak; mint new ones with openssl rand -hex 16', {
+        lines: short.map(lineIdForToken),
+      });
+    }
     return createGptLiveAdapter({
       apiKey: key.key,
       publicUrl: (env.GPT_LIVE_PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, ''),
       voice: env.GPT_LIVE_VOICE || 'marin',
-      linkTokens: env.GPT_LIVE_LINK_TOKEN.split(','),
+      linkTokens,
       ui: parseUiConfig(env.GPT_LIVE_UI),
       maxCallDurationMs: Number(env.GPT_LIVE_MAX_CALL_SECONDS ?? 900) * 1000,
       maxCallsPerHour: Number(env.GPT_LIVE_MAX_CALLS_PER_HOUR ?? 12),
+      maxCallMsPerDay: Number(env.GPT_LIVE_MAX_MINUTES_PER_DAY ?? 120) * 60_000,
+      delegationTimeoutMs: Number(env.GPT_LIVE_DELEGATION_TIMEOUT_SECONDS ?? 90) * 1000,
     });
   },
   defaults: GPT_LIVE_DEFAULTS,

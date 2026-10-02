@@ -294,6 +294,27 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(calls).toHaveLength(2);
   });
 
+  it('hands the adapter the replied-to inbound id with the agent scope stripped', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-reply');
+    insertOutbound('ag-1', session.id, 'out-proactive');
+    const db = new Database(outboundDbPath('ag-1', session.id));
+    db.prepare('UPDATE messages_out SET in_reply_to = ? WHERE id = ?').run('platform-msg-7:ag-1', 'out-reply');
+    db.close();
+
+    const replies: Array<string | undefined> = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, _content, _files, _instance, inReplyTo) {
+        replies.push(inReplyTo);
+        return undefined;
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(replies).toEqual(['platform-msg-7', undefined]);
+  });
+
   it('does not re-deliver when retried after a successful send (cleanup-after-send safety)', async () => {
     // If something post-send throws (e.g. outbox cleanup), the message has
     // still landed on the user's screen — the catch path must not trigger

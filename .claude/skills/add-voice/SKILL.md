@@ -30,8 +30,15 @@ internet and that bill — treat the link like a password.
 Calls end after 15 minutes, and each line permits at most 12 start attempts in
 an hour. Set `GPT_LIVE_MAX_CALL_SECONDS` (default `900`) and
 `GPT_LIVE_MAX_CALLS_PER_HOUR` (default `12`) to positive integers to change these
-limits. Attempts include upstream failures. The hourly counters are in memory
-and reset when the host restarts; these are call limits, not a dollar budget.
+limits. Attempts include upstream failures. Each line may also spend at most
+120 call minutes per UTC day (`GPT_LIVE_MAX_MINUTES_PER_DAY`): a call is refused
+once the day's minutes are gone, and a running call ends when they run out. The
+counters are in memory and reset when the host restarts, so this caps a day's
+spend per line rather than guaranteeing a dollar budget.
+
+When the voice model hands a request to the agent and no reply comes back within
+90 seconds (`GPT_LIVE_DELEGATION_TIMEOUT_SECONDS`), the caller hears that it
+could not be done in time instead of waiting in silence.
 
 The stable channel identifier and URL prefix are `voice`. The `GPT_LIVE_*`
 settings and adapter module names identify the current voice engine.
@@ -186,9 +193,13 @@ GPT_LIVE_VOICE=marin
 The voice line's secret. Reuse the one already in `.env` on a re-run, otherwise
 mint a fresh one:
 
-```nc:run capture:link_token validate:^[0-9a-f]{16}$ effect:fetch
-grep -s '^GPT_LIVE_LINK_TOKEN=' .env | cut -d= -f2- | cut -d, -f1 | grep -E '^[0-9a-f]{16}$' || openssl rand -hex 8
+```nc:run capture:link_token validate:^[0-9a-f]{16}([0-9a-f]{16})?$ effect:fetch
+grep -s '^GPT_LIVE_LINK_TOKEN=' .env | cut -d= -f2- | cut -d, -f1 | grep -E '^[0-9a-f]{16}([0-9a-f]{16})?$' || openssl rand -hex 16
 ```
+
+Tokens minted by earlier versions of this skill are 16 hex characters and keep
+working; the host logs a warning for them. To upgrade a line, replace its token
+with `openssl rand -hex 16` and re-run the wiring steps for the new line id.
 
 ```nc:env-set
 GPT_LIVE_LINK_TOKEN={{link_token}}

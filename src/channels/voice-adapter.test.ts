@@ -20,7 +20,14 @@ import type { Duplex } from 'node:stream';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ChannelAdapter, InboundMessage } from './adapter.js';
-import { createGptLiveAdapter, lineIdForToken } from './voice.js';
+import type { ResolveLineOptions } from './gpt-live-prompt.js';
+import {
+  createGptLiveAdapter,
+  delegationMessageId,
+  DELEGATION_TIMEOUT_LINE,
+  lineIdForToken,
+  type GptLiveConfig,
+} from './voice.js';
 
 /** What NanoClaw calls the line: a hash of the token, never the token. */
 const LINE = lineIdForToken('tok123');
@@ -292,6 +299,11 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     const html = await res.text();
     expect(html).toContain('RTCPeerConnection');
     expect(html).toContain('x-voice-session');
+    expect(res.headers.get('x-frame-options')).toBe('DENY');
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+    const csp = res.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(csp).toContain("connect-src 'self'");
   });
 
   it('refuses an SDP offer without a known link token', async () => {
@@ -373,6 +385,7 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
       senderId: LINE,
       gptLive: { sessionId: 'live_fake1', delegationId: 'item_1', supersedes: null },
     });
+    expect(message.id).toBe(delegationMessageId('live_fake1', 'item_1'));
 
     await vi.waitFor(() => expect(fake.received.some((e) => e.type === 'session.thinking.append')).toBe(true));
     const ack = fake.received.find((e) => e.type === 'session.thinking.append');
@@ -394,10 +407,11 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     expect(thinking().length).toBe(before + 1); // again within 20 s: suppressed
   });
 
-  it('speaks the agent reply as commentary on the open delegation', async () => {
+  it('speaks the agent reply as commentary on the delegation it replies to', async () => {
     const id = await adapter.deliver(LINE, null, {
       kind: 'chat',
       content: { text: 'Two meetings: standup at nine and lunch with Dana.' },
+      inReplyTo: inbound[0].message.id,
     });
     expect(id).toBeTruthy();
     await vi.waitFor(() => expect(fake.received.some((e) => e.type === 'session.commentary.append')).toBe(true));
@@ -415,6 +429,32 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     await adapter.setTyping?.(LINE, null, 'Still checking');
     await new Promise((r) => setTimeout(r, 150));
     expect(count()).toBe(before);
+  });
+
+  it('routes each reply to its own delegation; proactive and repeat replies answer none', async () => {
+    const commentary = () => fake.received.filter((e) => e.type === 'session.commentary.append');
+    const delegate = (id: string) =>
+      fake.push({ type: 'session.delegation.created', delegation: { id, type: 'delegation', target: 'client' } });
+    fake.push({ type: 'session.input_transcript.delta', delta: 'Book a table.' });
+    delegate('item_2');
+    fake.push({ type: 'session.input_transcript.delta', delta: 'And remind me to call Dana.' });
+    delegate('item_3');
+    await vi.waitFor(() => expect(inbound).toHaveLength(3));
+    const [, , second, third] = [null, ...inbound].map((e) => e?.message.id);
+
+    await adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'By the way, it is raining.' } });
+    await vi.waitFor(() => expect(commentary().at(-1)).toMatchObject({ content: 'By the way, it is raining.' }));
+    expect(commentary().at(-1)?.delegation_id).toBeNull();
+
+    // The newer delegation is answered first; the older one stays open for its own reply.
+    await adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Reminder set.' }, inReplyTo: third });
+    await vi.waitFor(() => expect(commentary().at(-1)).toMatchObject({ delegation_id: 'item_3' }));
+    await adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Table booked.' }, inReplyTo: second });
+    await vi.waitFor(() => expect(commentary().at(-1)).toMatchObject({ delegation_id: 'item_2' }));
+
+    await adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'For eight people.' }, inReplyTo: second });
+    await vi.waitFor(() => expect(commentary().at(-1)).toMatchObject({ content: 'For eight people.' }));
+    expect(commentary().at(-1)?.delegation_id).toBeNull();
   });
 
   it('hangs up the specified session and rejects later replies', async () => {
@@ -475,6 +515,19 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     await adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'New call still connected.' } });
     await vi.waitFor(() => expect(winner.received.some((e) => e.content === 'New call still connected.')).toBe(true));
     expect(winner.closedByClient).toBe(false);
+  });
+
+  it('drops a slow reply from an ended call instead of speaking it into the new one', async () => {
+    const winner = fake.attaches.at(-1)!;
+    const before = winner.received.length;
+    const id = await adapter.deliver(LINE, null, {
+      kind: 'chat',
+      content: { text: 'Answer for the first call.' },
+      inReplyTo: delegationMessageId('live_fake1', 'item_1'),
+    });
+    expect(id).toBeUndefined();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(winner.received).toHaveLength(before);
   });
 
   it('rejects question cards and attachments instead of falsely reporting delivery', async () => {
@@ -545,7 +598,7 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     expect(fake.sessionCreates.length).toBe(creates);
   });
 
-  it('answers 502 with the upstream message when OpenAI refuses the session', async () => {
+  it('answers 502 without the upstream detail when OpenAI refuses the credentials', async () => {
     const res = await fetch(`${base}/sdp?t=tok123`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/sdp' },
@@ -554,7 +607,7 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     expect(res.status).toBe(502);
     const text = await res.text();
     expect(text).toContain('session create failed: 401');
-    expect(text).toContain('Incorrect API key');
+    expect(text).not.toContain('Incorrect API key');
   });
 
   it('the call page hangs up with a keepalive request so a closing tab still reaches the host', async () => {
@@ -680,5 +733,153 @@ describe('voice call limits and pending creation', () => {
     expect((await pending).status).toBe(409);
     expect(fake.hangups).toEqual(['live_fake1']);
     expect(fake.attaches).toHaveLength(0);
+  });
+});
+
+describe('voice delegation deadlines, daily budget and teardown races', () => {
+  const NOON_UTC = Date.UTC(2026, 9, 2, 12);
+  let fake: FakeOpenAI;
+  let adapter: ChannelAdapter;
+  let base: string;
+  let clock: number;
+  let inbound: InboundMessage[];
+  /** Holds the next access recheck (a resolve without persona) until released. */
+  let recheckGate: Promise<void> | null;
+  let recheckStarted: boolean;
+  const offer = () => fetch(`${base}/sdp?t=tok`, { method: 'POST', body: 'v=0\r\noffer' });
+  const commentary = () => fake.received.filter((e) => e.type === 'session.commentary.append');
+
+  const boot = async (overrides: Partial<GptLiveConfig> = {}): Promise<void> => {
+    adapter = createGptLiveAdapter({
+      apiKey: 'sk-test-key',
+      publicUrl: base,
+      voice: 'marin',
+      linkTokens: ['tok'],
+      apiBase: `http://127.0.0.1:${fake.port}/v1`,
+      wsBase: `ws://127.0.0.1:${fake.port}/v1`,
+      resolveLine: async (id: string, options?: ResolveLineOptions) => {
+        if (!options?.persona && recheckGate) {
+          const gate = recheckGate;
+          recheckGate = null;
+          recheckStarted = true;
+          await gate;
+        }
+        return { caller: { id, name: 'Caller' }, agentGroupId: 'ag-test', agent: { name: 'Agent' } };
+      },
+      requestTimeoutMs: 500,
+      now: () => clock,
+      ...overrides,
+    });
+    await adapter.setup({
+      onInbound: (_platformId, _threadId, message) => {
+        inbound.push(message);
+      },
+      onInboundEvent: () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    });
+  };
+
+  const delegate = (id: string) =>
+    fake.push({ type: 'session.delegation.created', delegation: { id, type: 'delegation', target: 'client' } });
+
+  beforeEach(async () => {
+    fake = await startFakeOpenAI();
+    const port = await freePort();
+    clock = NOON_UTC;
+    inbound = [];
+    recheckGate = null;
+    recheckStarted = false;
+    vi.stubEnv('WEBHOOK_PORT', String(port));
+    base = `http://127.0.0.1:${port}/webhook/voice`;
+  });
+
+  afterEach(async () => {
+    await adapter.teardown();
+    await stopWebhookServer();
+    await fake.close();
+    vi.unstubAllEnvs();
+  });
+
+  it('tells the caller a delegation failed when the agent misses the deadline', async () => {
+    await boot({ delegationTimeoutMs: 150 });
+    expect((await offer()).status).toBe(200);
+    delegate('item_1');
+    await vi.waitFor(() => expect(inbound).toHaveLength(1));
+    await vi.waitFor(() =>
+      expect(commentary().at(-1)).toMatchObject({ delegation_id: 'item_1', content: DELEGATION_TIMEOUT_LINE }),
+    );
+
+    // The reply arriving after the deadline is still spoken, but answers nothing.
+    await adapter.deliver(lineIdForToken('tok'), null, {
+      kind: 'chat',
+      content: { text: 'Found it after all.' },
+      inReplyTo: inbound[0].id,
+    });
+    await vi.waitFor(() => expect(commentary().at(-1)).toMatchObject({ content: 'Found it after all.' }));
+    expect(commentary().at(-1)?.delegation_id).toBeNull();
+  });
+
+  it('an answered delegation never times out', async () => {
+    await boot({ delegationTimeoutMs: 200 });
+    expect((await offer()).status).toBe(200);
+    delegate('item_1');
+    await vi.waitFor(() => expect(inbound).toHaveLength(1));
+    await adapter.deliver(lineIdForToken('tok'), null, {
+      kind: 'chat',
+      content: { text: 'Done.' },
+      inReplyTo: inbound[0].id,
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(commentary().map((e) => e.content)).toEqual(['Done.']);
+  });
+
+  it('refuses a call once the line used its daily minutes, and recovers the next day', async () => {
+    await boot({ maxCallMsPerDay: 1000 });
+    const first = await offer();
+    expect(first.status).toBe(200);
+    clock += 1200; // the running call alone spends the budget
+    const capped = await offer();
+    expect(capped.status).toBe(429);
+    expect(Number(capped.headers.get('retry-after'))).toBeGreaterThan(0);
+    expect(fake.sessionCreates).toHaveLength(1);
+    const session = first.headers.get('x-voice-session')!;
+    expect((await fetch(`${base}/hangup?t=tok&session=${session}`, { method: 'POST' })).status).toBe(204);
+    expect((await offer()).status).toBe(429);
+    clock += 86_400_000;
+    expect((await offer()).status).toBe(200);
+  });
+
+  it('caps the call timer at the minutes left today', async () => {
+    await boot({ maxCallMsPerDay: 1000 });
+    expect((await offer()).status).toBe(200);
+    clock += 800;
+    const second = await offer(); // replaces the first, which is charged 800 ms
+    expect(second.status).toBe(200);
+    const sessionId = second.headers.get('x-voice-session')!;
+    await vi.waitFor(() => expect(fake.hangups).toContain(sessionId), { timeout: 2000 });
+  });
+
+  it('a teardown during the access recheck hangs up the session and never attaches', async () => {
+    await boot();
+    let release!: () => void;
+    recheckGate = new Promise((r) => (release = r));
+    const pending = offer();
+    await vi.waitFor(() => expect(recheckStarted).toBe(true));
+    await adapter.teardown();
+    release();
+    expect((await pending).status).toBe(409);
+    expect(fake.hangups).toEqual(['live_fake1']);
+    expect(fake.attaches).toHaveLength(0);
+  });
+
+  it('a teardown during the attach hangs up the session and refuses the call', async () => {
+    await boot();
+    fake.nextAttachDelayMs = 300;
+    const pending = offer();
+    await vi.waitFor(() => expect(fake.attaches).toHaveLength(1));
+    await adapter.teardown();
+    expect((await pending).status).toBe(503);
+    expect(fake.hangups).toEqual(['live_fake1']);
   });
 });

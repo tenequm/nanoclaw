@@ -24,12 +24,16 @@ export function stageGroupPersona(groupDir: string, instructions: string): boole
   }
 }
 
-/** Read a group's standing instructions without following symlinks. */
+/**
+ * Read a group's standing instructions without following symlinks. O_NONBLOCK
+ * because the group folder is writable from the agent container: a FIFO planted
+ * at this path would otherwise block the open, and with it the host event loop.
+ */
 export function readGroupPersona(groupDir: string, fileName: string = PERSONA_PREPEND_FILE): string | null {
   const file = path.join(groupDir, fileName);
   let fd: number | undefined;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     if (!fs.fstatSync(fd).isFile()) return null;
     const content = fs.readFileSync(fd, 'utf-8').trim();
     return content || null;

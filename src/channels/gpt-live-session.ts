@@ -18,8 +18,9 @@
  *    (silent) each take at most 500 tokens per append; longer text is
  *    split into several appends that share one `delegation_id`.
  *  - A caller interruption never cancels backend work. Delegations queue up
- *    in arrival order; each reply answers the oldest unanswered one, and a
- *    reply with nothing pending (a reminder, a follow-up) carries no id.
+ *    in arrival order. A reply names the delegation it answers when the
+ *    adapter knows it; otherwise it answers the oldest unanswered one. A
+ *    reply with no id (a reminder, a follow-up) answers nothing.
  */
 
 /** Any server event from the sideband. Only `type` is load-bearing here. */
@@ -138,17 +139,23 @@ export class GptLiveSession {
 
   /**
    * Speak `text` to the caller. Chunked under the per-append cap; every chunk
-   * carries the same delegation id. Without an explicit id the reply answers
-   * the oldest unanswered delegation and retires it; with nothing pending it
-   * goes out with no id. Returns the event ids sent, in order.
+   * carries the same delegation id. Without an id argument the reply answers
+   * the oldest unanswered delegation; with an id it answers that one; either
+   * way the answered delegation is retired. `null` speaks without answering
+   * anything. Returns the event ids sent, in order.
    */
   speak(text: string, delegationId?: string | null): string[] {
     const chunks = chunkForAppend(text);
     if (this.closed || chunks.length === 0) return [];
     const id = delegationId === undefined ? this.currentDelegation() : delegationId;
     const ids = this.emitChunks('session.commentary.append', chunks, id);
-    if (delegationId === undefined) this.pending.shift();
+    const answered = id === null ? -1 : this.pending.indexOf(id);
+    if (answered >= 0) this.pending.splice(answered, 1);
     return ids;
+  }
+
+  isPending(delegationId: string): boolean {
+    return this.pending.includes(delegationId);
   }
 
   /** Silent progress note for the voice model ("still working"), about the oldest pending delegation. */
