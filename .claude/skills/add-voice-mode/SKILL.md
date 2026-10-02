@@ -14,8 +14,9 @@ LiveKit Agents worker next to the host cuts the caller's audio into turns,
 transcribes them with Gemini and speaks the agent's replies with Gemini TTS.
 Native adapter: the host owns the call (admits it, opens its room, dispatches
 the worker, checks access, ends it) and routes turns and replies through its
-normal inbound and delivery paths. NanoClaw doesn't ship channels in trunk — this skill copies the adapter,
-the worker and their tests in from the `channels` branch.
+normal inbound and delivery paths. NanoClaw doesn't ship channels in trunk —
+this skill copies the adapter, the worker and their tests in from the
+`channels` branch.
 
 A **voice line** is one call link, `…/voice?t=<token>`, wired to one agent
 group. Inside NanoClaw the line goes by a _line id_, a hash of the token, so
