@@ -19,7 +19,7 @@
  *
  * Transports:
  *  - WebRTC (browser), this version: the call page at
- *    `/webhook/voice/call?t=<token>` posts its SDP offer to `…/sdp`; the
+ *    `/voice/call?t=<token>` posts its SDP offer to `…/sdp`; the
  *    host creates the session, attaches the sideband, and returns the answer.
  *  - SIP (phone), next: OpenAI posts `realtime.call.incoming` to `…/sip`.
  *
@@ -36,6 +36,7 @@
  */
 import { createHash } from 'node:crypto';
 import type http from 'node:http';
+import net from 'node:net';
 
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -60,7 +61,7 @@ import { createLiveKitVoice, LIVEKIT_ID_PREFIX, type LiveKitVoiceConfig } from '
 import { DEFAULT_WALKIE_MIRROR } from './voice-livekit-protocol.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
-import { registerWebhookHandler } from '../webhook-server.js';
+import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
 
 export const CHANNEL_TYPE = 'voice';
 const DEFAULT_API_BASE = 'https://api.openai.com/v1';
@@ -120,6 +121,92 @@ export function isLoopbackAddress(address: string | undefined): boolean {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
+/** A set of address ranges from a comma-separated CIDR list (VOICE_TRUSTED_PROXY_CIDRS, VOICE_ALLOWED_CLIENT_CIDRS). */
+export interface CidrSet {
+  /** Whether any range was configured, valid or not: a list whose every entry is invalid matches nothing. */
+  configured: boolean;
+  has(address: string | undefined): boolean;
+}
+
+/** Parses `10.0.0.0/8, fd7a::/48, 192.0.2.7`; invalid entries are skipped with a warning (they match nothing). */
+export function parseCidrs(raw: string | undefined, key: string): CidrSet {
+  const list = new net.BlockList();
+  const entries = (raw ?? '')
+    .split(',')
+    .map((e) => e.trim())
+    .filter(Boolean);
+  for (const entry of entries) {
+    const [address, bits, extra] = entry.split('/');
+    const type = net.isIPv4(address) ? 'ipv4' : net.isIPv6(address) ? 'ipv6' : null;
+    const max = type === 'ipv4' ? 32 : 128;
+    const prefix = bits === undefined ? max : /^\d{1,3}$/.test(bits) ? Number(bits) : NaN;
+    if (!type || extra !== undefined || !(prefix >= 0 && prefix <= max)) {
+      log.warn(`gpt-live: ignoring an invalid ${key} entry`, { entry });
+      continue;
+    }
+    list.addSubnet(address, prefix, type);
+  }
+  return {
+    configured: entries.length > 0,
+    has(address) {
+      // An IPv4 peer on a dual-stack socket arrives as ::ffff:a.b.c.d.
+      const plain = address?.trim().replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/i, '');
+      if (!plain) return false;
+      const type = net.isIPv4(plain) ? 'ipv4' : net.isIPv6(plain) ? 'ipv6' : null;
+      return type !== null && list.check(plain, type);
+    },
+  };
+}
+
+/** Who may reach the browser-facing voice routes besides loopback peers. */
+export interface VoiceProxyPolicy {
+  /** Reverse proxies whose X-Forwarded-For is believed; empty means none, today's loopback-only behaviour. */
+  trustedProxies: CidrSet;
+  /** Clients a trusted proxy may forward; not configured means any client it forwards. */
+  allowedClients: CidrSet;
+}
+
+/**
+ * Whether a browser-facing voice request is admitted: a loopback peer, or a trusted proxy forwarding
+ * an allowed client. The client is the rightmost X-Forwarded-For hop outside the trusted proxies (the
+ * leftmost when every hop is one): hops to its left are whatever the client claimed.
+ */
+export function admitsVoicePeer(
+  policy: VoiceProxyPolicy,
+  peer: string | undefined,
+  forwardedFor: string | string[] | undefined,
+): boolean {
+  if (isLoopbackAddress(peer)) return true;
+  if (!policy.trustedProxies.has(peer)) return false;
+  if (!policy.allowedClients.configured) return true;
+  const hops = [forwardedFor ?? []]
+    .flat()
+    .flatMap((h) => h.split(','))
+    .map((h) => h.trim())
+    .filter(Boolean);
+  const client = hops.findLast((h) => !policy.trustedProxies.has(h)) ?? hops[0];
+  return policy.allowedClients.has(client);
+}
+
+/** Browser routes under the short /voice prefix a reverse proxy forwards; the bare prefix is the walkie page. */
+const CLEAN_PREFIX_ROUTES = new Set(['call', 'info', 'sdp', 'hangup', 'livekit', 'livekit/token', 'livekit/end']);
+const LEGACY_PREFIX = /^\/webhook\/voice(?:\/|$)/;
+const CLEAN_PREFIX = /^\/voice(?:\/|$)/;
+
+/**
+ * The voice route of a request path: anything under /webhook/voice (old links, the worker), or a
+ * browser route under /voice. Null for a /voice path that is not one, the worker's routes included.
+ */
+export function voiceRoute(pathname: string): string | null {
+  if (LEGACY_PREFIX.test(pathname)) return pathname.replace(LEGACY_PREFIX, '').replace(/\/+$/, '');
+  if (!CLEAN_PREFIX.test(pathname)) return null;
+  const route = pathname.replace(CLEAN_PREFIX, '').replace(/\/+$/, '') || 'livekit';
+  return CLEAN_PREFIX_ROUTES.has(route) ? route : null;
+}
+
+/** The worker's routes keep their own per-call secret and stay loopback-only, never admitted through a proxy. */
+const isWorkerRoute = (route: string): boolean => /^livekit\/agent(?:\/|$)/.test(route);
+
 /**
  * A voice line is DM-shaped: everything the voice model delegates is for the
  * agent (pattern '.'), there are no threads and no platform mention concept.
@@ -164,10 +251,14 @@ export interface GptLiveConfig {
   maxCallMsPerDay?: number;
   /** How long a delegation may wait for the agent before the caller hears it failed. */
   delegationTimeoutMs?: number;
-  /** Enables the LiveKit walkie-talkie path under /webhook/voice/livekit; without it those routes answer 503. */
+  /** Enables the LiveKit walkie-talkie path (/voice, and /webhook/voice/livekit); without it those routes answer 503. */
   livekit?: LiveKitVoiceConfig;
   /** Serve the voice routes to non-loopback peers too (GPT_LIVE_ALLOW_NON_LOOPBACK); for local development only. */
   allowNonLoopback?: boolean;
+  /** VOICE_TRUSTED_PROXY_CIDRS: reverse proxies (e.g. a Docker bridge subnet) admitted for the browser routes. */
+  trustedProxyCidrs?: string;
+  /** VOICE_ALLOWED_CLIENT_CIDRS: clients those proxies may forward (X-Forwarded-For); unset is any. */
+  allowedClientCidrs?: string;
 }
 
 export type { SidebandSocket } from './gpt-live-sideband.js';
@@ -239,6 +330,10 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
   const apiBase = (config.apiBase ?? DEFAULT_API_BASE).replace(/\/+$/, '');
   const wsBase = (config.wsBase ?? DEFAULT_WS_BASE).replace(/\/+$/, '');
   const tokens = new Set(config.linkTokens.map((t) => t.trim()).filter(Boolean));
+  const proxyPolicy: VoiceProxyPolicy = {
+    trustedProxies: parseCidrs(config.trustedProxyCidrs, 'VOICE_TRUSTED_PROXY_CIDRS'),
+    allowedClients: parseCidrs(config.allowedClientCidrs, 'VOICE_ALLOWED_CLIENT_CIDRS'),
+  };
   const resolveLine =
     config.resolveLine ??
     ((platformId: string, options?: ResolveLineOptions) =>
@@ -621,15 +716,24 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
     res.end(body);
   };
 
-  /** HTTP routes under /webhook/voice/… on the shared webhook server. */
+  /** HTTP routes under /webhook/voice/… and the browser's under /voice/… on the shared webhook server. */
   const handleHttp = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     const url = new URL(req.url ?? '/', 'http://localhost');
-    const route = url.pathname.replace(/^\/webhook\/voice(?:\/|$)/, '').replace(/\/+$/, '');
+    const parsed = voiceRoute(url.pathname);
     const token = url.searchParams.get('t') ?? '';
     // Before any token check: a link must not be usable, or probed, from the LAN over plain HTTP.
-    if (!config.allowNonLoopback && !isLoopbackAddress(req.socket.remoteAddress)) {
-      return reply(res, 403, 'Voice calls are served through the host front only');
+    const peer = req.socket.remoteAddress;
+    if (!config.allowNonLoopback && !isLoopbackAddress(peer)) {
+      const browserRoute = parsed !== null && !isWorkerRoute(parsed);
+      if (!browserRoute || !admitsVoicePeer(proxyPolicy, peer, req.headers['x-forwarded-for'])) {
+        if (proxyPolicy.trustedProxies.has(peer)) {
+          log.warn('gpt-live: refused a proxied voice request', { peer, forwardedFor: req.headers['x-forwarded-for'] });
+        }
+        return reply(res, 403, 'Voice calls are served through the host front only');
+      }
     }
+    if (parsed === null) return reply(res, 404, 'Not found');
+    const route = parsed;
     try {
       // The shared webhook server has no unregister; after teardown the routes stay reachable
       // and must refuse rather than start sessions for a channel that is no longer running.
@@ -752,17 +856,18 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
     walkieLink(platformId: string): string | null {
       if (!livekit) return null;
       const token = [...tokens].find((t) => lineIdForToken(t) === platformId);
-      return token
-        ? `${config.publicUrl.replace(/\/+$/, '')}/webhook/voice/livekit?t=${encodeURIComponent(token)}`
-        : null;
+      return token ? `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}` : null;
     },
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
       registerWebhookHandler(CHANNEL_TYPE, handleHttp);
+      registerRootHandler(CHANNEL_TYPE, handleHttp);
       connected = true;
       log.info('gpt-live: ready', {
-        callUrl: `${config.publicUrl.replace(/\/+$/, '')}/webhook/voice/call?t=<link token>`,
+        callUrl: `${config.publicUrl.replace(/\/+$/, '')}/voice/call?t=<link token>`,
+        walkieUrl: livekit ? `${config.publicUrl.replace(/\/+$/, '')}/voice?t=<link token>` : 'off',
+        trustedProxies: config.trustedProxyCidrs?.trim() || 'none',
         lines: tokens.size,
         voice: config.voice,
         livekit: config.livekit ? config.livekit.url : 'off',
@@ -885,6 +990,8 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'GPT_LIVE_MAX_MINUTES_PER_DAY',
       'GPT_LIVE_DELEGATION_TIMEOUT_SECONDS',
       'GPT_LIVE_ALLOW_NON_LOOPBACK',
+      'VOICE_TRUSTED_PROXY_CIDRS',
+      'VOICE_ALLOWED_CLIENT_CIDRS',
       'GPT_LIVE_VOCABULARY',
       'GEMINI_API_KEY',
       'LIVEKIT_URL',
@@ -921,6 +1028,8 @@ registerChannelAdapter(CHANNEL_TYPE, {
       linkTokens,
       ui: parseUiConfig(env.GPT_LIVE_UI),
       allowNonLoopback: env.GPT_LIVE_ALLOW_NON_LOOPBACK === '1',
+      trustedProxyCidrs: env.VOICE_TRUSTED_PROXY_CIDRS,
+      allowedClientCidrs: env.VOICE_ALLOWED_CLIENT_CIDRS,
       maxCallDurationMs: Number(env.GPT_LIVE_MAX_CALL_SECONDS ?? 900) * 1000,
       maxCallsPerHour: Number(env.GPT_LIVE_MAX_CALLS_PER_HOUR ?? 12),
       maxCallMsPerDay: Number(env.GPT_LIVE_MAX_MINUTES_PER_DAY ?? 120) * 60_000,

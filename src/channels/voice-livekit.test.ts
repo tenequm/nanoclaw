@@ -373,7 +373,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('renders the walkie-talkie link of a line it holds the token for, and no other', () => {
     const adapter = h.adapter as VoiceChannelAdapter;
-    expect(adapter.walkieLink(LINE)).toBe(`${h.hostUrl}/webhook/voice/livekit?t=tok123`);
+    expect(adapter.walkieLink(LINE)).toBe(`${h.hostUrl}/voice?t=tok123`);
     expect(adapter.walkieLink(lineIdForToken('other'))).toBeNull();
   });
 
@@ -409,6 +409,22 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     h.access.enabled = false;
     expect((await post(`${h.base}/livekit/token?t=tok123`)).status).toBe(403);
     expect(h.lk.rooms).toEqual([]);
+  });
+
+  it('serves the walkie page and its routes under the short /voice prefix, never the worker routes', async () => {
+    const page = await fetch(`${h.hostUrl}/voice?t=tok123`);
+    expect(page.status).toBe(200);
+    expect(await page.text()).toBe(callPageHtml({ transport: 'livekit' }));
+    expect((await fetch(`${h.hostUrl}/voice/?t=tok123`)).status).toBe(200);
+    expect((await fetch(`${h.hostUrl}/voice/info?t=tok123`)).status).toBe(200);
+    const res = await post(`${h.hostUrl}/voice/livekit/token?t=tok123`);
+    expect(res.status).toBe(200);
+    const { callId } = (await res.json()) as TokenResponse;
+    expect(h.lk.rooms).toHaveLength(1);
+    for (const path of ['events', 'joined', 'utterance', 'ended']) {
+      expect((await post(`${h.hostUrl}/voice/livekit/agent/${path}?call=${callId}`, { callId })).status).toBe(404);
+    }
+    expect((await post(`${h.hostUrl}/voice/livekit/end?t=tok123`, { callId })).status).toBe(204);
   });
 
   it('opens a unique room, dispatches the worker with the call metadata and mints a room-only caller token', async () => {

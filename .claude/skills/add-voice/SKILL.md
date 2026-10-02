@@ -14,7 +14,7 @@ delegations to inbound messages and agent replies to spoken commentary.
 NanoClaw doesn't ship channels in trunk — this skill copies the adapter and its
 tests in from the `channels` branch.
 
-A **voice line** is one call link, `…/webhook/voice/call?t=<token>`, wired to
+A **voice line** is one call link, `…/voice/call?t=<token>`, wired to
 one agent group. Every call on the link lands in the same agent session, so the
 agent remembers the previous call. Inside NanoClaw the line goes by a _line id_,
 a hash of the token, so the token itself stays in the link and never reaches the
@@ -189,33 +189,93 @@ security find-generic-password -s nanoclaw-openai -a "$USER" -w >/dev/null
 
 ### Public URL
 
-The call page and the SDP handshake are served by the host's webhook server.
-Give the origin a caller's browser reaches it at — `http://localhost:3000` for
-a local try, a tailnet or tunnel URL to call from a phone's browser. Browsers
-allow the microphone only on `localhost` or HTTPS. Set-if-absent, so a re-run
-keeps your value:
-
-On a tailnet, `tailscale serve` gives the host an HTTPS name with a valid
-certificate. Mount the webhook path on it; the target repeats the path because
-serve strips the mount prefix before proxying (run as root or a Tailscale
-operator; an existing mount at `/` for another service is unaffected):
-
-```bash
-tailscale serve --bg --set-path=/webhook http://127.0.0.1:3000/webhook
-```
-
-The origin is then `https://<host>.<tailnet>.ts.net` and the call page lives at
-`…/webhook/voice/call?t=<token>`.
+The call pages and their routes are served by the host's webhook server under
+`/voice`: the OpenAI call page at `…/voice/call?t=<token>`, the LiveKit
+walkie-talkie at `…/voice?t=<token>`, and the routes those pages call next to
+them (`/voice/info`, `/voice/sdp`, `/voice/hangup`, `/voice/livekit/token`,
+`/voice/livekit/end`). The older `…/webhook/voice/…` paths keep working. Give
+the origin a caller's browser reaches it at — `http://localhost:3000` for a
+local try, an HTTPS name to call from a phone's browser. Browsers allow the
+microphone only on `localhost` or HTTPS.
 
 The webhook server listens on every interface, so the voice routes answer only
-loopback peers (403 otherwise, before any token check): a call link must not
-work, or be probed, over plain HTTP from the LAN. A front such as `tailscale
-serve` or a local reverse proxy connects from `127.0.0.1` and passes. For a
-local-development setup whose front connects from elsewhere (a container
-bridge, another machine), set `GPT_LIVE_ALLOW_NON_LOOPBACK=1`.
+loopback peers by default (403 otherwise, before any token check): a call link
+must not work, or be probed, over plain HTTP from the LAN. Put one of these
+fronts in front of it.
+
+**(a) Tailscale Serve.** On a tailnet, `tailscale serve` gives the host an HTTPS
+name with a valid certificate and connects from `127.0.0.1`, so nothing else is
+needed. Mount `/voice`; the target repeats the path because serve strips the
+mount prefix before proxying (run as root or a Tailscale operator; an existing
+mount at `/` for another service is unaffected). Keep a `/webhook` mount only
+if older `…/webhook/voice/…` links are still in use:
+
+```bash
+tailscale serve --bg --set-path=/voice http://127.0.0.1:3000/voice
+```
+
+The origin is then `https://<host>.<tailnet>.ts.net`.
+
+**(b) A reverse proxy in a container** (Traefik, Caddy, nginx on a Docker
+bridge network). It connects from a container address, not loopback, so tell
+the host which proxies to trust and, optionally, which clients they may
+forward:
+
+| Key | Default | What |
+| --- | --- | --- |
+| `VOICE_TRUSTED_PROXY_CIDRS` | empty (loopback only) | Comma-separated CIDRs of the proxy as the host sees it. Use the narrowest range: the proxy's own address (`/32`) or its Docker network's subnet (`docker network inspect <network>`). Any container in a trusted range can claim any client. |
+| `VOICE_ALLOWED_CLIENT_CIDRS` | empty (any client the proxy forwards) | Comma-separated CIDRs the forwarded client must be in. The client is the rightmost `X-Forwarded-For` hop outside the trusted proxies, so a client cannot prepend its way in. For a tailnet-only service: `100.64.0.0/10,fd7a:115c:a1e0::/48`. |
+
+A request is admitted if its peer is loopback, or its peer is in
+`VOICE_TRUSTED_PROXY_CIDRS` and the forwarded client is in
+`VOICE_ALLOWED_CLIENT_CIDRS` (when set). LAN peers outside the trusted ranges
+still get 403, and an `X-Forwarded-For` from them is ignored. The LiveKit
+worker's routes (`/webhook/voice/livekit/agent/…`) never pass through the proxy
+gate: they stay loopback-only and are not served under `/voice` at all. Invalid
+entries are logged and match nothing.
+
+A Traefik example (dynamic file configuration; `voice.example.com`, the
+resolver name and the host gateway address are placeholders):
+
+```yaml
+http:
+  routers:
+    nanoclaw-voice:
+      rule: Host(`voice.example.com`) && PathPrefix(`/voice`)
+      entryPoints: [websecure]
+      tls: { certResolver: letsencrypt }
+      middlewares: [voice-allowlist]
+      service: nanoclaw-voice
+  middlewares:
+    voice-allowlist:
+      ipAllowList:
+        sourceRange: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+  services:
+    nanoclaw-voice:
+      loadBalancer:
+        servers:
+          - url: http://172.18.0.1:3000   # the proxy network's gateway (the Docker host), WEBHOOK_PORT
+```
+
+In `.env`, with the proxy network's subnet (or the proxy's `/32`) as the trusted range:
+
+```
+GPT_LIVE_PUBLIC_URL=https://voice.example.com
+VOICE_TRUSTED_PROXY_CIDRS=172.18.0.0/16
+VOICE_ALLOWED_CLIENT_CIDRS=100.64.0.0/10,fd7a:115c:a1e0::/48
+```
+
+The two allowlists are independent layers: the proxy's middleware refuses
+outsiders at the edge, and the host refuses anything that skipped the proxy or
+came through it from elsewhere. For a local-development setup that needs no
+gate at all, `GPT_LIVE_ALLOW_NON_LOOPBACK=1` serves the voice routes to every
+peer.
+
+The origin to give below is the front's, with no path. Set-if-absent, so a
+re-run keeps your value:
 
 ```nc:prompt public_url validate:^https?://\S+$ normalize:rstrip-slash
-What origin can a caller's browser reach this NanoClaw host at? (e.g. http://localhost:3000 or https://nanoclaw.example.ts.net)
+What origin can a caller's browser reach this NanoClaw host at? (e.g. http://localhost:3000, https://nanoclaw.example.ts.net or https://voice.example.com)
 ```
 
 ```nc:env-set
@@ -313,7 +373,7 @@ seconds during a call; revocation or a changed wiring ends the call.
 Tell the user where to call from:
 
 ```nc:operator
-The call link is {{public_url}}/webhook/voice/call?t={{link_token}} — keep it private, anyone holding it is treated as {{caller_name}} and can talk to {{agent_folder}} on your OpenAI bill. Open it in a browser, allow the microphone, press Call and say hello. Ask something that needs memory ("what did we decide about the launch date?") to see the agent get involved; the page shows captions when the call carries them.
+The call link is {{public_url}}/voice/call?t={{link_token}} — keep it private, anyone holding it is treated as {{caller_name}} and can talk to {{agent_folder}} on your OpenAI bill. Open it in a browser, allow the microphone, press Call and say hello. Ask something that needs memory ("what did we decide about the launch date?") to see the agent get involved; the page shows captions when the call carries them.
 ```
 
 ## Smoke test without a microphone
@@ -410,7 +470,8 @@ call and connects to nothing.
 ## LiveKit walkie-talkie (WebRTC)
 
 The same lines also take calls over WebRTC through a self-hosted
-[LiveKit](https://docs.livekit.io/) server at `…/webhook/voice/livekit?t=<token>`
+[LiveKit](https://docs.livekit.io/) server at `…/voice?t=<token>` (the older
+`…/webhook/voice/livekit?t=<token>` still works)
 (same token, line, agent wiring and access checks as `/call`). On
 this path the caller talks to the line's real agent, not to a voice model: each
 spoken turn is transcribed and sent to the agent as a message, and each agent
@@ -432,7 +493,8 @@ same box; defaults to `LIVEKIT_URL`), `LIVEKIT_AGENT_NAME` (dispatch name,
 default `nanoclaw-voice`; set the same value for host and worker),
 `LIVEKIT_HOST_URL` (worker only: where it reaches this host's webhook server,
 default `http://127.0.0.1:<WEBHOOK_PORT>`; it must be a loopback address unless
-`GPT_LIVE_ALLOW_NON_LOOPBACK=1`, like every voice route; the worker never takes
+`GPT_LIVE_ALLOW_NON_LOOPBACK=1`, like the worker's routes on the host, which no
+trusted proxy opens; the worker never takes
 an address from the dispatch). The walkie-talkie settings, read by the host and
 handed to the worker with each call:
 
@@ -514,7 +576,7 @@ environment and every forked job, and agents-js lets `LIVEKIT_URL` from the
 environment override `LIVEKIT_WORKER_URL`. Set `Environment=LOG_LEVEL=debug`
 for verbose logs.
 
-How a call runs: the page posts to `/webhook/voice/livekit/token`; the host
+How a call runs: the page posts to `/voice/livekit/token`; the host
 admits the call against the shared hourly and daily limits, ends any other call
 on the line (newest wins, across both engines), creates a unique room
 `voice-<line id>-<random>`, dispatches the worker to it with the call metadata

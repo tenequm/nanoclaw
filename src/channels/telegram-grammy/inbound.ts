@@ -148,7 +148,8 @@ function formatForwardHeader(origin: MessageOrigin): string {
   return `[forwarded from ${describeOrigin(origin)}, ${origDate}]`;
 }
 
-const VOICE_LINK_PATH = '/webhook/voice/';
+// Covers /voice?t=, /voice/call?t= and the older /webhook/voice/...?t= links alike.
+const VOICE_LINK_PATH = '/voice';
 const LINK_TOKEN_PARAM = /[?&]t=[^&#]/;
 
 /**

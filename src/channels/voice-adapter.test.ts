@@ -22,11 +22,15 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { ChannelAdapter, InboundMessage } from './adapter.js';
 import type { ResolveLineOptions } from './gpt-live-prompt.js';
 import {
+  admitsVoicePeer,
   createGptLiveAdapter,
   delegationMessageId,
   DELEGATION_TIMEOUT_LINE,
   lineIdForToken,
+  parseCidrs,
+  voiceRoute,
   type GptLiveConfig,
+  type VoiceProxyPolicy,
 } from './voice.js';
 import type { LiveKitServerApi, MirrorApi } from './voice-livekit.js';
 import type { LiveKitJobMetadata } from './voice-livekit-protocol.js';
@@ -306,6 +310,24 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     const csp = res.headers.get('content-security-policy') ?? '';
     expect(csp).toContain("frame-ancestors 'none'");
     expect(csp).toContain("connect-src 'self'");
+  });
+
+  it('serves the call page and its routes under the short /voice prefix too', async () => {
+    const root = base.replace(/\/webhook\/voice$/, '');
+    const page = await fetch(`${root}/voice/call?t=tok123`);
+    expect(page.status).toBe(200);
+    expect(page.headers.get('x-frame-options')).toBe('DENY');
+    expect(await page.text()).toContain('RTCPeerConnection');
+    const info = await fetch(`${root}/voice/info?t=tok123`);
+    expect(info.status).toBe(200);
+    expect(await info.json()).toEqual({ agent: 'Andy 🐾', caller: 'Ethan' });
+    expect((await fetch(`${root}/voice/sdp?t=nope`, { method: 'POST', body: 'v=0\r\noffer' })).status).toBe(403);
+    expect((await fetch(`${root}/voice/hangup?t=tok123&session=none`, { method: 'POST' })).status).toBe(204);
+    // The walkie page lives at the bare prefix; LiveKit is off on this host.
+    expect((await fetch(`${root}/voice?t=tok123`)).status).toBe(503);
+    expect((await fetch(`${root}/voice/sip`, { method: 'POST' })).status).toBe(404);
+    expect((await fetch(`${root}/voicemail?t=tok123`)).status).toBe(404);
+    expect(fake.sessionCreates).toHaveLength(0);
   });
 
   it('refuses an SDP offer without a known link token', async () => {
@@ -935,5 +957,73 @@ describe('voice delegation deadlines, daily budget and teardown races', () => {
     await adapter.teardown();
     expect((await pending).status).toBe(503);
     expect(fake.hangups).toEqual(['live_fake1']);
+  });
+});
+
+describe('voice routes and the reverse-proxy gate', () => {
+  it('maps both prefixes to routes, the short one only for browser routes', () => {
+    expect(voiceRoute('/webhook/voice/call')).toBe('call');
+    expect(voiceRoute('/webhook/voice/livekit/agent/events')).toBe('livekit/agent/events');
+    expect(voiceRoute('/voice')).toBe('livekit');
+    expect(voiceRoute('/voice/')).toBe('livekit');
+    expect(voiceRoute('/voice/call/')).toBe('call');
+    expect(voiceRoute('/voice/livekit/token')).toBe('livekit/token');
+    expect(voiceRoute('/voice/livekit/agent/events')).toBeNull();
+    expect(voiceRoute('/voice/livekit%2Fagent%2Fevents')).toBeNull();
+    expect(voiceRoute('/voice//livekit/agent/joined')).toBeNull();
+    expect(voiceRoute('/voice/sip')).toBeNull();
+    expect(voiceRoute('/voicemail')).toBeNull();
+  });
+
+  const policy = (trusted?: string, allowed?: string): VoiceProxyPolicy => ({
+    trustedProxies: parseCidrs(trusted, 'VOICE_TRUSTED_PROXY_CIDRS'),
+    allowedClients: parseCidrs(allowed, 'VOICE_ALLOWED_CLIENT_CIDRS'),
+  });
+  const tailnet = '100.64.0.0/10, fd7a:115c:a1e0::/48';
+
+  it('admits loopback peers and refuses LAN peers with no proxy configured', () => {
+    const p = policy();
+    expect(admitsVoicePeer(p, '127.0.0.1', undefined)).toBe(true);
+    expect(admitsVoicePeer(p, '::1', undefined)).toBe(true);
+    expect(admitsVoicePeer(p, '::ffff:127.0.0.1', '203.0.113.9')).toBe(true);
+    expect(admitsVoicePeer(p, '192.168.1.20', undefined)).toBe(false);
+    expect(admitsVoicePeer(p, '172.18.0.5', '100.100.1.2')).toBe(false);
+    expect(admitsVoicePeer(p, undefined, undefined)).toBe(false);
+  });
+
+  it('admits a trusted proxy forwarding an allowed client, and refuses a disallowed one', () => {
+    const p = policy('172.18.0.0/16', tailnet);
+    expect(admitsVoicePeer(p, '172.18.0.5', '100.100.1.2')).toBe(true);
+    expect(admitsVoicePeer(p, '::ffff:172.18.0.5', 'fd7a:115c:a1e0::1234')).toBe(true);
+    expect(admitsVoicePeer(p, '172.18.0.5', '203.0.113.9')).toBe(false);
+    expect(admitsVoicePeer(p, '172.18.0.5', '192.168.1.20')).toBe(false);
+    expect(admitsVoicePeer(p, '172.18.0.5', undefined)).toBe(false);
+    expect(admitsVoicePeer(p, '172.18.0.5', 'not-an-ip')).toBe(false);
+  });
+
+  it('takes the rightmost hop outside the trusted proxies as the client', () => {
+    const p = policy('172.18.0.0/16', tailnet);
+    // A client cannot prepend its way in: the proxy appends the real peer last.
+    expect(admitsVoicePeer(p, '172.18.0.5', '100.100.1.2, 203.0.113.9')).toBe(false);
+    expect(admitsVoicePeer(p, '172.18.0.5', '203.0.113.9, 100.100.1.2')).toBe(true);
+    expect(admitsVoicePeer(p, '172.18.0.5', ['203.0.113.9', '100.100.1.2, 172.18.0.9'])).toBe(true);
+  });
+
+  it('ignores X-Forwarded-For from a peer outside the trusted proxies', () => {
+    const p = policy('172.18.0.0/16', tailnet);
+    expect(admitsVoicePeer(p, '192.168.1.20', '100.100.1.2')).toBe(false);
+    expect(admitsVoicePeer(p, '172.19.0.5', '100.100.1.2')).toBe(false);
+  });
+
+  it('admits any client a trusted proxy forwards when no client ranges are set', () => {
+    const p = policy('172.18.0.5');
+    expect(admitsVoicePeer(p, '172.18.0.5', '203.0.113.9')).toBe(true);
+    expect(admitsVoicePeer(p, '172.18.0.6', '203.0.113.9')).toBe(false);
+  });
+
+  it('fails closed on invalid ranges', () => {
+    expect(admitsVoicePeer(policy('172.18.0.0/33, nonsense'), '172.18.0.5', undefined)).toBe(false);
+    // A client list whose entries are all invalid admits no client, not every client.
+    expect(admitsVoicePeer(policy('172.18.0.0/16', '100.64.0.0/x'), '172.18.0.5', '100.100.1.2')).toBe(false);
   });
 });
