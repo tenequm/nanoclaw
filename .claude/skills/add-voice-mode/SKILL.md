@@ -693,10 +693,13 @@ or discard; after either the microphone stays off until the next talk. The page
 publishes its microphone muted in review and offers the mode only when the
 worker sets the attribute `nanoclaw.voice.review` to "1". It drives the worker
 with RPCs (`nanoclaw.voice.mode`, `.talk`, `.done`, `.send`, `.discard`; JSON
-`ReviewRequest` in, `ReviewReply` out, see `voice-livekit-protocol.ts`), so the
-caller's token may publish data; the worker answers them only from the caller's
-identity, one at a time, each for the draft id it names (a late or repeated one
-is "stale"). The worker sends every change of its `CallReviewState` (`{"seq",
+`ReviewRequest` in, `ReviewReply` out, see `voice-livekit-protocol.ts`; a mode
+request naming no mode only re-reads the state, as the page does after a
+reconnect or an unanswered request), so the caller's token may publish data. The
+worker answers them only from the caller's identity, one at a time, each for the
+draft id it names (a late or repeated one is "stale"), and closes agents-js's
+own session control topic (`lk.agent.session`), which the caller would
+otherwise reach. The worker sends every change of its `CallReviewState` (`{"seq",
 "mode", "draft": {"id", "state": "recording" | "finishing" | "ready" | "empty" |
 "failed", "text", "tooLong"?, "reason"?: "agent" | "switch"}}`) on the topic
 `nanoclaw.voice.review`. In review the session's turn detection is manual and

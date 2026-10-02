@@ -289,10 +289,12 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const reviewSegments = useRef(new Set<string>())
   /** The open recording's segments, as the transcription has them so far. */
   const provisionalSegs = useRef(new Map<string, string>())
-  /** Segments of recordings before the open one: a late update to one never shows as heard now. */
-  const closedSegs = useRef(new Set<string>())
-  /** Worker turns that are sent review drafts. */
+  /** The recording each review segment first showed up in: a late update to an older one never shows as heard now. */
+  const segRecording = useRef(new Map<string, number>())
+  const recordings = useRef(0)
+  /** Worker turns that are sent review drafts, and the newest of them. */
   const reviewTurns = useRef(new Set<number>())
+  const lastReviewTurn = useRef(0)
   /** This call already asked the worker for the review mode it was started in. */
   const reviewAsked = useRef(false)
   const agentId = useRef<string | null>(null)
@@ -421,6 +423,34 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     [teardown, setPhase]
   )
 
+  const rpc = useCallback(
+    /** The worker's reply; null when it did not answer, undefined when the call it was for is over. */
+    async (op: ReviewOp, fields: { draft?: number; mode?: TurnMode; afterTurn?: number } = {}): Promise<ReviewReply | null | undefined> => {
+      const id = agentId.current
+      if (!id) return null
+      const call = generation.current
+      try {
+        const raw = await room.localParticipant.performRpc({
+          destinationIdentity: id,
+          method: REVIEW_RPC[op],
+          payload: JSON.stringify({ gen: ++opGen.current, ...fields }),
+          responseTimeout: REVIEW_RPC_TIMEOUT_MS,
+        })
+        if (generation.current !== call) return undefined
+        const reply = JSON.parse(raw) as ReviewReply
+        return typeof reply?.ok === "boolean" && typeof reply.seq === "number" ? reply : null
+      } catch {
+        return generation.current === call ? null : undefined
+      }
+    },
+    [room]
+  )
+
+  /** Ask the worker to send its review state again (a mode request naming no mode only re-reads it). */
+  const resyncReview = useCallback(() => {
+    if (active.current && reviewSeq.current > 0) void rpc("mode")
+  }, [rpc])
+
   // Room events for the hook's lifetime; each handler acts only on a call in progress.
   useEffect(() => {
     const onTrack = (track: RemoteTrack) => {
@@ -440,12 +470,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     }
     const onReconnected = () => {
       setReconnecting(false)
-      // The worker's review state may have moved on meanwhile: ask for it again.
-      const id = agentId.current
-      if (!active.current || !id || reviewSeq.current === 0) return
-      void room.localParticipant
-        .performRpc({ destinationIdentity: id, method: REVIEW_RPC.mode, payload: JSON.stringify({ gen: ++opGen.current, mode: reviewRef.current.mode }), responseTimeout: REVIEW_RPC_TIMEOUT_MS })
-        .catch(() => {})
+      // The worker's review state may have moved on meanwhile: read it again, never set it.
+      resyncReview()
     }
     // The host rewrites the room metadata when a mid-call /voice moves the call (CallRoomMetadata).
     const onMetadata = (metadata: string | undefined) => {
@@ -479,7 +505,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       room.off(RoomEvent.Reconnected, onReconnected)
       room.off(RoomEvent.RoomMetadataChanged, onMetadata)
     }
-  }, [room, end])
+  }, [room, end, resyncReview])
 
   // The agent's state drives the phase once the caller is in the room.
   useEffect(() => {
@@ -526,7 +552,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (!active.current) return
     let next = linesRef.current
     let touched: number | null = null
-    let provisional: string | null = null
+    let heard = false
     for (const t of transcriptions) {
       const attrs = t.streamInfo.attributes ?? {}
       const key = attrs["lk.segment_id"] || t.streamInfo.id
@@ -540,12 +566,13 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       const r = reviewRef.current
       if (mine && (reviewSegments.current.has(key) || (r.mode === "review" && !segmentLine.current.has(key)) || r.pending?.to === "review")) {
         reviewSegments.current.add(key)
+        if (!segRecording.current.has(key)) segRecording.current.set(key, recordings.current)
         const state = r.draft?.state
         // Only an open recording shows what is heard; a frozen draft shows the worker's text.
         const open = state === "recording" || state === "finishing" || r.pending?.op === "talk" || r.pending?.to === "review"
-        if (open && !closedSegs.current.has(key)) {
+        if (open && segRecording.current.get(key) === recordings.current) {
           provisionalSegs.current.set(key, text)
-          provisional = [...provisionalSegs.current.values()].join(" ")
+          heard = true
         }
         continue
       }
@@ -565,9 +592,9 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         touched = id
       }
     }
-    if (provisional !== null) {
-      const heard = provisional
-      updateReview((r) => ({ ...r, provisional: heard }))
+    if (heard) {
+      const provisional = [...provisionalSegs.current.values()].join(" ")
+      updateReview((r) => ({ ...r, provisional }))
     }
     if (touched === null) return
     commitLines(next)
@@ -601,6 +628,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         if (fromDraft && status.text) {
           // A sent draft enters the history once, with exactly the text the caller approved.
           reviewTurns.current.add(status.turn)
+          lastReviewTurn.current = Math.max(lastReviewTurn.current, status.turn)
           const line: Line = { id: nextId.current++, from: "user", text: status.text, at: secondsIn(), turn: shown, mark: { status: "sending" } }
           coveredLines.current.add(line.id)
           next = [...next, line]
@@ -609,7 +637,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         continue
       }
       next = applyTurn(next, coveredLines.current, status, () => ({ id: nextId.current++, from: "user", text: "", at: secondsIn() }), shown)
-      if (fromDraft && status.turn === Math.max(...reviewTurns.current)) delivery = status.status
+      if (fromDraft && status.turn === lastReviewTurn.current) delivery = status.status
     }
     if (next !== linesRef.current) commitLines(next)
     if (delivery) {
@@ -633,8 +661,9 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     doneReviewStreams.current.clear()
     reviewSegments.current.clear()
     provisionalSegs.current.clear()
-    closedSegs.current.clear()
+    segRecording.current.clear()
     reviewTurns.current.clear()
+    lastReviewTurn.current = 0
     setError(null)
     setErrorKind(null)
     setEndedText(null)
@@ -679,10 +708,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         await track.mute()
         mutedRef.current = true
         setMutedState(true)
-      }
-      if (cancelled()) {
-        track.stop()
-        return
+        if (cancelled()) {
+          track.stop()
+          return
+        }
       }
       mic.current = track
       setMicStream(new MediaStream([track.mediaStreamTrack]))
@@ -691,7 +720,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         if (mic.current !== track || muteBusy.current) return
         mutedRef.current = track.isMuted
         setMutedState(track.isMuted)
-        updateReview((r) => ({ ...r, micOn: !track.isMuted }))
       }
       track.on(TrackEvent.Muted, follow)
       track.on(TrackEvent.Unmuted, follow)
@@ -783,45 +811,28 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       if (mic.current !== track) return false
       mutedRef.current = track.isMuted
       setMutedState(track.isMuted)
-      updateReview((r) => ({ ...r, micOn: !track.isMuted }))
       return track.isMuted !== on
     },
-    [updateReview]
-  )
-
-  const rpc = useCallback(
-    async (op: ReviewOp, fields: { draft?: number; mode?: TurnMode; afterTurn?: number } = {}): Promise<ReviewReply | null> => {
-      const id = agentId.current
-      if (!id) return null
-      try {
-        const raw = await room.localParticipant.performRpc({
-          destinationIdentity: id,
-          method: REVIEW_RPC[op],
-          payload: JSON.stringify({ gen: ++opGen.current, ...fields }),
-          responseTimeout: REVIEW_RPC_TIMEOUT_MS,
-        })
-        const reply = JSON.parse(raw) as ReviewReply
-        return typeof reply?.ok === "boolean" && typeof reply.seq === "number" ? reply : null
-      } catch {
-        return null
-      }
-    },
-    [room]
+    []
   )
 
   /** The operation is over once the state its reply named has arrived (it may already have). */
   const settleOp = useCallback(
-    (reply: ReviewReply | null, extra: Partial<ReviewState> = {}) => {
+    (reply: ReviewReply | null | undefined, extra: Partial<ReviewState> = {}) => {
+      // An answer for a call that is over changes nothing in this one.
+      if (reply === undefined) return
       if (reply && reply.ok && reply.seq > reviewSeq.current) {
         awaitSeq.current = reply.seq
         updateReview((r) => ({ ...r, ...extra }))
         return
       }
       awaitSeq.current = null
+      // Unanswered: the worker may have done it anyway, so its state is read again.
+      if (!reply) resyncReview()
       const refused = reply && !reply.ok ? refusalNote(reply.error, agentNameRef.current) : null
       updateReview((r) => ({ ...r, pending: null, ...(refused ? { note: refused } : {}), ...(!reply ? { note: "The voice service did not answer - try again." } : {}), ...extra }))
     },
-    [updateReview]
+    [updateReview, resyncReview]
   )
 
   // The worker's review state: the newest one wins.
@@ -894,14 +905,17 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     const r = reviewRef.current
     if (r.pending || r.mode !== "review" || phaseRef.current === "talking" || !LIVE_PHASES.has(phaseRef.current)) return
     if (r.draft && r.draft.state !== "empty") return
-    for (const k of reviewSegments.current) closedSegs.current.add(k)
+    recordings.current++
     provisionalSegs.current.clear()
     updateReview((x) => ({ ...x, pending: { op: "talk" }, note: null, micError: null, delivery: null, provisional: "" }))
     const reply = await rpc("talk")
     if (!reply?.ok || reply.draft === undefined) return settleOp(reply)
     // The worker hears now; the microphone opens, and only then the caller is told to speak.
     if (await setMic(true)) {
-      cue("listening")
+      // A reply may have stopped the recording meanwhile: the microphone follows the worker.
+      const d = reviewRef.current.draft
+      if (d && (d.id !== reply.draft || d.state !== "recording")) await setMic(false)
+      else cue("listening")
       return settleOp(reply)
     }
     updateReview((x) => ({ ...x, micError: "start" }))
@@ -924,7 +938,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (r.pending || !d || d.state !== "ready" || d.tooLong || r.micError === "stop" || r.ended) return
     updateReview((x) => ({ ...x, pending: { op: "send" }, note: null }))
     const reply = await rpc("send", { draft: d.id })
-    if (reply?.ok && reply.turn !== undefined) reviewTurns.current.add(reply.turn)
+    if (reply?.ok && reply.turn !== undefined) {
+      reviewTurns.current.add(reply.turn)
+      lastReviewTurn.current = Math.max(lastReviewTurn.current, reply.turn)
+    }
     settleOp(reply, reply?.ok ? { delivery: "sending" } : {})
   }, [updateReview, rpc, settleOp])
 
@@ -1111,16 +1128,18 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     void start()
   }, [start])
 
+  const micOn = !!micStream && !muted
+  const reviewState = useMemo(() => (review.micOn === micOn ? review : { ...review, micOn }), [review, micOn])
   const reviewControls = useMemo(
     () => ({
-      state: review,
+      state: reviewState,
       setMode: (m: TurnMode) => void setTurnMode(m),
       talk: () => void talk(),
       done: () => void done(),
       send: () => void send(),
       discard: () => void discard(),
     }),
-    [review, setTurnMode, talk, done, send, discard]
+    [reviewState, setTurnMode, talk, done, send, discard]
   )
 
   return useMemo(

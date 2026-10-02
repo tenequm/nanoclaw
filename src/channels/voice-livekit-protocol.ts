@@ -145,6 +145,7 @@ export interface CallReviewState {
 export interface ReviewRequest {
   gen: number;
   draft?: number;
+  /** For `mode`: the mode to switch to; absent, the worker only sends its state again. */
   mode?: TurnMode;
   /** With `mode`: the newest worker turn number the page had seen, to hear of a turn sent meanwhile. */
   afterTurn?: number;

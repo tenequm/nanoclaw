@@ -151,10 +151,19 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
     timers.current.push(window.setTimeout(fn, ms))
   }, [])
 
+  const secondsIn = () => Math.max(0, Math.floor((Date.now() - startedAt.current) / 1000))
+  /** The newest caller line gets this mark (and turn number). */
+  const markLastUser = useCallback((mark: TurnMark, turn?: number) => {
+    setLines((prev) => {
+      const last = prev.findLast((l) => l.from === "user")
+      return last ? prev.map((l) => (l === last ? { ...l, mark, ...(turn !== undefined ? { turn } : {}) } : l)) : prev
+    })
+  }, [])
+
   const streamLine = useCallback(
     (from: Speaker, text: string, ms: number, re?: string, instant = false) => {
       const id = nextId.current++
-      const at = Math.max(0, Math.floor((Date.now() - startedAt.current) / 1000))
+      const at = secondsIn()
       if (instant) {
         setLines((prev) => [...prev, { id, from, text, at, ...(re ? { re, group: id } : {}) }])
         return
@@ -199,20 +208,13 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
       } else setReview(next)
       if (step.sentDraft) {
         const turn = ++turns.current
-        const at = Math.max(0, Math.floor((Date.now() - startedAt.current) / 1000))
-        setLines((prev) => [...prev, { id: nextId.current++, from: "user", text: step.sentDraft!, at, turn, mark: { status: "sending" } }])
+        setLines((prev) => [...prev, { id: nextId.current++, from: "user", text: step.sentDraft!, at: secondsIn(), turn, mark: { status: "sending" } }])
         if (!instant) playCue(cueCtx.current, "sent")
       }
-      if (step.mark) {
-        const mark = step.mark
-        setLines((prev) => {
-          const last = prev.findLast((l) => l.from === "user")
-          return last ? prev.map((l) => (l === last ? { ...l, mark } : l)) : prev
-        })
-      }
+      if (step.mark) markLastUser(step.mark)
       if (!instant && next.draft?.state === "ready" && step.phase !== "talking" && !next.pending && !next.micError) playCue(cueCtx.current, "draft")
     },
-    [later]
+    [later, markLastUser]
   )
 
   const runStep = useCallback(
@@ -251,11 +253,7 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
       }
       if (step.sent) {
         const turn = ++turns.current
-        const mark = () =>
-          setLines((prev) => {
-            const last = prev.findLast((l) => l.from === "user")
-            return last ? prev.map((l) => (l === last ? { ...l, mark: { status: "sent" }, turn } : l)) : prev
-          })
+        const mark = () => markLastUser({ status: "sent" }, turn)
         if (instant) mark()
         else later(mark, DEMO_STORED_MS)
       }

@@ -781,7 +781,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         canPublishSources: [TrackSource.MICROPHONE],
         canSubscribe: true,
         // Review mode's RPCs to the worker travel as data packets; LiveKit has no grant for RPC alone.
-        // The worker answers only its own methods, and only from this identity.
+        // The worker answers its review methods only from this identity, and closes agents-js's own
+        // session control topic, so this reaches nothing else.
         canPublishData: true,
         canUpdateOwnMetadata: false,
       });

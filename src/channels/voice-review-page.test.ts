@@ -1,6 +1,6 @@
 /**
  * The call page's review mode view (`ui/src/lib/review.ts`): keys, readout and draft panel for
- * every state of the review mode design's tables. It lives in the maintainer build tree, which an
+ * every review state (SKILL.md's review mode section). It lives in the maintainer build tree, which an
  * installed payload does not carry, so these tests run only where it is.
  */
 import { existsSync } from 'node:fs';
@@ -22,7 +22,6 @@ type View = {
   capturing: boolean;
   panel: { title: string; text: string; tone: string; note?: string } | null;
   modeDisabled: boolean;
-  modeBlock: string | null;
 };
 interface ReviewLib {
   INITIAL_REVIEW: ReviewState;
@@ -202,11 +201,8 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(lib.autoBlock(review({ draft: draft('ready', 'x', { tooLong: true }) }))).toBe('Discard before auto.');
     expect(lib.autoBlock(review({ draft: draft('empty') }))).toBe('Discard before auto.');
     expect(lib.autoBlock(review({ draft: draft('failed', 'x') }))).toBe('Discard before auto.');
-    expect(view({ draft: draft('recording'), micOn: true }).modeBlock).toBe('Tap done, then send or discard.');
-    expect(view({ draft: draft('ready', 'x') })).toMatchObject({
-      modeDisabled: false,
-      modeBlock: 'Send or discard before auto.',
-    });
+    // A draft leaves the switch usable, so a pick of auto can say why it waits.
+    expect(view({ draft: draft('ready', 'x') }).modeDisabled).toBe(false);
     expect(lib.refusalNote('draft_open', 'Dan')).toBe('Send or discard before auto.');
     expect(lib.refusalNote('agent_speaking', 'Dan')).toBe('Tap talk when Dan finishes.');
     expect(lib.refusalNote('stale', 'Dan')).toBeNull();

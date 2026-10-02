@@ -57,6 +57,7 @@ import {
   TurnTaking,
   callSession,
   CLEAR_SETTLE_MS,
+  FLUSH_QUIET_MS,
   FLUSH_TIMEOUT_MS,
   readReviewRequest,
   ReviewControl,
@@ -1310,8 +1311,7 @@ function reviewControl(overrides: Partial<ReviewDeps> = {}) {
 }
 
 /** Lets the flush poll run until the quiet time has passed. */
-const settle = () => vi.advanceTimersByTimeAsync(FLUSH_QUIET_MS_FOR_TESTS);
-const FLUSH_QUIET_MS_FOR_TESTS = 600;
+const settle = () => vi.advanceTimersByTimeAsync(FLUSH_QUIET_MS + 200);
 
 describe('review mode', () => {
   it('talk opens the input, done flushes and freezes the final text, send posts exactly that text', async () => {
@@ -1513,7 +1513,10 @@ describe('review mode', () => {
     // The same mode again only re-reads the state (after a reconnect).
     const before = r.states.length;
     expect(await op('mode', { mode: 'auto' })).toMatchObject({ ok: true });
-    expect(r.states).toHaveLength(before + 1);
+    // A request naming no mode re-reads too, and never switches.
+    expect(await op('mode')).toMatchObject({ ok: true });
+    expect(r.states).toHaveLength(before + 2);
+    expect(r.last.mode).toBe('auto');
   });
 
   it('a reply taking the channel stops the recording into a draft, and talk waits for the agent', async () => {
@@ -1650,7 +1653,7 @@ describe('review mode in the session', () => {
       onTranscript: (text, final, stream) => void heard.push([text, final, stream]),
     };
     const vad = {} as VAD;
-    const { agent, review } = callSession(META, { geminiKey: 'gk-test', record: false }, { vad }, events, {
+    const { agent, review, session } = callSession(META, { geminiKey: 'gk-test', record: false }, { vad }, events, {
       ...silentLog,
       error: () => undefined,
     });
@@ -1699,8 +1702,12 @@ describe('review mode in the session', () => {
       await new Promise((r) => setTimeout(r, 250));
       expect(reached).toHaveLength(fed);
       endAudio();
-      // A restarted transcription is the next stream.
+      // A session that is not running cannot clear: the stream that runs stays the current one.
+      expect(review.clearTurn()).toBe(1);
+      // A clear restarts the transcription, which is the next stream.
+      const clear = vi.spyOn(session, 'clearUserTurn').mockImplementation(() => undefined);
       expect(review.clearTurn()).toBe(2);
+      expect(clear).toHaveBeenCalledOnce();
     } finally {
       node.mockRestore();
     }

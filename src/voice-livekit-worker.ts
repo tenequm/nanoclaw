@@ -139,7 +139,7 @@ const FLUSH_MIN_MS = 700;
 /** The unary fallback closes speech at its own 1 s pause and then makes a request: a longer flush. */
 const FLUSH_FALLBACK_MIN_MS = 2_500;
 /** The flush ends once no interim text waits for its final and nothing was heard for this long... */
-const FLUSH_QUIET_MS = 400;
+export const FLUSH_QUIET_MS = 400;
 /** ...or after this long, with what is still interim text left unverified. */
 export const FLUSH_TIMEOUT_MS = 4_000;
 const FLUSH_POLL_MS = 50;
@@ -151,6 +151,8 @@ const FLUSH_CHUNK_MS = 100;
  */
 export const CLEAR_SETTLE_MS = 300;
 const STALE_STREAM_MS = 2_000;
+/** agents-js's session control topic (its TOPIC_SESSION_MESSAGES), served to the caller unless closed. */
+const SESSION_CONTROL_TOPIC = 'lk.agent.session';
 /** Review mode's waits, on the global timers (which tests can fake). */
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 /** VOICE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
@@ -1149,9 +1151,8 @@ export class ReviewControl {
       : undefined;
     switch (op) {
       case 'mode': {
-        if (req.mode !== 'auto' && req.mode !== 'review') return reply({ error: 'stale' });
-        if (req.mode === this.mode) {
-          // Nothing to change: the page is re-reading the state, after a reconnect say.
+        if (req.mode === undefined || req.mode === this.mode) {
+          // Nothing to change: the page re-reads the state, after a reconnect say.
           this.publish();
           return reply();
         }
@@ -1231,7 +1232,7 @@ export class ReviewControl {
       // The caller's unsent words become a draft; never sent by the switch itself.
       this.draft = { id: ++this.drafts, state: 'finishing', text: '', reason: 'switch' };
       this.publish();
-      void this.finalize(this.draft);
+      this.finalizeSafely(this.draft);
     } else {
       this.resetHeard();
       this.publish();
@@ -1245,7 +1246,17 @@ export class ReviewControl {
     this.deps.setCaptureOpen(false);
     this.deps.voice.setInput(false);
     this.publish();
-    void this.finalize(this.draft);
+    this.finalizeSafely(this.draft);
+  }
+
+  /** A finalize that fails leaves the draft unverified, never stuck finishing. */
+  private finalizeSafely(draft: CallDraft): void {
+    this.finalize(draft).catch((err: unknown) => {
+      this.deps.log.warn('voice worker: finishing a review draft failed', { err });
+      if (this.draft?.id !== draft.id) return;
+      this.draft = { ...draft, state: 'failed', text: this.draft.text };
+      this.publish();
+    });
   }
 
   private async finalize(draft: CallDraft): Promise<void> {
@@ -1408,10 +1419,10 @@ const loadFallbackVad = (): Promise<VAD> =>
   });
 
 const FLUSH_SILENCE = new AudioFrame(
-  new Int16Array((INPUT_SAMPLE_RATE * FLUSH_CHUNK_MS) / 1000),
+  new Int16Array(samplesOf(FLUSH_CHUNK_MS)),
   INPUT_SAMPLE_RATE,
   1,
-  (INPUT_SAMPLE_RATE * FLUSH_CHUNK_MS) / 1000,
+  samplesOf(FLUSH_CHUNK_MS),
 );
 
 class CallAgent extends voice.Agent {
@@ -1725,7 +1736,7 @@ export function callSession(
       if (text) events.onTurn(text, turn);
     },
     capture && ((frame) => capture.push(frame)),
-    events.onTranscript && ((text, final, stream) => events.onTranscript?.(text, final, stream)),
+    events.onTranscript?.bind(events),
   );
   return {
     session,
@@ -1744,7 +1755,9 @@ export function callSession(
         try {
           session.clearUserTurn();
         } catch (err) {
+          // Nothing restarts: the stream that runs now stays the current one.
           log.warn('voice worker: could not clear the open turn', { err });
+          return agent.streams;
         }
         return agent.streams + 1;
       },
@@ -1779,6 +1792,12 @@ async function sessionVoice(
     log,
     (value) => void setAttribute(ctx, CALL_PENDING_ATTRIBUTE, value).catch(() => undefined),
   );
+  /** One JSON message on a text stream topic; a failure is logged, never thrown. */
+  const sendJson = (topic: string, value: unknown, what: string): void => {
+    void ctx.room.localParticipant
+      ?.sendText(JSON.stringify(value), { topic })
+      .catch((err: unknown) => log.warn(`voice worker: could not publish ${what}`, { err }));
+  };
   await session.start({
     agent,
     room: ctx.room,
@@ -1790,28 +1809,24 @@ async function sessionVoice(
     },
     record: false,
   });
+  // The caller's token may publish data (review mode's RPCs). agents-js also serves remote control
+  // of the session (input on/off, typed turns, forced interrupts) to the linked participant on this
+  // topic; nothing here uses it, so the caller must not reach it.
+  try {
+    ctx.room.unregisterByteStreamHandler(SESSION_CONTROL_TOPIC);
+  } catch (err) {
+    log.warn('voice worker: could not close the session control topic', { err });
+  }
   return {
     say,
     setThinking(thinking) {
       void setAttribute(ctx, CALL_THINKING_ATTRIBUTE, thinking ? '1' : '').catch(() => undefined);
     },
-    publishTurn(status) {
-      void ctx.room.localParticipant
-        ?.sendText(JSON.stringify(status), { topic: CALL_TURN_TOPIC })
-        .catch((err: unknown) => log.warn('voice worker: could not publish a turn status', { err }));
-    },
-    publishReply(info) {
-      void ctx.room.localParticipant
-        ?.sendText(JSON.stringify(info), { topic: CALL_REPLY_TOPIC })
-        .catch((err: unknown) => log.warn('voice worker: could not publish a reply label', { err }));
-    },
+    publishTurn: (status) => sendJson(CALL_TURN_TOPIC, status, 'a turn status'),
+    publishReply: (info) => sendJson(CALL_REPLY_TOPIC, info, 'a reply label'),
     review: {
       ...review,
-      publishReview(state) {
-        void ctx.room.localParticipant
-          ?.sendText(JSON.stringify(state), { topic: CALL_REVIEW_TOPIC })
-          .catch((err: unknown) => log.warn('voice worker: could not publish the review state', { err }));
-      },
+      publishReview: (state) => sendJson(CALL_REVIEW_TOPIC, state, 'the review state'),
       serve(handle) {
         const local = ctx.room.localParticipant;
         if (!local) return;
@@ -2062,7 +2077,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     return abandon('could not set up the call audio', { err });
   }
   const reviewVoice = callVoice.review;
-  if (reviewVoice) {
+  // A call that ended while its audio was set up gets no review controls.
+  if (reviewVoice && !ending) {
     const control = new ReviewControl({
       voice: reviewVoice,
       post: (text, draft, take) => sendTurn(text, take, draft),

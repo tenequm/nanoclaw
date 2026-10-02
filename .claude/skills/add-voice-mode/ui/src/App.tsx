@@ -548,14 +548,12 @@ export default function App() {
     else if (action === "done") rc?.done()
     else if (action === "send") rc?.send()
   }
-  const keysRef = useRef({ rv, rightArmed, draftOpen: false })
-  keysRef.current = { rv, rightArmed, draftOpen: !!rs?.draft }
+  const keysRef = useRef({ rv, rc, rightArmed, draftOpen: false, switching: false })
+  keysRef.current = { rv, rc, rightArmed, draftOpen: !!rs?.draft, switching: switchingToReview }
 
   // Keyboard: space toggles the microphone (in review: talk and done, never send), escape ends the
   // call (never while a review draft is open). Never while a control has focus.
   const { toggleMute, end: endCall, start: startCall } = call
-  const reviewTalk = rc?.talk
-  const reviewDone = rc?.done
   useEffect(() => {
     if (!cfg.shortcuts) return
     const onKey = (e: KeyboardEvent) => {
@@ -564,18 +562,20 @@ export default function App() {
       const keys = keysRef.current
       if (e.code === "Space" && LIVE_PHASES.has(p)) {
         e.preventDefault()
+        // Mid-switch the microphone stays as the switch left it, like the disabled key.
+        if (keys.switching) return
         if (!keys.rv) return toggleMute()
         const right = keys.rv.right
         if (right.disabled || !keys.rightArmed) return
-        if (right.action === "talk") reviewTalk?.()
-        else if (right.action === "done") reviewDone?.()
+        if (right.action === "talk") keys.rc?.talk()
+        else if (right.action === "done") keys.rc?.done()
       } else if (e.key === "Escape" && (LIVE_PHASES.has(p) || p === "connecting") && !keys.draftOpen) {
         endCall()
       }
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [cfg.shortcuts, toggleMute, endCall, reviewTalk, reviewDone])
+  }, [cfg.shortcuts, toggleMute, endCall])
   // The review view speaks for the call while it runs, and for a draft kept after it.
   const reviewReadout = !!rv && phase !== "error" && (live || phase === "connecting" || phase === "idle" || (!!rs?.ended && !!rs.draft))
   const chipClass = reviewReadout
@@ -636,7 +636,7 @@ export default function App() {
   const readout = (
     <span className={`state-chip ${chipClass}`} role="status" aria-live="polite">
       {live && phase !== "connecting" && <span className="pulse" aria-hidden="true" />}
-      {phase === "thinking" && !reconnecting && !reduced && chipText === `${agentName} is working` ? (
+      {phase === "thinking" && !reconnecting && !reduced && (reviewReadout ? rv.chipTone === "think" : !switchingToReview) ? (
         <ShimmeringText className="shimmer" text={chipText} duration={1.4} />
       ) : (
         chipText
@@ -647,11 +647,11 @@ export default function App() {
   const limitLine = reviewReadout && live && call.limitNote ? <p className="limit-note">{call.limitNote}</p> : null
   const modeRow = rc && (
     <ModeRow
-      mode={rs!.mode}
-      pendingTo={rs!.pending?.op === "mode" ? (rs!.pending.to ?? null) : null}
-      available={rs!.available}
-      disabled={phase === "connecting" || (rv ? rv.modeDisabled : !!rs!.pending || reconnecting)}
-      note={rs!.note}
+      mode={rc.state.mode}
+      pendingTo={rc.state.pending?.op === "mode" ? (rc.state.pending.to ?? null) : null}
+      available={rc.state.available}
+      disabled={phase === "connecting" || (rv ? rv.modeDisabled : !!rc.state.pending || reconnecting)}
+      note={rc.state.note}
       onPick={rc.setMode}
     />
   )
@@ -689,7 +689,7 @@ export default function App() {
               phase === "connecting"
                 ? `Connecting to ${agentName}.`
                 : live && reviewOn
-                  ? "Tap talk to start."
+                  ? "Sent turns show here."
                   : live
                   ? muted
                     ? "Unmute to speak."
@@ -735,24 +735,23 @@ export default function App() {
   const primaryDisabled = (!token && !demo) || (phase === "connecting" && !cancelArmed)
   const onPrimary = live || phase === "connecting" ? endCall : startCall
 
-  // Review keys: the same two caps, relabelled; a cap that just changed what it does waits a moment.
-  const leftKey = rv && {
-    label: rv.left.label,
-    disabled:
-      rv.left.disabled ||
-      !leftArmed ||
-      (rv.left.action === "call" && !token && !demo) ||
-      (rv.left.action === "cancel" && !cancelArmed),
-    onClick: () => runKey(rv.left.action),
-  }
+  // Review relabels the same two caps; a cap that just changed what it does waits a moment.
+  const primary = rv
+    ? {
+        label: rv.left.label,
+        disabled: rv.left.disabled || !leftArmed || ((rv.left.action === "call" || rv.left.action === "cancel") && primaryDisabled),
+        onClick: () => runKey(rv.left.action),
+        hangup: rv.left.action === "end",
+      }
+    : { label: primaryLabel, disabled: primaryDisabled, onClick: onPrimary, hangup: live }
   const rightKey = rv && {
     label: rv.right.label,
-    disabled: rv.right.disabled || !rightArmed || rv.right.action === "none",
+    disabled: rv.right.disabled || !rightArmed,
     onClick: () => runKey(rv.right.action),
     icon:
       rv.right.action === "done" ? (
         <Square size={13} aria-hidden="true" />
-      ) : rv.right.label === "Send" ? (
+      ) : rv.right.action === "send" ? (
         <ArrowUp size={15} aria-hidden="true" />
       ) : (
         <Mic size={15} aria-hidden="true" />
@@ -771,15 +770,9 @@ export default function App() {
         </div>
         {modeRow}
         <div className="key key-end">
-          {leftKey ? (
-            <button type="button" className="cap orange" onClick={leftKey.onClick} aria-disabled={leftKey.disabled} disabled={leftKey.disabled}>
-              {leftKey.label}
-            </button>
-          ) : (
-            <button type="button" className="cap orange" onClick={onPrimary} aria-disabled={primaryDisabled} disabled={primaryDisabled}>
-              {primaryLabel}
-            </button>
-          )}
+          <button type="button" className="cap orange" onClick={primary.onClick} aria-disabled={primary.disabled} disabled={primary.disabled}>
+            {primary.label}
+          </button>
           <span className="label">
             <i className={`led${live ? " green" : ""}`} aria-hidden="true" />
             {live ? "On call" : phase === "connecting" ? "Connecting" : phase === "error" ? "Not connected" : "Ready"}
@@ -789,7 +782,7 @@ export default function App() {
         <div className="key key-mute">
           {rightKey && rv ? (
             <>
-              <button type="button" className={`cap${rv.right.label === "Talk" ? " dark" : ""}`} disabled={rightKey.disabled} onClick={rightKey.onClick}>
+              <button type="button" className={`cap${rv.right.action === "talk" ? " dark" : ""}`} disabled={rightKey.disabled} onClick={rightKey.onClick}>
                 {rightKey.icon}
                 {rightKey.label}
               </button>
@@ -819,15 +812,9 @@ export default function App() {
         <span className="timer" role="timer" aria-label="Call duration">
           {live ? `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)}` : ""}
         </span>
-        {leftKey ? (
-          <Button size="lg" className={`${live || phase === "connecting" ? "btn-hangup" : "btn-call"} h-12 w-full rounded-full text-[15px] font-semibold`} onClick={leftKey.onClick} disabled={leftKey.disabled}>
-            {leftKey.label === "End" ? "Hang up" : leftKey.label}
-          </Button>
-        ) : (
-          <Button size="lg" className={`${live || phase === "connecting" ? "btn-hangup" : "btn-call"} h-12 w-full rounded-full text-[15px] font-semibold`} onClick={onPrimary} disabled={primaryDisabled}>
-            {live ? "Hang up" : primaryLabel}
-          </Button>
-        )}
+        <Button size="lg" className={`${live || phase === "connecting" ? "btn-hangup" : "btn-call"} h-12 w-full rounded-full text-[15px] font-semibold`} onClick={primary.onClick} disabled={primary.disabled}>
+          {primary.hangup ? "Hang up" : primary.label}
+        </Button>
         {rightKey ? (
           <Button size="lg" variant="secondary" className="btn-mute h-12 rounded-full" disabled={rightKey.disabled} onClick={rightKey.onClick}>
             {rightKey.icon}

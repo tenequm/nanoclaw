@@ -1,3 +1,5 @@
+import type { Phase } from "./voice-call"
+
 /**
  * Review mode on the page: what the caller sees and may press, worked out from the separate
  * models it is made of: the turn mode, the operation in flight, the worker's draft, the delivery
@@ -67,7 +69,7 @@ export const INITIAL_REVIEW: ReviewState = {
 }
 
 /** What a key does when pressed. */
-export type KeyAction = "call" | "cancel" | "end" | "discard" | "talk" | "done" | "send" | "none"
+export type KeyAction = "call" | "cancel" | "end" | "discard" | "talk" | "done" | "send"
 
 export interface KeyView {
   label: string
@@ -97,13 +99,12 @@ export interface ReviewView {
   /** The microphone captures right now (its LED, and the level meter). */
   capturing: boolean
   panel: PanelView | null
-  /** Whether the caller may pick the other mode now; a pick refused by `modeBlock` shows that reason. */
+  /** The switch is off while an operation settles, the line reconnects or a transcript finishes. */
   modeDisabled: boolean
-  modeBlock: string | null
 }
 
 export interface ReviewInput {
-  phase: "idle" | "connecting" | "listening" | "thinking" | "talking" | "ended" | "error"
+  phase: Phase
   agentName: string
   reconnecting: boolean
   /** Seconds the agent has been working, for the thinking hint. */
@@ -128,29 +129,34 @@ export function panelView(review: ReviewState, agentName: string): PanelView | n
 
 const key = (label: string, action: KeyAction, disabled = false): KeyView => ({ label, action, disabled })
 
+/** Why auto has to wait: what the caller does first. */
+const BLOCKED = {
+  recording: "Tap done, then send or discard.",
+  finishing: "Finishing transcript.",
+  sendable: "Send or discard before auto.",
+  unsendable: "Discard before auto.",
+} as const
+
 /** Why the caller cannot leave review for auto right now, or null when they can. */
 export function autoBlock(review: ReviewState): string | null {
   const d = review.draft
   if (!d) return null
-  if (d.state === "recording") return "Tap done, then send or discard."
-  if (d.state === "finishing") return "Finishing transcript."
-  if (d.state === "ready" && !d.tooLong) return "Send or discard before auto."
-  return "Discard before auto."
+  if (d.state === "recording") return BLOCKED.recording
+  if (d.state === "finishing") return BLOCKED.finishing
+  return d.state === "ready" && !d.tooLong ? BLOCKED.sendable : BLOCKED.unsendable
 }
 
 /**
- * Keys, readout and panel for a call in review mode (or switching to or from it), by the state
- * tables of the review mode design: the caller's state first, then the overlays (connection,
- * agent speaking or working, a switch in flight, microphone failures).
+ * Keys, readout and panel for a call in review mode (or switching to or from it): the caller's
+ * state first, then the overlays (connection, agent speaking or working, a switch in flight,
+ * microphone failures). SKILL.md's review mode section describes the flow.
  */
 export function reviewView({ phase, agentName, reconnecting, waited, review }: ReviewInput): ReviewView {
   const d = review.draft
   const panel = panelView(review, agentName)
   const pending = review.pending
   const live = phase === "listening" || phase === "thinking" || phase === "talking"
-  const frozen = d && d.state !== "recording" && d.state !== "finishing"
   const sendable = !!d && d.state === "ready" && !d.tooLong && review.micError !== "stop"
-  const block = autoBlock(review)
 
   if (!live) {
     const kept = d && review.ended
@@ -162,7 +168,7 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
           : key(phase === "ended" || phase === "error" ? "Call again" : "Call", "call")
     return {
       left,
-      right: key(kept && d.state !== "empty" ? "Send" : "Talk", "none", true),
+      right: kept && d.state !== "empty" ? key("Send", "send", true) : key("Talk", "talk", true),
       chip: phase === "connecting" ? "Connecting…" : phase === "ended" ? "Call ended" : phase === "error" ? "" : "Ready",
       chipTone: phase === "ended" ? "ended" : phase === "error" ? "err" : phase === "idle" ? "idle" : "",
       hint: kept
@@ -176,7 +182,6 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
       capturing: false,
       panel: kept ? panel : null,
       modeDisabled: phase === "connecting" || !!kept,
-      modeBlock: null,
     }
   }
 
@@ -293,15 +298,14 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
     capturing,
     panel,
     modeDisabled: reconnecting || !!pending || d?.state === "finishing",
-    modeBlock: frozen || d?.state === "recording" ? block : null,
   }
 }
 
 /** The worker's error for a refused operation, as the caller's next step. */
 export function refusalNote(error: string | undefined, agentName: string): string | null {
-  if (error === "recording") return "Tap done, then send or discard."
-  if (error === "finishing") return "Finishing transcript."
-  if (error === "draft_open") return "Send or discard before auto."
+  if (error === "recording") return BLOCKED.recording
+  if (error === "finishing") return BLOCKED.finishing
+  if (error === "draft_open") return BLOCKED.sendable
   if (error === "agent_speaking") return `Tap talk when ${agentName} finishes.`
   return null
 }
