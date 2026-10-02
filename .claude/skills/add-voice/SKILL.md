@@ -113,13 +113,13 @@ container/skills/voice-formatting/SKILL.md
 
 ### 4. Build
 
-The OpenAI path needs no new package: they use Node's
+The OpenAI path needs no new package: it uses Node's
 built-in `fetch` and WebSocket client (Node 22 or later). The LiveKit path adds
 `@livekit/agents`, `@livekit/agents-plugin-google` (Gemini transcription and
 speech), `@livekit/agents-plugin-silero` (Silero VAD on
 `onnxruntime-node`, whose npm package ships the CPU binaries for linux-x64 and
 macOS; its postinstall only fetches optional CUDA files and pnpm skips it),
-`@livekit/rtc-node`, `livekit-server-sdk`, `livekit-client` and `zod`. Build first: it guards the
+`@livekit/rtc-node`, `livekit-server-sdk` and `zod` (a peer of the agents package). Build first: it guards the
 adapter's typed calls into the channel core.
 
 ```nc:run effect:build
@@ -535,7 +535,7 @@ from `LIVEKIT_API_SECRET`, so the worker needs that key too. Then, walkie-talkie
   worker complete over the host's event stream, and the agent's typing there is
   the worker's "thinking". The worker strips markdown, URLs and tags and speaks
   it uninterruptibly (`session.say`), in sentence batches of up to 400
-  characters, all requested at once so the next is ready while one plays.
+  characters, two requested at a time: the one playing and the next.
   Replies never overlap, and a reply waits for a caller who is mid-turn (at most
   `WALKIE_SILENCE_MS` plus ten seconds, then it takes the channel).
 - While the agent's audio plays, the caller is not transcribed (no barge-in).
@@ -620,7 +620,8 @@ into it, no CDN. Its readout follows the worker: Listening, Asking `<agent>`...
 while `nanoclaw.walkie.thinking` is set, and Speaking; captions come from
 `lk.transcription` (the caller's interim text shows live), and each caller turn
 gets a small sent / not-sent mark from the worker's `nanoclaw.walkie.turn`
-stream. The header names the chat the call talks in. Microphone capture runs
+stream. The header names the chat the call talks in when it starts (an unnamed
+direct chat shows as `<channel> DM`). Microphone capture runs
 with echo cancellation, noise suppression and auto gain; DTX is off because the
 worker times turns by the silence it hears. On iOS Safari the call must be
 started with the Call button (audio unlocks on that tap) and joins relay-only
