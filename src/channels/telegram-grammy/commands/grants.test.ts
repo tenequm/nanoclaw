@@ -138,7 +138,7 @@ describe('computeCommandGrants', () => {
     await wire('mg-line', 'ag-1');
 
     const grants = await computeCommandGrants();
-    expect(grants.find((g) => g.chatPlatformId === OWNER)?.commands).toEqual([...COMMAND_ORDER, 'voice']);
+    expect(grants.find((g) => g.chatPlatformId === OWNER)?.commands).toEqual(['voice', ...COMMAND_ORDER]);
     expect(grants.find((g) => g.chatPlatformId === 'telegram:-200')?.commands).toEqual(COMMAND_ORDER);
   });
 
