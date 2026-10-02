@@ -340,7 +340,9 @@ To uninstall: see [REMOVE.md](REMOVE.md).
 ## The call page
 
 The page callers open is a small React app. Its maintainer sources live at
-`.claude/skills/add-voice/ui/` on the `channels` branch beside the generated payload:
+`.claude/skills/add-voice/ui/` beside the generated payload (in this fork: vendored
+unchanged from upstream `feat/voice-payload`, PR #3772, at `324d7445`; MIT, see
+`ui/THIRD_PARTY_NOTICES.md`):
 Teenage Engineering inspired, one screen beside a rail of keys, a dot-matrix
 display that shows the caller's voice in white, thinking in orange and the
 agent's voice in orange, captions that fade in word by word, and three device
@@ -369,10 +371,13 @@ GPT_LIVE_UI={"colorway":"field","presence":"matrix","brand":"Casa line"}
 
 Callers can also switch the finish from the three dots under the transcript;
 the choice stays in their browser. To change the components themselves, edit
-`ui/src` in a checkout of `channels`, then from `ui/` run
+`ui/src`, then from `ui/` run
 `pnpm install --frozen-lockfile --ignore-scripts && pnpm build`. The build regenerates
 the module and stamps it with a hash of the explicit `source-files.json` inputs;
-the registry CI verifies both together. Ordinary installs copy the generated page
+`src/channels/gpt-live-call-page.test.ts` fails when the two drift, so always
+rebuild the module and commit it with the source change, never hand-edit it.
+`ui/` is its own pnpm workspace and sits outside the root build, lint, format
+and test globs. Ordinary installs copy the generated page
 and do not need a frontend build. The UI has the same three-day release-age gate
 as the host and requires no dependency install scripts. Try the page without a
 microphone or an agent by adding `&demo=1` to any call link: it plays a scripted
