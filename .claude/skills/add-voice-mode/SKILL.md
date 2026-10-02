@@ -36,7 +36,10 @@ remote that points at `nanocoai/nanoclaw` (in a fork usually `upstream`; set
 `NANOCLAW_CHANNELS_REMOTE=<remote>` to name it), with
 `git fetch <remote> +refs/heads/channels:refs/remotes/<remote>/channels`, and
 copy each file below in with `git show <remote>/channels:<path> > <path>`,
-overwriting (the branch is canonical; never merge it):
+overwriting (the branch is canonical; never merge it). Create each
+destination's parent directory first (`mkdir -p
+container/skills/voice-mode-formatting`; the `src` folders exist already). Stop
+if a fetch or `git show` fails; do not continue with missing or empty files.
 
 - the channel, `src/channels/voice-mode.ts`: the page server, the call-link
   check, call limits, the proxy gate;
@@ -84,7 +87,8 @@ container/skills/voice-mode-formatting/SKILL.md
 Optional, only while the `channels` branch does not carry these files yet:
 take them from the contributor's branch instead,
 `git fetch https://github.com/tenequm/nanoclaw.git feat/add-voice-mode`, then
-`git show FETCH_HEAD:<path> > <path>` for each file above.
+`git show FETCH_HEAD:<path> > <path>` for each file above, with the same
+`mkdir -p` first and the same stop on any failure.
 
 ### 2. Register the channel
 
@@ -151,6 +155,11 @@ a fake LiveKit server.
 
 ## Credentials
 
+Decide the page's HTTPS origin before this step, since it is asked for right
+after the keys (The page's address, below; with Tailscale Serve, set the mount
+up now). For self-hosted LiveKit, have the server and its proxy routes working
+first (Self-hosted LiveKit, below).
+
 ### LiveKit
 
 **LiveKit Cloud (default).** Create a project at https://cloud.livekit.io and,
@@ -159,7 +168,8 @@ in its settings, an API key. The project URL looks like
 phones on mobile data; the worker runs on this machine and connects out to it.
 
 **Self-hosted LiveKit** (the second option, below): the URL is
-`wss://<page host>`, where the browser signals at `/rtc`.
+`wss://<page host>`, where the browser signals at `/rtc`. Also set
+`LIVEKIT_WORKER_URL=ws://127.0.0.1:7880` in `.env` before the restart below.
 
 Ask the user for the LiveKit URL the caller's browser connects to, the API key
 and its secret (a secret: never echo it back):
@@ -184,6 +194,11 @@ host checks it is set. Speech is transcribed by `gemini-3.5-transcribe-live`
 request per turn, and its quota is small (on Tier 1, 10 requests a minute and
 100 a day), so it is only a stopgap. Replies are spoken by
 `gemini-3.8-flash-tts`, falling back to `gemini-3.8-flash-lite-tts`.
+
+The key's project needs access and quota for these models; creating a key does
+not prove either, and the fallbacks use the same key. The first call confirms
+both directions; if one fails, check the worker log for authentication, quota
+or model errors.
 
 Ask the user for the Gemini API key (a secret too):
 
@@ -235,7 +250,8 @@ The worker talks to the host on the host's webhook server
 `VOICE_MODE_ALLOW_NON_LOOPBACK=1` drops the gate entirely, for local development only.
 
 Ask the user for the origin callers' browsers reach the page at, and write it to
-`.env` as `VOICE_MODE_PUBLIC_URL` (unless already set):
+`.env` as `VOICE_MODE_PUBLIC_URL` (unless already set). It is the exact HTTPS
+origin, without `/voice`: the call link appends `/voice` itself.
 
 ```nc:prompt public_url validate:^https?://\S+$ normalize:rstrip-slash
 What origin (no path) does a caller's browser reach the page at? e.g. http://localhost:3100 to try it here, or https://voice.example.com
@@ -247,12 +263,22 @@ VOICE_MODE_PUBLIC_URL={{public_url}}
 
 ## Restart
 
-Restart the host with `bash setup/lib/restart.sh` so the channel loads (it
-creates its `voice_mode_lines` table on start):
+`VOICE_MODE_PUBLIC_URL` (and, self-hosted, `LIVEKIT_WORKER_URL`) must be in
+`.env` before this restart; if either changes later, restart the host first,
+then the worker. Restart the host with `bash setup/lib/restart.sh` so the
+channel loads (it creates its `voice_mode_lines` table on start):
 
 ```nc:run effect:restart
 bash setup/lib/restart.sh
 ```
+
+Check it: `grep 'voice-mode: ready' logs/nanoclaw.log | tail -1` shows the
+page port and call URL, and
+`curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3100/voice` (your
+`VOICE_MODE_PORT`) prints `200`. Run the same `curl` against
+`https://<origin>/voice` from a device that can reach the origin; it must print
+`200` too. With `VOICE_MODE_ALLOWED_CLIENT_CIDRS` set and loopback trusted, a
+local 403 is expected; check through the proxy only.
 
 ## Who can make a call link
 
@@ -271,18 +297,6 @@ ncl users list
 ncl roles grant --user slack:<id> --role admin --group <agent group id>
 ```
 
-## Make the first line
-
-Tell the user to send `/voice` (on Slack `!voice`) in a chat wired to the agent,
-preferably a direct chat with the bot, after starting the worker (below): the
-first time it sends a private call link for that agent (keep it, it is shown
-once) and makes that chat the one calls talk in; later, `/voice` in another chat
-only moves calls there, and `/voice new` replaces a lost link:
-
-```nc:operator
-In a chat wired to your agent (a direct chat with the bot is best), send /voice (on Slack: !voice). The first time, you get a private call link for that agent (keep it: it is shown once), and calls talk in that chat. Later, /voice in another chat only moves calls there; /voice new replaces a lost link. Start the voice worker first (Run the worker, below).
-```
-
 ## Run the worker
 
 The worker is a separate process (LiveKit's agent framework forks a child per
@@ -292,15 +306,24 @@ update, **restart the host first, then the worker**, from the same build: they
 share a protocol version, and a mismatched worker makes the page say the voice
 service is updating.
 
-Try it in a terminal first: `node dist/voice-mode-worker.js start`. Its health
-check answers on `127.0.0.1:8089` (`VOICE_MODE_WORKER_HEALTH_PORT`). If the host's
-webhook server is not on `http://127.0.0.1:3000` (`WEBHOOK_PORT`), set
-`LIVEKIT_HOST_URL`; it must be a local `http(s)` address (`localhost`,
-`127.0.0.1` or `[::1]`), since the host serves the worker on loopback only, and
-the worker refuses to start otherwise.
+Try it in a terminal first, from the checkout:
+`node dist/voice-mode-worker.js start`. It prints
+`voice worker: protocol v<n>, host URL <url> (LIVEKIT_HOST_URL)`, then, once
+LiveKit accepts it, a line like `registered worker`.
+`curl -s http://127.0.0.1:8089/` (`VOICE_MODE_WORKER_HEALTH_PORT`) prints `OK`
+while it is connected to LiveKit; that alone is not a working call.
+The worker reaches the host at `http://127.0.0.1:<WEBHOOK_PORT>`, taking
+`WEBHOOK_PORT` from this checkout's `.env` or its own environment, else 3000.
+Set `LIVEKIT_HOST_URL` only to override that; it must be a local `http(s)`
+address (`localhost`, `127.0.0.1` or `[::1]`), since the host serves the worker
+on loopback only, and the worker refuses to start otherwise. Stop the terminal
+worker with Ctrl-C before starting it as a service.
 
-**Linux, systemd user unit** (`~/.config/systemd/user/nanoclaw-voice-mode-worker.service`;
-`WorkingDirectory` is your checkout):
+**Linux, systemd user unit** (`~/.config/systemd/user/nanoclaw-voice-mode-worker.service`).
+Replace `/absolute/path/to/nanoclaw` with this checkout's absolute path and
+`/absolute/path/to/node` with the output of `command -v node` from the terminal
+where the worker ran (Node 22 or newer); systemd does not load your shell's Node
+manager.
 
 ```ini
 [Unit]
@@ -308,9 +331,10 @@ Description=NanoClaw Voice mode worker
 After=network-online.target
 
 [Service]
-WorkingDirectory=%h/nanoclaw
-ExecStart=/usr/bin/env node dist/voice-mode-worker.js start
+WorkingDirectory=/absolute/path/to/nanoclaw
+ExecStart=/absolute/path/to/node dist/voice-mode-worker.js start
 Restart=on-failure
+RestartSec=5
 TimeoutStopSec=90
 
 [Install]
@@ -318,7 +342,10 @@ WantedBy=default.target
 ```
 
 ```bash
+mkdir -p ~/.config/systemd/user   # before writing the unit
 systemctl --user daemon-reload && systemctl --user enable --now nanoclaw-voice-mode-worker
+systemctl --user status nanoclaw-voice-mode-worker
+journalctl --user -u nanoclaw-voice-mode-worker -n 50
 ```
 
 **macOS, launchd** (`~/Library/LaunchAgents/com.nanoclaw-voice-mode-worker.plist`;
@@ -341,12 +368,28 @@ use the absolute paths of your checkout and of `which node`):
 </plist>
 ```
 
+From the checkout:
+
 ```bash
+mkdir -p logs ~/Library/LaunchAgents   # before writing the plist
 launchctl load ~/Library/LaunchAgents/com.nanoclaw-voice-mode-worker.plist
+tail -n 50 logs/voice-mode-worker.log
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw-voice-mode-worker   # restart after an update
 ```
 
 On stop the worker takes no new calls and gives running ones 60 seconds.
+
+## Make the first line
+
+Once the worker is running (above), tell the user to send `/voice` (on Slack
+`!voice`) in a chat wired to the agent, preferably a direct chat with the bot:
+the first time it sends a private call link for that agent (keep it, it is
+shown once) and makes that chat the one calls talk in; later, `/voice` in
+another chat only moves calls there, and `/voice new` replaces a lost link:
+
+```nc:operator
+With the voice worker running (Run the worker), in a chat wired to your agent (a direct chat with the bot is best), send /voice (on Slack: !voice). The first time, you get a private call link for that agent (keep it: it is shown once), and calls talk in that chat. Later, /voice in another chat only moves calls there; /voice new replaces a lost link.
+```
 
 ## Where calls talk, and `/voice`
 
@@ -382,7 +425,9 @@ direct chat among several), and are refused when there is none.
 Open the link `/voice` sent you, press Call, allow the microphone and
 ask something only the agent knows ("what's on my calendar tomorrow?"). The
 first answer of a call can take a few seconds longer while the agent's container
-starts. On iPhone, start the call with the Call button so audio can play.
+starts. On iPhone, start the call with the Call button so audio can play. The
+install works when your words reach the chat as a transcript and you hear the
+agent's reply; if not, see Troubleshooting.
 Adding `&demo=1` to the link plays a scripted call that connects to nothing.
 
 Three short sounds let you follow a call without looking: a rising two-note
@@ -428,9 +473,19 @@ the file too. Terms over 80 characters are skipped, and the file shares the
 
 ## Self-hosted LiveKit
 
+**Advanced.** This needs an existing HTTPS endpoint, DNS and certificates for
+both the page name and a TURN name, and a reverse proxy that carries WebSocket
+signalling and TURN over TCP/TLS; without that, use LiveKit Cloud for the first
+call. Tailscale Serve for `/voice` alone does not provide TURN, and iPhones use
+relay (TURN) by default, so without it the page loads but there is no audio.
+
 Your own LiveKit server instead of Cloud. A working shape for a home server
 reached over a tailnet or LAN, with a reverse proxy that already holds a
-certificate on port 443:
+certificate on port 443. The example advertises one IPv4 LAN or tailnet address
+(`/32` is IPv4): every caller must be able to reach it, so a LAN-only address
+does not work from a phone on mobile data. Callers need TCP 443 (page,
+signalling, TURN) through the proxy and UDP 7882 plus TCP 7881 on `<node-ip>`;
+7880 and 5349 stay private, reached by the proxy only.
 
 1. Install `livekit-server` (on Linux a release binary from
    https://github.com/livekit/livekit/releases, on macOS `brew install livekit`)
@@ -471,7 +526,8 @@ certificate on port 443:
    `tls` on, and a service `address: 127.0.0.1:5349`; nginx needs a `stream`
    block, Caddy its layer4 plugin.
 5. In `.env`: `LIVEKIT_URL=wss://<page host>` (the browser signals at `/rtc`
-   there), `LIVEKIT_WORKER_URL=ws://127.0.0.1:7880`, and the key pair.
+   there), `LIVEKIT_WORKER_URL=ws://127.0.0.1:7880`, and the key pair, all
+   before the host restart (Restart, above).
 6. Let callers reach UDP 7882 and TCP 7881 on `<node-ip>`.
 7. Verify: `curl -s https://<page host>/rtc/validate` returns LiveKit's own 401
    ("no permissions to access the room"), and
@@ -501,6 +557,18 @@ to override. Desktop browsers use UDP.
   `GEMINI_API_KEY` are all set; the host log names what
   is missing.
 - **The microphone is refused.** The page is not on HTTPS or `localhost`.
+- **The microphone is refused on HTTPS.** Allow it in the browser's site
+  settings and the OS privacy settings, and open the link in a full browser,
+  not an in-app webview.
+- **The page is unreachable or blank.** Check the host logged
+  `voice-mode: ready`, that the proxy targets `VOICE_MODE_PORT` and keeps the
+  `/voice` path and its child routes (`/voice/info`, `/voice/livekit/...`), and,
+  with Tailscale Serve, that the caller's device is on the same tailnet.
+- **The call connects but there is no audio.** Unmute, and press the page's
+  `Tap to hear <agent>` button if it shows. No transcript in the chat: check the
+  worker log for transcription errors, then LiveKit media and TURN. A transcript
+  but no speech: check the worker log for speech (TTS) errors and the device's
+  playback. Self-hosted on an iPhone: check TURN (Self-hosted LiveKit).
 - **403 on the page.** The request came from a non-loopback address outside
   `VOICE_MODE_TRUSTED_PROXY_CIDRS`, or a trusted proxy (loopback included, once
   listed there) forwarded a client outside `VOICE_MODE_ALLOWED_CLIENT_CIDRS`, or
