@@ -29,6 +29,8 @@ import {
 } from './channels/voice-livekit-protocol.js';
 import {
   AWAIT_REPLY_MS,
+  capSpokenText,
+  DEFAULT_MAX_SPOKEN_CHARS,
   FAILURE_LINES,
   GeminiTranscribeSTT,
   HostLink,
@@ -36,6 +38,7 @@ import {
   interactionText,
   languageOf,
   MAX_IDLE_WAIT_MS,
+  maxSpokenChars,
   parseJobMetadata,
   PacedTTS,
   pathSegment,
@@ -43,6 +46,7 @@ import {
   readJobHeader,
   recordingDays,
   REPLY_CHUNKS,
+  REST_IN_CHAT,
   runCall,
   speakableText,
   TTS_CONCURRENCY,
@@ -120,7 +124,36 @@ describe('helpers', () => {
   it('names why the host did not take a turn', () => {
     expect(hostLossReason({ accepted: false, status: 429 })).toBe('rate_limited');
     expect(hostLossReason({ accepted: false, status: 409 })).toBe('rejected');
+    expect(hostLossReason({ accepted: false, status: 422 })).toBe('rejected');
+    expect(hostLossReason({ accepted: false, status: 500 })).toBe('rejected');
+    expect(hostLossReason({ accepted: false, status: 504 })).toBe('timeout');
     expect(hostLossReason({ accepted: false, error: 'The operation was aborted due to timeout' })).toBe('timeout');
+  });
+
+  it('cuts long spoken text at the last sentence end within the cap and says the rest is in the chat', () => {
+    expect(capSpokenText('Short. Fine.', 20, 'en')).toBe('Short. Fine.');
+    expect(capSpokenText('x'.repeat(5000), 0, 'en')).toBe('x'.repeat(5000));
+    const text = 'First one here. Second sentence is right here! Third goes past the cap.';
+    expect(capSpokenText(text, 50, 'en')).toBe(`First one here. Second sentence is right here! ${REST_IN_CHAT.en}`);
+    // A sentence end that would need the character past the cap does not count.
+    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 10, 'uk')).toBe(`Aaaa bbbb. ${REST_IN_CHAT.uk}`);
+    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 9, 'uk')).toBe(`Aaaa… ${REST_IN_CHAT.uk}`);
+    // Decimals are not sentence ends; with none before the cap the cut is at a word, never inside one.
+    expect(capSpokenText('Version 2.4 of the release, with many words', 30, 'en')).toBe(
+      `Version 2.4 of the release… ${REST_IN_CHAT.en}`,
+    );
+    expect(capSpokenText('Слово слово слово слово', 13, 'uk')).toBe(`Слово слово… ${REST_IN_CHAT.uk}`);
+    expect(capSpokenText('a'.repeat(30), 10, 'en')).toBe(REST_IN_CHAT.en);
+    expect(REST_IN_CHAT).toEqual({ uk: 'Решта - у чаті.', en: 'The rest is in the chat.' });
+  });
+
+  it('reads WALKIE_MAX_SPOKEN_CHARS, with 0 for no cap', () => {
+    expect(maxSpokenChars(undefined)).toBe(DEFAULT_MAX_SPOKEN_CHARS);
+    expect(DEFAULT_MAX_SPOKEN_CHARS).toBe(800);
+    expect(maxSpokenChars(' 400 ')).toBe(400);
+    expect(maxSpokenChars('0')).toBe(0);
+    expect(maxSpokenChars('-5')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
+    expect(maxSpokenChars('lots')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
   });
 
   it('reads the language of a transcript from its script', () => {
@@ -240,6 +273,22 @@ describe('Walkie', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(said).toEqual(['Booked for eight.']);
     expect(statuses.at(-1)).toBe(false);
+  });
+
+  it("caps every spoken message, closing in the caller's latest language", async () => {
+    vi.useFakeTimers();
+    const { deps, said } = fakeWalkieDeps();
+    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 20 });
+    walkie.onTurn('what is new');
+    await vi.advanceTimersByTimeAsync(SILENCE + TURN_SETTLE_MS);
+    walkie.onReply('Two things. A **third** one that is long.');
+    walkie.onReply('Fits.');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(said).toEqual([`Two things. ${REST_IN_CHAT.en}`, 'Fits.']);
+    const uncapped = new Walkie(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 0 });
+    uncapped.onReply('Two things. A third one that is long.');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(said.at(-1)).toBe('Two things. A third one that is long.');
   });
 
   it('drops thinking after a while without typing ticks, and holds it while they come', async () => {
@@ -503,6 +552,7 @@ describe('runCall', () => {
       expect(host.calls.find((c) => c.url.endsWith('/utterance'))?.body).toEqual({
         callId: 'call-1',
         text: 'Book a table',
+        turnKey: expect.stringMatching(/^[0-9a-f-]{36}$/),
       }),
     );
     expect(v.voice.setThinking).toHaveBeenCalledWith(true);
@@ -534,6 +584,43 @@ describe('runCall', () => {
     });
     v.events.onTurnLost('stt', { speechMs: 1200 }, { sttModel: 'gemini-3.5-transcribe-live' });
     expect(v.voice.publishTurn).toHaveBeenLastCalledWith({ turn: 2, status: 'lost', reason: 'stt' });
+  });
+
+  it('posts a turn once more under the same key when the connection drops, but not after a timeout', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    let failures = [new TypeError('fetch failed')] as Error[];
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const failure = String(input).endsWith('/utterance') && failures.shift();
+      if (failure) {
+        host.calls.push({ url: String(input), auth: undefined, body: JSON.parse(String(init?.body)) });
+        throw failure;
+      }
+      return host.fetchImpl(input, init);
+    });
+    const v = fakeVoice();
+    await runCall(ctx, deps(fetchImpl, v.createVoice));
+    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' }),
+    );
+    const posts = host.calls.filter((c) => c.url.endsWith('/utterance'));
+    expect(posts).toHaveLength(2);
+    expect(posts[1].body).toEqual(posts[0].body);
+
+    failures = [new DOMException('The operation was aborted due to timeout', 'TimeoutError')];
+    v.events.onTurn('And a taxi', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({
+        turn: 2,
+        status: 'lost',
+        reason: 'timeout',
+        text: 'And a taxi',
+      }),
+    );
+    expect(host.calls.filter((c) => c.url.endsWith('/utterance'))).toHaveLength(3);
+    // A different turn, a different key.
+    expect(host.calls.at(-1)?.body?.turnKey).not.toBe(posts[0].body?.turnKey);
   });
 
   it('names the host URL when the host is unreachable at join', async () => {

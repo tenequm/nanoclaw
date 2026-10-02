@@ -151,6 +151,7 @@ async function main(): Promise<void> {
             });
           });
       },
+      routeInboundEvent: (event) => inboundReady.then(() => routeInbound(event)),
       onMetadata(platformId, name, isGroup) {
         log.info('Channel metadata discovered', {
           channelType: adapter.channelType,

@@ -18,6 +18,13 @@ export interface ChannelSetup {
    */
   onInboundEvent(event: InboundEvent): void | Promise<void>;
 
+  /**
+   * `onInboundEvent` for a caller that must know what became of the event (a
+   * voice call's turn): resolves once routing finished and rejects when it
+   * threw. Pair it with `event.onStored` to learn whether a session took it.
+   */
+  routeInboundEvent?(event: InboundEvent): Promise<void>;
+
   /** Called when the adapter discovers metadata about a conversation. */
   onMetadata(platformId: string, name?: string, isGroup?: boolean): void;
 
@@ -86,6 +93,11 @@ export interface InboundEvent {
    * voice call's turns, src/channels/voice-livekit.ts); never from platform input.
    */
   agentGroupId?: string;
+  /**
+   * Called each time the router stores the message in an agent's session as a
+   * trigger, before the wake. Set only host-side, like `agentGroupId`.
+   */
+  onStored?: () => void;
 }
 
 /** Inbound message from adapter to host. */

@@ -136,6 +136,8 @@ interface Harness {
   inbound: InboundMessage[];
   clock: { now: number };
   access: { enabled: boolean };
+  /** What the router does with the next turns: store them, drop them, never finish, or throw. */
+  routing: { mode: 'store' | 'drop' | 'hang' | 'throw' };
   lk: FakeLiveKit;
   stop(): Promise<void>;
 }
@@ -151,6 +153,7 @@ async function startHarness(
   const events: InboundEvent[] = [];
   const clock = { now: Date.UTC(2026, 9, 2, 1, 0, 0) };
   const access = { enabled: true };
+  const routing: Harness['routing'] = { mode: 'store' };
   const lk = fakeLiveKit();
   const adapter = createGptLiveAdapter({
     apiKey: 'sk-test-key',
@@ -189,12 +192,21 @@ async function startHarness(
     onInboundEvent: (event) => {
       events.push(event);
     },
+    // The LiveKit engine routes here; a turn on the voice line is recorded as the message it carries.
+    routeInboundEvent: async ({ onStored, ...event }) => {
+      if (event.channelType !== 'voice') events.push(event);
+      else inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
+      if (routing.mode === 'hang') return new Promise<void>(() => {});
+      if (routing.mode === 'throw') throw new Error('router exploded');
+      if (routing.mode === 'store') onStored?.();
+    },
     onMetadata: () => {},
     onAction: () => {},
   });
   return {
     adapter,
     events,
+    routing,
     hostUrl: `http://127.0.0.1:${port}`,
     base: `http://127.0.0.1:${port}/webhook/voice`,
     inbound,
@@ -502,6 +514,56 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(refused.headers.get('retry-after')).toBeTruthy();
     h.clock.now += MIN;
     expect((await worker.post('utterance', { text: 'later' })).status).toBe(202);
+    worker.close();
+  });
+
+  it('answers 202 only once the agent session stored the turn', async () => {
+    await h.stop();
+    h = await startHarness({}, true, { routeTimeoutMs: 100 });
+    const { worker } = await startCall(h);
+    h.routing.mode = 'drop';
+    expect((await worker.post('utterance', { text: 'dropped' })).status).toBe(422);
+    h.routing.mode = 'throw';
+    expect((await worker.post('utterance', { text: 'broken' })).status).toBe(500);
+    h.routing.mode = 'hang';
+    expect((await worker.post('utterance', { text: 'stuck' })).status).toBe(504);
+    h.routing.mode = 'store';
+    expect((await worker.post('utterance', { text: 'taken' })).status).toBe(202);
+    expect(h.inbound).toHaveLength(4);
+    worker.close();
+  });
+
+  it('answers a retried turn from its first outcome and routes it once', async () => {
+    const { worker } = await startCall(h);
+    const first = await worker.post('utterance', { text: 'once', turnKey: 'k-1' });
+    const again = await worker.post('utterance', { text: 'once', turnKey: 'k-1' });
+    expect(first.status).toBe(202);
+    expect(again.status).toBe(202);
+    expect(await again.json()).toEqual(await first.json());
+    expect(h.inbound).toHaveLength(1);
+    // A refusal is remembered as well: the retry is not routed a second time.
+    h.routing.mode = 'drop';
+    expect((await worker.post('utterance', { text: 'no', turnKey: 'k-2' })).status).toBe(422);
+    h.routing.mode = 'store';
+    expect((await worker.post('utterance', { text: 'no', turnKey: 'k-2' })).status).toBe(422);
+    expect(h.inbound).toHaveLength(2);
+    worker.close();
+  });
+
+  it('caps the turns still being routed on one call', async () => {
+    await h.stop();
+    h = await startHarness({}, true, { routeTimeoutMs: 300 });
+    const { worker } = await startCall(h);
+    h.routing.mode = 'hang';
+    const pending = [1, 2, 3].map((i) => worker.post('utterance', { text: `t${i}`, turnKey: `k${i}` }));
+    await vi.waitFor(() => expect(h.inbound).toHaveLength(3));
+    expect((await worker.post('utterance', { text: 't4' })).status).toBe(429);
+    // A retry of a turn in flight joins it rather than counting against the cap.
+    const retried = worker.post('utterance', { text: 't1', turnKey: 'k1' });
+    expect((await Promise.all([...pending, retried])).map((r) => r.status)).toEqual([504, 504, 504, 504]);
+    h.routing.mode = 'store';
+    expect((await worker.post('utterance', { text: 't5' })).status).toBe(202);
+    expect(h.inbound).toHaveLength(4);
     worker.close();
   });
 
@@ -928,6 +990,19 @@ describe('livekit call talking in the agent chat', () => {
       'Answer to two.',
       'Answer to four.',
     ]);
+    worker.close();
+  });
+
+  it('posts the transcript of a turn only once the agent has it', async () => {
+    const { posts } = await start([{ platform_id: 'telegram:100', name: 'HQ' }]);
+    const { worker } = await startCall(h);
+    h.routing.mode = 'drop';
+    expect((await worker.post('utterance', { text: 'lost words' })).status).toBe(422);
+    h.routing.mode = 'store';
+    await worker.utter('kept words');
+    await vi.waitFor(() =>
+      expect(posts).toEqual([{ instance: 'telegram', platformId: 'telegram:100', text: '🎙 Ethan: kept words' }]),
+    );
     worker.close();
   });
 

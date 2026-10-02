@@ -19,12 +19,14 @@
  *  - each finished turn goes to the host, which hands it to the agent as a
  *    spoken message; nothing in the session answers it;
  *  - each complete agent reply from the host's event stream is spoken with
- *    `session.say()` once the caller is not mid-turn, uninterruptible: while
+ *    `session.say()` once the caller is not mid-turn, cut to
+ *    WALKIE_MAX_SPOKEN_CHARS at a sentence end, uninterruptible: while
  *    it plays, the caller's audio is not transcribed (no barge-in); Gemini
  *    TTS, through LiveKit's TTS FallbackAdapter onto a second model.
  * The session owns the audio, captions and `lk.agent.state`; "thinking" goes
  * on a separate attribute, since a session without an LLM never thinks.
  */
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ReadableStream, TransformStream } from 'node:stream/web';
@@ -118,6 +120,10 @@ const MISMATCH_NOTICE_MS = 3_000;
 const RECORDING_PAD_MS = 300;
 /** Longest turn recording; audio past it is not kept. */
 const MAX_RECORDED_TURN_MS = 120_000;
+/** A turn whose POST failed in transit is sent once more, under the same turn key, after this long. */
+const TURN_RETRY_DELAY_MS = 500;
+/** WALKIE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
+export const DEFAULT_MAX_SPOKEN_CHARS = 800;
 const DAY_MS = 86_400_000;
 
 /** The worker's HTTP client for the host's /webhook/voice/livekit/agent routes. */
@@ -217,6 +223,41 @@ export const FAILURE_LINES: Record<'turn' | 'reply', Record<CallLanguage, string
   turn: { uk: 'Не розчув, повтори, будь ласка.', en: "Sorry, I didn't catch that." },
   reply: { uk: 'Не вийшло озвучити відповідь, вона є на екрані.', en: "Sorry, I couldn't read that reply out." },
 };
+
+/** Said after a message cut for speech: the full text is in the chat. */
+export const REST_IN_CHAT: Record<CallLanguage, string> = {
+  uk: 'Решта - у чаті.',
+  en: 'The rest is in the chat.',
+};
+
+/** WALKIE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default. */
+export function maxSpokenChars(raw: string | undefined): number {
+  const value = raw?.trim();
+  if (!value) return DEFAULT_MAX_SPOKEN_CHARS;
+  const chars = Number(value);
+  return Number.isInteger(chars) && chars >= 0 ? chars : DEFAULT_MAX_SPOKEN_CHARS;
+}
+
+/**
+ * Speakable text cut to `max` characters for a call: up to the last sentence end within the cap, else
+ * the last whole word, then a line saying the rest is in the chat. Unchanged when it fits or `max` is 0.
+ */
+export function capSpokenText(text: string, max: number, language: CallLanguage): string {
+  if (max <= 0 || text.length <= max) return text;
+  // One character past the cap shows whether the text breaks right at it.
+  const span = text.slice(0, max + 1);
+  let cut = 0;
+  for (const m of span.matchAll(/[.!?…]+["'»”)\]]*(?=\s)/g)) {
+    const end = m.index + m[0].length;
+    if (end <= max) cut = end;
+  }
+  let head = text.slice(0, cut).trim();
+  if (!head) {
+    const space = span.search(/\s\S*$/);
+    head = space > 0 ? `${text.slice(0, space).replace(/[\s,;:–—-]+$/, '')}…` : '';
+  }
+  return head ? `${head} ${REST_IN_CHAT[language]}` : REST_IN_CHAT[language];
+}
 
 /** The language a transcript is in, by its script; undefined when it has no letters. */
 export function languageOf(text: string): CallLanguage | undefined {
@@ -751,7 +792,7 @@ export class Walkie {
 
   constructor(
     private readonly deps: WalkieDeps,
-    private readonly options: { silenceMs: number; language: CallLanguage },
+    private readonly options: { silenceMs: number; language: CallLanguage; maxSpokenChars?: number },
   ) {
     this.now = deps.now ?? (() => Date.now());
     this.refresh();
@@ -785,9 +826,15 @@ export class Walkie {
     if (this.closed) return;
     this.thinkingUntil = 0;
     this.refresh();
-    const spoken = speakableText(text);
-    if (!spoken) return;
+    const full = speakableText(text);
+    if (!full) return;
+    const max = this.options.maxSpokenChars ?? DEFAULT_MAX_SPOKEN_CHARS;
+    if (max > 0 && full.length > max) {
+      this.deps.log.info('walkie: a long message is cut for speech', { chars: full.length, max });
+    }
     this.enqueue(async () => {
+      // Cut when spoken, so the closing line is in the language of the caller's latest turn.
+      const spoken = capSpokenText(full, max, this.options.language);
       if (!(await this.deps.say(spoken)) && !this.closed) {
         this.deps.log.warn('walkie: a reply could not be synthesized');
         this.feedback('reply');
@@ -894,7 +941,8 @@ export class Walkie {
 /** Why the host did not take a turn, as the page's turn status says it. */
 export function hostLossReason(result: SendResult): 'rate_limited' | 'rejected' | 'timeout' {
   if (result.status === 429) return 'rate_limited';
-  return result.status !== undefined ? 'rejected' : 'timeout';
+  // 504: the host could not get the turn into the agent's session in time.
+  return result.status !== undefined && result.status !== 504 ? 'rejected' : 'timeout';
 }
 
 /** The fields every job carries whatever its version, enough to answer a mismatched one. */
@@ -1285,7 +1333,13 @@ async function sessionVoice(
 
 function defaultDeps(): RunCallDeps {
   return {
-    env: workerEnv(['GEMINI_API_KEY', 'LIVEKIT_API_SECRET', 'LIVEKIT_HOST_URL', 'WALKIE_RECORDINGS_DAYS']),
+    env: workerEnv([
+      'GEMINI_API_KEY',
+      'LIVEKIT_API_SECRET',
+      'LIVEKIT_HOST_URL',
+      'WALKIE_RECORDINGS_DAYS',
+      'WALKIE_MAX_SPOKEN_CHARS',
+    ]),
     createVoice: (ctx, meta, settings, events) => sessionVoice(ctx as JobContext, meta, settings, events),
     markUpdating: (ctx) => setAttribute(ctx, WALKIE_UPDATING_ATTRIBUTE, '1'),
     log: workerLog(agentsLog()),
@@ -1359,7 +1413,14 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const walkie = new Walkie(
     {
       send: async (text) => {
-        const res = await host.post('utterance', { text });
+        // The host answers a turn key once, so a retry after a dropped connection cannot reach the agent twice.
+        const turnKey = randomUUID();
+        const res = await host.post('utterance', { text, turnKey }).catch(async (err: unknown) => {
+          if ((err as Error | null)?.name === 'TimeoutError') throw err;
+          callLog.warn('voice worker: posting a turn failed; trying once more', { err });
+          await sleep(TURN_RETRY_DELAY_MS);
+          return host.post('utterance', { text, turnKey });
+        });
         if (res.status === 202) {
           const body = (await res.json().catch(() => null)) as { id?: unknown } | null;
           return { accepted: true, status: 202, id: typeof body?.id === 'string' ? body.id : undefined };
@@ -1372,7 +1433,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       setThinking: (thinking) => callVoice?.setThinking(thinking),
       log: callLog,
     },
-    { silenceMs: meta.silenceMs, language: DEFAULT_CALL_LANGUAGE },
+    {
+      silenceMs: meta.silenceMs,
+      language: DEFAULT_CALL_LANGUAGE,
+      maxSpokenChars: maxSpokenChars(deps.env.WALKIE_MAX_SPOKEN_CHARS),
+    },
   );
   const end = async (reason: string, tellHost: boolean) => {
     if (ending) return;
@@ -1506,6 +1571,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'LIVEKIT_HOST_URL',
     'VOICE_WORKER_HEALTH_PORT',
     'WALKIE_RECORDINGS_DAYS',
+    'WALKIE_MAX_SPOKEN_CHARS',
   ]);
   // agents-js initializes its logger once the CLI runs a command; console until then.
   console.info(

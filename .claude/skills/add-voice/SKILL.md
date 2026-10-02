@@ -446,7 +446,15 @@ handed to the worker with each call:
 | `WALKIE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
 | `WALKIE_MIRROR` | `telegram` | Channel type of the default call chat, used until `/voice` picks one (see below); `off` keeps calls on the voice line until then. |
 
-The worker itself reads `WALKIE_RECORDINGS_DAYS` (default `0`, off): with a
+The worker itself reads `WALKIE_MAX_SPOKEN_CHARS` (default `800`; `0` for no
+cap): an agent message longer than that, after markdown and links are stripped,
+is spoken up to its last sentence end within the cap (or its last whole word when
+no sentence ends before it), followed by "Решта - у чаті." or "The rest is in the
+chat." in the language of the caller's last turn. It applies to every message
+spoken during the call, replies and proactive ones alike, and the captions show
+what was spoken; the full text stays in the chat.
+
+It also reads `WALKIE_RECORDINGS_DAYS` (default `0`, off): with a
 number of days, it saves every caller turn it hears as a 16 kHz mono WAV plus a
 JSON sidecar (call and line id, agent, turn number, start and end, speech
 length, the transcription model that heard it, the transcript or why there was
@@ -534,13 +542,20 @@ from `LIVEKIT_API_SECRET`, so the worker needs that key too. Then, walkie-talkie
   messages; with no call chat, every agent message for the line) goes to the
   worker complete over the host's event stream, and the agent's typing there is
   the worker's "thinking". The worker strips markdown, URLs and tags and speaks
-  it uninterruptibly (`session.say`), in sentence batches of up to 400
+  it uninterruptibly (`session.say`), cut at `WALKIE_MAX_SPOKEN_CHARS` (above),
+  in sentence batches of up to 400
   characters, two requested at a time: the one playing and the next.
   Replies never overlap, and a reply waits for a caller who is mid-turn (at most
   `WALKIE_SILENCE_MS` plus ten seconds, then it takes the channel).
 - While the agent's audio plays, the caller is not transcribed (no barge-in).
   While the agent works the page says it is thinking; the caller can keep
   talking, and each finished turn goes to the agent as a follow-up.
+- The host answers a turn 202 only once the agent's session has stored it.
+  When the router drops it (access or sender policy, no agent taking it) the
+  host answers 422, when routing throws 500, and when the turn is not stored
+  within 8 seconds 504. Each POST carries a random `turnKey`; the worker posts
+  a turn once more under the same key when the connection drops, and the host
+  answers a repeated key from the first outcome without routing it again.
 - When a turn is lost (speech that came out as no text, or the host refusing
   or not answering the turn) the caller hears "Не розчув, повтори, будь ласка" or
   "Sorry, I didn't catch that", in the language of their last turn; when a reply
@@ -548,8 +563,10 @@ from `LIVEKIT_API_SECRET`, so the worker needs that key too. Then, walkie-talkie
   worker also sends one JSON message per caller turn (noise is not reported) on the text stream topic
   `nanoclaw.walkie.turn`: `{"turn": n, "status": "sent" | "lost", "reason"?:
   "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
+  "sent" means the agent's session has the turn; a 504 is "timeout", 429
+  "rate_limited", any other refusal "rejected".
 
-Turns are capped at 8 KB of text and 20 a minute per call. A reply for a call
+Turns are capped at 8 KB of text, 20 a minute and 3 still being routed per call. A reply for a call
 that already ended is not spoken. If the worker does not open its event stream
 within 30 seconds of the caller joining, the host ends the call. The host
 rechecks access every five seconds and ends a call (hangup, revocation,
@@ -594,7 +611,8 @@ During a call each turn is routed into the call chat's session through the
 normal inbound path, as a message from the line's own caller. It is addressed to
 the line's agent alone, whoever else is wired there, and engages it whatever
 the chat's trigger; session mode, access and sender policy apply as for a typed
-message. The bot posts `🎙 <name>: <transcript>` into the chat. The agent answers
+message. Once the agent's session has a turn, the bot posts `🎙 <name>: <transcript>`
+into the chat. The agent answers
 in the chat as usual; while the call is live, each message it delivers to that
 chat (and thread) is also spoken, and its typing there shows as thinking. After
 a mid-call `/voice` the call also keeps speaking the chat it left, until a whole
