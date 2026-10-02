@@ -220,7 +220,9 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   // (e.g. free-text DM replies during multi-step approval flows). They run in
   // registration order; the first to claim the message stops routing. The
   // sequential await is intentional — first-to-claim is order-dependent.
-  for (const intercept of messageInterceptors) {
+  // A host-addressed event (agentGroupId: a voice call's turn) is not a typed
+  // reply to anything, so no interceptor may take it (e.g. as a rejection reason).
+  for (const intercept of event.agentGroupId ? [] : messageInterceptors) {
     if (await intercept(event)) return;
   }
 
@@ -422,7 +424,10 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     );
     const effectiveThreadId = threadsEnabled ? event.threadId : null;
 
-    const ruleEngages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
+    // An event addressed to this one agent by the host (a voice call's turn) engages it whatever
+    // the chat's trigger; the access and sender-scope gates below still apply.
+    const ruleEngages =
+      event.agentGroupId !== undefined || (await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId));
 
     const accessOk =
       ruleEngages && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);
@@ -714,7 +719,8 @@ async function deliverToAgent(
       event.platformId,
       effectiveThreadId,
       mg.instance,
-      event.message.id,
+      // A host-addressed event's id (livekit:<call>:<n>) is no platform message to react to.
+      event.agentGroupId ? undefined : event.message.id,
     );
     const freshSession = await getSession(session.id);
     if (freshSession) {
