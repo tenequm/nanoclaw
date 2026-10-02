@@ -19,6 +19,7 @@ import {
   type APIConnectOptions,
   type VAD,
 } from '@livekit/agents';
+import * as google from '@livekit/agents-plugin-google';
 import { AudioFrame } from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -60,7 +61,9 @@ import {
   FLUSH_QUIET_MS,
   FLUSH_TIMEOUT_MS,
   readReviewRequest,
+  ReadyingGeminiSTT,
   ReviewControl,
+  STT_READY_TIMEOUT_MS,
   type ReviewDeps,
   wholeReplySpeech,
   writeTurnRecording,
@@ -1346,12 +1349,16 @@ function fakeReviewVoice() {
     flushing: false,
     clears: 0,
     minMs: 0,
+    /** Hold each restarted transcription's readiness until `ready()`; at once otherwise. */
+    hold: false,
+    holds: [] as Array<() => void>,
     setManualTurns: vi.fn((manual: boolean) => void (voice.manual = manual)),
     setInput: vi.fn((enabled: boolean) => void (voice.input = enabled)),
     setFlushing: vi.fn((on: boolean) => void (voice.flushing = on)),
     clearTurn: vi.fn(() => {
       voice.clears++;
-      return ++stream;
+      const ready = voice.hold ? new Promise<void>((resolve) => voice.holds.push(resolve)) : Promise.resolve();
+      return { stream: ++stream, ready };
     }),
     flushMinMs: () => voice.minMs,
     takeTurn: vi.fn((): TurnTake => ({ sttModel: 'gemini-3.5-transcribe-live' })),
@@ -1485,6 +1492,71 @@ describe('review mode', () => {
     expect(r.voice.flushing).toBe(false);
     expect(r.states.every((s) => s.draft?.text !== 'Delete the files.')).toBe(true);
     expect(posted).toEqual([]);
+  });
+
+  it('holds talk after a freeze until the restarted transcription takes audio, and says so in the state', async () => {
+    vi.useFakeTimers();
+    const { r, op, draft, heard } = reviewControl();
+    await op('mode', { mode: 'review' });
+    await op('talk');
+    heard('Book a table.', true);
+    r.voice.hold = true;
+    await op('done', { draft: 1 });
+    await settle();
+    expect(draft()).toMatchObject({ id: 1, state: 'ready' });
+    expect(r.last.preparing).toBe(true);
+    await op('send', { draft: 1 });
+    expect(r.last).toMatchObject({ draft: null, preparing: true });
+    let talked = false;
+    const talking = op('talk').then((reply) => {
+      talked = true;
+      return reply;
+    });
+    // The wait runs from the clear at the freeze, a settle ago.
+    await vi.advanceTimersByTimeAsync(STT_READY_TIMEOUT_MS / 2);
+    // The microphone opens on talk's answer: nothing the caller says can reach a stream not yet set up.
+    expect(talked).toBe(false);
+    expect(r.voice.input).toBe(false);
+    r.voice.holds.shift()!();
+    expect(await talking).toMatchObject({ ok: true, draft: 2 });
+    expect(r.voice.input).toBe(true);
+    const recording = r.states.findIndex((s) => s.draft?.id === 2);
+    expect(r.states[recording - 1]).toMatchObject({ draft: null });
+    expect(r.states[recording - 1].preparing).toBeUndefined();
+    expect(r.last.preparing).toBeUndefined();
+  });
+
+  it('lets talk through when the restarted transcription never reports ready, and logs it', async () => {
+    vi.useFakeTimers();
+    const warn = vi.fn();
+    const { r, op, draft } = reviewControl({ log: { info: () => undefined, warn } });
+    await op('mode', { mode: 'review' });
+    await op('talk');
+    r.voice.hold = true;
+    await op('done', { draft: 1 });
+    await settle();
+    expect(draft()).toMatchObject({ id: 1, state: 'empty' });
+    const talking = op('talk');
+    await vi.advanceTimersByTimeAsync(STT_READY_TIMEOUT_MS);
+    expect(await talking).toMatchObject({ ok: true, draft: 2 });
+    expect(warn).toHaveBeenCalledWith('voice worker: the restarted transcription did not report ready in time');
+    expect(r.last.preparing).toBeUndefined();
+  });
+
+  it('refuses a talk that waited for the transcription when the agent started speaking meanwhile', async () => {
+    vi.useFakeTimers();
+    const { control, r, op } = reviewControl();
+    await op('mode', { mode: 'review' });
+    await op('talk');
+    r.voice.hold = true;
+    await op('done', { draft: 1 });
+    await settle();
+    const talking = op('talk');
+    await vi.advanceTimersByTimeAsync(100);
+    control.onAgentSpeaking(true);
+    r.voice.holds.shift()!();
+    expect(await talking).toMatchObject({ ok: false, error: 'agent_speaking' });
+    expect(r.voice.input).toBe(false);
   });
 
   it('says nothing was heard, lets talk retry from there, and never posts an empty draft', async () => {
@@ -1725,6 +1797,33 @@ describe('review mode in a call', () => {
   });
 });
 
+describe('ReadyingGeminiSTT', () => {
+  it('tells, once per stream and by opening order, when a stream it opened first reads its input', async () => {
+    const inputs: Array<{ next: () => Promise<unknown> }> = [];
+    const opened = vi.spyOn(google.beta.GeminiSTT.prototype, 'stream').mockImplementation(() => {
+      const input = { next: async () => ({ done: true, value: undefined }) };
+      inputs.push(input);
+      return { input } as unknown as stt.SpeechStream;
+    });
+    try {
+      const reading: number[] = [];
+      const transcription = new ReadyingGeminiSTT({ apiKey: 'gk-test' }, (n) => reading.push(n));
+      const first = inputs.length;
+      transcription.stream();
+      transcription.stream();
+      expect(transcription.streamsOpened).toBe(2);
+      expect(reading).toEqual([]);
+      const [a, b] = inputs.slice(first);
+      await b.next();
+      await b.next();
+      await a.next();
+      expect(reading).toEqual([2, 1]);
+    } finally {
+      opened.mockRestore();
+    }
+  });
+});
+
 describe('review mode in the session', () => {
   it('feeds the flush silence straight to the transcription, and numbers each stream it hears', async () => {
     const heard: Array<[string, boolean, number]> = [];
@@ -1787,13 +1886,57 @@ describe('review mode in the session', () => {
       expect(reached).toHaveLength(fed);
       endAudio();
       // A session that is not running cannot clear: the stream that runs stays the current one.
-      expect(review.clearTurn()).toBe(1);
+      const notCleared = review.clearTurn();
+      expect(notCleared.stream).toBe(1);
+      await notCleared.ready;
       // A clear restarts the transcription, which is the next stream.
       const clear = vi.spyOn(session, 'clearUserTurn').mockImplementation(() => undefined);
-      expect(review.clearTurn()).toBe(2);
+      expect(review.clearTurn().stream).toBe(2);
       expect(clear).toHaveBeenCalledOnce();
     } finally {
       node.mockRestore();
+    }
+  });
+
+  it('a clear is ready once a transcription stream opened after it reads its audio, not one opened before', async () => {
+    const events: CallVoiceEvents = {
+      onTurn: () => undefined,
+      onCallerSpeaking: () => undefined,
+      onTurnLost: () => undefined,
+      onTurnDropped: () => undefined,
+      onClosed: () => undefined,
+    };
+    const { review, session } = callSession(META, { geminiKey: 'gk-test', record: false }, { vad: {} as VAD }, events, {
+      ...silentLog,
+      error: () => undefined,
+    });
+    // Gemini itself is not loaded: each stream is its input queue, read as its send loop would.
+    const inputs: Array<{ next: () => Promise<unknown> }> = [];
+    const opened = vi.spyOn(google.beta.GeminiSTT.prototype, 'stream').mockImplementation(() => {
+      const input = { next: async () => ({ done: true, value: undefined }) };
+      inputs.push(input);
+      return { input } as unknown as stt.SpeechStream;
+    });
+    vi.spyOn(session, 'clearUserTurn').mockImplementation(() => undefined);
+    try {
+      const transcription = session.stt as stt.STT;
+      transcription.stream();
+      const { ready } = review.clearTurn();
+      let isReady = false;
+      void ready.then(() => (isReady = true));
+      // The stream from before the clear reading says nothing about the restarted one.
+      await inputs[0].next();
+      await flush();
+      expect(isReady).toBe(false);
+      // The restarted stream exists but is still connecting: Gemini reads nothing before setup.
+      transcription.stream();
+      await flush();
+      expect(isReady).toBe(false);
+      await inputs[1].next();
+      await flush();
+      expect(isReady).toBe(true);
+    } finally {
+      opened.mockRestore();
     }
   });
 });

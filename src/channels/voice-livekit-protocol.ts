@@ -136,11 +136,17 @@ export interface CallDraft {
   reason?: 'agent' | 'switch';
 }
 
-/** The worker's review state; `seq` grows with every change, so the page keeps the newest. */
+/**
+ * The worker's review state; `seq` grows with every change, so the page keeps the newest.
+ * `preparing`: a draft froze or was discarded, which restarts the transcription, and the restarted
+ * stream takes no audio yet; talk answers once it does (at most a few seconds), so the page keeps
+ * talk off meanwhile. Absent from an older worker, whose talk never waits.
+ */
 export interface CallReviewState {
   seq: number;
   mode: TurnMode;
   draft: CallDraft | null;
+  preparing?: true;
 }
 
 /** `gen` is the page's own operation counter, echoed back; `draft` names the draft an operation is for. */

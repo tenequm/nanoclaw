@@ -116,6 +116,27 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(v).toMatchObject({ chip: 'Mic muted', hint: 'Sent - tap talk for another turn.' });
   });
 
+  it('keeps talk off while the worker gets its transcription ready after a draft', () => {
+    let v = view({ preparing: true, delivery: 'sent' });
+    expect(keys(v)).toEqual(['End', 'Talk(off)']);
+    expect(v).toMatchObject({ chip: 'Getting ready', hint: 'Talk opens in a moment.', mic: 'Mic off' });
+    // An empty draft gives way to talk, which waits the same.
+    v = view({ preparing: true, draft: draft('empty') });
+    expect(keys(v)).toEqual(['Discard', 'Talk(off)']);
+    expect(v.chip).toBe('Getting ready');
+    // The agent's own state keeps its chip; talk still waits.
+    v = view({ preparing: true }, 'thinking');
+    expect(keys(v)).toEqual(['End', 'Talk(off)']);
+    expect(v).toMatchObject({ chip: 'Andy is working', hint: 'Talk opens in a moment.' });
+    expect(keys(view({ preparing: true }, 'talking'))).toEqual(['End', 'Talk(off)']);
+    // A draft to read or send is not held up by it.
+    v = view({ preparing: true, draft: draft('ready', 'Book a table.') });
+    expect(keys(v)).toEqual(['Discard', 'Send']);
+    expect(v.chip).toBe('Review draft');
+    // Ready again: talk opens.
+    expect(keys(view({ preparing: false, delivery: 'sent' }))).toEqual(['End', 'Talk']);
+  });
+
   it('discarding waits for the worker; empty, failed and oversize drafts cannot be sent', () => {
     let v = view({ draft: draft('ready', 'x'), pending: { op: 'discard' } });
     expect(keys(v)).toEqual(['Discard(off)', 'Talk(off)']);

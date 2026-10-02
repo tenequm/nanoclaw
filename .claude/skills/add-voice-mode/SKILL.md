@@ -719,12 +719,17 @@ draft id it names (a late or repeated one is "stale"), and closes agents-js's
 own session control topic (`lk.agent.session`), which the caller would
 otherwise reach. The worker sends every change of its `CallReviewState` (`{"seq",
 "mode", "draft": {"id", "state": "recording" | "finishing" | "ready" | "empty" |
-"failed", "text", "tooLong"?, "reason"?: "agent" | "switch"}}`) on the topic
-`nanoclaw.voice.review`. In review the session's turn detection is manual and
-its input is off between recordings; after done the transcription gets silence
-until it has finalized what it heard (at most 4 s, past which the rest is
-unverified and the draft cannot be sent), and the draft's text is frozen from
-its final transcripts. Send posts exactly that text through the ordinary turn
+"failed", "text", "tooLong"?, "reason"?: "agent" | "switch"}, "preparing"?:
+true}`) on the topic `nanoclaw.voice.review`. In review the session's turn
+detection is manual and its input is off between recordings; after done the
+transcription gets silence until it has finalized what it heard (at most 4 s,
+past which the rest is unverified and the draft cannot be sent), and the draft's
+text is frozen from its final transcripts. Freezing or discarding an open draft
+clears the session's own turn, which restarts its transcription, and a new
+Gemini Live stream takes no audio until its setup completes: until then the
+state says `"preparing": true`, the page keeps talk off ("getting ready"), and
+the worker answers a talk only once the stream reads audio (at most 3 s), so the
+microphone never opens onto a stream that would lose the first words. Send posts exactly that text through the ordinary turn
 path, and its `sending` status carries the text and the draft id, so the page
 shows that text as the turn. A draft over the 8 KB turn limit cannot be sent.
 A reply that waits out a recording (the usual bounded wait) takes the channel

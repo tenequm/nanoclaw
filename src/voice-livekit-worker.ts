@@ -151,6 +151,11 @@ const FLUSH_CHUNK_MS = 100;
  */
 export const CLEAR_SETTLE_MS = 300;
 const STALE_STREAM_MS = 2_000;
+/**
+ * The restarted transcription takes no audio until its Gemini session is set up; talk waits for
+ * that, and for no longer than this, so a session that never reports it cannot hold talk shut.
+ */
+export const STT_READY_TIMEOUT_MS = 3_000;
 /** agents-js's session control topic (its TOPIC_SESSION_MESSAGES), served to the caller unless closed. */
 const SESSION_CONTROL_TOPIC = 'lk.agent.session';
 /** Review mode's waits, on the global timers (which tests can fake). */
@@ -418,6 +423,50 @@ export class GeminiTranscribeSTT extends stt.STT {
 
   stream(): stt.SpeechStream {
     throw new Error('GeminiTranscribeSTT is not streaming; wrap it in a stt.StreamAdapter');
+  }
+}
+
+/**
+ * The streaming transcription, saying when each stream it opens starts taking audio. Gemini's
+ * stream reads its input only once `live.connect` has resolved, which @google/genai holds until the
+ * server's setupComplete; audio pushed before that waits in the stream's queue and reaches the model
+ * in a burst, which is how the first words after a restart got lost. `onReading` gets the stream's
+ * number (1, 2, ... in opening order) the first time it reads.
+ */
+export class ReadyingGeminiSTT extends google.beta.GeminiSTT {
+  private opened = 0;
+
+  constructor(
+    opts: ConstructorParameters<typeof google.beta.GeminiSTT>[0],
+    private readonly onReading: (stream: number) => void,
+  ) {
+    super(opts);
+  }
+
+  /** Streams opened so far. */
+  get streamsOpened(): number {
+    return this.opened;
+  }
+
+  override stream(options?: Parameters<google.beta.GeminiSTT['stream']>[0]): stt.SpeechStream {
+    const stream = super.stream(options);
+    const number = ++this.opened;
+    // The input queue is the stream's own (protected in agents-js); only its send loop reads it.
+    const input = (stream as unknown as { input?: { next?: (...args: unknown[]) => unknown } }).input;
+    const next = input?.next;
+    if (!input || typeof next !== 'function') {
+      this.onReading(number);
+      return stream;
+    }
+    let told = false;
+    input.next = (...args: unknown[]) => {
+      if (!told) {
+        told = true;
+        this.onReading(number);
+      }
+      return next.apply(input, args);
+    };
+    return stream;
   }
 }
 
@@ -749,8 +798,11 @@ export interface ReviewVoice {
   setInput(enabled: boolean): void;
   /** Feed silence to the transcription, so it finalizes what it has heard. */
   setFlushing(on: boolean): void;
-  /** Drop the session's own open turn; its transcription restarts. Returns the restarted stream's number. */
-  clearTurn(): number;
+  /**
+   * Drop the session's own open turn; its transcription restarts. Returns the restarted stream's
+   * number, and when that stream takes audio (resolved at once when nothing restarts).
+   */
+  clearTurn(): { stream: number; ready: Promise<void> };
   /** How long a flush runs at least. */
   flushMinMs(): number;
   /** The open turn's recording, taken once its text is frozen. */
@@ -1071,6 +1123,10 @@ export class ReviewControl {
   private heardAt = 0;
   private minStream = 0;
   private clearedAt = 0;
+  /** The restarted transcription does not take audio yet: talk waits for `sttReady`. */
+  private preparing = false;
+  private sttReady: Promise<void> = Promise.resolve();
+  private clears = 0;
   private callerSpeaking = false;
   private agentSpeaking = false;
   private sttFailed = false;
@@ -1172,6 +1228,13 @@ export class ReviewControl {
         // An empty draft gives way to a new recording; any other one has to be sent or discarded.
         if (busy && draft?.state !== 'empty') return reply({ error: busy });
         if (this.agentSpeaking) return reply({ error: 'agent_speaking' });
+        // Words spoken before the restarted transcription takes audio are lost: the caller's
+        // microphone opens on this reply, so it comes once the transcription is ready.
+        if (this.preparing) {
+          await this.sttReady;
+          if (this.closed) return reply({ error: 'closed' });
+          if (this.agentSpeaking) return reply({ error: 'agent_speaking' });
+        }
         this.resetHeard();
         this.sttFailed = false;
         this.take = undefined;
@@ -1300,8 +1363,20 @@ export class ReviewControl {
   /** Forget what was heard and clear the session's own open turn, which restarts its transcription. */
   private clear(): void {
     this.resetHeard();
-    this.minStream = this.deps.voice.clearTurn();
+    const { stream, ready } = this.deps.voice.clearTurn();
+    this.minStream = stream;
     this.clearedAt = Date.now();
+    const clear = ++this.clears;
+    this.preparing = true;
+    this.sttReady = Promise.race([ready.then(() => true), pause(STT_READY_TIMEOUT_MS).then(() => false)]).then(
+      (took) => {
+        // A newer clear has its own wait.
+        if (clear !== this.clears) return;
+        if (!took) this.deps.log.warn('voice worker: the restarted transcription did not report ready in time');
+        this.preparing = false;
+        this.publish();
+      },
+    );
   }
 
   private resetHeard(): void {
@@ -1311,7 +1386,12 @@ export class ReviewControl {
 
   private publish(): void {
     if (this.closed) return;
-    this.deps.voice.publishReview({ seq: ++this.seq, mode: this.mode, draft: this.draft });
+    this.deps.voice.publishReview({
+      seq: ++this.seq,
+      mode: this.mode,
+      draft: this.draft,
+      ...(this.preparing ? { preparing: true } : {}),
+    });
   }
 }
 
@@ -1540,13 +1620,24 @@ export function callSession(
   const capture = settings.record ? new TurnCapture() : undefined;
   // The host already trimmed, deduplicated and capped it.
   const vocabulary = meta.vocabulary ?? [];
-  const streaming = new google.beta.GeminiSTT({
-    apiKey,
-    model: meta.sttModel,
-    languageCodes: [...STT_LANGUAGE_CODES],
-    customVocabulary: vocabulary,
-    sampleRate: INPUT_SAMPLE_RATE,
-  });
+  /** Waits for a streaming transcription opened after a clear to take audio. */
+  const readyWaits = new Set<{ after: number; resolve: () => void }>();
+  const streaming = new ReadyingGeminiSTT(
+    {
+      apiKey,
+      model: meta.sttModel,
+      languageCodes: [...STT_LANGUAGE_CODES],
+      customVocabulary: vocabulary,
+      sampleRate: INPUT_SAMPLE_RATE,
+    },
+    (stream) => {
+      for (const wait of readyWaits) {
+        if (wait.after >= stream) continue;
+        readyWaits.delete(wait);
+        wait.resolve();
+      }
+    },
+  );
 
   // The fallback transcribes only while it is the adapter's elected stream. The session goes back
   // to the streaming model once that recovers, or every HAND_BACK_RETRY_MS, always at a pause, so
@@ -1722,6 +1813,8 @@ export function callSession(
   });
   session.on(voice.AgentSessionEventTypes.Close, (ev) => {
     clearInterval(handBackTimer);
+    for (const wait of readyWaits) wait.resolve();
+    readyWaits.clear();
     agent.setFlushing(false);
     countdown.clear();
     // The session closes neither; their recovery probes would run on.
@@ -1752,14 +1845,19 @@ export function callSession(
         agent.setFlushing(on);
       },
       clearTurn() {
+        const opened = streaming.streamsOpened;
         try {
           session.clearUserTurn();
         } catch (err) {
           // Nothing restarts: the stream that runs now stays the current one.
           log.warn('voice worker: could not clear the open turn', { err });
-          return agent.streams;
+          return { stream: agent.streams, ready: Promise.resolve() };
         }
-        return agent.streams + 1;
+        // The fallback transcription takes audio as it comes; the streaming one has to connect first.
+        const ready = fallbackServing()
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => readyWaits.add({ after: opened, resolve }));
+        return { stream: agent.streams + 1, ready };
       },
       flushMinMs: () => (fallbackServing() ? FLUSH_FALLBACK_MIN_MS : FLUSH_MIN_MS),
       takeTurn: take,

@@ -872,7 +872,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     }
     const done = awaitSeq.current !== null && snap.seq >= awaitSeq.current
     if (done) awaitSeq.current = null
-    updateReview((r) => ({ ...r, mode: snap.mode, draft: d, provisional, ...(done ? { pending: null } : {}) }))
+    updateReview((r) => ({ ...r, mode: snap.mode, draft: d, provisional, preparing: !!snap.preparing, ...(done ? { pending: null } : {}) }))
     // The worker stopped the recording (a reply took the channel): the microphone follows it.
     if (snap.mode === "review" && (!d || d.state !== "recording") && mic.current && !mic.current.isMuted && prev.pending?.op !== "talk") void setMic(false)
     if (d?.state === "ready" && !d.tooLong && d.text && !(prev.draft?.id === d.id && prev.draft.state === "ready")) cue("draft")
