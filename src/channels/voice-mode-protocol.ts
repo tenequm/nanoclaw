@@ -86,7 +86,7 @@ export interface LiveKitJobMetadata {
 export const CALL_THINKING_ATTRIBUTE = 'nanoclaw.voice-mode.thinking';
 /** The worker's participant attribute: "1" when it cannot serve this host's protocol version. */
 export const CALL_UPDATING_ATTRIBUTE = 'nanoclaw.voice-mode.updating';
-/** Text stream topic the worker sends one JSON `CallTurnStatus` on per caller turn. */
+/** Text stream topic the worker sends JSON `CallTurnStatus` messages on, per caller turn. */
 export const CALL_TURN_TOPIC = 'nanoclaw.voice-mode.turn';
 
 /**
@@ -100,13 +100,15 @@ export interface CallRoomMetadata {
 }
 
 /**
- * What became of a caller turn: sent to the agent, or lost because the transcription failed
- * (`stt`) or heard no words (`empty`), or the host refused it (`rejected`, `rate_limited`) or
- * did not answer (`timeout`).
+ * What became of a caller turn: closed and on its way to the host (`sending`, once the closing
+ * silence and the final transcript are in, before the host answers), sent to the agent, or lost
+ * because the transcription failed (`stt`) or heard no words (`empty`), or the host refused it
+ * (`rejected`, `rate_limited`) or did not answer (`timeout`). Every turn handed to the host says
+ * `sending` first; one lost to the transcription does not.
  */
 export interface CallTurnStatus {
   turn: number;
-  status: 'sent' | 'lost';
+  status: 'sending' | 'sent' | 'lost';
   reason?: 'stt' | 'rejected' | 'rate_limited' | 'timeout' | 'empty';
   /** The final transcript, when there is one. */
   text?: string;

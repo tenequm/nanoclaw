@@ -13,7 +13,7 @@ export interface Line {
   at: number
   /** Whether this caller turn reached the agent. */
   mark?: TurnMark
-  /** The caller turn's number on this page, once the worker settled it. */
+  /** The caller turn's number on this page, counted from when the turn closed. */
   turn?: number
   /** What an agent line answers ("re: turn 2", "unprompted"), on the first line of a message. */
   re?: string
@@ -92,6 +92,48 @@ export interface VoiceCall {
 export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking", "talking"])
 
 export const PAGE_CLOSED = "The call ended when the page was closed."
+
+/**
+ * The call's sound cues, for a caller who is not looking at the screen: `listening` once the
+ * worker hears the caller, `sent` the moment a turn closes, `turn` when the agent is done and the
+ * microphone is open again.
+ */
+export type Cue = "listening" | "sent" | "turn"
+
+/** Each cue's notes as [Hz, start s, length s], and their peak gain. */
+const CUES: Record<Cue, { notes: ReadonlyArray<readonly [hz: number, at: number, len: number]>; peak: number }> = {
+  // A rising fifth: the line is open.
+  listening: { notes: [[784, 0, 0.09], [1175, 0.1, 0.11]], peak: 0.22 },
+  // One short high tick: the turn is on its way.
+  sent: { notes: [[1760, 0, 0.06]], peak: 0.3 },
+  // A falling third, like a doorbell: over to the caller.
+  turn: { notes: [[1319, 0, 0.09], [1047, 0.11, 0.12]], peak: 0.22 },
+}
+
+/** After a reply, the "your turn" cue waits this long for the next queued line to show up. */
+export const TURN_CUE_DELAY_MS = 600
+
+/**
+ * Plays a cue on the gesture-unlocked context; nothing without one that runs, or when the link
+ * says `?cues=0`. Short pure sine notes, mid-to-high so a phone speaker carries them.
+ */
+export function playCue(ctx: AudioContext | null, cue: Cue) {
+  if (!ctx || ctx.state !== "running" || new URLSearchParams(location.search).get("cues") === "0") return
+  const { notes, peak } = CUES[cue]
+  for (const [hz, at, len] of notes) {
+    const t = ctx.currentTime + at
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.type = "sine"
+    osc.frequency.value = hz
+    gain.gain.setValueAtTime(0.0001, t)
+    gain.gain.linearRampToValueAtTime(peak, t + 0.005)
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + len)
+    osc.connect(gain).connect(ctx.destination)
+    osc.start(t)
+    osc.stop(t + len + 0.01)
+  }
+}
 
 export function statusErrorKind(status: number): ErrorKind {
   if (status === 403) return "link"

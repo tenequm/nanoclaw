@@ -14,11 +14,14 @@ import {
   CallError,
   LIVE_PHASES,
   PAGE_CLOSED,
+  TURN_CUE_DELAY_MS,
   errorText,
   levelsFromStats,
   micErrorKind,
   micErrorText,
+  playCue,
   statusErrorKind,
+  type Cue,
   type ErrorKind,
   type Line,
   type Phase,
@@ -42,7 +45,7 @@ import { voiceEndpoint } from "./voice-endpoint"
 const THINKING_ATTR = "nanoclaw.voice-mode.thinking"
 /** "1" when the worker cannot serve this host's protocol version. */
 const UPDATING_ATTR = "nanoclaw.voice-mode.updating"
-/** One JSON CallTurnStatus per caller turn. */
+/** JSON CallTurnStatus messages per caller turn: "sending" as one goes to the host, then "sent" or "lost". */
 const TURN_TOPIC = "nanoclaw.voice-mode.turn"
 /** Without a worker in the room after this long, it is down or mid-update (host and worker restart together). */
 const AGENT_JOIN_MS = 25_000
@@ -68,8 +71,6 @@ const LIMIT_NAME: Record<string, string> = { duration: "call time limit", daily:
 const LIMIT_WARN_MS = 60_000
 /** Shown later than this before the limit, the warning says "under a minute", not "1 min". */
 const LIMIT_WARN_LATE_MS = LIMIT_WARN_MS - 5_000
-/** After a reply, the "your turn" cue waits this long for the next queued line to show up. */
-const TURN_CUE_DELAY_MS = 600
 
 interface ReplyInfo {
   reply: number
@@ -99,27 +100,10 @@ function endReasonText(metadata: string | undefined): string | null {
   return typeof end === "string" ? (END_TEXT[end] ?? null) : null
 }
 
-/** A short soft tone pair on the gesture-unlocked context: quiet and brief, so the worker's VAD does not take it for speech. */
-function tone(ctx: AudioContext, notes: ReadonlyArray<readonly [hz: number, at: number]>, peak: number) {
-  for (const [hz, at] of notes) {
-    const t = ctx.currentTime + at
-    const osc = ctx.createOscillator()
-    const gain = ctx.createGain()
-    osc.type = "sine"
-    osc.frequency.value = hz
-    gain.gain.setValueAtTime(0.0001, t)
-    gain.gain.linearRampToValueAtTime(peak, t + 0.008)
-    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.06)
-    osc.connect(gain).connect(ctx.destination)
-    osc.start(t)
-    osc.stop(t + 0.07)
-  }
-}
-
-interface TurnStatus extends TurnMark {
-  turn: number
-  text?: string
-}
+/** What became of a caller turn, with its final text when there is one. */
+type SettledTurn = TurnMark & { turn: number; text?: string }
+/** The worker says "sending" the moment a turn closes, before its outcome. */
+type TurnStatus = SettledTurn | { turn: number; status: "sending" }
 
 interface Attempt {
   callId: string | null
@@ -127,8 +111,8 @@ interface Attempt {
 }
 
 function isTurnStatus(v: unknown): v is TurnStatus {
-  const s = v as TurnStatus | null
-  return !!s && typeof s.turn === "number" && (s.status === "sent" || s.status === "lost")
+  const s = v as { turn?: unknown; status?: unknown } | null
+  return !!s && typeof s.turn === "number" && (s.status === "sending" || s.status === "sent" || s.status === "lost")
 }
 
 function tokenError(status: number, body: string): CallError {
@@ -146,11 +130,6 @@ function tokenError(status: number, body: string): CallError {
  * LiveKit's fallback timers fire; going straight to TURN/TLS connects at once.
  * `?relay=1` / `?relay=0` overrides the iOS default.
  */
-/** Call sound cues are on unless the link says `?cues=0`. */
-function cuesEnabled(): boolean {
-  return new URLSearchParams(location.search).get("cues") !== "0"
-}
-
 function forceRelay(): boolean {
   const param = new URLSearchParams(location.search).get("relay")
   if (param !== null) return param === "1"
@@ -180,7 +159,7 @@ const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
  * segments. A turn with no caption at all (nothing transcribed) gets a line of its own. A second
  * status for a turn (a timed-out one the agent got after all) replaces the mark on its line.
  */
-function applyTurn(lines: Line[], covered: Set<number>, status: TurnStatus, newLine: () => Line, turn: number): Line[] {
+function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, newLine: () => Line, turn: number): Line[] {
   const mark: TurnMark = status.reason ? { status: status.status, reason: status.reason } : { status: status.status }
   const marked = lines.find((l) => l.from === "user" && l.turn === turn)
   if (marked) return lines.map((l) => (l.id === marked.id ? { ...l, mark } : l))
@@ -266,7 +245,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const labelledReplies = useRef(new Set<number>())
   const limit = useRef<{ ms: number; kind: string } | null>(null)
   const joinedAt = useRef(0)
-  const cuesOn = useRef(cuesEnabled())
+
+  // Never over the agent's own speech.
+  const cue = useCallback((kind: Cue) => {
+    if (phaseRef.current !== "talking") playCue(unlockCtx.current, kind)
+  }, [])
 
   const setPhase = useCallback((p: Phase) => {
     phaseRef.current = p
@@ -439,7 +422,9 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       startedAt.current = Date.now()
     }
     if (next !== p) setPhase(next)
-  }, [joined, agent, agentAttributes, fail, setPhase])
+    // The worker's session is up and hears the published microphone: the caller can start.
+    if (p === "connecting" && next === "listening") cue("listening")
+  }, [joined, agent, agentAttributes, fail, setPhase, cue])
 
   // What the next spoken line answers. Runs before the captions below, which take it for new agent lines.
   useEffect(() => {
@@ -498,19 +483,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     setStreaming(touched)
   }, [transcriptions, room, commitLines, setStreaming])
 
-  const playCue = useCallback((kind: "sent" | "turn") => {
-    const ctx = unlockCtx.current
-    // Never over the agent's own speech; the turn cue is the quieter one, as the microphone is open again.
-    if (!cuesOn.current || !ctx || ctx.state !== "running" || phaseRef.current === "talking") return
-    if (kind === "sent") tone(ctx, [[1047, 0]], 0.05)
-    else tone(ctx, [[784, 0], [1047, 0.08]], 0.03)
-  }, [])
-
   // Per-turn delivery marks from the worker.
   useEffect(() => {
     if (!active.current) return
     let next = linesRef.current
-    let sent = false
+    let closed = false
     for (const s of turnStreams) {
       if (doneTurns.current.has(s.streamInfo.id)) continue
       let status: unknown
@@ -523,12 +500,16 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       if (!isTurnStatus(status)) continue
       let shown = shownTurns.current.get(status.turn)
       if (shown === undefined) shownTurns.current.set(status.turn, (shown = shownTurns.current.size + 1))
-      sent ||= status.status === "sent"
+      // The sent cue sounds as the turn closes; the agent's "sent" later is the mark alone.
+      if (status.status === "sending") {
+        closed = true
+        continue
+      }
       next = applyTurn(next, coveredLines.current, status, () => ({ id: nextId.current++, from: "user", text: "", at: secondsIn() }), shown)
     }
     if (next !== linesRef.current) commitLines(next)
-    if (sent) playCue("sent")
-  }, [turnStreams, commitLines, playCue])
+    if (closed) cue("sent")
+  }, [turnStreams, commitLines, cue])
 
   const start = useCallback(async () => {
     if (!token) return
@@ -687,7 +668,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     return () => window.clearTimeout(t)
   }, [live])
 
-  // A reply finished and nothing else is queued: the caller's turn, with a soft cue.
+  // A reply finished and nothing else is queued: the caller's turn, with its cue.
   const lastPhase = useRef<Phase>(phase)
   useEffect(() => {
     const was = lastPhase.current
@@ -698,10 +679,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       // A next line announced (before the phase change or since) and not spoken yet: still the agent's turn.
       const next = currentReply.current
       const unspoken = !!next && !labelledReplies.current.has(next.group)
-      if (phaseRef.current === "listening" && !sendCueRef.current && next?.group === group && !unspoken) playCue("turn")
+      if (phaseRef.current === "listening" && !sendCueRef.current && next?.group === group && !unspoken) cue("turn")
     }, TURN_CUE_DELAY_MS)
     return () => window.clearTimeout(t)
-  }, [phase, playCue])
+  }, [phase, cue])
 
   // Call timer.
   useEffect(() => {

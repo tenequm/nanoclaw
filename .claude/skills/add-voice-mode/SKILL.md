@@ -382,6 +382,11 @@ first answer of a call can take a few seconds longer while the agent's container
 starts. On iPhone, start the call with the Call button so audio can play.
 Adding `&demo=1` to the link plays a scripted call that connects to nothing.
 
+Three short sounds let you follow a call without looking: a rising two-note
+when the line hears you, a single high tick when what you said goes to the
+agent, and a falling two-note when the agent is done and it is your turn. None
+plays while the agent speaks. Add `&cues=0` to the link to turn them off.
+
 ## Settings
 
 All in `.env`; restart the host (and the worker, for its keys) to apply. An
