@@ -57,7 +57,7 @@ import {
   type LiveClientEvent,
   type LiveServerEvent,
 } from './gpt-live-session.js';
-import { createLiveKitVoice, LIVEKIT_ID_PREFIX, type LiveKitVoiceConfig } from './voice-livekit.js';
+import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-livekit.js';
 import { DEFAULT_WALKIE_MIRROR } from './voice-livekit-protocol.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
@@ -611,7 +611,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
     if (previous) {
       closeCall(previous, 'replaced by a new call');
     }
-    livekit?.endLine(platformId, 'replaced by a new call');
+    livekit?.endLine(platformId, 'replaced by a new call', 'newer_call');
     // Charged after the replaced call above, so its minutes count against this one.
     const remainingMs = maxCallMsPerDay - usedTodayMs(platformId, now());
     const call: LiveCall = {
@@ -910,8 +910,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
       const text = typeof content === 'string' ? content : typeof content?.text === 'string' ? content.text : '';
       const target = message.inReplyTo ? parseDelegationMessageId(message.inReplyTo) : null;
       if (!target && livekit) {
-        const parts = message.inReplyTo ? parseScopedId(LIVEKIT_ID_PREFIX, message.inReplyTo) : null;
-        const lkTarget = parts && { callId: parts[0], utteranceId: parts[1] };
+        const lkTarget = message.inReplyTo ? parseLiveKitUtteranceId(message.inReplyTo) : null;
         const spoken = await livekit.deliver(platformId, lkTarget, message.inReplyTo, text);
         if (spoken) return spoken.id;
       }

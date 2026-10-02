@@ -650,11 +650,13 @@ export class TurnCapture {
 /**
  * The page's send cue: while a stretch of caller speech waits out the closing silence that sends
  * it, the `nanoclaw.walkie.pending` attribute says how far into that silence it is; it clears
- * when the caller speaks again, the turn goes out or is dropped, or the agent speaks.
+ * when the caller speaks again, the turn goes out or is dropped, the agent speaks, or the turn
+ * is overdue (a transcript of only whitespace commits nothing and times nothing out).
  */
 export class SendCountdown {
   private waits = 0;
   private shown = false;
+  private expiry?: ReturnType<typeof setTimeout>;
 
   constructor(
     private readonly publish: (value: string) => void,
@@ -667,9 +669,13 @@ export class SendCountdown {
     const elapsed = Math.round(Math.max(0, Math.min(this.silenceMs, this.now() - speechEndedAt)));
     this.shown = true;
     this.publish(`${++this.waits}:${elapsed}:${this.silenceMs}`);
+    clearTimeout(this.expiry);
+    this.expiry = setTimeout(() => this.clear(), this.silenceMs - elapsed + TURN_SETTLE_MS);
+    this.expiry.unref();
   }
 
   clear(): void {
+    clearTimeout(this.expiry);
     if (!this.shown) return;
     this.shown = false;
     this.publish('');
@@ -1354,6 +1360,7 @@ export function walkieSession(
   });
   session.on(voice.AgentSessionEventTypes.Close, (ev) => {
     clearInterval(handBackTimer);
+    countdown.clear();
     // The session closes neither; their recovery probes would run on.
     void adapter?.close().catch(() => undefined);
     void ttsAdapter?.close().catch(() => undefined);
@@ -1549,7 +1556,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     if (ending) return;
     ending = true;
     walkie.close();
-    hostLink.abort();
+    // The host link stays open until the host answered: closed first, it ends the call on its own
+    // and answers this at once, before the room carries why the call ended.
     await Promise.all([
       tellHost &&
         host
@@ -1558,6 +1566,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           .catch(() => undefined),
       callVoice?.close().catch(() => undefined),
     ]);
+    hostLink.abort();
     await ctx.deleteRoom().catch(() => undefined);
     ctx.shutdown(reason);
   };
@@ -1656,7 +1665,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     .events((event) => {
       if (event.type === 'end') void end(`host: ${event.reason}`, false);
       else if (event.type === 'reply')
-        walkie.onReply(event.text, event.turn === undefined ? null : turnsByHostId.get(event.turn));
+        // A host that sends no turn at all predates reply labels: not known, so no label.
+        walkie.onReply(event.text, typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn);
       else if (event.type === 'thinking') walkie.onThinking();
       else if (event.type === 'chat') walkie.onChat(event.chat);
       else if (event.type === 'turn-stored') {

@@ -65,11 +65,11 @@ export const WALKIE_TURN_TOPIC = 'nanoclaw.walkie.turn';
 
 /**
  * The room metadata the host sets when a mid-call `/voice` moves the call to another chat, so the
- * page's header follows it: the new call chat's label, or null once the call talks on the voice line.
+ * page's header follows it (the new call chat's label, or null once the call talks on the voice
+ * line), and again right before it deletes the room, with why the call ended.
  */
 export interface WalkieRoomMetadata {
   chat: string | null;
-  /** Set right before the host deletes the room: why the call ended, for the page to say. */
   end?: WalkieEndReason;
 }
 
@@ -112,26 +112,28 @@ export interface WalkieReplyInfo {
 }
 
 /** Why the host ended a call, in the room metadata (`WalkieRoomMetadata.end`) right before it deletes the room. */
-export type WalkieEndReason =
-  | 'hangup'
-  | 'limit_duration'
-  | 'limit_daily'
-  | 'newer_call'
-  | 'revoked'
-  | 'shutdown'
-  | 'worker_gone';
+export const WALKIE_END_REASONS = [
+  'limit_duration',
+  'limit_daily',
+  'newer_call',
+  'revoked',
+  'shutdown',
+  'worker_gone',
+] as const;
+export type WalkieEndReason = (typeof WALKIE_END_REASONS)[number];
 
 /**
  * One line of the host-to-worker event stream: a complete agent message to
- * speak (`turn`: the host's utterance id of the caller turn it answers, when it
- * answers one of this call), the agent still working (from the host's typing
- * refresh), whether the call now talks in a chat (`chat`; none until it does),
- * a turn answered 504 that the agent's session stored after all (`turn-stored`:
- * its `turnKey` and the host's utterance id), the end of the call, or a keepalive.
- * A worker ignores a type it does not know, so new types need no version bump.
+ * speak (`turn`: the host's utterance id of the caller turn it answers, null
+ * when it answers none of this call's turns), the agent still working (from the
+ * host's typing refresh), whether the call now talks in a chat (`chat`; none
+ * until it does), a turn answered 504 that the agent's session stored after all
+ * (`turn-stored`: its `turnKey` and the host's utterance id), the end of the
+ * call, or a keepalive. A worker ignores a type it does not know, so new types
+ * need no version bump.
  */
 export type LiveKitHostEvent =
-  | { type: 'reply'; text: string; turn?: string }
+  | { type: 'reply'; text: string; turn?: string | null }
   | { type: 'thinking' }
   | { type: 'chat'; chat: boolean }
   | { type: 'turn-stored'; turnKey: string; id: string }

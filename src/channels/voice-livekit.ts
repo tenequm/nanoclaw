@@ -60,8 +60,8 @@ import {
   WORKER_REQUEST_TIMEOUT_MS,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
-  type WalkieRoomMetadata,
   type WalkieEndReason,
+  type WalkieRoomMetadata,
 } from './voice-livekit-protocol.js';
 import {
   getMessagingGroup,
@@ -112,46 +112,17 @@ export function walkieMessageText(transcript: string, note: string = WALKIE_REPL
   return `<voice source="livekit">${transcript}</voice>\n${note}`;
 }
 
-/** Inbound ids for caller turns are `livekit:<call>:<n>`; voice.ts parses replies with parseScopedId. */
+/** Inbound ids for caller turns are `livekit:<call>:<n>`; replies name them back in their in-reply-to. */
 export const LIVEKIT_ID_PREFIX = 'livekit:';
 
 function liveKitUtteranceMessageId(callId: string, utteranceId: string): string {
   return `${LIVEKIT_ID_PREFIX}${callId}:${utteranceId}`;
 }
 
-/** The call turn a delivered chat message answers, from its in-reply-to id (agent-scoped, as delivery hands it over). */
-export function liveKitTurnOf(
-  inReplyTo: string | null | undefined,
-  agentGroupId: string,
-): { callId: string; utteranceId: string } | null {
-  if (!inReplyTo) return null;
-  const id = platformMessageId(inReplyTo, agentGroupId);
+export function parseLiveKitUtteranceId(id: string): { callId: string; utteranceId: string } | null {
   if (!id.startsWith(LIVEKIT_ID_PREFIX)) return null;
   const [callId, utteranceId, ...rest] = id.slice(LIVEKIT_ID_PREFIX.length).split(':');
   return callId && utteranceId && rest.length === 0 ? { callId, utteranceId } : null;
-}
-
-/** Why a call ended, as the page names it; null for ends no page is there to hear about. */
-export function walkieEndReason(reason: string): WalkieEndReason | null {
-  switch (reason) {
-    case 'hangup':
-      return 'hangup';
-    case 'duration limit':
-      return 'limit_duration';
-    case 'daily minute budget':
-      return 'limit_daily';
-    case 'replaced by a new call':
-      return 'newer_call';
-    case 'caller access revoked or line changed':
-      return 'revoked';
-    case 'teardown':
-      return 'shutdown';
-    case 'worker link closed':
-    case 'worker never opened its event stream':
-    case 'worker ended':
-      return 'worker_gone';
-  }
-  return reason.startsWith('worker: ') ? 'worker_gone' : null;
 }
 
 /** The slices of the LiveKit server API the host uses; injectable for tests. */
@@ -295,6 +266,8 @@ interface LiveKitCall {
    */
   previousChat: { chat: CallChat; active: boolean } | null;
   cleanup?: Promise<void>;
+  /** The latest chat-label write; the end reason waits for it, so a late label cannot erase the reason. */
+  metadataWrite?: Promise<void>;
   /** Settles once the room carries why the call ended (or that failed) and the worker was told. */
   announced?: Promise<void>;
 }
@@ -338,7 +311,7 @@ export interface LiveKitVoice {
   chatTyping(chat: ChatAddress, agentGroupId: string): void;
   /** The running call on a line, for the shared daily budget. */
   activeCall(platformId: string): { platformId: string; startedAt: number } | undefined;
-  endLine(platformId: string, reason: string): void;
+  endLine(platformId: string, reason: string, end?: WalkieEndReason): void;
   teardown(): Promise<void>;
 }
 
@@ -418,7 +391,8 @@ export function liveKitChatDelivered(
   const text = spokenText(msg);
   if (!text) return;
   const chat = { channelType: msg.channelType, platformId: msg.platformId, threadId: msg.threadId ?? null };
-  const replyTo = liveKitTurnOf(msg.inReplyTo, agentGroupId);
+  // Delivery hands the id over agent-scoped.
+  const replyTo = msg.inReplyTo ? parseLiveKitUtteranceId(platformMessageId(msg.inReplyTo, agentGroupId)) : null;
   for (const engine of engines) engine.chatMessage(chat, agentGroupId, text, replyTo);
 }
 
@@ -555,14 +529,16 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const sameChat = (a: CallChat | null, b: CallChat | null): boolean =>
     a?.group.id === b?.group.id && a?.threadId === b?.threadId;
 
+  const roomMetadata = (chat: CallChat | null, end?: WalkieEndReason): string =>
+    JSON.stringify({ chat: chat ? chatLabel(chat.group) : null, ...(end && { end }) } satisfies WalkieRoomMetadata);
+
   const showChat = (call: LiveKitCall, chat: CallChat | null): void => {
     if (call.ended) return;
-    const metadata: WalkieRoomMetadata = { chat: chat ? chatLabel(chat.group) : null };
-    api
-      .updateRoomMetadata(call.roomName, JSON.stringify(metadata))
-      .catch((err: unknown) =>
+    call.metadataWrite = api.updateRoomMetadata(call.roomName, roomMetadata(chat)).then(
+      () => undefined,
+      (err: unknown) =>
         log.warn('livekit-voice: could not show the new call chat on the page', { callId: call.callId, err }),
-      );
+    );
   };
 
   /**
@@ -652,21 +628,22 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     });
   };
 
-  /** Teardown awaits every delete in flight, wherever it started. `after` runs first. */
-  const trackedDeleteRoom = (call: LiveKitCall, after: Promise<void> = Promise.resolve()): Promise<void> => {
-    const cleanup = after.then(() => deleteRoom(call)).finally(() => cleanups.delete(cleanup));
+  /** Teardown awaits every delete in flight, wherever it started. The delete waits for `once` first. */
+  const trackedDeleteRoom = (call: LiveKitCall, once: Promise<void> = Promise.resolve()): Promise<void> => {
+    const cleanup = once.then(() => deleteRoom(call)).finally(() => cleanups.delete(cleanup));
     cleanups.add(cleanup);
     return cleanup;
   };
 
   /** Room metadata the page reads when it is disconnected, so it can say why; best effort and bounded. */
   const announceEnd = async (call: LiveKitCall, code: WalkieEndReason): Promise<void> => {
-    // The whole metadata is replaced, so the chat label the page shows goes along.
-    const metadata: WalkieRoomMetadata = { chat: call.chat ? chatLabel(call.chat.group) : null, end: code };
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        api.updateRoomMetadata(call.roomName, JSON.stringify(metadata)),
+        // The whole metadata is replaced, so the chat label the page shows goes along.
+        (call.metadataWrite ?? Promise.resolve()).then(() =>
+          api.updateRoomMetadata(call.roomName, roomMetadata(call.chat, code)),
+        ),
         new Promise((_, reject) => {
           timer = setTimeout(() => reject(new Error('timed out')), END_NOTICE_TIMEOUT_MS);
           timer.unref();
@@ -680,7 +657,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
   };
 
-  const endCall = (call: LiveKitCall, reason: string): void => {
+  /** `end`: why, as the page names it; left out for ends no page is there to hear about. */
+  const endCall = (call: LiveKitCall, reason: string, end?: WalkieEndReason): void => {
     if (call.ended) return;
     call.ended = true;
     clearTimeout(call.joinTimer);
@@ -692,10 +670,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (calls.get(call.platformId) === call) calls.delete(call.platformId);
     const stream = call.stream;
     call.stream = undefined;
-    const code = walkieEndReason(reason);
     // The room gets the reason before the worker hears of the end: the worker leaves the room as
     // soon as it does, and the page would see it go before it could read why.
-    call.announced = (code ? announceEnd(call, code) : Promise.resolve()).then(() => {
+    call.announced = (end ? announceEnd(call, end) : Promise.resolve()).then(() => {
       if (stream && !stream.writableEnded) {
         stream.write(`${JSON.stringify({ type: 'end', reason } satisfies LiveKitHostEvent)}\n`);
         stream.end();
@@ -714,7 +691,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     } catch (err) {
       log.warn('livekit-voice: call access check failed', { platformId: call.platformId, err });
     }
-    endCall(call, 'caller access revoked or line changed');
+    endCall(call, 'caller access revoked or line changed', 'revoked');
     return false;
   };
 
@@ -747,9 +724,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     // running calls' time is already in the day's total, so ending them below does not change it.
     const remainingMs = host.remainingTodayMs(platformId, t);
     if (remainingMs <= 0) return reply(res, 429, 'This voice line has used its call minutes for today.');
+    const capMs = Math.min(host.maxCallDurationMs, remainingMs);
     // Newest wins on the line, whatever engine holds it.
     const previous = calls.get(platformId);
-    if (previous) endCall(previous, 'replaced by a new call');
+    if (previous) endCall(previous, 'replaced by a new call', 'newer_call');
     host.endOtherCalls(platformId, 'replaced by a new call');
     const callId = randomUUID();
     const call: LiveKitCall = {
@@ -785,7 +763,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       callerIdentity: call.callerIdentity,
       vocabulary: [...(line.agent.vocabulary ?? [])],
       ...walkie,
-      maxDurationMs: Math.min(host.maxCallDurationMs, remainingMs),
+      maxDurationMs: capMs,
       joinTimeoutMs,
     };
     let token: string;
@@ -841,10 +819,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     });
     // What the page needs for its hints: the silence that sends a turn, and the cap that ends the
     // call (from join; onJoined recomputes it, never later than this).
-    const limit = {
-      ms: Math.min(host.maxCallDurationMs, remainingMs),
-      kind: remainingMs < host.maxCallDurationMs ? 'daily' : 'duration',
-    };
+    const limit = { ms: capMs, kind: remainingMs < host.maxCallDurationMs ? 'daily' : 'duration' };
     reply(
       res,
       200,
@@ -867,7 +842,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const t = host.now();
     const remainingMs = host.remainingTodayMs(call.platformId, t);
     if (remainingMs <= 0) {
-      endCall(call, 'daily minute budget');
+      endCall(call, 'daily minute budget', 'limit_daily');
       return reply(res, 409, 'This voice line has used its call minutes for today');
     }
     call.state = 'live';
@@ -875,13 +850,16 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     clearTimeout(call.joinTimer);
     const budgetCaps = remainingMs < host.maxCallDurationMs;
     call.expires = setTimeout(
-      () => endCall(call, budgetCaps ? 'daily minute budget' : 'duration limit'),
+      () =>
+        budgetCaps
+          ? endCall(call, 'daily minute budget', 'limit_daily')
+          : endCall(call, 'duration limit', 'limit_duration'),
       Math.max(1, budgetCaps ? remainingMs : host.maxCallDurationMs),
     );
     call.expires.unref();
     if (!call.stream) {
       call.streamTimer = setTimeout(() => {
-        if (!call.stream) endCall(call, 'worker never opened its event stream');
+        if (!call.stream) endCall(call, 'worker never opened its event stream', 'worker_gone');
       }, config.workerStreamTimeoutMs ?? WORKER_STREAM_TIMEOUT_MS);
       call.streamTimer.unref();
     }
@@ -904,7 +882,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     call.pingTimer.unref();
     res.on('close', () => {
       // Replies can no longer reach the caller, so the call is over.
-      if (call.stream === res && !call.ended) endCall(call, 'worker link closed');
+      if (call.stream === res && !call.ended) endCall(call, 'worker link closed', 'worker_gone');
     });
   };
 
@@ -1074,7 +1052,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (route === 'livekit/agent/joined') return onJoined(res, call);
     if (route === 'livekit/agent/utterance') return onUtterance(res, call, body);
     if (route === 'livekit/agent/ended') {
-      endCall(call, typeof body.reason === 'string' ? `worker: ${body.reason.slice(0, 80)}` : 'worker ended');
+      endCall(
+        call,
+        typeof body.reason === 'string' ? `worker: ${body.reason.slice(0, 80)}` : 'worker ended',
+        'worker_gone',
+      );
       // The worker deletes the room once answered; the page reads the reason off it first.
       await call.announced;
       return reply(res, 204, '');
@@ -1143,7 +1125,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       if (!call || call.state !== 'live') return target ? { id: undefined } : null;
       if (!text.trim()) throw new Error('livekit-voice: reply contains no speakable text');
       if (!(await checkAccess(call))) throw new Error('livekit-voice: caller access has been revoked');
-      push(call, target ? { type: 'reply', text, turn: target.utteranceId } : { type: 'reply', text });
+      push(call, { type: 'reply', text, turn: target ? target.utteranceId : null });
       return { id: target ? inReplyTo : `${LIVEKIT_ID_PREFIX}${call.callId}:out-${++call.sent}` };
     },
 
@@ -1155,8 +1137,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     chatMessage(chat, agentGroupId, text, replyTo) {
       for (const call of calls.values()) {
         if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
-        const turn = replyTo?.callId === call.callId ? replyTo.utteranceId : undefined;
-        if (callChatAt(call, chat)) push(call, turn ? { type: 'reply', text, turn } : { type: 'reply', text });
+        const turn = replyTo?.callId === call.callId ? replyTo.utteranceId : null;
+        if (callChatAt(call, chat)) push(call, { type: 'reply', text, turn });
       }
     },
 
@@ -1174,14 +1156,14 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         : undefined;
     },
 
-    endLine(platformId, reason) {
+    endLine(platformId, reason, end) {
       const call = calls.get(platformId);
-      if (call) endCall(call, reason);
+      if (call) endCall(call, reason, end);
     },
 
     async teardown() {
       engines.delete(engine);
-      for (const call of [...calls.values()]) endCall(call, 'teardown');
+      for (const call of [...calls.values()]) endCall(call, 'teardown', 'shutdown');
       await Promise.all([...cleanups, ...mirrorChains.values()]);
     },
   };

@@ -39,7 +39,6 @@ import {
   interactionText,
   languageOf,
   MAX_IDLE_WAIT_MS,
-  SendCountdown,
   maxSpokenChars,
   parseJobMetadata,
   PacedTTS,
@@ -49,6 +48,7 @@ import {
   recordingDays,
   REPLY_CHUNKS,
   runCall,
+  SendCountdown,
   speakableText,
   TTS_CONCURRENCY,
   TtsFallback,
@@ -641,9 +641,9 @@ describe('runCall', () => {
     expect(v.voice.setThinking).toHaveBeenCalledWith(true);
     expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' });
 
-    host.emit({ type: 'reply', text: 'Booked for eight.' });
+    host.emit({ type: 'reply', text: 'Booked for eight.', turn: null });
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked for eight.'));
-    // No turn from the host: a message nobody asked for, and the page is told so first.
+    // It answers no turn: a message nobody asked for, and the page is told so first.
     expect(v.voice.publishReply).toHaveBeenCalledWith({ reply: 1, unprompted: true });
 
     host.emit({ type: 'end', reason: 'hangup' });
@@ -668,12 +668,14 @@ describe('runCall', () => {
     host.emit({ type: 'reply', text: 'Checking.', turn: '1' });
     host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
     host.emit({ type: 'reply', text: 'Answer to a turn this worker never sent.', turn: '9' });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledTimes(3));
-    expect(v.voice.publishReply.mock.calls.map(([info]) => info)).toEqual([
-      expect.objectContaining({ reply: 1, turn: 2, part: 1 }),
-      expect.objectContaining({ reply: 2, turn: 2, part: 2 }),
+    host.emit({ type: 'reply', text: 'From a host that names no turns.' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledTimes(4));
+    expect(v.voice.publishReply.mock.calls.map(([{ more: _more, ...info }]) => info)).toEqual([
+      { reply: 1, turn: 2, part: 1 },
+      { reply: 2, turn: 2, part: 2 },
       // Not known here, so not labelled at all: never a guessed link.
       { reply: 3 },
+      { reply: 4 },
     ]);
     host.endStream();
   });
@@ -921,6 +923,27 @@ describe('runCall', () => {
     v.events.onClosed('session closed: error');
     await vi.waitFor(() => expect(third.job.shutdown).toHaveBeenCalledWith('session closed: error'));
     await flush();
+  });
+
+  it('keeps the host link open until the host answered that the call ended', async () => {
+    // Closed first, the host ends the call on its own and answers at once, before the room says why.
+    const { job, ctx } = fakeJob();
+    const host = fakeHostFetch();
+    let link: AbortSignal | undefined;
+    let openWhenEnded: boolean | undefined;
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/events')) link = init?.signal ?? undefined;
+      if (url.endsWith('/ended')) openWhenEnded = !!link && !link.aborted;
+      return host.fetchImpl(input, init);
+    });
+    const v = fakeVoice();
+    await runCall(ctx, deps(fetchImpl as typeof fetch, v.createVoice));
+    await vi.waitFor(() => expect(link).toBeDefined());
+    v.events.onClosed('session closed: error');
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('session closed: error'));
+    expect(openWhenEnded).toBe(true);
+    expect(link?.aborted).toBe(true);
   });
 });
 
@@ -1211,5 +1234,18 @@ describe('SendCountdown', () => {
     // Reported late, it is never past the whole silence.
     countdown.stopped(now - 9000);
     expect(published).toEqual(['1:600:2500', '', '2:2500:2500']);
+    countdown.clear();
+  });
+
+  it('clears itself once the turn is overdue, so a turn that never commits does not leave it up', () => {
+    vi.useFakeTimers();
+    const published: string[] = [];
+    const countdown = new SendCountdown((value) => published.push(value), 2500);
+    countdown.stopped(Date.now() - 500);
+    vi.advanceTimersByTime(2000 + TURN_SETTLE_MS - 1);
+    expect(published).toEqual(['1:500:2500']);
+    vi.advanceTimersByTime(1);
+    expect(published).toEqual(['1:500:2500', '']);
+    vi.useRealTimers();
   });
 });
