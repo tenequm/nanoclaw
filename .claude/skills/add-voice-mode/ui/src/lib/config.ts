@@ -1,4 +1,4 @@
-/** Runtime config the host injects as window.__VOICE_UI__ (see VOICE_UI in SKILL.md). */
+/** Runtime config the host injects as window.__VOICE_UI__ (see VOICE_MODE_UI in SKILL.md). */
 export interface VoiceUiConfig {
   skin?: "te" | "nanoclaw"
   colorway?: "auto" | "ivory" | "field" | "rabbit"

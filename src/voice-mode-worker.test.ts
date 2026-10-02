@@ -167,7 +167,7 @@ describe('helpers', () => {
     expect(CUT_LINES.no_chat).toEqual({ uk: 'Скорочую.', en: "I've cut it short." });
   });
 
-  it('reads VOICE_MAX_SPOKEN_CHARS, with 0 for no cap', () => {
+  it('reads VOICE_MODE_MAX_SPOKEN_CHARS, with 0 for no cap', () => {
     expect(maxSpokenChars(undefined)).toBe(DEFAULT_MAX_SPOKEN_CHARS);
     expect(DEFAULT_MAX_SPOKEN_CHARS).toBe(800);
     expect(maxSpokenChars(' 400 ')).toBe(400);
@@ -184,7 +184,7 @@ describe('helpers', () => {
     expect(languageOf('Привет', false)).toBe('en');
   });
 
-  it('reads the call languages from VOICE_LANGUAGES: hints, first line language, Ukrainian or not', () => {
+  it('reads the call languages from VOICE_MODE_LANGUAGES: hints, first line language, Ukrainian or not', () => {
     expect(callLanguages(undefined)).toEqual({ codes: ['en-US'], initial: 'en', ukrainian: false });
     expect(callLanguages(['uk-UA', 'en-US'])).toEqual({ codes: ['uk-UA', 'en-US'], initial: 'uk', ukrainian: true });
     expect(callLanguages(['en-GB', 'uk'])).toEqual({ codes: ['en-GB', 'uk'], initial: 'en', ukrainian: true });
@@ -315,7 +315,7 @@ describe('TurnTaking', () => {
     turnTaking.onReply('Two things now. A **third** one that is long.');
     turnTaking.onReply('Fits.');
     await vi.advanceTimersByTimeAsync(1);
-    // No `chat` event yet: the call talks on the voice line, where no chat holds the rest.
+    // No `chat` event yet: no chat is known to hold the rest.
     expect(said).toEqual([`Two things now. ${CUT_LINES.no_chat.en}`, 'Fits.']);
     turnTaking.onChat(true);
     turnTaking.onReply('Two things now. A third one that is long.');
@@ -855,7 +855,7 @@ describe('runCall', () => {
       await runCall(
         ctx,
         deps(host.fetchImpl, v.createVoice, {
-          env: { ...ENV, VOICE_RECORDINGS_DAYS: '7' },
+          env: { ...ENV, VOICE_MODE_RECORDINGS_DAYS: '7' },
           recordingsRoot: root,
         }),
       );

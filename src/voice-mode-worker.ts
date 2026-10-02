@@ -20,7 +20,7 @@
  *    spoken message; nothing in the session answers it;
  *  - each complete agent reply from the host's event stream is spoken with
  *    `session.say()` once the caller is not mid-turn, cut to
- *    VOICE_MAX_SPOKEN_CHARS at a sentence end, uninterruptible: while
+ *    VOICE_MODE_MAX_SPOKEN_CHARS at a sentence end, uninterruptible: while
  *    it plays, the caller's audio is not transcribed (no barge-in); Gemini
  *    TTS synthesizes the whole reply in one streamed request, through
  *    LiveKit's TTS FallbackAdapter onto a second model.
@@ -124,7 +124,7 @@ const MAX_RECORDED_TURN_MS = 120_000;
 const TURN_RETRY_DELAY_MS = 500;
 /** Timed-out turns kept for a late `turn-stored`; the host remembers no more turn keys than this either. */
 const MAX_UNCONFIRMED_TURNS = 32;
-/** VOICE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
+/** VOICE_MODE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
 export const DEFAULT_MAX_SPOKEN_CHARS = 800;
 const DAY_MS = 86_400_000;
 
@@ -219,7 +219,7 @@ export function speakableText(message: string): string {
 /** The worker's own lines exist in English and Ukrainian; any other configured language hears English. */
 export type CallLanguage = 'uk' | 'en';
 
-/** What a call's languages (VOICE_LANGUAGES) mean for the worker's own lines. */
+/** What a call's languages (VOICE_MODE_LANGUAGES) mean for the worker's own lines. */
 export interface CallLanguages {
   /** The transcription's language hints. */
   codes: string[];
@@ -259,7 +259,7 @@ export const CUT_LINES: Record<'chat' | 'no_chat', Record<CallLanguage, string>>
 /** A sentence end earlier than this share of the cap wastes the budget: the cut goes to a word instead. */
 const MIN_SENTENCE_CUT = 0.6;
 
-/** VOICE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default. */
+/** VOICE_MODE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default. */
 export function maxSpokenChars(raw: string | undefined): number {
   const value = raw?.trim();
   if (!value) return DEFAULT_MAX_SPOKEN_CHARS;
@@ -577,7 +577,7 @@ export class TurnCapture {
 
 /**
  * The page's send cue: while a stretch of caller speech waits out the closing silence that sends
- * it, the `nanoclaw.voice.pending` attribute says how far into that silence it is; it clears
+ * it, the `nanoclaw.voice-mode.pending` attribute says how far into that silence it is; it clears
  * when the caller speaks again, the turn goes out or is dropped, the agent speaks, or the turn
  * is overdue (a transcript of only whitespace commits nothing and times nothing out).
  */
@@ -705,7 +705,7 @@ export async function pruneRecordings(root: string, days: number, now = Date.now
   return removed;
 }
 
-/** VOICE_RECORDINGS_DAYS: 0 (the default) records nothing. */
+/** VOICE_MODE_RECORDINGS_DAYS: 0 (the default) records nothing. */
 export function recordingDays(raw: string | undefined): number {
   const days = Number(raw?.trim() || 0);
   return Number.isInteger(days) && days > 0 ? days : 0;
@@ -715,11 +715,11 @@ export function recordingDays(raw: string | undefined): number {
 export interface CallVoice {
   /** Speak a line, uninterruptible; resolves after playout with whether all of it was synthesized. */
   say(text: string): Promise<boolean>;
-  /** The `nanoclaw.voice.thinking` attribute. */
+  /** The `nanoclaw.voice-mode.thinking` attribute. */
   setThinking(thinking: boolean): void;
-  /** One message on the `nanoclaw.voice.turn` topic. */
+  /** One message on the `nanoclaw.voice-mode.turn` topic. */
   publishTurn(status: CallTurnStatus): void;
-  /** One message on the `nanoclaw.voice.reply` topic, sent right before the line it describes is spoken. */
+  /** One message on the `nanoclaw.voice-mode.reply` topic, sent right before the line it describes is spoken. */
   publishReply(info: CallReplyInfo): void;
   close(): Promise<void>;
 }
@@ -851,7 +851,7 @@ export class TurnTaking {
     });
   }
 
-  /** The host's `chat` event: the call now talks in a chat, or on the voice line. */
+  /** The host's `chat` event: the call now talks in a chat, or has lost it. */
   onChat(inChat: boolean): void {
     this.inChat = inChat;
   }
@@ -1372,8 +1372,8 @@ function defaultDeps(): RunCallDeps {
       'GEMINI_API_KEY',
       'LIVEKIT_API_SECRET',
       'LIVEKIT_HOST_URL',
-      'VOICE_RECORDINGS_DAYS',
-      'VOICE_MAX_SPOKEN_CHARS',
+      'VOICE_MODE_RECORDINGS_DAYS',
+      'VOICE_MODE_MAX_SPOKEN_CHARS',
     ]),
     createVoice: (ctx, meta, settings, events) => sessionVoice(ctx as JobContext, meta, settings, events),
     markUpdating: (ctx) => setAttribute(ctx, CALL_UPDATING_ATTRIBUTE, '1'),
@@ -1425,7 +1425,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   }
   const geminiKey = deps.env.GEMINI_API_KEY;
   if (!geminiKey) return abandon('GEMINI_API_KEY is not set for the worker');
-  const record = recordingDays(deps.env.VOICE_RECORDINGS_DAYS) > 0;
+  const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
 
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
   try {
@@ -1479,7 +1479,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     {
       silenceMs: meta.silenceMs,
       languages: callLanguages(meta.languages),
-      maxSpokenChars: maxSpokenChars(deps.env.VOICE_MAX_SPOKEN_CHARS),
+      maxSpokenChars: maxSpokenChars(deps.env.VOICE_MODE_MAX_SPOKEN_CHARS),
     },
   );
   /** `restart`: the worker is shutting down, so the caller's page says the service restarted. */
@@ -1639,15 +1639,15 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'LIVEKIT_API_SECRET',
     'LIVEKIT_AGENT_NAME',
     'LIVEKIT_HOST_URL',
-    'VOICE_WORKER_HEALTH_PORT',
-    'VOICE_RECORDINGS_DAYS',
-    'VOICE_MAX_SPOKEN_CHARS',
+    'VOICE_MODE_WORKER_HEALTH_PORT',
+    'VOICE_MODE_RECORDINGS_DAYS',
+    'VOICE_MODE_MAX_SPOKEN_CHARS',
   ]);
   // agents-js initializes its logger once the CLI runs a command; console until then.
   console.info(
     `voice worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${liveKitHostUrl(env)} (LIVEKIT_HOST_URL)`,
   );
-  const keepDays = recordingDays(env.VOICE_RECORDINGS_DAYS);
+  const keepDays = recordingDays(env.VOICE_MODE_RECORDINGS_DAYS);
   if (keepDays > 0) {
     const prune = () =>
       void pruneRecordings(recordingsRoot(), keepDays).then(
@@ -1667,10 +1667,10 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
       apiSecret: env.LIVEKIT_API_SECRET,
       // Health endpoint on loopback only, off agents-js's default 8081.
       host: '127.0.0.1',
-      port: Number(env.VOICE_WORKER_HEALTH_PORT || 8089),
+      port: Number(env.VOICE_MODE_WORKER_HEALTH_PORT || 8089),
       numIdleProcesses: 1,
       // On SIGTERM the worker takes no new calls and gives running ones this long before closing
-      // them; a call can run up to VOICE_MAX_CALL_SECONDS, so a restart cuts longer ones short.
+      // them; a call can run up to VOICE_MODE_MAX_CALL_SECONDS, so a restart cuts longer ones short.
       drainTimeout: 60_000,
       // Never throws and always answers: agents-js logs the whole job, metadata included, when a
       // request function fails or leaves the request unanswered. A job of another protocol version

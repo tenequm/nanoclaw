@@ -1,5 +1,5 @@
 {
-  "notes": "Conformance fixtures for scripts/skill-conformance.test.ts - shaped fake values only, never real credentials. One scenario: every prompt is unguarded. Exec stubs answer the captures: the link-token run (openssl rand -hex 16), the line-id hash (createHash), and the agent-group list (join(\", \")); the copy/append/dep/build/test, restart, check and wire runs need no stdout.",
+  "notes": "Conformance fixtures for scripts/skill-conformance.test.ts - shaped fake values only, never real credentials. One scenario: every prompt is unguarded, and no run captures output, so no exec stubs are needed.",
   "scenarios": [
     {
       "name": "cloud",
@@ -8,24 +8,9 @@
         "livekit_api_key": "APIfakekey123",
         "livekit_api_secret": "fakesecretfakesecretfakesecretfake",
         "gemini_api_key": "fake-gemini-key-0000000000000000",
-        "public_url": "https://voice.example.com",
-        "agent_folder": "main",
-        "caller_name": "Alex"
+        "public_url": "https://voice.example.com"
       },
-      "exec": [
-        {
-          "match": "openssl rand -hex 16",
-          "stdout": "0123456789abcdef0123456789abcdef"
-        },
-        {
-          "match": "createHash('sha256')",
-          "stdout": "5fdb6c84438e"
-        },
-        {
-          "match": "join(\", \")",
-          "stdout": "main (Andy)"
-        }
-      ]
+      "exec": []
     }
   ]
 }

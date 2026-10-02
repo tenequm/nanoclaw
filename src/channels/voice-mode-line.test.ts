@@ -1,136 +1,89 @@
+/**
+ * Who a line connects, against the real central DB: the caller is whoever minted the line's link,
+ * and stays one only while core grants them an owner or admin role over the line's agent.
+ */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { closeDb, initTestDb, runMigrations } from '../db/index.js';
 import { createAgentGroup } from '../db/agent-groups.js';
-import { createMessagingGroup, createMessagingGroupAgent, updateMessagingGroup } from '../db/messaging-groups.js';
-import { addMember, removeMember } from '../modules/permissions/db/agent-group-members.js';
-import { createUser, updateDisplayName } from '../modules/permissions/db/users.js';
-import { grantRole, isOwner } from '../modules/permissions/db/user-roles.js';
-import { resolveVoiceLine } from './voice-mode-line.js';
+import { mintVoiceModeLine } from '../db/voice-mode-lines.js';
+import { addMember } from '../modules/permissions/db/agent-group-members.js';
+import { createUser } from '../modules/permissions/db/users.js';
+import { grantRole, revokeRole } from '../modules/permissions/db/user-roles.js';
+import { linePlatformId, resolveVoiceLine, sameCallerAndAgent } from './voice-mode-line.js';
 
 const stamp = () => new Date().toISOString();
-const ETHAN = 'voice-mode:ethan-test';
-const LAURA = 'voice-mode:laura-test';
+const ADMIN = 'telegram:7';
+const MEMBER = 'telegram:8';
 
-async function line(id: string, name: string) {
-  await createUser({ id, kind: 'voice-mode', display_name: name, created_at: stamp() });
-  await createMessagingGroup({
-    id: `mg-${id}`,
-    channel_type: 'voice-mode',
-    platform_id: id,
-    instance: 'voice-mode',
-    name: 'Personal call',
-    is_group: 0,
-    unknown_sender_policy: 'strict',
-    created_at: stamp(),
-  });
-  await createMessagingGroupAgent({
-    id: `wire-${id}`,
-    messaging_group_id: `mg-${id}`,
-    agent_group_id: 'voice-agent',
-    engage_mode: 'pattern',
-    engage_pattern: '.',
-    sender_scope: 'known',
-    ignored_message_policy: 'drop',
-    session_mode: 'shared',
-    priority: 0,
-    created_at: stamp(),
-  });
-}
-const allow = (id: string) =>
-  addMember({ user_id: id, agent_group_id: 'voice-agent', added_by: null, added_at: stamp() });
+const mint = async (owner: string) =>
+  linePlatformId(
+    (await mintVoiceModeLine({ agentGroupId: 'ag-1', ownerUserId: owner, messagingGroupId: 'mg-1', threadId: null }))
+      .line.line_id,
+  );
 
 beforeEach(async () => {
-  const db = await initTestDb();
-  await runMigrations(db);
+  await runMigrations(await initTestDb());
   await createAgentGroup({
-    id: 'voice-agent',
-    name: 'Casa',
-    folder: 'voice-access-fixture',
+    id: 'ag-1',
+    name: 'Andy',
+    folder: 'voice-line-fixture',
     agent_provider: null,
     created_at: stamp(),
   });
-  await line(ETHAN, 'Ethan');
+  await createUser({ id: ADMIN, kind: 'telegram', display_name: 'Ethan', created_at: stamp() });
+  await createUser({ id: MEMBER, kind: 'telegram', display_name: null, created_at: stamp() });
+  await grantRole({ user_id: ADMIN, role: 'admin', agent_group_id: 'ag-1', granted_by: null, granted_at: stamp() });
+  await addMember({ user_id: MEMBER, agent_group_id: 'ag-1', added_by: null, added_at: stamp() });
 });
 afterEach(async () => {
   await closeDb();
 });
 
-describe('personal voice line access (real central DB)', () => {
-  it('requires explicit membership and never infers ownership from a matching name', async () => {
-    await createUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Ethan', created_at: stamp() });
-    await grantRole({
-      user_id: 'telegram:owner',
-      role: 'owner',
-      agent_group_id: null,
-      granted_by: null,
-      granted_at: stamp(),
+describe('voice line access (real central DB)', () => {
+  it("resolves the line's agent and its caller, the user who minted the link", async () => {
+    expect(await resolveVoiceLine(await mint(ADMIN))).toEqual({
+      caller: { id: ADMIN, name: 'Ethan' },
+      agentGroupId: 'ag-1',
+      agent: { name: 'Andy' },
+      linkHash: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
-    expect(await resolveVoiceLine(ETHAN)).toBeNull();
-    await allow(ETHAN);
-    const access = await resolveVoiceLine(ETHAN);
-    expect(access).toMatchObject({
-      caller: { id: ETHAN, name: 'Ethan' },
-      agent: { name: 'Casa' },
-      agentGroupId: 'voice-agent',
-    });
-    expect(await isOwner(ETHAN)).toBe(false);
   });
 
   it('lists the startup vocabulary on call setup only, and no names when none are configured', async () => {
-    await allow(ETHAN);
-    const setup = await resolveVoiceLine(ETHAN, { forCall: true, vocabulary: 'Acme, k8s' });
-    expect(setup?.agent.vocabulary).toEqual(['Acme', 'k8s']);
-    expect((await resolveVoiceLine(ETHAN, { vocabulary: 'Acme' }))?.agent.vocabulary).toBeUndefined();
-    expect((await resolveVoiceLine(ETHAN, { forCall: true }))?.agent.vocabulary).toBeUndefined();
+    const line = await mint(ADMIN);
+    expect((await resolveVoiceLine(line, { forCall: true, vocabulary: 'Acme, k8s' }))?.agent.vocabulary).toEqual([
+      'Acme',
+      'k8s',
+    ]);
+    expect((await resolveVoiceLine(line, { vocabulary: 'Acme' }))?.agent.vocabulary).toBeUndefined();
+    expect((await resolveVoiceLine(line, { forCall: true }))?.agent.vocabulary).toBeUndefined();
   });
 
-  it('keeps two people distinct when they call the same agent', async () => {
-    await line(LAURA, 'Laura');
-    await allow(ETHAN);
-    await allow(LAURA);
-    const first = await resolveVoiceLine(ETHAN);
-    const second = await resolveVoiceLine(LAURA);
-    expect(first?.agentGroupId).toBe(second?.agentGroupId);
-    expect(first?.caller).toEqual({ id: ETHAN, name: 'Ethan' });
-    expect(second?.caller).toEqual({ id: LAURA, name: 'Laura' });
+  it('denies a caller whose role was revoked, a plain member, and unknown lines', async () => {
+    const line = await mint(ADMIN);
+    await revokeRole(ADMIN, 'admin', 'ag-1');
+    expect(await resolveVoiceLine(line)).toBeNull();
+    expect(await resolveVoiceLine(await mint(MEMBER))).toBeNull();
+    expect(await resolveVoiceLine('voice-mode:000000000000')).toBeNull();
+    expect(await resolveVoiceLine('telegram:7')).toBeNull();
   });
 
-  it('denies revoked, anonymous, and public lines', async () => {
-    await allow(ETHAN);
-    expect(await resolveVoiceLine(ETHAN)).not.toBeNull();
-    await removeMember(ETHAN, 'voice-agent');
-    expect(await resolveVoiceLine(ETHAN)).toBeNull();
-    await allow(ETHAN);
-    await updateDisplayName(ETHAN, ' ');
-    expect(await resolveVoiceLine(ETHAN)).toBeNull();
-    await updateDisplayName(ETHAN, 'Ethan');
-    await updateMessagingGroup(`mg-${ETHAN}`, { unknown_sender_policy: 'public' });
-    expect(await resolveVoiceLine(ETHAN)).toBeNull();
-    expect(await resolveVoiceLine('voice-mode:unknown')).toBeNull();
+  it('ends a call once its link is re-minted, even by the same caller', async () => {
+    const line = await mint(ADMIN);
+    const before = (await resolveVoiceLine(line))!;
+    expect(sameCallerAndAgent(before, (await resolveVoiceLine(line))!)).toBe(true);
+    await mint(ADMIN);
+    expect(sameCallerAndAgent(before, (await resolveVoiceLine(line))!)).toBe(false);
   });
 
-  it('refuses ambiguous wiring to multiple agents', async () => {
-    await allow(ETHAN);
-    await createAgentGroup({
-      id: 'other-agent',
-      name: 'Other',
-      folder: 'voice-access-other',
-      agent_provider: null,
-      created_at: stamp(),
-    });
-    await createMessagingGroupAgent({
-      id: 'second-wire',
-      messaging_group_id: `mg-${ETHAN}`,
-      agent_group_id: 'other-agent',
-      engage_mode: 'pattern',
-      engage_pattern: '.',
-      sender_scope: 'known',
-      ignored_message_policy: 'drop',
-      session_mode: 'shared',
-      priority: 1,
-      created_at: stamp(),
-    });
-    expect(await resolveVoiceLine(ETHAN)).toBeNull();
+  it('names the caller by id when the user has no display name, and ends a call when someone else re-mints', async () => {
+    const line = await mint(ADMIN);
+    const before = (await resolveVoiceLine(line))!;
+    await grantRole({ user_id: MEMBER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: stamp() });
+    expect(await mint(MEMBER)).toBe(line);
+    const after = (await resolveVoiceLine(line))!;
+    expect(after.caller).toEqual({ id: MEMBER, name: MEMBER });
+    expect(sameCallerAndAgent(before, after)).toBe(false);
   });
 });

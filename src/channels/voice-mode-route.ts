@@ -1,6 +1,6 @@
 /**
  * How a caller's turn reaches the agent: written straight into the session of the one agent the
- * line belongs to, in the call chat (or on the voice line itself), as a waking message from the
+ * line belongs to, in the call chat, as a waking message from the
  * line's caller - the same steps the router takes for an engaged message (thread policy, session
  * mode, cross-session backfill and fan-out, typing, wake). The router is not involved because a
  * turn is addressed to one agent whatever else is wired to that chat and whatever its trigger;

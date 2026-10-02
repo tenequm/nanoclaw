@@ -1,6 +1,6 @@
 ---
 name: voice-mode-formatting
-description: How to write replies that will be spoken aloud on a live voice call through the voice channel. Use whenever the inbound message came from the voice channel (sender handle starts with `voice-mode:`, or the text is wrapped in `<voice source="livekit">`) - the reply is read out by text-to-speech, not displayed.
+description: How to write replies that will be spoken aloud on a live voice call. Use whenever an inbound message is wrapped in `<voice source="livekit">` - while the call lasts, what you send to that chat is read out by text-to-speech.
 ---
 
 # Replies on a voice call
@@ -23,17 +23,13 @@ until it arrives. Write for the ear.
   headline and offer the rest: "Want the details?"
 - **Say what you did.** "I've moved the meeting to Thursday at ten." Not "Done."
 - **Ask one question at a time** in plain text when you need something from the caller.
-  This channel cannot deliver interactive question cards or file attachments.
-  Send files through another wired destination.
+  Question cards and files are not spoken; send them only when the caller asks for them.
 
 ## Long material
 
-Where anything long (lists, links, code, details) goes depends on the note
-under the turn. A call on the voice line itself: put it in a separate written
-message to your chat, and say so in one spoken sentence. A call that talks in
-a chat: every message you send to that chat during the call is read aloud, so
-offer it for after the call instead. Only the start of a long message is
-spoken (about 800 characters unless the operator set another cap): the rest is
+Every message you send to the call's chat during the call is read aloud, so
+offer anything long (lists, links, code, details) for after the call instead.
+Only the start of a long message is spoken (about 800 characters unless the operator set another cap): the rest is
 cut at a sentence and the caller hears that it is in the chat, so say what
 matters first. More turns can arrive while you work: the caller adding to
 what they said.
@@ -43,7 +39,6 @@ it tells you to; otherwise answer in the language of the transcript.
 
 ## Proactive messages
 
-While a call is active, a message you send that answers no turn (a reminder
-or follow-up) is spoken too. Keep it to one sentence and lead with why you are
-interrupting. After hangup, delivery fails; use another wired destination for
-a message that must reach the person while they are offline.
+While a call is active, a message you send to the chat that answers no turn (a
+reminder or follow-up) is spoken too. Keep it to one sentence and lead with why
+you are interrupting. After the call, messages to the chat are only written.

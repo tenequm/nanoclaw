@@ -1,100 +1,98 @@
 /**
- * Voice line owners and `/voice` targets: whose chat accounts own each voice
- * line, and the chat its LiveKit calls talk in. See src/channels/voice-mode-livekit.ts.
- * Rows are written by the operator (`ncl voice-lines set|add-owner`,
- * src/cli/resources/voice-mode-lines.ts).
+ * Voice mode's own state: one voice line per agent group, in the skill's own table. The line holds
+ * the SHA-256 of its current call-link token (never the token), who minted it (the caller), and
+ * the chat its calls talk in. `/voice` creates and re-mints lines (src/channels/voice-mode-command.ts);
+ * the call page finds a line by its token's hash (src/channels/voice-mode.ts).
+ *
+ * Who may run `/voice` is core's business (owner and admin roles); this table only records what a
+ * run produced. No foreign keys into core tables: a line whose chat was deleted, unwired or denied
+ * is ignored by its reader (src/channels/voice-mode-livekit.ts), never an integrity error.
  */
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+
 import { getDb } from './connection.js';
 import { registerMigration } from './migrations/index.js';
 
-/**
- * `voice_lines` + `voice_line_owners` - who owns each voice line, and where its
- * LiveKit calls talk.
- *
- * One `voice_lines` row per voice line (its `voice-mode` messaging group), created by
- * the operator (`ncl voice-lines set`). Its owners are one person's chat
- * accounts (e.g. `telegram:123` and `slack:U123`), one `voice_line_owners` row
- * each (`ncl voice-lines add-owner`). A line's caller is its own
- * `voice-mode:<line id>` user, which is linked to no other account, so these rows
- * are the only link between a line and its owner's chat identities. Only an
- * owner account can run `/voice` for the line. That sets the target: a chat
- * (messaging group + thread) wired to the line's agent, where each transcribed
- * turn of a call is routed as a message from the line's own caller. The last
- * `/voice` from any owner account wins. Both target columns stay null until
- * then, and the default rule (VOICE_MIRROR) picks the chat.
- *
- * No foreign keys: a row whose chat was deleted, unwired or denied is ignored
- * by the reader (src/channels/voice-mode-livekit.ts), never an integrity error.
- * A module migration (registered on import, applied at host start), so the
- * skill adds no line to the core migration barrel and needs no number.
- */
 registerMigration({
   version: 1,
-  name: 'module:voice-mode:voice-lines',
+  name: 'module:voice-mode:lines',
   async up(db) {
     await db.exec(`
-      CREATE TABLE IF NOT EXISTS voice_lines (
-        line_messaging_group_id   TEXT PRIMARY KEY,
-        target_messaging_group_id TEXT,
-        thread_id                 TEXT,
-        updated_at                TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS voice_line_owners (
-        line_messaging_group_id TEXT NOT NULL,
-        owner_user_id           TEXT NOT NULL,
-        PRIMARY KEY (line_messaging_group_id, owner_user_id)
+      CREATE TABLE IF NOT EXISTS voice_mode_lines (
+        line_id            TEXT PRIMARY KEY,
+        agent_group_id     TEXT NOT NULL UNIQUE,
+        token_hash         TEXT NOT NULL UNIQUE,
+        owner_user_id      TEXT NOT NULL,
+        messaging_group_id TEXT,
+        thread_id          TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL
       );
     `);
   },
 });
 
-export interface VoiceLineRow {
-  /** The voice line's messaging group (channel type `voice`). */
-  line_messaging_group_id: string;
-  target_messaging_group_id: string | null;
+export interface VoiceModeLine {
+  /** Random and stable for the line's life; calls, rooms and limits are keyed by it, not by the token. */
+  line_id: string;
+  agent_group_id: string;
+  /** Hex SHA-256 of the current call-link token. */
+  token_hash: string;
+  /** The user who minted the current link; calls speak as them and need their admin role. */
+  owner_user_id: string;
+  /** The chat calls talk in, and its thread. */
+  messaging_group_id: string | null;
   thread_id: string | null;
+  created_at: string;
   updated_at: string;
 }
 
-export async function getVoiceLine(lineMessagingGroupId: string): Promise<VoiceLineRow | undefined> {
-  return getDb().get<VoiceLineRow>('SELECT * FROM voice_lines WHERE line_messaging_group_id = ?', lineMessagingGroupId);
+export const hashLinkToken = (token: string): string => createHash('sha256').update(token).digest('hex');
+
+export async function getVoiceModeLine(lineId: string): Promise<VoiceModeLine | undefined> {
+  return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE line_id = ?', lineId);
 }
 
-/** The line's owner accounts (namespaced chat user ids); only these can run /voice for it. */
-export async function getVoiceLineOwners(lineMessagingGroupId: string): Promise<string[]> {
-  const rows = await getDb().all<{ owner_user_id: string }>(
-    'SELECT owner_user_id FROM voice_line_owners WHERE line_messaging_group_id = ? ORDER BY owner_user_id',
-    lineMessagingGroupId,
-  );
-  return rows.map((r) => r.owner_user_id);
+/** The line a call-link token opens, or undefined. Only hashes are compared: the token is stored nowhere. */
+export async function findVoiceModeLineByToken(token: string): Promise<VoiceModeLine | undefined> {
+  if (!/^[0-9a-f]{32}$/.test(token)) return undefined;
+  const hash = hashLinkToken(token);
+  const row = await getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE token_hash = ?', hash);
+  // The row was found by an equal hash; the constant-time check keeps the comparison explicit.
+  return row && timingSafeEqual(Buffer.from(row.token_hash, 'hex'), Buffer.from(hash, 'hex')) ? row : undefined;
 }
 
-export async function isVoiceLineOwner(lineMessagingGroupId: string, userId: string): Promise<boolean> {
-  const row = await getDb().get(
-    'SELECT 1 AS owned FROM voice_line_owners WHERE line_messaging_group_id = ? AND owner_user_id = ?',
-    lineMessagingGroupId,
-    userId,
-  );
-  return row !== undefined;
-}
-
-/** Point the line at a chat, replacing any earlier target; false when `ownerUserId` is not one of its owners. */
-export async function setVoiceLineTarget(target: {
-  lineMessagingGroupId: string;
+/**
+ * Mint a new call link for the agent's line (creating the line on first use), make `ownerUserId` its
+ * caller and the given chat its call chat. The previous link stops working. Returns the line and
+ * the new token, which is stored nowhere: the caller hands it out once.
+ */
+export async function mintVoiceModeLine(target: {
+  agentGroupId: string;
   ownerUserId: string;
-  targetMessagingGroupId: string;
+  messagingGroupId: string;
   threadId: string | null;
-}): Promise<boolean> {
-  const result = await getDb().run(
-    `UPDATE voice_lines SET target_messaging_group_id = ?, thread_id = ?, updated_at = ?
-       WHERE line_messaging_group_id = ? AND EXISTS (
-         SELECT 1 FROM voice_line_owners o
-          WHERE o.line_messaging_group_id = voice_lines.line_messaging_group_id AND o.owner_user_id = ?)`,
-    target.targetMessagingGroupId,
-    target.threadId,
-    new Date().toISOString(),
-    target.lineMessagingGroupId,
+}): Promise<{ line: VoiceModeLine; token: string }> {
+  const token = randomBytes(16).toString('hex');
+  const now = new Date().toISOString();
+  const line = await getDb().get<VoiceModeLine>(
+    `INSERT INTO voice_mode_lines
+       (line_id, agent_group_id, token_hash, owner_user_id, messaging_group_id, thread_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (agent_group_id) DO UPDATE SET
+       token_hash = excluded.token_hash, owner_user_id = excluded.owner_user_id,
+       messaging_group_id = excluded.messaging_group_id, thread_id = excluded.thread_id,
+       updated_at = excluded.updated_at
+     RETURNING *`,
+    randomBytes(6).toString('hex'),
+    target.agentGroupId,
+    hashLinkToken(token),
     target.ownerUserId,
+    target.messagingGroupId,
+    target.threadId,
+    now,
+    now,
   );
-  return result.changes > 0;
+  if (!line) throw new Error('voice-mode: the line was not stored');
+  return { line, token };
 }

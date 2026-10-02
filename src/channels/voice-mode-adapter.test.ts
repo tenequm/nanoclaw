@@ -27,8 +27,8 @@ describe('voice routes and the reverse-proxy gate', () => {
   });
 
   const policy = (trusted?: string, allowed?: string): VoiceProxyPolicy => ({
-    trustedProxies: parseCidrs(trusted, 'VOICE_TRUSTED_PROXY_CIDRS'),
-    allowedClients: parseCidrs(allowed, 'VOICE_ALLOWED_CLIENT_CIDRS'),
+    trustedProxies: parseCidrs(trusted, 'VOICE_MODE_TRUSTED_PROXY_CIDRS'),
+    allowedClients: parseCidrs(allowed, 'VOICE_MODE_ALLOWED_CLIENT_CIDRS'),
   });
   const tailnet = '100.64.0.0/10, fd7a:115c:a1e0::/48';
 

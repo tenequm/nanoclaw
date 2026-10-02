@@ -49,7 +49,6 @@ src/channels/voice-mode-protocol.ts
 src/channels/voice-mode-route.ts
 src/voice-mode-worker.ts
 src/db/voice-mode-lines.ts
-src/cli/resources/voice-mode-lines.ts
 src/channels/voice-mode-registration.test.ts
 src/channels/voice-mode-adapter.test.ts
 src/channels/voice-mode-page.test.ts
@@ -58,23 +57,23 @@ src/channels/voice-mode-line.test.ts
 src/channels/voice-mode-livekit.test.ts
 src/channels/voice-mode-route.test.ts
 src/voice-mode-worker.test.ts
-src/cli/resources/voice-mode-lines.test.ts
 container/skills/voice-mode-formatting/SKILL.md
 ```
 
-What they are: the channel (`voice-mode.ts`: the page server, link tokens, call
-limits, the proxy gate), the call page (`voice-mode-page.ts`, generated from this
-skill's `ui/` folder), the `/voice` chat command, the voice line's access check,
-the LiveKit engine, the turn hand-off into the agent's session
-(`voice-mode-route.ts`), the worker, the `voice_lines` tables with their
-migration, `ncl voice-lines`, the `voice-mode-formatting` container skill, and
-the tests.
+What they are: the channel (`voice-mode.ts`: the page server, the call-link
+check, call limits, the proxy gate), the call page (`voice-mode-page.ts`,
+generated from this skill's `ui/` folder), the `/voice` chat command, the voice
+line's access check against core's roles, the LiveKit engine, the turn hand-off
+into the agent's session (`voice-mode-route.ts`), the worker, the
+`voice_mode_lines` table with its migration (one line per agent: the link
+token's hash, the caller, the chat), the `voice-mode-formatting` container
+skill, and the tests.
 
 ### 2. Register the channel
 
 Append the self-registration import to the channel barrel (skipped if present).
-It is the skill's only edit to existing code: the chat command, `ncl voice-lines`
-and the tables' migration come in with the channel.
+It is the skill's only edit to existing code: the chat command and the table's
+migration come in with the channel.
 
 ```nc:append to:src/channels/index.ts
 import './voice-mode.js';
@@ -100,13 +99,14 @@ pnpm run build
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-mode src/voice-mode-worker src/cli/resources/voice-mode-lines
+pnpm exec vitest run src/channels/voice-mode src/voice-mode-worker
 ```
 
 `voice-mode-registration.test.ts` imports the real channel barrel and asserts
-the channel, `ncl voice-lines` and the voice tables are registered; it goes red
-if the barrel line is gone or a package is missing. `voice-mode-route.test.ts`
-drives a turn into a real session; `voice-mode-livekit.test.ts` drives calls over
+the channel and its table are registered; it goes red if the barrel line is
+gone or a package is missing. `voice-mode-command.test.ts` runs `/voice` against
+core's roles on a real database; `voice-mode-route.test.ts` drives a turn into a
+real session; `voice-mode-livekit.test.ts` drives calls over
 HTTP against a fake LiveKit server.
 
 ## Credentials
@@ -156,7 +156,7 @@ GEMINI_API_KEY={{gemini_api_key}}
 ### The page's address
 
 The page and its routes live under `/voice` on the channel's own page server,
-port `VOICE_PORT` (default 3100), listening on every interface. It answers only
+port `VOICE_MODE_PORT` (default 3100), listening on every interface. It answers only
 loopback peers unless told otherwise, so the LAN gets 403. Browsers need HTTPS
 (or `localhost`) for the microphone:
 
@@ -169,103 +169,55 @@ loopback peers unless told otherwise, so the LAN gets 403. Browsers need HTTPS
   your HTTPS host to `http://<this machine>:3100`; with Caddy on the same
   machine, `voice.example.com { reverse_proxy /voice* 127.0.0.1:3100 }`. A proxy
   that does not connect from loopback (one in a Docker container, say) needs
-  `VOICE_TRUSTED_PROXY_CIDRS` (the proxy's `/32` or its Docker subnet; keep it
+  `VOICE_MODE_TRUSTED_PROXY_CIDRS` (the proxy's `/32` or its Docker subnet; keep it
   narrow, any container in the range can claim any client) and, optionally,
-  `VOICE_ALLOWED_CLIENT_CIDRS` (where forwarded clients must be, read from the
+  `VOICE_MODE_ALLOWED_CLIENT_CIDRS` (where forwarded clients must be, read from the
   rightmost `X-Forwarded-For` hop outside the trusted proxies; for a
   tailnet-only page `100.64.0.0/10,fd7a:115c:a1e0::/48`).
 
 The worker talks to the host on the host's webhook server
 (`/webhook/voice-mode/livekit/agent/...`), loopback only; never proxy that path.
-`VOICE_ALLOW_NON_LOOPBACK=1` drops the gate entirely, for local development only.
+`VOICE_MODE_ALLOW_NON_LOOPBACK=1` drops the gate entirely, for local development only.
 
 ```nc:prompt public_url validate:^https?://\S+$ normalize:rstrip-slash
 What origin (no path) does a caller's browser reach the page at? e.g. http://localhost:3100 to try it here, or https://voice.example.com
 ```
 
 ```nc:env-set
-VOICE_PUBLIC_URL={{public_url}}
-```
-
-### The call link
-
-A **voice line** is one link, `<origin>/voice?t=<token>`, wired to one agent.
-The token is its only credential: whoever holds the link talks to the agent as
-the line's caller. Reuse the first token already in `.env` on a re-run,
-otherwise mint one:
-
-```nc:run capture:link_token validate:^[0-9a-f]{32}$ effect:fetch
-grep -s '^VOICE_LINK_TOKEN=' .env | cut -d= -f2- | cut -d, -f1 | grep -E '^[0-9a-f]{32}$' || openssl rand -hex 16
-```
-
-```nc:env-set
-VOICE_LINK_TOKEN={{link_token}}
-```
-
-More lines are more tokens in `VOICE_LINK_TOKEN`, comma-separated. NanoClaw
-stores a line by its id, the first twelve hex characters of the token's
-SHA-256, never the token itself:
-
-```nc:run capture:line_id validate:^[0-9a-f]{12}$ effect:fetch
-printf '%s' '{{link_token}}' | node -e "let d='';process.stdin.on('data',(c)=>{d+=c}).on('end',()=>console.log(require('crypto').createHash('sha256').update(d).digest('hex').slice(0,12)))"
+VOICE_MODE_PUBLIC_URL={{public_url}}
 ```
 
 ## Restart
 
-Restart so the channel loads and `ncl` knows the `voice-mode` channel type:
+Restart so the channel loads (it creates its `voice_mode_lines` table on start):
 
 ```nc:run effect:restart
 bash setup/lib/restart.sh
 ```
 
-## Wire the line
+## Who can make a call link
 
-The line is wired to one agent group. List them:
+`/voice` is for the people core already trusts with an agent: the global
+`owner`, a global `admin`, or an `admin` scoped to that agent group. NanoClaw
+has no cross-channel identity: your Telegram account (`telegram:<id>`) and your
+Slack account (`slack:<id>`) are separate users, so each account you want to
+use needs the role. An account becomes a user the first time it messages the
+bot, so send the bot anything from it first. See who has what, and grant a
+scoped admin role, with core's own commands (`<agent group id>` from
+`ncl groups list`):
 
-```nc:run capture:agent_groups effect:fetch
-ncl groups list --json | jq -r 'if (.data|length)==0 then "no agent groups yet - run /init-first-agent first" else [.data[] | "\(.folder) (\(.name))"] | join(", ") end'
+```bash
+ncl roles list
+ncl users list
+ncl roles grant --user slack:<id> --role admin --group <agent group id>
 ```
+
+## Make the first line
 
 Tell the user:
 
 ```nc:operator
-Agent groups on this install: {{agent_groups}}. The voice line is wired to one of them; its calls talk to that agent.
-```
-
-```nc:prompt agent_folder validate:^[A-Za-z0-9_-]+$ normalize:trim
-Which agent group answers the voice line? Enter its folder name (the first word above).
-```
-
-The folder must be a real agent group:
-
-```nc:run effect:check
-ncl groups list --json | jq -e --arg f '{{agent_folder}}' '.data[] | select(.folder==$f)' >/dev/null
-```
-
-The line has one named caller, a member of that agent; spoken names never change
-who is calling:
-
-```nc:prompt caller_name validate:^[\p{L}\p{M}\p{N}\x20.'_-]{1,80}$ flags:u normalize:trim
-Who receives this personal call link? Their name (letters, numbers, spaces, apostrophes, dots, hyphens or underscores).
-```
-
-Create the caller, its membership, the line and its strict, known-sender wiring:
-
-```nc:run effect:wire
-ncl users create --id "voice-mode:{{line_id}}" --kind voice-mode --display-name "{{caller_name}}"
-ncl users update --id "voice-mode:{{line_id}}" --display-name "{{caller_name}}"
-ncl members add --user "voice-mode:{{line_id}}" --group "$(ncl groups list --json | jq -er --arg f '{{agent_folder}}' '.data[] | select(.folder==$f) | .id')"
-ncl messaging-groups list --json | jq -e --arg p "voice-mode:{{line_id}}" '.data[] | select(.platform_id==$p)' >/dev/null || ncl messaging-groups create --channel-type voice-mode --platform-id "voice-mode:{{line_id}}" --name "Voice line" --is-group 0 --unknown-sender-policy strict
-ncl wirings create --channel-type voice-mode --platform-id "voice-mode:{{line_id}}" --agent-group "{{agent_folder}}" --session-mode shared --sender-scope known
-```
-
-Access is checked before a call starts, before every turn and every five
-seconds during the call; removing the membership or the wiring ends the call.
-
-Tell the user:
-
-```nc:operator
-The call link is {{public_url}}/voice?t={{link_token}} - keep it private: anyone holding it talks to {{agent_folder}} as {{caller_name}}. Start the voice worker (Run the worker, below), then open the link, press Call and allow the microphone.
+In a chat wired to your agent (a direct chat with the bot is best), send /voice (on Slack: !voice). You get a private call link for that agent, and calls talk in that chat. Start the voice worker first (Run the worker, below).
 ```
 
 ## Run the worker
@@ -278,7 +230,7 @@ share a protocol version, and a mismatched worker makes the page say the voice
 service is updating.
 
 Try it in a terminal first: `node dist/voice-mode-worker.js start`. Its health
-check answers on `127.0.0.1:8089` (`VOICE_WORKER_HEALTH_PORT`). If the host's
+check answers on `127.0.0.1:8089` (`VOICE_MODE_WORKER_HEALTH_PORT`). If the host's
 webhook server is not on `http://127.0.0.1:3000` (`WEBHOOK_PORT`), set
 `LIVEKIT_HOST_URL` (loopback only).
 
@@ -333,35 +285,31 @@ On stop the worker takes no new calls and gives running ones 60 seconds.
 
 ## Where calls talk, and `/voice`
 
-A call talks in one of the agent's chats: your turns are posted there as
-`🎙 <name>: <text>` and handed to the agent as messages from the line's caller,
-and every message the agent sends to that chat during the call is spoken.
+Each agent has one voice line. `/voice` (Telegram) or `!voice` (Slack, whose
+client eats unknown slash commands), sent in a chat wired to the agent by an
+owner or admin of it:
 
-Name the line's owner, the person's account on a chat platform (`ncl users
-list` shows ids), plus any other accounts of the same person:
+- creates the line on first use, and mints a fresh call link every time: the
+  previous link stops working (only a hash of the link's token is stored, so an
+  old link cannot be shown again; running `/voice` is also how a lost or leaked
+  link is replaced);
+- makes that chat (and its thread, where the wiring keeps threads) the chat the
+  line's calls talk in;
+- makes the sender the line's caller: turns are posted as `🎙 <name>: <text>`
+  and handed to the agent as messages from that account;
+- sends the link to the sender: as the reply in a direct chat, by direct
+  message from a group chat, so other members never see it. The command never
+  reaches the agent.
 
-```bash
-ncl voice-lines set --line voice-mode:<line id> --owner telegram:<their id>
-ncl voice-lines add-owner --line voice-mode:<line id> --owner slack:<their id>
-ncl voice-lines get voice-mode:<line id>
-```
-
-The owner then sends `/voice` (Telegram) or `!voice` (Slack, whose client eats
-unknown slash commands) in a chat wired to the agent; that account must also be
-an owner or admin of the agent. That chat (and its thread, where the wiring
-keeps threads) becomes the line's call chat until `/voice` is run elsewhere. In
-a direct chat the reply carries the call link; in a group chat the link goes to
-the owner's direct chat and the group only hears where calls now talk. The
-command never reaches the agent.
-
-Before any `/voice`, `VOICE_MIRROR` picks the chat: the one chat of that channel
-type wired to the agent (or the one direct chat among several). With none,
-several, or `VOICE_MIRROR=off`, the call talks on the voice line itself and
-nothing is posted.
+During a call every message the agent sends to that chat is spoken. Running
+`/voice` again ends a call made with the old link, as does the caller losing
+their role. If the chat stops being wired to the agent, calls fall back to the
+one chat of the `VOICE_MODE_MIRROR` channel type wired to the agent (or the one
+direct chat among several), and are refused when there is none.
 
 ## First call
 
-Open the link (or the one `/voice` sends), press Call, allow the microphone and
+Open the link `/voice` sent you, press Call, allow the microphone and
 ask something only the agent knows ("what's on my calendar tomorrow?"). The
 first answer of a call can take a few seconds longer while the agent's container
 starts. On iPhone, start the call with the Call button so audio can play.
@@ -374,26 +322,26 @@ empty value reads as unset, so turn a fallback off with `off`.
 
 | Key | Default | Read by | What |
 | --- | --- | --- | --- |
-| `VOICE_LANGUAGES` | `en-US` | host | Languages callers speak, BCP-47, comma-separated, the first the default (e.g. `uk-UA,en-US`). The transcription's language hints; unless it is English only, each turn also tells the agent which languages to answer in. With Ukrainian listed and Russian not, a Russian-looking transcript is treated as misheard Ukrainian. The worker's own short lines exist in English and Ukrainian. |
-| `VOICE_VOCABULARY` | empty | host | Comma-separated names to recognise and spell exactly; merged with the agent's optional `voice.vocabulary.txt` (one per line, in its group folder). At most 60 terms. |
-| `VOICE_PORT` | `3100` | host | The page server's port. |
-| `VOICE_MAX_CALL_SECONDS` | `900` | host | Longest call. |
-| `VOICE_MAX_CALLS_PER_HOUR` | `12` | host | Call starts per line per hour. |
-| `VOICE_MAX_MINUTES_PER_DAY` | `120` | host | Call minutes per line per UTC day (counted in memory, reset on restart). |
-| `VOICE_UI` | default look | host | JSON for the page's look, e.g. `{"colorway":"field","brand":"Home line"}`. |
-| `VOICE_SILENCE_MS` | `2500` | host | Silence that sends a turn (300-30000). |
-| `VOICE_MIRROR` | `telegram` | host | Channel type of the default call chat before any `/voice`; `off` for the voice line. |
-| `VOICE_STT_MODEL` | `gemini-3.5-transcribe-live` | host | Streaming transcription. |
-| `VOICE_STT_FALLBACK_MODEL` | `gemini-3.5-transcribe` | host | Used only while the streaming model fails; `off` for none. |
-| `VOICE_TTS_MODEL` | `gemini-3.8-flash-tts` | host | Speaks the replies. |
-| `VOICE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | host | `off` for none. |
-| `VOICE_TTS_VOICE` | `Alnilam` | host | Prebuilt Gemini voice. |
+| `VOICE_MODE_LANGUAGES` | `en-US` | host | Languages callers speak, BCP-47, comma-separated, the first the default (e.g. `uk-UA,en-US`). The transcription's language hints; unless it is English only, each turn also tells the agent which languages to answer in. With Ukrainian listed and Russian not, a Russian-looking transcript is treated as misheard Ukrainian. The worker's own short lines exist in English and Ukrainian. |
+| `VOICE_MODE_VOCABULARY` | empty | host | Comma-separated names to recognise and spell exactly; merged with the agent's optional `voice.vocabulary.txt` (one per line, in its group folder). At most 60 terms. |
+| `VOICE_MODE_PORT` | `3100` | host | The page server's port. |
+| `VOICE_MODE_MAX_CALL_SECONDS` | `900` | host | Longest call. |
+| `VOICE_MODE_MAX_CALLS_PER_HOUR` | `12` | host | Call starts per line per hour. |
+| `VOICE_MODE_MAX_MINUTES_PER_DAY` | `120` | host | Call minutes per line per UTC day (counted in memory, reset on restart). |
+| `VOICE_MODE_UI` | default look | host | JSON for the page's look, e.g. `{"colorway":"field","brand":"Home line"}`. |
+| `VOICE_MODE_SILENCE_MS` | `2500` | host | Silence that sends a turn (300-30000). |
+| `VOICE_MODE_MIRROR` | `telegram` | host | Channel type of the fallback call chat when the `/voice` chat is no longer wired to the agent; `off` refuses calls instead. |
+| `VOICE_MODE_STT_MODEL` | `gemini-3.5-transcribe-live` | host | Streaming transcription. |
+| `VOICE_MODE_STT_FALLBACK_MODEL` | `gemini-3.5-transcribe` | host | Used only while the streaming model fails; `off` for none. |
+| `VOICE_MODE_TTS_MODEL` | `gemini-3.8-flash-tts` | host | Speaks the replies. |
+| `VOICE_MODE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | host | `off` for none. |
+| `VOICE_MODE_TTS_VOICE` | `Alnilam` | host | Prebuilt Gemini voice. |
 | `LIVEKIT_WORKER_URL` | `LIVEKIT_URL` | both | Server-side LiveKit URL (e.g. `ws://127.0.0.1:7880` for a server on this machine). |
 | `LIVEKIT_AGENT_NAME` | `nanoclaw-voice` | both | Dispatch name; the same value for host and worker. |
 | `LIVEKIT_HOST_URL` | `http://127.0.0.1:<WEBHOOK_PORT>` | worker | Where the worker reaches the host; loopback only. |
-| `VOICE_WORKER_HEALTH_PORT` | `8089` | worker | Health check on `127.0.0.1`. |
-| `VOICE_MAX_SPOKEN_CHARS` | `800` | worker | Longest spoken message; the rest stays in the chat. `0` for no cap. |
-| `VOICE_RECORDINGS_DAYS` | `0` (off) | worker | Keep each caller turn as WAV + JSON under `data/voice-recordings/` for this many days. It is the caller's voice, kept only on this machine in owner-only files, pruned daily. |
+| `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | worker | Health check on `127.0.0.1`. |
+| `VOICE_MODE_MAX_SPOKEN_CHARS` | `800` | worker | Longest spoken message; the rest stays in the chat. `0` for no cap. |
+| `VOICE_MODE_RECORDINGS_DAYS` | `0` (off) | worker | Keep each caller turn as WAV + JSON under `data/voice-recordings/` for this many days. It is the caller's voice, kept only on this machine in owner-only files, pruned daily. |
 
 ## Self-hosted LiveKit
 
@@ -463,22 +411,31 @@ to override. Desktop browsers use UDP.
   worker cannot reach the host: set `LIVEKIT_HOST_URL` to the host's loopback
   webhook URL.
 - **`voice-mode` is missing from `ncl` channel lists.** The channel stays
-  offline until `VOICE_LINK_TOKEN`, `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
-  `LIVEKIT_API_SECRET` and `GEMINI_API_KEY` are all set; the host log names what
+  offline until `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` and
+  `GEMINI_API_KEY` are all set; the host log names what
   is missing.
 - **The microphone is refused.** The page is not on HTTPS or `localhost`.
 - **403 on the page.** The request came from a non-loopback address outside
-  `VOICE_TRUSTED_PROXY_CIDRS`, or the forwarded client is outside
-  `VOICE_ALLOWED_CLIENT_CIDRS`.
-- **"Caller access denied".** The line's user is not a member of the agent, or
-  the line lacks its strict, known-sender wiring.
-- **`/voice` says you have no line.** Run `ncl voice-lines set` for the line
-  with that chat account, and make the account an owner or admin of the agent.
+  `VOICE_MODE_TRUSTED_PROXY_CIDRS`, or the forwarded client is outside
+  `VOICE_MODE_ALLOWED_CLIENT_CIDRS`.
+- **"Unknown call link".** The link was replaced: every `/voice` mints a new
+  one. Use the newest link, or run `/voice` again.
+- **"Caller access denied".** The account that last ran `/voice` no longer has
+  an owner or admin role over the agent (`ncl roles list`).
+- **`/voice` says only an owner or admin can use it.** That chat account has no
+  role over the agent; grant one with `ncl roles grant` (Who can make a call
+  link, above). Each channel account is its own user.
+- **"This voice line has no chat to talk in".** The chat `/voice` was last run
+  in is no longer wired to the agent and `VOICE_MODE_MIRROR` finds no single
+  other chat; run `/voice` in a chat that is wired.
+- **No answer at all to `/voice` from a newly granted account.** That account
+  has never messaged the bot, so core has no user for it yet; send the bot any
+  message from it, then `/voice` again.
 - **No answer to `/voice` in a group.** The bot must see the message: in a
   Telegram group send `/voice@<bot>`; on Slack use a chat where the bot reads
   messages.
 - **Replies are not spoken.** Only messages the agent sends to the call chat
-  while the call is live are spoken; check the call chat with
-  `ncl voice-lines get`.
+  while the call is live are spoken: the chat `/voice` was last run in (or the
+  `VOICE_MODE_MIRROR` fallback).
 
 To uninstall, see [REMOVE.md](REMOVE.md).

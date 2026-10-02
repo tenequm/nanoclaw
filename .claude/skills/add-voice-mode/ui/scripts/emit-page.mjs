@@ -32,7 +32,7 @@ const body = `/* eslint-disable */
  * The browser call page for the voice channel as one self-contained HTML
  * document (${kb} KB). The host injects a small runtime config where the
  * VOICE_UI_CONFIG placeholder sits, so operators can change the look without
- * rebuilding: see VoiceUiConfig and the VOICE_UI key in SKILL.md.
+ * rebuilding: see VoiceUiConfig and the VOICE_MODE_UI key in SKILL.md.
  */
 
 export interface VoiceUiConfig {

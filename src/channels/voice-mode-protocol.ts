@@ -15,7 +15,7 @@ export const HOST_SILENCE_MS = 3 * PING_INTERVAL_MS;
 export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
 
 /** Wire version of the job metadata; host and worker must agree, so they ship and restart together. */
-export const LIVEKIT_PROTOCOL_VERSION = 4;
+export const LIVEKIT_PROTOCOL_VERSION = 5;
 
 /** Streaming transcription over the Gemini Live API, verbatim. */
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
@@ -26,14 +26,14 @@ export const DEFAULT_VOICE_TTS_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
 export const DEFAULT_VOICE_TTS_VOICE = 'Alnilam';
 /** Silence that ends the caller's turn; shorter pauses mid-thought keep it open. */
 export const DEFAULT_VOICE_SILENCE_MS = 2500;
-/** Channel type of the default call chat when `/voice` has not set one (VOICE_MIRROR). */
+/** Channel type of the fallback call chat when the `/voice` chat is no longer wired (VOICE_MODE_MIRROR). */
 export const DEFAULT_VOICE_MIRROR = 'telegram';
-/** The languages callers speak when VOICE_LANGUAGES is unset (BCP-47; the first is the default). */
+/** The languages callers speak when VOICE_MODE_LANGUAGES is unset (BCP-47; the first is the default). */
 export const DEFAULT_VOICE_LANGUAGES: readonly string[] = ['en-US'];
 const MAX_VOICE_LANGUAGES = 4;
 
 /**
- * VOICE_LANGUAGES: comma-separated BCP-47 codes (`uk-UA,en-US`), the first the call's default.
+ * VOICE_MODE_LANGUAGES: comma-separated BCP-47 codes (`uk-UA,en-US`), the first the call's default.
  * They are the transcription's language hints and shape the agents' language notes. Invalid
  * entries are dropped; none left means the default.
  */
@@ -62,9 +62,9 @@ export interface LiveKitJobMetadata {
   agentName: string;
   callerName: string;
   callerIdentity: string;
-  /** Spelling hints for the transcription: VOICE_VOCABULARY plus the agent's voice.vocabulary.txt. */
+  /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
-  /** VOICE_LANGUAGES: the transcription's language hints; the first is the call's default. */
+  /** VOICE_MODE_LANGUAGES: the transcription's language hints; the first is the call's default. */
   languages: string[];
   sttModel: string;
   /** Takes over while `sttModel` fails; empty for none. */
@@ -83,11 +83,11 @@ export interface LiveKitJobMetadata {
  * The worker's participant attribute for what `lk.agent.state` cannot say (its session has no
  * LLM, so it never thinks): "1" while the host says the agent works on a turn, "" otherwise.
  */
-export const CALL_THINKING_ATTRIBUTE = 'nanoclaw.voice.thinking';
+export const CALL_THINKING_ATTRIBUTE = 'nanoclaw.voice-mode.thinking';
 /** The worker's participant attribute: "1" when it cannot serve this host's protocol version. */
-export const CALL_UPDATING_ATTRIBUTE = 'nanoclaw.voice.updating';
+export const CALL_UPDATING_ATTRIBUTE = 'nanoclaw.voice-mode.updating';
 /** Text stream topic the worker sends one JSON `CallTurnStatus` on per caller turn. */
-export const CALL_TURN_TOPIC = 'nanoclaw.voice.turn';
+export const CALL_TURN_TOPIC = 'nanoclaw.voice-mode.turn';
 
 /**
  * The room metadata the host sets when a mid-call `/voice` moves the call to another chat, so the
@@ -118,9 +118,9 @@ export interface CallTurnStatus {
  * the next and elapsedMs is how much of the silence had passed when it was set. "" otherwise:
  * speech resumed, the turn went out or was dropped, or the agent speaks.
  */
-export const CALL_PENDING_ATTRIBUTE = 'nanoclaw.voice.pending';
+export const CALL_PENDING_ATTRIBUTE = 'nanoclaw.voice-mode.pending';
 /** Text stream topic the worker sends one JSON `CallReplyInfo` on right before each line it speaks. */
-export const CALL_REPLY_TOPIC = 'nanoclaw.voice.reply';
+export const CALL_REPLY_TOPIC = 'nanoclaw.voice-mode.reply';
 
 /**
  * What the next spoken line is: an agent message answering the caller's turn `turn` (the
