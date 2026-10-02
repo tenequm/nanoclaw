@@ -148,8 +148,8 @@ function formatForwardHeader(origin: MessageOrigin): string {
   return `[forwarded from ${describeOrigin(origin)}, ${origDate}]`;
 }
 
-/** A voice call page link (`/webhook/voice/...?t=<line token>`), wherever it was pasted. */
-const VOICE_LINK = /\S*\/webhook\/voice\/\S*?[?&]t=[^\s&#]+\S*/g;
+const VOICE_LINK_PATH = '/webhook/voice/';
+const LINK_TOKEN_PARAM = /[?&]t=[^&#]/;
 
 /**
  * A voice line's call link is that line's credential. The /voice reply carries
@@ -157,7 +157,12 @@ const VOICE_LINK = /\S*\/webhook\/voice\/\S*?[?&]t=[^\s&#]+\S*/g;
  * hand it over either.
  */
 export function redactVoiceLinks(text: string): string {
-  return text.replace(VOICE_LINK, '[voice call link]');
+  // Word by word, not one regex over the text: any group member controls this text, and a
+  // backtracking pattern over a 4 KB word stalls the host for seconds.
+  return text.replace(/\S+/g, (word) => {
+    const at = word.indexOf(VOICE_LINK_PATH);
+    return at >= 0 && LINK_TOKEN_PARAM.test(word.slice(at + VOICE_LINK_PATH.length)) ? '[voice call link]' : word;
+  });
 }
 
 export function extractReplyContext(msg: Message): ReplyContext | null {

@@ -181,6 +181,14 @@ describe('extractReplyContext keeps voice call links out of the agent', () => {
       'see https://example.com/webhook/other?t=1',
     );
   });
+
+  it('stays linear on a long word that keeps almost matching', () => {
+    const text = '/webhook/voice/'.repeat(273);
+    const reply = { message_id: 9, text, from: { first_name: 'A' } };
+    const started = Date.now();
+    expect(extractReplyContext({ message_id: 10, reply_to_message: reply } as unknown as Message)?.text).toBe(text);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
 });
 
 describe('parseChatId', () => {
