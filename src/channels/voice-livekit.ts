@@ -25,7 +25,7 @@
  *  - `POST agent/ended`      the worker's session is over.
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
- * line: the chat the line's owner last ran `/voice` in (voice_lines), else the
+ * line: the chat any of the line's owner accounts last ran `/voice` in (voice_lines), else the
  * one chat of the WALKIE_MIRROR channel type wired to the agent
  * (pickMirrorTarget). Each turn is routed into that chat's session through the
  * normal inbound path as a message from the line's own caller, addressed to
@@ -64,7 +64,7 @@ import {
   getMessagingGroupByPlatform,
   getMessagingGroupsByAgentGroup,
 } from '../db/messaging-groups.js';
-import { getVoiceLine } from '../db/voice-lines.js';
+import { getVoiceLine, getVoiceLineOwners } from '../db/voice-lines.js';
 import { registerPostDeliveryHook } from '../delivery.js';
 import { log } from '../log.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
@@ -121,8 +121,8 @@ export interface LiveKitServerApi {
 export interface BoundCallChat {
   group: MessagingGroup;
   threadId: string | null;
-  /** The line's owner, the only one who can set the binding. */
-  ownerId: string;
+  /** The line's owner accounts, the only ones who can set the binding. */
+  ownerIds: string[];
 }
 
 /** The agent's chats a call can talk in; the central DB and live adapters by default, fakes in tests. */
@@ -300,7 +300,7 @@ const defaultMirrorApi: MirrorApi = {
     const row = line && (await getVoiceLine(line.id));
     const group = row?.target_messaging_group_id && (await getMessagingGroup(row.target_messaging_group_id));
     if (!row || !group) return null;
-    return { group, threadId: row.thread_id, ownerId: row.owner_user_id };
+    return { group, threadId: row.thread_id, ownerIds: await getVoiceLineOwners(line.id) };
   },
   isAdmin: (userId, agentGroupId) => hasAdminPrivilege(userId, agentGroupId),
 };
@@ -439,7 +439,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     log.info(`livekit-voice: ${note}`, { platformId: call.platformId, callId: call.callId, ...fields });
   };
 
-  /** The `/voice` chat if it is still the agent's and the line's owner still administers the agent, else the WALKIE_MIRROR pick. */
+  /** The `/voice` chat if it is still the agent's and an owner account of the line still administers the agent, else the WALKIE_MIRROR pick. */
   const resolveChat = async (call: LiveKitCall): Promise<CallChat | null> => {
     const { line } = call;
     const groups = await mirrorApi.groupsFor(line.agentGroupId);
@@ -451,8 +451,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         noteChat(call, 'binding', 'the /voice chat is no longer wired to the agent; using the default', {
           chat: g.id,
         });
-      } else if (!(await mirrorApi.isAdmin(bound.ownerId, line.agentGroupId))) {
-        noteChat(call, 'binding', 'the line owner is no longer an admin of the agent; using the default', {
+      } else if (
+        !(await Promise.all(bound.ownerIds.map((id) => mirrorApi.isAdmin(id, line.agentGroupId)))).some(Boolean)
+      ) {
+        noteChat(call, 'binding', 'no line owner account is an admin of the agent; using the default', {
           chat: g.id,
         });
       } else {

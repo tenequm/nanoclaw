@@ -42,7 +42,7 @@ import {
   getMessagingGroupsByAgentGroup,
   updateMessagingGroupAgent,
 } from '../db/messaging-groups.js';
-import { getVoiceLine, setVoiceLineTarget } from '../db/voice-lines.js';
+import { isVoiceLineOwner, setVoiceLineTarget } from '../db/voice-lines.js';
 import {
   findSessionByAgentGroup,
   findSessionForAgent,
@@ -603,8 +603,8 @@ function callChatThread(wiring: MessagingGroupAgent, mg: MessagingGroup, threadI
 /**
  * Make this chat the call chat of the agent's voice line(s) that belong to
  * `actorUserId`, and return their walkie-talkie links. Admin only. A line
- * belongs to the user its voice_lines row names as owner; another person's
- * line is never bound or linked here. The call chat is where the line's LiveKit
+ * belongs to the chat accounts voice_line_owners names for it (one person's
+ * accounts across channels); another person's line is never bound or linked here. The call chat is where the line's LiveKit
  * calls talk (src/channels/voice-livekit.ts), as the line's own caller, until
  * /voice is run in another chat. The links are secrets: callers send them to
  * this chat only and never log them.
@@ -624,7 +624,7 @@ export async function setVoiceTarget(
 
   const owned: MessagingGroup[] = [];
   for (const line of await voiceLinesOf(agentGroupId)) {
-    if ((await getVoiceLine(line.id))?.owner_user_id === actorUserId) owned.push(line);
+    if (await isVoiceLineOwner(line.id, actorUserId)) owned.push(line);
   }
   if (owned.length === 0) return fail('no-voice-line');
   const linked = owned.flatMap((line) => {
@@ -642,7 +642,7 @@ export async function setVoiceTarget(
       targetMessagingGroupId: chat.messagingGroupId,
       threadId,
     });
-    // The owner changed since the read above: that line is no longer theirs to hand out.
+    // The owners changed since the read above: that line is no longer theirs to hand out.
     if (ok) bound.push(entry);
   }
   if (bound.length === 0) return fail('no-voice-line');

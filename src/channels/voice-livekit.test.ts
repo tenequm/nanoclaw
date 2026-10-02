@@ -860,7 +860,7 @@ describe('livekit call talking in the agent chat', () => {
   it('talks in the chat /voice was run in, ahead of the default rule, still as the line caller', async () => {
     const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
     const { posts } = await start([{ platform_id: 'telegram:100' }, topic], 'telegram', {
-      bound: { group: topic, threadId: 'th-1', ownerId: 'telegram:42' },
+      bound: { group: topic, threadId: 'th-1', ownerIds: ['telegram:42'] },
       admins: ['telegram:42'],
     });
     const { worker } = await startCall(h);
@@ -889,23 +889,29 @@ describe('livekit call talking in the agent chat', () => {
     worker.close();
   });
 
-  it('ignores a /voice chat that is no longer the agent, or whose owner is no longer its admin', async () => {
+  it('ignores a /voice chat that is no longer the agent, or when no owner account is its admin', async () => {
     const gone = { id: 'mg-gone', platform_id: 'telegram:-9' };
     const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
     const fake = await start([{ platform_id: 'telegram:100' }, topic], 'telegram', {
-      bound: { group: gone, threadId: null, ownerId: 'telegram:42' },
+      bound: { group: gone, threadId: null, ownerIds: ['telegram:42'] },
       admins: ['telegram:42'],
     });
     const { worker } = await startCall(h);
     await worker.utter('one');
     expect(h.events[0].platformId).toBe('telegram:100');
-    fake.state.bound = { group: topic, threadId: null, ownerId: 'telegram:42' };
+    fake.state.bound = { group: topic, threadId: null, ownerIds: ['telegram:42'] };
     fake.state.admins.clear();
     await worker.utter('two');
     expect(h.events[1].platformId).toBe('telegram:100');
     fake.state.admins.add('telegram:42');
     await worker.utter('three');
     expect(h.events[2].platformId).toBe('telegram:-300:7');
+    // Any owner account of the line that is still an admin keeps the binding.
+    fake.state.bound = { group: topic, threadId: null, ownerIds: ['telegram:42', 'slack:U42'] };
+    fake.state.admins.clear();
+    fake.state.admins.add('slack:U42');
+    await worker.utter('four');
+    expect(h.events[3].platformId).toBe('telegram:-300:7');
     for (const event of h.events) {
       expect(JSON.parse(event.message.content)).toMatchObject({ sender: 'Ethan', senderId: LINE });
     }
@@ -918,7 +924,7 @@ describe('livekit call talking in the agent chat', () => {
     const { worker } = await startCall(h);
     await worker.utter('one');
     expect(h.events[0].platformId).toBe('telegram:100');
-    fake.state.bound = { group: topic, threadId: null, ownerId: 'telegram:42' };
+    fake.state.bound = { group: topic, threadId: null, ownerIds: ['telegram:42'] };
     await worker.utter('two');
     expect(h.events[1].platformId).toBe('telegram:-300:7');
     delivered('telegram:100', 'Answer to one.');

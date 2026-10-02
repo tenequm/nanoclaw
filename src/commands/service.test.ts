@@ -568,13 +568,17 @@ describe('/voice', () => {
     });
   }
 
-  /** What `ncl voice-lines set` leaves behind. */
+  /** What `ncl voice-lines set|add-owner` leaves behind. */
   async function own(lineMessagingGroupId: string, ownerUserId: string) {
     await getDb().run(
-      'INSERT INTO voice_lines (line_messaging_group_id, owner_user_id, updated_at) VALUES (?, ?, ?)',
+      'INSERT INTO voice_lines (line_messaging_group_id, updated_at) VALUES (?, ?) ON CONFLICT DO NOTHING',
+      lineMessagingGroupId,
+      now(),
+    );
+    await getDb().run(
+      'INSERT INTO voice_line_owners (line_messaging_group_id, owner_user_id) VALUES (?, ?)',
       lineMessagingGroupId,
       ownerUserId,
-      now(),
     );
   }
 
@@ -609,11 +613,7 @@ describe('/voice', () => {
       agentGroupId: 'ag-1',
       links: ['https://voice.example/webhook/voice/livekit?t=tok-voice:abc'],
     });
-    expect(await getVoiceLine('mg-line')).toMatchObject({
-      owner_user_id: OWNER,
-      target_messaging_group_id: 'mg-dm',
-      thread_id: null,
-    });
+    expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-dm', thread_id: null });
     // Another admin's line is neither bound nor linked.
     expect(await getVoiceLine('mg-line-2')).toMatchObject({ target_messaging_group_id: null });
 
@@ -628,8 +628,31 @@ describe('/voice', () => {
     expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-topic' });
   });
 
+  it("binds the line from any of its owner's accounts; the last /voice wins", async () => {
+    const SLACK_OWNER = 'slack:U1';
+    await makeUser(SLACK_OWNER);
+    await grantRole({
+      user_id: SLACK_OWNER,
+      role: 'admin',
+      agent_group_id: 'ag-1',
+      granted_by: null,
+      granted_at: now(),
+    });
+    await own('mg-line', SLACK_OWNER);
+    await setVoiceTarget('ag-1', chat('mg-topic'), OWNER, link);
+    const res = await setVoiceTarget('ag-1', chat('mg-dm'), SLACK_OWNER, link);
+    expect(res).toMatchObject({
+      ok: true,
+      view: { links: ['https://voice.example/webhook/voice/livekit?t=tok-voice:abc'] },
+    });
+    expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-dm' });
+    expect(await getVoiceLine('mg-line-2')).toMatchObject({ target_messaging_group_id: null });
+    await setVoiceTarget('ag-1', chat('mg-topic'), OWNER, link);
+    expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-topic' });
+  });
+
   it('refuses an admin who owns no line of the agent, and changes nothing', async () => {
-    await getDb().run('DELETE FROM voice_lines WHERE line_messaging_group_id = ?', 'mg-line-2');
+    await getDb().run('DELETE FROM voice_line_owners WHERE line_messaging_group_id = ?', 'mg-line-2');
     expect(await setVoiceTarget('ag-1', chat('mg-dm'), SCOPED_ADMIN, link)).toEqual({
       ok: false,
       reason: 'no-voice-line',
