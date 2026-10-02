@@ -52,8 +52,8 @@ to say, so it spells them exactly: `VOICE_VOCABULARY` (comma-separated, in
 e.g. `VOICE_VOCABULARY=Acme, Zephyr, k8s`. Both are merged, trimmed and
 deduplicated, and capped at 60 terms and 1 KB. `VOICE_VOCABULARY` is read at
 startup, the file on every call. The agent maintains the file itself: the
-`voice-formatting` container skill tells it to add names a transcript
-misspelled, so read or edit `groups/<folder>/voice.vocabulary.txt` to check
+resident `voice-formatting` instructions (step 3) tell it to add names a
+transcript misspelled, so read or edit `groups/<folder>/voice.vocabulary.txt` to check
 or correct its entries.
 
 The stable channel identifier and URL prefix are `voice`.
@@ -92,14 +92,20 @@ import './voice.js';
 
 ### 3. Teach agents to write for the ear
 
-Replies on this channel are spoken. Mount the formatting skill so every agent
-answers a call in short plain prose. `container/skills/` is mounted read-only
-into every agent container; the skill only changes behaviour when a message
-arrives from a call. Copy it separately so reapplying missing adapter files
-does not overwrite a customized formatting skill:
+Replies on this channel are spoken. The note the host adds under every
+transcribed turn carries the format rules (depth matched to the question, plain
+prose with no markdown, links or code, numbers as words, Ukrainian never
+Russian). What a turn's note cannot carry lives in resident instructions:
+messages that answer no turn, no question cards or attachments, where reading
+material goes, and the vocabulary file. The host composes
+`container/skills/voice-formatting/instructions.md` into every group's
+`CLAUDE.md` at spawn, as the section `NanoClaw Skill: voice-formatting` (a group
+with an explicit skill list needs `voice-formatting` in it), so the agent has it
+before the first call rather than on demand. Copy it separately so reapplying
+missing adapter files does not overwrite customized instructions:
 
 ```nc:copy from-branch:channels
-container/skills/voice-formatting/SKILL.md
+container/skills/voice-formatting/instructions.md
 ```
 
 ### 4. Build

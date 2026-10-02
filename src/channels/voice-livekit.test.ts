@@ -1339,6 +1339,7 @@ describe('turn message text', () => {
     }
     expect(CALL_DEPTH_NOTE).toContain('Match the depth to the question: brief for simple ones');
     expect(CALL_DEPTH_NOTE).toContain('take the time to think and verify, and give the full considered answer');
+    expect(CALL_DEPTH_NOTE).toContain('Lead with the answer; for a long one, say how many points there are');
     expect(CALL_DEPTH_NOTE).toContain('No markdown, no links, no code blocks, numbers written as words.');
     expect(CALL_CHAT_REPLY_NOTE).toContain('for after the call instead of sending it now');
   });

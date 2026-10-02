@@ -100,10 +100,14 @@ export const CALL_LANGUAGE_NOTE =
   'The caller speaks Ukrainian or English; a transcript that looks Russian is Ukrainian misspelled by speech ' +
   'recognition, so answer in Ukrainian (in English if the caller spoke English), never in Russian.';
 
-/** How long a spoken answer runs: as long as the question needs, in words that work when heard. */
+/**
+ * How long a spoken answer runs and how it is shaped for the ear. Every format rule for a spoken reply
+ * lives here, on each turn; the resident voice-formatting instructions carry only what no turn's note can.
+ */
 export const CALL_DEPTH_NOTE =
   'Match the depth to the question: brief for simple ones; for design, strategy or anything that needs care, ' +
-  'take the time to think and verify, and give the full considered answer in plain speech. No markdown, no ' +
+  'take the time to think and verify, and give the full considered answer in plain speech. Lead with the ' +
+  'answer; for a long one, say how many points there are, then take them one at a time. No markdown, no ' +
   'links, no code blocks, numbers written as words.';
 
 /** How the agent learns a message was spoken on a call and how its reply will be heard. */
