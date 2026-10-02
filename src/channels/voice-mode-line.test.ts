@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { closeDb, initTestDb, runMigrations } from '../db/index.js';
 import { createAgentGroup } from '../db/agent-groups.js';
-import { mintVoiceModeLine } from '../db/voice-mode-lines.js';
+import { bindVoiceModeLineChat, mintVoiceModeLine } from '../db/voice-mode-lines.js';
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
 import { createUser } from '../modules/permissions/db/users.js';
 import { grantRole, revokeRole } from '../modules/permissions/db/user-roles.js';
@@ -75,6 +75,13 @@ describe('voice line access (real central DB)', () => {
     expect(sameCallerAndAgent(before, (await resolveVoiceLine(line))!)).toBe(true);
     await mint(ADMIN);
     expect(sameCallerAndAgent(before, (await resolveVoiceLine(line))!)).toBe(false);
+  });
+
+  it('keeps a call going when /voice only moves the line to another chat', async () => {
+    const line = await mint(ADMIN);
+    const before = (await resolveVoiceLine(line))!;
+    await bindVoiceModeLineChat({ agentGroupId: 'ag-1', messagingGroupId: 'mg-2', threadId: null });
+    expect(sameCallerAndAgent(before, (await resolveVoiceLine(line))!)).toBe(true);
   });
 
   it('names the caller by id when the user has no display name, and ends a call when someone else re-mints', async () => {

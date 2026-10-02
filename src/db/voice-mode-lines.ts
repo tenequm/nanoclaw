@@ -1,7 +1,8 @@
 /**
  * Voice mode's own state: one voice line per agent group, in the skill's own table. The line holds
  * the SHA-256 of its current call-link token (never the token), who minted it (the caller), and
- * the chat its calls talk in. `/voice` creates and re-mints lines (src/channels/voice-mode-command.ts);
+ * the chat its calls talk in. `/voice` creates lines and moves their chat, `/voice new` re-mints their
+ * link (src/channels/voice-mode-command.ts);
  * the call page finds a line by its token's hash (src/channels/voice-mode.ts).
  *
  * Who may run `/voice` is core's business (owner and admin roles); this table only records what a
@@ -51,6 +52,26 @@ export const hashLinkToken = (token: string): string => createHash('sha256').upd
 
 export async function getVoiceModeLine(lineId: string): Promise<VoiceModeLine | undefined> {
   return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE line_id = ?', lineId);
+}
+
+export async function getVoiceModeLineForAgent(agentGroupId: string): Promise<VoiceModeLine | undefined> {
+  return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE agent_group_id = ?', agentGroupId);
+}
+
+/** Make another chat the line's call chat; its link and caller stay. Undefined when the agent has no line. */
+export async function bindVoiceModeLineChat(target: {
+  agentGroupId: string;
+  messagingGroupId: string;
+  threadId: string | null;
+}): Promise<VoiceModeLine | undefined> {
+  return getDb().get<VoiceModeLine>(
+    `UPDATE voice_mode_lines SET messaging_group_id = ?, thread_id = ?, updated_at = ?
+       WHERE agent_group_id = ? RETURNING *`,
+    target.messagingGroupId,
+    target.threadId,
+    new Date().toISOString(),
+    target.agentGroupId,
+  );
 }
 
 /** The line a call-link token opens, or undefined. Only hashes are compared: the token is stored nowhere. */

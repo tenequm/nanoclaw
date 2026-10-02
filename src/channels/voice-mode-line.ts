@@ -39,7 +39,8 @@ export interface VoiceLine {
 
 /**
  * Whether two resolutions of a line still name the same caller, agent and link; a call ends when
- * they stop, so `/voice` (which re-mints the link) also cuts off a call made with the old one.
+ * they stop, so `/voice new` (which re-mints the link) also cuts off a call made with the old one; a
+ * plain `/voice` only moves the call chat and keeps the call.
  */
 export function sameCallerAndAgent(a: VoiceLine, b: VoiceLine): boolean {
   return (

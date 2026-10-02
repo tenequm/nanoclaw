@@ -29,7 +29,7 @@ import { upsertUser } from '../modules/permissions/db/users.js';
 import type { MessagingGroup } from '../types.js';
 import {
   handleVoiceCommand,
-  isVoiceCommand,
+  parseVoiceCommand,
   runVoiceCommand,
   senderUserId,
   voiceCommandReply,
@@ -74,8 +74,8 @@ async function wire(mgId: string, agentGroupId: string) {
 const lines = () => getDb().all<VoiceModeLine>('SELECT * FROM voice_mode_lines ORDER BY agent_group_id');
 const mg = (id: string, isGroup = 0) =>
   ({ id, instance: null, channel_type: 'chat', is_group: isGroup }) as unknown as MessagingGroup;
-const linkFrom = async (who: string, chat = 'mg-dm', threadId: string | null = null) => {
-  const outcome = await runVoiceCommand(mg(chat), threadId, who, callUrl);
+const linkFrom = async (who: string, chat = 'mg-dm', threadId: string | null = null, renew = false) => {
+  const outcome = await runVoiceCommand(mg(chat), threadId, who, callUrl, renew);
   return voiceLinkLines(outcome)[0]?.split(': ').slice(1).join(': ');
 };
 
@@ -108,15 +108,19 @@ afterEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
-describe('isVoiceCommand / senderUserId', () => {
-  it('takes /voice, /voice@bot and, on Slack only, !voice', () => {
-    expect(isVoiceCommand('/voice', 'telegram')).toBe(true);
-    expect(isVoiceCommand('/VOICE please', 'telegram')).toBe(true);
-    expect(isVoiceCommand('/voice@some_bot', 'telegram')).toBe(true);
-    expect(isVoiceCommand('!voice', 'slack')).toBe(true);
-    expect(isVoiceCommand('!voice', 'telegram')).toBe(false);
-    expect(isVoiceCommand('/voices', 'telegram')).toBe(false);
-    expect(isVoiceCommand('my /voice', 'telegram')).toBe(false);
+describe('parseVoiceCommand / senderUserId', () => {
+  it('takes /voice, /voice@bot and, on Slack only, !voice, with `new` as the only argument', () => {
+    expect(parseVoiceCommand('/voice', 'telegram')).toEqual({ renew: false });
+    expect(parseVoiceCommand('/VOICE please', 'telegram')).toEqual({ renew: false });
+    expect(parseVoiceCommand('/voice@some_bot', 'telegram')).toEqual({ renew: false });
+    expect(parseVoiceCommand('/voice new', 'telegram')).toEqual({ renew: true });
+    expect(parseVoiceCommand('/voice@some_bot  NEW', 'telegram')).toEqual({ renew: true });
+    expect(parseVoiceCommand('!voice new', 'slack')).toEqual({ renew: true });
+    expect(parseVoiceCommand('/voice newer', 'telegram')).toEqual({ renew: false });
+    expect(parseVoiceCommand('!voice', 'slack')).toEqual({ renew: false });
+    expect(parseVoiceCommand('!voice', 'telegram')).toBeNull();
+    expect(parseVoiceCommand('/voices', 'telegram')).toBeNull();
+    expect(parseVoiceCommand('my /voice', 'telegram')).toBeNull();
   });
 
   it('reads the sender the way the permissions module does, namespacing a bare handle', () => {
@@ -147,10 +151,32 @@ describe('runVoiceCommand', () => {
     expect((await findVoiceModeLineByToken(token))?.line_id).toBe(line.line_id);
   });
 
-  it('re-mints on every run: the old link stops working, the line and its id stay', async () => {
+  it('on later runs only moves the call chat: no new link, the old one and its caller stay', async () => {
     const first = tokenOf((await linkFrom(OWNER))!);
     const [before] = await lines();
-    const second = tokenOf((await linkFrom(SCOPED_ADMIN, 'mg-other'))!);
+    const outcome = await runVoiceCommand(mg('mg-other'), null, SCOPED_ADMIN, callUrl);
+    expect(outcome).toEqual({ kind: 'done', results: [{ ok: true, agentName: 'Andy', rebound: true }] });
+    expect(voiceLinkLines(outcome)).toEqual([]);
+    expect(voiceCommandReply(outcome)).toBe(
+      'Calls with Andy now talk in this chat. Lost the link? Send /voice new for a fresh one (the old one stops working).',
+    );
+    const after = await lines();
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({
+      line_id: before.line_id,
+      owner_user_id: OWNER,
+      messaging_group_id: 'mg-other',
+      token_hash: before.token_hash,
+    });
+    expect((await findVoiceModeLineByToken(first))?.line_id).toBe(before.line_id);
+  });
+
+  it('with `new` re-mints: the old link stops working, the line and its id stay', async () => {
+    const first = tokenOf((await linkFrom(OWNER))!);
+    const [before] = await lines();
+    const outcome = await runVoiceCommand(mg('mg-other'), null, SCOPED_ADMIN, callUrl, true);
+    const second = tokenOf(voiceLinkLines(outcome)[0].split(': ').slice(1).join(': '));
+    expect(voiceCommandReply(outcome)).toContain('Any earlier link no longer works.');
     const after = await lines();
     expect(after).toHaveLength(1);
     expect(after[0]).toMatchObject({
@@ -189,7 +215,7 @@ describe('runVoiceCommand', () => {
   it('rotates nothing when the voice-mode channel is not running here', async () => {
     await linkFrom(OWNER);
     const [before] = await lines();
-    expect(voiceCommandReply(await runVoiceCommand(mg('mg-dm'), null, OWNER, null))).toBe(
+    expect(voiceCommandReply(await runVoiceCommand(mg('mg-dm'), null, OWNER, null, true))).toBe(
       'Voice calls are off on this host (the voice-mode channel is not configured).',
     );
     expect((await lines())[0].token_hash).toBe(before.token_hash);
@@ -199,6 +225,7 @@ describe('runVoiceCommand', () => {
     const reply = voiceCommandReply(await runVoiceCommand(mg('mg-dm'), null, OWNER, callUrl))!;
     expect(reply).toMatch(/^🎙 Talk to Andy: https:\/\/voice\.example\.com\/voice\?t=[0-9a-f]{32}\n\n/);
     expect(reply).toContain('Calls now talk in this chat, until /voice is run in another one.');
+    expect(reply).not.toContain('earlier link');
   });
 });
 
@@ -295,10 +322,34 @@ describe('handleVoiceCommand (the interceptor)', () => {
     const direct = delivered.filter((d) => d.platformId !== 'chat:G1');
     expect(inGroup).toHaveLength(1);
     expect(JSON.stringify(inGroup[0].message)).not.toContain('?t=');
-    expect(JSON.stringify(inGroup[0].message)).toContain('Your new call link is in our direct chat.');
+    expect(JSON.stringify(inGroup[0].message)).toContain('Your call link is in our direct chat.');
     expect(direct).toHaveLength(1);
     expect(JSON.stringify(direct[0].message)).toMatch(/voice\?t=[0-9a-f]{32}/);
     expect((await lines())[0]).toMatchObject({ messaging_group_id: 'mg-group' });
+  });
+
+  it('in a group chat a later /voice only confirms the move there, and /voice new sends a fresh link directly', async () => {
+    await startChat(false);
+    await chatGroup('mg-group', 'chat:G1', 1);
+    await wire('mg-group', 'ag-1');
+    await linkFrom(OWNER);
+    const [before] = await lines();
+    await handleVoiceCommand(event('/voice', OWNER, 'chat:G1'), callUrl);
+    expect(delivered).toEqual([
+      {
+        platformId: 'chat:G1',
+        threadId: null,
+        message: { kind: 'chat', content: { text: expect.stringContaining('Calls with Andy now talk in this chat.') } },
+      },
+    ]);
+    expect((await lines())[0]).toMatchObject({ messaging_group_id: 'mg-group', token_hash: before.token_hash });
+    delivered.length = 0;
+    await handleVoiceCommand(event('/voice new', OWNER, 'chat:G1'), callUrl);
+    const direct = delivered.filter((d) => d.platformId !== 'chat:G1');
+    expect(direct).toHaveLength(1);
+    expect(JSON.stringify(direct[0].message)).toMatch(/voice\?t=[0-9a-f]{32}/);
+    expect(JSON.stringify(delivered.filter((d) => d.platformId === 'chat:G1'))).not.toContain('?t=');
+    expect((await lines())[0].token_hash).not.toBe(before.token_hash);
   });
 
   it('opens no direct chat for a group member without the role', async () => {

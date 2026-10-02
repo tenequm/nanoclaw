@@ -217,7 +217,7 @@ ncl roles grant --user slack:<id> --role admin --group <agent group id>
 Tell the user:
 
 ```nc:operator
-In a chat wired to your agent (a direct chat with the bot is best), send /voice (on Slack: !voice). You get a private call link for that agent, and calls talk in that chat. Start the voice worker first (Run the worker, below).
+In a chat wired to your agent (a direct chat with the bot is best), send /voice (on Slack: !voice). The first time, you get a private call link for that agent (keep it: it is shown once), and calls talk in that chat. Later, /voice in another chat only moves calls there; /voice new replaces a lost link. Start the voice worker first (Run the worker, below).
 ```
 
 ## Run the worker
@@ -289,21 +289,24 @@ Each agent has one voice line. `/voice` (Telegram) or `!voice` (Slack, whose
 client eats unknown slash commands), sent in a chat wired to the agent by an
 owner or admin of it:
 
-- creates the line on first use, and mints a fresh call link every time: the
-  previous link stops working (only a hash of the link's token is stored, so an
-  old link cannot be shown again; running `/voice` is also how a lost or leaked
-  link is replaced);
 - makes that chat (and its thread, where the wiring keeps threads) the chat the
-  line's calls talk in;
-- makes the sender the line's caller: turns are posted as `🎙 <name>: <text>`
-  and handed to the agent as messages from that account;
-- sends the link to the sender: as the reply in a direct chat, by direct
-  message from a group chat, so other members never see it. The command never
-  reaches the agent.
+  line's calls talk in, and confirms it;
+- the first time, creates the line, mints its call link and sends it to the
+  sender: as the reply in a direct chat, by direct message from a group chat,
+  so other members never see it. Only a hash of the link's token is stored, so
+  the link cannot be shown again. The sender becomes the line's caller: turns
+  are posted as `🎙 <name>: <text>` and handed to the agent as messages from
+  that account;
+- later runs only move the call chat: the link, its caller and a live call stay
+  (the call carries on in the new chat).
 
-During a call every message the agent sends to that chat is spoken. Running
-`/voice` again ends a call made with the old link, as does the caller losing
-their role. If the chat stops being wired to the agent, calls fall back to the
+`/voice new` (`!voice new` on Slack) mints a fresh link instead, sent the same
+way: the old link stops working, a call made with it ends, and the sender
+becomes the caller. It is how a lost or leaked link is replaced. The command
+never reaches the agent.
+
+During a call every message the agent sends to that chat is spoken. A call
+also ends when the caller loses their role. If the chat stops being wired to the agent, calls fall back to the
 one chat of the `VOICE_MODE_MIRROR` channel type wired to the agent (or the one
 direct chat among several), and are refused when there is none.
 
@@ -418,10 +421,15 @@ to override. Desktop browsers use UDP.
 - **403 on the page.** The request came from a non-loopback address outside
   `VOICE_MODE_TRUSTED_PROXY_CIDRS`, or the forwarded client is outside
   `VOICE_MODE_ALLOWED_CLIENT_CIDRS`.
-- **"Unknown call link".** The link was replaced: every `/voice` mints a new
-  one. Use the newest link, or run `/voice` again.
-- **"Caller access denied".** The account that last ran `/voice` no longer has
-  an owner or admin role over the agent (`ncl roles list`).
+- **Lost the call link.** It cannot be shown again (only its hash is stored):
+  send `/voice new` (`!voice new` on Slack) for a fresh one; the old one stops
+  working.
+- **"Unknown call link".** The link was replaced by `/voice new`. Use the newest
+  link, or send `/voice new` again.
+- **"Caller access denied".** The account the link was minted for (the first
+  `/voice`, or the last `/voice new`) no longer has an owner or admin role over
+  the agent (`ncl roles list`); an admin sends `/voice new` to take the line
+  over.
 - **`/voice` says only an owner or admin can use it.** That chat account has no
   role over the agent; grant one with `ncl roles grant` (Who can make a call
   link, above). Each channel account is its own user.
