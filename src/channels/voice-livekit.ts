@@ -21,7 +21,8 @@
  *    agent still working, and when to end, with pings;
  *  - `POST agent/joined`     the caller is in the room; the clock starts here;
  *  - `POST agent/utterance`  one transcribed caller turn, fed to the agent as
- *    an inbound message with the id `livekit:<callId>:<n>`;
+ *    an inbound message with the id `livekit:<callId>:<n>`; answered 202 only
+ *    once the agent's session stored it, so the caller's "sent" mark is true;
  *  - `POST agent/ended`      the worker's session is over.
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
@@ -41,7 +42,7 @@ import type http from 'node:http';
 
 import { AccessToken, AgentDispatchClient, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
 
-import type { ChannelAdapter, InboundEvent, InboundMessage } from './adapter.js';
+import type { ChannelAdapter, InboundEvent } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
 import { callPageHtml, type VoiceUiConfig } from './gpt-live-call-page.js';
 import type { ResolveLineOptions, VoiceLine } from './gpt-live-prompt.js';
@@ -81,6 +82,12 @@ const WORKER_STREAM_TIMEOUT_MS = 30_000;
 /** A turn is at most 90 s of speech; Ukrainian runs about 4 KB of UTF-8 for that. */
 const MAX_UTTERANCE_BYTES = 8 * 1024;
 const MAX_UTTERANCES_PER_MINUTE = 20;
+/** The router has this long to store a turn in the agent's session: inside the worker's 10 s request timeout. */
+const ROUTE_TIMEOUT_MS = 8_000;
+/** Turns routing at once on a call. The worker sends one at a time, so more is a worker gone wrong. */
+const MAX_TURNS_IN_FLIGHT = 3;
+/** Outcomes a call keeps by the worker's turn key, so a retried turn is answered, not routed again. */
+const MAX_REMEMBERED_TURNS = 32;
 
 /** How the agent learns a message was spoken on a call and how its reply will be heard. */
 export const WALKIE_REPLY_NOTE =
@@ -181,6 +188,8 @@ export interface LiveKitVoiceConfig {
   joinTimeoutMs?: number;
   /** How long the worker has to open its event stream after reporting the caller in. */
   workerStreamTimeoutMs?: number;
+  /** How long a turn may take to reach the agent's session before the worker hears it timed out. */
+  routeTimeoutMs?: number;
   /** Test seam; defaults to the livekit-server-sdk clients. */
   api?: LiveKitServerApi;
 }
@@ -195,10 +204,11 @@ export interface LiveKitHost {
   chargeUsage(call: { platformId: string; startedAt: number }): void;
   /** Newest wins across engines: end any other engine's call on the line. */
   endOtherCalls(platformId: string, reason: string): void;
-  /** Hand a turn to the router; fire and forget, so a routing failure is logged there, not reported here. */
-  onInbound(platformId: string, message: InboundMessage): void;
-  /** Route a turn into the call chat, through the same inbound path the chat's own messages take. */
-  onInboundEvent(event: InboundEvent): void;
+  /**
+   * Route a turn through the host's inbound path, into the call chat or onto the voice line. Resolves
+   * true once the agent's session stored it, false when the router dropped it; rejects when routing threw.
+   */
+  routeTurn(event: InboundEvent): Promise<boolean>;
   isRunning(): boolean;
   now(): number;
   maxCallDurationMs: number;
@@ -228,6 +238,9 @@ interface LiveKitCall {
   /** Accepted utterance times (config clock), for the per-minute cap. */
   utteranceStarts: number[];
   utterances: number;
+  /** What became of each turn, by the worker's turn key; a retry gets the same answer. */
+  turnOutcomes: Map<string, Promise<TurnOutcome>>;
+  turnsInFlight: number;
   sent: number;
   /** Where the call talks; null while it talks on the voice line. Refreshed on join and every turn. */
   chat: CallChat | null;
@@ -240,6 +253,12 @@ interface LiveKitCall {
    */
   previousChat: { chat: CallChat; active: boolean } | null;
   cleanup?: Promise<void>;
+}
+
+/** The host's answer to one utterance POST. */
+interface TurnOutcome {
+  status: number;
+  body: string;
 }
 
 export interface LiveKitVoice {
@@ -404,6 +423,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const mirrorChannel = config.mirror && config.mirror !== 'off' ? config.mirror : null;
   const mirrorApi = config.mirrorApi ?? defaultMirrorApi;
   const joinTimeoutMs = config.joinTimeoutMs ?? 60_000;
+  const routeTimeoutMs = config.routeTimeoutMs ?? ROUTE_TIMEOUT_MS;
   const calls = new Map<string, LiveKitCall>();
   const cleanups = new Set<Promise<void>>();
   /** Per line, so transcripts land in the order they were spoken. */
@@ -665,6 +685,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       queue: [],
       utteranceStarts: [],
       utterances: 0,
+      turnOutcomes: new Map(),
+      turnsInFlight: 0,
       sent: 0,
       chat: null,
       chatRefreshes: 0,
@@ -788,7 +810,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     });
   };
 
-  /** One transcribed caller turn: the agent gets it as a spoken message in the call chat, which also shows it. */
+  /**
+   * One transcribed caller turn: the agent gets it as a spoken message in the call chat, which also
+   * shows it. Answered 202 only once the agent's session stored it; a worker that retries a turn
+   * under the same `turnKey` gets the first answer instead of a second copy for the agent.
+   */
   const onUtterance = async (
     res: http.ServerResponse,
     call: LiveKitCall,
@@ -800,6 +826,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (Buffer.byteLength(text) > MAX_UTTERANCE_BYTES) {
       return reply(res, 413, `utterance is too large (${MAX_UTTERANCE_BYTES / 1024} KB max)`);
     }
+    const turnKey = typeof body.turnKey === 'string' && body.turnKey.length <= 64 ? body.turnKey : undefined;
+    const known = turnKey && call.turnOutcomes.get(turnKey);
+    if (known) return answer(res, await known);
+    if (call.turnsInFlight >= MAX_TURNS_IN_FLIGHT) return reply(res, 429, 'Too many turns are still being routed');
     const t = host.now();
     call.utteranceStarts = call.utteranceStarts.filter((at) => at > t - MINUTE_MS);
     if (call.utteranceStarts.length >= MAX_UTTERANCES_PER_MINUTE) {
@@ -808,42 +838,87 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       });
     }
     call.utteranceStarts.push(t);
-    if (!(await checkAccess(call))) return reply(res, 403, 'Caller access denied');
-    if (!host.isRunning()) return reply(res, 503, 'The voice channel is shutting down');
+    call.turnsInFlight++;
+    const outcome = takeTurn(call, text).finally(() => call.turnsInFlight--);
+    if (turnKey) {
+      call.turnOutcomes.set(turnKey, outcome);
+      for (const key of call.turnOutcomes.keys()) {
+        if (call.turnOutcomes.size <= MAX_REMEMBERED_TURNS) break;
+        call.turnOutcomes.delete(key);
+      }
+    }
+    answer(res, await outcome);
+  };
+
+  const answer = (res: http.ServerResponse, outcome: TurnOutcome): void =>
+    reply(res, outcome.status, outcome.body, outcome.status === 202 ? JSON_HEADERS : {});
+
+  const takeTurn = async (call: LiveKitCall, text: string): Promise<TurnOutcome> => {
+    if (!(await checkAccess(call))) return { status: 403, body: 'Caller access denied' };
+    if (!host.isRunning()) return { status: 503, body: 'The voice channel is shutting down' };
     const chat = await refreshChat(call, true);
     // The call can end or be replaced while the chat lookups run; its turn must not reach the agent then.
-    if (call.ended || calls.get(call.platformId) !== call) return reply(res, 409, 'The call has ended');
+    if (call.ended || calls.get(call.platformId) !== call) return { status: 409, body: 'The call has ended' };
     const utteranceId = String(++call.utterances);
     // Always the line's own caller, wherever the call talks: the line is that person's, not whoever ran /voice.
     const sender = call.line.caller;
-    const message: InboundMessage = {
+    const message: InboundEvent['message'] = {
       id: liveKitUtteranceMessageId(call.callId, utteranceId),
       kind: 'chat',
-      content: {
+      content: JSON.stringify({
         text: walkieMessageText(text, chat ? WALKIE_CHAT_REPLY_NOTE : WALKIE_REPLY_NOTE),
         sender: sender.name,
         senderId: sender.id,
         livekit: { callId: call.callId, utteranceId },
-      },
+      }),
       timestamp: new Date().toISOString(),
       isMention: true,
       isGroup: chat ? chat.group.is_group !== 0 : false,
     };
+    const routed = host.routeTurn(
+      chat
+        ? {
+            channelType: chat.group.channel_type,
+            instance: chat.group.instance ?? chat.group.channel_type,
+            platformId: chat.group.platform_id,
+            threadId: chat.threadId,
+            // Addressed to the line's agent only, whoever else is wired to the chat and whatever its trigger.
+            agentGroupId: call.line.agentGroupId,
+            message,
+          }
+        : { channelType: 'voice', instance: 'voice', platformId: call.platformId, threadId: null, message },
+    );
+    // Shown once the agent has it, even when that comes after the worker was told it timed out.
     if (chat) {
-      host.onInboundEvent({
-        channelType: chat.group.channel_type,
-        instance: chat.group.instance ?? chat.group.channel_type,
-        platformId: chat.group.platform_id,
-        threadId: chat.threadId,
-        // Addressed to the line's agent only, whoever else is wired to the chat and whatever its trigger.
-        agentGroupId: call.line.agentGroupId,
-        message: { ...message, content: JSON.stringify(message.content) },
-      });
-      mirror(call.platformId, chat, `🎙 ${sender.name}: ${text}`);
-    } else {
-      host.onInbound(call.platformId, message);
+      void routed.then(
+        (stored) => {
+          if (stored) mirror(call.platformId, chat, `🎙 ${sender.name}: ${text}`);
+        },
+        () => undefined,
+      );
     }
-    reply(res, 202, JSON.stringify({ id: utteranceId }), JSON_HEADERS);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), routeTimeoutMs);
+      timer.unref();
+    });
+    const fields = { callId: call.callId, utteranceId };
+    try {
+      const stored = await Promise.race([routed, timedOut]);
+      if (stored === 'timeout') {
+        log.warn('livekit-voice: a turn did not reach the agent in time', fields);
+        return { status: 504, body: 'The turn did not reach the agent in time' };
+      }
+      if (!stored) {
+        log.warn('livekit-voice: the router did not hand a turn to the agent', fields);
+        return { status: 422, body: 'The agent did not take the turn' };
+      }
+      return { status: 202, body: JSON.stringify({ id: utteranceId }) };
+    } catch {
+      return { status: 500, body: 'Routing the turn failed' };
+    } finally {
+      clearTimeout(timer);
+    }
   };
 
   /** /webhook/voice/livekit/agent/*: the worker's side, authenticated by the per-call secret. */

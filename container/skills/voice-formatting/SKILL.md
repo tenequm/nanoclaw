@@ -44,6 +44,8 @@ code, details) goes depends on the note under the turn. A call on the voice line
 itself: put it in a separate written message to your chat, and say so in one
 spoken sentence. A call that talks in a chat: every message you send to that
 chat during the call is read aloud, so offer it for after the call instead.
+Only about the first 800 characters of a message are spoken: the rest is cut at
+a sentence and the caller hears that it is in the chat, so say what matters first.
 More turns can arrive while you work: the caller adding to
 what they said.
 

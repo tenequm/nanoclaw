@@ -678,6 +678,7 @@ async function deliverToAgent(
     content,
     trigger: wake,
   });
+  if (wake) event.onStored?.();
 
   if (wake && created) {
     // A brand-new engaged session: notify registered modules with the

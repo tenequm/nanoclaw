@@ -332,21 +332,18 @@ export function createGptLiveAdapter(config: GptLiveConfig): VoiceChannelAdapter
           // An OpenAI start still creating its session sees itself superseded and hangs up.
           pendingStarts.delete(platformId);
         },
-        // Fire and forget, as the host routes in the background (src/index.ts). The engine checks
-        // isRunning() first, so a missing setup is a teardown race and the turn is dropped.
-        onInbound: (platformId, message) => {
-          if (!setup) return log.warn('livekit-voice: channel is not running; turn dropped', { platformId });
-          Promise.resolve(setup.onInbound(platformId, null, message)).catch((err: unknown) =>
-            log.error('livekit-voice: routing a turn failed', { platformId, err }),
-          );
-        },
-        onInboundEvent: (event) => {
-          const fields = { agentGroupId: event.agentGroupId };
-          if (!setup) return log.warn('livekit-voice: channel is not running; turn dropped', fields);
-          Promise.resolve(setup.onInboundEvent(event)).catch((err: unknown) =>
-            log.error('livekit-voice: routing a turn failed', { ...fields, err }),
-          );
-        },
+        // Resolves once the agent's session stored the turn, or with false once routing ended without that.
+        routeTurn: (event) =>
+          new Promise<boolean>((resolve, reject) => {
+            if (!setup?.routeInboundEvent) return reject(new Error('the voice channel is not running'));
+            setup.routeInboundEvent({ ...event, onStored: () => resolve(true) }).then(
+              () => resolve(false),
+              (err: unknown) => {
+                log.error('livekit-voice: routing a turn failed', { platformId: event.platformId, err });
+                reject(err instanceof Error ? err : new Error(String(err)));
+              },
+            );
+          }),
         isRunning: () => connected,
         now,
         maxCallDurationMs,

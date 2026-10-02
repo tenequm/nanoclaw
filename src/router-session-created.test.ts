@@ -341,6 +341,32 @@ describe('an event addressed to one agent group', () => {
     expect(events).toHaveLength(1);
   });
 
+  it('reports through onStored that a session took it, and stays silent when nothing did', async () => {
+    await activate();
+    await seedWiring({});
+    const stored: string[] = [];
+    const turn = (agentGroupId: string) =>
+      routeInbound({
+        channelType: 'testchat',
+        platformId: 'testchat:C1',
+        threadId: null,
+        agentGroupId,
+        message: {
+          id: `livekit:call-1:${agentGroupId}`,
+          kind: 'chat',
+          content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text: 'spoken' }),
+          timestamp: now(),
+          isMention: true,
+          isGroup: false,
+        },
+        onStored: () => stored.push(agentGroupId),
+      });
+    await turn('ag-1');
+    // Addressed to an agent the chat is not wired to: routing ends without storing it anywhere.
+    await turn('ag-unwired');
+    expect(stored).toEqual(['ag-1']);
+  });
+
   it('puts no reaction ack on its host-made message id', async () => {
     await activate();
     await seedWiring({});
