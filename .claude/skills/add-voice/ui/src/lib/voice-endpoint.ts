@@ -1,5 +1,5 @@
 /** Resolve sibling routes for both /call and /call/ links, preserving proxy prefixes. */
-export function voiceEndpoint(route: "info" | "sdp" | "hangup", token: string, pageUrl = location.href): URL {
+export function voiceEndpoint(route: "info" | "sdp" | "hangup" | "livekit/token" | "livekit/end", token: string, pageUrl = location.href): URL {
   const page = new URL(pageUrl)
   page.pathname = page.pathname.replace(/\/+$/, "")
   const url = new URL(route, page)

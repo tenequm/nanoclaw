@@ -8,7 +8,8 @@ import { ShimmeringText } from "@/components/ui/shimmering-text"
 import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
-import { LIVE_PHASES, useVoiceCall, type Phase, type Speaker, type VoiceCall } from "@/lib/voice-call"
+import { LIVE_PHASES, useVoiceCall, type Phase, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
+import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
 
@@ -73,6 +74,26 @@ const HINT: Record<Phase, string> = {
   talking: "You can interrupt at any time.",
   ended: "Thanks for calling.",
   error: "Try again, or ask for a fresh link.",
+}
+
+// The walkie-talkie sends a turn when the caller pauses and plays each reply to the end.
+const WALKIE_HINT: Record<Phase, string> = {
+  ...HINT,
+  listening: "Go ahead. A pause sends what you said.",
+  talking: "Talk once the reply has finished.",
+}
+
+const LOST_REASON: Record<NonNullable<TurnMark["reason"]>, string> = {
+  stt: "not heard",
+  empty: "no words heard",
+  rejected: "refused",
+  rate_limited: "too many turns",
+  timeout: "no answer",
+}
+
+function markLabel(mark: TurnMark): string {
+  if (mark.status === "sent") return "sent"
+  return mark.reason ? `not sent · ${LOST_REASON[mark.reason]}` : "not sent"
 }
 
 /**
@@ -262,6 +283,7 @@ const TranscriptLine = memo(function TranscriptLine({
   isStreaming,
   agentName,
   showTs,
+  mark,
 }: {
   from: Speaker
   text: string
@@ -270,6 +292,7 @@ const TranscriptLine = memo(function TranscriptLine({
   isStreaming: boolean
   agentName: string
   showTs: boolean
+  mark?: TurnMark
 }) {
   return (
     <Message from={from} className={`py-1.5 ${isLast ? "is-live" : "is-history"}`}>
@@ -277,6 +300,7 @@ const TranscriptLine = memo(function TranscriptLine({
         <span className="speaker">
           {from === "user" ? "You" : agentName}
           {showTs && <span className="ts">{`${Math.floor(at / 60)}:${pad(at % 60)}`}</span>}
+          {mark && <span className={`turn-mark ${mark.status}`}>{markLabel(mark)}</span>}
         </span>
         <p>
           <StreamText text={text} />
@@ -297,9 +321,12 @@ export default function App() {
   const params = useMemo(() => new URLSearchParams(location.search), [])
   const token = params.get("t") || ""
   const demo = params.get("demo") === "1"
-  const realCall = useVoiceCall(demo ? "" : token, "your agent")
+  const walkie = cfg.transport === "livekit"
+  const realCall = useVoiceCall(demo || walkie ? "" : token, "your agent")
+  const walkieCall = useLiveKitCall(demo || !walkie ? "" : token, "your agent")
   const demoCall = useDemoCall(demo)
-  const call = demo ? demoCall : realCall
+  const call = demo ? demoCall : walkie ? walkieCall : realCall
+  const hints = walkie ? WALKIE_HINT : HINT
   const { phase, lines, streamingId, agentName, elapsed, muted, error, endedText } = call
   const live = LIVE_PHASES.has(phase)
   const skin = cfg.skin
@@ -373,16 +400,18 @@ export default function App() {
     phase === "idle" ? "idle" : phase === "ended" ? "ended" : phase === "error" ? "err" : phase === "listening" ? "you" : phase === "thinking" ? "think" : ""
   const hintText =
     phase === "error"
-      ? HINT.error
+      ? hints.error
       : muted && live
         ? "Your microphone is muted."
-        : phase === "ended"
+        : call.audioBlocked
+          ? "Tap anywhere to hear the call."
+          : phase === "ended"
           ? `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${lines.length} ${lines.length === 1 ? "turn" : "turns"} · ${
               endedText && endedText !== "Call ended." ? endedText.replace(/\.$/, "").toLowerCase() : "thanks for calling"
             }.`
           : phase === "thinking" && slowNote
             ? slowNote
-            : HINT[phase]
+            : hints[phase]
 
   const readout = (
     <span className={`state-chip ${chipClass}`} role="status" aria-live="polite">
@@ -422,7 +451,7 @@ export default function App() {
           <ConversationEmptyState title="Nothing said yet" description={live ? "Say hello to start." : phase === "ended" ? "Call again to keep talking." : `Press call to talk to ${agentName}.`} />
         ) : (
           lines.map((l, i) => (
-            <TranscriptLine key={l.id} from={l.from} text={l.text} at={l.at} isLast={i === lines.length - 1} isStreaming={l.id === streamingId} agentName={agentName} showTs={showTs} />
+            <TranscriptLine key={l.id} from={l.from} text={l.text} at={l.at} isLast={i === lines.length - 1} isStreaming={l.id === streamingId} agentName={agentName} showTs={showTs} mark={l.mark} />
           ))
         )}
       </ConversationContent>
@@ -500,6 +529,7 @@ export default function App() {
             <p className="agent-line">
               {live ? "On a call with " : phase === "connecting" ? "Calling " : phase === "ended" ? "Call ended with " : "Ready to call "}
               <strong>{agentName}</strong>
+              {call.chat && (live || phase === "connecting" || phase === "ended") && <span className="call-chat">{` → ${call.chat}`}</span>}
             </p>
           </div>
         </header>

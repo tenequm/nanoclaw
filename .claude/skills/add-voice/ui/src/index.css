@@ -892,6 +892,8 @@
 .voice-page[data-skin="te"][data-colorway="rabbit"] .screen .state-chip.you { color: #fff1e6; }
 
 /* timestamps, shortcut labels, footer row with swatches */
+.turn-mark { margin-left: 8px; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.04em; text-transform: none; color: var(--muted-foreground); }
+.turn-mark.lost { color: var(--coral); }
 .voice-page[data-skin="te"] .ts { margin-left: 8px; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.04em; color: #8a877f; text-transform: none; }
 .voice-page[data-skin="te"] kbd {
   display: none;

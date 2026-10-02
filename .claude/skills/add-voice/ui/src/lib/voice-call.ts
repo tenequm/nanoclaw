@@ -19,6 +19,13 @@ export interface Line {
   text: string
   /** Seconds into the call when the turn started. */
   at: number
+  /** Walkie-talkie only: whether this caller turn reached the agent. */
+  mark?: TurnMark
+}
+
+export interface TurnMark {
+  status: "sent" | "lost"
+  reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty"
 }
 
 interface LiveEvent {
@@ -48,6 +55,10 @@ export interface VoiceCall {
   inputLevel: React.RefObject<number>
   outputLevel: React.RefObject<number>
   audioRef: React.RefObject<HTMLAudioElement | null>
+  /** Walkie-talkie only: the chat the call talks in, as the host names it. */
+  chat?: string | null
+  /** Walkie-talkie only: the browser holds the agent's audio until the next tap. */
+  audioBlocked?: boolean
 }
 
 export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking", "talking"])
@@ -55,7 +66,7 @@ export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking",
 /** How long a WebRTC "disconnected" may last before the call is treated as dropped. */
 const DISCONNECT_GRACE_MS = 6000
 
-function errorText(status: number, body: string): string {
+export function errorText(status: number, body: string): string {
   if (status === 403) return "This call link is not valid."
   if (status === 429) return "This line has reached its hourly call limit. Try again later."
   if (status === 503) return "The voice line is offline right now."
@@ -87,7 +98,7 @@ function waitForIce(pc: RTCPeerConnection): Promise<void> {
  * the model receives silence while the page still looks connected. The sender's
  * `media-source` report gives the same number with nothing attached to the track.
  */
-function levelsFromStats(report: RTCStatsReport): { mic: number | null; agent: number | null } {
+export function levelsFromStats(report: RTCStatsReport): { mic: number | null; agent: number | null } {
   let mic: number | null = null
   let agent: number | null = null
   report.forEach((entry) => {
@@ -103,7 +114,7 @@ function levelsFromStats(report: RTCStatsReport): { mic: number | null; agent: n
 }
 
 /** What went wrong reaching the microphone, in words a caller can act on. */
-function micErrorText(err: unknown): string | null {
+export function micErrorText(err: unknown): string | null {
   if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
     return location.protocol === "https:" || location.hostname === "localhost"
       ? "This browser will not give a page access to the microphone."

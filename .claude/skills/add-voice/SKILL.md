@@ -362,7 +362,8 @@ To uninstall: see [REMOVE.md](REMOVE.md).
 
 The page callers open is a small React app. Its maintainer sources live at
 `.claude/skills/add-voice/ui/` beside the generated payload (in this fork: vendored
-unchanged from upstream `feat/voice-payload`, PR #3772, at `324d7445`; MIT, see
+from upstream `feat/voice-payload`, PR #3772, at `324d7445`, plus the LiveKit
+walkie-talkie transport in `ui/src/lib/livekit-call.ts`; MIT, see
 `ui/THIRD_PARTY_NOTICES.md`):
 Teenage Engineering inspired, one screen beside a rail of keys, a dot-matrix
 display that shows the caller's voice in white, thinking in orange and the
@@ -389,6 +390,9 @@ GPT_LIVE_UI={"colorway":"field","presence":"matrix","brand":"Casa line"}
 | `shortcuts`      | print `esc` and `space` on the keys (desktop)           | `true`                                     |
 | `timestamps`     | time into the call on each transcript turn              | `true`                                     |
 | `colorwayPicker` | let callers pick a finish from the page                 | `true`                                     |
+
+The LiveKit page (`/livekit`) defaults its footer to `Walkie-talkie over LiveKit · answers by {agent}`;
+a `footer` set here applies to both pages.
 
 Callers can also switch the finish from the three dots under the transcript;
 the choice stays in their browser. To change the components themselves, edit
@@ -596,14 +600,21 @@ talks on the voice line itself as before (replies come back by their
 `livekit:` reply id, nothing is posted) and the host logs why once. The
 OpenAI (`/call`) and Gemini Live (`/gemini`) pages always talk on the voice line.
 
-The page loads `livekit-client` from the host itself (`/webhook/voice/livekit/client.js`),
-no CDN. Its status line shows Listening, Sending..., `<agent>` is thinking or
-`<agent>` is speaking, and the captions show `You: <transcript>` and
-`<agent>: <reply>` as the worker sends them. Microphone capture runs with echo
-cancellation, noise suppression and auto gain; DTX is off because the worker
-times turns by the silence it hears. On iOS Safari the call must be started with
-the Call button (audio unlocks on that tap) and joins relay-only (TURN over
-TLS); if playback is still blocked a "Tap to hear the call" button appears.
+The LiveKit page is the same React call page as `/call` (one build from `ui/`),
+served with `transport: "livekit"` in its injected config and the same
+`GPT_LIVE_UI` look; `livekit-client` and `@livekit/components-react` are bundled
+into it, no CDN. Its readout follows the worker: Listening, Asking `<agent>`...
+while `nanoclaw.walkie.thinking` is set, and Speaking; captions come from
+`lk.transcription` (the caller's interim text shows live), and each caller turn
+gets a small sent / not-sent mark from the worker's `nanoclaw.walkie.turn`
+stream. The header names the chat the call talks in. Microphone capture runs
+with echo cancellation, noise suppression and auto gain; DTX is off because the
+worker times turns by the silence it hears. On iOS Safari the call must be
+started with the Call button (audio unlocks on that tap) and joins relay-only
+(TURN over TLS; `?relay=1` / `?relay=0` override it); if playback is still
+blocked the hint asks for a tap anywhere. With no worker in the room after 25
+seconds, or a worker on another protocol version, the page says the voice
+service is updating.
 
 ## Channel Info
 
