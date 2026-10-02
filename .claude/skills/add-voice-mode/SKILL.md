@@ -588,7 +588,7 @@ TTS, captions and the agent state are the framework's. Then:
   after the host took that turn, unless a reply to it came first. When the agent
   is still busy with an earlier turn, its runner's next re-mark (every 5 s) can
   stand in for the pickup, so "working" there means "working, with your turn in
-  hand", not "on your turn".
+  hand", not "on your turn". The call page takes no action on it.
 - Right before each line it speaks, the worker sends one JSON message on
   `nanoclaw.voice.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
   true, "notice"?: true, "more"?: true}`. `turn` is the caller turn the agent
@@ -729,8 +729,8 @@ clears the session's own turn, which restarts its transcription, and a new
 Gemini Live stream takes no audio until its setup completes: until then the
 state says `"preparing": true`, the page keeps talk off ("getting ready"), and
 the worker answers a talk only once the stream reads audio (at most 3 s), so the
-microphone never opens onto a stream that would lose the first words. Send posts exactly that text through the ordinary turn
-path, and its `sending` status carries the text and the draft id, so the page
+microphone never opens onto a stream that is still connecting. Send posts
+exactly that text through the ordinary turn path, and its `sending` status carries the text and the draft id, so the page
 shows that text as the turn. A draft over the 8 KB turn limit cannot be sent.
 A reply that waits out a recording (the usual bounded wait) takes the channel
 and turns the recording into a draft ("`<agent>` started speaking - review what

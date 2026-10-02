@@ -430,8 +430,8 @@ export class GeminiTranscribeSTT extends stt.STT {
  * The streaming transcription, saying when each stream it opens starts taking audio. Gemini's
  * stream reads its input only once `live.connect` has resolved, which @google/genai holds until the
  * server's setupComplete; audio pushed before that waits in the stream's queue and reaches the model
- * in a burst, which is how the first words after a restart got lost. `onReading` gets the stream's
- * number (1, 2, ... in opening order) the first time it reads.
+ * late, in a burst. Review talk waits for this so the caller never speaks into a stream still
+ * connecting. `onReading` gets the stream's number (1, 2, ... in opening order) the first time it reads.
  */
 export class ReadyingGeminiSTT extends google.beta.GeminiSTT {
   private opened = 0;
