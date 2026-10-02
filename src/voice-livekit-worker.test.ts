@@ -1,5 +1,5 @@
 /**
- * The walkie-talkie worker: the walkie rules (turn order, reply gating, thinking, failure
+ * The voice call worker: the turn-taking rules (turn order, reply gating, thinking, failure
  * lines) against fake host and voice, the unary Gemini transcription against a fake fetch, the
  * text helpers, and runCall end to end with a fake room and session. The LiveKit session,
  * Silero and Gemini themselves are not loaded here.
@@ -50,8 +50,8 @@ import {
   TtsFallback,
   TURN_SETTLE_MS,
   TurnCapture,
-  Walkie,
-  walkieSession,
+  TurnTaking,
+  callSession,
   wholeReplySpeech,
   writeTurnRecording,
   type CallJob,
@@ -62,7 +62,7 @@ import {
   type TurnTake,
   type SendResult,
   type VoiceSettings,
-  type WalkieDeps,
+  type TurnTakingDeps,
 } from './voice-livekit-worker.js';
 
 initializeLogger({ pretty: false, level: 'error' });
@@ -166,7 +166,7 @@ describe('helpers', () => {
     expect(CUT_LINES.no_chat).toEqual({ uk: 'Скорочую.', en: "I've cut it short." });
   });
 
-  it('reads WALKIE_MAX_SPOKEN_CHARS, with 0 for no cap', () => {
+  it('reads VOICE_MAX_SPOKEN_CHARS, with 0 for no cap', () => {
     expect(maxSpokenChars(undefined)).toBe(DEFAULT_MAX_SPOKEN_CHARS);
     expect(DEFAULT_MAX_SPOKEN_CHARS).toBe(800);
     expect(maxSpokenChars(' 400 ')).toBe(400);
@@ -256,11 +256,11 @@ describe('GeminiTranscribeSTT', () => {
   });
 });
 
-function fakeWalkieDeps(overrides: Partial<WalkieDeps> = {}) {
+function fakeTurnTakingDeps(overrides: Partial<TurnTakingDeps> = {}) {
   const said: string[] = [];
   const sent: string[] = [];
   const statuses: boolean[] = [];
-  const deps: WalkieDeps = {
+  const deps: TurnTakingDeps = {
     send: vi.fn(async (text: string) => {
       sent.push(text);
       return { accepted: true, id: String(sent.length) };
@@ -276,19 +276,19 @@ function fakeWalkieDeps(overrides: Partial<WalkieDeps> = {}) {
   return { deps, said, sent, statuses };
 }
 
-describe('Walkie', () => {
+describe('TurnTaking', () => {
   it('sends turns in order and shows thinking until a reply, then speaks it as plain text', async () => {
     vi.useFakeTimers();
-    const { deps, said, sent, statuses } = fakeWalkieDeps();
-    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
+    const { deps, said, sent, statuses } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
     const results: unknown[] = [];
-    walkie.onTurn('book a table', (r) => results.push(r));
-    walkie.onTurn('for two');
+    turnTaking.onTurn('book a table', (r) => results.push(r));
+    turnTaking.onTurn('for two');
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['book a table', 'for two']);
     expect(results).toEqual([{ accepted: true, id: '1' }]);
     expect(statuses).toEqual([false, true]);
-    walkie.onReply('**Booked** for [eight](https://x.y).');
+    turnTaking.onReply('**Booked** for [eight](https://x.y).');
     await vi.advanceTimersByTimeAsync(1);
     expect(said).toEqual(['Booked for eight.']);
     expect(statuses.at(-1)).toBe(false);
@@ -296,20 +296,20 @@ describe('Walkie', () => {
 
   it("caps every spoken message, closing in the caller's latest language", async () => {
     vi.useFakeTimers();
-    const { deps, said } = fakeWalkieDeps();
-    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 20 });
-    walkie.onTurn('what is new');
+    const { deps, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 20 });
+    turnTaking.onTurn('what is new');
     await vi.advanceTimersByTimeAsync(SILENCE + TURN_SETTLE_MS);
-    walkie.onReply('Two things now. A **third** one that is long.');
-    walkie.onReply('Fits.');
+    turnTaking.onReply('Two things now. A **third** one that is long.');
+    turnTaking.onReply('Fits.');
     await vi.advanceTimersByTimeAsync(1);
     // No `chat` event yet: the call talks on the voice line, where no chat holds the rest.
     expect(said).toEqual([`Two things now. ${CUT_LINES.no_chat.en}`, 'Fits.']);
-    walkie.onChat(true);
-    walkie.onReply('Two things now. A third one that is long.');
+    turnTaking.onChat(true);
+    turnTaking.onReply('Two things now. A third one that is long.');
     await vi.advanceTimersByTimeAsync(1);
     expect(said.at(-1)).toBe(`Two things now. ${CUT_LINES.chat.en}`);
-    const uncapped = new Walkie(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 0 });
+    const uncapped = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 0 });
     uncapped.onReply('Two things. A third one that is long.');
     await vi.advanceTimersByTimeAsync(1);
     expect(said.at(-1)).toBe('Two things. A third one that is long.');
@@ -317,11 +317,11 @@ describe('Walkie', () => {
 
   it('drops thinking after a while without typing ticks, and holds it while they come', async () => {
     vi.useFakeTimers();
-    const { deps, statuses } = fakeWalkieDeps();
-    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
-    walkie.onTurn('thanks');
+    const { deps, statuses } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.onTurn('thanks');
     await vi.advanceTimersByTimeAsync(AWAIT_REPLY_MS - 1000);
-    walkie.onThinking();
+    turnTaking.onThinking();
     await vi.advanceTimersByTimeAsync(5000);
     expect(statuses.at(-1)).toBe(true);
     await vi.advanceTimersByTimeAsync(6000);
@@ -330,24 +330,24 @@ describe('Walkie', () => {
 
   it('holds a reply while the caller talks and until their turn could still be committed', async () => {
     vi.useFakeTimers();
-    const { deps, said } = fakeWalkieDeps();
-    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
-    walkie.onCallerSpeaking(true);
-    walkie.onReply('First.');
+    const { deps, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.onCallerSpeaking(true);
+    turnTaking.onReply('First.');
     await vi.advanceTimersByTimeAsync(4000);
     expect(said).toEqual([]);
-    walkie.onCallerSpeaking(false);
+    turnTaking.onCallerSpeaking(false);
     await vi.advanceTimersByTimeAsync(SILENCE);
     expect(said).toEqual([]);
     // The committed turn frees the channel at once.
-    walkie.onTurn('and another thing');
+    turnTaking.onTurn('and another thing');
     await vi.advanceTimersByTimeAsync(1);
     expect(said).toEqual(['First.']);
 
     // A caller who stops and never gets a turn committed (a cough) frees it after the settle time.
-    walkie.onCallerSpeaking(true);
-    walkie.onCallerSpeaking(false);
-    walkie.onReply('Second.');
+    turnTaking.onCallerSpeaking(true);
+    turnTaking.onCallerSpeaking(false);
+    turnTaking.onReply('Second.');
     await vi.advanceTimersByTimeAsync(SILENCE + TURN_SETTLE_MS - 10);
     expect(said).toEqual(['First.']);
     await vi.advanceTimersByTimeAsync(20);
@@ -356,10 +356,10 @@ describe('Walkie', () => {
 
   it('lets a reply take the channel from a caller who never stops', async () => {
     vi.useFakeTimers();
-    const { deps, said } = fakeWalkieDeps();
-    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
-    walkie.onCallerSpeaking(true);
-    walkie.onReply('Done.');
+    const { deps, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.onCallerSpeaking(true);
+    turnTaking.onReply('Done.');
     await vi.advanceTimersByTimeAsync(SILENCE + MAX_IDLE_WAIT_MS - 10);
     expect(said).toEqual([]);
     await vi.advanceTimersByTimeAsync(20);
@@ -367,14 +367,14 @@ describe('Walkie', () => {
   });
 
   it("says it didn't catch a turn the STT lost, in the caller's language, once", async () => {
-    const { deps, said } = fakeWalkieDeps();
-    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
-    walkie.onTurnLost('empty');
-    walkie.onTurnLost('empty');
-    await walkie.idle();
+    const { deps, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.onTurnLost('empty');
+    turnTaking.onTurnLost('empty');
+    await turnTaking.idle();
     expect(said).toEqual([FAILURE_LINES.turn.uk]);
-    walkie.onTurnLost('stt');
-    await walkie.idle();
+    turnTaking.onTurnLost('stt');
+    await turnTaking.idle();
     expect(said).toEqual([FAILURE_LINES.turn.uk, FAILURE_LINES.turn.uk]);
   });
 
@@ -386,15 +386,15 @@ describe('Walkie', () => {
       { accepted: false, error: 'The operation was aborted due to timeout' },
       { accepted: false, status: 504 },
     ];
-    const { deps, said } = fakeWalkieDeps({ send: async () => answers.shift() ?? { accepted: true } });
-    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
+    const { deps, said } = fakeTurnTakingDeps({ send: async () => answers.shift() ?? { accepted: true } });
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
     for (const text of ['what about the logs', 'and the disk', 'а диск', 'і пам’ять']) {
-      walkie.onTurn(text);
-      await walkie.idle();
+      turnTaking.onTurn(text);
+      await turnTaking.idle();
     }
-    walkie.onChat(true);
-    walkie.onTurn('а мережа');
-    await walkie.idle();
+    turnTaking.onChat(true);
+    turnTaking.onTurn('а мережа');
+    await turnTaking.idle();
     expect(said).toEqual([
       FAILURE_LINES.rate_limited.en,
       FAILURE_LINES.rejected.en,
@@ -412,7 +412,7 @@ describe('Walkie', () => {
   it('says so when a reply could not be synthesized, and keeps speaking after a failure', async () => {
     const said: string[] = [];
     let calls = 0;
-    const { deps } = fakeWalkieDeps({
+    const { deps } = fakeTurnTakingDeps({
       say: async (text) => {
         calls++;
         if (calls === 1) return false;
@@ -421,29 +421,29 @@ describe('Walkie', () => {
         return true;
       },
     });
-    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'en' });
-    walkie.onReply('Reply one.');
-    await walkie.idle();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'en' });
+    turnTaking.onReply('Reply one.');
+    await turnTaking.idle();
     expect(said).toEqual([FAILURE_LINES.reply.en]);
-    walkie.onReply('Reply two.');
-    walkie.onReply('Reply three.');
-    await walkie.idle();
+    turnTaking.onReply('Reply two.');
+    turnTaking.onReply('Reply three.');
+    await turnTaking.idle();
     expect(said).toEqual([FAILURE_LINES.reply.en, 'Reply three.']);
   });
 
   it('describes each line before it is spoken: the turn it answers, unprompted, or its own notice', async () => {
     vi.useFakeTimers();
     const announced: unknown[] = [];
-    const { deps, said } = fakeWalkieDeps({
+    const { deps, said } = fakeTurnTakingDeps({
       announce: (info) => announced.push({ ...info, before: said.length }),
     });
-    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'en' });
-    walkie.onReply('One.', 3);
-    walkie.onReply('Two.', 3);
-    walkie.onReply('Three.', null);
-    await walkie.idle();
-    walkie.onTurnLost('stt');
-    await walkie.idle();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'en' });
+    turnTaking.onReply('One.', 3);
+    turnTaking.onReply('Two.', 3);
+    turnTaking.onReply('Three.', null);
+    await turnTaking.idle();
+    turnTaking.onTurnLost('stt');
+    await turnTaking.idle();
     expect(said).toEqual(['One.', 'Two.', 'Three.', FAILURE_LINES.turn.en]);
     expect(announced).toEqual([
       // Queued together, so each but the last knows another line follows it.
@@ -455,13 +455,13 @@ describe('Walkie', () => {
   });
 
   it('stays silent once closed', async () => {
-    const { deps, said, sent } = fakeWalkieDeps();
-    const walkie = new Walkie(deps, { silenceMs: SILENCE, language: 'uk' });
-    walkie.close();
-    walkie.onTurn('hello');
-    walkie.onReply('Hi.');
-    walkie.onTurnLost('empty');
-    await walkie.idle();
+    const { deps, said, sent } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.close();
+    turnTaking.onTurn('hello');
+    turnTaking.onReply('Hi.');
+    turnTaking.onTurnLost('empty');
+    await turnTaking.idle();
     expect(sent).toEqual([]);
     expect(said).toEqual([]);
   });
@@ -507,7 +507,7 @@ const META: LiveKitJobMetadata = {
 };
 
 describe('job metadata', () => {
-  it('takes only a walkie-talkie call of this version as a call to run', () => {
+  it('takes only a voice call of this version as a call to run', () => {
     expect(() => parseJobMetadata('{}')).toThrow();
     expect(() => parseJobMetadata('not json')).toThrow();
     expect(() => parseJobMetadata(JSON.stringify({ ...META, v: 2 }))).toThrow();
@@ -811,7 +811,7 @@ describe('runCall', () => {
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(true);
   });
 
-  it('ends a job of this version that is not a whole walkie-talkie call, and tells the host', async () => {
+  it('ends a job of this version that is not a whole voice call, and tells the host', async () => {
     const { job, ctx } = fakeJob({ ...META, agentName: '' });
     const host = fakeHostFetch();
     const v = fakeVoice();
@@ -831,7 +831,7 @@ describe('runCall', () => {
   });
 
   it('records each turn with its outcome once the host answered, when recordings are on', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'walkie-rec-'));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-rec-'));
     try {
       const { ctx } = fakeJob();
       const host = fakeHostFetch();
@@ -839,7 +839,7 @@ describe('runCall', () => {
       await runCall(
         ctx,
         deps(host.fetchImpl, v.createVoice, {
-          env: { ...ENV, WALKIE_RECORDINGS_DAYS: '7' },
+          env: { ...ENV, VOICE_RECORDINGS_DAYS: '7' },
           recordingsRoot: root,
         }),
       );
@@ -985,7 +985,7 @@ describe('turn recordings', () => {
   });
 
   it('writes owner-only files under agent and day, and prunes old ones with their empty folders', async () => {
-    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'walkie-rec-')), 'voice-recordings');
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'voice-rec-')), 'voice-recordings');
     try {
       const record: TurnRecord = {
         callId: 'c/../1',
@@ -1169,13 +1169,10 @@ describe('speech and transcription adapters', () => {
       onTurnDropped: () => undefined,
       onClosed: () => undefined,
     };
-    const { session } = walkieSession(
-      META,
-      { geminiKey: 'gk-test', record: false },
-      { vad, fallbackVad: vad },
-      events,
-      { ...silentLog, error: () => undefined },
-    );
+    const { session } = callSession(META, { geminiKey: 'gk-test', record: false }, { vad, fallbackVad: vad }, events, {
+      ...silentLog,
+      error: () => undefined,
+    });
     const primary = new ControlledSTT('primary');
     const fallback = new ControlledSTT('fallback');
     const adapter = new stt.FallbackAdapter({ sttInstances: [primary, fallback] });
@@ -1192,7 +1189,7 @@ describe('speech and transcription adapters', () => {
       await vi.waitFor(() => expect(primary.streams).toHaveLength(1));
       primary.streams[0].fail();
       await vi.waitFor(() => expect(fallback.streams).toHaveLength(1));
-      // The adapter's probe hears the streaming model again; the walkie hands back at a pause.
+      // The adapter's probe hears the streaming model again; the call hands back at a pause.
       await vi.waitFor(() => expect(primary.streams).toHaveLength(2));
       primary.streams[1].say('back');
       await vi.waitFor(() => expect(adapter.status[0].available).toBe(true));

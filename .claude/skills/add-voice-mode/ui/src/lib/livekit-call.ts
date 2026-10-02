@@ -29,7 +29,7 @@ import {
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
- * The browser side of a LiveKit walkie-talkie call, behind the VoiceCall shape
+ * The browser side of a LiveKit voice call, behind the VoiceCall shape
  * the page renders (the `?demo=1` script has the same shape).
  *
  * The host's routes next to the page mint the room token (`livekit/token`) and
@@ -39,11 +39,11 @@ import { voiceEndpoint } from "./voice-endpoint"
  */
 
 /** "1" while nanoclaw's agent works on a turn: the worker's session has no LLM, so it never thinks itself. */
-const THINKING_ATTR = "nanoclaw.walkie.thinking"
+const THINKING_ATTR = "nanoclaw.voice.thinking"
 /** "1" when the worker cannot serve this host's protocol version. */
-const UPDATING_ATTR = "nanoclaw.walkie.updating"
-/** One JSON WalkieTurnStatus per caller turn. */
-const TURN_TOPIC = "nanoclaw.walkie.turn"
+const UPDATING_ATTR = "nanoclaw.voice.updating"
+/** One JSON CallTurnStatus per caller turn. */
+const TURN_TOPIC = "nanoclaw.voice.turn"
 /** Without a worker in the room after this long, it is down or mid-update (host and worker restart together). */
 const AGENT_JOIN_MS = 25_000
 const UPDATING = "The voice service is updating. Try again in a minute."
@@ -51,10 +51,10 @@ const NO_AGENT = "The voice service did not answer the call."
 /** How long a failed mute or unmute shows on the key. */
 const MUTE_ERROR_MS = 4000
 /** "<n>:<elapsedMs>:<silenceMs>" while a stopped caller's turn waits out the silence that sends it. */
-const PENDING_ATTR = "nanoclaw.walkie.pending"
-/** One JSON WalkieReplyInfo right before each line the worker speaks. */
-const REPLY_TOPIC = "nanoclaw.walkie.reply"
-/** What the page says for each WalkieRoomMetadata.end the host sets before it deletes the room. */
+const PENDING_ATTR = "nanoclaw.voice.pending"
+/** One JSON CallReplyInfo right before each line the worker speaks. */
+const REPLY_TOPIC = "nanoclaw.voice.reply"
+/** What the page says for each CallRoomMetadata.end the host sets before it deletes the room. */
 const END_TEXT: Record<string, string> = {
   limit_duration: "The call reached its time limit.",
   limit_daily: "Today's call minutes are used up.",
@@ -83,7 +83,7 @@ function isReplyInfo(v: unknown): v is ReplyInfo {
   return !!v && typeof (v as ReplyInfo).reply === "number"
 }
 
-/** The host's WalkieRoomMetadata, or null when the room carries none of ours. */
+/** The host's CallRoomMetadata, or null when the room carries none of ours. */
 function readRoomMetadata(metadata: string | undefined): { chat?: unknown; end?: unknown } | null {
   if (!metadata) return null
   try {
@@ -146,7 +146,7 @@ function tokenError(status: number, body: string): CallError {
  * LiveKit's fallback timers fire; going straight to TURN/TLS connects at once.
  * `?relay=1` / `?relay=0` overrides the iOS default.
  */
-/** Walkie sound cues are on unless the link says `?cues=0`. */
+/** Call sound cues are on unless the link says `?cues=0`. */
 function cuesEnabled(): boolean {
   return new URLSearchParams(location.search).get("cues") !== "0"
 }
@@ -389,7 +389,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       if (active.current) setReconnecting(true)
     }
     const onReconnected = () => setReconnecting(false)
-    // The host rewrites the room metadata when a mid-call /voice moves the call (WalkieRoomMetadata).
+    // The host rewrites the room metadata when a mid-call /voice moves the call (CallRoomMetadata).
     const onMetadata = (metadata: string | undefined) => {
       const m = readRoomMetadata(metadata)
       if (!active.current || !m) return

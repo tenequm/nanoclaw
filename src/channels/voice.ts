@@ -25,7 +25,7 @@ import { registerChannelAdapter } from './channel-registry.js';
 import type { VoiceUiConfig } from './voice-call-page.js';
 import { resolveVoiceLine, type ResolveLineOptions, type VoiceLine } from './voice-line.js';
 import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-livekit.js';
-import { DEFAULT_WALKIE_MIRROR } from './voice-livekit-protocol.js';
+import { DEFAULT_VOICE_MIRROR } from './voice-livekit-protocol.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
@@ -419,12 +419,12 @@ export function parseUiConfig(raw: string | undefined): VoiceUiConfig | undefine
   return undefined;
 }
 
-/** WALKIE_SILENCE_MS: how long the caller is silent before their turn ends; nonsense falls back to the default. */
-function parseWalkieSilenceMs(raw: string | undefined): number | undefined {
+/** VOICE_SILENCE_MS: how long the caller is silent before their turn ends; nonsense falls back to the default. */
+function parseSilenceMs(raw: string | undefined): number | undefined {
   if (!raw?.trim()) return undefined;
   const ms = Number(raw);
   if (Number.isInteger(ms) && ms >= 300 && ms <= 30_000) return ms;
-  log.warn('voice: WALKIE_SILENCE_MS must be whole milliseconds between 300 and 30000; using the default');
+  log.warn('voice: VOICE_SILENCE_MS must be whole milliseconds between 300 and 30000; using the default');
   return undefined;
 }
 
@@ -447,13 +447,13 @@ registerChannelAdapter(CHANNEL_TYPE, {
       ...LIVEKIT_REQUIRED,
       'LIVEKIT_WORKER_URL',
       'LIVEKIT_AGENT_NAME',
-      'WALKIE_STT_MODEL',
-      'WALKIE_STT_FALLBACK_MODEL',
-      'WALKIE_TTS_MODEL',
-      'WALKIE_TTS_FALLBACK_MODEL',
-      'WALKIE_TTS_VOICE',
-      'WALKIE_SILENCE_MS',
-      'WALKIE_MIRROR',
+      'VOICE_STT_MODEL',
+      'VOICE_STT_FALLBACK_MODEL',
+      'VOICE_TTS_MODEL',
+      'VOICE_TTS_FALLBACK_MODEL',
+      'VOICE_TTS_VOICE',
+      'VOICE_SILENCE_MS',
+      'VOICE_MIRROR',
     ]);
     if (!env.VOICE_LINK_TOKEN) {
       if (env.LIVEKIT_URL) log.warn('voice: VOICE_LINK_TOKEN is not set; the channel stays offline');
@@ -488,15 +488,15 @@ registerChannelAdapter(CHANNEL_TYPE, {
         apiKey: env.LIVEKIT_API_KEY,
         apiSecret: env.LIVEKIT_API_SECRET,
         agentName: env.LIVEKIT_AGENT_NAME,
-        walkie: {
-          sttModel: env.WALKIE_STT_MODEL,
-          sttFallbackModel: env.WALKIE_STT_FALLBACK_MODEL,
-          ttsModel: env.WALKIE_TTS_MODEL,
-          ttsFallbackModel: env.WALKIE_TTS_FALLBACK_MODEL,
-          ttsVoice: env.WALKIE_TTS_VOICE,
-          silenceMs: parseWalkieSilenceMs(env.WALKIE_SILENCE_MS),
+        speech: {
+          sttModel: env.VOICE_STT_MODEL,
+          sttFallbackModel: env.VOICE_STT_FALLBACK_MODEL,
+          ttsModel: env.VOICE_TTS_MODEL,
+          ttsFallbackModel: env.VOICE_TTS_FALLBACK_MODEL,
+          ttsVoice: env.VOICE_TTS_VOICE,
+          silenceMs: parseSilenceMs(env.VOICE_SILENCE_MS),
         },
-        mirror: (env.WALKIE_MIRROR || DEFAULT_WALKIE_MIRROR).trim().toLowerCase(),
+        mirror: (env.VOICE_MIRROR || DEFAULT_VOICE_MIRROR).trim().toLowerCase(),
       },
     });
   },

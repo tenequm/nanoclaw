@@ -14,7 +14,7 @@ import type { PortableMigration } from './index.js';
  * (messaging group + thread) wired to the line's agent, where each transcribed
  * turn of a call is routed as a message from the line's own caller. The last
  * `/voice` from any owner account wins. Both target columns stay null until
- * then, and the default rule (WALKIE_MIRROR) picks the chat.
+ * then, and the default rule (VOICE_MIRROR) picks the chat.
  *
  * No foreign keys: a row whose chat was deleted, unwired or denied is ignored
  * by the reader (src/channels/voice-livekit.ts), never an integrity error.

@@ -26,13 +26,13 @@
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
  * line: the chat any of the line's owner accounts last ran `/voice` in (voice_lines), else the
- * one chat of the WALKIE_MIRROR channel type wired to the agent
+ * one chat of the VOICE_MIRROR channel type wired to the agent
  * (pickMirrorTarget). Each turn is routed into that chat's session through the
  * normal inbound path as a message from the line's own caller, addressed to
  * the line's agent only; the transcript is posted into the chat, and the agent
  * answers there as it always does. While the call is live, every message the
  * agent delivers to that chat is also spoken, and its typing there is the
- * worker's `thinking`. With no call chat (WALKIE_MIRROR off,
+ * worker's `thinking`. With no call chat (VOICE_MIRROR off,
  * or no single chat to pick) the call talks on the voice line itself, and the
  * agent's replies come back through deliver() by their `livekit:` reply id.
  */
@@ -47,20 +47,20 @@ import { callPageHtml, type VoiceUiConfig } from './voice-call-page.js';
 import { sameCallerAndAgent, type ResolveLineOptions, type VoiceLine } from './voice-line.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
-  DEFAULT_WALKIE_SILENCE_MS,
-  DEFAULT_WALKIE_STT_FALLBACK_MODEL,
-  DEFAULT_WALKIE_STT_MODEL,
-  DEFAULT_WALKIE_TTS_FALLBACK_MODEL,
-  DEFAULT_WALKIE_TTS_MODEL,
-  DEFAULT_WALKIE_TTS_VOICE,
+  DEFAULT_VOICE_SILENCE_MS,
+  DEFAULT_VOICE_STT_FALLBACK_MODEL,
+  DEFAULT_VOICE_STT_MODEL,
+  DEFAULT_VOICE_TTS_FALLBACK_MODEL,
+  DEFAULT_VOICE_TTS_MODEL,
+  DEFAULT_VOICE_TTS_VOICE,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   PING_INTERVAL_MS,
   WORKER_REQUEST_TIMEOUT_MS,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
-  type WalkieEndReason,
-  type WalkieRoomMetadata,
+  type CallEndReason,
+  type CallRoomMetadata,
 } from './voice-livekit-protocol.js';
 import {
   getMessagingGroup,
@@ -95,24 +95,24 @@ const MAX_TURN_KEY_LENGTH = 64;
 const END_NOTICE_TIMEOUT_MS = 2_000;
 
 /** The transcription takes its language codes as a hint only, so a Ukrainian turn can come out in Russian spelling. */
-export const WALKIE_LANGUAGE_NOTE =
+export const CALL_LANGUAGE_NOTE =
   'The caller speaks Ukrainian or English; a transcript that looks Russian is Ukrainian misspelled by speech ' +
   'recognition, so answer in Ukrainian (in English if the caller spoke English), never in Russian.';
 
 /** How the agent learns a message was spoken on a call and how its reply will be heard. */
-export const WALKIE_REPLY_NOTE =
+export const CALL_REPLY_NOTE =
   'Spoken on a live voice call; your reply is read aloud word for word. Answer in a few short spoken ' +
   'sentences: no markdown, no links, no code blocks, numbers written as words. Send longer material ' +
-  `as a separate written message to your chat. ${WALKIE_LANGUAGE_NOTE}`;
+  `as a separate written message to your chat. ${CALL_LANGUAGE_NOTE}`;
 
 /** The same for a call that talks in a chat, where every message the agent sends there is spoken. */
-export const WALKIE_CHAT_REPLY_NOTE =
+export const CALL_CHAT_REPLY_NOTE =
   'Spoken on a live voice call; while it lasts, every message you send to this chat is read aloud word for ' +
   'word. Answer in a few short spoken sentences: no markdown, no links, no code blocks, numbers written as ' +
-  `words. Offer longer material for after the call instead of sending it now. ${WALKIE_LANGUAGE_NOTE}`;
+  `words. Offer longer material for after the call instead of sending it now. ${CALL_LANGUAGE_NOTE}`;
 
 /** The inbound text for one transcribed caller turn. */
-export function walkieMessageText(transcript: string, note: string = WALKIE_REPLY_NOTE): string {
+export function turnMessageText(transcript: string, note: string = CALL_REPLY_NOTE): string {
   return `<voice source="livekit">${transcript}</voice>\n${note}`;
 }
 
@@ -170,11 +170,11 @@ export interface ChatAddress {
 export interface CallChat {
   group: MessagingGroup;
   threadId: string | null;
-  /** Set by `/voice`, or picked by the WALKIE_MIRROR rule. */
+  /** Set by `/voice`, or picked by the VOICE_MIRROR rule. */
   source: 'voice-command' | 'default';
 }
 
-export interface WalkieSettings {
+export interface SpeechSettings {
   sttModel?: string;
   /** Unset for the default; `off` (or empty) for no fallback. */
   sttFallbackModel?: string;
@@ -194,9 +194,9 @@ export interface LiveKitVoiceConfig {
   apiSecret: string;
   /** Dispatch name the worker registers under. */
   agentName?: string;
-  /** Transcription and speech settings the worker gets in the job metadata (WALKIE_*). */
-  walkie?: WalkieSettings;
-  /** Channel type of the default call chat when `/voice` has not set one; none when unset or `off`. voice.ts passes WALKIE_MIRROR, default DEFAULT_WALKIE_MIRROR. */
+  /** Transcription and speech settings the worker gets in the job metadata (VOICE_STT_*, VOICE_TTS_*, VOICE_SILENCE_MS). */
+  speech?: SpeechSettings;
+  /** Channel type of the default call chat when `/voice` has not set one; none when unset or `off`. voice.ts passes VOICE_MIRROR, default DEFAULT_VOICE_MIRROR. */
   mirror?: string;
   /** Test seam; defaults to the central DB and the live channel adapters. */
   mirrorApi?: MirrorApi;
@@ -437,13 +437,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const model = (raw ?? fallback).trim();
     return /^(off|none)$/i.test(model) ? '' : model;
   };
-  const walkie = {
-    sttModel: config.walkie?.sttModel || DEFAULT_WALKIE_STT_MODEL,
-    sttFallbackModel: fallbackModel(config.walkie?.sttFallbackModel, DEFAULT_WALKIE_STT_FALLBACK_MODEL),
-    ttsModel: config.walkie?.ttsModel || DEFAULT_WALKIE_TTS_MODEL,
-    ttsFallbackModel: fallbackModel(config.walkie?.ttsFallbackModel, DEFAULT_WALKIE_TTS_FALLBACK_MODEL),
-    ttsVoice: config.walkie?.ttsVoice || DEFAULT_WALKIE_TTS_VOICE,
-    silenceMs: config.walkie?.silenceMs || DEFAULT_WALKIE_SILENCE_MS,
+  const speech = {
+    sttModel: config.speech?.sttModel || DEFAULT_VOICE_STT_MODEL,
+    sttFallbackModel: fallbackModel(config.speech?.sttFallbackModel, DEFAULT_VOICE_STT_FALLBACK_MODEL),
+    ttsModel: config.speech?.ttsModel || DEFAULT_VOICE_TTS_MODEL,
+    ttsFallbackModel: fallbackModel(config.speech?.ttsFallbackModel, DEFAULT_VOICE_TTS_FALLBACK_MODEL),
+    ttsVoice: config.speech?.ttsVoice || DEFAULT_VOICE_TTS_VOICE,
+    silenceMs: config.speech?.silenceMs || DEFAULT_VOICE_SILENCE_MS,
   };
   const mirrorChannel = config.mirror && config.mirror !== 'off' ? config.mirror : null;
   const mirrorApi = config.mirrorApi ?? defaultMirrorApi;
@@ -491,7 +491,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     log.info(`livekit-voice: ${note}`, { platformId: call.platformId, callId: call.callId, ...fields });
   };
 
-  /** The `/voice` chat if it is still the agent's and an owner account of the line still administers the agent, else the WALKIE_MIRROR pick. */
+  /** The `/voice` chat if it is still the agent's and an owner account of the line still administers the agent, else the VOICE_MIRROR pick. */
   const resolveChat = async (call: LiveKitCall): Promise<CallChat | null> => {
     const { line } = call;
     const groups = await mirrorApi.groupsFor(line.agentGroupId);
@@ -515,7 +515,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       }
     }
     if (!mirrorChannel) {
-      noteChat(call, 'choice', 'call talks on the voice line: no /voice chat and WALKIE_MIRROR is off');
+      noteChat(call, 'choice', 'call talks on the voice line: no /voice chat and VOICE_MIRROR is off');
       return null;
     }
     const pick = pickMirrorTarget(groups, mirrorChannel);
@@ -529,8 +529,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const sameChat = (a: CallChat | null, b: CallChat | null): boolean =>
     a?.group.id === b?.group.id && a?.threadId === b?.threadId;
 
-  const roomMetadata = (chat: CallChat | null, end?: WalkieEndReason): string =>
-    JSON.stringify({ chat: chat ? chatLabel(chat.group) : null, ...(end && { end }) } satisfies WalkieRoomMetadata);
+  const roomMetadata = (chat: CallChat | null, end?: CallEndReason): string =>
+    JSON.stringify({ chat: chat ? chatLabel(chat.group) : null, ...(end && { end }) } satisfies CallRoomMetadata);
 
   const showChat = (call: LiveKitCall, chat: CallChat | null): void => {
     if (call.ended) return;
@@ -636,7 +636,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
 
   /** Room metadata the page reads when it is disconnected, so it can say why; best effort and bounded. */
-  const announceEnd = async (call: LiveKitCall, code: WalkieEndReason): Promise<void> => {
+  const announceEnd = async (call: LiveKitCall, code: CallEndReason): Promise<void> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -658,7 +658,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
 
   /** `end`: why, as the page names it; left out for ends no page is there to hear about. */
-  const endCall = (call: LiveKitCall, reason: string, end?: WalkieEndReason): void => {
+  const endCall = (call: LiveKitCall, reason: string, end?: CallEndReason): void => {
     if (call.ended) return;
     call.ended = true;
     clearTimeout(call.joinTimer);
@@ -760,7 +760,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       callerName: line.caller.name,
       callerIdentity: call.callerIdentity,
       vocabulary: [...(line.agent.vocabulary ?? [])],
-      ...walkie,
+      ...speech,
       maxDurationMs: capMs,
       joinTimeoutMs,
     };
@@ -810,10 +810,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       callId,
       room: call.roomName,
       agent: line.agent.name,
-      sttModel: walkie.sttModel,
-      sttFallbackModel: walkie.sttFallbackModel,
-      ttsModel: walkie.ttsModel,
-      ttsFallbackModel: walkie.ttsFallbackModel,
+      sttModel: speech.sttModel,
+      sttFallbackModel: speech.sttFallbackModel,
+      ttsModel: speech.ttsModel,
+      ttsFallbackModel: speech.ttsFallbackModel,
     });
     // What the page needs for its hints: the silence that sends a turn, and the cap that ends the
     // call (from join; onJoined recomputes it, never later than this).
@@ -827,7 +827,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         callId,
         agent: line.agent.name,
         chat,
-        silenceMs: walkie.silenceMs,
+        silenceMs: speech.silenceMs,
         limit,
       }),
       JSON_HEADERS,
@@ -955,7 +955,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         id: liveKitUtteranceMessageId(call.callId, utteranceId),
         kind: 'chat',
         content: JSON.stringify({
-          text: walkieMessageText(text, chat ? WALKIE_CHAT_REPLY_NOTE : WALKIE_REPLY_NOTE),
+          text: turnMessageText(text, chat ? CALL_CHAT_REPLY_NOTE : CALL_REPLY_NOTE),
           sender: sender.name,
           senderId: sender.id,
           livekit: { callId: call.callId, utteranceId },

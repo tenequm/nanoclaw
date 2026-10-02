@@ -1,6 +1,6 @@
 /**
- * The LiveKit Agents worker for the voice channel's LiveKit path: walkie-talkie
- * mode, where the caller talks to the line's real NanoClaw agent.
+ * The LiveKit Agents worker for the voice channel's LiveKit path, where the caller takes
+ * turns talking to the line's real NanoClaw agent.
  *
  * A separate process (`pnpm run voice-worker`), because agents-js runs every
  * job in a forked child process of its worker and owns that process's signals
@@ -20,7 +20,7 @@
  *    spoken message; nothing in the session answers it;
  *  - each complete agent reply from the host's event stream is spoken with
  *    `session.say()` once the caller is not mid-turn, cut to
- *    WALKIE_MAX_SPOKEN_CHARS at a sentence end, uninterruptible: while
+ *    VOICE_MAX_SPOKEN_CHARS at a sentence end, uninterruptible: while
  *    it plays, the caller's audio is not transcribed (no barge-in); Gemini
  *    TTS synthesizes the whole reply in one streamed request, through
  *    LiveKit's TTS FallbackAdapter onto a second model.
@@ -65,16 +65,16 @@ import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   liveKitHostUrl,
-  WALKIE_PENDING_ATTRIBUTE,
-  WALKIE_REPLY_TOPIC,
-  WALKIE_THINKING_ATTRIBUTE,
-  WALKIE_TURN_TOPIC,
-  WALKIE_UPDATING_ATTRIBUTE,
+  CALL_PENDING_ATTRIBUTE,
+  CALL_REPLY_TOPIC,
+  CALL_THINKING_ATTRIBUTE,
+  CALL_TURN_TOPIC,
+  CALL_UPDATING_ATTRIBUTE,
   WORKER_REQUEST_TIMEOUT_MS,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
-  type WalkieReplyInfo,
-  type WalkieTurnStatus,
+  type CallReplyInfo,
+  type CallTurnStatus,
 } from './channels/voice-livekit-protocol.js';
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
@@ -124,7 +124,7 @@ const MAX_RECORDED_TURN_MS = 120_000;
 const TURN_RETRY_DELAY_MS = 500;
 /** Timed-out turns kept for a late `turn-stored`; the host remembers no more turn keys than this either. */
 const MAX_UNCONFIRMED_TURNS = 32;
-/** WALKIE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
+/** VOICE_MAX_SPOKEN_CHARS when unset: the longest message spoken in full. */
 export const DEFAULT_MAX_SPOKEN_CHARS = 800;
 const DAY_MS = 86_400_000;
 
@@ -244,7 +244,7 @@ export const CUT_LINES: Record<'chat' | 'no_chat', Record<CallLanguage, string>>
 /** A sentence end earlier than this share of the cap wastes the budget: the cut goes to a word instead. */
 const MIN_SENTENCE_CUT = 0.6;
 
-/** WALKIE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default. */
+/** VOICE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default. */
 export function maxSpokenChars(raw: string | undefined): number {
   const value = raw?.trim();
   if (!value) return DEFAULT_MAX_SPOKEN_CHARS;
@@ -303,7 +303,7 @@ export function interactionText(body: unknown): string {
  * sends nothing unless `shouldServe` says the streaming transcription is down.
  */
 export class GeminiTranscribeSTT extends stt.STT {
-  label = 'walkie.GeminiTranscribe';
+  label = 'voice.GeminiTranscribe';
   private blockedUntil = 0;
 
   constructor(
@@ -561,7 +561,7 @@ export class TurnCapture {
 
 /**
  * The page's send cue: while a stretch of caller speech waits out the closing silence that sends
- * it, the `nanoclaw.walkie.pending` attribute says how far into that silence it is; it clears
+ * it, the `nanoclaw.voice.pending` attribute says how far into that silence it is; it clears
  * when the caller speaks again, the turn goes out or is dropped, the agent speaks, or the turn
  * is overdue (a transcript of only whitespace commits nothing and times nothing out).
  */
@@ -689,22 +689,22 @@ export async function pruneRecordings(root: string, days: number, now = Date.now
   return removed;
 }
 
-/** WALKIE_RECORDINGS_DAYS: 0 (the default) records nothing. */
+/** VOICE_RECORDINGS_DAYS: 0 (the default) records nothing. */
 export function recordingDays(raw: string | undefined): number {
   const days = Number(raw?.trim() || 0);
   return Number.isInteger(days) && days > 0 ? days : 0;
 }
 
-/** The call's voice: what the walkie needs from the session in the room. Faked in tests. */
+/** The call's voice: what turn-taking needs from the session in the room. Faked in tests. */
 export interface CallVoice {
   /** Speak a line, uninterruptible; resolves after playout with whether all of it was synthesized. */
   say(text: string): Promise<boolean>;
-  /** The `nanoclaw.walkie.thinking` attribute. */
+  /** The `nanoclaw.voice.thinking` attribute. */
   setThinking(thinking: boolean): void;
-  /** One message on the `nanoclaw.walkie.turn` topic. */
-  publishTurn(status: WalkieTurnStatus): void;
-  /** One message on the `nanoclaw.walkie.reply` topic, sent right before the line it describes is spoken. */
-  publishReply(info: WalkieReplyInfo): void;
+  /** One message on the `nanoclaw.voice.turn` topic. */
+  publishTurn(status: CallTurnStatus): void;
+  /** One message on the `nanoclaw.voice.reply` topic, sent right before the line it describes is spoken. */
+  publishReply(info: CallReplyInfo): void;
   close(): Promise<void>;
 }
 
@@ -736,21 +736,21 @@ export interface SendResult {
   turnKey?: string;
 }
 
-export interface WalkieDeps {
+export interface TurnTakingDeps {
   send(text: string): Promise<SendResult>;
   say(text: string): Promise<boolean>;
   setThinking(thinking: boolean): void;
   /** What the line about to be spoken is, for the page's caption labels. */
-  announce?(info: WalkieReplyInfo): void;
+  announce?(info: CallReplyInfo): void;
   log: Pick<Console, 'info' | 'warn'>;
   now?: () => number;
 }
 
 /**
- * The walkie-talkie rules on top of the session: turns out in order, replies in when the caller
+ * The turn-taking rules on top of the session: turns out in order, replies in when the caller
  * is not mid-turn, "thinking" while the agent works, and a spoken line when something is lost.
  */
-export class Walkie {
+export class TurnTaking {
   private readonly now: () => number;
   private callerSpeaking = false;
   /** Until then, the caller's last speech may still be committed as a turn. */
@@ -771,7 +771,7 @@ export class Walkie {
   private inChat = false;
 
   constructor(
-    private readonly deps: WalkieDeps,
+    private readonly deps: TurnTakingDeps,
     private readonly options: { silenceMs: number; language: CallLanguage; maxSpokenChars?: number },
   ) {
     this.now = deps.now ?? (() => Date.now());
@@ -792,12 +792,12 @@ export class Walkie {
     this.wake();
     this.sends = this.sends
       .then(() => this.sendTurn(text, onSent))
-      .catch((err: unknown) => this.deps.log.warn('walkie: sending a turn failed', { err }));
+      .catch((err: unknown) => this.deps.log.warn('voice worker: sending a turn failed', { err }));
   }
 
   onTurnLost(reason: 'stt' | 'empty', fields: Record<string, unknown> = {}): void {
     if (this.closed) return;
-    this.deps.log.warn(`walkie: a turn was lost (${reason})`, fields);
+    this.deps.log.warn(`voice worker: a turn was lost (${reason})`, fields);
     this.feedback('turn');
   }
 
@@ -813,7 +813,7 @@ export class Walkie {
     if (!full) return;
     const max = this.options.maxSpokenChars ?? DEFAULT_MAX_SPOKEN_CHARS;
     if (max > 0 && full.length > max) {
-      this.deps.log.info('walkie: a long message is cut for speech', { chars: full.length, max });
+      this.deps.log.info('voice worker: a long message is cut for speech', { chars: full.length, max });
     }
     this.enqueue(async () => {
       // Cut when spoken, so the closing line is in the language of the caller's latest turn.
@@ -826,7 +826,7 @@ export class Walkie {
         this.announce(turn === null ? { unprompted: true } : {});
       }
       if (!(await this.deps.say(spoken)) && !this.closed) {
-        this.deps.log.warn('walkie: a reply could not be synthesized');
+        this.deps.log.warn('voice worker: a reply could not be synthesized');
         this.feedback('reply');
       }
     });
@@ -862,7 +862,7 @@ export class Walkie {
 
   private async sendTurn(text: string, onSent?: (result: SendResult) => void): Promise<void> {
     const result = await this.deps.send(text).catch((err: unknown): SendResult => {
-      this.deps.log.warn('walkie: could not hand the turn to the host', { err });
+      this.deps.log.warn('voice worker: sending a turn threw', { err });
       return { accepted: false, error: err instanceof Error ? err.message : String(err) };
     });
     onSent?.(result);
@@ -883,7 +883,7 @@ export class Walkie {
     });
   }
 
-  private announce(info: Omit<WalkieReplyInfo, 'reply' | 'more'>): void {
+  private announce(info: Omit<CallReplyInfo, 'reply' | 'more'>): void {
     this.deps.announce?.({ reply: ++this.replies, ...info, ...(this.queued > 1 ? { more: true } : {}) });
   }
 
@@ -894,7 +894,7 @@ export class Walkie {
         await this.callerIdle();
         if (!this.closed) await job();
       })
-      .catch((err: unknown) => this.deps.log.warn('walkie: speaking failed', { err }))
+      .catch((err: unknown) => this.deps.log.warn('voice worker: speaking failed', { err }))
       .finally(() => this.queued--);
   }
 
@@ -905,7 +905,7 @@ export class Walkie {
       const t = this.now();
       if (!this.callerSpeaking && t >= this.turnOpenUntil) return;
       if (t >= deadline) {
-        this.deps.log.info('walkie: the caller is still talking; the reply takes the channel');
+        this.deps.log.info('voice worker: the caller is still talking; the reply takes the channel');
         return;
       }
       const until = this.callerSpeaking ? deadline : Math.min(deadline, this.turnOpenUntil);
@@ -965,7 +965,7 @@ export function readJobHeader(raw: string): { v: unknown; callId: string; caller
 export function parseJobMetadata(raw: string): LiveKitJobMetadata {
   const meta = JSON.parse(raw) as LiveKitJobMetadata;
   if (meta?.v !== LIVEKIT_PROTOCOL_VERSION || !meta.callId || !meta.callerIdentity || !meta.agentName) {
-    throw new Error('voice worker: job metadata is not a NanoClaw walkie-talkie call of this version');
+    throw new Error('voice worker: job metadata is not a NanoClaw voice call of this version');
   }
   return meta;
 }
@@ -1035,7 +1035,7 @@ const loadFallbackVad = (): Promise<VAD> =>
     minSpeechDuration: FALLBACK_MIN_SPEECH_MS,
   });
 
-class WalkieAgent extends voice.Agent {
+class CallAgent extends voice.Agent {
   constructor(
     private readonly onTurn: (text: string) => void,
     private readonly tap?: (frame: AudioFrame) => void,
@@ -1074,7 +1074,7 @@ const setAttribute = async (ctx: CallJob, key: string, value: string): Promise<v
 
 type WorkerLog = Pick<Console, 'info' | 'warn' | 'error'>;
 
-/** The agents-js logger as `(message, fields)`, the shape the walkie code logs in. */
+/** The agents-js logger as `(message, fields)`, the shape the turn-taking code logs in. */
 const workerLog = (logger: ReturnType<typeof agentsLog>): WorkerLog => ({
   info: (msg: string, fields?: unknown) => logger.info(fields ?? {}, msg),
   warn: (msg: string, fields?: unknown) => logger.warn(fields ?? {}, msg),
@@ -1085,7 +1085,7 @@ const workerLog = (logger: ReturnType<typeof agentsLog>): WorkerLog => ({
  * The call's AgentSession: VAD turns, streaming STT, Gemini TTS, no LLM, wired to `events`. Not
  * started; `sessionVoice` starts it in the room.
  */
-export function walkieSession(
+export function callSession(
   meta: LiveKitJobMetadata,
   settings: VoiceSettings,
   vads: { vad: VAD; fallbackVad?: VAD },
@@ -1278,7 +1278,7 @@ export function walkieSession(
 
   return {
     session,
-    agent: new WalkieAgent(
+    agent: new CallAgent(
       (text) => {
         const turn = take();
         if (text) events.onTurn(text, turn);
@@ -1305,13 +1305,13 @@ async function sessionVoice(
   const userData = ctx.proc.userData as WorkerUserData;
   userData.vad ??= await loadVad();
   if (meta.sttFallbackModel) userData.fallbackVad ??= await loadFallbackVad();
-  const { session, agent, say } = walkieSession(
+  const { session, agent, say } = callSession(
     meta,
     settings,
     { vad: userData.vad, fallbackVad: userData.fallbackVad },
     events,
     log,
-    (value) => void setAttribute(ctx, WALKIE_PENDING_ATTRIBUTE, value).catch(() => undefined),
+    (value) => void setAttribute(ctx, CALL_PENDING_ATTRIBUTE, value).catch(() => undefined),
   );
   await session.start({
     agent,
@@ -1327,16 +1327,16 @@ async function sessionVoice(
   return {
     say,
     setThinking(thinking) {
-      void setAttribute(ctx, WALKIE_THINKING_ATTRIBUTE, thinking ? '1' : '').catch(() => undefined);
+      void setAttribute(ctx, CALL_THINKING_ATTRIBUTE, thinking ? '1' : '').catch(() => undefined);
     },
     publishTurn(status) {
       void ctx.room.localParticipant
-        ?.sendText(JSON.stringify(status), { topic: WALKIE_TURN_TOPIC })
+        ?.sendText(JSON.stringify(status), { topic: CALL_TURN_TOPIC })
         .catch((err: unknown) => log.warn('voice worker: could not publish a turn status', { err }));
     },
     publishReply(info) {
       void ctx.room.localParticipant
-        ?.sendText(JSON.stringify(info), { topic: WALKIE_REPLY_TOPIC })
+        ?.sendText(JSON.stringify(info), { topic: CALL_REPLY_TOPIC })
         .catch((err: unknown) => log.warn('voice worker: could not publish a reply label', { err }));
     },
     async close() {
@@ -1351,11 +1351,11 @@ function defaultDeps(): RunCallDeps {
       'GEMINI_API_KEY',
       'LIVEKIT_API_SECRET',
       'LIVEKIT_HOST_URL',
-      'WALKIE_RECORDINGS_DAYS',
-      'WALKIE_MAX_SPOKEN_CHARS',
+      'VOICE_RECORDINGS_DAYS',
+      'VOICE_MAX_SPOKEN_CHARS',
     ]),
     createVoice: (ctx, meta, settings, events) => sessionVoice(ctx as JobContext, meta, settings, events),
-    markUpdating: (ctx) => setAttribute(ctx, WALKIE_UPDATING_ATTRIBUTE, '1'),
+    markUpdating: (ctx) => setAttribute(ctx, CALL_UPDATING_ATTRIBUTE, '1'),
     log: workerLog(agentsLog()),
   };
 }
@@ -1404,7 +1404,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   }
   const geminiKey = deps.env.GEMINI_API_KEY;
   if (!geminiKey) return abandon('GEMINI_API_KEY is not set for the worker');
-  const record = recordingDays(deps.env.WALKIE_RECORDINGS_DAYS) > 0;
+  const record = recordingDays(deps.env.VOICE_RECORDINGS_DAYS) > 0;
 
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
   try {
@@ -1424,7 +1424,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     info: (msg: string, fields?: unknown) => log.info(msg, { ...callFields, ...(fields as object) }),
     warn: (msg: string, fields?: unknown) => log.warn(msg, { ...callFields, ...(fields as object) }),
   } as Pick<Console, 'info' | 'warn'>;
-  const walkie = new Walkie(
+  const turnTaking = new TurnTaking(
     {
       send: async (text) => {
         // The host answers a turn key once, so a retry after a dropped connection cannot reach the agent twice.
@@ -1458,14 +1458,14 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     {
       silenceMs: meta.silenceMs,
       language: DEFAULT_CALL_LANGUAGE,
-      maxSpokenChars: maxSpokenChars(deps.env.WALKIE_MAX_SPOKEN_CHARS),
+      maxSpokenChars: maxSpokenChars(deps.env.VOICE_MAX_SPOKEN_CHARS),
     },
   );
   /** `restart`: the worker is shutting down, so the caller's page says the service restarted. */
   const end = async (reason: string, tellHost: boolean, restart = false) => {
     if (ending) return;
     ending = true;
-    walkie.close();
+    turnTaking.close();
     // The host link stays open until the host answered: closed first, it ends the call on its own
     // and answers this at once, before the room carries why the call ended.
     await Promise.all([
@@ -1487,7 +1487,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const turnsByHostId = new Map<string, number>();
   /** Turns the host did not confirm, by turn key, until its `turn-stored` says the agent has one after all. */
   const unconfirmed = new Map<string, { turn: number; text: string }>();
-  const publish = (status: WalkieTurnStatus) => callVoice?.publishTurn(status);
+  const publish = (status: CallTurnStatus) => callVoice?.publishTurn(status);
   const saveTurn = (
     index: number,
     { audio, sttModel }: TurnTake,
@@ -1520,7 +1520,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       {
         onTurn: (text, take) => {
           const turn = ++turns;
-          walkie.onTurn(text, (host) => {
+          turnTaking.onTurn(text, (host) => {
             if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
             if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {
               unconfirmed.set(host.turnKey, { turn, text });
@@ -1537,11 +1537,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
             saveTurn(turn, take, text, { host });
           });
         },
-        onCallerSpeaking: (speaking) => walkie.onCallerSpeaking(speaking),
+        onCallerSpeaking: (speaking) => turnTaking.onCallerSpeaking(speaking),
         onTurnLost: (reason, fields, take) => {
           if (ending) return;
           const turn = ++turns;
-          walkie.onTurnLost(reason, fields);
+          turnTaking.onTurnLost(reason, fields);
           publish({ turn, status: 'lost', reason });
           saveTurn(turn, take, '', { reason });
         },
@@ -1552,7 +1552,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       },
     );
   } catch (err) {
-    walkie.close();
+    turnTaking.close();
     return abandon('could not set up the call audio', { err });
   }
   // Defense in depth: the host ends the call on time; this stops a worker that lost the host.
@@ -1576,9 +1576,9 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       if (event.type === 'end') void end(`host: ${event.reason}`, false);
       else if (event.type === 'reply')
         // A host that sends no turn at all predates reply labels: not known, so no label.
-        walkie.onReply(event.text, typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn);
-      else if (event.type === 'thinking') walkie.onThinking();
-      else if (event.type === 'chat') walkie.onChat(event.chat);
+        turnTaking.onReply(event.text, typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn);
+      else if (event.type === 'thinking') turnTaking.onThinking();
+      else if (event.type === 'chat') turnTaking.onChat(event.chat);
       else if (event.type === 'turn-stored') {
         const late = unconfirmed.get(event.turnKey);
         if (!late) return;
@@ -1619,14 +1619,14 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'LIVEKIT_AGENT_NAME',
     'LIVEKIT_HOST_URL',
     'VOICE_WORKER_HEALTH_PORT',
-    'WALKIE_RECORDINGS_DAYS',
-    'WALKIE_MAX_SPOKEN_CHARS',
+    'VOICE_RECORDINGS_DAYS',
+    'VOICE_MAX_SPOKEN_CHARS',
   ]);
   // agents-js initializes its logger once the CLI runs a command; console until then.
   console.info(
     `voice worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${liveKitHostUrl(env)} (LIVEKIT_HOST_URL)`,
   );
-  const keepDays = recordingDays(env.WALKIE_RECORDINGS_DAYS);
+  const keepDays = recordingDays(env.VOICE_RECORDINGS_DAYS);
   if (keepDays > 0) {
     const prune = () =>
       void pruneRecordings(recordingsRoot(), keepDays).then(
