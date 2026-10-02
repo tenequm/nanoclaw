@@ -100,17 +100,23 @@ export const CALL_LANGUAGE_NOTE =
   'The caller speaks Ukrainian or English; a transcript that looks Russian is Ukrainian misspelled by speech ' +
   'recognition, so answer in Ukrainian (in English if the caller spoke English), never in Russian.';
 
+/** How long a spoken answer runs: as long as the question needs, in words that work when heard. */
+export const CALL_DEPTH_NOTE =
+  'Match the depth to the question: brief for simple ones; for design, strategy or anything that needs care, ' +
+  'take the time to think and verify, and give the full considered answer in plain speech. No markdown, no ' +
+  'links, no code blocks, numbers written as words.';
+
 /** How the agent learns a message was spoken on a call and how its reply will be heard. */
 export const CALL_REPLY_NOTE =
-  'Spoken on a live voice call; your reply is read aloud word for word. Answer in a few short spoken ' +
-  'sentences: no markdown, no links, no code blocks, numbers written as words. Send longer material ' +
-  `as a separate written message to your chat. ${CALL_LANGUAGE_NOTE}`;
+  `Spoken on a live voice call; your reply is read aloud word for word. ${CALL_DEPTH_NOTE} ` +
+  'Send anything meant for reading (code, links, long lists) as a separate written message to your chat. ' +
+  CALL_LANGUAGE_NOTE;
 
 /** The same for a call that talks in a chat, where every message the agent sends there is spoken. */
 export const CALL_CHAT_REPLY_NOTE =
   'Spoken on a live voice call; while it lasts, every message you send to this chat is read aloud word for ' +
-  'word. Answer in a few short spoken sentences: no markdown, no links, no code blocks, numbers written as ' +
-  `words. Offer longer material for after the call instead of sending it now. ${CALL_LANGUAGE_NOTE}`;
+  `word. ${CALL_DEPTH_NOTE} Offer anything meant for reading (code, links, long lists) for after the call ` +
+  `instead of sending it now. ${CALL_LANGUAGE_NOTE}`;
 
 /** The inbound text for one transcribed caller turn. */
 export function turnMessageText(transcript: string, note: string = CALL_REPLY_NOTE): string {
