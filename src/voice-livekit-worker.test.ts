@@ -690,6 +690,43 @@ describe('runCall', () => {
     host.endStream();
   });
 
+  it('tells the page once per turn that the agent picked it up, never before the host took it or after its answer', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    const working = () => v.voice.publishTurn.mock.calls.filter(([s]) => s.status === 'working').map(([s]) => s);
+    // No turn yet: the agent working on something else says nothing about this call's turns.
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(v.voice.setThinking).toHaveBeenCalledWith(true));
+    expect(working()).toEqual([]);
+
+    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' }),
+    );
+    host.emit({ type: 'working' });
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(working()).toEqual([{ turn: 1, status: 'working' }]));
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.'));
+
+    // Turn 2 (the fake host names it '1' too) is answered before any pickup is heard: no late "working".
+    v.events.onTurn('And a taxi', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 2, status: 'sent', text: 'And a taxi' }),
+    );
+    host.emit({ type: 'reply', text: 'Taxi on its way.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Taxi on its way.'));
+    host.emit({ type: 'working' });
+    // Turn 3 is picked up while its answer is still to come.
+    v.events.onTurn('Thanks', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() => expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 3, status: 'sent', text: 'Thanks' }));
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(working()).toEqual([{ turn: 1, status: 'working' }, { turn: 3, status: 'working' }]));
+    host.endStream();
+  });
+
   it('speaks the lost-turn line when the host refuses a turn', async () => {
     const { ctx } = fakeJob();
     const host = fakeHostFetch(200, 429);

@@ -697,7 +697,7 @@ describe('typing observers', () => {
     startTypingRefresh('sess-1', 'ag-1', 'telegram', 'telegram:100', null, 'telegram');
     await vi.advanceTimersByTimeAsync(0);
     expect(seen).toEqual([
-      { agentGroupId: 'ag-1', channelType: 'telegram', platformId: 'telegram:100', threadId: null },
+      { agentGroupId: 'ag-1', channelType: 'telegram', platformId: 'telegram:100', threadId: null, working: false },
     ]);
     expect(calls).toHaveLength(1);
   });
@@ -708,6 +708,41 @@ describe('typing observers', () => {
     await vi.advanceTimersByTimeAsync(8_000);
     expect(reactions.filter((r) => r.op === 'add')).toHaveLength(1);
     expect(seen).toHaveLength(3);
-    expect(seen[0]).toEqual({ agentGroupId: 'ag-1', channelType: 'slack', platformId: 'slack:C1', threadId: null });
+    expect(seen[0]).toEqual({
+      agentGroupId: 'ag-1',
+      channelType: 'slack',
+      platformId: 'slack:C1',
+      threadId: null,
+      working: false,
+    });
+  });
+
+  it('hear the runner pick an inbound up at once, once, and only from a report stamped after that inbound', async () => {
+    const calls = captureAdapter();
+    startTypingRefresh('sess-pick', 'ag-1', 'voice', 'voice:line', null);
+    await vi.advanceTimersByTimeAsync(0);
+    const painted = calls.length;
+    seen.length = 0;
+    // A leftover report from before this inbound says nothing about it.
+    notePresence('sess-pick', { turn: 'working', updatedAtMs: Date.now() - 1_000, status: null });
+    expect(seen).toEqual([]);
+    await vi.advanceTimersByTimeAsync(500);
+    notePresence('sess-pick', { turn: 'working', updatedAtMs: Date.now(), status: null });
+    expect(seen).toEqual([expect.objectContaining({ platformId: 'voice:line', working: true })]);
+    // Observers only: the platform indicator keeps its own cadence.
+    expect(calls).toHaveLength(painted);
+    // A re-mark of the same turn is no second pickup; the refresh ticks carry the flag.
+    notePresence('sess-pick', { turn: 'working', updatedAtMs: Date.now(), status: null });
+    expect(seen).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(3_600);
+    expect(seen.at(-1)).toEqual(expect.objectContaining({ working: true }));
+    // The next inbound starts a new stretch: not working on it until a report says so.
+    seen.length = 0;
+    startTypingRefresh('sess-pick', 'ag-1', 'voice', 'voice:line', null);
+    expect(seen).toEqual([expect.objectContaining({ working: false })]);
+    await vi.advanceTimersByTimeAsync(1);
+    notePresence('sess-pick', { turn: 'working', updatedAtMs: Date.now(), status: null });
+    expect(seen.at(-1)).toEqual(expect.objectContaining({ working: true }));
+    stopTypingRefresh('sess-pick');
   });
 });

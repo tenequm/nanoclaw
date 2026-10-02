@@ -1985,6 +1985,9 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turns = 0;
   /** The newest turn handed to the host. */
   let lastPosted = 0;
+  /** The newest turn the host took, and the newest the page heard the agent pick up or answer. */
+  let lastAccepted = 0;
+  let pickedUp = 0;
   /** The host's utterance id of each sent turn to its number here, to tell the page what a reply answers. */
   const turnsByHostId = new Map<string, number>();
   /** Turns the host did not confirm, by turn key, until its `turn-stored` says the agent has one after all. */
@@ -2022,6 +2025,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     if (!ending) publish(draft === undefined ? { turn, status: 'sending' } : { turn, status: 'sending', text, draft });
     turnTaking.onTurn(text, (host) => {
       if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
+      if (host.accepted) lastAccepted = Math.max(lastAccepted, turn);
       if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {
         unconfirmed.set(host.turnKey, { turn, text });
         for (const key of unconfirmed.keys()) {
@@ -2114,16 +2118,29 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   host
     .events((event) => {
       if (event.type === 'end') void end(`host: ${event.reason}`, false);
-      else if (event.type === 'reply')
+      else if (event.type === 'reply') {
         // A host that sends no turn at all predates reply labels: not known, so no label.
-        turnTaking.onReply(event.text, typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn);
-      else if (event.type === 'thinking') turnTaking.onThinking();
+        const turn = typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn;
+        // An answered turn needs no "working" any more.
+        if (typeof turn === 'number') pickedUp = Math.max(pickedUp, turn);
+        turnTaking.onReply(event.text, turn);
+      } else if (event.type === 'thinking') turnTaking.onThinking();
+      else if (event.type === 'working') {
+        turnTaking.onThinking();
+        // The runner works on what reached it after the newest turn the host took: the page's
+        // working cue, once per turn. A pickup heard before that turn's 202 waits for the next tick.
+        if (lastAccepted > pickedUp) {
+          pickedUp = lastAccepted;
+          publish({ turn: lastAccepted, status: 'working' });
+        }
+      }
       else if (event.type === 'chat') turnTaking.onChat(event.chat);
       else if (event.type === 'turn-stored') {
         const late = unconfirmed.get(event.turnKey);
         if (!late) return;
         unconfirmed.delete(event.turnKey);
         turnsByHostId.set(event.id, late.turn);
+        lastAccepted = Math.max(lastAccepted, late.turn);
         callLog.info('voice worker: a timed-out turn reached the agent after all', { turn: late.turn });
         // The page's mark for this turn goes from "not confirmed" to "sent".
         publish({ turn: late.turn, status: 'sent', text: late.text });

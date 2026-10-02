@@ -656,6 +656,16 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     });
     await h.adapter.setTyping!(LINE, null);
     await worker.waitFor((e) => e.type === 'thinking');
+    // The runner's pickup on the line's own chat is the worker's `working`; the adapter already said thinking.
+    const thinking = worker.events.filter((e) => e.type === 'thinking').length;
+    liveKitChatTyping({ channelType: 'voice', platformId: LINE, threadId: null }, 'ag-andy');
+    liveKitChatTyping({ channelType: 'voice', platformId: LINE, threadId: null }, 'ag-other', true);
+    liveKitChatTyping({ channelType: 'voice', platformId: 'voice:other', threadId: null }, 'ag-andy', true);
+    await settle();
+    expect(worker.events.some((e) => e.type === 'working')).toBe(false);
+    liveKitChatTyping({ channelType: 'voice', platformId: LINE, threadId: null }, 'ag-andy', true);
+    await worker.waitFor((e) => e.type === 'working');
+    expect(worker.events.filter((e) => e.type === 'thinking')).toHaveLength(thinking);
     worker.close();
   });
 
@@ -1046,6 +1056,10 @@ describe('livekit call talking in the agent chat', () => {
     expect(worker.events.some((e) => e.type === 'thinking')).toBe(false);
     liveKitChatTyping({ channelType: 'telegram', platformId: 'telegram:100', threadId: null }, 'ag-andy');
     await worker.waitFor((e) => e.type === 'thinking');
+    expect(worker.events.some((e) => e.type === 'working')).toBe(false);
+    // The runner picked up what reached the call chat: thinking, then working.
+    liveKitChatTyping({ channelType: 'telegram', platformId: 'telegram:100', threadId: null }, 'ag-andy', true);
+    await worker.waitFor((e) => e.type === 'working');
     await worker.waitFor((e) => e.type === 'reply');
     expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
       { type: 'reply', text: 'Booked for **eight**.', turn: null },
