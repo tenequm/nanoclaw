@@ -106,9 +106,8 @@ This one line is the only edit the skill makes to the channel core. The adapter
 also relies on core pieces this fork's trunk carries and upstream does not:
 host-addressed turns (`agentGroupId` and `onStored` on `InboundEvent`,
 `routeInboundEvent`), `expediteDelivery` in `src/delivery.ts`, the `voice-call`
-wake reason with `holdIdleCeiling` in `src/reconcile-session.ts`, and the agent
-runner's idle start and prompt-cache warm for that wake. Apply it to this
-fork's trunk, not to plain upstream:
+wake reason in `src/request-wake.ts`, and the agent runner's idle start for
+that wake. Apply it to this fork's trunk, not to plain upstream:
 
 ```nc:append to:src/channels/index.ts
 import './voice.js';
@@ -903,13 +902,14 @@ path. Voice does not deliver files or interactive question cards; ask questions
 in plain spoken text and send attachments to another wired channel.
 
 **The first answer on a call is slower than the rest.** When the caller joins,
-the host starts the agent's container and its Claude session and refreshes the
-prompt cache, so the first turn usually meets a running agent. The first answer
-still pays for the start when the caller speaks within a few seconds of joining,
-or when the call's chat has no agent session yet (its first message creates
-one). The page shows the agent working while it waits, rather than leaving the
-caller looking at a silent screen. The container is kept for the whole call;
-after it, an idle container is reclaimed as before.
+the host starts the agent's container and its Claude session once, so the first
+turn usually meets a running agent. The first answer still pays for the start
+when the caller speaks within a few seconds of joining, or when the call's chat
+has no agent session yet (its first message creates one). The page shows the
+agent working while it waits, rather than leaving the caller looking at a silent
+screen. A call does not keep the container alive: if the caller stays silent
+past the host's idle ceiling, the idle container is reclaimed as for any
+session, and the next turn wakes the agent again, paying the start once more.
 
 **`Caller access denied` on the page.** Verify the voice user has a display name,
 is a member of the answering agent, and the line has exactly one strict,

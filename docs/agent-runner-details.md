@@ -37,11 +37,6 @@ interface AgentProvider {
    *  voice call's first turn. */
   readonly startsIdle?: boolean;
 
-  /** Optional. Warm the prompt cache for `input.continuation` without a turn
-   *  of its own (nothing persisted, delivered or run). Called when a voice
-   *  call starts the agent before its first turn. Best-effort. */
-  warmPromptCache?(input: QueryInput): Promise<void>;
-
   /** True if the error means the stored continuation is invalid (missing
    *  transcript, unknown session) and should be cleared. */
   isSessionInvalid(err: unknown): boolean;
@@ -458,7 +453,7 @@ Everything below is handled by the agent-runner, not the provider.
 
 **Concurrent polling during active query:** While the provider is running a query, the agent-runner continues polling messages_in on a short interval (~500ms). New pending messages are formatted and pushed into the active query via `provider.push()`. This lets follow-up messages arrive while the agent is processing — Claude handles this natively, Codex/OpenCode handle it via abort+restart internally.
 
-**Idle behavior:** When no messages are pending and no query is active, the agent-runner sleeps briefly (1s) and re-polls. The container stays warm until the host kills it (idle timeout).
+**Idle behavior:** When no messages are pending and no query is active, the agent-runner sleeps briefly (1s) and re-polls. The container stays warm until the host kills it (idle timeout). A container woken for a voice call (`NANOCLAW_WAKE_REASON=voice-call`) whose provider `startsIdle` opens the query with an empty prompt before the first turn, unless a message is already pending; the caller's first turn is pushed into that query and stays `processing` until its result. Nothing holds the idle ceiling for the call: a long silent call is reclaimed like any idle container, and its next turn wakes the agent normally.
 
 **Idle detection exceptions:** The container should NOT be considered idle when:
 - An `ask_user_question` tool call is pending (waiting for user response in messages_in)
