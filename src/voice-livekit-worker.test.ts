@@ -55,7 +55,6 @@ import {
   cueFrames,
   matchCommand,
   matchWake,
-  matchWakeText,
   wakeWordSettings,
   awakeLimits,
   endsLike,
@@ -2130,24 +2129,26 @@ describe('CallTurns, hands-free', () => {
 });
 
 describe('CallTurns, wake', () => {
-  it('nothing is transcribed before the wake word; it opens with the window and is cut from the text; only send sends', async () => {
+  it('nothing is transcribed before the wake word; the turn starts where it was spotted; only send sends', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
     await h.pass(3000);
     await h.talk(1500);
     expect(h.t.begins).toEqual([]);
     expect(h.turns.spotting).toBe(true);
     const end = h.position;
-    h.turns.onWake(end - 32_000, end);
-    expect(h.t.begins).toEqual([32_000 + 16 * 300]);
+    h.turns.onWake(end);
+    // No audio from before the detection: the phrase (which ends there) is not in the turn.
+    expect(h.t.begins).toEqual([0]);
     expect(h.out.cues).toEqual(['wake']);
-    expect(h.turns.state).toMatchObject({ on: true, waiting: false, heard: 1, phrase: 'Hey LiveKit' });
-    h.t.results.push(heard('Hey LiveKit, book a table for two. Send it.', 'Send it.'));
+    expect(h.turns.state).toMatchObject({ on: true, waiting: false, heard: 1, phrase: 'Hey LiveKit', cut: true });
+    h.t.results.push(heard('Book a table for two. Send it.', 'Send it.'));
     await h.talk(1500);
     await h.pass(SILENCE + 500);
     expect(h.t.ended).toBe(0);
-    await h.interim('Hey LiveKit, book a table for two. Send it.');
-    await h.interim('Hey LiveKit, book a table for two. Send it.');
-    expect(h.out.sent).toEqual(['book a table for two.']);
+    await h.interim('Book a table for two. Send it.');
+    await h.interim('Book a table for two. Send it.');
+    // The text is not searched for the phrase: words like it after the wake stay words.
+    expect(h.out.sent).toEqual(['Book a table for two.']);
     expect(h.turns.state.waiting).toBe(true);
   });
 
@@ -2158,25 +2159,25 @@ describe('CallTurns, wake', () => {
     h.turns.configure(true, true);
     h.turns.configure(false, true);
     h.turns.configure(true, true);
-    h.turns.onWake(old - 32_000, old);
+    h.turns.onWake(old);
     expect(h.t.begins).toEqual([]);
     await h.pass(100);
-    h.turns.onWake(h.position - 32_000, h.position);
-    h.t.results.push(heard('Hey LiveKit what time is it', 'Hey LiveKit, what time is it?'));
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('what time is it', 'What time is it?'));
     await h.talk(1000);
     await h.pass(SILENCE);
-    expect(h.out.sent).toEqual(['what time is it?']);
+    expect(h.out.sent).toEqual(['What time is it?']);
   });
 
   it('goes back to waiting with the sleep cue: nothing said, then words held; a final ending in send it still sends', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
     await h.pass(100);
-    h.turns.onWake(0, h.position);
+    h.turns.onWake(h.position);
     await h.pass(8_000);
     expect(h.out.cues).toEqual(['wake', 'sleep']);
     expect(h.turns.state).toMatchObject({ waiting: true, slept: 1 });
     await h.pass(100);
-    h.turns.onWake(h.position - 100, h.position);
+    h.turns.onWake(h.position);
     h.t.results.push(heard('Remind me to buy bread', 'Remind me to buy bread.'));
     await h.talk(1000);
     await h.interim('Remind me to buy bread');
@@ -2185,7 +2186,7 @@ describe('CallTurns, wake', () => {
     await h.pass(1_100);
     expect(h.out.drops).toEqual([['asleep', 'Remind me to buy bread.']]);
     await h.pass(100);
-    h.turns.onWake(h.position - 100, h.position);
+    h.turns.onWake(h.position);
     h.t.results.push(heard('Remind me to buy milk', 'Remind me to buy milk. Send it.'));
     await h.talk(1000);
     await h.interim('Remind me to buy milk');
@@ -2196,7 +2197,7 @@ describe('CallTurns, wake', () => {
   it('a discard right after the wake word takes it back', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
     await h.pass(100);
-    h.turns.onWake(0, h.position);
+    h.turns.onWake(h.position);
     h.t.results.push(heard('Scratch that.', 'Scratch that.'));
     await h.talk(700);
     await h.interim('Scratch that.');
@@ -2232,7 +2233,7 @@ describe('CallTurns, wake', () => {
     expect(h.out.drops).toEqual([['unaddressed', 'half a thought']]);
     h.turns.useWakeWord('Hey LiveKit');
     await h.pass(100);
-    h.turns.onWake(h.position - 100, h.position);
+    h.turns.onWake(h.position);
     h.t.results.push(heard('Book a table', 'Book a table'));
     await h.talk(1000);
     h.turns.configure(false, false);
@@ -2720,7 +2721,7 @@ describe('acoustic wake word in a call', () => {
     };
   }
 
-  it('a detection opens the turn with the window that had the phrase; the phrase is cut; audio is scored only while waiting', async () => {
+  it('a detection opens the turn where it was spotted; audio is scored only while waiting', async () => {
     const { ctx } = fakeJob();
     const host = fakeHostFetch();
     const v = fakeVoice();
@@ -2735,17 +2736,17 @@ describe('acoustic wake word in a call', () => {
     expect(v.transcription.begins).toEqual([]);
     // The spotter's own positions: it was pushed all of this call's audio since it started.
     w.events.onDetect(0.9, { start: w.pushed - 32_000, end: w.pushed });
-    expect(v.transcription.begins).toEqual([32_000 + 16 * 300]);
+    expect(v.transcription.begins).toEqual([0]);
     await vi.waitFor(() => expect(v.voice.playCue.mock.calls.map(([k]) => k)).toContain('wake'));
     v.audio(20);
     expect(w.listening.at(-1)).toBe(false);
-    v.transcription.results.push(heard('Hey LiveKit, what is the time? Send it.', 'Send it.'));
+    v.transcription.results.push(heard('What is the time? Send it.', 'Send it.'));
     v.events.onSpeech(true, 0);
     v.audio(1000);
     v.events.onSpeech(false, 0);
-    v.interim('Hey LiveKit, what is the time? Send it.');
-    v.interim('Hey LiveKit, what is the time? Send it.');
-    await vi.waitFor(() => expect(utterances(host)).toEqual(['what is the time?']));
+    v.interim('What is the time? Send it.');
+    v.interim('What is the time? Send it.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['What is the time?']));
     host.endStream();
   });
 
@@ -2763,30 +2764,6 @@ describe('acoustic wake word in a call', () => {
 });
 
 describe('acoustic wake word', () => {
-  it('finds the spotted phrase however the transcription spelled it', () => {
-    const at = (text: string) => {
-      const found = matchWakeText(text, 'hey livekit');
-      return found && [text.slice(0, found.start), text.slice(found.end)];
-    };
-    expect(at('Hey, LiveKit, what time is it?')).toEqual(['', ', what time is it?']);
-    expect(at('So that is settled. Hey Live Kit what time')).toEqual(['So that is settled. ', ' what time']);
-    expect(at('hey live kid. Book a table')).toEqual(['', '. Book a table']);
-    expect(at('Гей, Лайвкіт, котра година?')).toEqual(['', ', котра година?']);
-    expect(at('Hi Lifekit')).toEqual(['', '']);
-    // The name without a hey before it is the phrase too: the audio already said it was spoken.
-    expect(at('LiveKit, book a table')).toEqual(['', ', book a table']);
-    // Opening with hey, the words after it may be further off: the audio decided already.
-    expect(at('Hey, little kid, remind me to buy milk')).toEqual(['', ', remind me to buy milk']);
-    expect(at("Hey, you've got. What is the capital of France?")).toEqual(['', '. What is the capital of France?']);
-    expect(at('Hey, look at it')).toEqual(['', ' it']);
-    expect(at('Hey, what is the capital of France?')).toBeNull();
-    expect(at('Hey, call me back')).toBeNull();
-    expect(at('So, hey, little kid')).toBeNull();
-    expect(at('we live in a kit house')).toBeNull();
-    // Another model's phrase, by its file name.
-    expect(matchWakeText('Hey Jarvis, lights', 'hey jarvis')).toEqual({ start: 0, end: 10 });
-  });
-
   it('reads the model, threshold and phrase from the settings', () => {
     expect(wakeWordSettings({})).toEqual({
       classifier: expect.stringMatching(/hey_livekit\.onnx$/),

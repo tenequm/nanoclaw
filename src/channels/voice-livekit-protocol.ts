@@ -194,9 +194,8 @@ export interface CallWakeState {
   /** How many times this call an open turn went back to waiting because nothing more was said; grows on every one. */
   slept?: number;
   /**
-   * From an older worker: the last wake phrase restarted the transcription right after it, so the
-   * caption line it was heard on is the phrase alone. The current worker cuts the phrase from the
-   * turn's text instead, and never sets it.
+   * The last wake was the acoustic wake word, and the turn's transcription started right after the
+   * phrase: no transcript of the turn has it.
    */
   cut?: boolean;
 }

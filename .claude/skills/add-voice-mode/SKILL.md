@@ -528,7 +528,7 @@ the wake switch (see spoken commands below). `VOICE_WAKE_MODEL` is a wake word
 classifier `.onnx` in livekit-wakeword's format, a path (default: the bundled
 `assets/voice-wakeword/hey_livekit.onnx`; `off` for none, and `hey <agent>` in the
 transcript opens a turn). `VOICE_WAKE_PHRASE` is what that model listens for, as the
-page shows it and the worker cuts it from the turn's text: `Hey LiveKit` by default,
+page shows it: `Hey LiveKit` by default,
 for the bundled model; set it whenever `VOICE_WAKE_MODEL` names your own classifier
 (`VOICE_WAKE_PHRASE="Hey Jarvis"`). It is shown as written, and the host reads it too,
 so the page names it before the call. It does not change what the model hears. openWakeWord's
@@ -852,12 +852,10 @@ not the transcript: while it waits, nothing goes to Google; the worker scores th
 caller's audio with the wake word model (`VOICE_WAKE_MODEL`, by default livekit-wakeword's
 `hey_livekit`, in a worker thread, 2 s windows every 80 ms; `VOICE_WAKE_PHRASE` names
 it), a score at or over `VOICE_WAKE_THRESHOLD` opens the turn (at most once in 2 s),
-and the switch and chip name that phrase. The turn's activity starts with the 2 s
-window that had the phrase and 300 ms before it (the window ends where scoring
-stopped, not where the phrase did, so no word after it is lost), and the phrase's
-words, however the transcription spells them (`Hey, LiveKit`, `live kit`,
-`Лайвкіт`), are cut from the start of the turn's text with whatever came before
-them. Speech before the phrase is not transcribed at all, so it shows no caption. A
+and the switch and chip name that phrase. The turn's activity starts right where the
+phrase was spotted, as the wake cue plays (the model is end-aligned: it fires as the
+phrase ends, within an 80 ms hop), so the phrase is never in the turn's audio or text,
+and nothing in the text is searched for it. Speech before the phrase is not transcribed at all, so it shows no caption. A
 turn the phrase opened that hears nothing for `VOICE_WAKE_START_SECONDS`, or nothing
 more for `VOICE_WAKE_IDLE_SECONDS` after its last words, goes back to waiting: its
 final is read first (a `send it` the interim text missed still sends then, late), else
@@ -878,8 +876,9 @@ takes the switches in the `nanoclaw.voice.settings` RPC (`{"wake", "pauseSends",
 "cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase", "heard",
 "slept", "cut"}` (`phrase` only with a wake word model, from the start while it loads;
 `heard` counts the wake phrases heard, so the page marks "heard - listening" even when
-it missed the awake state; `slept` counts the turns that went back to waiting; `cut`
-is no longer set: the phrase's words are cut from the text, not the audio), and dropped words go out
+it missed the awake state; `slept` counts the turns that went back to waiting; `cut`:
+the last wake was the acoustic one, so the turn started after the phrase and no caption of
+the turn has it), and dropped words go out
 on the turn topic as `{"dropped": "discarded" | "unaddressed" | "command" | "asleep",
 "text"}`. The agent's own speech is never transcribed, so it
 cannot trigger a command; caller speech that starts under it sends

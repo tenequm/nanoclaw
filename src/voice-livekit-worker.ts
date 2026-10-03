@@ -1420,69 +1420,6 @@ export function matchWake(text: string, names: readonly WakeName[]): { start: nu
   return null;
 }
 
-/** A word's consonants, voicing and doubling ignored: `livekit`, `live kit`, `lifekit` and `Лайвкіт` read alike. */
-const consonantSkeleton = (word: string): string =>
-  word
-    .replace(/[aeiouy]/g, '')
-    .replace(/[fw]/g, 'v')
-    .replace(/d/g, 't')
-    .replace(/g/g, 'k')
-    .replace(/b/g, 'p')
-    .replace(/z/g, 's')
-    .replace(/(.)\1+/g, '$1');
-
-/** Edits between two strings (Levenshtein). */
-function editDistance(a: string, b: string): number {
-  let row = Array.from({ length: b.length + 1 }, (_, j) => j);
-  for (let i = 1; i <= a.length; i++) {
-    const next = [i];
-    for (let j = 1; j <= b.length; j++) {
-      next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-    }
-    row = next;
-  }
-  return row[b.length];
-}
-
-/**
- * Where an acoustic wake phrase (`hey livekit`) sits in a transcript, however the transcription
- * spelled its name: the name's consonants in one to three words, with a `hey` before it. Only used
- * right after the audio said the phrase was spoken, so it can be lenient: a text that opens with
- * `hey` loses it and the one to three words after it when their consonants are near the name's and
- * end as its do (`Hey, little kid`, `Hey, you've got`). `lenient: false` takes only the name's own
- * consonants, for a final that already went by before the audio spotted the phrase.
- */
-export function matchWakeText(text: string, phrase: string, lenient = true): { start: number; end: number } | null {
-  const phraseWords = spokenWords(phrase).map((w) => w.word);
-  const nameWords = WAKE_WORDS.has(phraseWords[0]) && phraseWords.length > 1 ? phraseWords.slice(1) : phraseWords;
-  const name = nameWords.join('');
-  const skeleton = consonantSkeleton(name);
-  const fuzzy = skeleton.length >= 3;
-  const words = spokenWords(text);
-  for (let i = 0; i < words.length; i++) {
-    let joined = '';
-    for (let k = i; k < Math.min(words.length, i + 3); k++) {
-      joined += words[k].word;
-      if (joined !== name && (!fuzzy || consonantSkeleton(joined) !== skeleton)) continue;
-      const lead = i > 0 && WAKE_WORDS.has(words[i - 1].word);
-      return { start: words[lead ? i - 1 : i].start, end: words[k].end };
-    }
-  }
-  if (!lenient || !fuzzy || words.length < 2 || !WAKE_WORDS.has(words[0].word)) return null;
-  const allowed = Math.floor(skeleton.length / 2);
-  let best: { end: number; distance: number } | null = null;
-  let joined = '';
-  for (let k = 1; k < Math.min(words.length, 4); k++) {
-    joined += words[k].word;
-    const said = consonantSkeleton(joined);
-    // Near, and ending as the name does: `what` is not `livekit`, `you've got` may be.
-    if (!said.endsWith(skeleton.slice(-2))) continue;
-    const distance = editDistance(said, skeleton);
-    if (distance <= allowed && (!best || distance < best.distance)) best = { end: words[k].end, distance };
-  }
-  return best && { start: words[0].start, end: best.end };
-}
-
 export type SpokenCommand = 'send' | 'discard';
 /**
  * The commands, longest first, as the words that end an utterance (Cyrillic already read as Latin:
@@ -1613,10 +1550,6 @@ const joinText = (...parts: string[]): string =>
 /** Text without the punctuation and spaces a cut left at its edges. */
 const trimCut = (text: string): string => text.replace(/^[\s,.;:!?–—-]+|[\s,;:–—-]+$/gu, '');
 
-/** A wake phrase is looked for in this many leading characters of a turn the acoustic wake word opened. */
-const WAKE_PHRASE_LEAD_CHARS = 60;
-/** A wake replay starts this long before the window that had the phrase. */
-const WAKE_CONTEXT_MS = 300;
 /** A command acts once this many interims in a row ended with it, and the caller is silent. */
 const STABLE_COMMAND_INTERIMS = 2;
 
@@ -1631,8 +1564,6 @@ interface OpenTurn {
   addressed: boolean;
   /** Waits for `hey <agent>` in its own transcript; the turn is the words after it. */
   textWake: boolean;
-  /** Opened by the acoustic wake word with the phrase in its audio: the phrase is cut from its text. */
-  acousticWake: boolean;
   /** Text of an earlier activity of this turn (a command that turned out to be words). */
   carry: string;
   /** The activity's whole text so far. */
@@ -1706,8 +1637,8 @@ export interface Recording {
  * Auto mode, hands-free: the caller's speech opens a turn (with a pre-roll from just before it) and
  * the closing silence (`silenceMs` from the end of their speech, with the page's countdown) sends
  * it; speech before then keeps the same turn going. With the wake switch on nothing is transcribed
- * until the wake word spotter hears the phrase; the turn opens with the audio of the phrase (whose
- * words are cut from its text), and only a spoken send sends it (or the pause too, with
+ * until the wake word spotter hears the phrase; the turn opens right after it (where the wake cue
+ * plays), and only a spoken send sends it (or the pause too, with
  * `pauseSends`); it goes back to waiting with no speech for a while (AwakeLimits). Without a
  * spotter the transcript's `hey <agent>` opens it instead.
  *
@@ -1745,6 +1676,8 @@ export class CallTurns {
   private segments = 0;
   private wakes = 0;
   private slept = 0;
+  /** The last wake was the acoustic one: the turn started after the phrase, so no caption of it has the phrase. */
+  private cut = false;
   private pauseTimer?: ReturnType<typeof setTimeout>;
   private awakeTimer?: ReturnType<typeof setTimeout>;
   private closed = false;
@@ -1771,6 +1704,7 @@ export class CallTurns {
       ...(phrase ? { phrase } : {}),
       ...(this.wakes ? { heard: this.wakes } : {}),
       ...(this.slept ? { slept: this.slept } : {}),
+      ...(this.cut ? { cut: true } : {}),
     };
   }
 
@@ -1822,6 +1756,7 @@ export class CallTurns {
     }
     this.wake = wake;
     this.pauseSends = pauseSends;
+    this.cut = false;
     this.waitingSince = this.ring.position;
     if (this.turn && !this.speaking) this.armPause();
     this.arm();
@@ -1875,23 +1810,22 @@ export class CallTurns {
   }
 
   /**
-   * The acoustic wake word: the scored window [start, end) had the phrase. The turn opens with that
-   * window's audio and a little before it, so no word after the phrase is lost; the phrase is cut
-   * from its text.
+   * The acoustic wake word: the window scored up to stream position `at` had the phrase. The turn
+   * opens right there, where the wake cue plays: the model is end-aligned and spots the phrase as it
+   * ends, so the turn's audio, and its text, start after it.
    */
-  onWake(start: number, end: number): void {
+  onWake(at: number): void {
     if (this.closed || !this.spotting) return;
-    if (end <= this.waitingSince) {
+    if (at <= this.waitingSince) {
       this.deps.log.info('voice worker: a wake word from an earlier wait is ignored');
       return;
     }
-    const from = start - samplesOf(WAKE_CONTEXT_MS);
-    if (from < this.ring.position - samplesOf(RING_MS)) {
+    if (at < this.ring.position - samplesOf(RING_MS)) {
       this.deps.log.warn('voice worker: the wake word window is older than the kept audio; no turn opens');
       return;
     }
-    this.open('auto', from, true);
-    if (this.turn) this.turn.acousticWake = true;
+    this.open('auto', at, true);
+    this.cut = true;
     this.woke();
   }
 
@@ -1908,6 +1842,7 @@ export class CallTurns {
       const before = trimCut(text.slice(0, found.start));
       if (before) this.deps.drop('unaddressed', before);
       turn.addressed = true;
+      this.cut = false;
       this.woke();
       if (!this.speaking) this.armPause();
     }
@@ -2014,7 +1949,6 @@ export class CallTurns {
       segment: ++this.segments,
       addressed,
       textWake: kind === 'auto' && this.wake && !addressed,
-      acousticWake: false,
       carry: '',
       heard: '',
       speechMs: 0,
@@ -2045,14 +1979,10 @@ export class CallTurns {
     return true;
   }
 
-  /** The turn's own words in `text`: after `hey <agent>`, or after the acoustic wake phrase near its start. */
+  /** The turn's own words in `text`: after `hey <agent>` when the transcript opened it. */
   private spoken(turn: OpenTurn, text: string): string {
     if (turn.textWake) {
       const found = matchWake(text, this.names);
-      return found ? trimCut(text.slice(found.end)) : text;
-    }
-    if (turn.acousticWake && this.wakeWord) {
-      const found = matchWakeText(text.slice(0, WAKE_PHRASE_LEAD_CHARS), this.wakeWord);
       return found ? trimCut(text.slice(found.end)) : text;
     }
     return text;
@@ -3442,14 +3372,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       spotterFrom = callTurns.position;
       spotter = deps.wakeWord?.({
         onDetect: (score, window) => {
-          const start = window.start + spotterFrom;
           const end = window.end + spotterFrom;
           callLog.info('voice worker: wake word spotted', {
             score: Math.round(score * 1000) / 1000,
             scoredMsAgo: Math.round(msOf(callTurns.position - end)),
           });
           if (ending || review?.reviewing) return;
-          callTurns.onWake(start, end);
+          callTurns.onWake(end);
         },
         onError: (err) => {
           callLog.warn('voice worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn', {
