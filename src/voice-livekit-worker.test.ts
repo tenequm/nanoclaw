@@ -1661,7 +1661,8 @@ describe('speech output', () => {
 describe('spoken command matching', () => {
   it('finds a command only at the end of an utterance, with what was said before it', () => {
     expect(matchCommand('Book a table for two. Send it.')).toEqual({ command: 'send', rest: 'Book a table for two.' });
-    expect(matchCommand('book a table, send it')).toEqual({ command: 'send', rest: 'book a table' });
+    // The comma before the command goes, and the words keep their period.
+    expect(matchCommand('book a table, send it')).toEqual({ command: 'send', rest: 'book a table.' });
     expect(matchCommand('SEND IT!')).toEqual({ command: 'send', rest: '' });
     // Mid-sentence it is words, and so is a longer word ending in it.
     expect(matchCommand('Send it to Anna tomorrow')).toBeNull();
@@ -1669,7 +1670,7 @@ describe('spoken command matching', () => {
     // `over` is no command any more: a Ukrainian speaker's `over` is transcribed as anything.
     expect(matchCommand('Book a table. Over.')).toBeNull();
     // A sentence that really ends in it sends: the price of hands-free.
-    expect(matchCommand("I'll send it.")).toEqual({ command: 'send', rest: "I'll" });
+    expect(matchCommand("I'll send it.")).toEqual({ command: 'send', rest: "I'll." });
   });
 
   it('hears send it as a Ukrainian speaker gets it transcribed, and the Ukrainian прийом', () => {
@@ -1678,11 +1679,11 @@ describe('spoken command matching', () => {
       return m?.command === 'send' ? m.rest : null;
     };
     expect(rest('Забронюй столик. Сенд іт.')).toBe('Забронюй столик.');
-    expect(rest('Забронюй столик, сендіт')).toBe('Забронюй столик');
+    expect(rest('Забронюй столик, сендіт')).toBe('Забронюй столик.');
     expect(rest('Сендип.')).toBe('');
-    expect(rest('Book a table, sendit')).toBe('Book a table');
+    expect(rest('Book a table, sendit')).toBe('Book a table.');
     expect(rest('Book a table. Sent it.')).toBe('Book a table.');
-    expect(rest('Book a table, send eat')).toBe('Book a table');
+    expect(rest('Book a table, send eat')).toBe('Book a table.');
     // The transcription may cut it to its first word.
     expect(rest('Скільки я читав сьогодні? Send.')).toBe('Скільки я читав сьогодні?');
     expect(rest('Скільки я читав сьогодні? Прийом.')).toBe('Скільки я читав сьогодні?');
@@ -1695,8 +1696,8 @@ describe('spoken command matching', () => {
       command: 'discard',
       rest: 'Call the plumber.',
     });
-    expect(matchCommand('call the plumber discard turn')).toEqual({ command: 'discard', rest: 'call the plumber' });
-    expect(matchCommand('No wait - scratch that!')).toEqual({ command: 'discard', rest: 'No wait' });
+    expect(matchCommand('call the plumber discard turn')).toEqual({ command: 'discard', rest: 'call the plumber.' });
+    expect(matchCommand('No wait - scratch that!')).toEqual({ command: 'discard', rest: 'No wait.' });
     expect(matchCommand('Scratch that.')).toEqual({ command: 'discard', rest: '' });
     expect(matchCommand('scratch that idea and call the plumber')).toBeNull();
   });
@@ -2064,6 +2065,46 @@ describe('CallTurns, hands-free', () => {
     expect(h.out.cues).toEqual(['discard']);
   });
 
+  it('a command one interim showed and the next and the final left out still discards at the pause, with no countdown', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Remind me to call the plumber.', 'Remind me to call the plumber.'));
+    await h.talk(1500);
+    expect(h.out.countdown.at(-1)).toMatch(/^stopped/);
+    await h.interim('Remind me to call the plumber. Scratch that.');
+    // A command is pending: the countdown goes, so nothing looks like it is being sent.
+    expect(h.out.countdown.at(-1)).toBe('clear');
+    await h.interim('Remind me to call the plumber.');
+    expect(h.out.countdown.at(-1)).toBe('clear');
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['discarded', 'Remind me to call the plumber.']]);
+    expect(h.out.cues).toEqual(['discard']);
+    // New words after the command, or the same words said again, make it words.
+    h.t.results.push(
+      heard(
+        'Remind me to call mom. Scratch that. Remind me to call mom tomorrow.',
+        'Remind me to call mom. Scratch that. Remind me to call mom tomorrow.',
+      ),
+    );
+    await h.talk(1500);
+    await h.interim('Remind me to call mom. Scratch that.');
+    await h.talk(1500);
+    await h.interim('Remind me to call mom. Scratch that. Remind me to call mom tomorrow.');
+    expect(h.out.countdown.at(-1)).toMatch(/^stopped/);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Remind me to call mom. Scratch that. Remind me to call mom tomorrow.']);
+  });
+
+  it('a sent turn shows what the agent got: no spoken command in its caption, the period kept', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Answer in one word, send it.', 'Answer in one word, send it.'));
+    await h.talk(1500);
+    await h.interim('Answer in one word, send it.');
+    await h.interim('Answer in one word, send it.');
+    expect(h.out.sent).toEqual(['Answer in one word.']);
+    expect(h.out.captions.at(-1)).toEqual([1, 'Answer in one word.', true]);
+  });
+
   it('a command alone, or a question ending in it, sends nothing', async () => {
     const h = turnsHarness();
     h.t.results.push(heard('Send it.', 'Send it.'));
@@ -2193,6 +2234,72 @@ describe('CallTurns, wake', () => {
     await h.interim('Remind me to buy milk');
     await h.pass(20_100);
     expect(h.out.sent).toEqual(['Remind me to buy milk.']);
+  });
+
+  it('words held after the wake go back to waiting on time, however many interims repeat them', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Remind me to stretch later.', 'Remind me to stretch later.'));
+    await h.talk(1000);
+    await h.interim('Remind me to stretch later.');
+    for (let i = 0; i < 4; i++) {
+      await h.pass(5_000);
+      await h.interim('Remind me to stretch later.');
+    }
+    await h.pass(300);
+    expect(h.out.drops).toEqual([['asleep', 'Remind me to stretch later.']]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+
+  it('a scratch that the interims showed once discards when the woken turn goes back to waiting', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Remind me to buy some bread.', 'Remind me to buy some bread.'));
+    await h.talk(1500);
+    await h.interim('Remind me to buy some bread. Scratch that.');
+    await h.interim('Remind me to buy some bread.');
+    await h.pass(20_100);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['discarded', 'Remind me to buy some bread.']]);
+    expect(h.out.cues).toEqual(['wake', 'discard']);
+  });
+
+  it('the wake phrase again in an open turn: never in its text, and a discard before it drops only those words', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    // No interim showed the discard: the second wake phrase and the send are what the caller relies on.
+    h.t.results.push(
+      heard(
+        'Remind me to buy some bread. Hey Andy. What is the capital of Germany? Send it.',
+        'Remind me to buy some bread, scratch that. Hey Andy. What is the capital of Germany? Send it.',
+      ),
+    );
+    await h.talk(1500);
+    await h.interim('Remind me to buy some bread.');
+    await h.pass(10_000);
+    await h.talk(2000);
+    await h.interim('Remind me to buy some bread. Hey Andy. What is the capital of Germany? Send it.');
+    await h.interim('Remind me to buy some bread. Hey Andy. What is the capital of Germany? Send it.');
+    expect(h.out.drops).toEqual([['discarded', 'Remind me to buy some bread, scratch that.']]);
+    expect(h.out.sent).toEqual(['What is the capital of Germany?']);
+    expect(h.out.cues).toEqual(['wake', 'discard']);
+    expect(h.out.captions.at(-1)).toEqual([1, 'Remind me to buy some bread, scratch that.', true]);
+    // Without a discard the words before it stay; the phrase (here the acoustic one's own name) goes.
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(
+      heard(
+        'Remind me to stretch. Hey LiveKit, and buy bread. Send it.',
+        'Remind me to stretch. Hey LiveKit, and buy bread. Send it.',
+      ),
+    );
+    await h.talk(2000);
+    await h.interim('Remind me to stretch. Hey LiveKit, and buy bread. Send it.');
+    await h.interim('Remind me to stretch. Hey LiveKit, and buy bread. Send it.');
+    expect(h.out.sent.at(-1)).toBe('Remind me to stretch. and buy bread.');
   });
 
   it('a discard right after the wake word takes it back', async () => {

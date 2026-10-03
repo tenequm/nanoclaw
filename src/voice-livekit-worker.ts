@@ -1500,15 +1500,32 @@ export function matchCommand(text: string): { command: SpokenCommand; rest: stri
     const tail = words.slice(words.length - phrase.length);
     if (!tail.every((w, i) => w.word === phrase[i])) continue;
     if (text.slice(tail[tail.length - 1].end).includes('?')) return null;
-    return {
-      command,
-      rest: text
-        .slice(0, tail[0].start)
-        .replace(/[\s,;:–—-]+$/u, '')
-        .trim(),
-    };
+    return { command, rest: sentence(text.slice(0, tail[0].start)) };
   }
   return null;
+}
+
+/** Words before a command, as a sentence: the comma before it gone, a period where none ends them. */
+function sentence(text: string): string {
+  const rest = text.replace(/[\s,;:–—-]+$/u, '').trim();
+  return /[\p{L}\p{N}]$/u.test(rest) ? `${rest}.` : rest;
+}
+
+/** The name in a wake phrase (`Hey LiveKit`: `LiveKit`), or none when it does not start with a wake word. */
+function phraseName(phrase: string): string | undefined {
+  const [lead, ...rest] = phrase.trim().split(/\s+/);
+  return rest.length && WAKE_WORDS.has(spokenWord(lead)) ? rest.join(' ') : undefined;
+}
+
+/** Every `hey <agent>` in a transcript, in order. */
+export function matchWakes(text: string, names: readonly WakeName[]): Array<{ start: number; end: number }> {
+  const found: Array<{ start: number; end: number }> = [];
+  for (let from = 0; ; ) {
+    const match = matchWake(text.slice(from), names);
+    if (!match) return found;
+    found.push({ start: from + match.start, end: from + match.end });
+    from += match.end;
+  }
 }
 
 /** How long an open turn waits for speech before it goes back to waiting for the wake phrase; 0 never. */
@@ -1588,6 +1605,18 @@ export function endsLike(final: string, rest: string): boolean {
   return said.length === 2 && said.every((w) => before.has(w));
 }
 
+/** Words a command may add: its own (three at most) and a filler. */
+const COMMAND_WORDS = 4;
+
+/**
+ * Whether `text` is the words an earlier interim had before its command, with the command left out:
+ * it ends like them (endsLike) and has no more words than they and a command would. New words after
+ * the command (`send it to Anna`), or a repeat of the same words, are not.
+ */
+export function droppedCommand(text: string, rest: string): boolean {
+  return endsLike(text, rest) && wordCount(text) <= wordCount(rest) + COMMAND_WORDS - 1;
+}
+
 const joinText = (...parts: string[]): string =>
   parts
     .map((p) => p.trim())
@@ -1617,6 +1646,13 @@ interface OpenTurn {
   heard: string;
   /** The command the last interims ended with, and in how many in a row. */
   candidate?: { command: SpokenCommand; count: number };
+  /**
+   * The last command any interim of this activity ended with, and the words before it: a later
+   * interim, and the final, can leave it out again.
+   */
+  seen?: { command: SpokenCommand; rest: string };
+  /** The send countdown is held back: a command is pending. */
+  quiet?: boolean;
   speechMs: number;
   /** Stream position of its last speech end, for the recording's trim. */
   lastSpeechEnd: number;
@@ -1693,7 +1729,9 @@ export interface Recording {
  * its end in STABLE_COMMAND_INTERIMS interims in a row, with the caller silent, ends the activity,
  * and the final text decides (turnText): a command it still ends with acts, one it does not was
  * words, and the turn goes on in a new activity carrying the text so far. A pause or sleep that
- * ends a turn applies a command its text ends with the same way.
+ * ends a turn applies a command its text ends with the same way, or one any interim of the activity
+ * ended with that the final left out (`droppedCommand`). The wake phrase said again inside a woken
+ * turn is never part of its words: a discard before it drops only the words before it.
  *
  * Review mode (manual): `record` opens a turn, `stopRecording` closes it into a draft, and the auto
  * rules stand aside. Speech while the agent's line is due or plays is noted (`unheard`), never transcribed.
@@ -1728,7 +1766,8 @@ export class CallTurns {
   private pauseTimer?: ReturnType<typeof setTimeout>;
   private awakeTimer?: ReturnType<typeof setTimeout>;
   private closed = false;
-  private readonly names: WakeName[];
+  /** The names `hey <agent>` takes, and the acoustic phrase's own name while one is in use. */
+  private names: WakeName[];
   private readonly limits: AwakeLimits;
   private readonly now: () => number;
 
@@ -1790,6 +1829,8 @@ export class CallTurns {
   useWakeWord(phrase: string | undefined): void {
     this.loadingPhrase = undefined;
     this.wakeWord = phrase;
+    const name = phrase ? phraseName(phrase) : undefined;
+    this.names = wakeNameWords([...this.options.names, ...(name ? [name] : [])]);
     this.waitingSince = this.ring.position;
     this.deps.changed();
   }
@@ -1880,6 +1921,7 @@ export class CallTurns {
   onInterim(text: string): void {
     const turn = this.turn;
     if (!turn) return;
+    const changed = text !== turn.heard;
     turn.heard = text;
     this.deps.caption(turn.segment, joinText(turn.carry, text), false);
     if (turn.kind !== 'auto') return;
@@ -1894,11 +1936,14 @@ export class CallTurns {
       if (!this.speaking) this.armPause();
     }
     const match = matchCommand(this.spoken(turn, text));
+    if (match) turn.seen = match;
     if (!match) turn.candidate = undefined;
     else if (turn.candidate?.command === match.command) turn.candidate.count++;
     else turn.candidate = { command: match.command, count: 1 };
-    this.command();
-    this.arm();
+    if (this.command()) return;
+    // The idle clock restarts on new words only: an interim repeating the same text is no speech.
+    if (changed) this.arm();
+    this.syncCountdown(turn);
   }
 
   /** An agent line is due (true, from before its speech is made) or done: the caller is not transcribed meanwhile. */
@@ -2026,6 +2071,28 @@ export class CallTurns {
     return true;
   }
 
+  /**
+   * The command the activity's text would end in were it finished now: the one its last interim ends
+   * with, or one an earlier interim ended with that the text still ends like (the interim dropped it).
+   */
+  private pendingCommand(
+    turn: OpenTurn,
+    text = this.spoken(turn, turn.heard),
+  ): { command: SpokenCommand; rest: string } | null {
+    return matchCommand(text) ?? (turn.seen && droppedCommand(text, turn.seen.rest) ? turn.seen : null);
+  }
+
+  /** The send countdown shows while the closing silence runs, and not while a spoken command is pending. */
+  private syncCountdown(turn: OpenTurn): void {
+    if (turn !== this.turn || turn.kind !== 'auto' || !turn.addressed || !this.pausesSend) return;
+    if (this.speaking || this.agentSpeaking) return;
+    const quiet = !!this.pendingCommand(turn);
+    if (quiet === !!turn.quiet) return;
+    turn.quiet = quiet;
+    if (quiet) this.deps.countdown.clear();
+    else this.deps.countdown.stopped(this.now() - msOf(this.ring.position - Math.max(turn.lastSpeechEnd, turn.from)));
+  }
+
   /** The turn's own words in `text`: after `hey <agent>` when the transcript opened it. */
   private spoken(turn: OpenTurn, text: string): string {
     if (turn.textWake) {
@@ -2043,7 +2110,11 @@ export class CallTurns {
     if (turn.addressed && !this.pausesSend) return;
     const sinceEnd = msOf(this.ring.position - Math.max(turn.lastSpeechEnd, turn.from));
     const left = Math.max(0, this.options.silenceMs - sinceEnd);
-    if (turn.addressed) this.deps.countdown.stopped(this.now() - sinceEnd);
+    if (turn.addressed) {
+      // A spoken command is pending: the pause applies it, so nothing looks like it is being sent.
+      turn.quiet = !!this.pendingCommand(turn);
+      if (!turn.quiet) this.deps.countdown.stopped(this.now() - sinceEnd);
+    }
     this.pauseTimer = setTimeout(() => void this.finish(turn.addressed ? 'pause' : 'unaddressed'), left);
     this.pauseTimer.unref?.();
   }
@@ -2094,7 +2165,7 @@ export class CallTurns {
     if (turn.before) turn.carry = joinText(await turn.before, turn.carry);
     if (this.finalizing?.turn === turn) this.finalizing = undefined;
     const chosen = turnText(heard);
-    const said = joinText(turn.carry, chosen.text);
+    let said = joinText(turn.carry, chosen.text);
     this.deps.log.info('voice worker: turn text', {
       segment: turn.segment,
       why,
@@ -2103,51 +2174,95 @@ export class CallTurns {
       finalizeMs: heard.finalizeMs,
       ...(heard.failed ? { audioLost: true } : {}),
     });
-    if (said) this.deps.caption(turn.segment, said, true);
-    if (this.closed) return null;
-    this.syncHold();
+    const caption = (text: string) => {
+      if (text) this.deps.caption(turn.segment, text, true);
+    };
     const recording: Recording = { text: said, failed: heard.failed && !said, take };
-    if (why === 'review' || why === 'switch') return recording;
-    if (turn.switched) {
-      turn.switched(recording);
+    const decides = !(
+      why === 'review' ||
+      why === 'switch' ||
+      turn.switched ||
+      turn.handOff ||
+      why === 'dropped' ||
+      why === 'unaddressed'
+    );
+    if (!decides || this.closed) {
+      caption(said);
+      if (this.closed) return null;
+      this.syncHold();
+      if (why === 'review' || why === 'switch') return recording;
+      if (turn.switched) {
+        turn.switched(recording);
+        return null;
+      }
+      if (turn.handOff) {
+        turn.handOff(said);
+        return null;
+      }
+      if (why === 'unaddressed') {
+        if (said) this.deps.drop('unaddressed', said);
+        this.deps.noTurn();
+      }
       return null;
     }
-    if (turn.handOff) {
-      turn.handOff(said);
-      return null;
+    this.syncHold();
+    let text = this.spoken(turn, said);
+    /** Words before a second wake phrase that a discard ended: dropped on their own. */
+    let scratched: string | undefined;
+    const rewoken = this.wake ? matchWakes(text, this.names).at(-1) : undefined;
+    if (rewoken) {
+      // The wake phrase again inside the open turn: never part of its words. What came before it
+      // ended in a discard is dropped; otherwise it stays, and the turn is the words around the phrase.
+      const before = trimCut(text.slice(0, rewoken.start));
+      const after = trimCut(text.slice(rewoken.end));
+      if (matchCommand(before)?.command === 'discard') {
+        scratched = before;
+        text = after;
+      } else text = joinText(before, after);
+      said = text;
     }
-    if (why === 'dropped') return null;
-    if (why === 'unaddressed') {
-      if (said) this.deps.drop('unaddressed', said);
-      this.deps.noTurn();
-      return null;
-    }
-    const text = this.spoken(turn, said);
     let match = matchCommand(text);
-    const nominated = turn.kind === 'auto' ? matchCommand(this.spoken(turn, turn.heard)) : null;
+    // The command an interim ended with, the last one's or an earlier one's.
+    const nominated = turn.kind === 'auto' ? this.pendingCommand(turn) : null;
     // A final that ends in the command's words as a question asked it: the interim text cannot overrule that.
     const asked = !match && !!matchCommand(text.replace(/[?\s]+$/u, ''));
     if (!match && !asked && nominated && endsLike(text, nominated.rest)) {
       // The final left out the command the interim text ended with: the command stands, and the
       // final is the turn's text.
-      match = { command: nominated.command, rest: trimCut(text) };
+      match = { command: nominated.command, rest: sentence(trimCut(text)) };
     }
+    const scratch = () => {
+      if (scratched) this.discarded(scratched);
+    };
     // A command the final does not end with was words: the turn goes on.
-    if ((why === 'send' || why === 'discard') && match?.command !== why) {
+    if ((why === 'send' || why === 'discard') && match?.command !== why && !(why === 'discard' && scratched)) {
+      caption(scratched ?? said);
+      scratch();
       this.goOn(said, endedAt);
       return null;
     }
     if (match?.command === 'discard') {
+      caption(scratched ?? said);
+      scratch();
       // A discard with nothing said takes a wake back; in hands-free it has nothing to act on.
       if (!match.rest && !this.wake) this.nope(text);
       else this.discarded(text);
       return null;
     }
     if (match?.command === 'send' && !match.rest) {
+      caption(scratched ?? said);
+      scratch();
       this.nope(text);
       return null;
     }
     const body = match ? match.rest : text;
+    // A sent turn's caption is what the agent gets: the spoken command is not part of it.
+    caption(scratched ?? (match?.command === 'send' ? (matchCommand(said)?.rest ?? said) : said));
+    scratch();
+    if (scratched && !body) {
+      if (this.wake) this.deps.changed();
+      return null;
+    }
     if (why === 'asleep' && !match) {
       if (body) this.deps.drop('asleep', body);
       this.slept++;
