@@ -123,6 +123,7 @@ describe('WakeWordSpotter', () => {
   it('names the phrase after the classifier file', () => {
     expect(wakePhraseOf(DEFAULT_WAKE_MODEL)).toBe('hey livekit');
     expect(wakePhraseOf('/models/hey_jarvis.int8.onnx')).toBe('hey jarvis');
+    expect(wakePhraseOf('hey_jarvis_v0.1.onnx')).toBe('hey jarvis');
   });
 
   it('spots the wake word once in a worker thread, and only while listening', async () => {

@@ -5,7 +5,8 @@
  *
  * The pipeline is the reference's `WakeWordModel.predict` on a 2 s window of 16 kHz mono audio:
  * the frozen mel model (x/10 + 2), the speech embedding on 76-frame mel windows every 8 frames, and
- * the classifier on the last 16 embeddings. Like the reference listener, a window is scored every
+ * the classifier on the last 16 embeddings (or as many as its input takes, with a longer window:
+ * openWakeWord classifiers load too). Like the reference listener, a window is scored every
  * 80 ms of new audio.
  *
  * Imports nothing local: the worker thread loads this same file, as `.js` from the build and as
@@ -19,7 +20,7 @@ import { Worker, isMainThread, parentPort, workerData } from 'node:worker_thread
 import * as ort from 'onnxruntime-node';
 
 export const WAKE_SAMPLE_RATE = 16_000;
-/** The audio one score looks at: 2 s, which yields exactly the classifier's 16 embeddings. */
+/** The audio one score looks at for a 16-embedding classifier: 2 s, as the reference listener's. */
 export const WAKE_WINDOW_SAMPLES = 32_000;
 /** New audio between scores: 80 ms, the reference listener's frame. */
 export const WAKE_HOP_SAMPLES = 1_280;
@@ -32,18 +33,24 @@ export const CUSTOM_WAKE_THRESHOLD = 0.5;
 const MEL_BINS = 32;
 const EMBEDDING_WINDOW = 76;
 const EMBEDDING_STRIDE = 8;
-const EMBEDDINGS = 16;
+/** The classifier input's length when its model does not say. */
+const DEFAULT_EMBEDDINGS = 16;
 const EMBEDDING_DIM = 96;
+
+/** The audio a classifier of `embeddings` timesteps scores: 2 s for 16, and 80 ms more per extra one. */
+export const windowSamples = (embeddings: number): number =>
+  WAKE_WINDOW_SAMPLES + (embeddings - DEFAULT_EMBEDDINGS) * EMBEDDING_STRIDE * (WAKE_SAMPLE_RATE / 100);
 
 /** The bundled models: the two frozen feature models and the `hey_livekit` classifier. */
 export const WAKE_MODEL_DIR = fileURLToPath(new URL('../assets/voice-wakeword/', import.meta.url));
 export const DEFAULT_WAKE_MODEL = path.join(WAKE_MODEL_DIR, 'hey_livekit.onnx');
 
-/** The phrase a classifier listens for, from its file name: `hey_livekit.onnx` is "hey livekit". */
+/** The phrase a classifier listens for, from its file name: `hey_livekit.onnx` and `hey_jarvis_v0.1.onnx` say it. */
 export function wakePhraseOf(modelPath: string): string {
   return path
     .basename(modelPath)
     .replace(/(\.int8)?\.onnx$/i, '')
+    .replace(/[_-]v\d+(\.\d+)*$/i, '')
     .replace(/[_-]+/g, ' ')
     .trim();
 }
@@ -64,11 +71,17 @@ export class WakeWordPipeline {
   private readonly mel: ort.InferenceSession;
   private readonly embedding: ort.InferenceSession;
   private readonly classifier: ort.InferenceSession;
+  /** Embedding timesteps the classifier takes: 16 for livekit-wakeword's, other openWakeWord models differ. */
+  readonly embeddings: number;
 
   private constructor(mel: ort.InferenceSession, embedding: ort.InferenceSession, classifier: ort.InferenceSession) {
     this.mel = mel;
     this.embedding = embedding;
     this.classifier = classifier;
+    // Bound by position, not name: openWakeWord's classifiers call them `x.1` and `53`.
+    const input = classifier.inputMetadata[0];
+    const steps = input?.isTensor ? input.shape[1] : undefined;
+    this.embeddings = typeof steps === 'number' && steps > 0 ? steps : DEFAULT_EMBEDDINGS;
   }
 
   static async load(classifier: string, featureDir = WAKE_MODEL_DIR): Promise<WakeWordPipeline> {
@@ -102,26 +115,26 @@ export class WakeWordPipeline {
     const frames = melTensor.dims[melTensor.dims.length - 2];
     const melDb = melTensor.data as Float32Array;
     const windows = frames < EMBEDDING_WINDOW ? 0 : Math.floor((frames - EMBEDDING_WINDOW) / EMBEDDING_STRIDE) + 1;
-    if (windows < EMBEDDINGS) {
+    if (windows < this.embeddings) {
       this.last = undefined;
       return 0;
     }
-    const first = windows - EMBEDDINGS;
+    const first = windows - this.embeddings;
     const perWindow = EMBEDDING_WINDOW * MEL_BINS;
-    const mel = new Float32Array(EMBEDDINGS * perWindow);
-    for (let w = 0; w < EMBEDDINGS; w++) {
+    const mel = new Float32Array(this.embeddings * perWindow);
+    for (let w = 0; w < this.embeddings; w++) {
       const from = (first + w) * EMBEDDING_STRIDE * MEL_BINS;
       // Scaled as openWakeWord's melspec_transform does.
       for (let i = 0; i < perWindow; i++) mel[w * perWindow + i] = melDb[from + i] / 10 + 2;
     }
-    const embeddings = new Float32Array(EMBEDDINGS * EMBEDDING_DIM);
+    const embeddings = new Float32Array(this.embeddings * EMBEDDING_DIM);
     const last = this.last;
     const hop = EMBEDDING_STRIDE * (WAKE_SAMPLE_RATE / 100);
     const shift = last && end !== undefined && (end - last.end) % hop === 0 ? (end - last.end) / hop : 0;
     const missing: number[] = [];
-    for (let w = 0; w < EMBEDDINGS; w++) {
+    for (let w = 0; w < this.embeddings; w++) {
       const from = w + shift;
-      if (last && shift > 0 && from < EMBEDDINGS && sameBlock(mel, w, last.mel, from, perWindow)) {
+      if (last && shift > 0 && from < this.embeddings && sameBlock(mel, w, last.mel, from, perWindow)) {
         embeddings.set(last.embeddings.subarray(from * EMBEDDING_DIM, (from + 1) * EMBEDDING_DIM), w * EMBEDDING_DIM);
       } else missing.push(w);
     }
@@ -144,7 +157,7 @@ export class WakeWordPipeline {
     this.last = end === undefined ? undefined : { end, mel, embeddings };
     this.embedded += missing.length;
     const scoreOut = await this.classifier.run({
-      [this.classifier.inputNames[0]]: new ort.Tensor('float32', embeddings, [1, EMBEDDINGS, EMBEDDING_DIM]),
+      [this.classifier.inputNames[0]]: new ort.Tensor('float32', embeddings, [1, this.embeddings, EMBEDDING_DIM]),
     });
     return (scoreOut[this.classifier.outputNames[0]].data as Float32Array)[0];
   }
@@ -176,7 +189,7 @@ interface ThreadInit {
   classifier: string;
   featureDir: string;
 }
-type ThreadReply = { ready: true } | { error: string } | { id: number; score: number; ms: number };
+type ThreadReply = { ready: true; embeddings: number } | { error: string } | { id: number; score: number; ms: number };
 
 if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
   const init = workerData as ThreadInit;
@@ -190,7 +203,7 @@ if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
           (err: unknown) => port.postMessage({ error: String(err) } satisfies ThreadReply),
         );
       });
-      port.postMessage({ ready: true } satisfies ThreadReply);
+      port.postMessage({ ready: true, embeddings: pipeline.embeddings } satisfies ThreadReply);
     },
     (err: unknown) =>
       port.postMessage({ error: err instanceof Error ? err.message : String(err) } satisfies ThreadReply),
@@ -232,7 +245,8 @@ export class WakeWordSpotter {
   /** Resolves once the models are loaded, rejects when they cannot be. */
   readonly ready: Promise<void>;
   private readonly thread: Worker;
-  private readonly ring = new Float32Array(WAKE_WINDOW_SAMPLES);
+  /** The last window's audio: its length is the classifier's (2 s for 16 embeddings). */
+  private ring = new Float32Array(WAKE_WINDOW_SAMPLES);
   private write = 0;
   private filled = 0;
   /** Samples pushed so far: where the window just taken ends, for the thread to reuse work. */
@@ -268,6 +282,12 @@ export class WakeWordSpotter {
     this.ready = new Promise<void>((resolve, reject) => {
       this.thread.on('message', (msg: ThreadReply) => {
         if ('ready' in msg) {
+          const size = windowSamples(msg.embeddings);
+          if (size !== this.ring.length) {
+            this.ring = new Float32Array(size);
+            this.write = 0;
+            this.filled = 0;
+          }
           this.loaded = true;
           return resolve();
         }
@@ -297,24 +317,25 @@ export class WakeWordSpotter {
   /** 16 kHz mono audio, in order. */
   push(pcm: Int16Array): void {
     if (this.closed) return;
+    const size = this.ring.length;
     for (let i = 0; i < pcm.length; i++) {
       this.ring[this.write] = pcm[i] / 32768;
-      this.write = (this.write + 1) % WAKE_WINDOW_SAMPLES;
+      this.write = (this.write + 1) % size;
     }
-    this.filled = Math.min(WAKE_WINDOW_SAMPLES, this.filled + pcm.length);
+    this.filled = Math.min(size, this.filled + pcm.length);
     this.position += pcm.length;
     if (!this.listening || !this.loaded) return;
     this.sinceScore += pcm.length;
-    // Like the reference listener: a full 2 s window, then one score per 80 ms.
-    if (this.filled < WAKE_WINDOW_SAMPLES || this.sinceScore < WAKE_HOP_SAMPLES) return;
+    // Like the reference listener: a full window, then one score per 80 ms.
+    if (this.filled < size || this.sinceScore < WAKE_HOP_SAMPLES) return;
     this.sinceScore %= WAKE_HOP_SAMPLES;
     if (this.inflight) {
       this.stats.skipped++;
       return;
     }
-    const audio = new Float32Array(WAKE_WINDOW_SAMPLES);
+    const audio = new Float32Array(size);
     audio.set(this.ring.subarray(this.write));
-    audio.set(this.ring.subarray(0, this.write), WAKE_WINDOW_SAMPLES - this.write);
+    audio.set(this.ring.subarray(0, this.write), size - this.write);
     this.inflight = true;
     this.thread.postMessage({ id: this.nextId++, audio, end: this.position }, [audio.buffer]);
   }

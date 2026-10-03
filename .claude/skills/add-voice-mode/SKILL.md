@@ -510,7 +510,9 @@ It also reads `VOICE_WAKE_MODEL` and `VOICE_WAKE_THRESHOLD`, for the wake switch
 (see spoken commands below). `VOICE_WAKE_MODEL` is a wake word classifier `.onnx`
 in livekit-wakeword's format (default: the bundled
 `assets/voice-wakeword/hey_livekit.onnx`; `off` for none); its file name is the
-phrase (`hey_jarvis.onnx` listens for "hey jarvis"). `VOICE_WAKE_THRESHOLD` is the
+phrase (`hey_jarvis_v0.1.onnx` listens for "hey jarvis"). openWakeWord's
+classifiers load too, but their pretrained models are CC BY-NC-SA 4.0
+(non-commercial): fine for your own install, never to be committed or shipped. `VOICE_WAKE_THRESHOLD` is the
 score (0 to 1) that counts as the wake word: by default 0.68, livekit-wakeword's
 documented operating point for `hey_livekit`, and 0.5 for another model.
 
