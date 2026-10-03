@@ -66,6 +66,7 @@ import {
   liveKitCallSecret,
   liveKitHostUrl,
   CALL_COMMANDS_ATTRIBUTE,
+  CALL_COMMANDS_VERSION,
   CALL_CUE_TRACK,
   CALL_PENDING_ATTRIBUTE,
   CALL_REPLY_TOPIC,
@@ -1512,8 +1513,8 @@ export function wakeNameWords(names: readonly string[]): WakeName[] {
     .filter((words) => words.length > 0);
 }
 
-/** Where the first `hey <agent>` in a final transcript ends, or -1 when it has none; `Heyben` counts too. */
-export function matchWake(text: string, names: readonly WakeName[]): number {
+/** Where the first `hey <agent>` in a final transcript starts (its `hey`) and ends, or null; `Heyben` counts too. */
+export function matchWake(text: string, names: readonly WakeName[]): { start: number; end: number } | null {
   const words = spokenWords(text);
   for (let i = 0; i < words.length; i++) {
     const { word } = words[i];
@@ -1528,26 +1529,13 @@ export function matchWake(text: string, names: readonly WakeName[]): number {
     for (const said of starts) {
       for (const name of names) {
         if (said.length < name.length) continue;
-        if (name.every((part, j) => sameNameWord(said[j], part))) return said[name.length - 1].end;
+        if (name.every((part, j) => sameNameWord(said[j], part))) {
+          return { start: words[i].start, end: said[name.length - 1].end };
+        }
       }
     }
   }
-  return -1;
-}
-
-/** Where the `hey <agent>` that ends at `end` starts: its `hey` word (or the word it is glued to). */
-function wakeStart(text: string, end: number): number {
-  const words = spokenWords(text.slice(0, end));
-  for (let i = words.length - 1; i >= 0; i--) {
-    const { word } = words[i];
-    if (
-      WAKE_WORDS.has(word) ||
-      GLUED_WAKE_WORDS.some((lead) => word.length > lead.length + 1 && word.startsWith(lead))
-    ) {
-      return words[i].start;
-    }
-  }
-  return 0;
+  return null;
 }
 
 /** A word's consonants, voicing and doubling ignored: `livekit`, `live kit`, `lifekit` and `Лайвкіт` read alike. */
@@ -1560,9 +1548,6 @@ const consonantSkeleton = (word: string): string =>
     .replace(/b/g, 'p')
     .replace(/z/g, 's')
     .replace(/(.)\1+/g, '$1');
-
-/** Words a transcript may put before the spotted phrase's name, as part of the phrase. */
-const WAKE_LEADS = new Set([...WAKE_WORDS, 'hi', 'hay']);
 
 /** Edits between two strings (Levenshtein). */
 function editDistance(a: string, b: string): number {
@@ -1582,11 +1567,12 @@ function editDistance(a: string, b: string): number {
  * spelled its name: the name's consonants in one to three words, with a `hey` before it. Only used
  * right after the audio said the phrase was spoken, so it can be lenient: a text that opens with
  * `hey` loses it and the one to three words after it when their consonants are near the name's and
- * end as its do (`Hey, little kid`, `Hey, you've got`).
+ * end as its do (`Hey, little kid`, `Hey, you've got`). `lenient: false` takes only the name's own
+ * consonants, for a final that already went by before the audio spotted the phrase.
  */
-export function matchWakeText(text: string, phrase: string): { start: number; end: number } | null {
+export function matchWakeText(text: string, phrase: string, lenient = true): { start: number; end: number } | null {
   const phraseWords = spokenWords(phrase).map((w) => w.word);
-  const nameWords = WAKE_LEADS.has(phraseWords[0]) && phraseWords.length > 1 ? phraseWords.slice(1) : phraseWords;
+  const nameWords = WAKE_WORDS.has(phraseWords[0]) && phraseWords.length > 1 ? phraseWords.slice(1) : phraseWords;
   const name = nameWords.join('');
   const skeleton = consonantSkeleton(name);
   const fuzzy = skeleton.length >= 3;
@@ -1596,11 +1582,11 @@ export function matchWakeText(text: string, phrase: string): { start: number; en
     for (let k = i; k < Math.min(words.length, i + 3); k++) {
       joined += words[k].word;
       if (joined !== name && (!fuzzy || consonantSkeleton(joined) !== skeleton)) continue;
-      const lead = i > 0 && WAKE_LEADS.has(words[i - 1].word);
+      const lead = i > 0 && WAKE_WORDS.has(words[i - 1].word);
       return { start: words[lead ? i - 1 : i].start, end: words[k].end };
     }
   }
-  if (!fuzzy || words.length < 2 || !WAKE_LEADS.has(words[0].word)) return null;
+  if (!lenient || !fuzzy || words.length < 2 || !WAKE_WORDS.has(words[0].word)) return null;
   const allowed = Math.floor(skeleton.length / 2);
   let best: { end: number; distance: number } | null = null;
   let joined = '';
@@ -1619,7 +1605,7 @@ export type SpokenCommand = 'send' | 'discard';
 /**
  * The commands, longest first, as the words that end an utterance (Cyrillic already read as Latin:
  * `сенд іт` is `send it`). `send it` as the transcription hears it from a Ukrainian speaker
- * (`сендіт`, `сендип`, `sent it`, `send eat`, or cut to a final `send`), and the Ukrainian `прийом`.
+ * (`сендіт`, `сендит`, `сендип`, `sent it`, `send eat`, or cut to a final `send`), and the Ukrainian `прийом`.
  */
 const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[]]> = [
   ['discard', ['discard', 'this', 'turn']],
@@ -1629,6 +1615,7 @@ const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[]]> = [
   ['send', ['sent', 'it']],
   ['send', ['send', 'eat']],
   ['send', ['sendit']],
+  ['send', ['sendyt']],
   ['send', ['sendyp']],
   ['send', ['sendip']],
   ['send', ['send']],
@@ -1698,8 +1685,11 @@ export class SpokenCommands {
   private wakeWord?: string;
   /** After a spotted wake word: the finals that may still carry its phrase, to strip it from. */
   private strip?: { until: number; finals: number; keepBefore: boolean };
-  /** The last final dropped while waiting: a wake word spotted just after it may have been in it. */
-  private lastUnaddressed?: { text: string; at: number };
+  /**
+   * The last final dropped while waiting, not reported yet: a wake word spotted just after it may
+   * have been in it, and then its words after the phrase are the turn, never "ignored" on the page.
+   */
+  private lastUnaddressed?: { text: string; at: number; timer: ReturnType<typeof setTimeout> };
   /** How many times the wake phrase opened a turn this call. */
   private wakes = 0;
 
@@ -1731,7 +1721,7 @@ export class SpokenCommands {
     if (phrase === this.wakeWord) return;
     this.wakeWord = phrase;
     this.strip = undefined;
-    this.lastUnaddressed = undefined;
+    this.reportUnaddressed();
     this.deps.changed();
   }
 
@@ -1748,12 +1738,18 @@ export class SpokenCommands {
     if (keepBefore) return;
     this.open();
     const late = this.lastUnaddressed;
+    if (!late) return;
     this.lastUnaddressed = undefined;
-    if (!late || now - late.at > WAKE_LATE_FINAL_MS) return;
-    const found = matchWakeText(late.text, this.wakeWord);
-    if (!found) return;
-    // Its words before the phrase were reported as unaddressed already.
+    clearTimeout(late.timer);
+    // Only the name's own spelling: a final that is already gone is not taken on a near miss.
+    const found = now - late.at <= WAKE_LATE_FINAL_MS ? matchWakeText(late.text, this.wakeWord, false) : null;
+    if (!found) return this.deps.drop('unaddressed', late.text);
     this.strip = undefined;
+    const before = late.text
+      .slice(0, found.start)
+      .replace(/[\s,;:–—-]+$/u, '')
+      .trim();
+    if (before) this.deps.drop('unaddressed', before);
     const said = late.text.slice(found.end).replace(/^[\s,.;:!?–—-]+/u, '');
     if (said) this.take(said);
   }
@@ -1779,7 +1775,7 @@ export class SpokenCommands {
       this.awake = false;
       this.pending = undefined;
       this.strip = undefined;
-      this.lastUnaddressed = undefined;
+      this.reportUnaddressed();
       // From here the open turn is these words: none when the gate closes, since none were addressed.
       this.cutSinceCommit = true;
       if (wake) {
@@ -1797,7 +1793,7 @@ export class SpokenCommands {
     this.heardWords = [];
     this.pending = undefined;
     this.strip = undefined;
-    this.lastUnaddressed = undefined;
+    this.reportUnaddressed();
     this.cutSinceCommit = true;
     if (this.awake) {
       this.awake = false;
@@ -1826,26 +1822,26 @@ export class SpokenCommands {
     if (this.pending) this.unhold();
     let said = words;
     if (this.waiting && this.wakeWord) {
+      this.reportUnaddressed();
       if (this.loneCommand(said)) return;
-      this.lastUnaddressed = { text: said, at: this.now() };
-      this.deps.drop('unaddressed', said);
+      this.holdUnaddressed(said);
       return this.deps.noTurn?.();
     }
     if (this.waiting) {
-      const end = matchWake(said, this.names);
-      if (end < 0) {
+      const found = matchWake(said, this.names);
+      if (!found) {
         if (this.loneCommand(said)) return;
         this.deps.drop('unaddressed', said);
         return this.deps.noTurn?.();
       }
       // Words before the phrase in the same final were not for the agent: the page marks them so.
       const before = said
-        .slice(0, wakeStart(said, end))
+        .slice(0, found.start)
         .replace(/[\s,;:–—-]+$/u, '')
         .trim();
       if (before) this.deps.drop('unaddressed', before);
       this.open();
-      said = said.slice(end).replace(/^[\s,.;:!?–—-]+/u, '');
+      said = said.slice(found.end).replace(/^[\s,.;:!?–—-]+/u, '');
       if (!said) return;
     }
     const stripped = this.stripWakeWord(said, true);
@@ -1855,6 +1851,22 @@ export class SpokenCommands {
       if (!said) return this.deps.heard('', true);
     }
     this.take(said);
+  }
+
+  /** Hold a final dropped while waiting for WAKE_LATE_FINAL_MS, then report it as unaddressed. */
+  private holdUnaddressed(text: string): void {
+    const timer = setTimeout(() => this.reportUnaddressed(), WAKE_LATE_FINAL_MS);
+    timer.unref?.();
+    this.lastUnaddressed = { text, at: this.now(), timer };
+  }
+
+  /** The held final can no longer carry a wake word: the page marks it ignored now. */
+  private reportUnaddressed(): void {
+    const late = this.lastUnaddressed;
+    if (!late) return;
+    this.lastUnaddressed = undefined;
+    clearTimeout(late.timer);
+    this.deps.drop('unaddressed', late.text);
   }
 
   /** A final's words, after any wake phrase: kept, or held when they end in a command. */
@@ -2927,7 +2939,7 @@ async function sessionVoice(
           local.registerRpcMethod(REVIEW_RPC[op], (data) => handle(op, data.payload, data.callerIdentity));
         }
         void ctx.room.localParticipant
-          ?.setAttributes({ [CALL_REVIEW_ATTRIBUTE]: '1', [CALL_COMMANDS_ATTRIBUTE]: '1' })
+          ?.setAttributes({ [CALL_REVIEW_ATTRIBUTE]: '1', [CALL_COMMANDS_ATTRIBUTE]: CALL_COMMANDS_VERSION })
           .catch(() => undefined);
       },
     },

@@ -155,7 +155,7 @@ export interface ReviewInput {
 const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
 
 /** The host takes a turn of at most this many UTF-8 bytes (MAX_TURN_TEXT_BYTES in the protocol). */
-export const MAX_TURN_BYTES = 8 * 1024
+const MAX_TURN_BYTES = 8 * 1024
 
 /** How many characters a draft has to lose to fit the host's limit (0 when it fits). */
 export function charsOver(text: string): number {
@@ -389,16 +389,28 @@ export function modeCaption(mode: TurnMode, commands: boolean): string {
 }
 
 /**
- * The page's own copy of the worker's send words and discard phrases, as `norm` leaves them (lowercase,
- * letters and digits only, Cyrillic kept as is). A caption line that ends in one holds that command.
+ * The `nanoclaw.voice.commands` value of the worker whose words these are (CALL_COMMANDS_VERSION):
+ * "1" had `over` as the send word, so the page offers commands to this vocabulary's worker only.
  */
-const COMMAND_END = /(sendit|sentit|sendeat|send|сендіт|сендит|сендіп|сендип|сенд|прийом|приём|discardthisturn|discardturn|scratchthat)$/u
+export const COMMANDS_VERSION = "2"
+
+/**
+ * The page's own copy of the worker's send words, then its discard phrases, as `norm` leaves them
+ * (lowercase, letters and digits only, Cyrillic kept as is). A caption line that ends in one holds
+ * that command. The channel tests check each one against the worker's own matching.
+ */
+export const SEND_WORDS = ["sendit", "sentit", "sendeat", "send", "сендіт", "сендит", "сендіп", "сендип", "сенд", "прийом", "приём"]
+export const DISCARD_PHRASES = ["discardthisturn", "discardturn", "scratchthat"]
+const COMMAND_END = new RegExp(`(${[...SEND_WORDS, ...DISCARD_PHRASES].join("|")})$`, "u")
+const DISCARD_END = new RegExp(`(${DISCARD_PHRASES.join("|")})$`, "u")
 
 export const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
 /** A caption line as a sent turn's text holds it: a spoken command that ended the turn is not sent. */
 export const lineKey = (s: string) => norm(s).replace(COMMAND_END, "")
 /** A caption line that is only a spoken command ("Send it."), with nothing else said. */
 export const isCommandOnly = (s: string) => norm(s) !== "" && lineKey(s) === ""
+/** A caption line that ends in a discard phrase ("Scratch that."). */
+export const endsInDiscard = (s: string) => DISCARD_END.test(norm(s))
 
 export interface ListeningView {
   chip: string
@@ -416,7 +428,7 @@ export function wakePhraseOf(review: ReviewState, agentName: string): string {
  * Auto mode's readout while it listens with the microphone on: what sends a turn, and with the wake
  * switch on, the phrase that opens one. A worker without spoken commands keeps the plain pause copy.
  */
-export function autoListening({ agentName, review }: { agentName: string; silenceMs?: number | null; review: ReviewState }): ListeningView {
+export function autoListening({ agentName, review }: { agentName: string; review: ReviewState }): ListeningView {
   // The send countdown shows how long the pause is; the copy never quotes seconds.
   if (!review.commands) return { chip: "Listening", hint: "Go ahead. Stop for a moment to send.", empty: "Speak when ready." }
   const wakePhrase = `"${wakePhraseOf(review, agentName)}"`

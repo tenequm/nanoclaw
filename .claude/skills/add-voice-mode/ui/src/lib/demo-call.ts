@@ -432,7 +432,6 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
       inputLevel,
       outputLevel,
       audioRef,
-      silenceMs: DEMO_SILENCE_MS,
       sendCue,
       limitNote,
       reconnecting,

@@ -24,7 +24,7 @@ export const WAKE_SAMPLE_RATE = 16_000;
 export const WAKE_WINDOW_SAMPLES = 32_000;
 /** New audio between scores: 80 ms, the reference listener's frame. */
 export const WAKE_HOP_SAMPLES = 1_280;
-export const WAKE_DEBOUNCE_MS = 2_000;
+const WAKE_DEBOUNCE_MS = 2_000;
 /** Windows that may wait for the thread; more means it is slower than real time. */
 const WAKE_MAX_QUEUED = 8;
 /** livekit-wakeword's documented optimal threshold for its conv-attention `hey_livekit` model. */
@@ -40,11 +40,11 @@ const DEFAULT_EMBEDDINGS = 16;
 const EMBEDDING_DIM = 96;
 
 /** The audio a classifier of `embeddings` timesteps scores: 2 s for 16, and 80 ms more per extra one. */
-export const windowSamples = (embeddings: number): number =>
+const windowSamples = (embeddings: number): number =>
   WAKE_WINDOW_SAMPLES + (embeddings - DEFAULT_EMBEDDINGS) * EMBEDDING_STRIDE * (WAKE_SAMPLE_RATE / 100);
 
 /** The bundled models: the two frozen feature models and the `hey_livekit` classifier. */
-export const WAKE_MODEL_DIR = fileURLToPath(new URL('../assets/voice-wakeword/', import.meta.url));
+const WAKE_MODEL_DIR = fileURLToPath(new URL('../assets/voice-wakeword/', import.meta.url));
 export const DEFAULT_WAKE_MODEL = path.join(WAKE_MODEL_DIR, 'hey_livekit.onnx');
 
 /** The phrase a classifier listens for, from its file name: `hey_livekit.onnx` and `hey_jarvis_v0.1.onnx` say it. */
@@ -310,12 +310,16 @@ export class WakeWordSpotter {
     this.ready.catch(() => undefined);
   }
 
-  /** Score windows (on) or only keep the audio (off). */
+  /**
+   * Score windows (on) or not (off). Turned on, the first window scored is all new audio: what was
+   * said while it was off (a phrase while the turn was open, the end of a review recording) never opens a turn.
+   */
   listen(on: boolean): void {
     if (on === this.listening) return;
     this.listening = on;
     this.sinceScore = 0;
     this.queued = [];
+    if (on) this.filled = 0;
   }
 
   /** 16 kHz mono audio, in order. */

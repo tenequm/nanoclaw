@@ -2068,10 +2068,13 @@ describe('spoken command matching', () => {
   it('finds the wake phrase by the agent name or its vocabulary spellings, across scripts and punctuation', () => {
     const names = wakeNameWords(['Andy', 'Енді', 'Nano Claw', 'Al']);
     const after = (text: string) => {
-      const end = matchWake(text, names);
-      return end < 0 ? null : text.slice(end);
+      const found = matchWake(text, names);
+      return found && text.slice(found.end);
     };
     expect(after('Hey, Andy. What is on today?')).toBe('. What is on today?');
+    // It starts at its hey, glued or not.
+    expect(matchWake('So I said hey Andy', names)).toEqual({ start: 10, end: 18 });
+    expect(matchWake('Ok. Heyandy, go', wakeNameWords(['Andy']))).toEqual({ start: 4, end: 11 });
     expect(after('hey andy')).toBe('');
     expect(after('Гей, Енді, що там?')).toBe(', що там?');
     expect(after('Хей Енді')).toBe('');
@@ -2095,8 +2098,8 @@ describe('spoken command matching', () => {
     const ben = wakeNameWords(['Ben']);
     const sam = wakeNameWords(['Sam']);
     const after = (text: string, names = ben) => {
-      const end = matchWake(text, names);
-      return end < 0 ? null : text.slice(end);
+      const found = matchWake(text, names);
+      return found && text.slice(found.end);
     };
     expect(after('Hi Ben, what time is it?')).toBe(', what time is it?');
     expect(after('Хай Бен')).toBe('');
@@ -2793,9 +2796,12 @@ describe('acoustic wake word', () => {
     expect(h.commands.spotting).toBe(true);
     h.say('Hey Andy, book a table.');
     expect(h.commands.waiting).toBe(true);
-    expect(h.dropped).toEqual([['unaddressed', 'Hey Andy, book a table.']]);
+    // Held a moment: a wake word spotted just after it may make it the turn.
+    expect(h.dropped).toEqual([]);
 
     h.commands.onWakeWord();
+    // It has no `hey livekit`: ignored after all.
+    expect(h.dropped).toEqual([['unaddressed', 'Hey Andy, book a table.']]);
     expect(h.commands.waiting).toBe(false);
     expect(h.commands.spotting).toBe(false);
     expect(h.cues).toEqual(['wake']);
@@ -2825,10 +2831,11 @@ describe('acoustic wake word', () => {
   it('a final that came just before the wake word, with its phrase, is the turn after all', () => {
     const h = spotted();
     h.say('Hey LiveKit, what time is it');
-    expect(h.dropped).toEqual([['unaddressed', 'Hey LiveKit, what time is it']]);
     h.tick(1_500);
     h.commands.onWakeWord();
     expect(h.heard).toEqual([['what time is it', true]]);
+    // Never reported as ignored: the page leaves the line open for the turn.
+    expect(h.dropped).toEqual([]);
     h.say('Send it.');
     expect(h.sent).toEqual(['what time is it']);
 
@@ -2836,9 +2843,41 @@ describe('acoustic wake word', () => {
     h.say('Hey LiveKit, call mum');
     h.tick(5_000);
     h.commands.onWakeWord();
+    expect(h.dropped).toEqual([['unaddressed', 'Hey LiveKit, call mum']]);
     h.say('Send it.');
     expect(h.sent).toEqual(['what time is it']);
     expect(h.cues.at(-1)).toBe('nope');
+  });
+
+  it('a late final loses only its words before the phrase, and a near miss is not the phrase', () => {
+    const h = spotted();
+    h.say('So that is settled. Hey LiveKit, book a table');
+    h.commands.onWakeWord();
+    expect(h.dropped).toEqual([['unaddressed', 'So that is settled.']]);
+    h.say('Send it.');
+    expect(h.sent).toEqual(['book a table']);
+
+    // Ordinary words that only sound near the name are not taken into the turn.
+    h.say('Hey, look at it. Delete the old files');
+    h.commands.onWakeWord();
+    expect(h.dropped.at(-1)).toEqual(['unaddressed', 'Hey, look at it. Delete the old files']);
+    expect(h.heard.filter(([text]) => text.includes('Delete'))).toEqual([]);
+  });
+
+  it('reports a held final as unaddressed once no wake word came for it, or when a newer one arrives', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = spotted();
+    h.say('So what did you think of the film?');
+    h.say('Anyway.');
+    expect(h.dropped).toEqual([['unaddressed', 'So what did you think of the film?']]);
+    vi.advanceTimersByTime(2_900);
+    expect(h.dropped).toHaveLength(1);
+    vi.advanceTimersByTime(200);
+    expect(h.dropped.at(-1)).toEqual(['unaddressed', 'Anyway.']);
+    // Switching the wake off reports what it held at once.
+    h.say('Never mind.');
+    h.commands.configure(false, false);
+    expect(h.dropped.at(-1)).toEqual(['unaddressed', 'Never mind.']);
   });
 
   it('looks for the phrase in two finals at most; a later one keeps every word', () => {
@@ -2950,8 +2989,9 @@ describe('acoustic wake word in a call', () => {
     c.v.events.onAgentSpeaking?.(false);
 
     c.say('Hey Andy, so the plan is set.');
-    expect(c.dropped).toEqual([{ dropped: 'unaddressed', text: 'Hey Andy, so the plan is set.' }]);
+    expect(c.dropped).toEqual([]);
     w.events.onDetect(0.97);
+    expect(c.dropped).toEqual([{ dropped: 'unaddressed', text: 'Hey Andy, so the plan is set.' }]);
     expect(c.r.last.wake?.waiting).toBe(false);
     c.frame();
     expect(w.listening.at(-1)).toBe(false);

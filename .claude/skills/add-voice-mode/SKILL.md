@@ -138,7 +138,8 @@ directly, so it is a direct dependency at Silero's version:
 ```nc:dep
 onnxruntime-node@1.24.3
 ```
- Build first: it guards the adapter's typed calls into the channel
+
+Build first: it guards the adapter's typed calls into the channel
 core.
 
 ```nc:run effect:build
@@ -797,13 +798,15 @@ next call.
 and `discard turn`, `discard this turn` or `scratch that` there drops everything
 since the last send; nothing is posted and the page marks those caption lines
 "discarded". `send it` is also taken as the transcription writes it from a
-Ukrainian speaker (`сенд іт`, `сендіт`, `сендип`, `sent it`, `send eat`, or a
+Ukrainian speaker (`сенд іт`, `сендіт`, `сендит`, `сендип`, `sent it`, `send eat`, or a
 final cut to `send`), and the Ukrainian `прийом` sends too. (`over` was the send
 word before; it failed in Ukrainian sentences.) Only the end counts: `send it to
 Anna` is words, while a sentence that really ends in `send it` sends. A final that
 ends in a command while the caller still speaks waits for the pause; new words
 first make it words. A command with nothing to act on (also one said while the
-wake switch waits) plays the nope cue, and its line says "nothing to send". A wake switch under the
+wake switch waits) plays the nope cue, and its line says "nothing to send" (or "nothing to discard").
+While the acoustic wake word waits, a stretch of speech is marked "ignored" a few seconds after its
+transcript: a wake word spotted just after it may make its words after the phrase the turn. A wake switch under the
 mode row, in a labelled "voice commands" block with a one-line explainer (`hey <agent>`, off by default, kept for the next call like the mode
 pick) holds everything until the caller says `hey <agent>`: the chip says
 `Say "hey <agent>"` on a dim outlined chip, speech before it is dropped (its lines show "ignored · no
@@ -824,7 +827,9 @@ transcript open the turn: `<agent>` is then the agent's name or any entry in its
 spelling (`Hey, Andy.`, `гей Енді`, `хей Енді`, `hi Andy`, `хай Енді`, a name
 glued to the hey as in `Heyandy`, and in Cyrillic a Ukrainian vocative ending, as
 in `Гей, Бене` for Ben). The worker
-advertises the commands with the attribute `nanoclaw.voice.commands` = "1" and
+advertises the commands with the attribute `nanoclaw.voice.commands` = "2" (the
+`send it` vocabulary; "1" was `over`, and a page offers the commands only to the value it
+knows, so a page left open across an update falls back to pauses) and
 takes the switches in the `nanoclaw.voice.settings` RPC (`{"wake", "pauseSends",
 "cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase", "heard"}`
 (`phrase` only with a wake word model; `heard` counts the wake phrases heard, so the

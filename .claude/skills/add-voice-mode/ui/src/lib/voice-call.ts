@@ -44,7 +44,7 @@ export interface TurnMark {
   /**
    * `sending`: a sent review draft the agent has not confirmed yet (auto turns show no mark until then).
    * `dropped`: words the worker will never send: a spoken discard, speech before the wake phrase, or
-   * a send word with nothing open to send (`command`).
+   * a spoken command said alone, with nothing open to act on (`command`).
    */
   status: "sending" | "sent" | "lost" | "dropped"
   reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty" | "discarded" | "unaddressed" | "command"
@@ -98,8 +98,6 @@ export interface VoiceCall {
   reconnecting?: boolean
   /** The last mute or unmute did not take, in a few words. */
   muteError?: string | null
-  /** The silence that sends a turn, from the host. */
-  silenceMs?: number | null
   /** A caller turn counting down to being sent. */
   sendCue?: SendCue | null
   /** The call is about to hit its time limit. */

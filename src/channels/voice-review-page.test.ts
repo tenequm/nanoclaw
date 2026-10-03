@@ -8,6 +8,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
+import { matchCommand, type SpokenCommand } from '../voice-livekit-worker.js';
+import { CALL_COMMANDS_VERSION } from './voice-livekit-protocol.js';
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const reviewLib = path.resolve(here, '../../.claude/skills/add-voice-mode/ui/src/lib/review.ts');
 
@@ -36,13 +39,18 @@ interface ReviewLib {
   refusalNote(error: string | undefined, agent: string): string | null;
   isReviewSnapshot(v: unknown): boolean;
   keyIdentity(action: string | null, draftId?: number): string;
-  autoListening(input: { agentName: string; silenceMs: number | null; review: ReviewState }): {
+  autoListening(input: { agentName: string; review: ReviewState }): {
     chip: string;
     hint: string;
     empty: string;
   };
   lineKey(s: string): string;
   isCommandOnly(s: string): boolean;
+  endsInDiscard(s: string): boolean;
+  norm(s: string): string;
+  SEND_WORDS: string[];
+  DISCARD_PHRASES: string[];
+  COMMANDS_VERSION: string;
   MODE_NAME: Record<string, string>;
   modeCaption(mode: string, commands: boolean): string;
   charsOver(text: string): number;
@@ -272,8 +280,8 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
   });
 
   it("auto's readout: send it or a pause sends, and with the wake switch the phrase that opens a turn", () => {
-    const listen = (fields: Partial<ReviewState>, silenceMs: number | null = 2500) =>
-      lib.autoListening({ agentName: 'Andy', silenceMs, review: { ...lib.INITIAL_REVIEW, ...fields } });
+    const listen = (fields: Partial<ReviewState>) =>
+      lib.autoListening({ agentName: 'Andy', review: { ...lib.INITIAL_REVIEW, ...fields } });
     expect(listen({})).toEqual({
       chip: 'Listening',
       hint: 'Go ahead. Stop for a moment, or say "send it" to send now.',
@@ -298,7 +306,6 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     });
     // The copy never quotes seconds: the countdown shows how long the pause is.
     expect(listen({ wake: true, pauseSends: true }).hint).toBe('Say "send it", or stop for a moment, to send.');
-    expect(listen({ wake: true, pauseSends: true }, null).hint).toBe('Say "send it", or stop for a moment, to send.');
     // The switch's picks start off; the worker's wake state rides on its review state.
     expect(lib.INITIAL_REVIEW).toMatchObject({
       wake: false,
@@ -350,5 +357,39 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(lib.modeCaption('auto', true)).toBe('Stop for a moment, or say "send it", to send.');
     expect(lib.modeCaption('auto', false)).toBe('Stop for a moment to send.');
     expect(lib.modeCaption('review', true)).toBe('Tap talk, read your words, then send.');
+  });
+  it("the page's command words are the worker's, on the same commands vocabulary", () => {
+    // How the transcription writes each one; every page word needs a spelling here.
+    const spoken: Array<[string, SpokenCommand]> = [
+      ['Send it.', 'send'],
+      ['Sent it.', 'send'],
+      ['Send eat.', 'send'],
+      ['Sendit.', 'send'],
+      ['Send.', 'send'],
+      ['Сенд іт.', 'send'],
+      ['Сендіт.', 'send'],
+      ['Сендит.', 'send'],
+      ['Сендіп.', 'send'],
+      ['Сендип.', 'send'],
+      ['Сенд.', 'send'],
+      ['Прийом.', 'send'],
+      ['Приём.', 'send'],
+      ['Discard this turn.', 'discard'],
+      ['Discard turn.', 'discard'],
+      ['Scratch that.', 'discard'],
+    ];
+    const covered = new Set(spoken.map(([text]) => lib.norm(text)));
+    for (const word of [...lib.SEND_WORDS, ...lib.DISCARD_PHRASES]) expect(covered, word).toContain(word);
+    for (const [text, command] of spoken) {
+      expect(lib.isCommandOnly(text), text).toBe(true);
+      expect(lib.endsInDiscard(text), text).toBe(command === 'discard');
+      expect(matchCommand(text), text).toEqual({ command, rest: '' });
+    }
+    // Not a command for either: words before or after it.
+    for (const text of ['Send it to Anna.', 'Scratch that idea.']) {
+      expect(lib.isCommandOnly(text), text).toBe(false);
+      expect(matchCommand(text), text).toBeNull();
+    }
+    expect(lib.COMMANDS_VERSION).toBe(CALL_COMMANDS_VERSION);
   });
 });

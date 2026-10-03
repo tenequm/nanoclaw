@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
 import { LIVE_PHASES, type ErrorKind, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
-import { MODE_NAME, autoListening, keyIdentity, modeCaption, reviewView, wakePhraseOf, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
+import { MODE_NAME, autoListening, endsInDiscard, keyIdentity, modeCaption, reviewView, wakePhraseOf, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
@@ -22,6 +22,7 @@ const MATRIX_ROWS = 7
 const MATRIX_COLS = 14
 const BAR_COUNT = 12
 const MATRIX_OFF: Frame = Array.from({ length: MATRIX_ROWS }, () => Array(MATRIX_COLS).fill(0))
+const BARS_OFF: number[] = Array(BAR_COUNT).fill(0)
 /** Waiting for the wake phrase: a dim flat line, the line is open but nothing is taken. */
 const MATRIX_SLEEP: Frame = Array.from({ length: MATRIX_ROWS }, (_, r) => Array(MATRIX_COLS).fill(r === Math.floor(MATRIX_ROWS / 2) ? 0.55 : 0))
 
@@ -121,9 +122,12 @@ const LOST_NOTICE: Record<LostReason, string> = {
   timeout: "delivery not confirmed - check the chat before repeating.",
 }
 
-function markLabel(mark: TurnMark): string {
+function markLabel(mark: TurnMark, text: string): string {
   if (mark.status === "sent" || mark.status === "sending") return mark.status
-  if (mark.status === "dropped") return mark.reason === "unaddressed" ? "ignored · no wake phrase" : mark.reason === "command" ? "nothing to send" : "discarded"
+  if (mark.status === "dropped") {
+    if (mark.reason === "command") return endsInDiscard(text) ? "nothing to discard" : "nothing to send"
+    return mark.reason === "unaddressed" ? "ignored · no wake phrase" : "discarded"
+  }
   if (mark.reason === "timeout") return LOST_REASON.timeout
   // A newer worker may send a reason this page does not know yet.
   const why = mark.reason && LOST_REASON[mark.reason as LostReason]
@@ -269,14 +273,15 @@ const Stage = memo(function Stage({
   sleeping?: boolean
 }) {
   const bars = presence === "bars"
-  const { levels, glow } = useLevelTicker(call, phase, true, reduced, bars ? BAR_COUNT : MATRIX_COLS)
+  // Asleep, the stage draws a fixed line: no levels to meter, and nothing to re-render 20 times a second.
+  const { levels, glow } = useLevelTicker(call, phase, !sleeping, reduced, bars ? BAR_COUNT : MATRIX_COLS)
   if (bars) {
     // The bars read the same metering as the matrix. Handing the component a
     // MediaStream instead would open an AudioContext on the call's own microphone,
     // which silences the outgoing track on iOS Safari.
     return (
       <div className={`bars-wrap${phase === "listening" && !sleeping ? " you" : ""}`}>
-        <BarVisualizer state={BAR_STATE[phase]} volumeBands={sleeping ? levels.map(() => 0) : levels} barCount={BAR_COUNT} centerAlign minHeight={12} className="h-full w-full gap-2 rounded-none bg-transparent p-0" />
+        <BarVisualizer state={BAR_STATE[phase]} volumeBands={sleeping ? BARS_OFF : levels} barCount={BAR_COUNT} centerAlign minHeight={12} className="h-full w-full gap-2 rounded-none bg-transparent p-0" />
       </div>
     )
   }
@@ -384,7 +389,7 @@ const TranscriptLine = memo(function TranscriptLine({
           {showTs && <span className="ts">{`${Math.floor(at / 60)}:${pad(at % 60)}`}</span>}
           {note && <span className="turn-ref">{note}</span>}
           {wake && <span className={`turn-mark wake${!mark && awake ? " awake" : ""}`}>{mark ? "heard" : awake ? "heard - listening" : "heard"}</span>}
-          {mark && <span className={`turn-mark ${mark.status}${mark.reason ? ` ${mark.reason}` : ""}`}>{markLabel(mark)}</span>}
+          {mark && <span className={`turn-mark ${mark.status}${mark.reason ? ` ${mark.reason}` : ""}`}>{markLabel(mark, text)}</span>}
           {unspoken && <span className="turn-mark lost">reply not spoken</span>}
           {preWake && <span className="turn-mark dropped">words before the wake phrase ignored</span>}
         </span>
@@ -740,7 +745,7 @@ export default function App() {
   // The review view speaks for the call while it runs, and for a draft kept after it.
   const reviewReadout = !!rv && phase !== "error" && (live || phase === "connecting" || phase === "idle" || keptDraft)
   // What sends a turn in auto, and the wake phrase while the worker waits for it.
-  const listening = rs ? autoListening({ agentName, silenceMs: call.silenceMs ?? null, review: rs }) : null
+  const listening = rs ? autoListening({ agentName, review: rs }) : null
   // Auto with the wake switch, before the phrase: the line is open but nothing is taken.
   const waitingWake = !reviewReadout && phase === "listening" && !muted && !reconnecting && !!rs?.wake && !!rs.awaitingWake && !!rs.commands
   // The worker's countdown to sending the caller's turn, shown on the readout itself.

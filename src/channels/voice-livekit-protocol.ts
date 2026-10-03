@@ -107,9 +107,10 @@ export interface CallTurnStatus {
 /**
  * Caller words that will never be sent, on the turn topic: dropped by a spoken discard
  * (`discarded`), heard while auto mode waits for the wake phrase (`unaddressed`), or a spoken
- * command with nothing open to act on (`command`: a lone `send it`). `text` is what was heard, for
- * the page to mark those caption lines. It carries no turn number, so a page that does not know it
- * ignores it.
+ * command with nothing open to act on (`command`: a send word or a discard phrase said alone).
+ * `text` is what was heard, for the page to mark those caption lines. It carries no turn number, so
+ * a page that does not know it ignores it. While an acoustic wake word waits, an `unaddressed` final
+ * is reported a few seconds late: a wake word spotted just after it may make it the turn after all.
  */
 export interface CallDroppedSpeech {
   dropped: 'discarded' | 'unaddressed' | 'command';
@@ -172,11 +173,14 @@ export interface CallDraft {
  * now, `discard turn`, `discard this turn` or `scratch that` there drops it, and with the wake switch
  * `on` nothing is kept or sent until `hey <agent>`, or the worker's acoustic wake word
  * (`CallWakeState.phrase`), is heard (`waiting` until then). After the wake phrase only `send it` sends, unless
- * `pauseSends` lets the closing silence send too. The worker's participant attribute is "1" when it
- * understands them and the `settings` RPC; an older worker sets none, and its auto mode has no
- * commands.
+ * `pauseSends` lets the closing silence send too. The worker's participant attribute is
+ * CALL_COMMANDS_VERSION when it understands them and the `settings` RPC; a page offers the commands
+ * only for the value it knows, so a page and a worker from either side of a vocabulary change fall
+ * back to pauses. An older worker sets none, and its auto mode has no commands.
  */
 export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice.commands';
+/** The commands' vocabulary: "1" had `over` as the send word, "2" has `send it`. */
+export const CALL_COMMANDS_VERSION = '2';
 export interface CallWakeState {
   on: boolean;
   pauseSends: boolean;

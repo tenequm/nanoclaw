@@ -659,7 +659,6 @@
   box-shadow: inset 0 0 0 1px rgba(0,0,0,0.15);
 }
 .voice-page[data-skin="te"] .led.on { background: var(--te-orange); box-shadow: 0 0 6px rgba(255,79,31,0.8); }
-.voice-page[data-skin="te"] .led.green { background: var(--ok); box-shadow: 0 0 6px rgba(55,178,77,0.7); }
 .voice-page[data-skin="te"] .segment { display: inline-flex; align-items: center; justify-content: center; gap: 3px; height: 46px; padding: 0 10px; border-radius: 8px; background: var(--orb-well); box-shadow: inset 0 1px 3px rgba(0,0,0,0.6), 0 0 0 1px var(--te-cap-edge); }
 .voice-page[data-skin="te"] .segment .colon { width: 3px; display: flex; flex-direction: column; gap: 6px; }
 .voice-page[data-skin="te"] .segment .colon i { display: block; width: 3px; height: 3px; border-radius: 50%; background: var(--te-orange); }
@@ -862,7 +861,6 @@
 .voice-page[data-skin="te"][data-colorway="rabbit"] .key .cap { box-shadow: 0 4px 0 #b8471f, 0 6px 10px rgba(80, 30, 10, 0.25); }
 .voice-page[data-skin="te"][data-colorway="rabbit"] .key .cap.dark { background: #141414; color: #fff1e6; box-shadow: 0 4px 0 #000; }
 .voice-page[data-skin="te"][data-colorway="rabbit"] .led.on { background: #fff1e6; box-shadow: 0 0 6px rgba(255, 241, 230, 0.9); }
-.voice-page[data-skin="te"][data-colorway="rabbit"] .led.green { background: #1a0e08; box-shadow: none; }
 .voice-page[data-skin="te"][data-colorway="rabbit"] .badge .presence.live { background: #fff1e6; box-shadow: 0 0 6px rgba(255, 241, 230, 0.8); }
 .voice-page[data-skin="te"][data-colorway="rabbit"] .badge, .voice-page[data-skin="te"][data-colorway="rabbit"] .screen, .voice-page[data-skin="te"][data-colorway="rabbit"] .segment { box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.7), 0 0 0 1px #b8471f; }
 .voice-page[data-skin="te"][data-colorway="rabbit"] .call-card::after { opacity: 0.09; }
@@ -981,8 +979,6 @@
 .mode-seg.pending { animation: pulse 1.4s ease-in-out infinite; }
 .mode-seg:disabled { opacity: 0.5; cursor: default; }
 .mode-seg:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
-.mode-seg .led { width: 6px; height: 6px; border-radius: 50%; background: var(--muted-foreground); opacity: 0.4; }
-.mode-seg.on .led { background: var(--teal); opacity: 1; }
 .mode-note { margin: 0; text-align: center; font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.04em; color: var(--muted-foreground); }
 .limit-note { margin: 0; font-size: 12px; color: var(--muted-foreground); text-align: center; }
 
@@ -990,12 +986,10 @@
 .voice-page[data-skin="te"] .mode-note { text-transform: lowercase; }
 .voice-page[data-skin="te"] .mode-seg { border-radius: 4px; }
 .voice-page[data-skin="te"] .mode-seg.on { background: var(--te-cap); box-shadow: 0 2px 0 var(--te-cap-edge); }
-.voice-page[data-skin="te"] .mode-seg.on .led { background: var(--te-orange); box-shadow: 0 0 6px rgba(255, 79, 31, 0.8); }
 .voice-page[data-skin="te"] .mode-seg:focus-visible { outline-color: var(--te-orange); }
 .voice-page[data-skin="te"] .limit-note { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.04em; text-transform: lowercase; }
 .voice-page[data-skin="te"] .screen .limit-note { text-align: left; padding: 0 2px; color: #8a877f; }
 .voice-page[data-skin="te"] .console .turn-mark.sending { color: #8a877f; }
-.voice-page[data-skin="te"][data-colorway="rabbit"] .mode-seg.on .led { background: #fff1e6; box-shadow: 0 0 6px rgba(255, 241, 230, 0.9); }
 
 /* Words the worker dropped stay readable but step back, like history. */
 .turn-mark.dropped { color: var(--muted-foreground); }

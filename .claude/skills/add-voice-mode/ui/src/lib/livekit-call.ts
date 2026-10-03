@@ -27,7 +27,7 @@ import {
   type TurnMark,
   type VoiceCall,
 } from "./voice-call"
-import { INITIAL_REVIEW, autoBlock, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSION, INITIAL_REVIEW, autoBlock, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -69,7 +69,7 @@ const REVIEW_RPC: Record<ReviewOp | "settings", string> = {
   discard: "nanoclaw.voice.discard",
   settings: "nanoclaw.voice.settings",
 }
-/** "1" when the worker understands spoken commands (`send it`, discard, the wake phrase) and the settings RPC. */
+/** COMMANDS_VERSION when the worker understands spoken commands (`send it`, discard, the wake phrase) and the settings RPC. */
 const COMMANDS_ATTR = "nanoclaw.voice.commands"
 /** The worker's sound cues come on their own track (CALL_CUE_TRACK), never the speech track. */
 const CUE_TRACK = "background_audio"
@@ -144,7 +144,7 @@ function endReasonText(metadata: string | undefined): string | null {
 type SettledTurn = { turn: number; status: "sent" | "lost"; reason?: TurnMark["reason"]; text?: string }
 /**
  * Caller words the worker will never send (CallDroppedSpeech): a spoken discard, speech before the
- * wake phrase, or a send word with nothing open to send.
+ * wake phrase, or a spoken command said alone, with nothing open to act on.
  */
 type DroppedSpeech = { dropped: "discarded" | "unaddressed" | "command"; text: string }
 
@@ -301,7 +301,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const { textStreams: turnStreams } = useTextStream(TURN_TOPIC, { room })
   const { textStreams: replyStreams } = useTextStream(REPLY_TOPIC, { room })
   const { canPlayAudio } = useAudioPlayback(room)
-  const [silenceMs, setSilenceMs] = useState<number | null>(null)
   const [limitNote, setLimitNote] = useState<string | null>(null)
 
   const phaseRef = useRef<Phase>(phase)
@@ -379,7 +378,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const agentId = useRef<string | null>(null)
   agentId.current = agent?.identity ?? null
   const reviewAvailable = agentAttributes?.[REVIEW_ATTR] === "1"
-  const commandsAvailable = agentAttributes?.[COMMANDS_ATTR] === "1"
+  const commandsAvailable = agentAttributes?.[COMMANDS_ATTR] === COMMANDS_VERSION
   /** This call already gave the worker the page's settings. */
   const settingsSent = useRef(false)
   /** The wake switch as the worker last said it runs it. */
@@ -847,7 +846,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     lastUserAt.current = 0
     currentReply.current = null
     limit.current = null
-    setSilenceMs(null)
     startedAt.current = 0
     setStreaming(null)
     setElapsed(0)
@@ -910,7 +908,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         callId: string
         agent?: string
         chat?: string
-        silenceMs?: number
         limit?: { ms: number; kind: string }
       }
       a.callId = session.callId
@@ -918,7 +915,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       if (cancelled()) return endOnServer(a, false)
       if (session.agent) setAgentName(session.agent)
       if (session.chat) setChat(session.chat)
-      if (typeof session.silenceMs === "number" && session.silenceMs > 0) setSilenceMs(session.silenceMs)
       if (session.limit && typeof session.limit.ms === "number") limit.current = session.limit
       // The host's clock (and the limit) starts once the worker sees the caller in, after this.
       joinedAt.current = Date.now()
@@ -1392,7 +1388,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       unlockAudio,
       reconnecting,
       muteError,
-      silenceMs,
       sendCue,
       limitNote,
       review: reviewControls,
@@ -1417,7 +1412,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       unlockAudio,
       reconnecting,
       muteError,
-      silenceMs,
       sendCue,
       limitNote,
       reviewControls,
