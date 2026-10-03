@@ -11,6 +11,7 @@ import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryIn
  * module does not import it.
  */
 export class MockProvider implements AgentProvider {
+  readonly startsIdle = true;
   private responseFactory: (prompt: string) => string;
   private textFactory: ((prompt: string) => string[]) | undefined;
 

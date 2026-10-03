@@ -31,11 +31,15 @@ export interface AgentProvider {
    */
   onExchangeComplete?(exchange: ProviderExchange): void;
 
-  /**
-   * Start a new query. Returns a handle for streaming input and output. An
-   * empty `prompt` starts it idle: the first turn arrives through `push`.
-   */
+  /** Start a new query. Returns a handle for streaming input and output. */
   query(input: QueryInput): AgentQuery;
+
+  /**
+   * Optional. True when `query` with an empty `prompt` starts idle, the first
+   * turn arriving through `push`. Only such a provider is started ahead of a
+   * voice call's first turn; any other would run the empty prompt as a turn.
+   */
+  readonly startsIdle?: boolean;
 
   /**
    * Optional. Warm the model's prompt cache for `input.continuation` so the

@@ -67,6 +67,7 @@ import { pondStoreMounts } from './pond-stores.js';
 import './provider-contracts/index.js';
 import { getProviderHostContract } from './provider-contracts/registry.js';
 import { resolveProviderName } from './providers/provider-name.js';
+import type { WakeReason } from './request-wake.js';
 import {
   providerStateVolumePath,
   realizeProviderSpawnSurfaces,
@@ -327,11 +328,11 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
  * need to wrap — the inbound row stays pending and host-sweep retries on its
  * next tick.
  *
- * `reason` (request-wake.ts `WakeReason`) reaches the runner as
+ * `reason` reaches the runner as
  * `NANOCLAW_WAKE_REASON` when this wake spawns the container; a wake that
  * joins a running or in-flight container drops it.
  */
-export function wakeContainer(session: Session, reason?: string): Promise<boolean> {
+export function wakeContainer(session: Session, reason?: WakeReason): Promise<boolean> {
   if (activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
     return Promise.resolve(true);
@@ -354,7 +355,7 @@ export function wakeContainer(session: Session, reason?: string): Promise<boolea
   return promise;
 }
 
-async function spawnContainer(session: Session, wakeReason?: string): Promise<void> {
+async function spawnContainer(session: Session, wakeReason?: WakeReason): Promise<void> {
   if (pendingAdoptions.has(session.id)) {
     // A running container is waiting to be re-fenced after a failed adoption
     // claim. Reclaim it rather than spawning a duplicate; its poll loop picks
@@ -1270,8 +1271,8 @@ export interface ComposeSessionSpecInput {
   gateway: GatewayContribution;
   /** Non-secret configuration supplied by the selected mailbox implementation. */
   mailboxEnvironment: Record<string, string>;
-  /** Why this spawn happened (request-wake.ts `WakeReason`), for the runner. */
-  wakeReason?: string;
+  /** Why this spawn happened, for the runner. */
+  wakeReason?: WakeReason;
 }
 
 /**

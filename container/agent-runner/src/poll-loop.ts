@@ -131,8 +131,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   let pollCount = 0;
   let isFirstPoll = true;
   // The host woke this container for a voice call (src/request-wake.ts): start the agent before the
-  // caller's first turn, unless that turn is already here.
-  let startForCall = process.env.NANOCLAW_WAKE_REASON === 'voice-call';
+  // caller's first turn, unless that turn is already here. Only a provider that can open a query
+  // without a turn (`startsIdle`); any other would run the empty prompt as one.
+  let startForCall = process.env.NANOCLAW_WAKE_REASON === 'voice-call' && config.provider.startsIdle === true;
   while (true) {
     if (config.signal?.aborted) return;
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
@@ -254,13 +255,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
-    const query = config.provider.query({
-      prompt,
-      continuation,
-      cwd: config.cwd,
-      systemContext: config.systemContext,
-    });
-    // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped.map((s) => s.id));
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     // Publish the batch's route so MCP tools (send_message, send_file) thread
@@ -268,56 +262,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // a2a return-path routing. Re-published at every turn boundary inside
     // processQuery as later messages are answered.
     publishReplyRoute(routing);
-    // Forward a loop stop to the ACTIVE query. The stream deliberately stays
-    // open between turns, so the loop can be parked inside processQuery when
-    // config.signal fires; without this, the "stopped" loop's query — and its
-    // 500ms follow-up poller — outlives the stop and keeps polling (and
-    // claiming) messages from whatever inbound DB the process points at. In
-    // tests that leaked one immortal poller per loop-driven test, which could
-    // steal a later test's follow-up message into a dead query.
-    const abortActiveQuery = () => query.abort();
-    if (config.signal?.aborted) abortActiveQuery();
-    else config.signal?.addEventListener('abort', abortActiveQuery, { once: true });
-    try {
-      const result = await processQuery(
-        query,
-        routing,
-        processingIds,
-        config.providerName,
-        config.provider.onExchangeComplete?.bind(config.provider),
-        prompt,
-        continuation,
-        midTurnCompleteDelivery,
-        config.signal,
-      );
-      if (result.continuation && result.continuation !== continuation) {
-        continuation = result.continuation;
-        setContinuation(config.providerName, continuation);
-      }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log(`Query error: ${errMsg}`);
-
-      // Stale/corrupt continuation recovery: ask the provider whether
-      // this error means the stored continuation is unusable, and clear
-      // it so the next attempt starts fresh.
-      if (continuation && config.provider.isSessionInvalid(err)) {
-        log(`Stale session detected (${continuation}) — clearing for next retry`);
-        continuation = undefined;
-        clearContinuation(config.providerName);
-      }
-
-      // processQuery owns failure notices: it knows which active and queued
-      // turns the failure abandoned. The opening batch may already be done.
-
-      // The batch is still acked completed below (no redelivery). Without
-      // this line the only log trace of the errored turn is "Query error"
-      // followed by a "Completed" line that reads like success.
-      log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
-    } finally {
-      clearCurrentReplyRoute();
-      config.signal?.removeEventListener('abort', abortActiveQuery);
-    }
+    continuation = await runQuery(config, continuation, midTurnCompleteDelivery, prompt, routing, processingIds);
 
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).
@@ -336,23 +281,49 @@ async function runIdleQuery(
   continuation: string | undefined,
   midTurnCompleteDelivery: boolean,
 ): Promise<string | undefined> {
-  log('Voice call: starting the agent ahead of its first turn');
-  const input = { prompt: '', continuation, cwd: config.cwd, systemContext: config.systemContext };
+  log('Starting the agent ahead of its first turn');
   config.provider
-    .warmPromptCache?.(input)
+    .warmPromptCache?.({ prompt: '', continuation, cwd: config.cwd, systemContext: config.systemContext })
     .catch((err) => log(`Prompt cache warm failed: ${err instanceof Error ? err.message : String(err)}`));
-  const query = config.provider.query(input);
-  const abortQuery = () => query.abort();
-  if (config.signal?.aborted) abortQuery();
-  else config.signal?.addEventListener('abort', abortQuery, { once: true });
+  return runQuery(config, continuation, midTurnCompleteDelivery, '', extractRouting([]), []);
+}
+
+/**
+ * Run one provider query until it ends, polling follow-ups into it meanwhile
+ * (processQuery). Returns the continuation to keep.
+ */
+async function runQuery(
+  config: PollLoopConfig,
+  continuation: string | undefined,
+  midTurnCompleteDelivery: boolean,
+  prompt: string,
+  routing: RoutingContext,
+  batchIds: string[],
+): Promise<string | undefined> {
+  const query = config.provider.query({
+    prompt,
+    continuation,
+    cwd: config.cwd,
+    systemContext: config.systemContext,
+  });
+  // Forward a loop stop to the ACTIVE query. The stream deliberately stays
+  // open between turns, so the loop can be parked inside processQuery when
+  // config.signal fires; without this, the "stopped" loop's query — and its
+  // 500ms follow-up poller — outlives the stop and keeps polling (and
+  // claiming) messages from whatever inbound DB the process points at. In
+  // tests that leaked one immortal poller per loop-driven test, which could
+  // steal a later test's follow-up message into a dead query.
+  const abortActiveQuery = () => query.abort();
+  if (config.signal?.aborted) abortActiveQuery();
+  else config.signal?.addEventListener('abort', abortActiveQuery, { once: true });
   try {
     const result = await processQuery(
       query,
-      extractRouting([]),
-      [],
+      routing,
+      batchIds,
       config.providerName,
       config.provider.onExchangeComplete?.bind(config.provider),
-      '',
+      prompt,
       continuation,
       midTurnCompleteDelivery,
       config.signal,
@@ -362,15 +333,30 @@ async function runIdleQuery(
       return result.continuation;
     }
   } catch (err) {
-    log(`Query error: ${err instanceof Error ? err.message : String(err)}`);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log(`Query error: ${errMsg}`);
+
+    // Stale/corrupt continuation recovery: ask the provider whether
+    // this error means the stored continuation is unusable, and clear
+    // it so the next attempt starts fresh.
     if (continuation && config.provider.isSessionInvalid(err)) {
       log(`Stale session detected (${continuation}) — clearing for next retry`);
+      continuation = undefined;
       clearContinuation(config.providerName);
-      return undefined;
+    }
+
+    // processQuery owns failure notices: it knows which active and queued
+    // turns the failure abandoned. The opening batch may already be done.
+
+    // The batch is still acked completed by the caller (no redelivery).
+    // Without this line the only log trace of the errored turn is "Query
+    // error" followed by a "Completed" line that reads like success.
+    if (batchIds.length > 0) {
+      log(`Errored batch will be acked completed — ${batchIds.length} message(s), no redelivery`);
     }
   } finally {
     clearCurrentReplyRoute();
-    config.signal?.removeEventListener('abort', abortQuery);
+    config.signal?.removeEventListener('abort', abortActiveQuery);
   }
   return continuation;
 }
@@ -439,6 +425,11 @@ export async function processQuery(
 ): Promise<QueryResult> {
   // adoptTurn mutates routing in place; keep the caller's batch route intact.
   routing = { ...routing };
+  // A query opened idle (empty initial prompt) has no initial batch: the first
+  // turn pushed into it stands in for one and stays 'processing' until its
+  // result, so a crash redelivers it and the host's claim-stuck check covers it.
+  let batchIds = initialBatchIds;
+  let adoptsInitialBatch = initialPrompt === '';
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
@@ -645,7 +636,10 @@ export async function processQuery(
         };
         if (answering) queuedTurns.push(next);
         else adoptTurn(next);
-        markCompleted(keptIds);
+        if (adoptsInitialBatch) {
+          adoptsInitialBatch = false;
+          batchIds = keptIds;
+        } else markCompleted(keptIds);
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
         // terminates the container on unhandled-rejection. The initial-batch
@@ -722,7 +716,7 @@ export async function processQuery(
         // follow-up pushes. The agent may have responded via MCP
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
-        markCompleted(initialBatchIds);
+        markCompleted(batchIds);
         const resultText = event.text ?? '';
         const failed = event.isError === true;
         // A clean end_turn that leaves a <message to="…"> block open ends the
@@ -913,6 +907,8 @@ export async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    // The caller acks only its own batch when the query ends without a result.
+    if (batchIds !== initialBatchIds) markCompleted(batchIds);
     // Clean loop exit (turn finished, stream ended, or aborted): stop the
     // re-mark timer and report idle. Idempotent with the turn-boundary idle.
     enterIdle();

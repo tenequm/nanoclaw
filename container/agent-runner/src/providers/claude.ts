@@ -3,6 +3,7 @@ import {
   type HookCallback,
   type Options as SdkOptions,
   type PreCompactHookInput,
+  type Query as SdkQuery,
 } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
@@ -163,10 +164,27 @@ const STREAM_ACTIVITY_INTERVAL_MS = 1000;
 const CACHE_WARM_PROMPT = 'Prompt cache warm-up; no reply needed.';
 /** The warm gives up after this long; the first turn then simply pays for the cache itself. */
 const CACHE_WARM_TIMEOUT_MS = 60_000;
+/** How long the warm waits for its interrupt to be acknowledged before it closes the SDK anyway. */
+const CACHE_WARM_INTERRUPT_MS = 1_000;
 
 /** The cache warm runs no tool, whatever the model would start. */
 const denyAllTools: HookCallback = async () =>
   ({ decision: 'block', stopReason: 'Prompt cache warm-up runs no tools.' }) as unknown as ReturnType<HookCallback>;
+
+/**
+ * Stop the warm's request at once. Closing the SDK alone only ends the CLI's
+ * input and kills it 2 s later, while the model keeps generating.
+ */
+async function interruptWarm(warm: SdkQuery): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    warm.interrupt().catch(() => undefined),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, CACHE_WARM_INTERRUPT_MS);
+    }),
+  ]);
+  clearTimeout(timer);
+}
 
 /** The real clock for archive names and rotation stamps; tests hand the history functions a fixed one. */
 const REAL_CLOCK = { now: () => Date.now() };
@@ -209,6 +227,7 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
 const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
 
 export class ClaudeProvider implements AgentProvider {
+  readonly startsIdle = true;
   private assistantName?: string;
   private mcp: ReturnType<typeof resolveClaudeMcpServers>;
   private inference: ReturnType<typeof resolveClaudeInference>;
@@ -322,7 +341,7 @@ export class ClaudeProvider implements AgentProvider {
     const timer = setTimeout(() => abortController.abort(), CACHE_WARM_TIMEOUT_MS);
     const startedAt = Date.now();
     try {
-      for await (const message of sdkQuery({
+      const warm = sdkQuery({
         prompt: CACHE_WARM_PROMPT,
         options: {
           ...this.sdkOptions(input),
@@ -331,9 +350,11 @@ export class ClaudeProvider implements AgentProvider {
           abortController,
           hooks: { PreToolUse: [{ hooks: [denyAllTools] }] },
         },
-      })) {
+      });
+      for await (const message of warm) {
         if (message.type === 'system' && message.subtype === 'status' && message.status === 'compacting') {
           log('Prompt cache not warmed: the context is due for compaction');
+          await interruptWarm(warm);
           return;
         }
         if (message.type === 'stream_event' && message.event.type === 'message_start') {
@@ -342,6 +363,7 @@ export class ClaudeProvider implements AgentProvider {
             `Prompt cache warmed in ${Date.now() - startedAt} ms ` +
               `(${usage.cache_creation_input_tokens ?? 0} tokens written, ${usage.cache_read_input_tokens ?? 0} read)`,
           );
+          await interruptWarm(warm);
           return;
         }
         if (message.type === 'result') return;

@@ -27,7 +27,7 @@ import type { VoiceUiConfig } from './voice-call-page.js';
 import { resolveVoiceLine, type ResolveLineOptions, type VoiceLine } from './voice-line.js';
 import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-livekit.js';
 import { DEFAULT_VOICE_MIRROR } from './voice-livekit-protocol.js';
-import { getMessagingGroupAgents, getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
+import { getMessagingGroupAgentByPair, getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
 import { readEnvFile } from '../env.js';
@@ -206,7 +206,7 @@ export async function findCallSession(
   const found = await getMessagingGroupWithAgentCount(route.channelType, route.platformId, instance);
   if (!found) return undefined;
   const { mg } = found;
-  const wiring = (await getMessagingGroupAgents(mg.id)).find((a) => a.agent_group_id === agentGroupId);
+  const wiring = await getMessagingGroupAgentByPair(mg.id, agentGroupId);
   if (!wiring) return undefined;
   const supportsThreads = getChannelAdapter(instance)?.supportsThreads === true;
   const threadsEnabled = resolveThreadPolicy(

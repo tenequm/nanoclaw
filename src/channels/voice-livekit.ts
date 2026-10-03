@@ -236,7 +236,8 @@ export interface LiveKitHost {
   routeTurn(event: InboundEvent): Promise<boolean>;
   /**
    * The caller joined: `route` is where the call's turns go now (`agentGroupId`: the line's agent).
-   * Starts that agent's session before the first turn and keeps it running until `callEnded`.
+   * Wakes that agent's existing session before the first turn (none is created) and keeps it
+   * running until `callEnded`.
    */
   callJoined?(callId: string, route: Omit<InboundEvent, 'message'>, agentGroupId: string): void;
   callEnded?(callId: string): void;

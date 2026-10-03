@@ -12,14 +12,20 @@ interface SdkCall {
 }
 let calls: SdkCall[] = [];
 let warmEvents: unknown[] = [];
+let interrupts = 0;
 
 mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: (args: SdkCall) => {
     calls.push(args);
     if (typeof args.prompt !== 'string') return (async function* () {})();
-    return (async function* () {
+    const warm = (async function* () {
       for (const event of warmEvents) yield event;
     })();
+    return Object.assign(warm, {
+      interrupt: async () => {
+        interrupts += 1;
+      },
+    });
   },
 }));
 
@@ -43,10 +49,10 @@ function transcript(sessionId: string, agoMs: number, bucket: '1h' | '5m'): void
   const dir = path.join(tmp, '.claude', 'projects', '-workspace-agent');
   fs.mkdirSync(dir, { recursive: true });
   const at = (ms: number) => new Date(Date.now() - ms).toISOString();
-  const usage = (ms: number) => ({
+  const usage = (tokens: number) => ({
     cache_creation: {
-      ephemeral_1h_input_tokens: bucket === '1h' ? ms : 0,
-      ephemeral_5m_input_tokens: bucket === '5m' ? ms : 0,
+      ephemeral_1h_input_tokens: bucket === '1h' ? tokens : 0,
+      ephemeral_5m_input_tokens: bucket === '5m' ? tokens : 0,
     },
   });
   const lines = [
@@ -74,6 +80,7 @@ const input = (continuation?: string) => ({
 beforeEach(() => {
   calls = [];
   warmEvents = [];
+  interrupts = 0;
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-warm-'));
   prevHome = process.env.HOME;
   prevConfig = process.env.CLAUDE_CONFIG_DIR;
@@ -115,6 +122,8 @@ describe('claude provider, started ahead of a voice call', () => {
     expect(warmOptions).toEqual(turnOptions);
     expect(warmOptions.resume).toBe('sess-a');
     expect({ forkSession, persistSession }).toEqual({ forkSession: true, persistSession: false });
+    // The request is interrupted at its first event: closing the SDK alone lets the model generate on.
+    expect(interrupts).toBe(1);
     expect(abortController?.signal.aborted).toBe(true);
     // Its only hook refuses every tool; the turn's own hooks (tool state, pre-compact archive) are not run.
     expect(Object.keys(hooks as object)).toEqual(['PreToolUse']);
@@ -141,6 +150,7 @@ describe('claude provider, started ahead of a voice call', () => {
     warmEvents = [{ type: 'system', subtype: 'status', status: 'compacting' }, messageStart];
     await provider().warmPromptCache!(input('sess-full'));
     expect(calls).toHaveLength(1);
+    expect(interrupts).toBe(1);
     expect(calls[0].options.abortController?.signal.aborted).toBe(true);
   });
 });

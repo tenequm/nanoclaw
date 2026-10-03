@@ -1,13 +1,14 @@
 /**
  * Claude-owned transcript history: the pre-compact archive, continuation
- * rotation, and the newest-trace lookup. All of it reads the Claude Agent
- * SDK's on-disk `.jsonl` transcripts, so it belongs to this provider and is
- * not part of the runtime contract — ClaudeProvider calls the archive from its
- * PreCompact hook and the rotation from `maybeRotateContinuation`; only
+ * rotation, the newest-trace lookup and the prompt-cache expiry check. All of
+ * it reads the Claude Agent SDK's on-disk `.jsonl` transcripts, so it belongs
+ * to this provider and is not part of the runtime contract — ClaudeProvider
+ * calls the archive from its PreCompact hook, the rotation from
+ * `maybeRotateContinuation` and the expiry check from `warmPromptCache`; only
  * `newestClaudeTranscript` is declared on the contract (`history.readTrace`).
  *
- * The functions take a clock instead of reading `Date.now()` themselves so
- * tests can pin the archive name and header.
+ * The functions take the time (a clock, or `now`) instead of reading
+ * `Date.now()` themselves so tests can pin it.
  */
 
 import fs from 'fs';

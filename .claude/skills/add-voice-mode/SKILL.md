@@ -90,6 +90,7 @@ src/channels/voice-registration.test.ts
 src/channels/voice-line.test.ts
 src/channels/voice-call-page.test.ts
 src/channels/voice-livekit.test.ts
+src/channels/voice-call-session.test.ts
 src/voice-livekit-worker.test.ts
 src/voice-wakeword.test.ts
 src/voice-wakeword-fixtures/positive.wav
@@ -99,7 +100,13 @@ src/voice-wakeword-fixtures/negative.wav
 ### 2. Register the adapter
 
 Append the self-registration import to the channel barrel (skipped if present).
-This one line is the skill's only reach-in into the channel core:
+This one line is the only edit the skill makes to the channel core. The adapter
+also relies on core pieces this fork's trunk carries and upstream does not:
+host-addressed turns (`agentGroupId` and `onStored` on `InboundEvent`,
+`routeInboundEvent`), `expediteDelivery` in `src/delivery.ts`, the `voice-call`
+wake reason with `holdIdleCeiling` in `src/reconcile-session.ts`, and the agent
+runner's idle start and prompt-cache warm for that wake. Apply it to this
+fork's trunk, not to plain upstream:
 
 ```nc:append to:src/channels/index.ts
 import './voice.js';
@@ -153,7 +160,7 @@ page check, and the integration tests (a fake LiveKit server behind the real
 webhook server, and the worker's turn-taking rules):
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.test.ts src/voice-wakeword.test.ts
+pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/channels/voice-call-session.test.ts src/voice-livekit-worker.test.ts src/voice-wakeword.test.ts
 ```
 
 `voice-registration.test.ts` imports the real channel barrel and asserts the

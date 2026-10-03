@@ -22,6 +22,9 @@
  *        reaching an SDK event —
  *        and so never writes a heartbeat — still ages out instead of
  *        living forever (see decideStuckAction's grace-period comment).
+ *        Skipped while the session's ceiling is held (holdIdleCeiling: a
+ *        live voice call, whose caller may stay silent longer than the agent
+ *        works); the hold carries its own deadline.
  *
  *     2. Message-scoped stuck: for each 'processing' row, tolerance =
  *        max(60s, current_bash_timeout_ms_if_Bash_running). If
