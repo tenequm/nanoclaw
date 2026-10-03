@@ -31,8 +31,19 @@ export interface AgentProvider {
    */
   onExchangeComplete?(exchange: ProviderExchange): void;
 
-  /** Start a new query. Returns a handle for streaming input and output. */
+  /**
+   * Start a new query. Returns a handle for streaming input and output. An
+   * empty `prompt` starts it idle: the first turn arrives through `push`.
+   */
   query(input: QueryInput): AgentQuery;
+
+  /**
+   * Optional. Warm the model's prompt cache for `input.continuation` so the
+   * next turn reads its context instead of writing it, without a turn of its
+   * own (nothing persisted, delivered or run). Called when a voice call starts
+   * the agent before its first turn. Best-effort; never throws.
+   */
+  warmPromptCache?(input: QueryInput): Promise<void>;
 
   /**
    * True if the given error indicates the stored continuation is invalid

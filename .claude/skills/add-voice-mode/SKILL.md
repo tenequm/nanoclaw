@@ -866,12 +866,14 @@ that cannot be spoken is reported as a delivery failure through the host retry
 path. Voice does not deliver files or interactive question cards; ask questions
 in plain spoken text and send attachments to another wired channel.
 
-**The first answer on a call takes about ten seconds.** That wait is the host
-creating the agent's session and starting its container. Ask a second question
-in the same call and the reply comes back quickly, because the container is
-already running. The page shows the agent working while it waits, rather than
-leaving the caller looking at a silent screen. Containers are reclaimed when a
-session goes idle, so the next call pays the same first-answer cost.
+**The first answer on a call is slower than the rest.** When the caller joins,
+the host starts the agent's container and its Claude session and refreshes the
+prompt cache, so the first turn usually meets a running agent. The first answer
+still pays for the start when the caller speaks within a few seconds of joining,
+or when the call's chat has no agent session yet (its first message creates
+one). The page shows the agent working while it waits, rather than leaving the
+caller looking at a silent screen. The container is kept for the whole call;
+after it, an idle container is reclaimed as before.
 
 **`Caller access denied` on the page.** Verify the voice user has a display name,
 is a member of the answering agent, and the line has exactly one strict,

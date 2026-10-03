@@ -254,6 +254,65 @@ export function rotateClaudeContinuation(
   }
 }
 
+/** Prompt-cache lifetimes, by the cache-write bucket a response used. */
+const CACHE_TTL_MS = { ephemeral_1h_input_tokens: 3_600_000, ephemeral_5m_input_tokens: 300_000 };
+/** Treated as expired this long before it is, so a warm never races the expiry. */
+const CACHE_EXPIRY_MARGIN_MS = 60_000;
+/** The transcript's tail holds its last response; read no more than this of it. */
+const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
+
+/**
+ * Whether the prompt cache the session's last response wrote has (likely) expired: the response's
+ * time plus the lifetime of the bucket it wrote (1 h on a subscription, 5 min on an API key). True
+ * when that cannot be read, so a warm is never skipped on a guess.
+ */
+export function claudePromptCacheExpired(continuation: string, now: number): boolean {
+  const transcriptPath = findContinuationFile(path.join(claudeConfigDirectory(), 'projects'), `${continuation}.jsonl`);
+  if (!transcriptPath) return true;
+  try {
+    const lines = readTail(transcriptPath, TRANSCRIPT_TAIL_BYTES).split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].includes('"cache_creation"')) continue;
+      const entry = parseLine(lines[i]) as {
+        type?: string;
+        timestamp?: string;
+        message?: { usage?: { cache_creation?: Record<string, number> } };
+      } | null;
+      const written = entry?.type === 'assistant' ? entry.message?.usage?.cache_creation : undefined;
+      if (!written || !entry?.timestamp) continue;
+      const ttl = written.ephemeral_1h_input_tokens
+        ? CACHE_TTL_MS.ephemeral_1h_input_tokens
+        : CACHE_TTL_MS.ephemeral_5m_input_tokens;
+      return now - Date.parse(entry.timestamp) > ttl - CACHE_EXPIRY_MARGIN_MS;
+    }
+  } catch {
+    // Unreadable: assume expired.
+  }
+  return true;
+}
+
+/** One transcript line; null for the partial first line of a tail read. */
+function parseLine(line: string): unknown {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+function readTail(filePath: string, bytes: number): string {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    const length = Math.min(size, bytes);
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, size - length);
+    return buffer.toString('utf-8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function decideContinuationRotation(
   input: { size: number; firstLine: string },
   fx: ClaudeHistoryClock,

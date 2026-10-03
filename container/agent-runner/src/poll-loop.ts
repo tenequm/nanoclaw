@@ -130,6 +130,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   let pollCount = 0;
   let isFirstPoll = true;
+  // The host woke this container for a voice call (src/request-wake.ts): start the agent before the
+  // caller's first turn, unless that turn is already here.
+  let startForCall = process.env.NANOCLAW_WAKE_REASON === 'voice-call';
   while (true) {
     if (config.signal?.aborted) return;
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
@@ -143,9 +146,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (messages.length === 0) {
+      if (startForCall) {
+        startForCall = false;
+        continuation = await runIdleQuery(config, continuation, midTurnCompleteDelivery);
+        continue;
+      }
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
+    startForCall = false;
 
     // Accumulate gate: if the batch contains only trigger=0 rows
     // (context-only, router-stored under ignored_message_policy='accumulate'),
@@ -315,6 +324,55 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
   }
+}
+
+/**
+ * Open the provider query with no turn yet, so the next message is pushed into a running SDK
+ * (processQuery adopts it as its turn), and warm the provider's prompt cache meanwhile. Returns the
+ * continuation to keep.
+ */
+async function runIdleQuery(
+  config: PollLoopConfig,
+  continuation: string | undefined,
+  midTurnCompleteDelivery: boolean,
+): Promise<string | undefined> {
+  log('Voice call: starting the agent ahead of its first turn');
+  const input = { prompt: '', continuation, cwd: config.cwd, systemContext: config.systemContext };
+  config.provider
+    .warmPromptCache?.(input)
+    .catch((err) => log(`Prompt cache warm failed: ${err instanceof Error ? err.message : String(err)}`));
+  const query = config.provider.query(input);
+  const abortQuery = () => query.abort();
+  if (config.signal?.aborted) abortQuery();
+  else config.signal?.addEventListener('abort', abortQuery, { once: true });
+  try {
+    const result = await processQuery(
+      query,
+      extractRouting([]),
+      [],
+      config.providerName,
+      config.provider.onExchangeComplete?.bind(config.provider),
+      '',
+      continuation,
+      midTurnCompleteDelivery,
+      config.signal,
+    );
+    if (result.continuation && result.continuation !== continuation) {
+      setContinuation(config.providerName, result.continuation);
+      return result.continuation;
+    }
+  } catch (err) {
+    log(`Query error: ${err instanceof Error ? err.message : String(err)}`);
+    if (continuation && config.provider.isSessionInvalid(err)) {
+      log(`Stale session detected (${continuation}) — clearing for next retry`);
+      clearContinuation(config.providerName);
+      return undefined;
+    }
+  } finally {
+    clearCurrentReplyRoute();
+    config.signal?.removeEventListener('abort', abortQuery);
+  }
+  return continuation;
 }
 
 /**

@@ -7,7 +7,8 @@
  * src/db/coordination.ts) and served event-driven. The implementation below
  * is a pure delegation — byte-equivalent to calling `wakeContainer` — and
  * MUST stay that way until the durable rows become authoritative: no
- * logging, no signal writes, no behavior.
+ * logging, no signal writes, no behavior. The reason rides along to the
+ * spawn, where the runner reads it (`NANOCLAW_WAKE_REASON`).
  */
 import { wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
@@ -25,8 +26,10 @@ export type WakeReason =
   | 'interactive'
   | 'cli'
   | 'approval-response'
-  | 'adoption';
+  | 'adoption'
+  // A voice call joined: start the agent before the caller's first turn (no message is posted).
+  | 'voice-call';
 
-export async function requestWake(session: Session, _reason: WakeReason): Promise<boolean> {
-  return wakeContainer(session);
+export async function requestWake(session: Session, reason: WakeReason): Promise<boolean> {
+  return wakeContainer(session, reason);
 }

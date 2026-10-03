@@ -1,4 +1,9 @@
-import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import {
+  query as sdkQuery,
+  type HookCallback,
+  type Options as SdkOptions,
+  type PreCompactHookInput,
+} from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
@@ -17,7 +22,7 @@ import {
 } from './claude-config.js';
 // Transcript archiving and rotation are this provider's own concern: both
 // read the SDK's on-disk .jsonl, which no other provider has.
-import { archiveClaudeTranscript, rotateClaudeContinuation } from './claude-history.js';
+import { archiveClaudeTranscript, claudePromptCacheExpired, rotateClaudeContinuation } from './claude-history.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
@@ -154,6 +159,15 @@ const postToolUseHook: HookCallback = async () => {
 /** Minimum spacing between `activity` frames derived from streaming deltas. */
 const STREAM_ACTIVITY_INTERVAL_MS = 1000;
 
+/** The cache warm's own prompt: never persisted, and the request is cut off before the model answers it. */
+const CACHE_WARM_PROMPT = 'Prompt cache warm-up; no reply needed.';
+/** The warm gives up after this long; the first turn then simply pays for the cache itself. */
+const CACHE_WARM_TIMEOUT_MS = 60_000;
+
+/** The cache warm runs no tool, whatever the model would start. */
+const denyAllTools: HookCallback = async () =>
+  ({ decision: 'block', stopReason: 'Prompt cache warm-up runs no tools.' }) as unknown as ReturnType<HookCallback>;
+
 /** The real clock for archive names and rotation stamps; tests hand the history functions a fixed one. */
 const REAL_CLOCK = { now: () => Date.now() };
 
@@ -250,56 +264,104 @@ export class ClaudeProvider implements AgentProvider {
     return rotateClaudeContinuation({ continuation, assistantName: this.assistantName, log }, REAL_CLOCK);
   }
 
+  /** The SDK options of a turn; the cache warm reuses them so its request prefix is the turn's byte for byte. */
+  private sdkOptions(input: QueryInput): SdkOptions {
+    const instructions = input.systemContext?.instructions;
+    return {
+      cwd: input.cwd,
+      additionalDirectories: this.additionalDirectories,
+      resume: input.continuation,
+      pathToClaudeCodeExecutable: '/pnpm/claude',
+      // The append (agent name + destinations) is rebuilt at every container
+      // start. Left to the SDK default, Claude Code records the prompt on a
+      // session's first request and resends that record on every resume, so
+      // a resumed agent would keep its old name and destination list until
+      // compaction. snapshot: false renders it fresh each time.
+      systemPrompt: instructions
+        ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions, snapshot: false }
+        : undefined,
+      allowedTools: [...this.mcp.allowedTools],
+      disallowedTools: [...this.executionPolicy.disallowedTools],
+      // The SDK emits `assistant` only per completed content block, so a long
+      // block is silent and the host sweep kills the container mid-generation.
+      // Streaming deltas are the liveness signal for that window; translateEvents
+      // turns them into throttled `activity` and nothing else.
+      includePartialMessages: true,
+      env: this.env,
+      model: this.inference.model,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      effort: this.inference.effort as any,
+      permissionMode: this.executionPolicy.permissionMode,
+      allowDangerouslySkipPermissions: this.executionPolicy.allowDangerouslySkipPermissions,
+      settingSources: ['project', 'user', 'local'],
+      // Flag-level settings: `fastMode` only when the install turns it on,
+      // then the execution policy's fixed keys, spread last so per-group
+      // input can never override them. Both are Settings members rather
+      // than query options, which is why they ride `settings`.
+      settings: { ...this.inference.settings, ...this.executionPolicy.settings },
+      mcpServers: this.mcp.mcpServers,
+      hooks: {
+        PreToolUse: [{ hooks: [preToolUseHook] }],
+        PostToolUse: [{ hooks: [postToolUseHook] }],
+        PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+        PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
+      },
+    };
+  }
+
+  /**
+   * Make the session's next request read its context from the prompt cache: a forked, unpersisted
+   * copy of the session sends a one-line prompt with the exact options a turn uses, and is cut off
+   * at the response's first event, once the API has written the cache and before any output or tool.
+   * Skipped when the cache the last response wrote is likely still warm, or when the copy would
+   * compact the context first (the real turn compacts anyway).
+   */
+  async warmPromptCache(input: QueryInput): Promise<void> {
+    if (!input.continuation || !claudePromptCacheExpired(input.continuation, Date.now())) return;
+    const abortController = new AbortController();
+    const timer = setTimeout(() => abortController.abort(), CACHE_WARM_TIMEOUT_MS);
+    const startedAt = Date.now();
+    try {
+      for await (const message of sdkQuery({
+        prompt: CACHE_WARM_PROMPT,
+        options: {
+          ...this.sdkOptions(input),
+          forkSession: true,
+          persistSession: false,
+          abortController,
+          hooks: { PreToolUse: [{ hooks: [denyAllTools] }] },
+        },
+      })) {
+        if (message.type === 'system' && message.subtype === 'status' && message.status === 'compacting') {
+          log('Prompt cache not warmed: the context is due for compaction');
+          return;
+        }
+        if (message.type === 'stream_event' && message.event.type === 'message_start') {
+          const usage = message.event.message.usage;
+          log(
+            `Prompt cache warmed in ${Date.now() - startedAt} ms ` +
+              `(${usage.cache_creation_input_tokens ?? 0} tokens written, ${usage.cache_read_input_tokens ?? 0} read)`,
+          );
+          return;
+        }
+        if (message.type === 'result') return;
+      }
+    } catch (err) {
+      if (!abortController.signal.aborted)
+        log(`Prompt cache warm failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      clearTimeout(timer);
+      abortController.abort();
+    }
+  }
+
   query(input: QueryInput): AgentQuery {
     if (!this.memorySessionHook) throw new Error('Claude memory session hook was not registered');
     const stream = new MessageStream();
-    stream.push(input.prompt);
+    // An empty prompt starts the SDK idle: the first turn is pushed later.
+    if (input.prompt) stream.push(input.prompt);
 
-    const instructions = input.systemContext?.instructions;
-
-    const sdkResult = sdkQuery({
-      prompt: stream,
-      options: {
-        cwd: input.cwd,
-        additionalDirectories: this.additionalDirectories,
-        resume: input.continuation,
-        pathToClaudeCodeExecutable: '/pnpm/claude',
-        // The append (agent name + destinations) is rebuilt at every container
-        // start. Left to the SDK default, Claude Code records the prompt on a
-        // session's first request and resends that record on every resume, so
-        // a resumed agent would keep its old name and destination list until
-        // compaction. snapshot: false renders it fresh each time.
-        systemPrompt: instructions
-          ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions, snapshot: false }
-          : undefined,
-        allowedTools: [...this.mcp.allowedTools],
-        disallowedTools: [...this.executionPolicy.disallowedTools],
-        // The SDK emits `assistant` only per completed content block, so a long
-        // block is silent and the host sweep kills the container mid-generation.
-        // Streaming deltas are the liveness signal for that window; translateEvents
-        // turns them into throttled `activity` and nothing else.
-        includePartialMessages: true,
-        env: this.env,
-        model: this.inference.model,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        effort: this.inference.effort as any,
-        permissionMode: this.executionPolicy.permissionMode,
-        allowDangerouslySkipPermissions: this.executionPolicy.allowDangerouslySkipPermissions,
-        settingSources: ['project', 'user', 'local'],
-        // Flag-level settings: `fastMode` only when the install turns it on,
-        // then the execution policy's fixed keys, spread last so per-group
-        // input can never override them. Both are Settings members rather
-        // than query options, which is why they ride `settings`.
-        settings: { ...this.inference.settings, ...this.executionPolicy.settings },
-        mcpServers: this.mcp.mcpServers,
-        hooks: {
-          PreToolUse: [{ hooks: [preToolUseHook] }],
-          PostToolUse: [{ hooks: [postToolUseHook] }],
-          PostToolUseFailure: [{ hooks: [postToolUseHook] }],
-          PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
-        },
-      },
-    });
+    const sdkResult = sdkQuery({ prompt: stream, options: this.sdkOptions(input) });
 
     let aborted = false;
 
