@@ -125,6 +125,20 @@ describe('WakeWordSpotter', () => {
     return { spotter, detections, windows };
   };
 
+  it('closes with a window in flight by letting the thread finish it, never terminating it mid-inference', async () => {
+    const { spotter } = make();
+    await spotter.ready;
+    const thread = (spotter as unknown as { thread: import('node:worker_threads').Worker }).thread;
+    const codes: number[] = [];
+    thread.once('exit', (code) => codes.push(code));
+    spotter.listen(true);
+    spotter.push(positive());
+    expect((spotter as unknown as { inflight: boolean }).inflight).toBe(true);
+    await spotter.close();
+    // terminate() exits 1; a thread that stopped on its own exits 0.
+    expect(codes).toEqual([0]);
+  });
+
   it('spots the wake word once in a worker thread, and only while listening', async () => {
     const { spotter, detections, windows } = make();
     await spotter.ready;

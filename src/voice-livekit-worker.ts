@@ -2653,37 +2653,39 @@ const SEGMENT_ID = 'lk.segment_id';
 const TRANSCRIPTION_FINAL = 'lk.transcription_final';
 const TRANSCRIBED_TRACK = 'lk.transcribed_track_id';
 
-/** A publication to the room that takes longer than this is stuck: the call ends. */
+/** A publication to the room that takes longer than this is waited for no more: the next one goes. */
 const OUTBOX_DEADLINE_MS = 5_000;
-/** At most this many publications wait; more means the room stopped taking them. */
+/** At most this many publications wait; past it the oldest replaceable one (or the oldest) is dropped. */
 const OUTBOX_MAX = 64;
 
 /**
  * The page's data and attributes, published one at a time in order. A queued update with the same
  * key (an interim caption of one turn, one attribute) is replaced by the newer one; finals, labels and
- * statuses keep their place. A publication that takes over OUTBOX_DEADLINE_MS, or a queue over
- * OUTBOX_MAX, is room I/O that stopped: `onStuck` ends the call rather than holding every update behind it.
+ * statuses keep their place. A slow room never ends the call: a publication still pending after
+ * OUTBOX_DEADLINE_MS is left to finish on its own while the next goes, and a queue over OUTBOX_MAX
+ * drops what a newer update supersedes first.
  */
 export class Outbox {
   private readonly queue: Array<{ what: string; key?: string; run: () => Promise<unknown> }> = [];
   private busy = false;
-  private stuck = false;
 
   constructor(
-    private readonly onStuck: (what: string) => void,
-    private readonly log: Pick<Console, 'warn' | 'error'>,
+    private readonly log: Pick<Console, 'warn'>,
     private readonly deadlineMs = OUTBOX_DEADLINE_MS,
     private readonly max = OUTBOX_MAX,
   ) {}
 
   post(what: string, run: () => Promise<unknown>, key?: string): void {
-    if (this.stuck) return;
     const queued = key ? this.queue.find((job) => job.key === key) : undefined;
     if (queued) {
       queued.run = run;
       return;
     }
-    if (this.queue.length >= this.max) return this.fail(what);
+    if (this.queue.length >= this.max) {
+      const replaceable = this.queue.findIndex((job) => job.key !== undefined);
+      const [dropped] = this.queue.splice(replaceable >= 0 ? replaceable : 0, 1);
+      this.log.warn(`voice worker: the room is behind; dropped ${dropped.what}`);
+    }
     this.queue.push({ what, key, run });
     void this.next();
   }
@@ -2691,27 +2693,24 @@ export class Outbox {
   private async next(): Promise<void> {
     if (this.busy) return;
     this.busy = true;
-    while (this.queue.length && !this.stuck) {
+    while (this.queue.length) {
       const job = this.queue.shift()!;
       let timer: ReturnType<typeof setTimeout> | undefined;
       const late = new Promise<'late'>((resolve) => (timer = setTimeout(() => resolve('late'), this.deadlineMs)));
+      // A native call that throws at once is a failed publication, not the job's error.
+      const running = (async () => job.run())();
+      // A late publication that fails afterwards is only logged.
+      running.catch((err: unknown) => this.log.warn(`voice worker: could not publish ${job.what}`, { err }));
       try {
-        const result = await Promise.race([job.run(), late]);
-        if (result === 'late') this.fail(job.what);
-      } catch (err) {
-        this.log.warn(`voice worker: could not publish ${job.what}`, { err });
+        const result = await Promise.race([running, late]);
+        if (result === 'late') this.log.warn(`voice worker: ${job.what} is slow to reach the room; moving on`);
+      } catch {
+        // Logged above.
       } finally {
         clearTimeout(timer);
       }
     }
     this.busy = false;
-  }
-
-  private fail(what: string): void {
-    this.stuck = true;
-    this.queue.length = 0;
-    this.log.error(`voice worker: the room stopped taking updates (${what})`);
-    this.onStuck(what);
   }
 }
 
@@ -2828,7 +2827,7 @@ async function roomVoice(
     return undefined;
   });
 
-  const outbox = new Outbox((what) => events.onClosed(`room output stuck (${what})`), log);
+  const outbox = new Outbox(log);
   const post = (what: string, job: () => Promise<unknown>, key?: string) => outbox.post(what, job, key);
   const sendJson = (topic: string, value: unknown, what: string) =>
     post(what, () => local.sendText(JSON.stringify(value), { topic }));
@@ -3000,12 +2999,20 @@ async function roomVoice(
       sayAbort.abort();
       room.off(RoomEvent.TrackSubscribed, listen);
       room.off(RoomEvent.TrackUnsubscribed, unlisten);
-      await callerAudio?.cancel().catch(() => undefined);
-      input.close();
-      await cueTrack?.close().catch(() => undefined);
-      if (speechPublication.sid) await local.unpublishTrack(speechPublication.sid).catch(() => undefined);
-      await speechTrack.close().catch(() => undefined);
-      await speechSource.close().catch(() => undefined);
+      // Each step on its own: a native close that throws, at once or later, skips none of the others.
+      const quietly = async (step: () => unknown) => {
+        try {
+          await step();
+        } catch (err) {
+          log.warn('voice worker: could not close part of the call', { err });
+        }
+      };
+      await quietly(() => callerAudio?.cancel());
+      await quietly(() => input.close());
+      await quietly(() => cueTrack?.close());
+      await quietly(() => speechPublication.sid && local.unpublishTrack(speechPublication.sid));
+      await quietly(() => speechTrack.close());
+      await quietly(() => speechSource.close());
     },
   };
 }
@@ -3235,7 +3242,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         cpu: Math.round(wakeWord.utilization * 1000) / 1000,
       });
     }
-    void spotter?.close().catch(() => undefined);
     // A job process serves one call: its heap now is what the call grew it to (long calls show
     // 100-150 ms GC pauses).
     const mem = process.memoryUsage();
@@ -3255,6 +3261,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           .then((res) => res.body?.cancel())
           .catch(() => undefined),
       callVoice?.close().catch(() => undefined),
+      // Before the job exits: a process leaving with the wake word thread mid-inference aborts.
+      spotter?.close().catch(() => undefined),
     ]);
     hostLink.abort();
     await ctx.deleteRoom().catch(() => undefined);

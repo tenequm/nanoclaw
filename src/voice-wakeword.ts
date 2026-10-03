@@ -27,6 +27,8 @@ export const WAKE_HOP_SAMPLES = 1_280;
 const WAKE_DEBOUNCE_MS = 2_000;
 /** Windows that may wait for the thread; more means it is slower than real time. */
 const WAKE_MAX_QUEUED = 8;
+/** How long a closing thread may take to finish its score and release the models. */
+const WAKE_STOP_MS = 3_000;
 /** livekit-wakeword's documented optimal threshold for its conv-attention `hey_livekit` model. */
 export const DEFAULT_WAKE_THRESHOLD = 0.68;
 /** The reference listener's default, for a classifier with no documented threshold. */
@@ -186,9 +188,19 @@ if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
   const port = parentPort!;
   WakeWordPipeline.load(init.classifier, init.featureDir).then(
     (pipeline) => {
-      port.on('message', (msg: { id: number; audio: Float32Array; end: number }) => {
+      let scoring: Promise<unknown> = Promise.resolve();
+      port.on('message', (msg: { id: number; audio: Float32Array; end: number } | { stop: true }) => {
+        if ('stop' in msg) {
+          // Out of native code before the thread goes: terminated mid-inference, onnxruntime's
+          // pending Napi::Error aborts the whole process.
+          void scoring
+            .then(() => pipeline.release())
+            .catch(() => undefined)
+            .finally(() => process.exit(0));
+          return;
+        }
         const started = performance.now();
-        pipeline.score(msg.audio, msg.end).then(
+        scoring = pipeline.score(msg.audio, msg.end).then(
           (score) => port.postMessage({ id: msg.id, score, ms: performance.now() - started } satisfies ThreadReply),
           (err: unknown) => port.postMessage({ error: String(err) } satisfies ThreadReply),
         );
@@ -243,6 +255,7 @@ export class WakeWordSpotter {
   /** Resolves once the models are loaded, rejects when they cannot be. */
   readonly ready: Promise<void>;
   private readonly thread: Worker;
+  private readonly exited: Promise<void>;
   /** The last window's audio: its length is the classifier's (2 s for 16 embeddings). */
   private ring = new Float32Array(WAKE_WINDOW_SAMPLES);
   private write = 0;
@@ -281,6 +294,7 @@ export class WakeWordSpotter {
       } satisfies ThreadInit,
     });
     this.thread.unref();
+    this.exited = new Promise((resolve) => this.thread.once('exit', () => resolve()));
     this.ready = new Promise<void>((resolve, reject) => {
       this.thread.on('message', (msg: ThreadReply) => {
         if ('ready' in msg) {
@@ -380,7 +394,20 @@ export class WakeWordSpotter {
     if (this.closed) return;
     this.closed = true;
     this.listening = false;
-    await this.thread.terminate();
+    await this.stop();
+  }
+
+  /**
+   * The thread finishes the window it is scoring and exits on its own: terminating a thread inside
+   * an onnxruntime call aborts the process (nodejs/node#34567). Terminated only when it hangs.
+   */
+  private async stop(): Promise<void> {
+    this.thread.postMessage({ stop: true });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const hung = new Promise<'hung'>((resolve) => (timer = setTimeout(() => resolve('hung'), WAKE_STOP_MS)));
+    const outcome = await Promise.race([this.exited, hung]);
+    clearTimeout(timer);
+    if (outcome === 'hung') await this.thread.terminate();
   }
 
   private onScore(id: number, score: number, ms: number): void {
@@ -414,7 +441,7 @@ export class WakeWordSpotter {
     if (this.closed) return;
     this.closed = true;
     this.listening = false;
-    void this.thread.terminate();
+    void this.stop();
     this.options.onError?.(err);
   }
 }

@@ -2477,11 +2477,11 @@ describe('cue audio', () => {
 });
 
 describe('room output and the caller input', () => {
-  it('publishes in order, replaces a waiting interim with a newer one, and ends the call on a stuck publication', async () => {
+  it('publishes in order, replaces a waiting interim with a newer one, and moves past a stuck publication', async () => {
     vi.useFakeTimers();
-    const stuck: string[] = [];
+    const warnings: string[] = [];
     const sent: string[] = [];
-    const outbox = new Outbox((what) => void stuck.push(what), { warn: () => undefined, error: () => undefined });
+    const outbox = new Outbox({ warn: (msg: string) => void warnings.push(msg) });
     let release!: () => void;
     outbox.post('first', () => new Promise<void>((r) => (release = () => (sent.push('first'), r()))));
     outbox.post('interim', async () => void sent.push('interim 1'), 'caption 1');
@@ -2490,20 +2490,29 @@ describe('room output and the caller input', () => {
     release();
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toEqual(['first', 'interim 2', 'final']);
-    outbox.post('stuck', () => new Promise(() => undefined));
+    // The first agent state after a join that never resolves: the call goes on, later updates flow.
+    outbox.post('the agent state', () => new Promise(() => undefined), 'attribute lk.agent.state');
     outbox.post('status', async () => void sent.push('status'));
+    outbox.post('a native throw', () => {
+      throw new Error('closed');
+    });
+    outbox.post('the agent state', async () => void sent.push('state listening'), 'attribute lk.agent.state');
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(stuck).toEqual(['stuck']);
-    expect(sent).toEqual(['first', 'interim 2', 'final']);
-    // A room that took nothing for a while is stuck too: the queue does not grow without bound.
-    const full = new Outbox(
-      (what) => void stuck.push(what),
-      { warn: () => undefined, error: () => undefined },
-      60_000,
-      3,
-    );
-    for (let i = 0; i < 5; i++) full.post(`update ${i}`, () => new Promise(() => undefined));
-    expect(stuck).toEqual(['stuck', 'update 4']);
+    expect(sent).toEqual(['first', 'interim 2', 'final', 'status', 'state listening']);
+    expect(warnings.some((w) => w.includes('slow'))).toBe(true);
+    expect(warnings.some((w) => w.includes('could not publish a native throw'))).toBe(true);
+    // A room that takes nothing for a while drops superseded updates first, and never stops the queue.
+    const full = new Outbox({ warn: (msg: string) => void warnings.push(msg) }, 60_000, 3);
+    const order: string[] = [];
+    full.post('stuck', () => new Promise(() => undefined));
+    full.post('label', async () => void order.push('label'));
+    full.post('interim', async () => void order.push('interim'), 'caption 2');
+    full.post('final', async () => void order.push('final'));
+    full.post('status', async () => void order.push('status'));
+    expect(warnings.at(-1)).toContain('dropped interim');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(order).toEqual(['label', 'final', 'status']);
+    vi.useRealTimers();
   });
 
   it('a microphone track that ends mid-speech ends the speech; the next track gets a fresh VAD on the same positions', async () => {
@@ -2800,6 +2809,23 @@ describe('acoustic wake word in a call', () => {
     v.interim('What is the time? Send it.');
     await vi.waitFor(() => expect(utterances(host)).toEqual(['What is the time?']));
     host.endStream();
+  });
+
+  it('the job shuts down only once the spotter thread stopped: a process leaving mid-inference aborts', async () => {
+    const { ctx, job, roomHandlers } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const w = fakeWakeWord();
+    let stopped!: () => void;
+    w.wake.close.mockImplementation(() => new Promise<undefined>((resolve) => (stopped = () => resolve(undefined))));
+    await runCall(ctx, { ...callDeps(host.fetchImpl, v), wakeWord: w.make });
+    await vi.waitFor(() => expect(v.states.some((s) => s.wake?.phrase === 'Hey LiveKit')).toBe(true));
+    roomHandlers.get('participantDisconnected')?.({ identity: 'caller-1' });
+    await vi.waitFor(() => expect(w.wake.close).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(job.shutdown).not.toHaveBeenCalled();
+    stopped();
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('caller left'));
   });
 
   it('names the phrase while the model loads, and falls back to the transcript name when it does not', async () => {
