@@ -235,10 +235,11 @@ export interface LiveKitHost {
   routeTurn(event: InboundEvent): Promise<boolean>;
   /**
    * The caller joined: `route` is where the call's turns go now (`agentGroupId`: the line's agent).
-   * Wakes that agent's existing session before the first turn (none is created) and keeps it
-   * running until `callEnded`.
+   * Wakes that agent's existing session once, before the first turn (none is created); a long
+   * silent call lets the session be reclaimed as usual, and the next turn wakes it again.
    */
   callJoined?(callId: string, route: Omit<InboundEvent, 'message'>, agentGroupId: string): void;
+  /** The call ended: it is no longer joined, so a session lookup still running wakes nothing. */
   callEnded?(callId: string): void;
   isRunning(): boolean;
   now(): number;
