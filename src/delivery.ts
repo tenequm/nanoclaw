@@ -197,6 +197,43 @@ export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
   }
 }
 
+/** A session someone waits on in real time is drained this often, instead of on the active poll alone. */
+const EXPEDITED_POLL_MS = 200;
+/** Sessions drained every EXPEDITED_POLL_MS, each until its deadline. */
+const expedited = new Map<string, { session: Session; until: number }>();
+let expediteTimer: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * Drain one session's outbound queue every EXPEDITED_POLL_MS for the next `forMs`: for a caller
+ * waiting on the reply live (a voice call's turn), the ~1 s active poll alone adds half a second
+ * on average. The per-session re-entry guard keeps it from racing the regular polls.
+ */
+export function expediteDelivery(session: Session, forMs: number): void {
+  if (!activePolling) return;
+  expedited.set(session.id, { session, until: Date.now() + forMs });
+  if (expediteTimer) return;
+  expediteTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [id, entry] of expedited) {
+      if (entry.until <= now) {
+        expedited.delete(id);
+        continue;
+      }
+      void deliverSessionMessages(entry.session).catch((err: unknown) =>
+        log.error('Session delivery failed', { sessionId: id, err }),
+      );
+    }
+    if (expedited.size === 0) stopExpediting();
+  }, EXPEDITED_POLL_MS);
+  expediteTimer.unref?.();
+}
+
+function stopExpediting(): void {
+  clearInterval(expediteTimer);
+  expediteTimer = undefined;
+  expedited.clear();
+}
+
 /** Start the active container poll loop (~1s). */
 export function startActiveDeliveryPoll(): void {
   if (activePolling) return;
@@ -902,4 +939,5 @@ async function handleSystemAction(content: Record<string, unknown>, session: Ses
 export function stopDeliveryPolls(): void {
   activePolling = false;
   sweepPolling = false;
+  stopExpediting();
 }

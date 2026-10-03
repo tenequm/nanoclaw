@@ -359,12 +359,13 @@ describe('an event addressed to one agent group', () => {
           isMention: true,
           isGroup: false,
         },
-        onStored: () => stored.push(agentGroupId),
+        onStored: (session) => stored.push(`${agentGroupId}:${session.agent_group_id}`),
       });
     await turn('ag-1');
     // Addressed to an agent the chat is not wired to: routing ends without storing it anywhere.
     await turn('ag-unwired');
-    expect(stored).toEqual(['ag-1']);
+    // It names the session that took it.
+    expect(stored).toEqual(['ag-1:ag-1']);
   });
 
   it('reports through onStored a turn on a chat whose agent keeps it as context without waking', async () => {

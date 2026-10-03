@@ -4,6 +4,7 @@
  * Channel adapters bridge NanoClaw with messaging platforms (Discord, Slack, etc.).
  * Two patterns: native adapters (implement directly) or Chat SDK bridge (wrap a Chat SDK adapter).
  */
+import type { Session } from '../types.js';
 
 /** Passed to the adapter at setup time. */
 export interface ChannelSetup {
@@ -95,10 +96,10 @@ export interface InboundEvent {
   agentGroupId?: string;
   /**
    * Called each time the router stores the message in an agent's session, as a
-   * trigger (before the wake) or as context under the `accumulate` policy. Set
-   * only host-side, like `agentGroupId`.
+   * trigger (before the wake) or as context under the `accumulate` policy, with
+   * that session. Set only host-side, like `agentGroupId`.
    */
-  onStored?: () => void;
+  onStored?: (session: Session) => void;
 }
 
 /** Inbound message from adapter to host. */
