@@ -27,7 +27,7 @@ import {
   type TurnMark,
   type VoiceCall,
 } from "./voice-call"
-import { INITIAL_REVIEW, autoBlock, isReviewSnapshot, refusalNote, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSION, INITIAL_REVIEW, autoBlock, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -69,7 +69,7 @@ const REVIEW_RPC: Record<ReviewOp | "settings", string> = {
   discard: "nanoclaw.voice.discard",
   settings: "nanoclaw.voice.settings",
 }
-/** "1" when the worker understands spoken commands (`over`, discard, the wake phrase) and the settings RPC. */
+/** COMMANDS_VERSION when the worker understands spoken commands (`send it`, discard, the wake phrase) and the settings RPC. */
 const COMMANDS_ATTR = "nanoclaw.voice.commands"
 /** The worker's sound cues come on their own track (CALL_CUE_TRACK), never the speech track. */
 const CUE_TRACK = "background_audio"
@@ -78,6 +78,12 @@ const REVIEW_RPC_TIMEOUT_MS = 10_000
 const AGENT_ATTR_GRACE_MS = 3000
 /** How long a note under the mode row stays. */
 const REVIEW_NOTE_MS = 5000
+/** After the agent's line ends, the readout keeps "speaking" this long: back-to-back lines read as one reply. */
+const SPEAK_GRACE_MS = 1200
+/** While the worker said more lines of the reply follow, the gap before the next one can be longer. */
+const SPEAK_MORE_MS = 4000
+/** A wake heard this soon after the caller's newest line changed belongs to that line, not the next one. */
+const WAKE_LINE_MS = 1500
 
 interface ReviewReply {
   gen: number
@@ -109,6 +115,9 @@ interface ReplyInfo {
   unprompted?: boolean
   part?: number
   more?: boolean
+  /** Sent after a line the worker could not synthesize, with what it would have said. */
+  unspoken?: boolean
+  text?: string
 }
 
 function isReplyInfo(v: unknown): v is ReplyInfo {
@@ -133,12 +142,20 @@ function endReasonText(metadata: string | undefined): string | null {
 
 /** What became of a caller turn, with its final text when there is one. */
 type SettledTurn = { turn: number; status: "sent" | "lost"; reason?: TurnMark["reason"]; text?: string }
-/** Caller words the worker will never send (CallDroppedSpeech): a spoken discard, or speech before the wake phrase. */
-type DroppedSpeech = { dropped: "discarded" | "unaddressed"; text: string }
+/**
+ * Caller words the worker will never send (CallDroppedSpeech): a spoken discard, speech before the
+ * wake phrase, or a spoken command said alone, with nothing open to act on.
+ */
+type DroppedSpeech = { dropped: "discarded" | "unaddressed" | "command"; text: string }
 
 function isDroppedSpeech(v: unknown): v is DroppedSpeech {
   const d = v as DroppedSpeech | null
-  return !!d && (d.dropped === "discarded" || d.dropped === "unaddressed") && typeof d.text === "string"
+  return !!d && (d.dropped === "discarded" || d.dropped === "unaddressed" || d.dropped === "command") && typeof d.text === "string"
+}
+
+/** The caller spoke while the agent's line played (CallUnheardSpeech): none of it was transcribed. */
+function isUnheard(v: unknown): boolean {
+  return !!v && (v as { unheard?: unknown }).unheard === "agent_speaking"
 }
 /** The worker says "sending" the moment a turn closes, before its outcome; a sent review draft's carries its text. */
 type TurnStatus = SettledTurn | { turn: number; status: "sending"; text?: string; draft?: number }
@@ -189,22 +206,18 @@ function agentPhase(attrs: Readonly<Record<string, string>>): Phase | null {
  */
 const spaceSentences = (s: string) => s.replace(/([\p{Ll}\p{N}][.!?…]+)(?=\p{Lu})/gu, "$1 ")
 
-const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
-/** A caption line as a sent turn's text holds it: a spoken command that ended the turn is not sent. */
-const lineKey = (s: string) => norm(s).replace(/(over|discardthisturn|discardturn|scratchthat)$/u, "")
 /** Whether a caption line belongs to the text the worker reports (a line of only a command does). */
 const within = (said: string, line: Line) => norm(line.text) !== "" && said.includes(lineKey(line.text))
 
 /**
- * Put a turn's mark on the caller line it belongs to: the latest unmarked one its final text
- * contains, else the latest unmarked one. Earlier unmarked lines are the same turn's opening
- * segments. A turn with no caption at all (nothing transcribed) gets a line of its own. A second
- * status for a turn (a timed-out one the agent got after all) replaces the mark on its line.
+ * Put a turn's mark on the caller lines it is made of: the latest unmarked one its final text
+ * contains, else the latest unmarked one, and the unmarked ones before it (the same turn's opening
+ * segments). A turn with no caption at all (nothing transcribed) gets a line of its own. A second
+ * status for a turn (a timed-out one the agent got after all) replaces the mark on its lines.
  */
 function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, newLine: () => Line, turn: number): Line[] {
   const mark: TurnMark = status.reason ? { status: status.status, reason: status.reason } : { status: status.status }
-  const marked = lines.find((l) => l.from === "user" && l.turn === turn)
-  if (marked) return lines.map((l) => (l.id === marked.id ? { ...l, mark } : l))
+  if (lines.some((l) => l.from === "user" && l.turn === turn)) return lines.map((l) => (l.from === "user" && l.turn === turn ? { ...l, mark } : l))
   const open = lines.filter((l) => l.from === "user" && !covered.has(l.id))
   const said = norm(status.text ?? "")
   const target =
@@ -214,11 +227,13 @@ function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, new
     covered.add(line.id)
     return [...lines, line]
   }
+  const lineIds = new Set<number>()
   for (const l of open) {
     covered.add(l.id)
+    lineIds.add(l.id)
     if (l.id === target.id) break
   }
-  return lines.map((l) => (l.id === target.id ? { ...l, mark, turn } : l))
+  return lines.map((l) => (lineIds.has(l.id) ? { ...l, mark, turn } : l))
 }
 
 /**
@@ -229,7 +244,24 @@ function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, new
 function applyDropped(lines: Line[], covered: Set<number>, d: DroppedSpeech): Line[] {
   const open = lines.filter((l) => l.from === "user" && !covered.has(l.id))
   const said = norm(d.text)
-  const target = d.dropped === "discarded" ? open[open.length - 1] : ([...open].reverse().find((l) => within(said, l)) ?? open[0])
+  if (d.dropped === "command") {
+    // A send word with nothing open is one line of its own: never the caller's next words.
+    const target = [...open].reverse().find((l) => isCommandOnly(l.text)) ?? [...open].reverse().find((l) => norm(l.text) === said)
+    if (!target) return lines
+    covered.add(target.id)
+    return lines.map((l) => (l.id === target.id ? { ...l, mark: { status: "dropped", reason: "command" } } : l))
+  }
+  const whole = d.dropped === "unaddressed" ? [...open].reverse().find((l) => within(said, l)) : undefined
+  // Words before the wake phrase that share a caption with it: that line stays open for the turn it
+  // starts, tagged for the part that was ignored; only the lines before it were wholly ignored.
+  const part =
+    d.dropped === "unaddressed" && !whole && said ? [...open].reverse().find((l) => lineKey(l.text).length > said.length && lineKey(l.text).includes(said)) : undefined
+  if (part) {
+    const before = new Set(open.slice(0, open.indexOf(part)).map((l) => l.id))
+    for (const id of before) covered.add(id)
+    return lines.map((l) => (l.id === part.id ? { ...l, preWake: true } : before.has(l.id) ? { ...l, mark: { status: "dropped", reason: "unaddressed" } } : l))
+  }
+  const target = d.dropped === "discarded" ? open[open.length - 1] : (whole ?? open[0])
   if (!target) return lines
   const marked = new Set<number>()
   for (const l of open) {
@@ -269,7 +301,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const { textStreams: turnStreams } = useTextStream(TURN_TOPIC, { room })
   const { textStreams: replyStreams } = useTextStream(REPLY_TOPIC, { room })
   const { canPlayAudio } = useAudioPlayback(room)
-  const [silenceMs, setSilenceMs] = useState<number | null>(null)
   const [limitNote, setLimitNote] = useState<string | null>(null)
 
   const phaseRef = useRef<Phase>(phase)
@@ -307,6 +338,17 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   /** The line the worker is about to speak or speaks: new agent captions belong to it. */
   const currentReply = useRef<{ group: number; re?: string; more: boolean } | null>(null)
   const labelledReplies = useRef(new Set<number>())
+  /** What each reply answers, for a line of it the worker could not speak. */
+  const replyLabels = useRef(new Map<number, string | undefined>())
+  /** Replies the caller already got a "not heard" note for: one per reply. */
+  const unheardReplies = useRef(new Set<number>())
+  /** The agent's newest attributes, for the speaking hold's timer. */
+  const attrsRef = useRef<Readonly<Record<string, string>> | undefined>(undefined)
+  const speakHold = useRef<number | null>(null)
+  /** The wake phrase was heard before its caption: the next caller line carries the mark. */
+  const wakeNext = useRef(false)
+  const wakeHeard = useRef(0)
+  const lastUserAt = useRef(0)
   const limit = useRef<{ ms: number; kind: string } | null>(null)
   const joinedAt = useRef(0)
 
@@ -336,7 +378,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const agentId = useRef<string | null>(null)
   agentId.current = agent?.identity ?? null
   const reviewAvailable = agentAttributes?.[REVIEW_ATTR] === "1"
-  const commandsAvailable = agentAttributes?.[COMMANDS_ATTR] === "1"
+  const commandsAvailable = agentAttributes?.[COMMANDS_ATTR] === COMMANDS_VERSION
   /** This call already gave the worker the page's settings. */
   const settingsSent = useRef(false)
   /** The wake switch as the worker last said it runs it. */
@@ -401,6 +443,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       if (agentTimer.current !== null) {
         window.clearTimeout(agentTimer.current)
         agentTimer.current = null
+      }
+      if (speakHold.current !== null) {
+        window.clearTimeout(speakHold.current)
+        speakHold.current = null
       }
       if (tellHost) endOnServer(attempt.current, beacon, reason)
       attempt.current = null
@@ -559,7 +605,14 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     }
   }, [room, end, resyncReview])
 
+  const dropSpeakHold = useCallback(() => {
+    if (speakHold.current === null) return
+    window.clearTimeout(speakHold.current)
+    speakHold.current = null
+  }, [])
+
   // The agent's state drives the phase once the caller is in the room.
+  attrsRef.current = agentAttributes
   useEffect(() => {
     if (!joined || !agent || !agentAttributes) return
     const p = phaseRef.current
@@ -574,8 +627,49 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       }
       startedAt.current = Date.now()
     }
+    // Between two lines of a reply the session says "listening" for a moment: the readout keeps
+    // "speaking" a little longer, and longer while the worker said more lines follow.
+    if (p === "talking" && next === "listening") {
+      if (speakHold.current === null) {
+        speakHold.current = window.setTimeout(
+          () => {
+            speakHold.current = null
+            const now = attrsRef.current ? agentPhase(attrsRef.current) : null
+            if (phaseRef.current === "talking" && now && now !== "talking") setPhase(now)
+          },
+          currentReply.current?.more ? SPEAK_MORE_MS : SPEAK_GRACE_MS
+        )
+      }
+      return
+    }
+    dropSpeakHold()
     if (next !== p) setPhase(next)
-  }, [joined, agent, agentAttributes, fail, setPhase])
+  }, [joined, agent, agentAttributes, fail, setPhase, dropSpeakHold])
+
+  /**
+   * A line the worker could not speak: its text joins the reply as an agent line marked unspoken (a
+   * caption of the same text is marked instead). The readout stops claiming the agent speaks, and
+   * the reply being spoken keeps labelling the lines that follow.
+   */
+  const showUnspoken = useCallback(
+    (info: ReplyInfo) => {
+      const text = info.text?.trim() ?? ""
+      const lines = linesRef.current
+      const caption = text ? lines.find((l) => l.from === "assistant" && l.group === info.reply && norm(l.text) === norm(text)) : undefined
+      if (caption) commitLines(lines.map((l) => (l.id === caption.id ? { ...l, unspoken: true } : l)))
+      else {
+        const first = !labelledReplies.current.has(info.reply)
+        labelledReplies.current.add(info.reply)
+        const re = first ? replyLabels.current.get(info.reply) : undefined
+        commitLines([...lines, { id: nextId.current++, from: "assistant", text, at: secondsIn(), group: info.reply, unspoken: true, ...(re ? { re } : {}) }])
+      }
+      if (currentReply.current?.group === info.reply) currentReply.current = { ...currentReply.current, more: false }
+      dropSpeakHold()
+      const now = attrsRef.current ? agentPhase(attrsRef.current) : null
+      if (phaseRef.current === "talking" && now && now !== "talking") setPhase(now)
+    },
+    [commitLines, dropSpeakHold, setPhase]
+  )
 
   // What the next spoken line answers. Runs before the captions below, which take it for new agent lines.
   useEffect(() => {
@@ -590,12 +684,17 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       }
       doneReplies.current.add(s.streamInfo.id)
       if (!isReplyInfo(info)) continue
+      if (info.unspoken) {
+        showUnspoken(info)
+        continue
+      }
       const shown = typeof info.turn === "number" ? shownTurns.current.get(info.turn) : undefined
       const re =
-        shown !== undefined ? `re: turn ${shown}${info.part && info.part > 1 ? ` · part ${info.part}` : ""}` : info.unprompted ? "unprompted" : undefined
+        shown !== undefined ? `reply to turn ${shown}${info.part && info.part > 1 ? ` · part ${info.part}` : ""}` : info.unprompted ? "unprompted" : undefined
       currentReply.current = { group: info.reply, re, more: !!info.more }
+      replyLabels.current.set(info.reply, re)
     }
-  }, [replyStreams])
+  }, [replyStreams, showUnspoken])
 
   // Captions: one line per transcript segment, updated in place as interim text firms up.
   useEffect(() => {
@@ -635,12 +734,15 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         const first = !!reply && !labelledReplies.current.has(reply.group)
         if (reply) labelledReplies.current.add(reply.group)
         const about = reply ? { group: reply.group, ...(first && reply.re ? { re: reply.re } : {}) } : {}
-        next = [...next, { id: nid, from: mine ? "user" : "assistant", text, at: secondsIn(), ...about }]
+        const woke = mine && wakeNext.current
+        if (woke) wakeNext.current = false
+        next = [...next, { id: nid, from: mine ? "user" : "assistant", text, at: secondsIn(), ...about, ...(woke ? { wake: true } : {}) }]
         touched = nid
       } else {
         next = next.map((l) => (l.id === id ? { ...l, text } : l))
         touched = id
       }
+      if (mine) lastUserAt.current = Date.now()
     }
     if (heard) {
       const provisional = [...provisionalSegs.current.values()].join(" ")
@@ -666,6 +768,15 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         continue // not all of it yet
       }
       doneTurns.current.add(s.streamInfo.id)
+      if (isUnheard(status)) {
+        // One note per reply the caller spoke over, however many times they tried.
+        const reply = currentReply.current?.group ?? -1
+        if (!unheardReplies.current.has(reply)) {
+          unheardReplies.current.add(reply)
+          next = [...next, { id: nextId.current++, from: "assistant", text: "", at: secondsIn(), kind: "unheard" }]
+        }
+        continue
+      }
       if (isDroppedSpeech(status)) {
         next = applyDropped(next, coveredLines.current, status)
         continue
@@ -728,9 +839,13 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     shownTurns.current.clear()
     doneReplies.current.clear()
     labelledReplies.current.clear()
+    replyLabels.current.clear()
+    unheardReplies.current.clear()
+    wakeNext.current = false
+    wakeHeard.current = 0
+    lastUserAt.current = 0
     currentReply.current = null
     limit.current = null
-    setSilenceMs(null)
     startedAt.current = 0
     setStreaming(null)
     setElapsed(0)
@@ -752,7 +867,13 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     cueAudioRef.current?.play().catch(() => {})
     room.startAudio().catch(() => {})
     try {
-      const track = await createLocalAudioTrack({ echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 })
+      let track: LocalAudioTrack
+      try {
+        track = await createLocalAudioTrack({ echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 })
+      } catch (err) {
+        // Whatever the browser said, it was the microphone that failed: a mic error in the caller's words.
+        throw new CallError(micErrorText(err) ?? "The microphone could not be opened. Check it, then call again.", micErrorKind(err) ?? "mic")
+      }
       if (cancelled()) {
         track.stop()
         return
@@ -787,7 +908,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         callId: string
         agent?: string
         chat?: string
-        silenceMs?: number
         limit?: { ms: number; kind: string }
       }
       a.callId = session.callId
@@ -795,7 +915,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       if (cancelled()) return endOnServer(a, false)
       if (session.agent) setAgentName(session.agent)
       if (session.chat) setChat(session.chat)
-      if (typeof session.silenceMs === "number" && session.silenceMs > 0) setSilenceMs(session.silenceMs)
       if (session.limit && typeof session.limit.ms === "number") limit.current = session.limit
       // The host's clock (and the limit) starts once the worker sees the caller in, after this.
       joinedAt.current = Date.now()
@@ -804,7 +923,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         await room.connect(session.url, session.token, forceRelay() ? { autoSubscribe: true, rtcConfig: { iceTransportPolicy: "relay" } } : { autoSubscribe: true })
       } catch (err) {
         if (cancelled()) return
-        throw new CallError(`Could not connect to the call. ${err instanceof Error ? err.message : String(err)}`, "other")
+        throw new CallError("Could not connect to the call. Check the connection, then try again.", "other")
       }
       if (cancelled()) return
       // DTX off: the worker times the caller's turn by the silence it hears, so silence must keep arriving.
@@ -818,7 +937,9 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       }, AGENT_JOIN_MS)
     } catch (err) {
       if (cancelled()) return
-      fail(micErrorText(err) ?? (err instanceof Error ? err.message : String(err)), micErrorKind(err) ?? (err instanceof CallError ? err.kind : "other"))
+      // Only messages written for the caller are shown, never a library's own words.
+      if (err instanceof CallError) fail(err.message, err.kind)
+      else fail(micErrorText(err) ?? "The call could not start. Try again.", micErrorKind(err) ?? "other")
     }
   }, [token, room, commitLines, endOnServer, fail, setPhase, setStreaming, setJoined, updateReview])
 
@@ -928,6 +1049,18 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (done) awaitSeq.current = null
     if (snap.wake) workerWake.current = snap.wake
     const awaitingWake = !!snap.wake?.on && snap.wake.waiting
+    const heard = snap.wake?.heard
+    if (typeof heard === "number" && heard > wakeHeard.current) {
+      wakeHeard.current = heard
+      // The line being spoken as the phrase was heard carries the mark, else the next one.
+      const lines = linesRef.current
+      const last = lines.findLast((l) => l.from === "user")
+      if (last && !last.mark && !coveredLines.current.has(last.id) && Date.now() - lastUserAt.current < WAKE_LINE_MS) {
+        commitLines(lines.map((l) => (l.id === last.id ? { ...l, wake: true } : l)))
+        wakeNext.current = false
+      } else wakeNext.current = true
+    }
+    if (awaitingWake) wakeNext.current = false
     updateReview((r) => ({
       ...r,
       mode: snap.mode,
@@ -935,6 +1068,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       provisional,
       preparing: !!snap.preparing,
       awaitingWake,
+      wakeHeard: wakeHeard.current,
       ...(snap.wake ? { wakePhrase: snap.wake.phrase ?? null } : {}),
       ...(done ? { pending: null } : {}),
     }))
@@ -1096,7 +1230,12 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (!(silence > 0) || !(elapsed >= 0)) return null
     return { id: pending, from: Math.min(1, elapsed / silence), ms: Math.max(0, silence - elapsed) }
   }, [pending])
-  const sendCue = live && phase !== "talking" ? pendingCue : null
+  // A lone send word has nothing to send: its line shows no countdown, whatever the attribute says.
+  const loneCommand = useMemo(() => {
+    const last = lines.findLast((l) => l.from === "user")
+    return !!last && !last.mark && isCommandOnly(last.text)
+  }, [lines])
+  const sendCue = live && phase !== "talking" && !loneCommand ? pendingCue : null
 
   // A quiet note in the hint a minute before the host's limit ends the call.
   useEffect(() => {
@@ -1249,7 +1388,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       unlockAudio,
       reconnecting,
       muteError,
-      silenceMs,
       sendCue,
       limitNote,
       review: reviewControls,
@@ -1274,7 +1412,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       unlockAudio,
       reconnecting,
       muteError,
-      silenceMs,
       sendCue,
       limitNote,
       reviewControls,
