@@ -3015,10 +3015,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         commands.useWakeWord(loading.phrase);
         callLog.info('voice worker: wake word ready', { phrase: loading.phrase, threshold: loading.threshold });
       },
-      (err: unknown) =>
+      (err: unknown) => {
+        // A call that ended while the models loaded closed the spotter: nothing failed.
+        if (ending) return;
         callLog.warn('voice worker: no wake word model; "hey <agent>" in the transcript opens a turn', {
           err: err instanceof Error ? err.message : String(err),
-        }),
+        });
+      },
     );
   }
   const reviewVoice = callVoice.review;

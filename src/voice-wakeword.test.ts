@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import {
   DEFAULT_WAKE_MODEL,
@@ -140,6 +140,26 @@ describe('WakeWordSpotter', () => {
     expect(detections[0]).toBeGreaterThan(0.9);
     expect(spotter.summary).toMatchObject({ detections: 1, skipped: 0 });
     expect(spotter.summary.scored).toBeGreaterThan(10);
+  });
+
+  it('scores the window at every 80 ms boundary, whatever the frame size, also when audio comes in a burst', async () => {
+    const { spotter, detections } = make();
+    await spotter.ready;
+    spotter.listen(true);
+    // In 30 ms frames: the 2 s fill, then 0.64 s at once (8 windows wait their turn), then the rest.
+    const audio = concat(silence(1), positive());
+    const idle = () => vi.waitFor(() => expect((spotter as unknown as { inflight: boolean }).inflight).toBe(false));
+    const pushFrames = (from: number, to: number) => {
+      for (let at = from; at < to; at += 480) spotter.push(audio.subarray(at, Math.min(at + 480, to)));
+    };
+    pushFrames(0, 32_000);
+    await idle();
+    pushFrames(32_000, 42_240);
+    await idle();
+    pushFrames(42_240, audio.length);
+    await idle();
+    expect(spotter.summary).toMatchObject({ scored: 13, skipped: 0, detections: 1 });
+    expect(detections).toHaveLength(1);
   });
 
   it('debounces: a second wake word within 2 s of the first is not a detection', async () => {

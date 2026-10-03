@@ -25,6 +25,8 @@ export const WAKE_WINDOW_SAMPLES = 32_000;
 /** New audio between scores: 80 ms, the reference listener's frame. */
 export const WAKE_HOP_SAMPLES = 1_280;
 export const WAKE_DEBOUNCE_MS = 2_000;
+/** Windows that may wait for the thread; more means it is slower than real time. */
+const WAKE_MAX_QUEUED = 8;
 /** livekit-wakeword's documented optimal threshold for its conv-attention `hey_livekit` model. */
 export const DEFAULT_WAKE_THRESHOLD = 0.68;
 /** The reference listener's default, for a classifier with no documented threshold. */
@@ -225,7 +227,7 @@ export interface WakeWordOptions {
 /** What scoring cost so far, for the call's log. */
 export interface WakeWordStats {
   scored: number;
-  /** Hops skipped because the previous score was still running: slower than real time. */
+  /** Windows dropped because scoring fell behind by more than WAKE_MAX_QUEUED: slower than real time. */
   skipped: number;
   meanMs: number;
   maxMs: number;
@@ -235,9 +237,10 @@ export interface WakeWordStats {
 
 /**
  * Spots the wake word in a call's 16 kHz mono audio. `push` keeps the last 2 s; while `listen` is on,
- * every 80 ms of new audio scores that window in the worker thread, at most one at a time (a hop that
- * comes while one runs is skipped, never queued). A score at or over the threshold is a detection,
- * at most one per `debounceMs`; the audio before it is forgotten, so it cannot fire twice.
+ * the window ending at every 80 ms of new audio is scored in the worker thread, one at a time, in
+ * order (audio arrives in bursts, so a few wait; past WAKE_MAX_QUEUED the oldest is dropped). A score
+ * at or over the threshold is a detection, at most one per `debounceMs`; the audio before it is
+ * forgotten, so it cannot fire twice.
  */
 export class WakeWordSpotter {
   readonly phrase: string;
@@ -256,6 +259,8 @@ export class WakeWordSpotter {
   private loaded = false;
   private closed = false;
   private inflight = false;
+  /** Windows taken while one was being scored. */
+  private queued: Array<{ id: number; audio: Float32Array<ArrayBuffer>; end: number }> = [];
   private nextId = 0;
   /** Scores of windows taken before this id are stale (the audio was forgotten). */
   private validFrom = 0;
@@ -312,32 +317,44 @@ export class WakeWordSpotter {
     if (on === this.listening) return;
     this.listening = on;
     this.sinceScore = 0;
+    this.queued = [];
   }
 
   /** 16 kHz mono audio, in order. */
   push(pcm: Int16Array): void {
     if (this.closed) return;
     const size = this.ring.length;
+    const scoring = this.listening && this.loaded;
     for (let i = 0; i < pcm.length; i++) {
       this.ring[this.write] = pcm[i] / 32768;
       this.write = (this.write + 1) % size;
+      this.position++;
+      if (this.filled < size) this.filled++;
+      // Like the reference listener: a full window, then one every 80 ms, on the 80 ms boundary
+      // whatever the frame size, so consecutive windows share their embeddings.
+      if (!scoring || ++this.sinceScore < WAKE_HOP_SAMPLES) continue;
+      this.sinceScore = 0;
+      if (this.filled >= size) this.take();
     }
-    this.filled = Math.min(size, this.filled + pcm.length);
-    this.position += pcm.length;
-    if (!this.listening || !this.loaded) return;
-    this.sinceScore += pcm.length;
-    // Like the reference listener: a full window, then one score per 80 ms.
-    if (this.filled < size || this.sinceScore < WAKE_HOP_SAMPLES) return;
-    this.sinceScore %= WAKE_HOP_SAMPLES;
-    if (this.inflight) {
-      this.stats.skipped++;
-      return;
-    }
+  }
+
+  private take(): void {
+    const size = this.ring.length;
     const audio = new Float32Array(size);
     audio.set(this.ring.subarray(this.write));
     audio.set(this.ring.subarray(0, this.write), size - this.write);
+    const window = { id: this.nextId++, audio, end: this.position };
+    if (!this.inflight) return this.send(window);
+    this.queued.push(window);
+    if (this.queued.length > WAKE_MAX_QUEUED) {
+      this.queued.shift();
+      this.stats.skipped++;
+    }
+  }
+
+  private send(window: { id: number; audio: Float32Array<ArrayBuffer>; end: number }): void {
     this.inflight = true;
-    this.thread.postMessage({ id: this.nextId++, audio, end: this.position }, [audio.buffer]);
+    this.thread.postMessage(window, [window.audio.buffer]);
   }
 
   get summary(): WakeWordStats {
@@ -370,16 +387,25 @@ export class WakeWordSpotter {
     this.stats.totalMs += ms;
     this.stats.maxMs = Math.max(this.stats.maxMs, ms);
     this.stats.maxScore = Math.max(this.stats.maxScore, score);
-    if (id < this.validFrom || !this.listening || this.closed || score < this.threshold) return;
+    if (this.detects(id, score)) {
+      // The phrase is in the window just scored: forget it, as the reference listener clears its buffer.
+      this.filled = 0;
+      this.sinceScore = 0;
+      this.queued = [];
+      this.validFrom = this.nextId;
+      this.options.onDetect(score);
+    }
+    const next = this.queued.shift();
+    if (next && !this.closed) this.send(next);
+  }
+
+  private detects(id: number, score: number): boolean {
+    if (id < this.validFrom || !this.listening || this.closed || score < this.threshold) return false;
     const now = this.now();
-    if (now - this.lastDetection < this.debounceMs) return;
+    if (now - this.lastDetection < this.debounceMs) return false;
     this.lastDetection = now;
     this.stats.detections++;
-    // The phrase is in the window just scored: forget it, as the reference listener clears its buffer.
-    this.filled = 0;
-    this.sinceScore = 0;
-    this.validFrom = this.nextId;
-    this.options.onDetect(score);
+    return true;
   }
 
   private fail(err: string): void {
