@@ -54,7 +54,9 @@ deduplicated, and capped at 60 terms and 1 KB. `VOICE_VOCABULARY` is read at
 startup, the file on every call. The agent maintains the file itself: the
 resident `voice-formatting` instructions (step 3) tell it to add names a
 transcript misspelled, so read or edit `groups/<folder>/voice.vocabulary.txt` to check
-or correct its entries.
+or correct its entries. The file's entries also count as the agent's name in the wake
+phrase `hey <agent>` (see spoken commands below), so another script or spelling
+of the name belongs there too.
 
 The stable channel identifier and URL prefix are `voice`.
 
@@ -450,7 +452,8 @@ and do not need a frontend build. The UI has the same three-day release-age gate
 as the host and requires no dependency install scripts. Try the page without a
 microphone or an agent by adding `&demo=1` to any call link: it plays a scripted
 call and connects to nothing. `&demo=review` plays a review mode call through
-every review state, and `&step=<n>` stops either script at step n.
+every review state, `&demo=wake` the wake switch and spoken commands, and
+`&step=<n>` stops a script at step n.
 
 ## How a call runs
 
@@ -686,13 +689,20 @@ token reply carries `silenceMs` and `limit: {ms, kind: "duration" | "daily"}`:
 the listening hint names the pause that sends a turn, a thin line under the
 readout fills while `nanoclaw.voice.pending` counts down, caller lines show
 "turn n" and the first caption of a reply "re: turn n" (or "unprompted"), and a
-minute before the limit the hint says the call is about to end. Three short Web
-Audio cues let a caller follow the call without looking: a rising two-note
-(listening) once the worker's session hears the published microphone, a single
-high tick (sent) on a turn's "sending", and a falling two-note (your turn) once
-the agent is done and nothing else is queued. None plays while the agent speaks;
-the later "sent" is the caption mark alone. `?cues=0` turns them off, and
-`?demo=1` plays them too once its Call button is tapped. Microphone capture runs
+minute before the limit the hint says the call is about to end. Short sound
+cues let a caller follow the call without looking. The worker plays them, on a
+second audio track (`background_audio`, agents-js's `BackgroundAudioPlayer`, tones
+synthesized in code) apart from the agent's speech track, so the same cues work
+on any surface and the caller's next words are never taken for the agent
+speaking: a rising two-note (listening) once the call is ready, a quicker higher
+two-note (wake) on the wake phrase, a single high tick (sent) as a turn goes
+out, a falling low two-note (discard) on a spoken discard, a falling two-note
+(your turn) once the agent is done and nothing else is queued, a low blip
+(nope) for a command with nothing to act on, and two soft notes when a review
+draft is ready. Silence while the agent works; none plays while it speaks.
+Call problems are the worker's short spoken lines, as before. `?cues=0` turns
+the cues off (the page passes it to the worker in its settings RPC; the
+listening cue waits up to 2 s for it). Microphone capture runs
 with echo cancellation, noise suppression and auto gain; DTX is off because the
 worker times turns by the silence it hears. On iOS Safari the call must be
 started with the Call button (audio unlocks on that tap) and joins relay-only
@@ -704,8 +714,8 @@ another protocol version makes it say the service is updating.
 
 **Review mode.** A segmented `auto | review` switch sits above the keys, before
 and during the call; the pick stays for the next call on the same page. In
-review nothing goes out on a pause: the caller taps talk (the microphone opens,
-then the listening cue plays), speaks with any pauses, taps done, reads the
+review nothing goes out on a pause: the caller taps talk (the worker opens its
+input and plays the listening cue, then the microphone opens), speaks with any pauses, taps done, reads the
 draft in a dashed panel pinned above the keys (`draft - not sent`) and taps send
 or discard; after either the microphone stays off until the next talk. The page
 publishes its microphone muted in review and offers the mode only when the
@@ -740,7 +750,30 @@ and makes the unsent words a draft; if the commit already went, the page says
 "previous turn already submitted". Back to auto needs no open draft and leaves
 the microphone muted. A quiet two-note cue says a draft is ready to read; a call
 that ends with a draft keeps it readable until discarded, never sent into the
-next call. Auto mode is unchanged.
+next call.
+
+**Spoken commands in auto.** On the final transcript (never interim text), the
+word `over` at the end of an utterance sends the turn at once without the word,
+and `discard turn`, `discard this turn` or `scratch that` there drops everything
+since the last send; nothing is posted and the page marks those caption lines
+"discarded". Only the end counts: `start over` mid-sentence is words, while a
+sentence that really ends in `over` sends. A final that ends in a command while
+the caller still speaks waits for the pause; new words first make it words. A
+command with nothing to act on plays the nope cue. A wake switch under the
+`auto | review` row (`hey <agent>`, off by default, kept for the next call like the mode
+pick) holds everything until the caller says `hey <agent>`: the chip says
+`say "hey <agent>"`, speech before it is dropped (its lines show "ignored · no
+wake phrase", and a stretch with no words says nothing), and after it only `over`
+sends, unless the second switch (`pause sends`) lets the closing silence send
+too; after a send or a discard it waits again. `<agent>` is the agent's name or
+any entry in its `voice.vocabulary.txt`, matched across case, punctuation and
+Latin/Cyrillic spelling (`Hey, Andy.`, `гей Енді`, `хей Енді`). The worker
+advertises the commands with the attribute `nanoclaw.voice.commands` = "1" and
+takes the switches in the `nanoclaw.voice.settings` RPC (`{"wake", "pauseSends",
+"cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting"}`,
+and dropped words go out on the turn topic as `{"dropped": "discarded" |
+"unaddressed", "text"}`. The agent's own speech is never transcribed, so it
+cannot trigger a command. `&demo=wake` plays the wake switch.
 
 ## Channel Info
 

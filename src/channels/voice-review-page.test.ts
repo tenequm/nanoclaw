@@ -36,6 +36,11 @@ interface ReviewLib {
   refusalNote(error: string | undefined, agent: string): string | null;
   isReviewSnapshot(v: unknown): boolean;
   keyIdentity(action: string | null, draftId?: number): string;
+  autoListening(input: { agentName: string; silenceMs: number | null; review: ReviewState }): {
+    chip: string;
+    hint: string;
+    empty: string;
+  };
 }
 
 describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
@@ -254,5 +259,33 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(lib.isReviewSnapshot({ seq: 2, mode: 'auto', draft: { id: 1, state: 'ready', text: 'x' } })).toBe(true);
     expect(lib.isReviewSnapshot({ seq: 1, mode: 'walkie', draft: null })).toBe(false);
     expect(lib.isReviewSnapshot({ mode: 'review', draft: null })).toBe(false);
+  });
+
+  it("auto's readout: over or a pause sends, and with the wake switch the phrase that opens a turn", () => {
+    const listen = (fields: Partial<ReviewState>, silenceMs: number | null = 2500) =>
+      lib.autoListening({ agentName: 'Andy', silenceMs, review: { ...lib.INITIAL_REVIEW, ...fields } });
+    expect(listen({})).toEqual({
+      chip: 'Listening',
+      hint: 'Go ahead. Pause about 2.5 s or say "over" to send.',
+      empty: 'Speak when ready.',
+    });
+    // A worker without spoken commands keeps the old copy.
+    expect(listen({ commands: false }).hint).toBe('Go ahead. Pause about 2.5 s to send.');
+    expect(listen({ wake: true, awaitingWake: true })).toEqual({
+      chip: 'Say "hey Andy"',
+      hint: 'Nothing is sent until you say "hey Andy".',
+      empty: 'Say "hey Andy" to start.',
+    });
+    expect(listen({ wake: true, awaitingWake: false })).toMatchObject({
+      chip: 'Listening',
+      hint: 'Say "over" to send - pauses don\'t.',
+    });
+    expect(listen({ wake: true, pauseSends: true }).hint).toBe('Say "over" or pause about 2.5 s to send.');
+    expect(listen({ wake: true, pauseSends: true }, null).hint).toBe('Say "over" or pause to send.');
+    // The switch's picks start off; the worker's wake state rides on its review state.
+    expect(lib.INITIAL_REVIEW).toMatchObject({ wake: false, pauseSends: false, awaitingWake: false, commands: true });
+    expect(
+      lib.isReviewSnapshot({ seq: 3, mode: 'auto', draft: null, wake: { on: true, pauseSends: false, waiting: true } }),
+    ).toBe(true);
   });
 });

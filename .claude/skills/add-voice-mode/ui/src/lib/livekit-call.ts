@@ -8,20 +8,18 @@ import {
   type LocalAudioTrack,
   type RemoteParticipant,
   type RemoteTrack,
+  type RemoteTrackPublication,
 } from "livekit-client"
 import { useAudioPlayback, useParticipantAttributes, useRemoteParticipants, useTextStream, useTranscriptions } from "@livekit/components-react"
 import {
   CallError,
   LIVE_PHASES,
   PAGE_CLOSED,
-  TURN_CUE_DELAY_MS,
   errorText,
   levelsFromStats,
   micErrorKind,
   micErrorText,
-  playCue,
   statusErrorKind,
-  type Cue,
   type ErrorKind,
   type Line,
   type Phase,
@@ -62,14 +60,19 @@ const REPLY_TOPIC = "nanoclaw.voice.reply"
 const REVIEW_ATTR = "nanoclaw.voice.review"
 /** JSON CallReviewState from the worker whenever its review state changes. */
 const REVIEW_TOPIC = "nanoclaw.voice.review"
-/** The worker's review RPCs (REVIEW_RPC in the protocol). */
-const REVIEW_RPC: Record<ReviewOp, string> = {
+/** The worker's review RPCs (REVIEW_RPC in the protocol), and its settings one. */
+const REVIEW_RPC: Record<ReviewOp | "settings", string> = {
   mode: "nanoclaw.voice.mode",
   talk: "nanoclaw.voice.talk",
   done: "nanoclaw.voice.done",
   send: "nanoclaw.voice.send",
   discard: "nanoclaw.voice.discard",
+  settings: "nanoclaw.voice.settings",
 }
+/** "1" when the worker understands spoken commands (`over`, discard, the wake phrase) and the settings RPC. */
+const COMMANDS_ATTR = "nanoclaw.voice.commands"
+/** The worker's sound cues come on their own track (CALL_CUE_TRACK), never the speech track. */
+const CUE_TRACK = "background_audio"
 const REVIEW_RPC_TIMEOUT_MS = 10_000
 /** A worker in review mode sets its attribute right after its session starts; this long, then the page runs auto. */
 const AGENT_ATTR_GRACE_MS = 3000
@@ -130,6 +133,13 @@ function endReasonText(metadata: string | undefined): string | null {
 
 /** What became of a caller turn, with its final text when there is one. */
 type SettledTurn = { turn: number; status: "sent" | "lost"; reason?: TurnMark["reason"]; text?: string }
+/** Caller words the worker will never send (CallDroppedSpeech): a spoken discard, or speech before the wake phrase. */
+type DroppedSpeech = { dropped: "discarded" | "unaddressed"; text: string }
+
+function isDroppedSpeech(v: unknown): v is DroppedSpeech {
+  const d = v as DroppedSpeech | null
+  return !!d && (d.dropped === "discarded" || d.dropped === "unaddressed") && typeof d.text === "string"
+}
 /** The worker says "sending" the moment a turn closes, before its outcome; a sent review draft's carries its text. */
 type TurnStatus = SettledTurn | { turn: number; status: "sending"; text?: string; draft?: number }
 
@@ -180,6 +190,10 @@ function agentPhase(attrs: Readonly<Record<string, string>>): Phase | null {
 const spaceSentences = (s: string) => s.replace(/([\p{Ll}\p{N}][.!?…]+)(?=\p{Lu})/gu, "$1 ")
 
 const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
+/** A caption line as a sent turn's text holds it: a spoken command that ended the turn is not sent. */
+const lineKey = (s: string) => norm(s).replace(/(over|discardthisturn|discardturn|scratchthat)$/u, "")
+/** Whether a caption line belongs to the text the worker reports (a line of only a command does). */
+const within = (said: string, line: Line) => norm(line.text) !== "" && said.includes(lineKey(line.text))
 
 /**
  * Put a turn's mark on the caller line it belongs to: the latest unmarked one its final text
@@ -194,7 +208,7 @@ function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, new
   const open = lines.filter((l) => l.from === "user" && !covered.has(l.id))
   const said = norm(status.text ?? "")
   const target =
-    (said ? [...open].reverse().find((l) => norm(l.text) !== "" && said.includes(norm(l.text))) : undefined) ?? open[open.length - 1]
+    (said ? [...open].reverse().find((l) => within(said, l)) : undefined) ?? open[open.length - 1]
   if (!target) {
     const line = { ...newLine(), text: status.text?.trim() ?? "", mark, turn }
     covered.add(line.id)
@@ -205,6 +219,26 @@ function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, new
     if (l.id === target.id) break
   }
   return lines.map((l) => (l.id === target.id ? { ...l, mark, turn } : l))
+}
+
+/**
+ * Mark the caller lines of words the worker dropped. A discard drops the whole open turn: every open
+ * line. Speech before the wake phrase is one transcript: the latest open line it contains and the
+ * open ones before it, else the oldest open line; the newest may already be the caller's next words.
+ */
+function applyDropped(lines: Line[], covered: Set<number>, d: DroppedSpeech): Line[] {
+  const open = lines.filter((l) => l.from === "user" && !covered.has(l.id))
+  const said = norm(d.text)
+  const target = d.dropped === "discarded" ? open[open.length - 1] : ([...open].reverse().find((l) => within(said, l)) ?? open[0])
+  if (!target) return lines
+  const marked = new Set<number>()
+  for (const l of open) {
+    covered.add(l.id)
+    marked.add(l.id)
+    if (l.id === target.id) break
+  }
+  const mark: TurnMark = { status: "dropped", reason: d.dropped }
+  return lines.map((l) => (marked.has(l.id) ? { ...l, mark } : l))
 }
 
 export function useLiveKitCall(token: string, fallbackAgent = "your agent"): VoiceCall {
@@ -246,6 +280,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const mic = useRef<LocalAudioTrack | null>(null)
   const localSid = useRef<string | null>(null)
   const remote = useRef<RemoteTrack | null>(null)
+  const cueTrack = useRef<RemoteTrack | null>(null)
   const unlockCtx = useRef<AudioContext | null>(null)
   const agentTimer = useRef<number | null>(null)
   const mutedRef = useRef(false)
@@ -255,6 +290,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const inputLevel = useRef(0)
   const outputLevel = useRef(0)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const cueAudioRef = useRef<HTMLAudioElement | null>(null)
   const startedAt = useRef(0)
   const generation = useRef(0)
   const linesRef = useRef<Line[]>([])
@@ -300,11 +336,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const agentId = useRef<string | null>(null)
   agentId.current = agent?.identity ?? null
   const reviewAvailable = agentAttributes?.[REVIEW_ATTR] === "1"
-
-  // Never over the agent's own speech.
-  const cue = useCallback((kind: Cue) => {
-    if (phaseRef.current !== "talking") playCue(unlockCtx.current, kind)
-  }, [])
+  const commandsAvailable = agentAttributes?.[COMMANDS_ATTR] === "1"
+  /** This call already gave the worker the page's settings. */
+  const settingsSent = useRef(false)
+  /** The wake switch as the worker last said it runs it. */
+  const workerWake = useRef<ReviewSnapshot["wake"]>(undefined)
 
   const setPhase = useCallback((p: Phase) => {
     phaseRef.current = p
@@ -374,6 +410,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       localSid.current = null
       remote.current?.detach()
       remote.current = null
+      cueTrack.current?.detach()
+      cueTrack.current = null
       unlockCtx.current?.close().catch(() => {})
       unlockCtx.current = null
       if (audioRef.current) audioRef.current.srcObject = null
@@ -392,7 +430,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         const open = d && (d.state === "recording" || d.state === "finishing")
         const kept: Draft | null =
           d && (d.state === "ready" || d.state === "failed") ? d : open && r.provisional.trim() ? { ...d, state: "failed", text: r.provisional.trim() } : null
-        return { ...INITIAL_REVIEW, mode: r.mode, available: r.available, draft: kept, ended: !!kept }
+        return { ...INITIAL_REVIEW, mode: r.mode, available: r.available, wake: r.wake, pauseSends: r.pauseSends, draft: kept, ended: !!kept }
       })
       setMicStream(null)
       setRemoteStream(null)
@@ -425,7 +463,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
 
   const rpc = useCallback(
     /** The worker's reply; null when it did not answer, undefined when the call it was for is over. */
-    async (op: ReviewOp, fields: { draft?: number; mode?: TurnMode; afterTurn?: number } = {}): Promise<ReviewReply | null | undefined> => {
+    async (
+      op: ReviewOp | "settings",
+      fields: { draft?: number; mode?: TurnMode; afterTurn?: number; wake?: boolean; pauseSends?: boolean; cues?: boolean } = {}
+    ): Promise<ReviewReply | null | undefined> => {
       const id = agentId.current
       if (!id) return null
       const call = generation.current
@@ -453,13 +494,24 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
 
   // Room events for the hook's lifetime; each handler acts only on a call in progress.
   useEffect(() => {
-    const onTrack = (track: RemoteTrack) => {
+    const onTrack = (track: RemoteTrack, publication: RemoteTrackPublication) => {
       if (!active.current || track.kind !== Track.Kind.Audio) return
+      // The cues play beside the speech; the speech track alone drives the agent's level.
+      if (publication.trackName === CUE_TRACK) {
+        cueTrack.current = track
+        if (cueAudioRef.current) track.attach(cueAudioRef.current)
+        return
+      }
       remote.current = track
       if (audioRef.current) track.attach(audioRef.current)
       setRemoteStream(new MediaStream([track.mediaStreamTrack]))
     }
     const onUntrack = (track: RemoteTrack) => {
+      if (cueTrack.current === track) {
+        track.detach()
+        cueTrack.current = null
+        return
+      }
       if (remote.current !== track) return
       track.detach()
       remote.current = null
@@ -523,9 +575,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       startedAt.current = Date.now()
     }
     if (next !== p) setPhase(next)
-    // The worker's session is up and hears the published microphone: the caller can start.
-    if (p === "connecting" && next === "listening") cue("listening")
-  }, [joined, agent, agentAttributes, fail, setPhase, cue])
+  }, [joined, agent, agentAttributes, fail, setPhase])
 
   // What the next spoken line answers. Runs before the captions below, which take it for new agent lines.
   useEffect(() => {
@@ -602,11 +652,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     setStreaming(touched)
   }, [transcriptions, room, commitLines, setStreaming, updateReview])
 
-  // Per-turn delivery marks from the worker.
+  // Per-turn delivery marks from the worker, and words it dropped.
   useEffect(() => {
     if (!active.current) return
     let next = linesRef.current
-    let closed = false
     let delivery: ReviewState["delivery"] = null
     for (const s of turnStreams) {
       if (doneTurns.current.has(s.streamInfo.id)) continue
@@ -617,14 +666,17 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         continue // not all of it yet
       }
       doneTurns.current.add(s.streamInfo.id)
+      if (isDroppedSpeech(status)) {
+        next = applyDropped(next, coveredLines.current, status)
+        continue
+      }
       if (!isTurnStatus(status)) continue
       maxTurn.current = Math.max(maxTurn.current, status.turn)
       let shown = shownTurns.current.get(status.turn)
       if (shown === undefined) shownTurns.current.set(status.turn, (shown = shownTurns.current.size + 1))
       const fromDraft = status.status === "sending" ? typeof status.draft === "number" : reviewTurns.current.has(status.turn)
-      // The sent cue sounds as the turn closes; the agent's "sent" later is the mark alone.
+      // An auto turn shows no mark while it goes out; a sent draft enters the history here.
       if (status.status === "sending") {
-        closed = true
         if (fromDraft && status.text) {
           // A sent draft enters the history once, with exactly the text the caller approved.
           reviewTurns.current.add(status.turn)
@@ -644,8 +696,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       const d = delivery
       updateReview((r) => ({ ...r, delivery: d }))
     }
-    if (closed) cue("sent")
-  }, [turnStreams, commitLines, cue, updateReview])
+  }, [turnStreams, commitLines, updateReview])
 
   const start = useCallback(async () => {
     if (!token) return
@@ -653,9 +704,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (p === "connecting" || LIVE_PHASES.has(p)) return
     // A draft from the last call is discarded first, never carried into this one.
     if (reviewRef.current.ended && reviewRef.current.draft) return
-    updateReview((r) => ({ ...INITIAL_REVIEW, mode: r.mode }))
+    updateReview((r) => ({ ...INITIAL_REVIEW, mode: r.mode, wake: r.wake, pauseSends: r.pauseSends }))
     reviewSeq.current = 0
     reviewAsked.current = false
+    settingsSent.current = false
+    workerWake.current = undefined
     awaitSeq.current = null
     maxTurn.current = 0
     doneReviewStreams.current.clear()
@@ -696,6 +749,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       /* no Web Audio; the element below still unlocks */
     }
     audioRef.current?.play().catch(() => {})
+    cueAudioRef.current?.play().catch(() => {})
     room.startAudio().catch(() => {})
     try {
       const track = await createLocalAudioTrack({ echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 })
@@ -872,11 +926,12 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     }
     const done = awaitSeq.current !== null && snap.seq >= awaitSeq.current
     if (done) awaitSeq.current = null
-    updateReview((r) => ({ ...r, mode: snap.mode, draft: d, provisional, preparing: !!snap.preparing, ...(done ? { pending: null } : {}) }))
+    if (snap.wake) workerWake.current = snap.wake
+    const awaitingWake = !!snap.wake?.on && snap.wake.waiting
+    updateReview((r) => ({ ...r, mode: snap.mode, draft: d, provisional, preparing: !!snap.preparing, awaitingWake, ...(done ? { pending: null } : {}) }))
     // The worker stopped the recording (a reply took the channel): the microphone follows it.
     if (snap.mode === "review" && (!d || d.state !== "recording") && mic.current && !mic.current.isMuted && prev.pending?.op !== "talk") void setMic(false)
-    if (d?.state === "ready" && !d.tooLong && d.text && !(prev.draft?.id === d.id && prev.draft.state === "ready")) cue("draft")
-  }, [reviewStreams, commitLines, updateReview, setMic, cue])
+  }, [reviewStreams, commitLines, updateReview, setMic])
 
   const setTurnMode = useCallback(
     async (to: TurnMode) => {
@@ -915,12 +970,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       // A reply may have stopped the recording meanwhile: the microphone follows the worker.
       const d = reviewRef.current.draft
       if (d && (d.id !== reply.draft || d.state !== "recording")) await setMic(false)
-      else cue("listening")
       return settleOp(reply)
     }
     updateReview((x) => ({ ...x, micError: "start" }))
     settleOp(await rpc("discard", { draft: reply.draft }))
-  }, [updateReview, rpc, setMic, settleOp, cue])
+  }, [updateReview, rpc, setMic, settleOp])
 
   const done = useCallback(async () => {
     const r = reviewRef.current
@@ -982,6 +1036,41 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (reviewLive) updateReview((x) => (x.available === reviewAvailable ? x : { ...x, available: reviewAvailable }))
   }, [reviewLive, reviewAvailable, updateReview])
 
+  /**
+   * The page's settings to the worker: the wake switch, and `?cues=0` (the worker plays the cues).
+   * Tried twice; if the worker never takes them, the switches go back to what it runs.
+   */
+  const sendSettings = useCallback(async () => {
+    const ask = () => {
+      const r = reviewRef.current
+      return rpc("settings", { wake: r.wake, pauseSends: r.pauseSends, cues: new URLSearchParams(location.search).get("cues") !== "0" })
+    }
+    let reply = await ask()
+    if (reply === null) reply = await ask()
+    if (reply === undefined || reply.ok) return
+    const ran = workerWake.current
+    updateReview((x) => ({ ...x, wake: ran?.on ?? false, pauseSends: ran?.pauseSends ?? false, note: "Settings didn't reach the call - try again." }))
+  }, [rpc, updateReview])
+
+  // Once per call, as soon as the worker says it takes them. The worker holds its first cue until then.
+  useEffect(() => {
+    if (reviewLive) updateReview((x) => (x.commands === commandsAvailable ? x : { ...x, commands: commandsAvailable }))
+    if (!reviewLive || !commandsAvailable || settingsSent.current) return
+    settingsSent.current = true
+    void sendSettings()
+  }, [reviewLive, commandsAvailable, updateReview, sendSettings])
+
+  const setWakeOption = useCallback(
+    (fields: { wake?: boolean; pauseSends?: boolean }) => {
+      const r = reviewRef.current
+      // Mid-call the worker has to take it; before a call it is the pick for the next one.
+      if (LIVE_PHASES.has(phaseRef.current) && (!r.commands || r.pending)) return
+      updateReview((x) => ({ ...x, ...fields, note: null }))
+      if (LIVE_PHASES.has(phaseRef.current) && settingsSent.current) void sendSettings()
+    },
+    [updateReview, sendSettings]
+  )
+
   useEffect(() => {
     if (!review.note) return
     const t = window.setTimeout(() => updateReview((x) => ({ ...x, note: null })), REVIEW_NOTE_MS)
@@ -999,8 +1088,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     return { id: pending, from: Math.min(1, elapsed / silence), ms: Math.max(0, silence - elapsed) }
   }, [pending])
   const sendCue = live && phase !== "talking" ? pendingCue : null
-  const sendCueRef = useRef(sendCue)
-  sendCueRef.current = sendCue
 
   // A quiet note in the hint a minute before the host's limit ends the call.
   useEffect(() => {
@@ -1019,22 +1106,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     const t = window.setTimeout(show, wait)
     return () => window.clearTimeout(t)
   }, [live])
-
-  // A reply finished and nothing else is queued: the caller's turn, with its cue.
-  const lastPhase = useRef<Phase>(phase)
-  useEffect(() => {
-    const was = lastPhase.current
-    lastPhase.current = phase
-    if (was !== "talking" || phase !== "listening" || currentReply.current?.more) return
-    const group = currentReply.current?.group
-    const t = window.setTimeout(() => {
-      // A next line announced (before the phase change or since) and not spoken yet: still the agent's turn.
-      const next = currentReply.current
-      const unspoken = !!next && !labelledReplies.current.has(next.group)
-      if (phaseRef.current === "listening" && !sendCueRef.current && next?.group === group && !unspoken) cue("turn")
-    }, TURN_CUE_DELAY_MS)
-    return () => window.clearTimeout(t)
-  }, [phase, cue])
 
   // Call timer.
   useEffect(() => {
@@ -1138,8 +1209,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       done: () => void done(),
       send: () => void send(),
       discard: () => void discard(),
+      setWake: (on: boolean) => setWakeOption({ wake: on }),
+      setPauseSends: (on: boolean) => setWakeOption({ pauseSends: on }),
     }),
-    [reviewState, setTurnMode, talk, done, send, discard]
+    [reviewState, setTurnMode, talk, done, send, discard, setWakeOption]
   )
 
   return useMemo(
@@ -1161,6 +1234,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       inputLevel,
       outputLevel,
       audioRef,
+      cueAudioRef,
       chat,
       audioBlocked,
       unlockAudio,

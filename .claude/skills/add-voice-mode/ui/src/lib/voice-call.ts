@@ -33,9 +33,12 @@ export interface SendCue {
 }
 
 export interface TurnMark {
-  /** `sending`: a sent review draft the agent has not confirmed yet (auto turns show no mark until then). */
-  status: "sending" | "sent" | "lost"
-  reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty"
+  /**
+   * `sending`: a sent review draft the agent has not confirmed yet (auto turns show no mark until then).
+   * `dropped`: words the worker will never send, a spoken discard or speech before the wake phrase.
+   */
+  status: "sending" | "sent" | "lost" | "dropped"
+  reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty" | "discarded" | "unaddressed"
 }
 
 /** What kind of problem ended a call, so the page can say what to do about it. */
@@ -74,6 +77,8 @@ export interface VoiceCall {
   inputLevel: React.RefObject<number>
   outputLevel: React.RefObject<number>
   audioRef: React.RefObject<HTMLAudioElement | null>
+  /** Where the worker's sound cues play: their own track, apart from the agent's speech. */
+  cueAudioRef?: React.RefObject<HTMLAudioElement | null>
   /** The chat the call talks in, as the host names it. */
   chat?: string | null
   /** The browser holds the agent's audio until the caller allows it. */
@@ -101,56 +106,14 @@ export interface ReviewControls {
   done: () => void
   send: () => void
   discard: () => void
+  /** Auto mode's wake switch, and whether a pause sends after the wake phrase. */
+  setWake: (on: boolean) => void
+  setPauseSends: (on: boolean) => void
 }
 
 export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking", "talking"])
 
 export const PAGE_CLOSED = "The call ended when the page was closed."
-
-/**
- * The call's sound cues, for a caller who is not looking at the screen: `listening` once the
- * worker hears the caller (in review: once talk opened the microphone), `sent` the moment a turn
- * closes, `turn` when the agent is done and the microphone is open again, `draft` when a review
- * draft is ready to read.
- */
-export type Cue = "listening" | "sent" | "turn" | "draft"
-
-/** Each cue's notes as [Hz, start s, length s], and their peak gain. */
-const CUES: Record<Cue, { notes: ReadonlyArray<readonly [hz: number, at: number, len: number]>; peak: number }> = {
-  // A rising fifth: the line is open.
-  listening: { notes: [[784, 0, 0.09], [1175, 0.1, 0.11]], peak: 0.22 },
-  // One short high tick: the turn is on its way.
-  sent: { notes: [[1760, 0, 0.06]], peak: 0.3 },
-  // A falling third, like a doorbell: over to the caller.
-  turn: { notes: [[1319, 0, 0.09], [1047, 0.11, 0.12]], peak: 0.22 },
-  // Two soft low notes, quieter than the rest: words to read, nothing sent.
-  draft: { notes: [[523, 0, 0.08], [659, 0.1, 0.1]], peak: 0.14 },
-}
-
-/** After a reply, the "your turn" cue waits this long for the next queued line to show up. */
-export const TURN_CUE_DELAY_MS = 600
-
-/**
- * Plays a cue on the gesture-unlocked context; nothing without one that runs, or when the link
- * says `?cues=0`. Short pure sine notes, mid-to-high so a phone speaker carries them.
- */
-export function playCue(ctx: AudioContext | null, cue: Cue) {
-  if (!ctx || ctx.state !== "running" || new URLSearchParams(location.search).get("cues") === "0") return
-  const { notes, peak } = CUES[cue]
-  for (const [hz, at, len] of notes) {
-    const t = ctx.currentTime + at
-    const osc = ctx.createOscillator()
-    const gain = ctx.createGain()
-    osc.type = "sine"
-    osc.frequency.value = hz
-    gain.gain.setValueAtTime(0.0001, t)
-    gain.gain.linearRampToValueAtTime(peak, t + 0.005)
-    gain.gain.exponentialRampToValueAtTime(0.0001, t + len)
-    osc.connect(gain).connect(ctx.destination)
-    osc.start(t)
-    osc.stop(t + len + 0.01)
-  }
-}
 
 export function statusErrorKind(status: number): ErrorKind {
   if (status === 403) return "link"

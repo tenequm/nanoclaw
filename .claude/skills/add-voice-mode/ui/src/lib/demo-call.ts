@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { LIVE_PHASES, TURN_CUE_DELAY_MS, playCue, type Line, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "./voice-call"
+import { LIVE_PHASES, type Line, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "./voice-call"
 import { INITIAL_REVIEW, type ReviewState, type TurnMode } from "./review"
 
 /**
- * A scripted call with the same shape as the real one, for `?demo=1` (auto mode) and
- * `?demo=review` (review mode): the page can be tried without a microphone or a wired agent, and
- * every state can be looked at; `&step=<n>` stops the script at step n. Nothing here touches the
- * host; the words and the levels are made up. The sound cues play where a real call plays them
- * (`?cues=0` silences them); a browser that blocks autoplay keeps the self-started first run
- * silent until the Call button is tapped.
+ * A scripted call with the same shape as the real one, for `?demo=1` (auto mode), `?demo=wake`
+ * (auto mode with the wake switch and spoken commands) and `?demo=review` (review mode): the page
+ * can be tried without a microphone or a wired agent, and every state can be looked at;
+ * `&step=<n>` stops the script at step n. Nothing here touches the host; the words and the levels
+ * are made up. The worker plays the sound cues, so the demo is silent.
  */
+export type DemoScript = TurnMode | "wake"
 
 type Step = {
   phase: Phase
@@ -34,11 +34,14 @@ type Step = {
   mark?: TurnMark
   muted?: boolean
   reconnecting?: boolean
+  /** Auto with the wake switch on: whether the worker waits for the wake phrase in this step. */
+  awaitingWake?: boolean
+  /** The worker dropped the newest caller line: a spoken discard, or words before the wake phrase. */
+  drop?: "discarded" | "unaddressed"
 }
 
 const AGENT = "Casa"
-// Walks through every cue: the listening, sent and your-turn sounds, the send countdown, sent
-// marks, what each reply answers, the limit note and an end reason.
+// Walks through the send countdown, sent marks, what each reply answers, the limit note and an end reason.
 const SCRIPT: Step[] = [
   { phase: "connecting", ms: 1300 },
   { phase: "listening", ms: 3600, from: "user", text: "Hey Casa, what did we decide about the launch date?", pause: true },
@@ -62,6 +65,23 @@ const SCRIPT: Step[] = [
   },
   { phase: "listening", ms: 2200 },
   { phase: "ended", ms: 0, end: "Today's call minutes are used up." },
+]
+
+// The wake switch: words before "hey Casa" go nowhere, "over" sends, "scratch that" drops the turn.
+const WAKE_SCRIPT: Step[] = [
+  { phase: "connecting", ms: 1300 },
+  { phase: "listening", ms: 2400, awaitingWake: true },
+  { phase: "listening", ms: 2600, awaitingWake: true, from: "user", text: "So that's settled for the weekend then." },
+  { phase: "listening", ms: 1400, awaitingWake: true, drop: "unaddressed" },
+  { phase: "listening", ms: 3400, awaitingWake: false, from: "user", text: "Hey Casa, book a table for two at eight." },
+  { phase: "listening", ms: 2400, awaitingWake: false, from: "user", text: "Somewhere near the office. Over." },
+  { phase: "thinking", ms: 1900, awaitingWake: true, sent: true },
+  { phase: "talking", ms: 3600, from: "assistant", text: "Booked Tavola for eight. Want it on your calendar too?", re: "re: turn 1", awaitingWake: true },
+  { phase: "listening", ms: 2000, awaitingWake: true },
+  { phase: "listening", ms: 3000, awaitingWake: false, from: "user", text: "Hey Casa, cancel the dentist on Friday." },
+  { phase: "listening", ms: 1600, awaitingWake: false, from: "user", text: "No wait, scratch that." },
+  { phase: "listening", ms: 2600, awaitingWake: true, drop: "discarded" },
+  { phase: "ended", ms: 0, end: "Call ended." },
 ]
 
 const DRAFT_1 = "Book a table for two at eight, somewhere near the office."
@@ -113,7 +133,9 @@ const DEMO_SILENCE_MS = 2500
 /** How long after a turn closes the agent's session confirms it. */
 const DEMO_STORED_MS = 500
 
-export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", stopAt: number | null = null): VoiceCall {
+const scriptFor = (which: DemoScript): Step[] => (which === "review" ? REVIEW_SCRIPT : which === "wake" ? WAKE_SCRIPT : SCRIPT)
+
+export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stopAt: number | null = null): VoiceCall {
   const [phase, setPhase] = useState<Phase>("idle")
   const [lines, setLines] = useState<Line[]>([])
   const [streamingId, setStreamingId] = useState<number | null>(null)
@@ -122,7 +144,7 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
   const [endedText, setEndedText] = useState<string | null>(null)
   const [sendCue, setSendCue] = useState<SendCue | null>(null)
   const [limitNote, setLimitNote] = useState<string | null>(null)
-  const [review, setReview] = useState<ReviewState>({ ...INITIAL_REVIEW, mode: initialMode })
+  const [review, setReview] = useState<ReviewState>({ ...INITIAL_REVIEW, mode: initial === "review" ? "review" : "auto", wake: initial === "wake" })
   const [reconnecting, setReconnecting] = useState(false)
   const turns = useRef(0)
 
@@ -135,8 +157,7 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
   const inputLevel = useRef(0)
   const outputLevel = useRef(0)
   const audioRef = useRef<HTMLAudioElement | null>(null)
-  const cueCtx = useRef<AudioContext | null>(null)
-  const script = useRef<Step[]>(initialMode === "review" ? REVIEW_SCRIPT : SCRIPT)
+  const script = useRef<Step[]>(scriptFor(initial))
   phaseRef.current = phase
   mutedRef.current = muted
 
@@ -158,6 +179,13 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
     setLines((prev) => {
       const last = prev.findLast((l) => l.from === "user")
       return last ? prev.map((l) => (l === last ? { ...l, mark, ...(turn !== undefined ? { turn } : {}) } : l)) : prev
+    })
+  }, [])
+  /** The worker dropped the caller's unmarked lines since the last marked one. */
+  const dropOpen = useCallback((reason: "discarded" | "unaddressed") => {
+    setLines((prev) => {
+      const from = prev.findLastIndex((l) => l.from === "user" && l.mark)
+      return prev.map((l, i) => (i > from && l.from === "user" && !l.mark ? { ...l, mark: { status: "dropped", reason } } : l))
     })
   }, [])
 
@@ -210,10 +238,8 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
       if (step.sentDraft) {
         const turn = ++turns.current
         setLines((prev) => [...prev, { id: nextId.current++, from: "user", text: step.sentDraft!, at: secondsIn(), turn, mark: { status: "sending" } }])
-        if (!instant) playCue(cueCtx.current, "sent")
       }
       if (step.mark) markLastUser(step.mark)
-      if (!instant && next.draft?.state === "ready" && step.phase !== "talking" && !next.pending && !next.micError) playCue(cueCtx.current, "draft")
     },
     [later, markLastUser]
   )
@@ -231,26 +257,20 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
         if (step.review) applyReview(step, instant)
         return
       }
-      // As on a real call: listening once connected, your turn once the agent is done.
-      const was = phaseRef.current
-      if (!instant && was === "connecting" && step.phase === "listening") playCue(cueCtx.current, "listening")
-      if (!instant && was === "talking" && step.phase === "listening") {
-        later(() => {
-          if (phaseRef.current === "listening") playCue(cueCtx.current, "turn")
-        }, TURN_CUE_DELAY_MS)
-      }
       phaseRef.current = step.phase
       setPhase(step.phase)
       if (step.text && step.from) streamLine(step.from, step.text, step.ms, step.re, instant)
       if (step.review) applyReview(step, instant)
+      if (step.awaitingWake !== undefined) {
+        const awaitingWake = step.awaitingWake
+        setReview((r) => ({ ...r, wake: true, awaitingWake }))
+      }
+      if (step.drop) dropOpen(step.drop)
       if (step.pause && !instant) {
         // As the worker reports it: the caller stopped a moment ago, the rest of the silence is left.
         const left = 1600
         later(() => setSendCue({ id: `demo-${i}`, from: 1 - left / DEMO_SILENCE_MS, ms: left }), step.ms - left)
-        later(() => {
-          setSendCue(null)
-          playCue(cueCtx.current, "sent")
-        }, step.ms)
+        later(() => setSendCue(null), step.ms)
       }
       if (step.sent) {
         const turn = ++turns.current
@@ -266,23 +286,17 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
       if (stopAt !== null && i >= stopAt) return
       later(() => runStep(i + 1), step.ms)
     },
-    [later, streamLine, clearTimers, applyReview, stopAt]
+    [later, streamLine, clearTimers, applyReview, dropOpen, stopAt]
   )
 
   const start = useCallback(() => {
-    try {
-      cueCtx.current ??= new AudioContext()
-      void cueCtx.current.resume().catch(() => {})
-    } catch {
-      /* no Web Audio: a silent demo */
-    }
     clearTimers()
     setLines([])
     setMuted(false)
     setEndedText(null)
     setLimitNote(null)
     setReconnecting(false)
-    setReview((r) => ({ ...INITIAL_REVIEW, mode: script.current === REVIEW_SCRIPT ? "review" : r.mode }))
+    setReview((r) => ({ ...INITIAL_REVIEW, mode: script.current === REVIEW_SCRIPT ? "review" : r.mode, wake: script.current === WAKE_SCRIPT }))
     turns.current = 0
     startedAt.current = Date.now()
     setElapsed(0)
@@ -301,24 +315,19 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
 
   const toggleMute = useCallback(() => setMuted((m) => !m), [])
 
-  // Picking the other mode plays that mode's script from the start.
-  const setMode = useCallback(
-    (mode: TurnMode) => {
-      script.current = mode === "review" ? REVIEW_SCRIPT : SCRIPT
-      setReview({ ...INITIAL_REVIEW, mode })
+  // Picking the other mode, or the wake switch, plays that script from the start.
+  const pick = useCallback(
+    (which: DemoScript) => {
+      script.current = scriptFor(which)
+      setReview({ ...INITIAL_REVIEW, mode: which === "review" ? "review" : "auto", wake: which === "wake" })
       if (LIVE_PHASES.has(phaseRef.current)) start()
     },
     [start]
   )
+  const setMode = useCallback((mode: TurnMode) => pick(mode), [pick])
+  const setWake = useCallback((on: boolean) => pick(on ? "wake" : "auto"), [pick])
+  const setPauseSends = useCallback((on: boolean) => setReview((r) => ({ ...r, pauseSends: on })), [])
   const discard = useCallback(() => setReview((r) => ({ ...r, draft: null, ended: false })), [])
-
-  useEffect(
-    () => () => {
-      void cueCtx.current?.close().catch(() => {})
-      cueCtx.current = null
-    },
-    []
-  )
 
   useEffect(() => {
     if (!enabled) return
@@ -356,8 +365,8 @@ export function useDemoCall(enabled: boolean, initialMode: TurnMode = "auto", st
   }, [enabled])
 
   const reviewControls = useMemo(
-    () => ({ state: review, setMode, talk: () => {}, done: () => {}, send: () => {}, discard }),
-    [review, setMode, discard]
+    () => ({ state: review, setMode, talk: () => {}, done: () => {}, send: () => {}, discard, setWake, setPauseSends }),
+    [review, setMode, discard, setWake, setPauseSends]
   )
 
   return useMemo(

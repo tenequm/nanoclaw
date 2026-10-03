@@ -1044,6 +1044,18 @@
 .voice-page[data-skin="te"] .console .turn-mark.sending { color: #8a877f; }
 .voice-page[data-skin="te"][data-colorway="rabbit"] .mode-seg.on .led { background: #fff1e6; box-shadow: 0 0 6px rgba(255, 241, 230, 0.9); }
 
+/* Auto's wake switch under the mode row: two independent switches, lighter than the segments. */
+.wake-row { margin-top: 7px; background: transparent; box-shadow: none; padding: 0 3px; }
+.wake-row .mode-seg { min-width: 0; box-shadow: inset 0 0 0 1px var(--border); }
+.wake-row .mode-seg.on { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12); }
+.wake-row .seg-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-page[data-skin="te"] .wake-row .mode-seg.on { box-shadow: 0 2px 0 var(--te-cap-edge); }
+/* Words the worker dropped stay readable but step back, like history. */
+.turn-mark.dropped { color: var(--muted-foreground); }
+.transcript-box .has-dropped p { opacity: 0.6; }
+.transcript-box .has-discarded p { text-decoration: line-through; text-decoration-color: color-mix(in srgb, currentColor 45%, transparent); }
+.voice-page[data-skin="te"] .console .turn-mark.dropped { color: #8a877f; }
+
 /* Rail: the switch sits right above the keys. */
 .voice-page[data-skin="te"] aside.rail .mode-wrap { width: 100%; }
 @media (max-width: 600px) {
