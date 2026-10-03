@@ -3425,7 +3425,7 @@ describe('acoustic wake word in a call', () => {
     c.v.events.onTranscript?.('So that', false, 1);
     c.v.events.onCallerSpeaking(false);
     c.v.events.onTurn('So that', take);
-    w.events.onDetect(0.9, 0);
+    w.events.onDetect('wake', 0.9, 0);
     await new Promise((r) => setTimeout(r, 10));
     c.v.events.onTranscript?.('Book a table', true, 2);
     await new Promise((r) => setTimeout(r, 10));
