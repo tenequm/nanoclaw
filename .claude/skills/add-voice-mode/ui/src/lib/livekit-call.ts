@@ -27,7 +27,7 @@ import {
   type TurnMark,
   type VoiceCall,
 } from "./voice-call"
-import { COMMANDS_VERSION, INITIAL_REVIEW, autoBlock, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSION, INITIAL_REVIEW, autoBlock, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, storeWakePhrase, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -215,7 +215,7 @@ const within = (said: string, line: Line) => norm(line.text) !== "" && said.incl
  * segments). A turn with no caption at all (nothing transcribed) gets a line of its own. A second
  * status for a turn (a timed-out one the agent got after all) replaces the mark on its lines.
  */
-function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, newLine: () => Line, turn: number): Line[] {
+function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, newLine: () => Line, turn: number, wakeCut = false): Line[] {
   const mark: TurnMark = status.reason ? { status: status.status, reason: status.reason } : { status: status.status }
   if (lines.some((l) => l.from === "user" && l.turn === turn)) return lines.map((l) => (l.from === "user" && l.turn === turn ? { ...l, mark } : l))
   const open = lines.filter((l) => l.from === "user" && !covered.has(l.id))
@@ -232,12 +232,18 @@ function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, new
     return [...lines, line]
   }
   const lineIds = new Set<number>()
+  const phraseIds = new Set<number>()
   for (const l of open) {
     covered.add(l.id)
-    lineIds.add(l.id)
+    // With the transcript cut at the wake phrase the turn's text is exactly its words: an earlier
+    // line it does not contain is the phrase's own caption, no part of the turn.
+    if (wakeCut && said && l.id !== target.id && !within(said, l)) phraseIds.add(l.id)
+    else lineIds.add(l.id)
     if (l.id === target.id) break
   }
-  return lines.map((l) => (lineIds.has(l.id) ? { ...l, mark, turn } : l))
+  return lines.map((l) =>
+    lineIds.has(l.id) ? { ...l, mark, turn } : phraseIds.has(l.id) ? { ...l, wake: true, wakeOnly: true } : l,
+  )
 }
 
 /**
@@ -804,7 +810,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         }
         continue
       }
-      next = applyTurn(next, coveredLines.current, status, () => ({ id: nextId.current++, from: "user", text: "", at: secondsIn() }), shown)
+      next = applyTurn(next, coveredLines.current, status, () => ({ id: nextId.current++, from: "user", text: "", at: secondsIn() }), shown, !!workerWake.current?.cut)
       if (fromDraft && status.turn === lastReviewTurn.current) delivery = status.status
     }
     if (next !== linesRef.current) commitLines(next)
@@ -1053,7 +1059,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     }
     const done = awaitSeq.current !== null && snap.seq >= awaitSeq.current
     if (done) awaitSeq.current = null
-    if (snap.wake) workerWake.current = snap.wake
+    if (snap.wake) {
+      workerWake.current = snap.wake
+      storeWakePhrase(snap.wake.phrase ?? null)
+    }
     const awaitingWake = !!snap.wake?.on && snap.wake.waiting
     const heard = snap.wake?.heard
     if (typeof heard === "number" && heard > wakeHeard.current) {
@@ -1063,12 +1072,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       const last = lines.findLast((l) => l.from === "user")
       const current = !!last && !last.mark && !coveredLines.current.has(last.id) && Date.now() - lastUserAt.current < WAKE_LINE_MS
       if (snap.wake?.cut) {
-        // The transcription restarted right after the phrase: its line is the phrase alone, never
-        // part of the turn, and the turn's words come on lines of their own.
-        if (current && last) {
-          coveredLines.current.add(last.id)
-          commitLines(lines.map((l) => (l.id === last.id ? { ...l, wake: true, wakeOnly: true } : l)))
-        }
+        // The transcription restarted right after the phrase: the turn's words come on lines of their
+        // own, and a caption of the phrase itself is found when the turn settles (applyTurn).
         wakeNext.current = false
       } else if (current && last) {
         commitLines(lines.map((l) => (l.id === last.id ? { ...l, wake: true } : l)))

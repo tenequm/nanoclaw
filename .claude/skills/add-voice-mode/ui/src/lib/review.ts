@@ -80,6 +80,27 @@ export interface ReviewState {
   wakeSlept: number
 }
 
+const WAKE_PHRASE_KEY = "voice-wake-phrase"
+
+/** The wake phrase the worker named last time, so the page names it before this call's worker does. */
+function storedWakePhrase(): string | null {
+  try {
+    return localStorage.getItem(WAKE_PHRASE_KEY) || null
+  } catch {
+    return null
+  }
+}
+
+/** Remember the worker's wake phrase for the next page load; null: `hey <agent>`. */
+export function storeWakePhrase(phrase: string | null): void {
+  try {
+    if (phrase) localStorage.setItem(WAKE_PHRASE_KEY, phrase)
+    else localStorage.removeItem(WAKE_PHRASE_KEY)
+  } catch {
+    // Storage off (a private window): the next load names `hey <agent>` until the worker says.
+  }
+}
+
 export const INITIAL_REVIEW: ReviewState = {
   mode: "auto",
   available: true,
@@ -94,7 +115,7 @@ export const INITIAL_REVIEW: ReviewState = {
   wake: false,
   pauseSends: false,
   awaitingWake: false,
-  wakePhrase: null,
+  wakePhrase: storedWakePhrase(),
   wakeHeard: 0,
   wakeSlept: 0,
 }

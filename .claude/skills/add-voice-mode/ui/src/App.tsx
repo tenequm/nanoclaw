@@ -953,7 +953,7 @@ export default function App() {
     : muted
       ? "Mic muted"
       : notListening
-        ? "Not listening during reply"
+        ? "Paused for reply"
         : "Mic on"
   // The one LED: lit while the microphone actually feeds the call.
   const micCapturing = rv ? rv.capturing || rv.mic === "Mic still on" : live && !muted && !notListening

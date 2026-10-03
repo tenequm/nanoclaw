@@ -796,6 +796,95 @@ describe('runCall', () => {
     host.endStream();
   });
 
+  it('working shows while a turn awaits its reply and until the reply is heard, not for typing after it', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    let speak!: () => void;
+    v.voice.say.mockImplementation(() => new Promise<boolean>((resolve) => (speak = () => resolve(true))));
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    const thinking = () => v.voice.setThinking.mock.calls.at(-1)?.[0];
+    // Typing with no turn waiting for its answer says nothing.
+    host.emit({ type: 'thinking' });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(v.voice.setThinking).not.toHaveBeenCalled();
+
+    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() => expect(thinking()).toBe(true));
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.'));
+    // The reply's speech is still being made: the page keeps "working" until its audio plays.
+    expect(thinking()).toBe(true);
+    v.events.onAgentSpeaking?.(true);
+    expect(thinking()).toBe(true);
+    // A moment into its audio (the page has the speaking state by then) it lets go.
+    await vi.waitFor(() => expect(thinking()).toBe(false));
+    speak();
+    v.events.onAgentSpeaking?.(false);
+    // The agent's typing after its answer: no "working" with nothing coming.
+    host.emit({ type: 'thinking' });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(thinking()).toBe(false);
+    host.endStream();
+  });
+
+  it('a turn the session commits while a final is still on its way waits for it (a late discard drops it)', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    const utterances = () => host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+    const take = { sttModel: 'gemini-3.5-transcribe-live' };
+
+    v.events.onCallerSpeaking(true);
+    v.events.onTranscript?.('Remind me to call the plumber.', true, 1);
+    v.events.onTranscript?.('Scratch', false, 1);
+    v.events.onCallerSpeaking(false);
+    v.events.onTurn('Remind me to call the plumber.', take);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(utterances()).toEqual([]);
+    v.events.onTranscript?.('Scratch that.', true, 1);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(utterances()).toEqual([]);
+
+    // A late final with more words: they are in the turn, and not in the next one.
+    v.events.onCallerSpeaking(true);
+    v.events.onTranscript?.('Скільки буде сім помножити на вісім?', true, 1);
+    v.events.onCallerSpeaking(true);
+    v.events.onCallerSpeaking(false);
+    v.events.onTurn('Скільки буде сім помножити на вісім?', take);
+    v.events.onTranscript?.('Одним словом.', true, 1);
+    await vi.waitFor(() => expect(utterances()).toEqual(['Скільки буде сім помножити на вісім? Одним словом.']));
+    v.events.onCallerSpeaking(true);
+    v.events.onTranscript?.('And the weather?', true, 1);
+    v.events.onCallerSpeaking(false);
+    v.events.onTurn('Одним словом. And the weather?', take);
+    await vi.waitFor(() => expect(utterances()).toHaveLength(2));
+    expect(utterances()[1]).toBe('And the weather?');
+    host.endStream();
+  });
+
+  it('a turn waits at most 2 s for a late final, then goes out as the session had it', async () => {
+    vi.useFakeTimers();
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    v.events.onCallerSpeaking(true);
+    v.events.onTranscript?.('Book a table', true, 1);
+    v.events.onTranscript?.('for', false, 1);
+    v.events.onCallerSpeaking(false);
+    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.advanceTimersByTimeAsync(1_900);
+    expect(host.calls.filter((c) => c.url.endsWith('/utterance'))).toEqual([]);
+    await vi.advanceTimersByTimeAsync(200);
+    vi.useRealTimers();
+    await vi.waitFor(() =>
+      expect(host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text)).toEqual(['Book a table']),
+    );
+    host.endStream();
+  });
+
   it('tells the page once per turn that the agent picked it up, never before the host took it or after its answer', async () => {
     const { ctx } = fakeJob();
     const host = fakeHostFetch();
@@ -3187,6 +3276,22 @@ describe('acoustic wake word in a call', () => {
     host.endStream();
   });
 
+  it('names the phrase while the model loads, and takes it back if it fails', async () => {
+    const { ctx } = fakeJob();
+    const c = wakeCall();
+    let fail!: (err: Error) => void;
+    const w = fakeWakeWord();
+    Object.assign(w.wake, { ready: new Promise<void>((_, reject) => (fail = reject)) });
+    w.wake.ready.catch(() => undefined);
+    await runCall(ctx, deps(fakeHostFetch().fetchImpl, c.v.createVoice, { wakeWord: w.make }));
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    expect(c.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true, phrase: 'hey livekit' });
+    c.frame();
+    expect(w.pushed).toEqual([]);
+    fail(new Error('wake word model not found: x'));
+    await vi.waitFor(() => expect(c.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true }));
+  });
+
   it('falls back to the transcript name when the model does not load, or stops', async () => {
     const { ctx } = fakeJob();
     const host = fakeHostFetch();
@@ -3241,6 +3346,7 @@ describe('acoustic wake word in a call', () => {
       );
       await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
       await vi.waitFor(() => expect(c.r.last.wake?.phrase).toBe('hey livekit'));
+      await spotter.ready;
       // 20 ms frames, as the room delivers them, each 80 ms waiting for its score.
       for (let at = 0; at < audio.length; at += 320) {
         c.v.events.onAudio?.(new AudioFrame(audio.slice(at, at + 320), 16_000, 1, Math.min(320, audio.length - at)));
