@@ -822,10 +822,12 @@ and turns the recording into a draft ("`<agent>` started speaking - review what
 was heard"); talk waits while the agent speaks, but a draft can be sent then as
 a follow-up. Switching auto to review mid-turn cancels the pending auto commit
 and makes the unsent words a draft; if the commit already went, the page says
-"previous turn already submitted". Back to auto needs no open draft and leaves
-the microphone muted. A quiet two-note cue says a draft is ready to read; a call
-that ends with a draft keeps it readable until discarded, never sent into the
-next call.
+"previous turn already submitted". Back to auto needs no open draft, and once the
+worker took the switch the microphone opens again, unless the caller had muted it
+with the mute key. A quiet two-note cue says a draft is ready to read. While a
+draft is open the call can still end ("end call" on the draft, or Esc), and the
+draft goes with it; a call that ends on its own with a draft keeps it readable
+until discarded, never sent into the next call.
 
 **Spoken commands in auto.** `send it` at the end of what the caller said sends
 the turn at once without the words, and `discard turn`, `discard this turn` or
@@ -841,7 +843,13 @@ does not end with (the interim text was ahead of itself) was words, and the turn
 on in a new activity carrying them, as it does when the caller talks on before the
 final comes. Only the end counts: `send it to Anna` is words, and so is a question
 ending in it (`Should I send it?`). A pause that ends a turn whose final text ends in
-a command applies it too. A command with nothing to act on plays the nope cue, and its
+a command applies it too, and so does one any interim of the turn ended with that later
+interims and the final left out (the final ends like the words before it, with no
+more words than a command adds), so a dropped `scratch that` never sends the words;
+the send countdown is not shown while a command is pending. A sent turn's caption is
+the text the agent got, without the command; the words before it keep their period.
+The transcription sometimes returns its own vocabulary list as the caller's words
+(`'Dan', 'Stan', 'send it', ...`); that echo is cut from every interim and final. A command with nothing to act on plays the nope cue, and its
 line says "nothing to send" (or "nothing to discard"). A wake switch under the mode
 row, in a labelled "voice commands" block with a one-line explainer (on by default,
 kept for the next call like the mode pick; the worker starts with it on until the
@@ -858,8 +866,9 @@ caller's audio with the wake word model (`VOICE_WAKE_MODEL`, by default livekit-
 it), a score at or over `VOICE_WAKE_THRESHOLD` opens the turn (at most once in 2 s),
 and the switch and chip name that phrase. The turn's activity starts right where the
 phrase was spotted, as the wake cue plays (the model is end-aligned: it fires as the
-phrase ends, within an 80 ms hop), so the phrase is never in the turn's audio or text,
-and nothing in the text is searched for it. Speech before the phrase is not transcribed at all, so it shows no caption. A
+phrase ends, within an 80 ms hop), so the phrase is never in the turn's audio or text.
+Said again inside an open turn, the wake phrase (`hey <agent>`, or the model's phrase) is
+cut out of the turn's text, and a discard before it drops only the words before it. Speech before the phrase is not transcribed at all, so it shows no caption. A
 turn the phrase opened that hears nothing for `VOICE_WAKE_START_SECONDS`, or nothing
 more for `VOICE_WAKE_IDLE_SECONDS` after its last words, goes back to waiting: its
 final is read first (a `send it` the interim text missed still sends then, late), else
