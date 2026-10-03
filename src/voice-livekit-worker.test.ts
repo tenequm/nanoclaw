@@ -60,6 +60,7 @@ import {
   awakeLimits,
   endsLike,
   Outbox,
+  audioLevels,
   CallerInput,
   type VadStream,
   type WakeWord,
@@ -1173,6 +1174,58 @@ describe('runCall', () => {
       body: { callId: 'call-1', reason: 'job shutdown', restart: true },
     });
     expect(job.shutdown).toHaveBeenCalledWith('job shutdown');
+  });
+});
+
+describe('reply recordings', () => {
+  it('a call with recordings on writes each spoken line as it was played, next to the turns, and logs its levels', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-rec-'));
+    try {
+      const { ctx } = fakeJob();
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      const info = vi.fn();
+      await runCall(
+        ctx,
+        callDeps(host.fetchImpl, v, {
+          env: { ...ENV, VOICE_RECORDINGS_DAYS: '7' },
+          recordingsRoot: root,
+          log: { info, warn: () => undefined },
+        }),
+      );
+      const settings = v.createVoice.mock.calls[0][2];
+      const pcm = Int16Array.from({ length: 24_000 }, (_, i) => (i % 2 ? 16384 : -16384));
+      settings.recordReply?.(pcm, 'gemini-3.8-flash-lite-tts');
+      const file = path.join(root, 'Andy', new Date().toISOString().slice(0, 10), 'call-1-reply-1.wav');
+      await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
+      const wav = fs.readFileSync(file);
+      expect(wav.readUInt32LE(24)).toBe(24_000);
+      expect(wav.length - 44).toBe(2 * 24_000);
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+      await vi.waitFor(() =>
+        expect(info).toHaveBeenCalledWith('voice worker: saved a reply recording', {
+          callId: 'call-1',
+          reply: 1,
+          durationMs: 1000,
+          model: 'gemini-3.8-flash-lite-tts',
+          peakDb: -6,
+          rmsDb: -6,
+        }),
+      );
+      host.endStream();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('records nothing with recordings off', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    expect(v.createVoice.mock.calls[0][2].recordReply).toBeUndefined();
+    expect(audioLevels(new Int16Array(10))).toEqual({ peakDb: -Infinity, rmsDb: -Infinity });
+    host.endStream();
   });
 });
 

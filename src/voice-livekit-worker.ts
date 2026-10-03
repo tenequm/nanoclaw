@@ -353,6 +353,8 @@ export class GeminiSpeech {
   private downUntil = 0;
   private readonly now: () => number;
   private readonly models = new Map<string, SpeechModel>();
+  /** The model the last line's audio came from. */
+  spokenBy = '';
 
   constructor(private readonly opts: SpeechOptions) {
     this.now = opts.now ?? (() => Date.now());
@@ -384,6 +386,7 @@ export class GeminiSpeech {
         try {
           for await (const audio of withIdleTimeout(stream, TTS_IDLE_TIMEOUT_MS)) {
             spoke = true;
+            this.spokenBy = name;
             yield audio.frame.data;
           }
           error = stream.error ?? (spoke ? undefined : new Error(`speech model ${name} sent no audio`));
@@ -628,6 +631,36 @@ export const pathSegment = (name: string): string =>
     .slice(0, 64) || 'unnamed';
 
 /** Writes `<root>/<agent>/<YYYY-MM-DD>/<callId>-<turn>.wav` and `.json`, owner-only. */
+/** A recording's peak and RMS, in dBFS. */
+export function audioLevels(pcm: Int16Array): { peakDb: number; rmsDb: number } {
+  let peak = 0;
+  let sum = 0;
+  for (const v of pcm) {
+    peak = Math.max(peak, Math.abs(v));
+    sum += v * v;
+  }
+  const db = (x: number) => (x > 0 ? Math.round(20 * Math.log10(x / 32768) * 10) / 10 : -Infinity);
+  return { peakDb: db(peak), rmsDb: db(Math.sqrt(sum / Math.max(1, pcm.length))) };
+}
+
+/**
+ * Writes a spoken reply's audio, exactly as it went to the speech track (24 kHz mono), as
+ * `<root>/<agent>/<YYYY-MM-DD>/<callId>-reply-<n>.wav`, next to the call's turn recordings, owner-only.
+ */
+export async function writeReplyRecording(
+  root: string,
+  call: { agent: string; callId: string },
+  reply: number,
+  pcm: Int16Array,
+  at = Date.now(),
+): Promise<string> {
+  const dir = path.join(root, pathSegment(call.agent), new Date(at).toISOString().slice(0, 10));
+  await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+  const file = path.join(dir, `${pathSegment(call.callId)}-reply-${reply}.wav`);
+  await fs.promises.writeFile(file, pcmToWav(pcm, TTS_SAMPLE_RATE), { mode: 0o600 });
+  return file;
+}
+
 export async function writeTurnRecording(root: string, record: TurnRecord, audio: TurnAudio): Promise<string> {
   const dir = path.join(root, pathSegment(record.agent), record.startedAt.slice(0, 10));
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -2537,6 +2570,8 @@ export type CallJob = Pick<
 /** What a call's room needs besides the job metadata. */
 export interface VoiceSettings {
   geminiKey: string;
+  /** With recordings on: each spoken line's audio as sent to the speech track, and the model that made it. */
+  recordReply?(pcm: Int16Array, model: string): void;
 }
 
 export interface RunCallDeps {
@@ -2870,6 +2905,12 @@ async function roomVoice(
   const say = async (text: string): Promise<boolean> => {
     let heard = false;
     let rest: Int16Array | undefined;
+    /** The frames sent to the speech track, for the reply's recording. */
+    const sent: Int16Array[] = [];
+    const capture = async (frame: Int16Array) => {
+      if (settings.recordReply) sent.push(frame);
+      await speechSource.captureFrame(new AudioFrame(frame, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
+    };
     const play = async (pcm: Int16Array) => {
       let data = pcm;
       if (rest) {
@@ -2878,11 +2919,7 @@ async function roomVoice(
         data.set(pcm, rest.length);
       }
       let at = 0;
-      for (; at + SPEECH_FRAME <= data.length; at += SPEECH_FRAME) {
-        await speechSource.captureFrame(
-          new AudioFrame(data.slice(at, at + SPEECH_FRAME), TTS_SAMPLE_RATE, 1, SPEECH_FRAME),
-        );
-      }
+      for (; at + SPEECH_FRAME <= data.length; at += SPEECH_FRAME) await capture(data.slice(at, at + SPEECH_FRAME));
       rest = at < data.length ? data.slice(at) : undefined;
     };
     try {
@@ -2910,7 +2947,7 @@ async function roomVoice(
         const tail = new Int16Array(SPEECH_FRAME);
         tail.set(rest);
         rest = undefined;
-        await speechSource.captureFrame(new AudioFrame(tail, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
+        await capture(tail);
       }
       if (heard) await speechSource.waitForPlayout();
       return heard && !closed;
@@ -2922,6 +2959,11 @@ async function roomVoice(
       if (heard && !closed) {
         setAttr(AGENT_STATE_ATTRIBUTE, 'listening', 'the agent state');
         events.onAgentSpeaking?.(false);
+      }
+      if (sent.length) {
+        const pcm = new Int16Array(sent.length * SPEECH_FRAME);
+        sent.forEach((frame, i) => pcm.set(frame, i * SPEECH_FRAME));
+        settings.recordReply?.(pcm, speech.spokenBy);
       }
     }
   };
@@ -3049,6 +3091,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const geminiKey = deps.env.GEMINI_API_KEY;
   if (!geminiKey) return abandon('GEMINI_API_KEY is not set for the worker');
   const record = recordingDays(deps.env.VOICE_RECORDINGS_DAYS) > 0;
+  /** Spoken lines recorded so far, for their file names. */
+  let replies = 0;
   if (meta.sttFallbackModel) {
     log.warn('voice worker: VOICE_STT_FALLBACK_MODEL is ignored: turns are transcribed by the Live model only', {
       ...callFields,
@@ -3331,7 +3375,31 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     callVoice = await deps.createVoice(
       ctx,
       meta,
-      { geminiKey },
+      {
+        geminiKey,
+        ...(record
+          ? {
+              recordReply: (pcm: Int16Array, model: string) => {
+                const reply = ++replies;
+                const fields = {
+                  reply,
+                  durationMs: Math.round((pcm.length * 1000) / TTS_SAMPLE_RATE),
+                  model,
+                  ...audioLevels(pcm),
+                };
+                void writeReplyRecording(
+                  deps.recordingsRoot ?? recordingsRoot(),
+                  { agent: meta.agentName, callId: meta.callId },
+                  reply,
+                  pcm,
+                ).then(
+                  () => callLog.info('voice worker: saved a reply recording', fields),
+                  (err: unknown) => callLog.warn('voice worker: could not save a reply recording', { err, reply }),
+                );
+              },
+            }
+          : {}),
+      },
       {
         onAudio: (pcm) => {
           // Scored only while it can open a turn: waiting in auto, and not while an agent line is due or plays.
