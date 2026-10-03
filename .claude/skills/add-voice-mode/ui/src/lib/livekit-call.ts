@@ -27,7 +27,7 @@ import {
   type TurnMark,
   type VoiceCall,
 } from "./voice-call"
-import { COMMANDS_VERSION, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, infoWakePhrase, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSION, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, reopensMic, infoWakePhrase, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -333,6 +333,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const micRaw = useRef(0)
   const agentRaw = useRef(0)
   const muteBusy = useRef(false)
+  /** The caller muted with the mute key (not review mode's own muting): back in hands-free it stays muted. */
+  const mutedByHand = useRef(false)
   const inputLevel = useRef(0)
   const outputLevel = useRef(0)
   const audioRef = useRef<HTMLAudioElement | null>(null)
@@ -497,6 +499,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       inputLevel.current = 0
       outputLevel.current = 0
       mutedRef.current = false
+      mutedByHand.current = false
       setMutedState(false)
       setMuteError(null)
       setReconnecting(false)
@@ -988,7 +991,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     }
   }, [token, room, commitLines, endOnServer, fail, setPhase, setStreaming, setJoined, updateReview])
 
-  const endCall = useCallback(() => end(true, "Call ended."), [end])
+  // The caller ending the call drops a review draft with it: nothing of it is kept to send later.
+  const endCall = useCallback(() => {
+    updateReview((r) => (r.draft ? { ...r, draft: null, provisional: "" } : r))
+    end(true, "Call ended.")
+  }, [end, updateReview])
 
   // The key shows what the track actually did, not what was asked of it.
   const toggleMute = useCallback(() => {
@@ -1005,6 +1012,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         muteBusy.current = false
         if (mic.current !== track) return
         mutedRef.current = track.isMuted
+        mutedByHand.current = track.isMuted
         setMutedState(track.isMuted)
       })
   }, [])
@@ -1154,6 +1162,9 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       if (to === "review" && mic.current && !mic.current.isMuted) await setMic(false)
       const reply = await rpc("mode", { mode: to, afterTurn: maxTurn.current })
       if (reply?.ok) keepPrefs({ mode: to })
+      // Hands-free listens: once the worker took the switch the microphone opens again, unless the
+      // caller had muted it themselves.
+      if (reopensMic({ to, taken: !!reply?.ok, muted: !!mic.current?.isMuted, mutedByHand: mutedByHand.current })) await setMic(true)
       settleOp(reply, reply?.ok && reply.submitted !== undefined ? { note: "Previous turn already submitted." } : {})
     },
     [updateReview, setMic, rpc, settleOp, keepPrefs]
@@ -1235,8 +1246,12 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     return () => window.clearTimeout(t)
   }, [reviewLive, review.mode, review.pending, reviewAvailable, updateReview, rpc, settleOp])
 
+  // The worker's attributes trail its joining: what the page assumed stays until they had their grace.
   useEffect(() => {
-    if (reviewLive) updateReview((x) => (x.available === reviewAvailable ? x : { ...x, available: reviewAvailable }))
+    if (!reviewLive) return
+    if (reviewAvailable) return updateReview((x) => (x.available ? x : { ...x, available: true }))
+    const t = window.setTimeout(() => updateReview((x) => (x.available ? { ...x, available: false } : x)), AGENT_ATTR_GRACE_MS)
+    return () => window.clearTimeout(t)
   }, [reviewLive, reviewAvailable, updateReview])
 
   /**
@@ -1261,9 +1276,15 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   }, [rpc, updateReview, keepPrefs])
 
   // Once per call, as soon as the worker says it takes them. The worker holds its first cue until then.
+  // The switches stay through the connect: a worker without commands loses them only after the grace.
   useEffect(() => {
-    if (reviewLive) updateReview((x) => (x.commands === commandsAvailable ? x : { ...x, commands: commandsAvailable }))
-    if (!reviewLive || !commandsAvailable || settingsSent.current) return
+    if (!reviewLive) return
+    if (!commandsAvailable) {
+      const t = window.setTimeout(() => updateReview((x) => (x.commands ? { ...x, commands: false } : x)), AGENT_ATTR_GRACE_MS)
+      return () => window.clearTimeout(t)
+    }
+    updateReview((x) => (x.commands ? x : { ...x, commands: true }))
+    if (settingsSent.current) return
     settingsSent.current = true
     void sendSettings()
   }, [reviewLive, commandsAvailable, updateReview, sendSettings])

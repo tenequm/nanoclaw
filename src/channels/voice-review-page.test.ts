@@ -26,6 +26,7 @@ type View = {
   capturing: boolean;
   panel: { title: string; text: string; tone: string; note?: string } | null;
   modeDisabled: boolean;
+  endable: boolean;
 };
 type Prefs = { mode: string; wake: boolean; pauseSends: boolean };
 interface ReviewLib {
@@ -62,7 +63,9 @@ interface ReviewLib {
   settingsNotTaken(ran: { on: boolean; pauseSends: boolean } | undefined): Record<string, unknown>;
   storedWakePhrase(): string | null;
   storeWakePhrase(phrase: string | null): void;
-  modeCaption(mode: string, commands: boolean): string;
+  modeCaption(mode: string, commands: boolean, wake?: { on: boolean; pauseSends: boolean }): string;
+  wakeSwitchPhrase(review: ReviewState, agentName: string, placeholder: string): string | null;
+  reopensMic(input: { to: string; taken: boolean; muted: boolean; mutedByHand: boolean }): boolean;
   charsOver(text: string): number;
 }
 
@@ -387,6 +390,39 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(lib.modeCaption('auto', true)).toBe('Stop for a moment, or say "send it", to send.');
     expect(lib.modeCaption('auto', false)).toBe('Stop for a moment to send.');
     expect(lib.modeCaption('review', true)).toBe('Tap talk, read your words, then send.');
+    // With the wake switch a pause sends only with the pause switch, as the hint says.
+    expect(lib.modeCaption('auto', true, { on: true, pauseSends: false })).toBe('Say "send it" to send.');
+    expect(lib.modeCaption('auto', true, { on: true, pauseSends: true })).toBe(
+      'Stop for a moment, or say "send it", to send.',
+    );
+    expect(lib.modeCaption('auto', true, { on: false, pauseSends: false })).toBe(
+      'Stop for a moment, or say "send it", to send.',
+    );
+  });
+
+  it('never names a placeholder agent in the wake switch: no phrase until the line info says one', () => {
+    expect(lib.wakeSwitchPhrase(review({ wakePhrase: null }), 'your agent', 'your agent')).toBeNull();
+    expect(lib.wakeSwitchPhrase(review({ wakePhrase: null }), 'Dan', 'your agent')).toBe('Hey Dan');
+    expect(lib.wakeSwitchPhrase(review({ wakePhrase: 'Hey LiveKit' }), 'your agent', 'your agent')).toBe('Hey LiveKit');
+  });
+
+  it('back in hands-free the microphone opens once the worker took it, unless the caller muted it', () => {
+    expect(lib.reopensMic({ to: 'auto', taken: true, muted: true, mutedByHand: false })).toBe(true);
+    expect(lib.reopensMic({ to: 'auto', taken: true, muted: true, mutedByHand: true })).toBe(false);
+    expect(lib.reopensMic({ to: 'auto', taken: false, muted: true, mutedByHand: false })).toBe(false);
+    expect(lib.reopensMic({ to: 'review', taken: true, muted: true, mutedByHand: false })).toBe(false);
+    expect(lib.reopensMic({ to: 'auto', taken: true, muted: false, mutedByHand: false })).toBe(false);
+  });
+
+  it('the call can end while a draft is open, besides its discard and send keys', () => {
+    for (const state of ['ready', 'empty', 'failed', 'finishing']) {
+      const v = view({ draft: draft(state, 'Words') });
+      expect(v.left.action).toBe('discard');
+      expect(v.endable).toBe(true);
+    }
+    expect(view({ draft: null }).endable).toBe(false);
+    expect(view({ draft: draft('recording') }).endable).toBe(false);
+    expect(view({ draft: draft('ready', 'Keep me'), ended: true }, 'ended').endable).toBe(false);
   });
 
   it('calls the review mode Manual everywhere a caller or operator reads it', () => {

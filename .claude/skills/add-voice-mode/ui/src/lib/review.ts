@@ -218,6 +218,8 @@ export interface ReviewView {
   panel: PanelView | null
   /** The switch is off while an operation settles, the line reconnects or a transcript finishes. */
   modeDisabled: boolean
+  /** The call can end besides the two keys (the left one is Discard): ending drops the draft. */
+  endable: boolean
 }
 
 export interface ReviewInput {
@@ -316,6 +318,7 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
       capturing: false,
       panel: kept ? panel : null,
       modeDisabled: phase === "connecting" || !!kept,
+      endable: false,
     }
   }
 
@@ -444,7 +447,16 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
     capturing,
     panel,
     modeDisabled: reconnecting || !!pending || d?.state === "finishing",
+    endable: left.action !== "end",
   }
+}
+
+/**
+ * Whether a mode switch opens the microphone again: Manual keeps it off between recordings, so back
+ * in hands-free it listens once the worker took the switch, unless the caller muted it themselves.
+ */
+export function reopensMic({ to, taken, muted, mutedByHand }: { to: TurnMode; taken: boolean; muted: boolean; mutedByHand: boolean }): boolean {
+  return to === "auto" && taken && muted && !mutedByHand
 }
 
 /** The worker's error for a refused operation, as the caller's next step. */
@@ -459,10 +471,15 @@ export function refusalNote(error: string | undefined, agentName: string): strin
 /** Turn modes as the page names them; the protocol keeps `auto` and `review`. */
 export const MODE_NAME: Record<TurnMode, string> = { auto: "hands-free", review: "Manual" }
 
-/** What each mode does, in one line under the switch. */
-export function modeCaption(mode: TurnMode, commands: boolean): string {
+/**
+ * What each mode does, in one line under the switch. With the wake switch on a pause sends only when
+ * the pause switch says so, as the readout's hint says too.
+ */
+export function modeCaption(mode: TurnMode, commands: boolean, wake?: { on: boolean; pauseSends: boolean }): string {
   if (mode === "review") return "Tap talk, read your words, then send."
-  return commands ? `Stop for a moment, or say "send it", to send.` : "Stop for a moment to send."
+  if (!commands) return "Stop for a moment to send."
+  if (wake?.on && !wake.pauseSends) return `Say "send it" to send.`
+  return `Stop for a moment, or say "send it", to send.`
 }
 
 /**
@@ -505,6 +522,14 @@ export function infoWakePhrase(info: unknown): string | null | undefined {
   const phrase = info.wakePhrase
   if (phrase === null) return null
   return typeof phrase === "string" && phrase.trim() ? phrase.trim() : undefined
+}
+
+/**
+ * The wake switch's phrase, or null while it is not known: before the line info names the agent the
+ * page has only a placeholder name (`placeholder`), never shown as `Hey <placeholder>`.
+ */
+export function wakeSwitchPhrase(review: ReviewState, agentName: string, placeholder: string): string | null {
+  return review.wakePhrase ?? (agentName === placeholder ? null : `Hey ${agentName}`)
 }
 
 /** The phrase that opens a turn with the wake switch on, shown exactly as configured. */
