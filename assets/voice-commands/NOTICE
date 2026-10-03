@@ -1,0 +1,30 @@
+Phrase models for this fork's own voice worker (src/voice-wakeword.ts)
+
+Not part of the add-voice-mode skill: the skill copies an explicit file list and
+never this directory, and its default wake word stays hey_livekit. This fork's
+deploy opts in through .env, with paths relative to the NanoClaw directory:
+
+  VOICE_WAKE_MODEL=assets/voice-commands/hey_dan.onnx
+
+hey_dan.onnx listens for "hey dan" (and "hey den", as a Ukrainian speaker says
+it). It is a livekit-wakeword classifier (conv-attention, medium) trained with
+livekit-wakeword (https://github.com/livekit/livekit-wakeword, Apache-2.0,
+commit fb92cb3 with local changes for weighted hand-picked near misses and
+batched feature extraction) on synthetic speech only:
+- 50,000 positive and 50,000 adversarial clips from the Piper VITS
+  en-us-libritts-high voice that livekit-wakeword downloads, with 40 hand-picked
+  near misses ("hey ben", "hey stan", "hey danny", "send it", ...);
+- background noise, room responses and the ACAV100M negative features that
+  livekit-wakeword's setup downloads;
+- 100,000 training steps, target 0.1 false positives per hour.
+It runs on the mel and embedding models in assets/voice-wakeword/.
+
+Its own evaluation (35 h of held-out negatives): recall 0.885 at 0.5 with 0.49
+false positives per hour; recall 0.81 at 0.76 with 0.086. Its known threshold
+in the worker is 0.76.
+
+Measured on other voices (macOS say and Gemini TTS, offline and on a real call):
+real "hey dan" scores 0.82-0.98 on 20 of 22 clips, but "hey" with another one
+syllable name scores as high ("Hey Ben" 0.97, "Hey Jan" 0.98, "Hey Stan" 0.96,
+"Hey Danny" 0.95). No threshold separates them, so a nearby "hey <name>" can
+open a turn. Retrain with more voices for the near misses before relying on it.

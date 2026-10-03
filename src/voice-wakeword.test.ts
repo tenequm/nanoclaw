@@ -251,6 +251,23 @@ describe('WakeWordSpotter', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // This fork's own model, absent where the skill installed the worker.
+  const HEY_DAN = fileURLToPath(new URL('../assets/voice-commands/hey_dan.onnx', import.meta.url));
+  it.skipIf(!fs.existsSync(HEY_DAN))(
+    "loads the fork's hey_dan model: its phrase, its threshold, no hit on hey livekit",
+    async () => {
+      expect(defaultThreshold(HEY_DAN)).toBe(0.76);
+      const pipeline = await WakeWordPipeline.load([HEY_DAN]);
+      try {
+        const [score] = await pipeline.score(pcmToFloat(readWav(path.join(FIXTURES, 'positive.wav'))));
+        expect(score).toBeLessThan(0.76);
+      } finally {
+        await pipeline.release();
+      }
+      expect(wakePhraseOf(HEY_DAN)).toBe('hey dan');
+    },
+  );
+
   it('rejects ready when no classifier loads', async () => {
     const spotter = new WakeWordSpotter({
       classifiers: [{ name: 'wake', model: '/nonexistent/hey_nobody.onnx', threshold: 0.5 }],

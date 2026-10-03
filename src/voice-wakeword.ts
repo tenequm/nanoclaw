@@ -35,6 +35,8 @@ export const CUSTOM_WAKE_THRESHOLD = 0.5;
 /** Thresholds picked for known classifiers, by file name. */
 const KNOWN_THRESHOLDS: Record<string, number> = {
   hey_livekit: DEFAULT_WAKE_THRESHOLD,
+  // This fork's own model (assets/voice-commands/, see its NOTICE): its evaluation's operating point.
+  hey_dan: 0.76,
 };
 
 /** The threshold a classifier gets unless the settings say otherwise. */
