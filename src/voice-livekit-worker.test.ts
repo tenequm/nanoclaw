@@ -45,7 +45,6 @@ import {
   MAX_IDLE_WAIT_MS,
   maxSpokenChars,
   parseJobMetadata,
-  questionSilenceMs,
   pathSegment,
   pruneRecordings,
   readJobHeader,
@@ -203,14 +202,6 @@ describe('helpers', () => {
     expect(maxSpokenChars('0')).toBe(0);
     expect(maxSpokenChars('-5')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
     expect(maxSpokenChars('lots')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
-  });
-
-  it('reads VOICE_QUESTION_SILENCE_MS, off unless it is a shorter pause', () => {
-    expect(questionSilenceMs(undefined, 2500)).toBeUndefined();
-    expect(questionSilenceMs(' 1000 ', 2500)).toBe(1000);
-    expect(questionSilenceMs('2500', 2500)).toBeUndefined();
-    expect(questionSilenceMs('100', 2500)).toBeUndefined();
-    expect(questionSilenceMs('soon', 2500)).toBeUndefined();
   });
 
   it('reads the language of a transcript from its script', () => {
@@ -1416,24 +1407,6 @@ describe('SendCountdown', () => {
     countdown.clear();
   });
 
-  it('restarts a countdown on show with a new length, and stays down when none is', () => {
-    let now = 10_000;
-    const published: string[] = [];
-    const countdown = new SendCountdown(
-      (value) => published.push(value),
-      2500,
-      () => now,
-    );
-    countdown.resize(1000);
-    expect(published).toEqual([]);
-    countdown.stopped(now - 600);
-    now += 200;
-    countdown.resize(1000);
-    countdown.clear();
-    countdown.resize(2500);
-    expect(published).toEqual(['1:600:2500', '2:800:1000', '']);
-  });
-
   it('clears itself once the turn is overdue, so a turn that never commits does not leave it up', () => {
     vi.useFakeTimers();
     const published: string[] = [];
@@ -1933,77 +1906,6 @@ describe('ReadyingGeminiSTT', () => {
 });
 
 describe('review mode in the session', () => {
-  it('after a final that ends in a question mark, shortens the pause that sends the turn, until more words come', async () => {
-    let sends = true;
-    const events: CallVoiceEvents = {
-      onTurn: () => undefined,
-      onCallerSpeaking: () => undefined,
-      onTurnLost: () => undefined,
-      onTurnDropped: () => undefined,
-      onClosed: () => undefined,
-      pausesSend: () => sends,
-    };
-    const { agent, session } = callSession(
-      META,
-      { geminiKey: 'gk-test', record: false, questionSilenceMs: 1000 },
-      { vad: {} as VAD },
-      events,
-      { ...silentLog, error: () => undefined },
-    );
-    const seen: string[] = [];
-    vi.spyOn(session, 'updateOptions').mockImplementation((options) => {
-      seen.push(
-        `pause ${options?.turnHandling?.endpointing?.minDelay}/${options?.turnHandling?.endpointing?.maxDelay}`,
-      );
-    });
-    let say!: (text: string, final: boolean) => void;
-    const node = vi.spyOn(agentsVoice.Agent.prototype, 'sttNode').mockImplementation(
-      async () =>
-        new ReadableStream<stt.SpeechEvent>({
-          start(controller) {
-            say = (text, final) =>
-              controller.enqueue({
-                type: final ? stt.SpeechEventType.FINAL_TRANSCRIPT : stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                alternatives: [{ text, language: normalizeLanguage('en'), startTime: 0, endTime: 0, confidence: 1 }],
-              });
-          },
-        }),
-    );
-    try {
-      const out = (
-        (await agent.sttNode(new ReadableStream<AudioFrame>(), {} as never)) as ReadableStream<stt.SpeechEvent | string>
-      ).getReader();
-      const heard = async (text: string, final: boolean) => {
-        say(text, final);
-        const { value } = await out.read();
-        seen.push(`heard ${(value as stt.SpeechEvent).alternatives?.[0]?.text}`);
-      };
-      await heard('What time is it?', true);
-      await heard('in Lisbon', false);
-      await heard('Tell me.', true);
-      await heard('Скільки зараз?', true);
-      await heard('Thanks.', true);
-      // No pause sends while the turn waits for a spoken command: nothing to shorten.
-      sends = false;
-      await heard('Why?', true);
-      // The pause is set before the session sees the transcript that decides it.
-      expect(seen).toEqual([
-        'pause 1000/1000',
-        'heard What time is it?',
-        'pause 2500/2500',
-        'heard in Lisbon',
-        'heard Tell me.',
-        'pause 1000/1000',
-        'heard Скільки зараз?',
-        'pause 2500/2500',
-        'heard Thanks.',
-        'heard Why?',
-      ]);
-    } finally {
-      node.mockRestore();
-    }
-  });
-
   it('feeds the flush silence straight to the transcription, and numbers each stream it hears', async () => {
     const heard: Array<[string, boolean, number]> = [];
     const events: CallVoiceEvents = {

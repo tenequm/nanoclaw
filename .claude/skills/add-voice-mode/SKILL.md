@@ -514,16 +514,6 @@ that talks on the voice line, with no chat to hold the rest, closes with
 spoken during the call, replies and proactive ones alike, and the captions show
 what was spoken; the full text stays in the chat.
 
-It also reads `VOICE_QUESTION_SILENCE_MS` (default unset: off). Set it to a
-pause shorter than `VOICE_SILENCE_MS` (`1000` works) and a turn whose last
-final transcript ends in a question mark is sent after that much silence
-instead of the whole pause; more words, new speech or the turn going out bring
-the whole pause back, and the page's send countdown follows. Measured on the
-real path, a question then reaches the host about 1.45 s after the caller stops
-instead of 2.75 s. The cost: a question followed by a longer pause and more
-words ("Is it going to rain? ... I mean in Lisbon tomorrow.") goes out as two
-turns, the second as a follow-up while the agent works.
-
 It also reads `VOICE_WAKE_MODEL` and `VOICE_WAKE_THRESHOLD`, for the wake switch
 (see spoken commands below). `VOICE_WAKE_MODEL` is a wake word classifier `.onnx`
 in livekit-wakeword's format (default: the bundled

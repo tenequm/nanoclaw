@@ -306,15 +306,6 @@ export const CUT_LINES: Record<'chat' | 'no_chat', Record<CallLanguage, string>>
 /** A sentence end earlier than this share of the cap wastes the budget: the cut goes to a word instead. */
 const MIN_SENTENCE_CUT = 0.6;
 
-/**
- * VOICE_QUESTION_SILENCE_MS: a turn whose transcript ends in a question mark is sent after this much
- * silence instead of the whole pause. Off when unset, or when not shorter than the pause.
- */
-export function questionSilenceMs(raw: string | undefined, silenceMs: number): number | undefined {
-  const ms = Number(raw?.trim() || NaN);
-  return Number.isInteger(ms) && ms >= 300 && ms < silenceMs ? ms : undefined;
-}
-
 /** VOICE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default (no cap). */
 export function maxSpokenChars(raw: string | undefined): number {
   const value = raw?.trim();
@@ -711,7 +702,6 @@ export class TurnCapture {
 export class SendCountdown {
   private waits = 0;
   private shown = false;
-  private speechEndedAt = 0;
   private expiry?: ReturnType<typeof setTimeout>;
 
   constructor(
@@ -721,19 +711,13 @@ export class SendCountdown {
   ) {}
 
   /** The caller's speech ended at `speechEndedAt`; the turn goes out `silenceMs` after that. */
-  stopped(speechEndedAt: number, silenceMs = this.silenceMs): void {
-    const elapsed = Math.round(Math.max(0, Math.min(silenceMs, this.now() - speechEndedAt)));
+  stopped(speechEndedAt: number): void {
+    const elapsed = Math.round(Math.max(0, Math.min(this.silenceMs, this.now() - speechEndedAt)));
     this.shown = true;
-    this.speechEndedAt = speechEndedAt;
-    this.publish(`${++this.waits}:${elapsed}:${silenceMs}`);
+    this.publish(`${++this.waits}:${elapsed}:${this.silenceMs}`);
     clearTimeout(this.expiry);
-    this.expiry = setTimeout(() => this.clear(), silenceMs - elapsed + TURN_SETTLE_MS);
+    this.expiry = setTimeout(() => this.clear(), this.silenceMs - elapsed + TURN_SETTLE_MS);
     this.expiry.unref();
-  }
-
-  /** The closing silence that sends the turn is now `silenceMs` long: a countdown on show restarts with it. */
-  resize(silenceMs: number): void {
-    if (this.shown) this.stopped(this.speechEndedAt, silenceMs);
   }
 
   clear(): void {
@@ -2412,8 +2396,6 @@ export type CallJob = Pick<
 export interface VoiceSettings {
   geminiKey: string;
   record: boolean;
-  /** The shorter closing silence after a question (VOICE_QUESTION_SILENCE_MS); none when off. */
-  questionSilenceMs?: number;
   /** Where calls remember a speech model that failed (ttsDownSince); none, and every call tries it first. */
   ttsStateFile?: string;
 }
@@ -2701,7 +2683,6 @@ export function callSession(
     turnSpeechMs = 0;
     const turn = { audio: capture?.take(), sttModel: models.length > 0 ? models.join('+') : transcription.model };
     countdown.clear();
-    setQuick(false);
     handBack();
     return turn;
   };
@@ -2770,32 +2751,19 @@ export function callSession(
   let sttFailedAt = 0;
   let ttsFailures = 0;
   const reviewing = () => events.reviewing?.() ?? false;
-  const pausesSend = () => events.pausesSend?.() ?? !reviewing();
-  // A final transcript that ends in a question mark sends the turn after the shorter silence
-  // (VOICE_QUESTION_SILENCE_MS); more words, new speech or the turn going out bring the whole pause back.
-  const quickMs = settings.questionSilenceMs;
-  let quick = false;
-  function setQuick(on: boolean): void {
-    if (quickMs === undefined || on === quick) return;
-    quick = on;
-    const ms = on ? quickMs : meta.silenceMs;
-    session.updateOptions({ turnHandling: { endpointing: { minDelay: ms, maxDelay: ms } } });
-    countdown.resize(ms);
-  }
   session.on(voice.AgentSessionEventTypes.UserStateChanged, (ev) => {
     const speaking = ev.newState === 'speaking';
     if (speaking && agentSpeaking) events.onUnheardSpeech?.();
     if (speaking) {
       turnOpen = true;
       speakingSince = Date.now();
-      setQuick(false);
       countdown.clear();
     } else if (ev.oldState === 'speaking') {
       turnSpeechMs += Math.max(0, Date.now() - speakingSince - VAD_SILENCE_MS);
       // Speech heard under the agent's is not transcribed, so it sends nothing to count down to;
       // in review no pause sends anything.
-      if (turnOpen && !agentSpeaking && agentSpokeAt < speakingSince && pausesSend()) {
-        countdown.stopped(ev.createdAt - VAD_SILENCE_MS, quick ? quickMs : undefined);
+      if (turnOpen && !agentSpeaking && agentSpokeAt < speakingSince && (events.pausesSend?.() ?? !reviewing())) {
+        countdown.stopped(ev.createdAt - VAD_SILENCE_MS);
       }
     }
     capture?.onSpeaking(speaking);
@@ -2853,12 +2821,7 @@ export function callSession(
       capture?.push(frame);
       events.onAudio?.(frame);
     },
-    // Ahead of the session: the pause that ends this turn is set before the transcript reaches it.
-    (text, final, stream) => {
-      const words = text.trim();
-      if (words && !agentSpeaking && pausesSend()) setQuick(final && /[?？]$/u.test(words));
-      events.onTranscript?.(text, final, stream);
-    },
+    events.onTranscript?.bind(events),
   );
   return {
     session,
@@ -2994,7 +2957,6 @@ function defaultDeps(): RunCallDeps {
     'LIVEKIT_HOST_URL',
     'VOICE_RECORDINGS_DAYS',
     'VOICE_MAX_SPOKEN_CHARS',
-    'VOICE_QUESTION_SILENCE_MS',
     'VOICE_WAKE_MODEL',
     'VOICE_WAKE_THRESHOLD',
   ]);
@@ -3276,12 +3238,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     callVoice = await deps.createVoice(
       ctx,
       meta,
-      {
-        geminiKey,
-        record,
-        questionSilenceMs: questionSilenceMs(deps.env.VOICE_QUESTION_SILENCE_MS, meta.silenceMs),
-        ttsStateFile: path.join(DATA_DIR, 'voice-tts-state.json'),
-      },
+      { geminiKey, record, ttsStateFile: path.join(DATA_DIR, 'voice-tts-state.json') },
       {
         onTurn: (text, take) => {
           // An auto commit that lost the race to a switch: its words are already the review draft.
