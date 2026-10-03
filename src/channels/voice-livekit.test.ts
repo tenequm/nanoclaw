@@ -414,12 +414,12 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it("tells the page the worker's wake phrase before the call: the configured one, or null for hey <agent>", async () => {
     expect(wakePhrase({})).toBe('Hey LiveKit');
-    expect(wakePhrase({ VOICE_WAKE_MODEL: 'data/voice-models/my_model.onnx', VOICE_WAKE_PHRASE: '  Hey   Dan ' })).toBe(
-      'Hey Dan',
-    );
+    expect(
+      wakePhrase({ VOICE_WAKE_MODEL: 'data/voice-models/my_model.onnx', VOICE_WAKE_PHRASE: '  Hey   Casa ' }),
+    ).toBe('Hey Casa');
     for (const off of ['off', 'None', '0', 'false'])
-      expect(wakePhrase({ VOICE_WAKE_MODEL: off, VOICE_WAKE_PHRASE: 'Hey Dan' })).toBeNull();
-    for (const wakePhrase of ['Hey Dan', null]) {
+      expect(wakePhrase({ VOICE_WAKE_MODEL: off, VOICE_WAKE_PHRASE: 'Hey Casa' })).toBeNull();
+    for (const wakePhrase of ['Hey Casa', null]) {
       await h.stop();
       h = await startHarness({ wakePhrase });
       const info = await (await fetch(`${h.base}/info?t=tok123`)).json();

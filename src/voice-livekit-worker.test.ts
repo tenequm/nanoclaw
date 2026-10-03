@@ -1897,16 +1897,16 @@ describe('CallTurns, hands-free', () => {
     const h = turnsHarness();
     h.t.results.push(
       heard(
-        'а можеш мені розказати чим я закінчив з AI і фін проєктом AIFFIN? Scratch that.',
-        'А можеш мені розказати, чим я закінчив з AIFFIN проектом?',
+        'а можеш мені розказати чим я закінчив з проєктом Альфа? Scratch that.',
+        'А можеш мені розказати, чим я закінчив з Альфа проектом?',
       ),
     );
     await h.talk(2000);
-    await h.interim('а можеш мені розказати чим я закінчив з AI і фін проєктом AIFFIN?');
-    await h.interim('а можеш мені розказати чим я закінчив з AI і фін проєктом AIFFIN? Scratch that.');
+    await h.interim('а можеш мені розказати чим я закінчив з проєктом Альфа?');
+    await h.interim('а можеш мені розказати чим я закінчив з проєктом Альфа? Scratch that.');
     await h.pass(SILENCE);
     expect(h.out.sent).toEqual([]);
-    expect(h.out.drops).toEqual([['discarded', 'А можеш мені розказати, чим я закінчив з AIFFIN проектом?']]);
+    expect(h.out.drops).toEqual([['discarded', 'А можеш мені розказати, чим я закінчив з Альфа проектом?']]);
     // An interim command the final does not end like is not taken: the final's words win.
     h.t.results.push(heard('Remind me to send it.', 'Remind me to send it to Anna tomorrow.'));
     await h.talk(1500);
@@ -1928,7 +1928,7 @@ describe('CallTurns, hands-free', () => {
   });
 
   it('reads where a final ends by sound, across spellings and scripts', () => {
-    expect(endsLike('чим я закінчив з AIFFIN проектом?', 'чим я закінчив з AI і фін проєктом AIFFIN?')).toBe(true);
+    expect(endsLike('чим я закінчив з Альфа проектом?', 'чим я закінчив з проєктом Альфа?')).toBe(true);
     expect(endsLike('що саме там він питає?', 'і сказати, що саме там він питає?')).toBe(true);
     expect(endsLike('Send it to Anna tomorrow.', 'Remind me to')).toBe(false);
     expect(endsLike('Yes.', 'Yes')).toBe(false);
