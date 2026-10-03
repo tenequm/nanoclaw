@@ -681,6 +681,12 @@
 .voice-page[data-skin="te"] .transcript-box .is-streaming p:last-child::after { width: 0.55em; opacity: 0.9; }
 @keyframes caret { 50% { opacity: 0; } }
 .transcript-box p { margin: 0; }
+/* Interim caller text steps back until the transcription's final replaces it. */
+.bubble-you p { transition: opacity 0.2s ease-out; }
+.bubble-you.is-interim p { opacity: 0.6; }
+/* A turn's later caption pieces carry on under its first one's speaker row. */
+.voice-page .is-cont .bubble-you .speaker { display: none; }
+@media (prefers-reduced-motion: reduce) { .bubble-you p { transition: none; } }
 .ellipsis { color: var(--muted-foreground); }
 @media (prefers-reduced-motion: reduce) { .transcript-box .is-streaming p:last-child::after { animation: none; } }
 
