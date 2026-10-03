@@ -26,7 +26,7 @@ import { getChannelAdapter, getChannelDefaults, registerChannelAdapter } from '.
 import type { VoiceUiConfig } from './voice-call-page.js';
 import { resolveVoiceLine, type ResolveLineOptions, type VoiceLine } from './voice-line.js';
 import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-livekit.js';
-import { DEFAULT_VOICE_MIRROR, wakeWordPhrase } from './voice-livekit-protocol.js';
+import { DEFAULT_VOICE_MIRROR, wakePhrase } from './voice-livekit-protocol.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
@@ -173,7 +173,7 @@ export interface VoiceConfig {
   now?: () => number;
   /** Look of the browser call page; injected at serve time, no rebuild needed (VOICE_UI). */
   ui?: VoiceUiConfig;
-  /** The wake phrase the worker listens for (wakeWordPhrase); null: `hey <agent>`. Unset: the page is not told. */
+  /** The wake phrase the worker listens for (wakePhrase); null: `hey <agent>`. Unset: the page is not told. */
   wakePhrase?: string | null;
   maxCallDurationMs?: number;
   maxCallsPerHour?: number;
@@ -551,6 +551,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'VOICE_SILENCE_MS',
       'VOICE_MIRROR',
       'VOICE_WAKE_MODEL',
+      'VOICE_WAKE_PHRASE',
     ]);
     if (!env.VOICE_LINK_TOKEN) {
       if (env.LIVEKIT_URL) log.warn('voice: VOICE_LINK_TOKEN is not set; the channel stays offline');
@@ -572,7 +573,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       publicUrl: (env.VOICE_PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, ''),
       linkTokens,
       ui: parseUiConfig(env.VOICE_UI),
-      wakePhrase: wakeWordPhrase(env),
+      wakePhrase: wakePhrase(env),
       allowNonLoopback: env.VOICE_ALLOW_NON_LOOPBACK === '1',
       trustedProxyCidrs: env.VOICE_TRUSTED_PROXY_CIDRS,
       allowedClientCidrs: env.VOICE_ALLOWED_CLIENT_CIDRS,

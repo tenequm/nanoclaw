@@ -48,7 +48,6 @@ import { sameCallerAndAgent, type ResolveLineOptions, type VoiceLine } from './v
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_VOICE_SILENCE_MS,
-  DEFAULT_VOICE_STT_FALLBACK_MODEL,
   DEFAULT_VOICE_STT_MODEL,
   DEFAULT_VOICE_TTS_FALLBACK_MODEL,
   DEFAULT_VOICE_TTS_MODEL,
@@ -461,7 +460,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
   const speech = {
     sttModel: config.speech?.sttModel || DEFAULT_VOICE_STT_MODEL,
-    sttFallbackModel: fallbackModel(config.speech?.sttFallbackModel, DEFAULT_VOICE_STT_FALLBACK_MODEL),
+    // Deprecated: no default, and a worker that is still sent one logs that it ignores it.
+    sttFallbackModel: fallbackModel(config.speech?.sttFallbackModel, ''),
     ttsModel: config.speech?.ttsModel || DEFAULT_VOICE_TTS_MODEL,
     ttsFallbackModel: fallbackModel(config.speech?.ttsFallbackModel, DEFAULT_VOICE_TTS_FALLBACK_MODEL),
     ttsVoice: config.speech?.ttsVoice || DEFAULT_VOICE_TTS_VOICE,

@@ -79,6 +79,7 @@ src/channels/voice-call-page.ts
 src/channels/voice-livekit.ts
 src/channels/voice-livekit-protocol.ts
 src/voice-livekit-worker.ts
+src/voice-gemini-live.ts
 src/voice-wakeword.ts
 assets/voice-wakeword/melspectrogram.onnx
 assets/voice-wakeword/embedding_model.onnx
@@ -92,6 +93,7 @@ src/channels/voice-call-page.test.ts
 src/channels/voice-livekit.test.ts
 src/channels/voice-call-session.test.ts
 src/voice-livekit-worker.test.ts
+src/voice-gemini-live.test.ts
 src/voice-wakeword.test.ts
 src/voice-wakeword-fixtures/positive.wav
 src/voice-wakeword-fixtures/negative.wav
@@ -132,8 +134,9 @@ container/skills/voice-formatting/instructions.md
 
 ### 4. Build
 
-The channel uses `@livekit/agents`, `@livekit/agents-plugin-google` (Gemini
-transcription and speech), `@livekit/agents-plugin-silero` (Silero VAD on
+The channel uses `@livekit/agents` (the worker's job dispatch),
+`@livekit/agents-plugin-google` (Gemini speech; the transcription is the worker's
+own Gemini Live client), `@livekit/agents-plugin-silero` (Silero VAD on
 `onnxruntime-node`, whose npm package ships the CPU binaries for linux-x64 and
 macOS; its postinstall only fetches optional CUDA files and pnpm skips it),
 `@livekit/rtc-node`, `livekit-server-sdk` and `zod` (a peer of the agents
@@ -160,7 +163,7 @@ page check, and the integration tests (a fake LiveKit server behind the real
 webhook server, and the worker's turn-taking rules):
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/channels/voice-call-session.test.ts src/voice-livekit-worker.test.ts src/voice-wakeword.test.ts
+pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/channels/voice-call-session.test.ts src/voice-livekit-worker.test.ts src/voice-gemini-live.test.ts src/voice-wakeword.test.ts
 ```
 
 `voice-registration.test.ts` imports the real channel barrel and asserts the
@@ -502,10 +505,10 @@ to the worker with each call:
 
 | Key | Default | What |
 | --- | --- | --- |
-| `VOICE_STT_MODEL` | `gemini-3.5-transcribe-live` | Streams the caller's speech over the Gemini Live API while they talk, verbatim, with the language hints `uk-UA` and `en-US` and the line's vocabulary as custom vocabulary. |
-| `VOICE_STT_FALLBACK_MODEL` | `gemini-3.5-transcribe` | Unary transcription that takes over while the streaming model fails (LiveKit's STT `FallbackAdapter`). Its quota is small (on some tiers 10 requests a minute and 100 a day), so it sends nothing while the streaming model works, every request it makes is logged at warn, and the call goes back to the streaming model at the next pause once that recovers, or tries it again every minute. `off` for none (an empty value in `.env` reads as unset). |
+| `VOICE_STT_MODEL` | `gemini-3.5-transcribe-live` | Transcribes each caller turn over the Gemini Live API as it is spoken, as one manual activity (below), verbatim, with the language hints `uk-UA` and `en-US`, and the line's vocabulary plus the spoken commands as custom vocabulary. |
+| `VOICE_STT_FALLBACK_MODEL` | - | Deprecated and ignored: there is no unary fallback any more, and a call whose host still sends one logs that once. While the Live API fails, a turn with no text is lost (the caller hears "Sorry, I didn't catch that") and the next turn tries again. |
 | `VOICE_TTS_MODEL` | `gemini-3.8-flash-tts` | Speaks the agent's replies. |
-| `VOICE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Speaks when the main model fails (LiveKit's TTS `FallbackAdapter`, one retry each; a failed model is tried again every 30 seconds, and a main model that failed in a call during the last 10 minutes starts the next call on the fallback, so a model out of its daily quota does not cost every call's first reply a failed request; `data/voice-tts-state.json` holds that); `off` for none. |
+| `VOICE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Speaks when the main model fails before any audio of a line (a transient error is tried once more first); the main model is skipped for 30 seconds, then tried again on the next line. A failure after a line's audio started ends that line, never repeats it. `off` for none. |
 | `VOICE_TTS_VOICE` | `Alnilam` | Prebuilt Gemini voice, for both TTS models. |
 | `VOICE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
 | `VOICE_MIRROR` | `telegram` | Channel type of the default call chat, used until `/voice` picks one (see below); `off` keeps calls on the voice line until then. |
@@ -521,11 +524,15 @@ that talks on the voice line, with no chat to hold the rest, closes with
 spoken during the call, replies and proactive ones alike, and the captions show
 what was spoken; the full text stays in the chat.
 
-It also reads `VOICE_WAKE_MODEL` and `VOICE_WAKE_THRESHOLD`, for the wake switch
-(see spoken commands below). `VOICE_WAKE_MODEL` is a wake word classifier `.onnx`
-in livekit-wakeword's format (default: the bundled
-`assets/voice-wakeword/hey_livekit.onnx`; `off` for none); its file name is the
-phrase (`hey_jarvis_v0.1.onnx` listens for "hey jarvis"). openWakeWord's
+It also reads `VOICE_WAKE_MODEL`, `VOICE_WAKE_THRESHOLD` and `VOICE_WAKE_PHRASE`, for
+the wake switch (see spoken commands below). `VOICE_WAKE_MODEL` is a wake word
+classifier `.onnx` in livekit-wakeword's format, a path (default: the bundled
+`assets/voice-wakeword/hey_livekit.onnx`; `off` for none, and `hey <agent>` in the
+transcript opens a turn). `VOICE_WAKE_PHRASE` is what that model listens for, as the
+page shows it and the worker cuts it from the turn's text: `Hey LiveKit` by default,
+for the bundled model; set it whenever `VOICE_WAKE_MODEL` names your own classifier
+(`VOICE_WAKE_PHRASE="Hey Jarvis"`). It is shown as written, and the host reads it too,
+so the page names it before the call. It does not change what the model hears. openWakeWord's
 classifiers load too, but their pretrained models are CC BY-NC-SA 4.0
 (non-commercial): fine for your own install, never to be committed or shipped. `VOICE_WAKE_THRESHOLD` is the
 score (0 to 1) that counts as the wake word: by default 0.68, livekit-wakeword's
@@ -569,17 +576,25 @@ transcription and speech settings; nothing secret, since agents-js logs whole
 jobs on some paths) and returns a two-minute token that can only join that
 room, publish a microphone and subscribe. The worker waits for the caller,
 tells the host (the daily minutes are charged from here until the room ends)
-and starts its session, which publishes the agent's audio track. The worker
+and publishes the agent's audio track. The worker
 authenticates to the host with a per-call secret both derive from
-`LIVEKIT_API_SECRET`, so the worker needs that key too. The worker is a LiveKit
-Agents `AgentSession` with no LLM in it: VAD turns, streaming transcription,
-TTS, captions and the agent state are the framework's. Then:
+`LIVEKIT_API_SECRET`, so the worker needs that key too. The worker runs the call
+itself (LiveKit Agents only dispatches the job): it reads the caller's microphone at
+16 kHz, publishes the agent's speech, the captions (`lk.transcription`) and the agent
+state (`lk.agent.state`), and keeps the turns in one state machine. Then:
 
 - Silero VAD follows the caller's speech (VAD-only turn detection: LiveKit's
-  turn detector models have no Ukrainian). A turn survives pauses and ends
-  after `VOICE_SILENCE_MS` of silence.
-- The transcription streams while the caller talks, so the text is ready when
-  the turn ends; the page shows it as it comes. The worker posts the turn's
+  turn detector models have no Ukrainian). A turn opens at the caller's speech and
+  survives pauses; it ends after `VOICE_SILENCE_MS` of silence counted from the end
+  of their speech (Silero reports an end 550 ms into the silence, so that is the
+  shortest a turn can close in).
+- A turn is one Gemini Live activity on a socket of its own (manual activity:
+  `activityStart` with 500 ms of audio from before the speech, the caller's audio,
+  `activityEnd`), so a turn with thinking pauses is transcribed as one piece, never
+  as segments cut at the model's own pauses. The page shows the text as it comes.
+  The turn's text is the final transcript, or the last interim text when the final
+  collapsed to its last short phrase (3 words or fewer while the interim had more)
+  or never came within 3 seconds. Nothing is sent to Google outside a turn. The worker posts the turn's
   text to `/webhook/voice/livekit/agent/utterance`, and the host hands it to the
   agent in the line's call chat (below) as `<voice source="livekit">…</voice>`
   plus a line saying the reply is read aloud (depth matched to the question:
@@ -593,9 +608,9 @@ TTS, captions and the agent state are the framework's. Then:
   messages; with no call chat, every agent message for the line) goes to the
   worker complete over the host's event stream, and the agent's typing there is
   the worker's "thinking". The worker strips markdown, URLs and tags and speaks
-  it uninterruptibly (`session.say`), in full unless `VOICE_MAX_SPOKEN_CHARS` (above) caps it,
+  it uninterruptibly, in full unless `VOICE_MAX_SPOKEN_CHARS` (above) caps it,
   synthesized whole in one streamed TTS request (so a very long message waits
-  longer for its first audio).
+  longer for its first audio). Its caption shows as its audio starts.
   Replies never overlap, and a reply waits for a caller who is mid-turn (at most
   `VOICE_SILENCE_MS` plus ten seconds, then it takes the channel).
 - While the agent's audio plays, the caller is not transcribed (no barge-in).
@@ -777,21 +792,17 @@ with RPCs (`nanoclaw.voice.mode`, `.talk`, `.done`, `.send`, `.discard`; JSON
 request naming no mode only re-reads the state, as the page does after a
 reconnect or an unanswered request), so the caller's token may publish data. The
 worker answers them only from the caller's identity, one at a time, each for the
-draft id it names (a late or repeated one is "stale"), and closes agents-js's
-own session control topic (`lk.agent.session`), which the caller would
-otherwise reach. The worker sends every change of its `CallReviewState` (`{"seq",
+draft id it names (a late or repeated one is "stale"); it serves no other control
+to the caller (no typed turns, no interrupts). The worker sends every change of its `CallReviewState` (`{"seq",
 "mode", "draft": {"id", "state": "recording" | "finishing" | "ready" | "empty" |
 "failed", "text", "tooLong"?, "reason"?: "agent" | "switch"}, "preparing"?:
-true}`) on the topic `nanoclaw.voice.review`. In review the session's turn
-detection is manual and its input is off between recordings; after done the
-transcription gets silence until it has finalized what it heard (at most 4 s,
-past which the rest is unverified and the draft cannot be sent), and the draft's
-text is frozen from its final transcripts. Freezing or discarding an open draft
-clears the session's own turn, which restarts its transcription, and a new
-Gemini Live stream takes no audio until its setup completes: until then the
-state says `"preparing": true`, the page keeps talk off ("getting ready"), and
-the worker answers a talk only once the stream reads audio (at most 3 s), so the
-microphone never opens onto a stream that is still connecting. Send posts
+true}`) on the topic `nanoclaw.voice.review`. A recording is one transcription
+activity: talk sets its Gemini Live socket up first (meanwhile the state says
+`"preparing": true` and the page keeps talk off, "getting ready"), so the microphone
+never opens onto a socket that is still connecting; done ends it, and the draft's text
+(the final, or the last interim text when the final collapsed or never came) freezes
+within 4 s, or the draft fails. Pauses and spoken commands in a recording are words;
+nothing is posted until send. Send posts
 exactly that text through the ordinary turn path, and its `sending` status carries the text and the draft id, so the page
 shows that text as the turn. A draft over the 8 KB turn limit cannot be sent.
 A reply that waits out a recording (the usual bounded wait) takes the channel
@@ -804,49 +815,48 @@ the microphone muted. A quiet two-note cue says a draft is ready to read; a call
 that ends with a draft keeps it readable until discarded, never sent into the
 next call.
 
-**Spoken commands in auto.** On the final transcript (never interim text),
-`send it` at the end of an utterance sends the turn at once without the words,
-and `discard turn`, `discard this turn` or `scratch that` there drops everything
-since the last send; nothing is posted and the page marks those caption lines
-"discarded". `send it` is also taken as the transcription writes it from a
-Ukrainian speaker (`сенд іт`, `сендіт`, `сендит`, `сендип`, `sent it`, `send eat`, or a
-final cut to `send`), and the Ukrainian `прийом` sends too. (`over` was the send
-word before; it failed in Ukrainian sentences.) Only the end counts: `send it to
-Anna` is words, while a sentence that really ends in `send it` sends. A final that
-ends in a command while the caller still speaks waits for the pause; new words
-first make it words. A command with nothing to act on (also one said while the
-wake switch waits) plays the nope cue, and its line says "nothing to send" (or "nothing to discard").
-While the acoustic wake word waits, a stretch of speech is marked "ignored" a few seconds after its
-transcript: a wake word spotted just after it may make its words after the phrase the turn. A wake switch under the
-mode row, in a labelled "voice commands" block with a one-line explainer (`hey <agent>`, off by default, kept for the next call like the mode
-pick) holds everything until the caller says `hey <agent>`: the chip says
-`Say "hey <agent>"` on a dim outlined chip, speech before it is dropped (its lines show "ignored · no
-wake phrase", and a stretch with no words says nothing), and once it is heard the chip flashes
-and the line says "heard - listening", and after it only `send it`
-sends, unless the second switch ("a pause also sends", shown only with the first) lets the closing silence send
-too; after a send or a discard it waits again. The wake phrase is heard in the
-audio, not the transcript: while it waits, the worker scores the caller's audio
-with a wake word model (`VOICE_WAKE_MODEL`, by default livekit-wakeword's
-`hey livekit`, in a worker thread, 2 s windows every 80 ms), a score at or over
-`VOICE_WAKE_THRESHOLD` opens the turn (at most once in 2 s), and the switch and
-chip name that phrase (`say "hey livekit"`) instead of `hey <agent>` (the host reads
-`VOICE_WAKE_MODEL` too and tells the page before the call; the worker's own wins once
-it runs). The
-transcription restarts right after the window that had the phrase and first hears
-again the audio since then (a 10 s replay of its input), so no transcript of the turn
-has the phrase and no word after it is lost; the page shows the phrase's own caption,
-if one got through, dimmed as "wake phrase". If the transcription cannot restart, the
-phrase's words, however it spells them (`Hey, LiveKit`, `live kit`, `Лайвкіт`), are
-taken out of the next transcripts instead, with the words before them. A turn the
-phrase opened that hears nothing for `VOICE_WAKE_START_SECONDS`, or nothing more for
-`VOICE_WAKE_IDLE_SECONDS` after its last words, goes back to waiting: a soft falling
-cue plays, the page says "went back to sleep", and words it held are dropped as
-`asleep`, never sent. A final that ends in `send it` as a question (`Should I send
-it?`) is words, not a send. A turn the session commits while the transcription still
-owes words (speech or interim text after its last final) waits up to 2 s for them, so
-a late `scratch that` drops it and late words join it.
+**Spoken commands in auto.** `send it` at the end of what the caller said sends
+the turn at once without the words, and `discard turn`, `discard this turn` or
+`scratch that` there drops everything since the last send; nothing is posted and the
+page marks those caption lines "discarded". `send it` is also taken as the
+transcription writes it from a Ukrainian speaker (`сенд іт`, `сендіт`, `сендит`,
+`сендип`, `sent it`, `send eat`, or cut to `send`), and the Ukrainian `прийом` sends
+too. The commands are in the transcription's custom vocabulary (it hears them far
+more reliably so). A command is noticed in the interim text: when two interim updates
+in a row end with it and the caller is silent (the VAD's end of speech), the turn's
+activity ends, and its final text decides: a command it still ends with acts, one it
+does not end with (the interim text was ahead of itself) was words, and the turn goes
+on in a new activity carrying them, as it does when the caller talks on before the
+final comes. Only the end counts: `send it to Anna` is words, and so is a question
+ending in it (`Should I send it?`). A pause that ends a turn whose final text ends in
+a command applies it too. A command with nothing to act on plays the nope cue, and its
+line says "nothing to send" (or "nothing to discard"). A wake switch under the mode
+row, in a labelled "voice commands" block with a one-line explainer (on by default,
+kept for the next call like the mode pick; the worker starts with it on until the
+page's settings arrive), holds everything until the wake phrase: the chip says
+`Say "<phrase>"` on a dim outlined chip, and once it is heard the chip flashes and the
+line says "heard - listening", and after it only `send it` sends, unless the second
+switch ("a pause also sends", shown only with the first) lets the closing silence send
+too; after a send or a discard it waits again. The wake phrase is heard in the audio,
+not the transcript: while it waits, nothing goes to Google; the worker scores the
+caller's audio with the wake word model (`VOICE_WAKE_MODEL`, by default livekit-wakeword's
+`hey_livekit`, in a worker thread, 2 s windows every 80 ms; `VOICE_WAKE_PHRASE` names
+it), a score at or over `VOICE_WAKE_THRESHOLD` opens the turn (at most once in 2 s),
+and the switch and chip name that phrase. The turn's activity starts with the 2 s
+window that had the phrase and 300 ms before it (the window ends where scoring
+stopped, not where the phrase did, so no word after it is lost), and the phrase's
+words, however the transcription spells them (`Hey, LiveKit`, `live kit`,
+`Лайвкіт`), are cut from the start of the turn's text with whatever came before
+them. Speech before the phrase is not transcribed at all, so it shows no caption. A
+turn the phrase opened that hears nothing for `VOICE_WAKE_START_SECONDS`, or nothing
+more for `VOICE_WAKE_IDLE_SECONDS` after its last words, goes back to waiting: its
+final is read first (a `send it` the interim text missed still sends then, late), else
+a soft falling cue plays, the page says "went back to sleep", and words it held are
+dropped as `asleep`, never sent.
 Only without a model (`off`, or one that does not load) does `hey <agent>` in the
-transcript open the turn: `<agent>` is then the agent's name or any entry in its
+transcript open the turn, and then speech before it is transcribed (each stretch is
+an activity; words with no wake phrase are marked "ignored · no wake phrase"):
+`<agent>` is then the agent's name or any entry in its
 `voice.vocabulary.txt`, matched across case, punctuation and Latin/Cyrillic
 spelling (`Hey, Andy.`, `гей Енді`, `хей Енді`, `hi Andy`, `хай Енді`, a name
 glued to the hey as in `Heyandy`, and in Cyrillic a Ukrainian vocative ending, as
@@ -858,8 +868,8 @@ takes the switches in the `nanoclaw.voice.settings` RPC (`{"wake", "pauseSends",
 "cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase", "heard",
 "slept", "cut"}` (`phrase` only with a wake word model, from the start while it loads;
 `heard` counts the wake phrases heard, so the page marks "heard - listening" even when
-it missed the awake state; `slept` counts the turns that went back to waiting; `cut`:
-the last wake restarted the transcription past the phrase), and dropped words go out
+it missed the awake state; `slept` counts the turns that went back to waiting; `cut`
+is no longer set: the phrase's words are cut from the text, not the audio), and dropped words go out
 on the turn topic as `{"dropped": "discarded" | "unaddressed" | "command" | "asleep",
 "text"}`. The agent's own speech is never transcribed, so it
 cannot trigger a command; caller speech that starts under it sends

@@ -38,6 +38,7 @@ import {
   CALL_THINKING_ATTRIBUTE,
   CALL_TURN_TOPIC,
   CALL_UPDATING_ATTRIBUTE,
+  wakePhrase,
 } from './voice-livekit-protocol.js';
 import { stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './voice-call-page.js';
@@ -416,8 +417,14 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect((await fetch(`${h.base}/info?t=tok123`)).status).toBe(403);
   });
 
-  it("tells the page the worker's wake phrase before the call: the model's, or null for hey <agent>", async () => {
-    for (const wakePhrase of ['hey livekit', null]) {
+  it("tells the page the worker's wake phrase before the call: the configured one, or null for hey <agent>", async () => {
+    expect(wakePhrase({})).toBe('Hey LiveKit');
+    expect(wakePhrase({ VOICE_WAKE_MODEL: 'data/voice-models/my_model.onnx', VOICE_WAKE_PHRASE: '  Hey   Dan ' })).toBe(
+      'Hey Dan',
+    );
+    for (const off of ['off', 'None', '0', 'false'])
+      expect(wakePhrase({ VOICE_WAKE_MODEL: off, VOICE_WAKE_PHRASE: 'Hey Dan' })).toBeNull();
+    for (const wakePhrase of ['Hey Dan', null]) {
       await h.stop();
       h = await startHarness({ wakePhrase });
       const info = await (await fetch(`${h.base}/info?t=tok123`)).json();
@@ -492,7 +499,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       // The agent's own spellings of its name, for the wake phrase.
       wakeNames: ['Енді'],
       sttModel: 'gemini-3.5-transcribe-live',
-      sttFallbackModel: 'gemini-3.5-transcribe',
+      sttFallbackModel: '',
       ttsModel: 'gemini-3.8-flash-tts',
       ttsFallbackModel: 'gemini-3.8-flash-lite-tts',
       ttsVoice: 'Alnilam',

@@ -4,7 +4,6 @@
  * imports it, and must not load the host's database and channel modules.
  */
 import { createHmac } from 'node:crypto';
-import path from 'node:path';
 
 export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice';
 
@@ -21,10 +20,8 @@ export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
  */
 export const LIVEKIT_PROTOCOL_VERSION = 4;
 
-/** Streaming transcription over the Gemini Live API, verbatim. */
+/** Transcription over the Gemini Live API, verbatim, one manual activity per caller turn. */
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
-/** Unary transcription, used only while the streaming model fails: its quota is small. */
-export const DEFAULT_VOICE_STT_FALLBACK_MODEL = 'gemini-3.5-transcribe';
 export const DEFAULT_VOICE_TTS_MODEL = 'gemini-3.8-flash-tts';
 export const DEFAULT_VOICE_TTS_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
 export const DEFAULT_VOICE_TTS_VOICE = 'Alnilam';
@@ -50,7 +47,7 @@ export interface LiveKitJobMetadata {
    */
   wakeNames?: string[];
   sttModel: string;
-  /** Takes over while `sttModel` fails; empty for none. */
+  /** Deprecated and ignored (there is no unary fallback any more); kept for the wire format, empty by default. */
   sttFallbackModel: string;
   ttsModel: string;
   /** Takes over while `ttsModel` fails; empty for none. */
@@ -197,33 +194,31 @@ export interface CallWakeState {
   /** How many times this call an open turn went back to waiting because nothing more was said; grows on every one. */
   slept?: number;
   /**
-   * The last wake phrase restarted the transcription right after it: no transcript of the turn has
-   * the phrase, and the caption line it was heard on is the phrase alone, never part of the turn.
+   * From an older worker: the last wake phrase restarted the transcription right after it, so the
+   * caption line it was heard on is the phrase alone. The current worker cuts the phrase from the
+   * turn's text instead, and never sets it.
    */
   cut?: boolean;
 }
 
+/** The phrase the bundled wake word model (livekit-wakeword's `hey_livekit`) listens for. */
+export const DEFAULT_WAKE_PHRASE = 'Hey LiveKit';
+
 /**
- * The phrase VOICE_WAKE_MODEL makes the worker listen for, as its wake word spotter names it: the
- * classifier's file name (`hey_livekit.onnx`, the bundled default, says `hey livekit`); null when
- * it is `off`, and `hey <agent>` in the transcript opens a turn. The host tells the page before a
- * call; during one the worker's CallWakeState.phrase wins (a model that fails to load has none).
+ * The wake phrase the page names: VOICE_WAKE_PHRASE, which says what the VOICE_WAKE_MODEL classifier
+ * listens for (`Hey LiveKit`, the bundled model's, when unset; shown as written); null when VOICE_WAKE_MODEL is `off`,
+ * and `hey <agent>` in the transcript opens a turn. The host tells the page before a call, the worker
+ * during one (CallWakeState.phrase; none while a model that failed to load leaves `hey <agent>`).
  */
-export function wakeWordPhrase(env: { VOICE_WAKE_MODEL?: string }): string | null {
-  const model = env.VOICE_WAKE_MODEL?.trim();
-  if (model && /^(off|none|0|false)$/i.test(model)) return null;
-  return (model ? path.basename(model) : 'hey_livekit.onnx')
-    .replace(/(\.int8)?\.onnx$/i, '')
-    .replace(/[_-]v\d+(\.\d+)*$/i, '')
-    .replace(/[_-]+/g, ' ')
-    .trim();
+export function wakePhrase(env: { VOICE_WAKE_MODEL?: string; VOICE_WAKE_PHRASE?: string }): string | null {
+  if (/^(off|none|0|false)$/i.test(env.VOICE_WAKE_MODEL?.trim() ?? '')) return null;
+  return env.VOICE_WAKE_PHRASE?.trim().replace(/\s+/g, ' ') || DEFAULT_WAKE_PHRASE;
 }
 
 /**
  * The worker's review state; `seq` grows with every change, so the page keeps the newest.
- * `preparing`: a draft froze or was discarded, which restarts the transcription, and the restarted
- * stream takes no audio yet; talk answers once it does (at most a few seconds), so the page keeps
- * talk off meanwhile. Absent from an older worker, whose talk never waits.
+ * `preparing`: talk is setting up the recording's transcription; it answers once that can take audio
+ * (at most a few seconds), so the page keeps talk off meanwhile. Absent from an older worker.
  */
 export interface CallReviewState {
   seq: number;

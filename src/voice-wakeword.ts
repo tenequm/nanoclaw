@@ -47,16 +47,6 @@ const windowSamples = (embeddings: number): number =>
 const WAKE_MODEL_DIR = fileURLToPath(new URL('../assets/voice-wakeword/', import.meta.url));
 export const DEFAULT_WAKE_MODEL = path.join(WAKE_MODEL_DIR, 'hey_livekit.onnx');
 
-/** The phrase a classifier listens for, from its file name: `hey_livekit.onnx` and `hey_jarvis_v0.1.onnx` say it. */
-export function wakePhraseOf(modelPath: string): string {
-  return path
-    .basename(modelPath)
-    .replace(/(\.int8)?\.onnx$/i, '')
-    .replace(/[_-]v\d+(\.\d+)*$/i, '')
-    .replace(/[_-]+/g, ' ')
-    .trim();
-}
-
 const sessionOptions: ort.InferenceSession.SessionOptions = {
   executionProviders: ['cpu'],
   // One core per model: the call's own work (VAD, audio, transcription) needs the rest.
@@ -213,14 +203,17 @@ if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
 export interface WakeWordOptions {
   /** The classifier .onnx; the feature models come from `featureDir`. */
   classifier: string;
+  /** What the classifier listens for, as the page names it (VOICE_WAKE_PHRASE). */
+  phrase: string;
   featureDir?: string;
   threshold: number;
   debounceMs?: number;
   /**
-   * A detection: its score, and how much audio (samples) came in after the window that had the
-   * phrase, by the time it was scored: the caller's words after the phrase start that far back.
+   * A detection: its score, and the window that had the phrase, as positions in the audio pushed so
+   * far (samples; `end` exclusive). Its end is where scoring stopped, not where the phrase did: the
+   * caller's next words may already be in it.
    */
-  onDetect(score: number, after: number): void;
+  onDetect(score: number, window: { start: number; end: number }): void;
   /** The thread failed after it loaded: no more detections. */
   onError?(err: string): void;
   now?: () => number;
@@ -276,7 +269,7 @@ export class WakeWordSpotter {
 
   constructor(options: WakeWordOptions) {
     this.options = options;
-    this.phrase = wakePhraseOf(options.classifier);
+    this.phrase = options.phrase;
     this.threshold = options.threshold;
     this.now = options.now ?? (() => Date.now());
     this.debounceMs = options.debounceMs ?? WAKE_DEBOUNCE_MS;
@@ -402,7 +395,7 @@ export class WakeWordSpotter {
       this.sinceScore = 0;
       this.queued = [];
       this.validFrom = this.nextId;
-      this.options.onDetect(score, this.position - this.inflightEnd);
+      this.options.onDetect(score, { start: Math.max(0, this.inflightEnd - this.ring.length), end: this.inflightEnd });
     }
     const next = this.queued.shift();
     if (next && !this.closed) this.send(next);
