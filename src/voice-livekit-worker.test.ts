@@ -2446,7 +2446,13 @@ describe('acoustic wake word', () => {
     expect(at('Hi Lifekit')).toEqual(['', '']);
     // The name without a hey before it is the phrase too: the audio already said it was spoken.
     expect(at('LiveKit, book a table')).toEqual(['', ', book a table']);
-    expect(at('Hey, look at it')).toBeNull();
+    // Opening with hey, the words after it may be further off: the audio decided already.
+    expect(at('Hey, little kid, remind me to buy milk')).toEqual(['', ', remind me to buy milk']);
+    expect(at("Hey, you've got. What is the capital of France?")).toEqual(['', '. What is the capital of France?']);
+    expect(at('Hey, look at it')).toEqual(['', ' it']);
+    expect(at('Hey, what is the capital of France?')).toBeNull();
+    expect(at('Hey, call me back')).toBeNull();
+    expect(at('So, hey, little kid')).toBeNull();
     expect(at('we live in a kit house')).toBeNull();
     // Another model's phrase, by its file name.
     expect(matchWakeText('Hey Jarvis, lights', 'hey jarvis')).toEqual({ start: 0, end: 10 });

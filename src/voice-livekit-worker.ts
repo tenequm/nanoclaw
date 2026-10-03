@@ -1329,15 +1329,33 @@ const consonantSkeleton = (word: string): string =>
     .replace(/[aeiouy]/g, '')
     .replace(/[fw]/g, 'v')
     .replace(/d/g, 't')
+    .replace(/g/g, 'k')
+    .replace(/b/g, 'p')
+    .replace(/z/g, 's')
     .replace(/(.)\1+/g, '$1');
 
 /** Words a transcript may put before the spotted phrase's name, as part of the phrase. */
 const WAKE_LEADS = new Set([...WAKE_WORDS, 'hi', 'hay']);
 
+/** Edits between two strings (Levenshtein). */
+function editDistance(a: string, b: string): number {
+  let row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const next = [i];
+    for (let j = 1; j <= b.length; j++) {
+      next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    row = next;
+  }
+  return row[b.length];
+}
+
 /**
  * Where an acoustic wake phrase (`hey livekit`) sits in a transcript, however the transcription
  * spelled its name: the name's consonants in one to three words, with a `hey` before it. Only used
- * right after the audio said the phrase was spoken, so it can be lenient.
+ * right after the audio said the phrase was spoken, so it can be lenient: a text that opens with
+ * `hey` loses it and the one to three words after it when their consonants are near the name's and
+ * end as its do (`Hey, little kid`, `Hey, you've got`).
  */
 export function matchWakeText(text: string, phrase: string): { start: number; end: number } | null {
   const phraseWords = spokenWords(phrase).map((w) => w.word);
@@ -1355,7 +1373,19 @@ export function matchWakeText(text: string, phrase: string): { start: number; en
       return { start: words[lead ? i - 1 : i].start, end: words[k].end };
     }
   }
-  return null;
+  if (!fuzzy || words.length < 2 || !WAKE_LEADS.has(words[0].word)) return null;
+  const allowed = Math.floor(skeleton.length / 2);
+  let best: { end: number; distance: number } | null = null;
+  let joined = '';
+  for (let k = 1; k < Math.min(words.length, 4); k++) {
+    joined += words[k].word;
+    const said = consonantSkeleton(joined);
+    // Near, and ending as the name does: `what` is not `livekit`, `you've got` may be.
+    if (!said.endsWith(skeleton.slice(-2))) continue;
+    const distance = editDistance(said, skeleton);
+    if (distance <= allowed && (!best || distance < best.distance)) best = { end: words[k].end, distance };
+  }
+  return best && { start: words[0].start, end: best.end };
 }
 
 export type SpokenCommand = 'over' | 'discard';
