@@ -7,8 +7,9 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { getEventListeners } from 'node:events';
 
-import { AgentServer, InferenceRunner, initializeLogger, ServerOptions } from '@livekit/agents';
+import { AgentServer, InferenceRunner, initializeLogger, ServerOptions, VADEventType } from '@livekit/agents';
 import { AudioFrame } from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -58,6 +59,9 @@ import {
   wakeWordSettings,
   awakeLimits,
   endsLike,
+  Outbox,
+  CallerInput,
+  type VadStream,
   type WakeWord,
   type WakeWordEvents,
   TURN_CUE_DELAY_MS,
@@ -1451,8 +1455,10 @@ function fakeSpeech(
   let calls = 0;
   const said: string[] = [];
   const model: SpeechModel = {
-    synthesize(text: string) {
+    synthesize(text: string, _conn?: unknown, abortSignal?: AbortSignal) {
       said.push(text);
+      // As the plugin's ChunkedStream does: a one-shot listener on the signal it is given, never removed.
+      abortSignal?.addEventListener('abort', () => undefined, { once: true });
       const { chunks = 0, error } = plan(text, ++calls);
       const stream = {
         error: undefined as Error | undefined,
@@ -1545,6 +1551,43 @@ describe('speech output', () => {
     await expect(speak(second, 'Long line.')).rejects.toThrow('cut');
     expect(partial.said).toEqual(['Long line.']);
     expect(fallback.said).toEqual([]);
+  });
+
+  it('a model that stalls before audio is closed and the fallback speaks; finished requests leave no listener on the call signal', async () => {
+    vi.useFakeTimers();
+    let closed = 0;
+    const stalled: SpeechModel = {
+      synthesize: () => ({
+        error: undefined,
+        close: () => void closed++,
+        async *[Symbol.asyncIterator]() {
+          await new Promise(() => undefined);
+          yield* [];
+        },
+      }),
+      on: () => undefined,
+    };
+    const fallback = fakeSpeech(() => ({ chunks: 2 }));
+    const speech = new GeminiSpeech({
+      apiKey: 'k',
+      model: 'a',
+      fallbackModel: 'b',
+      voice: 'v',
+      log: silentLog,
+      create: (m) => (m === 'a' ? stalled : fallback.model),
+    });
+    const call = new AbortController();
+    const chunks: Int16Array[] = [];
+    const done = (async () => {
+      for await (const pcm of speech.speak('One.', call.signal)) chunks.push(pcm);
+    })();
+    await vi.advanceTimersByTimeAsync(60_000);
+    await done;
+    expect(closed).toBe(1);
+    expect(chunks).toHaveLength(2);
+    expect(fallback.said).toEqual(['One.']);
+    for (let i = 0; i < 5; i++) for await (const _ of speech.speak('Again.', call.signal));
+    expect(getEventListeners(call.signal, 'abort')).toHaveLength(0);
   });
 
   it('throws when no model speaks', async () => {
@@ -2145,6 +2188,97 @@ describe('CallTurns, wake', () => {
   });
 });
 
+/** Review mode over a real CallTurns (turnsHarness): what the page sees and what was posted. */
+function reviewOverTurns(h: ReturnType<typeof turnsHarness>) {
+  const states: CallReviewState[] = [];
+  const posted: string[] = [];
+  const control = new ReviewControl({
+    voice: {
+      get turnOpen() {
+        return h.turns.turnOpen;
+      },
+      setReviewing: (on) => h.turns.setReviewing(on),
+      prepare: () => h.turns.prepare(),
+      record: () => h.turns.record(),
+      stopRecording: () => h.turns.stopRecording(),
+      dropRecording: () => h.turns.dropRecording(),
+      publishReview: (state) => void states.push(state),
+    },
+    post: (text) => posted.push(text),
+    lastPosted: () => posted.length,
+    setCaptureOpen: () => undefined,
+    resetCaller: () => undefined,
+    sttModel: 'model',
+    log: silentLog,
+  });
+  let gen = 0;
+  return {
+    control,
+    states,
+    posted,
+    op: (op: ReviewOp, f: Partial<ReviewRequest> = {}) => control.handle(op, { gen: ++gen, ...f }),
+  };
+}
+
+describe('CallTurns, finalizing turns and the switch to Manual', () => {
+  it('a switch while a pause-ended turn finalizes makes it the draft, never a POST', async () => {
+    const h = turnsHarness();
+    const r = reviewOverTurns(h);
+    h.t.hold = true;
+    h.t.results.push(heard('Book a table.', 'Book a table.'));
+    await h.talk(1000);
+    await h.pass(SILENCE);
+    expect(h.t.ended).toBe(1);
+    expect(await r.op('mode', { mode: 'review' })).toMatchObject({ ok: true });
+    expect(r.states.at(-1)?.draft).toMatchObject({ state: 'finishing', reason: 'switch' });
+    h.t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual([]);
+    expect(r.states.at(-1)?.draft).toMatchObject({ state: 'ready', text: 'Book a table.', reason: 'switch' });
+  });
+
+  it('a switch while a spoken command is confirmed keeps the words as the draft', async () => {
+    const h = turnsHarness();
+    const r = reviewOverTurns(h);
+    h.t.hold = true;
+    h.t.results.push(heard('Book a table. Send it.', 'Book a table. Send it.'));
+    await h.talk(1000);
+    await h.interim('Book a table. Send it.');
+    await h.interim('Book a table. Send it.');
+    expect(h.turns.turnOpen).toBe(true);
+    await r.op('mode', { mode: 'review' });
+    h.t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual([]);
+    expect(r.posted).toEqual([]);
+    expect(r.states.at(-1)?.draft).toMatchObject({ state: 'ready', text: 'Book a table. Send it.' });
+  });
+
+  it('speech after a command waits for the earlier words: one turn, in order, sent once', async () => {
+    const h = turnsHarness();
+    h.t.hold = true;
+    h.t.results.push(heard('Remind me to send it', 'Remind me to send it.'));
+    await h.talk(1500);
+    await h.interim('Remind me to send it');
+    await h.interim('Remind me to send it');
+    expect(h.t.ended).toBe(1);
+    // The caller goes on and confirms another send while the first part is still being finalized.
+    h.t.hold = false;
+    h.t.results.push(heard('to Anna tomorrow. Send it.', 'to Anna tomorrow. Send it.'));
+    await h.talk(1500);
+    await h.interim('to Anna tomorrow. Send it.');
+    await h.interim('to Anna tomorrow. Send it.');
+    expect(h.t.ended).toBe(2);
+    expect(h.out.sent).toEqual([]);
+    h.t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual(['Remind me to send it. to Anna tomorrow.']);
+    expect(h.turns.turnOpen).toBe(false);
+    await h.pass(SILENCE + 500);
+    expect(h.t.begins).toHaveLength(2);
+  });
+});
+
 describe('CallTurns, review', () => {
   it('an open auto turn becomes the switch draft; a recording is words, commands included', async () => {
     const h = turnsHarness();
@@ -2252,6 +2386,97 @@ describe('cue audio', () => {
     await feed.running;
     expect(errors).toHaveLength(1);
     await feed.play(cueFrames('sent'));
+  });
+});
+
+describe('room output and the caller input', () => {
+  it('publishes in order, replaces a waiting interim with a newer one, and ends the call on a stuck publication', async () => {
+    vi.useFakeTimers();
+    const stuck: string[] = [];
+    const sent: string[] = [];
+    const outbox = new Outbox((what) => void stuck.push(what), { warn: () => undefined, error: () => undefined });
+    let release!: () => void;
+    outbox.post('first', () => new Promise<void>((r) => (release = () => (sent.push('first'), r()))));
+    outbox.post('interim', async () => void sent.push('interim 1'), 'caption 1');
+    outbox.post('interim', async () => void sent.push('interim 2'), 'caption 1');
+    outbox.post('final', async () => void sent.push('final'));
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual(['first', 'interim 2', 'final']);
+    outbox.post('stuck', () => new Promise(() => undefined));
+    outbox.post('status', async () => void sent.push('status'));
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(stuck).toEqual(['stuck']);
+    expect(sent).toEqual(['first', 'interim 2', 'final']);
+    // A room that took nothing for a while is stuck too: the queue does not grow without bound.
+    const full = new Outbox(
+      (what) => void stuck.push(what),
+      { warn: () => undefined, error: () => undefined },
+      60_000,
+      3,
+    );
+    for (let i = 0; i < 5; i++) full.post(`update ${i}`, () => new Promise(() => undefined));
+    expect(stuck).toEqual(['stuck', 'update 4']);
+  });
+
+  it('a microphone track that ends mid-speech ends the speech; the next track gets a fresh VAD on the same positions', async () => {
+    const streams: Array<{ push: (ev: unknown) => void; frames: number; closed: boolean }> = [];
+    const newVad = () => {
+      const events: unknown[] = [];
+      let wake: (() => void) | undefined;
+      const entry = { push: (ev: unknown) => (events.push(ev), wake?.()), frames: 0, closed: false };
+      streams.push(entry);
+      return {
+        pushFrame: () => void entry.frames++,
+        close: () => ((entry.closed = true), wake?.()),
+        async *[Symbol.asyncIterator]() {
+          for (;;) {
+            if (events.length) yield events.shift() as never;
+            else if (entry.closed) return;
+            else await new Promise<void>((r) => (wake = r));
+          }
+        },
+      } as unknown as VadStream;
+    };
+    const speech: Array<[boolean, number]> = [];
+    const input = new CallerInput(
+      newVad,
+      { onAudio: () => undefined, onSpeech: (on, at) => void speech.push([on, at]), onClosed: () => undefined },
+      { error: () => undefined },
+    );
+    const frame = () => input.frame(new AudioFrame(new Int16Array(320), 16_000, 1, 320));
+    for (let i = 0; i < 50; i++) frame();
+    streams[0].push({
+      type: VADEventType.START_OF_SPEECH,
+      samplesIndex: 16_000,
+      speechDuration: 200,
+      silenceDuration: 0,
+    });
+    await flush();
+    expect(speech).toEqual([[true, 16_000 - 3_200]]);
+    input.ended();
+    expect(speech).toEqual([
+      [true, 12_800],
+      [false, 16_000],
+    ]);
+    // The old VAD's late events are ignored; the new track's positions continue the call's.
+    streams[0].push({
+      type: VADEventType.END_OF_SPEECH,
+      samplesIndex: 30_000,
+      speechDuration: 0,
+      silenceDuration: 600,
+    });
+    for (let i = 0; i < 50; i++) frame();
+    streams[1].push({
+      type: VADEventType.START_OF_SPEECH,
+      samplesIndex: 8_000,
+      speechDuration: 100,
+      silenceDuration: 0,
+    });
+    await flush();
+    expect(streams[0].closed).toBe(true);
+    expect(speech.at(-1)).toEqual([true, 16_000 + 8_000 - 1_600]);
+    expect(speech).toHaveLength(3);
   });
 });
 

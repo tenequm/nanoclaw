@@ -326,7 +326,7 @@ export interface SpeechModel {
     text: string,
     connOptions?: APIConnectOptions,
     abortSignal?: AbortSignal,
-  ): AsyncIterable<{ frame: AudioFrame }> & { readonly error?: Error };
+  ): AsyncIterable<{ frame: AudioFrame }> & { readonly error?: Error; close?(): void };
   on(event: 'error', listener: (ev: unknown) => void): unknown;
 }
 
@@ -370,17 +370,32 @@ export class GeminiSpeech {
       for (let attempt = 0; attempt < 2; attempt++) {
         if (signal.aborted) return;
         let spoke = false;
+        let error: Error | undefined;
+        // Each request has its own abort: the call's signal is forwarded and let go after it, so no
+        // finished request stays referenced from the call-long signal.
+        const request = new AbortController();
+        const forward = () => request.abort();
+        signal.addEventListener('abort', forward, { once: true });
         const stream = this.model(name).synthesize(
           line,
           { maxRetry: 0, retryIntervalMs: 0, timeoutMs: TTS_IDLE_TIMEOUT_MS },
-          signal,
+          request.signal,
         );
-        for await (const audio of withIdleTimeout(stream, TTS_IDLE_TIMEOUT_MS)) {
-          spoke = true;
-          yield audio.frame.data;
+        try {
+          for await (const audio of withIdleTimeout(stream, TTS_IDLE_TIMEOUT_MS)) {
+            spoke = true;
+            yield audio.frame.data;
+          }
+          error = stream.error ?? (spoke ? undefined : new Error(`speech model ${name} sent no audio`));
+        } catch (err) {
+          // A stall (or a throwing stream) is a failure like any other: before audio the next model speaks.
+          error = err instanceof Error ? err : new Error(String(err));
+        } finally {
+          signal.removeEventListener('abort', forward);
+          request.abort();
+          stream.close?.();
         }
         if (signal.aborted) return;
-        const error = stream.error ?? (spoke ? undefined : new Error(`speech model ${name} sent no audio`));
         if (!error) {
           this.markUp(name);
           return;
@@ -433,10 +448,7 @@ async function* withIdleTimeout<T>(stream: AsyncIterable<T>, ms: number): AsyncG
     let timer: ReturnType<typeof setTimeout> | undefined;
     const stalled = new Promise<'stalled'>((resolve) => (timer = setTimeout(() => resolve('stalled'), ms)));
     const next = await Promise.race([it.next(), stalled]).finally(() => clearTimeout(timer));
-    if (next === 'stalled') {
-      await it.return?.();
-      throw new Error(`speech stalled: no audio for ${ms} ms`);
-    }
+    if (next === 'stalled') throw new Error(`speech stalled: no audio for ${ms} ms`);
     if (next.done) return;
     yield next.value;
   }
@@ -1599,8 +1611,12 @@ interface OpenTurn {
   lastSpeechEnd: number;
   /** Where its audio starts in the stream. */
   from: number;
-  /** Set while it finalizes: the caller spoke again (its command is words), or a switch took it (its draft). */
-  resumed?: boolean;
+  /**
+   * Set while it finalizes: the caller spoke again after its command, so the next activity carries its
+   * text (`handOff`, which that activity awaits as `before`), or a switch to review took it (its draft).
+   */
+  handOff?: (said: string) => void;
+  before?: Promise<string>;
   switched?: (recording: Recording) => void;
 }
 
@@ -1682,7 +1698,10 @@ export class CallTurns {
   private reviewing = false;
   private turn?: OpenTurn;
   /** An auto turn finalizing after a command: speech now continues it. */
-  private draining?: { turn: OpenTurn; endedAt: number };
+  /** An auto turn for the agent whose activity ended and whose text is not acted on yet; `command`: a spoken one ended it. */
+  private finalizing?: { turn: OpenTurn; endedAt: number; command: boolean };
+  /** What `hold` last said. */
+  private holding = false;
   private speaking = false;
   private speechFrom = 0;
   private agentSpeaking = false;
@@ -1724,7 +1743,7 @@ export class CallTurns {
 
   /** Nothing is kept until the wake phrase. */
   get waiting(): boolean {
-    return this.wake && !this.turnOpen && !this.draining;
+    return this.wake && !this.turnOpen;
   }
 
   /** Waiting for an acoustic wake word: the audio is worth scoring. */
@@ -1742,9 +1761,9 @@ export class CallTurns {
     return this.ring.position;
   }
 
-  /** An auto turn for the agent is open: a switch to review makes it a draft. */
+  /** An auto turn for the agent is open or still finalizing: a switch to review makes it a draft. */
   get turnOpen(): boolean {
-    return this.turn?.kind === 'auto' && this.turn.addressed;
+    return (this.turn?.kind === 'auto' && this.turn.addressed) || !!this.finalizing;
   }
 
   /** A wake word model loads for this phrase (`useWakeWord` once it is in use, or with none if it fails). */
@@ -1798,12 +1817,15 @@ export class CallTurns {
       if (this.agentSpeaking) return this.deps.unheard();
       if (this.turn?.candidate) this.turn.candidate = undefined;
       if (this.turn || this.reviewing) return;
-      const draining = this.draining;
-      if (draining) {
-        // The caller went on after a command: it was words, and this speech continues the turn.
-        draining.turn.resumed = true;
-        this.draining = undefined;
-        this.open('auto', Math.max(draining.endedAt, at - samplesOf(PRE_ROLL_MS)), true);
+      const finalizing = this.finalizing;
+      if (finalizing?.command) {
+        // The caller went on after a command: it was words, and this speech continues the turn. The
+        // new activity waits for the earlier one's text before it acts, so the words stay in order.
+        this.finalizing = undefined;
+        const before = new Promise<string>((resolve) => (finalizing.turn.handOff = resolve));
+        this.open('auto', Math.max(finalizing.endedAt, at - samplesOf(PRE_ROLL_MS)), true);
+        const successor = this.turn as OpenTurn | undefined;
+        if (successor) successor.before = before;
         return;
       }
       if (!this.wake || !this.wakeWord) this.open('auto', at - samplesOf(PRE_ROLL_MS), !this.wake);
@@ -1893,19 +1915,25 @@ export class CallTurns {
     this.deps.countdown.clear();
     clearTimeout(this.pauseTimer);
     this.disarm();
-    const draining = this.draining;
-    if (draining) {
-      this.draining = undefined;
-      return new Promise((resolve) => (draining.turn.switched = resolve));
+    // The words not acted on yet, in order: a turn still finalizing, then the open one.
+    const parts: Array<Promise<Recording | null>> = [];
+    const finalizing = this.finalizing;
+    if (finalizing) {
+      this.finalizing = undefined;
+      parts.push(new Promise((resolve) => (finalizing.turn.switched = resolve)));
     }
     const turn = this.turn;
-    if (turn?.kind !== 'auto') return null;
-    if (!turn.addressed) {
-      void this.finish('unaddressed');
-      return null;
-    }
+    if (turn?.kind === 'auto' && !turn.addressed) void this.finish('unaddressed');
+    else if (turn?.kind === 'auto') parts.push(this.finish('switch'));
     this.deps.changed();
-    return this.finish('switch');
+    if (!parts.length) return null;
+    const recordings = (await Promise.all(parts)).filter((r): r is Recording => !!r);
+    if (!recordings.length) return null;
+    return {
+      text: joinText(...recordings.map((r) => r.text)),
+      failed: recordings.every((r) => r.failed),
+      take: recordings[0].take,
+    };
   }
 
   /** Review: set the transcription up for a recording; resolves whether it can take one. */
@@ -1934,7 +1962,15 @@ export class CallTurns {
     clearTimeout(this.pauseTimer);
     this.disarm();
     this.turn = undefined;
-    this.draining = undefined;
+    this.finalizing = undefined;
+  }
+
+  /** Replies wait while an auto turn for the agent is open or finalizing. */
+  private syncHold(): void {
+    const open = this.turnOpen;
+    if (open === this.holding) return;
+    this.holding = open;
+    this.deps.hold(open);
   }
 
   private open(kind: OpenTurn['kind'], from: number, addressed: boolean): void {
@@ -1954,13 +1990,13 @@ export class CallTurns {
     };
     this.deps.transcriber.begin(preRoll);
     this.capture?.start(preRoll);
-    if (kind === 'auto' && addressed) this.deps.hold(true);
+    this.syncHold();
   }
 
   /** The wake phrase opened the turn. */
   private woke(): void {
     this.wakes++;
-    this.deps.hold(true);
+    this.syncHold();
     this.deps.cue('wake');
     this.deps.changed();
     this.arm();
@@ -2031,7 +2067,9 @@ export class CallTurns {
     this.disarm();
     this.deps.countdown.clear();
     const endedAt = this.ring.position;
-    if (why === 'send' || why === 'discard') this.draining = { turn, endedAt };
+    if (turn.kind === 'auto' && turn.addressed && why !== 'switch') {
+      this.finalizing = { turn, endedAt, command: why === 'send' || why === 'discard' };
+    }
     // The recording ends a pad after the last speech, not with the closing silence.
     const keep = turn.lastSpeechEnd - turn.from + samplesOf(RECORDING_PAD_MS);
     const take: TurnTake = {
@@ -2042,7 +2080,9 @@ export class CallTurns {
     const silent = !!turn.carry && !turn.heard && turn.speechMs === 0;
     const ending = this.deps.transcriber.end();
     const heard = silent ? { interim: '', finals: 0, failed: false, finalizeMs: 0 } : await ending;
-    if (this.draining?.turn === turn) this.draining = undefined;
+    // Words of an earlier activity of this turn, still finalizing when the caller went on, lead it.
+    if (turn.before) turn.carry = joinText(await turn.before, turn.carry);
+    if (this.finalizing?.turn === turn) this.finalizing = undefined;
     const chosen = turnText(heard);
     const said = joinText(turn.carry, chosen.text);
     this.deps.log.info('voice worker: turn text', {
@@ -2055,11 +2095,15 @@ export class CallTurns {
     });
     if (said) this.deps.caption(turn.segment, said, true);
     if (this.closed) return null;
-    if (turn.kind === 'auto' && turn.addressed) this.deps.hold(false);
+    this.syncHold();
     const recording: Recording = { text: said, failed: heard.failed && !said, take };
     if (why === 'review' || why === 'switch') return recording;
     if (turn.switched) {
       turn.switched(recording);
+      return null;
+    }
+    if (turn.handOff) {
+      turn.handOff(said);
       return null;
     }
     if (why === 'dropped') return null;
@@ -2073,13 +2117,13 @@ export class CallTurns {
     const nominated = turn.kind === 'auto' ? matchCommand(this.spoken(turn, turn.heard)) : null;
     // A final that ends in the command's words as a question asked it: the interim text cannot overrule that.
     const asked = !match && !!matchCommand(text.replace(/[?\s]+$/u, ''));
-    if (!match && !asked && nominated && !turn.resumed && endsLike(text, nominated.rest)) {
+    if (!match && !asked && nominated && endsLike(text, nominated.rest)) {
       // The final left out the command the interim text ended with: the command stands, and the
       // final is the turn's text.
       match = { command: nominated.command, rest: trimCut(text) };
     }
-    // A command the final does not end with, or one the caller talked on after, was words: the turn goes on.
-    if ((why === 'send' || why === 'discard') && (match?.command !== why || turn.resumed)) {
+    // A command the final does not end with was words: the turn goes on.
+    if ((why === 'send' || why === 'discard') && match?.command !== why) {
       this.goOn(said, endedAt);
       return null;
     }
@@ -2597,6 +2641,143 @@ const SEGMENT_ID = 'lk.segment_id';
 const TRANSCRIPTION_FINAL = 'lk.transcription_final';
 const TRANSCRIBED_TRACK = 'lk.transcribed_track_id';
 
+/** A publication to the room that takes longer than this is stuck: the call ends. */
+const OUTBOX_DEADLINE_MS = 5_000;
+/** At most this many publications wait; more means the room stopped taking them. */
+const OUTBOX_MAX = 64;
+
+/**
+ * The page's data and attributes, published one at a time in order. A queued update with the same
+ * key (an interim caption of one turn, one attribute) is replaced by the newer one; finals, labels and
+ * statuses keep their place. A publication that takes over OUTBOX_DEADLINE_MS, or a queue over
+ * OUTBOX_MAX, is room I/O that stopped: `onStuck` ends the call rather than holding every update behind it.
+ */
+export class Outbox {
+  private readonly queue: Array<{ what: string; key?: string; run: () => Promise<unknown> }> = [];
+  private busy = false;
+  private stuck = false;
+
+  constructor(
+    private readonly onStuck: (what: string) => void,
+    private readonly log: Pick<Console, 'warn' | 'error'>,
+    private readonly deadlineMs = OUTBOX_DEADLINE_MS,
+    private readonly max = OUTBOX_MAX,
+  ) {}
+
+  post(what: string, run: () => Promise<unknown>, key?: string): void {
+    if (this.stuck) return;
+    const queued = key ? this.queue.find((job) => job.key === key) : undefined;
+    if (queued) {
+      queued.run = run;
+      return;
+    }
+    if (this.queue.length >= this.max) return this.fail(what);
+    this.queue.push({ what, key, run });
+    void this.next();
+  }
+
+  private async next(): Promise<void> {
+    if (this.busy) return;
+    this.busy = true;
+    while (this.queue.length && !this.stuck) {
+      const job = this.queue.shift()!;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<'late'>((resolve) => (timer = setTimeout(() => resolve('late'), this.deadlineMs)));
+      try {
+        const result = await Promise.race([job.run(), late]);
+        if (result === 'late') this.fail(job.what);
+      } catch (err) {
+        this.log.warn(`voice worker: could not publish ${job.what}`, { err });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    this.busy = false;
+  }
+
+  private fail(what: string): void {
+    this.stuck = true;
+    this.queue.length = 0;
+    this.log.error(`voice worker: the room stopped taking updates (${what})`);
+    this.onStuck(what);
+  }
+}
+
+/** A VAD stream as CallerInput uses it: Silero's, or a test's. */
+export interface VadStream extends AsyncIterable<{
+  type: VADEventType;
+  samplesIndex: number;
+  speechDuration: number;
+  silenceDuration: number;
+}> {
+  pushFrame(frame: AudioFrame): void;
+  close(): void;
+}
+
+/**
+ * The caller's microphone into the VAD and the call: every frame counted once, so the VAD's speech
+ * positions and the turns' audio positions line up across tracks. When the microphone's track ends
+ * (unpublished, unsubscribed, replaced), speech under way ends there, and the next track starts a
+ * fresh VAD: an old VAD's events are ignored.
+ */
+export class CallerInput {
+  private position = 0;
+  private vad?: { stream: VadStream; from: number; speaking: boolean; closed: boolean };
+
+  constructor(
+    private readonly newVad: () => VadStream,
+    private readonly events: Pick<CallVoiceEvents, 'onAudio' | 'onSpeech' | 'onClosed'>,
+    private readonly log: Pick<Console, 'error'>,
+  ) {}
+
+  frame(frame: AudioFrame): void {
+    const vad = this.vad ?? this.start();
+    vad.stream.pushFrame(frame);
+    this.position += frame.samplesPerChannel;
+    this.events.onAudio(frame.data);
+  }
+
+  /** The microphone's track ended. */
+  ended(): void {
+    const vad = this.vad;
+    if (!vad) return;
+    this.vad = undefined;
+    vad.closed = true;
+    vad.stream.close();
+    if (vad.speaking) this.events.onSpeech(false, this.position);
+  }
+
+  close(): void {
+    const vad = this.vad;
+    this.vad = undefined;
+    if (!vad) return;
+    vad.closed = true;
+    vad.stream.close();
+  }
+
+  private start() {
+    const vad = { stream: this.newVad(), from: this.position, speaking: false, closed: false };
+    this.vad = vad;
+    void (async () => {
+      for await (const ev of vad.stream) {
+        if (vad.closed) break;
+        if (ev.type === VADEventType.START_OF_SPEECH) {
+          vad.speaking = true;
+          this.events.onSpeech(true, vad.from + ev.samplesIndex - samplesOf(ev.speechDuration));
+        } else if (ev.type === VADEventType.END_OF_SPEECH) {
+          vad.speaking = false;
+          this.events.onSpeech(false, vad.from + ev.samplesIndex - samplesOf(ev.silenceDuration));
+        }
+      }
+    })().catch((err: unknown) => {
+      if (vad.closed) return;
+      this.log.error('voice worker: the VAD stopped', { err });
+      this.events.onClosed('vad failed');
+    });
+    return vad;
+  }
+}
+
 /**
  * The real room: the caller's microphone at 16 kHz into Silero and the call's turns, the agent's
  * speech track fed by Gemini TTS, the cue track, and what the page reads (captions, attributes,
@@ -2635,52 +2816,49 @@ async function roomVoice(
     return undefined;
   });
 
-  /** Data and attributes go out in order, and a failure is logged, never thrown. */
-  let outbox: Promise<unknown> = Promise.resolve();
-  const post = (what: string, job: () => Promise<unknown>): void => {
-    outbox = outbox.then(job).catch((err: unknown) => log.warn(`voice worker: could not publish ${what}`, { err }));
-  };
+  const outbox = new Outbox((what) => events.onClosed(`room output stuck (${what})`), log);
+  const post = (what: string, job: () => Promise<unknown>, key?: string) => outbox.post(what, job, key);
   const sendJson = (topic: string, value: unknown, what: string) =>
     post(what, () => local.sendText(JSON.stringify(value), { topic }));
-  const setAttr = (key: string, value: string, what: string) => post(what, () => local.setAttributes({ [key]: value }));
-
-  // The VAD: speech start and end, with where each is in the caller's audio.
-  const vad = userData.vad.stream();
-  void (async () => {
-    for await (const ev of vad) {
-      if (closed) break;
-      if (ev.type === VADEventType.START_OF_SPEECH) {
-        events.onSpeech(true, ev.samplesIndex - samplesOf(ev.speechDuration));
-      } else if (ev.type === VADEventType.END_OF_SPEECH) {
-        events.onSpeech(false, ev.samplesIndex - samplesOf(ev.silenceDuration));
-      }
-    }
-  })().catch((err: unknown) => {
-    if (closed) return;
-    log.error('voice worker: the VAD stopped', { err });
-    events.onClosed('vad failed');
-  });
+  const setAttr = (key: string, value: string, what: string) =>
+    post(what, () => local.setAttributes({ [key]: value }), `attribute ${key}`);
 
   // The caller's microphone, from its first frame: the VAD and the turns count the same samples.
+  const vads = userData.vad;
+  const input = new CallerInput(() => vads.stream() as unknown as VadStream, events, log);
   let callerTrack: string | undefined;
   let callerAudio: ReadableStreamDefaultReader<AudioFrame> | undefined;
+  /** The caller's track ended or was replaced: its reader stops, and speech under way ends. */
+  const stopListening = () => {
+    void callerAudio?.cancel().catch(() => undefined);
+    callerAudio = undefined;
+    callerTrack = undefined;
+    input.ended();
+  };
   const listen = (track: RemoteTrack, publication: RemoteTrackPublication, participant: RemoteParticipant) => {
     if (closed || participant.identity !== meta.callerIdentity || track.kind !== TrackKind.KIND_AUDIO) return;
     if (publication.sid === callerTrack && callerAudio) return;
-    void callerAudio?.cancel().catch(() => undefined);
+    stopListening();
     callerTrack = publication.sid;
     const reader = new AudioStream(track, { sampleRate: INPUT_SAMPLE_RATE, numChannels: 1 }).getReader();
     callerAudio = reader;
     void (async () => {
       for (;;) {
         const { done, value: frame } = await reader.read();
-        if (done || closed || callerAudio !== reader) break;
-        vad.pushFrame(frame);
-        events.onAudio(frame.data);
+        if (closed || callerAudio !== reader) return;
+        if (done) return stopListening();
+        input.frame(frame);
       }
-    })().catch((err: unknown) => log.warn('voice worker: the caller audio stopped', { err }));
+    })().catch((err: unknown) => {
+      log.warn('voice worker: the caller audio stopped', { err });
+      if (callerAudio === reader) stopListening();
+    });
+  };
+  const unlisten = (_track: RemoteTrack, publication: RemoteTrackPublication, participant: RemoteParticipant) => {
+    if (participant.identity === meta.callerIdentity && publication.sid === callerTrack) stopListening();
   };
   room.on(RoomEvent.TrackSubscribed, listen);
+  room.on(RoomEvent.TrackUnsubscribed, unlisten);
   for (const participant of room.remoteParticipants.values()) {
     for (const publication of participant.trackPublications.values()) {
       if (publication.track) listen(publication.track as RemoteTrack, publication, participant);
@@ -2758,15 +2936,19 @@ async function roomVoice(
       sendJson(CALL_TURN_TOPIC, { unheard: 'agent_speaking' } satisfies CallUnheardSpeech, 'unheard speech'),
     setPending: (value) => setAttr(CALL_PENDING_ATTRIBUTE, value, 'the countdown'),
     caption: (segment, text, final) =>
-      post('a caption', () =>
-        local.sendText(text, {
-          topic: TRANSCRIPTION_TOPIC,
-          attributes: {
-            [SEGMENT_ID]: `SG_turn_${segment}`,
-            [TRANSCRIPTION_FINAL]: final ? 'true' : 'false',
-            ...(callerTrack ? { [TRANSCRIBED_TRACK]: callerTrack } : {}),
-          },
-        }),
+      post(
+        'a caption',
+        () =>
+          local.sendText(text, {
+            topic: TRANSCRIPTION_TOPIC,
+            attributes: {
+              [SEGMENT_ID]: `SG_turn_${segment}`,
+              [TRANSCRIPTION_FINAL]: final ? 'true' : 'false',
+              ...(callerTrack ? { [TRANSCRIBED_TRACK]: callerTrack } : {}),
+            },
+          }),
+        // A newer interim of the turn replaces one still waiting; its final keeps its place.
+        final ? undefined : `caption ${segment}`,
       ),
     async playCue(kind) {
       await cueTrack?.feed.play(cueFrames(kind));
@@ -2787,8 +2969,9 @@ async function roomVoice(
       closed = true;
       sayAbort.abort();
       room.off(RoomEvent.TrackSubscribed, listen);
+      room.off(RoomEvent.TrackUnsubscribed, unlisten);
       await callerAudio?.cancel().catch(() => undefined);
-      vad.close();
+      input.close();
       await cueTrack?.close().catch(() => undefined);
       if (speechPublication.sid) await local.unpublishTrack(speechPublication.sid).catch(() => undefined);
       await speechTrack.close().catch(() => undefined);
