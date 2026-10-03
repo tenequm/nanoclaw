@@ -35,6 +35,8 @@ const MAX_PENDING_MS = 20_000;
 /** A socket that cannot take audio (its send buffer stays over this) for STALL_MS is replaced. */
 const SEND_HIGH_WATER = 256 * 1024;
 const STALL_MS = 5_000;
+/** While the send buffer is full, the queued audio is tried again this often. */
+const DRAIN_RETRY_MS = 50;
 
 /** The slice of a WebSocket the transcriber uses: the global one, or a test's. */
 export interface LiveSocket {
@@ -99,12 +101,16 @@ interface Activity {
   /** Text of sockets this activity outlived, in order (a slot fills when a handed-over socket drained). */
   kept: string[];
   part: Part;
-  /** The whole text as the last interim showed it. */
+  /**
+   * The whole text as the last interim showed it. A final inside the activity does not replace it:
+   * the final can collapse to the last short phrase, and the turn text then needs this.
+   */
   heard: string;
   socket?: Socket;
-  /** activityStart went out on `socket`. */
+  /** activityStart went out on `socket`; `endSent`: activityEnd too. */
   started: boolean;
-  /** Audio waiting for `socket` to take it. */
+  endSent: boolean;
+  /** Audio waiting for `socket` to take it: before its setup, or while its send buffer is full. */
   queued: Int16Array[];
   queuedSamples: number;
   chunk: Int16Array[];
@@ -115,6 +121,7 @@ interface Activity {
   /** Handed-over sockets still draining. */
   draining: number;
   stallSince: number;
+  drainTimer?: ReturnType<typeof setTimeout>;
   resolve?: (heard: Heard) => void;
   timer?: ReturnType<typeof setTimeout>;
   graceTimer?: ReturnType<typeof setTimeout>;
@@ -140,8 +147,11 @@ export class GeminiLiveTranscriber {
   /** Set a socket up for the next activity; resolves whether it is ready. */
   async prepare(): Promise<boolean> {
     if (this.closed) return false;
-    this.prepared ??= this.connect();
-    return !!(await this.prepared);
+    const pending = (this.prepared ??= this.connect());
+    const socket = await pending;
+    // A failed setup is not kept: the next talk tries again.
+    if (!socket && this.prepared === pending) this.prepared = undefined;
+    return !!socket;
   }
 
   /** Open an activity; `preRoll` is the audio from just before it (manual activity has no padding). */
@@ -152,6 +162,7 @@ export class GeminiLiveTranscriber {
       part: { finals: [], interim: '' },
       heard: '',
       started: false,
+      endSent: false,
       queued: [],
       queuedSamples: 0,
       chunk: [],
@@ -174,8 +185,8 @@ export class GeminiLiveTranscriber {
     const activity = this.activity;
     if (!activity || activity.failed) return;
     if (activity.socket && this.now() >= activity.socket.retireAt) this.handOver(activity, 'age');
-    if (this.live(activity)) this.write(activity, pcm);
-    else this.queue(activity, pcm);
+    this.queue(activity, pcm);
+    this.pump(activity);
   }
 
   /** Close the open activity; resolves with what it heard: at its final (plus a short grace), or FINAL_TIMEOUT_MS after. */
@@ -187,7 +198,7 @@ export class GeminiLiveTranscriber {
     activity.endedAt = this.now();
     const heard = new Promise<Heard>((resolve) => (activity.resolve = resolve));
     if (activity.failed && !activity.socket) this.settle(activity);
-    else if (this.live(activity)) this.sendEnd(activity);
+    else this.pump(activity);
     return heard;
   }
 
@@ -201,11 +212,6 @@ export class GeminiLiveTranscriber {
     }
     for (const socket of [...this.sockets]) this.retire(socket);
     this.prepared = undefined;
-  }
-
-  private live(activity: Activity): boolean {
-    const socket = activity.socket;
-    return activity.started && !!socket && !socket.closed && activity.queued.length === 0;
   }
 
   private queue(activity: Activity, pcm: Int16Array): void {
@@ -226,7 +232,9 @@ export class GeminiLiveTranscriber {
 
   /** Start the activity on a socket once it is set up: activityStart, the queued audio, and its end if it came. */
   private async attach(activity: Activity, pending: Promise<Socket | undefined>): Promise<void> {
-    const socket = await pending;
+    let socket = await pending;
+    // A socket set up ahead that closed before it was used: a fresh one.
+    if (socket?.closed && !this.closed) socket = await this.connect();
     if (this.closed || (!activity.resolve && activity.ending)) return this.retire(socket);
     if (!socket) {
       activity.failed = true;
@@ -241,10 +249,30 @@ export class GeminiLiveTranscriber {
     socket.onLost = () => this.lost(activity, socket);
     socket.onContent = (content) => this.onContent(activity, content);
     this.send(socket, { realtimeInput: { activityStart: {} } });
-    const queued = activity.queued;
-    activity.queued = [];
-    activity.queuedSamples = 0;
-    for (const pcm of queued) this.write(activity, pcm);
+    this.pump(activity);
+  }
+
+  /**
+   * The queued audio to the socket in ~100 ms chunks while its send buffer takes it; when the buffer
+   * is full, it is tried again shortly, and a socket that takes nothing for STALL_MS is replaced.
+   * The activity's end goes out once all its audio did.
+   */
+  private pump(activity: Activity): void {
+    clearTimeout(activity.drainTimer);
+    const socket = activity.socket;
+    if (!socket || !activity.started || socket.closed || activity.endSent) return;
+    while (activity.queued.length) {
+      if ((socket.ws.bufferedAmount ?? 0) > SEND_HIGH_WATER) {
+        activity.stallSince ||= this.now();
+        if (this.now() - activity.stallSince > STALL_MS) return this.handOver(activity, 'stall');
+        activity.drainTimer = setTimeout(() => this.pump(activity), DRAIN_RETRY_MS);
+        return;
+      }
+      const pcm = activity.queued.shift()!;
+      activity.queuedSamples -= pcm.length;
+      this.write(activity, pcm);
+    }
+    activity.stallSince = 0;
     if (activity.ending) this.sendEnd(activity);
   }
 
@@ -252,22 +280,17 @@ export class GeminiLiveTranscriber {
   private write(activity: Activity, pcm: Int16Array): void {
     for (let at = 0; at < pcm.length; ) {
       const take = Math.min(pcm.length - at, this.chunkMax - activity.chunkSamples);
-      activity.chunk.push(pcm.slice(at, at + take));
+      activity.chunk.push(pcm.subarray(at, at + take));
       activity.chunkSamples += take;
       at += take;
       if (activity.chunkSamples >= this.chunkMax) this.flush(activity);
     }
   }
 
+  /** The chunk built so far, out now. */
   private flush(activity: Activity): void {
     const socket = activity.socket;
     if (!activity.chunkSamples || !socket) return;
-    if ((socket.ws.bufferedAmount ?? 0) > SEND_HIGH_WATER) {
-      activity.stallSince ||= this.now();
-      if (this.now() - activity.stallSince > STALL_MS) this.handOver(activity, 'stall');
-      return;
-    }
-    activity.stallSince = 0;
     const pcm = new Int16Array(activity.chunkSamples);
     let offset = 0;
     for (const part of activity.chunk) {
@@ -280,17 +303,27 @@ export class GeminiLiveTranscriber {
     this.send(socket, { realtimeInput: { audio: { data, mimeType: `audio/pcm;rate=${this.opts.sampleRate}` } } });
   }
 
-  /** activityEnd, then the final is waited for at most FINAL_TIMEOUT_MS. */
+  /**
+   * activityEnd, after all the activity's audio; then the final is waited for at most FINAL_TIMEOUT_MS,
+   * and a final that already came inside the activity only gets the grace for any more.
+   */
   private sendEnd(activity: Activity): void {
     const socket = activity.socket;
-    if (!socket) return;
+    if (!socket || activity.endSent) return;
     this.flush(activity);
+    activity.endSent = true;
     this.send(socket, { realtimeInput: { activityEnd: {} } });
     clearTimeout(activity.timer);
     activity.timer = setTimeout(() => {
       this.opts.log.warn('voice worker: no final transcript in time; the turn keeps its interim text');
       this.settle(activity);
     }, FINAL_TIMEOUT_MS);
+    if (activity.part.finals.length) this.graceThenSettle(activity);
+  }
+
+  private graceThenSettle(activity: Activity): void {
+    clearTimeout(activity.graceTimer);
+    activity.graceTimer = setTimeout(() => this.settleWhenDrained(activity), FINAL_GRACE_MS);
   }
 
   /**
@@ -301,11 +334,12 @@ export class GeminiLiveTranscriber {
     const old = activity.socket;
     if (!old) return;
     this.opts.log.info('voice worker: the transcription moves to a fresh socket mid-turn', { why });
-    const unsent = activity.chunk;
-    activity.chunk = [];
-    activity.chunkSamples = 0;
+    clearTimeout(activity.drainTimer);
+    this.requeueChunk(activity);
     activity.socket = undefined;
     activity.started = false;
+    activity.endSent = false;
+    activity.stallSince = 0;
     const part = activity.part;
     activity.part = { finals: [], interim: '' };
     const slot = activity.kept.push(partText(part)) - 1;
@@ -336,8 +370,15 @@ export class GeminiLiveTranscriber {
     };
     const cap = setTimeout(finish, FINAL_TIMEOUT_MS);
     this.send(old, { realtimeInput: { activityEnd: {} } });
-    for (const pcm of unsent) this.queue(activity, pcm);
     void this.attach(activity, this.connect());
+  }
+
+  /** The chunk not sent yet goes back to the front of the queue, for the next socket. */
+  private requeueChunk(activity: Activity): void {
+    activity.queued.unshift(...activity.chunk);
+    activity.queuedSamples += activity.chunkSamples;
+    activity.chunk = [];
+    activity.chunkSamples = 0;
   }
 
   /** The activity's socket closed under it: keep its words, and go on in a fresh one. */
@@ -345,9 +386,9 @@ export class GeminiLiveTranscriber {
     if (activity.socket !== socket) return;
     activity.socket = undefined;
     activity.started = false;
-    for (const pcm of activity.chunk) this.queue(activity, pcm);
-    activity.chunk = [];
-    activity.chunkSamples = 0;
+    activity.endSent = false;
+    clearTimeout(activity.drainTimer);
+    this.requeueChunk(activity);
     activity.kept.push(partText(activity.part));
     activity.part = { finals: [], interim: '' };
     if (activity.ending) return this.settle(activity);
@@ -366,16 +407,11 @@ export class GeminiLiveTranscriber {
     if (typeof final === 'string' && final.trim()) {
       activity.part.finals.push(final.trim());
       activity.part.interim = '';
-      if (!activity.ending) {
-        // A final inside the activity: the interim text after it starts over, so the whole is kept here.
-        activity.heard = this.text(activity);
-        this.opts.onInterim(activity.heard);
-      } else {
-        clearTimeout(activity.graceTimer);
-        activity.graceTimer = setTimeout(() => this.settleWhenDrained(activity), FINAL_GRACE_MS);
-      }
+      // The interim text after a final starts over; `heard` keeps the last interim's whole text.
+      if (!activity.ending) this.opts.onInterim(this.text(activity));
+      if (activity.endSent) this.graceThenSettle(activity);
     }
-    if ((content.turnComplete || content.generationComplete) && activity.ending && activity.part.finals.length) {
+    if ((content.turnComplete || content.generationComplete) && activity.endSent && activity.part.finals.length) {
       this.settleWhenDrained(activity);
     }
   }
@@ -387,6 +423,7 @@ export class GeminiLiveTranscriber {
   private settle(activity: Activity): void {
     clearTimeout(activity.timer);
     clearTimeout(activity.graceTimer);
+    clearTimeout(activity.drainTimer);
     const resolve = activity.resolve;
     activity.resolve = undefined;
     this.retire(activity.socket);

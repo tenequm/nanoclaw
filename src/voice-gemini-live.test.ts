@@ -279,4 +279,80 @@ describe('GeminiLiveTranscriber', () => {
     await h.tick(FINAL_GRACE_MS);
     expect(done()).toMatchObject({ final: 'Book a table for two.' });
   });
+
+  it('a full send buffer holds the audio without blocking, sends it when it drains, and the end waits for all of it', async () => {
+    const h = harness();
+    h.t.begin(new Int16Array(0));
+    await h.tick(0);
+    const s = h.sockets[0];
+    s.ready();
+    await h.tick(0);
+    h.t.push(pcm(100));
+    expect(s.kinds).toEqual(['start', 'audio:1600']);
+    s.bufferedAmount = 300_000;
+    // Frames while the buffer is full return at once and wait in the queue.
+    for (let i = 0; i < 10; i++) h.t.push(pcm(10));
+    h.t.push(pcm(50));
+    const done = h.result(h.t.end());
+    await h.tick(200);
+    expect(s.kinds).toEqual(['start', 'audio:1600']);
+    s.bufferedAmount = 0;
+    await h.tick(60);
+    // All 150 ms, the partial chunk included, then the end.
+    expect(s.kinds).toEqual(['start', 'audio:1600', 'audio:1600', 'audio:800', 'end']);
+    s.final('Book a table.');
+    await h.tick(FINAL_GRACE_MS);
+    expect(done()).toMatchObject({ final: 'Book a table.', failed: false });
+  });
+
+  it('a socket whose send buffer stays full is replaced, and the held audio goes to the fresh one', async () => {
+    const h = harness();
+    h.t.begin(new Int16Array(0));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(0);
+    h.sockets[0].bufferedAmount = 300_000;
+    h.t.push(pcm(100));
+    await h.tick(5_100);
+    h.t.push(pcm(100));
+    await h.tick(0);
+    expect(h.sockets).toHaveLength(2);
+    expect(h.sockets[0].kinds.at(-1)).toBe('end');
+    h.sockets[1].ready();
+    await h.tick(0);
+    expect(h.sockets[1].kinds).toEqual(['start', 'audio:1600', 'audio:1600']);
+  });
+
+  it('a final inside the activity keeps the last interim for the turn text, and needs only the grace after the end', async () => {
+    const h = harness();
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(0);
+    h.sockets[0].interim('Please book a table for six. Send it.');
+    h.sockets[0].final('Send it.');
+    expect(h.interims.at(-1)).toBe('Send it.');
+    const done = h.result(h.t.end());
+    await h.tick(FINAL_GRACE_MS);
+    expect(done()).toEqual({
+      final: 'Send it.',
+      interim: 'Please book a table for six. Send it.',
+      finals: 1,
+      failed: false,
+      finalizeMs: FINAL_GRACE_MS,
+    });
+  });
+
+  it('a failed prepare is not kept: the next one tries again', async () => {
+    const h = harness();
+    const first = h.t.prepare();
+    await h.tick(CONNECT_TIMEOUT_MS * 3 + 2_000);
+    expect(await first).toBe(false);
+    expect(h.sockets).toHaveLength(3);
+    const second = h.t.prepare();
+    await h.tick(0);
+    expect(h.sockets).toHaveLength(4);
+    h.sockets[3].ready();
+    expect(await second).toBe(true);
+  });
 });
