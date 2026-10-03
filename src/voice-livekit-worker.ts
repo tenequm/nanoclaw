@@ -163,6 +163,8 @@ export const STT_READY_TIMEOUT_MS = 3_000;
 const SESSION_CONTROL_TOPIC = 'lk.agent.session';
 /** After a spoken line, the your-turn cue waits this long for the next one to start. */
 export const TURN_CUE_DELAY_MS = 600;
+/** A your-turn cue this soon after the last one is the same hand-over, and stays silent. */
+const TURN_CUE_REPEAT_MS = 3_000;
 /** The listening cue waits this long for the page's settings (`?cues=0` turns cues off), then plays. */
 export const READY_CUE_WAIT_MS = 2_000;
 /** Review mode's waits, on the global timers (which tests can fake). */
@@ -2550,6 +2552,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     cue('listening');
   };
   let turnCueTimer: ReturnType<typeof setTimeout> | undefined;
+  let turnCuedAt = 0;
   const turnTaking = new TurnTaking(
     {
       send: async (text) => {
@@ -2584,7 +2587,16 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       spokenAll: () => {
         clearTimeout(turnCueTimer);
         turnCueTimer = setTimeout(() => {
-          if (!turnTaking.speaking && !turnTaking.working && !callerSpeaking) cue('turn');
+          // Lines that end close together are one hand-over: one cue.
+          if (
+            turnTaking.speaking ||
+            turnTaking.working ||
+            callerSpeaking ||
+            Date.now() - turnCuedAt < TURN_CUE_REPEAT_MS
+          )
+            return;
+          turnCuedAt = Date.now();
+          cue('turn');
         }, TURN_CUE_DELAY_MS);
         turnCueTimer.unref?.();
       },

@@ -2339,6 +2339,27 @@ describe('spoken commands and cues in a call', () => {
     host.endStream();
   });
 
+  it('replies that end close together are one hand-over: one your-turn cue', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = commandCall();
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice));
+    await c.rpc('settings', { cues: true });
+    host.emit({ type: 'reply', text: 'Booked.', turn: null });
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
+    host.emit({ type: 'reply', text: 'And the taxi too.', turn: null });
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
+    expect(c.v.voice.say).toHaveBeenCalledTimes(2);
+    expect(c.played).toEqual(['listening', 'turn']);
+    // A later reply is a new hand-over.
+    await vi.advanceTimersByTimeAsync(5_000);
+    host.emit({ type: 'reply', text: 'Also, it may rain.', turn: null });
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
+    expect(c.played).toEqual(['listening', 'turn', 'turn']);
+    host.endStream();
+  });
+
   it('review mode: talk plays listening, a ready draft its own cue; spoken commands stand aside', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
     const { ctx } = fakeJob();
