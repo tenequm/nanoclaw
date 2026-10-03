@@ -32,6 +32,16 @@ interface AgentProvider {
   /** Start a new query. Returns a handle for streaming input and output. */
   query(input: QueryInput): AgentQuery;
 
+  /** Optional. True when `query` with an empty prompt starts idle (the first
+   *  turn arrives through `push`); only such a provider is started ahead of a
+   *  voice call's first turn. */
+  readonly startsIdle?: boolean;
+
+  /** Optional. Warm the prompt cache for `input.continuation` without a turn
+   *  of its own (nothing persisted, delivered or run). Called when a voice
+   *  call starts the agent before its first turn. Best-effort. */
+  warmPromptCache?(input: QueryInput): Promise<void>;
+
   /** True if the error means the stored continuation is invalid (missing
    *  transcript, unknown session) and should be cleared. */
   isSessionInvalid(err: unknown): boolean;

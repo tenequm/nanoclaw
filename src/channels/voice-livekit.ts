@@ -234,6 +234,13 @@ export interface LiveKitHost {
    * rejects when routing threw.
    */
   routeTurn(event: InboundEvent): Promise<boolean>;
+  /**
+   * The caller joined: `route` is where the call's turns go now (`agentGroupId`: the line's agent).
+   * Wakes that agent's existing session before the first turn (none is created) and keeps it
+   * running until `callEnded`.
+   */
+  callJoined?(callId: string, route: Omit<InboundEvent, 'message'>, agentGroupId: string): void;
+  callEnded?(callId: string): void;
   isRunning(): boolean;
   now(): number;
   maxCallDurationMs: number;
@@ -694,6 +701,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       }
     });
     call.cleanup = trackedDeleteRoom(call, call.announced);
+    host.callEnded?.(call.callId);
     log.info('livekit-voice: call ended', { platformId: call.platformId, callId: call.callId, reason });
   };
 
@@ -853,6 +861,19 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     );
   };
 
+  /** Where a turn goes: the call chat, or the voice line itself. */
+  const turnRoute = (call: LiveKitCall, chat: CallChat | null): Omit<InboundEvent, 'message'> =>
+    chat
+      ? {
+          channelType: chat.group.channel_type,
+          instance: chat.group.instance ?? chat.group.channel_type,
+          platformId: chat.group.platform_id,
+          threadId: chat.threadId,
+          // Addressed to the line's agent only, whoever else is wired to the chat and whatever its trigger.
+          agentGroupId: call.line.agentGroupId,
+        }
+      : { channelType: 'voice', instance: 'voice', platformId: call.platformId, threadId: null };
+
   /** The worker saw the caller join: start the clock and the duration / budget cap. */
   const onJoined = (res: http.ServerResponse, call: LiveKitCall): void => {
     if (call.state === 'live') return reply(res, 200, JSON.stringify({ ok: true }), JSON_HEADERS);
@@ -882,7 +903,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     log.info('livekit-voice: caller joined', { platformId: call.platformId, callId: call.callId });
     // Known before the first turn, so the agent's messages to that chat are spoken from the start.
-    void refreshChat(call, false);
+    void refreshChat(call, false).then((chat) => {
+      if (!call.ended) host.callJoined?.(call.callId, turnRoute(call, chat), call.line.agentGroupId);
+    });
     reply(res, 200, JSON.stringify({ ok: true }), JSON_HEADERS);
   };
 
@@ -983,19 +1006,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         isMention: true,
         isGroup: chat ? chat.group.is_group !== 0 : false,
       };
-      routed = host.routeTurn(
-        chat
-          ? {
-              channelType: chat.group.channel_type,
-              instance: chat.group.instance ?? chat.group.channel_type,
-              platformId: chat.group.platform_id,
-              threadId: chat.threadId,
-              // Addressed to the line's agent only, whoever else is wired to the chat and whatever its trigger.
-              agentGroupId: call.line.agentGroupId,
-              message,
-            }
-          : { channelType: 'voice', instance: 'voice', platformId: call.platformId, threadId: null, message },
-      );
+      routed = host.routeTurn({ ...turnRoute(call, chat), message });
       // Shown once the agent has it, even when that comes after the worker was told it timed out.
       if (chat) {
         void routed.then(

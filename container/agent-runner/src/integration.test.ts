@@ -6,7 +6,7 @@ import { getPendingMessages } from './db/messages-in.js';
 import { getContinuation, setContinuation } from './db/session-state.js';
 import { getSessionRouting } from './db/session-routing.js';
 import { MockProvider } from './providers/mock.js';
-import type { ProviderExchange } from './providers/types.js';
+import type { ProviderExchange, QueryInput } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
 const MOCK_PROVIDER_CONTRACT = {
@@ -369,6 +369,131 @@ async function waitFor(condition: () => boolean, timeoutMs: number): Promise<voi
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+describe('poll loop — started ahead of a voice call', () => {
+  class RecordingProvider extends MockProvider {
+    readonly prompts: string[] = [];
+    readonly warmed: Array<string | undefined> = [];
+    query(input: QueryInput) {
+      this.prompts.push(input.prompt);
+      return super.query(input);
+    }
+    async warmPromptCache(input: QueryInput): Promise<void> {
+      this.warmed.push(input.continuation);
+    }
+  }
+  const reply = () => '<message to="discord-test">here</message>';
+  const previous = process.env.NANOCLAW_WAKE_REASON;
+  afterEach(() => {
+    if (previous === undefined) delete process.env.NANOCLAW_WAKE_REASON;
+    else process.env.NANOCLAW_WAKE_REASON = previous;
+  });
+
+  it('opens the query and warms the cache before any message, then answers the first turn in that query', async () => {
+    process.env.NANOCLAW_WAKE_REASON = 'voice-call';
+    setContinuation('mock', 'sess-prior');
+    const provider = new RecordingProvider({}, reply);
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);
+
+    await waitFor(() => provider.prompts.length === 1, 1000);
+    expect(provider.prompts).toEqual(['']);
+    expect(provider.warmed).toEqual(['sess-prior']);
+    await sleep(100);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+
+    insertMessage('m1', { sender: 'Alice', text: 'hi' }, { platformId: 'chan-1', channelType: 'discord' });
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    controller.abort();
+    const out = getUndeliveredMessages();
+    expect(out.map((m) => [JSON.parse(m.content).text, m.in_reply_to])).toEqual([['here', 'm1']]);
+    // The turn went into the query already running; no second one was started.
+    expect(provider.prompts).toEqual(['']);
+    await loopPromise.catch(() => {});
+  });
+
+  it('starts nothing ahead of time for any other wake, or when the first turn is already waiting', async () => {
+    delete process.env.NANOCLAW_WAKE_REASON;
+    const idle = new RecordingProvider({}, reply);
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(idle, controller.signal, 3000);
+    await sleep(300);
+    controller.abort();
+    await loopPromise.catch(() => {});
+    expect(idle.prompts).toEqual([]);
+
+    process.env.NANOCLAW_WAKE_REASON = 'voice-call';
+    insertMessage('m1', { sender: 'Alice', text: 'hi' }, { platformId: 'chan-1', channelType: 'discord' });
+    const busy = new RecordingProvider({}, reply);
+    const second = new AbortController();
+    const busyLoop = runPollLoopWithTimeout(busy, second.signal, 3000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    second.abort();
+    await busyLoop.catch(() => {});
+    expect(busy.prompts).toHaveLength(1);
+    expect(busy.prompts[0]).toContain('hi');
+    expect(busy.warmed).toEqual([]);
+  });
+
+  it('starts nothing ahead of time for a provider that cannot open a query without a turn', async () => {
+    process.env.NANOCLAW_WAKE_REASON = 'voice-call';
+    const provider = new RecordingProvider({}, reply);
+    Object.defineProperty(provider, 'startsIdle', { value: false });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);
+    await sleep(300);
+    expect(provider.prompts).toEqual([]);
+    expect(provider.warmed).toEqual([]);
+
+    insertMessage('m1', { sender: 'Alice', text: 'hi' }, { platformId: 'chan-1', channelType: 'discord' });
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+    expect(provider.prompts).toHaveLength(1);
+    expect(provider.prompts[0]).toContain('hi');
+  });
+
+  it("keeps the first turn pushed into the idle query 'processing' until its result", async () => {
+    process.env.NANOCLAW_WAKE_REASON = 'voice-call';
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    // Each result waits for `release`, so the turn is observably in flight.
+    class HeldProvider extends MockProvider {
+      query(input: QueryInput) {
+        const inner = super.query(input);
+        return {
+          ...inner,
+          events: (async function* () {
+            for await (const event of inner.events) {
+              if (event.type === 'result') await held;
+              yield event;
+            }
+          })(),
+        };
+      }
+    }
+    const ack = (id: string) =>
+      (
+        getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as {
+          status: string;
+        } | null
+      )?.status;
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(new HeldProvider({}, reply), controller.signal, 3000);
+    await sleep(300);
+
+    insertMessage('m1', { sender: 'Alice', text: 'hi' }, { platformId: 'chan-1', channelType: 'discord' });
+    await waitFor(() => ack('m1') === 'processing', 1000);
+    await sleep(300);
+    // Still claimed while it runs: a crash now redelivers it, and the host's claim-stuck check sees it.
+    expect(ack('m1')).toBe('processing');
+
+    release();
+    await waitFor(() => ack('m1') === 'completed', 1000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+});
 
 describe('poll loop — exchange hook (onExchangeComplete)', () => {
   // A provider that declares the per-exchange hook. The hook call is the

@@ -22,6 +22,9 @@
  *        reaching an SDK event —
  *        and so never writes a heartbeat — still ages out instead of
  *        living forever (see decideStuckAction's grace-period comment).
+ *        Skipped while the session's ceiling is held (holdIdleCeiling: a
+ *        live voice call, whose caller may stay silent longer than the agent
+ *        works); the hold carries its own deadline.
  *
  *     2. Message-scoped stuck: for each 'processing' row, tolerance =
  *        max(60s, current_bash_timeout_ms_if_Bash_running). If
@@ -51,6 +54,35 @@ export const CLAIM_STUCK_MS = 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
+/** Per session: holder → deadline (epoch ms) while the idle ceiling is held. */
+const ceilingHolds = new Map<string, Map<string, number>>();
+
+/**
+ * Keep the absolute idle ceiling off a running session until `untilMs` (a
+ * live voice call: the caller may stay silent longer than the agent works).
+ * The claim-stuck check still applies. Re-holding under the same `holder`
+ * moves its deadline; the returned function releases that hold.
+ */
+export function holdIdleCeiling(sessionId: string, holder: string, untilMs: number): () => void {
+  const holds = ceilingHolds.get(sessionId) ?? new Map<string, number>();
+  holds.set(holder, untilMs);
+  ceilingHolds.set(sessionId, holds);
+  return () => {
+    const current = ceilingHolds.get(sessionId);
+    if (current?.get(holder) !== untilMs) return;
+    current.delete(holder);
+    if (current.size === 0) ceilingHolds.delete(sessionId);
+  };
+}
+
+export function isIdleCeilingHeld(sessionId: string, now: number): boolean {
+  const holds = ceilingHolds.get(sessionId);
+  if (!holds) return false;
+  for (const [holder, until] of holds) if (until <= now) holds.delete(holder);
+  if (holds.size === 0) ceilingHolds.delete(sessionId);
+  return holds.size > 0;
+}
+
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
@@ -67,6 +99,8 @@ export function decideStuckAction(args: {
   containerStartedAtMs?: number; // fallback when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ messageId: string; statusChanged: string }>;
+  /** holdIdleCeiling: skip the absolute ceiling, keep the claim check. */
+  ceilingHeld?: boolean;
 }): StuckDecision {
   const { now, heartbeatMtimeMs, containerStartedAtMs, containerState, claims } = args;
   const declaredBashMs = bashTimeoutMs(containerState);
@@ -88,7 +122,7 @@ export function decideStuckAction(args: {
   // anything) the claim-stuck check below handles it independently of this
   // fallback.
   const effectiveHeartbeatMs = heartbeatMtimeMs !== 0 ? heartbeatMtimeMs : (containerStartedAtMs ?? 0);
-  if (effectiveHeartbeatMs !== 0) {
+  if (effectiveHeartbeatMs !== 0 && !args.ceilingHeld) {
     const heartbeatAge = now - effectiveHeartbeatMs;
     const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredBashMs ?? 0);
     if (heartbeatAge > ceiling) {
@@ -248,12 +282,14 @@ async function enforceRunningContainerSla(
     return { ...claim, statusChanged: new Date(incarnationStartMs).toISOString() };
   });
 
+  const now = Date.now();
   const decision = decideStuckAction({
-    now: Date.now(),
+    now,
     heartbeatMtimeMs: gatedHeartbeatMs,
     containerStartedAtMs: getContainerStartedAtMs(session.id),
     containerState: outDb.getContainerState(),
     claims: gatedClaims,
+    ceilingHeld: isIdleCeilingHeld(session.id, now),
   });
 
   if (decision.action === 'ok') return;

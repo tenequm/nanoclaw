@@ -90,6 +90,7 @@ src/channels/voice-registration.test.ts
 src/channels/voice-line.test.ts
 src/channels/voice-call-page.test.ts
 src/channels/voice-livekit.test.ts
+src/channels/voice-call-session.test.ts
 src/voice-livekit-worker.test.ts
 src/voice-wakeword.test.ts
 src/voice-wakeword-fixtures/positive.wav
@@ -99,7 +100,13 @@ src/voice-wakeword-fixtures/negative.wav
 ### 2. Register the adapter
 
 Append the self-registration import to the channel barrel (skipped if present).
-This one line is the skill's only reach-in into the channel core:
+This one line is the only edit the skill makes to the channel core. The adapter
+also relies on core pieces this fork's trunk carries and upstream does not:
+host-addressed turns (`agentGroupId` and `onStored` on `InboundEvent`,
+`routeInboundEvent`), `expediteDelivery` in `src/delivery.ts`, the `voice-call`
+wake reason with `holdIdleCeiling` in `src/reconcile-session.ts`, and the agent
+runner's idle start and prompt-cache warm for that wake. Apply it to this
+fork's trunk, not to plain upstream:
 
 ```nc:append to:src/channels/index.ts
 import './voice.js';
@@ -153,7 +160,7 @@ page check, and the integration tests (a fake LiveKit server behind the real
 webhook server, and the worker's turn-taking rules):
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.test.ts src/voice-wakeword.test.ts
+pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/channels/voice-call-session.test.ts src/voice-livekit-worker.test.ts src/voice-wakeword.test.ts
 ```
 
 `voice-registration.test.ts` imports the real channel barrel and asserts the
@@ -866,12 +873,14 @@ that cannot be spoken is reported as a delivery failure through the host retry
 path. Voice does not deliver files or interactive question cards; ask questions
 in plain spoken text and send attachments to another wired channel.
 
-**The first answer on a call takes about ten seconds.** That wait is the host
-creating the agent's session and starting its container. Ask a second question
-in the same call and the reply comes back quickly, because the container is
-already running. The page shows the agent working while it waits, rather than
-leaving the caller looking at a silent screen. Containers are reclaimed when a
-session goes idle, so the next call pays the same first-answer cost.
+**The first answer on a call is slower than the rest.** When the caller joins,
+the host starts the agent's container and its Claude session and refreshes the
+prompt cache, so the first turn usually meets a running agent. The first answer
+still pays for the start when the caller speaks within a few seconds of joining,
+or when the call's chat has no agent session yet (its first message creates
+one). The page shows the agent working while it waits, rather than leaving the
+caller looking at a silent screen. The container is kept for the whole call;
+after it, an idle container is reclaimed as before.
 
 **`Caller access denied` on the page.** Verify the voice user has a display name,
 is a member of the answering agent, and the line has exactly one strict,
