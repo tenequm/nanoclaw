@@ -70,6 +70,8 @@ export interface ReviewState {
   wake: boolean
   /** With the wake switch: a pause sends too after the wake phrase, not only `send it`. */
   pauseSends: boolean
+  /** The typing sound while the agent works. Kept for the next call (ReviewPrefs). */
+  typing: boolean
   /** The worker waits for the wake phrase right now. */
   awaitingWake: boolean
   /** The phrase the worker's wake word listens for, as configured (`Hey LiveKit`); null: `Hey <agent>`. Kept for the next call. */
@@ -106,10 +108,11 @@ export interface ReviewPrefs {
   mode: TurnMode
   wake: boolean
   pauseSends: boolean
+  typing: boolean
 }
 
-/** A caller with nothing remembered: hands-free, with the wake switch on. */
-export const DEFAULT_PREFS: ReviewPrefs = { mode: "auto", wake: true, pauseSends: false }
+/** A caller with nothing remembered: hands-free, with the wake switch and the typing sound on. */
+export const DEFAULT_PREFS: ReviewPrefs = { mode: "auto", wake: true, pauseSends: false, typing: true }
 
 const PREFS_KEY = "voice-review-prefs"
 
@@ -130,6 +133,7 @@ export function storedPrefs(): ReviewPrefs {
     mode: saved.mode === "auto" || saved.mode === "review" ? saved.mode : DEFAULT_PREFS.mode,
     wake: typeof saved.wake === "boolean" ? saved.wake : DEFAULT_PREFS.wake,
     pauseSends: typeof saved.pauseSends === "boolean" ? saved.pauseSends : DEFAULT_PREFS.pauseSends,
+    typing: typeof saved.typing === "boolean" ? saved.typing : DEFAULT_PREFS.typing,
   }
 }
 
@@ -148,7 +152,7 @@ export function settingsNotTaken(ran: ReviewSnapshot["wake"]): Pick<ReviewState,
 /** Remember the caller's picks: one made before a call, or one the worker took during it. */
 export function storePrefs(prefs: ReviewPrefs): void {
   try {
-    localStorage.setItem(PREFS_KEY, JSON.stringify({ mode: prefs.mode, wake: prefs.wake, pauseSends: prefs.pauseSends }))
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ mode: prefs.mode, wake: prefs.wake, pauseSends: prefs.pauseSends, typing: prefs.typing }))
   } catch {
     // Storage off: the picks last as long as the page.
   }
@@ -167,6 +171,7 @@ export const INITIAL_REVIEW: ReviewState = {
   commands: true,
   wake: DEFAULT_PREFS.wake,
   pauseSends: DEFAULT_PREFS.pauseSends,
+  typing: DEFAULT_PREFS.typing,
   awaitingWake: false,
   wakePhrase: null,
   wakeHeard: 0,

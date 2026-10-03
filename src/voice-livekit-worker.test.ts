@@ -1588,6 +1588,8 @@ describe('review mode', () => {
       mode: 'review',
       wake: true,
     });
+    expect(readReviewRequest('{"gen":4,"typing":false,"cues":true}')).toEqual({ gen: 4, typing: false, cues: true });
+    expect(readReviewRequest('{"gen":5,"typing":"no"}')).toEqual({ gen: 5 });
     expect(readReviewRequest('{"draft":2}')).toBeNull();
     expect(readReviewRequest('nope')).toBeNull();
   });
@@ -2870,6 +2872,29 @@ describe('commands, cues and review in a call', () => {
     await vi.waitFor(() => expect(typing).toEqual([true, false, true]));
     await v.rpc('settings', { cues: false });
     expect(typing).toEqual([true, false, true, false]);
+    host.endStream();
+  });
+
+  it("the page's typing switch: off, no typing while the agent works; off mid-work stops it at once", async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const typing: boolean[] = [];
+    Object.assign(v.voice, { setTyping: vi.fn((on: boolean) => void typing.push(on)) });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.rpc('settings', { typing: false });
+    await v.turn('Book a table');
+    host.emit({ type: 'working' });
+    await flush();
+    expect(typing).toEqual([]);
+    // Back on while the agent still works: it types; off again, it stops right there.
+    await v.rpc('settings', { typing: true });
+    expect(typing).toEqual([true]);
+    await v.rpc('settings', { typing: false });
+    expect(typing).toEqual([true, false]);
+    // Settings that leave the switch out keep it as it is.
+    await v.rpc('settings', { wake: false });
+    expect(typing).toEqual([true, false]);
     host.endStream();
   });
 

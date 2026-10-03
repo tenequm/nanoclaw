@@ -769,7 +769,10 @@ speech track, so the same cues work on any surface and the caller's next words
 are never taken for the agent speaking. While the page shows the agent working, the same
 track loops LiveKit's quiet keyboard typing (`keyboard-typing2.ogg` from `@livekit/agents`,
 decoded once per worker process with ffmpeg); it stops as the agent starts speaking, a cue
-takes its place while one plays, and `?cues=0` turns it off with the cues. Each is 150-250 ms of held tone about
+takes its place while one plays, and `?cues=0` turns it off with the cues. A "Typing sound"
+switch under the mode row (on by default, in either mode, kept in the browser like the other
+switches) turns the typing alone off; it reaches the worker in the `settings` RPC (`typing`), and
+off stops a loop already playing. Each is 150-250 ms of held tone about
 6 dB under the agent's speech: a rising two-note (listening) once the call is
 ready, a quicker higher two-note (wake) on the wake phrase, a single high note
 (sent) as a turn goes out, a falling low two-note (discard) on a spoken discard,

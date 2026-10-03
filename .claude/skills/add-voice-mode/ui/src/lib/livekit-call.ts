@@ -549,7 +549,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     /** The worker's reply; null when it did not answer, undefined when the call it was for is over. */
     async (
       op: ReviewOp | "settings",
-      fields: { draft?: number; mode?: TurnMode; afterTurn?: number; wake?: boolean; pauseSends?: boolean; cues?: boolean } = {}
+      fields: { draft?: number; mode?: TurnMode; afterTurn?: number; wake?: boolean; pauseSends?: boolean; cues?: boolean; typing?: boolean } = {}
     ): Promise<ReviewReply | null | undefined> => {
       const id = agentId.current
       if (!id) return null
@@ -861,7 +861,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (p === "connecting" || LIVE_PHASES.has(p)) return
     // A draft from the last call is discarded first, never carried into this one.
     if (reviewRef.current.ended && reviewRef.current.draft) return
-    updateReview((r) => ({ ...INITIAL_REVIEW, mode: r.mode, wake: r.wake, pauseSends: r.pauseSends, wakePhrase: r.wakePhrase }))
+    updateReview((r) => ({ ...INITIAL_REVIEW, mode: r.mode, wake: r.wake, pauseSends: r.pauseSends, typing: r.typing, wakePhrase: r.wakePhrase }))
     reviewSeq.current = 0
     reviewAsked.current = false
     settingsSent.current = false
@@ -1255,7 +1255,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   }, [reviewLive, reviewAvailable, updateReview])
 
   /**
-   * The page's settings to the worker: the wake switch, and `?cues=0` (the worker plays the cues).
+   * The page's settings to the worker: the wake switch, the typing sound, and `?cues=0` (the worker plays the cues).
    * Tried twice; if the worker never takes them, the switches go back to what it runs. Only switches
    * the worker took are kept for the next call, and only from the newest request.
    */
@@ -1263,9 +1263,9 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const sendSettings = useCallback(async () => {
     const gen = ++settingsGen.current
     const ask = async () => {
-      const { wake, pauseSends } = reviewRef.current
-      const reply = await rpc("settings", { wake, pauseSends, cues: new URLSearchParams(location.search).get("cues") !== "0" })
-      if (reply?.ok && gen === settingsGen.current) keepPrefs({ wake, pauseSends })
+      const { wake, pauseSends, typing } = reviewRef.current
+      const reply = await rpc("settings", { wake, pauseSends, typing, cues: new URLSearchParams(location.search).get("cues") !== "0" })
+      if (reply?.ok && gen === settingsGen.current) keepPrefs({ wake, pauseSends, typing })
       return reply
     }
     let reply = await ask()
@@ -1290,7 +1290,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   }, [reviewLive, commandsAvailable, updateReview, sendSettings])
 
   const setWakeOption = useCallback(
-    (fields: { wake?: boolean; pauseSends?: boolean }) => {
+    (fields: { wake?: boolean; pauseSends?: boolean; typing?: boolean }) => {
       const r = reviewRef.current
       // Mid-call the worker has to take it; before a call it is the pick for the next one.
       const live = LIVE_PHASES.has(phaseRef.current)
@@ -1464,6 +1464,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       discard: () => void discard(),
       setWake: (on: boolean) => setWakeOption({ wake: on }),
       setPauseSends: (on: boolean) => setWakeOption({ pauseSends: on }),
+      setTyping: (on: boolean) => setWakeOption({ typing: on }),
     }),
     [reviewState, setTurnMode, talk, done, send, discard, setWakeOption]
   )
