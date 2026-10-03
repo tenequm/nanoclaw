@@ -161,6 +161,19 @@ describe('WakeWordSpotter', () => {
     expect(spotter.summary.scored).toBeGreaterThan(10);
   });
 
+  it('turned on, scores only audio that came after: a phrase said while off never opens a turn', async () => {
+    const { spotter, detections } = make();
+    await spotter.ready;
+    // The phrase ends right before listening turns on, so it is all in the 2 s ring.
+    await feed(spotter, concat(silence(1), positive()));
+    spotter.listen(['wake']);
+    await feed(spotter, silence(1.9));
+    expect(spotter.summary.scored).toBe(0);
+    await feed(spotter, silence(1));
+    expect(spotter.summary.scored).toBeGreaterThan(0);
+    expect(detections).toEqual([]);
+  });
+
   it('scores the window at every 80 ms boundary, whatever the frame size, also when audio comes in a burst', async () => {
     const { spotter, detections } = make();
     await spotter.ready;
