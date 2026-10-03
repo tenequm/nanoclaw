@@ -71,6 +71,9 @@ importers:
       mediabunny:
         specifier: 1.40.1
         version: 1.40.1
+      onnxruntime-node:
+        specifier: 1.24.3
+        version: 1.24.3
       openai:
         specifier: ^6.34.0
         version: 6.49.0(ws@8.21.3)(zod@4.6.5)

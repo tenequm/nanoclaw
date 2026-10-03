@@ -60,6 +60,10 @@ import {
   cueFrames,
   matchCommand,
   matchWake,
+  matchWakeText,
+  wakeWordSettings,
+  type WakeWord,
+  type WakeWordEvents,
   READY_CUE_WAIT_MS,
   SpokenCommands,
   TURN_CUE_DELAY_MS,
@@ -2002,21 +2006,25 @@ describe('spoken command matching', () => {
   });
 });
 
-function commandsHarness(names = ['Andy']) {
+function commandsHarness(names = ['Andy'], now?: () => number) {
   const sent: string[] = [];
   const cues: CueKind[] = [];
   const dropped: Array<[string, string]> = [];
   const heard: Array<[string, boolean]> = [];
   let cuts = 0;
   let changes = 0;
-  const commands = new SpokenCommands(names, {
-    send: (text) => sent.push(text),
-    cue: (kind) => cues.push(kind),
-    drop: (reason, text) => dropped.push([reason, text]),
-    heard: (text, final) => heard.push([text, final]),
-    cut: () => cuts++,
-    changed: () => changes++,
-  });
+  const commands = new SpokenCommands(
+    names,
+    {
+      send: (text) => sent.push(text),
+      cue: (kind) => cues.push(kind),
+      drop: (reason, text) => dropped.push([reason, text]),
+      heard: (text, final) => heard.push([text, final]),
+      cut: () => cuts++,
+      changed: () => changes++,
+    },
+    now,
+  );
   /** One stretch of speech: the caller talks, the final arrives, then they stop. */
   const say = (text: string) => {
     commands.onCallerSpeaking(true);
@@ -2422,5 +2430,302 @@ describe('the countdown in the session', () => {
     // Speaking again clears the last one; no new one counts down.
     expect(shown()).toEqual(['1:0:2500']);
     expect(pending.at(-1)).toBe('');
+  });
+});
+
+describe('acoustic wake word', () => {
+  it('finds the spotted phrase however the transcription spelled it', () => {
+    const at = (text: string) => {
+      const found = matchWakeText(text, 'hey livekit');
+      return found && [text.slice(0, found.start), text.slice(found.end)];
+    };
+    expect(at('Hey, LiveKit, what time is it?')).toEqual(['', ', what time is it?']);
+    expect(at('So that is settled. Hey Live Kit what time')).toEqual(['So that is settled. ', ' what time']);
+    expect(at('hey live kid. Book a table')).toEqual(['', '. Book a table']);
+    expect(at('Гей, Лайвкіт, котра година?')).toEqual(['', ', котра година?']);
+    expect(at('Hi Lifekit')).toEqual(['', '']);
+    // The name without a hey before it is the phrase too: the audio already said it was spoken.
+    expect(at('LiveKit, book a table')).toEqual(['', ', book a table']);
+    expect(at('Hey, look at it')).toBeNull();
+    expect(at('we live in a kit house')).toBeNull();
+    // Another model's phrase, by its file name.
+    expect(matchWakeText('Hey Jarvis, lights', 'hey jarvis')).toEqual({ start: 0, end: 10 });
+  });
+
+  it('reads the model and threshold from the settings', () => {
+    expect(wakeWordSettings({})).toEqual({ classifier: expect.stringMatching(/hey_livekit\.onnx$/), threshold: 0.68 });
+    expect(wakeWordSettings({ VOICE_WAKE_MODEL: 'off' })).toBeNull();
+    expect(wakeWordSettings({ VOICE_WAKE_MODEL: '/m/hey_jarvis.onnx' })).toEqual({
+      classifier: '/m/hey_jarvis.onnx',
+      threshold: 0.5,
+    });
+    expect(wakeWordSettings({ VOICE_WAKE_THRESHOLD: '0.8' })?.threshold).toBe(0.8);
+    expect(wakeWordSettings({ VOICE_WAKE_THRESHOLD: '7' })?.threshold).toBe(0.68);
+  });
+
+  function spotted() {
+    let clock = 1_000_000;
+    const h = commandsHarness(['Andy'], () => clock);
+    h.commands.configure(true, false);
+    h.commands.useWakeWord('hey livekit');
+    return {
+      ...h,
+      tick: (ms: number) => void (clock += ms),
+    };
+  }
+
+  it('the spotted wake word opens the turn; the transcript name does not; the phrase and what came before are dropped', () => {
+    const h = spotted();
+    expect(h.commands.state).toEqual({ on: true, pauseSends: false, waiting: true, phrase: 'hey livekit' });
+    expect(h.commands.spotting).toBe(true);
+    h.say('Hey Andy, book a table.');
+    expect(h.commands.waiting).toBe(true);
+    expect(h.dropped).toEqual([['unaddressed', 'Hey Andy, book a table.']]);
+
+    h.commands.onWakeWord();
+    expect(h.commands.waiting).toBe(false);
+    expect(h.commands.spotting).toBe(false);
+    expect(h.cues).toEqual(['wake']);
+    h.commands.onTranscript('So that is settled. Hey LiveKit, book', false);
+    expect(h.heard.at(-1)).toEqual(['book', false]);
+    h.say('So that is settled. Hey LiveKit, book a table');
+    expect(h.dropped.at(-1)).toEqual(['unaddressed', 'So that is settled.']);
+    // After the first final with the phrase, the name is a word again.
+    h.say('at the LiveKit cafe. Over.');
+    expect(h.sent).toEqual(['book a table at the LiveKit cafe.']);
+    expect(h.commands.waiting).toBe(true);
+  });
+
+  it('a final with only the phrase ends its interim text and keeps nothing', () => {
+    const h = spotted();
+    h.commands.onWakeWord();
+    h.commands.onTranscript('Hey LiveKit', false);
+    h.say('Hey, LiveKit.');
+    expect(h.heard).toEqual([
+      ['', false],
+      ['', true],
+    ]);
+    h.say('What time is it? Over.');
+    expect(h.sent).toEqual(['What time is it?']);
+  });
+
+  it('a final that came just before the wake word, with its phrase, is the turn after all', () => {
+    const h = spotted();
+    h.say('Hey LiveKit, what time is it');
+    expect(h.dropped).toEqual([['unaddressed', 'Hey LiveKit, what time is it']]);
+    h.tick(1_500);
+    h.commands.onWakeWord();
+    expect(h.heard).toEqual([['what time is it', true]]);
+    h.say('Over.');
+    expect(h.sent).toEqual(['what time is it']);
+
+    // Too long before, or without the phrase: it stays unaddressed.
+    h.say('Hey LiveKit, call mum');
+    h.tick(5_000);
+    h.commands.onWakeWord();
+    h.say('Over.');
+    expect(h.sent).toEqual(['what time is it']);
+    expect(h.cues.at(-1)).toBe('nope');
+  });
+
+  it('looks for the phrase in two finals at most; a later one keeps every word', () => {
+    const h = spotted();
+    h.commands.onWakeWord();
+    h.say('Book a table');
+    h.say('for two');
+    h.say('near LiveKit HQ. Over.');
+    expect(h.sent).toEqual(['Book a table for two near LiveKit HQ.']);
+  });
+
+  it('a wake word heard after the turn opened only loses its phrase', () => {
+    const h = spotted();
+    h.commands.onWakeWord();
+    h.say('Book a table');
+    h.commands.onWakeWord();
+    expect(h.cues).toEqual(['wake']);
+    h.say('for two, hey LiveKit, at eight. Over.');
+    expect(h.sent).toEqual(['Book a table for two at eight.']);
+    expect(h.dropped).toEqual([]);
+  });
+
+  it('does nothing with the wake switch off, and goes back to the transcript name without the model', () => {
+    const h = spotted();
+    h.commands.configure(false, false);
+    h.commands.onWakeWord();
+    expect(h.cues).toEqual([]);
+    h.commands.configure(true, false);
+    h.commands.useWakeWord(undefined);
+    expect(h.commands.state).toEqual({ on: true, pauseSends: false, waiting: true });
+    h.say('Hey Andy, book a table. Over.');
+    expect(h.sent).toEqual(['book a table.']);
+  });
+});
+
+describe('acoustic wake word in a call', () => {
+  function fakeWakeWord(load: 'ok' | 'fail' = 'ok') {
+    let events!: WakeWordEvents;
+    const pushed: number[] = [];
+    const listening: boolean[] = [];
+    const wake = {
+      phrase: 'hey livekit',
+      threshold: 0.68,
+      ready: load === 'ok' ? Promise.resolve() : Promise.reject(new Error('wake word model not found: x')),
+      listen: vi.fn((on: boolean) => void listening.push(on)),
+      push: vi.fn((pcm: Int16Array) => void pushed.push(pcm.length)),
+      summary: { scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
+      utilization: 0,
+      close: vi.fn(async () => undefined),
+    } satisfies WakeWord;
+    wake.ready.catch(() => undefined);
+    const make = vi.fn((e: WakeWordEvents) => {
+      events = e;
+      return wake;
+    });
+    return {
+      wake,
+      make,
+      pushed,
+      listening,
+      get events() {
+        return events;
+      },
+    };
+  }
+  function wakeCall() {
+    const v = fakeVoice();
+    const r = fakeReviewVoice();
+    let handle!: (op: ReviewOp, payload: string, callerIdentity: string) => Promise<string>;
+    const played: CueKind[] = [];
+    const dropped: unknown[] = [];
+    Object.assign(v.voice, {
+      review: { ...r.voice, serve: (h: typeof handle) => void (handle = h) },
+      playCue: vi.fn(async (kind: CueKind) => void played.push(kind)),
+      publishDropped: vi.fn((d: unknown) => void dropped.push(d)),
+    });
+    const rpc = async (op: ReviewOp, fields: Partial<ReviewRequest> = {}) =>
+      JSON.parse(await handle(op, JSON.stringify({ gen: 1, ...fields }), 'caller-1')) as Record<string, unknown>;
+    const say = (text: string) => {
+      v.events.onCallerSpeaking(true);
+      v.events.onCallerSpeaking(false);
+      v.events.onTranscript?.(text, true, 1);
+    };
+    const frame = (samples = 160, rate = 16_000) =>
+      v.events.onAudio?.(new AudioFrame(new Int16Array(samples), rate, 1, samples));
+    return { v, r, rpc, played, dropped, say, frame };
+  }
+  const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+
+  it('a detection opens the turn like the wake phrase; the page hears the phrase; audio is scored only while waiting', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = wakeCall();
+    const w = fakeWakeWord();
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice, { wakeWord: w.make }));
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    await vi.waitFor(() =>
+      expect(c.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true, phrase: 'hey livekit' }),
+    );
+
+    c.frame();
+    c.frame(160, 48_000);
+    expect(w.pushed).toEqual([160]);
+    expect(w.listening.at(-1)).toBe(true);
+    c.v.events.onAgentSpeaking?.(true);
+    c.frame();
+    expect(w.listening.at(-1)).toBe(false);
+    c.v.events.onAgentSpeaking?.(false);
+
+    c.say('Hey Andy, so the plan is set.');
+    expect(c.dropped).toEqual([{ dropped: 'unaddressed', text: 'Hey Andy, so the plan is set.' }]);
+    w.events.onDetect(0.97);
+    expect(c.r.last.wake?.waiting).toBe(false);
+    c.frame();
+    expect(w.listening.at(-1)).toBe(false);
+    c.say('Hey, LiveKit. Book a table for two. Over.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table for two.']));
+    await vi.waitFor(() => expect(c.played).toEqual(['listening', 'wake', 'sent']));
+    expect(c.r.last.wake?.waiting).toBe(true);
+    c.frame();
+    expect(w.listening.at(-1)).toBe(true);
+    host.endStream();
+    await vi.waitFor(() => expect(w.wake.close).toHaveBeenCalled());
+  });
+
+  it('falls back to the transcript name when the model does not load, or stops', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = wakeCall();
+    const w = fakeWakeWord('fail');
+    const warn = vi.fn();
+    await runCall(
+      ctx,
+      deps(host.fetchImpl, c.v.createVoice, { wakeWord: w.make, log: { info: () => undefined, warn } }),
+    );
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    await vi.waitFor(() =>
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('no wake word model'), expect.anything()),
+    );
+    expect(c.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true });
+    c.frame();
+    expect(w.pushed).toEqual([]);
+    c.say('Hey Andy, book a table. Over.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['book a table.']));
+    host.endStream();
+
+    const second = fakeJob();
+    const c2 = wakeCall();
+    const w2 = fakeWakeWord();
+    await runCall(second.ctx, deps(fakeHostFetch().fetchImpl, c2.v.createVoice, { wakeWord: w2.make }));
+    await c2.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    await vi.waitFor(() => expect(c2.r.last.wake?.phrase).toBe('hey livekit'));
+    w2.events.onError('thread exited');
+    expect(c2.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true });
+  });
+
+  it('a real spotter on real audio: the wake word opens the turn, other speech does not', async () => {
+    const wav = (name: string) => {
+      const buf = fs.readFileSync(new URL(`./voice-wakeword-fixtures/${name}`, import.meta.url));
+      const data = buf.indexOf('data', 12);
+      return new Int16Array(
+        buf.buffer.slice(buf.byteOffset + data + 8, buf.byteOffset + data + 8 + buf.readUInt32LE(data + 4)),
+      );
+    };
+    const { WakeWordSpotter, DEFAULT_WAKE_MODEL } = await import('./voice-wakeword.js');
+    const run = async (audio: Int16Array) => {
+      const { ctx } = fakeJob();
+      const host = fakeHostFetch();
+      const c = wakeCall();
+      let spotter!: InstanceType<typeof WakeWordSpotter>;
+      await runCall(
+        ctx,
+        deps(host.fetchImpl, c.v.createVoice, {
+          wakeWord: (events: WakeWordEvents) =>
+            (spotter = new WakeWordSpotter({ classifier: DEFAULT_WAKE_MODEL, threshold: 0.68, ...events })),
+        }),
+      );
+      await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+      await vi.waitFor(() => expect(c.r.last.wake?.phrase).toBe('hey livekit'));
+      // 20 ms frames, as the room delivers them, each 80 ms waiting for its score.
+      for (let at = 0; at < audio.length; at += 320) {
+        c.v.events.onAudio?.(new AudioFrame(audio.slice(at, at + 320), 16_000, 1, Math.min(320, audio.length - at)));
+        while ((spotter as unknown as { inflight: boolean }).inflight) await new Promise((r) => setTimeout(r, 1));
+      }
+      const waiting = c.r.last.wake?.waiting;
+      const summary = spotter.summary;
+      host.endStream();
+      return { waiting, summary, played: c.played };
+    };
+    const silence = new Int16Array(16_000);
+    const positive = wav('positive.wav');
+    const yes = await run(Int16Array.from([...silence, ...silence, ...positive, ...silence]));
+    expect(yes.waiting).toBe(false);
+    expect(yes.summary.detections).toBe(1);
+    await vi.waitFor(() => expect(yes.played).toContain('wake'));
+    // The same voice and level, played backwards: no wake word.
+    const no = await run(Int16Array.from([...silence, ...silence, ...positive.slice().reverse(), ...silence]));
+    expect(no.summary.scored).toBeGreaterThan(20);
+    expect(no.summary.maxScore).toBeLessThan(0.68);
+    expect(no.waiting).toBe(true);
   });
 });

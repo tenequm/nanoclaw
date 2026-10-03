@@ -160,7 +160,8 @@ export interface CallDraft {
 /**
  * Auto mode's spoken commands: `over` at the end of an utterance sends the turn now, `discard turn`,
  * `discard this turn` or `scratch that` there drops it, and with the wake switch `on` nothing is kept
- * or sent until `hey <agent>` (`waiting` until then). After the wake phrase only `over` sends, unless
+ * or sent until `hey <agent>`, or the worker's acoustic wake word (`CallWakeState.phrase`), is heard
+ * (`waiting` until then). After the wake phrase only `over` sends, unless
  * `pauseSends` lets the closing silence send too. The worker's participant attribute is "1" when it
  * understands them and the `settings` RPC; an older worker sets none, and its auto mode has no
  * commands.
@@ -170,6 +171,11 @@ export interface CallWakeState {
   on: boolean;
   pauseSends: boolean;
   waiting: boolean;
+  /**
+   * The phrase that opens a turn when the worker spots a wake word in the audio (`hey livekit`);
+   * absent when it matches `hey <agent>` in the transcript instead.
+   */
+  phrase?: string;
 }
 
 /**
