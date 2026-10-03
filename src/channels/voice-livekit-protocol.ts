@@ -240,6 +240,8 @@ export interface ReviewRequest {
   wake?: boolean;
   pauseSends?: boolean;
   cues?: boolean;
+  /** For `settings`: the typing sound while the agent works (on unless the page says off; cues off silence it too). */
+  typing?: boolean;
 }
 
 /**

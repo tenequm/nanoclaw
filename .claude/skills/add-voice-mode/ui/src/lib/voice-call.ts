@@ -124,6 +124,8 @@ export interface ReviewControls {
   /** Auto mode's wake switch, and whether a pause sends after the wake phrase. */
   setWake: (on: boolean) => void
   setPauseSends: (on: boolean) => void
+  /** The typing sound while the agent works. */
+  setTyping: (on: boolean) => void
 }
 
 export const LIVE_PHASES: ReadonlySet<Phase> = new Set(["listening", "thinking", "talking"])

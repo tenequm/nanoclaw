@@ -378,6 +378,7 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
   const setMode = useCallback((mode: TurnMode) => pick(mode), [pick])
   const setWake = useCallback((on: boolean) => pick(on ? "wake" : "auto"), [pick])
   const setPauseSends = useCallback((on: boolean) => setReview((r) => ({ ...r, pauseSends: on })), [])
+  const setTyping = useCallback((on: boolean) => setReview((r) => ({ ...r, typing: on })), [])
   const discard = useCallback(() => setReview((r) => ({ ...r, draft: null, ended: false })), [])
 
   useEffect(() => {
@@ -416,8 +417,8 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
   }, [enabled])
 
   const reviewControls = useMemo(
-    () => ({ state: review, setMode, talk: () => {}, done: () => {}, send: () => {}, discard, setWake, setPauseSends }),
-    [review, setMode, discard, setWake, setPauseSends]
+    () => ({ state: review, setMode, talk: () => {}, done: () => {}, send: () => {}, discard, setWake, setPauseSends, setTyping }),
+    [review, setMode, discard, setWake, setPauseSends, setTyping]
   )
 
   return useMemo(

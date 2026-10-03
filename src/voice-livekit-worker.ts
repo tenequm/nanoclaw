@@ -2841,6 +2841,7 @@ export function readReviewRequest(payload: string): ReviewRequest | null {
       ...(typeof req.wake === 'boolean' ? { wake: req.wake } : {}),
       ...(typeof req.pauseSends === 'boolean' ? { pauseSends: req.pauseSends } : {}),
       ...(typeof req.cues === 'boolean' ? { cues: req.cues } : {}),
+      ...(typeof req.typing === 'boolean' ? { typing: req.typing } : {}),
     };
   } catch {
     return null;
@@ -3587,13 +3588,15 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   } as Pick<Console, 'info' | 'warn'>;
   /** The page's `?cues=0` turns the cues off, through the `settings` RPC. */
   let cuesOn = true;
+  /** The page's typing switch, through the `settings` RPC. */
+  let typingWanted = true;
   let agentSpeaking = false;
   /** The page shows the agent working. */
   let thinking = false;
   let typingOn = false;
-  /** The typing sound plays while the agent works and is not speaking, with cues on. */
+  /** The typing sound plays while the agent works and is not speaking, with cues and the typing switch on. */
   const updateTyping = () => {
-    const on = thinking && !agentSpeaking && cuesOn && !ending;
+    const on = thinking && !agentSpeaking && cuesOn && typingWanted && !ending;
     if (on === typingOn) return;
     typingOn = on;
     callVoice?.setTyping?.(on);
@@ -4012,6 +4015,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       resetCaller: () => turnTaking.resetCaller(),
       configure: (req) => {
         if (req.cues !== undefined) cuesOn = req.cues;
+        if (req.typing !== undefined) typingWanted = req.typing;
         updateTyping();
         callTurns.configure(req.wake ?? callTurns.state.on, req.pauseSends ?? callTurns.state.pauseSends);
         readyCue();

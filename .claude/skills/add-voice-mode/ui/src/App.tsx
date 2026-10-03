@@ -917,6 +917,21 @@ export default function App() {
       onPauseSends={rc.setPauseSends}
     />
   )
+  // The typing sound while the agent works, in either mode; a worker without the settings RPC has none.
+  const typingRow = rc && rc.state.commands && (
+    <div className="sound-row">
+      <Switch
+        label="Typing sound"
+        on={rc.state.typing}
+        disabled={phase === "connecting" || reconnecting || !!rc.state.pending}
+        describedBy="typing-desc"
+        onClick={() => rc.setTyping(!rc.state.typing)}
+      />
+      <span id="typing-desc" className="sr-only">
+        A quiet keyboard sound while the agent works on your turn.
+      </span>
+    </div>
+  )
   // A refusal about the draft ("send or discard first") shows on the draft, not under the switch.
   // Ending the call is on offer next to an open draft (the keys are Discard and Send); it drops the draft.
   const draftPanel = rv?.panel ? <DraftPanel panel={rv.panel} note={rs?.note ?? null} copyable={keptDraft} onEnd={rv.endable && live ? call.end : undefined} /> : null
@@ -1062,6 +1077,7 @@ export default function App() {
         )}
         {modeRow}
         {commandsBlock}
+        {typingRow}
         <div className={`keys${showRight ? "" : " one"}`}>
           <div className="key key-end">
             <button type="button" className={`cap${primary.neutral ? "" : " orange"}`} onClick={primary.onClick} aria-disabled={primary.disabled} disabled={primary.disabled}>
@@ -1227,6 +1243,7 @@ export default function App() {
             </section>
             {skin !== "te" && modeRow}
             {skin !== "te" && commandsBlock}
+            {skin !== "te" && typingRow}
             <div className="control-bar">{keys}</div>
           </>
         )}

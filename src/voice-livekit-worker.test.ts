@@ -1588,6 +1588,8 @@ describe('review mode', () => {
       mode: 'review',
       wake: true,
     });
+    expect(readReviewRequest('{"gen":4,"typing":false,"cues":true}')).toEqual({ gen: 4, typing: false, cues: true });
+    expect(readReviewRequest('{"gen":5,"typing":"no"}')).toEqual({ gen: 5 });
     expect(readReviewRequest('{"draft":2}')).toBeNull();
     expect(readReviewRequest('nope')).toBeNull();
   });
@@ -1777,8 +1779,8 @@ describe('spoken command matching', () => {
     expect(rest('Book a table. Sent it.')).toBe('Book a table.');
     expect(rest('Book a table, send eat')).toBe('Book a table.');
     // The transcription may cut it to its first word.
-    expect(rest('Скільки я читав сьогодні? Send.')).toBe('Скільки я читав сьогодні?');
-    expect(rest('Скільки я читав сьогодні? Прийом.')).toBe('Скільки я читав сьогодні?');
+    expect(rest('Скільки зараз часу? Send.')).toBe('Скільки зараз часу?');
+    expect(rest('Скільки зараз часу? Прийом.')).toBe('Скільки зараз часу?');
     expect(rest('Прийом')).toBe('');
     expect(rest('send it again')).toBeNull();
   });
@@ -2019,14 +2021,14 @@ describe('CallTurns, hands-free', () => {
 
   it('keeps a thinking pause in the same turn: one activity, one text', async () => {
     const h = turnsHarness();
-    h.t.results.push(heard('з пошуком нового корма', 'З пошуком, не знаю, нового корма.'));
+    h.t.results.push(heard('з купівлею нового столу', 'З купівлею, не знаю, нового столу.'));
     await h.talk(1000);
     await h.pass(1500);
     await h.talk(800);
     await h.pass(SILENCE);
     expect(h.t.begins).toHaveLength(1);
     expect(h.t.ended).toBe(1);
-    expect(h.out.sent).toEqual(['З пошуком, не знаю, нового корма.']);
+    expect(h.out.sent).toEqual(['З купівлею, не знаю, нового столу.']);
   });
 
   it('a command in two interims in a row, with the caller silent, ends the turn; the final confirms and is stripped', async () => {
@@ -2077,12 +2079,12 @@ describe('CallTurns, hands-free', () => {
   it('a final that leaves the command out but ends where the interim text did still confirms it', async () => {
     const h = turnsHarness();
     h.t.results.push(
-      heard('знайти мій діалог, що саме там він питає? Прийом.', 'Знайти мій діалог, і що саме там він питає?'),
+      heard('перевір мій список, що саме там треба купити? Прийом.', 'Перевір мій список, і що саме там треба купити?'),
     );
     await h.talk(1500);
-    await h.interim('знайти мій діалог, що саме там він питає? Прийом.');
-    await h.interim('знайти мій діалог, що саме там він питає? Прийом.');
-    expect(h.out.sent).toEqual(['Знайти мій діалог, і що саме там він питає?']);
+    await h.interim('перевір мій список, що саме там треба купити? Прийом.');
+    await h.interim('перевір мій список, що саме там треба купити? Прийом.');
+    expect(h.out.sent).toEqual(['Перевір мій список, і що саме там треба купити?']);
     expect(h.t.begins).toHaveLength(1);
   });
 
@@ -2090,16 +2092,16 @@ describe('CallTurns, hands-free', () => {
     const h = turnsHarness();
     h.t.results.push(
       heard(
-        'а можеш мені розказати чим я закінчив з проєктом Альфа? Scratch that.',
-        'А можеш мені розказати, чим я закінчив з Альфа проектом?',
+        'а можеш мені нагадати коли ми почали з проєктом Бета? Scratch that.',
+        'А можеш мені нагадати, коли ми почали з Бета проектом?',
       ),
     );
     await h.talk(2000);
-    await h.interim('а можеш мені розказати чим я закінчив з проєктом Альфа?');
-    await h.interim('а можеш мені розказати чим я закінчив з проєктом Альфа? Scratch that.');
+    await h.interim('а можеш мені нагадати коли ми почали з проєктом Бета?');
+    await h.interim('а можеш мені нагадати коли ми почали з проєктом Бета? Scratch that.');
     await h.pass(SILENCE);
     expect(h.out.sent).toEqual([]);
-    expect(h.out.drops).toEqual([['discarded', 'А можеш мені розказати, чим я закінчив з Альфа проектом?']]);
+    expect(h.out.drops).toEqual([['discarded', 'А можеш мені нагадати, коли ми почали з Бета проектом?']]);
     // An interim command the final does not end like is not taken: the final's words win.
     h.t.results.push(heard('Remind me to send it.', 'Remind me to send it to Anna tomorrow.'));
     await h.talk(1500);
@@ -2121,8 +2123,8 @@ describe('CallTurns, hands-free', () => {
   });
 
   it('reads where a final ends by sound, across spellings and scripts', () => {
-    expect(endsLike('чим я закінчив з Альфа проектом?', 'чим я закінчив з проєктом Альфа?')).toBe(true);
-    expect(endsLike('що саме там він питає?', 'і сказати, що саме там він питає?')).toBe(true);
+    expect(endsLike('коли ми почали з Бета проектом?', 'коли ми почали з проєктом Бета?')).toBe(true);
+    expect(endsLike('що саме там треба купити?', 'і сказати, що саме там треба купити?')).toBe(true);
     expect(endsLike('Send it to Anna tomorrow.', 'Remind me to')).toBe(false);
     expect(endsLike('Yes.', 'Yes')).toBe(false);
   });
@@ -2870,6 +2872,29 @@ describe('commands, cues and review in a call', () => {
     await vi.waitFor(() => expect(typing).toEqual([true, false, true]));
     await v.rpc('settings', { cues: false });
     expect(typing).toEqual([true, false, true, false]);
+    host.endStream();
+  });
+
+  it("the page's typing switch: off, no typing while the agent works; off mid-work stops it at once", async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const typing: boolean[] = [];
+    Object.assign(v.voice, { setTyping: vi.fn((on: boolean) => void typing.push(on)) });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.rpc('settings', { typing: false });
+    await v.turn('Book a table');
+    host.emit({ type: 'working' });
+    await flush();
+    expect(typing).toEqual([]);
+    // Back on while the agent still works: it types; off again, it stops right there.
+    await v.rpc('settings', { typing: true });
+    expect(typing).toEqual([true]);
+    await v.rpc('settings', { typing: false });
+    expect(typing).toEqual([true, false]);
+    // Settings that leave the switch out keep it as it is.
+    await v.rpc('settings', { wake: false });
+    expect(typing).toEqual([true, false]);
     host.endStream();
   });
 

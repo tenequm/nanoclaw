@@ -1198,6 +1198,7 @@
 .cmds-title { font-family: var(--font-mono); font-size: 0.6875rem; font-weight: 500; letter-spacing: 0.06em; text-transform: lowercase; color: var(--foreground); }
 .cmds-explain { font-size: 0.75rem; line-height: 1.35; color: var(--muted-foreground); }
 .cmds-switches { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
+.sound-row { display: grid; grid-template-columns: minmax(0, 1fr); }
 .sw {
   position: relative;
   display: flex;

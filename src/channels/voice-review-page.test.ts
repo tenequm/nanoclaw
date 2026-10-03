@@ -28,7 +28,7 @@ type View = {
   modeDisabled: boolean;
   endable: boolean;
 };
-type Prefs = { mode: string; wake: boolean; pauseSends: boolean };
+type Prefs = { mode: string; wake: boolean; pauseSends: boolean; typing: boolean };
 interface ReviewLib {
   INITIAL_REVIEW: ReviewState;
   reviewView(input: {
@@ -377,7 +377,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     ])
       expect(lib.isCommandOnly(said), said).toBe(true);
     expect(lib.lineKey('Book a table for two. Send it.')).toBe('bookatablefortwo');
-    expect(lib.lineKey('Скільки я читав? Прийом.')).toBe('скількиячитав');
+    expect(lib.lineKey('Скільки зараз часу? Прийом.')).toBe('скількизаразчасу');
     // "over" is no longer a command: it stays part of what was said.
     expect(lib.isCommandOnly('Over.')).toBe(false);
     expect(lib.lineKey('Game over')).toBe('gameover');
@@ -402,7 +402,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
 
   it('never names a placeholder agent in the wake switch: no phrase until the line info says one', () => {
     expect(lib.wakeSwitchPhrase(review({ wakePhrase: null }), 'your agent', 'your agent')).toBeNull();
-    expect(lib.wakeSwitchPhrase(review({ wakePhrase: null }), 'Dan', 'your agent')).toBe('Hey Dan');
+    expect(lib.wakeSwitchPhrase(review({ wakePhrase: null }), 'Andy', 'your agent')).toBe('Hey Andy');
     expect(lib.wakeSwitchPhrase(review({ wakePhrase: 'Hey LiveKit' }), 'your agent', 'your agent')).toBe('Hey LiveKit');
   });
 
@@ -457,19 +457,22 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
       vi.unstubAllGlobals();
     });
 
-    it('a new caller starts hands-free with the wake switch on', () => {
+    it('a new caller starts hands-free with the wake switch and the typing sound on', () => {
       withPrefs(undefined);
-      expect(lib.DEFAULT_PREFS).toEqual({ mode: 'auto', wake: true, pauseSends: false });
-      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: true, pauseSends: false });
+      expect(lib.DEFAULT_PREFS).toEqual({ mode: 'auto', wake: true, pauseSends: false, typing: true });
+      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: true, pauseSends: false, typing: true });
+      expect(lib.INITIAL_REVIEW).toMatchObject({ typing: true });
     });
 
     it('a remembered choice wins, a remembered off included; a missing one takes its default', () => {
       withPrefs(JSON.stringify({ mode: 'review', wake: true, pauseSends: true }));
-      expect(lib.storedPrefs()).toEqual({ mode: 'review', wake: true, pauseSends: true });
+      expect(lib.storedPrefs()).toEqual({ mode: 'review', wake: true, pauseSends: true, typing: true });
       withPrefs(JSON.stringify({ wake: false }));
-      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: false, pauseSends: false });
+      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: false, pauseSends: false, typing: true });
       withPrefs(JSON.stringify({ mode: 'review' }));
-      expect(lib.storedPrefs()).toEqual({ mode: 'review', wake: true, pauseSends: false });
+      expect(lib.storedPrefs()).toEqual({ mode: 'review', wake: true, pauseSends: false, typing: true });
+      withPrefs(JSON.stringify({ typing: false }));
+      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: true, pauseSends: false, typing: false });
     });
 
     it('corrupt or foreign values read as nothing remembered, each on its own', () => {
@@ -477,10 +480,10 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
         withPrefs(raw);
         expect(lib.storedPrefs(), raw).toEqual(lib.DEFAULT_PREFS);
       }
-      withPrefs(JSON.stringify({ mode: 'walkie', wake: 'no', pauseSends: 1 }));
+      withPrefs(JSON.stringify({ mode: 'walkie', wake: 'no', pauseSends: 1, typing: 'off' }));
       expect(lib.storedPrefs()).toEqual(lib.DEFAULT_PREFS);
       withPrefs(JSON.stringify({ mode: 'walkie', wake: false }));
-      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: false, pauseSends: false });
+      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: false, pauseSends: false, typing: true });
     });
 
     it('blocked or missing storage reads the defaults and never throws on a write', () => {
@@ -489,7 +492,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
       };
       vi.stubGlobal('localStorage', { getItem: blocked, setItem: blocked, removeItem: blocked });
       expect(lib.storedPrefs()).toEqual(lib.DEFAULT_PREFS);
-      expect(() => lib.storePrefs({ mode: 'review', wake: false, pauseSends: false })).not.toThrow();
+      expect(() => lib.storePrefs({ mode: 'review', wake: false, pauseSends: false, typing: false })).not.toThrow();
       expect(lib.storedWakePhrase()).toBeNull();
       expect(() => lib.storeWakePhrase('Hey LiveKit')).not.toThrow();
       vi.stubGlobal('localStorage', undefined);
@@ -497,15 +500,16 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
       expect(() => lib.storePrefs(lib.DEFAULT_PREFS)).not.toThrow();
     });
 
-    it('keeps exactly the three picks, and reads back what it kept', () => {
+    it('keeps exactly the four picks, and reads back what it kept', () => {
       const store = withPrefs(undefined);
-      lib.storePrefs({ mode: 'review', wake: false, pauseSends: true, extra: 1 } as Prefs);
+      lib.storePrefs({ mode: 'review', wake: false, pauseSends: true, typing: false, extra: 1 } as Prefs);
       expect(JSON.parse(store.items.get('voice-review-prefs') ?? '')).toEqual({
         mode: 'review',
         wake: false,
         pauseSends: true,
+        typing: false,
       });
-      expect(lib.storedPrefs()).toEqual({ mode: 'review', wake: false, pauseSends: true });
+      expect(lib.storedPrefs()).toEqual({ mode: 'review', wake: false, pauseSends: true, typing: false });
     });
 
     it('settings the worker did not take fall back to what it runs, and are never remembered', () => {
@@ -518,7 +522,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
       // A worker that has not said yet starts waiting for the wake phrase.
       expect(lib.settingsNotTaken(undefined)).toMatchObject({ wake: true, pauseSends: false });
       expect(store.setItem).not.toHaveBeenCalled();
-      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: false, pauseSends: false });
+      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: false, pauseSends: false, typing: true });
     });
 
     it('a fresh phrase replaces a stale stored one, case and all', () => {
