@@ -328,6 +328,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const nextId = useRef(1)
   const segmentLine = useRef(new Map<string, number>())
   const segmentText = useRef(new Map<string, string>())
+  /** The caller's segments whose text is still interim: the transcription may yet change it. */
+  const interimSegments = useRef(new Set<string>())
   const coveredLines = useRef(new Set<number>())
   const doneTurns = useRef(new Set<string>())
   const lastDeltaAt = useRef(0)
@@ -710,8 +712,12 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         (localSid.current !== null && attrs["lk.transcribed_track_id"] === localSid.current) ||
         t.participantInfo.identity === room.localParticipant.identity
       const text = mine ? spaceSentences(t.text.trim()) : t.text.trim()
-      if (!text || segmentText.current.get(key) === text) continue
+      // The final often repeats the last interim text word for word; it still firms the line up.
+      const interim = mine && attrs["lk.transcription_final"] !== "true"
+      if (!text || (segmentText.current.get(key) === text && interimSegments.current.has(key) === interim)) continue
       segmentText.current.set(key, text)
+      if (interim) interimSegments.current.add(key)
+      else interimSegments.current.delete(key)
       const r = reviewRef.current
       if (mine && (reviewSegments.current.has(key) || (r.mode === "review" && !segmentLine.current.has(key)) || r.pending?.to === "review")) {
         reviewSegments.current.add(key)
@@ -736,10 +742,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         const about = reply ? { group: reply.group, ...(first && reply.re ? { re: reply.re } : {}) } : {}
         const woke = mine && wakeNext.current
         if (woke) wakeNext.current = false
-        next = [...next, { id: nid, from: mine ? "user" : "assistant", text, at: secondsIn(), ...about, ...(woke ? { wake: true } : {}) }]
+        next = [...next, { id: nid, from: mine ? "user" : "assistant", text, at: secondsIn(), ...about, ...(woke ? { wake: true } : {}), ...(interim ? { interim } : {}) }]
         touched = nid
       } else {
-        next = next.map((l) => (l.id === id ? { ...l, text } : l))
+        next = next.map((l) => (l.id === id ? { ...l, text, interim: interim || undefined } : l))
         touched = id
       }
       if (mine) lastUserAt.current = Date.now()
@@ -834,6 +840,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     commitLines([])
     segmentLine.current.clear()
     segmentText.current.clear()
+    interimSegments.current.clear()
     coveredLines.current.clear()
     doneTurns.current.clear()
     shownTurns.current.clear()

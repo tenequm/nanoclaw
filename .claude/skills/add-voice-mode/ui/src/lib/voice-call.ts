@@ -25,6 +25,8 @@ export interface Line {
   wake?: boolean
   /** The line opens with words said before the wake phrase, which the worker ignored. */
   preWake?: boolean
+  /** A caller line the transcription may still revise: shown dimmed until its final text. */
+  interim?: boolean
   /** An agent line the worker could not speak: its text, shown instead of heard. */
   unspoken?: boolean
   /** Not a caption: the page's own note, `unheard` when the caller spoke over the agent. */
