@@ -27,7 +27,7 @@ import {
   type TurnMark,
   type VoiceCall,
 } from "./voice-call"
-import { COMMANDS_VERSION, INITIAL_REVIEW, autoBlock, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, storeWakePhrase, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSION, INITIAL_REVIEW, autoBlock, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, storeWakePhrase, storedWakePhrase, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -146,7 +146,8 @@ function endReasonText(metadata: string | undefined): string | null {
 type SettledTurn = { turn: number; status: "sent" | "lost"; reason?: TurnMark["reason"]; text?: string }
 /**
  * Caller words the worker will never send (CallDroppedSpeech): a spoken discard, speech before the
- * wake phrase, or a spoken command said alone, with nothing open to act on.
+ * wake phrase, a spoken command said alone, with nothing open to act on, or the words of a turn the
+ * wake phrase opened that went back to waiting (`asleep`).
  */
 type DroppedSpeech = { dropped: "discarded" | "unaddressed" | "command" | "asleep"; text: string }
 
@@ -214,7 +215,9 @@ const within = (said: string, line: Line) => norm(line.text) !== "" && said.incl
 /**
  * Put a turn's mark on the caller lines it is made of: the latest unmarked one its final text
  * contains, else the latest unmarked one, and the unmarked ones before it (the same turn's opening
- * segments). A turn with no caption at all (nothing transcribed) gets a line of its own. A second
+ * segments). A turn with no caption at all (nothing transcribed), or lost with no words, gets a line
+ * of its own. With the transcript cut at the wake phrase (`wakeCut`), an earlier open line the text
+ * does not contain is the phrase's own caption: marked as the wake phrase, not as the turn. A second
  * status for a turn (a timed-out one the agent got after all) replaces the mark on its lines.
  */
 function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, newLine: () => Line, turn: number, wakeCut = false): Line[] {
@@ -249,8 +252,8 @@ function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, new
 }
 
 /**
- * Mark the caller lines of words the worker dropped. A discard drops the whole open turn: every open
- * line. Speech before the wake phrase is one transcript: the latest open line it contains and the
+ * Mark the caller lines of words the worker dropped. A discard, or a turn gone back to waiting, drops
+ * the whole open turn: every open line. Speech before the wake phrase is one transcript: the latest open line it contains and the
  * open ones before it, else the oldest open line; the newest may already be the caller's next words.
  */
 function applyDropped(lines: Line[], covered: Set<number>, d: DroppedSpeech): Line[] {
@@ -368,8 +371,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const joinedAt = useRef(0)
 
   // Review mode. The worker owns the draft; the page shows its newest state and asks for changes.
-  const [review, setReviewState] = useState<ReviewState>(INITIAL_REVIEW)
-  const reviewRef = useRef<ReviewState>(INITIAL_REVIEW)
+  const [review, setReviewState] = useState<ReviewState>(() => ({ ...INITIAL_REVIEW, wakePhrase: storedWakePhrase() }))
+  const reviewRef = useRef<ReviewState>(review)
   const { textStreams: reviewStreams } = useTextStream(REVIEW_TOPIC, { room })
   const doneReviewStreams = useRef(new Set<string>())
   const reviewSeq = useRef(0)
@@ -1076,8 +1079,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     const done = awaitSeq.current !== null && snap.seq >= awaitSeq.current
     if (done) awaitSeq.current = null
     if (snap.wake) {
+      if (workerWake.current?.phrase !== snap.wake.phrase || !workerWake.current) storeWakePhrase(snap.wake.phrase ?? null)
       workerWake.current = snap.wake
-      storeWakePhrase(snap.wake.phrase ?? null)
     }
     const awaitingWake = !!snap.wake?.on && snap.wake.waiting
     const heard = snap.wake?.heard

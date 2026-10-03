@@ -722,7 +722,7 @@ id, nothing is posted) and the host logs why once.
 The page's readout follows the worker: Listening, `<agent>` is working (with
 "you can keep talking" and a local wait clock) while `nanoclaw.voice.thinking`
 is set, and `<agent>` is speaking (speech is ignored until the reply finishes;
-the mute key says "not listening during reply"); captions come from
+the mute key says "Paused for reply"); captions come from
 `lk.transcription` (the caller's interim text shows live), and each caller turn
 gets a small sent / not-sent mark from the worker's `nanoclaw.voice.turn`
 stream. A lost turn also stays as a notice above the transcript until a later
@@ -750,8 +750,9 @@ are never taken for the agent speaking. Each is 150-250 ms of held tone about
 ready, a quicker higher two-note (wake) on the wake phrase, a single high note
 (sent) as a turn goes out, a falling low two-note (discard) on a spoken discard,
 a falling two-note (your turn) once the agent is done and nothing else is
-queued, a low note (nope) for a command with nothing to act on, and two soft
-notes when a review draft is ready. Silence while the agent works; none plays
+queued, a low note (nope) for a command with nothing to act on, two soft
+notes when a review draft is ready, and a soft falling two-note (sleep) when a
+turn the wake phrase opened goes back to waiting. Silence while the agent works; none plays
 while it speaks. A reply the speech model could not synthesize is shown on the
 page as text marked "reply not spoken" (the reply topic carries
 `{"reply", "unspoken": true, "text"}` after it), and no your-turn cue plays for it.

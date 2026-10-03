@@ -2466,7 +2466,7 @@ describe('speech model memory across calls', () => {
 
 describe('cue audio', () => {
   it('is 20 ms frames of 48 kHz mono: 150-250 ms of tone held near its level, with soft edges', () => {
-    for (const kind of ['listening', 'wake', 'sent', 'discard', 'turn', 'nope', 'draft'] as const) {
+    for (const kind of ['listening', 'wake', 'sent', 'discard', 'turn', 'nope', 'draft', 'sleep'] as const) {
       const frames = cueFrames(kind);
       for (const f of frames) expect([f.sampleRate, f.channels, f.samplesPerChannel]).toEqual([48_000, 1, 960]);
       const pcm = Int16Array.from(frames.flatMap((f) => [...f.data]));
@@ -3406,6 +3406,34 @@ describe('acoustic wake word in a call', () => {
     c.v.events.onCallerSpeaking(false);
     c.v.events.onTranscript?.('Hey, LiveKit. What time is it? Send it.', true, 3);
     await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table for two.', 'What time is it?']));
+    host.endStream();
+  });
+
+  it('a commit still waiting for a final from before the wake phrase does not take the turn it opened', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = wakeCall();
+    const w = fakeWakeWord();
+    let stream = 1;
+    Object.assign(c.v.voice, { cutTranscription: vi.fn(() => ++stream) });
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice, { wakeWord: w.make }));
+    await c.rpc('settings', { wake: true, pauseSends: true, cues: true });
+    await vi.waitFor(() => expect(c.r.last.wake?.phrase).toBe('hey livekit'));
+    const take = { sttModel: 'gemini-3.5-transcribe-live' };
+    // Speech before the phrase, its final late: the session's commit waits for it.
+    c.v.events.onCallerSpeaking(true);
+    c.v.events.onTranscript?.('So that', false, 1);
+    c.v.events.onCallerSpeaking(false);
+    c.v.events.onTurn('So that', take);
+    w.events.onDetect(0.9, 0);
+    await new Promise((r) => setTimeout(r, 10));
+    c.v.events.onTranscript?.('Book a table', true, 2);
+    await new Promise((r) => setTimeout(r, 10));
+    c.v.events.onTranscript?.('for two.', true, 2);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(utterances(host)).toEqual([]);
+    c.v.events.onTurn('Book a table for two.', take);
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table for two.']));
     host.endStream();
   });
 
