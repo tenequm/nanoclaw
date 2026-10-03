@@ -57,9 +57,17 @@ import {
   TurnCapture,
   TurnTaking,
   callSession,
+  setTtsDown,
+  ttsDownSince,
+  TTS_DOWN_MEMORY_MS,
+  CueFeed,
   cueFrames,
   matchCommand,
   matchWake,
+  matchWakeText,
+  wakeWordSettings,
+  type WakeWord,
+  type WakeWordEvents,
   READY_CUE_WAIT_MS,
   SpokenCommands,
   TURN_CUE_DELAY_MS,
@@ -375,6 +383,21 @@ describe('TurnTaking', () => {
     expect(said).toEqual(['First.', 'Second.']);
   });
 
+  it('frees the channel at once when the caller speech came to no turn', async () => {
+    vi.useFakeTimers();
+    const { deps, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.onCallerSpeaking(true);
+    turnTaking.onReply('First.');
+    turnTaking.onCallerSpeaking(false);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(said).toEqual([]);
+    // Words before the wake phrase, a discard, noise: nothing will be committed.
+    turnTaking.releaseTurn();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(said).toEqual(['First.']);
+  });
+
   it('lets a reply take the channel from a caller who never stops', async () => {
     vi.useFakeTimers();
     const { deps, said } = fakeTurnTakingDeps();
@@ -450,6 +473,56 @@ describe('TurnTaking', () => {
     turnTaking.onReply('Reply three.');
     await turnTaking.idle();
     expect(said).toEqual([FAILURE_LINES.reply.en, 'Reply three.']);
+  });
+
+  it('a reply the speech model failed on goes to the page as text, and no line was heard: no hand-over', async () => {
+    const announced: unknown[] = [];
+    const handOvers: boolean[] = [];
+    let ok = false;
+    const { deps } = fakeTurnTakingDeps({
+      say: async () => ok,
+      announce: (info) => announced.push(info),
+      spokenAll: (spoken) => handOvers.push(spoken),
+    });
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'en' });
+    turnTaking.onReply('Booked for **eight**.', 2);
+    await turnTaking.idle();
+    expect(announced).toEqual([
+      { reply: 1, turn: 2, part: 1 },
+      { reply: 1, turn: 2, part: 1, unspoken: true, text: 'Booked for eight.' },
+      // The spoken failure line failed too.
+      { reply: 2, notice: true },
+    ]);
+    expect(handOvers).toEqual([false]);
+    ok = true;
+    turnTaking.onReply('Done.');
+    await turnTaking.idle();
+    expect(handOvers).toEqual([false, true]);
+  });
+
+  it('a line queued while another plays says so again on the playing line: another follows', async () => {
+    const announced: unknown[] = [];
+    let finish!: () => void;
+    const { deps } = fakeTurnTakingDeps({
+      announce: (info) => announced.push(info),
+      say: vi.fn(async (text: string) => {
+        if (text === 'One.') await new Promise<void>((r) => (finish = r));
+        return true;
+      }),
+    });
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'en' });
+    turnTaking.onReply('One.', 1);
+    await flush();
+    expect(announced).toEqual([{ reply: 1, turn: 1, part: 1 }]);
+    turnTaking.onReply('Two.', 1);
+    expect(announced.at(-1)).toEqual({ reply: 1, turn: 1, part: 1, more: true });
+    finish();
+    await turnTaking.idle();
+    expect(announced.at(-1)).toEqual({ reply: 2, turn: 1, part: 2 });
+    // Nothing plays now: a new line labels only itself.
+    turnTaking.onReply('Three.', 1);
+    await turnTaking.idle();
+    expect(announced).toHaveLength(4);
   });
 
   it('describes each line before it is spoken: the turn it answers, unprompted, or its own notice', async () => {
@@ -637,7 +710,7 @@ describe('runCall', () => {
     expect(v.createVoice).toHaveBeenCalledWith(
       ctx,
       expect.objectContaining({ callId: 'call-1' }),
-      { geminiKey: 'gk-test', record: false },
+      { geminiKey: 'gk-test', record: false, ttsStateFile: expect.stringMatching(/voice-tts-state\.json$/) },
       v.events,
     );
     // The host address and secret come from the worker's settings, never from the dispatch.
@@ -1951,17 +2024,34 @@ describe('review mode in the session', () => {
 
 describe('spoken command matching', () => {
   it('finds a command only at the end of an utterance, with what was said before it', () => {
-    expect(matchCommand('Book a table for two. Over.')).toEqual({ command: 'over', rest: 'Book a table for two.' });
-    expect(matchCommand('book a table, over')).toEqual({ command: 'over', rest: 'book a table' });
-    expect(matchCommand('OVER!')).toEqual({ command: 'over', rest: '' });
-    // The transcription may write it in Cyrillic.
-    expect(matchCommand('Забронюй столик. Овер.')).toEqual({ command: 'over', rest: 'Забронюй столик.' });
-    // Mid-sentence it is a word, and so is a longer word ending in it.
-    expect(matchCommand("Let's start over with the plan")).toBeNull();
-    expect(matchCommand('It is all over the news, moreover')).toBeNull();
-    expect(matchCommand('Takeover')).toBeNull();
+    expect(matchCommand('Book a table for two. Send it.')).toEqual({ command: 'send', rest: 'Book a table for two.' });
+    expect(matchCommand('book a table, send it')).toEqual({ command: 'send', rest: 'book a table' });
+    expect(matchCommand('SEND IT!')).toEqual({ command: 'send', rest: '' });
+    // Mid-sentence it is words, and so is a longer word ending in it.
+    expect(matchCommand('Send it to Anna tomorrow')).toBeNull();
+    expect(matchCommand('It was godsend')).toBeNull();
+    // `over` is no command any more: a Ukrainian speaker's `over` is transcribed as anything.
+    expect(matchCommand('Book a table. Over.')).toBeNull();
     // A sentence that really ends in it sends: the price of hands-free.
-    expect(matchCommand("Let's start over.")).toEqual({ command: 'over', rest: "Let's start" });
+    expect(matchCommand("I'll send it.")).toEqual({ command: 'send', rest: "I'll" });
+  });
+
+  it('hears send it as a Ukrainian speaker gets it transcribed, and the Ukrainian прийом', () => {
+    const rest = (text: string) => {
+      const m = matchCommand(text);
+      return m?.command === 'send' ? m.rest : null;
+    };
+    expect(rest('Забронюй столик. Сенд іт.')).toBe('Забронюй столик.');
+    expect(rest('Забронюй столик, сендіт')).toBe('Забронюй столик');
+    expect(rest('Сендип.')).toBe('');
+    expect(rest('Book a table, sendit')).toBe('Book a table');
+    expect(rest('Book a table. Sent it.')).toBe('Book a table.');
+    expect(rest('Book a table, send eat')).toBe('Book a table');
+    // The transcription may cut it to its first word.
+    expect(rest('Скільки я читав сьогодні? Send.')).toBe('Скільки я читав сьогодні?');
+    expect(rest('Скільки я читав сьогодні? Прийом.')).toBe('Скільки я читав сьогодні?');
+    expect(rest('Прийом')).toBe('');
+    expect(rest('send it again')).toBeNull();
   });
 
   it('knows the discard phrases, longest first, and only at the end', () => {
@@ -1978,10 +2068,13 @@ describe('spoken command matching', () => {
   it('finds the wake phrase by the agent name or its vocabulary spellings, across scripts and punctuation', () => {
     const names = wakeNameWords(['Andy', 'Енді', 'Nano Claw', 'Al']);
     const after = (text: string) => {
-      const end = matchWake(text, names);
-      return end < 0 ? null : text.slice(end);
+      const found = matchWake(text, names);
+      return found && text.slice(found.end);
     };
     expect(after('Hey, Andy. What is on today?')).toBe('. What is on today?');
+    // It starts at its hey, glued or not.
+    expect(matchWake('So I said hey Andy', names)).toEqual({ start: 10, end: 18 });
+    expect(matchWake('Ok. Heyandy, go', wakeNameWords(['Andy']))).toEqual({ start: 4, end: 11 });
     expect(after('hey andy')).toBe('');
     expect(after('Гей, Енді, що там?')).toBe(', що там?');
     expect(after('Хей Енді')).toBe('');
@@ -2000,23 +2093,47 @@ describe('spoken command matching', () => {
     expect(after('hey Al, go')).toBe(', go');
     expect(after('hey all, go')).toBeNull();
   });
+
+  it('takes hi and хай for hey, a Ukrainian vocative, and hey glued to the name', () => {
+    const ben = wakeNameWords(['Ben']);
+    const sam = wakeNameWords(['Sam']);
+    const after = (text: string, names = ben) => {
+      const found = matchWake(text, names);
+      return found && text.slice(found.end);
+    };
+    expect(after('Hi Ben, what time is it?')).toBe(', what time is it?');
+    expect(after('Хай Бен')).toBe('');
+    expect(after('Hai Ben')).toBe('');
+    expect(after('Гей, Бене, що там?')).toBe(', що там?');
+    expect(after('Гей, Семе', sam)).toBe('');
+    expect(after('Heyben, go')).toBe(', go');
+    // Not every word that starts like hey: `hidden` is no `hi Den`.
+    expect(after('It was hidden', wakeNameWords(['Den']))).toBeNull();
+    expect(after('Hey Bena')).toBeNull();
+    // The vocative ending only counts in Cyrillic: `Hey, bone` is not `Hey, Ben`.
+    expect(after('Hey, bone')).toBeNull();
+  });
 });
 
-function commandsHarness(names = ['Andy']) {
+function commandsHarness(names = ['Andy'], now?: () => number) {
   const sent: string[] = [];
   const cues: CueKind[] = [];
   const dropped: Array<[string, string]> = [];
   const heard: Array<[string, boolean]> = [];
   let cuts = 0;
   let changes = 0;
-  const commands = new SpokenCommands(names, {
-    send: (text) => sent.push(text),
-    cue: (kind) => cues.push(kind),
-    drop: (reason, text) => dropped.push([reason, text]),
-    heard: (text, final) => heard.push([text, final]),
-    cut: () => cuts++,
-    changed: () => changes++,
-  });
+  const commands = new SpokenCommands(
+    names,
+    {
+      send: (text) => sent.push(text),
+      cue: (kind) => cues.push(kind),
+      drop: (reason, text) => dropped.push([reason, text]),
+      heard: (text, final) => heard.push([text, final]),
+      cut: () => cuts++,
+      changed: () => changes++,
+    },
+    now,
+  );
   /** One stretch of speech: the caller talks, the final arrives, then they stop. */
   const say = (text: string) => {
     commands.onCallerSpeaking(true);
@@ -2049,14 +2166,14 @@ describe('SpokenCommands', () => {
     expect(h.cues).toEqual([]);
   });
 
-  it('over sends now without the word, and the pause after it sends nothing more', () => {
+  it('send it sends now without the word, and the pause after it sends nothing more', () => {
     const h = commandsHarness();
     h.say('Book a table');
-    h.say('for two. Over.');
+    h.say('for two. Send it.');
     expect(h.sent).toEqual(['Book a table for two.']);
     expect(h.cues).toEqual([]);
     // The session still holds the words; its pause commits them, and they already went.
-    expect(h.commands.onPause('Book a table for two. Over.')).toBeNull();
+    expect(h.commands.onPause('Book a table for two. Send it.')).toBeNull();
     // Words after it are the next turn: the pause sends them alone.
     h.say('And a taxi');
     expect(h.commands.onPause('And a taxi')).toBe('And a taxi');
@@ -2064,13 +2181,17 @@ describe('SpokenCommands', () => {
 
   it('a command with nothing to act on only says nope', () => {
     const h = commandsHarness();
-    h.say('Over.');
+    h.say('Send it.');
     // The session commits the word on its pause: it is no turn either.
-    expect(h.commands.onPause('Over.')).toBeNull();
+    expect(h.commands.onPause('Send it.')).toBeNull();
     h.say('Scratch that.');
     expect(h.commands.onPause('Scratch that.')).toBeNull();
     expect(h.sent).toEqual([]);
-    expect(h.dropped).toEqual([]);
+    // The page marks those lines: nothing to send.
+    expect(h.dropped).toEqual([
+      ['command', 'Send it.'],
+      ['command', 'Scratch that.'],
+    ]);
     expect(h.cues).toEqual(['nope', 'nope']);
     // The next words are a turn as usual.
     h.say('Book a table');
@@ -2084,19 +2205,19 @@ describe('SpokenCommands', () => {
     expect(h.commands.onPause("Let's start over with the plan")).toBe("Let's start over with the plan");
   });
 
-  it('a final ending in over while the caller still talks waits: new words make it words, a pause sends it', () => {
+  it('a final ending in send it while the caller still talks waits: new words make it words, a pause sends it', () => {
     const h = commandsHarness();
     h.commands.onCallerSpeaking(true);
-    h.commands.onTranscript("We'll start over", true);
+    h.commands.onTranscript("We'll send it", true);
     h.commands.onTranscript('tomorrow', false);
     h.commands.onCallerSpeaking(false);
     h.commands.onTranscript('tomorrow morning.', true);
     expect(h.sent).toEqual([]);
-    expect(h.heard.filter(([, final]) => final).map(([t]) => t)).toEqual(["We'll start over", 'tomorrow morning.']);
+    expect(h.heard.filter(([, final]) => final).map(([t]) => t)).toEqual(["We'll send it", 'tomorrow morning.']);
 
     h.commands.onPause('');
     h.commands.onCallerSpeaking(true);
-    h.commands.onTranscript('Call the plumber, over', true);
+    h.commands.onTranscript('Call the plumber, send it', true);
     expect(h.sent).toEqual([]);
     h.commands.onCallerSpeaking(false);
     expect(h.sent).toEqual(['Call the plumber']);
@@ -2112,7 +2233,7 @@ describe('SpokenCommands', () => {
     expect(h.sent).toEqual([]);
   });
 
-  it('with the wake switch on nothing is kept before the wake phrase, and after it only over sends', () => {
+  it('with the wake switch on nothing is kept before the wake phrase, and after it only send it sends', () => {
     const h = commandsHarness(['Andy', 'Енді']);
     h.commands.configure(true, false);
     expect(h.commands.state).toEqual({ on: true, pauseSends: false, waiting: true });
@@ -2124,27 +2245,45 @@ describe('SpokenCommands', () => {
 
     h.say('Anyway. Хей, Енді, what is on my calendar');
     expect(h.cues).toEqual(['wake']);
+    // The words before the phrase in that final are marked, not silently lost.
+    expect(h.dropped.at(-1)).toEqual(['unaddressed', 'Anyway.']);
     expect(h.commands.state.waiting).toBe(false);
     expect(h.commands.holdsReplies).toBe(true);
     // Pauses never send after the wake phrase.
     expect(h.commands.onPause('Anyway. Хей, Енді, what is on my calendar')).toBeNull();
-    h.say('for tomorrow? Over.');
+    h.say('for tomorrow? Send it.');
     expect(h.sent).toEqual(['what is on my calendar for tomorrow?']);
     expect(h.cues).toEqual(['wake']);
     // Back to waiting for the wake phrase.
     expect(h.commands.state.waiting).toBe(true);
-    h.say('and the weather, over');
+    h.say('and the weather, send it');
     expect(h.sent).toHaveLength(1);
     expect(h.cues).toEqual(['wake']);
+  });
+
+  it('a command alone while waiting for the wake phrase says nope; the wake phrase counts as heard', () => {
+    const h = commandsHarness();
+    h.commands.configure(true, false);
+    h.say('Send it.');
+    expect(h.cues).toEqual(['nope']);
+    expect(h.dropped).toEqual([['command', 'Send it.']]);
+    h.say('book a table, send it');
+    expect(h.dropped.at(-1)).toEqual(['unaddressed', 'book a table, send it']);
+    expect(h.commands.state.heard).toBeUndefined();
+    h.say('Hey Andy, book a table, send it');
+    expect(h.sent).toEqual(['book a table']);
+    expect(h.commands.state).toEqual({ on: true, pauseSends: false, waiting: true, heard: 1 });
+    h.say('Hey Andy');
+    expect(h.commands.state).toMatchObject({ waiting: false, heard: 2 });
   });
 
   it('the wake phrase and the command can share one utterance', () => {
     const h = commandsHarness();
     h.commands.configure(true, false);
-    h.say('Hey Andy, call the plumber. Over.');
+    h.say('Hey Andy, call the plumber. Send it.');
     expect(h.cues).toEqual(['wake']);
     expect(h.sent).toEqual(['call the plumber.']);
-    h.say('hey andy over');
+    h.say('hey andy send it');
     expect(h.cues).toEqual(['wake', 'wake', 'nope']);
     // Nope keeps the wake: the turn is still open.
     expect(h.commands.state.waiting).toBe(false);
@@ -2185,23 +2324,104 @@ describe('SpokenCommands', () => {
     expect(h.commands.onPause('Book a table')).toBeNull();
     h.say('hey Andy, book a table');
     h.commands.configure(false, false);
-    expect(h.commands.state).toEqual({ on: false, pauseSends: false, waiting: false });
+    expect(h.commands.state).toEqual({ on: false, pauseSends: false, waiting: false, heard: 1 });
     expect(h.commands.onPause('hey Andy, book a table')).toBe('book a table');
   });
 });
 
+describe('speech model memory across calls', () => {
+  it('remembers a failed model for a while, forgets it when it is back, and never throws', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tts-state-'));
+    const file = path.join(dir, 'sub', 'state.json');
+    try {
+      expect(ttsDownSince(file, 'tts-a')).toBeNull();
+      setTtsDown(file, 'tts-a', true, 1_000);
+      expect(ttsDownSince(file, 'tts-a', 2_000)).toBe(1_000);
+      expect(ttsDownSince(file, 'tts-b', 2_000)).toBeNull();
+      expect(ttsDownSince(file, 'tts-a', 1_000 + TTS_DOWN_MEMORY_MS)).toBeNull();
+      setTtsDown(file, 'tts-a', false, 3_000);
+      expect(ttsDownSince(file, 'tts-a', 3_000)).toBeNull();
+      fs.writeFileSync(file, 'not json');
+      expect(ttsDownSince(file, 'tts-a')).toBeNull();
+      setTtsDown(path.join(file, 'not-a-dir', 'x.json'), 'tts-a', true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('cue audio', () => {
-  it('is whole 100 ms blocks of 48 kHz mono, sounding first and silent at the end', () => {
+  it('is 20 ms frames of 48 kHz mono: 150-250 ms of tone held near its level, with soft edges', () => {
     for (const kind of ['listening', 'wake', 'sent', 'discard', 'turn', 'nope', 'draft'] as const) {
       const frames = cueFrames(kind);
-      expect(frames.length).toBeGreaterThanOrEqual(2);
-      for (const f of frames) expect([f.sampleRate, f.channels, f.samplesPerChannel]).toEqual([48_000, 1, 4800]);
-      const peak = Math.max(...frames[0].data.map(Math.abs));
-      expect(peak).toBeGreaterThan(0.1 * 32767);
-      expect(peak).toBeLessThanOrEqual(0.31 * 32767);
-      expect(Math.max(...frames.at(-1)!.data.map(Math.abs))).toBe(0);
+      for (const f of frames) expect([f.sampleRate, f.channels, f.samplesPerChannel]).toEqual([48_000, 1, 960]);
+      const pcm = Int16Array.from(frames.flatMap((f) => [...f.data]));
+      const ms = pcm.length / 48;
+      expect(ms).toBeGreaterThanOrEqual(150);
+      expect(ms).toBeLessThanOrEqual(260);
+      // 5 ms windows: most of the cue holds within 6 dB of its loudest window; a decay to a click would not.
+      const rms: number[] = [];
+      for (let i = 0; i + 240 <= pcm.length; i += 240) {
+        let sum = 0;
+        for (let j = i; j < i + 240; j++) sum += pcm[j] * pcm[j];
+        rms.push(Math.sqrt(sum / 240));
+      }
+      const loudest = Math.max(...rms);
+      expect(rms.filter((r) => r >= loudest / 2).length / rms.length).toBeGreaterThan(0.75);
+      expect(loudest).toBeGreaterThan(0.06 * 32767);
+      expect(Math.max(...pcm.map(Math.abs))).toBeLessThanOrEqual(0.2 * 32767);
+      // No click at either end.
+      expect(Math.abs(pcm[0])).toBeLessThan(200);
+      expect(Math.abs(pcm[pcm.length - 1])).toBeLessThan(200);
     }
     expect(cueFrames('sent')).toBe(cueFrames('sent'));
+  });
+
+  it('feeds the track a faint noise floor, a cue as soon as it is asked for, and says when the track took it', async () => {
+    const taken: AudioFrame[] = [];
+    let release!: () => void;
+    let gate = Promise.resolve();
+    const sink = {
+      captureFrame: async (frame: AudioFrame) => {
+        taken.push(frame);
+        await gate;
+      },
+    };
+    gate = new Promise((r) => (release = r));
+    const feed = new CueFeed(sink);
+    await flush();
+    // The source is full: the feed waits on it, one noise frame in.
+    expect(taken).toHaveLength(1);
+    const noise = taken[0].data;
+    expect(Math.max(...noise.map(Math.abs))).toBeGreaterThan(0);
+    expect(Math.max(...noise.map(Math.abs))).toBeLessThanOrEqual(2);
+    let played = false;
+    const cue = cueFrames('sent');
+    void feed.play(cue).then(() => (played = true));
+    gate = Promise.resolve();
+    release();
+    await vi.waitFor(() => expect(played).toBe(true));
+    // Right after the frame that was waiting: the whole cue, in order.
+    expect(taken.slice(1, 1 + cue.length)).toEqual(cue);
+    feed.stop();
+    await feed.running;
+    // Stopped: a cue asked for now resolves at once.
+    await feed.play(cue);
+  });
+
+  it('ends on a failing source and lets every cue waiting on it go', async () => {
+    let fail!: (err: Error) => void;
+    const errors: unknown[] = [];
+    const feed = new CueFeed({ captureFrame: () => new Promise((_, reject) => (fail = reject)) }, (err) =>
+      errors.push(err),
+    );
+    await flush();
+    const waiting = feed.play(cueFrames('sent'));
+    fail(new Error('source closed'));
+    await waiting;
+    await feed.running;
+    expect(errors).toHaveLength(1);
+    await feed.play(cueFrames('sent'));
   });
 });
 
@@ -2231,7 +2451,7 @@ describe('spoken commands and cues in a call', () => {
   const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
     host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
 
-  it('plays the listening cue once the page said it wants cues, then sent on over; none over speech', async () => {
+  it('plays the listening cue once the page said it wants cues, then sent on send it; none over speech', async () => {
     const { ctx } = fakeJob();
     const host = fakeHostFetch();
     const c = commandCall();
@@ -2240,11 +2460,11 @@ describe('spoken commands and cues in a call', () => {
     await vi.waitFor(() => expect(c.played).toEqual(['listening']));
     expect(c.r.last.wake).toEqual({ on: false, pauseSends: false, waiting: false });
 
-    c.say('Book a table for two. Over.');
+    c.say('Book a table for two. Send it.');
     await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table for two.']));
     await vi.waitFor(() => expect(c.played).toEqual(['listening', 'sent']));
     // The session's own pause commits the same words later: nothing more goes out.
-    c.v.events.onTurn('Book a table for two. Over.', { sttModel: 'gemini-3.5-transcribe-live' });
+    c.v.events.onTurn('Book a table for two. Send it.', { sttModel: 'gemini-3.5-transcribe-live' });
     await flush();
     expect(utterances(host)).toHaveLength(1);
 
@@ -2273,7 +2493,7 @@ describe('spoken commands and cues in a call', () => {
     host.endStream();
   });
 
-  it('wake on: speech before the wake phrase goes nowhere, over sends, a follow-up while the agent works', async () => {
+  it('wake on: speech before the wake phrase goes nowhere, send it sends, a follow-up while the agent works', async () => {
     const { ctx } = fakeJob({ ...META, wakeNames: ['Енді'] });
     const host = fakeHostFetch();
     const c = commandCall();
@@ -2295,13 +2515,13 @@ describe('spoken commands and cues in a call', () => {
     c.say('Гей Енді, book a table');
     expect(c.r.last.wake?.waiting).toBe(false);
     c.v.events.onTurn('Гей Енді, book a table', { sttModel: 'gemini-3.5-transcribe-live' });
-    c.say('for two, over');
+    c.say('for two, send it');
     await vi.waitFor(() => expect(utterances(host)).toEqual(['book a table for two']));
     expect(c.r.last.wake?.waiting).toBe(true);
 
     // The agent works on it; a follow-up goes out as its own turn.
     host.emit({ type: 'thinking' });
-    c.say('Hey Andy, and a taxi. Over.');
+    c.say('Hey Andy, and a taxi. Send it.');
     await vi.waitFor(() => expect(utterances(host)).toEqual(['book a table for two', 'and a taxi.']));
     await vi.waitFor(() => expect(c.played).toEqual(['listening', 'wake', 'sent', 'wake', 'sent']));
     host.endStream();
@@ -2333,9 +2553,65 @@ describe('spoken commands and cues in a call', () => {
 
     await c.rpc('settings', { cues: false });
     host.emit({ type: 'reply', text: 'Done.', turn: null });
-    c.say('Thanks, over.');
+    c.say('Thanks, send it.');
     await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
     expect(c.played).toEqual(['listening', 'turn']);
+    host.endStream();
+  });
+
+  it('a reply nobody heard (the speech model failed) shows as text and plays no your-turn cue', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = commandCall();
+    c.v.voice.say.mockResolvedValue(false);
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice));
+    await c.rpc('settings', { cues: true });
+    host.emit({ type: 'reply', text: 'Booked for eight.', turn: null });
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
+    expect(c.v.voice.publishReply).toHaveBeenCalledWith({
+      reply: 1,
+      unprompted: true,
+      unspoken: true,
+      text: 'Booked for eight.',
+    });
+    expect(c.played).toEqual(['listening']);
+    host.endStream();
+  });
+
+  it('speech under the agent is reported unheard; a command alone clears the countdown', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = commandCall();
+    const unheard = vi.fn();
+    const clearPending = vi.fn();
+    Object.assign(c.v.voice, { publishUnheard: unheard, clearPending });
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice));
+    c.v.events.onUnheardSpeech?.();
+    expect(unheard).toHaveBeenCalledTimes(1);
+    c.say('Send it.');
+    await vi.waitFor(() => expect(c.dropped).toEqual([{ dropped: 'command', text: 'Send it.' }]));
+    expect(clearPending).toHaveBeenCalledTimes(1);
+    expect(utterances(host)).toEqual([]);
+    host.endStream();
+  });
+
+  it('speech before the wake phrase does not hold a waiting reply for the settle time', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = commandCall();
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice));
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    c.v.events.onCallerSpeaking(true);
+    host.emit({ type: 'reply', text: 'Booked.', turn: null });
+    await vi.advanceTimersByTimeAsync(100);
+    c.v.events.onCallerSpeaking(false);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(c.v.voice.say).not.toHaveBeenCalledWith('Booked.');
+    c.v.events.onTranscript?.('So what did you think of the film?', true, 1);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(c.v.voice.say).toHaveBeenCalledWith('Booked.');
     host.endStream();
   });
 
@@ -2370,10 +2646,10 @@ describe('spoken commands and cues in a call', () => {
     await c.rpc('mode', { mode: 'review' });
     expect(c.v.events.pausesSend?.()).toBe(false);
     expect(await c.rpc('talk')).toMatchObject({ ok: true, draft: 1 });
-    c.v.events.onTranscript?.('Book a table, over', true, 1);
+    c.v.events.onTranscript?.('Book a table, send it', true, 1);
     await c.rpc('done', { draft: 1 });
     await vi.advanceTimersByTimeAsync(1000);
-    expect(c.r.last.draft).toMatchObject({ state: 'ready', text: 'Book a table, over' });
+    expect(c.r.last.draft).toMatchObject({ state: 'ready', text: 'Book a table, send it' });
     expect(c.played).toEqual(['listening', 'listening', 'draft']);
     expect(utterances(host)).toEqual([]);
     host.endStream();
@@ -2422,5 +2698,387 @@ describe('the countdown in the session', () => {
     // Speaking again clears the last one; no new one counts down.
     expect(shown()).toEqual(['1:0:2500']);
     expect(pending.at(-1)).toBe('');
+  });
+
+  it('clears on request, and says when the caller starts speaking under the agent', () => {
+    const pending: string[] = [];
+    let unheard = 0;
+    const events: CallVoiceEvents = {
+      onTurn: () => undefined,
+      onCallerSpeaking: () => undefined,
+      onTurnLost: () => undefined,
+      onTurnDropped: () => undefined,
+      onClosed: () => undefined,
+      onUnheardSpeech: () => unheard++,
+    };
+    const { session, clearPending } = callSession(
+      META,
+      { geminiKey: 'gk-test', record: false },
+      { vad: {} as VAD },
+      events,
+      { ...silentLog, error: () => undefined },
+      (value) => pending.push(value),
+    );
+    const user = (oldState: 'listening' | 'speaking', newState: 'listening' | 'speaking') =>
+      session.emit(agentsVoice.AgentSessionEventTypes.UserStateChanged, {
+        type: 'user_state_changed',
+        oldState,
+        newState,
+        createdAt: Date.now(),
+      });
+    user('listening', 'speaking');
+    user('speaking', 'listening');
+    expect(pending).toHaveLength(1);
+    clearPending();
+    expect(pending.at(-1)).toBe('');
+    expect(unheard).toBe(0);
+    session.emit(agentsVoice.AgentSessionEventTypes.AgentStateChanged, {
+      type: 'agent_state_changed',
+      oldState: 'listening',
+      newState: 'speaking',
+      createdAt: Date.now(),
+    });
+    user('listening', 'speaking');
+    expect(unheard).toBe(1);
+  });
+});
+
+describe('acoustic wake word', () => {
+  it('finds the spotted phrase however the transcription spelled it', () => {
+    const at = (text: string) => {
+      const found = matchWakeText(text, 'hey livekit');
+      return found && [text.slice(0, found.start), text.slice(found.end)];
+    };
+    expect(at('Hey, LiveKit, what time is it?')).toEqual(['', ', what time is it?']);
+    expect(at('So that is settled. Hey Live Kit what time')).toEqual(['So that is settled. ', ' what time']);
+    expect(at('hey live kid. Book a table')).toEqual(['', '. Book a table']);
+    expect(at('Гей, Лайвкіт, котра година?')).toEqual(['', ', котра година?']);
+    expect(at('Hi Lifekit')).toEqual(['', '']);
+    // The name without a hey before it is the phrase too: the audio already said it was spoken.
+    expect(at('LiveKit, book a table')).toEqual(['', ', book a table']);
+    // Opening with hey, the words after it may be further off: the audio decided already.
+    expect(at('Hey, little kid, remind me to buy milk')).toEqual(['', ', remind me to buy milk']);
+    expect(at("Hey, you've got. What is the capital of France?")).toEqual(['', '. What is the capital of France?']);
+    expect(at('Hey, look at it')).toEqual(['', ' it']);
+    expect(at('Hey, what is the capital of France?')).toBeNull();
+    expect(at('Hey, call me back')).toBeNull();
+    expect(at('So, hey, little kid')).toBeNull();
+    expect(at('we live in a kit house')).toBeNull();
+    // Another model's phrase, by its file name.
+    expect(matchWakeText('Hey Jarvis, lights', 'hey jarvis')).toEqual({ start: 0, end: 10 });
+  });
+
+  it('reads the model and threshold from the settings', () => {
+    expect(wakeWordSettings({})).toEqual({ classifier: expect.stringMatching(/hey_livekit\.onnx$/), threshold: 0.68 });
+    expect(wakeWordSettings({ VOICE_WAKE_MODEL: 'off' })).toBeNull();
+    expect(wakeWordSettings({ VOICE_WAKE_MODEL: '/m/hey_jarvis.onnx' })).toEqual({
+      classifier: '/m/hey_jarvis.onnx',
+      threshold: 0.5,
+    });
+    expect(wakeWordSettings({ VOICE_WAKE_THRESHOLD: '0.8' })?.threshold).toBe(0.8);
+    expect(wakeWordSettings({ VOICE_WAKE_THRESHOLD: '7' })?.threshold).toBe(0.68);
+  });
+
+  function spotted() {
+    let clock = 1_000_000;
+    const h = commandsHarness(['Andy'], () => clock);
+    h.commands.configure(true, false);
+    h.commands.useWakeWord('hey livekit');
+    return {
+      ...h,
+      tick: (ms: number) => void (clock += ms),
+    };
+  }
+
+  it('the spotted wake word opens the turn; the transcript name does not; the phrase and what came before are dropped', () => {
+    const h = spotted();
+    expect(h.commands.state).toEqual({ on: true, pauseSends: false, waiting: true, phrase: 'hey livekit' });
+    expect(h.commands.spotting).toBe(true);
+    h.say('Hey Andy, book a table.');
+    expect(h.commands.waiting).toBe(true);
+    // Held a moment: a wake word spotted just after it may make it the turn.
+    expect(h.dropped).toEqual([]);
+
+    h.commands.onWakeWord();
+    // It has no `hey livekit`: ignored after all.
+    expect(h.dropped).toEqual([['unaddressed', 'Hey Andy, book a table.']]);
+    expect(h.commands.waiting).toBe(false);
+    expect(h.commands.spotting).toBe(false);
+    expect(h.cues).toEqual(['wake']);
+    h.commands.onTranscript('So that is settled. Hey LiveKit, book', false);
+    expect(h.heard.at(-1)).toEqual(['book', false]);
+    h.say('So that is settled. Hey LiveKit, book a table');
+    expect(h.dropped.at(-1)).toEqual(['unaddressed', 'So that is settled.']);
+    // After the first final with the phrase, the name is a word again.
+    h.say('at the LiveKit cafe. Send it.');
+    expect(h.sent).toEqual(['book a table at the LiveKit cafe.']);
+    expect(h.commands.waiting).toBe(true);
+  });
+
+  it('a final with only the phrase ends its interim text and keeps nothing', () => {
+    const h = spotted();
+    h.commands.onWakeWord();
+    h.commands.onTranscript('Hey LiveKit', false);
+    h.say('Hey, LiveKit.');
+    expect(h.heard).toEqual([
+      ['', false],
+      ['', true],
+    ]);
+    h.say('What time is it? Send it.');
+    expect(h.sent).toEqual(['What time is it?']);
+  });
+
+  it('a final that came just before the wake word, with its phrase, is the turn after all', () => {
+    const h = spotted();
+    h.say('Hey LiveKit, what time is it');
+    h.tick(1_500);
+    h.commands.onWakeWord();
+    expect(h.heard).toEqual([['what time is it', true]]);
+    // Never reported as ignored: the page leaves the line open for the turn.
+    expect(h.dropped).toEqual([]);
+    h.say('Send it.');
+    expect(h.sent).toEqual(['what time is it']);
+
+    // Too long before, or without the phrase: it stays unaddressed.
+    h.say('Hey LiveKit, call mum');
+    h.tick(5_000);
+    h.commands.onWakeWord();
+    expect(h.dropped).toEqual([['unaddressed', 'Hey LiveKit, call mum']]);
+    h.say('Send it.');
+    expect(h.sent).toEqual(['what time is it']);
+    expect(h.cues.at(-1)).toBe('nope');
+  });
+
+  it('a late final loses only its words before the phrase, and a near miss is not the phrase', () => {
+    const h = spotted();
+    h.say('So that is settled. Hey LiveKit, book a table');
+    h.commands.onWakeWord();
+    expect(h.dropped).toEqual([['unaddressed', 'So that is settled.']]);
+    h.say('Send it.');
+    expect(h.sent).toEqual(['book a table']);
+
+    // Ordinary words that only sound near the name are not taken into the turn.
+    h.say('Hey, look at it. Delete the old files');
+    h.commands.onWakeWord();
+    expect(h.dropped.at(-1)).toEqual(['unaddressed', 'Hey, look at it. Delete the old files']);
+    expect(h.heard.filter(([text]) => text.includes('Delete'))).toEqual([]);
+  });
+
+  it('reports a held final as unaddressed once no wake word came for it, or when a newer one arrives', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = spotted();
+    h.say('So what did you think of the film?');
+    h.say('Anyway.');
+    expect(h.dropped).toEqual([['unaddressed', 'So what did you think of the film?']]);
+    vi.advanceTimersByTime(2_900);
+    expect(h.dropped).toHaveLength(1);
+    vi.advanceTimersByTime(200);
+    expect(h.dropped.at(-1)).toEqual(['unaddressed', 'Anyway.']);
+    // Switching the wake off reports what it held at once.
+    h.say('Never mind.');
+    h.commands.configure(false, false);
+    expect(h.dropped.at(-1)).toEqual(['unaddressed', 'Never mind.']);
+  });
+
+  it('looks for the phrase in two finals at most; a later one keeps every word', () => {
+    const h = spotted();
+    h.commands.onWakeWord();
+    h.say('Book a table');
+    h.say('for two');
+    h.say('near LiveKit HQ. Send it.');
+    expect(h.sent).toEqual(['Book a table for two near LiveKit HQ.']);
+  });
+
+  it('a wake word heard after the turn opened only loses its phrase', () => {
+    const h = spotted();
+    h.commands.onWakeWord();
+    h.say('Book a table');
+    h.commands.onWakeWord();
+    expect(h.cues).toEqual(['wake']);
+    h.say('for two, hey LiveKit, at eight. Send it.');
+    expect(h.sent).toEqual(['Book a table for two at eight.']);
+    expect(h.dropped).toEqual([]);
+  });
+
+  it('does nothing with the wake switch off, and goes back to the transcript name without the model', () => {
+    const h = spotted();
+    h.commands.configure(false, false);
+    h.commands.onWakeWord();
+    expect(h.cues).toEqual([]);
+    h.commands.configure(true, false);
+    h.commands.useWakeWord(undefined);
+    expect(h.commands.state).toEqual({ on: true, pauseSends: false, waiting: true });
+    h.say('Hey Andy, book a table. Send it.');
+    expect(h.sent).toEqual(['book a table.']);
+  });
+});
+
+describe('acoustic wake word in a call', () => {
+  function fakeWakeWord(load: 'ok' | 'fail' = 'ok') {
+    let events!: WakeWordEvents;
+    const pushed: number[] = [];
+    const listening: boolean[] = [];
+    const wake = {
+      phrase: 'hey livekit',
+      threshold: 0.68,
+      ready: load === 'ok' ? Promise.resolve() : Promise.reject(new Error('wake word model not found: x')),
+      listen: vi.fn((on: boolean) => void listening.push(on)),
+      push: vi.fn((pcm: Int16Array) => void pushed.push(pcm.length)),
+      summary: { scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
+      utilization: 0,
+      close: vi.fn(async () => undefined),
+    } satisfies WakeWord;
+    wake.ready.catch(() => undefined);
+    const make = vi.fn((e: WakeWordEvents) => {
+      events = e;
+      return wake;
+    });
+    return {
+      wake,
+      make,
+      pushed,
+      listening,
+      get events() {
+        return events;
+      },
+    };
+  }
+  function wakeCall() {
+    const v = fakeVoice();
+    const r = fakeReviewVoice();
+    let handle!: (op: ReviewOp, payload: string, callerIdentity: string) => Promise<string>;
+    const played: CueKind[] = [];
+    const dropped: unknown[] = [];
+    Object.assign(v.voice, {
+      review: { ...r.voice, serve: (h: typeof handle) => void (handle = h) },
+      playCue: vi.fn(async (kind: CueKind) => void played.push(kind)),
+      publishDropped: vi.fn((d: unknown) => void dropped.push(d)),
+    });
+    const rpc = async (op: ReviewOp, fields: Partial<ReviewRequest> = {}) =>
+      JSON.parse(await handle(op, JSON.stringify({ gen: 1, ...fields }), 'caller-1')) as Record<string, unknown>;
+    const say = (text: string) => {
+      v.events.onCallerSpeaking(true);
+      v.events.onCallerSpeaking(false);
+      v.events.onTranscript?.(text, true, 1);
+    };
+    const frame = (samples = 160, rate = 16_000) =>
+      v.events.onAudio?.(new AudioFrame(new Int16Array(samples), rate, 1, samples));
+    return { v, r, rpc, played, dropped, say, frame };
+  }
+  const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+
+  it('a detection opens the turn like the wake phrase; the page hears the phrase; audio is scored only while waiting', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = wakeCall();
+    const w = fakeWakeWord();
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice, { wakeWord: w.make }));
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    await vi.waitFor(() =>
+      expect(c.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true, phrase: 'hey livekit' }),
+    );
+
+    c.frame();
+    c.frame(160, 48_000);
+    expect(w.pushed).toEqual([160]);
+    expect(w.listening.at(-1)).toBe(true);
+    c.v.events.onAgentSpeaking?.(true);
+    c.frame();
+    expect(w.listening.at(-1)).toBe(false);
+    c.v.events.onAgentSpeaking?.(false);
+
+    c.say('Hey Andy, so the plan is set.');
+    expect(c.dropped).toEqual([]);
+    w.events.onDetect(0.97);
+    expect(c.dropped).toEqual([{ dropped: 'unaddressed', text: 'Hey Andy, so the plan is set.' }]);
+    expect(c.r.last.wake?.waiting).toBe(false);
+    c.frame();
+    expect(w.listening.at(-1)).toBe(false);
+    c.say('Hey, LiveKit. Book a table for two. Send it.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table for two.']));
+    await vi.waitFor(() => expect(c.played).toEqual(['listening', 'wake', 'sent']));
+    expect(c.r.last.wake?.waiting).toBe(true);
+    c.frame();
+    expect(w.listening.at(-1)).toBe(true);
+    host.endStream();
+    await vi.waitFor(() => expect(w.wake.close).toHaveBeenCalled());
+  });
+
+  it('falls back to the transcript name when the model does not load, or stops', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = wakeCall();
+    const w = fakeWakeWord('fail');
+    const warn = vi.fn();
+    await runCall(
+      ctx,
+      deps(host.fetchImpl, c.v.createVoice, { wakeWord: w.make, log: { info: () => undefined, warn } }),
+    );
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    await vi.waitFor(() =>
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('no wake word model'), expect.anything()),
+    );
+    expect(c.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true });
+    c.frame();
+    expect(w.pushed).toEqual([]);
+    c.say('Hey Andy, book a table. Send it.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['book a table.']));
+    host.endStream();
+
+    const second = fakeJob();
+    const c2 = wakeCall();
+    const w2 = fakeWakeWord();
+    await runCall(second.ctx, deps(fakeHostFetch().fetchImpl, c2.v.createVoice, { wakeWord: w2.make }));
+    await c2.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    await vi.waitFor(() => expect(c2.r.last.wake?.phrase).toBe('hey livekit'));
+    w2.events.onError('thread exited');
+    expect(c2.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true });
+  });
+
+  it('a real spotter on real audio: the wake word opens the turn, other speech does not', async () => {
+    const wav = (name: string) => {
+      const buf = fs.readFileSync(new URL(`./voice-wakeword-fixtures/${name}`, import.meta.url));
+      const data = buf.indexOf('data', 12);
+      return new Int16Array(
+        buf.buffer.slice(buf.byteOffset + data + 8, buf.byteOffset + data + 8 + buf.readUInt32LE(data + 4)),
+      );
+    };
+    const { WakeWordSpotter, DEFAULT_WAKE_MODEL } = await import('./voice-wakeword.js');
+    const run = async (audio: Int16Array) => {
+      const { ctx } = fakeJob();
+      const host = fakeHostFetch();
+      const c = wakeCall();
+      let spotter!: InstanceType<typeof WakeWordSpotter>;
+      await runCall(
+        ctx,
+        deps(host.fetchImpl, c.v.createVoice, {
+          wakeWord: (events: WakeWordEvents) =>
+            (spotter = new WakeWordSpotter({ classifier: DEFAULT_WAKE_MODEL, threshold: 0.68, ...events })),
+        }),
+      );
+      await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+      await vi.waitFor(() => expect(c.r.last.wake?.phrase).toBe('hey livekit'));
+      // 20 ms frames, as the room delivers them, each 80 ms waiting for its score.
+      for (let at = 0; at < audio.length; at += 320) {
+        c.v.events.onAudio?.(new AudioFrame(audio.slice(at, at + 320), 16_000, 1, Math.min(320, audio.length - at)));
+        while ((spotter as unknown as { inflight: boolean }).inflight) await new Promise((r) => setTimeout(r, 1));
+      }
+      const waiting = c.r.last.wake?.waiting;
+      const summary = spotter.summary;
+      host.endStream();
+      return { waiting, summary, played: c.played };
+    };
+    const silence = new Int16Array(16_000);
+    const positive = wav('positive.wav');
+    const yes = await run(Int16Array.from([...silence, ...silence, ...positive, ...silence]));
+    expect(yes.waiting).toBe(false);
+    expect(yes.summary.detections).toBe(1);
+    await vi.waitFor(() => expect(yes.played).toContain('wake'));
+    // The same voice and level, played backwards: no wake word.
+    const no = await run(Int16Array.from([...silence, ...silence, ...positive.slice().reverse(), ...silence]));
+    expect(no.summary.scored).toBeGreaterThan(20);
+    expect(no.summary.maxScore).toBeLessThan(0.68);
+    expect(no.waiting).toBe(true);
   });
 });

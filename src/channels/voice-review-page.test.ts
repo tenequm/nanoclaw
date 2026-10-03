@@ -8,6 +8,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
+import { matchCommand, type SpokenCommand } from '../voice-livekit-worker.js';
+import { CALL_COMMANDS_VERSION } from './voice-livekit-protocol.js';
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const reviewLib = path.resolve(here, '../../.claude/skills/add-voice-mode/ui/src/lib/review.ts');
 
@@ -36,11 +39,21 @@ interface ReviewLib {
   refusalNote(error: string | undefined, agent: string): string | null;
   isReviewSnapshot(v: unknown): boolean;
   keyIdentity(action: string | null, draftId?: number): string;
-  autoListening(input: { agentName: string; silenceMs: number | null; review: ReviewState }): {
+  autoListening(input: { agentName: string; review: ReviewState }): {
     chip: string;
     hint: string;
     empty: string;
   };
+  lineKey(s: string): string;
+  isCommandOnly(s: string): boolean;
+  endsInDiscard(s: string): boolean;
+  norm(s: string): string;
+  SEND_WORDS: string[];
+  DISCARD_PHRASES: string[];
+  COMMANDS_VERSION: string;
+  MODE_NAME: Record<string, string>;
+  modeCaption(mode: string, commands: boolean): string;
+  charsOver(text: string): number;
 }
 
 describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
@@ -88,7 +101,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(keys(v)).toEqual(['End', 'Done']);
     expect(v).toMatchObject({
       chip: 'Listening',
-      hint: 'Pauses stay here - tap done to review.',
+      hint: "Pausing won't send - tap done to read it.",
       mic: 'Recording',
       capturing: true,
     });
@@ -175,7 +188,10 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     v = view({ draft: draft('ready', 'я'.repeat(4200), { tooLong: true }) });
     expect(keys(v)).toEqual(['Discard', 'Send(off)']);
     expect(v).toMatchObject({ chip: 'Draft too long', hint: 'Discard and try a shorter turn.' });
-    expect(v.panel?.title).toBe('draft too long');
+    // 4200 two-byte letters are 8400 bytes: 208 over the host's 8192, so 104 letters to cut.
+    expect(v.panel).toMatchObject({ title: 'draft too long', note: 'about 104 characters over the limit' });
+    expect(lib.charsOver('я'.repeat(4096))).toBe(0);
+    expect(lib.charsOver('a'.repeat(8193))).toBe(1);
   });
 
   it('the agent speaking: talk waits, a draft can still be sent as a follow-up', () => {
@@ -188,7 +204,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
 
     v = view({ draft: draft('ready', 'Also this', { reason: 'agent' }) }, 'talking');
     expect(keys(v)).toEqual(['Discard', 'Send']);
-    expect(v).toMatchObject({ chip: 'Andy is speaking', hint: 'Send adds a follow-up.' });
+    expect(v).toMatchObject({ chip: 'Andy is speaking', hint: 'You can send it now; Andy gets it next.' });
     expect(v.panel?.note).toBe('Andy started speaking - review what was heard');
 
     v = view({ draft: draft('finishing') }, 'talking');
@@ -199,13 +215,13 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
   it('the agent working: talk adds a follow-up, recording and drafts say so', () => {
     expect(view({}, 'thinking', { waited: 12 })).toMatchObject({
       chip: 'Andy is working',
-      hint: 'Tap talk to add a follow-up · waiting 0:12',
+      hint: 'Tap talk to add more · waiting 0:12',
     });
     expect(keys(view({}, 'thinking'))).toEqual(['End', 'Talk']);
     const rec = view({ draft: draft('recording'), micOn: true }, 'thinking');
     expect(keys(rec)).toEqual(['End', 'Done']);
-    expect(rec.hint).toBe('Recording - tap done to review.');
-    expect(view({ draft: draft('ready', 'x') }, 'thinking').hint).toBe('Send adds a follow-up.');
+    expect(rec.hint).toBe('Recording - tap done to read it.');
+    expect(view({ draft: draft('ready', 'x') }, 'thinking').hint).toBe('You can send it now; Andy gets it next.');
   });
 
   it('switching, reconnecting and microphone failures override the routine state', () => {
@@ -249,6 +265,8 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
   it('a call that ended with a draft keeps it to read: discard first, nothing to send', () => {
     const v = view({ draft: draft('ready', 'Keep me'), ended: true }, 'ended');
     expect(keys(v)).toEqual(['Discard', 'Send(off)']);
+    // The chip says the call ended; the hint does not say it again.
+    expect(v).toMatchObject({ chip: 'Call ended', hint: 'Draft not sent. Copy it, or discard it to call again.' });
     expect(v.panel).toMatchObject({ text: 'Keep me', tone: 'draft' });
     expect(v.modeDisabled).toBe(true);
     expect(keys(view({ draft: null, ended: false }, 'ended'))).toEqual(['Call again', 'Talk(off)']);
@@ -261,31 +279,117 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(lib.isReviewSnapshot({ mode: 'review', draft: null })).toBe(false);
   });
 
-  it("auto's readout: over or a pause sends, and with the wake switch the phrase that opens a turn", () => {
-    const listen = (fields: Partial<ReviewState>, silenceMs: number | null = 2500) =>
-      lib.autoListening({ agentName: 'Andy', silenceMs, review: { ...lib.INITIAL_REVIEW, ...fields } });
+  it("auto's readout: send it or a pause sends, and with the wake switch the phrase that opens a turn", () => {
+    const listen = (fields: Partial<ReviewState>) =>
+      lib.autoListening({ agentName: 'Andy', review: { ...lib.INITIAL_REVIEW, ...fields } });
     expect(listen({})).toEqual({
       chip: 'Listening',
-      hint: 'Go ahead. Pause about 2.5 s or say "over" to send.',
+      hint: 'Go ahead. Stop for a moment, or say "send it" to send now.',
       empty: 'Speak when ready.',
     });
     // A worker without spoken commands keeps the old copy.
-    expect(listen({ commands: false }).hint).toBe('Go ahead. Pause about 2.5 s to send.');
+    expect(listen({ commands: false }).hint).toBe('Go ahead. Stop for a moment to send.');
     expect(listen({ wake: true, awaitingWake: true })).toEqual({
       chip: 'Say "hey Andy"',
       hint: 'Nothing is sent until you say "hey Andy".',
       empty: 'Say "hey Andy" to start.',
     });
+    // A worker with an acoustic wake word names its phrase instead.
+    expect(listen({ wake: true, awaitingWake: true, wakePhrase: 'hey livekit' })).toEqual({
+      chip: 'Say "hey livekit"',
+      hint: 'Nothing is sent until you say "hey livekit".',
+      empty: 'Say "hey livekit" to start.',
+    });
     expect(listen({ wake: true, awaitingWake: false })).toMatchObject({
       chip: 'Listening',
-      hint: 'Say "over" to send - pauses don\'t.',
+      hint: 'Say "send it" to send - stopping won\'t.',
     });
-    expect(listen({ wake: true, pauseSends: true }).hint).toBe('Say "over" or pause about 2.5 s to send.');
-    expect(listen({ wake: true, pauseSends: true }, null).hint).toBe('Say "over" or pause to send.');
+    // The copy never quotes seconds: the countdown shows how long the pause is.
+    expect(listen({ wake: true, pauseSends: true }).hint).toBe('Say "send it", or stop for a moment, to send.');
     // The switch's picks start off; the worker's wake state rides on its review state.
-    expect(lib.INITIAL_REVIEW).toMatchObject({ wake: false, pauseSends: false, awaitingWake: false, commands: true });
+    expect(lib.INITIAL_REVIEW).toMatchObject({
+      wake: false,
+      pauseSends: false,
+      awaitingWake: false,
+      commands: true,
+      wakePhrase: null,
+      wakeHeard: 0,
+    });
     expect(
       lib.isReviewSnapshot({ seq: 3, mode: 'auto', draft: null, wake: { on: true, pauseSends: false, waiting: true } }),
     ).toBe(true);
+    expect(
+      lib.isReviewSnapshot({
+        seq: 4,
+        mode: 'auto',
+        draft: null,
+        wake: { on: true, pauseSends: false, waiting: false, heard: 2 },
+      }),
+    ).toBe(true);
+  });
+
+  it('knows the send words the worker takes, in Latin and Cyrillic, as a caption line ends', () => {
+    for (const said of [
+      'Send it.',
+      'sendit',
+      'Сенд іт.',
+      'Сендіт',
+      'Сендип.',
+      'Sent it.',
+      'Send eat.',
+      'Send.',
+      'Прийом.',
+      'Scratch that.',
+      'Discard this turn.',
+    ])
+      expect(lib.isCommandOnly(said), said).toBe(true);
+    expect(lib.lineKey('Book a table for two. Send it.')).toBe('bookatablefortwo');
+    expect(lib.lineKey('Скільки я читав? Прийом.')).toBe('скількиячитав');
+    // "over" is no longer a command: it stays part of what was said.
+    expect(lib.isCommandOnly('Over.')).toBe(false);
+    expect(lib.lineKey('Game over')).toBe('gameover');
+    expect(lib.isCommandOnly('')).toBe(false);
+    expect(lib.isCommandOnly('Book a table.')).toBe(false);
+  });
+
+  it('names the turn modes for people and says what each does', () => {
+    expect(lib.MODE_NAME).toEqual({ auto: 'hands-free', review: 'check first' });
+    expect(lib.modeCaption('auto', true)).toBe('Stop for a moment, or say "send it", to send.');
+    expect(lib.modeCaption('auto', false)).toBe('Stop for a moment to send.');
+    expect(lib.modeCaption('review', true)).toBe('Tap talk, read your words, then send.');
+  });
+  it("the page's command words are the worker's, on the same commands vocabulary", () => {
+    // How the transcription writes each one; every page word needs a spelling here.
+    const spoken: Array<[string, SpokenCommand]> = [
+      ['Send it.', 'send'],
+      ['Sent it.', 'send'],
+      ['Send eat.', 'send'],
+      ['Sendit.', 'send'],
+      ['Send.', 'send'],
+      ['Сенд іт.', 'send'],
+      ['Сендіт.', 'send'],
+      ['Сендит.', 'send'],
+      ['Сендіп.', 'send'],
+      ['Сендип.', 'send'],
+      ['Сенд.', 'send'],
+      ['Прийом.', 'send'],
+      ['Приём.', 'send'],
+      ['Discard this turn.', 'discard'],
+      ['Discard turn.', 'discard'],
+      ['Scratch that.', 'discard'],
+    ];
+    const covered = new Set(spoken.map(([text]) => lib.norm(text)));
+    for (const word of [...lib.SEND_WORDS, ...lib.DISCARD_PHRASES]) expect(covered, word).toContain(word);
+    for (const [text, command] of spoken) {
+      expect(lib.isCommandOnly(text), text).toBe(true);
+      expect(lib.endsInDiscard(text), text).toBe(command === 'discard');
+      expect(matchCommand(text), text).toEqual({ command, rest: '' });
+    }
+    // Not a command for either: words before or after it.
+    for (const text of ['Send it to Anna.', 'Scratch that idea.']) {
+      expect(lib.isCommandOnly(text), text).toBe(false);
+      expect(matchCommand(text), text).toBeNull();
+    }
+    expect(lib.COMMANDS_VERSION).toBe(CALL_COMMANDS_VERSION);
   });
 });
