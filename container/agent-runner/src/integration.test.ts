@@ -373,13 +373,9 @@ function sleep(ms: number): Promise<void> {
 describe('poll loop — started ahead of a voice call', () => {
   class RecordingProvider extends MockProvider {
     readonly prompts: string[] = [];
-    readonly warmed: Array<string | undefined> = [];
     query(input: QueryInput) {
       this.prompts.push(input.prompt);
       return super.query(input);
-    }
-    async warmPromptCache(input: QueryInput): Promise<void> {
-      this.warmed.push(input.continuation);
     }
   }
   const reply = () => '<message to="discord-test">here</message>';
@@ -389,7 +385,7 @@ describe('poll loop — started ahead of a voice call', () => {
     else process.env.NANOCLAW_WAKE_REASON = previous;
   });
 
-  it('opens the query and warms the cache before any message, then answers the first turn in that query', async () => {
+  it('opens the query before any message, then answers the first turn in that query', async () => {
     process.env.NANOCLAW_WAKE_REASON = 'voice-call';
     setContinuation('mock', 'sess-prior');
     const provider = new RecordingProvider({}, reply);
@@ -398,7 +394,6 @@ describe('poll loop — started ahead of a voice call', () => {
 
     await waitFor(() => provider.prompts.length === 1, 1000);
     expect(provider.prompts).toEqual(['']);
-    expect(provider.warmed).toEqual(['sess-prior']);
     await sleep(100);
     expect(getUndeliveredMessages()).toHaveLength(0);
 
@@ -432,7 +427,6 @@ describe('poll loop — started ahead of a voice call', () => {
     await busyLoop.catch(() => {});
     expect(busy.prompts).toHaveLength(1);
     expect(busy.prompts[0]).toContain('hi');
-    expect(busy.warmed).toEqual([]);
   });
 
   it('starts nothing ahead of time for a provider that cannot open a query without a turn', async () => {
@@ -443,7 +437,6 @@ describe('poll loop — started ahead of a voice call', () => {
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);
     await sleep(300);
     expect(provider.prompts).toEqual([]);
-    expect(provider.warmed).toEqual([]);
 
     insertMessage('m1', { sender: 'Alice', text: 'hi' }, { platformId: 'chan-1', channelType: 'discord' });
     await waitFor(() => getUndeliveredMessages().length > 0, 2000);

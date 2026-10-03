@@ -149,7 +149,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     if (messages.length === 0) {
       if (startForCall) {
         startForCall = false;
-        continuation = await runIdleQuery(config, continuation, midTurnCompleteDelivery);
+        // Open the query with no turn yet: the next message is pushed into a running SDK, and
+        // processQuery adopts it as its turn.
+        log('Starting the agent ahead of its first turn');
+        continuation = await runQuery(config, continuation, midTurnCompleteDelivery, '', extractRouting([]), []);
         continue;
       }
       await sleep(POLL_INTERVAL_MS);
@@ -269,23 +272,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
   }
-}
-
-/**
- * Open the provider query with no turn yet, so the next message is pushed into a running SDK
- * (processQuery adopts it as its turn), and warm the provider's prompt cache meanwhile. Returns the
- * continuation to keep.
- */
-async function runIdleQuery(
-  config: PollLoopConfig,
-  continuation: string | undefined,
-  midTurnCompleteDelivery: boolean,
-): Promise<string | undefined> {
-  log('Starting the agent ahead of its first turn');
-  config.provider
-    .warmPromptCache?.({ prompt: '', continuation, cwd: config.cwd, systemContext: config.systemContext })
-    .catch((err) => log(`Prompt cache warm failed: ${err instanceof Error ? err.message : String(err)}`));
-  return runQuery(config, continuation, midTurnCompleteDelivery, '', extractRouting([]), []);
 }
 
 /**

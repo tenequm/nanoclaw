@@ -1,5 +1,5 @@
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { ArrowUp, CircleAlert, Copy, Mic, MicOff, Square } from "lucide-react"
+import { ArrowUp, CircleAlert, Copy, Mic, MicOff, PhoneOff, Square } from "lucide-react"
 import { BarVisualizer, type AgentState as BarState } from "@/components/ui/bar-visualizer"
 import { Matrix, digits, loader, wave, type Frame } from "@/components/ui/matrix"
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from "@/components/ui/conversation"
@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
 import { LIVE_PHASES, type ErrorKind, type Line, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
-import { MODE_NAME, autoListening, endsInDiscard, keyIdentity, modeCaption, reviewView, wakePhraseOf, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
+import { MODE_NAME, autoListening, endsInDiscard, keyIdentity, modeCaption, reviewView, wakePhraseOf, wakeSwitchPhrase, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
@@ -432,7 +432,26 @@ function continues(lines: Line[], i: number): boolean {
 }
 
 /** One on/off switch: a label that wraps, and a track with a knob. Its description lives outside it. */
-function Switch({ label, on, disabled, describedBy, onClick }: { label: string; on: boolean; disabled: boolean; describedBy: string; onClick: () => void }) {
+/**
+ * `text` with each of `keep` shown as written, even where the skin sets everything in lowercase:
+ * the configured wake phrase and the mode names are the caller's to read as they are.
+ */
+function AsWritten({ text, keep }: { text: string; keep: readonly string[] }) {
+  const words = keep.filter(Boolean)
+  if (!words.length) return text
+  const parts = text.split(new RegExp(`(${words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`))
+  return parts.map((part, i) =>
+    i % 2 ? (
+      <span key={i} className="as-written">
+        {part}
+      </span>
+    ) : (
+      part
+    )
+  )
+}
+
+function Switch({ label, on, disabled, describedBy, onClick }: { label: React.ReactNode; on: boolean; disabled: boolean; describedBy: string; onClick: () => void }) {
   return (
     <button type="button" role="switch" aria-checked={on} aria-describedby={describedBy} className={`sw${on ? " on" : ""}`} disabled={disabled} onClick={onClick}>
       <span className="sw-label">{label}</span>
@@ -452,7 +471,8 @@ function CommandsBlock({
   onWake,
   onPauseSends,
 }: {
-  phrase: string
+  /** Null until the line info names it. */
+  phrase: string | null
   wake: boolean
   pauseSends: boolean
   disabled: boolean
@@ -468,10 +488,16 @@ function CommandsBlock({
         <span className="cmds-explain">Say "send it" or "прийом" to send now, "scratch that" to drop it.</span>
       </p>
       <div className={`cmds-switches${wake ? " two" : ""}`}>
-        <Switch label={`Wait for "${phrase}"`} on={wake} disabled={disabled} describedBy="wake-desc" onClick={() => onWake(!wake)} />
+        <Switch
+          label={phrase ? <AsWritten text={`Wait for "${phrase}"`} keep={[phrase]} /> : "Wait for the wake phrase"}
+          on={wake}
+          disabled={disabled}
+          describedBy="wake-desc"
+          onClick={() => onWake(!wake)}
+        />
         {wake && <Switch label="A pause also sends" on={pauseSends} disabled={disabled} describedBy="pause-sends-desc" onClick={() => onPauseSends(!pauseSends)} />}
       </div>
-      <span id="wake-desc" className="sr-only">{`Nothing is sent until you say ${phrase}; then say send it to send.`}</span>
+      <span id="wake-desc" className="sr-only">{`Nothing is sent until you say ${phrase ?? "the wake phrase"}; then say send it to send.`}</span>
       <span id="pause-sends-desc" className="sr-only">
         After the wake phrase a pause sends too, not only send it.
       </span>
@@ -486,6 +512,7 @@ function ModeRow({
   available,
   disabled,
   commands,
+  wake,
   note,
   onPick,
 }: {
@@ -494,6 +521,7 @@ function ModeRow({
   available: boolean
   disabled: boolean
   commands: boolean
+  wake: { on: boolean; pauseSends: boolean }
   note: string | null
   onPick: (mode: TurnMode) => void
 }) {
@@ -513,23 +541,23 @@ function ModeRow({
               aria-describedby={`mode-${m}-desc`}
               onClick={() => onPick(m)}
             >
-              {MODE_NAME[m]}
+              <span className="as-written">{MODE_NAME[m]}</span>
             </button>
           )
         })}
       </div>
       {(["auto", "review"] as const).map((m) => (
         <span key={m} id={`mode-${m}-desc`} className="sr-only">
-          {modeCaption(m, commands)}
+          {modeCaption(m, commands, wake)}
         </span>
       ))}
       {/* The selected radio already carries this as its description. */}
       <p className="mode-caption" aria-hidden="true">
-        {modeCaption(pendingTo ?? mode, commands)}
+        {modeCaption(pendingTo ?? mode, commands, wake)}
       </p>
       {note && (
         <p className="mode-note" role="status">
-          {note}
+          <AsWritten text={note} keep={Object.values(MODE_NAME)} />
         </p>
       )}
     </div>
@@ -537,7 +565,7 @@ function ModeRow({
 }
 
 /** The review draft, pinned under the readout: its own scroller, the header outside it. */
-function DraftPanel({ panel, note, copyable }: { panel: PanelView; note: string | null; copyable: boolean }) {
+function DraftPanel({ panel, note, copyable, onEnd }: { panel: PanelView; note: string | null; copyable: boolean; onEnd?: () => void }) {
   const body = useRef<HTMLDivElement | null>(null)
   const atBottom = useRef(true)
   // More text below the fold: the body fades out at its foot.
@@ -592,6 +620,12 @@ function DraftPanel({ panel, note, copyable }: { panel: PanelView; note: string 
             {copied === "done" ? "Copied" : copied === "failed" ? "Copy failed" : "Copy"}
           </button>
         )}
+        {onEnd && (
+          <button type="button" className="draft-copy" onClick={onEnd}>
+            <PhoneOff size={13} aria-hidden="true" />
+            End call
+          </button>
+        )}
       </header>
       {note && (
         <p className="draft-refusal" role="status">
@@ -644,6 +678,8 @@ function useFlash(count: number, ms: number): boolean {
 }
 
 const REARM_MS = 500
+/** The agent's name until the line info says it: never shown inside the wake phrase. */
+const PLACEHOLDER_AGENT = "your agent"
 const WAKE_FLASH_MS = 1200
 const SLEPT_NOTE_MS = 4000
 
@@ -665,7 +701,7 @@ export default function App() {
   const demoMode = params.get("demo")
   const demo = demoMode === "1" || demoMode === "review" || demoMode === "wake" || demoMode === "cues"
   const demoStep = Number.parseInt(params.get("step") ?? "", 10)
-  const liveKitCall = useLiveKitCall(demo ? "" : token, "your agent")
+  const liveKitCall = useLiveKitCall(demo ? "" : token, PLACEHOLDER_AGENT)
   const demoCall = useDemoCall(demo, demoMode === "review" || demoMode === "wake" || demoMode === "cues" ? demoMode : "auto", Number.isInteger(demoStep) && demoStep >= 0 ? demoStep : null)
   const call = demo ? demoCall : liveKitCall
   const { phase, lines, streamingId, agentName, elapsed, muted, error, endedText } = call
@@ -743,11 +779,11 @@ export default function App() {
     else if (action === "done") rc?.done()
     else if (action === "send") rc?.send()
   }
-  const keysRef = useRef({ rv, rc, rightArmed, draftOpen: false, switching: false })
-  keysRef.current = { rv, rc, rightArmed, draftOpen: !!rs?.draft, switching: switchingToReview }
+  const keysRef = useRef({ rv, rc, rightArmed, switching: false })
+  keysRef.current = { rv, rc, rightArmed, switching: switchingToReview }
 
   // Keyboard: space toggles the microphone (in review: talk and done, never send), escape ends the
-  // call (never while a review draft is open). Never while a control has focus.
+  // call (an open review draft is dropped with it). Never while a control has focus.
   const { toggleMute, end: endCall, start: startCall } = call
   useEffect(() => {
     if (!cfg.shortcuts) return
@@ -764,7 +800,7 @@ export default function App() {
         if (right.disabled || !keys.rightArmed) return
         if (right.action === "talk") keys.rc?.talk()
         else if (right.action === "done") keys.rc?.done()
-      } else if (e.key === "Escape" && (LIVE_PHASES.has(p) || p === "connecting") && !keys.draftOpen) {
+      } else if (e.key === "Escape" && (LIVE_PHASES.has(p) || p === "connecting")) {
         endCall()
       }
     }
@@ -841,8 +877,9 @@ export default function App() {
               : phase === "error"
                 ? ERROR_TITLE[errorKind]
                 : "Call ended"
-  const chipText = reviewReadout ? rv.chip : switchingToReview ? "Switching to review" : sleptNote && phase === "listening" ? "Went back to sleep" : autoChip
+  const chipText = reviewReadout ? rv.chip : switchingToReview ? `Switching to ${MODE_NAME.review}` : sleptNote && phase === "listening" ? "Went back to sleep" : autoChip
   const errChip = chipClass === "err"
+  const keepWords = [MODE_NAME.review, ...(rs ? [wakePhraseOf(rs, agentName)] : [])]
   const readout = (
     <span className={`state-chip ${chipClass}${counting ? " counting" : ""}${wakeFlash && !reduced ? " flash" : ""}`} role="status" aria-live="polite">
       {counting && call.sendCue && <ChipFill key={call.sendCue.id} cue={call.sendCue} reduced={reduced} />}
@@ -851,7 +888,7 @@ export default function App() {
         {phase === "thinking" && !reconnecting && !reduced && (reviewReadout ? rv.chipTone === "think" : !switchingToReview) ? (
           <ShimmeringText className="shimmer" text={chipText} duration={1.4} />
         ) : (
-          chipText
+          <AsWritten text={chipText} keep={keepWords} />
         )}
       </span>
     </span>
@@ -865,13 +902,14 @@ export default function App() {
       available={rc.state.available}
       disabled={phase === "connecting" || (rv ? rv.modeDisabled : !!rc.state.pending || reconnecting)}
       commands={rc.state.commands}
+      wake={{ on: rc.state.wake, pauseSends: rc.state.pauseSends }}
       note={rv?.panel ? null : rc.state.note}
       onPick={rc.setMode}
     />
   )
   const commandsBlock = rc && rc.state.mode === "auto" && !rv && rc.state.commands && (
     <CommandsBlock
-      phrase={wakePhraseOf(rc.state, agentName)}
+      phrase={wakeSwitchPhrase(rc.state, agentName, PLACEHOLDER_AGENT)}
       wake={rc.state.wake}
       pauseSends={rc.state.pauseSends}
       disabled={phase === "connecting" || reconnecting || !!rc.state.pending}
@@ -880,7 +918,8 @@ export default function App() {
     />
   )
   // A refusal about the draft ("send or discard first") shows on the draft, not under the switch.
-  const draftPanel = rv?.panel ? <DraftPanel panel={rv.panel} note={rs?.note ?? null} copyable={keptDraft} /> : null
+  // Ending the call is on offer next to an open draft (the keys are Discard and Send); it drops the draft.
+  const draftPanel = rv?.panel ? <DraftPanel panel={rv.panel} note={rs?.note ?? null} copyable={keptDraft} onEnd={rv.endable && live ? call.end : undefined} /> : null
 
   // The newest delivery mark decides: a lost turn stays on screen until a later one is sent.
   const lastMark = useMemo(() => lines.findLast((l) => l.mark && l.mark.status !== "dropped")?.mark, [lines])
@@ -1030,7 +1069,7 @@ export default function App() {
             </button>
             <span className="label">
               {live ? "On call" : phase === "connecting" ? "Connecting" : phase === "error" ? "Not connected" : keptDraft ? "Draft kept" : "Ready"}
-              {cfg.shortcuts && (live || phase === "connecting") && !(rv && rs?.draft) && <kbd>esc</kbd>}
+              {cfg.shortcuts && (live || phase === "connecting") && <kbd>esc</kbd>}
             </span>
           </div>
           {showRight && (
@@ -1147,7 +1186,9 @@ export default function App() {
               </div>
               <div className="screen-readout">
                 {readout}
-                <span className="screen-hint">{hintText}</span>
+                <span className="screen-hint">
+                  <AsWritten text={hintText} keep={keepWords} />
+                </span>
                 {hearKey}
                 {sendCueBar}
               </div>
@@ -1169,7 +1210,9 @@ export default function App() {
                 <Stage call={call} phase={phase} live={live} presence={cfg.presence} reduced={reduced} sleeping={waitingWake} />
               </div>
               {readout}
-              <p className="hint">{hintText}</p>
+              <p className="hint">
+                <AsWritten text={hintText} keep={keepWords} />
+              </p>
               {sendCueBar}
               {hearKey}
               {deliveryNotice}

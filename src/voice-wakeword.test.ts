@@ -8,11 +8,11 @@ import {
   DEFAULT_WAKE_MODEL,
   DEFAULT_WAKE_THRESHOLD,
   WAKE_HOP_SAMPLES,
+  WAKE_SAMPLE_RATE,
   WAKE_WINDOW_SAMPLES,
   WakeWordPipeline,
   WakeWordSpotter,
   pcmToFloat,
-  wakePhraseOf,
 } from './voice-wakeword.js';
 
 const FIXTURES = fileURLToPath(new URL('./voice-wakeword-fixtures/', import.meta.url));
@@ -110,28 +110,37 @@ describe('WakeWordSpotter', () => {
   });
   const make = (now?: () => number) => {
     const detections: number[] = [];
-    const afters: number[] = [];
+    const windows: Array<{ start: number; end: number }> = [];
     const spotter = new WakeWordSpotter({
       classifier: DEFAULT_WAKE_MODEL,
+      phrase: 'hey livekit',
       threshold: DEFAULT_WAKE_THRESHOLD,
-      onDetect: (score, after) => {
+      onDetect: (score, window) => {
         detections.push(score);
-        afters.push(after);
+        windows.push(window);
       },
       now,
     });
     spotters.push(spotter);
-    return { spotter, detections, afters };
+    return { spotter, detections, windows };
   };
 
-  it('names the phrase after the classifier file', () => {
-    expect(wakePhraseOf(DEFAULT_WAKE_MODEL)).toBe('hey livekit');
-    expect(wakePhraseOf('/models/hey_jarvis.int8.onnx')).toBe('hey jarvis');
-    expect(wakePhraseOf('hey_jarvis_v0.1.onnx')).toBe('hey jarvis');
+  it('closes with a window in flight by letting the thread finish it, never terminating it mid-inference', async () => {
+    const { spotter } = make();
+    await spotter.ready;
+    const thread = (spotter as unknown as { thread: import('node:worker_threads').Worker }).thread;
+    const codes: number[] = [];
+    thread.once('exit', (code) => codes.push(code));
+    spotter.listen(true);
+    spotter.push(positive());
+    expect((spotter as unknown as { inflight: boolean }).inflight).toBe(true);
+    await spotter.close();
+    // terminate() exits 1; a thread that stopped on its own exits 0.
+    expect(codes).toEqual([0]);
   });
 
   it('spots the wake word once in a worker thread, and only while listening', async () => {
-    const { spotter, detections, afters } = make();
+    const { spotter, detections, windows } = make();
     await spotter.ready;
     expect(spotter.phrase).toBe('hey livekit');
     await feed(spotter, concat(silence(1), positive(), silence(1)));
@@ -139,12 +148,16 @@ describe('WakeWordSpotter', () => {
     expect(spotter.summary.scored).toBe(0);
 
     spotter.listen(true);
-    await feed(spotter, concat(silence(1), positive(), silence(1)));
+    const clip = concat(silence(1), positive(), silence(1));
+    await feed(spotter, clip);
     expect(detections).toHaveLength(1);
     expect(detections[0]).toBeGreaterThan(0.9);
-    // Fed one 80 ms hop per score: the audio after the window with the phrase is at most that hop.
-    expect(afters[0]).toBeGreaterThanOrEqual(0);
-    expect(afters[0]).toBeLessThanOrEqual(WAKE_HOP_SAMPLES);
+    // The window that had the phrase, as positions in all the audio pushed: 2 s of the second clip,
+    // ending past its leading second of silence.
+    expect(windows[0].end - windows[0].start).toBe(WAKE_WINDOW_SAMPLES);
+    expect(windows[0].start).toBeGreaterThanOrEqual(clip.length - WAKE_WINDOW_SAMPLES);
+    expect(windows[0].end).toBeGreaterThan(clip.length + WAKE_SAMPLE_RATE);
+    expect(windows[0].end).toBeLessThanOrEqual(2 * clip.length);
     expect(spotter.summary).toMatchObject({ detections: 1, skipped: 0 });
     expect(spotter.summary.scored).toBeGreaterThan(10);
   });
@@ -202,6 +215,7 @@ describe('WakeWordSpotter', () => {
   it('rejects ready when the classifier is missing', async () => {
     const spotter = new WakeWordSpotter({
       classifier: '/nonexistent/hey_nobody.onnx',
+      phrase: 'hey nobody',
       threshold: 0.5,
       onDetect: () => undefined,
     });

@@ -78,18 +78,18 @@ const SCRIPT: Step[] = [
   { phase: "ended", ms: 0, end: "Today's call minutes are used up." },
 ]
 
-// The wake switch: words before "hey Casa" go nowhere, "send it" sends, "scratch that" drops the turn.
+// The wake switch: words before "Hey LiveKit" go nowhere, "send it" sends, "scratch that" drops the turn.
 const WAKE_SCRIPT: Step[] = [
   { phase: "connecting", ms: 1300 },
   { phase: "listening", ms: 2400, awaitingWake: true },
   { phase: "listening", ms: 2600, awaitingWake: true, from: "user", text: "So that's settled for the weekend then." },
   { phase: "listening", ms: 1400, awaitingWake: true, drop: "unaddressed" },
-  { phase: "listening", ms: 3400, awaitingWake: false, wakeHeard: true, from: "user", text: "Hey Casa, book a table for two at eight." },
+  { phase: "listening", ms: 3400, awaitingWake: false, wakeHeard: true, from: "user", text: "Hey LiveKit, book a table for two at eight." },
   { phase: "listening", ms: 2400, awaitingWake: false, from: "user", text: "Somewhere near the office. Send it." },
   { phase: "thinking", ms: 1900, awaitingWake: true, sent: true },
   { phase: "talking", ms: 3600, from: "assistant", text: "Booked Tavola for eight. Want it on your calendar too?", re: "reply to turn 1", awaitingWake: true },
   { phase: "listening", ms: 2000, awaitingWake: true },
-  { phase: "listening", ms: 3000, awaitingWake: false, wakeHeard: true, from: "user", text: "Hey Casa, cancel the dentist on Friday." },
+  { phase: "listening", ms: 3000, awaitingWake: false, wakeHeard: true, from: "user", text: "Hey LiveKit, cancel the dentist on Friday." },
   { phase: "listening", ms: 1600, awaitingWake: false, from: "user", text: "No wait, scratch that." },
   { phase: "listening", ms: 2600, awaitingWake: true, drop: "discarded" },
   { phase: "ended", ms: 0, end: "Call ended." },
@@ -100,7 +100,7 @@ const WAKE_SCRIPT: Step[] = [
 const CUES_SCRIPT: Step[] = [
   { phase: "connecting", ms: 1300 },
   { phase: "listening", ms: 2400, awaitingWake: true },
-  { phase: "listening", ms: 2600, awaitingWake: false, wakeHeard: true, preWake: true, from: "user", text: "Right, anyway. Hey Casa, what's on tomorrow morning?" },
+  { phase: "listening", ms: 2600, awaitingWake: false, wakeHeard: true, preWake: true, from: "user", text: "Right, anyway. Hey LiveKit, what's on tomorrow morning?" },
   { phase: "listening", ms: 3600, awaitingWake: false, pause: true },
   { phase: "thinking", ms: 1900, awaitingWake: true, sent: true },
   { phase: "talking", ms: 3600, from: "assistant", text: "You have the dentist at ten, then lunch with Laura.", re: "reply to turn 1", awaitingWake: true, unheard: true },
@@ -158,6 +158,12 @@ const DEMO_SILENCE_MS = 2500
 /** How long after a turn closes the agent's session confirms it. */
 const DEMO_STORED_MS = 500
 
+/**
+ * The demo's review state before any step: the bundled wake word's phrase, and every switch set
+ * explicitly per script rather than taken from a new caller's defaults.
+ */
+const demoReview = (mode: TurnMode, wake: boolean): ReviewState => ({ ...INITIAL_REVIEW, mode, wake, pauseSends: false, wakePhrase: "Hey LiveKit" })
+
 const scriptFor = (which: DemoScript): Step[] => (which === "review" ? REVIEW_SCRIPT : which === "wake" ? WAKE_SCRIPT : which === "cues" ? CUES_SCRIPT : SCRIPT)
 const wakeScript = (steps: Step[]) => steps === WAKE_SCRIPT || steps === CUES_SCRIPT
 
@@ -170,7 +176,7 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
   const [endedText, setEndedText] = useState<string | null>(null)
   const [sendCue, setSendCue] = useState<SendCue | null>(null)
   const [limitNote, setLimitNote] = useState<string | null>(null)
-  const [review, setReview] = useState<ReviewState>({ ...INITIAL_REVIEW, mode: initial === "review" ? "review" : "auto", wake: initial === "wake" || initial === "cues" })
+  const [review, setReview] = useState<ReviewState>(demoReview(initial === "review" ? "review" : "auto", initial === "wake" || initial === "cues"))
   const [reconnecting, setReconnecting] = useState(false)
   const turns = useRef(0)
 
@@ -248,7 +254,7 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
   /** A review step: its whole review state, and what it adds to the history. */
   const applyReview = useCallback(
     (step: Step, instant: boolean) => {
-      const next: ReviewState = { ...INITIAL_REVIEW, mode: "review", ...step.review }
+      const next: ReviewState = { ...demoReview("review", false), ...step.review }
       setReconnecting(!!step.reconnecting)
       setMuted(step.muted ?? !next.micOn)
       const heard = next.provisional
@@ -341,7 +347,7 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
     setEndedText(null)
     setLimitNote(null)
     setReconnecting(false)
-    setReview((r) => ({ ...INITIAL_REVIEW, mode: script.current === REVIEW_SCRIPT ? "review" : r.mode, wake: wakeScript(script.current) }))
+    setReview((r) => demoReview(script.current === REVIEW_SCRIPT ? "review" : r.mode, wakeScript(script.current)))
     turns.current = 0
     startedAt.current = Date.now()
     setElapsed(0)
@@ -364,7 +370,7 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
   const pick = useCallback(
     (which: DemoScript) => {
       script.current = scriptFor(which)
-      setReview({ ...INITIAL_REVIEW, mode: which === "review" ? "review" : "auto", wake: which === "wake" })
+      setReview(demoReview(which === "review" ? "review" : "auto", which === "wake"))
       if (LIVE_PHASES.has(phaseRef.current)) start()
     },
     [start]

@@ -26,13 +26,12 @@ import { getChannelAdapter, getChannelDefaults, registerChannelAdapter } from '.
 import type { VoiceUiConfig } from './voice-call-page.js';
 import { resolveVoiceLine, type ResolveLineOptions, type VoiceLine } from './voice-line.js';
 import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-livekit.js';
-import { DEFAULT_VOICE_MIRROR } from './voice-livekit-protocol.js';
+import { DEFAULT_VOICE_MIRROR, wakePhrase } from './voice-livekit-protocol.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
-import { holdIdleCeiling } from '../reconcile-session.js';
 import { requestWake } from '../request-wake.js';
 import type { Session } from '../types.js';
 import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
@@ -45,8 +44,6 @@ const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 /** After a turn reaches the agent, its session's replies are picked up at once for this long, not on the 1 s poll. */
 const CALL_REPLY_EXPEDITE_MS = 60_000;
-/** A call's hold on its sessions' idle ceiling outlasts the longest call by this much, in case the end is missed. */
-const CALL_HOLD_GRACE_MS = 5 * MINUTE_MS;
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 
@@ -173,6 +170,8 @@ export interface VoiceConfig {
   now?: () => number;
   /** Look of the browser call page; injected at serve time, no rebuild needed (VOICE_UI). */
   ui?: VoiceUiConfig;
+  /** The wake phrase the worker listens for (wakePhrase); null: `hey <agent>`. Unset: the page is not told. */
+  wakePhrase?: string | null;
   maxCallDurationMs?: number;
   maxCallsPerHour?: number;
   /** Call time one line may use per UTC day. */
@@ -185,11 +184,10 @@ export interface VoiceConfig {
   allowedClientCidrs?: string;
   /** The session a call's turn went to: its replies are delivered without waiting on the poll. Test seam. */
   expediteReplies?: (session: Session) => void;
-  /** How a call finds, starts and holds the agent session it talks to (findCallSession, requestWake, holdIdleCeiling). Test seams. */
+  /** How a call finds and starts the agent session it talks to (findCallSession, requestWake). Test seams. */
   prewarm?: {
     findSession?: (route: Omit<InboundEvent, 'message'>, agentGroupId: string) => Promise<Session | undefined>;
     wake?: (session: Session) => Promise<boolean>;
-    hold?: (sessionId: string, holder: string, untilMs: number) => () => void;
   };
 }
 
@@ -252,7 +250,6 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
     config.expediteReplies ?? ((session: Session) => expediteDelivery(session, CALL_REPLY_EXPEDITE_MS));
   const findSession = config.prewarm?.findSession ?? findCallSession;
   const wakeSession = config.prewarm?.wake ?? ((session: Session) => requestWake(session, 'voice-call'));
-  const holdSession = config.prewarm?.hold ?? holdIdleCeiling;
   const maxCallDurationMs = config.maxCallDurationMs ?? 15 * 60_000;
   const maxCallsPerHour = config.maxCallsPerHour ?? 12;
   const maxCallMsPerDay = config.maxCallMsPerDay ?? 120 * MINUTE_MS;
@@ -309,25 +306,17 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
     usage.set(call.platformId, { day, usedMs: (used?.day === day ? used.usedMs : 0) + elapsedTodayMs(call, t) });
   };
 
-  /** Per live call: releases of its holds on the idle ceiling of the sessions it talks to, by session id. */
-  const callHolds = new Map<string, Map<string, () => void>>();
-  const holdForCall = (callId: string, sessionId: string): void => {
-    const holds = callHolds.get(callId);
-    if (!holds || holds.has(sessionId)) return;
-    holds.set(
-      sessionId,
-      holdSession(sessionId, `voice-call:${callId}`, now() + maxCallDurationMs + CALL_HOLD_GRACE_MS),
-    );
-  };
+  /** Calls whose caller joined and that have not ended: each is woken for once, and never after its end. */
+  const joinedCalls = new Set<string>();
 
   /**
-   * The caller is in: start the agent the first turn goes to, so that turn meets a running agent,
-   * and keep it from being reaped as idle while the call lasts. Nothing reaches the chat.
+   * The caller is in: start the agent the first turn goes to, so that turn meets a running agent.
+   * Nothing reaches the chat. A long silent call is reaped as idle like any session; its next turn
+   * wakes the agent again.
    */
   const prewarmCall = async (callId: string, route: Omit<InboundEvent, 'message'>, agentGroupId: string) => {
     const session = await findSession(route, agentGroupId);
-    if (!session || !callHolds.has(callId)) return;
-    holdForCall(callId, session.id);
+    if (!session || !joinedCalls.has(callId)) return;
     if (await wakeSession(session))
       log.info('livekit-voice: agent running for the call', { callId, sessionId: session.id });
   };
@@ -347,8 +336,6 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
         }
         const onStored = (session: Session) => {
           expediteReplies(session);
-          const turn = parseLiveKitUtteranceId(event.message.id);
-          if (turn) holdForCall(turn.callId, session.id);
           resolve(true);
         };
         setup.routeInboundEvent({ ...event, onStored }).then(
@@ -360,16 +347,13 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
         );
       }),
     callJoined: (callId, route, agentGroupId) => {
-      if (callHolds.has(callId)) return;
-      callHolds.set(callId, new Map());
+      if (joinedCalls.has(callId)) return;
+      joinedCalls.add(callId);
       prewarmCall(callId, route, agentGroupId).catch((err: unknown) =>
         log.warn('livekit-voice: could not start the agent for the call', { callId, err }),
       );
     },
-    callEnded: (callId) => {
-      for (const release of callHolds.get(callId)?.values() ?? []) release();
-      callHolds.delete(callId);
-    },
+    callEnded: (callId) => void joinedCalls.delete(callId),
     isRunning: () => connected,
     now,
     maxCallDurationMs,
@@ -417,7 +401,8 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
         if (!tokens.has(token)) return reply(res, 403, 'Unknown call link');
         const line = await resolveLine(lineIdForToken(token));
         if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
-        return reply(res, 200, JSON.stringify({ agent: line.agent.name, caller: line.caller.name }), JSON_HEADERS);
+        const info = { agent: line.agent.name, caller: line.caller.name, wakePhrase: config.wakePhrase };
+        return reply(res, 200, JSON.stringify(info), JSON_HEADERS);
       }
       reply(res, 404, 'Not found');
     } catch (err) {
@@ -547,6 +532,8 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'VOICE_TTS_VOICE',
       'VOICE_SILENCE_MS',
       'VOICE_MIRROR',
+      'VOICE_WAKE_MODEL',
+      'VOICE_WAKE_PHRASE',
     ]);
     if (!env.VOICE_LINK_TOKEN) {
       if (env.LIVEKIT_URL) log.warn('voice: VOICE_LINK_TOKEN is not set; the channel stays offline');
@@ -568,6 +555,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       publicUrl: (env.VOICE_PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, ''),
       linkTokens,
       ui: parseUiConfig(env.VOICE_UI),
+      wakePhrase: wakePhrase(env),
       allowNonLoopback: env.VOICE_ALLOW_NON_LOOPBACK === '1',
       trustedProxyCidrs: env.VOICE_TRUSTED_PROXY_CIDRS,
       allowedClientCidrs: env.VOICE_ALLOWED_CLIENT_CIDRS,

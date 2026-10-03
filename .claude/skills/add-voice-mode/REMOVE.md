@@ -19,7 +19,7 @@ worker with its wake word models, and their seven tests:
 
 ```bash
 rm -f src/channels/voice.ts src/channels/voice-line.ts src/channels/voice-call-page.ts src/channels/voice-adapter.test.ts src/channels/voice-registration.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts
-rm -f src/channels/voice-livekit.ts src/channels/voice-livekit-protocol.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.ts src/voice-livekit-worker.test.ts
+rm -f src/channels/voice-livekit.ts src/channels/voice-livekit-protocol.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.ts src/voice-livekit-worker.test.ts src/voice-gemini-live.ts src/voice-gemini-live.test.ts
 rm -rf src/voice-wakeword.ts src/voice-wakeword.test.ts src/voice-wakeword-fixtures assets/voice-wakeword
 ```
 
@@ -32,7 +32,7 @@ rm -f ~/.config/systemd/user/nanoclaw-voice-worker.service && systemctl --user d
 
 Recorded caller turns (`VOICE_RECORDINGS_DAYS`) are under
 `data/voice-recordings/`; delete that directory if you do not want to keep them.
-The worker's note of a failed speech model is `data/voice-tts-state.json`; delete it too.
+An older worker kept a note of a failed speech model in `data/voice-tts-state.json`; the current one no longer reads or writes it, so delete it if it is there.
 
 ## 3. Remove the container skill
 
@@ -70,3 +70,6 @@ and delete the wiring and messaging group with `ncl wirings delete` and
 user record when keeping call history. Before deleting a line's messaging group,
 `ncl voice-lines remove --line voice:<line id>` drops its owners and call chat.
 The LiveKit server and the Gemini key are managed outside NanoClaw.
+The call page keeps each caller's Manual or hands-free pick, wake switches and
+wake phrase in their own browser (`localStorage`); clearing the site's data there
+removes them.

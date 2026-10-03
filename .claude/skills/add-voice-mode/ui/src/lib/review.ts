@@ -66,13 +66,13 @@ export interface ReviewState {
   preparing?: boolean
   /** The worker understands spoken commands (before a call: assumed). */
   commands: boolean
-  /** The caller's wake switch: in auto nothing is sent until `hey <agent>`. Kept for the next call. */
+  /** The caller's wake switch: in auto nothing is sent until the wake phrase. Kept for the next call (ReviewPrefs). */
   wake: boolean
   /** With the wake switch: a pause sends too after the wake phrase, not only `send it`. */
   pauseSends: boolean
   /** The worker waits for the wake phrase right now. */
   awaitingWake: boolean
-  /** The phrase the worker's wake word listens for (`hey livekit`); null: `hey <agent>`. Kept for the next call. */
+  /** The phrase the worker's wake word listens for, as configured (`Hey LiveKit`); null: `Hey <agent>`. Kept for the next call. */
   wakePhrase: string | null
   /** How many times this call the worker heard the wake phrase (CallWakeState.heard); each one flashes the readout. */
   wakeHeard: number
@@ -91,13 +91,66 @@ export function storedWakePhrase(): string | null {
   }
 }
 
-/** Remember the worker's wake phrase for the next page load; null: `hey <agent>`. */
+/** Remember the worker's wake phrase for the next page load; null: `Hey <agent>`. */
 export function storeWakePhrase(phrase: string | null): void {
   try {
     if (phrase) localStorage.setItem(WAKE_PHRASE_KEY, phrase)
     else localStorage.removeItem(WAKE_PHRASE_KEY)
   } catch {
-    // Storage off (a private window): the next load names `hey <agent>` until the worker says.
+    // Storage off (a private window): the next load names `Hey <agent>` until the worker says.
+  }
+}
+
+/** The caller's own picks, kept for the next call and page load. */
+export interface ReviewPrefs {
+  mode: TurnMode
+  wake: boolean
+  pauseSends: boolean
+}
+
+/** A caller with nothing remembered: hands-free, with the wake switch on. */
+export const DEFAULT_PREFS: ReviewPrefs = { mode: "auto", wake: true, pauseSends: false }
+
+const PREFS_KEY = "voice-review-prefs"
+
+/**
+ * The picks remembered in this browser, each one on its own: a value that is missing or not the
+ * right kind takes its default, so a remembered `wake: false` stays off. Storage that is off or
+ * holds something else reads as nothing remembered.
+ */
+export function storedPrefs(): ReviewPrefs {
+  let saved: Partial<Record<keyof ReviewPrefs, unknown>> = {}
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(PREFS_KEY) ?? "null")
+    if (parsed && typeof parsed === "object") saved = parsed
+  } catch {
+    // Unreadable or blocked: the defaults.
+  }
+  return {
+    mode: saved.mode === "auto" || saved.mode === "review" ? saved.mode : DEFAULT_PREFS.mode,
+    wake: typeof saved.wake === "boolean" ? saved.wake : DEFAULT_PREFS.wake,
+    pauseSends: typeof saved.pauseSends === "boolean" ? saved.pauseSends : DEFAULT_PREFS.pauseSends,
+  }
+}
+
+/**
+ * The switches after the worker did not take the page's settings: what it runs, as it last said, or
+ * what a worker starts with before it has said (waiting for the wake phrase). Never remembered.
+ */
+export function settingsNotTaken(ran: ReviewSnapshot["wake"]): Pick<ReviewState, "wake" | "pauseSends" | "note"> {
+  return {
+    wake: ran?.on ?? DEFAULT_PREFS.wake,
+    pauseSends: ran?.pauseSends ?? DEFAULT_PREFS.pauseSends,
+    note: "Settings didn't reach the call - try again.",
+  }
+}
+
+/** Remember the caller's picks: one made before a call, or one the worker took during it. */
+export function storePrefs(prefs: ReviewPrefs): void {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ mode: prefs.mode, wake: prefs.wake, pauseSends: prefs.pauseSends }))
+  } catch {
+    // Storage off: the picks last as long as the page.
   }
 }
 
@@ -112,8 +165,8 @@ export const INITIAL_REVIEW: ReviewState = {
   note: null,
   delivery: null,
   commands: true,
-  wake: false,
-  pauseSends: false,
+  wake: DEFAULT_PREFS.wake,
+  pauseSends: DEFAULT_PREFS.pauseSends,
   awaitingWake: false,
   wakePhrase: null,
   wakeHeard: 0,
@@ -165,6 +218,8 @@ export interface ReviewView {
   panel: PanelView | null
   /** The switch is off while an operation settles, the line reconnects or a transcript finishes. */
   modeDisabled: boolean
+  /** The call can end besides the two keys (the left one is Discard): ending drops the draft. */
+  endable: boolean
 }
 
 export interface ReviewInput {
@@ -214,8 +269,8 @@ const key = (label: string, action: KeyAction, disabled = false): KeyView => ({ 
 const BLOCKED = {
   recording: "Tap done, then send or discard.",
   finishing: "Finishing transcript.",
-  sendable: "Send or discard before auto.",
-  unsendable: "Discard before auto.",
+  sendable: "Send or discard before hands-free.",
+  unsendable: "Discard before hands-free.",
 } as const
 
 /** Why the caller cannot leave review for auto right now, or null when they can. */
@@ -263,6 +318,7 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
       capturing: false,
       panel: kept ? panel : null,
       modeDisabled: phase === "connecting" || !!kept,
+      endable: false,
     }
   }
 
@@ -356,7 +412,7 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
 
   // A switch in flight: the last acknowledged mode stays, nothing else can start.
   if (pending?.op === "mode") {
-    chip = pending.to === "review" ? "Switching to review" : "Switching to auto"
+    chip = `Switching to ${MODE_NAME[pending.to ?? "auto"]}`
     tone = ""
     left = d ? key("Discard", "discard", true) : key("End", "end")
     right = { ...right, disabled: true }
@@ -391,7 +447,16 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
     capturing,
     panel,
     modeDisabled: reconnecting || !!pending || d?.state === "finishing",
+    endable: left.action !== "end",
   }
+}
+
+/**
+ * Whether a mode switch opens the microphone again: Manual keeps it off between recordings, so back
+ * in hands-free it listens once the worker took the switch, unless the caller muted it themselves.
+ */
+export function reopensMic({ to, taken, muted, mutedByHand }: { to: TurnMode; taken: boolean; muted: boolean; mutedByHand: boolean }): boolean {
+  return to === "auto" && taken && muted && !mutedByHand
 }
 
 /** The worker's error for a refused operation, as the caller's next step. */
@@ -404,12 +469,17 @@ export function refusalNote(error: string | undefined, agentName: string): strin
 }
 
 /** Turn modes as the page names them; the protocol keeps `auto` and `review`. */
-export const MODE_NAME: Record<TurnMode, string> = { auto: "hands-free", review: "check first" }
+export const MODE_NAME: Record<TurnMode, string> = { auto: "hands-free", review: "Manual" }
 
-/** What each mode does, in one line under the switch. */
-export function modeCaption(mode: TurnMode, commands: boolean): string {
+/**
+ * What each mode does, in one line under the switch. With the wake switch on a pause sends only when
+ * the pause switch says so, as the readout's hint says too.
+ */
+export function modeCaption(mode: TurnMode, commands: boolean, wake?: { on: boolean; pauseSends: boolean }): string {
   if (mode === "review") return "Tap talk, read your words, then send."
-  return commands ? `Stop for a moment, or say "send it", to send.` : "Stop for a moment to send."
+  if (!commands) return "Stop for a moment to send."
+  if (wake?.on && !wake.pauseSends) return `Say "send it" to send.`
+  return `Stop for a moment, or say "send it", to send.`
 }
 
 /**
@@ -443,9 +513,28 @@ export interface ListeningView {
   empty: string
 }
 
-/** The phrase that opens a turn with the wake switch on. */
+/**
+ * The wake phrase in the host's line info, which it knows before the call: a phrase, null for
+ * `hey <agent>`, undefined when it does not say (an older host).
+ */
+export function infoWakePhrase(info: unknown): string | null | undefined {
+  if (!info || typeof info !== "object" || !("wakePhrase" in info)) return undefined
+  const phrase = info.wakePhrase
+  if (phrase === null) return null
+  return typeof phrase === "string" && phrase.trim() ? phrase.trim() : undefined
+}
+
+/**
+ * The wake switch's phrase, or null while it is not known: before the line info names the agent the
+ * page has only a placeholder name (`placeholder`), never shown as `Hey <placeholder>`.
+ */
+export function wakeSwitchPhrase(review: ReviewState, agentName: string, placeholder: string): string | null {
+  return review.wakePhrase ?? (agentName === placeholder ? null : `Hey ${agentName}`)
+}
+
+/** The phrase that opens a turn with the wake switch on, shown exactly as configured. */
 export function wakePhraseOf(review: ReviewState, agentName: string): string {
-  return review.wakePhrase ?? `hey ${agentName}`
+  return review.wakePhrase ?? `Hey ${agentName}`
 }
 
 /**
