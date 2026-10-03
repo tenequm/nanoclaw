@@ -268,19 +268,25 @@ describe('WakeWordSpotter', () => {
     },
   );
 
+  const SEND_IT = fileURLToPath(new URL('../assets/voice-commands/send_it.onnx', import.meta.url));
   const SCRATCH_THAT = fileURLToPath(new URL('../assets/voice-commands/scratch_that.onnx', import.meta.url));
-  it.skipIf(!fs.existsSync(SCRATCH_THAT))("loads the fork's scratch_that model next to the wake word", async () => {
-    expect(defaultThreshold(SCRATCH_THAT)).toBe(0.35);
-    expect(wakePhraseOf(SCRATCH_THAT)).toBe('scratch that');
-    const pipeline = await WakeWordPipeline.load([DEFAULT_WAKE_MODEL, SCRATCH_THAT]);
-    try {
-      const [wake, discard] = await pipeline.score(pcmToFloat(readWav(path.join(FIXTURES, 'positive.wav'))));
-      expect(wake).toBeGreaterThan(0.9);
-      expect(discard).toBeLessThan(0.35);
-    } finally {
-      await pipeline.release();
-    }
-  });
+  it.skipIf(!fs.existsSync(SCRATCH_THAT) || !fs.existsSync(SEND_IT))(
+    "loads the fork's send_it and scratch_that models next to the wake word",
+    async () => {
+      expect(defaultThreshold(SCRATCH_THAT)).toBe(0.35);
+      expect(defaultThreshold(SEND_IT)).toBe(0.2);
+      expect(wakePhraseOf(SCRATCH_THAT)).toBe('scratch that');
+      const pipeline = await WakeWordPipeline.load([DEFAULT_WAKE_MODEL, SEND_IT, SCRATCH_THAT]);
+      try {
+        const [wake, send, discard] = await pipeline.score(pcmToFloat(readWav(path.join(FIXTURES, 'positive.wav'))));
+        expect(wake).toBeGreaterThan(0.9);
+        expect(send).toBeLessThan(0.2);
+        expect(discard).toBeLessThan(0.35);
+      } finally {
+        await pipeline.release();
+      }
+    },
+  );
 
   it('rejects ready when no classifier loads', async () => {
     const spotter = new WakeWordSpotter({

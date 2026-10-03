@@ -5,6 +5,7 @@ never this directory, and its default wake word stays hey_livekit. This fork's
 deploy opts in through .env, with paths relative to the NanoClaw directory:
 
   VOICE_WAKE_MODEL=assets/voice-commands/hey_dan.onnx
+  VOICE_SEND_MODEL=assets/voice-commands/send_it.onnx
   VOICE_DISCARD_MODEL=assets/voice-commands/scratch_that.onnx
 
 hey_dan.onnx listens for "hey dan" (and "hey den", as a Ukrainian speaker says
@@ -40,3 +41,13 @@ at 0.5), but on other voices (macOS say and Gemini TTS) "scratch that" scores
 misses ("catch that", "match that", "sketch that", "watch that", "send it")
 stay at 0.05 or under; "Scratch this plan" reaches 0.51, which the worker's
 transcript check keeps as words (it does not end the sentence).
+
+send_it.onnx listens for "send it" (the send command), trained like
+scratch_that.onnx with end-aligned negatives. Its known threshold in the worker
+is 0.2. Its own evaluation is pessimistic (recall 0.03 at 0.5), but on other
+voices "send it" scores 0.22-0.63 on 9 of 10 voices (the Ukrainian-accented one
+0.07-0.09), "sent it", "spend it", "send them" and the wake phrases stay at 0.15
+or under, and "Send this one later" reaches 0.41, which the worker's transcript
+check keeps as words (it does not end the sentence). On a real call, with both
+command models and hey_livekit in one spotter: no command fired on a near miss,
+and the spotter took 8.6 ms per 80 ms window (6.6% of one core) on an M1 Max.

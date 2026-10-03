@@ -2900,11 +2900,12 @@ describe('acoustic wake word', () => {
       }),
     ).toEqual([
       { name: 'send', model: '/m/send_it.onnx', threshold: 0.9 },
-      { name: 'discard', model: path.resolve('models/scratch_that.onnx'), threshold: 0.5 },
+      // The fork's own models' thresholds are known by file name.
+      { name: 'discard', model: path.resolve('models/scratch_that.onnx'), threshold: 0.35 },
     ]);
     expect(spotterSettings({ VOICE_SEND_MODEL: '/m/send_it.onnx', VOICE_DISCARD_MODEL: 'off' })).toEqual([
       wake,
-      { name: 'send', model: '/m/send_it.onnx', threshold: 0.5 },
+      { name: 'send', model: '/m/send_it.onnx', threshold: 0.2 },
     ]);
   });
 

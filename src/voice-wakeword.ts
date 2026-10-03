@@ -37,6 +37,7 @@ const KNOWN_THRESHOLDS: Record<string, number> = {
   hey_livekit: DEFAULT_WAKE_THRESHOLD,
   // This fork's own model (assets/voice-commands/, see its NOTICE): its evaluation's operating point.
   hey_dan: 0.76,
+  send_it: 0.2,
   scratch_that: 0.35,
 };
 
