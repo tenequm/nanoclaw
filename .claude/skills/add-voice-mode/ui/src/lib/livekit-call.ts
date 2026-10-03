@@ -146,11 +146,11 @@ type SettledTurn = { turn: number; status: "sent" | "lost"; reason?: TurnMark["r
  * Caller words the worker will never send (CallDroppedSpeech): a spoken discard, speech before the
  * wake phrase, or a spoken command said alone, with nothing open to act on.
  */
-type DroppedSpeech = { dropped: "discarded" | "unaddressed" | "command"; text: string }
+type DroppedSpeech = { dropped: "discarded" | "unaddressed" | "command" | "asleep"; text: string }
 
 function isDroppedSpeech(v: unknown): v is DroppedSpeech {
   const d = v as DroppedSpeech | null
-  return !!d && (d.dropped === "discarded" || d.dropped === "unaddressed" || d.dropped === "command") && typeof d.text === "string"
+  return !!d && (d.dropped === "discarded" || d.dropped === "unaddressed" || d.dropped === "command" || d.dropped === "asleep") && typeof d.text === "string"
 }
 
 /** The caller spoke while the agent's line played (CallUnheardSpeech): none of it was transcribed. */
@@ -220,8 +220,12 @@ function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, new
   if (lines.some((l) => l.from === "user" && l.turn === turn)) return lines.map((l) => (l.from === "user" && l.turn === turn ? { ...l, mark } : l))
   const open = lines.filter((l) => l.from === "user" && !covered.has(l.id))
   const said = norm(status.text ?? "")
-  const target =
-    (said ? [...open].reverse().find((l) => within(said, l)) : undefined) ?? open[open.length - 1]
+  // A turn lost with no words never claims a caption with words: those were transcribed after all
+  // (late), and stay open for the next turn.
+  const wordless = status.status === "lost" && !said
+  const target = wordless
+    ? undefined
+    : ((said ? [...open].reverse().find((l) => within(said, l)) : undefined) ?? open[open.length - 1])
   if (!target) {
     const line = { ...newLine(), text: status.text?.trim() ?? "", mark, turn }
     covered.add(line.id)
@@ -261,7 +265,7 @@ function applyDropped(lines: Line[], covered: Set<number>, d: DroppedSpeech): Li
     for (const id of before) covered.add(id)
     return lines.map((l) => (l.id === part.id ? { ...l, preWake: true } : before.has(l.id) ? { ...l, mark: { status: "dropped", reason: "unaddressed" } } : l))
   }
-  const target = d.dropped === "discarded" ? open[open.length - 1] : (whole ?? open[0])
+  const target = d.dropped === "discarded" || d.dropped === "asleep" ? open[open.length - 1] : (whole ?? open[0])
   if (!target) return lines
   const marked = new Set<number>()
   for (const l of open) {
@@ -348,6 +352,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   /** The wake phrase was heard before its caption: the next caller line carries the mark. */
   const wakeNext = useRef(false)
   const wakeHeard = useRef(0)
+  const wakeSlept = useRef(0)
   const lastUserAt = useRef(0)
   const limit = useRef<{ ms: number; kind: string } | null>(null)
   const joinedAt = useRef(0)
@@ -843,6 +848,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     unheardReplies.current.clear()
     wakeNext.current = false
     wakeHeard.current = 0
+    wakeSlept.current = 0
     lastUserAt.current = 0
     currentReply.current = null
     limit.current = null
@@ -1055,11 +1061,22 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       // The line being spoken as the phrase was heard carries the mark, else the next one.
       const lines = linesRef.current
       const last = lines.findLast((l) => l.from === "user")
-      if (last && !last.mark && !coveredLines.current.has(last.id) && Date.now() - lastUserAt.current < WAKE_LINE_MS) {
+      const current = !!last && !last.mark && !coveredLines.current.has(last.id) && Date.now() - lastUserAt.current < WAKE_LINE_MS
+      if (snap.wake?.cut) {
+        // The transcription restarted right after the phrase: its line is the phrase alone, never
+        // part of the turn, and the turn's words come on lines of their own.
+        if (current && last) {
+          coveredLines.current.add(last.id)
+          commitLines(lines.map((l) => (l.id === last.id ? { ...l, wake: true, wakeOnly: true } : l)))
+        }
+        wakeNext.current = false
+      } else if (current && last) {
         commitLines(lines.map((l) => (l.id === last.id ? { ...l, wake: true } : l)))
         wakeNext.current = false
       } else wakeNext.current = true
     }
+    const slept = snap.wake?.slept
+    if (typeof slept === "number" && slept > wakeSlept.current) wakeSlept.current = slept
     if (awaitingWake) wakeNext.current = false
     updateReview((r) => ({
       ...r,
@@ -1069,6 +1086,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       preparing: !!snap.preparing,
       awaitingWake,
       wakeHeard: wakeHeard.current,
+      wakeSlept: wakeSlept.current,
       ...(snap.wake ? { wakePhrase: snap.wake.phrase ?? null } : {}),
       ...(done ? { pending: null } : {}),
     }))

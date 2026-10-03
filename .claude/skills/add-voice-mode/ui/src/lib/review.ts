@@ -33,7 +33,7 @@ export interface ReviewSnapshot {
    * Auto mode's wake switch as the worker runs it: `waiting` until it hears `hey <agent>`, or its
    * acoustic wake word's `phrase` when it has one.
    */
-  wake?: { on: boolean; pauseSends: boolean; waiting: boolean; phrase?: string; heard?: number }
+  wake?: { on: boolean; pauseSends: boolean; waiting: boolean; phrase?: string; heard?: number; slept?: number; cut?: boolean }
 }
 
 export function isReviewSnapshot(v: unknown): v is ReviewSnapshot {
@@ -76,6 +76,8 @@ export interface ReviewState {
   wakePhrase: string | null
   /** How many times this call the worker heard the wake phrase (CallWakeState.heard); each one flashes the readout. */
   wakeHeard: number
+  /** How many times this call an open turn went back to waiting with nothing more said (CallWakeState.slept). */
+  wakeSlept: number
 }
 
 export const INITIAL_REVIEW: ReviewState = {
@@ -94,6 +96,7 @@ export const INITIAL_REVIEW: ReviewState = {
   awaitingWake: false,
   wakePhrase: null,
   wakeHeard: 0,
+  wakeSlept: 0,
 }
 
 /** What a key does when pressed. */

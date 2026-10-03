@@ -110,14 +110,18 @@ describe('WakeWordSpotter', () => {
   });
   const make = (now?: () => number) => {
     const detections: number[] = [];
+    const afters: number[] = [];
     const spotter = new WakeWordSpotter({
       classifier: DEFAULT_WAKE_MODEL,
       threshold: DEFAULT_WAKE_THRESHOLD,
-      onDetect: (score) => detections.push(score),
+      onDetect: (score, after) => {
+        detections.push(score);
+        afters.push(after);
+      },
       now,
     });
     spotters.push(spotter);
-    return { spotter, detections };
+    return { spotter, detections, afters };
   };
 
   it('names the phrase after the classifier file', () => {
@@ -127,7 +131,7 @@ describe('WakeWordSpotter', () => {
   });
 
   it('spots the wake word once in a worker thread, and only while listening', async () => {
-    const { spotter, detections } = make();
+    const { spotter, detections, afters } = make();
     await spotter.ready;
     expect(spotter.phrase).toBe('hey livekit');
     await feed(spotter, concat(silence(1), positive(), silence(1)));
@@ -138,6 +142,9 @@ describe('WakeWordSpotter', () => {
     await feed(spotter, concat(silence(1), positive(), silence(1)));
     expect(detections).toHaveLength(1);
     expect(detections[0]).toBeGreaterThan(0.9);
+    // Fed one 80 ms hop per score: the audio after the window with the phrase is at most that hop.
+    expect(afters[0]).toBeGreaterThanOrEqual(0);
+    expect(afters[0]).toBeLessThanOrEqual(WAKE_HOP_SAMPLES);
     expect(spotter.summary).toMatchObject({ detections: 1, skipped: 0 });
     expect(spotter.summary.scored).toBeGreaterThan(10);
   });
