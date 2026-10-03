@@ -2857,6 +2857,16 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       });
     }
     void spotter?.close().catch(() => undefined);
+    // A job process serves one call: its heap now is what the call grew it to (long calls show
+    // 100-150 ms GC pauses).
+    const mem = process.memoryUsage();
+    const mb = (bytes: number) => Math.round(bytes / 1_048_576);
+    callLog.info('voice worker: call memory', {
+      heapUsedMB: mb(mem.heapUsed),
+      heapTotalMB: mb(mem.heapTotal),
+      externalMB: mb(mem.external),
+      rssMB: mb(mem.rss),
+    });
     // The host link stays open until the host answered: closed first, it ends the call on its own
     // and answers this at once, before the room carries why the call ended.
     await Promise.all([
@@ -3172,6 +3182,10 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
   console.info(
     `voice worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${liveKitHostUrl(env)} (LIVEKIT_HOST_URL)`,
   );
+  // agents-js's default ("adaptive") enables the debugger domain on a job's first loop stall to
+  // sample stacks: that blocks the loop another ~250 ms mid-call and slows the call's JS by ~15%
+  // from then on. Set the variable to sample anyway; the job processes inherit it.
+  process.env.LIVEKIT_AGENTS_LOOP_BLOCK_STACKS ??= 'never';
   const keepDays = recordingDays(env.VOICE_RECORDINGS_DAYS);
   if (keepDays > 0) {
     const prune = () =>
