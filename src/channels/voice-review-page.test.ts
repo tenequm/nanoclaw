@@ -276,6 +276,12 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
       hint: 'Nothing is sent until you say "hey Andy".',
       empty: 'Say "hey Andy" to start.',
     });
+    // A worker with an acoustic wake word names its phrase instead.
+    expect(listen({ wake: true, awaitingWake: true, wakePhrase: 'hey livekit' })).toEqual({
+      chip: 'Say "hey livekit"',
+      hint: 'Nothing is sent until you say "hey livekit".',
+      empty: 'Say "hey livekit" to start.',
+    });
     expect(listen({ wake: true, awaitingWake: false })).toMatchObject({
       chip: 'Listening',
       hint: 'Say "over" to send - pauses don\'t.',
@@ -283,7 +289,13 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(listen({ wake: true, pauseSends: true }).hint).toBe('Say "over" or pause about 2.5 s to send.');
     expect(listen({ wake: true, pauseSends: true }, null).hint).toBe('Say "over" or pause to send.');
     // The switch's picks start off; the worker's wake state rides on its review state.
-    expect(lib.INITIAL_REVIEW).toMatchObject({ wake: false, pauseSends: false, awaitingWake: false, commands: true });
+    expect(lib.INITIAL_REVIEW).toMatchObject({
+      wake: false,
+      pauseSends: false,
+      awaitingWake: false,
+      commands: true,
+      wakePhrase: null,
+    });
     expect(
       lib.isReviewSnapshot({ seq: 3, mode: 'auto', draft: null, wake: { on: true, pauseSends: false, waiting: true } }),
     ).toBe(true);

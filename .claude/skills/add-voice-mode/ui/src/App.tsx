@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
 import { LIVE_PHASES, type ErrorKind, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
-import { autoListening, keyIdentity, reviewView, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
+import { autoListening, keyIdentity, reviewView, wakePhraseOf, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
@@ -362,14 +362,14 @@ const TranscriptLine = memo(function TranscriptLine({
 
 /** Auto mode's wake switch, and the pause switch that goes with it: under the mode row, in auto only. */
 function WakeRow({
-  agentName,
+  phrase,
   wake,
   pauseSends,
   disabled,
   onWake,
   onPauseSends,
 }: {
-  agentName: string
+  phrase: string
   wake: boolean
   pauseSends: boolean
   disabled: boolean
@@ -387,7 +387,7 @@ function WakeRow({
   )
   return (
     <div className="mode-row wake-row" role="group" aria-label="Spoken commands">
-      {toggle("wake-desc", `hey ${agentName}`, wake, disabled, `Nothing is sent until you say hey ${agentName}; then say over to send.`, () => onWake(!wake))}
+      {toggle("wake-desc", phrase, wake, disabled, `Nothing is sent until you say ${phrase}; then say over to send.`, () => onWake(!wake))}
       {toggle("pause-sends-desc", "pause sends", wake && pauseSends, disabled || !wake, "After the wake phrase a pause sends too, not only over.", () => onPauseSends(!pauseSends))}
     </div>
   )
@@ -697,7 +697,7 @@ export default function App() {
     >
       {rc.state.mode === "auto" && !rv && (
         <WakeRow
-          agentName={agentName}
+          phrase={wakePhraseOf(rc.state, agentName)}
           wake={rc.state.wake}
           pauseSends={rc.state.pauseSends}
           disabled={phase === "connecting" || reconnecting || !!rc.state.pending || (live && !rc.state.commands)}

@@ -29,8 +29,11 @@ export interface ReviewSnapshot {
   draft: Draft | null
   /** The worker's transcription restarted after a draft and takes no audio yet; talk waits for it. */
   preparing?: boolean
-  /** Auto mode's wake switch as the worker runs it: `waiting` until it hears `hey <agent>`. */
-  wake?: { on: boolean; pauseSends: boolean; waiting: boolean }
+  /**
+   * Auto mode's wake switch as the worker runs it: `waiting` until it hears `hey <agent>`, or its
+   * acoustic wake word's `phrase` when it has one.
+   */
+  wake?: { on: boolean; pauseSends: boolean; waiting: boolean; phrase?: string }
 }
 
 export function isReviewSnapshot(v: unknown): v is ReviewSnapshot {
@@ -69,6 +72,8 @@ export interface ReviewState {
   pauseSends: boolean
   /** The worker waits for the wake phrase right now. */
   awaitingWake: boolean
+  /** The phrase the worker's wake word listens for (`hey livekit`); null: `hey <agent>`. Kept for the next call. */
+  wakePhrase: string | null
 }
 
 export const INITIAL_REVIEW: ReviewState = {
@@ -85,6 +90,7 @@ export const INITIAL_REVIEW: ReviewState = {
   wake: false,
   pauseSends: false,
   awaitingWake: false,
+  wakePhrase: null,
 }
 
 /** What a key does when pressed. */
@@ -358,6 +364,11 @@ export interface ListeningView {
   empty: string
 }
 
+/** The phrase that opens a turn with the wake switch on. */
+export function wakePhraseOf(review: ReviewState, agentName: string): string {
+  return review.wakePhrase ?? `hey ${agentName}`
+}
+
 /**
  * Auto mode's readout while it listens with the microphone on: what sends a turn, and with the wake
  * switch on, the phrase that opens one. A worker without spoken commands keeps the plain pause copy.
@@ -365,7 +376,7 @@ export interface ListeningView {
 export function autoListening({ agentName, silenceMs, review }: { agentName: string; silenceMs: number | null; review: ReviewState }): ListeningView {
   const pause = silenceMs ? `pause about ${+(silenceMs / 1000).toFixed(1)} s` : "pause"
   if (!review.commands) return { chip: "Listening", hint: silenceMs ? `Go ahead. Pause about ${+(silenceMs / 1000).toFixed(1)} s to send.` : "Go ahead. A pause sends what you said.", empty: "Speak when ready." }
-  const wakePhrase = `"hey ${agentName}"`
+  const wakePhrase = `"${wakePhraseOf(review, agentName)}"`
   if (!review.wake) return { chip: "Listening", hint: `Go ahead. ${pause[0].toUpperCase()}${pause.slice(1)} or say "over" to send.`, empty: "Speak when ready." }
   if (review.awaitingWake) return { chip: `Say ${wakePhrase}`, hint: `Nothing is sent until you say ${wakePhrase}.`, empty: `Say ${wakePhrase} to start.` }
   return {

@@ -75,12 +75,21 @@ src/channels/voice-call-page.ts
 src/channels/voice-livekit.ts
 src/channels/voice-livekit-protocol.ts
 src/voice-livekit-worker.ts
+src/voice-wakeword.ts
+assets/voice-wakeword/melspectrogram.onnx
+assets/voice-wakeword/embedding_model.onnx
+assets/voice-wakeword/hey_livekit.onnx
+assets/voice-wakeword/LICENSE
+assets/voice-wakeword/NOTICE
 src/channels/voice-adapter.test.ts
 src/channels/voice-registration.test.ts
 src/channels/voice-line.test.ts
 src/channels/voice-call-page.test.ts
 src/channels/voice-livekit.test.ts
 src/voice-livekit-worker.test.ts
+src/voice-wakeword.test.ts
+src/voice-wakeword-fixtures/positive.wav
+src/voice-wakeword-fixtures/negative.wav
 ```
 
 ### 2. Register the adapter
@@ -117,7 +126,15 @@ transcription and speech), `@livekit/agents-plugin-silero` (Silero VAD on
 `onnxruntime-node`, whose npm package ships the CPU binaries for linux-x64 and
 macOS; its postinstall only fetches optional CUDA files and pnpm skips it),
 `@livekit/rtc-node`, `livekit-server-sdk` and `zod` (a peer of the agents
-package). Build first: it guards the adapter's typed calls into the channel
+package). The acoustic wake word runs the three models under `assets/voice-wakeword/`
+(from [livekit-wakeword](https://github.com/livekit/livekit-wakeword), Apache-2.0,
+see the `NOTICE` there) on the same `onnxruntime-node`, which the worker imports
+directly, so it is a direct dependency at Silero's version:
+
+```nc:dep
+onnxruntime-node@1.24.3
+```
+ Build first: it guards the adapter's typed calls into the channel
 core.
 
 ```nc:run effect:build
@@ -131,7 +148,7 @@ page check, and the integration tests (a fake LiveKit server behind the real
 webhook server, and the worker's turn-taking rules):
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.test.ts
+pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.test.ts src/voice-wakeword.test.ts
 ```
 
 `voice-registration.test.ts` imports the real channel barrel and asserts the
@@ -489,6 +506,14 @@ that talks on the voice line, with no chat to hold the rest, closes with
 spoken during the call, replies and proactive ones alike, and the captions show
 what was spoken; the full text stays in the chat.
 
+It also reads `VOICE_WAKE_MODEL` and `VOICE_WAKE_THRESHOLD`, for the wake switch
+(see spoken commands below). `VOICE_WAKE_MODEL` is a wake word classifier `.onnx`
+in livekit-wakeword's format (default: the bundled
+`assets/voice-wakeword/hey_livekit.onnx`; `off` for none); its file name is the
+phrase (`hey_jarvis.onnx` listens for "hey jarvis"). `VOICE_WAKE_THRESHOLD` is the
+score (0 to 1) that counts as the wake word: by default 0.68, livekit-wakeword's
+documented operating point for `hey_livekit`, and 0.5 for another model.
+
 It also reads `VOICE_RECORDINGS_DAYS` (default `0`, off): with a
 number of days, it saves every caller turn it hears as a 16 kHz mono WAV plus a
 JSON sidecar (call and line id, agent, turn number, start and end, speech
@@ -765,12 +790,22 @@ pick) holds everything until the caller says `hey <agent>`: the chip says
 `say "hey <agent>"`, speech before it is dropped (its lines show "ignored · no
 wake phrase", and a stretch with no words says nothing), and after it only `over`
 sends, unless the second switch (`pause sends`) lets the closing silence send
-too; after a send or a discard it waits again. `<agent>` is the agent's name or
-any entry in its `voice.vocabulary.txt`, matched across case, punctuation and
-Latin/Cyrillic spelling (`Hey, Andy.`, `гей Енді`, `хей Енді`). The worker
+too; after a send or a discard it waits again. The wake phrase is heard in the
+audio, not the transcript: while it waits, the worker scores the caller's audio
+with a wake word model (`VOICE_WAKE_MODEL`, by default livekit-wakeword's
+`hey livekit`, in a worker thread, 2 s windows every 80 ms), a score at or over
+`VOICE_WAKE_THRESHOLD` opens the turn (at most once in 2 s), and the switch and
+chip name that phrase (`say "hey livekit"`) instead of `hey <agent>`. The
+phrase's words, however the transcription spells them (`Hey, LiveKit`, `live kit`,
+`Лайвкіт`), are taken out of the next transcripts, with the words before them.
+Only without a model (`off`, or one that does not load) does `hey <agent>` in the
+transcript open the turn: `<agent>` is then the agent's name or any entry in its
+`voice.vocabulary.txt`, matched across case, punctuation and Latin/Cyrillic
+spelling (`Hey, Andy.`, `гей Енді`, `хей Енді`). The worker
 advertises the commands with the attribute `nanoclaw.voice.commands` = "1" and
 takes the switches in the `nanoclaw.voice.settings` RPC (`{"wake", "pauseSends",
-"cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting"}`,
+"cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase"}`
+(`phrase` only with a wake word model),
 and dropped words go out on the turn topic as `{"dropped": "discarded" |
 "unaddressed", "text"}`. The agent's own speech is never transcribed, so it
 cannot trigger a command. `&demo=wake` plays the wake switch.

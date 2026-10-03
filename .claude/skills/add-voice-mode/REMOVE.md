@@ -15,11 +15,12 @@ sed -i.bak "/^import '\.\/voice\.js';$/d" src/channels/index.ts && rm -f src/cha
 ## 2. Remove the copied files
 
 The adapter, its line resolver, the call page, the LiveKit engine and its
-worker, and their six tests:
+worker with its wake word models, and their seven tests:
 
 ```bash
 rm -f src/channels/voice.ts src/channels/voice-line.ts src/channels/voice-call-page.ts src/channels/voice-adapter.test.ts src/channels/voice-registration.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts
 rm -f src/channels/voice-livekit.ts src/channels/voice-livekit-protocol.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.ts src/voice-livekit-worker.test.ts
+rm -rf src/voice-wakeword.ts src/voice-wakeword.test.ts src/voice-wakeword-fixtures assets/voice-wakeword
 ```
 
 If the LiveKit worker runs as a systemd user unit, stop and remove it first:

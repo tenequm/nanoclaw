@@ -430,7 +430,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         const open = d && (d.state === "recording" || d.state === "finishing")
         const kept: Draft | null =
           d && (d.state === "ready" || d.state === "failed") ? d : open && r.provisional.trim() ? { ...d, state: "failed", text: r.provisional.trim() } : null
-        return { ...INITIAL_REVIEW, mode: r.mode, available: r.available, wake: r.wake, pauseSends: r.pauseSends, draft: kept, ended: !!kept }
+        return { ...INITIAL_REVIEW, mode: r.mode, available: r.available, wake: r.wake, pauseSends: r.pauseSends, wakePhrase: r.wakePhrase, draft: kept, ended: !!kept }
       })
       setMicStream(null)
       setRemoteStream(null)
@@ -704,7 +704,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (p === "connecting" || LIVE_PHASES.has(p)) return
     // A draft from the last call is discarded first, never carried into this one.
     if (reviewRef.current.ended && reviewRef.current.draft) return
-    updateReview((r) => ({ ...INITIAL_REVIEW, mode: r.mode, wake: r.wake, pauseSends: r.pauseSends }))
+    updateReview((r) => ({ ...INITIAL_REVIEW, mode: r.mode, wake: r.wake, pauseSends: r.pauseSends, wakePhrase: r.wakePhrase }))
     reviewSeq.current = 0
     reviewAsked.current = false
     settingsSent.current = false
@@ -928,7 +928,16 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (done) awaitSeq.current = null
     if (snap.wake) workerWake.current = snap.wake
     const awaitingWake = !!snap.wake?.on && snap.wake.waiting
-    updateReview((r) => ({ ...r, mode: snap.mode, draft: d, provisional, preparing: !!snap.preparing, awaitingWake, ...(done ? { pending: null } : {}) }))
+    updateReview((r) => ({
+      ...r,
+      mode: snap.mode,
+      draft: d,
+      provisional,
+      preparing: !!snap.preparing,
+      awaitingWake,
+      ...(snap.wake ? { wakePhrase: snap.wake.phrase ?? null } : {}),
+      ...(done ? { pending: null } : {}),
+    }))
     // The worker stopped the recording (a reply took the channel): the microphone follows it.
     if (snap.mode === "review" && (!d || d.state !== "recording") && mic.current && !mic.current.isMuted && prev.pending?.op !== "talk") void setMic(false)
   }, [reviewStreams, commitLines, updateReview, setMic])
