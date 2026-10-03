@@ -3,16 +3,17 @@
  * every review state (SKILL.md's review mode section). It lives in the maintainer build tree, which an
  * installed payload does not carry, so these tests run only where it is.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { matchCommand, type SpokenCommand } from '../voice-livekit-worker.js';
 import { CALL_COMMANDS_VERSION } from './voice-livekit-protocol.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const reviewLib = path.resolve(here, '../../.claude/skills/add-voice-mode/ui/src/lib/review.ts');
+const skillDir = path.resolve(here, '../../.claude/skills/add-voice-mode');
+const reviewLib = path.join(skillDir, 'ui/src/lib/review.ts');
 
 type Draft = { id: number; state: string; text: string; tooLong?: boolean; reason?: string };
 type ReviewState = Record<string, unknown> & { draft: Draft | null };
@@ -26,6 +27,7 @@ type View = {
   panel: { title: string; text: string; tone: string; note?: string } | null;
   modeDisabled: boolean;
 };
+type Prefs = { mode: string; wake: boolean; pauseSends: boolean };
 interface ReviewLib {
   INITIAL_REVIEW: ReviewState;
   reviewView(input: {
@@ -54,6 +56,12 @@ interface ReviewLib {
   DISCARD_PHRASES: string[];
   COMMANDS_VERSION: string;
   MODE_NAME: Record<string, string>;
+  DEFAULT_PREFS: Prefs;
+  storedPrefs(): Prefs;
+  storePrefs(prefs: Prefs): void;
+  settingsNotTaken(ran: { on: boolean; pauseSends: boolean } | undefined): Record<string, unknown>;
+  storedWakePhrase(): string | null;
+  storeWakePhrase(phrase: string | null): void;
   modeCaption(mode: string, commands: boolean): string;
   charsOver(text: string): number;
 }
@@ -229,10 +237,10 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
   it('switching, reconnecting and microphone failures override the routine state', () => {
     let v = view({ pending: { op: 'mode', to: 'auto' } });
     expect(keys(v)).toEqual(['End', 'Talk(off)']);
-    expect(v).toMatchObject({ chip: 'Switching to auto', hint: 'Mic off - please wait.', modeDisabled: true });
+    expect(v).toMatchObject({ chip: 'Switching to hands-free', hint: 'Mic off - please wait.', modeDisabled: true });
 
     v = view({ mode: 'auto', pending: { op: 'mode', to: 'review' }, micOn: true });
-    expect(v).toMatchObject({ chip: 'Switching to review', hint: 'Please wait.' });
+    expect(v).toMatchObject({ chip: 'Switching to Manual', hint: 'Please wait.' });
 
     v = view({ draft: draft('ready', 'x') }, 'listening', { reconnecting: true });
     expect(keys(v)).toEqual(['Discard(off)', 'Send(off)']);
@@ -253,13 +261,13 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(lib.autoBlock(review())).toBeNull();
     expect(lib.autoBlock(review({ draft: draft('recording') }))).toBe('Tap done, then send or discard.');
     expect(lib.autoBlock(review({ draft: draft('finishing') }))).toBe('Finishing transcript.');
-    expect(lib.autoBlock(review({ draft: draft('ready', 'x') }))).toBe('Send or discard before auto.');
-    expect(lib.autoBlock(review({ draft: draft('ready', 'x', { tooLong: true }) }))).toBe('Discard before auto.');
-    expect(lib.autoBlock(review({ draft: draft('empty') }))).toBe('Discard before auto.');
-    expect(lib.autoBlock(review({ draft: draft('failed', 'x') }))).toBe('Discard before auto.');
+    expect(lib.autoBlock(review({ draft: draft('ready', 'x') }))).toBe('Send or discard before hands-free.');
+    expect(lib.autoBlock(review({ draft: draft('ready', 'x', { tooLong: true }) }))).toBe('Discard before hands-free.');
+    expect(lib.autoBlock(review({ draft: draft('empty') }))).toBe('Discard before hands-free.');
+    expect(lib.autoBlock(review({ draft: draft('failed', 'x') }))).toBe('Discard before hands-free.');
     // A draft leaves the switch usable, so a pick of auto can say why it waits.
     expect(view({ draft: draft('ready', 'x') }).modeDisabled).toBe(false);
-    expect(lib.refusalNote('draft_open', 'Andy')).toBe('Send or discard before auto.');
+    expect(lib.refusalNote('draft_open', 'Andy')).toBe('Send or discard before hands-free.');
     expect(lib.refusalNote('agent_speaking', 'Andy')).toBe('Tap talk when Andy finishes.');
     expect(lib.refusalNote('stale', 'Andy')).toBeNull();
   });
@@ -281,14 +289,18 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(lib.isReviewSnapshot({ mode: 'review', draft: null })).toBe(false);
   });
 
-  it("names the host's wake phrase before the call, hey <agent> when it has none or does not say", () => {
+  it("names the host's wake phrase before the call as configured, Hey <agent> when it has none or does not say", () => {
     const named = (info: unknown) =>
       lib.wakePhraseOf({ ...lib.INITIAL_REVIEW, wakePhrase: lib.infoWakePhrase(info) ?? null }, 'Concierge');
-    expect(lib.infoWakePhrase({ agent: 'Concierge', wakePhrase: 'hey livekit' })).toBe('hey livekit');
-    expect(named({ agent: 'Concierge', wakePhrase: 'hey livekit' })).toBe('hey livekit');
-    expect(named({ agent: 'Concierge', wakePhrase: 'hey dan' })).toBe('hey dan');
+    expect(lib.infoWakePhrase({ agent: 'Concierge', wakePhrase: 'Hey LiveKit' })).toBe('Hey LiveKit');
+    expect(named({ agent: 'Concierge', wakePhrase: 'Hey LiveKit' })).toBe('Hey LiveKit');
+    // Exactly as configured: the case is kept, and a custom phrase is never title-cased.
+    expect(named({ agent: 'Concierge', wakePhrase: 'Hey Casa' })).toBe('Hey Casa');
+    expect(named({ agent: 'Concierge', wakePhrase: ' Hey Casa ' })).toBe('Hey Casa');
+    expect(named({ agent: 'Concierge', wakePhrase: 'hey jarvis' })).toBe('hey jarvis');
+    expect(named({ agent: 'Concierge', wakePhrase: 'OK computer' })).toBe('OK computer');
     expect(lib.infoWakePhrase({ agent: 'Concierge', wakePhrase: null })).toBeNull();
-    expect(named({ agent: 'Concierge', wakePhrase: null })).toBe('hey Concierge');
+    expect(named({ agent: 'Concierge', wakePhrase: null })).toBe('Hey Concierge');
     // An older host, or a broken answer: undefined, so the page keeps what it had.
     for (const info of [null, 'x', { agent: 'Concierge' }, { wakePhrase: 3 }, { wakePhrase: ' ' }]) {
       expect(lib.infoWakePhrase(info)).toBeUndefined();
@@ -298,7 +310,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
   it("auto's readout: send it or a pause sends, and with the wake switch the phrase that opens a turn", () => {
     const listen = (fields: Partial<ReviewState>) =>
       lib.autoListening({ agentName: 'Andy', review: { ...lib.INITIAL_REVIEW, ...fields } });
-    expect(listen({})).toEqual({
+    expect(listen({ wake: false })).toEqual({
       chip: 'Listening',
       hint: 'Go ahead. Stop for a moment, or say "send it" to send now.',
       empty: 'Speak when ready.',
@@ -306,25 +318,27 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     // A worker without spoken commands keeps the old copy.
     expect(listen({ commands: false }).hint).toBe('Go ahead. Stop for a moment to send.');
     expect(listen({ wake: true, awaitingWake: true })).toEqual({
-      chip: 'Say "hey Andy"',
-      hint: 'Nothing is sent until you say "hey Andy".',
-      empty: 'Say "hey Andy" to start.',
+      chip: 'Say "Hey Andy"',
+      hint: 'Nothing is sent until you say "Hey Andy".',
+      empty: 'Say "Hey Andy" to start.',
     });
-    // A worker with an acoustic wake word names its phrase instead.
-    expect(listen({ wake: true, awaitingWake: true, wakePhrase: 'hey livekit' })).toEqual({
-      chip: 'Say "hey livekit"',
-      hint: 'Nothing is sent until you say "hey livekit".',
-      empty: 'Say "hey livekit" to start.',
+    // A worker with an acoustic wake word names its phrase instead, as configured.
+    expect(listen({ wake: true, awaitingWake: true, wakePhrase: 'Hey LiveKit' })).toEqual({
+      chip: 'Say "Hey LiveKit"',
+      hint: 'Nothing is sent until you say "Hey LiveKit".',
+      empty: 'Say "Hey LiveKit" to start.',
     });
+    expect(listen({ wake: true, awaitingWake: true, wakePhrase: 'Hey Casa' }).chip).toBe('Say "Hey Casa"');
     expect(listen({ wake: true, awaitingWake: false })).toMatchObject({
       chip: 'Listening',
       hint: 'Say "send it" to send - stopping won\'t.',
     });
     // The copy never quotes seconds: the countdown shows how long the pause is.
     expect(listen({ wake: true, pauseSends: true }).hint).toBe('Say "send it", or stop for a moment, to send.');
-    // The switch's picks start off; the worker's wake state rides on its review state.
+    // A new caller starts hands-free with the wake switch on; the worker's wake state rides on its review state.
     expect(lib.INITIAL_REVIEW).toMatchObject({
-      wake: false,
+      mode: 'auto',
+      wake: true,
       pauseSends: false,
       awaitingWake: false,
       commands: true,
@@ -369,10 +383,122 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
   });
 
   it('names the turn modes for people and says what each does', () => {
-    expect(lib.MODE_NAME).toEqual({ auto: 'hands-free', review: 'check first' });
+    expect(lib.MODE_NAME).toEqual({ auto: 'hands-free', review: 'Manual' });
     expect(lib.modeCaption('auto', true)).toBe('Stop for a moment, or say "send it", to send.');
     expect(lib.modeCaption('auto', false)).toBe('Stop for a moment to send.');
     expect(lib.modeCaption('review', true)).toBe('Tap talk, read your words, then send.');
+  });
+
+  it('calls the review mode Manual everywhere a caller or operator reads it', () => {
+    const uiSrc = path.join(skillDir, 'ui/src');
+    const files = [
+      path.join(uiSrc, 'App.tsx'),
+      ...['review.ts', 'livekit-call.ts', 'demo-call.ts', 'voice-call.ts'].map((f) => path.join(uiSrc, 'lib', f)),
+      path.join(skillDir, 'SKILL.md'),
+      path.join(skillDir, 'REMOVE.md'),
+      path.resolve(here, 'voice-call-page.ts'),
+    ];
+    for (const file of files) expect(readFileSync(file, 'utf8'), file).not.toMatch(/check[\s-]*first/i);
+    expect(readFileSync(path.resolve(here, 'voice-call-page.ts'), 'utf8')).toContain('Manual');
+  });
+
+  describe("the caller's remembered picks", () => {
+    const fakeStorage = (initial: Record<string, string> = {}) => {
+      const items = new Map(Object.entries(initial));
+      return {
+        items,
+        getItem: vi.fn((k: string) => items.get(k) ?? null),
+        setItem: vi.fn((k: string, v: string) => void items.set(k, v)),
+        removeItem: vi.fn((k: string) => void items.delete(k)),
+      };
+    };
+    const withPrefs = (raw: string | undefined) => {
+      const store = fakeStorage(raw === undefined ? {} : { 'voice-review-prefs': raw });
+      vi.stubGlobal('localStorage', store);
+      return store;
+    };
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it('a new caller starts hands-free with the wake switch on', () => {
+      withPrefs(undefined);
+      expect(lib.DEFAULT_PREFS).toEqual({ mode: 'auto', wake: true, pauseSends: false });
+      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: true, pauseSends: false });
+    });
+
+    it('a remembered choice wins, a remembered off included; a missing one takes its default', () => {
+      withPrefs(JSON.stringify({ mode: 'review', wake: true, pauseSends: true }));
+      expect(lib.storedPrefs()).toEqual({ mode: 'review', wake: true, pauseSends: true });
+      withPrefs(JSON.stringify({ wake: false }));
+      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: false, pauseSends: false });
+      withPrefs(JSON.stringify({ mode: 'review' }));
+      expect(lib.storedPrefs()).toEqual({ mode: 'review', wake: true, pauseSends: false });
+    });
+
+    it('corrupt or foreign values read as nothing remembered, each on its own', () => {
+      for (const raw of ['{not json', 'null', '"auto"', '42', '[]']) {
+        withPrefs(raw);
+        expect(lib.storedPrefs(), raw).toEqual(lib.DEFAULT_PREFS);
+      }
+      withPrefs(JSON.stringify({ mode: 'walkie', wake: 'no', pauseSends: 1 }));
+      expect(lib.storedPrefs()).toEqual(lib.DEFAULT_PREFS);
+      withPrefs(JSON.stringify({ mode: 'walkie', wake: false }));
+      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: false, pauseSends: false });
+    });
+
+    it('blocked or missing storage reads the defaults and never throws on a write', () => {
+      const blocked = () => {
+        throw new Error('SecurityError');
+      };
+      vi.stubGlobal('localStorage', { getItem: blocked, setItem: blocked, removeItem: blocked });
+      expect(lib.storedPrefs()).toEqual(lib.DEFAULT_PREFS);
+      expect(() => lib.storePrefs({ mode: 'review', wake: false, pauseSends: false })).not.toThrow();
+      expect(lib.storedWakePhrase()).toBeNull();
+      expect(() => lib.storeWakePhrase('Hey LiveKit')).not.toThrow();
+      vi.stubGlobal('localStorage', undefined);
+      expect(lib.storedPrefs()).toEqual(lib.DEFAULT_PREFS);
+      expect(() => lib.storePrefs(lib.DEFAULT_PREFS)).not.toThrow();
+    });
+
+    it('keeps exactly the three picks, and reads back what it kept', () => {
+      const store = withPrefs(undefined);
+      lib.storePrefs({ mode: 'review', wake: false, pauseSends: true, extra: 1 } as Prefs);
+      expect(JSON.parse(store.items.get('voice-review-prefs') ?? '')).toEqual({
+        mode: 'review',
+        wake: false,
+        pauseSends: true,
+      });
+      expect(lib.storedPrefs()).toEqual({ mode: 'review', wake: false, pauseSends: true });
+    });
+
+    it('settings the worker did not take fall back to what it runs, and are never remembered', () => {
+      const store = withPrefs(JSON.stringify({ mode: 'auto', wake: false, pauseSends: false }));
+      expect(lib.settingsNotTaken({ on: false, pauseSends: true })).toEqual({
+        wake: false,
+        pauseSends: true,
+        note: "Settings didn't reach the call - try again.",
+      });
+      // A worker that has not said yet starts waiting for the wake phrase.
+      expect(lib.settingsNotTaken(undefined)).toMatchObject({ wake: true, pauseSends: false });
+      expect(store.setItem).not.toHaveBeenCalled();
+      expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: false, pauseSends: false });
+    });
+
+    it('a fresh phrase replaces a stale stored one, case and all', () => {
+      const store = fakeStorage({ 'voice-wake-phrase': 'hey livekit' });
+      vi.stubGlobal('localStorage', store);
+      expect(lib.storedWakePhrase()).toBe('hey livekit');
+      const fresh = lib.infoWakePhrase({ agent: 'Andy', wakePhrase: 'Hey LiveKit' });
+      lib.storeWakePhrase(fresh ?? null);
+      expect(lib.storedWakePhrase()).toBe('Hey LiveKit');
+      lib.storeWakePhrase('Hey Casa');
+      expect(lib.storedWakePhrase()).toBe('Hey Casa');
+      // No acoustic phrase on this line: the page names Hey <agent> again.
+      lib.storeWakePhrase(null);
+      expect(lib.storedWakePhrase()).toBeNull();
+      expect(lib.wakePhraseOf({ ...lib.INITIAL_REVIEW, wakePhrase: lib.storedWakePhrase() }, 'Andy')).toBe('Hey Andy');
+    });
   });
   it("the page's command words are the worker's, on the same commands vocabulary", () => {
     // How the transcription writes each one; every page word needs a spelling here.

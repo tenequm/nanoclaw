@@ -695,10 +695,15 @@ During a call each turn is routed into the call chat's session through the
 normal inbound path, as a message from the line's own caller. It is addressed to
 the line's agent alone, whoever else is wired there, and engages it whatever
 the chat's trigger; session mode, access and sender policy apply as for a typed
-message. Once the agent's session has a turn, the bot posts `🎙 <name>: <transcript>`
-into the chat. The agent answers
+message. Once the agent's session has a turn, the bot posts `🎙 <transcript>`
+into the chat (the turn itself still comes from the caller, by name). The agent answers
 in the chat as usual; while the call is live, each message it delivers to that
-chat (and thread) is also spoken, and its typing there shows as thinking. After
+chat (and thread) is also spoken, and its typing there shows as thinking. The
+chat's copy of a message picked for speech starts with `🔊 `: only what the
+platform shows, never the stored message, the agent's context or the spoken text.
+It marks a message the live call was given to speak, not proof it was heard (the
+worker still reports a reply it could not speak). A reply to a turn of an
+earlier call is neither marked nor spoken on a later one. After
 a mid-call `/voice` the call also keeps speaking the chat it left, until a whole
 turn passes with no message or typing from the agent there. A `/voice` chat that
 is no longer wired to the agent, or none of whose owner accounts is still an
@@ -763,9 +768,13 @@ reconnects the readout says to wait before speaking. With no worker in the room
 after 25 seconds the page says the voice service is unavailable; a worker on
 another protocol version makes it say the service is updating.
 
-**Review mode.** A segmented `hands-free | check first` switch (the modes
+**Review mode.** A segmented `hands-free | Manual` switch (the modes
 `auto` and `review`, with a visible caption) sits above the keys, before
-and during the call; the pick stays for the next call on the same page. In
+and during the call. The pick and the wake switches stay for the next call:
+the page keeps them in the browser (`localStorage`), the ones picked before a
+call and the ones the worker took during it, never a request it did not answer.
+A new caller (nothing kept, or storage off) starts hands-free with the wake
+switch on; a kept "off" stays off. In
 review nothing goes out on a pause: the caller taps talk (the worker opens its
 input and plays the listening cue, then the microphone opens), speaks with any pauses, taps done, reads the
 draft in a dashed panel pinned above the keys (`draft - not sent`) and taps send
@@ -818,20 +827,21 @@ first make it words. A command with nothing to act on (also one said while the
 wake switch waits) plays the nope cue, and its line says "nothing to send" (or "nothing to discard").
 While the acoustic wake word waits, a stretch of speech is marked "ignored" a few seconds after its
 transcript: a wake word spotted just after it may make its words after the phrase the turn. A wake switch under the
-mode row, in a labelled "voice commands" block with a one-line explainer (`hey <agent>`, off by default, kept for the next call like the mode
-pick) holds everything until the caller says `hey <agent>`: the chip says
-`Say "hey <agent>"` on a dim outlined chip, speech before it is dropped (its lines show "ignored · no
+mode row, in a labelled "voice commands" block with a one-line explainer (on for a new caller, kept for the next call like the mode
+pick) holds everything until the caller says the wake phrase: the chip says
+`Say "Hey <agent>"` on a dim outlined chip, speech before it is dropped (its lines show "ignored · no
 wake phrase", and a stretch with no words says nothing), and once it is heard the chip flashes
 and the line says "heard - listening", and after it only `send it`
 sends, unless the second switch ("a pause also sends", shown only with the first) lets the closing silence send
 too; after a send or a discard it waits again. The wake phrase is heard in the
 audio, not the transcript: while it waits, the worker scores the caller's audio
 with a wake word model (`VOICE_WAKE_MODEL`, by default livekit-wakeword's
-`hey livekit`, in a worker thread, 2 s windows every 80 ms), a score at or over
+"Hey LiveKit", in a worker thread, 2 s windows every 80 ms), a score at or over
 `VOICE_WAKE_THRESHOLD` opens the turn (at most once in 2 s), and the switch and
-chip name that phrase (`say "hey livekit"`) instead of `hey <agent>` (the host reads
-`VOICE_WAKE_MODEL` too and tells the page before the call; the worker's own wins once
-it runs). The
+chip name that phrase exactly as configured (`Say "Hey LiveKit"` for the bundled
+model; a configured phrase keeps its own case) instead of `Hey <agent>` (the host
+tells the page before the call, and a fresh phrase replaces the one the browser
+kept; the worker's own wins once it runs). The
 transcription restarts right after the window that had the phrase and first hears
 again the audio since then (a 10 s replay of its input), so no transcript of the turn
 has the phrase and no word after it is lost; the page shows the phrase's own caption,
