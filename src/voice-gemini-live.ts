@@ -129,7 +129,7 @@ interface Activity {
 
 const words = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
-/** A run of two or more quoted items in a list (`'Dan', 'Stan', 'send it'`); the last may be cut off. */
+/** A run of two or more quoted items in a list (`'Ava', 'Max', 'send it'`); the last may be cut off. */
 const QUOTED_LIST = /(?<=^|[\s([])(?:['‘’"“”«][^'‘’"“”«»,\n]{1,60}(?:['‘’"“”»]|(?=\s*$))[\s.]*(?:,[\s]*|$)){2,}/gu;
 const QUOTED_ITEM = /['‘’"“”«]([^'‘’"“”«»,\n]{1,60})/gu;
 const term = (s: string): string =>
@@ -141,7 +141,7 @@ const term = (s: string): string =>
 
 /**
  * Text without the transcription's echo of its own custom vocabulary. Gemini Live sometimes returns
- * the list as the caller's words (`'Dan', 'Stan', 'Emma', 'send it', 'scratch that', 'discard this`),
+ * the list as the caller's words (`'Ava', 'Max', 'Nova', 'send it', 'scratch that', 'discard this`),
  * mostly as an activity's first interim; the docs name no cause or setting. A quoted list whose items
  * are mostly vocabulary terms (the last may be cut short) goes, and so does text that is nothing but
  * vocabulary terms between commas; an echo must never read as a command the caller said.

@@ -855,7 +855,7 @@ more words than a command adds), so a dropped `scratch that` never sends the wor
 the send countdown is not shown while a command is pending. A sent turn's caption is
 the text the agent got, without the command; the words before it keep their period.
 The transcription sometimes returns its own vocabulary list as the caller's words
-(`'Dan', 'Stan', 'send it', ...`); that echo is cut from every interim and final. A command with nothing to act on plays the nope cue, and its
+(`'Ava', 'Max', 'send it', ...`); that echo is cut from every interim and final. A command with nothing to act on plays the nope cue, and its
 line says "nothing to send" (or "nothing to discard"). A wake switch under the mode
 row, in a labelled "voice commands" block with a one-line explainer (on by default,
 kept for the next call like the mode pick; the worker starts with it on until the

@@ -193,9 +193,9 @@ describe('GeminiLiveTranscriber', () => {
 
   it('tells a vocabulary echo from words that quote or list some of it', () => {
     const vocabulary = [
-      'Dan',
-      'Stan',
-      'Emma',
+      'Ava',
+      'Max',
+      'Nova',
       'Concierge',
       'send it',
       'прийом',
@@ -204,20 +204,20 @@ describe('GeminiLiveTranscriber', () => {
       'discard this turn',
     ];
     const echo =
-      "'Dan', 'Stan', 'Emma', 'Concierge', 'send it', 'прийом', 'scratch that', 'discard turn', 'discard this";
+      "'Ava', 'Max', 'Nova', 'Concierge', 'send it', 'прийом', 'scratch that', 'discard turn', 'discard this";
     expect(stripVocabularyEcho(echo, vocabulary)).toBe('');
-    expect(stripVocabularyEcho(`Remind me to stretch later. Hey Dan. ${echo}`, vocabulary)).toBe(
-      'Remind me to stretch later. Hey Dan.',
+    expect(stripVocabularyEcho(`Remind me to stretch later. Hey Ava. ${echo}`, vocabulary)).toBe(
+      'Remind me to stretch later. Hey Ava.',
     );
-    expect(stripVocabularyEcho('“Dan”, “Stan”, “Emma”, “discard this turn”.', vocabulary)).toBe('');
-    expect(stripVocabularyEcho('Dan, Stan, Emma, send it', vocabulary)).toBe('');
+    expect(stripVocabularyEcho('“Ava”, “Max”, “Nova”, “discard this turn”.', vocabulary)).toBe('');
+    expect(stripVocabularyEcho('Ava, Max, Nova, send it', vocabulary)).toBe('');
     // A caller's own words stay, quotes, apostrophes and names included.
     for (const said of [
-      "Tell Dan I'll send it, don't wait.",
+      "Tell Ava I'll send it, don't wait.",
       "Name the files 'draft' and 'final', then send it.",
-      "Say 'Dan' to wake him.",
-      'Dan, Stan and Emma are coming. Send it.',
-      'Dan, Stan, call me.',
+      "Say 'Ava' to wake him.",
+      'Ava, Max and Nova are coming. Send it.',
+      'Ava, Max, call me.',
     ]) {
       expect(stripVocabularyEcho(said, vocabulary)).toBe(said);
     }
