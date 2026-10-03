@@ -75,6 +75,10 @@ export class WakeWordPipeline {
   private readonly classifier: ort.InferenceSession;
   /** Embedding timesteps the classifier takes: 16 for livekit-wakeword's, other openWakeWord models differ. */
   readonly embeddings: number;
+  /** Mel windows run through the embedding model so far: `embeddings` per score without reuse. */
+  embedded = 0;
+  /** The last window scored, to reuse the embeddings of mel windows it shares with the next. */
+  private last?: { end: number; mel: Float32Array; embeddings: Float32Array };
 
   private constructor(mel: ort.InferenceSession, embedding: ort.InferenceSession, classifier: ort.InferenceSession) {
     this.mel = mel;
@@ -98,12 +102,9 @@ export class WakeWordPipeline {
     return new WakeWordPipeline(mel, embedding, head);
   }
 
-  /** The last window scored, to reuse the embeddings of mel windows it shares with the next. */
-  private last?: { end: number; mel: Float32Array; embeddings: Float32Array };
-
   /**
-   * The classifier's score (0-1) for 16 kHz mono audio in [-1, 1]; 0 when it is too short for 16
-   * embeddings. `end`, the stream position of the window's last sample, lets consecutive windows
+   * The classifier's score (0-1) for 16 kHz mono audio in [-1, 1]; 0 when it is too short for the
+   * classifier's embeddings. `end`, the stream position of the window's last sample, lets consecutive windows
    * share work: an embedding is reused only when its 76 mel frames are bit-for-bit the ones it was
    * computed from (the mel model clips to 80 dB under each window's own peak, so a window whose peak
    * moved recomputes), so the score is the reference's.
@@ -163,9 +164,6 @@ export class WakeWordPipeline {
     });
     return (scoreOut[this.classifier.outputNames[0]].data as Float32Array)[0];
   }
-
-  /** Mel windows run through the embedding model so far: 16 per score without reuse. */
-  embedded = 0;
 
   async release(): Promise<void> {
     await Promise.all([this.mel.release(), this.embedding.release(), this.classifier.release()]);
