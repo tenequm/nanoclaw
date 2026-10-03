@@ -1,14 +1,13 @@
 /**
  * Claude-owned transcript history: the pre-compact archive, continuation
- * rotation, the newest-trace lookup and the prompt-cache expiry check. All of
- * it reads the Claude Agent SDK's on-disk `.jsonl` transcripts, so it belongs
- * to this provider and is not part of the runtime contract — ClaudeProvider
- * calls the archive from its PreCompact hook, the rotation from
- * `maybeRotateContinuation` and the expiry check from `warmPromptCache`; only
+ * rotation, and the newest-trace lookup. All of it reads the Claude Agent
+ * SDK's on-disk `.jsonl` transcripts, so it belongs to this provider and is
+ * not part of the runtime contract — ClaudeProvider calls the archive from its
+ * PreCompact hook and the rotation from `maybeRotateContinuation`; only
  * `newestClaudeTranscript` is declared on the contract (`history.readTrace`).
  *
- * The functions take the time (a clock, or `now`) instead of reading
- * `Date.now()` themselves so tests can pin it.
+ * The functions take a clock instead of reading `Date.now()` themselves so
+ * tests can pin the archive name and header.
  */
 
 import fs from 'fs';
@@ -252,65 +251,6 @@ export function rotateClaudeContinuation(
     return decision.reason;
   } catch {
     return null;
-  }
-}
-
-/** Prompt-cache lifetimes, by the cache-write bucket a response used. */
-const CACHE_TTL_MS = { ephemeral_1h_input_tokens: 3_600_000, ephemeral_5m_input_tokens: 300_000 };
-/** Treated as expired this long before it is, so a warm never races the expiry. */
-const CACHE_EXPIRY_MARGIN_MS = 60_000;
-/** The transcript's tail holds its last response; read no more than this of it. */
-const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
-
-/**
- * Whether the prompt cache the session's last response wrote has (likely) expired: the response's
- * time plus the lifetime of the bucket it wrote (1 h on a subscription, 5 min on an API key). True
- * when that cannot be read, so a warm is never skipped on a guess.
- */
-export function claudePromptCacheExpired(continuation: string, now: number): boolean {
-  const transcriptPath = findContinuationFile(path.join(claudeConfigDirectory(), 'projects'), `${continuation}.jsonl`);
-  if (!transcriptPath) return true;
-  try {
-    const lines = readTail(transcriptPath, TRANSCRIPT_TAIL_BYTES).split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (!lines[i].includes('"cache_creation"')) continue;
-      const entry = parseLine(lines[i]) as {
-        type?: string;
-        timestamp?: string;
-        message?: { usage?: { cache_creation?: Record<string, number> } };
-      } | null;
-      const written = entry?.type === 'assistant' ? entry.message?.usage?.cache_creation : undefined;
-      if (!written || !entry?.timestamp) continue;
-      const ttl = written.ephemeral_1h_input_tokens
-        ? CACHE_TTL_MS.ephemeral_1h_input_tokens
-        : CACHE_TTL_MS.ephemeral_5m_input_tokens;
-      return now - Date.parse(entry.timestamp) > ttl - CACHE_EXPIRY_MARGIN_MS;
-    }
-  } catch {
-    // Unreadable: assume expired.
-  }
-  return true;
-}
-
-/** One transcript line; null for the partial first line of a tail read. */
-function parseLine(line: string): unknown {
-  try {
-    return JSON.parse(line);
-  } catch {
-    return null;
-  }
-}
-
-function readTail(filePath: string, bytes: number): string {
-  const fd = fs.openSync(filePath, 'r');
-  try {
-    const size = fs.fstatSync(fd).size;
-    const length = Math.min(size, bytes);
-    const buffer = Buffer.alloc(length);
-    fs.readSync(fd, buffer, 0, length, size - length);
-    return buffer.toString('utf-8');
-  } finally {
-    fs.closeSync(fd);
   }
 }
 

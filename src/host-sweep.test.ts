@@ -13,7 +13,6 @@ import {
   decideStuckAction,
   shouldCloseTaskSession,
 } from './host-sweep.js';
-import { holdIdleCeiling, isIdleCeilingHeld } from './reconcile-session.js';
 import type { Session } from './types.js';
 import { parseIsoTimestamp } from './mailbox/model.js';
 import { wrapSqliteInbound, wrapSqliteOutbound } from './mailbox/sqlite/index.js';
@@ -199,39 +198,6 @@ describe('decideStuckAction', () => {
       claims: [{ messageId: 'x', statusChanged: 'not-a-date' }],
     });
     expect(res.action).toBe('ok');
-  });
-
-  it('skips the absolute ceiling while it is held, but still kills a stuck claim', () => {
-    const silent = { now: BASE, heartbeatMtimeMs: BASE - JUST_OVER_CEILING_MS, containerState: null };
-    expect(decideStuckAction({ ...silent, claims: [], ceilingHeld: true })).toEqual({ action: 'ok' });
-    expect(decideStuckAction({ ...silent, claims: [claim('m1', CLAIM_STUCK_MS + 1)], ceilingHeld: true })).toEqual({
-      action: 'kill-claim',
-      messageId: 'm1',
-      claimAgeMs: CLAIM_STUCK_MS + 1,
-      toleranceMs: CLAIM_STUCK_MS,
-    });
-  });
-});
-
-describe('holdIdleCeiling', () => {
-  it('holds until the deadline or the release, per holder', () => {
-    const releaseA = holdIdleCeiling('s-hold', 'a', BASE + 1000);
-    const releaseB = holdIdleCeiling('s-hold', 'b', BASE + 5000);
-    expect(isIdleCeilingHeld('s-hold', BASE)).toBe(true);
-    releaseB();
-    expect(isIdleCeilingHeld('s-hold', BASE)).toBe(true);
-    expect(isIdleCeilingHeld('s-hold', BASE + 1000)).toBe(false);
-    releaseA();
-    expect(isIdleCeilingHeld('s-other', BASE)).toBe(false);
-  });
-
-  it('keeps a renewed hold when the earlier release runs', () => {
-    const stale = holdIdleCeiling('s-renew', 'a', BASE + 1000);
-    const current = holdIdleCeiling('s-renew', 'a', BASE + 9000);
-    stale();
-    expect(isIdleCeilingHeld('s-renew', BASE + 2000)).toBe(true);
-    current();
-    expect(isIdleCeilingHeld('s-renew', BASE + 2000)).toBe(false);
   });
 });
 
