@@ -4,12 +4,13 @@ import { INITIAL_REVIEW, type ReviewState, type TurnMode } from "./review"
 
 /**
  * A scripted call with the same shape as the real one, for `?demo=1` (auto mode), `?demo=wake`
- * (auto mode with the wake switch and spoken commands) and `?demo=review` (review mode): the page
- * can be tried without a microphone or a wired agent, and every state can be looked at;
- * `&step=<n>` stops the script at step n. Nothing here touches the host; the words and the levels
+ * (auto mode with the wake switch and spoken commands), `?demo=review` (review mode) and
+ * `?demo=cues` (the call's notes: wake heard, the send countdown, speech over a reply, a reply not
+ * spoken, a lone send word): the page can be tried without a microphone or a wired agent, and every
+ * state can be looked at; `&step=<n>` stops the script at step n. Nothing here touches the host; the words and the levels
  * are made up. The worker plays the sound cues, so the demo is silent.
  */
-export type DemoScript = TurnMode | "wake"
+export type DemoScript = TurnMode | "wake" | "cues"
 
 type Step = {
   phase: Phase
@@ -38,6 +39,16 @@ type Step = {
   awaitingWake?: boolean
   /** The worker dropped the newest caller line: a spoken discard, or words before the wake phrase. */
   drop?: "discarded" | "unaddressed"
+  /** The worker heard the wake phrase on this step's caller line. */
+  wakeHeard?: boolean
+  /** The caller spoke over this step's agent line: the page's "not heard" note. */
+  unheard?: boolean
+  /** An agent line the worker could not speak, with its text. */
+  unspoken?: string
+  /** This step's caller line is a lone send word: nothing to send. */
+  command?: boolean
+  /** This step's caller line opens with words before the wake phrase, which were ignored. */
+  preWake?: boolean
 }
 
 const AGENT = "Casa"
@@ -51,7 +62,7 @@ const SCRIPT: Step[] = [
     ms: 4800,
     from: "assistant",
     text: "We settled on the 24th, right after the beta feedback round closes. Want a reminder on Thursday so you can brief the team?",
-    re: "re: turn 1",
+    re: "reply to turn 1",
   },
   { phase: "talking", ms: 3200, from: "assistant", text: "Also, the venue confirmed the booking for Friday.", re: "unprompted" },
   { phase: "listening", ms: 3000, from: "user", text: "Yes, and let Laura know.", pause: true },
@@ -61,32 +72,46 @@ const SCRIPT: Step[] = [
     ms: 3800,
     from: "assistant",
     text: "Done. Thursday at nine is on your calendar, and Laura has a note in the family group.",
-    re: "re: turn 2",
+    re: "reply to turn 2",
   },
   { phase: "listening", ms: 2200 },
   { phase: "ended", ms: 0, end: "Today's call minutes are used up." },
 ]
 
-// The wake switch: words before "hey Casa" go nowhere, "over" sends, "scratch that" drops the turn.
+// The wake switch: words before "hey Casa" go nowhere, "send it" sends, "scratch that" drops the turn.
 const WAKE_SCRIPT: Step[] = [
   { phase: "connecting", ms: 1300 },
   { phase: "listening", ms: 2400, awaitingWake: true },
   { phase: "listening", ms: 2600, awaitingWake: true, from: "user", text: "So that's settled for the weekend then." },
   { phase: "listening", ms: 1400, awaitingWake: true, drop: "unaddressed" },
-  { phase: "listening", ms: 3400, awaitingWake: false, from: "user", text: "Hey Casa, book a table for two at eight." },
-  { phase: "listening", ms: 2400, awaitingWake: false, from: "user", text: "Somewhere near the office. Over." },
+  { phase: "listening", ms: 3400, awaitingWake: false, wakeHeard: true, from: "user", text: "Hey Casa, book a table for two at eight." },
+  { phase: "listening", ms: 2400, awaitingWake: false, from: "user", text: "Somewhere near the office. Send it." },
   { phase: "thinking", ms: 1900, awaitingWake: true, sent: true },
-  { phase: "talking", ms: 3600, from: "assistant", text: "Booked Tavola for eight. Want it on your calendar too?", re: "re: turn 1", awaitingWake: true },
+  { phase: "talking", ms: 3600, from: "assistant", text: "Booked Tavola for eight. Want it on your calendar too?", re: "reply to turn 1", awaitingWake: true },
   { phase: "listening", ms: 2000, awaitingWake: true },
-  { phase: "listening", ms: 3000, awaitingWake: false, from: "user", text: "Hey Casa, cancel the dentist on Friday." },
+  { phase: "listening", ms: 3000, awaitingWake: false, wakeHeard: true, from: "user", text: "Hey Casa, cancel the dentist on Friday." },
   { phase: "listening", ms: 1600, awaitingWake: false, from: "user", text: "No wait, scratch that." },
   { phase: "listening", ms: 2600, awaitingWake: true, drop: "discarded" },
   { phase: "ended", ms: 0, end: "Call ended." },
 ]
 
+// The call's notes, with the wake switch on: 1 waiting, 2 wake heard (after ignored words), 3 the send countdown, 5 speech
+// over a reply, 6 a reply that could not be spoken, 7 a lone send word.
+const CUES_SCRIPT: Step[] = [
+  { phase: "connecting", ms: 1300 },
+  { phase: "listening", ms: 2400, awaitingWake: true },
+  { phase: "listening", ms: 2600, awaitingWake: false, wakeHeard: true, preWake: true, from: "user", text: "Right, anyway. Hey Casa, what's on tomorrow morning?" },
+  { phase: "listening", ms: 3600, awaitingWake: false, pause: true },
+  { phase: "thinking", ms: 1900, awaitingWake: true, sent: true },
+  { phase: "talking", ms: 3600, from: "assistant", text: "You have the dentist at ten, then lunch with Laura.", re: "reply to turn 1", awaitingWake: true, unheard: true },
+  { phase: "listening", ms: 2400, awaitingWake: true, unspoken: "Also, the venue moved the booking to Friday." },
+  { phase: "listening", ms: 2400, awaitingWake: true, from: "user", text: "Send it.", command: true },
+  { phase: "ended", ms: 0, end: "Call ended." },
+]
+
 const DRAFT_1 = "Book a table for two at eight, somewhere near the office."
 const LONG =
-  "Okay, so for the offsite: перший день - знайомство і план на квартал, другий - воркшоп по voice mode, а ввечері вечеря. ".repeat(24).trim()
+  "Okay, so for the offsite: перший день - знайомство і план на квартал, другий - воркшоп по voice mode, а ввечері вечеря. ".repeat(48).trim()
 // Every review state, in the order a caller can meet them.
 const REVIEW_SCRIPT: Step[] = [
   { phase: "connecting", ms: 1300, review: {} },
@@ -98,7 +123,7 @@ const REVIEW_SCRIPT: Step[] = [
   { phase: "listening", ms: 600, review: { draft: { id: 1, state: "ready", text: DRAFT_1 }, pending: { op: "send" } } },
   { phase: "listening", ms: 900, review: { delivery: "sending" }, sentDraft: DRAFT_1 },
   { phase: "thinking", ms: 2400, review: { delivery: "sent" }, mark: { status: "sent" } },
-  { phase: "talking", ms: 4000, from: "assistant", text: "Booked Tavola for eight. Want it on your calendar too?", re: "re: turn 1", review: { delivery: "sent" } },
+  { phase: "talking", ms: 4000, from: "assistant", text: "Booked Tavola for eight. Want it on your calendar too?", re: "reply to turn 1", review: { delivery: "sent" } },
   { phase: "listening", ms: 2000, review: { delivery: "sent" } },
   { phase: "listening", ms: 2600, review: { draft: { id: 2, state: "recording", text: "" }, micOn: true, provisional: "Yes, and also remind me to" } },
   {
@@ -133,7 +158,8 @@ const DEMO_SILENCE_MS = 2500
 /** How long after a turn closes the agent's session confirms it. */
 const DEMO_STORED_MS = 500
 
-const scriptFor = (which: DemoScript): Step[] => (which === "review" ? REVIEW_SCRIPT : which === "wake" ? WAKE_SCRIPT : SCRIPT)
+const scriptFor = (which: DemoScript): Step[] => (which === "review" ? REVIEW_SCRIPT : which === "wake" ? WAKE_SCRIPT : which === "cues" ? CUES_SCRIPT : SCRIPT)
+const wakeScript = (steps: Step[]) => steps === WAKE_SCRIPT || steps === CUES_SCRIPT
 
 export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stopAt: number | null = null): VoiceCall {
   const [phase, setPhase] = useState<Phase>("idle")
@@ -144,7 +170,7 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
   const [endedText, setEndedText] = useState<string | null>(null)
   const [sendCue, setSendCue] = useState<SendCue | null>(null)
   const [limitNote, setLimitNote] = useState<string | null>(null)
-  const [review, setReview] = useState<ReviewState>({ ...INITIAL_REVIEW, mode: initial === "review" ? "review" : "auto", wake: initial === "wake" })
+  const [review, setReview] = useState<ReviewState>({ ...INITIAL_REVIEW, mode: initial === "review" ? "review" : "auto", wake: initial === "wake" || initial === "cues" })
   const [reconnecting, setReconnecting] = useState(false)
   const turns = useRef(0)
 
@@ -174,11 +200,15 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
   }, [])
 
   const secondsIn = () => Math.max(0, Math.floor((Date.now() - startedAt.current) / 1000))
-  /** The newest caller line gets this mark (and turn number). */
+  /** The open turn's caller lines (the unmarked ones since the last marked one) get this mark and turn number. */
   const markLastUser = useCallback((mark: TurnMark, turn?: number) => {
     setLines((prev) => {
-      const last = prev.findLast((l) => l.from === "user")
-      return last ? prev.map((l) => (l === last ? { ...l, mark, ...(turn !== undefined ? { turn } : {}) } : l)) : prev
+      const last = prev.findLastIndex((l) => l.from === "user")
+      if (last < 0) return prev
+      // A review draft's line is already marked "sending": it alone takes the update.
+      if (prev[last].mark) return prev.map((l, i) => (i === last ? { ...l, mark } : l))
+      const from = prev.findLastIndex((l) => l.from === "user" && l.mark)
+      return prev.map((l, i) => (i > from && i <= last && l.from === "user" ? { ...l, mark, ...(turn !== undefined ? { turn } : {}) } : l))
     })
   }, [])
   /** The worker dropped the caller's unmarked lines since the last marked one. */
@@ -190,16 +220,16 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
   }, [])
 
   const streamLine = useCallback(
-    (from: Speaker, text: string, ms: number, re?: string, instant = false) => {
+    (from: Speaker, text: string, ms: number, re?: string, instant = false, extra: Partial<Line> = {}) => {
       const id = nextId.current++
       const at = secondsIn()
       if (instant) {
-        setLines((prev) => [...prev, { id, from, text, at, ...(re ? { re, group: id } : {}) }])
+        setLines((prev) => [...prev, { id, from, text, at, ...(re ? { re, group: id } : {}), ...extra }])
         return
       }
       const words = text.split(" ")
       const interval = Math.max(70, Math.min(160, (ms * 0.8) / words.length))
-      setLines((prev) => [...prev, { id, from, text: "", at, ...(re ? { re, group: id } : {}) }])
+      setLines((prev) => [...prev, { id, from, text: "", at, ...(re ? { re, group: id } : {}), ...extra }])
       streamingRef.current = true
       setStreamingId(id)
       words.forEach((word, i) => {
@@ -259,7 +289,20 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
       }
       phaseRef.current = step.phase
       setPhase(step.phase)
-      if (step.text && step.from) streamLine(step.from, step.text, step.ms, step.re, instant)
+      if (step.text && step.from) {
+        const extra: Partial<Line> = step.command ? { mark: { status: "dropped", reason: "command" } } : { ...(step.wakeHeard ? { wake: true } : {}), ...(step.preWake ? { preWake: true } : {}) }
+        streamLine(step.from, step.text, step.ms, step.re, instant || !!step.command, extra)
+      }
+      if (step.wakeHeard) setReview((r) => ({ ...r, wakeHeard: r.wakeHeard + 1 }))
+      if (step.unheard) {
+        const note = () => setLines((prev) => [...prev, { id: nextId.current++, from: "assistant", text: "", at: secondsIn(), kind: "unheard" }])
+        if (instant) note()
+        else later(note, step.ms / 2)
+      }
+      if (step.unspoken) {
+        const reply = nextId.current++
+        setLines((prev) => [...prev, { id: reply, from: "assistant", text: step.unspoken!, at: secondsIn(), group: reply, unspoken: true }])
+      }
       if (step.review) applyReview(step, instant)
       if (step.awaitingWake !== undefined) {
         const awaitingWake = step.awaitingWake
@@ -268,9 +311,11 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
       if (step.drop) dropOpen(step.drop)
       if (step.pause && !instant) {
         // As the worker reports it: the caller stopped a moment ago, the rest of the silence is left.
+        // A script stopped on this step keeps the countdown on screen.
         const left = 1600
-        later(() => setSendCue({ id: `demo-${i}`, from: 1 - left / DEMO_SILENCE_MS, ms: left }), step.ms - left)
-        later(() => setSendCue(null), step.ms)
+        const held = stopAt === i
+        later(() => setSendCue({ id: `demo-${i}`, from: 1 - left / DEMO_SILENCE_MS, ms: held ? left * 4 : left }), held ? 300 : step.ms - left)
+        if (!held) later(() => setSendCue(null), step.ms)
       }
       if (step.sent) {
         const turn = ++turns.current
@@ -296,7 +341,7 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
     setEndedText(null)
     setLimitNote(null)
     setReconnecting(false)
-    setReview((r) => ({ ...INITIAL_REVIEW, mode: script.current === REVIEW_SCRIPT ? "review" : r.mode, wake: script.current === WAKE_SCRIPT }))
+    setReview((r) => ({ ...INITIAL_REVIEW, mode: script.current === REVIEW_SCRIPT ? "review" : r.mode, wake: wakeScript(script.current) }))
     turns.current = 0
     startedAt.current = Date.now()
     setElapsed(0)

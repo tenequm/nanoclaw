@@ -5,7 +5,7 @@ import type { Phase } from "./voice-call"
  * models it is made of: the turn mode, the operation in flight, the worker's draft, the delivery
  * of the last sent draft and the agent's activity. Pure, so every state can be tested and shown
  * by the demo. The worker owns the draft (see CallReviewState in the protocol); the page only
- * shows it and asks. Auto mode's spoken commands (`over`, the discard phrases, the wake switch)
+ * shows it and asks. Auto mode's spoken commands (`send it`, the discard phrases, the wake switch)
  * ride on the same state, see `autoListening`.
  */
 
@@ -33,7 +33,7 @@ export interface ReviewSnapshot {
    * Auto mode's wake switch as the worker runs it: `waiting` until it hears `hey <agent>`, or its
    * acoustic wake word's `phrase` when it has one.
    */
-  wake?: { on: boolean; pauseSends: boolean; waiting: boolean; phrase?: string }
+  wake?: { on: boolean; pauseSends: boolean; waiting: boolean; phrase?: string; heard?: number }
 }
 
 export function isReviewSnapshot(v: unknown): v is ReviewSnapshot {
@@ -68,12 +68,14 @@ export interface ReviewState {
   commands: boolean
   /** The caller's wake switch: in auto nothing is sent until `hey <agent>`. Kept for the next call. */
   wake: boolean
-  /** With the wake switch: a pause sends too after the wake phrase, not only `over`. */
+  /** With the wake switch: a pause sends too after the wake phrase, not only `send it`. */
   pauseSends: boolean
   /** The worker waits for the wake phrase right now. */
   awaitingWake: boolean
   /** The phrase the worker's wake word listens for (`hey livekit`); null: `hey <agent>`. Kept for the next call. */
   wakePhrase: string | null
+  /** How many times this call the worker heard the wake phrase (CallWakeState.heard); each one flashes the readout. */
+  wakeHeard: number
 }
 
 export const INITIAL_REVIEW: ReviewState = {
@@ -91,6 +93,7 @@ export const INITIAL_REVIEW: ReviewState = {
   pauseSends: false,
   awaitingWake: false,
   wakePhrase: null,
+  wakeHeard: 0,
 }
 
 /** What a key does when pressed. */
@@ -128,7 +131,8 @@ export interface ReviewView {
   left: KeyView
   right: KeyView
   chip: string
-  chipTone: "idle" | "you" | "think" | "ended" | "err" | ""
+  /** `you`: the caller's words are being taken; `off`: the line waits on the caller (mic muted). */
+  chipTone: "idle" | "you" | "off" | "think" | "ended" | "err" | ""
   hint: string
   /** The right key's label row: the microphone's actual state. */
   mic: string
@@ -150,6 +154,20 @@ export interface ReviewInput {
 
 const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
 
+/** The host takes a turn of at most this many UTF-8 bytes (MAX_TURN_TEXT_BYTES in the protocol). */
+export const MAX_TURN_BYTES = 8 * 1024
+
+/** How many characters a draft has to lose to fit the host's limit (0 when it fits). */
+export function charsOver(text: string): number {
+  const enc = new TextEncoder()
+  let bytes = enc.encode(text).length
+  if (bytes <= MAX_TURN_BYTES) return 0
+  const chars = [...text]
+  let n = 0
+  while (bytes > MAX_TURN_BYTES && n < chars.length) bytes -= enc.encode(chars[chars.length - 1 - n++]).length
+  return n
+}
+
 /** The panel for a draft, or for the words being heard. */
 export function panelView(review: ReviewState, agentName: string): PanelView | null {
   const d = review.draft
@@ -159,7 +177,10 @@ export function panelView(review: ReviewState, agentName: string): PanelView | n
   if (d.state === "finishing") return { title: "finishing transcript", text: review.provisional, tone: "finishing", note: why }
   if (d.state === "empty") return { title: "nothing heard", text: "", tone: "empty", note: why }
   if (d.state === "failed") return { title: "couldn't finish transcript", text: d.text, tone: "failed", note: "unverified - not sendable" }
-  if (d.tooLong) return { title: "draft too long", text: d.text, tone: "long", note: why }
+  if (d.tooLong) {
+    const over = charsOver(d.text)
+    return { title: "draft too long", text: d.text, tone: "long", note: over ? `about ${over} characters over the limit` : why }
+  }
   return { title: "draft - not sent", text: d.text, tone: "draft", note: why }
 }
 
@@ -208,7 +229,7 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
       chip: phase === "connecting" ? "Connecting…" : phase === "ended" ? "Call ended" : phase === "error" ? "" : "Ready",
       chipTone: phase === "ended" ? "ended" : phase === "error" ? "err" : phase === "idle" ? "idle" : "",
       hint: kept
-        ? "Call ended - draft not sent. Discard it to call again."
+        ? "Draft not sent. Copy it, or discard it to call again."
         : phase === "connecting"
           ? "Setting up the call."
           : phase === "idle"
@@ -225,7 +246,7 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
   let left = key("End", "end")
   let right = key("Talk", "talk")
   let chip = "Mic muted"
-  let tone: ReviewView["chipTone"] = "you"
+  let tone: ReviewView["chipTone"] = "off"
   let hint = "Tap talk to start."
   let mic = review.micOn ? "Mic on" : "Mic off"
   const capturing = !!d && d.state === "recording" && review.micOn
@@ -247,7 +268,8 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
   } else if (d?.state === "recording") {
     right = key("Done", "done", pending?.op === "done")
     chip = "Listening"
-    hint = "Pauses stay here - tap done to review."
+    tone = "you"
+    hint = "Pausing won't send - tap done to read it."
     mic = review.micOn ? "Recording" : pending?.op === "done" ? "Stopping mic" : "Mic off"
   } else if (d?.state === "finishing") {
     left = key("Discard", "discard")
@@ -288,13 +310,13 @@ export function reviewView({ phase, agentName, reconnecting, waited, review }: R
     tone = ""
     if (right.action === "talk") right = { ...right, disabled: true }
     if (!d || d.state === "empty") hint = `Tap talk when ${agentName} finishes.`
-    else if (sendable) hint = "Send adds a follow-up."
+    else if (sendable) hint = `You can send it now; ${agentName} gets it next.`
   } else if (phase === "thinking") {
     chip = `${agentName} is working`
     tone = "think"
-    if (!d && !pending) hint = `Tap talk to add a follow-up · waiting ${clock(waited)}`
-    else if (d?.state === "recording") hint = "Recording - tap done to review."
-    else if (sendable) hint = "Send adds a follow-up."
+    if (!d && !pending) hint = `Tap talk to add more · waiting ${clock(waited)}`
+    else if (d?.state === "recording") hint = "Recording - tap done to read it."
+    else if (sendable) hint = `You can send it now; ${agentName} gets it next.`
   }
 
   // The worker restarts its transcription after a draft; talk opens once it takes audio again, so
@@ -357,6 +379,27 @@ export function refusalNote(error: string | undefined, agentName: string): strin
   return null
 }
 
+/** Turn modes as the page names them; the protocol keeps `auto` and `review`. */
+export const MODE_NAME: Record<TurnMode, string> = { auto: "hands-free", review: "check first" }
+
+/** What each mode does, in one line under the switch. */
+export function modeCaption(mode: TurnMode, commands: boolean): string {
+  if (mode === "review") return "Tap talk, read your words, then send."
+  return commands ? `Stop for a moment, or say "send it", to send.` : "Stop for a moment to send."
+}
+
+/**
+ * The page's own copy of the worker's send words and discard phrases, as `norm` leaves them (lowercase,
+ * letters and digits only, Cyrillic kept as is). A caption line that ends in one holds that command.
+ */
+const COMMAND_END = /(sendit|sentit|sendeat|send|сендіт|сендит|сендіп|сендип|сенд|прийом|приём|discardthisturn|discardturn|scratchthat)$/u
+
+export const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
+/** A caption line as a sent turn's text holds it: a spoken command that ended the turn is not sent. */
+export const lineKey = (s: string) => norm(s).replace(COMMAND_END, "")
+/** A caption line that is only a spoken command ("Send it."), with nothing else said. */
+export const isCommandOnly = (s: string) => norm(s) !== "" && lineKey(s) === ""
+
 export interface ListeningView {
   chip: string
   hint: string
@@ -373,15 +416,15 @@ export function wakePhraseOf(review: ReviewState, agentName: string): string {
  * Auto mode's readout while it listens with the microphone on: what sends a turn, and with the wake
  * switch on, the phrase that opens one. A worker without spoken commands keeps the plain pause copy.
  */
-export function autoListening({ agentName, silenceMs, review }: { agentName: string; silenceMs: number | null; review: ReviewState }): ListeningView {
-  const pause = silenceMs ? `pause about ${+(silenceMs / 1000).toFixed(1)} s` : "pause"
-  if (!review.commands) return { chip: "Listening", hint: silenceMs ? `Go ahead. Pause about ${+(silenceMs / 1000).toFixed(1)} s to send.` : "Go ahead. A pause sends what you said.", empty: "Speak when ready." }
+export function autoListening({ agentName, review }: { agentName: string; silenceMs?: number | null; review: ReviewState }): ListeningView {
+  // The send countdown shows how long the pause is; the copy never quotes seconds.
+  if (!review.commands) return { chip: "Listening", hint: "Go ahead. Stop for a moment to send.", empty: "Speak when ready." }
   const wakePhrase = `"${wakePhraseOf(review, agentName)}"`
-  if (!review.wake) return { chip: "Listening", hint: `Go ahead. ${pause[0].toUpperCase()}${pause.slice(1)} or say "over" to send.`, empty: "Speak when ready." }
+  if (!review.wake) return { chip: "Listening", hint: `Go ahead. Stop for a moment, or say "send it" to send now.`, empty: "Speak when ready." }
   if (review.awaitingWake) return { chip: `Say ${wakePhrase}`, hint: `Nothing is sent until you say ${wakePhrase}.`, empty: `Say ${wakePhrase} to start.` }
   return {
     chip: "Listening",
-    hint: review.pauseSends ? `Say "over" or ${pause} to send.` : `Say "over" to send - pauses don't.`,
+    hint: review.pauseSends ? `Say "send it", or stop for a moment, to send.` : `Say "send it" to send - stopping won't.`,
     empty: "Speak when ready.",
   }
 }

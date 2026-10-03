@@ -17,10 +17,18 @@ export interface Line {
   mark?: TurnMark
   /** The caller turn's number on this page, counted from when the turn closed. */
   turn?: number
-  /** What an agent line answers ("re: turn 2", "unprompted"), on the first line of a message. */
+  /** What an agent line answers ("reply to turn 2", "unprompted"), on the first line of a message. */
   re?: string
   /** The spoken message an agent line belongs to; one message's lines read as one. */
   group?: number
+  /** The worker heard the wake phrase as this caller line was spoken (or just before it). */
+  wake?: boolean
+  /** The line opens with words said before the wake phrase, which the worker ignored. */
+  preWake?: boolean
+  /** An agent line the worker could not speak: its text, shown instead of heard. */
+  unspoken?: boolean
+  /** Not a caption: the page's own note, `unheard` when the caller spoke over the agent. */
+  kind?: "unheard"
 }
 
 /** The caller stopped and the turn goes out once this runs full, unless they speak again. */
@@ -35,10 +43,11 @@ export interface SendCue {
 export interface TurnMark {
   /**
    * `sending`: a sent review draft the agent has not confirmed yet (auto turns show no mark until then).
-   * `dropped`: words the worker will never send, a spoken discard or speech before the wake phrase.
+   * `dropped`: words the worker will never send: a spoken discard, speech before the wake phrase, or
+   * a send word with nothing open to send (`command`).
    */
   status: "sending" | "sent" | "lost" | "dropped"
-  reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty" | "discarded" | "unaddressed"
+  reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty" | "discarded" | "unaddressed" | "command"
 }
 
 /** What kind of problem ended a call, so the page can say what to do about it. */
@@ -163,6 +172,7 @@ export function micErrorText(err: unknown): string | null {
   if (name === "NotAllowedError" || name === "SecurityError") return "Microphone permission was refused."
   if (name === "NotFoundError" || name === "OverconstrainedError") return "No microphone is available on this device."
   if (name === "NotReadableError") return "The microphone is busy in another app. Close it and try again."
+  if (name === "NotSupportedError" || name === "AbortError") return "This browser could not open the microphone."
   return null
 }
 
@@ -170,6 +180,6 @@ export function micErrorKind(err: unknown): ErrorKind | null {
   if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) return "mic"
   const name = err instanceof DOMException ? err.name : ""
   if (name === "NotAllowedError" || name === "SecurityError") return "mic-permission"
-  if (name === "NotFoundError" || name === "OverconstrainedError" || name === "NotReadableError") return "mic"
+  if (name === "NotFoundError" || name === "OverconstrainedError" || name === "NotReadableError" || name === "NotSupportedError" || name === "AbortError") return "mic"
   return null
 }
