@@ -128,6 +128,41 @@ interface Activity {
 }
 
 const words = (s: string): string => s.replace(/\s+/g, ' ').trim();
+
+/** A run of two or more quoted items in a list (`'Dan', 'Stan', 'send it'`); the last may be cut off. */
+const QUOTED_LIST = /(?<=^|[\s([])(?:['‘’"“”«][^'‘’"“”«»,\n]{1,60}(?:['‘’"“”»]|(?=\s*$))[\s.]*(?:,[\s]*|$)){2,}/gu;
+const QUOTED_ITEM = /['‘’"“”«]([^'‘’"“”«»,\n]{1,60})/gu;
+const term = (s: string): string =>
+  s
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+/**
+ * Text without the transcription's echo of its own custom vocabulary. Gemini Live sometimes returns
+ * the list as the caller's words (`'Dan', 'Stan', 'Emma', 'send it', 'scratch that', 'discard this`),
+ * mostly as an activity's first interim; the docs name no cause or setting. A quoted list whose items
+ * are mostly vocabulary terms (the last may be cut short) goes, and so does text that is nothing but
+ * vocabulary terms between commas; an echo must never read as a command the caller said.
+ */
+export function stripVocabularyEcho(text: string, vocabulary: readonly string[]): string {
+  if (!vocabulary.length) return text;
+  const terms = new Set(vocabulary.map(term).filter(Boolean));
+  const known = (item: string, last: boolean) => {
+    const t = term(item);
+    return !!t && (terms.has(t) || (last && [...terms].some((v) => v.startsWith(t))));
+  };
+  const echoed = (items: string[]) =>
+    items.length >= 2 && items.filter((item, i) => known(item, i === items.length - 1)).length * 2 > items.length;
+  let out = text.replace(QUOTED_LIST, (list) => {
+    const items = [...list.matchAll(QUOTED_ITEM)].map((m) => m[1]);
+    return echoed(items) ? ' ' : list;
+  });
+  const parts = out.split(',').map((p) => p.trim());
+  if (parts.length >= 3 && parts.every((p, i) => known(p, i === parts.length - 1))) out = '';
+  return out === text ? text : words(out);
+}
 const partText = (part: Part): string => words([...part.finals, part.interim].join(' '));
 
 export class GeminiLiveTranscriber {
@@ -358,11 +393,11 @@ export class GeminiLiveTranscriber {
     };
     old.onLost = finish;
     old.onContent = (content) => {
-      if (typeof content.interimInputTranscription?.text === 'string')
-        part.interim = content.interimInputTranscription.text;
+      const interim = this.clean(content.interimInputTranscription?.text);
+      if (typeof interim === 'string') part.interim = interim;
       const final = content.inputTranscription?.text;
       if (typeof final === 'string' && final.trim()) {
-        part.finals.push(final.trim());
+        part.finals.push(this.clean(final.trim()) ?? '');
         part.interim = '';
         clearTimeout(grace);
         grace = setTimeout(finish, FINAL_GRACE_MS);
@@ -397,7 +432,7 @@ export class GeminiLiveTranscriber {
   }
 
   private onContent(activity: Activity, content: ServerContent): void {
-    const interim = content.interimInputTranscription?.text;
+    const interim = this.clean(content.interimInputTranscription?.text);
     if (typeof interim === 'string' && !activity.ending) {
       activity.part.interim = interim;
       activity.heard = this.text(activity);
@@ -405,7 +440,8 @@ export class GeminiLiveTranscriber {
     }
     const final = content.inputTranscription?.text;
     if (typeof final === 'string' && final.trim()) {
-      activity.part.finals.push(final.trim());
+      // A final that was only the echo still is the final: it says the activity heard no words.
+      activity.part.finals.push(this.clean(final.trim()) ?? '');
       activity.part.interim = '';
       // The interim text after a final starts over; `heard` keeps the last interim's whole text.
       if (!activity.ending) this.opts.onInterim(this.text(activity));
@@ -501,6 +537,13 @@ export class GeminiLiveTranscriber {
         if (msg.serverContent) socket.onContent?.(msg.serverContent);
       };
     });
+  }
+
+  /** Text without a vocabulary echo; none when it was nothing else (an interim then keeps the last one). */
+  private clean(text: string | undefined): string | undefined {
+    if (typeof text !== 'string') return undefined;
+    const kept = stripVocabularyEcho(text, this.opts.vocabulary);
+    return kept || !text.trim() ? kept : undefined;
   }
 
   private setup(): Record<string, unknown> {

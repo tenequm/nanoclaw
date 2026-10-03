@@ -11,6 +11,7 @@ import {
   GeminiLiveTranscriber,
   type Heard,
   type LiveSocket,
+  stripVocabularyEcho,
 } from './voice-gemini-live.js';
 
 afterEach(() => {
@@ -170,6 +171,56 @@ describe('GeminiLiveTranscriber', () => {
     h.sockets[1].say({ inputTranscription: { text: 'Yes.' }, turnComplete: true });
     await h.tick(0);
     expect(second()).toMatchObject({ final: 'Yes.', finals: 1 });
+  });
+
+  it('never passes on its own vocabulary echoed back as the caller words, in an interim or a final', async () => {
+    const h = harness();
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(0);
+    h.sockets[0].interim('Book a table');
+    // Echo-only: the last interim stands, so the caption does not flash the list.
+    h.sockets[0].interim("'Andy', 'send it', 'прийом'");
+    h.sockets[0].interim("Book a table for two. 'Andy', 'send it', 'при");
+    expect(h.interims).toEqual(['Book a table', 'Book a table for two.']);
+    const done = h.result(h.t.end());
+    h.sockets[0].final("'Andy', 'send it'");
+    await h.tick(FINAL_GRACE_MS);
+    // A final that was only the echo heard no words: the interim text is the turn's.
+    expect(done()).toMatchObject({ final: '', interim: 'Book a table for two.', finals: 1 });
+  });
+
+  it('tells a vocabulary echo from words that quote or list some of it', () => {
+    const vocabulary = [
+      'Dan',
+      'Stan',
+      'Emma',
+      'Concierge',
+      'send it',
+      'прийом',
+      'scratch that',
+      'discard turn',
+      'discard this turn',
+    ];
+    const echo =
+      "'Dan', 'Stan', 'Emma', 'Concierge', 'send it', 'прийом', 'scratch that', 'discard turn', 'discard this";
+    expect(stripVocabularyEcho(echo, vocabulary)).toBe('');
+    expect(stripVocabularyEcho(`Remind me to stretch later. Hey Dan. ${echo}`, vocabulary)).toBe(
+      'Remind me to stretch later. Hey Dan.',
+    );
+    expect(stripVocabularyEcho('“Dan”, “Stan”, “Emma”, “discard this turn”.', vocabulary)).toBe('');
+    expect(stripVocabularyEcho('Dan, Stan, Emma, send it', vocabulary)).toBe('');
+    // A caller's own words stay, quotes, apostrophes and names included.
+    for (const said of [
+      "Tell Dan I'll send it, don't wait.",
+      "Name the files 'draft' and 'final', then send it.",
+      "Say 'Dan' to wake him.",
+      'Dan, Stan and Emma are coming. Send it.',
+      'Dan, Stan, call me.',
+    ]) {
+      expect(stripVocabularyEcho(said, vocabulary)).toBe(said);
+    }
   });
 
   it('with no final, the interim text stands after the cap', async () => {
