@@ -40,6 +40,7 @@ import {
   AutoSubscribe,
   cli,
   defineAgent,
+  InferenceRunner,
   log as agentsLog,
   mergeFrames,
   normalizeLanguage,
@@ -3441,6 +3442,24 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     .catch(() => undefined);
 }
 
+// agents-js's EOT_INFERENCE_METHOD (inference/eot/runner.ts), which it does not export.
+const LOCAL_EOT_INFERENCE_METHOD = 'lk_eot_audio';
+
+/**
+ * Keeps agents-js from forking its shared inference process. AgentServer's constructor registers the
+ * local end-of-turn model runner whenever the native binding loads, and a registered runner forks a
+ * process that loads the model (~330 MB RSS) for good. Calls end turns on VAD and pauses, never on
+ * that model. A non-enumerable entry under the runner's method makes the registration a no-op while
+ * the executor, which counts enumerable keys, sees no runner and forks nothing.
+ */
+export function skipLocalTurnDetectorProcess(): void {
+  Object.defineProperty(InferenceRunner.registeredRunners, LOCAL_EOT_INFERENCE_METHOD, {
+    value: 'disabled',
+    enumerable: false,
+    configurable: true,
+  });
+}
+
 export default defineAgent({
   // Loaded once per idle job process, before a call is assigned to it.
   prewarm: async (proc: JobProcess) => {
@@ -3483,6 +3502,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     prune();
     setInterval(prune, DAY_MS).unref();
   }
+  skipLocalTurnDetectorProcess();
   cli.runApp(
     new ServerOptions({
       agent: fileURLToPath(import.meta.url),
