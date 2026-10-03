@@ -61,7 +61,11 @@ import {
   Outbox,
   loadTypingSound,
   audioLevels,
+  CallTelemetry,
   CallerInput,
+  LineMeter,
+  TURN_EVENT_WAIT_MS,
+  type TurnFacts,
   type VadStream,
   type WakeWord,
   type WakeWordEvents,
@@ -738,7 +742,7 @@ describe('runCall', () => {
     expect(v.createVoice).toHaveBeenCalledWith(
       ctx,
       expect.objectContaining({ callId: 'call-1' }),
-      { geminiKey: 'gk-test' },
+      { geminiKey: 'gk-test', spoke: expect.any(Function) },
       v.events,
     );
     // The host address and secret come from the worker's settings, never from the dispatch.
@@ -1192,7 +1196,7 @@ describe('runCall', () => {
 });
 
 describe('reply recordings', () => {
-  it('a call with recordings on writes each spoken line as it was played, next to the turns, and logs its levels', async () => {
+  it('a call with recordings on writes each spoken line as it was played, next to the turns, and reports it', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-rec-'));
     try {
       const { ctx } = fakeJob();
@@ -1208,24 +1212,38 @@ describe('reply recordings', () => {
         }),
       );
       const settings = v.createVoice.mock.calls[0][2];
+      expect(settings.recordReplies).toBe(true);
       const pcm = Int16Array.from({ length: 24_000 }, (_, i) => (i % 2 ? 16384 : -16384));
-      settings.recordReply?.(pcm, 'gemini-3.8-flash-lite-tts');
+      const line = {
+        outcome: 'spoken' as const,
+        model: 'gemini-3.8-flash-lite-tts',
+        fallback: false,
+        firstAudioMs: 900,
+        heldMs: 0,
+        durationMs: 1000,
+        ...audioLevels(pcm),
+      };
+      settings.spoke?.(line, pcm);
       const file = path.join(root, 'Andy', new Date().toISOString().slice(0, 10), 'call-1-reply-1.wav');
       await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
       const wav = fs.readFileSync(file);
       expect(wav.readUInt32LE(24)).toBe(24_000);
       expect(wav.length - 44).toBe(2 * 24_000);
       expect(fs.statSync(file).mode & 0o777).toBe(0o600);
-      await vi.waitFor(() =>
-        expect(info).toHaveBeenCalledWith('voice worker: saved a reply recording', {
-          callId: 'call-1',
-          reply: 1,
-          durationMs: 1000,
-          model: 'gemini-3.8-flash-lite-tts',
-          peakDb: -6,
-          rmsDb: -6,
-        }),
-      );
+      expect(info).toHaveBeenCalledWith('voice.reply', {
+        callId: 'call-1',
+        reply: 1,
+        kind: 'reply',
+        outcome: 'spoken',
+        model: 'gemini-3.8-flash-lite-tts',
+        fallback: false,
+        firstAudioMs: 900,
+        heldMs: 0,
+        durationMs: 1000,
+        peakDb: -6,
+        rmsDb: -6,
+        recorded: true,
+      });
       host.endStream();
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
@@ -1237,7 +1255,7 @@ describe('reply recordings', () => {
     const host = fakeHostFetch();
     const v = fakeVoice();
     await runCall(ctx, callDeps(host.fetchImpl, v));
-    expect(v.createVoice.mock.calls[0][2].recordReply).toBeUndefined();
+    expect(v.createVoice.mock.calls[0][2].recordReplies).toBeUndefined();
     expect(audioLevels(new Int16Array(10))).toEqual({ peakDb: -Infinity, rmsDb: -Infinity });
     host.endStream();
   });
@@ -1853,6 +1871,8 @@ function turnsHarness(
     noTurn: 0,
     unheard: 0,
     takes: [] as Array<TurnAudio | undefined>,
+    facts: [] as Array<TurnFacts | undefined>,
+    ended: [] as Array<[TurnFacts, string, string]>,
   };
   const turns = new CallTurns(
     {
@@ -1860,7 +1880,9 @@ function turnsHarness(
       send: (text, take) => {
         out.sent.push(text);
         out.takes.push(take.audio);
+        out.facts.push(take.facts);
       },
+      ended: (facts, outcome, reason) => void out.ended.push([facts, outcome, reason]),
       lost: (reason) => void out.lost.push(reason),
       noise: () => void out.noise++,
       drop: (reason, text) => void out.drops.push([reason, text]),
@@ -3044,5 +3066,233 @@ describe('acoustic wake word', () => {
       startMs: 8_000,
       idleMs: 20_000,
     });
+  });
+});
+
+describe('wide events', () => {
+  it('a turn reports its mode, text source and stage timings from the speech end, never its words', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Book a table for two', 'Book a table for two.'));
+    await h.talk(1000);
+    // talk() reports the speech end 560 ms (whole 20 ms frames) into the silence.
+    const speechEnd = Date.now() - 560;
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    const facts = h.out.facts[0];
+    expect(facts).toMatchObject({
+      segment: 1,
+      mode: 'handsfree',
+      endedBy: 'pause',
+      source: 'final',
+      finals: 1,
+      words: 5,
+      activityEndMs: SILENCE,
+      finalMs: SILENCE,
+    });
+    expect(facts?.speechEndAt).toBe(speechEnd);
+    expect(JSON.stringify(facts)).not.toContain('table');
+
+    // A spoken discard comes to nothing: reported as discarded by the command.
+    h.t.results.push(
+      heard('Remind me to call the plumber. Scratch that.', 'Remind me to call the plumber. Scratch that.'),
+    );
+    await h.talk(1500);
+    await h.pass(SILENCE);
+    expect(h.out.ended.map(([f, outcome, reason]) => [f.segment, outcome, reason])).toEqual([
+      [2, 'discarded', 'command'],
+    ]);
+  });
+
+  it('a woken turn says so, and the words before the wake phrase are unaddressed', async () => {
+    const h = turnsHarness({ wake: true, pauseSends: true });
+    h.t.results.push(heard('Just thinking aloud', 'Just thinking aloud.'));
+    await h.talk(1000);
+    await h.pass(SILENCE);
+    expect(h.out.ended.map(([f, outcome, reason]) => [f.mode, outcome, reason])).toEqual([
+      ['wake', 'unaddressed', 'no_wake'],
+    ]);
+  });
+
+  it('a sent turn waits for its reply to play; the call event counts what happened', () => {
+    vi.useFakeTimers();
+    const info = vi.fn();
+    const telemetry = new CallTelemetry({ info });
+    const facts: TurnFacts = {
+      segment: 1,
+      mode: 'handsfree',
+      endedBy: 'pause',
+      source: 'final',
+      finals: 1,
+      words: 3,
+      speechMs: 900,
+      speechEndAt: Date.now(),
+      activityEndMs: 2500,
+      finalMs: 2700,
+    };
+    vi.advanceTimersByTime(2900);
+    telemetry.turn({ facts, outcome: 'sent', turn: 1, hostAt: Date.now(), hostStatus: 202 });
+    telemetry.turn({ facts: { ...facts, segment: 2 }, outcome: 'empty', reason: 'noise', turn: 2 });
+    // Not out yet: its reply has not played.
+    expect(info.mock.calls.map(([, f]) => f.turn)).toEqual([2]);
+    vi.advanceTimersByTime(4100);
+    telemetry.replyStarted(1);
+    expect(info).toHaveBeenLastCalledWith('voice.turn', {
+      turn: 1,
+      segment: 1,
+      mode: 'handsfree',
+      endedBy: 'pause',
+      source: 'final',
+      finals: 1,
+      words: 3,
+      speechMs: 900,
+      activityEndMs: 2500,
+      finalMs: 2700,
+      outcome: 'sent',
+      hostMs: 2900,
+      hostStatus: 202,
+      replyMs: 7000,
+    });
+    // Another sent turn whose reply never comes goes out on its own after a while, without replyMs.
+    telemetry.turn({ facts, outcome: 'sent', turn: 3, hostAt: Date.now() });
+    vi.advanceTimersByTime(TURN_EVENT_WAIT_MS);
+    expect(info.mock.calls.at(-1)?.[1]).toMatchObject({ turn: 3, outcome: 'sent' });
+    expect(info.mock.calls.at(-1)?.[1]).not.toHaveProperty('replyMs');
+    // A Manual draft says so, whatever its activity was.
+    telemetry.turn({ facts, outcome: 'discarded', reason: 'review', draft: 4 });
+    expect(info.mock.calls.at(-1)?.[1]).toMatchObject({ draft: 4, mode: 'manual', outcome: 'discarded' });
+
+    telemetry.reply({
+      reply: 1,
+      kind: 'reply',
+      turn: 1,
+      part: 1,
+      outcome: 'spoken',
+      fallback: false,
+      durationMs: 1,
+      peakDb: -1,
+      rmsDb: -2,
+    });
+    telemetry.reply({
+      reply: 2,
+      kind: 'notice',
+      outcome: 'failed',
+      fallback: false,
+      durationMs: 0,
+      peakDb: -1,
+      rmsDb: -2,
+    });
+    telemetry.turn({ facts, outcome: 'sent', turn: 5, hostAt: Date.now() });
+    telemetry.ended('caller left', { wakes: 2 });
+    telemetry.ended('twice');
+    const events = info.mock.calls.map(([msg]) => msg);
+    // The waiting turn goes out before the call's event, and the call's event goes out once.
+    expect(events.slice(-2)).toEqual(['voice.turn', 'voice.call']);
+    expect(info.mock.calls.at(-1)?.[1]).toEqual({
+      reason: 'caller left',
+      durationMs: 2900 + 4100 + TURN_EVENT_WAIT_MS,
+      turnsSent: 3,
+      turnsDiscarded: 1,
+      turnsEmpty: 1,
+      turnsLost: 0,
+      turnsUnaddressed: 0,
+      repliesSpoken: 1,
+      repliesPartial: 0,
+      repliesFailed: 1,
+      wakes: 2,
+    });
+  });
+
+  it('a spoken line reports its model, fallback, latency, length and levels', () => {
+    let now = 1000;
+    const meter = new LineMeter(() => now);
+    expect(meter.done({ model: 'a', primary: 'a', failed: false, cut: false })).toBeNull();
+    now = 1800;
+    meter.audio();
+    now = 2000;
+    meter.audio();
+    meter.playing();
+    meter.frame(Int16Array.from({ length: 24_000 }, (_, i) => (i % 2 ? 16384 : -16384)));
+    expect(meter.done({ model: 'b', primary: 'a', failed: false, cut: false })).toEqual({
+      outcome: 'spoken',
+      model: 'b',
+      fallback: true,
+      firstAudioMs: 800,
+      heldMs: 200,
+      durationMs: 1000,
+      peakDb: -6,
+      rmsDb: -6,
+    });
+    expect(meter.done({ model: 'a', primary: 'a', failed: true, cut: false })?.outcome).toBe('partial');
+    expect(meter.done({ model: 'a', primary: 'a', failed: false, cut: true })?.outcome).toBe('partial');
+    expect(new LineMeter().done({ model: 'a', primary: 'a', failed: true, cut: false })).toEqual({
+      outcome: 'failed',
+      fallback: false,
+      durationMs: 0,
+      peakDb: -Infinity,
+      rmsDb: -Infinity,
+    });
+  });
+
+  it('in a call: the turn, its reply and the call each log one event', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const info = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { log: { info, warn: () => undefined } }));
+    const settings = v.createVoice.mock.calls[0][2];
+    v.voice.say.mockImplementation(async (_text: string, ready?: () => Promise<void>) => {
+      await ready?.();
+      v.events.onAgentSpeaking?.(true);
+      settings.spoke?.({ outcome: 'spoken', model: 'tts', fallback: false, durationMs: 800, peakDb: -3, rmsDb: -20 });
+      v.events.onAgentSpeaking?.(false);
+      return true;
+    });
+    await v.turn('Book a table');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith(expect.objectContaining({ status: 'sent' })),
+    );
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalled());
+    host.emit({ type: 'end', reason: 'caller hung up' });
+    await vi.waitFor(() => expect(info.mock.calls.some(([msg]) => msg === 'voice.call')).toBe(true));
+    const event = (msg: string) => info.mock.calls.filter(([m]) => m === msg).map(([, f]) => f);
+    expect(event('voice.turn')).toEqual([
+      expect.objectContaining({
+        callId: 'call-1',
+        turn: 1,
+        mode: 'handsfree',
+        outcome: 'sent',
+        source: 'final',
+        hostStatus: 202,
+        hostMs: expect.any(Number),
+        replyMs: expect.any(Number),
+      }),
+    ]);
+    expect(event('voice.reply')).toEqual([
+      {
+        callId: 'call-1',
+        reply: 1,
+        kind: 'reply',
+        turn: 1,
+        part: 1,
+        outcome: 'spoken',
+        model: 'tts',
+        fallback: false,
+        durationMs: 800,
+        peakDb: -3,
+        rmsDb: -20,
+      },
+    ]);
+    expect(event('voice.call')).toEqual([
+      expect.objectContaining({
+        callId: 'call-1',
+        reason: 'host: caller hung up',
+        turnsSent: 1,
+        repliesSpoken: 1,
+        wakes: 0,
+      }),
+    ]);
+    // No words of the caller or the agent in any event.
+    expect(JSON.stringify(info.mock.calls.filter(([m]) => String(m).startsWith('voice.')))).not.toMatch(/table|Booked/);
   });
 });

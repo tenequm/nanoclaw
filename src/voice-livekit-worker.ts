@@ -633,17 +633,81 @@ export const pathSegment = (name: string): string =>
     .replace(/^-+|-+$/g, '')
     .slice(0, 64) || 'unnamed';
 
-/** Writes `<root>/<agent>/<YYYY-MM-DD>/<callId>-<turn>.wav` and `.json`, owner-only. */
 /** A recording's peak and RMS, in dBFS. */
 export function audioLevels(pcm: Int16Array): { peakDb: number; rmsDb: number } {
-  let peak = 0;
-  let sum = 0;
-  for (const v of pcm) {
-    peak = Math.max(peak, Math.abs(v));
-    sum += v * v;
+  const meter = new LineMeter();
+  meter.frame(pcm);
+  return meter.levels;
+}
+
+/** One spoken line, as its `voice.reply` event reports it: never its words. */
+export interface SpokenLine {
+  outcome: 'spoken' | 'partial' | 'failed';
+  /** The speech model its audio came from; absent when none came. */
+  model?: string;
+  fallback: boolean;
+  /** From the synthesis request to the model's first audio. */
+  firstAudioMs?: number;
+  /** From the first audio to its playing: the line waited for the caller. */
+  heldMs?: number;
+  durationMs: number;
+  peakDb: number;
+  rmsDb: number;
+}
+
+/** One line's numbers, gathered as its audio goes to the speech track. */
+export class LineMeter {
+  private readonly startedAt: number;
+  private firstAudioAt = 0;
+  private playingAt = 0;
+  private samples = 0;
+  private peak = 0;
+  private squares = 0;
+
+  constructor(private readonly now: () => number = () => Date.now()) {
+    this.startedAt = now();
   }
-  const db = (x: number) => (x > 0 ? Math.round(20 * Math.log10(x / 32768) * 10) / 10 : -Infinity);
-  return { peakDb: db(peak), rmsDb: db(Math.sqrt(sum / Math.max(1, pcm.length))) };
+
+  /** Audio came from the speech model. */
+  audio(): void {
+    this.firstAudioAt ||= this.now();
+  }
+
+  /** Its audio starts to play. */
+  playing(): void {
+    this.playingAt ||= this.now();
+  }
+
+  frame(pcm: Int16Array): void {
+    for (const v of pcm) {
+      this.peak = Math.max(this.peak, Math.abs(v));
+      this.squares += v * v;
+    }
+    this.samples += pcm.length;
+  }
+
+  get levels(): { peakDb: number; rmsDb: number } {
+    const db = (x: number) => (x > 0 ? Math.round(20 * Math.log10(x / 32768) * 10) / 10 : -Infinity);
+    return { peakDb: db(this.peak), rmsDb: db(Math.sqrt(this.squares / Math.max(1, this.samples))) };
+  }
+
+  /**
+   * The line's numbers, or null when it neither played nor failed (the call ended first).
+   * `cut`: the call ended while it played.
+   */
+  done(o: { model: string; primary: string; failed: boolean; cut: boolean }): SpokenLine | null {
+    if (!this.samples && !o.failed) return null;
+    const outcome = o.failed ? (this.samples ? 'partial' : 'failed') : o.cut ? 'partial' : 'spoken';
+    return {
+      outcome,
+      ...(this.firstAudioAt
+        ? { model: o.model, fallback: o.model !== o.primary, firstAudioMs: this.firstAudioAt - this.startedAt }
+        : { fallback: false }),
+      ...(this.firstAudioAt && this.playingAt ? { heldMs: this.playingAt - this.firstAudioAt } : {}),
+      durationMs: Math.round((this.samples * 1000) / TTS_SAMPLE_RATE),
+      ...this.levels,
+    };
+  }
 }
 
 /**
@@ -664,6 +728,7 @@ export async function writeReplyRecording(
   return file;
 }
 
+/** Writes `<root>/<agent>/<YYYY-MM-DD>/<callId>-<turn>.wav` and `.json`, owner-only. */
 export async function writeTurnRecording(root: string, record: TurnRecord, audio: TurnAudio): Promise<string> {
   const dir = path.join(root, pathSegment(record.agent), record.startedAt.slice(0, 10));
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -773,6 +838,32 @@ export interface CallVoiceEvents {
 export interface TurnTake {
   audio?: TurnAudio;
   sttModel: string;
+  /** How its activity went, for its `voice.turn` event. */
+  facts?: TurnFacts;
+}
+
+/** What became of a turn, in its `voice.turn` event. */
+export type TurnOutcome = 'sent' | 'discarded' | 'empty' | 'lost' | 'unaddressed';
+
+/** A finished turn's activity, as its `voice.turn` event reports it: never its words. */
+export interface TurnFacts {
+  segment: number;
+  mode: 'handsfree' | 'wake' | 'manual';
+  endedBy: TurnEnd;
+  /** Where its text came from: the final, the last interim (`collapsed`: the final shrank to its end), or none. */
+  source: 'final' | 'interim' | 'none';
+  collapsed?: boolean;
+  finals: number;
+  /** Some of its audio never reached the transcription. */
+  audioLost?: boolean;
+  words: number;
+  speechMs: number;
+  /** Wall clock of the caller's last speech end, where the stage timings count from. */
+  speechEndAt: number;
+  /** The activity ended (activityEnd sent). */
+  activityEndMs: number;
+  /** Its text was in (the final, or the cap on waiting for one). */
+  finalMs: number;
 }
 
 /** What became of a turn handed to the host. */
@@ -1642,7 +1733,16 @@ const trimCut = (text: string): string => text.replace(/^[\s,.;:!?–—-]+|[\s,
 const STABLE_COMMAND_INTERIMS = 2;
 
 /** Why a turn's activity ended. */
-type TurnEnd = 'pause' | 'send' | 'discard' | 'agent' | 'asleep' | 'unaddressed' | 'switch' | 'review' | 'dropped';
+export type TurnEnd =
+  | 'pause'
+  | 'send'
+  | 'discard'
+  | 'agent'
+  | 'asleep'
+  | 'unaddressed'
+  | 'switch'
+  | 'review'
+  | 'dropped';
 
 interface OpenTurn {
   kind: 'auto' | 'review';
@@ -1702,6 +1802,8 @@ export interface CallTurnsDeps {
   noTurn(): void;
   /** The caller spoke while the agent's line played. */
   unheard(): void;
+  /** A turn that came to nothing for the agent: discarded, unaddressed, or a command alone. */
+  ended?(facts: TurnFacts, outcome: TurnOutcome, reason: string): void;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -2161,6 +2263,9 @@ export class CallTurns {
     this.disarm();
     this.deps.countdown.clear();
     const endedAt = this.ring.position;
+    const endWall = this.now();
+    const activityEndMs = Math.round(msOf(endedAt - turn.lastSpeechEnd));
+    const mode = turn.kind === 'review' ? 'manual' : this.wake ? 'wake' : 'handsfree';
     if (turn.kind === 'auto' && turn.addressed && why !== 'switch') {
       this.finalizing = { turn, endedAt, command: why === 'send' || why === 'discard' };
     }
@@ -2174,19 +2279,28 @@ export class CallTurns {
     const silent = !!turn.carry && !turn.heard && turn.speechMs === 0;
     const ending = this.deps.transcriber.end();
     const heard = silent ? { interim: '', finals: 0, failed: false, finalizeMs: 0 } : await ending;
+    const finalMs = activityEndMs + (this.now() - endWall);
     // Words of an earlier activity of this turn, still finalizing when the caller went on, lead it.
     if (turn.before) turn.carry = joinText(await turn.before, turn.carry);
     if (this.finalizing?.turn === turn) this.finalizing = undefined;
     const chosen = turnText(heard);
     let said = joinText(turn.carry, chosen.text);
-    this.deps.log.info('voice worker: turn text', {
+    const facts: TurnFacts = {
       segment: turn.segment,
-      why,
-      source: chosen.source,
+      mode,
+      endedBy: why,
+      source: chosen.source === 'final' || chosen.source === 'none' ? chosen.source : 'interim',
+      ...(chosen.source === 'collapse_interim' ? { collapsed: true } : {}),
       finals: heard.finals,
-      finalizeMs: heard.finalizeMs,
       ...(heard.failed ? { audioLost: true } : {}),
-    });
+      words: wordCount(said),
+      speechMs: Math.round(turn.speechMs),
+      speechEndAt: endWall - activityEndMs,
+      activityEndMs,
+      finalMs,
+    };
+    take.facts = facts;
+    const ended = (outcome: TurnOutcome, reason: string) => this.deps.ended?.(facts, outcome, reason);
     const caption = (text: string) => {
       if (text) this.deps.caption(turn.segment, text, true);
     };
@@ -2215,7 +2329,9 @@ export class CallTurns {
       if (why === 'unaddressed') {
         if (said) this.deps.drop('unaddressed', said);
         this.deps.noTurn();
+        ended('unaddressed', 'no_wake');
       }
+      if (why === 'dropped') ended('discarded', 'dropped');
       return null;
     }
     this.syncHold();
@@ -2258,14 +2374,20 @@ export class CallTurns {
       caption(scratched ?? said);
       scratch();
       // A discard with nothing said takes a wake back; in hands-free it has nothing to act on.
-      if (!match.rest && !this.wake) this.nope(text);
-      else this.discarded(text);
+      if (!match.rest && !this.wake) {
+        this.nope(text);
+        ended('empty', 'command_only');
+      } else {
+        this.discarded(text);
+        ended('discarded', 'command');
+      }
       return null;
     }
     if (match?.command === 'send' && !match.rest) {
       caption(scratched ?? said);
       scratch();
       this.nope(text);
+      ended('empty', 'command_only');
       return null;
     }
     const body = match ? match.rest : text;
@@ -2274,9 +2396,11 @@ export class CallTurns {
     scratch();
     if (scratched && !body) {
       if (this.wake) this.deps.changed();
+      ended('discarded', 'command');
       return null;
     }
     if (why === 'asleep' && !match) {
+      ended(body ? 'discarded' : 'empty', 'asleep');
       if (body) this.deps.drop('asleep', body);
       this.slept++;
       this.waitingSince = this.ring.position;
@@ -2378,6 +2502,8 @@ export interface ReviewDeps {
   cue?(kind: CueKind): void;
   /** The model a draft's take names when it has none. */
   sttModel: string;
+  /** A draft that came to nothing: discarded, or nothing heard. */
+  ended?(draft: number, take: TurnTake | undefined, outcome: TurnOutcome, reason: string): void;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -2519,6 +2645,8 @@ export class ReviewControl {
       }
       case 'discard': {
         if (!draft || draft.id !== req.draft) return reply({ error: 'stale' });
+        // An empty or failed draft was reported when it froze; a recording is when its activity ends.
+        if (draft.state === 'ready') this.deps.ended?.(draft.id, this.take, 'discarded', 'review');
         this.draft = null;
         this.take = undefined;
         if (draft.state === 'recording') {
@@ -2595,6 +2723,8 @@ export class ReviewControl {
         ...(Buffer.byteLength(text) > MAX_TURN_TEXT_BYTES ? { tooLong: true } : {}),
       };
       if (state === 'ready' && !this.draft.tooLong) this.deps.cue?.('draft');
+      if (state === 'empty') this.deps.ended?.(draft.id, heard?.take, 'empty', 'no_words');
+      if (state === 'failed') this.deps.ended?.(draft.id, heard?.take, 'lost', 'stt');
     }
     this.publish();
   }
@@ -2675,8 +2805,10 @@ export type CallJob = Pick<
 /** What a call's room needs besides the job metadata. */
 export interface VoiceSettings {
   geminiKey: string;
-  /** With recordings on: each spoken line's audio as sent to the speech track, and the model that made it. */
-  recordReply?(pcm: Int16Array, model: string): void;
+  /** Recordings are on: `spoke` gets each line's audio as it went to the speech track. */
+  recordReplies?: boolean;
+  /** Each line that played or failed: how it went, and with recordReplies its audio. */
+  spoke?(line: SpokenLine, pcm?: Int16Array): void;
 }
 
 export interface RunCallDeps {
@@ -3009,11 +3141,14 @@ async function roomVoice(
   /** One line into the speech track: streamed as it is synthesized, resolved once it has played. */
   const say = async (text: string, ready?: () => Promise<void>): Promise<boolean> => {
     let heard = false;
+    let failed = false;
     let rest: Int16Array | undefined;
+    const meter = new LineMeter();
     /** The frames sent to the speech track, for the reply's recording. */
     const sent: Int16Array[] = [];
     const capture = async (frame: Int16Array) => {
-      if (settings.recordReply) sent.push(frame);
+      meter.frame(frame);
+      if (settings.recordReplies) sent.push(frame);
       await speechSource.captureFrame(new AudioFrame(frame, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
     };
     const play = async (pcm: Int16Array) => {
@@ -3030,10 +3165,12 @@ async function roomVoice(
     try {
       for await (const pcm of speech.speak(text, sayAbort.signal)) {
         if (closed) break;
+        meter.audio();
         if (!heard) {
           await ready?.();
           if (closed) break;
           heard = true;
+          meter.playing();
           setAttr(AGENT_STATE_ATTRIBUTE, 'speaking', 'the agent state');
           events.onAgentSpeaking?.(true);
           // The line's caption, on the agent's speech track, as its audio starts.
@@ -3059,6 +3196,7 @@ async function roomVoice(
       if (heard) await speechSource.waitForPlayout();
       return heard && !closed;
     } catch (err) {
+      failed = true;
       log.warn('voice worker: a line could not be synthesized', { err: err instanceof Error ? err.message : err });
       if (heard) await speechSource.waitForPlayout().catch(() => undefined);
       return false;
@@ -3067,10 +3205,15 @@ async function roomVoice(
         setAttr(AGENT_STATE_ATTRIBUTE, 'listening', 'the agent state');
         events.onAgentSpeaking?.(false);
       }
-      if (sent.length) {
-        const pcm = new Int16Array(sent.length * SPEECH_FRAME);
-        sent.forEach((frame, i) => pcm.set(frame, i * SPEECH_FRAME));
-        settings.recordReply?.(pcm, speech.spokenBy);
+      const line = meter.done({ model: speech.spokenBy, primary: meta.ttsModel, failed, cut: closed });
+      if (line) {
+        let pcm: Int16Array | undefined;
+        if (sent.length) {
+          const all = new Int16Array(sent.length * SPEECH_FRAME);
+          sent.forEach((frame, i) => all.set(frame, i * SPEECH_FRAME));
+          pcm = all;
+        }
+        settings.spoke?.(line, pcm);
       }
     }
   };
@@ -3147,6 +3290,108 @@ async function roomVoice(
   };
 }
 
+/** How long a sent turn's `voice.turn` waits for its reply's first audio; then it goes out without it. */
+export const TURN_EVENT_WAIT_MS = 300_000;
+
+export interface TurnEventFields {
+  facts?: TurnFacts;
+  outcome: TurnOutcome;
+  reason?: string;
+  /** The call's turn number, for a turn that got one. */
+  turn?: number;
+  /** A review draft's number: the turn was taken in Manual. */
+  draft?: number;
+  /** When the host answered the turn's POST (wall clock), and its status. */
+  hostAt?: number;
+  hostStatus?: number;
+}
+
+/**
+ * The call's three wide events, for the logs: `voice.turn` once per finished turn, `voice.reply` once
+ * per spoken line, `voice.call` once at the end, with the counts. Stage timings count from the
+ * caller's speech end; a sent turn's event waits for its reply's first audio (or TURN_EVENT_WAIT_MS,
+ * or the call's end). No words of the caller or the agent are in any of them.
+ */
+export class CallTelemetry {
+  private readonly turns: Record<TurnOutcome, number> = { sent: 0, discarded: 0, empty: 0, lost: 0, unaddressed: 0 };
+  private readonly lines: Record<SpokenLine['outcome'], number> = { spoken: 0, partial: 0, failed: 0 };
+  private readonly awaiting = new Map<
+    number,
+    { event: Record<string, unknown>; speechEndAt: number; timer: ReturnType<typeof setTimeout> }
+  >();
+  private readonly startedAt: number;
+  private done = false;
+
+  constructor(
+    private readonly log: Pick<Console, 'info'>,
+    private readonly now: () => number = () => Date.now(),
+  ) {
+    this.startedAt = now();
+  }
+
+  turn(f: TurnEventFields): void {
+    this.turns[f.outcome]++;
+    const { speechEndAt, ...facts } = f.facts ?? {};
+    const event: Record<string, unknown> = {
+      ...(f.turn !== undefined ? { turn: f.turn } : {}),
+      ...(f.draft !== undefined ? { draft: f.draft } : {}),
+      ...facts,
+      ...(f.draft !== undefined ? { mode: 'manual' } : {}),
+      outcome: f.outcome,
+      ...(f.reason ? { reason: f.reason } : {}),
+      ...(f.hostAt !== undefined && speechEndAt !== undefined ? { hostMs: Math.round(f.hostAt - speechEndAt) } : {}),
+      ...(f.hostStatus !== undefined ? { hostStatus: f.hostStatus } : {}),
+    };
+    if (f.outcome === 'sent' && f.turn !== undefined && speechEndAt !== undefined && !this.done) {
+      const turn = f.turn;
+      const timer = setTimeout(() => this.release(turn), TURN_EVENT_WAIT_MS);
+      timer.unref?.();
+      this.awaiting.set(turn, { event, speechEndAt, timer });
+      return;
+    }
+    this.log.info('voice.turn', event);
+  }
+
+  /** The first audio of a reply to `turn` plays. */
+  replyStarted(turn: number): void {
+    const held = this.awaiting.get(turn);
+    if (held) this.release(turn, Math.round(this.now() - held.speechEndAt));
+  }
+
+  reply(fields: SpokenLine & { reply: number; kind: 'reply' | 'notice'; turn?: number; part?: number }): void {
+    this.lines[fields.outcome]++;
+    this.log.info('voice.reply', fields);
+  }
+
+  /** The call is over: turns still waiting for a reply go out without it, then `voice.call`. */
+  ended(reason: string, fields: Record<string, unknown> = {}): void {
+    if (this.done) return;
+    this.done = true;
+    for (const turn of [...this.awaiting.keys()]) this.release(turn);
+    this.log.info('voice.call', {
+      reason,
+      durationMs: this.now() - this.startedAt,
+      turnsSent: this.turns.sent,
+      turnsDiscarded: this.turns.discarded,
+      turnsEmpty: this.turns.empty,
+      turnsLost: this.turns.lost,
+      turnsUnaddressed: this.turns.unaddressed,
+      repliesSpoken: this.lines.spoken,
+      repliesPartial: this.lines.partial,
+      repliesFailed: this.lines.failed,
+      ...fields,
+    });
+  }
+
+  private release(turn: number, replyMs?: number): void {
+    const held = this.awaiting.get(turn);
+    if (!held) return;
+    this.awaiting.delete(turn);
+    clearTimeout(held.timer);
+    this.log.info('voice.turn', { ...held.event, ...(replyMs !== undefined ? { replyMs } : {}) });
+  }
+}
+
 function defaultDeps(): RunCallDeps {
   const env = workerEnv([
     'GEMINI_API_KEY',
@@ -3175,6 +3420,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const { log } = deps;
   const header = readJobHeader(ctx.job.metadata);
   const callFields = { callId: header.callId };
+  const telemetry = new CallTelemetry({ info: (msg, fields) => log.info(msg, { ...callFields, ...fields }) });
   const hostUrl = liveKitHostUrl(deps.env);
   const host = new HostLink(
     {
@@ -3186,6 +3432,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   );
   const abandon = async (reason: string, fields: Record<string, unknown> = {}) => {
     log.warn('voice worker: ending the call', { ...callFields, ...fields, reason });
+    telemetry.ended(reason);
     await host
       .post('ended', { reason })
       .then((res) => res.body?.cancel())
@@ -3216,8 +3463,10 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const geminiKey = deps.env.GEMINI_API_KEY;
   if (!geminiKey) return abandon('GEMINI_API_KEY is not set for the worker');
   const record = recordingDays(deps.env.VOICE_RECORDINGS_DAYS) > 0;
-  /** Spoken lines recorded so far, for their file names. */
+  /** Spoken lines so far, for those no label numbered. */
   let replies = 0;
+  /** The label of the line being spoken: TurnTaking announces each line right before it. */
+  let speakingLine: CallReplyInfo | undefined;
   if (meta.sttFallbackModel) {
     log.warn('voice worker: VOICE_STT_FALLBACK_MODEL is ignored: turns are transcribed by the Live model only', {
       ...callFields,
@@ -3319,7 +3568,10 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         callVoice?.setThinking(on);
         updateTyping();
       },
-      announce: (info) => callVoice?.publishReply(info),
+      announce: (info) => {
+        speakingLine = info;
+        callVoice?.publishReply(info);
+      },
       beforeSpeak: () => review?.beforeAgentSpeaks(),
       // Over to the caller, unless another line starts, the agent still works or the caller already talks.
       // A reply the speech model failed on was never heard: no cue says it is the caller's turn.
@@ -3376,11 +3628,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     // 100-150 ms GC pauses).
     const mem = process.memoryUsage();
     const mb = (bytes: number) => Math.round(bytes / 1_048_576);
-    callLog.info('voice worker: call memory', {
+    const wakes = callTurns.state;
+    telemetry.ended(reason, {
+      wakes: wakes.heard ?? 0,
+      slept: wakes.slept ?? 0,
       heapUsedMB: mb(mem.heapUsed),
-      heapTotalMB: mb(mem.heapTotal),
-      externalMB: mb(mem.external),
       rssMB: mb(mem.rss),
+      peakRssMB: mb(process.resourceUsage().maxRSS * 1024),
     });
     // The host link stays open until the host answered: closed first, it ends the call on its own
     // and answers this at once, before the room carries why the call ended.
@@ -3457,6 +3711,15 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       publish(
         host.accepted ? { turn, status: 'sent', text } : { turn, status: 'lost', reason: hostLossReason(host), text },
       );
+      telemetry.turn({
+        facts: take.facts,
+        outcome: host.accepted ? 'sent' : 'lost',
+        ...(host.accepted ? {} : { reason: `host_${hostLossReason(host)}` }),
+        turn,
+        ...(draft !== undefined ? { draft } : {}),
+        hostAt: Date.now(),
+        ...(host.status !== undefined ? { hostStatus: host.status } : {}),
+      });
       saveTurn(turn, take, text, { host });
     });
     return turn;
@@ -3483,10 +3746,22 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         const turn = ++turns;
         turnTaking.onTurnLost(reason, fields);
         publish({ turn, status: 'lost', reason });
+        telemetry.turn({
+          facts: take.facts,
+          outcome: reason === 'stt' ? 'lost' : 'empty',
+          reason: reason === 'stt' ? 'stt' : 'no_words',
+          turn,
+        });
         saveTurn(turn, take, '', { reason });
       },
       noise: (take) => {
-        if (!ending) saveTurn(++turns, take, '', { reason: 'noise' });
+        if (ending) return;
+        const turn = ++turns;
+        telemetry.turn({ facts: take.facts, outcome: 'empty', reason: 'noise', turn });
+        saveTurn(turn, take, '', { reason: 'noise' });
+      },
+      ended: (facts, outcome, reason) => {
+        if (!ending) telemetry.turn({ facts, outcome, reason });
       },
       drop: (dropped, text) => {
         if (!ending) callVoice?.publishDropped?.({ dropped, text });
@@ -3518,28 +3793,26 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       meta,
       {
         geminiKey,
-        ...(record
-          ? {
-              recordReply: (pcm: Int16Array, model: string) => {
-                const reply = ++replies;
-                const fields = {
-                  reply,
-                  durationMs: Math.round((pcm.length * 1000) / TTS_SAMPLE_RATE),
-                  model,
-                  ...audioLevels(pcm),
-                };
-                void writeReplyRecording(
-                  deps.recordingsRoot ?? recordingsRoot(),
-                  { agent: meta.agentName, callId: meta.callId },
-                  reply,
-                  pcm,
-                ).then(
-                  () => callLog.info('voice worker: saved a reply recording', fields),
-                  (err: unknown) => callLog.warn('voice worker: could not save a reply recording', { err, reply }),
-                );
-              },
-            }
-          : {}),
+        ...(record ? { recordReplies: true } : {}),
+        spoke: (line, pcm) => {
+          const label = speakingLine;
+          const reply = label?.reply ?? ++replies;
+          if (pcm) {
+            void writeReplyRecording(
+              deps.recordingsRoot ?? recordingsRoot(),
+              { agent: meta.agentName, callId: meta.callId },
+              reply,
+              pcm,
+            ).catch((err: unknown) => callLog.warn('voice worker: could not save a reply recording', { err, reply }));
+          }
+          telemetry.reply({
+            reply,
+            kind: label?.notice ? 'notice' : 'reply',
+            ...(typeof label?.turn === 'number' ? { turn: label.turn, part: label.part } : {}),
+            ...line,
+            ...(pcm ? { recorded: true } : {}),
+          });
+        },
       },
       {
         onAudio: (pcm) => {
@@ -3558,6 +3831,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         },
         onAgentSpeaking: (speaking) => {
           agentSpeaking = speaking;
+          if (speaking && typeof speakingLine?.turn === 'number') telemetry.replyStarted(speakingLine.turn);
           callTurns.onAgentSpeaking(speaking);
           updateTyping();
           // The speaking state reaches the page first, then "working" lets go: no flash of listening
@@ -3651,6 +3925,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       wakeState: () => callTurns.state,
       cue,
       sttModel: meta.sttModel,
+      ended: (draft, take, outcome, reason) => telemetry.turn({ facts: take?.facts, outcome, reason, draft }),
       log: callLog,
     });
     review = control;
