@@ -759,7 +759,10 @@ second audio track (`background_audio`, tones synthesized in code, fed from the
 worker's own 80 ms audio source with DTX off and a faint noise floor, so a cue
 starts about 0.1 s after its event and is never clipped) apart from the agent's
 speech track, so the same cues work on any surface and the caller's next words
-are never taken for the agent speaking. Each is 150-250 ms of held tone about
+are never taken for the agent speaking. While the page shows the agent working, the same
+track loops LiveKit's quiet keyboard typing (`keyboard-typing2.ogg` from `@livekit/agents`,
+decoded once per worker process with ffmpeg); it stops as the agent starts speaking, a cue
+takes its place while one plays, and `?cues=0` turns it off with the cues. Each is 150-250 ms of held tone about
 6 dB under the agent's speech: a rising two-note (listening) once the call is
 ready, a quicker higher two-note (wake) on the wake phrase, a single high note
 (sent) as a turn goes out, a falling low two-note (discard) on a spoken discard,

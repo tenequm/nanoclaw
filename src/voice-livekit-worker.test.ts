@@ -59,6 +59,7 @@ import {
   awakeLimits,
   endsLike,
   Outbox,
+  loadTypingSound,
   audioLevels,
   CallerInput,
   type VadStream,
@@ -2427,6 +2428,38 @@ describe('cue audio', () => {
     await feed.play(cue);
   });
 
+  it('loops the typing sound under no cue: a cue takes its place, and the noise floor is back once it stops', async () => {
+    const typing = await loadTypingSound();
+    expect(typing.length).toBeGreaterThan(50);
+    for (const f of typing.slice(0, 3))
+      expect([f.sampleRate, f.channels, f.samplesPerChannel]).toEqual([48_000, 1, 960]);
+    // Quiet: well under the cues' level.
+    let peak = 0;
+    for (const f of typing) for (const v of f.data) peak = Math.max(peak, Math.abs(v));
+    expect(peak).toBeGreaterThan(100);
+    expect(peak).toBeLessThan(0.15 * 32767);
+    expect(await loadTypingSound()).toBe(typing);
+
+    const taken: AudioFrame[] = [];
+    const sink = { captureFrame: async (frame: AudioFrame) => void taken.push(frame) };
+    const feed = new CueFeed(sink);
+    feed.setBed(typing);
+    await vi.waitFor(() => expect(taken.length).toBeGreaterThan(3));
+    const start = taken.findIndex((f) => f === typing[0]);
+    expect(taken.slice(start, start + 3)).toEqual(typing.slice(0, 3));
+    const cue = cueFrames('sent');
+    await feed.play(cue);
+    const cueAt = taken.indexOf(cue[0]);
+    // The cue alone, never mixed with the typing, then the typing goes on.
+    expect(taken.slice(cueAt, cueAt + cue.length)).toEqual(cue);
+    feed.setBed(undefined);
+    const off = taken.length;
+    await vi.waitFor(() => expect(taken.length).toBeGreaterThan(off + 2));
+    expect(typing).not.toContain(taken.at(-1));
+    feed.stop();
+    await feed.running;
+  });
+
   it('ends on a failing source and lets every cue waiting on it go', async () => {
     let fail!: (err: Error) => void;
     const errors: unknown[] = [];
@@ -2606,6 +2639,25 @@ describe('commands, cues and review in a call', () => {
       }),
     );
     expect(utterances(host)).toEqual([]);
+    host.endStream();
+  });
+
+  it('types while the agent works: stops as it speaks, and with cues off', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const typing: boolean[] = [];
+    Object.assign(v.voice, { setTyping: vi.fn((on: boolean) => void typing.push(on)) });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.turn('Book a table');
+    await vi.waitFor(() => expect(typing).toEqual([true]));
+    v.events.onAgentSpeaking?.(true);
+    expect(typing).toEqual([true, false]);
+    v.events.onAgentSpeaking?.(false);
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(typing).toEqual([true, false, true]));
+    await v.rpc('settings', { cues: false });
+    expect(typing).toEqual([true, false, true, false]);
     host.endStream();
   });
 

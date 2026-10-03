@@ -32,6 +32,9 @@ import { fileURLToPath } from 'node:url';
 
 import {
   AutoSubscribe,
+  audioFramesFromFile,
+  BuiltinAudioClip,
+  getBuiltinAudioPath,
   type APIConnectOptions,
   cli,
   defineAgent,
@@ -735,6 +738,8 @@ export interface CallVoice {
   review?: ReviewSession;
   /** Play a sound cue on the call's cue track; resolves once the track took all of it (heard about 0.1 s later). */
   playCue?(kind: CueKind): Promise<void>;
+  /** Loop the typing sound on the cue track (under no cue), or stop it. */
+  setTyping?(on: boolean): void;
   close(): Promise<void>;
 }
 
@@ -1237,6 +1242,9 @@ export class CueFeed {
   private readonly cues: Array<{ frames: AudioFrame[]; done: () => void }> = [];
   private stopped = false;
   private noise = 0;
+  /** A looped sound under no cue (the typing while the agent works); the noise floor without one. */
+  private bed?: AudioFrame[];
+  private bedAt = 0;
   readonly running: Promise<void>;
 
   constructor(
@@ -1261,13 +1269,22 @@ export class CueFeed {
     for (const cue of this.cues.splice(0)) cue.done();
   }
 
+  /** Loop `frames` while no cue plays (from its start each time it is set), or stop the loop. */
+  setBed(frames: AudioFrame[] | undefined): void {
+    if (frames === this.bed) return;
+    this.bed = frames?.length ? frames : undefined;
+    this.bedAt = 0;
+  }
+
   private async run(): Promise<void> {
     // The source paces the feed by holding a capture while its queue is full; this clock keeps the
     // feed to real time as well, so a source that does not hold can never make it spin.
     let clock = performance.now();
     while (!this.stopped) {
       const cue = this.cues[0];
-      const frame = cue?.frames.shift() ?? NOISE_FLOOR[this.noise++ % NOISE_FLOOR.length];
+      const bed = this.bed;
+      const frame =
+        cue?.frames.shift() ?? (bed ? bed[this.bedAt++ % bed.length] : NOISE_FLOOR[this.noise++ % NOISE_FLOOR.length]);
       await this.sink.captureFrame(frame);
       if (cue && cue.frames.length === 0) {
         this.cues.shift();
@@ -1279,6 +1296,36 @@ export class CueFeed {
       if (clock - now > CUE_QUEUE_MS) await pause(clock - now - CUE_QUEUE_MS);
     }
   }
+}
+
+/** The typing sound's level under its file's own: quiet, under the agent's speech and the cues. */
+const TYPING_GAIN = 0.15;
+let typingSound: Promise<AudioFrame[]> | undefined;
+
+/**
+ * LiveKit's `keyboard-typing2.ogg` (shipped with @livekit/agents) as cue-track frames: 48 kHz mono,
+ * 20 ms, at TYPING_GAIN. Decoded once per process with ffmpeg; a decode that fails is tried again on
+ * the next call.
+ */
+export function loadTypingSound(file = getBuiltinAudioPath(BuiltinAudioClip.KEYBOARD_TYPING2)): Promise<AudioFrame[]> {
+  typingSound ??= (async () => {
+    const pcm: number[] = [];
+    const reader = audioFramesFromFile(file, { sampleRate: CUE_SAMPLE_RATE, numChannels: 1 }).getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const v of value.data) pcm.push(Math.round(v * TYPING_GAIN));
+    }
+    const frames: AudioFrame[] = [];
+    for (let at = 0; at + CUE_FRAME <= pcm.length; at += CUE_FRAME) {
+      frames.push(new AudioFrame(Int16Array.from(pcm.slice(at, at + CUE_FRAME)), CUE_SAMPLE_RATE, 1, CUE_FRAME));
+    }
+    return frames;
+  })().catch((err: unknown) => {
+    typingSound = undefined;
+    throw err;
+  });
+  return typingSound;
 }
 
 /**
@@ -2831,6 +2878,7 @@ async function roomVoice(
   }
 
   const sayAbort = new AbortController();
+  let typing = false;
   /** One line into the speech track: streamed as it is synthesized, resolved once it has played. */
   const say = async (text: string): Promise<boolean> => {
     let heard = false;
@@ -2924,6 +2972,16 @@ async function roomVoice(
       ),
     async playCue(kind) {
       await cueTrack?.feed.play(cueFrames(kind));
+    },
+    setTyping(on) {
+      typing = on;
+      if (!on) return cueTrack?.feed.setBed(undefined);
+      loadTypingSound().then(
+        (frames) => {
+          if (typing && !closed) cueTrack?.feed.setBed(frames);
+        },
+        (err: unknown) => log.warn('voice worker: no typing sound', { err: err instanceof Error ? err.message : err }),
+      );
     },
     publishReply: (info) => sendJson(CALL_REPLY_TOPIC, info, 'a reply label'),
     review: {
@@ -3051,6 +3109,16 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   /** The page's `?cues=0` turns the cues off, through the `settings` RPC. */
   let cuesOn = true;
   let agentSpeaking = false;
+  /** The page shows the agent working. */
+  let thinking = false;
+  let typingOn = false;
+  /** The typing sound plays while the agent works and is not speaking, with cues on. */
+  const updateTyping = () => {
+    const on = thinking && !agentSpeaking && cuesOn && !ending;
+    if (on === typingOn) return;
+    typingOn = on;
+    callVoice?.setTyping?.(on);
+  };
   let callerSpeaking = false;
   let cues: Promise<void> = Promise.resolve();
   /** Cues play one after another, none over the agent's speech and none once the call ends. */
@@ -3109,7 +3177,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           callTurns.onAgentSpeaking(false);
         }
       },
-      setThinking: (thinking) => callVoice?.setThinking(thinking),
+      setThinking: (on) => {
+        thinking = on;
+        callVoice?.setThinking(on);
+        updateTyping();
+      },
       announce: (info) => callVoice?.publishReply(info),
       beforeSpeak: () => review?.beforeAgentSpeaks(),
       // Over to the caller, unless another line starts, the agent still works or the caller already talks.
@@ -3149,6 +3221,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const end = async (reason: string, tellHost: boolean, restart = false) => {
     if (ending) return;
     ending = true;
+    updateTyping();
     clearTimeout(readyTimer);
     clearTimeout(turnCueTimer);
     clearTimeout(replyHoldTimer);
@@ -3347,6 +3420,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         },
         onAgentSpeaking: (speaking) => {
           agentSpeaking = speaking;
+          updateTyping();
           // The speaking state reaches the page first, then "working" lets go: no flash of listening
           // before the reply's audio, nor of working after a short line. A line that ended sooner lets
           // its successor's hold be.
@@ -3431,6 +3505,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       resetCaller: () => turnTaking.resetCaller(),
       configure: (req) => {
         if (req.cues !== undefined) cuesOn = req.cues;
+        updateTyping();
         callTurns.configure(req.wake ?? callTurns.state.on, req.pauseSends ?? callTurns.state.pauseSends);
         readyCue();
       },
@@ -3535,6 +3610,8 @@ export default defineAgent({
   prewarm: async (proc: JobProcess) => {
     const userData = proc.userData as WorkerUserData;
     userData.vad = await loadVad();
+    // Decoded ahead of the call; a failure is only no typing sound, said when a call wants it.
+    await loadTypingSound().catch(() => undefined);
   },
   entry: (ctx) => runCall(ctx),
 });
