@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -11,6 +12,7 @@ import {
   WAKE_WINDOW_SAMPLES,
   WakeWordPipeline,
   WakeWordSpotter,
+  defaultThreshold,
   pcmToFloat,
   wakePhraseOf,
 } from './voice-wakeword.js';
@@ -63,7 +65,7 @@ const REFERENCE = {
 describe('wake word pipeline parity with livekit-wakeword', () => {
   let pipeline: WakeWordPipeline;
   beforeAll(async () => {
-    pipeline = await WakeWordPipeline.load(DEFAULT_WAKE_MODEL);
+    pipeline = await WakeWordPipeline.load([DEFAULT_WAKE_MODEL]);
   });
   afterAll(() => pipeline.release());
 
@@ -71,13 +73,13 @@ describe('wake word pipeline parity with livekit-wakeword', () => {
     it(`scores ${name}.wav as the reference does, whole and window by window`, async () => {
       const clip = readWav(path.join(FIXTURES, `${name}.wav`));
       expect(clip.length).toBe(WAKE_WINDOW_SAMPLES);
-      expect(await pipeline.score(pcmToFloat(clip))).toBeCloseTo(REFERENCE[name].clip, 5);
+      expect((await pipeline.score(pcmToFloat(clip)))[0]).toBeCloseTo(REFERENCE[name].clip, 5);
 
       const padded = concat(silence(1), clip, silence(1));
       const before = pipeline.embedded;
       const stream: number[] = [];
       for (let end = WAKE_WINDOW_SAMPLES; end <= padded.length; end += WAKE_HOP_SAMPLES) {
-        stream.push(await pipeline.score(pcmToFloat(padded.subarray(end - WAKE_WINDOW_SAMPLES, end)), end));
+        stream.push((await pipeline.score(pcmToFloat(padded.subarray(end - WAKE_WINDOW_SAMPLES, end)), end))[0]);
       }
       expect(stream).toHaveLength(REFERENCE[name].stream.length);
       stream.forEach((score, i) => expect(Math.abs(score - REFERENCE[name].stream[i])).toBeLessThan(1e-4));
@@ -87,7 +89,23 @@ describe('wake word pipeline parity with livekit-wakeword', () => {
   }
 
   it('scores audio too short for 16 embeddings as 0', async () => {
-    expect(await pipeline.score(new Float32Array(16_000))).toBe(0);
+    expect(await pipeline.score(new Float32Array(16_000))).toEqual([0]);
+  });
+
+  it('runs several classifiers on one set of features, each as it would alone, and only the active ones', async () => {
+    const both = await WakeWordPipeline.load([DEFAULT_WAKE_MODEL, '/nonexistent/send_it.onnx', DEFAULT_WAKE_MODEL]);
+    try {
+      expect(both.failed).toEqual({ 1: expect.stringMatching(/not found/) });
+      const clip = pcmToFloat(readWav(path.join(FIXTURES, 'positive.wav')));
+      const [a, missing, b] = await both.score(clip);
+      expect(a).toBeCloseTo(REFERENCE.positive.clip, 5);
+      expect(b).toBe(a);
+      expect(missing).toBe(0);
+      expect(await both.score(clip, undefined, [2])).toEqual([0, 0, a]);
+    } finally {
+      await both.release();
+    }
+    await expect(WakeWordPipeline.load(['/nonexistent/a.onnx'])).rejects.toThrow(/not found/);
   });
 });
 
@@ -111,41 +129,42 @@ describe('WakeWordSpotter', () => {
   const make = (now?: () => number) => {
     const detections: number[] = [];
     const spotter = new WakeWordSpotter({
-      classifier: DEFAULT_WAKE_MODEL,
-      threshold: DEFAULT_WAKE_THRESHOLD,
-      onDetect: (score) => detections.push(score),
+      classifiers: [{ name: 'wake', model: DEFAULT_WAKE_MODEL, threshold: DEFAULT_WAKE_THRESHOLD }],
+      onDetect: (_name, score) => detections.push(score),
       now,
     });
     spotters.push(spotter);
     return { spotter, detections };
   };
 
-  it('names the phrase after the classifier file', () => {
+  it("names the phrase after the classifier file, and knows the bundled one's threshold", () => {
     expect(wakePhraseOf(DEFAULT_WAKE_MODEL)).toBe('hey livekit');
     expect(wakePhraseOf('/models/hey_jarvis.int8.onnx')).toBe('hey jarvis');
     expect(wakePhraseOf('hey_jarvis_v0.1.onnx')).toBe('hey jarvis');
+    expect(defaultThreshold(DEFAULT_WAKE_MODEL)).toBe(DEFAULT_WAKE_THRESHOLD);
+    expect(defaultThreshold('/models/hey_jarvis.onnx')).toBe(0.5);
   });
 
   it('spots the wake word once in a worker thread, and only while listening', async () => {
     const { spotter, detections } = make();
     await spotter.ready;
-    expect(spotter.phrase).toBe('hey livekit');
+    expect(spotter.phrases).toEqual({ wake: 'hey livekit' });
     await feed(spotter, concat(silence(1), positive(), silence(1)));
     expect(detections).toEqual([]);
     expect(spotter.summary.scored).toBe(0);
 
-    spotter.listen(true);
+    spotter.listen(['wake']);
     await feed(spotter, concat(silence(1), positive(), silence(1)));
     expect(detections).toHaveLength(1);
     expect(detections[0]).toBeGreaterThan(0.9);
-    expect(spotter.summary).toMatchObject({ detections: 1, skipped: 0 });
+    expect(spotter.summary).toMatchObject({ detections: { wake: 1 }, skipped: 0 });
     expect(spotter.summary.scored).toBeGreaterThan(10);
   });
 
   it('scores the window at every 80 ms boundary, whatever the frame size, also when audio comes in a burst', async () => {
     const { spotter, detections } = make();
     await spotter.ready;
-    spotter.listen(true);
+    spotter.listen(['wake']);
     // In 30 ms frames: the 2 s fill, then 0.64 s at once (8 windows wait their turn), then the rest.
     const audio = concat(silence(1), positive());
     const idle = () => vi.waitFor(() => expect((spotter as unknown as { inflight: boolean }).inflight).toBe(false));
@@ -158,7 +177,7 @@ describe('WakeWordSpotter', () => {
     await idle();
     pushFrames(42_240, audio.length);
     await idle();
-    expect(spotter.summary).toMatchObject({ scored: 13, skipped: 0, detections: 1 });
+    expect(spotter.summary).toMatchObject({ scored: 13, skipped: 0, detections: { wake: 1 } });
     expect(detections).toHaveLength(1);
   });
 
@@ -167,7 +186,7 @@ describe('WakeWordSpotter', () => {
       let clock = 0;
       const { spotter, detections } = make(() => clock);
       await spotter.ready;
-      spotter.listen(true);
+      spotter.listen(['wake']);
       const first = concat(silence(1), positive());
       // The audio after a detection refills for 2 s before anything scores, so the clock decides.
       await feed(spotter, concat(first, silence(0.5), positive(), silence(1)), (at) => {
@@ -179,10 +198,42 @@ describe('WakeWordSpotter', () => {
     expect(await run(2_500)).toBe(2);
   });
 
-  it('rejects ready when the classifier is missing', async () => {
+  it('runs one classifier per phrase in the one thread; only those listened to detect', async () => {
+    // Stand-ins for command models: the bundled classifier under other names and thresholds.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeword-'));
+    for (const name of ['send_it', 'scratch_that']) fs.copyFileSync(DEFAULT_WAKE_MODEL, path.join(dir, `${name}.onnx`));
+    const detections: Array<[string, number]> = [];
+    const spotter = new WakeWordSpotter<'wake' | 'send' | 'discard' | 'broken'>({
+      classifiers: [
+        { name: 'wake', model: DEFAULT_WAKE_MODEL, threshold: 0.68 },
+        { name: 'send', model: path.join(dir, 'send_it.onnx'), threshold: 0.95 },
+        { name: 'discard', model: path.join(dir, 'scratch_that.onnx'), threshold: 0.5 },
+        { name: 'broken', model: path.join(dir, 'missing.onnx'), threshold: 0.5 },
+      ],
+      onDetect: (name, score) => detections.push([name, score]),
+    });
+    spotters.push(spotter);
+    expect(spotter.phrases).toMatchObject({ send: 'send it', discard: 'scratch that' });
+    await spotter.ready;
+    expect(spotter.phrases).toEqual({ wake: 'hey livekit', send: 'send it', discard: 'scratch that' });
+    expect(spotter.failed).toEqual({ broken: expect.stringMatching(/not found/) });
+
+    spotter.listen(['send', 'broken']);
+    await feed(spotter, concat(silence(2), positive(), silence(1)));
+    expect(detections.map(([name]) => name)).toEqual(['send']);
+
+    // Two over their thresholds in one window: the higher score is the detection.
+    spotter.listen(['wake', 'discard']);
+    await feed(spotter, concat(silence(2), positive(), silence(1)));
+    expect(detections.map(([name]) => name)).toEqual(['send', 'wake']);
+    expect(spotter.summary.detections).toEqual({ wake: 1, send: 1, discard: 0, broken: 0 });
+    expect(spotter.summary.maxScore.send).toBeGreaterThan(0.95);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('rejects ready when no classifier loads', async () => {
     const spotter = new WakeWordSpotter({
-      classifier: '/nonexistent/hey_nobody.onnx',
-      threshold: 0.5,
+      classifiers: [{ name: 'wake', model: '/nonexistent/hey_nobody.onnx', threshold: 0.5 }],
       onDetect: () => undefined,
     });
     spotters.push(spotter);

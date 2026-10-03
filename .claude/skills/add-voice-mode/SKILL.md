@@ -515,6 +515,11 @@ classifiers load too, but their pretrained models are CC BY-NC-SA 4.0
 (non-commercial): fine for your own install, never to be committed or shipped. `VOICE_WAKE_THRESHOLD` is the
 score (0 to 1) that counts as the wake word: by default 0.68, livekit-wakeword's
 documented operating point for `hey_livekit`, and 0.5 for another model.
+`VOICE_SEND_MODEL` and `VOICE_DISCARD_MODEL` (with `VOICE_SEND_THRESHOLD` and
+`VOICE_DISCARD_THRESHOLD`, same defaults) add classifiers for the send and discard
+commands in the same format (none by default: the skill ships no command model;
+train one with livekit-wakeword, e.g. `send_it.onnx`). They share the wake word's
+feature models and thread. A relative model path is from NanoClaw's directory.
 
 It also reads `VOICE_RECORDINGS_DAYS` (default `0`, off): with a
 number of days, it saves every caller turn it hears as a 16 kHz mono WAV plus a
@@ -800,6 +805,12 @@ with a wake word model (`VOICE_WAKE_MODEL`, by default livekit-wakeword's
 chip name that phrase (`say "hey livekit"`) instead of `hey <agent>`. The
 phrase's words, however the transcription spells them (`Hey, LiveKit`, `live kit`,
 `Лайвкіт`), are taken out of the next transcripts, with the words before them.
+With a send or discard model, the open turn is scored for those phrases too (never
+while the agent speaks): a detection acts once the final transcript that ends in
+the phrase arrives, however it was spelled (`sent in`, `scratched at`), as the
+command at the end of the utterance would; a final that goes on past the phrase
+makes it words, and with no final within 3 s the turn as held is sent or dropped.
+The transcript commands keep working beside them.
 Only without a model (`off`, or one that does not load) does `hey <agent>` in the
 transcript open the turn: `<agent>` is then the agent's name or any entry in its
 `voice.vocabulary.txt`, matched across case, punctuation and Latin/Cyrillic

@@ -61,7 +61,9 @@ import {
   matchCommand,
   matchWake,
   matchWakeText,
-  wakeWordSettings,
+  matchSpottedCommand,
+  spotterSettings,
+  type SpotterRole,
   type WakeWord,
   type WakeWordEvents,
   READY_CUE_WAIT_MS,
@@ -2458,15 +2460,30 @@ describe('acoustic wake word', () => {
     expect(matchWakeText('Hey Jarvis, lights', 'hey jarvis')).toEqual({ start: 0, end: 10 });
   });
 
-  it('reads the model and threshold from the settings', () => {
-    expect(wakeWordSettings({})).toEqual({ classifier: expect.stringMatching(/hey_livekit\.onnx$/), threshold: 0.68 });
-    expect(wakeWordSettings({ VOICE_WAKE_MODEL: 'off' })).toBeNull();
-    expect(wakeWordSettings({ VOICE_WAKE_MODEL: '/m/hey_jarvis.onnx' })).toEqual({
-      classifier: '/m/hey_jarvis.onnx',
-      threshold: 0.5,
-    });
-    expect(wakeWordSettings({ VOICE_WAKE_THRESHOLD: '0.8' })?.threshold).toBe(0.8);
-    expect(wakeWordSettings({ VOICE_WAKE_THRESHOLD: '7' })?.threshold).toBe(0.68);
+  it("reads each role's model and threshold from the settings", () => {
+    const wake = { name: 'wake', model: expect.stringMatching(/hey_livekit\.onnx$/), threshold: 0.68 };
+    expect(spotterSettings({})).toEqual([wake]);
+    expect(spotterSettings({ VOICE_WAKE_MODEL: 'off' })).toEqual([]);
+    expect(spotterSettings({ VOICE_WAKE_MODEL: '/m/hey_jarvis.onnx' })).toEqual([
+      { name: 'wake', model: '/m/hey_jarvis.onnx', threshold: 0.5 },
+    ]);
+    expect(spotterSettings({ VOICE_WAKE_THRESHOLD: '0.8' })[0].threshold).toBe(0.8);
+    expect(spotterSettings({ VOICE_WAKE_THRESHOLD: '7' })[0].threshold).toBe(0.68);
+    expect(
+      spotterSettings({
+        VOICE_WAKE_MODEL: 'none',
+        VOICE_SEND_MODEL: '/m/send_it.onnx',
+        VOICE_SEND_THRESHOLD: '0.9',
+        VOICE_DISCARD_MODEL: 'models/scratch_that.onnx',
+      }),
+    ).toEqual([
+      { name: 'send', model: '/m/send_it.onnx', threshold: 0.9 },
+      { name: 'discard', model: path.resolve('models/scratch_that.onnx'), threshold: 0.5 },
+    ]);
+    expect(spotterSettings({ VOICE_SEND_MODEL: '/m/send_it.onnx', VOICE_DISCARD_MODEL: 'off' })).toEqual([
+      wake,
+      { name: 'send', model: '/m/send_it.onnx', threshold: 0.5 },
+    ]);
   });
 
   function spotted() {
@@ -2567,18 +2584,150 @@ describe('acoustic wake word', () => {
   });
 });
 
+describe('spotted commands', () => {
+  it('finds a spotted command however the transcription heard it, and whether it ends the text', () => {
+    const at = (text: string, phrase = 'send it') => {
+      const found = matchSpottedCommand(text, phrase);
+      return found && [text.slice(0, found.start), found.last];
+    };
+    expect(at('Book a table for two, sent in.')).toEqual(['Book a table for two, ', true]);
+    expect(at('Book a table. Send it.')).toEqual(['Book a table. ', true]);
+    expect(at('Book a table, sandy')).toEqual(['Book a table, ', true]);
+    expect(at('Сенд іт')).toEqual(['', true]);
+    expect(at('send it to Anna tomorrow')).toEqual(['', false]);
+    // Other words that share its consonants without its first one are words.
+    expect(at('I will not, and then into it')).toBeNull();
+    expect(at('Book a table')).toBeNull();
+    expect(at('No wait, scratched at.', 'scratch that')).toEqual(['No wait, ', true]);
+    expect(at('No wait, catch that', 'scratch that')).toEqual(['No wait, ', true]);
+    expect(at('Call the plumber', 'scratch that')).toBeNull();
+  });
+
+  it('a short wake name matches with any vowel: hey Den is hey dan', () => {
+    const at = (text: string) => {
+      const found = matchWakeText(text, 'hey dan');
+      return found && [text.slice(0, found.start), text.slice(found.end)];
+    };
+    expect(at('Hey Den, book a table')).toEqual(['', ', book a table']);
+    expect(at('Гей, Ден, котра година?')).toEqual(['', ', котра година?']);
+    expect(at('Hey Dan.')).toEqual(['', '.']);
+    expect(at('Hey, then what?')).toBeNull();
+  });
+
+  function open() {
+    let clock = 1_000_000;
+    const h = commandsHarness(['Andy'], () => clock);
+    h.commands.configure(true, false);
+    h.say('Hey Andy');
+    expect(h.cues).toEqual(['wake']);
+    return { ...h, tick: (ms: number) => void (clock += ms) };
+  }
+
+  it('acts on the next final that ends in its words, however misheard', () => {
+    const h = open();
+    h.say('Book a table');
+    h.commands.onCommandWord('over', 'send it');
+    h.say('for two, sent in.');
+    expect(h.sent).toEqual(['Book a table for two']);
+    expect(h.commands.waiting).toBe(true);
+
+    h.say('Hey Andy');
+    h.say('Call the plumber');
+    h.commands.onCommandWord('discard', 'scratch that');
+    h.say('no wait, scratched at.');
+    expect(h.dropped.at(-1)).toEqual(['discarded', 'Call the plumber no wait, scratched at.']);
+    expect(h.cues.at(-1)).toBe('discard');
+    expect(h.commands.waiting).toBe(true);
+  });
+
+  it('the transcript command acts once; a final that goes on past the words makes them words', () => {
+    const h = open();
+    h.commands.onCommandWord('over', 'send it');
+    h.say('Book a table. Over.');
+    expect(h.sent).toEqual(['Book a table.']);
+
+    h.say('Hey Andy');
+    h.commands.onCommandWord('over', 'send it');
+    h.say('Send it to Anna tomorrow');
+    expect(h.sent).toEqual(['Book a table.']);
+    expect(h.commands.onPause('')).toBeNull();
+    // A final with none of its words keeps it waiting; the next one that ends in them acts.
+    h.commands.onCommandWord('over', 'send it');
+    h.say('and to Bob');
+    h.say('sandy');
+    expect(h.sent).toEqual(['Book a table.', 'Send it to Anna tomorrow and to Bob']);
+  });
+
+  it('a final just before it may have been the one', () => {
+    const h = open();
+    h.say('Book a table, sandy');
+    h.tick(800);
+    h.commands.onCommandWord('over', 'send it');
+    expect(h.sent).toEqual(['Book a table']);
+
+    // Too long before: it waits for a final of its own.
+    h.say('Hey Andy');
+    h.say('Call mum, sandy');
+    h.tick(5_000);
+    h.commands.onCommandWord('over', 'send it');
+    expect(h.sent).toEqual(['Book a table']);
+  });
+
+  it('with no final in time it acts on what the turn holds, unless the caller still talks', () => {
+    vi.useFakeTimers();
+    const h = open();
+    h.say('Book a table');
+    h.commands.onCommandWord('over', 'send it');
+    vi.advanceTimersByTime(2_900);
+    expect(h.sent).toEqual([]);
+    vi.advanceTimersByTime(200);
+    expect(h.sent).toEqual(['Book a table']);
+
+    h.say('Hey Andy');
+    h.say('Call the plumber');
+    h.commands.onCommandWord('over', 'send it');
+    h.commands.onCallerSpeaking(true);
+    vi.advanceTimersByTime(3_100);
+    expect(h.sent).toEqual(['Book a table']);
+    h.commands.onCallerSpeaking(false);
+  });
+
+  it('does nothing while waiting for the wake phrase, and a switch drops what waits', () => {
+    vi.useFakeTimers();
+    let clock = 0;
+    const h = commandsHarness(['Andy'], () => clock);
+    h.commands.configure(true, false);
+    h.commands.onCommandWord('over', 'send it');
+    h.say('Book a table, sandy');
+    expect(h.sent).toEqual([]);
+    expect(h.commands.listensForCommands).toBe(false);
+    h.say('Hey Andy');
+    expect(h.commands.listensForCommands).toBe(true);
+    h.say('Book a table');
+    clock += 10_000;
+    h.commands.onCommandWord('over', 'send it');
+    h.commands.configure(false, false);
+    vi.advanceTimersByTime(5_000);
+    expect(h.sent).toEqual([]);
+  });
+});
+
 describe('acoustic wake word in a call', () => {
-  function fakeWakeWord(load: 'ok' | 'fail' = 'ok') {
+  function fakeWakeWord(
+    load: 'ok' | 'fail' = 'ok',
+    phrases: Partial<Record<SpotterRole, string>> = { wake: 'hey livekit' },
+  ) {
     let events!: WakeWordEvents;
     const pushed: number[] = [];
-    const listening: boolean[] = [];
+    const listening: string[] = [];
     const wake = {
-      phrase: 'hey livekit',
-      threshold: 0.68,
+      phrases,
+      thresholds: { wake: 0.68 },
+      failed: {},
       ready: load === 'ok' ? Promise.resolve() : Promise.reject(new Error('wake word model not found: x')),
-      listen: vi.fn((on: boolean) => void listening.push(on)),
+      listen: vi.fn((roles: readonly SpotterRole[]) => void listening.push(roles.join('+'))),
       push: vi.fn((pcm: Int16Array) => void pushed.push(pcm.length)),
-      summary: { scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
+      summary: { scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: {}, maxScore: {} },
       utilization: 0,
       close: vi.fn(async () => undefined),
     } satisfies WakeWord;
@@ -2636,24 +2785,25 @@ describe('acoustic wake word in a call', () => {
     c.frame();
     c.frame(160, 48_000);
     expect(w.pushed).toEqual([160]);
-    expect(w.listening.at(-1)).toBe(true);
+    expect(w.listening.at(-1)).toBe('wake');
     c.v.events.onAgentSpeaking?.(true);
     c.frame();
-    expect(w.listening.at(-1)).toBe(false);
+    expect(w.listening.at(-1)).toBe('');
     c.v.events.onAgentSpeaking?.(false);
 
     c.say('Hey Andy, so the plan is set.');
     expect(c.dropped).toEqual([{ dropped: 'unaddressed', text: 'Hey Andy, so the plan is set.' }]);
-    w.events.onDetect(0.97);
+    w.events.onDetect('wake', 0.97);
     expect(c.r.last.wake?.waiting).toBe(false);
+    // The open turn listens for the commands instead.
     c.frame();
-    expect(w.listening.at(-1)).toBe(false);
+    expect(w.listening.at(-1)).toBe('send+discard');
     c.say('Hey, LiveKit. Book a table for two. Over.');
     await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table for two.']));
     await vi.waitFor(() => expect(c.played).toEqual(['listening', 'wake', 'sent']));
     expect(c.r.last.wake?.waiting).toBe(true);
     c.frame();
-    expect(w.listening.at(-1)).toBe(true);
+    expect(w.listening.at(-1)).toBe('wake');
     host.endStream();
     await vi.waitFor(() => expect(w.wake.close).toHaveBeenCalled());
   });
@@ -2689,6 +2839,43 @@ describe('acoustic wake word in a call', () => {
     expect(c2.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true });
   });
 
+  it('spotted commands send and discard the open turn the wake word opened', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = wakeCall();
+    const w = fakeWakeWord('ok', { wake: 'hey dan', send: 'send it', discard: 'scratch that' });
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice, { wakeWord: w.make }));
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    await vi.waitFor(() => expect(c.r.last.wake?.phrase).toBe('hey dan'));
+    c.frame();
+    expect(w.listening.at(-1)).toBe('wake');
+
+    w.events.onDetect('wake', 0.9);
+    c.frame();
+    expect(w.listening.at(-1)).toBe('send+discard');
+    c.v.events.onAgentSpeaking?.(true);
+    c.frame();
+    expect(w.listening.at(-1)).toBe('');
+    c.v.events.onAgentSpeaking?.(false);
+    c.say('Hey Den, book a table for two');
+    w.events.onDetect('send', 0.8);
+    c.say('sent in.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['book a table for two']));
+    expect(c.r.last.wake?.waiting).toBe(true);
+
+    w.events.onDetect('wake', 0.9);
+    c.say('Call the plumber');
+    w.events.onDetect('discard', 0.8);
+    c.say('scratch that.');
+    await vi.waitFor(() => expect(c.played).toEqual(['listening', 'wake', 'sent', 'wake', 'discard']));
+    expect(utterances(host)).toEqual(['book a table for two']);
+    // While waiting, a spotted command does nothing.
+    w.events.onDetect('send', 0.8);
+    c.say('Book a table, send it.');
+    expect(utterances(host)).toEqual(['book a table for two']);
+    host.endStream();
+  });
+
   it('a real spotter on real audio: the wake word opens the turn, other speech does not', async () => {
     const wav = (name: string) => {
       const buf = fs.readFileSync(new URL(`./voice-wakeword-fixtures/${name}`, import.meta.url));
@@ -2707,7 +2894,10 @@ describe('acoustic wake word in a call', () => {
         ctx,
         deps(host.fetchImpl, c.v.createVoice, {
           wakeWord: (events: WakeWordEvents) =>
-            (spotter = new WakeWordSpotter({ classifier: DEFAULT_WAKE_MODEL, threshold: 0.68, ...events })),
+            (spotter = new WakeWordSpotter<SpotterRole>({
+              classifiers: [{ name: 'wake', model: DEFAULT_WAKE_MODEL, threshold: 0.68 }],
+              ...events,
+            })),
         }),
       );
       await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
@@ -2726,12 +2916,12 @@ describe('acoustic wake word in a call', () => {
     const positive = wav('positive.wav');
     const yes = await run(Int16Array.from([...silence, ...silence, ...positive, ...silence]));
     expect(yes.waiting).toBe(false);
-    expect(yes.summary.detections).toBe(1);
+    expect(yes.summary.detections).toEqual({ wake: 1 });
     await vi.waitFor(() => expect(yes.played).toContain('wake'));
     // The same voice and level, played backwards: no wake word.
     const no = await run(Int16Array.from([...silence, ...silence, ...positive.slice().reverse(), ...silence]));
     expect(no.summary.scored).toBeGreaterThan(20);
-    expect(no.summary.maxScore).toBeLessThan(0.68);
+    expect(no.summary.maxScore.wake).toBeLessThan(0.68);
     expect(no.waiting).toBe(true);
   });
 });

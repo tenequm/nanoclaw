@@ -92,11 +92,11 @@ import {
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import {
-  CUSTOM_WAKE_THRESHOLD,
   DEFAULT_WAKE_MODEL,
-  DEFAULT_WAKE_THRESHOLD,
   WAKE_SAMPLE_RATE,
   WakeWordSpotter,
+  defaultThreshold,
+  type SpotterClassifier,
   type WakeWordStats,
 } from './voice-wakeword.js';
 
@@ -1363,12 +1363,15 @@ export function matchWakeText(text: string, phrase: string): { start: number; en
   const name = nameWords.join('');
   const skeleton = consonantSkeleton(name);
   const fuzzy = skeleton.length >= 3;
+  // A short name by its letters with any vowels: `Den` and `Ден` are `dan`.
+  const vowelBlind = name.length >= 3 ? nameSkeleton(name) : undefined;
   const words = spokenWords(text);
   for (let i = 0; i < words.length; i++) {
     let joined = '';
     for (let k = i; k < Math.min(words.length, i + 3); k++) {
       joined += words[k].word;
-      if (joined !== name && (!fuzzy || consonantSkeleton(joined) !== skeleton)) continue;
+      const same = joined === name || (vowelBlind !== undefined && nameSkeleton(joined) === vowelBlind);
+      if (!same && (!fuzzy || consonantSkeleton(joined) !== skeleton)) continue;
       const lead = i > 0 && WAKE_LEADS.has(words[i - 1].word);
       return { start: words[lead ? i - 1 : i].start, end: words[k].end };
     }
@@ -1418,6 +1421,55 @@ export function matchCommand(text: string): { command: SpokenCommand; rest: stri
   return null;
 }
 
+/** What was said before a command, without the punctuation that led into it. */
+const trimCommandRest = (text: string): string => text.replace(/[\s,;:–—-]+$/u, '').trim();
+
+/** How long a command the audio spotted waits for the final that ends its utterance. */
+const SPOTTED_COMMAND_WAIT_MS = 3_000;
+/** A final taken this shortly before a spotted command may have carried it. */
+const SPOTTED_COMMAND_LATE_MS = 1_500;
+
+/**
+ * Where the words of a command the audio spotted (`send it`) sit in a transcript, however the
+ * transcription heard them (`sent in`, `sandy`, `scratched at`): one to three words whose consonants
+ * are within a third of the phrase's (a short phrase's first one the same). At the end of the text
+ * first (`last`: nothing is said after them), else the nearest anywhere.
+ */
+export function matchSpottedCommand(text: string, phrase: string): { start: number; last: boolean } | null {
+  const target = consonantSkeleton(
+    spokenWords(phrase)
+      .map((w) => w.word)
+      .join(''),
+  );
+  if (!target) return null;
+  const allowed = Math.max(1, Math.floor(target.length / 3));
+  const words = spokenWords(text);
+  const distance = (from: number, to: number): number => {
+    const said = consonantSkeleton(
+      words
+        .slice(from, to + 1)
+        .map((w) => w.word)
+        .join(''),
+    );
+    if (!said || (target.length < 5 && said[0] !== target[0])) return Infinity;
+    return editDistance(said, target);
+  };
+  let best: { start: number; last: boolean; distance: number } | null = null;
+  const consider = (from: number, to: number) => {
+    const d = distance(from, to);
+    if (d <= allowed && (!best || d < best.distance)) {
+      best = { start: words[from].start, last: to === words.length - 1, distance: d };
+    }
+  };
+  const end = words.length - 1;
+  for (let from = Math.max(0, end - 2); from <= end; from++) consider(from, end);
+  if (best) return best;
+  for (let from = 0; from < words.length; from++) {
+    for (let to = from; to < Math.min(words.length, from + 3); to++) consider(from, to);
+  }
+  return best;
+}
+
 export interface SpokenCommandDeps {
   /** Send these words as a turn now. */
   send(text: string): void;
@@ -1460,6 +1512,10 @@ export class SpokenCommands {
   private strip?: { until: number; finals: number; keepBefore: boolean };
   /** The last final dropped while waiting: a wake word spotted just after it may have been in it. */
   private lastUnaddressed?: { text: string; at: number };
+  /** A command the audio spotted in the open turn, waiting for the final that ends its utterance. */
+  private spotted?: { command: SpokenCommand; phrase: string; timer: ReturnType<typeof setTimeout> };
+  /** The open turn's last final, as taken: a command spotted just after it may have been in it. */
+  private lastTaken?: { text: string; at: number };
 
   constructor(
     names: readonly string[],
@@ -1515,6 +1571,36 @@ export class SpokenCommands {
     if (said) this.take(said);
   }
 
+  /**
+   * The audio had a command phrase (`send it`, `scratch that`) while the turn was open. Its words
+   * arrive later: a final that ends in them however they were heard acts on it, and one that goes on
+   * past them makes it words. A final just before may have been the one. No final in time and the
+   * caller silent: it acts on what the turn holds.
+   */
+  onCommandWord(command: SpokenCommand, phrase: string): void {
+    if (!this.awake || this.pending || this.spotted) return;
+    const late = this.lastTaken;
+    if (late && this.now() - late.at <= SPOTTED_COMMAND_LATE_MS && this.heardWords.at(-1) === late.text) {
+      const found = matchSpottedCommand(late.text, phrase);
+      if (found?.last) {
+        this.heardWords.pop();
+        return this.hold({ command, rest: trimCommandRest(late.text.slice(0, found.start)), words: late.text });
+      }
+    }
+    const timer = setTimeout(() => {
+      this.spotted = undefined;
+      if (!this.awake || this.callerSpeaking) return;
+      this.hold({ command, rest: '', words: phrase });
+    }, SPOTTED_COMMAND_WAIT_MS);
+    timer.unref?.();
+    this.spotted = { command, phrase, timer };
+  }
+
+  /** The open turn may take a spotted command (`send it`): the audio is worth scoring for one. */
+  get listensForCommands(): boolean {
+    return this.awake;
+  }
+
   /** Nothing is kept until the wake phrase. */
   get waiting(): boolean {
     return this.wake && !this.awake;
@@ -1535,6 +1621,7 @@ export class SpokenCommands {
     if (wake !== this.wake) {
       this.awake = false;
       this.pending = undefined;
+      this.dropSpotted();
       this.strip = undefined;
       this.lastUnaddressed = undefined;
       // From here the open turn is these words: none when the gate closes, since none were addressed.
@@ -1553,6 +1640,7 @@ export class SpokenCommands {
   reset(): void {
     this.heardWords = [];
     this.pending = undefined;
+    this.dropSpotted();
     this.strip = undefined;
     this.lastUnaddressed = undefined;
     this.cutSinceCommit = true;
@@ -1604,14 +1692,35 @@ export class SpokenCommands {
 
   /** A final's words, after any wake phrase: kept, or held when they end in a command. */
   private take(said: string): void {
-    const match = matchCommand(said);
+    const match = matchCommand(said) ?? this.spottedIn(said);
     if (!match) {
       this.heardWords.push(said);
+      this.lastTaken = { text: said, at: this.now() };
       this.deps.heard(said, true);
       return;
     }
-    this.pending = { ...match, words: said };
+    this.dropSpotted();
+    this.hold({ ...match, words: said });
+  }
+
+  private hold(pending: { command: SpokenCommand; rest: string; words: string }): void {
+    this.pending = pending;
     if (!this.callerSpeaking) this.settle();
+  }
+
+  /** The spotted command when this final ends in its words; a final that goes on past them makes it words. */
+  private spottedIn(said: string): { command: SpokenCommand; rest: string } | null {
+    const spotted = this.spotted;
+    if (!spotted) return null;
+    const found = matchSpottedCommand(said, spotted.phrase);
+    if (!found) return null;
+    this.dropSpotted();
+    return found.last ? { command: spotted.command, rest: trimCommandRest(said.slice(0, found.start)) } : null;
+  }
+
+  private dropSpotted(): void {
+    clearTimeout(this.spotted?.timer);
+    this.spotted = undefined;
   }
 
   /**
@@ -1712,6 +1821,8 @@ export class SpokenCommands {
 
   /** Back to waiting for the wake phrase. */
   private sleep(): void {
+    this.dropSpotted();
+    this.lastTaken = undefined;
     if (!this.awake) return;
     this.awake = false;
     this.deps.changed();
@@ -2133,19 +2244,28 @@ export interface RunCallDeps {
   recordingsRoot?: string;
   /** Tell the caller's page this worker cannot serve the host's protocol version. */
   markUpdating(ctx: CallJob): Promise<void>;
-  /** The call's acoustic wake word spotter, or none: then `hey <agent>` in the transcript opens a turn. */
+  /** The call's acoustic phrase spotter, or none: then the transcript alone opens, sends and discards turns. */
   wakeWord?(events: WakeWordEvents): WakeWord | undefined;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
-/** What a call needs of a wake word spotter (`WakeWordSpotter`); faked in tests. */
+/**
+ * What a spotted phrase does: `wake` opens the turn, `send` sends it and `discard` drops it, as
+ * `hey <agent>`, `over` and `scratch that` in the transcript do.
+ */
+export type SpotterRole = 'wake' | 'send' | 'discard';
+
+/** What a call needs of a phrase spotter (`WakeWordSpotter`); faked in tests. */
 export interface WakeWord {
-  readonly phrase: string;
-  readonly threshold: number;
-  /** Resolves once it can spot, rejects when its models cannot load. */
+  /** The phrase of each role it spots; once ready, only those whose model loaded. */
+  readonly phrases: Partial<Record<SpotterRole, string>>;
+  readonly thresholds: Partial<Record<SpotterRole, number>>;
+  /** Why a role's model did not load; the other roles spot. */
+  readonly failed: Partial<Record<SpotterRole, string>>;
+  /** Resolves once it can spot, rejects when none of its models can load. */
   readonly ready: Promise<void>;
-  /** Score the audio (on) or only keep it (off). */
-  listen(on: boolean): void;
+  /** Score the audio for these roles, or none: then only keep it. */
+  listen(roles: readonly SpotterRole[]): void;
   /** 16 kHz mono audio. */
   push(pcm: Int16Array): void;
   readonly summary: WakeWordStats;
@@ -2155,25 +2275,35 @@ export interface WakeWord {
 }
 
 export interface WakeWordEvents {
-  onDetect(score: number): void;
+  onDetect(role: SpotterRole, score: number): void;
   /** It stopped for good after it loaded. */
   onError(err: string): void;
 }
 
+const SPOTTER_SETTINGS: ReadonlyArray<readonly [SpotterRole, string, string | undefined]> = [
+  ['wake', 'VOICE_WAKE', DEFAULT_WAKE_MODEL],
+  ['send', 'VOICE_SEND', undefined],
+  ['discard', 'VOICE_DISCARD', undefined],
+];
+/** The settings keys `spotterSettings` reads. */
+export const SPOTTER_KEYS = SPOTTER_SETTINGS.flatMap(([, prefix]) => [`${prefix}_MODEL`, `${prefix}_THRESHOLD`]);
+
 /**
- * VOICE_WAKE_MODEL (a classifier .onnx; the bundled `hey_livekit` by default, `off` for none) and
- * VOICE_WAKE_THRESHOLD (0-1; the bundled model's documented 0.68 by default, 0.5 for another model).
+ * The phrases to spot, one classifier .onnx (livekit-wakeword's format) per role:
+ * VOICE_WAKE_MODEL (the bundled `hey_livekit` by default), VOICE_SEND_MODEL and VOICE_DISCARD_MODEL
+ * (none by default); `off` for none. A relative path is from the working directory. Each one's
+ * VOICE_<ROLE>_THRESHOLD (0-1) defaults to the threshold known for its model (0.68 for the bundled
+ * one), else 0.5. None at all: no spotter.
  */
-export function wakeWordSettings(
-  env: Record<string, string | undefined>,
-): { classifier: string; threshold: number } | null {
-  const model = env.VOICE_WAKE_MODEL?.trim();
-  if (model && /^(off|none|0|false)$/i.test(model)) return null;
-  const threshold = Number(env.VOICE_WAKE_THRESHOLD?.trim() || NaN);
-  return {
-    classifier: model ? path.resolve(model) : DEFAULT_WAKE_MODEL,
-    threshold: threshold > 0 && threshold < 1 ? threshold : model ? CUSTOM_WAKE_THRESHOLD : DEFAULT_WAKE_THRESHOLD,
-  };
+export function spotterSettings(env: Record<string, string | undefined>): Array<SpotterClassifier<SpotterRole>> {
+  return SPOTTER_SETTINGS.flatMap(([name, prefix, fallback]) => {
+    const set = env[`${prefix}_MODEL`]?.trim();
+    if (set && /^(off|none|0|false)$/i.test(set)) return [];
+    const model = set ? path.resolve(set) : fallback;
+    if (!model) return [];
+    const threshold = Number(env[`${prefix}_THRESHOLD`]?.trim() || NaN);
+    return [{ name, model, threshold: threshold > 0 && threshold < 1 ? threshold : defaultThreshold(model) }];
+  });
 }
 
 /** Settings from the working directory's .env; WEBHOOK_PORT from the environment wins, as on the host. */
@@ -2681,15 +2811,15 @@ function defaultDeps(): RunCallDeps {
     'LIVEKIT_HOST_URL',
     'VOICE_RECORDINGS_DAYS',
     'VOICE_MAX_SPOKEN_CHARS',
-    'VOICE_WAKE_MODEL',
-    'VOICE_WAKE_THRESHOLD',
+    ...SPOTTER_KEYS,
   ]);
-  const wake = wakeWordSettings(env);
+  const classifiers = spotterSettings(env);
   return {
     env,
     createVoice: (ctx, meta, settings, events) => sessionVoice(ctx as JobContext, meta, settings, events),
     markUpdating: (ctx) => setAttribute(ctx, CALL_UPDATING_ATTRIBUTE, '1'),
-    wakeWord: (events) => (wake ? new WakeWordSpotter({ ...wake, ...events }) : undefined),
+    wakeWord: (events) =>
+      classifiers.length > 0 ? new WakeWordSpotter<SpotterRole>({ classifiers, ...events }) : undefined,
     log: workerLog(agentsLog()),
   };
 }
@@ -3008,9 +3138,15 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         },
         onAudio: (frame) => {
           if (!wakeWord || frame.sampleRate !== WAKE_SAMPLE_RATE || frame.channels !== 1) return;
-          // Scored only while it can open a turn: waiting in auto, and not under the agent's speech
-          // (the transcription hears silence then).
-          wakeWord.listen(commands.spotting && !agentSpeaking && !review?.reviewing);
+          // Scored only while a phrase can act: the wake phrase while waiting in auto, the commands
+          // while its turn is open, and never under the agent's speech (the transcription hears
+          // silence then) or in review.
+          const roles: SpotterRole[] = [];
+          if (!agentSpeaking && !review?.reviewing) {
+            if (commands.spotting) roles.push('wake');
+            if (commands.listensForCommands) roles.push('send', 'discard');
+          }
+          wakeWord.listen(roles);
           wakeWord.push(frame.data);
         },
       },
@@ -3022,9 +3158,12 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   if (!ending) {
     try {
       spotter = deps.wakeWord?.({
-        onDetect: (score) => {
-          callLog.info('voice worker: wake word spotted', { score: Math.round(score * 1000) / 1000 });
-          if (!ending && !review?.reviewing) commands.onWakeWord();
+        onDetect: (role, score) => {
+          callLog.info('voice worker: phrase spotted', { role, score: Math.round(score * 1000) / 1000 });
+          if (ending || review?.reviewing) return;
+          if (role === 'wake') return commands.onWakeWord();
+          const phrase = wakeWord?.phrases[role];
+          if (phrase) commands.onCommandWord(role === 'send' ? 'over' : 'discard', phrase);
         },
         onError: (err) => {
           callLog.warn('voice worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn', {
@@ -3042,8 +3181,12 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       () => {
         if (ending) return;
         wakeWord = loading;
-        commands.useWakeWord(loading.phrase);
-        callLog.info('voice worker: wake word ready', { phrase: loading.phrase, threshold: loading.threshold });
+        commands.useWakeWord(loading.phrases.wake);
+        callLog.info('voice worker: wake word ready', {
+          phrases: loading.phrases,
+          thresholds: loading.thresholds,
+          ...(Object.keys(loading.failed).length > 0 ? { failed: loading.failed } : {}),
+        });
       },
       (err: unknown) => {
         // A call that ended while the models loaded closed the spotter: nothing failed.
