@@ -12,6 +12,7 @@ import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js
 import { createVoiceAdapter, lineIdForToken, type VoiceChannelAdapter, type VoiceConfig } from './voice.js';
 import {
   liveKitChatDelivered,
+  liveKitChatPresentation,
   liveKitChatTyping,
   parseLiveKitUtteranceId,
   pickMirrorTarget,
@@ -1134,9 +1135,7 @@ describe('livekit call talking in the agent chat', () => {
       livekit: { callId: worker.meta.callId, utteranceId: id },
     });
     await vi.waitFor(() =>
-      expect(posts).toEqual([
-        { instance: 'telegram', platformId: 'telegram:100', text: '🎙 Ethan: Book a table for two' },
-      ]),
+      expect(posts).toEqual([{ instance: 'telegram', platformId: 'telegram:100', text: '🎙 Book a table for two' }]),
     );
 
     // The agent answers in the chat; the host speaks what reached it, and only there.
@@ -1183,16 +1182,160 @@ describe('livekit call talking in the agent chat', () => {
     // In the session, the turn's id carries the agent's scope; delivery hands it over like that.
     reply('Booked.', `livekit:${worker.meta.callId}:${id}:ag-andy`);
     reply('The dentist called.', null);
+    // An answer to a turn of another call is that call's: never spoken into this one.
     reply('About the last call.', 'livekit:another-call:1:ag-andy');
     reply('About what you typed.', 'tg-555:ag-andy');
     await worker.waitFor((e) => e.type === 'reply' && e.text === 'About what you typed.');
     expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
       { type: 'reply', text: 'Booked.', turn: id },
       { type: 'reply', text: 'The dentist called.', turn: null },
-      { type: 'reply', text: 'About the last call.', turn: null },
       { type: 'reply', text: 'About what you typed.', turn: null },
     ]);
     worker.close();
+  });
+
+  describe('the chat copy of a reply the call speaks', () => {
+    const SPEAKER = '\u{1F50A} ';
+    /** What the delivery seam asks just before the adapter sends a message to a chat. */
+    const present = (
+      content: Record<string, unknown>,
+      to: { platformId?: string; threadId?: string | null; inReplyTo?: string | null; kind?: string; id?: string } = {},
+      agentGroupId = 'ag-andy',
+    ) =>
+      liveKitChatPresentation(
+        {
+          id: to.id ?? 'out-1',
+          kind: to.kind ?? 'chat',
+          channelType: 'telegram',
+          platformId: to.platformId ?? 'telegram:100',
+          threadId: to.threadId ?? null,
+          inReplyTo: to.inReplyTo ?? null,
+        },
+        Object.freeze({ ...content }),
+        agentGroupId,
+      );
+
+    it('shows the caller turn without the caller name, while the agent still gets it from the caller', async () => {
+      const { posts } = await start([{ platform_id: 'telegram:100' }]);
+      const { worker } = await startCall(h);
+      await worker.utter('Book a table');
+      await vi.waitFor(() => expect(posts).toHaveLength(1));
+      expect(posts[0].text).toBe('\u{1F399} Book a table');
+      expect(posts[0].text).not.toContain('Ethan');
+      expect(JSON.parse(h.events[0].message.content)).toMatchObject({ sender: 'Ethan', senderId: LINE });
+      worker.close();
+    });
+
+    it('marks a reply the live call speaks once, and keeps the stored, hooked and spoken text original', async () => {
+      const { posts } = await start([{ platform_id: 'telegram:100' }]);
+      expect(present({ text: 'Before any call.' })).toBeNull();
+      const { worker } = await startCall(h);
+      const id = await worker.utter('Book a table');
+      const turn = `livekit:${worker.meta.callId}:${id}:ag-andy`;
+      const original = { text: 'Booked for **eight**.', extra: 1 };
+      const shown = present(original, { inReplyTo: turn });
+      expect(shown).toEqual({ text: `${SPEAKER}Booked for **eight**.`, extra: 1 });
+      expect(original.text).toBe('Booked for **eight**.');
+      // Each attempt starts from the original, so a retry is marked once too; an icon the agent wrote stays.
+      expect(present(original, { inReplyTo: turn })).toEqual(shown);
+      expect(present({ text: `${SPEAKER}Loud.` })).toEqual({ text: `${SPEAKER}${SPEAKER}Loud.` });
+      expect(present({ text: 'Unprompted.' })).toEqual({ text: `${SPEAKER}Unprompted.` });
+
+      // The post-delivery tap gets the stored content: the call speaks it unmarked, once.
+      liveKitChatDelivered(
+        {
+          id: 'out-1',
+          kind: 'chat',
+          content: JSON.stringify(original),
+          channelType: 'telegram',
+          platformId: 'telegram:100',
+          threadId: null,
+          inReplyTo: turn,
+        },
+        'ag-andy',
+      );
+      await worker.waitFor((e) => e.type === 'reply');
+      await settle();
+      expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
+        { type: 'reply', text: 'Booked for **eight**.', turn: id },
+      ]);
+      // Marking posts nothing of its own: the chat has only the caller turn.
+      expect(posts).toHaveLength(1);
+      worker.close();
+    });
+
+    it('marks nothing the call would not speak: other chats, threads, agents, calls, non-text', async () => {
+      await start([{ platform_id: 'telegram:100' }]);
+      const { worker } = await startCall(h);
+      await settle();
+      expect(present({ text: 'Another chat.' }, { platformId: 'telegram:200' })).toBeNull();
+      expect(present({ text: 'Other thread.' }, { threadId: 'th-2' })).toBeNull();
+      expect(present({ text: 'Another agent.' }, {}, 'ag-other')).toBeNull();
+      expect(present({ text: 'Old call.' }, { inReplyTo: 'livekit:another-call:1:ag-andy' })).toBeNull();
+      expect(present({ text: 'x', operation: 'edit', messageId: 'a' })).toBeNull();
+      expect(present({ operation: 'reaction', messageId: 'a', emoji: 'ok' })).toBeNull();
+      expect(present({ type: 'ask_question', text: 'pick' })).toBeNull();
+      expect(present({ text: 'status' }, { id: 'hcmd-reply-1' })).toBeNull();
+      expect(present({ text: 'x' }, { kind: 'system' })).toBeNull();
+      expect(present({ text: '   ' })).toBeNull();
+      expect(present({ files: ['a.png'] })).toBeNull();
+      worker.close();
+    });
+
+    it('marks nothing once the call ended', async () => {
+      await start([{ platform_id: 'telegram:100' }]);
+      const { call, worker } = await startCall(h);
+      await settle();
+      expect(present({ text: 'Live.' })).toEqual({ text: `${SPEAKER}Live.` });
+      expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: call.callId })).status).toBe(204);
+      await worker.streamClosed;
+      expect(present({ text: 'After.' })).toBeNull();
+    });
+
+    it('neither marks nor speaks a reply to the call this one replaced', async () => {
+      await start([{ platform_id: 'telegram:100' }]);
+      const first = await startCall(h);
+      const oldTurn = `livekit:${first.worker.meta.callId}:${await first.worker.utter('old question')}:ag-andy`;
+      const second = await startCall(h);
+      await settle();
+      expect(present({ text: 'Stale answer.' }, { inReplyTo: oldTurn })).toBeNull();
+      liveKitChatDelivered(
+        {
+          id: 'out-stale',
+          kind: 'chat',
+          content: JSON.stringify({ text: 'Stale answer.' }),
+          channelType: 'telegram',
+          platformId: 'telegram:100',
+          threadId: null,
+          inReplyTo: oldTurn,
+        },
+        'ag-andy',
+      );
+      // The new call still speaks and marks what is not tied to the old one.
+      expect(present({ text: 'Fresh.' })).toEqual({ text: `${SPEAKER}Fresh.` });
+      delivered('telegram:100', 'Fresh.');
+      await second.worker.waitFor((e) => e.type === 'reply');
+      await settle();
+      expect(second.worker.events.filter((e) => e.type === 'reply')).toEqual([
+        { type: 'reply', text: 'Fresh.', turn: null },
+      ]);
+      first.worker.close();
+      second.worker.close();
+    });
+
+    it('marks a reply in the chat a mid-call /voice left while that chat is still spoken', async () => {
+      const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
+      const fake = await start([{ platform_id: 'telegram:100' }, topic], 'telegram', { admins: ['telegram:42'] });
+      const { worker } = await startCall(h);
+      await worker.utter('one');
+      fake.state.bound = { group: topic, threadId: null, ownerIds: ['telegram:42'] };
+      await worker.utter('two');
+      expect(present({ text: 'Answer to one.' })).toEqual({ text: `${SPEAKER}Answer to one.` });
+      expect(present({ text: 'Answer to two.' }, { platformId: 'telegram:-300:7' })).toEqual({
+        text: `${SPEAKER}Answer to two.`,
+      });
+      worker.close();
+    });
   });
 
   it('names an unnamed direct chat by its channel for the page header', async () => {
@@ -1213,7 +1356,7 @@ describe('livekit call talking in the agent chat', () => {
     expect(JSON.parse(h.events[0].message.content)).toMatchObject({ sender: 'Ethan', senderId: LINE });
     await vi.waitFor(() =>
       expect(posts).toEqual([
-        { instance: 'telegram', platformId: 'telegram:-300:7', threadId: 'th-1', text: '🎙 Ethan: hello' },
+        { instance: 'telegram', platformId: 'telegram:-300:7', threadId: 'th-1', text: '🎙 hello' },
       ]),
     );
     delivered('telegram:-300:7', 'In the thread.', 'th-1');
@@ -1340,7 +1483,7 @@ describe('livekit call talking in the agent chat', () => {
     h.routing.mode = 'store';
     await worker.utter('kept words');
     await vi.waitFor(() =>
-      expect(posts).toEqual([{ instance: 'telegram', platformId: 'telegram:100', text: '🎙 Ethan: kept words' }]),
+      expect(posts).toEqual([{ instance: 'telegram', platformId: 'telegram:100', text: '🎙 kept words' }]),
     );
     worker.close();
   });

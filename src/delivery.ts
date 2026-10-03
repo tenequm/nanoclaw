@@ -763,7 +763,18 @@ async function deliverMessage(
     msg.platformId,
     msg.threadId,
     msg.kind,
-    outboundContent,
+    presentOutbound(
+      {
+        id: msg.id,
+        kind: msg.kind,
+        channelType: msg.channelType,
+        platformId: msg.platformId,
+        threadId: msg.threadId,
+        inReplyTo: msg.inReplyTo,
+      },
+      outboundContent,
+      session,
+    ),
     files,
     deliverInstance,
     msg.inReplyTo ? platformMessageId(msg.inReplyTo, session.agent_group_id) : undefined,
@@ -783,6 +794,50 @@ async function deliverMessage(
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
   return platformMsgId;
+}
+
+/**
+ * Outbound presentation: how the platform shows a message, never what it is.
+ *
+ * One optional transform a channel module may register (the voice module marks
+ * a chat reply its live call speaks). It sees a copy of the content about to go
+ * to the adapter and returns replacement content, or null for none; it must not
+ * send, store or mutate anything. The stored row, the post-delivery hooks and
+ * every retry start from the original content, so a retry is never decorated
+ * twice. A transform that throws leaves the message as it was.
+ */
+export interface OutboundAddress {
+  id: string;
+  kind: string;
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  inReplyTo: string | null;
+}
+
+export type OutboundPresentation = (
+  msg: OutboundAddress,
+  content: Readonly<Record<string, unknown>>,
+  session: Session,
+) => Record<string, unknown> | null;
+
+let outboundPresentation: OutboundPresentation | null = null;
+
+export function setOutboundPresentation(transform: OutboundPresentation | null): void {
+  outboundPresentation = transform;
+}
+
+function presentOutbound(msg: OutboundAddress, outboundContent: string, session: Session): string {
+  if (!outboundPresentation) return outboundContent;
+  try {
+    const content = JSON.parse(outboundContent) as unknown;
+    if (!content || typeof content !== 'object' || Array.isArray(content)) return outboundContent;
+    const presented = outboundPresentation(msg, Object.freeze(content as Record<string, unknown>), session);
+    return presented ? JSON.stringify(presented) : outboundContent;
+  } catch (err) {
+    log.warn('Outbound presentation failed; delivering the message as it is', { messageId: msg.id, err });
+    return outboundContent;
+  }
 }
 
 /**
