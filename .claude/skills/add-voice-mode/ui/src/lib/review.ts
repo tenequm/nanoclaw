@@ -5,7 +5,8 @@ import type { Phase } from "./voice-call"
  * models it is made of: the turn mode, the operation in flight, the worker's draft, the delivery
  * of the last sent draft and the agent's activity. Pure, so every state can be tested and shown
  * by the demo. The worker owns the draft (see CallReviewState in the protocol); the page only
- * shows it and asks.
+ * shows it and asks. Auto mode's spoken commands (`over`, the discard phrases, the wake switch)
+ * ride on the same state, see `autoListening`.
  */
 
 export type TurnMode = "auto" | "review"
@@ -28,6 +29,8 @@ export interface ReviewSnapshot {
   draft: Draft | null
   /** The worker's transcription restarted after a draft and takes no audio yet; talk waits for it. */
   preparing?: boolean
+  /** Auto mode's wake switch as the worker runs it: `waiting` until it hears `hey <agent>`. */
+  wake?: { on: boolean; pauseSends: boolean; waiting: boolean }
 }
 
 export function isReviewSnapshot(v: unknown): v is ReviewSnapshot {
@@ -58,6 +61,14 @@ export interface ReviewState {
   ended?: boolean
   /** The worker's transcription is getting ready after a draft (ReviewSnapshot.preparing). */
   preparing?: boolean
+  /** The worker understands spoken commands (before a call: assumed). */
+  commands: boolean
+  /** The caller's wake switch: in auto nothing is sent until `hey <agent>`. Kept for the next call. */
+  wake: boolean
+  /** With the wake switch: a pause sends too after the wake phrase, not only `over`. */
+  pauseSends: boolean
+  /** The worker waits for the wake phrase right now. */
+  awaitingWake: boolean
 }
 
 export const INITIAL_REVIEW: ReviewState = {
@@ -70,6 +81,10 @@ export const INITIAL_REVIEW: ReviewState = {
   micError: null,
   note: null,
   delivery: null,
+  commands: true,
+  wake: false,
+  pauseSends: false,
+  awaitingWake: false,
 }
 
 /** What a key does when pressed. */
@@ -334,4 +349,28 @@ export function refusalNote(error: string | undefined, agentName: string): strin
   if (error === "draft_open") return BLOCKED.sendable
   if (error === "agent_speaking") return `Tap talk when ${agentName} finishes.`
   return null
+}
+
+export interface ListeningView {
+  chip: string
+  hint: string
+  /** The transcript's line while it is empty. */
+  empty: string
+}
+
+/**
+ * Auto mode's readout while it listens with the microphone on: what sends a turn, and with the wake
+ * switch on, the phrase that opens one. A worker without spoken commands keeps the plain pause copy.
+ */
+export function autoListening({ agentName, silenceMs, review }: { agentName: string; silenceMs: number | null; review: ReviewState }): ListeningView {
+  const pause = silenceMs ? `pause about ${+(silenceMs / 1000).toFixed(1)} s` : "pause"
+  if (!review.commands) return { chip: "Listening", hint: silenceMs ? `Go ahead. Pause about ${+(silenceMs / 1000).toFixed(1)} s to send.` : "Go ahead. A pause sends what you said.", empty: "Speak when ready." }
+  const wakePhrase = `"hey ${agentName}"`
+  if (!review.wake) return { chip: "Listening", hint: `Go ahead. ${pause[0].toUpperCase()}${pause.slice(1)} or say "over" to send.`, empty: "Speak when ready." }
+  if (review.awaitingWake) return { chip: `Say ${wakePhrase}`, hint: `Nothing is sent until you say ${wakePhrase}.`, empty: `Say ${wakePhrase} to start.` }
+  return {
+    chip: "Listening",
+    hint: review.pauseSends ? `Say "over" or ${pause} to send.` : `Say "over" to send - pauses don't.`,
+    empty: "Speak when ready.",
+  }
 }

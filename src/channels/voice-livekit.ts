@@ -775,6 +775,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       callerName: line.caller.name,
       callerIdentity: call.callerIdentity,
       vocabulary: [...(line.agent.vocabulary ?? [])],
+      ...(line.agent.wakeNames?.length ? { wakeNames: [...line.agent.wakeNames] } : {}),
       ...speech,
       maxDurationMs: capMs,
       joinTimeoutMs,

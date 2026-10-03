@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
 import { LIVE_PHASES, type ErrorKind, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
-import { keyIdentity, reviewView, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
+import { autoListening, keyIdentity, reviewView, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
@@ -99,7 +99,7 @@ const ERROR_HINT: Record<ErrorKind, string> = {
   other: "Try again.",
 }
 
-type LostReason = NonNullable<TurnMark["reason"]>
+type LostReason = Exclude<NonNullable<TurnMark["reason"]>, "discarded" | "unaddressed">
 
 const LOST_REASON: Record<LostReason, string> = {
   stt: "couldn’t transcribe",
@@ -120,9 +120,10 @@ const LOST_NOTICE: Record<LostReason, string> = {
 
 function markLabel(mark: TurnMark): string {
   if (mark.status === "sent" || mark.status === "sending") return mark.status
+  if (mark.status === "dropped") return mark.reason === "unaddressed" ? "ignored · no wake phrase" : "discarded"
   if (mark.reason === "timeout") return LOST_REASON.timeout
   // A newer worker may send a reason this page does not know yet.
-  const why = mark.reason && LOST_REASON[mark.reason]
+  const why = mark.reason && LOST_REASON[mark.reason as LostReason]
   return why ? `not sent · ${why}` : "not sent"
 }
 
@@ -339,7 +340,7 @@ const TranscriptLine = memo(function TranscriptLine({
 }) {
   const lost = mark?.status === "lost"
   return (
-    <Message from={from} className={`py-1.5 ${isLast ? "is-live" : "is-history"}${lost ? " has-lost" : ""}`}>
+    <Message from={from} className={`py-1.5 ${isLast ? "is-live" : "is-history"}${lost ? " has-lost" : ""}${mark?.status === "dropped" ? (mark.reason === "discarded" ? " has-dropped has-discarded" : " has-dropped") : ""}`}>
       <MessageContent className={`min-w-0 ${from === "user" ? "bubble-you" : "bubble-agent"}${isStreaming ? " is-streaming" : ""}`}>
         <span className="speaker">
           {from === "user" ? "You" : agentName}
@@ -359,6 +360,39 @@ const TranscriptLine = memo(function TranscriptLine({
   )
 })
 
+/** Auto mode's wake switch, and the pause switch that goes with it: under the mode row, in auto only. */
+function WakeRow({
+  agentName,
+  wake,
+  pauseSends,
+  disabled,
+  onWake,
+  onPauseSends,
+}: {
+  agentName: string
+  wake: boolean
+  pauseSends: boolean
+  disabled: boolean
+  onWake: (on: boolean) => void
+  onPauseSends: (on: boolean) => void
+}) {
+  const toggle = (id: string, label: string, on: boolean, off: boolean, desc: string, onClick: () => void) => (
+    <button type="button" role="switch" aria-checked={on} aria-describedby={id} className={`mode-seg${on ? " on" : ""}`} disabled={off} onClick={onClick}>
+      <i className={`led${on ? " on" : ""}`} aria-hidden="true" />
+      <span className="seg-label">{label}</span>
+      <span id={id} className="sr-only">
+        {desc}
+      </span>
+    </button>
+  )
+  return (
+    <div className="mode-row wake-row" role="group" aria-label="Spoken commands">
+      {toggle("wake-desc", `hey ${agentName}`, wake, disabled, `Nothing is sent until you say hey ${agentName}; then say over to send.`, () => onWake(!wake))}
+      {toggle("pause-sends-desc", "pause sends", wake && pauseSends, disabled || !wake, "After the wake phrase a pause sends too, not only over.", () => onPauseSends(!pauseSends))}
+    </div>
+  )
+}
+
 /** The turn mode switch: always there, above the keys. */
 function ModeRow({
   mode,
@@ -367,6 +401,7 @@ function ModeRow({
   disabled,
   note,
   onPick,
+  children,
 }: {
   mode: TurnMode
   pendingTo: TurnMode | null
@@ -374,6 +409,8 @@ function ModeRow({
   disabled: boolean
   note: string | null
   onPick: (mode: TurnMode) => void
+  /** Auto mode's own switches, under the row. */
+  children?: React.ReactNode
 }) {
   return (
     <div className="mode-wrap">
@@ -394,12 +431,13 @@ function ModeRow({
               <i className={`led${on ? " on" : ""}`} aria-hidden="true" />
               {m}
               <span id={`mode-${m}-desc`} className="sr-only">
-                {m === "auto" ? "A pause sends what you said." : "Tap talk, then read the words before you send them."}
+                {m === "auto" ? "A pause or saying over sends what you said." : "Tap talk, then read the words before you send them."}
               </span>
             </button>
           )
         })}
       </div>
+      {children}
       {note && (
         <p className="mode-note" role="status">
           {note}
@@ -471,12 +509,13 @@ export default function App() {
   const cfg = useMemo(readConfig, [])
   const params = useMemo(() => new URLSearchParams(location.search), [])
   const token = params.get("t") || ""
-  // `?demo=1` plays an auto mode call, `?demo=review` a review mode one; `&step=<n>` stops at step n.
+  // `?demo=1` plays an auto mode call, `?demo=wake` one with the wake switch, `?demo=review` a review
+  // mode one; `&step=<n>` stops at step n.
   const demoMode = params.get("demo")
-  const demo = demoMode === "1" || demoMode === "review"
+  const demo = demoMode === "1" || demoMode === "review" || demoMode === "wake"
   const demoStep = Number.parseInt(params.get("step") ?? "", 10)
   const liveKitCall = useLiveKitCall(demo ? "" : token, "your agent")
-  const demoCall = useDemoCall(demo, demoMode === "review" ? "review" : "auto", Number.isInteger(demoStep) && demoStep >= 0 ? demoStep : null)
+  const demoCall = useDemoCall(demo, demoMode === "review" || demoMode === "wake" ? demoMode : "auto", Number.isInteger(demoStep) && demoStep >= 0 ? demoStep : null)
   const call = demo ? demoCall : liveKitCall
   const { phase, lines, streamingId, agentName, elapsed, muted, error, endedText } = call
   const errorKind = call.errorKind ?? "other"
@@ -595,6 +634,8 @@ export default function App() {
     endedText && endedText !== "Call ended." ? endedText.replace(/\.$/, "").toLowerCase() : "thanks for calling"
   // Lines are caption segments from both sides, not turns, so the summary leaves a count out.
   const endedHint = `${pad(Math.floor(elapsed / 60))}:${pad(elapsed % 60)} · ${endedSummary}.`
+  // What sends a turn in auto, and the wake phrase while the worker waits for it.
+  const listening = rs ? autoListening({ agentName, silenceMs: call.silenceMs ?? null, review: rs }) : null
   const autoHint =
     phase === "error"
       ? ERROR_HINT[errorKind]
@@ -610,8 +651,8 @@ export default function App() {
                 ? "Your microphone is muted."
                 : phase === "ended"
                   ? endedHint
-                  : phase === "listening" && call.silenceMs
-                    ? `Go ahead. Pause about ${+(call.silenceMs / 1000).toFixed(1)} s to send.`
+                  : phase === "listening" && listening
+                    ? listening.hint
                     : HINT[phase]
   const hintText = reviewReadout ? rv.hint : autoHint
 
@@ -626,7 +667,7 @@ export default function App() {
           : phase === "listening"
             ? muted
               ? "Mic muted"
-              : "Listening"
+              : (listening?.chip ?? "Listening")
             : phase === "talking"
               ? `${agentName} is speaking`
               : phase === "error"
@@ -653,16 +694,27 @@ export default function App() {
       disabled={phase === "connecting" || (rv ? rv.modeDisabled : !!rc.state.pending || reconnecting)}
       note={rc.state.note}
       onPick={rc.setMode}
-    />
+    >
+      {rc.state.mode === "auto" && !rv && (
+        <WakeRow
+          agentName={agentName}
+          wake={rc.state.wake}
+          pauseSends={rc.state.pauseSends}
+          disabled={phase === "connecting" || reconnecting || !!rc.state.pending || (live && !rc.state.commands)}
+          onWake={rc.setWake}
+          onPauseSends={rc.setPauseSends}
+        />
+      )}
+    </ModeRow>
   )
   const draftPanel = rv?.panel ? <DraftPanel panel={rv.panel} /> : null
 
   // The newest delivery mark decides: a lost turn stays on screen until a later one is sent.
-  const lastMark = useMemo(() => lines.findLast((l) => l.mark)?.mark, [lines])
+  const lastMark = useMemo(() => lines.findLast((l) => l.mark && l.mark.status !== "dropped")?.mark, [lines])
   const deliveryNotice =
     lastMark?.status === "lost" ? (
       <p className="delivery-notice" role="status">
-        {`Last turn: ${(lastMark.reason && LOST_NOTICE[lastMark.reason]) || "not sent."}`}
+        {`Last turn: ${(lastMark.reason && LOST_NOTICE[lastMark.reason as LostReason]) || "not sent."}`}
       </p>
     ) : null
   const hearKey =
@@ -693,7 +745,7 @@ export default function App() {
                   : live
                   ? muted
                     ? "Unmute to speak."
-                    : "Speak when ready."
+                    : (listening?.empty ?? "Speak when ready.")
                   : phase === "ended"
                     ? "Call again to keep talking."
                     : `Press call to talk to ${agentName}.`
@@ -940,6 +992,7 @@ export default function App() {
         </div>
       </main>
       <audio ref={call.audioRef} autoPlay playsInline className="sr-only" />
+      {call.cueAudioRef && <audio ref={call.cueAudioRef} autoPlay playsInline className="sr-only" />}
     </div>
   )
 }
