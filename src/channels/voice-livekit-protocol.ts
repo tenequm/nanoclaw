@@ -106,13 +106,23 @@ export interface CallTurnStatus {
 
 /**
  * Caller words that will never be sent, on the turn topic: dropped by a spoken discard
- * (`discarded`), or heard while auto mode waits for the wake phrase (`unaddressed`). `text` is what
- * was heard, for the page to mark those caption lines. It carries no turn number, so a page that
- * does not know it ignores it.
+ * (`discarded`), heard while auto mode waits for the wake phrase (`unaddressed`), or a spoken
+ * command with nothing open to act on (`command`: a lone `send it`). `text` is what was heard, for
+ * the page to mark those caption lines. It carries no turn number, so a page that does not know it
+ * ignores it.
  */
 export interface CallDroppedSpeech {
-  dropped: 'discarded' | 'unaddressed';
+  dropped: 'discarded' | 'unaddressed' | 'command';
   text: string;
+}
+
+/**
+ * On the turn topic: the caller started speaking while the agent's line played. Speech under the
+ * agent's is not transcribed, so none of it reaches the agent; the page says so. Additive: a page
+ * that does not know it ignores it.
+ */
+export interface CallUnheardSpeech {
+  unheard: 'agent_speaking';
 }
 
 /** The host takes a caller turn of at most this many UTF-8 bytes; a longer review draft cannot be sent. */
@@ -158,10 +168,10 @@ export interface CallDraft {
 }
 
 /**
- * Auto mode's spoken commands: `over` at the end of an utterance sends the turn now, `discard turn`,
- * `discard this turn` or `scratch that` there drops it, and with the wake switch `on` nothing is kept
- * or sent until `hey <agent>`, or the worker's acoustic wake word (`CallWakeState.phrase`), is heard
- * (`waiting` until then). After the wake phrase only `over` sends, unless
+ * Auto mode's spoken commands: `send it` (or `прийом`) at the end of an utterance sends the turn
+ * now, `discard turn`, `discard this turn` or `scratch that` there drops it, and with the wake switch
+ * `on` nothing is kept or sent until `hey <agent>`, or the worker's acoustic wake word
+ * (`CallWakeState.phrase`), is heard (`waiting` until then). After the wake phrase only `send it` sends, unless
  * `pauseSends` lets the closing silence send too. The worker's participant attribute is "1" when it
  * understands them and the `settings` RPC; an older worker sets none, and its auto mode has no
  * commands.
@@ -176,6 +186,8 @@ export interface CallWakeState {
    * absent when it matches `hey <agent>` in the transcript instead.
    */
   phrase?: string;
+  /** How many times this call the wake phrase opened a turn; grows on every wake, so a page that missed the awake state still sees it. */
+  heard?: number;
 }
 
 /**
@@ -238,12 +250,13 @@ export interface ReviewReply {
  */
 export const CALL_PENDING_ATTRIBUTE = 'nanoclaw.voice.pending';
 /**
- * The worker's sound cues go out on a second audio track of this name (agents-js's
- * BackgroundAudioPlayer), apart from the agent's speech track: a page plays it like the speech, and a
- * cue never counts as the agent speaking. None plays while the agent speaks.
+ * The worker's sound cues go out on a second audio track of this name (the name agents-js's
+ * BackgroundAudioPlayer used; the worker feeds the track itself now), apart from the agent's speech
+ * track: a page plays it like the speech, and a cue never counts as the agent speaking. None plays
+ * while the agent speaks.
  */
 export const CALL_CUE_TRACK = 'background_audio';
-/** Text stream topic the worker sends one JSON `CallReplyInfo` on right before each line it speaks. */
+/** Text stream topic the worker sends one JSON `CallReplyInfo` on right before each line it speaks, and again after one it could not. */
 export const CALL_REPLY_TOPIC = 'nanoclaw.voice.reply';
 
 /**
@@ -259,6 +272,12 @@ export interface CallReplyInfo {
   notice?: boolean;
   part?: number;
   more?: boolean;
+  /**
+   * Sent after the line, with the same `reply`: it could not be synthesized (the speech model
+   * failed), so nothing was heard; `text` is what it would have said, for the page to show.
+   */
+  unspoken?: true;
+  text?: string;
 }
 
 /**
