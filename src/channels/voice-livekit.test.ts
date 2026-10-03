@@ -416,6 +416,15 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect((await fetch(`${h.base}/info?t=tok123`)).status).toBe(403);
   });
 
+  it("tells the page the worker's wake phrase before the call: the model's, or null for hey <agent>", async () => {
+    for (const wakePhrase of ['hey livekit', null]) {
+      await h.stop();
+      h = await startHarness({ wakePhrase });
+      const info = await (await fetch(`${h.base}/info?t=tok123`)).json();
+      expect(info).toEqual({ agent: 'Andy', caller: 'Ethan', wakePhrase });
+    }
+  });
+
   it('serves no other page or route under either prefix', async () => {
     for (const path of ['/voice/call', '/webhook/voice/call', '/voice/sip', '/voicemail']) {
       expect((await fetch(`${h.hostUrl}${path}?t=tok123`)).status).toBe(404);

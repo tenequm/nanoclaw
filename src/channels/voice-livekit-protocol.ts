@@ -4,6 +4,7 @@
  * imports it, and must not load the host's database and channel modules.
  */
 import { createHmac } from 'node:crypto';
+import path from 'node:path';
 
 export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice';
 
@@ -200,6 +201,22 @@ export interface CallWakeState {
    * the phrase, and the caption line it was heard on is the phrase alone, never part of the turn.
    */
   cut?: boolean;
+}
+
+/**
+ * The phrase VOICE_WAKE_MODEL makes the worker listen for, as its wake word spotter names it: the
+ * classifier's file name (`hey_livekit.onnx`, the bundled default, says `hey livekit`); null when
+ * it is `off`, and `hey <agent>` in the transcript opens a turn. The host tells the page before a
+ * call; during one the worker's CallWakeState.phrase wins (a model that fails to load has none).
+ */
+export function wakeWordPhrase(env: { VOICE_WAKE_MODEL?: string }): string | null {
+  const model = env.VOICE_WAKE_MODEL?.trim();
+  if (model && /^(off|none|0|false)$/i.test(model)) return null;
+  return (model ? path.basename(model) : 'hey_livekit.onnx')
+    .replace(/(\.int8)?\.onnx$/i, '')
+    .replace(/[_-]v\d+(\.\d+)*$/i, '')
+    .replace(/[_-]+/g, ' ')
+    .trim();
 }
 
 /**

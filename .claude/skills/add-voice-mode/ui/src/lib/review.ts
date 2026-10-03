@@ -443,6 +443,17 @@ export interface ListeningView {
   empty: string
 }
 
+/**
+ * The wake phrase in the host's line info, which it knows before the call: a phrase, null for
+ * `hey <agent>`, undefined when it does not say (an older host).
+ */
+export function infoWakePhrase(info: unknown): string | null | undefined {
+  if (!info || typeof info !== "object" || !("wakePhrase" in info)) return undefined
+  const phrase = info.wakePhrase
+  if (phrase === null) return null
+  return typeof phrase === "string" && phrase.trim() ? phrase.trim() : undefined
+}
+
 /** The phrase that opens a turn with the wake switch on. */
 export function wakePhraseOf(review: ReviewState, agentName: string): string {
   return review.wakePhrase ?? `hey ${agentName}`

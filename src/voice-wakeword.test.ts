@@ -14,6 +14,7 @@ import {
   pcmToFloat,
   wakePhraseOf,
 } from './voice-wakeword.js';
+import { wakeWordPhrase } from './channels/voice-livekit-protocol.js';
 
 const FIXTURES = fileURLToPath(new URL('./voice-wakeword-fixtures/', import.meta.url));
 
@@ -128,6 +129,19 @@ describe('WakeWordSpotter', () => {
     expect(wakePhraseOf(DEFAULT_WAKE_MODEL)).toBe('hey livekit');
     expect(wakePhraseOf('/models/hey_jarvis.int8.onnx')).toBe('hey jarvis');
     expect(wakePhraseOf('hey_jarvis_v0.1.onnx')).toBe('hey jarvis');
+  });
+
+  it("the host's phrase for VOICE_WAKE_MODEL is the one the spotter names", () => {
+    expect(wakeWordPhrase({})).toBe(wakePhraseOf(DEFAULT_WAKE_MODEL));
+    for (const model of [
+      '/models/hey_jarvis.int8.onnx',
+      'hey_jarvis_v0.1.onnx',
+      'assets/voice-commands/hey_dan.onnx',
+    ]) {
+      expect(wakeWordPhrase({ VOICE_WAKE_MODEL: ` ${model} ` })).toBe(wakePhraseOf(model));
+    }
+    expect(wakeWordPhrase({ VOICE_WAKE_MODEL: 'assets/voice-commands/hey_dan.onnx' })).toBe('hey dan');
+    for (const off of ['off', 'None', '0', 'false']) expect(wakeWordPhrase({ VOICE_WAKE_MODEL: off })).toBeNull();
   });
 
   it('spots the wake word once in a worker thread, and only while listening', async () => {

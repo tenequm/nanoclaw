@@ -27,7 +27,7 @@ import {
   type TurnMark,
   type VoiceCall,
 } from "./voice-call"
-import { COMMANDS_VERSION, INITIAL_REVIEW, autoBlock, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, storeWakePhrase, storedWakePhrase, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSION, INITIAL_REVIEW, autoBlock, infoWakePhrase, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, storeWakePhrase, storedWakePhrase, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -429,7 +429,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
 
   const secondsIn = () => Math.max(0, Math.floor((Date.now() - (startedAt.current || Date.now())) / 1000))
 
-  // Who answers this line, so the page can greet by name before the call.
+  // Who answers this line and the wake phrase its worker listens for, so the page names both before the call.
   useEffect(() => {
     if (!token) return
     const ctl = new AbortController()
@@ -437,10 +437,15 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       .then((r) => (r.ok ? r.json() : null))
       .then((j: { agent?: unknown } | null) => {
         if (j && typeof j.agent === "string" && j.agent.trim()) setAgentName(j.agent.trim())
+        const wakePhrase = infoWakePhrase(j)
+        // The worker's own phrase, once it has said one, is what this call runs.
+        if (wakePhrase === undefined || workerWake.current) return
+        storeWakePhrase(wakePhrase)
+        updateReview((r) => ({ ...r, wakePhrase }))
       })
       .catch(() => {})
     return () => ctl.abort()
-  }, [token])
+  }, [token, updateReview])
 
   const endOnServer = useCallback(
     (a: Attempt | null, beacon: boolean, reason?: string) => {

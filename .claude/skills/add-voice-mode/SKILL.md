@@ -829,7 +829,9 @@ audio, not the transcript: while it waits, the worker scores the caller's audio
 with a wake word model (`VOICE_WAKE_MODEL`, by default livekit-wakeword's
 `hey livekit`, in a worker thread, 2 s windows every 80 ms), a score at or over
 `VOICE_WAKE_THRESHOLD` opens the turn (at most once in 2 s), and the switch and
-chip name that phrase (`say "hey livekit"`) instead of `hey <agent>`. The
+chip name that phrase (`say "hey livekit"`) instead of `hey <agent>` (the host reads
+`VOICE_WAKE_MODEL` too and tells the page before the call; the worker's own wins once
+it runs). The
 transcription restarts right after the window that had the phrase and first hears
 again the audio since then (a 10 s replay of its input), so no transcript of the turn
 has the phrase and no word after it is lost; the page shows the phrase's own caption,

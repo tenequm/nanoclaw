@@ -38,6 +38,8 @@ interface ReviewLib {
   autoBlock(review: ReviewState): string | null;
   refusalNote(error: string | undefined, agent: string): string | null;
   isReviewSnapshot(v: unknown): boolean;
+  infoWakePhrase(info: unknown): string | null | undefined;
+  wakePhraseOf(review: ReviewState, agent: string): string;
   keyIdentity(action: string | null, draftId?: number): string;
   autoListening(input: { agentName: string; review: ReviewState }): {
     chip: string;
@@ -277,6 +279,20 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(lib.isReviewSnapshot({ seq: 2, mode: 'auto', draft: { id: 1, state: 'ready', text: 'x' } })).toBe(true);
     expect(lib.isReviewSnapshot({ seq: 1, mode: 'walkie', draft: null })).toBe(false);
     expect(lib.isReviewSnapshot({ mode: 'review', draft: null })).toBe(false);
+  });
+
+  it("names the host's wake phrase before the call, hey <agent> when it has none or does not say", () => {
+    const named = (info: unknown) =>
+      lib.wakePhraseOf({ ...lib.INITIAL_REVIEW, wakePhrase: lib.infoWakePhrase(info) ?? null }, 'Concierge');
+    expect(lib.infoWakePhrase({ agent: 'Concierge', wakePhrase: 'hey livekit' })).toBe('hey livekit');
+    expect(named({ agent: 'Concierge', wakePhrase: 'hey livekit' })).toBe('hey livekit');
+    expect(named({ agent: 'Concierge', wakePhrase: 'hey dan' })).toBe('hey dan');
+    expect(lib.infoWakePhrase({ agent: 'Concierge', wakePhrase: null })).toBeNull();
+    expect(named({ agent: 'Concierge', wakePhrase: null })).toBe('hey Concierge');
+    // An older host, or a broken answer: undefined, so the page keeps what it had.
+    for (const info of [null, 'x', { agent: 'Concierge' }, { wakePhrase: 3 }, { wakePhrase: ' ' }]) {
+      expect(lib.infoWakePhrase(info)).toBeUndefined();
+    }
   });
 
   it("auto's readout: send it or a pause sends, and with the wake switch the phrase that opens a turn", () => {
