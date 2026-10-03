@@ -43,6 +43,11 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** Spelling hints for the transcription: VOICE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
+  /**
+   * The agent's own voice.vocabulary.txt entries: besides `agentName`, the names the wake phrase
+   * `hey <agent>` takes (another script or spelling of it, say). Absent when the file has none.
+   */
+  wakeNames?: string[];
   sttModel: string;
   /** Takes over while `sttModel` fails; empty for none. */
   sttFallbackModel: string;
@@ -63,7 +68,10 @@ export interface LiveKitJobMetadata {
 export const CALL_THINKING_ATTRIBUTE = 'nanoclaw.voice.thinking';
 /** The worker's participant attribute: "1" when it cannot serve this host's protocol version. */
 export const CALL_UPDATING_ATTRIBUTE = 'nanoclaw.voice.updating';
-/** Text stream topic the worker sends JSON `CallTurnStatus` messages on, per caller turn. */
+/**
+ * Text stream topic the worker sends JSON `CallTurnStatus` messages on, per caller turn, and a
+ * `CallDroppedSpeech` for caller words it will never send.
+ */
 export const CALL_TURN_TOPIC = 'nanoclaw.voice.turn';
 
 /**
@@ -96,6 +104,17 @@ export interface CallTurnStatus {
   draft?: number;
 }
 
+/**
+ * Caller words that will never be sent, on the turn topic: dropped by a spoken discard
+ * (`discarded`), or heard while auto mode waits for the wake phrase (`unaddressed`). `text` is what
+ * was heard, for the page to mark those caption lines. It carries no turn number, so a page that
+ * does not know it ignores it.
+ */
+export interface CallDroppedSpeech {
+  dropped: 'discarded' | 'unaddressed';
+  text: string;
+}
+
 /** The host takes a caller turn of at most this many UTF-8 bytes; a longer review draft cannot be sent. */
 export const MAX_TURN_TEXT_BYTES = 8 * 1024;
 
@@ -116,6 +135,8 @@ export const REVIEW_RPC = {
   done: 'nanoclaw.voice.done',
   send: 'nanoclaw.voice.send',
   discard: 'nanoclaw.voice.discard',
+  /** Auto mode's spoken-command settings and the cue switch (`ReviewRequest.wake`, `.pauseSends`, `.cues`). */
+  settings: 'nanoclaw.voice.settings',
 } as const;
 export type ReviewOp = keyof typeof REVIEW_RPC;
 
@@ -137,6 +158,21 @@ export interface CallDraft {
 }
 
 /**
+ * Auto mode's spoken commands: `over` at the end of an utterance sends the turn now, `discard turn`,
+ * `discard this turn` or `scratch that` there drops it, and with the wake switch `on` nothing is kept
+ * or sent until `hey <agent>` (`waiting` until then). After the wake phrase only `over` sends, unless
+ * `pauseSends` lets the closing silence send too. The worker's participant attribute is "1" when it
+ * understands them and the `settings` RPC; an older worker sets none, and its auto mode has no
+ * commands.
+ */
+export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice.commands';
+export interface CallWakeState {
+  on: boolean;
+  pauseSends: boolean;
+  waiting: boolean;
+}
+
+/**
  * The worker's review state; `seq` grows with every change, so the page keeps the newest.
  * `preparing`: a draft froze or was discarded, which restarts the transcription, and the restarted
  * stream takes no audio yet; talk answers once it does (at most a few seconds), so the page keeps
@@ -147,6 +183,8 @@ export interface CallReviewState {
   mode: TurnMode;
   draft: CallDraft | null;
   preparing?: true;
+  /** Auto mode's wake switch, from a worker that understands spoken commands. */
+  wake?: CallWakeState;
 }
 
 /** `gen` is the page's own operation counter, echoed back; `draft` names the draft an operation is for. */
@@ -157,6 +195,10 @@ export interface ReviewRequest {
   mode?: TurnMode;
   /** With `mode`: the newest worker turn number the page had seen, to hear of a turn sent meanwhile. */
   afterTurn?: number;
+  /** For `settings`: the wake switch, whether a pause sends after the wake phrase, and the sound cues. */
+  wake?: boolean;
+  pauseSends?: boolean;
+  cues?: boolean;
 }
 
 /**
@@ -189,6 +231,12 @@ export interface ReviewReply {
  * speech resumed, the turn went out or was dropped, or the agent speaks.
  */
 export const CALL_PENDING_ATTRIBUTE = 'nanoclaw.voice.pending';
+/**
+ * The worker's sound cues go out on a second audio track of this name (agents-js's
+ * BackgroundAudioPlayer), apart from the agent's speech track: a page plays it like the speech, and a
+ * cue never counts as the agent speaking. None plays while the agent speaks.
+ */
+export const CALL_CUE_TRACK = 'background_audio';
 /** Text stream topic the worker sends one JSON `CallReplyInfo` on right before each line it speaks. */
 export const CALL_REPLY_TOPIC = 'nanoclaw.voice.reply';
 

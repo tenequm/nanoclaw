@@ -57,6 +57,14 @@ import {
   TurnCapture,
   TurnTaking,
   callSession,
+  cueFrames,
+  matchCommand,
+  matchWake,
+  READY_CUE_WAIT_MS,
+  SpokenCommands,
+  TURN_CUE_DELAY_MS,
+  wakeNameWords,
+  type CueKind,
   CLEAR_SETTLE_MS,
   FLUSH_QUIET_MS,
   FLUSH_TIMEOUT_MS,
@@ -1938,5 +1946,460 @@ describe('review mode in the session', () => {
     } finally {
       opened.mockRestore();
     }
+  });
+});
+
+describe('spoken command matching', () => {
+  it('finds a command only at the end of an utterance, with what was said before it', () => {
+    expect(matchCommand('Book a table for two. Over.')).toEqual({ command: 'over', rest: 'Book a table for two.' });
+    expect(matchCommand('book a table, over')).toEqual({ command: 'over', rest: 'book a table' });
+    expect(matchCommand('OVER!')).toEqual({ command: 'over', rest: '' });
+    // The transcription may write it in Cyrillic.
+    expect(matchCommand('Забронюй столик. Овер.')).toEqual({ command: 'over', rest: 'Забронюй столик.' });
+    // Mid-sentence it is a word, and so is a longer word ending in it.
+    expect(matchCommand("Let's start over with the plan")).toBeNull();
+    expect(matchCommand('It is all over the news, moreover')).toBeNull();
+    expect(matchCommand('Takeover')).toBeNull();
+    // A sentence that really ends in it sends: the price of hands-free.
+    expect(matchCommand("Let's start over.")).toEqual({ command: 'over', rest: "Let's start" });
+  });
+
+  it('knows the discard phrases, longest first, and only at the end', () => {
+    expect(matchCommand('Call the plumber. Discard this turn.')).toEqual({
+      command: 'discard',
+      rest: 'Call the plumber.',
+    });
+    expect(matchCommand('call the plumber discard turn')).toEqual({ command: 'discard', rest: 'call the plumber' });
+    expect(matchCommand('No wait - scratch that!')).toEqual({ command: 'discard', rest: 'No wait' });
+    expect(matchCommand('Scratch that.')).toEqual({ command: 'discard', rest: '' });
+    expect(matchCommand('scratch that idea and call the plumber')).toBeNull();
+  });
+
+  it('finds the wake phrase by the agent name or its vocabulary spellings, across scripts and punctuation', () => {
+    const names = wakeNameWords(['Andy', 'Енді', 'Nano Claw', 'Al']);
+    const after = (text: string) => {
+      const end = matchWake(text, names);
+      return end < 0 ? null : text.slice(end);
+    };
+    expect(after('Hey, Andy. What is on today?')).toBe('. What is on today?');
+    expect(after('hey andy')).toBe('');
+    expect(after('Гей, Енді, що там?')).toBe(', що там?');
+    expect(after('Хей Енді')).toBe('');
+    // A spelling that sounds alike counts; one that sounds different does not.
+    expect(after('Хей Енди')).toBe('');
+    expect(after('hey Endy, go')).toBe(', go');
+    expect(after('Hey, and then what?')).toBeNull();
+    expect(after('Hey Andrew')).toBeNull();
+    // The name alone, or hey alone, is not the phrase.
+    expect(after('Andy, what is on today?')).toBeNull();
+    expect(after('Hey there')).toBeNull();
+    // A name of two words is the two words; the text before the phrase is not part of it.
+    expect(after('So I said hey Nano Claw, start')).toBe(', start');
+    expect(after('hey nano')).toBeNull();
+    // A name under three letters counts only as spelled.
+    expect(after('hey Al, go')).toBe(', go');
+    expect(after('hey all, go')).toBeNull();
+  });
+});
+
+function commandsHarness(names = ['Andy']) {
+  const sent: string[] = [];
+  const cues: CueKind[] = [];
+  const dropped: Array<[string, string]> = [];
+  const heard: Array<[string, boolean]> = [];
+  let cuts = 0;
+  let changes = 0;
+  const commands = new SpokenCommands(names, {
+    send: (text) => sent.push(text),
+    cue: (kind) => cues.push(kind),
+    drop: (reason, text) => dropped.push([reason, text]),
+    heard: (text, final) => heard.push([text, final]),
+    cut: () => cuts++,
+    changed: () => changes++,
+  });
+  /** One stretch of speech: the caller talks, the final arrives, then they stop. */
+  const say = (text: string) => {
+    commands.onCallerSpeaking(true);
+    commands.onCallerSpeaking(false);
+    commands.onTranscript(text, true);
+  };
+  return {
+    commands,
+    sent,
+    cues,
+    dropped,
+    heard,
+    say,
+    get cuts() {
+      return cuts;
+    },
+    get changes() {
+      return changes;
+    },
+  };
+}
+
+describe('SpokenCommands', () => {
+  it('auto as before: a pause sends the session text, unless a command cut the turn', () => {
+    const h = commandsHarness();
+    h.say('Book a table');
+    expect(h.commands.pausesSend).toBe(true);
+    expect(h.commands.onPause('Book a table')).toBe('Book a table');
+    expect(h.sent).toEqual([]);
+    expect(h.cues).toEqual([]);
+  });
+
+  it('over sends now without the word, and the pause after it sends nothing more', () => {
+    const h = commandsHarness();
+    h.say('Book a table');
+    h.say('for two. Over.');
+    expect(h.sent).toEqual(['Book a table for two.']);
+    expect(h.cues).toEqual([]);
+    // The session still holds the words; its pause commits them, and they already went.
+    expect(h.commands.onPause('Book a table for two. Over.')).toBeNull();
+    // Words after it are the next turn: the pause sends them alone.
+    h.say('And a taxi');
+    expect(h.commands.onPause('And a taxi')).toBe('And a taxi');
+  });
+
+  it('a command with nothing to act on only says nope', () => {
+    const h = commandsHarness();
+    h.say('Over.');
+    // The session commits the word on its pause: it is no turn either.
+    expect(h.commands.onPause('Over.')).toBeNull();
+    h.say('Scratch that.');
+    expect(h.commands.onPause('Scratch that.')).toBeNull();
+    expect(h.sent).toEqual([]);
+    expect(h.dropped).toEqual([]);
+    expect(h.cues).toEqual(['nope', 'nope']);
+    // The next words are a turn as usual.
+    h.say('Book a table');
+    expect(h.commands.onPause('Book a table')).toBe('Book a table');
+  });
+
+  it('start over mid-sentence sends nothing; the turn goes on its pause with every word', () => {
+    const h = commandsHarness();
+    h.say("Let's start over with the plan");
+    expect(h.sent).toEqual([]);
+    expect(h.commands.onPause("Let's start over with the plan")).toBe("Let's start over with the plan");
+  });
+
+  it('a final ending in over while the caller still talks waits: new words make it words, a pause sends it', () => {
+    const h = commandsHarness();
+    h.commands.onCallerSpeaking(true);
+    h.commands.onTranscript("We'll start over", true);
+    h.commands.onTranscript('tomorrow', false);
+    h.commands.onCallerSpeaking(false);
+    h.commands.onTranscript('tomorrow morning.', true);
+    expect(h.sent).toEqual([]);
+    expect(h.heard.filter(([, final]) => final).map(([t]) => t)).toEqual(["We'll start over", 'tomorrow morning.']);
+
+    h.commands.onPause('');
+    h.commands.onCallerSpeaking(true);
+    h.commands.onTranscript('Call the plumber, over', true);
+    expect(h.sent).toEqual([]);
+    h.commands.onCallerSpeaking(false);
+    expect(h.sent).toEqual(['Call the plumber']);
+  });
+
+  it('a discard drops the open turn: nothing is sent, now or on the pause', () => {
+    const h = commandsHarness();
+    h.say('Call the plumber');
+    h.say('no wait, scratch that.');
+    expect(h.cues).toEqual(['discard']);
+    expect(h.dropped).toEqual([['discarded', 'Call the plumber no wait, scratch that.']]);
+    expect(h.commands.onPause('Call the plumber no wait, scratch that.')).toBeNull();
+    expect(h.sent).toEqual([]);
+  });
+
+  it('with the wake switch on nothing is kept before the wake phrase, and after it only over sends', () => {
+    const h = commandsHarness(['Andy', 'Енді']);
+    h.commands.configure(true, false);
+    expect(h.commands.state).toEqual({ on: true, pauseSends: false, waiting: true });
+    expect(h.commands.pausesSend).toBe(false);
+    h.say('So what did you think of the film?');
+    expect(h.dropped).toEqual([['unaddressed', 'So what did you think of the film?']]);
+    expect(h.commands.onPause('So what did you think of the film?')).toBeNull();
+    expect(h.heard).toEqual([]);
+
+    h.say('Anyway. Хей, Енді, what is on my calendar');
+    expect(h.cues).toEqual(['wake']);
+    expect(h.commands.state.waiting).toBe(false);
+    expect(h.commands.holdsReplies).toBe(true);
+    // Pauses never send after the wake phrase.
+    expect(h.commands.onPause('Anyway. Хей, Енді, what is on my calendar')).toBeNull();
+    h.say('for tomorrow? Over.');
+    expect(h.sent).toEqual(['what is on my calendar for tomorrow?']);
+    expect(h.cues).toEqual(['wake']);
+    // Back to waiting for the wake phrase.
+    expect(h.commands.state.waiting).toBe(true);
+    h.say('and the weather, over');
+    expect(h.sent).toHaveLength(1);
+    expect(h.cues).toEqual(['wake']);
+  });
+
+  it('the wake phrase and the command can share one utterance', () => {
+    const h = commandsHarness();
+    h.commands.configure(true, false);
+    h.say('Hey Andy, call the plumber. Over.');
+    expect(h.cues).toEqual(['wake']);
+    expect(h.sent).toEqual(['call the plumber.']);
+    h.say('hey andy over');
+    expect(h.cues).toEqual(['wake', 'wake', 'nope']);
+    // Nope keeps the wake: the turn is still open.
+    expect(h.commands.state.waiting).toBe(false);
+  });
+
+  it('a discard after the wake phrase goes back to waiting, even with nothing said yet', () => {
+    const h = commandsHarness();
+    h.commands.configure(true, false);
+    h.say('Hey Andy');
+    h.say('scratch that');
+    expect(h.cues).toEqual(['wake', 'discard']);
+    expect(h.commands.state.waiting).toBe(true);
+    h.say('Hey Andy, book it');
+    h.say('discard this turn');
+    expect(h.dropped.at(-1)).toEqual(['discarded', 'book it discard this turn']);
+    expect(h.sent).toEqual([]);
+  });
+
+  it('the second switch lets the pause send after the wake phrase too', () => {
+    const h = commandsHarness();
+    h.commands.configure(true, true);
+    expect(h.commands.pausesSend).toBe(false);
+    h.say('hey Andy, book a table');
+    expect(h.commands.pausesSend).toBe(true);
+    expect(h.commands.holdsReplies).toBe(false);
+    expect(h.commands.onPause('hey Andy, book a table')).toBe('book a table');
+    expect(h.commands.state.waiting).toBe(true);
+    // A pause with nothing after the wake phrase sends nothing and keeps listening.
+    h.say('hey Andy');
+    expect(h.commands.onPause('hey Andy')).toBeNull();
+    expect(h.commands.state.waiting).toBe(false);
+  });
+
+  it('turning the switch on drops the open words; turning it off keeps what came after the wake phrase', () => {
+    const h = commandsHarness();
+    h.say('Book a table');
+    h.commands.configure(true, false);
+    expect(h.commands.onPause('Book a table')).toBeNull();
+    h.say('hey Andy, book a table');
+    h.commands.configure(false, false);
+    expect(h.commands.state).toEqual({ on: false, pauseSends: false, waiting: false });
+    expect(h.commands.onPause('hey Andy, book a table')).toBe('book a table');
+  });
+});
+
+describe('cue audio', () => {
+  it('is whole 100 ms blocks of 48 kHz mono, sounding first and silent at the end', () => {
+    for (const kind of ['listening', 'wake', 'sent', 'discard', 'turn', 'nope', 'draft'] as const) {
+      const frames = cueFrames(kind);
+      expect(frames.length).toBeGreaterThanOrEqual(2);
+      for (const f of frames) expect([f.sampleRate, f.channels, f.samplesPerChannel]).toEqual([48_000, 1, 4800]);
+      const peak = Math.max(...frames[0].data.map(Math.abs));
+      expect(peak).toBeGreaterThan(0.1 * 32767);
+      expect(peak).toBeLessThanOrEqual(0.31 * 32767);
+      expect(Math.max(...frames.at(-1)!.data.map(Math.abs))).toBe(0);
+    }
+    expect(cueFrames('sent')).toBe(cueFrames('sent'));
+  });
+});
+
+describe('spoken commands and cues in a call', () => {
+  function commandCall() {
+    const v = fakeVoice();
+    const r = fakeReviewVoice();
+    let handle!: (op: ReviewOp, payload: string, callerIdentity: string) => Promise<string>;
+    const played: CueKind[] = [];
+    const dropped: unknown[] = [];
+    Object.assign(v.voice, {
+      review: { ...r.voice, serve: (h: typeof handle) => void (handle = h) },
+      playCue: vi.fn(async (kind: CueKind) => void played.push(kind)),
+      publishDropped: vi.fn((d: unknown) => void dropped.push(d)),
+    });
+    let gen = 0;
+    const rpc = async (op: ReviewOp, fields: Partial<ReviewRequest> = {}) =>
+      JSON.parse(await handle(op, JSON.stringify({ gen: ++gen, ...fields }), 'caller-1')) as Record<string, unknown>;
+    /** One stretch of the caller's speech, as the session reports it: speaking, stopped, then the final. */
+    const say = (text: string) => {
+      v.events.onCallerSpeaking(true);
+      v.events.onCallerSpeaking(false);
+      v.events.onTranscript?.(text, true, 1);
+    };
+    return { v, r, rpc, played, dropped, say };
+  }
+  const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+
+  it('plays the listening cue once the page said it wants cues, then sent on over; none over speech', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = commandCall();
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice));
+    expect(await c.rpc('settings', { wake: false, pauseSends: false, cues: true })).toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(c.played).toEqual(['listening']));
+    expect(c.r.last.wake).toEqual({ on: false, pauseSends: false, waiting: false });
+
+    c.say('Book a table for two. Over.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table for two.']));
+    await vi.waitFor(() => expect(c.played).toEqual(['listening', 'sent']));
+    // The session's own pause commits the same words later: nothing more goes out.
+    c.v.events.onTurn('Book a table for two. Over.', { sttModel: 'gemini-3.5-transcribe-live' });
+    await flush();
+    expect(utterances(host)).toHaveLength(1);
+
+    // While the agent speaks, no cue: the caller is not heard then anyway.
+    c.v.events.onAgentSpeaking?.(true);
+    c.v.events.onTurn('Another turn', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() => expect(utterances(host)).toHaveLength(2));
+    await flush();
+    expect(c.played).toEqual(['listening', 'sent']);
+    host.endStream();
+  });
+
+  it('a spoken discard posts nothing, marks the words dropped and plays the discard cue', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = commandCall();
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice));
+    await c.rpc('settings', { cues: true });
+    c.say('Call the plumber');
+    c.say('scratch that');
+    c.v.events.onTurn('Call the plumber scratch that', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() => expect(c.played).toEqual(['listening', 'discard']));
+    expect(c.dropped).toEqual([{ dropped: 'discarded', text: 'Call the plumber scratch that' }]);
+    expect(utterances(host)).toEqual([]);
+    expect(c.v.voice.publishTurn).not.toHaveBeenCalled();
+    host.endStream();
+  });
+
+  it('wake on: speech before the wake phrase goes nowhere, over sends, a follow-up while the agent works', async () => {
+    const { ctx } = fakeJob({ ...META, wakeNames: ['Енді'] });
+    const host = fakeHostFetch();
+    const c = commandCall();
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice));
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    expect(c.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true });
+    expect(c.v.events.pausesSend?.()).toBe(false);
+
+    c.say('So that is the plan.');
+    c.v.events.onTurn('So that is the plan.', { sttModel: 'gemini-3.5-transcribe-live' });
+    // Unaddressed noise is not a lost turn either.
+    c.v.events.onTurnLost('empty', {}, { sttModel: 'gemini-3.5-transcribe-live' });
+    await flush();
+    expect(utterances(host)).toEqual([]);
+    expect(c.v.voice.publishTurn).not.toHaveBeenCalled();
+    expect(c.v.voice.say).not.toHaveBeenCalled();
+    expect(c.dropped).toEqual([{ dropped: 'unaddressed', text: 'So that is the plan.' }]);
+
+    c.say('Гей Енді, book a table');
+    expect(c.r.last.wake?.waiting).toBe(false);
+    c.v.events.onTurn('Гей Енді, book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    c.say('for two, over');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['book a table for two']));
+    expect(c.r.last.wake?.waiting).toBe(true);
+
+    // The agent works on it; a follow-up goes out as its own turn.
+    host.emit({ type: 'thinking' });
+    c.say('Hey Andy, and a taxi. Over.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['book a table for two', 'and a taxi.']));
+    await vi.waitFor(() => expect(c.played).toEqual(['listening', 'wake', 'sent', 'wake', 'sent']));
+    host.endStream();
+  });
+
+  it('plays your-turn once a reply is spoken and nothing else is queued; cues off plays nothing', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = commandCall();
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice));
+    // A call with no page asking: the listening cue comes after a wait.
+    await vi.advanceTimersByTimeAsync(READY_CUE_WAIT_MS);
+    expect(c.played).toEqual(['listening']);
+    host.emit({ type: 'reply', text: 'Booked.', turn: null });
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS - 50);
+    expect(c.v.voice.say).toHaveBeenCalledWith('Booked.');
+    expect(c.played).toEqual(['listening']);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(c.played).toEqual(['listening', 'turn']);
+
+    // A first part of a reply while the agent keeps working: silence, no your-turn.
+    host.emit({ type: 'reply', text: 'One moment.', turn: null });
+    await vi.advanceTimersByTimeAsync(1);
+    host.emit({ type: 'thinking' });
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
+    expect(c.v.voice.say).toHaveBeenCalledWith('One moment.');
+    expect(c.played).toEqual(['listening', 'turn']);
+
+    await c.rpc('settings', { cues: false });
+    host.emit({ type: 'reply', text: 'Done.', turn: null });
+    c.say('Thanks, over.');
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
+    expect(c.played).toEqual(['listening', 'turn']);
+    host.endStream();
+  });
+
+  it('review mode: talk plays listening, a ready draft its own cue; spoken commands stand aside', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = commandCall();
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice));
+    await c.rpc('settings', { wake: true, cues: true });
+    await c.rpc('mode', { mode: 'review' });
+    expect(c.v.events.pausesSend?.()).toBe(false);
+    expect(await c.rpc('talk')).toMatchObject({ ok: true, draft: 1 });
+    c.v.events.onTranscript?.('Book a table, over', true, 1);
+    await c.rpc('done', { draft: 1 });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(c.r.last.draft).toMatchObject({ state: 'ready', text: 'Book a table, over' });
+    expect(c.played).toEqual(['listening', 'listening', 'draft']);
+    expect(utterances(host)).toEqual([]);
+    host.endStream();
+  });
+});
+
+describe('the countdown in the session', () => {
+  it('shows only when a pause would send the turn', () => {
+    let pauses = true;
+    const pending: string[] = [];
+    const events: CallVoiceEvents = {
+      onTurn: () => undefined,
+      onCallerSpeaking: () => undefined,
+      onTurnLost: () => undefined,
+      onTurnDropped: () => undefined,
+      onClosed: () => undefined,
+      pausesSend: () => pauses,
+    };
+    const { session } = callSession(
+      META,
+      { geminiKey: 'gk-test', record: false },
+      { vad: {} as VAD },
+      events,
+      { ...silentLog, error: () => undefined },
+      (value) => pending.push(value),
+    );
+    const speak = () => {
+      session.emit(agentsVoice.AgentSessionEventTypes.UserStateChanged, {
+        type: 'user_state_changed',
+        oldState: 'listening',
+        newState: 'speaking',
+        createdAt: Date.now(),
+      });
+      session.emit(agentsVoice.AgentSessionEventTypes.UserStateChanged, {
+        type: 'user_state_changed',
+        oldState: 'speaking',
+        newState: 'listening',
+        createdAt: Date.now() + 1000,
+      });
+    };
+    const shown = () => pending.filter(Boolean);
+    speak();
+    expect(shown()).toEqual(['1:0:2500']);
+    pauses = false;
+    speak();
+    // Speaking again clears the last one; no new one counts down.
+    expect(shown()).toEqual(['1:0:2500']);
+    expect(pending.at(-1)).toBe('');
   });
 });

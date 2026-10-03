@@ -24,6 +24,8 @@ export interface VoiceAgent {
   name: string;
   /** Names the transcription should recognise and spell exactly; see voiceVocabulary. */
   vocabulary?: readonly string[];
+  /** The agent's own vocabulary file entries: other names the wake phrase `hey <agent>` takes. */
+  wakeNames?: readonly string[];
 }
 
 export interface VoiceCaller {
@@ -88,16 +90,19 @@ export async function resolveVoiceLine(
     const group = await getAgentGroup(groupId);
     if (!group) return null;
     // The persona reader's bounded, symlink- and FIFO-safe read: the file is agent-writable.
-    const vocabulary = options.forCall
-      ? voiceVocabulary(
-          options.vocabulary,
-          readGroupPersona(path.join(GROUPS_DIR, group.folder), VOICE_VOCABULARY_FILE),
-        )
-      : undefined;
+    const fileText = options.forCall
+      ? readGroupPersona(path.join(GROUPS_DIR, group.folder), VOICE_VOCABULARY_FILE)
+      : null;
+    const vocabulary = options.forCall ? voiceVocabulary(options.vocabulary, fileText) : undefined;
+    const wakeNames = fileText ? voiceVocabulary(undefined, fileText) : undefined;
     return {
       caller: { id: caller.id, name: caller.display_name.trim() },
       agentGroupId: group.id,
-      agent: { name: group.name, ...(vocabulary?.length ? { vocabulary } : {}) },
+      agent: {
+        name: group.name,
+        ...(vocabulary?.length ? { vocabulary } : {}),
+        ...(wakeNames?.length ? { wakeNames } : {}),
+      },
     };
   } catch (err) {
     log.warn('voice: could not authorize the voice line', { platformId, err });

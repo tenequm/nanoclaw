@@ -174,7 +174,7 @@ async function startHarness(
         ? {
             caller: { id, name: 'Ethan' },
             agentGroupId: 'ag-andy',
-            agent: { name: 'Andy', vocabulary: ['NanoClaw', 'Stan'] },
+            agent: { name: 'Andy', vocabulary: ['NanoClaw', 'Stan', 'Енді'], wakeNames: ['Енді'] },
           }
         : null,
     now: () => clock.now,
@@ -450,7 +450,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       agentName: 'Andy',
       callerName: 'Ethan',
       callerIdentity: expect.stringMatching(/^caller-/),
-      vocabulary: ['NanoClaw', 'Stan'],
+      vocabulary: ['NanoClaw', 'Stan', 'Енді'],
+      // The agent's own spellings of its name, for the wake phrase.
+      wakeNames: ['Енді'],
       sttModel: 'gemini-3.5-transcribe-live',
       sttFallbackModel: 'gemini-3.5-transcribe',
       ttsModel: 'gemini-3.8-flash-tts',
