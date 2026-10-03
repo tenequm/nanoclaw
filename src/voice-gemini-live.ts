@@ -41,6 +41,8 @@ export interface LiveSocket {
   send(data: string): void;
   close(code?: number, reason?: string): void;
   readonly bufferedAmount?: number;
+  /** The server sends its JSON as binary frames: they come as ArrayBuffers, not Blobs, with this set. */
+  binaryType?: string;
   onopen: (() => void) | null;
   onmessage: ((event: { data: unknown }) => void) | null;
   onclose: ((event: { code: number; reason: string }) => void) | null;
@@ -420,6 +422,7 @@ export class GeminiLiveTranscriber {
       this.opts.log.warn('voice worker: could not open a transcription socket', { err: this.redact(String(err)) });
       return Promise.resolve(undefined);
     }
+    ws.binaryType = 'arraybuffer';
     const socket: Socket = { ws, ready: false, closed: false, retireAt: this.now() + SOCKET_MAX_AGE_MS };
     this.sockets.add(socket);
     return new Promise((resolve) => {
@@ -498,7 +501,10 @@ export class GeminiLiveTranscriber {
 
   private parse(data: unknown): LiveMessage | null {
     try {
-      const text = typeof data === 'string' ? data : Buffer.from(data as ArrayBuffer).toString('utf8');
+      const text =
+        typeof data === 'string'
+          ? data
+          : Buffer.from(ArrayBuffer.isView(data) ? data.buffer : (data as ArrayBuffer)).toString('utf8');
       return JSON.parse(text) as LiveMessage;
     } catch {
       return null;

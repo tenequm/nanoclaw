@@ -1541,6 +1541,24 @@ export function turnText(heard: Pick<Heard, 'final' | 'interim'>): { text: strin
   return { text: final, source: 'final' };
 }
 
+/** A word's sound, roughly: Latin letters, vowel runs as one mark, doubled letters as one (`проєктом` = `proektom`). */
+const wordSound = (word: string): string =>
+  spokenWord(word)
+    .replace(/[aeiouy]+/g, '*')
+    .replace(/([^*])\1+/g, '$1');
+
+/**
+ * Whether `final` ends where `rest` (the interim text before a command) does: its last two words
+ * are among the last four of `rest`, by sound. The final can leave a trailing command out (seen
+ * with `прийом`, and with a command said in another voice or language); then the interim text's
+ * command stands.
+ */
+export function endsLike(final: string, rest: string): boolean {
+  const said = (final.match(/[\p{L}\p{N}]+/gu) ?? []).slice(-2).map(wordSound);
+  const before = new Set((rest.match(/[\p{L}\p{N}]+/gu) ?? []).slice(-4).map(wordSound));
+  return said.length === 2 && said.every((w) => before.has(w));
+}
+
 const joinText = (...parts: string[]): string =>
   parts
     .map((p) => p.trim())
@@ -2020,7 +2038,10 @@ export class CallTurns {
       audio: this.capture?.take(turn.speechMs, Math.max(keep, 0)),
       sttModel: this.options.sttModel,
     };
-    const heard = await this.deps.transcriber.end();
+    // A turn that went on after a command that was words, and heard nothing since, has no final to wait for.
+    const silent = !!turn.carry && !turn.heard && turn.speechMs === 0;
+    const ending = this.deps.transcriber.end();
+    const heard = silent ? { interim: '', finals: 0, failed: false, finalizeMs: 0 } : await ending;
     if (this.draining?.turn === turn) this.draining = undefined;
     const chosen = turnText(heard);
     const said = joinText(turn.carry, chosen.text);
@@ -2048,7 +2069,15 @@ export class CallTurns {
       return null;
     }
     const text = this.spoken(turn, said);
-    const match = matchCommand(text);
+    let match = matchCommand(text);
+    const nominated = turn.kind === 'auto' ? matchCommand(this.spoken(turn, turn.heard)) : null;
+    // A final that ends in the command's words as a question asked it: the interim text cannot overrule that.
+    const asked = !match && !!matchCommand(text.replace(/[?\s]+$/u, ''));
+    if (!match && !asked && nominated && !turn.resumed && endsLike(text, nominated.rest)) {
+      // The final left out the command the interim text ended with: the command stands, and the
+      // final is the turn's text.
+      match = { command: nominated.command, rest: trimCut(text) };
+    }
     // A command the final does not end with, or one the caller talked on after, was words: the turn goes on.
     if ((why === 'send' || why === 'discard') && (match?.command !== why || turn.resumed)) {
       this.goOn(said, endedAt);

@@ -57,6 +57,7 @@ import {
   matchWakeText,
   wakeWordSettings,
   awakeLimits,
+  endsLike,
   type WakeWord,
   type WakeWordEvents,
   TURN_CUE_DELAY_MS,
@@ -1878,6 +1879,59 @@ describe('CallTurns, hands-free', () => {
     await h.talk(800);
     await h.pass(SILENCE);
     expect(h.out.sent).toEqual(['Book a table, send it to Anna tomorrow. And for eight.']);
+  });
+
+  it('a final that leaves the command out but ends where the interim text did still confirms it', async () => {
+    const h = turnsHarness();
+    h.t.results.push(
+      heard('знайти мій діалог, що саме там він питає? Прийом.', 'Знайти мій діалог, і що саме там він питає?'),
+    );
+    await h.talk(1500);
+    await h.interim('знайти мій діалог, що саме там він питає? Прийом.');
+    await h.interim('знайти мій діалог, що саме там він питає? Прийом.');
+    expect(h.out.sent).toEqual(['Знайти мій діалог, і що саме там він питає?']);
+    expect(h.t.begins).toHaveLength(1);
+  });
+
+  it('a pause after a command the final left out still applies it: a discard never sends', async () => {
+    const h = turnsHarness();
+    h.t.results.push(
+      heard(
+        'а можеш мені розказати чим я закінчив з AI і фін проєктом AIFFIN? Scratch that.',
+        'А можеш мені розказати, чим я закінчив з AIFFIN проектом?',
+      ),
+    );
+    await h.talk(2000);
+    await h.interim('а можеш мені розказати чим я закінчив з AI і фін проєктом AIFFIN?');
+    await h.interim('а можеш мені розказати чим я закінчив з AI і фін проєктом AIFFIN? Scratch that.');
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['discarded', 'А можеш мені розказати, чим я закінчив з AIFFIN проектом?']]);
+    // An interim command the final does not end like is not taken: the final's words win.
+    h.t.results.push(heard('Remind me to send it.', 'Remind me to send it to Anna tomorrow.'));
+    await h.talk(1500);
+    await h.interim('Remind me to send it.');
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Remind me to send it to Anna tomorrow.']);
+  });
+
+  it('a question the final asks stays words, whatever the interim text ended with', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Book a table. Send it or not send it', 'Book a table. Send it or not send it?'));
+    await h.talk(1500);
+    await h.interim('Book a table. Send it or not send it');
+    await h.interim('Book a table. Send it or not send it');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual([]);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Book a table. Send it or not send it?']);
+  });
+
+  it('reads where a final ends by sound, across spellings and scripts', () => {
+    expect(endsLike('чим я закінчив з AIFFIN проектом?', 'чим я закінчив з AI і фін проєктом AIFFIN?')).toBe(true);
+    expect(endsLike('що саме там він питає?', 'і сказати, що саме там він питає?')).toBe(true);
+    expect(endsLike('Send it to Anna tomorrow.', 'Remind me to')).toBe(false);
+    expect(endsLike('Yes.', 'Yes')).toBe(false);
   });
 
   it('speech while a command is being confirmed continues the turn: the command was words', async () => {
