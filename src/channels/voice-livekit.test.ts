@@ -26,7 +26,7 @@ import {
   type LiveKitVoiceConfig,
   type MirrorApi,
 } from './voice-livekit.js';
-import type { MessagingGroup } from '../types.js';
+import type { MessagingGroup, Session } from '../types.js';
 import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
@@ -150,6 +150,8 @@ interface Harness {
   access: { enabled: boolean };
   /** What the router does with the next turns: store them, drop them, hang until `hung` is called (storing it on `true`), or throw. */
   routing: { mode: 'store' | 'drop' | 'hang' | 'throw'; hung: Array<(store?: boolean) => void> };
+  /** Sessions whose replies a stored turn expedited. */
+  expedited: string[];
   lk: FakeLiveKit;
   stop(): Promise<void>;
 }
@@ -165,6 +167,8 @@ async function startHarness(
   const clock = { now: Date.UTC(2026, 9, 2, 1, 0, 0) };
   const access = { enabled: true };
   const routing: Harness['routing'] = { mode: 'store', hung: [] };
+  const expedited: string[] = [];
+  const session = { id: 'sess-andy', agent_group_id: 'ag-andy' } as Session;
   const lk = fakeLiveKit();
   const adapter = createVoiceAdapter({
     publicUrl: `http://127.0.0.1:${port}`,
@@ -178,6 +182,7 @@ async function startHarness(
           }
         : null,
     now: () => clock.now,
+    expediteReplies: (stored) => void expedited.push(stored.id),
     livekit: {
       url: 'wss://lk.example.ts.net:47880',
       serverUrl: 'ws://127.0.0.1:7880',
@@ -203,13 +208,13 @@ async function startHarness(
       if (routing.mode === 'hang') {
         return new Promise<void>((resolve) =>
           routing.hung.push((store) => {
-            if (store) onStored?.();
+            if (store) onStored?.(session);
             resolve();
           }),
         );
       }
       if (routing.mode === 'throw') throw new Error('router exploded');
-      if (routing.mode === 'store') onStored?.();
+      if (routing.mode === 'store') onStored?.(session);
     },
     onMetadata: () => {},
     onAction: () => {},
@@ -224,6 +229,7 @@ async function startHarness(
     clock,
     access,
     lk,
+    expedited,
     stop: async () => {
       await adapter.teardown();
       await stopWebhookServer();
@@ -569,9 +575,12 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect((await worker.post('utterance', { text: 'broken' })).status).toBe(500);
     h.routing.mode = 'hang';
     expect((await worker.post('utterance', { text: 'stuck' })).status).toBe(504);
+    expect(h.expedited).toEqual([]);
     h.routing.mode = 'store';
     expect((await worker.post('utterance', { text: 'taken' })).status).toBe(202);
     expect(h.inbound).toHaveLength(4);
+    // The session that took it hands its reply over without waiting on the delivery poll.
+    expect(h.expedited).toEqual(['sess-andy']);
     worker.close();
   });
 

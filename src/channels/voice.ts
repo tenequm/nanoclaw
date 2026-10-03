@@ -26,8 +26,10 @@ import type { VoiceUiConfig } from './voice-call-page.js';
 import { resolveVoiceLine, type ResolveLineOptions, type VoiceLine } from './voice-line.js';
 import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-livekit.js';
 import { DEFAULT_VOICE_MIRROR } from './voice-livekit-protocol.js';
+import { expediteDelivery } from '../delivery.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import type { Session } from '../types.js';
 import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
 
 export const CHANNEL_TYPE = 'voice';
@@ -36,6 +38,8 @@ const MINUTE_MS = 60_000;
 const ACCESS_CHECK_INTERVAL_MS = 5000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
+/** After a turn reaches the agent, its session's replies are picked up at once for this long, not on the 1 s poll. */
+const CALL_REPLY_EXPEDITE_MS = 60_000;
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 
@@ -172,6 +176,8 @@ export interface VoiceConfig {
   trustedProxyCidrs?: string;
   /** VOICE_ALLOWED_CLIENT_CIDRS: clients those proxies may forward (X-Forwarded-For); unset is any. */
   allowedClientCidrs?: string;
+  /** The session a call's turn went to: its replies are delivered without waiting on the poll. Test seam. */
+  expediteReplies?: (session: Session) => void;
 }
 
 /**
@@ -200,6 +206,8 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
     ((platformId: string, options?: ResolveLineOptions) =>
       resolveVoiceLine(platformId, undefined, { vocabulary: config.vocabulary, ...options }));
   const now = config.now ?? (() => Date.now());
+  const expediteReplies =
+    config.expediteReplies ?? ((session: Session) => expediteDelivery(session, CALL_REPLY_EXPEDITE_MS));
   const maxCallDurationMs = config.maxCallDurationMs ?? 15 * 60_000;
   const maxCallsPerHour = config.maxCallsPerHour ?? 12;
   const maxCallMsPerDay = config.maxCallMsPerDay ?? 120 * MINUTE_MS;
@@ -269,7 +277,11 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
           log.warn('livekit-voice: channel is not running; turn dropped', { platformId: event.platformId });
           return reject(new Error('the voice channel is not running'));
         }
-        setup.routeInboundEvent({ ...event, onStored: () => resolve(true) }).then(
+        const onStored = (session: Session) => {
+          expediteReplies(session);
+          resolve(true);
+        };
+        setup.routeInboundEvent({ ...event, onStored }).then(
           () => resolve(false),
           (err: unknown) => {
             log.error('livekit-voice: routing a turn failed', { platformId: event.platformId, err });
