@@ -377,7 +377,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     ])
       expect(lib.isCommandOnly(said), said).toBe(true);
     expect(lib.lineKey('Book a table for two. Send it.')).toBe('bookatablefortwo');
-    expect(lib.lineKey('Скільки я читав? Прийом.')).toBe('скількиячитав');
+    expect(lib.lineKey('Скільки зараз часу? Прийом.')).toBe('скількизаразчасу');
     // "over" is no longer a command: it stays part of what was said.
     expect(lib.isCommandOnly('Over.')).toBe(false);
     expect(lib.lineKey('Game over')).toBe('gameover');
@@ -402,7 +402,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
 
   it('never names a placeholder agent in the wake switch: no phrase until the line info says one', () => {
     expect(lib.wakeSwitchPhrase(review({ wakePhrase: null }), 'your agent', 'your agent')).toBeNull();
-    expect(lib.wakeSwitchPhrase(review({ wakePhrase: null }), 'Dan', 'your agent')).toBe('Hey Dan');
+    expect(lib.wakeSwitchPhrase(review({ wakePhrase: null }), 'Andy', 'your agent')).toBe('Hey Andy');
     expect(lib.wakeSwitchPhrase(review({ wakePhrase: 'Hey LiveKit' }), 'your agent', 'your agent')).toBe('Hey LiveKit');
   });
 
