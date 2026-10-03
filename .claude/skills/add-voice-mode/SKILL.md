@@ -523,6 +523,12 @@ that talks on the voice line, with no chat to hold the rest, closes with
 spoken during the call, replies and proactive ones alike, and the captions show
 what was spoken; the full text stays in the chat.
 
+`VOICE_TTS_DEESS` (default on; `0`, `off` or `false` turns it off) runs the agent's
+speech through a split-band de-esser on its way to the call: above 4.5 kHz the
+signal is turned down, up to 6 dB, while it is louder than the voice below the
+split, with no added latency. Reply recordings hold what was sent. It is
+provisional while its effect on the voice is judged.
+
 It also reads `VOICE_WAKE_MODEL`, `VOICE_WAKE_THRESHOLD` and `VOICE_WAKE_PHRASE`, for
 the wake switch (see spoken commands below). `VOICE_WAKE_MODEL` is a wake word
 classifier `.onnx` in livekit-wakeword's format, a path (default: the bundled

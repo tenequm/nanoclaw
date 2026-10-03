@@ -53,6 +53,10 @@ import {
   turnText,
   CueFeed,
   cueFrames,
+  deEsser,
+  lineFilter,
+  ttsDeess,
+  TTS_SAMPLE_RATE,
   matchCommand,
   matchWake,
   wakeWordSettings,
@@ -184,6 +188,62 @@ describe('helpers', () => {
     expect(maxSpokenChars('0')).toBe(0);
     expect(maxSpokenChars('-5')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
     expect(maxSpokenChars('lots')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
+  });
+
+  it('de-esses the agent speech: flat through the voice band, about 6 dB off a lone sibilant, and off is a passthrough', () => {
+    const rate = TTS_SAMPLE_RATE;
+    const frame = rate / 50;
+    /** One second of tones (Hz to linear amplitude), through one line's filter in 20 ms frames. */
+    const run = (tones: Array<[number, number]>, filter = deEsser({ sampleRate: rate })) => {
+      const input = new Int16Array(rate);
+      for (let i = 0; i < input.length; i++) {
+        input[i] = Math.round(
+          tones.reduce((sum, [hz, amp]) => sum + amp * Math.sin((2 * Math.PI * hz * i) / rate), 0) * 32767,
+        );
+      }
+      const output = new Int16Array(input.length);
+      for (let at = 0; at < input.length; at += frame) output.set(filter(input.subarray(at, at + frame)), at);
+      return { input, output };
+    };
+    // The level after the first 200 ms (the filters and the detector settled), in dB against the input's.
+    const gainDb = ({ input, output }: { input: Int16Array; output: Int16Array }) => {
+      const rms = (pcm: Int16Array) => {
+        let sum = 0;
+        for (let i = rate / 5; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+        return Math.sqrt(sum / (pcm.length - rate / 5));
+      };
+      return 20 * Math.log10(rms(output) / rms(input));
+    };
+    for (const hz of [300, 2_000, 4_500]) expect(Math.abs(gainDb(run([[hz, 0.5]])))).toBeLessThan(0.1);
+    // The band is cut by the full 6 dB; what the low band still passes there (LR4) leaves -5.1 dB at
+    // 6.5 kHz, -5.8 dB at 8 kHz.
+    for (const hz of [6_500, 7_200, 8_000]) {
+      const db = gainDb(run([[hz, 0.5]]));
+      expect(db).toBeLessThan(-5);
+      expect(db).toBeGreaterThan(-6.1);
+    }
+    // A voice's body with quieter hiss over it is left alone: once the tones are in (the hiss's first
+    // millisecond outruns the body's envelope), what the crossover alone gives, to the last bit.
+    const voiced = run([
+      [300, 0.5],
+      [6_500, 0.1],
+    ]);
+    const uncut = run(
+      [
+        [300, 0.5],
+        [6_500, 0.1],
+      ],
+      deEsser({ sampleRate: rate, maxDb: 0 }),
+    );
+    let most = 0;
+    for (let i = rate / 2; i < rate; i++) most = Math.max(most, Math.abs(voiced.output[i] - uncut.output[i]));
+    expect(most).toBeLessThanOrEqual(1);
+    // Off, the line goes out exactly as synthesized.
+    const off = run([[7_000, 0.5]], lineFilter(false));
+    expect(off.output).toEqual(off.input);
+    expect(ttsDeess(undefined)).toBe(true);
+    expect(ttsDeess('1')).toBe(true);
+    for (const raw of ['0', 'off', ' OFF ', 'false']) expect(ttsDeess(raw)).toBe(false);
   });
 
   it('reads the language of a transcript from its script', () => {
@@ -742,7 +802,7 @@ describe('runCall', () => {
     expect(v.createVoice).toHaveBeenCalledWith(
       ctx,
       expect.objectContaining({ callId: 'call-1' }),
-      { geminiKey: 'gk-test', spoke: expect.any(Function) },
+      { geminiKey: 'gk-test', deess: true, spoke: expect.any(Function) },
       v.events,
     );
     // The host address and secret come from the worker's settings, never from the dispatch.

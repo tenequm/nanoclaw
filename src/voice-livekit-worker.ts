@@ -285,6 +285,93 @@ export function maxSpokenChars(raw: string | undefined): number {
   return Number.isInteger(chars) && chars >= 0 ? chars : DEFAULT_MAX_SPOKEN_CHARS;
 }
 
+/** VOICE_TTS_DEESS: the de-esser runs unless it says 0, off or false. */
+export function ttsDeess(raw: string | undefined): boolean {
+  return !['0', 'off', 'false'].includes(raw?.trim().toLowerCase() ?? '');
+}
+
+export interface DeEsserOptions {
+  sampleRate: number;
+  /** Where the sibilance band starts. */
+  crossoverHz?: number;
+  /** How far the band above the split may rise over the voice below it before it is cut. */
+  thresholdDb?: number;
+  /** The deepest cut. */
+  maxDb?: number;
+}
+
+/**
+ * A split-band de-esser for one spoken line, fed its 20 ms frames in order: a Linkwitz-Riley 4th-order
+ * crossover (two cascaded RBJ Butterworth biquads per band, https://www.w3.org/TR/audio-eq-cookbook/;
+ * the bands sum back in phase), and the band above the split turned down while its envelope rises
+ * over the one below. No lookahead: it adds no latency and holds nothing back at a line's end.
+ * Provisional: the owner is still weighing whether the agent's speech keeps it.
+ */
+export function deEsser(o: DeEsserOptions): (pcm: Int16Array) => Int16Array {
+  const sr = o.sampleRate;
+  const hz = o.crossoverHz ?? 4_500;
+  const thresholdDb = o.thresholdDb ?? 0;
+  const maxCut = 10 ** (-(o.maxDb ?? 6) / 20);
+  const coef = (ms: number) => Math.exp(-1 / ((ms / 1000) * sr));
+  const dbOf = (v: number) => 20 * Math.log10(Math.max(v, 1e-9));
+  const biquad = (kind: 'lp' | 'hp') => {
+    const w = (2 * Math.PI * hz) / sr;
+    const alpha = Math.sin(w) / (2 * Math.SQRT1_2);
+    const cos = Math.cos(w);
+    const a0 = 1 + alpha;
+    const b0 = (kind === 'lp' ? (1 - cos) / 2 : (1 + cos) / 2) / a0;
+    const b1 = (kind === 'lp' ? 1 - cos : -(1 + cos)) / a0;
+    const a1 = (-2 * cos) / a0;
+    const a2 = (1 - alpha) / a0;
+    let x1 = 0;
+    let x2 = 0;
+    let y1 = 0;
+    let y2 = 0;
+    return (x: number) => {
+      const y = b0 * x + b1 * x1 + b0 * x2 - a1 * y1 - a2 * y2;
+      x2 = x1;
+      x1 = x;
+      y2 = y1;
+      y1 = y;
+      return y;
+    };
+  };
+  const [lp1, lp2, hp1, hp2] = [biquad('lp'), biquad('lp'), biquad('hp'), biquad('hp')];
+  const envAttack = coef(1);
+  const envRelease = coef(40);
+  const cutAttack = coef(1);
+  const cutRelease = coef(60);
+  const follow = (env: number, v: number) => {
+    const k = v > env ? envAttack : envRelease;
+    return k * env + (1 - k) * v;
+  };
+  let highEnv = 0;
+  let lowEnv = 0;
+  let gain = 1;
+  return (pcm) => {
+    const out = new Int16Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) {
+      const x = pcm[i] / 32768;
+      const low = lp2(lp1(x));
+      const high = hp2(hp1(x));
+      highEnv = follow(highEnv, Math.abs(high));
+      lowEnv = follow(lowEnv, Math.abs(low));
+      // Sibilance: the band above the split louder than the voice's body below it.
+      const over = dbOf(highEnv) - dbOf(lowEnv) - thresholdDb;
+      const target = over > 0 ? Math.max(maxCut, 10 ** (-over / 20)) : 1;
+      const k = target < gain ? cutAttack : cutRelease;
+      gain = k * gain + (1 - k) * target;
+      out[i] = Math.max(-32768, Math.min(32767, Math.round((low + gain * high) * 32768)));
+    }
+    return out;
+  };
+}
+
+/** What a spoken line's frames go through on their way out: the de-esser, or nothing. */
+export function lineFilter(deess: boolean, sampleRate = TTS_SAMPLE_RATE): (pcm: Int16Array) => Int16Array {
+  return deess ? deEsser({ sampleRate }) : (pcm) => pcm;
+}
+
 /**
  * Speakable text cut to `max` characters for a call: up to the last sentence end within the cap when
  * that keeps most of it, else the last whole word, then a closing line (CUT_LINES; "the rest is in the
@@ -2807,6 +2894,8 @@ export interface VoiceSettings {
   geminiKey: string;
   /** Recordings are on: `spoke` gets each line's audio as it went to the speech track. */
   recordReplies?: boolean;
+  /** De-ess the agent's speech (VOICE_TTS_DEESS). */
+  deess?: boolean;
   /** Each line that played or failed: how it went, and with recordReplies its audio. */
   spoke?(line: SpokenLine, pcm?: Int16Array): void;
 }
@@ -3146,7 +3235,10 @@ async function roomVoice(
     const meter = new LineMeter();
     /** The frames sent to the speech track, for the reply's recording. */
     const sent: Int16Array[] = [];
-    const capture = async (frame: Int16Array) => {
+    // One filter per line: its state runs across the line's frames.
+    const filter = lineFilter(!!settings.deess);
+    const capture = async (synthesized: Int16Array) => {
+      const frame = filter(synthesized);
       meter.frame(frame);
       if (settings.recordReplies) sent.push(frame);
       await speechSource.captureFrame(new AudioFrame(frame, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
@@ -3399,6 +3491,7 @@ function defaultDeps(): RunCallDeps {
     'LIVEKIT_HOST_URL',
     'VOICE_RECORDINGS_DAYS',
     'VOICE_MAX_SPOKEN_CHARS',
+    'VOICE_TTS_DEESS',
     'VOICE_WAKE_MODEL',
     'VOICE_WAKE_THRESHOLD',
     'VOICE_WAKE_PHRASE',
@@ -3794,6 +3887,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       {
         geminiKey,
         ...(record ? { recordReplies: true } : {}),
+        ...(ttsDeess(deps.env.VOICE_TTS_DEESS) ? { deess: true } : {}),
         spoke: (line, pcm) => {
           const label = speakingLine;
           const reply = label?.reply ?? ++replies;
