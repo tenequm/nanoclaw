@@ -11,6 +11,7 @@ import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryIn
  * module does not import it.
  */
 export class MockProvider implements AgentProvider {
+  readonly startsIdle = true;
   private responseFactory: (prompt: string) => string;
   private textFactory: ((prompt: string) => string[]) | undefined;
 
@@ -59,9 +60,11 @@ export class MockProvider implements AgentProvider {
         yield { type: 'activity' };
         yield { type: 'init', continuation: `mock-session-${Date.now()}` };
 
-        // Process initial prompt
-        yield { type: 'activity' };
-        yield* turnEvents(input.prompt);
+        // Process initial prompt; an empty one starts idle, like the real SDK.
+        if (input.prompt) {
+          yield { type: 'activity' };
+          yield* turnEvents(input.prompt);
+        }
 
         // Process any pushed follow-ups
         while (!ended && !aborted) {

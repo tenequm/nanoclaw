@@ -67,6 +67,7 @@ import { pondStoreMounts } from './pond-stores.js';
 import './provider-contracts/index.js';
 import { getProviderHostContract } from './provider-contracts/registry.js';
 import { resolveProviderName } from './providers/provider-name.js';
+import type { WakeReason } from './request-wake.js';
 import {
   providerStateVolumePath,
   realizeProviderSpawnSurfaces,
@@ -326,8 +327,12 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
  * transient spawn failure (e.g. the selected gateway is unreachable). Callers don't
  * need to wrap — the inbound row stays pending and host-sweep retries on its
  * next tick.
+ *
+ * `reason` reaches the runner as
+ * `NANOCLAW_WAKE_REASON` when this wake spawns the container; a wake that
+ * joins a running or in-flight container drops it.
  */
-export function wakeContainer(session: Session): Promise<boolean> {
+export function wakeContainer(session: Session, reason?: WakeReason): Promise<boolean> {
   if (activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
     return Promise.resolve(true);
@@ -337,7 +342,7 @@ export function wakeContainer(session: Session): Promise<boolean> {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
-  const promise = spawnContainer(session)
+  const promise = spawnContainer(session, reason)
     .then(() => true)
     .catch((err) => {
       log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
@@ -350,7 +355,7 @@ export function wakeContainer(session: Session): Promise<boolean> {
   return promise;
 }
 
-async function spawnContainer(session: Session): Promise<void> {
+async function spawnContainer(session: Session, wakeReason?: WakeReason): Promise<void> {
   if (pendingAdoptions.has(session.id)) {
     // A running container is waiting to be re-fenced after a failed adoption
     // claim. Reclaim it rather than spawning a duplicate; its poll loop picks
@@ -430,6 +435,7 @@ async function spawnContainer(session: Session): Promise<void> {
       contribution,
       gateway,
       mailboxEnvironment,
+      wakeReason,
     });
 
     log.info('Spawning session', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -1265,6 +1271,8 @@ export interface ComposeSessionSpecInput {
   gateway: GatewayContribution;
   /** Non-secret configuration supplied by the selected mailbox implementation. */
   mailboxEnvironment: Record<string, string>;
+  /** Why this spawn happened, for the runner. */
+  wakeReason?: WakeReason;
 }
 
 /**
@@ -1291,6 +1299,7 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
   const env: Record<string, string> = {
     TZ: containerConfig.timezone ?? TIMEZONE,
     ...mailboxEnvironment,
+    ...(input.wakeReason && { NANOCLAW_WAKE_REASON: input.wakeReason }),
   };
   // The contributed lane (ContainerSpec.contributedEnv): registry-sourced env,
   // exempt from the credential-NAME check and still refused credential VALUES.

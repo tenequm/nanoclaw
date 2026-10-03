@@ -176,6 +176,22 @@ describe('composeSessionSpec', () => {
     expect(compose().containers[0].env.NANOCLAW_MAILBOX_BACKEND).toBe('sqlite');
   });
 
+  it('tells the runner why it was woken, when the wake said', () => {
+    expect(compose().containers[0].env.NANOCLAW_WAKE_REASON).toBeUndefined();
+    const spec = composeSessionSpec({
+      agentGroup,
+      session,
+      containerName: 'nanoclaw-v2-agent-one-1700000000000',
+      mounts,
+      containerConfig,
+      mailboxEnvironment: {},
+      contribution: {} as never,
+      gateway: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } },
+      wakeReason: 'voice-call',
+    });
+    expect(spec.containers[0].env.NANOCLAW_WAKE_REASON).toBe('voice-call');
+  });
+
   it('the gateway contribution fills the contributed lane last and wins a collision', () => {
     const spec = compose({
       contribution: { env: { HTTPS_PROXY: 'http://provider:1' } },

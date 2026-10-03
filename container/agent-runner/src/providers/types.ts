@@ -35,6 +35,21 @@ export interface AgentProvider {
   query(input: QueryInput): AgentQuery;
 
   /**
+   * Optional. True when `query` with an empty `prompt` starts idle, the first
+   * turn arriving through `push`. Only such a provider is started ahead of a
+   * voice call's first turn; any other would run the empty prompt as a turn.
+   */
+  readonly startsIdle?: boolean;
+
+  /**
+   * Optional. Warm the model's prompt cache for `input.continuation` so the
+   * next turn reads its context instead of writing it, without a turn of its
+   * own (nothing persisted, delivered or run). Called when a voice call starts
+   * the agent before its first turn. Best-effort; never throws.
+   */
+  warmPromptCache?(input: QueryInput): Promise<void>;
+
+  /**
    * True if the given error indicates the stored continuation is invalid
    * (missing transcript, unknown session, etc.) and should be cleared.
    */

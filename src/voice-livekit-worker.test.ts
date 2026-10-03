@@ -9,10 +9,13 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  AgentServer,
   APIConnectionError,
   APIStatusError,
+  InferenceRunner,
   initializeLogger,
   normalizeLanguage,
+  ServerOptions,
   stt,
   tts,
   voice as agentsVoice,
@@ -51,6 +54,7 @@ import {
   recordingDays,
   runCall,
   SendCountdown,
+  skipLocalTurnDetectorProcess,
   speakableText,
   TtsFallback,
   TURN_SETTLE_MS,
@@ -601,6 +605,22 @@ const META: LiveKitJobMetadata = {
   maxDurationMs: 60_000,
   joinTimeoutMs: 1000,
 };
+
+describe('local turn detector process', () => {
+  it('leaves agents-js no inference runner to fork a process for', () => {
+    skipLocalTurnDetectorProcess();
+    new AgentServer(
+      new ServerOptions({
+        agent: 'unused',
+        wsURL: 'ws://127.0.0.1:9',
+        apiKey: 'key',
+        apiSecret: 'secret',
+        simulation: true,
+      }),
+    );
+    expect(Object.keys(InferenceRunner.registeredRunners)).toEqual([]);
+  });
+});
 
 describe('job metadata', () => {
   it('takes only a voice call of this version as a call to run', () => {
