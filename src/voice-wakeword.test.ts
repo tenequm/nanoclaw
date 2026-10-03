@@ -268,6 +268,20 @@ describe('WakeWordSpotter', () => {
     },
   );
 
+  const SCRATCH_THAT = fileURLToPath(new URL('../assets/voice-commands/scratch_that.onnx', import.meta.url));
+  it.skipIf(!fs.existsSync(SCRATCH_THAT))("loads the fork's scratch_that model next to the wake word", async () => {
+    expect(defaultThreshold(SCRATCH_THAT)).toBe(0.35);
+    expect(wakePhraseOf(SCRATCH_THAT)).toBe('scratch that');
+    const pipeline = await WakeWordPipeline.load([DEFAULT_WAKE_MODEL, SCRATCH_THAT]);
+    try {
+      const [wake, discard] = await pipeline.score(pcmToFloat(readWav(path.join(FIXTURES, 'positive.wav'))));
+      expect(wake).toBeGreaterThan(0.9);
+      expect(discard).toBeLessThan(0.35);
+    } finally {
+      await pipeline.release();
+    }
+  });
+
   it('rejects ready when no classifier loads', async () => {
     const spotter = new WakeWordSpotter({
       classifiers: [{ name: 'wake', model: '/nonexistent/hey_nobody.onnx', threshold: 0.5 }],

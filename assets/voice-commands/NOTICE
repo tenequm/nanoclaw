@@ -5,6 +5,7 @@ never this directory, and its default wake word stays hey_livekit. This fork's
 deploy opts in through .env, with paths relative to the NanoClaw directory:
 
   VOICE_WAKE_MODEL=assets/voice-commands/hey_dan.onnx
+  VOICE_DISCARD_MODEL=assets/voice-commands/scratch_that.onnx
 
 hey_dan.onnx listens for "hey dan" (and "hey den", as a Ukrainian speaker says
 it). It is a livekit-wakeword classifier (conv-attention, medium) trained with
@@ -28,3 +29,14 @@ real "hey dan" scores 0.82-0.98 on 20 of 22 clips, but "hey" with another one
 syllable name scores as high ("Hey Ben" 0.97, "Hey Jan" 0.98, "Hey Stan" 0.96,
 "Hey Danny" 0.95). No threshold separates them, so a nearby "hey <name>" can
 open a turn. Retrain with more voices for the near misses before relying on it.
+
+scratch_that.onnx listens for "scratch that" (the discard command), trained the
+same way but with livekit-wakeword's augmentation patched so that negatives sit
+at the end of the 2 s window as the positives do (upstream centers them, and a
+model then learns where speech ends instead of which words were said). Its known
+threshold in the worker is 0.35. Its own evaluation is pessimistic (recall 0.28
+at 0.5), but on other voices (macOS say and Gemini TTS) "scratch that" scores
+0.50-0.84 on 9 of 10 voices (a Ukrainian-accented one scores 0.01), and near
+misses ("catch that", "match that", "sketch that", "watch that", "send it")
+stay at 0.05 or under; "Scratch this plan" reaches 0.51, which the worker's
+transcript check keeps as words (it does not end the sentence).
