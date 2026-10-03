@@ -1408,3 +1408,6 @@
 }
 .voice-page[data-skin="te"] .swatch.field i, .voice-page[data-skin="te"] .swatch.auto i { box-shadow: inset 0 0 0 1px rgba(128, 128, 128, 0.6); }
 .voice-page[data-skin="te"] .swatch.on.field i, .voice-page[data-skin="te"] .swatch.on.auto i { box-shadow: inset 0 0 0 1px rgba(128, 128, 128, 0.6), 0 0 0 2px var(--card), 0 0 0 3.5px var(--foreground); }
+
+/* The configured wake phrase and the mode names keep their case in every skin. */
+.as-written { text-transform: none; }

@@ -432,7 +432,26 @@ function continues(lines: Line[], i: number): boolean {
 }
 
 /** One on/off switch: a label that wraps, and a track with a knob. Its description lives outside it. */
-function Switch({ label, on, disabled, describedBy, onClick }: { label: string; on: boolean; disabled: boolean; describedBy: string; onClick: () => void }) {
+/**
+ * `text` with each of `keep` shown as written, even where the skin sets everything in lowercase:
+ * the configured wake phrase and the mode names are the caller's to read as they are.
+ */
+function AsWritten({ text, keep }: { text: string; keep: readonly string[] }) {
+  const words = keep.filter(Boolean)
+  if (!words.length) return text
+  const parts = text.split(new RegExp(`(${words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`))
+  return parts.map((part, i) =>
+    i % 2 ? (
+      <span key={i} className="as-written">
+        {part}
+      </span>
+    ) : (
+      part
+    )
+  )
+}
+
+function Switch({ label, on, disabled, describedBy, onClick }: { label: React.ReactNode; on: boolean; disabled: boolean; describedBy: string; onClick: () => void }) {
   return (
     <button type="button" role="switch" aria-checked={on} aria-describedby={describedBy} className={`sw${on ? " on" : ""}`} disabled={disabled} onClick={onClick}>
       <span className="sw-label">{label}</span>
@@ -468,7 +487,7 @@ function CommandsBlock({
         <span className="cmds-explain">Say "send it" or "прийом" to send now, "scratch that" to drop it.</span>
       </p>
       <div className={`cmds-switches${wake ? " two" : ""}`}>
-        <Switch label={`Wait for "${phrase}"`} on={wake} disabled={disabled} describedBy="wake-desc" onClick={() => onWake(!wake)} />
+        <Switch label={<AsWritten text={`Wait for "${phrase}"`} keep={[phrase]} />} on={wake} disabled={disabled} describedBy="wake-desc" onClick={() => onWake(!wake)} />
         {wake && <Switch label="A pause also sends" on={pauseSends} disabled={disabled} describedBy="pause-sends-desc" onClick={() => onPauseSends(!pauseSends)} />}
       </div>
       <span id="wake-desc" className="sr-only">{`Nothing is sent until you say ${phrase}; then say send it to send.`}</span>
@@ -513,7 +532,7 @@ function ModeRow({
               aria-describedby={`mode-${m}-desc`}
               onClick={() => onPick(m)}
             >
-              {MODE_NAME[m]}
+              <span className="as-written">{MODE_NAME[m]}</span>
             </button>
           )
         })}
@@ -529,7 +548,7 @@ function ModeRow({
       </p>
       {note && (
         <p className="mode-note" role="status">
-          {note}
+          <AsWritten text={note} keep={Object.values(MODE_NAME)} />
         </p>
       )}
     </div>
@@ -841,8 +860,9 @@ export default function App() {
               : phase === "error"
                 ? ERROR_TITLE[errorKind]
                 : "Call ended"
-  const chipText = reviewReadout ? rv.chip : switchingToReview ? "Switching to review" : sleptNote && phase === "listening" ? "Went back to sleep" : autoChip
+  const chipText = reviewReadout ? rv.chip : switchingToReview ? `Switching to ${MODE_NAME.review}` : sleptNote && phase === "listening" ? "Went back to sleep" : autoChip
   const errChip = chipClass === "err"
+  const keepWords = [MODE_NAME.review, ...(rs ? [wakePhraseOf(rs, agentName)] : [])]
   const readout = (
     <span className={`state-chip ${chipClass}${counting ? " counting" : ""}${wakeFlash && !reduced ? " flash" : ""}`} role="status" aria-live="polite">
       {counting && call.sendCue && <ChipFill key={call.sendCue.id} cue={call.sendCue} reduced={reduced} />}
@@ -851,7 +871,7 @@ export default function App() {
         {phase === "thinking" && !reconnecting && !reduced && (reviewReadout ? rv.chipTone === "think" : !switchingToReview) ? (
           <ShimmeringText className="shimmer" text={chipText} duration={1.4} />
         ) : (
-          chipText
+          <AsWritten text={chipText} keep={keepWords} />
         )}
       </span>
     </span>
@@ -1147,7 +1167,9 @@ export default function App() {
               </div>
               <div className="screen-readout">
                 {readout}
-                <span className="screen-hint">{hintText}</span>
+                <span className="screen-hint">
+                  <AsWritten text={hintText} keep={keepWords} />
+                </span>
                 {hearKey}
                 {sendCueBar}
               </div>
@@ -1169,7 +1191,9 @@ export default function App() {
                 <Stage call={call} phase={phase} live={live} presence={cfg.presence} reduced={reduced} sleeping={waitingWake} />
               </div>
               {readout}
-              <p className="hint">{hintText}</p>
+              <p className="hint">
+                <AsWritten text={hintText} keep={keepWords} />
+              </p>
               {sendCueBar}
               {hearKey}
               {deliveryNotice}

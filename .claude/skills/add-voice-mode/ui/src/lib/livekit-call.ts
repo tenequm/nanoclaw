@@ -27,7 +27,7 @@ import {
   type TurnMark,
   type VoiceCall,
 } from "./voice-call"
-import { COMMANDS_VERSION, INITIAL_REVIEW, autoBlock, infoWakePhrase, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, storeWakePhrase, storedWakePhrase, type Draft, type ReviewOp, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSION, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, infoWakePhrase, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -370,8 +370,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const limit = useRef<{ ms: number; kind: string } | null>(null)
   const joinedAt = useRef(0)
 
+  /** The caller's picks as last made before a call or taken by the worker during one: where each call starts. */
+  const prefs = useRef<ReviewPrefs | null>(null)
+  prefs.current ??= storedPrefs()
   // Review mode. The worker owns the draft; the page shows its newest state and asks for changes.
-  const [review, setReviewState] = useState<ReviewState>(() => ({ ...INITIAL_REVIEW, wakePhrase: storedWakePhrase() }))
+  const [review, setReviewState] = useState<ReviewState>(() => ({ ...INITIAL_REVIEW, ...prefs.current, wakePhrase: storedWakePhrase() }))
   const reviewRef = useRef<ReviewState>(review)
   const { textStreams: reviewStreams } = useTextStream(REVIEW_TOPIC, { room })
   const doneReviewStreams = useRef(new Set<string>())
@@ -425,6 +428,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const updateReview = useCallback((fn: (r: ReviewState) => ReviewState) => {
     reviewRef.current = fn(reviewRef.current)
     setReviewState(reviewRef.current)
+  }, [])
+
+  const keepPrefs = useCallback((picked: Partial<ReviewPrefs>) => {
+    prefs.current = { ...DEFAULT_PREFS, ...prefs.current, ...picked }
+    storePrefs(prefs.current)
   }, [])
 
   const secondsIn = () => Math.max(0, Math.floor((Date.now() - (startedAt.current || Date.now())) / 1000))
@@ -502,7 +510,8 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         const open = d && (d.state === "recording" || d.state === "finishing")
         const kept: Draft | null =
           d && (d.state === "ready" || d.state === "failed") ? d : open && r.provisional.trim() ? { ...d, state: "failed", text: r.provisional.trim() } : null
-        return { ...INITIAL_REVIEW, mode: r.mode, available: r.available, wake: r.wake, pauseSends: r.pauseSends, wakePhrase: r.wakePhrase, draft: kept, ended: !!kept }
+        // The next call starts from the caller's picks, not from a fallback this call's worker forced.
+        return { ...INITIAL_REVIEW, ...prefs.current, available: r.available, wakePhrase: r.wakePhrase, draft: kept, ended: !!kept }
       })
       setMicStream(null)
       setRemoteStream(null)
@@ -1129,7 +1138,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       const p = phaseRef.current
       if (!LIVE_PHASES.has(p)) {
         // Before a call (or after one): only the pick, kept for the next call.
-        if (p !== "connecting" && !r.ended) updateReview((x) => ({ ...x, mode: to, note: null }))
+        if (p !== "connecting" && !r.ended) {
+          keepPrefs({ mode: to })
+          updateReview((x) => ({ ...x, mode: to, note: null }))
+        }
         return
       }
       if (r.pending || r.mode === to || !joinedRef.current) return
@@ -1141,9 +1153,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       // Review starts with the microphone off: it stops here, before the worker is asked.
       if (to === "review" && mic.current && !mic.current.isMuted) await setMic(false)
       const reply = await rpc("mode", { mode: to, afterTurn: maxTurn.current })
+      if (reply?.ok) keepPrefs({ mode: to })
       settleOp(reply, reply?.ok && reply.submitted !== undefined ? { note: "Previous turn already submitted." } : {})
     },
-    [updateReview, setMic, rpc, settleOp]
+    [updateReview, setMic, rpc, settleOp, keepPrefs]
   )
 
   const talk = useCallback(async () => {
@@ -1210,14 +1223,14 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       updateReview((x) => ({ ...x, pending: { op: "mode", to: "review" } }))
       void rpc("mode", { mode: "review", afterTurn: maxTurn.current }).then((reply) =>
         // The worker stays in auto: so does the page, with the microphone still muted.
-        settleOp(reply, reply?.ok ? {} : { mode: "auto", note: "Review didn't start - the call is in auto." })
+        settleOp(reply, reply?.ok ? {} : { mode: "auto", note: `${MODE_NAME.review} didn't start - the call is ${MODE_NAME.auto}.` })
       )
       return
     }
     // The attribute can trail the session's first state by a moment.
     const t = window.setTimeout(() => {
       if (reviewSeq.current > 0) return
-      updateReview((x) => ({ ...x, mode: "auto", available: false, note: "Review isn't available on this line." }))
+      updateReview((x) => ({ ...x, mode: "auto", available: false, note: `${MODE_NAME.review} isn't available on this line.` }))
     }, AGENT_ATTR_GRACE_MS)
     return () => window.clearTimeout(t)
   }, [reviewLive, review.mode, review.pending, reviewAvailable, updateReview, rpc, settleOp])
@@ -1228,19 +1241,24 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
 
   /**
    * The page's settings to the worker: the wake switch, and `?cues=0` (the worker plays the cues).
-   * Tried twice; if the worker never takes them, the switches go back to what it runs.
+   * Tried twice; if the worker never takes them, the switches go back to what it runs. Only switches
+   * the worker took are kept for the next call, and only from the newest request.
    */
+  const settingsGen = useRef(0)
   const sendSettings = useCallback(async () => {
-    const ask = () => {
-      const r = reviewRef.current
-      return rpc("settings", { wake: r.wake, pauseSends: r.pauseSends, cues: new URLSearchParams(location.search).get("cues") !== "0" })
+    const gen = ++settingsGen.current
+    const ask = async () => {
+      const { wake, pauseSends } = reviewRef.current
+      const reply = await rpc("settings", { wake, pauseSends, cues: new URLSearchParams(location.search).get("cues") !== "0" })
+      if (reply?.ok && gen === settingsGen.current) keepPrefs({ wake, pauseSends })
+      return reply
     }
     let reply = await ask()
     if (reply === null) reply = await ask()
-    if (reply === undefined || reply.ok) return
+    if (reply === undefined || reply.ok || gen !== settingsGen.current) return
     const ran = workerWake.current
-    updateReview((x) => ({ ...x, wake: ran?.on ?? false, pauseSends: ran?.pauseSends ?? false, note: "Settings didn't reach the call - try again." }))
-  }, [rpc, updateReview])
+    updateReview((x) => ({ ...x, ...settingsNotTaken(ran) }))
+  }, [rpc, updateReview, keepPrefs])
 
   // Once per call, as soon as the worker says it takes them. The worker holds its first cue until then.
   useEffect(() => {
@@ -1254,11 +1272,13 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     (fields: { wake?: boolean; pauseSends?: boolean }) => {
       const r = reviewRef.current
       // Mid-call the worker has to take it; before a call it is the pick for the next one.
-      if (LIVE_PHASES.has(phaseRef.current) && (!r.commands || r.pending)) return
+      const live = LIVE_PHASES.has(phaseRef.current)
+      if (live && (!r.commands || r.pending)) return
       updateReview((x) => ({ ...x, ...fields, note: null }))
-      if (LIVE_PHASES.has(phaseRef.current) && settingsSent.current) void sendSettings()
+      if (!live) keepPrefs(fields)
+      else if (settingsSent.current) void sendSettings()
     },
-    [updateReview, sendSettings]
+    [updateReview, sendSettings, keepPrefs]
   )
 
   useEffect(() => {

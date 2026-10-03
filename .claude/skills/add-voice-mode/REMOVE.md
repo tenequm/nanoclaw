@@ -70,3 +70,6 @@ and delete the wiring and messaging group with `ncl wirings delete` and
 user record when keeping call history. Before deleting a line's messaging group,
 `ncl voice-lines remove --line voice:<line id>` drops its owners and call chat.
 The LiveKit server and the Gemini key are managed outside NanoClaw.
+The call page keeps each caller's Manual or hands-free pick, wake switches and
+wake phrase in their own browser (`localStorage`); clearing the site's data there
+removes them.

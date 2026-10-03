@@ -68,7 +68,7 @@ import {
   getMessagingGroupsByAgentGroup,
 } from '../db/messaging-groups.js';
 import { getVoiceLine, getVoiceLineOwners } from '../db/voice-lines.js';
-import { registerPostDeliveryHook } from '../delivery.js';
+import { registerPostDeliveryHook, setOutboundPresentation, type OutboundAddress } from '../delivery.js';
 import { log } from '../log.js';
 import { platformMessageId } from '../platform-id.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
@@ -325,6 +325,8 @@ export interface LiveKitVoice {
     text: string,
     replyTo?: { callId: string; utteranceId: string } | null,
   ): void;
+  /** Whether `chatMessage` with the same arguments would speak it on a live call right now; changes nothing. */
+  speaksChat(chat: ChatAddress, agentGroupId: string, replyTo: { callId: string; utteranceId: string } | null): boolean;
   /**
    * The agent is working in a chat: tell its live call that talks there. `working`: the runner has
    * picked up what reached that chat last (the typing module's `TypingTick.working`), which the call
@@ -382,39 +384,74 @@ const isCallChat = (chat: CallChat, to: ChatAddress): boolean =>
 /** Every running engine, for the delivery and typing taps below. */
 const engines = new Set<LiveKitVoice>();
 
+/** The words of a chat message's parsed content, or null for edits, reactions, cards and host command replies. */
+function wordsOf(id: string, kind: string, content: Readonly<Record<string, unknown>>): string | null {
+  if (kind !== 'chat' && kind !== 'chat-sdk') return null;
+  if (id.startsWith('hcmd-')) return null;
+  if (content.operation || content.type || typeof content.text !== 'string') return null;
+  return content.text.trim() || null;
+}
+
 /** The words of a delivered chat message, or null for edits, reactions, cards and host command replies. */
 export function spokenText(message: { id: string; kind: string; content: string }): string | null {
-  if (message.kind !== 'chat' && message.kind !== 'chat-sdk') return null;
-  if (message.id.startsWith('hcmd-')) return null;
   try {
-    const content = JSON.parse(message.content) as Record<string, unknown>;
-    if (content.operation || content.type || typeof content.text !== 'string') return null;
-    return content.text.trim() || null;
+    return wordsOf(message.id, message.kind, JSON.parse(message.content) as Record<string, unknown>);
   } catch {
     return null;
   }
 }
 
+type ChatMessageAddress = {
+  channelType: string | null;
+  platformId: string | null;
+  threadId: string | null;
+  inReplyTo?: string | null;
+};
+
+/** Where an agent message went and the call turn it answers, for the live calls to match. */
+function chatTarget(
+  msg: ChatMessageAddress,
+  agentGroupId: string,
+): { chat: ChatAddress; replyTo: { callId: string; utteranceId: string } | null } | null {
+  if (!msg.channelType || !msg.platformId) return null;
+  return {
+    chat: { channelType: msg.channelType, platformId: msg.platformId, threadId: msg.threadId ?? null },
+    // Delivery hands the id over agent-scoped.
+    replyTo: msg.inReplyTo ? parseLiveKitUtteranceId(platformMessageId(msg.inReplyTo, agentGroupId)) : null,
+  };
+}
+
 /** Delivery tap: an agent message reached a chat; a live call talking there speaks it. */
 export function liveKitChatDelivered(
-  msg: {
-    id: string;
-    kind: string;
-    content: string;
-    channelType: string | null;
-    platformId: string | null;
-    threadId: string | null;
-    inReplyTo?: string | null;
-  },
+  msg: ChatMessageAddress & { id: string; kind: string; content: string },
   agentGroupId: string,
 ): void {
-  if (engines.size === 0 || !msg.channelType || !msg.platformId) return;
+  if (engines.size === 0) return;
   const text = spokenText(msg);
-  if (!text) return;
-  const chat = { channelType: msg.channelType, platformId: msg.platformId, threadId: msg.threadId ?? null };
-  // Delivery hands the id over agent-scoped.
-  const replyTo = msg.inReplyTo ? parseLiveKitUtteranceId(platformMessageId(msg.inReplyTo, agentGroupId)) : null;
-  for (const engine of engines) engine.chatMessage(chat, agentGroupId, text, replyTo);
+  const target = text ? chatTarget(msg, agentGroupId) : null;
+  if (!text || !target) return;
+  for (const engine of engines) engine.chatMessage(target.chat, agentGroupId, text, target.replyTo);
+}
+
+/** Leads the chat's copy of an agent message a live call was given to speak (not proof it was heard). */
+export const SPOKEN_MARK = '\u{1F50A} ';
+
+/**
+ * Presentation tap: the chat's copy of an agent message that a live call is about to speak starts
+ * with SPOKEN_MARK. Only what the platform shows: the stored message, the post-delivery hooks, the
+ * spoken text and the agent's context keep the original. The same match as the delivery tap.
+ */
+export function liveKitChatPresentation(
+  msg: OutboundAddress,
+  content: Readonly<Record<string, unknown>>,
+  agentGroupId: string,
+): Record<string, unknown> | null {
+  if (engines.size === 0 || !wordsOf(msg.id, msg.kind, content)) return null;
+  const target = chatTarget(msg, agentGroupId);
+  if (!target || ![...engines].some((engine) => engine.speaksChat(target.chat, agentGroupId, target.replyTo))) {
+    return null;
+  }
+  return { ...content, text: `${SPOKEN_MARK}${content.text as string}` };
 }
 
 /** Typing tap: the agent works in a chat; its live call talking there hears it is thinking, and when it picked a turn up. */
@@ -423,6 +460,7 @@ export function liveKitChatTyping(chat: ChatAddress, agentGroupId: string, worki
 }
 
 registerPostDeliveryHook((msg, session) => liveKitChatDelivered(msg, session.agent_group_id));
+setOutboundPresentation((msg, content, session) => liveKitChatPresentation(msg, content, session.agent_group_id));
 registerTypingObserver(({ agentGroupId, working, ...chat }) => liveKitChatTyping(chat, agentGroupId, working));
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
@@ -608,6 +646,24 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       return true;
     }
     return false;
+  };
+
+  /**
+   * The chat a live call speaks an agent message that reached `to` from: the one it talks in, the one
+   * it just left, or none. Pure: chatMessage marks a left chat as still in use, speaksChat does not.
+   */
+  const speechChat = (
+    call: LiveKitCall,
+    to: ChatAddress,
+    agentGroupId: string,
+    replyTo: { callId: string; utteranceId: string } | null,
+  ): 'current' | 'previous' | null => {
+    if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) return null;
+    // An answer to a turn of another call (the one this call replaced) is never spoken into this one.
+    if (replyTo && replyTo.callId !== call.callId) return null;
+    if (call.chat && isCallChat(call.chat, to)) return 'current';
+    if (call.previousChat && isCallChat(call.previousChat.chat, to)) return 'previous';
+    return null;
   };
 
   const postToChat = async (chat: CallChat, text: string): Promise<void> => {
@@ -1011,7 +1067,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       if (chat) {
         void routed.then(
           (stored) => {
-            if (stored) mirror(call.platformId, chat, `🎙 ${sender.name}: ${text}`);
+            // The chat shows the words alone; the turn itself still comes from the caller by name.
+            if (stored) mirror(call.platformId, chat, `\u{1F399} ${text}`);
           },
           () => undefined,
         );
@@ -1164,10 +1221,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
     chatMessage(chat, agentGroupId, text, replyTo) {
       for (const call of calls.values()) {
-        if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
-        const turn = replyTo?.callId === call.callId ? replyTo.utteranceId : null;
-        if (callChatAt(call, chat)) push(call, { type: 'reply', text, turn });
+        const at = speechChat(call, chat, agentGroupId, replyTo ?? null);
+        if (!at) continue;
+        if (at === 'previous' && call.previousChat) call.previousChat.active = true;
+        push(call, { type: 'reply', text, turn: replyTo ? replyTo.utteranceId : null });
       }
+    },
+
+    speaksChat(chat, agentGroupId, replyTo) {
+      return [...calls.values()].some((call) => speechChat(call, chat, agentGroupId, replyTo) !== null);
     },
 
     chatTyping(chat, agentGroupId, working = false) {

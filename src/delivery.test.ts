@@ -35,6 +35,7 @@ import {
   registerDeliveryBatchPreview,
   registerPostDeliveryHook,
   setDeliveryAdapter,
+  setOutboundPresentation,
 } from './delivery.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
@@ -1108,5 +1109,132 @@ describe('deliverSessionMessages — agent-scoped message ids', () => {
   it('leaves a message with no messageId byte-identical', async () => {
     const payload = await deliveredContent({ text: 'hello' });
     expect(payload).toEqual({ text: 'hello' });
+  });
+});
+
+/**
+ * The optional presentation transform a channel module registers: it restyles
+ * only what the adapter sends. The stored row, the post-delivery hooks and every
+ * retry keep the original content.
+ */
+describe('deliverSessionMessages — outbound presentation', () => {
+  afterEach(() => {
+    setOutboundPresentation(null);
+  });
+
+  function insertChat(sessionId: string, msgId: string, content: Record<string, unknown>): void {
+    insertOperation('ag-1', sessionId, msgId, content);
+  }
+
+  function storedContent(sessionId: string, msgId: string): unknown {
+    const db = new Database(outboundDbPath('ag-1', sessionId), { readonly: true });
+    const row = db.prepare('SELECT content FROM messages_out WHERE id = ?').get(msgId) as { content: string };
+    db.close();
+    return JSON.parse(row.content);
+  }
+
+  it('sends the presented copy; the stored row and the post-delivery hook keep the original', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertChat(session.id, 'pr-1', { text: 'Booked.', extra: 1 });
+    const seen: Array<{ msg: string; session: string }> = [];
+    setOutboundPresentation((msg, content, s) => {
+      seen.push({ msg: msg.id, session: s.id });
+      expect(msg).toMatchObject({ kind: 'chat', channelType: 'telegram', platformId: 'telegram:123', threadId: null });
+      return { ...content, text: `> ${content.text as string}` };
+    });
+    const hooked: string[] = [];
+    registerPostDeliveryHook((msg) => {
+      if (msg.id === 'pr-1') hooked.push(msg.content);
+    });
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        sent.push(content);
+        return 'pm';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(sent.map((c) => JSON.parse(c))).toEqual([{ text: '> Booked.', extra: 1 }]);
+    expect(seen).toEqual([{ msg: 'pr-1', session: session.id }]);
+    expect(hooked.map((c) => JSON.parse(c))).toEqual([{ text: 'Booked.', extra: 1 }]);
+    expect(storedContent(session.id, 'pr-1')).toEqual({ text: 'Booked.', extra: 1 });
+  });
+
+  it('a message the transform passes on goes out byte-identical', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertChat(session.id, 'pr-2', { text: 'plain' });
+    setOutboundPresentation(() => null);
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        sent.push(content);
+        return 'pm';
+      },
+    });
+    await deliverSessionMessages(session);
+    expect(sent).toEqual([JSON.stringify({ text: 'plain' })]);
+  });
+
+  it('a transform that throws, or tries to change the content in place, leaves the message as it was', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertChat(session.id, 'pr-3', { text: 'one' });
+    setOutboundPresentation((_msg, content) => {
+      (content as Record<string, unknown>).text = 'mutated';
+      return null;
+    });
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        sent.push(content);
+        return 'pm';
+      },
+    });
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    try {
+      await deliverSessionMessages(session);
+    } finally {
+      warn.mockRestore();
+    }
+    expect(sent).toEqual([JSON.stringify({ text: 'one' })]);
+    expect(await withMailboxSession('ag-1', session.id, (mailbox) => mailbox.getDeliveredIds().has('pr-3'))).toBe(true);
+  });
+
+  it('a failed send runs no post-delivery hook, and its retry is presented once, from the original', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertChat(session.id, 'pr-4', { text: 'Booked.' });
+    setOutboundPresentation((_msg, content) => ({ ...content, text: `> ${content.text as string}` }));
+    const hooked: string[] = [];
+    registerPostDeliveryHook((msg) => {
+      if (msg.id === 'pr-4') hooked.push(msg.content);
+    });
+    const sent: string[] = [];
+    let calls = 0;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        calls++;
+        sent.push(content);
+        if (calls === 1) throw new Error('network timeout');
+        return 'pm';
+      },
+    });
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    try {
+      await deliverSessionMessages(session);
+      expect(hooked).toEqual([]);
+      await deliverSessionMessages(session);
+    } finally {
+      warn.mockRestore();
+    }
+    expect(sent.map((c) => JSON.parse(c))).toEqual([{ text: '> Booked.' }, { text: '> Booked.' }]);
+    expect(hooked.map((c) => JSON.parse(c))).toEqual([{ text: 'Booked.' }]);
+    // Delivered once: a later poll sends nothing again.
+    await deliverSessionMessages(session);
+    expect(sent).toHaveLength(2);
   });
 });
