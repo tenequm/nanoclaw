@@ -23,8 +23,15 @@ export interface Line {
   group?: number
   /** The worker heard the wake phrase as this caller line was spoken (or just before it). */
   wake?: boolean
+  /**
+   * The line is the wake phrase alone: the worker restarted its transcription right after it, so
+   * the line is no part of any turn and never carries a turn's mark.
+   */
+  wakeOnly?: boolean
   /** The line opens with words said before the wake phrase, which the worker ignored. */
   preWake?: boolean
+  /** A caller line the transcription may still revise: shown dimmed until its final text. */
+  interim?: boolean
   /** An agent line the worker could not speak: its text, shown instead of heard. */
   unspoken?: boolean
   /** Not a caption: the page's own note, `unheard` when the caller spoke over the agent. */
@@ -44,10 +51,11 @@ export interface TurnMark {
   /**
    * `sending`: a sent review draft the agent has not confirmed yet (auto turns show no mark until then).
    * `dropped`: words the worker will never send: a spoken discard, speech before the wake phrase, or
-   * a spoken command said alone, with nothing open to act on (`command`).
+   * a spoken command said alone, with nothing open to act on (`command`), or words held by a turn the
+   * wake phrase opened that heard nothing more for too long (`asleep`).
    */
   status: "sending" | "sent" | "lost" | "dropped"
-  reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty" | "discarded" | "unaddressed" | "command"
+  reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty" | "discarded" | "unaddressed" | "command" | "asleep"
 }
 
 /** What kind of problem ended a call, so the page can say what to do about it. */

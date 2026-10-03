@@ -46,7 +46,13 @@ const TEST_DIR = '/tmp/nanoclaw-test-delivery-poll';
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from './db/index.js';
 import { getRunningSessions } from './db/sessions.js';
-import { deliverToSessions, setDeliveryAdapter, startActiveDeliveryPoll, stopDeliveryPolls } from './delivery.js';
+import {
+  deliverToSessions,
+  expediteDelivery,
+  setDeliveryAdapter,
+  startActiveDeliveryPoll,
+  stopDeliveryPolls,
+} from './delivery.js';
 import { log } from './log.js';
 import { outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession } from './session-manager.js';
@@ -190,5 +196,36 @@ describe('active poll cadence', () => {
 
     // t=0 (runs until 1500) → breather 100 ms → t=1600 (until 3100) → t=3200.
     expect(startedAt.map((t) => t - startedAt[0])).toEqual([0, 1600, 3200]);
+  });
+});
+
+describe('expediteDelivery', () => {
+  it('drains a waited-on session well inside the active poll, and only for its window', async () => {
+    // The active poll finds nothing: whatever is delivered here, the expedited drain delivered.
+    vi.mocked(getRunningSessions).mockResolvedValue([]);
+    const [session] = await seedSessions(1);
+    const delivered: number[] = [];
+    setDeliveryAdapter({
+      deliver: async () => {
+        delivered.push(Date.now());
+        return 'pm';
+      },
+    });
+    // Not while the polls are stopped (shutdown).
+    expediteDelivery(session, 5_000);
+    startActiveDeliveryPoll();
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    expect(delivered).toEqual([]);
+
+    const since = Date.now();
+    expediteDelivery(session, 600);
+    await vi.waitFor(() => expect(delivered).toHaveLength(1), { timeout: 1_000, interval: 10 });
+    expect(delivered[0] - since).toBeLessThan(500);
+
+    // Past its window the session waits for the regular polls again.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    insertOutbound(session, 'out-late');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(delivered).toHaveLength(1);
   });
 });

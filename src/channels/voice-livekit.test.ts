@@ -26,7 +26,7 @@ import {
   type LiveKitVoiceConfig,
   type MirrorApi,
 } from './voice-livekit.js';
-import type { MessagingGroup } from '../types.js';
+import type { MessagingGroup, Session } from '../types.js';
 import {
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
@@ -150,6 +150,14 @@ interface Harness {
   access: { enabled: boolean };
   /** What the router does with the next turns: store them, drop them, hang until `hung` is called (storing it on `true`), or throw. */
   routing: { mode: 'store' | 'drop' | 'hang' | 'throw'; hung: Array<(store?: boolean) => void> };
+  /** Sessions whose replies a stored turn expedited. */
+  expedited: string[];
+  /** Call starts: where the agent was looked up, which sessions were woken, and the idle-ceiling holds. */
+  prewarm: {
+    lookups: Array<{ route: Omit<InboundEvent, 'message'>; agentGroupId: string }>;
+    woke: string[];
+    holds: Array<{ sessionId: string; holder: string; untilMs: number; released: boolean }>;
+  };
   lk: FakeLiveKit;
   stop(): Promise<void>;
 }
@@ -165,6 +173,9 @@ async function startHarness(
   const clock = { now: Date.UTC(2026, 9, 2, 1, 0, 0) };
   const access = { enabled: true };
   const routing: Harness['routing'] = { mode: 'store', hung: [] };
+  const expedited: string[] = [];
+  const prewarm: Harness['prewarm'] = { lookups: [], woke: [], holds: [] };
+  const session = { id: 'sess-andy', agent_group_id: 'ag-andy' } as Session;
   const lk = fakeLiveKit();
   const adapter = createVoiceAdapter({
     publicUrl: `http://127.0.0.1:${port}`,
@@ -178,6 +189,22 @@ async function startHarness(
           }
         : null,
     now: () => clock.now,
+    expediteReplies: (stored) => void expedited.push(stored.id),
+    prewarm: {
+      findSession: async (route, agentGroupId) => {
+        prewarm.lookups.push({ route, agentGroupId });
+        return session;
+      },
+      wake: async (woken) => {
+        prewarm.woke.push(woken.id);
+        return true;
+      },
+      hold: (sessionId, holder, untilMs) => {
+        const hold = { sessionId, holder, untilMs, released: false };
+        prewarm.holds.push(hold);
+        return () => void (hold.released = true);
+      },
+    },
     livekit: {
       url: 'wss://lk.example.ts.net:47880',
       serverUrl: 'ws://127.0.0.1:7880',
@@ -203,13 +230,13 @@ async function startHarness(
       if (routing.mode === 'hang') {
         return new Promise<void>((resolve) =>
           routing.hung.push((store) => {
-            if (store) onStored?.();
+            if (store) onStored?.(session);
             resolve();
           }),
         );
       }
       if (routing.mode === 'throw') throw new Error('router exploded');
-      if (routing.mode === 'store') onStored?.();
+      if (routing.mode === 'store') onStored?.(session);
     },
     onMetadata: () => {},
     onAction: () => {},
@@ -224,6 +251,8 @@ async function startHarness(
     clock,
     access,
     lk,
+    expedited,
+    prewarm,
     stop: async () => {
       await adapter.teardown();
       await stopWebhookServer();
@@ -569,10 +598,63 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect((await worker.post('utterance', { text: 'broken' })).status).toBe(500);
     h.routing.mode = 'hang';
     expect((await worker.post('utterance', { text: 'stuck' })).status).toBe(504);
+    expect(h.expedited).toEqual([]);
     h.routing.mode = 'store';
     expect((await worker.post('utterance', { text: 'taken' })).status).toBe(202);
     expect(h.inbound).toHaveLength(4);
+    // The session that took it hands its reply over without waiting on the delivery poll.
+    expect(h.expedited).toEqual(['sess-andy']);
     worker.close();
+  });
+
+  it('starts the agent the call talks to when the caller joins, and holds it until the call ends', async () => {
+    const { call } = await startCall(h);
+    await vi.waitFor(() => expect(h.prewarm.woke).toEqual(['sess-andy']));
+    // Looked up where the first turn goes (the voice line here), for the line's agent; nothing was routed.
+    expect(h.prewarm.lookups).toEqual([
+      {
+        route: { channelType: 'voice', instance: 'voice', platformId: LINE, threadId: null },
+        agentGroupId: 'ag-andy',
+      },
+    ]);
+    expect(h.inbound).toEqual([]);
+    expect(h.prewarm.holds).toEqual([
+      {
+        sessionId: 'sess-andy',
+        holder: `voice-call:${call.callId}`,
+        untilMs: h.clock.now + 15 * MIN + 5 * MIN,
+        released: false,
+      },
+    ]);
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: call.callId })).status).toBe(204);
+    expect(h.prewarm.holds.map((hold) => hold.released)).toEqual([true]);
+  });
+
+  it('holds every session the turns of the call reach, and wakes nothing for a chat with no session yet', async () => {
+    await h.stop();
+    h = await startHarness({
+      prewarm: {
+        findSession: async () => undefined,
+        wake: async () => {
+          throw new Error('nothing to wake');
+        },
+        hold: (sessionId, holder, untilMs) => {
+          const hold = { sessionId, holder, untilMs, released: false };
+          h.prewarm.holds.push(hold);
+          return () => void (hold.released = true);
+        },
+      },
+    });
+    const { call, worker } = await startCall(h);
+    await settle();
+    expect(h.prewarm.holds).toEqual([]);
+    await worker.utter('hello');
+    await worker.utter('again');
+    expect(h.prewarm.holds.map((hold) => [hold.sessionId, hold.holder])).toEqual([
+      ['sess-andy', `voice-call:${call.callId}`],
+    ]);
+    worker.close();
+    await vi.waitFor(() => expect(h.prewarm.holds.map((hold) => hold.released)).toEqual([true]));
   });
 
   it('tells the worker when a turn it heard 504 for reaches the agent after all', async () => {

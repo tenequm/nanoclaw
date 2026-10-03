@@ -20,14 +20,21 @@ import { createHash } from 'node:crypto';
 import type http from 'node:http';
 import net from 'node:net';
 
-import type { ChannelAdapter, ChannelDefaults, ChannelSetup, OutboundMessage } from './adapter.js';
-import { registerChannelAdapter } from './channel-registry.js';
+import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundEvent, OutboundMessage } from './adapter.js';
+import { resolveThreadPolicy } from './channel-defaults.js';
+import { getChannelAdapter, getChannelDefaults, registerChannelAdapter } from './channel-registry.js';
 import type { VoiceUiConfig } from './voice-call-page.js';
 import { resolveVoiceLine, type ResolveLineOptions, type VoiceLine } from './voice-line.js';
 import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-livekit.js';
 import { DEFAULT_VOICE_MIRROR } from './voice-livekit-protocol.js';
+import { getMessagingGroupAgentByPair, getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
+import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
+import { expediteDelivery } from '../delivery.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { holdIdleCeiling } from '../reconcile-session.js';
+import { requestWake } from '../request-wake.js';
+import type { Session } from '../types.js';
 import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
 
 export const CHANNEL_TYPE = 'voice';
@@ -36,6 +43,10 @@ const MINUTE_MS = 60_000;
 const ACCESS_CHECK_INTERVAL_MS = 5000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
+/** After a turn reaches the agent, its session's replies are picked up at once for this long, not on the 1 s poll. */
+const CALL_REPLY_EXPEDITE_MS = 60_000;
+/** A call's hold on its sessions' idle ceiling outlasts the longest call by this much, in case the end is missed. */
+const CALL_HOLD_GRACE_MS = 5 * MINUTE_MS;
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 
@@ -172,6 +183,43 @@ export interface VoiceConfig {
   trustedProxyCidrs?: string;
   /** VOICE_ALLOWED_CLIENT_CIDRS: clients those proxies may forward (X-Forwarded-For); unset is any. */
   allowedClientCidrs?: string;
+  /** The session a call's turn went to: its replies are delivered without waiting on the poll. Test seam. */
+  expediteReplies?: (session: Session) => void;
+  /** How a call finds, starts and holds the agent session it talks to (findCallSession, requestWake, holdIdleCeiling). Test seams. */
+  prewarm?: {
+    findSession?: (route: Omit<InboundEvent, 'message'>, agentGroupId: string) => Promise<Session | undefined>;
+    wake?: (session: Session) => Promise<boolean>;
+    hold?: (sessionId: string, holder: string, untilMs: number) => () => void;
+  };
+}
+
+/**
+ * The active session a turn to `route` would be stored in, found without creating anything: the
+ * router's own resolution (routeInbound / deliverToAgent in src/router.ts) for the one agent. None
+ * when the chat, the wiring or the session does not exist yet; the first turn then creates it.
+ */
+export async function findCallSession(
+  route: Omit<InboundEvent, 'message'>,
+  agentGroupId: string,
+): Promise<Session | undefined> {
+  const instance = route.instance ?? route.channelType;
+  const found = await getMessagingGroupWithAgentCount(route.channelType, route.platformId, instance);
+  if (!found) return undefined;
+  const { mg } = found;
+  const wiring = await getMessagingGroupAgentByPair(mg.id, agentGroupId);
+  if (!wiring) return undefined;
+  const supportsThreads = getChannelAdapter(instance)?.supportsThreads === true;
+  const threadsEnabled = resolveThreadPolicy(
+    wiring.threads ?? null,
+    getChannelDefaults(mg.instance ?? mg.channel_type, mg.channel_type),
+    mg.is_group === 1,
+    supportsThreads,
+  );
+  const threadId = threadsEnabled ? route.threadId : null;
+  const mode =
+    threadsEnabled && wiring.session_mode !== 'agent-shared' && mg.is_group !== 0 ? 'per-thread' : wiring.session_mode;
+  if (mode === 'agent-shared') return findSessionByAgentGroup(agentGroupId);
+  return findSessionForAgent(agentGroupId, mg.id, mode === 'shared' ? null : threadId);
 }
 
 /**
@@ -200,6 +248,11 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
     ((platformId: string, options?: ResolveLineOptions) =>
       resolveVoiceLine(platformId, undefined, { vocabulary: config.vocabulary, ...options }));
   const now = config.now ?? (() => Date.now());
+  const expediteReplies =
+    config.expediteReplies ?? ((session: Session) => expediteDelivery(session, CALL_REPLY_EXPEDITE_MS));
+  const findSession = config.prewarm?.findSession ?? findCallSession;
+  const wakeSession = config.prewarm?.wake ?? ((session: Session) => requestWake(session, 'voice-call'));
+  const holdSession = config.prewarm?.hold ?? holdIdleCeiling;
   const maxCallDurationMs = config.maxCallDurationMs ?? 15 * 60_000;
   const maxCallsPerHour = config.maxCallsPerHour ?? 12;
   const maxCallMsPerDay = config.maxCallMsPerDay ?? 120 * MINUTE_MS;
@@ -256,6 +309,29 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
     usage.set(call.platformId, { day, usedMs: (used?.day === day ? used.usedMs : 0) + elapsedTodayMs(call, t) });
   };
 
+  /** Per live call: releases of its holds on the idle ceiling of the sessions it talks to, by session id. */
+  const callHolds = new Map<string, Map<string, () => void>>();
+  const holdForCall = (callId: string, sessionId: string): void => {
+    const holds = callHolds.get(callId);
+    if (!holds || holds.has(sessionId)) return;
+    holds.set(
+      sessionId,
+      holdSession(sessionId, `voice-call:${callId}`, now() + maxCallDurationMs + CALL_HOLD_GRACE_MS),
+    );
+  };
+
+  /**
+   * The caller is in: start the agent the first turn goes to, so that turn meets a running agent,
+   * and keep it from being reaped as idle while the call lasts. Nothing reaches the chat.
+   */
+  const prewarmCall = async (callId: string, route: Omit<InboundEvent, 'message'>, agentGroupId: string) => {
+    const session = await findSession(route, agentGroupId);
+    if (!session || !callHolds.has(callId)) return;
+    holdForCall(callId, session.id);
+    if (await wakeSession(session))
+      log.info('livekit-voice: agent running for the call', { callId, sessionId: session.id });
+  };
+
   const livekit = createLiveKitVoice(config.livekit, {
     ui: config.ui,
     resolveLine,
@@ -269,7 +345,13 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
           log.warn('livekit-voice: channel is not running; turn dropped', { platformId: event.platformId });
           return reject(new Error('the voice channel is not running'));
         }
-        setup.routeInboundEvent({ ...event, onStored: () => resolve(true) }).then(
+        const onStored = (session: Session) => {
+          expediteReplies(session);
+          const turn = parseLiveKitUtteranceId(event.message.id);
+          if (turn) holdForCall(turn.callId, session.id);
+          resolve(true);
+        };
+        setup.routeInboundEvent({ ...event, onStored }).then(
           () => resolve(false),
           (err: unknown) => {
             log.error('livekit-voice: routing a turn failed', { platformId: event.platformId, err });
@@ -277,6 +359,17 @@ export function createVoiceAdapter(config: VoiceConfig): VoiceChannelAdapter {
           },
         );
       }),
+    callJoined: (callId, route, agentGroupId) => {
+      if (callHolds.has(callId)) return;
+      callHolds.set(callId, new Map());
+      prewarmCall(callId, route, agentGroupId).catch((err: unknown) =>
+        log.warn('livekit-voice: could not start the agent for the call', { callId, err }),
+      );
+    },
+    callEnded: (callId) => {
+      for (const release of callHolds.get(callId)?.values() ?? []) release();
+      callHolds.delete(callId);
+    },
     isRunning: () => connected,
     now,
     maxCallDurationMs,

@@ -90,6 +90,7 @@ src/channels/voice-registration.test.ts
 src/channels/voice-line.test.ts
 src/channels/voice-call-page.test.ts
 src/channels/voice-livekit.test.ts
+src/channels/voice-call-session.test.ts
 src/voice-livekit-worker.test.ts
 src/voice-wakeword.test.ts
 src/voice-wakeword-fixtures/positive.wav
@@ -99,7 +100,13 @@ src/voice-wakeword-fixtures/negative.wav
 ### 2. Register the adapter
 
 Append the self-registration import to the channel barrel (skipped if present).
-This one line is the skill's only reach-in into the channel core:
+This one line is the only edit the skill makes to the channel core. The adapter
+also relies on core pieces this fork's trunk carries and upstream does not:
+host-addressed turns (`agentGroupId` and `onStored` on `InboundEvent`,
+`routeInboundEvent`), `expediteDelivery` in `src/delivery.ts`, the `voice-call`
+wake reason with `holdIdleCeiling` in `src/reconcile-session.ts`, and the agent
+runner's idle start and prompt-cache warm for that wake. Apply it to this
+fork's trunk, not to plain upstream:
 
 ```nc:append to:src/channels/index.ts
 import './voice.js';
@@ -153,7 +160,7 @@ page check, and the integration tests (a fake LiveKit server behind the real
 webhook server, and the worker's turn-taking rules):
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.test.ts src/voice-wakeword.test.ts
+pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/channels/voice-call-session.test.ts src/voice-livekit-worker.test.ts src/voice-wakeword.test.ts
 ```
 
 `voice-registration.test.ts` imports the real channel barrel and asserts the
@@ -528,6 +535,9 @@ documented operating point for `hey_livekit`, and 0.5 for another model.
 commands in the same format (none by default: the skill ships no command model;
 train one with livekit-wakeword, e.g. `send_it.onnx`). They share the wake word's
 feature models and thread. A relative model path is from NanoClaw's directory.
+`VOICE_WAKE_START_SECONDS` (default 8) and `VOICE_WAKE_IDLE_SECONDS` (default 20)
+are how long a turn the wake phrase opened waits for speech, right after the phrase
+and then after the last words, before it goes back to waiting (`0`: never).
 
 It also reads `VOICE_RECORDINGS_DAYS` (default `0`, off): with a
 number of days, it saves every caller turn it hears as a 16 kHz mono WAV plus a
@@ -824,8 +834,19 @@ with a wake word model (`VOICE_WAKE_MODEL`, by default livekit-wakeword's
 `hey livekit`, in a worker thread, 2 s windows every 80 ms), a score at or over
 `VOICE_WAKE_THRESHOLD` opens the turn (at most once in 2 s), and the switch and
 chip name that phrase (`say "hey livekit"`) instead of `hey <agent>`. The
-phrase's words, however the transcription spells them (`Hey, LiveKit`, `live kit`,
-`Лайвкіт`), are taken out of the next transcripts, with the words before them.
+transcription restarts right after the window that had the phrase and first hears
+again the audio since then (a 10 s replay of its input), so no transcript of the turn
+has the phrase and no word after it is lost; the page shows the phrase's own caption,
+if one got through, dimmed as "wake phrase". If the transcription cannot restart, the
+phrase's words, however it spells them (`Hey, LiveKit`, `live kit`, `Лайвкіт`), are
+taken out of the next transcripts instead, with the words before them. A turn the
+phrase opened that hears nothing for `VOICE_WAKE_START_SECONDS`, or nothing more for
+`VOICE_WAKE_IDLE_SECONDS` after its last words, goes back to waiting: a soft falling
+cue plays, the page says "went back to sleep", and words it held are dropped as
+`asleep`, never sent. A final that ends in `send it` as a question (`Should I send
+it?`) is words, not a send. A turn the session commits while the transcription still
+owes words (speech or interim text after its last final) waits up to 2 s for them, so
+a late `scratch that` drops it and late words join it.
 With a send or discard model, the open turn is scored for those phrases too (never
 while the agent speaks): a detection acts once the final transcript that ends in
 the phrase arrives, however it was spelled (`sent in`, `scratched at`), as the
@@ -842,11 +863,13 @@ advertises the commands with the attribute `nanoclaw.voice.commands` = "2" (the
 `send it` vocabulary; "1" was `over`, and a page offers the commands only to the value it
 knows, so a page left open across an update falls back to pauses) and
 takes the switches in the `nanoclaw.voice.settings` RPC (`{"wake", "pauseSends",
-"cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase", "heard"}`
-(`phrase` only with a wake word model; `heard` counts the wake phrases heard, so the
-page marks "heard - listening" even when it missed the awake state),
-and dropped words go out on the turn topic as `{"dropped": "discarded" |
-"unaddressed" | "command", "text"}`. The agent's own speech is never transcribed, so it
+"cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase", "heard",
+"slept", "cut"}` (`phrase` only with a wake word model, from the start while it loads;
+`heard` counts the wake phrases heard, so the page marks "heard - listening" even when
+it missed the awake state; `slept` counts the turns that went back to waiting; `cut`:
+the last wake restarted the transcription past the phrase), and dropped words go out
+on the turn topic as `{"dropped": "discarded" | "unaddressed" | "command" | "asleep",
+"text"}`. The agent's own speech is never transcribed, so it
 cannot trigger a command; caller speech that starts under it sends
 `{"unheard": "agent_speaking"}` on the turn topic, and the page notes "not heard -
 <agent> was speaking". `&demo=wake` plays the wake switch.
@@ -877,12 +900,14 @@ that cannot be spoken is reported as a delivery failure through the host retry
 path. Voice does not deliver files or interactive question cards; ask questions
 in plain spoken text and send attachments to another wired channel.
 
-**The first answer on a call takes about ten seconds.** That wait is the host
-creating the agent's session and starting its container. Ask a second question
-in the same call and the reply comes back quickly, because the container is
-already running. The page shows the agent working while it waits, rather than
-leaving the caller looking at a silent screen. Containers are reclaimed when a
-session goes idle, so the next call pays the same first-answer cost.
+**The first answer on a call is slower than the rest.** When the caller joins,
+the host starts the agent's container and its Claude session and refreshes the
+prompt cache, so the first turn usually meets a running agent. The first answer
+still pays for the start when the caller speaks within a few seconds of joining,
+or when the call's chat has no agent session yet (its first message creates
+one). The page shows the agent working while it waits, rather than leaving the
+caller looking at a silent screen. The container is kept for the whole call;
+after it, an idle container is reclaimed as before.
 
 **`Caller access denied` on the page.** Verify the voice user has a display name,
 is a member of the answering agent, and the line has exactly one strict,

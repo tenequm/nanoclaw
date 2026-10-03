@@ -681,6 +681,12 @@
 .voice-page[data-skin="te"] .transcript-box .is-streaming p:last-child::after { width: 0.55em; opacity: 0.9; }
 @keyframes caret { 50% { opacity: 0; } }
 .transcript-box p { margin: 0; }
+/* Interim caller text steps back until the transcription's final replaces it. */
+.bubble-you p { transition: opacity 0.2s ease-out; }
+.bubble-you.is-interim p { opacity: 0.6; }
+/* A turn's later caption pieces carry on under its first one's speaker row. */
+.voice-page .is-cont .bubble-you .speaker { display: none; }
+@media (prefers-reduced-motion: reduce) { .bubble-you p { transition: none; } }
 .ellipsis { color: var(--muted-foreground); }
 @media (prefers-reduced-motion: reduce) { .transcript-box .is-streaming p:last-child::after { animation: none; } }
 
@@ -994,6 +1000,7 @@
 /* Words the worker dropped stay readable but step back, like history. */
 .turn-mark.dropped { color: var(--muted-foreground); }
 .transcript-box .has-dropped p { color: var(--muted-foreground); }
+.transcript-box .is-wake-only p { color: var(--muted-foreground); }
 .transcript-box .has-discarded p { text-decoration: line-through; text-decoration-color: color-mix(in srgb, currentColor 45%, transparent); }
 .voice-page[data-skin="te"] .console .turn-mark.dropped { color: #8a877f; }
 
@@ -1162,6 +1169,7 @@
 .voice-page[data-skin="te"] .console .is-history { opacity: 1; }
 .voice-page[data-skin="te"] .console .is-history p { color: var(--scr-soft); }
 .voice-page[data-skin="te"] .console .has-dropped p { color: var(--scr-dim); }
+.voice-page[data-skin="te"] .console .is-wake-only p { color: var(--scr-dim); }
 .voice-page[data-skin="te"] .console .has-lost p { color: var(--scr-fg); }
 .voice-page[data-skin="te"] .speaker { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 8px; }
 .voice-page[data-skin="te"] .speaker > * { margin-left: 0; }
