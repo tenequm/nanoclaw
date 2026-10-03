@@ -118,6 +118,10 @@ export const AWAIT_REPLY_MS = 20_000;
 export const TURN_SETTLE_MS = 3_000;
 /** A reply waits at most silenceMs plus this for a caller who keeps talking, then takes the channel. */
 export const MAX_IDLE_WAIT_MS = 10_000;
+/** How long "working" outlasts the start of a reply's speech, so the page has the speaking state first. */
+const REPLY_HOLD_MS = 500;
+/** How long a turn the session committed waits for a final still on its way (SpokenCommands.finalPending). */
+const LATE_FINAL_WAIT_MS = 2_000;
 /** Speech that produced no transcript within this long after it ended is a lost turn. */
 const TRANSCRIPTION_TIMEOUT_MS = 5_000;
 /** Shorter untranscribed speech is a cough or a noise, not a lost turn, unless the STT failed. */
@@ -846,6 +850,12 @@ export interface CallVoice {
   publishUnheard?(): void;
   /** Clear the page's send countdown (the `nanoclaw.voice.pending` attribute). */
   clearPending?(): void;
+  /**
+   * Restart the transcription from `afterMs` ago: the session's open turn is dropped, and the new
+   * stream hears the audio since then again, then the live audio. Returns the new stream's number,
+   * or undefined when it could not restart (the stream that runs stays the current one).
+   */
+  cutTranscription?(afterMs: number): number | undefined;
   /** Review mode's controls on the session; absent where the session cannot run it. */
   review?: ReviewSession;
   /** Play a sound cue on the call's cue track; resolves once the track took all of it (heard about 0.1 s later). */
@@ -959,6 +969,10 @@ export class TurnTaking {
   private speech: Promise<void> = Promise.resolve();
   private readonly wakers = new Set<() => void>();
   private thinkingUntil = 0;
+  /** A turn the host took has had no reply yet: the agent's typing means it works on it. */
+  private awaitingReply = false;
+  /** A reply arrived and its line has not ended: the page keeps "working" until its audio plays. */
+  private replyComing = false;
   private thinking?: boolean;
   private statusTimer?: ReturnType<typeof setTimeout>;
   private feedbackQueued = false;
@@ -1046,8 +1060,11 @@ export class TurnTaking {
   onReply(text: string, turn?: number | null): void {
     if (this.closed) return;
     this.thinkingUntil = 0;
-    this.refresh();
+    this.awaitingReply = false;
     const full = speakableText(text);
+    // Working until the line is heard: its speech takes a moment to synthesize.
+    this.replyComing = !!full;
+    this.refresh();
     if (!full) return;
     const max = this.options.maxSpokenChars ?? DEFAULT_MAX_SPOKEN_CHARS;
     if (max > 0 && full.length > max) {
@@ -1065,7 +1082,8 @@ export class TurnTaking {
         about = turn === null ? { unprompted: true } : {};
       }
       const reply = this.announce(about);
-      if (await this.say(spoken)) return;
+      const heard = await this.say(spoken).finally(() => this.replyHeard());
+      if (heard) return;
       if (this.closed) return;
       this.deps.log.warn('voice worker: a reply could not be synthesized');
       // Nothing was heard: the page shows the words instead.
@@ -1079,9 +1097,13 @@ export class TurnTaking {
     this.inChat = inChat;
   }
 
-  /** The agent is still working (the host's typing refresh). */
-  onThinking(): void {
-    if (this.closed) return;
+  /**
+   * The agent is working: it picked up new work (`pickup`, the host's `working`), or it types on a
+   * turn the host took and has not answered yet. Typing after its reply (its own follow-up work)
+   * says nothing to the caller, who would otherwise see "working" with nothing coming.
+   */
+  onThinking(pickup = false): void {
+    if (this.closed || (!pickup && !this.awaitingReply)) return;
     this.thinkingUntil = Math.max(this.thinkingUntil, this.now() + THINKING_HOLD_MS);
     this.refresh();
   }
@@ -1110,6 +1132,7 @@ export class TurnTaking {
     onSent?.(result);
     if (this.closed) return;
     if (!result.accepted) return this.feedback(hostLossReason(result));
+    this.awaitingReply = true;
     this.thinkingUntil = Math.max(this.thinkingUntil, this.now() + AWAIT_REPLY_MS);
     this.refresh();
   }
@@ -1196,12 +1219,28 @@ export class TurnTaking {
     for (const wake of [...this.wakers]) wake();
   }
 
+  /** A turn the host took still awaits its reply: the agent's typing means it works on it. */
+  expectReply(): void {
+    this.awaitingReply = true;
+  }
+
+  /**
+   * The reply's line ended (heard or not): it no longer holds "working". While it plays the page shows
+   * the agent speaking anyway, so the hold spans the gap before its audio, whichever signal comes first.
+   */
+  replyHeard(): void {
+    if (!this.replyComing) return;
+    this.replyComing = false;
+    this.refresh();
+  }
+
   private refresh(): void {
     if (this.closed) return;
     const t = this.now();
-    const next = t < this.thinkingUntil;
+    const next = t < this.thinkingUntil || this.replyComing;
     clearTimeout(this.statusTimer);
-    if (next) {
+    // Only the hold expires on its own; a reply still coming lets go through replyHeard.
+    if (t < this.thinkingUntil) {
       this.statusTimer = setTimeout(() => this.refresh(), this.thinkingUntil - t + 1);
       this.statusTimer.unref?.();
     }
@@ -1223,10 +1262,11 @@ export function hostLossReason(result: SendResult): 'rate_limited' | 'rejected' 
  * The call's sound cues, played by the worker on its own track (CALL_CUE_TRACK): `listening` once the
  * call is ready (and when a review recording opens), `wake` on the wake phrase, `sent` as a turn goes
  * out, `discard` on a spoken discard, `turn` once the agent is done and nothing else is queued, `nope`
- * for a command with nothing to act on, `draft` when a review draft is ready to read. Nothing plays
- * while the agent works or speaks.
+ * for a command with nothing to act on, `draft` when a review draft is ready to read, `sleep` when a
+ * turn the wake phrase opened heard nothing for too long and waits for the phrase again. Nothing
+ * plays while the agent works or speaks.
  */
-export type CueKind = 'listening' | 'wake' | 'sent' | 'discard' | 'turn' | 'nope' | 'draft';
+export type CueKind = 'listening' | 'wake' | 'sent' | 'discard' | 'turn' | 'nope' | 'draft' | 'sleep';
 
 /** A cue note's amplitude (of full scale): a sine about 6 dB under the agent's speech on the wire. */
 const CUE_LEVEL = 0.15;
@@ -1278,6 +1318,14 @@ const CUES: Record<CueKind, { notes: ReadonlyArray<readonly [hz: number, at: num
       [659, 0.1, 0.12],
     ],
     level: CUE_LEVEL * 0.7,
+  },
+  // A soft falling fourth, quietest of all: nothing more was said, back to waiting.
+  sleep: {
+    notes: [
+      [659, 0, 0.1],
+      [494, 0.1, 0.14],
+    ],
+    level: CUE_LEVEL * 0.6,
   },
 };
 /** The cue track's audio: 48 kHz mono in 20 ms frames. */
@@ -1625,7 +1673,8 @@ const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[]]> = [
 
 /**
  * The command a final transcript ends with, and what was said before it, or null. Only the end
- * counts: `send it to Anna` is words, while a sentence that really ends in `send it` sends.
+ * counts: `send it to Anna` is words, while a sentence that really ends in `send it` sends; one
+ * that ends in it as a question (`Send it or not send it?`) is words too.
  */
 export function matchCommand(text: string): { command: SpokenCommand; rest: string } | null {
   const words = spokenWords(text);
@@ -1633,6 +1682,7 @@ export function matchCommand(text: string): { command: SpokenCommand; rest: stri
     if (words.length < phrase.length) continue;
     const tail = words.slice(words.length - phrase.length);
     if (!tail.every((w, i) => w.word === phrase[i])) continue;
+    if (text.slice(tail[tail.length - 1].end).includes('?')) return null;
     return {
       command,
       rest: text
@@ -1644,6 +1694,30 @@ export function matchCommand(text: string): { command: SpokenCommand; rest: stri
   return null;
 }
 
+/** How long an open turn waits for speech before it goes back to waiting for the wake phrase; 0 never. */
+export interface AwakeLimits {
+  /** After the wake phrase, with nothing said since. */
+  startMs: number;
+  /** After the caller's last speech, with words held. */
+  idleMs: number;
+}
+const DEFAULT_AWAKE_LIMITS: AwakeLimits = { startMs: 8_000, idleMs: 20_000 };
+
+/**
+ * VOICE_WAKE_START_SECONDS (8) and VOICE_WAKE_IDLE_SECONDS (20): how long a turn the wake phrase
+ * opened waits for speech, first and then after the last words, before it goes back to waiting; 0 never.
+ */
+export function awakeLimits(env: Record<string, string | undefined>): AwakeLimits {
+  const seconds = (raw: string | undefined, fallback: number) => {
+    const n = Number(raw?.trim() || NaN);
+    return Number.isFinite(n) && n >= 0 ? Math.round(n * 1000) : fallback;
+  };
+  return {
+    startMs: seconds(env.VOICE_WAKE_START_SECONDS, DEFAULT_AWAKE_LIMITS.startMs),
+    idleMs: seconds(env.VOICE_WAKE_IDLE_SECONDS, DEFAULT_AWAKE_LIMITS.idleMs),
+  };
+}
+
 export interface SpokenCommandDeps {
   /** Send these words as a turn now. */
   send(text: string): void;
@@ -1652,11 +1726,11 @@ export interface SpokenCommandDeps {
   drop(reason: CallDroppedSpeech['dropped'], text: string): void;
   /** What the open turn holds so far, as the session's transcription events would say it. */
   heard(text: string, final: boolean): void;
-  /** The open turn ended here (a send, a discard, the wake phrase): what it held is gone. */
+  /** The open turn ended here (a send, a discard, the wake phrase, back to waiting): what it held is gone. */
   cut(): void;
   /** The wake state changed. */
   changed(): void;
-  /** The caller's speech came to nothing to send (unaddressed, discarded, a command alone). */
+  /** The caller's speech came to nothing to send (unaddressed, discarded, a command alone, asleep). */
   noTurn?(): void;
 }
 
@@ -1684,6 +1758,11 @@ export class SpokenCommands {
   private readonly names: WakeName[];
   /** The acoustic wake word's phrase: when set, it opens the turn and the transcript's `hey <agent>` does not. */
   private wakeWord?: string;
+  /**
+   * The phrase of a wake word whose model still loads: the page names it from the start rather than
+   * `hey <agent>` for a moment. The transcript's `hey <agent>` opens the turn until it is in use.
+   */
+  private loadingPhrase?: string;
   /** After a spotted wake word: the finals that may still carry its phrase, to strip it from. */
   private strip?: { until: number; finals: number; keepBefore: boolean };
   /**
@@ -1693,11 +1772,21 @@ export class SpokenCommands {
   private lastUnaddressed?: { text: string; at: number; timer: ReturnType<typeof setTimeout> };
   /** How many times the wake phrase opened a turn this call. */
   private wakes = 0;
+  /** How many times an open turn went back to waiting with no speech (AwakeLimits). */
+  private slept = 0;
+  /** The last wake phrase restarted the transcription past it: its caption is the phrase alone. */
+  private wakeCut = false;
+  /** Speech or interim words came after the last final: a final for them is still on its way. */
+  private finalDue = false;
+  /** Waiting for that final (`nextFinal`): true when it came. */
+  private readonly finalWaiters = new Set<(came: boolean) => void>();
+  private awakeTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     names: readonly string[],
     private readonly deps: SpokenCommandDeps,
     private readonly now: () => number = () => Date.now(),
+    private readonly limits: AwakeLimits = DEFAULT_AWAKE_LIMITS,
   ) {
     this.names = wakeNameWords(names);
   }
@@ -1707,9 +1796,17 @@ export class SpokenCommands {
       on: this.wake,
       pauseSends: this.pauseSends,
       waiting: this.waiting,
-      ...(this.wakeWord ? { phrase: this.wakeWord } : {}),
+      ...(this.wakeWord || this.loadingPhrase ? { phrase: this.wakeWord ?? this.loadingPhrase } : {}),
       ...(this.wakes ? { heard: this.wakes } : {}),
+      ...(this.slept ? { slept: this.slept } : {}),
+      ...(this.wakeCut ? { cut: true } : {}),
     };
+  }
+
+  /** A wake word model loads for this phrase (`useWakeWord` once it is in use, or with none if it fails). */
+  loadWakeWord(phrase: string): void {
+    this.loadingPhrase = phrase;
+    this.deps.changed();
   }
 
   /** Waiting for an acoustic wake word: the audio is worth scoring. */
@@ -1719,9 +1816,15 @@ export class SpokenCommands {
 
   /** The acoustic wake word is in use (its phrase), or not, and `hey <agent>` in the transcript opens the turn. */
   useWakeWord(phrase: string | undefined): void {
-    if (phrase === this.wakeWord) return;
+    const wasLoading = this.loadingPhrase !== undefined;
+    this.loadingPhrase = undefined;
+    if (phrase === this.wakeWord) {
+      if (wasLoading) this.deps.changed();
+      return;
+    }
     this.wakeWord = phrase;
     this.strip = undefined;
+    this.wakeCut = false;
     this.reportUnaddressed();
     this.deps.changed();
   }
@@ -1730,9 +1833,19 @@ export class SpokenCommands {
    * The audio had the wake word: open the turn, as `hey <agent>` in a transcript does. Its words
    * arrive later, so the next finals are searched for the phrase and lose it (and, when it opened
    * the turn, what came before it). A final dropped just before may have held it after all.
+   *
+   * `cut`: the transcription restarted at the phrase's end (CallVoice.cutTranscription), so nothing
+   * it says from here has the phrase, and the words after it are heard again: no text is searched.
    */
-  onWakeWord(): void {
+  onWakeWord(cut = false): void {
     if (!this.wake || !this.wakeWord) return;
+    if (cut) {
+      if (!this.waiting) return;
+      this.wakeCut = true;
+      this.reportUnaddressed();
+      return this.open();
+    }
+    this.wakeCut = false;
     const now = this.now();
     const keepBefore = !this.waiting;
     this.strip = { until: now + WAKE_TEXT_WINDOW_MS, finals: WAKE_TEXT_FINALS, keepBefore };
@@ -1774,8 +1887,10 @@ export class SpokenCommands {
     if (wake === this.wake && pauseSends === this.pauseSends) return;
     if (wake !== this.wake) {
       this.awake = false;
+      this.disarm();
       this.pending = undefined;
       this.strip = undefined;
+      this.wakeCut = false;
       this.reportUnaddressed();
       // From here the open turn is these words: none when the gate closes, since none were addressed.
       this.cutSinceCommit = true;
@@ -1793,7 +1908,9 @@ export class SpokenCommands {
   reset(): void {
     this.heardWords = [];
     this.pending = undefined;
+    this.disarm();
     this.strip = undefined;
+    this.finalDue = false;
     this.reportUnaddressed();
     this.cutSinceCommit = true;
     if (this.awake) {
@@ -1802,13 +1919,38 @@ export class SpokenCommands {
     }
   }
 
+  /** Speech or interim words came after the last final: the transcription has more to say. */
+  get finalPending(): boolean {
+    return this.finalDue;
+  }
+
+  /** Resolves true at the next final transcript, or false after `ms` without one. */
+  nextFinal(ms: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const done = (came: boolean) => {
+        clearTimeout(timer);
+        this.finalWaiters.delete(done);
+        resolve(came);
+      };
+      const timer = setTimeout(() => done(false), ms);
+      timer.unref?.();
+      this.finalWaiters.add(done);
+    });
+  }
+
   onCallerSpeaking(speaking: boolean): void {
     this.callerSpeaking = speaking;
+    if (speaking) this.finalDue = true;
     if (!speaking) this.settle();
+    this.arm();
   }
 
   onTranscript(text: string, final: boolean): void {
     const words = text.trim();
+    if (final) {
+      this.finalDue = false;
+      for (const done of [...this.finalWaiters]) done(true);
+    } else if (words) this.finalDue = true;
     if (!final) {
       // New words after a final that ended in a command: it was mid-utterance after all.
       if (words && this.pending) this.unhold();
@@ -1876,7 +2018,7 @@ export class SpokenCommands {
     if (!match) {
       this.heardWords.push(said);
       this.deps.heard(said, true);
-      return;
+      return this.arm();
     }
     this.pending = { ...match, words: said };
     if (!this.callerSpeaking) this.settle();
@@ -1886,10 +2028,12 @@ export class SpokenCommands {
    * The session committed a turn after its closing silence: the text to send now, or null. Its own
    * text while nothing cut the turn since its last commit, else the words heard since the cut.
    */
-  onPause(sessionText: string): string | null {
+  onPause(sessionText: string, late = false): string | null {
     this.settle();
-    const cut = this.cutSinceCommit;
-    this.cutSinceCommit = false;
+    // `late`: a final came after the session committed; its words are in the turn, and the
+    // session's own text, which has them as the start of its next turn, is not the next turn.
+    const cut = this.cutSinceCommit || late;
+    this.cutSinceCommit = late;
     if (this.wake && !this.pausesSend) return null;
     const text = cut || this.wake ? this.heardWords.join(' ') : sessionText;
     this.heardWords = [];
@@ -1904,9 +2048,42 @@ export class SpokenCommands {
     this.wakes++;
     this.heardWords = [];
     this.cutSinceCommit = true;
+    // A commit still waiting for a final from before the phrase must not take this turn's first words.
+    for (const done of [...this.finalWaiters]) done(false);
     this.deps.cut();
     this.deps.cue('wake');
     this.deps.changed();
+    this.arm();
+  }
+
+  /**
+   * While the turn is open and the caller silent, the clock to going back to waiting runs: from the
+   * wake phrase (or the last speech) while nothing was said, and from the last speech once words are held.
+   */
+  private arm(): void {
+    this.disarm();
+    if (!this.awake || this.callerSpeaking || this.pending) return;
+    const ms = this.heardWords.length ? this.limits.idleMs : this.limits.startMs;
+    if (!(ms > 0)) return;
+    this.awakeTimer = setTimeout(() => this.doze(), ms);
+    this.awakeTimer.unref?.();
+  }
+
+  private disarm(): void {
+    clearTimeout(this.awakeTimer);
+    this.awakeTimer = undefined;
+  }
+
+  /** No speech for too long: the open turn goes back to waiting, and what it held is never sent. */
+  private doze(): void {
+    this.awakeTimer = undefined;
+    if (!this.awake || this.callerSpeaking || this.pending) return;
+    const held = this.heardWords.join(' ');
+    if (held) this.deps.drop('asleep', held);
+    this.slept++;
+    this.cutTurn();
+    this.deps.cue('sleep');
+    this.deps.noTurn?.();
   }
 
   /**
@@ -1992,6 +2169,7 @@ export class SpokenCommands {
 
   /** Back to waiting for the wake phrase. */
   private sleep(): void {
+    this.disarm();
     if (!this.awake) return;
     this.awake = false;
     this.deps.changed();
@@ -2437,7 +2615,8 @@ export interface WakeWord {
 }
 
 export interface WakeWordEvents {
-  onDetect(score: number): void;
+  /** `after`: the audio (16 kHz samples) that came in after the window with the phrase, by the time it was scored. */
+  onDetect(score: number, after: number): void;
   /** It stopped for good after it loaded. */
   onError(err: string): void;
 }
@@ -2486,11 +2665,71 @@ const FLUSH_SILENCE = new AudioFrame(
   samplesOf(FLUSH_CHUNK_MS),
 );
 
+/** How much of the transcription's recent input is kept, to give a restarted stream again. */
+const REPLAY_KEEP_MS = 10_000;
+
+/** The last `samples` (at the frame's own rate) of an audio frame. */
+function tailOf(frame: AudioFrame, samples: number): AudioFrame {
+  if (samples >= frame.samplesPerChannel) return frame;
+  const from = (frame.samplesPerChannel - samples) * frame.channels;
+  return new AudioFrame(frame.data.slice(from), frame.sampleRate, frame.channels, samples);
+}
+
+const frameMs = (frame: AudioFrame): number => (frame.samplesPerChannel / frame.sampleRate) * 1000;
+
+/**
+ * The transcription's input of the last REPLAY_KEEP_MS, to start a restarted stream with: a
+ * restart drops what the old stream had not finalized, and this gives it back from a cut point.
+ */
+export class ReplayBuffer {
+  private recent: AudioFrame[] = [];
+  private recentMs = 0;
+  /** All the input taken so far (ms). */
+  private takenMs = 0;
+  /** The cut: the next stream gets the input taken since this point (ms into `takenMs`). */
+  private from?: number;
+  /** When the cut was made: a restart that never came leaves no replay for a later one. */
+  private cutAt = 0;
+
+  /** A frame the transcription took. */
+  keep(frame: AudioFrame): void {
+    this.recent.push(frame);
+    this.recentMs += frameMs(frame);
+    this.takenMs += frameMs(frame);
+    while (this.recent.length > 1 && this.recentMs - frameMs(this.recent[0]) >= REPLAY_KEEP_MS) {
+      this.recentMs -= frameMs(this.recent.shift()!);
+    }
+  }
+
+  /** Cut `ms` back from the input taken so far; undefined: no cut. */
+  cut(ms: number | undefined): void {
+    this.from = ms === undefined ? undefined : this.takenMs - ms;
+    this.cutAt = Date.now();
+  }
+
+  /** The input taken since the cut, as it went to the transcription; none without one. Clears the cut. */
+  take(): AudioFrame[] {
+    if (this.from === undefined) return [];
+    let left = this.takenMs - this.from;
+    this.from = undefined;
+    if (Date.now() - this.cutAt >= STALE_STREAM_MS) return [];
+    const out: AudioFrame[] = [];
+    for (let i = this.recent.length - 1; i >= 0 && left > 0; i--) {
+      const frame = this.recent[i];
+      const ms = frameMs(frame);
+      out.unshift(ms <= left ? frame : tailOf(frame, Math.round((left / 1000) * frame.sampleRate)));
+      left -= ms;
+    }
+    return out;
+  }
+}
+
 class CallAgent extends voice.Agent {
   /** The session's transcription streams so far; it opens a new one on every restart. */
   streams = 0;
   private feed?: TransformStreamDefaultController<AudioFrame>;
   private flushTimer?: ReturnType<typeof setInterval>;
+  private readonly replay = new ReplayBuffer();
 
   constructor(
     private readonly onTurn: (text: string) => void,
@@ -2526,6 +2765,14 @@ class CallAgent extends voice.Agent {
   }
 
   /**
+   * The next transcription stream starts with the last `ms` of the input the current one took, then
+   * the live audio; undefined: it does not.
+   */
+  replayNext(ms: number | undefined): void {
+    this.replay.cut(ms);
+  }
+
+  /**
    * The audio the transcription gets (silence while the agent speaks), copied for recordings, with
    * a way in for the flush's silence; and what it transcribes, numbered by stream.
    */
@@ -2536,13 +2783,18 @@ class CallAgent extends voice.Agent {
     const tap = this.tap;
     const stream = ++this.streams;
     const source = audio instanceof ReadableStream ? audio : ReadableStream.from(audio);
+    // The old stream took input until it closed: all of it since the cut goes to this one.
+    const replay = this.replay.take();
     const fed = source.pipeThrough(
       new TransformStream<AudioFrame, AudioFrame>({
         start: (controller) => {
           this.feed = controller;
+          // Already tapped once: heard again, not counted again.
+          for (const frame of replay) controller.enqueue(frame);
         },
-        transform(frame, controller) {
+        transform: (frame, controller) => {
           tap?.(frame);
+          this.replay.keep(frame);
           controller.enqueue(frame);
         },
       }),
@@ -2595,6 +2847,7 @@ export function callSession(
   agent: voice.Agent;
   say(text: string): Promise<boolean>;
   clearPending(): void;
+  cutTranscription(afterMs: number): number | undefined;
   review: Omit<ReviewVoice, 'publishReview'>;
 } {
   const apiKey = settings.geminiKey;
@@ -2856,6 +3109,19 @@ export function callSession(
       takeTurn: take,
     },
     clearPending: () => countdown.clear(),
+    cutTranscription(afterMs) {
+      agent.replayNext(afterMs);
+      try {
+        session.clearUserTurn();
+      } catch (err) {
+        agent.replayNext(undefined);
+        log.warn('voice worker: could not restart the transcription at the wake word', { err });
+        return undefined;
+      }
+      // The session's turn so far was before the phrase: no recording of the next turn carries it.
+      take();
+      return agent.streams + 1;
+    },
     async say(text) {
       // Replies are spoken one at a time, so a failure counted meanwhile is this one's.
       const failures = ttsFailures;
@@ -2876,7 +3142,7 @@ async function sessionVoice(
   const userData = ctx.proc.userData as WorkerUserData;
   userData.vad ??= await loadVad();
   if (meta.sttFallbackModel) userData.fallbackVad ??= await loadFallbackVad();
-  const { session, agent, say, clearPending, review } = callSession(
+  const { session, agent, say, clearPending, cutTranscription, review } = callSession(
     meta,
     settings,
     { vad: userData.vad, fallbackVad: userData.fallbackVad },
@@ -2926,6 +3192,7 @@ async function sessionVoice(
     publishUnheard: () =>
       sendJson(CALL_TURN_TOPIC, { unheard: 'agent_speaking' } satisfies CallUnheardSpeech, 'unheard speech'),
     clearPending,
+    cutTranscription,
     async playCue(kind) {
       await cueTrack?.feed.play(cueFrames(kind));
     },
@@ -2960,6 +3227,8 @@ function defaultDeps(): RunCallDeps {
     'VOICE_MAX_SPOKEN_CHARS',
     'VOICE_WAKE_MODEL',
     'VOICE_WAKE_THRESHOLD',
+    'VOICE_WAKE_START_SECONDS',
+    'VOICE_WAKE_IDLE_SECONDS',
   ]);
   const wake = wakeWordSettings(env);
   return {
@@ -3060,6 +3329,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   };
   let turnCueTimer: ReturnType<typeof setTimeout> | undefined;
   let turnCuedAt = 0;
+  let replyHoldTimer: ReturnType<typeof setTimeout> | undefined;
   const turnTaking = new TurnTaking(
     {
       send: async (text) => {
@@ -3127,6 +3397,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     ending = true;
     clearTimeout(readyTimer);
     clearTimeout(turnCueTimer);
+    clearTimeout(replyHoldTimer);
     turnTaking.close();
     review?.close();
     if (wakeWord) {
@@ -3225,26 +3496,37 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   };
   /** The transcription stream auto mode's words come from, for review's view of the open turn. */
   let autoStream = 0;
-  const commands = new SpokenCommands([meta.agentName, ...(meta.wakeNames ?? [])], {
-    send: (text) => sendTurn(text, callVoice?.review?.takeTurn() ?? { sttModel: meta.sttModel }),
-    cue,
-    drop: (dropped, text) => {
-      if (ending) return;
-      callVoice?.publishDropped?.({ dropped, text });
-      // A command alone sends nothing: no countdown runs toward a send.
-      if (dropped === 'command') callVoice?.clearPending?.();
+  /**
+   * Auto mode's transcripts from older streams are stale: the wake word restarted the transcription
+   * past them. For STALE_STREAM_MS, as review's are: a restart that never came must not silence the call.
+   */
+  let autoFrom = 0;
+  let autoCutAt = 0;
+  const commands = new SpokenCommands(
+    [meta.agentName, ...(meta.wakeNames ?? [])],
+    {
+      send: (text) => sendTurn(text, callVoice?.review?.takeTurn() ?? { sttModel: meta.sttModel }),
+      cue,
+      drop: (dropped, text) => {
+        if (ending) return;
+        callVoice?.publishDropped?.({ dropped, text });
+        // A command alone sends nothing: no countdown runs toward a send.
+        if (dropped === 'command') callVoice?.clearPending?.();
+      },
+      heard: (text, final) => review?.onTranscript(text, final, autoStream),
+      // A settings change during a review recording must not touch the recording.
+      cut: () => {
+        if (!review?.reviewing) review?.onAutoTurnClosed();
+      },
+      changed: () => {
+        turnTaking.setCaptureOpen(commands.holdsReplies, 'wake');
+        review?.republish();
+      },
+      noTurn: () => turnTaking.releaseTurn(),
     },
-    heard: (text, final) => review?.onTranscript(text, final, autoStream),
-    // A settings change during a review recording must not touch the recording.
-    cut: () => {
-      if (!review?.reviewing) review?.onAutoTurnClosed();
-    },
-    changed: () => {
-      turnTaking.setCaptureOpen(commands.holdsReplies, 'wake');
-      review?.republish();
-    },
-    noTurn: () => turnTaking.releaseTurn(),
-  });
+    undefined,
+    awakeLimits(deps.env),
+  );
   try {
     callVoice = await deps.createVoice(
       ctx,
@@ -3255,10 +3537,17 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           // An auto commit that lost the race to a switch: its words are already the review draft.
           if (review?.reviewing) return;
           // The pause may send the session's turn, the words since a spoken command, or nothing.
-          const send = commands.onPause(text);
-          if (send === null) return turnTaking.releaseTurn();
-          review?.onAutoTurnClosed();
-          sendTurn(send, take);
+          const commit = (late: boolean) => {
+            if (ending || review?.reviewing) return;
+            const send = commands.onPause(text, late);
+            if (send === null) return turnTaking.releaseTurn();
+            review?.onAutoTurnClosed();
+            sendTurn(send, take);
+          };
+          // The transcription is late with the last words (they may be the turn's end, or `scratch
+          // that`): the turn waits a moment for them rather than going out without them.
+          if (!commands.finalPending) return commit(false);
+          void commands.nextFinal(LATE_FINAL_WAIT_MS).then(commit);
         },
         onCallerSpeaking: (speaking) => {
           callerSpeaking = speaking;
@@ -3273,6 +3562,14 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           if (ending || review?.reviewing) return;
           // Before the wake phrase speech is not for the agent: only a failed transcription is said.
           if (reason === 'empty' && commands.waiting) return;
+          // After the wake phrase the turn stays open, and words transcribed late still join it:
+          // nothing is lost yet, and the page never marks words "no words heard".
+          if (reason === 'empty' && commands.holdsReplies) {
+            callLog.info('voice worker: no transcript yet for speech in the open turn', fields);
+            turnTaking.releaseTurn();
+            saveTurn(++turns, take, '', { reason });
+            return;
+          }
           // After the wake phrase the turn stays open until `send it`: a lost stretch does not close it.
           if (!commands.holdsReplies) review?.onAutoTurnClosed();
           const turn = ++turns;
@@ -3291,13 +3588,21 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         pausesSend: () => !review?.reviewing && commands.pausesSend,
         onTranscript: (text, final, stream) => {
           if (review?.reviewing) return review.onTranscript(text, final, stream);
-          if (review?.stale(stream)) return;
+          if (review?.stale(stream) || (stream < autoFrom && Date.now() - autoCutAt < STALE_STREAM_MS)) return;
           autoStream = stream;
           commands.onTranscript(text, final);
         },
         onSttError: () => review?.onSttError(),
         onAgentSpeaking: (speaking) => {
           agentSpeaking = speaking;
+          // The speaking state reaches the page first, then "working" lets go: no flash of listening
+          // before the reply's audio, nor of working after a short line. A line that ended sooner lets
+          // its successor's hold be.
+          clearTimeout(replyHoldTimer);
+          if (speaking) {
+            replyHoldTimer = setTimeout(() => turnTaking.replyHeard(), REPLY_HOLD_MS);
+            replyHoldTimer.unref?.();
+          }
           review?.onAgentSpeaking(speaking);
         },
         onUnheardSpeech: () => {
@@ -3319,9 +3624,17 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   if (!ending) {
     try {
       spotter = deps.wakeWord?.({
-        onDetect: (score) => {
-          callLog.info('voice worker: wake word spotted', { score: Math.round(score * 1000) / 1000 });
-          if (!ending && !review?.reviewing) commands.onWakeWord();
+        onDetect: (score, after) => {
+          const afterMs = Math.round((after / WAKE_SAMPLE_RATE) * 1000);
+          callLog.info('voice worker: wake word spotted', { score: Math.round(score * 1000) / 1000, afterMs });
+          if (ending || review?.reviewing) return;
+          // The turn's transcript starts after the phrase: the transcription restarts at the window
+          // that had it and hears what came since again. Without that, the phrase is cut from the text.
+          const stream = commands.spotting ? callVoice?.cutTranscription?.(afterMs) : undefined;
+          if (stream === undefined) return commands.onWakeWord();
+          autoFrom = stream;
+          autoCutAt = Date.now();
+          commands.onWakeWord(true);
         },
         onError: (err) => {
           callLog.warn('voice worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn', {
@@ -3335,6 +3648,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       callLog.warn('voice worker: could not start the wake word spotter', { err });
     }
     const loading = spotter;
+    if (loading) commands.loadWakeWord(loading.phrase);
     loading?.ready.then(
       () => {
         if (ending) return;
@@ -3345,6 +3659,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       (err: unknown) => {
         // A call that ended while the models loaded closed the spotter: nothing failed.
         if (ending) return;
+        commands.useWakeWord(undefined);
         callLog.warn('voice worker: no wake word model; "hey <agent>" in the transcript opens a turn', {
           err: err instanceof Error ? err.message : String(err),
         });
@@ -3410,9 +3725,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         // Any agent message after the turns the host took answers the "did it get it" question.
         pickedUp = Math.max(pickedUp, lastAccepted, typeof turn === 'number' ? turn : 0);
         turnTaking.onReply(event.text, turn);
+        // A reply to an earlier turn: a newer one the host took still awaits its own.
+        if (typeof turn === 'number' && turn < lastAccepted) turnTaking.expectReply();
       } else if (event.type === 'thinking') turnTaking.onThinking();
       else if (event.type === 'working') {
-        turnTaking.onThinking();
+        turnTaking.onThinking(true);
         // The runner works on what reached it after the newest turn the host took: the page's
         // working status, once per turn. While a newer turn awaits the host's answer the pickup could
         // be read as that one's, so it waits for the next tick.
@@ -3427,6 +3744,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         unconfirmed.delete(event.turnKey);
         turnsByHostId.set(event.id, late.turn);
         lastAccepted = Math.max(lastAccepted, late.turn);
+        if (late.turn > pickedUp) turnTaking.expectReply();
         callLog.info('voice worker: a timed-out turn reached the agent after all', { turn: late.turn });
         // The page's mark for this turn goes from "not confirmed" to "sent".
         publish({ turn: late.turn, status: 'sent', text: late.text });

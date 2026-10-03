@@ -70,6 +70,8 @@ import {
   matchWake,
   matchWakeText,
   wakeWordSettings,
+  awakeLimits,
+  ReplayBuffer,
   type WakeWord,
   type WakeWordEvents,
   READY_CUE_WAIT_MS,
@@ -791,6 +793,95 @@ describe('runCall', () => {
       { reply: 3 },
       { reply: 4 },
     ]);
+    host.endStream();
+  });
+
+  it('working shows while a turn awaits its reply and until the reply is heard, not for typing after it', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    let speak!: () => void;
+    v.voice.say.mockImplementation(() => new Promise<boolean>((resolve) => (speak = () => resolve(true))));
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    const thinking = () => v.voice.setThinking.mock.calls.at(-1)?.[0];
+    // Typing with no turn waiting for its answer says nothing.
+    host.emit({ type: 'thinking' });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(v.voice.setThinking).not.toHaveBeenCalled();
+
+    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.waitFor(() => expect(thinking()).toBe(true));
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.'));
+    // The reply's speech is still being made: the page keeps "working" until its audio plays.
+    expect(thinking()).toBe(true);
+    v.events.onAgentSpeaking?.(true);
+    expect(thinking()).toBe(true);
+    // A moment into its audio (the page has the speaking state by then) it lets go.
+    await vi.waitFor(() => expect(thinking()).toBe(false));
+    speak();
+    v.events.onAgentSpeaking?.(false);
+    // The agent's typing after its answer: no "working" with nothing coming.
+    host.emit({ type: 'thinking' });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(thinking()).toBe(false);
+    host.endStream();
+  });
+
+  it('a turn the session commits while a final is still on its way waits for it (a late discard drops it)', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    const utterances = () => host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+    const take = { sttModel: 'gemini-3.5-transcribe-live' };
+
+    v.events.onCallerSpeaking(true);
+    v.events.onTranscript?.('Remind me to call the plumber.', true, 1);
+    v.events.onTranscript?.('Scratch', false, 1);
+    v.events.onCallerSpeaking(false);
+    v.events.onTurn('Remind me to call the plumber.', take);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(utterances()).toEqual([]);
+    v.events.onTranscript?.('Scratch that.', true, 1);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(utterances()).toEqual([]);
+
+    // A late final with more words: they are in the turn, and not in the next one.
+    v.events.onCallerSpeaking(true);
+    v.events.onTranscript?.('Скільки буде сім помножити на вісім?', true, 1);
+    v.events.onCallerSpeaking(true);
+    v.events.onCallerSpeaking(false);
+    v.events.onTurn('Скільки буде сім помножити на вісім?', take);
+    v.events.onTranscript?.('Одним словом.', true, 1);
+    await vi.waitFor(() => expect(utterances()).toEqual(['Скільки буде сім помножити на вісім? Одним словом.']));
+    v.events.onCallerSpeaking(true);
+    v.events.onTranscript?.('And the weather?', true, 1);
+    v.events.onCallerSpeaking(false);
+    v.events.onTurn('Одним словом. And the weather?', take);
+    await vi.waitFor(() => expect(utterances()).toHaveLength(2));
+    expect(utterances()[1]).toBe('And the weather?');
+    host.endStream();
+  });
+
+  it('a turn waits at most 2 s for a late final, then goes out as the session had it', async () => {
+    vi.useFakeTimers();
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, deps(host.fetchImpl, v.createVoice));
+    v.events.onCallerSpeaking(true);
+    v.events.onTranscript?.('Book a table', true, 1);
+    v.events.onTranscript?.('for', false, 1);
+    v.events.onCallerSpeaking(false);
+    v.events.onTurn('Book a table', { sttModel: 'gemini-3.5-transcribe-live' });
+    await vi.advanceTimersByTimeAsync(1_900);
+    expect(host.calls.filter((c) => c.url.endsWith('/utterance'))).toEqual([]);
+    await vi.advanceTimersByTimeAsync(200);
+    vi.useRealTimers();
+    await vi.waitFor(() =>
+      expect(host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text)).toEqual(['Book a table']),
+    );
     host.endStream();
   });
 
@@ -2135,7 +2226,7 @@ describe('spoken command matching', () => {
   });
 });
 
-function commandsHarness(names = ['Andy'], now?: () => number) {
+function commandsHarness(names = ['Andy'], now?: () => number, limits?: { startMs: number; idleMs: number }) {
   const sent: string[] = [];
   const cues: CueKind[] = [];
   const dropped: Array<[string, string]> = [];
@@ -2153,6 +2244,7 @@ function commandsHarness(names = ['Andy'], now?: () => number) {
       changed: () => changes++,
     },
     now,
+    limits,
   );
   /** One stretch of speech: the caller talks, the final arrives, then they stop. */
   const say = (text: string) => {
@@ -2372,7 +2464,7 @@ describe('speech model memory across calls', () => {
 
 describe('cue audio', () => {
   it('is 20 ms frames of 48 kHz mono: 150-250 ms of tone held near its level, with soft edges', () => {
-    for (const kind of ['listening', 'wake', 'sent', 'discard', 'turn', 'nope', 'draft'] as const) {
+    for (const kind of ['listening', 'wake', 'sent', 'discard', 'turn', 'nope', 'draft', 'sleep'] as const) {
       const frames = cueFrames(kind);
       for (const f of frames) expect([f.sampleRate, f.channels, f.samplesPerChannel]).toEqual([48_000, 1, 960]);
       const pcm = Int16Array.from(frames.flatMap((f) => [...f.data]));
@@ -2933,6 +3025,110 @@ describe('acoustic wake word', () => {
   });
 });
 
+describe('awake limits and the wake cut', () => {
+  function awake(limits = { startMs: 8_000, idleMs: 20_000 }) {
+    vi.useFakeTimers();
+    const h = commandsHarness(['Andy'], undefined, limits);
+    h.commands.configure(true, false);
+    h.commands.useWakeWord('hey livekit');
+    return h;
+  }
+
+  it('reads its limits from the settings, in seconds; 0 is never', () => {
+    expect(awakeLimits({})).toEqual({ startMs: 8_000, idleMs: 20_000 });
+    expect(awakeLimits({ VOICE_WAKE_START_SECONDS: '5', VOICE_WAKE_IDLE_SECONDS: '0' })).toEqual({
+      startMs: 5_000,
+      idleMs: 0,
+    });
+    expect(awakeLimits({ VOICE_WAKE_START_SECONDS: 'soon', VOICE_WAKE_IDLE_SECONDS: '-1' })).toEqual({
+      startMs: 8_000,
+      idleMs: 20_000,
+    });
+  });
+
+  it('nothing said after the wake phrase: back to waiting with the sleep cue, nothing sent', () => {
+    const h = awake();
+    h.commands.onWakeWord(true);
+    expect(h.commands.waiting).toBe(false);
+    vi.advanceTimersByTime(7_900);
+    expect(h.commands.waiting).toBe(false);
+    vi.advanceTimersByTime(200);
+    expect(h.commands.waiting).toBe(true);
+    expect(h.cues).toEqual(['wake', 'sleep']);
+    expect(h.commands.state).toMatchObject({ waiting: true, heard: 1, slept: 1 });
+    expect(h.dropped).toEqual([]);
+    expect(h.sent).toEqual([]);
+  });
+
+  it('words held, then silence: they are dropped as asleep; speech keeps the turn open', () => {
+    const h = awake();
+    h.commands.onWakeWord(true);
+    h.commands.onCallerSpeaking(true);
+    vi.advanceTimersByTime(30_000);
+    expect(h.commands.waiting).toBe(false);
+    h.commands.onCallerSpeaking(false);
+    h.commands.onTranscript('Send it or not send it?', true);
+    vi.advanceTimersByTime(19_000);
+    h.say('Hmm, let me think.');
+    vi.advanceTimersByTime(19_000);
+    expect(h.commands.waiting).toBe(false);
+    vi.advanceTimersByTime(1_100);
+    expect(h.commands.waiting).toBe(true);
+    expect(h.dropped).toEqual([['asleep', 'Send it or not send it? Hmm, let me think.']]);
+    expect(h.cues).toEqual(['wake', 'sleep']);
+    expect(h.sent).toEqual([]);
+    // Nothing waits after a send.
+    h.commands.onWakeWord(true);
+    h.say('Book a table. Send it.');
+    expect(h.sent).toEqual(['Book a table.']);
+    vi.advanceTimersByTime(60_000);
+    expect(h.cues).toEqual(['wake', 'sleep', 'wake']);
+  });
+
+  it('0 turns a limit off', () => {
+    const h = awake({ startMs: 0, idleMs: 0 });
+    h.commands.onWakeWord(true);
+    vi.advanceTimersByTime(120_000);
+    expect(h.commands.waiting).toBe(false);
+  });
+
+  it('a cut wake searches no text for the phrase, and reports a held final as ignored at once', () => {
+    const h = awake();
+    h.say('So that is settled.');
+    expect(h.dropped).toEqual([]);
+    h.commands.onWakeWord(true);
+    expect(h.dropped).toEqual([['unaddressed', 'So that is settled.']]);
+    // A name in the turn stays: nothing is stripped.
+    h.say('LiveKit docs, open them. Send it.');
+    expect(h.sent).toEqual(['LiveKit docs, open them.']);
+  });
+
+  it('a question that ends in the send words asks, it does not send', () => {
+    expect(matchCommand('Send it or not send it?')).toBeNull();
+    expect(matchCommand('Should I send it?')).toBeNull();
+    expect(matchCommand('Is that it? Send it.')).toEqual({ command: 'send', rest: 'Is that it?' });
+    expect(matchCommand('Scratch that?')).toBeNull();
+  });
+
+  it('the replay buffer gives a restarted stream the input since the cut, the cut frame trimmed', () => {
+    const buf = new ReplayBuffer();
+    const frame = (n: number, value: number) => new AudioFrame(new Int16Array(n).fill(value), 16_000, 1, n);
+    for (let i = 1; i <= 5; i++) buf.keep(frame(320, i)); // 5 x 20 ms
+    expect(buf.take()).toEqual([]);
+    buf.cut(30);
+    // Taken after the cut, before the new stream starts: given back too.
+    buf.keep(frame(320, 6));
+    const replay = buf.take();
+    expect(replay.map((f) => f.samplesPerChannel)).toEqual([160, 320, 320]);
+    expect(replay.map((f) => f.data[0])).toEqual([4, 5, 6]);
+    expect(buf.take()).toEqual([]);
+    // Only the last 10 s are kept.
+    for (let i = 0; i < 1_000; i++) buf.keep(frame(320, 7));
+    buf.cut(60_000);
+    expect(buf.take().reduce((ms, f) => ms + f.samplesPerChannel / 16, 0)).toBe(10_000);
+  });
+});
+
 describe('acoustic wake word in a call', () => {
   function fakeWakeWord(load: 'ok' | 'fail' = 'ok') {
     let events!: WakeWordEvents;
@@ -3010,7 +3206,7 @@ describe('acoustic wake word in a call', () => {
 
     c.say('Hey Andy, so the plan is set.');
     expect(c.dropped).toEqual([]);
-    w.events.onDetect(0.97);
+    w.events.onDetect(0.97, 0);
     expect(c.dropped).toEqual([{ dropped: 'unaddressed', text: 'Hey Andy, so the plan is set.' }]);
     expect(c.r.last.wake?.waiting).toBe(false);
     c.frame();
@@ -3023,6 +3219,105 @@ describe('acoustic wake word in a call', () => {
     expect(w.listening.at(-1)).toBe(true);
     host.endStream();
     await vi.waitFor(() => expect(w.wake.close).toHaveBeenCalled());
+  });
+
+  it('a detection restarts the transcription at the phrase: the turn is only what came after it', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = wakeCall();
+    const w = fakeWakeWord();
+    let stream = 1;
+    const cut = vi.fn((_afterMs: number) => ++stream);
+    Object.assign(c.v.voice, { cutTranscription: cut });
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice, { wakeWord: w.make }));
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    await vi.waitFor(() => expect(c.r.last.wake?.phrase).toBe('hey livekit'));
+    c.say('So the plan is set.');
+
+    // 4000 samples after the window with the phrase: 250 ms of audio the new stream hears again.
+    w.events.onDetect(0.9, 4_000);
+    expect(cut).toHaveBeenCalledWith(250);
+    expect(c.dropped).toEqual([{ dropped: 'unaddressed', text: 'So the plan is set.' }]);
+    expect(c.r.last.wake).toMatchObject({ waiting: false, heard: 1, cut: true });
+    // The old stream's late words (the phrase) are past: never part of the turn.
+    c.v.events.onTranscript?.('Hey Lively', false, 1);
+    c.v.events.onTranscript?.('Hey Lively kit, book', true, 1);
+    c.v.events.onCallerSpeaking(true);
+    c.v.events.onCallerSpeaking(false);
+    c.v.events.onTranscript?.('Book a table for two. Send it.', true, 2);
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table for two.']));
+
+    // Without a restart (it failed), the phrase is taken out of the text as before.
+    cut.mockReturnValueOnce(undefined as unknown as number);
+    w.events.onDetect(0.9, 0);
+    expect(c.r.last.wake).toMatchObject({ waiting: false, heard: 2 });
+    expect(c.r.last.wake?.cut).toBeUndefined();
+    c.v.events.onCallerSpeaking(true);
+    c.v.events.onCallerSpeaking(false);
+    c.v.events.onTranscript?.('Hey, LiveKit. What time is it? Send it.', true, 3);
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table for two.', 'What time is it?']));
+    host.endStream();
+  });
+
+  it('a commit still waiting for a final from before the wake phrase does not take the turn it opened', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = wakeCall();
+    const w = fakeWakeWord();
+    let stream = 1;
+    Object.assign(c.v.voice, { cutTranscription: vi.fn(() => ++stream) });
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice, { wakeWord: w.make }));
+    await c.rpc('settings', { wake: true, pauseSends: true, cues: true });
+    await vi.waitFor(() => expect(c.r.last.wake?.phrase).toBe('hey livekit'));
+    const take = { sttModel: 'gemini-3.5-transcribe-live' };
+    // Speech before the phrase, its final late: the session's commit waits for it.
+    c.v.events.onCallerSpeaking(true);
+    c.v.events.onTranscript?.('So that', false, 1);
+    c.v.events.onCallerSpeaking(false);
+    c.v.events.onTurn('So that', take);
+    w.events.onDetect(0.9, 0);
+    await new Promise((r) => setTimeout(r, 10));
+    c.v.events.onTranscript?.('Book a table', true, 2);
+    await new Promise((r) => setTimeout(r, 10));
+    c.v.events.onTranscript?.('for two.', true, 2);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(utterances(host)).toEqual([]);
+    c.v.events.onTurn('Book a table for two.', take);
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table for two.']));
+    host.endStream();
+  });
+
+  it('speech with no transcript yet in an open turn is not lost: late words join the turn', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const c = wakeCall();
+    const w = fakeWakeWord();
+    await runCall(ctx, deps(host.fetchImpl, c.v.createVoice, { wakeWord: w.make }));
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    await vi.waitFor(() => expect(c.r.last.wake?.phrase).toBe('hey livekit'));
+    w.events.onDetect(0.9, 0);
+    c.v.events.onTurnLost('empty', { speechMs: 900 }, { sttModel: 'gemini-3.5-transcribe-live' });
+    expect(c.v.voice.publishTurn).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'lost' }));
+    c.say('Can I discard this message somehow?');
+    c.say('Send it.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Can I discard this message somehow?']));
+    host.endStream();
+  });
+
+  it('names the phrase while the model loads, and takes it back if it fails', async () => {
+    const { ctx } = fakeJob();
+    const c = wakeCall();
+    let fail!: (err: Error) => void;
+    const w = fakeWakeWord();
+    Object.assign(w.wake, { ready: new Promise<void>((_, reject) => (fail = reject)) });
+    w.wake.ready.catch(() => undefined);
+    await runCall(ctx, deps(fakeHostFetch().fetchImpl, c.v.createVoice, { wakeWord: w.make }));
+    await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
+    expect(c.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true, phrase: 'hey livekit' });
+    c.frame();
+    expect(w.pushed).toEqual([]);
+    fail(new Error('wake word model not found: x'));
+    await vi.waitFor(() => expect(c.r.last.wake).toEqual({ on: true, pauseSends: false, waiting: true }));
   });
 
   it('falls back to the transcript name when the model does not load, or stops', async () => {
@@ -3079,6 +3374,7 @@ describe('acoustic wake word in a call', () => {
       );
       await c.rpc('settings', { wake: true, pauseSends: false, cues: true });
       await vi.waitFor(() => expect(c.r.last.wake?.phrase).toBe('hey livekit'));
+      await spotter.ready;
       // 20 ms frames, as the room delivers them, each 80 ms waiting for its score.
       for (let at = 0; at < audio.length; at += 320) {
         c.v.events.onAudio?.(new AudioFrame(audio.slice(at, at + 320), 16_000, 1, Math.min(320, audio.length - at)));

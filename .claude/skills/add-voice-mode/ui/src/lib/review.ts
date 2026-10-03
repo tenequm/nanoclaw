@@ -33,7 +33,7 @@ export interface ReviewSnapshot {
    * Auto mode's wake switch as the worker runs it: `waiting` until it hears `hey <agent>`, or its
    * acoustic wake word's `phrase` when it has one.
    */
-  wake?: { on: boolean; pauseSends: boolean; waiting: boolean; phrase?: string; heard?: number }
+  wake?: { on: boolean; pauseSends: boolean; waiting: boolean; phrase?: string; heard?: number; slept?: number; cut?: boolean }
 }
 
 export function isReviewSnapshot(v: unknown): v is ReviewSnapshot {
@@ -76,6 +76,29 @@ export interface ReviewState {
   wakePhrase: string | null
   /** How many times this call the worker heard the wake phrase (CallWakeState.heard); each one flashes the readout. */
   wakeHeard: number
+  /** How many times this call an open turn went back to waiting with nothing more said (CallWakeState.slept). */
+  wakeSlept: number
+}
+
+const WAKE_PHRASE_KEY = "voice-wake-phrase"
+
+/** The wake phrase the worker named last time, so the page names it before this call's worker does. */
+export function storedWakePhrase(): string | null {
+  try {
+    return localStorage.getItem(WAKE_PHRASE_KEY) || null
+  } catch {
+    return null
+  }
+}
+
+/** Remember the worker's wake phrase for the next page load; null: `hey <agent>`. */
+export function storeWakePhrase(phrase: string | null): void {
+  try {
+    if (phrase) localStorage.setItem(WAKE_PHRASE_KEY, phrase)
+    else localStorage.removeItem(WAKE_PHRASE_KEY)
+  } catch {
+    // Storage off (a private window): the next load names `hey <agent>` until the worker says.
+  }
 }
 
 export const INITIAL_REVIEW: ReviewState = {
@@ -94,6 +117,7 @@ export const INITIAL_REVIEW: ReviewState = {
   awaitingWake: false,
   wakePhrase: null,
   wakeHeard: 0,
+  wakeSlept: 0,
 }
 
 /** What a key does when pressed. */

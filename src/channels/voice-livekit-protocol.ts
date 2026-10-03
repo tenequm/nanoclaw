@@ -107,13 +107,14 @@ export interface CallTurnStatus {
 /**
  * Caller words that will never be sent, on the turn topic: dropped by a spoken discard
  * (`discarded`), heard while auto mode waits for the wake phrase (`unaddressed`), or a spoken
- * command with nothing open to act on (`command`: a send word or a discard phrase said alone).
+ * command with nothing open to act on (`command`: a send word or a discard phrase said alone), or
+ * held by a turn the wake phrase opened that heard nothing more for too long (`asleep`).
  * `text` is what was heard, for the page to mark those caption lines. It carries no turn number, so
  * a page that does not know it ignores it. While an acoustic wake word waits, an `unaddressed` final
  * is reported a few seconds late: a wake word spotted just after it may make it the turn after all.
  */
 export interface CallDroppedSpeech {
-  dropped: 'discarded' | 'unaddressed' | 'command';
+  dropped: 'discarded' | 'unaddressed' | 'command' | 'asleep';
   text: string;
 }
 
@@ -192,6 +193,13 @@ export interface CallWakeState {
   phrase?: string;
   /** How many times this call the wake phrase opened a turn; grows on every wake, so a page that missed the awake state still sees it. */
   heard?: number;
+  /** How many times this call an open turn went back to waiting because nothing more was said; grows on every one. */
+  slept?: number;
+  /**
+   * The last wake phrase restarted the transcription right after it: no transcript of the turn has
+   * the phrase, and the caption line it was heard on is the phrase alone, never part of the turn.
+   */
+  cut?: boolean;
 }
 
 /**

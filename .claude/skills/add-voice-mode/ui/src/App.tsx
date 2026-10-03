@@ -103,7 +103,7 @@ const ERROR_HINT: Record<ErrorKind, string> = {
   other: "Try again.",
 }
 
-type LostReason = Exclude<NonNullable<TurnMark["reason"]>, "discarded" | "unaddressed" | "command">
+type LostReason = Exclude<NonNullable<TurnMark["reason"]>, "discarded" | "unaddressed" | "command" | "asleep">
 
 const LOST_REASON: Record<LostReason, string> = {
   stt: "couldn’t transcribe",
@@ -126,6 +126,7 @@ function markLabel(mark: TurnMark, text: string): string {
   if (mark.status === "sent" || mark.status === "sending") return mark.status
   if (mark.status === "dropped") {
     if (mark.reason === "command") return endsInDiscard(text) ? "nothing to discard" : "nothing to send"
+    if (mark.reason === "asleep") return "went back to sleep"
     return mark.reason === "unaddressed" ? "ignored · no wake phrase" : "discarded"
   }
   if (mark.reason === "timeout") return LOST_REASON.timeout
@@ -352,6 +353,7 @@ const TranscriptLine = memo(function TranscriptLine({
   mark,
   note,
   wake,
+  wakeOnly,
   awake,
   unspoken,
   preWake,
@@ -370,6 +372,8 @@ const TranscriptLine = memo(function TranscriptLine({
   note?: string
   /** The wake phrase was heard on this line. */
   wake?: boolean
+  /** The line is the wake phrase alone, no part of any turn: shown dim as the wake marker. */
+  wakeOnly?: boolean
   /** The worker still takes the turn this line opened. */
   awake: boolean
   /** The worker could not speak this agent line. */
@@ -387,14 +391,19 @@ const TranscriptLine = memo(function TranscriptLine({
   return (
     <Message
       from={from}
-      className={`${cont ? "is-cont pt-0 pb-1.5" : "py-1.5"} ${isLast ? "is-live" : "is-history"}${lost || unspoken ? " has-lost" : ""}${dropped ? " has-dropped" : ""}${struck ? " has-discarded" : ""}${wake ? " has-wake" : ""}`}
+      className={`${cont ? "is-cont pt-0 pb-1.5" : "py-1.5"} ${isLast ? "is-live" : "is-history"}${lost || unspoken ? " has-lost" : ""}${dropped ? " has-dropped" : ""}${struck ? " has-discarded" : ""}${wake ? " has-wake" : ""}${wakeOnly ? " is-wake-only" : ""}`}
     >
       <MessageContent className={`min-w-0 ${from === "user" ? "bubble-you" : "bubble-agent"}${isStreaming ? " is-streaming" : ""}${interim && !mark ? " is-interim" : ""}`}>
         <span className="speaker">
           {from === "user" ? "You" : agentName}
           {showTs && <span className="ts">{`${Math.floor(at / 60)}:${pad(at % 60)}`}</span>}
           {note && <span className="turn-ref">{note}</span>}
-          {wake && <span className={`turn-mark wake${!mark && awake ? " awake" : ""}`}>{mark ? "heard" : awake ? "heard - listening" : "heard"}</span>}
+          {wake &&
+            (wakeOnly ? (
+              <span className="turn-mark wake">wake phrase</span>
+            ) : (
+              <span className={`turn-mark wake${!mark && awake ? " awake" : ""}`}>{mark ? "heard" : awake ? "heard - listening" : "heard"}</span>
+            ))}
           {mark && <span className={`turn-mark ${mark.status}${mark.reason ? ` ${mark.reason}` : ""}`}>{markLabel(mark, text)}</span>}
           {unspoken && <span className="turn-mark lost">reply not spoken</span>}
           {preWake && <span className="turn-mark dropped">words before the wake phrase ignored</span>}
@@ -636,6 +645,7 @@ function useFlash(count: number, ms: number): boolean {
 
 const REARM_MS = 500
 const WAKE_FLASH_MS = 1200
+const SLEPT_NOTE_MS = 4000
 
 function isTypingTarget(t: EventTarget | null): boolean {
   const el = t as HTMLElement | null
@@ -723,6 +733,8 @@ export default function App() {
   const rightArmed = useRearm(rv ? `${rv.right.action}:${rs?.draft?.id ?? ""}` : "auto", REARM_MS)
   const switchingToReview = !reviewOn && rs?.pending?.op === "mode" && rs.pending.to === "review"
   const wakeFlash = useFlash(rs?.wakeHeard ?? 0, WAKE_FLASH_MS)
+  // Back to waiting with nothing more said: the readout says so for a moment.
+  const sleptNote = useFlash(rs?.wakeSlept ?? 0, SLEPT_NOTE_MS) && !!rs?.awaitingWake
   const runKey = (action: KeyAction) => {
     if (action === "call") call.start()
     else if (action === "cancel" || action === "end") call.end()
@@ -829,7 +841,7 @@ export default function App() {
               : phase === "error"
                 ? ERROR_TITLE[errorKind]
                 : "Call ended"
-  const chipText = reviewReadout ? rv.chip : switchingToReview ? "Switching to review" : autoChip
+  const chipText = reviewReadout ? rv.chip : switchingToReview ? "Switching to review" : sleptNote && phase === "listening" ? "Went back to sleep" : autoChip
   const errChip = chipClass === "err"
   const readout = (
     <span className={`state-chip ${chipClass}${counting ? " counting" : ""}${wakeFlash && !reduced ? " flash" : ""}`} role="status" aria-live="polite">
@@ -941,6 +953,7 @@ export default function App() {
                 // A turn's number shows once, on its first line.
                 note={l.from === "user" ? (l.turn && !(i > 0 && lines[i - 1].from === "user" && lines[i - 1].turn === l.turn) ? `turn ${l.turn}` : undefined) : l.re}
                 wake={l.wake}
+                wakeOnly={l.wakeOnly}
                 awake={awake}
                 unspoken={l.unspoken}
                 preWake={l.preWake}
@@ -962,7 +975,7 @@ export default function App() {
     : muted
       ? "Mic muted"
       : notListening
-        ? "Not listening during reply"
+        ? "Paused for reply"
         : "Mic on"
   // The one LED: lit while the microphone actually feeds the call.
   const micCapturing = rv ? rv.capturing || rv.mic === "Mic still on" : live && !muted && !notListening

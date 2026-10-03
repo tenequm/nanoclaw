@@ -216,7 +216,11 @@ export interface WakeWordOptions {
   featureDir?: string;
   threshold: number;
   debounceMs?: number;
-  onDetect(score: number): void;
+  /**
+   * A detection: its score, and how much audio (samples) came in after the window that had the
+   * phrase, by the time it was scored: the caller's words after the phrase start that far back.
+   */
+  onDetect(score: number, after: number): void;
   /** The thread failed after it loaded: no more detections. */
   onError?(err: string): void;
   now?: () => number;
@@ -257,6 +261,8 @@ export class WakeWordSpotter {
   private loaded = false;
   private closed = false;
   private inflight = false;
+  /** Where the window being scored ends in the stream. */
+  private inflightEnd = 0;
   /** Windows taken while one was being scored. */
   private queued: Array<{ id: number; audio: Float32Array<ArrayBuffer>; end: number }> = [];
   private nextId = 0;
@@ -356,6 +362,7 @@ export class WakeWordSpotter {
 
   private send(window: { id: number; audio: Float32Array<ArrayBuffer>; end: number }): void {
     this.inflight = true;
+    this.inflightEnd = window.end;
     this.thread.postMessage(window, [window.audio.buffer]);
   }
 
@@ -395,7 +402,7 @@ export class WakeWordSpotter {
       this.sinceScore = 0;
       this.queued = [];
       this.validFrom = this.nextId;
-      this.options.onDetect(score);
+      this.options.onDetect(score, this.position - this.inflightEnd);
     }
     const next = this.queued.shift();
     if (next && !this.closed) this.send(next);

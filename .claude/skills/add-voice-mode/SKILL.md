@@ -530,6 +530,9 @@ classifiers load too, but their pretrained models are CC BY-NC-SA 4.0
 (non-commercial): fine for your own install, never to be committed or shipped. `VOICE_WAKE_THRESHOLD` is the
 score (0 to 1) that counts as the wake word: by default 0.68, livekit-wakeword's
 documented operating point for `hey_livekit`, and 0.5 for another model.
+`VOICE_WAKE_START_SECONDS` (default 8) and `VOICE_WAKE_IDLE_SECONDS` (default 20)
+are how long a turn the wake phrase opened waits for speech, right after the phrase
+and then after the last words, before it goes back to waiting (`0`: never).
 
 It also reads `VOICE_RECORDINGS_DAYS` (default `0`, off): with a
 number of days, it saves every caller turn it hears as a 16 kHz mono WAV plus a
@@ -714,7 +717,7 @@ id, nothing is posted) and the host logs why once.
 The page's readout follows the worker: Listening, `<agent>` is working (with
 "you can keep talking" and a local wait clock) while `nanoclaw.voice.thinking`
 is set, and `<agent>` is speaking (speech is ignored until the reply finishes;
-the mute key says "not listening during reply"); captions come from
+the mute key says "Paused for reply"); captions come from
 `lk.transcription` (the caller's interim text shows live), and each caller turn
 gets a small sent / not-sent mark from the worker's `nanoclaw.voice.turn`
 stream. A lost turn also stays as a notice above the transcript until a later
@@ -742,8 +745,9 @@ are never taken for the agent speaking. Each is 150-250 ms of held tone about
 ready, a quicker higher two-note (wake) on the wake phrase, a single high note
 (sent) as a turn goes out, a falling low two-note (discard) on a spoken discard,
 a falling two-note (your turn) once the agent is done and nothing else is
-queued, a low note (nope) for a command with nothing to act on, and two soft
-notes when a review draft is ready. Silence while the agent works; none plays
+queued, a low note (nope) for a command with nothing to act on, two soft
+notes when a review draft is ready, and a soft falling two-note (sleep) when a
+turn the wake phrase opened goes back to waiting. Silence while the agent works; none plays
 while it speaks. A reply the speech model could not synthesize is shown on the
 page as text marked "reply not spoken" (the reply topic carries
 `{"reply", "unspoken": true, "text"}` after it), and no your-turn cue plays for it.
@@ -826,8 +830,19 @@ with a wake word model (`VOICE_WAKE_MODEL`, by default livekit-wakeword's
 `hey livekit`, in a worker thread, 2 s windows every 80 ms), a score at or over
 `VOICE_WAKE_THRESHOLD` opens the turn (at most once in 2 s), and the switch and
 chip name that phrase (`say "hey livekit"`) instead of `hey <agent>`. The
-phrase's words, however the transcription spells them (`Hey, LiveKit`, `live kit`,
-`Лайвкіт`), are taken out of the next transcripts, with the words before them.
+transcription restarts right after the window that had the phrase and first hears
+again the audio since then (a 10 s replay of its input), so no transcript of the turn
+has the phrase and no word after it is lost; the page shows the phrase's own caption,
+if one got through, dimmed as "wake phrase". If the transcription cannot restart, the
+phrase's words, however it spells them (`Hey, LiveKit`, `live kit`, `Лайвкіт`), are
+taken out of the next transcripts instead, with the words before them. A turn the
+phrase opened that hears nothing for `VOICE_WAKE_START_SECONDS`, or nothing more for
+`VOICE_WAKE_IDLE_SECONDS` after its last words, goes back to waiting: a soft falling
+cue plays, the page says "went back to sleep", and words it held are dropped as
+`asleep`, never sent. A final that ends in `send it` as a question (`Should I send
+it?`) is words, not a send. A turn the session commits while the transcription still
+owes words (speech or interim text after its last final) waits up to 2 s for them, so
+a late `scratch that` drops it and late words join it.
 Only without a model (`off`, or one that does not load) does `hey <agent>` in the
 transcript open the turn: `<agent>` is then the agent's name or any entry in its
 `voice.vocabulary.txt`, matched across case, punctuation and Latin/Cyrillic
@@ -838,11 +853,13 @@ advertises the commands with the attribute `nanoclaw.voice.commands` = "2" (the
 `send it` vocabulary; "1" was `over`, and a page offers the commands only to the value it
 knows, so a page left open across an update falls back to pauses) and
 takes the switches in the `nanoclaw.voice.settings` RPC (`{"wake", "pauseSends",
-"cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase", "heard"}`
-(`phrase` only with a wake word model; `heard` counts the wake phrases heard, so the
-page marks "heard - listening" even when it missed the awake state),
-and dropped words go out on the turn topic as `{"dropped": "discarded" |
-"unaddressed" | "command", "text"}`. The agent's own speech is never transcribed, so it
+"cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase", "heard",
+"slept", "cut"}` (`phrase` only with a wake word model, from the start while it loads;
+`heard` counts the wake phrases heard, so the page marks "heard - listening" even when
+it missed the awake state; `slept` counts the turns that went back to waiting; `cut`:
+the last wake restarted the transcription past the phrase), and dropped words go out
+on the turn topic as `{"dropped": "discarded" | "unaddressed" | "command" | "asleep",
+"text"}`. The agent's own speech is never transcribed, so it
 cannot trigger a command; caller speech that starts under it sends
 `{"unheard": "agent_speaking"}` on the turn topic, and the page notes "not heard -
 <agent> was speaking". `&demo=wake` plays the wake switch.
