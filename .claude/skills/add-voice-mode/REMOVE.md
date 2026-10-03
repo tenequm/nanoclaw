@@ -32,6 +32,7 @@ rm -f ~/.config/systemd/user/nanoclaw-voice-worker.service && systemctl --user d
 
 Recorded caller turns (`VOICE_RECORDINGS_DAYS`) are under
 `data/voice-recordings/`; delete that directory if you do not want to keep them.
+The worker's note of a failed speech model is `data/voice-tts-state.json`; delete it too.
 
 ## 3. Remove the container skill
 
