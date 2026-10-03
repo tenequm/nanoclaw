@@ -718,8 +718,12 @@ export function recordingDays(raw: string | undefined): number {
 
 /** The call's room: what the turn logic needs from the audio, tracks and data channels. Faked in tests. */
 export interface CallVoice {
-  /** Speak a line, uninterruptible; resolves after playout with whether it was heard (all of it synthesized). */
-  say(text: string): Promise<boolean>;
+  /**
+   * Speak a line, uninterruptible once it plays; resolves after playout with whether it was heard
+   * (all of it synthesized). `ready` is awaited before its first audio plays: the caller may be
+   * finishing a turn they started while the line was synthesized.
+   */
+  say(text: string, ready?: () => Promise<void>): Promise<boolean>;
   /** The `nanoclaw.voice.thinking` attribute. */
   setThinking(thinking: boolean): void;
   /** One message on the `nanoclaw.voice.turn` topic. */
@@ -1033,6 +1037,14 @@ export class TurnTaking {
         this.spokeSinceIdle = false;
         this.deps.spokenAll?.(spoken);
       });
+  }
+
+  /**
+   * A line about to play waits for the caller like a queued one does: speech they started while it
+   * was synthesized is a turn of theirs, never talked over or lost.
+   */
+  waitForCaller(): Promise<void> {
+    return this.callerIdle();
   }
 
   /** Resolves when the caller is neither talking nor about to have a turn committed, or after a cap. */
@@ -1734,7 +1746,8 @@ export interface Recording {
  * turn is never part of its words: a discard before it drops only the words before it.
  *
  * Review mode (manual): `record` opens a turn, `stopRecording` closes it into a draft, and the auto
- * rules stand aside. Speech while the agent's line is due or plays is noted (`unheard`), never transcribed.
+ * rules stand aside. Speech while the agent's line plays is noted (`unheard`), never transcribed; speech
+ * while a line is still synthesized is a turn like any other, and the line waits for it.
  */
 export class CallTurns {
   /** On until the page's settings say otherwise: a first call never sends before its wake phrase. */
@@ -1851,7 +1864,7 @@ export class CallTurns {
     this.deps.changed();
   }
 
-  /** The caller's audio, every frame: kept for pre-rolls, and the open turn's while no agent line is due. */
+  /** The caller's audio, every frame: kept for pre-rolls, and the open turn's while no agent line plays. */
   audio(pcm: Int16Array): void {
     // Speech under the agent's line is not transcribed: the ring and the turn hear silence instead.
     const heard = this.agentSpeaking ? new Int16Array(pcm.length) : pcm;
@@ -1946,7 +1959,7 @@ export class CallTurns {
     this.syncCountdown(turn);
   }
 
-  /** An agent line is due (true, from before its speech is made) or done: the caller is not transcribed meanwhile. */
+  /** An agent line started playing (true) or is done: the caller is not transcribed meanwhile. */
   onAgentSpeaking(speaking: boolean): void {
     if (speaking === this.agentSpeaking) return;
     this.agentSpeaking = speaking;
@@ -2994,7 +3007,7 @@ async function roomVoice(
   const sayAbort = new AbortController();
   let typing = false;
   /** One line into the speech track: streamed as it is synthesized, resolved once it has played. */
-  const say = async (text: string): Promise<boolean> => {
+  const say = async (text: string, ready?: () => Promise<void>): Promise<boolean> => {
     let heard = false;
     let rest: Int16Array | undefined;
     /** The frames sent to the speech track, for the reply's recording. */
@@ -3018,6 +3031,8 @@ async function roomVoice(
       for await (const pcm of speech.speak(text, sayAbort.signal)) {
         if (closed) break;
         if (!heard) {
+          await ready?.();
+          if (closed) break;
           heard = true;
           setAttr(AGENT_STATE_ATTRIBUTE, 'speaking', 'the agent state');
           events.onAgentSpeaking?.(true);
@@ -3264,7 +3279,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turnCueTimer: ReturnType<typeof setTimeout> | undefined;
   let turnCuedAt = 0;
   let replyHoldTimer: ReturnType<typeof setTimeout> | undefined;
-  const turnTaking = new TurnTaking(
+  const turnTaking: TurnTaking = new TurnTaking(
     {
       send: async (text) => {
         // The host answers a turn key once, so a retry after a dropped connection cannot reach the agent twice.
@@ -3290,11 +3305,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         callLog.warn('voice worker: the host refused a turn', { status: res.status });
         return { accepted: false, status: res.status, turnKey };
       },
-      // From before the line is made until it has played, the caller is not transcribed.
-      say: async (text) => {
-        callTurns.onAgentSpeaking(true);
+      // While the line is synthesized the caller is heard as ever, and a turn they start then holds
+      // its audio back (`waitForCaller`); once it plays the caller is not transcribed (onAgentSpeaking).
+      say: async (text): Promise<boolean> => {
         try {
-          return (await callVoice?.say(text)) ?? false;
+          return (await callVoice?.say(text, () => turnTaking.waitForCaller())) ?? false;
         } finally {
           callTurns.onAgentSpeaking(false);
         }
@@ -3528,7 +3543,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       },
       {
         onAudio: (pcm) => {
-          // Scored only while it can open a turn: waiting in auto, and not while an agent line is due or plays.
+          // Scored only while it can open a turn: waiting in auto, and not while an agent line plays.
           wakeWord?.listen(callTurns.spotting);
           spotter?.push(pcm);
           callTurns.audio(pcm);
@@ -3543,6 +3558,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         },
         onAgentSpeaking: (speaking) => {
           agentSpeaking = speaking;
+          callTurns.onAgentSpeaking(speaking);
           updateTyping();
           // The speaking state reaches the page first, then "working" lets go: no flash of listening
           // before the reply's audio, nor of working after a short line. A line that ended sooner lets

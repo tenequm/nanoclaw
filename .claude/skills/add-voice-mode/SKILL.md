@@ -611,7 +611,8 @@ state (`lk.agent.state`), and keeps the turns in one state machine. Then:
   synthesized whole in one streamed TTS request (so a very long message waits
   longer for its first audio). Its caption shows as its audio starts.
   Replies never overlap, and a reply waits for a caller who is mid-turn (at most
-  `VOICE_SILENCE_MS` plus ten seconds, then it takes the channel).
+  `VOICE_SILENCE_MS` plus ten seconds, then it takes the channel), also one who
+  started speaking while it was being synthesized: that speech is a turn.
 - While the agent's audio plays, the caller is not transcribed (no barge-in).
   While the agent works the page says it is thinking; the caller can keep
   talking, and each finished turn goes to the agent as a follow-up.

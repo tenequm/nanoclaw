@@ -626,7 +626,13 @@ function fakeVoice() {
   let gen = 0;
   let position = 0;
   const voice = {
-    say: vi.fn(async (_text: string) => true),
+    /** Plays at once: waits for the caller as the room's does, then speaks. */
+    say: vi.fn(async (_text: string, ready?: () => Promise<void>) => {
+      await ready?.();
+      events.onAgentSpeaking?.(true);
+      events.onAgentSpeaking?.(false);
+      return true;
+    }),
     setThinking: vi.fn(),
     publishTurn: vi.fn(),
     publishReply: vi.fn(),
@@ -665,6 +671,10 @@ function fakeVoice() {
     interim: (_text: string) => undefined as void,
     get events() {
       return events;
+    },
+    /** The caller's audio so far, as the call counts it. */
+    get position() {
+      return position;
     },
     /** One RPC from the caller's page. */
     rpc: async (op: ReviewOp, fields: Partial<ReviewRequest> = {}) =>
@@ -754,7 +764,7 @@ describe('runCall', () => {
     ]);
 
     host.emit({ type: 'reply', text: 'Booked for eight.', turn: null });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked for eight.'));
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked for eight.', expect.any(Function)));
     // It answers no turn: a message nobody asked for, and the page is told so first.
     expect(v.voice.publishReply).toHaveBeenCalledWith({ reply: 1, unprompted: true });
 
@@ -808,7 +818,7 @@ describe('runCall', () => {
     await v.turn('Book a table');
     await vi.waitFor(() => expect(thinking()).toBe(true));
     host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.'));
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
     // The reply's speech is still being made: the page keeps "working" until its audio plays.
     expect(thinking()).toBe(true);
     v.events.onAgentSpeaking?.(true);
@@ -843,7 +853,7 @@ describe('runCall', () => {
     host.emit({ type: 'working' });
     await vi.waitFor(() => expect(working()).toEqual([{ turn: 1, status: 'working' }]));
     host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.'));
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
 
     // Turn 2 (the fake host names it '1' too) is answered before any pickup is heard: no late "working".
     await v.turn('And a taxi');
@@ -851,7 +861,7 @@ describe('runCall', () => {
       expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 2, status: 'sent', text: 'And a taxi' }),
     );
     host.emit({ type: 'reply', text: 'Taxi on its way.', turn: '1' });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Taxi on its way.'));
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Taxi on its way.', expect.any(Function)));
     host.emit({ type: 'working' });
     // A message naming no turn (unprompted, or a chat reply) also answers it: no "working" after it.
     await v.turn('One more');
@@ -859,7 +869,7 @@ describe('runCall', () => {
       expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 3, status: 'sent', text: 'One more' }),
     );
     host.emit({ type: 'reply', text: 'Your taxi is here.', turn: null });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Your taxi is here.'));
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Your taxi is here.', expect.any(Function)));
     host.emit({ type: 'working' });
     // Turn 4 is picked up while its answer is still to come.
     await v.turn('Thanks');
@@ -914,7 +924,9 @@ describe('runCall', () => {
     const v = fakeVoice();
     await runCall(ctx, callDeps(host.fetchImpl, v));
     await v.turn('Привіт');
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.rate_limited.uk));
+    await vi.waitFor(() =>
+      expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.rate_limited.uk, expect.any(Function)),
+    );
     expect(v.voice.publishTurn).toHaveBeenCalledWith({
       turn: 1,
       status: 'lost',
@@ -939,7 +951,9 @@ describe('runCall', () => {
         text: 'Book a table',
       }),
     );
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.timeout_no_chat.en));
+    await vi.waitFor(() =>
+      expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.timeout_no_chat.en, expect.any(Function)),
+    );
     const turnKey = host.calls.find((c) => c.url.endsWith('/utterance'))?.body?.turnKey;
     // Another worker's key, or one already settled, changes nothing.
     host.emit({ type: 'turn-stored', turnKey: 'not-ours', id: '7' });
@@ -952,12 +966,12 @@ describe('runCall', () => {
     expect(v.voice.publishTurn).toHaveBeenCalledTimes(3);
     // The late turn's answer is labelled with it.
     host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.'));
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
     expect(v.voice.publishReply).toHaveBeenLastCalledWith(expect.objectContaining({ turn: 1, part: 1 }));
 
     host.emit({ type: 'chat', chat: true });
     await v.turn('And a taxi');
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.timeout.en));
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.timeout.en, expect.any(Function)));
     host.endStream();
   });
 
@@ -2714,7 +2728,7 @@ describe('commands, cues and review in a call', () => {
     await v.turn('Book a table');
     await vi.waitFor(() => expect(played(v)).toEqual(['listening', 'sent']));
     host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.'));
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
     await vi.waitFor(() => expect(played(v)).toEqual(['listening', 'sent', 'turn']));
     await v.rpc('settings', { cues: false });
     await v.turn('And a taxi');
@@ -2777,21 +2791,74 @@ describe('commands, cues and review in a call', () => {
     host.endStream();
   });
 
-  it('speech under the agent is reported unheard and opens no turn', async () => {
+  it('speech while a line plays is reported unheard and opens no turn', async () => {
     const { ctx } = fakeJob();
     const host = fakeHostFetch();
     const v = fakeVoice();
-    let finish!: () => void;
-    v.voice.say.mockImplementation(() => new Promise<boolean>((resolve) => (finish = () => resolve(true))));
+    let finish: (() => void) | undefined;
+    v.voice.say.mockImplementation(async (_text: string, ready?: () => Promise<void>) => {
+      await ready?.();
+      v.events.onAgentSpeaking?.(true);
+      await new Promise<void>((resolve) => (finish = resolve));
+      v.events.onAgentSpeaking?.(false);
+      return true;
+    });
     await runCall(ctx, callDeps(host.fetchImpl, v));
     await flush();
     host.emit({ type: 'reply', text: 'A long story.', turn: null });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalled());
+    await vi.waitFor(() => expect(finish).toBeDefined());
     v.events.onSpeech(true, 0);
     expect(v.voice.publishUnheard).toHaveBeenCalledTimes(1);
     v.events.onSpeech(false, 0);
     expect(v.transcription.begins).toEqual([]);
-    finish();
+    finish?.();
+    host.endStream();
+  });
+
+  it('speech while a reply is synthesized is a turn: the reply waits for it, and no sentence of three is lost', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    let synthesized: (() => void) | undefined;
+    const played: string[] = [];
+    v.voice.say.mockImplementation(async (text: string, ready?: () => Promise<void>) => {
+      await new Promise<void>((resolve) => (synthesized = resolve));
+      await ready?.();
+      v.events.onAgentSpeaking?.(true);
+      played.push(text);
+      v.events.onAgentSpeaking?.(false);
+      return true;
+    });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await flush();
+    // Three sentences with 3 s thinking pauses: the 2.5 s closing silence sends each as it ends.
+    await v.turn('The first sentence.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['The first sentence.']));
+    host.emit({ type: 'reply', text: 'Noted.', turn: '1' });
+    await vi.waitFor(() => expect(synthesized).toBeDefined());
+    v.audio(500);
+    // The second sentence starts while the reply is synthesized: heard, never "not heard".
+    v.transcription.results.push(heard('The second sentence.', 'The second sentence.'));
+    const start = v.position;
+    v.audio(100);
+    v.events.onSpeech(true, start);
+    expect(v.transcription.begins).toHaveLength(2);
+    synthesized?.();
+    await flush();
+    expect(played).toEqual([]);
+    v.audio(900);
+    const end = v.position;
+    v.audio(SILENCE);
+    v.events.onSpeech(false, end);
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['The first sentence.', 'The second sentence.']));
+    // Its turn sent, the reply plays.
+    await vi.waitFor(() => expect(played).toEqual(['Noted.']));
+    v.audio(500);
+    await v.turn('The third sentence.');
+    await vi.waitFor(() =>
+      expect(utterances(host)).toEqual(['The first sentence.', 'The second sentence.', 'The third sentence.']),
+    );
+    expect(v.voice.publishUnheard).not.toHaveBeenCalled();
     host.endStream();
   });
 
@@ -2808,7 +2875,7 @@ describe('commands, cues and review in a call', () => {
         expect.objectContaining({ unspoken: true, text: 'It is sunny.' }),
       ),
     );
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.reply.uk));
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.reply.uk, expect.any(Function)));
     await new Promise((r) => setTimeout(r, TURN_CUE_DELAY_MS + 50));
     expect(played(v)).toEqual(['listening', 'turn']);
     host.endStream();
