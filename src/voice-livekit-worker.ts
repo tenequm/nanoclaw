@@ -367,9 +367,66 @@ export function deEsser(o: DeEsserOptions): (pcm: Int16Array) => Int16Array {
   };
 }
 
-/** What a spoken line's frames go through on their way out: the de-esser, or nothing. */
-export function lineFilter(deess: boolean, sampleRate = TTS_SAMPLE_RATE): (pcm: Int16Array) => Int16Array {
-  return deess ? deEsser({ sampleRate }) : (pcm) => pcm;
+/** VOICE_TTS_NOTCH: the whistle notches run unless it says 0, off or false. */
+export function ttsNotch(raw: string | undefined): boolean {
+  return ttsDeess(raw);
+}
+
+/**
+ * Where gemini-3.8-flash-tts whistles, as [Hz, notch width in Hz]: past about 35 s of audio in one streamed
+ * request its output grows steady, wavering tones (the caller hears a buzz under the voice) until its decoder
+ * resets. A server-side fault of the streaming path only (the same request unary is clean; Google AI forum
+ * thread 184948). The tones sit at the same frequencies in every voice, run and setting; the first three are
+ * the loud ones. Notching them all takes under 1 dB off a clean voice above 6 kHz and nothing below.
+ */
+export const WHISTLE_NOTCHES: ReadonlyArray<readonly [number, number]> = [
+  [8_118, 220],
+  [9_068, 220],
+  [10_875, 220],
+  ...[
+    7_310, 8_000, 8_070, 8_190, 9_000, 9_205, 9_275, 9_450, 9_710, 9_935, 10_002, 10_274, 10_360, 10_509, 11_025,
+    11_212, 11_325, 11_801,
+  ].map((hz) => [hz, 110] as const),
+];
+
+/** RBJ cookbook notch biquads (https://www.w3.org/TR/audio-eq-cookbook/) at WHISTLE_NOTCHES, the loud three twice. */
+export function whistleNotch(sampleRate: number): (pcm: Int16Array) => Int16Array {
+  const stages = WHISTLE_NOTCHES.flatMap((notch, i) => (i < 3 ? [notch, notch] : [notch])).map(([hz, width]) => {
+    const w = (2 * Math.PI * hz) / sampleRate;
+    const alpha = Math.sin(w) / (2 * (hz / width));
+    const a0 = 1 + alpha;
+    return { b0: 1 / a0, b1: (-2 * Math.cos(w)) / a0, a2: (1 - alpha) / a0, x1: 0, x2: 0, y1: 0, y2: 0 };
+  });
+  return (pcm) => {
+    const out = new Int16Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) {
+      let v = pcm[i] / 32768;
+      for (const s of stages) {
+        // A notch's b2 equals its b0, and its a1 its b1.
+        const y = s.b0 * v + s.b1 * s.x1 + s.b0 * s.x2 - s.b1 * s.y1 - s.a2 * s.y2;
+        s.x2 = s.x1;
+        s.x1 = v;
+        s.y2 = s.y1;
+        s.y1 = y;
+        v = y;
+      }
+      out[i] = Math.max(-32768, Math.min(32767, Math.round(v * 32768)));
+    }
+    return out;
+  };
+}
+
+/** What a spoken line's frames go through on their way out: the whistle notches, then the de-esser. */
+export function lineFilter(
+  o: { deess: boolean; notch: boolean },
+  sampleRate = TTS_SAMPLE_RATE,
+): (pcm: Int16Array) => Int16Array {
+  const notch = o.notch ? whistleNotch(sampleRate) : undefined;
+  const deess = o.deess ? deEsser({ sampleRate }) : undefined;
+  return (pcm) => {
+    const notched = notch ? notch(pcm) : pcm;
+    return deess ? deess(notched) : notched;
+  };
 }
 
 /**
@@ -2897,6 +2954,8 @@ export interface VoiceSettings {
   recordReplies?: boolean;
   /** De-ess the agent's speech (VOICE_TTS_DEESS). */
   deess?: boolean;
+  /** Notch out the speech model's whistle (VOICE_TTS_NOTCH). */
+  notch?: boolean;
   /** Each line that played or failed: how it went, and with recordReplies its audio. */
   spoke?(line: SpokenLine, pcm?: Int16Array): void;
 }
@@ -3237,7 +3296,7 @@ async function roomVoice(
     /** The frames sent to the speech track, for the reply's recording. */
     const sent: Int16Array[] = [];
     // One filter per line: its state runs across the line's frames.
-    const filter = lineFilter(!!settings.deess);
+    const filter = lineFilter({ deess: !!settings.deess, notch: !!settings.notch });
     const capture = async (synthesized: Int16Array) => {
       const frame = filter(synthesized);
       meter.frame(frame);
@@ -3493,6 +3552,7 @@ function defaultDeps(): RunCallDeps {
     'VOICE_RECORDINGS_DAYS',
     'VOICE_MAX_SPOKEN_CHARS',
     'VOICE_TTS_DEESS',
+    'VOICE_TTS_NOTCH',
     'VOICE_WAKE_MODEL',
     'VOICE_WAKE_THRESHOLD',
     'VOICE_WAKE_PHRASE',
@@ -3891,6 +3951,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         geminiKey,
         ...(record ? { recordReplies: true } : {}),
         ...(ttsDeess(deps.env.VOICE_TTS_DEESS) ? { deess: true } : {}),
+        ...(ttsNotch(deps.env.VOICE_TTS_NOTCH) ? { notch: true } : {}),
         spoke: (line, pcm) => {
           const label = speakingLine;
           const reply = label?.reply ?? ++replies;
