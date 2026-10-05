@@ -55,6 +55,9 @@ import {
   cueFrames,
   deEsser,
   lineFilter,
+  whistleNotch,
+  WHISTLE_NOTCHES,
+  ttsNotch,
   ttsDeess,
   TTS_SAMPLE_RATE,
   matchCommand,
@@ -239,11 +242,37 @@ describe('helpers', () => {
     for (let i = rate / 2; i < rate; i++) most = Math.max(most, Math.abs(voiced.output[i] - uncut.output[i]));
     expect(most).toBeLessThanOrEqual(1);
     // Off, the line goes out exactly as synthesized.
-    const off = run([[7_000, 0.5]], lineFilter(false));
+    const off = run([[7_000, 0.5]], lineFilter({ deess: false, notch: false }));
     expect(off.output).toEqual(off.input);
     expect(ttsDeess(undefined)).toBe(true);
     expect(ttsDeess('1')).toBe(true);
     for (const raw of ['0', 'off', ' OFF ', 'false']) expect(ttsDeess(raw)).toBe(false);
+
+    // The whistle notches: the model's loud whistle tones go, the voice stays.
+    const notch = () => whistleNotch(rate);
+    for (const [hz] of WHISTLE_NOTCHES.slice(0, 3)) expect(gainDb(run([[hz, 0.5]], notch()))).toBeLessThan(-30);
+    for (const [hz] of WHISTLE_NOTCHES.slice(3)) expect(gainDb(run([[hz, 0.5]], notch()))).toBeLessThan(-15);
+    for (const hz of [150, 300, 1_000, 2_000, 3_500, 5_000, 6_000]) {
+      expect(Math.abs(gainDb(run([[hz, 0.5]], notch())))).toBeLessThan(0.1);
+    }
+    // Between the notches a voice's hiss passes nearly whole.
+    for (const hz of [7_700, 8_600, 9_600, 11_500]) expect(gainDb(run([[hz, 0.5]], notch()))).toBeGreaterThan(-2);
+    // Fed in 20 ms frames it is the same filter as over the whole line at once.
+    const whole = run([
+      [300, 0.3],
+      [8_118, 0.3],
+    ]);
+    expect(
+      run(
+        [
+          [300, 0.3],
+          [8_118, 0.3],
+        ],
+        notch(),
+      ).output,
+    ).toEqual(notch()(whole.input));
+    expect(ttsNotch(undefined)).toBe(true);
+    expect(ttsNotch('off')).toBe(false);
   });
 
   it('reads the language of a transcript from its script', () => {
@@ -802,7 +831,7 @@ describe('runCall', () => {
     expect(v.createVoice).toHaveBeenCalledWith(
       ctx,
       expect.objectContaining({ callId: 'call-1' }),
-      { geminiKey: 'gk-test', deess: true, spoke: expect.any(Function) },
+      { geminiKey: 'gk-test', deess: true, notch: true, spoke: expect.any(Function) },
       v.events,
     );
     // The host address and secret come from the worker's settings, never from the dispatch.

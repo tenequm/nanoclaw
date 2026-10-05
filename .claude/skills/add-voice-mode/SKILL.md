@@ -529,6 +529,14 @@ signal is turned down, up to 6 dB, while it is louder than the voice below the
 split, with no added latency. Reply recordings hold what was sent. It is
 provisional while its effect on the voice is judged.
 
+`VOICE_TTS_NOTCH` (default on; `0`, `off` or `false` turns it off) runs it, before
+the de-esser, through fixed notches at the tones `gemini-3.8-flash-tts` whistles
+on once one streamed request passes about 35 s of audio (a fault of Google's
+streaming path; the unary path is clean). They sit at the same frequencies in
+every voice and run, the loudest near 8.1, 9.1 and 10.9 kHz. The notches take
+under 1 dB off a clean voice above 6 kHz and nothing below, with no added latency.
+Drop them once Google fixes the stream.
+
 It also reads `VOICE_WAKE_MODEL`, `VOICE_WAKE_THRESHOLD` and `VOICE_WAKE_PHRASE`, for
 the wake switch (see spoken commands below). `VOICE_WAKE_MODEL` is a wake word
 classifier `.onnx` in livekit-wakeword's format, a path (default: the bundled
