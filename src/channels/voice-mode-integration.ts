@@ -1,8 +1,13 @@
-import { platformMessageId } from './voice-mode-platform-id.js';
+/**
+ * The voice channel's side of its core reach-ins: what src/router.ts, src/delivery.ts and
+ * src/webhook-server.ts call (voiceModeStored, presentVoiceModeOutbound, handleVoiceModeRoot), and the
+ * seams the channel fills in. Each is inert while no voice call needs it, and a failure in the
+ * channel is logged here, never thrown into core.
+ */
 import type http from 'node:http';
 import fs from 'node:fs';
 
-import type { OutboundMessage, InboundEvent } from './adapter.js';
+import type { InboundEvent } from './adapter.js';
 import { resolveThreadPolicy } from './channel-defaults.js';
 import { getChannelAdapter, getChannelDefaults } from './channel-registry.js';
 import { deliverSessionMessages } from '../delivery.js';
@@ -10,10 +15,6 @@ import { onHostShutdown, onHostStart } from '../host-lifecycle.js';
 import { log } from '../log.js';
 import { heartbeatPath } from '../session-manager.js';
 import type { MessagingGroup, MessagingGroupAgent, Session } from '../types.js';
-
-export interface VoiceModeOutboundMessage extends OutboundMessage {
-  inReplyTo?: string | null;
-}
 
 export interface VoiceModeInboundEvent extends InboundEvent {
   agentGroupId?: string;
@@ -30,59 +31,115 @@ export function wiringThreadsEnabled(wiring: Pick<MessagingGroupAgent, 'threads'
   );
 }
 
-type TypingObserver = (tick: {
+/** Delivery hands a reply's in-reply-to over agent-scoped (`<id>:<agent group>`); this is the platform's id. */
+export function platformMessageId(scopedId: string, agentGroupId: string): string {
+  const suffix = `:${agentGroupId}`;
+  return scopedId.endsWith(suffix) ? scopedId.slice(0, -suffix.length) : scopedId;
+}
+
+let hostRunning = false;
+/** Whether the host has started its modules (and with them, taking inbound messages) and not shut down. */
+export const voiceModeHostRunning = (): boolean => hostRunning;
+
+// Upstream typing's timings (src/modules/typing), which it keeps private.
+const TYPING_REFRESH_MS = 4_000;
+const TYPING_GRACE_MS = 15_000;
+const HEARTBEAT_FRESH_MS = 6_000;
+const POST_DELIVERY_PAUSE_MS = 10_000;
+/** Longest stretch shown as thinking with no reply delivered and no new turn: bounds a runner stuck working. */
+const TYPING_CEILING_MS = 5 * 60_000;
+
+export interface TypingTick {
   channelType: string;
   platformId: string;
   threadId: string | null;
   agentGroupId: string;
+  /** The session's heartbeat moved since the message that started this stretch: the agent picked it up. */
   working: boolean;
-}) => void;
-const observers: TypingObserver[] = [];
-const thinking = new Map<
-  string,
-  { session: Session; event: InboundEvent; startedAt: number; timer: ReturnType<typeof setInterval> }
->();
-export function registerTypingObserver(observer: TypingObserver): void {
-  observers.push(observer);
+}
+type TypingObserver = (tick: TypingTick) => void;
+const observers: Array<{ observe: TypingObserver; live: () => boolean }> = [];
+interface Thinking {
+  session: Session;
+  event: InboundEvent;
+  startedAt: number;
+  /** Start of the stretch TYPING_CEILING_MS bounds: the last waking message or delivered reply. */
+  typingSince: number;
+  pausedUntil: number;
+  timer: ReturnType<typeof setInterval>;
+}
+const thinking = new Map<string, Thinking>();
+
+/** `live`: whether the observer has a live call to tell; while none has, no session is tracked. */
+export function registerTypingObserver(observe: TypingObserver, live: () => boolean): void {
+  observers.push({ observe, live });
+}
+
+function stopThinking(sessionId: string): void {
+  clearInterval(thinking.get(sessionId)?.timer);
+  thinking.delete(sessionId);
+}
+
+function heartbeatAt(session: Session): number {
+  try {
+    return fs.statSync(heartbeatPath(session.agent_group_id, session.id)).mtimeMs;
+  } catch {
+    return 0; // A not-yet-started container has no heartbeat.
+  }
 }
 
 function thinkingTick(sessionId: string): void {
   const entry = thinking.get(sessionId);
   if (!entry) return;
-  let working = false;
-  try {
-    working = Date.now() - fs.statSync(heartbeatPath(entry.session.agent_group_id, sessionId)).mtimeMs < 6_000;
-  } catch {
-    /* A not-yet-started container has no heartbeat. */
+  const now = Date.now();
+  const beat = heartbeatAt(entry.session);
+  const fresh = now - beat < HEARTBEAT_FRESH_MS;
+  if (!fresh && now - entry.startedAt > TYPING_GRACE_MS) return stopThinking(sessionId);
+  if (entry.pausedUntil > now || now - entry.typingSince >= TYPING_CEILING_MS) return;
+  const tick: TypingTick = {
+    channelType: entry.event.channelType,
+    platformId: entry.event.platformId,
+    threadId: entry.event.threadId,
+    agentGroupId: entry.session.agent_group_id,
+    working: fresh && beat >= entry.startedAt,
+  };
+  for (const { observe } of observers) {
+    try {
+      observe(tick);
+    } catch (err) {
+      log.warn('voice-mode: typing observer failed', { sessionId, err });
+    }
   }
-  if (!working && Date.now() - entry.startedAt > 15_000) {
-    clearInterval(entry.timer);
-    thinking.delete(sessionId);
-    return;
-  }
-  for (const observer of observers)
-    observer({
-      channelType: entry.event.channelType,
-      platformId: entry.event.platformId,
-      threadId: entry.event.threadId,
-      agentGroupId: entry.session.agent_group_id,
-      working,
-    });
 }
 
-export function voiceModeStored(event: InboundEvent, session: Session): void {
+/**
+ * The router stored `event` in `session`. A voice turn hears it stored (`onStored`); a message that
+ * wakes the agent while a call is live starts the agent's thinking ticks for that chat.
+ */
+export function voiceModeStored(event: InboundEvent, session: Session, wake: boolean): void {
+  try {
+    (event as VoiceModeInboundEvent).onStored?.(session);
+  } catch (err) {
+    log.warn('voice-mode: stored-turn callback failed', { sessionId: session.id, err });
+  }
+  if (!wake || !observers.some(({ live }) => live())) return;
+  const now = Date.now();
   const existing = thinking.get(session.id);
-  if (existing) {
-    existing.session = session;
-    existing.event = event;
-    existing.startedAt = Date.now();
-  } else {
-    const timer = setInterval(() => thinkingTick(session.id), 4_000);
+  if (existing) Object.assign(existing, { session, event, startedAt: now, typingSince: now, pausedUntil: 0 });
+  else {
+    const timer = setInterval(() => thinkingTick(session.id), TYPING_REFRESH_MS);
     timer.unref();
-    thinking.set(session.id, { session, event, startedAt: Date.now(), timer });
+    thinking.set(session.id, { session, event, startedAt: now, typingSince: now, pausedUntil: 0, timer });
   }
   thinkingTick(session.id);
-  (event as VoiceModeInboundEvent).onStored?.(session);
+}
+
+/** A reply from `session` reached its chat: thinking pauses as core typing does, and the ceiling restarts. */
+export function voiceModeReplyDelivered(session: Session): void {
+  const entry = thinking.get(session.id);
+  if (!entry) return;
+  entry.pausedUntil = Date.now() + POST_DELIVERY_PAUSE_MS;
+  entry.typingSince = Date.now();
 }
 
 export interface VoiceModeOutboundAddress {
@@ -102,52 +159,57 @@ let presentation: Presentation | null = null;
 export function setOutboundPresentation(transform: Presentation | null): void {
   presentation = transform;
 }
-export function presentVoiceModeOutbound(msg: VoiceModeOutboundAddress, session: Session): string {
-  const original = (msg as VoiceModeOutboundAddress & { content: string }).content;
-  if (!presentation) return original;
+
+/** What the platform is handed of an outbound message: its stored content, unless the voice channel restyles it. */
+export function presentVoiceModeOutbound(
+  msg: VoiceModeOutboundAddress & { content: string },
+  session: Session,
+): string {
+  if (!presentation) return msg.content;
   try {
-    const content = JSON.parse(original) as Record<string, unknown>;
-    const shown = presentation(msg, Object.freeze(content), session) ?? content;
-    return JSON.stringify(
-      msg.channelType === 'voice-mode' && msg.inReplyTo
-        ? { ...shown, voiceModeInReplyTo: platformMessageId(msg.inReplyTo, session.agent_group_id) }
-        : shown,
-    );
-  } catch {
-    return original;
+    const content: unknown = JSON.parse(msg.content);
+    if (!content || typeof content !== 'object' || Array.isArray(content)) return msg.content;
+    const shown = presentation(msg, Object.freeze(content as Record<string, unknown>), session);
+    return shown ? JSON.stringify(shown) : msg.content;
+  } catch (err) {
+    log.warn('voice-mode: outbound presentation failed; delivering the message as stored', { id: msg.id, err });
+    return msg.content;
   }
 }
 
-let running = false;
-const expedited = new Map<string, { session: Session; until: number }>();
-let timer: ReturnType<typeof setInterval> | undefined;
+/** How often an expedited session's replies are polled; the host's own poll runs every second. */
+const EXPEDITED_POLL_MS = 200;
+const expedited = new Map<string, { session: Session; since: number; until: number }>();
+let expediteTimer: ReturnType<typeof setInterval> | undefined;
 function stopExpediting(): void {
-  clearInterval(timer);
-  timer = undefined;
+  clearInterval(expediteTimer);
+  expediteTimer = undefined;
   expedited.clear();
 }
-let initialized = false;
-export function initializeVoiceModeIntegration(): void {
-  if (initialized) return;
-  initialized = true;
-  onHostStart(() => {
-    running = true;
-  });
-  onHostShutdown(() => {
-    running = false;
-    stopExpediting();
-    for (const entry of thinking.values()) clearInterval(entry.timer);
-    thinking.clear();
-  });
-}
 
+onHostStart(() => {
+  hostRunning = true;
+});
+onHostShutdown(() => {
+  hostRunning = false;
+  stopExpediting();
+  for (const id of [...thinking.keys()]) stopThinking(id);
+});
+
+/**
+ * Deliver `session`'s replies every EXPEDITED_POLL_MS for up to `forMs`, so a call hears them at once.
+ * The window closes early once the agent is idle: past the start-up grace with a stale heartbeat.
+ */
 export function expediteDelivery(session: Session, forMs: number): void {
-  if (!running) return;
-  expedited.set(session.id, { session, until: Date.now() + forMs });
-  if (timer) return;
-  timer = setInterval(() => {
+  if (!hostRunning) return;
+  const now = Date.now();
+  expedited.set(session.id, { session, since: now, until: now + forMs });
+  if (expediteTimer) return;
+  expediteTimer = setInterval(() => {
+    const t = Date.now();
     for (const [id, entry] of expedited) {
-      if (entry.until <= Date.now()) {
+      const idle = t - entry.since > TYPING_GRACE_MS && t - heartbeatAt(entry.session) >= HEARTBEAT_FRESH_MS;
+      if (entry.until <= t || idle) {
         expedited.delete(id);
         continue;
       }
@@ -156,8 +218,8 @@ export function expediteDelivery(session: Session, forMs: number): void {
       );
     }
     if (expedited.size === 0) stopExpediting();
-  }, 200);
-  timer.unref();
+  }, EXPEDITED_POLL_MS);
+  expediteTimer.unref();
 }
 
 let rootHandler: ((req: http.IncomingMessage, res: http.ServerResponse) => void | Promise<void>) | null = null;
@@ -166,11 +228,14 @@ export function registerVoiceModeRootHandler(handler: typeof rootHandler): void 
 }
 export async function handleVoiceModeRoot(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean> {
   if (!rootHandler || !/^\/voice(?:[/?]|$)/.test(req.url ?? '')) return false;
+  /* eslint-disable no-catch-all/no-catch-all -- the shared webhook server has no other way to answer the browser */
   try {
     await rootHandler(req, res);
-  } catch {
+  } catch (err) {
+    log.warn('voice-mode: browser route failed', { err });
     if (!res.headersSent) res.writeHead(500);
     res.end();
   }
+  /* eslint-enable no-catch-all/no-catch-all */
   return true;
 }

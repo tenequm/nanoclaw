@@ -25,7 +25,9 @@ vi.mock('../config.js', async () => {
 });
 
 import { wakeContainer } from '../container-runner.js';
-import { registerSessionCreatedHook, type SessionCreatedEvent } from '../router.js';
+import { deliverToAgent, registerSessionCreatedHook, type SessionCreatedEvent } from '../router.js';
+import { getAgentGroup } from '../db/agent-groups.js';
+import { getMessagingGroup, getMessagingGroupAgentByPair } from '../db/messaging-groups.js';
 import {
   closeDb,
   createAgentGroup,
@@ -36,7 +38,7 @@ import {
 } from '../db/index.js';
 import { getSessionsByAgentGroup } from '../db/sessions.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
-import type { VoiceModeInboundEvent as InboundEvent } from './voice-mode-integration.js';
+import { registerTypingObserver, type VoiceModeInboundEvent as InboundEvent } from './voice-mode-integration.js';
 import { getHostStartCallbacks } from '../host-lifecycle.js';
 import './index.js'; // the real channel barrel: registers the voice channel
 import { routeVoiceModeTurn } from './voice-mode-route.js';
@@ -44,6 +46,10 @@ import { routeVoiceModeTurn } from './voice-mode-route.js';
 const now = () => new Date().toISOString();
 /** The line's caller; the chat is looked up from the event. */
 const FROM_CALLER = { callerId: 'voice-mode:abc', chat: null };
+
+/** A typing observer that throws, as a broken channel tap would; it hears ticks only while `live`. */
+const typing = { live: false, observe: vi.fn<() => void>() };
+registerTypingObserver(typing.observe, () => typing.live);
 
 const sessionsCreated: SessionCreatedEvent[] = [];
 registerSessionCreatedHook((event) => {
@@ -102,6 +108,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  typing.live = false;
+  typing.observe.mockReset();
   sessionsCreated.length = 0;
   vi.mocked(wakeContainer).mockClear();
   await closeDb();
@@ -110,7 +118,7 @@ afterEach(async () => {
 
 describe('routeVoiceModeTurn', () => {
   it('takes no turn before the host has started, as the router takes no inbound before then', async () => {
-    await expect(routeVoiceModeTurn(turn(), FROM_CALLER)).rejects.toThrow('still starting');
+    await expect(routeVoiceModeTurn(turn(), FROM_CALLER)).rejects.toThrow('the host is not running');
     expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
   });
 
@@ -154,6 +162,32 @@ describe('routeVoiceModeTurn', () => {
       });
       await routeVoiceModeTurn({ ...turn(), message: { ...turn().message, id: 'livekit:call-1:2' } }, FROM_CALLER);
       expect(sessionsCreated).toHaveLength(1);
+    });
+
+    it('wakes the agent and acknowledges the turn although a typing observer and the stored-turn callback throw', async () => {
+      typing.live = true;
+      typing.observe.mockImplementation(() => {
+        throw new Error('observer broke');
+      });
+      const event = turn();
+      event.onStored = () => {
+        throw new Error('callback broke');
+      };
+      expect(await routeVoiceModeTurn(event, FROM_CALLER)).toBe(true);
+      expect(typing.observe).toHaveBeenCalled();
+      expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows no thinking for a message stored without waking the agent', async () => {
+      typing.live = true;
+      const wiring = (await getMessagingGroupAgentByPair('mg-1', 'ag-1'))!;
+      const agentGroup = (await getAgentGroup('ag-1'))!;
+      const mg = (await getMessagingGroup('mg-1'))!;
+      await deliverToAgent(wiring, agentGroup, mg, turn(), 'voice-mode:abc', false, null, false);
+      expect(await getSessionsByAgentGroup('ag-1')).toHaveLength(1);
+      expect(typing.observe).not.toHaveBeenCalled();
+      await routeVoiceModeTurn({ ...turn(), message: { ...turn().message, id: 'livekit:call-1:2' } }, FROM_CALLER);
+      expect(typing.observe).toHaveBeenCalledOnce();
     });
 
     it('stores nothing when the chat or its wiring to the agent is gone', async () => {

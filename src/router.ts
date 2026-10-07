@@ -31,12 +31,12 @@ import { findSessionForAgent } from './db/sessions.js';
 import { backfillSession, fanInboundMessage } from './modules/cross-session-context/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { voiceModeStored } from './channels/voice-mode-integration.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
+import { voiceModeStored } from './channels/voice-mode-integration.js';
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -600,7 +600,7 @@ export async function deliverToAgent(
     trigger: wake,
   });
 
-  voiceModeStored({ ...event, threadId: effectiveThreadId }, session);
+  voiceModeStored({ ...event, threadId: effectiveThreadId }, session, wake);
 
   if (wake && created) {
     // A brand-new engaged session: notify registered modules with the

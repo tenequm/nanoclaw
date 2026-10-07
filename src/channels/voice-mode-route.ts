@@ -5,14 +5,16 @@
  * line's caller. `routeInbound` is not used because a turn is addressed to that agent whatever
  * else is wired to the chat and whatever its trigger; the caller's access to the agent and the
  * call chat's wiring are checked by the voice engine before every turn. The call hears the agent
- * thinking through core's typing observer (src/channels/voice-mode-livekit.ts).
+ * thinking through the channel's typing observer (src/channels/voice-mode-integration.ts).
  */
-import type { VoiceModeInboundEvent as InboundEvent } from './voice-mode-integration.js';
-import { wiringThreadsEnabled } from './voice-mode-integration.js';
+import {
+  voiceModeHostRunning,
+  wiringThreadsEnabled,
+  type VoiceModeInboundEvent as InboundEvent,
+} from './voice-mode-integration.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { log } from '../log.js';
-import { onHostStart } from '../host-lifecycle.js';
 import { deliverToAgent } from '../router.js';
 import type { MessagingGroup } from '../types.js';
 
@@ -20,18 +22,9 @@ import type { MessagingGroup } from '../types.js';
 export interface VoiceModeTurn {
   /** The line's caller, who the turn is from. */
   callerId: string;
-  /** The call chat as the engine just resolved it; null for a turn on the voice line itself. */
+  /** The call chat as the engine just resolved it; null to look it up from the event. */
   chat: MessagingGroup | null;
 }
-
-/**
- * The host takes inbound messages only once running sessions are adopted (src/index.ts); the page can
- * take a call before that, so turns wait for the same point: host modules start right after it.
- */
-let hostStarted = false;
-onHostStart(() => {
-  hostStarted = true;
-});
 
 /**
  * Store a turn in the session of the agent the event names (`agentGroupId`) for the event's chat and
@@ -39,7 +32,9 @@ onHostStart(() => {
  * rejects when storing threw.
  */
 export async function routeVoiceModeTurn(event: InboundEvent, turn: VoiceModeTurn): Promise<boolean> {
-  if (!hostStarted) throw new Error('the host is still starting');
+  // The host takes inbound messages only once running sessions are adopted (src/index.ts), right
+  // before host modules start; the page can take a call before that, or after shutdown began.
+  if (!voiceModeHostRunning()) throw new Error('the host is not running');
   const { agentGroupId } = event;
   if (!agentGroupId) throw new Error('a voice turn must name its agent');
   const mg =
