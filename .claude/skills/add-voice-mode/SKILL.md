@@ -169,10 +169,15 @@ LIVEKIT_API_SECRET={{livekit_api_secret}}
 GEMINI_API_KEY={{gemini_api_key}}
 ```
 
-The page listens on `VOICE_MODE_PORT` (default `3100`), and also under
-`/voice` on the existing host webhook port. Worker routes live only on that
-host port under `/webhook/voice-mode/livekit/agent/`; never proxy them.
-The old `/webhook/voice/livekit` browser links remain valid on the host port.
+The page listens on `127.0.0.1:3100` (`VOICE_MODE_PORT`, and
+`VOICE_MODE_PAGE_HOST` for another bind address), and also under `/voice` on
+the existing host webhook port. `VOICE_MODE_PORT=off` (or `0`) turns the
+separate listener off when the front already forwards `/voice` to the webhook
+port. A container proxy that cannot reach loopback needs the listener bound
+to an address it can reach, plus the trusted-proxy settings below. Worker
+routes live only on the host port under `/webhook/voice-mode/livekit/agent/`;
+never proxy them. The old `/webhook/voice/livekit` browser links remain valid
+on the host port.
 
 For Tailscale Serve, mount only the page prefix and repeat it in the target
 because Serve strips the mount prefix:
@@ -258,7 +263,8 @@ seconds and before replies. A revoked role or changed token ends the call.
 The current call chat must stay wired to the line's agent. When it disappears,
 `VOICE_MODE_MIRROR` picks an unambiguous fallback chat; a new line with no
 usable chat cannot deliver turns. Main's older membership-based lines retain
-their identities and can still deliver on their voice line.
+their identities and can still deliver on their voice line: a `voice`
+compatibility adapter hands their replies and typing to the voice-mode engine.
 
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use
@@ -268,11 +274,12 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `VOICE_MODE_PORT` | `3100` | Separate page server; `WEBHOOK_PORT` still serves worker routes and old links. |
+| `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page, worker routes and old links. |
+| `VOICE_MODE_PAGE_HOST` | `127.0.0.1` | Bind address of the separate page server. |
 | `VOICE_MODE_MAX_CALL_SECONDS` | `900` | Per-call duration limit. |
 | `VOICE_MODE_MAX_CALLS_PER_HOUR` | `12` | Start attempts per line, including failed starts. |
 | `VOICE_MODE_MAX_MINUTES_PER_DAY` | `120` | Per-line UTC daily call time. These counters reset when the host restarts. |
-| `VOICE_MODE_LANGUAGES` | `uk-UA,en-US` | Up to four language hints, first is primary. Agent language guidance follows them. |
+| `VOICE_MODE_LANGUAGES` | `uk-UA,en-US` | Up to four language hints, first is primary. Agent language guidance follows them; the worker's own notices start in the first one and use Ukrainian only when it is listed. |
 | `VOICE_MODE_STT_MODEL` | `gemini-3.5-transcribe-live` | Own Gemini Live pipeline, one manual activity per caller turn. |
 | `VOICE_MODE_STT_FALLBACK_MODEL` | ignored | Deprecated unary fallback; the next turn retries Live. |
 | `VOICE_MODE_TTS_MODEL` | `gemini-3.8-flash-tts` | Reply speech model. |
@@ -293,7 +300,9 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 
 `LIVEKIT_WORKER_URL` selects the worker/API-side LiveKit URL; default is
 `LIVEKIT_URL`. `LIVEKIT_HOST_URL` is the worker's loopback host webhook origin;
-by default it uses `WEBHOOK_PORT` or port 3000. `LIVEKIT_AGENT_NAME` must match
+by default it uses `WEBHOOK_PORT` or port 3000. Only a local http(s) origin
+(`localhost`, `127.0.0.1`, `[::1]`) is accepted: the worker exits at start and
+ends a call cleanly otherwise, since every request carries call secrets. `LIVEKIT_AGENT_NAME` must match
 on host and worker; default is `nanoclaw-voice-mode`.
 
 The vocabulary file is bounded and rejects symlinks/FIFOs. Keep names only:

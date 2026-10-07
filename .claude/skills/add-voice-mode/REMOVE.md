@@ -86,7 +86,15 @@ rm -rf src/voice-mode-wakeword-fixtures assets/voice-mode-wakeword container/ski
 ```
 
 Keep operator-owned acoustic models and recordings unless explicitly retiring
-that data. Remove `voice-mode-formatting` from explicit group skill lists.
+that data. Remove `voice-mode-formatting` from explicit group skill lists in
+`container_configs.skills`, through the query wrapper rather than `sqlite3`:
+
+```bash
+pnpm exec tsx scripts/q.ts data/v2.db "UPDATE container_configs SET skills = (SELECT json_group_array(value) FROM json_each(skills) WHERE value != 'voice-mode-formatting'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE json_valid(skills) AND json_type(skills) = 'array' AND skills LIKE '%\"voice-mode-formatting\"%'"
+pnpm exec tsx scripts/q.ts data/v2.db "SELECT agent_group_id FROM container_configs WHERE skills LIKE '%voice-mode-formatting%'"
+```
+
+The second query must print nothing.
 The old core line admin commands and legacy tables are retained for rollback.
 The native Telegram structural handler and router export are safe without the
 voice adapter and need not be removed.
