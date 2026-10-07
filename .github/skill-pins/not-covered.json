@@ -84,6 +84,12 @@
       "kind": "version",
       "source": ".claude/skills/add-onecli/versions.json",
       "why": "read by the skill's own scripts; Dependabot does not read versions.json"
+    },
+    {
+      "pin": "package.json",
+      "kind": "npm manifest",
+      "source": ".claude/skills/add-voice-mode/ui/package.json",
+      "why": "Dependabot's npm ecosystem could read this directory itself; not configured"
     }
   ]
 }
