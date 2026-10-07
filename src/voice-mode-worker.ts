@@ -105,7 +105,12 @@ import {
   type TurnMode,
 } from './channels/voice-mode-protocol.js';
 import { DATA_DIR } from './config.js';
-import { voiceModeEnv, voiceModeEnvKeys } from './channels/voice-mode-protocol.js';
+import {
+  baseLanguage,
+  DEFAULT_VOICE_LANGUAGES,
+  voiceModeEnv,
+  voiceModeEnvKeys,
+} from './channels/voice-mode-protocol.js';
 import { readEnvFile } from './env.js';
 import { GeminiLiveTranscriber, type Heard, type TranscriberOptions } from './voice-mode-gemini-live.js';
 import { JevTurnShadow, type TurnShadowSink } from './voice-mode-jev-turn.js';
@@ -133,8 +138,6 @@ export function callerRejoinWaitMs(reason: DisconnectReason | undefined): number
 }
 /** Silero, the wake word, the transcription and the recordings all take 16 kHz mono. */
 const INPUT_SAMPLE_RATE = 16_000;
-/** Language hints for the transcription; the call's language for the worker's own lines. */
-const STT_LANGUAGE_CODES = ['uk-UA', 'en-US'] as const;
 /** One typing tick from the host keeps "thinking" up this long; the host re-fires every 4 s. */
 const THINKING_HOLD_MS = 10_000;
 /** After a turn went out, "thinking" holds this long without a reply or a typing tick. */
@@ -270,9 +273,24 @@ export function speakableText(message: string): string {
   return out.join(' ');
 }
 
+/** The worker's own lines exist in English and Ukrainian; any other configured language hears English. */
 export type CallLanguage = 'uk' | 'en';
-/** Until the caller says something, the worker's own lines use the first transcription language. */
-const DEFAULT_CALL_LANGUAGE: CallLanguage = 'uk';
+
+/** What a call's languages (VOICE_MODE_LANGUAGES) mean for the worker's own lines. */
+export interface CallLanguages {
+  /** The transcription's language hints. */
+  codes: string[];
+  /** The language of the worker's lines until the caller says something: the first configured one. */
+  initial: CallLanguage;
+  /** Cyrillic speech is Ukrainian only when Ukrainian is configured; otherwise it hears English lines. */
+  ukrainian: boolean;
+}
+
+export function callLanguages(languages: readonly string[] | undefined): CallLanguages {
+  const codes = languages?.length ? [...languages] : [...DEFAULT_VOICE_LANGUAGES];
+  const ukrainian = codes.some((code) => baseLanguage(code) === 'uk');
+  return { codes, initial: baseLanguage(codes[0]) === 'uk' ? 'uk' : 'en', ukrainian };
+}
 
 /**
  * What the worker says itself when the exchange breaks, in the call's language: a turn it did not
@@ -474,9 +492,9 @@ export function capSpokenText(text: string, max: number, language: CallLanguage,
   return head ? `${head} ${closing}` : closing;
 }
 
-/** The language a transcript is in, by its script; undefined when it has no letters. */
-export function languageOf(text: string): CallLanguage | undefined {
-  if (/\p{Script=Cyrillic}/u.test(text)) return 'uk';
+/** The language a transcript is in, by its script; undefined when it has no letters. Cyrillic is Ukrainian only when the call speaks it. */
+export function languageOf(text: string, ukrainian: boolean): CallLanguage | undefined {
+  if (/\p{Script=Cyrillic}/u.test(text)) return ukrainian ? 'uk' : 'en';
   if (/[A-Za-z]/.test(text)) return 'en';
   return undefined;
 }
@@ -1095,7 +1113,13 @@ export class TurnTaking {
 
   constructor(
     private readonly deps: TurnTakingDeps,
-    private readonly options: { silenceMs: number; language: CallLanguage; maxSpokenChars?: number },
+    private readonly options: {
+      silenceMs: number;
+      language: CallLanguage;
+      /** Whether the call's languages include Ukrainian (callLanguages); unset is yes. */
+      ukrainian?: boolean;
+      maxSpokenChars?: number;
+    },
   ) {
     this.now = deps.now ?? (() => Date.now());
     this.refresh();
@@ -1145,7 +1169,7 @@ export class TurnTaking {
   onTurn(text: string, onSent?: (result: SendResult) => void): void {
     if (this.closed) return;
     this.turnOpenUntil = 0;
-    this.options.language = languageOf(text) ?? this.options.language;
+    this.options.language = languageOf(text, this.options.ukrainian ?? true) ?? this.options.language;
     this.wake();
     this.sends = this.sends
       .then(() => this.sendTurn(text, onSent))
@@ -3827,6 +3851,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turnCuedAt = 0;
   let replyHoldTimer: ReturnType<typeof setTimeout> | undefined;
   const jevTurn = new JevTurnShadow({ callId: meta.callId, log: (line, fields) => callLog.info(line, fields) });
+  const languages = callLanguages(meta.languages);
   const turnTaking: TurnTaking = new TurnTaking(
     {
       send: async (text) => {
@@ -3896,7 +3921,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     },
     {
       silenceMs: meta.silenceMs,
-      language: DEFAULT_CALL_LANGUAGE,
+      language: languages.initial,
+      ukrainian: languages.ukrainian,
       maxSpokenChars: maxSpokenChars(deps.env.VOICE_MODE_MAX_SPOKEN_CHARS),
     },
   );
@@ -4030,7 +4056,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     // The names (the host trimmed, deduplicated and capped them) and the commands, which the
     // transcription does not hear reliably unless they are in its vocabulary.
     vocabulary: [...new Set([...(meta.vocabulary ?? []), ...COMMAND_VOCABULARY])],
-    languageCodes: meta.languages?.length ? meta.languages : STT_LANGUAGE_CODES,
+    languageCodes: languages.codes,
     sampleRate: INPUT_SAMPLE_RATE,
     onInterim: (text) => callTurns.onInterim(text),
     log: callLog,

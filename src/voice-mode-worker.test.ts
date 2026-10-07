@@ -29,6 +29,7 @@ import {
   AudioRing,
   CALLER_REJOIN_MS,
   callerRejoinWaitMs,
+  callLanguages,
   CallTurns,
   capSpokenText,
   COMMAND_SETTLE_MS,
@@ -284,9 +285,18 @@ describe('helpers', () => {
   });
 
   it('reads the language of a transcript from its script', () => {
-    expect(languageOf('Привіт, як справи?')).toBe('uk');
-    expect(languageOf('check the grafana logs')).toBe('en');
-    expect(languageOf('1, 2, 3')).toBeUndefined();
+    expect(languageOf('Привіт, як справи?', true)).toBe('uk');
+    expect(languageOf('Привіт, як справи?', false)).toBe('en');
+    expect(languageOf('check the grafana logs', true)).toBe('en');
+    expect(languageOf('1, 2, 3', true)).toBeUndefined();
+  });
+
+  it('starts the worker lines in the first configured language and hears Ukrainian only when it is configured', () => {
+    expect(callLanguages(undefined)).toEqual({ codes: ['uk-UA', 'en-US'], initial: 'uk', ukrainian: true });
+    expect(callLanguages(['uk-UA', 'en-US'])).toEqual({ codes: ['uk-UA', 'en-US'], initial: 'uk', ukrainian: true });
+    expect(callLanguages(['en-US'])).toEqual({ codes: ['en-US'], initial: 'en', ukrainian: false });
+    expect(callLanguages(['en-GB', 'uk'])).toEqual({ codes: ['en-GB', 'uk'], initial: 'en', ukrainian: true });
+    expect(callLanguages(['de-DE'])).toEqual({ codes: ['de-DE'], initial: 'en', ukrainian: false });
   });
 });
 
@@ -1236,6 +1246,24 @@ describe('runCall', () => {
     expect(job.deleteRoom).toHaveBeenCalled();
     expect(job.shutdown).toHaveBeenCalledWith(expect.stringContaining('LIVEKIT_HOST_URL must be a local'));
     expect(JSON.stringify(warn.mock.calls)).not.toContain('hunter2');
+  });
+
+  it("speaks an English-only call's first failure notice in English, and a default call's in Ukrainian", async () => {
+    for (const [languages, line] of [
+      [['en-US'], FAILURE_LINES.turn.en],
+      [undefined, FAILURE_LINES.turn.uk],
+    ] as const) {
+      const { ctx } = fakeJob(languages ? { ...META, languages } : { ...META });
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      const transcriber = vi.fn((_options: { languageCodes: readonly string[] }) => v.transcription);
+      await runCall(ctx, { ...callDeps(host.fetchImpl, v), transcriber });
+      expect(transcriber.mock.calls[0][0].languageCodes).toEqual(languages ?? ['uk-UA', 'en-US']);
+      await v.turn('', { speechMs: 1200, failed: true });
+      await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(line, expect.any(Function)));
+      expect(v.voice.say).toHaveBeenCalledTimes(1);
+      host.endStream();
+    }
   });
 
   it('refuses to start without the LiveKit secret it derives the host credential from', async () => {
