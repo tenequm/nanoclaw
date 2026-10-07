@@ -2531,6 +2531,45 @@ describe('CallTurns, wake', () => {
     expect(h.out.sent).toEqual(['Rewrite the landing page and the pricing.']);
   });
 
+  it('a copy only the interim text has sends nothing, even when the short final collapsed to the interim', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    // Three words: turnText takes the interim text, which has the copy as its own sentence.
+    h.t.results.push(heard('Book a table. Copy.', 'Book a table'));
+    await h.talk(1500);
+    await h.interim('Book a table. Copy.');
+    await h.interim('Book a table. Copy.');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual([]);
+    expect(h.turns.state.waiting).toBe(false);
+  });
+
+  it('a copy only the interim text has sends nothing when no final came', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table. Copy.'));
+    await h.talk(1500);
+    await h.interim('Book a table. Copy.');
+    await h.interim('Book a table. Copy.');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual([]);
+    expect(h.turns.state.waiting).toBe(false);
+  });
+
+  it('a final that collapsed to its copy still sends the interim text before it', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table for two. Copy.', 'Copy.'));
+    await h.talk(1500);
+    await h.interim('Book a table for two. Copy.');
+    await h.interim('Book a table for two. Copy.');
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    expect(h.turns.state.waiting).toBe(true);
+  });
+
   it('a pause sends too with pauseSends; a detection from an earlier wait opens nothing', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', pauseSends: true });
     await h.pass(3000);

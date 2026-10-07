@@ -2582,6 +2582,15 @@ export class CallTurns {
       said = text;
     }
     let match = matchCommand(text);
+    if (match?.ownSentence && chosen.source !== 'final') {
+      // The text is the interim's (the final collapsed or never came): it may carry the body, but
+      // only a final that ends in `copy` as its own sentence confirms the command.
+      const confirmed = matchCommand(heard.final ?? '');
+      if (confirmed?.command !== match.command || !confirmed.ownSentence) {
+        this.deps.log.info(`voice.command near-miss word=${commandEnd(text)?.phrase} reason=unconfirmed`);
+        match = null;
+      }
+    }
     // The command an interim ended with, the last one's or an earlier one's.
     const nominated = turn.kind === 'auto' ? this.pendingCommand(turn) : null;
     // A final that ends in `copy` inside a sentence decided it was words: the interim text cannot overrule that.
