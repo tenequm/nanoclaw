@@ -4,16 +4,14 @@
  * and every periodic access check resolves the line here, so a revoked caller
  * or a rewired line ends the call.
  */
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { GROUPS_DIR } from '../config.js';
-import { getVoiceModeLine, getVoiceModeLineForAgent } from '../db/voice-mode-lines.js';
+import { getVoiceModeLine } from '../db/voice-mode-lines.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { getAgentGroup } from '../db/agent-groups.js';
-import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
-import { readGroupPersona } from './voice-mode-group-persona.js';
 import { log } from '../log.js';
-import { canAccessAgentGroup } from '../modules/permissions/access.js';
 import { getUser } from '../modules/permissions/db/users.js';
 
 /** Optional per-agent names for the transcription, one per line; added to VOICE_MODE_VOCABULARY. */
@@ -21,6 +19,34 @@ export const VOICE_MODE_VOCABULARY_FILE = 'voice.vocabulary.txt';
 export const MAX_VOCABULARY_TERMS = 60;
 export const MAX_VOCABULARY_BYTES = 1024;
 const MAX_VOCABULARY_TERM_CHARS = 80;
+/** Far more than MAX_VOCABULARY_BYTES of terms ever needs; nothing past it is read. */
+const MAX_VOCABULARY_READ_BYTES = 64 * 1024;
+
+/**
+ * The agent's vocabulary file, or null. The group folder is writable from the agent container, so
+ * the read follows no symlink, never blocks on a planted FIFO (O_NONBLOCK) and is bounded.
+ */
+function readVocabularyFile(groupDir: string): string | null {
+  const file = path.join(groupDir, VOICE_MODE_VOCABULARY_FILE);
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) return null;
+    const buf = Buffer.alloc(Math.min(stat.size, MAX_VOCABULARY_READ_BYTES));
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.toString('utf-8', 0, n).trim() || null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    log.warn('voice-mode: could not read the agent vocabulary file; calls use VOICE_MODE_VOCABULARY only', {
+      file,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
 
 export interface VoiceModeAgent {
   name: string;
@@ -38,7 +64,8 @@ export interface VoiceModeLine {
   agent: VoiceModeAgent;
   caller: VoiceModeCaller;
   agentGroupId: string;
-  linkHash?: string;
+  /** The line's link token hash: a new link (`/voice new`) ends the calls on the old one. */
+  linkHash: string;
 }
 
 /** Whether two resolutions of a line still name the same caller, agent and link; a call ends when they stop. */
@@ -85,12 +112,9 @@ function buildLine(
   caller: VoiceModeCaller,
   group: { id: string; name: string; folder: string },
   options: ResolveLineOptions,
-  linkHash?: string,
+  linkHash: string,
 ): VoiceModeLine {
-  // The persona reader's bounded, symlink- and FIFO-safe read: the file is agent-writable.
-  const fileText = options.forCall
-    ? readGroupPersona(path.join(GROUPS_DIR, group.folder), VOICE_MODE_VOCABULARY_FILE)
-    : null;
+  const fileText = options.forCall ? readVocabularyFile(path.join(GROUPS_DIR, group.folder)) : null;
   const vocabulary = options.forCall ? voiceModeVocabulary(options.vocabulary, fileText) : undefined;
   const wakeNames = fileText ? voiceModeVocabulary(undefined, fileText) : undefined;
   return {
@@ -101,11 +125,11 @@ function buildLine(
       ...(vocabulary?.length ? { vocabulary } : {}),
       ...(wakeNames?.length ? { wakeNames } : {}),
     },
-    ...(linkHash ? { linkHash } : {}),
+    linkHash,
   };
 }
 
-/** Resolve a named personal line and its explicit access before reading the agent's files. */
+/** Resolve a line's caller and agent, and the caller's owner or admin role over it, before reading the agent's files. */
 export async function resolveVoiceModeLine(
   platformId: string,
   options: ResolveLineOptions = {},
@@ -113,28 +137,11 @@ export async function resolveVoiceModeLine(
   try {
     const lineId = lineIdOf(platformId);
     const line = lineId ? await getVoiceModeLine(lineId) : undefined;
-    if (line) {
-      if (!(await hasAdminPrivilege(line.owner_user_id, line.agent_group_id))) return null;
-      const [caller, group] = await Promise.all([getUser(line.owner_user_id), getAgentGroup(line.agent_group_id)]);
-      if (!caller || !group) return null;
-      const name = caller.display_name?.trim() || caller.id;
-      return buildLine({ id: caller.id, name }, group, options, line.token_hash);
-    }
-    // Every other line is a hashed-token row (above); only a line from before the rename resolves here.
-    if (lineChannelType(platformId) !== VOICE_MODE_CHANNEL) return null;
-    const caller = await getUser(platformId);
-    if (!caller || caller.kind !== VOICE_MODE_CHANNEL || !caller.display_name?.trim()) return null;
-    const mg = await getMessagingGroupByPlatform(VOICE_MODE_CHANNEL, platformId);
-    if (!mg || mg.is_group || mg.unknown_sender_policy !== 'strict') return null;
-    const wirings = await getMessagingGroupAgents(mg.id);
-    if (wirings.length !== 1 || wirings[0].sender_scope !== 'known') return null;
-    const groupId = wirings[0].agent_group_id;
-    // A line /voice new made for the agent retires its configured personal lines.
-    if (await getVoiceModeLineForAgent(groupId)) return null;
-    if (!(await canAccessAgentGroup(caller.id, groupId)).allowed) return null;
-    const group = await getAgentGroup(groupId);
-    if (!group) return null;
-    return buildLine({ id: caller.id, name: caller.display_name.trim() }, group, options);
+    if (!line || !(await hasAdminPrivilege(line.owner_user_id, line.agent_group_id))) return null;
+    const [caller, group] = await Promise.all([getUser(line.owner_user_id), getAgentGroup(line.agent_group_id)]);
+    if (!caller || !group) return null;
+    const name = caller.display_name?.trim() || caller.id;
+    return buildLine({ id: caller.id, name }, group, options, line.token_hash);
   } catch (err) {
     log.warn('voice-mode: could not authorize the voice line', { platformId, err });
     return null;
@@ -147,8 +154,6 @@ export const VOICE_MODE_CHANNEL = 'voice-mode';
 /** The platform id of the voice_mode_lines row `lineId`: `voice-mode:<line id>`. */
 export const linePlatformId = (lineId: string): string => `${VOICE_MODE_CHANNEL}:${lineId}`;
 
-/** The voice_mode_lines id a platform id names, or null for any other id (a configured personal line's, say). */
+/** The voice_mode_lines id a platform id names, or null for any other id. */
 export const lineIdOf = (platformId: string): string | null =>
   platformId.startsWith(`${VOICE_MODE_CHANNEL}:`) ? platformId.slice(VOICE_MODE_CHANNEL.length + 1) : null;
-
-export const lineChannelType = (_platformId: string): string => VOICE_MODE_CHANNEL;

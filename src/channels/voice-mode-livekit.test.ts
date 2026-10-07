@@ -1,4 +1,3 @@
-import type { VoiceModeInboundEvent as InboundEvent } from './voice-mode-integration.js';
 /**
  * The LiveKit path of the voice channel at the host boundary: the real adapter
  * behind the real webhook server, hit over HTTP the way the call page and the
@@ -22,6 +21,7 @@ vi.mock('../config.js', async () => ({
   DATA_DIR: TEST_DATA_DIR,
 }));
 afterAll(() => fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true }));
+vi.mock('../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 vi.mock('../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(true),
   isContainerRunning: vi.fn().mockReturnValue(false),
@@ -29,11 +29,10 @@ vi.mock('../container-runner.js', () => ({
   killContainer: vi.fn(),
 }));
 
-import type { InboundMessage } from './adapter.js';
-import type { VoiceModeOutboundMessage as OutboundMessage } from './voice-mode-integration.js';
+import type { InboundMessage, OutboundMessage } from './adapter.js';
+import type { VoiceModeInboundEvent as InboundEvent } from './voice-mode-integration.js';
 import {
   createVoiceModeAdapter,
-  voiceModeLineIdForToken,
   pageListener,
   type VoiceModeChannelAdapter,
   type VoiceModeConfig,
@@ -50,7 +49,6 @@ import {
   CALL_CHAT_REPLY_NOTE,
   CALL_DEPTH_NOTE,
   CALL_LANGUAGE_NOTE,
-  CALL_REPLY_NOTE,
   callLanguageNote,
   type LiveKitServerApi,
   type LiveKitVoiceConfig,
@@ -71,14 +69,28 @@ import {
   wakePhrase,
 } from './voice-mode-protocol.js';
 import { log } from '../log.js';
+import { requestWake } from '../request-wake.js';
 import { getWebhookStatus, stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './voice-mode-page.js';
 import { linePlatformId } from './voice-mode-line.js';
 
-/** A line from before the rename: with no call chat, its calls talk on the line itself. */
-const LINE = voiceModeLineIdForToken('tok123');
-/** A line /voice made: its calls need a chat to talk in. */
-const NEW_LINE = linePlatformId('0123456789ab');
+/** The line `tok123` opens. */
+const LINE = linePlatformId('0123456789ab');
+/** The chat the harness's calls talk in unless a test gives the mirror others: the agent's one telegram DM. */
+const CHAT = { channelType: 'telegram', platformId: 'telegram:100', threadId: null };
+let said = 0;
+/** The agent's message reached the call chat as delivery reports it; `answers` is the inbound id of the turn it answers. */
+const agentSays = (text: string, answers: string | null = null): void =>
+  liveKitChatDelivered(
+    {
+      id: `said-${++said}`,
+      kind: 'chat',
+      content: JSON.stringify({ text }),
+      ...CHAT,
+      inReplyTo: answers && `${answers}:ag-andy`,
+    },
+    'ag-andy',
+  );
 const MIN = 60_000;
 const API_KEY = 'APIfakekey123';
 const API_SECRET = 'fakesecretfakesecretfakesecretfakesecretfakesecr';
@@ -240,15 +252,14 @@ async function openHarness(
   const lk = fakeLiveKit();
   const adapter = createVoiceModeAdapter({
     publicUrl: `http://127.0.0.1:${port}`,
-    linkTokens: ['tok123'],
     lineForToken: async (token) => (token === 'tok123' ? LINE : null),
     resolveLine: async (id) =>
       access.enabled
         ? {
             caller: { id, name: 'Ethan' },
             agentGroupId: 'ag-andy',
-            ...(id === NEW_LINE ? { linkHash: 'test-hash' } : {}),
-            agent: { name: 'Andy', vocabulary: ['NanoClaw', 'Stan', 'Енді'], wakeNames: ['Енді'] },
+            linkHash: 'test-hash',
+            agent: { name: 'Andy', vocabulary: ['NanoClaw', 'Ava', 'Ава'], wakeNames: ['Ава'] },
           }
         : null,
     now: () => clock.now,
@@ -269,13 +280,14 @@ async function openHarness(
       apiKey: API_KEY,
       apiSecret: API_SECRET,
       api: lk,
-      mirrorApi: fakeMirror([]).api,
+      mirror: 'telegram',
+      mirrorApi: fakeMirror([{}]).api,
       ...lkOverrides,
     },
-    // The LiveKit engine routes here; a turn on the voice line is recorded as the message it carries.
+    // The LiveKit engine routes here; each turn is recorded as routed and as the message it carries.
     routeTurn: async ({ onStored, ...event }) => {
-      if (event.channelType !== 'voice-mode') events.push(event);
-      else inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
+      events.push(event);
+      inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
       if (routing.mode === 'hang') {
         return new Promise<boolean>((resolve, reject) =>
           routing.hung.push((store) => {
@@ -335,7 +347,7 @@ interface TokenResponse {
   token: string;
   callId: string;
   agent: string;
-  /** The call chat's name, for the page; absent while the call talks on the voice line. */
+  /** The call chat's name, for the page. */
   chat?: string;
   silenceMs: number;
   limit: { ms: number; kind: 'duration' | 'daily' };
@@ -407,8 +419,8 @@ async function attachWorker(h: Harness, meta: LiveKitJobMetadata): Promise<FakeW
   };
 }
 
-async function startCall(h: Harness): Promise<{ call: TokenResponse; worker: FakeWorker }> {
-  const res = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+async function startCall(h: Harness, token = 'tok123'): Promise<{ call: TokenResponse; worker: FakeWorker }> {
+  const res = await post(`${h.base}/livekit/token?v=6&t=${token}`);
   expect(res.status).toBe(200);
   const call = (await res.json()) as TokenResponse;
   const dispatch = h.lk.dispatches.at(-1)!;
@@ -419,42 +431,55 @@ async function startCall(h: Harness): Promise<{ call: TokenResponse; worker: Fak
 
 const settle = () => new Promise((r) => setTimeout(r, 30));
 
-/** LINE as main left it in a test DB: its named voice user, a member of Andy, and its strict known-sender chat. */
-async function seedLegacyLine(): Promise<void> {
+/** A /voice line in a test DB: Andy, its admin caller, and the telegram chat its calls talk in. */
+async function seedLine() {
   const { createAgentGroup, createMessagingGroup, createMessagingGroupAgent } = await import('../db/index.js');
   const { createUser } = await import('../modules/permissions/db/users.js');
-  const { addMember } = await import('../modules/permissions/db/agent-group-members.js');
+  const { grantRole } = await import('../modules/permissions/db/user-roles.js');
+  const { mintVoiceModeLine } = await import('../db/voice-mode-lines.js');
   const stamp = new Date().toISOString();
   await createAgentGroup({
     id: 'ag-andy',
     name: 'Andy',
-    folder: 'legacy-fixture',
+    folder: 'line-fixture',
     agent_provider: null,
     created_at: stamp,
   });
-  await createUser({ id: LINE, kind: 'voice-mode', display_name: 'Caller', created_at: stamp });
-  await addMember({ user_id: LINE, agent_group_id: 'ag-andy', added_by: null, added_at: stamp });
+  await createUser({ id: 'telegram:42', kind: 'telegram', display_name: 'Caller', created_at: stamp });
+  await grantRole({
+    user_id: 'telegram:42',
+    role: 'admin',
+    agent_group_id: 'ag-andy',
+    granted_by: null,
+    granted_at: stamp,
+  });
   await createMessagingGroup({
-    id: 'saved-line',
-    channel_type: 'voice-mode',
-    platform_id: LINE,
-    instance: 'voice-mode',
-    name: null,
+    id: 'mg-tg',
+    channel_type: 'telegram',
+    platform_id: 'telegram:100',
+    instance: 'telegram',
+    name: 'HQ',
     is_group: 0,
     unknown_sender_policy: 'strict',
     created_at: stamp,
   });
   await createMessagingGroupAgent({
-    id: 'saved-wire',
-    messaging_group_id: 'saved-line',
+    id: 'wire-tg',
+    messaging_group_id: 'mg-tg',
     agent_group_id: 'ag-andy',
     session_mode: 'shared',
-    sender_scope: 'known',
+    sender_scope: 'all',
     engage_mode: 'pattern',
     engage_pattern: '.',
     ignored_message_policy: 'drop',
     priority: 0,
     created_at: stamp,
+  });
+  return mintVoiceModeLine({
+    agentGroupId: 'ag-andy',
+    ownerUserId: 'telegram:42',
+    messagingGroupId: 'mg-tg',
+    threadId: null,
   });
 }
 
@@ -485,59 +510,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await h.stop();
   });
 
-  it('renders the call link of a line it holds the token for, and no other', () => {
-    expect(h.adapter.callLink(LINE)).toBe(`${h.hostUrl}/voice?t=tok123`);
-    expect(h.adapter.callLink(NEW_LINE)).toBeNull();
-    expect(h.adapter.callLink(voiceModeLineIdForToken('other'))).toBeNull();
-  });
-
-  it('keeps a saved main token working through the real legacy line and membership rows', async () => {
-    await h.stop();
-    const { initTestDb, runMigrations, closeDb } = await import('../db/index.js');
-    await runMigrations(await initTestDb());
-    try {
-      await seedLegacyLine();
-      const routed: InboundEvent[] = [];
-      h = await startHarness({
-        lineForToken: undefined,
-        resolveLine: undefined,
-        routeTurn: async (event) => routed.push(event) > 0,
-      });
-      const info = await fetch(`${h.hostUrl}/voice/info?t=tok123`);
-      expect(info.status).toBe(200);
-      expect(await info.json()).toMatchObject({ agent: 'Andy', caller: 'Caller', protocol: 6 });
-      const { worker } = await startCall(h);
-      expect(worker.meta.lineId).toBe(LINE);
-      await worker.utter('Saved link still works');
-      expect(JSON.parse(routed[0].message.content)).toMatchObject({ senderId: LINE });
-      expect(routed[0]).toMatchObject({ channelType: 'voice-mode', instance: 'voice-mode', platformId: LINE });
-      expect(routed[0].replyTo).toBeUndefined();
-    } finally {
-      await h.stop();
-      await closeDb();
-    }
-  });
-
-  it('opens no line for an env token whose saved main line is gone', async () => {
-    await h.stop();
-    const { initTestDb, runMigrations, closeDb } = await import('../db/index.js');
-    await runMigrations(await initTestDb());
-    try {
-      h = await startHarness({ lineForToken: undefined, resolveLine: undefined });
-      const info = await fetch(`${h.hostUrl}/voice/info?t=tok123`);
-      expect(info.status).toBe(403);
-      expect(await info.text()).toBe('Unknown call link');
-    } finally {
-      await h.stop();
-      await closeDb();
-    }
-  });
-
-  it("delivers a saved main line's answer through core to its live call, with no call chat, in the line's own session", async () => {
+  it("delivers the agent's answer through core to the live call in its /voice chat, and its typing there", async () => {
     await h.stop();
     const db = await import('../db/index.js');
     const { getSessionsByAgentGroup } = await import('../db/sessions.js');
-    const { getMessagingGroupByPlatform } = await import('../db/messaging-groups.js');
     const { inboundDbPath, outboundDbPath } = await import('../mailbox/sqlite/paths.js');
     const { getHostStartCallbacks } = await import('../host-lifecycle.js');
     const { deliverSessionMessages, setDeliveryAdapter } = await import('../delivery.js');
@@ -545,55 +521,63 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
     await db.runMigrations(await db.initTestDb());
     try {
-      await seedLegacyLine();
-      // The real line lookup and the real router; the mirror finds no chat, so the call talks on the line.
-      h = await startHarness({ lineForToken: undefined, resolveLine: undefined, routeTurn: undefined });
+      const { token, line } = await seedLine();
+      const chatCopies: OutboundMessage[] = [];
+      // The real line lookup, router and call-chat lookup; the chat is a fake telegram adapter.
+      h = await startHarness(
+        { lineForToken: undefined, resolveLine: undefined, routeTurn: undefined },
+        { mirrorApi: undefined },
+      );
       for (const start of getHostStartCallbacks()) await start({} as never);
-      // The host's registry, as at startup: this voice-mode adapter, then the module's own `voice` registration.
       registry.registerChannelAdapter('voice-mode', { factory: () => h.adapter });
+      registry.registerChannelAdapter('telegram', {
+        factory: () => ({
+          name: 'telegram',
+          channelType: 'telegram',
+          supportsThreads: false,
+          setup: async () => {},
+          teardown: async () => {},
+          isConnected: () => true,
+          deliver: async (_platformId: string, _threadId: string | null, message: OutboundMessage) => {
+            chatCopies.push(message);
+            return 'tg-1';
+          },
+        }),
+      });
       await registry.initChannelAdapters(() => ({
         onInbound: () => {},
         onInboundEvent: () => {},
         onMetadata: () => {},
         onAction: () => {},
       }));
-      expect(registry.getChannelAdapterExact('voice-mode')).toBeDefined();
       setDeliveryAdapter(registry.createChannelDeliveryAdapter());
 
-      const { worker } = await startCall(h);
-      expect(worker.meta.lineId).toBe(LINE);
-      const turnId = await worker.utter('Saved link, no chat');
+      const { call, worker } = await startCall(h, token);
+      expect(call.chat).toBe('HQ');
+      expect(worker.meta.lineId).toBe(linePlatformId(line.line_id));
+      const turnId = await worker.utter('Book a table');
       const turnMessageId = `livekit:${worker.meta.callId}:${turnId}:ag-andy`;
-      await vi.waitFor(async () => expect(await getSessionsByAgentGroup('ag-andy')).toHaveLength(1));
+      // The stored, waking turn starts the agent's thinking on the call that talks in its chat.
+      await worker.waitFor((e) => e.type === 'thinking');
       const [session] = await getSessionsByAgentGroup('ag-andy');
-      expect(session.messaging_group_id).toBe('saved-line');
-      expect(await getMessagingGroupByPlatform('voice-mode', LINE)).toBeDefined();
+      expect(session.messaging_group_id).toBe('mg-tg');
       const inbound = new Database(inboundDbPath('ag-andy', session.id), { readonly: true });
       const stored = inbound.prepare('SELECT id, channel_type, platform_id FROM messages_in WHERE trigger = 1').get();
       inbound.close();
-      expect(stored).toEqual({ id: turnMessageId, channel_type: 'voice-mode', platform_id: LINE });
+      expect(stored).toEqual({ id: turnMessageId, channel_type: 'telegram', platform_id: 'telegram:100' });
 
-      // The runner's pickup and the typing indicator reach the call through the `voice` address.
-      liveKitChatTyping({ channelType: 'voice-mode', platformId: LINE, threadId: null }, 'ag-andy', true);
-      await worker.waitFor((e) => e.type === 'working');
-      await registry.createChannelDeliveryAdapter().setTyping!('voice-mode', LINE, null, 'voice-mode');
-      await worker.waitFor((e) => e.type === 'thinking');
-
-      // The agent answers the turn on the chat it came from; core's delivery poll sends it.
+      // The agent answers in the chat; core's delivery poll sends it there, and the call speaks it.
       const out = new Database(outboundDbPath('ag-andy', session.id));
       out
         .prepare(
           `INSERT INTO messages_out (id, in_reply_to, timestamp, kind, platform_id, channel_type, content)
-           VALUES ('answer-1', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'chat', ?, 'voice-mode', ?)`,
+           VALUES ('answer-1', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'chat', 'telegram:100', 'telegram', ?)`,
         )
-        .run(turnMessageId, LINE, JSON.stringify({ text: 'The answer.' }));
+        .run(turnMessageId, JSON.stringify({ text: 'Booked.' }));
       out.close();
       await deliverSessionMessages(session);
-      expect(await worker.waitFor((e) => e.type === 'reply')).toEqual({
-        type: 'reply',
-        text: 'The answer.',
-        turn: turnId,
-      });
+      expect(await worker.waitFor((e) => e.type === 'reply')).toEqual({ type: 'reply', text: 'Booked.', turn: turnId });
+      expect(chatCopies.map((m) => m.content)).toContainEqual({ text: '\u{1F50A} Booked.' });
     } finally {
       await registry.teardownChannelAdapters();
       await h.stop();
@@ -879,12 +863,11 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       agentName: 'Andy',
       callerName: 'Ethan',
       callerIdentity: expect.stringMatching(/^caller-/),
-      vocabulary: ['NanoClaw', 'Stan', 'Енді'],
+      vocabulary: ['NanoClaw', 'Ava', 'Ава'],
       languages: ['en-US'],
       // The agent's own spellings of its name, for the wake phrase.
-      wakeNames: ['Енді'],
+      wakeNames: ['Ава'],
       sttModel: 'gemini-3.5-transcribe-live',
-      sttFallbackModel: '',
       ttsModel: 'gemini-3.8-flash-tts',
       ttsFallbackModel: 'gemini-3.8-flash-lite-tts',
       ttsVoice: 'Alnilam',
@@ -976,13 +959,8 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const second = await worker.utter('And the day after?');
     expect(second).not.toBe(id);
 
-    const interim = await h.adapter.deliver(LINE, null, {
-      kind: 'chat',
-      content: { text: 'Checking.' },
-      inReplyTo: msg.id,
-    });
-    expect(interim).toBe(msg.id);
-    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Dentist at nine.' }, inReplyTo: msg.id });
+    agentSays('Checking.', msg.id);
+    agentSays('Dentist at nine.', msg.id);
     await worker.waitFor((e) => e.type === 'reply' && e.text === 'Dentist at nine.');
     // Both answer the first turn, and say so: the page labels them with it.
     expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
@@ -1027,13 +1005,13 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('starts the agent the call talks to once, when the caller joins, routing nothing', async () => {
     const { call, worker } = await startCall(h);
     await vi.waitFor(() => expect(h.prewarm.woke).toEqual(['sess-andy']));
-    // Looked up where the first turn goes (the voice line here), for the line's agent; nothing was routed.
+    // Looked up where the first turn goes (the call chat), for the line's agent; nothing was routed.
     expect(h.prewarm.lookups).toEqual([
       {
         route: {
-          channelType: 'voice-mode',
-          instance: 'voice-mode',
-          platformId: LINE,
+          channelType: 'telegram',
+          instance: 'telegram',
+          platformId: 'telegram:100',
           threadId: null,
           agentGroupId: 'ag-andy',
         },
@@ -1081,6 +1059,15 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     worker.close();
   });
 
+  it('starts the agent for a call as an interactive wake, not as if a message came in', async () => {
+    await h.stop();
+    h = await startHarness({ prewarm: { findSession: async () => ({ id: 'sess-andy' }) as Session } });
+    await startCall(h);
+    await vi.waitFor(() =>
+      expect(vi.mocked(requestWake)).toHaveBeenCalledWith(expect.objectContaining({ id: 'sess-andy' }), 'interactive'),
+    );
+  });
+
   it('tells the worker when a turn it heard 504 for reaches the agent after all', async () => {
     await h.stop();
     h = await startHarness({}, { routeTimeoutMs: 100 });
@@ -1116,7 +1103,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       expect((await worker.post('utterance', { text: 'broken' })).status).toBe(500);
       expect(error).toHaveBeenCalledWith(
         'livekit-voice-mode: routing a turn failed',
-        expect.objectContaining({ platformId: LINE }),
+        expect.objectContaining({ platformId: 'telegram:100' }),
       );
       h.routing.mode = 'hang';
       expect((await worker.post('utterance', { text: 'stuck' })).status).toBe(504);
@@ -1181,38 +1168,31 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.inbound).toEqual([]);
   });
 
-  it('speaks proactive agent messages and tells the worker while the agent works', async () => {
+  it('speaks proactive agent messages to the call chat and tells the worker while the agent works there', async () => {
     const { worker } = await startCall(h);
-    const id = await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Your taxi is here.' } });
-    expect(id).toMatch(/^livekit:.*:out-1$/);
+    agentSays('Your taxi is here.');
     // It answers no turn, so it carries none.
     expect(await worker.waitFor((e) => e.type === 'reply')).toEqual({
       type: 'reply',
       text: 'Your taxi is here.',
       turn: null,
     });
-    await h.adapter.setTyping!(LINE, null);
+    liveKitChatTyping(CHAT, 'ag-andy');
     await worker.waitFor((e) => e.type === 'thinking');
-    // The runner's pickup on the line's own chat is the worker's `working`; the adapter already said thinking.
-    const thinking = worker.events.filter((e) => e.type === 'thinking').length;
-    liveKitChatTyping({ channelType: 'voice-mode', platformId: LINE, threadId: null }, 'ag-andy');
-    liveKitChatTyping({ channelType: 'voice-mode', platformId: LINE, threadId: null }, 'ag-other', true);
-    liveKitChatTyping({ channelType: 'voice-mode', platformId: 'voice:other', threadId: null }, 'ag-andy', true);
+    // The runner's pickup in the call chat is the worker's `working`; another agent's, or another chat's, is not.
+    liveKitChatTyping(CHAT, 'ag-other', true);
+    liveKitChatTyping({ ...CHAT, platformId: 'telegram:200' }, 'ag-andy', true);
     await settle();
     expect(worker.events.some((e) => e.type === 'working')).toBe(false);
-    liveKitChatTyping({ channelType: 'voice-mode', platformId: LINE, threadId: null }, 'ag-andy', true);
+    liveKitChatTyping(CHAT, 'ag-andy', true);
     await worker.waitFor((e) => e.type === 'working');
-    expect(worker.events.filter((e) => e.type === 'thinking')).toHaveLength(thinking);
     worker.close();
   });
 
-  it('refuses question cards, attachments and a reply with no call, instead of reporting them delivered', async () => {
-    const card = { kind: 'chat', content: { type: 'ask_question', question: 'Which one?' } };
-    await expect(h.adapter.deliver(LINE, null, card)).rejects.toThrow('question cards are unsupported');
-    const file = { kind: 'chat', content: { text: 'Here.' }, files: [{ filename: 'a.txt', data: Buffer.from('a') }] };
-    await expect(h.adapter.deliver(LINE, null, file)).rejects.toThrow('attachments cannot be delivered');
+  it('takes no message on a voice line itself: a call speaks in its chat', async () => {
+    await startCall(h);
     await expect(h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Hello?' } })).rejects.toThrow(
-      'no active call on this line',
+      'is a voice line, not a chat',
     );
   });
 
@@ -1221,9 +1201,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await first.worker.utter('old question');
     const oldId = h.inbound[0].id;
     const second = await startCall(h);
-    await expect(
-      h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'stale' }, inReplyTo: oldId }),
-    ).resolves.toBeUndefined();
+    agentSays('stale', oldId);
     await settle();
     expect(second.worker.events.some((e) => e.type === 'reply')).toBe(false);
     first.worker.close();
@@ -1263,7 +1241,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     release();
     expect((await ended).status).toBe(204);
     await worker.streamClosed;
-    expect(h.lk.roomMetadata).toEqual([{ room: h.lk.rooms[0], metadata: { chat: null, end: 'worker_gone' } }]);
+    expect(h.lk.roomMetadata).toEqual([{ room: h.lk.rooms[0], metadata: { chat: 'telegram DM', end: 'worker_gone' } }]);
     expect(h.lk.deleted).toEqual([h.lk.rooms[0]]);
   });
 
@@ -1271,7 +1249,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const { worker } = await startCall(h);
     expect((await worker.post('ended', { reason: 'job shutdown', restart: true })).status).toBe(204);
     await worker.streamClosed;
-    expect(h.lk.roomMetadata).toEqual([{ room: h.lk.rooms[0], metadata: { chat: null, end: 'worker_restart' } }]);
+    expect(h.lk.roomMetadata).toEqual([
+      { room: h.lk.rooms[0], metadata: { chat: 'telegram DM', end: 'worker_restart' } },
+    ]);
   });
 
   it('ends a call the page hung up on without naming it there: nobody is left to read it', async () => {
@@ -1288,37 +1268,35 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await vi.waitFor(() =>
       expect(h.lk.roomMetadata).toContainEqual({
         room: h.lk.dispatches[0].room,
-        metadata: { chat: null, end: 'newer_call' },
+        metadata: { chat: 'telegram DM', end: 'newer_call' },
       }),
     );
     first.worker.close();
     await h.adapter.teardown();
     expect(h.lk.roomMetadata.at(-1)).toEqual({
       room: h.lk.dispatches[1].room,
-      metadata: { chat: null, end: 'shutdown' },
+      metadata: { chat: 'telegram DM', end: 'shutdown' },
     });
     await h.stop();
     h = await startHarness({ maxCallDurationMs: 50 });
     const { worker } = await startCall(h);
     await worker.streamClosed;
-    expect(h.lk.roomMetadata).toEqual([{ room: h.lk.rooms[0], metadata: { chat: null, end: 'limit_duration' } }]);
+    expect(h.lk.roomMetadata).toEqual([
+      { room: h.lk.rooms[0], metadata: { chat: 'telegram DM', end: 'limit_duration' } },
+    ]);
   });
 
-  it('turns a fallback model off when it is set to off or empty', async () => {
-    await h.stop();
-    h = await startHarness(
-      {},
-      {
-        speech: { sttFallbackModel: 'off', ttsFallbackModel: ' ', ttsModel: 'gemini-3.8-flash-lite-tts' },
-      },
-    );
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
-    expect(h.lk.dispatches[0].metadata).toMatchObject({
-      sttModel: 'gemini-3.5-transcribe-live',
-      sttFallbackModel: '',
-      ttsModel: 'gemini-3.8-flash-lite-tts',
-      ttsFallbackModel: '',
-    });
+  it('turns the speech fallback model off when it is set to off or empty', async () => {
+    for (const ttsFallbackModel of ['off', ' ']) {
+      await h.stop();
+      h = await startHarness({}, { speech: { ttsFallbackModel, ttsModel: 'gemini-3.8-flash-lite-tts' } });
+      expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
+      expect(h.lk.dispatches[0].metadata).toMatchObject({
+        sttModel: 'gemini-3.5-transcribe-live',
+        ttsModel: 'gemini-3.8-flash-lite-tts',
+        ttsFallbackModel: '',
+      });
+    }
   });
 
   it('names a missing or mismatched worker when the page gives up on it', async () => {
@@ -1344,7 +1322,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await worker.streamClosed;
     expect(worker.events.at(-1)).toMatchObject({ type: 'end', reason: 'caller access revoked or line changed' });
     expect(h.lk.deleted).toHaveLength(1);
-    expect(h.lk.roomMetadata.at(-1)?.metadata).toEqual({ chat: null, end: 'revoked' });
+    expect(h.lk.roomMetadata.at(-1)?.metadata).toEqual({ chat: 'telegram DM', end: 'revoked' });
   });
 
   it('ends the call when the worker link drops', async () => {
@@ -1352,7 +1330,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     worker.close();
     await new Promise((r) => setTimeout(r, 100));
     expect(h.lk.deleted).toHaveLength(1);
-    expect(h.lk.roomMetadata.at(-1)?.metadata).toEqual({ chat: null, end: 'worker_gone' });
+    expect(h.lk.roomMetadata.at(-1)?.metadata).toEqual({ chat: 'telegram DM', end: 'worker_gone' });
   });
 
   it('charges the daily minutes from join to end and caps a call at the remaining budget', async () => {
@@ -1382,7 +1360,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await worker.streamClosed;
     expect(worker.events.at(-1)).toEqual({ type: 'end', reason: 'daily minute budget' });
     expect(h.lk.deleted).toHaveLength(1);
-    expect(h.lk.roomMetadata.at(-1)?.metadata).toEqual({ chat: null, end: 'limit_daily' });
+    expect(h.lk.roomMetadata.at(-1)?.metadata).toEqual({ chat: 'telegram DM', end: 'limit_daily' });
   });
 
   it('refuses starts over the hourly cap with a retry time', async () => {
@@ -1475,17 +1453,6 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.deleted).toEqual([h.lk.rooms[0]]);
   });
 
-  it('refuses a delivery once the caller lost access instead of reporting it sent', async () => {
-    await h.stop();
-    h = await startHarness({ accessCheckIntervalMs: 60_000 });
-    const { worker } = await startCall(h);
-    h.access.enabled = false;
-    await expect(
-      h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Your taxi is here.' } }),
-    ).rejects.toThrow(/revoked/);
-    await worker.streamClosed;
-  });
-
   it('refuses a start over the daily minutes without ending the running call', async () => {
     await h.stop();
     h = await startHarness({ maxCallMsPerDay: 2 * MIN });
@@ -1560,7 +1527,6 @@ describe('livekit call talking in the agent chat', () => {
     const { call, worker } = await startCall(h);
     expect(call.chat).toBe('HQ');
     const id = await worker.utter('Book a table for two');
-    expect(h.inbound).toEqual([]);
     expect(h.events).toHaveLength(1);
     const event = h.events[0];
     expect(event).toMatchObject({
@@ -1827,7 +1793,6 @@ describe('livekit call talking in the agent chat', () => {
     const { worker } = await startCall(h);
     await worker.utter('hello');
     expect(h.events).toEqual([expect.objectContaining({ platformId: 'telegram:-300:7' })]);
-    expect(h.inbound).toEqual([]);
     worker.close();
   });
 
@@ -1941,35 +1906,17 @@ describe('livekit call talking in the agent chat', () => {
     worker.close();
   });
 
-  it('keeps the call on the voice line when no single chat could be meant', async () => {
+  it('refuses a call when no single chat could be meant', async () => {
     for (const groups of [[], [{ platform_id: 'telegram:1' }, { id: 'x', platform_id: 'telegram:2' }]]) {
       const { posts } = await start(groups);
-      const { worker } = await startCall(h);
-      await worker.utter('hello');
-      expect(h.events).toEqual([]);
-      expect(h.inbound).toHaveLength(1);
-      await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Hi.' }, inReplyTo: h.inbound[0].id });
-      await worker.waitFor((e) => e.type === 'reply' && e.text === 'Hi.');
-      await settle();
+      const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+      expect(refused.status).toBe(409);
+      expect(await refused.json()).toMatchObject({ error: 'no-chat' });
+      expect(h.lk.rooms).toEqual([]);
       expect(posts).toEqual([]);
-      worker.close();
       await h.stop();
     }
     h = await startHarness();
-  });
-
-  it('keeps the call on the voice line with VOICE_MODE_MIRROR=off and no /voice chat', async () => {
-    const { posts } = await start([{}], 'off');
-    const { call, worker } = await startCall(h);
-    expect(call.chat).toBeUndefined();
-    await worker.utter('hello');
-    expect(h.events).toEqual([]);
-    expect(h.inbound).toHaveLength(1);
-    await settle();
-    expect(posts).toEqual([]);
-    // No chat to point the caller at: the worker is never told there is one.
-    expect(worker.events.some((e) => e.type === 'chat')).toBe(false);
-    worker.close();
   });
 
   it('refuses a /voice line with no chat to talk in: a start before it counts or opens anything, a turn once the chat is gone', async () => {
@@ -1979,7 +1926,6 @@ describe('livekit call talking in the agent chat', () => {
       {
         accessCheckIntervalMs: 60_000,
         maxCallsPerHour: 1,
-        lineForToken: async (token) => (token === 'tok123' ? NEW_LINE : null),
       },
       { mirror: 'off', mirrorApi: fake.api },
     );
@@ -2002,7 +1948,11 @@ describe('livekit call talking in the agent chat', () => {
     expect(turn.status).toBe(409);
     expect(await turn.text()).toBe('The call has no chat to talk in');
     expect(h.events).toHaveLength(1);
-    expect(h.inbound).toEqual([]);
+    // The worker hears the chat is gone, then the end.
+    expect(worker.events.filter((e) => e.type === 'chat')).toEqual([
+      { type: 'chat', chat: true },
+      { type: 'chat', chat: false },
+    ]);
     // A call with nowhere to talk is over, not refused turn after turn.
     expect(await worker.waitFor((e) => e.type === 'end')).toEqual({ type: 'end', reason: 'no chat to talk in' });
     await settle();
@@ -2017,16 +1967,13 @@ describe('livekit call talking in the agent chat', () => {
       fake.api.groupsFor = async () => {
         throw new Error('db gone');
       };
-      h = await startHarness(
-        { lineForToken: async (token) => (token === 'tok123' ? NEW_LINE : null) },
-        { mirror: 'telegram', mirrorApi: fake.api },
-      );
+      h = await startHarness({}, { mirror: 'telegram', mirrorApi: fake.api });
       const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
       expect(refused.status).toBe(409);
       expect(await refused.json()).toMatchObject({ error: 'no-chat' });
       expect(h.lk.rooms).toEqual([]);
       expect(info).toHaveBeenCalledWith('livekit-voice-mode: call refused: the line has no chat to talk in', {
-        platformId: NEW_LINE,
+        platformId: LINE,
       });
       expect(JSON.stringify(info.mock.calls)).not.toContain('starting');
     } finally {
@@ -2043,24 +1990,6 @@ describe('livekit call talking in the agent chat', () => {
     const { worker } = await startCall(h);
     await worker.utter('hello');
     expect(h.events).toEqual([expect.objectContaining({ platformId: 'telegram:100' })]);
-    worker.close();
-  });
-
-  it('tells the worker when the call moves off its chat onto the voice line', async () => {
-    const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
-    const fake = await start([topic], 'off', {
-      bound: { group: topic, threadId: null, ownerIds: ['telegram:42'] },
-      admins: ['telegram:42'],
-    });
-    const { worker } = await startCall(h);
-    await worker.utter('one');
-    fake.state.bound = undefined;
-    await worker.utter('two');
-    await worker.waitFor((e) => e.type === 'chat' && !e.chat);
-    expect(worker.events.filter((e) => e.type === 'chat')).toEqual([
-      { type: 'chat', chat: true },
-      { type: 'chat', chat: false },
-    ]);
     worker.close();
   });
 });
@@ -2084,22 +2013,15 @@ describe('spoken text of a delivered message', () => {
 });
 
 describe('turn message text', () => {
-  it('marks the transcript as spoken and says how to answer', () => {
-    expect(turnMessageText('Привіт')).toBe(`<voice source="livekit">Привіт</voice>\n${CALL_REPLY_NOTE}`);
-    expect(CALL_REPLY_NOTE).toContain('separate written message');
-  });
-
-  it('warns a call in a chat that everything sent there is spoken', () => {
+  it('marks the transcript as spoken and warns that everything sent to the chat is spoken', () => {
+    expect(turnMessageText('Привіт')).toBe(`<voice source="livekit">Привіт</voice>\n${CALL_CHAT_REPLY_NOTE}`);
     expect(CALL_CHAT_REPLY_NOTE).toContain('every message you send to this chat is read aloud');
-    expect(CALL_CHAT_REPLY_NOTE).not.toContain('separate written message');
   });
 
   it('asks for depth that matches the question, not a fixed short length, and keeps the spoken-output rules', () => {
-    for (const note of [CALL_REPLY_NOTE, CALL_CHAT_REPLY_NOTE]) {
-      expect(note).toContain(CALL_DEPTH_NOTE);
-      expect(note).not.toMatch(/few short/i);
-      expect(note).toContain('code, links, long lists');
-    }
+    expect(CALL_CHAT_REPLY_NOTE).toContain(CALL_DEPTH_NOTE);
+    expect(CALL_CHAT_REPLY_NOTE).not.toMatch(/few short/i);
+    expect(CALL_CHAT_REPLY_NOTE).toContain('code, links, long lists');
     expect(CALL_DEPTH_NOTE).toContain('Match the depth to the question: brief for simple ones');
     expect(CALL_DEPTH_NOTE).toContain('take the time to think and verify, and give the full considered answer');
     expect(CALL_DEPTH_NOTE).toContain('Lead with the answer; for a long one, say how many points there are');
@@ -2109,9 +2031,7 @@ describe('turn message text', () => {
 
   it('keeps the transcript as heard and tells the agent Russian spelling is Ukrainian, never to answer in Russian', () => {
     expect(turnMessageText('Привет.')).toContain('<voice source="livekit">Привет.</voice>');
-    for (const note of [CALL_REPLY_NOTE, CALL_CHAT_REPLY_NOTE]) {
-      expect(note).toContain(CALL_LANGUAGE_NOTE);
-    }
+    expect(CALL_CHAT_REPLY_NOTE).toContain(CALL_LANGUAGE_NOTE);
     expect(callLanguageNote(['uk-UA', 'en-US'])).toContain(
       'looks Russian is Ukrainian misspelled by speech recognition',
     );

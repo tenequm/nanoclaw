@@ -1,8 +1,3 @@
-import { initializeVoiceModeIntegration, registerVoiceModeRootHandler } from './voice-mode-integration.js';
-import type {
-  VoiceModeOutboundMessage as OutboundMessage,
-  VoiceModeInboundEvent as InboundEvent,
-} from './voice-mode-integration.js';
 /**
  * Voice channel: browser calls with a NanoClaw agent. The caller talks to the
  * line's real agent: each turn of speech is transcribed and handed to the
@@ -14,9 +9,10 @@ import type {
  * link to one agent: a voice_mode_lines row that `/voice` creates
  * (voice-mode-command.ts), with the platform id `voice-mode:<line id>` for a
  * random line id. The row keeps only the link token's SHA-256, so the token
- * itself never reaches the database, the logs or the agent's messages. Configured personal lines keep their `voice-mode:<hash>` identities
- * and tokens in `.env`. There are no threads. One call is active per line at a
- * time; the newest wins.
+ * itself never reaches the database, the logs or the agent's messages. A call
+ * talks in one of the agent's chats, never on the line itself, so the line has
+ * no messaging group of its own. One call is active per line at a time; the
+ * newest wins.
  *
  * The link token gates the HTTP routes: a request without a known `t` gets a
  * 403 before any room is created. The page is at `/voice?t=<token>` behind a
@@ -26,8 +22,13 @@ import http from 'node:http';
 import net from 'node:net';
 
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup } from './adapter.js';
-import { wiringThreadsEnabled } from './voice-mode-integration.js';
-import { getChannelAdapterExact, registerChannelAdapter } from './channel-registry.js';
+import { registerChannelAdapter } from './channel-registry.js';
+import {
+  expediteDelivery,
+  registerVoiceModeRootHandler,
+  wiringThreadsEnabled,
+  type VoiceModeInboundEvent as InboundEvent,
+} from './voice-mode-integration.js';
 import type { VoiceModeUiConfig } from './voice-mode-page.js';
 import {
   linePlatformId,
@@ -36,20 +37,17 @@ import {
   type ResolveLineOptions,
   type VoiceModeLine,
 } from './voice-mode-line.js';
-import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
+import { createLiveKitVoice, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_VOICE_MIRROR,
   LIVEKIT_PROTOCOL_VERSION,
   wakePhrase,
-  voiceModeEnv,
-  voiceModeEnvKeys,
   parseVoiceLanguages,
 } from './voice-mode-protocol.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
-import { expediteDelivery } from './voice-mode-integration.js';
-import { findVoiceModeLineByToken, hashLinkToken } from '../db/voice-mode-lines.js';
+import { findVoiceModeLineByToken } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand } from './voice-mode-command.js';
 import { readEnvFile } from '../env.js';
@@ -170,9 +168,7 @@ const isWorkerRoute = (route: string): boolean => /^livekit\/agent(?:\/|$)/.test
  * A voice line is DM-shaped: every caller turn is for the agent (pattern '.'),
  * there are no threads and no platform mention concept. The link token is the
  * credential: whoever holds the link is the line's caller. A call needs the
- * hashed-line table's caller to hold an owner or admin role over the agent, or,
- * failing a row there, a configured personal line's named user with explicit membership on a
- * strict chat with a known-sender wiring.
+ * line's caller to hold an owner or admin role over the agent.
  */
 const VOICE_MODE_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'strict' },
@@ -189,9 +185,7 @@ export interface VoiceModeConfig {
   pageHost?: string;
   /** VOICE_MODE_PORT was set: a page listener that cannot bind fails setup instead of being skipped. */
   pagePortRequired?: boolean;
-  /** Link tokens accepted on the HTTP routes; each is one voice line. */
-  linkTokens?: string[];
-  /** The line a link token opens, by platform id, or null. Defaults to the hashed-line table, then the env tokens. */
+  /** The line a link token opens, by platform id, or null. Defaults to the hashed-line table. */
   lineForToken?: (token: string) => Promise<string | null>;
   /** Routes a turn instead of routeVoiceModeTurn; resolves true once the agent's session stored it. Test seam. */
   routeTurn?: (event: InboundEvent) => Promise<boolean>;
@@ -212,8 +206,6 @@ export interface VoiceModeConfig {
   maxCallsPerHour?: number;
   /** Call time one line may use per UTC day. */
   maxCallMsPerDay?: number;
-  /** Serve the voice routes to non-loopback peers too (VOICE_MODE_ALLOW_NON_LOOPBACK); for local development only. */
-  allowNonLoopback?: boolean;
   /** VOICE_MODE_TRUSTED_PROXY_CIDRS: reverse proxies (e.g. a Docker bridge subnet) admitted for the browser routes. */
   trustedProxyCidrs?: string;
   /** VOICE_MODE_ALLOWED_CLIENT_CIDRS: clients those proxies may forward (X-Forwarded-For); unset is any. */
@@ -252,16 +244,8 @@ export async function findCallSession(
   return findSessionForAgent(agentGroupId, mg.id, mode === 'shared' ? null : threadId);
 }
 
-/** The id an env link token's line had before the voice-mode rename: `voice:` + its SHA-256's first 12 hex characters. */
-export function voiceModeLineIdForToken(token: string): string {
-  return `${VOICE_MODE_CHANNEL}:${hashLinkToken(token).slice(0, 12)}`;
-}
-
-/** The voice adapter, plus the call link of one of its lines for the `/voice` command. */
+/** The voice adapter, plus the call link of its lines for the `/voice` command. */
 export interface VoiceModeChannelAdapter extends ChannelAdapter {
-  deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined>;
-  /** The line's call page URL, or null when the line has no link token here. */
-  callLink(platformId: string): string | null;
   /** The call page URL for a link token. */
   callUrl(token: string): string;
   /** `/voice` in a chat, with this adapter's call URLs and saved links (voice-mode-command.ts). */
@@ -269,29 +253,14 @@ export interface VoiceModeChannelAdapter extends ChannelAdapter {
 }
 
 export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChannelAdapter {
-  initializeVoiceModeIntegration();
-  /** Main's env link tokens by the legacy line id each opens; lines made since are hashed-token rows. */
-  const personalLines = new Map(
-    (config.linkTokens ?? [])
-      .map((t) => t.trim())
-      .filter(Boolean)
-      .map((t) => [t, voiceModeLineIdForToken(t)]),
-  );
   const lineForToken =
     config.lineForToken ??
     (async (token: string) => {
       const line = await findVoiceModeLineByToken(token);
-      if (line) return linePlatformId(line.line_id);
-      const personal = personalLines.get(token);
-      if (!personal) return null;
-      return (await getMessagingGroupByPlatform(VOICE_MODE_CHANNEL, personal, VOICE_MODE_CHANNEL)) ? personal : null;
+      return line ? linePlatformId(line.line_id) : null;
     });
   const callUrl = (token: string): string =>
     `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}`;
-  const callLink = (platformId: string): string | null => {
-    const token = [...personalLines].find(([, id]) => id === platformId)?.[0];
-    return token ? callUrl(token) : null;
-  };
   const proxyPolicy: VoiceModeProxyPolicy = {
     trustedProxies: parseCidrs(config.trustedProxyCidrs, 'VOICE_MODE_TRUSTED_PROXY_CIDRS'),
     allowedClients: parseCidrs(config.allowedClientCidrs, 'VOICE_MODE_ALLOWED_CLIENT_CIDRS'),
@@ -304,7 +273,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
   const expediteReplies =
     config.expediteReplies ?? ((session: Session) => expediteDelivery(session, CALL_REPLY_EXPEDITE_MS));
   const findSession = config.prewarm?.findSession ?? findCallSession;
-  const wakeSession = config.prewarm?.wake ?? ((session: Session) => requestWake(session, 'inbound-message'));
+  const wakeSession = config.prewarm?.wake ?? ((session: Session) => requestWake(session, 'interactive'));
   const maxCallDurationMs = config.maxCallDurationMs ?? 15 * 60_000;
   const maxCallsPerHour = config.maxCallsPerHour ?? 12;
   const maxCallMsPerDay = config.maxCallMsPerDay ?? 120 * MINUTE_MS;
@@ -417,7 +386,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     res.end(body);
   };
 
-  /** HTTP routes under /webhook/voice-mode/ and /webhook/voice/, and the browser's under /voice/, on the shared webhook server. */
+  /** HTTP routes under /webhook/voice-mode/, and the browser's under /voice/, on the shared webhook server. */
   const handleHttp = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     let url: URL;
     try {
@@ -435,21 +404,17 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     }
     // Before any token check: a link must not be usable, or probed, from the LAN over plain HTTP.
     const peer = req.socket.remoteAddress;
-    if (!config.allowNonLoopback) {
-      const browserRoute = parsed !== null && !isWorkerRoute(parsed);
-      if (
-        browserRoute
-          ? !admitsVoiceModePeer(proxyPolicy, peer, req.headers['x-forwarded-for'])
-          : !isLoopbackAddress(peer)
-      ) {
-        if (proxyPolicy.trustedProxies.has(peer)) {
-          log.warn('voice-mode: refused a proxied voice request', {
-            peer,
-            forwardedFor: req.headers['x-forwarded-for'],
-          });
-        }
-        return reply(res, 403, 'Voice calls are served through the host front only');
+    const browserRoute = parsed !== null && !isWorkerRoute(parsed);
+    if (
+      browserRoute ? !admitsVoiceModePeer(proxyPolicy, peer, req.headers['x-forwarded-for']) : !isLoopbackAddress(peer)
+    ) {
+      if (proxyPolicy.trustedProxies.has(peer)) {
+        log.warn('voice-mode: refused a proxied voice request', {
+          peer,
+          forwardedFor: req.headers['x-forwarded-for'],
+        });
       }
+      return reply(res, 403, 'Voice calls are served through the host front only');
     }
     if (parsed === null) return reply(res, 404, 'Not found');
     const route = parsed;
@@ -492,7 +457,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
     callUrl,
     handleVoiceCommand: (event: InboundEvent): Promise<boolean> => handleVoiceCommand(event, callUrl),
-    callLink,
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
@@ -538,7 +502,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       log.info('voice-mode: ready', {
         callUrl: `${callUrl('')}<link token>`,
         trustedProxies: config.trustedProxyCidrs?.trim() || 'none',
-        envTokens: personalLines.size,
         livekit: config.livekit.url,
         protocol: LIVEKIT_PROTOCOL_VERSION,
         agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
@@ -566,26 +529,9 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       return connected;
     },
 
-    async deliver(platformId: string, _threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
-      const content = message.content as { text?: unknown; type?: unknown } | string;
-      if (typeof content === 'object' && content?.type === 'ask_question') {
-        throw new Error('voice-mode: question cards are unsupported; ask the caller in plain text');
-      }
-      if (message.files?.length) throw new Error('voice-mode: attachments cannot be delivered over a voice call');
-      const text = typeof content === 'string' ? content : typeof content?.text === 'string' ? content.text : '';
-      const replyId =
-        message.inReplyTo ??
-        (typeof content === 'object' && content !== null
-          ? (content as { voiceModeInReplyTo?: string }).voiceModeInReplyTo
-          : undefined);
-      const target = replyId ? parseLiveKitUtteranceId(replyId) : null;
-      const spoken = await livekit.deliver(platformId, target, replyId ?? undefined, text);
-      if (!spoken) throw new Error('voice-mode: no active call on this line');
-      return spoken.id;
-    },
-
-    async setTyping(platformId: string): Promise<void> {
-      await livekit.setTyping(platformId);
+    // A call speaks the agent's messages to its call chat (voice-mode-livekit.ts); no chat is a voice line.
+    async deliver(platformId: string): Promise<string | undefined> {
+      throw new Error(`voice-mode: ${platformId} is a voice line, not a chat; calls speak in their chat`);
     },
   };
 }
@@ -658,49 +604,34 @@ const LIVEKIT_REQUIRED = ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET'
 
 registerChannelAdapter(VOICE_MODE_CHANNEL, {
   factory: () => {
-    const env = voiceModeEnv(
-      readEnvFile(
-        voiceModeEnvKeys([
-          'VOICE_MODE_PUBLIC_URL',
-          'VOICE_MODE_PORT',
-          'VOICE_MODE_PAGE_HOST',
-          'VOICE_MODE_LANGUAGES',
-          'VOICE_MODE_LINK_TOKEN',
-          'VOICE_MODE_UI',
-          'VOICE_MODE_MAX_CALL_SECONDS',
-          'VOICE_MODE_MAX_CALLS_PER_HOUR',
-          'VOICE_MODE_MAX_MINUTES_PER_DAY',
-          'VOICE_MODE_ALLOW_NON_LOOPBACK',
-          'VOICE_MODE_TRUSTED_PROXY_CIDRS',
-          'VOICE_MODE_ALLOWED_CLIENT_CIDRS',
-          'VOICE_MODE_VOCABULARY',
-          ...LIVEKIT_REQUIRED,
-          'LIVEKIT_WORKER_URL',
-          'LIVEKIT_AGENT_NAME',
-          'VOICE_MODE_STT_MODEL',
-          'VOICE_MODE_STT_FALLBACK_MODEL',
-          'VOICE_MODE_TTS_MODEL',
-          'VOICE_MODE_TTS_FALLBACK_MODEL',
-          'VOICE_MODE_TTS_VOICE',
-          'VOICE_MODE_SILENCE_MS',
-          'VOICE_MODE_MIRROR',
-          'VOICE_MODE_WAKE_MODEL',
-          'VOICE_MODE_WAKE_PHRASE',
-        ]),
-      ),
-      (message) => log.warn(message),
-    );
+    const env = readEnvFile([
+      'VOICE_MODE_PUBLIC_URL',
+      'VOICE_MODE_PORT',
+      'VOICE_MODE_PAGE_HOST',
+      'VOICE_MODE_LANGUAGES',
+      'VOICE_MODE_UI',
+      'VOICE_MODE_MAX_CALL_SECONDS',
+      'VOICE_MODE_MAX_CALLS_PER_HOUR',
+      'VOICE_MODE_MAX_MINUTES_PER_DAY',
+      'VOICE_MODE_TRUSTED_PROXY_CIDRS',
+      'VOICE_MODE_ALLOWED_CLIENT_CIDRS',
+      'VOICE_MODE_VOCABULARY',
+      ...LIVEKIT_REQUIRED,
+      'LIVEKIT_WORKER_URL',
+      'LIVEKIT_AGENT_NAME',
+      'VOICE_MODE_STT_MODEL',
+      'VOICE_MODE_TTS_MODEL',
+      'VOICE_MODE_TTS_FALLBACK_MODEL',
+      'VOICE_MODE_TTS_VOICE',
+      'VOICE_MODE_SILENCE_MS',
+      'VOICE_MODE_MIRROR',
+      'VOICE_MODE_WAKE_MODEL',
+      'VOICE_MODE_WAKE_PHRASE',
+    ]);
     const missing = LIVEKIT_REQUIRED.filter((key) => !env[key]);
     if (missing.length > 0) {
       log.warn('voice-mode: LiveKit is not configured; the channel stays offline', { missing });
       return null;
-    }
-    const linkTokens = (env.VOICE_MODE_LINK_TOKEN ?? '').split(',');
-    const short = linkTokens.map((t) => t.trim()).filter((t) => t && t.length < 32);
-    if (short.length > 0) {
-      log.warn('voice-mode: link tokens shorter than 32 characters are weak; replace their lines with /voice new', {
-        lines: short.map(voiceModeLineIdForToken),
-      });
     }
     const page = pageListener(env.VOICE_MODE_PORT, env.VOICE_MODE_PAGE_HOST);
     return createVoiceModeAdapter({
@@ -708,10 +639,8 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       pageHost: page?.host,
       pagePortRequired: page?.explicit,
       publicUrl: (env.VOICE_MODE_PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, ''),
-      linkTokens,
       ui: parseUiConfig(env.VOICE_MODE_UI),
       wakePhrase: wakePhrase(env),
-      allowNonLoopback: env.VOICE_MODE_ALLOW_NON_LOOPBACK === '1',
       trustedProxyCidrs: env.VOICE_MODE_TRUSTED_PROXY_CIDRS,
       allowedClientCidrs: env.VOICE_MODE_ALLOWED_CLIENT_CIDRS,
       maxCallDurationMs: Number(env.VOICE_MODE_MAX_CALL_SECONDS ?? 900) * 1000,
@@ -727,7 +656,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
         agentName: env.LIVEKIT_AGENT_NAME,
         speech: {
           sttModel: env.VOICE_MODE_STT_MODEL,
-          sttFallbackModel: env.VOICE_MODE_STT_FALLBACK_MODEL,
           ttsModel: env.VOICE_MODE_TTS_MODEL,
           ttsFallbackModel: env.VOICE_MODE_TTS_FALLBACK_MODEL,
           ttsVoice: env.VOICE_MODE_TTS_VOICE,
