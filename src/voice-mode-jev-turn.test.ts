@@ -113,68 +113,81 @@ describe('config and the daily cap', () => {
     expect(loadJevTurnConfig().enabled).toBe(false);
   });
 
-  it('counts judgements per local day in a file', () => {
+  it('counts judgements per local day, one file a day', () => {
     const day = new Date('2026-10-07T10:00:00Z');
     expect(takeDailyJudgement(2, day)).toBe('taken');
     expect(takeDailyJudgement(2, day)).toBe('taken');
     expect(takeDailyJudgement(2, day)).toBe('capped');
-    expect(takeDailyJudgement(2, new Date('2026-10-08T10:00:00Z'))).toBe('taken');
+    expect(fs.readFileSync(path.join(TEST_DIR, 'jev-turn-usage-2026-10-07'), 'utf-8')).toBe('...');
     expect(takeDailyJudgement(0, day)).toBe('taken');
   });
 
-  it('skips a judgement it cannot account for: the count locked by another process, torn, or unwritable', () => {
-    const day = new Date('2026-10-07T10:00:00Z');
-    const usage = path.join(TEST_DIR, 'jev-turn-usage.json');
+  it("a new day's first take prunes other days and the previous scheme's files", () => {
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    fs.writeFileSync(`${usage}.lock`, '');
-    expect(takeDailyJudgement(5, day)).toBe('failed');
-    expect(fs.existsSync(usage)).toBe(false);
-    fs.rmSync(`${usage}.lock`);
-    expect(takeDailyJudgement(5, day)).toBe('taken');
-    // A torn count is never read as zero.
-    fs.writeFileSync(usage, '{"day":"2026-10-07","cou');
-    expect(takeDailyJudgement(5, day)).toBe('failed');
-    expect(fs.readFileSync(usage, 'utf-8')).toBe('{"day":"2026-10-07","cou');
-    fs.rmSync(usage);
+    const left = [
+      'jev-turn-usage-2026-10-06',
+      'jev-turn-usage.json',
+      'jev-turn-usage.json.lock',
+      'jev-turn-usage.json.123.tmp',
+      'jev-turn-usage.json.lock.123.stale',
+    ];
+    for (const name of left) fs.writeFileSync(path.join(TEST_DIR, name), '');
+    fs.writeFileSync(path.join(TEST_DIR, 'jev-turn.json'), '{}');
+    expect(takeDailyJudgement(2, new Date('2026-10-07T10:00:00Z'))).toBe('taken');
+    expect(fs.readdirSync(TEST_DIR).sort()).toEqual(['jev-turn-usage-2026-10-07', 'jev-turn.json']);
+    expect(takeDailyJudgement(2, new Date('2026-10-08T10:00:00Z'))).toBe('taken');
+    expect(fs.readdirSync(TEST_DIR).sort()).toEqual(['jev-turn-usage-2026-10-08', 'jev-turn.json']);
+  });
+
+  it.skipIf(process.getuid?.() === 0)('skips a judgement it cannot count: an unwritable directory', () => {
+    fs.mkdirSync(TEST_DIR, { recursive: true });
     fs.chmodSync(TEST_DIR, 0o500);
     try {
-      expect(takeDailyJudgement(5, day)).toBe('failed');
+      expect(takeDailyJudgement(5, new Date('2026-10-07T10:00:00Z'))).toBe('failed');
     } finally {
       fs.chmodSync(TEST_DIR, 0o700);
     }
     expect(fs.readdirSync(TEST_DIR)).toEqual([]);
   });
 
-  it('takes over a lock a crashed process left behind', () => {
-    const day = new Date('2026-10-07T10:00:00Z');
-    const lock = path.join(TEST_DIR, 'jev-turn-usage.json.lock');
-    fs.mkdirSync(TEST_DIR, { recursive: true });
-    fs.writeFileSync(lock, '');
-    const old = new Date(Date.now() - 60_000);
-    fs.utimesSync(lock, old, old);
-    expect(takeDailyJudgement(5, day)).toBe('taken');
-    expect(fs.readdirSync(TEST_DIR)).toEqual(['jev-turn-usage.json']);
+  it('turns any error into a skipped judgement, never a throw', () => {
+    const spy = vi.spyOn(fs, 'writeSync').mockImplementation(() => {
+      throw new Error('disk on fire');
+    });
+    try {
+      expect(takeDailyJudgement(5, new Date('2026-10-07T10:00:00Z'))).toBe('failed');
+    } finally {
+      spy.mockRestore();
+    }
   });
 
-  it('never over-counts across concurrent processes', async () => {
+  /** Takes `each` judgements in each of `procs` concurrent processes; how many were taken in all. */
+  async function takeInProcesses(procs: number, each: number, max: number): Promise<number> {
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    const usage = path.join(TEST_DIR, 'jev-turn-usage.json');
     const tsx = path.resolve('node_modules/.bin/tsx');
     const mod = path.resolve('src/voice-mode-jev-turn.ts');
     const script = [
       `import(${JSON.stringify(mod)}).then(({ takeDailyJudgement }) => {`,
       '  let taken = 0;',
-      `  for (let i = 0; i < 150; i++) if (takeDailyJudgement(400, new Date('2026-10-07T10:00:00Z'), ${JSON.stringify(usage)}) === 'taken') taken++;`,
+      `  for (let i = 0; i < ${each}; i++) if (takeDailyJudgement(${max}, new Date('2026-10-07T10:00:00Z'), ${JSON.stringify(TEST_DIR)}) === 'taken') taken++;`,
       '  console.log(taken);',
       '});',
     ].join('\n');
     const runs = await Promise.all(
-      Array.from({ length: 4 }, () => promisify(execFile)(tsx, ['--eval', script], { cwd: path.resolve('.') })),
+      Array.from({ length: procs }, () => promisify(execFile)(tsx, ['--eval', script], { cwd: path.resolve('.') })),
     );
-    const taken = runs.reduce((sum, run) => sum + Number(run.stdout.trim()), 0);
-    expect(taken).toBeGreaterThan(0);
-    expect(taken).toBeLessThanOrEqual(400);
-    expect(JSON.parse(fs.readFileSync(usage, 'utf-8'))).toEqual({ day: '2026-10-07', count: taken });
+    return runs.reduce((sum, run) => sum + Number(run.stdout.trim()), 0);
+  }
+  const usageBytes = () => fs.statSync(path.join(TEST_DIR, 'jev-turn-usage-2026-10-07')).size;
+
+  it('never over-counts across concurrent processes', async () => {
+    // Under the cap the count is exact; over it, every take is still one byte and none goes past it.
+    const under = await takeInProcesses(3, 100, 1000);
+    expect(under).toBe(300);
+    expect(usageBytes()).toBe(under);
+    const over = await takeInProcesses(4, 150, 400);
+    expect(over).toBeLessThanOrEqual(400 - under);
+    expect(usageBytes()).toBe(900);
   }, 30_000);
 });
 
@@ -185,12 +198,16 @@ function shadowHarness(o: { config?: Partial<JevTurnConfig>; daily?: DailyTake; 
   const asked: string[] = [];
   const pending: Array<(r: TurnJudgement) => void> = [];
   let auto = true;
+  let takes = 0;
   const config = { ...ENABLED, ...o.config };
   const shadow = new JevTurnShadow({
     callId: 'c1',
     log: (line) => void lines.push(line),
     config: () => config,
-    takeDaily: () => o.daily ?? 'taken',
+    takeDaily: () => {
+      takes++;
+      return o.daily ?? 'taken';
+    },
     judge: (text) => {
       asked.push(text);
       if (auto) return Promise.resolve(o.answer ?? { finished: 0.9, trailing: 0.1, ms: 50 });
@@ -202,6 +219,7 @@ function shadowHarness(o: { config?: Partial<JevTurnConfig>; daily?: DailyTake; 
     lines,
     asked,
     config,
+    takes: () => takes,
     hold: () => (auto = false),
     release: async (r: TurnJudgement = { finished: 0.9, trailing: 0.1, ms: 50 }) => {
       pending.shift()?.(r);
@@ -281,7 +299,23 @@ describe('JevTurnShadow trigger', () => {
     unaccounted.shadow.interim(1, 'book a table for two');
     await unaccounted.wait(1200);
     expect(unaccounted.asked).toEqual([]);
-    expect(unaccounted.lines).toEqual(['voice-mode.turn-end jev capped call=c1 scope=usage limit=1000']);
+    // Each judgement tries to count again; the line is logged once.
+    expect(unaccounted.takes()).toBe(2);
+    expect(unaccounted.lines).toEqual(['voice-mode.turn-end jev capped call=c1 scope=usage']);
+  });
+
+  it('leaves the usage file alone once the day is capped, until the day changes', async () => {
+    const h = shadowHarness({ daily: 'capped' });
+    h.shadow.interim(1, 'book a table');
+    await h.wait(1200);
+    h.shadow.interim(1, 'book a table for two');
+    await h.wait(1200);
+    expect(h.takes()).toBe(1);
+    vi.setSystemTime(Date.now() + 24 * 60 * 60 * 1000);
+    h.shadow.interim(1, 'book a table for two please');
+    await h.wait(1200);
+    expect(h.takes()).toBe(2);
+    expect(h.lines).toEqual(['voice-mode.turn-end jev capped call=c1 scope=day limit=1000']);
   });
 
   it('never logs the words', async () => {

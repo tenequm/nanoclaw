@@ -312,6 +312,9 @@ The worker announces command vocabulary version `3` and the actual words.
 interims or a single interim unchanged for 700 milliseconds nominate a command
 once speech stops; the final decides it. A missing or collapsed final cannot
 confirm `copy`. Other commands retain main's dropped-command recovery.
+The page drives commands and settings for vocabulary `2` and `3` alike (the
+same `zulu`/`copy` words); any other value gets no commands and no settings.
+A page that accepts only `2` leaves a `3` worker wake-gated until it reloads.
 Manual review treats these words as ordinary dictation. Cue and typing sound
 switches remain independent settings. Caller speech during agent speech is
 reported as unheard. Reconnect grace keeps a same-identity full rejoin alive.
@@ -321,7 +324,11 @@ it. It can only measure, never send or end a turn. No Jev credential, endpoint,
 model or service is required for voice installation. See
 [optional shadow configuration](../../../docs/jev-turn.md).
 `JEV_API_KEY`, `JEV_URL`, `JEV_MODEL` retain their generic names and defaults.
-The daily judgment cap is locked across job processes and fails closed.
+The daily cap counts one appended byte per judgement in a file per local day,
+`data/jev-turn-usage-<YYYY-MM-DD>`, with no lock: concurrent calls can only
+under-count, and a judgement that cannot be counted is skipped and logged once
+per call as `scope=usage`. Kill switch: `"enabled": false`, or delete
+`data/jev-turn.json`.
 
 ## Upgrade
 

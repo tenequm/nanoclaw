@@ -204,17 +204,20 @@ export interface CallDraft {
  * worker's acoustic wake word (`CallWakeState.phrase`), is heard (`waiting` until then). After the
  * wake phrase only a spoken send sends, unless `pauseSends` lets the closing silence send too. The
  * worker's participant attribute is CALL_COMMANDS_VERSION when it understands them and the
- * `settings` RPC; a page offers the commands only for the value it knows, so a page and a worker
- * from either side of a vocabulary change quote no words to each other. The worker starts
- * wake-gated until a client's `settings` say otherwise: a page that finds an older vocabulary
- * switches that worker's wake gate off, so pauses send, while a page older than the worker sends
- * nothing and has to be reloaded. An older worker sets none, and its auto mode has no commands.
+ * `settings` RPC; a page offers the commands only for the values it knows. The worker starts
+ * wake-gated until a client's `settings` say otherwise, so a page that does not know its value sends
+ * none and leaves it waiting for words the page never names: reload the page with the worker. An
+ * older worker sets none, and its auto mode has no commands.
  */
 export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice-mode.commands';
 /**
- * The commands' vocabulary: "1" had `over` as the send word, "2" `send it`, "3" `zulu`, `copy` and
- * `copy that`. A page takes the words themselves from CALL_COMMAND_WORDS_ATTRIBUTE; a change to
- * them that a client cannot follow from there bumps this.
+ * The commands' vocabulary: "1" had `over` as the send word; "2" is `zulu`, `copy` and `copy that`
+ * with the words announced in CALL_COMMAND_WORDS_ATTRIBUTE (the `send it` era also said "2"); "3" is
+ * the same words, bumped so a page from the `send it` era, which drives any "2" and quotes its own
+ * words, stops quoting the wrong ones. A page that accepts only "2" (the `send it` era's, or a
+ * `zulu` one already open across the bump) offers no commands and sends no `settings` to a "3"
+ * worker, which then stays wake-gated until that page is reloaded. A current page drives "2" and "3"
+ * alike; a page takes the words themselves from CALL_COMMAND_WORDS_ATTRIBUTE.
  */
 export const CALL_COMMANDS_VERSION = '3';
 

@@ -66,8 +66,7 @@ interface ReviewLib {
   parseCommandWords(raw: string | undefined): CommandWords | null;
   quoteWords(list: CommandWords['send'], all?: boolean): string;
   FALLBACK_COMMAND_WORDS: CommandWords;
-  COMMANDS_VERSION: string;
-  workerCommands(attr: string | undefined): 'commands' | 'legacy' | 'none';
+  COMMANDS_VERSIONS: ReadonlySet<string>;
   MODE_NAME: Record<string, string>;
   DEFAULT_PREFS: Prefs;
   storedPrefs(): Prefs;
@@ -611,20 +610,19 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
       expect(lib.wakePhraseOf({ ...lib.INITIAL_REVIEW, wakePhrase: lib.storedWakePhrase() }, 'Andy')).toBe('Hey Andy');
     });
   });
-  it("the page's commands version is the worker's", () => {
+  it("the page drives the worker's commands version", () => {
     // Words the page used to match itself are the worker's alone now.
     expect(matchCommand('Send me a copy.')).toBeNull();
-    expect(lib.COMMANDS_VERSION).toBe(CALL_COMMANDS_VERSION);
+    expect(lib.COMMANDS_VERSIONS.has(CALL_COMMANDS_VERSION)).toBe(true);
   });
-  it('a page and a worker from either side of the zulu change offer each other no words', () => {
-    expect(lib.workerCommands(CALL_COMMANDS_VERSION)).toBe('commands');
-    // An older worker hears `send it` ("2") or `over` ("1"): no commands, its wake gate switched off.
-    expect(lib.workerCommands('2')).toBe('legacy');
-    expect(lib.workerCommands('1')).toBe('legacy');
-    expect(lib.workerCommands(undefined)).toBe('none');
-    expect(lib.workerCommands('99')).toBe('none');
-    // An already-open older page offers its words only to a worker at "2" or "1".
-    expect(['1', '2']).not.toContain(CALL_COMMANDS_VERSION);
+  it('a page drives the zulu vocabulary at "2" and "3" alike, and nothing else', () => {
+    // "2" is the zulu worker deployed before the bump; "3" is the same words.
+    expect([...lib.COMMANDS_VERSIONS].sort()).toEqual(['2', '3']);
+    // `over` ("1") and a vocabulary this page has never heard of get no commands and no settings.
+    expect(lib.COMMANDS_VERSIONS.has('1')).toBe(false);
+    expect(lib.COMMANDS_VERSIONS.has('99')).toBe(false);
+    // A `send it` era page drives only "2": the worker's bump keeps it from quoting its own words.
+    expect(CALL_COMMANDS_VERSION).not.toBe('2');
   });
 });
 

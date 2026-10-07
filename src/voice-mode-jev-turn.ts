@@ -41,7 +41,6 @@ export const DEFAULT_JEV_TURN_CONFIG: JevTurnConfig = {
 };
 
 export const jevTurnConfigPath = (): string => path.join(DATA_DIR, 'jev-turn.json');
-export const jevTurnUsagePath = (): string => path.join(DATA_DIR, 'jev-turn-usage.json');
 
 let cache: { file: string; mtimeMs: number; size: number; config: JevTurnConfig } | null = null;
 
@@ -89,75 +88,52 @@ export function resetJevTurnConfigCache(): void {
 /** A daily judgement: `taken` and counted, `capped` for today, or `failed` to count, so skipped too. */
 export type DailyTake = 'taken' | 'capped' | 'failed';
 
-/** A lock older than this was left by a process that died holding it; holding one takes microseconds. */
-const STALE_LOCK_MS = 10_000;
+const USAGE_PREFIX = 'jev-turn-usage';
 
-/** Takes the usage file's lock, created exclusively; false when another process holds it or it cannot be made. */
-function lockUsage(lock: string): boolean {
+/** The local day the daily cap counts in, `YYYY-MM-DD`. */
+export const localDay = (now: Date): string => now.toLocaleDateString('en-CA', { timeZone: TIMEZONE });
+
+/** Removes other days' usage files, and the previous scheme's count, lock and temp files; best-effort. */
+function pruneUsage(dir: string, keep: string): void {
   try {
-    fs.writeFileSync(lock, `${process.pid}\n`, { flag: 'wx' });
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return false;
-  }
-  try {
-    const held = fs.statSync(lock);
-    if (Date.now() - held.mtimeMs < STALE_LOCK_MS) return false;
-    // Moved aside, not removed: of two processes taking over the same stale lock, one moves it.
-    const aside = `${lock}.${process.pid}.stale`;
-    fs.renameSync(lock, aside);
-    if (fs.statSync(aside).ino !== held.ino) {
-      // A live lock taken in between: put it back unless yet another one stands there now.
-      try {
-        fs.linkSync(aside, lock);
-      } catch {
-        // Its holder's unlock removes the newer lock; the next judgement waits for the stale age again.
-      }
-      fs.rmSync(aside, { force: true });
-      return false;
+    for (const name of fs.readdirSync(dir)) {
+      if (name.startsWith(USAGE_PREFIX) && name !== keep) fs.rmSync(path.join(dir, name), { force: true });
     }
-    fs.rmSync(aside, { force: true });
-    fs.writeFileSync(lock, `${process.pid}\n`, { flag: 'wx' });
-    return true;
   } catch {
-    return false;
+    // The next day's first take tries again.
   }
 }
 
 /**
- * One judgement for today's cap, counted in a file: a job process serves one call, so a count in
- * memory would reset with every call. Concurrent calls read, check and bump it under a lock file,
- * and the count is replaced by rename, so no reader sees it torn. Anything that keeps it from being
- * counted (the lock held, a torn or unreadable count, an unwritable directory) skips the judgement.
+ * One judgement for today's cap, counted as one byte appended to the day's usage file: a job process
+ * serves one call, so a count in memory would reset with every call. Each append is atomic, and the
+ * size read back after it is at least this take's place in the day, so concurrent processes can only
+ * under-count, never over-count, and nothing can tear. Any error skips the judgement as `failed`.
  */
-export function takeDailyJudgement(max: number, now = new Date(), file = jevTurnUsagePath()): DailyTake {
+export function takeDailyJudgement(max: number, now = new Date(), dir = DATA_DIR): DailyTake {
   if (!(max > 0)) return 'taken';
-  const day = now.toLocaleDateString('en-CA', { timeZone: TIMEZONE });
-  const lock = `${file}.lock`;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-  } catch {
-    return 'failed';
-  }
-  if (!lockUsage(lock)) return 'failed';
-  const tmp = `${file}.${process.pid}.tmp`;
-  try {
-    let count = 0;
+    const name = `${USAGE_PREFIX}-${localDay(now)}`;
+    const file = path.join(dir, name);
+    let fd: number;
     try {
-      const usage = JSON.parse(fs.readFileSync(file, 'utf-8')) as { day?: unknown; count?: unknown };
-      if (usage.day === day) count = num(usage.count, 0);
+      fd = fs.openSync(file, 'a');
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return 'failed';
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      fs.mkdirSync(dir, { recursive: true });
+      fd = fs.openSync(file, 'a');
     }
-    if (count >= max) return 'capped';
-    fs.writeFileSync(tmp, `${JSON.stringify({ day, count: count + 1 })}\n`);
-    fs.renameSync(tmp, file);
-    return 'taken';
+    let size: number;
+    try {
+      fs.writeSync(fd, '.');
+      size = fs.fstatSync(fd).size;
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (size === 1) pruneUsage(dir, name);
+    return size <= max ? 'taken' : 'capped';
   } catch {
-    fs.rmSync(tmp, { force: true });
     return 'failed';
-  } finally {
-    fs.rmSync(lock, { force: true });
   }
 }
 
@@ -283,9 +259,10 @@ export class JevTurnShadow implements TurnShadowSink {
   private turn?: ShadowTurn;
   private inFlight = false;
   private calls = 0;
-  private cappedCall = false;
-  private cappedDay = false;
-  private unaccounted = false;
+  /** The cap and usage lines already logged this call. */
+  private readonly logged = new Set<'call' | 'day' | 'usage'>();
+  /** The local day the daily cap was reached; the usage file is left alone until the day changes. */
+  private cappedOn?: string;
   private recent: string[] = [];
   private readonly now: () => number;
   private readonly config: () => JevTurnConfig;
@@ -351,20 +328,19 @@ export class JevTurnShadow implements TurnShadowSink {
       return;
     }
     if (config.maxPerCall > 0 && this.calls >= config.maxPerCall) {
-      if (!this.cappedCall) this.capped('call', config.maxPerCall);
-      this.cappedCall = true;
+      this.capped('call', config.maxPerCall);
       return;
     }
+    const today = localDay(new Date(this.now()));
+    if (this.cappedOn === today) return;
     const daily = (this.deps.takeDaily ?? takeDailyJudgement)(config.maxPerDay);
     if (daily === 'capped') {
-      if (!this.cappedDay) this.capped('day', config.maxPerDay);
-      this.cappedDay = true;
+      this.cappedOn = today;
+      this.capped('day', config.maxPerDay);
       return;
     }
     if (daily === 'failed') {
-      // The daily count could not be kept: no judgement it does not count.
-      if (!this.unaccounted) this.capped('usage', config.maxPerDay);
-      this.unaccounted = true;
+      this.capped('usage');
       return;
     }
     this.calls++;
@@ -416,8 +392,11 @@ export class JevTurnShadow implements TurnShadowSink {
     this.deps.log(line('voice-mode.turn-end jev shadow', fields), { jevTurn: 'shadow', ...fields });
   }
 
-  private capped(scope: 'call' | 'day' | 'usage', limit: number): void {
-    const fields = { call: this.deps.callId, scope, limit };
+  /** Logs a cap, or a daily count that could not be kept (`usage`, no limit), once per call. */
+  private capped(scope: 'call' | 'day' | 'usage', limit?: number): void {
+    if (this.logged.has(scope)) return;
+    this.logged.add(scope);
+    const fields = { call: this.deps.callId, scope, ...(limit !== undefined ? { limit } : {}) };
     this.deps.log(line('voice-mode.turn-end jev capped', fields), { jevTurn: 'capped', ...fields });
   }
 }

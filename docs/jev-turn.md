@@ -27,14 +27,9 @@ per call, and the request uses the gate's 2 s timeout. Every failure (no key,
 timeout, non-200, bad body, missing Noul) is nulls plus a reason, never an
 action.
 
-The endpoint is the host's: `JEV_URL`, `JEV_MODEL` and `JEV_API_KEY`, read by
-`src/config.ts` from the process environment or the checkout's `.env` (the
-worker runs from the same checkout as the host). `JEV_URL` and `JEV_MODEL`
-default to TypeSafe (`https://api.typesafe.ai/v1/systemone`, `jev-latest`);
-any endpoint with the same request shape works, for example OpenRouter
-(`https://openrouter.ai/api/v1/systemone`, model `jev-1.13`, an OpenRouter
-key). See `docs/jev-gate.md`. The key is never logged, and neither is any
-transcript text: the lines carry counts only.
+The endpoint is the host's: `JEV_URL`, `JEV_MODEL` and `JEV_API_KEY`, as in
+`docs/jev-gate.md`. The key is never logged, and neither is any transcript
+text: the lines carry counts only.
 
 ## Log lines
 
@@ -61,10 +56,16 @@ more words before the turn ended. A spoken command that turns out to be words
 ends one activity (`endedBy=send-word` or `discard`) and its continuation is
 logged as the next `turn`.
 
-When a cap is reached: `voice-mode.turn-end jev capped call=<id> scope=call|day limit=<n>`, once per call.
-`scope=usage` (also once per call) means the daily count could not be kept -
-another process held it, or the usage file was torn or unwritable - so that
-judgment was skipped rather than left uncounted.
+When a cap is reached, or the daily count cannot be kept:
+
+```
+voice-mode.turn-end jev capped call=<id> scope=call|day|usage [limit=<n>]
+```
+
+Each scope is logged at most once per call. `call` and `day` mean the cap in
+`limit` was reached. `usage` (no `limit`) means the daily count could not be
+kept - the usage file could not be written - so that judgement was skipped
+rather than left uncounted.
 
 Each line is also emitted with the same values as structured fields
 (`jevTurn: shadow|outcome|capped`), next to the call's `callId`.
@@ -86,11 +87,13 @@ unreadable file means off.
 ```
 
 Only `enabled` is required; the rest default to the values above. The daily
-count lives in `data/jev-turn-usage.json` (each call runs in its own job
-process, so it cannot be kept in memory). Concurrent calls read, check and
-bump it under `data/jev-turn-usage.json.lock` and replace it by rename, so
-`maxPerDay` holds across calls; a judgment that cannot be counted is skipped.
-Kill switch: `"enabled": false`, or delete the file.
+count lives in one file per local day, `data/jev-turn-usage-<YYYY-MM-DD>`
+(each call runs in its own job process, so it cannot be kept in memory). Each
+judgement appends one byte and reads the size back: appends are atomic, so
+concurrent calls can only under-count, never go past `maxPerDay`, and there is
+no lock. A day's first judgement removes the other days' files. Once a call
+sees the day capped it leaves the file alone until the day changes.
+Kill switch: `"enabled": false`, or delete `data/jev-turn.json`.
 
 ## Enabling
 
