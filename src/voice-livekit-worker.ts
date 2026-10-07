@@ -962,7 +962,8 @@ export interface ReviewSession {
   publishReview(state: CallReviewState): void;
   /**
    * Answer the page's review and settings RPCs with `handle`, and tell the page review mode and
-   * spoken commands are on offer.
+   * spoken commands are on offer, in the same update as the agent's first `listening` state: the
+   * room publishes no agent state before this.
    */
   serve(handle: (op: ReviewOp, payload: string, callerIdentity: string) => Promise<string>): void;
 }
@@ -3370,7 +3371,8 @@ async function roomVoice(
     }
   };
 
-  setAttr(AGENT_STATE_ATTRIBUTE, 'listening', 'the agent state');
+  // The first `listening` goes out with the review attributes, from review.serve: a page takes
+  // `listening` as the call being live, so what the call offers is known with it.
   return {
     say,
     setThinking: (thinking) => setAttr(CALL_THINKING_ATTRIBUTE, thinking ? '1' : '', 'the thinking state'),
@@ -3414,8 +3416,13 @@ async function roomVoice(
         for (const op of Object.keys(REVIEW_RPC) as ReviewOp[]) {
           local.registerRpcMethod(REVIEW_RPC[op], (data) => handle(op, data.payload, data.callerIdentity));
         }
-        post('the review attributes', () =>
-          local.setAttributes({ [CALL_REVIEW_ATTRIBUTE]: '1', [CALL_COMMANDS_ATTRIBUTE]: CALL_COMMANDS_VERSION }),
+        // Unkeyed: a `speaking` posted after it queues behind it instead of replacing it.
+        post('the agent state and the review attributes', () =>
+          local.setAttributes({
+            [AGENT_STATE_ATTRIBUTE]: 'listening',
+            [CALL_REVIEW_ATTRIBUTE]: '1',
+            [CALL_COMMANDS_ATTRIBUTE]: CALL_COMMANDS_VERSION,
+          }),
         );
       },
     },

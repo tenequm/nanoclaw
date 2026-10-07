@@ -860,6 +860,19 @@ describe('runCall', () => {
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked for eight.', expect.any(Function)));
     // It answers no turn: a message nobody asked for, and the page is told so first.
     expect(v.voice.publishReply).toHaveBeenCalledWith({ reply: 1, unprompted: true });
+    // review.serve carries the agent's first `listening` with the review attributes: the call is
+    // served before any state, caption or line of it can reach the page.
+    expect(v.voice.review.serve).toHaveBeenCalledTimes(1);
+    const served = v.voice.review.serve.mock.invocationCallOrder[0];
+    for (const later of [
+      v.voice.say,
+      v.voice.setThinking,
+      v.voice.publishTurn,
+      v.voice.publishReply,
+      v.voice.caption,
+    ]) {
+      for (const order of later.mock.invocationCallOrder) expect(order).toBeGreaterThan(served);
+    }
 
     host.emit({ type: 'end', reason: 'hangup' });
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
