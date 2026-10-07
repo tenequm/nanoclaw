@@ -3160,21 +3160,14 @@ export function wakeWordSettings(
   };
 }
 
-/** Old-setting warnings already given: a job process reads its settings for every call it runs. */
-const envWarnings = new Set<string>();
-
 /**
  * Settings from the working directory's .env (`root` in tests); WEBHOOK_PORT from the environment
- * wins, as on the host. Each old-setting warning is given once per process.
+ * wins, as on the host. Each read warns about every old setting it finds; the callers read once per
+ * process (see callEnv).
  */
 export function workerEnv(keys: string[], root?: string): Record<string, string | undefined> {
-  const warnOnce = (message: string) => {
-    if (envWarnings.has(message)) return;
-    envWarnings.add(message);
-    console.warn(message);
-  };
   return {
-    ...voiceModeEnv(readEnvFile(voiceModeEnvKeys([...keys, 'WEBHOOK_PORT']), root), warnOnce),
+    ...voiceModeEnv(readEnvFile(voiceModeEnvKeys([...keys, 'WEBHOOK_PORT']), root), (message) => console.warn(message)),
     ...(process.env.WEBHOOK_PORT ? { WEBHOOK_PORT: process.env.WEBHOOK_PORT } : {}),
   };
 }
@@ -3706,7 +3699,7 @@ export class CallTelemetry {
   }
 }
 
-/** A call's settings, read once per job process: host and worker restart together for a change. */
+/** A call's settings, read once per job process and kept for every call it runs: a `.env` change reaches calls after a worker restart. */
 let callEnv: Record<string, string | undefined> | undefined;
 
 function defaultDeps(): RunCallDeps {
@@ -3740,25 +3733,25 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const header = readJobHeader(ctx.job.metadata);
   const callFields = { callId: header.callId };
   const telemetry = new CallTelemetry({ info: (msg, fields) => log.info(msg, { ...callFields, ...fields }) });
+  /** The host, once its URL is known; before that there is no one to tell. */
+  let link: HostLink | undefined;
   /** Ends the call from this side: the host hears why when there is one to tell, then the room goes. */
-  const ender =
-    (link: HostLink | undefined) =>
-    async (reason: string, fields: Record<string, unknown> = {}): Promise<void> => {
-      log.warn('voice-mode worker: ending the call', { ...callFields, ...fields, reason });
-      telemetry.ended(reason);
-      await link
-        ?.post('ended', { reason })
-        .then((res) => res.body?.cancel())
-        .catch(() => undefined);
-      await ctx.deleteRoom().catch(() => undefined);
-      ctx.shutdown(reason);
-    };
+  const abandon = async (reason: string, fields: Record<string, unknown> = {}): Promise<void> => {
+    log.warn('voice-mode worker: ending the call', { ...callFields, ...fields, reason });
+    telemetry.ended(reason);
+    await link
+      ?.post('ended', { reason })
+      .then((res) => res.body?.cancel())
+      .catch(() => undefined);
+    await ctx.deleteRoom().catch(() => undefined);
+    ctx.shutdown(reason);
+  };
   let hostUrl: string;
   try {
     hostUrl = liveKitHostUrl(deps.env);
   } catch (err) {
     // No host to tell: the host ends the call when its worker never joins.
-    return ender(undefined)((err as Error).message);
+    return abandon((err as Error).message);
   }
   const host = new HostLink(
     {
@@ -3768,7 +3761,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     },
     deps.fetchImpl,
   );
-  const abandon = ender(host);
+  link = host;
   if (!deps.env.LIVEKIT_API_SECRET) return abandon('LIVEKIT_API_SECRET is not set for the worker');
 
   if (header.v !== LIVEKIT_PROTOCOL_VERSION) {
