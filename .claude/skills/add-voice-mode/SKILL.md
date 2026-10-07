@@ -28,8 +28,7 @@ A call link is a bearer credential for its caller: keep it private.
 Fetch `origin/channels`. For each path below, create its parent and copy with
 `git show origin/channels:<path> > <path>`. Stop if fetching or copying fails.
 Reapply overwrites implementation files while preserving runtime data and
-operator configuration. The payload must be on `channels` before this skill
-lands on `main`.
+operator configuration.
 
 ```nc:copy from-branch:channels
 src/channels/voice-mode-adapter.test.ts
@@ -38,7 +37,7 @@ src/channels/voice-mode-command.test.ts
 src/channels/voice-mode-command.ts
 src/channels/voice-mode-gemini-live.test.ts
 src/channels/voice-mode-gemini-live.ts
-src/channels/voice-mode-group-persona.ts
+src/channels/voice-mode-integration.test.ts
 src/channels/voice-mode-integration.ts
 src/channels/voice-mode-line-roles.test.ts
 src/channels/voice-mode-line.ts
@@ -47,7 +46,6 @@ src/channels/voice-mode-livekit.ts
 src/channels/voice-mode-page.test.ts
 src/channels/voice-mode-page.ts
 src/channels/voice-mode-third-party-notices.txt
-src/channels/voice-mode-platform-id.ts
 src/channels/voice-mode-protocol.ts
 src/channels/voice-mode-registration.test.ts
 src/channels/voice-mode-review-page.test.ts
@@ -114,11 +112,9 @@ pnpm run build
 pnpm exec vitest run src/channels/voice-mode*.test.ts scripts/voice-mode-install.test.ts
 ```
 
-The generated page ships with readable third-party notices. Maintainers change
-it through the [browser source](ui/package.json): run `pnpm install
---frozen-lockfile --ignore-scripts`, then `pnpm run build` in `ui/`. The generated
-source-hash test covers the page and its notices. Asset provenance and the
-starting point in glifocat's drafts are in [reference notes](references/2610-07-provenance.md).
+The generated page ships with readable third-party notices. Its browser source,
+asset provenance and the starting point in glifocat's drafts are in the
+[provenance notes](references/provenance.md).
 
 ### 4. Configure the host and worker
 
@@ -174,7 +170,7 @@ only from trusted peers. Keep `/webhook/voice-mode/livekit/agent` on loopback.
 Restart the host with `bash setup/lib/restart.sh`. Start the worker from the
 same checkout with `pnpm run voice-mode-worker`. Host and worker must use the
 same build and protocol version. For a persistent worker, follow the
-[install-scoped service procedure](references/2610-07-services.md).
+[install-scoped service procedure](references/services.md).
 
 ```nc:run effect:restart
 bash setup/lib/restart.sh
@@ -190,7 +186,8 @@ calls using the retired token. A group-chat link is delivered only by DM.
 Start the voice worker from this checkout. In a chat wired to your agent, send /voice (on Slack, !voice). Open the private link, press Call and allow the microphone. Confirm your transcript reaches that chat and the agent's reply is audible. Use /voice new to replace a lost or leaked link.
 ```
 
-Resident guidance comes from `voice-mode-formatting`. For an explicit group skill list, run `pnpm exec tsx
+Resident guidance comes from `voice-mode-formatting`. A group whose skill list is
+`all` gets it with no step. For an explicit group skill list, run `pnpm exec tsx
 scripts/voice-mode-install.ts guidance-add <group-id>`, then `ncl groups restart
 --id <group-id>`. This uses core config helpers and preserves other entries.
 
@@ -198,14 +195,13 @@ scripts/voice-mode-install.ts guidance-add <group-id>`, then `ncl groups restart
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page, worker routes and configured personal links. A taken default port is logged and skipped; an explicit port that cannot bind stops voice-mode from starting. |
+| `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page and the worker routes. A taken default port is logged and skipped; an explicit port that cannot bind stops voice-mode from starting. |
 | `VOICE_MODE_PAGE_HOST` | `127.0.0.1` | Bind address of the separate page server. |
 | `VOICE_MODE_MAX_CALL_SECONDS` | `900` | Per-call duration limit. |
 | `VOICE_MODE_MAX_CALLS_PER_HOUR` | `12` | Start attempts per line, including failed starts. |
 | `VOICE_MODE_MAX_MINUTES_PER_DAY` | `120` | Per-line UTC daily call time. These counters reset when the host restarts. |
-| `VOICE_MODE_LANGUAGES` | `en-US` | Up to four language hints, first is primary. Agent language guidance follows them; the worker's own notices start in the first one and use Ukrainian only when it is listed. |
+| `VOICE_MODE_LANGUAGES` | `en-US` | Up to four language hints, first is primary. Agent language guidance follows them; the worker's own notices start in the first one and use Ukrainian only when it is listed, which also adds the send word `прийом`. |
 | `VOICE_MODE_STT_MODEL` | `gemini-3.5-transcribe-live` | Own Gemini Live pipeline, one manual activity per caller turn. |
-| `VOICE_MODE_STT_FALLBACK_MODEL` | ignored | Deprecated unary fallback; the next turn retries Live. |
 | `VOICE_MODE_TTS_MODEL` | `gemini-3.8-flash-tts` | Reply speech model. |
 | `VOICE_MODE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Pre-audio fallback; `off` disables it. No replay after partial speech. |
 | `VOICE_MODE_TTS_VOICE` | `Alnilam` | Speech voice. |
@@ -242,27 +238,22 @@ audio to Google; transcript wake necessarily transcribes speech before deciding
 whether it was addressed. Failure to load an acoustic model falls back to
 transcript.
 
-The worker announces command vocabulary version `3` and the actual words.
-`zulu`, `прийом`, and a final-confirmed own-sentence `copy`/`copy that` send;
-`scratch that`, `discard turn`, `discard this turn` discard. Two matching
-interims or a single interim unchanged for 700 milliseconds nominate a command
-once speech stops; the final decides it. A missing or collapsed final cannot
-confirm `copy`. Other commands use the dropped-command recovery.
-The page drives commands and settings for vocabulary `2` and `3` alike (the
-same `zulu`/`copy` words); any other value gets no commands and no settings.
-A page that accepts only `2` leaves a `3` worker wake-gated until it reloads.
+The worker announces its command words, and the page quotes them. `zulu` and a
+final-confirmed own-sentence `copy`/`copy that` send (with Ukrainian listed,
+`прийом` too); `scratch that`, `discard turn`, `discard this turn` discard. Two
+matching interims or a single interim unchanged for 700 milliseconds nominate a
+command once speech stops; the final decides it. A missing or collapsed final
+cannot confirm `copy`. Other commands use the dropped-command recovery.
 Manual review treats these words as ordinary dictation. Cue and typing sound
 switches remain independent settings. Caller speech during agent speech is
 reported as unheard. Reconnect grace keeps a same-identity full rejoin alive.
 
-
-For removal, follow [REMOVE.md](REMOVE.md). Existing branch users should read
-[the protocol upgrade procedure](../../../docs/2610-07-voice-mode-upgrade.md).
+For removal, follow [REMOVE.md](REMOVE.md).
 
 ## Troubleshooting
 
 If Call is refused, check that the worker is registered with the host's
-`LIVEKIT_AGENT_NAME`, both builds report protocol 6, and the line's minting
+`LIVEKIT_AGENT_NAME`, both builds report the same protocol version, and the line's minting
 user still has a core owner/admin role for that agent. Reload a stale page.
 The worker health endpoint is loopback-only; inspect it privately.
 

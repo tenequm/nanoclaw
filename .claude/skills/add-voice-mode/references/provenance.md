@@ -1,10 +1,12 @@
 # Voice mode provenance
 
-This contribution started from glifocat's [voice adapter draft](https://github.com/nanocoai/nanoclaw/pull/3764) and [voice skill and UI draft](https://github.com/nanocoai/nanoclaw/pull/3772), incorporated at commit `47e77742`. The browser component starting point includes [ElevenLabs UI](https://github.com/elevenlabs/ui) and [shadcn/ui](https://github.com/shadcn-ui/ui). Their complete MIT notices accompany the generated page.
+This contribution started from glifocat's [voice adapter draft](https://github.com/nanocoai/nanoclaw/pull/3764) and [voice skill and UI draft](https://github.com/nanocoai/nanoclaw/pull/3772). The browser component starting point includes [ElevenLabs UI](https://github.com/elevenlabs/ui) and [shadcn/ui](https://github.com/shadcn-ui/ui). Their complete MIT notices accompany the generated page.
 
-The subsequent implementation adds a dedicated Gemini Live transcription pipeline, acoustic wake, automatic and reviewed turns, explicit send/discard commands, captions, reply cues, typing audio, reconnect grace, per-line limits and protocol 6. It remains a separate `voice-mode` channel, worker, namespace and install skill.
+The subsequent implementation adds a dedicated Gemini Live transcription pipeline, acoustic wake, automatic and reviewed turns, explicit send/discard commands, captions, reply cues, typing audio, reconnect grace and per-line limits. It remains a separate `voice-mode` channel, worker, namespace and install skill.
 
 ## Browser distribution
+
+The page is generated from the [browser source](../ui/package.json) into `src/channels/voice-mode-page.ts`. To change it, run `pnpm install --frozen-lockfile --ignore-scripts`, then `pnpm run build` in `ui/`; the generated source-hash test covers the page and its notices.
 
 The self-contained page embeds complete third-party notices in a readable disclosure. `src/channels/voice-mode-third-party-notices.txt` carries the same notices in the installed payload. The UI source hash includes the notices, full font licenses, generator and every browser source/build input. The [notice source](../ui/THIRD_PARTY_NOTICES.md) contains bundled JavaScript licenses and font copyright/OFL texts. [Hanken Grotesk](https://github.com/google/fonts/tree/main/ofl/hankengrotesk) and [IBM Plex Mono](https://github.com/google/fonts/tree/main/ofl/ibmplexmono) retain their full OFL-1.1 licenses beside the WOFF2 files. The NanoClaw logo comes from the project's MIT-licensed browser draft.
 

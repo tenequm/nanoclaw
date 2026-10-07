@@ -6,7 +6,7 @@ Close this page's admission front, finish active calls and stop the host before 
 pnpm exec tsx scripts/voice-mode-install.ts service-remove
 ```
 
-Remove only this checkout's HTTPS `/voice` route and any dedicated worker callback front. Preserve shared LiveKit services and other routes. On a partial install without the script, there is no generated service to remove; inspect any operator-created old unit separately.
+Remove only this checkout's HTTPS `/voice` route and any dedicated worker callback front. Preserve shared LiveKit services and other routes.
 
 ## Retire links and guidance
 
@@ -16,11 +16,11 @@ With the installed payload still present, retire the module's hashed links and r
 pnpm exec tsx scripts/voice-mode-install.ts retire
 ```
 
-This deletes rows only in `voice_mode_lines` and preserves the empty table and named migration record for reinstall. It removes only `voice-mode-formatting` from explicit lists, preserving other entries; implicit lists need no mutation. It does not delete core identities, roles, memberships, chats or sessions. A partial installation without the table is accepted. Remove `VOICE_MODE_LINK_TOKEN` from `.env` privately to retire configured personal links as well.
+This deletes rows only in `voice_mode_lines` and preserves the empty table and named migration record for reinstall. It removes only `voice-mode-formatting` from explicit lists, preserving other entries. It does not delete core identities, roles, memberships, chats or sessions. A partial installation without the table is accepted.
 
 ## Restore core and delete the payload
 
-The installer reverses every core import/call/export and the worker package script before its own file is deleted. It tolerates reapplication and refuses changed anchors rather than editing unfamiliar core code.
+The installer reverses every core import, call and export it added, and the worker package script, before its own file is deleted. It tolerates reapplication and refuses changed anchors rather than editing unfamiliar core code.
 
 ```bash
 pnpm exec tsx scripts/voice-mode-install.ts remove
@@ -30,7 +30,7 @@ rm -f src/channels/voice-mode-adapter.test.ts \
   src/channels/voice-mode-command.ts \
   src/channels/voice-mode-gemini-live.test.ts \
   src/channels/voice-mode-gemini-live.ts \
-  src/channels/voice-mode-group-persona.ts \
+  src/channels/voice-mode-integration.test.ts \
   src/channels/voice-mode-integration.ts \
   src/channels/voice-mode-line-roles.test.ts \
   src/channels/voice-mode-line.ts \
@@ -39,7 +39,6 @@ rm -f src/channels/voice-mode-adapter.test.ts \
   src/channels/voice-mode-page.test.ts \
   src/channels/voice-mode-page.ts \
   src/channels/voice-mode-third-party-notices.txt \
-  src/channels/voice-mode-platform-id.ts \
   src/channels/voice-mode-protocol.ts \
   src/channels/voice-mode-registration.test.ts \
   src/channels/voice-mode-review-page.test.ts \
@@ -60,7 +59,9 @@ rm -f src/channels/voice-mode-adapter.test.ts \
   assets/voice-mode-wakeword/embedding_model.onnx \
   assets/voice-mode-wakeword/hey_livekit.onnx \
   assets/voice-mode-wakeword/melspectrogram.onnx \
-  container/skills/voice-mode-formatting/instructions.md
+  container/skills/voice-mode-formatting/instructions.md \
+  logs/voice-mode-worker.log
+rmdir src/channels/voice-mode-wakeword-fixtures assets/voice-mode-wakeword container/skills/voice-mode-formatting
 ```
 
 Remove compiled counterparts under `dist/channels/voice-mode*` and `dist/db/voice-mode-lines.*`; preserve every unrelated artifact. Retain operator-owned recordings, vocabulary and custom classifiers unless the operator is retiring that data. The skill definition and browser maintainer sources may stay installed for reinstallation.
@@ -73,7 +74,7 @@ Inspect remaining imports with `rg` and consumers with `pnpm why <package>` for 
 pnpm remove @livekit/agents @livekit/agents-plugin-google @livekit/agents-plugin-silero @livekit/rtc-node livekit-server-sdk onnxruntime-node zod
 ```
 
-Privately delete this skill's `VOICE_MODE_*` entries from `.env`. Remove `LIVEKIT_*` and `GEMINI_API_KEY` only if no remaining integration uses them; otherwise preserve them. Preserve all other configuration. No release-age exclusions or approved build-script entries were added by the skill.
+Privately delete this skill's `VOICE_MODE_*` entries from `.env`. Remove `LIVEKIT_*` and `GEMINI_API_KEY` only if no remaining integration uses them; otherwise preserve them. Preserve all other configuration.
 
 ```bash
 pnpm run build
