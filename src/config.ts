@@ -19,6 +19,8 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'JEV_API_KEY',
+  'JEV_URL',
+  'JEV_MODEL',
   'WEBHOOK_PORT',
 ]);
 
@@ -108,9 +110,13 @@ export const EGRESS_LOCKDOWN = (process.env.NANOCLAW_EGRESS_LOCKDOWN || envConfi
 export const EGRESS_NETWORK =
   process.env.NANOCLAW_EGRESS_NETWORK || envConfig.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
 
-// Jev (api.typesafe.ai) key for the ambient wake-gate. Empty means the gate
-// fails silent on every message — see src/modules/jev-gate.
+// Jev key for the ambient wake-gate and the voice end-of-turn shadow. Empty means
+// both fail silent — see src/modules/jev-gate. The endpoint serves TypeSafe's System
+// One shape: TypeSafe itself or OpenRouter (https://openrouter.ai/api/v1/systemone,
+// model jev-1.13) with that vendor's key.
 export const JEV_API_KEY = process.env.JEV_API_KEY || envConfig.JEV_API_KEY || '';
+export const JEV_URL = process.env.JEV_URL || envConfig.JEV_URL || 'https://api.typesafe.ai/v1/systemone';
+export const JEV_MODEL = process.env.JEV_MODEL || envConfig.JEV_MODEL || 'jev-latest';
 
 // Resolve when the listener starts so a late process override still wins.
 export function getWebhookPort(): number {

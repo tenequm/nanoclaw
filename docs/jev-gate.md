@@ -31,6 +31,8 @@ on every message** — no restart, no redeploy. Operator surface:
    host-written `jev` metadata key that the levers derive from — user text
    cannot forge a JSON key, so chat content cannot trip the counters.
 
+**Endpoint:** `JEV_URL` and `JEV_MODEL` in `.env` (defaults TypeSafe `https://api.typesafe.ai/v1/systemone`, `jev-latest`). OpenRouter serves the same request shape at `https://openrouter.ai/api/v1/systemone` with model `jev-1.13` and an OpenRouter key in `JEV_API_KEY`; bl uses OpenRouter since 2026-10-07 (TypeSafe answered 402). The voice end-of-turn shadow (`docs/jev-turn.md`) uses the same three keys. A change needs a restart of the host and the voice worker.
+
 **Fail-silent contract:** missing key, timeout, non-200, bad body, unreadable
 config or session DB — every failure means silent, which is the pre-gate
 behavior. On a pattern-everything wiring, failing open would wake a container

@@ -10,12 +10,11 @@
  * `silent` — today's behavior for a non-mention message. Failing open would
  * mean one container wake per message on a pattern-everything wiring.
  */
-import { JEV_API_KEY } from '../../config.js';
+import { JEV_API_KEY, JEV_MODEL, JEV_URL } from '../../config.js';
 import { log } from '../../log.js';
 import type { JevThresholds } from './config.js';
 
-export const JEV_URL = 'https://api.typesafe.ai/v1/systemone';
-export const JEV_MODEL = 'jev-latest';
+export { JEV_URL, JEV_MODEL };
 export const JEV_TIMEOUT_MS = 2000;
 
 export type JevQuestionId = 'direct_invitation' | 'unresolved' | 'already_answered' | 'human_pingpong';
