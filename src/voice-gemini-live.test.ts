@@ -13,6 +13,7 @@ import {
   type LiveSocket,
   stripVocabularyEcho,
 } from './voice-gemini-live.js';
+import { CALL_COMMAND_WORDS } from './channels/voice-livekit-protocol.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -70,19 +71,20 @@ class FakeSocket implements LiveSocket {
   }
 }
 
-function harness() {
+function harness(vocabulary = ['Andy', 'send it', 'прийом']) {
   vi.useFakeTimers();
   const sockets: FakeSocket[] = [];
   const interims: string[] = [];
   const warn = vi.fn();
+  const info = vi.fn();
   const t = new GeminiLiveTranscriber({
     apiKey: 'secret-key',
     model: 'gemini-3.5-transcribe-live',
-    vocabulary: ['Andy', 'send it', 'прийом'],
+    vocabulary,
     languageCodes: ['uk-UA', 'en-US'],
     sampleRate: 16_000,
     onInterim: (text) => void interims.push(text),
-    log: { info: () => undefined, warn },
+    log: { info, warn },
     socket: (url) => {
       const socket = new FakeSocket(url);
       sockets.push(socket);
@@ -95,7 +97,7 @@ function harness() {
     void p.then((h) => (out = h));
     return () => out;
   };
-  return { t, sockets, interims, warn, result, tick: (ms: number) => vi.advanceTimersByTimeAsync(ms) };
+  return { t, sockets, interims, warn, info, result, tick: (ms: number) => vi.advanceTimersByTimeAsync(ms) };
 }
 
 const pcm = (ms: number) => new Int16Array(16 * ms).fill(7);
@@ -184,11 +186,29 @@ describe('GeminiLiveTranscriber', () => {
     h.sockets[0].interim("'Andy', 'send it', 'прийом'");
     h.sockets[0].interim("Book a table for two. 'Andy', 'send it', 'при");
     expect(h.interims).toEqual(['Book a table', 'Book a table for two.']);
+    expect(h.info.mock.calls.map((c) => c[1])).toEqual([
+      { kind: 'interim', words: 4, kept: 0 },
+      { kind: 'interim', words: 9, kept: 5 },
+    ]);
     const done = h.result(h.t.end());
     h.sockets[0].final("'Andy', 'send it'");
     await h.tick(FINAL_GRACE_MS);
     // A final that was only the echo heard no words: the interim text is the turn's.
     expect(done()).toMatchObject({ final: '', interim: 'Book a table for two.', finals: 1 });
+  });
+
+  it('passes a trailing command said as its own sentence on to the interim text', async () => {
+    const commands = [...CALL_COMMAND_WORDS.send, ...CALL_COMMAND_WORDS.discard].map((w) => w.say);
+    const h = harness(['Dan', 'Stan', ...commands]);
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(0);
+    const words = 'Rewrite the landing page copy for the pricing section.';
+    const said = [words, `${words} Copy.`, `${words} Copy that.`, `${words}, copy`, 'What is three plus four? Zulu.'];
+    for (const text of said) h.sockets[0].interim(text);
+    expect(h.interims).toEqual(said);
+    expect(h.info).not.toHaveBeenCalled();
   });
 
   it('tells a vocabulary echo from words that quote or list some of it', () => {

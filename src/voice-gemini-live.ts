@@ -128,6 +128,7 @@ interface Activity {
 }
 
 const words = (s: string): string => s.replace(/\s+/g, ' ').trim();
+const wordCount = (s: string): number => (s.match(/[\p{L}\p{N}]+/gu) ?? []).length;
 
 /** A run of two or more quoted items in a list (`'Ava', 'Max', 'send it'`); the last may be cut off. */
 const QUOTED_LIST = /(?<=^|[\s([])(?:['‘’"“”«][^'‘’"“”«»,\n]{1,60}(?:['‘’"“”»]|(?=\s*$))[\s.]*(?:,[\s]*|$)){2,}/gu;
@@ -393,11 +394,11 @@ export class GeminiLiveTranscriber {
     };
     old.onLost = finish;
     old.onContent = (content) => {
-      const interim = this.clean(content.interimInputTranscription?.text);
+      const interim = this.clean(content.interimInputTranscription?.text, 'interim');
       if (typeof interim === 'string') part.interim = interim;
       const final = content.inputTranscription?.text;
       if (typeof final === 'string' && final.trim()) {
-        part.finals.push(this.clean(final.trim()) ?? '');
+        part.finals.push(this.clean(final.trim(), 'final') ?? '');
         part.interim = '';
         clearTimeout(grace);
         grace = setTimeout(finish, FINAL_GRACE_MS);
@@ -432,7 +433,7 @@ export class GeminiLiveTranscriber {
   }
 
   private onContent(activity: Activity, content: ServerContent): void {
-    const interim = this.clean(content.interimInputTranscription?.text);
+    const interim = this.clean(content.interimInputTranscription?.text, 'interim');
     if (typeof interim === 'string' && !activity.ending) {
       activity.part.interim = interim;
       activity.heard = this.text(activity);
@@ -441,7 +442,7 @@ export class GeminiLiveTranscriber {
     const final = content.inputTranscription?.text;
     if (typeof final === 'string' && final.trim()) {
       // A final that was only the echo still is the final: it says the activity heard no words.
-      activity.part.finals.push(this.clean(final.trim()) ?? '');
+      activity.part.finals.push(this.clean(final.trim(), 'final') ?? '');
       activity.part.interim = '';
       // The interim text after a final starts over; `heard` keeps the last interim's whole text.
       if (!activity.ending) this.opts.onInterim(this.text(activity));
@@ -540,9 +541,17 @@ export class GeminiLiveTranscriber {
   }
 
   /** Text without a vocabulary echo; none when it was nothing else (an interim then keeps the last one). */
-  private clean(text: string | undefined): string | undefined {
+  private clean(text: string | undefined, kind: 'interim' | 'final'): string | undefined {
     if (typeof text !== 'string') return undefined;
     const kept = stripVocabularyEcho(text, this.opts.vocabulary);
+    // Counts, not text: they show whether a stripped echo took the caller's last words with it.
+    if (kept !== text) {
+      this.opts.log.info('voice worker: the transcription echoed its vocabulary; stripped', {
+        kind,
+        words: wordCount(text),
+        kept: wordCount(kept),
+      });
+    }
     return kept || !text.trim() ? kept : undefined;
   }
 

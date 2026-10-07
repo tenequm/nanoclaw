@@ -2746,9 +2746,13 @@ describe('CallTurns, a command in one interim that settles', () => {
     const said = 'Rewrite the landing page copy for the pricing section. Copy.';
     h.t.results.push(heard(said, said));
     await h.talk(3000);
+    await h.interim('Rewrite the landing page copy for the pricing section.');
+    await h.pass(1500);
+    await h.talk(500);
     await h.interim(said);
     await h.pass(COMMAND_SETTLE_MS);
     expect(h.out.sent).toEqual(['Rewrite the landing page copy for the pricing section.']);
+    expect(h.out.facts[0]?.endedBy).toBe('send');
   });
 
   it('settles while the caller still talks and acts once they stop', async () => {
