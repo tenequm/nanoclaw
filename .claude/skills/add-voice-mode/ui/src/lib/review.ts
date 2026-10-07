@@ -5,8 +5,8 @@ import type { Phase } from "./voice-call"
  * models it is made of: the turn mode, the operation in flight, the worker's draft, the delivery
  * of the last sent draft and the agent's activity. Pure, so every state can be tested and shown
  * by the demo. The worker owns the draft (see CallReviewState in the protocol); the page only
- * shows it and asks. Auto mode's spoken commands (`zulu`, `copy`, the discard phrases, the wake switch)
- * ride on the same state, see `autoListening`.
+ * shows it and asks. Auto mode's spoken commands (the worker's words, the wake switch) ride on the
+ * same state, see `autoListening`.
  */
 
 export type TurnMode = "auto" | "review"
@@ -40,6 +40,79 @@ export function isReviewSnapshot(v: unknown): v is ReviewSnapshot {
   const s = v as ReviewSnapshot | null
   return !!s && typeof s.seq === "number" && (s.mode === "auto" || s.mode === "review") && (s.draft === null || typeof s.draft?.id === "number")
 }
+
+/** One spoken command as the worker announces it (CallCommandWord): `hint` marks the words short hints quote. */
+export interface CommandWord {
+  say: string
+  ownSentence?: boolean
+  hint?: boolean
+}
+export interface CommandWords {
+  send: CommandWord[]
+  discard: CommandWord[]
+}
+
+/**
+ * The worker's commands as of this page (CALL_COMMAND_WORDS), for the hints until a worker announces
+ * its own (`nanoclaw.voice.command-words`): before the call, and with an older worker. Never matched
+ * against captions: the worker marks the lines that hold a command.
+ */
+export const FALLBACK_COMMAND_WORDS: CommandWords = {
+  send: [{ say: "zulu", hint: true }, { say: "copy", ownSentence: true, hint: true }, { say: "copy that", ownSentence: true }, { say: "прийом" }],
+  discard: [{ say: "scratch that", hint: true }, { say: "discard turn" }, { say: "discard this turn" }],
+}
+
+const commandWordList = (v: unknown): CommandWord[] | null => {
+  if (!Array.isArray(v)) return null
+  const list: CommandWord[] = []
+  for (const w of v as unknown[]) {
+    const { say, ownSentence, hint } = (w ?? {}) as Record<string, unknown>
+    if (typeof say === "string" && say.trim()) list.push({ say: say.trim(), ...(ownSentence === true ? { ownSentence } : {}), ...(hint === true ? { hint } : {}) })
+  }
+  return list
+}
+
+/** The worker's announced commands (`nanoclaw.voice.command-words`), or null when it has none this page reads (version 1, some send word). */
+export function parseCommandWords(raw: string | undefined): CommandWords | null {
+  if (!raw) return null
+  let v: { v?: unknown; send?: unknown; discard?: unknown }
+  try {
+    v = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!v || v.v !== 1) return null
+  const send = commandWordList(v.send)
+  if (!send?.length) return null
+  return { send, discard: commandWordList(v.discard) ?? [] }
+}
+
+/** The words a hint quotes, joined for a sentence: `"zulu" or "copy"`. Short hints take the `hint` ones (else the first); `all` every one. */
+export function quoteWords(list: CommandWord[], all = false): string {
+  const picked = all ? list : list.some((w) => w.hint) ? list.filter((w) => w.hint) : list.slice(0, 1)
+  const quoted = picked.map((w) => `"${w.say}"`)
+  return quoted.length > 1 ? `${quoted.slice(0, -1).join(", ")} or ${quoted[quoted.length - 1]}` : (quoted[0] ?? "")
+}
+
+/** The worker's mark on a caption that ends in a spoken command (`nanoclaw.voice.command`, `nanoclaw.voice.words`). */
+export interface CaptionCommand {
+  command: "send" | "discard"
+  /** The caption's words before the command; "" when it was said alone. */
+  words: string
+}
+
+/** A caption's command mark from its stream attributes, or undefined: a caption without one clears the line's. */
+export function captionCommand(attrs: Readonly<Record<string, string>>): CaptionCommand | undefined {
+  const command = attrs["nanoclaw.voice.command"]
+  const words = attrs["nanoclaw.voice.words"]
+  return (command === "send" || command === "discard") && typeof words === "string" ? { command, words } : undefined
+}
+
+export const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
+/** A caption line's words as a turn's text holds them: a spoken command the worker marked is not part of them. */
+export const lineWords = (line: { text: string; command?: CaptionCommand }) => norm(line.command ? line.command.words : line.text)
+/** A caption line the worker marked as a spoken command said alone ("Zulu."). */
+export const isLoneCommand = (line: { text: string; command?: CaptionCommand }) => !!line.command && norm(line.command.words) === ""
 
 /** Everything the page knows about review mode, beside the call itself. */
 export interface ReviewState {
@@ -80,6 +153,8 @@ export interface ReviewState {
   wakeHeard: number
   /** How many times this call an open turn went back to waiting with nothing more said (CallWakeState.slept). */
   wakeSlept: number
+  /** The spoken commands' words the hints quote: the worker's announced ones, else the page's own. */
+  words: CommandWords
 }
 
 const WAKE_PHRASE_KEY = "voice-wake-phrase"
@@ -176,6 +251,7 @@ export const INITIAL_REVIEW: ReviewState = {
   wakePhrase: null,
   wakeHeard: 0,
   wakeSlept: 0,
+  words: FALLBACK_COMMAND_WORDS,
 }
 
 /** What a key does when pressed. */
@@ -480,39 +556,24 @@ export const MODE_NAME: Record<TurnMode, string> = { auto: "hands-free", review:
  * What each mode does, in one line under the switch. With the wake switch on a pause sends only when
  * the pause switch says so, as the readout's hint says too.
  */
-export function modeCaption(mode: TurnMode, commands: boolean, wake?: { on: boolean; pauseSends: boolean }): string {
+export function modeCaption(
+  mode: TurnMode,
+  commands: boolean,
+  wake?: { on: boolean; pauseSends: boolean },
+  words: CommandWords = FALLBACK_COMMAND_WORDS
+): string {
   if (mode === "review") return "Tap talk, read your words, then send."
   if (!commands) return "Stop for a moment to send."
-  if (wake?.on && !wake.pauseSends) return `Say "zulu" or "copy" to send.`
-  return `Stop for a moment, or say "zulu" or "copy", to send.`
+  const send = quoteWords(words.send)
+  if (wake?.on && !wake.pauseSends) return `Say ${send} to send.`
+  return `Stop for a moment, or say ${send}, to send.`
 }
 
 /**
- * The `nanoclaw.voice.commands` value of the worker whose words these are (CALL_COMMANDS_VERSION):
- * "1" had `over` as the send word, so the page offers commands to this vocabulary's worker only.
+ * The `nanoclaw.voice.commands` value of a worker whose commands and settings RPC this page drives
+ * (CALL_COMMANDS_VERSION); the words themselves come from the worker's announcement.
  */
 export const COMMANDS_VERSION = "2"
-
-/**
- * The page's own copy of the worker's send words, then its discard phrases, as `norm` leaves them
- * (lowercase, letters and digits only, Cyrillic kept as is). A caption line that ends in one holds
- * that command; `copy` and `copy that` only as their own sentence (the whole line, or after
- * punctuation, OWN_SENTENCE_END). The channel tests check each one against the worker's own matching.
- */
-export const SEND_WORDS = ["zulu", "зулу", "прийом", "приём"]
-export const DISCARD_PHRASES = ["discardthisturn", "discardturn", "scratchthat"]
-const COMMAND_END = new RegExp(`(${[...SEND_WORDS, ...DISCARD_PHRASES].join("|")})$`, "u")
-const OWN_SENTENCE_END = /(^|[.!?,;:–—-])\s*copy(\s+that)?[^\p{L}\p{N}]*$/iu
-const DISCARD_END = new RegExp(`(${DISCARD_PHRASES.join("|")})$`, "u")
-
-export const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
-/** A caption line as a sent turn's text holds it: a spoken command that ended the turn is not sent. */
-export const lineKey = (s: string) =>
-  OWN_SENTENCE_END.test(s) ? norm(s.replace(OWN_SENTENCE_END, "")) : norm(s).replace(COMMAND_END, "")
-/** A caption line that is only a spoken command ("Zulu."), with nothing else said. */
-export const isCommandOnly = (s: string) => norm(s) !== "" && lineKey(s) === ""
-/** A caption line that ends in a discard phrase ("Scratch that."). */
-export const endsInDiscard = (s: string) => DISCARD_END.test(norm(s))
 
 export interface ListeningView {
   chip: string
@@ -553,11 +614,12 @@ export function autoListening({ agentName, review }: { agentName: string; review
   // The send countdown shows how long the pause is; the copy never quotes seconds.
   if (!review.commands) return { chip: "Listening", hint: "Go ahead. Stop for a moment to send.", empty: "Speak when ready." }
   const wakePhrase = `"${wakePhraseOf(review, agentName)}"`
-  if (!review.wake) return { chip: "Listening", hint: `Go ahead. Stop for a moment, or say "zulu" or "copy" to send now.`, empty: "Speak when ready." }
+  const send = quoteWords(review.words.send)
+  if (!review.wake) return { chip: "Listening", hint: `Go ahead. Stop for a moment, or say ${send} to send now.`, empty: "Speak when ready." }
   if (review.awaitingWake) return { chip: `Say ${wakePhrase}`, hint: `Nothing is sent until you say ${wakePhrase}.`, empty: `Say ${wakePhrase} to start.` }
   return {
     chip: "Listening",
-    hint: review.pauseSends ? `Say "zulu" or "copy", or stop for a moment, to send.` : `Say "zulu" or "copy" to send - stopping won't.`,
+    hint: review.pauseSends ? `Say ${send}, or stop for a moment, to send.` : `Say ${send} to send - stopping won't.`,
     empty: "Speak when ready.",
   }
 }

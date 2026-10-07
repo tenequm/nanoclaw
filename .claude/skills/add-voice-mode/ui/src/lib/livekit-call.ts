@@ -27,7 +27,7 @@ import {
   type TurnMark,
   type VoiceCall,
 } from "./voice-call"
-import { COMMANDS_VERSION, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, reopensMic, infoWakePhrase, isCommandOnly, isReviewSnapshot, lineKey, norm, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSION, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, captionCommand, reopensMic, infoWakePhrase, isLoneCommand, isReviewSnapshot, lineWords, norm, parseCommandWords, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -69,8 +69,10 @@ const REVIEW_RPC: Record<ReviewOp | "settings", string> = {
   discard: "nanoclaw.voice.discard",
   settings: "nanoclaw.voice.settings",
 }
-/** COMMANDS_VERSION when the worker understands spoken commands (`zulu`, `copy`, discard, the wake phrase) and the settings RPC. */
+/** COMMANDS_VERSION when the worker understands spoken commands (send, discard, the wake phrase) and the settings RPC. */
 const COMMANDS_ATTR = "nanoclaw.voice.commands"
+/** The worker's spoken commands as JSON (CallCommandWords): the words the hints quote. */
+const COMMAND_WORDS_ATTR = "nanoclaw.voice.command-words"
 /** The worker's sound cues come on their own track (CALL_CUE_TRACK), never the speech track. */
 const CUE_TRACK = "background_audio"
 const REVIEW_RPC_TIMEOUT_MS = 10_000
@@ -149,7 +151,13 @@ type SettledTurn = { turn: number; status: "sent" | "lost"; reason?: TurnMark["r
  * wake phrase, a spoken command said alone, with nothing open to act on, or the words of a turn the
  * wake phrase opened that went back to waiting (`asleep`).
  */
-type DroppedSpeech = { dropped: "discarded" | "unaddressed" | "command" | "asleep"; text: string }
+type DroppedSpeech = {
+  dropped: "discarded" | "unaddressed" | "command" | "asleep"
+  text: string
+  /** On `command`: which command, and its caption's `lk.segment_id`. */
+  command?: "send" | "discard"
+  segment?: string
+}
 
 function isDroppedSpeech(v: unknown): v is DroppedSpeech {
   const d = v as DroppedSpeech | null
@@ -210,7 +218,7 @@ function agentPhase(attrs: Readonly<Record<string, string>>): Phase | null {
 const spaceSentences = (s: string) => s.replace(/([\p{Ll}\p{N}][.!?…]+)(?=\p{Lu})/gu, "$1 ")
 
 /** Whether a caption line belongs to the text the worker reports (a line of only a command does). */
-const within = (said: string, line: Line) => norm(line.text) !== "" && said.includes(lineKey(line.text))
+const within = (said: string, line: Line) => norm(line.text) !== "" && said.includes(lineWords(line))
 
 /**
  * Put a turn's mark on the caller lines it is made of: the latest unmarked one its final text
@@ -256,21 +264,23 @@ function applyTurn(lines: Line[], covered: Set<number>, status: SettledTurn, new
  * the whole open turn: every open line. Speech before the wake phrase is one transcript: the latest open line it contains and the
  * open ones before it, else the oldest open line; the newest may already be the caller's next words.
  */
-function applyDropped(lines: Line[], covered: Set<number>, d: DroppedSpeech): Line[] {
+function applyDropped(lines: Line[], covered: Set<number>, d: DroppedSpeech, segmentLine?: number): Line[] {
   const open = lines.filter((l) => l.from === "user" && !covered.has(l.id))
   const said = norm(d.text)
   if (d.dropped === "command") {
-    // A send word with nothing open is one line of its own: never the caller's next words.
-    const target = [...open].reverse().find((l) => isCommandOnly(l.text)) ?? [...open].reverse().find((l) => norm(l.text) === said)
+    // A command with nothing open is one line of its own, its caption's: never the caller's next words.
+    const target =
+      open.find((l) => l.id === segmentLine) ?? [...open].reverse().find(isLoneCommand) ?? [...open].reverse().find((l) => norm(l.text) === said)
     if (!target) return lines
     covered.add(target.id)
-    return lines.map((l) => (l.id === target.id ? { ...l, mark: { status: "dropped", reason: "command" } } : l))
+    const command = d.command ?? target.command?.command
+    return lines.map((l) => (l.id === target.id ? { ...l, mark: { status: "dropped", reason: "command", ...(command ? { command } : {}) } } : l))
   }
   const whole = d.dropped === "unaddressed" ? [...open].reverse().find((l) => within(said, l)) : undefined
   // Words before the wake phrase that share a caption with it: that line stays open for the turn it
   // starts, tagged for the part that was ignored; only the lines before it were wholly ignored.
   const part =
-    d.dropped === "unaddressed" && !whole && said ? [...open].reverse().find((l) => lineKey(l.text).length > said.length && lineKey(l.text).includes(said)) : undefined
+    d.dropped === "unaddressed" && !whole && said ? [...open].reverse().find((l) => lineWords(l).length > said.length && lineWords(l).includes(said)) : undefined
   if (part) {
     const before = new Set(open.slice(0, open.indexOf(part)).map((l) => l.id))
     for (const id of before) covered.add(id)
@@ -402,6 +412,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   agentId.current = agent?.identity ?? null
   const reviewAvailable = agentAttributes?.[REVIEW_ATTR] === "1"
   const commandsAvailable = agentAttributes?.[COMMANDS_ATTR] === COMMANDS_VERSION
+  const announcedWords = agentAttributes?.[COMMAND_WORDS_ATTR]
   /** This call already gave the worker the page's settings. */
   const settingsSent = useRef(false)
   /** The wake switch as the worker last said it runs it. */
@@ -514,7 +525,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         const kept: Draft | null =
           d && (d.state === "ready" || d.state === "failed") ? d : open && r.provisional.trim() ? { ...d, state: "failed", text: r.provisional.trim() } : null
         // The next call starts from the caller's picks, not from a fallback this call's worker forced.
-        return { ...INITIAL_REVIEW, ...prefs.current, available: r.available, wakePhrase: r.wakePhrase, draft: kept, ended: !!kept }
+        return { ...INITIAL_REVIEW, ...prefs.current, available: r.available, wakePhrase: r.wakePhrase, words: r.words, draft: kept, ended: !!kept }
       })
       setMicStream(null)
       setRemoteStream(null)
@@ -750,9 +761,12 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       const text = mine ? spaceSentences(t.text.trim()) : t.text.trim()
       // The final often repeats the last interim text word for word; it still firms the line up.
       const interim = mine && attrs["lk.transcription_final"] !== "true"
-      const changed = segmentText.current.get(key) !== text
+      // The worker's mark on a caption that ends in a spoken command; each caption replaces the last one's.
+      const command = mine ? captionCommand(attrs) : undefined
+      const shown = command ? `${text}\0${command.command}\0${command.words}` : text
+      const changed = segmentText.current.get(key) !== shown
       if (!text || (!changed && interimSegments.current.has(key) === interim)) continue
-      segmentText.current.set(key, text)
+      segmentText.current.set(key, shown)
       if (interim) interimSegments.current.set(key, Date.now())
       else interimSegments.current.delete(key)
       const r = reviewRef.current
@@ -779,10 +793,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         const about = reply ? { group: reply.group, ...(first && reply.re ? { re: reply.re } : {}) } : {}
         const woke = mine && wakeNext.current
         if (woke) wakeNext.current = false
-        next = [...next, { id: nid, from: mine ? "user" : "assistant", text, at: secondsIn(), ...about, ...(woke ? { wake: true } : {}), ...(interim ? { interim } : {}) }]
+        next = [...next, { id: nid, from: mine ? "user" : "assistant", text, at: secondsIn(), ...about, ...(woke ? { wake: true } : {}), ...(interim ? { interim } : {}), ...(command ? { command } : {}) }]
         touched = nid
       } else {
-        next = next.map((l) => (l.id === id ? { ...l, text, interim: interim || undefined } : l))
+        next = next.map((l) => (l.id === id ? { ...l, text, interim: interim || undefined, command } : l))
         // A final that only firms the text up is no new words: no caret, and the wake timing stands.
         if (!changed) continue
         touched = id
@@ -824,7 +838,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         continue
       }
       if (isDroppedSpeech(status)) {
-        next = applyDropped(next, coveredLines.current, status)
+        next = applyDropped(next, coveredLines.current, status, status.segment === undefined ? undefined : segmentLine.current.get(status.segment))
         continue
       }
       if (!isTurnStatus(status)) continue
@@ -861,7 +875,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (p === "connecting" || LIVE_PHASES.has(p)) return
     // A draft from the last call is discarded first, never carried into this one.
     if (reviewRef.current.ended && reviewRef.current.draft) return
-    updateReview((r) => ({ ...INITIAL_REVIEW, mode: r.mode, wake: r.wake, pauseSends: r.pauseSends, typing: r.typing, wakePhrase: r.wakePhrase }))
+    updateReview((r) => ({ ...INITIAL_REVIEW, mode: r.mode, wake: r.wake, pauseSends: r.pauseSends, typing: r.typing, wakePhrase: r.wakePhrase, words: r.words }))
     reviewSeq.current = 0
     reviewAsked.current = false
     settingsSent.current = false
@@ -1289,6 +1303,12 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     void sendSettings()
   }, [reviewLive, commandsAvailable, updateReview, sendSettings])
 
+  // The worker's own command words once it names them; they stay for later calls on this page too.
+  useEffect(() => {
+    const words = parseCommandWords(announcedWords)
+    if (words) updateReview((x) => (JSON.stringify(x.words) === JSON.stringify(words) ? x : { ...x, words }))
+  }, [announcedWords, updateReview])
+
   const setWakeOption = useCallback(
     (fields: { wake?: boolean; pauseSends?: boolean; typing?: boolean }) => {
       const r = reviewRef.current
@@ -1318,10 +1338,10 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (!(silence > 0) || !(elapsed >= 0)) return null
     return { id: pending, from: Math.min(1, elapsed / silence), ms: Math.max(0, silence - elapsed) }
   }, [pending])
-  // A lone send word has nothing to send: its line shows no countdown, whatever the attribute says.
+  // A lone command has nothing to send: its line shows no countdown, whatever the attribute says.
   const loneCommand = useMemo(() => {
     const last = lines.findLast((l) => l.from === "user")
-    return !!last && !last.mark && isCommandOnly(last.text)
+    return !!last && !last.mark && isLoneCommand(last)
   }, [lines])
   const sendCue = live && phase !== "talking" && !loneCommand ? pendingCue : null
 

@@ -8,8 +8,13 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { matchCommand, type SpokenCommand } from '../voice-livekit-worker.js';
-import { CALL_COMMANDS_VERSION } from './voice-livekit-protocol.js';
+import { COMMAND_WORDS_JSON, captionMark, matchCommand } from '../voice-livekit-worker.js';
+import {
+  CALL_CAPTION_COMMAND_ATTRIBUTE,
+  CALL_CAPTION_WORDS_ATTRIBUTE,
+  CALL_COMMAND_WORDS,
+  CALL_COMMANDS_VERSION,
+} from './voice-livekit-protocol.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const skillDir = path.resolve(here, '../../.claude/skills/add-voice-mode');
@@ -29,6 +34,11 @@ type View = {
   endable: boolean;
 };
 type Prefs = { mode: string; wake: boolean; pauseSends: boolean; typing: boolean };
+type CommandWords = {
+  send: Array<{ say: string; ownSentence?: boolean; hint?: boolean }>;
+  discard: Array<{ say: string; ownSentence?: boolean; hint?: boolean }>;
+};
+type CaptionCommand = { command: 'send' | 'discard'; words: string };
 interface ReviewLib {
   INITIAL_REVIEW: ReviewState;
   reviewView(input: {
@@ -49,12 +59,13 @@ interface ReviewLib {
     hint: string;
     empty: string;
   };
-  lineKey(s: string): string;
-  isCommandOnly(s: string): boolean;
-  endsInDiscard(s: string): boolean;
   norm(s: string): string;
-  SEND_WORDS: string[];
-  DISCARD_PHRASES: string[];
+  lineWords(line: { text: string; command?: CaptionCommand }): string;
+  isLoneCommand(line: { text: string; command?: CaptionCommand }): boolean;
+  captionCommand(attrs: Record<string, string>): CaptionCommand | undefined;
+  parseCommandWords(raw: string | undefined): CommandWords | null;
+  quoteWords(list: CommandWords['send'], all?: boolean): string;
+  FALLBACK_COMMAND_WORDS: CommandWords;
   COMMANDS_VERSION: string;
   MODE_NAME: Record<string, string>;
   DEFAULT_PREFS: Prefs;
@@ -63,7 +74,12 @@ interface ReviewLib {
   settingsNotTaken(ran: { on: boolean; pauseSends: boolean } | undefined): Record<string, unknown>;
   storedWakePhrase(): string | null;
   storeWakePhrase(phrase: string | null): void;
-  modeCaption(mode: string, commands: boolean, wake?: { on: boolean; pauseSends: boolean }): string;
+  modeCaption(
+    mode: string,
+    commands: boolean,
+    wake?: { on: boolean; pauseSends: boolean },
+    words?: CommandWords,
+  ): string;
   wakeSwitchPhrase(review: ReviewState, agentName: string, placeholder: string): string | null;
   reopensMic(input: { to: string; taken: boolean; muted: boolean; mutedByHand: boolean }): boolean;
   charsOver(text: string): number;
@@ -361,23 +377,82 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     ).toBe(true);
   });
 
-  it('knows the send words the worker takes, in Latin and Cyrillic, as a caption line ends', () => {
-    for (const said of ['Zulu.', 'Зулу.', 'Copy.', 'Copy that.', 'Прийом.', 'Scratch that.', 'Discard this turn.'])
-      expect(lib.isCommandOnly(said), said).toBe(true);
-    expect(lib.lineKey('Book a table for two. Zulu.')).toBe('bookatablefortwo');
-    expect(lib.lineKey('Скільки зараз часу? Прийом.')).toBe('скількизаразчасу');
-    // `copy` only as its own sentence; a trailing "?" changes nothing.
-    expect(lib.lineKey('Book a table, copy that.')).toBe('bookatable');
-    expect(lib.lineKey('Is it ready? Copy?')).toBe('isitready');
-    expect(lib.lineKey('Send me a copy.')).toBe('sendmeacopy');
-    expect(lib.lineKey('Can you copy that?')).toBe('canyoucopythat');
-    expect(lib.isCommandOnly('Zulu?')).toBe(true);
-    expect(lib.isCommandOnly('Прийом?')).toBe(true);
-    // "over" and "send it" are no longer commands: they stay part of what was said.
-    for (const said of ['Over.', 'Send it.', 'Sendit', 'Send.']) expect(lib.isCommandOnly(said), said).toBe(false);
-    expect(lib.lineKey('Game over')).toBe('gameover');
-    expect(lib.isCommandOnly('')).toBe(false);
-    expect(lib.isCommandOnly('Book a table.')).toBe(false);
+  it("reads the worker's command marks off a caption, never the words themselves", () => {
+    const attrs = (text: string, command: 'send' | 'discard') => {
+      const mark = captionMark(text, command);
+      return { [CALL_CAPTION_COMMAND_ATTRIBUTE]: mark.command, [CALL_CAPTION_WORDS_ATTRIBUTE]: mark.words };
+    };
+    const line = (text: string, command?: 'send' | 'discard') => ({
+      text,
+      command: command && lib.captionCommand(attrs(text, command)),
+    });
+    expect(lib.captionCommand(attrs('Book a table for two. Zulu.', 'send'))).toEqual({
+      command: 'send',
+      words: 'Book a table for two.',
+    });
+    expect(lib.lineWords(line('Book a table for two. Zulu.', 'send'))).toBe('bookatablefortwo');
+    expect(lib.lineWords(line('Скільки зараз часу? Прийом.', 'send'))).toBe('скількизаразчасу');
+    for (const said of ['Zulu.', 'Copy that.', 'Прийом?', 'Scratch that.'])
+      expect(lib.isLoneCommand(line(said, said.startsWith('Scratch') ? 'discard' : 'send')), said).toBe(true);
+    // Unmarked, the page takes a caption as words, whatever it ends in.
+    expect(lib.isLoneCommand(line('Zulu.'))).toBe(false);
+    expect(lib.lineWords(line('Book a table. Zulu.'))).toBe('bookatablezulu');
+    expect(lib.isLoneCommand(line('Book a table.', 'send'))).toBe(false);
+    // A caption without the attributes, or with a command this page does not know, has no mark.
+    expect(lib.captionCommand({ 'lk.segment_id': 'SG_turn_1' })).toBeUndefined();
+    expect(
+      lib.captionCommand({ [CALL_CAPTION_COMMAND_ATTRIBUTE]: 'over', [CALL_CAPTION_WORDS_ATTRIBUTE]: '' }),
+    ).toBeUndefined();
+    expect(lib.captionCommand({ [CALL_CAPTION_COMMAND_ATTRIBUTE]: 'send' })).toBeUndefined();
+  });
+
+  it("quotes the worker's announced command words, and its own only until a worker names them", () => {
+    const { v: _v, ...table } = CALL_COMMAND_WORDS;
+    // The page's own list is the worker's as of this build.
+    expect(lib.FALLBACK_COMMAND_WORDS).toEqual(table);
+    expect(lib.INITIAL_REVIEW.words).toEqual(table);
+    expect(lib.parseCommandWords(COMMAND_WORDS_JSON)).toEqual(table);
+    const announced = lib.parseCommandWords(
+      JSON.stringify({
+        v: 1,
+        send: [
+          { say: 'roger', hint: true },
+          { say: 'over and out', hint: true },
+          { say: 'ten four', hint: true },
+        ],
+        discard: [{ say: 'never mind' }, { say: 'scrap it' }],
+        later: true,
+      }),
+    );
+    expect(announced).toEqual({
+      send: [
+        { say: 'roger', hint: true },
+        { say: 'over and out', hint: true },
+        { say: 'ten four', hint: true },
+      ],
+      discard: [{ say: 'never mind' }, { say: 'scrap it' }],
+    });
+    expect(lib.quoteWords(announced!.send)).toBe('"roger", "over and out" or "ten four"');
+    // No hint flagged: the first; `all`: every one.
+    expect(lib.quoteWords(announced!.discard)).toBe('"never mind"');
+    expect(lib.quoteWords(table.send, true)).toBe('"zulu", "copy", "copy that" or "прийом"');
+    expect(lib.modeCaption('auto', true, { on: true, pauseSends: false }, announced!)).toBe(
+      'Say "roger", "over and out" or "ten four" to send.',
+    );
+    expect(
+      lib.autoListening({ agentName: 'Andy', review: { ...lib.INITIAL_REVIEW, wake: false, words: announced } }).hint,
+    ).toBe('Go ahead. Stop for a moment, or say "roger", "over and out" or "ten four" to send now.');
+    // Another version, a broken value or no send word: not an announcement.
+    for (const raw of [
+      undefined,
+      '',
+      '{',
+      'null',
+      '{"v":2,"send":[{"say":"zulu"}]}',
+      '{"v":1,"send":[]}',
+      '{"v":1,"send":[{"say":" "}]}',
+    ])
+      expect(lib.parseCommandWords(raw), raw).toBeNull();
   });
 
   it('names the turn modes for people and says what each does', () => {
@@ -535,39 +610,9 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
       expect(lib.wakePhraseOf({ ...lib.INITIAL_REVIEW, wakePhrase: lib.storedWakePhrase() }, 'Andy')).toBe('Hey Andy');
     });
   });
-  it("the page's command words are the worker's, on the same commands vocabulary", () => {
-    // How the transcription writes each one; every page word needs a spelling here.
-    const spoken: Array<[string, SpokenCommand]> = [
-      ['Zulu.', 'send'],
-      ['Зулу.', 'send'],
-      ['Copy.', 'send'],
-      ['Copy that.', 'send'],
-      ['Copy?', 'send'],
-      ['Zulu?', 'send'],
-      ['Прийом.', 'send'],
-      ['Приём.', 'send'],
-      ['Discard this turn.', 'discard'],
-      ['Discard turn.', 'discard'],
-      ['Scratch that.', 'discard'],
-    ];
-    const covered = new Set(spoken.map(([text]) => lib.norm(text)));
-    for (const word of [...lib.SEND_WORDS, ...lib.DISCARD_PHRASES]) expect(covered, word).toContain(word);
-    for (const [text, command] of spoken) {
-      expect(lib.isCommandOnly(text), text).toBe(true);
-      expect(lib.endsInDiscard(text), text).toBe(command === 'discard');
-      expect(matchCommand(text), text).toMatchObject({ command, rest: '' });
-    }
-    // Not a command for either: words before or after it.
-    for (const text of [
-      'Zulu, call Anna.',
-      'Scratch that idea.',
-      'Send me a copy.',
-      'Can you copy that?',
-      'Send it.',
-    ]) {
-      expect(lib.isCommandOnly(text), text).toBe(false);
-      expect(matchCommand(text), text).toBeNull();
-    }
+  it("the page's commands version is the worker's", () => {
+    // Words the page used to match itself are the worker's alone now.
+    expect(matchCommand('Send me a copy.')).toBeNull();
     expect(lib.COMMANDS_VERSION).toBe(CALL_COMMANDS_VERSION);
   });
 });
