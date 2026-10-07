@@ -26,6 +26,7 @@ import { getChannelAdapterExact, registerChannelAdapter } from './channel-regist
 import type { VoiceModeUiConfig } from './voice-mode-page.js';
 import {
   LEGACY_VOICE_CHANNEL,
+  linePlatformId,
   resolveVoiceModeLine,
   type ResolveLineOptions,
   type VoiceModeLine,
@@ -273,19 +274,24 @@ export interface VoiceModeChannelAdapter extends ChannelAdapter {
 }
 
 export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChannelAdapter {
-  const tokens = new Set((config.linkTokens ?? []).map((t) => t.trim()).filter(Boolean));
+  /** Main's env link tokens by the legacy line id each opens; lines made since are hashed-token rows. */
+  const legacyLines = new Map(
+    (config.linkTokens ?? [])
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .map((t) => [t, legacyLineIdForToken(t)]),
+  );
   const lineForToken =
     config.lineForToken ??
     (async (token: string) => {
       const line = await findVoiceModeLineByToken(token);
-      if (line) return `voice-mode:${line.line_id}`;
-      if (!tokens.has(token)) return null;
-      const legacy = legacyLineIdForToken(token);
-      const old = await getMessagingGroupByPlatform(LEGACY_VOICE_CHANNEL, legacy, LEGACY_VOICE_CHANNEL);
-      return old ? legacy : lineIdForToken(token);
+      if (line) return linePlatformId(line.line_id);
+      const legacy = legacyLines.get(token);
+      if (!legacy) return null;
+      return (await getMessagingGroupByPlatform(LEGACY_VOICE_CHANNEL, legacy, LEGACY_VOICE_CHANNEL)) ? legacy : null;
     });
   const callLink = (platformId: string): string | null => {
-    const token = [...tokens].find((t) => lineIdForToken(t) === platformId || legacyLineIdForToken(t) === platformId);
+    const token = [...legacyLines].find(([, id]) => id === platformId)?.[0];
     return token ? `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}` : null;
   };
   const proxyPolicy: VoiceModeProxyPolicy = {
@@ -535,7 +541,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       log.info('voice-mode: ready', {
         callUrl: `${config.publicUrl.replace(/\/+$/, '')}/voice?t=<link token>`,
         trustedProxies: config.trustedProxyCidrs?.trim() || 'none',
-        lines: tokens.size,
+        lines: legacyLines.size,
         livekit: config.livekit.url,
         protocol: LIVEKIT_PROTOCOL_VERSION,
         agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
@@ -715,8 +721,8 @@ registerChannelAdapter(CHANNEL_TYPE, {
     const linkTokens = (env.VOICE_MODE_LINK_TOKEN ?? '').split(',');
     const short = linkTokens.map((t) => t.trim()).filter((t) => t && t.length < 32);
     if (short.length > 0) {
-      log.warn('voice-mode: link tokens shorter than 32 characters are weak; mint new ones with openssl rand -hex 16', {
-        lines: short.map(lineIdForToken),
+      log.warn('voice-mode: link tokens shorter than 32 characters are weak; replace their lines with /voice new', {
+        lines: short.map(legacyLineIdForToken),
       });
     }
     const page = pageListener(env.VOICE_MODE_PORT, env.VOICE_MODE_PAGE_HOST);

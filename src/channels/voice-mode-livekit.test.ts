@@ -478,6 +478,21 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     }
   });
 
+  it('opens no line for an env token whose saved main line is gone', async () => {
+    await h.stop();
+    const { initTestDb, runMigrations, closeDb } = await import('../db/index.js');
+    await runMigrations(await initTestDb());
+    try {
+      h = await startHarness({ lineForToken: undefined, resolveLine: undefined });
+      const info = await fetch(`${h.hostUrl}/voice/info?t=tok123`);
+      expect(info.status).toBe(403);
+      expect(await info.text()).toBe('Unknown call link');
+    } finally {
+      await h.stop();
+      await closeDb();
+    }
+  });
+
   it("delivers a saved main line's answer through core to its live call, with no call chat, in the line's own session", async () => {
     await h.stop();
     const db = await import('../db/index.js');

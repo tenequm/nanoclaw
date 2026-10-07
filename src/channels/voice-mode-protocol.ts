@@ -468,21 +468,66 @@ export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: 
   return raw;
 }
 
+/**
+ * The settings main read as `VOICE_<suffix>`, still read for their `VOICE_MODE_<suffix>` names: the
+ * upgrade runbook's rename table. Settings new to voice-mode (VOICE_MODE_PORT, VOICE_MODE_PAGE_HOST,
+ * VOICE_MODE_LANGUAGES) have no old name.
+ */
+export const LEGACY_VOICE_KEYS: readonly string[] = [
+  'VOICE_PUBLIC_URL',
+  'VOICE_LINK_TOKEN',
+  'VOICE_UI',
+  'VOICE_MAX_CALL_SECONDS',
+  'VOICE_MAX_CALLS_PER_HOUR',
+  'VOICE_MAX_MINUTES_PER_DAY',
+  'VOICE_ALLOW_NON_LOOPBACK',
+  'VOICE_TRUSTED_PROXY_CIDRS',
+  'VOICE_ALLOWED_CLIENT_CIDRS',
+  'VOICE_VOCABULARY',
+  'VOICE_STT_MODEL',
+  'VOICE_STT_FALLBACK_MODEL',
+  'VOICE_TTS_MODEL',
+  'VOICE_TTS_FALLBACK_MODEL',
+  'VOICE_TTS_VOICE',
+  'VOICE_SILENCE_MS',
+  'VOICE_MIRROR',
+  'VOICE_WAKE_MODEL',
+  'VOICE_WAKE_PHRASE',
+  'VOICE_WAKE_THRESHOLD',
+  'VOICE_WAKE_START_SECONDS',
+  'VOICE_WAKE_IDLE_SECONDS',
+  'VOICE_RECORDINGS_DAYS',
+  'VOICE_MAX_SPOKEN_CHARS',
+  'VOICE_TTS_DEESS',
+  'VOICE_TTS_NOTCH',
+  'VOICE_WORKER_HEALTH_PORT',
+];
+
+const legacyName = (key: string): string | null => {
+  const old = key.replace(/^VOICE_MODE_/, 'VOICE_');
+  return old !== key && LEGACY_VOICE_KEYS.includes(old) ? old : null;
+};
+
+/** The keys to read from `.env`: each requested key, and the old name of a `VOICE_MODE_*` one that had one. */
 export function voiceModeEnvKeys(keys: readonly string[]): string[] {
-  return [
-    ...new Set(
-      keys.flatMap((key) => (key.startsWith('VOICE_MODE_') ? [key, key.replace('VOICE_MODE_', 'VOICE_')] : [key])),
-    ),
-  ];
+  return [...new Set(keys.flatMap((key) => [key, legacyName(key) ?? []].flat()))];
 }
 
+/**
+ * `.env` values with each old LEGACY_VOICE_KEYS setting under its `VOICE_MODE_*` name, unless that
+ * name is set too, in which case the old one is ignored. `warn` hears key names only, never values.
+ */
 export function voiceModeEnv(env: Record<string, string>, warn: (message: string) => void): Record<string, string> {
   const out = { ...env };
-  for (const key of Object.keys(env)) {
-    if (!key.startsWith('VOICE_') || key.startsWith('VOICE_MODE_')) continue;
-    const renamed = key.replace('VOICE_', 'VOICE_MODE_');
-    if (out[renamed] === undefined) out[renamed] = env[key];
-    warn(`voice-mode: ${key} is deprecated; use ${renamed}`);
+  for (const key of LEGACY_VOICE_KEYS) {
+    if (env[key] === undefined) continue;
+    const renamed = key.replace(/^VOICE_/, 'VOICE_MODE_');
+    if (env[renamed] === undefined) {
+      out[renamed] = env[key];
+      warn(`voice-mode: ${key} is deprecated; use ${renamed}`);
+    } else {
+      warn(`voice-mode: ${key} is ignored because ${renamed} is set; remove it`);
+    }
   }
   return out;
 }

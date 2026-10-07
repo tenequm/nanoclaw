@@ -112,15 +112,17 @@ export async function resolveVoiceModeLine(
         linkHash: line.token_hash,
       };
     }
+    // Every other line is a hashed-token row (above); only a line from before the rename resolves here.
+    if (lineChannelType(platformId) !== LEGACY_VOICE_CHANNEL) return null;
     const caller = await getUser(platformId);
-    const lineChannel = lineChannelType(platformId);
-    if (!caller || caller.kind !== lineChannel || !caller.display_name?.trim()) return null;
-    const mg = await getMessagingGroupByPlatform(lineChannel, platformId, instance);
+    if (!caller || caller.kind !== LEGACY_VOICE_CHANNEL || !caller.display_name?.trim()) return null;
+    const mg = await getMessagingGroupByPlatform(LEGACY_VOICE_CHANNEL, platformId, instance);
     if (!mg || mg.is_group || mg.unknown_sender_policy !== 'strict') return null;
     const wirings = await getMessagingGroupAgents(mg.id);
     if (wirings.length !== 1 || wirings[0].sender_scope !== 'known') return null;
     const groupId = wirings[0].agent_group_id;
-    if (lineChannel === LEGACY_VOICE_CHANNEL && (await getVoiceModeLineForAgent(groupId))) return null;
+    // A line /voice new made for the agent retires its legacy lines.
+    if (await getVoiceModeLineForAgent(groupId)) return null;
     if (!(await canAccessAgentGroup(caller.id, groupId)).allowed) return null;
     const group = await getAgentGroup(groupId);
     if (!group) return null;

@@ -30,9 +30,9 @@ that hands their replies, typing and call links to the live voice-mode engine.
 
 ### Configuration rename
 
-Every old `VOICE_<suffix>` read by host or worker is accepted as
-`VOICE_MODE_<suffix>`, with a warning naming keys only. An explicit new value
-wins when both are present. The existing `.env` parser ignores empty values;
+Every old key in the table below is accepted as its `VOICE_MODE_<suffix>`
+name, with a warning naming keys only; no other `VOICE_*` key is. An explicit
+new value wins when both are present, and the old key is reported as ignored. The existing `.env` parser ignores empty values;
 use documented `off`/`0` switches rather than an empty line to disable a setting.
 
 | Main key | Protocol 6 key |

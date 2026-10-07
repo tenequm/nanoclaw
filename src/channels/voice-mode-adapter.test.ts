@@ -3,6 +3,9 @@
  * peers may reach the browser routes through a reverse proxy. The routes
  * themselves are exercised over HTTP in voice-mode-livekit.test.ts.
  */
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import { admitsVoiceModePeer, parseCidrs, voiceRoute, type VoiceModeProxyPolicy } from './voice-mode.js';
@@ -107,9 +110,36 @@ describe('voice-mode environment compatibility', () => {
         warnings.push(s),
       ),
     ).toMatchObject({ VOICE_MODE_LINK_TOKEN: 'new', VOICE_MODE_WAKE_MODEL: 'off' });
-    expect(warnings).toHaveLength(2);
+    expect(warnings).toEqual([
+      'voice-mode: VOICE_LINK_TOKEN is ignored because VOICE_MODE_LINK_TOKEN is set; remove it',
+      'voice-mode: VOICE_WAKE_MODEL is deprecated; use VOICE_MODE_WAKE_MODEL',
+    ]);
     expect(warnings.join(' ')).not.toContain(oldValue);
     expect(parseVoiceLanguages(undefined)).toEqual(['uk-UA', 'en-US']);
     expect(parseVoiceLanguages('de-DE,en-US,de-de,invalid!')).toEqual(['de-DE', 'en-US']);
+  });
+
+  it('aliases only the old keys main read: none for settings new to voice-mode', async () => {
+    const { voiceModeEnv, voiceModeEnvKeys } = await import('./voice-mode-protocol.js');
+    const fresh = ['VOICE_MODE_PORT', 'VOICE_MODE_PAGE_HOST', 'VOICE_MODE_LANGUAGES'];
+    expect(voiceModeEnvKeys(fresh)).toEqual(fresh);
+    const warnings: string[] = [];
+    const env = voiceModeEnv({ VOICE_PORT: '9', VOICE_PAGE_HOST: '0.0.0.0', VOICE_LANGUAGES: 'de-DE' }, (s) =>
+      warnings.push(s),
+    );
+    for (const key of fresh) expect(env[key]).toBeUndefined();
+    expect(warnings).toEqual([]);
+  });
+
+  it("aliases exactly the upgrade runbook's rename table", async () => {
+    const { LEGACY_VOICE_KEYS } = await import('./voice-mode-protocol.js');
+    const runbook = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '../../docs/2610-07-voice-mode-upgrade.md',
+    );
+    if (!existsSync(runbook)) return; // An installed payload does not carry the fork's docs.
+    const table = [...readFileSync(runbook, 'utf8').matchAll(/^\| `(VOICE_[A-Z_]+)` \| `VOICE_MODE_[A-Z_]+` \|$/gm)];
+    expect(table.map((m) => m[1])).toEqual([...LEGACY_VOICE_KEYS]);
+    expect(LEGACY_VOICE_KEYS).toHaveLength(27);
   });
 });

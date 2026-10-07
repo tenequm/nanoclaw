@@ -10,8 +10,9 @@ import { resolveVoiceModeLine } from './voice-mode-line.js';
 
 const stamp = () => new Date().toISOString();
 
-// Lines from before the voice-mode rename keep their `voice` rows and ids; env-backed new ones are `voice-mode`.
-describe.each(['voice', 'voice-mode'] as const)('personal %s line access (real central DB)', (channel) => {
+// Lines from before the voice-mode rename keep their `voice` rows and ids; lines made since are hashed-token rows.
+describe('personal legacy voice line access (real central DB)', () => {
+  const channel: string = 'voice';
   const ETHAN = `${channel}:ethan-test`;
   const LAURA = `${channel}:laura-test`;
 
@@ -110,6 +111,35 @@ describe.each(['voice', 'voice-mode'] as const)('personal %s line access (real c
     await updateMessagingGroup(`mg-${ETHAN}`, { unknown_sender_policy: 'public' });
     expect(await resolveVoiceModeLine(ETHAN)).toBeNull();
     expect(await resolveVoiceModeLine(`${channel}:unknown`)).toBeNull();
+  });
+
+  it('resolves no membership line in the voice-mode namespace: lines there are hashed-token rows only', async () => {
+    const id = 'voice-mode:ethan-test';
+    await createUser({ id, kind: 'voice-mode', display_name: 'Ethan', created_at: stamp() });
+    await createMessagingGroup({
+      id: 'mg-new-namespace',
+      channel_type: 'voice-mode',
+      platform_id: id,
+      instance: 'voice-mode',
+      name: 'Personal call',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: stamp(),
+    });
+    await createMessagingGroupAgent({
+      id: 'wire-new-namespace',
+      messaging_group_id: 'mg-new-namespace',
+      agent_group_id: 'voice-agent',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'known',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: stamp(),
+    });
+    await allow(id);
+    expect(await resolveVoiceModeLine(id)).toBeNull();
   });
 
   it('refuses ambiguous wiring to multiple agents', async () => {
