@@ -1,3 +1,4 @@
+import { handleVoiceModeRoot } from './channels/voice-mode-integration.js';
 /**
  * Minimal HTTP server for Chat SDK adapter webhooks.
  *
@@ -128,6 +129,7 @@ function ensureServer(): void {
   const candidate = http.createServer((req, res) => {
     res.setHeader('x-nanoclaw-webhook-id', id);
     void (async () => {
+      if (await handleVoiceModeRoot(req, res)) return;
       const url = req.url || '/';
 
       // Route: /webhook/{adapterName}

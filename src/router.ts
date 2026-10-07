@@ -31,6 +31,7 @@ import { findSessionForAgent } from './db/sessions.js';
 import { backfillSession, fanInboundMessage } from './modules/cross-session-context/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { voiceModeStored } from './channels/voice-mode-integration.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
@@ -598,6 +599,8 @@ export async function deliverToAgent(
     content: event.message.content,
     trigger: wake,
   });
+
+  voiceModeStored({ ...event, threadId: effectiveThreadId }, session);
 
   if (wake && created) {
     // A brand-new engaged session: notify registered modules with the

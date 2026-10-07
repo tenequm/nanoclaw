@@ -1,3 +1,4 @@
+import { presentVoiceModeOutbound } from './channels/voice-mode-integration.js';
 /**
  * Poll outbound mailboxes and deliver undelivered messages through channel adapters.
  * SQLite reads runner-owned outbound state read-only and records delivery in
@@ -539,7 +540,7 @@ async function deliverMessage(
     msg.platformId,
     msg.threadId,
     msg.kind,
-    msg.content,
+    presentVoiceModeOutbound(msg, session),
     files,
     deliverInstance,
   );
