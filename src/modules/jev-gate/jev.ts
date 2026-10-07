@@ -14,9 +14,9 @@ import { JEV_API_KEY } from '../../config.js';
 import { log } from '../../log.js';
 import type { JevThresholds } from './config.js';
 
-const JEV_URL = 'https://api.typesafe.ai/v1/systemone';
-const JEV_MODEL = 'jev-latest';
-const JEV_TIMEOUT_MS = 2000;
+export const JEV_URL = 'https://api.typesafe.ai/v1/systemone';
+export const JEV_MODEL = 'jev-latest';
+export const JEV_TIMEOUT_MS = 2000;
 
 export type JevQuestionId = 'direct_invitation' | 'unresolved' | 'already_answered' | 'human_pingpong';
 

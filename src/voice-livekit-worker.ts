@@ -101,6 +101,7 @@ import {
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import { GeminiLiveTranscriber, type Heard, type TranscriberOptions } from './voice-gemini-live.js';
+import { JevTurnShadow, type TurnShadowSink } from './voice-jev-turn.js';
 import {
   CUSTOM_WAKE_THRESHOLD,
   DEFAULT_WAKE_MODEL,
@@ -1962,6 +1963,8 @@ export interface CallTurnsDeps {
   unheard(): void;
   /** A turn that came to nothing for the agent: discarded, unaddressed, or a command alone. */
   ended?(facts: TurnFacts, outcome: TurnOutcome, reason: string): void;
+  /** Watches addressed auto turns and logs what it would do (src/voice-jev-turn.ts); never acts. */
+  shadow?: TurnShadowSink;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -2197,6 +2200,8 @@ export class CallTurns {
     const changed = text !== turn.heard;
     turn.heard = text;
     this.deps.caption(turn.segment, joinText(turn.carry, text), false);
+    if (turn.kind === 'auto' && turn.addressed)
+      this.deps.shadow?.interim(turn.segment, this.spoken(turn, joinText(turn.carry, text)));
     if (turn.kind !== 'auto') return;
     if (!turn.addressed) {
       const found = matchWake(text, this.names);
@@ -2294,6 +2299,7 @@ export class CallTurns {
     this.closed = true;
     clearTimeout(this.pauseTimer);
     this.disarm();
+    if (this.turn) this.deps.shadow?.ended(this.turn.segment, 'hangup');
     this.turn = undefined;
     this.finalizing = undefined;
   }
@@ -2417,6 +2423,7 @@ export class CallTurns {
     const turn = this.turn;
     if (!turn) return null;
     this.turn = undefined;
+    this.deps.shadow?.ended(turn.segment, why);
     clearTimeout(this.pauseTimer);
     this.disarm();
     this.deps.countdown.clear();
@@ -3704,6 +3711,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turnCueTimer: ReturnType<typeof setTimeout> | undefined;
   let turnCuedAt = 0;
   let replyHoldTimer: ReturnType<typeof setTimeout> | undefined;
+  const jevTurn = new JevTurnShadow({ callId: meta.callId, log: (line, fields) => callLog.info(line, fields) });
   const turnTaking: TurnTaking = new TurnTaking(
     {
       send: async (text) => {
@@ -3733,6 +3741,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       // While the line is synthesized the caller is heard as ever, and a turn they start then holds
       // its audio back (`waitForCaller`); once it plays the caller is not transcribed (onAgentSpeaking).
       say: async (text): Promise<boolean> => {
+        jevTurn.context(text);
         try {
           return (await callVoice?.say(text, () => turnTaking.waitForCaller())) ?? false;
         } finally {
@@ -3950,6 +3959,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       changed: () => review?.republish(),
       hold: (open) => turnTaking.setCaptureOpen(open, 'turn'),
       noTurn: () => turnTaking.releaseTurn(),
+      shadow: jevTurn,
       unheard: () => {
         if (!ending && !review?.reviewing) callVoice?.publishUnheard?.();
       },
