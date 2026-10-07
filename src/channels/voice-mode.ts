@@ -428,7 +428,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     res.end(body);
   };
 
-  /** HTTP routes under /webhook/voice-mode/… and /webhook/voice/…, and the browser's under /voice/…, on the shared webhook server. */
+  /** HTTP routes under /webhook/voice-mode/ and /webhook/voice/, and the browser's under /voice/, on the shared webhook server. */
   const handleHttp = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     let url: URL;
     try {
