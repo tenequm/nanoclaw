@@ -27,10 +27,14 @@ per call, and the request uses the gate's 2 s timeout. Every failure (no key,
 timeout, non-200, bad body, missing Noul) is nulls plus a reason, never an
 action.
 
-The key is the host's `JEV_API_KEY`, read by `src/config.ts` from the process
-environment or the checkout's `.env` (the worker runs from the same checkout as
-the host). It is never logged, and neither is any transcript text: the lines
-carry counts only.
+The endpoint is the host's: `JEV_URL`, `JEV_MODEL` and `JEV_API_KEY`, read by
+`src/config.ts` from the process environment or the checkout's `.env` (the
+worker runs from the same checkout as the host). `JEV_URL` and `JEV_MODEL`
+default to TypeSafe (`https://api.typesafe.ai/v1/systemone`, `jev-latest`);
+any endpoint with the same request shape works, for example OpenRouter
+(`https://openrouter.ai/api/v1/systemone`, model `jev-1.13`, an OpenRouter
+key). See `docs/jev-gate.md`. The key is never logged, and neither is any
+transcript text: the lines carry counts only.
 
 ## Log lines
 
@@ -58,6 +62,9 @@ ends one activity (`endedBy=send-word` or `discard`) and its continuation is
 logged as the next `turn`.
 
 When a cap is reached: `voice.turn-end jev capped call=<id> scope=call|day limit=<n>`, once per call.
+`scope=usage` (also once per call) means the daily count could not be kept -
+another process held it, or the usage file was torn or unwritable - so that
+judgment was skipped rather than left uncounted.
 
 Each line is also emitted with the same values as structured fields
 (`jevTurn: shadow|outcome|capped`), next to the call's `callId`.
@@ -80,23 +87,26 @@ unreadable file means off.
 
 Only `enabled` is required; the rest default to the values above. The daily
 count lives in `data/jev-turn-usage.json` (each call runs in its own job
-process, so it cannot be kept in memory). Kill switch: `"enabled": false`, or
-delete the file.
+process, so it cannot be kept in memory). Concurrent calls read, check and
+bump it under `data/jev-turn-usage.json.lock` and replace it by rename, so
+`maxPerDay` holds across calls; a judgment that cannot be counted is skipped.
+Kill switch: `"enabled": false`, or delete the file.
 
-## Enabling on bl
+## Enabling
 
-In the nanoclaw checkout on bl, write `data/jev-turn.json` with
+In the nanoclaw checkout, write `data/jev-turn.json` with
 `{ "enabled": true }` (the worker build must include this module). It takes
 effect from the next call's next interim; no restart. Check that `JEV_API_KEY`
-is in the checkout's `.env`, or every judgement logs `err=no_key`.
+is set, or every judgement logs `err=no_key`.
 
 ## Evaluating
+
+Grep the voice worker's log for `voice.turn-end jev`; with the skill's systemd
+user unit:
 
 ```bash
 journalctl --user -u nanoclaw-voice-worker --since today | grep 'voice.turn-end jev'
 ```
-
-Loki: `{user_unit="nanoclaw-voice-worker.service"} |= "voice.turn-end jev"`.
 
 What to read off the outcome lines, per `endedBy`:
 

@@ -54,8 +54,8 @@ export interface CommandWords {
 
 /**
  * The worker's commands as of this page (CALL_COMMAND_WORDS), for the hints until a worker announces
- * its own (`nanoclaw.voice.command-words`): before the call, and with an older worker. Never matched
- * against captions: the worker marks the lines that hold a command.
+ * its own (`nanoclaw.voice.command-words`), as every worker this page drives commands for does. Never
+ * matched against captions: the worker marks the lines that hold a command.
  */
 export const FALLBACK_COMMAND_WORDS: CommandWords = {
   send: [{ say: "zulu", hint: true }, { say: "copy", ownSentence: true, hint: true }, { say: "copy that", ownSentence: true }, { say: "прийом" }],

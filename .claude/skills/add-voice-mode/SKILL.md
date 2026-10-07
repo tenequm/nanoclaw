@@ -854,7 +854,8 @@ worker logs `voice.command near-miss word=<cmd> reason=no-boundary` for it.
 `discard turn`, `discard this turn` or `scratch that` there drops everything since
 the last send; nothing is posted and the page marks those caption lines "discarded". The commands are in the transcription's custom vocabulary (it hears them far
 more reliably so). A command is noticed in the interim text: when two interim updates
-in a row end with it and the caller is silent (the VAD's end of speech), the turn's
+in a row end with it, or a single one that ends with it stays unchanged for 700 ms
+(`COMMAND_SETTLE_MS`), and the caller is silent (the VAD's end of speech), the turn's
 activity ends, and its final text decides: a command it still ends with acts, one it
 does not end with (the interim text was ahead of itself) was words, and the turn goes
 on in a new activity carrying them, as it does when the caller talks on before the
@@ -863,7 +864,12 @@ nothing (`Is it ready? Copy?` sends). A pause that ends a turn whose final text 
 a command applies it too, and so does one any interim of the turn ended with that later
 interims and the final left out (the final ends like the words before it, with no
 more words than a command adds), so a dropped `scratch that` never sends the words;
-the send countdown is not shown while a command is pending. A sent turn's caption is
+the send countdown is not shown while a command is pending. Not `copy` or `copy that`:
+they act only when the final itself ends with them as their own sentence. A `copy` the
+final left out is words, and so is one only the interim text has when the final
+collapsed to a few words or never came (logged as `voice.command near-miss word=<cmd>
+reason=unconfirmed`); a final that collapsed to the `copy` alone still sends the
+interim words before it. A sent turn's caption is
 the text the agent got, without the command; the words before it keep their period.
 The transcription sometimes returns its own vocabulary list as the caller's words
 (`'Ava', 'Max', 'zulu', ...`); that echo is cut from every interim and final. A command with nothing to act on plays the nope cue, and its
@@ -899,16 +905,22 @@ an activity; words with no wake phrase are marked "ignored · no wake phrase"):
 spelling (`Hey, Andy.`, `гей Енді`, `хей Енді`, `hi Andy`, `хай Енді`, a name
 glued to the hey as in `Heyandy`, and in Cyrillic a Ukrainian vocative ending, as
 in `Гей, Бене` for Ben). The worker
-advertises the commands with the attribute `nanoclaw.voice.commands` = "2" (the
-`zulu` / `copy` vocabulary, which replaced `send it` without a bump; "1" was `over`, and a page offers the commands only to the value it
-knows, so a page left open across an update falls back to pauses), and announces
+advertises the commands with the attribute `nanoclaw.voice.commands` = "3" (the
+`zulu` / `copy` vocabulary; "2" was `send it`, "1" was `over`). A page offers the
+commands only to the value it knows, so a page and a worker from either side of a
+vocabulary change quote no words to each other. The worker stays wake-gated until a
+client's settings say otherwise, so the two sides of a change behave differently: a
+page that finds a worker at "2" or "1" turns its wake switch off, and pauses send; a
+page older than the worker sends no settings, so that worker keeps waiting for a
+wake phrase and a send word the page never names - reload the page (and update the
+iOS app) with the worker. The worker announces
 the words themselves, in the same attribute update, as
 `nanoclaw.voice.command-words`: compact JSON of `CALL_COMMAND_WORDS` in the
 protocol module, the one list the worker matches, puts in the transcription's
 vocabulary and announces (`{"v":1,"send":[{"say":"zulu","hint":true},{"say":"copy","ownSentence":true,"hint":true},...],"discard":[{"say":"scratch that","hint":true},...]}`).
 The page and the iOS app quote those words in every hint (the `hint` ones in short
-hints, every send word in the commands block) and keep their own copy only for an
-older worker, and for the page before any worker has named them. They never match
+hints, every send word in the commands block) and keep their own copy only for the
+hints before a worker has named them. They never match
 the words against captions: a caller caption (`lk.transcription`) that ends in a
 command carries the stream attributes `nanoclaw.voice.command` (`send` or
 `discard`) and `nanoclaw.voice.words` (the caption's text before the command, ""
