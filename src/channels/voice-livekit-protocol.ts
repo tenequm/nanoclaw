@@ -114,6 +114,10 @@ export interface CallTurnStatus {
 export interface CallDroppedSpeech {
   dropped: 'discarded' | 'unaddressed' | 'command' | 'asleep';
   text: string;
+  /** On `command`: which command had nothing to act on. */
+  command?: CallCommand;
+  /** On `command`: the `lk.segment_id` of its caption line. */
+  segment?: string;
 }
 
 /**
@@ -168,9 +172,8 @@ export interface CallDraft {
 }
 
 /**
- * Auto mode's spoken commands: `zulu`, `прийом`, or `copy` / `copy that` as their own sentence, at
- * the end of an utterance sends the turn now, `discard turn`, `discard this turn` or `scratch that`
- * there drops it, and with the wake switch `on` nothing is kept or sent until `hey <agent>`, or the
+ * Auto mode's spoken commands (CALL_COMMAND_WORDS): a send word at the end of an utterance sends the
+ * turn now, a discard phrase there drops it, and with the wake switch `on` nothing is kept or sent until `hey <agent>`, or the
  * worker's acoustic wake word (`CallWakeState.phrase`), is heard (`waiting` until then). After the
  * wake phrase only a spoken send sends, unless `pauseSends` lets the closing silence send too. The
  * worker's participant attribute is CALL_COMMANDS_VERSION when it understands them and the
@@ -181,9 +184,57 @@ export interface CallDraft {
 export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice.commands';
 /**
  * The commands' vocabulary: "1" had `over` as the send word, "2" had `send it` and now has `zulu`,
- * `copy` and `copy that`; kept at "2" so open pages keep their commands across the change.
+ * `copy` and `copy that`; kept at "2" so open pages keep their commands across the change. A page
+ * takes the words themselves from CALL_COMMAND_WORDS_ATTRIBUTE.
  */
 export const CALL_COMMANDS_VERSION = '2';
+
+export type CallCommand = 'send' | 'discard';
+/**
+ * One spoken command as the caller says it (`say`, any script). `ownSentence`: it counts only as its
+ * own sentence, the whole utterance or after punctuation. `hint`: a page's short hints quote it.
+ */
+export interface CallCommandWord {
+  say: string;
+  ownSentence?: true;
+  hint?: true;
+}
+/** What the worker announces on CALL_COMMAND_WORDS_ATTRIBUTE, in display order. */
+export interface CallCommandWords {
+  v: 1;
+  send: CallCommandWord[];
+  discard: CallCommandWord[];
+}
+/**
+ * The spoken commands, the one source: the worker matches transcripts against them, gives them to
+ * the transcription as vocabulary, and announces them, so a page and an app quote the words it
+ * hears instead of their own copy.
+ */
+export const CALL_COMMAND_WORDS: CallCommandWords = {
+  v: 1,
+  send: [
+    { say: 'zulu', hint: true },
+    { say: 'copy', ownSentence: true, hint: true },
+    { say: 'copy that', ownSentence: true },
+    { say: 'прийом' },
+  ],
+  discard: [{ say: 'scratch that', hint: true }, { say: 'discard turn' }, { say: 'discard this turn' }],
+};
+/**
+ * The worker's participant attribute with CALL_COMMAND_WORDS as compact JSON, set with
+ * CALL_COMMANDS_ATTRIBUTE. Additive: a page without it uses its own list, and an old page ignores it.
+ */
+export const CALL_COMMAND_WORDS_ATTRIBUTE = 'nanoclaw.voice.command-words';
+/**
+ * Attributes of a caller caption (`lk.transcription`, segment `SG_turn_<n>`) whose text ends in a
+ * spoken command, both or neither: the command (`send` or `discard`), and the caption's words before
+ * it, a prefix of the text with the separators before the command trimmed ("" when the command was
+ * said alone; the whole text when a final left the command out). On an interim, the command the
+ * worker acts on if the caller stops now; on a final, the one it acted on: a sent final's text is
+ * already only its words. A caption without them clears the line's mark: the command was words.
+ */
+export const CALL_CAPTION_COMMAND_ATTRIBUTE = 'nanoclaw.voice.command';
+export const CALL_CAPTION_WORDS_ATTRIBUTE = 'nanoclaw.voice.words';
 export interface CallWakeState {
   on: boolean;
   pauseSends: boolean;

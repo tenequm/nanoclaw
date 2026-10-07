@@ -14,6 +14,7 @@ import { AudioFrame, DisconnectReason } from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  CALL_COMMAND_WORDS,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   type CallReviewState,
@@ -30,6 +31,9 @@ import {
   CallTurns,
   capSpokenText,
   COMMAND_VOCABULARY,
+  COMMAND_WORDS_JSON,
+  captionMark,
+  type CaptionMark,
   CUT_LINES,
   DEFAULT_MAX_SPOKEN_CHARS,
   FAILURE_LINES,
@@ -1858,6 +1862,41 @@ describe('speech output', () => {
 });
 
 describe('spoken command matching', () => {
+  it('announces the one list it matches and gives the transcription', () => {
+    expect(JSON.parse(COMMAND_WORDS_JSON)).toEqual(CALL_COMMAND_WORDS);
+    expect(COMMAND_VOCABULARY).toEqual([...CALL_COMMAND_WORDS.send, ...CALL_COMMAND_WORDS.discard].map((w) => w.say));
+    for (const command of ['send', 'discard'] as const) {
+      for (const { say, ownSentence } of CALL_COMMAND_WORDS[command]) {
+        const spoken = `${say[0].toUpperCase()}${say.slice(1)}.`;
+        expect(matchCommand(spoken), say).toEqual({ command, rest: '', ...(ownSentence ? { ownSentence } : {}) });
+        expect(matchCommand(`Book a table. ${spoken}`), say).toMatchObject({ command, rest: 'Book a table.' });
+        // Inside a sentence only the ownSentence words are words.
+        expect(matchCommand(`Book a table ${say}`) === null, say).toBe(!!ownSentence);
+      }
+    }
+  });
+
+  it("marks a caption's command with the words before it", () => {
+    expect(captionMark('Book a table for two. Zulu.', 'send')).toEqual({
+      command: 'send',
+      words: 'Book a table for two.',
+    });
+    expect(captionMark('book a table, zulu', 'send')).toEqual({ command: 'send', words: 'book a table' });
+    expect(captionMark('Скільки буде? Прийом.', 'send')).toEqual({ command: 'send', words: 'Скільки буде?' });
+    expect(captionMark('Zulu.', 'send')).toEqual({ command: 'send', words: '' });
+    expect(captionMark('Book it. Scratch that.', 'discard')).toEqual({ command: 'discard', words: 'Book it.' });
+    // A final that left the command out: all of it is words.
+    expect(captionMark('Book a table.', 'discard')).toEqual({ command: 'discard', words: 'Book a table.' });
+    for (const [text, command] of [
+      ['Book a table for two. Zulu.', 'send'],
+      ['Скільки буде? Прийом.', 'send'],
+      ['Book it, copy that.', 'send'],
+    ] as const) {
+      const { words } = captionMark(text, command);
+      expect(text.startsWith(words), text).toBe(true);
+    }
+  });
+
   it('finds a command only at the end of an utterance, with what was said before it', () => {
     expect(matchCommand('Book a table for two. Zulu.')).toEqual({ command: 'send', rest: 'Book a table for two.' });
     // The comma before the command goes, and the words keep their period.
@@ -2042,8 +2081,10 @@ function turnsHarness(
     lost: [] as string[],
     noise: 0,
     drops: [] as Array<[string, string]>,
+    lone: [] as Array<{ command: string; segment: number }>,
     cues: [] as CueKind[],
     captions: [] as Array<[number, string, boolean]>,
+    marks: [] as Array<[number, string, boolean, CaptionMark]>,
     countdown: [] as string[],
     holds: [] as boolean[],
     noTurn: 0,
@@ -2064,9 +2105,15 @@ function turnsHarness(
       ended: (facts, outcome, reason) => void out.ended.push([facts, outcome, reason]),
       lost: (reason) => void out.lost.push(reason),
       noise: () => void out.noise++,
-      drop: (reason, text) => void out.drops.push([reason, text]),
+      drop: (reason, text, lone) => {
+        out.drops.push([reason, text]);
+        if (lone) out.lone.push(lone);
+      },
       cue: (kind) => void out.cues.push(kind),
-      caption: (segment, text, final) => void out.captions.push([segment, text, final]),
+      caption: (segment, text, final, mark) => {
+        out.captions.push([segment, text, final]);
+        if (mark) out.marks.push([segment, text, final, mark]);
+      },
       countdown: {
         stopped: (at) => void out.countdown.push(`stopped ${Date.now() - at}`),
         clear: () => void out.countdown.push('clear'),
@@ -2157,6 +2204,12 @@ describe('CallTurns, hands-free', () => {
     await h.interim('Book a table for two. Zulu.');
     expect(h.t.ended).toBe(1);
     expect(h.out.sent).toEqual(['Book a table for two.']);
+    // Each caption says the command it ends in: the interims as heard, the sent final as only its words.
+    expect(h.out.marks).toEqual([
+      [1, 'Book a table for two. Zulu.', false, { command: 'send', words: 'Book a table for two.' }],
+      [1, 'Book a table for two. Zulu.', false, { command: 'send', words: 'Book a table for two.' }],
+      [1, 'Book a table for two.', true, { command: 'send', words: 'Book a table for two.' }],
+    ]);
   });
 
   it('holds a command while the caller still talks; new words make it words', async () => {
@@ -2289,6 +2342,17 @@ describe('CallTurns, hands-free', () => {
     expect(h.out.sent).toHaveLength(1);
     expect(h.out.drops).toEqual([['discarded', 'Remind me to call the plumber. Scratch that.']]);
     expect(h.out.cues).toEqual(['discard']);
+    // No interim showed either command; the finals carry what the worker did with them.
+    expect(h.out.marks).toEqual([
+      [1, 'Скільки буде два плюс три?', true, { command: 'send', words: 'Скільки буде два плюс три?' }],
+      [
+        2,
+        'Remind me to call the plumber. Scratch that.',
+        true,
+        { command: 'discard', words: 'Remind me to call the plumber.' },
+      ],
+    ]);
+    expect(h.out.lone).toEqual([]);
   });
 
   it('a command one interim showed and the next and the final left out still discards at the pause, with no countdown', async () => {
@@ -2338,6 +2402,8 @@ describe('CallTurns, hands-free', () => {
     await h.interim('Zulu.');
     await h.interim('Zulu.');
     expect(h.out.drops).toEqual([['command', 'Zulu.']]);
+    expect(h.out.lone).toEqual([{ command: 'send', segment: 1 }]);
+    expect(h.out.marks.at(-1)).toEqual([1, 'Zulu.', true, { command: 'send', words: '' }]);
     expect(h.out.cues).toEqual(['nope']);
     h.t.results.push(heard('Zulu?', 'Zulu?'));
     await h.talk(800);
@@ -2990,6 +3056,28 @@ describe('commands, cues and review in a call', () => {
     await vi.waitFor(() => expect(utterances(host)).toHaveLength(2));
     await flush();
     expect(played(v)).toEqual(['listening', 'sent', 'turn']);
+    host.endStream();
+  });
+
+  it('a command said alone names itself and its caption line', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.turn('Scratch that.');
+    await vi.waitFor(() =>
+      expect(v.voice.publishDropped).toHaveBeenCalledWith({
+        dropped: 'command',
+        text: 'Scratch that.',
+        command: 'discard',
+        segment: expect.stringMatching(/^SG_turn_\d+$/),
+      }),
+    );
+    const segment = v.voice.publishDropped.mock.calls.at(-1)?.[0].segment as string;
+    expect(v.voice.caption).toHaveBeenCalledWith(Number(segment.slice('SG_turn_'.length)), 'Scratch that.', true, {
+      command: 'discard',
+      words: '',
+    });
     host.endStream();
   });
 

@@ -901,7 +901,22 @@ glued to the hey as in `Heyandy`, and in Cyrillic a Ukrainian vocative ending, a
 in `Гей, Бене` for Ben). The worker
 advertises the commands with the attribute `nanoclaw.voice.commands` = "2" (the
 `zulu` / `copy` vocabulary, which replaced `send it` without a bump; "1" was `over`, and a page offers the commands only to the value it
-knows, so a page left open across an update falls back to pauses) and
+knows, so a page left open across an update falls back to pauses), and announces
+the words themselves, in the same attribute update, as
+`nanoclaw.voice.command-words`: compact JSON of `CALL_COMMAND_WORDS` in the
+protocol module, the one list the worker matches, puts in the transcription's
+vocabulary and announces (`{"v":1,"send":[{"say":"zulu","hint":true},{"say":"copy","ownSentence":true,"hint":true},...],"discard":[{"say":"scratch that","hint":true},...]}`).
+The page and the iOS app quote those words in every hint (the `hint` ones in short
+hints, every send word in the commands block) and keep their own copy only for an
+older worker, and for the page before any worker has named them. They never match
+the words against captions: a caller caption (`lk.transcription`) that ends in a
+command carries the stream attributes `nanoclaw.voice.command` (`send` or
+`discard`) and `nanoclaw.voice.words` (the caption's text before the command, ""
+for a command said alone); an interim's is the command the worker acts on if the
+caller stops now, a final's the one it acted on, and a caption without them clears
+the line's mark. A lone command's line shows no send countdown, and its
+`{"dropped": "command"}` names `"command"` and the caption's `"segment"`
+(`lk.segment_id`), which the page marks "nothing to send" or "nothing to discard". It
 takes the switches in the `nanoclaw.voice.settings` RPC (`{"wake", "pauseSends",
 "cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase", "heard",
 "slept", "cut"}` (`phrase` only with a wake word model, from the start while it loads;

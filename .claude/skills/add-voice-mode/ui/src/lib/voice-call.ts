@@ -1,4 +1,4 @@
-import type { ReviewState, TurnMode } from "./review"
+import type { CaptionCommand, ReviewState, TurnMode } from "./review"
 
 /**
  * The shape of a call as the page renders it, shared by the LiveKit hook and the
@@ -32,6 +32,8 @@ export interface Line {
   preWake?: boolean
   /** A caller line the transcription may still revise: shown dimmed until its final text. */
   interim?: boolean
+  /** The worker's mark from the line's latest caption: it ends in a spoken command. */
+  command?: CaptionCommand
   /** An agent line the worker could not speak: its text, shown instead of heard. */
   unspoken?: boolean
   /** Not a caption: the page's own note, `unheard` when the caller spoke over the agent. */
@@ -56,6 +58,8 @@ export interface TurnMark {
    */
   status: "sending" | "sent" | "lost" | "dropped"
   reason?: "stt" | "rejected" | "rate_limited" | "timeout" | "empty" | "discarded" | "unaddressed" | "command" | "asleep"
+  /** On a `command` drop: which command had nothing to act on. */
+  command?: "send" | "discard"
 }
 
 /** What kind of problem ended a call, so the page can say what to do about it. */

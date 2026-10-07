@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
 import { readConfig, type VoiceUiConfig } from "@/lib/config"
 import { LIVE_PHASES, type ErrorKind, type Line, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
-import { MODE_NAME, autoListening, endsInDiscard, keyIdentity, modeCaption, reviewView, wakePhraseOf, wakeSwitchPhrase, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
+import { MODE_NAME, autoListening, keyIdentity, modeCaption, quoteWords, reviewView, wakePhraseOf, wakeSwitchPhrase, type CommandWords, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
@@ -122,10 +122,10 @@ const LOST_NOTICE: Record<LostReason, string> = {
   timeout: "delivery not confirmed - check the chat before repeating.",
 }
 
-function markLabel(mark: TurnMark, text: string): string {
+function markLabel(mark: TurnMark): string {
   if (mark.status === "sent" || mark.status === "sending") return mark.status
   if (mark.status === "dropped") {
-    if (mark.reason === "command") return endsInDiscard(text) ? "nothing to discard" : "nothing to send"
+    if (mark.reason === "command") return mark.command === "discard" ? "nothing to discard" : "nothing to send"
     if (mark.reason === "asleep") return "went back to sleep"
     return mark.reason === "unaddressed" ? "ignored · no wake phrase" : "discarded"
   }
@@ -404,7 +404,7 @@ const TranscriptLine = memo(function TranscriptLine({
             ) : (
               <span className={`turn-mark wake${!mark && awake ? " awake" : ""}`}>{mark ? "heard" : awake ? "heard - listening" : "heard"}</span>
             ))}
-          {mark && <span className={`turn-mark ${mark.status}${mark.reason ? ` ${mark.reason}` : ""}`}>{markLabel(mark, text)}</span>}
+          {mark && <span className={`turn-mark ${mark.status}${mark.reason ? ` ${mark.reason}` : ""}`}>{markLabel(mark)}</span>}
           {unspoken && <span className="turn-mark lost">reply not spoken</span>}
           {preWake && <span className="turn-mark dropped">words before the wake phrase ignored</span>}
         </span>
@@ -465,6 +465,7 @@ function Switch({ label, on, disabled, describedBy, onClick }: { label: React.Re
 /** Auto mode's spoken commands: what they are, the wake switch, and with it the pause switch. */
 function CommandsBlock({
   phrase,
+  words,
   wake,
   pauseSends,
   disabled,
@@ -473,6 +474,7 @@ function CommandsBlock({
 }: {
   /** Null until the line info names it. */
   phrase: string | null
+  words: CommandWords
   wake: boolean
   pauseSends: boolean
   disabled: boolean
@@ -485,7 +487,9 @@ function CommandsBlock({
         <span id="cmds-title" className="cmds-title">
           Voice commands
         </span>
-        <span className="cmds-explain">Say "zulu", "copy" or "прийом" to send now, "scratch that" to drop it.</span>
+        <span className="cmds-explain">
+          Say {quoteWords(words.send, true)} to send now{words.discard.length ? `, ${quoteWords(words.discard)} to drop it` : ""}.
+        </span>
       </p>
       <div className={`cmds-switches${wake ? " two" : ""}`}>
         <Switch
@@ -497,9 +501,9 @@ function CommandsBlock({
         />
         {wake && <Switch label="A pause also sends" on={pauseSends} disabled={disabled} describedBy="pause-sends-desc" onClick={() => onPauseSends(!pauseSends)} />}
       </div>
-      <span id="wake-desc" className="sr-only">{`Nothing is sent until you say ${phrase ?? "the wake phrase"}; then say zulu or copy to send.`}</span>
+      <span id="wake-desc" className="sr-only">{`Nothing is sent until you say ${phrase ?? "the wake phrase"}; then say ${quoteWords(words.send)} to send.`}</span>
       <span id="pause-sends-desc" className="sr-only">
-        After the wake phrase a pause sends too, not only zulu or copy.
+        After the wake phrase a pause sends too, not only {quoteWords(words.send)}.
       </span>
     </section>
   )
@@ -513,6 +517,7 @@ function ModeRow({
   disabled,
   commands,
   wake,
+  words,
   note,
   onPick,
 }: {
@@ -522,6 +527,7 @@ function ModeRow({
   disabled: boolean
   commands: boolean
   wake: { on: boolean; pauseSends: boolean }
+  words: CommandWords
   note: string | null
   onPick: (mode: TurnMode) => void
 }) {
@@ -548,12 +554,12 @@ function ModeRow({
       </div>
       {(["auto", "review"] as const).map((m) => (
         <span key={m} id={`mode-${m}-desc`} className="sr-only">
-          {modeCaption(m, commands, wake)}
+          {modeCaption(m, commands, wake, words)}
         </span>
       ))}
       {/* The selected radio already carries this as its description. */}
       <p className="mode-caption" aria-hidden="true">
-        {modeCaption(pendingTo ?? mode, commands, wake)}
+        {modeCaption(pendingTo ?? mode, commands, wake, words)}
       </p>
       {note && (
         <p className="mode-note" role="status">
@@ -903,6 +909,7 @@ export default function App() {
       disabled={phase === "connecting" || (rv ? rv.modeDisabled : !!rc.state.pending || reconnecting)}
       commands={rc.state.commands}
       wake={{ on: rc.state.wake, pauseSends: rc.state.pauseSends }}
+      words={rc.state.words}
       note={rv?.panel ? null : rc.state.note}
       onPick={rc.setMode}
     />
@@ -910,6 +917,7 @@ export default function App() {
   const commandsBlock = rc && rc.state.mode === "auto" && !rv && rc.state.commands && (
     <CommandsBlock
       phrase={wakeSwitchPhrase(rc.state, agentName, PLACEHOLDER_AGENT)}
+      words={rc.state.words}
       wake={rc.state.wake}
       pauseSends={rc.state.pauseSends}
       disabled={phase === "connecting" || reconnecting || !!rc.state.pending}

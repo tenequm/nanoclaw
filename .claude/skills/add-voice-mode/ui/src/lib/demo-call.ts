@@ -296,7 +296,9 @@ export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stop
       phaseRef.current = step.phase
       setPhase(step.phase)
       if (step.text && step.from) {
-        const extra: Partial<Line> = step.command ? { mark: { status: "dropped", reason: "command" } } : { ...(step.wakeHeard ? { wake: true } : {}), ...(step.preWake ? { preWake: true } : {}) }
+        const extra: Partial<Line> = step.command
+          ? { command: { command: "send", words: "" }, mark: { status: "dropped", reason: "command", command: "send" } }
+          : { ...(step.wakeHeard ? { wake: true } : {}), ...(step.preWake ? { preWake: true } : {}) }
         streamLine(step.from, step.text, step.ms, step.re, instant || !!step.command, extra)
       }
       if (step.wakeHeard) setReview((r) => ({ ...r, wakeHeard: r.wakeHeard + 1 }))
