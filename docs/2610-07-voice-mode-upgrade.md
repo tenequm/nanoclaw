@@ -71,8 +71,9 @@ The build adds a separate page listener on `127.0.0.1:3100` (`VOICE_MODE_PORT`,
 fronts still work on `WEBHOOK_PORT`. Do not move a working front during the
 compatibility upgrade. An install whose front already forwards `/voice` to the
 webhook port does not need the listener: set `VOICE_MODE_PORT=off`.
-`LIVEKIT_HOST_URL` must be a local http(s) origin (`localhost`, `127.0.0.1` or
-`[::1]`); the worker refuses to start with anything else. A configured
+`LIVEKIT_HOST_URL` must be a local plain-http origin (`localhost`, `127.0.0.1`
+or `[::1]`); the worker refuses to start with anything else. Point it directly
+at the webhook port, never through a proxy. A configured
 custom wake model remains operator-owned at its current path; preserve its
 phrase, threshold and vocabulary. The bundled assets moved from
 `assets/voice-wakeword` to `assets/voice-mode-wakeword`: update a setting that

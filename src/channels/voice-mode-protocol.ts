@@ -441,8 +441,10 @@ export function liveKitCallSecret(apiSecret: string, callId: string): string {
 /**
  * Where the worker reaches the host's webhook server; only ever from the worker's own settings. The
  * host answers the worker's routes for loopback peers only, and every request carries the call's
- * bearer secret and the caller's words, so anything but a local HTTP(S) origin is a
- * misconfiguration and throws. The error names the scheme and host only, never credentials.
+ * bearer secret and the caller's words, so anything but a local HTTP origin is a misconfiguration
+ * and throws. The webhook server speaks plain HTTP: an https origin means a TLS proxy in between,
+ * whose X-Forwarded-For the worker routes refuse. The error names the scheme and host only, never
+ * credentials.
  */
 export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: string }): string {
   const raw = (env.LIVEKIT_HOST_URL || `http://127.0.0.1:${env.WEBHOOK_PORT || '3000'}`).replace(/\/+$/, '');
@@ -454,7 +456,7 @@ export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: 
   }
   const local =
     url !== null &&
-    /^https?:$/.test(url.protocol) &&
+    url.protocol === 'http:' &&
     /^(localhost|127\.0\.0\.1|\[::1\])$/.test(url.hostname) &&
     !url.username &&
     !url.password;
@@ -463,7 +465,7 @@ export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: 
       ? `${url.protocol}//${url.host}${url.username || url.password ? ' with credentials' : ''}`
       : 'no URL';
     throw new Error(
-      `LIVEKIT_HOST_URL must be a local http(s) address such as http://127.0.0.1:3000 (got ${got}): the host serves the worker on loopback only`,
+      `LIVEKIT_HOST_URL must be a local http address such as http://127.0.0.1:3000 (got ${got}): point it directly at the host's webhook port, never through a proxy`,
     );
   }
   return raw;

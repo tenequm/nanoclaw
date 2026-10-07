@@ -302,10 +302,12 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 
 `LIVEKIT_WORKER_URL` selects the worker/API-side LiveKit URL; default is
 `LIVEKIT_URL`. `LIVEKIT_HOST_URL` is the worker's loopback host webhook origin;
-by default it uses `WEBHOOK_PORT` or port 3000. Only a local http(s) origin
+by default it uses `WEBHOOK_PORT` or port 3000. Only a local plain-http origin
 (`localhost`, `127.0.0.1`, `[::1]`) is accepted: the worker exits at start and
-ends a call cleanly otherwise, since every request carries call secrets. `LIVEKIT_AGENT_NAME` must match
-on host and worker; default is `nanoclaw-voice-mode`.
+ends a call cleanly otherwise, since every request carries call secrets. Point
+`LIVEKIT_HOST_URL` directly at the webhook port, never through a proxy.
+`LIVEKIT_AGENT_NAME` must match on host and worker; default is
+`nanoclaw-voice-mode`.
 
 The vocabulary file is bounded and rejects symlinks/FIFOs. Keep names only:
 60 terms and 1024 bytes total, at most 80 characters per term. Its entries
