@@ -1,4 +1,3 @@
-import { handleVoiceModeRoot } from './channels/voice-mode-integration.js';
 /**
  * Minimal HTTP server for Chat SDK adapter webhooks.
  *
@@ -18,6 +17,7 @@ import type { Chat } from 'chat';
 
 import { getWebhookPort } from './config.js';
 import { log } from './log.js';
+import { handleVoiceModeRoot } from './channels/voice-mode-integration.js';
 
 interface WebhookEntry {
   chat: Chat;

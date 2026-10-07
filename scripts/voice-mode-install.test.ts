@@ -1,10 +1,10 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import ts from 'typescript';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { installVoiceModeCore, voiceModeService } from './voice-mode-install.js';
+import { installVoiceModeCore, manageService, voiceModeService, type ServiceHost } from './voice-mode-install.js';
 
 const coreFiles = [
   'src/channels/index.ts',
@@ -14,24 +14,53 @@ const coreFiles = [
   'package.json',
 ];
 
+/** A temporary root holding this checkout's core files. */
+function coreCopy(): { root: string; snapshot(): string[] } {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'voice-mode-footprint-'));
+  for (const file of coreFiles) {
+    mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+    writeFileSync(path.join(root, file), readFileSync(file));
+  }
+  return { root, snapshot: () => coreFiles.map((file) => readFileSync(path.join(root, file), 'utf8')) };
+}
+
 describe('voice-mode core footprint', () => {
-  it('applies twice, removes twice and preserves the rest of core', () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), 'voice-mode-footprint-'));
+  it('applies exactly the installed core files, twice, and removes back to core without a voice-mode trace', () => {
+    const { root, snapshot } = coreCopy();
     try {
-      for (const file of coreFiles) {
-        mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
-        writeFileSync(path.join(root, file), readFileSync(file));
-      }
+      const installed = snapshot();
       installVoiceModeCore(root, true);
-      const snapshot = () => coreFiles.map((file) => readFileSync(path.join(root, file), 'utf8'));
       const before = snapshot();
+      for (const text of before.slice(0, -1)) expect(text).not.toMatch(/voice-?mode/i);
+      // An import goes below the file's doc header, never above it.
+      for (const [i, text] of before.entries()) expect(installed[i].split('\n')[0]).toBe(text.split('\n')[0]);
       installVoiceModeCore(root);
-      const applied = snapshot();
+      expect(snapshot()).toEqual(installed);
       installVoiceModeCore(root);
-      expect(snapshot()).toEqual(applied);
+      expect(snapshot()).toEqual(installed);
       installVoiceModeCore(root, true);
       installVoiceModeCore(root, true);
       expect(snapshot()).toEqual(before);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves an export of the router function that core already had', () => {
+    const { root, snapshot } = coreCopy();
+    try {
+      installVoiceModeCore(root, true);
+      const router = path.join(root, 'src/router.ts');
+      const exported = readFileSync(router, 'utf8').replace(
+        'async function deliverToAgent(',
+        'export async function deliverToAgent(',
+      );
+      writeFileSync(router, exported);
+      const before = snapshot();
+      installVoiceModeCore(root);
+      installVoiceModeCore(root, true);
+      expect(snapshot()).toEqual(before);
+      expect(readFileSync(router, 'utf8')).toContain('export async function deliverToAgent(');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -93,6 +122,8 @@ describe('voice-mode core footprint', () => {
 });
 
 describe('voice-mode worker service footprint', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
   it.each(['linux', 'darwin'])(
     'scopes %s to the install, quotes paths and keeps credentials out of the unit',
     (platform) => {
@@ -101,11 +132,84 @@ describe('voice-mode worker service footprint', () => {
       expect(first.file).not.toBe(second.file);
       expect(first.name).toContain('voice-mode-worker');
       expect(first.content).toContain('dist/channels/voice-mode-worker.js');
-      expect(first.content).not.toMatch(/Environment(File|Variables)?/);
+      expect(first.content).not.toMatch(/EnvironmentFile|Environment=|KEY|SECRET/);
       if (platform === 'linux') expect(first.content).toContain('ExecStart="/tmp/node & tools/node"');
-      else expect(first.content).toContain('<string>/tmp/node &amp; tools/node</string>');
+      else {
+        expect(first.content).toContain('<string>/tmp/node &amp; tools/node</string>');
+        // launchd's default PATH has no Homebrew, where ffmpeg for the typing sound usually is; nothing else is set.
+        expect(first.content).toMatch(
+          /<key>EnvironmentVariables<\/key><dict><key>PATH<\/key><string>\/opt\/homebrew\/bin:[^<]*<\/string><\/dict>/,
+        );
+      }
     },
   );
+
+  it("follows the host's install identity, under a name setup's peer cleanup does not take for a host", () => {
+    vi.stubEnv('NANOCLAW_INSTALL_ID', 'casa');
+    const linux = voiceModeService('/tmp/a', 'linux', '/tmp/home', 'node');
+    const darwin = voiceModeService('/tmp/a', 'darwin', '/tmp/home', 'node');
+    expect(linux.name).toBe('voice-mode-worker-nanoclaw-v2-casa.service');
+    expect(darwin.name).toBe('voice-mode-worker.com.nanoclaw-v2-casa');
+    // setup/peer-cleanup.ts probes these as other NanoClaw hosts.
+    expect(path.basename(linux.file)).not.toMatch(/^nanoclaw.*\.service$/);
+    expect(path.basename(darwin.file)).not.toMatch(/^com\.nanoclaw.*\.plist$/);
+  });
+
+  describe('installing the service', () => {
+    let root: string;
+    let home: string;
+    const fakeHost = (platform: string, printed: number[]) => {
+      const calls: string[] = [];
+      const host: ServiceHost = {
+        platform,
+        home,
+        node: '/usr/bin/node',
+        uid: 501,
+        run(command, args) {
+          calls.push(`${command} ${args[0] === '--user' ? args[1] : args[0]}`);
+          return command === 'launchctl' && args[0] === 'print' ? (printed.shift() ?? 113) : 0;
+        },
+        sleep: () => undefined,
+      };
+      return { host, calls };
+    };
+    beforeEach(() => {
+      root = mkdtempSync(path.join(os.tmpdir(), 'voice-mode-service-'));
+      home = mkdtempSync(path.join(os.tmpdir(), 'voice-mode-home-'));
+    });
+    afterEach(() => {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    });
+
+    it('refuses before a build exists', () => {
+      const { host, calls } = fakeHost('linux', []);
+      expect(() => manageService(root, false, host)).toThrow('voice-mode-worker.js is missing');
+      expect(calls).toEqual([]);
+    });
+
+    it('waits on macOS until launchd let the old worker go before it bootstraps the new one', () => {
+      mkdirSync(path.join(root, 'dist/channels'), { recursive: true });
+      writeFileSync(path.join(root, 'dist/channels/voice-mode-worker.js'), '');
+      const first = fakeHost('darwin', []);
+      manageService(root, false, first.host);
+      expect(first.calls).toEqual(['launchctl bootstrap']);
+      // Reapply: the old one is loaded, and launchd still reports it once after bootout.
+      const again = fakeHost('darwin', [0, 0, 113]);
+      manageService(root, false, again.host);
+      expect(again.calls).toEqual([
+        'launchctl print',
+        'launchctl bootout',
+        'launchctl print',
+        'launchctl print',
+        'launchctl bootstrap',
+      ]);
+      const gone = fakeHost('darwin', [113]);
+      manageService(root, true, gone.host);
+      expect(gone.calls).toEqual(['launchctl print']);
+      expect(existsSync(voiceModeService(root, 'darwin', home, 'node').file)).toBe(false);
+    });
+  });
 });
 
 it('preserves other guidance and implicit lists when adding and retiring the voice skill', async () => {

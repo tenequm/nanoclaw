@@ -1,4 +1,3 @@
-import { presentVoiceModeOutbound } from './channels/voice-mode-integration.js';
 /**
  * Poll outbound mailboxes and deliver undelivered messages through channel adapters.
  * SQLite reads runner-owned outbound state read-only and records delivery in
@@ -38,6 +37,7 @@ import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typ
 import type { OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
 import type { OutboundMessage } from './mailbox/index.js';
+import { presentVoiceModeOutbound } from './channels/voice-mode-integration.js';
 
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
