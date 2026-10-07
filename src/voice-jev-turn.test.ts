@@ -25,6 +25,7 @@ import {
   loadJevTurnConfig,
   resetJevTurnConfigCache,
   takeDailyJudgement,
+  type DailyTake,
   type JevTurnConfig,
   type JudgeOptions,
   type TurnJudgement,
@@ -178,9 +179,7 @@ describe('config and the daily cap', () => {
 });
 
 /** A shadow on fake timers with a scripted judge. */
-function shadowHarness(
-  o: { config?: Partial<JevTurnConfig>; daily?: boolean | 'failed'; answer?: TurnJudgement } = {},
-) {
+function shadowHarness(o: { config?: Partial<JevTurnConfig>; daily?: DailyTake; answer?: TurnJudgement } = {}) {
   vi.useFakeTimers();
   const lines: string[] = [];
   const asked: string[] = [];
@@ -191,7 +190,7 @@ function shadowHarness(
     callId: 'c1',
     log: (line) => void lines.push(line),
     config: () => config,
-    takeDaily: () => (o.daily === false ? 'capped' : (o.daily ?? 'taken')),
+    takeDaily: () => o.daily ?? 'taken',
     judge: (text) => {
       asked.push(text);
       if (auto) return Promise.resolve(o.answer ?? { finished: 0.9, trailing: 0.1, ms: 50 });
@@ -271,7 +270,7 @@ describe('JevTurnShadow trigger', () => {
     expect(h.lines.filter((l) => l.startsWith('voice.turn-end jev capped'))).toEqual([
       'voice.turn-end jev capped call=c1 scope=call limit=1',
     ]);
-    const day = shadowHarness({ daily: false });
+    const day = shadowHarness({ daily: 'capped' });
     day.shadow.interim(1, 'book a table');
     await day.wait(1200);
     expect(day.asked).toEqual([]);
