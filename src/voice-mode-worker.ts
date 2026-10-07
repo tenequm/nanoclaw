@@ -3734,7 +3734,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const callFields = { callId: header.callId };
   const telemetry = new CallTelemetry({ info: (msg, fields) => log.info(msg, { ...callFields, ...fields }) });
   /** The host, once its URL is known; before that there is no one to tell. */
-  let link: HostLink | undefined;
+  let link: HostLink | undefined = undefined;
   /** Ends the call from this side: the host hears why when there is one to tell, then the room goes. */
   const abandon = async (reason: string, fields: Record<string, unknown> = {}): Promise<void> => {
     log.warn('voice-mode worker: ending the call', { ...callFields, ...fields, reason });
