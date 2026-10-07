@@ -16,7 +16,6 @@
  * 403 before any room is created. The page is at `/voice?t=<token>` behind a
  * loopback front (or a trusted reverse proxy) that terminates TLS.
  */
-import { createHash } from 'node:crypto';
 import http from 'node:http';
 import net from 'node:net';
 
@@ -28,6 +27,7 @@ import {
   LEGACY_VOICE_CHANNEL,
   linePlatformId,
   resolveVoiceModeLine,
+  VOICE_MODE_CHANNEL,
   type ResolveLineOptions,
   type VoiceModeLine,
 } from './voice-mode-line.js';
@@ -44,7 +44,7 @@ import {
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
-import { findVoiceModeLineByToken } from '../db/voice-mode-lines.js';
+import { findVoiceModeLineByToken, hashLinkToken } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn, type VoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand } from './voice-mode-command.js';
 import { readEnvFile } from '../env.js';
@@ -53,7 +53,7 @@ import { requestWake } from '../request-wake.js';
 import type { Session } from '../types.js';
 import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
 
-export const CHANNEL_TYPE = 'voice-mode';
+export const CHANNEL_TYPE = VOICE_MODE_CHANNEL;
 const MINUTE_MS = 60_000;
 /** How often a running call rechecks that its caller may still use the line. */
 const ACCESS_CHECK_INTERVAL_MS = 5000;
@@ -129,7 +129,7 @@ export function admitsVoiceModePeer(
 ): boolean {
   const trusted = policy.trustedProxies.has(peer);
   if (isLoopbackAddress(peer) && !(trusted && policy.allowedClients.configured)) return true;
-  if (!policy.trustedProxies.has(peer)) return false;
+  if (!trusted) return false;
   if (!policy.allowedClients.configured) return true;
   const hops = [forwardedFor ?? []]
     .flat()
@@ -257,12 +257,12 @@ export async function findCallSession(
  * show; the token itself stays in the adapter's allow-list and the call link.
  */
 export function lineIdForToken(token: string): string {
-  return `${CHANNEL_TYPE}:${createHash('sha256').update(token).digest('hex').slice(0, 12)}`;
+  return linePlatformId(hashLinkToken(token).slice(0, 12));
 }
 
 /** The id the same token's line had before the voice-mode rename: `voice:` + the same hash. */
 export function legacyLineIdForToken(token: string): string {
-  return `${LEGACY_VOICE_CHANNEL}:${createHash('sha256').update(token).digest('hex').slice(0, 12)}`;
+  return `${LEGACY_VOICE_CHANNEL}:${hashLinkToken(token).slice(0, 12)}`;
 }
 
 /** The voice adapter, plus the call link of one of its lines for the `/voice` command. */
@@ -290,9 +290,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       if (!legacy) return null;
       return (await getMessagingGroupByPlatform(LEGACY_VOICE_CHANNEL, legacy, LEGACY_VOICE_CHANNEL)) ? legacy : null;
     });
+  const callUrl = (token: string): string =>
+    `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}`;
   const callLink = (platformId: string): string | null => {
     const token = [...legacyLines].find(([, id]) => id === platformId)?.[0];
-    return token ? `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}` : null;
+    return token ? callUrl(token) : null;
   };
   const proxyPolicy: VoiceModeProxyPolicy = {
     trustedProxies: parseCidrs(config.trustedProxyCidrs, 'VOICE_MODE_TRUSTED_PROXY_CIDRS'),
@@ -301,7 +303,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
   const resolveLine =
     config.resolveLine ??
     ((platformId: string, options?: ResolveLineOptions) =>
-      resolveVoiceModeLine(platformId, undefined, { vocabulary: config.vocabulary, ...options }));
+      resolveVoiceModeLine(platformId, { vocabulary: config.vocabulary, ...options }));
   const now = config.now ?? (() => Date.now());
   const expediteReplies =
     config.expediteReplies ?? ((session: Session) => expediteDelivery(session, CALL_REPLY_EXPEDITE_MS));
@@ -490,16 +492,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     supportsThreads: false,
     defaults: VOICE_MODE_DEFAULTS,
 
-    callUrl(token: string): string {
-      return `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}`;
-    },
-    handleVoiceCommand(event: InboundEvent): Promise<boolean> {
-      return handleVoiceCommand(
-        event,
-        (token) => `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}`,
-        callLink,
-      );
-    },
+    callUrl,
+    handleVoiceCommand: (event: InboundEvent): Promise<boolean> => handleVoiceCommand(event, callUrl, callLink),
     callLink,
 
     async setup(cfg: ChannelSetup): Promise<void> {
@@ -539,7 +533,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       }
       connected = true;
       log.info('voice-mode: ready', {
-        callUrl: `${config.publicUrl.replace(/\/+$/, '')}/voice?t=<link token>`,
+        callUrl: `${callUrl('')}<link token>`,
         trustedProxies: config.trustedProxyCidrs?.trim() || 'none',
         lines: legacyLines.size,
         livekit: config.livekit.url,

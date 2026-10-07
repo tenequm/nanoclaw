@@ -80,43 +80,51 @@ export interface ResolveLineOptions {
   vocabulary?: string;
 }
 
+/** The resolved line, with the agent's vocabulary file read only for a call's setup. */
+function buildLine(
+  caller: VoiceModeCaller,
+  group: { id: string; name: string; folder: string },
+  options: ResolveLineOptions,
+  linkHash?: string,
+): VoiceModeLine {
+  // The persona reader's bounded, symlink- and FIFO-safe read: the file is agent-writable.
+  const fileText = options.forCall
+    ? readGroupPersona(path.join(GROUPS_DIR, group.folder), VOICE_MODE_VOCABULARY_FILE)
+    : null;
+  const vocabulary = options.forCall ? voiceModeVocabulary(options.vocabulary, fileText) : undefined;
+  const wakeNames = fileText ? voiceModeVocabulary(undefined, fileText) : undefined;
+  return {
+    caller,
+    agentGroupId: group.id,
+    agent: {
+      name: group.name,
+      ...(vocabulary?.length ? { vocabulary } : {}),
+      ...(wakeNames?.length ? { wakeNames } : {}),
+    },
+    ...(linkHash ? { linkHash } : {}),
+  };
+}
+
 /** Resolve a named personal line and its explicit access before reading the agent's files. */
 export async function resolveVoiceModeLine(
   platformId: string,
-  instance?: string | ResolveLineOptions,
   options: ResolveLineOptions = {},
 ): Promise<VoiceModeLine | null> {
-  if (typeof instance === 'object') {
-    options = instance;
-    instance = undefined;
-  }
   try {
-    const line = platformId.startsWith('voice-mode:') ? await getVoiceModeLine(platformId.slice(11)) : undefined;
+    const lineId = lineIdOf(platformId);
+    const line = lineId ? await getVoiceModeLine(lineId) : undefined;
     if (line) {
       if (!(await hasAdminPrivilege(line.owner_user_id, line.agent_group_id))) return null;
       const [caller, group] = await Promise.all([getUser(line.owner_user_id), getAgentGroup(line.agent_group_id)]);
       if (!caller || !group) return null;
-      const fileText = options.forCall
-        ? readGroupPersona(path.join(GROUPS_DIR, group.folder), VOICE_MODE_VOCABULARY_FILE)
-        : null;
-      const vocabulary = options.forCall ? voiceModeVocabulary(options.vocabulary, fileText) : undefined;
-      const wakeNames = fileText ? voiceModeVocabulary(undefined, fileText) : undefined;
-      return {
-        caller: { id: caller.id, name: caller.display_name?.trim() || caller.id },
-        agentGroupId: group.id,
-        agent: {
-          name: group.name,
-          ...(vocabulary?.length ? { vocabulary } : {}),
-          ...(wakeNames?.length ? { wakeNames } : {}),
-        },
-        linkHash: line.token_hash,
-      };
+      const name = caller.display_name?.trim() || caller.id;
+      return buildLine({ id: caller.id, name }, group, options, line.token_hash);
     }
     // Every other line is a hashed-token row (above); only a line from before the rename resolves here.
     if (lineChannelType(platformId) !== LEGACY_VOICE_CHANNEL) return null;
     const caller = await getUser(platformId);
     if (!caller || caller.kind !== LEGACY_VOICE_CHANNEL || !caller.display_name?.trim()) return null;
-    const mg = await getMessagingGroupByPlatform(LEGACY_VOICE_CHANNEL, platformId, instance);
+    const mg = await getMessagingGroupByPlatform(LEGACY_VOICE_CHANNEL, platformId);
     if (!mg || mg.is_group || mg.unknown_sender_policy !== 'strict') return null;
     const wirings = await getMessagingGroupAgents(mg.id);
     if (wirings.length !== 1 || wirings[0].sender_scope !== 'known') return null;
@@ -126,32 +134,26 @@ export async function resolveVoiceModeLine(
     if (!(await canAccessAgentGroup(caller.id, groupId)).allowed) return null;
     const group = await getAgentGroup(groupId);
     if (!group) return null;
-    // The persona reader's bounded, symlink- and FIFO-safe read: the file is agent-writable.
-    const fileText = options.forCall
-      ? readGroupPersona(path.join(GROUPS_DIR, group.folder), VOICE_MODE_VOCABULARY_FILE)
-      : null;
-    const vocabulary = options.forCall ? voiceModeVocabulary(options.vocabulary, fileText) : undefined;
-    const wakeNames = fileText ? voiceModeVocabulary(undefined, fileText) : undefined;
-    return {
-      caller: { id: caller.id, name: caller.display_name.trim() },
-      agentGroupId: group.id,
-      agent: {
-        name: group.name,
-        ...(vocabulary?.length ? { vocabulary } : {}),
-        ...(wakeNames?.length ? { wakeNames } : {}),
-      },
-    };
+    return buildLine({ id: caller.id, name: caller.display_name.trim() }, group, options);
   } catch (err) {
     log.warn('voice-mode: could not authorize the voice line', { platformId, err });
     return null;
   }
 }
 
-export const linePlatformId = (lineId: string): string => `voice-mode:${lineId}`;
+/** The channel of every line /voice makes, and the prefix of their platform ids. */
+export const VOICE_MODE_CHANNEL = 'voice-mode';
+
+/** The platform id of the voice_mode_lines row `lineId`: `voice-mode:<line id>`. */
+export const linePlatformId = (lineId: string): string => `${VOICE_MODE_CHANNEL}:${lineId}`;
+
+/** The voice_mode_lines id a platform id names, or null for any other id (a legacy line's, say). */
+export const lineIdOf = (platformId: string): string | null =>
+  platformId.startsWith(`${VOICE_MODE_CHANNEL}:`) ? platformId.slice(VOICE_MODE_CHANNEL.length + 1) : null;
 
 /** Lines made before the voice-mode rename keep their `voice` rows and `voice:<hash>` ids, so saved links still reach them. */
 export const LEGACY_VOICE_CHANNEL = 'voice';
 
 /** The channel a line's own chat is on, by the line's platform id. */
 export const lineChannelType = (platformId: string): string =>
-  platformId.startsWith(`${LEGACY_VOICE_CHANNEL}:`) ? LEGACY_VOICE_CHANNEL : 'voice-mode';
+  platformId.startsWith(`${LEGACY_VOICE_CHANNEL}:`) ? LEGACY_VOICE_CHANNEL : VOICE_MODE_CHANNEL;

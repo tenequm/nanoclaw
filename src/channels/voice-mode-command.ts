@@ -32,6 +32,7 @@ import { ensureUserDm } from '../modules/permissions/user-dm.js';
 import { registerMessageInterceptor } from '../router.js';
 import type { MessagingGroup } from '../types.js';
 import type { VoiceModeChannelAdapter } from './voice-mode.js';
+import { VOICE_MODE_CHANNEL } from './voice-mode-line.js';
 
 /** Channels whose client intercepts `/`: the command is typed `!voice` there. */
 const BANG_CHANNELS = new Set(['slack']);
@@ -42,7 +43,7 @@ export type CallUrlFn = (token: string) => string;
 /** A legacy line's saved call link by its platform id; null when this host holds no token for it. */
 export type CallLinkFn = (platformId: string) => string | null;
 
-const liveAdapter = () => getChannelAdapterExact('voice-mode') as VoiceModeChannelAdapter | undefined;
+const liveAdapter = () => getChannelAdapterExact(VOICE_MODE_CHANNEL) as VoiceModeChannelAdapter | undefined;
 
 /** The live voice-mode adapter's page URLs (it knows the public origin), or null when the channel is not running. */
 function liveCallUrl(): CallUrlFn | null {

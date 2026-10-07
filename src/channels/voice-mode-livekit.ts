@@ -49,6 +49,7 @@ import type { VoiceModeTurn } from './voice-mode-route.js';
 import {
   LEGACY_VOICE_CHANNEL,
   lineChannelType,
+  lineIdOf,
   sameCallerAndAgent,
   type ResolveLineOptions,
   type VoiceModeLine,
@@ -390,7 +391,8 @@ const defaultMirrorApi: MirrorApi = {
   groupsFor: (agentGroupId) => getMessagingGroupsByAgentGroup(agentGroupId),
   adapter: (key) => getChannelAdapterExact(key),
   async boundChat(lineId) {
-    const current = await getVoiceModeLine(lineId.replace(/^voice-mode:/, ''));
+    const id = lineIdOf(lineId);
+    const current = id ? await getVoiceModeLine(id) : undefined;
     if (current) {
       const group = current.messaging_group_id && (await getMessagingGroup(current.messaging_group_id));
       return group ? { group, threadId: current.thread_id, ownerIds: [current.owner_user_id] } : null;

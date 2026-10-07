@@ -9,7 +9,7 @@
  * run produced. No foreign keys into core tables: a line whose chat was deleted, unwired or denied
  * is ignored by its reader (src/channels/voice-mode-livekit.ts), never an integrity error.
  */
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import { getDb } from './connection.js';
 import { registerMigration } from './migrations/index.js';
@@ -82,10 +82,7 @@ export async function bindVoiceModeLineChat(target: {
 /** The line a call-link token opens, or undefined. Only hashes are compared: the token is stored nowhere. */
 export async function findVoiceModeLineByToken(token: string): Promise<VoiceModeLine | undefined> {
   if (!/^[0-9a-f]{32}$/.test(token)) return undefined;
-  const hash = hashLinkToken(token);
-  const row = await getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE token_hash = ?', hash);
-  // The row was found by an equal hash; the constant-time check keeps the comparison explicit.
-  return row && timingSafeEqual(Buffer.from(row.token_hash, 'hex'), Buffer.from(hash, 'hex')) ? row : undefined;
+  return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE token_hash = ?', hashLinkToken(token));
 }
 
 /** Who a minted link is for and where its calls talk. */

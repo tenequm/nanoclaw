@@ -17,6 +17,7 @@ import {
   PAGE_CLOSED,
   errorText,
   levelsFromStats,
+  matchesClientProtocol,
   micErrorKind,
   micErrorText,
   statusErrorKind,
@@ -28,7 +29,6 @@ import {
   type VoiceModeCall,
 } from "./voice-call"
 import { COMMANDS_VERSIONS, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, captionCommand, reopensMic, infoWakePhrase, isLoneCommand, isReviewSnapshot, lineWords, norm, parseCommandWords, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
-import { matchesClientProtocol } from "./voice-call"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**

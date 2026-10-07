@@ -238,6 +238,7 @@ async function startHarness(
       mirrorApi: fakeMirror([]).api,
       ...lkOverrides,
     },
+    // The LiveKit engine routes here; a turn on the voice line is recorded as the message it carries.
     routeTurn: async ({ onStored, ...event }) => {
       if (event.channelType !== 'voice') events.push(event);
       else inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
@@ -263,7 +264,6 @@ async function startHarness(
     onInboundEvent: (event) => {
       events.push(event);
     },
-    // The LiveKit engine routes here; a turn on the voice line is recorded as the message it carries.
     onMetadata: () => {},
     onAction: () => {},
   });
@@ -385,6 +385,45 @@ async function startCall(h: Harness): Promise<{ call: TokenResponse; worker: Fak
 
 const settle = () => new Promise((r) => setTimeout(r, 30));
 
+/** LINE as main left it in a test DB: its named voice user, a member of Andy, and its strict known-sender chat. */
+async function seedLegacyLine(): Promise<void> {
+  const { createAgentGroup, createMessagingGroup, createMessagingGroupAgent } = await import('../db/index.js');
+  const { createUser } = await import('../modules/permissions/db/users.js');
+  const { addMember } = await import('../modules/permissions/db/agent-group-members.js');
+  const stamp = new Date().toISOString();
+  await createAgentGroup({
+    id: 'ag-andy',
+    name: 'Andy',
+    folder: 'legacy-fixture',
+    agent_provider: null,
+    created_at: stamp,
+  });
+  await createUser({ id: LINE, kind: 'voice', display_name: 'Caller', created_at: stamp });
+  await addMember({ user_id: LINE, agent_group_id: 'ag-andy', added_by: null, added_at: stamp });
+  await createMessagingGroup({
+    id: 'saved-line',
+    channel_type: 'voice',
+    platform_id: LINE,
+    instance: 'voice',
+    name: null,
+    is_group: 0,
+    unknown_sender_policy: 'strict',
+    created_at: stamp,
+  });
+  await createMessagingGroupAgent({
+    id: 'saved-wire',
+    messaging_group_id: 'saved-line',
+    agent_group_id: 'ag-andy',
+    session_mode: 'shared',
+    sender_scope: 'known',
+    engage_mode: 'pattern',
+    engage_pattern: '.',
+    ignored_message_policy: 'drop',
+    priority: 0,
+    created_at: stamp,
+  });
+}
+
 /** One raw HTTP request, for request lines `fetch` would never send; resolves what the server answered. */
 function rawRequest(port: number, request: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -419,45 +458,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('keeps a saved main token working through the real legacy line and membership rows', async () => {
     await h.stop();
-    const { initTestDb, runMigrations, closeDb, createAgentGroup, createMessagingGroup, createMessagingGroupAgent } =
-      await import('../db/index.js');
-    const { createUser } = await import('../modules/permissions/db/users.js');
-    const { addMember } = await import('../modules/permissions/db/agent-group-members.js');
-    const legacy = LINE;
-    const stamp = new Date().toISOString();
+    const { initTestDb, runMigrations, closeDb } = await import('../db/index.js');
     await runMigrations(await initTestDb());
     try {
-      await createAgentGroup({
-        id: 'ag-andy',
-        name: 'Andy',
-        folder: 'legacy-fixture',
-        agent_provider: null,
-        created_at: stamp,
-      });
-      await createUser({ id: legacy, kind: 'voice', display_name: 'Caller', created_at: stamp });
-      await addMember({ user_id: legacy, agent_group_id: 'ag-andy', added_by: null, added_at: stamp });
-      await createMessagingGroup({
-        id: 'saved-line',
-        channel_type: 'voice',
-        platform_id: legacy,
-        instance: 'voice',
-        name: null,
-        is_group: 0,
-        unknown_sender_policy: 'strict',
-        created_at: stamp,
-      });
-      await createMessagingGroupAgent({
-        id: 'saved-wire',
-        messaging_group_id: 'saved-line',
-        agent_group_id: 'ag-andy',
-        session_mode: 'shared',
-        sender_scope: 'known',
-        engage_mode: 'pattern',
-        engage_pattern: '.',
-        ignored_message_policy: 'drop',
-        priority: 0,
-        created_at: stamp,
-      });
+      await seedLegacyLine();
       const routed: InboundEvent[] = [];
       h = await startHarness({
         lineForToken: undefined,
@@ -468,10 +472,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       expect(info.status).toBe(200);
       expect(await info.json()).toMatchObject({ agent: 'Andy', caller: 'Caller', protocol: 6 });
       const { worker } = await startCall(h);
-      expect(worker.meta.lineId).toBe(legacy);
+      expect(worker.meta.lineId).toBe(LINE);
       await worker.utter('Saved link still works');
-      expect(JSON.parse(routed[0].message.content)).toMatchObject({ senderId: legacy });
-      expect(routed[0]).toMatchObject({ channelType: 'voice', instance: 'voice', platformId: legacy });
+      expect(JSON.parse(routed[0].message.content)).toMatchObject({ senderId: LINE });
+      expect(routed[0]).toMatchObject({ channelType: 'voice', instance: 'voice', platformId: LINE });
       expect(routed[0].replyTo).toBeUndefined();
     } finally {
       await h.stop();
@@ -497,50 +501,16 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it("delivers a saved main line's answer through core to its live call, with no call chat, in the line's own session", async () => {
     await h.stop();
     const db = await import('../db/index.js');
-    const { createUser } = await import('../modules/permissions/db/users.js');
-    const { addMember } = await import('../modules/permissions/db/agent-group-members.js');
     const { getSessionsByAgentGroup } = await import('../db/sessions.js');
     const { getMessagingGroupByPlatform } = await import('../db/messaging-groups.js');
     const { inboundDbPath, outboundDbPath } = await import('../mailbox/sqlite/paths.js');
     const { getHostStartCallbacks } = await import('../host-lifecycle.js');
     const { deliverSessionMessages, setDeliveryAdapter } = await import('../delivery.js');
     const registry = await import('./channel-registry.js');
-    const legacy = LINE;
-    const stamp = new Date().toISOString();
     fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
     await db.runMigrations(await db.initTestDb());
     try {
-      await db.createAgentGroup({
-        id: 'ag-andy',
-        name: 'Andy',
-        folder: 'ag-andy',
-        agent_provider: null,
-        created_at: stamp,
-      });
-      await createUser({ id: legacy, kind: 'voice', display_name: 'Caller', created_at: stamp });
-      await addMember({ user_id: legacy, agent_group_id: 'ag-andy', added_by: null, added_at: stamp });
-      await db.createMessagingGroup({
-        id: 'saved-line',
-        channel_type: 'voice',
-        platform_id: legacy,
-        instance: 'voice',
-        name: null,
-        is_group: 0,
-        unknown_sender_policy: 'strict',
-        created_at: stamp,
-      });
-      await db.createMessagingGroupAgent({
-        id: 'saved-wire',
-        messaging_group_id: 'saved-line',
-        agent_group_id: 'ag-andy',
-        session_mode: 'shared',
-        sender_scope: 'known',
-        engage_mode: 'pattern',
-        engage_pattern: '.',
-        ignored_message_policy: 'drop',
-        priority: 0,
-        created_at: stamp,
-      });
+      await seedLegacyLine();
       // The real line lookup and the real router; the mirror finds no chat, so the call talks on the line.
       h = await startHarness({ lineForToken: undefined, resolveLine: undefined, routeTurn: undefined });
       for (const start of getHostStartCallbacks()) await start({} as never);
@@ -556,22 +526,22 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       setDeliveryAdapter(registry.createChannelDeliveryAdapter());
 
       const { worker } = await startCall(h);
-      expect(worker.meta.lineId).toBe(legacy);
+      expect(worker.meta.lineId).toBe(LINE);
       const turnId = await worker.utter('Saved link, no chat');
       const turnMessageId = `livekit:${worker.meta.callId}:${turnId}:ag-andy`;
       await vi.waitFor(async () => expect(await getSessionsByAgentGroup('ag-andy')).toHaveLength(1));
       const [session] = await getSessionsByAgentGroup('ag-andy');
       expect(session.messaging_group_id).toBe('saved-line');
-      expect(await getMessagingGroupByPlatform('voice-mode', legacy)).toBeUndefined();
+      expect(await getMessagingGroupByPlatform('voice-mode', LINE)).toBeUndefined();
       const inbound = new Database(inboundDbPath('ag-andy', session.id), { readonly: true });
       const stored = inbound.prepare('SELECT id, channel_type, platform_id FROM messages_in WHERE trigger = 1').get();
       inbound.close();
-      expect(stored).toEqual({ id: turnMessageId, channel_type: 'voice', platform_id: legacy });
+      expect(stored).toEqual({ id: turnMessageId, channel_type: 'voice', platform_id: LINE });
 
       // The runner's pickup and the typing indicator reach the call through the `voice` address.
-      liveKitChatTyping({ channelType: 'voice', platformId: legacy, threadId: null }, 'ag-andy', true);
+      liveKitChatTyping({ channelType: 'voice', platformId: LINE, threadId: null }, 'ag-andy', true);
       await worker.waitFor((e) => e.type === 'working');
-      await registry.createChannelDeliveryAdapter().setTyping!('voice', legacy, null, 'voice');
+      await registry.createChannelDeliveryAdapter().setTyping!('voice', LINE, null, 'voice');
       await worker.waitFor((e) => e.type === 'thinking');
 
       // The agent answers the turn on the chat it came from; core's delivery poll sends it.
@@ -581,7 +551,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
           `INSERT INTO messages_out (id, in_reply_to, timestamp, kind, platform_id, channel_type, content)
            VALUES ('answer-1', ?, datetime('now'), 'chat', ?, 'voice', ?)`,
         )
-        .run(turnMessageId, legacy, JSON.stringify({ text: 'The answer.' }));
+        .run(turnMessageId, LINE, JSON.stringify({ text: 'The answer.' }));
       out.close();
       await deliverSessionMessages(session);
       expect(await worker.waitFor((e) => e.type === 'reply')).toEqual({

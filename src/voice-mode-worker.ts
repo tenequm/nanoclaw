@@ -65,6 +65,10 @@ import {
 } from '@livekit/rtc-node';
 
 import {
+  baseLanguage,
+  DEFAULT_VOICE_LANGUAGES,
+  voiceModeEnv,
+  voiceModeEnvKeys,
   wakePhrase,
   DEFAULT_LIVEKIT_AGENT_NAME,
   HOST_SILENCE_MS,
@@ -105,12 +109,6 @@ import {
   type TurnMode,
 } from './channels/voice-mode-protocol.js';
 import { DATA_DIR } from './config.js';
-import {
-  baseLanguage,
-  DEFAULT_VOICE_LANGUAGES,
-  voiceModeEnv,
-  voiceModeEnvKeys,
-} from './channels/voice-mode-protocol.js';
 import { readEnvFile } from './env.js';
 import { GeminiLiveTranscriber, type Heard, type TranscriberOptions } from './voice-mode-gemini-live.js';
 import { JevTurnShadow, type TurnShadowSink } from './voice-mode-jev-turn.js';
@@ -3741,17 +3739,25 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const header = readJobHeader(ctx.job.metadata);
   const callFields = { callId: header.callId };
   const telemetry = new CallTelemetry({ info: (msg, fields) => log.info(msg, { ...callFields, ...fields }) });
+  /** Ends the call from this side: the host hears why when there is one to tell, then the room goes. */
+  const ender =
+    (link: HostLink | undefined) =>
+    async (reason: string, fields: Record<string, unknown> = {}): Promise<void> => {
+      log.warn('voice-mode worker: ending the call', { ...callFields, ...fields, reason });
+      telemetry.ended(reason);
+      await link
+        ?.post('ended', { reason })
+        .then((res) => res.body?.cancel())
+        .catch(() => undefined);
+      await ctx.deleteRoom().catch(() => undefined);
+      ctx.shutdown(reason);
+    };
   let hostUrl: string;
   try {
     hostUrl = liveKitHostUrl(deps.env);
   } catch (err) {
-    // No host to tell: the room goes, and the host ends the call when its worker never joins.
-    const reason = (err as Error).message;
-    log.warn('voice-mode worker: ending the call', { ...callFields, reason });
-    telemetry.ended(reason);
-    await ctx.deleteRoom().catch(() => undefined);
-    ctx.shutdown(reason);
-    return;
+    // No host to tell: the host ends the call when its worker never joins.
+    return ender(undefined)((err as Error).message);
   }
   const host = new HostLink(
     {
@@ -3761,16 +3767,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     },
     deps.fetchImpl,
   );
-  const abandon = async (reason: string, fields: Record<string, unknown> = {}) => {
-    log.warn('voice-mode worker: ending the call', { ...callFields, ...fields, reason });
-    telemetry.ended(reason);
-    await host
-      .post('ended', { reason })
-      .then((res) => res.body?.cancel())
-      .catch(() => undefined);
-    await ctx.deleteRoom().catch(() => undefined);
-    ctx.shutdown(reason);
-  };
+  const abandon = ender(host);
   if (!deps.env.LIVEKIT_API_SECRET) return abandon('LIVEKIT_API_SECRET is not set for the worker');
 
   if (header.v !== LIVEKIT_PROTOCOL_VERSION) {

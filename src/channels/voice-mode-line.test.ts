@@ -82,10 +82,10 @@ describe('personal legacy voice line access (real central DB)', () => {
 
   it('lists the startup vocabulary on call setup only, and no names when none are configured', async () => {
     await allow(ETHAN);
-    const setup = await resolveVoiceModeLine(ETHAN, undefined, { forCall: true, vocabulary: 'Acme, k8s' });
+    const setup = await resolveVoiceModeLine(ETHAN, { forCall: true, vocabulary: 'Acme, k8s' });
     expect(setup?.agent.vocabulary).toEqual(['Acme', 'k8s']);
-    expect((await resolveVoiceModeLine(ETHAN, undefined, { vocabulary: 'Acme' }))?.agent.vocabulary).toBeUndefined();
-    expect((await resolveVoiceModeLine(ETHAN, undefined, { forCall: true }))?.agent.vocabulary).toBeUndefined();
+    expect((await resolveVoiceModeLine(ETHAN, { vocabulary: 'Acme' }))?.agent.vocabulary).toBeUndefined();
+    expect((await resolveVoiceModeLine(ETHAN, { forCall: true }))?.agent.vocabulary).toBeUndefined();
   });
 
   it('keeps two people distinct when they call the same agent', async () => {
