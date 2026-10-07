@@ -1,5 +1,5 @@
 /**
- * SHADOW-ONLY end-of-turn judge for the voice worker: measures whether Jev (api.typesafe.ai
+ * SHADOW-ONLY end-of-turn judge for the voice-mode worker: measures whether Jev (api.typesafe.ai
  * `systemone`) can tell that the caller finished a turn, on real calls, without acting on it.
  *
  * While an addressed auto turn is open (hands-free or woken; never a Manual/review recording) and
@@ -10,7 +10,7 @@
  *
  * Off unless `data/jev-turn.json` says `"enabled": true` (hot-reloaded); fail-silent on every
  * error. To remove it: this file, its test, its doc, and the `jevTurn`/`shadow` lines in
- * src/voice-livekit-worker.ts.
+ * src/voice-mode-worker.ts.
  */
 import fs from 'node:fs';
 import path from 'node:path';

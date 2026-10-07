@@ -54,7 +54,7 @@ export interface CommandWords {
 
 /**
  * The worker's commands as of this page (CALL_COMMAND_WORDS), for the hints until a worker announces
- * its own (`nanoclaw.voice.command-words`), as every worker this page drives commands for does. Never
+ * its own (`nanoclaw.voice-mode.command-words`), as every worker this page drives commands for does. Never
  * matched against captions: the worker marks the lines that hold a command.
  */
 export const FALLBACK_COMMAND_WORDS: CommandWords = {
@@ -72,7 +72,7 @@ const commandWordList = (v: unknown): CommandWord[] | null => {
   return list
 }
 
-/** The worker's announced commands (`nanoclaw.voice.command-words`), or null when it has none this page reads (version 1, some send word). */
+/** The worker's announced commands (`nanoclaw.voice-mode.command-words`), or null when it has none this page reads (version 1, some send word). */
 export function parseCommandWords(raw: string | undefined): CommandWords | null {
   if (!raw) return null
   let v: { v?: unknown; send?: unknown; discard?: unknown }
@@ -94,7 +94,7 @@ export function quoteWords(list: CommandWord[], all = false): string {
   return quoted.length > 1 ? `${quoted.slice(0, -1).join(", ")} or ${quoted[quoted.length - 1]}` : (quoted[0] ?? "")
 }
 
-/** The worker's mark on a caption that ends in a spoken command (`nanoclaw.voice.command`, `nanoclaw.voice.words`). */
+/** The worker's mark on a caption that ends in a spoken command (`nanoclaw.voice-mode.command`, `nanoclaw.voice-mode.words`). */
 export interface CaptionCommand {
   command: "send" | "discard"
   /** The caption's words before the command; "" when it was said alone. */
@@ -103,8 +103,8 @@ export interface CaptionCommand {
 
 /** A caption's command mark from its stream attributes, or undefined: a caption without one clears the line's. */
 export function captionCommand(attrs: Readonly<Record<string, string>>): CaptionCommand | undefined {
-  const command = attrs["nanoclaw.voice.command"]
-  const words = attrs["nanoclaw.voice.words"]
+  const command = attrs["nanoclaw.voice-mode.command"]
+  const words = attrs["nanoclaw.voice-mode.words"]
   return (command === "send" || command === "discard") && typeof words === "string" ? { command, words } : undefined
 }
 
@@ -570,14 +570,14 @@ export function modeCaption(
 }
 
 /**
- * The `nanoclaw.voice.commands` value of a worker whose commands and settings RPC this page drives
+ * The `nanoclaw.voice-mode.commands` value of a worker whose commands and settings RPC this page drives
  * (CALL_COMMANDS_VERSION); the words themselves come from the worker's announcement.
  */
 export const COMMANDS_VERSION = "3"
 /** Older vocabularies ("1": `over`, "2": `send it`): this page quotes none of their words, but their settings RPC turns the wake gate off. */
 const LEGACY_COMMANDS_VERSIONS = new Set(["1", "2"])
 
-/** What this page does with a worker's `nanoclaw.voice.commands`: drive its commands, switch an older one to pauses, or neither. */
+/** What this page does with a worker's `nanoclaw.voice-mode.commands`: drive its commands, switch an older one to pauses, or neither. */
 export function workerCommands(attr: string | undefined): "commands" | "legacy" | "none" {
   if (attr === COMMANDS_VERSION) return "commands"
   return attr !== undefined && LEGACY_COMMANDS_VERSIONS.has(attr) ? "legacy" : "none"

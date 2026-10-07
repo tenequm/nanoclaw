@@ -252,7 +252,7 @@ export class GeminiLiveTranscriber {
 
   private queue(activity: Activity, pcm: Int16Array): void {
     if (activity.queuedSamples + pcm.length > (this.opts.sampleRate * MAX_PENDING_MS) / 1000) {
-      if (!activity.failed) this.opts.log.warn('voice worker: the transcription fell behind; the turn lost audio');
+      if (!activity.failed) this.opts.log.warn('voice-mode worker: the transcription fell behind; the turn lost audio');
       activity.failed = true;
       return;
     }
@@ -276,7 +276,7 @@ export class GeminiLiveTranscriber {
       activity.failed = true;
       activity.queued = [];
       activity.queuedSamples = 0;
-      this.opts.log.warn('voice worker: the transcription is unavailable; the turn has no text from here');
+      this.opts.log.warn('voice-mode worker: the transcription is unavailable; the turn has no text from here');
       if (activity.ending) this.settle(activity);
       return;
     }
@@ -351,7 +351,7 @@ export class GeminiLiveTranscriber {
     this.send(socket, { realtimeInput: { activityEnd: {} } });
     clearTimeout(activity.timer);
     activity.timer = setTimeout(() => {
-      this.opts.log.warn('voice worker: no final transcript in time; the turn keeps its interim text');
+      this.opts.log.warn('voice-mode worker: no final transcript in time; the turn keeps its interim text');
       this.settle(activity);
     }, FINAL_TIMEOUT_MS);
     if (activity.part.finals.length) this.graceThenSettle(activity);
@@ -369,7 +369,7 @@ export class GeminiLiveTranscriber {
   private handOver(activity: Activity, why: string): void {
     const old = activity.socket;
     if (!old) return;
-    this.opts.log.info('voice worker: the transcription moves to a fresh socket mid-turn', { why });
+    this.opts.log.info('voice-mode worker: the transcription moves to a fresh socket mid-turn', { why });
     clearTimeout(activity.drainTimer);
     this.requeueChunk(activity);
     activity.socket = undefined;
@@ -428,7 +428,7 @@ export class GeminiLiveTranscriber {
     activity.kept.push(partText(activity.part));
     activity.part = { finals: [], interim: '' };
     if (activity.ending) return this.settle(activity);
-    this.opts.log.warn('voice worker: the transcription socket closed mid-turn; the turn goes on in a fresh one');
+    this.opts.log.warn('voice-mode worker: the transcription socket closed mid-turn; the turn goes on in a fresh one');
     void this.attach(activity, this.connect());
   }
 
@@ -493,7 +493,7 @@ export class GeminiLiveTranscriber {
     try {
       ws = factory(`${LIVE_URL}?key=${encodeURIComponent(this.opts.apiKey)}`);
     } catch (err) {
-      this.opts.log.warn('voice worker: could not open a transcription socket', { err: this.redact(String(err)) });
+      this.opts.log.warn('voice-mode worker: could not open a transcription socket', { err: this.redact(String(err)) });
       return Promise.resolve(undefined);
     }
     ws.binaryType = 'arraybuffer';
@@ -501,7 +501,7 @@ export class GeminiLiveTranscriber {
     this.sockets.add(socket);
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
-        this.opts.log.warn('voice worker: a transcription socket did not set up in time');
+        this.opts.log.warn('voice-mode worker: a transcription socket did not set up in time');
         this.retire(socket);
         resolve(undefined);
       }, CONNECT_TIMEOUT_MS);
@@ -513,13 +513,13 @@ export class GeminiLiveTranscriber {
         if (!socket.ready) {
           socket.closed = true;
           this.sockets.delete(socket);
-          this.opts.log.warn('voice worker: a transcription socket closed before its setup', fields);
+          this.opts.log.warn('voice-mode worker: a transcription socket closed before its setup', fields);
           return resolve(undefined);
         }
         if (socket.closed) return;
         socket.closed = true;
         this.sockets.delete(socket);
-        this.opts.log.warn('voice worker: a transcription socket closed', fields);
+        this.opts.log.warn('voice-mode worker: a transcription socket closed', fields);
         socket.onLost?.();
       };
       ws.onmessage = (ev) => {
@@ -546,7 +546,7 @@ export class GeminiLiveTranscriber {
     const kept = stripVocabularyEcho(text, this.opts.vocabulary);
     // Counts, not text: they show whether a stripped echo took the caller's last words with it.
     if (kept !== text) {
-      this.opts.log.info('voice worker: the transcription echoed its vocabulary; stripped', {
+      this.opts.log.info('voice-mode worker: the transcription echoed its vocabulary; stripped', {
         kind,
         words: wordCount(text),
         kept: wordCount(kept),
@@ -573,7 +573,7 @@ export class GeminiLiveTranscriber {
     try {
       socket.ws.send(JSON.stringify(message));
     } catch (err) {
-      this.opts.log.warn('voice worker: could not send to a transcription socket', { err: this.redact(String(err)) });
+      this.opts.log.warn('voice-mode worker: could not send to a transcription socket', { err: this.redact(String(err)) });
     }
   }
 

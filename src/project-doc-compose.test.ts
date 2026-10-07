@@ -284,7 +284,7 @@ describe('composeGroupProjectDoc skill selection', () => {
 
   // The fork's house style and voice guidance are resident prose, not lazily discovered skills
   // nor text in the shared base: red if either moves back or stops composing from the real tree.
-  it('composes the shipped house-style and voice-formatting prose, and keeps the base free of it', async () => {
+  it('composes the shipped house-style and voice-mode-formatting prose, and keeps the base free of it', async () => {
     const ag = await seed('ag-resident', 'resident-group');
     const root = fs.mkdtempSync(path.join(TEST_ROOT, 'real-skills-'));
     fs.mkdirSync(path.join(root, 'container'));
@@ -308,7 +308,7 @@ describe('composeGroupProjectDoc skill selection', () => {
         fs.readFileSync(path.join(REPO_ROOT, 'container', 'skills', name, 'instructions.md'), 'utf-8').trim();
 
       expect(section('NanoClaw Skill: house-style')).toContain(skill('house-style'));
-      expect(section('NanoClaw Skill: voice-formatting')).toContain(skill('voice-formatting'));
+      expect(section('NanoClaw Skill: voice-mode-formatting')).toContain(skill('voice-mode-formatting'));
       const base = section('NanoClaw Runtime Contract');
       expect(base).toContain('You are a NanoClaw agent.');
       expect(base).not.toMatch(/em-dash|house style/i);

@@ -6,7 +6,7 @@
  * job in a forked child process of its worker and owns that process's signals
  * and logging; the host dispatches it to each call's room (explicit dispatch
  * by agent name) and the two talk over the host's webhook server, see
- * `src/channels/voice-livekit-protocol.ts` for the protocol. The host's address and the
+ * `src/channels/voice-mode-protocol.ts` for the protocol. The host's address and the
  * call's secret come from the worker's own settings, never from the dispatch.
  *
  * Per job: join the room, wait for the caller named in the metadata, tell the host (which starts
@@ -18,7 +18,7 @@
  *    turn with thinking pauses is transcribed as one piece;
  *  - each finished turn goes to the host, which hands it to the agent as a spoken message;
  *  - each complete agent reply from the host's event stream is spoken once the caller is not
- *    mid-turn, in full (cut at a sentence end only when VOICE_MAX_SPOKEN_CHARS sets a cap),
+ *    mid-turn, in full (cut at a sentence end only when VOICE_MODE_MAX_SPOKEN_CHARS sets a cap),
  *    uninterruptible: while it plays the caller is not transcribed (no barge-in). Gemini TTS
  *    streams the whole reply from one request into the call's speech track, and a second model
  *    speaks while the first fails.
@@ -102,18 +102,18 @@ import {
   type ReviewReply,
   type ReviewRequest,
   type TurnMode,
-} from './channels/voice-livekit-protocol.js';
+} from './channels/voice-mode-protocol.js';
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
-import { GeminiLiveTranscriber, type Heard, type TranscriberOptions } from './voice-gemini-live.js';
-import { JevTurnShadow, type TurnShadowSink } from './voice-jev-turn.js';
+import { GeminiLiveTranscriber, type Heard, type TranscriberOptions } from './voice-mode-gemini-live.js';
+import { JevTurnShadow, type TurnShadowSink } from './voice-mode-jev-turn.js';
 import {
   CUSTOM_WAKE_THRESHOLD,
   DEFAULT_WAKE_MODEL,
   DEFAULT_WAKE_THRESHOLD,
   WakeWordSpotter,
   type WakeWordStats,
-} from './voice-wakeword.js';
+} from './voice-mode-wakeword.js';
 
 /** The worker's duration cap outlasts the host's by this; it only fires when the host is gone. */
 const WORKER_DEADLINE_GRACE_MS = 30_000;
@@ -174,7 +174,7 @@ const TURN_CUE_REPEAT_MS = 3_000;
 export const READY_CUE_WAIT_MS = 2_000;
 /** Waits on the global timers (which tests can fake). */
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-/** VOICE_MAX_SPOKEN_CHARS when unset: 0, no cap; a reply is spoken in full however long it runs. */
+/** VOICE_MODE_MAX_SPOKEN_CHARS when unset: 0, no cap; a reply is spoken in full however long it runs. */
 export const DEFAULT_MAX_SPOKEN_CHARS = 0;
 const DAY_MS = 86_400_000;
 
@@ -296,7 +296,7 @@ export const CUT_LINES: Record<'chat' | 'no_chat', Record<CallLanguage, string>>
 /** A sentence end earlier than this share of the cap wastes the budget: the cut goes to a word instead. */
 const MIN_SENTENCE_CUT = 0.6;
 
-/** VOICE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default (no cap). */
+/** VOICE_MODE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default (no cap). */
 export function maxSpokenChars(raw: string | undefined): number {
   const value = raw?.trim();
   if (!value) return DEFAULT_MAX_SPOKEN_CHARS;
@@ -304,7 +304,7 @@ export function maxSpokenChars(raw: string | undefined): number {
   return Number.isInteger(chars) && chars >= 0 ? chars : DEFAULT_MAX_SPOKEN_CHARS;
 }
 
-/** VOICE_TTS_DEESS: the de-esser runs unless it says 0, off or false. */
+/** VOICE_MODE_TTS_DEESS: the de-esser runs unless it says 0, off or false. */
 export function ttsDeess(raw: string | undefined): boolean {
   return !['0', 'off', 'false'].includes(raw?.trim().toLowerCase() ?? '');
 }
@@ -386,7 +386,7 @@ export function deEsser(o: DeEsserOptions): (pcm: Int16Array) => Int16Array {
   };
 }
 
-/** VOICE_TTS_NOTCH: the whistle notches run unless it says 0, off or false. */
+/** VOICE_MODE_TTS_NOTCH: the whistle notches run unless it says 0, off or false. */
 export function ttsNotch(raw: string | undefined): boolean {
   return ttsDeess(raw);
 }
@@ -570,7 +570,7 @@ export class GeminiSpeech {
           return;
         }
         lastError = error;
-        this.opts.log.warn(`voice worker: speech model ${name} failed`, { err: error.message, partial: spoke });
+        this.opts.log.warn(`voice-mode worker: speech model ${name} failed`, { err: error.message, partial: spoke });
         if (spoke) throw error;
         if (attempt > 0 || (error as { retryable?: boolean }).retryable !== true) break;
         await pause(TTS_RETRY_DELAY_MS);
@@ -606,7 +606,7 @@ export class GeminiSpeech {
   private markUp(model: string): void {
     if (model !== this.opts.model || this.downUntil === 0) return;
     this.downUntil = 0;
-    this.opts.log.info(`voice worker: speech model ${model} is back`);
+    this.opts.log.info(`voice-mode worker: speech model ${model} is back`);
   }
 }
 
@@ -715,7 +715,7 @@ export class TurnCapture {
 
 /**
  * The page's send cue: while a stretch of caller speech waits out the closing silence that sends
- * it, the `nanoclaw.voice.pending` attribute says how far into that silence it is; it clears
+ * it, the `nanoclaw.voice-mode.pending` attribute says how far into that silence it is; it clears
  * when the caller speaks again, the turn goes out or is dropped, the agent speaks, or the turn
  * is overdue (a transcript of only whitespace commits nothing and times nothing out).
  */
@@ -938,7 +938,7 @@ export async function pruneRecordings(root: string, days: number, now = Date.now
   return removed;
 }
 
-/** VOICE_RECORDINGS_DAYS: 0 (the default) records nothing. */
+/** VOICE_MODE_RECORDINGS_DAYS: 0 (the default) records nothing. */
 export function recordingDays(raw: string | undefined): number {
   const days = Number(raw?.trim() || 0);
   return Number.isInteger(days) && days > 0 ? days : 0;
@@ -952,17 +952,17 @@ export interface CallVoice {
    * finishing a turn they started while the line was synthesized.
    */
   say(text: string, ready?: () => Promise<void>): Promise<boolean>;
-  /** The `nanoclaw.voice.thinking` attribute. */
+  /** The `nanoclaw.voice-mode.thinking` attribute. */
   setThinking(thinking: boolean): void;
-  /** One message on the `nanoclaw.voice.turn` topic. */
+  /** One message on the `nanoclaw.voice-mode.turn` topic. */
   publishTurn(status: CallTurnStatus): void;
-  /** One message on the `nanoclaw.voice.reply` topic, sent right before the line it describes is spoken. */
+  /** One message on the `nanoclaw.voice-mode.reply` topic, sent right before the line it describes is spoken. */
   publishReply(info: CallReplyInfo): void;
-  /** Words that will never be sent, on the `nanoclaw.voice.turn` topic. */
+  /** Words that will never be sent, on the `nanoclaw.voice-mode.turn` topic. */
   publishDropped?(dropped: CallDroppedSpeech): void;
-  /** On the `nanoclaw.voice.turn` topic: the caller spoke under the agent's line, unheard. */
+  /** On the `nanoclaw.voice-mode.turn` topic: the caller spoke under the agent's line, unheard. */
   publishUnheard?(): void;
-  /** The page's send countdown (the `nanoclaw.voice.pending` attribute); '' clears it. */
+  /** The page's send countdown (the `nanoclaw.voice-mode.pending` attribute); '' clears it. */
   setPending?(value: string): void;
   /** The caller's caption for turn `segment`: interim text as it grows, then its final text; `mark` when it ends in a command. */
   caption?(segment: number, text: string, final: boolean, mark?: CaptionMark): void;
@@ -977,7 +977,7 @@ export interface CallVoice {
 
 /** Review mode's page side: its state topic and its RPCs. */
 export interface ReviewSession {
-  /** One message on the `nanoclaw.voice.review` topic. */
+  /** One message on the `nanoclaw.voice-mode.review` topic. */
   publishReview(state: CallReviewState): void;
   /**
    * Answer the page's review and settings RPCs with `handle`, and tell the page review mode and
@@ -1147,12 +1147,12 @@ export class TurnTaking {
     this.wake();
     this.sends = this.sends
       .then(() => this.sendTurn(text, onSent))
-      .catch((err: unknown) => this.deps.log.warn('voice worker: sending a turn failed', { err }));
+      .catch((err: unknown) => this.deps.log.warn('voice-mode worker: sending a turn failed', { err }));
   }
 
   onTurnLost(reason: 'stt' | 'empty', fields: Record<string, unknown> = {}): void {
     if (this.closed) return;
-    this.deps.log.warn(`voice worker: a turn was lost (${reason})`, fields);
+    this.deps.log.warn(`voice-mode worker: a turn was lost (${reason})`, fields);
     this.feedback('turn');
   }
 
@@ -1171,7 +1171,7 @@ export class TurnTaking {
     if (!full) return;
     const max = this.options.maxSpokenChars ?? DEFAULT_MAX_SPOKEN_CHARS;
     if (max > 0 && full.length > max) {
-      this.deps.log.info('voice worker: a long message is cut for speech', { chars: full.length, max });
+      this.deps.log.info('voice-mode worker: a long message is cut for speech', { chars: full.length, max });
     }
     this.enqueue(async () => {
       // Cut when spoken, so the closing line is in the language of the caller's latest turn.
@@ -1188,7 +1188,7 @@ export class TurnTaking {
       const heard = await this.say(spoken).finally(() => this.replyHeard());
       if (heard) return;
       if (this.closed) return;
-      this.deps.log.warn('voice worker: a reply could not be synthesized');
+      this.deps.log.warn('voice-mode worker: a reply could not be synthesized');
       // Nothing was heard: the page shows the words instead.
       this.deps.announce?.({ reply, ...about, unspoken: true, text: spoken });
       this.feedback('reply');
@@ -1229,7 +1229,7 @@ export class TurnTaking {
 
   private async sendTurn(text: string, onSent?: (result: SendResult) => void): Promise<void> {
     const result = await this.deps.send(text).catch((err: unknown): SendResult => {
-      this.deps.log.warn('voice worker: sending a turn threw', { err });
+      this.deps.log.warn('voice-mode worker: sending a turn threw', { err });
       return { accepted: false, error: err instanceof Error ? err.message : String(err) };
     });
     onSent?.(result);
@@ -1285,7 +1285,7 @@ export class TurnTaking {
         this.deps.beforeSpeak?.();
         await job();
       })
-      .catch((err: unknown) => this.deps.log.warn('voice worker: speaking failed', { err }))
+      .catch((err: unknown) => this.deps.log.warn('voice-mode worker: speaking failed', { err }))
       .finally(() => {
         if (--this.queued > 0 || this.closed) return;
         const spoken = this.spokeSinceIdle;
@@ -1310,7 +1310,7 @@ export class TurnTaking {
       const busy = this.callerSpeaking || this.holds.size > 0;
       if (!busy && t >= this.turnOpenUntil) return;
       if (t >= deadline) {
-        this.deps.log.info('voice worker: the caller is still talking; the reply takes the channel');
+        this.deps.log.info('voice-mode worker: the caller is still talking; the reply takes the channel');
         return;
       }
       const until = busy ? deadline : Math.min(deadline, this.turnOpenUntil);
@@ -1605,7 +1605,7 @@ async function publishCueTrack(room: Room, log: WorkerLog): Promise<{ feed: CueF
   const local = room.localParticipant;
   if (!local) throw new Error('no local participant');
   const publication = await local.publishTrack(track, new TrackPublishOptions({ dtx: false }));
-  const feed = new CueFeed(source, (err) => log.warn('voice worker: the cue track stopped', { err }));
+  const feed = new CueFeed(source, (err) => log.warn('voice-mode worker: the cue track stopped', { err }));
   return {
     feed,
     async close() {
@@ -1838,7 +1838,7 @@ export interface AwakeLimits {
 const DEFAULT_AWAKE_LIMITS: AwakeLimits = { startMs: 8_000, idleMs: 20_000 };
 
 /**
- * VOICE_WAKE_START_SECONDS (8) and VOICE_WAKE_IDLE_SECONDS (20): how long a turn the wake phrase
+ * VOICE_MODE_WAKE_START_SECONDS (8) and VOICE_MODE_WAKE_IDLE_SECONDS (20): how long a turn the wake phrase
  * opened waits for speech, first and then after the last words, before it goes back to waiting; 0 never.
  */
 export function awakeLimits(env: Record<string, string | undefined>): AwakeLimits {
@@ -1847,8 +1847,8 @@ export function awakeLimits(env: Record<string, string | undefined>): AwakeLimit
     return Number.isFinite(n) && n >= 0 ? Math.round(n * 1000) : fallback;
   };
   return {
-    startMs: seconds(env.VOICE_WAKE_START_SECONDS, DEFAULT_AWAKE_LIMITS.startMs),
-    idleMs: seconds(env.VOICE_WAKE_IDLE_SECONDS, DEFAULT_AWAKE_LIMITS.idleMs),
+    startMs: seconds(env.VOICE_MODE_WAKE_START_SECONDS, DEFAULT_AWAKE_LIMITS.startMs),
+    idleMs: seconds(env.VOICE_MODE_WAKE_IDLE_SECONDS, DEFAULT_AWAKE_LIMITS.idleMs),
   };
 }
 
@@ -2006,7 +2006,7 @@ export interface CallTurnsDeps {
   unheard(): void;
   /** A turn that came to nothing for the agent: discarded, unaddressed, or a command alone. */
   ended?(facts: TurnFacts, outcome: TurnOutcome, reason: string): void;
-  /** Watches addressed auto turns and logs what it would do (src/voice-jev-turn.ts); never acts. */
+  /** Watches addressed auto turns and logs what it would do (src/voice-mode-jev-turn.ts); never acts. */
   shadow?: TurnShadowSink;
   log: Pick<Console, 'info' | 'warn'>;
 }
@@ -2227,11 +2227,11 @@ export class CallTurns {
   onWake(at: number): void {
     if (this.closed || !this.spotting) return;
     if (at <= this.waitingSince) {
-      this.deps.log.info('voice worker: a wake word from an earlier wait is ignored');
+      this.deps.log.info('voice-mode worker: a wake word from an earlier wait is ignored');
       return;
     }
     if (at < this.ring.position - samplesOf(RING_MS)) {
-      this.deps.log.warn('voice worker: the wake word window is older than the kept audio; no turn opens');
+      this.deps.log.warn('voice-mode worker: the wake word window is older than the kept audio; no turn opens');
       return;
     }
     this.open('auto', at, true);
@@ -2727,7 +2727,7 @@ export interface ReviewVoice {
   stopRecording(): Promise<Recording | null>;
   /** Drop the open recording. */
   dropRecording(): void;
-  /** One message on the `nanoclaw.voice.review` topic. */
+  /** One message on the `nanoclaw.voice-mode.review` topic. */
   publishReview(state: CallReviewState): void;
 }
 
@@ -2857,7 +2857,7 @@ export class ReviewControl {
         this.preparing = false;
         if (this.closed) return reply({ error: 'closed' });
         if (!ready) {
-          this.deps.log.warn('voice worker: the transcription could not be set up for a recording');
+          this.deps.log.warn('voice-mode worker: the transcription could not be set up for a recording');
           this.publish();
           return reply({ error: 'closed' });
         }
@@ -2943,7 +2943,7 @@ export class ReviewControl {
   /** A freeze that fails leaves the draft failed, never stuck finishing. */
   private freezeSafely(draft: CallDraft, recording: Promise<Recording | null>): void {
     this.freeze(draft, recording).catch((err: unknown) => {
-      this.deps.log.warn('voice worker: finishing a review draft failed', { err });
+      this.deps.log.warn('voice-mode worker: finishing a review draft failed', { err });
       if (this.draft?.id !== draft.id) return;
       this.draft = { ...draft, state: 'failed', text: this.draft.text };
       this.publish();
@@ -3011,7 +3011,7 @@ export function readReviewRequest(payload: string): ReviewRequest | null {
 export function readJobHeader(raw: string): { v: unknown; callId: string; callerIdentity: string; agentName?: string } {
   const meta = JSON.parse(raw) as Record<string, unknown> | null;
   if (!meta || typeof meta.callId !== 'string' || !meta.callId || typeof meta.callerIdentity !== 'string') {
-    throw new Error('voice worker: job metadata is not a NanoClaw voice call');
+    throw new Error('voice-mode worker: job metadata is not a NanoClaw voice call');
   }
   return {
     v: meta.v,
@@ -3024,7 +3024,7 @@ export function readJobHeader(raw: string): { v: unknown; callId: string; caller
 export function parseJobMetadata(raw: string): LiveKitJobMetadata {
   const meta = JSON.parse(raw) as LiveKitJobMetadata;
   if (meta?.v !== LIVEKIT_PROTOCOL_VERSION || !meta.callId || !meta.callerIdentity || !meta.agentName) {
-    throw new Error('voice worker: job metadata is not a NanoClaw voice call of this version');
+    throw new Error('voice-mode worker: job metadata is not a NanoClaw voice call of this version');
   }
   return meta;
 }
@@ -3050,13 +3050,13 @@ export type CallJob = Pick<
 >;
 
 /** What a call's room needs besides the job metadata. */
-export interface VoiceSettings {
+export interface VoiceModeSettings {
   geminiKey: string;
   /** Recordings are on: `spoke` gets each line's audio as it went to the speech track. */
   recordReplies?: boolean;
-  /** De-ess the agent's speech (VOICE_TTS_DEESS). */
+  /** De-ess the agent's speech (VOICE_MODE_TTS_DEESS). */
   deess?: boolean;
-  /** Notch out the speech model's whistle (VOICE_TTS_NOTCH). */
+  /** Notch out the speech model's whistle (VOICE_MODE_TTS_NOTCH). */
   notch?: boolean;
   /** Each line that played or failed: how it went, and with recordReplies its audio. */
   spoke?(line: SpokenLine, pcm?: Int16Array): void;
@@ -3069,7 +3069,7 @@ export interface RunCallDeps {
   createVoice(
     ctx: CallJob,
     meta: LiveKitJobMetadata,
-    settings: VoiceSettings,
+    settings: VoiceModeSettings,
     events: CallVoiceEvents,
   ): Promise<CallVoice>;
   /** The call's transcription; Gemini Live by default. */
@@ -3111,17 +3111,17 @@ export const COMMAND_VOCABULARY: readonly string[] = [...CALL_COMMAND_WORDS.send
   (word) => word.say,
 );
 /**
- * VOICE_WAKE_MODEL (a classifier .onnx; the bundled `hey_livekit` by default, `off` for none),
- * VOICE_WAKE_THRESHOLD (0-1; the bundled model's documented 0.68 by default, 0.5 for another model)
- * and VOICE_WAKE_PHRASE (what the model listens for, as the page names it; see wakePhrase).
+ * VOICE_MODE_WAKE_MODEL (a classifier .onnx; the bundled `hey_livekit` by default, `off` for none),
+ * VOICE_MODE_WAKE_THRESHOLD (0-1; the bundled model's documented 0.68 by default, 0.5 for another model)
+ * and VOICE_MODE_WAKE_PHRASE (what the model listens for, as the page names it; see wakePhrase).
  */
 export function wakeWordSettings(
   env: Record<string, string | undefined>,
 ): { classifier: string; threshold: number; phrase: string } | null {
   const phrase = wakePhrase(env);
   if (phrase === null) return null;
-  const model = env.VOICE_WAKE_MODEL?.trim();
-  const threshold = Number(env.VOICE_WAKE_THRESHOLD?.trim() || NaN);
+  const model = env.VOICE_MODE_WAKE_MODEL?.trim();
+  const threshold = Number(env.VOICE_MODE_WAKE_THRESHOLD?.trim() || NaN);
   return {
     classifier: model ? path.resolve(model) : DEFAULT_WAKE_MODEL,
     phrase,
@@ -3201,7 +3201,7 @@ export class Outbox {
     if (this.queue.length >= this.max) {
       const replaceable = this.queue.findIndex((job) => job.key !== undefined);
       const [dropped] = this.queue.splice(replaceable >= 0 ? replaceable : 0, 1);
-      this.log.warn(`voice worker: the room is behind; dropped ${dropped.what}`);
+      this.log.warn(`voice-mode worker: the room is behind; dropped ${dropped.what}`);
     }
     this.queue.push({ what, key, run });
     void this.next();
@@ -3217,10 +3217,10 @@ export class Outbox {
       // A native call that throws at once is a failed publication, not the job's error.
       const running = (async () => job.run())();
       // A late publication that fails afterwards is only logged.
-      running.catch((err: unknown) => this.log.warn(`voice worker: could not publish ${job.what}`, { err }));
+      running.catch((err: unknown) => this.log.warn(`voice-mode worker: could not publish ${job.what}`, { err }));
       try {
         const result = await Promise.race([running, late]);
-        if (result === 'late') this.log.warn(`voice worker: ${job.what} is slow to reach the room; moving on`);
+        if (result === 'late') this.log.warn(`voice-mode worker: ${job.what} is slow to reach the room; moving on`);
       } catch {
         // Logged above.
       } finally {
@@ -3299,7 +3299,7 @@ export class CallerInput {
       }
     })().catch((err: unknown) => {
       if (vad.closed) return;
-      this.log.error('voice worker: the VAD stopped', { err });
+      this.log.error('voice-mode worker: the VAD stopped', { err });
       this.events.onClosed('vad failed');
     });
     return vad;
@@ -3314,7 +3314,7 @@ export class CallerInput {
 async function roomVoice(
   ctx: JobContext,
   meta: LiveKitJobMetadata,
-  settings: VoiceSettings,
+  settings: VoiceModeSettings,
   events: CallVoiceEvents,
 ): Promise<CallVoice> {
   const log = workerLog(agentsLog().child({ callId: meta.callId }));
@@ -3340,7 +3340,7 @@ async function roomVoice(
   // The cues' own track: never the speech track, so a cue is never the agent speaking. Without it
   // the call runs silent of cues.
   const cueTrack = await publishCueTrack(room, log).catch((err: unknown) => {
-    log.warn('voice worker: could not publish the cue track', { err });
+    log.warn('voice-mode worker: could not publish the cue track', { err });
     return undefined;
   });
 
@@ -3378,7 +3378,7 @@ async function roomVoice(
         input.frame(frame);
       }
     })().catch((err: unknown) => {
-      log.warn('voice worker: the caller audio stopped', { err });
+      log.warn('voice-mode worker: the caller audio stopped', { err });
       if (callerAudio === reader) stopListening();
     });
   };
@@ -3457,7 +3457,7 @@ async function roomVoice(
       return heard && !closed;
     } catch (err) {
       failed = true;
-      log.warn('voice worker: a line could not be synthesized', { err: err instanceof Error ? err.message : err });
+      log.warn('voice-mode worker: a line could not be synthesized', { err: err instanceof Error ? err.message : err });
       if (heard) await speechSource.waitForPlayout().catch(() => undefined);
       return false;
     } finally {
@@ -3516,7 +3516,7 @@ async function roomVoice(
         (frames) => {
           if (typing && !closed) cueTrack?.feed.setBed(frames);
         },
-        (err: unknown) => log.warn('voice worker: no typing sound', { err: err instanceof Error ? err.message : err }),
+        (err: unknown) => log.warn('voice-mode worker: no typing sound', { err: err instanceof Error ? err.message : err }),
       );
     },
     publishReply: (info) => sendJson(CALL_REPLY_TOPIC, info, 'a reply label'),
@@ -3547,7 +3547,7 @@ async function roomVoice(
         try {
           await step();
         } catch (err) {
-          log.warn('voice worker: could not close part of the call', { err });
+          log.warn('voice-mode worker: could not close part of the call', { err });
         }
       };
       await quietly(() => callerAudio?.cancel());
@@ -3667,15 +3667,15 @@ function defaultDeps(): RunCallDeps {
     'GEMINI_API_KEY',
     'LIVEKIT_API_SECRET',
     'LIVEKIT_HOST_URL',
-    'VOICE_RECORDINGS_DAYS',
-    'VOICE_MAX_SPOKEN_CHARS',
-    'VOICE_TTS_DEESS',
-    'VOICE_TTS_NOTCH',
-    'VOICE_WAKE_MODEL',
-    'VOICE_WAKE_THRESHOLD',
-    'VOICE_WAKE_PHRASE',
-    'VOICE_WAKE_START_SECONDS',
-    'VOICE_WAKE_IDLE_SECONDS',
+    'VOICE_MODE_RECORDINGS_DAYS',
+    'VOICE_MODE_MAX_SPOKEN_CHARS',
+    'VOICE_MODE_TTS_DEESS',
+    'VOICE_MODE_TTS_NOTCH',
+    'VOICE_MODE_WAKE_MODEL',
+    'VOICE_MODE_WAKE_THRESHOLD',
+    'VOICE_MODE_WAKE_PHRASE',
+    'VOICE_MODE_WAKE_START_SECONDS',
+    'VOICE_MODE_WAKE_IDLE_SECONDS',
   ]);
   const wake = wakeWordSettings(env);
   return {
@@ -3703,7 +3703,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     deps.fetchImpl,
   );
   const abandon = async (reason: string, fields: Record<string, unknown> = {}) => {
-    log.warn('voice worker: ending the call', { ...callFields, ...fields, reason });
+    log.warn('voice-mode worker: ending the call', { ...callFields, ...fields, reason });
     telemetry.ended(reason);
     await host
       .post('ended', { reason })
@@ -3734,13 +3734,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   }
   const geminiKey = deps.env.GEMINI_API_KEY;
   if (!geminiKey) return abandon('GEMINI_API_KEY is not set for the worker');
-  const record = recordingDays(deps.env.VOICE_RECORDINGS_DAYS) > 0;
+  const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
   /** Spoken lines so far, for those no label numbered. */
   let replies = 0;
   /** The label of the line being spoken: TurnTaking announces each line right before it. */
   let speakingLine: CallReplyInfo | undefined;
   if (meta.sttFallbackModel) {
-    log.warn('voice worker: VOICE_STT_FALLBACK_MODEL is ignored: turns are transcribed by the Live model only', {
+    log.warn('voice-mode worker: VOICE_MODE_STT_FALLBACK_MODEL is ignored: turns are transcribed by the Live model only', {
       ...callFields,
       model: meta.sttFallbackModel,
     });
@@ -3788,7 +3788,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         if (ending || !cuesOn || agentSpeaking) return;
         await callVoice?.playCue?.(kind);
       })
-      .catch((err: unknown) => callLog.warn('voice worker: a cue did not play', { err, kind }));
+      .catch((err: unknown) => callLog.warn('voice-mode worker: a cue did not play', { err, kind }));
   };
   let readyCued = false;
   let readyTimer: ReturnType<typeof setTimeout> | undefined;
@@ -3812,13 +3812,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         try {
           res = await host.post('utterance', { text, turnKey }).catch(async (err: unknown) => {
             if ((err as Error | null)?.name === 'TimeoutError') throw err;
-            callLog.warn('voice worker: posting a turn failed; trying once more', { err });
+            callLog.warn('voice-mode worker: posting a turn failed; trying once more', { err });
             await sleep(TURN_RETRY_DELAY_MS);
             return host.post('utterance', { text, turnKey });
           });
         } catch (err) {
           // Unanswered, not refused: the host may still store it and say so with `turn-stored`.
-          callLog.warn('voice worker: could not hand the turn to the host', { err });
+          callLog.warn('voice-mode worker: could not hand the turn to the host', { err });
           return { accepted: false, turnKey, error: err instanceof Error ? err.message : String(err) };
         }
         if (res.status === 202) {
@@ -3826,7 +3826,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           return { accepted: true, status: 202, turnKey, id: typeof body?.id === 'string' ? body.id : undefined };
         }
         void res.body?.cancel().catch(() => {});
-        callLog.warn('voice worker: the host refused a turn', { status: res.status });
+        callLog.warn('voice-mode worker: the host refused a turn', { status: res.status });
         return { accepted: false, status: res.status, turnKey };
       },
       // While the line is synthesized the caller is heard as ever, and a turn they start then holds
@@ -3873,7 +3873,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     {
       silenceMs: meta.silenceMs,
       language: DEFAULT_CALL_LANGUAGE,
-      maxSpokenChars: maxSpokenChars(deps.env.VOICE_MAX_SPOKEN_CHARS),
+      maxSpokenChars: maxSpokenChars(deps.env.VOICE_MODE_MAX_SPOKEN_CHARS),
     },
   );
   let review: ReviewControl | undefined;
@@ -3895,7 +3895,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     callTurns.close();
     transcriber.close();
     if (wakeWord) {
-      callLog.info('voice worker: wake word use', {
+      callLog.info('voice-mode worker: wake word use', {
         ...wakeWord.summary,
         cpu: Math.round(wakeWord.utilization * 1000) / 1000,
       });
@@ -3963,7 +3963,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       ...outcome,
     };
     void writeTurnRecording(deps.recordingsRoot ?? recordingsRoot(), record, audio).catch((err: unknown) =>
-      callLog.warn('voice worker: could not save a turn recording', { err, turn: index }),
+      callLog.warn('voice-mode worker: could not save a turn recording', { err, turn: index }),
     );
   };
   /** A finished turn to the host: an auto turn, or a review draft (`draft`) the caller sent. */
@@ -4074,8 +4074,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       {
         geminiKey,
         ...(record ? { recordReplies: true } : {}),
-        ...(ttsDeess(deps.env.VOICE_TTS_DEESS) ? { deess: true } : {}),
-        ...(ttsNotch(deps.env.VOICE_TTS_NOTCH) ? { notch: true } : {}),
+        ...(ttsDeess(deps.env.VOICE_MODE_TTS_DEESS) ? { deess: true } : {}),
+        ...(ttsNotch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
         spoke: (line, pcm) => {
           const label = speakingLine;
           const reply = label?.reply ?? ++replies;
@@ -4085,7 +4085,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
               { agent: meta.agentName, callId: meta.callId },
               reply,
               pcm,
-            ).catch((err: unknown) => callLog.warn('voice worker: could not save a reply recording', { err, reply }));
+            ).catch((err: unknown) => callLog.warn('voice-mode worker: could not save a reply recording', { err, reply }));
           }
           telemetry.reply({
             reply,
@@ -4142,7 +4142,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       spotter = deps.wakeWord?.({
         onDetect: (score, window) => {
           const end = window.end + spotterFrom;
-          callLog.info('voice worker: wake word spotted', {
+          callLog.info('voice-mode worker: wake word spotted', {
             score: Math.round(score * 1000) / 1000,
             scoredMsAgo: Math.round(msOf(callTurns.position - end)),
           });
@@ -4150,7 +4150,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           callTurns.onWake(end);
         },
         onError: (err) => {
-          callLog.warn('voice worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn', {
+          callLog.warn('voice-mode worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn', {
             err,
           });
           wakeWord = undefined;
@@ -4158,7 +4158,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         },
       });
     } catch (err) {
-      callLog.warn('voice worker: could not start the wake word spotter', { err });
+      callLog.warn('voice-mode worker: could not start the wake word spotter', { err });
     }
     const loading = spotter;
     if (loading) callTurns.loadWakeWord(loading.phrase);
@@ -4167,13 +4167,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         if (ending) return;
         wakeWord = loading;
         callTurns.useWakeWord(loading.phrase);
-        callLog.info('voice worker: wake word ready', { phrase: loading.phrase, threshold: loading.threshold });
+        callLog.info('voice-mode worker: wake word ready', { phrase: loading.phrase, threshold: loading.threshold });
       },
       (err: unknown) => {
         // A call that ended while the models loaded closed the spotter: nothing failed.
         if (ending) return;
         callTurns.useWakeWord(undefined);
-        callLog.warn('voice worker: no wake word model; "hey <agent>" in the transcript opens a turn', {
+        callLog.warn('voice-mode worker: no wake word model; "hey <agent>" in the transcript opens a turn', {
           err: err instanceof Error ? err.message : String(err),
         });
       },
@@ -4240,7 +4240,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     if (participant.identity !== meta.callerIdentity || !callerGone) return;
     clearTimeout(callerGone);
     callerGone = undefined;
-    callLog.info('voice worker: the caller rejoined', { sid: participant.sid });
+    callLog.info('voice-mode worker: the caller rejoined', { sid: participant.sid });
     // The review state goes out as data: the new instance has not heard it. Its audio and RPCs
     // follow the identity on their own.
     review?.republish();
@@ -4250,7 +4250,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     const reason = participant.disconnectReason;
     const waitMs = callerRejoinWaitMs(reason);
     if (!waitMs) return void end('caller left', true);
-    callLog.info('voice worker: the caller dropped, waiting for it to rejoin', {
+    callLog.info('voice-mode worker: the caller dropped, waiting for it to rejoin', {
       sid: participant.sid,
       reason: reason === undefined ? 'unknown' : DisconnectReason[reason],
       waitMs,
@@ -4294,7 +4294,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         turnsByHostId.set(event.id, late.turn);
         lastAccepted = Math.max(lastAccepted, late.turn);
         if (late.turn > pickedUp) turnTaking.expectReply();
-        callLog.info('voice worker: a timed-out turn reached the agent after all', { turn: late.turn });
+        callLog.info('voice-mode worker: a timed-out turn reached the agent after all', { turn: late.turn });
         // The page's mark for this turn goes from "not confirmed" to "sent".
         publish({ turn: late.turn, status: 'sent', text: late.text });
       }
@@ -4302,7 +4302,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     .then(
       () => end('host link closed', true),
       (err: unknown) => {
-        if (!ending) log.warn('voice worker: host link failed', { ...callFields, err });
+        if (!ending) log.warn('voice-mode worker: host link failed', { ...callFields, err });
         return end('host link failed', true);
       },
     )
@@ -4347,26 +4347,26 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'LIVEKIT_API_SECRET',
     'LIVEKIT_AGENT_NAME',
     'LIVEKIT_HOST_URL',
-    'VOICE_WORKER_HEALTH_PORT',
-    'VOICE_RECORDINGS_DAYS',
-    'VOICE_MAX_SPOKEN_CHARS',
+    'VOICE_MODE_WORKER_HEALTH_PORT',
+    'VOICE_MODE_RECORDINGS_DAYS',
+    'VOICE_MODE_MAX_SPOKEN_CHARS',
   ]);
   // agents-js initializes its logger once the CLI runs a command; console until then.
   console.info(
-    `voice worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${liveKitHostUrl(env)} (LIVEKIT_HOST_URL)`,
+    `voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${liveKitHostUrl(env)} (LIVEKIT_HOST_URL)`,
   );
   // agents-js's default ("adaptive") enables the debugger domain on a job's first loop stall to
   // sample stacks: that blocks the loop another ~250 ms mid-call and slows the call's JS by ~15%
   // from then on. Set the variable to sample anyway; the job processes inherit it.
   process.env.LIVEKIT_AGENTS_LOOP_BLOCK_STACKS ??= 'never';
-  const keepDays = recordingDays(env.VOICE_RECORDINGS_DAYS);
+  const keepDays = recordingDays(env.VOICE_MODE_RECORDINGS_DAYS);
   if (keepDays > 0) {
     const prune = () =>
       void pruneRecordings(recordingsRoot(), keepDays).then(
-        (removed) => removed > 0 && console.info(`voice worker: pruned ${removed} turn recording files`),
-        (err: unknown) => console.warn('voice worker: pruning turn recordings failed', err),
+        (removed) => removed > 0 && console.info(`voice-mode worker: pruned ${removed} turn recording files`),
+        (err: unknown) => console.warn('voice-mode worker: pruning turn recordings failed', err),
       );
-    console.info(`voice worker: recording caller turns to ${recordingsRoot()}, kept ${keepDays} days`);
+    console.info(`voice-mode worker: recording caller turns to ${recordingsRoot()}, kept ${keepDays} days`);
     prune();
     setInterval(prune, DAY_MS).unref();
   }
@@ -4380,10 +4380,10 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
       apiSecret: env.LIVEKIT_API_SECRET,
       // Health endpoint on loopback only, off agents-js's default 8081.
       host: '127.0.0.1',
-      port: Number(env.VOICE_WORKER_HEALTH_PORT || 8089),
+      port: Number(env.VOICE_MODE_WORKER_HEALTH_PORT || 8089),
       numIdleProcesses: 1,
       // On SIGTERM the worker takes no new calls and gives running ones this long before closing
-      // them; a call can run up to VOICE_MAX_CALL_SECONDS, so a restart cuts longer ones short.
+      // them; a call can run up to VOICE_MODE_MAX_CALL_SECONDS, so a restart cuts longer ones short.
       drainTimeout: 60_000,
       // Never throws and always answers: agents-js logs the whole job, metadata included, when a
       // request function fails or leaves the request unanswered. A job of another protocol version

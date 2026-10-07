@@ -1,4 +1,4 @@
-Wake word models for the voice worker (src/voice-wakeword.ts)
+Wake word models for the voice worker (src/voice-mode-wakeword.ts)
 
 These files are copied unmodified from livekit-wakeword
 (https://github.com/livekit/livekit-wakeword, commit fb92cb3, version 0.2),
@@ -9,7 +9,7 @@ Copyright 2026 LiveKit, Inc., licensed under the Apache License, Version 2.0
 - embedding_model.onnx   src/livekit/wakeword/resources/embedding_model.onnx
 - hey_livekit.onnx       examples/resources/hey_livekit.onnx
 
-and, as test fixtures, src/voice-wakeword-fixtures/positive.wav and negative.wav
+and, as test fixtures, src/voice-mode-wakeword-fixtures/positive.wav and negative.wav
 from its tests/fixtures/.
 
 As livekit-wakeword documents them: melspectrogram.onnx is openWakeWord's
@@ -17,5 +17,5 @@ torchlibrosa mel-spectrogram front end, embedding_model.onnx is Google's
 speech_embedding model (TF Hub google/speech_embedding/1), and hey_livekit.onnx
 is LiveKit's conv-attention classifier for the phrase "hey livekit".
 
-src/voice-wakeword.ts is a TypeScript port of livekit-wakeword's inference
+src/voice-mode-wakeword.ts is a TypeScript port of livekit-wakeword's inference
 pipeline (WakeWordModel.predict and WakeWordListener), not a copy of its code.

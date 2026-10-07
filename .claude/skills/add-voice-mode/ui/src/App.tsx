@@ -7,14 +7,14 @@ import { Message, MessageContent } from "@/components/ui/message"
 import { ShimmeringText } from "@/components/ui/shimmering-text"
 import { Button } from "@/components/ui/button"
 import { StreamText } from "@/components/StreamText"
-import { readConfig, type VoiceUiConfig } from "@/lib/config"
-import { LIVE_PHASES, type ErrorKind, type Line, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "@/lib/voice-call"
+import { readConfig, type VoiceModeUiConfig } from "@/lib/config"
+import { LIVE_PHASES, type ErrorKind, type Line, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceModeCall } from "@/lib/voice-call"
 import { MODE_NAME, autoListening, keyIdentity, modeCaption, quoteWords, reviewView, wakePhraseOf, wakeSwitchPhrase, type CommandWords, type KeyAction, type PanelView, type TurnMode } from "@/lib/review"
 import { useLiveKitCall } from "@/lib/livekit-call"
 import { useDemoCall } from "@/lib/demo-call"
 import logo from "@/assets/nanoclaw-logo.png"
 
-type Colorway = NonNullable<VoiceUiConfig["colorway"]>
+type Colorway = NonNullable<VoiceModeUiConfig["colorway"]>
 /** `auto` follows the device's light or dark setting. */
 const COLORWAYS: Colorway[] = ["auto", "ivory", "field", "rabbit"]
 
@@ -169,7 +169,7 @@ function useReducedMotion(): boolean {
 
 // Level and glow samples ~20 times a second, read from the call's refs. Only the
 // component that calls this re-renders, so the transcript and keys stay still.
-function useLevelTicker(call: VoiceCall, phase: Phase, wantLevels: boolean, reduced: boolean, count = MATRIX_COLS) {
+function useLevelTicker(call: VoiceModeCall, phase: Phase, wantLevels: boolean, reduced: boolean, count = MATRIX_COLS) {
   const [levels, setLevels] = useState<number[]>(() => Array(count).fill(0))
   const [glow, setGlow] = useState(1)
   const phaseRef = useRef(phase)
@@ -244,7 +244,7 @@ function SegmentTimer({ seconds, live }: { seconds: number; live: boolean }) {
   )
 }
 
-const Badge = memo(function Badge({ call, phase, live, reduced }: { call: VoiceCall; phase: Phase; live: boolean; reduced: boolean }) {
+const Badge = memo(function Badge({ call, phase, live, reduced }: { call: VoiceModeCall; phase: Phase; live: boolean; reduced: boolean }) {
   const { glow } = useLevelTicker(call, phase, false, reduced)
   return (
     <div className="badge" aria-hidden="true">
@@ -263,7 +263,7 @@ const Stage = memo(function Stage({
   compact = false,
   sleeping = false,
 }: {
-  call: VoiceCall
+  call: VoiceModeCall
   phase: Phase
   live: boolean
   presence: "matrix" | "bars"

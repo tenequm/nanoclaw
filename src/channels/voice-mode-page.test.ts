@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-import { callPageHtml, UI_SOURCE_HASH } from './voice-call-page.js';
+import { callPageHtml, UI_SOURCE_HASH } from './voice-mode-page.js';
 
 describe('voice call page (generated)', () => {
   it('is one self-contained document: React root, no external scripts or stylesheets', () => {
@@ -17,7 +17,7 @@ describe('voice call page (generated)', () => {
 
   it('injects the host config where the placeholder sat, defaulting to an empty object', () => {
     expect(callPageHtml()).toContain('<script>window.__VOICE_UI__={}</script>');
-    expect(callPageHtml()).not.toContain('<!--VOICE_UI_CONFIG-->');
+    expect(callPageHtml()).not.toContain('<!--VOICE_MODE_UI_CONFIG-->');
     const html = callPageHtml({ skin: 'te', colorway: 'rabbit', presence: 'bars', brand: 'Casa line' });
     expect(html).toContain('"colorway":"rabbit"');
     expect(html).toContain('"brand":"Casa line"');
@@ -35,7 +35,7 @@ describe('voice call page (generated)', () => {
       const html = callPageHtml({ brand });
       expect(html.length).toBeLessThan(plain.length + 200);
       expect(html).toContain(JSON.stringify(brand));
-      expect(html).not.toContain('<!--VOICE_UI_CONFIG-->');
+      expect(html).not.toContain('<!--VOICE_MODE_UI_CONFIG-->');
     }
   });
 

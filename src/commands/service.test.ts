@@ -595,8 +595,8 @@ describe('/voice', () => {
     await addMember({ user_id: NON_ADMIN, agent_group_id: 'ag-1', added_by: null, added_at: now() });
     await chatGroup('mg-dm', 'telegram:1');
     await chatGroup('mg-topic', 'telegram:-100:5');
-    await chatGroup('mg-line', 'voice:abc', 'voice');
-    await chatGroup('mg-line-2', 'voice:def', 'voice');
+    await chatGroup('mg-line', 'voice-mode:abc', 'voice');
+    await chatGroup('mg-line-2', 'voice-mode:def', 'voice');
     await wire('mg-dm', 'ag-1');
     await wire('mg-topic', 'ag-1');
     await wire('mg-line', 'ag-1');
@@ -611,7 +611,7 @@ describe('/voice', () => {
     expect(res.view).toEqual({
       agentName: 'Emma',
       agentGroupId: 'ag-1',
-      links: [link({ platform_id: 'voice:abc' } as MessagingGroup)],
+      links: [link({ platform_id: 'voice-mode:abc' } as MessagingGroup)],
     });
     expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-dm', thread_id: null });
     // Another admin's line is neither bound nor linked.
@@ -623,7 +623,7 @@ describe('/voice', () => {
     const other = await setVoiceTarget('ag-1', chat('mg-dm'), SCOPED_ADMIN, link);
     expect(other).toMatchObject({
       ok: true,
-      view: { links: [link({ platform_id: 'voice:def' } as MessagingGroup)] },
+      view: { links: [link({ platform_id: 'voice-mode:def' } as MessagingGroup)] },
     });
     expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-topic' });
   });
@@ -644,7 +644,7 @@ describe('/voice', () => {
     expect(res).toMatchObject({
       ok: true,
       view: {
-        links: ['https://voice.example/voice?t=tok-voice:abc'],
+        links: ['https://voice.example/voice?t=tok-voice-mode:abc'],
       },
     });
     expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-dm' });
@@ -732,7 +732,7 @@ describe('/voice', () => {
 
     const done = await runVoiceCommand(targets, chat('mg-dm'), OWNER, link);
     expect(voiceCommandReply(done, MD_FMT)).toBe(
-      '🎙 Voice call with **Emma**: https://voice.example/voice?t=tok-voice:abc\n\n' +
+      '🎙 Voice call with **Emma**: https://voice.example/voice?t=tok-voice-mode:abc\n\n' +
         'Voice calls now talk in this chat, until /voice is run in another one.',
     );
     const off = await runVoiceCommand(targets, chat('mg-dm'), OWNER, () => null);

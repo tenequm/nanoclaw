@@ -13,9 +13,9 @@ import {
   WakeWordPipeline,
   WakeWordSpotter,
   pcmToFloat,
-} from './voice-wakeword.js';
+} from './voice-mode-wakeword.js';
 
-const FIXTURES = fileURLToPath(new URL('./voice-wakeword-fixtures/', import.meta.url));
+const FIXTURES = fileURLToPath(new URL('./voice-mode-wakeword-fixtures/', import.meta.url));
 
 /** A 16 kHz mono 16-bit PCM wav's samples. */
 function readWav(file: string): Int16Array {

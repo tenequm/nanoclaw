@@ -14,41 +14,41 @@ import { log } from '../log.js';
 import { canAccessAgentGroup } from '../modules/permissions/access.js';
 import { getUser } from '../modules/permissions/db/users.js';
 
-/** Optional per-agent names for the transcription, one per line; added to VOICE_VOCABULARY. */
-export const VOICE_VOCABULARY_FILE = 'voice.vocabulary.txt';
+/** Optional per-agent names for the transcription, one per line; added to VOICE_MODE_VOCABULARY. */
+export const VOICE_MODE_VOCABULARY_FILE = 'voice.vocabulary.txt';
 export const MAX_VOCABULARY_TERMS = 60;
 export const MAX_VOCABULARY_BYTES = 1024;
 const MAX_VOCABULARY_TERM_CHARS = 80;
 
-export interface VoiceAgent {
+export interface VoiceModeAgent {
   name: string;
-  /** Names the transcription should recognise and spell exactly; see voiceVocabulary. */
+  /** Names the transcription should recognise and spell exactly; see voiceModeVocabulary. */
   vocabulary?: readonly string[];
   /** The agent's own vocabulary file entries: other names the wake phrase `hey <agent>` takes. */
   wakeNames?: readonly string[];
 }
 
-export interface VoiceCaller {
+export interface VoiceModeCaller {
   id: string;
   name: string;
 }
-export interface VoiceLine {
-  agent: VoiceAgent;
-  caller: VoiceCaller;
+export interface VoiceModeLine {
+  agent: VoiceModeAgent;
+  caller: VoiceModeCaller;
   agentGroupId: string;
 }
 
 /** Whether two resolutions of a line still name the same caller and agent; a call ends when they stop. */
-export function sameCallerAndAgent(a: VoiceLine, b: VoiceLine): boolean {
+export function sameCallerAndAgent(a: VoiceModeLine, b: VoiceModeLine): boolean {
   return a.caller.id === b.caller.id && a.caller.name === b.caller.name && a.agentGroupId === b.agentGroupId;
 }
 
 /**
- * The names a voice call should know: VOICE_VOCABULARY (comma-separated) plus the agent's
+ * The names a voice call should know: VOICE_MODE_VOCABULARY (comma-separated) plus the agent's
  * vocabulary file (one per line); none when both are empty. Trimmed, deduplicated
  * case-insensitively and capped, since every term travels to the transcription.
  */
-export function voiceVocabulary(envList: string | undefined, fileText: string | null): string[] {
+export function voiceModeVocabulary(envList: string | undefined, fileText: string | null): string[] {
   const terms = [...(envList ?? '').split(','), ...(fileText ?? '').split(/\r?\n/)];
   const out: string[] = [];
   const seen = new Set<string>();
@@ -68,20 +68,20 @@ export function voiceVocabulary(envList: string | undefined, fileText: string | 
 export interface ResolveLineOptions {
   /** Read the agent's vocabulary file too. Only call setup needs it; the periodic access checks do not. */
   forCall?: boolean;
-  /** VOICE_VOCABULARY as the adapter read it at startup; merged with the agent's vocabulary file. */
+  /** VOICE_MODE_VOCABULARY as the adapter read it at startup; merged with the agent's vocabulary file. */
   vocabulary?: string;
 }
 
 /** Resolve a named personal line and its explicit access before reading the agent's files. */
-export async function resolveVoiceLine(
+export async function resolveVoiceModeLine(
   platformId: string,
   instance?: string,
   options: ResolveLineOptions = {},
-): Promise<VoiceLine | null> {
+): Promise<VoiceModeLine | null> {
   try {
     const caller = await getUser(platformId);
-    if (!caller || caller.kind !== 'voice' || !caller.display_name?.trim()) return null;
-    const mg = await getMessagingGroupByPlatform('voice', platformId, instance);
+    if (!caller || caller.kind !== 'voice-mode' || !caller.display_name?.trim()) return null;
+    const mg = await getMessagingGroupByPlatform('voice-mode', platformId, instance);
     if (!mg || mg.is_group || mg.unknown_sender_policy !== 'strict') return null;
     const wirings = await getMessagingGroupAgents(mg.id);
     if (wirings.length !== 1 || wirings[0].sender_scope !== 'known') return null;
@@ -91,10 +91,10 @@ export async function resolveVoiceLine(
     if (!group) return null;
     // The persona reader's bounded, symlink- and FIFO-safe read: the file is agent-writable.
     const fileText = options.forCall
-      ? readGroupPersona(path.join(GROUPS_DIR, group.folder), VOICE_VOCABULARY_FILE)
+      ? readGroupPersona(path.join(GROUPS_DIR, group.folder), VOICE_MODE_VOCABULARY_FILE)
       : null;
-    const vocabulary = options.forCall ? voiceVocabulary(options.vocabulary, fileText) : undefined;
-    const wakeNames = fileText ? voiceVocabulary(undefined, fileText) : undefined;
+    const vocabulary = options.forCall ? voiceModeVocabulary(options.vocabulary, fileText) : undefined;
+    const wakeNames = fileText ? voiceModeVocabulary(undefined, fileText) : undefined;
     return {
       caller: { id: caller.id, name: caller.display_name.trim() },
       agentGroupId: group.id,
@@ -105,7 +105,7 @@ export async function resolveVoiceLine(
       },
     };
   } catch (err) {
-    log.warn('voice: could not authorize the voice line', { platformId, err });
+    log.warn('voice-mode: could not authorize the voice line', { platformId, err });
     return null;
   }
 }

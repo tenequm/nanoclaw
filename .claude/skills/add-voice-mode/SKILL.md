@@ -32,10 +32,10 @@ speech, plus the agent's own model usage. The link token is the only thing
 between the internet and those bills — treat the link like a password.
 
 Calls end after 15 minutes, and each line permits at most 12 start attempts in
-an hour. Set `VOICE_MAX_CALL_SECONDS` (default `900`) and
-`VOICE_MAX_CALLS_PER_HOUR` (default `12`) to positive integers to change these
+an hour. Set `VOICE_MODE_MAX_CALL_SECONDS` (default `900`) and
+`VOICE_MODE_MAX_CALLS_PER_HOUR` (default `12`) to positive integers to change these
 limits. Attempts include failed starts. Each line may also spend at most 120
-call minutes per UTC day (`VOICE_MAX_MINUTES_PER_DAY`): a call is refused once
+call minutes per UTC day (`VOICE_MODE_MAX_MINUTES_PER_DAY`): a call is refused once
 the day's minutes are gone, and a running call ends when they run out. The
 counters are in memory and reset when the host restarts, so this caps a day's
 spend per line rather than guaranteeing a budget.
@@ -46,17 +46,17 @@ transcription is hinted at Ukrainian and English, and the agent is told that a
 transcript that looks Russian is Ukrainian misspelled by speech recognition.
 
 The transcription also gets a custom vocabulary of names the caller is likely
-to say, so it spells them exactly: `VOICE_VOCABULARY` (comma-separated, in
+to say, so it spells them exactly: `VOICE_MODE_VOCABULARY` (comma-separated, in
 `.env`) plus the agent's optional `voice.vocabulary.txt` in its group folder
 (one term per line, read with a size cap, symlinks and FIFOs refused),
-e.g. `VOICE_VOCABULARY=Andy, Енді`. Keep both to names: the agents' names and
+e.g. `VOICE_MODE_VOCABULARY=Andy, Енді`. Keep both to names: the agents' names and
 their spellings. Every term biases the transcription toward it, and short
 jargon terms (tool or host names) get substituted for short spoken words: in
 tests `send it` came back as a tool name and `scratch that` as another, so a
 command was lost. Both are merged, trimmed and
-deduplicated, and capped at 60 terms and 1 KB. `VOICE_VOCABULARY` is read at
+deduplicated, and capped at 60 terms and 1 KB. `VOICE_MODE_VOCABULARY` is read at
 startup, the file on every call. The agent maintains the file itself: the
-resident `voice-formatting` instructions (step 3) tell it to add names a
+resident `voice-mode-formatting` instructions (step 3) tell it to add names a
 transcript misspelled, so read or edit `groups/<folder>/voice.vocabulary.txt` to check
 or correct its entries. The file's entries also count as the agent's name in the wake
 phrase `hey <agent>` (see spoken commands below), so another script or spelling
@@ -73,30 +73,30 @@ page, the LiveKit engine, its worker and their tests into place (overwrite —
 the branch is canonical):
 
 ```nc:copy from-branch:channels
-src/channels/voice.ts
-src/channels/voice-line.ts
-src/channels/voice-call-page.ts
-src/channels/voice-livekit.ts
-src/channels/voice-livekit-protocol.ts
-src/voice-livekit-worker.ts
-src/voice-gemini-live.ts
-src/voice-wakeword.ts
-assets/voice-wakeword/melspectrogram.onnx
-assets/voice-wakeword/embedding_model.onnx
-assets/voice-wakeword/hey_livekit.onnx
-assets/voice-wakeword/LICENSE
-assets/voice-wakeword/NOTICE
-src/channels/voice-adapter.test.ts
-src/channels/voice-registration.test.ts
-src/channels/voice-line.test.ts
-src/channels/voice-call-page.test.ts
-src/channels/voice-livekit.test.ts
-src/channels/voice-call-session.test.ts
-src/voice-livekit-worker.test.ts
-src/voice-gemini-live.test.ts
-src/voice-wakeword.test.ts
-src/voice-wakeword-fixtures/positive.wav
-src/voice-wakeword-fixtures/negative.wav
+src/channels/voice-mode.ts
+src/channels/voice-mode-line.ts
+src/channels/voice-mode-page.ts
+src/channels/voice-mode-livekit.ts
+src/channels/voice-mode-protocol.ts
+src/voice-mode-worker.ts
+src/voice-mode-gemini-live.ts
+src/voice-mode-wakeword.ts
+assets/voice-mode-wakeword/melspectrogram.onnx
+assets/voice-mode-wakeword/embedding_model.onnx
+assets/voice-mode-wakeword/hey_livekit.onnx
+assets/voice-mode-wakeword/LICENSE
+assets/voice-mode-wakeword/NOTICE
+src/channels/voice-mode-adapter.test.ts
+src/channels/voice-mode-registration.test.ts
+src/channels/voice-mode-line.test.ts
+src/channels/voice-mode-page.test.ts
+src/channels/voice-mode-livekit.test.ts
+src/channels/voice-mode-call-session.test.ts
+src/voice-mode-worker.test.ts
+src/voice-mode-gemini-live.test.ts
+src/voice-mode-wakeword.test.ts
+src/voice-mode-wakeword-fixtures/positive.wav
+src/voice-mode-wakeword-fixtures/negative.wav
 ```
 
 ### 2. Register the adapter
@@ -110,7 +110,7 @@ wake reason in `src/request-wake.ts`, and the agent runner's idle start for
 that wake. Apply it to this fork's trunk, not to plain upstream:
 
 ```nc:append to:src/channels/index.ts
-import './voice.js';
+import './voice-mode.js';
 ```
 
 ### 3. Teach agents to write for the ear
@@ -121,14 +121,14 @@ prose with no markdown, links or code, numbers as words, Ukrainian never
 Russian). What a turn's note cannot carry lives in resident instructions:
 messages that answer no turn, no question cards or attachments, where reading
 material goes, and the vocabulary file. The host composes
-`container/skills/voice-formatting/instructions.md` into every group's
-`CLAUDE.md` at spawn, as the section `NanoClaw Skill: voice-formatting` (a group
-with an explicit skill list needs `voice-formatting` in it), so the agent has it
+`container/skills/voice-mode-formatting/instructions.md` into every group's
+`CLAUDE.md` at spawn, as the section `NanoClaw Skill: voice-mode-formatting` (a group
+with an explicit skill list needs `voice-mode-formatting` in it), so the agent has it
 before the first call rather than on demand. Copy it separately so reapplying
 missing adapter files does not overwrite customized instructions:
 
 ```nc:copy from-branch:channels
-container/skills/voice-formatting/instructions.md
+container/skills/voice-mode-formatting/instructions.md
 ```
 
 ### 4. Build
@@ -139,7 +139,7 @@ own Gemini Live client), `@livekit/agents-plugin-silero` (Silero VAD on
 `onnxruntime-node`, whose npm package ships the CPU binaries for linux-x64 and
 macOS; its postinstall only fetches optional CUDA files and pnpm skips it),
 `@livekit/rtc-node`, `livekit-server-sdk` and `zod` (a peer of the agents
-package). The acoustic wake word runs the three models under `assets/voice-wakeword/`
+package). The acoustic wake word runs the three models under `assets/voice-mode-wakeword/`
 (from [livekit-wakeword](https://github.com/livekit/livekit-wakeword), Apache-2.0,
 see the `NOTICE` there) on the same `onnxruntime-node`, which the worker imports
 directly, so it is a direct dependency at Silero's version:
@@ -162,12 +162,12 @@ page check, and the integration tests (a fake LiveKit server behind the real
 webhook server, and the worker's turn-taking rules):
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-registration.test.ts src/channels/voice-adapter.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts src/channels/voice-livekit.test.ts src/channels/voice-call-session.test.ts src/voice-livekit-worker.test.ts src/voice-gemini-live.test.ts src/voice-wakeword.test.ts
+pnpm exec vitest run src/channels/voice-mode-registration.test.ts src/channels/voice-mode-adapter.test.ts src/channels/voice-mode-line.test.ts src/channels/voice-mode-page.test.ts src/channels/voice-mode-livekit.test.ts src/channels/voice-mode-call-session.test.ts src/voice-mode-worker.test.ts src/voice-mode-gemini-live.test.ts src/voice-mode-wakeword.test.ts
 ```
 
-`voice-registration.test.ts` imports the real channel barrel and asserts the
+`voice-mode-registration.test.ts` imports the real channel barrel and asserts the
 registry contains `voice` — it goes red if the import line drifts.
-`voice-livekit.test.ts` drives the call page and its routes over HTTP, opens a
+`voice-mode-livekit.test.ts` drives the call page and its routes over HTTP, opens a
 call against the fake LiveKit server, round-trips a transcribed turn to an
 inbound message and an agent reply to the worker's event stream, and covers
 the limits, access checks and the call chat. A real call is verified manually
@@ -238,12 +238,12 @@ forward:
 
 | Key | Default | What |
 | --- | --- | --- |
-| `VOICE_TRUSTED_PROXY_CIDRS` | empty (loopback only) | Comma-separated CIDRs of the proxy as the host sees it. Use the narrowest range: the proxy's own address (`/32`) or its Docker network's subnet (`docker network inspect <network>`). Any container in a trusted range can claim any client. |
-| `VOICE_ALLOWED_CLIENT_CIDRS` | empty (any client the proxy forwards) | Comma-separated CIDRs the forwarded client must be in. The client is the rightmost `X-Forwarded-For` hop outside the trusted proxies, so a client cannot prepend its way in. For a tailnet-only service: `100.64.0.0/10,fd7a:115c:a1e0::/48`. |
+| `VOICE_MODE_TRUSTED_PROXY_CIDRS` | empty (loopback only) | Comma-separated CIDRs of the proxy as the host sees it. Use the narrowest range: the proxy's own address (`/32`) or its Docker network's subnet (`docker network inspect <network>`). Any container in a trusted range can claim any client. |
+| `VOICE_MODE_ALLOWED_CLIENT_CIDRS` | empty (any client the proxy forwards) | Comma-separated CIDRs the forwarded client must be in. The client is the rightmost `X-Forwarded-For` hop outside the trusted proxies, so a client cannot prepend its way in. For a tailnet-only service: `100.64.0.0/10,fd7a:115c:a1e0::/48`. |
 
 A request is admitted if its peer is loopback, or its peer is in
-`VOICE_TRUSTED_PROXY_CIDRS` and the forwarded client is in
-`VOICE_ALLOWED_CLIENT_CIDRS` (when set). LAN peers outside the trusted ranges
+`VOICE_MODE_TRUSTED_PROXY_CIDRS` and the forwarded client is in
+`VOICE_MODE_ALLOWED_CLIENT_CIDRS` (when set). LAN peers outside the trusted ranges
 still get 403, and an `X-Forwarded-For` from them is ignored. The worker's
 routes (`/webhook/voice/livekit/agent/…`) never pass through the proxy gate:
 they stay loopback-only and are not served under `/voice` at all. Invalid
@@ -255,18 +255,18 @@ resolver name and the host gateway address are placeholders):
 ```yaml
 http:
   routers:
-    nanoclaw-voice:
+    nanoclaw-voice-mode:
       rule: Host(`voice.example.com`) && PathPrefix(`/voice`)
       entryPoints: [websecure]
       tls: { certResolver: letsencrypt }
       middlewares: [voice-allowlist]
-      service: nanoclaw-voice
+      service: nanoclaw-voice-mode
   middlewares:
     voice-allowlist:
       ipAllowList:
         sourceRange: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
   services:
-    nanoclaw-voice:
+    nanoclaw-voice-mode:
       loadBalancer:
         servers:
           - url: http://172.18.0.1:3000   # the proxy network's gateway (the Docker host), WEBHOOK_PORT
@@ -275,15 +275,15 @@ http:
 In `.env`, with the proxy network's subnet (or the proxy's `/32`) as the trusted range:
 
 ```
-VOICE_PUBLIC_URL=https://voice.example.com
-VOICE_TRUSTED_PROXY_CIDRS=172.18.0.0/16
-VOICE_ALLOWED_CLIENT_CIDRS=100.64.0.0/10,fd7a:115c:a1e0::/48
+VOICE_MODE_PUBLIC_URL=https://voice.example.com
+VOICE_MODE_TRUSTED_PROXY_CIDRS=172.18.0.0/16
+VOICE_MODE_ALLOWED_CLIENT_CIDRS=100.64.0.0/10,fd7a:115c:a1e0::/48
 ```
 
 The two allowlists are independent layers: the proxy's middleware refuses
 outsiders at the edge, and the host refuses anything that skipped the proxy or
 came through it from elsewhere. For a local-development setup that needs no
-gate at all, `VOICE_ALLOW_NON_LOOPBACK=1` serves the voice routes to every
+gate at all, `VOICE_MODE_ALLOW_NON_LOOPBACK=1` serves the voice routes to every
 peer.
 
 The origin to give below is the front's, with no path. Set-if-absent, so a
@@ -294,7 +294,7 @@ What origin can a caller's browser reach this NanoClaw host at? (e.g. http://loc
 ```
 
 ```nc:env-set
-VOICE_PUBLIC_URL={{public_url}}
+VOICE_MODE_PUBLIC_URL={{public_url}}
 ```
 
 ### Link token
@@ -303,7 +303,7 @@ The voice line's secret. Reuse the one already in `.env` on a re-run, otherwise
 mint a fresh one:
 
 ```nc:run capture:link_token validate:^[0-9a-f]{16}([0-9a-f]{16})?$ effect:fetch
-grep -s '^VOICE_LINK_TOKEN=' .env | cut -d= -f2- | cut -d, -f1 | grep -E '^[0-9a-f]{16}([0-9a-f]{16})?$' || openssl rand -hex 16
+grep -s '^VOICE_MODE_LINK_TOKEN=' .env | cut -d= -f2- | cut -d, -f1 | grep -E '^[0-9a-f]{16}([0-9a-f]{16})?$' || openssl rand -hex 16
 ```
 
 Tokens minted by earlier versions of this skill are 16 hex characters and keep
@@ -311,10 +311,10 @@ working; the host logs a warning for them. To upgrade a line, replace its token
 with `openssl rand -hex 16` and re-run the wiring steps for the new line id.
 
 ```nc:env-set
-VOICE_LINK_TOKEN={{link_token}}
+VOICE_MODE_LINK_TOKEN={{link_token}}
 ```
 
-The line id is what NanoClaw calls this link (`voice:<line id>`): the first
+The line id is what NanoClaw calls this link (`voice-mode:<line id>`): the first
 twelve hex characters of the token's SHA-256, derived the same way the adapter
 derives it, so the token itself is never written anywhere but `.env`:
 
@@ -371,11 +371,11 @@ create a strict line with a known-sender wiring. Each command is independent;
 the validated name allows Unicode and apostrophes while excluding shell syntax:
 
 ```nc:run effect:wire
-ncl users create --id "voice:{{line_id}}" --kind voice --display-name "{{caller_name}}"
-ncl users update --id "voice:{{line_id}}" --display-name "{{caller_name}}"
-ncl members add --user "voice:{{line_id}}" --group "$(ncl groups list --json | jq -er --arg f '{{agent_folder}}' '.data[] | select(.folder==$f) | .id')"
-ncl messaging-groups list --json | jq -e --arg p "voice:{{line_id}}" '.data[] | select(.platform_id==$p)' >/dev/null || ncl messaging-groups create --channel-type voice --platform-id "voice:{{line_id}}" --name "Personal voice line" --is-group 0 --unknown-sender-policy strict
-ncl wirings create --channel-type voice --platform-id "voice:{{line_id}}" --agent-group "{{agent_folder}}" --session-mode shared --sender-scope known
+ncl users create --id "voice-mode:{{line_id}}" --kind voice --display-name "{{caller_name}}"
+ncl users update --id "voice-mode:{{line_id}}" --display-name "{{caller_name}}"
+ncl members add --user "voice-mode:{{line_id}}" --group "$(ncl groups list --json | jq -er --arg f '{{agent_folder}}' '.data[] | select(.folder==$f) | .id')"
+ncl messaging-groups list --json | jq -e --arg p "voice-mode:{{line_id}}" '.data[] | select(.platform_id==$p)' >/dev/null || ncl messaging-groups create --channel-type voice --platform-id "voice-mode:{{line_id}}" --name "Personal voice line" --is-group 0 --unknown-sender-policy strict
+ncl wirings create --channel-type voice --platform-id "voice-mode:{{line_id}}" --agent-group "{{agent_folder}}" --session-mode shared --sender-scope known
 ```
 
 The adapter checks the named caller's membership before returning private agent
@@ -393,21 +393,21 @@ reads its settings from that directory's `.env` itself, like the host, so no
 secret goes into its environment or its job processes):
 
 ```bash
-pnpm run voice-worker        # node dist/voice-livekit-worker.js start
+pnpm run voice-worker        # node dist/voice-mode-worker.js start
 ```
 
 Host and worker must be from the same build, so restart them together. As a
 systemd user unit:
 
 ```ini
-# ~/.config/systemd/user/nanoclaw-voice-worker.service
+# ~/.config/systemd/user/nanoclaw-voice-mode-worker.service
 [Unit]
 Description=NanoClaw LiveKit voice worker
 After=network-online.target
 
 [Service]
 WorkingDirectory=%h/nanoclaw
-ExecStart=/usr/bin/env node dist/voice-livekit-worker.js start
+ExecStart=/usr/bin/env node dist/voice-mode-worker.js start
 Restart=on-failure
 TimeoutStopSec=90
 
@@ -430,9 +430,9 @@ The call link is {{public_url}}/voice?t={{link_token}} — keep it private, anyo
 
 Callers talk to the agent itself: each turn they speak is a message to it, and
 everything it replies during the call is spoken. To add a second line for
-someone else, append another token to `VOICE_LINK_TOKEN` (comma-separated),
+someone else, append another token to `VOICE_MODE_LINK_TOKEN` (comma-separated),
 derive its line id the same way, and repeat the named-user, membership and
-strict wiring steps for `voice:<that line id>`. Restart to load the additional
+strict wiring steps for `voice-mode:<that line id>`. Restart to load the additional
 token.
 
 To uninstall: see [REMOVE.md](REMOVE.md).
@@ -447,7 +447,7 @@ LiveKit call in `ui/src/lib/livekit-call.ts`; MIT, see
 rail of keys, a dot-matrix display that shows the caller's voice in white,
 thinking in orange and the agent's voice in orange, captions that fade in word
 by word, and three device finishes. It ships as one self-contained document
-inside `src/channels/voice-call-page.ts` (generated, do not edit by hand), so
+inside `src/channels/voice-mode-page.ts` (generated, do not edit by hand), so
 the host build, the copy list and the routes never change when the look does.
 `livekit-client` and `@livekit/components-react` are bundled into it, no CDN.
 
@@ -455,7 +455,7 @@ Change the look without a rebuild with one `.env` key holding a JSON object,
 injected into the page when it is served:
 
 ```
-VOICE_UI={"colorway":"field","presence":"matrix","brand":"Casa line"}
+VOICE_MODE_UI={"colorway":"field","presence":"matrix","brand":"Casa line"}
 ```
 
 | key              | values                                                  | default                                            |
@@ -476,7 +476,7 @@ choice stays in their browser. To change the components themselves, edit
 `ui/src`, then from `ui/` run
 `pnpm install --frozen-lockfile --ignore-scripts && pnpm build`. The build regenerates
 the module and stamps it with a hash of the explicit `source-files.json` inputs;
-`src/channels/voice-call-page.test.ts` fails when the two drift, so always
+`src/channels/voice-mode-page.test.ts` fails when the two drift, so always
 rebuild the module and commit it with the source change, never hand-edit it.
 `ui/` is its own pnpm workspace and sits outside the root build, lint, format
 and test globs. Ordinary installs copy the generated page
@@ -494,25 +494,25 @@ under the agent, a reply not spoken, a send word with nothing to send), and
 Optional host settings: `LIVEKIT_WORKER_URL` (server-side URL for the worker
 and the host's room/dispatch API calls, e.g. `ws://127.0.0.1:7880` when the
 server runs on the same box; defaults to `LIVEKIT_URL`), `LIVEKIT_AGENT_NAME`
-(dispatch name, default `nanoclaw-voice`; set the same value for host and
+(dispatch name, default `nanoclaw-voice-mode`; set the same value for host and
 worker), `LIVEKIT_HOST_URL` (worker only: where it reaches this host's webhook
 server, default `http://127.0.0.1:<WEBHOOK_PORT>`; it must be a loopback
-address unless `VOICE_ALLOW_NON_LOOPBACK=1`, like the worker's routes on the
+address unless `VOICE_MODE_ALLOW_NON_LOOPBACK=1`, like the worker's routes on the
 host, which no trusted proxy opens; the worker never takes an address from the
 dispatch). The transcription and speech settings, read by the host and handed
 to the worker with each call:
 
 | Key | Default | What |
 | --- | --- | --- |
-| `VOICE_STT_MODEL` | `gemini-3.5-transcribe-live` | Transcribes each caller turn over the Gemini Live API as it is spoken, as one manual activity (below), verbatim, with the language hints `uk-UA` and `en-US`, and the line's vocabulary plus the spoken commands as custom vocabulary. |
-| `VOICE_STT_FALLBACK_MODEL` | - | Deprecated and ignored: there is no unary fallback any more, and a call whose host still sends one logs that once. While the Live API fails, a turn with no text is lost (the caller hears "Sorry, I didn't catch that") and the next turn tries again. |
-| `VOICE_TTS_MODEL` | `gemini-3.8-flash-tts` | Speaks the agent's replies. |
-| `VOICE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Speaks when the main model fails before any audio of a line (a transient error is tried once more first); the main model is skipped for 30 seconds, then tried again on the next line. A failure after a line's audio started ends that line, never repeats it. `off` for none. |
-| `VOICE_TTS_VOICE` | `Alnilam` | Prebuilt Gemini voice, for both TTS models. |
-| `VOICE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
-| `VOICE_MIRROR` | `telegram` | Channel type of the default call chat, used until `/voice` picks one (see below); `off` keeps calls on the voice line until then. |
+| `VOICE_MODE_STT_MODEL` | `gemini-3.5-transcribe-live` | Transcribes each caller turn over the Gemini Live API as it is spoken, as one manual activity (below), verbatim, with the language hints `uk-UA` and `en-US`, and the line's vocabulary plus the spoken commands as custom vocabulary. |
+| `VOICE_MODE_STT_FALLBACK_MODEL` | - | Deprecated and ignored: there is no unary fallback any more, and a call whose host still sends one logs that once. While the Live API fails, a turn with no text is lost (the caller hears "Sorry, I didn't catch that") and the next turn tries again. |
+| `VOICE_MODE_TTS_MODEL` | `gemini-3.8-flash-tts` | Speaks the agent's replies. |
+| `VOICE_MODE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Speaks when the main model fails before any audio of a line (a transient error is tried once more first); the main model is skipped for 30 seconds, then tried again on the next line. A failure after a line's audio started ends that line, never repeats it. `off` for none. |
+| `VOICE_MODE_TTS_VOICE` | `Alnilam` | Prebuilt Gemini voice, for both TTS models. |
+| `VOICE_MODE_SILENCE_MS` | `2500` | Silence that ends the caller's turn (300 to 30000); shorter pauses mid-thought keep it open. |
+| `VOICE_MODE_MIRROR` | `telegram` | Channel type of the default call chat, used until `/voice` picks one (see below); `off` keeps calls on the voice line until then. |
 
-The worker itself reads `VOICE_MAX_SPOKEN_CHARS` (default `0`: no cap, every
+The worker itself reads `VOICE_MODE_MAX_SPOKEN_CHARS` (default `0`: no cap, every
 message is spoken in full). Set it to a positive number of characters to cap
 speech: an agent message longer than that, after markdown and links are stripped,
 is spoken up to its last sentence end within the cap when that end is past 60%
@@ -523,13 +523,13 @@ that talks on the voice line, with no chat to hold the rest, closes with
 spoken during the call, replies and proactive ones alike, and the captions show
 what was spoken; the full text stays in the chat.
 
-`VOICE_TTS_DEESS` (default on; `0`, `off` or `false` turns it off) runs the agent's
+`VOICE_MODE_TTS_DEESS` (default on; `0`, `off` or `false` turns it off) runs the agent's
 speech through a split-band de-esser on its way to the call: above 4.5 kHz the
 signal is turned down, up to 6 dB, while it is louder than the voice below the
 split, with no added latency. Reply recordings hold what was sent. It is
 provisional while its effect on the voice is judged.
 
-`VOICE_TTS_NOTCH` (default on; `0`, `off` or `false` turns it off) runs it, before
+`VOICE_MODE_TTS_NOTCH` (default on; `0`, `off` or `false` turns it off) runs it, before
 the de-esser, through fixed notches at the tones `gemini-3.8-flash-tts` whistles
 on once one streamed request passes about 35 s of audio (a fault of Google's
 streaming path; the unary path is clean). They sit at the same frequencies in
@@ -537,38 +537,38 @@ every voice and run, the loudest near 8.1, 9.1 and 10.9 kHz. The notches take
 under 1 dB off a clean voice above 6 kHz and nothing below, with no added latency.
 Drop them once Google fixes the stream.
 
-It also reads `VOICE_WAKE_MODEL`, `VOICE_WAKE_THRESHOLD` and `VOICE_WAKE_PHRASE`, for
-the wake switch (see spoken commands below). `VOICE_WAKE_MODEL` is a wake word
+It also reads `VOICE_MODE_WAKE_MODEL`, `VOICE_MODE_WAKE_THRESHOLD` and `VOICE_MODE_WAKE_PHRASE`, for
+the wake switch (see spoken commands below). `VOICE_MODE_WAKE_MODEL` is a wake word
 classifier `.onnx` in livekit-wakeword's format, a path (default: the bundled
-`assets/voice-wakeword/hey_livekit.onnx`; `off` for none, and `hey <agent>` in the
-transcript opens a turn). `VOICE_WAKE_PHRASE` is what that model listens for, as the
+`assets/voice-mode-wakeword/hey_livekit.onnx`; `off` for none, and `hey <agent>` in the
+transcript opens a turn). `VOICE_MODE_WAKE_PHRASE` is what that model listens for, as the
 page shows it: `Hey LiveKit` by default,
-for the bundled model; set it whenever `VOICE_WAKE_MODEL` names your own classifier
-(`VOICE_WAKE_PHRASE="Hey Jarvis"`). It is shown as written, and the host reads it too,
+for the bundled model; set it whenever `VOICE_MODE_WAKE_MODEL` names your own classifier
+(`VOICE_MODE_WAKE_PHRASE="Hey Jarvis"`). It is shown as written, and the host reads it too,
 so the page names it before the call. It does not change what the model hears. openWakeWord's
 classifiers load too, but their pretrained models are CC BY-NC-SA 4.0
-(non-commercial): fine for your own install, never to be committed or shipped. `VOICE_WAKE_THRESHOLD` is the
+(non-commercial): fine for your own install, never to be committed or shipped. `VOICE_MODE_WAKE_THRESHOLD` is the
 score (0 to 1) that counts as the wake word: by default 0.68, livekit-wakeword's
 documented operating point for `hey_livekit`, and 0.5 for another model.
-`VOICE_WAKE_START_SECONDS` (default 8) and `VOICE_WAKE_IDLE_SECONDS` (default 20)
+`VOICE_MODE_WAKE_START_SECONDS` (default 8) and `VOICE_MODE_WAKE_IDLE_SECONDS` (default 20)
 are how long a turn the wake phrase opened waits for speech, right after the phrase
 and then after the last words, before it goes back to waiting (`0`: never).
 
-It also reads `VOICE_RECORDINGS_DAYS` (default `0`, off): with a
+It also reads `VOICE_MODE_RECORDINGS_DAYS` (default `0`, off): with a
 number of days, it saves every caller turn it hears as a 16 kHz mono WAV plus a
 JSON sidecar (call and line id, agent, turn number, start and end, speech
 length, the transcription model that heard it, the transcript or why there was
 none, and the host's answer) under
 `data/voice-recordings/<agent>/<YYYY-MM-DD>/<call id>-<turn>.wav|.json`, owner-only
 (files 0600, folders 0700), and deletes files older than that many days at
-start and once a day. The recordings are the caller's voice: they stay on this
+start and once a day. The recordings are the caller's voice-mode: they stay on this
 machine under `data/` (which git ignores), nothing uploads or backs them up, and
 anyone who can read the NanoClaw folder as its user can play them.
 
-Restart the host to load them. Calls end at `VOICE_MAX_CALL_SECONDS`
+Restart the host to load them. Calls end at `VOICE_MODE_MAX_CALL_SECONDS`
 (default 15 minutes) or when the day's minutes run out, whichever comes first.
 
-The worker's health check listens on `127.0.0.1:8089` (`VOICE_WORKER_HEALTH_PORT`
+The worker's health check listens on `127.0.0.1:8089` (`VOICE_MODE_WORKER_HEALTH_PORT`
 in `.env`). At startup it logs its protocol version and the host URL it uses
 (set `LIVEKIT_HOST_URL` in `.env` if that is not this NanoClaw's webhook
 server; a call the host does not answer ends at once with the URL in the log).
@@ -576,7 +576,7 @@ Each idle job process loads the Silero models before a call reaches it. On
 SIGTERM it takes no new calls and gives running ones 60 seconds before closing
 them, so a restart cuts a longer call short. The job metadata is versioned
 (`v: 4`). A worker that gets a call of another version joins only to set its
-`nanoclaw.voice.updating` attribute, so the caller's page says "The voice service
+`nanoclaw.voice-mode.updating` attribute, so the caller's page says "The voice service
 is updating. Try again in a minute.", and leaves; the page says the same when
 no worker joins within 25 seconds (worker down, or an older one that turns such
 calls away), and the host logs why the call ended.
@@ -598,7 +598,7 @@ state (`lk.agent.state`), and keeps the turns in one state machine. Then:
 
 - Silero VAD follows the caller's speech (VAD-only turn detection: LiveKit's
   turn detector models have no Ukrainian). A turn opens at the caller's speech and
-  survives pauses; it ends after `VOICE_SILENCE_MS` of silence counted from the end
+  survives pauses; it ends after `VOICE_MODE_SILENCE_MS` of silence counted from the end
   of their speech (Silero reports an end 550 ms into the silence, so that is the
   shortest a turn can close in).
 - A turn is one Gemini Live activity on a socket of its own (manual activity:
@@ -621,11 +621,11 @@ state (`lk.agent.state`), and keeps the turns in one state machine. Then:
   messages; with no call chat, every agent message for the line) goes to the
   worker complete over the host's event stream, and the agent's typing there is
   the worker's "thinking". The worker strips markdown, URLs and tags and speaks
-  it uninterruptibly, in full unless `VOICE_MAX_SPOKEN_CHARS` (above) caps it,
+  it uninterruptibly, in full unless `VOICE_MODE_MAX_SPOKEN_CHARS` (above) caps it,
   synthesized whole in one streamed TTS request (so a very long message waits
   longer for its first audio). Its caption shows as its audio starts.
   Replies never overlap, and a reply waits for a caller who is mid-turn (at most
-  `VOICE_SILENCE_MS` plus ten seconds, then it takes the channel), also one who
+  `VOICE_MODE_SILENCE_MS` plus ten seconds, then it takes the channel), also one who
   started speaking while it was being synthesized: that speech is a turn.
 - While the agent's audio plays, the caller is not transcribed (no barge-in).
   While the agent works the page says it is thinking; the caller can keep
@@ -655,7 +655,7 @@ state (`lk.agent.state`), and keeps the turns in one state machine. Then:
   one "Too many turns - give it a moment." (and their Ukrainian lines). When a
   reply cannot be synthesized, a line saying so. All of these also show as captions. The
   worker also sends JSON messages per caller turn (noise is not reported) on the text stream topic
-  `nanoclaw.voice.turn`: `{"turn": n, "status": "sending" | "sent" | "working" | "lost", "reason"?:
+  `nanoclaw.voice-mode.turn`: `{"turn": n, "status": "sending" | "sent" | "working" | "lost", "reason"?:
   "stt" | "empty" | "rejected" | "rate_limited" | "timeout", "text"?: …}`.
   Every turn handed to the host first gets "sending", once the closing silence
   and the final transcript are in and before the host answers (a turn lost to
@@ -667,14 +667,14 @@ state (`lk.agent.state`), and keeps the turns in one state machine. Then:
   stand in for the pickup, so "working" there means "working, with your turn in
   hand", not "on your turn". The call page takes no action on it.
 - Right before each line it speaks, the worker sends one JSON message on
-  `nanoclaw.voice.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
+  `nanoclaw.voice-mode.reply`: `{"reply": n, "turn"?: n, "part"?: k, "unprompted"?:
   true, "notice"?: true, "more"?: true}`. `turn` is the caller turn the agent
   message answers (from the host event's `turn`, the utterance id the 202 named;
   a turn the worker cannot map gets no label), `unprompted` a message answering
   no turn of this call, `notice` the worker's own lost-turn or failure line, and
   `more` that another line is already queued behind it.
-- While a finished stretch of caller speech waits out `VOICE_SILENCE_MS`, the
-  worker sets the attribute `nanoclaw.voice.pending` to
+- While a finished stretch of caller speech waits out `VOICE_MODE_SILENCE_MS`, the
+  worker sets the attribute `nanoclaw.voice-mode.pending` to
   `"<n>:<elapsedMs>:<silenceMs>"` and clears it when the caller speaks again,
   the turn is sent, dropped or overdue, or the agent speaks.
 
@@ -687,16 +687,16 @@ disconnects caller and worker.
 
 **The call chat and `/voice`.** A call talks in one of the agent's chats, so
 the agent answers with that chat's context and the chat shows both sides. A
-line's caller is its own `voice:<line id>` user, linked to no other account, so
+line's caller is its own `voice-mode:<line id>` user, linked to no other account, so
 the operator first names the line's owner, the person's user on a chat
 platform, and then adds the same person's other chat accounts, so `/voice`
 (Telegram) and `!voice` (Slack) both work for the line (`ncl users list` shows
 the ids; operator only, from the host):
 
 ```bash
-ncl voice-lines set --line voice:<line id> --owner telegram:<their id>
-ncl voice-lines add-owner --line voice:<line id> --owner slack:<their id>
-ncl voice-lines get voice:<line id>   # owners and the current call chat
+ncl voice-lines set --line voice-mode:<line id> --owner telegram:<their id>
+ncl voice-lines add-owner --line voice-mode:<line id> --owner slack:<their id>
+ncl voice-lines get voice-mode:<line id>   # owners and the current call chat
 ```
 
 `remove-owner --line ... --owner ...` drops one account (never the last;
@@ -738,22 +738,22 @@ turn passes with no message or typing from the agent there. A `/voice` chat that
 is no longer wired to the agent, or none of whose owner accounts is still an
 admin of it, is ignored (the host logs it).
 
-Before any `/voice` the default is the `VOICE_MIRROR` rule: the one live (not
+Before any `/voice` the default is the `VOICE_MODE_MIRROR` rule: the one live (not
 denied, not detached) chat of that channel type wired to the agent, or the one
 direct chat among several, with the line's own caller as the sender. That chat
 then converses: the caller's turns go into its session and every agent message
 to it is spoken during the call, even when it is not the caller's own chat, so
 run `/voice` where calls should talk when that matters. With none,
-with several and no single direct chat, or with `VOICE_MIRROR=off`, the call
+with several and no single direct chat, or with `VOICE_MODE_MIRROR=off`, the call
 talks on the voice line itself (replies come back by their `livekit:` reply
 id, nothing is posted) and the host logs why once.
 
 The page's readout follows the worker: Listening, `<agent>` is working (with
-"you can keep talking" and a local wait clock) while `nanoclaw.voice.thinking`
+"you can keep talking" and a local wait clock) while `nanoclaw.voice-mode.thinking`
 is set, and `<agent>` is speaking (speech is ignored until the reply finishes;
 the mute key says "Paused for reply"); captions come from
 `lk.transcription` (the caller's interim text shows live), and each caller turn
-gets a small sent / not-sent mark from the worker's `nanoclaw.voice.turn`
+gets a small sent / not-sent mark from the worker's `nanoclaw.voice-mode.turn`
 stream. A lost turn also stays as a notice above the transcript until a later
 turn is sent; a `timeout` reads "delivery not confirmed - check the chat before
 repeating", since the host may still have it. The header names the chat the
@@ -766,7 +766,7 @@ writes why the call ended (`"end"`: `limit_duration`, `limit_daily`,
 in a deploy) or `worker_gone`; a hangup names none), and the page says so. The
 token reply carries `silenceMs` and `limit: {ms, kind: "duration" | "daily"}`:
 the listening hint says a pause sends a turn, a "sending..." chip fills while
-`nanoclaw.voice.pending` counts down, caller lines show
+`nanoclaw.voice-mode.pending` counts down, caller lines show
 "turn n" and the first caption of a reply "reply to turn n" (or "unprompted"), and a
 minute before the limit the hint says the call is about to end. Short sound
 cues let a caller follow the call without looking. The worker plays them, on a
@@ -815,9 +815,9 @@ input and plays the listening cue, then the microphone opens), speaks with any p
 draft in a dashed panel pinned above the keys (`draft - not sent`) and taps send
 or discard; after either the microphone stays off until the next talk. The page
 publishes its microphone muted in review and offers the mode only when the
-worker sets the attribute `nanoclaw.voice.review` to "1". It drives the worker
-with RPCs (`nanoclaw.voice.mode`, `.talk`, `.done`, `.send`, `.discard`; JSON
-`ReviewRequest` in, `ReviewReply` out, see `voice-livekit-protocol.ts`; a mode
+worker sets the attribute `nanoclaw.voice-mode.review` to "1". It drives the worker
+with RPCs (`nanoclaw.voice-mode.mode`, `.talk`, `.done`, `.send`, `.discard`; JSON
+`ReviewRequest` in, `ReviewReply` out, see `voice-mode-protocol.ts`; a mode
 request naming no mode only re-reads the state, as the page does after a
 reconnect or an unanswered request), so the caller's token may publish data. The
 worker answers them only from the caller's identity, one at a time, each for the
@@ -825,7 +825,7 @@ draft id it names (a late or repeated one is "stale"); it serves no other contro
 to the caller (no typed turns, no interrupts). The worker sends every change of its `CallReviewState` (`{"seq",
 "mode", "draft": {"id", "state": "recording" | "finishing" | "ready" | "empty" |
 "failed", "text", "tooLong"?, "reason"?: "agent" | "switch"}, "preparing"?:
-true}`) on the topic `nanoclaw.voice.review`. A recording is one transcription
+true}`) on the topic `nanoclaw.voice-mode.review`. A recording is one transcription
 activity: talk sets its Gemini Live socket up first (meanwhile the state says
 `"preparing": true` and the page keeps talk off, "getting ready"), so the microphone
 never opens onto a socket that is still connecting; done ends it, and the draft's text
@@ -884,16 +884,16 @@ line says "heard - listening", and after it only a spoken send sends, unless the
 switch ("a pause also sends", shown only with the first) lets the closing silence send
 too; after a send or a discard it waits again. The wake phrase is heard in the audio,
 not the transcript: while it waits, nothing goes to Google; the worker scores the
-caller's audio with the wake word model (`VOICE_WAKE_MODEL`, by default livekit-wakeword's
-`hey_livekit`, in a worker thread, 2 s windows every 80 ms; `VOICE_WAKE_PHRASE` names
-it), a score at or over `VOICE_WAKE_THRESHOLD` opens the turn (at most once in 2 s),
+caller's audio with the wake word model (`VOICE_MODE_WAKE_MODEL`, by default livekit-wakeword's
+`hey_livekit`, in a worker thread, 2 s windows every 80 ms; `VOICE_MODE_WAKE_PHRASE` names
+it), a score at or over `VOICE_MODE_WAKE_THRESHOLD` opens the turn (at most once in 2 s),
 and the switch and chip name that phrase. The turn's activity starts right where the
 phrase was spotted, as the wake cue plays (the model is end-aligned: it fires as the
 phrase ends, within an 80 ms hop), so the phrase is never in the turn's audio or text.
 Said again inside an open turn, the wake phrase (`hey <agent>`, or the model's phrase) is
 cut out of the turn's text, and a discard before it drops only the words before it. Speech before the phrase is not transcribed at all, so it shows no caption. A
-turn the phrase opened that hears nothing for `VOICE_WAKE_START_SECONDS`, or nothing
-more for `VOICE_WAKE_IDLE_SECONDS` after its last words, goes back to waiting: its
+turn the phrase opened that hears nothing for `VOICE_MODE_WAKE_START_SECONDS`, or nothing
+more for `VOICE_MODE_WAKE_IDLE_SECONDS` after its last words, goes back to waiting: its
 final is read first (a `zulu` the interim text missed still sends then, late), else
 a soft falling cue plays, the page says "went back to sleep", and words it held are
 dropped as `asleep`, never sent.
@@ -905,7 +905,7 @@ an activity; words with no wake phrase are marked "ignored · no wake phrase"):
 spelling (`Hey, Andy.`, `гей Енді`, `хей Енді`, `hi Andy`, `хай Енді`, a name
 glued to the hey as in `Heyandy`, and in Cyrillic a Ukrainian vocative ending, as
 in `Гей, Бене` for Ben). The worker
-advertises the commands with the attribute `nanoclaw.voice.commands` = "3" (the
+advertises the commands with the attribute `nanoclaw.voice-mode.commands` = "3" (the
 `zulu` / `copy` vocabulary; "2" was `send it`, "1" was `over`). A page offers the
 commands only to the value it knows, so a page and a worker from either side of a
 vocabulary change quote no words to each other. The worker stays wake-gated until a
@@ -915,21 +915,21 @@ page older than the worker sends no settings, so that worker keeps waiting for a
 wake phrase and a send word the page never names - reload the page (and update the
 iOS app) with the worker. The worker announces
 the words themselves, in the same attribute update, as
-`nanoclaw.voice.command-words`: compact JSON of `CALL_COMMAND_WORDS` in the
+`nanoclaw.voice-mode.command-words`: compact JSON of `CALL_COMMAND_WORDS` in the
 protocol module, the one list the worker matches, puts in the transcription's
 vocabulary and announces (`{"v":1,"send":[{"say":"zulu","hint":true},{"say":"copy","ownSentence":true,"hint":true},...],"discard":[{"say":"scratch that","hint":true},...]}`).
 The page and the iOS app quote those words in every hint (the `hint` ones in short
 hints, every send word in the commands block) and keep their own copy only for the
 hints before a worker has named them. They never match
 the words against captions: a caller caption (`lk.transcription`) that ends in a
-command carries the stream attributes `nanoclaw.voice.command` (`send` or
-`discard`) and `nanoclaw.voice.words` (the caption's text before the command, ""
+command carries the stream attributes `nanoclaw.voice-mode.command` (`send` or
+`discard`) and `nanoclaw.voice-mode.words` (the caption's text before the command, ""
 for a command said alone); an interim's is the command the worker acts on if the
 caller stops now, a final's the one it acted on, and a caption without them clears
 the line's mark. A lone command's line shows no send countdown, and its
 `{"dropped": "command"}` names `"command"` and the caption's `"segment"`
 (`lk.segment_id`), which the page marks "nothing to send" or "nothing to discard". It
-takes the switches in the `nanoclaw.voice.settings` RPC (`{"wake", "pauseSends",
+takes the switches in the `nanoclaw.voice-mode.settings` RPC (`{"wake", "pauseSends",
 "cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase", "heard",
 "slept", "cut"}` (`phrase` only with a wake word model, from the start while it loads;
 `heard` counts the wake phrases heard, so the page marks "heard - listening" even when
@@ -946,9 +946,9 @@ cannot trigger a command; caller speech that starts under it sends
 
 - **type**: `voice`
 - **terminology**: a "line" is one call link; whoever opens it talks to the wired agent. Calls are 1:1 conversations, there are no groups.
-- **platform-id-format**: `voice:{line id}` where the line id is the first 12 hex characters of SHA-256 of the link token (never the token itself). The caller's user id is the same string.
-- **how-to-find-id**: derive it from the token in `.env`: `node -e "console.log(require('crypto').createHash('sha256').update(process.argv[1]).digest('hex').slice(0,12))" "$VOICE_LINK_TOKEN"`; the wiring step in this skill does that for you.
-- **instances**: one adapter; several lines by listing several tokens in `VOICE_LINK_TOKEN` (comma-separated), each wired on its own.
+- **platform-id-format**: `voice-mode:{line id}` where the line id is the first 12 hex characters of SHA-256 of the link token (never the token itself). The caller's user id is the same string.
+- **how-to-find-id**: derive it from the token in `.env`: `node -e "console.log(require('crypto').createHash('sha256').update(process.argv[1]).digest('hex').slice(0,12))" "$VOICE_MODE_LINK_TOKEN"`; the wiring step in this skill does that for you.
+- **instances**: one adapter; several lines by listing several tokens in `VOICE_MODE_LINK_TOKEN` (comma-separated), each wired on its own.
 - **supports-threads**: no
 - **typical-use**: a spoken conversation with one agent from a browser, for the people you hand a link to
 - **default-isolation**: one named user and explicit membership per personal link; strict line policy and known-sender wiring. Different links have different voice users. Agent-group memory is still shared within that group; use a separate group for a demo.
@@ -983,7 +983,7 @@ is a member of the answering agent, and the line has exactly one strict,
 known-sender wiring. Spoken identity claims cannot grant access.
 
 **`Unknown call link` on the page.** The `t` in the URL is not in
-`VOICE_LINK_TOKEN`. Copy the link from the operator note above, or check
+`VOICE_MODE_LINK_TOKEN`. Copy the link from the operator note above, or check
 `.env`.
 
 **The page says the microphone was refused.** Browsers only grant the
@@ -992,11 +992,11 @@ anything but a local try.
 
 **The page says the voice service is unavailable or updating.** No worker joined
 the room within 25 seconds, or one on another protocol version did. Check the
-worker runs (`systemctl --user status nanoclaw-voice-worker.service`) and was
+worker runs (`systemctl --user status nanoclaw-voice-mode-worker.service`) and was
 restarted with the host after the last build; the host log names why the call
 ended.
 
 **`voice` is missing from `ncl` channel lists.** The factory returned null:
-`VOICE_LINK_TOKEN` is missing, or the host log says `LiveKit is not configured`
+`VOICE_MODE_LINK_TOKEN` is missing, or the host log says `LiveKit is not configured`
 and names which of `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` and
 `GEMINI_API_KEY` is not in `.env`. Set them and restart.

@@ -91,7 +91,7 @@ export interface InboundEvent {
   /**
    * Restricts the fan-out to this one wired agent group. Set only host-side, by
    * an adapter routing a message into another chat on one agent's behalf (a
-   * voice call's turns, src/channels/voice-livekit.ts); never from platform input.
+   * voice call's turns, src/channels/voice-mode-livekit.ts); never from platform input.
    */
   agentGroupId?: string;
   /**

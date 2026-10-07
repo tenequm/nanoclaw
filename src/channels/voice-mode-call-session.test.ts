@@ -19,7 +19,7 @@ import { routeInbound } from '../router.js';
 import type { MessagingGroupAgent, Session } from '../types.js';
 import type { ChannelAdapter, ChannelDefaults, InboundEvent } from './adapter.js';
 import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from './channel-registry.js';
-import { findCallSession } from './voice.js';
+import { findCallSession } from './voice-mode.js';
 
 vi.mock('../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(true),
@@ -110,7 +110,7 @@ async function routedSession(threadId: string | null): Promise<Session> {
     message: {
       id: `livekit:call-1:${Math.random()}`,
       kind: 'chat',
-      content: JSON.stringify({ text: 'hello', sender: 'Ethan', senderId: 'voice:test' }),
+      content: JSON.stringify({ text: 'hello', sender: 'Ethan', senderId: 'voice-mode:test' }),
       timestamp: now(),
       isMention: true,
       isGroup: false,

@@ -74,7 +74,7 @@ export class CallError extends Error {
   }
 }
 
-export interface VoiceCall {
+export interface VoiceModeCall {
   phase: Phase
   lines: Line[]
   /** Id of the line still receiving transcript, if any. */

@@ -21,8 +21,8 @@ import {
   type LiveKitJobMetadata,
   type ReviewOp,
   type ReviewRequest,
-} from './channels/voice-livekit-protocol.js';
-import type { Heard } from './voice-gemini-live.js';
+} from './channels/voice-mode-protocol.js';
+import type { Heard } from './voice-mode-gemini-live.js';
 import {
   AWAIT_REPLY_MS,
   AudioRing,
@@ -98,10 +98,10 @@ import {
   type CallVoiceEvents,
   type TurnAudio,
   type TurnRecord,
-  type VoiceSettings,
+  type VoiceModeSettings,
   type SendResult,
   type TurnTakingDeps,
-} from './voice-livekit-worker.js';
+} from './voice-mode-worker.js';
 
 initializeLogger({ pretty: false, level: 'error' });
 
@@ -191,7 +191,7 @@ describe('helpers', () => {
     expect(CUT_LINES.no_chat).toEqual({ uk: 'Скорочую.', en: "I've cut it short." });
   });
 
-  it('reads VOICE_MAX_SPOKEN_CHARS, with no cap unless it sets one', () => {
+  it('reads VOICE_MODE_MAX_SPOKEN_CHARS, with no cap unless it sets one', () => {
     expect(maxSpokenChars(undefined)).toBe(DEFAULT_MAX_SPOKEN_CHARS);
     expect(DEFAULT_MAX_SPOKEN_CHARS).toBe(0);
     expect(maxSpokenChars(' 400 ')).toBe(400);
@@ -589,7 +589,7 @@ describe('HostLink', () => {
 const META: LiveKitJobMetadata = {
   v: LIVEKIT_PROTOCOL_VERSION,
   callId: 'call-1',
-  lineId: 'voice:abc',
+  lineId: 'voice-mode:abc',
   agentName: 'Andy',
   callerName: 'Ethan',
   callerIdentity: 'caller-1',
@@ -761,7 +761,7 @@ function fakeVoice() {
     close: vi.fn(async () => undefined),
   } satisfies CallVoice;
   const createVoice = vi.fn(
-    async (_ctx: CallJob, _meta: LiveKitJobMetadata, _settings: VoiceSettings, e: CallVoiceEvents) => {
+    async (_ctx: CallJob, _meta: LiveKitJobMetadata, _settings: VoiceModeSettings, e: CallVoiceEvents) => {
       events = e;
       return voice;
     },
@@ -1142,7 +1142,7 @@ describe('runCall', () => {
     });
     const v = fakeVoice();
     await runCall(ctx, callDeps(fetchImpl, v, { log: { info: () => undefined, warn } }));
-    expect(warn).toHaveBeenCalledWith('voice worker: ending the call', {
+    expect(warn).toHaveBeenCalledWith('voice-mode worker: ending the call', {
       callId: 'call-1',
       hostUrl: 'http://127.0.0.1:3555',
       reason: 'host refused the call (unreachable)',
@@ -1207,7 +1207,7 @@ describe('runCall', () => {
       const v = fakeVoice();
       await runCall(
         ctx,
-        callDeps(host.fetchImpl, v, { env: { ...ENV, VOICE_RECORDINGS_DAYS: '7' }, recordingsRoot: root }),
+        callDeps(host.fetchImpl, v, { env: { ...ENV, VOICE_MODE_RECORDINGS_DAYS: '7' }, recordingsRoot: root }),
       );
       await v.turn('Book a table');
       await v.turn('', { speechMs: 900 });
@@ -1217,7 +1217,7 @@ describe('runCall', () => {
       const first = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-1.json'), 'utf8')) as TurnRecord;
       expect(first).toMatchObject({
         callId: 'call-1',
-        lineId: 'voice:abc',
+        lineId: 'voice-mode:abc',
         agent: 'Andy',
         turn: 1,
         sttModel: 'gemini-3.5-transcribe-live',
@@ -1376,7 +1376,7 @@ describe('reply recordings', () => {
       await runCall(
         ctx,
         callDeps(host.fetchImpl, v, {
-          env: { ...ENV, VOICE_RECORDINGS_DAYS: '7' },
+          env: { ...ENV, VOICE_MODE_RECORDINGS_DAYS: '7' },
           recordingsRoot: root,
           log: { info, warn: () => undefined },
         }),
@@ -1437,7 +1437,7 @@ describe('turn recordings', () => {
     try {
       const record: TurnRecord = {
         callId: 'c/../1',
-        lineId: 'voice:abc',
+        lineId: 'voice-mode:abc',
         agent: '../Andy Bot',
         turn: 2,
         startedAt: '2026-10-02T12:00:00.000Z',
@@ -3545,25 +3545,25 @@ describe('acoustic wake word', () => {
       threshold: 0.68,
       phrase: 'Hey LiveKit',
     });
-    expect(wakeWordSettings({ VOICE_WAKE_MODEL: 'off' })).toBeNull();
+    expect(wakeWordSettings({ VOICE_MODE_WAKE_MODEL: 'off' })).toBeNull();
     expect(
-      wakeWordSettings({ VOICE_WAKE_MODEL: 'data/models/hey_jarvis.onnx', VOICE_WAKE_PHRASE: ' Hey  Jarvis ' }),
+      wakeWordSettings({ VOICE_MODE_WAKE_MODEL: 'data/models/hey_jarvis.onnx', VOICE_MODE_WAKE_PHRASE: ' Hey  Jarvis ' }),
     ).toEqual({
       classifier: path.resolve('data/models/hey_jarvis.onnx'),
       threshold: 0.5,
       phrase: 'Hey Jarvis',
     });
-    expect(wakeWordSettings({ VOICE_WAKE_THRESHOLD: '0.8' })?.threshold).toBe(0.8);
-    expect(wakeWordSettings({ VOICE_WAKE_THRESHOLD: '7' })?.threshold).toBe(0.68);
+    expect(wakeWordSettings({ VOICE_MODE_WAKE_THRESHOLD: '0.8' })?.threshold).toBe(0.8);
+    expect(wakeWordSettings({ VOICE_MODE_WAKE_THRESHOLD: '7' })?.threshold).toBe(0.68);
   });
 
   it('reads its limits from the settings, in seconds; 0 is never', () => {
     expect(awakeLimits({})).toEqual({ startMs: 8_000, idleMs: 20_000 });
-    expect(awakeLimits({ VOICE_WAKE_START_SECONDS: '5', VOICE_WAKE_IDLE_SECONDS: '0' })).toEqual({
+    expect(awakeLimits({ VOICE_MODE_WAKE_START_SECONDS: '5', VOICE_MODE_WAKE_IDLE_SECONDS: '0' })).toEqual({
       startMs: 5_000,
       idleMs: 0,
     });
-    expect(awakeLimits({ VOICE_WAKE_START_SECONDS: 'soon', VOICE_WAKE_IDLE_SECONDS: '-1' })).toEqual({
+    expect(awakeLimits({ VOICE_MODE_WAKE_START_SECONDS: 'soon', VOICE_MODE_WAKE_IDLE_SECONDS: '-1' })).toEqual({
       startMs: 8_000,
       idleMs: 20_000,
     });

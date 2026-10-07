@@ -567,7 +567,7 @@ export type VoiceLinkFn = (line: MessagingGroup) => string | null;
 
 /** Asks the live voice adapter, the only holder of the link tokens. */
 const liveVoiceLink: VoiceLinkFn = (line) => {
-  // Structural, not voice.ts's VoiceChannelAdapter: core must still build once add-voice-mode is removed.
+  // Structural, not voice-mode.ts's VoiceChannelAdapter: core must still build once add-voice-mode is removed.
   const adapter = getChannelAdapterExact(line.instance ?? line.channel_type) as
     | { callLink?(platformId: string): string | null }
     | undefined;
@@ -605,7 +605,7 @@ function callChatThread(wiring: MessagingGroupAgent, mg: MessagingGroup, threadI
  * `actorUserId`, and return their call links. Admin only. A line
  * belongs to the chat accounts voice_line_owners names for it (one person's
  * accounts across channels); another person's line is never bound or linked here. The call chat is where the line's
- * calls talk (src/channels/voice-livekit.ts), as the line's own caller, until
+ * calls talk (src/channels/voice-mode-livekit.ts), as the line's own caller, until
  * /voice is run in another chat. The links are secrets: callers send them to
  * this chat only and never log them.
  */

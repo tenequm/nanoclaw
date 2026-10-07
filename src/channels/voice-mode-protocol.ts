@@ -1,11 +1,11 @@
 /**
- * What the voice host (`voice-livekit.ts`) and the LiveKit worker
- * (`../voice-livekit-worker.ts`) share. Dependency-free on purpose: the worker
+ * What the voice host (`voice-mode-livekit.ts`) and the LiveKit worker
+ * (`../voice-mode-worker.ts`) share. Dependency-free on purpose: the worker
  * imports it, and must not load the host's database and channel modules.
  */
 import { createHmac } from 'node:crypto';
 
-export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice';
+export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice-mode';
 
 /** The host pings the worker's event stream this often, so silence means a dead link. */
 export const PING_INTERVAL_MS = 15_000;
@@ -18,7 +18,7 @@ export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
  * Wire version of the job metadata and the worker's attribute and topic names; host and worker
  * must agree, so they ship and restart together.
  */
-export const LIVEKIT_PROTOCOL_VERSION = 4;
+export const LIVEKIT_PROTOCOL_VERSION = 6;
 
 /** Transcription over the Gemini Live API, verbatim, one manual activity per caller turn. */
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
@@ -27,7 +27,7 @@ export const DEFAULT_VOICE_TTS_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
 export const DEFAULT_VOICE_TTS_VOICE = 'Alnilam';
 /** Silence that ends the caller's turn; shorter pauses mid-thought keep it open. */
 export const DEFAULT_VOICE_SILENCE_MS = 2500;
-/** Channel type of the default call chat when `/voice` has not set one (VOICE_MIRROR). */
+/** Channel type of the default call chat when `/voice` has not set one (VOICE_MODE_MIRROR). */
 export const DEFAULT_VOICE_MIRROR = 'telegram';
 
 /** What the worker receives as job metadata. Nothing secret: agents-js logs the whole job on some paths. */
@@ -39,7 +39,7 @@ export interface LiveKitJobMetadata {
   agentName: string;
   callerName: string;
   callerIdentity: string;
-  /** Spelling hints for the transcription: VOICE_VOCABULARY plus the agent's voice.vocabulary.txt. */
+  /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
   /**
    * The agent's own voice.vocabulary.txt entries: besides `agentName`, the names the wake phrase
@@ -63,14 +63,14 @@ export interface LiveKitJobMetadata {
  * The worker's participant attribute for what `lk.agent.state` cannot say (its session has no
  * LLM, so it never thinks): "1" while the host says the agent works on a turn, "" otherwise.
  */
-export const CALL_THINKING_ATTRIBUTE = 'nanoclaw.voice.thinking';
+export const CALL_THINKING_ATTRIBUTE = 'nanoclaw.voice-mode.thinking';
 /** The worker's participant attribute: "1" when it cannot serve this host's protocol version. */
-export const CALL_UPDATING_ATTRIBUTE = 'nanoclaw.voice.updating';
+export const CALL_UPDATING_ATTRIBUTE = 'nanoclaw.voice-mode.updating';
 /**
  * Text stream topic the worker sends JSON `CallTurnStatus` messages on, per caller turn, and a
  * `CallDroppedSpeech` for caller words it will never send.
  */
-export const CALL_TURN_TOPIC = 'nanoclaw.voice.turn';
+export const CALL_TURN_TOPIC = 'nanoclaw.voice-mode.turn';
 
 /**
  * The room metadata the host sets when a mid-call `/voice` moves the call to another chat, so the
@@ -139,18 +139,18 @@ export const MAX_TURN_TEXT_BYTES = 8 * 1024;
  * worker sends every change of its `CallReviewState` on the topic. All of it is additive to v4: an
  * old page never calls the RPCs, and an old worker sets no attribute.
  */
-export const CALL_REVIEW_ATTRIBUTE = 'nanoclaw.voice.review';
+export const CALL_REVIEW_ATTRIBUTE = 'nanoclaw.voice-mode.review';
 /** Text stream topic the worker sends one JSON `CallReviewState` on whenever it changes. */
-export const CALL_REVIEW_TOPIC = 'nanoclaw.voice.review';
+export const CALL_REVIEW_TOPIC = 'nanoclaw.voice-mode.review';
 /** The RPC methods the worker registers for the page; each takes a `ReviewRequest` and answers a `ReviewReply`. */
 export const REVIEW_RPC = {
-  mode: 'nanoclaw.voice.mode',
-  talk: 'nanoclaw.voice.talk',
-  done: 'nanoclaw.voice.done',
-  send: 'nanoclaw.voice.send',
-  discard: 'nanoclaw.voice.discard',
+  mode: 'nanoclaw.voice-mode.mode',
+  talk: 'nanoclaw.voice-mode.talk',
+  done: 'nanoclaw.voice-mode.done',
+  send: 'nanoclaw.voice-mode.send',
+  discard: 'nanoclaw.voice-mode.discard',
   /** Auto mode's spoken-command settings and the cue switch (`ReviewRequest.wake`, `.pauseSends`, `.cues`). */
-  settings: 'nanoclaw.voice.settings',
+  settings: 'nanoclaw.voice-mode.settings',
 } as const;
 export type ReviewOp = keyof typeof REVIEW_RPC;
 
@@ -183,7 +183,7 @@ export interface CallDraft {
  * switches that worker's wake gate off, so pauses send, while a page older than the worker sends
  * nothing and has to be reloaded. An older worker sets none, and its auto mode has no commands.
  */
-export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice.commands';
+export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice-mode.commands';
 /**
  * The commands' vocabulary: "1" had `over` as the send word, "2" `send it`, "3" `zulu`, `copy` and
  * `copy that`. A page takes the words themselves from CALL_COMMAND_WORDS_ATTRIBUTE; a change to
@@ -226,7 +226,7 @@ export const CALL_COMMAND_WORDS: CallCommandWords = {
  * The worker's participant attribute with CALL_COMMAND_WORDS as compact JSON, set with
  * CALL_COMMANDS_ATTRIBUTE. Additive: a page without it uses its own list, and an old page ignores it.
  */
-export const CALL_COMMAND_WORDS_ATTRIBUTE = 'nanoclaw.voice.command-words';
+export const CALL_COMMAND_WORDS_ATTRIBUTE = 'nanoclaw.voice-mode.command-words';
 /**
  * Attributes of a caller caption (`lk.transcription`, segment `SG_turn_<n>`) whose text ends in a
  * spoken command, both or neither: the command (`send` or `discard`), and the caption's words before
@@ -235,8 +235,8 @@ export const CALL_COMMAND_WORDS_ATTRIBUTE = 'nanoclaw.voice.command-words';
  * worker acts on if the caller stops now; on a final, the one it acted on: a sent final's text is
  * already only its words. A caption without them clears the line's mark: the command was words.
  */
-export const CALL_CAPTION_COMMAND_ATTRIBUTE = 'nanoclaw.voice.command';
-export const CALL_CAPTION_WORDS_ATTRIBUTE = 'nanoclaw.voice.words';
+export const CALL_CAPTION_COMMAND_ATTRIBUTE = 'nanoclaw.voice-mode.command';
+export const CALL_CAPTION_WORDS_ATTRIBUTE = 'nanoclaw.voice-mode.words';
 export interface CallWakeState {
   on: boolean;
   pauseSends: boolean;
@@ -261,14 +261,14 @@ export interface CallWakeState {
 export const DEFAULT_WAKE_PHRASE = 'Hey LiveKit';
 
 /**
- * The wake phrase the page names: VOICE_WAKE_PHRASE, which says what the VOICE_WAKE_MODEL classifier
- * listens for (`Hey LiveKit`, the bundled model's, when unset; shown as written); null when VOICE_WAKE_MODEL is `off`,
+ * The wake phrase the page names: VOICE_MODE_WAKE_PHRASE, which says what the VOICE_MODE_WAKE_MODEL classifier
+ * listens for (`Hey LiveKit`, the bundled model's, when unset; shown as written); null when VOICE_MODE_WAKE_MODEL is `off`,
  * and `hey <agent>` in the transcript opens a turn. The host tells the page before a call, the worker
  * during one (CallWakeState.phrase; none while a model that failed to load leaves `hey <agent>`).
  */
-export function wakePhrase(env: { VOICE_WAKE_MODEL?: string; VOICE_WAKE_PHRASE?: string }): string | null {
-  if (/^(off|none|0|false)$/i.test(env.VOICE_WAKE_MODEL?.trim() ?? '')) return null;
-  return env.VOICE_WAKE_PHRASE?.trim().replace(/\s+/g, ' ') || DEFAULT_WAKE_PHRASE;
+export function wakePhrase(env: { VOICE_MODE_WAKE_MODEL?: string; VOICE_MODE_WAKE_PHRASE?: string }): string | null {
+  if (/^(off|none|0|false)$/i.test(env.VOICE_MODE_WAKE_MODEL?.trim() ?? '')) return null;
+  return env.VOICE_MODE_WAKE_PHRASE?.trim().replace(/\s+/g, ' ') || DEFAULT_WAKE_PHRASE;
 }
 
 /**
@@ -330,7 +330,7 @@ export interface ReviewReply {
  * the next and elapsedMs is how much of the silence had passed when it was set. "" otherwise:
  * speech resumed, the turn went out or was dropped, or the agent speaks.
  */
-export const CALL_PENDING_ATTRIBUTE = 'nanoclaw.voice.pending';
+export const CALL_PENDING_ATTRIBUTE = 'nanoclaw.voice-mode.pending';
 /**
  * The worker's sound cues go out on a second audio track of this name (the name agents-js's
  * BackgroundAudioPlayer used; the worker feeds the track itself now), apart from the agent's speech
@@ -339,7 +339,7 @@ export const CALL_PENDING_ATTRIBUTE = 'nanoclaw.voice.pending';
  */
 export const CALL_CUE_TRACK = 'background_audio';
 /** Text stream topic the worker sends one JSON `CallReplyInfo` on right before each line it speaks, and again after one it could not. */
-export const CALL_REPLY_TOPIC = 'nanoclaw.voice.reply';
+export const CALL_REPLY_TOPIC = 'nanoclaw.voice-mode.reply';
 
 /**
  * What the next spoken line is: an agent message answering the caller's turn `turn` (the
@@ -404,7 +404,7 @@ export type LiveKitHostEvent =
  * secret both processes already hold, so it never travels in the dispatch.
  */
 export function liveKitCallSecret(apiSecret: string, callId: string): string {
-  return createHmac('sha256', apiSecret).update(`nanoclaw-voice-call:${callId}`).digest('base64url');
+  return createHmac('sha256', apiSecret).update(`nanoclaw-voice-mode-call:${callId}`).digest('base64url');
 }
 
 /** Where the worker reaches the host's webhook server; only ever from the worker's own settings. */

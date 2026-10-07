@@ -18,30 +18,30 @@ The adapter, its line resolver, the call page, the LiveKit engine and its
 worker with its wake word models, and their seven tests:
 
 ```bash
-rm -f src/channels/voice.ts src/channels/voice-line.ts src/channels/voice-call-page.ts src/channels/voice-adapter.test.ts src/channels/voice-registration.test.ts src/channels/voice-line.test.ts src/channels/voice-call-page.test.ts
-rm -f src/channels/voice-livekit.ts src/channels/voice-livekit-protocol.ts src/channels/voice-livekit.test.ts src/voice-livekit-worker.ts src/voice-livekit-worker.test.ts src/voice-gemini-live.ts src/voice-gemini-live.test.ts
-rm -rf src/voice-wakeword.ts src/voice-wakeword.test.ts src/voice-wakeword-fixtures assets/voice-wakeword
+rm -f src/channels/voice-mode.ts src/channels/voice-mode-line.ts src/channels/voice-mode-page.ts src/channels/voice-mode-adapter.test.ts src/channels/voice-mode-registration.test.ts src/channels/voice-mode-line.test.ts src/channels/voice-mode-page.test.ts
+rm -f src/channels/voice-mode-livekit.ts src/channels/voice-mode-protocol.ts src/channels/voice-mode-livekit.test.ts src/voice-mode-worker.ts src/voice-mode-worker.test.ts src/voice-mode-gemini-live.ts src/voice-mode-gemini-live.test.ts
+rm -rf src/voice-mode-wakeword.ts src/voice-mode-wakeword.test.ts src/voice-mode-wakeword-fixtures assets/voice-mode-wakeword
 ```
 
 If the LiveKit worker runs as a systemd user unit, stop and remove it first:
 
 ```bash
-systemctl --user disable --now nanoclaw-voice-worker.service
-rm -f ~/.config/systemd/user/nanoclaw-voice-worker.service && systemctl --user daemon-reload
+systemctl --user disable --now nanoclaw-voice-mode-worker.service
+rm -f ~/.config/systemd/user/nanoclaw-voice-mode-worker.service && systemctl --user daemon-reload
 ```
 
-Recorded caller turns (`VOICE_RECORDINGS_DAYS`) are under
+Recorded caller turns (`VOICE_MODE_RECORDINGS_DAYS`) are under
 `data/voice-recordings/`; delete that directory if you do not want to keep them.
 An older worker kept a note of a failed speech model in `data/voice-tts-state.json`; the current one no longer reads or writes it, so delete it if it is there.
 
 ## 3. Remove the container skill
 
 `container/skills/` is a read-only mount; the per-group skill symlink and the
-composed `NanoClaw Skill: voice-formatting` section go on each agent's next
+composed `NanoClaw Skill: voice-mode-formatting` section go on each agent's next
 spawn:
 
 ```bash
-rm -rf container/skills/voice-formatting
+rm -rf container/skills/voice-mode-formatting
 ```
 
 ## 4. Remove the environment keys
@@ -50,7 +50,7 @@ rm -rf container/skills/voice-formatting
 (check `.env` for other consumers first):
 
 ```bash
-sed -i.bak '/^VOICE_[A-Z_]*=/d' .env && rm -f .env.bak
+sed -i.bak '/^VOICE_MODE_[A-Z_]*=/d' .env && rm -f .env.bak
 sed -i.bak '/^LIVEKIT_URL=/d;/^LIVEKIT_WORKER_URL=/d;/^LIVEKIT_API_KEY=/d;/^LIVEKIT_API_SECRET=/d;/^LIVEKIT_AGENT_NAME=/d;/^LIVEKIT_HOST_URL=/d' .env && rm -f .env.bak
 # only if no other consumer:
 # sed -i.bak '/^GEMINI_API_KEY=/d' .env && rm -f .env.bak
@@ -68,7 +68,7 @@ Remove membership with `ncl members remove --user <voice-id> --group <agent-id>`
 and delete the wiring and messaging group with `ncl wirings delete` and
 `ncl messaging-groups delete` if you no longer want them listed. Retain the
 user record when keeping call history. Before deleting a line's messaging group,
-`ncl voice-lines remove --line voice:<line id>` drops its owners and call chat.
+`ncl voice-lines remove --line voice-mode:<line id>` drops its owners and call chat.
 The LiveKit server and the Gemini key are managed outside NanoClaw.
 The call page keeps each caller's Manual or hands-free pick, wake switches and
 wake phrase in their own browser (`localStorage`); clearing the site's data there

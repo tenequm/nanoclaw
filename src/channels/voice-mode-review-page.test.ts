@@ -8,13 +8,13 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { COMMAND_WORDS_JSON, captionMark, matchCommand } from '../voice-livekit-worker.js';
+import { COMMAND_WORDS_JSON, captionMark, matchCommand } from '../voice-mode-worker.js';
 import {
   CALL_CAPTION_COMMAND_ATTRIBUTE,
   CALL_CAPTION_WORDS_ATTRIBUTE,
   CALL_COMMAND_WORDS,
   CALL_COMMANDS_VERSION,
-} from './voice-livekit-protocol.js';
+} from './voice-mode-protocol.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const skillDir = path.resolve(here, '../../.claude/skills/add-voice-mode');
@@ -503,10 +503,10 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
       ...['review.ts', 'livekit-call.ts', 'demo-call.ts', 'voice-call.ts'].map((f) => path.join(uiSrc, 'lib', f)),
       path.join(skillDir, 'SKILL.md'),
       path.join(skillDir, 'REMOVE.md'),
-      path.resolve(here, 'voice-call-page.ts'),
+      path.resolve(here, 'voice-mode-page.ts'),
     ];
     for (const file of files) expect(readFileSync(file, 'utf8'), file).not.toMatch(/check[\s-]*first/i);
-    expect(readFileSync(path.resolve(here, 'voice-call-page.ts'), 'utf8')).toContain('Manual');
+    expect(readFileSync(path.resolve(here, 'voice-mode-page.ts'), 'utf8')).toContain('Manual');
   });
 
   describe("the caller's remembered picks", () => {

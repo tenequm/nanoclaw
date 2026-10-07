@@ -25,13 +25,13 @@ import {
   type Phase,
   type SendCue,
   type TurnMark,
-  type VoiceCall,
+  type VoiceModeCall,
 } from "./voice-call"
 import { DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, captionCommand, reopensMic, infoWakePhrase, isLoneCommand, isReviewSnapshot, lineWords, norm, parseCommandWords, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, workerCommands, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
- * The browser side of a LiveKit voice call, behind the VoiceCall shape
+ * The browser side of a LiveKit voice call, behind the VoiceModeCall shape
  * the page renders (the `?demo=1` script has the same shape).
  *
  * The host's routes next to the page mint the room token (`livekit/token`) and
@@ -41,11 +41,11 @@ import { voiceEndpoint } from "./voice-endpoint"
  */
 
 /** "1" while nanoclaw's agent works on a turn: the worker's session has no LLM, so it never thinks itself. */
-const THINKING_ATTR = "nanoclaw.voice.thinking"
+const THINKING_ATTR = "nanoclaw.voice-mode.thinking"
 /** "1" when the worker cannot serve this host's protocol version. */
-const UPDATING_ATTR = "nanoclaw.voice.updating"
+const UPDATING_ATTR = "nanoclaw.voice-mode.updating"
 /** JSON CallTurnStatus messages per caller turn: "sending" as one goes to the host, then "sent" or "lost". */
-const TURN_TOPIC = "nanoclaw.voice.turn"
+const TURN_TOPIC = "nanoclaw.voice-mode.turn"
 /** Without a worker in the room after this long, it is down or mid-update (host and worker restart together). */
 const AGENT_JOIN_MS = 25_000
 const UPDATING = "The voice service is updating. Try again in a minute."
@@ -53,26 +53,26 @@ const NO_AGENT = "The voice service did not answer the call."
 /** How long a failed mute or unmute shows on the key. */
 const MUTE_ERROR_MS = 4000
 /** "<n>:<elapsedMs>:<silenceMs>" while a stopped caller's turn waits out the silence that sends it. */
-const PENDING_ATTR = "nanoclaw.voice.pending"
+const PENDING_ATTR = "nanoclaw.voice-mode.pending"
 /** One JSON CallReplyInfo right before each line the worker speaks. */
-const REPLY_TOPIC = "nanoclaw.voice.reply"
+const REPLY_TOPIC = "nanoclaw.voice-mode.reply"
 /** "1" when the worker runs review mode; the page offers it only then. */
-const REVIEW_ATTR = "nanoclaw.voice.review"
+const REVIEW_ATTR = "nanoclaw.voice-mode.review"
 /** JSON CallReviewState from the worker whenever its review state changes. */
-const REVIEW_TOPIC = "nanoclaw.voice.review"
+const REVIEW_TOPIC = "nanoclaw.voice-mode.review"
 /** The worker's review RPCs (REVIEW_RPC in the protocol), and its settings one. */
 const REVIEW_RPC: Record<ReviewOp | "settings", string> = {
-  mode: "nanoclaw.voice.mode",
-  talk: "nanoclaw.voice.talk",
-  done: "nanoclaw.voice.done",
-  send: "nanoclaw.voice.send",
-  discard: "nanoclaw.voice.discard",
-  settings: "nanoclaw.voice.settings",
+  mode: "nanoclaw.voice-mode.mode",
+  talk: "nanoclaw.voice-mode.talk",
+  done: "nanoclaw.voice-mode.done",
+  send: "nanoclaw.voice-mode.send",
+  discard: "nanoclaw.voice-mode.discard",
+  settings: "nanoclaw.voice-mode.settings",
 }
 /** COMMANDS_VERSION when the worker understands spoken commands (send, discard, the wake phrase) and the settings RPC (workerCommands). */
-const COMMANDS_ATTR = "nanoclaw.voice.commands"
+const COMMANDS_ATTR = "nanoclaw.voice-mode.commands"
 /** The worker's spoken commands as JSON (CallCommandWords): the words the hints quote. */
-const COMMAND_WORDS_ATTR = "nanoclaw.voice.command-words"
+const COMMAND_WORDS_ATTR = "nanoclaw.voice-mode.command-words"
 /** The worker's sound cues come on their own track (CALL_CUE_TRACK), never the speech track. */
 const CUE_TRACK = "background_audio"
 const REVIEW_RPC_TIMEOUT_MS = 10_000
@@ -298,7 +298,7 @@ function applyDropped(lines: Line[], covered: Set<number>, d: DroppedSpeech, seg
   return lines.map((l) => (marked.has(l.id) ? { ...l, mark } : l))
 }
 
-export function useLiveKitCall(token: string, fallbackAgent = "your agent"): VoiceCall {
+export function useLiveKitCall(token: string, fallbackAgent = "your agent"): VoiceModeCall {
   const [phase, setPhaseState] = useState<Phase>(token ? "idle" : "error")
   const [error, setError] = useState<string | null>(token ? null : "This link is missing its token. Ask for the full call link.")
   const [errorKind, setErrorKind] = useState<ErrorKind | null>(token ? null : "link")

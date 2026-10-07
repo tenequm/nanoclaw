@@ -17,7 +17,7 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-jev-turn', JEV_API_KEY: '', TIMEZONE: 'UTC' };
 });
 
-import type { Heard } from './voice-gemini-live.js';
+import type { Heard } from './voice-mode-gemini-live.js';
 import {
   DEFAULT_JEV_TURN_CONFIG,
   JevTurnShadow,
@@ -29,8 +29,8 @@ import {
   type JevTurnConfig,
   type JudgeOptions,
   type TurnJudgement,
-} from './voice-jev-turn.js';
-import { CallTurns, type Transcription } from './voice-livekit-worker.js';
+} from './voice-mode-jev-turn.js';
+import { CallTurns, type Transcription } from './voice-mode-worker.js';
 
 const ENABLED: JevTurnConfig = { ...DEFAULT_JEV_TURN_CONFIG, enabled: true };
 
@@ -160,7 +160,7 @@ describe('config and the daily cap', () => {
     fs.mkdirSync(TEST_DIR, { recursive: true });
     const usage = path.join(TEST_DIR, 'jev-turn-usage.json');
     const tsx = path.resolve('node_modules/.bin/tsx');
-    const mod = path.resolve('src/voice-jev-turn.ts');
+    const mod = path.resolve('src/voice-mode-jev-turn.ts');
     const script = [
       `import(${JSON.stringify(mod)}).then(({ takeDailyJudgement }) => {`,
       '  let taken = 0;',

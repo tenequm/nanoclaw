@@ -1,4 +1,4 @@
-// Turns dist/index.html (one self-contained file) into src/channels/voice-call-page.ts,
+// Turns dist/index.html (one self-contained file) into src/channels/voice-mode-page.ts,
 // the module the adapter serves. The page keeps a placeholder comment where the host injects
 // its runtime config; callPageHtml() fills it. Never edit the generated module by hand.
 import { readFileSync, writeFileSync } from "node:fs"
@@ -9,8 +9,8 @@ import path from "node:path"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const html = readFileSync(path.join(here, "..", "dist", "index.html"), "utf8")
-if (!html.includes("<!--VOICE_UI_CONFIG-->")) throw new Error("dist/index.html lost the VOICE_UI_CONFIG placeholder")
-const out = path.join(here, "..", "..", "..", "..", "..", "src", "channels", "voice-call-page.ts")
+if (!html.includes("<!--VOICE_MODE_UI_CONFIG-->")) throw new Error("dist/index.html lost the VOICE_MODE_UI_CONFIG placeholder")
+const out = path.join(here, "..", "..", "..", "..", "..", "src", "channels", "voice-mode-page.ts")
 
 const kb = Math.round(html.length / 1024)
 
@@ -31,18 +31,18 @@ const body = `/* eslint-disable */
  *
  * The browser call page for the voice channel as one self-contained HTML
  * document (${kb} KB). The host injects a small runtime config where the
- * VOICE_UI_CONFIG placeholder sits, so operators can change the look without
- * rebuilding: see VoiceUiConfig and the VOICE_UI key in SKILL.md.
+ * VOICE_MODE_UI_CONFIG placeholder sits, so operators can change the look without
+ * rebuilding: see VoiceModeUiConfig and the VOICE_MODE_UI key in SKILL.md.
  */
 
-export interface VoiceUiConfig {
+export interface VoiceModeUiConfig {
   /** Visual language: the Teenage Engineering inspired device (default) or the NanoClaw card. */
   skin?: 'te' | 'nanoclaw';
   /** Device finish for the te skin; auto follows the viewer's light/dark setting. */
   colorway?: 'auto' | 'ivory' | 'field' | 'rabbit';
   /** Screen beside a control rail (default) or everything stacked. */
   layout?: 'rail' | 'stack';
-  /** What shows the voice: the dot matrix (default) or bars. */
+  /** What shows the voice-mode: the dot matrix (default) or bars. */
   presence?: 'matrix' | 'bars';
   /** Product name in the header. */
   brand?: string;
@@ -70,9 +70,9 @@ function safeJson(value: unknown): string {
 }
 
 /** The call page with the host's runtime config injected. */
-export function callPageHtml(config: VoiceUiConfig = {}): string {
+export function callPageHtml(config: VoiceModeUiConfig = {}): string {
   // A function replacer: a string replacement would interpret $& and $' inside the config.
-  return PAGE.replace('<!--VOICE_UI_CONFIG-->', () => '<script>window.__VOICE_UI__=' + safeJson(config) + '</script>');
+  return PAGE.replace('<!--VOICE_MODE_UI_CONFIG-->', () => '<script>window.__VOICE_UI__=' + safeJson(config) + '</script>');
 }
 `
 writeFileSync(out, body)

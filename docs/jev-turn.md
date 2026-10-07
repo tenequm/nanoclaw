@@ -5,7 +5,7 @@ A **shadow-only** judge in the LiveKit voice worker that measures whether
 It never sends, ends or changes a turn; it only logs what it would have done,
 so its answers can be compared with how each turn really ended.
 
-Code: `src/voice-jev-turn.ts` (judge, trigger, outcome counting, config). The
+Code: `src/voice-mode-jev-turn.ts` (judge, trigger, outcome counting, config). The
 worker hooks are the `shadow` dep of `CallTurns` (interim text and the turn's
 end) and `jevTurn` in `runCall` (the agent's spoken lines as context).
 
@@ -105,7 +105,7 @@ Grep the voice worker's log for `voice.turn-end jev`; with the skill's systemd
 user unit:
 
 ```bash
-journalctl --user -u nanoclaw-voice-worker --since today | grep 'voice.turn-end jev'
+journalctl --user -u nanoclaw-voice-mode-worker --since today | grep 'voice.turn-end jev'
 ```
 
 What to read off the outcome lines, per `endedBy`:
@@ -122,6 +122,6 @@ without new calls.
 
 ## Removing it
 
-Delete `src/voice-jev-turn.ts`, its test and this doc, then the `shadow` field
+Delete `src/voice-mode-jev-turn.ts`, its test and this doc, then the `shadow` field
 and its three calls in `CallTurns` and the three `jevTurn` lines in `runCall`
-(`src/voice-livekit-worker.ts`).
+(`src/voice-mode-worker.ts`).

@@ -46,7 +46,7 @@ const windowSamples = (embeddings: number): number =>
   WAKE_WINDOW_SAMPLES + (embeddings - DEFAULT_EMBEDDINGS) * EMBEDDING_STRIDE * (WAKE_SAMPLE_RATE / 100);
 
 /** The bundled models: the two frozen feature models and the `hey_livekit` classifier. */
-const WAKE_MODEL_DIR = fileURLToPath(new URL('../assets/voice-wakeword/', import.meta.url));
+const WAKE_MODEL_DIR = fileURLToPath(new URL('../assets/voice-mode-wakeword/', import.meta.url));
 export const DEFAULT_WAKE_MODEL = path.join(WAKE_MODEL_DIR, 'hey_livekit.onnx');
 
 const sessionOptions: ort.InferenceSession.SessionOptions = {
@@ -215,7 +215,7 @@ if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
 export interface WakeWordOptions {
   /** The classifier .onnx; the feature models come from `featureDir`. */
   classifier: string;
-  /** What the classifier listens for, as the page names it (VOICE_WAKE_PHRASE). */
+  /** What the classifier listens for, as the page names it (VOICE_MODE_WAKE_PHRASE). */
   phrase: string;
   featureDir?: string;
   threshold: number;

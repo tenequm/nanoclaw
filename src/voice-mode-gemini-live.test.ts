@@ -12,8 +12,8 @@ import {
   type Heard,
   type LiveSocket,
   stripVocabularyEcho,
-} from './voice-gemini-live.js';
-import { CALL_COMMAND_WORDS } from './channels/voice-livekit-protocol.js';
+} from './voice-mode-gemini-live.js';
+import { CALL_COMMAND_WORDS } from './channels/voice-mode-protocol.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -300,7 +300,7 @@ describe('GeminiLiveTranscriber', () => {
     expect(h.sockets).toHaveLength(4);
     expect(failed()).toMatchObject({ interim: '', failed: true });
     expect(h.warn).toHaveBeenCalledWith(
-      'voice worker: the transcription is unavailable; the turn has no text from here',
+      'voice-mode worker: the transcription is unavailable; the turn has no text from here',
     );
   });
 

@@ -9,7 +9,7 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
-import { createVoiceAdapter, lineIdForToken, type VoiceChannelAdapter, type VoiceConfig } from './voice.js';
+import { createVoiceModeAdapter, lineIdForToken, type VoiceModeChannelAdapter, type VoiceModeConfig } from './voice-mode.js';
 import {
   liveKitChatDelivered,
   liveKitChatPresentation,
@@ -26,7 +26,7 @@ import {
   type LiveKitServerApi,
   type LiveKitVoiceConfig,
   type MirrorApi,
-} from './voice-livekit.js';
+} from './voice-mode-livekit.js';
 import type { MessagingGroup, Session } from '../types.js';
 import {
   LIVEKIT_PROTOCOL_VERSION,
@@ -40,9 +40,9 @@ import {
   CALL_TURN_TOPIC,
   CALL_UPDATING_ATTRIBUTE,
   wakePhrase,
-} from './voice-livekit-protocol.js';
+} from './voice-mode-protocol.js';
 import { stopWebhookServer } from '../webhook-server.js';
-import { callPageHtml } from './voice-call-page.js';
+import { callPageHtml } from './voice-mode-page.js';
 
 const LINE = lineIdForToken('tok123');
 const MIN = 60_000;
@@ -141,7 +141,7 @@ function mg(overrides: Partial<MessagingGroup>): MessagingGroup {
 }
 
 interface Harness {
-  adapter: VoiceChannelAdapter;
+  adapter: VoiceModeChannelAdapter;
   /** Turns routed into a call chat. */
   events: InboundEvent[];
   /** Where the worker reaches the host, from its own settings. */
@@ -164,7 +164,7 @@ interface Harness {
 }
 
 async function startHarness(
-  overrides: Partial<VoiceConfig> = {},
+  overrides: Partial<VoiceModeConfig> = {},
   lkOverrides: Partial<LiveKitVoiceConfig> = {},
 ): Promise<Harness> {
   const port = await freePort();
@@ -178,7 +178,7 @@ async function startHarness(
   const prewarm: Harness['prewarm'] = { lookups: [], woke: [] };
   const session = { id: 'sess-andy', agent_group_id: 'ag-andy' } as Session;
   const lk = fakeLiveKit();
-  const adapter = createVoiceAdapter({
+  const adapter = createVoiceModeAdapter({
     publicUrl: `http://127.0.0.1:${port}`,
     linkTokens: ['tok123'],
     resolveLine: async (id) =>
@@ -221,7 +221,7 @@ async function startHarness(
     },
     // The LiveKit engine routes here; a turn on the voice line is recorded as the message it carries.
     routeInboundEvent: async ({ onStored, ...event }) => {
-      if (event.channelType !== 'voice') events.push(event);
+      if (event.channelType !== 'voice-mode') events.push(event);
       else inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
       if (routing.mode === 'hang') {
         return new Promise<void>((resolve) =>
@@ -415,10 +415,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it("tells the page the worker's wake phrase before the call: the configured one, or null for hey <agent>", async () => {
     expect(wakePhrase({})).toBe('Hey LiveKit');
     expect(
-      wakePhrase({ VOICE_WAKE_MODEL: 'data/voice-models/my_model.onnx', VOICE_WAKE_PHRASE: '  Hey   Casa ' }),
+      wakePhrase({ VOICE_MODE_WAKE_MODEL: 'data/voice-models/my_model.onnx', VOICE_MODE_WAKE_PHRASE: '  Hey   Casa ' }),
     ).toBe('Hey Casa');
     for (const off of ['off', 'None', '0', 'false'])
-      expect(wakePhrase({ VOICE_WAKE_MODEL: off, VOICE_WAKE_PHRASE: 'Hey Casa' })).toBeNull();
+      expect(wakePhrase({ VOICE_MODE_WAKE_MODEL: off, VOICE_MODE_WAKE_PHRASE: 'Hey Casa' })).toBeNull();
     for (const wakePhrase of ['Hey Casa', null]) {
       await h.stop();
       h = await startHarness({ wakePhrase });
@@ -478,10 +478,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(body.silenceMs).toBe(2500);
     expect(body.limit).toEqual({ ms: 15 * MIN, kind: 'duration' });
     const room = h.lk.rooms[0];
-    expect(room).toMatch(new RegExp(`^voice-${LINE.slice(6)}-[0-9a-f]{12}$`));
+    expect(room).toMatch(new RegExp(`^voice-${LINE.replace(/^voice-mode:/, '')}-[0-9a-f]{12}$`));
     const [dispatch] = h.lk.dispatches;
     expect(dispatch.room).toBe(room);
-    expect(dispatch.agentName).toBe('nanoclaw-voice');
+    expect(dispatch.agentName).toBe('nanoclaw-voice-mode');
     const meta = dispatch.metadata;
     expect(meta).toEqual({
       v: LIVEKIT_PROTOCOL_VERSION,
@@ -624,7 +624,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     // Looked up where the first turn goes (the voice line here), for the line's agent; nothing was routed.
     expect(h.prewarm.lookups).toEqual([
       {
-        route: { channelType: 'voice', instance: 'voice', platformId: LINE, threadId: null },
+        route: { channelType: 'voice-mode', instance: 'voice-mode', platformId: LINE, threadId: null },
         agentGroupId: 'ag-andy',
       },
     ]);
@@ -754,12 +754,12 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await worker.waitFor((e) => e.type === 'thinking');
     // The runner's pickup on the line's own chat is the worker's `working`; the adapter already said thinking.
     const thinking = worker.events.filter((e) => e.type === 'thinking').length;
-    liveKitChatTyping({ channelType: 'voice', platformId: LINE, threadId: null }, 'ag-andy');
-    liveKitChatTyping({ channelType: 'voice', platformId: LINE, threadId: null }, 'ag-other', true);
-    liveKitChatTyping({ channelType: 'voice', platformId: 'voice:other', threadId: null }, 'ag-andy', true);
+    liveKitChatTyping({ channelType: 'voice-mode', platformId: LINE, threadId: null }, 'ag-andy');
+    liveKitChatTyping({ channelType: 'voice-mode', platformId: LINE, threadId: null }, 'ag-other', true);
+    liveKitChatTyping({ channelType: 'voice-mode', platformId: 'voice-mode:other', threadId: null }, 'ag-andy', true);
     await settle();
     expect(worker.events.some((e) => e.type === 'working')).toBe(false);
-    liveKitChatTyping({ channelType: 'voice', platformId: LINE, threadId: null }, 'ag-andy', true);
+    liveKitChatTyping({ channelType: 'voice-mode', platformId: LINE, threadId: null }, 'ag-andy', true);
     await worker.waitFor((e) => e.type === 'working');
     expect(worker.events.filter((e) => e.type === 'thinking')).toHaveLength(thinking);
     worker.close();
@@ -1114,7 +1114,7 @@ describe('livekit call talking in the agent chat', () => {
   it('routes each turn into the one Telegram chat as the line caller, posts the transcript and speaks the chat replies', async () => {
     const { posts } = await start([
       { platform_id: 'telegram:100', name: 'HQ' },
-      { channel_type: 'voice', platform_id: LINE },
+      { channel_type: 'voice-mode', platform_id: LINE },
     ]);
     const { call, worker } = await startCall(h);
     expect(call.chat).toBe('HQ');
@@ -1341,7 +1341,7 @@ describe('livekit call talking in the agent chat', () => {
   });
 
   it('names an unnamed direct chat by its channel for the page header', async () => {
-    await start([{ platform_id: 'telegram:100' }, { channel_type: 'voice', platform_id: LINE }]);
+    await start([{ platform_id: 'telegram:100' }, { channel_type: 'voice-mode', platform_id: LINE }]);
     const { call } = await startCall(h);
     expect(call.chat).toBe('telegram DM');
   });
@@ -1507,7 +1507,7 @@ describe('livekit call talking in the agent chat', () => {
     h = await startHarness();
   });
 
-  it('keeps the call on the voice line with VOICE_MIRROR=off and no /voice chat', async () => {
+  it('keeps the call on the voice line with VOICE_MODE_MIRROR=off and no /voice chat', async () => {
     const { posts } = await start([{}], 'off');
     const { call, worker } = await startCall(h);
     expect(call.chat).toBeUndefined();

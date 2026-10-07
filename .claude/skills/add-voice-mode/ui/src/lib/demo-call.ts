@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { LIVE_PHASES, type Line, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceCall } from "./voice-call"
+import { LIVE_PHASES, type Line, type Phase, type SendCue, type Speaker, type TurnMark, type VoiceModeCall } from "./voice-call"
 import { INITIAL_REVIEW, type ReviewState, type TurnMode } from "./review"
 
 /**
@@ -167,7 +167,7 @@ const demoReview = (mode: TurnMode, wake: boolean): ReviewState => ({ ...INITIAL
 const scriptFor = (which: DemoScript): Step[] => (which === "review" ? REVIEW_SCRIPT : which === "wake" ? WAKE_SCRIPT : which === "cues" ? CUES_SCRIPT : SCRIPT)
 const wakeScript = (steps: Step[]) => steps === WAKE_SCRIPT || steps === CUES_SCRIPT
 
-export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stopAt: number | null = null): VoiceCall {
+export function useDemoCall(enabled: boolean, initial: DemoScript = "auto", stopAt: number | null = null): VoiceModeCall {
   const [phase, setPhase] = useState<Phase>("idle")
   const [lines, setLines] = useState<Line[]>([])
   const [streamingId, setStreamingId] = useState<number | null>(null)

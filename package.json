@@ -31,7 +31,7 @@
     "lint:fix": "eslint src/ --fix",
     "test": "vitest run",
     "test:watch": "vitest",
-    "voice-worker": "node dist/voice-livekit-worker.js start"
+    "voice-mode-worker": "node dist/voice-mode-worker.js start"
   },
   "dependencies": {
     "@chat-adapter/slack": "4.29.0",

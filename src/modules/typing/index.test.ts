@@ -719,7 +719,7 @@ describe('typing observers', () => {
 
   it('hear the runner pick an inbound up at once, once, and only from a report stamped after that inbound', async () => {
     const calls = captureAdapter();
-    startTypingRefresh('sess-pick', 'ag-1', 'voice', 'voice:line', null);
+    startTypingRefresh('sess-pick', 'ag-1', 'voice', 'voice-mode:line', null);
     await vi.advanceTimersByTimeAsync(0);
     const painted = calls.length;
     seen.length = 0;
@@ -728,7 +728,7 @@ describe('typing observers', () => {
     expect(seen).toEqual([]);
     await vi.advanceTimersByTimeAsync(500);
     notePresence('sess-pick', { turn: 'working', updatedAtMs: Date.now(), status: null });
-    expect(seen).toEqual([expect.objectContaining({ platformId: 'voice:line', working: true })]);
+    expect(seen).toEqual([expect.objectContaining({ platformId: 'voice-mode:line', working: true })]);
     // Observers only: the platform indicator keeps its own cadence.
     expect(calls).toHaveLength(painted);
     // A re-mark of the same turn is no second pickup; the refresh ticks carry the flag.
@@ -738,7 +738,7 @@ describe('typing observers', () => {
     expect(seen.at(-1)).toEqual(expect.objectContaining({ working: true }));
     // The next inbound starts a new stretch: not working on it until a report says so.
     seen.length = 0;
-    startTypingRefresh('sess-pick', 'ag-1', 'voice', 'voice:line', null);
+    startTypingRefresh('sess-pick', 'ag-1', 'voice', 'voice-mode:line', null);
     expect(seen).toEqual([expect.objectContaining({ working: false })]);
     await vi.advanceTimersByTimeAsync(1);
     notePresence('sess-pick', { turn: 'working', updatedAtMs: Date.now(), status: null });
@@ -748,7 +748,7 @@ describe('typing observers', () => {
 
   it('stay quiet about a pickup inside the post-delivery pause, like the refresh ticks', async () => {
     captureAdapter();
-    startTypingRefresh('sess-pause', 'ag-1', 'voice', 'voice:line', null);
+    startTypingRefresh('sess-pause', 'ag-1', 'voice', 'voice-mode:line', null);
     await vi.advanceTimersByTimeAsync(1);
     pauseTypingRefreshAfterDelivery('sess-pause');
     seen.length = 0;

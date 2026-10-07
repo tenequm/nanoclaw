@@ -1,5 +1,5 @@
-/** Runtime config the host injects as window.__VOICE_UI__ (see VOICE_UI in SKILL.md). */
-export interface VoiceUiConfig {
+/** Runtime config the host injects as window.__VOICE_UI__ (see VOICE_MODE_UI in SKILL.md). */
+export interface VoiceModeUiConfig {
   skin?: "te" | "nanoclaw"
   colorway?: "auto" | "ivory" | "field" | "rabbit"
   layout?: "rail" | "stack"
@@ -11,7 +11,7 @@ export interface VoiceUiConfig {
   colorwayPicker?: boolean
 }
 
-export const DEFAULTS: Required<VoiceUiConfig> = {
+export const DEFAULTS: Required<VoiceModeUiConfig> = {
   skin: "te",
   colorway: "auto",
   layout: "rail",
@@ -23,7 +23,7 @@ export const DEFAULTS: Required<VoiceUiConfig> = {
   colorwayPicker: true,
 }
 
-export function readConfig(): Required<VoiceUiConfig> {
+export function readConfig(): Required<VoiceModeUiConfig> {
   const raw = (typeof window !== "undefined" && window.__VOICE_UI__) || {}
   const c = { ...DEFAULTS }
   if (raw.skin === "te" || raw.skin === "nanoclaw") c.skin = raw.skin
