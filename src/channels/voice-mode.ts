@@ -17,7 +17,7 @@
  * loopback front (or a trusted reverse proxy) that terminates TLS.
  */
 import { createHash } from 'node:crypto';
-import type http from 'node:http';
+import http from 'node:http';
 import net from 'node:net';
 
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundEvent, OutboundMessage } from './adapter.js';
@@ -30,6 +30,9 @@ import { DEFAULT_VOICE_MIRROR, wakePhrase } from './voice-mode-protocol.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
+import { findVoiceModeLineByToken } from '../db/voice-mode-lines.js';
+import { routeVoiceModeTurn } from './voice-mode-route.js';
+import { handleVoiceCommand } from './voice-mode-command.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { requestWake } from '../request-wake.js';
@@ -110,7 +113,8 @@ export function admitsVoiceModePeer(
   peer: string | undefined,
   forwardedFor: string | string[] | undefined,
 ): boolean {
-  if (isLoopbackAddress(peer)) return true;
+  const trusted = policy.trustedProxies.has(peer);
+  if (isLoopbackAddress(peer) && !(trusted && policy.allowedClients.configured)) return true;
   if (!policy.trustedProxies.has(peer)) return false;
   if (!policy.allowedClients.configured) return true;
   const hops = [forwardedFor ?? []]
@@ -118,7 +122,7 @@ export function admitsVoiceModePeer(
     .flatMap((h) => h.split(','))
     .map((h) => h.trim())
     .filter(Boolean);
-  const client = hops.findLast((h) => !policy.trustedProxies.has(h)) ?? hops[0];
+  const client = hops.findLast((h) => !policy.trustedProxies.has(h)) ?? hops[0] ?? peer;
   return policy.allowedClients.has(client);
 }
 
@@ -157,8 +161,11 @@ const VOICE_MODE_DEFAULTS: ChannelDefaults = {
 export interface VoiceModeConfig {
   /** Origin the caller's browser reaches the host at (for the call link). */
   publicUrl: string;
+  pagePort?: number;
   /** Link tokens accepted on the HTTP routes; each is one voice line. */
-  linkTokens: string[];
+  linkTokens?: string[];
+  lineForToken?: (token: string) => Promise<string | null>;
+  routeTurn?: (event: InboundEvent) => Promise<boolean>;
   /** The LiveKit server the calls run on. */
   livekit: LiveKitVoiceConfig;
   /** Resolves the named caller, single wiring and explicit access. Defaults to the central DB. */
@@ -233,10 +240,18 @@ export function lineIdForToken(token: string): string {
 export interface VoiceModeChannelAdapter extends ChannelAdapter {
   /** The line's call page URL, or null when the line has no link token here. */
   callLink(platformId: string): string | null;
+  callUrl(token: string): string;
+  handleVoiceCommand(event: InboundEvent): Promise<boolean>;
 }
 
 export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChannelAdapter {
-  const tokens = new Set(config.linkTokens.map((t) => t.trim()).filter(Boolean));
+  const tokens = new Set((config.linkTokens ?? []).map((t) => t.trim()).filter(Boolean));
+  const lineForToken =
+    config.lineForToken ??
+    (async (token: string) => {
+      const line = await findVoiceModeLineByToken(token);
+      return line ? `voice-mode:${line.line_id}` : tokens.has(token) ? lineIdForToken(token) : null;
+    });
   const proxyPolicy: VoiceModeProxyPolicy = {
     trustedProxies: parseCidrs(config.trustedProxyCidrs, 'VOICE_MODE_TRUSTED_PROXY_CIDRS'),
     allowedClients: parseCidrs(config.allowedClientCidrs, 'VOICE_MODE_ALLOWED_CLIENT_CIDRS'),
@@ -265,6 +280,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
   const starts = new Map<string, number[]>();
   let setup: ChannelSetup | null = null;
   let connected = false;
+  let pageServer: http.Server | undefined;
   /** Call time already used per line, for the UTC day (epoch day number) it was used on. */
   const usage = new Map<string, { day: number; usedMs: number }>();
   const utcDay = (t: number): number => Math.floor(t / DAY_MS);
@@ -327,25 +343,21 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     admitStart,
     remainingTodayMs: (platformId, t) => maxCallMsPerDay - usedTodayMs(platformId, t),
     chargeUsage,
-    // Resolves once the agent's session stored the turn (to answer, or as context), or with false once routing ended without that.
-    routeTurn: (event) =>
-      new Promise<boolean>((resolve, reject) => {
-        if (!setup?.routeInboundEvent) {
-          log.warn('livekit-voice-mode: channel is not running; turn dropped', { platformId: event.platformId });
-          return reject(new Error('the voice channel is not running'));
-        }
-        const onStored = (session: Session) => {
+    routeTurn: async (event) => {
+      if (!setup) throw new Error('the voice-mode channel is not running');
+      let stored = false;
+      const routed = {
+        ...event,
+        onStored: (session: Session) => {
+          stored = true;
           expediteReplies(session);
-          resolve(true);
-        };
-        setup.routeInboundEvent({ ...event, onStored }).then(
-          () => resolve(false),
-          (err: unknown) => {
-            log.error('livekit-voice-mode: routing a turn failed', { platformId: event.platformId, err });
-            reject(err instanceof Error ? err : new Error(String(err)));
-          },
-        );
-      }),
+        },
+      };
+      const accepted = config.routeTurn
+        ? await config.routeTurn(routed)
+        : await routeVoiceModeTurn(routed, event.agentGroupId!);
+      return stored || accepted;
+    },
     callJoined: (callId, route, agentGroupId) => {
       if (joinedCalls.has(callId)) return;
       joinedCalls.add(callId);
@@ -377,11 +389,18 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     const token = url.searchParams.get('t') ?? '';
     // Before any token check: a link must not be usable, or probed, from the LAN over plain HTTP.
     const peer = req.socket.remoteAddress;
-    if (!config.allowNonLoopback && !isLoopbackAddress(peer)) {
+    if (!config.allowNonLoopback) {
       const browserRoute = parsed !== null && !isWorkerRoute(parsed);
-      if (!browserRoute || !admitsVoiceModePeer(proxyPolicy, peer, req.headers['x-forwarded-for'])) {
+      if (
+        browserRoute
+          ? !admitsVoiceModePeer(proxyPolicy, peer, req.headers['x-forwarded-for'])
+          : !isLoopbackAddress(peer)
+      ) {
         if (proxyPolicy.trustedProxies.has(peer)) {
-          log.warn('voice-mode: refused a proxied voice request', { peer, forwardedFor: req.headers['x-forwarded-for'] });
+          log.warn('voice-mode: refused a proxied voice request', {
+            peer,
+            forwardedFor: req.headers['x-forwarded-for'],
+          });
         }
         return reply(res, 403, 'Voice calls are served through the host front only');
       }
@@ -393,13 +412,14 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       // and must refuse rather than start calls for a channel that is no longer running.
       if (!connected || !setup) return reply(res, 503, 'Voice is not running');
       if (route === 'livekit' || route.startsWith('livekit/')) {
-        return await livekit.handleHttp(req, res, route, url, tokens, lineIdForToken);
+        return await livekit.handleHttp(req, res, route, url, lineForToken);
       }
       if (route === 'info') {
         // Who answers this line, so the page can greet by name before the call.
         if (req.method !== 'GET') return reply(res, 405, 'GET only');
-        if (!tokens.has(token)) return reply(res, 403, 'Unknown call link');
-        const line = await resolveLine(lineIdForToken(token));
+        const platformId = await lineForToken(token);
+        if (!platformId) return reply(res, 403, 'Unknown call link');
+        const line = await resolveLine(platformId);
         if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
         const info = { agent: line.agent.name, caller: line.caller.name, wakePhrase: config.wakePhrase };
         return reply(res, 200, JSON.stringify(info), JSON_HEADERS);
@@ -419,6 +439,15 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     supportsThreads: false,
     defaults: VOICE_MODE_DEFAULTS,
 
+    callUrl(token: string): string {
+      return `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}`;
+    },
+    handleVoiceCommand(event: InboundEvent): Promise<boolean> {
+      return handleVoiceCommand(
+        event,
+        (token) => `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}`,
+      );
+    },
     callLink(platformId: string): string | null {
       const token = [...tokens].find((t) => lineIdForToken(t) === platformId);
       return token ? `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}` : null;
@@ -429,6 +458,18 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       registerWebhookHandler(CHANNEL_TYPE, handleHttp);
       registerRootHandler('voice', handleHttp);
       registerWebhookHandler('voice', handleHttp);
+      if (config.pagePort !== undefined) {
+        pageServer = http.createServer((req, res) => {
+          void handleHttp(req, res);
+        });
+        await new Promise<void>((resolve, reject) => {
+          pageServer!.once('error', reject);
+          pageServer!.listen(config.pagePort, () => {
+            pageServer!.off('error', reject);
+            resolve();
+          });
+        });
+      }
       connected = true;
       log.info('voice-mode: ready', {
         callUrl: `${config.publicUrl.replace(/\/+$/, '')}/voice?t=<link token>`,
@@ -440,6 +481,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
     async teardown(): Promise<void> {
       connected = false;
+      if (pageServer)
+        await new Promise<void>((resolve, reject) => pageServer!.close((err) => (err ? reject(err) : resolve())));
       await livekit.teardown();
       setup = null;
     },
@@ -514,6 +557,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
   factory: () => {
     const env = readEnvFile([
       'VOICE_MODE_PUBLIC_URL',
+      'VOICE_MODE_PORT',
       'VOICE_MODE_LINK_TOKEN',
       'VOICE_MODE_UI',
       'VOICE_MODE_MAX_CALL_SECONDS',
@@ -536,16 +580,12 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'VOICE_MODE_WAKE_MODEL',
       'VOICE_MODE_WAKE_PHRASE',
     ]);
-    if (!env.VOICE_MODE_LINK_TOKEN) {
-      if (env.LIVEKIT_URL) log.warn('voice-mode: VOICE_MODE_LINK_TOKEN is not set; the channel stays offline');
-      return null;
-    }
     const missing = LIVEKIT_REQUIRED.filter((key) => !env[key]);
     if (missing.length > 0) {
       log.warn('voice-mode: LiveKit is not configured; the channel stays offline', { missing });
       return null;
     }
-    const linkTokens = env.VOICE_MODE_LINK_TOKEN.split(',');
+    const linkTokens = (env.VOICE_MODE_LINK_TOKEN ?? '').split(',');
     const short = linkTokens.map((t) => t.trim()).filter((t) => t && t.length < 32);
     if (short.length > 0) {
       log.warn('voice-mode: link tokens shorter than 32 characters are weak; mint new ones with openssl rand -hex 16', {
@@ -553,6 +593,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       });
     }
     return createVoiceModeAdapter({
+      pagePort: Number(env.VOICE_MODE_PORT ?? 3100),
       publicUrl: (env.VOICE_MODE_PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, ''),
       linkTokens,
       ui: parseUiConfig(env.VOICE_MODE_UI),

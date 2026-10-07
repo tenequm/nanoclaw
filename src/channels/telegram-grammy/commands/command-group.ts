@@ -40,11 +40,13 @@ import {
   type StatusChatContext,
   type TargetAgent,
 } from '../../../commands/index.js';
+import { getChannelAdapterExact } from '../../channel-registry.js';
+import type { InboundEvent } from '../../adapter.js';
 import { log } from '../../../log.js';
 import { hasAdminPrivilege } from '../../../modules/permissions/db/user-roles.js';
 import type { AdapterRuntime } from '../runtime.js';
 
-import { actorUserId, contextMessagingGroupId, resolveTargetsForContext } from './context.js';
+import { actorUserId, contextPlatformId, contextMessagingGroupId, resolveTargetsForContext } from './context.js';
 import type { CommandMenus } from './menus.js';
 import {
   activationChangeConfirmation,
@@ -241,6 +243,27 @@ export function buildCommandGroup(runtime: AdapterRuntime, menus: CommandMenus):
       const res = yield* Effect.promise(() => resolveTargetsForContext(ctx));
       const chatCtx = yield* Effect.promise(() => chatContext(ctx));
       if (res.kind === 'none' || !chatCtx) return yield* dropNoAgent('voice', ctx);
+      const voice = getChannelAdapterExact('voice-mode') as
+        | { handleVoiceCommand?: (event: InboundEvent) => Promise<boolean> }
+        | undefined;
+      const platformId = contextPlatformId(ctx);
+      if (voice?.handleVoiceCommand && platformId && ctx.msg) {
+        yield* Effect.promise(() =>
+          voice.handleVoiceCommand!({
+            channelType: 'telegram',
+            instance: 'telegram',
+            platformId,
+            threadId: null,
+            message: {
+              id: String(ctx.msg!.message_id),
+              kind: 'chat',
+              content: JSON.stringify({ text: `/voice ${commandArg(ctx)}`, senderId: actor }),
+              timestamp: new Date(ctx.msg!.date * 1000).toISOString(),
+            },
+          }),
+        );
+        return;
+      }
       const outcome = yield* Effect.promise(() => runVoiceCommand(res, chatCtx, actor));
       const text = voiceCommandReply(outcome);
       if (text === null) return yield* dropNoAgent('voice', ctx);

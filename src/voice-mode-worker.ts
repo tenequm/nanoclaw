@@ -3516,7 +3516,8 @@ async function roomVoice(
         (frames) => {
           if (typing && !closed) cueTrack?.feed.setBed(frames);
         },
-        (err: unknown) => log.warn('voice-mode worker: no typing sound', { err: err instanceof Error ? err.message : err }),
+        (err: unknown) =>
+          log.warn('voice-mode worker: no typing sound', { err: err instanceof Error ? err.message : err }),
       );
     },
     publishReply: (info) => sendJson(CALL_REPLY_TOPIC, info, 'a reply label'),
@@ -3740,10 +3741,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   /** The label of the line being spoken: TurnTaking announces each line right before it. */
   let speakingLine: CallReplyInfo | undefined;
   if (meta.sttFallbackModel) {
-    log.warn('voice-mode worker: VOICE_MODE_STT_FALLBACK_MODEL is ignored: turns are transcribed by the Live model only', {
-      ...callFields,
-      model: meta.sttFallbackModel,
-    });
+    log.warn(
+      'voice-mode worker: VOICE_MODE_STT_FALLBACK_MODEL is ignored: turns are transcribed by the Live model only',
+      {
+        ...callFields,
+        model: meta.sttFallbackModel,
+      },
+    );
   }
 
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
@@ -4085,7 +4089,9 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
               { agent: meta.agentName, callId: meta.callId },
               reply,
               pcm,
-            ).catch((err: unknown) => callLog.warn('voice-mode worker: could not save a reply recording', { err, reply }));
+            ).catch((err: unknown) =>
+              callLog.warn('voice-mode worker: could not save a reply recording', { err, reply }),
+            );
           }
           telemetry.reply({
             reply,
@@ -4150,9 +4156,12 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           callTurns.onWake(end);
         },
         onError: (err) => {
-          callLog.warn('voice-mode worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn', {
-            err,
-          });
+          callLog.warn(
+            'voice-mode worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn',
+            {
+              err,
+            },
+          );
           wakeWord = undefined;
           callTurns.useWakeWord(undefined);
         },

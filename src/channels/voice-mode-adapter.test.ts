@@ -74,4 +74,17 @@ describe('voice routes and the reverse-proxy gate', () => {
     // A client list whose entries are all invalid admits no client, not every client.
     expect(admitsVoiceModePeer(policy('172.18.0.0/16', '100.64.0.0/x'), '172.18.0.5', '100.100.1.2')).toBe(false);
   });
+  it('holds a loopback proxy listed as trusted to the allowed clients, and a direct local request too', () => {
+    const p = policy('127.0.0.1/32, ::1/128', tailnet);
+    expect(admitsVoiceModePeer(p, '127.0.0.1', '100.100.1.2')).toBe(true);
+    expect(admitsVoiceModePeer(p, '::1', 'fd7a:115c:a1e0::1234')).toBe(true);
+    expect(admitsVoiceModePeer(p, '127.0.0.1', '203.0.113.9')).toBe(false);
+    expect(admitsVoiceModePeer(p, '127.0.0.1', undefined)).toBe(false);
+    expect(admitsVoiceModePeer(policy('127.0.0.1/32, ::1/128', `${tailnet}, 127.0.0.1`), '127.0.0.1', undefined)).toBe(
+      true,
+    );
+    // Loopback stays open unless it is a trusted proxy with client ranges set.
+    expect(admitsVoiceModePeer(policy('127.0.0.1/32'), '127.0.0.1', '203.0.113.9')).toBe(true);
+    expect(admitsVoiceModePeer(policy('172.17.0.0/16', tailnet), '127.0.0.1', '203.0.113.9')).toBe(true);
+  });
 });

@@ -3547,7 +3547,10 @@ describe('acoustic wake word', () => {
     });
     expect(wakeWordSettings({ VOICE_MODE_WAKE_MODEL: 'off' })).toBeNull();
     expect(
-      wakeWordSettings({ VOICE_MODE_WAKE_MODEL: 'data/models/hey_jarvis.onnx', VOICE_MODE_WAKE_PHRASE: ' Hey  Jarvis ' }),
+      wakeWordSettings({
+        VOICE_MODE_WAKE_MODEL: 'data/models/hey_jarvis.onnx',
+        VOICE_MODE_WAKE_PHRASE: ' Hey  Jarvis ',
+      }),
     ).toEqual({
       classifier: path.resolve('data/models/hey_jarvis.onnx'),
       threshold: 0.5,

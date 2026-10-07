@@ -67,6 +67,8 @@ import {
   getMessagingGroupByPlatform,
   getMessagingGroupsByAgentGroup,
 } from '../db/messaging-groups.js';
+import { stopThinking } from './voice-mode-route.js';
+import { getVoiceModeLine } from '../db/voice-mode-lines.js';
 import { getVoiceLine, getVoiceLineOwners } from '../db/voice-lines.js';
 import { registerPostDeliveryHook, setOutboundPresentation, type OutboundAddress } from '../delivery.js';
 import { log } from '../log.js';
@@ -304,8 +306,7 @@ export interface LiveKitVoice {
     res: http.ServerResponse,
     route: string,
     url: URL,
-    tokens: ReadonlySet<string>,
-    lineIdForToken: (token: string) => string,
+    lineForToken: (token: string) => Promise<string | null>,
   ): Promise<void>;
   /**
    * Speak an agent message on the line's LiveKit call. `target` is the parsed
@@ -363,6 +364,11 @@ const defaultMirrorApi: MirrorApi = {
   groupsFor: (agentGroupId) => getMessagingGroupsByAgentGroup(agentGroupId),
   adapter: (key) => getChannelAdapterExact(key),
   async boundChat(lineId) {
+    const current = await getVoiceModeLine(lineId.replace(/^voice-mode:/, ''));
+    if (current) {
+      const group = current.messaging_group_id && (await getMessagingGroup(current.messaging_group_id));
+      return group ? { group, threadId: current.thread_id, ownerIds: [current.owner_user_id] } : null;
+    }
     const line = await getMessagingGroupByPlatform('voice-mode', lineId);
     const row = line && (await getVoiceLine(line.id));
     const group = row?.target_messaging_group_id && (await getMessagingGroup(row.target_messaging_group_id));
@@ -460,7 +466,10 @@ export function liveKitChatTyping(chat: ChatAddress, agentGroupId: string, worki
   for (const engine of engines) engine.chatTyping(chat, agentGroupId, working);
 }
 
-registerPostDeliveryHook((msg, session) => liveKitChatDelivered(msg, session.agent_group_id));
+registerPostDeliveryHook((msg, session) => {
+  if (spokenText(msg)) stopThinking(session.id);
+  liveKitChatDelivered(msg, session.agent_group_id);
+});
 setOutboundPresentation((msg, content, session) => liveKitChatPresentation(msg, content, session.agent_group_id));
 registerTypingObserver(({ agentGroupId, working, ...chat }) => liveKitChatTyping(chat, agentGroupId, working));
 
@@ -1168,7 +1177,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
 
   const engine: LiveKitVoice = {
-    async handleHttp(req, res, route, url, tokens, lineIdForToken) {
+    async handleHttp(req, res, route, url, lineForToken) {
       if (route.startsWith('livekit/agent/')) return handleAgent(req, res, route, url);
       if (route === 'livekit') {
         if (req.method !== 'GET') return reply(res, 405, 'GET only');
@@ -1179,8 +1188,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       }
       if (req.method !== 'POST') return reply(res, 405, 'POST only');
       const token = url.searchParams.get('t') ?? '';
-      if (!tokens.has(token)) return reply(res, 403, 'Unknown call link');
-      const platformId = lineIdForToken(token);
+      const platformId = await lineForToken(token);
+      if (!platformId) return reply(res, 403, 'Unknown call link');
       if (route === 'livekit/token') return startCall(res, platformId);
       if (route === 'livekit/end') {
         const body = await readJson(req);

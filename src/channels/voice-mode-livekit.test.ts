@@ -9,7 +9,12 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
-import { createVoiceModeAdapter, lineIdForToken, type VoiceModeChannelAdapter, type VoiceModeConfig } from './voice-mode.js';
+import {
+  createVoiceModeAdapter,
+  lineIdForToken,
+  type VoiceModeChannelAdapter,
+  type VoiceModeConfig,
+} from './voice-mode.js';
 import {
   liveKitChatDelivered,
   liveKitChatPresentation,
@@ -210,6 +215,21 @@ async function startHarness(
       mirrorApi: fakeMirror([]).api,
       ...lkOverrides,
     },
+    routeTurn: async ({ onStored, ...event }) => {
+      if (event.channelType !== 'voice-mode') events.push(event);
+      else inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
+      if (routing.mode === 'hang') {
+        return new Promise<boolean>((resolve) =>
+          routing.hung.push((store) => {
+            if (store) onStored?.(session);
+            resolve(store === true);
+          }),
+        );
+      }
+      if (routing.mode === 'throw') throw new Error('router exploded');
+      if (routing.mode === 'store') onStored?.(session);
+      return routing.mode === 'store';
+    },
     ...overrides,
   });
   await adapter.setup({
@@ -220,20 +240,6 @@ async function startHarness(
       events.push(event);
     },
     // The LiveKit engine routes here; a turn on the voice line is recorded as the message it carries.
-    routeInboundEvent: async ({ onStored, ...event }) => {
-      if (event.channelType !== 'voice-mode') events.push(event);
-      else inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
-      if (routing.mode === 'hang') {
-        return new Promise<void>((resolve) =>
-          routing.hung.push((store) => {
-            if (store) onStored?.(session);
-            resolve();
-          }),
-        );
-      }
-      if (routing.mode === 'throw') throw new Error('router exploded');
-      if (routing.mode === 'store') onStored?.(session);
-    },
     onMetadata: () => {},
     onAction: () => {},
   });

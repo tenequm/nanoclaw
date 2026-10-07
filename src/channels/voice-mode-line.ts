@@ -7,6 +7,8 @@
 import path from 'node:path';
 
 import { GROUPS_DIR } from '../config.js';
+import { getVoiceModeLine } from '../db/voice-mode-lines.js';
+import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { readGroupPersona } from '../group-persona.js';
@@ -36,11 +38,17 @@ export interface VoiceModeLine {
   agent: VoiceModeAgent;
   caller: VoiceModeCaller;
   agentGroupId: string;
+  linkHash?: string;
 }
 
 /** Whether two resolutions of a line still name the same caller and agent; a call ends when they stop. */
 export function sameCallerAndAgent(a: VoiceModeLine, b: VoiceModeLine): boolean {
-  return a.caller.id === b.caller.id && a.caller.name === b.caller.name && a.agentGroupId === b.agentGroupId;
+  return (
+    a.caller.id === b.caller.id &&
+    a.caller.name === b.caller.name &&
+    a.agentGroupId === b.agentGroupId &&
+    a.linkHash === b.linkHash
+  );
 }
 
 /**
@@ -75,10 +83,35 @@ export interface ResolveLineOptions {
 /** Resolve a named personal line and its explicit access before reading the agent's files. */
 export async function resolveVoiceModeLine(
   platformId: string,
-  instance?: string,
+  instance?: string | ResolveLineOptions,
   options: ResolveLineOptions = {},
 ): Promise<VoiceModeLine | null> {
+  if (typeof instance === 'object') {
+    options = instance;
+    instance = undefined;
+  }
   try {
+    const line = platformId.startsWith('voice-mode:') ? await getVoiceModeLine(platformId.slice(11)) : undefined;
+    if (line) {
+      if (!(await hasAdminPrivilege(line.owner_user_id, line.agent_group_id))) return null;
+      const [caller, group] = await Promise.all([getUser(line.owner_user_id), getAgentGroup(line.agent_group_id)]);
+      if (!caller || !group) return null;
+      const fileText = options.forCall
+        ? readGroupPersona(path.join(GROUPS_DIR, group.folder), VOICE_MODE_VOCABULARY_FILE)
+        : null;
+      const vocabulary = options.forCall ? voiceModeVocabulary(options.vocabulary, fileText) : undefined;
+      const wakeNames = fileText ? voiceModeVocabulary(undefined, fileText) : undefined;
+      return {
+        caller: { id: caller.id, name: caller.display_name?.trim() || caller.id },
+        agentGroupId: group.id,
+        agent: {
+          name: group.name,
+          ...(vocabulary?.length ? { vocabulary } : {}),
+          ...(wakeNames?.length ? { wakeNames } : {}),
+        },
+        linkHash: line.token_hash,
+      };
+    }
     const caller = await getUser(platformId);
     if (!caller || caller.kind !== 'voice-mode' || !caller.display_name?.trim()) return null;
     const mg = await getMessagingGroupByPlatform('voice-mode', platformId, instance);
@@ -109,3 +142,5 @@ export async function resolveVoiceModeLine(
     return null;
   }
 }
+
+export const linePlatformId = (lineId: string): string => `voice-mode:${lineId}`;

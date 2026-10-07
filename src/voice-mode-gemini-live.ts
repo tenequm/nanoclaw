@@ -573,7 +573,9 @@ export class GeminiLiveTranscriber {
     try {
       socket.ws.send(JSON.stringify(message));
     } catch (err) {
-      this.opts.log.warn('voice-mode worker: could not send to a transcription socket', { err: this.redact(String(err)) });
+      this.opts.log.warn('voice-mode worker: could not send to a transcription socket', {
+        err: this.redact(String(err)),
+      });
     }
   }
 
