@@ -1,16 +1,15 @@
 {
-  "notes": "Conformance fixtures for scripts/skill-conformance.test.ts - shaped fake values only, never real credentials. One scenario: every prompt is unguarded, and no run captures output, so no exec stubs are needed.",
+  "notes": "Synthetic configuration prompts only. /voice creates links through core roles after install; no token captures, caller fixtures or wiring scripts.",
   "scenarios": [
     {
-      "name": "cloud",
+      "name": "default",
       "inputs": {
-        "livekit_url": "wss://example-project.livekit.cloud",
-        "livekit_api_key": "APIfakekey123",
-        "livekit_api_secret": "fakesecretfakesecretfakesecretfake",
-        "gemini_api_key": "fake-gemini-key-0000000000000000",
-        "public_url": "https://voice.example.com"
-      },
-      "exec": []
+        "livekit_url": "wss://livekit.example.com",
+        "livekit_api_key": "APIFAKEFAKE",
+        "livekit_api_secret": "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE",
+        "gemini_api_key": "FAKE-gemini-key-0000000000000000",
+        "public_url": "http://localhost:3100"
+      }
     }
   ]
 }

@@ -63,6 +63,7 @@
           - ".claude/skills/add-slack/**"
           - ".claude/skills/add-teams/**"
           - ".claude/skills/add-telegram/**"
+          - ".claude/skills/add-voice-mode/**"
           - ".claude/skills/add-webex/**"
           - ".claude/skills/add-wechat/**"
           - ".claude/skills/add-whatsapp/**"

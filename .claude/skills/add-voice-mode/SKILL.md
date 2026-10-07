@@ -1,125 +1,98 @@
 ---
 name: add-voice-mode
-description: Add Voice mode - talk to your real NanoClaw agent by voice from a phone or desktop browser. Your speech is transcribed and sent to the agent in one of its chats, with its memory, tools and persona; its written reply is spoken back. Gemini speech-to-text and text-to-speech, audio over LiveKit (LiveKit Cloud free tier or self-hosted). Use when the user wants to call or talk to their agent by voice.
+description: Adds LiveKit and Gemini voice calls with a real NanoClaw agent, a browser page and a separate worker. Use when an operator wants automatic or reviewed voice turns with an agent.
 ---
 
-# Add Voice mode
+# Add voice mode
 
-A browser page you open from a private link. You talk; when you pause, what you
-said is transcribed and sent to your agent as a message in one of its chats, so
-the agent answers with that chat's context, memory, tools and persona. Its reply
-is read out to you, and the chat shows both sides. No separate voice model
-stands in for the agent: every answer is the agent's own.
+A private browser link calls the real agent in one of its chats. The worker uses
+[LiveKit](https://docs.livekit.io/) for audio and
+[Gemini](https://ai.google.dev/gemini-api/docs/live) for transcription and speech.
+Replies use the agent's existing memory and tools. The host and worker run
+outside its container.
 
-How a call behaves: a pause of about 2.5 seconds sends what you said. While the
-agent's reply plays you are not heard (no interrupting); while it works you can
-keep talking, and each finished turn reaches it as a follow-up. A long reply is
-spoken up to a cap and the rest stays in the chat.
+Automatic mode listens for the configured acoustic phrase, then a spoken send
+word. Manual review lets the caller inspect, send or discard a draft. Calls
+include captions, cues, reconnect grace and container prewarm. Listening pauses
+while a reply plays.
 
-Parts: the `voice-mode` channel serves the page and hands turns to the agent; a
-separate worker process joins each call through LiveKit and runs Gemini
-transcription and speech; LiveKit carries the audio. You need:
-
-- a LiveKit project: LiveKit Cloud's free Build plan is enough (5,000 WebRTC
-  participant minutes a month, a hard cap; a call uses two participants, you and
-  the worker), or your own LiveKit server (see Self-hosted LiveKit);
-- a Gemini API key (Google AI Studio);
-- an HTTPS address for the page, since browsers give the microphone only to
-  `localhost` or HTTPS (Tailscale Serve or a reverse proxy, below).
+Costs include LiveKit transport, Gemini speech and the agent's own model usage.
+Default limits are fifteen minutes per call, twelve starts per hour and one
+hundred twenty minutes per UTC day per line. Counters reset on host restart.
+A call link is a bearer credential for its caller: keep it private.
 
 ## Apply
 
-### 1. Copy the code in
+### 1. Copy the payload
 
-The code lives on NanoClaw's `channels` registry branch. Fetch it from the
-remote that points at `nanocoai/nanoclaw` (in a fork usually `upstream`; set
-`NANOCLAW_CHANNELS_REMOTE=<remote>` to name it), with
-`git fetch <remote> +refs/heads/channels:refs/remotes/<remote>/channels`, and
-copy each file below in with `git show <remote>/channels:<path> > <path>`,
-overwriting (the branch is canonical; never merge it). Create each
-destination's parent directory first (`mkdir -p
-container/skills/voice-mode-formatting`; the `src` folders exist already). Stop
-if a fetch or `git show` fails; do not continue with missing or empty files.
-
-- the channel, `src/channels/voice-mode.ts`: the page server, the call-link
-  check, call limits, the proxy gate;
-- the call page, `src/channels/voice-mode-page.ts`, generated from this skill's
-  `ui/` folder;
-- the `/voice` chat command, `src/channels/voice-mode-command.ts`;
-- the voice line's access check against core's roles,
-  `src/channels/voice-mode-line.ts`;
-- the LiveKit engine, `src/channels/voice-mode-livekit.ts`, and the protocol it
-  shares with the worker, `src/channels/voice-mode-protocol.ts`;
-- the turn hand-off into the agent's session, `src/channels/voice-mode-route.ts`;
-- the worker, `src/voice-mode-worker.ts`;
-- the `voice_mode_lines` table with its migration, `src/db/voice-mode-lines.ts`
-  (one line per agent: the link token's hash, the caller, the chat);
-- the tests: `src/channels/voice-mode-registration.test.ts`,
-  `src/channels/voice-mode-adapter.test.ts`,
-  `src/channels/voice-mode-page.test.ts`,
-  `src/channels/voice-mode-command.test.ts`,
-  `src/channels/voice-mode-line.test.ts`,
-  `src/channels/voice-mode-livekit.test.ts`,
-  `src/channels/voice-mode-route.test.ts` and `src/voice-mode-worker.test.ts`;
-- the agent's container skill, `container/skills/voice-mode-formatting/SKILL.md`.
+Fetch `origin/channels`. For each path below, create its parent and copy with
+`git show origin/channels:<path> > <path>`. Stop if fetching or copying fails.
+Reapply overwrites implementation files while preserving runtime data and
+operator configuration. The payload must be on `channels` before this skill
+lands on `main`.
 
 ```nc:copy from-branch:channels
-src/channels/voice-mode.ts
-src/channels/voice-mode-page.ts
-src/channels/voice-mode-command.ts
-src/channels/voice-mode-line.ts
-src/channels/voice-mode-livekit.ts
-src/channels/voice-mode-protocol.ts
-src/channels/voice-mode-route.ts
-src/voice-mode-worker.ts
-src/db/voice-mode-lines.ts
-src/channels/voice-mode-registration.test.ts
 src/channels/voice-mode-adapter.test.ts
-src/channels/voice-mode-page.test.ts
+src/channels/voice-mode-call-session.test.ts
 src/channels/voice-mode-command.test.ts
-src/channels/voice-mode-line.test.ts
+src/channels/voice-mode-command.ts
+src/channels/voice-mode-gemini-live.test.ts
+src/channels/voice-mode-gemini-live.ts
+src/channels/voice-mode-group-persona.ts
+src/channels/voice-mode-integration.ts
+src/channels/voice-mode-line-roles.test.ts
+src/channels/voice-mode-line.ts
 src/channels/voice-mode-livekit.test.ts
+src/channels/voice-mode-livekit.ts
+src/channels/voice-mode-page.test.ts
+src/channels/voice-mode-page.ts
+src/channels/voice-mode-third-party-notices.txt
+src/channels/voice-mode-platform-id.ts
+src/channels/voice-mode-protocol.ts
+src/channels/voice-mode-registration.test.ts
+src/channels/voice-mode-review-page.test.ts
 src/channels/voice-mode-route.test.ts
-src/voice-mode-worker.test.ts
-container/skills/voice-mode-formatting/SKILL.md
+src/channels/voice-mode-route.ts
+src/channels/voice-mode-wakeword.test.ts
+src/channels/voice-mode-wakeword.ts
+src/channels/voice-mode-worker.test.ts
+src/channels/voice-mode-worker.ts
+src/channels/voice-mode.ts
+src/channels/voice-mode-wakeword-fixtures/negative.wav
+src/channels/voice-mode-wakeword-fixtures/positive.wav
+src/db/voice-mode-lines.ts
+scripts/voice-mode-install.ts
+scripts/voice-mode-install.test.ts
+assets/voice-mode-wakeword/LICENSE
+assets/voice-mode-wakeword/NOTICE
+assets/voice-mode-wakeword/embedding_model.onnx
+assets/voice-mode-wakeword/hey_livekit.onnx
+assets/voice-mode-wakeword/melspectrogram.onnx
 ```
 
-Optional, only while the `channels` branch does not carry these files yet:
-take them from the contributor's branch instead,
-`git fetch https://github.com/tenequm/nanoclaw.git feat/add-voice-mode`, then
-`git show FETCH_HEAD:<path> > <path>` for each file above, with the same
-`mkdir -p` first and the same stop on any failure.
+Copy resident agent guidance separately, preserving customized prose during an
+implementation repair:
 
-### 2. Register the channel
-
-Append `import './voice-mode.js';` to the channel barrel,
-`src/channels/index.ts`, unless the line is already there. The chat command and
-the table's migration come in with the channel.
-
-```nc:append to:src/channels/index.ts
-import './voice-mode.js';
+```nc:copy from-branch:channels
+container/skills/voice-mode-formatting/instructions.md
 ```
 
-### 3. Expose the router's delivery to one agent
+### 2. Connect to core
 
-A spoken turn goes to the line's one agent through the router's own
-engaged-message delivery, `deliverToAgent` in `src/router.ts` (thread policy,
-session, backfill, session-created hooks, typing, wake, fan-out). Export it:
-turn `async function deliverToAgent(` into `export async function
-deliverToAgent(`, unless it is exported already:
+Run `pnpm exec tsx scripts/voice-mode-install.ts apply`. It registers the channel,
+exports the router's engaged delivery function, calls the stored-turn helper,
+adds the outbound presentation helper and connects the browser root route.
+Each reach-in has a deletion-sensitive integration test. Line state registers
+its own module migration through the channel import.
 
 ```nc:run effect:refresh
-grep -q '^export async function deliverToAgent(' src/router.ts || { sed -i.bak 's/^async function deliverToAgent(/export async function deliverToAgent(/' src/router.ts && rm -f src/router.ts.bak; }
-grep -q '^export async function deliverToAgent(' src/router.ts
+pnpm exec tsx scripts/voice-mode-install.ts apply
 ```
 
-### 4. Install the packages
+### 3. Install exact dependencies and build
 
-Add these exact versions as dependencies (`pnpm add --save-exact`):
-`@livekit/agents@1.9.1`, `@livekit/agents-plugin-google@1.9.1`,
-`@livekit/agents-plugin-silero@1.9.1`, `@livekit/rtc-node@1.1.0`,
-`livekit-server-sdk@2.19.1` and `zod@4.6.5` (a peer dependency of the LiveKit
-agents).
+Install these pins with pnpm. Preserve the release-age and approved build-script
+policies. Acoustic wake inference uses the packaged ONNX CPU runtime.
 
 ```nc:dep
 @livekit/agents@1.9.1
@@ -127,475 +100,176 @@ agents).
 @livekit/agents-plugin-silero@1.9.1
 @livekit/rtc-node@1.1.0
 livekit-server-sdk@2.19.1
+onnxruntime-node@1.24.3
 zod@4.6.5
 ```
 
-### 5. Build and validate
-
-Build with `pnpm run build`, then run the voice tests with
-`pnpm exec vitest run src/channels/voice-mode src/voice-mode-worker`.
+Build, then run the voice tests and install/remove tests:
 
 ```nc:run effect:build
 pnpm run build
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-mode src/voice-mode-worker
+pnpm exec vitest run src/channels/voice-mode*.test.ts scripts/voice-mode-install.test.ts
 ```
 
-The tests drive every reach-in through core and go red when one is deleted:
-`voice-mode-registration.test.ts` loads the real channel and modules barrels,
-runs core's default migrations and only then uses the table (the barrel line,
-or a missing package, fails it); `voice-mode-command.test.ts` sends `/voice`
-through the router's `routeInbound` against core's roles on a real database;
-`voice-mode-route.test.ts` drives a turn into a real session, sees core's
-session-created hooks fire and core's delivery reach the channel's
-post-delivery hook; `voice-mode-livekit.test.ts` drives calls over HTTP against
-a fake LiveKit server.
+The generated page ships with readable third-party notices. Maintainers change
+it through the [browser source](ui/package.json): run `pnpm install
+--frozen-lockfile --ignore-scripts`, then `pnpm run build` in `ui/`. The generated
+source-hash test covers the page and its notices. Asset provenance and the
+starting point in glifocat's drafts are in [reference notes](references/2610-07-provenance.md).
 
-## Credentials
+### 4. Configure the host and worker
 
-Decide the page's HTTPS origin before this step, since it is asked for right
-after the keys (The page's address, below; with Tailscale Serve, set the mount
-up now). For self-hosted LiveKit, have the server and its proxy routes working
-first (Self-hosted LiveKit, below).
+Use a reachable LiveKit server or [Cloud project](https://cloud.livekit.io/),
+a Gemini project with access and quota for the configured speech models, and an
+HTTPS origin for the page. The microphone works on HTTPS or localhost.
+A self-hosted server needs signaling and UDP/TURN reachability; use the
+[deployment guide](https://docs.livekit.io/home/self-hosting/deployment/).
 
-### LiveKit
-
-**LiveKit Cloud (default).** Create a project at https://cloud.livekit.io and,
-in its settings, an API key. The project URL looks like
-`wss://<project>.livekit.cloud`. Cloud runs the TURN relays, so calls work from
-phones on mobile data; the worker runs on this machine and connects out to it.
-
-**Self-hosted LiveKit** (the second option, below): the URL is
-`wss://<page host>`, where the browser signals at `/rtc`. Also set
-`LIVEKIT_WORKER_URL=ws://127.0.0.1:7880` in `.env` before the restart below.
-
-Ask the user for the LiveKit URL the caller's browser connects to, the API key
-and its secret (a secret: never echo it back):
+Read existing configuration privately. Acquire credentials directly into `.env`
+or the operator's credential store; mask prompts, never place values in messages,
+reports, command arguments or service definitions. Both processes read `.env`
+themselves. Preserve already-set values when reapplying.
 
 ```nc:prompt livekit_url validate:^wss?://\S+$ normalize:rstrip-slash
-LiveKit URL the caller's browser connects to, e.g. wss://my-project.livekit.cloud
+LiveKit signaling URL, e.g. wss://your-project.livekit.cloud
 ```
 
-```nc:prompt livekit_api_key validate:^\S{6,}$ normalize:trim
-LiveKit API key (the key's name, from the project settings)
+```nc:prompt livekit_api_key secret validate:^\S{6,}$ normalize:trim
+LiveKit API key
 ```
 
-```nc:prompt livekit_api_secret secret validate:^\S{20,}$ normalize:trim
-LiveKit API secret for that key
+```nc:prompt livekit_api_secret secret validate:^\S{16,}$ normalize:trim
+LiveKit API secret
 ```
-
-### Gemini
-
-Create a key at https://aistudio.google.com/apikey. Only the worker uses it; the
-host checks it is set. Speech is transcribed by `gemini-3.5-transcribe-live`
-(streaming). While that model fails, `gemini-3.5-transcribe` takes over with one
-request per turn, and its quota is small (on Tier 1, 10 requests a minute and
-100 a day), so it is only a stopgap. Replies are spoken by
-`gemini-3.8-flash-tts`, falling back to `gemini-3.8-flash-lite-tts`.
-
-The key's project needs access and quota for these models; creating a key does
-not prove either, and the fallbacks use the same key. The first call confirms
-both directions; if one fails, check the worker log for authentication, quota
-or model errors.
-
-Ask the user for the Gemini API key (a secret too):
 
 ```nc:prompt gemini_api_key secret validate:^\S{20,}$ normalize:trim
 Gemini API key from https://aistudio.google.com/apikey
 ```
 
-Write the four values to `.env` as `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
-`LIVEKIT_API_SECRET` and `GEMINI_API_KEY`, leaving any key that is already set
-as it is:
+```nc:prompt public_url validate:^https?://\S+$ normalize:rstrip-slash
+Browser page origin, e.g. http://localhost:3100 or https://voice.example.com
+```
+
+Write the collected values to `.env`, set-if-absent:
 
 ```nc:env-set
 LIVEKIT_URL={{livekit_url}}
 LIVEKIT_API_KEY={{livekit_api_key}}
 LIVEKIT_API_SECRET={{livekit_api_secret}}
 GEMINI_API_KEY={{gemini_api_key}}
-```
-
-### The page's address
-
-The page and its routes live under `/voice` on the channel's own page server,
-port `VOICE_MODE_PORT` (default 3100), listening on every interface. It answers only
-loopback peers unless told otherwise, so the LAN gets 403. Browsers need HTTPS
-(or `localhost`) for the microphone:
-
-- **Tailscale Serve** (phone and computer on one tailnet) connects from
-  `127.0.0.1`, so nothing else is needed. The target repeats the path because
-  serve strips the mount prefix:
-  `tailscale serve --bg --set-path=/voice http://127.0.0.1:3100/voice`. The
-  origin is the machine's HTTPS name that `tailscale serve status` prints.
-- **A reverse proxy you already run** (Caddy, nginx, Traefik): route `/voice` on
-  your HTTPS host to `http://<this machine>:3100`; with Caddy on the same
-  machine, `voice.example.com { reverse_proxy /voice* 127.0.0.1:3100 }`. A proxy
-  that does not connect from loopback (one in a Docker container, say) needs
-  `VOICE_MODE_TRUSTED_PROXY_CIDRS` (the proxy's `/32` or its Docker subnet; keep it
-  narrow, any container in the range can claim any client).
-
-To admit only some callers, set `VOICE_MODE_ALLOWED_CLIENT_CIDRS` (where
-forwarded clients must be, read from the rightmost `X-Forwarded-For` hop outside
-the trusted proxies; for a tailnet-only page `100.64.0.0/10,fd7a:115c:a1e0::/48`).
-It applies to the proxies in `VOICE_MODE_TRUSTED_PROXY_CIDRS`; for a proxy on
-this machine, list loopback there too (`127.0.0.1/32,::1/128`). A direct local
-request then has to be in the allowed ranges as well, and the proxy must send
-`X-Forwarded-For`. Without loopback in the trusted list, loopback peers are
-always admitted.
-
-The worker talks to the host on the host's webhook server
-(`/webhook/voice-mode/livekit/agent/...`), loopback only; never proxy that path.
-`VOICE_MODE_ALLOW_NON_LOOPBACK=1` drops the gate entirely, for local development only.
-
-Ask the user for the origin callers' browsers reach the page at, and write it to
-`.env` as `VOICE_MODE_PUBLIC_URL` (unless already set). It is the exact HTTPS
-origin, without `/voice`: the call link appends `/voice` itself.
-
-```nc:prompt public_url validate:^https?://\S+$ normalize:rstrip-slash
-What origin (no path) does a caller's browser reach the page at? e.g. http://localhost:3100 to try it here, or https://voice.example.com
-```
-
-```nc:env-set
 VOICE_MODE_PUBLIC_URL={{public_url}}
 ```
 
-## Restart
+The page listener defaults to loopback port `3100`. Route `/voice` and its child
+paths through the chosen HTTPS front. A proxy on another address needs its
+narrow subnet or address in `VOICE_MODE_TRUSTED_PROXY_CIDRS`. Restrict forwarded
+clients with `VOICE_MODE_ALLOWED_CLIENT_CIDRS`; forwarding headers are accepted
+only from trusted peers. Keep `/webhook/voice-mode/livekit/agent` on loopback.
 
-`VOICE_MODE_PUBLIC_URL` (and, self-hosted, `LIVEKIT_WORKER_URL`) must be in
-`.env` before this restart; if either changes later, restart the host first,
-then the worker. Restart the host with `bash setup/lib/restart.sh` so the
-channel loads (it creates its `voice_mode_lines` table on start):
+### 5. Start and make the first line
+
+Restart the host with `bash setup/lib/restart.sh`. Start the worker from the
+same checkout with `pnpm run voice-mode-worker`. Host and worker must use the
+same build and protocol version. For a persistent worker, follow the
+[install-scoped service procedure](references/2610-07-services.md).
 
 ```nc:run effect:restart
 bash setup/lib/restart.sh
 ```
 
-Check it: `grep 'voice-mode: ready' logs/nanoclaw.log | tail -1` shows the
-page port and call URL, and
-`curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3100/voice` (your
-`VOICE_MODE_PORT`) prints `200`. Run the same `curl` against
-`https://<origin>/voice` from a device that can reach the origin; it must print
-`200` too. With `VOICE_MODE_ALLOWED_CLIENT_CIDRS` set and loopback trusted, a
-local 403 is expected; check through the proxy only.
-
-## Who can make a call link
-
-`/voice` is for the people core already trusts with an agent: the global
-`owner`, a global `admin`, or an `admin` scoped to that agent group. NanoClaw
-has no cross-channel identity: your Telegram account (`telegram:<id>`) and your
-Slack account (`slack:<id>`) are separate users, so each account you want to
-use needs the role. An account becomes a user the first time it messages the
-bot, so send the bot anything from it first. See who has what, and grant a
-scoped admin role, with core's own commands (`<agent group id>` from
-`ncl groups list`):
-
-```bash
-ncl roles list
-ncl users list
-ncl roles grant --user slack:<id> --role admin --group <agent group id>
-```
-
-## Run the worker
-
-The worker is a separate process (LiveKit's agent framework forks a child per
-call). It reads `.env` from its working directory itself; never give it an
-`EnvironmentFile`, which would put every secret in its environment. After any
-update, **restart the host first, then the worker**, from the same build: they
-share a protocol version, and a mismatched worker makes the page say the voice
-service is updating.
-
-Try it in a terminal first, from the checkout:
-`node dist/voice-mode-worker.js start`. It prints
-`voice worker: protocol v<n>, host URL <url> (LIVEKIT_HOST_URL)`, then, once
-LiveKit accepts it, a line like `registered worker`.
-`curl -s http://127.0.0.1:8089/` (`VOICE_MODE_WORKER_HEALTH_PORT`) prints `OK`
-while it is connected to LiveKit; that alone is not a working call.
-The worker reaches the host at `http://127.0.0.1:<WEBHOOK_PORT>`, taking
-`WEBHOOK_PORT` from this checkout's `.env` or its own environment, else 3000.
-Set `LIVEKIT_HOST_URL` only to override that; it must be a local `http(s)`
-address (`localhost`, `127.0.0.1` or `[::1]`), since the host serves the worker
-on loopback only, and the worker refuses to start otherwise. Stop the terminal
-worker with Ctrl-C before starting it as a service.
-
-**Linux, systemd user unit** (`~/.config/systemd/user/nanoclaw-voice-mode-worker.service`).
-Replace `/absolute/path/to/nanoclaw` with this checkout's absolute path and
-`/absolute/path/to/node` with the output of `command -v node` from the terminal
-where the worker ran (Node 22 or newer); systemd does not load your shell's Node
-manager.
-
-```ini
-[Unit]
-Description=NanoClaw Voice mode worker
-After=network-online.target
-
-[Service]
-WorkingDirectory=/absolute/path/to/nanoclaw
-ExecStart=/absolute/path/to/node dist/voice-mode-worker.js start
-Restart=on-failure
-RestartSec=5
-TimeoutStopSec=90
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
-mkdir -p ~/.config/systemd/user   # before writing the unit
-systemctl --user daemon-reload && systemctl --user enable --now nanoclaw-voice-mode-worker
-systemctl --user status nanoclaw-voice-mode-worker
-journalctl --user -u nanoclaw-voice-mode-worker -n 50
-```
-
-**macOS, launchd** (`~/Library/LaunchAgents/com.nanoclaw-voice-mode-worker.plist`;
-use the absolute paths of your checkout and of `which node`):
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.nanoclaw-voice-mode-worker</string>
-  <key>ProgramArguments</key>
-  <array><string>/path/to/node</string><string>dist/voice-mode-worker.js</string><string>start</string></array>
-  <key>WorkingDirectory</key><string>/path/to/nanoclaw</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/path/to/nanoclaw/logs/voice-mode-worker.log</string>
-  <key>StandardErrorPath</key><string>/path/to/nanoclaw/logs/voice-mode-worker.log</string>
-</dict>
-</plist>
-```
-
-From the checkout:
-
-```bash
-mkdir -p logs ~/Library/LaunchAgents   # before writing the plist
-launchctl load ~/Library/LaunchAgents/com.nanoclaw-voice-mode-worker.plist
-tail -n 50 logs/voice-mode-worker.log
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw-voice-mode-worker   # restart after an update
-```
-
-On stop the worker takes no new calls and gives running ones 60 seconds.
-
-## Make the first line
-
-Once the worker is running (above), tell the user to send `/voice` (on Slack
-`!voice`) in a chat wired to the agent, preferably a direct chat with the bot:
-the first time it sends a private call link for that agent (keep it, it is
-shown once) and makes that chat the one calls talk in; later, `/voice` in
-another chat only moves calls there, and `/voice new` replaces a lost link:
+Tell the operator to send `/voice` in a chat wired to the agent (on Slack,
+`!voice`). Core owner or admin roles authorize this command. The first run
+creates a hashed link and sends it privately. Later runs move calls to that
+chat without changing the link; `/voice new` replaces the link and terminates
+calls using the retired token. A group-chat link is delivered only by DM.
 
 ```nc:operator
-With the voice worker running (Run the worker), in a chat wired to your agent (a direct chat with the bot is best), send /voice (on Slack: !voice). The first time, you get a private call link for that agent (keep it: it is shown once), and calls talk in that chat. Later, /voice in another chat only moves calls there; /voice new replaces a lost link.
+Start the voice worker from this checkout. In a chat wired to your agent, send /voice (on Slack, !voice). Open the private link, press Call and allow the microphone. Confirm your transcript reaches that chat and the agent's reply is audible. Use /voice new to replace a lost or leaked link.
 ```
 
-## Where calls talk, and `/voice`
+Resident guidance comes from `voice-mode-formatting`. For an explicit group skill list, run `pnpm exec tsx
+scripts/voice-mode-install.ts guidance-add <group-id>`, then `ncl groups restart
+--id <group-id>`. This uses core config helpers and preserves other entries.
 
-Each agent has one voice line. `/voice` (Telegram) or `!voice` (Slack, whose
-client eats unknown slash commands), sent in a chat wired to the agent by an
-owner or admin of it:
+## Settings and behavior
 
-- makes that chat (and its thread, where the wiring keeps threads) the chat the
-  line's calls talk in, and confirms it;
-- the first time, creates the line, mints its call link and sends it to the
-  sender: as the reply in a direct chat, by direct message from a group chat,
-  so other members never see it. Only a hash of the link's token is stored, so
-  the link cannot be shown again. The sender becomes the line's caller: turns
-  are posted as `🎙 <name>: <text>` and handed to the agent as messages from
-  that account;
-- later runs by the line's caller only move the call chat: the link, its
-  caller and a live call stay (the call carries on in the new chat). Another
-  admin's `/voice` moves nothing and says so: their speech never lands in a chat
-  the caller did not pick.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page, worker routes and configured personal links. A taken default port is logged and skipped; an explicit port that cannot bind stops voice-mode from starting. |
+| `VOICE_MODE_PAGE_HOST` | `127.0.0.1` | Bind address of the separate page server. |
+| `VOICE_MODE_MAX_CALL_SECONDS` | `900` | Per-call duration limit. |
+| `VOICE_MODE_MAX_CALLS_PER_HOUR` | `12` | Start attempts per line, including failed starts. |
+| `VOICE_MODE_MAX_MINUTES_PER_DAY` | `120` | Per-line UTC daily call time. These counters reset when the host restarts. |
+| `VOICE_MODE_LANGUAGES` | `en-US` | Up to four language hints, first is primary. Agent language guidance follows them; the worker's own notices start in the first one and use Ukrainian only when it is listed. |
+| `VOICE_MODE_STT_MODEL` | `gemini-3.5-transcribe-live` | Own Gemini Live pipeline, one manual activity per caller turn. |
+| `VOICE_MODE_STT_FALLBACK_MODEL` | ignored | Deprecated unary fallback; the next turn retries Live. |
+| `VOICE_MODE_TTS_MODEL` | `gemini-3.8-flash-tts` | Reply speech model. |
+| `VOICE_MODE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Pre-audio fallback; `off` disables it. No replay after partial speech. |
+| `VOICE_MODE_TTS_VOICE` | `Alnilam` | Speech voice. |
+| `VOICE_MODE_SILENCE_MS` | `2500` | Closing silence, valid range 300 to 30000 milliseconds. |
+| `VOICE_MODE_MIRROR` | `telegram` | Fallback call-chat channel; `off` disables fallback. |
+| `VOICE_MODE_VOCABULARY` | empty | Comma-separated names, merged with the agent's `voice.vocabulary.txt`. |
+| `VOICE_MODE_MAX_SPOKEN_CHARS` | `0` | No cap; positive values cut speech at a sentence or whole word. |
+| `VOICE_MODE_TTS_DEESS`, `VOICE_MODE_TTS_NOTCH` | on | De-essing and fixed whistle notches; `off`, `false` or `0` disables each. |
+| `VOICE_MODE_WAKE_MODEL` | bundled `hey_livekit.onnx` | Custom acoustic classifier path, or `off` for transcript wake. |
+| `VOICE_MODE_WAKE_PHRASE` | `Hey LiveKit` | Label of the acoustic phrase; it does not train or change the model. |
+| `VOICE_MODE_WAKE_THRESHOLD` | `0.68` bundled, `0.5` custom | Acoustic confidence threshold between zero and one. |
+| `VOICE_MODE_WAKE_START_SECONDS`, `VOICE_MODE_WAKE_IDLE_SECONDS` | `8`, `20` | How long an addressed turn waits for first or more speech; zero disables each timer. |
+| `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`. |
+| `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | Worker health on loopback. |
+| `VOICE_MODE_UI` | empty | Page options: skin, colorway, layout, presence, brand, footer, shortcuts, timestamps, colorwayPicker. |
 
-`/voice new` (`!voice new` on Slack) mints a fresh link instead, sent the same
-way: the old link stops working, a call made with it ends, and the sender
-becomes the caller. It is how a lost or leaked link is replaced. The command
-never reaches the agent.
+`LIVEKIT_WORKER_URL` selects the worker/API-side LiveKit URL; default is
+`LIVEKIT_URL`. `LIVEKIT_HOST_URL` is the worker's loopback host webhook origin;
+by default it uses `WEBHOOK_PORT` or port 3000. Only a local plain-http origin
+(`localhost`, `127.0.0.1`, `[::1]`) is accepted: the worker exits at start and
+ends a call cleanly otherwise, since every request carries call secrets. Point
+`LIVEKIT_HOST_URL` directly at the webhook port, never through a proxy.
+`LIVEKIT_AGENT_NAME` must match on host and worker; default is
+`nanoclaw-voice-mode`.
 
-During a call every message the agent sends to that chat is spoken. A call
-also ends when the caller loses their role. If the chat stops being wired to
-the agent, calls fall back to the one chat of the `VOICE_MODE_MIRROR` channel type wired to the agent (or the one
-direct chat among several), and are refused when there is none.
+The vocabulary file is bounded and rejects symlinks/FIFOs. Keep names only:
+60 terms and 1024 bytes total, at most 80 characters per term. Its entries
+also name the agent for transcript wake. Preserve it across upgrades.
 
-## First call
+A custom acoustic classifier is used from `VOICE_MODE_WAKE_MODEL` with its
+phrase and threshold settings. Without a model, transcript `hey <agent>` opens
+the turn, including the agent's alternate names. Acoustic wake sends no idle
+audio to Google; transcript wake necessarily transcribes speech before deciding
+whether it was addressed. Failure to load an acoustic model falls back to
+transcript.
 
-Open the link `/voice` sent you, press Call, allow the microphone and
-ask something only the agent knows ("what's on my calendar tomorrow?"). The
-first answer of a call can take a few seconds longer while the agent's container
-starts. On iPhone, start the call with the Call button so audio can play. The
-install works when your words reach the chat as a transcript and you hear the
-agent's reply; if not, see Troubleshooting.
-Adding `&demo=1` to the link plays a scripted call that connects to nothing.
+The worker announces command vocabulary version `3` and the actual words.
+`zulu`, `прийом`, and a final-confirmed own-sentence `copy`/`copy that` send;
+`scratch that`, `discard turn`, `discard this turn` discard. Two matching
+interims or a single interim unchanged for 700 milliseconds nominate a command
+once speech stops; the final decides it. A missing or collapsed final cannot
+confirm `copy`. Other commands use the dropped-command recovery.
+The page drives commands and settings for vocabulary `2` and `3` alike (the
+same `zulu`/`copy` words); any other value gets no commands and no settings.
+A page that accepts only `2` leaves a `3` worker wake-gated until it reloads.
+Manual review treats these words as ordinary dictation. Cue and typing sound
+switches remain independent settings. Caller speech during agent speech is
+reported as unheard. Reconnect grace keeps a same-identity full rejoin alive.
 
-Three short sounds let you follow a call without looking: a rising two-note
-when the line hears you, a single high tick when what you said goes to the
-agent, and a falling two-note when the agent is done and it is your turn. None
-plays while the agent speaks. Add `&cues=0` to the link to turn them off.
 
-## Settings
-
-All in `.env`; restart the host (and the worker, for its keys) to apply. An
-empty value reads as unset, so turn a fallback off with `off`.
-
-| Key | Default | Read by | What |
-| --- | --- | --- | --- |
-| `VOICE_MODE_LANGUAGES` | `en-US` | host | Languages callers speak, BCP-47, comma-separated, the first the default (e.g. `uk-UA,en-US`). The transcription's language hints; unless it is English only, each turn also tells the agent which languages to answer in. With Ukrainian listed and Russian not, a Russian-looking transcript is treated as misheard Ukrainian. The worker's own short lines exist in English and Ukrainian. |
-| `VOICE_MODE_VOCABULARY` | empty | host | Comma-separated names to recognise and spell exactly, for every agent; merged with each agent's vocabulary file (below). At most 60 terms and 1024 bytes together, these first. |
-| `VOICE_MODE_PORT` | `3100` | host | The page server's port. |
-| `VOICE_MODE_MAX_CALL_SECONDS` | `900` | host | Longest call. |
-| `VOICE_MODE_MAX_CALLS_PER_HOUR` | `12` | host | Call starts per line per hour. |
-| `VOICE_MODE_MAX_MINUTES_PER_DAY` | `120` | host | Call minutes per line per UTC day (counted in memory, reset on restart). |
-| `VOICE_MODE_SILENCE_MS` | `2500` | host | Silence that sends a turn (300-30000). |
-| `VOICE_MODE_MIRROR` | `telegram` | host | Channel type of the fallback call chat when the `/voice` chat is no longer wired to the agent; `off` refuses calls instead. |
-| `VOICE_MODE_STT_MODEL` | `gemini-3.5-transcribe-live` | host | Streaming transcription. |
-| `VOICE_MODE_STT_FALLBACK_MODEL` | `gemini-3.5-transcribe` | host | Used only while the streaming model fails; `off` for none. |
-| `VOICE_MODE_TTS_MODEL` | `gemini-3.8-flash-tts` | host | Speaks the replies. |
-| `VOICE_MODE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | host | `off` for none. |
-| `VOICE_MODE_TTS_VOICE` | `Alnilam` | host | Prebuilt Gemini voice. |
-| `LIVEKIT_WORKER_URL` | `LIVEKIT_URL` | both | Server-side LiveKit URL (e.g. `ws://127.0.0.1:7880` for a server on this machine). |
-| `LIVEKIT_AGENT_NAME` | `nanoclaw-voice` | both | Dispatch name; the same value for host and worker. |
-| `LIVEKIT_HOST_URL` | `http://127.0.0.1:<WEBHOOK_PORT>` | worker | Where the worker reaches the host; a local `http(s)` address, checked at start. |
-| `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | worker | Health check on `127.0.0.1`. |
-| `VOICE_MODE_MAX_SPOKEN_CHARS` | `0` | worker | Longest spoken message, cut at a sentence end; the rest stays in the chat. `0` speaks every message in full. |
-
-### The agent's vocabulary file
-
-`voice.vocabulary.txt` in the agent's group folder (`groups/<folder>/`, which
-the agent sees as `/workspace/agent/`) lists names the transcription should
-spell exactly, one per line. It is read at the start of each call, so changes
-apply from the next call. The agent adds names a transcript got wrong (the
-`voice-mode-formatting` container skill tells it to); you can read and edit
-the file too. Terms over 80 characters are skipped, and the file shares the
-60-term, 1024-byte cap with `VOICE_MODE_VOCABULARY`.
-
-## Self-hosted LiveKit
-
-**Advanced.** This needs an existing HTTPS endpoint, DNS and certificates for
-both the page name and a TURN name, and a reverse proxy that carries WebSocket
-signalling and TURN over TCP/TLS; without that, use LiveKit Cloud for the first
-call. Tailscale Serve for `/voice` alone does not provide TURN, and iPhones use
-relay (TURN) by default, so without it the page loads but there is no audio.
-
-Your own LiveKit server instead of Cloud. A working shape for a home server
-reached over a tailnet or LAN, with a reverse proxy that already holds a
-certificate on port 443. The example advertises one IPv4 LAN or tailnet address
-(`/32` is IPv4): every caller must be able to reach it, so a LAN-only address
-does not work from a phone on mobile data. Callers need TCP 443 (page,
-signalling, TURN) through the proxy and UDP 7882 plus TCP 7881 on `<node-ip>`;
-7880 and 5349 stay private, reached by the proxy only.
-
-1. Install `livekit-server` (on Linux a release binary from
-   https://github.com/livekit/livekit/releases, on macOS `brew install livekit`)
-   and generate a key pair: `livekit-server generate-keys`.
-2. Write `livekit.yaml`. `<node-ip>` is the address phones reach this machine
-   at (its tailnet or LAN IP); `turn.example.com` is a name your proxy has a
-   certificate for:
-
-   ```yaml
-   port: 7880                      # signalling + server API
-   bind_addresses: [127.0.0.1]     # add the address your proxy connects from
-   keys:
-     <api key>: <api secret>       # or key_file: a file only you can read
-   rtc:
-     tcp_port: 7881                # ICE/TCP fallback; keep it on
-     udp_port: 7882                # all media on one UDP port
-     use_external_ip: false
-     node_ip: <node-ip>
-     ips:
-       includes: [<node-ip>/32]
-   turn:
-     enabled: true
-     domain: turn.example.com      # LiveKit always advertises TURN on :443
-     tls_port: 5349
-     external_tls: true            # the proxy terminates TLS, passes plain TCP
-     udp_port: 0
-   room:
-     auto_create: false            # NanoClaw creates each call's room
-   ```
-
-3. Run it as a service: `livekit-server --config livekit.yaml`, restarted
-   always (it exits 0 on a failed start), started once `<node-ip>` exists (the
-   UDP socket binds only the addresses present at start).
-4. Proxy two things on :443. Signalling: `/rtc` on the same HTTPS host as the
-   page, to `http://127.0.0.1:7880`. TURN/TLS: a TCP route by SNI for
-   `turn.example.com` that terminates TLS and forwards plain TCP to `:5349`. In
-   Traefik that is a `tcp` router with ``rule: HostSNI(`turn.example.com`)``,
-   `tls` on, and a service `address: 127.0.0.1:5349`; nginx needs a `stream`
-   block, Caddy its layer4 plugin.
-5. In `.env`: `LIVEKIT_URL=wss://<page host>` (the browser signals at `/rtc`
-   there), `LIVEKIT_WORKER_URL=ws://127.0.0.1:7880`, and the key pair, all
-   before the host restart (Restart, above).
-6. Let callers reach UDP 7882 and TCP 7881 on `<node-ip>`.
-7. Verify: `curl -s https://<page host>/rtc/validate` returns LiveKit's own 401
-   ("no permissions to access the room"), and
-   `openssl s_client -connect turn.example.com:443 -servername turn.example.com`
-   shows your certificate.
-
-iPhones and iPads join relay-only (TURN over TLS): iOS Safari's WebRTC UDP often
-fails over VPN tunnels, and LiveKit's own fallback reaches TURN only after
-10-30 seconds. Append `&relay=0` (or `&relay=1` on other devices) to the link
-to override. Desktop browsers use UDP.
+For removal, follow [REMOVE.md](REMOVE.md). Existing branch users should read
+[the protocol upgrade procedure](../../../docs/2610-07-voice-mode-upgrade.md).
 
 ## Troubleshooting
 
-- **The page says the voice service is unavailable.** No worker joined within 25
-  seconds: the worker is down, or its LiveKit URL or keys differ from the
-  host's. Check its log.
-- **"The voice service is updating".** Host and worker are from different
-  builds; restart the host, then the worker.
-- **The call ends at once and the host log says it refused the call.** The
-  worker cannot reach the host: set `LIVEKIT_HOST_URL` to the host's loopback
-  webhook URL.
-- **The worker exits at start saying `LIVEKIT_HOST_URL` must be local.** It
-  names a remote address; the worker must run on the host's machine and reach
-  it over loopback.
-- **`voice-mode` is missing from `ncl` channel lists.** The channel stays
-  offline until `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` and
-  `GEMINI_API_KEY` are all set; the host log names what
-  is missing.
-- **The microphone is refused.** The page is not on HTTPS or `localhost`.
-- **The microphone is refused on HTTPS.** Allow it in the browser's site
-  settings and the OS privacy settings, and open the link in a full browser,
-  not an in-app webview.
-- **The page is unreachable or blank.** Check the host logged
-  `voice-mode: ready`, that the proxy targets `VOICE_MODE_PORT` and keeps the
-  `/voice` path and its child routes (`/voice/info`, `/voice/livekit/...`), and,
-  with Tailscale Serve, that the caller's device is on the same tailnet.
-- **The call connects but there is no audio.** Unmute, and press the page's
-  `Tap to hear <agent>` button if it shows. No transcript in the chat: check the
-  worker log for transcription errors, then LiveKit media and TURN. A transcript
-  but no speech: check the worker log for speech (TTS) errors and the device's
-  playback. Self-hosted on an iPhone: check TURN (Self-hosted LiveKit).
-- **403 on the page.** The request came from a non-loopback address outside
-  `VOICE_MODE_TRUSTED_PROXY_CIDRS`, or a trusted proxy (loopback included, once
-  listed there) forwarded a client outside `VOICE_MODE_ALLOWED_CLIENT_CIDRS`, or
-  sent no `X-Forwarded-For`.
-- **Lost the call link.** It cannot be shown again (only its hash is stored):
-  send `/voice new` (`!voice new` on Slack) for a fresh one; the old one stops
-  working.
-- **"Unknown call link".** The link was replaced by `/voice new`. Use the newest
-  link, or send `/voice new` again.
-- **"Caller access denied".** The account the link was minted for (the first
-  `/voice`, or the last `/voice new`) no longer has an owner or admin role over
-  the agent (`ncl roles list`); an admin sends `/voice new` to take the line
-  over.
-- **`/voice` says only an owner or admin can use it.** That chat account has no
-  role over the agent; grant one with `ncl roles grant` (Who can make a call
-  link, above). Each channel account is its own user.
-- **"This voice line has no chat to talk in".** The chat `/voice` was last run
-  in is no longer wired to the agent and `VOICE_MODE_MIRROR` finds no single
-  other chat; run `/voice` in a chat that is wired.
-- **No answer at all to `/voice` from a newly granted account.** That account
-  has never messaged the bot, so core has no user for it yet; send the bot any
-  message from it, then `/voice` again.
-- **No answer to `/voice` in a group.** The bot must see the message: in a
-  Telegram group send `/voice@<bot>`; on Slack use a chat where the bot reads
-  messages.
-- **Replies are not spoken.** Only messages the agent sends to the call chat
-  while the call is live are spoken: the chat `/voice` was last run in (or the
-  `VOICE_MODE_MIRROR` fallback).
+If Call is refused, check that the worker is registered with the host's
+`LIVEKIT_AGENT_NAME`, both builds report protocol 6, and the line's minting
+user still has a core owner/admin role for that agent. Reload a stale page.
+The worker health endpoint is loopback-only; inspect it privately.
 
-To uninstall, see [REMOVE.md](REMOVE.md).
+If a link opens but audio cannot connect, check HTTPS microphone permission,
+LiveKit signaling and media/TURN reachability. If transcription or speech
+fails, check the configured Gemini model's access and quota; preserve the
+pipeline's reported error and turn ID, keeping call links and keys private.
+For missing typing audio, check `ffmpeg` on the worker host. For acoustic wake,
+check the classifier and bundled frontend/embedding paths and the configured
+phrase/threshold; fallback transcription is a separate behavior.

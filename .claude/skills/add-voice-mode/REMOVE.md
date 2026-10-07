@@ -1,160 +1,83 @@
-# Remove Voice mode
+# Remove voice mode
 
-Reverses `/add-voice-mode`, with one exception: the emptied `voice_mode_lines`
-table and its migration record stay on purpose, so a reinstall is safe. Do not
-drop the table alone; its recorded migration would then never recreate it.
-Every step can be re-run, and works on a partial install: a step whose target
-is already gone does nothing.
-
-## 1. Stop the worker
-
-If you started the worker in a terminal, stop it there with Ctrl-C. Stop and
-remove the worker's service, if one was installed:
+Close this page's admission front, finish active calls and stop the host before removal. Privately back up the central DB and `.env`; never print credentials. Stop a terminal worker with Ctrl-C. Remove the persistent worker using the installer while its script exists:
 
 ```bash
-# Linux
-if [ -f ~/.config/systemd/user/nanoclaw-voice-mode-worker.service ]; then
-  systemctl --user disable --now nanoclaw-voice-mode-worker.service
-  rm -f ~/.config/systemd/user/nanoclaw-voice-mode-worker.service && systemctl --user daemon-reload
-fi
-# macOS
-if [ -f ~/Library/LaunchAgents/com.nanoclaw-voice-mode-worker.plist ]; then
-  launchctl unload ~/Library/LaunchAgents/com.nanoclaw-voice-mode-worker.plist
-  rm -f ~/Library/LaunchAgents/com.nanoclaw-voice-mode-worker.plist
-fi
+pnpm exec tsx scripts/voice-mode-install.ts service-remove
 ```
 
-Remove the page's front too. With Tailscale Serve, remove only the `/voice`
-mount, keeping any others, and confirm it is gone:
+Remove only this checkout's HTTPS `/voice` route and any dedicated worker callback front. Preserve shared LiveKit services and other routes. On a partial install without the script, there is no generated service to remove; inspect any operator-created old unit separately.
+
+## Retire links and guidance
+
+With the installed payload still present, retire the module's hashed links and remove its guidance from explicit group lists using core DB/config helpers:
 
 ```bash
-tailscale serve --https=443 --set-path=/voice off
-tailscale serve status
+pnpm exec tsx scripts/voice-mode-install.ts retire
 ```
 
-With a reverse proxy, remove the `/voice` route. With a self-hosted LiveKit,
-remove only the routes and services you created for it (`/rtc`, the TURN name,
-the `livekit-server` service).
+This deletes rows only in `voice_mode_lines` and preserves the empty table and named migration record for reinstall. It removes only `voice-mode-formatting` from explicit lists, preserving other entries; implicit lists need no mutation. It does not delete core identities, roles, memberships, chats or sessions. A partial installation without the table is accepted. Remove `VOICE_MODE_LINK_TOKEN` from `.env` privately to retire configured personal links as well.
 
-## 2. Retire the lines
+## Restore core and delete the payload
 
-With the host still running, invalidate every call link (the table holds only
-token hashes, the caller and the bound chat). The empty table stays, so a later
-reinstall starts with no working links. On an install whose host never started
-with the channel there is no table, and the command reports `no such table`:
-nothing to retire.
+The installer reverses every core import/call/export and the worker package script before its own file is deleted. It tolerates reapplication and refuses changed anchors rather than editing unfamiliar core code.
 
 ```bash
-pnpm exec tsx scripts/q.ts data/v2.db "DELETE FROM voice_mode_lines"
+pnpm exec tsx scripts/voice-mode-install.ts remove
+rm -f src/channels/voice-mode-adapter.test.ts \
+  src/channels/voice-mode-call-session.test.ts \
+  src/channels/voice-mode-command.test.ts \
+  src/channels/voice-mode-command.ts \
+  src/channels/voice-mode-gemini-live.test.ts \
+  src/channels/voice-mode-gemini-live.ts \
+  src/channels/voice-mode-group-persona.ts \
+  src/channels/voice-mode-integration.ts \
+  src/channels/voice-mode-line-roles.test.ts \
+  src/channels/voice-mode-line.ts \
+  src/channels/voice-mode-livekit.test.ts \
+  src/channels/voice-mode-livekit.ts \
+  src/channels/voice-mode-page.test.ts \
+  src/channels/voice-mode-page.ts \
+  src/channels/voice-mode-third-party-notices.txt \
+  src/channels/voice-mode-platform-id.ts \
+  src/channels/voice-mode-protocol.ts \
+  src/channels/voice-mode-registration.test.ts \
+  src/channels/voice-mode-review-page.test.ts \
+  src/channels/voice-mode-route.test.ts \
+  src/channels/voice-mode-route.ts \
+  src/channels/voice-mode-wakeword.test.ts \
+  src/channels/voice-mode-wakeword.ts \
+  src/channels/voice-mode-worker.test.ts \
+  src/channels/voice-mode-worker.ts \
+  src/channels/voice-mode.ts \
+  src/channels/voice-mode-wakeword-fixtures/negative.wav \
+  src/channels/voice-mode-wakeword-fixtures/positive.wav \
+  src/db/voice-mode-lines.ts \
+  scripts/voice-mode-install.ts \
+  scripts/voice-mode-install.test.ts \
+  assets/voice-mode-wakeword/LICENSE \
+  assets/voice-mode-wakeword/NOTICE \
+  assets/voice-mode-wakeword/embedding_model.onnx \
+  assets/voice-mode-wakeword/hey_livekit.onnx \
+  assets/voice-mode-wakeword/melspectrogram.onnx \
+  container/skills/voice-mode-formatting/instructions.md
 ```
 
-Roles granted for `/voice` are core's and stay; revoke any you no longer want
-with `ncl roles revoke`.
+Remove compiled counterparts under `dist/channels/voice-mode*` and `dist/db/voice-mode-lines.*`; preserve every unrelated artifact. Retain operator-owned recordings, vocabulary and custom classifiers unless the operator is retiring that data. The skill definition and browser maintainer sources may stay installed for reinstallation.
 
-## 3. Remove the registration
+## Dependencies and configuration
 
-Delete the line `import './voice-mode.js';` from `src/channels/index.ts`:
+Inspect remaining imports with `rg` and consumers with `pnpm why <package>` for each package below. Remove a direct dependency only when no other integration uses it. In a voice-only fresh installation all seven can be removed:
 
 ```bash
-sed -i.bak "/^import '\.\/voice-mode\.js';$/d" src/channels/index.ts && rm -f src/channels/index.ts.bak
+pnpm remove @livekit/agents @livekit/agents-plugin-google @livekit/agents-plugin-silero @livekit/rtc-node livekit-server-sdk onnxruntime-node zod
 ```
 
-## 4. Remove the copied files
-
-```bash
-rm -f src/channels/voice-mode.ts src/channels/voice-mode-page.ts src/channels/voice-mode-command.ts \
-  src/channels/voice-mode-line.ts src/channels/voice-mode-livekit.ts src/channels/voice-mode-protocol.ts \
-  src/channels/voice-mode-route.ts src/voice-mode-worker.ts src/db/voice-mode-lines.ts \
-  src/channels/voice-mode-registration.test.ts src/channels/voice-mode-adapter.test.ts \
-  src/channels/voice-mode-page.test.ts src/channels/voice-mode-command.test.ts \
-  src/channels/voice-mode-line.test.ts src/channels/voice-mode-livekit.test.ts \
-  src/channels/voice-mode-route.test.ts src/voice-mode-worker.test.ts
-rm -rf container/skills/voice-mode-formatting
-```
-
-## 5. Make the router's delivery private again
-
-Applying the skill exported `deliverToAgent` from `src/router.ts`. Make it
-private again unless other code now imports it (then the command lists those
-files and changes nothing):
-
-```bash
-if grep -rlqE --include='*.ts' --exclude=router.ts "import .*\bdeliverToAgent\b" src; then
-  grep -rlE --include='*.ts' --exclude=router.ts "import .*\bdeliverToAgent\b" src
-else
-  sed -i.bak 's/^export async function deliverToAgent(/async function deliverToAgent(/' src/router.ts && rm -f src/router.ts.bak
-fi
-```
-
-## 6. Remove the packages
-
-Remove each LiveKit package unless remaining code still imports it (another
-voice integration, say):
-
-```bash
-for pkg in @livekit/agents @livekit/agents-plugin-google @livekit/agents-plugin-silero @livekit/rtc-node livekit-server-sdk; do
-  grep -q "\"$pkg\"" package.json || continue
-  if grep -rqIE --exclude-dir=node_modules "from ['\"]$pkg['\"/]" src setup scripts container 2>/dev/null; then
-    echo "keeping $pkg: still imported"
-  else
-    pnpm remove "$pkg"
-  fi
-done
-```
-
-`zod` may be shared. Remove it only when no code imports it and no other
-package depends on it (`pnpm why zod` lists nothing but the project itself):
-
-```bash
-grep -rlE --include='*.ts' "from ['\"]zod" src setup scripts container/agent-runner/src 2>/dev/null
-pnpm why zod
-```
-
-If both show nothing else uses it: `pnpm remove zod`.
-
-## 7. Remove the environment keys
-
-Keep a private copy of `.env` first; delete it once nothing turned out to need
-a removed key:
-
-```bash
-(umask 077 && cp .env .env.before-voice-mode-remove)
-```
-
-The `VOICE_MODE_*` keys are this skill's alone:
-
-```bash
-sed -i.bak '/^VOICE_MODE_[A-Z_]*=/d' .env && rm -f .env.bak
-```
-
-The LiveKit and Gemini keys may serve another integration, so each goes only
-when nothing left in the checkout mentions it (code, scripts, compose or
-Docker files). Keep by hand any you set for something outside this checkout:
-
-```bash
-for key in LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET LIVEKIT_WORKER_URL LIVEKIT_AGENT_NAME LIVEKIT_HOST_URL GEMINI_API_KEY; do
-  if grep -rqI --exclude-dir={node_modules,.git,dist,data,logs,groups} --exclude='.env*' --exclude='*.md' "$key" . 2>/dev/null; then
-    echo "keeping $key: still mentioned by remaining files"
-  else
-    sed -i.bak "/^$key=/d" .env && rm -f .env.bak && echo "removed $key"
-  fi
-done
-```
-
-## 8. Rebuild and restart
+Privately delete this skill's `VOICE_MODE_*` entries from `.env`. Remove `LIVEKIT_*` and `GEMINI_API_KEY` only if no remaining integration uses them; otherwise preserve them. Preserve all other configuration. No release-age exclusions or approved build-script entries were added by the skill.
 
 ```bash
 pnpm run build
 bash setup/lib/restart.sh
 ```
 
-The build leaves the compiled files of the removed sources in `dist/`; delete
-them:
-
-```bash
-rm -f dist/channels/voice-mode*.* dist/voice-mode-worker*.* dist/db/voice-mode-lines.*
-```
-
-Applying the skill adds no git remote; if you added one only to fetch its files,
-remove it with `git remote remove <name>`. A LiveKit Cloud project or a
-self-hosted LiveKit server is yours to delete.
+Confirm unrelated channels still work and calls cannot start. Reinstallation creates new links and safely reuses the retained empty module table. The removal commands require the copied installer until the core edits are reversed; after files are absent, skip those already-completed steps.
