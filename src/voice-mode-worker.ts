@@ -185,7 +185,7 @@ const DAY_MS = 86_400_000;
 
 const samplesOf = (ms: number): number => Math.round((ms * INPUT_SAMPLE_RATE) / 1000);
 const msOf = (samples: number): number => (samples * 1000) / INPUT_SAMPLE_RATE;
-/** The worker's HTTP client for the host's /webhook/voice/livekit/agent routes. */
+/** The worker's HTTP client for the host's /webhook/voice-mode/livekit/agent routes. */
 export class HostLink {
   constructor(
     private readonly link: { hostUrl: string; secret: string; callId: string },

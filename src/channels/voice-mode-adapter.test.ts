@@ -8,9 +8,12 @@ import { describe, expect, it } from 'vitest';
 import { admitsVoiceModePeer, parseCidrs, voiceRoute, type VoiceModeProxyPolicy } from './voice-mode.js';
 
 describe('voice routes and the reverse-proxy gate', () => {
-  it('maps both prefixes to routes, the short one only for browser routes', () => {
+  it('maps the prefixes to routes, the worker routes only under /webhook/voice-mode', () => {
     expect(voiceRoute('/webhook/voice/livekit')).toBe('livekit');
-    expect(voiceRoute('/webhook/voice/livekit/agent/events')).toBe('livekit/agent/events');
+    expect(voiceRoute('/webhook/voice-mode/livekit')).toBe('livekit');
+    expect(voiceRoute('/webhook/voice-mode/livekit/agent/events')).toBe('livekit/agent/events');
+    expect(voiceRoute('/webhook/voice/livekit/agent/events')).toBeNull();
+    expect(voiceRoute('/webhook/voice/livekit/agent')).toBeNull();
     expect(voiceRoute('/voice')).toBe('livekit');
     expect(voiceRoute('/voice/')).toBe('livekit');
     expect(voiceRoute('/voice/info')).toBe('info');

@@ -176,8 +176,9 @@ separate listener off when the front already forwards `/voice` to the webhook
 port. A container proxy that cannot reach loopback needs the listener bound
 to an address it can reach, plus the trusted-proxy settings below. Worker
 routes live only on the host port under `/webhook/voice-mode/livekit/agent/`;
-never proxy them. The old `/webhook/voice/livekit` browser links remain valid
-on the host port.
+never proxy them: a worker request with `X-Forwarded-For` or `Forwarded` is
+refused. The old `/webhook/voice/livekit` browser links remain valid on the
+host port; worker routes are not served under that prefix.
 
 For Tailscale Serve, mount only the page prefix and repeat it in the target
 because Serve strips the mount prefix:
@@ -206,7 +207,8 @@ A listed loopback proxy is held to the caller allowlist too. Without a
 caller allowlist, a trusted proxy may forward any client. Loopback peers
 remain admitted unless explicitly trusted with caller restrictions.
 `VOICE_MODE_ALLOW_NON_LOOPBACK=1` disables the peer gate for local development.
-Worker routes otherwise always require loopback and a per-call secret.
+Worker routes always require the `/webhook/voice-mode/` prefix, a per-call
+secret and no forwarding header, and otherwise loopback.
 
 ## Start the host and worker, then create a line
 

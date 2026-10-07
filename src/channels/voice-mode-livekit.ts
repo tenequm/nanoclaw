@@ -13,7 +13,7 @@
  * deleting the room, which disconnects caller and worker alike.
  *
  * The worker reaches the host over HTTP on the webhook server
- * (`/webhook/voice/livekit/agent/*`), at an address from its own settings,
+ * (`/webhook/voice-mode/livekit/agent/*`), at an address from its own settings,
  * authenticated by a per-call secret both sides derive from the LiveKit API
  * secret (never in the dispatch metadata, never in the caller's token):
  *  - `GET  agent/events`     an NDJSON stream of agent replies to speak, the
@@ -301,7 +301,7 @@ interface TurnOutcome {
 }
 
 export interface LiveKitVoice {
-  /** Routes under /webhook/voice/livekit. */
+  /** The `livekit` routes: the page and its token and end routes, and the worker's `livekit/agent/*`. */
   handleHttp(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -1139,7 +1139,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
   };
 
-  /** /webhook/voice/livekit/agent/*: the worker's side, authenticated by the per-call secret. */
+  /** /webhook/voice-mode/livekit/agent/*: the worker's side, authenticated by the per-call secret. */
   const handleAgent = async (
     req: http.IncomingMessage,
     res: http.ServerResponse,

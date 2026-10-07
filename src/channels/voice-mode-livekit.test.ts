@@ -319,7 +319,7 @@ async function attachWorker(h: Harness, meta: LiveKitJobMetadata): Promise<FakeW
   const waiters: Array<{ pred: (e: LiveKitHostEvent) => boolean; resolve: (e: LiveKitHostEvent) => void }> = [];
   const controller = new AbortController();
   const auth = workerAuth(meta.callId);
-  const res = await fetch(`${h.hostUrl}/webhook/voice/livekit/agent/events?call=${meta.callId}`, {
+  const res = await fetch(`${h.hostUrl}/webhook/voice-mode/livekit/agent/events?call=${meta.callId}`, {
     headers: auth,
     signal: controller.signal,
   });
@@ -346,7 +346,7 @@ async function attachWorker(h: Harness, meta: LiveKitJobMetadata): Promise<FakeW
     }
   })();
   const workerPost = (path: string, body: Record<string, unknown> = {}) =>
-    post(`${h.hostUrl}/webhook/voice/livekit/agent/${path}`, { callId: meta.callId, ...body }, auth);
+    post(`${h.hostUrl}/webhook/voice-mode/livekit/agent/${path}`, { callId: meta.callId, ...body }, auth);
   return {
     meta,
     events,
@@ -859,7 +859,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('authenticates the worker routes with the per-call secret derived from the API secret', async () => {
     await post(`${h.base}/livekit/token?v=6&t=tok123`);
     const meta = h.lk.dispatches[0].metadata;
-    const url = `${h.hostUrl}/webhook/voice/livekit/agent`;
+    const url = `${h.hostUrl}/webhook/voice-mode/livekit/agent`;
     const secret = liveKitCallSecret(API_SECRET, meta.callId);
     expect((await post(`${url}/joined`, { callId: meta.callId })).status).toBe(409);
     expect((await post(`${url}/joined`, { callId: meta.callId }, { Authorization: `Bearer ${secret}x` })).status).toBe(
@@ -871,6 +871,22 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     );
     expect((await fetch(`${url}/events?call=${meta.callId}`)).status).toBe(404);
     expect((await post(`${url}/joined`, { callId: meta.callId }, workerAuth(meta.callId))).status).toBe(200);
+  });
+
+  it('serves the worker routes only under the voice-mode prefix and never to a forwarded request', async () => {
+    await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    const meta = h.lk.dispatches[0].metadata;
+    const auth = workerAuth(meta.callId);
+    expect((await post(`${h.hostUrl}/webhook/voice/livekit/agent/joined`, { callId: meta.callId }, auth)).status).toBe(
+      404,
+    );
+    expect((await fetch(`${h.hostUrl}/webhook/voice/livekit/agent/events?call=${meta.callId}`)).status).toBe(404);
+    const url = `${h.hostUrl}/webhook/voice-mode/livekit/agent/joined`;
+    const forwards: Record<string, string>[] = [{ 'X-Forwarded-For': '203.0.113.9' }, { Forwarded: 'for=203.0.113.9' }];
+    for (const forwarded of forwards) {
+      expect((await post(url, { callId: meta.callId }, { ...auth, ...forwarded })).status).toBe(403);
+    }
+    expect((await post(url, { callId: meta.callId }, auth)).status).toBe(200);
   });
 
   it('hands each transcribed turn to the agent as a spoken message and speaks every reply in full', async () => {
@@ -1062,7 +1078,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('refuses an utterance before the caller is in and after access is gone', async () => {
     expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
     const meta = h.lk.dispatches[0].metadata;
-    const url = `${h.hostUrl}/webhook/voice/livekit/agent/utterance`;
+    const url = `${h.hostUrl}/webhook/voice-mode/livekit/agent/utterance`;
     expect((await post(url, { callId: meta.callId, text: 'hi' }, workerAuth(meta.callId))).status).toBe(409);
     expect((await post(url, { callId: meta.callId, text: 'hi' })).status).toBe(409);
     expect(h.inbound).toEqual([]);
@@ -1353,7 +1369,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
     const meta = h.lk.dispatches[0].metadata;
     const joined = await post(
-      `${h.hostUrl}/webhook/voice/livekit/agent/joined`,
+      `${h.hostUrl}/webhook/voice-mode/livekit/agent/joined`,
       { callId: meta.callId },
       workerAuth(meta.callId),
     );

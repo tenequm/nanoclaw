@@ -146,21 +146,30 @@ export function admitsVoiceModePeer(
 
 /** Browser routes under the short /voice prefix a reverse proxy forwards; the bare prefix is the call page. */
 const CLEAN_PREFIX_ROUTES = new Set(['info', 'livekit', 'livekit/token', 'livekit/end']);
-const LEGACY_PREFIX = /^\/webhook\/voice(?:-mode)?(?:\/|$)/;
+const WEBHOOK_PREFIX = /^\/webhook\/(voice(?:-mode)?)(?:\/|$)/;
 const CLEAN_PREFIX = /^\/voice(?:\/|$)/;
 
 /**
- * The voice route of a request path: anything under /webhook/voice (old links, the worker), or a
- * browser route under /voice. Null for a /voice path that is not one, the worker's routes included.
+ * The voice route of a request path: anything under /webhook/voice-mode, a browser route under
+ * /webhook/voice (old links), or a browser route under /voice. Null for any other path, the
+ * worker's routes outside /webhook/voice-mode included.
  */
 export function voiceRoute(pathname: string): string | null {
-  if (LEGACY_PREFIX.test(pathname)) return pathname.replace(LEGACY_PREFIX, '').replace(/\/+$/, '');
+  const webhook = WEBHOOK_PREFIX.exec(pathname);
+  if (webhook) {
+    const route = pathname.slice(webhook[0].length).replace(/\/+$/, '');
+    // A front that forwards old /webhook/voice links may forward remote requests; the worker never uses it.
+    return webhook[1] === 'voice-mode' || !isWorkerRoute(route) ? route : null;
+  }
   if (!CLEAN_PREFIX.test(pathname)) return null;
   const route = pathname.replace(CLEAN_PREFIX, '').replace(/\/+$/, '') || 'livekit';
   return CLEAN_PREFIX_ROUTES.has(route) ? route : null;
 }
 
-/** The worker's routes keep their own per-call secret and stay loopback-only, never admitted through a proxy. */
+/**
+ * The worker's routes, only under /webhook/voice-mode: they keep their own per-call secret and stay
+ * loopback-only, never admitted through a proxy.
+ */
 const isWorkerRoute = (route: string): boolean => /^livekit\/agent(?:\/|$)/.test(route);
 
 /**
@@ -414,7 +423,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     res.end(body);
   };
 
-  /** HTTP routes under /webhook/voice/… and the browser's under /voice/… on the shared webhook server. */
+  /** HTTP routes under /webhook/voice-mode/… and /webhook/voice/…, and the browser's under /voice/…, on the shared webhook server. */
   const handleHttp = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     let url: URL;
     try {
@@ -424,6 +433,10 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     }
     const parsed = voiceRoute(url.pathname);
     const token = url.searchParams.get('t') ?? '';
+    // The worker calls from the same host; a forwarded request came through a front from elsewhere.
+    if (parsed !== null && isWorkerRoute(parsed) && (req.headers['x-forwarded-for'] || req.headers.forwarded)) {
+      return reply(res, 403, 'Voice worker routes are not served through a proxy');
+    }
     // Before any token check: a link must not be usable, or probed, from the LAN over plain HTTP.
     const peer = req.socket.remoteAddress;
     if (!config.allowNonLoopback) {
