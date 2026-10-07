@@ -2264,8 +2264,9 @@ export class CallTurns {
       this.woke();
       if (!this.speaking) this.armPause();
     }
-    // After the wake resolves: the interim that holds the wake phrase can be the turn's only one.
-    this.deps.shadow?.interim(turn.segment, this.spoken(turn, shown));
+    // After the wake resolves: the interim that holds the wake phrase can be the turn's only one. A
+    // repeat is no new text for the shadow, and cannot newly resolve the wake.
+    if (changed) this.deps.shadow?.interim(turn.segment, this.spoken(turn, shown));
     if (match) turn.seen = match;
     if (!match) turn.candidate = undefined;
     else if (turn.candidate?.command === match.command) turn.candidate.count++;
