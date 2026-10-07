@@ -28,7 +28,7 @@ import {
   type TurnMark,
   type VoiceModeCall,
 } from "./voice-call"
-import { COMMANDS_VERSIONS, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, captionCommand, reopensMic, infoWakePhrase, isLoneCommand, isReviewSnapshot, lineWords, norm, parseCommandWords, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSION, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, captionCommand, reopensMic, infoWakePhrase, isLoneCommand, isReviewSnapshot, lineWords, norm, parseCommandWords, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -71,7 +71,7 @@ const REVIEW_RPC: Record<ReviewOp | "settings", string> = {
   discard: "nanoclaw.voice-mode.discard",
   settings: "nanoclaw.voice-mode.settings",
 }
-/** One of COMMANDS_VERSIONS when the worker understands spoken commands (send, discard, the wake phrase) and the settings RPC. */
+/** COMMANDS_VERSION when the worker understands spoken commands (send, discard, the wake phrase) and the settings RPC. */
 const COMMANDS_ATTR = "nanoclaw.voice-mode.commands"
 /** The worker's spoken commands as JSON (CallCommandWords): the words the hints quote. */
 const COMMAND_WORDS_ATTR = "nanoclaw.voice-mode.command-words"
@@ -428,7 +428,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const agentId = useRef<string | null>(null)
   agentId.current = agent?.identity ?? null
   const reviewAvailable = agentAttributes?.[REVIEW_ATTR] === "1"
-  const commandsAvailable = COMMANDS_VERSIONS.has(agentAttributes?.[COMMANDS_ATTR] ?? "")
+  const commandsAvailable = agentAttributes?.[COMMANDS_ATTR] === COMMANDS_VERSION
   const announcedWords = agentAttributes?.[COMMAND_WORDS_ATTR]
   /** This call already gave the worker the page's settings. */
   const settingsSent = useRef(false)

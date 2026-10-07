@@ -199,7 +199,7 @@ describe('GeminiLiveTranscriber', () => {
 
   it('passes a trailing command said as its own sentence on to the interim text', async () => {
     const commands = [...CALL_COMMAND_WORDS.send, ...CALL_COMMAND_WORDS.discard].map((w) => w.say);
-    const h = harness(['Dan', 'Stan', ...commands]);
+    const h = harness(['Ava', 'Max', ...commands]);
     h.t.begin(pcm(100));
     await h.tick(0);
     h.sockets[0].ready();

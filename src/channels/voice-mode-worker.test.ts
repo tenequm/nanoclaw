@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   CALL_COMMAND_WORDS,
+  callCommandWords,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   liveKitHostUrl,
@@ -33,8 +34,7 @@ import {
   CallTurns,
   capSpokenText,
   COMMAND_SETTLE_MS,
-  COMMAND_VOCABULARY,
-  COMMAND_WORDS_JSON,
+  commandVocabulary,
   captionMark,
   type CaptionMark,
   CUT_LINES,
@@ -623,7 +623,6 @@ const META: LiveKitJobMetadata = {
   callerIdentity: 'caller-1',
   vocabulary: ['NanoClaw'],
   sttModel: 'gemini-3.5-transcribe-live',
-  sttFallbackModel: 'gemini-3.5-transcribe',
   ttsModel: 'gemini-3.8-flash-tts',
   ttsFallbackModel: 'gemini-3.8-flash-lite-tts',
   ttsVoice: 'Alnilam',
@@ -1958,19 +1957,42 @@ describe('speech output', () => {
   });
 });
 
+/** The commands of a call that speaks Ukrainian as well as English. */
+const UK = callCommandWords(['uk-UA', 'en-US']);
+
 describe('spoken command matching', () => {
-  it('announces the one list it matches and gives the transcription', () => {
-    expect(JSON.parse(COMMAND_WORDS_JSON)).toEqual(CALL_COMMAND_WORDS);
-    expect(COMMAND_VOCABULARY).toEqual([...CALL_COMMAND_WORDS.send, ...CALL_COMMAND_WORDS.discard].map((w) => w.say));
-    for (const command of ['send', 'discard'] as const) {
-      for (const { say, ownSentence } of CALL_COMMAND_WORDS[command]) {
-        const spoken = `${say[0].toUpperCase()}${say.slice(1)}.`;
-        expect(matchCommand(spoken), say).toEqual({ command, rest: '', ...(ownSentence ? { ownSentence } : {}) });
-        expect(matchCommand(`Book a table. ${spoken}`), say).toMatchObject({ command, rest: 'Book a table.' });
-        // Inside a sentence only the ownSentence words are words.
-        expect(matchCommand(`Book a table ${say}`) === null, say).toBe(!!ownSentence);
+  it('matches the list a call announces and gives the transcription', () => {
+    expect(commandVocabulary(CALL_COMMAND_WORDS)).toEqual([
+      'zulu',
+      'copy',
+      'copy that',
+      'scratch that',
+      'discard turn',
+      'discard this turn',
+    ]);
+    for (const words of [CALL_COMMAND_WORDS, UK]) {
+      expect(commandVocabulary(words)).toEqual([...words.send, ...words.discard].map((w) => w.say));
+      for (const command of ['send', 'discard'] as const) {
+        for (const { say, ownSentence } of words[command]) {
+          const spoken = `${say[0].toUpperCase()}${say.slice(1)}.`;
+          const match = (text: string) => matchCommand(text, false, words);
+          expect(match(spoken), say).toEqual({ command, rest: '', ...(ownSentence ? { ownSentence } : {}) });
+          expect(match(`Book a table. ${spoken}`), say).toMatchObject({ command, rest: 'Book a table.' });
+          // Inside a sentence only the ownSentence words are words.
+          expect(match(`Book a table ${say}`) === null, say).toBe(!!ownSentence);
+        }
       }
     }
+  });
+
+  it('takes the Ukrainian send word only on a call that speaks Ukrainian', () => {
+    expect(CALL_COMMAND_WORDS.send.map((w) => w.say)).not.toContain('прийом');
+    expect(callCommandWords(['en-US'])).toBe(CALL_COMMAND_WORDS);
+    expect(callCommandWords(['de-DE', 'en-GB'])).toBe(CALL_COMMAND_WORDS);
+    expect(UK.send.map((w) => w.say)).toEqual(['zulu', 'copy', 'copy that', 'прийом']);
+    expect(callCommandWords(['en-US', 'uk'])).toEqual(UK);
+    expect(matchCommand('Book a table. Прийом.')).toBeNull();
+    expect(matchCommand('Book a table. Прийом.', false, UK)).toEqual({ command: 'send', rest: 'Book a table.' });
   });
 
   it("marks a caption's command with the words before it", () => {
@@ -1979,7 +2001,7 @@ describe('spoken command matching', () => {
       words: 'Book a table for two.',
     });
     expect(captionMark('book a table, zulu', 'send')).toEqual({ command: 'send', words: 'book a table' });
-    expect(captionMark('Скільки буде? Прийом.', 'send')).toEqual({ command: 'send', words: 'Скільки буде?' });
+    expect(captionMark('Скільки буде? Прийом.', 'send', UK)).toEqual({ command: 'send', words: 'Скільки буде?' });
     expect(captionMark('Zulu.', 'send')).toEqual({ command: 'send', words: '' });
     expect(captionMark('Book it. Scratch that.', 'discard')).toEqual({ command: 'discard', words: 'Book it.' });
     // A final that left the command out: all of it is words.
@@ -1989,7 +2011,7 @@ describe('spoken command matching', () => {
       ['Скільки буде? Прийом.', 'send'],
       ['Book it, copy that.', 'send'],
     ] as const) {
-      const { words } = captionMark(text, command);
+      const { words } = captionMark(text, command, UK);
       expect(text.startsWith(words), text).toBe(true);
     }
   });
@@ -2013,7 +2035,7 @@ describe('spoken command matching', () => {
 
   it('takes copy and copy that only as their own sentence in a final, and the Ukrainian прийом anywhere', () => {
     const rest = (text: string, interim = false) => {
-      const m = matchCommand(text, interim);
+      const m = matchCommand(text, interim, UK);
       return m?.command === 'send' ? m.rest : null;
     };
     expect(rest('Book a table. Copy.')).toBe('Book a table.');
@@ -2049,7 +2071,7 @@ describe('spoken command matching', () => {
   });
 
   it('finds the wake phrase by the agent name or its vocabulary spellings, across scripts and punctuation', () => {
-    const names = wakeNameWords(['Andy', 'Енді', 'Nano Claw', 'Al']);
+    const names = wakeNameWords(['Andy', 'Ава', 'Nano Claw', 'Al']);
     const after = (text: string) => {
       const found = matchWake(text, names);
       return found && text.slice(found.end);
@@ -2059,10 +2081,10 @@ describe('spoken command matching', () => {
     expect(matchWake('So I said hey Andy', names)).toEqual({ start: 10, end: 18 });
     expect(matchWake('Ok. Heyandy, go', wakeNameWords(['Andy']))).toEqual({ start: 4, end: 11 });
     expect(after('hey andy')).toBe('');
-    expect(after('Гей, Енді, що там?')).toBe(', що там?');
-    expect(after('Хей Енді')).toBe('');
+    expect(after('Гей, Ава, що там?')).toBe(', що там?');
+    expect(after('Хей Ава')).toBe('');
     // A spelling that sounds alike counts; one that sounds different does not.
-    expect(after('Хей Енди')).toBe('');
+    expect(after('Хей Ева')).toBe('');
     expect(after('hey Endy, go')).toBe(', go');
     expect(after('Hey, and then what?')).toBeNull();
     expect(after('Hey Andrew')).toBeNull();
@@ -2221,7 +2243,8 @@ function turnsHarness(
       unheard: () => void out.unheard++,
       log: { info: (msg: string) => void out.logs.push(msg), warn: () => undefined },
     },
-    { silenceMs: SILENCE, names: ['Andy'], limits: o.limits, record: o.record, sttModel: 'model' },
+    // A call that speaks Ukrainian as well (META.languages): its send words include `прийом`.
+    { silenceMs: SILENCE, names: ['Andy'], limits: o.limits, record: o.record, sttModel: 'model', commandWords: UK },
   );
   turns.configure(o.wake ?? false, o.pauseSends ?? false);
   if (o.wakeWord) turns.useWakeWord(o.wakeWord);
@@ -3287,8 +3310,20 @@ describe('commands, cues and review in a call', () => {
         model: 'gemini-3.5-transcribe-live',
         languageCodes: ['uk-UA', 'en-US'],
         sampleRate: 16_000,
-        vocabulary: ['NanoClaw', ...COMMAND_VOCABULARY],
+        vocabulary: ['NanoClaw', ...commandVocabulary(UK)],
       }),
+    );
+    host.endStream();
+  });
+
+  it('gives an English-only call the English commands alone', async () => {
+    const { ctx } = fakeJob({ ...META, languages: ['en-US'] });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const make = vi.fn(() => v.transcription);
+    await runCall(ctx, { ...callDeps(host.fetchImpl, v), transcriber: make });
+    expect(make).toHaveBeenCalledWith(
+      expect.objectContaining({ vocabulary: ['NanoClaw', ...commandVocabulary(CALL_COMMAND_WORDS)] }),
     );
     host.endStream();
   });

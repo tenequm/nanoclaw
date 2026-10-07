@@ -53,12 +53,12 @@ export interface CommandWords {
 }
 
 /**
- * The worker's commands as of this page (CALL_COMMAND_WORDS), for the hints until a worker announces
- * its own (`nanoclaw.voice-mode.command-words`), as every worker this page drives commands for does. Never
- * matched against captions: the worker marks the lines that hold a command.
+ * The worker's English commands as of this page (CALL_COMMAND_WORDS), for the hints until the worker
+ * announces the call's own (`nanoclaw.voice-mode.command-words`), as every worker this page drives
+ * commands for does. Never matched against captions: the worker marks the lines that hold a command.
  */
 export const FALLBACK_COMMAND_WORDS: CommandWords = {
-  send: [{ say: "zulu", hint: true }, { say: "copy", ownSentence: true, hint: true }, { say: "copy that", ownSentence: true }, { say: "прийом" }],
+  send: [{ say: "zulu", hint: true }, { say: "copy", ownSentence: true, hint: true }, { say: "copy that", ownSentence: true }],
   discard: [{ say: "scratch that", hint: true }, { say: "discard turn" }, { say: "discard this turn" }],
 }
 
@@ -570,11 +570,11 @@ export function modeCaption(
 }
 
 /**
- * The `nanoclaw.voice-mode.commands` values of a worker whose commands and settings RPC this page drives:
- * "2" and "3" both mean the `zulu` / `copy` vocabulary (CALL_COMMANDS_VERSION); the words themselves
- * come from the worker's announcement. Any other value gets no commands.
+ * The `nanoclaw.voice-mode.commands` value (CALL_COMMANDS_VERSION) of a worker whose commands and
+ * settings RPC this page drives; the words themselves come from the worker's announcement. Any other
+ * value gets no commands.
  */
-export const COMMANDS_VERSIONS: ReadonlySet<string> = new Set(["2", "3"])
+export const COMMANDS_VERSION = "3"
 
 export interface ListeningView {
   chip: string

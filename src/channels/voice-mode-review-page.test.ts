@@ -8,12 +8,13 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { COMMAND_WORDS_JSON, captionMark, matchCommand } from './voice-mode-worker.js';
+import { captionMark, matchCommand } from './voice-mode-worker.js';
 import {
   CALL_CAPTION_COMMAND_ATTRIBUTE,
   CALL_CAPTION_WORDS_ATTRIBUTE,
   CALL_COMMAND_WORDS,
   CALL_COMMANDS_VERSION,
+  callCommandWords,
 } from './voice-mode-protocol.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -66,7 +67,7 @@ interface ReviewLib {
   parseCommandWords(raw: string | undefined): CommandWords | null;
   quoteWords(list: CommandWords['send'], all?: boolean): string;
   FALLBACK_COMMAND_WORDS: CommandWords;
-  COMMANDS_VERSIONS: ReadonlySet<string>;
+  COMMANDS_VERSION: string;
   MODE_NAME: Record<string, string>;
   DEFAULT_PREFS: Prefs;
   storedPrefs(): Prefs;
@@ -380,7 +381,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
 
   it("reads the worker's command marks off a caption, never the words themselves", () => {
     const attrs = (text: string, command: 'send' | 'discard') => {
-      const mark = captionMark(text, command);
+      const mark = captionMark(text, command, callCommandWords(['uk-UA']));
       return { [CALL_CAPTION_COMMAND_ATTRIBUTE]: mark.command, [CALL_CAPTION_WORDS_ATTRIBUTE]: mark.words };
     };
     const line = (text: string, command?: 'send' | 'discard') => ({
@@ -412,7 +413,11 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     // The page's own list is the worker's as of this build.
     expect(lib.FALLBACK_COMMAND_WORDS).toEqual(table);
     expect(lib.INITIAL_REVIEW.words).toEqual(table);
-    expect(lib.parseCommandWords(COMMAND_WORDS_JSON)).toEqual(table);
+    expect(lib.parseCommandWords(JSON.stringify(CALL_COMMAND_WORDS))).toEqual(table);
+    // A call that also speaks Ukrainian announces its send word too, and the page quotes it.
+    const { v: _u, ...ukrainian } = callCommandWords(['en-US', 'uk-UA']);
+    expect(lib.parseCommandWords(JSON.stringify(callCommandWords(['en-US', 'uk-UA'])))).toEqual(ukrainian);
+    expect(lib.quoteWords(ukrainian.send, true)).toBe('"zulu", "copy", "copy that" or "прийом"');
     const announced = lib.parseCommandWords(
       JSON.stringify({
         v: 1,
@@ -436,7 +441,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(lib.quoteWords(announced!.send)).toBe('"roger", "over and out" or "ten four"');
     // No hint flagged: the first; `all`: every one.
     expect(lib.quoteWords(announced!.discard)).toBe('"never mind"');
-    expect(lib.quoteWords(table.send, true)).toBe('"zulu", "copy", "copy that" or "прийом"');
+    expect(lib.quoteWords(table.send, true)).toBe('"zulu", "copy" or "copy that"');
     expect(lib.modeCaption('auto', true, { on: true, pauseSends: false }, announced!)).toBe(
       'Say "roger", "over and out" or "ten four" to send.',
     );
@@ -614,16 +619,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
   it("the page drives the worker's commands version", () => {
     // Words the page used to match itself are the worker's alone now.
     expect(matchCommand('Send me a copy.')).toBeNull();
-    expect(lib.COMMANDS_VERSIONS.has(CALL_COMMANDS_VERSION)).toBe(true);
-  });
-  it('a page drives the zulu vocabulary at "2" and "3" alike, and nothing else', () => {
-    // "2" is the zulu worker deployed before the bump; "3" is the same words.
-    expect([...lib.COMMANDS_VERSIONS].sort()).toEqual(['2', '3']);
-    // `over` ("1") and a vocabulary this page has never heard of get no commands and no settings.
-    expect(lib.COMMANDS_VERSIONS.has('1')).toBe(false);
-    expect(lib.COMMANDS_VERSIONS.has('99')).toBe(false);
-    // A `send it` era page drives only "2": the worker's bump keeps it from quoting its own words.
-    expect(CALL_COMMANDS_VERSION).not.toBe('2');
+    expect(lib.COMMANDS_VERSION).toBe(CALL_COMMANDS_VERSION);
   });
 });
 

@@ -79,8 +79,6 @@ export interface LiveKitJobMetadata {
    */
   wakeNames?: string[];
   sttModel: string;
-  /** Deprecated and ignored (there is no unary fallback any more); kept for the wire format, empty by default. */
-  sttFallbackModel: string;
   ttsModel: string;
   /** Takes over while `ttsModel` fails; empty for none. */
   ttsFallbackModel: string;
@@ -106,8 +104,8 @@ export const CALL_TURN_TOPIC = 'nanoclaw.voice-mode.turn';
 
 /**
  * The room metadata the host sets when a mid-call `/voice` moves the call to another chat, so the
- * page's header follows it (the new call chat's label, or null once the call talks on the voice
- * line), and again right before it deletes the room, with why the call ended.
+ * page's header follows it (the new call chat's label, or null once the call has none), and again
+ * right before it deletes the room, with why the call ended.
  */
 export interface CallRoomMetadata {
   chat: string | null;
@@ -208,21 +206,12 @@ export interface CallDraft {
  * worker's acoustic wake word (`CallWakeState.phrase`), is heard (`waiting` until then). After the
  * wake phrase only a spoken send sends, unless `pauseSends` lets the closing silence send too. The
  * worker's participant attribute is CALL_COMMANDS_VERSION when it understands them and the
- * `settings` RPC; a page offers the commands only for the values it knows. The worker starts
- * wake-gated until a client's `settings` say otherwise, so a page that does not know its value sends
- * none and leaves it waiting for words the page never names: reload the page with the worker. An
- * older worker sets none, and its auto mode has no commands.
+ * `settings` RPC; a page offers the commands only for that value. The worker starts wake-gated until
+ * a client's `settings` say otherwise, so a page of another version sends none and leaves it waiting
+ * for words the page never names: reload the page with the worker.
  */
 export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice-mode.commands';
-/**
- * The commands' vocabulary: "1" had `over` as the send word; "2" is `zulu`, `copy` and `copy that`
- * with the words announced in CALL_COMMAND_WORDS_ATTRIBUTE (the `send it` era also said "2"); "3" is
- * the same words, bumped so a page from the `send it` era, which drives any "2" and quotes its own
- * words, stops quoting the wrong ones. A page that accepts only "2" (the `send it` era's, or a
- * `zulu` one already open across the bump) offers no commands and sends no `settings` to a "3"
- * worker, which then stays wake-gated until that page is reloaded. A current page drives "2" and "3"
- * alike; a page takes the words themselves from CALL_COMMAND_WORDS_ATTRIBUTE.
- */
+/** The commands' contract; the words themselves are announced on CALL_COMMAND_WORDS_ATTRIBUTE. */
 export const CALL_COMMANDS_VERSION = '3';
 
 export type CallCommand = 'send' | 'discard';
@@ -242,9 +231,9 @@ export interface CallCommandWords {
   discard: CallCommandWord[];
 }
 /**
- * The spoken commands, the one source: the worker matches transcripts against them, gives them to
- * the transcription as vocabulary, and announces them, so a page and an app quote the words it
- * hears instead of their own copy.
+ * The spoken commands of a call that speaks only English, the one source: the worker matches
+ * transcripts against a call's words (callCommandWords), gives them to the transcription as
+ * vocabulary, and announces them, so a page and an app quote the words it hears instead of their own copy.
  */
 export const CALL_COMMAND_WORDS: CallCommandWords = {
   v: 1,
@@ -252,10 +241,17 @@ export const CALL_COMMAND_WORDS: CallCommandWords = {
     { say: 'zulu', hint: true },
     { say: 'copy', ownSentence: true, hint: true },
     { say: 'copy that', ownSentence: true },
-    { say: 'прийом' },
   ],
   discard: [{ say: 'scratch that', hint: true }, { say: 'discard turn' }, { say: 'discard this turn' }],
 };
+/** Send words a call takes besides the English ones when VOICE_MODE_LANGUAGES lists their language. */
+const LANGUAGE_SEND_WORDS: Readonly<Record<string, readonly CallCommandWord[]>> = { uk: [{ say: 'прийом' }] };
+
+/** A call's spoken commands: CALL_COMMAND_WORDS plus the send words of its configured languages. */
+export function callCommandWords(languages: readonly string[]): CallCommandWords {
+  const extra = [...new Set(languages.map(baseLanguage))].flatMap((code) => LANGUAGE_SEND_WORDS[code] ?? []);
+  return extra.length ? { ...CALL_COMMAND_WORDS, send: [...CALL_COMMAND_WORDS.send, ...extra] } : CALL_COMMAND_WORDS;
+}
 /**
  * The worker's participant attribute with CALL_COMMAND_WORDS as compact JSON, set with
  * CALL_COMMANDS_ATTRIBUTE. Additive: a page without it uses its own list, and an old page ignores it.
@@ -472,11 +468,4 @@ export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: 
     );
   }
   return raw;
-}
-
-export function voiceModeEnvKeys(keys: readonly string[]): string[] {
-  return [...new Set(keys)];
-}
-export function voiceModeEnv(env: Record<string, string>, _warn: (message: string) => void): Record<string, string> {
-  return { ...env };
 }

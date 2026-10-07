@@ -67,8 +67,6 @@ import {
 import {
   baseLanguage,
   DEFAULT_VOICE_LANGUAGES,
-  voiceModeEnv,
-  voiceModeEnvKeys,
   wakePhrase,
   DEFAULT_LIVEKIT_AGENT_NAME,
   HOST_SILENCE_MS,
@@ -78,6 +76,8 @@ import {
   CALL_CAPTION_COMMAND_ATTRIBUTE,
   CALL_CAPTION_WORDS_ATTRIBUTE,
   CALL_COMMAND_WORDS,
+  callCommandWords,
+  type CallCommandWords,
   CALL_COMMAND_WORDS_ATTRIBUTE,
   CALL_PROTOCOL_ATTRIBUTE,
   CALL_COMMANDS_ATTRIBUTE,
@@ -1219,7 +1219,7 @@ export class TurnTaking {
     });
   }
 
-  /** The host's `chat` event: the call now talks in a chat, or on the voice line. */
+  /** The host's `chat` event: the call now talks in a chat, or has none. */
   onChat(inChat: boolean): void {
     this.inChat = inChat;
   }
@@ -1642,7 +1642,7 @@ async function publishCueTrack(room: Room, log: WorkerLog): Promise<{ feed: CueF
   };
 }
 
-/** Cyrillic letters as Latin sounds, so a name matches in either script (`Енді` and `Andy`). */
+/** Cyrillic letters as Latin sounds, so a name matches in either script (`Ава` and `Ava`). */
 const CYRILLIC_LATIN: Record<string, string> = {
   а: 'a',
   б: 'b',
@@ -1701,7 +1701,7 @@ function spokenWords(text: string): Array<{ word: string; start: number; end: nu
   }));
 }
 
-/** Vowels as one mark and doubled letters as one: `Andy`, `Endy` and `Енді` sound alike, `and` and `Andy` do not. */
+/** Vowels as one mark and doubled letters as one: `Ava`, `Eva` and `Ава` sound alike, `and` and `Andy` do not. */
 const nameSkeleton = (word: string): string => word.replace(/[aeiouy]/g, '*').replace(/([^*])\1+/g, '$1');
 
 /** `hey` or `hi`, as the transcription writes it in either script (`гей`, `хей`, `эй`, `хай`). */
@@ -1761,21 +1761,28 @@ export function matchWake(text: string, names: readonly WakeName[]): { start: nu
 export type SpokenCommand = CallCommand;
 /** A command a transcript ends with, and what was said before it; `ownSentence` for `copy` and `copy that`. */
 export type CommandMatch = { command: SpokenCommand; rest: string; ownSentence?: true };
+type CommandTable = ReadonlyArray<readonly [SpokenCommand, readonly string[], { ownSentence: true } | undefined]>;
+const commandTables = new WeakMap<CallCommandWords, CommandTable>();
 /**
- * CALL_COMMAND_WORDS, longest first, as the words that end an utterance (Cyrillic read as Latin:
+ * A call's command words, longest first, as the words that end an utterance (Cyrillic read as Latin:
  * `зулу` is `zulu`, `прийом` is `pryyom`). `copy` and `copy that` are everyday words too, so a
  * final takes them only as their own sentence (`ownSentence`): the whole utterance, or after punctuation.
  */
-const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[], { ownSentence: true } | undefined]> = (
-  ['send', 'discard'] as const
-)
-  .flatMap((command) =>
-    CALL_COMMAND_WORDS[command].map(
-      ({ say, ownSentence }) =>
-        [command, spokenWords(say).map((w) => w.word), ownSentence ? { ownSentence } : undefined] as const,
-    ),
-  )
-  .sort((a, b) => b[1].length - a[1].length);
+function commandTable(words: CallCommandWords): CommandTable {
+  let table = commandTables.get(words);
+  if (!table) {
+    table = (['send', 'discard'] as const)
+      .flatMap((command) =>
+        words[command].map(
+          ({ say, ownSentence }) =>
+            [command, spokenWords(say).map((w) => w.word), ownSentence ? { ownSentence } : undefined] as const,
+        ),
+      )
+      .sort((a, b) => b[1].length - a[1].length);
+    commandTables.set(words, table);
+  }
+  return table;
+}
 
 /**
  * The command phrase a transcript ends with and what was said before it; `missed` when it is an
@@ -1785,9 +1792,10 @@ const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[], { ownS
 function commandEnd(
   text: string,
   interim = false,
+  commands: CallCommandWords = CALL_COMMAND_WORDS,
 ): (CommandMatch & { phrase: string; at: number; missed?: true }) | null {
   const words = spokenWords(text);
-  for (const [command, phrase, guard] of COMMANDS) {
+  for (const [command, phrase, guard] of commandTable(commands)) {
     if (words.length < phrase.length) continue;
     const tail = words.slice(words.length - phrase.length);
     if (!tail.every((w, i) => w.word === phrase[i])) continue;
@@ -1803,8 +1811,12 @@ function commandEnd(
  * The command a transcript ends with, and what was said before it, or null. Only the end counts:
  * `zulu, call Anna` is words, while a sentence that really ends in `zulu` sends, even as a question.
  */
-export function matchCommand(text: string, interim = false): CommandMatch | null {
-  return endMatch(commandEnd(text, interim));
+export function matchCommand(
+  text: string,
+  interim = false,
+  commands: CallCommandWords = CALL_COMMAND_WORDS,
+): CommandMatch | null {
+  return endMatch(commandEnd(text, interim, commands));
 }
 
 /** The command a commandEnd result acts as, or null when it is words. */
@@ -1821,8 +1833,12 @@ export interface CaptionMark {
 }
 
 /** The mark for a caption the worker takes `command` from: its words are the text before the command, or all of it when the text left it out. */
-export function captionMark(text: string, command: SpokenCommand): CaptionMark {
-  const end = commandEnd(text, true);
+export function captionMark(
+  text: string,
+  command: SpokenCommand,
+  commands: CallCommandWords = CALL_COMMAND_WORDS,
+): CaptionMark {
+  const end = commandEnd(text, true, commands);
   if (end?.command !== command) return { command, words: text.trim() };
   return {
     command,
@@ -2045,6 +2061,8 @@ export interface CallTurnsOptions {
   /** Record turns (TurnTake.audio). */
   record?: boolean;
   sttModel: string;
+  /** The call's spoken commands (callCommandWords); CALL_COMMAND_WORDS when unset. */
+  commandWords?: CallCommandWords;
   now?: () => number;
 }
 
@@ -2069,7 +2087,7 @@ export interface Recording {
  * `pauseSends`); it goes back to waiting with no speech for a while (AwakeLimits). Without a
  * spotter the transcript's `hey <agent>` opens it instead.
  *
- * Spoken commands are nominated by the interim text: a send word (`zulu`, `copy`, `прийом`) or a discard phrase at
+ * Spoken commands are nominated by the interim text: a send word (`zulu`, `copy`) or a discard phrase at
  * its end in STABLE_COMMAND_INTERIMS interims in a row, or in one whose text then stays unchanged for
  * COMMAND_SETTLE_MS, with the caller silent, ends the activity,
  * and the final text decides (turnText): a command it still ends with acts, one it does not was
@@ -2117,12 +2135,14 @@ export class CallTurns {
   private names: WakeName[];
   private readonly limits: AwakeLimits;
   private readonly now: () => number;
+  private readonly commands: CallCommandWords;
 
   constructor(
     private readonly deps: CallTurnsDeps,
     private readonly options: CallTurnsOptions,
   ) {
     this.names = wakeNameWords(options.names);
+    this.commands = options.commandWords ?? CALL_COMMAND_WORDS;
     this.limits = options.limits ?? DEFAULT_AWAKE_LIMITS;
     this.now = options.now ?? (() => Date.now());
     if (options.record) this.capture = new TurnCapture(this.now);
@@ -2273,9 +2293,11 @@ export class CallTurns {
     turn.heard = text;
     const found = turn.kind === 'auto' && !turn.addressed ? matchWake(text, this.names) : null;
     const match =
-      turn.kind === 'auto' && (turn.addressed || found) ? matchCommand(this.spoken(turn, text), true) : null;
+      turn.kind === 'auto' && (turn.addressed || found)
+        ? matchCommand(this.spoken(turn, text), true, this.commands)
+        : null;
     const shown = joinText(turn.carry, text);
-    this.deps.caption(turn.segment, shown, false, match ? captionMark(shown, match.command) : undefined);
+    this.deps.caption(turn.segment, shown, false, match ? captionMark(shown, match.command, this.commands) : undefined);
     if (turn.kind !== 'auto') return;
     if (!turn.addressed) {
       if (!found) return;
@@ -2286,8 +2308,7 @@ export class CallTurns {
       this.woke();
       if (!this.speaking) this.armPause();
     }
-    // After the wake resolves: the interim that holds the wake phrase can be the turn's only one. A
-    // repeat is no new text for the shadow, and cannot newly resolve the wake.
+    // After the wake resolves: the interim that holds the wake phrase can be the turn's only one.
     if (match) turn.seen = match;
     if (!match) turn.candidate = undefined;
     else if (turn.candidate?.command === match.command) turn.candidate.count++;
@@ -2449,7 +2470,9 @@ export class CallTurns {
    * with, or one an earlier interim ended with that the text still ends like (the interim dropped it).
    */
   private pendingCommand(turn: OpenTurn, text = this.spoken(turn, turn.heard)): CommandMatch | null {
-    return matchCommand(text, true) ?? (turn.seen && droppedCommand(text, turn.seen.rest) ? turn.seen : null);
+    return (
+      matchCommand(text, true, this.commands) ?? (turn.seen && droppedCommand(text, turn.seen.rest) ? turn.seen : null)
+    );
   }
 
   /** The send countdown shows while the closing silence runs, and not while a spoken command is pending. */
@@ -2558,7 +2581,7 @@ export class CallTurns {
     take.facts = facts;
     const ended = (outcome: TurnOutcome, reason: string) => this.deps.ended?.(facts, outcome, reason);
     const caption = (text: string, command?: SpokenCommand) => {
-      if (text) this.deps.caption(turn.segment, text, true, command && captionMark(text, command));
+      if (text) this.deps.caption(turn.segment, text, true, command && captionMark(text, command, this.commands));
     };
     const recording: Recording = { text: said, failed: heard.failed && !said, take };
     const decides = !(
@@ -2600,18 +2623,18 @@ export class CallTurns {
       // ended in a discard is dropped; otherwise it stays, and the turn is the words around the phrase.
       const before = trimCut(text.slice(0, rewoken.start));
       const after = trimCut(text.slice(rewoken.end));
-      if (matchCommand(before)?.command === 'discard') {
+      if (matchCommand(before, false, this.commands)?.command === 'discard') {
         scratched = before;
         text = after;
       } else text = joinText(before, after);
       said = text;
     }
-    const end = commandEnd(text);
+    const end = commandEnd(text, false, this.commands);
     let match = endMatch(end);
     if (match?.ownSentence && chosen.source !== 'final') {
       // The text is the interim's (the final collapsed or never came): it may carry the body, but
       // only a final that ends in `copy` as its own sentence confirms the command.
-      const confirmed = matchCommand(heard.final ?? '');
+      const confirmed = matchCommand(heard.final ?? '', false, this.commands);
       if (confirmed?.command !== match.command || !confirmed.ownSentence) {
         this.deps.log.info(`voice-mode.command near-miss word=${end?.phrase} reason=unconfirmed`);
         match = null;
@@ -2661,7 +2684,7 @@ export class CallTurns {
     // A sent turn's caption is what the agent gets: the spoken command is not part of it.
     if (scratched) caption(scratched, 'discard');
     else if (match?.command === 'send') {
-      const words = matchCommand(said)?.rest ?? said;
+      const words = matchCommand(said, false, this.commands)?.rest ?? said;
       if (words) this.deps.caption(turn.segment, words, true, { command: 'send', words });
     } else caption(said);
     scratch();
@@ -3131,10 +3154,9 @@ export interface WakeWordEvents {
   onError(err: string): void;
 }
 
-/** The command phrases, as spelling hints for the transcription: they must be in its vocabulary to be heard. */
-export const COMMAND_VOCABULARY: readonly string[] = [...CALL_COMMAND_WORDS.send, ...CALL_COMMAND_WORDS.discard].map(
-  (word) => word.say,
-);
+/** A call's command phrases, as spelling hints for the transcription: they must be in its vocabulary to be heard. */
+export const commandVocabulary = (words: CallCommandWords): string[] =>
+  [...words.send, ...words.discard].map((word) => word.say);
 /**
  * VOICE_MODE_WAKE_MODEL (a classifier .onnx; the bundled `hey_livekit` by default, `off` for none),
  * VOICE_MODE_WAKE_THRESHOLD (0-1; the bundled model's documented 0.68 by default, 0.5 for another model)
@@ -3156,12 +3178,11 @@ export function wakeWordSettings(
 
 /**
  * Settings from the working directory's .env (`root` in tests); WEBHOOK_PORT from the environment
- * wins, as on the host. Each read warns about every old setting it finds; the callers read once per
- * process (see callEnv).
+ * wins, as on the host. The callers read once per process (see callEnv).
  */
 export function workerEnv(keys: string[], root?: string): Record<string, string | undefined> {
   return {
-    ...voiceModeEnv(readEnvFile(voiceModeEnvKeys([...keys, 'WEBHOOK_PORT']), root), (message) => console.warn(message)),
+    ...readEnvFile([...new Set([...keys, 'WEBHOOK_PORT'])], root),
     ...(process.env.WEBHOOK_PORT ? { WEBHOOK_PORT: process.env.WEBHOOK_PORT } : {}),
   };
 }
@@ -3193,8 +3214,6 @@ const AGENT_STATE_ATTRIBUTE = 'lk.agent.state';
 const TRANSCRIPTION_TOPIC = 'lk.transcription';
 /** The `lk.segment_id` of the caller's caption for turn `segment`. */
 const captionSegment = (segment: number) => `SG_turn_${segment}`;
-/** CALL_COMMAND_WORDS as the worker announces them. */
-export const COMMAND_WORDS_JSON = JSON.stringify(CALL_COMMAND_WORDS);
 const SEGMENT_ID = 'lk.segment_id';
 const TRANSCRIPTION_FINAL = 'lk.transcription_final';
 const TRANSCRIBED_TRACK = 'lk.transcribed_track_id';
@@ -3563,7 +3582,7 @@ async function roomVoice(
             [CALL_PROTOCOL_ATTRIBUTE]: String(LIVEKIT_PROTOCOL_VERSION),
             [CALL_REVIEW_ATTRIBUTE]: '1',
             [CALL_COMMANDS_ATTRIBUTE]: CALL_COMMANDS_VERSION,
-            [CALL_COMMAND_WORDS_ATTRIBUTE]: COMMAND_WORDS_JSON,
+            [CALL_COMMAND_WORDS_ATTRIBUTE]: JSON.stringify(callCommandWords(callLanguages(meta.languages).codes)),
           }),
         );
       },
@@ -3783,16 +3802,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let replies = 0;
   /** The label of the line being spoken: TurnTaking announces each line right before it. */
   let speakingLine: CallReplyInfo | undefined;
-  if (meta.sttFallbackModel) {
-    log.warn(
-      'voice-mode worker: VOICE_MODE_STT_FALLBACK_MODEL is ignored: turns are transcribed by the Live model only',
-      {
-        ...callFields,
-        model: meta.sttFallbackModel,
-      },
-    );
-  }
-
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
   try {
     await withTimeout(ctx.waitForParticipant(meta.callerIdentity), meta.joinTimeoutMs, 'caller never joined');
@@ -3850,6 +3859,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turnCuedAt = 0;
   let replyHoldTimer: ReturnType<typeof setTimeout> | undefined;
   const languages = callLanguages(meta.languages);
+  const commandWords = callCommandWords(languages.codes);
   const turnTaking: TurnTaking = new TurnTaking(
     {
       send: async (text) => {
@@ -4052,7 +4062,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     model: meta.sttModel,
     // The names (the host trimmed, deduplicated and capped them) and the commands, which the
     // transcription does not hear reliably unless they are in its vocabulary.
-    vocabulary: [...new Set([...(meta.vocabulary ?? []), ...COMMAND_VOCABULARY])],
+    vocabulary: [...new Set([...(meta.vocabulary ?? []), ...commandVocabulary(commandWords)])],
     languageCodes: languages.codes,
     sampleRate: INPUT_SAMPLE_RATE,
     onInterim: (text) => callTurns.onInterim(text),
@@ -4111,6 +4121,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       limits: awakeLimits(deps.env),
       record,
       sttModel: meta.sttModel,
+      commandWords,
     },
   );
   try {
