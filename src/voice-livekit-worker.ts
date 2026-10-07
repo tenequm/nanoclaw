@@ -2250,7 +2250,6 @@ export class CallTurns {
       turn.kind === 'auto' && (turn.addressed || found) ? matchCommand(this.spoken(turn, text), true) : null;
     const shown = joinText(turn.carry, text);
     this.deps.caption(turn.segment, shown, false, match ? captionMark(shown, match.command) : undefined);
-    if (turn.kind === 'auto' && turn.addressed) this.deps.shadow?.interim(turn.segment, this.spoken(turn, shown));
     if (turn.kind !== 'auto') return;
     if (!turn.addressed) {
       if (!found) return;
@@ -2261,6 +2260,8 @@ export class CallTurns {
       this.woke();
       if (!this.speaking) this.armPause();
     }
+    // After the wake resolves: the interim that holds the wake phrase can be the turn's only one.
+    this.deps.shadow?.interim(turn.segment, this.spoken(turn, shown));
     if (match) turn.seen = match;
     if (!match) turn.candidate = undefined;
     else if (turn.candidate?.command === match.command) turn.candidate.count++;

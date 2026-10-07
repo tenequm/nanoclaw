@@ -344,7 +344,7 @@ const heard = (interim: string, final?: string): Heard => ({
 });
 
 /** CallTurns with the shadow attached, against a fake transcription. */
-function turnsWithShadow(silenceMs: number) {
+function turnsWithShadow(silenceMs: number, wake = false) {
   const h = shadowHarness();
   const results: Heard[] = [];
   const transcriber = {
@@ -378,7 +378,7 @@ function turnsWithShadow(silenceMs: number) {
     },
     { silenceMs, names: ['Andy'], sttModel: 'model' },
   );
-  turns.configure(false, false);
+  turns.configure(wake, false);
   return { ...h, turns, transcriber, sent, results };
 }
 
@@ -407,6 +407,16 @@ describe('JevTurnShadow on CallTurns', () => {
     expect(c.outcome()).toMatch(
       /turn=1 endedBy=pause words=5 judgements=1 firstWouldSendMsBeforeEnd=\d+ falseWouldSends=0/,
     );
+  });
+
+  it("judges a turn whose only interim holds the wake phrase, on the words after it", async () => {
+    const c = turnsWithShadow(60_000, true);
+    c.turns.onSpeech(true, 0);
+    c.turns.onInterim('Hey Andy book a table for two');
+    await c.wait(5000);
+    expect(c.asked).toEqual(['book a table for two']);
+    c.turns.close();
+    expect(c.outcome()).toContain('turn=1 endedBy=hangup words=5 judgements=1');
   });
 
   it('judges nothing in Manual mode', async () => {
