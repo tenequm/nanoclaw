@@ -63,6 +63,7 @@ import {
   CALL_UPDATING_ATTRIBUTE,
   wakePhrase,
 } from './voice-mode-protocol.js';
+import { log } from '../log.js';
 import { stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './voice-mode-page.js';
 
@@ -176,7 +177,7 @@ interface Harness {
   clock: { now: number };
   access: { enabled: boolean };
   /** What the router does with the next turns: store them, drop them, hang until `hung` is called (storing it on `true`), or throw. */
-  routing: { mode: 'store' | 'drop' | 'hang' | 'throw'; hung: Array<(store?: boolean) => void> };
+  routing: { mode: 'store' | 'drop' | 'hang' | 'throw'; hung: Array<(store?: boolean | Error) => void> };
   /** Sessions whose replies a stored turn expedited. */
   expedited: string[];
   /** Call starts: where the agent was looked up, and which sessions were woken. */
@@ -240,8 +241,9 @@ async function startHarness(
       if (event.channelType !== 'voice') events.push(event);
       else inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
       if (routing.mode === 'hang') {
-        return new Promise<boolean>((resolve) =>
+        return new Promise<boolean>((resolve, reject) =>
           routing.hung.push((store) => {
+            if (store instanceof Error) return reject(store);
             if (store) onStored?.(session);
             resolve(store === true);
           }),
@@ -1044,6 +1046,35 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(again.status).toBe(202);
     expect(await again.json()).toEqual({ id: '1' });
     worker.close();
+  });
+
+  it('logs a turn that failed to route, in time or after its 504', async () => {
+    await h.stop();
+    h = await startHarness({}, { routeTimeoutMs: 100 });
+    const error = vi.spyOn(log, 'error');
+    const warn = vi.spyOn(log, 'warn');
+    try {
+      const { worker } = await startCall(h);
+      h.routing.mode = 'throw';
+      expect((await worker.post('utterance', { text: 'broken' })).status).toBe(500);
+      expect(error).toHaveBeenCalledWith(
+        'livekit-voice-mode: routing a turn failed',
+        expect.objectContaining({ platformId: LINE }),
+      );
+      h.routing.mode = 'hang';
+      expect((await worker.post('utterance', { text: 'stuck' })).status).toBe(504);
+      h.routing.hung[0](new Error('router exploded late'));
+      await vi.waitFor(() =>
+        expect(warn).toHaveBeenCalledWith(
+          'livekit-voice-mode: a timed-out turn failed to route',
+          expect.objectContaining({ callId: worker.meta.callId }),
+        ),
+      );
+      worker.close();
+    } finally {
+      error.mockRestore();
+      warn.mockRestore();
+    }
   });
 
   it('answers a retried turn from its first outcome and routes it once', async () => {

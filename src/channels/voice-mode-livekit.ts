@@ -1133,18 +1133,17 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         const stored = await Promise.race([routed, timedOut]);
         if (stored === 'timeout') {
           log.warn('livekit-voice-mode: a turn did not reach the agent in time', fields);
-          if (turnKey) {
-            void routed.then(
-              (late) => {
-                if (!late) return;
-                log.info('livekit-voice-mode: a timed-out turn reached the agent', fields);
-                const accepted = { status: 202, body: JSON.stringify({ id: utteranceId }) };
-                if (call.turnOutcomes.has(turnKey)) call.turnOutcomes.set(turnKey, Promise.resolve(accepted));
-                if (!call.ended) push(call, { type: 'turn-stored', turnKey, id: utteranceId });
-              },
-              () => undefined,
-            );
-          }
+          void routed.then(
+            (late) => {
+              if (!late) return;
+              log.info('livekit-voice-mode: a timed-out turn reached the agent', fields);
+              if (!turnKey) return;
+              const accepted = { status: 202, body: JSON.stringify({ id: utteranceId }) };
+              if (call.turnOutcomes.has(turnKey)) call.turnOutcomes.set(turnKey, Promise.resolve(accepted));
+              if (!call.ended) push(call, { type: 'turn-stored', turnKey, id: utteranceId });
+            },
+            (err: unknown) => log.warn('livekit-voice-mode: a timed-out turn failed to route', { ...fields, err }),
+          );
           return { status: 504, body: 'The turn did not reach the agent in time' };
         }
         if (!stored) {

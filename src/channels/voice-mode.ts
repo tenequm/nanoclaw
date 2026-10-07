@@ -394,10 +394,15 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
           expediteReplies(session);
         },
       };
-      const accepted = config.routeTurn
-        ? await config.routeTurn(routed)
-        : await routeVoiceModeTurn(routed, event.agentGroupId!);
-      return stored || accepted;
+      try {
+        const accepted = config.routeTurn
+          ? await config.routeTurn(routed)
+          : await routeVoiceModeTurn(routed, event.agentGroupId!);
+        return stored || accepted;
+      } catch (err) {
+        log.error('livekit-voice-mode: routing a turn failed', { platformId: event.platformId, err });
+        throw err;
+      }
     },
     callJoined: (callId, route, agentGroupId) => {
       if (joinedCalls.has(callId)) return;
