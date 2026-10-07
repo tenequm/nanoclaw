@@ -409,7 +409,7 @@ describe('JevTurnShadow on CallTurns', () => {
     );
   });
 
-  it("judges a turn whose only interim holds the wake phrase, on the words after it", async () => {
+  it('judges a turn whose only interim holds the wake phrase, on the words after it', async () => {
     const c = turnsWithShadow(60_000, true);
     c.turns.onSpeech(true, 0);
     c.turns.onInterim('Hey Andy book a table for two');
