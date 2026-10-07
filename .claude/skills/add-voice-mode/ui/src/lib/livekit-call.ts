@@ -187,7 +187,8 @@ function tokenError(status: number, body: string): CallError {
   const kind = statusErrorKind(status)
   // The host's own words say which limit: the hourly starts or the day's minutes.
   if (status === 429 && said) return new CallError(said, kind)
-  if (status === 409 && said.includes("protocol 6")) return new CallError(UPDATING, "updating")
+  // 426: this page speaks another protocol than the host; a host from before 426 said so in a 409.
+  if (status === 426 || (status === 409 && said.includes("protocol 6"))) return new CallError(UPDATING, "updating")
   if (status === 409) return new CallError("This call attempt is no longer active. Try again.", kind)
   if (status === 502) return new CallError("Could not open the call room. Try again.", kind)
   return new CallError(errorText(status, said), kind)

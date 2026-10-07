@@ -483,6 +483,16 @@ const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache
 
 const NO_CHAT = 'This voice line has no chat to talk in. Run /voice in a chat with the agent.';
 
+/**
+ * The 426 answer to a start from a client of another protocol version, before any room exists. Native
+ * clients match the status and the words "update your client".
+ */
+const PROTOCOL_REFUSAL = JSON.stringify({
+  error: 'protocol',
+  protocol: LIVEKIT_PROTOCOL_VERSION,
+  message: `The voice service is updating. Reload the page or update your client to protocol ${LIVEKIT_PROTOCOL_VERSION}.`,
+});
+
 /** Only a line from before the rename talks on itself with no call chat; any other line needs one. */
 const talksOnLine = (platformId: string): boolean => lineChannelType(platformId) === LEGACY_VOICE_CHANNEL;
 
@@ -1234,8 +1244,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       const platformId = await lineForToken(token);
       if (!platformId) return reply(res, 403, 'Unknown call link');
       if (route === 'livekit/token') {
-        if (url.searchParams.get('v') !== String(LIVEKIT_PROTOCOL_VERSION))
-          return reply(res, 409, 'The voice service is updating. Reload the page or update your client to protocol 6.');
+        if (url.searchParams.get('v') !== String(LIVEKIT_PROTOCOL_VERSION)) {
+          return reply(res, 426, PROTOCOL_REFUSAL, JSON_HEADERS);
+        }
         return startCall(res, platformId);
       }
       if (route === 'livekit/end') {

@@ -237,8 +237,8 @@ the first judgement of a day; nothing needs deleting by hand.
    macOS read the arguments from `launchctl print gui/$(id -u)/<worker label>`
    and the lines from the log files its plist names.
 10. Close or reload every browser tab that had a call page open. A tab still
-    running the old protocol 4 page is refused and shows the generic "This
-    call attempt is no longer active. Try again." on every retry, which never
+    running the old protocol 4 page is refused with HTTP 426 and shows the
+    generic "Could not start the call (HTTP 426)." on every retry, which never
     succeeds until the page reloads.
 11. Reload a saved browser bookmark; check the correct caller and agent, one
     spoken send, review draft, discard, captions, reply, reconnect and hangup.
@@ -265,7 +265,7 @@ filename if desired, but its executable is `dist/voice-mode-worker.js`.
 Preserve `VOICE_MODE_PORT` or its default 3100. The page listener now binds
 `127.0.0.1` instead of every interface: a front that reaches it over another
 address (a container bridge, the LAN) needs `VOICE_MODE_PAGE_HOST` set to that
-address. Reload the browser page so it requests protocol 6. Old protocol 5 starts are refused with 409 before a room
+address. Reload the browser page so it requests protocol 6. Old protocol 5 starts are refused with 426 before a room
 or cost-bearing worker is created.
 
 Behavior changes from that worker: own Gemini Live manual activities replace

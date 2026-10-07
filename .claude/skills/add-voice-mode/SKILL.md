@@ -369,7 +369,7 @@ Remove via [REMOVE.md](REMOVE.md).
 - Caller denied: new lines require a current core owner/admin role. Legacy
   lines retain their named voice caller, strict wiring and group membership.
 - Updating: reload the page or update the native client to protocol 6. Host and
-  worker must match; token requests need `v=6` and older starts return 409.
+  worker must match; token requests need `v=6` and older starts get HTTP 426.
 - No worker: check the worker unit, LiveKit signaling, host loopback URL and
   matching dispatch name. Its health port is separate from the host's.
 - No media: check LiveKit UDP/TURN reachability and browser microphone permission.

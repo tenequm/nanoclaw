@@ -581,10 +581,16 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     }
   });
 
-  it('refuses protocol four and five clients before creating a room', async () => {
+  it('refuses protocol four and five clients with 426 before creating a room', async () => {
     for (const suffix of ['', '&v=4', '&v=5']) {
       const result = await post(`${h.base}/livekit/token?t=tok123${suffix}`);
-      expect(result.status).toBe(409);
+      expect(result.status).toBe(426);
+      expect(result.headers.get('content-type')).toContain('application/json');
+      expect(await result.json()).toEqual({
+        error: 'protocol',
+        protocol: LIVEKIT_PROTOCOL_VERSION,
+        message: 'The voice service is updating. Reload the page or update your client to protocol 6.',
+      });
     }
     expect(h.lk.rooms).toEqual([]);
   });
@@ -733,6 +739,8 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       expect(html).toContain(name);
     }
     expect(html).toContain('window.__VOICE_MODE_UI__={}');
+    // A 426 start tells the caller the service is updating, not a generic failure.
+    expect(html).toMatch(/===426\|\|[^;]*"updating"/);
   });
 
   it('tells the page who answers the line, only with a known token and a caller with access', async () => {

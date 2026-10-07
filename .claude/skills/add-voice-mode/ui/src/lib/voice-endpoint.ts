@@ -1,3 +1,5 @@
+import { CLIENT_PROTOCOL_VERSION } from "./voice-call"
+
 /**
  * Resolve the host's routes from the page URL, preserving proxy prefixes. The page sits at the
  * voice root (/voice) or at a legacy address one segment below it (/voice/livekit,
@@ -10,6 +12,6 @@ export function voiceEndpoint(route: "info" | "livekit/token" | "livekit/end", t
   url.search = ""
   url.hash = ""
   url.searchParams.set("t", token)
-  url.searchParams.set("v", "6")
+  url.searchParams.set("v", String(CLIENT_PROTOCOL_VERSION))
   return url
 }
