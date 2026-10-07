@@ -1950,7 +1950,12 @@ describe('livekit call talking in the agent chat', () => {
     );
     const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
     expect(refused.status).toBe(409);
-    expect(await refused.text()).toBe('This voice line has no chat to talk in. Run /voice in a chat with the agent.');
+    expect(refused.headers.get('content-type')).toContain('application/json');
+    // The page names the cause by `error`, not by a status it shares with a replaced attempt.
+    expect(await refused.json()).toEqual({
+      error: 'no-chat',
+      message: 'This voice line has no chat to talk in. Run /voice in a chat with the agent.',
+    });
     expect(h.lk.rooms).toEqual([]);
     // The refusal used none of the hourly starts.
     fake.state.bound = { group: topic, threadId: null, ownerIds: ['telegram:42'] };

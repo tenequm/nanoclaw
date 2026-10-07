@@ -501,7 +501,11 @@ registerTypingObserver(({ agentGroupId, working, ...chat }) => liveKitChatTyping
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
 
-const NO_CHAT = 'This voice line has no chat to talk in. Run /voice in a chat with the agent.';
+/** The 409 answer to a start on a line with no chat to talk in; the page tells it by `error`, not the status. */
+const NO_CHAT_REFUSAL = JSON.stringify({
+  error: 'no-chat',
+  message: 'This voice line has no chat to talk in. Run /voice in a chat with the agent.',
+});
 
 /**
  * The 426 answer to a start from a client of another protocol version, before any room exists. Native
@@ -859,7 +863,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
     // Before anything is spent or ended: a line with no chat to talk in is refused outright.
     if (!talksOnLine(platformId) && !(await resolveChat({ line, platformId, callId: 'starting' }))) {
-      return reply(res, 409, NO_CHAT);
+      return reply(res, 409, NO_CHAT_REFUSAL, JSON_HEADERS);
     }
     const t = host.now();
     const refusal = host.admitStart(platformId, t);
@@ -943,7 +947,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const chatGroup = (await refreshChat(call, false))?.group;
     if (!chatGroup && !talksOnLine(platformId) && !call.ended) {
       endCall(call, 'no chat to talk in');
-      return reply(res, 409, NO_CHAT);
+      return reply(res, 409, NO_CHAT_REFUSAL, JSON_HEADERS);
     }
     const chat = chatGroup ? chatLabel(chatGroup) : undefined;
     if (call.ended || !host.isRunning()) {

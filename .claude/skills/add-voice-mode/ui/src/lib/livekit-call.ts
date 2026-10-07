@@ -183,6 +183,17 @@ function isTurnStatus(v: unknown): v is TurnStatus {
   return !!s && typeof s.turn === "number" && (s.status === "sending" || s.status === "sent" || s.status === "lost")
 }
 
+/** The host's words when the line has no chat to talk in (`error: "no-chat"`), else null. */
+function noChatRefusal(body: string): string | null {
+  try {
+    const refusal = JSON.parse(body) as { error?: unknown; message?: unknown } | null
+    if (refusal?.error === "no-chat" && typeof refusal.message === "string") return refusal.message
+  } catch {
+    // A plain-text body, from a host that answered it in words.
+  }
+  return body.startsWith("This voice line has no chat") ? body : null
+}
+
 function tokenError(status: number, body: string): CallError {
   const said = body.trim()
   const kind = statusErrorKind(status)
@@ -190,6 +201,8 @@ function tokenError(status: number, body: string): CallError {
   if (status === 429 && said) return new CallError(said, kind)
   // 426: this page speaks another protocol than the host; a host from before 426 said so in a 409.
   if (status === 426 || (status === 409 && said.includes("protocol 6"))) return new CallError(UPDATING, "updating")
+  const noChat = noChatRefusal(said)
+  if (status === 409 && noChat) return new CallError(noChat, kind)
   if (status === 409) return new CallError("This call attempt is no longer active. Try again.", kind)
   if (status === 502) return new CallError("Could not open the call room. Try again.", kind)
   return new CallError(errorText(status, said), kind)

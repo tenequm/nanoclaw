@@ -39,6 +39,10 @@ describe('voice call page (generated)', () => {
     }
   });
 
+  it("shows the host's no-chat refusal instead of a generic retry", () => {
+    expect(callPageHtml()).toContain('"no-chat"');
+  });
+
   it('keeps the hangup keepalive so a closing tab still reaches the host', () => {
     expect(callPageHtml()).toMatch(/keepalive\s*:\s*(true|!0)/);
   });
