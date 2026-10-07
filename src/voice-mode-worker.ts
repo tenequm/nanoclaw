@@ -4414,7 +4414,9 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     console.error(`voice-mode worker: ${(err as Error).message}`);
     process.exit(1);
   }
-  console.info(`voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${hostUrl} (LIVEKIT_HOST_URL)`);
+  console.info(
+    `voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, dispatch name ${env.LIVEKIT_AGENT_NAME || DEFAULT_LIVEKIT_AGENT_NAME}, host URL ${hostUrl} (LIVEKIT_HOST_URL)`,
+  );
   // agents-js's default ("adaptive") enables the debugger domain on a job's first loop stall to
   // sample stacks: that blocks the loop another ~250 ms mid-call and slows the call's JS by ~15%
   // from then on. Set the variable to sample anyway; the job processes inherit it.

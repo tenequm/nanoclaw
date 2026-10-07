@@ -37,6 +37,7 @@ import {
 } from './voice-mode-line.js';
 import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
 import {
+  DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_VOICE_MIRROR,
   LIVEKIT_PROTOCOL_VERSION,
   wakePhrase,
@@ -512,6 +513,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         trustedProxies: config.trustedProxyCidrs?.trim() || 'none',
         lines: tokens.size,
         livekit: config.livekit.url,
+        protocol: LIVEKIT_PROTOCOL_VERSION,
+        agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
         pageListener: config.pagePort ? `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}` : 'off',
       });
     },
