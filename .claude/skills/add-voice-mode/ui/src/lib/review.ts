@@ -573,7 +573,15 @@ export function modeCaption(
  * The `nanoclaw.voice.commands` value of a worker whose commands and settings RPC this page drives
  * (CALL_COMMANDS_VERSION); the words themselves come from the worker's announcement.
  */
-export const COMMANDS_VERSION = "2"
+export const COMMANDS_VERSION = "3"
+/** Older vocabularies ("1": `over`, "2": `send it`): this page quotes none of their words, but their settings RPC turns the wake gate off. */
+const LEGACY_COMMANDS_VERSIONS = new Set(["1", "2"])
+
+/** What this page does with a worker's `nanoclaw.voice.commands`: drive its commands, switch an older one to pauses, or neither. */
+export function workerCommands(attr: string | undefined): "commands" | "legacy" | "none" {
+  if (attr === COMMANDS_VERSION) return "commands"
+  return attr !== undefined && LEGACY_COMMANDS_VERSIONS.has(attr) ? "legacy" : "none"
+}
 
 export interface ListeningView {
   chip: string

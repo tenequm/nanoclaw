@@ -67,6 +67,7 @@ interface ReviewLib {
   quoteWords(list: CommandWords['send'], all?: boolean): string;
   FALLBACK_COMMAND_WORDS: CommandWords;
   COMMANDS_VERSION: string;
+  workerCommands(attr: string | undefined): 'commands' | 'legacy' | 'none';
   MODE_NAME: Record<string, string>;
   DEFAULT_PREFS: Prefs;
   storedPrefs(): Prefs;
@@ -614,5 +615,15 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     // Words the page used to match itself are the worker's alone now.
     expect(matchCommand('Send me a copy.')).toBeNull();
     expect(lib.COMMANDS_VERSION).toBe(CALL_COMMANDS_VERSION);
+  });
+  it('a page and a worker from either side of the zulu change offer each other no words', () => {
+    expect(lib.workerCommands(CALL_COMMANDS_VERSION)).toBe('commands');
+    // An older worker hears `send it` ("2") or `over` ("1"): no commands, its wake gate switched off.
+    expect(lib.workerCommands('2')).toBe('legacy');
+    expect(lib.workerCommands('1')).toBe('legacy');
+    expect(lib.workerCommands(undefined)).toBe('none');
+    expect(lib.workerCommands('99')).toBe('none');
+    // An already-open older page offers its words only to a worker at "2" or "1".
+    expect(['1', '2']).not.toContain(CALL_COMMANDS_VERSION);
   });
 });

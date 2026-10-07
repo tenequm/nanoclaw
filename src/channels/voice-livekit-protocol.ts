@@ -178,16 +178,18 @@ export interface CallDraft {
  * wake phrase only a spoken send sends, unless `pauseSends` lets the closing silence send too. The
  * worker's participant attribute is CALL_COMMANDS_VERSION when it understands them and the
  * `settings` RPC; a page offers the commands only for the value it knows, so a page and a worker
- * from either side of a vocabulary change fall back to pauses. An older worker sets none, and its
- * auto mode has no commands.
+ * from either side of a vocabulary change quote no words to each other. The worker starts
+ * wake-gated until a client's `settings` say otherwise: a page that finds an older vocabulary
+ * switches that worker's wake gate off, so pauses send, while a page older than the worker sends
+ * nothing and has to be reloaded. An older worker sets none, and its auto mode has no commands.
  */
 export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice.commands';
 /**
- * The commands' vocabulary: "1" had `over` as the send word, "2" had `send it` and now has `zulu`,
- * `copy` and `copy that`; kept at "2" so open pages keep their commands across the change. A page
- * takes the words themselves from CALL_COMMAND_WORDS_ATTRIBUTE.
+ * The commands' vocabulary: "1" had `over` as the send word, "2" `send it`, "3" `zulu`, `copy` and
+ * `copy that`. A page takes the words themselves from CALL_COMMAND_WORDS_ATTRIBUTE; a change to
+ * them that a client cannot follow from there bumps this.
  */
-export const CALL_COMMANDS_VERSION = '2';
+export const CALL_COMMANDS_VERSION = '3';
 
 export type CallCommand = 'send' | 'discard';
 /**
