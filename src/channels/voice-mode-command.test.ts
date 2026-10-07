@@ -46,7 +46,7 @@ import { createAgentGroup } from '../db/agent-groups.js';
 import { closeDb, getDb, initTestDb } from '../db/connection.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../db/messaging-groups.js';
 import { runMigrations } from '../db/migrations/index.js';
-import { findVoiceModeLineByToken, hashLinkToken, type VoiceModeLine } from '../db/voice-mode-lines.js';
+import { findVoiceModeLineByToken, hashLinkToken, type VoiceModeLineRow } from '../db/voice-mode-lines.js';
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
 import { grantRole } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
@@ -99,7 +99,7 @@ async function wire(mgId: string, agentGroupId: string) {
   });
 }
 
-const lines = () => getDb().all<VoiceModeLine>('SELECT * FROM voice_mode_lines ORDER BY agent_group_id');
+const lines = () => getDb().all<VoiceModeLineRow>('SELECT * FROM voice_mode_lines ORDER BY agent_group_id');
 const mg = (id: string, isGroup = 0) =>
   ({ id, instance: null, channel_type: 'chat', is_group: isGroup }) as unknown as MessagingGroup;
 const linkFrom = async (who: string, chat = 'mg-dm', threadId: string | null = null) => {

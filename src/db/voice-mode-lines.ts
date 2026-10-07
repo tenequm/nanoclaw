@@ -33,7 +33,7 @@ registerMigration({
   },
 });
 
-export interface VoiceModeLine {
+export interface VoiceModeLineRow {
   /** Random and stable for the line's life; calls, rooms and limits are keyed by it, not by the token. */
   line_id: string;
   agent_group_id: string;
@@ -52,13 +52,13 @@ export interface VoiceModeLine {
 export const hashLinkToken = (token: string): string => createHash('sha256').update(token).digest('hex');
 
 /** The line with this line id (a `voice-mode:` platform id without its prefix). */
-export async function getVoiceModeLine(lineId: string): Promise<VoiceModeLine | undefined> {
-  return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE line_id = ?', lineId);
+export async function getVoiceModeLine(lineId: string): Promise<VoiceModeLineRow | undefined> {
+  return getDb().get<VoiceModeLineRow>('SELECT * FROM voice_mode_lines WHERE line_id = ?', lineId);
 }
 
 /** The agent's line; an agent has at most one. */
-export async function getVoiceModeLineForAgent(agentGroupId: string): Promise<VoiceModeLine | undefined> {
-  return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE agent_group_id = ?', agentGroupId);
+export async function getVoiceModeLineForAgent(agentGroupId: string): Promise<VoiceModeLineRow | undefined> {
+  return getDb().get<VoiceModeLineRow>('SELECT * FROM voice_mode_lines WHERE agent_group_id = ?', agentGroupId);
 }
 
 /**
@@ -70,8 +70,8 @@ export async function bindVoiceModeLineChat(target: {
   callerUserId: string;
   messagingGroupId: string;
   threadId: string | null;
-}): Promise<VoiceModeLine | undefined> {
-  return getDb().get<VoiceModeLine>(
+}): Promise<VoiceModeLineRow | undefined> {
+  return getDb().get<VoiceModeLineRow>(
     `UPDATE voice_mode_lines SET messaging_group_id = ?, thread_id = ?, updated_at = ?
        WHERE agent_group_id = ? AND owner_user_id = ? RETURNING *`,
     target.messagingGroupId,
@@ -83,9 +83,9 @@ export async function bindVoiceModeLineChat(target: {
 }
 
 /** The line a call-link token opens, or undefined. Only hashes are compared: the token is stored nowhere. */
-export async function findVoiceModeLineByToken(token: string): Promise<VoiceModeLine | undefined> {
+export async function findVoiceModeLineByToken(token: string): Promise<VoiceModeLineRow | undefined> {
   if (!/^[0-9a-f]{32}$/.test(token)) return undefined;
-  return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE token_hash = ?', hashLinkToken(token));
+  return getDb().get<VoiceModeLineRow>('SELECT * FROM voice_mode_lines WHERE token_hash = ?', hashLinkToken(token));
 }
 
 /** Who a minted link is for and where its calls talk. */
@@ -99,10 +99,10 @@ export interface VoiceModeLineTarget {
 async function insertLine(
   target: VoiceModeLineTarget,
   onConflict: string,
-): Promise<{ line: VoiceModeLine; token: string } | undefined> {
+): Promise<{ line: VoiceModeLineRow; token: string } | undefined> {
   const token = randomBytes(16).toString('hex');
   const now = new Date().toISOString();
-  const line = await getDb().get<VoiceModeLine>(
+  const line = await getDb().get<VoiceModeLineRow>(
     `INSERT INTO voice_mode_lines
        (line_id, agent_group_id, token_hash, owner_user_id, messaging_group_id, thread_id, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -125,7 +125,9 @@ async function insertLine(
  * caller and the given chat its call chat. The previous link stops working. Returns the line and
  * the new token, which is stored nowhere: the caller hands it out once.
  */
-export async function mintVoiceModeLine(target: VoiceModeLineTarget): Promise<{ line: VoiceModeLine; token: string }> {
+export async function mintVoiceModeLine(
+  target: VoiceModeLineTarget,
+): Promise<{ line: VoiceModeLineRow; token: string }> {
   const minted = await insertLine(
     target,
     `DO UPDATE SET
@@ -143,6 +145,6 @@ export async function mintVoiceModeLine(target: VoiceModeLineTarget): Promise<{ 
  */
 export async function createVoiceModeLine(
   target: VoiceModeLineTarget,
-): Promise<{ line: VoiceModeLine; token: string } | undefined> {
+): Promise<{ line: VoiceModeLineRow; token: string } | undefined> {
   return insertLine(target, 'DO NOTHING');
 }
