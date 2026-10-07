@@ -178,7 +178,10 @@ const VOICE_MODE_DEFAULTS: ChannelDefaults = {
 export interface VoiceModeConfig {
   /** Origin the caller's browser reaches the host at (for the call link). */
   publicUrl: string;
+  /** The separate page listener's port; unset: no separate listener (the host's webhook port still serves the page). */
   pagePort?: number;
+  /** The address the page listener binds; loopback unless set (VOICE_MODE_PAGE_HOST). */
+  pageHost?: string;
   /** Link tokens accepted on the HTTP routes; each is one voice line. */
   linkTokens?: string[];
   lineForToken?: (token: string) => Promise<string | null>;
@@ -497,7 +500,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         });
         await new Promise<void>((resolve, reject) => {
           pageServer!.once('error', reject);
-          pageServer!.listen(config.pagePort, () => {
+          pageServer!.listen(config.pagePort, config.pageHost ?? DEFAULT_PAGE_HOST, () => {
             pageServer!.off('error', reject);
             resolve();
           });
@@ -509,6 +512,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         trustedProxies: config.trustedProxyCidrs?.trim() || 'none',
         lines: tokens.size,
         livekit: config.livekit.url,
+        pageListener: config.pagePort ? `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}` : 'off',
       });
     },
 
@@ -599,6 +603,28 @@ export function parseUiConfig(raw: string | undefined): VoiceModeUiConfig | unde
   return undefined;
 }
 
+const DEFAULT_PAGE_PORT = 3100;
+const DEFAULT_PAGE_HOST = '127.0.0.1';
+
+/**
+ * VOICE_MODE_PORT and VOICE_MODE_PAGE_HOST: where the separate page listener binds, by default
+ * 127.0.0.1:3100. `0` or `off` turns it off, for installs whose front already forwards /voice to the
+ * host's webhook port. An unusable port falls back to the default with a warning.
+ */
+export function pageListener(
+  rawPort: string | undefined,
+  rawHost: string | undefined,
+): { port: number; host: string } | null {
+  const value = rawPort?.trim().toLowerCase();
+  if (value === '0' || value === 'off') return null;
+  const host = rawHost?.trim() || DEFAULT_PAGE_HOST;
+  if (!value) return { port: DEFAULT_PAGE_PORT, host };
+  const port = Number(value);
+  if (Number.isInteger(port) && port > 0 && port < 65_536) return { port, host };
+  log.warn(`voice-mode: VOICE_MODE_PORT must be a port number, 0 or off; using ${DEFAULT_PAGE_PORT}`);
+  return { port: DEFAULT_PAGE_PORT, host };
+}
+
 /** VOICE_MODE_SILENCE_MS: how long the caller is silent before their turn ends; nonsense falls back to the default. */
 function parseSilenceMs(raw: string | undefined): number | undefined {
   if (!raw?.trim()) return undefined;
@@ -618,6 +644,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
         voiceModeEnvKeys([
           'VOICE_MODE_PUBLIC_URL',
           'VOICE_MODE_PORT',
+          'VOICE_MODE_PAGE_HOST',
           'VOICE_MODE_LANGUAGES',
           'VOICE_MODE_LINK_TOKEN',
           'VOICE_MODE_UI',
@@ -656,8 +683,10 @@ registerChannelAdapter(CHANNEL_TYPE, {
         lines: short.map(lineIdForToken),
       });
     }
+    const page = pageListener(env.VOICE_MODE_PORT, env.VOICE_MODE_PAGE_HOST);
     return createVoiceModeAdapter({
-      pagePort: Number(env.VOICE_MODE_PORT ?? 3100),
+      pagePort: page?.port,
+      pageHost: page?.host,
       publicUrl: (env.VOICE_MODE_PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, ''),
       linkTokens,
       ui: parseUiConfig(env.VOICE_MODE_UI),

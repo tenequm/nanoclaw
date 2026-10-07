@@ -27,6 +27,7 @@ import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js
 import {
   createVoiceModeAdapter,
   lineIdForToken,
+  pageListener,
   type VoiceModeChannelAdapter,
   type VoiceModeConfig,
 } from './voice-mode.js';
@@ -564,6 +565,33 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       expect(result.status).toBe(409);
     }
     expect(h.lk.rooms).toEqual([]);
+  });
+
+  it('binds the separate page listener to loopback unless told otherwise, and turns it off on 0 or off', async () => {
+    expect(pageListener(undefined, undefined)).toEqual({ port: 3100, host: '127.0.0.1' });
+    expect(pageListener(' 3200 ', '0.0.0.0')).toEqual({ port: 3200, host: '0.0.0.0' });
+    expect(pageListener('0', undefined)).toBeNull();
+    expect(pageListener('OFF', '0.0.0.0')).toBeNull();
+    expect(pageListener('nonsense', undefined)).toEqual({ port: 3100, host: '127.0.0.1' });
+
+    const listen = vi.spyOn(http.Server.prototype, 'listen');
+    try {
+      for (const [pageHost, address] of [
+        [undefined, '127.0.0.1'],
+        ['::1', '::1'],
+      ] as const) {
+        const port = await freePort();
+        await h.stop();
+        listen.mockClear();
+        h = await startHarness({ pagePort: port, ...(pageHost ? { pageHost } : {}) });
+        const bound = listen.mock.contexts
+          .map((server) => (server as http.Server).address() as AddressInfo | null)
+          .filter((info) => info?.port === port);
+        expect(bound).toEqual([expect.objectContaining({ address, port })]);
+      }
+    } finally {
+      listen.mockRestore();
+    }
   });
 
   it('serves the page on the separate port and keeps worker routes on the host port', async () => {
