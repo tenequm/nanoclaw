@@ -95,6 +95,7 @@ import {
   type SpeechModel,
   type Transcription,
   writeTurnRecording,
+  workerEnv,
   type CallJob,
   type CallVoice,
   type CallVoiceEvents,
@@ -113,6 +114,24 @@ const silentLog = { info: () => undefined, warn: () => undefined };
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe('worker settings', () => {
+  it('reads an old setting under its new name and warns about it once per process', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-mode-worker-env-'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      fs.writeFileSync(path.join(root, '.env'), 'VOICE_TTS_VOICE=Kore\n');
+      for (let call = 0; call < 3; call++) {
+        expect(workerEnv(['VOICE_MODE_TTS_VOICE'], root).VOICE_MODE_TTS_VOICE).toBe('Kore');
+      }
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith('voice-mode: VOICE_TTS_VOICE is deprecated; use VOICE_MODE_TTS_VOICE');
+    } finally {
+      warn.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('speakable text', () => {

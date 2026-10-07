@@ -94,10 +94,10 @@ function messageText(content: string): string {
  * that matters (`renew`: mint a fresh link); null for any other message.
  */
 export function parseVoiceCommand(text: string, channelType: string): { renew: boolean } | null {
-  const [command = '', arg = ''] = text.toLowerCase().split(/\s+/);
-  const matches =
-    command === '!voice' ? BANG_CHANNELS.has(channelType) : command === '/voice' || command.startsWith('/voice@');
-  return matches ? { renew: arg === 'new' } : null;
+  const match = /^\s*([!/]voice(?:@\S*)?)(?!\S)(?:\s+(\S+))?/i.exec(text);
+  if (!match) return null;
+  if (match[1][0] === '!' && !BANG_CHANNELS.has(channelType)) return null;
+  return { renew: match[2]?.toLowerCase() === 'new' };
 }
 
 /** The sender's namespaced user id, read the way the permissions module reads it; no row is created. */
@@ -264,15 +264,21 @@ export function voiceCommandReply(outcome: VoiceCommandOutcome, cmd = '/voice'):
 const noDirectChat = (cmd: string) => `I cannot message you directly here: run ${cmd} in a direct chat with me.`;
 const undeliveredLink = (cmd: string) => `I could not deliver your call link; run ${cmd} new again.`;
 
-/** Claims every /voice message; the agents never see one. */
+/**
+ * Claims every /voice message; the agents never see one. Runs on every inbound message, so anything
+ * that cannot be /voice leaves before parsing; `callUrl` defaults to the live adapter's, looked up
+ * only for a command.
+ */
 export async function handleVoiceCommand(
   event: InboundEvent,
-  callUrl: CallUrlFn | null = liveCallUrl(),
+  callUrlFor?: CallUrlFn | null,
   callLink: CallLinkFn = liveCallLink,
 ): Promise<boolean> {
   if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') return false;
+  if (!/voice/i.test(event.message.content)) return false;
   const command = parseVoiceCommand(messageText(event.message.content), event.channelType);
   if (!command) return false;
+  const callUrl = callUrlFor === undefined ? liveCallUrl() : callUrlFor;
 
   const instance = event.instance ?? event.channelType;
   const adapter = getChannelAdapterExact(instance);

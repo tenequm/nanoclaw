@@ -149,6 +149,10 @@ describe('parseVoiceCommand / senderUserId', () => {
     expect(parseVoiceCommand('!voice', 'telegram')).toBeNull();
     expect(parseVoiceCommand('/voices', 'telegram')).toBeNull();
     expect(parseVoiceCommand('my /voice', 'telegram')).toBeNull();
+    expect(parseVoiceCommand('  /voice\tnew', 'telegram')).toEqual({ renew: true });
+    expect(parseVoiceCommand('/voice@', 'telegram')).toEqual({ renew: false });
+    expect(parseVoiceCommand('/voice-mode', 'telegram')).toBeNull();
+    expect(parseVoiceCommand('', 'telegram')).toBeNull();
   });
 
   it('reads the sender the way the permissions module does, namespacing a bare handle', () => {

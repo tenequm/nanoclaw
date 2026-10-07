@@ -45,6 +45,7 @@ import {
   CALL_DEPTH_NOTE,
   CALL_LANGUAGE_NOTE,
   CALL_REPLY_NOTE,
+  callLanguageNote,
   type LiveKitServerApi,
   type LiveKitVoiceConfig,
   type MirrorApi,
@@ -1787,6 +1788,16 @@ describe('livekit call talking in the agent chat', () => {
     worker.close();
   });
 
+  it("talks in a /voice line's chat without asking again whether its caller, the owner, administers the agent", async () => {
+    const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
+    await start([topic], 'off', { bound: { group: topic, threadId: null, ownerIds: [LINE] }, admins: [] });
+    const { worker } = await startCall(h);
+    await worker.utter('hello');
+    expect(h.events).toEqual([expect.objectContaining({ platformId: 'telegram:-300:7' })]);
+    expect(h.inbound).toEqual([]);
+    worker.close();
+  });
+
   it('ignores a /voice chat that is no longer the agent, or when no owner account is its admin', async () => {
     const gone = { id: 'mg-gone', platform_id: 'telegram:-9' };
     const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
@@ -2026,6 +2037,15 @@ describe('turn message text', () => {
     expect(CALL_LANGUAGE_NOTE).toContain('looks Russian is Ukrainian misspelled by speech recognition');
     expect(CALL_LANGUAGE_NOTE).toContain('answer in Ukrainian (in English if the caller spoke English)');
     expect(CALL_LANGUAGE_NOTE).toContain('never in Russian');
+  });
+
+  it('names configured languages other than the default, and Ukrainian spelling only where Ukrainian is listed', () => {
+    expect(callLanguageNote(['uk-UA', 'en-US'])).toBe(CALL_LANGUAGE_NOTE);
+    expect(callLanguageNote(['en-US', 'uk-UA'])).toBe(
+      'The caller speaks en-US, uk-UA; answer in the language they spoke. A transcript that looks Russian is ' +
+        'Ukrainian misspelled by speech recognition; answer in Ukrainian, never Russian.',
+    );
+    expect(callLanguageNote(['de-DE'])).toBe('The caller speaks de-DE; answer in the language they spoke.');
   });
 });
 

@@ -3161,10 +3161,21 @@ export function wakeWordSettings(
   };
 }
 
-/** Settings from the working directory's .env; WEBHOOK_PORT from the environment wins, as on the host. */
-function workerEnv(keys: string[]): Record<string, string | undefined> {
+/** Old-setting warnings already given: a job process reads its settings for every call it runs. */
+const envWarnings = new Set<string>();
+
+/**
+ * Settings from the working directory's .env (`root` in tests); WEBHOOK_PORT from the environment
+ * wins, as on the host. Each old-setting warning is given once per process.
+ */
+export function workerEnv(keys: string[], root?: string): Record<string, string | undefined> {
+  const warnOnce = (message: string) => {
+    if (envWarnings.has(message)) return;
+    envWarnings.add(message);
+    console.warn(message);
+  };
   return {
-    ...voiceModeEnv(readEnvFile(voiceModeEnvKeys([...keys, 'WEBHOOK_PORT'])), (message) => console.warn(message)),
+    ...voiceModeEnv(readEnvFile(voiceModeEnvKeys([...keys, 'WEBHOOK_PORT']), root), warnOnce),
     ...(process.env.WEBHOOK_PORT ? { WEBHOOK_PORT: process.env.WEBHOOK_PORT } : {}),
   };
 }
@@ -3696,8 +3707,11 @@ export class CallTelemetry {
   }
 }
 
+/** A call's settings, read once per job process: host and worker restart together for a change. */
+let callEnv: Record<string, string | undefined> | undefined;
+
 function defaultDeps(): RunCallDeps {
-  const env = workerEnv([
+  const env = (callEnv ??= workerEnv([
     'GEMINI_API_KEY',
     'LIVEKIT_API_SECRET',
     'LIVEKIT_HOST_URL',
@@ -3710,7 +3724,7 @@ function defaultDeps(): RunCallDeps {
     'VOICE_MODE_WAKE_PHRASE',
     'VOICE_MODE_WAKE_START_SECONDS',
     'VOICE_MODE_WAKE_IDLE_SECONDS',
-  ]);
+  ]));
   const wake = wakeWordSettings(env);
   return {
     env,

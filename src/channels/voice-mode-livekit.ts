@@ -64,7 +64,8 @@ import {
   liveKitCallSecret,
   MAX_TURN_TEXT_BYTES,
   PING_INTERVAL_MS,
-  parseVoiceLanguages,
+  baseLanguage,
+  DEFAULT_VOICE_LANGUAGES,
   WORKER_REQUEST_TIMEOUT_MS,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
@@ -130,6 +131,22 @@ export const CALL_CHAT_REPLY_NOTE =
   'Spoken on a live voice call; while it lasts, every message you send to this chat is read aloud word for ' +
   `word. ${CALL_DEPTH_NOTE} Offer anything meant for reading (code, links, long lists) for after the call ` +
   `instead of sending it now. ${CALL_LANGUAGE_NOTE}`;
+
+/** Added to a non-default VOICE_MODE_LANGUAGES note when Ukrainian is listed. */
+const MISSPELLED_UKRAINIAN_NOTE =
+  'A transcript that looks Russian is Ukrainian misspelled by speech recognition; answer in Ukrainian, never Russian.';
+
+/** What a turn says about the caller's language: CALL_LANGUAGE_NOTE for the default languages, else the configured ones. */
+export function callLanguageNote(languages: readonly string[]): string {
+  if (
+    languages.length === DEFAULT_VOICE_LANGUAGES.length &&
+    languages.every((code, i) => code === DEFAULT_VOICE_LANGUAGES[i])
+  ) {
+    return CALL_LANGUAGE_NOTE;
+  }
+  const ukrainian = languages.some((code) => baseLanguage(code) === 'uk');
+  return `The caller speaks ${languages.join(', ')}; answer in the language they spoke.${ukrainian ? ` ${MISSPELLED_UKRAINIAN_NOTE}` : ''}`;
+}
 
 /** The inbound text for one transcribed caller turn. */
 export function turnMessageText(transcript: string, note: string = CALL_REPLY_NOTE): string {
@@ -527,11 +544,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const model = (raw ?? fallback).trim();
     return /^(off|none)$/i.test(model) ? '' : model;
   };
-  const languages = parseVoiceLanguages(config.languages?.join(','));
-  const languageNote =
-    languages.join(',') === 'uk-UA,en-US'
-      ? CALL_LANGUAGE_NOTE
-      : `The caller speaks ${languages.join(', ')}; answer in the language they spoke.${languages.some((code) => code.toLowerCase().startsWith('uk')) ? ' A transcript that looks Russian is Ukrainian misspelled by speech recognition; answer in Ukrainian, never Russian.' : ''}`;
+  const languages = config.languages?.length ? [...config.languages] : [...DEFAULT_VOICE_LANGUAGES];
+  // What every turn tells the agent, by where the call talks; the same for the engine's life.
+  const languageNote = callLanguageNote(languages);
+  const replyNote = CALL_REPLY_NOTE.replace(CALL_LANGUAGE_NOTE, languageNote);
+  const chatReplyNote = CALL_CHAT_REPLY_NOTE.replace(CALL_LANGUAGE_NOTE, languageNote);
   const speech = {
     sttModel: config.speech?.sttModel || DEFAULT_VOICE_STT_MODEL,
     // Deprecated: no default, and a worker that is still sent one logs that it ignores it.
@@ -603,6 +620,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
           chat: g.id,
         });
       } else if (
+        // A /voice line's one owner is its caller, whose role every access check of the line holds already.
+        !bound.ownerIds.every((id) => id === line.caller.id) &&
         !(await Promise.all(bound.ownerIds.map((id) => mirrorApi.isAdmin(id, line.agentGroupId)))).some(Boolean)
       ) {
         noteChat(call, 'binding', 'no line owner account is an admin of the agent; using the default', {
@@ -1111,10 +1130,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         id: liveKitUtteranceMessageId(call.callId, utteranceId),
         kind: 'chat',
         content: JSON.stringify({
-          text: turnMessageText(
-            text,
-            (chat ? CALL_CHAT_REPLY_NOTE : CALL_REPLY_NOTE).replace(CALL_LANGUAGE_NOTE, languageNote),
-          ),
+          text: turnMessageText(text, chat ? chatReplyNote : replyNote),
           sender: sender.name,
           senderId: sender.id,
           livekit: { callId: call.callId, utteranceId },
