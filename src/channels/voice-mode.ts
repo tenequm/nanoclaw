@@ -47,7 +47,7 @@ import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
 import { findVoiceModeLineByToken, hashLinkToken } from '../db/voice-mode-lines.js';
-import { routeVoiceModeTurn, type VoiceModeTurn } from './voice-mode-route.js';
+import { routeVoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand } from './voice-mode-command.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
