@@ -3,9 +3,6 @@
  * peers may reach the browser routes through a reverse proxy. The routes
  * themselves are exercised over HTTP in voice-mode-livekit.test.ts.
  */
-import { existsSync, readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import { admitsVoiceModePeer, parseCidrs, voiceRoute, type VoiceModeProxyPolicy } from './voice-mode.js';

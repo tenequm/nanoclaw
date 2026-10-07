@@ -1,4 +1,3 @@
-import type { VoiceModeInboundEvent as InboundEvent } from './voice-mode-integration.js';
 /**
  * findCallSession must name the session the router itself stores a call's turn
  * in, without creating one. Checked against the REAL routeInbound (seeded
@@ -7,6 +6,7 @@ import type { VoiceModeInboundEvent as InboundEvent } from './voice-mode-integra
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { VoiceModeInboundEvent as InboundEvent } from './voice-mode-integration.js';
 import {
   closeDb,
   createAgentGroup,

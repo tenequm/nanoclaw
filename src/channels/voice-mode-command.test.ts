@@ -1,4 +1,3 @@
-import type { InboundEvent } from './adapter.js';
 /**
  * `/voice` against the real core: core's router hands it to the command (registered through the
  * real channel barrel) before any agent sees it, who may run it is decided by core's owner and
@@ -7,6 +6,8 @@ import type { InboundEvent } from './adapter.js';
  */
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import type { InboundEvent } from './adapter.js';
 
 vi.mock('../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -55,7 +56,6 @@ import { addMember } from '../modules/permissions/db/agent-group-members.js';
 import { grantRole } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { getSessionsByAgentGroup } from '../db/sessions.js';
-import { resolveVoiceModeLine } from './voice-mode-line.js';
 import { routeInbound } from '../router.js';
 import type { MessagingGroup } from '../types.js';
 import {
@@ -512,5 +512,3 @@ describe('handleVoiceCommand (the interceptor)', () => {
     expect((await lines())[0]).toMatchObject({ messaging_group_id: 'mg-chan', thread_id: null });
   });
 });
-
-/** A line from before the rename, as main left it: its voice user, chat, wiring and OWNER as its owner. */
