@@ -72,7 +72,7 @@ function safeJson(value: unknown): string {
 /** The call page with the host's runtime config injected. */
 export function callPageHtml(config: VoiceModeUiConfig = {}): string {
   // A function replacer: a string replacement would interpret $& and $' inside the config.
-  return PAGE.replace('<!--VOICE_MODE_UI_CONFIG-->', () => '<script>window.__VOICE_UI__=' + safeJson(config) + '</script>');
+  return PAGE.replace('<!--VOICE_MODE_UI_CONFIG-->', () => '<script>window.__VOICE_MODE_UI__=' + safeJson(config) + '</script>');
 }
 `
 writeFileSync(out, body)

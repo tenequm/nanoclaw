@@ -2,7 +2,7 @@
  * The LiveKit Agents worker for the voice channel's LiveKit path, where the caller takes
  * turns talking to the line's real NanoClaw agent.
  *
- * A separate process (`pnpm run voice-worker`), because agents-js runs every
+ * A separate process (`pnpm run voice-mode-worker`), because agents-js runs every
  * job in a forked child process of its worker and owns that process's signals
  * and logging; the host dispatches it to each call's room (explicit dispatch
  * by agent name) and the two talk over the host's webhook server, see
@@ -805,7 +805,7 @@ export function audioLevels(pcm: Int16Array): { peakDb: number; rmsDb: number } 
   return meter.levels;
 }
 
-/** One spoken line, as its `voice.reply` event reports it: never its words. */
+/** One spoken line, as its `voice-mode.reply` event reports it: never its words. */
 export interface SpokenLine {
   outcome: 'spoken' | 'partial' | 'failed';
   /** The speech model its audio came from; absent when none came. */
@@ -1004,14 +1004,14 @@ export interface CallVoiceEvents {
 export interface TurnTake {
   audio?: TurnAudio;
   sttModel: string;
-  /** How its activity went, for its `voice.turn` event. */
+  /** How its activity went, for its `voice-mode.turn` event. */
   facts?: TurnFacts;
 }
 
-/** What became of a turn, in its `voice.turn` event. */
+/** What became of a turn, in its `voice-mode.turn` event. */
 export type TurnOutcome = 'sent' | 'discarded' | 'empty' | 'lost' | 'unaddressed';
 
-/** A finished turn's activity, as its `voice.turn` event reports it: never its words. */
+/** A finished turn's activity, as its `voice-mode.turn` event reports it: never its words. */
 export interface TurnFacts {
   segment: number;
   mode: 'handsfree' | 'wake' | 'manual';
@@ -2590,7 +2590,7 @@ export class CallTurns {
       // only a final that ends in `copy` as its own sentence confirms the command.
       const confirmed = matchCommand(heard.final ?? '');
       if (confirmed?.command !== match.command || !confirmed.ownSentence) {
-        this.deps.log.info(`voice.command near-miss word=${commandEnd(text)?.phrase} reason=unconfirmed`);
+        this.deps.log.info(`voice-mode.command near-miss word=${commandEnd(text)?.phrase} reason=unconfirmed`);
         match = null;
       }
     }
@@ -2598,7 +2598,7 @@ export class CallTurns {
     const nominated = turn.kind === 'auto' ? this.pendingCommand(turn) : null;
     // A final that ends in `copy` inside a sentence decided it was words: the interim text cannot overrule that.
     const missed = match ? null : commandEnd(text);
-    if (missed?.missed) this.deps.log.info(`voice.command near-miss word=${missed.phrase} reason=no-boundary`);
+    if (missed?.missed) this.deps.log.info(`voice-mode.command near-miss word=${missed.phrase} reason=no-boundary`);
     if (!match && !missed?.missed && nominated && !nominated.ownSentence && endsLike(text, nominated.rest)) {
       // The final left out the command the interim text ended with: the command stands, and the
       // final is the turn's text. Not `copy`: only a final that has it, as its own sentence, sends it.
@@ -3564,7 +3564,7 @@ async function roomVoice(
   };
 }
 
-/** How long a sent turn's `voice.turn` waits for its reply's first audio; then it goes out without it. */
+/** How long a sent turn's `voice-mode.turn` waits for its reply's first audio; then it goes out without it. */
 export const TURN_EVENT_WAIT_MS = 300_000;
 
 export interface TurnEventFields {
@@ -3581,8 +3581,8 @@ export interface TurnEventFields {
 }
 
 /**
- * The call's three wide events, for the logs: `voice.turn` once per finished turn, `voice.reply` once
- * per spoken line, `voice.call` once at the end, with the counts. Stage timings count from the
+ * The call's three wide events, for the logs: `voice-mode.turn` once per finished turn, `voice-mode.reply` once
+ * per spoken line, `voice-mode.call` once at the end, with the counts. Stage timings count from the
  * caller's speech end; a sent turn's event waits for its reply's first audio (or TURN_EVENT_WAIT_MS,
  * or the call's end). No words of the caller or the agent are in any of them.
  */
@@ -3623,7 +3623,7 @@ export class CallTelemetry {
       this.awaiting.set(turn, { event, speechEndAt, timer });
       return;
     }
-    this.log.info('voice.turn', event);
+    this.log.info('voice-mode.turn', event);
   }
 
   /** The first audio of a reply to `turn` plays. */
@@ -3634,15 +3634,15 @@ export class CallTelemetry {
 
   reply(fields: SpokenLine & { reply: number; kind: 'reply' | 'notice'; turn?: number; part?: number }): void {
     this.lines[fields.outcome]++;
-    this.log.info('voice.reply', fields);
+    this.log.info('voice-mode.reply', fields);
   }
 
-  /** The call is over: turns still waiting for a reply go out without it, then `voice.call`. */
+  /** The call is over: turns still waiting for a reply go out without it, then `voice-mode.call`. */
   ended(reason: string, fields: Record<string, unknown> = {}): void {
     if (this.done) return;
     this.done = true;
     for (const turn of [...this.awaiting.keys()]) this.release(turn);
-    this.log.info('voice.call', {
+    this.log.info('voice-mode.call', {
       reason,
       durationMs: this.now() - this.startedAt,
       turnsSent: this.turns.sent,
@@ -3662,7 +3662,7 @@ export class CallTelemetry {
     if (!held) return;
     this.awaiting.delete(turn);
     clearTimeout(held.timer);
-    this.log.info('voice.turn', { ...held.event, ...(replyMs !== undefined ? { replyMs } : {}) });
+    this.log.info('voice-mode.turn', { ...held.event, ...(replyMs !== undefined ? { replyMs } : {}) });
   }
 }
 

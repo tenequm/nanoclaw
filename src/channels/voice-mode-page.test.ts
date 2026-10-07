@@ -16,7 +16,7 @@ describe('voice call page (generated)', () => {
   });
 
   it('injects the host config where the placeholder sat, defaulting to an empty object', () => {
-    expect(callPageHtml()).toContain('<script>window.__VOICE_UI__={}</script>');
+    expect(callPageHtml()).toContain('<script>window.__VOICE_MODE_UI__={}</script>');
     expect(callPageHtml()).not.toContain('<!--VOICE_MODE_UI_CONFIG-->');
     const html = callPageHtml({ skin: 'te', colorway: 'rabbit', presence: 'bars', brand: 'Casa line' });
     expect(html).toContain('"colorway":"rabbit"');

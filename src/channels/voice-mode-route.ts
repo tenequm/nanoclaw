@@ -117,7 +117,24 @@ export async function routeVoiceModeTurn(
   );
   const threadId = threadsEnabled ? event.threadId : null;
   const callerId = (JSON.parse(event.message.content) as { senderId?: string }).senderId ?? null;
-  await deliverToAgent(wiring, agentGroup, mg, event, callerId, threadsEnabled, threadId, true);
+  let stored = false;
+  await deliverToAgent(
+    wiring,
+    agentGroup,
+    mg,
+    {
+      ...event,
+      onStored: (session) => {
+        stored = true;
+        event.onStored?.(session);
+      },
+    },
+    callerId,
+    threadsEnabled,
+    threadId,
+    true,
+  );
+  if (!stored) return false;
 
   if (onThinking) {
     // Read-only and off the turn's path: the session the router just resolved for this wiring

@@ -12,7 +12,7 @@ binding handles them at the adapter.
 | `/model` | Admin only | Bare `/model` opens a model picker (active model checkmarked). `/model <alias-or-id>` switches directly. |
 | `/config` | Admin only | Bare `/config` opens the config menu (Model / Effort / Compact window / Activation / Restart). `/config set <field> <value>` writes one field. |
 | `/restart` | Admin only | Restarts the agent's running container(s) immediately. |
-| `/voice` | Admin only, line owner | Replies with the sender's own voice call link for the agent and makes this chat (and its thread or topic) where that line's calls talk, until `/voice` is run in another chat of the agent. The operator names each line's owner accounts with `ncl voice-lines set` and `add-owner`. See the add-voice-mode skill. |
+| `/voice`, `/voice new` | Core owner or admin over the agent | Creates a private hashed call link, or moves the caller's existing line to this chat/topic. `new` replaces the link and ends calls using the old one. See the [voice mode skill](../.claude/skills/add-voice-mode/SKILL.md) and [upgrade runbook](2610-07-voice-mode-upgrade.md). |
 
 ## Slack: the `!` prefix
 
@@ -62,14 +62,16 @@ explicit alert, never silently ignored.
 
 For `/status`, the member gate uses `canAccessAgentGroup`. Unknown senders (no
 `users` row) are dropped silently, mirroring how the router treats their normal
-messages; known non-members get an explicit refusal. `/voice` uses the same
-tri-state with an admin check on top (`voiceAccess`): it hands out a voice
-line's call link, which is a credential, so it acts only on the lines that
-list the sender among their owner accounts (`voice_line_owners`; one person's
-Telegram and Slack users can both own a line). Its reply goes to the
-invoking chat only, straight through the chat's adapter (never a session's
-outbound DB), with link previews and unfurls off; a Telegram reply quoting it
-reaches the agent with the link redacted, and the host logs never carry it.
+messages; known non-members get an explicit refusal. The installed voice-mode
+adapter checks core owner/admin roles on `/voice`, and rechecks access before
+every call turn. Only the current caller can move a line with plain `/voice`;
+another authorized admin must deliberately use `/voice new` to replace it.
+New tokens are stored only as hashes and returned once. A group invocation
+first resolves a private DM before minting, so a failed DM leaves the old line
+untouched. Replies bypass the agent session and disable previews/unfurls.
+Existing env-backed main lines keep their original owner-account checks and
+saved links until an explicit replacement; plain `/voice` only moves their
+chat binding. See the [upgrade runbook](2610-07-voice-mode-upgrade.md).
 
 The pressing user is authoritative on a menu tap: the handler re-checks the
 tapper's privilege, NOT the original requester's. Someone who opened a picker
@@ -234,7 +236,8 @@ messaging-group wirings and emits a grant list:
 Grants are per chat, never per topic (Telegram command scopes cannot target a
 forum topic), so multiple topics that share one chat id are folded together and
 their wired-agent admin sets are unioned. `/voice` is added to a chat's grants
-only when one of its agents has a voice line.
+when the voice-mode adapter is installed, so an authorized caller can create
+a first line. Without it, the legacy fallback requires an existing voice line.
 
 ### Startup scope janitor
 
@@ -278,8 +281,10 @@ sorted order.
   (`/model`, `/config`, `/restart`) refuse politely with a hint to run the
   command in the agent's own topic or use `ncl` from the host.
 - **`/voice`** (both paths) acts like `/status`: for every agent of the chat
-  that the sender administers, the sender's own voice line(s) of it get the
-  chat as their call chat, and the reply lists each agent's link.
+  that the sender administers, it creates or moves the caller's line to this
+  chat/topic. New links are delivered privately; existing hashed links cannot
+  be recovered from storage. `/voice new` deliberately replaces those links.
+  Legacy env-backed lines keep their saved links on a plain invocation.
 
 ## Troubleshooting
 

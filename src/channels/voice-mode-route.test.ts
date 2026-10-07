@@ -128,6 +128,17 @@ describe('routeVoiceModeTurn', () => {
       expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
     });
 
+    it('does not acknowledge a turn consumed by the core command gate', async () => {
+      const event = turn();
+      event.message.content = JSON.stringify({ text: '/status', senderId: 'voice-mode:abc' });
+      event.onStored = vi.fn();
+      const onThinking = vi.fn();
+      expect(await routeVoiceModeTurn(event, 'ag-1', onThinking)).toBe(false);
+      expect(event.onStored).not.toHaveBeenCalled();
+      expect(onThinking).not.toHaveBeenCalled();
+      expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
+    });
+
     it("tells core's session-created hooks about the session a first turn creates, once", async () => {
       await routeVoiceModeTurn(turn(), 'ag-1');
       const [session] = await getSessionsByAgentGroup('ag-1');

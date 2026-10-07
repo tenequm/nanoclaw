@@ -1,5 +1,5 @@
 {
-  "notes": "Conformance fixtures for scripts/skill-conformance.test.ts — shaped fake values only, never real credentials. One scenario: the LiveKit and Gemini prompts, the public URL, the agent and the caller. Exec stubs answer the three captures: `openssl rand -hex 16` mints the link token, the node `createHash` one-liner derives the line id, and the `ncl groups list` jq `join(\", \")` lists the agent groups; the restart and the two ncl wiring runs need no stdout.",
+  "notes": "Synthetic configuration prompts only. /voice creates links through core roles after install; no token captures, caller fixtures or wiring scripts.",
   "scenarios": [
     {
       "name": "default",
@@ -8,24 +8,8 @@
         "livekit_api_key": "APIFAKEFAKE",
         "livekit_api_secret": "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE",
         "gemini_api_key": "FAKE-gemini-key-0000000000000000",
-        "public_url": "http://localhost:3000",
-        "agent_folder": "main",
-        "caller_name": "Ethan"
-      },
-      "exec": [
-        {
-          "match": "openssl rand -hex 16",
-          "stdout": "0123456789abcdef0123456789abcdef"
-        },
-        {
-          "match": "createHash('sha256')",
-          "stdout": "5fdb6c84438e"
-        },
-        {
-          "match": "join(\", \")",
-          "stdout": "main (Andy)"
-        }
-      ]
+        "public_url": "http://localhost:3100"
+      }
     }
   ]
 }

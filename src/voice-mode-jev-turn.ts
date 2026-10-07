@@ -339,7 +339,7 @@ export class JevTurnShadow implements TurnShadowSink {
       firstWouldSendMsBeforeEnd: first ? end - first.at : undefined,
       falseWouldSends: turn.judged.filter((j) => j.wouldSend && j.grew).length,
     };
-    this.deps.log(line('voice.turn-end jev outcome', fields), { jevTurn: 'outcome', ...fields });
+    this.deps.log(line('voice-mode.turn-end jev outcome', fields), { jevTurn: 'outcome', ...fields });
   }
 
   private fire(turn: ShadowTurn): void {
@@ -413,11 +413,11 @@ export class JevTurnShadow implements TurnShadowSink {
       err: result.error,
       ...(late ? { late: true } : {}),
     };
-    this.deps.log(line('voice.turn-end jev shadow', fields), { jevTurn: 'shadow', ...fields });
+    this.deps.log(line('voice-mode.turn-end jev shadow', fields), { jevTurn: 'shadow', ...fields });
   }
 
   private capped(scope: 'call' | 'day' | 'usage', limit: number): void {
     const fields = { call: this.deps.callId, scope, limit };
-    this.deps.log(line('voice.turn-end jev capped', fields), { jevTurn: 'capped', ...fields });
+    this.deps.log(line('voice-mode.turn-end jev capped', fields), { jevTurn: 'capped', ...fields });
   }
 }

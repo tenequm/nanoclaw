@@ -41,7 +41,7 @@ transcript text: the lines carry counts only.
 One per judgement:
 
 ```
-voice.turn-end jev shadow call=<id> turn=<n> words=<count> pauseMs=<n> finished=<0..1|-> trailing=<0..1|-> wouldSend=<bool> ms=<latency> err=<reason|->
+voice-mode.turn-end jev shadow call=<id> turn=<n> words=<count> pauseMs=<n> finished=<0..1|-> trailing=<0..1|-> wouldSend=<bool> ms=<latency> err=<reason|->
 ```
 
 `late=true` is appended when the answer came after the turn had already ended
@@ -50,7 +50,7 @@ voice.turn-end jev shadow call=<id> turn=<n> words=<count> pauseMs=<n> finished=
 One per turn the shadow watched, when it ends:
 
 ```
-voice.turn-end jev outcome call=<id> turn=<n> endedBy=<why> words=<count> judgements=<n> firstWouldSendMsBeforeEnd=<n|-> falseWouldSends=<n>
+voice-mode.turn-end jev outcome call=<id> turn=<n> endedBy=<why> words=<count> judgements=<n> firstWouldSendMsBeforeEnd=<n|-> falseWouldSends=<n>
 ```
 
 `endedBy` is `send-word`, `pause` (closing silence), `discard`, `timeout` (wake
@@ -61,7 +61,7 @@ more words before the turn ended. A spoken command that turns out to be words
 ends one activity (`endedBy=send-word` or `discard`) and its continuation is
 logged as the next `turn`.
 
-When a cap is reached: `voice.turn-end jev capped call=<id> scope=call|day limit=<n>`, once per call.
+When a cap is reached: `voice-mode.turn-end jev capped call=<id> scope=call|day limit=<n>`, once per call.
 `scope=usage` (also once per call) means the daily count could not be kept -
 another process held it, or the usage file was torn or unwritable - so that
 judgment was skipped rather than left uncounted.
@@ -101,11 +101,11 @@ is set, or every judgement logs `err=no_key`.
 
 ## Evaluating
 
-Grep the voice worker's log for `voice.turn-end jev`; with the skill's systemd
+Grep the voice worker's log for `voice-mode.turn-end jev`; with the skill's systemd
 user unit:
 
 ```bash
-journalctl --user -u nanoclaw-voice-mode-worker --since today | grep 'voice.turn-end jev'
+journalctl --user -u nanoclaw-voice-mode-worker -n 100 | rg 'voice-mode.turn-end jev'
 ```
 
 What to read off the outcome lines, per `endedBy`:

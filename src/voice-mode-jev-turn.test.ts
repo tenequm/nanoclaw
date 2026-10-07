@@ -208,8 +208,8 @@ function shadowHarness(o: { config?: Partial<JevTurnConfig>; daily?: DailyTake; 
       await vi.advanceTimersByTimeAsync(0);
     },
     wait: (ms: number) => vi.advanceTimersByTimeAsync(ms),
-    shadowLines: () => lines.filter((l) => l.startsWith('voice.turn-end jev shadow')),
-    outcome: () => lines.find((l) => l.startsWith('voice.turn-end jev outcome')),
+    shadowLines: () => lines.filter((l) => l.startsWith('voice-mode.turn-end jev shadow')),
+    outcome: () => lines.find((l) => l.startsWith('voice-mode.turn-end jev outcome')),
   };
 }
 
@@ -229,7 +229,7 @@ describe('JevTurnShadow trigger', () => {
     await h.wait(5000);
     expect(h.asked).toHaveLength(1);
     expect(h.shadowLines()[0]).toBe(
-      'voice.turn-end jev shadow call=c1 turn=1 words=7 pauseMs=1200 finished=0.90 trailing=0.10 wouldSend=true ms=50 err=-',
+      'voice-mode.turn-end jev shadow call=c1 turn=1 words=7 pauseMs=1200 finished=0.90 trailing=0.10 wouldSend=true ms=50 err=-',
     );
   });
 
@@ -267,21 +267,21 @@ describe('JevTurnShadow trigger', () => {
     h.shadow.interim(1, 'book a table for two please');
     await h.wait(1200);
     expect(h.asked).toHaveLength(1);
-    expect(h.lines.filter((l) => l.startsWith('voice.turn-end jev capped'))).toEqual([
-      'voice.turn-end jev capped call=c1 scope=call limit=1',
+    expect(h.lines.filter((l) => l.startsWith('voice-mode.turn-end jev capped'))).toEqual([
+      'voice-mode.turn-end jev capped call=c1 scope=call limit=1',
     ]);
     const day = shadowHarness({ daily: 'capped' });
     day.shadow.interim(1, 'book a table');
     await day.wait(1200);
     expect(day.asked).toEqual([]);
-    expect(day.lines).toEqual(['voice.turn-end jev capped call=c1 scope=day limit=1000']);
+    expect(day.lines).toEqual(['voice-mode.turn-end jev capped call=c1 scope=day limit=1000']);
     const unaccounted = shadowHarness({ daily: 'failed' });
     unaccounted.shadow.interim(1, 'book a table');
     await unaccounted.wait(1200);
     unaccounted.shadow.interim(1, 'book a table for two');
     await unaccounted.wait(1200);
     expect(unaccounted.asked).toEqual([]);
-    expect(unaccounted.lines).toEqual(['voice.turn-end jev capped call=c1 scope=usage limit=1000']);
+    expect(unaccounted.lines).toEqual(['voice-mode.turn-end jev capped call=c1 scope=usage limit=1000']);
   });
 
   it('never logs the words', async () => {
@@ -304,7 +304,7 @@ describe('JevTurnShadow outcome', () => {
     await h.wait(600);
     h.shadow.ended(3, 'send');
     expect(h.outcome()).toBe(
-      'voice.turn-end jev outcome call=c1 turn=3 endedBy=send-word words=5 judgements=2 firstWouldSendMsBeforeEnd=1800 falseWouldSends=1',
+      'voice-mode.turn-end jev outcome call=c1 turn=3 endedBy=send-word words=5 judgements=2 firstWouldSendMsBeforeEnd=1800 falseWouldSends=1',
     );
   });
 
@@ -314,7 +314,7 @@ describe('JevTurnShadow outcome', () => {
     await h.wait(1200);
     h.shadow.ended(1, 'asleep');
     expect(h.outcome()).toBe(
-      'voice.turn-end jev outcome call=c1 turn=1 endedBy=timeout words=5 judgements=1 firstWouldSendMsBeforeEnd=- falseWouldSends=0',
+      'voice-mode.turn-end jev outcome call=c1 turn=1 endedBy=timeout words=5 judgements=1 firstWouldSendMsBeforeEnd=- falseWouldSends=0',
     );
     const late = shadowHarness();
     late.hold();

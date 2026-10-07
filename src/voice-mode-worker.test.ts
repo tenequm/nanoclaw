@@ -1400,7 +1400,7 @@ describe('reply recordings', () => {
       expect(wav.readUInt32LE(24)).toBe(24_000);
       expect(wav.length - 44).toBe(2 * 24_000);
       expect(fs.statSync(file).mode & 0o777).toBe(0o600);
-      expect(info).toHaveBeenCalledWith('voice.reply', {
+      expect(info).toHaveBeenCalledWith('voice-mode.reply', {
         callId: 'call-1',
         reply: 1,
         kind: 'reply',
@@ -2300,7 +2300,7 @@ describe('CallTurns, hands-free', () => {
     await h.interim('can you copy that');
     expect(h.t.ended).toBe(1);
     expect(h.out.sent).toEqual([]);
-    expect(h.out.logs[0]).toBe('voice.command near-miss word=copy-that reason=no-boundary');
+    expect(h.out.logs[0]).toBe('voice-mode.command near-miss word=copy-that reason=no-boundary');
     await h.pass(SILENCE);
     expect(h.out.sent).toEqual(['Can you copy that?']);
   });
@@ -2501,7 +2501,7 @@ describe('CallTurns, wake', () => {
     await h.interim('copy the file then copy');
     expect(h.t.ended).toBe(1);
     expect(h.out.sent).toEqual([]);
-    expect(h.out.logs).toEqual(['voice.command near-miss word=copy reason=no-boundary']);
+    expect(h.out.logs).toEqual(['voice-mode.command near-miss word=copy reason=no-boundary']);
     expect(h.turns.state.waiting).toBe(false);
     h.t.results.push(heard('Book a table. Copy.', 'Book a table. Copy.'));
     await h.talk(1200);
@@ -2869,7 +2869,7 @@ describe('CallTurns, a command in one interim that settles', () => {
     await h.pass(COMMAND_SETTLE_MS);
     expect(h.t.ended).toBe(1);
     expect(h.out.sent).toEqual([]);
-    expect(h.out.logs).toEqual(['voice.command near-miss word=copy reason=no-boundary']);
+    expect(h.out.logs).toEqual(['voice-mode.command near-miss word=copy reason=no-boundary']);
     expect(h.turns.state.waiting).toBe(false);
   });
 });
@@ -3640,7 +3640,7 @@ describe('wide events', () => {
     expect(info.mock.calls.map(([, f]) => f.turn)).toEqual([2]);
     vi.advanceTimersByTime(4100);
     telemetry.replyStarted(1);
-    expect(info).toHaveBeenLastCalledWith('voice.turn', {
+    expect(info).toHaveBeenLastCalledWith('voice-mode.turn', {
       turn: 1,
       segment: 1,
       mode: 'handsfree',
@@ -3690,7 +3690,7 @@ describe('wide events', () => {
     telemetry.ended('twice');
     const events = info.mock.calls.map(([msg]) => msg);
     // The waiting turn goes out before the call's event, and the call's event goes out once.
-    expect(events.slice(-2)).toEqual(['voice.turn', 'voice.call']);
+    expect(events.slice(-2)).toEqual(['voice-mode.turn', 'voice-mode.call']);
     expect(info.mock.calls.at(-1)?.[1]).toEqual({
       reason: 'caller left',
       durationMs: 2900 + 4100 + TURN_EVENT_WAIT_MS,
@@ -3758,9 +3758,9 @@ describe('wide events', () => {
     host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalled());
     host.emit({ type: 'end', reason: 'caller hung up' });
-    await vi.waitFor(() => expect(info.mock.calls.some(([msg]) => msg === 'voice.call')).toBe(true));
+    await vi.waitFor(() => expect(info.mock.calls.some(([msg]) => msg === 'voice-mode.call')).toBe(true));
     const event = (msg: string) => info.mock.calls.filter(([m]) => m === msg).map(([, f]) => f);
-    expect(event('voice.turn')).toEqual([
+    expect(event('voice-mode.turn')).toEqual([
       expect.objectContaining({
         callId: 'call-1',
         turn: 1,
@@ -3772,7 +3772,7 @@ describe('wide events', () => {
         replyMs: expect.any(Number),
       }),
     ]);
-    expect(event('voice.reply')).toEqual([
+    expect(event('voice-mode.reply')).toEqual([
       {
         callId: 'call-1',
         reply: 1,
@@ -3787,7 +3787,7 @@ describe('wide events', () => {
         rmsDb: -20,
       },
     ]);
-    expect(event('voice.call')).toEqual([
+    expect(event('voice-mode.call')).toEqual([
       expect.objectContaining({
         callId: 'call-1',
         reason: 'host: caller hung up',

@@ -627,3 +627,11 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(['1', '2']).not.toContain(CALL_COMMANDS_VERSION);
   });
 });
+
+it('the page accepts only protocol six, including when pointed at an older host', async () => {
+  const library = (await import(pathToFileURL(path.join(skillDir, 'ui/src/lib/voice-call.ts')).href)) as {
+    matchesClientProtocol(version: unknown): boolean;
+  };
+  expect(library.matchesClientProtocol(6)).toBe(true);
+  for (const version of [undefined, 4, 5, '6', 7]) expect(library.matchesClientProtocol(version)).toBe(false);
+});

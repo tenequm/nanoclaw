@@ -28,6 +28,7 @@ import {
   type VoiceModeCall,
 } from "./voice-call"
 import { DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, captionCommand, reopensMic, infoWakePhrase, isLoneCommand, isReviewSnapshot, lineWords, norm, parseCommandWords, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, workerCommands, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { matchesClientProtocol } from "./voice-call"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -186,6 +187,7 @@ function tokenError(status: number, body: string): CallError {
   const kind = statusErrorKind(status)
   // The host's own words say which limit: the hourly starts or the day's minutes.
   if (status === 429 && said) return new CallError(said, kind)
+  if (status === 409 && said.includes("protocol 6")) return new CallError(UPDATING, "updating")
   if (status === 409) return new CallError("This call attempt is no longer active. Try again.", kind)
   if (status === 502) return new CallError("Could not open the call room. Try again.", kind)
   return new CallError(errorText(status, said), kind)
@@ -966,6 +968,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       const body = await res.text()
       if (!res.ok) throw tokenError(res.status, body)
       const session = JSON.parse(body) as {
+        protocol?: number
         url: string
         token: string
         callId: string
@@ -974,6 +977,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
         limit?: { ms: number; kind: string }
       }
       a.callId = session.callId
+      if (!matchesClientProtocol(session.protocol)) throw new CallError(UPDATING, "updating")
       // Cancelled while the host opened the room: it holds a call for us, so end it.
       if (cancelled()) return endOnServer(a, false)
       if (session.agent) setAgentName(session.agent)

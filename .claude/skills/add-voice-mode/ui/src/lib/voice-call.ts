@@ -195,3 +195,6 @@ export function micErrorKind(err: unknown): ErrorKind | null {
   if (name === "NotFoundError" || name === "OverconstrainedError" || name === "NotReadableError" || name === "NotSupportedError" || name === "AbortError") return "mic"
   return null
 }
+
+export const CLIENT_PROTOCOL_VERSION = 6
+export function matchesClientProtocol(version: unknown): boolean { return version === CLIENT_PROTOCOL_VERSION }

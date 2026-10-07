@@ -1,4 +1,4 @@
-/** Runtime config the host injects as window.__VOICE_UI__ (see VOICE_MODE_UI in SKILL.md). */
+/** Runtime config the host injects as window.__VOICE_MODE_UI__ (see VOICE_MODE_UI in SKILL.md). */
 export interface VoiceModeUiConfig {
   skin?: "te" | "nanoclaw"
   colorway?: "auto" | "ivory" | "field" | "rabbit"
@@ -24,7 +24,7 @@ export const DEFAULTS: Required<VoiceModeUiConfig> = {
 }
 
 export function readConfig(): Required<VoiceModeUiConfig> {
-  const raw = (typeof window !== "undefined" && window.__VOICE_UI__) || {}
+  const raw = (typeof window !== "undefined" && window.__VOICE_MODE_UI__) || {}
   const c = { ...DEFAULTS }
   if (raw.skin === "te" || raw.skin === "nanoclaw") c.skin = raw.skin
   if (raw.colorway === "auto" || raw.colorway === "ivory" || raw.colorway === "field" || raw.colorway === "rabbit") c.colorway = raw.colorway

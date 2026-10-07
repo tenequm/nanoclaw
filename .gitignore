@@ -62,3 +62,5 @@ forks.md
 # Local eval worktrees (never committed)
 .eval-worktrees/
 .worktrees/
+
+.voice-mode-upgrade-backup/

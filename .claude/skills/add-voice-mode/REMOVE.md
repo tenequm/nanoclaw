@@ -1,75 +1,119 @@
 # Remove voice mode
 
-Reverses `/add-voice-mode`. Every step is idempotent — safe to re-run, and safe
-when only partially installed (skip any step whose target is already absent).
+Removal disables calls and invalidates links. Keep a private backup of the
+central DB and `.env` first. Work on this checkout only. Shared LiveKit,
+Gemini credentials, core roles and other integrations stay operator-owned.
+Every removal step tolerates a missing target; do not run it as part of an
+upgrade.
 
-## 1. Delete the barrel import
+## 1. Stop the worker and remove its front
 
-Remove the self-registration line from `src/channels/index.ts` (delete it, do
-not comment it out):
-
-```bash
-sed -i.bak "/^import '\.\/voice\.js';$/d" src/channels/index.ts && rm -f src/channels/index.ts.bak
-```
-
-## 2. Remove the copied files
-
-The adapter, its line resolver, the call page, the LiveKit engine and its
-worker with its wake word models, and their seven tests:
-
-```bash
-rm -f src/channels/voice-mode.ts src/channels/voice-mode-line.ts src/channels/voice-mode-page.ts src/channels/voice-mode-adapter.test.ts src/channels/voice-mode-registration.test.ts src/channels/voice-mode-line.test.ts src/channels/voice-mode-page.test.ts
-rm -f src/channels/voice-mode-livekit.ts src/channels/voice-mode-protocol.ts src/channels/voice-mode-livekit.test.ts src/voice-mode-worker.ts src/voice-mode-worker.test.ts src/voice-mode-gemini-live.ts src/voice-mode-gemini-live.test.ts
-rm -rf src/voice-mode-wakeword.ts src/voice-mode-wakeword.test.ts src/voice-mode-wakeword-fixtures assets/voice-mode-wakeword
-```
-
-If the LiveKit worker runs as a systemd user unit, stop and remove it first:
+Stop a terminal worker with Ctrl-C. Disable the unit this install actually
+uses, including an old `nanoclaw-voice-worker.service` if retained on upgrade.
+For the new Linux unit:
 
 ```bash
 systemctl --user disable --now nanoclaw-voice-mode-worker.service
-rm -f ~/.config/systemd/user/nanoclaw-voice-mode-worker.service && systemctl --user daemon-reload
+rm -f ~/.config/systemd/user/nanoclaw-voice-mode-worker.service
+systemctl --user daemon-reload
 ```
 
-Recorded caller turns (`VOICE_MODE_RECORDINGS_DAYS`) are under
-`data/voice-recordings/`; delete that directory if you do not want to keep them.
-An older worker kept a note of a failed speech model in `data/voice-tts-state.json`; the current one no longer reads or writes it, so delete it if it is there.
-
-## 3. Remove the container skill
-
-`container/skills/` is a read-only mount; the per-group skill symlink and the
-composed `NanoClaw Skill: voice-mode-formatting` section go on each agent's next
-spawn:
+On macOS unload and delete only this install's worker LaunchAgent. Remove
+only this page's reverse-proxy route or Tailscale Serve mount:
 
 ```bash
-rm -rf container/skills/voice-mode-formatting
+tailscale serve --https=443 --set-path=/voice off
+tailscale serve status
 ```
 
-## 4. Remove the environment keys
+Remove the legacy `/webhook/voice` mount only if this install owned it. Keep
+other mounts and a LiveKit service used elsewhere.
 
-`GEMINI_API_KEY` is removed only if nothing else on this install uses it
-(check `.env` for other consumers first):
+## 2. Retire line credentials
+
+With the host DB available:
 
 ```bash
-sed -i.bak '/^VOICE_MODE_[A-Z_]*=/d' .env && rm -f .env.bak
-sed -i.bak '/^LIVEKIT_URL=/d;/^LIVEKIT_WORKER_URL=/d;/^LIVEKIT_API_KEY=/d;/^LIVEKIT_API_SECRET=/d;/^LIVEKIT_AGENT_NAME=/d;/^LIVEKIT_HOST_URL=/d' .env && rm -f .env.bak
-# only if no other consumer:
-# sed -i.bak '/^GEMINI_API_KEY=/d' .env && rm -f .env.bak
+pnpm exec tsx scripts/q.ts data/v2.db "DELETE FROM voice_mode_lines"
 ```
 
-## 5. Rebuild and restart
+A partial install without the table has nothing to retire. The empty table
+and its named migration record stay deliberately: dropping only the table
+would prevent reinstall from recreating it. The legacy `voice_lines` and
+`voice_line_owners` tables belong to the fork and remain; remove its legacy
+`VOICE_LINK_TOKEN`/`VOICE_MODE_LINK_TOKEN` settings to invalidate those links.
+Do not delete chat users, roles, memberships or shared sessions automatically.
+
+## 3. Remove registration and copied files
+
+Delete `import './voice-mode.js';` from `src/channels/index.ts`:
+
+```bash
+sed -i.bak "/^import '\.\/voice-mode\.js';$/d" src/channels/index.ts
+rm -f src/channels/index.ts.bak
+```
+
+Remove these skill-owned files:
+
+```bash
+rm -f src/channels/voice-mode-adapter.test.ts \
+  src/channels/voice-mode-call-session.test.ts \
+  src/channels/voice-mode-command.test.ts \
+  src/channels/voice-mode-command.ts \
+  src/channels/voice-mode-line-roles.test.ts \
+  src/channels/voice-mode-line.test.ts \
+  src/channels/voice-mode-line.ts \
+  src/channels/voice-mode-livekit.test.ts \
+  src/channels/voice-mode-livekit.ts \
+  src/channels/voice-mode-page.test.ts \
+  src/channels/voice-mode-page.ts \
+  src/channels/voice-mode-protocol.ts \
+  src/channels/voice-mode-registration.test.ts \
+  src/channels/voice-mode-review-page.test.ts \
+  src/channels/voice-mode-route.test.ts \
+  src/channels/voice-mode-route.ts \
+  src/channels/voice-mode.ts \
+  src/voice-mode-gemini-live.test.ts \
+  src/voice-mode-gemini-live.ts \
+  src/voice-mode-jev-turn.test.ts \
+  src/voice-mode-jev-turn.ts \
+  src/voice-mode-wakeword.test.ts \
+  src/voice-mode-wakeword.ts \
+  src/voice-mode-worker.test.ts \
+  src/voice-mode-worker.ts \
+  src/db/voice-mode-lines.ts
+rm -rf src/voice-mode-wakeword-fixtures assets/voice-mode-wakeword container/skills/voice-mode-formatting
+```
+
+Keep operator-owned acoustic models and recordings unless explicitly retiring
+that data. Remove `voice-mode-formatting` from explicit group skill lists.
+The old core line admin commands and legacy tables are retained for rollback.
+The native Telegram structural handler and router export are safe without the
+voice adapter and need not be removed.
+
+## 4. Remove dependencies only when unused
+
+For each of `@livekit/agents`, `@livekit/agents-plugin-google`,
+`@livekit/agents-plugin-silero`, `@livekit/rtc-node`, `livekit-server-sdk`,
+`onnxruntime-node` and `zod`, inspect remaining imports with `rg` and consumers
+with `pnpm why <package>`. Use `pnpm remove <package>` only when no remaining
+source or dependency needs it. Do not remove shared packages blindly.
+Remove `scripts.voice-mode-worker` from package.json, or retain it if another
+worker now uses that entry. Preserve all other scripts and lockfile changes.
+
+## 5. Remove configuration and rebuild
+
+Privately back up `.env`. Delete this skill's `VOICE_MODE_*` and legacy
+`VOICE_*` entries. Keep `LIVEKIT_*`, `GEMINI_API_KEY` and `JEV_*` values used
+by other integrations. Do not display the file or its values.
 
 ```bash
 pnpm run build
 bash setup/lib/restart.sh
+rm -f dist/channels/voice-mode*.* dist/voice-mode*.* dist/db/voice-mode-lines.*
 ```
 
-The named voice user, membership, messaging group and wiring are runtime data.
-Remove membership with `ncl members remove --user <voice-id> --group <agent-id>`
-and delete the wiring and messaging group with `ncl wirings delete` and
-`ncl messaging-groups delete` if you no longer want them listed. Retain the
-user record when keeping call history. Before deleting a line's messaging group,
-`ncl voice-lines remove --line voice-mode:<line id>` drops its owners and call chat.
-The LiveKit server and the Gemini key are managed outside NanoClaw.
-The call page keeps each caller's Manual or hands-free pick, wake switches and
-wake phrase in their own browser (`localStorage`); clearing the site's data there
-removes them.
+If older compiled voice files were left by migration, remove only their
+voice-specific counterparts too. Confirm the host still builds and calls no
+longer start. Retire a dedicated LiveKit project/service separately only if
+nothing else uses it. Reinstallation reuses the empty module table safely.
