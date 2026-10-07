@@ -1,8 +1,7 @@
 /**
  * A caller's turn against the real core: the agent's session for the call chat gets the turn as a
  * waking message, and only the line's agent gets it, whoever else is wired to that chat. Core's
- * session-created hooks see a session a turn creates, and core's delivery of the agent's answer
- * reaches the voice channel's post-delivery hook (registered through the real channel barrel).
+ * session-created hooks see a session a turn creates.
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -23,7 +22,6 @@ vi.mock('../config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-voice-route';
 
 import { wakeContainer } from '../container-runner.js';
-import { deliverSessionMessages, setDeliveryAdapter } from '../delivery.js';
 import { registerSessionCreatedHook, type SessionCreatedEvent } from '../router.js';
 import {
   closeDb,
@@ -34,11 +32,11 @@ import {
   runMigrations,
 } from '../db/index.js';
 import { getSessionsByAgentGroup } from '../db/sessions.js';
-import { inboundDbPath, outboundDbPath } from '../mailbox/sqlite/paths.js';
+import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import type { InboundEvent } from './adapter.js';
 import { getHostStartCallbacks } from '../host-lifecycle.js';
-import './index.js'; // the real channel barrel: registers the voice channel and its delivery hook
-import { routeVoiceModeTurn, stopThinkingWatchers } from './voice-mode-route.js';
+import './index.js'; // the real channel barrel: registers the voice channel
+import { routeVoiceModeTurn } from './voice-mode-route.js';
 
 const now = () => new Date().toISOString();
 
@@ -98,7 +96,6 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  stopThinkingWatchers();
   sessionsCreated.length = 0;
   vi.mocked(wakeContainer).mockClear();
   await closeDb();
@@ -132,10 +129,8 @@ describe('routeVoiceModeTurn', () => {
       const event = turn();
       event.message.content = JSON.stringify({ text: '/status', senderId: 'voice-mode:abc' });
       event.onStored = vi.fn();
-      const onThinking = vi.fn();
-      expect(await routeVoiceModeTurn(event, 'ag-1', onThinking)).toBe(false);
+      expect(await routeVoiceModeTurn(event, 'ag-1')).toBe(false);
       expect(event.onStored).not.toHaveBeenCalled();
-      expect(onThinking).not.toHaveBeenCalled();
       expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
     });
 
@@ -160,42 +155,6 @@ describe('routeVoiceModeTurn', () => {
       expect(await routeVoiceModeTurn(turn(), 'ag-unwired')).toBe(false);
       expect(await getSessionsByAgentGroup('ag-1')).toEqual([]);
       expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
-    });
-
-    it('tells the call the agent is thinking while it works, until its answer is delivered', async () => {
-      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
-      try {
-        const onThinking = vi.fn();
-        await routeVoiceModeTurn(turn(), 'ag-1', onThinking);
-        // The watcher starts off the turn's path, once the session is looked up.
-        for (let i = 0; i < 50 && onThinking.mock.calls.length === 0; i++) await new Promise(setImmediate);
-        expect(onThinking).toHaveBeenCalledTimes(1);
-        vi.advanceTimersByTime(4_000);
-        expect(onThinking).toHaveBeenCalledTimes(2);
-        // The agent's answer, delivered by core's own delivery poll.
-        const [session] = await getSessionsByAgentGroup('ag-1');
-        const out = new Database(outboundDbPath('ag-1', session.id));
-        out
-          .prepare(
-            `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
-             VALUES ('out-1', datetime('now'), 'chat', 'chat:G1', 'chat', ?)`,
-          )
-          .run(JSON.stringify({ text: 'Booked for eight.' }));
-        out.close();
-        const sent: string[] = [];
-        setDeliveryAdapter({
-          async deliver(_channelType, _platformId, _threadId, _kind, content) {
-            sent.push(content);
-            return 'plat-1';
-          },
-        });
-        await deliverSessionMessages(session);
-        expect(sent).toHaveLength(1);
-        vi.advanceTimersByTime(8_000);
-        expect(onThinking).toHaveBeenCalledTimes(2);
-      } finally {
-        vi.useRealTimers();
-      }
     });
   });
 });

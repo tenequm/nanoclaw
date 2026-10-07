@@ -68,7 +68,6 @@ import {
   getMessagingGroupByPlatform,
   getMessagingGroupsByAgentGroup,
 } from '../db/messaging-groups.js';
-import { stopThinking } from './voice-mode-route.js';
 import { getVoiceModeLine } from '../db/voice-mode-lines.js';
 import { getVoiceLine, getVoiceLineOwners } from '../db/voice-lines.js';
 import { registerPostDeliveryHook, setOutboundPresentation, type OutboundAddress } from '../delivery.js';
@@ -468,10 +467,7 @@ export function liveKitChatTyping(chat: ChatAddress, agentGroupId: string, worki
   for (const engine of engines) engine.chatTyping(chat, agentGroupId, working);
 }
 
-registerPostDeliveryHook((msg, session) => {
-  if (spokenText(msg)) stopThinking(session.id);
-  liveKitChatDelivered(msg, session.agent_group_id);
-});
+registerPostDeliveryHook((msg, session) => liveKitChatDelivered(msg, session.agent_group_id));
 setOutboundPresentation((msg, content, session) => liveKitChatPresentation(msg, content, session.agent_group_id));
 registerTypingObserver(({ agentGroupId, working, ...chat }) => liveKitChatTyping(chat, agentGroupId, working));
 
