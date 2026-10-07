@@ -75,6 +75,7 @@ import {
   CALL_CAPTION_WORDS_ATTRIBUTE,
   CALL_COMMAND_WORDS,
   CALL_COMMAND_WORDS_ATTRIBUTE,
+  CALL_PROTOCOL_ATTRIBUTE,
   CALL_COMMANDS_ATTRIBUTE,
   CALL_COMMANDS_VERSION,
   CALL_CUE_TRACK,
@@ -104,6 +105,7 @@ import {
   type TurnMode,
 } from './channels/voice-mode-protocol.js';
 import { DATA_DIR } from './config.js';
+import { voiceModeEnv, voiceModeEnvKeys } from './channels/voice-mode-protocol.js';
 import { readEnvFile } from './env.js';
 import { GeminiLiveTranscriber, type Heard, type TranscriberOptions } from './voice-mode-gemini-live.js';
 import { JevTurnShadow, type TurnShadowSink } from './voice-mode-jev-turn.js';
@@ -188,7 +190,7 @@ export class HostLink {
   ) {}
 
   private url(path: string): string {
-    return `${this.link.hostUrl}/webhook/voice/livekit/agent/${path}`;
+    return `${this.link.hostUrl}/webhook/voice-mode/livekit/agent/${path}`;
   }
 
   post(path: 'joined' | 'utterance' | 'ended', body: Record<string, unknown> = {}): Promise<Response> {
@@ -3132,7 +3134,7 @@ export function wakeWordSettings(
 /** Settings from the working directory's .env; WEBHOOK_PORT from the environment wins, as on the host. */
 function workerEnv(keys: string[]): Record<string, string | undefined> {
   return {
-    ...readEnvFile([...keys, 'WEBHOOK_PORT']),
+    ...voiceModeEnv(readEnvFile(voiceModeEnvKeys([...keys, 'WEBHOOK_PORT'])), (message) => console.warn(message)),
     ...(process.env.WEBHOOK_PORT ? { WEBHOOK_PORT: process.env.WEBHOOK_PORT } : {}),
   };
 }
@@ -3531,6 +3533,7 @@ async function roomVoice(
         post('the agent state and the review attributes', () =>
           local.setAttributes({
             [AGENT_STATE_ATTRIBUTE]: 'listening',
+            [CALL_PROTOCOL_ATTRIBUTE]: String(LIVEKIT_PROTOCOL_VERSION),
             [CALL_REVIEW_ATTRIBUTE]: '1',
             [CALL_COMMANDS_ATTRIBUTE]: CALL_COMMANDS_VERSION,
             [CALL_COMMAND_WORDS_ATTRIBUTE]: COMMAND_WORDS_JSON,
@@ -4010,7 +4013,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     // The names (the host trimmed, deduplicated and capped them) and the commands, which the
     // transcription does not hear reliably unless they are in its vocabulary.
     vocabulary: [...new Set([...(meta.vocabulary ?? []), ...COMMAND_VOCABULARY])],
-    languageCodes: STT_LANGUAGE_CODES,
+    languageCodes: meta.languages?.length ? meta.languages : STT_LANGUAGE_CODES,
     sampleRate: INPUT_SAMPLE_RATE,
     onInterim: (text) => callTurns.onInterim(text),
     log: callLog,

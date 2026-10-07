@@ -56,6 +56,7 @@ import {
   liveKitCallSecret,
   MAX_TURN_TEXT_BYTES,
   PING_INTERVAL_MS,
+  parseVoiceLanguages,
   WORKER_REQUEST_TIMEOUT_MS,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
@@ -198,6 +199,7 @@ export interface SpeechSettings {
 }
 
 export interface LiveKitVoiceConfig {
+  languages?: readonly string[];
   /** Signaling URL the caller's browser connects to (LIVEKIT_URL). */
   url: string;
   /** Server-side URL for the host's API calls (LIVEKIT_WORKER_URL); defaults to `url`. */
@@ -369,7 +371,7 @@ const defaultMirrorApi: MirrorApi = {
       const group = current.messaging_group_id && (await getMessagingGroup(current.messaging_group_id));
       return group ? { group, threadId: current.thread_id, ownerIds: [current.owner_user_id] } : null;
     }
-    const line = await getMessagingGroupByPlatform('voice-mode', lineId);
+    const line = await getMessagingGroupByPlatform(lineId.startsWith('voice:') ? 'voice' : 'voice-mode', lineId);
     const row = line && (await getVoiceLine(line.id));
     const group = row?.target_messaging_group_id && (await getMessagingGroup(row.target_messaging_group_id));
     if (!row || !group) return null;
@@ -506,6 +508,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const model = (raw ?? fallback).trim();
     return /^(off|none)$/i.test(model) ? '' : model;
   };
+  const languages = parseVoiceLanguages(config.languages?.join(','));
+  const languageNote =
+    languages.join(',') === 'uk-UA,en-US'
+      ? CALL_LANGUAGE_NOTE
+      : `The caller speaks ${languages.join(', ')}; answer in the language they spoke.${languages.some((code) => code.toLowerCase().startsWith('uk')) ? ' A transcript that looks Russian is Ukrainian misspelled by speech recognition; answer in Ukrainian, never Russian.' : ''}`;
   const speech = {
     sttModel: config.speech?.sttModel || DEFAULT_VOICE_STT_MODEL,
     // Deprecated: no default, and a worker that is still sent one logs that it ignores it.
@@ -821,7 +828,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       callId,
       platformId,
       line,
-      roomName: `voice-${platformId.replace(/^voice-mode:/, '')}-${randomBytes(6).toString('hex')}`,
+      roomName: `voice-${platformId.replace(/^voice(?:-mode)?:/, '')}-${randomBytes(6).toString('hex')}`,
       secret: liveKitCallSecret(config.apiSecret, callId),
       callerIdentity: `caller-${callId.slice(0, 8)}`,
       state: 'connecting',
@@ -849,6 +856,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       callerName: line.caller.name,
       callerIdentity: call.callerIdentity,
       vocabulary: [...(line.agent.vocabulary ?? [])],
+      languages,
       ...(line.agent.wakeNames?.length ? { wakeNames: [...line.agent.wakeNames] } : {}),
       ...speech,
       maxDurationMs: capMs,
@@ -915,6 +923,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       res,
       200,
       JSON.stringify({
+        protocol: LIVEKIT_PROTOCOL_VERSION,
         url: config.url,
         token,
         callId,
@@ -938,7 +947,14 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
           // Addressed to the line's agent only, whoever else is wired to the chat and whatever its trigger.
           agentGroupId: call.line.agentGroupId,
         }
-      : { channelType: 'voice-mode', instance: 'voice-mode', platformId: call.platformId, threadId: null };
+      : {
+          channelType: call.platformId.startsWith('voice:') ? 'voice' : 'voice-mode',
+          instance: call.platformId.startsWith('voice:') ? 'voice' : 'voice-mode',
+          platformId: call.platformId,
+          threadId: null,
+          agentGroupId: call.line.agentGroupId,
+          replyTo: { channelType: 'voice-mode', platformId: call.platformId, threadId: null },
+        };
 
   /** The worker saw the caller join: start the clock and the duration / budget cap. */
   const onJoined = (res: http.ServerResponse, call: LiveKitCall): void => {
@@ -1063,7 +1079,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         id: liveKitUtteranceMessageId(call.callId, utteranceId),
         kind: 'chat',
         content: JSON.stringify({
-          text: turnMessageText(text, chat ? CALL_CHAT_REPLY_NOTE : CALL_REPLY_NOTE),
+          text: turnMessageText(
+            text,
+            (chat ? CALL_CHAT_REPLY_NOTE : CALL_REPLY_NOTE).replace(CALL_LANGUAGE_NOTE, languageNote),
+          ),
           sender: sender.name,
           senderId: sender.id,
           livekit: { callId: call.callId, utteranceId },
@@ -1190,7 +1209,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       const token = url.searchParams.get('t') ?? '';
       const platformId = await lineForToken(token);
       if (!platformId) return reply(res, 403, 'Unknown call link');
-      if (route === 'livekit/token') return startCall(res, platformId);
+      if (route === 'livekit/token') {
+        if (url.searchParams.get('v') !== String(LIVEKIT_PROTOCOL_VERSION))
+          return reply(res, 409, 'The voice service is updating. Reload the page or update your client to protocol 6.');
+        return startCall(res, platformId);
+      }
       if (route === 'livekit/end') {
         const body = await readJson(req);
         const call = calls.get(platformId);

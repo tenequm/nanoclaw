@@ -122,3 +122,11 @@ export async function mintVoiceModeLine(target: {
   if (!line) throw new Error('voice-mode: the line was not stored');
   return { line, token };
 }
+
+export async function getLegacyVoiceModeLinesForAgent(agentGroupId: string): Promise<{ id: string }[]> {
+  return getDb().all<{ id: string }>(
+    `SELECT m.id FROM messaging_groups m JOIN messaging_group_agents w ON w.messaging_group_id = m.id
+     WHERE m.channel_type = 'voice' AND m.is_group = 0 AND m.denied_at IS NULL AND w.agent_group_id = ?`,
+    agentGroupId,
+  );
+}

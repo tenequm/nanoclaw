@@ -581,7 +581,7 @@ describe('HostLink', () => {
     const link = new HostLink({ hostUrl: 'http://127.0.0.1:3001', secret: 's3cret', callId: 'c1' }, fetchImpl);
     const events: unknown[] = [];
     await link.events((e) => events.push(e), new AbortController().signal);
-    expect(fetchImpl.mock.calls[0][0]).toBe('http://127.0.0.1:3001/webhook/voice/livekit/agent/events?call=c1');
+    expect(fetchImpl.mock.calls[0][0]).toBe('http://127.0.0.1:3001/webhook/voice-mode/livekit/agent/events?call=c1');
     expect(events).toEqual([{ type: 'reply', text: 'hi' }, { type: 'ping' }, { type: 'end', reason: 'hangup' }]);
   });
 });
@@ -853,7 +853,7 @@ describe('runCall', () => {
     // The host address and secret come from the worker's settings, never from the dispatch.
     const secret = liveKitCallSecret('lk-secret', 'call-1');
     for (const call of host.calls) {
-      expect(call.url.startsWith('http://127.0.0.1:3555/webhook/voice/livekit/agent/')).toBe(true);
+      expect(call.url.startsWith('http://127.0.0.1:3555/webhook/voice-mode/livekit/agent/')).toBe(true);
       expect(call.auth).toBe(`Bearer ${secret}`);
     }
 
@@ -1250,7 +1250,7 @@ describe('runCall', () => {
     expect(d.markUpdating).toHaveBeenCalledWith(ctx);
     expect(v.createVoice).not.toHaveBeenCalled();
     expect(host.calls.at(-1)).toMatchObject({
-      url: 'http://127.0.0.1:3555/webhook/voice/livekit/agent/ended',
+      url: 'http://127.0.0.1:3555/webhook/voice-mode/livekit/agent/ended',
       body: { callId: 'call-1', reason: `protocol mismatch: host sent v2, worker speaks v${LIVEKIT_PROTOCOL_VERSION}` },
     });
     expect(job.shutdown).toHaveBeenCalled();
@@ -1358,7 +1358,7 @@ describe('runCall', () => {
     const onShutdown = job.addShutdownCallback.mock.calls[0][0] as () => Promise<void>;
     await onShutdown();
     expect(host.calls.at(-1)).toMatchObject({
-      url: 'http://127.0.0.1:3555/webhook/voice/livekit/agent/ended',
+      url: 'http://127.0.0.1:3555/webhook/voice-mode/livekit/agent/ended',
       body: { callId: 'call-1', reason: 'job shutdown', restart: true },
     });
     expect(job.shutdown).toHaveBeenCalledWith('job shutdown');

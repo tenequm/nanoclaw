@@ -5,6 +5,11 @@
  * knows by hash.
  */
 import fs from 'fs';
+import { Bot } from 'grammy';
+import { Effect } from 'effect';
+import { buildCommandGroup } from './telegram-grammy/commands/command-group.js';
+import type { AdapterRuntime } from './telegram-grammy/runtime.js';
+import type { CommandMenus } from './telegram-grammy/commands/menus.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../log.js', () => ({
@@ -30,6 +35,8 @@ import { addMember } from '../modules/permissions/db/agent-group-members.js';
 import { grantRole } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { getSessionsByAgentGroup } from '../db/sessions.js';
+import { getVoiceLine } from '../db/voice-lines.js';
+import { resolveVoiceModeLine } from './voice-mode-line.js';
 import { routeInbound } from '../router.js';
 import type { MessagingGroup } from '../types.js';
 import {
@@ -429,4 +436,122 @@ describe('handleVoiceCommand (the interceptor)', () => {
     await handleVoiceCommand(event('/voice', OWNER, 'chat:C1', 'chat:C1:99'), callUrl);
     expect((await lines())[0]).toMatchObject({ messaging_group_id: 'mg-chan', thread_id: null });
   });
+});
+
+it('moves a saved main line without minting, and only /voice new retires its link', async () => {
+  const id = 'voice:legacy';
+  await upsertUser({ id, kind: 'voice', display_name: 'Caller', created_at: now() });
+  await addMember({ user_id: id, agent_group_id: 'ag-1', added_by: null, added_at: now() });
+  await createMessagingGroup({
+    id: 'legacy-mg',
+    channel_type: 'voice',
+    platform_id: id,
+    name: null,
+    is_group: 0,
+    unknown_sender_policy: 'strict',
+    created_at: now(),
+  });
+  await wire('legacy-mg', 'ag-1');
+  await getDb().run(
+    "UPDATE messaging_group_agents SET sender_scope = 'known' WHERE messaging_group_id = ?",
+    'legacy-mg',
+  );
+  await getDb().run('INSERT INTO voice_lines (line_messaging_group_id, updated_at) VALUES (?, ?)', 'legacy-mg', now());
+  await getDb().run(
+    'INSERT INTO voice_line_owners (line_messaging_group_id, owner_user_id) VALUES (?, ?)',
+    'legacy-mg',
+    OWNER,
+  );
+  expect(await resolveVoiceModeLine(id)).not.toBeNull();
+  expect(await runVoiceCommand(mg('mg-other'), null, OWNER, callUrl)).toMatchObject({ results: [{ rebound: true }] });
+  expect(await lines()).toEqual([]);
+  expect((await getVoiceLine('legacy-mg'))?.target_messaging_group_id).toBe('mg-other');
+  expect(await runVoiceCommand(mg('mg-dm'), null, SCOPED_ADMIN, callUrl)).toMatchObject({
+    results: [{ reason: 'other-caller' }],
+  });
+  expect(await resolveVoiceModeLine(id)).not.toBeNull();
+  expect(await runVoiceCommand(mg('mg-dm'), null, OWNER, callUrl, true)).toMatchObject({
+    results: [{ replaced: true }],
+  });
+  expect(await resolveVoiceModeLine(id)).toBeNull();
+});
+
+it('native Telegram /voice and /voice new use the same line handler as the router', async () => {
+  const actor = 'telegram:1';
+  await upsertUser({ id: actor, kind: 'telegram', display_name: 'Caller', created_at: now() });
+  await grantRole({ user_id: actor, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+  await createMessagingGroup({
+    id: 'native-mg',
+    channel_type: 'telegram',
+    platform_id: actor,
+    is_group: 0,
+    name: null,
+    unknown_sender_policy: 'strict',
+    created_at: now(),
+  });
+  await wire('native-mg', 'ag-1');
+  const delivered: OutboundMessage[] = [];
+  const adapter = (name: string): ChannelAdapter => ({
+    name,
+    channelType: name,
+    supportsThreads: false,
+    setup: async () => {},
+    teardown: async () => {},
+    isConnected: () => true,
+    deliver: async (_id, _thread, message) => {
+      delivered.push(message);
+      return undefined;
+    },
+  });
+  registerChannelAdapter('telegram', { factory: () => adapter('telegram') });
+  registerChannelAdapter('voice-mode', {
+    factory: () => ({
+      ...adapter('voice-mode'),
+      handleVoiceCommand: (event: InboundEvent) => handleVoiceCommand(event, callUrl),
+    }),
+  });
+  await initChannelAdapters(() => ({
+    onInboundEvent: () => {},
+    onInbound: () => {},
+    onMetadata: () => {},
+    onAction: () => {},
+  }));
+  const bot = new Bot('1:fixture');
+  bot.botInfo = {
+    id: 9,
+    is_bot: true,
+    first_name: 'Fixture',
+    username: 'fixture_bot',
+    can_join_groups: true,
+    can_read_all_group_messages: true,
+    supports_inline_queries: false,
+    can_connect_to_business: false,
+    has_main_web_app: false,
+    has_topics_enabled: false,
+    allows_users_to_create_topics: false,
+    can_manage_bots: false,
+    supports_join_request_queries: false,
+  };
+  bot.use(buildCommandGroup({ runPromise: Effect.runPromise } as unknown as AdapterRuntime, {} as CommandMenus));
+  const send = (text: string, id: number) =>
+    bot.handleUpdate({
+      update_id: id,
+      message: {
+        message_id: id,
+        date: 1,
+        chat: { id: 1, type: 'private', first_name: 'Caller' },
+        from: { id: 1, is_bot: false, first_name: 'Caller' },
+        text,
+        entities: [{ type: 'bot_command', offset: 0, length: 6 }],
+      },
+    });
+  await send('/voice', 1);
+  expect(delivered).toHaveLength(1);
+  expect(JSON.stringify(delivered[0])).toContain('/voice?t=');
+  const [first] = await lines();
+  await send('/voice', 2);
+  expect((await lines())[0].token_hash).toBe(first.token_hash);
+  await send('/voice new', 3);
+  expect((await lines())[0].token_hash).not.toBe(first.token_hash);
+  expect(await getSessionsByAgentGroup('ag-1')).toEqual([]);
 });

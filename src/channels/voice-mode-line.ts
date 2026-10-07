@@ -7,7 +7,7 @@
 import path from 'node:path';
 
 import { GROUPS_DIR } from '../config.js';
-import { getVoiceModeLine } from '../db/voice-mode-lines.js';
+import { getVoiceModeLine, getVoiceModeLineForAgent } from '../db/voice-mode-lines.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
@@ -113,12 +113,14 @@ export async function resolveVoiceModeLine(
       };
     }
     const caller = await getUser(platformId);
-    if (!caller || caller.kind !== 'voice-mode' || !caller.display_name?.trim()) return null;
-    const mg = await getMessagingGroupByPlatform('voice-mode', platformId, instance);
+    const legacyChannel = platformId.startsWith('voice:') ? 'voice' : 'voice-mode';
+    if (!caller || caller.kind !== legacyChannel || !caller.display_name?.trim()) return null;
+    const mg = await getMessagingGroupByPlatform(legacyChannel, platformId, instance);
     if (!mg || mg.is_group || mg.unknown_sender_policy !== 'strict') return null;
     const wirings = await getMessagingGroupAgents(mg.id);
     if (wirings.length !== 1 || wirings[0].sender_scope !== 'known') return null;
     const groupId = wirings[0].agent_group_id;
+    if (legacyChannel === 'voice' && (await getVoiceModeLineForAgent(groupId))) return null;
     if (!(await canAccessAgentGroup(caller.id, groupId)).allowed) return null;
     const group = await getAgentGroup(groupId);
     if (!group) return null;

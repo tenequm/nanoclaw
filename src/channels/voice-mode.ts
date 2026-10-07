@@ -26,7 +26,14 @@ import { getChannelAdapter, getChannelDefaults, registerChannelAdapter } from '.
 import type { VoiceModeUiConfig } from './voice-mode-page.js';
 import { resolveVoiceModeLine, type ResolveLineOptions, type VoiceModeLine } from './voice-mode-line.js';
 import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
-import { DEFAULT_VOICE_MIRROR, wakePhrase } from './voice-mode-protocol.js';
+import {
+  DEFAULT_VOICE_MIRROR,
+  LIVEKIT_PROTOCOL_VERSION,
+  wakePhrase,
+  voiceModeEnv,
+  voiceModeEnvKeys,
+  parseVoiceLanguages,
+} from './voice-mode-protocol.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
@@ -128,7 +135,7 @@ export function admitsVoiceModePeer(
 
 /** Browser routes under the short /voice prefix a reverse proxy forwards; the bare prefix is the call page. */
 const CLEAN_PREFIX_ROUTES = new Set(['info', 'livekit', 'livekit/token', 'livekit/end']);
-const LEGACY_PREFIX = /^\/webhook\/voice(?:\/|$)/;
+const LEGACY_PREFIX = /^\/webhook\/voice(?:-mode)?(?:\/|$)/;
 const CLEAN_PREFIX = /^\/voice(?:\/|$)/;
 
 /**
@@ -250,7 +257,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     config.lineForToken ??
     (async (token: string) => {
       const line = await findVoiceModeLineByToken(token);
-      return line ? `voice-mode:${line.line_id}` : tokens.has(token) ? lineIdForToken(token) : null;
+      if (line) return `voice-mode:${line.line_id}`;
+      if (!tokens.has(token)) return null;
+      const legacy = `voice:${createHash('sha256').update(token).digest('hex').slice(0, 12)}`;
+      const old = await getMessagingGroupWithAgentCount('voice', legacy, 'voice');
+      return old ? legacy : lineIdForToken(token);
     });
   const proxyPolicy: VoiceModeProxyPolicy = {
     trustedProxies: parseCidrs(config.trustedProxyCidrs, 'VOICE_MODE_TRUSTED_PROXY_CIDRS'),
@@ -421,7 +432,12 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         if (!platformId) return reply(res, 403, 'Unknown call link');
         const line = await resolveLine(platformId);
         if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
-        const info = { agent: line.agent.name, caller: line.caller.name, wakePhrase: config.wakePhrase };
+        const info = {
+          protocol: LIVEKIT_PROTOCOL_VERSION,
+          agent: line.agent.name,
+          caller: line.caller.name,
+          wakePhrase: config.wakePhrase,
+        };
         return reply(res, 200, JSON.stringify(info), JSON_HEADERS);
       }
       reply(res, 404, 'Not found');
@@ -460,6 +476,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       registerWebhookHandler('voice', handleHttp);
       if (config.pagePort !== undefined) {
         pageServer = http.createServer((req, res) => {
+          if (!CLEAN_PREFIX.test(new URL(req.url ?? '/', 'http://localhost').pathname))
+            return reply(res, 404, 'Not found');
           void handleHttp(req, res);
         });
         await new Promise<void>((resolve, reject) => {
@@ -555,31 +573,37 @@ const LIVEKIT_REQUIRED = ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET'
 
 registerChannelAdapter(CHANNEL_TYPE, {
   factory: () => {
-    const env = readEnvFile([
-      'VOICE_MODE_PUBLIC_URL',
-      'VOICE_MODE_PORT',
-      'VOICE_MODE_LINK_TOKEN',
-      'VOICE_MODE_UI',
-      'VOICE_MODE_MAX_CALL_SECONDS',
-      'VOICE_MODE_MAX_CALLS_PER_HOUR',
-      'VOICE_MODE_MAX_MINUTES_PER_DAY',
-      'VOICE_MODE_ALLOW_NON_LOOPBACK',
-      'VOICE_MODE_TRUSTED_PROXY_CIDRS',
-      'VOICE_MODE_ALLOWED_CLIENT_CIDRS',
-      'VOICE_MODE_VOCABULARY',
-      ...LIVEKIT_REQUIRED,
-      'LIVEKIT_WORKER_URL',
-      'LIVEKIT_AGENT_NAME',
-      'VOICE_MODE_STT_MODEL',
-      'VOICE_MODE_STT_FALLBACK_MODEL',
-      'VOICE_MODE_TTS_MODEL',
-      'VOICE_MODE_TTS_FALLBACK_MODEL',
-      'VOICE_MODE_TTS_VOICE',
-      'VOICE_MODE_SILENCE_MS',
-      'VOICE_MODE_MIRROR',
-      'VOICE_MODE_WAKE_MODEL',
-      'VOICE_MODE_WAKE_PHRASE',
-    ]);
+    const env = voiceModeEnv(
+      readEnvFile(
+        voiceModeEnvKeys([
+          'VOICE_MODE_PUBLIC_URL',
+          'VOICE_MODE_PORT',
+          'VOICE_MODE_LANGUAGES',
+          'VOICE_MODE_LINK_TOKEN',
+          'VOICE_MODE_UI',
+          'VOICE_MODE_MAX_CALL_SECONDS',
+          'VOICE_MODE_MAX_CALLS_PER_HOUR',
+          'VOICE_MODE_MAX_MINUTES_PER_DAY',
+          'VOICE_MODE_ALLOW_NON_LOOPBACK',
+          'VOICE_MODE_TRUSTED_PROXY_CIDRS',
+          'VOICE_MODE_ALLOWED_CLIENT_CIDRS',
+          'VOICE_MODE_VOCABULARY',
+          ...LIVEKIT_REQUIRED,
+          'LIVEKIT_WORKER_URL',
+          'LIVEKIT_AGENT_NAME',
+          'VOICE_MODE_STT_MODEL',
+          'VOICE_MODE_STT_FALLBACK_MODEL',
+          'VOICE_MODE_TTS_MODEL',
+          'VOICE_MODE_TTS_FALLBACK_MODEL',
+          'VOICE_MODE_TTS_VOICE',
+          'VOICE_MODE_SILENCE_MS',
+          'VOICE_MODE_MIRROR',
+          'VOICE_MODE_WAKE_MODEL',
+          'VOICE_MODE_WAKE_PHRASE',
+        ]),
+      ),
+      (message) => log.warn(message),
+    );
     const missing = LIVEKIT_REQUIRED.filter((key) => !env[key]);
     if (missing.length > 0) {
       log.warn('voice-mode: LiveKit is not configured; the channel stays offline', { missing });
@@ -607,6 +631,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       vocabulary: env.VOICE_MODE_VOCABULARY,
       livekit: {
         url: env.LIVEKIT_URL,
+        languages: parseVoiceLanguages(env.VOICE_MODE_LANGUAGES),
         serverUrl: env.LIVEKIT_WORKER_URL,
         apiKey: env.LIVEKIT_API_KEY,
         apiSecret: env.LIVEKIT_API_SECRET,

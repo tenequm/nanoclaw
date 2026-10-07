@@ -580,7 +580,7 @@ async function voiceLinesOf(agentGroupId: string): Promise<MessagingGroup[]> {
 }
 
 export async function hasVoiceLine(agentGroupId: string): Promise<boolean> {
-  return (await voiceLinesOf(agentGroupId)).length > 0;
+  return getChannelAdapterExact('voice-mode') !== undefined || (await voiceLinesOf(agentGroupId)).length > 0;
 }
 
 /**

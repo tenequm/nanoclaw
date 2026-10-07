@@ -17,7 +17,13 @@ import { resolveThreadPolicy } from './channel-defaults.js';
 import { getChannelAdapter, getChannelAdapterExact, getChannelDefaults } from './channel-registry.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
-import { bindVoiceModeLineChat, getVoiceModeLineForAgent, mintVoiceModeLine } from '../db/voice-mode-lines.js';
+import {
+  bindVoiceModeLineChat,
+  getVoiceModeLineForAgent,
+  getLegacyVoiceModeLinesForAgent,
+  mintVoiceModeLine,
+} from '../db/voice-mode-lines.js';
+import { isVoiceLineOwner, setVoiceLineTarget } from '../db/voice-lines.js';
 import { log } from '../log.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { getUser } from '../modules/permissions/db/users.js';
@@ -43,7 +49,12 @@ async function mintsAnyLink(mg: MessagingGroup, userId: string, renew: boolean):
   if (!(await getUser(userId))) return false;
   for (const wiring of await getMessagingGroupAgents(mg.id)) {
     if (!(await hasAdminPrivilege(userId, wiring.agent_group_id))) continue;
-    if (renew || !(await getVoiceModeLineForAgent(wiring.agent_group_id))) return true;
+    if (
+      renew ||
+      (!(await getVoiceModeLineForAgent(wiring.agent_group_id)) &&
+        (await getLegacyVoiceModeLinesForAgent(wiring.agent_group_id)).length === 0)
+    )
+      return true;
   }
   return false;
 }
@@ -138,6 +149,28 @@ export async function runVoiceCommand(
       continue;
     }
     const callThread = callChatThread(wiring, mg, threadId);
+    if (!renew && !(await getVoiceModeLineForAgent(ag.id))) {
+      const legacy = await getLegacyVoiceModeLinesForAgent(ag.id);
+      if (legacy.length) {
+        let rebound = false;
+        for (const line of legacy) {
+          if (!(await isVoiceLineOwner(line.id, userId))) continue;
+          rebound =
+            (await setVoiceLineTarget({
+              lineMessagingGroupId: line.id,
+              ownerUserId: userId,
+              targetMessagingGroupId: mg.id,
+              threadId: callThread,
+            })) || rebound;
+        }
+        results.push(
+          rebound
+            ? { ok: true, agentName: ag.name, rebound: true }
+            : { ok: false, agentName: ag.name, reason: 'other-caller' },
+        );
+        continue;
+      }
+    }
     if (!renew) {
       const moved = await bindVoiceModeLineChat({
         agentGroupId: ag.id,
@@ -161,7 +194,10 @@ export async function runVoiceCommand(
         continue;
       }
     }
-    const replaced = renew && (await getVoiceModeLineForAgent(ag.id)) !== undefined;
+    const replaced =
+      renew &&
+      ((await getVoiceModeLineForAgent(ag.id)) !== undefined ||
+        (await getLegacyVoiceModeLinesForAgent(ag.id)).length > 0);
     const { line, token } = await mintVoiceModeLine({
       agentGroupId: ag.id,
       ownerUserId: userId,

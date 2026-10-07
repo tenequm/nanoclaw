@@ -10,5 +10,6 @@ export function voiceEndpoint(route: "info" | "livekit/token" | "livekit/end", t
   url.search = ""
   url.hash = ""
   url.searchParams.set("t", token)
+  url.searchParams.set("v", "6")
   return url
 }

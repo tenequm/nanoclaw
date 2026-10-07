@@ -19,6 +19,7 @@ export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
  * must agree, so they ship and restart together.
  */
 export const LIVEKIT_PROTOCOL_VERSION = 6;
+export const CALL_PROTOCOL_ATTRIBUTE = 'nanoclaw.voice-mode.protocol';
 
 /** Transcription over the Gemini Live API, verbatim, one manual activity per caller turn. */
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
@@ -29,6 +30,31 @@ export const DEFAULT_VOICE_TTS_VOICE = 'Alnilam';
 export const DEFAULT_VOICE_SILENCE_MS = 2500;
 /** Channel type of the default call chat when `/voice` has not set one (VOICE_MODE_MIRROR). */
 export const DEFAULT_VOICE_MIRROR = 'telegram';
+
+/** The languages callers speak when VOICE_MODE_LANGUAGES is unset (BCP-47; the first is the default). */
+export const DEFAULT_VOICE_LANGUAGES: readonly string[] = ['uk-UA', 'en-US'];
+const MAX_VOICE_LANGUAGES = 4;
+
+/**
+ * VOICE_MODE_LANGUAGES: comma-separated BCP-47 codes (`uk-UA,en-US`), the first the call's default.
+ * They are the transcription's language hints and shape the agents' language notes. Invalid
+ * entries are dropped; none left means the default.
+ */
+export function parseVoiceLanguages(raw: string | undefined): string[] {
+  const out: string[] = [];
+  for (const entry of (raw ?? '').split(',')) {
+    const code = entry.trim();
+    if (!/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(code)) continue;
+    if (out.some((c) => c.toLowerCase() === code.toLowerCase())) continue;
+    if (out.length < MAX_VOICE_LANGUAGES) out.push(code);
+  }
+  return out.length > 0 ? out : [...DEFAULT_VOICE_LANGUAGES];
+}
+
+/** The primary language subtag of a BCP-47 code, lowercased (`uk-UA` -> `uk`). */
+export function baseLanguage(code: string): string {
+  return code.split('-')[0].toLowerCase();
+}
 
 /** What the worker receives as job metadata. Nothing secret: agents-js logs the whole job on some paths. */
 export interface LiveKitJobMetadata {
@@ -41,6 +67,7 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
+  languages?: string[];
   /**
    * The agent's own voice.vocabulary.txt entries: besides `agentName`, the names the wake phrase
    * `hey <agent>` takes (another script or spelling of it, say). Absent when the file has none.
@@ -410,4 +437,23 @@ export function liveKitCallSecret(apiSecret: string, callId: string): string {
 /** Where the worker reaches the host's webhook server; only ever from the worker's own settings. */
 export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: string }): string {
   return (env.LIVEKIT_HOST_URL || `http://127.0.0.1:${env.WEBHOOK_PORT || '3000'}`).replace(/\/+$/, '');
+}
+
+export function voiceModeEnvKeys(keys: readonly string[]): string[] {
+  return [
+    ...new Set(
+      keys.flatMap((key) => (key.startsWith('VOICE_MODE_') ? [key, key.replace('VOICE_MODE_', 'VOICE_')] : [key])),
+    ),
+  ];
+}
+
+export function voiceModeEnv(env: Record<string, string>, warn: (message: string) => void): Record<string, string> {
+  const out = { ...env };
+  for (const key of Object.keys(env)) {
+    if (!key.startsWith('VOICE_') || key.startsWith('VOICE_MODE_')) continue;
+    const renamed = key.replace('VOICE_', 'VOICE_MODE_');
+    if (out[renamed] === undefined) out[renamed] = env[key];
+    warn(`voice-mode: ${key} is deprecated; use ${renamed}`);
+  }
+  return out;
 }

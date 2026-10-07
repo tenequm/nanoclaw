@@ -88,3 +88,25 @@ describe('voice routes and the reverse-proxy gate', () => {
     expect(admitsVoiceModePeer(policy('172.17.0.0/16', tailnet), '127.0.0.1', '203.0.113.9')).toBe(true);
   });
 });
+
+describe('voice-mode environment compatibility', () => {
+  it('reads old settings, prefers explicit new keys and never prints their values', async () => {
+    const { voiceModeEnv, voiceModeEnvKeys, parseVoiceLanguages } = await import('./voice-mode-protocol.js');
+    const warnings: string[] = [];
+    const oldValue = 'private-' + 'value';
+    expect(voiceModeEnvKeys(['VOICE_MODE_LINK_TOKEN', 'LIVEKIT_URL'])).toEqual([
+      'VOICE_MODE_LINK_TOKEN',
+      'VOICE_LINK_TOKEN',
+      'LIVEKIT_URL',
+    ]);
+    expect(
+      voiceModeEnv({ VOICE_LINK_TOKEN: oldValue, VOICE_MODE_LINK_TOKEN: 'new', VOICE_WAKE_MODEL: 'off' }, (s) =>
+        warnings.push(s),
+      ),
+    ).toMatchObject({ VOICE_MODE_LINK_TOKEN: 'new', VOICE_MODE_WAKE_MODEL: 'off' });
+    expect(warnings).toHaveLength(2);
+    expect(warnings.join(' ')).not.toContain(oldValue);
+    expect(parseVoiceLanguages(undefined)).toEqual(['uk-UA', 'en-US']);
+    expect(parseVoiceLanguages('de-DE,en-US,de-de,invalid!')).toEqual(['de-DE', 'en-US']);
+  });
+});
