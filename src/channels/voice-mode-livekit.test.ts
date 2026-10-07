@@ -1968,6 +1968,46 @@ describe('livekit call talking in the agent chat', () => {
     expect(await turn.text()).toBe('The call has no chat to talk in');
     expect(h.events).toHaveLength(1);
     expect(h.inbound).toEqual([]);
+    // A call with nowhere to talk is over, not refused turn after turn.
+    expect(await worker.waitFor((e) => e.type === 'end')).toEqual({ type: 'end', reason: 'no chat to talk in' });
+    await settle();
+    expect(h.lk.deleted).toHaveLength(1);
+    worker.close();
+  });
+
+  it('refuses a start whose chat lookup fails as having no chat, and logs the refusal without a made-up call id', async () => {
+    const info = vi.spyOn(log, 'info');
+    try {
+      const fake = fakeMirror([]);
+      fake.api.groupsFor = async () => {
+        throw new Error('db gone');
+      };
+      h = await startHarness(
+        { lineForToken: async (token) => (token === 'tok123' ? NEW_LINE : null) },
+        { mirror: 'telegram', mirrorApi: fake.api },
+      );
+      const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+      expect(refused.status).toBe(409);
+      expect(await refused.json()).toMatchObject({ error: 'no-chat' });
+      expect(h.lk.rooms).toEqual([]);
+      expect(info).toHaveBeenCalledWith('livekit-voice-mode: call refused: the line has no chat to talk in', {
+        platformId: NEW_LINE,
+      });
+      expect(JSON.stringify(info.mock.calls)).not.toContain('starting');
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('takes a /voice binding with no owner accounts as no binding', async () => {
+    const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
+    await start([{ platform_id: 'telegram:100' }, topic], 'telegram', {
+      bound: { group: topic, threadId: null, ownerIds: [] },
+      admins: [],
+    });
+    const { worker } = await startCall(h);
+    await worker.utter('hello');
+    expect(h.events).toEqual([expect.objectContaining({ platformId: 'telegram:100' })]);
     worker.close();
   });
 

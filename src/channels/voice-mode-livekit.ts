@@ -594,8 +594,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (call.queue.length > MAX_QUEUED_EVENTS) call.queue.shift();
   };
 
-  /** What chat resolution needs of a call; a call start checks it before the call exists. */
-  type ChatProbe = Pick<LiveKitCall, 'line' | 'platformId' | 'callId'>;
+  /** What chat resolution needs of a call; a call start checks it before the call exists, with no call id. */
+  type ChatProbe = Pick<LiveKitCall, 'line' | 'platformId'> & { callId?: string };
 
   const noteChat = (
     call: ChatProbe,
@@ -611,7 +611,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const value = `${note}|${JSON.stringify(fields)}`;
     if (chatNotes.get(key) === value) return;
     chatNotes.set(key, value);
-    log.info(`livekit-voice-mode: ${note}`, { platformId: call.platformId, callId: call.callId, ...fields });
+    log.info(`livekit-voice-mode: ${note}`, {
+      platformId: call.platformId,
+      ...(call.callId && { callId: call.callId }),
+      ...fields,
+    });
   };
 
   /** The `/voice` chat if it is still the agent's and an owner account of the line still administers the agent, else the VOICE_MODE_MIRROR pick. */
@@ -628,7 +632,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         });
       } else if (
         // A /voice line's one owner is its caller, whose role every access check of the line holds already.
-        !bound.ownerIds.every((id) => id === line.caller.id) &&
+        !(bound.ownerIds.length > 0 && bound.ownerIds.every((id) => id === line.caller.id)) &&
         !(await Promise.all(bound.ownerIds.map((id) => mirrorApi.isAdmin(id, line.agentGroupId)))).some(Boolean)
       ) {
         noteChat(call, 'binding', 'no line owner account is an admin of the agent; using the default', {
@@ -670,18 +674,19 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
    * Re-resolve where the call talks; `turn` marks a caller turn, where a chat
    * left behind by a mid-call `/voice` ages out once it went quiet.
    */
+  /** resolveChat, with a failed lookup taken as no chat. */
+  const probeChat = async (call: ChatProbe): Promise<CallChat | null> => {
+    try {
+      return await resolveChat(call);
+    } catch (err) {
+      log.warn('livekit-voice-mode: could not resolve the call chat', { platformId: call.platformId, err });
+      return null;
+    }
+  };
+
   const refreshChat = async (call: LiveKitCall, turn: boolean): Promise<CallChat | null> => {
     const refresh = ++call.chatRefreshes;
-    let chat: CallChat | null;
-    try {
-      chat = await resolveChat(call);
-    } catch (err) {
-      log.warn('livekit-voice-mode: could not resolve the call chat; the call talks on the voice line', {
-        platformId: call.platformId,
-        err,
-      });
-      chat = null;
-    }
+    const chat = await probeChat(call);
     // A slower, older refresh (the join's, say) must not undo a newer one.
     if (refresh !== call.chatRefreshes) return chat;
     if (turn && call.previousChat) {
@@ -862,7 +867,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const line = await host.resolveLine(platformId, { forCall: true });
     if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
     // Before anything is spent or ended: a line with no chat to talk in is refused outright.
-    if (!talksOnLine(platformId) && !(await resolveChat({ line, platformId, callId: 'starting' }))) {
+    if (!talksOnLine(platformId) && !(await probeChat({ line, platformId }))) {
+      log.info('livekit-voice-mode: call refused: the line has no chat to talk in', { platformId });
       return reply(res, 409, NO_CHAT_REFUSAL, JSON_HEADERS);
     }
     const t = host.now();
@@ -1129,7 +1135,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       const chat = await refreshChat(call, true);
       // The call can end or be replaced while the chat lookups run; its turn must not reach the agent then.
       if (call.ended || calls.get(call.platformId) !== call) return { status: 409, body: 'The call has ended' };
-      if (!chat && !talksOnLine(call.platformId)) return { status: 409, body: 'The call has no chat to talk in' };
+      if (!chat && !talksOnLine(call.platformId)) {
+        endCall(call, 'no chat to talk in');
+        return { status: 409, body: 'The call has no chat to talk in' };
+      }
       const utteranceId = String(++call.utterances);
       // Always the line's own caller, wherever the call talks: the line is that person's, not whoever ran /voice.
       const sender = call.line.caller;
