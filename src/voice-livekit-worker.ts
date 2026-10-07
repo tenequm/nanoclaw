@@ -1729,6 +1729,8 @@ export function matchWake(text: string, names: readonly WakeName[]): { start: nu
 }
 
 export type SpokenCommand = 'send' | 'discard';
+/** A command a transcript ends with, and what was said before it; `ownSentence` for `copy` and `copy that`. */
+export type CommandMatch = { command: SpokenCommand; rest: string; ownSentence?: true };
 /**
  * The commands, longest first, as the words that end an utterance (Cyrillic already read as Latin:
  * `зулу` is `zulu`, `прийом` is `pryyom`). `copy` and `copy that` are everyday words too, so a
@@ -1749,17 +1751,14 @@ const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[], { ownS
  * `ownSentence` command inside a final's sentence (`send me a copy`). Interim text is mostly
  * unpunctuated, so there the final decides that.
  */
-function commandEnd(
-  text: string,
-  interim = false,
-): { command: SpokenCommand; rest: string; phrase: string; missed?: true } | null {
+function commandEnd(text: string, interim = false): (CommandMatch & { phrase: string; missed?: true }) | null {
   const words = spokenWords(text);
   for (const [command, phrase, guard] of COMMANDS) {
     if (words.length < phrase.length) continue;
     const tail = words.slice(words.length - phrase.length);
     if (!tail.every((w, i) => w.word === phrase[i])) continue;
     const before = text.slice(0, tail[0].start);
-    const found = { command, rest: sentence(before), phrase: phrase.join('-') };
+    const found = { command, rest: sentence(before), phrase: phrase.join('-'), ...guard };
     if (guard?.ownSentence && !interim && !/(^|[.!?,;:–—-])\s*$/u.test(before)) return { ...found, missed: true };
     return found;
   }
@@ -1770,9 +1769,11 @@ function commandEnd(
  * The command a transcript ends with, and what was said before it, or null. Only the end counts:
  * `zulu, call Anna` is words, while a sentence that really ends in `zulu` sends, even as a question.
  */
-export function matchCommand(text: string, interim = false): { command: SpokenCommand; rest: string } | null {
+export function matchCommand(text: string, interim = false): CommandMatch | null {
   const end = commandEnd(text, interim);
-  return end && !end.missed ? { command: end.command, rest: end.rest } : null;
+  if (!end || end.missed) return null;
+  const { command, rest, ownSentence } = end;
+  return ownSentence ? { command, rest, ownSentence } : { command, rest };
 }
 
 /** Words before a command, as a sentence: the comma before it gone, a period where none ends them. */
@@ -1929,7 +1930,7 @@ interface OpenTurn {
    * The last command any interim of this activity ended with, and the words before it: a later
    * interim, and the final, can leave it out again.
    */
-  seen?: { command: SpokenCommand; rest: string };
+  seen?: CommandMatch;
   /** The send countdown is held back: a command is pending. */
   quiet?: boolean;
   speechMs: number;
@@ -2357,10 +2358,7 @@ export class CallTurns {
    * The command the activity's text would end in were it finished now: the one its last interim ends
    * with, or one an earlier interim ended with that the text still ends like (the interim dropped it).
    */
-  private pendingCommand(
-    turn: OpenTurn,
-    text = this.spoken(turn, turn.heard),
-  ): { command: SpokenCommand; rest: string } | null {
+  private pendingCommand(turn: OpenTurn, text = this.spoken(turn, turn.heard)): CommandMatch | null {
     return matchCommand(text, true) ?? (turn.seen && droppedCommand(text, turn.seen.rest) ? turn.seen : null);
   }
 
@@ -2523,9 +2521,9 @@ export class CallTurns {
     // A final that ends in `copy` inside a sentence decided it was words: the interim text cannot overrule that.
     const missed = match ? null : commandEnd(text);
     if (missed?.missed) this.deps.log.info(`voice.command near-miss word=${missed.phrase} reason=no-boundary`);
-    if (!match && !missed?.missed && nominated && endsLike(text, nominated.rest)) {
+    if (!match && !missed?.missed && nominated && !nominated.ownSentence && endsLike(text, nominated.rest)) {
       // The final left out the command the interim text ended with: the command stands, and the
-      // final is the turn's text.
+      // final is the turn's text. Not `copy`: only a final that has it, as its own sentence, sends it.
       match = { command: nominated.command, rest: sentence(trimCut(text)) };
     }
     const scratch = () => {

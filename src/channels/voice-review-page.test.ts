@@ -555,7 +555,7 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     for (const [text, command] of spoken) {
       expect(lib.isCommandOnly(text), text).toBe(true);
       expect(lib.endsInDiscard(text), text).toBe(command === 'discard');
-      expect(matchCommand(text), text).toEqual({ command, rest: '' });
+      expect(matchCommand(text), text).toMatchObject({ command, rest: '' });
     }
     // Not a command for either: words before or after it.
     for (const text of [

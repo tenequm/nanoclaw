@@ -2443,6 +2443,26 @@ describe('CallTurns, wake', () => {
     expect(h.turns.state.waiting).toBe(true);
   });
 
+  it('a copy the interim text ended with and the final left out sends nothing: the turn goes on', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('rewrite the landing page copy', 'Rewrite the landing page'));
+    await h.talk(1500);
+    await h.interim('rewrite the landing page copy');
+    await h.interim('rewrite the landing page copy');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.logs).toEqual([]);
+    expect(h.turns.state.waiting).toBe(false);
+    // A dropped zulu still stands, as a dropped прийом always has.
+    h.t.results.push(heard('and the pricing zulu', 'And the pricing'));
+    await h.talk(1200);
+    await h.interim('and the pricing zulu');
+    await h.interim('and the pricing zulu');
+    expect(h.out.sent).toEqual(['Rewrite the landing page and the pricing.']);
+  });
+
   it('a pause sends too with pauseSends; a detection from an earlier wait opens nothing', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', pauseSends: true });
     await h.pass(3000);
