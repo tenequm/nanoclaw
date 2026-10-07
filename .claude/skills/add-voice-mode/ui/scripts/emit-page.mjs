@@ -42,7 +42,7 @@ export interface VoiceModeUiConfig {
   colorway?: 'auto' | 'ivory' | 'field' | 'rabbit';
   /** Screen beside a control rail (default) or everything stacked. */
   layout?: 'rail' | 'stack';
-  /** What shows the voice-mode: the dot matrix (default) or bars. */
+  /** What shows the voice: the dot matrix (default) or bars. */
   presence?: 'matrix' | 'bars';
   /** Product name in the header. */
   brand?: string;

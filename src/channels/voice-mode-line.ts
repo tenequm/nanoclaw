@@ -41,7 +41,7 @@ export interface VoiceModeLine {
   linkHash?: string;
 }
 
-/** Whether two resolutions of a line still name the same caller and agent; a call ends when they stop. */
+/** Whether two resolutions of a line still name the same caller, agent and link; a call ends when they stop. */
 export function sameCallerAndAgent(a: VoiceModeLine, b: VoiceModeLine): boolean {
   return (
     a.caller.id === b.caller.id &&

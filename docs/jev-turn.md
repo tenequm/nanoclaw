@@ -108,7 +108,7 @@ Grep the voice worker's log for `voice-mode.turn-end jev`; with the skill's syst
 user unit:
 
 ```bash
-journalctl --user -u nanoclaw-voice-mode-worker -n 100 | rg 'voice-mode.turn-end jev'
+journalctl --user -u nanoclaw-voice-mode-worker --since today | grep 'voice-mode.turn-end jev'
 ```
 
 What to read off the outcome lines, per `endedBy`:

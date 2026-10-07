@@ -18,7 +18,7 @@ import { getRegisteredChannelNames } from './channel-registry.js';
 import './index.js'; // the real barrel — triggers every channel's self-registration
 
 describe('voice channel registration', () => {
-  it('registers voice via the channel barrel', () => {
+  it('registers voice-mode via the channel barrel', () => {
     expect(getRegisteredChannelNames()).toContain('voice-mode');
   });
 

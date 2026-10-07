@@ -36,9 +36,10 @@ import { voiceEndpoint } from "./voice-endpoint"
  * the page renders (the `?demo=1` script has the same shape).
  *
  * The host's routes next to the page mint the room token (`livekit/token`) and
- * end the call (`livekit/end`). In the room, the worker's AgentSession owns
- * `lk.agent.state` and the `lk.transcription` captions; the worker adds the
- * attributes and the per-turn topic named below.
+ * end the call (`livekit/end`). In the room, the worker publishes
+ * `lk.agent.state` and the `lk.transcription` captions in the shapes
+ * agents-js's AgentSession used, and adds the attributes and the per-turn
+ * topic named below.
  */
 
 /** "1" while nanoclaw's agent works on a turn: the worker's session has no LLM, so it never thinks itself. */

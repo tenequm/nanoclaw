@@ -19,6 +19,7 @@ export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
  * must agree, so they ship and restart together.
  */
 export const LIVEKIT_PROTOCOL_VERSION = 6;
+/** The worker's participant attribute with LIVEKIT_PROTOCOL_VERSION; native clients log it with a call. */
 export const CALL_PROTOCOL_ATTRIBUTE = 'nanoclaw.voice-mode.protocol';
 
 /** Transcription over the Gemini Live API, verbatim, one manual activity per caller turn. */
@@ -67,6 +68,7 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
+  /** VOICE_MODE_LANGUAGES: the transcription's language hints, the first the call's default; absent for the default ones. */
   languages?: string[];
   /**
    * The agent's own voice.vocabulary.txt entries: besides `agentName`, the names the wake phrase
@@ -163,8 +165,7 @@ export const MAX_TURN_TEXT_BYTES = 8 * 1024;
  * Review mode: the caller taps talk, speaks, taps done, reads the draft and sends or discards it;
  * nothing goes out on a pause. The worker's participant attribute is "1" when it runs review mode,
  * and the page offers it only then. The page drives it with the RPCs below on the worker, and the
- * worker sends every change of its `CallReviewState` on the topic. All of it is additive to v4: an
- * old page never calls the RPCs, and an old worker sets no attribute.
+ * worker sends every change of its `CallReviewState` on the topic.
  */
 export const CALL_REVIEW_ATTRIBUTE = 'nanoclaw.voice-mode.review';
 /** Text stream topic the worker sends one JSON `CallReviewState` on whenever it changes. */

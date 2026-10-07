@@ -284,6 +284,7 @@ export interface CallLanguages {
   ukrainian: boolean;
 }
 
+/** The call's languages from the job metadata; DEFAULT_VOICE_LANGUAGES when the host sent none. */
 export function callLanguages(languages: readonly string[] | undefined): CallLanguages {
   const codes = languages?.length ? [...languages] : [...DEFAULT_VOICE_LANGUAGES];
   const ukrainian = codes.some((code) => baseLanguage(code) === 'uk');

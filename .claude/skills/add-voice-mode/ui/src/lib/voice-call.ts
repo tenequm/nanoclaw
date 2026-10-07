@@ -196,5 +196,7 @@ export function micErrorKind(err: unknown): ErrorKind | null {
   return null
 }
 
+/** The host and worker protocol this page speaks (LIVEKIT_PROTOCOL_VERSION); its token requests carry it as `v`. */
 export const CLIENT_PROTOCOL_VERSION = 6
+/** Whether a host's `protocol` (from `info` or the token reply) is the one this page speaks. */
 export function matchesClientProtocol(version: unknown): boolean { return version === CLIENT_PROTOCOL_VERSION }

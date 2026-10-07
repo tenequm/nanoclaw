@@ -48,12 +48,15 @@ export interface VoiceModeLine {
   updated_at: string;
 }
 
+/** Hex SHA-256 of a call-link token: what the table stores and looks a link up by. */
 export const hashLinkToken = (token: string): string => createHash('sha256').update(token).digest('hex');
 
+/** The line with this line id (a `voice-mode:` platform id without its prefix). */
 export async function getVoiceModeLine(lineId: string): Promise<VoiceModeLine | undefined> {
   return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE line_id = ?', lineId);
 }
 
+/** The agent's line; an agent has at most one. */
 export async function getVoiceModeLineForAgent(agentGroupId: string): Promise<VoiceModeLine | undefined> {
   return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE agent_group_id = ?', agentGroupId);
 }

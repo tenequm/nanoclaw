@@ -13,8 +13,8 @@ The host and worker run outside the agent container. No separate voice model
 stands in for the agent.
 
 This distribution targets the public NanoClaw fork with its host command,
-prewarm, delivery and legacy-line foundations. Use the complete
-[voice-mode rebuild branch](https://github.com/tenequm/nanoclaw/tree/feat/voice-mode-rebuild).
+prewarm, delivery and legacy-line foundations. Use the fork's
+[main branch](https://github.com/tenequm/nanoclaw/tree/main).
 Do not copy it into an unrelated upstream checkout: its core boundaries differ.
 The build below checks those dependencies. Applying this skill never merges,
 deploys a server, or changes an existing call-link token.
@@ -24,7 +24,7 @@ wake gate on: say the configured acoustic phrase, or `hey <agent>` when the
 model is off, then a spoken send word. The page can turn wake off so pauses
 send. Manual mode lets the caller read and send or discard a draft. The caller
 is not transcribed while the agent speaks. Follow-up turns while it works,
-live captions, cues, reconnect grace and agent prewarm are retained.
+live captions, cues, reconnect grace and agent prewarm are included.
 
 You need a reachable LiveKit server or Cloud project, its API key and secret,
 a Gemini key for the configured models, and an HTTPS origin for the page.
@@ -37,13 +37,13 @@ Follow the [LiveKit deployment guide](https://docs.livekit.io/home/self-hosting/
 
 ### 1. Copy the implementation and tests
 
-Use `git fetch origin feat/voice-mode-rebuild`, with `origin` pointing at the
-fork above. For every path in the following list, create its parent directory
-and copy with `git show origin/feat/voice-mode-rebuild:<path> > <path>`.
+Use `git fetch origin main`, with `origin` pointing at the fork above. For
+every path in the following list, create its parent directory and copy with
+`git show origin/main:<path> > <path>`.
 Stop on any failed fetch or copy; never leave empty source files. Reapplying
 these files is safe. Preserve agent vocabulary and local configuration.
 
-```nc:copy from-branch:feat/voice-mode-rebuild
+```nc:copy from-branch:main
 src/channels/voice-mode-adapter.test.ts
 src/channels/voice-mode-call-session.test.ts
 src/channels/voice-mode-command.test.ts
@@ -97,7 +97,7 @@ The registration, router and native command tests guard these connections.
 Copy resident agent guidance separately so an implementation repair can
 preserve customized prose:
 
-```nc:copy from-branch:feat/voice-mode-rebuild
+```nc:copy from-branch:main
 container/skills/voice-mode-formatting/instructions.md
 ```
 
@@ -264,9 +264,9 @@ Calls use the caller's core role, checked at start, every turn, every five
 seconds and before replies. A revoked role or changed token ends the call.
 The current call chat must stay wired to the line's agent. When it disappears,
 `VOICE_MODE_MIRROR` picks an unambiguous fallback chat; a new line with no
-usable chat cannot deliver turns. Main's older membership-based lines retain
-their identities and can still deliver on their voice line: a `voice`
-compatibility adapter hands their replies and typing to the voice-mode engine.
+usable chat cannot deliver turns. A legacy membership-based `voice` line
+can also talk on the line itself: a `voice` compatibility adapter hands its
+replies and typing to the voice-mode engine.
 
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use
@@ -296,9 +296,9 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_WAKE_PHRASE` | `Hey LiveKit` | Label of the acoustic phrase; it does not train or change the model. |
 | `VOICE_MODE_WAKE_THRESHOLD` | `0.68` bundled, `0.5` custom | Acoustic confidence threshold between zero and one. |
 | `VOICE_MODE_WAKE_START_SECONDS`, `VOICE_MODE_WAKE_IDLE_SECONDS` | `8`, `20` | How long an addressed turn waits for first or more speech; zero disables each timer. |
-| `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`; old path retained. |
+| `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`. |
 | `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | Worker health on loopback. |
-| `VOICE_MODE_UI` | empty | Main's page options: skin, colorway, layout, presence, brand, footer, shortcuts, timestamps, colorwayPicker. |
+| `VOICE_MODE_UI` | empty | Page options: skin, colorway, layout, presence, brand, footer, shortcuts, timestamps, colorwayPicker. |
 
 `LIVEKIT_WORKER_URL` selects the worker/API-side LiveKit URL; default is
 `LIVEKIT_URL`. `LIVEKIT_HOST_URL` is the worker's loopback host webhook origin;
@@ -311,7 +311,7 @@ The vocabulary file is bounded and rejects symlinks/FIFOs. Keep names only:
 60 terms and 1024 bytes total, at most 80 characters per term. Its entries
 also name the agent for transcript wake. Preserve it across upgrades.
 
-A configured acoustic `hey dan` classifier keeps working with its path and
+A configured custom acoustic classifier keeps working with its path and
 phrase settings. Without a model, transcript `hey <agent>` opens the turn,
 including the agent's alternate names. Acoustic wake sends no idle audio to
 Google; transcript wake necessarily transcribes speech before deciding whether
@@ -322,7 +322,7 @@ The worker announces command vocabulary version `3` and the actual words.
 `scratch that`, `discard turn`, `discard this turn` discard. Two matching
 interims or a single interim unchanged for 700 milliseconds nominate a command
 once speech stops; the final decides it. A missing or collapsed final cannot
-confirm `copy`. Other commands retain main's dropped-command recovery.
+confirm `copy`. Other commands use the dropped-command recovery.
 The page drives commands and settings for vocabulary `2` and `3` alike (the
 same `zulu`/`copy` words); any other value gets no commands and no settings.
 A page that accepts only `2` leaves a `3` worker wake-gated until it reloads.
@@ -343,23 +343,8 @@ per call as `scope=usage`. Kill switch: `"enabled": false`, or delete
 
 ## Upgrade
 
-For main protocol 4: keep `.env`, the central DB, agent vocabulary, models and
-saved call URLs. Old `VOICE_*` settings remain readable with key-only warnings;
-rename them to `VOICE_MODE_*` when convenient. Plain `/voice` preserves an old
-line; `/voice new` intentionally retires its links. Host and worker restart
-together; protocol 4 apps require the protocol 6 update before calling.
+Upgrade an existing voice install with the [upgrade runbook](../../../docs/2610-07-voice-mode-upgrade.md).
 
-For the shared protocol 5 AgentSession build: preserve `voice_mode_lines` and
-its migration record, `.env` and the same public page origin/port. Existing
-hashes, callers and call chats are reused without re-minting. Reapply this
-fork build, keep `VOICE_MODE_LANGUAGES=en-US` if that was the desired language,
-restart both processes and reload the page. Wake is now on by default; the
-page's wake switch restores pause-send operation. Unary STT fallback is gone.
-Existing `LIVEKIT_AGENT_NAME=nanoclaw-voice` must remain identical on both
-processes, or remove the override from both for the new default.
-
-The precise backup, env rename, service cutover and rollback steps are in the
-[upgrade runbook](../../../docs/2610-07-voice-mode-upgrade.md).
 Remove via [REMOVE.md](REMOVE.md).
 
 ## Troubleshooting

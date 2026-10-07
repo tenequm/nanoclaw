@@ -2,9 +2,9 @@
 
 This is an operator runbook. No server actions are performed by building this
 branch. Use the complete fork build, with matching host and worker. Update
-native clients before the server cutover (Hey Dan 0.4.0 speaks protocol 4 and
-6), and close or reload every open browser tab afterwards. Browser bookmarks
-keep their URLs and receive the new page after reload.
+native clients before the server cutover (to a build that speaks protocol 4
+and 6), and close or reload every open browser tab afterwards. Browser
+bookmarks keep their URLs and receive the new page after reload.
 
 ## Main protocol 4 and env-backed links
 
@@ -76,7 +76,7 @@ webhook port does not need the listener: set `VOICE_MODE_PORT=off`.
 custom wake model remains operator-owned at its current path; preserve its
 phrase, threshold and vocabulary. The bundled assets moved from
 `assets/voice-wakeword` to `assets/voice-mode-wakeword`: update a setting that
-explicitly names the old bundled path. An external acoustic `hey dan` model
+explicitly names the old bundled path. An external acoustic model
 needs no rename. `off` retains transcript `hey <agent>` wake.
 
 `LIVEKIT_AGENT_NAME` must be the same on host and worker. An explicit old
@@ -100,9 +100,8 @@ the first judgement of a day; nothing needs deleting by hand.
 
 ### Backup and cutover
 
-1. Update native clients first. Install the Hey Dan build that speaks
-   protocol 4 and 6 (0.4.0 or later) and confirm it still calls the old
-   server. A protocol-4-only app cannot call after the cutover, and a
+1. Update native clients first. Install a native client build that speaks
+   protocol 4 and 6 and confirm it still calls the old server. A protocol-4-only app cannot call after the cutover, and a
    protocol-6-only app could not call before it.
 2. Identify this checkout's host service:
 

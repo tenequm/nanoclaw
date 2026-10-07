@@ -224,6 +224,7 @@ export interface SpeechSettings {
 }
 
 export interface LiveKitVoiceConfig {
+  /** VOICE_MODE_LANGUAGES as parseVoiceLanguages read it; DEFAULT_VOICE_LANGUAGES when unset. */
   languages?: readonly string[];
   /** Signaling URL the caller's browser connects to (LIVEKIT_URL). */
   url: string;
