@@ -14,12 +14,15 @@ vi.mock('../container-runner.js', () => ({
   killContainer: vi.fn(),
 }));
 
+const TEST_DIR = await vi.hoisted(async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  return mkdtempSync(`${tmpdir()}/nanoclaw-test-voice-route-`);
+});
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-voice-route' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
-
-const TEST_DIR = '/tmp/nanoclaw-test-voice-route';
 
 import { wakeContainer } from '../container-runner.js';
 import { registerSessionCreatedHook, type SessionCreatedEvent } from '../router.js';

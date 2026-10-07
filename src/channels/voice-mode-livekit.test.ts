@@ -8,14 +8,19 @@ import fs from 'node:fs';
 import http from 'node:http';
 import net, { type AddressInfo } from 'node:net';
 import Database from 'better-sqlite3';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Only the saved-line delivery test reaches core storage: its session folders go here, and no container starts.
-const TEST_DATA_DIR = '/tmp/nanoclaw-test-voice-mode-livekit';
+const TEST_DATA_DIR = await vi.hoisted(async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  return mkdtempSync(`${tmpdir()}/nanoclaw-test-voice-mode-livekit-`);
+});
 vi.mock('../config.js', async () => ({
   ...(await vi.importActual('../config.js')),
-  DATA_DIR: '/tmp/nanoclaw-test-voice-mode-livekit',
+  DATA_DIR: TEST_DATA_DIR,
 }));
+afterAll(() => fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true }));
 vi.mock('../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(true),
   isContainerRunning: vi.fn().mockReturnValue(false),
@@ -64,7 +69,7 @@ import {
   wakePhrase,
 } from './voice-mode-protocol.js';
 import { log } from '../log.js';
-import { stopWebhookServer } from '../webhook-server.js';
+import { getWebhookStatus, stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './voice-mode-page.js';
 import { linePlatformId } from './voice-mode-line.js';
 
@@ -190,11 +195,37 @@ interface Harness {
   stop(): Promise<void>;
 }
 
+/**
+ * The harness on a free webhook port, once the webhook server is bound to it. Another process can take
+ * the port between freePort() and the bind; a fresh port is tried then, three times in all.
+ */
 async function startHarness(
   overrides: Partial<VoiceModeConfig> = {},
   lkOverrides: Partial<LiveKitVoiceConfig> = {},
 ): Promise<Harness> {
-  const port = await freePort();
+  for (let attempt = 1; ; attempt++) {
+    const port = await freePort();
+    const harness = await openHarness(port, overrides, lkOverrides);
+    try {
+      await vi.waitFor(
+        () => {
+          if (getWebhookStatus()?.port !== port) throw new Error(`the webhook server is not bound to ${port}`);
+        },
+        { timeout: 2000, interval: 10 },
+      );
+      return harness;
+    } catch (err) {
+      await harness.stop();
+      if (attempt >= 3) throw err;
+    }
+  }
+}
+
+async function openHarness(
+  port: number,
+  overrides: Partial<VoiceModeConfig>,
+  lkOverrides: Partial<LiveKitVoiceConfig>,
+): Promise<Harness> {
   process.env.WEBHOOK_PORT = String(port);
   const inbound: InboundMessage[] = [];
   const events: InboundEvent[] = [];

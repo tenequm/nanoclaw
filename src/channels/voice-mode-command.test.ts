@@ -16,12 +16,15 @@ vi.mock('../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+const TEST_DIR = await vi.hoisted(async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  return mkdtempSync(`${tmpdir()}/nanoclaw-test-voice-command-`);
+});
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-voice-command' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
-
-const TEST_DIR = '/tmp/nanoclaw-test-voice-command';
 
 /** Runs once right after the next lookup of an agent's line: what another /voice did in between. */
 const lineLookups = vi.hoisted(() => ({ after: null as null | (() => Promise<void>) }));
