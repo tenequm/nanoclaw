@@ -1,3 +1,4 @@
+import type { InboundEvent } from './adapter.js';
 /**
  * `/voice` against the real core: core's router hands it to the command (registered through the
  * real channel barrel) before any agent sees it, who may run it is decided by core's owner and
@@ -11,25 +12,50 @@ vi.mock('../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+const TEST_DIR = await vi.hoisted(async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  return mkdtempSync(`${tmpdir()}/nanoclaw-test-voice-command-`);
+});
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-voice-command' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-voice-command';
+/** Runs once right after the next lookup of an agent's line: what another /voice did in between. */
+const lineLookups = vi.hoisted(() => ({ after: null as null | (() => Promise<void>) }));
+vi.mock('../db/voice-mode-lines.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../db/voice-mode-lines.js')>();
+  return {
+    ...actual,
+    getVoiceModeLineForAgent: async (agentGroupId: string) => {
+      const found = await actual.getVoiceModeLineForAgent(agentGroupId);
+      const after = lineLookups.after;
+      lineLookups.after = null;
+      await after?.();
+      return found;
+    },
+  };
+});
 
-import type { ChannelAdapter, InboundEvent, OutboundMessage } from './adapter.js';
+import type { ChannelAdapter, OutboundMessage } from './adapter.js';
 import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from './channel-registry.js';
 import './index.js'; // the real channel barrel: the voice channel brings the /voice command with it
 import { createAgentGroup } from '../db/agent-groups.js';
 import { closeDb, getDb, initTestDb } from '../db/connection.js';
-import { createMessagingGroup, createMessagingGroupAgent } from '../db/messaging-groups.js';
+import {
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  getMessagingGroupByPlatform,
+  updateMessagingGroupAgent,
+} from '../db/messaging-groups.js';
 import { runMigrations } from '../db/migrations/index.js';
-import { findVoiceModeLineByToken, hashLinkToken, type VoiceModeLine } from '../db/voice-mode-lines.js';
+import { findVoiceModeLineByToken, hashLinkToken, type VoiceModeLineRow } from '../db/voice-mode-lines.js';
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
 import { grantRole } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { getSessionsByAgentGroup } from '../db/sessions.js';
+import { resolveVoiceModeLine } from './voice-mode-line.js';
 import { routeInbound } from '../router.js';
 import type { MessagingGroup } from '../types.js';
 import {
@@ -76,7 +102,7 @@ async function wire(mgId: string, agentGroupId: string) {
   });
 }
 
-const lines = () => getDb().all<VoiceModeLine>('SELECT * FROM voice_mode_lines ORDER BY agent_group_id');
+const lines = () => getDb().all<VoiceModeLineRow>('SELECT * FROM voice_mode_lines ORDER BY agent_group_id');
 const mg = (id: string, isGroup = 0) =>
   ({ id, instance: null, channel_type: 'chat', is_group: isGroup }) as unknown as MessagingGroup;
 const linkFrom = async (who: string, chat = 'mg-dm', threadId: string | null = null) => {
@@ -126,6 +152,10 @@ describe('parseVoiceCommand / senderUserId', () => {
     expect(parseVoiceCommand('!voice', 'telegram')).toBeNull();
     expect(parseVoiceCommand('/voices', 'telegram')).toBeNull();
     expect(parseVoiceCommand('my /voice', 'telegram')).toBeNull();
+    expect(parseVoiceCommand('  /voice\tnew', 'telegram')).toEqual({ renew: true });
+    expect(parseVoiceCommand('/voice@', 'telegram')).toEqual({ renew: false });
+    expect(parseVoiceCommand('/voice-mode', 'telegram')).toBeNull();
+    expect(parseVoiceCommand('', 'telegram')).toBeNull();
   });
 
   it('reads the sender the way the permissions module does, namespacing a bare handle', () => {
@@ -154,6 +184,20 @@ describe('runVoiceCommand', () => {
     expect(line.line_id).toMatch(/^[0-9a-f]{12}$/);
     expect(JSON.stringify(line)).not.toContain(token);
     expect((await findVoiceModeLineByToken(token))?.line_id).toBe(line.line_id);
+  });
+
+  it("never replaces the link another admin's /voice created after this run looked for a line", async () => {
+    let ownerLink: string | undefined;
+    lineLookups.after = async () => {
+      ownerLink = await linkFrom(OWNER);
+    };
+    expect(await runVoiceCommand(mg('mg-other'), null, SCOPED_ADMIN, callUrl)).toEqual({
+      kind: 'done',
+      results: [{ ok: false, agentName: 'Andy', reason: 'other-caller' }],
+    });
+    expect(await lines()).toEqual([
+      expect.objectContaining({ owner_user_id: OWNER, token_hash: hashLinkToken(tokenOf(ownerLink!)) }),
+    ]);
   });
 
   it('on later runs only moves the call chat: no new link, the old one and its caller stay', async () => {
@@ -259,7 +303,7 @@ describe('findVoiceModeLineByToken', () => {
 describe('handleVoiceCommand (the interceptor)', () => {
   const delivered: Array<{ platformId: string; threadId: string | null; message: OutboundMessage }> = [];
 
-  async function startChat(supportsThreads: boolean, voiceRunning = false) {
+  async function startChat(supportsThreads: boolean, voiceRunning = false, failLinks = false) {
     delivered.length = 0;
     const defaults = {
       dm: {
@@ -281,6 +325,7 @@ describe('handleVoiceCommand (the interceptor)', () => {
         teardown: async () => {},
         isConnected: () => true,
         deliver: async (platformId, threadId, message) => {
+          if (failLinks && JSON.stringify(message).includes('?t=')) throw new Error('send failed');
           delivered.push({ platformId, threadId, message });
           return undefined;
         },
@@ -336,6 +381,43 @@ describe('handleVoiceCommand (the interceptor)', () => {
         message: { kind: 'chat', content: { text: expect.stringMatching(/voice\?t=[0-9a-f]{32}/) } },
       },
     ]);
+  });
+
+  it('tells the sender, without the link, when a minted link could not be delivered', async () => {
+    await startChat(false, false, true);
+    expect(await handleVoiceCommand(event('/voice', OWNER), callUrl)).toBe(true);
+    expect(await lines()).toHaveLength(1);
+    expect(delivered).toEqual([
+      {
+        platformId: 'chat:1',
+        threadId: null,
+        message: {
+          kind: 'chat',
+          content: { text: 'I could not deliver your call link; run /voice new for a fresh link.' },
+        },
+      },
+    ]);
+  });
+
+  it('says nothing about a lost link when the link reached the direct chat and only the group notice failed', async () => {
+    await startChat(false);
+    await chatGroup('mg-group', 'chat:G1', 1);
+    await wire('mg-group', 'ag-1');
+    const chat = (await import('./channel-registry.js')).getChannelAdapterExact('chat')!;
+    const deliver = chat.deliver.bind(chat);
+    chat.deliver = async (platformId, threadId, message) => {
+      if (platformId === 'chat:G1' && JSON.stringify(message).includes('Your call link is in our direct chat.')) {
+        throw new Error('group send failed');
+      }
+      return deliver(platformId, threadId, message);
+    };
+    await handleVoiceCommand(event('/voice', OWNER, 'chat:G1'), callUrl);
+    expect(delivered).toEqual([
+      expect.objectContaining({
+        message: { kind: 'chat', content: { text: expect.stringMatching(/voice\?t=[0-9a-f]{32}/) } },
+      }),
+    ]);
+    expect(delivered[0].platformId).not.toBe('chat:G1');
   });
 
   it("is claimed from core's routeInbound before any agent session sees it", async () => {
@@ -412,7 +494,7 @@ describe('handleVoiceCommand (the interceptor)', () => {
         message: { kind: 'chat', content: { text: 'Only an owner or admin of this agent can use /voice.' } },
       },
     ]);
-    expect(await getDb().all("SELECT id FROM messaging_groups WHERE platform_id = 'chat:2'")).toEqual([]);
+    expect(await getMessagingGroupByPlatform('chat', 'chat:2')).toBeUndefined();
   });
 
   it('binds a thread where the wiring keeps threads, and a top-level command to the chat itself', async () => {
@@ -425,8 +507,10 @@ describe('handleVoiceCommand (the interceptor)', () => {
     // Top level: the platform's thread id is the command's own id.
     await handleVoiceCommand(event('/voice', OWNER, 'chat:C1', 'chat:C1:171'), callUrl);
     expect((await lines())[0]).toMatchObject({ thread_id: null });
-    await getDb().run("UPDATE messaging_group_agents SET threads = 0 WHERE messaging_group_id = 'mg-chan'");
+    await updateMessagingGroupAgent('mga-mg-chan-ag-1', { threads: 0 });
     await handleVoiceCommand(event('/voice', OWNER, 'chat:C1', 'chat:C1:99'), callUrl);
     expect((await lines())[0]).toMatchObject({ messaging_group_id: 'mg-chan', thread_id: null });
   });
 });
+
+/** A line from before the rename, as main left it: its voice user, chat, wiring and OWNER as its owner. */

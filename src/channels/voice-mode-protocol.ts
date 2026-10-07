@@ -5,7 +5,7 @@
  */
 import { createHmac } from 'node:crypto';
 
-export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice';
+export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice-mode';
 
 /** The host pings the worker's event stream this often, so silence means a dead link. */
 export const PING_INTERVAL_MS = 15_000;
@@ -14,20 +14,24 @@ export const HOST_SILENCE_MS = 3 * PING_INTERVAL_MS;
 /** How long the worker waits for the host to answer one of its POSTs (a turn included). */
 export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
 
-/** Wire version of the job metadata; host and worker must agree, so they ship and restart together. */
-export const LIVEKIT_PROTOCOL_VERSION = 5;
+/**
+ * Wire version of the job metadata and the worker's attribute and topic names; host and worker
+ * must agree, so they ship and restart together.
+ */
+export const LIVEKIT_PROTOCOL_VERSION = 6;
+/** The worker's participant attribute with LIVEKIT_PROTOCOL_VERSION; native clients log it with a call. */
+export const CALL_PROTOCOL_ATTRIBUTE = 'nanoclaw.voice-mode.protocol';
 
-/** Streaming transcription over the Gemini Live API, verbatim. */
+/** Transcription over the Gemini Live API, verbatim, one manual activity per caller turn. */
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
-/** Unary transcription, used only while the streaming model fails: its quota is small. */
-export const DEFAULT_VOICE_STT_FALLBACK_MODEL = 'gemini-3.5-transcribe';
 export const DEFAULT_VOICE_TTS_MODEL = 'gemini-3.8-flash-tts';
 export const DEFAULT_VOICE_TTS_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
 export const DEFAULT_VOICE_TTS_VOICE = 'Alnilam';
 /** Silence that ends the caller's turn; shorter pauses mid-thought keep it open. */
 export const DEFAULT_VOICE_SILENCE_MS = 2500;
-/** Channel type of the fallback call chat when the `/voice` chat is no longer wired (VOICE_MODE_MIRROR). */
+/** Channel type of the default call chat when `/voice` has not set one (VOICE_MODE_MIRROR). */
 export const DEFAULT_VOICE_MIRROR = 'telegram';
+
 /** The languages callers speak when VOICE_MODE_LANGUAGES is unset (BCP-47; the first is the default). */
 export const DEFAULT_VOICE_LANGUAGES: readonly string[] = ['en-US'];
 const MAX_VOICE_LANGUAGES = 4;
@@ -64,10 +68,18 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
-  /** VOICE_MODE_LANGUAGES: the transcription's language hints; the first is the call's default. */
-  languages: string[];
+  /**
+   * VOICE_MODE_LANGUAGES: the transcription's language hints, the first the call's default. The host
+   * always sends them; a worker falls back to DEFAULT_VOICE_LANGUAGES when they are absent.
+   */
+  languages?: string[];
+  /**
+   * The agent's own voice.vocabulary.txt entries: besides `agentName`, the names the wake phrase
+   * `hey <agent>` takes (another script or spelling of it, say). Absent when the file has none.
+   */
+  wakeNames?: string[];
   sttModel: string;
-  /** Takes over while `sttModel` fails; empty for none. */
+  /** Deprecated and ignored (there is no unary fallback any more); kept for the wire format, empty by default. */
   sttFallbackModel: string;
   ttsModel: string;
   /** Takes over while `ttsModel` fails; empty for none. */
@@ -86,7 +98,10 @@ export interface LiveKitJobMetadata {
 export const CALL_THINKING_ATTRIBUTE = 'nanoclaw.voice-mode.thinking';
 /** The worker's participant attribute: "1" when it cannot serve this host's protocol version. */
 export const CALL_UPDATING_ATTRIBUTE = 'nanoclaw.voice-mode.updating';
-/** Text stream topic the worker sends JSON `CallTurnStatus` messages on, per caller turn. */
+/**
+ * Text stream topic the worker sends JSON `CallTurnStatus` messages on, per caller turn, and a
+ * `CallDroppedSpeech` for caller words it will never send.
+ */
 export const CALL_TURN_TOPIC = 'nanoclaw.voice-mode.turn';
 
 /**
@@ -101,17 +116,246 @@ export interface CallRoomMetadata {
 
 /**
  * What became of a caller turn: closed and on its way to the host (`sending`, once the closing
- * silence and the final transcript are in, before the host answers), sent to the agent, or lost
+ * silence and the final transcript are in, before the host answers), sent to the agent, picked up
+ * by it (`working`: after `sent`, at most once per turn, when the host's `working` event says the
+ * agent's runner works on what reached it after that turn, and no reply to it came first), or lost
  * because the transcription failed (`stt`) or heard no words (`empty`), or the host refused it
  * (`rejected`, `rate_limited`) or did not answer (`timeout`). Every turn handed to the host says
- * `sending` first; one lost to the transcription does not.
+ * `sending` first; one lost to the transcription does not. A page that does not know `sending`
+ * ignores it (and `working`), so neither needs a version bump.
  */
 export interface CallTurnStatus {
   turn: number;
-  status: 'sending' | 'sent' | 'lost';
+  status: 'sending' | 'sent' | 'working' | 'lost';
   reason?: 'stt' | 'rejected' | 'rate_limited' | 'timeout' | 'empty';
-  /** The final transcript, when there is one. */
+  /** The final transcript, when there is one; on `sending` only for a sent review draft. */
   text?: string;
+  /** On a sent review draft's `sending`: its `CallDraft.id`, so the page shows that text as the turn. */
+  draft?: number;
+}
+
+/**
+ * Caller words that will never be sent, on the turn topic: dropped by a spoken discard
+ * (`discarded`), heard while auto mode waits for the wake phrase (`unaddressed`), or a spoken
+ * command with nothing open to act on (`command`: a send word or a discard phrase said alone), or
+ * held by a turn the wake phrase opened that heard nothing more for too long (`asleep`).
+ * `text` is what was heard, for the page to mark those caption lines. It carries no turn number, so
+ * a page that does not know it ignores it. While an acoustic wake word waits, an `unaddressed` final
+ * is reported a few seconds late: a wake word spotted just after it may make it the turn after all.
+ */
+export interface CallDroppedSpeech {
+  dropped: 'discarded' | 'unaddressed' | 'command' | 'asleep';
+  text: string;
+  /** On `command`: which command had nothing to act on. */
+  command?: CallCommand;
+  /** On `command`: the `lk.segment_id` of its caption line. */
+  segment?: string;
+}
+
+/**
+ * On the turn topic: the caller started speaking while the agent's line played. Speech under the
+ * agent's is not transcribed, so none of it reaches the agent; the page says so. Additive: a page
+ * that does not know it ignores it.
+ */
+export interface CallUnheardSpeech {
+  unheard: 'agent_speaking';
+}
+
+/** The host takes a caller turn of at most this many UTF-8 bytes; a longer review draft cannot be sent. */
+export const MAX_TURN_TEXT_BYTES = 8 * 1024;
+
+/**
+ * Review mode: the caller taps talk, speaks, taps done, reads the draft and sends or discards it;
+ * nothing goes out on a pause. The worker's participant attribute is "1" when it runs review mode,
+ * and the page offers it only then. The page drives it with the RPCs below on the worker, and the
+ * worker sends every change of its `CallReviewState` on the topic.
+ */
+export const CALL_REVIEW_ATTRIBUTE = 'nanoclaw.voice-mode.review';
+/** Text stream topic the worker sends one JSON `CallReviewState` on whenever it changes. */
+export const CALL_REVIEW_TOPIC = 'nanoclaw.voice-mode.review';
+/** The RPC methods the worker registers for the page; each takes a `ReviewRequest` and answers a `ReviewReply`. */
+export const REVIEW_RPC = {
+  mode: 'nanoclaw.voice-mode.mode',
+  talk: 'nanoclaw.voice-mode.talk',
+  done: 'nanoclaw.voice-mode.done',
+  send: 'nanoclaw.voice-mode.send',
+  discard: 'nanoclaw.voice-mode.discard',
+  /** Auto mode's spoken-command settings and the cue switch (`ReviewRequest.wake`, `.pauseSends`, `.cues`). */
+  settings: 'nanoclaw.voice-mode.settings',
+} as const;
+export type ReviewOp = keyof typeof REVIEW_RPC;
+
+export type TurnMode = 'auto' | 'review';
+
+/**
+ * One review turn: `recording` from talk to done (the caller's audio reaches the transcription),
+ * `finishing` while the transcription is flushed, then the frozen text: `ready` to send, `empty`
+ * (nothing heard) or `failed` (the transcription did not finish; `text` is unverified). `tooLong`:
+ * over MAX_TURN_TEXT_BYTES. `reason`: it stopped without done, because a reply took the channel
+ * (`agent`), or it is an open auto turn the caller switched to review (`switch`).
+ */
+export interface CallDraft {
+  id: number;
+  state: 'recording' | 'finishing' | 'ready' | 'empty' | 'failed';
+  text: string;
+  tooLong?: boolean;
+  reason?: 'agent' | 'switch';
+}
+
+/**
+ * Auto mode's spoken commands (CALL_COMMAND_WORDS): a send word at the end of an utterance sends the
+ * turn now, a discard phrase there drops it, and with the wake switch `on` nothing is kept or sent until `hey <agent>`, or the
+ * worker's acoustic wake word (`CallWakeState.phrase`), is heard (`waiting` until then). After the
+ * wake phrase only a spoken send sends, unless `pauseSends` lets the closing silence send too. The
+ * worker's participant attribute is CALL_COMMANDS_VERSION when it understands them and the
+ * `settings` RPC; a page offers the commands only for the values it knows. The worker starts
+ * wake-gated until a client's `settings` say otherwise, so a page that does not know its value sends
+ * none and leaves it waiting for words the page never names: reload the page with the worker. An
+ * older worker sets none, and its auto mode has no commands.
+ */
+export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice-mode.commands';
+/**
+ * The commands' vocabulary: "1" had `over` as the send word; "2" is `zulu`, `copy` and `copy that`
+ * with the words announced in CALL_COMMAND_WORDS_ATTRIBUTE (the `send it` era also said "2"); "3" is
+ * the same words, bumped so a page from the `send it` era, which drives any "2" and quotes its own
+ * words, stops quoting the wrong ones. A page that accepts only "2" (the `send it` era's, or a
+ * `zulu` one already open across the bump) offers no commands and sends no `settings` to a "3"
+ * worker, which then stays wake-gated until that page is reloaded. A current page drives "2" and "3"
+ * alike; a page takes the words themselves from CALL_COMMAND_WORDS_ATTRIBUTE.
+ */
+export const CALL_COMMANDS_VERSION = '3';
+
+export type CallCommand = 'send' | 'discard';
+/**
+ * One spoken command as the caller says it (`say`, any script). `ownSentence`: it counts only as its
+ * own sentence, the whole utterance or after punctuation. `hint`: a page's short hints quote it.
+ */
+export interface CallCommandWord {
+  say: string;
+  ownSentence?: true;
+  hint?: true;
+}
+/** What the worker announces on CALL_COMMAND_WORDS_ATTRIBUTE, in display order. */
+export interface CallCommandWords {
+  v: 1;
+  send: CallCommandWord[];
+  discard: CallCommandWord[];
+}
+/**
+ * The spoken commands, the one source: the worker matches transcripts against them, gives them to
+ * the transcription as vocabulary, and announces them, so a page and an app quote the words it
+ * hears instead of their own copy.
+ */
+export const CALL_COMMAND_WORDS: CallCommandWords = {
+  v: 1,
+  send: [
+    { say: 'zulu', hint: true },
+    { say: 'copy', ownSentence: true, hint: true },
+    { say: 'copy that', ownSentence: true },
+    { say: 'прийом' },
+  ],
+  discard: [{ say: 'scratch that', hint: true }, { say: 'discard turn' }, { say: 'discard this turn' }],
+};
+/**
+ * The worker's participant attribute with CALL_COMMAND_WORDS as compact JSON, set with
+ * CALL_COMMANDS_ATTRIBUTE. Additive: a page without it uses its own list, and an old page ignores it.
+ */
+export const CALL_COMMAND_WORDS_ATTRIBUTE = 'nanoclaw.voice-mode.command-words';
+/**
+ * Attributes of a caller caption (`lk.transcription`, segment `SG_turn_<n>`) whose text ends in a
+ * spoken command, both or neither: the command (`send` or `discard`), and the caption's words before
+ * it, a prefix of the text with the separators before the command trimmed ("" when the command was
+ * said alone; the whole text when a final left the command out). On an interim, the command the
+ * worker acts on if the caller stops now; on a final, the one it acted on: a sent final's text is
+ * already only its words. A caption without them clears the line's mark: the command was words.
+ */
+export const CALL_CAPTION_COMMAND_ATTRIBUTE = 'nanoclaw.voice-mode.command';
+export const CALL_CAPTION_WORDS_ATTRIBUTE = 'nanoclaw.voice-mode.words';
+export interface CallWakeState {
+  on: boolean;
+  pauseSends: boolean;
+  waiting: boolean;
+  /**
+   * The phrase that opens a turn when the worker spots a wake word in the audio (`hey livekit`);
+   * absent when it matches `hey <agent>` in the transcript instead.
+   */
+  phrase?: string;
+  /** How many times this call the wake phrase opened a turn; grows on every wake, so a page that missed the awake state still sees it. */
+  heard?: number;
+  /** How many times this call an open turn went back to waiting because nothing more was said; grows on every one. */
+  slept?: number;
+  /**
+   * The last wake was the acoustic wake word, and the turn's transcription started right after the
+   * phrase: no transcript of the turn has it.
+   */
+  cut?: boolean;
+}
+
+/** The phrase the bundled wake word model (livekit-wakeword's `hey_livekit`) listens for. */
+export const DEFAULT_WAKE_PHRASE = 'Hey LiveKit';
+
+/**
+ * The wake phrase the page names: VOICE_MODE_WAKE_PHRASE, which says what the VOICE_MODE_WAKE_MODEL classifier
+ * listens for (`Hey LiveKit`, the bundled model's, when unset; shown as written); null when VOICE_MODE_WAKE_MODEL is `off`,
+ * and `hey <agent>` in the transcript opens a turn. The host tells the page before a call, the worker
+ * during one (CallWakeState.phrase; none while a model that failed to load leaves `hey <agent>`).
+ */
+export function wakePhrase(env: { VOICE_MODE_WAKE_MODEL?: string; VOICE_MODE_WAKE_PHRASE?: string }): string | null {
+  if (/^(off|none|0|false)$/i.test(env.VOICE_MODE_WAKE_MODEL?.trim() ?? '')) return null;
+  return env.VOICE_MODE_WAKE_PHRASE?.trim().replace(/\s+/g, ' ') || DEFAULT_WAKE_PHRASE;
+}
+
+/**
+ * The worker's review state; `seq` grows with every change, so the page keeps the newest.
+ * `preparing`: talk is setting up the recording's transcription; it answers once that can take audio
+ * (at most a few seconds), so the page keeps talk off meanwhile. Absent from an older worker.
+ */
+export interface CallReviewState {
+  seq: number;
+  mode: TurnMode;
+  draft: CallDraft | null;
+  preparing?: true;
+  /** Auto mode's wake switch, from a worker that understands spoken commands. */
+  wake?: CallWakeState;
+}
+
+/** `gen` is the page's own operation counter, echoed back; `draft` names the draft an operation is for. */
+export interface ReviewRequest {
+  gen: number;
+  draft?: number;
+  /** For `mode`: the mode to switch to; absent, the worker only sends its state again. */
+  mode?: TurnMode;
+  /** With `mode`: the newest worker turn number the page had seen, to hear of a turn sent meanwhile. */
+  afterTurn?: number;
+  /** For `settings`: the wake switch, whether a pause sends after the wake phrase, and the sound cues. */
+  wake?: boolean;
+  pauseSends?: boolean;
+  cues?: boolean;
+  /** For `settings`: the typing sound while the agent works (on unless the page says off; cues off silence it too). */
+  typing?: boolean;
+}
+
+/**
+ * What the worker did. `seq`: the state that shows it, which the page waits for on the topic.
+ * `draft`: the draft talk opened. `turn`: the turn number a sent draft got. `submitted`: on a switch
+ * to review, a turn auto mode had already sent after `afterTurn`. `error`: why nothing happened.
+ */
+export interface ReviewReply {
+  gen: number;
+  ok: boolean;
+  seq: number;
+  draft?: number;
+  turn?: number;
+  submitted?: number;
+  error?:
+    | 'stale'
+    | 'recording'
+    | 'finishing'
+    | 'draft_open'
+    | 'agent_speaking'
+    | 'not_review'
+    | 'unsendable'
+    | 'closed';
 }
 
 /**
@@ -121,7 +365,14 @@ export interface CallTurnStatus {
  * speech resumed, the turn went out or was dropped, or the agent speaks.
  */
 export const CALL_PENDING_ATTRIBUTE = 'nanoclaw.voice-mode.pending';
-/** Text stream topic the worker sends one JSON `CallReplyInfo` on right before each line it speaks. */
+/**
+ * The worker's sound cues go out on a second audio track of this name (the name agents-js's
+ * BackgroundAudioPlayer used; the worker feeds the track itself now), apart from the agent's speech
+ * track: a page plays it like the speech, and a cue never counts as the agent speaking. None plays
+ * while the agent speaks.
+ */
+export const CALL_CUE_TRACK = 'background_audio';
+/** Text stream topic the worker sends one JSON `CallReplyInfo` on right before each line it speaks, and again after one it could not. */
 export const CALL_REPLY_TOPIC = 'nanoclaw.voice-mode.reply';
 
 /**
@@ -137,6 +388,12 @@ export interface CallReplyInfo {
   notice?: boolean;
   part?: number;
   more?: boolean;
+  /**
+   * Sent after the line, with the same `reply`: it could not be synthesized (the speech model
+   * failed), so nothing was heard; `text` is what it would have said, for the page to show.
+   */
+  unspoken?: true;
+  text?: string;
 }
 
 /**
@@ -159,7 +416,9 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * One line of the host-to-worker event stream: a complete agent message to
  * speak (`turn`: the host's utterance id of the caller turn it answers, null
  * when it answers none of this call's turns), the agent still working (from the
- * host's typing refresh), whether the call now talks in a chat (`chat`; none
+ * host's typing refresh), the agent's runner working on what reached it since
+ * the call's latest turn (`working`, from the same refresh: the runner's own
+ * turn report, stamped after that turn landed), whether the call now talks in a chat (`chat`; none
  * until it does), a turn answered 504 that the agent's session stored after all
  * (`turn-stored`: its `turnKey` and the host's utterance id), the end of the
  * call, or a keepalive. A worker ignores a type it does not know, so new types
@@ -168,6 +427,7 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
 export type LiveKitHostEvent =
   | { type: 'reply'; text: string; turn?: string | null }
   | { type: 'thinking' }
+  | { type: 'working' }
   | { type: 'chat'; chat: boolean }
   | { type: 'turn-stored'; turnKey: string; id: string }
   | { type: 'end'; reason: string }
@@ -178,13 +438,16 @@ export type LiveKitHostEvent =
  * secret both processes already hold, so it never travels in the dispatch.
  */
 export function liveKitCallSecret(apiSecret: string, callId: string): string {
-  return createHmac('sha256', apiSecret).update(`nanoclaw-voice-call:${callId}`).digest('base64url');
+  return createHmac('sha256', apiSecret).update(`nanoclaw-voice-mode-call:${callId}`).digest('base64url');
 }
 
 /**
  * Where the worker reaches the host's webhook server; only ever from the worker's own settings. The
- * host answers the worker's routes for loopback peers only, so anything but a local HTTP(S) origin
- * is a misconfiguration and throws.
+ * host answers the worker's routes for loopback peers only, and every request carries the call's
+ * bearer secret and the caller's words, so anything but a local HTTP origin is a misconfiguration
+ * and throws. The webhook server speaks plain HTTP: an https origin means a TLS proxy in between,
+ * whose X-Forwarded-For the worker routes refuse. The error names the scheme and host only, never
+ * credentials.
  */
 export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: string }): string {
   const raw = (env.LIVEKIT_HOST_URL || `http://127.0.0.1:${env.WEBHOOK_PORT || '3000'}`).replace(/\/+$/, '');
@@ -194,11 +457,26 @@ export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: 
   } catch {
     // Reported below.
   }
-  const local = url && /^https?:$/.test(url.protocol) && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(url.hostname);
+  const local =
+    url !== null &&
+    url.protocol === 'http:' &&
+    /^(localhost|127\.0\.0\.1|\[::1\])$/.test(url.hostname) &&
+    !url.username &&
+    !url.password;
   if (!local) {
+    const got = url
+      ? `${url.protocol}//${url.host}${url.username || url.password ? ' with credentials' : ''}`
+      : 'no URL';
     throw new Error(
-      `LIVEKIT_HOST_URL must be a local http(s) address such as http://127.0.0.1:3000 (got "${raw}"): the host serves the worker on loopback only`,
+      `LIVEKIT_HOST_URL must be a local http address such as http://127.0.0.1:3000 (got ${got}): point it directly at the host's webhook port, never through a proxy`,
     );
   }
   return raw;
+}
+
+export function voiceModeEnvKeys(keys: readonly string[]): string[] {
+  return [...new Set(keys)];
+}
+export function voiceModeEnv(env: Record<string, string>, _warn: (message: string) => void): Record<string, string> {
+  return { ...env };
 }

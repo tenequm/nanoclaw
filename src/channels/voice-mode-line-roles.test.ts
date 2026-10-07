@@ -10,7 +10,7 @@ import { bindVoiceModeLineChat, mintVoiceModeLine } from '../db/voice-mode-lines
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
 import { createUser } from '../modules/permissions/db/users.js';
 import { grantRole, revokeRole } from '../modules/permissions/db/user-roles.js';
-import { linePlatformId, resolveVoiceLine, sameCallerAndAgent } from './voice-mode-line.js';
+import { linePlatformId, resolveVoiceModeLine, sameCallerAndAgent } from './voice-mode-line.js';
 
 const stamp = () => new Date().toISOString();
 const ADMIN = 'telegram:7';
@@ -42,7 +42,7 @@ afterEach(async () => {
 
 describe('voice line access (real central DB)', () => {
   it("resolves the line's agent and its caller, the user who minted the link", async () => {
-    expect(await resolveVoiceLine(await mint(ADMIN))).toEqual({
+    expect(await resolveVoiceModeLine(await mint(ADMIN))).toEqual({
       caller: { id: ADMIN, name: 'Ethan' },
       agentGroupId: 'ag-1',
       agent: { name: 'Andy' },
@@ -52,50 +52,63 @@ describe('voice line access (real central DB)', () => {
 
   it('lists the startup vocabulary on call setup only, and no names when none are configured', async () => {
     const line = await mint(ADMIN);
-    expect((await resolveVoiceLine(line, { forCall: true, vocabulary: 'Acme, k8s' }))?.agent.vocabulary).toEqual([
+    expect((await resolveVoiceModeLine(line, { forCall: true, vocabulary: 'Acme, k8s' }))?.agent.vocabulary).toEqual([
       'Acme',
       'k8s',
     ]);
-    expect((await resolveVoiceLine(line, { vocabulary: 'Acme' }))?.agent.vocabulary).toBeUndefined();
-    expect((await resolveVoiceLine(line, { forCall: true }))?.agent.vocabulary).toBeUndefined();
+    expect((await resolveVoiceModeLine(line, { vocabulary: 'Acme' }))?.agent.vocabulary).toBeUndefined();
+    expect((await resolveVoiceModeLine(line, { forCall: true }))?.agent.vocabulary).toBeUndefined();
   });
 
   it('denies a caller whose role was revoked, a plain member, and unknown lines', async () => {
     const line = await mint(ADMIN);
     await revokeRole(ADMIN, 'admin', 'ag-1');
-    expect(await resolveVoiceLine(line)).toBeNull();
-    expect(await resolveVoiceLine(await mint(MEMBER))).toBeNull();
-    expect(await resolveVoiceLine('voice-mode:000000000000')).toBeNull();
-    expect(await resolveVoiceLine('telegram:7')).toBeNull();
+    expect(await resolveVoiceModeLine(line)).toBeNull();
+    expect(await resolveVoiceModeLine(await mint(MEMBER))).toBeNull();
+    expect(await resolveVoiceModeLine('voice-mode:000000000000')).toBeNull();
+    expect(await resolveVoiceModeLine('telegram:7')).toBeNull();
   });
 
   it('ends a call once its link is re-minted, even by the same caller', async () => {
     const line = await mint(ADMIN);
-    const before = (await resolveVoiceLine(line))!;
-    expect(sameCallerAndAgent(before, (await resolveVoiceLine(line))!)).toBe(true);
+    const before = (await resolveVoiceModeLine(line))!;
+    expect(sameCallerAndAgent(before, (await resolveVoiceModeLine(line))!)).toBe(true);
     await mint(ADMIN);
-    expect(sameCallerAndAgent(before, (await resolveVoiceLine(line))!)).toBe(false);
+    expect(sameCallerAndAgent(before, (await resolveVoiceModeLine(line))!)).toBe(false);
   });
 
   it('keeps a call going when /voice only moves the line to another chat', async () => {
     const line = await mint(ADMIN);
-    const before = (await resolveVoiceLine(line))!;
+    const before = (await resolveVoiceModeLine(line))!;
     await bindVoiceModeLineChat({
       agentGroupId: 'ag-1',
       callerUserId: ADMIN,
       messagingGroupId: 'mg-2',
       threadId: null,
     });
-    expect(sameCallerAndAgent(before, (await resolveVoiceLine(line))!)).toBe(true);
+    expect(sameCallerAndAgent(before, (await resolveVoiceModeLine(line))!)).toBe(true);
   });
 
   it('names the caller by id when the user has no display name, and ends a call when someone else re-mints', async () => {
     const line = await mint(ADMIN);
-    const before = (await resolveVoiceLine(line))!;
+    const before = (await resolveVoiceModeLine(line))!;
     await grantRole({ user_id: MEMBER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: stamp() });
     expect(await mint(MEMBER)).toBe(line);
-    const after = (await resolveVoiceLine(line))!;
+    const after = (await resolveVoiceModeLine(line))!;
     expect(after.caller).toEqual({ id: MEMBER, name: MEMBER });
     expect(sameCallerAndAgent(before, after)).toBe(false);
   });
+});
+
+it('retires hashed links without dropping the module table, and supports reinstallation', async () => {
+  const { retireVoiceModeLines, findVoiceModeLineByToken } = await import('../db/voice-mode-lines.js');
+  const token = (
+    await mintVoiceModeLine({ agentGroupId: 'ag-1', ownerUserId: ADMIN, messagingGroupId: 'mg-1', threadId: null })
+  ).token;
+  expect(await findVoiceModeLineByToken(token)).toBeDefined();
+  await retireVoiceModeLines();
+  await retireVoiceModeLines();
+  expect(await findVoiceModeLineByToken(token)).toBeUndefined();
+  await runMigrations((await import('../db/connection.js')).getDb());
+  expect(await mint(ADMIN)).toMatch(/^voice-mode:/);
 });

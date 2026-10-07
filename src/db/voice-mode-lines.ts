@@ -9,7 +9,7 @@
  * run produced. No foreign keys into core tables: a line whose chat was deleted, unwired or denied
  * is ignored by its reader (src/channels/voice-mode-livekit.ts), never an integrity error.
  */
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import { getDb } from './connection.js';
 import { registerMigration } from './migrations/index.js';
@@ -33,7 +33,7 @@ registerMigration({
   },
 });
 
-export interface VoiceModeLine {
+export interface VoiceModeLineRow {
   /** Random and stable for the line's life; calls, rooms and limits are keyed by it, not by the token. */
   line_id: string;
   agent_group_id: string;
@@ -48,14 +48,17 @@ export interface VoiceModeLine {
   updated_at: string;
 }
 
+/** Hex SHA-256 of a call-link token: what the table stores and looks a link up by. */
 export const hashLinkToken = (token: string): string => createHash('sha256').update(token).digest('hex');
 
-export async function getVoiceModeLine(lineId: string): Promise<VoiceModeLine | undefined> {
-  return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE line_id = ?', lineId);
+/** The line with this line id (a `voice-mode:` platform id without its prefix). */
+export async function getVoiceModeLine(lineId: string): Promise<VoiceModeLineRow | undefined> {
+  return getDb().get<VoiceModeLineRow>('SELECT * FROM voice_mode_lines WHERE line_id = ?', lineId);
 }
 
-export async function getVoiceModeLineForAgent(agentGroupId: string): Promise<VoiceModeLine | undefined> {
-  return getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE agent_group_id = ?', agentGroupId);
+/** The agent's line; an agent has at most one. */
+export async function getVoiceModeLineForAgent(agentGroupId: string): Promise<VoiceModeLineRow | undefined> {
+  return getDb().get<VoiceModeLineRow>('SELECT * FROM voice_mode_lines WHERE agent_group_id = ?', agentGroupId);
 }
 
 /**
@@ -67,8 +70,8 @@ export async function bindVoiceModeLineChat(target: {
   callerUserId: string;
   messagingGroupId: string;
   threadId: string | null;
-}): Promise<VoiceModeLine | undefined> {
-  return getDb().get<VoiceModeLine>(
+}): Promise<VoiceModeLineRow | undefined> {
+  return getDb().get<VoiceModeLineRow>(
     `UPDATE voice_mode_lines SET messaging_group_id = ?, thread_id = ?, updated_at = ?
        WHERE agent_group_id = ? AND owner_user_id = ? RETURNING *`,
     target.messagingGroupId,
@@ -80,35 +83,34 @@ export async function bindVoiceModeLineChat(target: {
 }
 
 /** The line a call-link token opens, or undefined. Only hashes are compared: the token is stored nowhere. */
-export async function findVoiceModeLineByToken(token: string): Promise<VoiceModeLine | undefined> {
+export async function findVoiceModeLineByToken(token: string): Promise<VoiceModeLineRow | undefined> {
   if (!/^[0-9a-f]{32}$/.test(token)) return undefined;
-  const hash = hashLinkToken(token);
-  const row = await getDb().get<VoiceModeLine>('SELECT * FROM voice_mode_lines WHERE token_hash = ?', hash);
-  // The row was found by an equal hash; the constant-time check keeps the comparison explicit.
-  return row && timingSafeEqual(Buffer.from(row.token_hash, 'hex'), Buffer.from(hash, 'hex')) ? row : undefined;
+  return getDb().get<VoiceModeLineRow>('SELECT * FROM voice_mode_lines WHERE token_hash = ?', hashLinkToken(token));
 }
 
-/**
- * Mint a new call link for the agent's line (creating the line on first use), make `ownerUserId` its
- * caller and the given chat its call chat. The previous link stops working. Returns the line and
- * the new token, which is stored nowhere: the caller hands it out once.
- */
-export async function mintVoiceModeLine(target: {
+/** Who a minted link is for and where its calls talk. */
+export interface VoiceModeLineTarget {
   agentGroupId: string;
   ownerUserId: string;
   messagingGroupId: string;
   threadId: string | null;
-}): Promise<{ line: VoiceModeLine; token: string }> {
+}
+
+/**
+ * Insert the agent's line with a fresh token, or apply `onConflict` (an `ON CONFLICT` action) to the
+ * one it has. Undefined when the conflict action returned no row (`DO NOTHING`).
+ */
+async function insertLine(
+  target: VoiceModeLineTarget,
+  onConflict: string,
+): Promise<{ line: VoiceModeLineRow; token: string } | undefined> {
   const token = randomBytes(16).toString('hex');
   const now = new Date().toISOString();
-  const line = await getDb().get<VoiceModeLine>(
+  const line = await getDb().get<VoiceModeLineRow>(
     `INSERT INTO voice_mode_lines
        (line_id, agent_group_id, token_hash, owner_user_id, messaging_group_id, thread_id, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT (agent_group_id) DO UPDATE SET
-       token_hash = excluded.token_hash, owner_user_id = excluded.owner_user_id,
-       messaging_group_id = excluded.messaging_group_id, thread_id = excluded.thread_id,
-       updated_at = excluded.updated_at
+     ON CONFLICT (agent_group_id) ${onConflict}
      RETURNING *`,
     randomBytes(6).toString('hex'),
     target.agentGroupId,
@@ -119,6 +121,38 @@ export async function mintVoiceModeLine(target: {
     now,
     now,
   );
-  if (!line) throw new Error('voice-mode: the line was not stored');
-  return { line, token };
+  return line && { line, token };
+}
+
+/**
+ * Mint a new call link for the agent's line (creating the line on first use), make `ownerUserId` its
+ * caller and the given chat its call chat. The previous link stops working. Returns the line and
+ * the new token, which is stored nowhere: the caller hands it out once.
+ */
+export async function mintVoiceModeLine(
+  target: VoiceModeLineTarget,
+): Promise<{ line: VoiceModeLineRow; token: string }> {
+  const minted = await insertLine(
+    target,
+    `DO UPDATE SET
+       token_hash = excluded.token_hash, owner_user_id = excluded.owner_user_id,
+       messaging_group_id = excluded.messaging_group_id, thread_id = excluded.thread_id,
+       updated_at = excluded.updated_at`,
+  );
+  if (!minted) throw new Error('voice-mode: the line was not stored');
+  return minted;
+}
+
+/**
+ * Create the agent's line with a first call link, as mintVoiceModeLine does, but never replace one:
+ * undefined when the agent already has a line, so a link another run just handed out keeps working.
+ */
+export async function createVoiceModeLine(
+  target: VoiceModeLineTarget,
+): Promise<{ line: VoiceModeLineRow; token: string } | undefined> {
+  return insertLine(target, 'DO NOTHING');
+}
+
+export async function retireVoiceModeLines(): Promise<void> {
+  await getDb().run('DELETE FROM voice_mode_lines');
 }
