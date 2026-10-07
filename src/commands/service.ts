@@ -28,8 +28,8 @@
  */
 import fs from 'fs';
 
-import { resolveThreadPolicy } from '../channels/channel-defaults.js';
-import { getChannelAdapter, getChannelAdapterExact, getChannelDefaults } from '../channels/channel-registry.js';
+import { wiringThreadsEnabled } from '../channels/channel-defaults.js';
+import { getChannelAdapterExact } from '../channels/channel-registry.js';
 import { restartAgentGroupContainers } from '../container-restart.js';
 import { isContainerRunning, killContainer } from '../container-runner.js';
 import { getAgentGroup } from '../db/agent-groups.js';
@@ -52,7 +52,7 @@ import { log } from '../log.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { countDueMessages, openInboundDb } from '../mailbox/sqlite/session-db.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
-import type { ContainerConfigRow, EngageMode, MessagingGroup, MessagingGroupAgent, Session } from '../types.js';
+import type { ContainerConfigRow, EngageMode, MessagingGroup, Session } from '../types.js';
 import { voiceAccess } from './auth.js';
 import { readTranscriptStats } from './transcript.js';
 import {
@@ -567,7 +567,7 @@ export type VoiceLinkFn = (line: MessagingGroup) => string | null;
 
 /** Asks the live voice adapter, the only holder of the link tokens. */
 const liveVoiceLink: VoiceLinkFn = (line) => {
-  // Structural, not voice-mode.ts's VoiceChannelAdapter: core must still build once add-voice-mode is removed.
+  // Structural, not voice-mode.ts's VoiceModeChannelAdapter: core must still build once add-voice-mode is removed.
   const adapter = getChannelAdapterExact(line.instance ?? line.channel_type) as
     | { callLink?(platformId: string): string | null }
     | undefined;
@@ -575,29 +575,41 @@ const liveVoiceLink: VoiceLinkFn = (line) => {
 };
 
 /** The agent's voice lines: its `voice` messaging groups (a chat is wired to an agent at most once). */
-async function voiceLinesOf(agentGroupId: string): Promise<MessagingGroup[]> {
+export async function voiceLinesOf(agentGroupId: string): Promise<MessagingGroup[]> {
   return (await getMessagingGroupsByAgentGroup(agentGroupId)).filter((g) => g.channel_type === 'voice' && !g.denied_at);
 }
 
-export async function hasVoiceLine(agentGroupId: string): Promise<boolean> {
-  return getChannelAdapterExact('voice-mode') !== undefined || (await voiceLinesOf(agentGroupId)).length > 0;
+/**
+ * Whether a chat with these agents offers /voice: always while the voice-mode channel runs (an
+ * admin's first /voice creates a line), else where one of them has a voice line.
+ */
+export async function offersVoiceCommand(agentGroupIds: Iterable<string>): Promise<boolean> {
+  if (getChannelAdapterExact('voice-mode') !== undefined) return true;
+  for (const id of agentGroupIds) if ((await voiceLinesOf(id)).length > 0) return true;
+  return false;
 }
 
 /**
- * The thread a call should talk in for this wiring: none when the wiring keeps
- * no threads (its turns would land in the chat's shared session anyway), else
- * the one /voice was run in.
+ * Make the chat (and thread) the call chat of each of these voice lines `ownerUserId` owns; returns
+ * the lines moved. Ownership is checked in the same write, so a line whose owners just changed stays.
  */
-function callChatThread(wiring: MessagingGroupAgent, mg: MessagingGroup, threadId: string | null): string | null {
-  if (threadId === null) return null;
-  const adapter = getChannelAdapter(mg.instance ?? mg.channel_type);
-  const threads = resolveThreadPolicy(
-    wiring.threads ?? null,
-    getChannelDefaults(mg.instance ?? mg.channel_type, mg.channel_type),
-    mg.is_group === 1,
-    adapter?.supportsThreads === true,
-  );
-  return threads ? threadId : null;
+export async function rebindVoiceLines<T extends Pick<MessagingGroup, 'id'>>(
+  lines: readonly T[],
+  ownerUserId: string,
+  targetMessagingGroupId: string,
+  threadId: string | null,
+): Promise<T[]> {
+  const bound: T[] = [];
+  for (const line of lines) {
+    const ok = await setVoiceLineTarget({
+      lineMessagingGroupId: line.id,
+      ownerUserId,
+      targetMessagingGroupId,
+      threadId,
+    });
+    if (ok) bound.push(line);
+  }
+  return bound;
 }
 
 /**
@@ -633,18 +645,16 @@ export async function setVoiceTarget(
   });
   if (linked.length === 0) return fail('voice-unavailable');
 
-  const threadId = callChatThread(wiring, mg, chat.threadId);
-  const bound: typeof linked = [];
-  for (const entry of linked) {
-    const ok = await setVoiceLineTarget({
-      lineMessagingGroupId: entry.line.id,
-      ownerUserId: actorUserId,
-      targetMessagingGroupId: chat.messagingGroupId,
-      threadId,
-    });
-    // The owners changed since the read above: that line is no longer theirs to hand out.
-    if (ok) bound.push(entry);
-  }
+  // A wiring that keeps no threads would land the call's turns in the chat's shared session anyway.
+  const threadId = chat.threadId !== null && wiringThreadsEnabled(wiring, mg) ? chat.threadId : null;
+  // A line left out had its owners changed since the read above: it is no longer theirs to hand out.
+  const moved = await rebindVoiceLines(
+    linked.map(({ line }) => line),
+    actorUserId,
+    chat.messagingGroupId,
+    threadId,
+  );
+  const bound = linked.filter(({ line }) => moved.includes(line));
   if (bound.length === 0) return fail('no-voice-line');
   log.info('Voice call chat set via chat command', {
     agentGroupId,

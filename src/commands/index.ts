@@ -12,8 +12,10 @@ export {
   setConfigValue,
   setActivation,
   restartAgent,
-  hasVoiceLine,
+  offersVoiceCommand,
+  rebindVoiceLines,
   setVoiceTarget,
+  voiceLinesOf,
   runVoiceCommand,
   type VoiceLinkFn,
 } from './service.js';

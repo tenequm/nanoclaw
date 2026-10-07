@@ -25,7 +25,7 @@
  */
 import { getAllMessagingGroups, getMessagingGroupAgents } from '../../../db/messaging-groups.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../../../modules/permissions/db/user-roles.js';
-import { COMMAND_ORDER, hasVoiceLine, type CommandName } from '../../../commands/index.js';
+import { COMMAND_ORDER, offersVoiceCommand, type CommandName } from '../../../commands/index.js';
 
 const TELEGRAM_CHANNEL = 'telegram';
 
@@ -108,23 +108,14 @@ export async function computeCommandGrants(): Promise<CommandGrant[]> {
     return ids;
   };
 
-  // /voice only where an agent of the chat has a voice line to hand out, and then first in the popup.
-  const voiceCache = new Map<string, boolean>();
-  const anyVoiceLine = async (agentGroupIds: Iterable<string>): Promise<boolean> => {
-    for (const id of agentGroupIds) {
-      if (!voiceCache.has(id)) voiceCache.set(id, await hasVoiceLine(id));
-      if (voiceCache.get(id)) return true;
-    }
-    return false;
-  };
-
   const grants: CommandGrant[] = [];
   for (const acc of chats.values()) {
     const admins = new Set(globalAdminUserIds);
     for (const agId of acc.agentGroupIds) {
       for (const uid of await scopedAdminsOf(agId)) admins.add(uid);
     }
-    const commands: readonly CommandName[] = (await anyVoiceLine(acc.agentGroupIds))
+    // /voice only where the chat offers it (offersVoiceCommand), and then first in the popup.
+    const commands: readonly CommandName[] = (await offersVoiceCommand(acc.agentGroupIds))
       ? ['voice', ...COMMAND_ORDER]
       : COMMAND_ORDER;
 

@@ -15,9 +15,9 @@
  * Slack/Discord, and non-threaded group platforms have null threadIds).
  */
 import type { ChannelDefaults } from './adapter.js';
-import { getChannelDefaults, hasDeclaredChannelDefaults } from './channel-registry.js';
+import { getChannelAdapter, getChannelDefaults, hasDeclaredChannelDefaults } from './channel-registry.js';
 import { log } from '../log.js';
-import type { MessagingGroup } from '../types.js';
+import type { MessagingGroup, MessagingGroupAgent } from '../types.js';
 
 function escapeRegex(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -137,6 +137,20 @@ export function resolveThreadPolicy(
   const inherited = (isGroup ? decl.group : decl.dm).threads;
   const wanted = wiringThreads === null ? inherited : wiringThreads !== 0;
   return wanted && supportsThreads;
+}
+
+/**
+ * resolveThreadPolicy for one wiring of a stored chat, keyed the way the router keys it: the
+ * chat's instance for the declaration and the live adapter's thread capability.
+ */
+export function wiringThreadsEnabled(wiring: Pick<MessagingGroupAgent, 'threads'>, mg: MessagingGroup): boolean {
+  const key = mg.instance ?? mg.channel_type;
+  return resolveThreadPolicy(
+    wiring.threads ?? null,
+    getChannelDefaults(key, mg.channel_type),
+    mg.is_group === 1,
+    getChannelAdapter(key)?.supportsThreads === true,
+  );
 }
 
 export interface EngageValues {

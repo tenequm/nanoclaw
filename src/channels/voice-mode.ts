@@ -21,13 +21,8 @@ import http from 'node:http';
 import net from 'node:net';
 
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundEvent, OutboundMessage } from './adapter.js';
-import { resolveThreadPolicy } from './channel-defaults.js';
-import {
-  getChannelAdapter,
-  getChannelAdapterExact,
-  getChannelDefaults,
-  registerChannelAdapter,
-} from './channel-registry.js';
+import { wiringThreadsEnabled } from './channel-defaults.js';
+import { getChannelAdapterExact, registerChannelAdapter } from './channel-registry.js';
 import type { VoiceModeUiConfig } from './voice-mode-page.js';
 import {
   LEGACY_VOICE_CHANNEL,
@@ -45,11 +40,11 @@ import {
   voiceModeEnvKeys,
   parseVoiceLanguages,
 } from './voice-mode-protocol.js';
-import { getMessagingGroupAgentByPair, getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
+import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
 import { findVoiceModeLineByToken } from '../db/voice-mode-lines.js';
-import { routeVoiceModeTurn } from './voice-mode-route.js';
+import { routeVoiceModeTurn, type VoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand } from './voice-mode-command.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
@@ -239,19 +234,15 @@ export async function findCallSession(
   route: Omit<InboundEvent, 'message'>,
   agentGroupId: string,
 ): Promise<Session | undefined> {
-  const instance = route.instance ?? route.channelType;
-  const found = await getMessagingGroupWithAgentCount(route.channelType, route.platformId, instance);
-  if (!found) return undefined;
-  const { mg } = found;
+  const mg = await getMessagingGroupByPlatform(
+    route.channelType,
+    route.platformId,
+    route.instance ?? route.channelType,
+  );
+  if (!mg) return undefined;
   const wiring = await getMessagingGroupAgentByPair(mg.id, agentGroupId);
   if (!wiring) return undefined;
-  const supportsThreads = getChannelAdapter(instance)?.supportsThreads === true;
-  const threadsEnabled = resolveThreadPolicy(
-    wiring.threads ?? null,
-    getChannelDefaults(mg.instance ?? mg.channel_type, mg.channel_type),
-    mg.is_group === 1,
-    supportsThreads,
-  );
+  const threadsEnabled = wiringThreadsEnabled(wiring, mg);
   const threadId = threadsEnabled ? route.threadId : null;
   const mode =
     threadsEnabled && wiring.session_mode !== 'agent-shared' && mg.is_group !== 0 ? 'per-thread' : wiring.session_mode;
@@ -290,7 +281,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       if (line) return `voice-mode:${line.line_id}`;
       if (!tokens.has(token)) return null;
       const legacy = legacyLineIdForToken(token);
-      const old = await getMessagingGroupWithAgentCount(LEGACY_VOICE_CHANNEL, legacy, LEGACY_VOICE_CHANNEL);
+      const old = await getMessagingGroupByPlatform(LEGACY_VOICE_CHANNEL, legacy, LEGACY_VOICE_CHANNEL);
       return old ? legacy : lineIdForToken(token);
     });
   const proxyPolicy: VoiceModeProxyPolicy = {
@@ -384,21 +375,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     admitStart,
     remainingTodayMs: (platformId, t) => maxCallMsPerDay - usedTodayMs(platformId, t),
     chargeUsage,
-    routeTurn: async (event) => {
+    routeTurn: async (event, turn) => {
       if (!setup) throw new Error('the voice-mode channel is not running');
-      let stored = false;
-      const routed = {
-        ...event,
-        onStored: (session: Session) => {
-          stored = true;
-          expediteReplies(session);
-        },
-      };
+      const routed = { ...event, onStored: expediteReplies };
       try {
-        const accepted = config.routeTurn
-          ? await config.routeTurn(routed)
-          : await routeVoiceModeTurn(routed, event.agentGroupId!);
-        return stored || accepted;
+        return await (config.routeTurn ? config.routeTurn(routed) : routeVoiceModeTurn(routed, turn));
       } catch (err) {
         log.error('livekit-voice-mode: routing a turn failed', { platformId: event.platformId, err });
         throw err;

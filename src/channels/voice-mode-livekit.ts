@@ -45,6 +45,7 @@ import { AccessToken, AgentDispatchClient, RoomServiceClient, TrackSource } from
 import type { ChannelAdapter, InboundEvent } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
 import { callPageHtml, type VoiceModeUiConfig } from './voice-mode-page.js';
+import type { VoiceModeTurn } from './voice-mode-route.js';
 import {
   LEGACY_VOICE_CHANNEL,
   lineChannelType,
@@ -242,7 +243,7 @@ export interface LiveKitHost {
    * true once the agent's session stored it (to answer, or as context), false when the router dropped it;
    * rejects when routing threw.
    */
-  routeTurn(event: InboundEvent): Promise<boolean>;
+  routeTurn(event: InboundEvent, turn: VoiceModeTurn): Promise<boolean>;
   /**
    * The caller joined: `route` is where the call's turns go now (`agentGroupId`: the line's agent).
    * Wakes that agent's existing session once, before the first turn (none is created); a long
@@ -1112,7 +1113,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         isMention: true,
         isGroup: chat ? chat.group.is_group !== 0 : false,
       };
-      routed = host.routeTurn({ ...turnRoute(call, chat), message });
+      routed = host.routeTurn(
+        { ...turnRoute(call, chat), message },
+        { callerId: sender.id, chat: chat?.group ?? null },
+      );
       // Shown once the agent has it, even when that comes after the worker was told it timed out.
       if (chat) {
         void routed.then(

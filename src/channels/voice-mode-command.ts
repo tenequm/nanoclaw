@@ -13,23 +13,18 @@
  * sender or an unwired chat gets nothing.
  */
 import type { InboundEvent } from './adapter.js';
-import { resolveThreadPolicy } from './channel-defaults.js';
-import { getChannelAdapter, getChannelAdapterExact, getChannelDefaults } from './channel-registry.js';
+import { wiringThreadsEnabled } from './channel-defaults.js';
+import { getChannelAdapter, getChannelAdapterExact } from './channel-registry.js';
+import { rebindVoiceLines, voiceLinesOf } from '../commands/index.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
-import {
-  bindVoiceModeLineChat,
-  getVoiceModeLineForAgent,
-  getLegacyVoiceModeLinesForAgent,
-  mintVoiceModeLine,
-} from '../db/voice-mode-lines.js';
-import { isVoiceLineOwner, setVoiceLineTarget } from '../db/voice-lines.js';
+import { bindVoiceModeLineChat, getVoiceModeLineForAgent, mintVoiceModeLine } from '../db/voice-mode-lines.js';
 import { log } from '../log.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { getUser } from '../modules/permissions/db/users.js';
 import { ensureUserDm } from '../modules/permissions/user-dm.js';
 import { registerMessageInterceptor } from '../router.js';
-import type { MessagingGroup, MessagingGroupAgent } from '../types.js';
+import type { MessagingGroup } from '../types.js';
 import type { VoiceModeChannelAdapter } from './voice-mode.js';
 
 /** Channels whose client intercepts `/`: the command is typed `!voice` there. */
@@ -49,12 +44,12 @@ async function mintsAnyLink(mg: MessagingGroup, userId: string, renew: boolean):
   if (!(await getUser(userId))) return false;
   for (const wiring of await getMessagingGroupAgents(mg.id)) {
     if (!(await hasAdminPrivilege(userId, wiring.agent_group_id))) continue;
-    if (
-      renew ||
-      (!(await getVoiceModeLineForAgent(wiring.agent_group_id)) &&
-        (await getLegacyVoiceModeLinesForAgent(wiring.agent_group_id)).length === 0)
-    )
-      return true;
+    if (renew) return true;
+    const [line, legacy] = await Promise.all([
+      getVoiceModeLineForAgent(wiring.agent_group_id),
+      voiceLinesOf(wiring.agent_group_id),
+    ]);
+    if (!line && legacy.length === 0) return true;
   }
   return false;
 }
@@ -107,19 +102,6 @@ export type VoiceCommandOutcome =
   | { kind: 'refused' }
   | { kind: 'done'; results: VoiceTargetResult[] };
 
-/** The thread a call should talk in: none when the wiring keeps no threads, else the one /voice was run in. */
-function callChatThread(wiring: MessagingGroupAgent, mg: MessagingGroup, threadId: string | null): string | null {
-  if (threadId === null) return null;
-  const adapter = getChannelAdapter(mg.instance ?? mg.channel_type);
-  const threads = resolveThreadPolicy(
-    wiring.threads ?? null,
-    getChannelDefaults(mg.instance ?? mg.channel_type, mg.channel_type),
-    mg.is_group === 1,
-    adapter?.supportsThreads === true,
-  );
-  return threads ? threadId : null;
-}
-
 /**
  * /voice over a chat's wired agents: unknown senders are dropped silently, known senders without
  * an owner or admin role over any of them are refused, and for every agent the sender administers
@@ -148,30 +130,19 @@ export async function runVoiceCommand(
       results.push({ ok: false, agentName: ag.name, reason: 'voice-unavailable' });
       continue;
     }
-    const callThread = callChatThread(wiring, mg, threadId);
-    if (!renew && !(await getVoiceModeLineForAgent(ag.id))) {
-      const legacy = await getLegacyVoiceModeLinesForAgent(ag.id);
-      if (legacy.length) {
-        let rebound = false;
-        for (const line of legacy) {
-          if (!(await isVoiceLineOwner(line.id, userId))) continue;
-          rebound =
-            (await setVoiceLineTarget({
-              lineMessagingGroupId: line.id,
-              ownerUserId: userId,
-              targetMessagingGroupId: mg.id,
-              threadId: callThread,
-            })) || rebound;
-        }
-        results.push(
-          rebound
-            ? { ok: true, agentName: ag.name, rebound: true }
-            : { ok: false, agentName: ag.name, reason: 'other-caller' },
-        );
-        continue;
-      }
+    // None when the wiring keeps no threads, else the one /voice was run in.
+    const callThread = threadId !== null && wiringThreadsEnabled(wiring, mg) ? threadId : null;
+    const [current, legacy] = await Promise.all([getVoiceModeLineForAgent(ag.id), voiceLinesOf(ag.id)]);
+    if (!renew && !current && legacy.length > 0) {
+      const rebound = (await rebindVoiceLines(legacy, userId, mg.id, callThread)).length > 0;
+      results.push(
+        rebound
+          ? { ok: true, agentName: ag.name, rebound: true }
+          : { ok: false, agentName: ag.name, reason: 'other-caller' },
+      );
+      continue;
     }
-    if (!renew) {
+    if (!renew && current) {
       const moved = await bindVoiceModeLineChat({
         agentGroupId: ag.id,
         callerUserId: userId,
@@ -187,17 +158,12 @@ export async function runVoiceCommand(
           userId,
         });
         results.push({ ok: true, agentName: ag.name, rebound: true });
-        continue;
-      }
-      if (await getVoiceModeLineForAgent(ag.id)) {
+      } else {
         results.push({ ok: false, agentName: ag.name, reason: 'other-caller' });
-        continue;
       }
+      continue;
     }
-    const replaced =
-      renew &&
-      ((await getVoiceModeLineForAgent(ag.id)) !== undefined ||
-        (await getLegacyVoiceModeLinesForAgent(ag.id)).length > 0);
+    const replaced = renew && (current !== undefined || legacy.length > 0);
     const { line, token } = await mintVoiceModeLine({
       agentGroupId: ag.id,
       ownerUserId: userId,

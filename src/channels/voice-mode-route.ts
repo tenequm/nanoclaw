@@ -8,13 +8,21 @@
  * thinking through core's typing observer (src/channels/voice-mode-livekit.ts).
  */
 import type { InboundEvent } from './adapter.js';
-import { resolveThreadPolicy } from './channel-defaults.js';
-import { getChannelAdapter, getChannelDefaults } from './channel-registry.js';
+import { wiringThreadsEnabled } from './channel-defaults.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { onHostStart } from '../host-lifecycle.js';
 import { deliverToAgent } from '../router.js';
+import type { MessagingGroup } from '../types.js';
+
+/** What the voice engine knows of a turn besides its event. */
+export interface VoiceModeTurn {
+  /** The line's caller, who the turn is from. */
+  callerId: string;
+  /** The call chat as the engine just resolved it; null for a turn on the voice line itself. */
+  chat: MessagingGroup | null;
+}
 
 /**
  * The host takes inbound messages only once running sessions are adopted (src/index.ts); the page can
@@ -26,13 +34,17 @@ onHostStart(() => {
 });
 
 /**
- * Store a turn in `agentGroupId`'s session for the event's chat and wake the agent. Resolves true
- * once stored, false when the chat or its wiring to that agent is gone; rejects when storing threw.
+ * Store a turn in the session of the agent the event names (`agentGroupId`) for the event's chat and
+ * wake the agent. Resolves true once stored, false when the chat or its wiring to that agent is gone;
+ * rejects when storing threw.
  */
-export async function routeVoiceModeTurn(event: InboundEvent, agentGroupId: string): Promise<boolean> {
+export async function routeVoiceModeTurn(event: InboundEvent, turn: VoiceModeTurn): Promise<boolean> {
   if (!hostStarted) throw new Error('the host is still starting');
-  const instance = event.instance ?? event.channelType;
-  const mg = await getMessagingGroupByPlatform(event.channelType, event.platformId, instance);
+  const { agentGroupId } = event;
+  if (!agentGroupId) throw new Error('a voice turn must name its agent');
+  const mg =
+    turn.chat ??
+    (await getMessagingGroupByPlatform(event.channelType, event.platformId, event.instance ?? event.channelType));
   const wiring = mg && !mg.denied_at ? await getMessagingGroupAgentByPair(mg.id, agentGroupId) : undefined;
   const agentGroup = wiring ? await getAgentGroup(agentGroupId) : undefined;
   if (!mg || !wiring || !agentGroup) {
@@ -44,14 +56,8 @@ export async function routeVoiceModeTurn(event: InboundEvent, agentGroupId: stri
   }
 
   // The router's own thread policy and engaged-message delivery, for this one wiring.
-  const threadsEnabled = resolveThreadPolicy(
-    wiring.threads ?? null,
-    getChannelDefaults(instance, mg.channel_type),
-    mg.is_group === 1,
-    getChannelAdapter(instance)?.supportsThreads === true,
-  );
+  const threadsEnabled = wiringThreadsEnabled(wiring, mg);
   const threadId = threadsEnabled ? event.threadId : null;
-  const callerId = (JSON.parse(event.message.content) as { senderId?: string }).senderId ?? null;
   let stored = false;
   await deliverToAgent(
     wiring,
@@ -64,7 +70,7 @@ export async function routeVoiceModeTurn(event: InboundEvent, agentGroupId: stri
         event.onStored?.(session);
       },
     },
-    callerId,
+    turn.callerId,
     threadsEnabled,
     threadId,
     true,

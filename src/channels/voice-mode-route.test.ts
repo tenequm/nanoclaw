@@ -39,17 +39,20 @@ import './index.js'; // the real channel barrel: registers the voice channel
 import { routeVoiceModeTurn } from './voice-mode-route.js';
 
 const now = () => new Date().toISOString();
+/** The line's caller; the chat is looked up from the event. */
+const FROM_CALLER = { callerId: 'voice-mode:abc', chat: null };
 
 const sessionsCreated: SessionCreatedEvent[] = [];
 registerSessionCreatedHook((event) => {
   sessionsCreated.push(event);
 });
 
-const turn = (platformId = 'chat:G1'): InboundEvent => ({
+const turn = (platformId = 'chat:G1', agentGroupId = 'ag-1'): InboundEvent => ({
   channelType: 'chat',
   instance: 'chat',
   platformId,
   threadId: null,
+  agentGroupId,
   message: {
     id: 'livekit:call-1:1',
     kind: 'chat',
@@ -104,7 +107,7 @@ afterEach(async () => {
 
 describe('routeVoiceModeTurn', () => {
   it('takes no turn before the host has started, as the router takes no inbound before then', async () => {
-    await expect(routeVoiceModeTurn(turn(), 'ag-1')).rejects.toThrow('still starting');
+    await expect(routeVoiceModeTurn(turn(), FROM_CALLER)).rejects.toThrow('still starting');
     expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
   });
 
@@ -114,7 +117,7 @@ describe('routeVoiceModeTurn', () => {
       for (const start of getHostStartCallbacks()) await start({} as never);
     });
     it("stores the turn as a waking message in the line agent's session only, and wakes it", async () => {
-      expect(await routeVoiceModeTurn(turn(), 'ag-1')).toBe(true);
+      expect(await routeVoiceModeTurn(turn(), FROM_CALLER)).toBe(true);
       const [session] = await getSessionsByAgentGroup('ag-1');
       expect(session).toMatchObject({ messaging_group_id: 'mg-1' });
       expect(await getSessionsByAgentGroup('ag-2')).toEqual([]);
@@ -129,13 +132,13 @@ describe('routeVoiceModeTurn', () => {
       const event = turn();
       event.message.content = JSON.stringify({ text: '/status', senderId: 'voice-mode:abc' });
       event.onStored = vi.fn();
-      expect(await routeVoiceModeTurn(event, 'ag-1')).toBe(false);
+      expect(await routeVoiceModeTurn(event, FROM_CALLER)).toBe(false);
       expect(event.onStored).not.toHaveBeenCalled();
       expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
     });
 
     it("tells core's session-created hooks about the session a first turn creates, once", async () => {
-      await routeVoiceModeTurn(turn(), 'ag-1');
+      await routeVoiceModeTurn(turn(), FROM_CALLER);
       const [session] = await getSessionsByAgentGroup('ag-1');
       expect(sessionsCreated).toHaveLength(1);
       expect(sessionsCreated[0]).toMatchObject({
@@ -146,13 +149,13 @@ describe('routeVoiceModeTurn', () => {
         sessionMode: 'shared',
         message: { id: 'livekit:call-1:1' },
       });
-      await routeVoiceModeTurn({ ...turn(), message: { ...turn().message, id: 'livekit:call-1:2' } }, 'ag-1');
+      await routeVoiceModeTurn({ ...turn(), message: { ...turn().message, id: 'livekit:call-1:2' } }, FROM_CALLER);
       expect(sessionsCreated).toHaveLength(1);
     });
 
     it('stores nothing when the chat or its wiring to the agent is gone', async () => {
-      expect(await routeVoiceModeTurn(turn('chat:unknown'), 'ag-1')).toBe(false);
-      expect(await routeVoiceModeTurn(turn(), 'ag-unwired')).toBe(false);
+      expect(await routeVoiceModeTurn(turn('chat:unknown'), FROM_CALLER)).toBe(false);
+      expect(await routeVoiceModeTurn(turn('chat:G1', 'ag-unwired'), FROM_CALLER)).toBe(false);
       expect(await getSessionsByAgentGroup('ag-1')).toEqual([]);
       expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
     });

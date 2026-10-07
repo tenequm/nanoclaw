@@ -17,7 +17,8 @@ import { getConfigView, resolveTargets, type TargetAgent, type TargetResolution 
 import { getMessagingGroupByPlatform } from '../../../db/messaging-groups.js';
 import { platformIdFor } from '../inbound.js';
 
-const CHANNEL = 'telegram';
+/** The channel type (and default instance) of every chat this command layer serves. */
+export const CHANNEL = 'telegram';
 
 /** The authoritative presser / sender id as a namespaced user id. */
 export function actorUserId(ctx: Context): string {

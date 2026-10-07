@@ -46,7 +46,13 @@ import { log } from '../../../log.js';
 import { hasAdminPrivilege } from '../../../modules/permissions/db/user-roles.js';
 import type { AdapterRuntime } from '../runtime.js';
 
-import { actorUserId, contextPlatformId, contextMessagingGroupId, resolveTargetsForContext } from './context.js';
+import {
+  actorUserId,
+  CHANNEL,
+  contextPlatformId,
+  contextMessagingGroupId,
+  resolveTargetsForContext,
+} from './context.js';
 import type { CommandMenus } from './menus.js';
 import {
   activationChangeConfirmation,
@@ -240,9 +246,7 @@ export function buildCommandGroup(runtime: AdapterRuntime, menus: CommandMenus):
   const onVoice = (ctx: Context): Effect.Effect<void> =>
     Effect.gen(function* () {
       const actor = actorUserId(ctx);
-      const res = yield* Effect.promise(() => resolveTargetsForContext(ctx));
-      const chatCtx = yield* Effect.promise(() => chatContext(ctx));
-      if (res.kind === 'none' || !chatCtx) return yield* dropNoAgent('voice', ctx);
+      // The voice-mode channel answers /voice itself, as it does on every other channel.
       const voice = getChannelAdapterExact('voice-mode') as
         | { handleVoiceCommand?: (event: InboundEvent) => Promise<boolean> }
         | undefined;
@@ -250,8 +254,8 @@ export function buildCommandGroup(runtime: AdapterRuntime, menus: CommandMenus):
       if (voice?.handleVoiceCommand && platformId && ctx.msg) {
         yield* Effect.promise(() =>
           voice.handleVoiceCommand!({
-            channelType: 'telegram',
-            instance: 'telegram',
+            channelType: CHANNEL,
+            instance: CHANNEL,
             platformId,
             threadId: null,
             message: {
@@ -264,6 +268,9 @@ export function buildCommandGroup(runtime: AdapterRuntime, menus: CommandMenus):
         );
         return;
       }
+      const res = yield* Effect.promise(() => resolveTargetsForContext(ctx));
+      const chatCtx = yield* Effect.promise(() => chatContext(ctx));
+      if (res.kind === 'none' || !chatCtx) return yield* dropNoAgent('voice', ctx);
       const outcome = yield* Effect.promise(() => runVoiceCommand(res, chatCtx, actor));
       const text = voiceCommandReply(outcome);
       if (text === null) return yield* dropNoAgent('voice', ctx);
