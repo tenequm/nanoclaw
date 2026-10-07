@@ -11,7 +11,6 @@ import type { InboundEvent } from './adapter.js';
 import { resolveThreadPolicy } from './channel-defaults.js';
 import { getChannelAdapter, getChannelDefaults } from './channel-registry.js';
 import { deliverSessionMessages } from '../delivery.js';
-import { onHostShutdown, onHostStart } from '../host-lifecycle.js';
 import { log } from '../log.js';
 import { heartbeatPath } from '../session-manager.js';
 import type { MessagingGroup, MessagingGroupAgent, Session } from '../types.js';
@@ -187,14 +186,18 @@ function stopExpediting(): void {
   expedited.clear();
 }
 
-onHostStart(() => {
+/**
+ * Host lifecycle, registered by the channel module (voice-mode.ts): core imports this file, and core
+ * modules must not register lifecycle callbacks by being imported.
+ */
+export function voiceModeHostStarted(): void {
   hostRunning = true;
-});
-onHostShutdown(() => {
+}
+export function voiceModeHostStopped(): void {
   hostRunning = false;
   stopExpediting();
   for (const id of [...thinking.keys()]) stopThinking(id);
-});
+}
 
 /**
  * Deliver `session`'s replies every EXPEDITED_POLL_MS for up to `forMs`, so a call hears them at once.

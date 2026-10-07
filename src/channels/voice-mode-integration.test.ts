@@ -18,7 +18,6 @@ vi.mock('../delivery.js', () => ({ deliverSessionMessages: vi.fn(async () => und
 afterAll(() => fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true }));
 
 import { deliverSessionMessages } from '../delivery.js';
-import { getHostStartCallbacks } from '../host-lifecycle.js';
 import { log } from '../log.js';
 import { heartbeatPath } from '../session-manager.js';
 import type { Session } from '../types.js';
@@ -29,6 +28,7 @@ import {
   registerTypingObserver,
   registerVoiceModeRootHandler,
   setOutboundPresentation,
+  voiceModeHostStarted,
   voiceModeReplyDelivered,
   voiceModeStored,
   type TypingTick,
@@ -174,7 +174,7 @@ describe('outbound presentation', () => {
 describe('expedited replies', () => {
   it("polls a call's session while its agent works and stops once it is idle, before the window ends", async () => {
     vi.useFakeTimers({ now: Date.UTC(2026, 9, 7, 12) });
-    for (const start of getHostStartCallbacks()) await start({} as never);
+    voiceModeHostStarted();
     const deliver = vi.mocked(deliverSessionMessages);
     deliver.mockClear();
     const session = newSession();

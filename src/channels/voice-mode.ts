@@ -26,6 +26,8 @@ import { registerChannelAdapter } from './channel-registry.js';
 import {
   expediteDelivery,
   registerVoiceModeRootHandler,
+  voiceModeHostStarted,
+  voiceModeHostStopped,
   wiringThreadsEnabled,
   type VoiceModeInboundEvent as InboundEvent,
 } from './voice-mode-integration.js';
@@ -51,6 +53,7 @@ import { findVoiceModeLineByToken } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand } from './voice-mode-command.js';
 import { readEnvFile } from '../env.js';
+import { onHostShutdown, onHostStart } from '../host-lifecycle.js';
 import { log } from '../log.js';
 import { requestWake } from '../request-wake.js';
 import type { Session } from '../types.js';
@@ -601,6 +604,9 @@ function parseSilenceMs(raw: string | undefined): number | undefined {
 
 /** The settings a call cannot run without, beyond the link token; the worker holds the Gemini key, the host checks it is there. */
 const LIVEKIT_REQUIRED = ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'GEMINI_API_KEY'] as const;
+
+onHostStart(voiceModeHostStarted);
+onHostShutdown(voiceModeHostStopped);
 
 registerChannelAdapter(VOICE_MODE_CHANNEL, {
   factory: () => {
