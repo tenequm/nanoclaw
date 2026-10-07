@@ -12,17 +12,16 @@ const stamp = () => new Date().toISOString();
 
 // Lines from before the voice-mode rename keep their `voice` rows and ids; lines made since are hashed-token rows.
 describe('personal legacy voice line access (real central DB)', () => {
-  const channel: string = 'voice';
-  const ETHAN = `${channel}:ethan-test`;
-  const LAURA = `${channel}:laura-test`;
+  const ETHAN = 'voice:ethan-test';
+  const LAURA = 'voice:laura-test';
 
   async function line(id: string, name: string) {
-    await createUser({ id, kind: channel, display_name: name, created_at: stamp() });
+    await createUser({ id, kind: 'voice', display_name: name, created_at: stamp() });
     await createMessagingGroup({
       id: `mg-${id}`,
-      channel_type: channel,
+      channel_type: 'voice',
       platform_id: id,
-      instance: channel,
+      instance: 'voice',
       name: 'Personal call',
       is_group: 0,
       unknown_sender_policy: 'strict',
@@ -110,7 +109,7 @@ describe('personal legacy voice line access (real central DB)', () => {
     await updateDisplayName(ETHAN, 'Ethan');
     await updateMessagingGroup(`mg-${ETHAN}`, { unknown_sender_policy: 'public' });
     expect(await resolveVoiceModeLine(ETHAN)).toBeNull();
-    expect(await resolveVoiceModeLine(`${channel}:unknown`)).toBeNull();
+    expect(await resolveVoiceModeLine('voice:unknown')).toBeNull();
   });
 
   it('resolves no membership line in the voice-mode namespace: lines there are hashed-token rows only', async () => {

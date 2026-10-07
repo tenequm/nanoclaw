@@ -55,7 +55,6 @@ import { requestWake } from '../request-wake.js';
 import type { Session } from '../types.js';
 import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
 
-export const CHANNEL_TYPE = VOICE_MODE_CHANNEL;
 const MINUTE_MS = 60_000;
 /** How often a running call rechecks that its caller may still use the line. */
 const ACCESS_CHECK_INTERVAL_MS = 5000;
@@ -256,16 +255,7 @@ export async function findCallSession(
   return findSessionForAgent(agentGroupId, mg.id, mode === 'shared' ? null : threadId);
 }
 
-/**
- * The line id for a link token: `voice-mode:` + the first 12 hex characters of
- * the token's SHA-256. It is the platform id, the sender id and what the logs
- * show; the token itself stays in the adapter's allow-list and the call link.
- */
-export function lineIdForToken(token: string): string {
-  return linePlatformId(hashLinkToken(token).slice(0, 12));
-}
-
-/** The id the same token's line had before the voice-mode rename: `voice:` + the same hash. */
+/** The id an env link token's line had before the voice-mode rename: `voice:` + its SHA-256's first 12 hex characters. */
 export function legacyLineIdForToken(token: string): string {
   return `${LEGACY_VOICE_CHANNEL}:${hashLinkToken(token).slice(0, 12)}`;
 }
@@ -496,8 +486,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
   };
 
   return {
-    name: CHANNEL_TYPE,
-    channelType: CHANNEL_TYPE,
+    name: VOICE_MODE_CHANNEL,
+    channelType: VOICE_MODE_CHANNEL,
     supportsThreads: false,
     defaults: VOICE_MODE_DEFAULTS,
 
@@ -507,7 +497,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
-      registerWebhookHandler(CHANNEL_TYPE, handleHttp);
+      registerWebhookHandler(VOICE_MODE_CHANNEL, handleHttp);
       registerRootHandler('voice', handleHttp);
       registerWebhookHandler('voice', handleHttp);
       if (config.pagePort !== undefined) {
@@ -550,7 +540,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       log.info('voice-mode: ready', {
         callUrl: `${callUrl('')}<link token>`,
         trustedProxies: config.trustedProxyCidrs?.trim() || 'none',
-        lines: legacyLines.size,
+        envTokens: legacyLines.size,
         livekit: config.livekit.url,
         protocol: LIVEKIT_PROTOCOL_VERSION,
         agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
@@ -688,7 +678,7 @@ function parseSilenceMs(raw: string | undefined): number | undefined {
 /** The settings a call cannot run without, beyond the link token; the worker holds the Gemini key, the host checks it is there. */
 const LIVEKIT_REQUIRED = ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'GEMINI_API_KEY'] as const;
 
-registerChannelAdapter(CHANNEL_TYPE, {
+registerChannelAdapter(VOICE_MODE_CHANNEL, {
   factory: () => {
     const env = voiceModeEnv(
       readEnvFile(
@@ -775,7 +765,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
 // Registered after voice-mode, so the registry has started that adapter when this factory runs.
 registerChannelAdapter(LEGACY_VOICE_CHANNEL, {
   factory: () => {
-    const live = getChannelAdapterExact(CHANNEL_TYPE) as VoiceModeChannelAdapter | undefined;
+    const live = getChannelAdapterExact(VOICE_MODE_CHANNEL) as VoiceModeChannelAdapter | undefined;
     return live ? createLegacyVoiceAdapter(live) : null;
   },
   defaults: VOICE_MODE_DEFAULTS,

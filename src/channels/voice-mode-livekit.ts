@@ -1012,8 +1012,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       : {
           // A line from before the rename keeps its own `voice` chat and session; its replies come
           // back through the `voice` compatibility registration (src/channels/voice-mode.ts).
-          channelType: lineChannelType(call.platformId),
-          instance: lineChannelType(call.platformId),
+          channelType: LEGACY_VOICE_CHANNEL,
+          instance: LEGACY_VOICE_CHANNEL,
           platformId: call.platformId,
           threadId: null,
           agentGroupId: call.line.agentGroupId,

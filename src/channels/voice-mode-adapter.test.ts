@@ -137,9 +137,9 @@ describe('voice-mode environment compatibility', () => {
       path.dirname(fileURLToPath(import.meta.url)),
       '../../docs/2610-07-voice-mode-upgrade.md',
     );
+    expect(LEGACY_VOICE_KEYS).toHaveLength(27);
     if (!existsSync(runbook)) return; // An installed payload does not carry the fork's docs.
     const table = [...readFileSync(runbook, 'utf8').matchAll(/^\| `(VOICE_[A-Z_]+)` \| `VOICE_MODE_[A-Z_]+` \|$/gm)];
     expect(table.map((m) => m[1])).toEqual([...LEGACY_VOICE_KEYS]);
-    expect(LEGACY_VOICE_KEYS).toHaveLength(27);
   });
 });

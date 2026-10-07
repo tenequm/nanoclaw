@@ -27,7 +27,6 @@ import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js
 import {
   createVoiceModeAdapter,
   legacyLineIdForToken,
-  lineIdForToken,
   pageListener,
   type VoiceModeChannelAdapter,
   type VoiceModeConfig,
@@ -67,11 +66,12 @@ import {
 import { log } from '../log.js';
 import { stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './voice-mode-page.js';
+import { linePlatformId } from './voice-mode-line.js';
 
 /** A line from before the rename: with no call chat, its calls talk on the line itself. */
 const LINE = legacyLineIdForToken('tok123');
 /** A line /voice made: its calls need a chat to talk in. */
-const NEW_LINE = lineIdForToken('tok123');
+const NEW_LINE = linePlatformId('0123456789ab');
 const MIN = 60_000;
 const API_KEY = 'APIfakekey123';
 const API_SECRET = 'fakesecretfakesecretfakesecretfakesecretfakesecr';
@@ -453,7 +453,8 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('renders the call link of a line it holds the token for, and no other', () => {
     expect(h.adapter.callLink(LINE)).toBe(`${h.hostUrl}/voice?t=tok123`);
-    expect(h.adapter.callLink(lineIdForToken('other'))).toBeNull();
+    expect(h.adapter.callLink(NEW_LINE)).toBeNull();
+    expect(h.adapter.callLink(legacyLineIdForToken('other'))).toBeNull();
   });
 
   it('keeps a saved main token working through the real legacy line and membership rows', async () => {

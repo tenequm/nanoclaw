@@ -506,14 +506,16 @@ export const LEGACY_VOICE_KEYS: readonly string[] = [
   'VOICE_WORKER_HEALTH_PORT',
 ];
 
-const legacyName = (key: string): string | null => {
-  const old = key.replace(/^VOICE_MODE_/, 'VOICE_');
-  return old !== key && LEGACY_VOICE_KEYS.includes(old) ? old : null;
-};
-
 /** The keys to read from `.env`: each requested key, and the old name of a `VOICE_MODE_*` one that had one. */
 export function voiceModeEnvKeys(keys: readonly string[]): string[] {
-  return [...new Set(keys.flatMap((key) => [key, legacyName(key) ?? []].flat()))];
+  return [
+    ...new Set(
+      keys.flatMap((key) => {
+        const old = key.replace(/^VOICE_MODE_/, 'VOICE_');
+        return old !== key && LEGACY_VOICE_KEYS.includes(old) ? [key, old] : [key];
+      }),
+    ),
+  ];
 }
 
 /**

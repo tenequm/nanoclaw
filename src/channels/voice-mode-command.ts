@@ -273,7 +273,7 @@ const undeliveredLink = (cmd: string, outcome: VoiceCommandOutcome) =>
 
 /**
  * Claims every /voice message; the agents never see one. Runs on every inbound message, so anything
- * that cannot be /voice leaves before parsing; `callUrl` defaults to the live adapter's, looked up
+ * that cannot be /voice leaves before parsing; `callUrlFor` defaults to the live adapter's, looked up
  * only for a command.
  */
 export async function handleVoiceCommand(

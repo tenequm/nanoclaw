@@ -96,6 +96,10 @@ export interface VoiceModeLineTarget {
   threadId: string | null;
 }
 
+/**
+ * Insert the agent's line with a fresh token, or apply `onConflict` (an `ON CONFLICT` action) to the
+ * one it has. Undefined when the conflict action returned no row (`DO NOTHING`).
+ */
 async function insertLine(
   target: VoiceModeLineTarget,
   onConflict: string,
