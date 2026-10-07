@@ -1928,6 +1928,11 @@ const trimCut = (text: string): string => text.replace(/^[\s,.;:!?–—-]+|[\s,
 
 /** A command acts once this many interims in a row ended with it, and the caller is silent. */
 const STABLE_COMMAND_INTERIMS = 2;
+/**
+ * Or once the interim text ending with it stayed unchanged this long: the transcription sends an
+ * interim only when its text changes, so a short last word before silence often comes in just one.
+ */
+export const COMMAND_SETTLE_MS = 700;
 
 /** Why a turn's activity ended. */
 export type TurnEnd =
@@ -1953,8 +1958,8 @@ interface OpenTurn {
   carry: string;
   /** The activity's whole text so far. */
   heard: string;
-  /** The command the last interims ended with, and in how many in a row. */
-  candidate?: { command: SpokenCommand; count: number };
+  /** The command the last interims ended with, in how many in a row, and whether their text settled (COMMAND_SETTLE_MS). */
+  candidate?: { command: SpokenCommand; count: number; settled?: boolean };
   /**
    * The last command any interim of this activity ended with, and the words before it: a later
    * interim, and the final, can leave it out again.
@@ -2039,7 +2044,8 @@ export interface Recording {
  * spotter the transcript's `hey <agent>` opens it instead.
  *
  * Spoken commands are nominated by the interim text: a send word (`zulu`, `copy`, `прийом`) or a discard phrase at
- * its end in STABLE_COMMAND_INTERIMS interims in a row, with the caller silent, ends the activity,
+ * its end in STABLE_COMMAND_INTERIMS interims in a row, or in one whose text then stays unchanged for
+ * COMMAND_SETTLE_MS, with the caller silent, ends the activity,
  * and the final text decides (turnText): a command it still ends with acts, one it does not was
  * words, and the turn goes on in a new activity carrying the text so far. A pause or sleep that
  * ends a turn applies a command its text ends with the same way, or one any interim of the activity
@@ -2079,6 +2085,7 @@ export class CallTurns {
   private cut = false;
   private pauseTimer?: ReturnType<typeof setTimeout>;
   private awakeTimer?: ReturnType<typeof setTimeout>;
+  private settleTimer?: ReturnType<typeof setTimeout>;
   private closed = false;
   /** The names `hey <agent>` takes, and the acoustic phrase's own name while one is in use. */
   private names: WakeName[];
@@ -2185,6 +2192,7 @@ export class CallTurns {
       this.deps.countdown.clear();
       this.disarm();
       if (this.agentSpeaking) return this.deps.unheard();
+      this.unsettle();
       if (this.turn?.candidate) this.turn.candidate = undefined;
       if (this.turn || this.reviewing) return;
       const finalizing = this.finalizing;
@@ -2257,6 +2265,8 @@ export class CallTurns {
     if (!match) turn.candidate = undefined;
     else if (turn.candidate?.command === match.command) turn.candidate.count++;
     else turn.candidate = { command: match.command, count: 1 };
+    if (changed || !match) this.unsettle();
+    if (match && !this.settleTimer) this.settle(turn);
     if (this.command()) return;
     // The idle clock restarts on new words only: an interim repeating the same text is no speech.
     if (changed) this.arm();
@@ -2275,6 +2285,7 @@ export class CallTurns {
     this.deps.countdown.clear();
     clearTimeout(this.pauseTimer);
     this.disarm();
+    this.unsettle();
     const turn = this.turn;
     if (turn) turn.candidate = undefined;
     // A reply that waited its longest takes the channel: an open turn goes out as it is, while the
@@ -2338,6 +2349,7 @@ export class CallTurns {
     this.closed = true;
     clearTimeout(this.pauseTimer);
     this.disarm();
+    this.unsettle();
     if (this.turn) this.deps.shadow?.ended(this.turn.segment, 'hangup');
     this.turn = undefined;
     this.finalizing = undefined;
@@ -2384,9 +2396,26 @@ export class CallTurns {
     const turn = this.turn;
     if (!turn || turn.kind !== 'auto' || !turn.addressed || this.speaking || this.agentSpeaking) return false;
     const candidate = turn.candidate;
-    if (!candidate || candidate.count < STABLE_COMMAND_INTERIMS) return false;
+    if (!candidate || (candidate.count < STABLE_COMMAND_INTERIMS && !candidate.settled)) return false;
     void this.finish(candidate.command);
     return true;
+  }
+
+  /** The interim text ending in the turn's candidate command starts settling: unchanged for COMMAND_SETTLE_MS, it is stable. */
+  private settle(turn: OpenTurn): void {
+    const candidate = turn.candidate;
+    this.settleTimer = setTimeout(() => {
+      this.settleTimer = undefined;
+      if (this.turn !== turn || turn.candidate !== candidate || !candidate) return;
+      candidate.settled = true;
+      this.command();
+    }, COMMAND_SETTLE_MS);
+    this.settleTimer.unref?.();
+  }
+
+  private unsettle(): void {
+    clearTimeout(this.settleTimer);
+    this.settleTimer = undefined;
   }
 
   /**
@@ -2462,6 +2491,7 @@ export class CallTurns {
     this.deps.shadow?.ended(turn.segment, why);
     clearTimeout(this.pauseTimer);
     this.disarm();
+    this.unsettle();
     this.deps.countdown.clear();
     const endedAt = this.ring.position;
     const endWall = this.now();

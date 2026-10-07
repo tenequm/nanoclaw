@@ -30,6 +30,7 @@ import {
   callerRejoinWaitMs,
   CallTurns,
   capSpokenText,
+  COMMAND_SETTLE_MS,
   COMMAND_VOCABULARY,
   COMMAND_WORDS_JSON,
   captionMark,
@@ -2276,7 +2277,8 @@ describe('CallTurns, hands-free', () => {
     h.t.results.push(heard('Remind me to zulu.', 'Remind me to zulu to Anna tomorrow.'));
     await h.talk(1500);
     await h.interim('Remind me to zulu.');
-    await h.pass(SILENCE);
+    // The settled interim ends the activity; the final's words go on, and its own closing silence sends them.
+    await h.pass(COMMAND_SETTLE_MS + SILENCE);
     expect(h.out.sent).toEqual(['Remind me to zulu to Anna tomorrow.']);
   });
 
@@ -2716,6 +2718,118 @@ function reviewOverTurns(h: ReturnType<typeof turnsHarness>) {
     op: (op: ReviewOp, f: Partial<ReviewRequest> = {}) => control.handle(op, { gen: ++gen, ...f }),
   };
 }
+
+describe('CallTurns, a command in one interim that settles', () => {
+  const woken = async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    return h;
+  };
+
+  it('one interim ending in zulu, then silence, ends the activity after the settle time and sends', async () => {
+    const h = await woken();
+    h.t.results.push(heard('Book a table for two. Zulu.', 'Book a table for two. Zulu.'));
+    await h.talk(1500);
+    await h.interim('Book a table for two. Zulu.');
+    await h.pass(COMMAND_SETTLE_MS - 20);
+    expect(h.t.ended).toBe(0);
+    await h.pass(20);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    expect(h.out.facts[0]?.endedBy).toBe('send');
+    expect(h.turns.state.waiting).toBe(true);
+  });
+
+  it('a copy as its own sentence sends the same way', async () => {
+    const h = await woken();
+    const said = 'Rewrite the landing page copy for the pricing section. Copy.';
+    h.t.results.push(heard(said, said));
+    await h.talk(3000);
+    await h.interim(said);
+    await h.pass(COMMAND_SETTLE_MS);
+    expect(h.out.sent).toEqual(['Rewrite the landing page copy for the pricing section.']);
+  });
+
+  it('settles while the caller still talks and acts once they stop', async () => {
+    const h = await woken();
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, h.position - 1600);
+    await h.interim('Book a table. Zulu.');
+    await h.pass(COMMAND_SETTLE_MS + 100, 500);
+    expect(h.t.ended).toBe(0);
+    h.turns.onSpeech(false, h.position);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual(['Book a table.']);
+  });
+
+  it('new text within the settle time cancels it', async () => {
+    const h = await woken();
+    await h.talk(1500);
+    await h.interim('Book a table. Zulu.');
+    await h.pass(COMMAND_SETTLE_MS / 2);
+    await h.interim('Book a table. Zulu to Anna');
+    await h.pass(COMMAND_SETTLE_MS * 2);
+    expect(h.t.ended).toBe(0);
+  });
+
+  it('two interims in a row still act at once', async () => {
+    const h = await woken();
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.talk(1500);
+    await h.interim('Book a table.');
+    await h.interim('Book a table. Zulu.');
+    expect(h.t.ended).toBe(0);
+    await h.interim('Book a table. Zulu.');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual(['Book a table.']);
+  });
+
+  it('never fires for a turn that already ended', async () => {
+    const h = await woken();
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.talk(1500);
+    await h.interim('Book a table. Zulu.');
+    const draft = h.turns.setReviewing(true);
+    await h.pass(COMMAND_SETTLE_MS * 2);
+    expect(await draft).toMatchObject({ text: 'Book a table. Zulu.' });
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual([]);
+
+    const g = await woken();
+    await g.talk(1500);
+    await g.interim('Book a table. Zulu.');
+    g.turns.close();
+    await g.pass(COMMAND_SETTLE_MS * 2);
+    expect(g.t.ended).toBe(0);
+    expect(g.out.sent).toEqual([]);
+  });
+
+  it('a discard phrase settles the same way', async () => {
+    const h = await woken();
+    const said = 'Remind me to call the plumber. Scratch that.';
+    h.t.results.push(heard(said, said));
+    await h.talk(2000);
+    await h.interim(said);
+    await h.pass(COMMAND_SETTLE_MS);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['discarded', said]]);
+  });
+
+  it('a settled copy whose final has no boundary sends nothing and keeps the turn', async () => {
+    const h = await woken();
+    h.t.results.push(heard('copy the file then copy', 'Copy the file then copy'));
+    await h.talk(1500);
+    await h.interim('copy the file then copy');
+    await h.pass(COMMAND_SETTLE_MS);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.logs).toEqual(['voice.command near-miss word=copy reason=no-boundary']);
+    expect(h.turns.state.waiting).toBe(false);
+  });
+});
 
 describe('CallTurns, finalizing turns and the switch to Manual', () => {
   it('a switch while a pause-ended turn finalizes makes it the draft, never a POST', async () => {
