@@ -1,10 +1,10 @@
 # Voice mode upgrade and rollback
 
-This is an operator runbook. No server actions are performed by building this
-branch. Use the complete fork build, with matching host and worker. Update
-native clients before the server cutover (to a build that speaks protocol 4
-and 6), and close or reload every open browser tab afterwards. Browser
-bookmarks keep their URLs and receive the new page after reload.
+This is an operator runbook. Building the fork's main branch performs no server
+actions. Use the complete fork build, with matching host and worker. Update
+native clients before the server cutover (to a build that speaks protocol 4 and
+6), and close or reload every open browser tab afterwards. Browser bookmarks
+keep their URLs and receive the new page after reload.
 
 ## Main protocol 4 and env-backed links
 
@@ -14,12 +14,15 @@ named caller, strict line wiring, group membership and original call-chat
 binding. Tokens are not printed or written into the DB. There is no automatic
 re-mint, identity rewrite or destructive DB migration.
 
-Plain `/voice` from an existing line owner moves its old call-chat binding and
-keeps its saved links. Other admins cannot move that person's line. `/voice new`
-creates a hashed-token line for the authorized caller and deliberately retires
-all old env-backed links for that agent; active old calls fail their next access
-check. New lines use core roles. A newly minted line's token is shown only once,
-privately to its caller, so keep an old link unless replacement is intentional.
+Plain `/voice` from an existing line owner moves its old call-chat binding,
+keeps its saved links and hands the owner the saved link again (privately, in
+the owner's direct chat, when run in a group; with no reachable direct chat the
+binding still moves and the link is not sent). Other admins cannot move that
+person's line. `/voice new` creates a hashed-token line for the authorized
+caller and deliberately retires all old env-backed links for that agent; active
+old calls fail their next access check. New lines use core roles. A newly minted
+line's token is shown only once, privately to its caller, so keep an old link
+unless replacement is intentional.
 
 Keep the old `.env` entries until replacement is intentional. A legacy line's
 voice user and messaging-group rows must not be removed just because its new
@@ -32,8 +35,11 @@ that hands their replies, typing and call links to the live voice-mode engine.
 
 Every old key in the table below is accepted as its `VOICE_MODE_<suffix>`
 name, with a warning naming keys only; no other `VOICE_*` key is. An explicit
-new value wins when both are present, and the old key is reported as ignored. The existing `.env` parser ignores empty values;
-use documented `off`/`0` switches rather than an empty line to disable a setting.
+new value wins when both are present, and the old key is reported as ignored.
+The existing `.env` parser ignores empty values; use documented `off`/`0`
+switches rather than an empty line to disable a setting. Host and worker read
+`.env` when they start (the worker in each job process): restart both after
+changing settings.
 
 | Main key | Protocol 6 key |
 | --- | --- |
@@ -70,7 +76,10 @@ The build adds a separate page listener on `127.0.0.1:3100` (`VOICE_MODE_PORT`,
 `VOICE_MODE_PAGE_HOST`); main's existing `/voice` and `/webhook/voice/livekit`
 fronts still work on `WEBHOOK_PORT`. Do not move a working front during the
 compatibility upgrade. An install whose front already forwards `/voice` to the
-webhook port does not need the listener: set `VOICE_MODE_PORT=off`.
+webhook port does not need the listener: set `VOICE_MODE_PORT=off`. If the
+default port is taken, the host logs it and serves the page on `WEBHOOK_PORT`
+only; an explicit `VOICE_MODE_PORT` that cannot bind fails setup, and neither
+voice-mode nor the `voice` compatibility adapter starts.
 `LIVEKIT_HOST_URL` must be a local plain-http origin (`localhost`, `127.0.0.1`
 or `[::1]`); the worker refuses to start with anything else. Point it directly
 at the webhook port, never through a proxy. A configured
@@ -102,8 +111,9 @@ the first judgement of a day; nothing needs deleting by hand.
 ### Backup and cutover
 
 1. Update native clients first. Install a native client build that speaks
-   protocol 4 and 6 and confirm it still calls the old server. A protocol-4-only app cannot call after the cutover, and a
-   protocol-6-only app could not call before it.
+   protocol 4 and 6 and confirm it still calls the old server. A
+   protocol-4-only app cannot call after the cutover, and a protocol-6-only app
+   could not call before it.
 2. Identify this checkout's host service:
 
    ```bash
@@ -158,7 +168,7 @@ the first judgement of a day; nothing needs deleting by hand.
    the SQLite example. On macOS record `$(launchd_label)` and the worker's
    label, and copy their plists from `~/Library/LaunchAgents/` instead of the
    systemd files.
-5. Install the reviewed revision from the voice-mode rebuild branch, with a
+5. Install the reviewed revision of the fork's main branch, with a
    clean checkout. Preserve local configuration and data; do not merge the
    shared registry branch into a customized install. Clear the old build so
    `dist/voice-livekit-worker.js` cannot keep running, install the locked
@@ -265,8 +275,8 @@ filename if desired, but its executable is `dist/voice-mode-worker.js`.
 Preserve `VOICE_MODE_PORT` or its default 3100. The page listener now binds
 `127.0.0.1` instead of every interface: a front that reaches it over another
 address (a container bridge, the LAN) needs `VOICE_MODE_PAGE_HOST` set to that
-address. Reload the browser page so it requests protocol 6. Old protocol 5 starts are refused with 426 before a room
-or cost-bearing worker is created.
+address. Reload the browser page so it requests protocol 6. Old protocol 5
+starts are refused with 426 before a room or cost-bearing worker is created.
 
 Behavior changes from that worker: own Gemini Live manual activities replace
 AgentSession STT, unary fallback is ignored, wake is on by default, review and

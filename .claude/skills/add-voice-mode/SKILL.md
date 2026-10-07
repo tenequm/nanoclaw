@@ -79,9 +79,9 @@ src/voice-mode-wakeword-fixtures/negative.wav
 src/voice-mode-wakeword-fixtures/positive.wav
 ```
 
-The table registers its own named migration through core. Existing shared
-`voice_mode_lines` rows and their migration record are reused. Legacy main
-`voice_lines` and `voice_line_owners` rows stay intact for saved links.
+The `voice_mode_lines` table registers its own named migration through core.
+Saved links from before the voice-mode rename keep their `voice_lines` and
+`voice_line_owners` rows.
 
 Append `import './voice-mode.js';` to `src/channels/index.ts` once:
 
@@ -102,7 +102,6 @@ container/skills/voice-mode-formatting/instructions.md
 ```
 
 An explicit group skill list must include `voice-mode-formatting`.
-When migrating such lists, replace `voice-formatting` with that name.
 The host composes the instructions into the agent's project document.
 
 ### 2. Install dependencies and build
@@ -173,7 +172,10 @@ The page listens on `127.0.0.1:3100` (`VOICE_MODE_PORT`, and
 `VOICE_MODE_PAGE_HOST` for another bind address), and also under `/voice` on
 the existing host webhook port. `VOICE_MODE_PORT=off` (or `0`) turns the
 separate listener off when the front already forwards `/voice` to the webhook
-port. A container proxy that cannot reach loopback needs the listener bound
+port. When the default port is taken, the host logs it and serves the page on
+the webhook port only; when an explicit `VOICE_MODE_PORT` cannot bind, setup
+fails and neither voice-mode nor the `voice` compatibility adapter starts.
+A container proxy that cannot reach loopback needs the listener bound
 to an address it can reach, plus the trusted-proxy settings below. Worker
 routes live only on the host port under `/webhook/voice-mode/livekit/agent/`;
 never proxy them: a worker request with `X-Forwarded-For` or `Forwarded` is
@@ -222,7 +224,9 @@ bash setup/lib/restart.sh
 pnpm run voice-mode-worker
 ```
 
-Host and worker must be the same build. For a persistent Linux worker, create
+Host and worker must be the same build. Both read `.env` when they start (the
+worker in each job process): restart the host and worker after changing
+settings. For a persistent Linux worker, create
 `~/.config/systemd/user/nanoclaw-voice-mode-worker.service` with the checkout's
 actual absolute path in `WorkingDirectory` and the installed Node in
 `ExecStart`:
@@ -255,7 +259,7 @@ Run `/voice` in an existing chat wired to the agent, as a known owner or
 scoped/global admin. Slack callers type `!voice`. First use creates a line
 and sends its secret link once. In a group the link goes to the sender's DM;
 if that DM cannot be resolved, nothing is minted. Later `/voice` moves the
-call chat and keeps the link. Only the current caller moves a new-model line.
+call chat and keeps the link. Only the line's caller moves its call chat.
 `/voice new` re-mints it for an authorized sender and ends the old call.
 Lost links cannot be read back: only their SHA-256 is stored. Do not paste
 links into shared chats, agent messages or logs.
@@ -263,10 +267,11 @@ links into shared chats, agent messages or logs.
 Calls use the caller's core role, checked at start, every turn, every five
 seconds and before replies. A revoked role or changed token ends the call.
 The current call chat must stay wired to the line's agent. When it disappears,
-`VOICE_MODE_MIRROR` picks an unambiguous fallback chat; a new line with no
-usable chat cannot deliver turns. A legacy membership-based `voice` line
-can also talk on the line itself: a `voice` compatibility adapter hands its
-replies and typing to the voice-mode engine.
+`VOICE_MODE_MIRROR` picks an unambiguous fallback chat. A line `/voice` made
+with no usable chat is refused at call start, and a running call on it ends,
+until `/voice` runs in a chat with the agent. A legacy membership-based
+`voice` line can also talk on the line itself: a `voice` compatibility adapter
+hands its replies and typing to the voice-mode engine.
 
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use
@@ -276,7 +281,7 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page, worker routes and old links. |
+| `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page, worker routes and old links. A taken default port is logged and skipped; an explicit port that cannot bind stops voice-mode from starting. |
 | `VOICE_MODE_PAGE_HOST` | `127.0.0.1` | Bind address of the separate page server. |
 | `VOICE_MODE_MAX_CALL_SECONDS` | `900` | Per-call duration limit. |
 | `VOICE_MODE_MAX_CALLS_PER_HOUR` | `12` | Start attempts per line, including failed starts. |
@@ -313,11 +318,12 @@ The vocabulary file is bounded and rejects symlinks/FIFOs. Keep names only:
 60 terms and 1024 bytes total, at most 80 characters per term. Its entries
 also name the agent for transcript wake. Preserve it across upgrades.
 
-A configured custom acoustic classifier keeps working with its path and
-phrase settings. Without a model, transcript `hey <agent>` opens the turn,
-including the agent's alternate names. Acoustic wake sends no idle audio to
-Google; transcript wake necessarily transcribes speech before deciding whether
-it was addressed. Failure to load an acoustic model falls back to transcript.
+A custom acoustic classifier is used from `VOICE_MODE_WAKE_MODEL` with its
+phrase and threshold settings. Without a model, transcript `hey <agent>` opens
+the turn, including the agent's alternate names. Acoustic wake sends no idle
+audio to Google; transcript wake necessarily transcribes speech before deciding
+whether it was addressed. Failure to load an acoustic model falls back to
+transcript.
 
 The worker announces command vocabulary version `3` and the actual words.
 `zulu`, `прийом`, and a final-confirmed own-sentence `copy`/`copy that` send;
@@ -336,7 +342,7 @@ The Jev end-of-turn shadow is optional, off unless `data/jev-turn.json` enables
 it. It can only measure, never send or end a turn. No Jev credential, endpoint,
 model or service is required for voice installation. See
 [optional shadow configuration](../../../docs/jev-turn.md).
-`JEV_API_KEY`, `JEV_URL`, `JEV_MODEL` retain their generic names and defaults.
+Its settings are `JEV_API_KEY`, `JEV_URL` and `JEV_MODEL`.
 The daily cap counts one appended byte per judgement in a file per local day,
 `data/jev-turn-usage-<YYYY-MM-DD>`, with no lock: concurrent calls can only
 under-count, and a judgement that cannot be counted is skipped and logged once
@@ -351,10 +357,15 @@ Remove via [REMOVE.md](REMOVE.md).
 
 ## Troubleshooting
 
-- Unknown link: new-model links are shown only once; `/voice new` replaces one.
-  Legacy tokens must remain in `.env` with their original line and membership.
-- Caller denied: new lines require a current core owner/admin role. Legacy
-  lines retain their named voice caller, strict wiring and group membership.
+- Unknown link: a link is shown only once and cannot be read back; `/voice new`
+  replaces it. A saved link works while its token is in `VOICE_MODE_LINK_TOKEN`
+  and its `voice` line and membership rows exist.
+- Caller denied: a `/voice` line needs its caller to hold a core owner or admin
+  role over the agent; a saved line needs its named voice caller, strict wiring
+  and group membership.
+- No chat to talk in: the page says the line has no chat to talk in. Run
+  `/voice` in a chat wired to the agent, or set `VOICE_MODE_MIRROR` to a channel
+  with one unambiguous chat for it.
 - Updating: reload the page or update the native client to protocol 6. Host and
   worker must match; token requests need `v=6` and older starts get HTTP 426.
 - No worker: check the worker unit, LiveKit signaling, host loopback URL and

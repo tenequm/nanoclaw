@@ -68,7 +68,10 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
-  /** VOICE_MODE_LANGUAGES: the transcription's language hints, the first the call's default; absent for the default ones. */
+  /**
+   * VOICE_MODE_LANGUAGES: the transcription's language hints, the first the call's default. The host
+   * always sends them; a worker falls back to DEFAULT_VOICE_LANGUAGES when they are absent.
+   */
   languages?: string[];
   /**
    * The agent's own voice.vocabulary.txt entries: besides `agentName`, the names the wake phrase
