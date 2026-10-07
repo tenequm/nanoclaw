@@ -3703,7 +3703,18 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const header = readJobHeader(ctx.job.metadata);
   const callFields = { callId: header.callId };
   const telemetry = new CallTelemetry({ info: (msg, fields) => log.info(msg, { ...callFields, ...fields }) });
-  const hostUrl = liveKitHostUrl(deps.env);
+  let hostUrl: string;
+  try {
+    hostUrl = liveKitHostUrl(deps.env);
+  } catch (err) {
+    // No host to tell: the room goes, and the host ends the call when its worker never joins.
+    const reason = (err as Error).message;
+    log.warn('voice-mode worker: ending the call', { ...callFields, reason });
+    telemetry.ended(reason);
+    await ctx.deleteRoom().catch(() => undefined);
+    ctx.shutdown(reason);
+    return;
+  }
   const host = new HostLink(
     {
       hostUrl,
@@ -4370,9 +4381,14 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'VOICE_MODE_MAX_SPOKEN_CHARS',
   ]);
   // agents-js initializes its logger once the CLI runs a command; console until then.
-  console.info(
-    `voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${liveKitHostUrl(env)} (LIVEKIT_HOST_URL)`,
-  );
+  let hostUrl: string;
+  try {
+    hostUrl = liveKitHostUrl(env);
+  } catch (err) {
+    console.error(`voice-mode worker: ${(err as Error).message}`);
+    process.exit(1);
+  }
+  console.info(`voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, host URL ${hostUrl} (LIVEKIT_HOST_URL)`);
   // agents-js's default ("adaptive") enables the debugger domain on a job's first loop stall to
   // sample stacks: that blocks the loop another ~250 ms mid-call and slows the call's JS by ~15%
   // from then on. Set the variable to sample anyway; the job processes inherit it.

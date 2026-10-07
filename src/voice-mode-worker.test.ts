@@ -17,6 +17,7 @@ import {
   CALL_COMMAND_WORDS,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
+  liveKitHostUrl,
   type CallReviewState,
   type LiveKitJobMetadata,
   type ReviewOp,
@@ -1188,6 +1189,53 @@ describe('runCall', () => {
     expect(v.createVoice).not.toHaveBeenCalled();
     expect(host.calls.at(-1)?.url.endsWith('/ended')).toBe(true);
     expect(job.deleteRoom).toHaveBeenCalled();
+  });
+
+  it('takes a local http(s) origin only: the host serves the worker on loopback', () => {
+    expect(liveKitHostUrl({})).toBe('http://127.0.0.1:3000');
+    expect(liveKitHostUrl({ WEBHOOK_PORT: '3555' })).toBe('http://127.0.0.1:3555');
+    expect(liveKitHostUrl({ LIVEKIT_HOST_URL: 'http://localhost:3000/' })).toBe('http://localhost:3000');
+    expect(liveKitHostUrl({ LIVEKIT_HOST_URL: 'https://[::1]:3000' })).toBe('https://[::1]:3000');
+    for (const bad of [
+      'http://192.168.1.5:3000',
+      'http://127.0.0.2:3000',
+      'https://voice.example.com',
+      'ws://127.0.0.1:3000',
+      'nonsense',
+      'http://user:hunter2@127.0.0.1:3000',
+    ]) {
+      expect(() => liveKitHostUrl({ LIVEKIT_HOST_URL: bad })).toThrow('LIVEKIT_HOST_URL must be a local');
+    }
+    expect(() => liveKitHostUrl({ WEBHOOK_PORT: 'abc' })).toThrow('LIVEKIT_HOST_URL must be a local');
+    // The diagnostic names the origin, never the credentials in it.
+    expect(() => liveKitHostUrl({ LIVEKIT_HOST_URL: 'https://user:hunter2@voice.example.com/x?k=v' })).toThrow(
+      /got https:\/\/voice\.example\.com with credentials\)/,
+    );
+    try {
+      liveKitHostUrl({ LIVEKIT_HOST_URL: 'https://user:hunter2@voice.example.com/x?k=v' });
+    } catch (err) {
+      expect(String(err)).not.toMatch(/hunter2|user|k=v/);
+    }
+  });
+
+  it('ends the job without a word to a host that is not local', async () => {
+    const { job, ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const warn = vi.fn();
+    await runCall(
+      ctx,
+      callDeps(host.fetchImpl, v, {
+        env: { ...ENV, LIVEKIT_HOST_URL: 'https://user:hunter2@remote.example.invalid' },
+        log: { info: () => undefined, warn },
+      }),
+    );
+    expect(host.calls).toEqual([]);
+    expect(job.connect).not.toHaveBeenCalled();
+    expect(v.createVoice).not.toHaveBeenCalled();
+    expect(job.deleteRoom).toHaveBeenCalled();
+    expect(job.shutdown).toHaveBeenCalledWith(expect.stringContaining('LIVEKIT_HOST_URL must be a local'));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('hunter2');
   });
 
   it('refuses to start without the LiveKit secret it derives the host credential from', async () => {

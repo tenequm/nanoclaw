@@ -437,9 +437,35 @@ export function liveKitCallSecret(apiSecret: string, callId: string): string {
   return createHmac('sha256', apiSecret).update(`nanoclaw-voice-mode-call:${callId}`).digest('base64url');
 }
 
-/** Where the worker reaches the host's webhook server; only ever from the worker's own settings. */
+/**
+ * Where the worker reaches the host's webhook server; only ever from the worker's own settings. The
+ * host answers the worker's routes for loopback peers only, and every request carries the call's
+ * bearer secret and the caller's words, so anything but a local HTTP(S) origin is a
+ * misconfiguration and throws. The error names the scheme and host only, never credentials.
+ */
 export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: string }): string {
-  return (env.LIVEKIT_HOST_URL || `http://127.0.0.1:${env.WEBHOOK_PORT || '3000'}`).replace(/\/+$/, '');
+  const raw = (env.LIVEKIT_HOST_URL || `http://127.0.0.1:${env.WEBHOOK_PORT || '3000'}`).replace(/\/+$/, '');
+  let url: URL | null = null;
+  try {
+    url = new URL(raw);
+  } catch {
+    // Reported below.
+  }
+  const local =
+    url !== null &&
+    /^https?:$/.test(url.protocol) &&
+    /^(localhost|127\.0\.0\.1|\[::1\])$/.test(url.hostname) &&
+    !url.username &&
+    !url.password;
+  if (!local) {
+    const got = url
+      ? `${url.protocol}//${url.host}${url.username || url.password ? ' with credentials' : ''}`
+      : 'no URL';
+    throw new Error(
+      `LIVEKIT_HOST_URL must be a local http(s) address such as http://127.0.0.1:3000 (got ${got}): the host serves the worker on loopback only`,
+    );
+  }
+  return raw;
 }
 
 export function voiceModeEnvKeys(keys: readonly string[]): string[] {
