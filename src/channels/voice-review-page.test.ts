@@ -310,12 +310,12 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     }
   });
 
-  it("auto's readout: send it or a pause sends, and with the wake switch the phrase that opens a turn", () => {
+  it("auto's readout: a send word or a pause sends, and with the wake switch the phrase that opens a turn", () => {
     const listen = (fields: Partial<ReviewState>) =>
       lib.autoListening({ agentName: 'Andy', review: { ...lib.INITIAL_REVIEW, ...fields } });
     expect(listen({ wake: false })).toEqual({
       chip: 'Listening',
-      hint: 'Go ahead. Stop for a moment, or say "send it" to send now.',
+      hint: 'Go ahead. Stop for a moment, or say "zulu" or "copy" to send now.',
       empty: 'Speak when ready.',
     });
     // A worker without spoken commands keeps the old copy.
@@ -334,10 +334,10 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
     expect(listen({ wake: true, awaitingWake: true, wakePhrase: 'Hey Casa' }).chip).toBe('Say "Hey Casa"');
     expect(listen({ wake: true, awaitingWake: false })).toMatchObject({
       chip: 'Listening',
-      hint: 'Say "send it" to send - stopping won\'t.',
+      hint: 'Say "zulu" or "copy" to send - stopping won\'t.',
     });
     // The copy never quotes seconds: the countdown shows how long the pause is.
-    expect(listen({ wake: true, pauseSends: true }).hint).toBe('Say "send it", or stop for a moment, to send.');
+    expect(listen({ wake: true, pauseSends: true }).hint).toBe('Say "zulu" or "copy", or stop for a moment, to send.');
     // A new caller starts hands-free with the wake switch on; the worker's wake state rides on its review state.
     expect(lib.INITIAL_REVIEW).toMatchObject({
       mode: 'auto',
@@ -362,24 +362,19 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
   });
 
   it('knows the send words the worker takes, in Latin and Cyrillic, as a caption line ends', () => {
-    for (const said of [
-      'Send it.',
-      'sendit',
-      'Сенд іт.',
-      'Сендіт',
-      'Сендип.',
-      'Sent it.',
-      'Send eat.',
-      'Send.',
-      'Прийом.',
-      'Scratch that.',
-      'Discard this turn.',
-    ])
+    for (const said of ['Zulu.', 'Зулу.', 'Copy.', 'Copy that.', 'Прийом.', 'Scratch that.', 'Discard this turn.'])
       expect(lib.isCommandOnly(said), said).toBe(true);
-    expect(lib.lineKey('Book a table for two. Send it.')).toBe('bookatablefortwo');
+    expect(lib.lineKey('Book a table for two. Zulu.')).toBe('bookatablefortwo');
     expect(lib.lineKey('Скільки зараз часу? Прийом.')).toBe('скількизаразчасу');
-    // "over" is no longer a command: it stays part of what was said.
-    expect(lib.isCommandOnly('Over.')).toBe(false);
+    // `copy` only as its own sentence; a trailing "?" changes nothing.
+    expect(lib.lineKey('Book a table, copy that.')).toBe('bookatable');
+    expect(lib.lineKey('Is it ready? Copy?')).toBe('isitready');
+    expect(lib.lineKey('Send me a copy.')).toBe('sendmeacopy');
+    expect(lib.lineKey('Can you copy that?')).toBe('canyoucopythat');
+    expect(lib.isCommandOnly('Zulu?')).toBe(true);
+    expect(lib.isCommandOnly('Прийом?')).toBe(true);
+    // "over" and "send it" are no longer commands: they stay part of what was said.
+    for (const said of ['Over.', 'Send it.', 'Sendit', 'Send.']) expect(lib.isCommandOnly(said), said).toBe(false);
     expect(lib.lineKey('Game over')).toBe('gameover');
     expect(lib.isCommandOnly('')).toBe(false);
     expect(lib.isCommandOnly('Book a table.')).toBe(false);
@@ -387,16 +382,16 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
 
   it('names the turn modes for people and says what each does', () => {
     expect(lib.MODE_NAME).toEqual({ auto: 'hands-free', review: 'Manual' });
-    expect(lib.modeCaption('auto', true)).toBe('Stop for a moment, or say "send it", to send.');
+    expect(lib.modeCaption('auto', true)).toBe('Stop for a moment, or say "zulu" or "copy", to send.');
     expect(lib.modeCaption('auto', false)).toBe('Stop for a moment to send.');
     expect(lib.modeCaption('review', true)).toBe('Tap talk, read your words, then send.');
     // With the wake switch a pause sends only with the pause switch, as the hint says.
-    expect(lib.modeCaption('auto', true, { on: true, pauseSends: false })).toBe('Say "send it" to send.');
+    expect(lib.modeCaption('auto', true, { on: true, pauseSends: false })).toBe('Say "zulu" or "copy" to send.');
     expect(lib.modeCaption('auto', true, { on: true, pauseSends: true })).toBe(
-      'Stop for a moment, or say "send it", to send.',
+      'Stop for a moment, or say "zulu" or "copy", to send.',
     );
     expect(lib.modeCaption('auto', true, { on: false, pauseSends: false })).toBe(
-      'Stop for a moment, or say "send it", to send.',
+      'Stop for a moment, or say "zulu" or "copy", to send.',
     );
   });
 
@@ -543,17 +538,12 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
   it("the page's command words are the worker's, on the same commands vocabulary", () => {
     // How the transcription writes each one; every page word needs a spelling here.
     const spoken: Array<[string, SpokenCommand]> = [
-      ['Send it.', 'send'],
-      ['Sent it.', 'send'],
-      ['Send eat.', 'send'],
-      ['Sendit.', 'send'],
-      ['Send.', 'send'],
-      ['Сенд іт.', 'send'],
-      ['Сендіт.', 'send'],
-      ['Сендит.', 'send'],
-      ['Сендіп.', 'send'],
-      ['Сендип.', 'send'],
-      ['Сенд.', 'send'],
+      ['Zulu.', 'send'],
+      ['Зулу.', 'send'],
+      ['Copy.', 'send'],
+      ['Copy that.', 'send'],
+      ['Copy?', 'send'],
+      ['Zulu?', 'send'],
       ['Прийом.', 'send'],
       ['Приём.', 'send'],
       ['Discard this turn.', 'discard'],
@@ -568,7 +558,13 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
       expect(matchCommand(text), text).toEqual({ command, rest: '' });
     }
     // Not a command for either: words before or after it.
-    for (const text of ['Send it to Anna.', 'Scratch that idea.']) {
+    for (const text of [
+      'Zulu, call Anna.',
+      'Scratch that idea.',
+      'Send me a copy.',
+      'Can you copy that?',
+      'Send it.',
+    ]) {
       expect(lib.isCommandOnly(text), text).toBe(false);
       expect(matchCommand(text), text).toBeNull();
     }

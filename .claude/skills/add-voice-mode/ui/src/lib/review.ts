@@ -5,7 +5,7 @@ import type { Phase } from "./voice-call"
  * models it is made of: the turn mode, the operation in flight, the worker's draft, the delivery
  * of the last sent draft and the agent's activity. Pure, so every state can be tested and shown
  * by the demo. The worker owns the draft (see CallReviewState in the protocol); the page only
- * shows it and asks. Auto mode's spoken commands (`send it`, the discard phrases, the wake switch)
+ * shows it and asks. Auto mode's spoken commands (`zulu`, `copy`, the discard phrases, the wake switch)
  * ride on the same state, see `autoListening`.
  */
 
@@ -68,7 +68,7 @@ export interface ReviewState {
   commands: boolean
   /** The caller's wake switch: in auto nothing is sent until the wake phrase. Kept for the next call (ReviewPrefs). */
   wake: boolean
-  /** With the wake switch: a pause sends too after the wake phrase, not only `send it`. */
+  /** With the wake switch: a pause sends too after the wake phrase, not only a spoken send. */
   pauseSends: boolean
   /** The typing sound while the agent works. Kept for the next call (ReviewPrefs). */
   typing: boolean
@@ -483,8 +483,8 @@ export const MODE_NAME: Record<TurnMode, string> = { auto: "hands-free", review:
 export function modeCaption(mode: TurnMode, commands: boolean, wake?: { on: boolean; pauseSends: boolean }): string {
   if (mode === "review") return "Tap talk, read your words, then send."
   if (!commands) return "Stop for a moment to send."
-  if (wake?.on && !wake.pauseSends) return `Say "send it" to send.`
-  return `Stop for a moment, or say "send it", to send.`
+  if (wake?.on && !wake.pauseSends) return `Say "zulu" or "copy" to send.`
+  return `Stop for a moment, or say "zulu" or "copy", to send.`
 }
 
 /**
@@ -496,17 +496,20 @@ export const COMMANDS_VERSION = "2"
 /**
  * The page's own copy of the worker's send words, then its discard phrases, as `norm` leaves them
  * (lowercase, letters and digits only, Cyrillic kept as is). A caption line that ends in one holds
- * that command. The channel tests check each one against the worker's own matching.
+ * that command; `copy` and `copy that` only as their own sentence (the whole line, or after
+ * punctuation, OWN_SENTENCE_END). The channel tests check each one against the worker's own matching.
  */
-export const SEND_WORDS = ["sendit", "sentit", "sendeat", "send", "сендіт", "сендит", "сендіп", "сендип", "сенд", "прийом", "приём"]
+export const SEND_WORDS = ["zulu", "зулу", "прийом", "приём"]
 export const DISCARD_PHRASES = ["discardthisturn", "discardturn", "scratchthat"]
 const COMMAND_END = new RegExp(`(${[...SEND_WORDS, ...DISCARD_PHRASES].join("|")})$`, "u")
+const OWN_SENTENCE_END = /(^|[.!?,;:–—-])\s*copy(\s+that)?[^\p{L}\p{N}]*$/iu
 const DISCARD_END = new RegExp(`(${DISCARD_PHRASES.join("|")})$`, "u")
 
 export const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
 /** A caption line as a sent turn's text holds it: a spoken command that ended the turn is not sent. */
-export const lineKey = (s: string) => norm(s).replace(COMMAND_END, "")
-/** A caption line that is only a spoken command ("Send it."), with nothing else said. */
+export const lineKey = (s: string) =>
+  OWN_SENTENCE_END.test(s) ? norm(s.replace(OWN_SENTENCE_END, "")) : norm(s).replace(COMMAND_END, "")
+/** A caption line that is only a spoken command ("Zulu."), with nothing else said. */
 export const isCommandOnly = (s: string) => norm(s) !== "" && lineKey(s) === ""
 /** A caption line that ends in a discard phrase ("Scratch that."). */
 export const endsInDiscard = (s: string) => DISCARD_END.test(norm(s))
@@ -550,11 +553,11 @@ export function autoListening({ agentName, review }: { agentName: string; review
   // The send countdown shows how long the pause is; the copy never quotes seconds.
   if (!review.commands) return { chip: "Listening", hint: "Go ahead. Stop for a moment to send.", empty: "Speak when ready." }
   const wakePhrase = `"${wakePhraseOf(review, agentName)}"`
-  if (!review.wake) return { chip: "Listening", hint: `Go ahead. Stop for a moment, or say "send it" to send now.`, empty: "Speak when ready." }
+  if (!review.wake) return { chip: "Listening", hint: `Go ahead. Stop for a moment, or say "zulu" or "copy" to send now.`, empty: "Speak when ready." }
   if (review.awaitingWake) return { chip: `Say ${wakePhrase}`, hint: `Nothing is sent until you say ${wakePhrase}.`, empty: `Say ${wakePhrase} to start.` }
   return {
     chip: "Listening",
-    hint: review.pauseSends ? `Say "send it", or stop for a moment, to send.` : `Say "send it" to send - stopping won't.`,
+    hint: review.pauseSends ? `Say "zulu" or "copy", or stop for a moment, to send.` : `Say "zulu" or "copy" to send - stopping won't.`,
     empty: "Speak when ready.",
   }
 }

@@ -1731,39 +1731,48 @@ export function matchWake(text: string, names: readonly WakeName[]): { start: nu
 export type SpokenCommand = 'send' | 'discard';
 /**
  * The commands, longest first, as the words that end an utterance (Cyrillic already read as Latin:
- * `сенд іт` is `send it`). `send it` as the transcription hears it from a Ukrainian speaker
- * (`сендіт`, `сендит`, `сендип`, `sent it`, `send eat`, or cut to a final `send`), and the Ukrainian `прийом`.
+ * `зулу` is `zulu`, `прийом` is `pryyom`). `copy` and `copy that` are everyday words too, so a
+ * final takes them only as their own sentence (`ownSentence`): the whole utterance, or after punctuation.
  */
-const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[]]> = [
+const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[], { ownSentence: true }?]> = [
   ['discard', ['discard', 'this', 'turn']],
   ['discard', ['discard', 'turn']],
   ['discard', ['scratch', 'that']],
-  ['send', ['send', 'it']],
-  ['send', ['sent', 'it']],
-  ['send', ['send', 'eat']],
-  ['send', ['sendit']],
-  ['send', ['sendyt']],
-  ['send', ['sendyp']],
-  ['send', ['sendip']],
-  ['send', ['send']],
+  ['send', ['copy', 'that'], { ownSentence: true }],
+  ['send', ['copy'], { ownSentence: true }],
+  ['send', ['zulu']],
   ['send', ['pryyom']],
 ];
 
 /**
- * The command a final transcript ends with, and what was said before it, or null. Only the end
- * counts: `send it to Anna` is words, while a sentence that really ends in `send it` sends; one
- * that ends in it as a question (`Send it or not send it?`) is words too.
+ * The command phrase a transcript ends with and what was said before it; `missed` when it is an
+ * `ownSentence` command inside a final's sentence (`send me a copy`). Interim text is mostly
+ * unpunctuated, so there the final decides that.
  */
-export function matchCommand(text: string): { command: SpokenCommand; rest: string } | null {
+function commandEnd(
+  text: string,
+  interim = false,
+): { command: SpokenCommand; rest: string; phrase: string; missed?: true } | null {
   const words = spokenWords(text);
-  for (const [command, phrase] of COMMANDS) {
+  for (const [command, phrase, guard] of COMMANDS) {
     if (words.length < phrase.length) continue;
     const tail = words.slice(words.length - phrase.length);
     if (!tail.every((w, i) => w.word === phrase[i])) continue;
-    if (text.slice(tail[tail.length - 1].end).includes('?')) return null;
-    return { command, rest: sentence(text.slice(0, tail[0].start)) };
+    const before = text.slice(0, tail[0].start);
+    const found = { command, rest: sentence(before), phrase: phrase.join('-') };
+    if (guard?.ownSentence && !interim && !/(^|[.!?,;:–—-])\s*$/u.test(before)) return { ...found, missed: true };
+    return found;
   }
   return null;
+}
+
+/**
+ * The command a transcript ends with, and what was said before it, or null. Only the end counts:
+ * `zulu, call Anna` is words, while a sentence that really ends in `zulu` sends, even as a question.
+ */
+export function matchCommand(text: string, interim = false): { command: SpokenCommand; rest: string } | null {
+  const end = commandEnd(text, interim);
+  return end && !end.missed ? { command: end.command, rest: end.rest } : null;
 }
 
 /** Words before a command, as a sentence: the comma before it gone, a period where none ends them. */
@@ -1872,7 +1881,7 @@ const COMMAND_WORDS = 4;
 /**
  * Whether `text` is the words an earlier interim had before its command, with the command left out:
  * it ends like them (endsLike) and has no more words than they and a command would. New words after
- * the command (`send it to Anna`), or a repeat of the same words, are not.
+ * the command (`copy that to Anna`), or a repeat of the same words, are not.
  */
 export function droppedCommand(text: string, rest: string): boolean {
   return endsLike(text, rest) && wordCount(text) <= wordCount(rest) + COMMAND_WORDS - 1;
@@ -1997,7 +2006,7 @@ export interface Recording {
  * `pauseSends`); it goes back to waiting with no speech for a while (AwakeLimits). Without a
  * spotter the transcript's `hey <agent>` opens it instead.
  *
- * Spoken commands are nominated by the interim text: `send it` (or `прийом`) or a discard phrase at
+ * Spoken commands are nominated by the interim text: a send word (`zulu`, `copy`, `прийом`) or a discard phrase at
  * its end in STABLE_COMMAND_INTERIMS interims in a row, with the caller silent, ends the activity,
  * and the final text decides (turnText): a command it still ends with acts, one it does not was
  * words, and the turn goes on in a new activity carrying the text so far. A pause or sleep that
@@ -2208,7 +2217,7 @@ export class CallTurns {
       this.woke();
       if (!this.speaking) this.armPause();
     }
-    const match = matchCommand(this.spoken(turn, text));
+    const match = matchCommand(this.spoken(turn, text), true);
     if (match) turn.seen = match;
     if (!match) turn.candidate = undefined;
     else if (turn.candidate?.command === match.command) turn.candidate.count++;
@@ -2352,7 +2361,7 @@ export class CallTurns {
     turn: OpenTurn,
     text = this.spoken(turn, turn.heard),
   ): { command: SpokenCommand; rest: string } | null {
-    return matchCommand(text) ?? (turn.seen && droppedCommand(text, turn.seen.rest) ? turn.seen : null);
+    return matchCommand(text, true) ?? (turn.seen && droppedCommand(text, turn.seen.rest) ? turn.seen : null);
   }
 
   /** The send countdown shows while the closing silence runs, and not while a spoken command is pending. */
@@ -2511,9 +2520,10 @@ export class CallTurns {
     let match = matchCommand(text);
     // The command an interim ended with, the last one's or an earlier one's.
     const nominated = turn.kind === 'auto' ? this.pendingCommand(turn) : null;
-    // A final that ends in the command's words as a question asked it: the interim text cannot overrule that.
-    const asked = !match && !!matchCommand(text.replace(/[?\s]+$/u, ''));
-    if (!match && !asked && nominated && endsLike(text, nominated.rest)) {
+    // A final that ends in `copy` inside a sentence decided it was words: the interim text cannot overrule that.
+    const missed = match ? null : commandEnd(text);
+    if (missed?.missed) this.deps.log.info(`voice.command near-miss word=${missed.phrase} reason=no-boundary`);
+    if (!match && !missed?.missed && nominated && endsLike(text, nominated.rest)) {
       // The final left out the command the interim text ended with: the command stands, and the
       // final is the turn's text.
       match = { command: nominated.command, rest: sentence(trimCut(text)) };
@@ -3019,7 +3029,15 @@ export interface WakeWordEvents {
 }
 
 /** The command phrases, as spelling hints for the transcription: they must be in its vocabulary to be heard. */
-export const COMMAND_VOCABULARY = ['send it', 'прийом', 'scratch that', 'discard turn', 'discard this turn'] as const;
+export const COMMAND_VOCABULARY = [
+  'zulu',
+  'copy',
+  'copy that',
+  'прийом',
+  'scratch that',
+  'discard turn',
+  'discard this turn',
+] as const;
 /**
  * VOICE_WAKE_MODEL (a classifier .onnx; the bundled `hey_livekit` by default, `off` for none),
  * VOICE_WAKE_THRESHOLD (0-1; the bundled model's documented 0.68 by default, 0.5 for another model)

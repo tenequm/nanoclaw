@@ -846,27 +846,27 @@ draft is open the call can still end ("end call" on the draft, or Esc), and the
 draft goes with it; a call that ends on its own with a draft keeps it readable
 until discarded, never sent into the next call.
 
-**Spoken commands in auto.** `send it` at the end of what the caller said sends
-the turn at once without the words, and `discard turn`, `discard this turn` or
-`scratch that` there drops everything since the last send; nothing is posted and the
-page marks those caption lines "discarded". `send it` is also taken as the
-transcription writes it from a Ukrainian speaker (`сенд іт`, `сендіт`, `сендит`,
-`сендип`, `sent it`, `send eat`, or cut to `send`), and the Ukrainian `прийом` sends
-too. The commands are in the transcription's custom vocabulary (it hears them far
+**Spoken commands in auto.** `zulu` (`зулу`) or the Ukrainian `прийом` at the end
+of what the caller said sends the turn at once without the words, and so do `copy`
+and `copy that`, but only as their own sentence in the final (the whole utterance,
+or after `.`, `!`, `?`, `,`, `;`, `:` or a dash): `send me a copy` is words, and the
+worker logs `voice.command near-miss word=<cmd> reason=no-boundary` for it.
+`discard turn`, `discard this turn` or `scratch that` there drops everything since
+the last send; nothing is posted and the page marks those caption lines "discarded". The commands are in the transcription's custom vocabulary (it hears them far
 more reliably so). A command is noticed in the interim text: when two interim updates
 in a row end with it and the caller is silent (the VAD's end of speech), the turn's
 activity ends, and its final text decides: a command it still ends with acts, one it
 does not end with (the interim text was ahead of itself) was words, and the turn goes
 on in a new activity carrying them, as it does when the caller talks on before the
-final comes. Only the end counts: `send it to Anna` is words, and so is a question
-ending in it (`Should I send it?`). A pause that ends a turn whose final text ends in
+final comes. Only the end counts: `zulu, call Anna` is words; a trailing `?` changes
+nothing (`Is it ready? Copy?` sends). A pause that ends a turn whose final text ends in
 a command applies it too, and so does one any interim of the turn ended with that later
 interims and the final left out (the final ends like the words before it, with no
 more words than a command adds), so a dropped `scratch that` never sends the words;
 the send countdown is not shown while a command is pending. A sent turn's caption is
 the text the agent got, without the command; the words before it keep their period.
 The transcription sometimes returns its own vocabulary list as the caller's words
-(`'Ava', 'Max', 'send it', ...`); that echo is cut from every interim and final. A command with nothing to act on plays the nope cue, and its
+(`'Ava', 'Max', 'zulu', ...`); that echo is cut from every interim and final. A command with nothing to act on plays the nope cue, and its
 line says "nothing to send" (or "nothing to discard"). A wake switch under the mode
 row, in a labelled "voice commands" block with a one-line explainer (on by default,
 kept for the next call like the mode pick; the worker starts with it on until the
@@ -874,7 +874,7 @@ page's settings arrive), holds everything until the wake phrase: the chip says
 `Say "<phrase>"` on a dim outlined chip, the phrase exactly as configured (`Say "Hey
 LiveKit"` for the bundled model, `Hey <agent>` without a model; a fresh phrase from the
 host or the worker replaces the one the browser kept), and once it is heard the chip flashes and the
-line says "heard - listening", and after it only `send it` sends, unless the second
+line says "heard - listening", and after it only a spoken send sends, unless the second
 switch ("a pause also sends", shown only with the first) lets the closing silence send
 too; after a send or a discard it waits again. The wake phrase is heard in the audio,
 not the transcript: while it waits, nothing goes to Google; the worker scores the
@@ -888,7 +888,7 @@ Said again inside an open turn, the wake phrase (`hey <agent>`, or the model's p
 cut out of the turn's text, and a discard before it drops only the words before it. Speech before the phrase is not transcribed at all, so it shows no caption. A
 turn the phrase opened that hears nothing for `VOICE_WAKE_START_SECONDS`, or nothing
 more for `VOICE_WAKE_IDLE_SECONDS` after its last words, goes back to waiting: its
-final is read first (a `send it` the interim text missed still sends then, late), else
+final is read first (a `zulu` the interim text missed still sends then, late), else
 a soft falling cue plays, the page says "went back to sleep", and words it held are
 dropped as `asleep`, never sent.
 Only without a model (`off`, or one that does not load) does `hey <agent>` in the
@@ -900,7 +900,7 @@ spelling (`Hey, Andy.`, `гей Енді`, `хей Енді`, `hi Andy`, `хай
 glued to the hey as in `Heyandy`, and in Cyrillic a Ukrainian vocative ending, as
 in `Гей, Бене` for Ben). The worker
 advertises the commands with the attribute `nanoclaw.voice.commands` = "2" (the
-`send it` vocabulary; "1" was `over`, and a page offers the commands only to the value it
+`zulu` / `copy` vocabulary, which replaced `send it` without a bump; "1" was `over`, and a page offers the commands only to the value it
 knows, so a page left open across an update falls back to pauses) and
 takes the switches in the `nanoclaw.voice.settings` RPC (`{"wake", "pauseSends",
 "cues"}`); its review state carries `"wake": {"on", "pauseSends", "waiting", "phrase", "heard",

@@ -78,14 +78,14 @@ const SCRIPT: Step[] = [
   { phase: "ended", ms: 0, end: "Today's call minutes are used up." },
 ]
 
-// The wake switch: words before "Hey LiveKit" go nowhere, "send it" sends, "scratch that" drops the turn.
+// The wake switch: words before "Hey LiveKit" go nowhere, "zulu" sends, "scratch that" drops the turn.
 const WAKE_SCRIPT: Step[] = [
   { phase: "connecting", ms: 1300 },
   { phase: "listening", ms: 2400, awaitingWake: true },
   { phase: "listening", ms: 2600, awaitingWake: true, from: "user", text: "So that's settled for the weekend then." },
   { phase: "listening", ms: 1400, awaitingWake: true, drop: "unaddressed" },
   { phase: "listening", ms: 3400, awaitingWake: false, wakeHeard: true, from: "user", text: "Hey LiveKit, book a table for two at eight." },
-  { phase: "listening", ms: 2400, awaitingWake: false, from: "user", text: "Somewhere near the office. Send it." },
+  { phase: "listening", ms: 2400, awaitingWake: false, from: "user", text: "Somewhere near the office. Zulu." },
   { phase: "thinking", ms: 1900, awaitingWake: true, sent: true },
   { phase: "talking", ms: 3600, from: "assistant", text: "Booked Tavola for eight. Want it on your calendar too?", re: "reply to turn 1", awaitingWake: true },
   { phase: "listening", ms: 2000, awaitingWake: true },
@@ -105,7 +105,7 @@ const CUES_SCRIPT: Step[] = [
   { phase: "thinking", ms: 1900, awaitingWake: true, sent: true },
   { phase: "talking", ms: 3600, from: "assistant", text: "You have the dentist at ten, then lunch with Laura.", re: "reply to turn 1", awaitingWake: true, unheard: true },
   { phase: "listening", ms: 2400, awaitingWake: true, unspoken: "Also, the venue moved the booking to Friday." },
-  { phase: "listening", ms: 2400, awaitingWake: true, from: "user", text: "Send it.", command: true },
+  { phase: "listening", ms: 2400, awaitingWake: true, from: "user", text: "Zulu.", command: true },
   { phase: "ended", ms: 0, end: "Call ended." },
 ]
 

@@ -168,17 +168,21 @@ export interface CallDraft {
 }
 
 /**
- * Auto mode's spoken commands: `send it` (or `прийом`) at the end of an utterance sends the turn
- * now, `discard turn`, `discard this turn` or `scratch that` there drops it, and with the wake switch
- * `on` nothing is kept or sent until `hey <agent>`, or the worker's acoustic wake word
- * (`CallWakeState.phrase`), is heard (`waiting` until then). After the wake phrase only `send it` sends, unless
- * `pauseSends` lets the closing silence send too. The worker's participant attribute is
- * CALL_COMMANDS_VERSION when it understands them and the `settings` RPC; a page offers the commands
- * only for the value it knows, so a page and a worker from either side of a vocabulary change fall
- * back to pauses. An older worker sets none, and its auto mode has no commands.
+ * Auto mode's spoken commands: `zulu`, `прийом`, or `copy` / `copy that` as their own sentence, at
+ * the end of an utterance sends the turn now, `discard turn`, `discard this turn` or `scratch that`
+ * there drops it, and with the wake switch `on` nothing is kept or sent until `hey <agent>`, or the
+ * worker's acoustic wake word (`CallWakeState.phrase`), is heard (`waiting` until then). After the
+ * wake phrase only a spoken send sends, unless `pauseSends` lets the closing silence send too. The
+ * worker's participant attribute is CALL_COMMANDS_VERSION when it understands them and the
+ * `settings` RPC; a page offers the commands only for the value it knows, so a page and a worker
+ * from either side of a vocabulary change fall back to pauses. An older worker sets none, and its
+ * auto mode has no commands.
  */
 export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice.commands';
-/** The commands' vocabulary: "1" had `over` as the send word, "2" has `send it`. */
+/**
+ * The commands' vocabulary: "1" had `over` as the send word, "2" had `send it` and now has `zulu`,
+ * `copy` and `copy that`; kept at "2" so open pages keep their commands across the change.
+ */
 export const CALL_COMMANDS_VERSION = '2';
 export interface CallWakeState {
   on: boolean;

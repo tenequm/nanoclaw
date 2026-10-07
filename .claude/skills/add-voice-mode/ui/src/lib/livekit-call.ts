@@ -69,7 +69,7 @@ const REVIEW_RPC: Record<ReviewOp | "settings", string> = {
   discard: "nanoclaw.voice.discard",
   settings: "nanoclaw.voice.settings",
 }
-/** COMMANDS_VERSION when the worker understands spoken commands (`send it`, discard, the wake phrase) and the settings RPC. */
+/** COMMANDS_VERSION when the worker understands spoken commands (`zulu`, `copy`, discard, the wake phrase) and the settings RPC. */
 const COMMANDS_ATTR = "nanoclaw.voice.commands"
 /** The worker's sound cues come on their own track (CALL_CUE_TRACK), never the speech track. */
 const CUE_TRACK = "background_audio"

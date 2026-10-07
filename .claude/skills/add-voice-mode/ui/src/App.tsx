@@ -485,7 +485,7 @@ function CommandsBlock({
         <span id="cmds-title" className="cmds-title">
           Voice commands
         </span>
-        <span className="cmds-explain">Say "send it" or "прийом" to send now, "scratch that" to drop it.</span>
+        <span className="cmds-explain">Say "zulu", "copy" or "прийом" to send now, "scratch that" to drop it.</span>
       </p>
       <div className={`cmds-switches${wake ? " two" : ""}`}>
         <Switch
@@ -497,9 +497,9 @@ function CommandsBlock({
         />
         {wake && <Switch label="A pause also sends" on={pauseSends} disabled={disabled} describedBy="pause-sends-desc" onClick={() => onPauseSends(!pauseSends)} />}
       </div>
-      <span id="wake-desc" className="sr-only">{`Nothing is sent until you say ${phrase ?? "the wake phrase"}; then say send it to send.`}</span>
+      <span id="wake-desc" className="sr-only">{`Nothing is sent until you say ${phrase ?? "the wake phrase"}; then say zulu or copy to send.`}</span>
       <span id="pause-sends-desc" className="sr-only">
-        After the wake phrase a pause sends too, not only send it.
+        After the wake phrase a pause sends too, not only zulu or copy.
       </span>
     </section>
   )
