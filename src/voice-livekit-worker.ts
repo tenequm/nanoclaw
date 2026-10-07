@@ -52,6 +52,7 @@ import {
   AudioFrame,
   AudioSource,
   AudioStream,
+  DisconnectReason,
   LocalAudioTrack,
   RoomEvent,
   TrackKind,
@@ -110,6 +111,18 @@ import {
 
 /** The worker's duration cap outlasts the host's by this; it only fires when the host is gone. */
 const WORKER_DEADLINE_GRACE_MS = 30_000;
+/** How long the caller's identity may be gone while its client rejoins under it (a full reconnect). */
+export const CALLER_REJOIN_MS = 5_000;
+
+/**
+ * How long to wait for the caller's identity to rejoin before its leaving ends the call. A client's
+ * full reconnect joins under the same identity and the server removes the old instance with
+ * DUPLICATE_IDENTITY; the SDK can also drop the old one itself, with no reason, when the new one's
+ * update arrives first. Any other reason is the caller really gone.
+ */
+export function callerRejoinWaitMs(reason: DisconnectReason | undefined): number {
+  return reason === undefined || reason === DisconnectReason.DUPLICATE_IDENTITY ? CALLER_REJOIN_MS : 0;
+}
 /** Silero, the wake word, the transcription and the recordings all take 16 kHz mono. */
 const INPUT_SAMPLE_RATE = 16_000;
 /** Language hints for the transcription; the call's language for the worker's own lines. */
@@ -4117,8 +4130,33 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     clearTimeout(deadline);
     await end('job shutdown', true, true);
   });
+  /** Set while the caller's identity is gone and may still rejoin. */
+  let callerGone: ReturnType<typeof setTimeout> | undefined;
+  ctx.room.on(RoomEvent.ParticipantConnected, (participant) => {
+    if (participant.identity !== meta.callerIdentity || !callerGone) return;
+    clearTimeout(callerGone);
+    callerGone = undefined;
+    callLog.info('voice worker: the caller rejoined', { sid: participant.sid });
+    // The review state goes out as data: the new instance has not heard it. Its audio and RPCs
+    // follow the identity on their own.
+    review?.republish();
+  });
   ctx.room.on(RoomEvent.ParticipantDisconnected, (participant) => {
-    if (participant.identity === meta.callerIdentity) void end('caller left', true);
+    if (participant.identity !== meta.callerIdentity || ending) return;
+    const reason = participant.disconnectReason;
+    const waitMs = callerRejoinWaitMs(reason);
+    if (!waitMs) return void end('caller left', true);
+    callLog.info('voice worker: the caller dropped, waiting for it to rejoin', {
+      sid: participant.sid,
+      reason: reason === undefined ? 'unknown' : DisconnectReason[reason],
+      waitMs,
+    });
+    clearTimeout(callerGone);
+    callerGone = setTimeout(() => {
+      callerGone = undefined;
+      void end('caller left', true);
+    }, waitMs);
+    callerGone.unref?.();
   });
   // The caller may have left while the call was being set up.
   if (!ctx.room.remoteParticipants.has(meta.callerIdentity)) void end('caller left', true);

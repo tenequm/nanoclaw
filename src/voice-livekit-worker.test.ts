@@ -10,7 +10,7 @@ import path from 'node:path';
 import { getEventListeners } from 'node:events';
 
 import { AgentServer, InferenceRunner, initializeLogger, ServerOptions, VADEventType } from '@livekit/agents';
-import { AudioFrame } from '@livekit/rtc-node';
+import { AudioFrame, DisconnectReason } from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -25,6 +25,8 @@ import type { Heard } from './voice-gemini-live.js';
 import {
   AWAIT_REPLY_MS,
   AudioRing,
+  CALLER_REJOIN_MS,
+  callerRejoinWaitMs,
   CallTurns,
   capSpokenText,
   COMMAND_VOCABULARY,
@@ -632,12 +634,21 @@ describe('job metadata', () => {
   });
 });
 
+interface FakeParticipant {
+  identity: string;
+  sid?: string;
+  disconnectReason?: DisconnectReason;
+}
+
+/** The caller hanging up: its client leaves the room. */
+const HANG_UP: FakeParticipant = { identity: 'caller-1', disconnectReason: DisconnectReason.CLIENT_INITIATED };
+
 function fakeJob(meta: Record<string, unknown> = { ...META }) {
-  const roomHandlers = new Map<string, (p: { identity: string }) => void>();
+  const roomHandlers = new Map<string, (p: FakeParticipant) => void>();
   const job = {
     job: { metadata: JSON.stringify(meta) },
     room: {
-      on: vi.fn((event: string, fn: (p: { identity: string }) => void) => roomHandlers.set(event, fn)),
+      on: vi.fn((event: string, fn: (p: FakeParticipant) => void) => roomHandlers.set(event, fn)),
       remoteParticipants: new Map([['caller-1', {}]]),
     },
     connect: vi.fn(async () => undefined),
@@ -1240,6 +1251,58 @@ describe('runCall', () => {
     expect(job.shutdown).toHaveBeenCalled();
   });
 
+  it("keeps the call through the caller's full reconnect: a new instance under the same identity", async () => {
+    const { job, ctx, roomHandlers } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await vi.waitFor(() => expect(v.states.length).toBeGreaterThan(0));
+    const published = v.states.length;
+    vi.useFakeTimers();
+    // The server removes the old instance, then the new one joins.
+    roomHandlers.get('participantDisconnected')?.({
+      identity: 'caller-1',
+      sid: 'PA_old',
+      disconnectReason: DisconnectReason.DUPLICATE_IDENTITY,
+    });
+    roomHandlers.get('participantConnected')?.({ identity: 'caller-1', sid: 'PA_new' });
+    // Or the SDK drops the old one itself, with no reason, as the new one's update arrives.
+    roomHandlers.get('participantDisconnected')?.({ identity: 'caller-1', sid: 'PA_new' });
+    roomHandlers.get('participantConnected')?.({ identity: 'caller-1', sid: 'PA_newer' });
+    await vi.advanceTimersByTimeAsync(CALLER_REJOIN_MS * 2);
+    expect(job.shutdown).not.toHaveBeenCalled();
+    expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+    // The new instance hears the review state it missed.
+    expect(v.states.length).toBeGreaterThan(published);
+    vi.useRealTimers();
+    // A hang-up still ends it at once.
+    roomHandlers.get('participantDisconnected')?.(HANG_UP);
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('caller left'));
+  });
+
+  it('ends the call when a replaced caller never rejoins', async () => {
+    const { job, ctx, roomHandlers } = fakeJob();
+    const host = fakeHostFetch();
+    await runCall(ctx, callDeps(host.fetchImpl, fakeVoice()));
+    vi.useFakeTimers();
+    roomHandlers.get('participantDisconnected')?.({
+      identity: 'caller-1',
+      disconnectReason: DisconnectReason.DUPLICATE_IDENTITY,
+    });
+    await vi.advanceTimersByTimeAsync(CALLER_REJOIN_MS - 100);
+    expect(job.shutdown).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(200);
+    vi.useRealTimers();
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('caller left'));
+  });
+
+  it('waits for a rejoin only when the caller was replaced or left for no reason', () => {
+    expect(callerRejoinWaitMs(DisconnectReason.DUPLICATE_IDENTITY)).toBe(CALLER_REJOIN_MS);
+    expect(callerRejoinWaitMs(undefined)).toBe(CALLER_REJOIN_MS);
+    expect(callerRejoinWaitMs(DisconnectReason.CLIENT_INITIATED)).toBe(0);
+    expect(callerRejoinWaitMs(DisconnectReason.ROOM_DELETED)).toBe(0);
+  });
+
   it('reports the end to the host when the host link drops, the caller leaves or the session closes', async () => {
     const first = fakeJob();
     const host = fakeHostFetch();
@@ -1251,7 +1314,7 @@ describe('runCall', () => {
 
     const second = fakeJob();
     await runCall(second.ctx, deps(fakeHostFetch().fetchImpl, fakeVoice().createVoice));
-    second.roomHandlers.get('participantDisconnected')?.({ identity: 'caller-1' });
+    second.roomHandlers.get('participantDisconnected')?.(HANG_UP);
     await vi.waitFor(() => expect(second.job.shutdown).toHaveBeenCalledWith('caller left'));
 
     const third = fakeJob();
@@ -3143,7 +3206,7 @@ describe('acoustic wake word in a call', () => {
     w.wake.close.mockImplementation(() => new Promise<undefined>((resolve) => (stopped = () => resolve(undefined))));
     await runCall(ctx, { ...callDeps(host.fetchImpl, v), wakeWord: w.make });
     await vi.waitFor(() => expect(v.states.some((s) => s.wake?.phrase === 'Hey LiveKit')).toBe(true));
-    roomHandlers.get('participantDisconnected')?.({ identity: 'caller-1' });
+    roomHandlers.get('participantDisconnected')?.(HANG_UP);
     await vi.waitFor(() => expect(w.wake.close).toHaveBeenCalled());
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(job.shutdown).not.toHaveBeenCalled();
