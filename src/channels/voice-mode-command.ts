@@ -55,30 +55,32 @@ function liveCallUrl(): CallUrlFn | null {
 const liveCallLink: CallLinkFn = (platformId) => liveAdapter()?.callLink(platformId) ?? null;
 
 /**
- * Whether /voice from this sender would hand them a link: `new`, an administered agent without a
- * line yet, or a legacy line of theirs whose saved link this host holds.
+ * Which link /voice from this sender would hand them: `mint` for `new` or an administered agent
+ * without a line yet, `saved` for only a legacy line of theirs whose saved link this host holds,
+ * null for none.
  */
 async function handsOutLink(
   mg: MessagingGroup,
   userId: string,
   renew: boolean,
   callLink: CallLinkFn,
-): Promise<boolean> {
-  if (!(await getUser(userId))) return false;
+): Promise<'mint' | 'saved' | null> {
+  if (!(await getUser(userId))) return null;
+  let saved = false;
   for (const wiring of await getMessagingGroupAgents(mg.id)) {
     if (!(await hasAdminPrivilege(userId, wiring.agent_group_id))) continue;
-    if (renew) return true;
+    if (renew) return 'mint';
     const [line, legacy] = await Promise.all([
       getVoiceModeLineForAgent(wiring.agent_group_id),
       voiceLinesOf(wiring.agent_group_id),
     ]);
     if (line) continue;
-    if (legacy.length === 0) return true;
+    if (legacy.length === 0) return 'mint';
     for (const old of legacy) {
-      if (callLink(old.platform_id) && (await isVoiceLineOwner(old.id, userId))) return true;
+      if (!saved && callLink(old.platform_id) && (await isVoiceLineOwner(old.id, userId))) saved = true;
     }
   }
-  return false;
+  return saved ? 'saved' : null;
 }
 
 function messageText(content: string): string {
@@ -119,7 +121,7 @@ export function senderUserId(event: InboundEvent): string | null {
 
 /** What /voice did for one agent of the chat: a new link, the call chat moved, or nothing. */
 export type VoiceTargetResult =
-  | { ok: true; agentName: string; link: string; replaced: boolean }
+  | { ok: true; agentName: string; link: string; replaced: boolean; saved?: true }
   | { ok: true; agentName: string; rebound: true }
   | { ok: false; agentName: string; reason: 'voice-unavailable' | 'other-caller' };
 
@@ -166,7 +168,7 @@ export async function runVoiceCommand(
       const links = moved.flatMap((line) => callLink(line.platform_id) ?? []);
       if (moved.length === 0) results.push({ ok: false, agentName: ag.name, reason: 'other-caller' });
       else if (links.length === 0) results.push({ ok: true, agentName: ag.name, rebound: true });
-      else for (const link of links) results.push({ ok: true, agentName: ag.name, link, replaced: false });
+      else for (const link of links) results.push({ ok: true, agentName: ag.name, link, replaced: false, saved: true });
       continue;
     }
     /** This chat becomes the line's call chat if the sender is its caller; otherwise the line is another admin's. */
@@ -263,7 +265,11 @@ export function voiceCommandReply(outcome: VoiceCommandOutcome, cmd = '/voice'):
 }
 
 const noDirectChat = (cmd: string) => `I cannot message you directly here: run ${cmd} in a direct chat with me.`;
-const undeliveredLink = (cmd: string) => `I could not deliver your call link; run ${cmd} new again.`;
+/** A lost saved link comes back with another /voice; a lost minted one is only replaced by /voice new. */
+const undeliveredLink = (cmd: string, outcome: VoiceCommandOutcome) =>
+  outcome.kind === 'done' && outcome.results.every((r) => !('link' in r) || r.saved)
+    ? `I could not deliver your call link; run ${cmd} again.`
+    : `I could not deliver your call link; run ${cmd} new for a fresh link.`;
 
 /**
  * Claims every /voice message; the agents never see one. Runs on every inbound message, so anything
@@ -301,28 +307,32 @@ export async function handleVoiceCommand(
     });
     return true;
   }
-  /** Set once links are on their way: if delivery fails, the sender must hear the link is lost. */
-  let sendingLinks = false;
+  /** Set while links are on their way: if delivery fails, the sender must hear the link is lost. */
+  let sendingLinks: VoiceCommandOutcome | null = null;
   try {
-    // In a group the link must reach the sender privately; without a direct chat nothing is minted.
+    // In a group the link must reach the sender privately; without a direct chat nothing is minted,
+    // and a saved link stays unsent while the call chat still moves.
     let direct: { adapter: typeof adapter; platformId: string } | null = null;
-    if (mg.is_group !== 0 && callUrl && (await handsOutLink(mg, userId, command.renew, callLink))) {
+    let linkFor = callLink;
+    const handout = mg.is_group !== 0 && callUrl ? await handsOutLink(mg, userId, command.renew, callLink) : null;
+    if (handout) {
       const dm = await ensureUserDm(userId, { privacySafeLogs: true, instance });
       const dmAdapter = dm ? getChannelAdapterExact(dm.instance ?? dm.channel_type) : undefined;
-      if (!dm || !dmAdapter) {
+      if (dm && dmAdapter) direct = { adapter: dmAdapter, platformId: dm.platform_id };
+      else if (handout === 'saved') linkFor = () => null;
+      else {
         await adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text: noDirectChat(cmd) } });
         return true;
       }
-      direct = { adapter: dmAdapter, platformId: dm.platform_id };
     }
-    const outcome = await runVoiceCommand(mg, chatThread, userId, callUrl, command.renew, callLink);
+    const outcome = await runVoiceCommand(mg, chatThread, userId, callUrl, command.renew, linkFor);
     const text = voiceCommandReply(outcome, cmd);
     if (text === null) {
       log.info('/voice from an unknown sender dropped', { channelType: event.channelType });
       return true;
     }
     const links = voiceLinkLines(outcome);
-    sendingLinks = links.length > 0;
+    if (links.length > 0) sendingLinks = outcome;
     if (mg.is_group !== 0 && links.length > 0) {
       // A link is a credential: in a group it only ever goes to the sender's direct chat.
       const groupText = direct
@@ -331,17 +341,19 @@ export async function handleVoiceCommand(
       if (direct) {
         const directText = [...links, ...(linkReplaced(outcome) ? [NEW_LINK_NOTE] : [])].join('\n\n');
         await direct.adapter.deliver(direct.platformId, null, { kind: 'chat', content: { text: directText } });
+        sendingLinks = null;
       }
       await adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text: groupText } });
       return true;
     }
     // Straight to the chat's adapter, never through a session: the agent must not hold the call link.
     await adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
+    sendingLinks = null;
   } catch (err) {
     log.warn('/voice reply could not be delivered', { channelType: event.channelType, err });
     if (sendingLinks) {
       await adapter
-        .deliver(event.platformId, threadId, { kind: 'chat', content: { text: undeliveredLink(cmd) } })
+        .deliver(event.platformId, threadId, { kind: 'chat', content: { text: undeliveredLink(cmd, sendingLinks) } })
         .catch((notice: unknown) =>
           log.warn('/voice could not say its link was lost', { channelType: event.channelType, err: notice }),
         );
