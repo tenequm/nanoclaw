@@ -27,7 +27,7 @@ import {
   type TurnMark,
   type VoiceCall,
 } from "./voice-call"
-import { DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, captionCommand, reopensMic, infoWakePhrase, isLoneCommand, isReviewSnapshot, lineWords, norm, parseCommandWords, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, workerCommands, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSIONS, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, captionCommand, reopensMic, infoWakePhrase, isLoneCommand, isReviewSnapshot, lineWords, norm, parseCommandWords, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -69,7 +69,7 @@ const REVIEW_RPC: Record<ReviewOp | "settings", string> = {
   discard: "nanoclaw.voice.discard",
   settings: "nanoclaw.voice.settings",
 }
-/** COMMANDS_VERSION when the worker understands spoken commands (send, discard, the wake phrase) and the settings RPC (workerCommands). */
+/** One of COMMANDS_VERSIONS when the worker understands spoken commands (send, discard, the wake phrase) and the settings RPC. */
 const COMMANDS_ATTR = "nanoclaw.voice.commands"
 /** The worker's spoken commands as JSON (CallCommandWords): the words the hints quote. */
 const COMMAND_WORDS_ATTR = "nanoclaw.voice.command-words"
@@ -411,8 +411,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const agentId = useRef<string | null>(null)
   agentId.current = agent?.identity ?? null
   const reviewAvailable = agentAttributes?.[REVIEW_ATTR] === "1"
-  const workerVocabulary = workerCommands(agentAttributes?.[COMMANDS_ATTR])
-  const commandsAvailable = workerVocabulary === "commands"
+  const commandsAvailable = COMMANDS_VERSIONS.has(agentAttributes?.[COMMANDS_ATTR] ?? "")
   const announcedWords = agentAttributes?.[COMMAND_WORDS_ATTR]
   /** This call already gave the worker the page's settings. */
   const settingsSent = useRef(false)
@@ -1295,11 +1294,6 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   useEffect(() => {
     if (!reviewLive) return
     if (!commandsAvailable) {
-      // An older vocabulary's words are not this page's to quote: that worker's wake gate goes off, so pauses send.
-      if (workerVocabulary === "legacy" && !settingsSent.current) {
-        settingsSent.current = true
-        void rpc("settings", { wake: false, pauseSends: true, typing: reviewRef.current.typing, cues: new URLSearchParams(location.search).get("cues") !== "0" })
-      }
       const t = window.setTimeout(() => updateReview((x) => (x.commands ? { ...x, commands: false } : x)), AGENT_ATTR_GRACE_MS)
       return () => window.clearTimeout(t)
     }
@@ -1307,7 +1301,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (settingsSent.current) return
     settingsSent.current = true
     void sendSettings()
-  }, [reviewLive, commandsAvailable, workerVocabulary, updateReview, sendSettings, rpc])
+  }, [reviewLive, commandsAvailable, updateReview, sendSettings])
 
   // The worker's own command words once it names them; they stay for later calls on this page too.
   useEffect(() => {

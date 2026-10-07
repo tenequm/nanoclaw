@@ -864,13 +864,13 @@ nothing (`Is it ready? Copy?` sends). A pause that ends a turn whose final text 
 a command applies it too, and so does one any interim of the turn ended with that later
 interims and the final left out (the final ends like the words before it, with no
 more words than a command adds), so a dropped `scratch that` never sends the words;
-the send countdown is not shown while a command is pending. Not `copy` or `copy that`:
-they act only when the final itself ends with them as their own sentence. A `copy` the
-final left out is words, and so is one only the interim text has when the final
-collapsed to a few words or never came (logged as `voice.command near-miss word=<cmd>
-reason=unconfirmed`); a final that collapsed to the `copy` alone still sends the
-interim words before it. A sent turn's caption is
-the text the agent got, without the command; the words before it keep their period.
+the send countdown is not shown while a command is pending. Not `copy` or `copy
+that`: they act only when the final itself ends with them as their own sentence. A
+`copy` the final left out is words, and so is one only the interim text has when the
+final collapsed to a few words or never came (logged as `voice.command near-miss
+word=<cmd> reason=unconfirmed`); a final that collapsed to the `copy` alone still
+sends the interim words before it. A sent turn's caption is the text the agent got,
+without the command; the words before it keep their period.
 The transcription sometimes returns its own vocabulary list as the caller's words
 (`'Ava', 'Max', 'zulu', ...`); that echo is cut from every interim and final. A command with nothing to act on plays the nope cue, and its
 line says "nothing to send" (or "nothing to discard"). A wake switch under the mode
@@ -904,16 +904,15 @@ an activity; words with no wake phrase are marked "ignored · no wake phrase"):
 `voice.vocabulary.txt`, matched across case, punctuation and Latin/Cyrillic
 spelling (`Hey, Andy.`, `гей Енді`, `хей Енді`, `hi Andy`, `хай Енді`, a name
 glued to the hey as in `Heyandy`, and in Cyrillic a Ukrainian vocative ending, as
-in `Гей, Бене` for Ben). The worker
-advertises the commands with the attribute `nanoclaw.voice.commands` = "3" (the
-`zulu` / `copy` vocabulary; "2" was `send it`, "1" was `over`). A page offers the
-commands only to the value it knows, so a page and a worker from either side of a
-vocabulary change quote no words to each other. The worker stays wake-gated until a
-client's settings say otherwise, so the two sides of a change behave differently: a
-page that finds a worker at "2" or "1" turns its wake switch off, and pauses send; a
-page older than the worker sends no settings, so that worker keeps waiting for a
-wake phrase and a send word the page never names - reload the page (and update the
-iOS app) with the worker. The worker announces
+in `Гей, Бене` for Ben). The worker advertises the commands with the attribute
+`nanoclaw.voice.commands` = "3": the `zulu` / `copy` vocabulary, the same words "2"
+already meant (the `send it` era also said "2", and "1" was `over`), bumped so a
+`send it` era page stops quoting its own words to it. A page drives the commands
+for "2" and "3" alike, and for any other value offers none and sends no settings.
+The worker stays wake-gated until a client's settings say otherwise, so a page that
+accepts only "2" (one from the `send it` era, or one left open across the bump)
+leaves a "3" worker waiting for a wake phrase and a send word the page never names -
+reload the page (and update the iOS app) with the worker. The worker announces
 the words themselves, in the same attribute update, as
 `nanoclaw.voice.command-words`: compact JSON of `CALL_COMMAND_WORDS` in the
 protocol module, the one list the worker matches, puts in the transcription's
