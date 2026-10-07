@@ -9,54 +9,56 @@ import { grantRole, isOwner } from '../modules/permissions/db/user-roles.js';
 import { resolveVoiceModeLine } from './voice-mode-line.js';
 
 const stamp = () => new Date().toISOString();
-const ETHAN = 'voice-mode:ethan-test';
-const LAURA = 'voice-mode:laura-test';
 
-async function line(id: string, name: string) {
-  await createUser({ id, kind: 'voice-mode', display_name: name, created_at: stamp() });
-  await createMessagingGroup({
-    id: `mg-${id}`,
-    channel_type: 'voice-mode',
-    platform_id: id,
-    instance: 'voice-mode',
-    name: 'Personal call',
-    is_group: 0,
-    unknown_sender_policy: 'strict',
-    created_at: stamp(),
-  });
-  await createMessagingGroupAgent({
-    id: `wire-${id}`,
-    messaging_group_id: `mg-${id}`,
-    agent_group_id: 'voice-agent',
-    engage_mode: 'pattern',
-    engage_pattern: '.',
-    sender_scope: 'known',
-    ignored_message_policy: 'drop',
-    session_mode: 'shared',
-    priority: 0,
-    created_at: stamp(),
-  });
-}
-const allow = (id: string) =>
-  addMember({ user_id: id, agent_group_id: 'voice-agent', added_by: null, added_at: stamp() });
+// Lines from before the voice-mode rename keep their `voice` rows and ids; env-backed new ones are `voice-mode`.
+describe.each(['voice', 'voice-mode'] as const)('personal %s line access (real central DB)', (channel) => {
+  const ETHAN = `${channel}:ethan-test`;
+  const LAURA = `${channel}:laura-test`;
 
-beforeEach(async () => {
-  const db = await initTestDb();
-  await runMigrations(db);
-  await createAgentGroup({
-    id: 'voice-agent',
-    name: 'Casa',
-    folder: 'voice-access-fixture',
-    agent_provider: null,
-    created_at: stamp(),
-  });
-  await line(ETHAN, 'Ethan');
-});
-afterEach(async () => {
-  await closeDb();
-});
+  async function line(id: string, name: string) {
+    await createUser({ id, kind: channel, display_name: name, created_at: stamp() });
+    await createMessagingGroup({
+      id: `mg-${id}`,
+      channel_type: channel,
+      platform_id: id,
+      instance: channel,
+      name: 'Personal call',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: stamp(),
+    });
+    await createMessagingGroupAgent({
+      id: `wire-${id}`,
+      messaging_group_id: `mg-${id}`,
+      agent_group_id: 'voice-agent',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'known',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: stamp(),
+    });
+  }
+  const allow = (id: string) =>
+    addMember({ user_id: id, agent_group_id: 'voice-agent', added_by: null, added_at: stamp() });
 
-describe('personal voice line access (real central DB)', () => {
+  beforeEach(async () => {
+    const db = await initTestDb();
+    await runMigrations(db);
+    await createAgentGroup({
+      id: 'voice-agent',
+      name: 'Casa',
+      folder: 'voice-access-fixture',
+      agent_provider: null,
+      created_at: stamp(),
+    });
+    await line(ETHAN, 'Ethan');
+  });
+  afterEach(async () => {
+    await closeDb();
+  });
+
   it('requires explicit membership and never infers ownership from a matching name', async () => {
     await createUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Ethan', created_at: stamp() });
     await grantRole({
@@ -107,7 +109,7 @@ describe('personal voice line access (real central DB)', () => {
     await updateDisplayName(ETHAN, 'Ethan');
     await updateMessagingGroup(`mg-${ETHAN}`, { unknown_sender_policy: 'public' });
     expect(await resolveVoiceModeLine(ETHAN)).toBeNull();
-    expect(await resolveVoiceModeLine('voice-mode:unknown')).toBeNull();
+    expect(await resolveVoiceModeLine(`${channel}:unknown`)).toBeNull();
   });
 
   it('refuses ambiguous wiring to multiple agents', async () => {

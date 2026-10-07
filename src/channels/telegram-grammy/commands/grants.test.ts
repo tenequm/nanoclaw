@@ -129,7 +129,7 @@ describe('computeCommandGrants', () => {
     await createMessagingGroup({
       id: 'mg-line',
       channel_type: 'voice',
-      platform_id: 'voice-mode:abc',
+      platform_id: 'voice:abc',
       name: null,
       is_group: 0,
       unknown_sender_policy: 'strict',

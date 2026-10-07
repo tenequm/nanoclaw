@@ -113,14 +113,14 @@ export async function resolveVoiceModeLine(
       };
     }
     const caller = await getUser(platformId);
-    const legacyChannel = platformId.startsWith('voice:') ? 'voice' : 'voice-mode';
-    if (!caller || caller.kind !== legacyChannel || !caller.display_name?.trim()) return null;
-    const mg = await getMessagingGroupByPlatform(legacyChannel, platformId, instance);
+    const lineChannel = lineChannelType(platformId);
+    if (!caller || caller.kind !== lineChannel || !caller.display_name?.trim()) return null;
+    const mg = await getMessagingGroupByPlatform(lineChannel, platformId, instance);
     if (!mg || mg.is_group || mg.unknown_sender_policy !== 'strict') return null;
     const wirings = await getMessagingGroupAgents(mg.id);
     if (wirings.length !== 1 || wirings[0].sender_scope !== 'known') return null;
     const groupId = wirings[0].agent_group_id;
-    if (legacyChannel === 'voice' && (await getVoiceModeLineForAgent(groupId))) return null;
+    if (lineChannel === LEGACY_VOICE_CHANNEL && (await getVoiceModeLineForAgent(groupId))) return null;
     if (!(await canAccessAgentGroup(caller.id, groupId)).allowed) return null;
     const group = await getAgentGroup(groupId);
     if (!group) return null;
@@ -146,3 +146,10 @@ export async function resolveVoiceModeLine(
 }
 
 export const linePlatformId = (lineId: string): string => `voice-mode:${lineId}`;
+
+/** Lines made before the voice-mode rename keep their `voice` rows and `voice:<hash>` ids, so saved links still reach them. */
+export const LEGACY_VOICE_CHANNEL = 'voice';
+
+/** The channel a line's own chat is on, by the line's platform id. */
+export const lineChannelType = (platformId: string): string =>
+  platformId.startsWith(`${LEGACY_VOICE_CHANNEL}:`) ? LEGACY_VOICE_CHANNEL : 'voice-mode';

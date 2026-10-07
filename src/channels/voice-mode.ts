@@ -22,9 +22,19 @@ import net from 'node:net';
 
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundEvent, OutboundMessage } from './adapter.js';
 import { resolveThreadPolicy } from './channel-defaults.js';
-import { getChannelAdapter, getChannelDefaults, registerChannelAdapter } from './channel-registry.js';
+import {
+  getChannelAdapter,
+  getChannelAdapterExact,
+  getChannelDefaults,
+  registerChannelAdapter,
+} from './channel-registry.js';
 import type { VoiceModeUiConfig } from './voice-mode-page.js';
-import { resolveVoiceModeLine, type ResolveLineOptions, type VoiceModeLine } from './voice-mode-line.js';
+import {
+  LEGACY_VOICE_CHANNEL,
+  resolveVoiceModeLine,
+  type ResolveLineOptions,
+  type VoiceModeLine,
+} from './voice-mode-line.js';
 import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
 import {
   DEFAULT_VOICE_MIRROR,
@@ -243,6 +253,11 @@ export function lineIdForToken(token: string): string {
   return `${CHANNEL_TYPE}:${createHash('sha256').update(token).digest('hex').slice(0, 12)}`;
 }
 
+/** The id the same token's line had before the voice-mode rename: `voice:` + the same hash. */
+export function legacyLineIdForToken(token: string): string {
+  return `${LEGACY_VOICE_CHANNEL}:${createHash('sha256').update(token).digest('hex').slice(0, 12)}`;
+}
+
 /** The voice adapter, plus the call link of one of its lines for the `/voice` command. */
 export interface VoiceModeChannelAdapter extends ChannelAdapter {
   /** The line's call page URL, or null when the line has no link token here. */
@@ -259,8 +274,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       const line = await findVoiceModeLineByToken(token);
       if (line) return `voice-mode:${line.line_id}`;
       if (!tokens.has(token)) return null;
-      const legacy = `voice:${createHash('sha256').update(token).digest('hex').slice(0, 12)}`;
-      const old = await getMessagingGroupWithAgentCount('voice', legacy, 'voice');
+      const legacy = legacyLineIdForToken(token);
+      const old = await getMessagingGroupWithAgentCount(LEGACY_VOICE_CHANNEL, legacy, LEGACY_VOICE_CHANNEL);
       return old ? legacy : lineIdForToken(token);
     });
   const proxyPolicy: VoiceModeProxyPolicy = {
@@ -465,7 +480,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       );
     },
     callLink(platformId: string): string | null {
-      const token = [...tokens].find((t) => lineIdForToken(t) === platformId);
+      const token = [...tokens].find((t) => lineIdForToken(t) === platformId || legacyLineIdForToken(t) === platformId);
       return token ? `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}` : null;
     },
 
@@ -525,6 +540,31 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     async setTyping(platformId: string): Promise<void> {
       await livekit.setTyping(platformId);
     },
+  };
+}
+
+/**
+ * The `voice` channel of lines made before the voice-mode rename: their chat, session and stored
+ * messages keep the `voice` address, so core delivery and typing look up a `voice` adapter. This
+ * one hands them to the live voice-mode adapter, whose engine runs those lines' calls too; it
+ * serves no routes of its own and starts only after the voice-mode adapter is up.
+ */
+export function createLegacyVoiceAdapter(
+  live: VoiceModeChannelAdapter,
+): ChannelAdapter & Pick<VoiceModeChannelAdapter, 'callLink'> {
+  return {
+    name: LEGACY_VOICE_CHANNEL,
+    channelType: LEGACY_VOICE_CHANNEL,
+    supportsThreads: false,
+    defaults: VOICE_MODE_DEFAULTS,
+    async setup() {},
+    async teardown() {},
+    isConnected: () => live.isConnected(),
+    deliver: (platformId, threadId, message) => live.deliver(platformId, threadId, message),
+    async setTyping(platformId, threadId) {
+      await live.setTyping?.(platformId, threadId);
+    },
+    callLink: (platformId) => live.callLink(platformId),
   };
 }
 
@@ -647,6 +687,15 @@ registerChannelAdapter(CHANNEL_TYPE, {
         mirror: (env.VOICE_MODE_MIRROR || DEFAULT_VOICE_MIRROR).trim().toLowerCase(),
       },
     });
+  },
+  defaults: VOICE_MODE_DEFAULTS,
+});
+
+// Registered after voice-mode, so the registry has started that adapter when this factory runs.
+registerChannelAdapter(LEGACY_VOICE_CHANNEL, {
+  factory: () => {
+    const live = getChannelAdapterExact(CHANNEL_TYPE) as VoiceModeChannelAdapter | undefined;
+    return live ? createLegacyVoiceAdapter(live) : null;
   },
   defaults: VOICE_MODE_DEFAULTS,
 });

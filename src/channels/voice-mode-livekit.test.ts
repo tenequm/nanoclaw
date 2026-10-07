@@ -4,9 +4,24 @@
  * worker do. Faked: the LiveKit server API (recorded calls), the mirror's
  * chats and the clock.
  */
+import fs from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// Only the saved-line delivery test reaches core storage: its session folders go here, and no container starts.
+const TEST_DATA_DIR = '/tmp/nanoclaw-test-voice-mode-livekit';
+vi.mock('../config.js', async () => ({
+  ...(await vi.importActual('../config.js')),
+  DATA_DIR: '/tmp/nanoclaw-test-voice-mode-livekit',
+}));
+vi.mock('../container-runner.js', () => ({
+  wakeContainer: vi.fn().mockResolvedValue(true),
+  isContainerRunning: vi.fn().mockReturnValue(false),
+  getActiveContainerCount: vi.fn().mockReturnValue(0),
+  killContainer: vi.fn(),
+}));
 
 import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
 import {
@@ -432,13 +447,114 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       expect(worker.meta.lineId).toBe(legacy);
       await worker.utter('Saved link still works');
       expect(JSON.parse(h.events[0].message.content)).toMatchObject({ senderId: legacy });
-      expect(h.events[0]).toMatchObject({
-        channelType: 'voice',
-        replyTo: { channelType: 'voice-mode', platformId: legacy },
-      });
+      expect(h.events[0]).toMatchObject({ channelType: 'voice', instance: 'voice', platformId: legacy });
+      expect(h.events[0].replyTo).toBeUndefined();
     } finally {
       await h.stop();
       await closeDb();
+    }
+  });
+
+  it("delivers a saved main line's answer through core to its live call, with no call chat, in the line's own session", async () => {
+    await h.stop();
+    const db = await import('../db/index.js');
+    const { createUser } = await import('../modules/permissions/db/users.js');
+    const { addMember } = await import('../modules/permissions/db/agent-group-members.js');
+    const { getSessionsByAgentGroup } = await import('../db/sessions.js');
+    const { getMessagingGroupByPlatform } = await import('../db/messaging-groups.js');
+    const { inboundDbPath, outboundDbPath } = await import('../mailbox/sqlite/paths.js');
+    const { getHostStartCallbacks } = await import('../host-lifecycle.js');
+    const { deliverSessionMessages, setDeliveryAdapter } = await import('../delivery.js');
+    const registry = await import('./channel-registry.js');
+    const legacy = 'voice:' + LINE.slice('voice-mode:'.length);
+    const stamp = new Date().toISOString();
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+    await db.runMigrations(await db.initTestDb());
+    try {
+      await db.createAgentGroup({
+        id: 'ag-andy',
+        name: 'Andy',
+        folder: 'ag-andy',
+        agent_provider: null,
+        created_at: stamp,
+      });
+      await createUser({ id: legacy, kind: 'voice', display_name: 'Caller', created_at: stamp });
+      await addMember({ user_id: legacy, agent_group_id: 'ag-andy', added_by: null, added_at: stamp });
+      await db.createMessagingGroup({
+        id: 'saved-line',
+        channel_type: 'voice',
+        platform_id: legacy,
+        instance: 'voice',
+        name: null,
+        is_group: 0,
+        unknown_sender_policy: 'strict',
+        created_at: stamp,
+      });
+      await db.createMessagingGroupAgent({
+        id: 'saved-wire',
+        messaging_group_id: 'saved-line',
+        agent_group_id: 'ag-andy',
+        session_mode: 'shared',
+        sender_scope: 'known',
+        engage_mode: 'pattern',
+        engage_pattern: '.',
+        ignored_message_policy: 'drop',
+        priority: 0,
+        created_at: stamp,
+      });
+      // The real line lookup and the real router; the mirror finds no chat, so the call talks on the line.
+      h = await startHarness({ lineForToken: undefined, resolveLine: undefined, routeTurn: undefined });
+      for (const start of getHostStartCallbacks()) await start({} as never);
+      // The host's registry, as at startup: this voice-mode adapter, then the module's own `voice` registration.
+      registry.registerChannelAdapter('voice-mode', { factory: () => h.adapter });
+      await registry.initChannelAdapters(() => ({
+        onInbound: () => {},
+        onInboundEvent: () => {},
+        onMetadata: () => {},
+        onAction: () => {},
+      }));
+      expect(registry.getChannelAdapterExact('voice')).toBeDefined();
+      setDeliveryAdapter(registry.createChannelDeliveryAdapter());
+
+      const { worker } = await startCall(h);
+      expect(worker.meta.lineId).toBe(legacy);
+      const turnId = await worker.utter('Saved link, no chat');
+      const turnMessageId = `livekit:${worker.meta.callId}:${turnId}:ag-andy`;
+      await vi.waitFor(async () => expect(await getSessionsByAgentGroup('ag-andy')).toHaveLength(1));
+      const [session] = await getSessionsByAgentGroup('ag-andy');
+      expect(session.messaging_group_id).toBe('saved-line');
+      expect(await getMessagingGroupByPlatform('voice-mode', legacy)).toBeUndefined();
+      const inbound = new Database(inboundDbPath('ag-andy', session.id), { readonly: true });
+      const stored = inbound.prepare('SELECT id, channel_type, platform_id FROM messages_in WHERE trigger = 1').get();
+      inbound.close();
+      expect(stored).toEqual({ id: turnMessageId, channel_type: 'voice', platform_id: legacy });
+
+      // The runner's pickup and the typing indicator reach the call through the `voice` address.
+      liveKitChatTyping({ channelType: 'voice', platformId: legacy, threadId: null }, 'ag-andy', true);
+      await worker.waitFor((e) => e.type === 'working');
+      await registry.createChannelDeliveryAdapter().setTyping!('voice', legacy, null, 'voice');
+      await worker.waitFor((e) => e.type === 'thinking');
+
+      // The agent answers the turn on the chat it came from; core's delivery poll sends it.
+      const out = new Database(outboundDbPath('ag-andy', session.id));
+      out
+        .prepare(
+          `INSERT INTO messages_out (id, in_reply_to, timestamp, kind, platform_id, channel_type, content)
+           VALUES ('answer-1', ?, datetime('now'), 'chat', ?, 'voice', ?)`,
+        )
+        .run(turnMessageId, legacy, JSON.stringify({ text: 'The answer.' }));
+      out.close();
+      await deliverSessionMessages(session);
+      expect(await worker.waitFor((e) => e.type === 'reply')).toEqual({
+        type: 'reply',
+        text: 'The answer.',
+        turn: turnId,
+      });
+    } finally {
+      await registry.teardownChannelAdapters();
+      await h.stop();
+      await db.closeDb();
+      fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
     }
   });
 
@@ -741,7 +857,6 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
           platformId: LINE,
           threadId: null,
           agentGroupId: 'ag-andy',
-          replyTo: { channelType: 'voice-mode', platformId: LINE, threadId: null },
         },
         agentGroupId: 'ag-andy',
       },

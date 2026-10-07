@@ -44,7 +44,7 @@ import { AccessToken, AgentDispatchClient, RoomServiceClient, TrackSource } from
 import type { ChannelAdapter, InboundEvent } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
 import { callPageHtml, type VoiceModeUiConfig } from './voice-mode-page.js';
-import { sameCallerAndAgent, type ResolveLineOptions, type VoiceModeLine } from './voice-mode-line.js';
+import { lineChannelType, sameCallerAndAgent, type ResolveLineOptions, type VoiceModeLine } from './voice-mode-line.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_VOICE_SILENCE_MS,
@@ -371,7 +371,7 @@ const defaultMirrorApi: MirrorApi = {
       const group = current.messaging_group_id && (await getMessagingGroup(current.messaging_group_id));
       return group ? { group, threadId: current.thread_id, ownerIds: [current.owner_user_id] } : null;
     }
-    const line = await getMessagingGroupByPlatform(lineId.startsWith('voice:') ? 'voice' : 'voice-mode', lineId);
+    const line = await getMessagingGroupByPlatform(lineChannelType(lineId), lineId);
     const row = line && (await getVoiceLine(line.id));
     const group = row?.target_messaging_group_id && (await getMessagingGroup(row.target_messaging_group_id));
     if (!row || !group) return null;
@@ -948,12 +948,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
           agentGroupId: call.line.agentGroupId,
         }
       : {
-          channelType: call.platformId.startsWith('voice:') ? 'voice' : 'voice-mode',
-          instance: call.platformId.startsWith('voice:') ? 'voice' : 'voice-mode',
+          // A line from before the rename keeps its own `voice` chat and session; its replies come
+          // back through the `voice` compatibility registration (src/channels/voice-mode.ts).
+          channelType: lineChannelType(call.platformId),
+          instance: lineChannelType(call.platformId),
           platformId: call.platformId,
           threadId: null,
           agentGroupId: call.line.agentGroupId,
-          replyTo: { channelType: 'voice-mode', platformId: call.platformId, threadId: null },
         };
 
   /** The worker saw the caller join: start the clock and the duration / budget cap. */
@@ -1270,7 +1271,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
         if (callChatAt(call, chat)) push(call, { type: 'thinking' });
         // On the voice line itself the adapter's setTyping already says thinking; only the pickup is new.
-        else if (chat.channelType !== 'voice-mode' || chat.platformId !== call.platformId) continue;
+        else if (chat.channelType !== lineChannelType(call.platformId) || chat.platformId !== call.platformId) continue;
         if (working) push(call, { type: 'working' });
       }
     },

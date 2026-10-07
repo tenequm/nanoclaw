@@ -21,4 +21,8 @@ describe('voice channel registration', () => {
   it('registers voice via the channel barrel', () => {
     expect(getRegisteredChannelNames()).toContain('voice-mode');
   });
+
+  it('registers the `voice` compatibility adapter that delivers to lines from before the rename', () => {
+    expect(getRegisteredChannelNames()).toContain('voice');
+  });
 });
