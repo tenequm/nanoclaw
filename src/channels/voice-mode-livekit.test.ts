@@ -641,10 +641,38 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     h = await startHarness({ pagePort: port });
     for (const target of ['//', '/\\', '/voice//']) {
       expect(await rawRequest(port, `GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`)).toMatch(
-        /^HTTP\/1\.1 (404|200) /,
+        /^HTTP\/1\.1 (400|404|200) /,
       );
     }
     expect((await fetch(`http://127.0.0.1:${port}/voice?t=tok123`)).status).toBe(200);
+  });
+
+  it('never reaches a worker route through dot segments, on the page listener or the host port', async () => {
+    const port = await freePort();
+    await h.stop();
+    h = await startHarness({ pagePort: port });
+    await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    const { callId } = h.lk.dispatches[0].metadata;
+    const body = JSON.stringify({ callId });
+    const hostPort = Number(new URL(h.hostUrl).port);
+    const attempts: Array<[number, string]> = [];
+    for (const dots of ['..', '%2e%2e', '%2E%2E']) {
+      for (const listener of [port, hostPort]) {
+        attempts.push([listener, `/voice/${dots}/webhook/voice-mode/livekit/agent/joined`]);
+      }
+      attempts.push([hostPort, `/webhook/voice/${dots}/voice-mode/livekit/agent/joined`]);
+    }
+    for (const [listener, target] of attempts) {
+      const answer = await rawRequest(
+        listener,
+        `POST ${target} HTTP/1.1\r\nHost: x\r\nAuthorization: ${workerAuth(callId).Authorization}\r\n` +
+          `Content-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
+      );
+      expect(answer, `${listener} ${target}`).toMatch(/^HTTP\/1\.1 (400|404) /);
+    }
+    expect(
+      (await post(`${h.hostUrl}/webhook/voice-mode/livekit/agent/joined`, { callId }, workerAuth(callId))).status,
+    ).toBe(200);
   });
 
   it('tears down with a half-sent page request open, ending the calls first', async () => {

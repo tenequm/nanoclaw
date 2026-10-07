@@ -436,6 +436,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     } catch {
       return reply(res, 400, 'Bad request');
     }
+    // Dot segments (`/voice/../webhook/...`, `%2e%2e`) would route on a path the listener never checked.
+    if (url.pathname !== (req.url ?? '/').split('?')[0]) return reply(res, 400, 'Bad request');
     const parsed = voiceRoute(url.pathname);
     const token = url.searchParams.get('t') ?? '';
     // The worker calls from the same host; a forwarded request came through a front from elsewhere.
@@ -510,8 +512,14 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       registerWebhookHandler('voice', handleHttp);
       if (config.pagePort !== undefined) {
         const server = http.createServer((req, res) => {
-          // The raw path: a request line like `GET //` is not a parsable URL.
-          if (!CLEAN_PREFIX.test((req.url ?? '/').split('?')[0])) return reply(res, 404, 'Not found');
+          let pathname: string;
+          try {
+            pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+          } catch {
+            // A request line like `GET //` is not a parsable URL.
+            return reply(res, 400, 'Bad request');
+          }
+          if (!CLEAN_PREFIX.test(pathname)) return reply(res, 404, 'Not found');
           handleHttp(req, res).catch((err: unknown) => {
             log.error('voice-mode: page request failed', { err });
             if (!res.headersSent) reply(res, 500, 'voice error');
