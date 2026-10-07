@@ -183,6 +183,8 @@ export interface VoiceModeConfig {
   pagePort?: number;
   /** The address the page listener binds; loopback unless set (VOICE_MODE_PAGE_HOST). */
   pageHost?: string;
+  /** VOICE_MODE_PORT was set: a page listener that cannot bind fails setup instead of being skipped. */
+  pagePortRequired?: boolean;
   /** Link tokens accepted on the HTTP routes; each is one voice line. */
   linkTokens?: string[];
   lineForToken?: (token: string) => Promise<string | null>;
@@ -414,7 +416,12 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
   /** HTTP routes under /webhook/voice/… and the browser's under /voice/… on the shared webhook server. */
   const handleHttp = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
-    const url = new URL(req.url ?? '/', 'http://localhost');
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      return reply(res, 400, 'Bad request');
+    }
     const parsed = voiceRoute(url.pathname);
     const token = url.searchParams.get('t') ?? '';
     // Before any token check: a link must not be usable, or probed, from the LAN over plain HTTP.
@@ -494,18 +501,34 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       registerRootHandler('voice', handleHttp);
       registerWebhookHandler('voice', handleHttp);
       if (config.pagePort !== undefined) {
-        pageServer = http.createServer((req, res) => {
-          if (!CLEAN_PREFIX.test(new URL(req.url ?? '/', 'http://localhost').pathname))
-            return reply(res, 404, 'Not found');
-          void handleHttp(req, res);
-        });
-        await new Promise<void>((resolve, reject) => {
-          pageServer!.once('error', reject);
-          pageServer!.listen(config.pagePort, config.pageHost ?? DEFAULT_PAGE_HOST, () => {
-            pageServer!.off('error', reject);
-            resolve();
+        const server = http.createServer((req, res) => {
+          // The raw path: a request line like `GET //` is not a parsable URL.
+          if (!CLEAN_PREFIX.test((req.url ?? '/').split('?')[0])) return reply(res, 404, 'Not found');
+          handleHttp(req, res).catch((err: unknown) => {
+            log.error('voice-mode: page request failed', { err });
+            if (!res.headersSent) reply(res, 500, 'voice error');
+            else res.end();
           });
         });
+        const address = `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}`;
+        try {
+          await new Promise<void>((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(config.pagePort, config.pageHost ?? DEFAULT_PAGE_HOST, () => {
+              server.off('error', reject);
+              resolve();
+            });
+          });
+          server.on('error', (err) => log.error('voice-mode: page listener error', { address, err }));
+          pageServer = server;
+        } catch (err) {
+          if (config.pagePortRequired) throw err;
+          // The webhook port still serves the page; a default port that is taken must not take the channel down.
+          log.error('voice-mode: the page listener could not bind; serving the page on the webhook port only', {
+            address,
+            err,
+          });
+        }
       }
       connected = true;
       log.info('voice-mode: ready', {
@@ -515,16 +538,24 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         livekit: config.livekit.url,
         protocol: LIVEKIT_PROTOCOL_VERSION,
         agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
-        pageListener: config.pagePort ? `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}` : 'off',
+        pageListener: pageServer ? `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}` : 'off',
       });
     },
 
     async teardown(): Promise<void> {
       connected = false;
-      if (pageServer)
-        await new Promise<void>((resolve, reject) => pageServer!.close((err) => (err ? reject(err) : resolve())));
-      await livekit.teardown();
-      setup = null;
+      const server = pageServer;
+      pageServer = undefined;
+      try {
+        await livekit.teardown();
+      } finally {
+        if (server) {
+          // A half-sent request would otherwise hold close() open until the headers timeout.
+          server.closeAllConnections();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        setup = null;
+      }
     },
 
     isConnected(): boolean {
@@ -612,20 +643,21 @@ const DEFAULT_PAGE_HOST = '127.0.0.1';
 /**
  * VOICE_MODE_PORT and VOICE_MODE_PAGE_HOST: where the separate page listener binds, by default
  * 127.0.0.1:3100. `0` or `off` turns it off, for installs whose front already forwards /voice to the
- * host's webhook port. An unusable port falls back to the default with a warning.
+ * host's webhook port. An unusable port falls back to the default with a warning. `explicit`: the
+ * port was set, so a failed bind fails setup; the default is skipped instead.
  */
 export function pageListener(
   rawPort: string | undefined,
   rawHost: string | undefined,
-): { port: number; host: string } | null {
+): { port: number; host: string; explicit: boolean } | null {
   const value = rawPort?.trim().toLowerCase();
   if (value === '0' || value === 'off') return null;
   const host = rawHost?.trim() || DEFAULT_PAGE_HOST;
-  if (!value) return { port: DEFAULT_PAGE_PORT, host };
+  if (!value) return { port: DEFAULT_PAGE_PORT, host, explicit: false };
   const port = Number(value);
-  if (Number.isInteger(port) && port > 0 && port < 65_536) return { port, host };
+  if (Number.isInteger(port) && port > 0 && port < 65_536) return { port, host, explicit: true };
   log.warn(`voice-mode: VOICE_MODE_PORT must be a port number, 0 or off; using ${DEFAULT_PAGE_PORT}`);
-  return { port: DEFAULT_PAGE_PORT, host };
+  return { port: DEFAULT_PAGE_PORT, host, explicit: false };
 }
 
 /** VOICE_MODE_SILENCE_MS: how long the caller is silent before their turn ends; nonsense falls back to the default. */
@@ -690,6 +722,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
     return createVoiceModeAdapter({
       pagePort: page?.port,
       pageHost: page?.host,
+      pagePortRequired: page?.explicit,
       publicUrl: (env.VOICE_MODE_PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, ''),
       linkTokens,
       ui: parseUiConfig(env.VOICE_MODE_UI),

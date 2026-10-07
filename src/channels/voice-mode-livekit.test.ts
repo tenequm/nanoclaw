@@ -6,7 +6,7 @@
  */
 import fs from 'node:fs';
 import http from 'node:http';
-import type { AddressInfo } from 'node:net';
+import net, { type AddressInfo } from 'node:net';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -378,6 +378,17 @@ async function startCall(h: Harness): Promise<{ call: TokenResponse; worker: Fak
 
 const settle = () => new Promise((r) => setTimeout(r, 30));
 
+/** One raw HTTP request, for request lines `fetch` would never send; resolves what the server answered. */
+function rawRequest(port: number, request: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1', () => socket.write(request));
+    let answer = '';
+    socket.on('data', (chunk) => (answer += chunk.toString()));
+    socket.on('end', () => resolve(answer));
+    socket.on('error', reject);
+  });
+}
+
 /** The room of the call a newer one replaced while connecting: the one the newer call was not given. */
 function replacedRoom(h: Harness, newer: TokenResponse): string {
   const newerRoom = h.lk.dispatches.find((d) => d.metadata.callId === newer.callId)!.room;
@@ -568,11 +579,11 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   });
 
   it('binds the separate page listener to loopback unless told otherwise, and turns it off on 0 or off', async () => {
-    expect(pageListener(undefined, undefined)).toEqual({ port: 3100, host: '127.0.0.1' });
-    expect(pageListener(' 3200 ', '0.0.0.0')).toEqual({ port: 3200, host: '0.0.0.0' });
+    expect(pageListener(undefined, undefined)).toEqual({ port: 3100, host: '127.0.0.1', explicit: false });
+    expect(pageListener(' 3200 ', '0.0.0.0')).toEqual({ port: 3200, host: '0.0.0.0', explicit: true });
     expect(pageListener('0', undefined)).toBeNull();
     expect(pageListener('OFF', '0.0.0.0')).toBeNull();
-    expect(pageListener('nonsense', undefined)).toEqual({ port: 3100, host: '127.0.0.1' });
+    expect(pageListener('nonsense', undefined)).toEqual({ port: 3100, host: '127.0.0.1', explicit: false });
 
     const listen = vi.spyOn(http.Server.prototype, 'listen');
     try {
@@ -619,6 +630,62 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
         )
       ).status,
     ).toBe(404);
+  });
+
+  it('answers a request line that is no URL on the page listener instead of taking the host down', async () => {
+    const port = await freePort();
+    await h.stop();
+    h = await startHarness({ pagePort: port });
+    for (const target of ['//', '/\\', '/voice//']) {
+      expect(await rawRequest(port, `GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`)).toMatch(
+        /^HTTP\/1\.1 (404|200) /,
+      );
+    }
+    expect((await fetch(`http://127.0.0.1:${port}/voice?t=tok123`)).status).toBe(200);
+  });
+
+  it('tears down with a half-sent page request open, ending the calls first', async () => {
+    const port = await freePort();
+    await h.stop();
+    h = await startHarness({ pagePort: port });
+    await startCall(h);
+    const socket = net.connect(port, '127.0.0.1');
+    await new Promise((resolve) => socket.once('connect', resolve));
+    socket.write('GET /voice HTTP/1.1\r\nHost: x\r\n');
+    try {
+      const done = h.adapter.teardown().then(() => 'done');
+      const late = new Promise((resolve) => setTimeout(() => resolve('hung'), 2000).unref());
+      expect(await Promise.race([done, late])).toBe('done');
+      expect(h.lk.deleted).toHaveLength(1);
+    } finally {
+      socket.destroy();
+    }
+  });
+
+  it('runs without the page listener when its default port is taken, and fails when VOICE_MODE_PORT named it', async () => {
+    const taken = http.createServer();
+    const port = await freePort();
+    await new Promise<void>((resolve) => taken.listen(port, '127.0.0.1', resolve));
+    try {
+      await h.stop();
+      h = await startHarness({ pagePort: port });
+      expect((await fetch(`${h.hostUrl}/voice?t=tok123`)).status).toBe(200);
+      await h.stop();
+      h = await startHarness();
+      const strict = createVoiceModeAdapter({
+        publicUrl: h.hostUrl,
+        pagePort: port,
+        pagePortRequired: true,
+        livekit: { url: 'wss://lk.example', apiKey: API_KEY, apiSecret: API_SECRET, api: fakeLiveKit() },
+      });
+      const noop = () => {};
+      await expect(
+        strict.setup({ onInbound: noop, onInboundEvent: noop, onMetadata: noop, onAction: noop }),
+      ).rejects.toThrow(/EADDRINUSE/);
+      await strict.teardown();
+    } finally {
+      await new Promise((resolve) => taken.close(resolve));
+    }
   });
 
   it('carries configured language hints to the worker and the agent', async () => {
