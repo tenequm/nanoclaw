@@ -284,6 +284,10 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       const old = await getMessagingGroupByPlatform(LEGACY_VOICE_CHANNEL, legacy, LEGACY_VOICE_CHANNEL);
       return old ? legacy : lineIdForToken(token);
     });
+  const callLink = (platformId: string): string | null => {
+    const token = [...tokens].find((t) => lineIdForToken(t) === platformId || legacyLineIdForToken(t) === platformId);
+    return token ? `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}` : null;
+  };
   const proxyPolicy: VoiceModeProxyPolicy = {
     trustedProxies: parseCidrs(config.trustedProxyCidrs, 'VOICE_MODE_TRUSTED_PROXY_CIDRS'),
     allowedClients: parseCidrs(config.allowedClientCidrs, 'VOICE_MODE_ALLOWED_CLIENT_CIDRS'),
@@ -487,12 +491,10 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       return handleVoiceCommand(
         event,
         (token) => `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}`,
+        callLink,
       );
     },
-    callLink(platformId: string): string | null {
-      const token = [...tokens].find((t) => lineIdForToken(t) === platformId || legacyLineIdForToken(t) === platformId);
-      return token ? `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}` : null;
-    },
+    callLink,
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;

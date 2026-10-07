@@ -23,6 +23,22 @@ vi.mock('../config.js', async () => {
 
 const TEST_DIR = '/tmp/nanoclaw-test-voice-command';
 
+/** Runs once right after the next lookup of an agent's line: what another /voice did in between. */
+const lineLookups = vi.hoisted(() => ({ after: null as null | (() => Promise<void>) }));
+vi.mock('../db/voice-mode-lines.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../db/voice-mode-lines.js')>();
+  return {
+    ...actual,
+    getVoiceModeLineForAgent: async (agentGroupId: string) => {
+      const found = await actual.getVoiceModeLineForAgent(agentGroupId);
+      const after = lineLookups.after;
+      lineLookups.after = null;
+      await after?.();
+      return found;
+    },
+  };
+});
+
 import type { ChannelAdapter, InboundEvent, OutboundMessage } from './adapter.js';
 import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from './channel-registry.js';
 import './index.js'; // the real channel barrel: the voice channel brings the /voice command with it
@@ -163,6 +179,20 @@ describe('runVoiceCommand', () => {
     expect((await findVoiceModeLineByToken(token))?.line_id).toBe(line.line_id);
   });
 
+  it("never replaces the link another admin's /voice created after this run looked for a line", async () => {
+    let ownerLink: string | undefined;
+    lineLookups.after = async () => {
+      ownerLink = await linkFrom(OWNER);
+    };
+    expect(await runVoiceCommand(mg('mg-other'), null, SCOPED_ADMIN, callUrl)).toEqual({
+      kind: 'done',
+      results: [{ ok: false, agentName: 'Andy', reason: 'other-caller' }],
+    });
+    expect(await lines()).toEqual([
+      expect.objectContaining({ owner_user_id: OWNER, token_hash: hashLinkToken(tokenOf(ownerLink!)) }),
+    ]);
+  });
+
   it('on later runs only moves the call chat: no new link, the old one and its caller stay', async () => {
     const first = tokenOf((await linkFrom(OWNER))!);
     const [before] = await lines();
@@ -266,7 +296,7 @@ describe('findVoiceModeLineByToken', () => {
 describe('handleVoiceCommand (the interceptor)', () => {
   const delivered: Array<{ platformId: string; threadId: string | null; message: OutboundMessage }> = [];
 
-  async function startChat(supportsThreads: boolean, voiceRunning = false) {
+  async function startChat(supportsThreads: boolean, voiceRunning = false, failLinks = false) {
     delivered.length = 0;
     const defaults = {
       dm: {
@@ -288,6 +318,7 @@ describe('handleVoiceCommand (the interceptor)', () => {
         teardown: async () => {},
         isConnected: () => true,
         deliver: async (platformId, threadId, message) => {
+          if (failLinks && JSON.stringify(message).includes('?t=')) throw new Error('send failed');
           delivered.push({ platformId, threadId, message });
           return undefined;
         },
@@ -341,6 +372,19 @@ describe('handleVoiceCommand (the interceptor)', () => {
         platformId: 'chat:1',
         threadId: null,
         message: { kind: 'chat', content: { text: expect.stringMatching(/voice\?t=[0-9a-f]{32}/) } },
+      },
+    ]);
+  });
+
+  it('tells the sender, without the link, when a minted link could not be delivered', async () => {
+    await startChat(false, false, true);
+    expect(await handleVoiceCommand(event('/voice', OWNER), callUrl)).toBe(true);
+    expect(await lines()).toHaveLength(1);
+    expect(delivered).toEqual([
+      {
+        platformId: 'chat:1',
+        threadId: null,
+        message: { kind: 'chat', content: { text: 'I could not deliver your call link; run /voice new again.' } },
       },
     ]);
   });
@@ -438,14 +482,15 @@ describe('handleVoiceCommand (the interceptor)', () => {
   });
 });
 
-it('moves a saved main line without minting, and only /voice new retires its link', async () => {
-  const id = 'voice:legacy';
-  await upsertUser({ id, kind: 'voice', display_name: 'Caller', created_at: now() });
-  await addMember({ user_id: id, agent_group_id: 'ag-1', added_by: null, added_at: now() });
+/** A line from before the rename, as main left it: its voice user, chat, wiring and OWNER as its owner. */
+const SAVED_LINE = 'voice:legacy';
+async function seedSavedLine(): Promise<void> {
+  await upsertUser({ id: SAVED_LINE, kind: 'voice', display_name: 'Caller', created_at: now() });
+  await addMember({ user_id: SAVED_LINE, agent_group_id: 'ag-1', added_by: null, added_at: now() });
   await createMessagingGroup({
     id: 'legacy-mg',
     channel_type: 'voice',
-    platform_id: id,
+    platform_id: SAVED_LINE,
     name: null,
     is_group: 0,
     unknown_sender_policy: 'strict',
@@ -462,6 +507,13 @@ it('moves a saved main line without minting, and only /voice new retires its lin
     'legacy-mg',
     OWNER,
   );
+}
+const SAVED_LINK = 'https://voice.example.com/voice?t=saved';
+const savedLink = (platformId: string) => (platformId === SAVED_LINE ? SAVED_LINK : null);
+
+it('moves a saved main line without minting, and only /voice new retires its link', async () => {
+  const id = SAVED_LINE;
+  await seedSavedLine();
   expect(await resolveVoiceModeLine(id)).not.toBeNull();
   expect(await runVoiceCommand(mg('mg-other'), null, OWNER, callUrl)).toMatchObject({ results: [{ rebound: true }] });
   expect(await lines()).toEqual([]);
@@ -474,6 +526,54 @@ it('moves a saved main line without minting, and only /voice new retires its lin
     results: [{ replaced: true }],
   });
   expect(await resolveVoiceModeLine(id)).toBeNull();
+});
+
+it("gives a saved main line's owner its saved link when /voice moves it, privately in a group", async () => {
+  await seedSavedLine();
+  expect(await runVoiceCommand(mg('mg-other'), null, OWNER, callUrl, false, savedLink)).toEqual({
+    kind: 'done',
+    results: [{ ok: true, agentName: 'Andy', link: SAVED_LINK, replaced: false }],
+  });
+  expect(await lines()).toEqual([]);
+
+  const delivered: Array<{ platformId: string; text: string }> = [];
+  registerChannelAdapter('chat', {
+    factory: (): ChannelAdapter => ({
+      name: 'chat',
+      channelType: 'chat',
+      supportsThreads: false,
+      setup: async () => {},
+      teardown: async () => {},
+      isConnected: () => true,
+      deliver: async (platformId, _threadId, message) => {
+        delivered.push({ platformId, text: (message.content as { text: string }).text });
+        return undefined;
+      },
+    }),
+  });
+  await initChannelAdapters(() => ({
+    onInbound: () => {},
+    onInboundEvent: () => {},
+    onMetadata: () => {},
+    onAction: () => {},
+  }));
+  await chatGroup('mg-group', 'chat:G1', 1);
+  await wire('mg-group', 'ag-1');
+  const event: InboundEvent = {
+    channelType: 'chat',
+    instance: 'chat',
+    platformId: 'chat:G1',
+    threadId: null,
+    message: { id: '9', kind: 'chat', content: JSON.stringify({ text: '/voice', senderId: OWNER }), timestamp: now() },
+  };
+  await handleVoiceCommand(event, callUrl, savedLink);
+  expect(delivered.filter((d) => d.platformId === 'chat:G1').map((d) => d.text)).toEqual([
+    'Calls now talk in this chat, until /voice is run in another one. Your call link is in our direct chat.',
+  ]);
+  expect(delivered.filter((d) => d.platformId !== 'chat:G1').map((d) => d.text)).toEqual([
+    `🎙 Talk to Andy: ${SAVED_LINK}`,
+  ]);
+  expect((await getVoiceLine('legacy-mg'))?.target_messaging_group_id).toBe('mg-group');
 });
 
 it('native Telegram /voice and /voice new use the same line handler as the router', async () => {
