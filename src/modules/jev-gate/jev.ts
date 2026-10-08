@@ -21,27 +21,31 @@ export type JevQuestionId = 'direct_invitation' | 'unresolved' | 'already_answer
 
 export type JevScores = Record<JevQuestionId, number>;
 
+const JEV_QUESTION_IDS: JevQuestionId[] = ['direct_invitation', 'unresolved', 'already_answered', 'human_pingpong'];
+
 export type JevResult = { ok: true; scores: JevScores } | { ok: false; reason: string };
 
 /**
  * The rubric. Wording lives in code and thresholds in config, so a
  * recalibration from logged annotations is a config edit; a change of what we
- * ask is a code change with a commit behind it.
+ * ask is a code change with a commit behind it. The agent's display name is
+ * the only thing templated in — the gate carries no per-chat context.
  */
-export const JEV_QUESTIONS: Record<JevQuestionId, string> = {
-  direct_invitation:
-    'Does the NEW MESSAGE invite Dan (the AI assistant in this chat) to speak, or ask for something Dan is uniquely placed to help with — a question about the system, a request for a lookup, research, code, a decision, or an explicit hand-off to him? Answer no when the message is small talk, an acknowledgement, a reaction, or addressed to a specific human.',
-  unresolved:
-    'Does the NEW MESSAGE leave an open question or request that nobody in the conversation has answered yet?',
-  already_answered:
-    'Has the substance of the NEW MESSAGE already been answered or handled earlier in this conversation, so that replying again would repeat what was said?',
-  human_pingpong:
-    'Are two humans in a personal back-and-forth here — a conversation between them where a third party joining in would interrupt rather than help?',
-};
+export function jevQuestions(agentName: string): Record<JevQuestionId, string> {
+  return {
+    direct_invitation: `Does the NEW MESSAGE invite ${agentName} (the AI assistant in this chat) to speak, or ask for something ${agentName} is uniquely placed to help with — a question about the system, a request for a lookup, research, code, a decision, or an explicit hand-off to them? Answer no when the message is small talk, an acknowledgement, a reaction, or addressed to a specific human.`,
+    unresolved:
+      'Does the NEW MESSAGE leave an open question or request that nobody in the conversation has answered yet?',
+    already_answered:
+      'Has the substance of the NEW MESSAGE already been answered or handled earlier in this conversation, so that replying again would repeat what was said?',
+    human_pingpong:
+      'Are two humans in a personal back-and-forth here — a conversation between them where a third party joining in would interrupt rather than help?',
+  };
+}
 
-function buildQuestions(): Record<string, { type: 'noul'; instructions: string }> {
+function buildQuestions(agentName: string): Record<string, { type: 'noul'; instructions: string }> {
   const out: Record<string, { type: 'noul'; instructions: string }> = {};
-  for (const [id, instructions] of Object.entries(JEV_QUESTIONS)) {
+  for (const [id, instructions] of Object.entries(jevQuestions(agentName))) {
     out[id] = { type: 'noul', instructions };
   }
   return out;
@@ -56,7 +60,7 @@ function readNoul(answers: unknown, id: JevQuestionId): number | null {
 }
 
 /** Ask Jev the rubric about `state`. Never throws. */
-export async function askJev(state: string): Promise<JevResult> {
+export async function askJev(state: string, agentName: string): Promise<JevResult> {
   if (!JEV_API_KEY) return { ok: false, reason: 'no_key' };
 
   let response: Response;
@@ -64,7 +68,7 @@ export async function askJev(state: string): Promise<JevResult> {
     response = await fetch(JEV_URL, {
       method: 'POST',
       headers: { authorization: `Bearer ${JEV_API_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ state, model: JEV_MODEL, questions: buildQuestions() }),
+      body: JSON.stringify({ state, model: JEV_MODEL, questions: buildQuestions(agentName) }),
       signal: AbortSignal.timeout(JEV_TIMEOUT_MS),
     });
   } catch (err) {
@@ -88,7 +92,7 @@ export async function askJev(state: string): Promise<JevResult> {
 
   const answers = (body as { answers?: unknown } | null)?.answers;
   const scores: Partial<JevScores> = {};
-  for (const id of Object.keys(JEV_QUESTIONS) as JevQuestionId[]) {
+  for (const id of JEV_QUESTION_IDS) {
     const value = readNoul(answers, id);
     if (value === null) return { ok: false, reason: `missing_${id}` };
     scores[id] = value;

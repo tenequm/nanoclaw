@@ -34,10 +34,9 @@ import { gateEntryFor, type JevGateEntry } from './config.js';
 import {
   consecutiveBotWakes,
   lastWakeAt,
-  oneLine,
   parseAuthor,
   readGateHistory,
-  renderStateLines,
+  renderState,
   wakesToday,
   type JevMeta,
 } from './history.js';
@@ -72,6 +71,8 @@ export interface JevGateInput {
   event: InboundEvent;
   /** The wiring's effective thread id, for session resolution. */
   threadId: string | null;
+  /** The agent group's display name, templated into the state and the rubric. */
+  agentName: string;
 }
 
 /**
@@ -155,12 +156,12 @@ function errorOutcome(entry: JevGateEntry, event: InboundEvent, reason: string):
  * Never throws.
  */
 export async function runJevGate(input: JevGateInput): Promise<JevGateOutcome | null> {
-  const { agent, mg, event, threadId } = input;
+  const { agent, mg, event, threadId, agentName } = input;
   const entry = gateEntryFor(agent.agent_group_id);
   if (!entry) return null;
 
   try {
-    return await judge(entry, agent, mg, event, threadId);
+    return await judge(entry, agent, mg, event, threadId, agentName);
   } catch (err) {
     // Any unexpected throw is a silent verdict, not a wake.
     log.warn('Jev gate threw — falling back to silent', { agentGroupId: agent.agent_group_id, err });
@@ -174,6 +175,7 @@ async function judge(
   mg: MessagingGroup,
   event: InboundEvent,
   threadId: string | null,
+  agentName: string,
 ): Promise<JevGateOutcome> {
   const session = await findSessionForAgent(agent.agent_group_id, mg.id, threadId);
   const rows = session ? await readGateHistory(agent.agent_group_id, session.id) : [];
@@ -201,16 +203,13 @@ async function judge(
     }
   }
 
-  const who = `${message.sender || 'unknown'}${message.isBot ? ' [bot]' : ''}`;
-  const state = [
-    'Conversation so far (oldest first):',
-    renderStateLines(rows) || '(no prior messages)',
-    '',
-    'NEW MESSAGE:',
-    `${who}: ${oneLine(message.text)}`,
-  ].join('\n');
+  const state = renderState(
+    rows,
+    { timestamp: event.message.timestamp, direction: 'in', kind: event.message.kind, ...message },
+    agentName,
+  );
 
-  const result = await askJev(state);
+  const result = await askJev(state, agentName);
   if (!result.ok) return errorOutcome(entry, event, result.reason);
 
   const decision = decide(result.scores, entry.thresholds);
