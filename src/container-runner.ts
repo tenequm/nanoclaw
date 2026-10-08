@@ -1021,7 +1021,8 @@ export async function resolveProviderContribution(
     context.selectedSkills,
     {
       legacyOverlay: () => Promise.resolve(fn?.({ ...context, coreOwnsProviderSurfaces: true as const }) ?? {}),
-      composeProjectDocument: (spec) => composeGroupProjectDoc(agentGroup, context.groupDir, spec),
+      composeProjectDocument: (spec) =>
+        composeGroupProjectDoc(agentGroup, context.groupDir, spec, context.selectedSkills),
     },
   );
   return { provider, contribution: surfaces.contribution, surfaces };

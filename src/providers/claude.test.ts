@@ -16,10 +16,11 @@ vi.mock('../env.js', async (importOriginal) => ({
     Object.fromEntries(keys.flatMap((k) => (k in dotenv.values ? [[k, dotenv.values[k]]] : []))),
 }));
 
-// The DB-backed project-doc compose is not under test here.
+// The DB-backed project-doc compose is not under test here; only what it is handed.
+const composeGroupProjectDoc = vi.hoisted(() => vi.fn(async (..._args: unknown[]) => {}));
 vi.mock('../project-doc-compose.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../project-doc-compose.js')>()),
-  composeGroupProjectDoc: async () => {},
+  composeGroupProjectDoc,
 }));
 
 import { resolveProviderContribution } from '../container-runner.js';
@@ -32,6 +33,7 @@ const KEY = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW';
 const previous = process.env[KEY];
 
 afterEach(() => {
+  composeGroupProjectDoc.mockClear();
   if (previous === undefined) delete process.env[KEY];
   else process.env[KEY] = previous;
   dotenv.values = {};
@@ -80,5 +82,19 @@ describe('claude provider container env', () => {
   it('drops a non-numeric value instead of passing it through', async () => {
     process.env[KEY] = '1m';
     expect((await claudeEnv())?.[KEY]).toBeUndefined();
+  });
+});
+
+describe('claude provider project document', () => {
+  // The document must teach the skills the runner links, forced gateway skills
+  // included, not the raw stored selection (here empty).
+  it('composes with the resolved skill list, gateway skill included', async () => {
+    delete process.env[KEY];
+    const { getGatewayProvider, resetGatewayProvider } = await import('../gateway-providers/index.js');
+    resetGatewayProvider({ ...getGatewayProvider(), kind: 'fixture-gateway', agentSkills: ['fixture-gateway'] });
+    await claudeEnv();
+
+    expect(composeGroupProjectDoc).toHaveBeenCalledTimes(1);
+    expect(composeGroupProjectDoc.mock.calls[0][3]).toEqual(['fixture-gateway']);
   });
 });

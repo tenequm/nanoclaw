@@ -344,6 +344,19 @@ describe('composeGroupProjectDoc skill selection', () => {
     expect(base.slice(defaultsAt)).toMatch(/no em-dash, ever/i);
     expect(doc.match(/no em-dash, ever/gi)).toHaveLength(1);
   });
+
+  // Runtime skills (container-runner's resolved list, gateway skills forced in) win over the
+  // stored selection, so the document teaches exactly the skills the runner linked.
+  it('composes a forced gateway skill the stored selection leaves out', async () => {
+    const ag = await seed('ag-forced', 'forced-group');
+    await updateContainerConfigJson(ag.id, 'skills', ['welcome']);
+
+    await composeGroupProjectDoc(ag, groupDirOf(ag.folder), CLAUDE_SPEC, ['welcome', 'fixture-gateway']);
+    const doc = fs.readFileSync(path.join(groupDirOf(ag.folder), 'CLAUDE.md'), 'utf-8');
+
+    expect(doc).toContain('# NanoClaw Skill: fixture-gateway');
+    expect(doc).toContain('Fixture credential guidance.');
+  });
 });
 
 describe('composeGroupProjectDoc per-agent sections', () => {
