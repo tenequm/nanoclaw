@@ -172,7 +172,18 @@ describe('extractReplyContext keeps voice call links out of the agent', () => {
       reply_to_message: reply,
       quote: { text: 'link: host.example/webhook/voice/call?t=ab12.' },
     };
-    expect(extractReplyContext(quoted as unknown as Message)?.text).toBe('link: [voice call link]');
+    expect(extractReplyContext(quoted as unknown as Message)?.quote).toBe('link: [voice call link]');
+  });
+
+  it('keeps the full original next to the highlighted fragment', () => {
+    const reply = { message_id: 9, text: 'lunch at noon, then the gym', from: { first_name: 'Ann' } };
+    const quoted = { message_id: 10, reply_to_message: reply, quote: { text: 'at noon' } };
+    expect(extractReplyContext(quoted as unknown as Message)).toEqual({
+      id: '9',
+      sender: 'Ann',
+      text: 'lunch at noon, then the gym',
+      quote: 'at noon',
+    });
   });
 
   it('redacts the short /voice links too', () => {

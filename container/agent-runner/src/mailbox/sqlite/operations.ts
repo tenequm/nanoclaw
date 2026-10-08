@@ -187,6 +187,43 @@ export function sqliteGetMessageIdBySeq(sequence: number): string | null {
   return delivered?.platform_message_id || outboundRow.id;
 }
 
+/**
+ * The session seq of a platform message in one chat — an inbound row whose
+ * id carries the platform id as a colon-delimited segment (Telegram rows are
+ * `<chat>:<msg>:<agent group>`), else a delivered outbound row.
+ */
+export function sqliteFindSeqByPlatformMessageId(
+  channelType: string,
+  platformId: string,
+  platformMessageId: string,
+): number | null {
+  const inbound = getInboundDb();
+  const inboundRow = inbound
+    .prepare(
+      `SELECT seq FROM messages_in
+       WHERE channel_type = $channel_type AND platform_id = $platform_id AND seq IS NOT NULL
+         AND (id = $id OR substr(id, 1, length($id) + 1) = $id || ':' OR instr(id, ':' || $id || ':') > 0)
+       ORDER BY seq LIMIT 1`,
+    )
+    .get({ $channel_type: channelType, $platform_id: platformId, $id: platformMessageId }) as
+    | { seq: number }
+    | undefined;
+  if (inboundRow) return inboundRow.seq;
+  const outIds = (
+    inbound.prepare('SELECT message_out_id FROM delivered WHERE platform_message_id = ?').all(platformMessageId) as {
+      message_out_id: string;
+    }[]
+  ).map((r) => r.message_out_id);
+  const outbound = getOutboundDb().prepare(
+    'SELECT seq FROM messages_out WHERE id = ? AND channel_type = ? AND platform_id = ? AND seq IS NOT NULL',
+  );
+  for (const id of outIds) {
+    const row = outbound.get(id, channelType, platformId) as { seq: number } | undefined;
+    if (row) return row.seq;
+  }
+  return null;
+}
+
 export function sqliteGetRoutingBySeq(
   sequence: number,
 ): { channel_type: string | null; platform_id: string | null; thread_id: string | null } | null {

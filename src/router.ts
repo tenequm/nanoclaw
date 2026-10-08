@@ -22,6 +22,7 @@ import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/chan
 import { applyNormalizedText, classifyHostCommand, gateCommand } from './command-gate.js';
 import { runHostCommand } from './commands/fallback.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { getDb } from './db/connection.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
   createMessagingGroupIfAbsent,
@@ -201,6 +202,43 @@ function dispatchSessionCreated(event: SessionCreatedEvent): void {
       log.error('Session-created hook threw', { sessionId: event.session.id, err });
     }
   }
+}
+
+/**
+ * The sender's nanoclaw role over this agent group. Owner wins over admin; a
+ * role scoped to another agent group does not count here.
+ */
+export async function senderRoleFor(
+  userId: string | null,
+  agentGroupId: string,
+): Promise<'owner' | 'admin' | undefined> {
+  if (!userId) return undefined;
+  const rows = await getDb().all<{ role: string }>(
+    'SELECT role FROM user_roles WHERE user_id = ? AND (agent_group_id IS NULL OR agent_group_id = ?)',
+    userId,
+    agentGroupId,
+  );
+  if (rows.some((r) => r.role === 'owner')) return 'owner';
+  if (rows.some((r) => r.role === 'admin')) return 'admin';
+  return undefined;
+}
+
+/**
+ * Stamp `senderRole` into inbound content for the agent's envelope — the
+ * container cannot read user_roles. Any `senderRole` the adapter passed
+ * through is dropped, so only the host can claim one.
+ */
+export function stampSenderRole(content: string, role: 'owner' | 'admin' | undefined): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return content;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return content;
+  if (!role && !('senderRole' in parsed)) return content;
+  const { senderRole: _claimed, ...rest } = parsed as Record<string, unknown>;
+  return JSON.stringify(role ? { ...rest, senderRole: role } : rest);
 }
 
 function safeParseContent(raw: string): { text?: string; sender?: string; senderId?: string } {
@@ -666,8 +704,12 @@ export async function deliverToAgent(
   } catch (err) {
     log.warn('Inbound message materialization failed', { messageId: event.message.id, err });
   }
-  const content =
+  const rawContent =
     normalizedText !== undefined ? applyNormalizedText(event.message.content, normalizedText) : event.message.content;
+  const content =
+    event.message.kind === 'chat' || event.message.kind === 'chat-sdk'
+      ? stampSenderRole(rawContent, await senderRoleFor(userId, agent.agent_group_id))
+      : rawContent;
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: messageId,
     kind: event.message.kind,

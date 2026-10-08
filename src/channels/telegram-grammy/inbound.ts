@@ -93,8 +93,8 @@ export function detectMention(ctx: Context, botUsername: string | null, botUserI
  * Three reply shapes are merged into this one envelope:
  *   - plain `msg.reply_to_message` — normal "tap reply".
  *   - `msg.quote` — iOS/Desktop quote-reply where the user highlights a
- *     specific fragment; we prefer the fragment over the whole message so
- *     the agent sees what was actually referenced.
+ *     specific fragment; `quote` carries the fragment next to the full
+ *     `text` so the agent sees both the message and what was referenced.
  *   - `msg.external_reply` — reply to a message from a *different* chat
  *     (quote-reply of a channel post etc.). No local id; we label the
  *     sender with the origin so the agent knows the quoted content is
@@ -104,6 +104,7 @@ export interface ReplyContext {
   id: string | null;
   text: string;
   sender: string;
+  quote?: string;
 }
 
 /**
@@ -168,38 +169,38 @@ export function redactVoiceLinks(text: string): string {
 
 export function extractReplyContext(msg: Message): ReplyContext | null {
   const context = rawReplyContext(msg);
-  return context && { ...context, text: redactVoiceLinks(context.text) };
+  if (!context) return null;
+  const { quote, ...rest } = context;
+  return { ...rest, text: redactVoiceLinks(context.text), ...(quote ? { quote: redactVoiceLinks(quote) } : {}) };
 }
 
 function rawReplyContext(msg: Message): ReplyContext | null {
   // Case C — reply to a message from a different chat (quote-reply of a
   // channel post, etc.). Telegram delivers this as `external_reply` with
   // an origin describing where the quoted message lived. No local id.
+  const quote = (msg as { quote?: { text: string } }).quote?.text || undefined;
   const ext = (msg as { external_reply?: { origin: MessageOrigin; message_id?: number } }).external_reply;
   if (ext) {
-    const quoteText = (msg as { quote?: { text: string } }).quote?.text;
-    const body = quoteText && quoteText.length > 0 ? quoteText : ((ext as { text?: string }).text ?? '');
+    // The external original's text is often absent; the fragment is then all there is.
+    const fullText = (ext as { text?: string }).text || quote || '';
     return {
       id: null,
       sender: `(external) ${describeOrigin(ext.origin)}`,
-      text: body,
+      text: fullText,
+      ...(quote && quote !== fullText ? { quote } : {}),
     };
   }
 
   const reply = msg.reply_to_message;
   if (!reply) return null;
 
-  // Case B — user highlighted a specific fragment and replied to that
-  // portion. Prefer the fragment so the agent sees exactly what was
-  // referenced rather than the whole message.
-  const quote = (msg as { quote?: { text: string; is_manual?: boolean } }).quote;
+  // Case B — user highlighted a specific fragment and replied to that portion.
   const fullText = reply.text ?? reply.caption ?? '';
-  const text = quote?.text && quote.text.length > 0 ? quote.text : fullText;
-
   return {
     id: String(reply.message_id),
-    text,
+    text: fullText || quote || '',
     sender: reply.from?.first_name ?? reply.from?.username ?? 'Unknown',
+    ...(quote && quote !== fullText ? { quote } : {}),
   };
 }
 
