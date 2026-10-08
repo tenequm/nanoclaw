@@ -335,20 +335,22 @@ describe('composeGroupProjectDoc skill selection', () => {
     expect(doc).toContain('# NanoClaw Skill: fixture-gateway');
   });
 
-  // The fork's no-em-dash rule lives once, in the base's Tenequm defaults block. Red if it moves
-  // back into a skill, or the defaults block stops composing from the real tree.
-  it('carries the em-dash rule once, inside the Tenequm defaults block', async () => {
+  // The fork's no-em-dash and never-Russian rules live once, in the base's "Rules for every
+  // agent" block. Red if one moves back into a skill, or the block stops composing from the real tree.
+  it('carries the fork rules once, inside the Rules for every agent block', async () => {
     const ag = await seed('ag-resident', 'resident-group');
 
     const doc = await withRealContainer(() => compose(ag));
 
     const base = composedSection(doc, 'NanoClaw Runtime Contract');
     expect(base).toContain('You are a NanoClaw agent.');
-    const defaultsAt = base.indexOf('\n## Tenequm defaults\n');
-    expect(defaultsAt).toBeGreaterThan(-1);
-    expect(base.slice(0, defaultsAt)).not.toMatch(/no em-dash/i);
-    expect(base.slice(defaultsAt)).toMatch(/no em-dash, ever/i);
+    const rulesAt = base.indexOf('\n## Rules for every agent\n');
+    expect(rulesAt).toBeGreaterThan(-1);
+    expect(base.slice(0, rulesAt)).not.toMatch(/no em-dash|never russian/i);
+    expect(base.slice(rulesAt)).toMatch(/no em-dash, ever/i);
+    expect(base.slice(rulesAt)).toContain('\n### Never Russian\n');
     expect(doc.match(/no em-dash, ever/gi)).toHaveLength(1);
+    expect(doc.match(/\*\*Never Russian\.\*\*/g)).toHaveLength(1);
   });
 
   // Runtime skills (container-runner's resolved list, gateway skills forced in) win over the
