@@ -125,11 +125,10 @@ export class TranscriptionService extends Context.Service<
 >()('telegram-grammy/TranscriptionService') {}
 
 /**
- * GroupFolderService — messaging_group → absolute on-disk attachment dir
- * for the wired primary agent group. Returns the full resolved path
- * (under `GROUPS_DIR`) so callers don't have to combine the central-DB
- * folder lookup with a path-resolution helper. Returns `null` when the
- * platformId isn't paired yet.
+ * GroupFolderService — messaging_group → the wired primary agent group's
+ * resolved folder (under `GROUPS_DIR`), or `null` when the platformId isn't
+ * paired yet. Attachments use it only to skip downloads for unpaired chats;
+ * the bytes go to staging and then to each session's inbox.
  */
 export class GroupFolderService extends Context.Service<
   GroupFolderService,

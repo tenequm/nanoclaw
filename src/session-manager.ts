@@ -10,7 +10,7 @@ import { deriveAttachmentName } from './attachment-naming.js';
 import { isSafeAttachmentName } from './attachment-safety.js';
 import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
-import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
+import { ensureContainedInboxDir, inboundStagingRoot, isPathInside } from './inbox-safety.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { isUniqueViolation } from './db/errors.js';
 import {
@@ -320,8 +320,10 @@ export async function writeSessionMessage(
 }
 
 /**
- * If message content has attachments with base64 `data`, save them to
- * the session's inbox directory and replace with `localPath`.
+ * If message content has attachments with base64 `data`, or a `stagedPath`
+ * an adapter downloaded to under `inboundStagingRoot()`, save them to the
+ * session's inbox directory and replace with `localPath`. A staged file is
+ * copied, not moved: the same inbound message can reach several sessions.
  *
  * Both `messageId` and `att.name` originate in untrusted input. WhatsApp
  * passes `msg.key.id` through raw (and that field is client generated, so a
@@ -368,9 +370,16 @@ function extractAttachmentFiles(
 
   let changed = false;
   for (const att of attachments) {
-    if (typeof att.data !== 'string') continue;
+    const staged = typeof att.stagedPath === 'string' ? att.stagedPath : undefined;
+    if (typeof att.data !== 'string' && !staged) continue;
+    const stagedSource = staged ? containedStagedFile(staged) : null;
+    if (staged && !stagedSource) {
+      log.warn('Refused staged attachment outside the inbound staging root', { messageId });
+      continue;
+    }
 
-    const rawName = deriveAttachmentName(att);
+    // A staged file already carries the adapter's chosen name; `att.name` may be a display label.
+    const rawName = staged ? path.basename(staged) : deriveAttachmentName(att);
     const filename = isSafeAttachmentName(rawName) ? rawName : `attachment-${Date.now()}`;
     if (filename !== rawName) {
       log.warn('Refused unsafe attachment filename, would escape inbox', {
@@ -389,10 +398,14 @@ function extractAttachmentFiles(
 
     const filePath = path.join(inboxDir, filename);
     try {
-      // wx = exclusive create. Refuses to follow a pre existing symlink or
-      // overwrite any existing file. The host expects to be the sole writer
-      // of these attachments.
-      fs.writeFileSync(filePath, Buffer.from(att.data as string, 'base64'), { flag: 'wx' });
+      // wx / COPYFILE_EXCL = exclusive create. Refuses to follow a pre
+      // existing symlink or overwrite any existing file. The host expects to
+      // be the sole writer of these attachments.
+      if (stagedSource) {
+        fs.copyFileSync(stagedSource, filePath, fs.constants.COPYFILE_EXCL);
+      } else {
+        fs.writeFileSync(filePath, Buffer.from(att.data as string, 'base64'), { flag: 'wx' });
+      }
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException;
       if (e.code === 'EEXIST') {
@@ -405,14 +418,38 @@ function extractAttachmentFiles(
       throw err;
     }
 
-    att.name = filename;
+    if (!staged) att.name = filename;
     att.localPath = `inbox/${messageId}/${filename}`;
     delete att.data;
+    delete att.stagedPath;
     changed = true;
     log.debug('Saved attachment to inbox', { messageId, filename, size: att.size });
   }
 
+  // A host path never reaches the container, saved or not.
+  for (const att of attachments) {
+    if ('stagedPath' in att) {
+      delete att.stagedPath;
+      changed = true;
+    }
+  }
+
   return changed ? JSON.stringify(parsed) : contentStr;
+}
+
+/**
+ * The real path of a staged file, or null unless it is a regular file under
+ * the staging root. Content also arrives from agents (agent-to-agent), so a
+ * `stagedPath` is untrusted until it resolves inside the root.
+ */
+function containedStagedFile(stagedPath: string): string | null {
+  try {
+    const real = fs.realpathSync(stagedPath);
+    if (!isPathInside(fs.realpathSync(inboundStagingRoot()), real)) return null;
+    return fs.statSync(real).isFile() ? real : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

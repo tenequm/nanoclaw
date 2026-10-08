@@ -9,6 +9,12 @@
  * module wraps that single call and runs voice/audio transcription
  * afterwards.
  *
+ * Bytes land in a host-only staging dir, never in an agent's folder: the
+ * message can be routed to several agents, and each one's copy belongs in
+ * its own session inbox (`inbox/<message-id>/<filename>`, the Runtime
+ * Contract's path). `writeSessionMessage` copies the staged file there per
+ * session and sets `localPath`; stale staging dirs are swept here.
+ *
  * Runs deferred: the adapter attaches `materializeAll` as the message's
  * `materialize` hook and the router calls it only after the engage, access
  * and scope gates pass, so a refused sender never triggers a download or a
@@ -16,6 +22,7 @@
  * populated on `message.content.attachments[]` because the router awaits
  * the hook before writing the message.
  */
+import { randomUUID } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -23,6 +30,7 @@ import { Effect } from 'effect';
 
 import { extForMime } from '../../attachment-naming.js';
 import { isSafeAttachmentName } from '../../attachment-safety.js';
+import { inboundStagingRoot } from '../../inbox-safety.js';
 import { AttachmentFetchFailed, AttachmentTooLarge, LocalFileUntrusted } from './errors.js';
 import type { InboundAttachment } from './inbound.js';
 import {
@@ -54,6 +62,33 @@ export function remapTrustedLocalPath(filePath: string, hostRoot: string): strin
   return path.join(hostRoot, tail);
 }
 
+// Routing copies a staged file into every session within the same inbound
+// pass, so anything this old has been consumed or abandoned.
+const STAGING_MAX_AGE_MS = 60 * 60 * 1000;
+
+const stagingDir = (): string => path.join(inboundStagingRoot(), 'telegram');
+
+/** Best-effort removal of staging dirs past their routing window; never fails the inbound. */
+async function sweepStaleStaging(dir: string, now: number): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return;
+  }
+  await Promise.all(
+    entries.map(async (entry) => {
+      const full = path.join(dir, entry);
+      try {
+        if (now - (await fs.lstat(full)).mtimeMs > STAGING_MAX_AGE_MS)
+          await fs.rm(full, { recursive: true, force: true });
+      } catch {
+        // Raced with another sweep, or unreadable: the next sweep retries.
+      }
+    }),
+  );
+}
+
 const VOICE_EXTS = new Set(['.ogg', '.oga', '.m4a', '.mp3', '.wav', '.webm']);
 
 function sanitizeName(name: string): string {
@@ -61,10 +96,15 @@ function sanitizeName(name: string): string {
   return cleaned || 'file';
 }
 
-/** Deterministic filename from the attachment's semantics + message context. */
-function destFilename(att: InboundAttachment, msgId: string, index: number, remotePath: string): string {
-  const raw = att.name ?? `${att.type}_${msgId}_${index}`;
-  const base = sanitizeName(isSafeAttachmentName(raw) ? raw : `file_${msgId}_${index}`);
+/**
+ * Filename from the attachment's semantics: Telegram's own name when it sent
+ * one, else the media type (`photo.jpg`, `voice.ogg`). Each message gets its
+ * own inbox dir, so only a second attachment on one message needs a suffix.
+ */
+function destFilename(att: InboundAttachment, index: number, remotePath: string): string {
+  const fallback = index > 0 ? `${att.type}_${index}` : att.type;
+  const raw = att.name ?? fallback;
+  const base = sanitizeName(isSafeAttachmentName(raw) ? raw : fallback);
   const hasExt = !!path.extname(base);
   if (hasExt) return base;
   const mimeExt = extForMime(att.mimeType);
@@ -73,12 +113,12 @@ function destFilename(att: InboundAttachment, msgId: string, index: number, remo
 }
 
 /**
- * Download one attachment's bytes. Mutates `att` in place with `localPath`
- * + optional `transcript` on success. Returns tagged errors on failure.
+ * Download one attachment's bytes into staging. Mutates `att` in place with
+ * its file `name`, `stagedPath` and optional `transcript` on success.
+ * Returns tagged errors on failure.
  */
 export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
   att: InboundAttachment,
-  msgId: string,
   index: number,
   platformId: string,
 ) {
@@ -121,13 +161,13 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
     );
   }
 
-  const attachDir = path.join(groupDir, 'attachments');
+  const attachDir = path.join(stagingDir(), randomUUID());
   yield* Effect.tryPromise({
     try: () => fs.mkdir(attachDir, { recursive: true }),
     catch: (cause) => new AttachmentFetchFailed({ fileId: att.fileId, cause }),
   });
 
-  const fileName = destFilename(att, msgId, index, remotePath);
+  const fileName = destFilename(att, index, remotePath);
   const destPath = path.join(attachDir, fileName);
 
   // The `@grammyjs/files` plugin handles both HTTP download (cloud /
@@ -141,7 +181,10 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
       cause instanceof LocalFileUntrusted ? cause : new AttachmentFetchFailed({ fileId: att.fileId, cause }),
   });
 
-  att.localPath = `agent/attachments/${fileName}`;
+  // Photos, voice notes and video notes carry no name of their own; show the
+  // saved file's. A sticker's emoji label or a document's original name stays.
+  att.name ??= fileName;
+  att.stagedPath = destPath;
 
   const ext = path.extname(fileName).toLowerCase();
   if (att.type === 'voice' || att.type === 'audio' || VOICE_EXTS.has(ext)) {
@@ -161,13 +204,13 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
  */
 export const materializeAll = Effect.fn('telegram-grammy.materializeAll')(function* (
   attachments: InboundAttachment[],
-  msgId: string,
   platformId: string,
 ) {
+  yield* Effect.promise(() => sweepStaleStaging(stagingDir(), Date.now()));
   yield* Effect.forEach(
     attachments,
     (att, i) =>
-      materialize(att, msgId, i, platformId).pipe(
+      materialize(att, i, platformId).pipe(
         Effect.catchTags({
           AttachmentTooLarge: (err) =>
             Effect.sync(() => {

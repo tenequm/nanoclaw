@@ -228,7 +228,13 @@ export interface InboundAttachment {
   width: number | null;
   height: number | null;
   durationSeconds: number | null;
-  /** Populated by attachments.ts after successful download, consumed by the agent-runner. */
+  /**
+   * Host-only path of the downloaded bytes, set by attachments.ts.
+   * `writeSessionMessage` copies the file into the session inbox, replaces
+   * this with `localPath`, and never lets it reach the container.
+   */
+  stagedPath?: string;
+  /** Session-relative inbox path (`inbox/<message-id>/<name>`), consumed by the agent-runner. */
   localPath?: string;
   transcript?: string;
   /**

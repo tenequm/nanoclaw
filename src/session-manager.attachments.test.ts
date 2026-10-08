@@ -20,6 +20,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./config.js', async () => {
@@ -99,5 +100,62 @@ describe('extractAttachmentFiles — inbox-root symlink containment (#2828 sibli
     const escaped = path.join(canaryDir, 'evil-inbox-root', 'pwn.txt');
     expect(fs.existsSync(escaped)).toBe(false);
     expect(fs.readdirSync(canaryDir)).toHaveLength(0);
+  });
+});
+
+describe('extractAttachmentFiles — staged adapter downloads', () => {
+  const STAGING = path.join(TEST_DIR, 'inbound-staging', 'telegram', 'stage-1');
+
+  async function write(id: string, attachment: Record<string, unknown>): Promise<Record<string, unknown>> {
+    await writeSessionMessage(AG, SESS, {
+      id,
+      kind: 'chat-sdk',
+      timestamp: now(),
+      platformId: 'telegram:123',
+      channelType: 'telegram',
+      threadId: null,
+      content: JSON.stringify({ text: '', attachments: [attachment] }),
+    });
+    const db = new Database(path.join(sessionDir(AG, SESS), 'inbound.db'), { readonly: true });
+    const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(id) as { content: string };
+    db.close();
+    return JSON.parse(row.content).attachments[0];
+  }
+
+  beforeEach(() => fs.mkdirSync(STAGING, { recursive: true }));
+
+  it('copies a staged file into the inbox under its staged name, keeping the display name', async () => {
+    const staged = path.join(STAGING, 'photo.jpg');
+    fs.writeFileSync(staged, 'jpeg-bytes');
+
+    const att = await write('-100:7:ag', { type: 'sticker', name: 'a sticker (from Pack)', stagedPath: staged });
+
+    expect(att).toMatchObject({ name: 'a sticker (from Pack)', localPath: 'inbox/-100:7:ag/photo.jpg' });
+    expect(att).not.toHaveProperty('stagedPath');
+    expect(fs.readFileSync(path.join(sessionDir(AG, SESS), 'inbox', '-100:7:ag', 'photo.jpg'), 'utf8')).toBe(
+      'jpeg-bytes',
+    );
+    // Copied, not moved: the same message can be routed to another session.
+    expect(fs.existsSync(staged)).toBe(true);
+  });
+
+  it.each([
+    ['a path outside the staging root', () => path.join(TEST_DIR, 'host-secret.txt')],
+    [
+      'a symlink inside the staging root pointing out',
+      () => {
+        const link = path.join(STAGING, 'link.txt');
+        fs.symlinkSync(path.join(TEST_DIR, 'host-secret.txt'), link);
+        return link;
+      },
+    ],
+  ])('refuses %s and never lets the host path reach the container', async (_label, stagedPath) => {
+    fs.writeFileSync(path.join(TEST_DIR, 'host-secret.txt'), 'secret');
+
+    const att = await write('forged', { type: 'document', name: 'x.txt', stagedPath: stagedPath() });
+
+    expect(att).not.toHaveProperty('stagedPath');
+    expect(att).not.toHaveProperty('localPath');
+    expect(fs.existsSync(path.join(sessionDir(AG, SESS), 'inbox', 'forged'))).toBe(false);
   });
 });

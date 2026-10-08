@@ -129,7 +129,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
             message.content.attachments.some((attachment) => attachment.fileId)
           ) {
             const content = message.content;
-            message.materialize = () => runtime.runPromise(materializeAll(content.attachments, message.id, platformId));
+            message.materialize = () => runtime.runPromise(materializeAll(content.attachments, platformId));
           }
 
           const isGroup = chat.type !== 'private';

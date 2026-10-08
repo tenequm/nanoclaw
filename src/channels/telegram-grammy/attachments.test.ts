@@ -15,14 +15,21 @@
  * Tests use a tmpdir wired through `GroupFolderService` so no project
  * state is touched.
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'fs';
 import { copyFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 
 import { Cause, Effect, Layer, Option } from 'effect';
 import type { UserFromGetMe } from 'grammy/types';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { DATA_DIR } = vi.hoisted(() => ({ DATA_DIR: `/tmp/nanoclaw-tgmg-attach-data-${process.pid}` }));
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  DATA_DIR,
+}));
+const STAGING = path.join(DATA_DIR, 'inbound-staging', 'telegram');
 
 import { materializeAll, remapTrustedLocalPath } from './attachments.js';
 import {
@@ -48,6 +55,7 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   rmSync(tmpRoot, { recursive: true, force: true });
+  rmSync(DATA_DIR, { recursive: true, force: true });
 });
 
 /**
@@ -156,7 +164,7 @@ describe('materializeAll: failure-reason surfacing', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'msg-1', 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
 
     expect(att.localPath).toBeUndefined();
     expect(att.error).toBe('exceeds 20 MB cap (file is 21 MB)');
@@ -168,7 +176,7 @@ describe('materializeAll: failure-reason surfacing', () => {
       getFile: () => Promise.reject(new Error('Bad Gateway')),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'msg-1', 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
 
     expect(att.localPath).toBeUndefined();
     expect(att.error).toMatch(/^download failed:/);
@@ -186,7 +194,7 @@ describe('materializeAll: failure-reason surfacing', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'msg-1', 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
 
     expect(att.error).toBe('exceeds 2000 MB cap (file is 2500 MB)');
   });
@@ -198,7 +206,7 @@ describe('materializeAll: failure-reason surfacing', () => {
       getFile: () => Promise.reject(new Error('should not be called')),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'msg-1', 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
 
     expect(att.error).toBeUndefined();
     expect(att.localPath).toBeUndefined();
@@ -226,15 +234,84 @@ describe('materializeAll: happy path via plugin', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'msg-1', 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
 
     expect(att.error).toBeUndefined();
-    expect(att.localPath).toBe('agent/attachments/ok.pdf');
     expect(seenDestPaths).toHaveLength(1);
-    // The destPath the plugin receives ends with the relative `localPath`
-    // suffix and is rooted at the per-test tmpdir.
-    expect(seenDestPaths[0]?.endsWith('/attachments/ok.pdf')).toBe(true);
-    expect(seenDestPaths[0]?.startsWith(tmpRoot)).toBe(true);
+    // Staged on the host, outside every agent folder; the session inbox
+    // copy (and `localPath`) is writeSessionMessage's job.
+    expect(path.dirname(path.dirname(seenDestPaths[0]!))).toBe(STAGING);
+    expect(path.basename(seenDestPaths[0]!)).toBe('ok.pdf');
+    expect(att.stagedPath).toBe(seenDestPaths[0]);
+    expect(att.localPath).toBeUndefined();
+    expect(att.name).toBe('ok.pdf');
+  });
+
+  it.each([
+    ['photo', 'image/jpeg', 'photos/file_7.jpg', 'photo.jpg'],
+    ['voice', 'audio/ogg', 'voice/file_8.oga', 'voice.ogg'],
+    ['video', null, 'videos/file_9.mp4', 'video.mp4'],
+  ] as const)(
+    'names a nameless %s after its media type, never "attachment"',
+    async (type, mimeType, filePath, expected) => {
+      const att: InboundAttachment = { ...makeDoc('unused', `file_${type}`, 10), type, name: null, mimeType };
+      const layers = buildTestLayers({
+        getFile: () =>
+          Promise.resolve(
+            makeHydratedFile({
+              file_id: `file_${type}`,
+              file_path: filePath,
+              file_size: 10,
+              download: async (destPath) => destPath,
+            }),
+          ),
+      });
+
+      await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+
+      expect(att.name).toBe(expected);
+      expect(path.basename(att.stagedPath!)).toBe(expected);
+    },
+  );
+
+  it('keeps a display label (sticker) as the name while staging under a safe filename', async () => {
+    const att: InboundAttachment = {
+      ...makeDoc('unused', 'file_sticker', 10),
+      type: 'sticker',
+      name: '\u{1F926} sticker (from Pack)',
+      mimeType: null,
+    };
+    const layers = buildTestLayers({
+      getFile: () =>
+        Promise.resolve(
+          makeHydratedFile({
+            file_id: 'file_sticker',
+            file_path: 'stickers/file_1.webp',
+            file_size: 10,
+            download: async (destPath) => destPath,
+          }),
+        ),
+    });
+
+    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+
+    expect(att.name).toBe('\u{1F926} sticker (from Pack)');
+    expect(path.basename(att.stagedPath!)).toBe('___sticker__from_Pack_.webp');
+  });
+
+  it('sweeps staging dirs past the routing window and keeps fresh ones', async () => {
+    const stale = path.join(STAGING, 'stale');
+    const fresh = path.join(STAGING, 'fresh');
+    mkdirSync(stale, { recursive: true });
+    mkdirSync(fresh, { recursive: true });
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(stale, twoHoursAgo, twoHoursAgo);
+    const layers = buildTestLayers({ groupDir: null, getFile: () => Promise.reject(new Error('unused')) });
+
+    await Effect.runPromise(Effect.provide(materializeAll([makeDoc()], 'telegram:123'), layers));
+
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
   });
 
   it('replaces an unsafe document name before choosing the destination', async () => {
@@ -255,10 +332,10 @@ describe('materializeAll: happy path via plugin', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'msg-unsafe', 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
 
-    expect(att.localPath).toBe('agent/attachments/file_msg-unsafe_0.pdf');
-    expect(path.basename(seenDestPaths[0]!)).toBe('file_msg-unsafe_0.pdf');
+    expect(path.basename(seenDestPaths[0]!)).toBe('document.pdf');
+    expect(att.stagedPath).toBe(seenDestPaths[0]);
   });
 
   it('local mode: copies bytes from a bind-mounted source path', async () => {
@@ -291,10 +368,10 @@ describe('materializeAll: happy path via plugin', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'msg-1', 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
 
     expect(att.error).toBeUndefined();
-    expect(att.localPath).toBe('agent/attachments/local.pdf');
+    expect(path.basename(att.stagedPath!)).toBe('local.pdf');
   });
 });
 
@@ -324,9 +401,9 @@ describe('materializeAll: --local untrusted path', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'msg-1', 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
 
-    expect(att.localPath).toBeUndefined();
+    expect(att.stagedPath).toBeUndefined();
     expect(att.error).toBe(`untrusted local file path (/etc/passwd not under ${CONTAINER_LOCAL_ROOT})`);
   });
 });

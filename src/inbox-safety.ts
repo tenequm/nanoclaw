@@ -6,7 +6,8 @@
  * host to write through it — landing attacker-influenced bytes outside the
  * sandbox (CWE-59). Both inbound paths that materialise files into a session's
  * `inbox/<messageId>/` directory route through `ensureContainedInboxDir`:
- *   - channel-inbound attachments (`extractAttachmentFiles` in session-manager)
+ *   - channel-inbound attachments (`extractAttachmentFiles` in session-manager),
+ *     inline base64 or staged under `inboundStagingRoot()` by an adapter
  *   - agent-to-agent forwarded files (`forwardAttachedFiles` in agent-route)
  *
  * Keeping the guard in one place means both paths defend identically; the fix
@@ -16,7 +17,18 @@
 import fs from 'fs';
 import path from 'path';
 
+import { DATA_DIR } from './config.js';
 import { log } from './log.js';
+
+/**
+ * Host-only directory where a channel adapter that downloads to disk (rather
+ * than passing base64 `data`) stages inbound files. `writeSessionMessage`
+ * copies a staged file into the session inbox only from under this root.
+ * Never mounted into a container.
+ */
+export function inboundStagingRoot(): string {
+  return path.join(DATA_DIR, 'inbound-staging');
+}
 
 /** True if `child` is `parent` itself or nested within it (no traversal/escape). */
 export function isPathInside(parent: string, child: string): boolean {
