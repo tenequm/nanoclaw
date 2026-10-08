@@ -21,6 +21,7 @@ import {
   parseChatId,
   parseTopicId,
   platformIdFor,
+  richMessageToMarkdown,
   resolveMessageThreadId,
   toInboundMessage,
   type InboundContent,
@@ -323,5 +324,106 @@ describe('entitiesToMarkdown', () => {
     ];
     // Close `bold` at pos 1 before opening `italic` at pos 1.
     expect(entitiesToMarkdown(text, e(entities))).toBe('**a**_b_');
+  });
+});
+
+describe('inbound rich messages are flattened, not dropped', () => {
+  const rich = {
+    blocks: [
+      { type: 'heading', size: 2, text: 'Plan' },
+      {
+        type: 'paragraph',
+        text: [
+          'Ship ',
+          { type: 'bold', text: 'today' },
+          ' at ',
+          { type: 'date_time', text: '15:00', unix_time: 1760108400, date_time_format: 't' },
+        ],
+      },
+      {
+        type: 'list',
+        items: [
+          { label: '\u2022', blocks: [{ type: 'paragraph', text: 'tests' }], has_checkbox: true, is_checked: true },
+          {
+            label: '\u2022',
+            blocks: [
+              { type: 'paragraph', text: 'docs' },
+              { type: 'list', items: [{ label: '1.', blocks: [{ type: 'paragraph', text: 'KB' }] }] },
+            ],
+            has_checkbox: true,
+          },
+        ],
+      },
+      {
+        type: 'table',
+        cells: [
+          [
+            { text: 'host', is_header: true, align: 'left', valign: 'top' },
+            { text: 'state', is_header: true, align: 'left', valign: 'top' },
+          ],
+          [
+            { text: 'bl', align: 'left', valign: 'top' },
+            { text: { type: 'code', text: 'up' }, align: 'left', valign: 'top' },
+          ],
+        ],
+      },
+      { type: 'pre', language: 'sh', text: 'ls' },
+      { type: 'details', summary: 'More', blocks: [{ type: 'paragraph', text: 'hidden' }] },
+    ],
+  } as unknown as NonNullable<Message['rich_message']>;
+
+  it('renders blocks and inline styles as markdown', () => {
+    expect(richMessageToMarkdown(rich)).toBe(
+      [
+        '## Plan',
+        'Ship **today** at [15:00](tg://time?unix=1760108400&format=t)',
+        '- [x] tests\n- [ ] docs\n      1. KB',
+        '| host | state |\n| --- | --- |\n| bl | `up` |',
+        '```sh\nls\n```',
+        '**More**\nhidden',
+      ].join('\n\n'),
+    );
+  });
+
+  const ctxFor = (msg: Record<string, unknown>, chatType = 'private') =>
+    ({
+      chat: { id: 1000001, type: chatType, title: 'Chat' },
+      msg,
+      from: { id: 1000001, first_name: 'Sender', is_bot: false },
+      update: {},
+    }) as unknown as Parameters<typeof toInboundMessage>[0];
+
+  it('keeps a text-less rich message as the inbound body', () => {
+    const env = toInboundMessage(ctxFor({ message_id: 30, date: 1_700_000_000, rich_message: rich }), 'bot', 1);
+    expect(env).not.toBeNull();
+    expect((env!.message.content as InboundContent).text).toContain('## Plan');
+  });
+
+  it('counts an @mention of the bot inside a rich message in a group', () => {
+    const mention = {
+      blocks: [{ type: 'paragraph', text: [{ type: 'mention', text: '@dan_bot', username: 'dan_bot' }, ' look'] }],
+    };
+    const env = toInboundMessage(
+      ctxFor({ message_id: 31, date: 1_700_000_000, rich_message: mention }, 'supergroup'),
+      'dan_bot',
+      1,
+    );
+    expect(env!.message.isMention).toBe(true);
+  });
+
+  it('uses a replied-to rich message as the reply context text', () => {
+    const ctx = extractReplyContext({
+      message_id: 32,
+      date: 1_700_000_000,
+      chat: { id: 1, type: 'private' },
+      reply_to_message: {
+        message_id: 5,
+        date: 1,
+        chat: { id: 1, type: 'private' },
+        from: { id: 2, first_name: 'Dan', is_bot: true },
+        rich_message: rich,
+      },
+    } as unknown as Message);
+    expect(ctx?.text).toContain('| host | state |');
   });
 });

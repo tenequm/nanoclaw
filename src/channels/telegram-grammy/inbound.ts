@@ -12,7 +12,7 @@
  * the bot is authoritative, and DMs are by definition addressed.
  */
 import type { Context } from 'grammy';
-import type { Message, MessageEntity, MessageOrigin, User } from 'grammy/types';
+import type { Message, MessageEntity, MessageOrigin, RichBlock, RichMessage, RichText, User } from 'grammy/types';
 
 import { TIMEZONE } from '../../config.js';
 import { formatLocalTime } from '../../timezone.js';
@@ -68,6 +68,8 @@ export function detectMention(ctx: Context, botUsername: string | null, botUserI
   // Reply to one of the bot's own messages counts as a mention.
   const replyFromId = msg.reply_to_message?.from?.id;
   if (botUserId != null && replyFromId === botUserId) return true;
+
+  if (msg.rich_message && richMentions(msg.rich_message, botUsername, botUserId)) return true;
 
   const entities: MessageEntity[] = msg.entities ?? msg.caption_entities ?? [];
   const source = msg.text ?? msg.caption ?? '';
@@ -198,8 +200,182 @@ function rawReplyContext(msg: Message): ReplyContext | null {
   return {
     id: String(reply.message_id),
     sender: reply.from?.first_name ?? reply.from?.username ?? 'Unknown',
-    ...withQuote(reply.text ?? reply.caption ?? '', quote),
+    ...withQuote(
+      reply.text ?? reply.caption ?? (reply.rich_message ? richMessageToMarkdown(reply.rich_message) : ''),
+      quote,
+    ),
   };
+}
+
+/* ----------------------------------------------------------------------- */
+/*                          Inbound rich messages                           */
+/* ----------------------------------------------------------------------- */
+
+/**
+ * Flatten a rich message (Telegram's rich editor, Bot API 10.1+) to markdown.
+ * Such a message carries `rich_message` blocks and often no `text`, so
+ * without this the body would be empty and the message dropped. Media inside
+ * a rich message is named, not downloaded.
+ */
+export function richMessageToMarkdown(rich: RichMessage): string {
+  return renderRichBlocks(rich.blocks, '').trim();
+}
+
+function renderRichBlocks(blocks: readonly RichBlock[], indent: string, separator = '\n\n'): string {
+  return blocks
+    .map((block) => renderRichBlock(block, indent))
+    .filter((part) => part.length > 0)
+    .join(separator);
+}
+
+function prefixLines(text: string, prefix: string): string {
+  return text
+    .split('\n')
+    .map((line) => prefix + line)
+    .join('\n');
+}
+
+function richCaption(caption: { text: RichText; credit?: RichText } | undefined): string {
+  if (!caption) return '';
+  const credit = caption.credit !== undefined ? ` (${renderRichText(caption.credit)})` : '';
+  return `${renderRichText(caption.text)}${credit}`;
+}
+
+function renderRichBlock(block: RichBlock, indent: string): string {
+  switch (block.type) {
+    case 'paragraph':
+    case 'footer':
+    case 'thinking':
+      return renderRichText(block.text);
+    case 'heading':
+      return `${'#'.repeat(block.size)} ${renderRichText(block.text)}`;
+    case 'pre':
+      return `\`\`\`${block.language ?? ''}\n${renderRichText(block.text)}\n\`\`\``;
+    case 'divider':
+      return '---';
+    case 'mathematical_expression':
+      return `$$${block.expression}$$`;
+    case 'anchor':
+      return '';
+    case 'list':
+      return block.items
+        .map((item) => {
+          const box = item.has_checkbox ? (item.is_checked ? '[x] ' : '[ ] ') : '';
+          const label = item.label.trim();
+          const marker = `${/^\w+[.)]$/.test(label) ? label : '-'} ${box}`;
+          const body = renderRichBlocks(item.blocks, '', '\n');
+          const childIndent = ' '.repeat(marker.length);
+          const [first = '', ...more] = body.split('\n');
+          return [indent + marker + first, ...more.map((line) => (line ? indent + childIndent + line : line))].join(
+            '\n',
+          );
+        })
+        .join('\n');
+    case 'blockquote':
+      return prefixLines(
+        [renderRichBlocks(block.blocks, ''), block.credit !== undefined ? `- ${renderRichText(block.credit)}` : '']
+          .filter(Boolean)
+          .join('\n'),
+        '> ',
+      );
+    case 'expandable_blockquote':
+    case 'pullquote':
+      return prefixLines(
+        [renderRichText(block.text), block.credit !== undefined ? `- ${renderRichText(block.credit)}` : '']
+          .filter(Boolean)
+          .join('\n'),
+        '> ',
+      );
+    case 'collage':
+    case 'slideshow':
+      return [renderRichBlocks(block.blocks, indent), richCaption(block.caption)].filter(Boolean).join('\n');
+    case 'table': {
+      const rows = block.cells.map(
+        (row) => `| ${row.map((cell) => (cell.text !== undefined ? renderRichText(cell.text) : '')).join(' | ')} |`,
+      );
+      if (rows.length === 0) return '';
+      const width = Math.max(...block.cells.map((row) => row.length));
+      const separator = `|${' --- |'.repeat(width)}`;
+      const table = [rows[0], separator, ...rows.slice(1)].join('\n');
+      return block.caption !== undefined ? `${renderRichText(block.caption)}\n${table}` : table;
+    }
+    case 'details':
+      return [`**${renderRichText(block.summary)}**`, renderRichBlocks(block.blocks, indent)]
+        .filter(Boolean)
+        .join('\n');
+    case 'map':
+      return [`[map: ${block.location.latitude}, ${block.location.longitude}]`, richCaption(block.caption)]
+        .filter(Boolean)
+        .join(' ');
+    case 'photo':
+    case 'video':
+    case 'animation':
+    case 'audio':
+    case 'document':
+    case 'voice_note': {
+      const caption = richCaption(block.caption);
+      return `[${block.type.replace('_', ' ')}${caption ? `: ${caption}` : ''}]`;
+    }
+    case 'buttons':
+      return block.buttons.map((button) => `[${renderRichText(button.text)}]`).join(' ');
+    default:
+      return '';
+  }
+}
+
+function renderRichText(text: RichText): string {
+  if (typeof text === 'string') return text;
+  if (Array.isArray(text)) return text.map(renderRichText).join('');
+  switch (text.type) {
+    case 'bold':
+      return `**${renderRichText(text.text)}**`;
+    case 'italic':
+      return `_${renderRichText(text.text)}_`;
+    case 'underline':
+      return `__${renderRichText(text.text)}__`;
+    case 'strikethrough':
+      return `~~${renderRichText(text.text)}~~`;
+    case 'spoiler':
+      return `||${renderRichText(text.text)}||`;
+    case 'code':
+      return `\`${renderRichText(text.text)}\``;
+    case 'url':
+      return `[${renderRichText(text.text)}](${text.url})`;
+    case 'text_mention':
+      return `[${renderRichText(text.text)}](tg://user?id=${text.user.id})`;
+    case 'date_time':
+      return `[${renderRichText(text.text)}](tg://time?unix=${text.unix_time}${text.date_time_format ? `&format=${text.date_time_format}` : ''})`;
+    case 'custom_emoji':
+      return text.alternative_text;
+    case 'mathematical_expression':
+      return `$${text.expression}$`;
+    case 'anchor':
+      return '';
+    case 'button':
+      return `[${renderRichText(text.button.text)}]`;
+    default:
+      return 'text' in text ? renderRichText(text.text) : '';
+  }
+}
+
+/** Whether a rich message @mentions the bot (by username or as a text mention). */
+function richMentions(rich: RichMessage, botUsername: string | null, botUserId: number | null): boolean {
+  const username = botUsername?.toLowerCase();
+  const inText = (text: RichText): boolean => {
+    if (typeof text === 'string') return false;
+    if (Array.isArray(text)) return text.some(inText);
+    if (text.type === 'mention' && username && text.username.replace(/^@/, '').toLowerCase() === username) return true;
+    if (text.type === 'text_mention' && botUserId != null && text.user.id === botUserId) return true;
+    return 'text' in text ? inText(text.text) : false;
+  };
+  const inBlocks = (blocks: readonly RichBlock[]): boolean =>
+    blocks.some((block) => {
+      if ('text' in block && inText(block.text)) return true;
+      if (block.type === 'list') return block.items.some((item) => inBlocks(item.blocks));
+      if ('blocks' in block) return inBlocks(block.blocks);
+      return false;
+    });
+  return inBlocks(rich.blocks);
 }
 
 /**
@@ -541,7 +717,10 @@ export function toInboundMessage(
   // Prefer entities over caption_entities when both exist (message text vs media caption).
   const rawText = msg.text ?? msg.caption ?? '';
   const rawEntities = msg.entities ?? msg.caption_entities;
-  const markdown = entitiesToMarkdown(rawText, rawEntities);
+  const markdown =
+    rawText === '' && msg.rich_message
+      ? richMessageToMarkdown(msg.rich_message)
+      : entitiesToMarkdown(rawText, rawEntities);
 
   // Prepend contextual prefixes: [EDITED], [forwarded from …], [album …].
   const prefixes: string[] = [];
