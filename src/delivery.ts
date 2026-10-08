@@ -152,6 +152,8 @@ export interface ChannelDeliveryAdapter {
    */
   resolveReaction?(channelType: string, emoji: string, instance?: string): ResolvedReaction | undefined;
   typingRequiresThread?(channelType: string, instance?: string): boolean;
+  /** Whether the channel can show a message as a reply to another (`content.threadReply`). */
+  threadsReplies?(channelType: string, instance?: string): boolean;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
@@ -755,8 +757,14 @@ async function deliverMessage(
     rewritten.messageId = platformMessageId(content.messageId, session.agent_group_id);
   }
   if (reaction.kind === 'substituted') rewritten.emoji = reaction.emoji;
+  const threadReply = await resolveThreadReply(msg, content, session, deliverInstance);
+  if (threadReply) rewritten.threadReply = threadReply;
+  // Only the host decides on a reply box; a `threadReply` in the stored content is not carried.
+  const { threadReply: _stored, ...base } = content;
   const outboundContent =
-    Object.keys(rewritten).length > 0 ? JSON.stringify({ ...content, ...rewritten }) : msg.content;
+    Object.keys(rewritten).length > 0 || 'threadReply' in content
+      ? JSON.stringify({ ...base, ...rewritten })
+      : msg.content;
 
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channelType,
@@ -794,6 +802,45 @@ async function deliverMessage(
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
   return platformMsgId;
+}
+
+/**
+ * Whether a reply shows as one (a reply box), carried to the adapter as
+ * `content.threadReply`. The agent's explicit `reply_to`/`quote` (the
+ * container writes `replyIntent`) always threads; a default reply threads
+ * only when newer messages arrived in that chat after the one it answers, so
+ * a reply to the latest message stays plain. A quote Telegram cannot find is
+ * the adapter's to retry without.
+ */
+async function resolveThreadReply(
+  msg: { channelType: string | null; platformId: string | null; inReplyTo: string | null },
+  content: Record<string, unknown>,
+  session: Session,
+  instance: string | undefined,
+): Promise<{ quote?: string } | undefined> {
+  if (!msg.inReplyTo || !msg.channelType || !msg.platformId) return undefined;
+  // Edits, reactions and questions are not new messages; a media group is.
+  if (typeof content.operation === 'string' && content.operation !== 'send_media_group') return undefined;
+  if (content.type === 'ask_question') return undefined;
+  if (!deliveryAdapter?.threadsReplies?.(msg.channelType, instance)) return undefined;
+
+  const intent = content.replyIntent;
+  if (typeof intent === 'object' && intent !== null) {
+    const quote = (intent as { quote?: unknown }).quote;
+    return typeof quote === 'string' && quote ? { quote } : {};
+  }
+
+  const { channelType, platformId, inReplyTo } = msg;
+  try {
+    const target = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getReplyTarget(inReplyTo),
+    );
+    const sameChat = target?.channelType === channelType && target.platformId === platformId;
+    return sameChat && target.newerInChat ? {} : undefined;
+  } catch (err) {
+    log.debug('Reply target unreadable, replying plain', { messageId: inReplyTo, sessionId: session.id, err });
+    return undefined;
+  }
 }
 
 /**

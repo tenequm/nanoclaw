@@ -13,7 +13,7 @@ import { getAgentGroup } from '../db/agent-groups.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { onHostStart } from '../host-lifecycle.js';
-import { deliverToAgent } from '../router.js';
+import { deliverToAgent, resolveSenderRole } from '../router.js';
 import type { MessagingGroup } from '../types.js';
 
 /** What the voice engine knows of a turn besides its event. */
@@ -74,6 +74,7 @@ export async function routeVoiceModeTurn(event: InboundEvent, turn: VoiceModeTur
     threadsEnabled,
     threadId,
     true,
+    await resolveSenderRole(event, turn.callerId, agentGroupId),
   );
   return stored;
 }

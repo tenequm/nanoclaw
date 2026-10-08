@@ -152,6 +152,31 @@ describe('routing (extractRouting)', () => {
     expect(routing.inReplyTo).toBe('m1');
   });
 
+  it('replies to the last waking message in the first row chat, not accumulated context', () => {
+    const tg = { platformId: 'telegram:-100', channelType: 'telegram' };
+    insertMessage('ctx', 'chat', { sender: 'Bob', text: 'old chatter' }, { seq: 2, trigger: 0, ...tg });
+    insertMessage('w1', 'chat', { sender: 'Alice', text: 'first ask' }, { seq: 4, ...tg });
+    insertMessage(
+      'other',
+      'chat',
+      { sender: 'Eve', text: 'elsewhere' },
+      { seq: 6, platformId: 'C9', channelType: 'slack' },
+    );
+    insertMessage('w2', 'chat', { sender: 'Alice', text: 'second ask' }, { seq: 8, ...tg });
+    insertMessage('late', 'chat', { sender: 'Bob', text: 'more chatter' }, { seq: 10, trigger: 0, ...tg });
+
+    const routing = extractRouting(getPendingMessages());
+    expect(routing.platformId).toBe('telegram:-100');
+    expect(routing.channelType).toBe('telegram');
+    expect(routing.inReplyTo).toBe('w2');
+  });
+
+  it('falls back to the first row when no row in its chat woke the turn', () => {
+    insertMessage('ctx', 'chat', { sender: 'Bob', text: 'old chatter' }, { seq: 2, trigger: 0, platformId: 'G1' });
+
+    expect(extractRouting(getPendingMessages()).inReplyTo).toBe('ctx');
+  });
+
   it('falls back to the first row when the batch is all echo (defensive)', () => {
     insertEcho('e1', { seq: 2 });
     insertEcho('e2', { seq: 4 });

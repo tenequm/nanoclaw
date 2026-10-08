@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { log } from '../log.js';
+
 // Keep the SDK's system trust order and its proxy-only fallback.
 const SYSTEM_CA_PATHS = ['/etc/ssl/cert.pem', '/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt'];
 
@@ -100,7 +102,9 @@ export function stageOnecliFile(dataDir: string, kind: 'ca' | 'combined' | 'stub
     try {
       fs.unlinkSync(temporary);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      // A throw here would replace the publish result or its error.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+        log.warn('OneCLI staged temp file left behind', { temporary, error });
     }
   }
 }

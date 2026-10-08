@@ -1238,3 +1238,160 @@ describe('deliverSessionMessages — outbound presentation', () => {
     expect(sent).toHaveLength(2);
   });
 });
+
+describe('deliverSessionMessages — reply box', () => {
+  let inboundSeq = 0;
+
+  function insertInbound(
+    sessionId: string,
+    id: string,
+    text: string,
+    platformId = 'telegram:123',
+    kind = 'chat-sdk',
+  ): void {
+    const db = openInboundDb('ag-1', sessionId);
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, content)
+       VALUES (?, ?, ?, datetime('now'), 'completed', ?, 'telegram', ?)`,
+    ).run(id, (inboundSeq += 2), kind, platformId, JSON.stringify({ text }));
+    db.close();
+  }
+
+  function insertReply(sessionId: string, id: string, inReplyTo: string, content: unknown): void {
+    insertOperation('ag-1', sessionId, id, content);
+    const db = new Database(outboundDbPath('ag-1', sessionId));
+    db.prepare('UPDATE messages_out SET in_reply_to = ? WHERE id = ?').run(inReplyTo, id);
+    db.close();
+  }
+
+  async function deliveredContent(
+    session: Parameters<typeof deliverSessionMessages>[0],
+    threadsReplies = true,
+  ): Promise<Array<Record<string, unknown>>> {
+    const seen: Array<Record<string, unknown>> = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        seen.push(JSON.parse(content) as Record<string, unknown>);
+        return undefined;
+      },
+      threadsReplies: () => threadsReplies,
+    });
+    await deliverSessionMessages(session);
+    return seen;
+  }
+
+  it('posts a default reply to the latest message in the chat plain', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'first');
+    insertInbound(session.id, '123:2:ag-1', 'latest');
+    insertReply(session.id, 'out-1', '123:2:ag-1', { text: 'answer' });
+
+    const [content] = await deliveredContent(session);
+    expect(content).toEqual({ text: 'answer' });
+  });
+
+  it('threads a default reply when newer messages arrived in that chat after it', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'question');
+    insertInbound(session.id, '123:2:ag-1', 'something else');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { text: 'answer' });
+
+    const [content] = await deliveredContent(session);
+    expect(content.threadReply).toEqual({});
+  });
+
+  it('ignores newer messages from another chat', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'question');
+    insertInbound(session.id, '999:5:ag-1', 'elsewhere', 'telegram:999');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { text: 'answer' });
+
+    const [content] = await deliveredContent(session);
+    expect(content.threadReply).toBeUndefined();
+  });
+
+  it('does not count reactions, edits or non-chat rows as newer messages', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'question');
+    insertInbound(session.id, '123:1:reaction:5:1700000000:ag-1', '[reacted: 👍]');
+    insertInbound(session.id, '123:1:edit:1700000001:ag-1', '[EDITED] question!');
+    insertInbound(session.id, 'sys-1', 'notice', 'telegram:123', 'system');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { text: 'answer' });
+
+    const [content] = await deliveredContent(session);
+    expect(content.threadReply).toBeUndefined();
+  });
+
+  it('always threads an explicit reply_to, even to the latest message', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'latest');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { text: 'answer', replyIntent: {} });
+
+    const [content] = await deliveredContent(session);
+    expect(content.threadReply).toEqual({});
+  });
+
+  it('passes the quote through untouched; a rejected one is the adapter retry', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'see you at noon');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { text: 'a', replyIntent: { quote: 'at midnight' } });
+    insertReply(session.id, 'out-2', '4242', { text: 'b', replyIntent: { quote: 'my own words' } });
+
+    const contents = await deliveredContent(session);
+    expect(contents.map((c) => c.threadReply)).toEqual([{ quote: 'at midnight' }, { quote: 'my own words' }]);
+  });
+
+  it('never carries a threadReply the container wrote itself', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'latest');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { text: 'answer', threadReply: { quote: 'forged' } });
+
+    const [content] = await deliveredContent(session);
+    expect(content).toEqual({ text: 'answer' });
+  });
+
+  it('threads nothing on a channel that does not show replies, and never edits or reactions', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'question');
+    insertInbound(session.id, '123:2:ag-1', 'newer');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { text: 'answer', replyIntent: {} });
+    expect((await deliveredContent(session, false))[0].threadReply).toBeUndefined();
+
+    const { session: other } = await resolveSession('ag-1', 'mg-1', 'th-2', 'per-thread');
+    insertInbound(other.id, '123:1:ag-1', 'question');
+    insertInbound(other.id, '123:2:ag-1', 'newer');
+    insertReply(other.id, 'out-2', '123:1:ag-1', { operation: 'edit', messageId: '123:9', text: 'fixed' });
+    expect((await deliveredContent(other))[0].threadReply).toBeUndefined();
+  });
+
+  it('threads a media group like any new message', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'question');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { operation: 'send_media_group', items: [], replyIntent: {} });
+
+    expect((await deliveredContent(session))[0].threadReply).toEqual({});
+  });
+
+  it('replies plain when the reply target cannot be read', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'question');
+    insertInbound(session.id, '123:2:ag-1', 'newer');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { text: 'answer' });
+    const db = openInboundDb('ag-1', session.id);
+    db.prepare('ALTER TABLE messages_in DROP COLUMN kind').run();
+    db.close();
+
+    const [content] = await deliveredContent(session);
+    expect(content).toEqual({ text: 'answer' });
+  });
+});

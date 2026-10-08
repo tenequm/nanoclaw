@@ -14,13 +14,22 @@
  *   - reaction         ({ operation: 'reaction', messageId, emoji })
  *   - send_media_group ({ operation: 'send_media_group', items })
  *   - ask_question     ({ type: 'ask_question', questionId, title, question?, options })
+ *
+ * A default message or media group carries `reply_parameters` on its first
+ * send when the host marked it `threadReply` (see delivery.ts).
  */
 import path from 'path';
 
 import { Effect } from 'effect';
 import { FormattedString } from '@grammyjs/parse-mode';
 import { InputFile } from 'grammy';
-import type { InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo } from 'grammy/types';
+import type {
+  InputMediaAudio,
+  InputMediaDocument,
+  InputMediaPhoto,
+  InputMediaVideo,
+  ReplyParameters,
+} from 'grammy/types';
 
 import type { OutboundFile, OutboundMessage } from '../adapter.js';
 import { normalizeOptions, type NormalizedOption, type RawOption } from '../ask-question.js';
@@ -103,6 +112,45 @@ function viewContent(message: OutboundMessage): ContentView {
 }
 
 /**
+ * `reply_parameters` for a message the host decided to show as a reply:
+ * `content.threadReply` is set and `inReplyTo` names a message in this chat.
+ */
+function replyParametersFor(message: OutboundMessage, chatId: number): ReplyParameters | undefined {
+  const thread = (message.content as Record<string, unknown> | null | undefined)?.threadReply;
+  if (!message.inReplyTo || typeof thread !== 'object' || thread === null) return undefined;
+  const parsed = extractTelegramMessageId(message.inReplyTo, chatId);
+  if (!parsed || parsed.chatId !== chatId) return undefined;
+  const quote = (thread as { quote?: unknown }).quote;
+  return {
+    message_id: parsed.messageId,
+    allow_sending_without_reply: true,
+    ...(typeof quote === 'string' && quote ? { quote } : {}),
+  };
+}
+
+/**
+ * One send of a possibly multi-message delivery: only the first (`index` 0)
+ * carries `reply_parameters`. A quote Telegram cannot find in the original
+ * fails that send, so it is retried once without the quote - the reply still
+ * threads, the highlight is lost, and nothing already sent goes out again.
+ */
+const sendReplying = <A, R>(
+  index: number,
+  reply: ReplyParameters | undefined,
+  send: (reply: ReplyParameters | undefined) => Effect.Effect<A, GrammyDeliveryError, R>,
+): Effect.Effect<A, GrammyDeliveryError, R> => {
+  if (index !== 0 || !reply?.quote) return send(index === 0 ? reply : undefined);
+  const { quote: _quote, ...unquoted } = reply;
+  return send(reply).pipe(
+    Effect.catchTag('GrammyQuoteError', (err) =>
+      Effect.logWarning('telegram-grammy: quote rejected, replying without it', err).pipe(
+        Effect.andThen(send(unquoted)),
+      ),
+    ),
+  );
+};
+
+/**
  * Retry-once helper: if the primary send fails with GrammyEntityError
  * (malformed entities — our mdast walker produced offsets Telegram's
  * validator rejected), retry with entities stripped and plain text.
@@ -126,19 +174,23 @@ const sendTextChunks = Effect.fn('telegram-grammy.sendTextChunks')(function* (
   messageThreadId: number | undefined,
   chunks: readonly FormattedString[],
   plain: boolean,
+  reply: ReplyParameters | undefined,
 ) {
   const { bot } = yield* BotService;
   let lastId: number | undefined;
-  for (const chunk of chunks) {
-    const sent = yield* Effect.tryPromise({
-      try: () =>
-        bot.api.sendMessage(chatId, chunk.text, {
-          entities: plain ? undefined : chunk.entities,
-          message_thread_id: messageThreadId,
-          link_preview_options: { is_disabled: true },
-        }),
-      catch: (err) => mapGrammyError(err, 'sendMessage', String(chatId)),
-    });
+  for (const [index, chunk] of chunks.entries()) {
+    const sent = yield* sendReplying(index, reply, (replyParameters) =>
+      Effect.tryPromise({
+        try: () =>
+          bot.api.sendMessage(chatId, chunk.text, {
+            entities: plain ? undefined : chunk.entities,
+            message_thread_id: messageThreadId,
+            link_preview_options: { is_disabled: true },
+            reply_parameters: replyParameters,
+          }),
+        catch: (err) => mapGrammyError(err, 'sendMessage', String(chatId)),
+      }),
+    );
     lastId = sent.message_id;
   }
   return lastId != null ? String(lastId) : undefined;
@@ -152,12 +204,14 @@ const sendSingleFile = (
   file: OutboundFile,
   caption: FormattedString | undefined,
   messageThreadId: number | undefined,
+  reply: ReplyParameters | undefined,
 ): Effect.Effect<string, GrammyDeliveryError> => {
   const input = new InputFile(file.data, file.filename);
   const baseOpts = {
     caption: caption?.text,
     caption_entities: caption?.entities,
     message_thread_id: messageThreadId,
+    reply_parameters: reply,
   };
   const method = `send-${kind}`;
   const mapId = (messageId: number): string => String(messageId);
@@ -245,6 +299,7 @@ const sendDefault = Effect.fn('telegram-grammy.sendDefault')(function* (
   messageThreadId: number | undefined,
   text: string,
   files: ReadonlyArray<OutboundFile>,
+  reply: ReplyParameters | undefined,
 ) {
   const { bot } = yield* BotService;
 
@@ -252,8 +307,8 @@ const sendDefault = Effect.fn('telegram-grammy.sendDefault')(function* (
     if (!text) return undefined;
     const fs = renderFS(text);
     const chunks = splitForBody(fs);
-    return yield* sendWithFallback(sendTextChunks(chatId, messageThreadId, chunks, false), () =>
-      sendTextChunks(chatId, messageThreadId, chunks, true),
+    return yield* sendWithFallback(sendTextChunks(chatId, messageThreadId, chunks, false, reply), () =>
+      sendTextChunks(chatId, messageThreadId, chunks, true, reply),
     );
   }
 
@@ -261,7 +316,9 @@ const sendDefault = Effect.fn('telegram-grammy.sendDefault')(function* (
     const file = files[0];
     const kind = mediaKindFromFilename(file.filename);
     const caption = text ? splitForCaption(renderFS(text))[0] : undefined;
-    return yield* sendSingleFile(bot, chatId, kind, file, caption, messageThreadId);
+    return yield* sendReplying(0, reply, (replyParameters) =>
+      sendSingleFile(bot, chatId, kind, file, caption, messageThreadId, replyParameters),
+    );
   }
 
   // Multiple files → sequential sendDocument. Telegram's media group API
@@ -270,19 +327,22 @@ const sendDefault = Effect.fn('telegram-grammy.sendDefault')(function* (
   // permissive path for arbitrary attachment bundles. For an opinionated
   // media group callers should use the `send_media_group` operation.
   let lastId: number | undefined;
-  let captionForFirst: FormattedString | undefined = text ? splitForCaption(renderFS(text))[0] : undefined;
-  for (const file of files) {
+  const caption: FormattedString | undefined = text ? splitForCaption(renderFS(text))[0] : undefined;
+  for (const [index, file] of files.entries()) {
     const input = new InputFile(file.data, file.filename);
-    const sent = yield* Effect.tryPromise({
-      try: () =>
-        bot.api.sendDocument(chatId, input, {
-          caption: captionForFirst?.text,
-          caption_entities: captionForFirst?.entities,
-          message_thread_id: messageThreadId,
-        }),
-      catch: (err) => mapGrammyError(err, 'sendDocument', String(chatId)),
-    });
-    captionForFirst = undefined;
+    const captionHere = index === 0 ? caption : undefined;
+    const sent = yield* sendReplying(index, reply, (replyParameters) =>
+      Effect.tryPromise({
+        try: () =>
+          bot.api.sendDocument(chatId, input, {
+            caption: captionHere?.text,
+            caption_entities: captionHere?.entities,
+            message_thread_id: messageThreadId,
+            reply_parameters: replyParameters,
+          }),
+        catch: (err) => mapGrammyError(err, 'sendDocument', String(chatId)),
+      }),
+    );
     lastId = sent.message_id;
   }
   return lastId != null ? String(lastId) : undefined;
@@ -364,6 +424,7 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
   messageThreadId: number | undefined,
   items: ReadonlyArray<{ path: string; caption?: string }>,
   files: ReadonlyArray<OutboundFile>,
+  reply: ReplyParameters | undefined,
 ) {
   if (items.length < 2 || items.length > 10) {
     yield* Effect.logWarning('telegram-grammy: send_media_group requires 2-10 items', { count: items.length });
@@ -399,23 +460,33 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
   if (mixedVisual && mixedDocs) {
     yield* Effect.logWarning('telegram-grammy: media group would mix types, falling back to sequential');
     let lastId: number | undefined;
-    for (const m of inputs) {
-      const sent = yield* Effect.tryPromise({
-        try: () =>
-          bot.api.sendDocument(chatId, m.media as InputFile, {
-            message_thread_id: messageThreadId,
-          }),
-        catch: (err) => mapGrammyError(err, 'sendDocument-fallback', String(chatId)),
-      });
+    for (const [index, m] of inputs.entries()) {
+      const sent = yield* sendReplying(index, reply, (replyParameters) =>
+        Effect.tryPromise({
+          try: () =>
+            bot.api.sendDocument(chatId, m.media as InputFile, {
+              message_thread_id: messageThreadId,
+              reply_parameters: replyParameters,
+            }),
+          catch: (err) => mapGrammyError(err, 'sendDocument-fallback', String(chatId)),
+        }),
+      );
       lastId = sent.message_id;
     }
     return lastId != null ? String(lastId) : undefined;
   }
 
-  const sent = yield* Effect.tryPromise({
-    try: () => bot.api.sendMediaGroup(chatId, inputs, { message_thread_id: messageThreadId }),
-    catch: (err) => mapGrammyError(err, 'sendMediaGroup', String(chatId)),
-  });
+  const sent = yield* sendReplying(0, reply, (replyParameters) =>
+    Effect.tryPromise({
+      // grammY 1.46 types each media-group family apart; the mixed-type check above narrows only at runtime.
+      try: () =>
+        bot.api.sendMediaGroup(chatId, inputs as Parameters<typeof bot.api.sendMediaGroup>[1], {
+          message_thread_id: messageThreadId,
+          reply_parameters: replyParameters,
+        }),
+      catch: (err) => mapGrammyError(err, 'sendMediaGroup', String(chatId)),
+    }),
+  );
   return sent.length > 0 ? String(sent[0].message_id) : undefined;
 });
 
@@ -485,6 +556,7 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
   const messageThreadId = resolveMessageThreadId(platformId, threadId);
   const topicScoped = parseTopicId(platformId) !== undefined;
   const files = message.files ?? [];
+  const reply = replyParametersFor(message, chatId);
 
   let result: string | undefined = undefined;
 
@@ -493,7 +565,7 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
   } else if (view.isReaction && view.reactionMessageId != null) {
     result = yield* reactToMessage(chatId, view.reactionMessageId, view.reactionEmoji);
   } else if (view.isMediaGroup && view.mediaGroupItems) {
-    result = yield* sendMediaGroup(chatId, messageThreadId, view.mediaGroupItems, files);
+    result = yield* sendMediaGroup(chatId, messageThreadId, view.mediaGroupItems, files, reply);
   } else if (view.isAskQuestion && view.askQuestionId != null && view.askTitle != null && view.askOptions) {
     result = yield* sendAskQuestion(
       chatId,
@@ -503,10 +575,9 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
       view.askQuestion ?? '',
       view.askOptions,
     );
-  } else if (view.isCard && view.cardFallbackText != null) {
-    result = yield* sendDefault(chatId, messageThreadId, view.cardFallbackText, files);
   } else {
-    result = yield* sendDefault(chatId, messageThreadId, view.text, files);
+    const text = view.isCard && view.cardFallbackText != null ? view.cardFallbackText : view.text;
+    result = yield* sendDefault(chatId, messageThreadId, text, files, reply);
   }
 
   // Remember which topic the bot's own message went to, so a user reaction

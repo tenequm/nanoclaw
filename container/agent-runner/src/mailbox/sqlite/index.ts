@@ -12,6 +12,7 @@ import {
   sqliteFindByRouting,
   sqliteFindCliResponse,
   sqliteFindQuestionResponse,
+  sqliteFindSeqByPlatformMessageId,
   sqliteGetAllDestinations,
   sqliteGetMessageIn,
   sqliteGetMessageIdBySeq,
@@ -165,6 +166,10 @@ export class SqliteAgentMailbox implements AgentMailbox {
         threadId: row.thread_id,
       })
     );
+  }
+
+  findSeqByPlatformMessageId(channelType: string, platformId: string, platformMessageId: string) {
+    return sqliteFindSeqByPlatformMessageId(channelType, platformId, platformMessageId);
   }
 
   getLatestInboundRoute(channelType: string, platformId: string) {

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS delivered (
   status              TEXT NOT NULL DEFAULT 'delivered',
   delivered_at        TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_delivered_platform_message ON delivered(platform_message_id);
 
 CREATE TABLE IF NOT EXISTS destinations (
   name            TEXT PRIMARY KEY,

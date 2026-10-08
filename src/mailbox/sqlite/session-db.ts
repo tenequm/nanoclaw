@@ -9,6 +9,7 @@ import Database from 'better-sqlite3';
 
 import { createInboundRecord } from '../model.js';
 import type { InboundWrite } from '../model.js';
+import type { ReplyTarget } from '../types.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
@@ -311,6 +312,7 @@ export function migrateDeliveredTable(db: Database.Database): void {
   if (!cols.has('status')) {
     db.prepare("ALTER TABLE delivered ADD COLUMN status TEXT NOT NULL DEFAULT 'delivered'").run();
   }
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_delivered_platform_message ON delivered(platform_message_id)').run();
 }
 
 // LEGACY-COMPAT(v1-tasks): adds columns added to messages_in after the initial
@@ -355,6 +357,27 @@ export function getInboundSourceSessionId(db: Database.Database, messageId: stri
     | { source_session_id: string | null }
     | undefined;
   return row?.source_session_id ?? null;
+}
+
+/**
+ * The inbound row a reply answers, and whether its chat got another message
+ * after it - what delivery needs to decide on a reply box. Reactions and
+ * edits are rows derived from an existing message, not newer messages.
+ */
+export function getReplyTarget(db: Database.Database, messageId: string): ReplyTarget | null {
+  const row = db.prepare('SELECT seq, channel_type, platform_id FROM messages_in WHERE id = ?').get(messageId) as
+    | { seq: number; channel_type: string | null; platform_id: string | null }
+    | undefined;
+  if (!row) return null;
+  const newer = db
+    .prepare(
+      `SELECT 1 FROM messages_in
+       WHERE channel_type IS ? AND platform_id IS ? AND seq > ? AND kind IN ('chat', 'chat-sdk')
+         AND id NOT LIKE '%:reaction:%' AND id NOT LIKE '%:edit:%'
+       LIMIT 1`,
+    )
+    .get(row.channel_type, row.platform_id, row.seq);
+  return { channelType: row.channel_type, platformId: row.platform_id, newerInChat: !!newer };
 }
 
 /**

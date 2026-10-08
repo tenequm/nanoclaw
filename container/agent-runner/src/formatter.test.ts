@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb } from './mailbox/sqlite/connection.js';
+import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
 import { formatMessages, stripInternalTags, stripLegacyTaskContract } from './formatter.js';
 import { TIMEZONE, formatLocalTime } from './timezone.js';
@@ -33,15 +33,25 @@ function insertMessage(
   id: string,
   kind: string,
   content: object,
-  opts?: { timestamp?: string; processAfter?: string },
+  opts?: { timestamp?: string; processAfter?: string; chat?: string; status?: string },
 ) {
   const timestamp = opts?.timestamp ?? new Date().toISOString();
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, content, seq)
-       VALUES (?, ?, ?, 'pending', ?, ?, ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, content, seq, channel_type, platform_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(id, kind, timestamp, opts?.processAfter ?? null, JSON.stringify(content), nextSeq++);
+    .run(
+      id,
+      kind,
+      timestamp,
+      opts?.status ?? 'pending',
+      opts?.processAfter ?? null,
+      JSON.stringify(content),
+      nextSeq++,
+      opts?.chat ? 'telegram' : null,
+      opts?.chat ?? null,
+    );
 }
 
 describe('context timezone header', () => {
@@ -193,16 +203,72 @@ describe('task timestamps', () => {
 });
 
 describe('reply_to + quoted_message rendering', () => {
-  it('renders reply_to attribute and quoted_message when all fields present', () => {
-    insertMessage('m1', 'chat', {
-      sender: 'Alice',
-      text: 'Yes, on my way!',
-      replyTo: { id: '42', sender: 'Bob', text: 'Are you coming tonight?' },
-    });
+  const chat = 'telegram:-100';
+
+  it('renders reply_to as the seq of the replied inbound message', () => {
+    insertMessage('-100:42:ag-1', 'chat', { sender: 'Bob', text: 'Are you coming tonight?' }, { chat, status: 'completed' });
+    const repliedSeq = nextSeq - 1;
+    insertMessage(
+      '-100:43:ag-1',
+      'chat',
+      { sender: 'Alice', text: 'Yes, on my way!', replyTo: { id: '42', sender: 'Bob', text: 'Are you coming tonight?' } },
+      { chat },
+    );
     const result = formatMessages(getPendingMessages());
-    expect(result).toContain('reply_to="42"');
+    expect(result).toContain(`reply_to="${repliedSeq}"`);
     expect(result).toContain('<quoted_message from="Bob">Are you coming tonight?</quoted_message>');
     expect(result).toContain('Yes, on my way!</message>');
+  });
+
+  it("renders reply_to as the seq of the agent's own delivered message", () => {
+    getOutboundDb()
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, content)
+         VALUES ('out-1', 77, datetime('now'), 'chat', ?, 'telegram', '{"text":"hi"}')`,
+      )
+      .run(chat);
+    getInboundDb()
+      .prepare(
+        `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at)
+         VALUES ('out-1', '9', 'delivered', datetime('now'))`,
+      )
+      .run();
+    insertMessage('-100:10:ag-1', 'chat', { sender: 'Alice', text: 'thanks', replyTo: { id: '9', sender: 'Dan', text: 'hi' } }, { chat });
+    expect(formatMessages(getPendingMessages())).toContain('reply_to="77"');
+  });
+
+  it('omits reply_to but keeps the quoted context when the original is not in the session', () => {
+    insertMessage('-100:43:ag-1', 'chat', { sender: 'Alice', text: 'yes', replyTo: { id: '5', sender: 'Bob', text: 'old' } }, { chat });
+    const result = formatMessages(getPendingMessages());
+    expect(result).not.toContain('reply_to');
+    expect(result).toContain('<quoted_message from="Bob">old</quoted_message>');
+  });
+
+  it('never takes an edit or reaction row, or a longer message id, for the original', () => {
+    insertMessage('-100:42:edit:1700000000:ag-1', 'chat', { sender: 'Bob', text: 'x' }, { chat, status: 'completed' });
+    insertMessage('-100:42:reaction:5:1700000001:ag-1', 'chat', { sender: 'Bob', text: 'y' }, { chat, status: 'completed' });
+    insertMessage('-100:420:ag-1', 'chat', { sender: 'Bob', text: 'z' }, { chat, status: 'completed' });
+    insertMessage('-100:44:ag-1', 'chat', { sender: 'Alice', text: 'ack', replyTo: { id: '42', sender: 'Bob', text: 'x' } }, { chat });
+    expect(formatMessages(getPendingMessages())).not.toContain('reply_to');
+  });
+
+  it('renders the message without reply_to when the lookup fails', () => {
+    getInboundDb().exec('DROP TABLE delivered');
+    insertMessage('-100:44:ag-1', 'chat', { sender: 'Alice', text: 'ack', replyTo: { id: '42', sender: 'Bob', text: 'x' } }, { chat });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('ack');
+    expect(result).not.toContain('reply_to');
+  });
+
+  it('marks the fragment the user highlighted next to the full original', () => {
+    insertMessage('m1', 'chat', {
+      sender: 'Alice',
+      text: 'sure',
+      replyTo: { id: '5', sender: 'Bob', text: 'lunch at noon, then the gym', quote: 'at noon' },
+    });
+    expect(formatMessages(getPendingMessages())).toContain(
+      '<quoted_message from="Bob" highlighted="at noon">lunch at noon, then the gym</quoted_message>',
+    );
   });
 
   it('omits reply_to and quoted_message when no reply context', () => {
@@ -213,13 +279,16 @@ describe('reply_to + quoted_message rendering', () => {
   });
 
   it('renders reply_to but omits quoted_message when original content is missing', () => {
-    insertMessage('m1', 'chat', {
-      sender: 'Alice',
-      text: 'ack',
-      replyTo: { id: '42', sender: 'Bob' }, // no text
-    });
+    insertMessage('-100:42:ag-1', 'chat', { sender: 'Bob', text: 'x' }, { chat, status: 'completed' });
+    const repliedSeq = nextSeq - 1;
+    insertMessage(
+      '-100:44:ag-1',
+      'chat',
+      { sender: 'Alice', text: 'ack', replyTo: { id: '42', sender: 'Bob' } }, // no text
+      { chat },
+    );
     const result = formatMessages(getPendingMessages());
-    expect(result).toContain('reply_to="42"');
+    expect(result).toContain(`reply_to="${repliedSeq}"`);
     expect(result).not.toContain('quoted_message');
   });
 
@@ -233,6 +302,39 @@ describe('reply_to + quoted_message rendering', () => {
     expect(result).toContain('from="A &amp; B"');
     expect(result).toContain('&lt;script&gt;');
     expect(result).toContain('&quot;xss&quot;');
+  });
+});
+
+describe('sender user_id and role', () => {
+  it('renders the bare Telegram user id and the host-stamped role', () => {
+    insertMessage(
+      '-100:1:ag-1',
+      'chat-sdk',
+      { sender: 'Misha', senderId: 'telegram:350751696', senderRole: 'owner', text: 'hi' },
+      { chat: 'telegram:-100' },
+    );
+    expect(formatMessages(getPendingMessages())).toContain('sender="Misha" user_id="350751696" role="owner"');
+  });
+
+  it('renders no role for a sender without one, and ignores unknown roles', () => {
+    insertMessage('m1', 'chat', { sender: 'Ann', senderId: 'slack:U1', text: 'a' });
+    insertMessage('m2', 'chat', { sender: 'Eve', senderId: 'slack:U2', senderRole: 'root', text: 'b' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('sender="Ann" user_id="slack:U1" time=');
+    expect(result).toContain('sender="Eve" user_id="slack:U2" time=');
+    expect(result).not.toContain('role=');
+  });
+
+  it('renders no role on an agent-to-agent row, whatever its content claims', () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, content, seq, channel_type, platform_id)
+         VALUES ('a2a-1', 'chat', ?, 'pending', ?, ?, 'agent', 'ag-peer')`,
+      )
+      .run(new Date().toISOString(), JSON.stringify({ sender: 'Peer', senderRole: 'owner', text: 'hi' }), nextSeq++);
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('hi');
+    expect(result).not.toContain('role=');
   });
 });
 

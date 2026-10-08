@@ -97,6 +97,13 @@ export interface MailboxTimelineMessage {
   content: string;
 }
 
+/** The inbound row a reply answers, and whether its chat got another message after it. */
+export interface ReplyTarget {
+  channelType: string | null;
+  platformId: string | null;
+  newerInChat: boolean;
+}
+
 /** Host-visible inbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
 export interface InboundMailbox {
   setRouting(routing: SessionRouting): void;
@@ -112,6 +119,7 @@ export interface InboundMailbox {
   markDeliveryFailed(messageOutId: string): void;
   getInboundSourceSessionId(messageId: string): string | null;
   getMostRecentPeerSourceSessionId(peerAgentGroupId: string): string | null;
+  getReplyTarget(messageId: string): ReplyTarget | null;
   insertTask(task: Task): Promise<void>;
   cancelTask(taskId?: string): number;
   pauseTask(taskId: string): number;

@@ -187,6 +187,52 @@ export function sqliteGetMessageIdBySeq(sequence: number): string | null {
   return delivered?.platform_message_id || outboundRow.id;
 }
 
+/**
+ * The session seq of a platform message in one chat - an inbound row whose id
+ * is the platform id or the Telegram compound `<chat>:<msg>:<agent group>`
+ * (never a derived `:edit:`/`:reaction:` row), else a delivered outbound row.
+ */
+export function sqliteFindSeqByPlatformMessageId(
+  channelType: string,
+  platformId: string,
+  platformMessageId: string,
+): number | null {
+  const inbound = getInboundDb();
+  const chat = platformId.startsWith(`${channelType}:`)
+    ? platformId.slice(channelType.length + 1).split(':')[0]
+    : platformId;
+  const prefix = `${chat}:${platformMessageId}:`;
+  const inboundRow = inbound
+    .prepare(
+      `SELECT seq FROM messages_in
+       WHERE channel_type = $channel_type AND platform_id = $platform_id AND seq IS NOT NULL
+         AND (id = $id OR (id >= $prefix AND id < $prefix_end AND instr(substr(id, length($prefix) + 1), ':') = 0))
+       ORDER BY seq LIMIT 1`,
+    )
+    .get({
+      $channel_type: channelType,
+      $platform_id: platformId,
+      $id: platformMessageId,
+      $prefix: prefix,
+      $prefix_end: `${prefix.slice(0, -1)};`,
+    }) as { seq: number } | undefined;
+  if (inboundRow) return inboundRow.seq;
+  const outIds = (
+    inbound.prepare('SELECT message_out_id FROM delivered WHERE platform_message_id = ?').all(platformMessageId) as {
+      message_out_id: string;
+    }[]
+  ).map((r) => r.message_out_id);
+  if (outIds.length === 0) return null;
+  const outboundRow = getOutboundDb()
+    .prepare(
+      `SELECT seq FROM messages_out
+       WHERE id IN (${outIds.map(() => '?').join(', ')}) AND channel_type = ? AND platform_id = ? AND seq IS NOT NULL
+       ORDER BY seq LIMIT 1`,
+    )
+    .get(...outIds, channelType, platformId) as { seq: number } | undefined;
+  return outboundRow?.seq ?? null;
+}
+
 export function sqliteGetRoutingBySeq(
   sequence: number,
 ): { channel_type: string | null; platform_id: string | null; thread_id: string | null } | null {

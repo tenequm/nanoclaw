@@ -3,13 +3,20 @@
  *
  * Every grammY call is wrapped in `Effect.tryPromise` whose catch handler
  * invokes `mapGrammyError`. Entity parse failures remain distinct for the
- * plain-text retry; other API responses share one tagged error, while
+ * plain-text retry and a rejected reply quote for the unquoted retry; other
+ * API responses share one tagged error, while
  * transport failures use `GrammyNetworkError`.
  */
 import { Schema } from 'effect';
 import { GrammyError } from 'grammy';
 
 export class GrammyEntityError extends Schema.TaggedErrorClass<GrammyEntityError>()('GrammyEntityError', {
+  chatId: Schema.String,
+  method: Schema.String,
+  description: Schema.String,
+}) {}
+
+export class GrammyQuoteError extends Schema.TaggedErrorClass<GrammyQuoteError>()('GrammyQuoteError', {
   chatId: Schema.String,
   method: Schema.String,
   description: Schema.String,
@@ -62,8 +69,10 @@ export class PairingFailed extends Schema.TaggedErrorClass<PairingFailed>()('Pai
   cause: Schema.Defect,
 }) {}
 
-export type GrammyDeliveryError = GrammyEntityError | GrammyApiError | GrammyNetworkError;
+export type GrammyDeliveryError = GrammyEntityError | GrammyQuoteError | GrammyApiError | GrammyNetworkError;
 
+// Word-initial, so a blockquote entity error stays an entity error.
+const QUOTE_RE = /\bquote/i;
 const ENTITY_RE = /(entity|entities|offset|parse|byte)/i;
 
 /**
@@ -78,6 +87,9 @@ export function mapGrammyError(err: unknown, method: string, chatId: string): Gr
   if (err instanceof GrammyError) {
     const code = err.error_code;
     const description = err.description;
+    if (code === 400 && QUOTE_RE.test(description)) {
+      return new GrammyQuoteError({ chatId, method, description });
+    }
     if (code === 400 && ENTITY_RE.test(description)) {
       return new GrammyEntityError({ chatId, method, description });
     }

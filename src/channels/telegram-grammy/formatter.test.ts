@@ -10,6 +10,7 @@
  * chunked output preserves entity offsets across slice boundaries.
  */
 import { describe, expect, it } from 'vitest';
+import { FormattedString } from '@grammyjs/parse-mode';
 
 import { renderFS, splitForBody, TELEGRAM_TEXT_LIMIT } from './formatter.js';
 
@@ -223,6 +224,13 @@ describe('User mention links (tg://user?id=N)', () => {
     expect(link).toBeDefined();
     expect((link as { url: string }).url).toBe('tg://user?id=12345');
     expect(fs.text).toContain('Alex');
+  });
+
+  it('renders the agent-written mention exactly as grammY mentionUser does', () => {
+    const fs = renderFS('[Alex](tg://user?id=350751696)');
+    const expected = FormattedString.mentionUser('Alex', 350751696);
+    expect(fs.text).toBe(expected.text);
+    expect(fs.entities).toEqual(expected.entities);
   });
 
   it('emits regular text_link for normal URLs', () => {
