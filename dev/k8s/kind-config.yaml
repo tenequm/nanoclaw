@@ -1,0 +1,8 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: nanoclaw-dev
+nodes:
+  - role: control-plane
+    # The node image kind v0.33.0 ships with, pinned so a kind upgrade does not
+    # silently move the Kubernetes version under the playground.
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5

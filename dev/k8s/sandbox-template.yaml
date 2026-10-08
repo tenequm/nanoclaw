@@ -1,0 +1,24 @@
+# The agent image as a Sandbox. `sleep infinity` replaces the image's
+# entrypoint.sh: the agent-runner needs its mailbox mounts to start, so this
+# proves scheduling and lifecycle only. tini stays PID 1 because a bare sleep
+# ignores SIGTERM, which turns every suspend into a 30s grace-period kill.
+# up.sh substitutes the image.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: nanoclaw-agent
+  namespace: default
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nanoclaw-agent
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: agent
+          image: __NANOCLAW_K8S_IMAGE__
+          # The image only exists inside the kind node (kind load), never in a
+          # registry, so a pull must never be attempted.
+          imagePullPolicy: Never
+          command: ["/usr/bin/tini", "--", "sleep", "infinity"]
