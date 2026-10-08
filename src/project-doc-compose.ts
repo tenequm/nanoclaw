@@ -160,9 +160,8 @@ const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mc
 const SKILLS_HOST_SUBPATH = path.join('container', 'skills');
 
 /** A section a host module contributes for the agents it applies to; null for every other agent. */
-export type ProjectDocSectionProvider = (
-  group: AgentGroup,
-) => { name: string; body: string } | null | Promise<{ name: string; body: string } | null>;
+export type ProjectDocSectionProvider = (group: AgentGroup) => ProvidedSection | Promise<ProvidedSection>;
+type ProvidedSection = { name: string; body: string } | null;
 
 /** Whether a resident skill's `instructions.md` belongs in this agent's document at all. */
 export type ResidentSkillGate = (group: AgentGroup) => boolean | Promise<boolean>;
@@ -187,8 +186,8 @@ export function registerResidentSkillGate(skillName: string, gate: ResidentSkill
 }
 
 /**
- * A gate that throws keeps its skill out: a missing rule costs one spawn of
- * that agent, a wrong one teaches every agent the channel's rules.
+ * A gate that throws keeps its skill out: a missing rule costs that agent the
+ * rule until its next spawn, a wrong one teaches every agent the channel's rules.
  */
 async function residentSkillAdmitted(skillName: string, group: AgentGroup): Promise<boolean> {
   const gate = residentSkillGates.get(skillName);
@@ -196,7 +195,7 @@ async function residentSkillAdmitted(skillName: string, group: AgentGroup): Prom
   try {
     return await gate(group);
   } catch (err) {
-    log.warn('Resident skill gate threw; skill left out of the project document', {
+    log.error('Resident skill gate threw; skill left out of the project document', {
       skill: skillName,
       group: group.name,
       err,
@@ -279,7 +278,7 @@ export async function composeGroupProjectDoc(
       const section = await provider(group);
       if (section) push(section.name, section.body, true);
     } catch (err) {
-      log.warn('Project document section provider threw; section left out', { group: group.name, err });
+      log.error('Project document section provider threw; section left out', { group: group.name, err });
     }
   }
 

@@ -102,7 +102,10 @@ container/skills/voice-mode-formatting/instructions.md
 ```
 
 An explicit group skill list must include `voice-mode-formatting`.
-The host composes the instructions into the agent's project document.
+The host composes the instructions into the project document only for agents
+that take calls (a voice-mode line, or a wired legacy `voice` chat); a listed
+skill on any other agent composes nothing. A first line for a running agent
+reaches its instructions on the next spawn.
 
 ### 2. Install dependencies and build
 

@@ -80,7 +80,8 @@ registerResource({
     update: {
       access: 'approval',
       description:
-        'Create or change the gate config for one agent group. Only the flags you pass change; the rest keep their current (or default) value.',
+        'Create or change the gate config for one agent group. Only the flags you pass change; the rest keep their current (or default) value. ' +
+        "A change to enabled or mode reaches the agent's instructions on its next spawn (`ncl groups restart`).",
       args: [
         { name: 'group', type: 'string', required: true, description: 'Agent group id.' },
         { name: 'enabled', type: 'boolean', description: 'Turn the gate on or off.' },
