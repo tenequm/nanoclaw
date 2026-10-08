@@ -358,6 +358,26 @@ export function getInboundSourceSessionId(db: Database.Database, messageId: stri
 }
 
 /**
+ * The inbound row a reply answers, and whether its chat got another inbound
+ * message after it — what delivery needs to decide on a reply box.
+ */
+export function getReplyTarget(
+  db: Database.Database,
+  messageId: string,
+): { channelType: string | null; platformId: string | null; content: string; newerInChat: boolean } | null {
+  const row = db
+    .prepare('SELECT seq, channel_type, platform_id, content FROM messages_in WHERE id = ?')
+    .get(messageId) as
+    | { seq: number; channel_type: string | null; platform_id: string | null; content: string }
+    | undefined;
+  if (!row) return null;
+  const newer = db
+    .prepare('SELECT 1 FROM messages_in WHERE channel_type IS ? AND platform_id IS ? AND seq > ? LIMIT 1')
+    .get(row.channel_type, row.platform_id, row.seq);
+  return { channelType: row.channel_type, platformId: row.platform_id, content: row.content, newerInChat: !!newer };
+}
+
+/**
  * Find the source_session_id of the most recent a2a inbound row from a
  * specific peer (by agent group id). Used as a peer-affinity fallback in
  * a2a routing when an outbound reply has no `in_reply_to` (e.g. the

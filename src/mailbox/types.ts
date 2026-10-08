@@ -112,6 +112,9 @@ export interface InboundMailbox {
   markDeliveryFailed(messageOutId: string): void;
   getInboundSourceSessionId(messageId: string): string | null;
   getMostRecentPeerSourceSessionId(peerAgentGroupId: string): string | null;
+  getReplyTarget(
+    messageId: string,
+  ): { channelType: string | null; platformId: string | null; content: string; newerInChat: boolean } | null;
   insertTask(task: Task): Promise<void>;
   cancelTask(taskId?: string): number;
   pauseTask(taskId: string): number;

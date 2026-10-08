@@ -16,6 +16,7 @@ import {
   getMessageForRetry,
   getMostRecentPeerSourceSessionId,
   getProcessingClaims,
+  getReplyTarget,
   insertMessage,
   markDelivered,
   markDeliveryFailed,
@@ -218,6 +219,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
     markDeliveryFailed: (messageOutId) => markDeliveryFailed(db, messageOutId),
     getInboundSourceSessionId: (messageId) => getInboundSourceSessionId(db, messageId),
     getMostRecentPeerSourceSessionId: (peerAgentGroupId) => getMostRecentPeerSourceSessionId(db, peerAgentGroupId),
+    getReplyTarget: (messageId) => getReplyTarget(db, messageId),
     insertTask: async (task) => insertTaskRow(db, task, nextSequence()),
     armNextTask: async (originalId, task) => {
       const sequence = nextSequence();

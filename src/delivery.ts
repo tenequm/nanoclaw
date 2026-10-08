@@ -755,6 +755,8 @@ async function deliverMessage(
     rewritten.messageId = platformMessageId(content.messageId, session.agent_group_id);
   }
   if (reaction.kind === 'substituted') rewritten.emoji = reaction.emoji;
+  const threadReply = await resolveThreadReply(msg, content, session);
+  if (threadReply !== undefined || 'threadReply' in content) rewritten.threadReply = threadReply;
   const outboundContent =
     Object.keys(rewritten).length > 0 ? JSON.stringify({ ...content, ...rewritten }) : msg.content;
 
@@ -794,6 +796,52 @@ async function deliverMessage(
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
   return platformMsgId;
+}
+
+/**
+ * Whether a reply shows as one (a reply box), carried to the adapter as
+ * `content.threadReply`. The agent's explicit `reply_to`/`quote` (the
+ * container writes `threadReply`) always threads; a default reply threads
+ * only when newer inbound messages arrived in that chat after the one it
+ * answers, so a reply to the latest message stays plain. A quote that is not
+ * in the stored original is dropped here — Telegram rejects the whole send
+ * for it — and the reply still threads.
+ */
+async function resolveThreadReply(
+  msg: { channelType: string | null; platformId: string | null; inReplyTo: string | null },
+  content: Record<string, unknown>,
+  session: Session,
+): Promise<{ quote?: string } | undefined> {
+  if (!msg.inReplyTo || !msg.channelType || !msg.platformId) return undefined;
+  const inReplyTo = msg.inReplyTo;
+  const explicit =
+    typeof content.threadReply === 'object' && content.threadReply !== null
+      ? (content.threadReply as { quote?: unknown })
+      : null;
+  const target = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.getReplyTarget(inReplyTo),
+  );
+  if (!explicit) {
+    const sameChat = target?.channelType === msg.channelType && target.platformId === msg.platformId;
+    return sameChat && target.newerInChat ? {} : undefined;
+  }
+  const quote = typeof explicit.quote === 'string' && explicit.quote ? explicit.quote : undefined;
+  if (!quote) return {};
+  if (!target) return { quote };
+  let original = '';
+  try {
+    const parsed = JSON.parse(target.content) as { text?: unknown };
+    if (typeof parsed.text === 'string') original = parsed.text;
+  } catch {
+    // Unparseable original: nothing to match the quote against.
+  }
+  return quoteInText(quote, original) ? { quote } : {};
+}
+
+/** Inbound text is stored as markdown, so markers are ignored on both sides. */
+export function quoteInText(quote: string, text: string): boolean {
+  const bare = (s: string): string => s.replace(/[*_~`]/g, '');
+  return text.includes(quote) || bare(text).includes(bare(quote));
 }
 
 /**
