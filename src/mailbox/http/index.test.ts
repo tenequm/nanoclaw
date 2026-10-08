@@ -62,12 +62,12 @@ describe('HttpServedAgentMailbox', () => {
 
   it('hands the runner the endpoint and a fresh per-spawn token, never in its environment', async () => {
     const mailbox = new HttpServedAgentMailbox(new SqliteAgentMailbox(), () => httpSettings);
-    const first = (await mailbox.runnerContext(KEY)) as { transport: string; url: string; token: string };
+    const first = (await mailbox.runnerContext(KEY))!;
     expect(first).toMatchObject({ transport: 'http', protocol: 1, url: `http://host.test:1${MAILBOX_HTTP_PATH}` });
     expect(first.token).toMatch(/^[0-9a-f]{64}$/);
     expect(await mailbox.runnerEnvironment(KEY)).toEqual({});
 
-    const second = (await mailbox.runnerContext(KEY)) as { token: string };
+    const second = (await mailbox.runnerContext(KEY))!;
     expect(second.token).not.toBe(first.token);
     expect(mailbox.verifyToken(KEY, second.token)).toBe(true);
     expect(mailbox.verifyToken(KEY, first.token), 'a replaced container is fenced out').toBe(false);
@@ -108,7 +108,7 @@ describe('HttpServedAgentMailbox', () => {
   it('touches the same heartbeat file the host sweep reads', async () => {
     const mailbox = new HttpServedAgentMailbox(new SqliteAgentMailbox(), () => httpSettings);
     mailbox.prepare(KEY);
-    const context = (await mailbox.runnerContext(KEY)) as { token: string };
+    const context = (await mailbox.runnerContext(KEY))!;
     await mailbox.listen();
     const response = await fetch(`http://127.0.0.1:${mailbox.address()!.port}${MAILBOX_HTTP_PATH}`, {
       method: 'POST',

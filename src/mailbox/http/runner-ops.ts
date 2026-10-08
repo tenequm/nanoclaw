@@ -12,7 +12,6 @@ import type Database from 'better-sqlite3';
 import { log } from '../../log.js';
 import {
   createOutboundRecord,
-  parseContainerRecord,
   parseDestinationRecord,
   parseInboundRecord,
   parseOutboundRecord,
@@ -26,18 +25,17 @@ import {
   type SessionRoutingRecord,
   type StateRecord,
 } from '../model.js';
+import { sqliteTimestamp } from '../sqlite/index.js';
+import { OUTBOUND_SCHEMA } from '../sqlite/schema.js';
 
 /** How many recent rows a fresh replica receives per table. */
-export const SNAPSHOT_WINDOW = 500;
+const SNAPSHOT_WINDOW = 500;
 
 const PROCESSING_STATUSES = new Set<ProcessingStatus>(['processing', 'completed', 'failed', 'script-skip:error']);
 const TURN_STATES = new Set(['working', 'idle']);
-const SQLITE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
 
 /** A caller mistake (HTTP 400): bad op name, bad arguments, or a record that fails validation. */
-export class MailboxRequestError extends Error {
-  readonly status = 400;
-}
+export class MailboxRequestError extends Error {}
 
 export interface RunnerSession {
   inbound: Database.Database;
@@ -71,12 +69,6 @@ export interface RunnerSnapshot {
 }
 
 type Row = Record<string, unknown>;
-
-function sqliteTimestamp(value: string): string {
-  const source = SQLITE_TIMESTAMP.test(value) ? `${value.replace(' ', 'T')}Z` : value;
-  const milliseconds = Date.parse(source);
-  return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : value;
-}
 
 function nullableTimestamp(value: unknown): string | null {
   return value === null || value === undefined ? null : sqliteTimestamp(String(value));
@@ -130,6 +122,16 @@ function outboundRecord(row: Row): OutboundRecord | undefined {
   }
 }
 
+/** Destination/state rows get the same containment: one bad row never blocks the mailbox. */
+function contained<T>(kind: string, parse: () => T): T | undefined {
+  try {
+    return parse();
+  } catch (err) {
+    log.warn(`Skipping invalid ${kind} mailbox row`, { err });
+    return undefined;
+  }
+}
+
 function defined<T>(value: T | undefined): value is T {
   return value !== undefined;
 }
@@ -149,29 +151,19 @@ function windowRows(db: Database.Database, table: 'messages_in' | 'messages_out'
     .all(SNAPSHOT_WINDOW) as Row[];
 }
 
-/** The tables the runner creates lazily on its own first open (older outbound.db files lack them). */
+/**
+ * What the runner does lazily on its own first open (container/agent-runner/src/mailbox/sqlite/connection.ts):
+ * older outbound.db files lack tables and columns, and carry legacy empty `updated_at` values.
+ */
 export function ensureRunnerOutboundTables(outbound: Database.Database): void {
-  outbound.exec(`
-    CREATE TABLE IF NOT EXISTS session_state (
-      key        TEXT PRIMARY KEY,
-      value      TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS container_state (
-      id                       INTEGER PRIMARY KEY CHECK (id = 1),
-      current_tool             TEXT,
-      tool_declared_timeout_ms INTEGER,
-      tool_started_at          TEXT,
-      turn                     TEXT,
-      updated_at               TEXT NOT NULL
-    );
-  `);
+  outbound.exec(OUTBOUND_SCHEMA);
   const stateColumns = new Set(
     (outbound.prepare("PRAGMA table_info('session_state')").all() as Array<{ name: string }>).map((c) => c.name),
   );
   if (!stateColumns.has('updated_at')) {
     outbound.exec(`ALTER TABLE session_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'`);
   }
+  outbound.exec(`UPDATE session_state SET updated_at = '1970-01-01T00:00:00.000Z' WHERE updated_at = ''`);
   const containerColumns = new Set(
     (outbound.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((c) => c.name),
   );
@@ -183,7 +175,7 @@ export function ensureRunnerOutboundTables(outbound: Database.Database): void {
  * id is the platform id or the Telegram compound `<chat>:<msg>:<agent group>`
  * (never a derived `:edit:`/`:reaction:` row), else a delivered outbound row.
  */
-export function findSeqByPlatformMessageId(
+function findSeqByPlatformMessageId(
   session: RunnerSession,
   channelType: string,
   platformId: string,
@@ -295,11 +287,13 @@ function snapshot(session: RunnerSession, cursor: SnapshotCursor | null): Runner
         | Row
         | undefined)
     : undefined;
+  const noRouting: SessionRoutingRecord = { channelType: null, platformId: null, threadId: null };
 
   return {
+    // Advanced only past rows actually sent, so a row committed mid-snapshot is never skipped.
     cursor: {
-      inbound: Math.max(cursor?.inbound ?? 0, maxSeq(inbound, 'messages_in')),
-      outbound: Math.max(cursor?.outbound ?? 0, maxSeq(outbound, 'messages_out')),
+      inbound: Math.max(cursor?.inbound ?? 0, Number(inboundRows.at(-1)?.seq ?? 0)),
+      outbound: Math.max(cursor?.outbound ?? 0, Number(outboundRows.at(-1)?.seq ?? 0)),
       delivered: Math.max(cursor?.delivered ?? 0, deliveredRows.at(-1)?.rowid ?? 0),
     },
     pending: pendingRows.map(inboundRecord).filter(defined),
@@ -312,28 +306,41 @@ function snapshot(session: RunnerSession, cursor: SnapshotCursor | null): Runner
     })),
     latestRoutes,
     replySeqs,
-    destinations: (inbound.prepare('SELECT * FROM destinations ORDER BY name').all() as Row[]).map((row) =>
-      parseDestinationRecord({
-        name: row.name,
-        displayName: row.display_name,
-        type: row.type,
-        channelType: row.channel_type,
-        platformId: row.platform_id,
-        agentGroupId: row.agent_group_id,
-      }),
-    ),
-    routing: parseSessionRoutingRecord({
-      channelType: routingRow?.channel_type ?? null,
-      platformId: routingRow?.platform_id ?? null,
-      threadId: routingRow?.thread_id ?? null,
-    }),
+    destinations: (inbound.prepare('SELECT * FROM destinations ORDER BY name').all() as Row[])
+      .map((row) =>
+        contained('destination', () =>
+          parseDestinationRecord({
+            name: row.name,
+            displayName: row.display_name,
+            type: row.type,
+            channelType: row.channel_type,
+            platformId: row.platform_id,
+            agentGroupId: row.agent_group_id,
+          }),
+        ),
+      )
+      .filter(defined),
+    routing:
+      contained('session routing', () =>
+        parseSessionRoutingRecord({
+          channelType: routingRow?.channel_type ?? null,
+          platformId: routingRow?.platform_id ?? null,
+          threadId: routingRow?.thread_id ?? null,
+        }),
+      ) ?? noRouting,
     state: (
       outbound.prepare('SELECT key, value, updated_at FROM session_state ORDER BY key').all() as Array<{
         key: string;
         value: string;
         updated_at: string;
       }>
-    ).map((row) => parseStateRecord({ key: row.key, value: row.value, updatedAt: sqliteTimestamp(row.updated_at) })),
+    )
+      .map((row) =>
+        contained('session state', () =>
+          parseStateRecord({ key: row.key, value: row.value, updatedAt: sqliteTimestamp(row.updated_at) }),
+        ),
+      )
+      .filter(defined),
   };
 }
 
@@ -400,16 +407,8 @@ function parseCursor(value: unknown): SnapshotCursor | null {
 
 type RunnerOp = (session: RunnerSession, args: unknown[]) => unknown;
 
-/** Operation table: name -> implementation. Unknown names are a 400. */
 export const RUNNER_OPS: Record<string, RunnerOp> = {
   snapshot: (session, [cursor]) => snapshot(session, parseCursor(cursor)),
-  findSeqByPlatformMessageId: (session, [channelType, platformId, platformMessageId]) =>
-    findSeqByPlatformMessageId(
-      session,
-      stringArg(channelType, 'channelType'),
-      stringArg(platformId, 'platformId'),
-      stringArg(platformMessageId, 'platformMessageId'),
-    ),
   heartbeat: (session) => session.touchHeartbeat(),
   writeMessageOut: (session, [draft]) => writeMessageOut(session, draft),
   markMessages: (session, [ids, status]) => {
@@ -443,13 +442,6 @@ export const RUNNER_OPS: Record<string, RunnerOp> = {
         ? declaredTimeoutMs
         : null;
     const now = new Date().toISOString();
-    const record = parseContainerRecord({
-      currentTool: stringArg(tool, 'tool'),
-      toolDeclaredTimeoutMs: timeout,
-      toolStartedAt: now,
-      turn: null,
-      updatedAt: now,
-    });
     session.outbound
       .prepare(
         `INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at, updated_at)
@@ -460,7 +452,7 @@ export const RUNNER_OPS: Record<string, RunnerOp> = {
            tool_started_at = excluded.tool_started_at,
            updated_at = excluded.updated_at`,
       )
-      .run(record.currentTool, record.toolDeclaredTimeoutMs, now, now);
+      .run(stringArg(tool, 'tool'), timeout, now, now);
   },
   clearContainerToolInFlight: (session) => {
     session.outbound
@@ -499,7 +491,7 @@ export interface RunnerOpCall {
 
 /**
  * Run a batch atomically on the outbound side: every write commits together or
- * none does. Returns only after the synchronous SQLite commit — the caller
+ * none does. Returns only after the synchronous SQLite commit; the caller
  * answers the HTTP request after this, which is what makes the runner's async
  * writes durable when their promise resolves.
  */

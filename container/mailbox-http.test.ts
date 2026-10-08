@@ -14,8 +14,14 @@ vi.mock('../src/config.js', async () => {
 });
 
 import { HttpServedAgentMailbox, type MailboxHttpSettings } from '../src/mailbox/http/index.js';
+import { RUNNER_OPS } from '../src/mailbox/http/runner-ops.js';
+import { MAILBOX_HTTP_PROTOCOL as HOST_PROTOCOL } from '../src/mailbox/http/server.js';
 import { heartbeatPath } from '../src/session-manager.js';
-import { HttpAgentMailbox, MailboxTransportError } from './agent-runner/src/mailbox/http/index.js';
+import {
+  HttpAgentMailbox,
+  MAILBOX_HTTP_PROTOCOL as RUNNER_PROTOCOL,
+  MailboxTransportError,
+} from './agent-runner/src/mailbox/http/index.js';
 
 const KEY = { agentGroupId: 'ag-e2e', sessionId: 'sess-e2e' };
 
@@ -47,25 +53,28 @@ async function spawnRunner(options = {}): Promise<HttpAgentMailbox> {
 
 beforeEach(async () => {
   runners = [];
-  let port = 0;
   const settings: MailboxHttpSettings = {
     transport: 'http',
     bind: '127.0.0.1',
-    get port() {
-      return port;
-    },
+    port: 0,
     get url() {
       return `http://127.0.0.1:${host.address()!.port}`;
     },
   };
   host = new HttpServedAgentMailbox(undefined, () => settings);
   await host.listen();
-  port = host.address()!.port;
   host.prepare(KEY);
   await host.session(KEY, async (mailbox) => {
     mailbox.setRouting({ channelType: 'test', platformId: 'room', threadId: null });
     mailbox.replaceDestinations([
-      { name: 'room', displayName: 'Room', type: 'channel', channelType: 'test', platformId: 'room', agentGroupId: null },
+      {
+        name: 'room',
+        displayName: 'Room',
+        type: 'channel',
+        channelType: 'test',
+        platformId: 'room',
+        agentGroupId: null,
+      },
     ]);
   });
 });
@@ -79,6 +88,49 @@ afterEach(async () => {
 afterAll(() => fs.rmSync(TEST_DIR, { recursive: true, force: true }));
 
 describe('HTTP mailbox transport, host and runner together', () => {
+  it('agree on the protocol, and the host serves every op the runner sends', async () => {
+    expect(RUNNER_PROTOCOL).toBe(HOST_PROTOCOL);
+    const sent = new Set<string>();
+    const runner = await spawnRunner();
+    const { operations } = runner;
+    operations.markMessages([], 'completed');
+    operations.markScriptSkipped([]);
+    operations.setState('k', 'v');
+    operations.deleteState('k');
+    operations.setContainerToolInFlight('Bash', 1);
+    operations.clearContainerToolInFlight();
+    operations.markContainerTurn('idle');
+    operations.clearStaleProcessingAcks();
+    runner.heartbeat();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      for (const { op } of (JSON.parse(String(init?.body)) as { ops: Array<{ op: string }> }).ops) sent.add(op);
+      return realFetch(input, init);
+    }) as typeof fetch;
+    try {
+      await operations.writeMessageOut({ id: 'out-ops', kind: 'chat', content: '{}' });
+      await runner.run(() => undefined);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect([...sent].sort()).toEqual(
+      [
+        'clearContainerToolInFlight',
+        'clearStaleProcessingAcks',
+        'deleteState',
+        'heartbeat',
+        'markContainerTurn',
+        'markMessages',
+        'markScriptSkipped',
+        'setContainerToolInFlight',
+        'setState',
+        'snapshot',
+        'writeMessageOut',
+      ].sort(),
+    );
+    for (const op of sent) expect(Object.hasOwn(RUNNER_OPS, op), op).toBe(true);
+  });
+
   it('carries a full turn: inbound, claim, reply, delivery bookkeeping', async () => {
     await host.session(KEY, (mailbox) => mailbox.insertMessage(chat('in-1')));
     const runner = await spawnRunner();
@@ -146,9 +198,10 @@ describe('HTTP mailbox transport, host and runner together', () => {
   it('fences out a replaced container: its next exchange is refused and it fails closed', async () => {
     const old = await spawnRunner();
     await spawnRunner(); // respawn rotates the session token
-    await expect(old.run(() => undefined)).rejects.toThrow(MailboxTransportError);
+    const refused = await old.run(() => undefined).catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(MailboxTransportError);
+    expect(old.shouldRestartAfter(refused)).toBe(true);
     expect(() => old.operations.getPendingMessages(10, false)).toThrow('unauthorized');
-    expect(old.shouldRestartAfter(new MailboxTransportError('x', true))).toBe(true);
   });
 
   it('refuses a session the host never prepared, without creating its storage', async () => {

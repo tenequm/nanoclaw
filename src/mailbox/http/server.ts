@@ -26,7 +26,7 @@ export const MAILBOX_HTTP_PROTOCOL = 1;
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 
-export interface MailboxHttpServerOptions {
+interface MailboxHttpServerOptions {
   /** Side-effect-free probe; a session without storage is a 404, never provisioned here. */
   exists(key: MailboxSessionKey): Promise<boolean>;
   verifyToken(key: MailboxSessionKey, token: string): boolean;
@@ -81,12 +81,22 @@ function parseCalls(body: unknown): RunnerOpCall[] {
   });
 }
 
+/**
+ * The heartbeat file sits in the directory the container mounts read-write, so
+ * never follow a link the agent planted there. Best effort: a missing beat is
+ * the sweep's business, not a reason to fail the batch.
+ */
 function touch(file: string): void {
   const now = new Date();
   try {
-    fs.utimesSync(file, now, now);
-  } catch {
-    fs.writeFileSync(file, '');
+    const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o644);
+    try {
+      fs.futimesSync(fd, now, now);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    log.warn('Mailbox heartbeat touch failed', { file, err });
   }
 }
 
@@ -115,7 +125,7 @@ export function createMailboxHttpServer(options: MailboxHttpServerOptions): http
     let outbound: Database.Database | undefined;
     try {
       inbound.pragma('busy_timeout = 5000');
-      outbound = openOutboundDbRw(paths.outbound);
+      outbound = openOutboundDbRw(paths.outbound, { fileMustExist: true });
       if (!prepared.has(paths.outbound)) {
         ensureRunnerOutboundTables(outbound);
         prepared.add(paths.outbound);

@@ -36,8 +36,8 @@ export function openOutboundDb(dbPath: string): Database.Database {
 }
 
 /** Open the outbound DB for a session with write access. Only safe to call when no container is running. */
-export function openOutboundDbRw(dbPath: string): Database.Database {
-  const db = new Database(dbPath);
+export function openOutboundDbRw(dbPath: string, options?: Database.Options): Database.Database {
+  const db = new Database(dbPath, options);
   db.pragma('journal_mode = DELETE');
   db.pragma('busy_timeout = 5000');
   return db;

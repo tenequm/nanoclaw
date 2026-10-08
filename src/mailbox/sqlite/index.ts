@@ -68,7 +68,7 @@ import type {
 
 const SQLITE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
 
-function sqliteTimestamp(value: string): string {
+export function sqliteTimestamp(value: string): string {
   const source = SQLITE_TIMESTAMP.test(value) ? `${value.replace(' ', 'T')}Z` : value;
   const milliseconds = Date.parse(source);
   return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : value;

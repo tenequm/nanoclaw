@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ensureSchema } from '../sqlite/session-db.js';
+import type { RunnerSnapshot } from './runner-ops.js';
 import { createMailboxHttpServer, MAILBOX_HTTP_PATH } from './server.js';
 
 const KEY = { agentGroupId: 'ag-1', sessionId: 'sess-1' };
@@ -165,7 +166,7 @@ describe('mailbox HTTP server: operations', () => {
       { op: 'markContainerTurn', args: ['working'] },
       { op: 'snapshot', args: [null] },
     ]);
-    const snapshot = results![7] as Record<string, any>;
+    const snapshot = results![7] as RunnerSnapshot;
     expect(snapshot.claimed).toEqual({ 'in-1': 'processing', 'in-2': 'script-skip:error' });
     expect(snapshot.pending.map((m: { id: string }) => m.id)).toEqual(['in-1', 'in-2']);
     expect(snapshot.pending[0]).toMatchObject({ trigger: true, onWake: false, timestamp: '2026-01-01T00:00:00.000Z' });
@@ -187,13 +188,13 @@ describe('mailbox HTTP server: operations', () => {
     db.close();
 
     await call([{ op: 'clearStaleProcessingAcks' }, { op: 'clearContainerToolInFlight' }]);
-    const after = (await call([{ op: 'snapshot', args: [null] }])).results![0] as Record<string, any>;
+    const after = (await call([{ op: 'snapshot', args: [null] }])).results![0] as RunnerSnapshot;
     expect(after.claimed).toEqual({ 'in-2': 'script-skip:error' });
   });
 
   it('returns only rows past the cursor, plus delivered mappings past its rowid', async () => {
     insertInbound({ id: 'in-1', seq: 2 });
-    const first = (await call([{ op: 'snapshot', args: [null] }])).results![0] as Record<string, any>;
+    const first = (await call([{ op: 'snapshot', args: [null] }])).results![0] as RunnerSnapshot;
     expect(first.inbound).toHaveLength(1);
     insertInbound({ id: 'in-2', seq: 4 });
     await call([
@@ -207,16 +208,31 @@ describe('mailbox HTTP server: operations', () => {
       "INSERT INTO delivered (message_out_id, platform_message_id, delivered_at) VALUES ('out-1', 'p-1', 'now')",
     ).run();
     db.close();
-    const second = (await call([{ op: 'snapshot', args: [first.cursor] }])).results![0] as Record<string, any>;
+    const second = (await call([{ op: 'snapshot', args: [first.cursor] }])).results![0] as RunnerSnapshot;
     expect(second.inbound.map((m: { id: string }) => m.id)).toEqual(['in-2']);
     expect(second.outbound.map((m: { id: string }) => m.id)).toEqual(['out-1']);
     expect(second.delivered).toEqual([{ messageOutId: 'out-1', platformMessageId: 'p-1' }]);
-    const third = (await call([{ op: 'snapshot', args: [second.cursor] }])).results![0] as Record<string, any>;
+    const third = (await call([{ op: 'snapshot', args: [second.cursor] }])).results![0] as RunnerSnapshot;
     expect([third.inbound, third.outbound, third.delivered]).toEqual([[], [], []]);
-    expect(
-      (await call([{ op: 'findSeqByPlatformMessageId', args: ['test', 'room', 'p-1'] }])).results,
-      'outbound row found through its delivered platform id',
-    ).toEqual([5]);
+    expect(third.cursor).toEqual(second.cursor);
+    insertInbound({ id: 'in-3', seq: 6, content: '{"text":"q","replyTo":{"id":"p-1"}}' });
+    const fourth = (await call([{ op: 'snapshot', args: [third.cursor] }])).results![0] as RunnerSnapshot;
+    expect(fourth.replySeqs, 'outbound row found through its delivered platform id').toEqual([
+      { channelType: 'test', platformId: 'room', platformMessageId: 'p-1', sequence: 5 },
+    ]);
+  });
+
+  it('never follows a heartbeat symlink planted in the container-writable session dir', async () => {
+    const target = path.join(dir, 'outside');
+    fs.symlinkSync(target, heartbeatPath);
+    expect((await call([{ op: 'heartbeat' }, { op: 'setState', args: ['k', 'v'] }])).status).toBe(200);
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
+  it('never creates a missing outbound.db', async () => {
+    fs.rmSync(outboundPath);
+    expect((await call([{ op: 'snapshot', args: [null] }])).status).toBe(500);
+    expect(fs.existsSync(outboundPath)).toBe(false);
   });
 
   it('touches the session heartbeat file on a heartbeat op', async () => {
@@ -226,6 +242,18 @@ describe('mailbox HTTP server: operations', () => {
     fs.utimesSync(heartbeatPath, new Date(0), new Date(0));
     await call([{ op: 'heartbeat' }]);
     expect(fs.statSync(heartbeatPath).mtimeMs).toBeGreaterThanOrEqual(created);
+  });
+
+  it('normalizes legacy empty state timestamps and skips rows that still fail validation', async () => {
+    const db = new Database(outboundPath);
+    db.prepare("INSERT INTO session_state (key, value, updated_at) VALUES ('legacy', 'v', '')").run();
+    db.prepare("INSERT INTO session_state (key, value, updated_at) VALUES ('broken', 'v', 'not a time')").run();
+    db.close();
+    const { status, results } = await call([{ op: 'snapshot', args: [null] }]);
+    expect(status).toBe(200);
+    expect((results![0] as RunnerSnapshot).state).toEqual([
+      { key: 'legacy', value: 'v', updatedAt: '1970-01-01T00:00:00.000Z' },
+    ]);
   });
 
   it('creates the runner-owned tables an older outbound.db lacks', async () => {

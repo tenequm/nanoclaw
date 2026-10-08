@@ -3,8 +3,8 @@
  *
  * Storage stays the SQLite mailbox, unchanged: every AgentMailbox method
  * delegates to an internal SqliteAgentMailbox. What this adds is the runner's
- * path to that storage — containers call one host endpoint instead of opening
- * inbound.db/outbound.db — and the runner context that points them at it.
+ * path to that storage (containers call one host endpoint instead of opening
+ * inbound.db/outbound.db) and the runner context that points them at it.
  *
  * NANOCLAW_MAILBOX_TRANSPORT=sqlite (process env or .env) turns the transport
  * off: runnerContext() goes back to the SQLite null sentinel and the server
@@ -63,7 +63,7 @@ function defaultBind(): string {
   return bridge.address;
 }
 
-/** `process.env` wins, then `.env`, then the default — the driver settings' precedence. */
+/** `process.env` wins, then `.env`, then the default: the driver settings' precedence. */
 export function readMailboxHttpSettings(env: NodeJS.ProcessEnv = process.env): MailboxHttpSettings {
   const file = readEnvFile([...SETTINGS]);
   const setting = (key: (typeof SETTINGS)[number]) => env[key]?.trim() || file[key]?.trim() || '';
@@ -98,6 +98,8 @@ export function readMailboxHttpSettings(env: NodeJS.ProcessEnv = process.env): M
   };
 }
 
+const tokenId = (key: MailboxSessionKey) => `${key.agentGroupId}/${key.sessionId}`;
+
 /** Host-only token file: outside the session directory the container mounts read-write. */
 function tokenPath(key: MailboxSessionKey): string {
   return path.join(DATA_DIR, 'v2-sessions', key.agentGroupId, '.mailbox-http', `${key.sessionId}.token`);
@@ -126,7 +128,7 @@ export class HttpServedAgentMailbox implements AgentMailbox {
   }
 
   async destroy(key: MailboxSessionKey): Promise<void> {
-    this.tokens.delete(`${key.agentGroupId}/${key.sessionId}`);
+    this.tokens.delete(tokenId(key));
     fs.rmSync(tokenPath(key), { force: true });
     await this.delegate.destroy(key);
   }
@@ -139,19 +141,19 @@ export class HttpServedAgentMailbox implements AgentMailbox {
    * A fresh token per spawn: the newest container of a session is the only one
    * the endpoint accepts, so a container the host replaced is fenced out.
    */
-  async runnerContext(key: MailboxSessionKey): Promise<HttpRunnerContext | unknown> {
+  async runnerContext(key: MailboxSessionKey): Promise<HttpRunnerContext | null> {
     if (this.settings.transport === 'sqlite') return this.delegate.runnerContext(key);
     const token = randomBytes(32).toString('hex');
     const file = tokenPath(key);
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     fs.writeFileSync(file, token, { mode: 0o600 });
-    this.tokens.set(`${key.agentGroupId}/${key.sessionId}`, token);
+    this.tokens.set(tokenId(key), token);
     return {
       transport: 'http',
       protocol: MAILBOX_HTTP_PROTOCOL,
       url: `${this.settings.url}${MAILBOX_HTTP_PATH}`,
       token,
-    } satisfies HttpRunnerContext;
+    };
   }
 
   /**
@@ -164,7 +166,7 @@ export class HttpServedAgentMailbox implements AgentMailbox {
   }
 
   verifyToken(key: MailboxSessionKey, presented: string): boolean {
-    const id = `${key.agentGroupId}/${key.sessionId}`;
+    const id = tokenId(key);
     let expected = this.tokens.get(id);
     if (expected === undefined) {
       // After a host restart, adopted containers still hold the token written at their spawn.
@@ -200,6 +202,8 @@ export class HttpServedAgentMailbox implements AgentMailbox {
         resolve();
       });
     });
+    // Past startup, an accept failure (EMFILE) must not surface as an unhandled 'error' event.
+    server.on('error', (err) => log.error('Mailbox HTTP server error', { err }));
     this.server = server;
     log.info('Mailbox HTTP endpoint listening', { bind, port, url: this.settings.url });
   }
