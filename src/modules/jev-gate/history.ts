@@ -2,13 +2,11 @@
  * The gate's read side: one host-side open of the session's mailbox per
  * judged message, merged in/out, from which everything else is derived.
  *
- * There is no gate table. The verdict lands on each stored message twice:
- * a human-readable `[jev: …]` line appended to `text` (for the agent's
- * prompt and pond), and a host-written `jev` metadata key in the content
- * JSON. Derivation — the daily wake count, the cooldown stamp, the
- * consecutive-bot streak — reads ONLY the metadata key. User-authored text
- * is a JSON string value and cannot forge a key, so a chat message
- * containing the literal marker cannot trip the levers.
+ * There is no gate table. The verdict lands on each stored message as a
+ * host-written `jev` metadata key in the content JSON. Derivation (the daily
+ * wake count, the cooldown stamp, the consecutive-bot streak) reads only that
+ * key, which user-authored text cannot forge. Rows stored before 2026-10-08
+ * also carry a `[jev: …]` line in `text`; it is stripped before rendering.
  *
  * Read-only from the host side (the existing open-read-close mailbox
  * helper), so it is safe with a live container.
@@ -22,9 +20,6 @@ import {
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { log } from '../../log.js';
 import type { UserRoleKind } from '../../types.js';
-
-/** Human-readable prefix of a granted-wake annotation. Display only — never derivation. */
-export const WAKE_MARKER = '[jev: reply';
 
 /** First window per judgment; escalates when a busy day outruns it (see readGateHistory). */
 export const GATE_HISTORY_LIMIT = 200;

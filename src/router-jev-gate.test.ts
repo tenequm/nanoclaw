@@ -171,17 +171,22 @@ async function inbound(id: string, text: string): Promise<void> {
   });
 }
 
-/** The stored inbound texts for one agent group's only session. */
-async function storedTexts(agentGroupId: string): Promise<string[]> {
+/** The stored inbound contents for one agent group's only session. */
+async function storedContents(
+  agentGroupId: string,
+): Promise<Array<{ text?: string; jev?: { v?: string; mode?: string } }>> {
   const sessions = await getSessionsByAgentGroup(agentGroupId);
-  const texts: string[] = [];
+  const contents: Array<{ text?: string; jev?: { v?: string; mode?: string } }> = [];
   for (const session of sessions) {
     const rows = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => mailbox.getInboundHistory(50));
-    for (const row of rows ?? []) {
-      texts.push((JSON.parse(row.content) as { text?: string }).text ?? '');
-    }
+    for (const row of rows ?? []) contents.push(JSON.parse(row.content) as { text?: string; jev?: { v?: string } });
   }
-  return texts;
+  return contents;
+}
+
+/** The stored inbound texts for one agent group's only session. */
+async function storedTexts(agentGroupId: string): Promise<string[]> {
+  return (await storedContents(agentGroupId)).map((c) => c.text ?? '');
 }
 
 /**
@@ -258,14 +263,17 @@ describe('routeInbound with the Jev wake-gate', () => {
 
     await inbound('m1', 'two humans chatting about lunch');
 
-    const gated = await storedTexts(GATED);
+    const gated = await storedContents(GATED);
     expect(gated).toHaveLength(1);
-    expect(gated[0]).toContain('[jev: silent');
+    // The verdict is metadata only: what the agent reads stays the chat's own text.
+    expect(gated[0].text).toBe('two humans chatting about lunch');
+    expect(gated[0].jev).toMatchObject({ v: 'silent', mode: 'live' });
 
-    // The fan-out loop shares one event object: the annotation must not have
+    // The fan-out loop shares one event object: the verdict must not have
     // reached the other wiring's copy.
-    const plain = await storedTexts(PLAIN);
-    expect(plain).toEqual(['two humans chatting about lunch']);
+    const plain = await storedContents(PLAIN);
+    expect(plain.map((c) => c.text)).toEqual(['two humans chatting about lunch']);
+    expect(plain[0].jev).toBeUndefined();
 
     // Only the ungated wiring woke a container.
     expect(wakeContainer).toHaveBeenCalledTimes(1);
@@ -279,7 +287,9 @@ describe('routeInbound with the Jev wake-gate', () => {
 
     await inbound('m1', 'can someone check the deploy?');
 
-    expect((await storedTexts(GATED))[0]).toContain('[jev: reply');
+    const [gated] = await storedContents(GATED);
+    expect(gated.text).toBe('can someone check the deploy?');
+    expect(gated.jev).toMatchObject({ v: 'reply', mode: 'live' });
     expect(await storedTexts(PLAIN)).toEqual(['can someone check the deploy?']);
     expect(wakeContainer).toHaveBeenCalledTimes(2);
   });
@@ -292,7 +302,9 @@ describe('routeInbound with the Jev wake-gate', () => {
 
     await inbound('m1', 'can someone check the deploy?');
 
-    expect((await storedTexts(GATED))[0]).toContain('[jev: shadow-reply');
+    const [gated] = await storedContents(GATED);
+    expect(gated.text).toBe('can someone check the deploy?');
+    expect(gated.jev).toMatchObject({ v: 'reply', mode: 'shadow' });
     expect(wakeContainer).toHaveBeenCalledTimes(1);
   });
 

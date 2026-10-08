@@ -468,7 +468,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     // Jev ambient wake-gate (fork) — src/modules/jev-gate. For wirings listed
     // in data/jev-gate.json, a non-mention group message that engaged is put
     // to Jev; a silent verdict flips `engages` off so the accumulate branch
-    // below stores it as context, and the verdict is annotated onto a
+    // below stores it as context, and the verdict metadata goes onto a
     // PER-DELIVERY copy of the event (the loop shares `event` across agents).
     // Placed after the access/scope gates so an untrusted sender's message is
     // never judged, annotated, or accumulated — see that branch's comment.
@@ -480,6 +480,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     if (ruleEngages && accessOk && scopeOk && !isMention && mg.is_group !== 0) {
       const gated = await runJevGate({ agent, mg, event, threadId: effectiveThreadId, senderRole });
       if (gated) {
+        log.info('Jev gate', { agentGroupId: agent.agent_group_id, verdict: gated.annotation });
         deliveryEvent = gated.event;
         if (gated.silence) engages = false;
       }

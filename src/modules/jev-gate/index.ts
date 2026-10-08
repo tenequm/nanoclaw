@@ -16,12 +16,11 @@
  *   exactly what the wiring did before the gate existed. Failing open on a
  *   pattern-everything wiring means a container wake per message.
  *
- *   NO NEW TABLES. The verdict lands on the stored message twice: a compact
- *   `[jev: …]` line appended to the text (the agent's prompt, pond, humans)
- *   and a host-written `jev` metadata key in the content JSON. The daily cap,
- *   the cooldown, and the bot-loop streak are re-derived from the METADATA
- *   only — user text cannot forge a JSON key, so a chat message containing
- *   the literal marker cannot trip the levers.
+ *   NO NEW TABLES, NO TEXT. The verdict lands on the stored message only as a
+ *   host-written `jev` metadata key in the content JSON, never in `text`: the
+ *   agent's prompt and transcripts must not carry the gate's bookkeeping. The
+ *   daily cap, the cooldown, and the bot-loop streak are re-derived from that
+ *   key, which user text cannot forge. The host log carries the verdict line.
  *
  *   NO SHARED-EVENT MUTATION. The router's fan-out loop reuses one `event`
  *   across every wired agent, so the annotation is applied to a per-delivery
@@ -56,14 +55,13 @@ export {
   writeGateEntry,
 } from './config.js';
 export type { JevGateEntry, JevGatePatch, JevThresholds } from './config.js';
-export { WAKE_MARKER } from './history.js';
 
 export interface JevGateOutcome {
   /** True when the router must flip `engages` off (live mode, silent verdict). */
   silence: boolean;
-  /** Per-delivery copy of the event carrying the verdict annotation. */
+  /** Per-delivery copy of the event carrying the verdict metadata. */
   event: InboundEvent;
-  /** The annotation line, for logs and tests. */
+  /** The verdict line, for the host log and tests. */
   annotation: string;
 }
 
@@ -78,20 +76,19 @@ export interface JevGateInput {
 }
 
 /**
- * Write the verdict onto this delivery's copy of the content JSON: the
- * human-readable line appended to `text` (prompt + pond), and the `jev`
- * metadata key the derivation side reads. Only the host writes this key —
- * user text is a JSON string value and cannot forge it.
+ * Write the `jev` metadata key onto this delivery's copy of the content JSON.
+ * Only the host writes this key; user text is a JSON string value and cannot
+ * forge it.
  */
-function annotateContent(raw: string, annotation: string, jev: JevMeta): string {
+function annotateContent(raw: string, jev: JevMeta): string {
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.text === 'string') {
-      return JSON.stringify({ ...parsed, text: `${parsed.text}\n${annotation}`, jev });
+      return JSON.stringify({ ...parsed, jev });
     }
     return raw;
   } catch {
-    return `${raw}\n${annotation}`;
+    return raw;
   }
 }
 
@@ -103,11 +100,11 @@ function annotateContent(raw: string, annotation: string, jev: JevMeta): string 
  * download stays shared with every other wiring; `at` is stamped once so the
  * stored verdict time does not drift by the download.
  */
-function annotatedCopy(event: InboundEvent, annotation: string, meta: JevMeta): InboundEvent {
+function annotatedCopy(event: InboundEvent, meta: JevMeta): InboundEvent {
   const jev: JevMeta = { ...meta, at: new Date().toISOString() };
   const copy: InboundEvent = {
     ...event,
-    message: { ...event.message, content: annotateContent(event.message.content, annotation, jev) },
+    message: { ...event.message, content: annotateContent(event.message.content, jev) },
   };
   const materialize = event.materialize;
   if (materialize) {
@@ -115,7 +112,7 @@ function annotatedCopy(event: InboundEvent, annotation: string, meta: JevMeta): 
       try {
         await materialize();
       } finally {
-        copy.message.content = annotateContent(event.message.content, annotation, jev);
+        copy.message.content = annotateContent(event.message.content, jev);
       }
     };
   }
@@ -137,7 +134,7 @@ function outcome(entry: JevGateEntry, event: InboundEvent, wake: boolean, detail
     // shadow verdict that wakes would turn calibration mode into one
     // container wake per message the moment the wiring is widened.
     silence: entry.mode === 'shadow' || !wake,
-    event: annotatedCopy(event, annotation, meta),
+    event: annotatedCopy(event, meta),
     annotation,
   };
 }
@@ -147,7 +144,7 @@ function errorOutcome(entry: JevGateEntry, event: InboundEvent, reason: string):
   const meta: JevMeta = { v: 'error', mode: entry.mode };
   return {
     silence: true,
-    event: annotatedCopy(event, annotation, meta),
+    event: annotatedCopy(event, meta),
     annotation,
   };
 }

@@ -63,7 +63,7 @@ vi.mock('../../session-manager.js', () => ({
     }),
 }));
 
-import { DEFAULT_THRESHOLDS, resetGateConfigCache, runJevGate, WAKE_MARKER } from './index.js';
+import { DEFAULT_THRESHOLDS, resetGateConfigCache, runJevGate } from './index.js';
 import {
   consecutiveBotWakes,
   lastWakeAt,
@@ -272,7 +272,8 @@ describe('verdicts', () => {
     const out = await gate();
     expect(out?.silence).toBe(false);
     expect(out?.annotation).toBe(WOKE);
-    expect(out?.content).toContain(WAKE_MARKER);
+    expect(out?.content).not.toContain('[jev:');
+    expect(JSON.parse(out?.content ?? '{}').jev).toMatchObject({ v: 'reply', mode: 'live' });
   });
 
   it('wakes on an unresolved question even with no invitation', async () => {
@@ -357,7 +358,7 @@ describe('fail-silent', () => {
 
   it('never marks an error as a wake, so it cannot be counted against the cap', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('econnreset')));
-    expect((await gate())?.content).not.toContain(WAKE_MARKER);
+    expect(JSON.parse((await gate())?.content ?? '{}').jev).toMatchObject({ v: 'error' });
   });
 });
 
@@ -376,7 +377,7 @@ describe('shadow mode (baseline = the pre-gate mention-only wiring: always suppr
     const out = await gate();
     expect(out?.silence).toBe(true);
     expect(out?.annotation).toBe('[jev: shadow-reply · value=0.99 · veto=0.00]');
-    expect(out?.content).not.toContain(WAKE_MARKER);
+    expect(JSON.parse(out?.content ?? '{}').jev).toMatchObject({ v: 'reply', mode: 'shadow' });
   });
 
   it('silences on a Jev error too', async () => {
