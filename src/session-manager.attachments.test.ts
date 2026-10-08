@@ -103,7 +103,7 @@ describe('extractAttachmentFiles — inbox-root symlink containment (#2828 sibli
   });
 });
 
-describe('extractAttachmentFiles — staged adapter downloads', () => {
+describe('extractAttachmentFiles: staged adapter downloads', () => {
   const STAGING = path.join(TEST_DIR, 'inbound-staging', 'telegram', 'stage-1');
 
   async function write(id: string, attachment: Record<string, unknown>): Promise<Record<string, unknown>> {

@@ -125,7 +125,7 @@ export class TranscriptionService extends Context.Service<
 >()('telegram-grammy/TranscriptionService') {}
 
 /**
- * GroupFolderService — messaging_group → the wired primary agent group's
+ * GroupFolderService - messaging_group -> the wired primary agent group's
  * resolved folder (under `GROUPS_DIR`), or `null` when the platformId isn't
  * paired yet. Attachments use it only to skip downloads for unpaired chats;
  * the bytes go to staging and then to each session's inbox.
