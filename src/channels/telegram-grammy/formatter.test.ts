@@ -116,6 +116,42 @@ describe('renderFS', () => {
     expect(fs.text).toContain('2. two');
   });
 
+  it('indents nested lists to their parent text column with a per-depth bullet', () => {
+    const fs = renderFS('- a\n  - a1\n    - deep\n- b');
+    expect(fs.text).toBe('• a\n  ◦ a1\n    ▪ deep\n• b');
+  });
+
+  it('numbers a nested ordered list on its own, indented under its item', () => {
+    const fs = renderFS('1. one\n   1. sub\n   2. sub2\n2. two');
+    expect(fs.text).toBe('1. one\n   1. sub\n   2. sub2\n2. two');
+  });
+
+  it('shows the state of task items', () => {
+    expect(renderFS('- [ ] todo\n- [x] done').text).toBe('☐ todo\n☑ done');
+    expect(renderFS('1. [x] shipped').text).toBe('1. ☑ shipped');
+  });
+
+  it('keeps a code block inside a list item intact and indents the paragraphs after it', () => {
+    const fs = renderFS('1. step:\n\n   ```sh\n   ls -la\n   ```\n\n   then more\n   second line\n2. next');
+    const pre = fs.entities.find((e) => e.type === 'pre') as { offset: number; length: number; language?: string };
+    expect(fs.text.slice(pre.offset, pre.offset + pre.length)).toBe('ls -la');
+    expect(pre.language).toBe('sh');
+    expect(fs.text).toBe('1. step:\nls -la\n   then more\n   second line\n2. next');
+  });
+
+  it('keeps entities on indented continuation lines', () => {
+    const fs = renderFS('- first\n  **bold** second line');
+    const bold = fs.entities.find((e) => e.type === 'bold') as { offset: number; length: number };
+    expect(fs.text.slice(bold.offset, bold.offset + bold.length)).toBe('bold');
+    expect(fs.text).toBe('• first\n  bold second line');
+  });
+
+  it('renders --- as a plain divider, never em-dashes', () => {
+    const fs = renderFS('a\n\n---\n\nb');
+    expect(fs.text).toBe(`a\n\n${'─'.repeat(8)}\n\nb`);
+    expect(fs.text).not.toContain('—');
+  });
+
   it('emits underline for __X__ (distinct from **bold**)', () => {
     const fs = renderFS('__under__');
     expect(fs.text).toBe('under');

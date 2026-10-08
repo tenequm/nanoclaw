@@ -40,7 +40,7 @@
  * Pure functions only — no Effect, no IO. Kept plain TS so the walker is
  * easy to test and reason about in isolation.
  */
-import type { Content as MdContent, MdastTable, Root as MdRoot, TableCell as MdTableCell } from 'chat';
+import type { Content as MdContent, List as MdList, MdastTable, Root as MdRoot, TableCell as MdTableCell } from 'chat';
 import {
   isBlockquoteNode,
   isCodeNode,
@@ -199,20 +199,13 @@ function renderNode(node: RenderableNode): FormattedString {
     return renderChildren(node.children);
   }
   if (isListNode(node)) {
-    const ordered = node.ordered === true;
-    const startValue = typeof node.start === 'number' && Number.isFinite(node.start) ? node.start : 1;
-    const items = node.children.map((item, i) => {
-      const prefix = ordered ? `${startValue + i}. ` : '• ';
-      const body = isListItemNode(item) ? joinFs(item.children.map(renderNode), NL()) : renderNode(item);
-      return PLAIN(prefix).concat(body);
-    });
-    return joinFs(items, NL());
+    return renderList(node, '', 0);
   }
   if (isListItemNode(node)) {
     return joinFs(node.children.map(renderNode), NL());
   }
   if (node.type === 'thematicBreak') {
-    return PLAIN('———');
+    return PLAIN(DIVIDER);
   }
   if (node.type === 'break') {
     return NL();
@@ -250,6 +243,61 @@ function renderNode(node: RenderableNode): FormattedString {
 function renderChildren(children: readonly RenderableNode[]): FormattedString {
   if (children.length === 0) return EMPTY();
   return children.map(renderNode).reduce((acc, cur) => acc.concat(cur), EMPTY());
+}
+
+/* ----------------------------------------------------------------------- */
+/*                                   Lists                                  */
+/* ----------------------------------------------------------------------- */
+
+/** Bullet per nesting depth; deeper levels reuse the last. */
+const BULLETS = ['•', '◦', '▪'] as const;
+const TASK_OPEN = '☐';
+const TASK_DONE = '☑';
+const DIVIDER = '─'.repeat(8);
+/** Telegram keeps leading spaces only unreliably across clients; NBSP always survives. */
+const INDENT_UNIT = ' ';
+
+/**
+ * Render a list at a nesting level. Each item's continuation lines and nested
+ * lists are indented to its text column, so structure survives without
+ * Telegram having a list primitive. A nested ordered list numbers itself;
+ * task items (`- [ ]` / `- [x]`) show a box for their state. Code and quote
+ * blocks inside an item keep their own entity unindented: Telegram draws them
+ * as separate boxes, and an indent would only put spaces into copied code.
+ */
+function renderList(node: MdList, indent: string, depth: number): FormattedString {
+  const ordered = node.ordered === true;
+  const startValue = typeof node.start === 'number' && Number.isFinite(node.start) ? node.start : 1;
+  const items = node.children.map((item, i) => {
+    const box = item.checked === true ? TASK_DONE : item.checked === false ? TASK_OPEN : null;
+    const bullet = BULLETS[Math.min(depth, BULLETS.length - 1)];
+    const marker = ordered ? `${startValue + i}. ${box ? `${box} ` : ''}` : `${box ?? bullet} `;
+    const childIndent = indent + INDENT_UNIT.repeat(marker.length);
+    const parts = item.children.map((child, j) => {
+      if (isListNode(child)) return renderList(child, childIndent, depth + 1);
+      const body = renderNode(child);
+      if (!isParagraphNode(child)) return body;
+      return indentContinuationLines(body, childIndent, j === 0);
+    });
+    return PLAIN(indent + marker).concat(joinFs(parts, NL()));
+  });
+  return joinFs(items, NL());
+}
+
+/** Prefix every line of `fs` (but the first, when `skipFirst`) with `prefix`, keeping entities. */
+function indentContinuationLines(fs: FormattedString, prefix: string, skipFirst: boolean): FormattedString {
+  const text = fs.rawText;
+  const lines: FormattedString[] = [];
+  let start = 0;
+  for (let at = text.indexOf('\n'); at !== -1; at = text.indexOf('\n', start)) {
+    lines.push(fs.slice(start, at));
+    start = at + 1;
+  }
+  lines.push(fs.slice(start, text.length));
+  return joinFs(
+    lines.map((line, i) => (skipFirst && i === 0 ? line : PLAIN(prefix).concat(line))),
+    NL(),
+  );
 }
 
 /* ----------------------------------------------------------------------- */
