@@ -15,7 +15,7 @@ name: agent-image
 on:
   workflow_dispatch:
   push:
-    branches: [main, feat/agent-image-ghcr]
+    branches: [main]
     paths:
       - 'container/**'
       - '.github/workflows/agent-image.yml'
