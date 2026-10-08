@@ -10,7 +10,7 @@
 import { describe, expect, it } from 'vitest';
 import { GrammyError } from 'grammy';
 
-import { GrammyApiError, GrammyEntityError, GrammyNetworkError, mapGrammyError } from './errors.js';
+import { GrammyApiError, GrammyEntityError, GrammyNetworkError, GrammyQuoteError, mapGrammyError } from './errors.js';
 
 /** Construct a GrammyError with minimal required fields for testing. */
 function makeGrammyError(code: number, description: string, parameters?: { retry_after?: number }): GrammyError {
@@ -29,6 +29,22 @@ describe('mapGrammyError', () => {
     const out = mapGrammyError(err, 'sendMessage', 'chat1');
     expect(out).toBeInstanceOf(GrammyEntityError);
     expect((out as GrammyEntityError).description).toContain('parse entities');
+  });
+
+  it('classifies a rejected reply quote as GrammyQuoteError, but not a blockquote entity error', () => {
+    expect(mapGrammyError(makeGrammyError(400, 'Bad Request: QUOTE_TEXT_INVALID'), 'sendMessage', 'c')).toBeInstanceOf(
+      GrammyQuoteError,
+    );
+    expect(
+      mapGrammyError(
+        makeGrammyError(400, "Bad Request: can't parse entities: unclosed BlockQuote"),
+        'sendMessage',
+        'c',
+      ),
+    ).toBeInstanceOf(GrammyEntityError);
+    expect(mapGrammyError(makeGrammyError(500, 'quote service down'), 'sendMessage', 'c')).toBeInstanceOf(
+      GrammyApiError,
+    );
   });
 
   it('maps flood waits to GrammyApiError with retry_after', () => {

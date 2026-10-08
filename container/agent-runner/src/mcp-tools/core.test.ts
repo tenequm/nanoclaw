@@ -308,12 +308,12 @@ describe('send_message — reply_to and quote', () => {
 
   it('resolves reply_to by the seq shown in the envelope and marks it explicit', async () => {
     await sendMessage.handler({ to: 'dm', text: 'that one', reply_to: 2, quote: 'hi' });
-    expect(lastOut()).toEqual({ inReplyTo: '42:7:ag-1', content: { text: 'that one', threadReply: { quote: 'hi' } } });
+    expect(lastOut()).toEqual({ inReplyTo: '42:7:ag-1', content: { text: 'that one', replyIntent: { quote: 'hi' } } });
   });
 
   it('marks a quote without reply_to explicit on the default target', async () => {
     await sendMessage.handler({ to: 'dm', text: 'x', quote: 'hi' });
-    expect(lastOut()).toEqual({ inReplyTo: '42:8:ag-1', content: { text: 'x', threadReply: { quote: 'hi' } } });
+    expect(lastOut()).toEqual({ inReplyTo: '42:8:ag-1', content: { text: 'x', replyIntent: { quote: 'hi' } } });
   });
 
   it('rejects an unknown id, a message from another chat and an oversized quote', async () => {

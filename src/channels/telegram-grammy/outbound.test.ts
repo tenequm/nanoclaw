@@ -43,6 +43,14 @@ function fakeBot(fail?: (call: Call) => unknown) {
 
 const file = (filename: string) => ({ filename, data: Buffer.from('x') });
 
+const badRequest = (what: string) =>
+  new GrammyError(
+    "Call to 'sendMessage' failed!",
+    { ok: false, error_code: 400, description: `Bad Request: ${what}` },
+    'sendMessage',
+    {},
+  );
+
 describe('telegram outbound reply threading', () => {
   it('sets reply_parameters on the first chunk only', async () => {
     const bot = fakeBot();
@@ -108,6 +116,38 @@ describe('telegram outbound reply threading', () => {
       { message_id: 7, allow_sending_without_reply: true },
     ]);
     expect(id).toBe('100');
+  });
+
+  it('retries only the first chunk without the quote, sending every chunk once', async () => {
+    const bot = fakeBot((call) =>
+      (call.other.reply_parameters as { quote?: string } | undefined)?.quote
+        ? badRequest('QUOTE_TEXT_INVALID')
+        : undefined,
+    );
+    const long = `${'a'.repeat(TELEGRAM_TEXT_LIMIT - 10)}\n\n${'b'.repeat(200)}`;
+    await bot.run({ kind: 'chat', content: { text: long, threadReply: { quote: 'aaa' } }, inReplyTo: '42:7' });
+    expect(bot.calls.map((c) => c.other.reply_parameters)).toEqual([
+      { message_id: 7, allow_sending_without_reply: true, quote: 'aaa' },
+      { message_id: 7, allow_sending_without_reply: true },
+      undefined,
+    ]);
+  });
+
+  it('does not retry an error that is not about the quote', async () => {
+    const bot = fakeBot(() => badRequest('chat not found'));
+    await expect(
+      bot.run({ kind: 'chat', content: { text: 'yes', threadReply: { quote: 'at noon' } }, inReplyTo: '42:7' }),
+    ).rejects.toBeDefined();
+    expect(bot.calls).toHaveLength(1);
+  });
+
+  it('never resends a delivered chunk when a later one fails', async () => {
+    const bot = fakeBot((call) => (call.other.reply_parameters ? undefined : badRequest('quote not found')));
+    const long = `${'a'.repeat(TELEGRAM_TEXT_LIMIT - 10)}\n\n${'b'.repeat(200)}`;
+    await expect(
+      bot.run({ kind: 'chat', content: { text: long, threadReply: { quote: 'aaa' } }, inReplyTo: '42:7' }),
+    ).rejects.toBeDefined();
+    expect(bot.calls).toHaveLength(2);
   });
 
   it('sends an agent mention as a tg://user text_link', async () => {

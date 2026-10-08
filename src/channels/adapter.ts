@@ -315,6 +315,12 @@ export interface ChannelAdapter {
    */
   typingRequiresThread?: boolean;
 
+  /**
+   * True when the platform can show a message as a reply to another. Delivery
+   * works out a reply box (`content.threadReply`) only for these adapters.
+   */
+  threadsReplies?: boolean;
+
   /** Reaction primitives, used for the threadless activity ack. Present only
    *  on adapters whose platform has reactions. */
   addReaction?(platformId: string, messageId: string, emoji: string): Promise<void>;

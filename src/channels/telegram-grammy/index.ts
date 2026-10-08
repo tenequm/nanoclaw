@@ -64,6 +64,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
   readonly name = CHANNEL_TYPE;
   readonly channelType = CHANNEL_TYPE;
   readonly supportsThreads = false;
+  readonly threadsReplies = true;
   readonly defaults: ChannelDefaults = TELEGRAM_DEFAULTS;
 
   private runtime: AdapterRuntime | null = null;

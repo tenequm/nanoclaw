@@ -176,6 +176,9 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
     typingRequiresThread(channelType: string, instance?: string): boolean {
       return getChannelAdapterExact(instance ?? channelType)?.typingRequiresThread === true;
     },
+    threadsReplies(channelType: string, instance?: string): boolean {
+      return getChannelAdapterExact(instance ?? channelType)?.threadsReplies === true;
+    },
   };
 }
 

@@ -85,10 +85,10 @@ export function detectMention(ctx: Context, botUsername: string | null, botUserI
 }
 
 /**
- * Reply context surfaced to the agent. The agent-runner formatter renders
- * `reply_to="<id>"` on the parent `<message>` plus `<quoted_message from="...">text</quoted_message>`
- * inline, so `id` is what lets the agent disambiguate between identical-
- * looking messages, and `text` is the context body.
+ * Reply context surfaced to the agent. The agent-runner formatter resolves
+ * `id` to the replied message's session id (`reply_to` on the parent
+ * `<message>`, when that message is in the session) and renders `text` inline
+ * as `<quoted_message from="...">`, with `quote` as its `highlighted` part.
  *
  * Three reply shapes are merged into this one envelope:
  *   - plain `msg.reply_to_message` — normal "tap reply".
@@ -174,33 +174,31 @@ export function extractReplyContext(msg: Message): ReplyContext | null {
   return { ...rest, text: redactVoiceLinks(context.text), ...(quote ? { quote: redactVoiceLinks(quote) } : {}) };
 }
 
+/** The original's text, falling back to the fragment when the original's text is absent. */
+function withQuote(fullText: string, quote: string | undefined): Pick<ReplyContext, 'text' | 'quote'> {
+  const text = fullText || quote || '';
+  return { text, ...(quote && quote !== text ? { quote } : {}) };
+}
+
 function rawReplyContext(msg: Message): ReplyContext | null {
-  // Case C — reply to a message from a different chat (quote-reply of a
+  const quote = (msg as { quote?: { text: string } }).quote?.text || undefined;
+
+  // External reply - to a message from a different chat (quote-reply of a
   // channel post, etc.). Telegram delivers this as `external_reply` with
   // an origin describing where the quoted message lived. No local id.
-  const quote = (msg as { quote?: { text: string } }).quote?.text || undefined;
-  const ext = (msg as { external_reply?: { origin: MessageOrigin; message_id?: number } }).external_reply;
+  const ext = (msg as { external_reply?: { origin: MessageOrigin; message_id?: number; text?: string } })
+    .external_reply;
   if (ext) {
-    // The external original's text is often absent; the fragment is then all there is.
-    const fullText = (ext as { text?: string }).text || quote || '';
-    return {
-      id: null,
-      sender: `(external) ${describeOrigin(ext.origin)}`,
-      text: fullText,
-      ...(quote && quote !== fullText ? { quote } : {}),
-    };
+    return { id: null, sender: `(external) ${describeOrigin(ext.origin)}`, ...withQuote(ext.text ?? '', quote) };
   }
 
+  // A tap reply, with the fragment the user highlighted when it is a quote-reply.
   const reply = msg.reply_to_message;
   if (!reply) return null;
-
-  // Case B — user highlighted a specific fragment and replied to that portion.
-  const fullText = reply.text ?? reply.caption ?? '';
   return {
     id: String(reply.message_id),
-    text: fullText || quote || '',
     sender: reply.from?.first_name ?? reply.from?.username ?? 'Unknown',
-    ...(quote && quote !== fullText ? { quote } : {}),
+    ...withQuote(reply.text ?? reply.caption ?? '', quote),
   };
 }
 
@@ -505,6 +503,14 @@ export function entitiesToMarkdown(text: string, entities: readonly MessageEntit
  * into messages_in doesn't collide with the original's primary key. The
  * body is prefixed with `[EDITED]` and `replyTo.id` links to the original.
  */
+/** `replyTo.sender` of an edit linked back to its original: a link, not a reply. */
+export const EDIT_LINK_SENDER = 'original';
+/** `replyTo.sender` of a reaction linked to the message it reacts to: a link, not a reply. */
+export const REACTION_LINK_SENDER = 'target';
+export const EDITED_PREFIX = '[EDITED]';
+/** Opens the `[album <media_group_id>]` tag; the id and `]` follow. */
+export const ALBUM_PREFIX = '[album';
+
 export function toInboundMessage(
   ctx: Context,
   botUsername: string | null,
@@ -529,11 +535,11 @@ export function toInboundMessage(
 
   // Prepend contextual prefixes: [EDITED], [forwarded from …], [album …].
   const prefixes: string[] = [];
-  if (isEdit) prefixes.push('[EDITED]');
+  if (isEdit) prefixes.push(EDITED_PREFIX);
   const fwd = (msg as { forward_origin?: MessageOrigin }).forward_origin;
   if (fwd) prefixes.push(formatForwardHeader(fwd));
   const albumId = (msg as { media_group_id?: string }).media_group_id;
-  if (albumId) prefixes.push(`[album ${albumId}]`);
+  if (albumId) prefixes.push(`${ALBUM_PREFIX} ${albumId}]`);
   const body =
     prefixes.length > 0
       ? markdown.length > 0
@@ -566,7 +572,7 @@ export function toInboundMessage(
     // Link the [EDITED] inbound back to the original message id so the
     // agent-runner renders `reply_to="<origId>"` on the envelope and the
     // agent can walk back to the pre-edit body in its own history.
-    replyTo = { id: String(msg.message_id), text: '', sender: 'original' };
+    replyTo = { id: String(msg.message_id), text: '', sender: EDIT_LINK_SENDER };
   }
   if (replyTo) content.replyTo = replyTo;
 
@@ -655,7 +661,7 @@ export function toReactionInbound(upd: ReactionUpdatePayload): InboundEnvelope |
       isBot: actor.is_bot === true,
     },
     attachments: [],
-    replyTo: { id: String(message_id), text: '', sender: 'target' },
+    replyTo: { id: String(message_id), text: '', sender: REACTION_LINK_SENDER },
   };
 
   return {

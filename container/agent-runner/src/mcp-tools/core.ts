@@ -66,6 +66,20 @@ function resolveRouting(
   return { channel_type: 'agent', platform_id: dest.agentGroupId!, thread_id: null, resolvedName: to };
 }
 
+/** The platform id and routing of a message the agent names by its seq. */
+function resolveSeqTarget(
+  seq: number,
+):
+  | { messageId: string; routing: { channel_type: string; platform_id: string; thread_id: string | null } }
+  | { error: string } {
+  const messageId = seq ? getMessageIdBySeq(seq) : null;
+  if (!messageId) return { error: `Message #${seq} not found` };
+  const routing = getRoutingBySeq(seq);
+  if (!routing?.channel_type || !routing.platform_id)
+    return { error: `Cannot determine destination for message #${seq}` };
+  return { messageId, routing: { ...routing, channel_type: routing.channel_type, platform_id: routing.platform_id } };
+}
+
 const MAX_QUOTE_LENGTH = 1024;
 
 export const sendMessage: McpToolDefinition = {
@@ -87,8 +101,7 @@ export const sendMessage: McpToolDefinition = {
         },
         quote: {
           type: 'string',
-          description:
-            'Part of the replied message to highlight, copied verbatim from its text (max 1024 chars). Dropped if it does not match.',
+          description: `Part of the replied message to highlight, copied verbatim from its text (max ${MAX_QUOTE_LENGTH} chars). Dropped if it does not match.`,
         },
       },
       required: ['to', 'text'],
@@ -110,13 +123,12 @@ export const sendMessage: McpToolDefinition = {
     if (quote && quote.length > MAX_QUOTE_LENGTH) return err(`quote is longer than ${MAX_QUOTE_LENGTH} characters`);
     if (args.reply_to != null) {
       const replySeq = Number(args.reply_to);
-      const target = replySeq ? getMessageIdBySeq(replySeq) : null;
-      if (!target) return err(`Message #${args.reply_to} not found`);
-      const replyRouting = getRoutingBySeq(replySeq);
-      if (replyRouting?.channel_type !== routing.channel_type || replyRouting?.platform_id !== routing.platform_id) {
+      const target = resolveSeqTarget(replySeq);
+      if ('error' in target) return err(target.error);
+      if (target.routing.channel_type !== routing.channel_type || target.routing.platform_id !== routing.platform_id) {
         return err(`Message #${replySeq} is not in ${routing.resolvedName}`);
       }
-      inReplyTo = target;
+      inReplyTo = target.messageId;
     }
     const explicit = args.reply_to != null || quote !== undefined;
 
@@ -128,7 +140,7 @@ export const sendMessage: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify(explicit ? { text, threadReply: quote ? { quote } : {} } : { text }),
+      content: JSON.stringify(explicit ? { text, replyIntent: quote ? { quote } : {} } : { text }),
     });
 
     log(`send_message: #${seq} → ${routing.resolvedName}`);
@@ -283,13 +295,9 @@ export const editMessage: McpToolDefinition = {
     const text = args.text as string;
     if (!seq || !text) return err('messageId and text are required');
 
-    const platformId = getMessageIdBySeq(seq);
-    if (!platformId) return err(`Message #${seq} not found`);
-
-    const routing = getRoutingBySeq(seq);
-    if (!routing || !routing.channel_type || !routing.platform_id) {
-      return err(`Cannot determine destination for message #${seq}`);
-    }
+    const target = resolveSeqTarget(seq);
+    if ('error' in target) return err(target.error);
+    const { messageId: platformId, routing } = target;
 
     const id = generateId();
     await writeMessageOut({
@@ -350,13 +358,9 @@ export const addReaction: McpToolDefinition = {
     const emoji = args.emoji as string;
     if (!seq || !emoji) return err('messageId and emoji are required');
 
-    const platformId = getMessageIdBySeq(seq);
-    if (!platformId) return err(`Message #${seq} not found`);
-
-    const routing = getRoutingBySeq(seq);
-    if (!routing || !routing.channel_type || !routing.platform_id) {
-      return err(`Cannot determine destination for message #${seq}`);
-    }
+    const target = resolveSeqTarget(seq);
+    if ('error' in target) return err(target.error);
+    const { messageId: platformId, routing } = target;
 
     const id = generateId();
     await writeMessageOut({
