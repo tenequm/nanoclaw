@@ -27,6 +27,22 @@ describe('buildAskQuestionKeyboard', () => {
     expect(keyboard.inline_keyboard).toHaveLength(2);
   });
 
+  it('colours buttons by option style and leaves default and unstyled buttons alone', () => {
+    const options: NormalizedOption[] = [
+      { label: 'Approve', selectedLabel: 'Approve', value: 'a', style: 'primary' },
+      { label: 'Reject', selectedLabel: 'Reject', value: 'r', style: 'danger' },
+      { label: 'Later', selectedLabel: 'Later', value: 'l', style: 'default' },
+      { label: 'Skip', selectedLabel: 'Skip', value: 's' },
+    ];
+    const { keyboard } = buildAskQuestionKeyboard('q1', options);
+    expect(keyboard.inline_keyboard.map((row) => (row[0] as { style?: string }).style)).toEqual([
+      'primary',
+      'danger',
+      undefined,
+      undefined,
+    ]);
+  });
+
   it('drops options whose callback_data overflows 64 bytes', () => {
     const big = 'x'.repeat(70); // 70 bytes — encoded as "ncq:q1:<70 x>" > 64
     const options: NormalizedOption[] = [

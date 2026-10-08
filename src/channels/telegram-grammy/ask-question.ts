@@ -9,9 +9,16 @@
  */
 import { InlineKeyboard } from 'grammy';
 
-import type { NormalizedOption } from '../ask-question.js';
+import type { NormalizedOption, OptionStyle } from '../ask-question.js';
 
 const CALLBACK_DATA_LIMIT = 64;
+
+/** Telegram colours buttons since Bot API 9.4: primary is blue, danger red; `default` keeps the client's own. */
+const BUTTON_STYLE: Record<OptionStyle, 'primary' | 'danger' | undefined> = {
+  primary: 'primary',
+  danger: 'danger',
+  default: undefined,
+};
 
 /** Encode an ask-question option into the 64-byte callback_data slot. */
 export function encodeCallbackData(questionId: string, value: string): string {
@@ -28,7 +35,8 @@ export interface BuildKeyboardResult {
  *
  * Telegram doesn't auto-wrap long rows; we give each option its own row so
  * long labels render consistently across mobile/desktop. If a consumer
- * wants side-by-side buttons, they can batch options in the payload.
+ * wants side-by-side buttons, they can batch options in the payload. An
+ * option's `style` colours its button.
  */
 export function buildAskQuestionKeyboard(
   questionId: string,
@@ -45,6 +53,8 @@ export function buildAskQuestionKeyboard(
     }
     if (!first) kb.row();
     kb.text(opt.label, data);
+    const style = BUTTON_STYLE[opt.style ?? 'default'];
+    if (style) kb.style(style);
     first = false;
   }
   return { keyboard: kb, skippedLabels };
