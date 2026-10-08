@@ -95,6 +95,26 @@ upstream files: `src/session-manager.ts` `extractAttachmentFiles` (async; staged
 and `src/modules/agent-to-agent/agent-route.ts` `withoutHostStamps` (agents cannot pass a
 `stagedPath`).
 
+## A6. [MERGE] Telegram rich messages and formatting fidelity (2026-10-09)
+Fork surface; re-apply on upstream files:
+- `container_configs.rich_messages` (migration file 028, applied name
+  `container-config-rich-messages`, INTEGER NOT NULL DEFAULT 0): `src/types.ts`,
+  `src/db/container-configs.ts` (scalar set + insert), `src/backfill-container-configs.ts`,
+  `src/container-config.ts` (`richMessages: true` in container.json only when on),
+  `src/cli/resources/groups.ts` (`--rich-messages on|off`, shown as on/off).
+- `src/delivery.ts` `richAllowed`: the host strips `content.rich` unless the group has
+  `rich_messages = 1` (warns when it strips), the same way it owns `threadReply`.
+- Agent-runner: `config.ts` `richMessages`; `mcp-tools/core.ts` `offerRichMessages()` adds
+  `send_message`'s `rich` only when on, and the handler writes `rich: true` only when offered.
+- Island files: `outbound.ts` (`sendRich` with fallback to a normal message, rich edits,
+  the sent-kind map, caption overflow follow-ups, captioned mixed albums, `.gif` as
+  animation, split long edits, `editMessageCaption`), `formatter.ts` (nested/task lists,
+  divider, `tg://time` -> `date_time`, `splitCaption`), `inbound.ts`
+  (`richMessageToMarkdown`, rich mentions), `ask-question.ts` (button `style`), and
+  `agent-docs.ts` (the "Rich messages" section and the `telegram-formatting` gate,
+  imported by the island's `index.ts`).
+- `container/skills/telegram-formatting/instructions.md` [COPY].
+
 ## A3. [RESTORED 2026-08-31] Host chat commands
 Restored post-migration, adapted to the async DbDriver tree: `2055cfdb` (system),
 `ec9ecf38` (auto_compact_window column threading), `41a32836` (markdown fallback cards).
