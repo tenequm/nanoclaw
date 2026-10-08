@@ -10,6 +10,7 @@
  * off: runnerContext() goes back to the SQLite null sentinel and the server
  * never listens. That is the rollback; no image or data change is involved.
  */
+import { execFileSync } from 'child_process';
 import { randomBytes, timingSafeEqual } from 'crypto';
 import fs from 'fs';
 import type http from 'http';
@@ -56,11 +57,30 @@ export interface HttpRunnerContext {
  */
 function defaultBind(): string {
   if (os.platform() !== 'linux') return '127.0.0.1';
-  const bridge = os.networkInterfaces().docker0?.find((entry) => entry.family === 'IPv4');
+  const bridge =
+    os.networkInterfaces().docker0?.find((entry) => entry.family === 'IPv4')?.address ?? carrierlessBridgeAddress();
   if (!bridge) {
     throw new Error('Mailbox HTTP transport: no docker0 IPv4 address; set NANOCLAW_MAILBOX_HTTP_BIND explicitly');
   }
-  return bridge.address;
+  return bridge;
+}
+
+/**
+ * os.networkInterfaces() skips links that are not RUNNING, and docker0 loses
+ * carrier whenever no container is attached, so a host restart with no agent
+ * running would find nothing. The kernel still holds the address; ask iproute2.
+ */
+function carrierlessBridgeAddress(): string | undefined {
+  try {
+    const out = execFileSync('ip', ['-4', '-o', 'addr', 'show', 'dev', 'docker0'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+    });
+    return /\binet (\d{1,3}(?:\.\d{1,3}){3})\//.exec(out)?.[1];
+  } catch {
+    return undefined;
+  }
 }
 
 /** `process.env` wins, then `.env`, then the default: the driver settings' precedence. */

@@ -2,9 +2,17 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 
-const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: `/tmp/nanoclaw-mailbox-http-wrapper-${process.pid}` }));
+const { TEST_DIR, execFileSync } = vi.hoisted(() => ({
+  TEST_DIR: `/tmp/nanoclaw-mailbox-http-wrapper-${process.pid}`,
+  execFileSync: vi.fn(),
+}));
+// Partial: only the bridge-address probe is faked; everything else in the graph keeps the real module.
+vi.mock('child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('child_process')>()),
+  execFileSync,
+}));
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
   return { ...actual, DATA_DIR: TEST_DIR };
@@ -142,6 +150,51 @@ describe('readMailboxHttpSettings', () => {
       readMailboxHttpSettings({ NANOCLAW_MAILBOX_HTTP_BIND: '127.0.0.1', NANOCLAW_MAILBOX_HTTP_URL: 'http://mbx:9/' })
         .url,
     ).toBe('http://mbx:9');
+  });
+
+  describe('default bind on Linux', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+      execFileSync.mockReset();
+    });
+
+    it('uses the running docker0 address without shelling out', () => {
+      vi.spyOn(os, 'platform').mockReturnValue('linux');
+      vi.spyOn(os, 'networkInterfaces').mockReturnValue({
+        docker0: [
+          { address: '172.17.0.1', family: 'IPv4', netmask: '255.255.0.0', internal: false, mac: '', cidr: null },
+        ],
+      });
+      expect(readMailboxHttpSettings({}).bind).toBe('172.17.0.1');
+      expect(execFileSync).not.toHaveBeenCalled();
+    });
+
+    it('finds a carrier-less docker0 (no container running) through iproute2', () => {
+      vi.spyOn(os, 'platform').mockReturnValue('linux');
+      vi.spyOn(os, 'networkInterfaces').mockReturnValue({});
+      execFileSync.mockReturnValue(
+        '3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever\n',
+      );
+      const settings = readMailboxHttpSettings({});
+      expect(settings.bind).toBe('172.17.0.1');
+      expect(settings.url).toBe('http://172.17.0.1:3010');
+      expect(execFileSync).toHaveBeenCalledWith(
+        'ip',
+        ['-4', '-o', 'addr', 'show', 'dev', 'docker0'],
+        expect.anything(),
+      );
+    });
+
+    it('still refuses to guess when docker0 has no address at all', () => {
+      vi.spyOn(os, 'platform').mockReturnValue('linux');
+      vi.spyOn(os, 'networkInterfaces').mockReturnValue({});
+      execFileSync.mockImplementation(() => {
+        throw new Error('Device "docker0" does not exist.');
+      });
+      expect(() => readMailboxHttpSettings({}).bind).toThrow('no docker0 IPv4 address');
+      execFileSync.mockReturnValue('');
+      expect(() => readMailboxHttpSettings({}).bind).toThrow('no docker0 IPv4 address');
+    });
   });
 
   it('rejects an unknown transport or port instead of guessing', () => {
