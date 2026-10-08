@@ -163,11 +163,12 @@ const SKILLS_HOST_SUBPATH = path.join('container', 'skills');
 export type ProjectDocSectionProvider = (group: AgentGroup) => ProvidedSection | Promise<ProvidedSection>;
 type ProvidedSection = { name: string; body: string } | null;
 
-/** Whether a resident skill's `instructions.md` belongs in this agent's document at all. */
-export type ResidentSkillGate = (group: AgentGroup) => boolean | Promise<boolean>;
+/** Whether a module's or resident skill's prose belongs in this agent's document at all. */
+export type SectionGate = (group: AgentGroup) => boolean | Promise<boolean>;
 
 const sectionProviders: ProjectDocSectionProvider[] = [];
-const residentSkillGates = new Map<string, ResidentSkillGate>();
+const moduleSectionGates = new Map<string, SectionGate>();
+const residentSkillGates = new Map<string, SectionGate>();
 
 /**
  * Host modules register agent-specific prose here at import time, so the
@@ -178,28 +179,38 @@ export function registerProjectDocSection(provider: ProjectDocSectionProvider): 
 }
 
 /**
+ * Narrow a module's `<name>.instructions.md` to the agents the gate admits:
+ * every module's prose otherwise reaches every agent, whatever its channels.
+ * Prose only; the module's tools stay registered.
+ */
+export function registerModuleSectionGate(moduleName: string, gate: SectionGate): void {
+  moduleSectionGates.set(moduleName, gate);
+}
+
+/**
  * Narrow a resident skill to the agents the gate admits, whatever the
  * selection says: `"all"` would otherwise teach every agent a channel's rules.
  */
-export function registerResidentSkillGate(skillName: string, gate: ResidentSkillGate): void {
+export function registerResidentSkillGate(skillName: string, gate: SectionGate): void {
   residentSkillGates.set(skillName, gate);
 }
 
 /**
- * A gate that throws keeps its skill out: a missing rule costs that agent the
+ * A gate that throws keeps its section out: a missing rule costs that agent the
  * rule until its next spawn, a wrong one teaches every agent the channel's rules.
  */
-async function residentSkillAdmitted(skillName: string, group: AgentGroup): Promise<boolean> {
-  const gate = residentSkillGates.get(skillName);
+async function sectionAdmitted(
+  gates: Map<string, SectionGate>,
+  kind: 'module' | 'skill',
+  name: string,
+  group: AgentGroup,
+): Promise<boolean> {
+  const gate = gates.get(name);
   if (!gate) return true;
   try {
     return await gate(group);
   } catch (err) {
-    log.error('Resident skill gate threw; skill left out of the project document', {
-      skill: skillName,
-      group: group.name,
-      err,
-    });
+    log.error('Project document section gate threw; section left out', { kind, name, group: group.name, err });
     return false;
   }
 }
@@ -267,6 +278,7 @@ export async function composeGroupProjectDoc(
       if (!match) continue;
       const moduleName = match[1];
       if (cliDisabled && NCL_DEPENDENT_MODULES.has(moduleName)) continue;
+      if (!(await sectionAdmitted(moduleSectionGates, 'module', moduleName, group))) continue;
       push(`NanoClaw Module: ${moduleName}`, fs.readFileSync(path.join(mcpToolsHostDir, entry), 'utf-8'), true);
     }
   }
@@ -292,7 +304,7 @@ export async function composeGroupProjectDoc(
       if (selectedSkills !== 'all' && !selectedSkills.includes(skillName)) continue;
       const hostFragment = path.join(skillsHostDir, skillName, 'instructions.md');
       if (!fs.existsSync(hostFragment)) continue;
-      if (!(await residentSkillAdmitted(skillName, group))) continue;
+      if (!(await sectionAdmitted(residentSkillGates, 'skill', skillName, group))) continue;
       push(`NanoClaw Skill: ${skillName}`, fs.readFileSync(hostFragment, 'utf-8'), true);
     }
   }

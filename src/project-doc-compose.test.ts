@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const TEST_ROOT = '/tmp/nanoclaw-project-doc-compose-test';
 const REPO_ROOT = process.cwd();
+const MCP_TOOLS_DIR = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 
 vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
@@ -35,6 +36,7 @@ import { log } from './log.js';
 import {
   BASE_INSTRUCTIONS_PATH,
   composeGroupProjectDoc,
+  registerModuleSectionGate,
   DEFAULT_PROJECT_DOC,
   MEMORY_NOTE_PLACEHOLDER,
   renderBaseInstructions,
@@ -44,6 +46,7 @@ import type { AgentGroup } from './types.js';
 // Loading these modules registers the per-agent sections and skill gates under test.
 import { resetGateConfigCache, writeGateEntry } from './modules/jev-gate/index.js';
 import './channels/voice-mode.js';
+import './channels/slack.js';
 
 const CLAUDE_SPEC: ProjectDocSpec = {
   fileName: 'CLAUDE.md',
@@ -370,13 +373,13 @@ describe('composeGroupProjectDoc per-agent sections', () => {
     resetGateConfigCache();
   });
 
-  async function wire(ag: AgentGroup, mgId: string, channelType: string): Promise<void> {
+  async function wire(ag: AgentGroup, mgId: string, channelType: string, instance = channelType): Promise<void> {
     const createdAt = new Date().toISOString();
     await createMessagingGroup({
       id: mgId,
       channel_type: channelType,
       platform_id: `${channelType}:${mgId}`,
-      instance: channelType,
+      instance,
       name: mgId,
       is_group: 1,
       unknown_sender_policy: 'public',
@@ -453,6 +456,48 @@ describe('composeGroupProjectDoc per-agent sections', () => {
     // Proves the walk ran on the real tree at "all": the ungated resident skill is there.
     expect(doc).toContain('# NanoClaw Skill: onecli-gateway');
     expect(doc).not.toContain(`# ${VOICE_SECTION}`);
+  });
+  const SLACK_ONLY_MODULES = ['canvas', 'create-agent-slack', 'rooms'];
+
+  it('leaves the Slack-only module prose out for a Telegram-only agent', async () => {
+    const ag = await seed('ag-tg-only', 'tg-only-group');
+    await wire(ag, 'mg-tg-only', 'telegram');
+
+    const doc = await compose(ag);
+
+    expect(doc).toContain('# NanoClaw Module: core');
+    for (const name of SLACK_ONLY_MODULES) expect(doc).not.toContain(`# NanoClaw Module: ${name}\n`);
+  });
+
+  it('composes the Slack-only module prose for an agent wired to a named Slack instance', async () => {
+    const ag = await seed('ag-slack', 'slack-group');
+    await wire(ag, 'mg-tg-side', 'telegram');
+    await wire(ag, 'mg-slack-emma', 'slack', 'slack-emma');
+
+    const doc = await compose(ag);
+
+    const source = (name: string): string =>
+      fs.readFileSync(path.join(REPO_ROOT, MCP_TOOLS_DIR, `${name}.instructions.md`), 'utf-8').trim();
+    for (const name of SLACK_ONLY_MODULES) {
+      expect(composedSection(doc, `NanoClaw Module: ${name}`)).toContain(source(name));
+    }
+  });
+
+  it('leaves a module out, and logs at error, when its gate throws', async () => {
+    const ag = await seed('ag-gate-throws', 'gate-throws-group');
+    registerModuleSectionGate('self-mod', (g) => {
+      if (g.id === ag.id) throw new Error('gate down');
+      return true;
+    });
+
+    const doc = await compose(ag);
+
+    expect(doc).not.toContain('# NanoClaw Module: self-mod\n');
+    expect(doc).toContain('# NanoClaw Module: core');
+    expect(log.error).toHaveBeenCalledWith(
+      'Project document section gate threw; section left out',
+      expect.objectContaining({ kind: 'module', name: 'self-mod', group: ag.name }),
+    );
   });
 });
 

@@ -16,7 +16,10 @@
  */
 import { createSlackAdapter, type SlackAdapter } from '@chat-adapter/slack';
 
+import { getMessagingGroupsByAgentGroup } from '../db/messaging-groups.js';
 import { readEnvFile } from '../env.js';
+import { registerModuleSectionGate } from '../project-doc-compose.js';
+import type { AgentGroup } from '../types.js';
 import type { ChannelAdapter, ChannelDefaults } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -257,3 +260,12 @@ for (const raw of (readEnvFile(['SLACK_INSTANCES']).SLACK_INSTANCES ?? '').split
     defaults: SLACK_DEFAULTS,
   });
 }
+
+// Fork-only module prose that teaches Slack-only tools (canvases, Slack bot
+// provisioning, MPIM rooms) reaches only agents wired to a Slack chat. Every
+// instance shares channelType 'slack', so one channel_type check covers
+// `slack-<name>` bots too.
+const SLACK_ONLY_MODULE_SECTIONS = ['canvas', 'create-agent-slack', 'rooms'];
+const hasSlackWiring = async (group: AgentGroup): Promise<boolean> =>
+  (await getMessagingGroupsByAgentGroup(group.id)).some((mg) => mg.channel_type === 'slack');
+for (const moduleName of SLACK_ONLY_MODULE_SECTIONS) registerModuleSectionGate(moduleName, hasSlackWiring);
