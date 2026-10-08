@@ -21,10 +21,14 @@ function log(msg: string): void {
 async function main(): Promise<void> {
   const mailbox = getAgentMailbox();
   await mailbox.start(await readMailboxContext());
+  // startMcpServer returns once stdio is attached while tools keep running for
+  // the life of the process, so the mailbox stays started; each tool call
+  // commits its writes inside run().
   try {
     await startMcpServer((action) => mailbox.run(action));
-  } finally {
+  } catch (err) {
     await mailbox.stop();
+    throw err;
   }
 }
 
