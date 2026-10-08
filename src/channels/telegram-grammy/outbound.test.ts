@@ -13,23 +13,38 @@ import { dispatchOutbound } from './outbound.js';
 import { BotService, type HydratedBot } from './services.js';
 import { TELEGRAM_TEXT_LIMIT } from './formatter.js';
 
-type Call = { method: string; other: Record<string, unknown> };
+type Call = { method: string; args: unknown[]; other: Record<string, unknown> };
+
+/** Where each Bot API method takes its options object. */
+const OTHER_ARG: Record<string, number> = { editMessageText: 3, editMessageCaption: 2 };
+const METHODS = [
+  'sendMessage',
+  'sendDocument',
+  'sendPhoto',
+  'sendVideo',
+  'sendAnimation',
+  'sendMediaGroup',
+  'sendRichMessage',
+  'editMessageText',
+  'editMessageCaption',
+];
 
 function fakeBot(fail?: (call: Call) => unknown) {
   const calls: Call[] = [];
   let nextId = 100;
   const record =
     (method: string) =>
-    (_chatId: number, _payload: unknown, other: Record<string, unknown> = {}) => {
-      const call = { method, other };
+    (...args: unknown[]) => {
+      const call = { method, args, other: (args[OTHER_ARG[method] ?? 2] ?? {}) as Record<string, unknown> };
       calls.push(call);
       const err = fail?.(call);
-      return err ? Promise.reject(err) : Promise.resolve({ message_id: nextId++ });
+      if (err) return Promise.reject(err);
+      if (method === 'sendMediaGroup')
+        return Promise.resolve((args[1] as unknown[]).map(() => ({ message_id: nextId++ })));
+      return Promise.resolve({ message_id: nextId++ });
     };
   const layer = Layer.succeed(BotService, {
-    bot: {
-      api: { sendMessage: record('sendMessage'), sendDocument: record('sendDocument'), sendPhoto: record('sendPhoto') },
-    } as unknown as HydratedBot,
+    bot: { api: Object.fromEntries(METHODS.map((m) => [m, record(m)])) } as unknown as HydratedBot,
     me: { id: 1, is_bot: true, first_name: 'Dan', username: 'dan_bot' } as UserFromGetMe,
     start: () => Effect.void,
     stop: () => Effect.void,
@@ -43,11 +58,11 @@ function fakeBot(fail?: (call: Call) => unknown) {
 
 const file = (filename: string) => ({ filename, data: Buffer.from('x') });
 
-const badRequest = (what: string) =>
+const badRequest = (what: string, method = 'sendMessage') =>
   new GrammyError(
-    "Call to 'sendMessage' failed!",
+    `Call to '${method}' failed!`,
     { ok: false, error_code: 400, description: `Bad Request: ${what}` },
-    'sendMessage',
+    method,
     {},
   );
 
@@ -156,5 +171,102 @@ describe('telegram outbound reply threading', () => {
     expect(bot.calls[0].other.entities).toEqual([
       { type: 'text_link', offset: 5, length: 5, url: 'tg://user?id=350751696' },
     ]);
+  });
+});
+
+describe('telegram outbound never drops text', () => {
+  const longCaption = `${'c'.repeat(1000)}\n\n${'tail '.repeat(60)}end`;
+
+  it('sends caption overflow as a follow-up message after a single file', async () => {
+    const bot = fakeBot();
+    await bot.run({ kind: 'chat', content: { text: longCaption }, files: [file('a.jpg')] });
+    expect(bot.calls.map((c) => c.method)).toEqual(['sendPhoto', 'sendMessage']);
+    expect(bot.calls[0].other.caption).toBe('c'.repeat(1000));
+    expect(bot.calls[1].args[1]).toBe(`${'tail '.repeat(60)}end`);
+  });
+
+  it('sends caption overflow after the last of several files', async () => {
+    const bot = fakeBot();
+    await bot.run({ kind: 'chat', content: { text: longCaption }, files: [file('a.pdf'), file('b.pdf')] });
+    expect(bot.calls.map((c) => c.method)).toEqual(['sendDocument', 'sendDocument', 'sendMessage']);
+    expect(bot.calls[1].other.caption).toBeUndefined();
+  });
+
+  it('keeps every caption when a mixed album falls back to sequential documents', async () => {
+    const bot = fakeBot();
+    await bot.run({
+      kind: 'chat',
+      content: {
+        operation: 'send_media_group',
+        items: [
+          { path: 'a.jpg', caption: 'photo caption' },
+          { path: 'b.pdf', caption: '**doc** caption' },
+        ],
+      },
+      files: [file('a.jpg'), file('b.pdf')],
+    });
+    expect(bot.calls.map((c) => [c.method, c.other.caption])).toEqual([
+      ['sendDocument', 'photo caption'],
+      ['sendDocument', 'doc caption'],
+    ]);
+    expect(bot.calls[1].other.caption_entities).toEqual([{ type: 'bold', offset: 0, length: 3 }]);
+  });
+
+  it('sends a gif in an album as an animation and keeps the rest an album', async () => {
+    const bot = fakeBot();
+    const id = await bot.run({
+      kind: 'chat',
+      content: {
+        operation: 'send_media_group',
+        items: [{ path: 'a.jpg' }, { path: 'b.gif', caption: 'loop' }, { path: 'c.jpg' }],
+      },
+      files: [file('a.jpg'), file('b.gif'), file('c.jpg')],
+    });
+    expect(bot.calls.map((c) => c.method)).toEqual(['sendMediaGroup', 'sendAnimation']);
+    expect((bot.calls[0].args[1] as Array<{ type: string }>).map((m) => m.type)).toEqual(['photo', 'photo']);
+    expect(bot.calls[1].other.caption).toBe('loop');
+    expect(id).toBe('100');
+  });
+
+  it('sends album caption overflow after the album', async () => {
+    const bot = fakeBot();
+    await bot.run({
+      kind: 'chat',
+      content: { operation: 'send_media_group', items: [{ path: 'a.jpg', caption: longCaption }, { path: 'b.jpg' }] },
+      files: [file('a.jpg'), file('b.jpg')],
+    });
+    expect(bot.calls.map((c) => c.method)).toEqual(['sendMediaGroup', 'sendMessage']);
+  });
+
+  it('splits a long edit: edits the first part and sends the rest', async () => {
+    const bot = fakeBot();
+    const long = `${'a'.repeat(TELEGRAM_TEXT_LIMIT - 10)}\n\n${'b'.repeat(200)}`;
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: '42:7', text: long } });
+    expect(bot.calls.map((c) => c.method)).toEqual(['editMessageText', 'sendMessage']);
+    expect(bot.calls[0].args.slice(0, 3)).toEqual([42, 7, 'a'.repeat(TELEGRAM_TEXT_LIMIT - 10)]);
+    expect(bot.calls[1].args[1]).toBe('b'.repeat(200));
+  });
+
+  it('edits the caption of a media message the bot sent', async () => {
+    const bot = fakeBot();
+    const id = await bot.run({ kind: 'chat', content: { text: 'pic' }, files: [file('a.jpg')] });
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '**new** caption' } });
+    expect(bot.calls[1]).toMatchObject({
+      method: 'editMessageCaption',
+      other: { caption: 'new caption', caption_entities: [{ type: 'bold', offset: 0, length: 3 }] },
+    });
+  });
+
+  it('falls back to editMessageCaption when Telegram says the message has no text', async () => {
+    const bot = fakeBot((call) =>
+      call.method === 'editMessageText'
+        ? badRequest('there is no text in the message to edit', call.method)
+        : undefined,
+    );
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: '42:900', text: 'fixed' } });
+    expect(bot.calls.map((c) => c.method)).toEqual(['editMessageText', 'editMessageCaption']);
+    // Remembered: the next edit goes straight to the caption.
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: '42:900', text: 'again' } });
+    expect(bot.calls.map((c) => c.method).slice(2)).toEqual(['editMessageCaption']);
   });
 });

@@ -718,43 +718,56 @@ export function renderFS(markdown: string): FormattedString {
 }
 
 /**
- * Length-aware splitter — preserves entities across chunk boundaries by
- * using FormattedString.slice (which recomputes entity offsets). Prefers
- * to break on a newline within the last ~200 chars of the limit, falls
- * through to space, then hard cut.
+ * End (exclusive) of the chunk that starts at `cursor`: prefers a paragraph
+ * break, then a line break, then a space within the last ~200 chars of the
+ * limit, and falls back to a hard cut.
+ */
+function chunkEnd(raw: string, cursor: number, limit: number): number {
+  if (raw.length - cursor <= limit) return raw.length;
+  const windowStart = cursor + Math.max(0, limit - 200);
+  const chunkText = raw.slice(cursor, cursor + limit);
+  let cut = chunkText.lastIndexOf('\n\n');
+  if (cut === -1 || cursor + cut <= windowStart) cut = chunkText.lastIndexOf('\n');
+  if (cut === -1 || cursor + cut <= windowStart) cut = chunkText.lastIndexOf(' ');
+  if (cut === -1) cut = limit;
+  return cursor + cut;
+}
+
+/** Skip whitespace that only served as a break between chunks. */
+function skipBreak(raw: string, cursor: number): number {
+  while (cursor < raw.length && (raw[cursor] === '\n' || raw[cursor] === ' ')) cursor++;
+  return cursor;
+}
+
+/**
+ * Length-aware splitter - preserves entities across chunk boundaries by
+ * using FormattedString.slice (which recomputes entity offsets).
  */
 function splitAt(fs: FormattedString, limit: number): FormattedString[] {
-  if (fs.rawText.length <= limit) return [fs];
-
+  const raw = fs.rawText;
+  if (raw.length <= limit) return [fs];
   const out: FormattedString[] = [];
-  let cursor = 0;
-  const total = fs.rawText.length;
-
-  while (cursor < total) {
-    const remaining = total - cursor;
-    if (remaining <= limit) {
-      out.push(fs.slice(cursor, total));
-      break;
-    }
-
-    const windowStart = cursor + Math.max(0, limit - 200);
-    const windowEnd = cursor + limit;
-    const chunkText = fs.rawText.slice(cursor, windowEnd);
-
-    let cut = chunkText.lastIndexOf('\n\n');
-    if (cut === -1 || cursor + cut <= windowStart) cut = chunkText.lastIndexOf('\n');
-    if (cut === -1 || cursor + cut <= windowStart) cut = chunkText.lastIndexOf(' ');
-    if (cut === -1) cut = limit;
-
-    const absCut = cursor + cut;
-    out.push(fs.slice(cursor, absCut));
-    cursor = absCut;
-    // Skip any leading whitespace that only served as a break.
-    while (cursor < total && (fs.rawText[cursor] === '\n' || fs.rawText[cursor] === ' ')) cursor++;
+  for (let cursor = 0; cursor < raw.length; ) {
+    const end = chunkEnd(raw, cursor, limit);
+    out.push(fs.slice(cursor, end));
+    cursor = skipBreak(raw, end);
   }
-
   return out.filter((c) => c.rawText.length > 0);
 }
 
 export const splitForBody = (fs: FormattedString): FormattedString[] => splitAt(fs, TELEGRAM_TEXT_LIMIT);
-export const splitForCaption = (fs: FormattedString): FormattedString[] => splitAt(fs, TELEGRAM_CAPTION_LIMIT);
+
+/**
+ * A media caption and whatever does not fit in it: the caption takes the first
+ * 1024 characters (cut at a break), and the remainder is split into message
+ * bodies so the caller can send it right after the file. Nothing is dropped.
+ */
+export function splitCaption(fs: FormattedString): { caption: FormattedString | undefined; rest: FormattedString[] } {
+  const raw = fs.rawText;
+  if (raw.length === 0) return { caption: undefined, rest: [] };
+  if (raw.length <= TELEGRAM_CAPTION_LIMIT) return { caption: fs, rest: [] };
+  const end = chunkEnd(raw, 0, TELEGRAM_CAPTION_LIMIT);
+  const restStart = skipBreak(raw, end);
+  const rest = restStart < raw.length ? splitForBody(fs.slice(restStart, raw.length)) : [];
+  return { caption: fs.slice(0, end), rest };
+}
