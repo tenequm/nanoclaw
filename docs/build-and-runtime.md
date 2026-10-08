@@ -75,6 +75,30 @@ Any failure fails the PR.
 - **No tsc build step in the container image.** Re-adding one would reintroduce the ~200-500ms per-session-wake cost we removed.
 - **Global container CLIs stay on pnpm, not Bun.** `agent-browser`, `@anthropic-ai/claude-code`, `vercel` and any future Node CLIs the agent invokes should be pinned versions under the Dockerfile's pnpm global-install block. `bun install -g` would bypass the pnpm supply-chain policy.
 
+## Registry images (GHCR)
+
+`.github/workflows/agent-image.yml` publishes two public images, on manual dispatch and on pushes to `main` that touch `container/**`:
+
+| Image | Built from | `/app/src`, `/app/skills` |
+|---|---|---|
+| `ghcr.io/tenequm/nanoclaw-agent` | `container/Dockerfile`, unchanged | Absent - the host bind-mounts them at spawn, exactly like a local build |
+| `ghcr.io/tenequm/nanoclaw-agent-k8s` | `container/Dockerfile.k8s`, `FROM` the base above by digest | Baked in from the commit that built it |
+
+- **Tags**: the full git SHA on every run, plus `latest` on `main`. A tag moves; pin by digest.
+- **The k8s image's source is frozen at build time.** There is no mount override: a runner or skill change reaches the cluster only through a new image. It exists for hosts that cannot bind-mount a checkout; on a host that can, use the base image so source edits apply without a rebuild.
+- **Labels**: both carry `dev.nanoclaw.agent-runner-lock-sha256`, so `container/pull.sh` accepts them without `NANOCLAW_ALLOW_UNLABELED_IMAGE`, and `dev.nanoclaw.image-source=local` - a CI build of the public-base Dockerfile, not the vendor-hardened image. The k8s image adds `dev.nanoclaw.baked-source-revision` with the commit its source came from.
+- **Platform**: `linux/amd64` only. arm64 is a `platforms:` change on both builds.
+- **`container/CLAUDE.md` is not baked**: the host composes it into the group's `/workspace/agent/CLAUDE.md`, so a cluster driver supplies it the same way it supplies the rest of `/workspace`.
+
+Pin by digest (the run's summary prints both):
+
+```bash
+crane digest ghcr.io/tenequm/nanoclaw-agent-k8s:<git-sha>
+docker pull ghcr.io/tenequm/nanoclaw-agent-k8s@sha256:<digest>
+```
+
+An install that pulls instead of building can use the base image: `NANOCLAW_HARDENED_IMAGE=true` and `NANOCLAW_AGENT_IMAGE_REF=ghcr.io/tenequm/nanoclaw-agent@sha256:<digest>` (see [hardened-image.md](hardened-image.md)). `--status` reports it as a local build, which is what it is.
+
 ## Migration history
 
 This structure replaced a uniform npm-on-Node stack across both host and container. The pnpm migration landed first (PR #1771) to bring the host under supply-chain policy, then the container moved to Bun to eliminate native-module compilation and the per-wake tsc step. The split was chosen over going full-Bun because Baileys' native deps are the main risk surface on the host — the container has no such deps, so it benefits from Bun without taking the risk.
