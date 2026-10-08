@@ -323,7 +323,7 @@ function renderRow(s: StateRow, agentName: string): string {
   const quote = row.replyTo?.text ? `: "${clip(oneLine(row.replyTo.text), REPLY_QUOTE_CHARS)}"` : '';
   const reply = row.replyTo ? ` (replying to ${row.replyTo.sender}${quote})` : '';
   const album = s.album ? `[album, ${s.album.items} item${s.album.items === 1 ? '' : 's'}] ` : '';
-  const body = oneLine(s.body) || (row.hasMedia ? '[media]' : '');
+  const body = oneLine(s.body) || (row.hasMedia && !s.album ? '[media]' : '');
   return `${who}${s.edited ? ' (edited)' : ''}${reply}: ${album}${body}`.trimEnd();
 }
 

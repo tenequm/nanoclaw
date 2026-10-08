@@ -682,6 +682,8 @@ describe('state rendering', () => {
     const state = renderState(album, next, AGENT_NAME);
     expect(historyOf(state).match(/\[album/g)).toHaveLength(1);
     expect(state).toContain('Alex: [album, 4 items] look at this');
+    const bare = renderState([row({ text: '[album 9]', hasMedia: true })], next, AGENT_NAME);
+    expect(bare).toContain('Alex: [album, 1 item]\n');
   });
 
   it('keeps only the latest version of an edited message', () => {
