@@ -159,6 +159,52 @@ const NCL_DEPENDENT_MODULES = new Set(['cli', 'scheduling']);
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 const SKILLS_HOST_SUBPATH = path.join('container', 'skills');
 
+/** A section a host module contributes for the agents it applies to; null for every other agent. */
+export type ProjectDocSectionProvider = (
+  group: AgentGroup,
+) => { name: string; body: string } | null | Promise<{ name: string; body: string } | null>;
+
+/** Whether a resident skill's `instructions.md` belongs in this agent's document at all. */
+export type ResidentSkillGate = (group: AgentGroup) => boolean | Promise<boolean>;
+
+const sectionProviders: ProjectDocSectionProvider[] = [];
+const residentSkillGates = new Map<string, ResidentSkillGate>();
+
+/**
+ * Host modules register agent-specific prose here at import time, so the
+ * composer never imports them and core composes the same with none installed.
+ */
+export function registerProjectDocSection(provider: ProjectDocSectionProvider): void {
+  sectionProviders.push(provider);
+}
+
+/**
+ * Narrow a resident skill to the agents the gate admits, whatever the
+ * selection says: `"all"` would otherwise teach every agent a channel's rules.
+ */
+export function registerResidentSkillGate(skillName: string, gate: ResidentSkillGate): void {
+  residentSkillGates.set(skillName, gate);
+}
+
+/**
+ * A gate that throws keeps its skill out: a missing rule costs one spawn of
+ * that agent, a wrong one teaches every agent the channel's rules.
+ */
+async function residentSkillAdmitted(skillName: string, group: AgentGroup): Promise<boolean> {
+  const gate = residentSkillGates.get(skillName);
+  if (!gate) return true;
+  try {
+    return await gate(group);
+  } catch (err) {
+    log.warn('Resident skill gate threw; skill left out of the project document', {
+      skill: skillName,
+      group: group.name,
+      err,
+    });
+    return false;
+  }
+}
+
 /**
  * Regenerate `groups/<folder>/<spec.fileName>` from every instruction source
  * the group has switched on. Deterministic: same inputs, same file.
@@ -226,6 +272,17 @@ export async function composeGroupProjectDoc(
     }
   }
 
+  // Agent-specific sections from host modules. A provider that throws loses
+  // only its own section, never the spawn.
+  for (const provider of sectionProviders) {
+    try {
+      const section = await provider(group);
+      if (section) push(section.name, section.body, true);
+    } catch (err) {
+      log.warn('Project document section provider threw; section left out', { group: group.name, err });
+    }
+  }
+
   // Resident skill prose. A skill's `SKILL.md` is loaded on demand by skill
   // discovery; its `instructions.md` has to be in context before the agent
   // knows it needs it, because a prohibition cannot be lazily loaded. Same
@@ -236,6 +293,7 @@ export async function composeGroupProjectDoc(
       if (selectedSkills !== 'all' && !selectedSkills.includes(skillName)) continue;
       const hostFragment = path.join(skillsHostDir, skillName, 'instructions.md');
       if (!fs.existsSync(hostFragment)) continue;
+      if (!(await residentSkillAdmitted(skillName, group))) continue;
       push(`NanoClaw Skill: ${skillName}`, fs.readFileSync(hostFragment, 'utf-8'), true);
     }
   }

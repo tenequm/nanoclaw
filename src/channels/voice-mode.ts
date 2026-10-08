@@ -46,11 +46,13 @@ import {
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
-import { findVoiceModeLineByToken, hashLinkToken } from '../db/voice-mode-lines.js';
+import { findVoiceModeLineByToken, getVoiceModeLineForAgent, hashLinkToken } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand } from './voice-mode-command.js';
+import { voiceLinesOf } from '../commands/index.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { registerResidentSkillGate } from '../project-doc-compose.js';
 import { requestWake } from '../request-wake.js';
 import type { Session } from '../types.js';
 import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
@@ -770,3 +772,11 @@ registerChannelAdapter(LEGACY_VOICE_CHANNEL, {
   },
   defaults: VOICE_MODE_DEFAULTS,
 });
+
+// Call formatting reaches only agents that take calls: a voice_mode_lines row,
+// or a line from before the rename (a wired `voice` chat).
+registerResidentSkillGate(
+  'voice-mode-formatting',
+  async (group) =>
+    (await getVoiceModeLineForAgent(group.id)) !== undefined || (await voiceLinesOf(group.id)).length > 0,
+);

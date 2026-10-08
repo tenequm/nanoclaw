@@ -31,6 +31,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { findSessionForAgent } from '../../db/sessions.js';
 import { log } from '../../log.js';
+import { registerProjectDocSection } from '../../project-doc-compose.js';
 import { gateEntryFor, type JevGateEntry } from './config.js';
 import {
   consecutiveBotWakes,
@@ -55,6 +56,15 @@ export {
   writeGateEntry,
 } from './config.js';
 export type { JevGateEntry, JevGatePatch, JevThresholds } from './config.js';
+
+const JEV_GATE_NOTE =
+  'Every chat message reaches you as context. A mention or a reply always wakes you; other messages pass a fast gate (Jev) that wakes you when you might help, like an unanswered question. A gate wake is an invitation, not an order: answer if you add real substance, otherwise stay `<internal>`.';
+
+// Live mode only: shadow silences every ambient message, so a shadow-gated
+// agent still wakes on mentions alone and the note would be false.
+registerProjectDocSection((group) =>
+  gateEntryFor(group.id)?.mode === 'live' ? { name: 'NanoClaw Module: jev-gate', body: JEV_GATE_NOTE } : null,
+);
 
 export interface JevGateOutcome {
   /** True when the router must flip `engages` off (live mode, silent verdict). */

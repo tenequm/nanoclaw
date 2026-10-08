@@ -9,12 +9,27 @@ vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
+// The jev gate reads `<DATA_DIR>/jev-gate.json`; keep it inside the test root.
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  DATA_DIR: '/tmp/nanoclaw-project-doc-compose-test/data',
+}));
+
 import {
   ensureContainerConfig,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from './db/container-configs.js';
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  getDb,
+  initTestDb,
+  runMigrations,
+} from './db/index.js';
+import { createVoiceModeLine } from './db/voice-mode-lines.js';
 import { PERSONA_PREPEND_FILE } from './group-persona.js';
 import { log } from './log.js';
 import {
@@ -26,6 +41,9 @@ import {
   type ProjectDocSpec,
 } from './project-doc-compose.js';
 import type { AgentGroup } from './types.js';
+// Side-effect imports: the host modules whose per-agent registrations are under test.
+import { resetGateConfigCache, writeGateEntry } from './modules/jev-gate/index.js';
+import './channels/voice-mode.js';
 
 const CLAUDE_SPEC: ProjectDocSpec = {
   fileName: 'CLAUDE.md',
@@ -311,14 +329,13 @@ describe('composeGroupProjectDoc skill selection', () => {
     expect(doc).toContain('# NanoClaw Skill: fixture-gateway');
   });
 
-  // The fork's no-em-dash rule lives once, in the base's Tenequm defaults block; the voice guidance
-  // is resident skill prose. Red if either moves or stops composing from the real tree.
-  it('carries the em-dash rule once, inside the Tenequm defaults block, and composes voice-mode-formatting', async () => {
+  // The fork's no-em-dash rule lives once, in the base's Tenequm defaults block. Red if it moves
+  // back into a skill, or the defaults block stops composing from the real tree.
+  it('carries the em-dash rule once, inside the Tenequm defaults block', async () => {
     const ag = await seed('ag-resident', 'resident-group');
 
     const doc = await withRealContainer(() => compose(ag));
 
-    expect(composedSection(doc, 'NanoClaw Skill: voice-mode-formatting')).toContain(realSkill('voice-mode-formatting'));
     const base = composedSection(doc, 'NanoClaw Runtime Contract');
     expect(base).toContain('You are a NanoClaw agent.');
     const defaultsAt = base.indexOf('\n## Tenequm defaults\n');
@@ -326,6 +343,101 @@ describe('composeGroupProjectDoc skill selection', () => {
     expect(base.slice(0, defaultsAt)).not.toMatch(/no em-dash/i);
     expect(base.slice(defaultsAt)).toMatch(/no em-dash, ever/i);
     expect(doc.match(/no em-dash, ever/gi)).toHaveLength(1);
+  });
+});
+
+describe('composeGroupProjectDoc per-agent sections', () => {
+  const JEV_HEADING = '# NanoClaw Module: jev-gate';
+  const VOICE_HEADING = '# NanoClaw Skill: voice-mode-formatting';
+
+  beforeEach(() => {
+    fs.mkdirSync(path.join(TEST_ROOT, 'data'), { recursive: true });
+    resetGateConfigCache();
+  });
+
+  async function wire(ag: AgentGroup, mgId: string, channelType: string): Promise<void> {
+    const createdAt = new Date().toISOString();
+    await createMessagingGroup({
+      id: mgId,
+      channel_type: channelType,
+      platform_id: `${channelType}:${mgId}`,
+      instance: channelType,
+      name: mgId,
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: createdAt,
+    });
+    await createMessagingGroupAgent({
+      id: `mga-${mgId}`,
+      messaging_group_id: mgId,
+      agent_group_id: ag.id,
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      threads: 0,
+      created_at: createdAt,
+    });
+  }
+
+  it('adds the jev-gate note for an agent whose gate is live', async () => {
+    const ag = await seed('ag-jev-live', 'jev-live-group');
+    writeGateEntry(ag.id, { enabled: true, mode: 'live' });
+
+    const doc = await compose(ag);
+
+    expect(composedSection(doc, 'NanoClaw Module: jev-gate')).toContain('A gate wake is an invitation, not an order');
+  });
+
+  // Shadow silences every ambient message, so the note's "the gate wakes you" would be false.
+  it.each([
+    ['no entry', undefined],
+    ['a disabled entry', { enabled: false, mode: 'live' as const }],
+    ['a shadow entry', { enabled: true, mode: 'shadow' as const }],
+  ])('leaves the jev-gate note out with %s', async (_label, entry) => {
+    const ag = await seed(`ag-jev-${_label.length}`, `jev-off-${_label.length}`);
+    if (entry) writeGateEntry(ag.id, entry);
+
+    const doc = await compose(ag);
+
+    expect(doc).not.toContain(JEV_HEADING);
+  });
+
+  it('composes voice-mode-formatting for an agent with a voice-mode line', async () => {
+    const ag = await seed('ag-voice', 'voice-group');
+    await wire(ag, 'mg-voice-chat', 'telegram');
+    await createVoiceModeLine({
+      agentGroupId: ag.id,
+      ownerUserId: 'telegram:owner',
+      messagingGroupId: 'mg-voice-chat',
+      threadId: null,
+    });
+
+    const doc = await withRealContainer(() => compose(ag));
+
+    expect(composedSection(doc, 'NanoClaw Skill: voice-mode-formatting')).toContain(realSkill('voice-mode-formatting'));
+  });
+
+  it('composes voice-mode-formatting for an agent with a line from before the rename', async () => {
+    const ag = await seed('ag-voice-legacy', 'voice-legacy-group');
+    await wire(ag, 'mg-voice-legacy', 'voice');
+
+    const doc = await withRealContainer(() => compose(ag));
+
+    expect(doc).toContain(VOICE_HEADING);
+  });
+
+  it('leaves voice-mode-formatting out for a non-voice agent on the "all" selection', async () => {
+    const ag = await seed('ag-no-voice', 'no-voice-group');
+    await wire(ag, 'mg-text-only', 'telegram');
+
+    const doc = await withRealContainer(() => compose(ag));
+
+    // Proves the walk ran on the real tree at "all": the ungated resident skill is there.
+    expect(doc).toContain('# NanoClaw Skill: onecli-gateway');
+    expect(doc).not.toContain(VOICE_HEADING);
   });
 });
 
