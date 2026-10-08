@@ -125,19 +125,6 @@ export class TranscriptionService extends Context.Service<
 >()('telegram-grammy/TranscriptionService') {}
 
 /**
- * GroupFolderService - messaging_group -> the wired primary agent group's
- * resolved folder (under `GROUPS_DIR`), or `null` when the platformId isn't
- * paired yet. Attachments use it only to skip downloads for unpaired chats;
- * the bytes go to staging and then to each session's inbox.
- */
-export class GroupFolderService extends Context.Service<
-  GroupFolderService,
-  {
-    readonly resolveForPlatformId: (platformId: string) => Effect.Effect<string | null>;
-  }
->()('telegram-grammy/GroupFolderService') {}
-
-/**
  * AdapterConfigService — holds the bot token plus the two Promise-shaped
  * callbacks the host hands us via `ChannelSetup`. They are wrapped into
  * Effect-returning functions so the rest of the module never sees raw

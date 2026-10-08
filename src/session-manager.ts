@@ -294,7 +294,7 @@ export async function writeSessionMessage(
   initSessionFolder(agentGroupId, sessionId);
 
   // Extract base64 attachment data, save to inbox, replace with file paths
-  const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
+  const content = await extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
 
   await withMailboxSession(agentGroupId, sessionId, async (mailbox) => {
     await mailbox.insertMessage({
@@ -336,15 +336,16 @@ export async function writeSessionMessage(
  *   1. basename check on `messageId` and `filename`.
  *   2. lstat of the inbox dir to refuse pre-placed symlinks.
  *   3. realpath-based containment under the session inbox root.
- *   4. `wx` flag on writeFileSync to refuse following a pre-existing symlink
- *      at the target file path or overwriting any existing file.
+ *   4. `wx` / `COPYFILE_EXCL` exclusive create to refuse following a
+ *      pre-existing symlink at the target file path or overwriting any
+ *      existing file.
  */
-function extractAttachmentFiles(
+async function extractAttachmentFiles(
   agentGroupId: string,
   sessionId: string,
   messageId: string,
   contentStr: string,
-): string {
+): Promise<string> {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(contentStr);
@@ -355,26 +356,39 @@ function extractAttachmentFiles(
   const attachments = parsed.attachments as Array<Record<string, unknown>> | undefined;
   if (!Array.isArray(attachments)) return contentStr;
 
+  // A host path never reaches the container, whatever happens below.
+  let changed = false;
+  const stagedPaths = new Map<Record<string, unknown>, string>();
+  for (const att of attachments) {
+    if (!('stagedPath' in att)) continue;
+    if (typeof att.stagedPath === 'string') stagedPaths.set(att, att.stagedPath);
+    delete att.stagedPath;
+    changed = true;
+  }
+
   if (!isSafeAttachmentName(messageId)) {
     log.warn('Rejecting unsafe inbound message id', { messageId });
-    return contentStr;
+    return changed ? JSON.stringify(parsed) : contentStr;
   }
 
   const inboxRoot = path.join(sessionDir(agentGroupId, sessionId), 'inbox');
   // Resolved lazily on the first attachment that actually carries bytes, so a
-  // message whose attachments have no inline `data` never creates an inbox dir.
-  // ensureContainedInboxDir refuses a pre-placed symlink at the inbox root or
-  // the per-message subdir before any write lands outside the sandbox (#2828).
+  // message whose attachments have no inline `data` or `stagedPath` never
+  // creates an inbox dir. ensureContainedInboxDir refuses a pre-placed symlink
+  // at the inbox root or the per-message subdir before any write lands outside
+  // the sandbox (#2828).
   let inboxDir: string | null = null;
   let inboxResolved = false;
 
-  let changed = false;
   for (const att of attachments) {
-    const staged = typeof att.stagedPath === 'string' ? att.stagedPath : undefined;
+    const staged = stagedPaths.get(att);
     if (typeof att.data !== 'string' && !staged) continue;
     const stagedSource = staged ? containedStagedFile(staged) : null;
     if (staged && !stagedSource) {
-      log.warn('Refused staged attachment outside the inbound staging root', { messageId });
+      log.warn('Staged attachment is missing, not a regular file, or outside the inbound staging root', {
+        messageId,
+      });
+      att.error = 'the file is no longer available';
       continue;
     }
 
@@ -402,7 +416,9 @@ function extractAttachmentFiles(
       // existing symlink or overwrite any existing file. The host expects to
       // be the sole writer of these attachments.
       if (stagedSource) {
-        fs.copyFileSync(stagedSource, filePath, fs.constants.COPYFILE_EXCL);
+        // Async: a staged file can be gigabytes. FICLONE reflinks where the
+        // filesystem can and falls back to a full copy where it cannot.
+        await fs.promises.copyFile(stagedSource, filePath, fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE);
       } else {
         fs.writeFileSync(filePath, Buffer.from(att.data as string, 'base64'), { flag: 'wx' });
       }
@@ -415,38 +431,36 @@ function extractAttachmentFiles(
         });
         continue;
       }
+      // One unsavable file costs that attachment, never the message (ENOSPC on a large copy).
+      if (stagedSource) {
+        log.warn('Could not copy a staged attachment into the inbox', { messageId, filename, err });
+        att.error = `could not be saved (${e.code ?? 'copy failed'})`;
+        changed = true;
+        continue;
+      }
       throw err;
     }
 
     if (!staged) att.name = filename;
     att.localPath = `inbox/${messageId}/${filename}`;
     delete att.data;
-    delete att.stagedPath;
     changed = true;
     log.debug('Saved attachment to inbox', { messageId, filename, size: att.size });
-  }
-
-  // A host path never reaches the container, saved or not.
-  for (const att of attachments) {
-    if ('stagedPath' in att) {
-      delete att.stagedPath;
-      changed = true;
-    }
   }
 
   return changed ? JSON.stringify(parsed) : contentStr;
 }
 
 /**
- * The real path of a staged file, or null unless it is a regular file under
- * the staging root. Content also arrives from agents (agent-to-agent), so a
- * `stagedPath` is untrusted until it resolves inside the root.
+ * The real path of a staged file, or null unless it is a regular file (not a
+ * symlink) under the staging root. Content also arrives from agents
+ * (agent-to-agent), so a `stagedPath` is untrusted until it resolves inside.
  */
 function containedStagedFile(stagedPath: string): string | null {
   try {
+    if (!fs.lstatSync(stagedPath).isFile()) return null;
     const real = fs.realpathSync(stagedPath);
-    if (!isPathInside(fs.realpathSync(inboundStagingRoot()), real)) return null;
-    return fs.statSync(real).isFile() ? real : null;
+    return isPathInside(fs.realpathSync(inboundStagingRoot()), real) ? real : null;
   } catch {
     return null;
   }

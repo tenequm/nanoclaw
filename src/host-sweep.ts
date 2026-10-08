@@ -16,6 +16,7 @@ import { stopOrphanedSessions } from './container-runner.js';
 import { ensureEgressNetwork } from './egress-lockdown.js';
 import { getActiveSessions } from './db/sessions.js';
 import { peekSessionDriver } from './drivers/index.js';
+import { sweepInboundStaging } from './inbox-safety.js';
 import type { SessionWatch } from './drivers/types.js';
 import { log } from './log.js';
 import { registerReconcileEnqueue } from './reconcile-feeds.js';
@@ -109,6 +110,15 @@ export function startHostSweep(): void {
           log.error('Orphaned container sweep failed', { err });
         }
       },
+      // Drop inbound attachments an adapter staged on disk once routing has
+      // had its window to copy them into session inboxes.
+      'singleton:inbound-staging': async () => {
+        try {
+          await sweepInboundStaging();
+        } catch (err) {
+          log.error('Inbound staging sweep failed', { err });
+        }
+      },
       // Finalize any "Reject with reason…" holds whose reply window elapsed
       // (admin ghosted, or the host restarted mid-capture). Central-DB scan,
       // once per tick — not per session.
@@ -171,6 +181,7 @@ async function sweep(): Promise<void> {
   }
   tickQueue.add('singleton:approvals-scan');
   tickQueue.add('singleton:orphan-containers');
+  tickQueue.add('singleton:inbound-staging');
 
   // The tick ends — and the next one is armed — only after everything this
   // tick enqueued has run. Delayed backoff retries don't hold the tick open.

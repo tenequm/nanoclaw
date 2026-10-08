@@ -3,7 +3,7 @@
  *
  * The adapter lives inside a Promise-based host, so the Effect world is
  * bounded to this module. `buildRuntime(config)` assembles every Layer
- * (Bot, Pairing, Transcription, GroupFolder, AdapterConfig) into one
+ * (Bot, Pairing, Transcription, AdapterConfig) into one
  * composed Layer and wraps it in a `ManagedRuntime`. The adapter's public
  * methods call `runtime.runPromise(...)` at the boundary; errors are
  * caught inside the Effect world so nothing throws out.
@@ -19,14 +19,13 @@ import { Effect, Layer, ManagedRuntime } from 'effect';
 import type { ChannelSetup } from '../adapter.js';
 
 import { GrammyNetworkError, TelegramConfigInvalid } from './errors.js';
-import { BotLayer, GroupFolderLayer, PairingLayer, TranscriptionLayer } from './layers.js';
+import { BotLayer, PairingLayer, TranscriptionLayer } from './layers.js';
 import {
   AdapterConfigService,
   CLOUD_MAX_BYTES,
   DEFAULT_API_ROOT,
   SELF_HOSTED_MAX_BYTES,
   type BotService,
-  type GroupFolderService,
   type PairingService,
   type TranscriptionService,
 } from './services.js';
@@ -42,7 +41,7 @@ export interface AdapterRuntimeConfig {
   readonly hostConfig: ChannelSetup;
 }
 
-type AdapterServices = BotService | PairingService | TranscriptionService | GroupFolderService | AdapterConfigService;
+type AdapterServices = BotService | PairingService | TranscriptionService | AdapterConfigService;
 
 /**
  * Validate and normalize a user-supplied `apiRoot`. Returns the canonical
@@ -183,7 +182,7 @@ export function buildAdapterLayer(config: AdapterRuntimeConfig): Layer.Layer<Ada
   // others are flat. Provide config to the ones that need it.
   const botProvided = BotLayer.pipe(Layer.provide(configLayer));
 
-  return Layer.mergeAll(configLayer, botProvided, PairingLayer, TranscriptionLayer, GroupFolderLayer);
+  return Layer.mergeAll(configLayer, botProvided, PairingLayer, TranscriptionLayer);
 }
 
 export type AdapterRuntime = ManagedRuntime.ManagedRuntime<AdapterServices, AdapterLayerError>;

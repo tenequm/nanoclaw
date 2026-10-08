@@ -335,7 +335,7 @@ async function performAgentRoute(
   // agent can actually see and re-send them. Without this, agent-to-agent
   // file attachments look like they arrive but the target has no way to
   // read the bytes — they live in a session dir it doesn't mount.
-  const forwardedContent = withoutSenderRole(
+  const forwardedContent = withoutHostStamps(
     forwardFileAttachments(msg, a2aMsgId, session, targetAgentGroupId, targetSession.id),
   );
 
@@ -407,17 +407,30 @@ function forwardFileAttachments(
   return JSON.stringify(parsed);
 }
 
-/** Only the host stamps `senderRole`, on a human's inbound message; an agent cannot pass one on. */
-function withoutSenderRole(content: string): string {
+/**
+ * Only the host stamps `senderRole` (on a human's inbound message) and an
+ * attachment's `stagedPath` (a host file to copy into the inbox); an agent
+ * can pass on neither.
+ */
+function withoutHostStamps(content: string): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
   } catch {
     return content;
   }
-  if (typeof parsed !== 'object' || parsed === null || !('senderRole' in parsed)) return content;
+  if (typeof parsed !== 'object' || parsed === null) return content;
   const { senderRole: _claimed, ...rest } = parsed as Record<string, unknown>;
-  return JSON.stringify(rest);
+  let changed = 'senderRole' in parsed;
+  if (Array.isArray(rest.attachments)) {
+    rest.attachments = rest.attachments.map((att: unknown) => {
+      if (typeof att !== 'object' || att === null || !('stagedPath' in att)) return att;
+      changed = true;
+      const { stagedPath: _staged, ...kept } = att as Record<string, unknown>;
+      return kept;
+    });
+  }
+  return changed ? JSON.stringify(rest) : content;
 }
 
 function countForwardedFiles(contentStr: string): number {

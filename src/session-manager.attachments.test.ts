@@ -30,6 +30,7 @@ vi.mock('./config.js', async () => {
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
 import { createSession } from './db/sessions.js';
+import { sweepInboundStaging } from './inbox-safety.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
 
@@ -156,6 +157,50 @@ describe('extractAttachmentFiles: staged adapter downloads', () => {
 
     expect(att).not.toHaveProperty('stagedPath');
     expect(att).not.toHaveProperty('localPath');
+    expect(att.error).toBe('the file is no longer available');
     expect(fs.existsSync(path.join(sessionDir(AG, SESS), 'inbox', 'forged'))).toBe(false);
+  });
+
+  it('keeps the message, and says why, when a staged file cannot be copied', async () => {
+    const staged = path.join(STAGING, 'locked.pdf');
+    fs.writeFileSync(staged, 'pdf');
+    fs.chmodSync(staged, 0o000);
+
+    const att = await write('locked', { type: 'document', name: 'locked.pdf', stagedPath: staged });
+
+    expect(att).not.toHaveProperty('localPath');
+    expect(att.error).toMatch(/^could not be saved \(E[A-Z]+\)$/);
+  });
+
+  it('strips a stagedPath even when the message id is refused', async () => {
+    const staged = path.join(STAGING, 'photo.jpg');
+    fs.writeFileSync(staged, 'jpeg-bytes');
+
+    const att = await write('../escape', { type: 'photo', name: 'photo.jpg', stagedPath: staged });
+
+    expect(att).not.toHaveProperty('stagedPath');
+    expect(att).not.toHaveProperty('localPath');
+  });
+});
+
+describe('sweepInboundStaging', () => {
+  it('removes staged entries past the routing window and keeps fresh ones and outside targets', async () => {
+    const adapterDir = path.join(TEST_DIR, 'inbound-staging', 'telegram');
+    const stale = path.join(adapterDir, 'stale');
+    const fresh = path.join(adapterDir, 'fresh');
+    const outside = path.join(TEST_DIR, 'outside');
+    for (const dir of [stale, fresh, outside]) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'keep.txt'), 'keep');
+    fs.symlinkSync(outside, path.join(adapterDir, 'link'));
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    fs.utimesSync(stale, twoHoursAgo, twoHoursAgo);
+    fs.lutimesSync(path.join(adapterDir, 'link'), twoHoursAgo, twoHoursAgo);
+
+    await sweepInboundStaging();
+
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(fresh)).toBe(true);
+    expect(fs.existsSync(path.join(adapterDir, 'link'))).toBe(false);
+    expect(fs.readFileSync(path.join(outside, 'keep.txt'), 'utf8')).toBe('keep');
   });
 });

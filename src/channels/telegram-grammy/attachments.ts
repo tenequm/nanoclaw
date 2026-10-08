@@ -13,14 +13,14 @@
  * message can be routed to several agents, and each one's copy belongs in
  * its own session inbox (`inbox/<message-id>/<filename>`, the Runtime
  * Contract's path). `writeSessionMessage` copies the staged file there per
- * session and sets `localPath`; stale staging dirs are swept here.
+ * session and sets `localPath`; the host sweep clears stale staging dirs.
  *
  * Runs deferred: the adapter attaches `materializeAll` as the message's
  * `materialize` hook and the router calls it only after the engage, access
- * and scope gates pass, so a refused sender never triggers a download or a
- * transcription. The agent-runner still sees `localPath` + `transcript`
- * populated on `message.content.attachments[]` because the router awaits
- * the hook before writing the message.
+ * and scope gates pass for a wired agent, so a refused sender or an unpaired
+ * chat never triggers a download or a transcription. The router awaits the
+ * hook before writing the message, so `stagedPath` + `transcript` are on
+ * `message.content.attachments[]` by then.
  */
 import { randomUUID } from 'crypto';
 import fs from 'fs/promises';
@@ -33,13 +33,7 @@ import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { inboundStagingRoot } from '../../inbox-safety.js';
 import { AttachmentFetchFailed, AttachmentTooLarge, LocalFileUntrusted } from './errors.js';
 import type { InboundAttachment } from './inbound.js';
-import {
-  AdapterConfigService,
-  BotService,
-  CONTAINER_LOCAL_ROOT,
-  GroupFolderService,
-  TranscriptionService,
-} from './services.js';
+import { AdapterConfigService, BotService, CONTAINER_LOCAL_ROOT, TranscriptionService } from './services.js';
 
 /**
  * Translate a server-returned absolute `file_path` (in `--local` mode)
@@ -62,31 +56,10 @@ export function remapTrustedLocalPath(filePath: string, hostRoot: string): strin
   return path.join(hostRoot, tail);
 }
 
-// Routing copies a staged file into every session within the same inbound
-// pass, so anything this old has been consumed or abandoned.
-const STAGING_MAX_AGE_MS = 60 * 60 * 1000;
-
-const stagingDir = (): string => path.join(inboundStagingRoot(), 'telegram');
-
-/** Best-effort removal of staging dirs past their routing window; never fails the inbound. */
-async function sweepStaleStaging(dir: string, now: number): Promise<void> {
-  let entries: string[];
-  try {
-    entries = await fs.readdir(dir);
-  } catch {
-    return;
-  }
-  await Promise.all(
-    entries.map(async (entry) => {
-      const full = path.join(dir, entry);
-      try {
-        if (now - (await fs.lstat(full)).mtimeMs > STAGING_MAX_AGE_MS)
-          await fs.rm(full, { recursive: true, force: true });
-      } catch {
-        // Raced with another sweep, or unreadable: the next sweep retries.
-      }
-    }),
-  );
+/** Node fs errors embed the host staging path in their message; the agent gets only the code. */
+function failureReason(cause: unknown): string {
+  const code = (cause as NodeJS.ErrnoException | null)?.code;
+  return typeof code === 'string' ? code : String(cause);
 }
 
 const VOICE_EXTS = new Set(['.ogg', '.oga', '.m4a', '.mp3', '.wav', '.webm']);
@@ -117,27 +90,14 @@ function destFilename(att: InboundAttachment, index: number, remotePath: string)
  * its file `name`, `stagedPath` and optional `transcript` on success.
  * Returns tagged errors on failure.
  */
-export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
-  att: InboundAttachment,
-  index: number,
-  platformId: string,
-) {
+export const materialize = Effect.fn('telegram-grammy.materialize')(function* (att: InboundAttachment, index: number) {
   const { bot } = yield* BotService;
-  const folderSvc = yield* GroupFolderService;
   const config = yield* AdapterConfigService;
   const transcriber = yield* TranscriptionService;
 
   // contact / location have no Telegram file — they're pure payload
   // surfaced via the attachment metadata (name field). Skip download.
   if (!att.fileId) return att;
-
-  const groupDir = yield* folderSvc.resolveForPlatformId(platformId);
-  if (!groupDir) {
-    // Pre-pairing — chat isn't wired to an agent yet. Leave the metadata
-    // in place so the pairing flow can inspect it; bytes are intentionally
-    // dropped because we have nowhere to put them.
-    return att;
-  }
 
   const file = yield* Effect.tryPromise({
     try: () => bot.api.getFile(att.fileId),
@@ -161,7 +121,7 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
     );
   }
 
-  const attachDir = path.join(stagingDir(), randomUUID());
+  const attachDir = path.join(inboundStagingRoot(), 'telegram', randomUUID());
   yield* Effect.tryPromise({
     try: () => fs.mkdir(attachDir, { recursive: true }),
     catch: (cause) => new AttachmentFetchFailed({ fileId: att.fileId, cause }),
@@ -202,15 +162,11 @@ export const materialize = Effect.fn('telegram-grammy.materialize')(function* (
  * `Effect.catchTags` shape gives us exhaustive narrowing across the
  * tagged-error union from `materialize`.
  */
-export const materializeAll = Effect.fn('telegram-grammy.materializeAll')(function* (
-  attachments: InboundAttachment[],
-  platformId: string,
-) {
-  yield* Effect.promise(() => sweepStaleStaging(stagingDir(), Date.now()));
+export const materializeAll = Effect.fn('telegram-grammy.materializeAll')(function* (attachments: InboundAttachment[]) {
   yield* Effect.forEach(
     attachments,
     (att, i) =>
-      materialize(att, i, platformId).pipe(
+      materialize(att, i).pipe(
         Effect.catchTags({
           AttachmentTooLarge: (err) =>
             Effect.sync(() => {
@@ -220,7 +176,7 @@ export const materializeAll = Effect.fn('telegram-grammy.materializeAll')(functi
             }),
           AttachmentFetchFailed: (err) =>
             Effect.sync(() => {
-              att.error = `download failed: ${String(err.cause)}`;
+              att.error = `download failed: ${failureReason(err.cause)}`;
             }),
           LocalFileUntrusted: (err) =>
             Effect.sync(() => {

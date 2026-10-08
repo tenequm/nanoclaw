@@ -12,10 +12,9 @@
  *
  * The `download` happy-path is asserted via a mock hydrated file whose
  * `download(destPath)` runs `fs.copyFile` from a per-test tmp source.
- * Tests use a tmpdir wired through `GroupFolderService` so no project
- * state is touched.
+ * Bytes stage under a mocked `DATA_DIR`, so no project state is touched.
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { copyFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -29,7 +28,6 @@ vi.mock('../../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../config.js')>()),
   DATA_DIR,
 }));
-const STAGING = path.join(DATA_DIR, 'inbound-staging', 'telegram');
 
 import { materializeAll, remapTrustedLocalPath } from './attachments.js';
 import {
@@ -41,8 +39,10 @@ import {
 } from './services.js';
 import { GrammyNetworkError, LocalFileUntrusted, TelegramConfigInvalid } from './errors.js';
 import type { InboundAttachment } from './inbound.js';
-import { AdapterConfigService, BotService, GroupFolderService, TranscriptionService } from './services.js';
+import { AdapterConfigService, BotService, TranscriptionService } from './services.js';
 import { validateApiRoot, validateMaxFileMb } from './runtime.js';
+
+const STAGING = path.join(DATA_DIR, 'inbound-staging', 'telegram');
 
 let tmpRoot: string;
 let originalFetch: typeof fetch;
@@ -75,8 +75,6 @@ interface HydratedFile {
 interface BuildLayersOpts {
   apiRoot?: string;
   maxFileSizeBytes?: number;
-  /** Absolute path returned by `GroupFolderService`; null for pre-pairing. */
-  groupDir?: string | null;
   /** When set, exposes the localFilesDir to the AdapterConfig stub. */
   localFilesDir?: string | null;
   getFile: (fileId: string) => Promise<HydratedFile>;
@@ -105,17 +103,11 @@ function buildTestLayers(opts: BuildLayersOpts) {
     onAction: () => {},
   });
 
-  // Service now returns the absolute resolved path (or null) — the test
-  // points it at a tmpdir so we never touch real `groups/`.
-  const folderLayer = Layer.succeed(GroupFolderService, {
-    resolveForPlatformId: () => Effect.succeed(opts.groupDir === undefined ? tmpRoot : opts.groupDir),
-  });
-
   const transcriptionLayer = Layer.succeed(TranscriptionService, {
     transcribe: () => Effect.succeed(null),
   });
 
-  return Layer.mergeAll(botLayer, configLayer, folderLayer, transcriptionLayer);
+  return Layer.mergeAll(botLayer, configLayer, transcriptionLayer);
 }
 
 function makeDoc(name = 'big.pdf', fileId = 'file_1', size: number | null = null): InboundAttachment {
@@ -164,7 +156,7 @@ describe('materializeAll: failure-reason surfacing', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att]), layers));
 
     expect(att.localPath).toBeUndefined();
     expect(att.error).toBe('exceeds 20 MB cap (file is 21 MB)');
@@ -176,7 +168,7 @@ describe('materializeAll: failure-reason surfacing', () => {
       getFile: () => Promise.reject(new Error('Bad Gateway')),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att]), layers));
 
     expect(att.localPath).toBeUndefined();
     expect(att.error).toMatch(/^download failed:/);
@@ -194,22 +186,31 @@ describe('materializeAll: failure-reason surfacing', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att]), layers));
 
     expect(att.error).toBe('exceeds 2000 MB cap (file is 2500 MB)');
   });
 
-  it('skips materialization (no error) when chat is not yet paired', async () => {
-    const att = makeDoc('pending.pdf', 'file_pending');
+  it('reports a filesystem failure by code, never with the host staging path', async () => {
+    const att = makeDoc('doc.pdf', 'file_fs');
     const layers = buildTestLayers({
-      groupDir: null,
-      getFile: () => Promise.reject(new Error('should not be called')),
+      getFile: () =>
+        Promise.resolve(
+          makeHydratedFile({
+            file_id: 'file_fs',
+            file_path: 'documents/doc.pdf',
+            file_size: 10,
+            download: (destPath) =>
+              Promise.reject(
+                Object.assign(new Error(`EACCES: permission denied, open '${destPath}'`), { code: 'EACCES' }),
+              ),
+          }),
+        ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att]), layers));
 
-    expect(att.error).toBeUndefined();
-    expect(att.localPath).toBeUndefined();
+    expect(att.error).toBe('download failed: EACCES');
   });
 });
 
@@ -234,7 +235,7 @@ describe('materializeAll: happy path via plugin', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att]), layers));
 
     expect(att.error).toBeUndefined();
     expect(seenDestPaths).toHaveLength(1);
@@ -267,7 +268,7 @@ describe('materializeAll: happy path via plugin', () => {
           ),
       });
 
-      await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+      await Effect.runPromise(Effect.provide(materializeAll([att]), layers));
 
       expect(att.name).toBe(expected);
       expect(path.basename(att.stagedPath!)).toBe(expected);
@@ -293,25 +294,10 @@ describe('materializeAll: happy path via plugin', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att]), layers));
 
     expect(att.name).toBe('\u{1F926} sticker (from Pack)');
     expect(path.basename(att.stagedPath!)).toBe('___sticker__from_Pack_.webp');
-  });
-
-  it('sweeps staging dirs past the routing window and keeps fresh ones', async () => {
-    const stale = path.join(STAGING, 'stale');
-    const fresh = path.join(STAGING, 'fresh');
-    mkdirSync(stale, { recursive: true });
-    mkdirSync(fresh, { recursive: true });
-    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
-    utimesSync(stale, twoHoursAgo, twoHoursAgo);
-    const layers = buildTestLayers({ groupDir: null, getFile: () => Promise.reject(new Error('unused')) });
-
-    await Effect.runPromise(Effect.provide(materializeAll([makeDoc()], 'telegram:123'), layers));
-
-    expect(existsSync(stale)).toBe(false);
-    expect(existsSync(fresh)).toBe(true);
   });
 
   it('replaces an unsafe document name before choosing the destination', async () => {
@@ -332,7 +318,7 @@ describe('materializeAll: happy path via plugin', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att]), layers));
 
     expect(path.basename(seenDestPaths[0]!)).toBe('document.pdf');
     expect(att.stagedPath).toBe(seenDestPaths[0]);
@@ -368,7 +354,7 @@ describe('materializeAll: happy path via plugin', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att]), layers));
 
     expect(att.error).toBeUndefined();
     expect(path.basename(att.stagedPath!)).toBe('local.pdf');
@@ -401,7 +387,7 @@ describe('materializeAll: --local untrusted path', () => {
         ),
     });
 
-    await Effect.runPromise(Effect.provide(materializeAll([att], 'telegram:123'), layers));
+    await Effect.runPromise(Effect.provide(materializeAll([att]), layers));
 
     expect(att.stagedPath).toBeUndefined();
     expect(att.error).toBe(`untrusted local file path (/etc/passwd not under ${CONTAINER_LOCAL_ROOT})`);

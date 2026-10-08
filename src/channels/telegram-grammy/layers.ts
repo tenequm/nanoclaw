@@ -19,7 +19,6 @@ import { hydrateFiles } from '@grammyjs/files';
 import { remapTrustedLocalPath } from './attachments.js';
 
 import { createMessagingGroup, getMessagingGroupByPlatform, updateMessagingGroup } from '../../db/messaging-groups.js';
-import { resolveGroupFolderForPlatformId, resolveGroupFolderPath } from '../../group-folder.js';
 import { grantRole, hasAnyOwner } from '../../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../../modules/permissions/db/users.js';
 import { transcribeAudio } from '../../transcription.js';
@@ -31,7 +30,6 @@ import {
   AdapterConfigService,
   BotService,
   DEFAULT_API_ROOT,
-  GroupFolderService,
   type HydratedBot,
   PairingService,
   TELEGRAM_DEFAULTS,
@@ -170,27 +168,4 @@ export const TranscriptionLayer = Layer.succeed(TranscriptionService, {
       try: () => transcribeAudio(filePath),
       catch: (cause) => cause,
     }).pipe(Effect.catch(() => Effect.succeed(null))),
-});
-
-/**
- * Messaging-group → absolute on-disk attachment dir lookup. Combines the
- * DB lookup (`resolveGroupFolderForPlatformId`) with `resolveGroupFolderPath`
- * so callers receive the fully resolved path or null. The central-DB lookup
- * is async, so this is `Effect.tryPromise` (not `Effect.sync`); a failed
- * lookup degrades to "not wired yet" — the caller drops the bytes and keeps
- * the attachment metadata.
- */
-export const GroupFolderLayer = Layer.succeed(GroupFolderService, {
-  resolveForPlatformId: (platformId) =>
-    Effect.tryPromise({
-      try: async () => {
-        const folder = await resolveGroupFolderForPlatformId('telegram', platformId);
-        return folder ? resolveGroupFolderPath(folder) : null;
-      },
-      catch: (cause) => cause,
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Effect.as(Effect.logWarning('telegram-grammy: group folder lookup failed', { platformId, cause }), null),
-      ),
-    ),
 });

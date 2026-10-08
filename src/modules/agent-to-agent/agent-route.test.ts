@@ -199,6 +199,26 @@ describe('routeAgentMessage return-path', () => {
     expect(JSON.parse(readInbound(B, SB.id)[0].content)).toEqual({ text: 'trust me' });
   });
 
+  it('drops a stagedPath the sending agent put on an attachment, so the host copies nothing', async () => {
+    const staged = path.join(TEST_DIR, 'inbound-staging', 'telegram', 'other-chat', 'photo.jpg');
+    fs.mkdirSync(path.dirname(staged), { recursive: true });
+    fs.writeFileSync(staged, 'someone else');
+
+    await routeAgentMessage(
+      {
+        id: 'msg-claims-staged',
+        platform_id: B,
+        content: JSON.stringify({ text: 'look', attachments: [{ name: 'photo.jpg', stagedPath: staged }] }),
+        in_reply_to: null,
+      },
+      S1,
+    );
+
+    const [row] = readInbound(B, SB.id);
+    expect(JSON.parse(row.content)).toEqual({ text: 'look', attachments: [{ name: 'photo.jpg' }] });
+    expect(fs.existsSync(path.join(sessionDir(B, SB.id), 'inbox'))).toBe(false);
+  });
+
   it('reply direction: routes back to the originating session, not the newest', async () => {
     // A.S1 sends to B.
     await routeAgentMessage(
