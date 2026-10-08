@@ -175,8 +175,8 @@ export interface RoutableAgentMessage {
   content: string;
   /**
    * For replies, the id of the inbound message being replied to. The
-   * container's formatter sets this from the first inbound in the batch
-   * (`container/agent-runner/src/formatter.ts`). Used here to route the
+   * container's formatter sets this to the batch's last waking inbound in its
+   * chat (`container/agent-runner/src/formatter.ts`). Used here to route the
    * reply back to the originating session — see `resolveTargetSession`.
    */
   in_reply_to: string | null;
@@ -335,7 +335,9 @@ async function performAgentRoute(
   // agent can actually see and re-send them. Without this, agent-to-agent
   // file attachments look like they arrive but the target has no way to
   // read the bytes — they live in a session dir it doesn't mount.
-  const forwardedContent = forwardFileAttachments(msg, a2aMsgId, session, targetAgentGroupId, targetSession.id);
+  const forwardedContent = withoutSenderRole(
+    forwardFileAttachments(msg, a2aMsgId, session, targetAgentGroupId, targetSession.id),
+  );
 
   await writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: a2aMsgId,
@@ -403,6 +405,19 @@ function forwardFileAttachments(
   parsed.attachments = [...existing, ...attachments];
 
   return JSON.stringify(parsed);
+}
+
+/** Only the host stamps `senderRole`, on a human's inbound message; an agent cannot pass one on. */
+function withoutSenderRole(content: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return content;
+  }
+  if (typeof parsed !== 'object' || parsed === null || !('senderRole' in parsed)) return content;
+  const { senderRole: _claimed, ...rest } = parsed as Record<string, unknown>;
+  return JSON.stringify(rest);
 }
 
 function countForwardedFiles(contentStr: string): number {

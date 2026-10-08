@@ -184,18 +184,28 @@ export interface RoutingContext {
  * back to the plain first row if the batch is somehow all echo (shouldn't
  * happen — echo rows never trigger). A batch that opens with a failure
  * notice routes by its first real waking message instead, so a failure
- * answers the requester, not the agent that failed.
+ * answers the requester, not the agent that failed. The default reply
+ * target is the last waking message in that chat, not old ambient context.
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
   const nonEcho = messages.filter((m) => !isSessionEcho(m));
   const waking = nonEcho.filter((m) => m.trigger !== 0);
   const preferred = nonEcho[0] && isFailureNotice(nonEcho[0]) ? waking.find((m) => !isFailureNotice(m)) : undefined;
   const first = preferred ?? nonEcho[0] ?? messages[0];
+  const answered = waking
+    .filter(
+      (m) =>
+        !isFailureNotice(m) &&
+        m.channel_type === first?.channel_type &&
+        m.platform_id === first.platform_id &&
+        m.thread_id === first.thread_id,
+    )
+    .at(-1);
   return {
     platformId: first?.platform_id ?? null,
     channelType: first?.channel_type ?? null,
     threadId: first?.thread_id ?? null,
-    inReplyTo: first?.id ?? null,
+    inReplyTo: (answered ?? first)?.id ?? null,
     // Echo rows riding along with a task must not disable one-door delivery:
     // taskRun as long as at least one task row and no non-task/non-echo row.
     taskRun: messages.some((m) => m.kind === 'task') && messages.every((m) => m.kind === 'task' || isSessionEcho(m)),
@@ -283,17 +293,22 @@ function formatSingleChat(msg: MessageInRow): string {
  */
 function replyToSeq(msg: MessageInRow, platformMessageId: unknown): number | null {
   if (platformMessageId == null || platformMessageId === '' || !msg.channel_type || !msg.platform_id) return null;
-  return getAgentMailbox().operations.findSeqByPlatformMessageId(
-    msg.channel_type,
-    msg.platform_id,
-    String(platformMessageId),
-  );
+  try {
+    return getAgentMailbox().operations.findSeqByPlatformMessageId(
+      msg.channel_type,
+      msg.platform_id,
+      String(platformMessageId),
+    );
+  } catch {
+    return null;
+  }
 }
 
 /**
  * `user_id` is the platform's own user id (the channel prefix dropped, so a
  * Telegram id is the bare number a `tg://user?id=` mention takes); `role` is
- * the nanoclaw role the host stamped as `senderRole`.
+ * the nanoclaw role the host stamped as `senderRole` on a human's message
+ * (never trusted on an agent-to-agent row).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function senderAttrs(msg: MessageInRow, content: any): string {
@@ -301,7 +316,9 @@ function senderAttrs(msg: MessageInRow, content: any): string {
   const prefix = `${msg.channel_type}:`;
   const userId = senderId?.startsWith(prefix) ? senderId.slice(prefix.length) : senderId;
   const userAttr = userId ? ` user_id="${escapeXml(userId)}"` : '';
-  const role = content.senderRole === 'owner' || content.senderRole === 'admin' ? ` role="${content.senderRole}"` : '';
+  const hostStamped =
+    msg.channel_type !== 'agent' && (content.senderRole === 'owner' || content.senderRole === 'admin');
+  const role = hostStamped ? ` role="${content.senderRole}"` : '';
   return userAttr + role;
 }
 
@@ -400,8 +417,8 @@ function formatSystemMessage(msg: MessageInRow): string {
  *
  * Matches v1 format (src/v1/router.ts:10-18): `<quoted_message from="X">Y</quoted_message>`,
  * plus `highlighted="..."` when the user quoted only a fragment of it.
- * Requires BOTH sender and text — if only id is present the reply_to attribute
- * on the parent <message> carries the link without an inline preview.
+ * Requires BOTH sender and text - if only id is present, the parent's reply_to
+ * attribute (set only when the original is in this session) is the whole link.
  *
  * No truncation here (v1 didn't truncate).
  */

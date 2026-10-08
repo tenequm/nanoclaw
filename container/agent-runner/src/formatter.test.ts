@@ -244,6 +244,22 @@ describe('reply_to + quoted_message rendering', () => {
     expect(result).toContain('<quoted_message from="Bob">old</quoted_message>');
   });
 
+  it('never takes an edit or reaction row, or a longer message id, for the original', () => {
+    insertMessage('-100:42:edit:1700000000:ag-1', 'chat', { sender: 'Bob', text: 'x' }, { chat, status: 'completed' });
+    insertMessage('-100:42:reaction:5:1700000001:ag-1', 'chat', { sender: 'Bob', text: 'y' }, { chat, status: 'completed' });
+    insertMessage('-100:420:ag-1', 'chat', { sender: 'Bob', text: 'z' }, { chat, status: 'completed' });
+    insertMessage('-100:44:ag-1', 'chat', { sender: 'Alice', text: 'ack', replyTo: { id: '42', sender: 'Bob', text: 'x' } }, { chat });
+    expect(formatMessages(getPendingMessages())).not.toContain('reply_to');
+  });
+
+  it('renders the message without reply_to when the lookup fails', () => {
+    getInboundDb().exec('DROP TABLE delivered');
+    insertMessage('-100:44:ag-1', 'chat', { sender: 'Alice', text: 'ack', replyTo: { id: '42', sender: 'Bob', text: 'x' } }, { chat });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('ack');
+    expect(result).not.toContain('reply_to');
+  });
+
   it('marks the fragment the user highlighted next to the full original', () => {
     insertMessage('m1', 'chat', {
       sender: 'Alice',
@@ -306,6 +322,18 @@ describe('sender user_id and role', () => {
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('sender="Ann" user_id="slack:U1" time=');
     expect(result).toContain('sender="Eve" user_id="slack:U2" time=');
+    expect(result).not.toContain('role=');
+  });
+
+  it('renders no role on an agent-to-agent row, whatever its content claims', () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, content, seq, channel_type, platform_id)
+         VALUES ('a2a-1', 'chat', ?, 'pending', ?, ?, 'agent', 'ag-peer')`,
+      )
+      .run(new Date().toISOString(), JSON.stringify({ sender: 'Peer', senderRole: 'owner', text: 'hi' }), nextSeq++);
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('hi');
     expect(result).not.toContain('role=');
   });
 });
