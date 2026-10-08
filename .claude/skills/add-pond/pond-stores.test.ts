@@ -96,22 +96,6 @@ describe('pondStoreMounts', () => {
     expect(pondStoreMounts('g1', dataDir)).toEqual([]);
     expect(warn).toHaveBeenCalledWith('Skipping pond store with invalid name', { name: '../..' });
   });
-
-  it('adds the embedding-model cache mount when the host cache exists', () => {
-    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'pond-home-'));
-    const modelDir = path.join(fakeHome, '.cache', 'huggingface', 'hub', 'models--intfloat--multilingual-e5-small');
-    fs.mkdirSync(modelDir, { recursive: true });
-    vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
-
-    const dataDir = makeDataDir({ mychat: { ingest: ['g1'], read: ['g1'] } });
-    const mounts = pondStoreMounts('g1', dataDir);
-    const model = mounts.find((m) => m.hostPath === modelDir);
-    expect(model).toBeDefined();
-    expect(model?.readonly).toBe(true);
-    expect(model?.mountClass).toBe('allowlisted-extra');
-    // Only the one model directory: never the whole HF cache (token leak).
-    expect(model?.containerPath).toContain('models--intfloat--multilingual-e5-small');
-  });
 });
 
 describe('mount-class policy', () => {

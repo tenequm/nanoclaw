@@ -32,9 +32,8 @@
  * the shell.
  *
  * Mount class: `allowlisted-extra`. The store root (`data/pond/stores/<name>`)
- * and the query-side model cache (under the host user's HF cache) are
- * host-decided paths that sit outside every root the other classes are pinned
- * to - `group-state` admits only `data/v2-sessions/<group>` and the group
+ * is a host-decided path that sits outside every root the other classes are
+ * pinned to - `group-state` admits only `data/v2-sessions/<group>` and the group
  * folder, `install-surface` only the enumerated release surfaces - so those
  * classes would be denied by `validateSpec`. This is the same contract the
  * provider-contributed mounts ride: vetted in-tree by this module (read-list
@@ -42,7 +41,6 @@
  * and always read-only.
  */
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import type { MountClass } from './drivers/types.js';
@@ -54,9 +52,6 @@ const POND_CONTAINER_ROOT = '/workspace/extra/pond';
 
 /** See the class rationale in the module header. */
 const POND_MOUNT_CLASS: MountClass = 'allowlisted-extra';
-
-/** Embedding model pond embeds queries with; synced stores carry its vectors. */
-const POND_MODEL_CACHE_SUBPATH = path.join('.cache', 'huggingface', 'hub', 'models--intfloat--multilingual-e5-small');
 
 interface PondStore {
   backend?: string;
@@ -114,23 +109,6 @@ export function pondStoreMounts(agentGroupId: string, dataDir: string): VolumeMo
       mountClass: POND_MOUNT_CLASS,
       scope: agentGroupId,
     });
-  }
-
-  // Query-side embedding model: pond embeds the *query* at search time, so
-  // vector search inside the (offline) container needs the model weights the
-  // host sync already downloaded. Only the one model directory is mounted -
-  // never the whole HF cache, which can hold an auth token.
-  if (mounts.length > 0) {
-    const hostModelCache = path.join(os.homedir(), POND_MODEL_CACHE_SUBPATH);
-    if (fs.existsSync(hostModelCache)) {
-      mounts.push({
-        hostPath: hostModelCache,
-        containerPath: path.join('/home/node', POND_MODEL_CACHE_SUBPATH),
-        readonly: true,
-        mountClass: POND_MOUNT_CLASS,
-        scope: agentGroupId,
-      });
-    }
   }
 
   return mounts;

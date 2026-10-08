@@ -43,9 +43,6 @@ export function pondMcpServers(
         // lock, last-sync record) off the read-only store mount.
         POND_CONFIG_FILE: '/tmp/pond-unused-config.toml',
         XDG_STATE_HOME: '/tmp/pond-state',
-        // pond resolves its embedding-model cache relative to $HOME; the
-        // host mounts the model at /home/node/.cache/huggingface.
-        HOME: '/home/node',
       },
     };
   }

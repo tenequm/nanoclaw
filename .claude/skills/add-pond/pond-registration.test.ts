@@ -52,7 +52,6 @@ describe('pondMcpServers', () => {
     const { pond } = pondMcpServers(root);
     expect(pond.env.XDG_STATE_HOME).toBe('/tmp/pond-state');
     expect(pond.env.POND_CONFIG_FILE).toBeDefined();
-    expect(pond.env.HOME).toBe('/home/node');
   });
 });
 

@@ -40,7 +40,7 @@ Check if `src/pond-stores.ts` exists. If it does, re-run Phase 2 anyway (every s
 
 ### Install pond on the host
 
-The host runs `pond sync` (ingest + embedding); the container only reads. Pin the same version used for `POND_VERSION` in Phase 2: host writes and container reads the same store format, and pond is pre-release with no compat shims.
+The host runs `pond sync` (ingest + full-text index maintenance); the container only reads. Search is BM25 full-text: with pond's opt-in embeddings left off (the default), no pond process downloads or loads an embedding model, on the host or in the container. Pin the same version used for `POND_VERSION` in Phase 2: host writes and container reads the same store format, and pond is pre-release with no compat shims.
 
 ```bash
 command -v pond && pond --version || echo "Not installed"
@@ -110,8 +110,7 @@ Then in `buildMounts`, after the provider-contributed mounts block and before `r
 site. The class is not a style choice: `validateSpec` pins `group-state` to
 `data/v2-sessions/<group>` and the group folder, and `install-surface` to the enumerated
 release surfaces (`mountPolicy` in `src/drivers/index.ts`). A pond store lives at
-`data/pond/stores/<name>` and the query-side model cache under the host user's HuggingFace
-cache, so both would be denied under either of those classes. `allowlisted-extra` is the
+`data/pond/stores/<name>`, so it would be denied under either of those classes. `allowlisted-extra` is the
 class for host paths vetted in-tree rather than by a path rule - the same lane the
 provider-contributed mounts ride - and this module does that vetting (read-list membership,
 local backend, directory exists) and never emits a writable mount.
@@ -225,6 +224,6 @@ Ask a granted agent (in its channel) something like "search your pond store for 
 ## Troubleshooting
 
 - **Agent has no pond tools**: `stores.json` missing, group not in `read`, store dir absent (sync never ran), or the container predates the config (kill it; next message respawns with mounts).
-- **`pond_search` returns nothing on a fresh store**: embedding happens at sync time; check `./scripts/pond-sync.sh` output and that the group actually has transcripts under `.claude-shared/projects`.
-- **Vector search fails offline**: the query-side embedding model mounts from the host HF cache (`models--intfloat--multilingual-e5-small`); it appears after the first host sync downloads it.
+- **`pond_search` returns nothing on a fresh store**: messages become searchable when a sync ingests them; check `./scripts/pond-sync.sh` output and that the group actually has transcripts under `.claude-shared/projects`.
+- **`--mode vector` is refused**: expected. Search is BM25 full-text; semantic search is opt-in in pond and this setup leaves it off, so nothing needs a model in the offline container.
 - **Version skew**: host `pond --version` must match the image's `POND_VERSION` (pre-release formats move together). Bump both, rebuild, re-sync.
