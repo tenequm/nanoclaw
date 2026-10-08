@@ -413,7 +413,11 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
   }
 
   const sent = yield* Effect.tryPromise({
-    try: () => bot.api.sendMediaGroup(chatId, inputs, { message_thread_id: messageThreadId }),
+    // grammY 1.46 types each media-group family apart; the mixed-type check above narrows only at runtime.
+    try: () =>
+      bot.api.sendMediaGroup(chatId, inputs as Parameters<typeof bot.api.sendMediaGroup>[1], {
+        message_thread_id: messageThreadId,
+      }),
     catch: (err) => mapGrammyError(err, 'sendMediaGroup', String(chatId)),
   });
   return sent.length > 0 ? String(sent[0].message_id) : undefined;
