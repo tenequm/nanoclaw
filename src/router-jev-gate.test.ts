@@ -208,8 +208,11 @@ async function inboundWithPhoto(id: string): Promise<{ download: ReturnType<type
     threadId: null,
     message: { id, kind: 'chat', content: JSON.stringify(payload), timestamp: now(), isMention: false, isGroup: true },
   };
+  const stagedPath = path.join(TEST_DIR, 'inbound-staging', 'telegram', id, 'photo.jpg');
   const download = vi.fn(async () => {
-    payload.attachments[0].localPath = 'agent/attachments/photo_0.jpg';
+    fs.mkdirSync(path.dirname(stagedPath), { recursive: true });
+    fs.writeFileSync(stagedPath, 'jpeg-bytes');
+    Object.assign(payload.attachments[0], { name: 'photo.jpg', stagedPath });
   });
   let pending: Promise<void> | undefined;
   event.materialize = () => {
@@ -360,8 +363,9 @@ describe('routeInbound with the Jev wake-gate', () => {
 
       // The gated copy used to keep its pre-download snapshot: fileId only,
       // no localPath, so the agent was never told where the file landed.
-      expect(await storedAttachments(GATED)).toEqual([{ localPath: 'agent/attachments/photo_0.jpg', jev: verdict }]);
-      expect(await storedAttachments(PLAIN)).toEqual([{ localPath: 'agent/attachments/photo_0.jpg', jev: null }]);
+      const inboxPath = expect.stringMatching(/^inbox\/[^/]+\/photo\.jpg$/);
+      expect(await storedAttachments(GATED)).toEqual([{ localPath: inboxPath, jev: verdict }]);
+      expect(await storedAttachments(PLAIN)).toEqual([{ localPath: inboxPath, jev: null }]);
       expect(download).toHaveBeenCalledTimes(1);
     });
   }

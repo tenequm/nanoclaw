@@ -466,7 +466,7 @@ describe('router', () => {
     expect(await findSession('mg-1', null)).toBeUndefined();
   });
 
-  it('materializes once across two agent wirings and stores the mutation', async () => {
+  it('materializes once across two agent wirings and copies the staged file into each inbox', async () => {
     const { routeInbound } = await import('./router.js');
     const { getSessionsByAgentGroup } = await import('./db/sessions.js');
     await createAgentGroup({
@@ -489,12 +489,15 @@ describe('router', () => {
       created_at: now(),
     });
 
-    const content: { text: string; attachments: Array<{ fileId: string; localPath?: string }> } = {
+    const content: { text: string; attachments: Array<{ fileId: string; name?: string; stagedPath?: string }> } = {
       text: 'photo',
       attachments: [{ fileId: 'photo-1' }],
     };
+    const stagedPath = path.join(TEST_DIR, 'inbound-staging', 'telegram', 'stage-1', 'photo.jpg');
     const runMaterialize = vi.fn(async () => {
-      content.attachments[0] = { ...content.attachments[0], localPath: 'agent/attachments/photo.jpg' };
+      fs.mkdirSync(path.dirname(stagedPath), { recursive: true });
+      fs.writeFileSync(stagedPath, 'jpeg-bytes');
+      content.attachments[0] = { ...content.attachments[0], name: 'photo.jpg', stagedPath };
     });
     const event: InboundEvent = {
       channelType: 'discord',
@@ -523,9 +526,13 @@ describe('router', () => {
       const sessions = await getSessionsByAgentGroup(agentGroupId);
       expect(sessions).toHaveLength(1);
       const db = new Database(inboundDbPath(agentGroupId, sessions[0].id));
-      const row = db.prepare('SELECT content FROM messages_in LIMIT 1').get() as { content: string };
+      const row = db.prepare('SELECT id, content FROM messages_in LIMIT 1').get() as { id: string; content: string };
       db.close();
-      expect(JSON.parse(row.content).attachments[0].localPath).toBe('agent/attachments/photo.jpg');
+      const [attachment] = JSON.parse(row.content).attachments;
+      expect(attachment).toMatchObject({ name: 'photo.jpg', localPath: `inbox/${row.id}/photo.jpg` });
+      expect(attachment).not.toHaveProperty('stagedPath');
+      const inboxCopy = path.join(TEST_DIR, 'v2-sessions', agentGroupId, sessions[0].id, attachment.localPath);
+      expect(fs.readFileSync(inboxCopy, 'utf8')).toBe('jpeg-bytes');
     }
   });
 
