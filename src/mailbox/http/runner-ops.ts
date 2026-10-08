@@ -63,6 +63,8 @@ export interface RunnerSnapshot {
   outbound: OutboundRecord[];
   delivered: Array<{ messageOutId: string; platformMessageId: string | null }>;
   latestRoutes: Array<{ channelType: string; platformId: string; threadId: string | null; inReplyTo: string }>;
+  /** findSeqByPlatformMessageId answered for every pending row's `replyTo.id`, so the formatter is exact. */
+  replySeqs: Array<{ channelType: string; platformId: string; platformMessageId: string; sequence: number | null }>;
   destinations: DestinationRecord[];
   routing: SessionRoutingRecord;
   state: StateRecord[];
@@ -176,6 +178,62 @@ export function ensureRunnerOutboundTables(outbound: Database.Database): void {
   if (!containerColumns.has('turn')) outbound.exec('ALTER TABLE container_state ADD COLUMN turn TEXT');
 }
 
+/**
+ * Port of the runner's sqliteFindSeqByPlatformMessageId: an inbound row whose
+ * id is the platform id or the Telegram compound `<chat>:<msg>:<agent group>`
+ * (never a derived `:edit:`/`:reaction:` row), else a delivered outbound row.
+ */
+export function findSeqByPlatformMessageId(
+  session: RunnerSession,
+  channelType: string,
+  platformId: string,
+  platformMessageId: string,
+): number | null {
+  const { inbound, outbound } = session;
+  const chat = platformId.startsWith(`${channelType}:`)
+    ? platformId.slice(channelType.length + 1).split(':')[0]
+    : platformId;
+  const prefix = `${chat}:${platformMessageId}:`;
+  const inboundRow = inbound
+    .prepare(
+      `SELECT seq FROM messages_in
+       WHERE channel_type = $channel_type AND platform_id = $platform_id AND seq IS NOT NULL
+         AND (id = $id OR (id >= $prefix AND id < $prefix_end AND instr(substr(id, length($prefix) + 1), ':') = 0))
+       ORDER BY seq LIMIT 1`,
+    )
+    .get({
+      channel_type: channelType,
+      platform_id: platformId,
+      id: platformMessageId,
+      prefix,
+      prefix_end: `${prefix.slice(0, -1)};`,
+    }) as { seq: number } | undefined;
+  if (inboundRow) return inboundRow.seq;
+  const outIds = (
+    inbound.prepare('SELECT message_out_id FROM delivered WHERE platform_message_id = ?').all(platformMessageId) as {
+      message_out_id: string;
+    }[]
+  ).map((row) => row.message_out_id);
+  if (outIds.length === 0) return null;
+  const outboundRow = outbound
+    .prepare(
+      `SELECT seq FROM messages_out
+       WHERE id IN (${outIds.map(() => '?').join(', ')}) AND channel_type = ? AND platform_id = ? AND seq IS NOT NULL
+       ORDER BY seq LIMIT 1`,
+    )
+    .get(...outIds, channelType, platformId) as { seq: number } | undefined;
+  return outboundRow?.seq ?? null;
+}
+
+function replyToId(content: unknown): string | null {
+  try {
+    const id = (JSON.parse(String(content)) as { replyTo?: { id?: unknown } } | null)?.replyTo?.id;
+    return id === null || id === undefined || id === '' ? null : String(id);
+  } catch {
+    return null;
+  }
+}
+
 function snapshot(session: RunnerSession, cursor: SnapshotCursor | null): RunnerSnapshot {
   const { inbound, outbound } = session;
   const pendingRows = inbound.prepare("SELECT * FROM messages_in WHERE status = 'pending' ORDER BY seq").all() as Row[];
@@ -218,6 +276,20 @@ function snapshot(session: RunnerSession, cursor: SnapshotCursor | null): Runner
     inReplyTo: row.id,
   }));
 
+  const replySeqs: RunnerSnapshot['replySeqs'] = [];
+  for (const row of pendingRows) {
+    const platformMessageId = replyToId(row.content);
+    if (platformMessageId === null || !row.channel_type || !row.platform_id) continue;
+    const channelType = String(row.channel_type);
+    const platformId = String(row.platform_id);
+    replySeqs.push({
+      channelType,
+      platformId,
+      platformMessageId,
+      sequence: findSeqByPlatformMessageId(session, channelType, platformId, platformMessageId),
+    });
+  }
+
   const routingRow = tableExists(inbound, 'session_routing')
     ? (inbound.prepare('SELECT channel_type, platform_id, thread_id FROM session_routing WHERE id = 1').get() as
         | Row
@@ -239,6 +311,7 @@ function snapshot(session: RunnerSession, cursor: SnapshotCursor | null): Runner
       platformMessageId: row.platform_message_id,
     })),
     latestRoutes,
+    replySeqs,
     destinations: (inbound.prepare('SELECT * FROM destinations ORDER BY name').all() as Row[]).map((row) =>
       parseDestinationRecord({
         name: row.name,
@@ -330,6 +403,13 @@ type RunnerOp = (session: RunnerSession, args: unknown[]) => unknown;
 /** Operation table: name -> implementation. Unknown names are a 400. */
 export const RUNNER_OPS: Record<string, RunnerOp> = {
   snapshot: (session, [cursor]) => snapshot(session, parseCursor(cursor)),
+  findSeqByPlatformMessageId: (session, [channelType, platformId, platformMessageId]) =>
+    findSeqByPlatformMessageId(
+      session,
+      stringArg(channelType, 'channelType'),
+      stringArg(platformId, 'platformId'),
+      stringArg(platformMessageId, 'platformMessageId'),
+    ),
   heartbeat: (session) => session.touchHeartbeat(),
   writeMessageOut: (session, [draft]) => writeMessageOut(session, draft),
   markMessages: (session, [ids, status]) => {

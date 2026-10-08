@@ -111,12 +111,13 @@ interface WireSnapshot {
   outbound: unknown[];
   delivered: Array<{ messageOutId: string; platformMessageId: string | null }>;
   latestRoutes: Array<{ channelType: string; platformId: string; threadId: string | null; inReplyTo: string }>;
+  replySeqs: Array<{ channelType: string; platformId: string; platformMessageId: string; sequence: number | null }>;
   destinations: unknown[];
   routing: unknown;
   state: unknown[];
 }
 
-const routeKey = (channelType: string, platformId: string) => `${channelType}\u0000${platformId}`;
+const routeKey = (...parts: string[]) => parts.join('\u0000');
 /** SQLite's datetime() compares at second precision; match it so due-ness agrees with the SQLite runner. */
 const dueAt = (timestamp: string | null, now: number) =>
   timestamp === null || Math.floor(Date.parse(timestamp) / 1000) <= Math.floor(now / 1000);
@@ -139,6 +140,7 @@ class Replica {
   outbound = new Map<number, OutboundMessage>();
   delivered = new Map<string, string | null>();
   latestRoutes = new Map<string, { threadId: string | null; inReplyTo: string }>();
+  replySeqs = new Map<string, number | null>();
   destinations: Destination[] = [];
   routing: SessionRouting = { channelType: null, platformId: null, threadId: null };
   state = new Map<string, StateValue>();
@@ -166,6 +168,12 @@ class Replica {
         { threadId: route.threadId, inReplyTo: route.inReplyTo },
       ]),
     );
+    this.replySeqs = new Map(
+      snapshot.replySeqs.map((entry) => [
+        routeKey(entry.channelType, entry.platformId, entry.platformMessageId),
+        entry.sequence,
+      ]),
+    );
     this.destinations = snapshot.destinations.map(parseDestinationRecord);
     this.routing = parseSessionRoutingRecord(snapshot.routing);
     this.state = new Map(
@@ -174,6 +182,42 @@ class Replica {
         .map((record) => [record.key, { value: record.value, updatedAt: record.updatedAt }]),
     );
     this.cursor = snapshot.cursor;
+  }
+
+  /**
+   * Exact for every pending row's reply target (the host resolves those in each
+   * snapshot); otherwise the same rule over the replica window, where an older
+   * target misses — the formatter then omits reply_to, as for any message
+   * outside the session's history.
+   */
+  findSeqByPlatformMessageId(channelType: string, platformId: string, platformMessageId: string): number | null {
+    const resolved = this.replySeqs.get(routeKey(channelType, platformId, platformMessageId));
+    if (resolved !== undefined) return resolved;
+    const chat = platformId.startsWith(`${channelType}:`)
+      ? platformId.slice(channelType.length + 1).split(':')[0]
+      : platformId;
+    const prefix = `${chat}:${platformMessageId}:`;
+    const inbound = [...this.pending.values(), ...this.inbound.values()]
+      .filter(
+        (message) =>
+          message.sequence !== null &&
+          message.channelType === channelType &&
+          message.platformId === platformId &&
+          (message.id === platformMessageId ||
+            (message.id.startsWith(prefix) && !message.id.slice(prefix.length).includes(':'))),
+      )
+      .sort(bySequence)[0];
+    if (inbound) return inbound.sequence;
+    const delivered = new Set(
+      [...this.delivered].filter(([, platform]) => platform === platformMessageId).map(([id]) => id),
+    );
+    const outbound = [...this.outbound.values()]
+      .filter(
+        (message) =>
+          delivered.has(message.id) && message.channelType === channelType && message.platformId === platformId,
+      )
+      .sort(bySequence)[0];
+    return outbound?.sequence ?? null;
   }
 
   inboundBySequence(sequence: number): InboundMessage | undefined {
@@ -507,6 +551,8 @@ export class HttpAgentMailbox implements AgentMailbox {
         }),
       getLatestInboundRoute: (channelType, platformId) =>
         read(() => replica.latestRoutes.get(routeKey(channelType, platformId)) ?? null),
+      findSeqByPlatformMessageId: (channelType, platformId, platformMessageId) =>
+        read(() => replica.findSeqByPlatformMessageId(channelType, platformId, platformMessageId)),
       getUndeliveredMessages: () =>
         read(() => {
           const now = Date.now();
