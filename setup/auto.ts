@@ -520,6 +520,14 @@ async function main(): Promise<void> {
     if (!res.ok) {
       await fail('service', "Couldn't start NanoClaw.", 'See logs/nanoclaw.error.log for details.');
     }
+    if (res.terminal?.fields.PROXY === 'ignored_by_node') {
+      p.log.warn(
+        brandBody(
+          `Node ${res.terminal.fields.PROXY_NODE_VERSION} ignores the outbound proxy, so NanoClaw will connect directly. ` +
+            'Upgrade to Node 22.21+ or 24.5+ to use it.',
+        ),
+      );
+    }
     if (res.terminal?.fields.DOCKER_GROUP_STALE === 'true') {
       p.log.warn(brandBody("NanoClaw's permissions need a tweak before it can reach Docker."));
       p.log.message(

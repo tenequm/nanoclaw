@@ -60,6 +60,61 @@ export function statePaths(projectRoot = process.cwd()) {
   };
 }
 
+/** A redirect fails: the port it points to stays closed to the agent. */
+export function checkModelList(response: string, port: number): void {
+  const split = response.indexOf('\r\n\r\n');
+  const status = /^HTTP\/1\.[01] (\d{3})/.exec(response)?.[1];
+  let body: any;
+  try {
+    body = split >= 0 ? JSON.parse(response.slice(split + 4)) : undefined;
+  } catch {
+    body = undefined;
+  }
+  if (status !== '200' || !body || !Array.isArray(body.data) || body.data.some((m: any) => typeof m?.id !== 'string'))
+    throw new Error(
+      `Port ${port} on this machine did not answer GET /v1/models with an OpenAI-style model list; it will not be reachable over plain HTTP.`,
+    );
+}
+
+// Plain HTTP opens a port on this machine, so gateway ports are refused and the model
+// list is fetched the way Iron reaches it.
+export async function prepareLocalModel(origin: string, projectRoot: string): Promise<void> {
+  const port = Number(origin.slice(origin.lastIndexOf(':') + 1));
+  const provider = await import('../../../../src/gateway-providers/iron-proxy.js');
+  const local = await import('../../../../src/gateway-providers/iron-proxy-local-model.js');
+  const settings = provider.readIronProxySettings(process.env, projectRoot);
+  if (local.gatewayPorts(settings.approvalPort).includes(port))
+    throw new Error(`Port ${port} belongs to a NanoClaw gateway, not a model server.`);
+  const image = readProjectEnv(projectRoot).NANOCLAW_IRON_PROXY_IMAGE;
+  if (!image) throw new Error('Install Iron Proxy before configuring a local model.');
+  let response = '';
+  try {
+    response = await docker(
+      [
+        'run',
+        '--rm',
+        ...(settings.managed ? ['--network', controlPaths(projectRoot).network] : []),
+        ...centralHostGatewayArgs(),
+        '--entrypoint',
+        'sh',
+        image,
+        '-c',
+        // Hold the request side open: BusyBox nc half-closes when stdin ends, and async
+        // servers (Uvicorn) then drop the reply. nc exits when the hold ends.
+        '{ printf "GET /v1/models HTTP/1.0\\r\\nHost: %s\\r\\nAccept: application/json\\r\\n\\r\\n" "$1"; sleep 5; } | nc -w 5 "$2" "$3"',
+        'probe',
+        origin,
+        local.LOCAL_MODEL_HOST,
+        String(port),
+      ],
+      true,
+    );
+  } catch (error) {
+    if (error instanceof InstallCommandFailure && error.interrupted) throw error;
+  }
+  checkModelList(response, port);
+}
+
 export function readAllowedHosts(projectRoot: string): string[] {
   return readAllowedHostsFile(statePaths(projectRoot).allowedHosts);
 }

@@ -17,8 +17,12 @@ Copy the package's provider, approval middleware, tests, and agent guidance into
 payload/src/gateway-providers/iron-proxy.ts -> src/gateway-providers/iron-proxy.ts
 payload/src/gateway-providers/iron-proxy.test.ts -> src/gateway-providers/iron-proxy.test.ts
 payload/src/gateway-providers/iron-proxy-allowlist.ts -> src/gateway-providers/iron-proxy-allowlist.ts
+payload/src/gateway-providers/iron-proxy-local-model.ts -> src/gateway-providers/iron-proxy-local-model.ts
+payload/src/gateway-providers/iron-proxy-local-model.test.ts -> src/gateway-providers/iron-proxy-local-model.test.ts
 payload/src/gateway-providers/iron-proxy-approval.ts -> src/gateway-providers/iron-proxy-approval.ts
 payload/src/gateway-providers/iron-proxy-approval.test.ts -> src/gateway-providers/iron-proxy-approval.test.ts
+payload/src/gateway-providers/iron-proxy-credential-scope.ts -> src/gateway-providers/iron-proxy-credential-scope.ts
+payload/src/gateway-providers/iron-proxy-credential-scope.test.ts -> src/gateway-providers/iron-proxy-credential-scope.test.ts
 payload/src/gateway-providers/iron-proxy-transform.proto -> src/gateway-providers/iron-proxy-transform.proto
 payload/container/skills/iron-proxy-gateway/SKILL.md -> container/skills/iron-proxy-gateway/SKILL.md
 payload/container/skills/iron-proxy-gateway/instructions.md -> container/skills/iron-proxy-gateway/instructions.md
@@ -35,7 +39,7 @@ import './iron-proxy.js';
 ## Install the bridge dependencies
 
 ```nc:dep manager:pnpm
-@grpc/grpc-js@1.14.4
+@grpc/grpc-js@1.14.5
 @grpc/proto-loader@0.8.1
 ```
 
@@ -47,8 +51,10 @@ The installer streams stage names and elapsed-time updates. Source downloads sto
 
 Setup builds unmodified upstream Iron Proxy and a separate NanoClaw approval front in the same image. No Iron fork or source patch is used. The front is the only network-facing listener. It authenticates session identities, inspects each HTTP request inside HTTPS tunnels, checks the allowlist, and waits for an explicit approval before forwarding to Iron on `127.0.0.1:18080`. Empty, malformed, rejected or timed-out decisions fail closed. Iron's own dial-time loopback and link-local deny rules prevent DNS aliases from reaching the internal backend. Managed control-plane updates only change Iron's credential transforms; they cannot remove the front's checks.
 
-The front builds and runs the pinned OneCLI helper in `gateway-compat/onecli-summary`; do not add app-specific rules. Only method, host, path, response status and the resulting OneCLI summary reach the approval bridge. Raw bodies, authorization headers, query strings and Iron transform traces do not. The helper sees a bounded pre-injection body prefix; the full original stream is preserved. Read the approval-presentation contract in `docs/gateway-seam.md`. The build tests stock Iron, the front, and the summary helper, then records an immutable image ID and source hash.
+The front builds and runs the pinned OneCLI helper in `gateway-compat/onecli-summary`; do not add app-specific rules. Only method, host, path, response status, the resulting OneCLI summary and whether the request sends a body or upgrade reach the approval bridge. Raw bodies, authorization headers, query strings and Iron transform traces do not. The helper sees a bounded pre-injection body prefix; the full original stream is preserved. Read the approval-presentation contract in `docs/gateway-seam.md`. The build tests stock Iron, the front, and the summary helper, then records an immutable image ID and source hash.
 NanoClaw's approval service uses a private Unix socket on Linux. On macOS it uses loopback with mutual TLS and a proxy-only client certificate. Credentials pass directly from Iron Control to Iron Proxy.
+
+With `NANOCLAW_GATEWAY_UNCREDENTIALED_READS=true` in `.env`, a GET or HEAD that sends no body or upgrade skips the card when no Iron credential rule could apply to its host and method. The bridge reads the rules from the proxy's `config.yaml` and, when managed, from Iron Control's effective config for the principal the proxy is assigned now. It reads them fresh for each such request and keeps every card for 30 seconds after its first read, because Iron applies grant changes on its own 10-second sync. Every rule it has seen stays in scope, recorded in `seen-credential-rules.json` beside `config.yaml`, because Iron can keep applying a grant that Iron Control has dropped. Delete that file and restart the host to forget revoked grants. The card also stays when Iron Control cannot be read, when the assignment changes mid-read, when a rule has an unknown shape, when `config.yaml` or `proxy.env` is newer than the running proxy (restart it), or when `proxy.env` sets a custom sync interval. Two gaps remain. A grant created in the moment between that read and the forward can be used without a card. So can a grant created and revoked between two reads, if Iron synced it in between, until Iron drops it. A front built before this change never attests a payload-free request, so re-run setup to rebuild it. See `docs/gateway-seam.md` for the data-leak trade-off.
 
 `NANOCLAW_IRON_PROXY_PORT` in `.env` sets the internal proxy port (default `8080`). Setup uses the same value for the front listener and the agent proxy URL. This does not publish a host port. Re-run setup and restart this NanoClaw copy after changing it.
 
@@ -92,12 +98,12 @@ pnpm run build
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run src/gateway-providers/iron-proxy.test.ts src/gateway-providers/iron-proxy-approval.test.ts src/gateway-providers/gateway-provider-registry.test.ts src/gateway-approval-coordinator.test.ts .claude/skills/add-iron-proxy/scripts/control.test.ts .claude/skills/add-iron-proxy/scripts/setup.test.ts .claude/skills/add-iron-proxy/scripts/provider-credentials.test.ts .claude/skills/add-iron-proxy/scripts/credential-isolation.test.ts .claude/skills/add-iron-proxy/scripts/install-command.test.ts
+pnpm exec vitest run src/gateway-providers/iron-proxy.test.ts src/gateway-providers/iron-proxy-approval.test.ts src/gateway-providers/iron-proxy-credential-scope.test.ts src/gateway-providers/gateway-provider-registry.test.ts src/gateway-approval-coordinator.test.ts .claude/skills/add-iron-proxy/scripts/control.test.ts .claude/skills/add-iron-proxy/scripts/setup.test.ts .claude/skills/add-iron-proxy/scripts/provider-credentials.test.ts .claude/skills/add-iron-proxy/scripts/credential-isolation.test.ts .claude/skills/add-iron-proxy/scripts/install-command.test.ts src/gateway-providers/iron-proxy-local-model.test.ts .claude/skills/add-iron-proxy/scripts/local-model.test.ts
 ```
 
 The setup consumer writes `NANOCLAW_GATEWAY_PROVIDER=iron-proxy` only after every directive succeeds. Restart only this copy's NanoClaw service after an upgrade so its session contribution and approval bridge match the new installation. Check the proxy has synced its assigned principal before reporting the gateway ready.
 
-The request order is front identity and allowlist → human approval → stock Iron credentials → upstream. The front also requires an explicit response decision before returning upstream data. HTTPS tunnels pin the target authority; each inner HTTP request is checked again. Streaming responses and WebSocket upgrades use this same request/response gate. Credentialed application requests use HTTPS; the approval bridge rejects plaintext HTTP destinations. Do not rewrite an HTTP request’s approval metadata as HTTPS to bypass that restriction. The bridge forwards every allowed HTTP request to core as a default approval request. Core uses the active agent provider’s model-domain declaration to permit model traffic without a card; other destinations retain human approval. CONNECT verifies identity; the inner HTTP request is the approval point. Existing standalone model credentials are moved into Iron Control during setup and removed from the old secret file after successful storage and grant.
+The request order is front identity and allowlist → human approval → stock Iron credentials → upstream. The front also requires an explicit response decision before returning upstream data. HTTPS tunnels pin the target authority; each inner HTTP request is checked again. Streaming responses and WebSocket upgrades use this same request/response gate. Credentialed application requests use HTTPS; the approval bridge rejects plaintext HTTP destinations, except one keyless model on this machine pinned by host and port (see [Serve a local model](#serve-a-local-model)). Do not rewrite an HTTP request’s approval metadata as HTTPS to bypass that restriction. The bridge forwards every allowed HTTP request to core as a default approval request. Core uses the active agent provider’s model-domain declaration to permit model traffic without a card; other destinations retain human approval. CONNECT verifies identity; the inner HTTP request is the approval point. Existing standalone model credentials are moved into Iron Control during setup and removed from the old secret file after successful storage and grant.
 
 ## Open and use the official console
 
@@ -164,9 +170,21 @@ reading values. Before keeping or overwriting a record, setup rechecks its
 ownership and rules and stops if they no longer match. Broker refresh may continue during login; a change to the broker's
 client binding or the secrets' rules stops setup.
 
-Native backends and custom/keyless HTTPS endpoints on port 443 are supported.
-Use a DNS name and TLS for local models; plaintext HTTP endpoints fail during
-setup. Follow the OpenCode skill to restart the host and test a real reply.
+Native backends and keyless or custom HTTPS endpoints on port 443 are supported.
+Setup refuses plain HTTP (except a local model, below), other ports, IP addresses
+and private names such as `*.home.arpa`, because Iron trusts only public
+certificates. Setup adds the model host to Iron's allowlist.
+Follow your provider's skill to restart the host and test a real reply.
+
+### Serve a local model
+
+A keyless model on this machine can use `http://host.docker.internal:<port>/v1`. Traffic still goes through Iron.
+
+1. Run the server on a fixed port, bound to `127.0.0.1` (Docker Desktop) or the Docker bridge address, often `172.17.0.1` (Linux). Not `0.0.0.0`: that exposes it to your network.
+2. Enter the URL at the provider's endpoint prompt, and answer that it needs no key.
+3. Restart the host.
+
+Only that port and the OpenAI inference routes are reachable. Don't grant an Iron credential for `host.docker.internal`: Iron would send it over plain HTTP. A model that needs a key, or runs on another machine, needs https on a public DNS name.
 
 ## Remove
 
