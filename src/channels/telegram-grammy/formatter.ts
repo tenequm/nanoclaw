@@ -27,6 +27,9 @@
  * we don't have at render time. grammy's `FormattedString.mentionUser`
  * helper is itself just `a(\`tg://user?id=${id}\`)` — same output.
  *
+ * Times: `[text](tg://time?unix=N&format=F)` (or the `![text](...)` image
+ * form, Telegram's own Rich Markdown spelling) becomes a `date_time` entity.
+ *
  * Two opt-in conventions this renderer adds on top:
  *
  *  - `> [!fold]` (also `[!expand]`, `[!expandable]`) on the first line of a
@@ -185,6 +188,8 @@ function renderNode(node: RenderableNode): FormattedString {
     return FormattedString.pre(node.value, lang);
   }
   if (isLinkNode(node)) {
+    const time = parseTimeLink(node.url);
+    if (time) return FormattedString.time(renderChildren(node.children), time.unix, time.format);
     return FormattedString.a(renderChildren(node.children), node.url);
   }
   if (isBlockquoteNode(node)) {
@@ -212,6 +217,8 @@ function renderNode(node: RenderableNode): FormattedString {
   }
   if (node.type === 'image') {
     const alt = node.alt ?? '';
+    const time = parseTimeLink(node.url);
+    if (time && alt) return FormattedString.time(alt, time.unix, time.format);
     if (!alt) return FormattedString.a('(image)', node.url);
     return FormattedString.a(alt, node.url);
   }
@@ -238,6 +245,24 @@ function renderNode(node: RenderableNode): FormattedString {
   // visible output. (footnoteDefinition is also dropped at AST level by
   // applyTelegramDialect; this is just a belt for the suspenders.)
   return EMPTY();
+}
+
+type DateTimeFormat = NonNullable<Parameters<typeof FormattedString.time>[2]>;
+const DATE_TIME_FORMAT_RE = /^(?:r|w?[dD]?[tT]?)$/;
+
+/**
+ * `tg://time?unix=<seconds>[&format=<fmt>]` - Telegram's own Rich Markdown
+ * syntax for a `date_time` entity, which each reader sees in their own
+ * timezone and locale. A link that does not parse stays a plain link.
+ */
+function parseTimeLink(url: string): { unix: number; format: DateTimeFormat | undefined } | null {
+  if (!url.startsWith('tg://time?')) return null;
+  const params = new URLSearchParams(url.slice('tg://time?'.length));
+  const unixRaw = params.get('unix') ?? '';
+  if (!/^\d+$/.test(unixRaw)) return null;
+  const format = params.get('format') ?? '';
+  if (!DATE_TIME_FORMAT_RE.test(format)) return null;
+  return { unix: Number(unixRaw), format: format ? (format as DateTimeFormat) : undefined };
 }
 
 function renderChildren(children: readonly RenderableNode[]): FormattedString {

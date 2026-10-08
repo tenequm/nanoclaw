@@ -248,6 +248,43 @@ describe('Surfaced node types (linkReference / imageReference / html)', () => {
   });
 });
 
+describe('Times (tg://time links)', () => {
+  const entityOf = (md: string) => {
+    const fs = renderFS(md);
+    return { fs, entity: fs.entities.find((e) => e.type === 'date_time') as Record<string, unknown> | undefined };
+  };
+
+  it('turns a tg://time link into a date_time entity over its label', () => {
+    const { fs, entity } = entityOf('Call at [Fri 15:00](tg://time?unix=1760108400&format=wDT) ok');
+    expect(fs.text).toBe('Call at Fri 15:00 ok');
+    expect(entity).toMatchObject({
+      type: 'date_time',
+      offset: 8,
+      length: 9,
+      unix_time: 1760108400,
+      date_time_format: 'wDT',
+    });
+    expect(fs.entities.some((e) => e.type === 'text_link')).toBe(false);
+  });
+
+  it('accepts the relative format, no format, and the image form', () => {
+    expect(entityOf('[in 2h](tg://time?unix=1760108400&format=r)').entity).toMatchObject({ date_time_format: 'r' });
+    expect(entityOf('[then](tg://time?unix=1760108400)').entity).toMatchObject({ unix_time: 1760108400 });
+    expect(entityOf('![tomorrow](tg://time?unix=1760108400&format=t)').entity).toMatchObject({
+      type: 'date_time',
+      date_time_format: 't',
+    });
+  });
+
+  it('leaves a malformed time link as a plain link', () => {
+    for (const md of ['[x](tg://time?unix=abc)', '[x](tg://time?unix=1&format=zz)']) {
+      const { fs, entity } = entityOf(md);
+      expect(entity).toBeUndefined();
+      expect(fs.entities.some((e) => e.type === 'text_link')).toBe(true);
+    }
+  });
+});
+
 describe('User mention links (tg://user?id=N)', () => {
   // Telegram renders text_link with `tg://user?id=N` as a clickable user
   // mention. A real `text_mention` entity would also work but requires the
