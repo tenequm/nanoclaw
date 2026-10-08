@@ -56,6 +56,35 @@ async function compose(ag: AgentGroup, spec: ProjectDocSpec = CLAUDE_SPEC): Prom
   return fs.readFileSync(path.join(groupDirOf(ag.folder), spec.fileName), 'utf-8');
 }
 
+/** Run `fn` with cwd at a root whose `container/` is the real tree, shipped skills included. */
+async function withRealContainer<T>(fn: () => Promise<T>): Promise<T> {
+  const root = fs.mkdtempSync(path.join(TEST_ROOT, 'real-skills-'));
+  fs.mkdirSync(path.join(root, 'container'));
+  for (const entry of ['CLAUDE.md', 'agent-runner', 'skills']) {
+    fs.symlinkSync(path.join(REPO_ROOT, 'container', entry), path.join(root, 'container', entry));
+  }
+  const previousCwd = process.cwd();
+  process.chdir(root);
+  try {
+    return await fn();
+  } finally {
+    process.chdir(previousCwd);
+  }
+}
+
+function realSkill(name: string): string {
+  return fs.readFileSync(path.join(REPO_ROOT, 'container', 'skills', name, 'instructions.md'), 'utf-8').trim();
+}
+
+/** One composed section, up to the next composed heading; the base has headings of its own. */
+function composedSection(doc: string, name: string): string {
+  const start = doc.indexOf(`# ${name}\n\n`);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const rest = doc.slice(start);
+  const next = rest.slice(1).search(/\n\n# (NanoClaw (Module|Skill): |MCP Server: |Native Runtime Skills\n)/);
+  return next === -1 ? rest : rest.slice(0, next + 1);
+}
+
 beforeEach(async () => {
   vi.clearAllMocks();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
@@ -282,40 +311,21 @@ describe('composeGroupProjectDoc skill selection', () => {
     expect(doc).toContain('# NanoClaw Skill: fixture-gateway');
   });
 
-  // The fork's house style and voice guidance are resident prose, not lazily discovered skills
-  // nor text in the shared base: red if either moves back or stops composing from the real tree.
-  it('composes the shipped house-style and voice-mode-formatting prose, and keeps the base free of it', async () => {
+  // The fork's no-em-dash rule lives once, in the base's Tenequm defaults block; the voice guidance
+  // is resident skill prose. Red if either moves or stops composing from the real tree.
+  it('carries the em-dash rule once, inside the Tenequm defaults block, and composes voice-mode-formatting', async () => {
     const ag = await seed('ag-resident', 'resident-group');
-    const root = fs.mkdtempSync(path.join(TEST_ROOT, 'real-skills-'));
-    fs.mkdirSync(path.join(root, 'container'));
-    for (const entry of ['CLAUDE.md', 'agent-runner', 'skills']) {
-      fs.symlinkSync(path.join(REPO_ROOT, 'container', entry), path.join(root, 'container', entry));
-    }
-    const previousCwd = process.cwd();
-    process.chdir(root);
 
-    try {
-      const doc = await compose(ag);
-      // A composed section runs to the next composed heading; the base has headings of its own.
-      const section = (name: string): string => {
-        const start = doc.indexOf(`# ${name}\n\n`);
-        expect(start).toBeGreaterThanOrEqual(0);
-        const rest = doc.slice(start);
-        const next = rest.slice(1).search(/\n\n# (NanoClaw (Module|Skill): |MCP Server: |Native Runtime Skills\n)/);
-        return next === -1 ? rest : rest.slice(0, next + 1);
-      };
-      const skill = (name: string): string =>
-        fs.readFileSync(path.join(REPO_ROOT, 'container', 'skills', name, 'instructions.md'), 'utf-8').trim();
+    const doc = await withRealContainer(() => compose(ag));
 
-      expect(section('NanoClaw Skill: house-style')).toContain(skill('house-style'));
-      expect(section('NanoClaw Skill: voice-mode-formatting')).toContain(skill('voice-mode-formatting'));
-      const base = section('NanoClaw Runtime Contract');
-      expect(base).toContain('You are a NanoClaw agent.');
-      expect(base).not.toMatch(/em-dash|house style/i);
-      expect(doc.match(/no em-dash, ever/gi)).toHaveLength(1);
-    } finally {
-      process.chdir(previousCwd);
-    }
+    expect(composedSection(doc, 'NanoClaw Skill: voice-mode-formatting')).toContain(realSkill('voice-mode-formatting'));
+    const base = composedSection(doc, 'NanoClaw Runtime Contract');
+    expect(base).toContain('You are a NanoClaw agent.');
+    const defaultsAt = base.indexOf('\n## Tenequm defaults\n');
+    expect(defaultsAt).toBeGreaterThan(-1);
+    expect(base.slice(0, defaultsAt)).not.toMatch(/no em-dash/i);
+    expect(base.slice(defaultsAt)).toMatch(/no em-dash, ever/i);
+    expect(doc.match(/no em-dash, ever/gi)).toHaveLength(1);
   });
 });
 

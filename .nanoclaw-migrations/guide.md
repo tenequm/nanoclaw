@@ -184,12 +184,11 @@ Attachment rendering: append ` transcript: "..."` when `a.transcript` is set; re
 the machine format the agents parse, not prose.)
 
 ## D4. [MERGE] `container/CLAUDE.md`
-Upstream is a 25-line platform doc. Prepend the fork's house-style banner (no em-dash / en-dash
-ever, applies to every agent) and add the fork's sections: "Cite sources with clickable links",
-"Don't speculate, look it up", "Prefer `glim` MCP tools for research", "GitHub and git"
-(gh + git-over-HTTPS via the gateway, HTTPS remotes only). Rewrite upstream's own prose
-em-dashes in this file to periods/colons so the file does not contradict its banner. Keep
-upstream's Memory / Conversation history sections verbatim.
+Take upstream's file verbatim, then append the fork's `## Tenequm defaults` block at the end
+(`git show <fork-head>:container/CLAUDE.md`): platform layer, No em-dash (the rule that used to
+be the `house-style` skill), "Cite sources with clickable links", "Don't speculate, look it up",
+"Prefer `glim` MCP tools for research", "GitHub and git", "DuckDB". Upstream's own prose above
+the block stays untouched, so a later merge conflicts only at the file's end.
 
 ## D5. [DROPPED] Repo `CLAUDE.md` fork sections
 Chat Commands, Per-agent group file layout (obsolete after the project-doc change), typing
