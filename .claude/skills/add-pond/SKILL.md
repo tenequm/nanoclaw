@@ -110,10 +110,10 @@ Then in `buildMounts`, after the provider-contributed mounts block and before `r
 site. The class is not a style choice: `validateSpec` pins `group-state` to
 `data/v2-sessions/<group>` and the group folder, and `install-surface` to the enumerated
 release surfaces (`mountPolicy` in `src/drivers/index.ts`). A pond store lives at
-`data/pond/stores/<name>`, so it would be denied under either of those classes. `allowlisted-extra` is the
-class for host paths vetted in-tree rather than by a path rule - the same lane the
-provider-contributed mounts ride - and this module does that vetting (read-list membership,
-local backend, directory exists) and never emits a writable mount.
+`data/pond/stores/<name>`, so it would be denied under either of those classes.
+`allowlisted-extra` is the class for host paths vetted in-tree rather than by a path rule -
+the same lane the provider-contributed mounts ride - and this module does that vetting
+(read-list membership, local backend, directory exists) and never emits a writable mount.
 
 ### Register pond MCP servers in the agent-runner
 

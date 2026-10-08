@@ -67,9 +67,8 @@ Also excise from the island: `TELEGRAM_NO_SEEN_CHATS` / seen-reaction remnants, 
 - Central DB reads/writes are async (`await`). `getMessagingGroupByPlatform`, `getAgentGroup`,
   `getMessagingGroupAgents`, `createMessagingGroupAgent`, user lookups: await them.
 - Session/mailbox access goes through `src/mailbox/` (not `src/db/session-db.ts`).
-- `resolveGroupFolderForPlatformId(channelType, platformId)` helper (fork added to
-  `src/group-folder.ts`) is used by attachments to stream bytes into the group folder - re-add
-  it as an async function.
+- Attachments stage under `data/inbound-staging/telegram/<uuid>/` and the host copies them into
+  each session's inbox (see A5); the adapter needs no group-folder lookup.
 - Shutdown: register through the host lifecycle API, not `response-registry.ts`.
 - `.env` keys stay: `TELEGRAM_BOT_TOKEN` (+ `_SUFFIX` per instance), `TELEGRAM_API_ROOT`,
   `TELEGRAM_LOCAL_FILES_DIR`, `OPENAI_API_KEY` (transcription).
@@ -85,6 +84,16 @@ Also excise from the island: `TELEGRAM_NO_SEEN_CHATS` / seen-reaction remnants, 
   `@grammyjs/parse-mode 2.3.0`, `effect 4.0.0-beta.52`, `markdown-it ^14.1.1`,
   `mediabunny 1.40.1`, `openai ^6.34.0`; dev `@types/markdown-it ^14.1.2`.
   (`@grammyjs/commands` 1.3.2, `@grammyjs/menu` 1.3.1 re-added with the restored chat commands.)
+
+## A5. [MERGE] Staged inbound attachments (2026-10-08)
+The adapter downloads into `inboundStagingRoot()` and sets `att.stagedPath` + `att.name`; core
+copies it into `inbox/<message-id>/<name>` (the Runtime Contract's path) per session. Re-apply on
+upstream files: `src/session-manager.ts` `extractAttachmentFiles` (async; staged branch with
+`containedStagedFile`, `COPYFILE_EXCL | COPYFILE_FICLONE`, per-attachment `att.error`, strip
+`stagedPath` before any return), `src/inbox-safety.ts` (`inboundStagingRoot`,
+`sweepInboundStaging`), `src/host-sweep.ts` + `src/reconcile.ts` (`singleton:inbound-staging`),
+and `src/modules/agent-to-agent/agent-route.ts` `withoutHostStamps` (agents cannot pass a
+`stagedPath`).
 
 ## A3. [RESTORED 2026-08-31] Host chat commands
 Restored post-migration, adapted to the async DbDriver tree: `2055cfdb` (system),
@@ -151,7 +160,8 @@ Store model (fork HEAD): one host-only `data/pond/stores.json` declaring named s
 independent `ingest` (host sync loop) and `read` (mount) group lists; local stores live at
 `data/pond/stores/<name>` and mount read-only at `/workspace/extra/pond/<name>`; remote
 backends are never mounted. Mount class: `allowlisted-extra` (the only class whose policy
-admits `data/pond/...` and the HF model-cache dir).
+admits `data/pond/...`). Pond searches BM25 full-text with embeddings off, so no model cache
+is mounted and pond-mcp sets no `HOME`.
 
 ## C3. [MERGE] Agent-runner hook - register MCP servers
 Fork: `import { pondMcpServers } from './pond-mcp.js'` and
@@ -189,6 +199,12 @@ Take upstream's file verbatim, then append the fork's `## Rules for every agent`
 to be the `house-style` skill), "Never Russian", "Cite sources with clickable links", "Don't speculate, look it up",
 "Prefer `glim` MCP tools for research", "GitHub and git", "DuckDB". Upstream's own prose above
 the block stays untouched, so a later merge conflicts only at the file's end.
+
+## D6. [MERGE] Module prose gates (2026-10-08)
+`src/project-doc-compose.ts`: `registerModuleSectionGate` beside `registerResidentSkillGate`
+(shared `SectionGate`, a throwing gate leaves the section out). `canvas-actions` and
+`slack-agent-flow` gate `canvas`, `create-agent-slack` and `rooms` on
+`isAgentWiredToChannel(group.id, 'slack')` (`src/db/messaging-groups.ts`).
 
 ## D5. [DROPPED] Repo `CLAUDE.md` fork sections
 Chat Commands, Per-agent group file layout (obsolete after the project-doc change), typing

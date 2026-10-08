@@ -234,7 +234,11 @@ export interface InboundAttachment {
    * this with `localPath`, and never lets it reach the container.
    */
   stagedPath?: string;
-  /** Session-relative inbox path (`inbox/<message-id>/<name>`), consumed by the agent-runner. */
+  /**
+   * Session-relative inbox path (`inbox/<message-id>/<name>`). Never set by
+   * the adapter: `writeSessionMessage` writes it on each session's copy of
+   * the record, and the agent-runner reads it there.
+   */
   localPath?: string;
   transcript?: string;
   /**
