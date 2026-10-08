@@ -22,6 +22,8 @@ export interface RunnerConfig {
   effort?: string;
   autoCompactWindow?: number;
   speed?: ProviderSpeed;
+  /** The host lets this group send Telegram Rich Messages; `send_message` then offers `rich`. */
+  richMessages: boolean;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -60,6 +62,7 @@ export function runnerConfigFromRaw(raw: Record<string, unknown>): RunnerConfig 
     effort: (raw.effort as string) || undefined,
     autoCompactWindow: (raw.autoCompactWindow as number) || undefined,
     speed: readSpeed(raw),
+    richMessages: raw.richMessages === true,
   };
 }
 

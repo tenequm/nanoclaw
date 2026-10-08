@@ -259,6 +259,8 @@ export interface ContainerConfig {
   /** Provider-declared speed tier (`standard` or `fast` for Claude); the group value overrides the install default. */
   speed?: ContainerSpeed;
   timezone?: string;
+  /** Present only when the group may send Telegram Rich Messages; the runner then offers `send_message`'s `rich`. */
+  richMessages?: true;
   /** Session isolation tier for the group's containers; absent = the composer's default ('container'). */
   runtimeTier?: 'container' | 'vm';
 }
@@ -385,6 +387,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     // A cleared group value falls back to the install-wide default.
     ...speedFields(parseContainerSpeed(row.speed) ?? (FAST_MODE ? 'fast' : undefined)),
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
+    ...(row.rich_messages === 1 ? { richMessages: true as const } : {}),
     runtimeTier: parseRuntimeTier(row.runtime_tier, group.name),
   };
 }

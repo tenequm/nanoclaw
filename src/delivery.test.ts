@@ -27,6 +27,7 @@ vi.mock('./config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
+import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { getDeliveredIds } from './mailbox/sqlite/session-db.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession, resolveTaskSession, withMailboxSession } from './session-manager.js';
@@ -1393,5 +1394,26 @@ describe('deliverSessionMessages — reply box', () => {
 
     const [content] = await deliveredContent(session);
     expect(content).toEqual({ text: 'answer' });
+  });
+
+  it('carries rich only for a group with rich_messages on, and strips it otherwise', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'latest');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { text: '| a |', rich: true });
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    try {
+      const [refused] = await deliveredContent(session);
+      expect(refused).toEqual({ text: '| a |' });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('Rich message requested'), expect.anything());
+    } finally {
+      warn.mockRestore();
+    }
+
+    await ensureContainerConfig('ag-1');
+    await updateContainerConfigScalars('ag-1', { rich_messages: 1 });
+    insertReply(session.id, 'out-2', '123:1:ag-1', { text: '| b |', rich: true });
+    insertReply(session.id, 'out-3', '123:1:ag-1', { text: 'plain' });
+    expect(await deliveredContent(session)).toEqual([{ text: '| b |', rich: true }, { text: 'plain' }]);
   });
 });

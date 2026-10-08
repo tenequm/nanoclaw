@@ -22,3 +22,11 @@ describe('runner config speed', () => {
     expect(runnerConfigFromRaw({ speed: 7 }).speed).toBeUndefined();
   });
 });
+
+describe('runner config richMessages', () => {
+  it('is on only when the host wrote richMessages: true', () => {
+    expect(runnerConfigFromRaw({ richMessages: true }).richMessages).toBe(true);
+    expect(runnerConfigFromRaw({}).richMessages).toBe(false);
+    expect(runnerConfigFromRaw({ richMessages: 'yes' }).richMessages).toBe(false);
+  });
+});

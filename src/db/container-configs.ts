@@ -13,6 +13,7 @@ const SCALAR_COLUMNS = new Set([
   'cli_scope',
   'timezone',
   'speed',
+  'rich_messages',
 ]);
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
 
@@ -30,11 +31,11 @@ export async function createContainerConfig(config: ContainerConfigRow): Promise
     `INSERT INTO container_configs (
         agent_group_id, provider, model, effort, image_tag, assistant_name,
         max_messages_per_prompt, auto_compact_window, skills, mcp_servers, packages_apt, packages_npm,
-        additional_mounts, cli_scope, timezone, speed, updated_at
+        additional_mounts, cli_scope, timezone, speed, rich_messages, updated_at
       ) VALUES (
         @agent_group_id, @provider, @model, @effort, @image_tag, @assistant_name,
         @max_messages_per_prompt, @auto_compact_window, @skills, @mcp_servers, @packages_apt, @packages_npm,
-        @additional_mounts, @cli_scope, @timezone, @speed, @updated_at
+        @additional_mounts, @cli_scope, @timezone, @speed, @rich_messages, @updated_at
       )`,
     config,
   );
@@ -90,6 +91,7 @@ export async function updateContainerConfigScalars(
       | 'cli_scope'
       | 'timezone'
       | 'speed'
+      | 'rich_messages'
     >
   >,
 ): Promise<void> {

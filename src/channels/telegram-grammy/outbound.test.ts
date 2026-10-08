@@ -270,3 +270,65 @@ describe('telegram outbound never drops text', () => {
     expect(bot.calls.map((c) => c.method).slice(2)).toEqual(['editMessageCaption']);
   });
 });
+
+describe('telegram outbound rich messages', () => {
+  const table = '| host | state |\n| --- | --- |\n| bl | up |';
+
+  it('sends rich content through sendRichMessage with its reply parameters', async () => {
+    const bot = fakeBot();
+    const id = await bot.run({
+      kind: 'chat',
+      content: { text: table, rich: true, threadReply: { quote: 'status?' } },
+      inReplyTo: '42:7',
+    });
+    expect(bot.calls).toHaveLength(1);
+    expect(bot.calls[0]).toMatchObject({
+      method: 'sendRichMessage',
+      other: { reply_parameters: { message_id: 7, allow_sending_without_reply: true, quote: 'status?' } },
+    });
+    expect(bot.calls[0].args.slice(0, 2)).toEqual([42, { markdown: table }]);
+    expect(id).toBe('100');
+  });
+
+  it('resends a rejected rich message as a normal one', async () => {
+    const bot = fakeBot((call) =>
+      call.method === 'sendRichMessage' ? badRequest('RICH_MESSAGE_INVALID', call.method) : undefined,
+    );
+    const id = await bot.run({ kind: 'chat', content: { text: '**hi**', rich: true } });
+    expect(bot.calls.map((c) => c.method)).toEqual(['sendRichMessage', 'sendMessage']);
+    expect(bot.calls[1].args[1]).toBe('hi');
+    expect(id).toBe('100');
+  });
+
+  it('sends an over-limit rich message as normal split messages', async () => {
+    const bot = fakeBot();
+    await bot.run({ kind: 'chat', content: { text: 'x '.repeat(17000), rich: true } });
+    expect(new Set(bot.calls.map((c) => c.method))).toEqual(new Set(['sendMessage']));
+    expect(bot.calls.length).toBeGreaterThan(1);
+  });
+
+  it('ignores rich for files and when the host did not set it', async () => {
+    const bot = fakeBot();
+    await bot.run({ kind: 'chat', content: { text: table, rich: true }, files: [file('a.pdf')] });
+    await bot.run({ kind: 'chat', content: { text: table } });
+    expect(bot.calls.map((c) => c.method)).toEqual(['sendDocument', 'sendMessage']);
+  });
+
+  it('edits a rich message in the rich form, and falls back to a normal edit when rejected', async () => {
+    const bot = fakeBot((call) =>
+      call.method === 'editMessageText' && (call.args[2] as { markdown?: string }).markdown === 'bad'
+        ? badRequest('RICH_MESSAGE_INVALID', call.method)
+        : undefined,
+    );
+    const id = await bot.run({ kind: 'chat', content: { text: table, rich: true } });
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '# new' } });
+    expect(bot.calls[1].method).toBe('editMessageText');
+    expect(bot.calls[1].args.slice(0, 3)).toEqual([42, Number(id), { markdown: '# new' }]);
+
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: 'bad' } });
+    expect(bot.calls.slice(2).map((c) => [c.method, c.args[2]])).toEqual([
+      ['editMessageText', { markdown: 'bad' }],
+      ['editMessageText', 'bad'],
+    ]);
+  });
+});

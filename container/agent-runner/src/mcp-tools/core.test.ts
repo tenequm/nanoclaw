@@ -16,7 +16,7 @@ import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import { sendFile, sendMediaGroup, sendMessage } from './core.js';
+import { offerRichMessages, sendFile, sendMediaGroup, sendMessage } from './core.js';
 
 let testRoot: string;
 let agentDir: string;
@@ -328,5 +328,23 @@ describe('send_message — reply_to and quote', () => {
       true,
     );
     expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+});
+
+describe('send_message - rich', () => {
+  const props = () => sendMessage.tool.inputSchema.properties as Record<string, unknown>;
+  const lastContent = () => JSON.parse(getUndeliveredMessages().at(-1)!.content) as Record<string, unknown>;
+
+  it('offers rich only once the group may send Rich Messages, and only then writes it', async () => {
+    expect(props().rich).toBeUndefined();
+    await sendMessage.handler({ to: 'peer', text: '| a |', rich: true });
+    expect(lastContent()).toEqual({ text: '| a |' });
+
+    offerRichMessages();
+    expect(props().rich).toMatchObject({ type: 'boolean' });
+    await sendMessage.handler({ to: 'peer', text: '| a |', rich: true });
+    expect(lastContent()).toEqual({ text: '| a |', rich: true });
+    await sendMessage.handler({ to: 'peer', text: 'plain' });
+    expect(lastContent()).toEqual({ text: 'plain' });
   });
 });

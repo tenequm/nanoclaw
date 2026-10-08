@@ -9,6 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { loadConfig } from '../config.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo, getCurrentReplyRoute } from '../db/session-state.js';
@@ -131,6 +132,7 @@ export const sendMessage: McpToolDefinition = {
       inReplyTo = target.messageId;
     }
     const explicit = args.reply_to != null || quote !== undefined;
+    const rich = args.rich === true && RICH_PROPERTY in (sendMessage.tool.inputSchema.properties ?? {});
 
     const id = generateId();
     const seq = await writeMessageOut({
@@ -140,13 +142,36 @@ export const sendMessage: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify(explicit ? { text, replyIntent: quote ? { quote } : {} } : { text }),
+      content: JSON.stringify({
+        text,
+        ...(explicit ? { replyIntent: quote ? { quote } : {} } : {}),
+        ...(rich ? { rich: true } : {}),
+      }),
     });
 
     log(`send_message: #${seq} → ${routing.resolvedName}`);
     return ok(`Message sent to ${routing.resolvedName} (id: ${seq})`);
   },
 };
+
+const RICH_PROPERTY = 'rich';
+
+/**
+ * Offer `send_message`'s `rich` flag, for a group the host lets send Telegram
+ * Rich Messages. The host re-checks the group's setting at delivery, so this
+ * only decides what the agent is shown.
+ */
+export function offerRichMessages(): void {
+  const properties = (sendMessage.tool.inputSchema.properties ??= {}) as Record<string, unknown>;
+  properties[RICH_PROPERTY] = {
+    type: 'boolean',
+    description:
+      'Telegram only: send as a Rich Message, with real tables, headings, task lists and collapsible <details> blocks (up to 32768 chars). Single line breaks collapse there, so separate lines with a blank line. Leave it off for normal chat; other channels ignore it.',
+  };
+}
+
+// The MCP server runs in its own process; it reads the same container.json the runner does.
+if (loadConfig().richMessages) offerRichMessages();
 
 export const sendFile: McpToolDefinition = {
   tool: {

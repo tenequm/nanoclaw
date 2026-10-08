@@ -31,6 +31,8 @@ import { log } from '../../log.js';
 
 import { resolveQuestionRender } from '../question-render-registry.js';
 
+// Registers the Telegram prose of the agents' project documents.
+import './agent-docs.js';
 import { materializeAll } from './attachments.js';
 import { composeSelectedCard, parseCallbackData } from './ask-question.js';
 import { renderFS } from './formatter.js';

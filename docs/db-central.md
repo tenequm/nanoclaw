@@ -327,9 +327,12 @@ CREATE TABLE container_configs (
   additional_mounts      TEXT NOT NULL DEFAULT '[]',
   cli_scope              TEXT NOT NULL DEFAULT 'group',   -- disabled | group | global
   timezone               TEXT,                            -- IANA id; NULL = install-global TZ (added by migration 20)
+  rich_messages          INTEGER NOT NULL DEFAULT 0,      -- 1 = may send Telegram Rich Messages (added by migration 28)
   updated_at             TEXT NOT NULL
 );
 ```
+
+`rich_messages` lets one agent group send a Telegram message as a Rich Message (`send_message` with `rich: true`: real tables, headings, task lists). Set via `ncl groups config update --id <group> --rich-messages on|off`. The host checks it at delivery (`richAllowed` in `src/delivery.ts`), so it applies at once and a container cannot opt itself in; the agent is offered `rich`, and taught it by a composed "Rich messages" section, after its next spawn.
 
 `timezone` overrides the install-global timezone for one agent group: host-side scheduling (cron interpretation, `--process-after`, run-log stamps) resolves it live via `resolveGroupTimezone` (`src/container-config.ts`); the container gets it as its `TZ` env on next respawn. Set via `ncl groups config update --timezone <IANA>` (`""` clears back to NULL) or `ncl groups create --timezone`.
 
@@ -440,6 +443,7 @@ Several early migrations were later renamed/retired and replaced by "module" fil
 | 20 | `container-config-timezone` | `020-container-config-timezone.ts` | `container_configs.timezone` — per-agent-group timezone override (NULL = install-global) |
 | 21 | `approval-question-render-metadata` | `021-approval-question.ts` | `question` card-body column on all three approval tables so terminal edits retain the original request |
 | 22 | `messaging-group-detached-at` | `022-messaging-group-detached.ts` | `messaging_groups.detached_at` — records when the bot left a channel without deleting its wiring |
+| 28 | `container-config-rich-messages` | `028-container-config-rich-messages.ts` | `container_configs.rich_messages` - per-agent-group Telegram Rich Messages opt-in (default 0) |
 
 Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
 

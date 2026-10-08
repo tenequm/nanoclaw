@@ -9,7 +9,7 @@
  * offsets Telegram rejects anyway, and retries as plain text.
  *
  * Ops supported:
- *   - default message  (text + optional files)
+ *   - default message  (text + optional files; `rich: true` sends a Rich Message)
  *   - edit             ({ operation: 'edit', messageId, text/markdown })
  *   - reaction         ({ operation: 'reaction', messageId, emoji })
  *   - send_media_group ({ operation: 'send_media_group', items })
@@ -64,6 +64,8 @@ function mediaKindFromFilename(filename: string): MediaKind {
 
 interface ContentView {
   text: string;
+  /** The host allowed a Rich Message (see `richAllowed` in src/delivery.ts). */
+  rich: boolean;
   isEdit: boolean;
   editMessageId?: string;
   isReaction: boolean;
@@ -94,6 +96,7 @@ function viewContent(message: OutboundMessage): ContentView {
 
   return {
     text,
+    rich: c.rich === true,
     isEdit,
     editMessageId: isEdit ? (c.messageId as string) : undefined,
     isReaction,
@@ -213,11 +216,12 @@ const sendFollowUp = (
 
 /**
  * What the bot sent as (chatId, messageId), for edits: a media message takes
- * `editMessageCaption`. Bounded FIFO, wiped by a host restart; an edit of an
- * unremembered media message still lands through the "no text" retry.
+ * `editMessageCaption`, a Rich Message the rich edit form. Bounded FIFO, wiped
+ * by a host restart; an edit of an unremembered media message still lands
+ * through the "no text" retry, one of a Rich Message as a normal edit.
  */
 const MAX_SENT_KINDS = 4096;
-type SentKind = 'media';
+type SentKind = 'media' | 'rich';
 const sentKinds = new Map<string, SentKind>();
 
 function rememberSentKind(chatId: number, messageId: string | number | undefined, kind: SentKind): void {
@@ -444,8 +448,88 @@ const editCaptionBody = (
     return rest;
   });
 
+/** Telegram's limit for a Rich Message's text. */
+const RICH_TEXT_LIMIT = 32768;
+
 /**
- * Edit a message the bot sent. A media message gets its caption edited (known
+ * Whether a Telegram answer (not a lost connection) should send the content
+ * down the normal path instead: a rejected Rich Message must still arrive.
+ */
+const isTelegramRejection = (err: GrammyDeliveryError): boolean => err._tag !== 'GrammyNetworkError';
+
+/**
+ * Send the agent's markdown as a Rich Message (Bot API 10.1+): real tables,
+ * headings, task lists. Too long for one, or rejected by Telegram, it goes out
+ * as a normal message instead, so the text always arrives.
+ */
+const sendRich = Effect.fn('telegram-grammy.sendRich')(function* (
+  chatId: number,
+  messageThreadId: number | undefined,
+  markdown: string,
+  reply: ReplyParameters | undefined,
+) {
+  if (markdown.length > RICH_TEXT_LIMIT) {
+    yield* Effect.logWarning('telegram-grammy: rich message over the limit, sending it as a normal message', {
+      chatId,
+      length: markdown.length,
+    });
+    return yield* sendDefault(chatId, messageThreadId, markdown, [], reply);
+  }
+  const { bot } = yield* BotService;
+  return yield* sendReplying(0, reply, (replyParameters) =>
+    Effect.tryPromise({
+      try: () =>
+        bot.api.sendRichMessage(
+          chatId,
+          { markdown },
+          { message_thread_id: messageThreadId, reply_parameters: replyParameters },
+        ),
+      catch: (err) => mapGrammyError(err, 'sendRichMessage', String(chatId)),
+    }),
+  ).pipe(
+    Effect.map((sent) => {
+      rememberSentKind(chatId, sent.message_id, 'rich');
+      return String(sent.message_id);
+    }),
+    Effect.catch((err) =>
+      isTelegramRejection(err)
+        ? Effect.logWarning('telegram-grammy: rich message rejected, sending it as a normal message', err).pipe(
+            Effect.andThen(sendDefault(chatId, messageThreadId, markdown, [], reply)),
+          )
+        : Effect.fail(err),
+    ),
+  );
+});
+
+/**
+ * Edit a Rich Message in the rich form. Returns false when it did not take
+ * (too long, or rejected) so the caller edits it as a normal message.
+ */
+const editRich = (
+  chatId: number,
+  messageId: number,
+  markdown: string,
+): Effect.Effect<boolean, GrammyDeliveryError, BotService> =>
+  Effect.gen(function* () {
+    if (markdown.length > RICH_TEXT_LIMIT) return false;
+    const { bot } = yield* BotService;
+    return yield* Effect.tryPromise({
+      try: () => bot.api.editMessageText(chatId, messageId, { markdown }),
+      catch: (err) => mapGrammyError(err, 'editMessageText-rich', String(chatId)),
+    }).pipe(
+      Effect.as(true),
+      Effect.catch((err) =>
+        isTelegramRejection(err)
+          ? Effect.logWarning('telegram-grammy: rich edit rejected, editing as a normal message', err).pipe(
+              Effect.as(false),
+            )
+          : Effect.fail(err),
+      ),
+    );
+  });
+
+/**
+ * Edit a message the bot sent. A Rich Message is edited in the rich form. A media message gets its caption edited (known
  * from what was sent, or learned from Telegram's "no text" answer). Text
  * beyond the message's limit is sent right after as new messages.
  */
@@ -460,9 +544,11 @@ const editMessage = Effect.fn('telegram-grammy.editMessage')(function* (
     yield* Effect.logError('telegram-grammy: edit with invalid compound id', { compound });
     return undefined;
   }
+  const kind = sentKindOf(parsed.chatId, parsed.messageId);
+  if (kind === 'rich' && (yield* editRich(parsed.chatId, parsed.messageId, text))) return undefined;
   const fs = renderFS(text);
   const rest =
-    sentKindOf(parsed.chatId, parsed.messageId) === 'media'
+    kind === 'media'
       ? yield* editCaptionBody(parsed.chatId, parsed.messageId, fs)
       : yield* editTextBody(parsed.chatId, parsed.messageId, fs).pipe(
           Effect.catchTag('GrammyApiError', (err) =>
@@ -726,6 +812,8 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
       view.askQuestion ?? '',
       view.askOptions,
     );
+  } else if (view.rich && !view.isCard && files.length === 0 && view.text) {
+    result = yield* sendRich(chatId, messageThreadId, view.text, reply);
   } else {
     const text = view.isCard && view.cardFallbackText != null ? view.cardFallbackText : view.text;
     result = yield* sendDefault(chatId, messageThreadId, text, files, reply);

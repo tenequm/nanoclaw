@@ -26,6 +26,7 @@ import {
   getMessagingGroupForOwnDestination,
 } from './db/messaging-groups.js';
 import { clearDeliveryAttempt, recordDeliveryAttempt } from './db/coordination.js';
+import { getContainerConfig } from './db/container-configs.js';
 import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from './delivery-guard.js';
 import { isUnguarded, type Unguarded } from './guard/index.js';
 import { mapConcurrent } from './concurrency.js';
@@ -759,10 +760,11 @@ async function deliverMessage(
   if (reaction.kind === 'substituted') rewritten.emoji = reaction.emoji;
   const threadReply = await resolveThreadReply(msg, content, session, deliverInstance);
   if (threadReply) rewritten.threadReply = threadReply;
-  // Only the host decides on a reply box; a `threadReply` in the stored content is not carried.
-  const { threadReply: _stored, ...base } = content;
+  if (await richAllowed(msg.id, content, session)) rewritten.rich = true;
+  // Only the host decides on a reply box and a rich send; the stored content's own keys are not carried.
+  const { threadReply: _stored, rich: _rich, ...base } = content;
   const outboundContent =
-    Object.keys(rewritten).length > 0 || 'threadReply' in content
+    Object.keys(rewritten).length > 0 || 'threadReply' in content || 'rich' in content
       ? JSON.stringify({ ...base, ...rewritten })
       : msg.content;
 
@@ -802,6 +804,21 @@ async function deliverMessage(
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
   return platformMsgId;
+}
+
+/**
+ * Whether a message the agent marked `rich` may go out as a Rich Message: only
+ * for a group whose `rich_messages` setting is on. The container is untrusted,
+ * so its flag alone never decides; a refused one sends as a normal message.
+ */
+async function richAllowed(messageId: string, content: Record<string, unknown>, session: Session): Promise<boolean> {
+  if (content.rich !== true) return false;
+  if ((await getContainerConfig(session.agent_group_id))?.rich_messages === 1) return true;
+  log.warn('Rich message requested by a group without rich_messages; sending it as a normal message', {
+    id: messageId,
+    agentGroupId: session.agent_group_id,
+  });
+  return false;
 }
 
 /**

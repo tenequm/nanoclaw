@@ -46,6 +46,7 @@ import type { AgentGroup } from './types.js';
 // Loading these modules registers the per-agent sections and skill gates under test.
 import { resetGateConfigCache, writeGateEntry } from './modules/jev-gate/index.js';
 import './channels/voice-mode.js';
+import { RICH_MESSAGES_BODY, RICH_MESSAGES_SECTION } from './channels/telegram-grammy/agent-docs.js';
 import './modules/canvas-actions/index.js';
 import './modules/slack-agent-flow/index.js';
 
@@ -469,6 +470,22 @@ describe('composeGroupProjectDoc per-agent sections', () => {
 
     expect(doc).toContain('# NanoClaw Module: core');
     for (const name of SLACK_ONLY_MODULES) expect(doc).not.toContain(`# NanoClaw Module: ${name}\n`);
+  });
+
+  it('composes the Rich Messages section only for a Telegram-wired agent with rich_messages on', async () => {
+    const on = await seed('ag-rich-on', 'rich-on-group');
+    await wire(on, 'mg-rich-on', 'telegram');
+    await updateContainerConfigScalars(on.id, { rich_messages: 1 });
+    expect(composedSection(await compose(on), RICH_MESSAGES_SECTION)).toContain(RICH_MESSAGES_BODY);
+
+    const off = await seed('ag-rich-off', 'rich-off-group');
+    await wire(off, 'mg-rich-off', 'telegram');
+    expect(await compose(off)).not.toContain(`# ${RICH_MESSAGES_SECTION}`);
+
+    const slackOnly = await seed('ag-rich-slack', 'rich-slack-group');
+    await wire(slackOnly, 'mg-rich-slack', 'slack');
+    await updateContainerConfigScalars(slackOnly.id, { rich_messages: 1 });
+    expect(await compose(slackOnly)).not.toContain(`# ${RICH_MESSAGES_SECTION}`);
   });
 
   it('composes the Slack-only module prose for an agent wired to a named Slack instance', async () => {

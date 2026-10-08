@@ -340,6 +340,42 @@ describe('groups config (host-only)', () => {
     expect(JSON.parse((await getContainerConfig(GID))!.additional_mounts)).toEqual([]);
   });
 
+  describe('--rich-messages on|off', () => {
+    const GID = 'ag-rich';
+    const setRich = (value: unknown) =>
+      dispatch(
+        { id: `rich-${String(value)}`, command: 'groups-config-update', args: { id: GID, 'rich-messages': value } },
+        { caller: 'host' },
+      );
+
+    beforeEach(async () => {
+      await createAgentGroup({ id: GID, name: 'r', folder: 'r', agent_provider: null, created_at: now() });
+      await ensureContainerConfig(GID);
+    });
+
+    it('defaults off, turns on and off, and reaches container.json only when on', async () => {
+      const group = { id: GID, name: 'r', folder: 'r', agent_provider: null, created_at: now() };
+      expect((await getContainerConfig(GID))!.rich_messages).toBe(0);
+      expect(configFromDb((await getContainerConfig(GID))!, group).richMessages).toBeUndefined();
+
+      expect((await setRich('on')).ok).toBe(true);
+      expect((await getContainerConfig(GID))!.rich_messages).toBe(1);
+      expect(configFromDb((await getContainerConfig(GID))!, group).richMessages).toBe(true);
+
+      expect((await setRich('off')).ok).toBe(true);
+      expect((await getContainerConfig(GID))!.rich_messages).toBe(0);
+    });
+
+    it('rejects anything but on or off and writes nothing', async () => {
+      for (const value of ['yes', '1', true]) {
+        const rejected = await setRich(value);
+        expect(rejected.ok).toBe(false);
+        expect(errorMessage(rejected)).toBe('--rich-messages must be "on" or "off"');
+      }
+      expect((await getContainerConfig(GID))!.rich_messages).toBe(0);
+    });
+  });
+
   describe("--speed validates against the tiers the group's provider declares", () => {
     const GID = 'ag-speed';
     const speedOf = async (): Promise<string | null> => (await getContainerConfig(GID))!.speed;

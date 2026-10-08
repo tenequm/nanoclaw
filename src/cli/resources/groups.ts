@@ -89,6 +89,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
     timezone: row.timezone,
+    rich_messages: row.rich_messages === 1 ? 'on' : 'off',
     updated_at: row.updated_at,
   };
 }
@@ -404,7 +405,8 @@ registerResource({
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and any of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --auto-compact-window, --cli-scope, ' +
         '--speed must be one of the speed tiers the group\'s provider declares (Claude: "standard", "fast"), or "" to follow the install default; a provider that declares none accepts only "". ' +
-        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
+        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart), ' +
+        '--rich-messages on|off (lets the agent send a Telegram message as a Rich Message, with real tables and headings; default off. The host honours it at once, the agent learns it after restart).',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -424,6 +426,7 @@ registerResource({
             | 'auto_compact_window'
             | 'cli_scope'
             | 'timezone'
+            | 'rich_messages'
           >
         > = {};
         if (args.provider !== undefined) updates.provider = args.provider as string;
@@ -457,10 +460,15 @@ registerResource({
           }
           updates.cli_scope = scope;
         }
+        if (args['rich-messages'] !== undefined || args.rich_messages !== undefined) {
+          const rich = String(args['rich-messages'] ?? args.rich_messages);
+          if (rich !== 'on' && rich !== 'off') throw new Error('--rich-messages must be "on" or "off"');
+          updates.rich_messages = rich === 'on' ? 1 : 0;
+        }
 
         if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --auto-compact-window, --cli-scope, --timezone',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --auto-compact-window, --cli-scope, --timezone, --rich-messages',
           );
         }
 
