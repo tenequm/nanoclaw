@@ -218,12 +218,12 @@ function rawReplyContext(msg: Message): ReplyContext | null {
  * a rich message is named, not downloaded.
  */
 export function richMessageToMarkdown(rich: RichMessage): string {
-  return renderRichBlocks(rich.blocks, '').trim();
+  return renderRichBlocks(rich.blocks).trim();
 }
 
-function renderRichBlocks(blocks: readonly RichBlock[], indent: string, separator = '\n\n'): string {
+function renderRichBlocks(blocks: readonly RichBlock[], separator = '\n\n'): string {
   return blocks
-    .map((block) => renderRichBlock(block, indent))
+    .map(renderRichBlock)
     .filter((part) => part.length > 0)
     .join(separator);
 }
@@ -235,13 +235,17 @@ function prefixLines(text: string, prefix: string): string {
     .join('\n');
 }
 
+function quoteWithCredit(body: string, credit: RichText | undefined): string {
+  return prefixLines(credit !== undefined ? `${body}\n- ${renderRichText(credit)}` : body, '> ');
+}
+
 function richCaption(caption: { text: RichText; credit?: RichText } | undefined): string {
   if (!caption) return '';
   const credit = caption.credit !== undefined ? ` (${renderRichText(caption.credit)})` : '';
   return `${renderRichText(caption.text)}${credit}`;
 }
 
-function renderRichBlock(block: RichBlock, indent: string): string {
+function renderRichBlock(block: RichBlock): string {
   switch (block.type) {
     case 'paragraph':
     case 'footer':
@@ -263,32 +267,20 @@ function renderRichBlock(block: RichBlock, indent: string): string {
           const box = item.has_checkbox ? (item.is_checked ? '[x] ' : '[ ] ') : '';
           const label = item.label.trim();
           const marker = `${/^\w+[.)]$/.test(label) ? label : '-'} ${box}`;
-          const body = renderRichBlocks(item.blocks, '', '\n');
+          const body = renderRichBlocks(item.blocks, '\n');
           const childIndent = ' '.repeat(marker.length);
           const [first = '', ...more] = body.split('\n');
-          return [indent + marker + first, ...more.map((line) => (line ? indent + childIndent + line : line))].join(
-            '\n',
-          );
+          return [marker + first, ...more.map((line) => (line ? childIndent + line : line))].join('\n');
         })
         .join('\n');
     case 'blockquote':
-      return prefixLines(
-        [renderRichBlocks(block.blocks, ''), block.credit !== undefined ? `- ${renderRichText(block.credit)}` : '']
-          .filter(Boolean)
-          .join('\n'),
-        '> ',
-      );
+      return quoteWithCredit(renderRichBlocks(block.blocks), block.credit);
     case 'expandable_blockquote':
     case 'pullquote':
-      return prefixLines(
-        [renderRichText(block.text), block.credit !== undefined ? `- ${renderRichText(block.credit)}` : '']
-          .filter(Boolean)
-          .join('\n'),
-        '> ',
-      );
+      return quoteWithCredit(renderRichText(block.text), block.credit);
     case 'collage':
     case 'slideshow':
-      return [renderRichBlocks(block.blocks, indent), richCaption(block.caption)].filter(Boolean).join('\n');
+      return [renderRichBlocks(block.blocks), richCaption(block.caption)].filter(Boolean).join('\n');
     case 'table': {
       const rows = block.cells.map(
         (row) => `| ${row.map((cell) => (cell.text !== undefined ? renderRichText(cell.text) : '')).join(' | ')} |`,
@@ -300,9 +292,7 @@ function renderRichBlock(block: RichBlock, indent: string): string {
       return block.caption !== undefined ? `${renderRichText(block.caption)}\n${table}` : table;
     }
     case 'details':
-      return [`**${renderRichText(block.summary)}**`, renderRichBlocks(block.blocks, indent)]
-        .filter(Boolean)
-        .join('\n');
+      return [`**${renderRichText(block.summary)}**`, renderRichBlocks(block.blocks)].filter(Boolean).join('\n');
     case 'map':
       return [`[map: ${block.location.latitude}, ${block.location.longitude}]`, richCaption(block.caption)]
         .filter(Boolean)
@@ -326,19 +316,9 @@ function renderRichBlock(block: RichBlock, indent: string): string {
 function renderRichText(text: RichText): string {
   if (typeof text === 'string') return text;
   if (Array.isArray(text)) return text.map(renderRichText).join('');
+  const wrap = ENTITY_WRAP[text.type];
+  if (wrap && 'text' in text) return `${wrap[0]}${renderRichText(text.text)}${wrap[1]}`;
   switch (text.type) {
-    case 'bold':
-      return `**${renderRichText(text.text)}**`;
-    case 'italic':
-      return `_${renderRichText(text.text)}_`;
-    case 'underline':
-      return `__${renderRichText(text.text)}__`;
-    case 'strikethrough':
-      return `~~${renderRichText(text.text)}~~`;
-    case 'spoiler':
-      return `||${renderRichText(text.text)}||`;
-    case 'code':
-      return `\`${renderRichText(text.text)}\``;
     case 'url':
       return `[${renderRichText(text.text)}](${text.url})`;
     case 'text_mention':

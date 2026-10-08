@@ -9,7 +9,7 @@
  * the Telegram dialect deviations from CommonMark hold, and that
  * chunked output preserves entity offsets across slice boundaries.
  */
-import fs from 'fs';
+import { readFileSync } from 'fs';
 import path from 'path';
 
 import { describe, expect, it } from 'vitest';
@@ -121,17 +121,17 @@ describe('renderFS', () => {
 
   it('indents nested lists to their parent text column with a per-depth bullet', () => {
     const fs = renderFS('- a\n  - a1\n    - deep\n- b');
-    expect(fs.text).toBe('• a\n  ◦ a1\n    ▪ deep\n• b');
+    expect(fs.text).toBe('\u2022 a\n\u00A0\u00A0\u25E6 a1\n\u00A0\u00A0\u00A0\u00A0\u25AA deep\n\u2022 b');
   });
 
   it('numbers a nested ordered list on its own, indented under its item', () => {
     const fs = renderFS('1. one\n   1. sub\n   2. sub2\n2. two');
-    expect(fs.text).toBe('1. one\n   1. sub\n   2. sub2\n2. two');
+    expect(fs.text).toBe('1. one\n\u00A0\u00A0\u00A01. sub\n\u00A0\u00A0\u00A02. sub2\n2. two');
   });
 
   it('shows the state of task items', () => {
-    expect(renderFS('- [ ] todo\n- [x] done').text).toBe('☐ todo\n☑ done');
-    expect(renderFS('1. [x] shipped').text).toBe('1. ☑ shipped');
+    expect(renderFS('- [ ] todo\n- [x] done').text).toBe('\u2610 todo\n\u2611 done');
+    expect(renderFS('1. [x] shipped').text).toBe('1. \u2611 shipped');
   });
 
   it('keeps a code block inside a list item intact and indents the paragraphs after it', () => {
@@ -139,20 +139,20 @@ describe('renderFS', () => {
     const pre = fs.entities.find((e) => e.type === 'pre') as { offset: number; length: number; language?: string };
     expect(fs.text.slice(pre.offset, pre.offset + pre.length)).toBe('ls -la');
     expect(pre.language).toBe('sh');
-    expect(fs.text).toBe('1. step:\nls -la\n   then more\n   second line\n2. next');
+    expect(fs.text).toBe('1. step:\nls -la\n\u00A0\u00A0\u00A0then more\n\u00A0\u00A0\u00A0second line\n2. next');
   });
 
   it('keeps entities on indented continuation lines', () => {
     const fs = renderFS('- first\n  **bold** second line');
     const bold = fs.entities.find((e) => e.type === 'bold') as { offset: number; length: number };
     expect(fs.text.slice(bold.offset, bold.offset + bold.length)).toBe('bold');
-    expect(fs.text).toBe('• first\n  bold second line');
+    expect(fs.text).toBe('\u2022 first\n\u00A0\u00A0bold second line');
   });
 
   it('renders --- as a plain divider, never em-dashes', () => {
     const fs = renderFS('a\n\n---\n\nb');
-    expect(fs.text).toBe(`a\n\n${'─'.repeat(8)}\n\nb`);
-    expect(fs.text).not.toContain('—');
+    expect(fs.text).toBe(`a\n\n${'\u2500'.repeat(8)}\n\nb`);
+    expect(fs.text).not.toContain('\u2014');
   });
 
   it('emits underline for __X__ (distinct from **bold**)', () => {
@@ -478,7 +478,7 @@ describe('splitForBody', () => {
  * the guide, so the two cannot drift apart.
  */
 describe('telegram-formatting guide renders as it says', () => {
-  const guide = fs.readFileSync(
+  const guide = readFileSync(
     path.join(process.cwd(), 'container', 'skills', 'telegram-formatting', 'instructions.md'),
     'utf-8',
   );

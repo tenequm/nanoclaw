@@ -332,11 +332,11 @@ CREATE TABLE container_configs (
 );
 ```
 
-`rich_messages` lets one agent group send a Telegram message as a Rich Message (`send_message` with `rich: true`: real tables, headings, task lists). Set via `ncl groups config update --id <group> --rich-messages on|off`. The host checks it at delivery (`richAllowed` in `src/delivery.ts`), so it applies at once and a container cannot opt itself in; the agent is offered `rich`, and taught it by a composed "Rich messages" section, after its next spawn.
+`rich_messages` lets one agent group send a Telegram message as a Rich Message (`send_message` with `rich: true`: real tables, headings, task lists). Set via `ncl groups config update --id <group> --rich-messages on|off`. The host checks it at delivery (`richAllowed` in `src/delivery.ts`), so it applies to new messages at once and a container cannot opt itself in (an edit of an earlier Rich Message stays rich); the agent is offered `rich`, and taught it by a composed "Rich messages" section, after its next spawn.
 
 `timezone` overrides the install-global timezone for one agent group: host-side scheduling (cron interpretation, `--process-after`, run-log stamps) resolves it live via `resolveGroupTimezone` (`src/container-config.ts`); the container gets it as its `TZ` env on next respawn. Set via `ncl groups config update --timezone <IANA>` (`""` clears back to NULL) or `ncl groups create --timezone`.
 
-- **Readers:** `src/container-config.ts`, `src/container-runner.ts`, `src/cli/dispatch.ts` (scope enforcement), `src/project-doc-compose.ts`
+- **Readers:** `src/container-config.ts`, `src/container-runner.ts`, `src/cli/dispatch.ts` (scope enforcement), `src/project-doc-compose.ts`, `src/delivery.ts` (`rich_messages`), `src/channels/telegram-grammy/agent-docs.ts` (`rich_messages`)
 - **Writers:** `src/db/container-configs.ts`, `src/modules/self-mod/apply.ts`, `src/backfill-container-configs.ts`
 
 ### 1.16 `pending_sender_approvals`

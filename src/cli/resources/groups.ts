@@ -406,7 +406,7 @@ registerResource({
         'Use --id <group-id> and any of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --auto-compact-window, --cli-scope, ' +
         '--speed must be one of the speed tiers the group\'s provider declares (Claude: "standard", "fast"), or "" to follow the install default; a provider that declares none accepts only "". ' +
         '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart), ' +
-        '--rich-messages on|off (lets the agent send a Telegram message as a Rich Message, with real tables and headings; default off. The host honours it at once, the agent learns it after restart).',
+        '--rich-messages on|off (lets the agent send a Telegram message as a Rich Message, with real tables and headings; default off. The host applies it to new messages at once, the agent learns it after restart).',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -461,9 +461,11 @@ registerResource({
           updates.cli_scope = scope;
         }
         if (args['rich-messages'] !== undefined || args.rich_messages !== undefined) {
+          // on|off as documented, plus the true|false|1|0 every other boolean flag takes (a bare flag is true).
           const rich = String(args['rich-messages'] ?? args.rich_messages);
-          if (rich !== 'on' && rich !== 'off') throw new Error('--rich-messages must be "on" or "off"');
-          updates.rich_messages = rich === 'on' ? 1 : 0;
+          if (['on', 'true', '1'].includes(rich)) updates.rich_messages = 1;
+          else if (['off', 'false', '0'].includes(rich)) updates.rich_messages = 0;
+          else throw new Error('--rich-messages must be on or off');
         }
 
         if (Object.keys(updates).length === 0) {

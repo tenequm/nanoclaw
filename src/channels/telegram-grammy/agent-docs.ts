@@ -21,7 +21,7 @@ export const RICH_MESSAGES_BODY = [
 ].join('\n\n');
 
 /** Rich Messages are taught only where they work: a Telegram-wired agent whose group has them on. */
-export async function richMessagesSection(group: AgentGroup): Promise<{ name: string; body: string } | null> {
+async function richMessagesSection(group: AgentGroup): Promise<{ name: string; body: string } | null> {
   if ((await getContainerConfig(group.id))?.rich_messages !== 1) return null;
   if (!(await isAgentWiredToChannel(group.id, CHANNEL_TYPE))) return null;
   return { name: RICH_MESSAGES_SECTION, body: RICH_MESSAGES_BODY };

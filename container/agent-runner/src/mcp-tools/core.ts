@@ -14,7 +14,7 @@ import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo, getCurrentReplyRoute } from '../db/session-state.js';
 import { resolveDestinationThread } from '../db/session-routing.js';
-import { registerTools } from './server.js';
+import { extendTool, registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 // Read per call so bun tests can point the outbox at a temp dir; the container always uses the default.
@@ -132,7 +132,7 @@ export const sendMessage: McpToolDefinition = {
       inReplyTo = target.messageId;
     }
     const explicit = args.reply_to != null || quote !== undefined;
-    const rich = args.rich === true && RICH_PROPERTY in (sendMessage.tool.inputSchema.properties ?? {});
+    const rich = args.rich === true && richOffered;
 
     const id = generateId();
     const seq = await writeMessageOut({
@@ -154,7 +154,7 @@ export const sendMessage: McpToolDefinition = {
   },
 };
 
-const RICH_PROPERTY = 'rich';
+let richOffered = false;
 
 /**
  * Offer `send_message`'s `rich` flag, for a group the host lets send Telegram
@@ -162,16 +162,18 @@ const RICH_PROPERTY = 'rich';
  * only decides what the agent is shown.
  */
 export function offerRichMessages(): void {
-  const properties = (sendMessage.tool.inputSchema.properties ??= {}) as Record<string, unknown>;
-  properties[RICH_PROPERTY] = {
-    type: 'boolean',
-    description:
-      'Telegram only: send as a Rich Message, with real tables, headings, task lists and collapsible <details> blocks (up to 32768 chars). Single line breaks collapse there, so separate lines with a blank line. Leave it off for normal chat; other channels ignore it.',
-  };
+  if (richOffered) return;
+  richOffered = true;
+  extendTool('send_message', {
+    properties: {
+      rich: {
+        type: 'boolean',
+        description:
+          'Telegram only: send as a Rich Message, with real tables, headings, task lists and collapsible <details> blocks (up to 32768 chars). Single line breaks collapse there, so separate lines with a blank line. Leave it off for normal chat; other channels ignore it.',
+      },
+    },
+  });
 }
-
-// The MCP server runs in its own process; it reads the same container.json the runner does.
-if (loadConfig().richMessages) offerRichMessages();
 
 export const sendFile: McpToolDefinition = {
   tool: {
@@ -403,3 +405,6 @@ export const addReaction: McpToolDefinition = {
 };
 
 registerTools([sendMessage, sendFile, sendMediaGroup, editMessage, addReaction]);
+
+// The MCP server runs in its own process; it reads the same container.json the runner does.
+if (loadConfig().richMessages) offerRichMessages();

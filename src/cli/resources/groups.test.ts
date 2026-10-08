@@ -366,11 +366,23 @@ describe('groups config (host-only)', () => {
       expect((await getContainerConfig(GID))!.rich_messages).toBe(0);
     });
 
-    it('rejects anything but on or off and writes nothing', async () => {
-      for (const value of ['yes', '1', true]) {
+    it('also takes the true|false|1|0 of other boolean flags, and a bare flag as on', async () => {
+      for (const [value, stored] of [
+        [true, 1],
+        ['0', 0],
+        ['true', 1],
+        ['false', 0],
+      ] as const) {
+        expect((await setRich(value)).ok).toBe(true);
+        expect((await getContainerConfig(GID))!.rich_messages).toBe(stored);
+      }
+    });
+
+    it('rejects anything else and writes nothing', async () => {
+      for (const value of ['yes', '2', '']) {
         const rejected = await setRich(value);
         expect(rejected.ok).toBe(false);
-        expect(errorMessage(rejected)).toBe('--rich-messages must be "on" or "off"');
+        expect(errorMessage(rejected)).toBe('--rich-messages must be on or off');
       }
       expect((await getContainerConfig(GID))!.rich_messages).toBe(0);
     });
