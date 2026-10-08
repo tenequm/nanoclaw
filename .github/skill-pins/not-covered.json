@@ -84,6 +84,18 @@
       "kind": "version",
       "source": ".claude/skills/add-onecli/versions.json",
       "why": "read by the skill's own scripts; Dependabot does not read versions.json"
+    },
+    {
+      "pin": "POND_VERSION=0.16.3",
+      "kind": "binary (Dockerfile ARG)",
+      "source": ".claude/skills/add-pond/SKILL.md",
+      "why": "a download pinned by version; no Dependabot ecosystem reads it"
+    },
+    {
+      "pin": "package.json",
+      "kind": "npm manifest",
+      "source": ".claude/skills/add-voice-mode/ui/package.json",
+      "why": "Dependabot's npm ecosystem could read this directory itself; not configured"
     }
   ]
 }

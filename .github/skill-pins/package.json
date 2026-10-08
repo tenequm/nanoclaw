@@ -21,6 +21,10 @@
     "@getdial/cli": "0.37.0",
     "@grpc/grpc-js": "1.14.5",
     "@grpc/proto-loader": "0.8.1",
+    "@livekit/agents": "1.9.1",
+    "@livekit/agents-plugin-google": "1.9.1",
+    "@livekit/agents-plugin-silero": "1.9.1",
+    "@livekit/rtc-node": "1.1.0",
     "@microsoft/teams.cli": "3.0.2",
     "@onecli-sh/sdk": "2.2.1",
     "@openai/codex": "0.155.1",
@@ -29,16 +33,19 @@
     "@types/qrcode": "1.5.6",
     "@types/ws": "8.18.1",
     "@whiskeysockets/baileys": "7.0.0-rc14",
-    "agent-browser": "0.27.1",
+    "agent-browser": "0.38.2",
     "chat-adapter-imessage": "0.1.1",
+    "livekit-server-sdk": "2.19.1",
     "mcp-remote": "0.1.38",
+    "onnxruntime-node": "1.24.3",
     "opencode-ai": "1.18.25",
     "pino": "9.6.0",
     "qrcode": "1.5.4",
     "spectrum-ts": "11.0.0",
     "vercel": "52.2.1",
     "wechat-ilink-client": "0.1.0",
-    "ws": "8.21.3"
+    "ws": "8.21.3",
+    "zod": "4.6.5"
   },
   "skillPins": {
     "@anthropic-ai/claude-code": {
@@ -138,6 +145,30 @@
         ".claude/skills/add-iron-proxy/SKILL.md nc:dep manager:pnpm"
       ]
     },
+    "@livekit/agents": {
+      "version": "1.9.1",
+      "sources": [
+        ".claude/skills/add-voice-mode/SKILL.md nc:dep"
+      ]
+    },
+    "@livekit/agents-plugin-google": {
+      "version": "1.9.1",
+      "sources": [
+        ".claude/skills/add-voice-mode/SKILL.md nc:dep"
+      ]
+    },
+    "@livekit/agents-plugin-silero": {
+      "version": "1.9.1",
+      "sources": [
+        ".claude/skills/add-voice-mode/SKILL.md nc:dep"
+      ]
+    },
+    "@livekit/rtc-node": {
+      "version": "1.1.0",
+      "sources": [
+        ".claude/skills/add-voice-mode/SKILL.md nc:dep"
+      ]
+    },
     "@microsoft/teams.cli": {
       "version": "3.0.2",
       "sources": [
@@ -188,7 +219,7 @@
       ]
     },
     "agent-browser": {
-      "version": "0.27.1",
+      "version": "0.38.2",
       "sources": [
         "container/cli-tools.json"
       ]
@@ -199,10 +230,22 @@
         ".claude/skills/add-imessage/SKILL.md nc:dep when:backend=local"
       ]
     },
+    "livekit-server-sdk": {
+      "version": "2.19.1",
+      "sources": [
+        ".claude/skills/add-voice-mode/SKILL.md nc:dep"
+      ]
+    },
     "mcp-remote": {
       "version": "0.1.38",
       "sources": [
         ".claude/skills/add-tavily-tool/SKILL.md json block"
+      ]
+    },
+    "onnxruntime-node": {
+      "version": "1.24.3",
+      "sources": [
+        ".claude/skills/add-voice-mode/SKILL.md nc:dep"
       ]
     },
     "opencode-ai": {
@@ -247,6 +290,12 @@
       "version": "8.21.3",
       "sources": [
         ".claude/skills/add-mattermost/SKILL.md nc:dep"
+      ]
+    },
+    "zod": {
+      "version": "4.6.5",
+      "sources": [
+        ".claude/skills/add-voice-mode/SKILL.md nc:dep"
       ]
     }
   }
