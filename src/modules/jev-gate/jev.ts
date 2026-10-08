@@ -17,11 +17,11 @@ import type { JevThresholds } from './config.js';
 export { JEV_URL, JEV_MODEL };
 export const JEV_TIMEOUT_MS = 2000;
 
-export type JevQuestionId = 'direct_invitation' | 'unresolved' | 'already_answered' | 'human_pingpong';
+const JEV_QUESTION_IDS = ['direct_invitation', 'unresolved', 'already_answered', 'human_pingpong'] as const;
+
+export type JevQuestionId = (typeof JEV_QUESTION_IDS)[number];
 
 export type JevScores = Record<JevQuestionId, number>;
-
-const JEV_QUESTION_IDS: JevQuestionId[] = ['direct_invitation', 'unresolved', 'already_answered', 'human_pingpong'];
 
 export type JevResult = { ok: true; scores: JevScores } | { ok: false; reason: string };
 
@@ -29,7 +29,7 @@ export type JevResult = { ok: true; scores: JevScores } | { ok: false; reason: s
  * The rubric. Wording lives in code and thresholds in config, so a
  * recalibration from logged annotations is a config edit; a change of what we
  * ask is a code change with a commit behind it. The agent's display name is
- * the only thing templated in — the gate carries no per-chat context.
+ * the only thing templated in - the gate carries no per-chat context.
  */
 export function jevQuestions(agentName: string): Record<JevQuestionId, string> {
   return {

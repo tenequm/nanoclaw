@@ -28,6 +28,8 @@
  *   copy handed back to the caller. Other wirings keep seeing the original.
  */
 import { TIMEZONE } from '../../config.js';
+import { getAgentGroup } from '../../db/agent-groups.js';
+import { getContainerConfig } from '../../db/container-configs.js';
 import { findSessionForAgent } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { gateEntryFor, type JevGateEntry } from './config.js';
@@ -42,7 +44,7 @@ import {
 } from './history.js';
 import { askJev, decide } from './jev.js';
 import type { InboundEvent } from '../../channels/adapter.js';
-import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
+import type { MessagingGroup, MessagingGroupAgent, UserRoleKind } from '../../types.js';
 
 export {
   DEFAULT_ENTRY,
@@ -71,8 +73,8 @@ export interface JevGateInput {
   event: InboundEvent;
   /** The wiring's effective thread id, for session resolution. */
   threadId: string | null;
-  /** The agent group's display name, templated into the state and the rubric. */
-  agentName: string;
+  /** The sender's role the host resolved; the content's own `senderRole` is not trusted. */
+  senderRole: UserRoleKind | undefined;
 }
 
 /**
@@ -156,12 +158,12 @@ function errorOutcome(entry: JevGateEntry, event: InboundEvent, reason: string):
  * Never throws.
  */
 export async function runJevGate(input: JevGateInput): Promise<JevGateOutcome | null> {
-  const { agent, mg, event, threadId, agentName } = input;
+  const { agent, mg, event, threadId, senderRole } = input;
   const entry = gateEntryFor(agent.agent_group_id);
   if (!entry) return null;
 
   try {
-    return await judge(entry, agent, mg, event, threadId, agentName);
+    return await judge(entry, agent, mg, event, threadId, senderRole);
   } catch (err) {
     // Any unexpected throw is a silent verdict, not a wake.
     log.warn('Jev gate threw — falling back to silent', { agentGroupId: agent.agent_group_id, err });
@@ -175,11 +177,11 @@ async function judge(
   mg: MessagingGroup,
   event: InboundEvent,
   threadId: string | null,
-  agentName: string,
+  senderRole: UserRoleKind | undefined,
 ): Promise<JevGateOutcome> {
   const session = await findSessionForAgent(agent.agent_group_id, mg.id, threadId);
   const rows = session ? await readGateHistory(agent.agent_group_id, session.id) : [];
-  const message = parseAuthor(event.message.content);
+  const message = { ...parseAuthor(event.message.content), role: senderRole ?? null };
   const now = new Date();
 
   // Free levers first — no reason to pay for a judgment we would override.
@@ -203,6 +205,7 @@ async function judge(
     }
   }
 
+  const agentName = await agentNameFor(agent.agent_group_id);
   const state = renderState(
     rows,
     { timestamp: event.message.timestamp, direction: 'in', kind: event.message.kind, ...message },
@@ -227,4 +230,10 @@ async function judge(
   });
 
   return outcome(entry, event, decision.wake, detail);
+}
+
+/** The name the agent goes by in chat, as its container is configured with it. */
+async function agentNameFor(agentGroupId: string): Promise<string> {
+  const assistantName = (await getContainerConfig(agentGroupId))?.assistant_name;
+  return assistantName ?? (await getAgentGroup(agentGroupId))?.name ?? agentGroupId;
 }

@@ -22,7 +22,6 @@ import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/chan
 import { applyNormalizedText, classifyHostCommand, gateCommand } from './command-gate.js';
 import { runHostCommand } from './commands/fallback.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { getDb } from './db/connection.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
   createMessagingGroupIfAbsent,
@@ -31,6 +30,7 @@ import {
 } from './db/messaging-groups.js';
 import { findSessionForAgent } from './db/sessions.js';
 import { backfillSession, fanInboundMessage } from './modules/cross-session-context/index.js';
+import { getRoleOverAgentGroup } from './modules/permissions/db/user-roles.js';
 import { runJevGate } from './modules/jev-gate/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -38,7 +38,7 @@ import { agentScopedMessageId } from './platform-id.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
-import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
+import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session, UserRoleKind } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
 function generateId(): string {
@@ -204,31 +204,25 @@ function dispatchSessionCreated(event: SessionCreatedEvent): void {
   }
 }
 
-/**
- * The sender's nanoclaw role over this agent group. Owner wins over admin; a
- * role scoped to another agent group does not count here.
- */
-export async function senderRoleFor(
+function isChatKind(kind: string): boolean {
+  return kind === 'chat' || kind === 'chat-sdk';
+}
+
+/** The sender's nanoclaw role over this agent group, for a chat message; none for anything else. */
+export async function resolveSenderRole(
+  event: InboundEvent,
   userId: string | null,
   agentGroupId: string,
-): Promise<'owner' | 'admin' | undefined> {
-  if (!userId) return undefined;
-  const rows = await getDb().all<{ role: string }>(
-    'SELECT role FROM user_roles WHERE user_id = ? AND (agent_group_id IS NULL OR agent_group_id = ?)',
-    userId,
-    agentGroupId,
-  );
-  if (rows.some((r) => r.role === 'owner')) return 'owner';
-  if (rows.some((r) => r.role === 'admin')) return 'admin';
-  return undefined;
+): Promise<UserRoleKind | undefined> {
+  return userId && isChatKind(event.message.kind) ? getRoleOverAgentGroup(userId, agentGroupId) : undefined;
 }
 
 /**
- * Stamp `senderRole` into inbound content for the agent's envelope — the
+ * Stamp `senderRole` into inbound content for the agent's envelope - the
  * container cannot read user_roles. Any `senderRole` the adapter passed
  * through is dropped, so only the host can claim one.
  */
-export function stampSenderRole(content: string, role: 'owner' | 'admin' | undefined): string {
+export function stampSenderRole(content: string, role: UserRoleKind | undefined): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
@@ -480,10 +474,11 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     // never judged, annotated, or accumulated — see that branch's comment.
     let engages = ruleEngages;
     let deliveryEvent = event;
+    const senderRole = await resolveSenderRole(event, userId, agent.agent_group_id);
     // is_group follows the file-wide convention: 0 means DM, anything else
     // (1 or a legacy NULL row) is a group — `=== 1` skipped real groups.
     if (ruleEngages && accessOk && scopeOk && !isMention && mg.is_group !== 0) {
-      const gated = await runJevGate({ agent, mg, event, threadId: effectiveThreadId, agentName: agentGroup.name });
+      const gated = await runJevGate({ agent, mg, event, threadId: effectiveThreadId, senderRole });
       if (gated) {
         deliveryEvent = gated.event;
         if (gated.silence) engages = false;
@@ -491,7 +486,17 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     }
 
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, deliveryEvent, userId, threadsEnabled, effectiveThreadId, true);
+      await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        deliveryEvent,
+        userId,
+        threadsEnabled,
+        effectiveThreadId,
+        true,
+        senderRole,
+      );
       engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
@@ -523,7 +528,17 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       // message (which also stages their attachments to disk via
       // writeSessionMessage → extractAttachmentFiles) is exactly what the
       // gate is meant to prevent.
-      await deliverToAgent(agent, agentGroup, mg, deliveryEvent, userId, threadsEnabled, effectiveThreadId, false);
+      await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        deliveryEvent,
+        userId,
+        threadsEnabled,
+        effectiveThreadId,
+        false,
+        senderRole,
+      );
       accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {
@@ -618,7 +633,9 @@ export async function deliverToAgent(
   threadsEnabled: boolean,
   effectiveThreadId: string | null,
   wake: boolean,
+  senderRole: UserRoleKind | undefined,
 ): Promise<void> {
+  const isChat = isChatKind(event.message.kind);
   // Apply the resolved thread policy (wiring override AND channel declaration
   // AND adapter capability — resolveThreadPolicy at fanout): thread-enabled
   // wiring in a group chat → per-thread session regardless of wiring
@@ -658,7 +675,7 @@ export async function deliverToAgent(
   // commands — applied after materialization below, which owns (and may
   // replace) the content string.
   let normalizedText: string | undefined;
-  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+  if (isChat) {
     const gate = await gateCommand(event.message.content, userId, agent.agent_group_id, event.channelType);
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
@@ -706,10 +723,7 @@ export async function deliverToAgent(
   }
   const rawContent =
     normalizedText !== undefined ? applyNormalizedText(event.message.content, normalizedText) : event.message.content;
-  const content =
-    event.message.kind === 'chat' || event.message.kind === 'chat-sdk'
-      ? stampSenderRole(rawContent, await senderRoleFor(userId, agent.agent_group_id))
-      : rawContent;
+  const content = isChat ? stampSenderRole(rawContent, senderRole) : rawContent;
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: messageId,
     kind: event.message.kind,

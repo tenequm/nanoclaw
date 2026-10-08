@@ -13,8 +13,15 @@
  * Read-only from the host side (the existing open-read-close mailbox
  * helper), so it is safe with a live container.
  */
+import {
+  ALBUM_PREFIX,
+  EDIT_LINK_SENDER,
+  EDITED_PREFIX,
+  REACTION_LINK_SENDER,
+} from '../../channels/telegram-grammy/inbound.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { log } from '../../log.js';
+import type { UserRoleKind } from '../../types.js';
 
 /** Human-readable prefix of a granted-wake annotation. Display only — never derivation. */
 export const WAKE_MARKER = '[jev: reply';
@@ -25,7 +32,11 @@ export const GATE_HISTORY_LIMIT = 200;
 /** Escalation ladder: a window is wide enough once it reaches back past 24h. */
 const HISTORY_LIMITS = [GATE_HISTORY_LIMIT, 1000, 4000];
 
-/** Rows rendered into the state we send Jev, counted after albums and edits collapse. */
+/**
+ * Rows rendered into the state we send Jev, counted after albums and edits
+ * collapse. Lines are not length-capped: Telegram bounds a message at 4096
+ * chars, so these plus the new message stay well inside Jev's 32k-token state budget.
+ */
 export const STATE_HISTORY_LINES = 15;
 
 /** A pause between rendered rows longer than this gets a gap marker. */
@@ -52,8 +63,8 @@ export interface GateHistoryRow {
   isBot: boolean;
   /** Host-written verdict metadata, null for rows the gate never judged. */
   jev: JevMeta | null;
-  /** The sender's nanoclaw role (`owner`, `admin`), host-stamped; null when none. */
-  role: string | null;
+  /** The sender's nanoclaw role, host-stamped; null when none. */
+  role: UserRoleKind | null;
   /** The message this one replies to, when the platform says so. */
   replyTo: { sender: string; text: string } | null;
   hasMedia: boolean;
@@ -65,6 +76,16 @@ function isChatRow(row: GateHistoryRow): boolean {
 }
 
 type ParsedContent = Pick<GateHistoryRow, 'text' | 'sender' | 'isBot' | 'jev' | 'role' | 'replyTo' | 'hasMedia'>;
+
+const EMPTY_PARSED: ParsedContent = {
+  text: '',
+  sender: '',
+  isBot: false,
+  jev: null,
+  role: null,
+  replyTo: null,
+  hasMedia: false,
+};
 
 function parseJevMeta(value: unknown): JevMeta | null {
   if (!value || typeof value !== 'object') return null;
@@ -86,7 +107,7 @@ export function parseAuthor(raw: string): ParsedContent {
   try {
     parsed = JSON.parse(raw) as Record<string, unknown>;
   } catch {
-    return { text: raw, sender: '', isBot: false, jev: null, role: null, replyTo: null, hasMedia: false };
+    return { ...EMPTY_PARSED, text: raw };
   }
   const author = (parsed.author ?? {}) as Record<string, unknown>;
   const text = typeof parsed.text === 'string' ? parsed.text : '';
@@ -98,9 +119,9 @@ export function parseAuthor(raw: string): ParsedContent {
   const userName = typeof author.userName === 'string' ? author.userName : '';
   const isBot = author.isBot === true || (author.isBot === undefined && userName.toLowerCase().endsWith('bot'));
   const reply = (parsed.replyTo ?? null) as Record<string, unknown> | null;
-  // An edit with no reply of its own is linked to its original as sender 'original' — not a reply.
+  const isLink = reply?.sender === EDIT_LINK_SENDER || reply?.sender === REACTION_LINK_SENDER;
   const replyTo =
-    reply && typeof reply.sender === 'string' && reply.sender && reply.sender !== 'original'
+    reply && typeof reply.sender === 'string' && reply.sender && !isLink
       ? { sender: reply.sender, text: typeof reply.text === 'string' ? reply.text : '' }
       : null;
   return {
@@ -108,7 +129,7 @@ export function parseAuthor(raw: string): ParsedContent {
     sender,
     isBot,
     jev: parseJevMeta(parsed.jev),
-    role: typeof parsed.senderRole === 'string' && parsed.senderRole ? parsed.senderRole : null,
+    role: parsed.senderRole === 'owner' || parsed.senderRole === 'admin' ? parsed.senderRole : null,
     replyTo,
     hasMedia: Array.isArray(parsed.attachments) && parsed.attachments.length > 0,
   };
@@ -167,15 +188,12 @@ export async function readGateHistory(agentGroupId: string, sessionId: string): 
     for (const r of raw.outbound) {
       const { text, hasMedia } = parseAuthor(r.content);
       rows.push({
+        ...EMPTY_PARSED,
         timestamp: r.timestamp,
         direction: 'out',
         kind: r.kind,
         text,
-        sender: '',
         isBot: true,
-        jev: null,
-        role: null,
-        replyTo: null,
         hasMedia,
       });
     }
@@ -251,8 +269,9 @@ interface StateRow {
 }
 
 const ANNOTATION_LINE = /\n?^\[jev: [^\n]*\]$/gm;
-const EDITED_PREFIX = /^\[EDITED\]\s*/;
-const ALBUM_TAG = /^((?:\[[^\]\n]*\] )*)\[album (\S+)\]\s*/;
+const literal = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const EDITED_TAG = new RegExp(`^${literal(EDITED_PREFIX)}\\s*`);
+const ALBUM_TAG = new RegExp(`^((?:\\[[^\\]\\n]*\\] )*)${literal(ALBUM_PREFIX)} (\\S+)\\]\\s*`);
 
 /**
  * The rows as a reader of the chat saw them. The gate's own `[jev: …]` lines
@@ -266,9 +285,9 @@ function collapse(rows: GateHistoryRow[]): StateRow[] {
   for (const row of rows) {
     if (!isChatRow(row)) continue;
     let body = row.text.replace(ANNOTATION_LINE, '');
-    const edited = EDITED_PREFIX.test(body);
+    const edited = EDITED_TAG.test(body);
     if (edited) {
-      body = body.replace(EDITED_PREFIX, '');
+      body = body.replace(EDITED_TAG, '');
       for (let i = out.length - 1; i >= 0; i--) {
         const prior = out[i].row;
         if (prior.direction === row.direction && prior.sender === row.sender && prior.timestamp === row.timestamp) {
@@ -328,20 +347,17 @@ function renderRow(s: StateRow, agentName: string): string {
 }
 
 /**
- * The state we send Jev: the last `lines` collapsed rows with gap markers,
- * then the new message. The new message collapses with the history, so an
- * edit retires its original and a late album item joins its album.
+ * The state we send Jev: the last `STATE_HISTORY_LINES` collapsed rows with
+ * gap markers, then the new message. The new message collapses with the
+ * history, so an edit retires its original and a late album item joins its
+ * album. Only the latest GATE_HISTORY_LIMIT rows are collapsed; the levers
+ * read the whole window.
  */
-export function renderState(
-  rows: GateHistoryRow[],
-  message: GateHistoryRow,
-  agentName: string,
-  lines = STATE_HISTORY_LINES,
-): string {
-  const all = collapse([...rows, message]);
+export function renderState(rows: GateHistoryRow[], message: GateHistoryRow, agentName: string): string {
+  const all = collapse([...rows.slice(-GATE_HISTORY_LIMIT), message]);
   const last = all.at(-1);
   const next = last && last.row === message ? all.pop()! : { row: message, body: '', edited: false, album: null };
-  const history = all.slice(-lines);
+  const history = all.slice(-STATE_HISTORY_LINES);
 
   const out = ['Conversation so far (oldest first):'];
   history.forEach((s, i) => {
@@ -357,8 +373,6 @@ export function renderState(
   return out.join('\n');
 }
 
-// No length cap: Telegram bounds a message at 4096 chars, so 15 history lines
-// plus the new message stay well inside Jev's 32k-token state budget.
-export function oneLine(text: string): string {
+function oneLine(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }

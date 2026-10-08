@@ -44,7 +44,9 @@ import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } 
 import { wakeContainer } from './container-runner.js';
 import { resetGateConfigCache } from './modules/jev-gate/index.js';
 import { withExistingMailboxSession } from './session-manager.js';
-import { routeInbound } from './router.js';
+import { grantRole } from './modules/permissions/db/user-roles.js';
+import { createUser } from './modules/permissions/db/users.js';
+import { routeInbound, setSenderResolver } from './router.js';
 import type { ChannelAdapter, ChannelDefaults } from './channels/adapter.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-router-jev';
@@ -351,4 +353,26 @@ describe('routeInbound with the Jev wake-gate', () => {
       expect(download).toHaveBeenCalledTimes(1);
     });
   }
+
+  // Last: the sender resolver is module state the other tests run without.
+  it('judges the new message with the sender role the host stamps', async () => {
+    writeGateConfig({ enabled: true, mode: 'live', daily_cap: 0, cooldown_minutes: 0, max_consecutive_bot: 0 });
+    stubJev(0.95);
+    await activate();
+    await seed();
+    await createUser({ id: 'testchat:U1', kind: 'testchat', display_name: 'Alex', created_at: now() });
+    await grantRole({
+      user_id: 'testchat:U1',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
+    setSenderResolver(() => 'testchat:U1');
+
+    await inbound('m1', 'can someone check the deploy?');
+
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as { body: string }).body) as { state: string };
+    expect(body.state).toContain('NEW MESSAGE:\nAlex [owner]: can someone check the deploy?');
+  });
 });
