@@ -55,7 +55,12 @@ vi.mock('./delivery.js', () => ({
   stopDeliveryPolls: vi.fn(),
 }));
 vi.mock('./host-sweep.js', () => ({ startHostSweep: vi.fn(), stopHostSweep: vi.fn() }));
-vi.mock('./host-lifecycle.js', () => ({ startHostModules: vi.fn(), stopHostModules: vi.fn() }));
+vi.mock('./host-lifecycle.js', () => ({
+  startHostModules: vi.fn(),
+  stopHostModules: vi.fn(),
+  onHostStart: vi.fn(),
+  onHostShutdown: vi.fn(),
+}));
 vi.mock('./router.js', () => ({ routeInbound: state.routeInbound }));
 vi.mock('./response-registry.js', () => ({ getResponseHandlers: () => [state.respond] }));
 vi.mock('./channels/index.js', () => ({}));
