@@ -285,3 +285,48 @@ describe('send_media_group MCP tool', () => {
     });
   });
 });
+
+describe('send_message — reply_to and quote', () => {
+  beforeEach(() => {
+    seedChannelDestination('dm', 'telegram', 'telegram:42');
+    seedChannelDestination('other', 'telegram', 'telegram:99');
+    seedInbound('42:7:ag-1', 'telegram', 'telegram:42', null);
+    seedInbound('42:8:ag-1', 'telegram', 'telegram:42', null);
+    publishReplyRoute({ inReplyTo: '42:8:ag-1', channelType: 'telegram', platformId: 'telegram:42' });
+  });
+
+  function lastOut() {
+    const out = getUndeliveredMessages();
+    const row = out[out.length - 1];
+    return { inReplyTo: row.in_reply_to, content: JSON.parse(row.content) };
+  }
+
+  it('keeps the default reply target and leaves threading to the host', async () => {
+    await sendMessage.handler({ to: 'dm', text: 'hi' });
+    expect(lastOut()).toEqual({ inReplyTo: '42:8:ag-1', content: { text: 'hi' } });
+  });
+
+  it('resolves reply_to by the seq shown in the envelope and marks it explicit', async () => {
+    await sendMessage.handler({ to: 'dm', text: 'that one', reply_to: 2, quote: 'hi' });
+    expect(lastOut()).toEqual({ inReplyTo: '42:7:ag-1', content: { text: 'that one', threadReply: { quote: 'hi' } } });
+  });
+
+  it('marks a quote without reply_to explicit on the default target', async () => {
+    await sendMessage.handler({ to: 'dm', text: 'x', quote: 'hi' });
+    expect(lastOut()).toEqual({ inReplyTo: '42:8:ag-1', content: { text: 'x', threadReply: { quote: 'hi' } } });
+  });
+
+  it('rejects an unknown id, a message from another chat and an oversized quote', async () => {
+    expect(((await sendMessage.handler({ to: 'dm', text: 'x', reply_to: 999 })) as { isError?: boolean }).isError).toBe(
+      true,
+    );
+    expect(
+      ((await sendMessage.handler({ to: 'other', text: 'x', reply_to: 2 })) as { isError?: boolean }).isError,
+    ).toBe(true);
+    const long = 'a'.repeat(1025);
+    expect(((await sendMessage.handler({ to: 'dm', text: 'x', quote: long })) as { isError?: boolean }).isError).toBe(
+      true,
+    );
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+});

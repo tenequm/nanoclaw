@@ -66,10 +66,13 @@ function resolveRouting(
   return { channel_type: 'agent', platform_id: dest.agentGroupId!, thread_id: null, resolvedName: to };
 }
 
+const MAX_QUOTE_LENGTH = 1024;
+
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
-    description: 'Send a message to a named destination.',
+    description:
+      'Send a message to a named destination. By default it answers the message you are replying to, shown as a reply only when newer messages came in after it. Pass reply_to to answer a specific earlier message, and quote to highlight the exact part you answer.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -78,6 +81,15 @@ export const sendMessage: McpToolDefinition = {
           description: 'Destination name (e.g., "family", "worker-1").',
         },
         text: { type: 'string', description: 'Message content' },
+        reply_to: {
+          type: 'integer',
+          description: 'Message ID to reply to (the numeric id shown in messages); always shown as a reply.',
+        },
+        quote: {
+          type: 'string',
+          description:
+            'Part of the replied message to highlight, copied verbatim from its text (max 1024 chars). Dropped if it does not match.',
+        },
       },
       required: ['to', 'text'],
     },
@@ -91,15 +103,32 @@ export const sendMessage: McpToolDefinition = {
     const routing = resolveRouting(to);
     if ('error' in routing) return err(routing.error);
 
+    // An explicit reply_to or quote always shows as a reply; the host decides
+    // for the default one (see resolveThreadReply in src/delivery.ts).
+    let inReplyTo = getCurrentInReplyTo();
+    const quote = typeof args.quote === 'string' && args.quote ? args.quote : undefined;
+    if (quote && quote.length > MAX_QUOTE_LENGTH) return err(`quote is longer than ${MAX_QUOTE_LENGTH} characters`);
+    if (args.reply_to != null) {
+      const replySeq = Number(args.reply_to);
+      const target = replySeq ? getMessageIdBySeq(replySeq) : null;
+      if (!target) return err(`Message #${args.reply_to} not found`);
+      const replyRouting = getRoutingBySeq(replySeq);
+      if (replyRouting?.channel_type !== routing.channel_type || replyRouting?.platform_id !== routing.platform_id) {
+        return err(`Message #${replySeq} is not in ${routing.resolvedName}`);
+      }
+      inReplyTo = target;
+    }
+    const explicit = args.reply_to != null || quote !== undefined;
+
     const id = generateId();
     const seq = await writeMessageOut({
       id,
-      in_reply_to: getCurrentInReplyTo(),
+      in_reply_to: inReplyTo,
       kind: 'chat',
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ text }),
+      content: JSON.stringify(explicit ? { text, threadReply: quote ? { quote } : {} } : { text }),
     });
 
     log(`send_message: #${seq} → ${routing.resolvedName}`);
