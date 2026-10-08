@@ -379,6 +379,20 @@ export async function deleteMessagingGroupAgent(id: string): Promise<void> {
   await getDb().run('DELETE FROM messaging_group_agents WHERE id = ?', id);
 }
 
+/** Whether an agent group is wired to at least one messaging group of `channelType`. */
+export async function isAgentWiredToChannel(agentGroupId: string, channelType: string): Promise<boolean> {
+  const row = await getDb().get<{ wired: number }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM messaging_group_agents mga
+         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+         WHERE mga.agent_group_id = ? AND mg.channel_type = ?
+     ) AS wired`,
+    agentGroupId,
+    channelType,
+  );
+  return row?.wired === 1;
+}
+
 /** Get all messaging groups wired to an agent group (reverse lookup). */
 export async function getMessagingGroupsByAgentGroup(agentGroupId: string): Promise<MessagingGroup[]> {
   return getDb().all<MessagingGroup>(

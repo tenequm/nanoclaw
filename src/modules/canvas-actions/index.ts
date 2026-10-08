@@ -18,8 +18,10 @@
  * registerDeliveryAction) — on this branch it resolves after the next
  * main → channels sync; the barrel import stays commented until then.
  */
+import { isAgentWiredToChannel } from '../../db/messaging-groups.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
+import { registerModuleSectionGate } from '../../project-doc-compose.js';
 import { handleCanvasEdit, handleCanvasRead } from './handlers.js';
 
 registerDeliveryAction(
@@ -33,3 +35,7 @@ registerDeliveryAction(
   handleCanvasRead,
   unguarded("read-only canvas fetch via the session's own bot identity; no privileged effect"),
 );
+
+// The canvas tools' prose reaches only agents that can have a Slack session;
+// every named slack-<name> instance shares channel_type 'slack'.
+registerModuleSectionGate('canvas', (group) => isAgentWiredToChannel(group.id, 'slack'));

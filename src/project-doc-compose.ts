@@ -184,6 +184,7 @@ export function registerProjectDocSection(provider: ProjectDocSectionProvider): 
  * Prose only; the module's tools stay registered.
  */
 export function registerModuleSectionGate(moduleName: string, gate: SectionGate): void {
+  if (moduleSectionGates.has(moduleName)) log.warn('Module section gate overwritten', { moduleName });
   moduleSectionGates.set(moduleName, gate);
 }
 
@@ -192,6 +193,7 @@ export function registerModuleSectionGate(moduleName: string, gate: SectionGate)
  * selection says: `"all"` would otherwise teach every agent a channel's rules.
  */
 export function registerResidentSkillGate(skillName: string, gate: SectionGate): void {
+  if (residentSkillGates.has(skillName)) log.warn('Resident skill gate overwritten', { skillName });
   residentSkillGates.set(skillName, gate);
 }
 

@@ -36,9 +36,9 @@ import { log } from './log.js';
 import {
   BASE_INSTRUCTIONS_PATH,
   composeGroupProjectDoc,
-  registerModuleSectionGate,
   DEFAULT_PROJECT_DOC,
   MEMORY_NOTE_PLACEHOLDER,
+  registerModuleSectionGate,
   renderBaseInstructions,
   type ProjectDocSpec,
 } from './project-doc-compose.js';
@@ -46,7 +46,8 @@ import type { AgentGroup } from './types.js';
 // Loading these modules registers the per-agent sections and skill gates under test.
 import { resetGateConfigCache, writeGateEntry } from './modules/jev-gate/index.js';
 import './channels/voice-mode.js';
-import './channels/slack.js';
+import './modules/canvas-actions/index.js';
+import './modules/slack-agent-flow/index.js';
 
 const CLAUDE_SPEC: ProjectDocSpec = {
   fileName: 'CLAUDE.md',
@@ -369,6 +370,7 @@ describe('composeGroupProjectDoc skill selection', () => {
 describe('composeGroupProjectDoc per-agent sections', () => {
   const JEV_SECTION = 'NanoClaw Module: jev-gate';
   const VOICE_SECTION = 'NanoClaw Skill: voice-mode-formatting';
+  const SLACK_ONLY_MODULES = ['canvas', 'create-agent-slack', 'rooms'];
 
   beforeEach(() => {
     fs.mkdirSync(path.join(TEST_ROOT, 'data'), { recursive: true });
@@ -459,8 +461,6 @@ describe('composeGroupProjectDoc per-agent sections', () => {
     expect(doc).toContain('# NanoClaw Skill: onecli-gateway');
     expect(doc).not.toContain(`# ${VOICE_SECTION}`);
   });
-  const SLACK_ONLY_MODULES = ['canvas', 'create-agent-slack', 'rooms'];
-
   it('leaves the Slack-only module prose out for a Telegram-only agent', async () => {
     const ag = await seed('ag-tg-only', 'tg-only-group');
     await wire(ag, 'mg-tg-only', 'telegram');

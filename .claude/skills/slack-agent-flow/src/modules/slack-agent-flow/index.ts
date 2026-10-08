@@ -24,8 +24,9 @@
 import { SlackApiError } from '../../channels/slack-lib.js';
 import { reenterGuardedDeliveryAction, registerDeliveryAction, registerDeliveryBatchPreview } from '../../delivery.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { getMessagingGroup, isAgentWiredToChannel } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
+import { registerModuleSectionGate } from '../../project-doc-compose.js';
 import type { Session } from '../../types.js';
 import { getDestinationByName, normalizeName } from '../agent-to-agent/db/agent-destinations.js';
 import { createAgent, requestCreateAgentHold, validateCreateAgent } from '../agent-to-agent/create-agent.js';
@@ -273,3 +274,9 @@ registerDeliveryAction('add_to_room', handleAddToRoom, {
   onDeny: (_content, session, reason) => notifyAgent(session, `add_to_room denied: ${reason}`),
 });
 registerApprovalHandler('add_to_room', reenterGuardedDeliveryAction('add_to_room'));
+
+// The room and Slack-provisioning prose reaches only Slack-wired agents (named
+// slack-<name> instances share channel_type 'slack'); the tools stay registered.
+for (const moduleName of ['create-agent-slack', 'rooms']) {
+  registerModuleSectionGate(moduleName, (group) => isAgentWiredToChannel(group.id, 'slack'));
+}
