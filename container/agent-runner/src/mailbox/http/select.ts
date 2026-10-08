@@ -2,8 +2,8 @@
  * One composed mailbox that picks its transport from the host-written session
  * context at start(): `mailbox: null` (or no context, from a pre-seam host) is
  * the SQLite files, `mailbox: { transport: 'http', ... }` is the host
- * endpoint. One image serves both, so switching transport — and rolling it
- * back — is a host-side setting. Anything else stops the runner with a clear
+ * endpoint. One image serves both, so switching transport (and rolling it
+ * back) is a host-side setting. Anything else stops the runner with a clear
  * error instead of guessing.
  *
  * Before start() it behaves as the SQLite mailbox, exactly as the composition

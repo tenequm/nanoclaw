@@ -108,7 +108,6 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  handler = defaultHandler;
   for (const mailbox of mailboxes) await mailbox.stop().catch(() => {});
   server.stop(true);
 });
@@ -169,7 +168,14 @@ describe('HTTP mailbox reads (served from the replica)', () => {
       latestRoutes: [{ channelType: 'test', platformId: 'room', threadId: 't-1', inReplyTo: 'old' }],
       replySeqs: [{ channelType: 'test', platformId: 'room', platformMessageId: 'way-back', sequence: 1 }],
       destinations: [
-        { name: 'room', displayName: null, type: 'channel', channelType: 'test', platformId: 'room', agentGroupId: null },
+        {
+          name: 'room',
+          displayName: null,
+          type: 'channel',
+          channelType: 'test',
+          platformId: 'room',
+          agentGroupId: null,
+        },
         { name: 'peer', displayName: 'Peer', type: 'agent', channelType: null, platformId: null, agentGroupId: 'ag-2' },
       ],
       state: [{ key: 'k', value: 'v', updatedAt: '2026-01-01T00:00:00.000Z' }],
@@ -190,9 +196,10 @@ describe('HTTP mailbox reads (served from the replica)', () => {
     expect(operations.findSeqByPlatformMessageId('test', 'room', 'old'), 'window fallback, inbound').toBe(2);
     expect(operations.findSeqByPlatformMessageId('test', 'room', 'platform-1'), 'window fallback, outbound').toBe(3);
     expect(operations.findSeqByPlatformMessageId('test', 'room', 'nope')).toBeNull();
-    expect(operations.getUndeliveredMessages().map((m) => m.id), 'deliverAfter in the future is not due').toEqual([
-      'out-1',
-    ]);
+    expect(
+      operations.getUndeliveredMessages().map((m) => m.id),
+      'deliverAfter in the future is not due',
+    ).toEqual(['out-1']);
     expect(operations.getState('k')).toEqual({ value: 'v', updatedAt: '2026-01-01T00:00:00.000Z' });
     expect(operations.getSessionRouting()).toEqual({ channelType: 'test', platformId: 'room', threadId: null });
     expect(operations.getDestinations().map((d) => d.name)).toEqual(['room', 'peer']);
@@ -228,7 +235,10 @@ describe('HTTP mailbox writes', () => {
     operations.setState('k', 'v');
     operations.deleteState('k');
     operations.setState('kept', 'x');
-    expect(operations.getPendingMessages(10, false).map((m) => m.id), 'read-your-writes').toEqual(['m2']);
+    expect(
+      operations.getPendingMessages(10, false).map((m) => m.id),
+      'read-your-writes',
+    ).toEqual(['m2']);
     expect(operations.getState('kept')?.value).toBe('x');
     operations.setContainerToolInFlight('Bash', 1000);
     operations.markContainerTurn('working');
@@ -293,12 +303,25 @@ describe('HTTP mailbox writes', () => {
     expect(mailbox.operations.getPendingMessages(10, false)).toEqual([]);
   });
 
-  test('carries the heartbeat to the host instead of touching a file', async () => {
-    const mailbox = await started();
+  test('carries the heartbeat on the next exchange, never as an exchange of its own', async () => {
+    const mailbox = await started({ syncIntervalMs: 60_000 });
+    const before = requests.length;
     expect(mailbox.heartbeat()).toBe(true);
     mailbox.heartbeat();
     await settle();
-    expect(allOps().filter((op) => op === 'heartbeat').length).toBeGreaterThanOrEqual(1);
+    expect(requests.length, 'a beat per provider event must not pace requests').toBe(before);
+    await mailbox.run(() => undefined);
+    expect(allOps()).toEqual(['heartbeat']);
+  });
+
+  test('stop() commits queued writes and is final', async () => {
+    const mailbox = await started({ syncIntervalMs: 60_000 });
+    mailbox.operations.setState('k', 'v');
+    await mailbox.stop();
+    expect(allOps()).toEqual(['setState']);
+    expect(() => mailbox.operations.getState('k')).toThrow('after stop()');
+    expect(() => mailbox.operations.setState('k', 'w')).toThrow('after stop()');
+    await expect(mailbox.run(() => 1)).rejects.toThrow('after stop()');
   });
 });
 
@@ -306,7 +329,8 @@ describe('HTTP mailbox fails closed', () => {
   test('a refused request poisons the mailbox: every op throws and the runner asks for a restart', async () => {
     snapshotState = { pending: [inbound('m1', 2)] };
     const mailbox = await started();
-    handler = () => Response.json({ error: { code: 'unauthorized', message: 'session token mismatch' } }, { status: 401 });
+    handler = () =>
+      Response.json({ error: { code: 'unauthorized', message: 'session token mismatch' } }, { status: 401 });
     const write = mailbox.operations.writeMessageOut({ id: 'o1', kind: 'chat', content: '{}' });
     await expect(write).rejects.toThrow('unauthorized');
     let error: unknown;
@@ -325,7 +349,10 @@ describe('HTTP mailbox fails closed', () => {
     snapshotState = { pending: [inbound('m1', 2)] };
     const mailbox = await started({ staleAfterMs: 150 });
     server.stop(true);
-    expect(mailbox.operations.getPendingMessages(10, false).map((m) => m.id), 'last good snapshot').toEqual(['m1']);
+    expect(
+      mailbox.operations.getPendingMessages(10, false).map((m) => m.id),
+      'last good snapshot',
+    ).toEqual(['m1']);
     await Bun.sleep(400);
     expect(() => mailbox.operations.getPendingMessages(10, false)).toThrow(MailboxTransportError);
   });
@@ -336,8 +363,10 @@ describe('HTTP mailbox fails closed', () => {
     await expect(mailbox.start(key())).rejects.toThrow(MailboxTransportError);
   });
 
-  test('operations before start() throw instead of answering', () => {
+  test('operations before start() throw instead of answering, without a retry window', async () => {
     expect(() => new HttpAgentMailbox().operations.getDestinations()).toThrow('before start()');
+    await expect(new HttpAgentMailbox().run(() => 1)).rejects.toThrow('before start()');
+    expect(new HttpAgentMailbox().heartbeat(), 'falls back to the heartbeat file').toBe(false);
   });
 });
 
@@ -383,7 +412,12 @@ describe('context-selected composition', () => {
 
   test('every standalone entry point that touches the mailbox starts it first', async () => {
     const read = (relative: string) => Bun.file(new URL(relative, import.meta.url)).text();
-    for (const entry of ['../../index.ts', '../../mcp-tools/index.ts', '../../cli/ncl.ts', '../../compact-instructions.ts']) {
+    for (const entry of [
+      '../../index.ts',
+      '../../mcp-tools/index.ts',
+      '../../cli/ncl.ts',
+      '../../compact-instructions.ts',
+    ]) {
       const source = await read(entry);
       expect(source, entry).toMatch(/modules\/index\.js'/);
       expect(source, entry).toContain('readMailboxContext()');

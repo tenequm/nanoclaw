@@ -11,7 +11,7 @@
  * - Sync reads answer from the latest snapshot (at most one sync interval
  *   old). run() refreshes before its action, so a tool call starts fresh.
  * - Sync writes apply to the replica at once (read-your-writes) and queue for
- *   the host, flushed on the next tick; run() flushes before it resolves —
+ *   the host, flushed on the next tick; run() flushes before it resolves,
  *   the runner-side analog of "durable once session() resolves".
  * - writeMessageOut resolves only after the host committed the row.
  *
@@ -41,16 +41,17 @@ import type {
   MailboxOperations,
   MailboxSessionKey,
   OutboundMessage,
-  OutboundMessageDraft,
   ProcessingStatus,
   SessionRouting,
   StateValue,
-  TurnState,
 } from '../types.js';
 
-export const HTTP_MAILBOX_PROTOCOL = 1;
+export const MAILBOX_HTTP_PROTOCOL = 1;
 /** Replica rows kept per table beyond the pending set; older seq lookups miss. */
 const REPLICA_WINDOW = 2000;
+const DEFAULT_SYNC_INTERVAL_MS = 250;
+const DEFAULT_STALE_AFTER_MS = 15_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
 export interface HttpMailboxContext {
   transport: 'http';
@@ -70,7 +71,6 @@ export class MailboxTransportError extends Error {
   constructor(
     message: string,
     readonly permanent: boolean,
-    readonly status?: number,
   ) {
     super(message);
     this.name = 'MailboxTransportError';
@@ -89,9 +89,9 @@ export function parseHttpMailboxContext(value: unknown): HttpMailboxContext {
   ) {
     throw new Error('Invalid HTTP mailbox context: expected { transport: "http", url, token }');
   }
-  if (context.protocol !== HTTP_MAILBOX_PROTOCOL) {
+  if (context.protocol !== MAILBOX_HTTP_PROTOCOL) {
     throw new Error(
-      `HTTP mailbox protocol mismatch: host speaks ${String(context.protocol)}, runner speaks ${HTTP_MAILBOX_PROTOCOL}`,
+      `HTTP mailbox protocol mismatch: host speaks ${String(context.protocol)}, runner speaks ${MAILBOX_HTTP_PROTOCOL}`,
     );
   }
   return context as HttpMailboxContext;
@@ -187,7 +187,7 @@ class Replica {
   /**
    * Exact for every pending row's reply target (the host resolves those in each
    * snapshot); otherwise the same rule over the replica window, where an older
-   * target misses — the formatter then omits reply_to, as for any message
+   * target misses; the formatter then omits reply_to, as for any message
    * outside the session's history.
    */
   findSeqByPlatformMessageId(channelType: string, platformId: string, platformMessageId: string): number | null {
@@ -220,42 +220,46 @@ class Replica {
     return outbound?.sequence ?? null;
   }
 
+  /** Pending rows first: they are current, while a window row may be a since-deleted holder of a reused seq. */
   inboundBySequence(sequence: number): InboundMessage | undefined {
-    const windowed = this.inbound.get(sequence);
-    if (windowed) return windowed;
     for (const message of this.pending.values()) if (message.sequence === sequence) return message;
-    return undefined;
+    return this.inbound.get(sequence);
   }
 }
 
 /** How each queued sync write shows up in the replica before the host confirms it. */
-const WRITE_EFFECTS: Record<string, (replica: Replica, args: unknown[]) => void> = {
-  markMessages: (replica, [ids, status]) => {
+const WRITE_EFFECTS = {
+  markMessages: (replica: Replica, [ids, status]: unknown[]) => {
     for (const id of ids as string[]) replica.claimed.set(id, status as ProcessingStatus);
   },
-  markScriptSkipped: (replica, [skips]) => {
+  markScriptSkipped: (replica: Replica, [skips]: unknown[]) => {
     for (const skip of skips as Array<{ id: string; reason: string }>) {
       replica.claimed.set(skip.id, skip.reason === 'error' ? 'script-skip:error' : 'completed');
     }
   },
-  setState: (replica, [key, value]) => {
+  setState: (replica: Replica, [key, value]: unknown[]) => {
     const record = parseStateRecord({ key, value, updatedAt: new Date().toISOString() });
     replica.state.set(record.key, { value: record.value, updatedAt: record.updatedAt });
   },
-  deleteState: (replica, [key]) => {
+  deleteState: (replica: Replica, [key]: unknown[]) => {
     replica.state.delete(key as string);
   },
-  clearStaleProcessingAcks: (replica) => {
+  clearStaleProcessingAcks: (replica: Replica) => {
     for (const [id, status] of replica.claimed) if (status === 'processing') replica.claimed.delete(id);
   },
   setContainerToolInFlight: () => {},
   clearContainerToolInFlight: () => {},
   markContainerTurn: () => {},
   writeMessageOut: () => {},
-};
+} satisfies Record<string, (replica: Replica, args: unknown[]) => void>;
+
+type WriteOp = keyof typeof WRITE_EFFECTS;
+
+const applyWrite = (replica: Replica, op: WriteOp, args: unknown[]) =>
+  (WRITE_EFFECTS[op] as (replica: Replica, args: unknown[]) => void)(replica, args);
 
 interface QueuedWrite {
-  op: string;
+  op: WriteOp;
   args: unknown[];
   resolve(value: unknown): void;
   reject(error: unknown): void;
@@ -278,15 +282,16 @@ export class HttpAgentMailbox implements AgentMailbox {
   private lastSuccessAt = 0;
   private failingSince: number | null = null;
   private fatal: Error | null = null;
+  private stopped = false;
   private running: Promise<void> = Promise.resolve();
   private scheduled: Promise<void> | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private interval: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: HttpMailboxOptions = {}) {
-    this.syncIntervalMs = options.syncIntervalMs ?? 250;
-    this.staleAfterMs = options.staleAfterMs ?? 15_000;
-    this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
+    this.syncIntervalMs = options.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS;
+    this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.operations = this.createOperations();
   }
 
@@ -295,6 +300,7 @@ export class HttpAgentMailbox implements AgentMailbox {
   }
 
   async start(key: MailboxSessionKey | null): Promise<void> {
+    if (this.context) throw new Error('HTTP mailbox already started');
     if (!key) throw new Error('HTTP mailbox requires the host session context; refusing the legacy null sentinel');
     this.context = parseHttpMailboxContext(key.mailbox);
     this.key = key;
@@ -307,31 +313,47 @@ export class HttpAgentMailbox implements AgentMailbox {
   }
 
   async run<T>(action: () => T | Promise<T>): Promise<T> {
+    this.assertUsable();
     await this.syncUntilSettled();
     const result = await action();
     await this.drain();
     return result;
   }
 
+  /** Final: commits what is queued, then every later operation throws, so a premature stop() is loud. */
   async stop(): Promise<void> {
-    if (this.interval) clearInterval(this.interval);
-    this.interval = null;
+    this.clearTimers();
     if (this.context && !this.fatal) await this.drain();
+    this.stopped = true;
   }
 
-  /** Heartbeats ride the next exchange; the host touches the session's heartbeat file. */
+  /**
+   * Heartbeats ride the next interval tick, not an exchange of their own: the
+   * poll loop beats once per provider event, which would otherwise pace
+   * requests by round-trip time. The host touches the session's heartbeat file.
+   */
   heartbeat(): boolean {
-    if (!this.fatal) {
-      this.heartbeatPending = true;
-      this.scheduleFlush();
-    }
+    if (!this.context) return false;
+    if (!this.fatal) this.heartbeatPending = true;
     return true;
   }
 
   // -- transport ---------------------------------------------------------
 
-  private assertReadable(): void {
+  private clearTimers(): void {
+    if (this.interval) clearInterval(this.interval);
+    this.interval = null;
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+  }
+
+  private assertUsable(): void {
     if (this.fatal) throw this.fatal;
+    if (this.stopped) throw new Error('HTTP mailbox used after stop()');
+  }
+
+  private assertReadable(): void {
+    this.assertUsable();
     if (!this.replica.cursor) throw new MailboxTransportError('HTTP mailbox used before start()', true);
     const age = Date.now() - this.lastSuccessAt;
     if (age > this.staleAfterMs) {
@@ -339,8 +361,8 @@ export class HttpAgentMailbox implements AgentMailbox {
     }
   }
 
-  private write(op: string, args: unknown[]): Promise<unknown> {
-    if (this.fatal) throw this.fatal;
+  private write(op: WriteOp, args: unknown[]): Promise<unknown> {
+    this.assertUsable();
     if (!this.context) throw new MailboxTransportError('HTTP mailbox used before start()', true);
     let resolve!: (value: unknown) => void;
     let reject!: (error: unknown) => void;
@@ -349,7 +371,7 @@ export class HttpAgentMailbox implements AgentMailbox {
       reject = rej;
     });
     const queued = { op, args, resolve, reject };
-    WRITE_EFFECTS[op](this.replica, args);
+    applyWrite(this.replica, op, args);
     this.queue.push(queued);
     this.enqueued += 1;
     this.scheduleFlush();
@@ -357,7 +379,7 @@ export class HttpAgentMailbox implements AgentMailbox {
   }
 
   /** Fire-and-forget sync writes still surface failures: the next op throws once poisoned. */
-  private writeSync(op: string, args: unknown[]): void {
+  private writeSync(op: WriteOp, args: unknown[]): void {
     this.write(op, args).catch(() => {});
   }
 
@@ -388,7 +410,7 @@ export class HttpAgentMailbox implements AgentMailbox {
       try {
         await this.sync();
         return;
-      } catch (error) {
+      } catch {
         if (this.fatal) throw this.fatal;
         await sleep(this.syncIntervalMs);
       }
@@ -412,14 +434,17 @@ export class HttpAgentMailbox implements AgentMailbox {
   private poison(error: Error): void {
     if (this.fatal) return;
     this.fatal = error;
-    console.error(`[mailbox-http] ${error.message} — mailbox disabled; this runner needs a restart`);
-    if (this.interval) clearInterval(this.interval);
-    this.interval = null;
+    console.error(`[mailbox-http] ${error.message}; mailbox disabled, this runner needs a restart`);
+    this.clearTimers();
     for (const queued of this.queue.splice(0)) queued.reject(error);
   }
 
   private async exchange(): Promise<void> {
     if (this.fatal) throw this.fatal;
+    if (!this.context || !this.key) {
+      this.poison(new MailboxTransportError('HTTP mailbox used before start()', true));
+      throw this.fatal;
+    }
     const batch = this.queue.slice();
     const heartbeat = this.heartbeatPending;
     this.heartbeatPending = false;
@@ -440,7 +465,9 @@ export class HttpAgentMailbox implements AgentMailbox {
       const now = Date.now();
       if (this.failingSince === null) {
         this.failingSince = now;
-        console.error(`[mailbox-http] ${failure.message} — retrying for up to ${this.staleAfterMs}ms`);
+        if (!failure.permanent) {
+          console.error(`[mailbox-http] ${failure.message}; retrying for up to ${this.staleAfterMs}ms`);
+        }
       }
       if (failure.permanent || now - this.failingSince > this.staleAfterMs) this.poison(failure);
       throw this.fatal ?? failure;
@@ -457,7 +484,7 @@ export class HttpAgentMailbox implements AgentMailbox {
       throw this.fatal;
     }
     // Writes queued while this exchange was in flight are not in the snapshot yet.
-    for (const queued of this.queue) WRITE_EFFECTS[queued.op](this.replica, queued.args);
+    for (const queued of this.queue) applyWrite(this.replica, queued.op, queued.args);
   }
 
   private async post(ops: Array<{ op: string; args: unknown[] }>): Promise<unknown[]> {
@@ -473,18 +500,28 @@ export class HttpAgentMailbox implements AgentMailbox {
       body: JSON.stringify({ ops }),
       signal: AbortSignal.timeout(this.requestTimeoutMs),
     });
-    const body = (await response.json().catch(() => null)) as {
-      results?: unknown[];
-      error?: { code?: string; message?: string };
-    } | null;
+    // A body that fails to arrive (timeout, reset) is a transport hiccup; one that arrives malformed is not.
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (error) {
+      throw new MailboxTransportError(`HTTP mailbox response body failed: ${String(error)}`, false);
+    }
+    let body: { results?: unknown[]; error?: { code?: string; message?: string } } | null;
+    try {
+      body = JSON.parse(text) as typeof body;
+    } catch {
+      body = null;
+    }
     if (!response.ok) {
       const detail = body?.error ? `${body.error.code}: ${body.error.message}` : `HTTP ${response.status}`;
-      // 4xx is the host refusing this request (bad token, unknown session, invalid op): retrying cannot help.
-      const permanent = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
-      throw new MailboxTransportError(`HTTP mailbox rejected request (${detail})`, permanent, response.status);
+      // A 4xx other than 408/429 is the host refusing this request (bad token, unknown session, invalid op): retrying cannot help.
+      const permanent =
+        response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
+      throw new MailboxTransportError(`HTTP mailbox rejected request (${detail})`, permanent);
     }
     if (!Array.isArray(body?.results) || body.results.length !== ops.length) {
-      throw new MailboxTransportError('HTTP mailbox returned a malformed response', true, response.status);
+      throw new MailboxTransportError('HTTP mailbox returned a malformed response', true);
     }
     return body.results;
   }
@@ -512,7 +549,8 @@ export class HttpAgentMailbox implements AgentMailbox {
         }),
       markMessages: (ids, status) => this.writeSync('markMessages', [ids, status]),
       markScriptSkipped: (skips) => this.writeSync('markScriptSkipped', [skips]),
-      getMessageIn: (id) => read(() => replica.pending.get(id) ?? [...replica.inbound.values()].find((m) => m.id === id)),
+      getMessageIn: (id) =>
+        read(() => replica.pending.get(id) ?? [...replica.inbound.values()].find((m) => m.id === id)),
       findQuestionResponse: (questionId) =>
         read(() => {
           const response = [...replica.pending.values()]
@@ -526,7 +564,7 @@ export class HttpAgentMailbox implements AgentMailbox {
             .sort(bySequence)
             .find((message) => containsIgnoringCase(message.content, `"requestId":"${requestId}"`)),
         ),
-      writeMessageOut: async (message: OutboundMessageDraft) => {
+      writeMessageOut: async (message) => {
         parseOutboundWrite(message);
         return (await this.write('writeMessageOut', [message])) as number;
       },
@@ -558,7 +596,7 @@ export class HttpAgentMailbox implements AgentMailbox {
           const now = Date.now();
           return [...replica.outbound.values()]
             .filter((message) => dueAt(message.deliverAfter, now))
-            .sort((a, b) => a.timestamp.localeCompare(b.timestamp) || bySequence(a, b));
+            .sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : bySequence(a, b)));
         }),
       getState: (key) => read(() => replica.state.get(key)),
       setState: (key, value) => this.writeSync('setState', [key, value]),
@@ -577,7 +615,7 @@ export class HttpAgentMailbox implements AgentMailbox {
       setContainerToolInFlight: (tool, declaredTimeoutMs) =>
         this.writeSync('setContainerToolInFlight', [tool, declaredTimeoutMs]),
       clearContainerToolInFlight: () => this.writeSync('clearContainerToolInFlight', []),
-      markContainerTurn: (turn: TurnState) => {
+      markContainerTurn: (turn) => {
         if (turn !== 'working' && turn !== 'idle') throw new Error(`Invalid turn state: ${String(turn)}`);
         this.writeSync('markContainerTurn', [turn]);
       },
