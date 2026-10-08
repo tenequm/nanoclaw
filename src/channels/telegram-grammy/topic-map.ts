@@ -15,20 +15,36 @@
  */
 const MAX_ENTRIES = 4096;
 
-const topicByMessage = new Map<string, string>();
+/** A bounded FIFO keyed by (chatId, messageId): the newest `max` entries survive. */
+export function createMessageMap<V>(max = MAX_ENTRIES) {
+  const entries = new Map<string, V>();
+  return {
+    remember(chatId: number, messageId: number | string, value: V): void {
+      const key = `${chatId}:${messageId}`;
+      if (entries.has(key)) entries.delete(key);
+      entries.set(key, value);
+      if (entries.size > max) {
+        const oldest = entries.keys().next().value;
+        if (oldest !== undefined) entries.delete(oldest);
+      }
+    },
+    get(chatId: number, messageId: number | string): V | undefined {
+      return entries.get(`${chatId}:${messageId}`);
+    },
+    clear(): void {
+      entries.clear();
+    },
+  };
+}
+
+const topicByMessage = createMessageMap<string>();
 
 export function rememberTopicMessage(chatId: number, messageId: number, platformId: string): void {
-  const key = `${chatId}:${messageId}`;
-  if (topicByMessage.has(key)) topicByMessage.delete(key);
-  topicByMessage.set(key, platformId);
-  if (topicByMessage.size > MAX_ENTRIES) {
-    const oldest = topicByMessage.keys().next().value;
-    if (oldest !== undefined) topicByMessage.delete(oldest);
-  }
+  topicByMessage.remember(chatId, messageId, platformId);
 }
 
 export function resolveTopicPlatformId(chatId: number, messageId: number): string | null {
-  return topicByMessage.get(`${chatId}:${messageId}`) ?? null;
+  return topicByMessage.get(chatId, messageId) ?? null;
 }
 
 export function _clearTopicMapForTest(): void {

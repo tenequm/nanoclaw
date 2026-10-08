@@ -6,10 +6,10 @@
 import { Effect, Layer } from 'effect';
 import { GrammyError } from 'grammy';
 import type { UserFromGetMe } from 'grammy/types';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { OutboundMessage } from '../adapter.js';
-import { dispatchOutbound } from './outbound.js';
+import { _clearSentKindsForTest, dispatchOutbound } from './outbound.js';
 import { BotService, type HydratedBot } from './services.js';
 import { TELEGRAM_TEXT_LIMIT } from './formatter.js';
 
@@ -56,12 +56,15 @@ function fakeBot(fail?: (call: Call) => unknown) {
   };
 }
 
+// Every fakeBot numbers from 100, so a kind remembered by one test must not leak into the next.
+beforeEach(() => _clearSentKindsForTest());
+
 const file = (filename: string) => ({ filename, data: Buffer.from('x') });
 
-const badRequest = (what: string, method = 'sendMessage') =>
+const badRequest = (what: string, method = 'sendMessage', code = 400) =>
   new GrammyError(
     `Call to '${method}' failed!`,
-    { ok: false, error_code: 400, description: `Bad Request: ${what}` },
+    { ok: false, error_code: code, description: `Bad Request: ${what}` },
     method,
     {},
   );
@@ -330,5 +333,66 @@ describe('telegram outbound rich messages', () => {
       ['editMessageText', { markdown: 'bad' }],
       ['editMessageText', 'bad'],
     ]);
+  });
+});
+
+describe('telegram outbound never sends twice', () => {
+  const entityCount = (call: Call): number => (call.other.entities as unknown[] | undefined)?.length ?? 0;
+  const long = `${'a'.repeat(TELEGRAM_TEXT_LIMIT - 10)}\n\n**${'b'.repeat(200)}**`;
+
+  it('retries only the chunk Telegram rejected for its entities as plain text', async () => {
+    const bot = fakeBot((call) =>
+      call.method === 'sendMessage' && (call.args[1] as string).startsWith('b') && entityCount(call) > 0
+        ? badRequest("can't parse entities")
+        : undefined,
+    );
+    await bot.run({ kind: 'chat', content: { text: long } });
+    expect(bot.calls.map((c) => [(c.args[1] as string)[0], entityCount(c)])).toEqual([
+      ['a', 0],
+      ['b', 1],
+      ['b', 0],
+    ]);
+  });
+
+  it('keeps a delivered file delivered when its caption follow-up fails', async () => {
+    const bot = fakeBot((call) => (call.method === 'sendMessage' ? badRequest('chat not found') : undefined));
+    const id = await bot.run({
+      kind: 'chat',
+      content: { text: `${'c'.repeat(1000)}\n\n${'tail '.repeat(60)}` },
+      files: [file('a.jpg')],
+    });
+    expect(id).toBe('100');
+    expect(bot.calls.map((c) => c.method)).toEqual(['sendPhoto', 'sendMessage']);
+  });
+
+  it('treats an edit Telegram reports as not modified as done, rich or not', async () => {
+    const bot = fakeBot((call) =>
+      call.method === 'editMessageText' ? badRequest('message is not modified') : undefined,
+    );
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: '42:7', text: 'same' } });
+    const id = await bot.run({ kind: 'chat', content: { text: '| a |', rich: true } });
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '| a |' } });
+    expect(bot.calls.map((c) => c.method)).toEqual(['editMessageText', 'sendRichMessage', 'editMessageText']);
+  });
+
+  it('leaves a rate-limited or failed rich send to the host retry instead of resending it plain', async () => {
+    for (const code of [429, 500]) {
+      const bot = fakeBot((call) =>
+        call.method === 'sendRichMessage' ? badRequest('Too Many Requests', call.method, code) : undefined,
+      );
+      await expect(bot.run({ kind: 'chat', content: { text: '| a |', rich: true } })).rejects.toBeDefined();
+      expect(bot.calls.map((c) => c.method)).toEqual(['sendRichMessage']);
+    }
+  });
+
+  it("sends nothing and reports it when none of an album's files are in the outbox", async () => {
+    const bot = fakeBot();
+    const id = await bot.run({
+      kind: 'chat',
+      content: { operation: 'send_media_group', items: [{ path: 'x.jpg' }, { path: 'y.jpg' }] },
+      files: [],
+    });
+    expect(id).toBeUndefined();
+    expect(bot.calls).toEqual([]);
   });
 });

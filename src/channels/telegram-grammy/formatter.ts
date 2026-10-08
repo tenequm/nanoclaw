@@ -72,6 +72,8 @@ import { FormattedString } from '@grammyjs/parse-mode';
 export const TELEGRAM_TEXT_LIMIT = 4096;
 /** Telegram's absolute caption limit for media. */
 export const TELEGRAM_CAPTION_LIMIT = 1024;
+/** Telegram's limit for a Rich Message's text (`sendRichMessage`). */
+export const TELEGRAM_RICH_TEXT_LIMIT = 32768;
 
 const EMPTY = (): FormattedString => new FormattedString('');
 const PLAIN = (s: string): FormattedString => new FormattedString(s);
@@ -248,6 +250,7 @@ function renderNode(node: RenderableNode): FormattedString {
 }
 
 type DateTimeFormat = NonNullable<Parameters<typeof FormattedString.time>[2]>;
+const TIME_LINK_PREFIX = 'tg://time?';
 const DATE_TIME_FORMAT_RE = /^(?:r|w?[dD]?[tT]?)$/;
 
 /**
@@ -256,8 +259,8 @@ const DATE_TIME_FORMAT_RE = /^(?:r|w?[dD]?[tT]?)$/;
  * timezone and locale. A link that does not parse stays a plain link.
  */
 function parseTimeLink(url: string): { unix: number; format: DateTimeFormat | undefined } | null {
-  if (!url.startsWith('tg://time?')) return null;
-  const params = new URLSearchParams(url.slice('tg://time?'.length));
+  if (!url.startsWith(TIME_LINK_PREFIX)) return null;
+  const params = new URLSearchParams(url.slice(TIME_LINK_PREFIX.length));
   const unixRaw = params.get('unix') ?? '';
   if (!/^\d+$/.test(unixRaw)) return null;
   const format = params.get('format') ?? '';
@@ -275,12 +278,12 @@ function renderChildren(children: readonly RenderableNode[]): FormattedString {
 /* ----------------------------------------------------------------------- */
 
 /** Bullet per nesting depth; deeper levels reuse the last. */
-const BULLETS = ['•', '◦', '▪'] as const;
-const TASK_OPEN = '☐';
-const TASK_DONE = '☑';
-const DIVIDER = '─'.repeat(8);
+const BULLETS = ['\u2022', '\u25E6', '\u25AA'] as const;
+const TASK_OPEN = '\u2610';
+const TASK_DONE = '\u2611';
+const DIVIDER = '\u2500'.repeat(8);
 /** Telegram keeps leading spaces only unreliably across clients; NBSP always survives. */
-const INDENT_UNIT = ' ';
+const INDENT_UNIT = '\u00A0';
 
 /**
  * Render a list at a nesting level. Each item's continuation lines and nested

@@ -37,9 +37,9 @@ import { normalizeOptions, type NormalizedOption, type RawOption } from '../ask-
 import { buildAskQuestionKeyboard } from './ask-question.js';
 import type { GrammyDeliveryError } from './errors.js';
 import { mapGrammyError } from './errors.js';
-import { renderFS, splitCaption, splitForBody } from './formatter.js';
+import { renderFS, splitCaption, splitForBody, TELEGRAM_RICH_TEXT_LIMIT } from './formatter.js';
 import { extractTelegramMessageId, parseChatId, parseTopicId, resolveMessageThreadId } from './inbound.js';
-import { rememberTopicMessage } from './topic-map.js';
+import { createMessageMap, rememberTopicMessage } from './topic-map.js';
 import { resolveReactionEmoji, type TelegramReactionEmoji } from './reactions.js';
 import { BotService } from './services.js';
 import { probeMediaMeta } from './media-meta.js';
@@ -154,45 +154,45 @@ const sendReplying = <A, R>(
 };
 
 /**
- * Retry-once helper: if the primary send fails with GrammyEntityError
- * (malformed entities — our mdast walker produced offsets Telegram's
- * validator rejected), retry with entities stripped and plain text.
- * Caption paths don't use this — they surface as delivery errors.
+ * Retry-once helper: if the send fails with GrammyEntityError (malformed
+ * entities - our mdast walker produced offsets Telegram's validator
+ * rejected), retry it with entities stripped, as plain text.
  */
 const sendWithFallback = <A>(
-  primary: Effect.Effect<A, GrammyDeliveryError, BotService>,
-  fallbackPlainText: () => Effect.Effect<A, GrammyDeliveryError, BotService>,
+  send: (plain: boolean) => Effect.Effect<A, GrammyDeliveryError, BotService>,
 ): Effect.Effect<A, GrammyDeliveryError, BotService> =>
-  primary.pipe(
+  send(false).pipe(
     Effect.catchTag('GrammyEntityError', (err) =>
-      Effect.logWarning('telegram-grammy: entity error, retrying as plain text', err).pipe(
-        Effect.andThen(fallbackPlainText()),
-      ),
+      Effect.logWarning('telegram-grammy: entity error, retrying as plain text', err).pipe(Effect.andThen(send(true))),
     ),
   );
 
-/** Typed sender for the default message path. */
+/**
+ * Send text chunks in order; returns the last chunk's id. The plain-text retry
+ * is per chunk, so a chunk that already went out is never sent again.
+ */
 const sendTextChunks = Effect.fn('telegram-grammy.sendTextChunks')(function* (
   chatId: number,
   messageThreadId: number | undefined,
   chunks: readonly FormattedString[],
-  plain: boolean,
   reply: ReplyParameters | undefined,
 ) {
   const { bot } = yield* BotService;
   let lastId: number | undefined;
   for (const [index, chunk] of chunks.entries()) {
-    const sent = yield* sendReplying(index, reply, (replyParameters) =>
-      Effect.tryPromise({
-        try: () =>
-          bot.api.sendMessage(chatId, chunk.text, {
-            entities: plain ? undefined : chunk.entities,
-            message_thread_id: messageThreadId,
-            link_preview_options: { is_disabled: true },
-            reply_parameters: replyParameters,
-          }),
-        catch: (err) => mapGrammyError(err, 'sendMessage', String(chatId)),
-      }),
+    const sent = yield* sendWithFallback((plain) =>
+      sendReplying(index, reply, (replyParameters) =>
+        Effect.tryPromise({
+          try: () =>
+            bot.api.sendMessage(chatId, chunk.text, {
+              entities: plain ? undefined : chunk.entities,
+              message_thread_id: messageThreadId,
+              link_preview_options: { is_disabled: true },
+              reply_parameters: replyParameters,
+            }),
+          catch: (err) => mapGrammyError(err, plain ? 'sendMessage-plain' : 'sendMessage', String(chatId)),
+        }),
+      ),
     );
     lastId = sent.message_id;
   }
@@ -200,43 +200,43 @@ const sendTextChunks = Effect.fn('telegram-grammy.sendTextChunks')(function* (
 });
 
 /**
+ * Whatever goes out after a delivery's first message has landed: failing it
+ * would make the host retry the whole delivery and send that first message
+ * again, so a failure here is logged instead.
+ */
+const afterFirstSend = <R>(
+  what: string,
+  send: Effect.Effect<unknown, GrammyDeliveryError, R>,
+): Effect.Effect<void, never, R> =>
+  send.pipe(
+    Effect.asVoid,
+    Effect.catch((err) => Effect.logError(`telegram-grammy: ${what} failed after the message was sent`, err)),
+  );
+
+/**
  * Text that did not fit where it was meant to go (a caption's overflow, the
- * tail of a long edit), sent as plain follow-up messages so nothing is lost.
+ * tail of a long edit), sent as follow-up messages so nothing is lost.
  */
 const sendFollowUp = (
   chatId: number,
   messageThreadId: number | undefined,
   chunks: readonly FormattedString[],
-): Effect.Effect<void, GrammyDeliveryError, BotService> =>
+): Effect.Effect<void, never, BotService> =>
   chunks.length === 0
     ? Effect.void
-    : sendWithFallback(sendTextChunks(chatId, messageThreadId, chunks, false, undefined), () =>
-        sendTextChunks(chatId, messageThreadId, chunks, true, undefined),
-      ).pipe(Effect.asVoid);
+    : afterFirstSend('overflow follow-up', sendTextChunks(chatId, messageThreadId, chunks, undefined));
 
 /**
  * What the bot sent as (chatId, messageId), for edits: a media message takes
- * `editMessageCaption`, a Rich Message the rich edit form. Bounded FIFO, wiped
- * by a host restart; an edit of an unremembered media message still lands
- * through the "no text" retry, one of a Rich Message as a normal edit.
+ * `editMessageCaption`, a Rich Message the rich edit form. Wiped by a host
+ * restart; an edit of an unremembered media message still lands through the
+ * "no text" retry, one of a Rich Message as a normal edit.
  */
-const MAX_SENT_KINDS = 4096;
 type SentKind = 'media' | 'rich';
-const sentKinds = new Map<string, SentKind>();
+const sentKinds = createMessageMap<SentKind>();
 
 function rememberSentKind(chatId: number, messageId: string | number | undefined, kind: SentKind): void {
-  if (messageId === undefined) return;
-  const key = `${chatId}:${messageId}`;
-  sentKinds.delete(key);
-  sentKinds.set(key, kind);
-  if (sentKinds.size > MAX_SENT_KINDS) {
-    const oldest = sentKinds.keys().next().value;
-    if (oldest !== undefined) sentKinds.delete(oldest);
-  }
-}
-
-function sentKindOf(chatId: number, messageId: number): SentKind | undefined {
-  return sentKinds.get(`${chatId}:${messageId}`);
+  if (messageId !== undefined) sentKinds.remember(chatId, messageId, kind);
 }
 
 export function _clearSentKindsForTest(): void {
@@ -341,8 +341,8 @@ const sendSingleFile = (
 };
 
 /**
- * Send a default text+files message. Returns the first chunk's message id, or
- * for files the (last) file's id. Text longer than a caption follows the
+ * Send a default text+files message. Returns the last chunk's message id, or
+ * for files the last file's id. Text longer than a caption follows the
  * file(s) as its own messages.
  */
 const sendDefault = Effect.fn('telegram-grammy.sendDefault')(function* (
@@ -356,56 +356,44 @@ const sendDefault = Effect.fn('telegram-grammy.sendDefault')(function* (
 
   if (files.length === 0) {
     if (!text) return undefined;
-    const fs = renderFS(text);
-    const chunks = splitForBody(fs);
-    return yield* sendWithFallback(sendTextChunks(chatId, messageThreadId, chunks, false, reply), () =>
-      sendTextChunks(chatId, messageThreadId, chunks, true, reply),
-    );
+    return yield* sendTextChunks(chatId, messageThreadId, splitForBody(renderFS(text)), reply);
   }
 
   const { caption, rest } = text ? splitCaption(renderFS(text)) : { caption: undefined, rest: [] };
 
-  if (files.length === 1) {
-    const file = files[0];
-    const kind = mediaKindFromFilename(file.filename);
-    const sentId = yield* sendReplying(0, reply, (replyParameters) =>
-      sendSingleFile(bot, chatId, kind, file, caption, messageThreadId, replyParameters),
-    );
-    rememberSentKind(chatId, sentId, 'media');
-    yield* sendFollowUp(chatId, messageThreadId, rest);
-    return sentId;
-  }
-
-  // Multiple files → sequential sendDocument. Telegram's media group API
-  // requires 2–10 items AND forbids mixing photos/videos with
-  // documents/audios, so falling back to sequential docs is the most
+  // One file goes out as its own kind. Several go as sequential documents:
+  // Telegram's media group API requires 2-10 items AND forbids mixing
+  // photos/videos with documents/audios, so sequential docs is the most
   // permissive path for arbitrary attachment bundles. For an opinionated
   // media group callers should use the `send_media_group` operation.
-  let lastId: number | undefined;
+  let lastId: string | undefined;
   for (const [index, file] of files.entries()) {
-    const input = new InputFile(file.data, file.filename);
-    const captionHere = index === 0 ? caption : undefined;
-    const sent = yield* sendReplying(index, reply, (replyParameters) =>
-      Effect.tryPromise({
-        try: () =>
-          bot.api.sendDocument(chatId, input, {
-            caption: captionHere?.text,
-            caption_entities: captionHere?.entities,
-            message_thread_id: messageThreadId,
-            reply_parameters: replyParameters,
-          }),
-        catch: (err) => mapGrammyError(err, 'sendDocument', String(chatId)),
-      }),
+    const kind = files.length === 1 ? mediaKindFromFilename(file.filename) : 'document';
+    lastId = yield* sendReplying(index, reply, (replyParameters) =>
+      sendSingleFile(bot, chatId, kind, file, index === 0 ? caption : undefined, messageThreadId, replyParameters),
     );
-    rememberSentKind(chatId, sent.message_id, 'media');
-    lastId = sent.message_id;
+    rememberSentKind(chatId, lastId, 'media');
   }
   yield* sendFollowUp(chatId, messageThreadId, rest);
-  return lastId != null ? String(lastId) : undefined;
+  return lastId;
 });
 
 /** Telegram's answer to `editMessageText` on a message that has a caption instead of text. */
 const NO_TEXT_TO_EDIT_RE = /no text in the message/i;
+
+/** Telegram's answer to an edit that changes nothing: the edit already holds. */
+const NOT_MODIFIED_RE = /message is not modified/i;
+
+/** An edit that already holds (a repeat, or a host retry after it landed) is a success. */
+const tolerateNotModified = <R>(
+  edit: Effect.Effect<unknown, GrammyDeliveryError, R>,
+): Effect.Effect<void, GrammyDeliveryError, R> =>
+  edit.pipe(
+    Effect.asVoid,
+    Effect.catchTag('GrammyApiError', (err) =>
+      NOT_MODIFIED_RE.test(err.description) ? Effect.void : Effect.fail(err),
+    ),
+  );
 
 /** Edit a text message's body; returns the chunks that did not fit. */
 const editTextBody = (
@@ -417,12 +405,14 @@ const editTextBody = (
     const { bot } = yield* BotService;
     const [head, ...rest] = splitForBody(fs);
     if (!head) return [];
-    const edit = (plain: boolean) =>
-      Effect.tryPromise({
-        try: () => bot.api.editMessageText(chatId, messageId, head.text, plain ? {} : { entities: head.entities }),
-        catch: (err) => mapGrammyError(err, plain ? 'editMessageText-plain' : 'editMessageText', String(chatId)),
-      }).pipe(Effect.asVoid);
-    yield* sendWithFallback<void>(edit(false), () => edit(true));
+    yield* sendWithFallback((plain) =>
+      tolerateNotModified(
+        Effect.tryPromise({
+          try: () => bot.api.editMessageText(chatId, messageId, head.text, plain ? {} : { entities: head.entities }),
+          catch: (err) => mapGrammyError(err, plain ? 'editMessageText-plain' : 'editMessageText', String(chatId)),
+        }),
+      ),
+    );
     return rest;
   });
 
@@ -435,27 +425,46 @@ const editCaptionBody = (
   Effect.gen(function* () {
     const { bot } = yield* BotService;
     const { caption, rest } = splitCaption(fs);
-    const edit = (plain: boolean) =>
-      Effect.tryPromise({
-        try: () =>
-          bot.api.editMessageCaption(chatId, messageId, {
-            caption: caption?.text ?? '',
-            ...(plain ? {} : { caption_entities: caption?.entities }),
-          }),
-        catch: (err) => mapGrammyError(err, plain ? 'editMessageCaption-plain' : 'editMessageCaption', String(chatId)),
-      }).pipe(Effect.asVoid);
-    yield* sendWithFallback<void>(edit(false), () => edit(true));
+    yield* sendWithFallback((plain) =>
+      tolerateNotModified(
+        Effect.tryPromise({
+          try: () =>
+            bot.api.editMessageCaption(chatId, messageId, {
+              caption: caption?.text ?? '',
+              ...(plain ? {} : { caption_entities: caption?.entities }),
+            }),
+          catch: (err) =>
+            mapGrammyError(err, plain ? 'editMessageCaption-plain' : 'editMessageCaption', String(chatId)),
+        }),
+      ),
+    );
     return rest;
   });
 
-/** Telegram's limit for a Rich Message's text. */
-const RICH_TEXT_LIMIT = 32768;
-
 /**
- * Whether a Telegram answer (not a lost connection) should send the content
- * down the normal path instead: a rejected Rich Message must still arrive.
+ * Whether Telegram refused the content itself (a 400, or 404 from a Bot API
+ * server without the method), so the normal path must carry it. A rate limit
+ * or server error is left to the host's retry: a 5xx does not prove the Rich
+ * Message was not created, and resending it plain could duplicate it.
  */
-const isTelegramRejection = (err: GrammyDeliveryError): boolean => err._tag !== 'GrammyNetworkError';
+const isTelegramRejection = (err: GrammyDeliveryError): boolean =>
+  err._tag === 'GrammyEntityError' ||
+  err._tag === 'GrammyQuoteError' ||
+  (err._tag === 'GrammyApiError' && (err.errorCode === 400 || err.errorCode === 404));
+
+/** On a Telegram rejection of the rich form, log it and take the normal path instead. */
+const onRejection =
+  <B, R2>(what: string, fallback: Effect.Effect<B, GrammyDeliveryError, R2>) =>
+  <A, R>(rich: Effect.Effect<A, GrammyDeliveryError, R>): Effect.Effect<A | B, GrammyDeliveryError, R | R2> =>
+    rich.pipe(
+      Effect.catch((err) =>
+        isTelegramRejection(err)
+          ? Effect.logWarning(`telegram-grammy: ${what} rejected, using a normal message`, err).pipe(
+              Effect.andThen(fallback),
+            )
+          : Effect.fail(err),
+      ),
+    );
 
 /**
  * Send the agent's markdown as a Rich Message (Bot API 10.1+): real tables,
@@ -468,7 +477,7 @@ const sendRich = Effect.fn('telegram-grammy.sendRich')(function* (
   markdown: string,
   reply: ReplyParameters | undefined,
 ) {
-  if (markdown.length > RICH_TEXT_LIMIT) {
+  if (markdown.length > TELEGRAM_RICH_TEXT_LIMIT) {
     yield* Effect.logWarning('telegram-grammy: rich message over the limit, sending it as a normal message', {
       chatId,
       length: markdown.length,
@@ -491,13 +500,7 @@ const sendRich = Effect.fn('telegram-grammy.sendRich')(function* (
       rememberSentKind(chatId, sent.message_id, 'rich');
       return String(sent.message_id);
     }),
-    Effect.catch((err) =>
-      isTelegramRejection(err)
-        ? Effect.logWarning('telegram-grammy: rich message rejected, sending it as a normal message', err).pipe(
-            Effect.andThen(sendDefault(chatId, messageThreadId, markdown, [], reply)),
-          )
-        : Effect.fail(err),
-    ),
+    onRejection('rich message', sendDefault(chatId, messageThreadId, markdown, [], reply)),
   );
 });
 
@@ -511,27 +514,21 @@ const editRich = (
   markdown: string,
 ): Effect.Effect<boolean, GrammyDeliveryError, BotService> =>
   Effect.gen(function* () {
-    if (markdown.length > RICH_TEXT_LIMIT) return false;
+    if (markdown.length > TELEGRAM_RICH_TEXT_LIMIT) return false;
     const { bot } = yield* BotService;
-    return yield* Effect.tryPromise({
-      try: () => bot.api.editMessageText(chatId, messageId, { markdown }),
-      catch: (err) => mapGrammyError(err, 'editMessageText-rich', String(chatId)),
-    }).pipe(
-      Effect.as(true),
-      Effect.catch((err) =>
-        isTelegramRejection(err)
-          ? Effect.logWarning('telegram-grammy: rich edit rejected, editing as a normal message', err).pipe(
-              Effect.as(false),
-            )
-          : Effect.fail(err),
-      ),
-    );
+    return yield* tolerateNotModified(
+      Effect.tryPromise({
+        try: () => bot.api.editMessageText(chatId, messageId, { markdown }),
+        catch: (err) => mapGrammyError(err, 'editMessageText-rich', String(chatId)),
+      }),
+    ).pipe(Effect.as(true), onRejection('rich edit', Effect.succeed(false)));
   });
 
 /**
- * Edit a message the bot sent. A Rich Message is edited in the rich form. A media message gets its caption edited (known
- * from what was sent, or learned from Telegram's "no text" answer). Text
- * beyond the message's limit is sent right after as new messages.
+ * Edit a message the bot sent. A Rich Message is edited in the rich form; a
+ * media message gets its caption edited (known from what was sent, or learned
+ * from Telegram's "no text" answer). Text beyond the message's limit is sent
+ * right after as new messages, so each long edit appends a fresh tail.
  */
 const editMessage = Effect.fn('telegram-grammy.editMessage')(function* (
   chatId: number,
@@ -544,7 +541,7 @@ const editMessage = Effect.fn('telegram-grammy.editMessage')(function* (
     yield* Effect.logError('telegram-grammy: edit with invalid compound id', { compound });
     return undefined;
   }
-  const kind = sentKindOf(parsed.chatId, parsed.messageId);
+  const kind = sentKinds.get(parsed.chatId, parsed.messageId);
   if (kind === 'rich' && (yield* editRich(parsed.chatId, parsed.messageId, text))) return undefined;
   const fs = renderFS(text);
   const rest =
@@ -605,13 +602,32 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
 });
 
 type AlbumInput = InputMediaPhoto | InputMediaVideo | InputMediaAudio | InputMediaDocument;
+type AlbumItem = { file: OutboundFile; kind: MediaKind; caption: FormattedString | undefined };
+
+/** The `sendMediaGroup` entry for one item; only here are videos probed for their dimensions. */
+const albumInput = ({ file, kind, caption }: AlbumItem): Effect.Effect<AlbumInput> => {
+  const base = {
+    media: new InputFile(file.data, file.filename),
+    caption: caption?.text,
+    caption_entities: caption?.entities,
+  };
+  if (kind === 'video') {
+    return Effect.promise(() => probeMediaMeta(file.data)).pipe(
+      Effect.map((meta): AlbumInput => ({ type: 'video', supports_streaming: true, ...base, ...(meta ?? {}) })),
+    );
+  }
+  if (kind === 'photo') return Effect.succeed({ type: 'photo', ...base });
+  if (kind === 'audio') return Effect.succeed({ type: 'audio', ...base });
+  return Effect.succeed({ type: 'document', ...base });
+};
 
 /**
  * Send 2-10 files as an album. Each item keeps its own caption, and caption
  * text beyond Telegram's limit follows as messages. A `.gif` cannot sit in a
  * Telegram album, so it goes out as its own animation after the album. An
  * album that would mix photos/videos with documents/audio (Telegram forbids
- * it) falls back to sequential documents, each still captioned.
+ * it) falls back to sequential documents, each still captioned. Returns the
+ * album's first id, or the last document's on the sequential fallback.
  */
 const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
   chatId: number,
@@ -627,8 +643,8 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
   const { bot } = yield* BotService;
 
   const overflow: FormattedString[] = [];
-  const album: Array<{ file: OutboundFile; input: AlbumInput }> = [];
-  const animations: Array<{ file: OutboundFile; caption: FormattedString | undefined }> = [];
+  const album: AlbumItem[] = [];
+  const animations: AlbumItem[] = [];
   for (const item of items) {
     const bare = path.basename(item.path);
     const file = files.find((f) => f.filename === bare);
@@ -639,92 +655,51 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
     const { caption, rest } = item.caption ? splitCaption(renderFS(item.caption)) : { caption: undefined, rest: [] };
     overflow.push(...rest);
     const kind = mediaKindFromFilename(file.filename);
-    if (kind === 'animation') {
-      animations.push({ file, caption });
-      continue;
-    }
-    const base = {
-      media: new InputFile(file.data, file.filename),
-      caption: caption?.text,
-      caption_entities: caption?.entities,
-    };
-    if (kind === 'video') {
-      const meta = yield* Effect.promise(() => probeMediaMeta(file.data));
-      album.push({ file, input: { type: 'video', supports_streaming: true, ...base, ...(meta ?? {}) } });
-    } else if (kind === 'photo') album.push({ file, input: { type: 'photo', ...base } });
-    else if (kind === 'audio') album.push({ file, input: { type: 'audio', ...base } });
-    else album.push({ file, input: { type: 'document', ...base } });
+    (kind === 'animation' ? animations : album).push({ file, kind, caption });
+  }
+  if (album.length === 0 && animations.length === 0) {
+    yield* Effect.logError('telegram-grammy: send_media_group found none of its files; nothing sent', { items });
+    return undefined;
   }
 
   let sends = 0;
-  let firstId: string | undefined;
-  const record = (id: string | number | undefined): void => {
-    if (id === undefined) return;
-    rememberSentKind(chatId, id, 'media');
-    firstId ??= String(id);
-  };
+  let resultId: string | undefined;
+  const sendOne = (item: AlbumItem, kind: MediaKind) =>
+    sendReplying(sends++, reply, (replyParameters) =>
+      sendSingleFile(bot, chatId, kind, item.file, item.caption, messageThreadId, replyParameters),
+    ).pipe(Effect.tap((id) => Effect.sync(() => rememberSentKind(chatId, id, 'media'))));
 
-  const types = new Set(album.map((a) => a.input.type));
-  const mixed = (types.has('photo') || types.has('video')) && (types.has('document') || types.has('audio'));
+  const kinds = new Set(album.map((a) => a.kind));
+  const mixed = (kinds.has('photo') || kinds.has('video')) && (kinds.has('document') || kinds.has('audio'));
   if (album.length === 1) {
-    const [{ file, input }] = album;
-    const caption =
-      input.caption !== undefined ? new FormattedString(input.caption, input.caption_entities ?? []) : undefined;
-    record(
-      yield* sendReplying(sends++, reply, (replyParameters) =>
-        sendSingleFile(
-          bot,
-          chatId,
-          mediaKindFromFilename(file.filename),
-          file,
-          caption,
-          messageThreadId,
-          replyParameters,
-        ),
-      ),
-    );
+    resultId = yield* sendOne(album[0], album[0].kind);
   } else if (album.length > 1 && mixed) {
     yield* Effect.logWarning('telegram-grammy: media group would mix types, falling back to sequential');
-    for (const { input } of album) {
-      const sent = yield* sendReplying(sends++, reply, (replyParameters) =>
-        Effect.tryPromise({
-          try: () =>
-            bot.api.sendDocument(chatId, input.media as InputFile, {
-              caption: input.caption,
-              caption_entities: input.caption_entities,
-              message_thread_id: messageThreadId,
-              reply_parameters: replyParameters,
-            }),
-          catch: (err) => mapGrammyError(err, 'sendDocument-fallback', String(chatId)),
-        }),
-      );
-      record(sent.message_id);
-    }
+    for (const item of album) resultId = yield* sendOne(item, 'document');
   } else if (album.length > 1) {
+    const inputs = yield* Effect.forEach(album, albumInput);
     const sent = yield* sendReplying(sends++, reply, (replyParameters) =>
       Effect.tryPromise({
         // grammY 1.46 types each media-group family apart; the mixed-type check above narrows only at runtime.
         try: () =>
-          bot.api.sendMediaGroup(chatId, album.map((a) => a.input) as Parameters<typeof bot.api.sendMediaGroup>[1], {
+          bot.api.sendMediaGroup(chatId, inputs as Parameters<typeof bot.api.sendMediaGroup>[1], {
             message_thread_id: messageThreadId,
             reply_parameters: replyParameters,
           }),
         catch: (err) => mapGrammyError(err, 'sendMediaGroup', String(chatId)),
       }),
     );
-    for (const m of sent) record(m.message_id);
+    for (const m of sent) rememberSentKind(chatId, m.message_id, 'media');
+    resultId = sent.length > 0 ? String(sent[0].message_id) : undefined;
   }
 
-  for (const { file, caption } of animations) {
-    record(
-      yield* sendReplying(sends++, reply, (replyParameters) =>
-        sendSingleFile(bot, chatId, 'animation', file, caption, messageThreadId, replyParameters),
-      ),
-    );
+  for (const item of animations) {
+    if (resultId === undefined) resultId = yield* sendOne(item, 'animation');
+    else yield* afterFirstSend('album animation', sendOne(item, 'animation'));
   }
 
   yield* sendFollowUp(chatId, messageThreadId, overflow);
-  return firstId;
+  return resultId;
 });
 
 const sendAskQuestion = Effect.fn('telegram-grammy.sendAskQuestion')(function* (
