@@ -445,7 +445,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     // is_group follows the file-wide convention: 0 means DM, anything else
     // (1 or a legacy NULL row) is a group — `=== 1` skipped real groups.
     if (ruleEngages && accessOk && scopeOk && !isMention && mg.is_group !== 0) {
-      const gated = await runJevGate({ agent, mg, event, threadId: effectiveThreadId });
+      const gated = await runJevGate({ agent, mg, event, threadId: effectiveThreadId, agentName: agentGroup.name });
       if (gated) {
         deliveryEvent = gated.event;
         if (gated.silence) engages = false;
