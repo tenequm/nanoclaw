@@ -89,7 +89,6 @@ describe('claude provider project document', () => {
   // The document must teach the skills the runner links, forced gateway skills
   // included, not the raw stored selection (here empty).
   it('composes with the resolved skill list, gateway skill included', async () => {
-    delete process.env[KEY];
     const { getGatewayProvider, resetGatewayProvider } = await import('../gateway-providers/index.js');
     resetGatewayProvider({ ...getGatewayProvider(), kind: 'fixture-gateway', agentSkills: ['fixture-gateway'] });
     await claudeEnv();

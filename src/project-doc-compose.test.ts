@@ -41,7 +41,7 @@ import {
   type ProjectDocSpec,
 } from './project-doc-compose.js';
 import type { AgentGroup } from './types.js';
-// Side-effect imports: the host modules whose per-agent registrations are under test.
+// Loading these modules registers the per-agent sections and skill gates under test.
 import { resetGateConfigCache, writeGateEntry } from './modules/jev-gate/index.js';
 import './channels/voice-mode.js';
 
@@ -69,12 +69,15 @@ function writePersona(folder: string, text: string): void {
   fs.writeFileSync(path.join(groupDirOf(folder), PERSONA_PREPEND_FILE), text);
 }
 
-async function compose(ag: AgentGroup, spec: ProjectDocSpec = CLAUDE_SPEC): Promise<string> {
-  await composeGroupProjectDoc(ag, groupDirOf(ag.folder), spec);
+async function compose(
+  ag: AgentGroup,
+  spec: ProjectDocSpec = CLAUDE_SPEC,
+  runtimeSkills?: readonly string[],
+): Promise<string> {
+  await composeGroupProjectDoc(ag, groupDirOf(ag.folder), spec, runtimeSkills);
   return fs.readFileSync(path.join(groupDirOf(ag.folder), spec.fileName), 'utf-8');
 }
 
-/** Run `fn` with cwd at a root whose `container/` is the real tree, shipped skills included. */
 async function withRealContainer<T>(fn: () => Promise<T>): Promise<T> {
   const root = fs.mkdtempSync(path.join(TEST_ROOT, 'real-skills-'));
   fs.mkdirSync(path.join(root, 'container'));
@@ -351,8 +354,7 @@ describe('composeGroupProjectDoc skill selection', () => {
     const ag = await seed('ag-forced', 'forced-group');
     await updateContainerConfigJson(ag.id, 'skills', ['welcome']);
 
-    await composeGroupProjectDoc(ag, groupDirOf(ag.folder), CLAUDE_SPEC, ['welcome', 'fixture-gateway']);
-    const doc = fs.readFileSync(path.join(groupDirOf(ag.folder), 'CLAUDE.md'), 'utf-8');
+    const doc = await compose(ag, CLAUDE_SPEC, ['welcome', 'fixture-gateway']);
 
     expect(doc).toContain('# NanoClaw Skill: fixture-gateway');
     expect(doc).toContain('Fixture credential guidance.');
@@ -360,8 +362,8 @@ describe('composeGroupProjectDoc skill selection', () => {
 });
 
 describe('composeGroupProjectDoc per-agent sections', () => {
-  const JEV_HEADING = '# NanoClaw Module: jev-gate';
-  const VOICE_HEADING = '# NanoClaw Skill: voice-mode-formatting';
+  const JEV_SECTION = 'NanoClaw Module: jev-gate';
+  const VOICE_SECTION = 'NanoClaw Skill: voice-mode-formatting';
 
   beforeEach(() => {
     fs.mkdirSync(path.join(TEST_ROOT, 'data'), { recursive: true });
@@ -401,21 +403,21 @@ describe('composeGroupProjectDoc per-agent sections', () => {
 
     const doc = await compose(ag);
 
-    expect(composedSection(doc, 'NanoClaw Module: jev-gate')).toContain('A gate wake is an invitation, not an order');
+    expect(composedSection(doc, JEV_SECTION)).toContain('A gate wake is an invitation, not an order');
   });
 
   // Shadow silences every ambient message, so the note's "the gate wakes you" would be false.
   it.each([
-    ['no entry', undefined],
-    ['a disabled entry', { enabled: false, mode: 'live' as const }],
-    ['a shadow entry', { enabled: true, mode: 'shadow' as const }],
-  ])('leaves the jev-gate note out with %s', async (_label, entry) => {
-    const ag = await seed(`ag-jev-${_label.length}`, `jev-off-${_label.length}`);
+    ['no entry', 'none', undefined],
+    ['a disabled entry', 'disabled', { enabled: false, mode: 'live' as const }],
+    ['a shadow entry', 'shadow', { enabled: true, mode: 'shadow' as const }],
+  ])('leaves the jev-gate note out with %s', async (_label, key, entry) => {
+    const ag = await seed(`ag-jev-${key}`, `jev-off-${key}`);
     if (entry) writeGateEntry(ag.id, entry);
 
     const doc = await compose(ag);
 
-    expect(doc).not.toContain(JEV_HEADING);
+    expect(doc).not.toContain(`# ${JEV_SECTION}`);
   });
 
   it('composes voice-mode-formatting for an agent with a voice-mode line', async () => {
@@ -430,7 +432,7 @@ describe('composeGroupProjectDoc per-agent sections', () => {
 
     const doc = await withRealContainer(() => compose(ag));
 
-    expect(composedSection(doc, 'NanoClaw Skill: voice-mode-formatting')).toContain(realSkill('voice-mode-formatting'));
+    expect(composedSection(doc, VOICE_SECTION)).toContain(realSkill('voice-mode-formatting'));
   });
 
   it('composes voice-mode-formatting for an agent with a line from before the rename', async () => {
@@ -439,7 +441,7 @@ describe('composeGroupProjectDoc per-agent sections', () => {
 
     const doc = await withRealContainer(() => compose(ag));
 
-    expect(doc).toContain(VOICE_HEADING);
+    expect(doc).toContain(`# ${VOICE_SECTION}`);
   });
 
   it('leaves voice-mode-formatting out for a non-voice agent on the "all" selection', async () => {
@@ -450,7 +452,7 @@ describe('composeGroupProjectDoc per-agent sections', () => {
 
     // Proves the walk ran on the real tree at "all": the ungated resident skill is there.
     expect(doc).toContain('# NanoClaw Skill: onecli-gateway');
-    expect(doc).not.toContain(VOICE_HEADING);
+    expect(doc).not.toContain(`# ${VOICE_SECTION}`);
   });
 });
 
