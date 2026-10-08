@@ -1,5 +1,7 @@
 import fs from 'fs';
 
+import { getAgentMailbox, type AgentMailbox } from './mailbox/index.js';
+
 const DEFAULT_HEARTBEAT_PATH = '/workspace/.heartbeat';
 
 /**
@@ -12,7 +14,16 @@ export function heartbeatPath(): string {
   return process.env.NANOCLAW_HEARTBEAT_PATH || DEFAULT_HEARTBEAT_PATH;
 }
 
+function registeredMailbox(): AgentMailbox | undefined {
+  try {
+    return getAgentMailbox();
+  } catch {
+    return undefined; // no composition loaded (unit tests importing this module alone)
+  }
+}
+
 export function touchHeartbeat(): void {
+  if (registeredMailbox()?.heartbeat?.()) return;
   const heartbeat = heartbeatPath();
   const now = new Date();
   try {

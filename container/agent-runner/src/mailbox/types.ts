@@ -79,6 +79,12 @@ export interface AgentMailbox {
   readonly operations: MailboxOperations;
   /** True when repeated read failures require a fresh runner process. */
   shouldRestartAfter?(error: unknown): boolean;
+  /**
+   * Carry the liveness heartbeat for a mailbox whose host cannot see the
+   * runner's filesystem. True when handled; absent or false means the caller
+   * touches the heartbeat file itself.
+   */
+  heartbeat?(): boolean;
   /** Null only during runner-before-host upgrades; implementations that need context must reject it explicitly. */
   start(key: MailboxSessionKey | null): Promise<void>;
   run<T>(action: () => T | Promise<T>): Promise<T>;
