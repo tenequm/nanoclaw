@@ -371,6 +371,7 @@ describe('composeGroupProjectDoc skill selection', () => {
 describe('composeGroupProjectDoc per-agent sections', () => {
   const JEV_SECTION = 'NanoClaw Module: jev-gate';
   const VOICE_SECTION = 'NanoClaw Skill: voice-mode-formatting';
+  const TG_FORMAT_SECTION = 'NanoClaw Skill: telegram-formatting';
   const SLACK_ONLY_MODULES = ['canvas', 'create-agent-slack', 'rooms'];
 
   beforeEach(() => {
@@ -470,6 +471,20 @@ describe('composeGroupProjectDoc per-agent sections', () => {
 
     expect(doc).toContain('# NanoClaw Module: core');
     for (const name of SLACK_ONLY_MODULES) expect(doc).not.toContain(`# NanoClaw Module: ${name}\n`);
+  });
+
+  it('composes telegram-formatting only for a Telegram-wired agent', async () => {
+    const tg = await seed('ag-tg-fmt', 'tg-fmt-group');
+    await wire(tg, 'mg-tg-fmt', 'telegram');
+    expect(composedSection(await withRealContainer(() => compose(tg)), TG_FORMAT_SECTION)).toContain(
+      realSkill('telegram-formatting'),
+    );
+
+    const slack = await seed('ag-slack-fmt', 'slack-fmt-group');
+    await wire(slack, 'mg-slack-fmt', 'slack');
+    const doc = await withRealContainer(() => compose(slack));
+    expect(doc).toContain('# NanoClaw Skill: onecli-gateway');
+    expect(doc).not.toContain(`# ${TG_FORMAT_SECTION}`);
   });
 
   it('composes the Rich Messages section only for a Telegram-wired agent with rich_messages on', async () => {

@@ -1,12 +1,13 @@
 /**
- * Telegram prose for the agents' composed project documents.
+ * Telegram prose for the agents' composed project documents: the
+ * telegram-formatting skill's gate and the Rich messages section.
  *
  * Kept apart from the adapter so composing a document never loads grammY: the
  * section and its gate are pure DB reads, registered at import time.
  */
 import { getContainerConfig } from '../../db/container-configs.js';
 import { isAgentWiredToChannel } from '../../db/messaging-groups.js';
-import { registerProjectDocSection } from '../../project-doc-compose.js';
+import { registerProjectDocSection, registerResidentSkillGate } from '../../project-doc-compose.js';
 import type { AgentGroup } from '../../types.js';
 
 const CHANNEL_TYPE = 'telegram';
@@ -27,3 +28,6 @@ export async function richMessagesSection(group: AgentGroup): Promise<{ name: st
 }
 
 registerProjectDocSection(richMessagesSection);
+
+// The formatting guide teaches Telegram's rendering, so only Telegram-wired agents get it.
+registerResidentSkillGate('telegram-formatting', (group) => isAgentWiredToChannel(group.id, CHANNEL_TYPE));

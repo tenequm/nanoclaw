@@ -9,6 +9,9 @@
  * the Telegram dialect deviations from CommonMark hold, and that
  * chunked output preserves entity offsets across slice boundaries.
  */
+import fs from 'fs';
+import path from 'path';
+
 import { describe, expect, it } from 'vitest';
 import { FormattedString } from '@grammyjs/parse-mode';
 
@@ -466,5 +469,55 @@ describe('splitForBody', () => {
         expect(entity.offset + entity.length).toBeLessThanOrEqual(chunk.text.length);
       }
     }
+  });
+});
+
+/**
+ * The telegram-formatting skill tells agents what renders. Every syntax it
+ * teaches is named here with the entity it must produce, and must still be in
+ * the guide, so the two cannot drift apart.
+ */
+describe('telegram-formatting guide renders as it says', () => {
+  const guide = fs.readFileSync(
+    path.join(process.cwd(), 'container', 'skills', 'telegram-formatting', 'instructions.md'),
+    'utf-8',
+  );
+  const entityTypes = (md: string): string[] => renderFS(md).entities.map((e) => e.type);
+
+  it.each([
+    ['**bold**', '**bold**', 'bold'],
+    ['_italic_', '_italic_', 'italic'],
+    ['__underline__', '__underline__', 'underline'],
+    ['~~strike~~', '~~strike~~', 'strikethrough'],
+    ['||spoiler||', '||spoiler||', 'spoiler'],
+    ['`code`', '`code`', 'code'],
+    ['fenced code with a language', '```ts\nconst x = 1\n```', 'pre'],
+    ['[label](https://...)', '[label](https://example.com)', 'text_link'],
+    ['> quote', '> quote', 'blockquote'],
+    ['[Name](tg://user?id=123)', '[Name](tg://user?id=123)', 'text_link'],
+    ['> [!fold]', '> [!fold]\n> long log', 'expandable_blockquote'],
+    [
+      '[Fri 15:00](tg://time?unix=1792162800&format=wDT)',
+      '[Fri 15:00](tg://time?unix=1792162800&format=wDT)',
+      'date_time',
+    ],
+    ['`format=r`', '[soon](tg://time?unix=1792162800&format=r)', 'date_time'],
+    ['`*x*` renders bold', '*x*', 'bold'],
+    ['italic as `_x_`', '_x_', 'italic'],
+  ])('%s', (taught, markdown, entity) => {
+    expect(guide).toContain(taught);
+    expect(entityTypes(markdown)).toContain(entity);
+  });
+
+  it('nested lists and task items', () => {
+    expect(guide).toContain('nested lists');
+    expect(guide).toContain('`- [ ]` / `- [x]` tasks');
+    expect(renderFS('- [ ] a\n- [x] b\n  - c').text).toBe('\u2610 a\n\u2611 b\n\u00A0\u00A0\u25E6 c');
+  });
+
+  it('degrades headings to bold and images to links, as it warns', () => {
+    expect(guide).toContain('headings become bold lines');
+    expect(entityTypes('# Title')).toEqual(['bold']);
+    expect(entityTypes('![chart](https://example.com/c.png)')).toEqual(['text_link']);
   });
 });
