@@ -132,3 +132,59 @@ export async function updateContainerConfigJson(
 export async function deleteContainerConfig(agentGroupId: string): Promise<void> {
   await getDb().run('DELETE FROM container_configs WHERE agent_group_id = ?', agentGroupId);
 }
+
+/**
+ * The group's configured session runtime kind, or undefined for "the install
+ * default". A missing config row is the default too: spawn materializes the
+ * row, and a group that has none has never been moved off the default.
+ */
+export async function getContainerConfigDriver(agentGroupId: string): Promise<string | undefined> {
+  const row = await getDb().get<{ driver: string | null }>(
+    'SELECT driver FROM container_configs WHERE agent_group_id = ?',
+    agentGroupId,
+  );
+  return row?.driver || undefined;
+}
+
+/**
+ * Set (or clear, with null) a group's runtime kind and record it as used. The
+ * caller owns the refusal rules (registered kind, no live or retained objects
+ * on the old driver); this only writes.
+ */
+export async function setContainerConfigDriver(agentGroupId: string, driver: string | null): Promise<void> {
+  await getDb().run(
+    'UPDATE container_configs SET driver = ?, updated_at = ? WHERE agent_group_id = ?',
+    driver,
+    new Date().toISOString(),
+    agentGroupId,
+  );
+  if (driver) await recordDriverKindsUsed([driver]);
+}
+
+/** Add kinds to the kinds-ever-used record (migration 029). Never removes. */
+export async function recordDriverKindsUsed(kinds: readonly string[]): Promise<void> {
+  const now = new Date().toISOString();
+  for (const kind of new Set(kinds.filter(Boolean))) {
+    await getDb().run(
+      'INSERT INTO runtime_driver_kinds (kind, first_used_at) VALUES (?, ?) ON CONFLICT (kind) DO NOTHING',
+      kind,
+      now,
+    );
+  }
+}
+
+/** Every kind this install has ever configured, oldest first. */
+export async function listDriverKindsUsed(): Promise<string[]> {
+  const rows = await getDb().all<{ kind: string }>(
+    'SELECT kind FROM runtime_driver_kinds ORDER BY first_used_at, kind',
+  );
+  return rows.map((row) => row.kind);
+}
+
+/** Every kind a group's config row names today (distinct, non-null). */
+export async function listConfiguredDriverKinds(): Promise<string[]> {
+  const rows = await getDb().all<{ driver: string }>(
+    "SELECT DISTINCT driver FROM container_configs WHERE driver IS NOT NULL AND driver <> ''",
+  );
+  return rows.map((row) => row.driver);
+}
