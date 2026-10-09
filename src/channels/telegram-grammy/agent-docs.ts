@@ -39,7 +39,7 @@ export const RICH_MESSAGES_SECTION = 'Rich messages';
 
 export const RICH_MESSAGES_BODY = [
   'On Telegram, `send_message` takes `rich: true` to send a Rich Message. Telegram then renders real tables, headings (`#`), nested and task lists (`- [ ]`, `- [x]`) and collapsible `<details><summary>Title</summary>...</details>` blocks, up to 32768 characters in one message.',
-  'Use it when structure carries the meaning: a table, a structured report, a long reference text. Keep normal chat plain, without `rich`: a plain message renders on every client, and readers can quote-reply a part of it, which a Rich Message does not allow.',
+  'This is a capability, off by default: messages go out normally unless you set `rich: true`. Consider it when the content truly needs structure that a normal message cannot carry well, such as a real table or a long structured report, and set it on that one message.',
   'A Rich Message reads standard markdown, so a single line break joins two lines into one paragraph; leave a blank line between lines you want apart. `**bold**` and `_italic_` mean the same in both kinds of message. If Telegram refuses a Rich Message it goes out as a normal message, so the text still arrives.',
 ].join('\n\n');
 
