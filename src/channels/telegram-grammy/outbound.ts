@@ -411,7 +411,6 @@ const tolerateNotModified = <R>(
     ),
   );
 
-/** Edit a text message's body; returns the chunks that did not fit. */
 const editTextBody = (
   chatId: number,
   messageId: number,
@@ -432,7 +431,6 @@ const editTextBody = (
     return rest;
   });
 
-/** Edit a media message's caption; returns the chunks that did not fit. */
 const editCaptionBody = (
   chatId: number,
   messageId: number,
@@ -467,7 +465,6 @@ const isTelegramRejection = (err: GrammyDeliveryError): boolean =>
   err._tag === 'GrammyEntityError' ||
   (err._tag === 'GrammyApiError' && (err.errorCode === 400 || err.errorCode === 404));
 
-/** On a Telegram rejection of the rich form, log it and take the normal path instead. */
 const onRejection =
   <B, R2>(what: string, fallback: Effect.Effect<B, GrammyDeliveryError, R2>) =>
   <A, R>(rich: Effect.Effect<A, GrammyDeliveryError, R>): Effect.Effect<A | B, GrammyDeliveryError, R | R2> =>
@@ -705,7 +702,7 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
   const mixed = (kinds.has('photo') || kinds.has('video')) && (kinds.has('document') || kinds.has('audio'));
   if (album.length === 1) {
     resultId = yield* sendOne(album[0], album[0].kind);
-  } else if (album.length > 1 && mixed) {
+  } else if (mixed) {
     yield* Effect.logWarning('telegram-grammy: media group would mix types, falling back to sequential');
     for (const [index, item] of album.entries()) {
       const send = sendOne(item, 'document').pipe(

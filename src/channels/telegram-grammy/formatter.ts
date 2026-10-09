@@ -77,6 +77,7 @@ export const TELEGRAM_RICH_TEXT_LIMIT = 32768;
 
 const EMPTY = (): FormattedString => new FormattedString('');
 const PLAIN = (s: string): FormattedString => new FormattedString(s);
+const DIVIDER = '\u2500'.repeat(8);
 const NL = (): FormattedString => new FormattedString('\n');
 const NL2 = (): FormattedString => new FormattedString('\n\n');
 
@@ -281,7 +282,6 @@ function renderChildren(children: readonly RenderableNode[]): FormattedString {
 const BULLETS = ['\u2022', '\u25E6', '\u25AA'] as const;
 const TASK_OPEN = '\u2610';
 const TASK_DONE = '\u2611';
-const DIVIDER = '\u2500'.repeat(8);
 /** Telegram keeps leading spaces only unreliably across clients; NBSP always survives. */
 const INDENT_UNIT = '\u00A0';
 
@@ -312,7 +312,6 @@ function renderList(node: MdList, indent: string, depth: number): FormattedStrin
   return joinFs(items, NL());
 }
 
-/** Prefix every line of `fs` (but the first, when `skipFirst`) with `prefix`, keeping entities. */
 function indentContinuationLines(fs: FormattedString, prefix: string, skipFirst: boolean): FormattedString {
   const text = fs.rawText;
   const lines: FormattedString[] = [];

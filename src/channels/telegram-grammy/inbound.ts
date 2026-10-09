@@ -338,7 +338,6 @@ function renderRichText(text: RichText): string {
   }
 }
 
-/** Whether a rich message @mentions the bot (by username or as a text mention). */
 function richMentions(rich: RichMessage, botUsername: string | null, botUserId: number | null): boolean {
   const username = botUsername?.toLowerCase();
   const inText = (text: RichText): boolean => {

@@ -35,8 +35,7 @@ export interface BuildKeyboardResult {
  *
  * Telegram doesn't auto-wrap long rows; we give each option its own row so
  * long labels render consistently across mobile/desktop. If a consumer
- * wants side-by-side buttons, they can batch options in the payload. An
- * option's `style` colours its button.
+ * wants side-by-side buttons, they can batch options in the payload.
  */
 export function buildAskQuestionKeyboard(
   questionId: string,
