@@ -830,6 +830,39 @@ describe('composition on the spawn path', () => {
     );
   });
 
+  it("refuses a group folder named 'v2-sessions': it would alias the group's session state on the volume", async () => {
+    await getDb().run("UPDATE agent_groups SET folder = 'v2-sessions' WHERE id = ?", GROUP_ID);
+    try {
+      const row = await createGroupSession();
+      expect(await wakeAndRefusal(row)).toMatch(
+        /spec-invalid: group folder 'v2-sessions' .*overlaps the session state at 'v2-sessions\/ag-driver-selection'/,
+      );
+      expect(groupVolume.prepared).toHaveLength(0);
+    } finally {
+      fs.rmSync(path.join(GROUPS_DIR, 'v2-sessions'), { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an unpinnable image before the gateway allocates anything for the session', async () => {
+    const ensure = vi.fn(async () => ({
+      contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' as const } } },
+    }));
+    resetGatewayProvider({
+      kind: 'counting-gateway',
+      agentSkills: [],
+      sessions: { ensure },
+      approvals: { subscribe: async () => {} },
+    });
+    try {
+      await updateContainerConfigScalars(GROUP_ID, { image_tag: 'ghcr.io/x/agent:latest' });
+      const row = await createGroupSession();
+      expect(await wakeAndRefusal(row)).toMatch(/spec-invalid: .*:latest/);
+      expect(ensure).not.toHaveBeenCalled();
+    } finally {
+      resetGatewayProvider(null);
+    }
+  });
+
   describe('runtime availability', () => {
     const reapOrphans = vi.fn(async () => {});
 
@@ -1214,5 +1247,25 @@ describe('adaptSpecToDriver', () => {
     const spec = fixtureSpec();
     spec.containers[0].image = 'registry:5000/agent';
     expect(() => adaptSpecToDriver(spec, caps, context)).toThrow(/untagged/);
+  });
+
+  it('accepts a digest only in the syntax the surface image needs: @sha256 and 64 lowercase hex', () => {
+    const caps = { ...HOST_BIND_CAPABILITIES, pinnedImages: true };
+    const digest = 'a'.repeat(64);
+    for (const image of [`ghcr.io/x/agent@sha256:${digest}`, `ghcr.io/x/agent:v1@sha256:${digest}`]) {
+      const spec = fixtureSpec();
+      spec.containers[0].image = image;
+      expect(() => adaptSpecToDriver(spec, caps, context)).not.toThrow();
+    }
+    for (const image of [
+      'ghcr.io/x/agent@sha256:abc',
+      `ghcr.io/x/agent@sha256:${'a'.repeat(63)}`,
+      `ghcr.io/x/agent@md5:${digest}`,
+      'agent@',
+    ]) {
+      const spec = fixtureSpec();
+      spec.containers[0].image = image;
+      expect(() => adaptSpecToDriver(spec, caps, context)).toThrow(/not a valid digest reference/);
+    }
   });
 });

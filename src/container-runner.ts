@@ -640,6 +640,14 @@ async function spawnOnDriver(
   });
   const mailboxEnvironment = await mailbox.runnerEnvironment(mailboxKey);
 
+  // The image refusals are permanent, so they land before the gateway
+  // allocates anything for a session that can never start (composition below
+  // re-checks the composed spec).
+  if (capabilities.pinnedImages) {
+    assertPinnedImage(containerConfig.imageTag || CONTAINER_IMAGE, { driverKind: driver.kind, agentGroup });
+  }
+  if (capabilities.imageCarriedSurfaces) resolveSurfaceImage();
+
   const key = { installSlug: INSTALL_SLUG, agentGroupId: agentGroup.id, sessionId: session.id };
   // Core calls the same idempotent provider operation for new and surviving
   // sessions. The returned typed contribution enters driver validation whole.
@@ -2209,6 +2217,9 @@ const SURFACE_IMAGE_MOUNTS: SurfaceImage['mounts'] = [
 /** Install setting: the digest-pinned surface image an image-carried-surfaces driver mounts; unset = baked mode. */
 const SURFACE_IMAGE_SETTING = 'NANOCLAW_SURFACE_IMAGE';
 
+/** A digest-pinned image reference: `<repo>@sha256:<64 lowercase hex>`. */
+const DIGEST_REFERENCE = /@sha256:[0-9a-f]{64}$/;
+
 export interface DriverCompositionContext {
   driverKind: string;
   provider: string;
@@ -2262,8 +2273,34 @@ export function adaptSpecToDriver(
       context.selectedSkills(),
       policy.dataRoot,
     );
+    assertFolderClearOfSessionState(context, spec);
   }
   return spec;
+}
+
+/**
+ * The subPath rule maps two host roots onto one group volume, root-relative:
+ * the group folder lands at `<folder>`, session and provider state under
+ * `v2-sessions/<group>/...`. A folder whose subPath equals, contains or sits
+ * inside one of those (a folder named `v2-sessions`) would alias the group's
+ * own session state on the volume, so it refuses by name rather than
+ * silently losing the separation the host roots give.
+ */
+function assertFolderClearOfSessionState(context: DriverCompositionContext, spec: SessionSpec): void {
+  const folder = path.posix.normalize(context.agentGroup.folder);
+  const stateSubPaths = [
+    path.posix.join('v2-sessions', spec.key.agentGroupId),
+    ...(spec.providerState ?? []).map((init) => init.subPath),
+  ];
+  const overlaps = (a: string, b: string) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+  const clash = stateSubPaths.find((subPath) => overlaps(folder, subPath));
+  if (clash !== undefined) {
+    throw specInvalid(
+      `group folder '${context.agentGroup.folder}' cannot run on driver '${context.driverKind}' (storage ` +
+        `'group-volume'): on the group volume its subPath '${folder}' overlaps the session state at '${clash}' — ` +
+        'rename the group folder',
+    );
+  }
 }
 
 /**
@@ -2271,7 +2308,7 @@ export function adaptSpecToDriver(
  * pre-imported image (`:latest` means pull-always), and the install's local
  * default image exists only in the host's own image store.
  */
-function assertPinnedImage(image: string, context: DriverCompositionContext): void {
+function assertPinnedImage(image: string, context: Pick<DriverCompositionContext, 'driverKind' | 'agentGroup'>): void {
   const why = `driver '${context.driverKind}' pulls by reference (pinnedImages)`;
   if (image === CONTAINER_IMAGE) {
     throw specInvalid(
@@ -2279,7 +2316,13 @@ function assertPinnedImage(image: string, context: DriverCompositionContext): vo
         "cannot use — pin the group's imageTag to a pushed or pre-imported reference (by digest, or a non-latest tag)",
     );
   }
-  if (image.includes('@')) return;
+  if (image.includes('@')) {
+    if (DIGEST_REFERENCE.test(image)) return;
+    throw specInvalid(
+      `group '${context.agentGroup.folder}' image '${image}' is not a valid digest reference ` +
+        '(<repo>@sha256:<64 hex>), which a driver that pulls by reference needs to pin',
+    );
+  }
   const lastSlash = image.lastIndexOf('/');
   const colon = image.lastIndexOf(':');
   const tag = colon > lastSlash ? image.slice(colon + 1) : '';
@@ -2296,7 +2339,7 @@ function resolveSurfaceImage(env: NodeJS.ProcessEnv = process.env): SurfaceImage
   const image =
     env[SURFACE_IMAGE_SETTING]?.trim() || readEnvFile([SURFACE_IMAGE_SETTING])[SURFACE_IMAGE_SETTING]?.trim();
   if (!image) return undefined;
-  if (!/@sha256:[0-9a-f]{64}$/.test(image)) {
+  if (!DIGEST_REFERENCE.test(image)) {
     throw specInvalid(`${SURFACE_IMAGE_SETTING} '${image}' must be a digest reference (<repo>@sha256:<64 hex>)`);
   }
   return { image, mounts: SURFACE_IMAGE_MOUNTS.map((mount) => ({ ...mount })) };

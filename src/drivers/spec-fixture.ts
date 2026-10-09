@@ -147,7 +147,7 @@ export const FIXTURE_LONG_GROUP_FOLDER = `agent-${'x'.repeat(56)}1`;
 
 /** The digest-pinned agent image a group on a pull-by-reference runtime must name. */
 export const FIXTURE_PINNED_IMAGE =
-  'ghcr.io/tenequm/nanoclaw-agent-k8s@sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00112233445566778899aabbccddeeff';
+  'ghcr.io/tenequm/nanoclaw-agent-k8s@sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f000112233445566778899aabbccddeeff';
 
 export const FIXTURE_SURFACE_IMAGE =
   'ghcr.io/tenequm/nanoclaw-agent-src@sha256:aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233';
