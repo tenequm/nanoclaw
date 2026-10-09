@@ -2,26 +2,23 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { closeDb, initTestDb, runMigrations } from '../db/index.js';
 import { createAgentGroup } from '../db/agent-groups.js';
-import { createMessagingGroup, createMessagingGroupAgent, updateMessagingGroup } from '../db/messaging-groups.js';
-import { addMember, removeMember } from '../modules/permissions/db/agent-group-members.js';
-import { createUser, updateDisplayName } from '../modules/permissions/db/users.js';
-import { grantRole, isOwner } from '../modules/permissions/db/user-roles.js';
+import { createMessagingGroup, createMessagingGroupAgent } from '../db/messaging-groups.js';
+import { addMember } from '../modules/permissions/db/agent-group-members.js';
+import { createUser } from '../modules/permissions/db/users.js';
 import { resolveVoiceModeLine } from './voice-mode-line.js';
 
 const stamp = () => new Date().toISOString();
 
-// Lines from before the voice-mode rename keep their `voice` rows and ids; lines made since are hashed-token rows.
-describe('personal legacy voice line access (real central DB)', () => {
-  const ETHAN = 'voice:ethan-test';
-  const LAURA = 'voice:laura-test';
-
-  async function line(id: string, name: string) {
-    await createUser({ id, kind: 'voice', display_name: name, created_at: stamp() });
+// Every line is a voice_mode_lines row (voice-mode-line-roles.test.ts); a member user on a wired chat opens nothing.
+describe('voice line access without a voice_mode_lines row (real central DB)', () => {
+  async function memberLine(channel: string, id: string) {
+    await createUser({ id, kind: channel, display_name: 'Ethan', created_at: stamp() });
+    await addMember({ user_id: id, agent_group_id: 'voice-agent', added_by: null, added_at: stamp() });
     await createMessagingGroup({
       id: `mg-${id}`,
-      channel_type: 'voice',
+      channel_type: channel,
       platform_id: id,
-      instance: 'voice',
+      instance: channel,
       name: 'Personal call',
       is_group: 0,
       unknown_sender_policy: 'strict',
@@ -40,8 +37,6 @@ describe('personal legacy voice line access (real central DB)', () => {
       created_at: stamp(),
     });
   }
-  const allow = (id: string) =>
-    addMember({ user_id: id, agent_group_id: 'voice-agent', added_by: null, added_at: stamp() });
 
   beforeEach(async () => {
     const db = await initTestDb();
@@ -53,115 +48,18 @@ describe('personal legacy voice line access (real central DB)', () => {
       agent_provider: null,
       created_at: stamp(),
     });
-    await line(ETHAN, 'Ethan');
   });
   afterEach(async () => {
     await closeDb();
   });
 
-  it('requires explicit membership and never infers ownership from a matching name', async () => {
-    await createUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Ethan', created_at: stamp() });
-    await grantRole({
-      user_id: 'telegram:owner',
-      role: 'owner',
-      agent_group_id: null,
-      granted_by: null,
-      granted_at: stamp(),
-    });
-    expect(await resolveVoiceModeLine(ETHAN)).toBeNull();
-    await allow(ETHAN);
-    const access = await resolveVoiceModeLine(ETHAN);
-    expect(access).toMatchObject({
-      caller: { id: ETHAN, name: 'Ethan' },
-      agent: { name: 'Casa' },
-      agentGroupId: 'voice-agent',
-    });
-    expect(await isOwner(ETHAN)).toBe(false);
+  it('resolves no line from before the voice-mode rename: its `voice` chat, member user and wiring open nothing', async () => {
+    await memberLine('voice', 'voice:ethan-test');
+    expect(await resolveVoiceModeLine('voice:ethan-test')).toBeNull();
   });
 
-  it('lists the startup vocabulary on call setup only, and no names when none are configured', async () => {
-    await allow(ETHAN);
-    const setup = await resolveVoiceModeLine(ETHAN, { forCall: true, vocabulary: 'Acme, k8s' });
-    expect(setup?.agent.vocabulary).toEqual(['Acme', 'k8s']);
-    expect((await resolveVoiceModeLine(ETHAN, { vocabulary: 'Acme' }))?.agent.vocabulary).toBeUndefined();
-    expect((await resolveVoiceModeLine(ETHAN, { forCall: true }))?.agent.vocabulary).toBeUndefined();
-  });
-
-  it('keeps two people distinct when they call the same agent', async () => {
-    await line(LAURA, 'Laura');
-    await allow(ETHAN);
-    await allow(LAURA);
-    const first = await resolveVoiceModeLine(ETHAN);
-    const second = await resolveVoiceModeLine(LAURA);
-    expect(first?.agentGroupId).toBe(second?.agentGroupId);
-    expect(first?.caller).toEqual({ id: ETHAN, name: 'Ethan' });
-    expect(second?.caller).toEqual({ id: LAURA, name: 'Laura' });
-  });
-
-  it('denies revoked, anonymous, and public lines', async () => {
-    await allow(ETHAN);
-    expect(await resolveVoiceModeLine(ETHAN)).not.toBeNull();
-    await removeMember(ETHAN, 'voice-agent');
-    expect(await resolveVoiceModeLine(ETHAN)).toBeNull();
-    await allow(ETHAN);
-    await updateDisplayName(ETHAN, ' ');
-    expect(await resolveVoiceModeLine(ETHAN)).toBeNull();
-    await updateDisplayName(ETHAN, 'Ethan');
-    await updateMessagingGroup(`mg-${ETHAN}`, { unknown_sender_policy: 'public' });
-    expect(await resolveVoiceModeLine(ETHAN)).toBeNull();
-    expect(await resolveVoiceModeLine('voice:unknown')).toBeNull();
-  });
-
-  it('resolves no membership line in the voice-mode namespace: lines there are hashed-token rows only', async () => {
-    const id = 'voice-mode:ethan-test';
-    await createUser({ id, kind: 'voice-mode', display_name: 'Ethan', created_at: stamp() });
-    await createMessagingGroup({
-      id: 'mg-new-namespace',
-      channel_type: 'voice-mode',
-      platform_id: id,
-      instance: 'voice-mode',
-      name: 'Personal call',
-      is_group: 0,
-      unknown_sender_policy: 'strict',
-      created_at: stamp(),
-    });
-    await createMessagingGroupAgent({
-      id: 'wire-new-namespace',
-      messaging_group_id: 'mg-new-namespace',
-      agent_group_id: 'voice-agent',
-      engage_mode: 'pattern',
-      engage_pattern: '.',
-      sender_scope: 'known',
-      ignored_message_policy: 'drop',
-      session_mode: 'shared',
-      priority: 0,
-      created_at: stamp(),
-    });
-    await allow(id);
-    expect(await resolveVoiceModeLine(id)).toBeNull();
-  });
-
-  it('refuses ambiguous wiring to multiple agents', async () => {
-    await allow(ETHAN);
-    await createAgentGroup({
-      id: 'other-agent',
-      name: 'Other',
-      folder: 'voice-access-other',
-      agent_provider: null,
-      created_at: stamp(),
-    });
-    await createMessagingGroupAgent({
-      id: 'second-wire',
-      messaging_group_id: `mg-${ETHAN}`,
-      agent_group_id: 'other-agent',
-      engage_mode: 'pattern',
-      engage_pattern: '.',
-      sender_scope: 'known',
-      ignored_message_policy: 'drop',
-      session_mode: 'shared',
-      priority: 1,
-      created_at: stamp(),
-    });
-    expect(await resolveVoiceModeLine(ETHAN)).toBeNull();
+  it('resolves no membership line in the voice-mode namespace either', async () => {
+    await memberLine('voice-mode', 'voice-mode:ethan-test');
+    expect(await resolveVoiceModeLine('voice-mode:ethan-test')).toBeNull();
   });
 });
