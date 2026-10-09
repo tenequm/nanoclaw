@@ -321,14 +321,24 @@ export function registerKubernetesConformance(): void {
             pod.status?.conditions?.some((c) => c.type === 'Ready' && c.status === 'True'),
           );
           // Pod Ready can be stale after an outage and the dev deployment has no readiness probe.
-          const leases = JSON.parse(
-            await kubectl(['--namespace', 'agent-sandbox-system', 'get', 'leases', '-o', 'json']),
-          ) as { items: KubeObject[] };
-          return leases.items.some(
-            (lease) =>
-              typeof lease.spec.renewTime === 'string' &&
-              new Date(lease.spec.renewTime).getTime() >= recoveredAt &&
-              readyPods.some((pod) => String(lease.spec.holderIdentity).startsWith(`${pod.metadata.name}_`)),
+          const leases = JSON.parse(await kubectl(['get', 'leases', '--all-namespaces', '-o', 'json'])) as {
+            items: KubeObject[];
+          };
+          const renewed = (lease: KubeObject): boolean =>
+            typeof lease.spec.renewTime === 'string' && new Date(lease.spec.renewTime).getTime() >= recoveredAt;
+          const controlPlaneReady = ['kube-scheduler', 'kube-controller-manager'].every((name) =>
+            leases.items.some(
+              (lease) => lease.metadata.namespace === 'kube-system' && lease.metadata.name === name && renewed(lease),
+            ),
+          );
+          return (
+            controlPlaneReady &&
+            leases.items.some(
+              (lease) =>
+                lease.metadata.namespace === 'agent-sandbox-system' &&
+                renewed(lease) &&
+                readyPods.some((pod) => String(lease.spec.holderIdentity).startsWith(`${pod.metadata.name}_`)),
+            )
           );
         },
         Boolean,
@@ -1175,7 +1185,23 @@ export function registerKubernetesConformance(): void {
         await handle.stop('conformance');
         await podGone(handle);
         const resumed = await driver.prepare(spec);
-        await resumed.start();
+        try {
+          await resumed.start();
+        } catch (error) {
+          const box = await get(RESOURCE, resumed.name);
+          const pod = await get('pod', resumed.name);
+          throw new Error(
+            JSON.stringify({
+              operation: 'resume after forced crash',
+              sandbox: { generation: box?.metadata.generation, status: box?.status },
+              pod: pod && { uid: pod.metadata.uid, status: pod.status },
+              forcedTerminalObserved: events.some((event) => event.kind === 'terminal'),
+              informerCreations,
+              informerConnections,
+            }),
+            { cause: error },
+          );
+        }
         events.length = 0;
         await resumed.stop('host-requested');
         await podGone(resumed);
