@@ -508,6 +508,46 @@ describe('composition on the spawn path', () => {
     expect(context.mailbox.url.startsWith(`http://${FIXTURE_GROUP_VOLUME_CAPABILITIES.hostAddress}:`)).toBe(true);
   });
 
+  it('a host-address capability bypasses gateway proxying on the real spawn path', async () => {
+    const gatewayEnv = {
+      HTTP_PROXY: 'http://remote-gateway:15001',
+      HTTPS_PROXY: 'http://remote-gateway:15001',
+      http_proxy: 'http://remote-gateway:15001',
+      https_proxy: 'http://remote-gateway:15001',
+      NODE_USE_ENV_PROXY: '1',
+      NO_PROXY: 'localhost, localhost',
+      no_proxy: 'internal',
+    };
+    resetGatewayProvider({
+      kind: 'remote-proxy-gateway',
+      agentSkills: [],
+      sessions: {
+        async ensure() {
+          return {
+            contribution: {
+              networkAccess: { endpoint: 'remote-gateway', target: { kind: 'host' } },
+              env: gatewayEnv,
+            },
+          };
+        },
+      },
+      approvals: { subscribe: async () => {} },
+    });
+    const row = await createGroupSession();
+    expect(await wakeAndRefusal(row)).toBeUndefined();
+    const bypass = `localhost,internal,${FIXTURE_GROUP_VOLUME_CAPABILITIES.hostAddress}`;
+    expect(groupVolume.prepared[0].containers[0].contributedEnv).toEqual({
+      ...gatewayEnv,
+      NO_PROXY: bypass,
+      no_proxy: bypass,
+    });
+    await stopIfRunning(row.id);
+    await setContainerConfigDriver(GROUP_ID, hostBind.kind);
+    const dockerRow = await createGroupSession({ id: 'sess-driver-selection-2' });
+    expect(await wakeAndRefusal(dockerRow)).toBeUndefined();
+    expect(JSON.stringify(hostBind.prepared[0].containers[0].contributedEnv)).toBe(JSON.stringify(gatewayEnv));
+  });
+
   it('a group with NO driver field composes exactly what it did before: host binds, no realization data', async () => {
     resetSessionDriver(getSessionDriver(hostBind.kind));
     await setContainerConfigDriver(GROUP_ID, null);

@@ -106,6 +106,8 @@ const mounts: VolumeMount[] = [
 
 function compose(
   overrides: {
+    hostAddress?: string;
+    mailboxUrl?: string;
     gateway?: Record<string, unknown>;
     contribution?: Record<string, unknown>;
     containerConfig?: ContainerConfig;
@@ -118,6 +120,8 @@ function compose(
     mounts,
     containerConfig: overrides.containerConfig ?? containerConfig,
     mailboxEnvironment: { NANOCLAW_MAILBOX_BACKEND: 'sqlite' },
+    hostAddress: overrides.hostAddress,
+    mailboxUrl: overrides.mailboxUrl,
     contribution: (overrides.contribution ?? {}) as never,
     gateway: {
       networkAccess: { endpoint: 'localhost', target: { kind: 'host' } },
@@ -140,6 +144,49 @@ function composeWithFolder(folder: string) {
 }
 
 describe('composeSessionSpec', () => {
+  const proxyEnv = {
+    HTTP_PROXY: 'http://remote-gateway:15001',
+    HTTPS_PROXY: 'http://remote-gateway:15001',
+    http_proxy: 'http://remote-gateway:15001',
+    https_proxy: 'http://remote-gateway:15001',
+    NODE_USE_ENV_PROXY: '1',
+  };
+
+  it('exempts the driver host and mailbox host after merging gateway proxy env', () => {
+    const spec = compose({
+      hostAddress: '0.250.250.254',
+      mailboxUrl: 'http://mailbox.internal:3010/mailbox/v1',
+      gateway: { env: proxyEnv },
+    });
+    expect(spec.containers[0].contributedEnv).toEqual({
+      ...proxyEnv,
+      NO_PROXY: '0.250.250.254,mailbox.internal',
+      no_proxy: '0.250.250.254,mailbox.internal',
+    });
+  });
+
+  it('preserves and deduplicates both existing proxy bypass lists', () => {
+    const spec = compose({
+      hostAddress: '0.250.250.254',
+      mailboxUrl: 'http://0.250.250.254:3010/mailbox/v1',
+      gateway: { env: { ...proxyEnv, NO_PROXY: 'localhost, 0.250.250.254', no_proxy: 'localhost,internal,' } },
+    });
+    expect(spec.containers[0].contributedEnv).toEqual({
+      ...proxyEnv,
+      NO_PROXY: 'localhost,0.250.250.254,internal',
+      no_proxy: 'localhost,0.250.250.254,internal',
+    });
+  });
+
+  it('keeps Docker env byte-identical without a declared host address', () => {
+    const gatewayEnv = { ...proxyEnv, NO_PROXY: 'localhost, internal', no_proxy: 'different' };
+    const baseline = compose();
+    const spec = compose({ mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1', gateway: { env: gatewayEnv } });
+    expect(JSON.stringify(spec.containers[0].env)).toBe(JSON.stringify(baseline.containers[0].env));
+    expect(JSON.stringify(spec.containers[0].contributedEnv)).toBe(JSON.stringify(gatewayEnv));
+    expect(compose({ gateway: { env: proxyEnv } }).containers[0].contributedEnv).toEqual(proxyEnv);
+  });
+
   it('carries gateway lineage without overriding reserved host labels', () => {
     const spec = compose({
       gateway: {

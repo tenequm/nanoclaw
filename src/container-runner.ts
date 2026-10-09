@@ -685,6 +685,8 @@ async function spawnOnDriver(
         contribution,
         gateway,
         mailboxEnvironment,
+        hostAddress: capabilities.hostAddress,
+        mailboxUrl: isNetworkRunnerContext(runnerContext) ? (runnerContext as { url: string }).url : undefined,
         wakeReason,
       }),
       capabilities,
@@ -2088,6 +2090,8 @@ export interface ComposeSessionSpecInput {
   gateway: GatewayContribution;
   /** Non-secret configuration supplied by the selected mailbox implementation. */
   mailboxEnvironment: Record<string, string>;
+  hostAddress?: string;
+  mailboxUrl?: string;
   /** Why this spawn happened, for the runner. */
   wakeReason?: WakeReason;
 }
@@ -2127,6 +2131,18 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     ...(contribution.env ?? {}),
     ...(gateway.env ?? {}),
   };
+  if (input.hostAddress) {
+    // Mailbox traffic must reach the driver host directly, even with a remote gateway.
+    const bypass = new Set(
+      [env.NO_PROXY, env.no_proxy, contributedEnv.NO_PROXY, contributedEnv.no_proxy]
+        .flatMap((value) => value?.split(',') ?? [])
+        .map((host) => host.trim())
+        .filter(Boolean),
+    );
+    bypass.add(input.hostAddress);
+    if (input.mailboxUrl) bypass.add(new URL(input.mailboxUrl).hostname);
+    contributedEnv.NO_PROXY = contributedEnv.no_proxy = [...bypass].join(',');
+  }
 
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
