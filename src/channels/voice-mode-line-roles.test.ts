@@ -6,11 +6,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { closeDb, initTestDb, runMigrations } from '../db/index.js';
 import { createAgentGroup } from '../db/agent-groups.js';
-import { bindVoiceModeLineChat, mintVoiceModeLine } from '../db/voice-mode-lines.js';
+import { bindVoiceModeLineChat, mintVoiceModeLine, setVoiceModeLineTts } from '../db/voice-mode-lines.js';
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
 import { createUser } from '../modules/permissions/db/users.js';
 import { grantRole, revokeRole } from '../modules/permissions/db/user-roles.js';
-import { linePlatformId, resolveVoiceModeLine, sameCallerAndAgent } from './voice-mode-line.js';
+import { TTS_DEFAULT_CHOICE } from '../voice-mode-tts.js';
+import { lineIdOf, linePlatformId, resolveVoiceModeLine, sameCallerAndAgent } from './voice-mode-line.js';
 
 const stamp = () => new Date().toISOString();
 const ADMIN = 'telegram:7';
@@ -47,7 +48,28 @@ describe('voice line access (real central DB)', () => {
       agentGroupId: 'ag-1',
       agent: { name: 'Andy' },
       linkHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      tts: TTS_DEFAULT_CHOICE,
     });
+  });
+
+  it("speaks with the line's saved choice, keeps it across a re-mint and a chat move, and clears it", async () => {
+    const line = await mint(ADMIN);
+    const lineId = lineIdOf(line)!;
+    const saved = await setVoiceModeLineTts(lineId, { provider: 'gemini', model: null, voice: 'en-us-techagent-4' });
+    expect(saved).toMatchObject({ tts_provider: 'gemini', tts_model: null, tts_voice: 'en-us-techagent-4' });
+    const techAdvisor = { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'en-us-techagent-4' };
+    expect((await resolveVoiceModeLine(line))?.tts).toEqual(techAdvisor);
+    await mint(ADMIN);
+    await bindVoiceModeLineChat({
+      agentGroupId: 'ag-1',
+      callerUserId: ADMIN,
+      messagingGroupId: 'mg-2',
+      threadId: null,
+    });
+    expect((await resolveVoiceModeLine(line))?.tts).toEqual(techAdvisor);
+    await setVoiceModeLineTts(lineId, null);
+    expect((await resolveVoiceModeLine(line))?.tts).toEqual(TTS_DEFAULT_CHOICE);
+    expect(await setVoiceModeLineTts('000000000000', null)).toBeUndefined();
   });
 
   it('lists the startup vocabulary on call setup only, and no names when none are configured', async () => {

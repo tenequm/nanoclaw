@@ -1,8 +1,8 @@
 /**
  * Voice mode's own state: one voice line per agent group, in the skill's own table. The line holds
- * the SHA-256 of its current call-link token (never the token), who minted it (the caller), and
- * the chat its calls talk in. `/voice` creates lines and moves their chat, `/voice new` re-mints their
- * link (src/channels/voice-mode-command.ts);
+ * the SHA-256 of its current call-link token (never the token), who minted it (the caller), the
+ * chat its calls talk in, and the speech choice its calls start with. `/voice` creates lines and
+ * moves their chat, `/voice new` re-mints their link (src/channels/voice-mode-command.ts);
  * the call page finds a line by its token's hash (src/channels/voice-mode.ts).
  *
  * Who may run `/voice` is core's business (owner and admin roles); this table only records what a
@@ -11,6 +11,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 
+import { isTtsProvider, type TtsSaved } from '../voice-mode-tts.js';
 import { getDb } from './connection.js';
 import { registerMigration } from './migrations/index.js';
 
@@ -33,6 +34,16 @@ registerMigration({
   },
 });
 
+registerMigration({
+  version: 2,
+  name: 'module:voice-mode:lines-tts',
+  async up(db) {
+    await db.exec('ALTER TABLE voice_mode_lines ADD COLUMN tts_provider TEXT');
+    await db.exec('ALTER TABLE voice_mode_lines ADD COLUMN tts_model TEXT');
+    await db.exec('ALTER TABLE voice_mode_lines ADD COLUMN tts_voice TEXT');
+  },
+});
+
 export interface VoiceModeLineRow {
   /** Random and stable for the line's life; calls, rooms and limits are keyed by it, not by the token. */
   line_id: string;
@@ -44,8 +55,37 @@ export interface VoiceModeLineRow {
   /** The chat calls talk in, and its thread. */
   messaging_group_id: string | null;
   thread_id: string | null;
+  /** The line's saved speech choice; null fields take the defaults (see savedTts). */
+  tts_provider: string | null;
+  tts_model: string | null;
+  tts_voice: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** The line's saved speech choice; an unknown provider reads as none. */
+export function savedTts(row: VoiceModeLineRow): TtsSaved {
+  return {
+    provider: isTtsProvider(row.tts_provider) ? row.tts_provider : null,
+    model: row.tts_model,
+    voice: row.tts_voice,
+  };
+}
+
+/** Save the line's speech choice, or clear it with null; undefined when there is no such line. */
+export async function setVoiceModeLineTts(
+  lineId: string,
+  saved: TtsSaved | null,
+): Promise<VoiceModeLineRow | undefined> {
+  return getDb().get<VoiceModeLineRow>(
+    `UPDATE voice_mode_lines SET tts_provider = ?, tts_model = ?, tts_voice = ?, updated_at = ?
+       WHERE line_id = ? RETURNING *`,
+    saved?.provider ?? null,
+    saved?.model ?? null,
+    saved?.voice ?? null,
+    new Date().toISOString(),
+    lineId,
+  );
 }
 
 /** Hex SHA-256 of a call-link token: what the table stores and looks a link up by. */
@@ -126,8 +166,8 @@ async function insertLine(
 
 /**
  * Mint a new call link for the agent's line (creating the line on first use), make `ownerUserId` its
- * caller and the given chat its call chat. The previous link stops working. Returns the line and
- * the new token, which is stored nowhere: the caller hands it out once.
+ * caller and the given chat its call chat. The previous link stops working; the saved speech choice
+ * stays. Returns the line and the new token, which is stored nowhere: the caller hands it out once.
  */
 export async function mintVoiceModeLine(
   target: VoiceModeLineTarget,

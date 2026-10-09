@@ -15,6 +15,8 @@ import { readGroupPersona } from '../group-persona.js';
 import { log } from '../log.js';
 import { canAccessAgentGroup } from '../modules/permissions/access.js';
 import { getUser } from '../modules/permissions/db/users.js';
+import { savedTts, type VoiceModeLineRow } from '../db/voice-mode-lines.js';
+import { effectiveTts, type TtsChoice } from '../voice-mode-tts.js';
 
 /** Optional per-agent names for the transcription, one per line; added to VOICE_MODE_VOCABULARY. */
 export const VOICE_MODE_VOCABULARY_FILE = 'voice.vocabulary.txt';
@@ -39,6 +41,8 @@ export interface VoiceModeLine {
   caller: VoiceModeCaller;
   agentGroupId: string;
   linkHash?: string;
+  /** The line's effective speech choice; absent for a legacy line. */
+  tts?: TtsChoice;
 }
 
 /** Whether two resolutions of a line still name the same caller, agent and link; a call ends when they stop. */
@@ -85,7 +89,7 @@ function buildLine(
   caller: VoiceModeCaller,
   group: { id: string; name: string; folder: string },
   options: ResolveLineOptions,
-  linkHash?: string,
+  row?: VoiceModeLineRow,
 ): VoiceModeLine {
   // The persona reader's bounded, symlink- and FIFO-safe read: the file is agent-writable.
   const fileText = options.forCall
@@ -101,7 +105,7 @@ function buildLine(
       ...(vocabulary?.length ? { vocabulary } : {}),
       ...(wakeNames?.length ? { wakeNames } : {}),
     },
-    ...(linkHash ? { linkHash } : {}),
+    ...(row ? { linkHash: row.token_hash, tts: effectiveTts(savedTts(row)) } : {}),
   };
 }
 
@@ -118,7 +122,7 @@ export async function resolveVoiceModeLine(
       const [caller, group] = await Promise.all([getUser(line.owner_user_id), getAgentGroup(line.agent_group_id)]);
       if (!caller || !group) return null;
       const name = caller.display_name?.trim() || caller.id;
-      return buildLine({ id: caller.id, name }, group, options, line.token_hash);
+      return buildLine({ id: caller.id, name }, group, options, line);
     }
     // Every other line is a hashed-token row (above); only a line from before the rename resolves here.
     if (lineChannelType(platformId) !== LEGACY_VOICE_CHANNEL) return null;
