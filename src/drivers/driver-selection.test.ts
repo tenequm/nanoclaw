@@ -26,12 +26,15 @@ import {
   killContainer,
   reapRetainedSessions,
   rediscoverUnavailableRuntimes,
+  stopRuntimeReconciliation,
   wakeContainer,
   _resetAdoptionRetryStateForTesting,
+  _runtimeReconciliationStateForTesting,
   _setRuntimeDiscoveryScheduleForTesting,
 } from '../container-runner.js';
 import * as containerConfigs from '../db/container-configs.js';
 import * as coordination from '../db/coordination.js';
+import * as sessionsDb from '../db/sessions.js';
 import { closeDb, createAgentGroup, createSession, getDb, initTestDb, runMigrations } from '../db/index.js';
 import {
   ensureContainerConfig,
@@ -281,6 +284,8 @@ interface FakeDriverOptions {
   listSessions?: () => Promise<SessionSnapshot[]>;
   listRetained?: () => Promise<RetainedObject[]>;
   reapRetained?: (installSlug: string, keys: SessionKey[]) => Promise<void>;
+  reapResidue?: () => Promise<void>;
+  reconcileNetworkAccess?: () => Promise<void>;
 }
 
 interface FakeDriverRecord {
@@ -331,6 +336,8 @@ function registerRecordingFake(options: FakeDriverOptions = {}): FakeDriverRecor
       },
     };
     if (options.ensureReady) driver.ensureReady = options.ensureReady;
+    if (options.reapResidue) driver.reapResidue = options.reapResidue;
+    if (options.reconcileNetworkAccess) driver.reconcileNetworkAccess = options.reconcileNetworkAccess;
     if (options.listRetained) driver.listRetained = options.listRetained;
     if (options.reapRetained || options.listRetained) {
       driver.reapRetained = async (installSlug, keys) => {
@@ -451,6 +458,8 @@ describe('composition on the spawn path', () => {
     await ensureContainerConfig(GROUP_ID);
     await updateContainerConfigScalars(GROUP_ID, { image_tag: FIXTURE_PINNED_IMAGE });
     await setContainerConfigDriver(GROUP_ID, groupVolume.kind);
+    // A non-default kind is admitted only after a pass in this process.
+    expect(await rediscoverUnavailableRuntimes([groupVolume.kind, hostBind.kind])).toBe(2);
   });
 
   afterEach(async () => {
@@ -735,6 +744,7 @@ describe('composition on the spawn path', () => {
       ],
     });
     await setContainerConfigDriver(GROUP_ID, settling.kind);
+    await rediscoverUnavailableRuntimes([settling.kind]);
     const row = await createGroupSession();
     expect(await wakeAndRefusal(row)).toMatch(/still has runtime ncl-old of another session/);
     expect(settling.prepared).toHaveLength(0);
@@ -842,8 +852,11 @@ describe('composition on the spawn path', () => {
         return [survivor];
       },
     });
-    await setContainerConfigDriver(GROUP_ID, origin.kind);
-    resetSessionDriver(getSessionDriver(hostBind.kind));
+    // The origin is the install default: its failed claim write leaves a
+    // pending adoption that the wake path retries (a background pass keeps a
+    // non-default kind closed instead, below).
+    await setContainerConfigDriver(GROUP_ID, null);
+    resetSessionDriver(getSessionDriver(origin.kind));
     const claim = vi.spyOn(coordination, 'tryClaimSession').mockRejectedValueOnce(new Error('store down'));
     try {
       await adoptRunningSessions();
@@ -914,6 +927,42 @@ describe('composition on the spawn path', () => {
   describe('runtime availability', () => {
     const reapOrphans = vi.fn(async () => {});
 
+    function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((settle) => (resolve = settle));
+      return { promise, resolve };
+    }
+
+    /** A running snapshot of `sessionId` in `agentGroupId`, its stops recorded as `name:reason`. */
+    function running(
+      sessionId: string,
+      name: string,
+      stops: string[] = [],
+      agentGroupId = GROUP_ID,
+      stop?: (reason: string) => Promise<void>,
+    ): SessionSnapshot {
+      return {
+        handle: {
+          ...fakeHandle(fixtureSpec({ key: { installSlug: INSTALL_SLUG, agentGroupId, sessionId } })),
+          name,
+          onTerminal: () => {},
+          stop: stop ?? (async (reason: string) => void stops.push(`${name}:${reason}`)),
+        },
+        phase: 'running',
+      } as unknown as SessionSnapshot;
+    }
+
+    /** Make `kinds` exactly what this install has used, and install a fresh default runtime. */
+    async function installWith(kinds: string[], defaultOptions: FakeDriverOptions = {}): Promise<FakeDriverRecord> {
+      await getDb().run('DELETE FROM runtime_driver_kinds');
+      await recordDriverKindsUsed(kinds);
+      const defaultFake = registerRecordingFake(defaultOptions);
+      resetSessionDriver(getSessionDriver(defaultFake.kind));
+      return defaultFake;
+    }
+
+    const closedKinds = () => _runtimeReconciliationStateForTesting().closed;
+
     beforeEach(() => {
       reapOrphans.mockClear();
       resetGatewayProvider({
@@ -929,33 +978,32 @@ describe('composition on the spawn path', () => {
       });
     });
 
-    afterEach(() => {
+    afterEach(async () => {
+      // A short bound: a case that failed mid-pass must not hold teardown.
+      _setRuntimeDiscoveryScheduleForTesting(50, 60_000);
+      await stopRuntimeReconciliation();
       _setRuntimeDiscoveryScheduleForTesting();
       _resetAdoptionRetryStateForTesting();
       resetGatewayProvider(null);
     });
 
-    it('a runtime whose listing never settles holds up neither the default runtime nor startup; it stays closed until rediscovered', async () => {
+    it('a runtime whose listing never settles holds up neither the default runtime nor startup; it stays closed until that listing answers', async () => {
       _setRuntimeDiscoveryScheduleForTesting(50, 60_000);
-      let hang = true;
-      const slow = registerRecordingFake({ listSessions: () => (hang ? new Promise(() => {}) : Promise.resolve([])) });
+      const listing = deferred<SessionSnapshot[]>();
+      let listings = 0;
+      const slow = registerRecordingFake({
+        listSessions: () => {
+          listings += 1;
+          return listings === 1 ? listing.promise : Promise.resolve([]);
+        },
+      });
       await setContainerConfigDriver(GROUP_ID, slow.kind);
       const stops: string[] = [];
-      const orphan = {
-        handle: {
-          ...fakeHandle(
-            fixtureSpec({ key: { installSlug: INSTALL_SLUG, agentGroupId: 'ag-gone', sessionId: 'sess-gone' } }),
-          ),
-          stop: async (reason: string) => void stops.push(reason),
-        },
-        phase: 'running',
-      } as unknown as SessionSnapshot;
-      const defaultFake = registerRecordingFake({ listSessions: async () => [orphan] });
-      resetSessionDriver(getSessionDriver(defaultFake.kind));
+      await installWith([slow.kind], { listSessions: async () => [running('sess-gone', 'gone', stops, 'ag-gone')] });
 
-      // Bounded: startup returns, and the default runtime's orphan was handled.
+      // Startup returns, and the default runtime's orphan was handled inline.
       expect(await adoptRunningSessions()).toEqual({ adopted: 0, stopped: 1 });
-      expect(stops).toEqual(['orphan-at-startup']);
+      expect(stops).toEqual(['gone:orphan-at-startup']);
       // The slow runtime's surviving sessions are unseen: no global gateway
       // reap, and its groups are closed to admission (retryable).
       expect(reapOrphans).not.toHaveBeenCalled();
@@ -963,14 +1011,467 @@ describe('composition on the spawn path', () => {
       expect(await wakeAndRefusal(row)).toMatch(/runtime-unavailable: .*which is not available \(discovery\)/);
       expect(slow.prepared).toHaveLength(0);
 
-      // Still hung: rediscovery leaves it closed, never "nothing there".
+      // Still hung: every pass waits on the SAME outstanding listing — none
+      // is re-issued — and the kind stays closed, never "nothing there".
       expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(listings).toBe(1);
       expect(await wakeAndRefusal(row)).toMatch(/runtime-unavailable/);
 
-      hang = false;
+      listing.resolve([]);
+      await vi.waitFor(() => expect(_runtimeReconciliationStateForTesting().outstandingCalls).toBe(0));
       expect(await rediscoverUnavailableRuntimes()).toBe(1);
       expect(await wakeAndRefusal(row)).toBeUndefined();
       expect(slow.prepared.map((spec) => spec.key.sessionId)).toEqual([SESSION_ID]);
+    });
+
+    it('never stacks passes or listings for one kind: concurrent triggers join the pass in flight', async () => {
+      const listing = deferred<SessionSnapshot[]>();
+      let listings = 0;
+      const secondary = registerRecordingFake({
+        listSessions: () => {
+          listings += 1;
+          return listing.promise;
+        },
+      });
+      await setContainerConfigDriver(GROUP_ID, secondary.kind);
+      await installWith([secondary.kind]);
+      await adoptRunningSessions();
+      const joined = [
+        rediscoverUnavailableRuntimes(),
+        rediscoverUnavailableRuntimes(),
+        rediscoverUnavailableRuntimes(),
+      ];
+      await vi.waitFor(() => expect(listings).toBe(1));
+      expect(_runtimeReconciliationStateForTesting().passes).toBe(1);
+      listing.resolve([]);
+      expect(await Promise.all(joined)).toEqual([1, 1, 1]);
+      expect(listings).toBe(1);
+      expect(closedKinds()).toEqual([]);
+    });
+
+    it('rediscovery keeps the session an earlier partial pass adopted from the same runtime (R1)', async () => {
+      // The re-review's reproduction: the pass adopts the first session, then
+      // a transient DB read fails on the second; the retry must keep the first.
+      const stops: string[] = [];
+      const secondary = registerRecordingFake({
+        listSessions: async () => [
+          running(SESSION_ID, 'review-first', stops),
+          running('sess-review-second', 'review-second', stops),
+        ],
+      });
+      await setContainerConfigDriver(GROUP_ID, secondary.kind);
+      await createGroupSession();
+      await installWith([secondary.kind]);
+      const readSession = sessionsDb.getSession;
+      let failed = false;
+      const read = vi.spyOn(sessionsDb, 'getSession').mockImplementation(async (id: string) => {
+        if (id === 'sess-review-second' && !failed) {
+          failed = true;
+          throw new Error('transient DB read');
+        }
+        return readSession(id);
+      });
+      try {
+        await adoptRunningSessions();
+        expect(await rediscoverUnavailableRuntimes()).toBe(0);
+        expect(failed).toBe(true);
+        expect(isContainerRunning(SESSION_ID)).toBe(true);
+        expect(closedKinds()).toEqual([secondary.kind]);
+
+        expect(await rediscoverUnavailableRuntimes()).toBe(1);
+      } finally {
+        read.mockRestore();
+      }
+      expect(stops).toEqual(['review-second:orphan-at-startup']);
+      expect(isContainerRunning(SESSION_ID)).toBe(true);
+    });
+
+    it('a secondary runtime whose stop never settles delays neither startup nor another runtime (R2)', async () => {
+      const stopEntered = deferred<void>();
+      const stopRelease = deferred<void>();
+      const hung = registerRecordingFake({
+        listSessions: async () => [
+          running('sess-orphan', 'orphan', [], 'ag-gone', async () => {
+            stopEntered.resolve();
+            await stopRelease.promise;
+          }),
+        ],
+      });
+      const healthy = registerRecordingFake();
+      await installWith([hung.kind, healthy.kind]);
+
+      // Startup and routing never wait on the deferred stop.
+      expect(await adoptRunningSessions()).toEqual({ adopted: 0, stopped: 0 });
+      await stopEntered.promise;
+      await vi.waitFor(() => expect(closedKinds()).toEqual([hung.kind]));
+
+      // The hung kind stays closed until its pass settles every snapshot.
+      stopRelease.resolve();
+      await vi.waitFor(() => expect(closedKinds()).toEqual([]));
+    });
+
+    it('a hung driver-change validation times out, releases the group, and holds up no other runtime (R3)', async () => {
+      _setRuntimeDiscoveryScheduleForTesting(50, 60_000);
+      const hung = registerRecordingFake({ listSessions: () => new Promise(() => {}) });
+      const other = registerRecordingFake({ listSessions: async () => [] });
+      await setContainerConfigDriver(GROUP_ID, hung.kind);
+      await installWith([hung.kind, other.kind]);
+      await adoptRunningSessions();
+
+      const change = changeGroupDriver(GROUP_ID, null, async () => {});
+      // Recovery of another kind is not vetoed while the change is held.
+      await vi.waitFor(() => expect(closedKinds()).not.toContain(other.kind));
+      await expect(change).rejects.toThrow(/could not be read .*did not settle within 50ms/);
+      // The mark was released: the next attempt is evaluated, not refused as in progress.
+      await expect(changeGroupDriver(GROUP_ID, null, async () => {})).rejects.toThrow(/did not settle within 50ms/);
+      const row = await createGroupSession();
+      expect(await wakeAndRefusal(row)).not.toMatch(/is changing its session runtime driver/);
+    });
+
+    it('a late adoption re-checks a driver change at the point of admission and defers the snapshot (R3)', async () => {
+      const listing = deferred<SessionSnapshot[]>();
+      let listings = 0;
+      const secondary = registerRecordingFake({
+        listSessions: () => (++listings === 1 ? listing.promise : Promise.resolve([running(SESSION_ID, 'late')])),
+      });
+      await setContainerConfigDriver(GROUP_ID, null);
+      await createGroupSession();
+      await installWith([secondary.kind]);
+      await adoptRunningSessions();
+
+      const gate = deferred<void>();
+      const change = changeGroupDriver(GROUP_ID, hostBind.kind, () => gate.promise);
+      listing.resolve([running(SESSION_ID, 'late')]);
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(isContainerRunning(SESSION_ID)).toBe(false);
+      expect(closedKinds()).toEqual([secondary.kind]);
+
+      gate.resolve();
+      await change;
+      expect(await rediscoverUnavailableRuntimes()).toBe(1);
+      expect(isContainerRunning(SESSION_ID)).toBe(true);
+    });
+
+    it('a runtime closed for readiness reopens only after ensureReady succeeds, through startup and every pass (R4)', async () => {
+      let ready = false;
+      let readyCalls = 0;
+      const defaultFake = await installWith([], {
+        ensureReady: async () => {
+          readyCalls += 1;
+          if (!ready) throw new Error('docker daemon unreachable');
+        },
+      });
+      // The group runs on the group-volume fake, which is ready.
+      await expect(ensureSessionRuntimesReady()).resolves.toBeUndefined();
+      expect(await adoptRunningSessions()).toEqual({ adopted: 0, stopped: 0 });
+      await rediscoverUnavailableRuntimes();
+      expect(closedKinds()).toContain(defaultFake.kind);
+      await rediscoverUnavailableRuntimes();
+      expect(closedKinds()).toContain(defaultFake.kind);
+      expect(readyCalls).toBe(3);
+
+      await setContainerConfigDriver(GROUP_ID, null);
+      const row = await createGroupSession();
+      expect(await wakeAndRefusal(row)).toMatch(/runtime-unavailable: .*which is not available \(readiness\)/);
+
+      ready = true;
+      await rediscoverUnavailableRuntimes();
+      expect(closedKinds()).not.toContain(defaultFake.kind);
+      expect(await wakeAndRefusal(row)).toBeUndefined();
+    });
+
+    it('shutdown stops background reconciliation: no retry timer, no pass, no adoption registered after it', async () => {
+      _setRuntimeDiscoveryScheduleForTesting(50, 60_000);
+      const listing = deferred<SessionSnapshot[]>();
+      const secondary = registerRecordingFake({ listSessions: () => listing.promise });
+      await setContainerConfigDriver(GROUP_ID, secondary.kind);
+      await createGroupSession();
+      await installWith([secondary.kind]);
+      await adoptRunningSessions();
+      // The first pass times out on the listing and arms its backoff timer.
+      await vi.waitFor(() => expect(_runtimeReconciliationStateForTesting().retryTimers).toBe(1));
+
+      // A second pass gets as far as the gateway when shutdown begins.
+      const atGateway = deferred<void>();
+      const gatewayRelease = deferred<void>();
+      resetGatewayProvider({
+        kind: 'gated-gateway',
+        agentSkills: [],
+        sessions: {
+          async ensure() {
+            atGateway.resolve();
+            await gatewayRelease.promise;
+            return { contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } } };
+          },
+        },
+        approvals: { subscribe: async () => {} },
+      });
+      _setRuntimeDiscoveryScheduleForTesting(5_000, 60_000);
+      const pass = rediscoverUnavailableRuntimes();
+      listing.resolve([running(SESSION_ID, 'late')]);
+      await atGateway.promise;
+      const stopping = stopRuntimeReconciliation();
+      gatewayRelease.resolve();
+      await stopping;
+      expect(await pass).toBe(0);
+
+      expect(isContainerRunning(SESSION_ID)).toBe(false);
+      expect(_runtimeReconciliationStateForTesting()).toMatchObject({ passes: 0, retryTimers: 0 });
+      expect(closedKinds()).toEqual([secondary.kind]);
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+    });
+
+    // --- A1 fix round 3: the second re-review's probes (B1-B4), reproduced ---
+
+    /** A gateway that refuses adoption while `refuse()` holds, and can pause creation. */
+    function gatewayWith(options: { refuseAdopt?: () => boolean; beforeCreate?: () => Promise<void> }): void {
+      resetGatewayProvider({
+        kind: 'probe-gateway',
+        agentSkills: [],
+        sessions: {
+          async ensure(input) {
+            if (input.disposition === 'adopt' && options.refuseAdopt?.()) throw new Error('lease unknown');
+            if (input.disposition === 'create') await options.beforeCreate?.();
+            return { contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } } };
+          },
+        },
+        approvals: { subscribe: async () => {} },
+      });
+    }
+
+    it('B1 rejected-stop: a stop that rejects inside a pass keeps the kind closed and the survivor protected, then retries', async () => {
+      let stopFails = true;
+      let gone = false;
+      const stops: string[] = [];
+      const secondary = registerRecordingFake({
+        listSessions: async () =>
+          gone
+            ? []
+            : [
+                running(SESSION_ID, 'old', [], GROUP_ID, async (reason) => {
+                  stops.push(reason);
+                  if (stopFails) throw new Error('apiserver refused the delete');
+                  gone = true;
+                }),
+              ],
+      });
+      await setContainerConfigDriver(GROUP_ID, secondary.kind);
+      const row = await createGroupSession();
+      await installWith([secondary.kind]);
+      gatewayWith({ refuseAdopt: () => true });
+
+      await adoptRunningSessions();
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(stops).toEqual(['gateway-adoption-failed']);
+      expect(closedKinds()).toEqual([secondary.kind]);
+      // The survivor keeps this host's claim; no second copy is admitted.
+      expect((await coordination.getSessionClaim(SESSION_ID))?.claimed_by).toBeTruthy();
+      expect(await wakeAndRefusal(row)).toMatch(/runtime-unavailable/);
+      expect(secondary.prepared).toHaveLength(0);
+
+      // The retried pass confirms the teardown, and only then reopens.
+      stopFails = false;
+      expect(await rediscoverUnavailableRuntimes()).toBe(1);
+      expect(stops).toEqual(['gateway-adoption-failed', 'gateway-adoption-failed']);
+      expect(await wakeAndRefusal(row)).toBeUndefined();
+      expect(secondary.prepared.map((spec) => spec.key.sessionId)).toEqual([SESSION_ID]);
+    });
+
+    it('B1: a stop that times out fails the pass, and the kind stays closed while that stop is outstanding', async () => {
+      _setRuntimeDiscoveryScheduleForTesting(50, 60_000);
+      const stop = deferred<void>();
+      let listed = true;
+      let stopCalls = 0;
+      const secondary = registerRecordingFake({
+        listSessions: async () =>
+          listed
+            ? [
+                running('sess-orphan', 'orphan', [], 'ag-gone', () => {
+                  stopCalls += 1;
+                  return stop.promise;
+                }),
+              ]
+            : [],
+      });
+      await installWith([secondary.kind]);
+      await adoptRunningSessions();
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(closedKinds()).toEqual([secondary.kind]);
+
+      // The object leaves the listing while its stop is still outstanding:
+      // that unsettled stop keeps the kind closed, and is not re-issued.
+      listed = false;
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(closedKinds()).toEqual([secondary.kind]);
+      expect(stopCalls).toBe(1);
+
+      stop.resolve();
+      await vi.waitFor(() => expect(_runtimeReconciliationStateForTesting().outstandingCalls).toBe(0));
+      expect(await rediscoverUnavailableRuntimes()).toBe(1);
+    });
+
+    it('a claim write that fails inside a pass keeps the kind closed and the survivor pending, then adopts it', async () => {
+      const secondary = registerRecordingFake({ listSessions: async () => [running(SESSION_ID, 'survivor')] });
+      await setContainerConfigDriver(GROUP_ID, secondary.kind);
+      const row = await createGroupSession();
+      await installWith([secondary.kind]);
+      const claim = vi.spyOn(coordination, 'tryClaimSession').mockRejectedValueOnce(new Error('store down'));
+      try {
+        await adoptRunningSessions();
+        expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      } finally {
+        claim.mockRestore();
+      }
+      expect(closedKinds()).toEqual([secondary.kind]);
+      expect(await wakeAndRefusal(row)).toMatch(/runtime-unavailable/);
+      expect(await rediscoverUnavailableRuntimes()).toBe(1);
+      expect(isContainerRunning(SESSION_ID)).toBe(true);
+      expect(secondary.prepared).toHaveLength(0);
+    });
+
+    it('B2 startup-kind-read-failure: every non-default kind stays closed; its first use reconciles it, never a second copy', async () => {
+      const secondary = registerRecordingFake({ listSessions: async () => [running(SESSION_ID, 'survivor')] });
+      await setContainerConfigDriver(GROUP_ID, secondary.kind);
+      const row = await createGroupSession();
+      await installWith([secondary.kind]);
+      const read = vi
+        .spyOn(containerConfigs, 'listConfiguredDriverKinds')
+        .mockRejectedValueOnce(new Error('db locked'));
+      try {
+        await adoptRunningSessions();
+      } finally {
+        read.mockRestore();
+      }
+      // The failed read is retried on a timer; nothing certified the secondary.
+      expect(_runtimeReconciliationStateForTesting().retryTimers).toBe(1);
+      expect(await wakeAndRefusal(row)).toMatch(/runtime-unavailable: .*which is not available \(discovery\)/);
+      expect(await rediscoverUnavailableRuntimes()).toBe(1);
+      expect(isContainerRunning(SESSION_ID)).toBe(true);
+      expect(await wakeContainer(row)).toBe(true);
+      expect(secondary.prepared).toHaveLength(0);
+    });
+
+    it('B2: the failed kinds read is retried, and the kinds it names are reconciled without waiting for a wake', async () => {
+      _setRuntimeDiscoveryScheduleForTesting(5_000, 20);
+      const secondary = registerRecordingFake({ listSessions: async () => [running(SESSION_ID, 'survivor')] });
+      await setContainerConfigDriver(GROUP_ID, secondary.kind);
+      await createGroupSession();
+      await installWith([secondary.kind]);
+      const read = vi
+        .spyOn(containerConfigs, 'listConfiguredDriverKinds')
+        .mockRejectedValueOnce(new Error('db locked'));
+      try {
+        await adoptRunningSessions();
+      } finally {
+        read.mockRestore();
+      }
+      await vi.waitFor(() => expect(isContainerRunning(SESSION_ID)).toBe(true));
+      expect(closedKinds()).toEqual([]);
+      expect(_runtimeReconciliationStateForTesting().retryTimers).toBe(0);
+    });
+
+    it('B2 kind-configured-after-startup: a driver change to an unseen kind reconciles it before anything spawns there', async () => {
+      let listings = 0;
+      const target = registerRecordingFake({
+        listSessions: async () => {
+          listings += 1;
+          return [running(SESSION_ID, 'survivor')];
+        },
+      });
+      await setContainerConfigDriver(GROUP_ID, null);
+      const row = await createGroupSession();
+      await installWith([]);
+      await adoptRunningSessions();
+      expect(closedKinds()).toEqual([]);
+
+      await changeGroupDriver(GROUP_ID, target.kind, () => setContainerConfigDriver(GROUP_ID, target.kind));
+      // Whether the pass is still running (refused) or done (adopted), no copy is spawned.
+      await wakeContainer(row);
+      // A pass that met that wake in flight deferred the snapshot; the next one adopts it.
+      await rediscoverUnavailableRuntimes();
+      await rediscoverUnavailableRuntimes();
+      expect(listings).toBeGreaterThan(0);
+      expect(isContainerRunning(SESSION_ID)).toBe(true);
+      expect(await wakeContainer(row)).toBe(true);
+      expect(target.prepared).toHaveLength(0);
+    });
+
+    it('B3 post-reopen-stop-intent: restart recovery of a reopened kind is awaited by shutdown and never registers after it', async () => {
+      const secondary = registerRecordingFake();
+      await setContainerConfigDriver(GROUP_ID, secondary.kind);
+      await createGroupSession();
+      await coordination.setStopIntent(SESSION_ID, 'respawn_after_stop', now());
+      await installWith([secondary.kind]);
+      const atGateway = deferred<void>();
+      const gatewayRelease = deferred<void>();
+      gatewayWith({
+        beforeCreate: async () => {
+          atGateway.resolve();
+          await gatewayRelease.promise;
+        },
+      });
+
+      await adoptRunningSessions();
+      // The pass reopens the kind, and its recovery wake waits at the gateway.
+      await atGateway.promise;
+      expect(closedKinds()).toEqual([]);
+      expect(_runtimeReconciliationStateForTesting().recoveries).toBe(1);
+
+      _setRuntimeDiscoveryScheduleForTesting(5_000, 60_000);
+      const stopping = stopRuntimeReconciliation();
+      gatewayRelease.resolve();
+      await stopping;
+      expect(_runtimeReconciliationStateForTesting().recoveries).toBe(0);
+      // The recovery wake got as far as prepare, and was torn down there.
+      await vi.waitFor(() => expect(secondary.prepared).toHaveLength(1));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(isContainerRunning(SESSION_ID)).toBe(false);
+      // Not honored, so it is kept for the next start.
+      expect((await coordination.getSessionClaim(SESSION_ID))?.stop_intent).toBe('respawn_after_stop');
+    });
+
+    it('B4 unsettled-residue: a residue reap that fails or times out keeps the kind closed until it settles', async () => {
+      _setRuntimeDiscoveryScheduleForTesting(50, 60_000);
+      const hung = deferred<void>();
+      let reaps = 0;
+      const secondary = registerRecordingFake({
+        reapResidue: () => {
+          reaps += 1;
+          if (reaps === 1) return Promise.reject(new Error('apiserver 500'));
+          if (reaps === 2) return hung.promise;
+          return Promise.resolve();
+        },
+      });
+      await installWith([secondary.kind]);
+      await adoptRunningSessions();
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(closedKinds()).toEqual([secondary.kind]);
+
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(closedKinds()).toEqual([secondary.kind]);
+      expect(_runtimeReconciliationStateForTesting().outstandingCalls).toBe(1);
+
+      hung.resolve();
+      await vi.waitFor(() => expect(_runtimeReconciliationStateForTesting().outstandingCalls).toBe(0));
+      expect(await rediscoverUnavailableRuntimes()).toBe(1);
+      expect(reaps).toBe(3);
+    });
+
+    it('driver-change validation shares the outstanding listing: repeated attempts never stack listings', async () => {
+      _setRuntimeDiscoveryScheduleForTesting(50, 60_000);
+      let listings = 0;
+      const hung = registerRecordingFake({
+        listSessions: () => {
+          listings += 1;
+          return new Promise<SessionSnapshot[]>(() => {});
+        },
+      });
+      await setContainerConfigDriver(GROUP_ID, hung.kind);
+      await installWith([]);
+      await expect(changeGroupDriver(GROUP_ID, null, async () => {})).rejects.toThrow(/did not settle within 50ms/);
+      await expect(changeGroupDriver(GROUP_ID, null, async () => {})).rejects.toThrow(/did not settle within 50ms/);
+      expect(listings).toBe(1);
     });
 
     it('a single-runtime install lists unbounded and closes nothing, exactly as before', async () => {
@@ -989,6 +1490,60 @@ describe('composition on the spawn path', () => {
       expect(reapOrphans).toHaveBeenCalledTimes(1);
       const row = await createGroupSession();
       expect(await wakeAndRefusal(row)).toBeUndefined();
+    });
+
+    it('a single-runtime install: the pre-selection call sequence, no closed kind, no timer, no background work', async () => {
+      const calls: string[] = [];
+      await setContainerConfigDriver(GROUP_ID, null);
+      await createGroupSession();
+      let listed = false;
+      const defaultFake = await installWith([], {
+        ensureReady: async () => void calls.push('ensureReady'),
+        listSessions: async () => {
+          // The second listing is the session-events hub's resync.
+          calls.push(listed ? 'resync listSessions' : 'listSessions');
+          listed = true;
+          return [running(SESSION_ID, 'survivor')];
+        },
+        reconcileNetworkAccess: async () => void calls.push('reconcileNetworkAccess'),
+        reapResidue: async () => void calls.push('reapResidue'),
+      });
+      resetGatewayProvider({
+        kind: 'recording-gateway',
+        agentSkills: [],
+        sessions: {
+          async ensure() {
+            calls.push('gateway ensure');
+            return { contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } } };
+          },
+          reapOrphans: async () => void calls.push('gateway reapOrphans'),
+        },
+        approvals: { subscribe: async () => {} },
+      });
+
+      await ensureSessionRuntimesReady();
+      expect(await adoptRunningSessions()).toEqual({ adopted: 1, stopped: 0 });
+      expect(calls).toEqual([
+        'ensureReady',
+        'listSessions',
+        'gateway ensure',
+        'reconcileNetworkAccess',
+        'gateway reapOrphans',
+        'reapResidue',
+        'resync listSessions',
+      ]);
+      expect(isContainerRunning(SESSION_ID)).toBe(true);
+      expect(_runtimeReconciliationStateForTesting()).toEqual({
+        closed: [],
+        passes: 0,
+        retryTimers: 0,
+        recoveries: 0,
+        outstandingCalls: 0,
+      });
+      await stopRuntimeReconciliation();
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(calls).toHaveLength(7);
+      expect(defaultFake.prepared).toHaveLength(0);
     });
 
     it('readiness: a failing default with every group on another, ready runtime closes only the default', async () => {
@@ -1143,15 +1698,22 @@ describe('retained objects and driver changes', () => {
       ],
     });
     resetSessionDriver(getSessionDriver(defaultFake.kind));
-    const result = await adoptRunningSessions();
-    // The default runtime's orphan was handled; the unreachable one blocked nothing...
-    expect(result).toEqual({ adopted: 0, stopped: 1 });
-    // ...but its live sessions' gateway resources were not reaped as orphans.
-    expect(reapOrphans).not.toHaveBeenCalled();
-    expect(log.warn).toHaveBeenCalledWith(
-      'Failed to list existing sessions for adoption',
-      expect.objectContaining({ driver: unreachable.kind }),
-    );
+    try {
+      const result = await adoptRunningSessions();
+      // The default runtime's orphan was handled; the unreachable one blocked nothing...
+      expect(result).toEqual({ adopted: 0, stopped: 1 });
+      // ...but its live sessions' gateway resources were not reaped as orphans.
+      expect(reapOrphans).not.toHaveBeenCalled();
+      // It is reconciled in the background, and stays closed while it fails.
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(log.warn).toHaveBeenCalledWith(
+        'Session runtime not reconciled yet; its admission stays closed',
+        expect.objectContaining({ driver: unreachable.kind }),
+      );
+    } finally {
+      await stopRuntimeReconciliation();
+      _resetAdoptionRetryStateForTesting();
+    }
   });
 });
 
@@ -1237,7 +1799,7 @@ describe('startup discovery edge cases', () => {
     expect(reapOrphans).toHaveBeenCalledTimes(1);
   });
 
-  it('arbitrates duplicates without building the selected kind: a missing selected overlay plus copies on two runtimes', async () => {
+  it('a cross-runtime duplicate: the supervised copy wins, the late copy is stopped, the missing selected kind is never built again', async () => {
     let builds = 0;
     const missing = `fake-${++uniqueKind}`;
     registerSessionDriver(missing, () => {
@@ -1253,12 +1815,24 @@ describe('startup discovery edge cases', () => {
     });
     await ensureContainerConfig(GROUP_ID);
     await setContainerConfigDriver(GROUP_ID, missing);
+    await createSession({
+      id: 'sess-dup',
+      agent_group_id: GROUP_ID,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    });
     const stops: string[] = [];
     const copy = (name: string) =>
       ({
         handle: {
           ...fakeHandle(fixtureSpec({ key: key('sess-dup') })),
           name,
+          onTerminal: () => {},
           stop: async (reason: string) => void stops.push(`${name}:${reason}`),
         },
         phase: 'running',
@@ -1267,10 +1841,19 @@ describe('startup discovery edge cases', () => {
     await recordDriverKindsUsed([other.kind]);
     const defaultFake = registerRecordingFake({ listSessions: async () => [copy('default')] });
     resetSessionDriver(getSessionDriver(defaultFake.kind));
-    expect(await adoptRunningSessions()).toEqual({ adopted: 0, stopped: 2 });
-    // Discovery tried the missing kind once; arbitration never built it again.
-    expect(builds).toBe(1);
-    expect(stops.filter((stop) => stop.endsWith(':duplicate-at-startup'))).toHaveLength(1);
+    try {
+      expect(await adoptRunningSessions()).toEqual({ adopted: 1, stopped: 0 });
+      expect(await rediscoverUnavailableRuntimes()).toBe(1);
+      expect(stops).toEqual(['other:duplicate-at-rediscovery']);
+      expect(isContainerRunning('sess-dup')).toBe(true);
+      // Discovery tried the missing kind once; nothing built it again.
+      expect(builds).toBe(1);
+    } finally {
+      killContainer('sess-dup', 'test-teardown');
+      await vi.waitFor(() => expect(isContainerRunning('sess-dup')).toBe(false));
+      await stopRuntimeReconciliation();
+      _resetAdoptionRetryStateForTesting();
+    }
   });
 });
 
