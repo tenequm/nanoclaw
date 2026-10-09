@@ -2368,12 +2368,13 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     if (input.hostAddress) bypass.add(input.hostAddress);
     if (input.mailboxUrl) {
       const mailboxHost = new URL(input.mailboxUrl).hostname;
+      const canonicalHost = (host: string) => host.toLowerCase().replace(/\.$/, '');
       // On the lockdown network this alias names the gateway container, so the mailbox must stay proxied.
       const gatewayAlias =
         !input.hostAddress &&
         EGRESS_LOCKDOWN &&
         gateway.networkAccess.target.kind === 'runtime' &&
-        mailboxHost === gateway.networkAccess.endpoint.toLowerCase().replace(/\.$/, '');
+        canonicalHost(mailboxHost) === canonicalHost(gateway.networkAccess.endpoint);
       if (!gatewayAlias) bypass.add(mailboxHost);
     }
     contributedEnv.NO_PROXY = contributedEnv.no_proxy = [...bypass].join(',');

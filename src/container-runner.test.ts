@@ -259,15 +259,19 @@ describe('composeSessionSpec', () => {
     },
   );
 
-  it('matches the lockdown gateway alias case-insensitively', () => {
+  it.each([
+    ['host.docker.internal', 'HOST.Docker.Internal.'],
+    ['host.docker.internal.', 'host.docker.internal'],
+    ['host.docker.internal.', 'host.docker.internal.'],
+  ])('matches the lockdown gateway alias canonically (mailbox %s, endpoint %s)', (mailboxHost, endpoint) => {
     topology.lockdown = true;
     try {
       const spec = compose({
-        mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
+        mailboxUrl: `http://${mailboxHost}:3010/mailbox/v1`,
         gateway: {
           env: { ...proxyEnv, NO_PROXY: 'localhost' },
           networkAccess: {
-            endpoint: 'HOST.Docker.Internal.',
+            endpoint,
             target: { kind: 'runtime', identity: 'fixture-gateway' },
           },
         },
