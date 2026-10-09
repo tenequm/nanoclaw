@@ -139,6 +139,18 @@ export function sandboxPhase(box: Sandbox): SessionPhase {
   return !suspended(box) && currentCondition(box, 'Ready')?.status === 'True' ? 'running' : 'starting';
 }
 
+function snapshotPhase(box: Sandbox, pod?: k8s.V1Pod): SessionPhase {
+  if (
+    pod?.status?.containerStatuses?.some((s) => s.name === 'agent' && s.state?.terminated) ||
+    ['Succeeded', 'Failed'].includes(pod?.status?.phase ?? '')
+  )
+    return 'terminal';
+  const phase = sandboxPhase(box);
+  return phase === 'running' && (!pod || pod.metadata?.deletionTimestamp || pod.status?.phase !== 'Running')
+    ? 'starting'
+    : phase;
+}
+
 function keyFromLabels(labels: Record<string, string> | undefined): SessionKey | undefined {
   if (!labels?.[LABELS.install] || !labels[LABELS.group] || !labels[LABELS.session] || labels[LABELS.role] !== 'agent')
     return;
@@ -405,7 +417,7 @@ export class KubernetesSessionDriver implements SessionDriver {
   private clients?: { core: k8s.CoreV1Api; custom: k8s.CustomObjectsApi; config: k8s.KubeConfig };
   private readonly watches = new Map<string, InstallWatch>();
   private readonly groupLocks = new Map<string, Promise<unknown>>();
-  private readonly staleSince = new Map<string, number>();
+  private readonly staleSince = new Map<string, { generation: number; since: number }>();
 
   constructor(readonly opts: KubernetesDriverOptions) {}
 
@@ -732,7 +744,9 @@ export class KubernetesSessionDriver implements SessionDriver {
       if (!box) throw asFailureError({ kind: 'runtime-unavailable', retryable: true });
       if (!suspended(box)) throw asFailureError({ kind: 'runtime-unavailable', retryable: true });
       const pod = await this.readPod(key.installSlug, name);
-      return currentCondition(box, 'Suspended')?.status === 'True' && !pod ? box : undefined;
+      if (currentCondition(box, 'Suspended')?.status !== 'True' || pod) return;
+      this.staleSince.delete(box.metadata.uid ?? box.metadata.name!);
+      return box;
     });
   }
 
@@ -829,6 +843,7 @@ export class KubernetesSessionDriver implements SessionDriver {
     }
     if (suspended(box)) {
       if (pod || currentCondition(box, 'Suspended')?.status !== 'True') return { phase: 'preparing' };
+      this.staleSince.delete(box.metadata.uid ?? box.metadata.name!);
       return { phase: box.metadata.annotations?.[STARTED_ONCE] === 'true' ? 'stopped' : 'ready' };
     }
     if (currentCondition(box, 'Finished')?.status === 'True') {
@@ -865,8 +880,10 @@ export class KubernetesSessionDriver implements SessionDriver {
     const identity = box.metadata.uid ?? box.metadata.name!;
     if (observed < generation) {
       const stamp = box.metadata.annotations?.[SPEC_UPDATED] ?? box.metadata.creationTimestamp;
-      const since = this.staleSince.get(identity) ?? (stamp ? new Date(stamp).getTime() : Date.now());
-      this.staleSince.set(identity, since);
+      const previous = this.staleSince.get(identity);
+      const since =
+        previous?.generation === generation ? previous.since : stamp ? new Date(stamp).getTime() : Date.now();
+      this.staleSince.set(identity, { generation, since });
       if (Date.now() - since >= (this.opts.controllerTimeoutMs ?? 30_000))
         return { phase: 'failed', failure: { kind: 'runtime-unavailable', retryable: true } };
     } else this.staleSince.delete(identity);
@@ -958,20 +975,12 @@ export class KubernetesSessionDriver implements SessionDriver {
         const key = keyFromLabels(box.metadata.labels)!;
         const pod = byName.get(box.metadata.name);
         const terminated = pod?.status?.containerStatuses?.find((s) => s.name === 'agent')?.state?.terminated;
-        const observedPhase = sandboxPhase(box);
-        const phase =
-          terminated || ['Succeeded', 'Failed'].includes(pod?.status?.phase ?? '')
-            ? 'terminal'
-            : observedPhase === 'running' &&
-                (!pod || pod.metadata?.deletionTimestamp || pod.status?.phase !== 'Running')
-              ? 'starting'
-              : observedPhase;
         const failed = terminated
           ? terminated.exitCode !== 0
           : pod?.status?.phase === 'Failed' || currentCondition(box, 'Finished')?.reason === 'PodFailed';
         return {
           handle: this.handle(key, box.metadata.name!, null, box.metadata.uid),
-          phase,
+          phase: snapshotPhase(box, pod),
           ...(failed && {
             failure: {
               kind: 'started-then-died' as const,
@@ -1029,21 +1038,49 @@ export class KubernetesSessionDriver implements SessionDriver {
   }
 
   private async deleteSandbox(key: SessionKey, box: Sandbox): Promise<void> {
+    if (!box.metadata.uid || !box.metadata.resourceVersion) return;
     try {
-      if (box.metadata.uid) this.staleSince.delete(box.metadata.uid);
       await (
         await this.api()
       ).custom.deleteNamespacedCustomObject(
         {
           ...this.params(key.installSlug),
           name: box.metadata.name!,
-          body: { preconditions: { uid: box.metadata.uid }, propagationPolicy: 'Background' },
+          body: {
+            preconditions: { uid: box.metadata.uid, resourceVersion: box.metadata.resourceVersion },
+            propagationPolicy: 'Background',
+          },
         },
         this.requestOptions(),
       );
+      this.staleSince.delete(box.metadata.uid);
     } catch (error) {
-      if (apiCode(error) !== 404) throw normalizeKubernetesError(error);
+      // A concurrent lifecycle or controller update invalidates the cleanup decision.
+      if (apiCode(error) !== 404 && apiCode(error) !== 409) throw normalizeKubernetesError(error);
     }
+  }
+
+  private async reapSandbox(key: SessionKey, observed: Sandbox, retained: boolean): Promise<void> {
+    await this.locked(key, async () => {
+      const box = await this.readSandbox(key, observed.metadata.name!);
+      if (
+        !box ||
+        !observed.metadata.uid ||
+        box.metadata.uid !== observed.metadata.uid ||
+        box.metadata.generation !== observed.metadata.generation ||
+        !isDeepStrictEqual(keyFromLabels(box.metadata.labels), key) ||
+        isGatewayOwned(box.metadata.labels?.[LABELS.session], box.metadata.labels?.[LABELS.role]) ||
+        suspended(box) !== retained
+      )
+        return;
+      const pod = await this.readPod(key.installSlug, box.metadata.name!);
+      if (
+        retained
+          ? currentCondition(box, 'Suspended')?.status === 'True' && !pod
+          : snapshotPhase(box, pod) === 'terminal'
+      )
+        await this.deleteSandbox(key, box);
+    });
   }
 
   async reapRetained(installSlug: string, keys: SessionKey[]): Promise<void> {
@@ -1051,20 +1088,25 @@ export class KubernetesSessionDriver implements SessionDriver {
     for (const key of keys) {
       if (key.installSlug !== installSlug || !key.sessionId) continue;
       const box = boxes.find((b) => isDeepStrictEqual(keyFromLabels(b.metadata.labels), key));
-      if (
-        box &&
-        suspended(box) &&
-        !isGatewayOwned(box.metadata.labels?.[LABELS.session], box.metadata.labels?.[LABELS.role])
-      )
-        await this.deleteSandbox(key, box);
+      if (box && suspended(box)) await this.reapSandbox(key, box, true);
     }
   }
 
   async reapResidue(installSlug: string): Promise<void> {
-    for (const snapshot of await this.listSessions(installSlug)) {
-      if (snapshot.phase !== 'terminal') continue;
-      const box = await this.readSandbox(snapshot.handle.key, snapshot.handle.name);
-      if (box && !suspended(box)) await this.deleteSandbox(snapshot.handle.key, box);
+    const boxes = (await this.listSandboxes(installSlug)).items.filter(
+      (box) => !suspended(box) && keyFromLabels(box.metadata.labels),
+    );
+    if (!boxes.length) return;
+    const pods = await (
+      await this.api()
+    ).core.listNamespacedPod(
+      { namespace: this.namespace(installSlug), labelSelector: `${LABELS.install}=${projectLabelValue(installSlug)}` },
+      this.requestOptions(),
+    );
+    const byName = new Map(pods.items.map((pod) => [pod.metadata?.name, pod]));
+    for (const box of boxes) {
+      if (snapshotPhase(box, byName.get(box.metadata.name)) === 'terminal')
+        await this.reapSandbox(keyFromLabels(box.metadata.labels)!, box, false);
     }
   }
 

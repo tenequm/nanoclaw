@@ -115,7 +115,7 @@ function harness(options: Partial<KubernetesDriverOptions> = {}) {
     })),
     createNamespacedCustomObject: vi.fn(async ({ body }: { body: Sandbox }) => {
       const box = structuredClone(body);
-      Object.assign(box.metadata, { uid: 'sandbox-uid', generation: 1 });
+      Object.assign(box.metadata, { uid: 'sandbox-uid', generation: 1, resourceVersion: '1' });
       setConditions(box);
       boxes.set(box.metadata.name!, box);
       return structuredClone(box);
@@ -142,10 +142,18 @@ function harness(options: Partial<KubernetesDriverOptions> = {}) {
         });
         for (const pvc of pvcs.values()) pvc.status = { phase: 'Bound' };
       } else if (body.spec?.operatingMode === 'Suspended') pods.delete(name);
+      box.metadata.resourceVersion = String(Number(box.metadata.resourceVersion) + 1);
       setConditions(box);
       return structuredClone(box);
     }),
-    deleteNamespacedCustomObject: vi.fn(async ({ name }: { name: string }) => {
+    deleteNamespacedCustomObject: vi.fn(async ({ name, body }: { name: string; body: k8s.V1DeleteOptions }) => {
+      const box = boxes.get(name);
+      if (!box) throw notFound();
+      if (
+        (body.preconditions?.uid && body.preconditions.uid !== box.metadata.uid) ||
+        (body.preconditions?.resourceVersion && body.preconditions.resourceVersion !== box.metadata.resourceVersion)
+      )
+        throw Object.assign(new Error('Conflict'), { code: 409 });
       boxes.delete(name);
       pods.delete(name);
       for (const [key, secret] of secrets)
@@ -525,6 +533,181 @@ describe('kubernetes driver lifecycle', () => {
     expect(h.pvcs.size).toBe(1);
     await h.driver.reapRetained('spike', [h.spec.key]);
   });
+  it.each(['retained', 'residue'] as const)('does not reap a resumed session after %s observation', async (path) => {
+    const h = harness();
+    let handle = await h.driver.prepare(h.spec);
+    await handle.start();
+    if (path === 'retained') await handle.stop('idle');
+    else setCondition(h.boxes.get(handle.name)!, 'Finished', 'True', 'PodFailed');
+    let release!: () => void;
+    let observed!: () => void;
+    const observation = new Promise<void>((resolve) => {
+      observed = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const list = h.custom.listNamespacedCustomObject.getMockImplementation()!;
+    h.custom.listNamespacedCustomObject.mockImplementationOnce(async () => {
+      const result = await list();
+      observed();
+      await gate;
+      return result;
+    });
+    const cleanup = path === 'retained' ? h.driver.reapRetained('spike', [h.spec.key]) : h.driver.reapResidue('spike');
+    await observation;
+    await handle.stop('resume');
+    handle = await h.driver.prepare(h.spec);
+    await handle.start();
+    expect(await handle.status()).toEqual({ phase: 'running' });
+    release();
+    await cleanup;
+    expect(h.boxes.has(handle.name)).toBe(true);
+    expect(h.secrets.size).toBe(1);
+    expect(h.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
+  it.each(['retained', 'residue'] as const)(
+    'does not reap a replacement Sandbox after %s observation',
+    async (path) => {
+      const h = harness();
+      const handle = await h.driver.prepare(h.spec);
+      if (path === 'residue') {
+        await handle.start();
+        setCondition(h.boxes.get(handle.name)!, 'Finished', 'True', 'PodFailed');
+      }
+      const list = h.custom.listNamespacedCustomObject.getMockImplementation()!;
+      h.custom.listNamespacedCustomObject.mockImplementationOnce(async () => {
+        const result = await list();
+        h.boxes.get(handle.name)!.metadata.uid = 'replacement-uid';
+        return result;
+      });
+      if (path === 'retained') await h.driver.reapRetained('spike', [h.spec.key]);
+      else await h.driver.reapResidue('spike');
+      expect(h.boxes.get(handle.name)?.metadata.uid).toBe('replacement-uid');
+      expect(h.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['retained', 'residue'] as const)(
+    'skips %s deletion on concurrent resourceVersion conflict',
+    async (path) => {
+      const h = harness();
+      const handle = await h.driver.prepare(h.spec);
+      if (path === 'residue') {
+        await handle.start();
+        setCondition(h.boxes.get(handle.name)!, 'Finished', 'True', 'PodFailed');
+      }
+      const remove = h.custom.deleteNamespacedCustomObject.getMockImplementation()!;
+      const box = h.boxes.get(handle.name)!;
+      const version = box.metadata.resourceVersion;
+      h.custom.deleteNamespacedCustomObject.mockImplementationOnce(async (input) => {
+        box.spec.operatingMode = 'Running';
+        box.metadata.resourceVersion = String(Number(version) + 1);
+        return remove(input);
+      });
+      if (path === 'retained') await h.driver.reapRetained('spike', [h.spec.key]);
+      else await h.driver.reapResidue('spike');
+      expect(h.boxes.has(handle.name)).toBe(true);
+      expect(h.custom.deleteNamespacedCustomObject).toHaveBeenCalledTimes(1);
+      expect(h.custom.deleteNamespacedCustomObject.mock.calls[0][0].body.preconditions).toEqual({
+        uid: 'sandbox-uid',
+        resourceVersion: version,
+      });
+    },
+  );
+
+  it.each(['retained', 'residue'] as const)('revalidates current %s eligibility before deletion', async (path) => {
+    const h = harness();
+    const handle = await h.driver.prepare(h.spec);
+    if (path === 'residue') {
+      await handle.start();
+      setCondition(h.boxes.get(handle.name)!, 'Finished', 'True', 'PodFailed');
+    }
+    const list = h.custom.listNamespacedCustomObject.getMockImplementation()!;
+    h.custom.listNamespacedCustomObject.mockImplementationOnce(async () => {
+      const result = await list();
+      const box = h.boxes.get(handle.name)!;
+      if (path === 'retained') setCondition(box, 'Suspended', 'False', 'Suspending');
+      else setCondition(box, 'Finished', 'False', 'Running');
+      return result;
+    });
+    if (path === 'retained') await h.driver.reapRetained('spike', [h.spec.key]);
+    else await h.driver.reapResidue('spike');
+    expect(h.boxes.has(handle.name)).toBe(true);
+    expect(h.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
+  it('resets a stale deadline on generation change without a suspension observation', async () => {
+    const h = harness({ controllerTimeoutMs: 50 });
+    const handle = await h.driver.prepare(h.spec);
+    await handle.start();
+    const box = h.boxes.get(handle.name)!;
+    box.metadata.generation!++;
+    box.metadata.annotations!['nanoclaw.dev/spec-updated-at'] = new Date(Date.now() - 1000).toISOString();
+    expect(await handle.status()).toMatchObject({ phase: 'failed', failure: { kind: 'runtime-unavailable' } });
+    box.metadata.generation!++;
+    box.metadata.annotations!['nanoclaw.dev/spec-updated-at'] = new Date().toISOString();
+    expect(await handle.status()).toEqual({ phase: 'preparing' });
+  });
+
+  it.each(['retained', 'residue'] as const)('serializes %s revalidation with lifecycle operations', async (path) => {
+    const h = harness();
+    const handle = await h.driver.prepare(h.spec);
+    if (path === 'residue') {
+      await handle.start();
+      setCondition(h.boxes.get(handle.name)!, 'Finished', 'True', 'PodFailed');
+    }
+    let release!: () => void;
+    let observed!: () => void;
+    const observation = new Promise<void>((resolve) => {
+      observed = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const read = h.custom.getNamespacedCustomObject.getMockImplementation()!;
+    h.custom.getNamespacedCustomObject.mockImplementationOnce(async (input) => {
+      observed();
+      await gate;
+      return read(input);
+    });
+    const cleanup = path === 'retained' ? h.driver.reapRetained('spike', [h.spec.key]) : h.driver.reapResidue('spike');
+    await observation;
+    let stopped = false;
+    const stop = handle.stop('cleanup').then(() => {
+      stopped = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(stopped).toBe(false);
+    release();
+    await Promise.all([cleanup, stop]);
+    expect(h.boxes.size).toBe(0);
+  });
+
+  it('gives a resumed generation a fresh controller deadline after outage recovery', async () => {
+    const h = harness({ controllerTimeoutMs: 50, startTimeoutMs: 200 });
+    let handle = await h.driver.prepare(h.spec);
+    await handle.start();
+    const box = h.boxes.get(handle.name)!;
+    box.metadata.generation!++;
+    box.metadata.annotations!['nanoclaw.dev/spec-updated-at'] = new Date(Date.now() - 1000).toISOString();
+    expect(await handle.status()).toMatchObject({ phase: 'failed', failure: { kind: 'runtime-unavailable' } });
+    await handle.stop('controller-recovered');
+    handle = await h.driver.prepare(h.spec);
+    const patch = h.custom.patchNamespacedCustomObject.getMockImplementation()!;
+    h.custom.patchNamespacedCustomObject.mockImplementation(async (input) => {
+      const result = await patch(input);
+      if (input.body.spec?.operatingMode === 'Running') {
+        setCondition(box, 'Ready', 'True', 'DependenciesReady', box.metadata.generation! - 1);
+        setTimeout(() => setCondition(box, 'Ready', 'True', 'DependenciesReady'), 10);
+      }
+      return result;
+    });
+    await handle.start();
+    expect(await handle.status()).toEqual({ phase: 'running' });
+  });
+
   it('reports clean exit and failure before Ready with exact exit codes', async () => {
     const h = harness();
     const handle = await h.driver.prepare(h.spec);
