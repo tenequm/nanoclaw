@@ -11,7 +11,9 @@ import './agents.js';
 import './self-mod.js';
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import '../modules/index.js';
+import { loadConfig } from '../config.js';
 import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
+import { offerRichMessages } from './core.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {
@@ -19,6 +21,8 @@ function log(msg: string): void {
 }
 
 async function main(): Promise<void> {
+  // The MCP server runs in its own process; it reads the same container.json the runner does.
+  if (loadConfig().richMessages) offerRichMessages();
   const mailbox = getAgentMailbox();
   await mailbox.start(await readMailboxContext());
   // startMcpServer returns once stdio is attached while tools keep running for

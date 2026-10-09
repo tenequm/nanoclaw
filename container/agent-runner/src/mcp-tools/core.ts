@@ -9,7 +9,6 @@
 import fs from 'fs';
 import path from 'path';
 
-import { loadConfig } from '../config.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo, getCurrentReplyRoute } from '../db/session-state.js';
@@ -83,6 +82,8 @@ function resolveSeqTarget(
 
 const MAX_QUOTE_LENGTH = 1024;
 
+let richOffered = false;
+
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
@@ -153,8 +154,6 @@ export const sendMessage: McpToolDefinition = {
     return ok(`Message sent to ${routing.resolvedName} (id: ${seq})`);
   },
 };
-
-let richOffered = false;
 
 /**
  * Offer `send_message`'s `rich` flag, for a group the host lets send Telegram
@@ -405,6 +404,3 @@ export const addReaction: McpToolDefinition = {
 };
 
 registerTools([sendMessage, sendFile, sendMediaGroup, editMessage, addReaction]);
-
-// The MCP server runs in its own process; it reads the same container.json the runner does.
-if (loadConfig().richMessages) offerRichMessages();

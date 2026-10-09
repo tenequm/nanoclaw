@@ -465,7 +465,6 @@ const editCaptionBody = (
  */
 const isTelegramRejection = (err: GrammyDeliveryError): boolean =>
   err._tag === 'GrammyEntityError' ||
-  err._tag === 'GrammyQuoteError' ||
   (err._tag === 'GrammyApiError' && (err.errorCode === 400 || err.errorCode === 404));
 
 /** On a Telegram rejection of the rich form, log it and take the normal path instead. */

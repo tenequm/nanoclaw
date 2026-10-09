@@ -2,8 +2,9 @@
  * Telegram prose for the agents' composed project documents: the
  * telegram-formatting skill's gate and the Rich messages section.
  *
- * Kept apart from the adapter so composing a document never loads grammY: the
- * section and its gate are pure DB reads, registered at import time.
+ * Kept apart from the adapter so tests can compose a document without loading
+ * the adapter: the section and its gate are pure DB reads, registered at import
+ * time.
  */
 import { getContainerConfig } from '../../db/container-configs.js';
 import { isAgentWiredToChannel } from '../../db/messaging-groups.js';

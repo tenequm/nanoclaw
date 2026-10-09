@@ -12,18 +12,20 @@
  * pre-topic behavior). Host restarts wipe the map — accepted gap: a
  * reaction to a pre-restart message routes to the base chat row instead of
  * the topic.
+ *
+ * Also hosts the bounded per-message map (`createMessageMap`) that outbound.ts reuses.
  */
 const MAX_ENTRIES = 4096;
 
-/** A bounded FIFO keyed by (chatId, messageId): the newest `max` entries survive. */
-export function createMessageMap<V>(max = MAX_ENTRIES) {
+/** A bounded FIFO keyed by (chatId, messageId): the newest `MAX_ENTRIES` entries survive. */
+export function createMessageMap<V>() {
   const entries = new Map<string, V>();
   return {
     remember(chatId: number, messageId: number | string, value: V): void {
       const key = `${chatId}:${messageId}`;
       if (entries.has(key)) entries.delete(key);
       entries.set(key, value);
-      if (entries.size > max) {
+      if (entries.size > MAX_ENTRIES) {
         const oldest = entries.keys().next().value;
         if (oldest !== undefined) entries.delete(oldest);
       }
