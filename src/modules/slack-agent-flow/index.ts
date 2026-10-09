@@ -26,7 +26,7 @@ import { reenterGuardedDeliveryAction, registerDeliveryAction, registerDeliveryB
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroup, isAgentWiredToChannel } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
-import { registerModuleSectionGate } from '../../project-doc-compose.js';
+import { registerModuleSectionGate, registerResidentSkillGate } from '../../project-doc-compose.js';
 import type { Session } from '../../types.js';
 import { getDestinationByName, normalizeName } from '../agent-to-agent/db/agent-destinations.js';
 import { createAgent, requestCreateAgentHold, validateCreateAgent } from '../agent-to-agent/create-agent.js';
@@ -275,8 +275,9 @@ registerDeliveryAction('add_to_room', handleAddToRoom, {
 });
 registerApprovalHandler('add_to_room', reenterGuardedDeliveryAction('add_to_room'));
 
-// The room and Slack-provisioning prose reaches only Slack-wired agents (named
-// slack-<name> instances share channel_type 'slack'); the tools stay registered.
+// The room, Slack-provisioning and sibling-agent prose reaches only Slack-wired
+// agents (named slack-<name> instances share channel_type 'slack'); the tools stay registered.
 for (const moduleName of ['create-agent-slack', 'rooms']) {
   registerModuleSectionGate(moduleName, (group) => isAgentWiredToChannel(group.id, 'slack'));
 }
+registerResidentSkillGate('slack-construct-agents', (group) => isAgentWiredToChannel(group.id, 'slack'));

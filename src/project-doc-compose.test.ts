@@ -52,6 +52,7 @@ import {
   RICH_MESSAGES_BODY,
   RICH_MESSAGES_SECTION,
 } from './channels/telegram-grammy/agent-docs.js';
+import './channels/slack.js';
 import './modules/canvas-actions/index.js';
 import './modules/slack-agent-flow/index.js';
 
@@ -377,6 +378,7 @@ describe('composeGroupProjectDoc per-agent sections', () => {
   const JEV_SECTION = 'NanoClaw Module: jev-gate';
   const VOICE_SECTION = 'NanoClaw Skill: voice-mode-formatting';
   const SLACK_ONLY_MODULES = ['canvas', 'create-agent-slack', 'rooms'];
+  const SLACK_ONLY_SKILLS = ['slack-construct', 'slack-construct-agents'];
 
   beforeEach(() => {
     fs.mkdirSync(path.join(TEST_ROOT, 'data'), { recursive: true });
@@ -530,6 +532,21 @@ describe('composeGroupProjectDoc per-agent sections', () => {
     for (const name of SLACK_ONLY_MODULES) {
       expect(composedSection(doc, `NanoClaw Module: ${name}`)).toContain(source(name));
     }
+  });
+
+  it('composes the Slack skills for a Slack-wired agent on "all", and leaves them out for a Telegram-only one', async () => {
+    const slack = await seed('ag-slack-skills', 'slack-skills-group');
+    await wire(slack, 'mg-slack-skills', 'slack', 'slack-emma');
+    const slackDoc = await withRealContainer(() => compose(slack));
+    for (const name of SLACK_ONLY_SKILLS) {
+      expect(composedSection(slackDoc, `NanoClaw Skill: ${name}`)).toContain(realSkill(name));
+    }
+
+    const tg = await seed('ag-tg-skills', 'tg-skills-group');
+    await wire(tg, 'mg-tg-skills', 'telegram');
+    const tgDoc = await withRealContainer(() => compose(tg));
+    expect(tgDoc).toContain('# NanoClaw Skill: onecli-gateway');
+    for (const name of SLACK_ONLY_SKILLS) expect(tgDoc).not.toContain(`# NanoClaw Skill: ${name}\n`);
   });
 
   it('leaves a module out, and logs at error, when its gate throws', async () => {

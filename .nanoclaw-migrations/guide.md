@@ -225,6 +225,8 @@ the block stays untouched, so a later merge conflicts only at the file's end.
 (shared `SectionGate`, a throwing gate leaves the section out). `canvas-actions` and
 `slack-agent-flow` gate `canvas`, `create-agent-slack` and `rooms` on
 `isAgentWiredToChannel(group.id, 'slack')` (`src/db/messaging-groups.ts`).
+The same predicate gates the resident skills `slack-construct` (registered in
+`src/channels/slack.ts`) and `slack-construct-agents` (in `slack-agent-flow`) (2026-10-09).
 
 ## D5. [DROPPED] Repo `CLAUDE.md` fork sections
 Chat Commands, Per-agent group file layout (obsolete after the project-doc change), typing

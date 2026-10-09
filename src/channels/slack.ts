@@ -16,7 +16,9 @@
  */
 import { createSlackAdapter, type SlackAdapter } from '@chat-adapter/slack';
 
+import { isAgentWiredToChannel } from '../db/messaging-groups.js';
 import { readEnvFile } from '../env.js';
+import { registerResidentSkillGate } from '../project-doc-compose.js';
 import type { ChannelAdapter, ChannelDefaults } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -257,3 +259,7 @@ for (const raw of (readEnvFile(['SLACK_INSTANCES']).SLACK_INSTANCES ?? '').split
     defaults: SLACK_DEFAULTS,
   });
 }
+
+// The Slack room prose reaches only Slack-wired agents, whatever their skill
+// selection; every named slack-<name> instance shares channel_type 'slack'.
+registerResidentSkillGate('slack-construct', (group) => isAgentWiredToChannel(group.id, 'slack'));
