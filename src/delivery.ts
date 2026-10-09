@@ -810,10 +810,14 @@ async function deliverMessage(
  * Whether a message the agent marked `rich` may go out as a Rich Message: only
  * for a group whose `rich_messages` setting is on. The container is untrusted,
  * so its flag alone never decides; a refused one sends as a normal message.
+ * An edit carries no agent flag: the setting alone decides whether a Rich
+ * Message is edited in the rich form.
  */
 async function richAllowed(messageId: string, content: Record<string, unknown>, session: Session): Promise<boolean> {
-  if (content.rich !== true) return false;
+  const isEdit = content.operation === 'edit';
+  if (!isEdit && content.rich !== true) return false;
   if ((await getContainerConfig(session.agent_group_id))?.rich_messages === 1) return true;
+  if (isEdit) return false;
   log.warn('Rich message requested by a group without rich_messages; sending it as a normal message', {
     id: messageId,
     agentGroupId: session.agent_group_id,

@@ -27,6 +27,7 @@ const METHODS = [
   'sendRichMessage',
   'editMessageText',
   'editMessageCaption',
+  'setMessageReaction',
 ];
 
 function fakeBot(fail?: (call: Call) => unknown) {
@@ -162,9 +163,12 @@ describe('telegram outbound reply threading', () => {
   it('never resends a delivered chunk when a later one fails', async () => {
     const bot = fakeBot((call) => (call.other.reply_parameters ? undefined : badRequest('quote not found')));
     const long = `${'a'.repeat(TELEGRAM_TEXT_LIMIT - 10)}\n\n${'b'.repeat(200)}`;
-    await expect(
-      bot.run({ kind: 'chat', content: { text: long, threadReply: { quote: 'aaa' } }, inReplyTo: '42:7' }),
-    ).rejects.toBeDefined();
+    const id = await bot.run({
+      kind: 'chat',
+      content: { text: long, threadReply: { quote: 'aaa' } },
+      inReplyTo: '42:7',
+    });
+    expect(id).toBe('100');
     expect(bot.calls).toHaveLength(2);
   });
 
@@ -324,14 +328,45 @@ describe('telegram outbound rich messages', () => {
         : undefined,
     );
     const id = await bot.run({ kind: 'chat', content: { text: table, rich: true } });
-    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '# new' } });
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '# new', rich: true } });
     expect(bot.calls[1].method).toBe('editMessageText');
     expect(bot.calls[1].args.slice(0, 3)).toEqual([42, Number(id), { markdown: '# new' }]);
 
-    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: 'bad' } });
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: 'bad', rich: true } });
     expect(bot.calls.slice(2).map((c) => [c.method, c.args[2]])).toEqual([
       ['editMessageText', { markdown: 'bad' }],
       ['editMessageText', 'bad'],
+    ]);
+  });
+
+  it('edits a rich message in the normal form when the host did not allow rich', async () => {
+    const bot = fakeBot();
+    const id = await bot.run({ kind: 'chat', content: { text: table, rich: true } });
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '**new**' } });
+    expect(bot.calls[1]).toMatchObject({ method: 'editMessageText', other: { entities: [{ type: 'bold' }] } });
+    expect(bot.calls[1].args.slice(0, 3)).toEqual([42, Number(id), 'new']);
+  });
+});
+
+describe('telegram outbound stays in its own chat', () => {
+  it('refuses to edit or react to a message in another chat', async () => {
+    const bot = fakeBot();
+    expect(
+      await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: '99:7', text: 'gotcha' } }),
+    ).toBeUndefined();
+    expect(
+      await bot.run({ kind: 'chat', content: { operation: 'reaction', messageId: '99:7', emoji: 'thumbs_up' } }),
+    ).toBeUndefined();
+    expect(bot.calls).toEqual([]);
+  });
+
+  it('edits and reacts in its own chat, by compound or bare id', async () => {
+    const bot = fakeBot();
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: '7', text: 'resolved' } });
+    await bot.run({ kind: 'chat', content: { operation: 'reaction', messageId: '42:7:ag-1', emoji: 'thumbs_up' } });
+    expect(bot.calls.map((c) => [c.method, c.args[0], c.args[1]])).toEqual([
+      ['editMessageText', 42, 7],
+      ['setMessageReaction', 42, 7],
     ]);
   });
 });
@@ -371,7 +406,7 @@ describe('telegram outbound never sends twice', () => {
     );
     await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: '42:7', text: 'same' } });
     const id = await bot.run({ kind: 'chat', content: { text: '| a |', rich: true } });
-    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '| a |' } });
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '| a |', rich: true } });
     expect(bot.calls.map((c) => c.method)).toEqual(['editMessageText', 'sendRichMessage', 'editMessageText']);
   });
 
@@ -383,6 +418,63 @@ describe('telegram outbound never sends twice', () => {
       await expect(bot.run({ kind: 'chat', content: { text: '| a |', rich: true } })).rejects.toBeDefined();
       expect(bot.calls.map((c) => c.method)).toEqual(['sendRichMessage']);
     }
+  });
+
+  it('keeps a delivered first text chunk delivered when a later chunk fails', async () => {
+    const bot = fakeBot((call) =>
+      (call.args[1] as string).startsWith('b') ? badRequest('chat not found') : undefined,
+    );
+    const id = await bot.run({ kind: 'chat', content: { text: long } });
+    expect(id).toBe('100');
+    expect(bot.calls.map((c) => (c.args[1] as string)[0])).toEqual(['a', 'b']);
+  });
+
+  it('fails the delivery when the first text chunk fails', async () => {
+    const bot = fakeBot(() => badRequest('chat not found'));
+    await expect(bot.run({ kind: 'chat', content: { text: long } })).rejects.toBeDefined();
+    expect(bot.calls).toHaveLength(1);
+  });
+
+  it('keeps the first of several files delivered when a later file fails', async () => {
+    const bot = fakeBot((call) =>
+      call.method === 'sendDocument' && (call.args[1] as { filename?: string }).filename === 'b.pdf'
+        ? badRequest('file too big', call.method)
+        : undefined,
+    );
+    const id = await bot.run({ kind: 'chat', content: { text: 'files' }, files: [file('a.pdf'), file('b.pdf')] });
+    expect(id).toBe('100');
+    expect(bot.calls.map((c) => c.method)).toEqual(['sendDocument', 'sendDocument']);
+  });
+
+  it('keeps the first document of a mixed album delivered when a later one fails', async () => {
+    const bot = fakeBot((call) =>
+      (call.args[1] as { filename?: string }).filename === 'b.pdf'
+        ? badRequest('file too big', call.method)
+        : undefined,
+    );
+    const id = await bot.run({
+      kind: 'chat',
+      content: { operation: 'send_media_group', items: [{ path: 'a.jpg' }, { path: 'b.pdf' }] },
+      files: [file('a.jpg'), file('b.pdf')],
+    });
+    expect(id).toBe('100');
+    expect(bot.calls.map((c) => c.method)).toEqual(['sendDocument', 'sendDocument']);
+  });
+
+  it('never resends an asked question when its overflow fails', async () => {
+    const bot = fakeBot((call) => (call.other.reply_markup ? undefined : badRequest('chat not found')));
+    const id = await bot.run({
+      kind: 'chat',
+      content: {
+        type: 'ask_question',
+        questionId: 'q1',
+        title: 'Pick',
+        question: `${'a'.repeat(TELEGRAM_TEXT_LIMIT - 10)}\n\n${'b'.repeat(200)}`,
+        options: ['Yes', 'No'],
+      },
+    });
+    expect(id).toBe('100');
+    expect(bot.calls).toHaveLength(2);
   });
 
   it("sends nothing and reports it when none of an album's files are in the outbox", async () => {

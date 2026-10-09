@@ -168,38 +168,6 @@ const sendWithFallback = <A>(
   );
 
 /**
- * Send text chunks in order; returns the last chunk's id. The plain-text retry
- * is per chunk, so a chunk that already went out is never sent again.
- */
-const sendTextChunks = Effect.fn('telegram-grammy.sendTextChunks')(function* (
-  chatId: number,
-  messageThreadId: number | undefined,
-  chunks: readonly FormattedString[],
-  reply: ReplyParameters | undefined,
-) {
-  const { bot } = yield* BotService;
-  let lastId: number | undefined;
-  for (const [index, chunk] of chunks.entries()) {
-    const sent = yield* sendWithFallback((plain) =>
-      sendReplying(index, reply, (replyParameters) =>
-        Effect.tryPromise({
-          try: () =>
-            bot.api.sendMessage(chatId, chunk.text, {
-              entities: plain ? undefined : chunk.entities,
-              message_thread_id: messageThreadId,
-              link_preview_options: { is_disabled: true },
-              reply_parameters: replyParameters,
-            }),
-          catch: (err) => mapGrammyError(err, plain ? 'sendMessage-plain' : 'sendMessage', String(chatId)),
-        }),
-      ),
-    );
-    lastId = sent.message_id;
-  }
-  return lastId != null ? String(lastId) : undefined;
-});
-
-/**
  * Whatever goes out after a delivery's first message has landed: failing it
  * would make the host retry the whole delivery and send that first message
  * again, so a failure here is logged instead.
@@ -212,6 +180,46 @@ const afterFirstSend = <R>(
     Effect.asVoid,
     Effect.catch((err) => Effect.logError(`telegram-grammy: ${what} failed after the message was sent`, err)),
   );
+
+/**
+ * Send text chunks in order; returns the last sent chunk's id. Only the first
+ * chunk can fail the delivery. The plain-text retry is per chunk, so a chunk
+ * that already went out is never sent again.
+ */
+const sendTextChunks = Effect.fn('telegram-grammy.sendTextChunks')(function* (
+  chatId: number,
+  messageThreadId: number | undefined,
+  chunks: readonly FormattedString[],
+  reply: ReplyParameters | undefined,
+) {
+  const { bot } = yield* BotService;
+  let lastId: string | undefined;
+  for (const [index, chunk] of chunks.entries()) {
+    const send = sendWithFallback((plain) =>
+      sendReplying(index, reply, (replyParameters) =>
+        Effect.tryPromise({
+          try: () =>
+            bot.api.sendMessage(chatId, chunk.text, {
+              entities: plain ? undefined : chunk.entities,
+              message_thread_id: messageThreadId,
+              link_preview_options: { is_disabled: true },
+              reply_parameters: replyParameters,
+            }),
+          catch: (err) => mapGrammyError(err, plain ? 'sendMessage-plain' : 'sendMessage', String(chatId)),
+        }),
+      ),
+    ).pipe(
+      Effect.tap((sent) =>
+        Effect.sync(() => {
+          lastId = String(sent.message_id);
+        }),
+      ),
+    );
+    if (index === 0) yield* send;
+    else yield* afterFirstSend(`chunk ${index + 1} of ${chunks.length}`, send);
+  }
+  return lastId;
+});
 
 /**
  * Text that did not fit where it was meant to go (a caption's overflow, the
@@ -369,10 +377,18 @@ const sendDefault = Effect.fn('telegram-grammy.sendDefault')(function* (
   let lastId: string | undefined;
   for (const [index, file] of files.entries()) {
     const kind = files.length === 1 ? mediaKindFromFilename(file.filename) : 'document';
-    lastId = yield* sendReplying(index, reply, (replyParameters) =>
+    const send = sendReplying(index, reply, (replyParameters) =>
       sendSingleFile(bot, chatId, kind, file, index === 0 ? caption : undefined, messageThreadId, replyParameters),
+    ).pipe(
+      Effect.tap((id) =>
+        Effect.sync(() => {
+          lastId = id;
+          rememberSentKind(chatId, id, 'media');
+        }),
+      ),
     );
-    rememberSentKind(chatId, lastId, 'media');
+    if (index === 0) yield* send;
+    else yield* afterFirstSend(`file ${index + 1} of ${files.length}`, send);
   }
   yield* sendFollowUp(chatId, messageThreadId, rest);
   return lastId;
@@ -525,8 +541,9 @@ const editRich = (
   });
 
 /**
- * Edit a message the bot sent. A Rich Message is edited in the rich form; a
- * media message gets its caption edited (known from what was sent, or learned
+ * Edit a message the bot sent. A Rich Message is edited in the rich form while
+ * the host allows it (`rich`, the group's toggle), otherwise as a normal
+ * message; a media message gets its caption edited (known from what was sent, or learned
  * from Telegram's "no text" answer). Text beyond the message's limit is sent
  * right after as new messages, so each long edit appends a fresh tail.
  */
@@ -535,14 +552,23 @@ const editMessage = Effect.fn('telegram-grammy.editMessage')(function* (
   messageThreadId: number | undefined,
   compound: string,
   text: string,
+  rich: boolean,
 ) {
   const parsed = extractTelegramMessageId(compound, chatId);
   if (!parsed) {
     yield* Effect.logError('telegram-grammy: edit with invalid compound id', { compound });
     return undefined;
   }
+  // The delivery ACL vets only the row's own chat; the compound id is the agent's to write.
+  if (parsed.chatId !== chatId) {
+    yield* Effect.logError('telegram-grammy: refusing an edit of a message in another chat', {
+      chatId,
+      targetChatId: parsed.chatId,
+    });
+    return undefined;
+  }
   const kind = sentKinds.get(parsed.chatId, parsed.messageId);
-  if (kind === 'rich' && (yield* editRich(parsed.chatId, parsed.messageId, text))) return undefined;
+  if (kind === 'rich' && rich && (yield* editRich(parsed.chatId, parsed.messageId, text))) return undefined;
   const fs = renderFS(text);
   const rest =
     kind === 'media'
@@ -569,6 +595,13 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
   const parsed = extractTelegramMessageId(compound, chatId);
   if (!parsed) {
     yield* Effect.logError('telegram-grammy: reaction with invalid compound id', { compound });
+    return undefined;
+  }
+  if (parsed.chatId !== chatId) {
+    yield* Effect.logError('telegram-grammy: refusing a reaction on a message in another chat', {
+      chatId,
+      targetChatId: parsed.chatId,
+    });
     return undefined;
   }
   // Translate slug-or-glyph input into Telegram's fixed allowlist before
@@ -675,7 +708,17 @@ const sendMediaGroup = Effect.fn('telegram-grammy.sendMediaGroup')(function* (
     resultId = yield* sendOne(album[0], album[0].kind);
   } else if (album.length > 1 && mixed) {
     yield* Effect.logWarning('telegram-grammy: media group would mix types, falling back to sequential');
-    for (const item of album) resultId = yield* sendOne(item, 'document');
+    for (const [index, item] of album.entries()) {
+      const send = sendOne(item, 'document').pipe(
+        Effect.tap((id) =>
+          Effect.sync(() => {
+            resultId = id;
+          }),
+        ),
+      );
+      if (index === 0) yield* send;
+      else yield* afterFirstSend(`album document ${index + 1} of ${album.length}`, send);
+    }
   } else if (album.length > 1) {
     const inputs = yield* Effect.forEach(album, albumInput);
     const sent = yield* sendReplying(sends++, reply, (replyParameters) =>
@@ -737,17 +780,7 @@ const sendAskQuestion = Effect.fn('telegram-grammy.sendAskQuestion')(function* (
     catch: (err) => mapGrammyError(err, 'sendMessage-askQuestion', String(chatId)),
   });
 
-  for (const chunk of tail) {
-    yield* Effect.tryPromise({
-      try: () =>
-        bot.api.sendMessage(chatId, chunk.text, {
-          entities: chunk.entities,
-          message_thread_id: messageThreadId,
-          link_preview_options: { is_disabled: true },
-        }),
-      catch: (err) => mapGrammyError(err, 'sendMessage-askQuestion-tail', String(chatId)),
-    });
-  }
+  yield* sendFollowUp(chatId, messageThreadId, tail);
 
   return String(headSent.message_id);
 });
@@ -773,7 +806,7 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
   let result: string | undefined = undefined;
 
   if (view.isEdit && view.editMessageId != null) {
-    result = yield* editMessage(chatId, messageThreadId, view.editMessageId, view.text);
+    result = yield* editMessage(chatId, messageThreadId, view.editMessageId, view.text, view.rich);
   } else if (view.isReaction && view.reactionMessageId != null) {
     result = yield* reactToMessage(chatId, view.reactionMessageId, view.reactionEmoji);
   } else if (view.isMediaGroup && view.mediaGroupItems) {

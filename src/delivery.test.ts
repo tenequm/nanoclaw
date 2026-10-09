@@ -1416,4 +1416,16 @@ describe('deliverSessionMessages — reply box', () => {
     insertReply(session.id, 'out-3', '123:1:ag-1', { text: 'plain' });
     expect(await deliveredContent(session)).toEqual([{ text: '| b |', rich: true }, { text: 'plain' }]);
   });
+
+  it('lets the rich_messages setting alone decide whether an edit is rich', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOperation('ag-1', session.id, 'out-1', { operation: 'edit', messageId: '123:5:ag-1', text: 'a', rich: true });
+    expect(await deliveredContent(session)).toEqual([{ operation: 'edit', messageId: '123:5', text: 'a' }]);
+
+    await ensureContainerConfig('ag-1');
+    await updateContainerConfigScalars('ag-1', { rich_messages: 1 });
+    insertOperation('ag-1', session.id, 'out-2', { operation: 'edit', messageId: '123:5:ag-1', text: 'b' });
+    expect(await deliveredContent(session)).toEqual([{ operation: 'edit', messageId: '123:5', text: 'b', rich: true }]);
+  });
 });
