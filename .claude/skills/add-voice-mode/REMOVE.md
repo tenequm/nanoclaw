@@ -72,11 +72,14 @@ rm -f src/channels/voice-mode-adapter.test.ts \
   src/channels/voice-mode-review-page.test.ts \
   src/channels/voice-mode-route.test.ts \
   src/channels/voice-mode-route.ts \
+  src/channels/voice-mode-tts.fixtures.json \
   src/channels/voice-mode.ts \
   src/voice-mode-gemini-live.test.ts \
   src/voice-mode-gemini-live.ts \
   src/voice-mode-jev-turn.test.ts \
   src/voice-mode-jev-turn.ts \
+  src/voice-mode-tts.test.ts \
+  src/voice-mode-tts.ts \
   src/voice-mode-wakeword.test.ts \
   src/voice-mode-wakeword.ts \
   src/voice-mode-worker.test.ts \
@@ -101,11 +104,12 @@ voice adapter and need not be removed.
 
 ## 4. Remove dependencies only when unused
 
-For each of `@livekit/agents`, `@livekit/agents-plugin-google`,
-`@livekit/agents-plugin-silero`, `@livekit/rtc-node`, `livekit-server-sdk`,
-`onnxruntime-node` and `zod`, inspect remaining imports with `rg` and consumers
-with `pnpm why <package>`. Use `pnpm remove <package>` only when no remaining
-source or dependency needs it. Do not remove shared packages blindly.
+For each of `@livekit/agents`, `@livekit/agents-plugin-elevenlabs`,
+`@livekit/agents-plugin-google`, `@livekit/agents-plugin-silero`,
+`@livekit/rtc-node`, `livekit-server-sdk`, `onnxruntime-node` and `zod`,
+inspect remaining imports with `rg` and consumers with `pnpm why <package>`.
+Use `pnpm remove <package>` only when no remaining source or dependency needs
+it. Do not remove shared packages blindly.
 Remove `scripts.voice-mode-worker` from package.json, or retain it if another
 worker now uses that entry. Preserve all other scripts and lockfile changes.
 

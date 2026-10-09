@@ -60,11 +60,14 @@ src/channels/voice-mode-registration.test.ts
 src/channels/voice-mode-review-page.test.ts
 src/channels/voice-mode-route.test.ts
 src/channels/voice-mode-route.ts
+src/channels/voice-mode-tts.fixtures.json
 src/channels/voice-mode.ts
 src/voice-mode-gemini-live.test.ts
 src/voice-mode-gemini-live.ts
 src/voice-mode-jev-turn.test.ts
 src/voice-mode-jev-turn.ts
+src/voice-mode-tts.test.ts
+src/voice-mode-tts.ts
 src/voice-mode-wakeword.test.ts
 src/voice-mode-wakeword.ts
 src/voice-mode-worker.test.ts
@@ -115,6 +118,7 @@ or approved build-script policies.
 
 ```nc:dep
 @livekit/agents@1.9.1
+@livekit/agents-plugin-elevenlabs@1.9.1
 @livekit/agents-plugin-google@1.9.1
 @livekit/agents-plugin-silero@1.9.1
 @livekit/rtc-node@1.1.0
