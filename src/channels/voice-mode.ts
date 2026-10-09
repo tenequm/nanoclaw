@@ -9,10 +9,8 @@
  * link to one agent: a voice_mode_lines row that `/voice` creates
  * (voice-mode-command.ts), with the platform id `voice-mode:<line id>` for a
  * random line id. The row keeps only the link token's SHA-256, so the token
- * itself never reaches the database, the logs or the agent's messages. A line
- * from before the rename keeps its `voice:<hash>` id, its chat and wiring, and
- * its token in `.env`. There are no threads. One call is active per line at a
- * time; the newest wins.
+ * itself never reaches the database, the logs or the agent's messages. There
+ * are no threads. One call is active per line at a time; the newest wins.
  *
  * The link token gates the HTTP routes: a request without a known `t` gets a
  * 403 before any room is created. The page is at `/voice?t=<token>` behind a
@@ -23,10 +21,9 @@ import net from 'node:net';
 
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundEvent, OutboundMessage } from './adapter.js';
 import { wiringThreadsEnabled } from './channel-defaults.js';
-import { getChannelAdapterExact, registerChannelAdapter } from './channel-registry.js';
+import { registerChannelAdapter } from './channel-registry.js';
 import type { VoiceModeUiConfig } from './voice-mode-page.js';
 import {
-  LEGACY_VOICE_CHANNEL,
   linePlatformId,
   resolveVoiceModeLine,
   VOICE_MODE_CHANNEL,
@@ -46,7 +43,7 @@ import {
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
-import { findVoiceModeLineByToken, getVoiceModeLineForAgent, hashLinkToken } from '../db/voice-mode-lines.js';
+import { findVoiceModeLineByToken, getVoiceModeLineForAgent } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand } from './voice-mode-command.js';
 import { readEnvFile } from '../env.js';
@@ -174,9 +171,7 @@ const isWorkerRoute = (route: string): boolean => /^livekit\/agent(?:\/|$)/.test
  * A voice line is DM-shaped: every caller turn is for the agent (pattern '.'),
  * there are no threads and no platform mention concept. The link token is the
  * credential: whoever holds the link is the line's caller. A call needs the
- * hashed-line table's caller to hold an owner or admin role over the agent, or,
- * failing a row there, a legacy line's named user with explicit membership on a
- * strict chat with a known-sender wiring.
+ * hashed-line table's caller to hold an owner or admin role over the agent.
  */
 const VOICE_MODE_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'strict' },
@@ -193,9 +188,7 @@ export interface VoiceModeConfig {
   pageHost?: string;
   /** VOICE_MODE_PORT was set: a page listener that cannot bind fails setup instead of being skipped. */
   pagePortRequired?: boolean;
-  /** Link tokens accepted on the HTTP routes; each is one voice line. */
-  linkTokens?: string[];
-  /** The line a link token opens, by platform id, or null. Defaults to the hashed-line table, then the env tokens. */
+  /** The line a link token opens, by platform id, or null. Defaults to the hashed-line table. */
   lineForToken?: (token: string) => Promise<string | null>;
   /** Routes a turn instead of routeVoiceModeTurn; resolves true once the agent's session stored it. Test seam. */
   routeTurn?: (event: InboundEvent) => Promise<boolean>;
@@ -256,15 +249,8 @@ export async function findCallSession(
   return findSessionForAgent(agentGroupId, mg.id, mode === 'shared' ? null : threadId);
 }
 
-/** The id an env link token's line had before the voice-mode rename: `voice:` + its SHA-256's first 12 hex characters. */
-export function legacyLineIdForToken(token: string): string {
-  return `${LEGACY_VOICE_CHANNEL}:${hashLinkToken(token).slice(0, 12)}`;
-}
-
-/** The voice adapter, plus the call link of one of its lines for the `/voice` command. */
+/** The voice adapter, plus the call URL of a link token for the `/voice` command. */
 export interface VoiceModeChannelAdapter extends ChannelAdapter {
-  /** The line's call page URL, or null when the line has no link token here. */
-  callLink(platformId: string): string | null;
   /** The call page URL for a link token. */
   callUrl(token: string): string;
   /** `/voice` in a chat, with this adapter's call URLs and saved links (voice-mode-command.ts). */
@@ -272,28 +258,14 @@ export interface VoiceModeChannelAdapter extends ChannelAdapter {
 }
 
 export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChannelAdapter {
-  /** Main's env link tokens by the legacy line id each opens; lines made since are hashed-token rows. */
-  const legacyLines = new Map(
-    (config.linkTokens ?? [])
-      .map((t) => t.trim())
-      .filter(Boolean)
-      .map((t) => [t, legacyLineIdForToken(t)]),
-  );
   const lineForToken =
     config.lineForToken ??
     (async (token: string) => {
       const line = await findVoiceModeLineByToken(token);
-      if (line) return linePlatformId(line.line_id);
-      const legacy = legacyLines.get(token);
-      if (!legacy) return null;
-      return (await getMessagingGroupByPlatform(LEGACY_VOICE_CHANNEL, legacy, LEGACY_VOICE_CHANNEL)) ? legacy : null;
+      return line ? linePlatformId(line.line_id) : null;
     });
   const callUrl = (token: string): string =>
     `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}`;
-  const callLink = (platformId: string): string | null => {
-    const token = [...legacyLines].find(([, id]) => id === platformId)?.[0];
-    return token ? callUrl(token) : null;
-  };
   const proxyPolicy: VoiceModeProxyPolicy = {
     trustedProxies: parseCidrs(config.trustedProxyCidrs, 'VOICE_MODE_TRUSTED_PROXY_CIDRS'),
     allowedClients: parseCidrs(config.allowedClientCidrs, 'VOICE_MODE_ALLOWED_CLIENT_CIDRS'),
@@ -494,7 +466,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
     callUrl,
     handleVoiceCommand: (event: InboundEvent): Promise<boolean> => handleVoiceCommand(event, callUrl),
-    callLink,
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
@@ -541,7 +512,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       log.info('voice-mode: ready', {
         callUrl: `${callUrl('')}<link token>`,
         trustedProxies: config.trustedProxyCidrs?.trim() || 'none',
-        envTokens: legacyLines.size,
         livekit: config.livekit.url,
         protocol: LIVEKIT_PROTOCOL_VERSION,
         agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
@@ -585,31 +555,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     async setTyping(platformId: string): Promise<void> {
       await livekit.setTyping(platformId);
     },
-  };
-}
-
-/**
- * The `voice` channel of lines made before the voice-mode rename: their chat, session and stored
- * messages keep the `voice` address, so core delivery and typing look up a `voice` adapter. This
- * one hands them to the live voice-mode adapter, whose engine runs those lines' calls too; it
- * serves no routes of its own and starts only after the voice-mode adapter is up.
- */
-export function createLegacyVoiceAdapter(
-  live: VoiceModeChannelAdapter,
-): ChannelAdapter & Pick<VoiceModeChannelAdapter, 'callLink'> {
-  return {
-    name: LEGACY_VOICE_CHANNEL,
-    channelType: LEGACY_VOICE_CHANNEL,
-    supportsThreads: false,
-    defaults: VOICE_MODE_DEFAULTS,
-    async setup() {},
-    async teardown() {},
-    isConnected: () => live.isConnected(),
-    deliver: (platformId, threadId, message) => live.deliver(platformId, threadId, message),
-    async setTyping(platformId, threadId) {
-      await live.setTyping?.(platformId, threadId);
-    },
-    callLink: (platformId) => live.callLink(platformId),
   };
 }
 
@@ -688,7 +633,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
           'VOICE_MODE_PORT',
           'VOICE_MODE_PAGE_HOST',
           'VOICE_MODE_LANGUAGES',
-          'VOICE_MODE_LINK_TOKEN',
           'VOICE_MODE_UI',
           'VOICE_MODE_MAX_CALL_SECONDS',
           'VOICE_MODE_MAX_CALLS_PER_HOUR',
@@ -718,20 +662,12 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       log.warn('voice-mode: LiveKit is not configured; the channel stays offline', { missing });
       return null;
     }
-    const linkTokens = (env.VOICE_MODE_LINK_TOKEN ?? '').split(',');
-    const short = linkTokens.map((t) => t.trim()).filter((t) => t && t.length < 32);
-    if (short.length > 0) {
-      log.warn('voice-mode: link tokens shorter than 32 characters are weak; replace their lines with /voice new', {
-        lines: short.map(legacyLineIdForToken),
-      });
-    }
     const page = pageListener(env.VOICE_MODE_PORT, env.VOICE_MODE_PAGE_HOST);
     return createVoiceModeAdapter({
       pagePort: page?.port,
       pageHost: page?.host,
       pagePortRequired: page?.explicit,
       publicUrl: (env.VOICE_MODE_PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, ''),
-      linkTokens,
       ui: parseUiConfig(env.VOICE_MODE_UI),
       wakePhrase: wakePhrase(env),
       allowNonLoopback: env.VOICE_MODE_ALLOW_NON_LOOPBACK === '1',
@@ -759,15 +695,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
         mirror: (env.VOICE_MODE_MIRROR || DEFAULT_VOICE_MIRROR).trim().toLowerCase(),
       },
     });
-  },
-  defaults: VOICE_MODE_DEFAULTS,
-});
-
-// Registered after voice-mode, so the registry has started that adapter when this factory runs.
-registerChannelAdapter(LEGACY_VOICE_CHANNEL, {
-  factory: () => {
-    const live = getChannelAdapterExact(VOICE_MODE_CHANNEL) as VoiceModeChannelAdapter | undefined;
-    return live ? createLegacyVoiceAdapter(live) : null;
   },
   defaults: VOICE_MODE_DEFAULTS,
 });

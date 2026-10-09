@@ -22,7 +22,7 @@ describe('voice channel registration', () => {
     expect(getRegisteredChannelNames()).toContain('voice-mode');
   });
 
-  it('registers the `voice` compatibility adapter that delivers to lines from before the rename', () => {
-    expect(getRegisteredChannelNames()).toContain('voice');
+  it('registers no `voice` compatibility adapter: every line is a voice_mode_lines row', () => {
+    expect(getRegisteredChannelNames()).not.toContain('voice');
   });
 });
