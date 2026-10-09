@@ -385,6 +385,8 @@ export function registerKubernetesConformance(): void {
       await apiReady();
       await kubectl(['get', 'crd', CRD, '-o', 'name']);
       await kubectl(['create', 'namespace', namespace]);
+      // The default service account controller can initialize late after leader recovery.
+      await eventually(() => get('serviceaccount', 'default'), Boolean, 90_000);
     }, 600_000);
 
     beforeEach(async () => {
