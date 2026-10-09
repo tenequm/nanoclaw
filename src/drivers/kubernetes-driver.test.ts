@@ -5,6 +5,7 @@ import path from 'path';
 import * as k8s from '@kubernetes/client-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { armSessionLifecycle } from '../container-runner.js';
 import {
   KubernetesSessionDriver,
   SECRET_LIMIT_BYTES,
@@ -20,6 +21,7 @@ import {
   type Sandbox,
 } from './kubernetes-driver.js';
 import { projectLabels } from './label-projection.js';
+import { withSessionEvents } from './session-events.js';
 import { FIXTURE_GROUP_VOLUME_CAPABILITIES, fixtureGroupVolumeSpec } from './spec-fixture.js';
 import { LABELS, type SessionEvent } from './types.js';
 
@@ -917,6 +919,54 @@ describe('kubernetes Sandbox informer', () => {
       },
     };
   }
+  it('does not finalize a resumed execution for a suspended informer update during Secret sync', async () => {
+    const fake = fakeInformer();
+    const h = harness({ informerFactory: fake.factory });
+    const supervised = withSessionEvents(h.driver);
+    const first = await supervised.prepare(h.spec);
+    await armSessionLifecycle({ handle: first, onTerminal: vi.fn() });
+    await first.stop('idle');
+    const suspended = structuredClone(h.boxes.get(first.name)!);
+    expect(await first.status()).toEqual({ phase: 'stopped' });
+    const resumed = await supervised.prepare(h.spec);
+    const snapshot = h.spec.containers[0].mounts.find((mount) => mount.realization?.kind === 'file-snapshot')!;
+    fs.writeFileSync(snapshot.hostPath, 'resumed');
+
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let syncing!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      syncing = resolve;
+    });
+    const replace = h.core.replaceNamespacedSecret.getMockImplementation()!;
+    h.core.replaceNamespacedSecret.mockImplementationOnce(async (request) => {
+      syncing();
+      await blocked;
+      return replace(request);
+    });
+    let finalization: Promise<void> | undefined;
+    const terminal = vi.fn(() => {
+      finalization = resumed.stop('terminal-finalization');
+    });
+    const starting = armSessionLifecycle({ handle: resumed, onTerminal: terminal });
+    try {
+      await entered;
+      fake.emit('update', suspended);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(terminal).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await starting;
+      await finalization;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(terminal).not.toHaveBeenCalled();
+    expect(await resumed.status()).toEqual({ phase: 'running' });
+    expect(h.pods.has(resumed.name)).toBe(true);
+    expect(h.boxes.get(resumed.name)!.spec.operatingMode).toBe('Running');
+  });
   it('shares one subscription, emits all terminals and stops only after the final subscriber', async () => {
     const fake = fakeInformer();
     const h = harness({ informerFactory: fake.factory });
