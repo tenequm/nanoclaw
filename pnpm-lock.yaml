@@ -35,6 +35,9 @@ importers:
       '@livekit/agents':
         specifier: 1.9.1
         version: 1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)
+      '@livekit/agents-plugin-elevenlabs':
+        specifier: 1.9.1
+        version: 1.9.1(@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)
       '@livekit/agents-plugin-google':
         specifier: 1.9.1
         version: 1.9.1(@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)(ws@8.21.3)(zod@4.6.5)
@@ -570,6 +573,12 @@ packages:
 
   '@jridgewell/sourcemap-codec@1.5.5':
     resolution: {integrity: sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==}
+
+  '@livekit/agents-plugin-elevenlabs@1.9.1':
+    resolution: {integrity: sha512-dtlEsKuF0DIP8ZBkTXQVPgM6+h0AZeqWzj8S2GSpj/rcsjhKGJM0/69RnRYfD7c33j8WuetEaJQhw2l3CycXnQ==}
+    peerDependencies:
+      '@livekit/agents': 1.9.1
+      '@livekit/rtc-node': ^1.1.0
 
   '@livekit/agents-plugin-google@1.9.1':
     resolution: {integrity: sha512-c6jutVScd04qpcZ4BedGQrmElneCxedrJH95RINfOdP+acWMCquyH4A+mdouiR5mPhHAGpIAjHwO2y0G7AiAQw==}
@@ -3004,6 +3013,16 @@ snapshots:
     optional: true
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
+
+  '@livekit/agents-plugin-elevenlabs@1.9.1(@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)':
+    dependencies:
+      '@livekit/agents': 1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)
+      '@livekit/mutex': 1.1.1
+      '@livekit/rtc-node': 1.1.0
+      ws: 8.21.3
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
 
   '@livekit/agents-plugin-google@1.9.1(@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)(ws@8.21.3)(zod@4.6.5)':
     dependencies:
