@@ -27,6 +27,7 @@ import {
 import { CONTAINER_PLUGINS_DIR, materializeContainerJson } from './container-config.js';
 import {
   getContainerConfig,
+  getContainerConfigDriver,
   listConfiguredDriverKinds,
   listDriverKindsUsed,
   recordDriverKindsUsed,
@@ -212,6 +213,33 @@ function releaseGroupSpawn(agentGroupId: string, sessionId: string): void {
   if (sessions?.size === 0) spawnsInFlight.delete(agentGroupId);
 }
 
+/**
+ * Runtime kinds whose admission is closed, with the reason: a kind whose
+ * startup discovery did not complete within its bound (its surviving
+ * sessions are unseen, so a fresh spawn could duplicate one), or whose
+ * readiness check failed while other kinds kept the host up. Spawns of their
+ * groups fail `runtime-unavailable` (retryable) until `rediscoverUnavailableRuntimes`
+ * lists the kind again. Only ever populated when more than one kind is in
+ * play: a single-runtime install keeps today's behavior exactly.
+ */
+const unavailableRuntimes = new Map<string, { reason: 'discovery' | 'readiness'; driver: SessionEventsDriver }>();
+let rediscoveryTimer: NodeJS.Timeout | undefined;
+let startupDiscoveryDone = false;
+/** Bound on each runtime's startup discovery step when several kinds are discovered. */
+let runtimeDiscoveryTimeoutMs = 15_000;
+let rediscoveryIntervalMs = 30_000;
+export function _setRuntimeDiscoveryScheduleForTesting(timeoutMs?: number, intervalMs?: number): void {
+  runtimeDiscoveryTimeoutMs = timeoutMs ?? 15_000;
+  rediscoveryIntervalMs = intervalMs ?? 30_000;
+}
+
+function runtimeUnavailable(detail: string): Error & SessionFailure {
+  return Object.assign(new Error(`runtime-unavailable: ${detail}`), {
+    kind: 'runtime-unavailable' as const,
+    retryable: true as const,
+  });
+}
+
 let gatewayUnavailableReason: string | undefined;
 let gatewayAdmissionGeneration = 0;
 
@@ -338,6 +366,10 @@ const pendingAdoptions = new Map<string, SessionEventsDriver>();
 export function _resetAdoptionRetryStateForTesting(): void {
   pendingAdoptions.clear();
   groupFence.clear();
+  unavailableRuntimes.clear();
+  clearTimeout(rediscoveryTimer);
+  rediscoveryTimer = undefined;
+  startupDiscoveryDone = false;
 }
 
 /**
@@ -351,6 +383,9 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
   // config: the surviving runtime lives where it was found.
   const driver = pendingAdoptions.get(session.id);
   if (!driver) return false;
+  if (unavailableRuntimes.has(driver.kind)) {
+    throw runtimeUnavailable(`driver '${driver.kind}' is not available; session ${session.id} waits for it`);
+  }
   const snapshots = await driver.listSessions(INSTALL_SLUG);
   const snapshot = snapshots.find(({ handle, phase }) => handle.key.sessionId === session.id && phase === 'running');
   if (!snapshot) {
@@ -476,6 +511,12 @@ async function spawnContainer(session: Session, wakeReason?: WakeReason): Promis
   // contribution all depend on what it declares (ratified D1). A group with no
   // `driver` resolves the install default, exactly as before.
   const driver = await sessionDriverForGroup(agentGroup.id);
+  if (unavailableRuntimes.has(driver.kind)) {
+    throw runtimeUnavailable(
+      `group '${agentGroup.folder}' runs on driver '${driver.kind}', which is not available ` +
+        `(${unavailableRuntimes.get(driver.kind)!.reason}); retrying later`,
+    );
+  }
   const capabilities = driver.capabilities();
   await admitToGroupFence(session, agentGroup, driver, capabilities);
   try {
@@ -1036,22 +1077,48 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
  * session's egress keeps working without any per-process state to rebuild.
  */
 export async function adoptRunningSessions(): Promise<{ adopted: number; stopped: number }> {
+  try {
+    return await discoverAndAdopt();
+  } finally {
+    // Rediscovery waits for startup discovery: run alongside it, both could
+    // adopt the same reopened runtime's sessions.
+    startupDiscoveryDone = true;
+    scheduleRuntimeRediscovery();
+  }
+}
+
+async function discoverAndAdopt(): Promise<{ adopted: number; stopped: number }> {
   // Every kind this install has ever used, each listed in isolation (ruling
   // 8b.3): an unreachable runtime logs and is skipped — it never blocks Docker
-  // adoption, and its sessions are never read as gone.
-  const listed: { driver: SessionEventsDriver; snapshot: SupervisedSnapshot }[] = [];
-  const reachable: SessionEventsDriver[] = [];
+  // adoption, and its sessions are never read as gone. With more than one
+  // kind in play the listings run concurrently, each within its own bound, so
+  // a runtime that never answers holds nothing else up: it is closed to
+  // admission (its surviving sessions are unseen) and rediscovered later. A
+  // single-runtime install lists exactly as it always has, unbounded.
   const discovery = await discoveryDrivers();
+  const bounded = discovery.kinds.length > 1;
+  const listings = await Promise.all(
+    discovery.drivers.map(async ({ kind, driver }) => {
+      // Closed by a failed readiness check: rediscovery owns it from here.
+      if (unavailableRuntimes.has(driver.kind)) return { kind, driver, snapshots: undefined };
+      try {
+        const snapshots = await withinDiscoveryBound(driver.listSessions(INSTALL_SLUG), kind, 'listing', bounded);
+        return { kind, driver, snapshots };
+      } catch (err) {
+        log.warn('Failed to list existing sessions for adoption', { driver: kind, err });
+        return { kind, driver, snapshots: undefined };
+      }
+    }),
+  );
   // A kind that could not even be enumerated or built is as unconsidered as
   // one whose listing failed.
-  let unreachable = discovery.skipped;
-  for (const { kind, driver } of discovery.drivers) {
-    let snapshots: SupervisedSnapshot[];
-    try {
-      snapshots = await driver.listSessions(INSTALL_SLUG);
-    } catch (err) {
-      log.warn('Failed to list existing sessions for adoption', { driver: kind, err });
-      unreachable += 1;
+  let complete = discovery.complete;
+  const listed: { driver: SessionEventsDriver; snapshot: SupervisedSnapshot }[] = [];
+  const reachable: SessionEventsDriver[] = [];
+  for (const { driver, snapshots } of listings) {
+    if (!snapshots) {
+      complete = false;
+      if (bounded) closeRuntimeAdmission(driver.kind, driver, 'discovery');
       continue;
     }
     reachable.push(driver);
@@ -1063,7 +1130,7 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
   let adopted = 0;
   let stopped = 0;
   for (const { driver, snapshot } of listed) {
-    const { handle, phase } = snapshot;
+    const { handle } = snapshot;
     if (duplicates.has(snapshot)) {
       log.error('Session discovered on two runtimes; stopping the copy that lost arbitration', {
         sessionId: handle.key.sessionId,
@@ -1074,101 +1141,29 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
       stopped += 1;
       continue;
     }
-    const session = handle.key.sessionId ? await getSession(handle.key.sessionId) : undefined;
-    const agentGroup = session ? await getAgentGroup(session.agent_group_id) : undefined;
-    // The snapshot's phase is the listing's own truth: a corpse arrives as
-    // 'terminal' (or not at all), so telling adoptable sessions apart needs
-    // no per-handle status() round trip. `stop()` on a corpse is still full
-    // teardown — a self-exited runtime needs its residue cleaned up.
-    if (!session || !agentGroup || session.status !== 'active' || phase !== 'running') {
-      await handle.stop('orphan-at-startup').catch(() => {});
-      stopped += 1;
-      continue;
-    }
-    const capabilities = driver.capabilities();
-    if (capabilities.sessionsPerGroup === 'one') {
-      const holder = groupFence.get(agentGroup.id);
-      if (holder && holder !== session.id) {
-        log.error('Second live session of a one-session group at startup; stopping it', {
-          sessionId: session.id,
-          holder,
-          driver: driver.kind,
-        });
-        await handle.stop('group-fence-at-startup').catch(() => {});
-        stopped += 1;
-        continue;
-      }
-    }
-    // Claim before adopting: a lost CAS means another live process already
-    // owns this session — leave its container strictly alone. A failed claim
-    // WRITE also fails closed: an unfenced adoption could stomp a newer
-    // claimant's session, while an unadopted-but-running container is safe to
-    // leave — the spawn path is claim-first fail-closed too, so nothing can
-    // start a duplicate while the store is down, and the wake path reclaims
-    // the container (`retryPendingAdoption`) once the store answers.
-    let claimIncarnation: number | null;
-    /* eslint-disable no-catch-all/no-catch-all -- fail closed: leave the container unadopted and let the wake path retry, never adopt unfenced */
-    try {
-      claimIncarnation = await claimSessionRun(session.id, handle.name);
-    } catch (err) {
-      log.error('Session claim write failed during adoption — leaving the container unadopted for retry', {
-        sessionId: session.id,
-        err,
-      });
-      pendingAdoptions.set(session.id, driver);
-      continue;
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
-    if (claimIncarnation === null) {
-      log.warn('Session adoption skipped — another live host process holds the claim', { sessionId: session.id });
-      continue;
-    }
-    pendingAdoptions.delete(session.id);
-    let gatewaySession: GatewaySessionControl;
-    try {
-      gatewaySession = await ensureGatewaySession({
-        disposition: 'adopt',
-        key: handle.key,
-        runtimeIdentity: gatewayRuntimeIdentity(handle.key),
-        groupName: agentGroup.name,
-        containerName: handle.name,
-        capabilities,
-      });
-      await driver.reconcileNetworkAccess?.(gatewaySession.lease.contribution.networkAccess);
-    } catch (err) {
-      log.error('Gateway could not adopt running session; stopping it', { sessionId: session.id, err });
-      await handle.stop('gateway-adoption-failed').catch(() => {});
-      await releaseClaimQuietly(session.id, claimIncarnation);
-      stopped += 1;
-      continue;
-    }
-    if (capabilities.sessionsPerGroup === 'one') groupFence.set(agentGroup.id, session.id);
-    const runtime = registerRuntime(session.id, handle, driver, gatewaySession, handle.name, true);
-    runtime.claimIncarnation = claimIncarnation;
-    runtime.stopReason = undefined;
-    handle.onTerminal((failure) => {
-      void finishAndResolve(session.id, runtime, failure);
-    });
-    if (armGatewayAvailability(session.id, gatewaySession)) {
-      await runtime.finishedPromise;
-      stopped += 1;
-      continue;
-    }
-    await markContainerRunning(session.id);
-    adopted += 1;
+    const outcome = await adoptSnapshot(driver, snapshot);
+    if (outcome === 'adopted') adopted += 1;
+    else if (outcome === 'stopped') stopped += 1;
   }
 
   // Install-wide gateway reconciliation runs only once every runtime's
-  // surviving sessions were considered: with one runtime unreachable, its live
-  // sessions' gateway resources would look orphaned.
-  if (unreachable === 0) await getGatewayProvider().sessions.reapOrphans?.();
-  else log.warn('Skipping gateway orphan reconciliation: a session runtime was unreachable', { unreachable });
+  // surviving sessions were considered: with one runtime unreachable, unbuilt
+  // or unenumerated, its live sessions' gateway resources would look orphaned.
+  if (complete) await getGatewayProvider().sessions.reapOrphans?.();
+  else log.warn('Skipping gateway orphan reconciliation: a session runtime was not fully discovered');
   for (const driver of reachable) {
-    await driver.reapResidue?.(INSTALL_SLUG).catch?.(() => {});
+    await withinDiscoveryBound(
+      driver.reapResidue?.(INSTALL_SLUG) ?? Promise.resolve(),
+      driver.kind,
+      'residue reap',
+      bounded,
+    ).catch(() => {});
     // Reconcile terminals the watch stream missed while no host was listening —
     // adoption is the one place a full re-list is already cheap, so the hub's
     // resync wires here rather than into new periodic machinery.
-    if (isSessionEventsDriver(driver)) await driver.resync(INSTALL_SLUG).catch(() => {});
+    if (isSessionEventsDriver(driver)) {
+      await withinDiscoveryBound(driver.resync(INSTALL_SLUG), driver.kind, 'resync', bounded).catch(() => {});
+    }
   }
 
   if (adopted > 0 || stopped > 0) {
@@ -1181,26 +1176,307 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
 }
 
 /**
+ * Adopt one discovered runtime, or stop it when it is not ours to keep.
+ * 'left' = deliberately untouched (another live host holds its claim, or the
+ * claim write failed and the wake path will retry the fenced adoption).
+ */
+async function adoptSnapshot(
+  driver: SessionEventsDriver,
+  snapshot: SupervisedSnapshot,
+): Promise<'adopted' | 'stopped' | 'left'> {
+  const { handle, phase } = snapshot;
+  const session = handle.key.sessionId ? await getSession(handle.key.sessionId) : undefined;
+  const agentGroup = session ? await getAgentGroup(session.agent_group_id) : undefined;
+  // The snapshot's phase is the listing's own truth: a corpse arrives as
+  // 'terminal' (or not at all), so telling adoptable sessions apart needs
+  // no per-handle status() round trip. `stop()` on a corpse is still full
+  // teardown — a self-exited runtime needs its residue cleaned up.
+  if (!session || !agentGroup || session.status !== 'active' || phase !== 'running') {
+    await handle.stop('orphan-at-startup').catch(() => {});
+    return 'stopped';
+  }
+  const capabilities = driver.capabilities();
+  if (capabilities.sessionsPerGroup === 'one') {
+    const holder = groupFence.get(agentGroup.id);
+    if (holder && holder !== session.id) {
+      log.error('Second live session of a one-session group at startup; stopping it', {
+        sessionId: session.id,
+        holder,
+        driver: driver.kind,
+      });
+      await handle.stop('group-fence-at-startup').catch(() => {});
+      return 'stopped';
+    }
+  }
+  // Claim before adopting: a lost CAS means another live process already
+  // owns this session — leave its container strictly alone. A failed claim
+  // WRITE also fails closed: an unfenced adoption could stomp a newer
+  // claimant's session, while an unadopted-but-running container is safe to
+  // leave — the spawn path is claim-first fail-closed too, so nothing can
+  // start a duplicate while the store is down, and the wake path reclaims
+  // the container (`retryPendingAdoption`) once the store answers.
+  let claimIncarnation: number | null;
+  /* eslint-disable no-catch-all/no-catch-all -- fail closed: leave the container unadopted and let the wake path retry, never adopt unfenced */
+  try {
+    claimIncarnation = await claimSessionRun(session.id, handle.name);
+  } catch (err) {
+    log.error('Session claim write failed during adoption — leaving the container unadopted for retry', {
+      sessionId: session.id,
+      err,
+    });
+    pendingAdoptions.set(session.id, driver);
+    return 'left';
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  if (claimIncarnation === null) {
+    log.warn('Session adoption skipped — another live host process holds the claim', { sessionId: session.id });
+    return 'left';
+  }
+  pendingAdoptions.delete(session.id);
+  let gatewaySession: GatewaySessionControl;
+  try {
+    gatewaySession = await ensureGatewaySession({
+      disposition: 'adopt',
+      key: handle.key,
+      runtimeIdentity: gatewayRuntimeIdentity(handle.key),
+      groupName: agentGroup.name,
+      containerName: handle.name,
+      capabilities,
+    });
+    await driver.reconcileNetworkAccess?.(gatewaySession.lease.contribution.networkAccess);
+  } catch (err) {
+    log.error('Gateway could not adopt running session; stopping it', { sessionId: session.id, err });
+    await handle.stop('gateway-adoption-failed').catch(() => {});
+    await releaseClaimQuietly(session.id, claimIncarnation);
+    return 'stopped';
+  }
+  if (capabilities.sessionsPerGroup === 'one') groupFence.set(agentGroup.id, session.id);
+  const runtime = registerRuntime(session.id, handle, driver, gatewaySession, handle.name, true);
+  runtime.claimIncarnation = claimIncarnation;
+  runtime.stopReason = undefined;
+  handle.onTerminal((failure) => {
+    void finishAndResolve(session.id, runtime, failure);
+  });
+  if (armGatewayAvailability(session.id, gatewaySession)) {
+    await runtime.finishedPromise;
+    return 'stopped';
+  }
+  await markContainerRunning(session.id);
+  return 'adopted';
+}
+
+/**
+ * One discovery step against one runtime, bounded when several runtimes are
+ * discovered: past the bound the step fails like an unreachable runtime, and
+ * the hung call is simply no longer waited on. Unbounded (a single-runtime
+ * install), it is the call itself, untouched.
+ */
+function withinDiscoveryBound<T>(operation: Promise<T>, kind: string, step: string, bounded: boolean): Promise<T> {
+  if (!bounded) return operation;
+  let timer: NodeJS.Timeout | undefined;
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`driver '${kind}' ${step} did not settle within ${runtimeDiscoveryTimeoutMs}ms`)),
+      runtimeDiscoveryTimeoutMs,
+    );
+    timer.unref?.();
+  });
+  return Promise.race([operation, expiry]).finally(() => clearTimeout(timer));
+}
+
+/** Close a runtime kind to admission and make sure rediscovery will come back for it. */
+function closeRuntimeAdmission(kind: string, driver: SessionEventsDriver, reason: 'discovery' | 'readiness'): void {
+  if (!unavailableRuntimes.has(kind)) {
+    log.error('Session runtime closed to admission until it can be discovered; its sessions are left untouched', {
+      driver: kind,
+      reason,
+    });
+  }
+  unavailableRuntimes.set(kind, { reason, driver });
+  scheduleRuntimeRediscovery();
+}
+
+function scheduleRuntimeRediscovery(): void {
+  if (!startupDiscoveryDone || rediscoveryTimer || unavailableRuntimes.size === 0) return;
+  rediscoveryTimer = setTimeout(() => {
+    rediscoveryTimer = undefined;
+    void rediscoverUnavailableRuntimes()
+      .catch((err: unknown) => log.error('Session runtime rediscovery failed', { err }))
+      .finally(scheduleRuntimeRediscovery);
+  }, rediscoveryIntervalMs);
+  rediscoveryTimer.unref?.();
+}
+
+let rediscovery: Promise<number> | undefined;
+
+/**
+ * Retry every runtime kind closed to admission: re-check readiness when that
+ * is what closed it, list it within the bound, adopt what it holds and reopen
+ * admission. A session found live here that this host already runs elsewhere
+ * (or is starting) keeps the supervised copy; the late one is stopped. A kind
+ * that still does not answer stays closed, its sessions still untouched.
+ * Returns how many kinds reopened.
+ */
+export function rediscoverUnavailableRuntimes(): Promise<number> {
+  rediscovery ??= rediscoverOnce().finally(() => {
+    rediscovery = undefined;
+  });
+  return rediscovery;
+}
+
+async function rediscoverOnce(): Promise<number> {
+  let reopened = 0;
+  for (const [kind, { reason, driver }] of [...unavailableRuntimes]) {
+    // A driver change validates against live listings; adopting under it
+    // would race that check. Come back next tick.
+    if (driverChangesInFlight.size > 0) break;
+    let snapshots: SupervisedSnapshot[];
+    try {
+      if (reason === 'readiness') {
+        await withinDiscoveryBound(driver.ensureReady?.() ?? Promise.resolve(), kind, 'readiness', true);
+      }
+      snapshots = await withinDiscoveryBound(driver.listSessions(INSTALL_SLUG), kind, 'listing', true);
+    } catch (err) {
+      log.warn('Session runtime still unavailable; its admission stays closed', { driver: kind, err });
+      continue;
+    }
+    let adopted = 0;
+    let stopped = 0;
+    for (const snapshot of snapshots) {
+      const { handle, phase } = snapshot;
+      const sessionId = handle.key.sessionId;
+      const elsewhere =
+        sessionId &&
+        (activeContainers.has(sessionId) ||
+          wakePromises.has(sessionId) ||
+          (pendingAdoptions.has(sessionId) && pendingAdoptions.get(sessionId) !== driver));
+      if (elsewhere && phase !== 'terminal') {
+        log.error('Session discovered late on a second runtime; stopping the late copy', {
+          sessionId,
+          driver: kind,
+          name: handle.name,
+        });
+        await handle.stop('duplicate-at-rediscovery').catch(() => {});
+        stopped += 1;
+        continue;
+      }
+      // Held under the group admission lock, like a spawn: a driver change
+      // for the group is refused while this adoption is in flight.
+      admitGroupSpawn(handle.key.agentGroupId, sessionId);
+      try {
+        const outcome = await adoptSnapshot(driver, snapshot);
+        if (outcome === 'adopted') adopted += 1;
+        else if (outcome === 'stopped') stopped += 1;
+      } finally {
+        releaseGroupSpawn(handle.key.agentGroupId, sessionId);
+      }
+    }
+    await withinDiscoveryBound(
+      driver.reapResidue?.(INSTALL_SLUG) ?? Promise.resolve(),
+      kind,
+      'residue reap',
+      true,
+    ).catch(() => {});
+    if (isSessionEventsDriver(driver)) {
+      await withinDiscoveryBound(driver.resync(INSTALL_SLUG), kind, 'resync', true).catch(() => {});
+    }
+    unavailableRuntimes.delete(kind);
+    reopened += 1;
+    log.info('Session runtime discovered; reopening its admission', { driver: kind, adopted, stopped });
+  }
+  return reopened;
+}
+
+/**
+ * Startup readiness. The install default's `ensureReady` is checked first and
+ * stays fatal exactly as before whenever no other kind could carry the host —
+ * a single-runtime install, or one where the failing default is the only kind
+ * any group uses. When groups are configured on other kinds and at least one
+ * of them is ready, the default's failure instead closes admission to that
+ * runtime (its groups' spawns fail `runtime-unavailable` and retry) until
+ * rediscovery finds it ready. Other kinds are otherwise reached lazily, as
+ * before.
+ */
+export async function ensureSessionRuntimesReady(): Promise<void> {
+  const fallback = getSessionDriver();
+  try {
+    await fallback.ensureReady?.();
+    return;
+  } catch (err) {
+    let others: { usable: string[]; unready: { kind: string; driver: SessionEventsDriver }[] };
+    try {
+      others = await probeOtherConfiguredRuntimes(fallback.kind);
+    } catch {
+      throw err;
+    }
+    if (others.usable.length === 0) throw err;
+    log.error('Install default session runtime is not ready; serving the groups on other runtimes', {
+      driver: fallback.kind,
+      usable: others.usable,
+      err,
+    });
+    closeRuntimeAdmission(fallback.kind, fallback, 'readiness');
+    for (const { kind, driver } of others.unready) closeRuntimeAdmission(kind, driver, 'readiness');
+  }
+}
+
+/** Every non-default kind a group is configured on, split into ready and not ready. Never throws per kind. */
+async function probeOtherConfiguredRuntimes(
+  defaultKind: string,
+): Promise<{ usable: string[]; unready: { kind: string; driver: SessionEventsDriver }[] }> {
+  const usable: string[] = [];
+  const unready: { kind: string; driver: SessionEventsDriver }[] = [];
+  for (const kind of new Set(await listConfiguredDriverKinds())) {
+    if (kind === defaultKind) continue;
+    let driver: SessionEventsDriver;
+    try {
+      driver = getSessionDriver(kind);
+    } catch (err) {
+      log.error('Configured session runtime cannot be built', { driver: kind, err });
+      continue;
+    }
+    try {
+      await withinDiscoveryBound(driver.ensureReady?.() ?? Promise.resolve(), kind, 'readiness', true);
+      usable.push(kind);
+    } catch (err) {
+      log.error('Configured session runtime is not ready', { driver: kind, err });
+      unready.push({ kind, driver });
+    }
+  }
+  return { usable, unready };
+}
+
+/**
  * The drivers startup discovery looks at: the install default plus every kind
- * this install has ever configured (ruling 8b.3), recorded here first so a
- * group's kind is remembered even after the group moves off it. A kind whose
- * driver cannot be built (its overlay was removed) is logged and skipped.
+ * a group is configured on or this install has ever used (ruling 8b.3), the
+ * configured ones then recorded so a group's kind is remembered even after the
+ * group moves off it. `complete` is false when the kinds could not be read
+ * (only the install default is known then) or a kind's driver could not be
+ * built (its overlay was removed): something live may be unconsidered. A
+ * failed record write leaves discovery complete — the read already named
+ * every kind.
  */
 async function discoveryDrivers(): Promise<{
+  kinds: string[];
   drivers: { kind: string; driver: SessionEventsDriver }[];
-  skipped: number;
+  complete: boolean;
 }> {
   const fallback = defaultSessionDriverKind();
   let kinds = [fallback];
-  let skipped = 0;
+  let complete = true;
   try {
-    await recordDriverKindsUsed([fallback, ...(await listConfiguredDriverKinds())]);
-    kinds = [...new Set([fallback, ...(await listDriverKindsUsed())])];
+    const configured = await listConfiguredDriverKinds();
+    kinds = [...new Set([fallback, ...configured, ...(await listDriverKindsUsed())])];
+    try {
+      await recordDriverKindsUsed([fallback, ...configured]);
+    } catch (err) {
+      log.warn('Could not record the driver kinds in use', { err });
+    }
   } catch (err) {
     log.warn('Could not read the driver kinds this install has used; discovering the install default only', {
       err,
     });
-    skipped += 1;
+    complete = false;
   }
   const drivers: { kind: string; driver: SessionEventsDriver }[] = [];
   for (const kind of kinds) {
@@ -1211,10 +1487,10 @@ async function discoveryDrivers(): Promise<{
         driver: kind,
         err,
       });
-      skipped += 1;
+      complete = false;
     }
   }
-  return { drivers, skipped };
+  return { kinds, drivers, complete };
 }
 
 /**
@@ -1225,7 +1501,8 @@ async function discoveryDrivers(): Promise<{
  * second registration would silently replace the first in the key-indexed
  * registry and leave a runner nobody supervises. Copies on one driver are
  * that driver's own business and are left exactly as before per-group
- * selection existed.
+ * selection existed. The selected kind is compared as a string against the
+ * drivers discovery already built — arbitration never builds a driver.
  */
 async function arbitrateDuplicateKeys(
   listed: { driver: SessionEventsDriver; snapshot: SupervisedSnapshot }[],
@@ -1240,18 +1517,19 @@ async function arbitrateDuplicateKeys(
   const losers = new Set<SupervisedSnapshot>();
   for (const copies of bySession.values()) {
     if (new Set(copies.map((copy) => copy.driver)).size < 2) continue;
-    let selected: SessionEventsDriver | undefined;
+    let selectedKind: string | undefined;
     try {
-      selected = await sessionDriverForGroup(copies[0].snapshot.handle.key.agentGroupId);
+      selectedKind =
+        (await getContainerConfigDriver(copies[0].snapshot.handle.key.agentGroupId)) ?? defaultSessionDriverKind();
     } catch (err) {
-      log.warn('Could not resolve the selected driver for a duplicated session; arbitrating without it', {
+      log.warn('Could not read the selected driver for a duplicated session; arbitrating without it', {
         sessionId: copies[0].snapshot.handle.key.sessionId,
         err,
       });
     }
     const running = copies.filter((copy) => copy.snapshot.phase === 'running');
     const pool = running.length > 0 ? running : copies;
-    const winner = pool.find((copy) => copy.driver === selected) ?? pool[0];
+    const winner = pool.find((copy) => copy.driver.kind === selectedKind) ?? pool[0];
     for (const copy of copies) if (copy.driver !== winner.driver) losers.add(copy.snapshot);
   }
   return losers;

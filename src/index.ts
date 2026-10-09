@@ -10,12 +10,12 @@ import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js
 import {
   abortGatewaySessionObservers,
   adoptRunningSessions,
+  ensureSessionRuntimesReady,
   resumeGatewaySessionAdmission,
   stopGatewaySessionsForUnavailability,
 } from './container-runner.js';
 import { closeDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
-import { getSessionDriver } from './drivers/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
@@ -94,7 +94,8 @@ async function main(): Promise<void> {
   else log.info('Skipping local container.json backfill for non-local central DB');
 
   // Prepare the runtime; inbound routing waits until approval health and adoption are ready.
-  await getSessionDriver().ensureReady?.();
+  // Fatal for the install default exactly as before unless groups run on another, ready runtime.
+  await ensureSessionRuntimesReady();
   await startHostInstanceLease();
   let releaseInbound!: () => void;
   const inboundReady = new Promise<void>((resolve) => {

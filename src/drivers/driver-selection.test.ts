@@ -21,12 +21,16 @@ import {
   adoptRunningSessions,
   assertGroupDriverChangeAllowed,
   changeGroupDriver,
+  ensureSessionRuntimesReady,
   isContainerRunning,
   killContainer,
   reapRetainedSessions,
+  rediscoverUnavailableRuntimes,
   wakeContainer,
   _resetAdoptionRetryStateForTesting,
+  _setRuntimeDiscoveryScheduleForTesting,
 } from '../container-runner.js';
+import * as containerConfigs from '../db/container-configs.js';
 import * as coordination from '../db/coordination.js';
 import { closeDb, createAgentGroup, createSession, getDb, initTestDb, runMigrations } from '../db/index.js';
 import {
@@ -273,6 +277,7 @@ describe('readSetting', () => {
 
 interface FakeDriverOptions {
   capabilities?: DriverCapabilities;
+  ensureReady?: () => Promise<void>;
   listSessions?: () => Promise<SessionSnapshot[]>;
   listRetained?: () => Promise<RetainedObject[]>;
   reapRetained?: (installSlug: string, keys: SessionKey[]) => Promise<void>;
@@ -325,6 +330,7 @@ function registerRecordingFake(options: FakeDriverOptions = {}): FakeDriverRecor
         return { stop: () => {} };
       },
     };
+    if (options.ensureReady) driver.ensureReady = options.ensureReady;
     if (options.listRetained) driver.listRetained = options.listRetained;
     if (options.reapRetained || options.listRetained) {
       driver.reapRetained = async (installSlug, keys) => {
@@ -725,6 +731,7 @@ describe('composition on the spawn path', () => {
     );
     expect(await groupRefusesAttachments(GROUP_ID)).toBe(true);
   });
+
   // --- A1 fix round: astra's BLOCK findings, reproduced ---------------------
 
   it('refuses a driver change while a spawn is paused in gateway acquisition; the next session stays on the old driver', async () => {
@@ -821,6 +828,118 @@ describe('composition on the spawn path', () => {
         err: expect.objectContaining({ message: expect.stringMatching(/already has active session/) }),
       }),
     );
+  });
+
+  describe('runtime availability', () => {
+    const reapOrphans = vi.fn(async () => {});
+
+    beforeEach(() => {
+      reapOrphans.mockClear();
+      resetGatewayProvider({
+        kind: 'availability-gateway',
+        agentSkills: [],
+        sessions: {
+          async ensure() {
+            return { contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } } };
+          },
+          reapOrphans,
+        },
+        approvals: { subscribe: async () => {} },
+      });
+    });
+
+    afterEach(() => {
+      _setRuntimeDiscoveryScheduleForTesting();
+      _resetAdoptionRetryStateForTesting();
+      resetGatewayProvider(null);
+    });
+
+    it('a runtime whose listing never settles holds up neither the default runtime nor startup; it stays closed until rediscovered', async () => {
+      _setRuntimeDiscoveryScheduleForTesting(50, 60_000);
+      let hang = true;
+      const slow = registerRecordingFake({ listSessions: () => (hang ? new Promise(() => {}) : Promise.resolve([])) });
+      await setContainerConfigDriver(GROUP_ID, slow.kind);
+      const stops: string[] = [];
+      const orphan = {
+        handle: {
+          ...fakeHandle(
+            fixtureSpec({ key: { installSlug: INSTALL_SLUG, agentGroupId: 'ag-gone', sessionId: 'sess-gone' } }),
+          ),
+          stop: async (reason: string) => void stops.push(reason),
+        },
+        phase: 'running',
+      } as unknown as SessionSnapshot;
+      const defaultFake = registerRecordingFake({ listSessions: async () => [orphan] });
+      resetSessionDriver(getSessionDriver(defaultFake.kind));
+
+      // Bounded: startup returns, and the default runtime's orphan was handled.
+      expect(await adoptRunningSessions()).toEqual({ adopted: 0, stopped: 1 });
+      expect(stops).toEqual(['orphan-at-startup']);
+      // The slow runtime's surviving sessions are unseen: no global gateway
+      // reap, and its groups are closed to admission (retryable).
+      expect(reapOrphans).not.toHaveBeenCalled();
+      const row = await createGroupSession();
+      expect(await wakeAndRefusal(row)).toMatch(/runtime-unavailable: .*which is not available \(discovery\)/);
+      expect(slow.prepared).toHaveLength(0);
+
+      // Still hung: rediscovery leaves it closed, never "nothing there".
+      expect(await rediscoverUnavailableRuntimes()).toBe(0);
+      expect(await wakeAndRefusal(row)).toMatch(/runtime-unavailable/);
+
+      hang = false;
+      expect(await rediscoverUnavailableRuntimes()).toBe(1);
+      expect(await wakeAndRefusal(row)).toBeUndefined();
+      expect(slow.prepared.map((spec) => spec.key.sessionId)).toEqual([SESSION_ID]);
+    });
+
+    it('a single-runtime install lists unbounded and closes nothing, exactly as before', async () => {
+      _setRuntimeDiscoveryScheduleForTesting(1, 60_000);
+      await setContainerConfigDriver(GROUP_ID, null);
+      await getDb().run('DELETE FROM runtime_driver_kinds');
+      let answer!: (snapshots: SessionSnapshot[]) => void;
+      const defaultFake = registerRecordingFake({
+        listSessions: () => new Promise<SessionSnapshot[]>((resolve) => (answer = resolve)),
+      });
+      resetSessionDriver(getSessionDriver(defaultFake.kind));
+      const adopting = adoptRunningSessions();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      answer([]);
+      expect(await adopting).toEqual({ adopted: 0, stopped: 0 });
+      expect(reapOrphans).toHaveBeenCalledTimes(1);
+      const row = await createGroupSession();
+      expect(await wakeAndRefusal(row)).toBeUndefined();
+    });
+
+    it('readiness: a failing default with every group on another, ready runtime closes only the default', async () => {
+      const notReady = new Error('docker daemon unreachable');
+      const defaultFake = registerRecordingFake({ ensureReady: () => Promise.reject(notReady) });
+      resetSessionDriver(getSessionDriver(defaultFake.kind));
+
+      // The group runs on the group-volume fake, which needs no readiness check.
+      await expect(ensureSessionRuntimesReady()).resolves.toBeUndefined();
+      const row = await createGroupSession();
+      expect(await wakeAndRefusal(row)).toBeUndefined();
+      expect(groupVolume.prepared).toHaveLength(1);
+      await stopIfRunning(SESSION_ID);
+
+      // A group on the default runtime is refused admission, retryably.
+      await setContainerConfigDriver(GROUP_ID, null);
+      expect(await wakeAndRefusal(row)).toMatch(/runtime-unavailable: .*which is not available \(readiness\)/);
+      expect(defaultFake.prepared).toHaveLength(0);
+    });
+
+    it('readiness: a failing default stays fatal, with the same error, when no group uses another kind', async () => {
+      const notReady = new Error('docker daemon unreachable');
+      const defaultFake = registerRecordingFake({ ensureReady: () => Promise.reject(notReady) });
+      resetSessionDriver(getSessionDriver(defaultFake.kind));
+      await setContainerConfigDriver(GROUP_ID, null);
+      await expect(ensureSessionRuntimesReady()).rejects.toBe(notReady);
+
+      // ...and when the only other kind configured is not ready either.
+      const alsoDown = registerRecordingFake({ ensureReady: () => Promise.reject(new Error('apiserver down')) });
+      await setContainerConfigDriver(GROUP_ID, alsoDown.kind);
+      await expect(ensureSessionRuntimesReady()).rejects.toBe(notReady);
+    });
   });
 });
 
@@ -1007,6 +1126,70 @@ describe('startup discovery edge cases', () => {
       expect.anything(),
     );
     expect(reapOrphans).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a failed read of the kinds this install used as incomplete discovery: no gateway orphan reap', async () => {
+    const read = vi.spyOn(containerConfigs, 'listDriverKindsUsed').mockRejectedValueOnce(new Error('db locked'));
+    try {
+      const defaultFake = registerRecordingFake();
+      resetSessionDriver(getSessionDriver(defaultFake.kind));
+      await adoptRunningSessions();
+    } finally {
+      read.mockRestore();
+    }
+    expect(log.warn).toHaveBeenCalledWith(
+      'Could not read the driver kinds this install has used; discovering the install default only',
+      expect.anything(),
+    );
+    expect(reapOrphans).not.toHaveBeenCalled();
+  });
+
+  it('a failed WRITE of the kinds record alone leaves discovery complete: the read already named every kind', async () => {
+    const write = vi.spyOn(containerConfigs, 'recordDriverKindsUsed').mockRejectedValueOnce(new Error('db read-only'));
+    try {
+      const defaultFake = registerRecordingFake();
+      resetSessionDriver(getSessionDriver(defaultFake.kind));
+      await adoptRunningSessions();
+    } finally {
+      write.mockRestore();
+    }
+    expect(reapOrphans).toHaveBeenCalledTimes(1);
+  });
+
+  it('arbitrates duplicates without building the selected kind: a missing selected overlay plus copies on two runtimes', async () => {
+    let builds = 0;
+    const missing = `fake-${++uniqueKind}`;
+    registerSessionDriver(missing, () => {
+      builds += 1;
+      throw new Error('overlay removed');
+    });
+    await createAgentGroup({
+      id: GROUP_ID,
+      name: 'Discovery',
+      folder: 'discovery',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    await ensureContainerConfig(GROUP_ID);
+    await setContainerConfigDriver(GROUP_ID, missing);
+    const stops: string[] = [];
+    const copy = (name: string) =>
+      ({
+        handle: {
+          ...fakeHandle(fixtureSpec({ key: key('sess-dup') })),
+          name,
+          stop: async (reason: string) => void stops.push(`${name}:${reason}`),
+        },
+        phase: 'running',
+      }) as unknown as SessionSnapshot;
+    const other = registerRecordingFake({ listSessions: async () => [copy('other')] });
+    await recordDriverKindsUsed([other.kind]);
+    const defaultFake = registerRecordingFake({ listSessions: async () => [copy('default')] });
+    resetSessionDriver(getSessionDriver(defaultFake.kind));
+    expect(await adoptRunningSessions()).toEqual({ adopted: 0, stopped: 2 });
+    // Discovery tried the missing kind once; arbitration never built it again.
+    expect(builds).toBe(1);
+    expect(stops.filter((stop) => stop.endsWith(':duplicate-at-startup'))).toHaveLength(1);
   });
 });
 
