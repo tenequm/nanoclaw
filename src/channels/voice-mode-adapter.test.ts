@@ -122,18 +122,18 @@ describe('voice-mode environment compatibility', () => {
     const { voiceModeEnv, voiceModeEnvKeys, parseVoiceLanguages } = await import('./voice-mode-protocol.js');
     const warnings: string[] = [];
     const oldValue = 'private-' + 'value';
-    expect(voiceModeEnvKeys(['VOICE_MODE_LINK_TOKEN', 'LIVEKIT_URL'])).toEqual([
-      'VOICE_MODE_LINK_TOKEN',
-      'VOICE_LINK_TOKEN',
+    expect(voiceModeEnvKeys(['VOICE_MODE_PUBLIC_URL', 'LIVEKIT_URL'])).toEqual([
+      'VOICE_MODE_PUBLIC_URL',
+      'VOICE_PUBLIC_URL',
       'LIVEKIT_URL',
     ]);
     expect(
-      voiceModeEnv({ VOICE_LINK_TOKEN: oldValue, VOICE_MODE_LINK_TOKEN: 'new', VOICE_WAKE_MODEL: 'off' }, (s) =>
+      voiceModeEnv({ VOICE_PUBLIC_URL: oldValue, VOICE_MODE_PUBLIC_URL: 'new', VOICE_WAKE_MODEL: 'off' }, (s) =>
         warnings.push(s),
       ),
-    ).toMatchObject({ VOICE_MODE_LINK_TOKEN: 'new', VOICE_MODE_WAKE_MODEL: 'off' });
+    ).toMatchObject({ VOICE_MODE_PUBLIC_URL: 'new', VOICE_MODE_WAKE_MODEL: 'off' });
     expect(warnings).toEqual([
-      'voice-mode: VOICE_LINK_TOKEN is ignored because VOICE_MODE_LINK_TOKEN is set; remove it',
+      'voice-mode: VOICE_PUBLIC_URL is ignored because VOICE_MODE_PUBLIC_URL is set; remove it',
       'voice-mode: VOICE_WAKE_MODEL is deprecated; use VOICE_MODE_WAKE_MODEL',
     ]);
     expect(warnings.join(' ')).not.toContain(oldValue);

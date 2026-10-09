@@ -1,5 +1,7 @@
 # Voice mode upgrade and rollback
 
+Retired 2026-10-09: env-backed `voice:` lines and the `voice` compatibility adapter are gone; every line is a `voice_mode_lines` row.
+
 This is an operator runbook. Building the fork's main branch performs no server
 actions. Use the complete fork build, with matching host and worker. Update
 native clients before the server cutover (to a build that speaks protocol 4 and

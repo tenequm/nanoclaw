@@ -54,8 +54,6 @@ import { addMember } from '../modules/permissions/db/agent-group-members.js';
 import { grantRole } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { getSessionsByAgentGroup } from '../db/sessions.js';
-import { getVoiceLine } from '../db/voice-lines.js';
-import { resolveVoiceModeLine } from './voice-mode-line.js';
 import { routeInbound } from '../router.js';
 import type { MessagingGroup } from '../types.js';
 import {
@@ -513,100 +511,6 @@ describe('handleVoiceCommand (the interceptor)', () => {
   });
 });
 
-/** A line from before the rename, as main left it: its voice user, chat, wiring and OWNER as its owner. */
-const SAVED_LINE = 'voice:legacy';
-async function seedSavedLine(): Promise<void> {
-  await upsertUser({ id: SAVED_LINE, kind: 'voice', display_name: 'Caller', created_at: now() });
-  await addMember({ user_id: SAVED_LINE, agent_group_id: 'ag-1', added_by: null, added_at: now() });
-  await createMessagingGroup({
-    id: 'legacy-mg',
-    channel_type: 'voice',
-    platform_id: SAVED_LINE,
-    name: null,
-    is_group: 0,
-    unknown_sender_policy: 'strict',
-    created_at: now(),
-  });
-  await wire('legacy-mg', 'ag-1');
-  await getDb().run(
-    "UPDATE messaging_group_agents SET sender_scope = 'known' WHERE messaging_group_id = ?",
-    'legacy-mg',
-  );
-  await getDb().run('INSERT INTO voice_lines (line_messaging_group_id, updated_at) VALUES (?, ?)', 'legacy-mg', now());
-  await getDb().run(
-    'INSERT INTO voice_line_owners (line_messaging_group_id, owner_user_id) VALUES (?, ?)',
-    'legacy-mg',
-    OWNER,
-  );
-}
-const SAVED_LINK = 'https://voice.example.com/voice?t=saved';
-const savedLink = (platformId: string) => (platformId === SAVED_LINE ? SAVED_LINK : null);
-
-it('moves a saved main line without minting, and only /voice new retires its link', async () => {
-  const id = SAVED_LINE;
-  await seedSavedLine();
-  expect(await resolveVoiceModeLine(id)).not.toBeNull();
-  expect(await runVoiceCommand(mg('mg-other'), null, OWNER, callUrl)).toMatchObject({ results: [{ rebound: true }] });
-  expect(await lines()).toEqual([]);
-  expect((await getVoiceLine('legacy-mg'))?.target_messaging_group_id).toBe('mg-other');
-  expect(await runVoiceCommand(mg('mg-dm'), null, SCOPED_ADMIN, callUrl)).toMatchObject({
-    results: [{ reason: 'other-caller' }],
-  });
-  expect(await resolveVoiceModeLine(id)).not.toBeNull();
-  expect(await runVoiceCommand(mg('mg-dm'), null, OWNER, callUrl, true)).toMatchObject({
-    results: [{ replaced: true }],
-  });
-  expect(await resolveVoiceModeLine(id)).toBeNull();
-});
-
-it("gives a saved main line's owner its saved link when /voice moves it, privately in a group", async () => {
-  await seedSavedLine();
-  expect(await runVoiceCommand(mg('mg-other'), null, OWNER, callUrl, false, savedLink)).toEqual({
-    kind: 'done',
-    results: [{ ok: true, agentName: 'Andy', link: SAVED_LINK, replaced: false, saved: true }],
-  });
-  expect(await lines()).toEqual([]);
-
-  const delivered: Array<{ platformId: string; text: string }> = [];
-  registerChannelAdapter('chat', {
-    factory: (): ChannelAdapter => ({
-      name: 'chat',
-      channelType: 'chat',
-      supportsThreads: false,
-      setup: async () => {},
-      teardown: async () => {},
-      isConnected: () => true,
-      deliver: async (platformId, _threadId, message) => {
-        delivered.push({ platformId, text: (message.content as { text: string }).text });
-        return undefined;
-      },
-    }),
-  });
-  await initChannelAdapters(() => ({
-    onInbound: () => {},
-    onInboundEvent: () => {},
-    onMetadata: () => {},
-    onAction: () => {},
-  }));
-  await chatGroup('mg-group', 'chat:G1', 1);
-  await wire('mg-group', 'ag-1');
-  const event: InboundEvent = {
-    channelType: 'chat',
-    instance: 'chat',
-    platformId: 'chat:G1',
-    threadId: null,
-    message: { id: '9', kind: 'chat', content: JSON.stringify({ text: '/voice', senderId: OWNER }), timestamp: now() },
-  };
-  await handleVoiceCommand(event, callUrl, savedLink);
-  expect(delivered.filter((d) => d.platformId === 'chat:G1').map((d) => d.text)).toEqual([
-    'Calls now talk in this chat, until /voice is run in another one. Your call link is in our direct chat.',
-  ]);
-  expect(delivered.filter((d) => d.platformId !== 'chat:G1').map((d) => d.text)).toEqual([
-    `🎙 Talk to Andy: ${SAVED_LINK}`,
-  ]);
-  expect((await getVoiceLine('legacy-mg'))?.target_messaging_group_id).toBe('mg-group');
-});
-
 it('native Telegram /voice and /voice new use the same line handler as the router', async () => {
   const actor = 'telegram:1';
   await upsertUser({ id: actor, kind: 'telegram', display_name: 'Caller', created_at: now() });
@@ -685,76 +589,4 @@ it('native Telegram /voice and /voice new use the same line handler as the route
   await send('/voice new', 3);
   expect((await lines())[0].token_hash).not.toBe(first.token_hash);
   expect(await getSessionsByAgentGroup('ag-1')).toEqual([]);
-});
-
-/** A `chat` adapter recording what it sends; `openDM` fails when `dm` is false, so no direct chat resolves. */
-async function savedLineChat(options: { dm: boolean; failLinks?: boolean }) {
-  const delivered: Array<{ platformId: string; text: string }> = [];
-  registerChannelAdapter('chat', {
-    factory: (): ChannelAdapter => ({
-      name: 'chat',
-      channelType: 'chat',
-      supportsThreads: false,
-      setup: async () => {},
-      teardown: async () => {},
-      isConnected: () => true,
-      ...(options.dm
-        ? {}
-        : {
-            openDM: async () => {
-              throw new Error('cannot open a direct chat');
-            },
-          }),
-      deliver: async (platformId, _threadId, message) => {
-        const text = (message.content as { text: string }).text;
-        if (options.failLinks && text.includes('?t=')) throw new Error('send failed');
-        delivered.push({ platformId, text });
-        return undefined;
-      },
-    }),
-  });
-  await initChannelAdapters(() => ({
-    onInbound: () => {},
-    onInboundEvent: () => {},
-    onMetadata: () => {},
-    onAction: () => {},
-  }));
-  return delivered;
-}
-
-const commandIn = (platformId: string, text = '/voice'): InboundEvent => ({
-  channelType: 'chat',
-  instance: 'chat',
-  platformId,
-  threadId: null,
-  message: { id: '9', kind: 'chat', content: JSON.stringify({ text, senderId: OWNER }), timestamp: now() },
-});
-
-it("moves a saved main line's call chat from a group with no reachable direct chat, without its link", async () => {
-  await seedSavedLine();
-  const delivered = await savedLineChat({ dm: false });
-  await chatGroup('mg-group', 'chat:G1', 1);
-  await wire('mg-group', 'ag-1');
-  await handleVoiceCommand(commandIn('chat:G1'), callUrl, savedLink);
-  expect((await getVoiceLine('legacy-mg'))?.target_messaging_group_id).toBe('mg-group');
-  expect(delivered).toEqual([
-    { platformId: 'chat:G1', text: expect.stringContaining('Calls with Andy now talk in this chat.') },
-  ]);
-  expect(JSON.stringify(delivered)).not.toContain('?t=');
-  expect(await lines()).toEqual([]);
-  // A mint still needs the direct chat: nothing is minted without one.
-  await handleVoiceCommand(commandIn('chat:G1', '/voice new'), callUrl, savedLink);
-  expect(delivered.at(-1)).toEqual({
-    platformId: 'chat:G1',
-    text: 'I cannot message you directly here: run /voice in a direct chat with me.',
-  });
-  expect(await lines()).toEqual([]);
-});
-
-it('tells the owner to run /voice again when a saved link could not be delivered', async () => {
-  await seedSavedLine();
-  const delivered = await savedLineChat({ dm: true, failLinks: true });
-  await handleVoiceCommand(commandIn('chat:1'), callUrl, savedLink);
-  expect(delivered).toEqual([{ platformId: 'chat:1', text: 'I could not deliver your call link; run /voice again.' }]);
-  expect(await lines()).toEqual([]);
 });

@@ -450,13 +450,13 @@ describe('composeGroupProjectDoc per-agent sections', () => {
     expect(composedSection(doc, VOICE_SECTION)).toContain(realSkill('voice-mode-formatting'));
   });
 
-  it('composes voice-mode-formatting for an agent with a line from before the rename', async () => {
+  it('leaves voice-mode-formatting out for an agent wired only to a `voice` chat from before the rename', async () => {
     const ag = await seed('ag-voice-legacy', 'voice-legacy-group');
     await wire(ag, 'mg-voice-legacy', 'voice');
 
     const doc = await withRealContainer(() => compose(ag));
 
-    expect(doc).toContain(`# ${VOICE_SECTION}`);
+    expect(doc).not.toContain(`# ${VOICE_SECTION}`);
   });
 
   it('leaves voice-mode-formatting out for a non-voice agent on the "all" selection', async () => {
