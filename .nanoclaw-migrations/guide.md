@@ -111,9 +111,9 @@ Fork surface; re-apply on upstream files:
   animation, split long edits, `editMessageCaption`), `formatter.ts` (nested/task lists,
   divider, `tg://time` -> `date_time`, `splitCaption`), `inbound.ts`
   (`richMessageToMarkdown`, rich mentions), `ask-question.ts` (button `style`), and
-  `agent-docs.ts` (the "Rich messages" section and the `telegram-formatting` gate,
-  imported by the island's `index.ts`).
-- `container/skills/telegram-formatting/instructions.md` [COPY].
+  `agent-docs.ts` (the "Telegram formatting" guide section for every Telegram-wired agent,
+  whatever its skill selection, then the "Rich messages" section; imported by the
+  island's `index.ts`).
 
 ## A3. [RESTORED 2026-08-31] Host chat commands
 Restored post-migration, adapted to the async DbDriver tree: `2055cfdb` (system),

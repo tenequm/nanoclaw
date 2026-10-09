@@ -9,12 +9,10 @@
  * the Telegram dialect deviations from CommonMark hold, and that
  * chunked output preserves entity offsets across slice boundaries.
  */
-import { readFileSync } from 'fs';
-import path from 'path';
-
 import { describe, expect, it } from 'vitest';
 import { FormattedString } from '@grammyjs/parse-mode';
 
+import { FORMATTING_BODY as guide } from './agent-docs.js';
 import { renderFS, splitForBody, TELEGRAM_TEXT_LIMIT } from './formatter.js';
 
 describe('renderFS', () => {
@@ -473,15 +471,11 @@ describe('splitForBody', () => {
 });
 
 /**
- * The telegram-formatting skill tells agents what renders. Every syntax it
+ * The Telegram formatting section tells agents what renders. Every syntax it
  * teaches is named here with the entity it must produce, and must still be in
  * the guide, so the two cannot drift apart.
  */
-describe('telegram-formatting guide renders as it says', () => {
-  const guide = readFileSync(
-    path.join(process.cwd(), 'container', 'skills', 'telegram-formatting', 'instructions.md'),
-    'utf-8',
-  );
+describe('Telegram formatting guide renders as it says', () => {
   const entityTypes = (md: string): string[] => renderFS(md).entities.map((e) => e.type);
 
   it.each([

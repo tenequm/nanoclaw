@@ -46,7 +46,12 @@ import type { AgentGroup } from './types.js';
 // Loading these modules registers the per-agent sections and skill gates under test.
 import { resetGateConfigCache, writeGateEntry } from './modules/jev-gate/index.js';
 import './channels/voice-mode.js';
-import { RICH_MESSAGES_BODY, RICH_MESSAGES_SECTION } from './channels/telegram-grammy/agent-docs.js';
+import {
+  FORMATTING_BODY,
+  FORMATTING_SECTION,
+  RICH_MESSAGES_BODY,
+  RICH_MESSAGES_SECTION,
+} from './channels/telegram-grammy/agent-docs.js';
 import './modules/canvas-actions/index.js';
 import './modules/slack-agent-flow/index.js';
 
@@ -371,7 +376,6 @@ describe('composeGroupProjectDoc skill selection', () => {
 describe('composeGroupProjectDoc per-agent sections', () => {
   const JEV_SECTION = 'NanoClaw Module: jev-gate';
   const VOICE_SECTION = 'NanoClaw Skill: voice-mode-formatting';
-  const TG_FORMAT_SECTION = 'NanoClaw Skill: telegram-formatting';
   const SLACK_ONLY_MODULES = ['canvas', 'create-agent-slack', 'rooms'];
 
   beforeEach(() => {
@@ -473,18 +477,29 @@ describe('composeGroupProjectDoc per-agent sections', () => {
     for (const name of SLACK_ONLY_MODULES) expect(doc).not.toContain(`# NanoClaw Module: ${name}\n`);
   });
 
-  it('composes telegram-formatting only for a Telegram-wired agent', async () => {
+  it('composes the Telegram formatting guide for a Telegram-wired agent, whatever its skill list', async () => {
     const tg = await seed('ag-tg-fmt', 'tg-fmt-group');
     await wire(tg, 'mg-tg-fmt', 'telegram');
-    expect(composedSection(await withRealContainer(() => compose(tg)), TG_FORMAT_SECTION)).toContain(
-      realSkill('telegram-formatting'),
-    );
+    await updateContainerConfigJson(tg.id, 'skills', ['welcome']);
+    expect(composedSection(await withRealContainer(() => compose(tg)), FORMATTING_SECTION)).toContain(FORMATTING_BODY);
 
     const slack = await seed('ag-slack-fmt', 'slack-fmt-group');
     await wire(slack, 'mg-slack-fmt', 'slack');
     const doc = await withRealContainer(() => compose(slack));
     expect(doc).toContain('# NanoClaw Skill: onecli-gateway');
-    expect(doc).not.toContain(`# ${TG_FORMAT_SECTION}`);
+    expect(doc).not.toContain(`# ${FORMATTING_SECTION}`);
+  });
+
+  it('puts the formatting guide before the Rich messages section', async () => {
+    const ag = await seed('ag-tg-order', 'tg-order-group');
+    await wire(ag, 'mg-tg-order', 'telegram');
+    await updateContainerConfigScalars(ag.id, { rich_messages: 1 });
+
+    const doc = await compose(ag);
+
+    const formatting = doc.indexOf(`# ${FORMATTING_SECTION}\n`);
+    expect(formatting).toBeGreaterThanOrEqual(0);
+    expect(doc.indexOf(`# ${RICH_MESSAGES_SECTION}\n`)).toBeGreaterThan(formatting);
   });
 
   it('composes the Rich Messages section only for a Telegram-wired agent with rich_messages on', async () => {
