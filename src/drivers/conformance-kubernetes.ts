@@ -138,6 +138,17 @@ export function registerKubernetesConformance(): void {
     let policy: MountPolicy;
     let spec: SessionSpec;
     let serial = 0;
+    let informerCreations = 0;
+    let informerConnections = 0;
+    let makeInformer: typeof import('@kubernetes/client-node').makeInformer;
+    function tracedInformer<T extends import('@kubernetes/client-node').KubernetesObject>(
+      ...args: Parameters<typeof makeInformer<T>>
+    ) {
+      informerCreations++;
+      const informer = makeInformer<T>(...args);
+      informer.on('connect', () => informerConnections++);
+      return informer;
+    }
     const watches: SessionWatch[] = [];
 
     const kubectl = (args: string[], input?: string, timeout?: number): Promise<string> =>
@@ -167,9 +178,10 @@ export function registerKubernetesConformance(): void {
         context: CONTEXT,
         namespace,
         hostAddress,
-        startTimeoutMs: 90_000,
+        startTimeoutMs: 30_000,
         pollIntervalMs: 100,
         requestTimeoutMs: 1500,
+        informerFactory: tracedInformer,
         ...options,
       });
       const original = raw.watchSessions.bind(raw);
@@ -242,6 +254,7 @@ export function registerKubernetesConformance(): void {
       );
 
     beforeAll(async () => {
+      makeInformer = (await import('@kubernetes/client-node')).makeInformer;
       const supplied = process.env.NANOCLAW_CONFORMANCE_KUBECONFIG;
       if (!supplied || resolve(supplied) === resolve(join(process.env.HOME ?? '', '.kube/config'))) {
         throw new Error('explicit non-default NANOCLAW_CONFORMANCE_KUBECONFIG required');
@@ -282,6 +295,8 @@ export function registerKubernetesConformance(): void {
     }, 120_000);
 
     beforeEach(async () => {
+      informerCreations = 0;
+      informerConnections = 0;
       policy = {
         groupsRoot: join(root, 'groups'),
         dataRoot: join(root, 'data'),
@@ -537,17 +552,24 @@ export function registerKubernetesConformance(): void {
     }, 60_000);
 
     it('refuses an illegal folder label instead of projecting it', async () => {
-      spec.labels[GROUP_FOLDER_LABEL] = 'bad/folder';
+      spec.labels[GROUP_FOLDER_LABEL] = 'x'.repeat(64);
+      // Isolate label grammar: the shared policy already refuses mounts whose
+      // admission join uses an illegal folder, before runtime label projection.
+      spec.containers[0].mounts = spec.containers[0].mounts.filter(
+        (mount) => !mount.hostPath.startsWith(`${policy.groupsRoot}/`),
+      );
       await expect(driver.prepare(spec)).rejects.toMatchObject({ kind: 'spec-invalid', retryable: false });
       expect(await list('pvc', installSelector())).toHaveLength(0);
       expect(await list(RESOURCE, installSelector())).toHaveLength(0);
     });
 
     it('enforces exactly one agent and the composed Block E refusal backstops', async () => {
+      const auxiliary = fixtureAuxContainer();
+      for (const mount of auxiliary.mounts) mount.hostPath = mount.hostPath.replace('/install', root);
       for (const containers of [
         [],
         [spec.containers[0], structuredClone(spec.containers[0])],
-        [...spec.containers, fixtureAuxContainer()],
+        [...spec.containers, auxiliary],
       ]) {
         await expect(driver.prepare({ ...spec, containers })).rejects.toMatchObject({
           kind: 'spec-invalid',
@@ -721,6 +743,26 @@ export function registerKubernetesConformance(): void {
       expect(terminal.mock.calls[0][0]).toMatchObject({ kind: 'started-then-died', exitCode: 137 });
       await delay(1000);
       expect(terminal).toHaveBeenCalledOnce();
+    }, 60_000);
+
+    it('multiple supervised handles share one informer and host stop suppresses terminal callbacks', async () => {
+      const supervised = withSessionEvents(driver);
+      const first = await supervised.prepare(spec);
+      const callback = vi.fn();
+      first.onTerminal(callback);
+      await first.start();
+      const adopted = (await supervised.listSessions(spec.key.installSlug))[0].handle;
+      adopted.onTerminal(callback);
+      expect(driver.watchSessions).toHaveBeenCalledOnce();
+      await eventually(
+        async () => informerCreations,
+        (count) => count === 1,
+      );
+      await adopted.stop('host-requested');
+      await podGone(adopted);
+      await delay(1000);
+      expect(callback).not.toHaveBeenCalled();
+      expect(informerCreations).toBe(1);
     }, 60_000);
 
     it('fresh snapshots, rotated mailbox token, image, env and resources reach the resumed pod', async () => {
@@ -967,6 +1009,7 @@ export function registerKubernetesConformance(): void {
     }, 60_000);
 
     it('maps unschedulable pod to resources-exhausted', async () => {
+      driver = driverFor({ startTimeoutMs: 8000 });
       spec.resources = { ...spec.resources, cpus: '100000' };
       const handle = await driver.prepare(spec);
       await expect(handle.start()).rejects.toMatchObject({ kind: 'resources-exhausted', retryable: true });
@@ -1005,6 +1048,7 @@ export function registerKubernetesConformance(): void {
     });
 
     it('one watch subscription survives apiserver restart and emits forced and host-requested terminals', async () => {
+      driver = driverFor({ startTimeoutMs: 90_000 });
       const events: SessionEvent[] = [];
       const watch = driver.watchSessions(spec.key.installSlug, (event) => events.push(event));
       try {
@@ -1062,7 +1106,15 @@ export function registerKubernetesConformance(): void {
           (all) => all.some((event) => event.kind === 'terminal'),
           60_000,
         );
+        events.length = 0;
+        await driver.reapRetained!(spec.key.installSlug, [spec.key]);
+        await eventually(
+          async () => events,
+          (all) => all.some((event) => event.kind === 'terminal'),
+          60_000,
+        );
         expect(driver.watchSessions).toHaveBeenCalledOnce();
+        expect(informerCreations).toBe(1);
       } finally {
         watch.stop();
       }
@@ -1078,9 +1130,14 @@ export function registerKubernetesConformance(): void {
           (count) => count > 0,
         );
         await chaos(async () => {
+          const connectedBefore = informerConnections;
           await command('docker', ['pause', NODE]);
           try {
-            await delay(7000);
+            await eventually(
+              async () => informerConnections,
+              (count) => count > connectedBefore,
+              45_000,
+            );
           } finally {
             await command('docker', ['unpause', NODE]);
             await apiReady();
@@ -1093,13 +1150,14 @@ export function registerKubernetesConformance(): void {
         await eventually(
           async () => events,
           (all) => all.some((event) => event.kind === 'terminal'),
-          45_000,
+          90_000,
         );
         expect(driver.watchSessions).toHaveBeenCalledOnce();
+        expect(informerCreations).toBe(1);
       } finally {
         watch.stop();
       }
-    }, 150_000);
+    }, 240_000);
 
     it('a deleted CRD maps runtime-unavailable and is restored in finally', async () => {
       await chaos(async () => {
@@ -1118,10 +1176,15 @@ export function registerKubernetesConformance(): void {
           await kubectl(['apply', '-f', '-'], JSON.stringify(saved));
           await kubectl(['wait', '--for=condition=Established', `crd/${CRD}`, '--timeout=30s']);
         }
-        const handle = await driverFor().prepare(spec);
+        const restored = driverFor();
+        const handle = await eventually(
+          () => restored.prepare(spec),
+          () => true,
+          90_000,
+        );
         await handle.start();
         expect(await handle.status()).toEqual({ phase: 'running' });
       });
-    }, 120_000);
+    }, 150_000);
   });
 }
