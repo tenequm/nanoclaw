@@ -142,3 +142,39 @@ docker exec nanoclaw-dev-control-plane mv /tmp/kube-apiserver.yaml /etc/kubernet
 Do not pause the node for this test: that leaves half-open sockets. client-node
 2.0.0 informers reconnect automatically for watch timeouts/410, but a fetch
 failure emits `error` and requires an application restart/backoff handler.
+
+## Driver-only harness
+
+The [driver harness](driver-harness.ts) feeds A1's group-volume fixture through
+prepare, start, status, exec, rapid suspend/resume, discovery and retained
+cleanup. It creates and deletes its own `nanoclaw-test-b1-*` namespace and uses
+synthetic file contents. A new pod UID, refreshed bytes/env, provider state,
+exact uid and skill-link targets, non-root posture, terminal watch delivery and
+group-PVC survival are asserted. Every multi-command shell check exits on its
+first failed assertion.
+
+```sh
+pnpm exec tsx dev/k8s/driver-harness.ts --help
+pnpm exec tsx dev/k8s/driver-harness.ts \
+  --kubeconfig dev/k8s/.kubeconfig \
+  --image nanoclaw-agent-dev:sha256-319e17ce64bf1ed761cc5f6f8d1b371634300565cc299975bf1523797fb41789 \
+  --surface-image "$(./dev/k8s/build-source.sh)"
+```
+
+Omit `--surface-image` only with a complete baked image. The harness attaches
+to a sleeping agent container; the full mailbox/model round trip belongs to
+the host milestone.
+
+The lazily constructed driver reads install settings from environment first,
+then `.env`: `NANOCLAW_KUBERNETES_KUBECONFIG` (explicit file),
+`NANOCLAW_KUBERNETES_CONTEXT` (explicit context), optional
+`NANOCLAW_KUBERNETES_NAMESPACE` (otherwise sanitized `nanoclaw-<installSlug>`)
+and `NANOCLAW_KUBERNETES_HOST_ADDRESS` (the address from `host-address.sh`).
+It never loads the default kubeconfig. An unreachable cluster affects the
+requesting session and does not run a startup readiness check.
+
+This MVP creates bare Sandboxes with permissive networking. The declared
+`declarative` network-policy capability describes the intended mechanism;
+this driver installs no NetworkPolicy. Session stop retains Sandbox and
+owned Secret; only host-named retained cleanup or terminal residue deletes
+session objects. Those paths always preserve the standalone group PVC.
