@@ -28,7 +28,7 @@
  */
 import fs from 'fs';
 
-import { getChannelAdapterExact } from '../channels/channel-registry.js';
+import { getRegisteredChannelNames } from '../channels/channel-registry.js';
 import { restartAgentGroupContainers } from '../container-restart.js';
 import { isContainerRunning, killContainer } from '../container-runner.js';
 import { getAgentGroup } from '../db/agent-groups.js';
@@ -557,9 +557,12 @@ export async function restartAgent(agentGroupId: string, actorUserId: string): P
 
 // --- /voice ---
 
-/** Whether a chat offers /voice: while the voice-mode channel runs (an admin's first /voice creates a line). */
+/**
+ * Whether a chat offers /voice: wherever the voice-mode channel is installed (an admin's first /voice
+ * creates a line). Installed, not running: Telegram syncs its command menus before voice-mode starts.
+ */
 export async function offersVoiceCommand(_agentGroupIds: Iterable<string>): Promise<boolean> {
-  return getChannelAdapterExact('voice-mode') !== undefined;
+  return getRegisteredChannelNames().includes('voice-mode');
 }
 
 /**

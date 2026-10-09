@@ -119,7 +119,7 @@ describe('computeCommandGrants', () => {
     expect(dm[0].commands).toEqual(COMMAND_ORDER);
   });
 
-  it('adds /voice to every chat only while the voice-mode channel runs', async () => {
+  it('adds /voice to every chat wherever the voice-mode channel is installed, before it starts too', async () => {
     await makeAgentGroup('ag-1', 'Emma');
     await makeAgentGroup('ag-2', 'Stan');
     await grantRole({ user_id: OWNER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
@@ -141,6 +141,8 @@ describe('computeCommandGrants', () => {
         deliver: async () => undefined,
       }),
     });
+    const installed = await computeCommandGrants();
+    expect(installed.find((g) => g.chatPlatformId === OWNER)?.commands).toEqual(['voice', ...COMMAND_ORDER]);
     await initChannelAdapters(() => ({
       onInbound: () => {},
       onInboundEvent: () => {},

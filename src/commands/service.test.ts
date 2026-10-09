@@ -568,7 +568,7 @@ describe('/voice', () => {
     await wire('mg-dm', 'ag-1');
   });
 
-  it('offers /voice only while the voice-mode channel runs', async () => {
+  it('offers /voice wherever the voice-mode channel is installed, before it starts too', async () => {
     expect(await offersVoiceCommand(['ag-1'])).toBe(false);
     registerChannelAdapter('voice-mode', {
       factory: () => ({
@@ -581,6 +581,7 @@ describe('/voice', () => {
         deliver: async () => undefined,
       }),
     });
+    expect(await offersVoiceCommand([])).toBe(true);
     await initChannelAdapters(() => ({
       onInbound: () => {},
       onInboundEvent: () => {},
