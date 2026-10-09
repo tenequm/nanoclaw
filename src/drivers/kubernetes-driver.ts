@@ -101,11 +101,17 @@ export function groupPvcName(key: SessionKey): string {
 }
 
 function sandboxName(key: SessionKey): string {
-  return kubernetesName(`ncl-${key.agentGroupId}-${key.sessionId}`, JSON.stringify(key));
+  return kubernetesName(
+    `ncl-${key.agentGroupId}-${key.sessionId}`,
+    JSON.stringify([key.installSlug, key.agentGroupId, key.sessionId]),
+  );
 }
 
 export function secretName(key: SessionKey): string {
-  return kubernetesName(`ncl-${key.agentGroupId}-${key.sessionId}-files`, JSON.stringify([key, 'files']));
+  return kubernetesName(
+    `ncl-${key.agentGroupId}-${key.sessionId}-files`,
+    JSON.stringify([key.installSlug, key.agentGroupId, key.sessionId, 'files']),
+  );
 }
 
 function condition(box: Sandbox, type: string): k8s.V1Condition | undefined {

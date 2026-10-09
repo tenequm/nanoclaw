@@ -195,6 +195,17 @@ describe('kubernetes driver manifests', () => {
     expect(kubernetesNamespace('UPPER_slug')).toBe('nanoclaw-upper-slug');
     expect(kubernetesNamespace('x'.repeat(100))).toHaveLength(63);
   });
+  it('names depend on key values, never JavaScript object property order', () => {
+    const h = harness();
+    const reordered = {
+      sessionId: h.spec.key.sessionId,
+      agentGroupId: h.spec.key.agentGroupId,
+      installSlug: h.spec.key.installSlug,
+    };
+    expect(h.driver.runtimeName(reordered)).toBe(h.driver.runtimeName(h.spec.key));
+    expect(secretName(reordered)).toBe(secretName(h.spec.key));
+  });
+
   it('group PVC names are independent of session ids', () => {
     const { key } = fixtureGroupVolumeSpec();
     expect(groupPvcName(key)).toBe(groupPvcName({ ...key, sessionId: 'other' }));
