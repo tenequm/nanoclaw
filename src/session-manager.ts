@@ -371,6 +371,8 @@ async function extractAttachmentFiles(
     return changed ? JSON.stringify(parsed) : contentStr;
   }
 
+  if (await refuseAttachmentBytes(agentGroupId, attachments, stagedPaths, messageId)) return JSON.stringify(parsed);
+
   const inboxRoot = path.join(sessionDir(agentGroupId, sessionId), 'inbox');
   // Resolved lazily on the first attachment that actually carries bytes, so a
   // message whose attachments have no inline `data` or `stagedPath` never
@@ -534,6 +536,42 @@ export function writeOutboundDirect(
   },
 ): Promise<void> {
   return withMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.writeDirect(message));
+}
+
+/**
+ * Whether the group's runtime can see host-written files at all. A runtime
+ * with no view of the host filesystem (`storage: 'group-volume'`, the
+ * kubernetes driver) has no path for attachment bytes in either direction
+ * until an attachment transport exists (Block E amendment) — so they are
+ * REFUSED loudly, never written somewhere the agent cannot read. Resolved
+ * lazily (dynamic import) so the plain-text path never touches selection.
+ */
+export async function groupRefusesAttachments(agentGroupId: string): Promise<boolean> {
+  const { sessionDriverForGroup } = await import('./drivers/index.js');
+  return (await sessionDriverForGroup(agentGroupId)).capabilities().storage === 'group-volume';
+}
+
+/** Inbound half of `groupRefusesAttachments`: each byte-carrying attachment is replaced by a visible refusal. */
+async function refuseAttachmentBytes(
+  agentGroupId: string,
+  attachments: Array<Record<string, unknown>>,
+  stagedPaths: Map<Record<string, unknown>, string>,
+  messageId: string,
+): Promise<boolean> {
+  const carrying = attachments.filter((att) => typeof att.data === 'string' || stagedPaths.has(att));
+  if (carrying.length === 0 || !(await groupRefusesAttachments(agentGroupId))) return false;
+  for (const att of carrying) {
+    delete att.data;
+    // The runner renders `error` as "[file: name — failed: ...]", so the agent
+    // sees the refusal and can tell the sender.
+    att.error = "attachments cannot reach this agent's runtime yet (no attachment transport for its driver)";
+  }
+  log.error('Refused inbound attachments: the group runtime has no host filesystem to receive them', {
+    agentGroupId,
+    messageId,
+    attachments: carrying.length,
+  });
+  return true;
 }
 
 /**

@@ -33,7 +33,13 @@ import { mapConcurrent } from './concurrency.js';
 import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
+import {
+  clearOutbox,
+  groupRefusesAttachments,
+  readOutboxFiles,
+  withExistingMailboxSession,
+  writeSessionMessage,
+} from './session-manager.js';
 import { notePresence, pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { platformMessageId } from './platform-id.js';
 import type { OutboundFile, ResolvedReaction } from './channels/adapter.js';
@@ -741,10 +747,28 @@ async function deliverMessage(
   // Read file attachments from outbox if the content declares files.
   // File I/O lives in session-manager.ts (symmetric with inbound
   // extractAttachmentFiles) — delivery just hands buffers to the adapter.
-  const files =
-    Array.isArray(content.files) && content.files.length > 0
-      ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
-      : undefined;
+  //
+  // A runtime with no host filesystem writes its outbox where the host cannot
+  // read it: refuse loudly (log + a note back to the agent) instead of the
+  // silent `undefined` a missing outbox dir would otherwise produce.
+  let files: OutboundFile[] | undefined;
+  if (Array.isArray(content.files) && content.files.length > 0) {
+    if (await groupRefusesAttachments(session.agent_group_id)) {
+      log.error('Refused outbound attachments: the group runtime has no host filesystem to send them from', {
+        sessionId: session.id,
+        messageId: msg.id,
+        files: content.files.length,
+      });
+      await writeOutboundNote(
+        session,
+        msg.id,
+        `Your message was delivered WITHOUT its ${content.files.length} attached file(s): this agent's runtime ` +
+          'cannot send attachments yet. Tell the recipient the files could not be sent.',
+      );
+    } else {
+      files = readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[]);
+    }
+  }
 
   // The agent addresses a message by its inbound ROW id, which the router
   // suffixed with the agent group to keep ids unique across the fan-out
