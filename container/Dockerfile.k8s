@@ -12,7 +12,11 @@
 #     --build-arg BASE_IMAGE=ghcr.io/tenequm/nanoclaw-agent@sha256:<digest> container
 
 ARG BASE_IMAGE=ghcr.io/tenequm/nanoclaw-agent:latest
-FROM ${BASE_IMAGE}
+FROM scratch AS source
+COPY --chown=root:root agent-runner/src /src
+COPY --chown=root:root skills /skills
+
+FROM ${BASE_IMAGE} AS baked
 
 # Root-owned and not writable by the `node` user the agent runs as, matching
 # the read-only bind mounts this replaces.
