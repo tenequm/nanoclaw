@@ -89,10 +89,9 @@ try {
   const attach = handle.execSpec([
     'bash',
     '-c',
-    "echo pvc-persisted > /workspace/persisted; id -u; cat /proc/1/comm; cat /app/.nanoclaw-session.json; cat /home/node/.claude/settings.json; readlink /home/node/.claude/skills/welcome; test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token; test -f /app/src/index.ts; test -d /app/skills/welcome; awk '/CapEff|NoNewPrivs/ {print}' /proc/self/status",
+    'set -eu; test "$(id -u)" = 1000; test "$(readlink /home/node/.claude/skills/welcome)" = /app/skills/welcome; test "$(readlink /home/node/.claude/skills/agent-browser)" = /app/skills/agent-browser; echo pvc-persisted > /workspace/persisted; id -u; cat /proc/1/comm; cat /app/.nanoclaw-session.json; cat /home/node/.claude/settings.json; readlink /home/node/.claude/skills/welcome; test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token; test -f /app/src/index.ts; test -d /app/skills/welcome; awk \'/CapEff|NoNewPrivs/ {print}\' /proc/self/status',
   ]);
   const output = execFileSync(attach.bin, attach.argsPlain, { encoding: 'utf8', timeout: 30_000 }).trim();
-  assert.match(output, /1000/);
   assert.match(output, /tini/);
   assert.match(output, /fixture-version-1/);
   assert.match(output, /autoMemoryEnabled/);
@@ -107,7 +106,7 @@ try {
     '--',
     'bash',
     '-c',
-    `printf '%s\n' '{"preserved":true}' > /home/node/.claude/settings.json; ln -s /app/skills/obsolete /home/node/.claude/skills/obsolete; rm /home/node/.claude/skills/agent-browser; mkdir /home/node/.claude/skills/agent-browser`,
+    `set -eu; printf '%s\n' '{"preserved":true}' > /home/node/.claude/settings.json; ln -s /app/skills/obsolete /home/node/.claude/skills/obsolete; rm /home/node/.claude/skills/agent-browser; mkdir /home/node/.claude/skills/agent-browser`,
   );
 
   await handle.stop('harness-resume');
@@ -131,7 +130,7 @@ try {
     '--',
     'bash',
     '-c',
-    'cat /workspace/persisted; cat /app/.nanoclaw-session.json; printf "%s\n" "$NANOCLAW_WAKE_REASON"',
+    'set -eu; cat /workspace/persisted; cat /app/.nanoclaw-session.json; printf "%s\n" "$NANOCLAW_WAKE_REASON"',
   );
   assert.match(resumed, /pvc-persisted/);
   assert.match(resumed, /fixture-version-2/);
@@ -145,7 +144,7 @@ try {
     '--',
     'bash',
     '-c',
-    `grep preserved /home/node/.claude/settings.json; test ! -L /home/node/.claude/skills/obsolete; test -d /home/node/.claude/skills/agent-browser; test ! -L /home/node/.claude/skills/agent-browser; test ! -w /app/.nanoclaw-session.json; test ! -w /app/src/index.ts; echo provider-state-and-readonly-mounts-verified`,
+    `set -eu; test "$(id -u)" = 1000; test "$(readlink /home/node/.claude/skills/welcome)" = /app/skills/welcome; grep preserved /home/node/.claude/settings.json; test ! -L /home/node/.claude/skills/obsolete; test -d /home/node/.claude/skills/agent-browser; test ! -L /home/node/.claude/skills/agent-browser; test ! -w /app/.nanoclaw-session.json; test ! -w /app/src/index.ts; echo provider-state-and-readonly-mounts-verified`,
   );
   assert.match(reconciled, /provider-state-and-readonly-mounts-verified/);
   step('provider-reconciliation', reconciled);
@@ -166,7 +165,12 @@ try {
     'Bound',
   );
   step('pvc-survives-session-delete', 'Bound');
-  step('watch-events', { total: events.length, terminal: events.filter((e) => e.kind === 'terminal').length });
+  const watchDeadline = Date.now() + 30_000;
+  const terminalEvents = () => events.filter((e) => e.kind === 'terminal' && e.key.sessionId === spec.key.sessionId);
+  while (!terminalEvents().length && Date.now() < watchDeadline)
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.ok(terminalEvents().length > 0, 'watch must deliver a terminal event for this session');
+  step('watch-events', { total: events.length, terminal: terminalEvents().length });
 } finally {
   watch?.stop();
   if (namespaceCreated) {

@@ -149,7 +149,9 @@ The [driver harness](driver-harness.ts) feeds A1's group-volume fixture through
 prepare, start, status, exec, rapid suspend/resume, discovery and retained
 cleanup. It creates and deletes its own `nanoclaw-test-b1-*` namespace and uses
 synthetic file contents. A new pod UID, refreshed bytes/env, provider state,
-non-root posture and group-PVC survival are asserted.
+exact uid and skill-link targets, non-root posture, terminal watch delivery and
+group-PVC survival are asserted. Every multi-command shell check exits on its
+first failed assertion.
 
 ```sh
 pnpm exec tsx dev/k8s/driver-harness.ts --help
