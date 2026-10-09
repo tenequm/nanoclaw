@@ -6,7 +6,8 @@ import { dirname, join, resolve } from 'node:path';
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { KubernetesSessionDriver } from './kubernetes-driver.js';
+import { armSessionLifecycle } from '../container-runner.js';
+import { KubernetesSessionDriver, type KubernetesDriverOptions } from './kubernetes-driver.js';
 import { projectLabels } from './label-projection.js';
 import { withSessionEvents } from './session-events.js';
 import {
@@ -177,7 +178,7 @@ export function registerKubernetesConformance(): void {
     };
     const apply = (object: unknown): Promise<string> => ns(['apply', '-f', '-'], JSON.stringify(object));
     const installSelector = (): string => `${LABELS.install}=${spec.key.installSlug}`;
-    const driverFor = (options: { startTimeoutMs?: number } = {}): SessionDriver => {
+    const driverFor = (options: Partial<KubernetesDriverOptions> = {}): SessionDriver => {
       const raw = new KubernetesSessionDriver({
         ...policy,
         kubeconfigPath: kubeconfig,
@@ -860,6 +861,65 @@ export function registerKubernetesConformance(): void {
       expect(callback).not.toHaveBeenCalled();
       expect(informerCreations).toBe(1);
     }, 60_000);
+
+    it('supervised resume ignores a suspended informer update delayed into Secret sync', async () => {
+      const { KubeConfig, CoreV1Api } = await import('@kubernetes/client-node');
+      const config = new KubeConfig();
+      config.loadFromFile(kubeconfig);
+      config.setCurrentContext(CONTEXT);
+      const core = config.makeApiClient(CoreV1Api);
+      driver = driverFor({ coreApi: core });
+      const supervised = withSessionEvents(driver);
+      const first = await supervised.prepare(spec);
+      await armSessionLifecycle({ handle: first, onTerminal: vi.fn() });
+      const oldPod = (await get('pod', first.name))!;
+      await first.stop('idle');
+      await podGone(first);
+      const resumed = await supervised.prepare(spec);
+      await writeSnapshots(2);
+
+      const hints: SessionEvent[] = [];
+      watches.push(driver.watchSessions(spec.key.installSlug, (event) => hints.push(event)));
+      let release!: () => void;
+      const blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let syncing!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        syncing = resolve;
+      });
+      const replace = core.replaceNamespacedSecret.bind(core);
+      vi.spyOn(core, 'replaceNamespacedSecret').mockImplementationOnce(async (...args) => {
+        syncing();
+        await blocked;
+        return replace(...args);
+      });
+      let finalization: Promise<void> | undefined;
+      const terminal = vi.fn(() => {
+        finalization = resumed.stop('terminal-finalization');
+      });
+      const starting = armSessionLifecycle({ handle: resumed, onTerminal: terminal });
+      try {
+        await entered;
+        hints.length = 0;
+        await ns(['annotate', RESOURCE, resumed.name, 'nanoclaw.dev/delayed-terminal=fix3', '--overwrite']);
+        await eventually(async () => hints.some((event) => event.kind === 'terminal'), Boolean);
+        expect(await resumed.status()).toEqual({ phase: 'stopped' });
+        expect(terminal).not.toHaveBeenCalled();
+      } finally {
+        release();
+        await starting;
+        await finalization;
+      }
+      await delay(1000);
+      expect(terminal).not.toHaveBeenCalled();
+      expect(await resumed.status()).toEqual({ phase: 'running' });
+      expect((await get('pod', resumed.name))!.metadata.uid).not.toBe(oldPod.metadata.uid);
+      expect((await get(RESOURCE, resumed.name))!.spec.operatingMode).toBe('Running');
+      await assertSnapshots(resumed);
+      await resumed.stop('conformance');
+      await podGone(resumed);
+    }, 90_000);
 
     it('fresh snapshots, rotated mailbox token, image, env and resources reach the resumed pod', async () => {
       const handle = await start();

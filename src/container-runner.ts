@@ -20,6 +20,7 @@ import {
   CONTAINER_MEMORY_LIMIT,
   CONTAINER_PIDS_LIMIT,
   DATA_DIR,
+  EGRESS_LOCKDOWN,
   GROUPS_DIR,
   INSTALL_SLUG,
   TIMEZONE,
@@ -2356,8 +2357,8 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     (key) => (contributedEnv[key] ?? env[key]) !== undefined,
   );
   if (hasProxy && (input.hostAddress || input.mailboxUrl)) {
-    // Traffic to the host (the mailbox, and anything on the driver's host
-    // address) must bypass the proxy, even with a remote gateway.
+    // A driver-declared host address (the gateway's URLs on it included) and
+    // the mailbox host bypass the proxy, even with a remote gateway.
     const bypass = new Set(
       [env.NO_PROXY, env.no_proxy, contributedEnv.NO_PROXY, contributedEnv.no_proxy]
         .flatMap((value) => value?.split(',') ?? [])
@@ -2365,7 +2366,16 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
         .filter(Boolean),
     );
     if (input.hostAddress) bypass.add(input.hostAddress);
-    if (input.mailboxUrl) bypass.add(new URL(input.mailboxUrl).hostname);
+    if (input.mailboxUrl) {
+      const mailboxHost = new URL(input.mailboxUrl).hostname;
+      // On the lockdown network this alias names the gateway container, so the mailbox must stay proxied.
+      const gatewayAlias =
+        !input.hostAddress &&
+        EGRESS_LOCKDOWN &&
+        gateway.networkAccess.target.kind === 'runtime' &&
+        mailboxHost === gateway.networkAccess.endpoint;
+      if (!gatewayAlias) bypass.add(mailboxHost);
+    }
     contributedEnv.NO_PROXY = contributedEnv.no_proxy = [...bypass].join(',');
   }
 

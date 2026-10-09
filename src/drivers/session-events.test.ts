@@ -244,6 +244,46 @@ describe('stop-intent suppression is hub-owned', () => {
 });
 
 describe('arming order', () => {
+  it('re-reads retained execution truth after start, including an immediate exit', async () => {
+    const driver = Object.assign(new FakeDriver(), { listRetained: async () => [] });
+    const { inner, handle, hub } = await prepared(driver, 's1');
+    const terminal = vi.fn();
+    handle.onTerminal(terminal);
+    inner.statusValue = { phase: 'stopped' };
+    driver.emit({ key: inner.key, kind: 'terminal' });
+    driver.snapshots = [{ handle: inner, phase: 'terminal' }];
+    await hub.resync('spike');
+    await settled();
+    expect(terminal).not.toHaveBeenCalled();
+
+    const failure = { kind: 'started-then-died' as const, retryable: false as const, exitCode: 3 };
+    vi.spyOn(inner, 'start').mockImplementation(async () => {
+      driver.emit({ key: inner.key, kind: 'terminal' });
+      await settled();
+      expect(terminal).not.toHaveBeenCalled();
+      inner.statusValue = { phase: 'failed', failure };
+    });
+    await handle.start();
+    expect(terminal).toHaveBeenCalledExactlyOnceWith(failure);
+    driver.emit({ key: inner.key, kind: 'terminal' });
+    await settled();
+    expect(terminal).toHaveBeenCalledOnce();
+  });
+
+  it('keeps adopted retained handles immediately supervised without a start call', async () => {
+    const driver = Object.assign(new FakeDriver(), { listRetained: async () => [] });
+    const hub = withSessionEvents(driver);
+    const inner = new FakeHandle(makeKey('s1'));
+    driver.snapshots = [{ handle: inner, phase: 'running' }];
+    const [{ handle }] = await hub.listSessions('spike');
+    const terminal = vi.fn();
+    handle.onTerminal(terminal);
+    inner.statusValue = { phase: 'stopped' };
+    driver.emit({ key: inner.key, kind: 'terminal' });
+    await settled();
+    expect(terminal).toHaveBeenCalledExactlyOnceWith(undefined);
+  });
+
   it('buffers a terminal confirmed before onTerminal is armed and delivers on arming', async () => {
     const driver = new FakeDriver();
     // Arming any key starts the install-wide subscription; the second key's

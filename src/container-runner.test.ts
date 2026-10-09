@@ -26,10 +26,23 @@ import {
 } from './container-runner.js';
 import type { SupervisedHandle } from './drivers/session-events.js';
 import { resetGatewayProvider } from './gateway-providers/index.js';
+import { createSessionDriver } from './drivers/index.js';
 import { log } from './log.js';
 import type { VolumeMount } from './providers/provider-container-registry.js';
 import type { AgentGroup, Session } from './types.js';
 
+const topology = vi.hoisted(() => ({ lockdown: false, attached: false, execFileSync: vi.fn() }));
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  get EGRESS_LOCKDOWN() {
+    return topology.lockdown;
+  },
+  EGRESS_NETWORK: 'fixture-egress',
+}));
+vi.mock('child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('child_process')>()),
+  execFileSync: topology.execFileSync,
+}));
 vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
@@ -112,13 +125,14 @@ function compose(
     gateway?: Record<string, unknown>;
     contribution?: Record<string, unknown>;
     containerConfig?: ContainerConfig;
+    mounts?: VolumeMount[];
   } = {},
 ) {
   return composeSessionSpec({
     agentGroup,
     session,
     containerName: 'nanoclaw-v2-agent-one-1700000000000',
-    mounts,
+    mounts: overrides.mounts ?? mounts,
     containerConfig: overrides.containerConfig ?? containerConfig,
     mailboxEnvironment: overrides.mailboxEnvironment ?? { NANOCLAW_MAILBOX_BACKEND: 'sqlite' },
     hostAddress: overrides.hostAddress,
@@ -189,6 +203,59 @@ describe('composeSessionSpec', () => {
         NO_PROXY: `localhost,internal,different,${host}`,
         no_proxy: `localhost,internal,different,${host}`,
       });
+    },
+  );
+
+  it.each([false, true])(
+    'routes the mailbox consistently with actual Docker network selection (lockdown=%s)',
+    async (lockdown) => {
+      topology.lockdown = lockdown;
+      topology.attached = false;
+      topology.execFileSync.mockReset().mockImplementation((_bin: string, args: string[]) => {
+        if (args[0] === 'inspect') throw new Error('no existing agent');
+        if (args[0] === 'network' && args[1] === 'connect') topology.attached = true;
+        if (args[0] === 'network' && args.includes('--format')) return topology.attached ? 'fixture-gateway ' : '';
+        return '';
+      });
+      const platform = vi.spyOn(os, 'platform').mockReturnValue('linux');
+      try {
+        const spec = compose({
+          mounts: [],
+          mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
+          gateway: {
+            env: { ...proxyEnv, NO_PROXY: 'localhost', no_proxy: 'internal' },
+            networkAccess: {
+              endpoint: 'host.docker.internal',
+              target: { kind: 'runtime', identity: 'fixture-gateway' },
+            },
+          },
+        });
+        await createSessionDriver('docker').prepare(spec);
+        const create = topology.execFileSync.mock.calls.find((call) => call[1][0] === 'create')![1] as string[];
+        const bypass = spec.containers[0].contributedEnv!;
+        const expected = lockdown ? 'localhost,internal' : 'localhost,internal,host.docker.internal';
+        expect(bypass.NO_PROXY).toBe(expected);
+        expect(bypass.no_proxy).toBe(expected);
+        expect(bypass).toMatchObject(proxyEnv);
+        if (lockdown) {
+          expect(create.slice(create.indexOf('--network'), create.indexOf('--network') + 2)).toEqual([
+            '--network',
+            'fixture-egress',
+          ]);
+          expect(create).not.toContain('--add-host=host.docker.internal:host-gateway');
+          expect(topology.execFileSync).toHaveBeenCalledWith(
+            'docker',
+            ['network', 'connect', '--alias', 'host.docker.internal', 'fixture-egress', 'fixture-gateway'],
+            expect.anything(),
+          );
+        } else {
+          expect(create).toContain('--add-host=host.docker.internal:host-gateway');
+          expect(create).not.toContain('--network');
+        }
+      } finally {
+        topology.lockdown = false;
+        platform.mockRestore();
+      }
     },
   );
 
