@@ -879,7 +879,7 @@ export function registerKubernetesConformance(): void {
       await writeSnapshots(2);
 
       const hints: SessionEvent[] = [];
-      watches.push(driver.watchSessions(spec.key.installSlug, (event) => hints.push(event)));
+      driver.watchSessions(spec.key.installSlug, (event) => hints.push(event));
       let release!: () => void;
       const blocked = new Promise<void>((resolve) => {
         release = resolve;
@@ -902,7 +902,7 @@ export function registerKubernetesConformance(): void {
       try {
         await entered;
         hints.length = 0;
-        await ns(['annotate', RESOURCE, resumed.name, 'nanoclaw.dev/delayed-terminal=fix3', '--overwrite']);
+        await ns(['annotate', RESOURCE, resumed.name, 'nanoclaw.dev/touched=resume', '--overwrite']);
         await eventually(async () => hints.some((event) => event.kind === 'terminal'), Boolean);
         expect(await resumed.status()).toEqual({ phase: 'stopped' });
         expect(terminal).not.toHaveBeenCalled();

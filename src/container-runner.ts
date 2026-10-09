@@ -2358,7 +2358,8 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
   );
   if (hasProxy && (input.hostAddress || input.mailboxUrl)) {
     // A driver-declared host address (the gateway's URLs on it included) and
-    // the mailbox host bypass the proxy, even with a remote gateway.
+    // the mailbox host bypass the proxy, even with a remote gateway; the
+    // lockdown gateway alias below is the one exception.
     const bypass = new Set(
       [env.NO_PROXY, env.no_proxy, contributedEnv.NO_PROXY, contributedEnv.no_proxy]
         .flatMap((value) => value?.split(',') ?? [])

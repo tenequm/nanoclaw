@@ -24,14 +24,14 @@ import {
   toMountSpecs,
   watchGatewayAvailability,
 } from './container-runner.js';
+import { createSessionDriver } from './drivers/index.js';
 import type { SupervisedHandle } from './drivers/session-events.js';
 import { resetGatewayProvider } from './gateway-providers/index.js';
-import { createSessionDriver } from './drivers/index.js';
 import { log } from './log.js';
 import type { VolumeMount } from './providers/provider-container-registry.js';
 import type { AgentGroup, Session } from './types.js';
 
-const topology = vi.hoisted(() => ({ lockdown: false, attached: false, execFileSync: vi.fn() }));
+const topology = vi.hoisted(() => ({ lockdown: false, execFileSync: vi.fn() }));
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
   get EGRESS_LOCKDOWN() {
@@ -47,7 +47,11 @@ vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-afterEach(() => resetGatewayProvider());
+afterEach(() => {
+  resetGatewayProvider();
+  topology.lockdown = false;
+  topology.execFileSync.mockReset();
+});
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -210,11 +214,11 @@ describe('composeSessionSpec', () => {
     'routes the mailbox consistently with actual Docker network selection (lockdown=%s)',
     async (lockdown) => {
       topology.lockdown = lockdown;
-      topology.attached = false;
-      topology.execFileSync.mockReset().mockImplementation((_bin: string, args: string[]) => {
+      let attached = false;
+      topology.execFileSync.mockImplementation((_bin: string, args: string[]) => {
         if (args[0] === 'inspect') throw new Error('no existing agent');
-        if (args[0] === 'network' && args[1] === 'connect') topology.attached = true;
-        if (args[0] === 'network' && args.includes('--format')) return topology.attached ? 'fixture-gateway ' : '';
+        if (args[0] === 'network' && args[1] === 'connect') attached = true;
+        if (args[0] === 'network' && args.includes('--format')) return attached ? 'fixture-gateway ' : '';
         return '';
       });
       const platform = vi.spyOn(os, 'platform').mockReturnValue('linux');
@@ -253,7 +257,6 @@ describe('composeSessionSpec', () => {
           expect(create).not.toContain('--network');
         }
       } finally {
-        topology.lockdown = false;
         platform.mockRestore();
       }
     },
@@ -265,21 +268,17 @@ describe('composeSessionSpec', () => {
     ['host.docker.internal.', 'host.docker.internal.'],
   ])('matches the lockdown gateway alias canonically (mailbox %s, endpoint %s)', (mailboxHost, endpoint) => {
     topology.lockdown = true;
-    try {
-      const spec = compose({
-        mailboxUrl: `http://${mailboxHost}:3010/mailbox/v1`,
-        gateway: {
-          env: { ...proxyEnv, NO_PROXY: 'localhost' },
-          networkAccess: {
-            endpoint,
-            target: { kind: 'runtime', identity: 'fixture-gateway' },
-          },
+    const spec = compose({
+      mailboxUrl: `http://${mailboxHost}:3010/mailbox/v1`,
+      gateway: {
+        env: { ...proxyEnv, NO_PROXY: 'localhost' },
+        networkAccess: {
+          endpoint,
+          target: { kind: 'runtime', identity: 'fixture-gateway' },
         },
-      });
-      expect(spec.containers[0].contributedEnv!.NO_PROXY).toBe('localhost');
-    } finally {
-      topology.lockdown = false;
-    }
+      },
+    });
+    expect(spec.containers[0].contributedEnv!.NO_PROXY).toBe('localhost');
   });
 
   it.each(['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'])(

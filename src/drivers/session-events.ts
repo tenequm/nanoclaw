@@ -76,7 +76,7 @@ interface KeyState {
   cb: ((failure?: SessionFailure) => void) | null;
   stopIntent: boolean;
   fired: boolean;
-  /** Retained runtime truth belongs to the previous execution until start settles. */
+  /** Retained runtime truth belongs to the previous execution until start settles, then start() re-reads it. */
   pendingStart: boolean;
   /** Terminal confirmed before a callback was armed; delivered on arming. */
   pending?: { failure?: SessionFailure };
@@ -92,7 +92,7 @@ class SessionEventsHub {
   constructor(private readonly driver: SessionDriver) {}
 
   /** A fresh incarnation resets the key: fired/stop-intent belong to the old one. */
-  trackPrepared(handle: SessionHandle, pendingStart = !!this.driver.listRetained): void {
+  trackPrepared(handle: SessionHandle, pendingStart: boolean): void {
     this.#states.set(idOf(handle.key), {
       handle,
       cb: null,
@@ -174,11 +174,7 @@ class SessionEventsHub {
 
   /** The hint discipline: re-read truth, then (maybe) fire — never fire on the event alone. */
   async #verify(state: KeyState): Promise<void> {
-    if (state.fired || state.stopIntent) return;
-    if (state.pendingStart) {
-      state.recheck = true;
-      return;
-    }
+    if (state.fired || state.stopIntent || state.pendingStart) return;
     if (state.verifying) {
       // Never drop a hint into an in-flight read: on a driver whose status()
       // is a remote round trip, the read may have snapshotted
@@ -257,7 +253,7 @@ export function withSessionEvents(driver: SessionDriver): SessionEventsDriver {
     capabilities: () => driver.capabilities(),
     prepare: async (spec) => {
       const handle = await driver.prepare(spec);
-      hub.trackPrepared(handle);
+      hub.trackPrepared(handle, !!driver.listRetained);
       return new HubHandle(handle, hub);
     },
     listSessions: async (installSlug) =>
