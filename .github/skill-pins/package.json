@@ -22,6 +22,7 @@
     "@grpc/grpc-js": "1.14.5",
     "@grpc/proto-loader": "0.8.1",
     "@livekit/agents": "1.9.1",
+    "@livekit/agents-plugin-elevenlabs": "1.9.1",
     "@livekit/agents-plugin-google": "1.9.1",
     "@livekit/agents-plugin-silero": "1.9.1",
     "@livekit/rtc-node": "1.1.0",
@@ -146,6 +147,12 @@
       ]
     },
     "@livekit/agents": {
+      "version": "1.9.1",
+      "sources": [
+        ".claude/skills/add-voice-mode/SKILL.md nc:dep"
+      ]
+    },
+    "@livekit/agents-plugin-elevenlabs": {
       "version": "1.9.1",
       "sources": [
         ".claude/skills/add-voice-mode/SKILL.md nc:dep"

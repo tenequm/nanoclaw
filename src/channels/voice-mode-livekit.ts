@@ -25,17 +25,15 @@
  *  - `POST agent/ended`      the worker's session is over.
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
- * line: the line's `/voice` chat (voice_mode_lines first, then a legacy line's
- * voice_lines binding), else the one chat of the VOICE_MODE_MIRROR channel type
- * wired to the agent (pickMirrorTarget). Each turn is routed into that chat's session through the
+ * line: the line's `/voice` chat (its voice_mode_lines binding), else the one
+ * chat of the VOICE_MODE_MIRROR channel type wired to the agent
+ * (pickMirrorTarget). Each turn is routed into that chat's session through the
  * normal inbound path as a message from the line's own caller, addressed to
  * the line's agent only; the transcript is posted into the chat, and the agent
  * answers there as it always does. While the call is live, every message the
  * agent delivers to that chat is also spoken, and its typing there is the
  * worker's `thinking`. With no call chat (VOICE_MODE_MIRROR off, or no single
- * chat to pick) a call is refused, except on a line from before the rename: that
- * call talks on the voice line itself, and the agent's replies come back through
- * deliver() by their `livekit:` reply id.
+ * chat to pick) a call is refused.
  */
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import type http from 'node:http';
@@ -46,21 +44,11 @@ import type { ChannelAdapter, InboundEvent } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
 import { callPageHtml, type VoiceModeUiConfig } from './voice-mode-page.js';
 import type { VoiceModeTurn } from './voice-mode-route.js';
-import {
-  LEGACY_VOICE_CHANNEL,
-  lineChannelType,
-  lineIdOf,
-  sameCallerAndAgent,
-  type ResolveLineOptions,
-  type VoiceModeLine,
-} from './voice-mode-line.js';
+import { lineIdOf, sameCallerAndAgent, type ResolveLineOptions, type VoiceModeLine } from './voice-mode-line.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_VOICE_SILENCE_MS,
   DEFAULT_VOICE_STT_MODEL,
-  DEFAULT_VOICE_TTS_FALLBACK_MODEL,
-  DEFAULT_VOICE_TTS_MODEL,
-  DEFAULT_VOICE_TTS_VOICE,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   MAX_TURN_TEXT_BYTES,
@@ -73,19 +61,15 @@ import {
   type CallEndReason,
   type CallRoomMetadata,
 } from './voice-mode-protocol.js';
-import {
-  getMessagingGroup,
-  getMessagingGroupByPlatform,
-  getMessagingGroupsByAgentGroup,
-} from '../db/messaging-groups.js';
+import { getMessagingGroup, getMessagingGroupsByAgentGroup } from '../db/messaging-groups.js';
 import { getVoiceModeLine } from '../db/voice-mode-lines.js';
-import { getVoiceLine, getVoiceLineOwners } from '../db/voice-lines.js';
 import { registerPostDeliveryHook, setOutboundPresentation, type OutboundAddress } from '../delivery.js';
 import { log } from '../log.js';
 import { platformMessageId } from '../platform-id.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { registerTypingObserver } from '../modules/typing/index.js';
 import type { MessagingGroup } from '../types.js';
+import { TTS_DEFAULT_CHOICE } from '../voice-mode-tts.js';
 
 const MINUTE_MS = 60_000;
 const MAX_QUEUED_EVENTS = 50;
@@ -121,13 +105,7 @@ export const CALL_DEPTH_NOTE =
   'answer; for a long one, say how many points there are, then take them one at a time. No markdown, no ' +
   'links, no code blocks, numbers written as words.';
 
-/** How the agent learns a message was spoken on a call and how its reply will be heard. */
-export const CALL_REPLY_NOTE =
-  `Spoken on a live voice call; your reply is read aloud word for word. ${CALL_DEPTH_NOTE} ` +
-  'Send anything meant for reading (code, links, long lists) as a separate written message to your chat. ' +
-  CALL_LANGUAGE_NOTE;
-
-/** The same for a call that talks in a chat, where every message the agent sends there is spoken. */
+/** How the agent learns a message was spoken on a call in its chat, where every message it sends there is heard. */
 export const CALL_CHAT_REPLY_NOTE =
   'Spoken on a live voice call; while it lasts, every message you send to this chat is read aloud word for ' +
   `word. ${CALL_DEPTH_NOTE} Offer anything meant for reading (code, links, long lists) for after the call ` +
@@ -150,7 +128,7 @@ export function callLanguageNote(languages: readonly string[]): string {
 }
 
 /** The inbound text for one transcribed caller turn. */
-export function turnMessageText(transcript: string, note: string = CALL_REPLY_NOTE): string {
+export function turnMessageText(transcript: string, note: string): string {
   return `<voice source="livekit">${transcript}</voice>\n${note}`;
 }
 
@@ -216,10 +194,6 @@ export interface SpeechSettings {
   sttModel?: string;
   /** Unset for the default; `off` (or empty) for no fallback. */
   sttFallbackModel?: string;
-  ttsModel?: string;
-  /** Unset for the default; `off` (or empty) for no fallback. */
-  ttsFallbackModel?: string;
-  ttsVoice?: string;
   silenceMs?: number;
 }
 
@@ -234,7 +208,7 @@ export interface LiveKitVoiceConfig {
   apiSecret: string;
   /** Dispatch name the worker registers under. */
   agentName?: string;
-  /** Transcription and speech settings the worker gets in the job metadata (VOICE_MODE_STT_*, VOICE_MODE_TTS_*, VOICE_MODE_SILENCE_MS). */
+  /** Transcription settings the worker gets in the job metadata (VOICE_MODE_STT_*, VOICE_MODE_SILENCE_MS); the voice is the line's. */
   speech?: SpeechSettings;
   /** Channel type of the default call chat when `/voice` has not set one; none when unset or `off`. voice-mode.ts passes VOICE_MODE_MIRROR, default DEFAULT_VOICE_MIRROR. */
   mirror?: string;
@@ -258,7 +232,7 @@ export interface LiveKitHost {
   remainingTodayMs(platformId: string, t: number): number;
   chargeUsage(call: { platformId: string; startedAt: number }): void;
   /**
-   * Route a turn through the host's inbound path, into the call chat or onto the voice line. Resolves
+   * Route a turn through the host's inbound path, into the call chat. Resolves
    * true once the agent's session stored it (to answer, or as context), false when the router dropped it;
    * rejects when routing threw.
    */
@@ -304,7 +278,7 @@ interface LiveKitCall {
   turnOutcomes: Map<string, Promise<TurnOutcome>>;
   turnsInFlight: number;
   sent: number;
-  /** Where the call talks; null while it has none (a legacy line talks on itself). Refreshed on join and every turn. */
+  /** Where the call talks; null while it has none (the next turn ends the call). Refreshed on join and every turn. */
   chat: CallChat | null;
   /** Orders chat refreshes: only the latest one started may set `chat`. */
   chatRefreshes: number;
@@ -394,15 +368,9 @@ const defaultMirrorApi: MirrorApi = {
   async boundChat(lineId) {
     const id = lineIdOf(lineId);
     const current = id ? await getVoiceModeLine(id) : undefined;
-    if (current) {
-      const group = current.messaging_group_id && (await getMessagingGroup(current.messaging_group_id));
-      return group ? { group, threadId: current.thread_id, ownerIds: [current.owner_user_id] } : null;
-    }
-    const line = await getMessagingGroupByPlatform(lineChannelType(lineId), lineId);
-    const row = line && (await getVoiceLine(line.id));
-    const group = row?.target_messaging_group_id && (await getMessagingGroup(row.target_messaging_group_id));
-    if (!row || !group) return null;
-    return { group, threadId: row.thread_id, ownerIds: await getVoiceLineOwners(line.id) };
+    if (!current) return null;
+    const group = current.messaging_group_id && (await getMessagingGroup(current.messaging_group_id));
+    return group ? { group, threadId: current.thread_id, ownerIds: [current.owner_user_id] } : null;
   },
   isAdmin: (userId, agentGroupId) => hasAdminPrivilege(userId, agentGroupId),
 };
@@ -517,9 +485,6 @@ const PROTOCOL_REFUSAL = JSON.stringify({
   message: `The voice service is updating. Reload the page or update your client to protocol ${LIVEKIT_PROTOCOL_VERSION}.`,
 });
 
-/** Only a line from before the rename talks on itself with no call chat; any other line needs one. */
-const talksOnLine = (platformId: string): boolean => lineChannelType(platformId) === LEGACY_VOICE_CHANNEL;
-
 function defaultApi(config: LiveKitVoiceConfig): LiveKitServerApi {
   const host = config.serverUrl || config.url;
   const rooms = new RoomServiceClient(host, config.apiKey, config.apiSecret, { requestTimeout: 10 });
@@ -543,26 +508,42 @@ const isNotFound = (err: unknown): boolean => {
   return e?.status === 404 || e?.code === 'not_found';
 };
 
+/**
+ * The request's JSON object, or null when it is larger than `maxBytes`, not JSON or not an object;
+ * an empty body is `whenEmpty` (null by default).
+ */
+export async function readJsonObject(
+  req: http.IncomingMessage,
+  maxBytes: number,
+  whenEmpty: Record<string, unknown> | null = null,
+): Promise<Record<string, unknown> | null> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += (chunk as Buffer).length;
+    if (total > maxBytes) return null;
+    chunks.push(chunk as Buffer);
+  }
+  if (total === 0) return whenEmpty;
+  try {
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost): LiveKitVoice {
   const api = config.api ?? defaultApi(config);
   const agentName = config.agentName || DEFAULT_LIVEKIT_AGENT_NAME;
-  // .env drops empty values, so `off` is how a fallback is turned off there.
-  const fallbackModel = (raw: string | undefined, fallback: string): string => {
-    const model = (raw ?? fallback).trim();
-    return /^(off|none)$/i.test(model) ? '' : model;
-  };
   const languages = config.languages?.length ? [...config.languages] : [...DEFAULT_VOICE_LANGUAGES];
   // What every turn tells the agent, by where the call talks; the same for the engine's life.
   const languageNote = callLanguageNote(languages);
-  const replyNote = CALL_REPLY_NOTE.replace(CALL_LANGUAGE_NOTE, languageNote);
   const chatReplyNote = CALL_CHAT_REPLY_NOTE.replace(CALL_LANGUAGE_NOTE, languageNote);
   const speech = {
     sttModel: config.speech?.sttModel || DEFAULT_VOICE_STT_MODEL,
     // Deprecated: no default, and a worker that is still sent one logs that it ignores it.
-    sttFallbackModel: fallbackModel(config.speech?.sttFallbackModel, ''),
-    ttsModel: config.speech?.ttsModel || DEFAULT_VOICE_TTS_MODEL,
-    ttsFallbackModel: fallbackModel(config.speech?.ttsFallbackModel, DEFAULT_VOICE_TTS_FALLBACK_MODEL),
-    ttsVoice: config.speech?.ttsVoice || DEFAULT_VOICE_TTS_VOICE,
+    sttFallbackModel: (config.speech?.sttFallbackModel ?? '').trim().replace(/^(off|none)$/i, ''),
     silenceMs: config.speech?.silenceMs || DEFAULT_VOICE_SILENCE_MS,
   };
   const mirrorChannel = config.mirror && config.mirror !== 'off' ? config.mirror : null;
@@ -644,12 +625,12 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       }
     }
     if (!mirrorChannel) {
-      noteChat(call, 'choice', 'call talks on the voice line: no /voice chat and VOICE_MODE_MIRROR is off');
+      noteChat(call, 'choice', 'call has no chat to talk in: no /voice chat and VOICE_MODE_MIRROR is off');
       return null;
     }
     const pick = pickMirrorTarget(groups, mirrorChannel);
     if ('skip' in pick) {
-      noteChat(call, 'choice', `call talks on the voice line: no /voice chat and ${pick.skip}`);
+      noteChat(call, 'choice', `call has no chat to talk in: no /voice chat and ${pick.skip}`);
       return null;
     }
     return { group: pick.target, threadId: null, source: 'default' };
@@ -844,30 +825,12 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     return false;
   };
 
-  const readJson = async (req: http.IncomingMessage): Promise<Record<string, unknown> | null> => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of req) {
-      total += (chunk as Buffer).length;
-      if (total > MAX_AGENT_BODY_BYTES) return null;
-      chunks.push(chunk as Buffer);
-    }
-    try {
-      const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>)
-        : null;
-    } catch {
-      return null;
-    }
-  };
-
   /** Admit the call, open its room, dispatch the worker and hand the caller a token for that room only. */
   const startCall = async (res: http.ServerResponse, platformId: string): Promise<void> => {
     const line = await host.resolveLine(platformId, { forCall: true });
     if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
     // Before anything is spent or ended: a line with no chat to talk in is refused outright.
-    if (!talksOnLine(platformId) && !(await probeChat({ line, platformId }))) {
+    if (!(await probeChat({ line, platformId }))) {
       log.info('livekit-voice-mode: call refused: the line has no chat to talk in', { platformId });
       return reply(res, 409, NO_CHAT_REFUSAL, JSON_HEADERS);
     }
@@ -917,6 +880,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       languages,
       ...(line.agent.wakeNames?.length ? { wakeNames: [...line.agent.wakeNames] } : {}),
       ...speech,
+      tts: line.tts ?? TTS_DEFAULT_CHOICE,
       maxDurationMs: capMs,
       joinTimeoutMs,
     };
@@ -951,7 +915,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     // The chat the call talks in, for the page to show; resolved again when the caller joins.
     const chatGroup = (await refreshChat(call, false))?.group;
-    if (!chatGroup && !talksOnLine(platformId) && !call.ended) {
+    if (!chatGroup && !call.ended) {
       endCall(call, 'no chat to talk in');
       return reply(res, 409, NO_CHAT_REFUSAL, JSON_HEADERS);
     }
@@ -975,8 +939,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       agent: line.agent.name,
       sttModel: speech.sttModel,
       sttFallbackModel: speech.sttFallbackModel,
-      ttsModel: speech.ttsModel,
-      ttsFallbackModel: speech.ttsFallbackModel,
+      tts: metadata.tts,
     });
     // What the page needs for its hints: the silence that sends a turn, and the cap that ends the
     // call (from join; onJoined recomputes it, never later than this).
@@ -998,26 +961,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     );
   };
 
-  /** Where a turn goes: the call chat, or the voice line itself. */
-  const turnRoute = (call: LiveKitCall, chat: CallChat | null): Omit<InboundEvent, 'message'> =>
-    chat
-      ? {
-          channelType: chat.group.channel_type,
-          instance: chat.group.instance ?? chat.group.channel_type,
-          platformId: chat.group.platform_id,
-          threadId: chat.threadId,
-          // Addressed to the line's agent only, whoever else is wired to the chat and whatever its trigger.
-          agentGroupId: call.line.agentGroupId,
-        }
-      : {
-          // A line from before the rename keeps its own `voice` chat and session; its replies come
-          // back through the `voice` compatibility registration (src/channels/voice-mode.ts).
-          channelType: LEGACY_VOICE_CHANNEL,
-          instance: LEGACY_VOICE_CHANNEL,
-          platformId: call.platformId,
-          threadId: null,
-          agentGroupId: call.line.agentGroupId,
-        };
+  /** Where a turn goes: the call chat. */
+  const turnRoute = (call: LiveKitCall, chat: CallChat): Omit<InboundEvent, 'message'> => ({
+    channelType: chat.group.channel_type,
+    instance: chat.group.instance ?? chat.group.channel_type,
+    platformId: chat.group.platform_id,
+    threadId: chat.threadId,
+    // Addressed to the line's agent only, whoever else is wired to the chat and whatever its trigger.
+    agentGroupId: call.line.agentGroupId,
+  });
 
   /** The worker saw the caller join: start the clock and the duration / budget cap. */
   const onJoined = (res: http.ServerResponse, call: LiveKitCall): void => {
@@ -1049,7 +1001,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     log.info('livekit-voice-mode: caller joined', { platformId: call.platformId, callId: call.callId });
     // Known before the first turn, so the agent's messages to that chat are spoken from the start.
     void refreshChat(call, false).then((chat) => {
-      if (!call.ended) host.callJoined?.(call.callId, turnRoute(call, chat), call.line.agentGroupId);
+      if (chat && !call.ended) host.callJoined?.(call.callId, turnRoute(call, chat), call.line.agentGroupId);
     });
     reply(res, 200, JSON.stringify({ ok: true }), JSON_HEADERS);
   };
@@ -1135,7 +1087,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       const chat = await refreshChat(call, true);
       // The call can end or be replaced while the chat lookups run; its turn must not reach the agent then.
       if (call.ended || calls.get(call.platformId) !== call) return { status: 409, body: 'The call has ended' };
-      if (!chat && !talksOnLine(call.platformId)) {
+      if (!chat) {
         endCall(call, 'no chat to talk in');
         return { status: 409, body: 'The call has no chat to talk in' };
       }
@@ -1146,29 +1098,24 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         id: liveKitUtteranceMessageId(call.callId, utteranceId),
         kind: 'chat',
         content: JSON.stringify({
-          text: turnMessageText(text, chat ? chatReplyNote : replyNote),
+          text: turnMessageText(text, chatReplyNote),
           sender: sender.name,
           senderId: sender.id,
           livekit: { callId: call.callId, utteranceId },
         }),
         timestamp: new Date().toISOString(),
         isMention: true,
-        isGroup: chat ? chat.group.is_group !== 0 : false,
+        isGroup: chat.group.is_group !== 0,
       };
-      routed = host.routeTurn(
-        { ...turnRoute(call, chat), message },
-        { callerId: sender.id, chat: chat?.group ?? null },
-      );
+      routed = host.routeTurn({ ...turnRoute(call, chat), message }, { callerId: sender.id, chat: chat.group });
       // Shown once the agent has it, even when that comes after the worker was told it timed out.
-      if (chat) {
-        void routed.then(
-          (stored) => {
-            // The chat shows the words alone; the turn itself still comes from the caller by name.
-            if (stored) mirror(call.platformId, chat, `\u{1F399} ${text}`);
-          },
-          () => undefined,
-        );
-      }
+      void routed.then(
+        (stored) => {
+          // The chat shows the words alone; the turn itself still comes from the caller by name.
+          if (stored) mirror(call.platformId, chat, `\u{1F399} ${text}`);
+        },
+        () => undefined,
+      );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timedOut = new Promise<'timeout'>((resolve) => {
         timer = setTimeout(() => resolve('timeout'), Math.max(0, routeTimeoutMs - (host.now() - receivedAt)));
@@ -1224,7 +1171,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       return onEvents(res, call);
     }
     if (req.method !== 'POST') return reply(res, 405, 'POST only');
-    const body = await readJson(req);
+    const body = await readJsonObject(req, MAX_AGENT_BODY_BYTES, {});
     if (!body) return reply(res, 400, 'Body must be a small JSON object');
     const call = findCall(body.callId);
     // Unknown, ended and unauthenticated look alike to the caller of these routes.
@@ -1282,7 +1229,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         return startCall(res, platformId);
       }
       if (route === 'livekit/end') {
-        const body = await readJson(req);
+        const body = await readJsonObject(req, MAX_AGENT_BODY_BYTES, {});
         const call = calls.get(platformId);
         if (call && body && call.callId === body.callId) {
           // The page gave up waiting for the worker, or the worker said it runs another version.
@@ -1335,9 +1282,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     chatTyping(chat, agentGroupId, working = false) {
       for (const call of calls.values()) {
         if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
-        if (callChatAt(call, chat)) push(call, { type: 'thinking' });
-        // On the voice line itself the adapter's setTyping already says thinking; only the pickup is new.
-        else if (chat.channelType !== lineChannelType(call.platformId) || chat.platformId !== call.platformId) continue;
+        if (!callChatAt(call, chat)) continue;
+        push(call, { type: 'thinking' });
         if (working) push(call, { type: 'working' });
       }
     },

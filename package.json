@@ -47,6 +47,7 @@
     "@grammyjs/parse-mode": "2.3.0",
     "@kubernetes/client-node": "2.0.0",
     "@livekit/agents": "1.9.1",
+    "@livekit/agents-plugin-elevenlabs": "1.9.1",
     "@livekit/agents-plugin-google": "1.9.1",
     "@livekit/agents-plugin-silero": "1.9.1",
     "@livekit/rtc-node": "1.1.0",

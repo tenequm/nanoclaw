@@ -1,0 +1,18 @@
+{"ttsView":{"effective":{"provider":"gemini","model":"gemini-3.8-flash-tts","voice":"en-us-techagent-4"},
+  "saved":{"provider":"gemini","model":null,"voice":"en-us-techagent-4"},
+  "providers":[
+   {"id":"gemini","name":"Gemini","available":true,"models":["gemini-3.8-flash-tts","gemini-3.8-flash-lite-tts"],"default":{"model":"gemini-3.8-flash-tts","voice":"Alnilam"}},
+   {"id":"elevenlabs","name":"ElevenLabs","available":false,"models":["eleven_turbo_v2_5","eleven_flash_v2_5","eleven_multilingual_v2"],"default":{"model":"eleven_turbo_v2_5","voice":"bIHbv24MWmeRgasZH58o"}}]},
+ "ttsViewUnsaved":{"effective":{"provider":"gemini","model":"gemini-3.8-flash-tts","voice":"Alnilam"},"saved":{"provider":null,"model":null,"voice":null},"providers":[
+   {"id":"gemini","name":"Gemini","available":true,"models":["gemini-3.8-flash-tts","gemini-3.8-flash-lite-tts"],"default":{"model":"gemini-3.8-flash-tts","voice":"Alnilam"}},
+   {"id":"elevenlabs","name":"ElevenLabs","available":false,"models":["eleven_turbo_v2_5","eleven_flash_v2_5","eleven_multilingual_v2"],"default":{"model":"eleven_turbo_v2_5","voice":"bIHbv24MWmeRgasZH58o"}}]},
+ "patchInvalid":{"error":"invalid","field":"voice"},
+ "patchUnavailable":{"error":"provider_unavailable","provider":"elevenlabs"},
+ "catalogGemini":{"provider":"gemini","voices":[
+   {"id":"achernar","name":"Achernar","language":"en-US","gender":"female","description":"Storyteller & Narrator. Soft, calm, and soothing voice with a higher pitch."},
+   {"id":"en-us-techagent-4","name":"Tech Advisor 4","language":"en-US","gender":"male","description":"Tech Support Agent / Tech Advisor. Confident and clear."}],
+  "next":"eyJvIjoxMDB9"},
+ "catalogElevenLast":{"provider":"elevenlabs","voices":[{"id":"bIHbv24MWmeRgasZH58o","name":"Will","language":"en","gender":"male","preview":"https://example.invalid/w.mp3"}]},
+ "settingsRequestTts":{"gen":7,"wake":true,"pauseSends":false,"cues":true,"typing":true,"tts":{"provider":"elevenlabs","voice":"bIHbv24MWmeRgasZH58o"}},
+ "replyTtsInvalid":{"gen":7,"ok":false,"seq":12,"error":"tts_invalid"},
+ "voiceAttribute":{"v":1,"active":{"provider":"gemini","model":"gemini-3.8-flash-tts","voice":"alnilam"},"pending":{"provider":"elevenlabs","model":"eleven_turbo_v2_5","voice":"bIHbv24MWmeRgasZH58o"},"gen":7}}

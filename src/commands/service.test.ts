@@ -39,23 +39,20 @@ import { grantRole } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
 import type { MessagingGroupAgent, Session } from '../types.js';
 import { getMessagingGroupAgentByPair } from '../db/messaging-groups.js';
-import { getDb } from '../db/connection.js';
-import { getVoiceLine } from '../db/voice-lines.js';
 import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from '../channels/channel-registry.js';
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
-import type { MessagingGroup } from '../types.js';
 import { MD_FMT, voiceCommandReply } from './cards.js';
 import {
   getConfigView,
   getModelPicker,
   getStatus,
+  offersVoiceCommand,
   resolveTargets,
   restartAgent,
   runVoiceCommand,
   setActivation,
   setConfigValue,
   setModel,
-  setVoiceTarget,
 } from './service.js';
 
 const OWNER = 'telegram:1';
@@ -553,156 +550,38 @@ describe('restartAgent', () => {
 // --- /voice ---
 
 describe('/voice', () => {
-  const link = (line: MessagingGroup) => `https://voice.example/voice?t=tok-${line.platform_id}`;
-  const chat = (messagingGroupId: string, threadId: string | null = null) => ({ messagingGroupId, threadId });
-
-  async function chatGroup(id: string, platformId: string, channelType = 'telegram', isGroup: 0 | 1 = 0) {
-    await createMessagingGroup({
-      id,
-      channel_type: channelType,
-      platform_id: platformId,
-      name: null,
-      is_group: isGroup,
-      unknown_sender_policy: 'strict',
-      created_at: now(),
-    });
-  }
-
-  /** What `ncl voice-lines set|add-owner` leaves behind. */
-  async function own(lineMessagingGroupId: string, ownerUserId: string) {
-    await getDb().run(
-      'INSERT INTO voice_lines (line_messaging_group_id, updated_at) VALUES (?, ?) ON CONFLICT DO NOTHING',
-      lineMessagingGroupId,
-      now(),
-    );
-    await getDb().run(
-      'INSERT INTO voice_line_owners (line_messaging_group_id, owner_user_id) VALUES (?, ?)',
-      lineMessagingGroupId,
-      ownerUserId,
-    );
-  }
+  const chat = { messagingGroupId: 'mg-dm', threadId: null };
 
   beforeEach(async () => {
     await makeAgentGroup('ag-1', 'Emma');
     await grantRole({ user_id: OWNER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
-    await grantRole({
-      user_id: SCOPED_ADMIN,
-      role: 'admin',
-      agent_group_id: 'ag-1',
-      granted_by: null,
-      granted_at: now(),
-    });
     await addMember({ user_id: NON_ADMIN, agent_group_id: 'ag-1', added_by: null, added_at: now() });
-    await chatGroup('mg-dm', 'telegram:1');
-    await chatGroup('mg-topic', 'telegram:-100:5');
-    await chatGroup('mg-line', 'voice:abc', 'voice');
-    await chatGroup('mg-line-2', 'voice:def', 'voice');
+    await createMessagingGroup({
+      id: 'mg-dm',
+      channel_type: 'telegram',
+      platform_id: 'telegram:1',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
     await wire('mg-dm', 'ag-1');
-    await wire('mg-topic', 'ag-1');
-    await wire('mg-line', 'ag-1');
-    await wire('mg-line-2', 'ag-1');
-    await own('mg-line', OWNER);
-    await own('mg-line-2', SCOPED_ADMIN);
   });
 
-  it("binds and links only the runner's own line, and the next chat replaces it", async () => {
-    const res = await setVoiceTarget('ag-1', chat('mg-dm'), OWNER, link);
-    if (!res.ok) throw new Error('expected ok');
-    expect(res.view).toEqual({
-      agentName: 'Emma',
-      agentGroupId: 'ag-1',
-      links: [link({ platform_id: 'voice:abc' } as MessagingGroup)],
-    });
-    expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-dm', thread_id: null });
-    // Another admin's line is neither bound nor linked.
-    expect(await getVoiceLine('mg-line-2')).toMatchObject({ target_messaging_group_id: null });
-
-    await setVoiceTarget('ag-1', chat('mg-topic'), OWNER, link);
-    expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-topic' });
-
-    const other = await setVoiceTarget('ag-1', chat('mg-dm'), SCOPED_ADMIN, link);
-    expect(other).toMatchObject({
-      ok: true,
-      view: { links: [link({ platform_id: 'voice:def' } as MessagingGroup)] },
-    });
-    expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-topic' });
-  });
-
-  it("binds the line from any of its owner's accounts; the last /voice wins", async () => {
-    const SLACK_OWNER = 'slack:U1';
-    await makeUser(SLACK_OWNER);
-    await grantRole({
-      user_id: SLACK_OWNER,
-      role: 'admin',
-      agent_group_id: 'ag-1',
-      granted_by: null,
-      granted_at: now(),
-    });
-    await own('mg-line', SLACK_OWNER);
-    await setVoiceTarget('ag-1', chat('mg-topic'), OWNER, link);
-    const res = await setVoiceTarget('ag-1', chat('mg-dm'), SLACK_OWNER, link);
-    expect(res).toMatchObject({
-      ok: true,
-      view: {
-        links: ['https://voice.example/voice?t=tok-voice:abc'],
-      },
-    });
-    expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-dm' });
-    expect(await getVoiceLine('mg-line-2')).toMatchObject({ target_messaging_group_id: null });
-    await setVoiceTarget('ag-1', chat('mg-topic'), OWNER, link);
-    expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-topic' });
-  });
-
-  it('refuses an admin who owns no line of the agent, and changes nothing', async () => {
-    await getDb().run('DELETE FROM voice_line_owners WHERE line_messaging_group_id = ?', 'mg-line-2');
-    expect(await setVoiceTarget('ag-1', chat('mg-dm'), SCOPED_ADMIN, link)).toEqual({
-      ok: false,
-      reason: 'no-voice-line',
-    });
-    expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: null });
-    const targets = await resolveTargets('mg-dm');
-    expect(voiceCommandReply(await runVoiceCommand(targets, chat('mg-dm'), SCOPED_ADMIN, link), MD_FMT)).toBe(
-      "You have no voice line for this agent. The operator names a line's owner accounts with `ncl voice-lines set` and `add-owner`.",
-    );
-  });
-
-  it('refuses non-admins, unwired chats, agents without a line, and hosts without the voice channel', async () => {
-    expect(await setVoiceTarget('ag-1', chat('mg-dm'), NON_ADMIN, link)).toMatchObject({ reason: 'unauthorized' });
-    await chatGroup('mg-other', 'telegram:7');
-    expect(await setVoiceTarget('ag-1', chat('mg-other'), OWNER, link)).toMatchObject({ reason: 'unknown-agent' });
-    expect(await setVoiceTarget('ag-1', chat('mg-dm'), OWNER, () => null)).toMatchObject({
-      reason: 'voice-unavailable',
-    });
-    await makeAgentGroup('ag-2', 'Zed');
-    await wire('mg-dm', 'ag-2');
-    expect(await setVoiceTarget('ag-2', chat('mg-dm'), OWNER, link)).toMatchObject({ reason: 'no-voice-line' });
-    expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: null });
-  });
-
-  it('keeps the thread only where the wiring keeps threads', async () => {
-    const defaults = {
-      dm: {
-        engageMode: 'pattern' as const,
-        engagePattern: '.',
-        threads: false,
-        unknownSenderPolicy: 'strict' as const,
-      },
-      group: { engageMode: 'mention' as const, threads: true, unknownSenderPolicy: 'strict' as const },
-      mentions: 'platform' as const,
-    };
-    registerChannelAdapter('threadchat', {
+  it('offers /voice wherever the voice-mode channel is installed, before it starts too', async () => {
+    expect(await offersVoiceCommand(['ag-1'])).toBe(false);
+    registerChannelAdapter('voice-mode', {
       factory: () => ({
-        name: 'threadchat',
-        channelType: 'threadchat',
-        supportsThreads: true,
-        defaults,
+        name: 'voice-mode',
+        channelType: 'voice-mode',
+        supportsThreads: false,
         setup: async () => {},
         teardown: async () => {},
         isConnected: () => true,
         deliver: async () => undefined,
       }),
-      defaults,
     });
+    expect(await offersVoiceCommand([])).toBe(true);
     await initChannelAdapters(() => ({
       onInbound: () => {},
       onInboundEvent: () => {},
@@ -710,32 +589,24 @@ describe('/voice', () => {
       onAction: () => {},
     }));
     try {
-      await chatGroup('mg-chan', 'threadchat:C1', 'threadchat', 1);
-      await wire('mg-chan', 'ag-1');
-      await setVoiceTarget('ag-1', chat('mg-chan', 'threadchat:C1:171'), OWNER, link);
-      expect(await getVoiceLine('mg-line')).toMatchObject({ thread_id: 'threadchat:C1:171' });
-      await getDb().run("UPDATE messaging_group_agents SET threads = 0 WHERE messaging_group_id = 'mg-chan'");
-      await setVoiceTarget('ag-1', chat('mg-chan', 'threadchat:C1:171'), OWNER, link);
-      expect(await getVoiceLine('mg-line')).toMatchObject({ target_messaging_group_id: 'mg-chan', thread_id: null });
+      expect(await offersVoiceCommand([])).toBe(true);
     } finally {
       await teardownChannelAdapters();
     }
   });
 
-  it('drops unknown senders, refuses members, and links every agent of the chat the admin runs', async () => {
+  it('drops unknown senders, refuses members, and tells an admin voice is off without the voice-mode channel', async () => {
     const targets = await resolveTargets('mg-dm');
-    expect(await runVoiceCommand(targets, chat('mg-dm'), null, link)).toEqual({ kind: 'drop' });
-    expect(await runVoiceCommand(targets, chat('mg-dm'), 'telegram:999', link)).toEqual({ kind: 'drop' });
-    const refused = await runVoiceCommand(targets, chat('mg-dm'), NON_ADMIN, link);
+    expect(await runVoiceCommand(targets, chat, null)).toEqual({ kind: 'drop' });
+    expect(await runVoiceCommand(targets, chat, 'telegram:999')).toEqual({ kind: 'drop' });
+    const refused = await runVoiceCommand(targets, chat, NON_ADMIN);
     expect(refused).toEqual({ kind: 'refused' });
     expect(voiceCommandReply(refused, MD_FMT)).toBe('🚫 Admins only.');
-
-    const done = await runVoiceCommand(targets, chat('mg-dm'), OWNER, link);
-    expect(voiceCommandReply(done, MD_FMT)).toBe(
-      '🎙 Voice call with **Emma**: https://voice.example/voice?t=tok-voice:abc\n\n' +
-        'Voice calls now talk in this chat, until /voice is run in another one.',
-    );
-    const off = await runVoiceCommand(targets, chat('mg-dm'), OWNER, () => null);
+    const off = await runVoiceCommand(targets, chat, OWNER);
+    expect(off).toEqual({
+      kind: 'done',
+      results: [{ agentName: 'Emma', result: { ok: false, reason: 'voice-unavailable' } }],
+    });
     expect(voiceCommandReply(off, MD_FMT)).toBe(
       'Voice calls are off on this host (the voice channel is not configured).',
     );

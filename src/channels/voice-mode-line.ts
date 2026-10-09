@@ -7,14 +7,13 @@
 import path from 'node:path';
 
 import { GROUPS_DIR } from '../config.js';
-import { getVoiceModeLine, getVoiceModeLineForAgent } from '../db/voice-mode-lines.js';
+import { getVoiceModeLine, savedTts, type VoiceModeLineRow } from '../db/voice-mode-lines.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { getAgentGroup } from '../db/agent-groups.js';
-import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { readGroupPersona } from '../group-persona.js';
 import { log } from '../log.js';
-import { canAccessAgentGroup } from '../modules/permissions/access.js';
 import { getUser } from '../modules/permissions/db/users.js';
+import { effectiveTts, type TtsChoice } from '../voice-mode-tts.js';
 
 /** Optional per-agent names for the transcription, one per line; added to VOICE_MODE_VOCABULARY. */
 export const VOICE_MODE_VOCABULARY_FILE = 'voice.vocabulary.txt';
@@ -39,6 +38,8 @@ export interface VoiceModeLine {
   caller: VoiceModeCaller;
   agentGroupId: string;
   linkHash?: string;
+  /** The line's effective speech choice. */
+  tts?: TtsChoice;
 }
 
 /** Whether two resolutions of a line still name the same caller, agent and link; a call ends when they stop. */
@@ -85,7 +86,7 @@ function buildLine(
   caller: VoiceModeCaller,
   group: { id: string; name: string; folder: string },
   options: ResolveLineOptions,
-  linkHash?: string,
+  row: VoiceModeLineRow,
 ): VoiceModeLine {
   // The persona reader's bounded, symlink- and FIFO-safe read: the file is agent-writable.
   const fileText = options.forCall
@@ -101,7 +102,8 @@ function buildLine(
       ...(vocabulary?.length ? { vocabulary } : {}),
       ...(wakeNames?.length ? { wakeNames } : {}),
     },
-    ...(linkHash ? { linkHash } : {}),
+    linkHash: row.token_hash,
+    tts: effectiveTts(savedTts(row)),
   };
 }
 
@@ -113,28 +115,11 @@ export async function resolveVoiceModeLine(
   try {
     const lineId = lineIdOf(platformId);
     const line = lineId ? await getVoiceModeLine(lineId) : undefined;
-    if (line) {
-      if (!(await hasAdminPrivilege(line.owner_user_id, line.agent_group_id))) return null;
-      const [caller, group] = await Promise.all([getUser(line.owner_user_id), getAgentGroup(line.agent_group_id)]);
-      if (!caller || !group) return null;
-      const name = caller.display_name?.trim() || caller.id;
-      return buildLine({ id: caller.id, name }, group, options, line.token_hash);
-    }
-    // Every other line is a hashed-token row (above); only a line from before the rename resolves here.
-    if (lineChannelType(platformId) !== LEGACY_VOICE_CHANNEL) return null;
-    const caller = await getUser(platformId);
-    if (!caller || caller.kind !== LEGACY_VOICE_CHANNEL || !caller.display_name?.trim()) return null;
-    const mg = await getMessagingGroupByPlatform(LEGACY_VOICE_CHANNEL, platformId);
-    if (!mg || mg.is_group || mg.unknown_sender_policy !== 'strict') return null;
-    const wirings = await getMessagingGroupAgents(mg.id);
-    if (wirings.length !== 1 || wirings[0].sender_scope !== 'known') return null;
-    const groupId = wirings[0].agent_group_id;
-    // A line /voice new made for the agent retires its legacy lines.
-    if (await getVoiceModeLineForAgent(groupId)) return null;
-    if (!(await canAccessAgentGroup(caller.id, groupId)).allowed) return null;
-    const group = await getAgentGroup(groupId);
-    if (!group) return null;
-    return buildLine({ id: caller.id, name: caller.display_name.trim() }, group, options);
+    if (!line || !(await hasAdminPrivilege(line.owner_user_id, line.agent_group_id))) return null;
+    const [caller, group] = await Promise.all([getUser(line.owner_user_id), getAgentGroup(line.agent_group_id)]);
+    if (!caller || !group) return null;
+    const name = caller.display_name?.trim() || caller.id;
+    return buildLine({ id: caller.id, name }, group, options, line);
   } catch (err) {
     log.warn('voice-mode: could not authorize the voice line', { platformId, err });
     return null;
@@ -147,13 +132,6 @@ export const VOICE_MODE_CHANNEL = 'voice-mode';
 /** The platform id of the voice_mode_lines row `lineId`: `voice-mode:<line id>`. */
 export const linePlatformId = (lineId: string): string => `${VOICE_MODE_CHANNEL}:${lineId}`;
 
-/** The voice_mode_lines id a platform id names, or null for any other id (a legacy line's, say). */
+/** The voice_mode_lines id a platform id names, or null for any other id. */
 export const lineIdOf = (platformId: string): string | null =>
   platformId.startsWith(`${VOICE_MODE_CHANNEL}:`) ? platformId.slice(VOICE_MODE_CHANNEL.length + 1) : null;
-
-/** Lines made before the voice-mode rename keep their `voice` rows and `voice:<hash>` ids, so saved links still reach them. */
-export const LEGACY_VOICE_CHANNEL = 'voice';
-
-/** The channel a line's own chat is on, by the line's platform id. */
-export const lineChannelType = (platformId: string): string =>
-  platformId.startsWith(`${LEGACY_VOICE_CHANNEL}:`) ? LEGACY_VOICE_CHANNEL : VOICE_MODE_CHANNEL;

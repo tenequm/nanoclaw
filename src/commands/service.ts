@@ -28,20 +28,16 @@
  */
 import fs from 'fs';
 
-import { wiringThreadsEnabled } from '../channels/channel-defaults.js';
-import { getChannelAdapterExact } from '../channels/channel-registry.js';
+import { getRegisteredChannelNames } from '../channels/channel-registry.js';
 import { restartAgentGroupContainers } from '../container-restart.js';
 import { isContainerRunning, killContainer } from '../container-runner.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../db/container-configs.js';
 import {
-  getMessagingGroup,
   getMessagingGroupAgentByPair,
   getMessagingGroupAgents,
-  getMessagingGroupsByAgentGroup,
   updateMessagingGroupAgent,
 } from '../db/messaging-groups.js';
-import { isVoiceLineOwner, setVoiceLineTarget } from '../db/voice-lines.js';
 import {
   findSessionByAgentGroup,
   findSessionForAgent,
@@ -52,7 +48,7 @@ import { log } from '../log.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { countDueMessages, openInboundDb } from '../mailbox/sqlite/session-db.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
-import type { ContainerConfigRow, EngageMode, MessagingGroup, Session } from '../types.js';
+import type { ContainerConfigRow, EngageMode, Session } from '../types.js';
 import { voiceAccess } from './auth.js';
 import { readTranscriptStats } from './transcript.js';
 import {
@@ -81,7 +77,6 @@ import {
   type TargetAgent,
   type TargetResolution,
   type VoiceCommandOutcome,
-  type VoiceTargetView,
 } from './types.js';
 
 /** Default cli_scope when no container_configs row exists yet. */
@@ -562,120 +557,25 @@ export async function restartAgent(agentGroupId: string, actorUserId: string): P
 
 // --- /voice ---
 
-/** A voice line's call link; null when the host has none for it (no voice adapter, or no link token here). */
-export type VoiceLinkFn = (line: MessagingGroup) => string | null;
-
-/** Asks the live voice adapter, the only holder of the link tokens. */
-const liveVoiceLink: VoiceLinkFn = (line) => {
-  // Structural, not voice-mode.ts's VoiceModeChannelAdapter: core must still build once add-voice-mode is removed.
-  const adapter = getChannelAdapterExact(line.instance ?? line.channel_type) as
-    | { callLink?(platformId: string): string | null }
-    | undefined;
-  return adapter?.callLink?.(line.platform_id) ?? null;
-};
-
-/** The agent's voice lines: its `voice` messaging groups (a chat is wired to an agent at most once). */
-export async function voiceLinesOf(agentGroupId: string): Promise<MessagingGroup[]> {
-  return (await getMessagingGroupsByAgentGroup(agentGroupId)).filter((g) => g.channel_type === 'voice' && !g.denied_at);
-}
-
 /**
- * Whether a chat with these agents offers /voice: always while the voice-mode channel runs (an
- * admin's first /voice creates a line), else where one of them has a voice line.
+ * Whether a chat offers /voice: wherever the voice-mode channel is installed (an admin's first /voice
+ * creates a line). Installed, not running: Telegram syncs its command menus before voice-mode starts.
  */
-export async function offersVoiceCommand(agentGroupIds: Iterable<string>): Promise<boolean> {
-  if (getChannelAdapterExact('voice-mode') !== undefined) return true;
-  for (const id of agentGroupIds) if ((await voiceLinesOf(id)).length > 0) return true;
-  return false;
-}
-
-/**
- * Make the chat (and thread) the call chat of each of these voice lines `ownerUserId` owns; returns
- * the lines moved. Ownership is checked in the same write, so a line whose owners just changed stays.
- */
-export async function rebindVoiceLines<T extends Pick<MessagingGroup, 'id'>>(
-  lines: readonly T[],
-  ownerUserId: string,
-  targetMessagingGroupId: string,
-  threadId: string | null,
-): Promise<T[]> {
-  const bound: T[] = [];
-  for (const line of lines) {
-    const ok = await setVoiceLineTarget({
-      lineMessagingGroupId: line.id,
-      ownerUserId,
-      targetMessagingGroupId,
-      threadId,
-    });
-    if (ok) bound.push(line);
-  }
-  return bound;
-}
-
-/**
- * Make this chat the call chat of the agent's voice line(s) that belong to
- * `actorUserId`, and return their call links. Admin only. A line
- * belongs to the chat accounts voice_line_owners names for it (one person's
- * accounts across channels); another person's line is never bound or linked here. The call chat is where the line's
- * calls talk (src/channels/voice-mode-livekit.ts), as the line's own caller, until
- * /voice is run in another chat. The links are secrets: callers send them to
- * this chat only and never log them.
- */
-export async function setVoiceTarget(
-  agentGroupId: string,
-  chat: StatusChatContext,
-  actorUserId: string,
-  linkFor: VoiceLinkFn = liveVoiceLink,
-): Promise<CommandResult<VoiceTargetView>> {
-  const ag = await getAgentGroup(agentGroupId);
-  if (!ag) return fail('unknown-agent');
-  if (!(await hasAdminPrivilege(actorUserId, agentGroupId))) return fail('unauthorized');
-  const wiring = await getMessagingGroupAgentByPair(chat.messagingGroupId, agentGroupId);
-  const mg = wiring && (await getMessagingGroup(chat.messagingGroupId));
-  if (!wiring || !mg) return fail('unknown-agent');
-
-  const owned: MessagingGroup[] = [];
-  for (const line of await voiceLinesOf(agentGroupId)) {
-    if (await isVoiceLineOwner(line.id, actorUserId)) owned.push(line);
-  }
-  if (owned.length === 0) return fail('no-voice-line');
-  const linked = owned.flatMap((line) => {
-    const link = linkFor(line);
-    return link ? [{ line, link }] : [];
-  });
-  if (linked.length === 0) return fail('voice-unavailable');
-
-  // A wiring that keeps no threads would land the call's turns in the chat's shared session anyway.
-  const threadId = chat.threadId !== null && wiringThreadsEnabled(wiring, mg) ? chat.threadId : null;
-  // A line left out had its owners changed since the read above: it is no longer theirs to hand out.
-  const moved = await rebindVoiceLines(
-    linked.map(({ line }) => line),
-    actorUserId,
-    chat.messagingGroupId,
-    threadId,
-  );
-  const bound = linked.filter(({ line }) => moved.includes(line));
-  if (bound.length === 0) return fail('no-voice-line');
-  log.info('Voice call chat set via chat command', {
-    agentGroupId,
-    lines: bound.map(({ line }) => line.platform_id),
-    messagingGroupId: chat.messagingGroupId,
-    threadId,
-    actorUserId,
-  });
-  return { ok: true, view: { agentName: ag.name, agentGroupId, links: bound.map(({ link }) => link) } };
+export async function offersVoiceCommand(_agentGroupIds: Iterable<string>): Promise<boolean> {
+  return getRegisteredChannelNames().includes('voice-mode');
 }
 
 /**
  * /voice over a chat's wired agents, gated like /status but admin-only:
- * unknown senders are dropped silently, known non-admins refused, and every
- * agent the actor administers gets this chat as its call chat.
+ * unknown senders are dropped silently and known non-admins refused. The
+ * voice-mode channel answers /voice itself (src/channels/voice-mode-command.ts);
+ * without it there is no line to bind, so every agent the actor administers
+ * says voice is unavailable.
  */
 export async function runVoiceCommand(
   targets: TargetResolution,
-  chat: StatusChatContext,
+  _chat: StatusChatContext,
   actorUserId: string | null,
-  linkFor: VoiceLinkFn = liveVoiceLink,
 ): Promise<VoiceCommandOutcome> {
   if (targets.kind === 'none') return { kind: 'drop' };
   const agents = targets.kind === 'single' ? [targets.agent] : targets.agents;
@@ -686,9 +586,8 @@ export async function runVoiceCommand(
   if (allowed.length === 0 || !actorUserId) {
     return decided.some(([, d]) => d === 'refuse') ? { kind: 'refused' } : { kind: 'drop' };
   }
-  const results = [];
-  for (const a of allowed) {
-    results.push({ agentName: a.agentName, result: await setVoiceTarget(a.agentGroupId, chat, actorUserId, linkFor) });
-  }
-  return { kind: 'done', results };
+  return {
+    kind: 'done',
+    results: allowed.map((a) => ({ agentName: a.agentName, result: fail('voice-unavailable') })),
+  };
 }
