@@ -354,6 +354,66 @@ describe('kubernetes driver lifecycle', () => {
     expect([...h.boxes.values()][0].spec).toEqual(before.spec);
     expect(h.core.replaceNamespacedSecret.mock.calls.length).toBe(writes);
   });
+  it.each([0, 7])('handles exit %i before Ready without inventing a clean-exit failure', async (code) => {
+    const h = harness();
+    const handle = await h.driver.prepare(h.spec);
+    const patch = h.custom.patchNamespacedCustomObject.getMockImplementation()!;
+    h.custom.patchNamespacedCustomObject.mockImplementation(async (input) => {
+      const result = await patch(input);
+      if (input.body.spec?.operatingMode === 'Running') {
+        const pod = h.pods.get(handle.name)!;
+        pod.status = {
+          phase: code ? 'Failed' : 'Succeeded',
+          containerStatuses: [
+            {
+              name: 'agent',
+              image: 'test',
+              imageID: 'test',
+              ready: false,
+              restartCount: 0,
+              state: { terminated: { exitCode: code } },
+            },
+          ],
+        };
+        setCondition(h.boxes.get(handle.name)!, 'Ready', 'False', code ? 'PodFailed' : 'PodSucceeded');
+      }
+      return result;
+    });
+    if (code) await expect(handle.start()).rejects.toMatchObject({ kind: 'started-then-died', exitCode: code });
+    else {
+      await handle.start();
+      expect(await handle.status()).toEqual({ phase: 'stopped' });
+      await handle.stop('cleanup');
+      expect(await handle.status()).toEqual({ phase: 'stopped' });
+    }
+  });
+
+  it('refuses to dress a missing or terminating pod as running in discovery', async () => {
+    const h = harness();
+    const handle = await h.driver.prepare(h.spec);
+    await handle.start();
+    h.pods.get(handle.name)!.metadata!.deletionTimestamp = new Date();
+    expect((await h.driver.listSessions('spike'))[0].phase).toBe('starting');
+    h.pods.delete(handle.name);
+    expect((await h.driver.listSessions('spike'))[0].phase).toBe('starting');
+  });
+
+  it('reports real unschedulability promptly rather than waiting the startup bound', async () => {
+    const h = harness({ startTimeoutMs: 90_000 });
+    const handle = await h.driver.prepare(h.spec);
+    const patch = h.custom.patchNamespacedCustomObject.getMockImplementation()!;
+    h.custom.patchNamespacedCustomObject.mockImplementation(async (input) => {
+      const result = await patch(input);
+      if (input.body.spec?.operatingMode === 'Running')
+        h.pods.get(handle.name)!.status = {
+          phase: 'Pending',
+          conditions: [{ type: 'PodScheduled', status: 'False', reason: 'Unschedulable', message: 'Insufficient cpu' }],
+        };
+      return result;
+    });
+    await expect(handle.start()).rejects.toMatchObject({ kind: 'resources-exhausted' });
+  });
+
   it('blocks resume until current-generation suspension and old pod deletion', async () => {
     const h = harness();
     const handle = await h.driver.prepare(h.spec);

@@ -241,7 +241,7 @@ function validateKubernetesSpec(spec: SessionSpec, policy: MountPolicy, caps: Dr
 
 export function sandboxManifest(spec: SessionSpec, namespace: string): Sandbox {
   const agent = spec.containers[0];
-  const labels = projectLabels(labelsForKey(spec.key, 'agent', { ...spec.labels, ...agent.labels }));
+  const labels = projectLabels({ ...spec.labels, ...agent.labels, ...labelsForKey(spec.key, 'agent') });
   const volumes: k8s.V1Volume[] = [
     { name: 'group-state', persistentVolumeClaim: { claimName: groupPvcName(spec.key) } },
   ];
@@ -736,13 +736,22 @@ export class KubernetesSessionDriver implements SessionDriver {
             const status = await this.statusFrom(current, backing);
             if (status.phase === 'failed') {
               if (status.failure.kind === 'resources-exhausted') {
+                const scheduling =
+                  backing?.status?.conditions?.find((c) => c.reason === 'Unschedulable') ??
+                  currentCondition(current, 'PodScheduled');
+                if (
+                  (scheduling?.reason === 'Unschedulable' &&
+                    !/persistentvolumeclaim|volume binding|unbound/i.test(scheduling.message ?? '')) ||
+                  currentCondition(current, 'Ready')?.reason === 'ReconcilerError'
+                ) {
+                  throw asFailureError(status.failure);
+                }
                 pendingFailure = status.failure;
                 return;
               }
               throw asFailureError(status.failure);
             }
-            if (status.phase === 'stopped')
-              throw asFailureError({ kind: 'started-then-died', retryable: false, exitCode: 0 });
+            if (status.phase === 'stopped') return backing ?? { metadata: {} };
             return status.phase === 'running' && backing?.metadata?.uid && backing.metadata.uid !== oldUid
               ? backing
               : undefined;
@@ -750,10 +759,12 @@ export class KubernetesSessionDriver implements SessionDriver {
           () => pendingFailure ?? { kind: 'runtime-unavailable', retryable: true },
         );
         await this.patch(key, name, {
-          metadata: { annotations: { [STARTED_ONCE]: 'true', [LAST_POD_UID]: pod.metadata!.uid! } },
+          metadata: {
+            annotations: { [STARTED_ONCE]: 'true', ...(pod.metadata?.uid && { [LAST_POD_UID]: pod.metadata.uid }) },
+          },
         });
       } catch (error) {
-        throw normalizeKubernetesError(error, boxUid(error));
+        throw normalizeKubernetesError(error);
       }
     });
   }
@@ -888,8 +899,14 @@ export class KubernetesSessionDriver implements SessionDriver {
         const key = keyFromLabels(box.metadata.labels)!;
         const pod = byName.get(box.metadata.name);
         const terminated = pod?.status?.containerStatuses?.find((s) => s.name === 'agent')?.state?.terminated;
+        const observedPhase = sandboxPhase(box);
         const phase =
-          terminated || ['Succeeded', 'Failed'].includes(pod?.status?.phase ?? '') ? 'terminal' : sandboxPhase(box);
+          terminated || ['Succeeded', 'Failed'].includes(pod?.status?.phase ?? '')
+            ? 'terminal'
+            : observedPhase === 'running' &&
+                (!pod || pod.metadata?.deletionTimestamp || pod.status?.phase !== 'Running')
+              ? 'starting'
+              : observedPhase;
         const failed = terminated
           ? terminated.exitCode !== 0
           : pod?.status?.phase === 'Failed' || currentCondition(box, 'Finished')?.reason === 'PodFailed';
@@ -954,6 +971,7 @@ export class KubernetesSessionDriver implements SessionDriver {
 
   private async deleteSandbox(key: SessionKey, box: Sandbox): Promise<void> {
     try {
+      if (box.metadata.uid) this.staleSince.delete(box.metadata.uid);
       await this.api().custom.deleteNamespacedCustomObject(
         {
           ...this.params(key.installSlug),
@@ -998,8 +1016,11 @@ export class KubernetesSessionDriver implements SessionDriver {
     const current = watch;
     current.subscribers.add(onEvent);
     if (!current.informer && !current.timer) void this.startWatch(installSlug, current);
+    let unsubscribed = false;
     return {
       stop: () => {
+        if (unsubscribed) return;
+        unsubscribed = true;
         current.subscribers.delete(onEvent);
         if (current.subscribers.size) return;
         current.stopped = true;
@@ -1081,10 +1102,6 @@ export class KubernetesSessionDriver implements SessionDriver {
     }, delay);
     watch.timer.unref();
   }
-}
-
-function boxUid(error: unknown): string {
-  return error && typeof error === 'object' && 'opaqueRef' in error ? String(error.opaqueRef) : 'kubernetes';
 }
 
 registerSessionDriver('kubernetes', (policy) => new KubernetesSessionDriver({ ...policy, ...kubernetesSettings() }));
