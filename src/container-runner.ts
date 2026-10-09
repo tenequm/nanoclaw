@@ -214,36 +214,47 @@ function releaseGroupSpawn(agentGroupId: string, sessionId: string): void {
 }
 
 /**
- * Runtime kinds closed to admission until reconciled. Every kind other than
- * the install default that startup discovery finds starts here: its surviving
- * sessions are unseen, so a fresh spawn could duplicate one. A kind whose
- * readiness check failed while other kinds kept the host up is here too, and
- * `needsReadiness` stays set until its `ensureReady` succeeds — nothing else
- * clears it. Each kind is reconciled on its own in the background once the
- * default's inline startup reconciliation is done (`reconcileClosedRuntime`):
- * list, stop or adopt each snapshot, reap. It reopens only when a pass
- * completes, so a late completion can never race a spawn. Spawns of its
- * groups fail `runtime-unavailable` (retryable) meanwhile. Never populated on
- * a single-runtime install: no pass, no timer.
+ * Admission per runtime kind. The install default is admitted as it always
+ * was, unless its readiness check failed while other kinds kept the host up.
+ * Every other kind is admitted only once a reconciliation pass completed for
+ * it in THIS process (`reconcileClosedRuntime`: list, stop or adopt each
+ * snapshot, reap, resync): until then its surviving sessions are unseen and a
+ * fresh spawn could duplicate one. Closed is the default — a kind startup did
+ * not enumerate (configured later, or the kinds read failed) gets its state on
+ * first use (`runtimeAdmissionRefusal`), and its pass starts there. Spawns of a
+ * closed kind's groups fail `runtime-unavailable` (retryable). `needsReadiness`
+ * stays set until the kind's `ensureReady` succeeds — nothing else clears it.
+ * A kind reopens only when a pass settled every snapshot and every mutating
+ * call it made, so a late completion can never race a spawn. Never populated
+ * on a single-runtime install: no pass, no timer.
  */
-interface ClosedRuntime {
+interface RuntimeReconciliation {
   driver: SessionEventsDriver;
+  /** A pass completed in this process: the kind is admitted. */
+  open: boolean;
   needsReadiness: boolean;
   /** The one reconciliation pass in flight for the kind. */
   pass?: Promise<boolean>;
   /** The backoff timer for the next pass after a failed one. */
   retry?: NodeJS.Timeout;
   failures: number;
+  /** Restart-intent recovery started when the kind reopened; shutdown waits for it. */
+  recovery?: Promise<void>;
 }
-const closedRuntimes = new Map<string, ClosedRuntime>();
+const runtimeStates = new Map<string, RuntimeReconciliation>();
+/** Re-read of the kinds this install used, after a failed startup read. */
+let kindsRetry: NodeJS.Timeout | undefined;
+let kindsReadFailures = 0;
 /**
- * The driver calls reconciliation awaits, keyed by kind and step and shared
- * until they settle: a pass that gives up on a hung call leaves it here, and
- * the next pass waits on that same call again instead of issuing another, so
- * a runtime that never answers accumulates one outstanding request, not one
- * per retry.
+ * The driver calls reconciliation and driver-change validation await, keyed by
+ * kind and step and shared until they settle: a caller that gives up on a hung
+ * call leaves it here, and the next one waits on that same call again instead
+ * of issuing another, so a runtime that never answers accumulates one
+ * outstanding request, not one per retry.
  */
 const outstandingRuntimeCalls = new Map<string, Promise<unknown>>();
+/** Steps that only read; any other outstanding step keeps its kind closed. */
+const READ_ONLY_STEPS = new Set(['readiness', 'listing', 'retained listing']);
 let runtimeReconciliationStopped = false;
 /** Bound on each background driver call, and on a driver change's validation listing. */
 let runtimeCallTimeoutMs = 15_000;
@@ -260,15 +271,44 @@ export function _runtimeReconciliationStateForTesting(): {
   closed: string[];
   passes: number;
   retryTimers: number;
+  recoveries: number;
   outstandingCalls: number;
 } {
-  const states = [...closedRuntimes.values()];
+  const entries = [...runtimeStates.entries()];
+  const states = entries.map(([, state]) => state);
   return {
-    closed: [...closedRuntimes.keys()],
+    closed: entries.filter(([, state]) => !state.open).map(([kind]) => kind),
     passes: states.filter((state) => state.pass !== undefined).length,
-    retryTimers: states.filter((state) => state.retry !== undefined).length,
+    retryTimers: states.filter((state) => state.retry !== undefined).length + (kindsRetry ? 1 : 0),
+    recoveries: states.filter((state) => state.recovery !== undefined).length,
     outstandingCalls: outstandingRuntimeCalls.size,
   };
+}
+
+/**
+ * Why a spawn (or a pending-adoption retry) on `driver` is refused now, or
+ * undefined when it is admitted. A non-default kind seen here for the first
+ * time is closed and its reconciliation pass started: first use proves the
+ * runtime empty of unseen sessions before anything is admitted to it.
+ */
+function runtimeAdmissionRefusal(driver: SessionEventsDriver): 'readiness' | 'discovery' | undefined {
+  let state = runtimeStates.get(driver.kind);
+  if (!state) {
+    if (driver.kind === getSessionDriver().kind) return undefined;
+    state = closeRuntimeAdmission(driver, 'discovery');
+    void reconcileClosedRuntime(driver.kind);
+  }
+  if (state.open) return undefined;
+  return state.needsReadiness ? 'readiness' : 'discovery';
+}
+
+/**
+ * Shutdown stopped reconciliation and `driver` is a kind it governs: nothing
+ * registers on it from here on (a recovery wake or a late adoption that was
+ * already past admission). Never true on a single-runtime install.
+ */
+function registrationFenced(driver: SessionEventsDriver): boolean {
+  return runtimeReconciliationStopped && runtimeStates.has(driver.kind);
 }
 
 function runtimeUnavailable(detail: string): Error & SessionFailure {
@@ -404,8 +444,11 @@ const pendingAdoptions = new Map<string, SessionEventsDriver>();
 export function _resetAdoptionRetryStateForTesting(): void {
   pendingAdoptions.clear();
   groupFence.clear();
-  for (const state of closedRuntimes.values()) clearTimeout(state.retry);
-  closedRuntimes.clear();
+  for (const state of runtimeStates.values()) clearTimeout(state.retry);
+  runtimeStates.clear();
+  clearTimeout(kindsRetry);
+  kindsRetry = undefined;
+  kindsReadFailures = 0;
   outstandingRuntimeCalls.clear();
   runtimeReconciliationStopped = false;
 }
@@ -421,7 +464,7 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
   // config: the surviving runtime lives where it was found.
   const driver = pendingAdoptions.get(session.id);
   if (!driver) return false;
-  if (closedRuntimes.has(driver.kind)) {
+  if (runtimeAdmissionRefusal(driver)) {
     throw runtimeUnavailable(`driver '${driver.kind}' is not available; session ${session.id} waits for it`);
   }
   const snapshots = await driver.listSessions(INSTALL_SLUG);
@@ -467,6 +510,10 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
       containerName: snapshot.handle.name,
       capabilities: driver.capabilities(),
     });
+    if (registrationFenced(driver)) {
+      await releaseGatewaySession(gatewaySession, { kind: 'host-detached', reason: 'host-shutdown' });
+      throw new Error(`host is shutting down; session ${session.id} stays unadopted`);
+    }
   } catch (err) {
     if (oneSessionGroup) releaseGroupFence(session.agent_group_id, session.id);
     await releaseClaimQuietly(session.id, claimIncarnation);
@@ -549,11 +596,10 @@ async function spawnContainer(session: Session, wakeReason?: WakeReason): Promis
   // contribution all depend on what it declares (ratified D1). A group with no
   // `driver` resolves the install default, exactly as before.
   const driver = await sessionDriverForGroup(agentGroup.id);
-  const closed = closedRuntimes.get(driver.kind);
-  if (closed) {
+  const refusal = runtimeAdmissionRefusal(driver);
+  if (refusal) {
     throw runtimeUnavailable(
-      `group '${agentGroup.folder}' runs on driver '${driver.kind}', which is not available ` +
-        `(${closed.needsReadiness ? 'readiness' : 'discovery'}); retrying later`,
+      `group '${agentGroup.folder}' runs on driver '${driver.kind}', which is not available (${refusal}); retrying later`,
     );
   }
   const capabilities = driver.capabilities();
@@ -759,6 +805,14 @@ async function spawnOnDriver(
     await releaseClaimQuietly(session.id, claimIncarnation);
     await releaseGatewaySession(gatewaySession, { kind: 'session-ended', reason: 'driver-prepare-failed' });
     throw err;
+  }
+  if (registrationFenced(driver)) {
+    await handle.stop('host-shutdown').catch((err: unknown) => {
+      log.error('Failed to clean up a session prepared during shutdown', { sessionId: session.id, err });
+    });
+    await releaseClaimQuietly(session.id, claimIncarnation);
+    await releaseGatewaySession(gatewaySession, { kind: 'session-ended', reason: 'host-shutdown' });
+    throw new Error(`host is shutting down; session ${session.id} is not started on driver '${driver.kind}'`);
   }
   const runtime = registerRuntime(session.id, handle, driver, gatewaySession, containerName, false);
   runtime.claimIncarnation = claimIncarnation;
@@ -1125,18 +1179,20 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
  *
  * The install default is reconciled here, inline and unbounded, exactly as
  * before per-group selection existed: inbound routing waits for it. Every
- * other kind this install has used (ruling 8b.3) is closed to admission and
- * reconciled in the background once this returns, each kind on its own — a
- * runtime that hangs or fails holds up neither startup nor any other kind,
- * and its sessions are never read as gone.
+ * other kind this install has used (ruling 8b.3) is reconciled in the
+ * background once this returns, each kind on its own — a runtime that hangs
+ * or fails holds up neither startup nor any other kind, and its sessions are
+ * never read as gone. Every other kind is closed until then, enumerated or
+ * not (`runtimeAdmissionRefusal`); a failed read of the kinds is retried.
  */
 export async function adoptRunningSessions(): Promise<{ adopted: number; stopped: number }> {
   const discovery = await discoveryDrivers();
   for (const driver of discovery.others) closeRuntimeAdmission(driver, 'discovery');
+  if (!discovery.kindsRead) scheduleKindsReread();
   try {
     const fallback = getSessionDriver();
     // Closed by a failed readiness check: background reconciliation owns it.
-    if (closedRuntimes.has(fallback.kind)) return { adopted: 0, stopped: 0 };
+    if (runtimeStates.has(fallback.kind)) return { adopted: 0, stopped: 0 };
     // Install-wide gateway reconciliation runs only when this pass considers
     // every kind the install ever used: with another kind still to reconcile
     // (or one unreadable, unbuilt or unenumerated), its live sessions' gateway
@@ -1145,7 +1201,7 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
     // second kind does not run it at all.
     return await reconcileDefaultRuntime(fallback, discovery.complete && discovery.others.length === 0);
   } finally {
-    for (const kind of closedRuntimes.keys()) void reconcileClosedRuntime(kind);
+    for (const [kind, state] of runtimeStates) if (!state.open) void reconcileClosedRuntime(kind);
   }
 }
 
@@ -1191,15 +1247,19 @@ async function reconcileDefaultRuntime(
  * Adopt one discovered runtime, or stop it when it is not ours to keep.
  * 'left' = deliberately untouched (another live host holds its claim, or the
  * claim write failed and the wake path will retry the fenced adoption).
- * `abandoned` (background reconciliation only) is checked once the gateway has
- * answered: shutdown began meanwhile, so the lease is detached and the claim
- * released instead of registering a runtime after teardown.
+ * `late` = a background reconciliation pass, where only confirmed teardown or
+ * a fenced adoption settles a snapshot: a stop that fails or times out, and a
+ * failed claim write, answer 'deferred' — the survivor keeps its protection
+ * (claim, pending record), its kind stays closed, and the next pass retries.
+ * Inline (the install default) a failed stop is swallowed as it always was.
+ * Shutdown beginning while the gateway answered detaches the lease and
+ * releases the claim instead of registering (`registrationFenced`).
  */
 async function adoptSnapshot(
   driver: SessionEventsDriver,
   snapshot: SupervisedSnapshot,
-  abandoned?: () => boolean,
-): Promise<'adopted' | 'stopped' | 'left'> {
+  late = false,
+): Promise<'adopted' | 'stopped' | 'left' | 'deferred'> {
   const { handle, phase } = snapshot;
   const session = handle.key.sessionId ? await getSession(handle.key.sessionId) : undefined;
   const agentGroup = session ? await getAgentGroup(session.agent_group_id) : undefined;
@@ -1208,8 +1268,7 @@ async function adoptSnapshot(
   // no per-handle status() round trip. `stop()` on a corpse is still full
   // teardown — a self-exited runtime needs its residue cleaned up.
   if (!session || !agentGroup || session.status !== 'active' || phase !== 'running') {
-    await handle.stop('orphan-at-startup').catch(() => {});
-    return 'stopped';
+    return (await stopSnapshot(driver, handle, 'orphan-at-startup', late)) ? 'stopped' : 'deferred';
   }
   const capabilities = driver.capabilities();
   if (capabilities.sessionsPerGroup === 'one') {
@@ -1220,8 +1279,7 @@ async function adoptSnapshot(
         holder,
         driver: driver.kind,
       });
-      await handle.stop('group-fence-at-startup').catch(() => {});
-      return 'stopped';
+      return (await stopSnapshot(driver, handle, 'group-fence-at-startup', late)) ? 'stopped' : 'deferred';
     }
   }
   // Claim before adopting: a lost CAS means another live process already
@@ -1241,7 +1299,7 @@ async function adoptSnapshot(
       err,
     });
     pendingAdoptions.set(session.id, driver);
-    return 'left';
+    return late ? 'deferred' : 'left';
   }
   /* eslint-enable no-catch-all/no-catch-all */
   if (claimIncarnation === null) {
@@ -1262,11 +1320,15 @@ async function adoptSnapshot(
     await driver.reconcileNetworkAccess?.(gatewaySession.lease.contribution.networkAccess);
   } catch (err) {
     log.error('Gateway could not adopt running session; stopping it', { sessionId: session.id, err });
-    await handle.stop('gateway-adoption-failed').catch(() => {});
+    if (!(await stopSnapshot(driver, handle, 'gateway-adoption-failed', late))) {
+      // Not confirmed gone: it keeps this host's claim and a pending record.
+      pendingAdoptions.set(session.id, driver);
+      return 'deferred';
+    }
     await releaseClaimQuietly(session.id, claimIncarnation);
     return 'stopped';
   }
-  if (abandoned?.()) {
+  if (registrationFenced(driver)) {
     await releaseGatewaySession(gatewaySession, { kind: 'host-detached', reason: 'host-shutdown' }).catch(() => {});
     await releaseClaimQuietly(session.id, claimIncarnation);
     return 'left';
@@ -1284,6 +1346,36 @@ async function adoptSnapshot(
   }
   await markContainerRunning(session.id);
   return 'adopted';
+}
+
+/**
+ * Stop a discovered runtime object; true when the stop is confirmed. Inline
+ * (the install default) a failure is swallowed, as before. In a background
+ * pass the stop is bounded and shared across passes like every other call,
+ * and a failure or timeout answers false so the pass fails.
+ */
+async function stopSnapshot(
+  driver: SessionEventsDriver,
+  handle: SupervisedHandle,
+  reason: string,
+  late: boolean,
+): Promise<boolean> {
+  if (!late) {
+    await handle.stop(reason).catch(() => {});
+    return true;
+  }
+  try {
+    await sharedRuntimeCall(driver.kind, `stop ${handle.name}`, () => handle.stop(reason));
+    return true;
+  } catch (err) {
+    log.error('Runtime object not confirmed stopped; its runtime stays closed and the stop is retried', {
+      driver: driver.kind,
+      name: handle.name,
+      reason,
+      err,
+    });
+    return false;
+  }
 }
 
 /** One runtime call within the bound: past it the call fails like an unreachable runtime and is no longer waited on. */
@@ -1323,17 +1415,41 @@ function sharedRuntimeCall<T>(
 }
 
 /** Close a runtime kind to admission. A readiness closure is never cleared by a discovery one. */
-function closeRuntimeAdmission(driver: SessionEventsDriver, reason: 'discovery' | 'readiness'): void {
-  let state = closedRuntimes.get(driver.kind);
+function closeRuntimeAdmission(driver: SessionEventsDriver, reason: 'discovery' | 'readiness'): RuntimeReconciliation {
+  let state = runtimeStates.get(driver.kind);
   if (!state) {
     log.error('Session runtime closed to admission until it is reconciled; its sessions are left untouched', {
       driver: driver.kind,
       reason,
     });
-    state = { driver, needsReadiness: false, failures: 0 };
-    closedRuntimes.set(driver.kind, state);
+    state = { driver, open: false, needsReadiness: false, failures: 0 };
+    runtimeStates.set(driver.kind, state);
   }
-  if (reason === 'readiness') state.needsReadiness = true;
+  if (reason === 'readiness') {
+    state.needsReadiness = true;
+    state.open = false;
+  }
+  return state;
+}
+
+/**
+ * After a failed startup read of the kinds this install used: re-read with
+ * backoff, and start reconciling every kind it names that nothing has touched
+ * yet. Those kinds are closed meanwhile regardless; this only reconciles them
+ * before their first use.
+ */
+function scheduleKindsReread(): void {
+  if (runtimeReconciliationStopped) return;
+  kindsReadFailures += 1;
+  const delay = Math.min(reconcileRetryBaseMs * 2 ** (kindsReadFailures - 1), RECONCILE_RETRY_CAP_MS);
+  kindsRetry = setTimeout(() => {
+    kindsRetry = undefined;
+    void discoveryDrivers().then(({ others, kindsRead }) => {
+      if (!kindsRead) return scheduleKindsReread();
+      for (const driver of others) runtimeAdmissionRefusal(driver);
+    });
+  }, delay);
+  kindsRetry.unref?.();
 }
 
 /**
@@ -1343,8 +1459,8 @@ function closeRuntimeAdmission(driver: SessionEventsDriver, reason: 'discovery' 
  * reopened.
  */
 function reconcileClosedRuntime(kind: string): Promise<boolean> {
-  const state = closedRuntimes.get(kind);
-  if (!state || runtimeReconciliationStopped) return Promise.resolve(false);
+  const state = runtimeStates.get(kind);
+  if (!state || state.open || runtimeReconciliationStopped) return Promise.resolve(false);
   if (state.pass) return state.pass;
   clearTimeout(state.retry);
   state.retry = undefined;
@@ -1362,8 +1478,8 @@ function reconcileClosedRuntime(kind: string): Promise<boolean> {
   return pass;
 }
 
-function scheduleReconciliationRetry(kind: string, state: ClosedRuntime): void {
-  if (runtimeReconciliationStopped || closedRuntimes.get(kind) !== state) return;
+function scheduleReconciliationRetry(kind: string, state: RuntimeReconciliation): void {
+  if (runtimeReconciliationStopped || runtimeStates.get(kind) !== state) return;
   state.failures += 1;
   const delay = Math.min(reconcileRetryBaseMs * 2 ** (state.failures - 1), RECONCILE_RETRY_CAP_MS);
   state.retry = setTimeout(() => {
@@ -1378,9 +1494,11 @@ function scheduleReconciliationRetry(kind: string, state: ClosedRuntime): void {
  * then the listing, then each snapshot stopped or adopted, then the kind's
  * residue reap and resync. Idempotent over a partial earlier pass: a session
  * this host already supervises from this same runtime is kept as it is. The
- * kind reopens only when every snapshot was settled.
+ * kind reopens only when every snapshot was settled and no mutating call to
+ * it — this pass's or an earlier one's — is still outstanding; a reap or
+ * resync that fails or times out fails the pass.
  */
-async function reconciliationPass(kind: string, state: ClosedRuntime): Promise<boolean> {
+async function reconciliationPass(kind: string, state: RuntimeReconciliation): Promise<boolean> {
   const { driver } = state;
   if (state.needsReadiness) {
     await sharedRuntimeCall(kind, 'readiness', () => driver.ensureReady?.());
@@ -1398,18 +1516,28 @@ async function reconciliationPass(kind: string, state: ClosedRuntime): Promise<b
     else if (outcome === 'stopped') stopped += 1;
   }
   if (runtimeReconciliationStopped) return false;
-  await sharedRuntimeCall(kind, 'residue reap', () => driver.reapResidue?.(INSTALL_SLUG)).catch(() => {});
-  if (isSessionEventsDriver(driver)) {
-    await sharedRuntimeCall(kind, 'resync', () => driver.resync(INSTALL_SLUG)).catch(() => {});
-  }
-  if (!settled || runtimeReconciliationStopped) return false;
-  if (closedRuntimes.get(kind) === state) closedRuntimes.delete(kind);
+  await sharedRuntimeCall(kind, 'residue reap', () => driver.reapResidue?.(INSTALL_SLUG));
+  if (isSessionEventsDriver(driver)) await sharedRuntimeCall(kind, 'resync', () => driver.resync(INSTALL_SLUG));
+  if (!settled || runtimeReconciliationStopped || runtimeStates.get(kind) !== state) return false;
+  const unsettled = [...outstandingRuntimeCalls.keys()]
+    .map((key) => key.split('\u0000'))
+    .filter(([callKind, step]) => callKind === kind && !READ_ONLY_STEPS.has(step))
+    .map(([, step]) => step);
+  if (unsettled.length > 0) throw new Error(`still outstanding: ${unsettled.join(', ')}`);
+  state.open = true;
+  state.failures = 0;
   log.info('Session runtime reconciled; reopening its admission', { driver: kind, adopted, stopped });
   // Restarts ordered before the host went down, for sessions on this kind:
-  // the startup pass could not honor them while the kind was closed.
-  void honorPendingStopIntents(wakeContainer, kind).catch((err: unknown) =>
-    log.warn('Failed to honor stop intents after reconciling a runtime', { driver: kind, err }),
-  );
+  // the startup pass could not honor them while the kind was closed. Tracked
+  // for shutdown, and fenced from registering after it (`registrationFenced`).
+  const recovery: Promise<void> = honorPendingStopIntents(wakeContainer, kind)
+    .catch((err: unknown) =>
+      log.warn('Failed to honor stop intents after reconciling a runtime', { driver: kind, err }),
+    )
+    .finally(() => {
+      if (state.recovery === recovery) state.recovery = undefined;
+    });
+  state.recovery = recovery;
   return true;
 }
 
@@ -1429,7 +1557,7 @@ async function reconcileLateSnapshot(
 ): Promise<'adopted' | 'stopped' | 'left' | 'deferred'> {
   const { handle } = snapshot;
   const sessionId = handle.key.sessionId;
-  if (!sessionId) return adoptSnapshot(driver, snapshot, () => runtimeReconciliationStopped);
+  if (!sessionId) return adoptSnapshot(driver, snapshot, true);
   const registered = activeContainers.get(sessionId);
   if (registered && registered.driver === driver) {
     if (registered.handle.name !== handle.name) {
@@ -1450,8 +1578,7 @@ async function reconcileLateSnapshot(
       name: handle.name,
       supervisedOn: (registered?.driver ?? pendingOn)?.kind,
     });
-    await handle.stop('duplicate-at-rediscovery').catch(() => {});
-    return 'stopped';
+    return (await stopSnapshot(driver, handle, 'duplicate-at-rediscovery', true)) ? 'stopped' : 'deferred';
   }
   if (wakePromises.has(sessionId)) return 'deferred';
   const agentGroupId = handle.key.agentGroupId;
@@ -1459,9 +1586,9 @@ async function reconcileLateSnapshot(
   admitGroupSpawn(agentGroupId, sessionId);
   let settleWake!: (adopted: boolean) => void;
   wakePromises.set(sessionId, new Promise<boolean>((resolve) => (settleWake = resolve)));
-  let outcome: 'adopted' | 'stopped' | 'left' = 'left';
+  let outcome: 'adopted' | 'stopped' | 'left' | 'deferred' = 'left';
   try {
-    outcome = await adoptSnapshot(driver, snapshot, () => runtimeReconciliationStopped);
+    outcome = await adoptSnapshot(driver, snapshot, true);
     return outcome;
   } finally {
     wakePromises.delete(sessionId);
@@ -1472,31 +1599,38 @@ async function reconcileLateSnapshot(
 
 /**
  * Run (or join) a reconciliation pass for every kind closed to admission now,
- * without waiting for its backoff. Resolves to how many kinds reopened.
+ * without waiting for its backoff; `kinds` not seen yet are closed first, as
+ * on their first use. Resolves to how many kinds reopened.
  */
-export async function rediscoverUnavailableRuntimes(): Promise<number> {
-  const reopened = await Promise.all([...closedRuntimes.keys()].map(reconcileClosedRuntime));
+export async function rediscoverUnavailableRuntimes(kinds: string[] = []): Promise<number> {
+  for (const kind of kinds) runtimeAdmissionRefusal(getSessionDriver(kind));
+  const closed = [...runtimeStates].filter(([, state]) => !state.open).map(([kind]) => kind);
+  const reopened = await Promise.all(closed.map(reconcileClosedRuntime));
   return reopened.filter(Boolean).length;
 }
 
 /**
- * Shutdown: no pass starts from here on, every retry timer is cleared, and a
- * pass in flight stops at its next checkpoint (between snapshots, and before
- * registering an adoption, which it detaches instead). Waits for those passes
- * at most one call bound: a pass stuck inside a runtime call cannot be
- * interrupted, and teardown must not hang on it. A no-op when nothing is
- * closed — a single-runtime install.
+ * Shutdown: no pass starts from here on, every retry timer is cleared, a pass
+ * in flight stops at its next checkpoint (between snapshots), and nothing
+ * registers on a reconciled kind any more (`registrationFenced`: a late
+ * adoption detaches instead, a restart-recovery spawn is torn down). Waits for
+ * the passes and recoveries at most one call bound: one stuck inside a runtime
+ * call cannot be interrupted, and teardown must not hang on it. A no-op when
+ * no kind was ever reconciled — a single-runtime install.
  */
 export async function stopRuntimeReconciliation(): Promise<void> {
   runtimeReconciliationStopped = true;
-  const passes: Promise<boolean>[] = [];
-  for (const state of closedRuntimes.values()) {
+  clearTimeout(kindsRetry);
+  kindsRetry = undefined;
+  const inFlight: Promise<unknown>[] = [];
+  for (const state of runtimeStates.values()) {
     clearTimeout(state.retry);
     state.retry = undefined;
-    if (state.pass) passes.push(state.pass);
+    if (state.pass) inFlight.push(state.pass);
+    if (state.recovery) inFlight.push(state.recovery);
   }
-  if (passes.length === 0) return;
-  await withinRuntimeBound(Promise.all(passes), 'reconciliation', 'shutdown').catch((err: unknown) =>
+  if (inFlight.length === 0) return;
+  await withinRuntimeBound(Promise.all(inFlight), 'reconciliation', 'shutdown').catch((err: unknown) =>
     log.warn('Session runtime reconciliation still in flight at shutdown', { err }),
   );
 }
@@ -1568,12 +1702,14 @@ async function probeOtherConfiguredRuntimes(
  * ever used (ruling 8b.3), the configured ones then recorded so a group's kind
  * is remembered even after the group moves off it. `complete` is false when
  * the kinds could not be read or a kind's driver could not be built (its
- * overlay was removed): something live may be unconsidered. A failed record
+ * overlay was removed): something live may be unconsidered. `kindsRead` is
+ * false when the read itself failed (the caller retries it). A failed record
  * write leaves discovery complete — the read already named every kind.
  */
-async function discoveryDrivers(): Promise<{ others: SessionEventsDriver[]; complete: boolean }> {
+async function discoveryDrivers(): Promise<{ others: SessionEventsDriver[]; complete: boolean; kindsRead: boolean }> {
   const fallback = defaultSessionDriverKind();
   let kinds: string[] = [];
+  let kindsRead = true;
   let complete = true;
   try {
     const configured = await listConfiguredDriverKinds();
@@ -1587,6 +1723,7 @@ async function discoveryDrivers(): Promise<{ others: SessionEventsDriver[]; comp
     log.warn('Could not read the driver kinds this install has used; discovering the install default only', {
       err,
     });
+    kindsRead = false;
     complete = false;
   }
   const others: SessionEventsDriver[] = [];
@@ -1602,7 +1739,7 @@ async function discoveryDrivers(): Promise<{ others: SessionEventsDriver[]; comp
       complete = false;
     }
   }
-  return { others, complete };
+  return { others, complete, kindsRead };
 }
 
 /**
@@ -1697,18 +1834,17 @@ export async function assertGroupDriverChangeAllowed(agentGroupId: string, nextK
   }
   // Bounded: a runtime that never answers fails the change closed, and
   // `changeGroupDriver` releases the group's mark, instead of holding every
-  // future wake of the group refused.
+  // future wake of the group refused. Shared: a repeated attempt (or a
+  // reconciliation pass) waits on the listing still outstanding, never stacks.
   try {
-    const listing = withinRuntimeBound(current.listSessions(INSTALL_SLUG), current.kind, 'listing for a driver change');
-    for (const { handle } of await listing) {
+    const listing = await sharedRuntimeCall(current.kind, 'listing', () => current.listSessions(INSTALL_SLUG));
+    for (const { handle } of listing ?? []) {
       if (handle.key.agentGroupId === agentGroupId) blocking.push(`runtime ${handle.name}`);
     }
-    const retained = withinRuntimeBound(
-      Promise.resolve(current.listRetained?.(INSTALL_SLUG)),
-      current.kind,
-      'retained listing for a driver change',
+    const retained = await sharedRuntimeCall(current.kind, 'retained listing', () =>
+      current.listRetained?.(INSTALL_SLUG),
     );
-    for (const object of (await retained) ?? []) {
+    for (const object of retained ?? []) {
       if (object.key.agentGroupId === agentGroupId) blocking.push(`retained ${object.kind} ${object.name}`);
     }
   } catch (err) {
@@ -1762,6 +1898,9 @@ export async function changeGroupDriver(
   try {
     await assertGroupDriverChangeAllowed(agentGroupId, nextKind);
     await apply();
+    // First use of the target kind: closed, and its reconciliation started now
+    // rather than at the group's next wake.
+    if (nextKind) runtimeAdmissionRefusal(getSessionDriver(nextKind));
   } finally {
     driverChangesInFlight.delete(agentGroupId);
   }
