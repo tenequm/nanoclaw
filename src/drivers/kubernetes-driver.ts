@@ -101,11 +101,17 @@ export function groupPvcName(key: SessionKey): string {
 }
 
 function sandboxName(key: SessionKey): string {
-  return kubernetesName(`ncl-${key.agentGroupId}-${key.sessionId}`, JSON.stringify(key));
+  return kubernetesName(
+    `ncl-${key.agentGroupId}-${key.sessionId}`,
+    JSON.stringify([key.installSlug, key.agentGroupId, key.sessionId]),
+  );
 }
 
 export function secretName(key: SessionKey): string {
-  return kubernetesName(`ncl-${key.agentGroupId}-${key.sessionId}-files`, JSON.stringify([key, 'files']));
+  return kubernetesName(
+    `ncl-${key.agentGroupId}-${key.sessionId}-files`,
+    JSON.stringify([key.installSlug, key.agentGroupId, key.sessionId, 'files']),
+  );
 }
 
 function condition(box: Sandbox, type: string): k8s.V1Condition | undefined {
@@ -182,7 +188,10 @@ export function kubernetesFailure(error: unknown, opaqueRef = 'kubernetes'): Ses
 }
 
 function normalizeKubernetesError(error: unknown, opaqueRef?: string): Error & SessionFailure {
-  if (error instanceof Error && 'kind' in error && 'retryable' in error) return error as Error & SessionFailure;
+  if (error instanceof Error && 'kind' in error && 'retryable' in error) {
+    const failure = error as Error & SessionFailure;
+    return failure.kind === 'unknown' && opaqueRef ? asFailureError({ ...failure, opaqueRef }) : failure;
+  }
   const failure = kubernetesFailure(error, opaqueRef);
   if (failure.kind === 'spec-invalid') return specInvalid(failure.detail);
   if (failure.kind === 'denied-by-policy') return deniedByPolicy(failure.detail);
@@ -369,6 +378,17 @@ for (const state of data.states) {
   };
 }
 
+function labelPatch(existing: Record<string, string> | undefined, desired: Record<string, string> | undefined) {
+  return {
+    ...Object.fromEntries(
+      Object.keys(existing ?? {})
+        .filter((key) => !(key in (desired ?? {})))
+        .map((key) => [key, null]),
+    ),
+    ...desired,
+  };
+}
+
 interface InstallWatch {
   subscribers: Set<(event: SessionEvent) => void>;
   informer?: k8s.Informer<Sandbox>;
@@ -530,6 +550,7 @@ export class KubernetesSessionDriver implements SessionDriver {
     validateKubernetesSpec(spec, this.opts, this.capabilities());
     const desired = sandboxManifest(spec, this.namespace(spec.key.installSlug));
     return this.locked(spec.key, async () => {
+      let opaqueRef: string | undefined;
       try {
         const { core, custom } = await this.api();
         const namespace = this.namespace(spec.key.installSlug);
@@ -600,21 +621,33 @@ export class KubernetesSessionDriver implements SessionDriver {
         }
         if (!box || !isDeepStrictEqual(keyFromLabels(box.metadata.labels), spec.key))
           throw deniedByPolicy('Sandbox identity does not match the requested session key');
-        if (!suspended(box)) return this.handle(spec.key, box.metadata.name!, null);
+        opaqueRef = box.metadata.uid;
+        if (!suspended(box)) return this.handle(spec.key, box.metadata.name!, null, opaqueRef);
         await this.waitSuspended(spec.key, box.metadata.name!);
         if (
           !isDeepStrictEqual(box.spec.podTemplate, desired.spec.podTemplate) ||
           !isDeepStrictEqual(box.metadata.labels, desired.metadata.labels)
         ) {
           box = await this.patch(spec.key, box.metadata.name!, {
-            metadata: { labels: desired.metadata.labels, annotations: desired.metadata.annotations },
-            spec: { podTemplate: desired.spec.podTemplate },
+            metadata: {
+              labels: labelPatch(box.metadata.labels, desired.metadata.labels),
+              annotations: desired.metadata.annotations,
+            },
+            spec: {
+              podTemplate: {
+                ...desired.spec.podTemplate,
+                metadata: {
+                  ...desired.spec.podTemplate.metadata,
+                  labels: labelPatch(box.spec.podTemplate.metadata?.labels, desired.spec.podTemplate.metadata?.labels),
+                },
+              },
+            },
           });
         }
         await this.syncSecret(spec, box);
-        return this.handle(spec.key, box.metadata.name!, spec);
+        return this.handle(spec.key, box.metadata.name!, spec, opaqueRef);
       } catch (error) {
-        throw normalizeKubernetesError(error);
+        throw normalizeKubernetesError(error, opaqueRef);
       }
     });
   }
@@ -703,11 +736,12 @@ export class KubernetesSessionDriver implements SessionDriver {
     });
   }
 
-  private async start(key: SessionKey, name: string, spec: SessionSpec | null): Promise<void> {
+  private async start(key: SessionKey, name: string, spec: SessionSpec | null, opaqueRef?: string): Promise<void> {
     return this.locked(key, async () => {
       try {
         let box = await this.readSandbox(key, name);
         if (!box) throw asFailureError({ kind: 'runtime-unavailable', retryable: true });
+        opaqueRef = box.metadata.uid;
         let oldUid = box.metadata.annotations?.[LAST_POD_UID];
         if (suspended(box)) {
           const oldPod = await this.readPod(key.installSlug, name);
@@ -754,6 +788,16 @@ export class KubernetesSessionDriver implements SessionDriver {
                 pendingFailure = status.failure;
                 return;
               }
+              if (status.failure.kind === 'started-then-died') {
+                await this.patch(key, name, {
+                  metadata: {
+                    annotations: {
+                      [STARTED_ONCE]: 'true',
+                      ...(backing?.metadata?.uid && { [LAST_POD_UID]: backing.metadata.uid }),
+                    },
+                  },
+                });
+              }
               throw asFailureError(status.failure);
             }
             if (status.phase === 'stopped') return backing ?? { metadata: {} };
@@ -769,7 +813,7 @@ export class KubernetesSessionDriver implements SessionDriver {
           },
         });
       } catch (error) {
-        throw normalizeKubernetesError(error);
+        throw normalizeKubernetesError(error, opaqueRef);
       }
     });
   }
@@ -844,33 +888,39 @@ export class KubernetesSessionDriver implements SessionDriver {
     return { phase: 'preparing' };
   }
 
-  private handle(key: SessionKey, name: string, spec: SessionSpec | null): SessionHandle {
+  private handle(key: SessionKey, name: string, spec: SessionSpec | null, opaqueRef?: string): SessionHandle {
     return {
       key,
       name,
-      start: () => this.start(key, name, spec),
+      start: () => this.start(key, name, spec, opaqueRef),
       status: async () => {
         try {
           const box = await this.readSandbox(key, name);
+          opaqueRef = box?.metadata.uid ?? opaqueRef;
           return box ? await this.statusFrom(box, await this.readPod(key.installSlug, name)) : { phase: 'stopped' };
         } catch (error) {
-          throw normalizeKubernetesError(error);
+          throw normalizeKubernetesError(error, opaqueRef);
         }
       },
       stop: (_reason) =>
         this.locked(key, async () => {
-          const box = await this.readSandbox(key, name);
-          if (!box || suspended(box)) return;
-          const pod = await this.readPod(key.installSlug, name);
-          await this.patch(key, name, {
-            metadata: {
-              annotations: {
-                [SPEC_UPDATED]: new Date().toISOString(),
-                ...(pod?.metadata?.uid && { [LAST_POD_UID]: pod.metadata.uid }),
+          try {
+            const box = await this.readSandbox(key, name);
+            opaqueRef = box?.metadata.uid ?? opaqueRef;
+            if (!box || suspended(box)) return;
+            const pod = await this.readPod(key.installSlug, name);
+            await this.patch(key, name, {
+              metadata: {
+                annotations: {
+                  [SPEC_UPDATED]: new Date().toISOString(),
+                  ...(pod?.metadata?.uid && { [LAST_POD_UID]: pod.metadata.uid }),
+                },
               },
-            },
-            spec: { operatingMode: 'Suspended' },
-          });
+              spec: { operatingMode: 'Suspended' },
+            });
+          } catch (error) {
+            throw normalizeKubernetesError(error, opaqueRef);
+          }
         }),
       execSpec: (command) => {
         const base = [
@@ -920,7 +970,7 @@ export class KubernetesSessionDriver implements SessionDriver {
           ? terminated.exitCode !== 0
           : pod?.status?.phase === 'Failed' || currentCondition(box, 'Finished')?.reason === 'PodFailed';
         return {
-          handle: this.handle(key, box.metadata.name!, null),
+          handle: this.handle(key, box.metadata.name!, null, box.metadata.uid),
           phase,
           ...(failed && {
             failure: {

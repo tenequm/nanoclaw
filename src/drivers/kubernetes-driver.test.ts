@@ -124,10 +124,14 @@ function harness(options: Partial<KubernetesDriverOptions> = {}) {
       const box = boxes.get(name)!;
       if (body.spec) {
         Object.assign(box.spec, body.spec);
+        for (const [key, value] of Object.entries(box.spec.podTemplate.metadata?.labels ?? {}))
+          if (value === null) delete box.spec.podTemplate.metadata!.labels![key];
         box.metadata.generation = (box.metadata.generation ?? 0) + 1;
       }
       if (body.metadata) {
         box.metadata.labels = { ...box.metadata.labels, ...body.metadata.labels };
+        for (const [key, value] of Object.entries(box.metadata.labels))
+          if (value === null) delete box.metadata.labels[key];
         box.metadata.annotations = { ...box.metadata.annotations, ...body.metadata.annotations };
       }
       if (body.spec?.operatingMode === 'Running') {
@@ -191,6 +195,17 @@ describe('kubernetes driver manifests', () => {
     expect(kubernetesNamespace('UPPER_slug')).toBe('nanoclaw-upper-slug');
     expect(kubernetesNamespace('x'.repeat(100))).toHaveLength(63);
   });
+  it('names depend on key values, never JavaScript object property order', () => {
+    const h = harness();
+    const reordered = {
+      sessionId: h.spec.key.sessionId,
+      agentGroupId: h.spec.key.agentGroupId,
+      installSlug: h.spec.key.installSlug,
+    };
+    expect(h.driver.runtimeName(reordered)).toBe(h.driver.runtimeName(h.spec.key));
+    expect(secretName(reordered)).toBe(secretName(h.spec.key));
+  });
+
   it('group PVC names are independent of session ids', () => {
     const { key } = fixtureGroupVolumeSpec();
     expect(groupPvcName(key)).toBe(groupPvcName({ ...key, sessionId: 'other' }));
@@ -301,6 +316,20 @@ describe('kubernetes driver lifecycle', () => {
     expect(await handle.status()).toEqual({ phase: 'running' });
     expect([...h.boxes.values()][0].metadata.annotations![STARTED_ONCE]).toBe('true');
   });
+  it('removes lineage labels that are absent from a refreshed suspended spec', async () => {
+    const h = harness();
+    h.spec.labels['temporary-lineage'] = 'old';
+    const handle = await h.driver.prepare(h.spec);
+    await handle.start();
+    await handle.stop('refresh');
+    delete h.spec.labels['temporary-lineage'];
+    await h.driver.prepare(h.spec);
+    const box = h.boxes.get(handle.name)!;
+    expect(box.metadata.labels).not.toHaveProperty('temporary-lineage');
+    expect(box.spec.podTemplate.metadata!.labels).not.toHaveProperty('temporary-lineage');
+    expect(h.secrets.get(secretName(h.spec.key))!.metadata!.labels).not.toHaveProperty('temporary-lineage');
+  });
+
   it('syncs latest bytes at start even without another prepare', async () => {
     const h = harness();
     const handle = await h.driver.prepare(h.spec);
@@ -379,8 +408,11 @@ describe('kubernetes driver lifecycle', () => {
       }
       return result;
     });
-    if (code) await expect(handle.start()).rejects.toMatchObject({ kind: 'started-then-died', exitCode: code });
-    else {
+    if (code) {
+      await expect(handle.start()).rejects.toMatchObject({ kind: 'started-then-died', exitCode: code });
+      await handle.stop('cleanup');
+      expect(await handle.status()).toEqual({ phase: 'stopped' });
+    } else {
       await handle.start();
       expect(await handle.status()).toEqual({ phase: 'stopped' });
       await handle.stop('cleanup');
@@ -593,6 +625,14 @@ describe('kubernetes driver lifecycle', () => {
 });
 
 describe('kubernetes failure and admission mapping', () => {
+  it('retains the Sandbox UID for unexpected handle API failures', async () => {
+    const h = harness();
+    const handle = await h.driver.prepare(h.spec);
+    await handle.start();
+    h.custom.getNamespacedCustomObject.mockRejectedValue(new Error('opaque'));
+    for (const operation of [() => handle.status(), () => handle.start(), () => handle.stop('shutdown')])
+      await expect(operation()).rejects.toMatchObject({ kind: 'unknown', opaqueRef: 'sandbox-uid' });
+  });
   it.each([
     [{ code: 403, body: { message: 'exceeded quota: storage' } }, 'resources-exhausted'],
     [{ code: 403, body: { reason: 'Forbidden' } }, 'denied-by-policy'],
