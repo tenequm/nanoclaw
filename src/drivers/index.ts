@@ -182,5 +182,6 @@ export function resetSessionDriver(next: SessionDriver | null = null): void {
 }
 
 export * from './driver-registry.js';
+export * from './label-projection.js';
 export * from './session-events.js';
 export * from './types.js';

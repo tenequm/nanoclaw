@@ -57,7 +57,39 @@ export interface MountSpec {
   mode: 'rw' | 'ro';
   /** Lets a realization — by admission or by in-code checks — pin group-state to the group subtree. */
   groupScope: string;
+  /**
+   * How a driver with no view of the host filesystem realizes this mount.
+   * Composed ONLY for a driver declaring `capabilities().storage ===
+   * 'group-volume'`; absent for every other driver, so a host-bind spec is
+   * byte-identical to what it was before this field existed. A driver that
+   * declares 'group-volume' realizes exactly what this says and never derives
+   * it from `hostPath`, `containerPath` or `class` (see `MountRealization`).
+   */
+  realization?: MountRealization;
 }
+
+/**
+ * The two shapes a 'group-volume' driver realizes. Composition classifies
+ * every mount it emits for such a driver into one of these, or refuses the
+ * spawn (`spec-invalid`, naming the mount) — a mount that is neither never
+ * reaches the driver.
+ *
+ * - 'group-volume': a group-state DIRECTORY, realized on the group's
+ *   persistent volume at `subPath`. The subPath rule (brief Block C): the
+ *   `hostPath` relative to the mount-policy root that contains it — session
+ *   state under `dataRoot` (`v2-sessions/<group>/...`), the group folder under
+ *   `groupsRoot` (`<folder>`). `containerPath` and `mode` realize verbatim.
+ *   Keyed by hostPath, never by containerPath: every session mounts
+ *   `/workspace`, and they must not alias one subtree.
+ * - 'file-snapshot': a read-only regular FILE (the session context, the
+ *   composed `container.json` and project document, gateway trust material
+ *   and credential stubs). The driver copies the bytes at `hostPath` into the
+ *   session's file bundle on EVERY `start()` — a snapshot taken at start,
+ *   never a live view — and projects each file read-only at `containerPath`,
+ *   readable by `SessionSpec.runAs`. A bundle the realization cannot carry
+ *   (a size cap) fails `spec-invalid` naming the limit.
+ */
+export type MountRealization = { kind: 'group-volume'; subPath: string } | { kind: 'file-snapshot' };
 
 export interface ContainerSpec {
   role: ContainerRole;
@@ -94,12 +126,52 @@ export interface ContainerSpec {
   mounts: MountSpec[];
   /** Stamped onto the realized object in addition to the canonical key labels. */
   labels?: Record<string, string>;
+  /**
+   * The install surfaces (runner source, skills) as their own read-only OCI
+   * image, mounted beside `image` instead of baked into it (ruling 8b.4).
+   * Composed only for a driver declaring `imageCarriedSurfaces`, and only
+   * when the install configures one (`NANOCLAW_SURFACE_IMAGE`, a digest
+   * reference — composition refuses a mutable one). Absent = baked mode: the
+   * agent image itself carries the surfaces, and the driver mounts nothing.
+   */
+  surfaceImage?: SurfaceImage;
   // No raw runtime flags here, ever: network topology is driver-private (the
   // Docker realization's `networkArgsFor`), and everything a gateway used to
   // append as raw `-e`/`-v` rides the typed lanes above, where admission can
   // see it. No raw security flags either. Rootfs policy (auxiliary roles: read-only; agent:
   // writable ephemeral scratch) is part of the named hardening posture, mapped per role by
   // each driver. Changing it means a new posture version, not a per-session knob.
+}
+
+/** See `ContainerSpec.surfaceImage`. Resolved before composition; the driver never resolves it. */
+export interface SurfaceImage {
+  /** Digest-pinned reference (`<repo>@sha256:<hex>`). */
+  image: string;
+  /** Each surface: the directory inside the image, mounted read-only at `containerPath`. */
+  mounts: { imagePath: string; containerPath: string }[];
+}
+
+/**
+ * Provider-owned state a 'group-volume' driver initializes on the group's
+ * volume before the agent starts (ruling 8b.1) — the same declared surfaces
+ * the host realizes on disk for a host-bind driver
+ * (`provider-contracts/realize.ts`), executed where the storage is. Re-run on
+ * every start, idempotent: it never overwrites a file that exists.
+ */
+export interface ProviderStateInit {
+  /** The provider whose contract this realizes, for diagnostics. */
+  provider: string;
+  /** Group-volume subPath of the provider's state directory (`MountRealization` subPath rule). */
+  subPath: string;
+  /** Files created under `subPath` only when absent; existing files are left byte-for-byte. */
+  createIfMissing: { relativePath: string; content: string }[];
+  /**
+   * Shared-skill links to reconcile under `subPath/relativeDir`: a symlink per
+   * name pointing at `<targetRoot>/<name>` is created when missing, a symlink
+   * whose name is not listed is removed, and a real (non-symlink) entry is
+   * never touched — the host's `syncSharedSkillLinks` semantics.
+   */
+  skillLinks?: { relativeDir: string; targetRoot: string; names: string[] };
 }
 
 export interface SessionResources {
@@ -130,15 +202,25 @@ export interface NetworkAccessIntent {
 
 export interface SessionSpec {
   key: SessionKey;
-  /** Lineage labels (channel id, container instance id, ...). Drivers stamp these onto every runtime object. */
+  /**
+   * Lineage labels (channel id, container instance id, ...). Drivers stamp these
+   * onto every runtime object. A value a driver cannot carry verbatim (fails
+   * `labelValueLegal`) is projected with `projectLabelValue` from
+   * `label-projection.ts` — except `GROUP_FOLDER_LABEL`, which is verbatim or
+   * refused at composition.
+   */
   labels: Record<string, string>;
   /** One session, exactly one container per safe role; an overlay may compose auxiliary containers beside `agent`. */
   containers: ContainerSpec[];
   /**
-   * 'shared-private': the containers of this session reach the gateway and nothing
-   * else. On Docker that is the egress-lockdown network machinery; other
-   * realizations enforce it declaratively. `capabilities.networkPolicy` tells
-   * the overlay which enforcement it got.
+   * 'shared-private': the INTENT that the containers of this session reach the
+   * gateway and nothing else. On Docker that is the egress-lockdown network
+   * machinery when lockdown is enabled. `capabilities.networkPolicy` names the
+   * MECHANISM a realization would enforce it with — not proof that it does:
+   * a 'declarative' driver that installs no policy (the kubernetes MVP, by
+   * owner decision) leaves the session's networking permissive, and says so
+   * in its own documentation. Never read this field, or a 'declarative'
+   * capability, as evidence that egress is restricted.
    */
   network: 'shared-private' | 'none';
   /** Selected gateway destination for this session. */
@@ -151,11 +233,19 @@ export interface SessionSpec {
    * uid:gid the containers run as. Docker papers over an image/host uid mismatch
    * with `--user`; not every realization has such a default, so the identity
    * that must read 0600 material has to be explicit in the spec rather than
-   * inherited from the image.
+   * inherited from the image. For a 'group-volume' driver composition sets the
+   * agent image's own user (there is no host-owned material to read: files
+   * arrive as snapshots), never the host uid; the driver realizes `gid` as the
+   * volume group (fsGroup) so fresh group storage is writable.
    */
   runAs?: { uid: number; gid: number };
   /** Grace before SIGKILL. Docker `stop -t`, or the realization's termination grace. */
   stopGraceSeconds: number;
+  /**
+   * Provider state to initialize on group storage (ruling 8b.1). Composed only
+   * for a 'group-volume' driver; absent everywhere else.
+   */
+  providerState?: ProviderStateInit[];
 }
 
 export type SessionFailure =
@@ -167,6 +257,12 @@ export type SessionFailure =
   | { kind: 'started-then-died'; retryable: false; exitCode?: number }
   | { kind: 'unknown'; retryable: false; opaqueRef: string };
 
+/**
+ * `ready` is a prepared incarnation that was NEVER started; `stopped` is one
+ * that ran and ended — including one a retaining driver keeps (see
+ * `SessionHandle.stop`). A retaining driver must tell the two apart from
+ * persistent object state, never from the absence of a live process.
+ */
 export type SessionStatus =
   | { phase: 'preparing' }
   | { phase: 'ready' } // prepared, not started
@@ -242,12 +338,27 @@ export interface SessionHandle {
   start(): Promise<void>;
   status(): Promise<SessionStatus>;
   /**
-   * Full teardown of everything this key allocated. The contract is that the
-   * session ENDS and its resources get cleaned up; that today's
-   * implementations block until the runtime object is actually gone is an
-   * implementation behavior (it happens to serialize workspace single-writer
-   * during termination), NOT a contract guarantee — callers must not rely on
-   * blocking-until-gone.
+   * End the session. The contract is that the session's EXECUTION ends and
+   * what it allocated is cleaned up; that today's implementations block until
+   * the runtime object is actually gone is an implementation behavior (it
+   * happens to serialize workspace single-writer during termination), NOT a
+   * contract guarantee — callers must not rely on blocking-until-gone.
+   *
+   * Retention amendment (brief Block B, owner-ratified): a driver that
+   * implements `listRetained` may RETAIN, across a stop, exactly these and
+   * nothing else:
+   * - the session's runtime object, stopped (no process, no pod) — a later
+   *   `prepare()` of the same key resumes it rather than allocating anew;
+   * - the session's file bundle (`MountRealization` 'file-snapshot'), owned
+   *   by that object and deleted with it;
+   * - the group's storage (`storage: 'group-volume'`), which is never a
+   *   session resource: it outlives every session and is deleted only by an
+   *   explicit group-level action, never by any session path.
+   * Everything else the key allocated is torn down as before. A retained
+   * object is excluded from `listSessions` (the host treats the key as gone),
+   * reported by `listRetained`, and deleted only when the host names its key
+   * to `reapRetained` (or by manual cleanup). For a driver without
+   * `listRetained` this is full teardown, unchanged.
    */
   stop(reason: string): Promise<void>;
   /**
@@ -262,6 +373,13 @@ export interface SessionHandle {
 export interface DriverCapabilities {
   isolationTiers: ('container' | 'vm')[];
   admissionEnforced: boolean;
+  /**
+   * The MECHANISM this realization would enforce `SessionSpec.network` with:
+   * 'topology' (Docker networks) or 'declarative' (an orchestrator policy
+   * object). It names a mechanism, not an installed policy — a driver that
+   * enforces nothing yet (the kubernetes MVP) still declares the mechanism it
+   * will use; see the honesty note on `SessionSpec.network`.
+   */
   networkPolicy: 'topology' | 'declarative';
   encryptedVolumes: boolean;
   /**
@@ -285,6 +403,73 @@ export interface DriverCapabilities {
    * is a backstop, not the UX.
    */
   auxiliaryContainers: boolean;
+  /**
+   * Whether the agent image carries the install surfaces itself (runner
+   * source, skills — Block D). A driver whose nodes cannot see the install's
+   * checkout declares true, and composition gates on it before the spec is
+   * built: the install-surface host binds (`/app/src`, `/app/skills`) are
+   * never emitted for it — the conformance floor's absence rule, not a
+   * driver-side skip. The surfaces then come from the agent image, or from
+   * `ContainerSpec.surfaceImage` when the install configures one. Stamped
+   * plugins are NOT install surfaces in this sense (per-group code): they
+   * follow `storage`. Absent = false: today's host binds.
+   */
+  imageCarriedSurfaces?: boolean;
+  /**
+   * How this driver realizes mounts. Absent = 'host-bind'.
+   *
+   * - 'host-bind': every `MountSpec` is the host path at `hostPath`, bound
+   *   into the container (Docker). `MountSpec.realization` is never composed.
+   * - 'group-volume': the runtime has no view of the host filesystem. Each
+   *   mount arrives classified (`MountSpec.realization`): group-state
+   *   directories on the group's persistent volume, read-only files as a
+   *   per-session snapshot. Composition refuses everything else loudly
+   *   (`spec-invalid` naming the item) and the same declaration drives every
+   *   gate that follows from "host and runtime share no disk": operator
+   *   `additionalMounts`, non-empty stamped plugins and pond stores are
+   *   refused (empty ones are skipped); the HTTP mailbox transport is
+   *   required (no host mailbox files reach the runtime); message
+   *   attachments are refused in both directions until an attachment
+   *   transport exists; provider state is initialized by the driver
+   *   (`SessionSpec.providerState`) and only for the contracts it lists in
+   *   `providerContracts`.
+   */
+  storage?: 'host-bind' | 'group-volume';
+  /**
+   * The provider host contracts a 'group-volume' driver realizes on group
+   * storage (ruling 8b.1: `claude` in the MVP). Composition refuses a group
+   * whose provider is not listed, naming it — undeclared surfaces must never
+   * go silently unrealized. Ignored for 'host-bind', where the host realizes
+   * every contract itself.
+   */
+  providerContracts?: readonly string[];
+  /**
+   * 'one': at most one session per agent group may be active or starting
+   * (ruling 8b.2 — the group's storage has one writer). Composition then
+   * requires every wiring of the group to route 'agent-shared', refuses
+   * task-series sessions, and spawn admission holds a group-level fence
+   * spanning the old execution's teardown through the new one's start.
+   * Absent = 'many', today's behavior.
+   */
+  sessionsPerGroup?: 'one' | 'many';
+  /**
+   * The runtime cannot see images in the host's local image store and pulls
+   * by reference, so a mutable tag defeats a pre-imported image (`:latest`
+   * implies pull-always on Kubernetes). Composition then refuses the install's
+   * local default image and any `:latest` (or untagged) reference: the group
+   * must pin its `imageTag`. Absent = false.
+   */
+  pinnedImages?: boolean;
+  /**
+   * The address a session realized by this driver uses to reach host-side
+   * services — the mailbox endpoint and the credential gateway (brief
+   * section 5). Composition advertises the mailbox URL on this host, and the
+   * gateway provider rewrites its host alias to it; drivers never see either
+   * URL. Declared from the driver's own install settings (a cluster cannot
+   * resolve Docker's `host.docker.internal`). Absent = each service's
+   * existing default (`host.docker.internal` / the configured URL), unchanged.
+   */
+  hostAddress?: string;
   /**
    * Whether this runtime can rebuild per-group agent images in place
    * (`buildAgentGroupImage` shells `docker build` against the local daemon).
@@ -318,7 +503,9 @@ export interface SessionDriver {
    * observed, so a caller can tell adoptable sessions from corpses WITHOUT a
    * per-handle status() read: a self-exited runtime (an exited container with
    * no teardown in flight) is either excluded or returned with phase
-   * 'terminal' — never dressed up as live.
+   * 'terminal' — never dressed up as live. A retaining driver EXCLUDES its
+   * retained objects (stopped, and prepared-never-started) from this list —
+   * owner-ratified amendment, Block B; they surface via `listRetained`.
    */
   listSessions(installSlug: string): Promise<SessionSnapshot[]>;
   /**
@@ -334,8 +521,54 @@ export interface SessionDriver {
   /**
    * Residue a stopped session could not clean up itself (a host that died
    * between stop and teardown). `stop()` remains full teardown for a live one.
+   * A retaining driver never deletes a retained object here: which retained
+   * objects are residue is a DB question, and only the host can answer it
+   * (`reapRetained`).
    */
   reapResidue?(installSlug: string): Promise<void>;
+  /**
+   * The objects this driver RETAINS across a stop (the Block B amendment on
+   * `SessionHandle.stop`), for this install — everything `listSessions`
+   * deliberately excludes. Rebuilt from labels alone, like `listSessions`.
+   * The host reconciles this against its session rows and hands the keys of
+   * residue to `reapRetained`; it also refuses a group's driver change while
+   * this reports anything for the group. Throws when the runtime cannot be
+   * read — an empty result means "nothing retained", never "unreachable".
+   * Optional: a driver that retains nothing (Docker) omits it.
+   */
+  listRetained?(installSlug: string): Promise<RetainedObject[]>;
+  /**
+   * Delete the retained SESSION objects named by the host — keys whose session
+   * rows the host established are gone or closed. Host-keyed by contract: the
+   * driver never decides which objects are residue. Group storage is never
+   * deleted through this path. Idempotent; an already-absent key is success.
+   */
+  reapRetained?(installSlug: string, keys: SessionKey[]): Promise<void>;
+  /**
+   * The runtime name `prepare()` will give this key, for a driver whose names
+   * derive from the key alone. When present, the host hands it to the gateway
+   * as `containerName` on create, so create and adopt (which passes
+   * `handle.name`) name the same runtime. Absent = the host's composed name.
+   */
+  runtimeName?(key: SessionKey): string;
+}
+
+/**
+ * One object a retaining driver keeps across a stop (`listRetained`).
+ *
+ * - kind 'session': the session's stopped runtime object (and the file bundle
+ *   it owns). `state` 'prepared' = created, never started; 'stopping' = a stop
+ *   was requested and the old execution is not yet gone (it still holds group
+ *   storage — the session fence counts it as active); 'stopped' = idle.
+ * - kind 'group-storage': the group's persistent volume. `key.sessionId` is
+ *   ''. Never reaped by the host; listed so a driver change can see it.
+ */
+export interface RetainedObject {
+  key: SessionKey;
+  /** The runtime object's name, for logs and operator cleanup commands. */
+  name: string;
+  kind: 'session' | 'group-storage';
+  state?: 'prepared' | 'stopping' | 'stopped';
 }
 
 /** Canonical label keys — the adoption contract. A handle must be rebuildable from these alone. */
