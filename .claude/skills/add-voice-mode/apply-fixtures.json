@@ -8,7 +8,20 @@
         "livekit_api_key": "APIFAKEFAKE",
         "livekit_api_secret": "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE",
         "gemini_api_key": "FAKE-gemini-key-0000000000000000",
-        "public_url": "http://localhost:3100"
+        "public_url": "http://localhost:3100",
+        "elevenlabs": "yes",
+        "elevenlabs_api_key": "FAKE-elevenlabs-key-00000000000000"
+      }
+    },
+    {
+      "name": "gemini-only",
+      "inputs": {
+        "livekit_url": "wss://livekit.example.com",
+        "livekit_api_key": "APIFAKEFAKE",
+        "livekit_api_secret": "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE",
+        "gemini_api_key": "FAKE-gemini-key-0000000000000000",
+        "public_url": "http://localhost:3100",
+        "elevenlabs": "no"
       }
     }
   ]

@@ -72,6 +72,8 @@ rm -f src/channels/voice-mode-adapter.test.ts \
   src/channels/voice-mode-review-page.test.ts \
   src/channels/voice-mode-route.test.ts \
   src/channels/voice-mode-route.ts \
+  src/channels/voice-mode-tts-catalog.test.ts \
+  src/channels/voice-mode-tts-catalog.ts \
   src/channels/voice-mode-tts.fixtures.json \
   src/channels/voice-mode.ts \
   src/voice-mode-gemini-live.test.ts \
@@ -115,9 +117,10 @@ worker now uses that entry. Preserve all other scripts and lockfile changes.
 
 ## 5. Remove configuration and rebuild
 
-Privately back up `.env`. Delete this skill's `VOICE_MODE_*` and legacy
-`VOICE_*` entries. Keep `LIVEKIT_*`, `GEMINI_API_KEY` and `JEV_*` values used
-by other integrations. Do not display the file or its values.
+Privately back up `.env`. Delete this skill's `VOICE_MODE_*` entries (the
+provider keys `VOICE_MODE_GEMINI_API_KEY` and `VOICE_MODE_ELEVENLABS_API_KEY`
+included) and legacy `VOICE_*` entries. Keep `LIVEKIT_*`, `GEMINI_API_KEY` and
+`JEV_*` values used by other integrations. Do not display the file or its values.
 
 ```bash
 pnpm run build

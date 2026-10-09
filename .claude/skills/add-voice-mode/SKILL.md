@@ -60,6 +60,8 @@ src/channels/voice-mode-registration.test.ts
 src/channels/voice-mode-review-page.test.ts
 src/channels/voice-mode-route.test.ts
 src/channels/voice-mode-route.ts
+src/channels/voice-mode-tts-catalog.test.ts
+src/channels/voice-mode-tts-catalog.ts
 src/channels/voice-mode-tts.fixtures.json
 src/channels/voice-mode.ts
 src/voice-mode-gemini-live.test.ts
@@ -148,9 +150,10 @@ source-hash test must pass.
 
 ## Connect
 
-Ask for the LiveKit signaling URL, API key and secret, and Gemini key. Reuse
-existing values; secret values go directly into `.env`, never into logs,
-agent messages or a report. Do not export the whole file to worker children.
+Ask for the LiveKit signaling URL, API key and secret, the Gemini key, and
+whether to offer ElevenLabs voices too (its key is optional). Reuse existing
+values; secret values go directly into `.env`, never into logs, agent messages
+or a report. Do not export the whole file to worker children.
 
 ```nc:prompt livekit_url validate:^wss?://\S+$ normalize:trim
 What is the LiveKit signaling URL reachable by the caller?
@@ -168,12 +171,27 @@ Supply the LiveKit API secret.
 Supply a Gemini API key with transcription and speech access.
 ```
 
+```nc:prompt elevenlabs validate:^(yes|no)$ normalize:lower
+Offer ElevenLabs voices to the lines as well? Answer yes or no.
+```
+
+```nc:prompt elevenlabs_api_key secret validate:^\S{20,}$ normalize:trim when:elevenlabs=yes
+Supply an ElevenLabs API key with text-to-speech and voices read access.
+```
+
 ```nc:env-set
 LIVEKIT_URL={{livekit_url}}
 LIVEKIT_API_KEY={{livekit_api_key}}
 LIVEKIT_API_SECRET={{livekit_api_secret}}
-GEMINI_API_KEY={{gemini_api_key}}
+VOICE_MODE_GEMINI_API_KEY={{gemini_api_key}}
 ```
+
+```nc:env-set when:elevenlabs=yes
+VOICE_MODE_ELEVENLABS_API_KEY={{elevenlabs_api_key}}
+```
+
+An existing `GEMINI_API_KEY` is still read as `VOICE_MODE_GEMINI_API_KEY`, with
+a warning; rename it when convenient.
 
 The page listens on `127.0.0.1:3100` (`VOICE_MODE_PORT`, and
 `VOICE_MODE_PAGE_HOST` for another bind address), and also under `/voice` on
@@ -296,9 +314,7 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_LANGUAGES` | `uk-UA,en-US` | Up to four language hints, first is primary. Agent language guidance follows them; the worker's own notices start in the first one and use Ukrainian only when it is listed. |
 | `VOICE_MODE_STT_MODEL` | `gemini-3.5-transcribe-live` | Own Gemini Live pipeline, one manual activity per caller turn. |
 | `VOICE_MODE_STT_FALLBACK_MODEL` | ignored | Deprecated unary fallback; the next turn retries Live. |
-| `VOICE_MODE_TTS_MODEL` | `gemini-3.8-flash-tts` | Reply speech model. |
-| `VOICE_MODE_TTS_FALLBACK_MODEL` | `gemini-3.8-flash-lite-tts` | Pre-audio fallback; `off` disables it. No replay after partial speech. |
-| `VOICE_MODE_TTS_VOICE` | `Alnilam` | Speech voice. |
+| `VOICE_MODE_ELEVENLABS_API_KEY` | empty | Offers ElevenLabs voices to the lines; without it only Gemini speaks. |
 | `VOICE_MODE_SILENCE_MS` | `2500` | Closing silence, valid range 300 to 30000 milliseconds. |
 | `VOICE_MODE_MIRROR` | `telegram` | Fallback call-chat channel; `off` disables fallback. |
 | `VOICE_MODE_VOCABULARY` | empty | Comma-separated names, merged with the agent's `voice.vocabulary.txt`. |
@@ -311,6 +327,22 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`. |
 | `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | Worker health on loopback. |
 | `VOICE_MODE_UI` | empty | Page options: skin, colorway, layout, presence, brand, footer, shortcuts, timestamps, colorwayPicker. |
+
+**Voice per line.** Each line speaks with its own saved provider, model and
+voice; unset fields take the provider's default (Gemini `gemini-3.8-flash-tts`,
+`Alnilam`). A Gemini line falls back to `gemini-3.8-flash-lite-tts` before any
+audio; nothing is replayed after partial speech. With the line's link token:
+`GET /voice/tts?t=<token>` answers the saved and effective choice and every
+provider with its models, defaults and whether its key is set.
+`PATCH /voice/tts?t=<token>` with `{"provider":"gemini","voice":"<id>"}`
+(`model` optional) or `{"reset":true}` saves it for the line's next calls; it
+needs the line's caller to still hold an owner or admin role, and a provider
+without its key answers 503. `GET /voice/voices?t=<token>&provider=gemini`
+(or `elevenlabs`, with optional `q`, `language`, `cursor` and `limit` up to
+100) pages the provider's voices: Gemini's list is cached on the host for an
+hour and filtered there, ElevenLabs pages are proxied. A running call keeps its
+voice; a client switches it mid-call through the worker's `settings` RPC.
+Provider keys never leave the host and worker.
 
 `LIVEKIT_WORKER_URL` selects the worker/API-side LiveKit URL; default is
 `LIVEKIT_URL`. `LIVEKIT_HOST_URL` is the worker's loopback host webhook origin;
@@ -378,6 +410,8 @@ Remove via [REMOVE.md](REMOVE.md).
 - No worker: check the worker unit, LiveKit signaling, host loopback URL and
   matching dispatch name. Its health port is separate from the host's.
 - No media: check LiveKit UDP/TURN reachability and browser microphone permission.
+- Provider unavailable: a voice route or switch names a provider without its
+  `VOICE_MODE_<PROVIDER>_API_KEY`; set it and restart the host and worker.
 - Call stops in background: compare Safari with Home Screen web-app behavior;
   native media/background support is outside this browser skill.
 - Slow first answer: prewarm needs an existing session; a first-ever chat turn
