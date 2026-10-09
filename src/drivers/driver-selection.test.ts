@@ -508,7 +508,7 @@ describe('composition on the spawn path', () => {
     expect(context.mailbox.url.startsWith(`http://${FIXTURE_GROUP_VOLUME_CAPABILITIES.hostAddress}:`)).toBe(true);
   });
 
-  it('a host-address capability bypasses gateway proxying on the real spawn path', async () => {
+  it('every driver bypasses gateway proxying on the real spawn path', async () => {
     const gatewayEnv = {
       HTTP_PROXY: 'http://remote-gateway:15001',
       HTTPS_PROXY: 'http://remote-gateway:15001',
@@ -545,7 +545,15 @@ describe('composition on the spawn path', () => {
     await setContainerConfigDriver(GROUP_ID, hostBind.kind);
     const dockerRow = await createGroupSession({ id: 'sess-driver-selection-2' });
     expect(await wakeAndRefusal(dockerRow)).toBeUndefined();
-    expect(JSON.stringify(hostBind.prepared[0].containers[0].contributedEnv)).toBe(JSON.stringify(gatewayEnv));
+    const context = JSON.parse(
+      fs.readFileSync(path.join(DATA_DIR, 'v2-sessions', GROUP_ID, '.context', `${dockerRow.id}.json`), 'utf8'),
+    ) as { mailbox: { url: string } };
+    const dockerBypass = `localhost,internal,${new URL(context.mailbox.url).hostname}`;
+    expect(hostBind.prepared[0].containers[0].contributedEnv).toEqual({
+      ...gatewayEnv,
+      NO_PROXY: dockerBypass,
+      no_proxy: dockerBypass,
+    });
   });
 
   it('a group with NO driver field composes exactly what it did before: host binds, no realization data', async () => {

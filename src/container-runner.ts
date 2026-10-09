@@ -2131,15 +2131,18 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     ...(contribution.env ?? {}),
     ...(gateway.env ?? {}),
   };
-  if (input.hostAddress) {
-    // Mailbox traffic must reach the driver host directly, even with a remote gateway.
+  const hasProxy = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'].some(
+    (key) => (contributedEnv[key] ?? env[key]) !== undefined,
+  );
+  if (hasProxy && (input.hostAddress || input.mailboxUrl)) {
+    // Mailbox traffic must reach the host directly, even with a remote gateway.
     const bypass = new Set(
       [env.NO_PROXY, env.no_proxy, contributedEnv.NO_PROXY, contributedEnv.no_proxy]
         .flatMap((value) => value?.split(',') ?? [])
         .map((host) => host.trim())
         .filter(Boolean),
     );
-    bypass.add(input.hostAddress);
+    if (input.hostAddress) bypass.add(input.hostAddress);
     if (input.mailboxUrl) bypass.add(new URL(input.mailboxUrl).hostname);
     contributedEnv.NO_PROXY = contributedEnv.no_proxy = [...bypass].join(',');
   }

@@ -108,6 +108,7 @@ function compose(
   overrides: {
     hostAddress?: string;
     mailboxUrl?: string;
+    mailboxEnvironment?: Record<string, string>;
     gateway?: Record<string, unknown>;
     contribution?: Record<string, unknown>;
     containerConfig?: ContainerConfig;
@@ -119,7 +120,7 @@ function compose(
     containerName: 'nanoclaw-v2-agent-one-1700000000000',
     mounts,
     containerConfig: overrides.containerConfig ?? containerConfig,
-    mailboxEnvironment: { NANOCLAW_MAILBOX_BACKEND: 'sqlite' },
+    mailboxEnvironment: overrides.mailboxEnvironment ?? { NANOCLAW_MAILBOX_BACKEND: 'sqlite' },
     hostAddress: overrides.hostAddress,
     mailboxUrl: overrides.mailboxUrl,
     contribution: (overrides.contribution ?? {}) as never,
@@ -178,13 +179,49 @@ describe('composeSessionSpec', () => {
     });
   });
 
-  it('keeps Docker env byte-identical without a declared host address', () => {
-    const gatewayEnv = { ...proxyEnv, NO_PROXY: 'localhost, internal', no_proxy: 'different' };
-    const baseline = compose();
-    const spec = compose({ mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1', gateway: { env: gatewayEnv } });
-    expect(JSON.stringify(spec.containers[0].env)).toBe(JSON.stringify(baseline.containers[0].env));
-    expect(JSON.stringify(spec.containers[0].contributedEnv)).toBe(JSON.stringify(gatewayEnv));
-    expect(compose({ gateway: { env: proxyEnv } }).containers[0].contributedEnv).toEqual(proxyEnv);
+  it.each(['host.docker.internal', '172.17.0.1', 'mailbox.internal'])(
+    'exempts the resolved Docker mailbox host %s without a declared host address',
+    (host) => {
+      const gatewayEnv = { ...proxyEnv, NO_PROXY: 'localhost, internal', no_proxy: 'internal,different' };
+      const spec = compose({ mailboxUrl: `http://${host}:3010/mailbox/v1`, gateway: { env: gatewayEnv } });
+      expect(spec.containers[0].contributedEnv).toEqual({
+        ...gatewayEnv,
+        NO_PROXY: `localhost,internal,different,${host}`,
+        no_proxy: `localhost,internal,different,${host}`,
+      });
+    },
+  );
+
+  it.each(['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'])(
+    'detects %s from every composed env source',
+    (key) => {
+      for (const source of ['gateway', 'contribution', 'mailboxEnvironment']) {
+        const proxy = { [key]: 'http://remote-gateway:15001' };
+        const spec = compose({
+          mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
+          [source]: source === 'mailboxEnvironment' ? proxy : { env: proxy },
+        });
+        expect(spec.containers[0].contributedEnv).toMatchObject({
+          NO_PROXY: 'host.docker.internal',
+          no_proxy: 'host.docker.internal',
+        });
+      }
+    },
+  );
+
+  it('keeps env byte-identical without proxy variables for every driver', () => {
+    for (const hostAddress of [undefined, '0.250.250.254']) {
+      for (const gatewayEnv of [{}, { NO_PROXY: 'localhost, internal', no_proxy: 'different' }]) {
+        const baseline = compose({ gateway: { env: gatewayEnv } });
+        const spec = compose({
+          hostAddress,
+          mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
+          gateway: { env: gatewayEnv },
+        });
+        expect(JSON.stringify(spec.containers[0].env)).toBe(JSON.stringify(baseline.containers[0].env));
+        expect(JSON.stringify(spec.containers[0].contributedEnv)).toBe(JSON.stringify(gatewayEnv));
+      }
+    }
   });
 
   it('carries gateway lineage without overriding reserved host labels', () => {
