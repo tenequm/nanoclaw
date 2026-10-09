@@ -13,6 +13,7 @@ import {
   ensureSessionRuntimesReady,
   resumeGatewaySessionAdmission,
   stopGatewaySessionsForUnavailability,
+  stopRuntimeReconciliation,
 } from './container-runner.js';
 import { closeDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
@@ -228,6 +229,8 @@ async function main(): Promise<void> {
 async function shutdown(signal: string): Promise<void> {
   log.info('Shutdown signal received', { signal });
   hostAbortController.abort();
+  // Before any observer or sweep stops: no late adoption may register after them.
+  await stopRuntimeReconciliation();
   stopGatewayAvailabilityMonitor?.();
   await stopGatewayApprovalCoordinator();
   await abortGatewaySessionObservers();
