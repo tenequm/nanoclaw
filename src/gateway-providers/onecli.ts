@@ -118,18 +118,39 @@ function monitorLease(signal: AbortSignal): Pick<GatewaySessionLease, 'onUnavail
   };
 }
 
+/** The host alias every OneCLI-served URL is written against: Docker's name for the host. */
+const DOCKER_HOST_ALIAS = 'host.docker.internal';
+
+/**
+ * Point a contribution at the host address the selected runtime declares
+ * (`capabilities.hostAddress`): a pod cannot resolve Docker's host alias, so
+ * every URL the gateway hands out would be unreachable from it. Only the
+ * hostname changes — scheme, credentials-in-URL placeholders, port and path
+ * stay byte-for-byte. A runtime that declares nothing keeps the contribution
+ * exactly as OneCLI shaped it.
+ */
+export function withHostAddress(contribution: OneCLIContribution, hostAddress?: string): OneCLIContribution {
+  if (!hostAddress || !contribution.env) return contribution;
+  const host = hostAddress.includes(':') ? `[${hostAddress}]` : hostAddress;
+  const env = Object.fromEntries(
+    Object.entries(contribution.env).map(([key, value]) => [key, value.replaceAll(DOCKER_HOST_ALIAS, host)]),
+  );
+  return { ...contribution, env };
+}
+
 async function ensureSession(input: GatewaySessionInput, signal: AbortSignal): Promise<GatewaySessionLease> {
   // The OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   await onecli.ensureAgent({ name: input.groupName, identifier: input.key.agentGroupId });
   const config = await onecli.getContainerConfig({ agent: input.key.agentGroupId });
   log.info('OneCLI gateway applied', { agentGroupId: input.key.agentGroupId, sessionId: input.key.sessionId });
+  const hostAddress = input.capabilities.hostAddress;
   return {
     ...monitorLease(signal),
     contribution: {
-      ...withProviderEnv(contributionFromConfig(config, input.key.agentGroupId)),
+      ...withHostAddress(withProviderEnv(contributionFromConfig(config, input.key.agentGroupId)), hostAddress),
       networkAccess: {
-        endpoint: 'host.docker.internal',
+        endpoint: hostAddress || DOCKER_HOST_ALIAS,
         target: { kind: 'runtime', identity: gatewayContainer },
       },
     },

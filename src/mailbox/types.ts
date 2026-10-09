@@ -170,13 +170,23 @@ export interface OutboundMailbox {
 
 export interface MailboxSession extends InboundMailbox, OutboundMailbox {}
 
+export interface RunnerContextOptions {
+  hostAddress?: string;
+}
+
 export interface AgentMailbox {
   /** True only when this implementation already owns storage for the key. Must not provision it. */
   exists(key: MailboxSessionKey): Promise<boolean>;
   /** Authorize/provision this implementation's storage for a later session(). */
   prepare(key: MailboxSessionKey): void;
   destroy(key: MailboxSessionKey): Promise<void>;
-  runnerContext(key: MailboxSessionKey): Promise<unknown>;
+  /**
+   * The runner's mailbox selection for one spawn. `options.hostAddress` is the
+   * address the session's runtime reaches the host on (the selected driver's
+   * `capabilities().hostAddress`); a network transport advertises its endpoint
+   * there instead of its install-wide default. Absent = today's URL.
+   */
+  runnerContext(key: MailboxSessionKey, options?: RunnerContextOptions): Promise<unknown>;
   /** Non-secret runner configuration only; never credentials, authorization material, or identity. */
   runnerEnvironment(key: MailboxSessionKey): Promise<Record<string, string>>;
   /**

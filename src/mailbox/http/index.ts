@@ -22,7 +22,7 @@ import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
 import { SqliteAgentMailbox } from '../sqlite/index.js';
 import { sessionMailboxDir, sessionMailboxPath } from '../sqlite/paths.js';
-import type { AgentMailbox, MailboxSession, MailboxSessionKey } from '../types.js';
+import type { AgentMailbox, MailboxSession, MailboxSessionKey, RunnerContextOptions } from '../types.js';
 import { createMailboxHttpServer, MAILBOX_HTTP_PATH, MAILBOX_HTTP_PROTOCOL } from './server.js';
 
 const SETTINGS = [
@@ -120,6 +120,17 @@ export function readMailboxHttpSettings(env: NodeJS.ProcessEnv = process.env): M
   };
 }
 
+/**
+ * The base URL a session's runtime reaches the endpoint on. A runtime that
+ * declares its own host address (a cluster cannot resolve Docker's
+ * `host.docker.internal`) gets that host on the configured port; everything
+ * else keeps the install-wide URL, exactly as before per-driver resolution.
+ */
+export function advertisedBase(settings: Pick<MailboxHttpSettings, 'url' | 'port'>, hostAddress?: string): string {
+  if (!hostAddress) return settings.url;
+  return `http://${hostAddress.includes(':') ? `[${hostAddress}]` : hostAddress}:${settings.port}`;
+}
+
 const tokenId = (key: MailboxSessionKey) => `${key.agentGroupId}/${key.sessionId}`;
 
 /** Host-only token file: outside the session directory the container mounts read-write. */
@@ -163,7 +174,7 @@ export class HttpServedAgentMailbox implements AgentMailbox {
    * A fresh token per spawn: the newest container of a session is the only one
    * the endpoint accepts, so a container the host replaced is fenced out.
    */
-  async runnerContext(key: MailboxSessionKey): Promise<HttpRunnerContext | null> {
+  async runnerContext(key: MailboxSessionKey, options: RunnerContextOptions = {}): Promise<HttpRunnerContext | null> {
     if (this.settings.transport === 'sqlite') return this.delegate.runnerContext(key);
     const token = randomBytes(32).toString('hex');
     const file = tokenPath(key);
@@ -173,7 +184,7 @@ export class HttpServedAgentMailbox implements AgentMailbox {
     return {
       transport: 'http',
       protocol: MAILBOX_HTTP_PROTOCOL,
-      url: `${this.settings.url}${MAILBOX_HTTP_PATH}`,
+      url: `${advertisedBase(this.settings, options.hostAddress)}${MAILBOX_HTTP_PATH}`,
       token,
     };
   }
