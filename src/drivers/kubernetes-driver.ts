@@ -15,6 +15,7 @@ import {
   asFailureError,
   deniedByPolicy,
   isGatewayOwned,
+  labelValueLegal,
   labelsForKey,
   specInvalid,
   validateSpec,
@@ -41,6 +42,9 @@ export const STARTED_ONCE = 'nanoclaw.dev/started-once';
 const LAST_POD_UID = 'nanoclaw.dev/last-pod-uid';
 const SPEC_UPDATED = 'nanoclaw.dev/spec-updated-at';
 export const SECRET_LIMIT_BYTES = 1024 * 1024;
+const SECRET_LIMIT_MESSAGE = `per-session Secret exceeds the 1 MiB (${SECRET_LIMIT_BYTES} bytes) limit`;
+const GROUP_PVC_SIZE = '20Gi';
+const installSelector = (installSlug: string): string => `${LABELS.install}=${projectLabelValue(installSlug)}`;
 
 export interface Sandbox extends k8s.KubernetesObject {
   metadata: k8s.V1ObjectMeta;
@@ -70,7 +74,7 @@ const SETTINGS = [
   'NANOCLAW_KUBERNETES_HOST_ADDRESS',
 ] as const;
 
-export function kubernetesSettings(env: NodeJS.ProcessEnv = process.env): Partial<KubernetesDriverOptions> {
+function kubernetesSettings(env: NodeJS.ProcessEnv = process.env): Partial<KubernetesDriverOptions> {
   const file = readEnvFile([...SETTINGS]);
   const read = (key: (typeof SETTINGS)[number]) => env[key]?.trim() || file[key]?.trim() || undefined;
   return {
@@ -220,6 +224,14 @@ function safeRelative(value: string): boolean {
 
 function validateKubernetesSpec(spec: SessionSpec, policy: MountPolicy, caps: DriverCapabilities): void {
   validateSpec(spec, policy, caps);
+  // Key labels are the adoption contract and must round-trip verbatim; a projected one never matches its key.
+  const projected = Object.entries(spec.key).find(([, value]) => !labelValueLegal(value));
+  if (projected) {
+    throw specInvalid(
+      `session key ${projected[0]} '${projected[1]}' is not a legal Kubernetes label value` +
+        (projected[0] === 'installSlug' ? ' (check NANOCLAW_INSTALL_ID)' : ''),
+    );
+  }
   if (spec.containers.length !== 1) throw specInvalid('kubernetes does not support auxiliary containers');
   if (spec.network === 'none') throw specInvalid('kubernetes MVP cannot realize network: none');
   const agent = spec.containers[0];
@@ -241,7 +253,8 @@ function validateKubernetesSpec(spec: SessionSpec, policy: MountPolicy, caps: Dr
       );
   }
   for (const state of spec.providerState ?? []) {
-    if (state.provider !== 'claude') throw specInvalid(`unsupported provider contract '${state.provider}'`);
+    if (!caps.providerContracts?.includes(state.provider))
+      throw specInvalid(`unsupported provider contract '${state.provider}'`);
     if (
       !safeRelative(state.subPath) ||
       state.createIfMissing.some((f) => !safeRelative(f.relativePath)) ||
@@ -279,16 +292,15 @@ export function sandboxManifest(spec: SessionSpec, namespace: string): Sandbox {
       readOnly: mount.mode === 'ro',
     });
   }
+  const surfaceMounts: k8s.V1VolumeMount[] = (agent.surfaceImage?.mounts ?? []).map((m) => ({
+    name: 'surfaces',
+    mountPath: m.containerPath,
+    subPath: m.imagePath,
+    readOnly: true,
+  }));
   if (agent.surfaceImage) {
     volumes.push({ name: 'surfaces', image: { reference: agent.surfaceImage.image, pullPolicy: 'IfNotPresent' } });
-    volumeMounts.push(
-      ...agent.surfaceImage.mounts.map((m) => ({
-        name: 'surfaces',
-        mountPath: m.containerPath,
-        subPath: m.imagePath,
-        readOnly: true,
-      })),
-    );
+    volumeMounts.push(...surfaceMounts);
   }
   volumes.push({ name: 'shm', emptyDir: { medium: 'Memory', sizeLimit: `${spec.resources.shmSizeMb ?? 64}Mi` } });
   volumeMounts.push({ name: 'shm', mountPath: '/dev/shm' });
@@ -300,16 +312,7 @@ export function sandboxManifest(spec: SessionSpec, namespace: string): Sandbox {
   const limits: Record<string, string> = {};
   if (spec.resources.memoryMb !== undefined) limits.memory = `${spec.resources.memoryMb}Mi`;
   if (spec.resources.cpus !== undefined) limits.cpu = spec.resources.cpus;
-  const initMounts: k8s.V1VolumeMount[] = [{ name: 'group-state', mountPath: '/ncl-state' }];
-  if (agent.surfaceImage)
-    initMounts.push(
-      ...agent.surfaceImage.mounts.map((m) => ({
-        name: 'surfaces',
-        mountPath: m.containerPath,
-        subPath: m.imagePath,
-        readOnly: true,
-      })),
-    );
+  const initMounts: k8s.V1VolumeMount[] = [{ name: 'group-state', mountPath: '/ncl-state' }, ...surfaceMounts];
   const initData = {
     directories: agent.mounts.flatMap((m) => (m.realization?.kind === 'group-volume' ? [m.realization.subPath] : [])),
     states: spec.providerState ?? [],
@@ -524,7 +527,7 @@ export class KubernetesSessionDriver implements SessionDriver {
       return (await (
         await this.api()
       ).custom.listNamespacedCustomObject(
-        { ...this.params(installSlug), labelSelector: `${LABELS.install}=${projectLabelValue(installSlug)}` },
+        { ...this.params(installSlug), labelSelector: installSelector(installSlug) },
         this.requestOptions(),
       )) as k8s.KubernetesListObject<Sandbox>;
     } catch (error) {
@@ -610,7 +613,7 @@ export class KubernetesSessionDriver implements SessionDriver {
                       [LABELS.group]: spec.key.agentGroupId,
                     }),
                   },
-                  spec: { accessModes: ['ReadWriteOnce'], resources: { requests: { storage: '20Gi' } } },
+                  spec: { accessModes: ['ReadWriteOnce'], resources: { requests: { storage: GROUP_PVC_SIZE } } },
                 },
               },
               this.requestOptions(),
@@ -675,8 +678,7 @@ export class KubernetesSessionDriver implements SessionDriver {
         try {
           const stat = await file.stat();
           if (!stat.isFile()) throw specInvalid(`file-snapshot '${mount.containerPath}' requires a regular file`);
-          if (stat.size + total > SECRET_LIMIT_BYTES)
-            throw specInvalid('per-session Secret exceeds the 1 MiB (1048576 bytes) limit');
+          if (stat.size + total > SECRET_LIMIT_BYTES) throw specInvalid(SECRET_LIMIT_MESSAGE);
           bytes = await file.readFile();
         } finally {
           await file.close();
@@ -686,7 +688,7 @@ export class KubernetesSessionDriver implements SessionDriver {
         throw specInvalid(`cannot snapshot regular file '${mount.containerPath}'`);
       }
       total += bytes.length;
-      if (total > SECRET_LIMIT_BYTES) throw specInvalid('per-session Secret exceeds the 1 MiB (1048576 bytes) limit');
+      if (total > SECRET_LIMIT_BYTES) throw specInvalid(SECRET_LIMIT_MESSAGE);
       data[`file-${index}`] = bytes.toString('base64');
     }
     if (!box.metadata.uid) throw asFailureError({ kind: 'runtime-unavailable', retryable: true });
@@ -966,7 +968,7 @@ export class KubernetesSessionDriver implements SessionDriver {
       ).core.listNamespacedPod(
         {
           namespace: this.namespace(installSlug),
-          labelSelector: `${LABELS.install}=${projectLabelValue(installSlug)}`,
+          labelSelector: installSelector(installSlug),
         },
         this.requestOptions(),
       );
@@ -1002,7 +1004,7 @@ export class KubernetesSessionDriver implements SessionDriver {
       );
       const { core } = await this.api();
       const namespace = this.namespace(installSlug);
-      const selector = `${LABELS.install}=${projectLabelValue(installSlug)}`;
+      const selector = installSelector(installSlug);
       const [pvcs, pods] = await Promise.all([
         core.listNamespacedPersistentVolumeClaim({ namespace, labelSelector: selector }, this.requestOptions()),
         core.listNamespacedPod({ namespace, labelSelector: selector }, this.requestOptions()),
@@ -1100,7 +1102,7 @@ export class KubernetesSessionDriver implements SessionDriver {
     const pods = await (
       await this.api()
     ).core.listNamespacedPod(
-      { namespace: this.namespace(installSlug), labelSelector: `${LABELS.install}=${projectLabelValue(installSlug)}` },
+      { namespace: this.namespace(installSlug), labelSelector: installSelector(installSlug) },
       this.requestOptions(),
     );
     const byName = new Map(pods.items.map((pod) => [pod.metadata?.name, pod]));
@@ -1138,8 +1140,8 @@ export class KubernetesSessionDriver implements SessionDriver {
     for (const subscriber of watch.subscribers) {
       try {
         subscriber(event);
-      } catch {
-        log.warn('Kubernetes session watch subscriber failed');
+      } catch (err) {
+        log.warn('Kubernetes session watch subscriber failed', { err });
       }
     }
   }
@@ -1151,7 +1153,7 @@ export class KubernetesSessionDriver implements SessionDriver {
       if (!watch.informer) {
         const { config } = await this.api();
         if (watch.stopped) return;
-        const selector = `${LABELS.install}=${projectLabelValue(installSlug)}`;
+        const selector = installSelector(installSlug);
         watch.informer = (this.opts.informerFactory ?? this.library!.makeInformer<Sandbox>)(
           config,
           `/apis/${GROUP}/${VERSION}/namespaces/${this.namespace(installSlug)}/${PLURAL}`,

@@ -5,12 +5,13 @@
  * `docker` — so an install that never sets it behaves exactly as it did before
  * the seam existed. It is the INSTALL default: a group may name another kind
  * in `container_configs.driver` (ratified D1), resolved per group by
- * `sessionDriverForGroup`, one memoized instance per kind. Nothing above this module may branch on the driver's
- * identity: features gate on `capabilities()`, never on `kind`.
+ * `sessionDriverForGroup`, one memoized instance per kind. Nothing above this
+ * module may branch on the driver's identity: features gate on
+ * `capabilities()`, never on `kind`.
  *
  * Selection is a registry, not a switch. Drivers self-register by kind; this
- * module pre-registers `docker`, the only realization that ships here. An
- * overlay adds its own with one `registerSessionDriver(...)` call and one
+ * module pre-registers `docker`; every other driver (the in-tree `kubernetes`
+ * included) registers through `installed.ts`. An overlay adds its own with one `registerSessionDriver(...)` call and one
  * appended import — the same shape as the provider container-config barrel
  * (`src/providers/index.ts`) and the session-egress factory. Nothing outside
  * this file has to be rewritten to install a driver, so an overlay never has to
@@ -190,7 +191,7 @@ export function assertGroupDriverKindRegistered(kind: DriverKind, subject: strin
   throw new Error(
     `${subject} selects driver '${kind}' (container_configs.driver) but no driver is registered for '${kind}'; ` +
       `installed: ${listSessionDriverKinds().join(', ')}. ` +
-      'Install the driver skill, or return the group to the install default with `--driver ""`.',
+      'Install (or reinstall) the driver skill; a group moves off a driver only once that driver can be read.',
   );
 }
 

@@ -149,13 +149,19 @@ export async function getContainerConfigDriver(agentGroupId: string): Promise<st
 }
 
 /**
- * Set (or clear, with null) a group's runtime kind and record it as used. The
- * caller owns the refusal rules (registered kind, no live or retained objects
- * on the old driver); this only writes.
+ * Set (or clear, with null) a group's runtime kind, with any other scalar
+ * `updates` in the same write. The caller owns the refusal rules (registered
+ * kind, no live or retained objects on the old driver). The kind is recorded
+ * as used first: a recorded kind with no group is harmless, a configured kind
+ * missing from the record could escape discovery once the group moves off it.
  */
-export async function setContainerConfigDriver(agentGroupId: string, driver: string | null): Promise<void> {
-  await updateContainerConfigScalars(agentGroupId, { driver });
+export async function setContainerConfigDriver(
+  agentGroupId: string,
+  driver: string | null,
+  updates: Parameters<typeof updateContainerConfigScalars>[1] = {},
+): Promise<void> {
   if (driver) await recordDriverKindsUsed([driver]);
+  await updateContainerConfigScalars(agentGroupId, { ...updates, driver });
 }
 
 /** Add kinds to the kinds-ever-used record (migration 029). Never removes. */

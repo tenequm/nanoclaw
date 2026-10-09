@@ -34,7 +34,7 @@ const NODE = 'nanoclaw-dev-control-plane';
 const CRD = 'sandboxes.agents.x-k8s.io';
 const RESOURCE = 'sandboxes.agents.x-k8s.io';
 const MANIFEST = '/etc/kubernetes/manifests/kube-apiserver.yaml';
-const MOVED_MANIFEST = '/tmp/nanoclaw-b2-kube-apiserver.yaml';
+const MOVED_MANIFEST = '/tmp/nanoclaw-conf-kube-apiserver.yaml';
 const ENABLED = process.env.NANOCLAW_CONFORMANCE_KUBERNETES === '1';
 const digest = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
 const delay = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
@@ -353,8 +353,8 @@ export function registerKubernetesConformance(): void {
         throw new Error('explicit non-default NANOCLAW_CONFORMANCE_KUBECONFIG required');
       }
       kubeconfig = resolve(supplied);
-      root = await mkdtemp(join(tmpdir(), 'nanoclaw-b2-'));
-      namespace = `nanoclaw-b2-${randomBytes(5).toString('hex')}`;
+      root = await mkdtemp(join(tmpdir(), 'nanoclaw-conf-'));
+      namespace = `nanoclaw-conf-${randomBytes(5).toString('hex')}`;
       const exported = join(root, 'kind.kubeconfig');
       await command('kind', ['export', 'kubeconfig', '--name', 'nanoclaw-dev', '--kubeconfig', exported]);
       const view = (file: string): Promise<string> =>
@@ -401,7 +401,7 @@ export function registerKubernetesConformance(): void {
         gatewayTrustRoot: join(root, 'data/gateway-trust'),
       };
       spec = fixtureGroupVolumeSpec({
-        key: { installSlug: `b2-${namespace.slice(-10)}-${++serial}`, agentGroupId: 'g1', sessionId: 's1' },
+        key: { installSlug: `conf-${namespace.slice(-10)}-${++serial}`, agentGroupId: 'g1', sessionId: 's1' },
         resources: { memoryMb: 256, cpus: '0.5', shmSizeMb: 64 },
       });
       spec.containers[0].image = image;
@@ -547,7 +547,7 @@ export function registerKubernetesConformance(): void {
         expect(mount.subPath).toBe(surface.imagePath);
         expect(mount.readOnly).toBe(true);
         expect(actual.volumes!.find((entry) => entry.name === mount.name)?.image?.reference).toBe(surfaceImage);
-        await expect(exec(handle, ['touch', `${surface.containerPath}/b2-write-probe`])).rejects.toThrow(
+        await expect(exec(handle, ['touch', `${surface.containerPath}/conf-write-probe`])).rejects.toThrow(
           /Read-only file system/,
         );
       }
@@ -870,7 +870,7 @@ export function registerKubernetesConformance(): void {
       await podGone(handle);
       await writeSnapshots(2);
       expect(digest(await readFile(contextMount.hostPath)) === oldContext).toBe(false);
-      const alternate = `${image}-b2-${namespace.slice(-10)}`;
+      const alternate = `${image}-conf-${namespace.slice(-10)}`;
       await command('docker', ['exec', NODE, 'ctr', '-n', 'k8s.io', 'images', 'tag', image, alternate]);
       try {
         spec.containers[0].image = alternate;
@@ -1093,7 +1093,7 @@ export function registerKubernetesConformance(): void {
     }, 60_000);
 
     it('maps forced ErrImagePull to image-unavailable', async () => {
-      spec.containers[0].image = '127.0.0.1:1/nanoclaw-missing:b2';
+      spec.containers[0].image = '127.0.0.1:1/nanoclaw-missing:conf';
       const handle = await driver.prepare(spec);
       await expect(handle.start()).rejects.toMatchObject({ kind: 'image-unavailable', retryable: true });
       const pod = (await get('pod', handle.name))!;
@@ -1116,7 +1116,7 @@ export function registerKubernetesConformance(): void {
     }, 60_000);
 
     it('gateway-owned sessionless objects are exempt from discovery and every sweep', async () => {
-      const gateway = 'ncl-b2-gateway';
+      const gateway = 'ncl-conf-gateway';
       await apply({
         apiVersion: 'agents.x-k8s.io/v1beta1',
         kind: 'Sandbox',

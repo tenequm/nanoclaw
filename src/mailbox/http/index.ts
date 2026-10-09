@@ -115,20 +115,23 @@ export function readMailboxHttpSettings(env: NodeJS.ProcessEnv = process.env): M
       // through Docker's host.docker.internal name.
       const host = resolveBind();
       const advertised = host === '127.0.0.1' || host === '0.0.0.0' || host === '::' ? 'host.docker.internal' : host;
-      return `http://${advertised.includes(':') ? `[${advertised}]` : advertised}:${port}`;
+      return httpBase(advertised, port);
     },
   };
+}
+
+function httpBase(host: string, port: number): string {
+  return `http://${host.includes(':') ? `[${host}]` : host}:${port}`;
 }
 
 /**
  * The base URL a session's runtime reaches the endpoint on. A runtime that
  * declares its own host address (a cluster cannot resolve Docker's
- * `host.docker.internal`) gets that host on the configured port; everything
- * else keeps the install-wide URL, exactly as before per-driver resolution.
+ * `host.docker.internal`) gets that host on the configured port; every other
+ * one gets the install-wide URL.
  */
 export function advertisedBase(settings: Pick<MailboxHttpSettings, 'url' | 'port'>, hostAddress?: string): string {
-  if (!hostAddress) return settings.url;
-  return `http://${hostAddress.includes(':') ? `[${hostAddress}]` : hostAddress}:${settings.port}`;
+  return hostAddress ? httpBase(hostAddress, settings.port) : settings.url;
 }
 
 const tokenId = (key: MailboxSessionKey) => `${key.agentGroupId}/${key.sessionId}`;

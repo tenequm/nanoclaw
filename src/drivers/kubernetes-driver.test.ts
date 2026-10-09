@@ -194,7 +194,7 @@ function setCondition(
 }
 
 describe('kubernetes driver manifests', () => {
-  it('declares A1 capabilities field for field', () => {
+  it('declares the group-volume fixture capabilities field for field', () => {
     expect(harness().driver.capabilities()).toEqual(FIXTURE_GROUP_VOLUME_CAPABILITIES);
   });
   it('uses stable RFC1123 names and separates normalized collisions', () => {
@@ -849,6 +849,12 @@ describe('kubernetes failure and admission mapping', () => {
     h.spec.providerState![0].provider = 'claude';
     h.spec.containers[0].image = 'local:latest';
     await expect(h.driver.prepare(h.spec)).rejects.toThrow(/pinned imageTag/);
+  });
+  it('refuses a session key that cannot round-trip as label values, before any API call', async () => {
+    const h = harness();
+    h.spec.key = { ...h.spec.key, installSlug: 'spike-' };
+    await expect(h.driver.prepare(h.spec)).rejects.toThrow(/installSlug 'spike-'.*NANOCLAW_INSTALL_ID/);
+    expect(h.core.readNamespace).not.toHaveBeenCalled();
   });
   it('refuses escaping PVC/provider subPaths', async () => {
     const h = harness();

@@ -17,7 +17,7 @@ import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
   getContainerConfig,
-  recordDriverKindsUsed,
+  setContainerConfigDriver,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
@@ -487,10 +487,7 @@ registerResource({
         } else {
           // One write, after the change is proven safe and with the group's
           // spawns held: a refused driver change leaves the whole update unapplied.
-          await changeGroupDriver(id, driver, async () => {
-            await updateContainerConfigScalars(id, { ...updates, driver });
-            if (driver) await recordDriverKindsUsed([driver]);
-          });
+          await changeGroupDriver(id, driver, () => setContainerConfigDriver(id, driver, updates));
         }
 
         const updated = (await getContainerConfig(id))!;
