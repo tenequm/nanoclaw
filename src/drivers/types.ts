@@ -274,8 +274,10 @@ export type SessionStatus =
  * Coarse liveness for discovery, deliberately distinct from `SessionStatus`:
  * that is the per-handle truth read; this is the one-shot classification a
  * list can vouch for without a per-handle round trip. 'starting' covers
- * prepared-not-started incarnations (a created container is not a corpse);
- * 'terminal' covers self-exited runtimes awaiting cleanup.
+ * prepared-not-started incarnations (a created container is not a corpse) of
+ * a driver that does not retain them - a retaining one reports them through
+ * `listRetained` as 'prepared'; 'terminal' covers self-exited runtimes
+ * awaiting cleanup.
  */
 export type SessionPhase = 'starting' | 'running' | 'terminal';
 
@@ -466,8 +468,13 @@ export interface DriverCapabilities {
    * section 5). Composition advertises the mailbox URL on this host, and the
    * gateway provider rewrites its host alias to it; drivers never see either
    * URL. Declared from the driver's own install settings (a cluster cannot
-   * resolve Docker's `host.docker.internal`). Absent = each service's
-   * existing default (`host.docker.internal` / the configured URL), unchanged.
+   * resolve Docker's `host.docker.internal`). When present, the mailbox is
+   * advertised as `http://<hostAddress>:<port>` and the configured mailbox URL
+   * is not used, so the mailbox bind (`NANOCLAW_MAILBOX_HTTP_BIND`) must be
+   * reachable at this address. Absent = each service's existing default
+   * (`host.docker.internal` / the configured URL), unchanged - which a pod on
+   * a real cluster usually cannot reach, so a 'group-volume' driver should
+   * declare it.
    */
   hostAddress?: string;
   /**
@@ -485,13 +492,16 @@ export interface DriverCapabilities {
 export interface SessionDriver {
   /**
    * Identity, for logs and diagnostics only — never a branch. Deliberately not
-   * a union: this tree ships one driver and enumerating kinds it cannot execute
-   * would make every overlay's kind a change to this file. Selection resolves
-   * kinds through the registry in `index.ts`.
+   * a union: enumerating kinds would make every overlay's kind a change to
+   * this file. Selection resolves kinds through the registry in `index.ts`.
    */
   readonly kind: string;
   capabilities(): DriverCapabilities;
-  /** Fatal-at-startup reachability check. Agents cannot run without a runtime. */
+  /**
+   * Fatal-at-startup reachability check for the install default. For any
+   * other kind the host also uses it as the readiness gate (startup probe,
+   * reopening a kind closed for readiness); an absent check counts as ready.
+   */
   ensureReady?(): Promise<void>;
   /** Restore gateway network realization when adopting an existing session. */
   reconcileNetworkAccess?(access: NetworkAccessIntent): Promise<void>;
@@ -541,7 +551,8 @@ export interface SessionDriver {
    * Delete the retained SESSION objects named by the host — keys whose session
    * rows the host established are gone or closed. Host-keyed by contract: the
    * driver never decides which objects are residue. Group storage is never
-   * deleted through this path. Idempotent; an already-absent key is success.
+   * deleted through this path. Idempotent; an already-absent key is success,
+   * and an object still stopping may be left for a later call.
    */
   reapRetained?(installSlug: string, keys: SessionKey[]): Promise<void>;
   /**

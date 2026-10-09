@@ -1,5 +1,5 @@
-// Out-of-tree session drivers self-register on import. Drivers that ship in
-// this tree (docker) register in `index.ts` and do not appear here.
+// Session drivers other than docker self-register on import: the in-tree
+// kubernetes driver, and any overlay's. docker registers in `index.ts`.
 //
 // Skills add a driver by appending one import line below — the same shape as
 // the provider container-config barrel (`src/providers/index.ts`). Append-only
