@@ -13,7 +13,7 @@ The host and worker run outside the agent container. No separate voice model
 stands in for the agent.
 
 This distribution targets the public NanoClaw fork with its host command,
-prewarm, delivery and legacy-line foundations. Use the fork's
+prewarm and delivery foundations. Use the fork's
 [main branch](https://github.com/tenequm/nanoclaw/tree/main).
 Do not copy it into an unrelated upstream checkout: its core boundaries differ.
 The build below checks those dependencies. Applying this skill never merges,
@@ -80,8 +80,9 @@ src/voice-mode-wakeword-fixtures/positive.wav
 ```
 
 The `voice_mode_lines` table registers its own named migration through core.
-Saved links from before the voice-mode rename keep their `voice_lines` and
-`voice_line_owners` rows.
+Its `module:voice-mode:drop-legacy-lines` migration drops the `voice_lines`
+and `voice_line_owners` tables from before the voice-mode rename: every line
+is a `voice_mode_lines` row.
 
 Append `import './voice-mode.js';` to `src/channels/index.ts` once:
 
@@ -103,7 +104,7 @@ container/skills/voice-mode-formatting/instructions.md
 
 An explicit group skill list must include `voice-mode-formatting`.
 The host composes the instructions into the project document only for agents
-that take calls (a voice-mode line, or a wired legacy `voice` chat); a listed
+that take calls (those with a voice-mode line); a listed
 skill on any other agent composes nothing. A first line for a running agent
 reaches its instructions on the next spawn.
 
@@ -272,9 +273,7 @@ seconds and before replies. A revoked role or changed token ends the call.
 The current call chat must stay wired to the line's agent. When it disappears,
 `VOICE_MODE_MIRROR` picks an unambiguous fallback chat. A line `/voice` made
 with no usable chat is refused at call start, and a running call on it ends,
-until `/voice` runs in a chat with the agent. A legacy membership-based
-`voice` line can also talk on the line itself: a `voice` compatibility adapter
-hands its replies and typing to the voice-mode engine.
+until `/voice` runs in a chat with the agent.
 
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use
@@ -361,11 +360,9 @@ Remove via [REMOVE.md](REMOVE.md).
 ## Troubleshooting
 
 - Unknown link: a link is shown only once and cannot be read back; `/voice new`
-  replaces it. A saved link works while its token is in `VOICE_MODE_LINK_TOKEN`
-  and its `voice` line and membership rows exist.
+  replaces it.
 - Caller denied: a `/voice` line needs its caller to hold a core owner or admin
-  role over the agent; a saved line needs its named voice caller, strict wiring
-  and group membership.
+  role over the agent.
 - No chat to talk in: the page says the line has no chat to talk in. Run
   `/voice` in a chat wired to the agent, or set `VOICE_MODE_MIRROR` to a channel
   with one unambiguous chat for it.

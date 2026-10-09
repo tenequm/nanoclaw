@@ -40,8 +40,8 @@ pnpm exec tsx scripts/q.ts data/v2.db "DELETE FROM voice_mode_lines"
 A partial install without the table has nothing to retire. The empty table
 and its named migration record stay deliberately: dropping only the table
 would prevent reinstall from recreating it. The legacy `voice_lines` and
-`voice_line_owners` tables belong to the fork and remain; remove its legacy
-`VOICE_LINK_TOKEN`/`VOICE_MODE_LINK_TOKEN` settings to invalidate those links.
+`voice_line_owners` tables are already gone: this skill's
+`module:voice-mode:drop-legacy-lines` migration dropped them.
 Do not delete chat users, roles, memberships or shared sessions automatically.
 
 ## 3. Remove registration and copied files
@@ -95,7 +95,6 @@ pnpm exec tsx scripts/q.ts data/v2.db "SELECT agent_group_id FROM container_conf
 ```
 
 The second query must print nothing.
-The old core line admin commands and legacy tables are retained for rollback.
 The native Telegram structural handler and router export are safe without the
 voice adapter and need not be removed.
 
