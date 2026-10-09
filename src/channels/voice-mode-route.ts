@@ -20,7 +20,7 @@ import type { MessagingGroup } from '../types.js';
 export interface VoiceModeTurn {
   /** The line's caller, who the turn is from. */
   callerId: string;
-  /** The call chat as the engine just resolved it; null for a turn on the voice line itself. */
+  /** The call chat as the engine just resolved it; null to look it up by the event's chat. */
   chat: MessagingGroup | null;
 }
 

@@ -113,13 +113,14 @@ import { readEnvFile } from './env.js';
 import { GeminiLiveTranscriber, type Heard, type TranscriberOptions } from './voice-mode-gemini-live.js';
 import { JevTurnShadow, type TurnShadowSink } from './voice-mode-jev-turn.js';
 import {
+  providerKeysFrom,
   readTtsChoice,
   TTS_DEFAULT_CHOICE,
   TTS_REGISTRY,
+  type ProviderKeys,
   type TtsAudio,
   type TtsChoice,
   type TtsInstance,
-  type TtsProvider,
 } from './voice-mode-tts.js';
 import {
   CUSTOM_WAKE_THRESHOLD,
@@ -552,9 +553,6 @@ const EMOJI =
 /** A transient failure before any audio is tried once more after this long. */
 const TTS_RETRY_DELAY_MS = 1_000;
 
-/** The call's provider keys, by provider; a provider without one never speaks. */
-export type ProviderKeys = Partial<Record<TtsProvider, string>>;
-
 export interface LineSpeechOptions {
   /** What the call speaks with until the caller picks another (the job's `tts`). */
   choice: TtsChoice;
@@ -567,7 +565,7 @@ export interface LineSpeechOptions {
   now?: () => number;
 }
 
-export const sameTts = (a: TtsChoice, b: TtsChoice): boolean =>
+const sameTts = (a: TtsChoice, b: TtsChoice): boolean =>
   a.provider === b.provider && a.model === b.model && a.voice === b.voice;
 const ttsKey = (c: TtsChoice): string => `${c.provider}/${c.model}/${c.voice}`;
 
@@ -1366,7 +1364,7 @@ export class TurnTaking {
     });
   }
 
-  /** The host's `chat` event: the call now talks in a chat, or on the voice line. */
+  /** The host's `chat` event: the call now talks in a chat, or has none. */
   onChat(inChat: boolean): void {
     this.inChat = inChat;
   }
@@ -3214,7 +3212,9 @@ export function readReviewRequest(payload: string): ReviewRequest | null {
   }
 }
 
-const ttsField = (value: unknown): value is string => typeof value === 'string' && value.length <= 64;
+/** Longer than any provider, model or voice the registry accepts. */
+const MAX_TTS_FIELD_CHARS = 64;
+const ttsField = (value: unknown): value is string => typeof value === 'string' && value.length <= MAX_TTS_FIELD_CHARS;
 
 /** A `settings` request's `tts` as sent; a malformed one names no provider, so it is refused as invalid. */
 function readTtsRequest(raw: unknown): NonNullable<ReviewRequest['tts']> {
@@ -4050,11 +4050,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   }
   const geminiKey = deps.env.VOICE_MODE_GEMINI_API_KEY;
   if (!geminiKey) return abandon('VOICE_MODE_GEMINI_API_KEY is not set for the worker');
-  const providerKeys: ProviderKeys = {};
-  for (const entry of Object.values(TTS_REGISTRY)) {
-    const key = deps.env[entry.envKey];
-    if (key) providerKeys[entry.id] = key;
-  }
+  const providerKeys = providerKeysFrom(deps.env);
   const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
   const transcriptDebug = transcriptDebugOn(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG);
   /** Spoken lines so far, for those no label numbered. */

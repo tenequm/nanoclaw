@@ -383,7 +383,7 @@ describe('TurnTaking', () => {
     turnTaking.onReply('Two things now. A **third** one that is long.');
     turnTaking.onReply('Fits.');
     await vi.advanceTimersByTimeAsync(1);
-    // No `chat` event yet: the call talks on the voice line, where no chat holds the rest.
+    // No `chat` event yet: no chat holds the rest.
     expect(said).toEqual([`Two things now. ${CUT_LINES.no_chat.en}`, 'Fits.']);
     turnTaking.onChat(true);
     turnTaking.onReply('Two things now. A third one that is long.');

@@ -162,6 +162,7 @@ describe('TTS choices', () => {
     expect(readTtsChoice(['gemini'])).toEqual({ invalid: 'provider' });
     expect(readTtsChoice({ provider: 'elevenlabs', model: 'eleven_v3' })).toEqual({ invalid: 'model' });
     expect(readTtsChoice({ provider: 'gemini', model: 7 })).toEqual({ invalid: 'model' });
+    expect(readTtsChoice({ provider: 'gemini', model: `gemini-${'x'.repeat(49)}-tts` })).toEqual({ invalid: 'model' });
     expect(readTtsChoice({ provider: 'gemini', voice: 'a b' })).toEqual({ invalid: 'voice' });
     expect(readTtsChoice({ provider: 'elevenlabs', voice: 'short' })).toEqual({ invalid: 'voice' });
   });

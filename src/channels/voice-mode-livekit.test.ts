@@ -27,7 +27,6 @@ import {
   CALL_CHAT_REPLY_NOTE,
   CALL_DEPTH_NOTE,
   CALL_LANGUAGE_NOTE,
-  CALL_REPLY_NOTE,
   callLanguageNote,
   type LiveKitServerApi,
   type LiveKitVoiceConfig,
@@ -1878,22 +1877,18 @@ describe('spoken text of a delivered message', () => {
 });
 
 describe('turn message text', () => {
-  it('marks the transcript as spoken and says how to answer', () => {
-    expect(turnMessageText('Привіт')).toBe(`<voice source="livekit">Привіт</voice>\n${CALL_REPLY_NOTE}`);
-    expect(CALL_REPLY_NOTE).toContain('separate written message');
-  });
-
-  it('warns a call in a chat that everything sent there is spoken', () => {
+  it('marks the transcript as spoken and warns that everything sent to the chat is spoken', () => {
+    expect(turnMessageText('Привіт', CALL_CHAT_REPLY_NOTE)).toBe(
+      `<voice source="livekit">Привіт</voice>\n${CALL_CHAT_REPLY_NOTE}`,
+    );
     expect(CALL_CHAT_REPLY_NOTE).toContain('every message you send to this chat is read aloud');
     expect(CALL_CHAT_REPLY_NOTE).not.toContain('separate written message');
   });
 
   it('asks for depth that matches the question, not a fixed short length, and keeps the spoken-output rules', () => {
-    for (const note of [CALL_REPLY_NOTE, CALL_CHAT_REPLY_NOTE]) {
-      expect(note).toContain(CALL_DEPTH_NOTE);
-      expect(note).not.toMatch(/few short/i);
-      expect(note).toContain('code, links, long lists');
-    }
+    expect(CALL_CHAT_REPLY_NOTE).toContain(CALL_DEPTH_NOTE);
+    expect(CALL_CHAT_REPLY_NOTE).not.toMatch(/few short/i);
+    expect(CALL_CHAT_REPLY_NOTE).toContain('code, links, long lists');
     expect(CALL_DEPTH_NOTE).toContain('Match the depth to the question: brief for simple ones');
     expect(CALL_DEPTH_NOTE).toContain('take the time to think and verify, and give the full considered answer');
     expect(CALL_DEPTH_NOTE).toContain('Lead with the answer; for a long one, say how many points there are');
@@ -1902,10 +1897,8 @@ describe('turn message text', () => {
   });
 
   it('keeps the transcript as heard and tells the agent Russian spelling is Ukrainian, never to answer in Russian', () => {
-    expect(turnMessageText('Привет.')).toContain('<voice source="livekit">Привет.</voice>');
-    for (const note of [CALL_REPLY_NOTE, CALL_CHAT_REPLY_NOTE]) {
-      expect(note).toContain(CALL_LANGUAGE_NOTE);
-    }
+    expect(turnMessageText('Привет.', CALL_CHAT_REPLY_NOTE)).toContain('<voice source="livekit">Привет.</voice>');
+    expect(CALL_CHAT_REPLY_NOTE).toContain(CALL_LANGUAGE_NOTE);
     expect(CALL_LANGUAGE_NOTE).toContain('looks Russian is Ukrainian misspelled by speech recognition');
     expect(CALL_LANGUAGE_NOTE).toContain('answer in Ukrainian (in English if the caller spoke English)');
     expect(CALL_LANGUAGE_NOTE).toContain('never in Russian');

@@ -31,7 +31,12 @@ import {
   type ResolveLineOptions,
   type VoiceModeLine,
 } from './voice-mode-line.js';
-import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
+import {
+  createLiveKitVoice,
+  parseLiveKitUtteranceId,
+  readJsonObject,
+  type LiveKitVoiceConfig,
+} from './voice-mode-livekit.js';
 import { createVoiceCatalog, type VoiceCatalog } from './voice-mode-tts-catalog.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
@@ -63,9 +68,10 @@ import { registerRootHandler, registerWebhookHandler } from '../webhook-server.j
 import {
   effectiveTts,
   isTtsProvider,
+  providerKeysFrom,
   readTtsChoice,
   TTS_REGISTRY,
-  type TtsProvider,
+  type ProviderKeys,
   type TtsSaved,
 } from '../voice-mode-tts.js';
 
@@ -223,7 +229,7 @@ export interface VoiceModeConfig {
   /** Clock, overridable for tests. */
   now?: () => number;
   /** Speech provider API keys (VOICE_MODE_<PROVIDER>_API_KEY): a provider without one is offered as unavailable. */
-  providerKeys?: Partial<Record<TtsProvider, string>>;
+  providerKeys?: ProviderKeys;
   /** The voice catalog `GET /voice/voices` pages through. Test seam; defaults to the providers' live listings. */
   catalog?: VoiceCatalog;
   /** Look of the browser call page; injected at serve time, no rebuild needed (VOICE_MODE_UI). */
@@ -278,7 +284,7 @@ export async function findCallSession(
 export interface VoiceModeChannelAdapter extends ChannelAdapter {
   /** The call page URL for a link token. */
   callUrl(token: string): string;
-  /** `/voice` in a chat, with this adapter's call URLs and saved links (voice-mode-command.ts). */
+  /** `/voice` in a chat, with this adapter's call URLs (voice-mode-command.ts). */
   handleVoiceCommand(event: InboundEvent): Promise<boolean>;
 }
 
@@ -434,25 +440,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     })),
   });
 
-  /** The request's JSON object, or null when it is larger than MAX_TTS_BODY_BYTES, not JSON or not an object. */
-  const readSmallJson = async (req: http.IncomingMessage): Promise<Record<string, unknown> | null> => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of req) {
-      total += (chunk as Buffer).length;
-      if (total > MAX_TTS_BODY_BYTES) return null;
-      chunks.push(chunk as Buffer);
-    }
-    try {
-      const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>)
-        : null;
-    } catch {
-      return null;
-    }
-  };
-
   /** `GET` the line's voice; `PATCH` saves it for the line's next calls (a running call keeps its own). */
   const handleTts = async (req: http.IncomingMessage, res: http.ServerResponse, token: string): Promise<void> => {
     if (req.method !== 'GET' && req.method !== 'PATCH') return reply(res, 405, 'GET or PATCH only');
@@ -460,11 +447,13 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     if (!platformId) return reply(res, 403, 'Unknown call link');
     const lineId = lineIdOf(platformId);
     const row = lineId ? await getVoiceModeLine(lineId) : undefined;
-    if (!lineId || !row) return reply(res, 403, 'This line keeps no voice; make a new link with /voice new');
+    if (!lineId || !row) return reply(res, 403, 'Unknown call link');
     if (req.method === 'GET') return replyJson(res, 200, ttsView(savedTts(row)));
     // Changing the voice takes what a call takes: the line's caller, still an owner or admin of its agent.
     if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
-    const body = await readSmallJson(req);
+    const body = await readJsonObject(req, MAX_TTS_BODY_BYTES);
+    // The body can take its time: a link re-minted meanwhile must not save.
+    if ((await lineForToken(token)) !== platformId) return reply(res, 403, 'Unknown call link');
     if (!body) return replyJson(res, 400, { error: 'bad_request' });
     let saved: TtsSaved | null = null;
     if ('reset' in body) {
@@ -495,7 +484,10 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     token: string,
   ): Promise<void> => {
     if (req.method !== 'GET') return reply(res, 405, 'GET only');
-    if (!(await lineForToken(token))) return reply(res, 403, 'Unknown call link');
+    const platformId = await lineForToken(token);
+    if (!platformId) return reply(res, 403, 'Unknown call link');
+    // The listing spends the host's provider key: only a caller who may still call gets it.
+    if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
     const params = url.searchParams;
     const provider = params.get('provider');
     const rawLimit = params.get('limit') ?? String(MAX_CATALOG_LIMIT);
@@ -573,7 +565,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
           caller: line.caller.name,
           wakePhrase: config.wakePhrase,
         };
-        return reply(res, 200, JSON.stringify(info), JSON_HEADERS);
+        return replyJson(res, 200, info);
       }
       if (route === 'tts') return await handleTts(req, res, token);
       if (route === 'voices') return await handleVoices(req, res, url, token);
@@ -755,6 +747,13 @@ function parseSilenceMs(raw: string | undefined): number | undefined {
  * default provider and the transcription); the host checks it is there and offers the voices it lists.
  */
 const LIVEKIT_REQUIRED = ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'VOICE_MODE_GEMINI_API_KEY'] as const;
+/** Settings nothing reads any more: lines come from /voice, and each line keeps its own voice. */
+const RETIRED_KEYS = [
+  'VOICE_MODE_LINK_TOKEN',
+  'VOICE_MODE_TTS_MODEL',
+  'VOICE_MODE_TTS_FALLBACK_MODEL',
+  'VOICE_MODE_TTS_VOICE',
+] as const;
 
 registerChannelAdapter(VOICE_MODE_CHANNEL, {
   factory: () => {
@@ -783,10 +782,17 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
           'VOICE_MODE_MIRROR',
           'VOICE_MODE_WAKE_MODEL',
           'VOICE_MODE_WAKE_PHRASE',
+          ...RETIRED_KEYS,
         ]),
       ),
       (message) => log.warn(message),
     );
+    const retired = RETIRED_KEYS.filter((key) => env[key] !== undefined);
+    if (retired.length > 0) {
+      log.warn('voice-mode: retired settings are ignored; /voice makes links and each line keeps its voice', {
+        keys: retired,
+      });
+    }
     const missing = LIVEKIT_REQUIRED.filter((key) => !env[key]);
     if (missing.length > 0) {
       log.warn('voice-mode: LiveKit is not configured; the channel stays offline', { missing });
@@ -807,9 +813,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       maxCallsPerHour: Number(env.VOICE_MODE_MAX_CALLS_PER_HOUR ?? 12),
       maxCallMsPerDay: Number(env.VOICE_MODE_MAX_MINUTES_PER_DAY ?? 120) * 60_000,
       vocabulary: env.VOICE_MODE_VOCABULARY,
-      providerKeys: Object.fromEntries(
-        Object.values(TTS_REGISTRY).flatMap((entry) => (env[entry.envKey] ? [[entry.id, env[entry.envKey]]] : [])),
-      ),
+      providerKeys: providerKeysFrom(env),
       livekit: {
         url: env.LIVEKIT_URL,
         languages: parseVoiceLanguages(env.VOICE_MODE_LANGUAGES),

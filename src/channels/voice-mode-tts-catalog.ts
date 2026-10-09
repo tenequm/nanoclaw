@@ -38,12 +38,11 @@ export interface VoiceCatalog {
 export const GEMINI_VOICES_URL = 'https://generativelanguage.googleapis.com/v1beta/voices';
 export const ELEVENLABS_VOICES_URL = 'https://api.elevenlabs.io/v2/voices';
 const GEMINI_CACHE_MS = 3_600_000;
-/** The listing's largest page; 2,089 voices took 3 pages on 2026-10-09. */
+/** The listing's largest page; 2,089 voices took 3 pages on 2026-10-09 (21 at the default size). */
 const GEMINI_PAGE_SIZE = 1000;
-const GEMINI_MAX_PAGES = 20;
+/** Headroom for a listing that grows or a page size the API caps lower. */
+const GEMINI_MAX_PAGES = 50;
 const UPSTREAM_TIMEOUT_MS = 15_000;
-
-class UpstreamError extends Error {}
 
 const text = (value: unknown): string | undefined =>
   typeof value === 'string' && value.trim() ? value.trim() : undefined;
@@ -101,10 +100,13 @@ export function createVoiceCatalog(
 
   const getJson = async (url: URL, headers: Record<string, string>): Promise<Record<string, unknown>> => {
     const res = await fetchFn(url, { headers, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
-    if (!res.ok) throw new UpstreamError(`HTTP ${res.status}`);
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new Error(`HTTP ${res.status}`);
+    }
     const body: unknown = await res.json();
     if (!body || typeof body !== 'object' || !Array.isArray((body as { voices?: unknown }).voices)) {
-      throw new UpstreamError('no voices list');
+      throw new Error('no voices list');
     }
     return body as Record<string, unknown>;
   };
@@ -127,7 +129,7 @@ export function createVoiceCatalog(
       pageToken = text(body.next_page_token);
       if (!pageToken) return voices;
     }
-    throw new UpstreamError(`more than ${GEMINI_MAX_PAGES} pages`);
+    throw new Error(`more than ${GEMINI_MAX_PAGES} pages`);
   };
 
   /** The cached list; one fetch serves every request while it runs, and a failed one is not kept. */

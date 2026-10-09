@@ -103,8 +103,8 @@ export const CALL_TURN_TOPIC = 'nanoclaw.voice-mode.turn';
 
 /**
  * The room metadata the host sets when a mid-call `/voice` moves the call to another chat, so the
- * page's header follows it (the new call chat's label, or null once the call talks on the voice
- * line), and again right before it deletes the room, with why the call ended.
+ * page's header follows it (the new call chat's label, or null when it has none), and again right
+ * before it deletes the room, with why the call ended.
  */
 export interface CallRoomMetadata {
   chat: string | null;

@@ -95,7 +95,7 @@ describe('voice catalog', () => {
     expect(await createVoiceCatalog({ fetch: endless.fetchFn }).page('gemini', 'key', { limit: 1 })).toEqual({
       error: 'upstream',
     });
-    expect(endless.urls).toHaveLength(20);
+    expect(endless.urls).toHaveLength(50);
     let calls = 0;
     const flaky = fakeUpstream(() =>
       ++calls === 1 ? new Response('', { status: 503 }) : Response.json({ voices: [] }),

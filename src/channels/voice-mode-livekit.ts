@@ -26,7 +26,8 @@
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
  * line: the line's `/voice` chat (its voice_mode_lines binding), else the one
- * chat of the VOICE_MODE_MIRROR channel type wired to the agent (pickMirrorTarget). Each turn is routed into that chat's session through the
+ * chat of the VOICE_MODE_MIRROR channel type wired to the agent
+ * (pickMirrorTarget). Each turn is routed into that chat's session through the
  * normal inbound path as a message from the line's own caller, addressed to
  * the line's agent only; the transcript is posted into the chat, and the agent
  * answers there as it always does. While the call is live, every message the
@@ -104,13 +105,7 @@ export const CALL_DEPTH_NOTE =
   'answer; for a long one, say how many points there are, then take them one at a time. No markdown, no ' +
   'links, no code blocks, numbers written as words.';
 
-/** How the agent learns a message was spoken on a call and how its reply will be heard. */
-export const CALL_REPLY_NOTE =
-  `Spoken on a live voice call; your reply is read aloud word for word. ${CALL_DEPTH_NOTE} ` +
-  'Send anything meant for reading (code, links, long lists) as a separate written message to your chat. ' +
-  CALL_LANGUAGE_NOTE;
-
-/** The same for a call that talks in a chat, where every message the agent sends there is spoken. */
+/** How the agent learns a message was spoken on a call in its chat, where every message it sends there is heard. */
 export const CALL_CHAT_REPLY_NOTE =
   'Spoken on a live voice call; while it lasts, every message you send to this chat is read aloud word for ' +
   `word. ${CALL_DEPTH_NOTE} Offer anything meant for reading (code, links, long lists) for after the call ` +
@@ -133,7 +128,7 @@ export function callLanguageNote(languages: readonly string[]): string {
 }
 
 /** The inbound text for one transcribed caller turn. */
-export function turnMessageText(transcript: string, note: string = CALL_REPLY_NOTE): string {
+export function turnMessageText(transcript: string, note: string): string {
   return `<voice source="livekit">${transcript}</voice>\n${note}`;
 }
 
@@ -513,14 +508,34 @@ const isNotFound = (err: unknown): boolean => {
   return e?.status === 404 || e?.code === 'not_found';
 };
 
+/**
+ * The request's JSON object, or null when it is larger than `maxBytes`, not JSON or not an object;
+ * an empty body is `whenEmpty` (null by default).
+ */
+export async function readJsonObject(
+  req: http.IncomingMessage,
+  maxBytes: number,
+  whenEmpty: Record<string, unknown> | null = null,
+): Promise<Record<string, unknown> | null> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += (chunk as Buffer).length;
+    if (total > maxBytes) return null;
+    chunks.push(chunk as Buffer);
+  }
+  if (total === 0) return whenEmpty;
+  try {
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost): LiveKitVoice {
   const api = config.api ?? defaultApi(config);
   const agentName = config.agentName || DEFAULT_LIVEKIT_AGENT_NAME;
-  // .env drops empty values, so `off` is how a fallback is turned off there.
-  const fallbackModel = (raw: string | undefined, fallback: string): string => {
-    const model = (raw ?? fallback).trim();
-    return /^(off|none)$/i.test(model) ? '' : model;
-  };
   const languages = config.languages?.length ? [...config.languages] : [...DEFAULT_VOICE_LANGUAGES];
   // What every turn tells the agent, by where the call talks; the same for the engine's life.
   const languageNote = callLanguageNote(languages);
@@ -528,7 +543,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const speech = {
     sttModel: config.speech?.sttModel || DEFAULT_VOICE_STT_MODEL,
     // Deprecated: no default, and a worker that is still sent one logs that it ignores it.
-    sttFallbackModel: fallbackModel(config.speech?.sttFallbackModel, ''),
+    sttFallbackModel: (config.speech?.sttFallbackModel ?? '').trim().replace(/^(off|none)$/i, ''),
     silenceMs: config.speech?.silenceMs || DEFAULT_VOICE_SILENCE_MS,
   };
   const mirrorChannel = config.mirror && config.mirror !== 'off' ? config.mirror : null;
@@ -808,24 +823,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     endCall(call, 'caller access revoked or line changed', 'revoked');
     return false;
-  };
-
-  const readJson = async (req: http.IncomingMessage): Promise<Record<string, unknown> | null> => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of req) {
-      total += (chunk as Buffer).length;
-      if (total > MAX_AGENT_BODY_BYTES) return null;
-      chunks.push(chunk as Buffer);
-    }
-    try {
-      const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>)
-        : null;
-    } catch {
-      return null;
-    }
   };
 
   /** Admit the call, open its room, dispatch the worker and hand the caller a token for that room only. */
@@ -1108,22 +1105,17 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         }),
         timestamp: new Date().toISOString(),
         isMention: true,
-        isGroup: chat ? chat.group.is_group !== 0 : false,
+        isGroup: chat.group.is_group !== 0,
       };
-      routed = host.routeTurn(
-        { ...turnRoute(call, chat), message },
-        { callerId: sender.id, chat: chat?.group ?? null },
-      );
+      routed = host.routeTurn({ ...turnRoute(call, chat), message }, { callerId: sender.id, chat: chat.group });
       // Shown once the agent has it, even when that comes after the worker was told it timed out.
-      if (chat) {
-        void routed.then(
-          (stored) => {
-            // The chat shows the words alone; the turn itself still comes from the caller by name.
-            if (stored) mirror(call.platformId, chat, `\u{1F399} ${text}`);
-          },
-          () => undefined,
-        );
-      }
+      void routed.then(
+        (stored) => {
+          // The chat shows the words alone; the turn itself still comes from the caller by name.
+          if (stored) mirror(call.platformId, chat, `\u{1F399} ${text}`);
+        },
+        () => undefined,
+      );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timedOut = new Promise<'timeout'>((resolve) => {
         timer = setTimeout(() => resolve('timeout'), Math.max(0, routeTimeoutMs - (host.now() - receivedAt)));
@@ -1179,7 +1171,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       return onEvents(res, call);
     }
     if (req.method !== 'POST') return reply(res, 405, 'POST only');
-    const body = await readJson(req);
+    const body = await readJsonObject(req, MAX_AGENT_BODY_BYTES, {});
     if (!body) return reply(res, 400, 'Body must be a small JSON object');
     const call = findCall(body.callId);
     // Unknown, ended and unauthenticated look alike to the caller of these routes.
@@ -1237,7 +1229,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         return startCall(res, platformId);
       }
       if (route === 'livekit/end') {
-        const body = await readJson(req);
+        const body = await readJsonObject(req, MAX_AGENT_BODY_BYTES, {});
         const call = calls.get(platformId);
         if (call && body && call.callId === body.callId) {
           // The page gave up waiting for the worker, or the worker said it runs another version.

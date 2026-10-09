@@ -1,6 +1,12 @@
 # Voice mode upgrade and rollback
 
-Retired 2026-10-09: env-backed `voice:` lines and the `voice` compatibility adapter are gone; every line is a `voice_mode_lines` row.
+Retired 2026-10-09: env-backed `voice:` lines and the `voice` compatibility
+adapter are gone; every line is a `voice_mode_lines` row. What this runbook says
+about env-backed links, saved links and the `voice` adapter describes the
+protocol 4 cutover only: a current build reads no link token from `.env`, so
+make each such line a row before upgrading, and its
+`module:voice-mode:drop-legacy-lines` migration drops `voice_lines` and
+`voice_line_owners` (see Rollback).
 
 This is an operator runbook. Building the fork's main branch performs no server
 actions. Use the complete fork build, with matching host and worker. Update
@@ -81,9 +87,10 @@ keys are voice-mode's own:
 | `GEMINI_API_KEY` | `VOICE_MODE_GEMINI_API_KEY` | Required; the old name is still read, with a warning. |
 | none | `VOICE_MODE_ELEVENLABS_API_KEY` | Optional; offers ElevenLabs voices to the lines. |
 
-`VOICE_MODE_TTS_MODEL`, `VOICE_MODE_TTS_FALLBACK_MODEL` and
-`VOICE_MODE_TTS_VOICE` (and their `VOICE_TTS_*` names above) are no longer
-read: each line keeps its own voice. Before upgrading an install that set one,
+`VOICE_MODE_TTS_MODEL`, `VOICE_MODE_TTS_FALLBACK_MODEL`,
+`VOICE_MODE_TTS_VOICE` and `VOICE_MODE_LINK_TOKEN` (and their `VOICE_*` names
+above) are no longer read, and the host warns when one is still set: each line
+keeps its own voice, and `/voice` makes the links. Before upgrading an install that set one,
 save it on every line with `PATCH /voice/tts` (see the skill's "Voice per
 line"), or its lines speak with the default `Alnilam`.
 The build adds a separate page listener on `127.0.0.1:3100` (`VOICE_MODE_PORT`,
@@ -92,8 +99,8 @@ fronts still work on `WEBHOOK_PORT`. Do not move a working front during the
 compatibility upgrade. An install whose front already forwards `/voice` to the
 webhook port does not need the listener: set `VOICE_MODE_PORT=off`. If the
 default port is taken, the host logs it and serves the page on `WEBHOOK_PORT`
-only; an explicit `VOICE_MODE_PORT` that cannot bind fails setup, and neither
-voice-mode nor the `voice` compatibility adapter starts.
+only; an explicit `VOICE_MODE_PORT` that cannot bind fails setup, and
+voice-mode does not start.
 `LIVEKIT_HOST_URL` must be a local plain-http origin (`localhost`, `127.0.0.1`
 or `[::1]`); the worker refuses to start with anything else. Point it directly
 at the webhook port, never through a proxy. A configured
@@ -354,7 +361,10 @@ the host and the old worker, and check the worker's arguments in
 and switch the native app to the build that speaks protocol 4. Keep the same
 public front.
 
-The new module table is additive, so an old main build can ignore it. Prefer
+The `voice_mode_lines` table is additive, so an old main build can ignore it,
+but `module:voice-mode:drop-legacy-lines` drops the `voice_lines` and
+`voice_line_owners` tables a build from before it needs: rolling back past that
+migration takes the stopped DB snapshot from before it. Otherwise prefer
 keeping the current DB to preserve messages created after cutover; restore the
 stopped DB snapshot only for a DB failure or a deliberate full-state rollback,
 which discards later changes. Back up current state before restoring it.

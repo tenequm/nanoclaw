@@ -7,13 +7,12 @@
 import path from 'node:path';
 
 import { GROUPS_DIR } from '../config.js';
-import { getVoiceModeLine } from '../db/voice-mode-lines.js';
+import { getVoiceModeLine, savedTts, type VoiceModeLineRow } from '../db/voice-mode-lines.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { readGroupPersona } from '../group-persona.js';
 import { log } from '../log.js';
 import { getUser } from '../modules/permissions/db/users.js';
-import { savedTts, type VoiceModeLineRow } from '../db/voice-mode-lines.js';
 import { effectiveTts, type TtsChoice } from '../voice-mode-tts.js';
 
 /** Optional per-agent names for the transcription, one per line; added to VOICE_MODE_VOCABULARY. */
@@ -39,7 +38,7 @@ export interface VoiceModeLine {
   caller: VoiceModeCaller;
   agentGroupId: string;
   linkHash?: string;
-  /** The line's effective speech choice; absent for a legacy line. */
+  /** The line's effective speech choice. */
   tts?: TtsChoice;
 }
 
@@ -87,7 +86,7 @@ function buildLine(
   caller: VoiceModeCaller,
   group: { id: string; name: string; folder: string },
   options: ResolveLineOptions,
-  row?: VoiceModeLineRow,
+  row: VoiceModeLineRow,
 ): VoiceModeLine {
   // The persona reader's bounded, symlink- and FIFO-safe read: the file is agent-writable.
   const fileText = options.forCall
@@ -103,7 +102,8 @@ function buildLine(
       ...(vocabulary?.length ? { vocabulary } : {}),
       ...(wakeNames?.length ? { wakeNames } : {}),
     },
-    ...(row ? { linkHash: row.token_hash, tts: effectiveTts(savedTts(row)) } : {}),
+    linkHash: row.token_hash,
+    tts: effectiveTts(savedTts(row)),
   };
 }
 
@@ -115,14 +115,11 @@ export async function resolveVoiceModeLine(
   try {
     const lineId = lineIdOf(platformId);
     const line = lineId ? await getVoiceModeLine(lineId) : undefined;
-    if (line) {
-      if (!(await hasAdminPrivilege(line.owner_user_id, line.agent_group_id))) return null;
-      const [caller, group] = await Promise.all([getUser(line.owner_user_id), getAgentGroup(line.agent_group_id)]);
-      if (!caller || !group) return null;
-      const name = caller.display_name?.trim() || caller.id;
-      return buildLine({ id: caller.id, name }, group, options, line);
-    }
-    return null;
+    if (!line || !(await hasAdminPrivilege(line.owner_user_id, line.agent_group_id))) return null;
+    const [caller, group] = await Promise.all([getUser(line.owner_user_id), getAgentGroup(line.agent_group_id)]);
+    if (!caller || !group) return null;
+    const name = caller.display_name?.trim() || caller.id;
+    return buildLine({ id: caller.id, name }, group, options, line);
   } catch (err) {
     log.warn('voice-mode: could not authorize the voice line', { platformId, err });
     return null;

@@ -200,7 +200,7 @@ the existing host webhook port. `VOICE_MODE_PORT=off` (or `0`) turns the
 separate listener off when the front already forwards `/voice` to the webhook
 port. When the default port is taken, the host logs it and serves the page on
 the webhook port only; when an explicit `VOICE_MODE_PORT` cannot bind, setup
-fails and neither voice-mode nor the `voice` compatibility adapter starts.
+fails and voice-mode does not start.
 A container proxy that cannot reach loopback needs the listener bound
 to an address it can reach, plus the trusted-proxy settings below. Worker
 routes live only on the host port under `/webhook/voice-mode/livekit/agent/`;

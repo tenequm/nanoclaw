@@ -353,6 +353,34 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     expect(res.status).toBe(403);
     expect(await res.text()).toBe('Caller access denied or voice line is not set up');
     expect(await json(await tts())).toEqual({ status: 200, body: fixtures.ttsViewUnsaved });
+    expect((await voices('provider=gemini')).status).toBe(403);
+    expect(upstream.calls).toEqual([]);
+  });
+
+  it('saves nothing when the link is re-minted while the body is on its way', async () => {
+    const encode = (s: string) => new TextEncoder().encode(s);
+    const res = await fetch(`${base}/tts?t=${token}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: new ReadableStream({
+        async start(stream) {
+          stream.enqueue(encode('{"provider":"gemini",'));
+          // Long enough for the route to pass its token and role checks and wait on the rest.
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await mintVoiceModeLine({
+            agentGroupId: 'ag-1',
+            ownerUserId: OWNER,
+            messagingGroupId: 'mg-1',
+            threadId: null,
+          });
+          stream.enqueue(encode('"voice":"Kore"}'));
+          stream.close();
+        },
+      }),
+      duplex: 'half',
+    } as RequestInit);
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe('Unknown call link');
   });
 
   it("pages Gemini's cached list with filters and a cursor, fetching it once", async () => {

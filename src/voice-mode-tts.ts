@@ -107,7 +107,7 @@ export function wrapSdkTts(sdk: SdkTts, log: Pick<Console, 'info' | 'warn'>): Tt
   };
 }
 
-const GEMINI_MODEL = /^gemini-[a-z0-9.-]+-tts$/;
+const GEMINI_MODEL = /^gemini-[a-z0-9.-]{1,48}-tts$/;
 const GEMINI_VOICE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const GEMINI_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
 const ELEVENLABS_MODELS = ['eleven_turbo_v2_5', 'eleven_flash_v2_5', 'eleven_multilingual_v2'];
@@ -145,6 +145,19 @@ export const TTS_REGISTRY: Readonly<Record<TtsProvider, TtsEntry>> = {
       wrapSdkTts(new elevenlabs.TTS({ apiKey, model: choice.model, voiceId: choice.voice }) as SdkTts, log),
   },
 };
+
+/** The speech providers' keys, by provider; a provider without one never speaks. */
+export type ProviderKeys = Partial<Record<TtsProvider, string>>;
+
+/** Each provider's key from its `envKey` in `env`. */
+export function providerKeysFrom(env: Record<string, string | undefined>): ProviderKeys {
+  const keys: ProviderKeys = {};
+  for (const entry of Object.values(TTS_REGISTRY)) {
+    const key = env[entry.envKey];
+    if (key) keys[entry.id] = key;
+  }
+  return keys;
+}
 
 export function isTtsProvider(value: unknown): value is TtsProvider {
   return typeof value === 'string' && Object.hasOwn(TTS_REGISTRY, value);
