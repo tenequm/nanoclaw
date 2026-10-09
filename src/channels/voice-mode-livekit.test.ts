@@ -882,9 +882,8 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       wakeNames: ['Енді'],
       sttModel: 'gemini-3.5-transcribe-live',
       sttFallbackModel: '',
-      ttsModel: 'gemini-3.8-flash-tts',
-      ttsFallbackModel: 'gemini-3.8-flash-lite-tts',
-      ttsVoice: 'Alnilam',
+      // A line with no saved choice speaks with the default.
+      tts: { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'Alnilam' },
       silenceMs: 2500,
       maxDurationMs: 15 * MIN,
       joinTimeoutMs: 60_000,
@@ -1301,21 +1300,27 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.roomMetadata).toEqual([{ room: h.lk.rooms[0], metadata: { chat: null, end: 'limit_duration' } }]);
   });
 
-  it('turns a fallback model off when it is set to off or empty', async () => {
+  it("turns the transcription fallback off when set to off, and sends the line's own voice", async () => {
     await h.stop();
+    const tts = { provider: 'elevenlabs', model: 'eleven_flash_v2_5', voice: 'bIHbv24MWmeRgasZH58o' } as const;
     h = await startHarness(
-      {},
       {
-        speech: { sttFallbackModel: 'off', ttsFallbackModel: ' ', ttsModel: 'gemini-3.8-flash-lite-tts' },
+        resolveLine: async (id) => ({
+          caller: { id, name: 'Ethan' },
+          agentGroupId: 'ag-andy',
+          agent: { name: 'Andy' },
+          tts,
+        }),
       },
+      { speech: { sttFallbackModel: 'off' } },
     );
     expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
     expect(h.lk.dispatches[0].metadata).toMatchObject({
       sttModel: 'gemini-3.5-transcribe-live',
       sttFallbackModel: '',
-      ttsModel: 'gemini-3.8-flash-lite-tts',
-      ttsFallbackModel: '',
+      tts,
     });
+    expect(h.lk.dispatches[0].metadata).not.toHaveProperty('ttsModel');
   });
 
   it('names a missing or mismatched worker when the page gives up on it', async () => {

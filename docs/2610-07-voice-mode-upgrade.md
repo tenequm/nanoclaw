@@ -71,7 +71,19 @@ changing settings.
 | `VOICE_TTS_NOTCH` | `VOICE_MODE_TTS_NOTCH` |
 | `VOICE_WORKER_HEALTH_PORT` | `VOICE_MODE_WORKER_HEALTH_PORT` |
 
-`LIVEKIT_*`, `GEMINI_API_KEY` and optional `JEV_*` names stay unchanged.
+`LIVEKIT_*` and optional `JEV_*` names stay unchanged. The speech provider
+keys are voice-mode's own:
+
+| Provider key read before | Voice-mode key | |
+| --- | --- | --- |
+| `GEMINI_API_KEY` | `VOICE_MODE_GEMINI_API_KEY` | Required; the old name is still read, with a warning. |
+| none | `VOICE_MODE_ELEVENLABS_API_KEY` | Optional; offers ElevenLabs voices to the lines. |
+
+`VOICE_MODE_TTS_MODEL`, `VOICE_MODE_TTS_FALLBACK_MODEL` and
+`VOICE_MODE_TTS_VOICE` (and their `VOICE_TTS_*` names above) are no longer
+read: each line keeps its own voice. Before upgrading an install that set one,
+save it on every line with `PATCH /voice/tts` (see the skill's "Voice per
+line"), or its lines speak with the default `Alnilam`.
 The build adds a separate page listener on `127.0.0.1:3100` (`VOICE_MODE_PORT`,
 `VOICE_MODE_PAGE_HOST`); main's existing `/voice` and `/webhook/voice/livekit`
 fronts still work on `WEBHOOK_PORT`. Do not move a working front during the

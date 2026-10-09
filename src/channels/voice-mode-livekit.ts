@@ -58,9 +58,6 @@ import {
   DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_VOICE_SILENCE_MS,
   DEFAULT_VOICE_STT_MODEL,
-  DEFAULT_VOICE_TTS_FALLBACK_MODEL,
-  DEFAULT_VOICE_TTS_MODEL,
-  DEFAULT_VOICE_TTS_VOICE,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   MAX_TURN_TEXT_BYTES,
@@ -86,6 +83,7 @@ import { platformMessageId } from '../platform-id.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { registerTypingObserver } from '../modules/typing/index.js';
 import type { MessagingGroup } from '../types.js';
+import { TTS_DEFAULT_CHOICE } from '../voice-mode-tts.js';
 
 const MINUTE_MS = 60_000;
 const MAX_QUEUED_EVENTS = 50;
@@ -216,10 +214,6 @@ export interface SpeechSettings {
   sttModel?: string;
   /** Unset for the default; `off` (or empty) for no fallback. */
   sttFallbackModel?: string;
-  ttsModel?: string;
-  /** Unset for the default; `off` (or empty) for no fallback. */
-  ttsFallbackModel?: string;
-  ttsVoice?: string;
   silenceMs?: number;
 }
 
@@ -234,7 +228,7 @@ export interface LiveKitVoiceConfig {
   apiSecret: string;
   /** Dispatch name the worker registers under. */
   agentName?: string;
-  /** Transcription and speech settings the worker gets in the job metadata (VOICE_MODE_STT_*, VOICE_MODE_TTS_*, VOICE_MODE_SILENCE_MS). */
+  /** Transcription settings the worker gets in the job metadata (VOICE_MODE_STT_*, VOICE_MODE_SILENCE_MS); the voice is the line's. */
   speech?: SpeechSettings;
   /** Channel type of the default call chat when `/voice` has not set one; none when unset or `off`. voice-mode.ts passes VOICE_MODE_MIRROR, default DEFAULT_VOICE_MIRROR. */
   mirror?: string;
@@ -560,9 +554,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     sttModel: config.speech?.sttModel || DEFAULT_VOICE_STT_MODEL,
     // Deprecated: no default, and a worker that is still sent one logs that it ignores it.
     sttFallbackModel: fallbackModel(config.speech?.sttFallbackModel, ''),
-    ttsModel: config.speech?.ttsModel || DEFAULT_VOICE_TTS_MODEL,
-    ttsFallbackModel: fallbackModel(config.speech?.ttsFallbackModel, DEFAULT_VOICE_TTS_FALLBACK_MODEL),
-    ttsVoice: config.speech?.ttsVoice || DEFAULT_VOICE_TTS_VOICE,
     silenceMs: config.speech?.silenceMs || DEFAULT_VOICE_SILENCE_MS,
   };
   const mirrorChannel = config.mirror && config.mirror !== 'off' ? config.mirror : null;
@@ -917,6 +908,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       languages,
       ...(line.agent.wakeNames?.length ? { wakeNames: [...line.agent.wakeNames] } : {}),
       ...speech,
+      tts: line.tts ?? TTS_DEFAULT_CHOICE,
       maxDurationMs: capMs,
       joinTimeoutMs,
     };
@@ -975,8 +967,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       agent: line.agent.name,
       sttModel: speech.sttModel,
       sttFallbackModel: speech.sttFallbackModel,
-      ttsModel: speech.ttsModel,
-      ttsFallbackModel: speech.ttsFallbackModel,
+      tts: metadata.tts,
     });
     // What the page needs for its hints: the silence that sends a turn, and the cap that ends the
     // call (from join; onJoined recomputes it, never later than this).

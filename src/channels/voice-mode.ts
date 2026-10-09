@@ -27,6 +27,7 @@ import { getChannelAdapterExact, registerChannelAdapter } from './channel-regist
 import type { VoiceModeUiConfig } from './voice-mode-page.js';
 import {
   LEGACY_VOICE_CHANNEL,
+  lineIdOf,
   linePlatformId,
   resolveVoiceModeLine,
   VOICE_MODE_CHANNEL,
@@ -34,6 +35,7 @@ import {
   type VoiceModeLine,
 } from './voice-mode-line.js';
 import { createLiveKitVoice, parseLiveKitUtteranceId, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
+import { createVoiceCatalog, type VoiceCatalog } from './voice-mode-tts-catalog.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_VOICE_MIRROR,
@@ -46,7 +48,14 @@ import {
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
-import { findVoiceModeLineByToken, getVoiceModeLineForAgent, hashLinkToken } from '../db/voice-mode-lines.js';
+import {
+  findVoiceModeLineByToken,
+  getVoiceModeLine,
+  getVoiceModeLineForAgent,
+  hashLinkToken,
+  savedTts,
+  setVoiceModeLineTts,
+} from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand } from './voice-mode-command.js';
 import { voiceLinesOf } from '../commands/index.js';
@@ -56,6 +65,14 @@ import { registerResidentSkillGate } from '../project-doc-compose.js';
 import { requestWake } from '../request-wake.js';
 import type { Session } from '../types.js';
 import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
+import {
+  effectiveTts,
+  isTtsProvider,
+  readTtsChoice,
+  TTS_REGISTRY,
+  type TtsProvider,
+  type TtsSaved,
+} from '../voice-mode-tts.js';
 
 const MINUTE_MS = 60_000;
 /** How often a running call rechecks that its caller may still use the line. */
@@ -66,6 +83,11 @@ const DAY_MS = 86_400_000;
 const CALL_REPLY_EXPEDITE_MS = 60_000;
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
+/** A `PATCH /voice/tts` body is one small object: `{provider, model?, voice?}` or `{"reset": true}`. */
+const MAX_TTS_BODY_BYTES = 1024;
+const MAX_CATALOG_LIMIT = 100;
+/** Longest `q`, `language` or `cursor` a catalog request takes. */
+const MAX_CATALOG_PARAM_CHARS = 512;
 
 /**
  * The shared webhook server listens on every interface, and the voice routes are meant to be reached
@@ -144,7 +166,7 @@ export function admitsVoiceModePeer(
 }
 
 /** Browser routes under the short /voice prefix a reverse proxy forwards; the bare prefix is the call page. */
-const CLEAN_PREFIX_ROUTES = new Set(['info', 'livekit', 'livekit/token', 'livekit/end']);
+const CLEAN_PREFIX_ROUTES = new Set(['info', 'tts', 'voices', 'livekit', 'livekit/token', 'livekit/end']);
 const WEBHOOK_PREFIX = /^\/webhook\/(voice(?:-mode)?)(?:\/|$)/;
 const CLEAN_PREFIX = /^\/voice(?:\/|$)/;
 
@@ -209,6 +231,10 @@ export interface VoiceModeConfig {
   accessCheckIntervalMs?: number;
   /** Clock, overridable for tests. */
   now?: () => number;
+  /** Speech provider API keys (VOICE_MODE_<PROVIDER>_API_KEY): a provider without one is offered as unavailable. */
+  providerKeys?: Partial<Record<TtsProvider, string>>;
+  /** The voice catalog `GET /voice/voices` pages through. Test seam; defaults to the providers' live listings. */
+  catalog?: VoiceCatalog;
   /** Look of the browser call page; injected at serve time, no rebuild needed (VOICE_MODE_UI). */
   ui?: VoiceModeUiConfig;
   /** The wake phrase the worker listens for (wakePhrase); null: `hey <agent>`. Unset: the page is not told. */
@@ -419,6 +445,107 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
     res.end(body);
   };
+  const replyJson = (res: http.ServerResponse, status: number, body: unknown): void =>
+    reply(res, status, JSON.stringify(body), JSON_HEADERS);
+
+  const providerKeys = config.providerKeys ?? {};
+  const catalog = config.catalog ?? createVoiceCatalog();
+
+  /** What `/voice/tts` answers: the line's saved choice, what it speaks with, and every provider. */
+  const ttsView = (saved: TtsSaved) => ({
+    effective: effectiveTts(saved),
+    saved,
+    providers: Object.values(TTS_REGISTRY).map((entry) => ({
+      id: entry.id,
+      name: entry.name,
+      available: Boolean(providerKeys[entry.id]),
+      models: [...entry.models],
+      default: { ...entry.defaults },
+    })),
+  });
+
+  /** The request's JSON object, or null when it is larger than MAX_TTS_BODY_BYTES, not JSON or not an object. */
+  const readSmallJson = async (req: http.IncomingMessage): Promise<Record<string, unknown> | null> => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of req) {
+      total += (chunk as Buffer).length;
+      if (total > MAX_TTS_BODY_BYTES) return null;
+      chunks.push(chunk as Buffer);
+    }
+    try {
+      const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  };
+
+  /** `GET` the line's voice; `PATCH` saves it for the line's next calls (a running call keeps its own). */
+  const handleTts = async (req: http.IncomingMessage, res: http.ServerResponse, token: string): Promise<void> => {
+    if (req.method !== 'GET' && req.method !== 'PATCH') return reply(res, 405, 'GET or PATCH only');
+    const platformId = await lineForToken(token);
+    if (!platformId) return reply(res, 403, 'Unknown call link');
+    const lineId = lineIdOf(platformId);
+    const row = lineId ? await getVoiceModeLine(lineId) : undefined;
+    if (!lineId || !row) return reply(res, 403, 'This line keeps no voice; make a new link with /voice new');
+    if (req.method === 'GET') return replyJson(res, 200, ttsView(savedTts(row)));
+    // Changing the voice takes what a call takes: the line's caller, still an owner or admin of its agent.
+    if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
+    const body = await readSmallJson(req);
+    if (!body) return replyJson(res, 400, { error: 'bad_request' });
+    let saved: TtsSaved | null = null;
+    if ('reset' in body) {
+      if (body.reset !== true || Object.keys(body).length !== 1) return replyJson(res, 400, { error: 'bad_request' });
+    } else {
+      const read = readTtsChoice(body);
+      if ('invalid' in read) return replyJson(res, 400, { error: 'invalid', field: read.invalid });
+      const { provider } = read.choice;
+      if (!providerKeys[provider]) return replyJson(res, 503, { error: 'provider_unavailable', provider });
+      // A field left out stays unset, so it follows the provider's default instead of pinning today's.
+      saved = {
+        provider,
+        model: typeof body.model === 'string' ? body.model : null,
+        voice: typeof body.voice === 'string' ? body.voice : null,
+      };
+    }
+    const updated = await setVoiceModeLineTts(lineId, saved);
+    if (!updated) return reply(res, 403, 'Unknown call link');
+    log.info('voice-mode: line voice saved', { platformId, tts: saved ?? 'default' });
+    return replyJson(res, 200, ttsView(savedTts(updated)));
+  };
+
+  /** One page of a provider's voices, filtered by `q` and `language`. */
+  const handleVoices = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    url: URL,
+    token: string,
+  ): Promise<void> => {
+    if (req.method !== 'GET') return reply(res, 405, 'GET only');
+    if (!(await lineForToken(token))) return reply(res, 403, 'Unknown call link');
+    const params = url.searchParams;
+    const provider = params.get('provider');
+    const rawLimit = params.get('limit') ?? String(MAX_CATALOG_LIMIT);
+    const limit = Number(rawLimit);
+    const [q, language, cursor] = ['q', 'language', 'cursor'].map((key) => params.get(key) || undefined);
+    if (
+      !isTtsProvider(provider) ||
+      !/^\d{1,3}$/.test(rawLimit) ||
+      limit < 1 ||
+      limit > MAX_CATALOG_LIMIT ||
+      [q, language, cursor].some((v) => v !== undefined && v.length > MAX_CATALOG_PARAM_CHARS)
+    ) {
+      return replyJson(res, 400, { error: 'bad_request' });
+    }
+    const apiKey = providerKeys[provider];
+    if (!apiKey) return replyJson(res, 503, { error: 'provider_unavailable', provider });
+    const result = await catalog.page(provider, apiKey, { q, language, cursor, limit });
+    if ('error' in result) return replyJson(res, result.error === 'upstream' ? 502 : 400, { error: result.error });
+    return replyJson(res, 200, result.page);
+  };
 
   /** HTTP routes under /webhook/voice-mode/ and /webhook/voice/, and the browser's under /voice/, on the shared webhook server. */
   const handleHttp = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
@@ -478,6 +605,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         };
         return reply(res, 200, JSON.stringify(info), JSON_HEADERS);
       }
+      if (route === 'tts') return await handleTts(req, res, token);
+      if (route === 'voices') return await handleVoices(req, res, url, token);
       reply(res, 404, 'Not found');
     } catch (err) {
       // The shared webhook server has no other way to answer the browser.
@@ -546,6 +675,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         livekit: config.livekit.url,
         protocol: LIVEKIT_PROTOCOL_VERSION,
         agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
+        speechProviders: Object.keys(providerKeys),
         pageListener: pageServer ? `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}` : 'off',
       });
     },
@@ -677,8 +807,11 @@ function parseSilenceMs(raw: string | undefined): number | undefined {
   return undefined;
 }
 
-/** The settings a call cannot run without, beyond the link token; the worker holds the Gemini key, the host checks it is there. */
-const LIVEKIT_REQUIRED = ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'GEMINI_API_KEY'] as const;
+/**
+ * The settings a call cannot run without, beyond the link token. The worker speaks with the Gemini key (the
+ * default provider and the transcription); the host checks it is there and offers the voices it lists.
+ */
+const LIVEKIT_REQUIRED = ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'VOICE_MODE_GEMINI_API_KEY'] as const;
 
 registerChannelAdapter(VOICE_MODE_CHANNEL, {
   factory: () => {
@@ -699,13 +832,11 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
           'VOICE_MODE_ALLOWED_CLIENT_CIDRS',
           'VOICE_MODE_VOCABULARY',
           ...LIVEKIT_REQUIRED,
+          'VOICE_MODE_ELEVENLABS_API_KEY',
           'LIVEKIT_WORKER_URL',
           'LIVEKIT_AGENT_NAME',
           'VOICE_MODE_STT_MODEL',
           'VOICE_MODE_STT_FALLBACK_MODEL',
-          'VOICE_MODE_TTS_MODEL',
-          'VOICE_MODE_TTS_FALLBACK_MODEL',
-          'VOICE_MODE_TTS_VOICE',
           'VOICE_MODE_SILENCE_MS',
           'VOICE_MODE_MIRROR',
           'VOICE_MODE_WAKE_MODEL',
@@ -742,6 +873,9 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       maxCallsPerHour: Number(env.VOICE_MODE_MAX_CALLS_PER_HOUR ?? 12),
       maxCallMsPerDay: Number(env.VOICE_MODE_MAX_MINUTES_PER_DAY ?? 120) * 60_000,
       vocabulary: env.VOICE_MODE_VOCABULARY,
+      providerKeys: Object.fromEntries(
+        Object.values(TTS_REGISTRY).flatMap((entry) => (env[entry.envKey] ? [[entry.id, env[entry.envKey]]] : [])),
+      ),
       livekit: {
         url: env.LIVEKIT_URL,
         languages: parseVoiceLanguages(env.VOICE_MODE_LANGUAGES),
@@ -752,9 +886,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
         speech: {
           sttModel: env.VOICE_MODE_STT_MODEL,
           sttFallbackModel: env.VOICE_MODE_STT_FALLBACK_MODEL,
-          ttsModel: env.VOICE_MODE_TTS_MODEL,
-          ttsFallbackModel: env.VOICE_MODE_TTS_FALLBACK_MODEL,
-          ttsVoice: env.VOICE_MODE_TTS_VOICE,
           silenceMs: parseSilenceMs(env.VOICE_MODE_SILENCE_MS),
         },
         mirror: (env.VOICE_MODE_MIRROR || DEFAULT_VOICE_MIRROR).trim().toLowerCase(),
