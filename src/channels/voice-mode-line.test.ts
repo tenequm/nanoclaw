@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { closeDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, getDb, initTestDb, runMigrations } from '../db/index.js';
+import { getRegisteredMigrations } from '../db/migrations/index.js';
 import { createAgentGroup } from '../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../db/messaging-groups.js';
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
@@ -61,5 +62,48 @@ describe('voice line access without a voice_mode_lines row (real central DB)', (
   it('resolves no membership line in the voice-mode namespace either', async () => {
     await memberLine('voice-mode', 'voice-mode:ethan-test');
     expect(await resolveVoiceModeLine('voice-mode:ethan-test')).toBeNull();
+  });
+});
+
+describe('module:voice-mode:drop-legacy-lines (real migrations)', () => {
+  const DROP = 'module:voice-mode:drop-legacy-lines';
+  /** Read from the schema itself: the driver's hasTable caches a table it once saw. */
+  const voiceTables = async (): Promise<string[]> =>
+    (
+      await getDb().all<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'voice%' ORDER BY name",
+      )
+    ).map((row) => row.name);
+
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  it('drops the legacy voice line tables, rows and all, from a DB that has them', async () => {
+    const db = await initTestDb();
+    await runMigrations(
+      db,
+      getRegisteredMigrations().filter((m) => m.name !== DROP),
+    );
+    await getDb().run(
+      'INSERT INTO voice_lines (line_messaging_group_id, updated_at) VALUES (?, ?)',
+      'mg-line',
+      stamp(),
+    );
+    await getDb().run(
+      'INSERT INTO voice_line_owners (line_messaging_group_id, owner_user_id) VALUES (?, ?)',
+      'mg-line',
+      'telegram:1',
+    );
+    expect(await voiceTables()).toEqual(['voice_line_owners', 'voice_lines', 'voice_mode_lines']);
+
+    await runMigrations(db);
+    expect(await voiceTables()).toEqual(['voice_mode_lines']);
+    expect(await db.get('SELECT name FROM schema_version WHERE name = ?', DROP)).toEqual({ name: DROP });
+  });
+
+  it('leaves a fresh DB without them', async () => {
+    await runMigrations(await initTestDb());
+    expect(await voiceTables()).toEqual(['voice_mode_lines']);
   });
 });
