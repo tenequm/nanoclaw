@@ -19,9 +19,9 @@
  *  - each finished turn goes to the host, which hands it to the agent as a spoken message;
  *  - each complete agent reply from the host's event stream is spoken once the caller is not
  *    mid-turn, in full (cut at a sentence end only when VOICE_MODE_MAX_SPOKEN_CHARS sets a cap),
- *    uninterruptible: while it plays the caller is not transcribed (no barge-in). Gemini TTS
- *    streams the whole reply from one request into the call's speech track, and a second model
- *    speaks while the first fails.
+ *    uninterruptible: while it plays the caller is not transcribed (no barge-in). The line's TTS
+ *    provider (`voice-mode-tts.ts`) streams the whole reply from one request into the call's speech
+ *    track, and a fallback speaks while it fails; the caller's page can switch it mid-call.
  * The worker publishes the captions, `lk.agent.state` and its own attributes the page reads.
  */
 import { randomUUID } from 'node:crypto';
@@ -35,7 +35,6 @@ import {
   audioFramesFromFile,
   BuiltinAudioClip,
   getBuiltinAudioPath,
-  type APIConnectOptions,
   cli,
   defineAgent,
   InferenceRunner,
@@ -46,7 +45,6 @@ import {
   type JobProcess,
   type VAD,
 } from '@livekit/agents';
-import * as google from '@livekit/agents-plugin-google';
 import * as silero from '@livekit/agents-plugin-silero';
 import {
   AudioFrame,
@@ -90,6 +88,7 @@ import {
   CALL_THINKING_ATTRIBUTE,
   CALL_TURN_TOPIC,
   CALL_UPDATING_ATTRIBUTE,
+  CALL_VOICE_ATTRIBUTE,
   MAX_TURN_TEXT_BYTES,
   REVIEW_RPC,
   WORKER_REQUEST_TIMEOUT_MS,
@@ -98,6 +97,7 @@ import {
   type CallDroppedSpeech,
   type CallReviewState,
   type CallUnheardSpeech,
+  type CallVoiceState,
   type CallWakeState,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
@@ -112,6 +112,15 @@ import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import { GeminiLiveTranscriber, type Heard, type TranscriberOptions } from './voice-mode-gemini-live.js';
 import { JevTurnShadow, type TurnShadowSink } from './voice-mode-jev-turn.js';
+import {
+  readTtsChoice,
+  TTS_DEFAULT_CHOICE,
+  TTS_REGISTRY,
+  type TtsAudio,
+  type TtsChoice,
+  type TtsInstance,
+  type TtsProvider,
+} from './voice-mode-tts.js';
 import {
   CUSTOM_WAKE_THRESHOLD,
   DEFAULT_WAKE_MODEL,
@@ -468,6 +477,44 @@ export function lineFilter(
 }
 
 /**
+ * A line's audio as the speech track takes it: 24 kHz mono, channels averaged and the rate converted by
+ * linear interpolation, its state running across the line's chunks. Audio already at 24 kHz mono passes as is.
+ */
+export function lineResampler(rate = TTS_SAMPLE_RATE): (audio: TtsAudio) => Int16Array {
+  let prev = 0;
+  /** Where the next output sample falls, in input samples from the chunk's start (-1 is the last chunk's end). */
+  let at = 0;
+  return ({ pcm, sampleRate, numChannels }) => {
+    const channels = Math.max(1, numChannels);
+    const length = Math.floor(pcm.length / channels);
+    let mono = pcm;
+    if (channels > 1) {
+      mono = new Int16Array(length);
+      for (let i = 0; i < length; i++) {
+        let sum = 0;
+        for (let c = 0; c < channels; c++) sum += pcm[i * channels + c];
+        mono[i] = Math.round(sum / channels);
+      }
+    }
+    if (sampleRate === rate || !length) return mono;
+    const step = sampleRate / rate;
+    const count = at > length - 1 ? 0 : Math.floor((length - 1 - at) / step) + 1;
+    const out = new Int16Array(count);
+    for (let k = 0; k < count; k++) {
+      const t = at + k * step;
+      const i = Math.floor(t);
+      const frac = t - i;
+      const a = i < 0 ? prev : mono[i];
+      const b = frac ? mono[i + 1] : a;
+      out[k] = Math.round(a + (b - a) * frac);
+    }
+    at += count * step - length;
+    prev = mono[length - 1];
+    return out;
+  };
+}
+
+/**
  * Speakable text cut to `max` characters for a call: up to the last sentence end within the cap when
  * that keeps most of it, else the last whole word, then a closing line (CUT_LINES; "the rest is in the
  * chat" only when `inChat`). Unchanged when it fits or `max` is 0.
@@ -505,55 +552,115 @@ const EMOJI =
 /** A transient failure before any audio is tried once more after this long. */
 const TTS_RETRY_DELAY_MS = 1_000;
 
-/** A speech model as GeminiSpeech uses it: the google plugin's TTS, or a test's. */
-export interface SpeechModel {
-  synthesize(
-    text: string,
-    connOptions?: APIConnectOptions,
-    abortSignal?: AbortSignal,
-  ): AsyncIterable<{ frame: AudioFrame }> & { readonly error?: Error; close?(): void };
-  on(event: 'error', listener: (ev: unknown) => void): unknown;
-}
+/** The call's provider keys, by provider; a provider without one never speaks. */
+export type ProviderKeys = Partial<Record<TtsProvider, string>>;
 
-export interface SpeechOptions {
-  apiKey: string;
-  model: string;
-  /** Speaks while `model` fails; empty for none. */
-  fallbackModel: string;
-  voice: string;
+export interface LineSpeechOptions {
+  /** What the call speaks with until the caller picks another (the job's `tts`). */
+  choice: TtsChoice;
+  keys: ProviderKeys;
   log: Pick<Console, 'info' | 'warn'>;
-  /** The speech models by name; the google plugin's TTS by default. */
-  create?(model: string): SpeechModel;
+  /** A provider instance; the registry entry's build by default. */
+  build?(choice: TtsChoice, apiKey: string): TtsInstance;
+  /** What speaks or is queued changed. */
+  changed?(state: CallVoiceState): void;
   now?: () => number;
 }
 
-/**
- * Gemini TTS through the google plugin's TTS, used standalone: each line goes to the model whole, in
- * one request, so it is voiced with one intonation, and its audio streams back as it is made. A
- * transient failure before any audio is tried once more; then the fallback model speaks, and the
- * first model is skipped for TTS_RECOVERY_DELAY_MS and tried again on the next line after that.
- * A failure after audio started ends the line: its start would be said twice.
- */
-export class GeminiSpeech {
-  private downUntil = 0;
-  private readonly now: () => number;
-  private readonly models = new Map<string, SpeechModel>();
-  /** The model the last line's audio came from. */
-  spokenBy = '';
+export const sameTts = (a: TtsChoice, b: TtsChoice): boolean =>
+  a.provider === b.provider && a.model === b.model && a.voice === b.voice;
+const ttsKey = (c: TtsChoice): string => `${c.provider}/${c.model}/${c.voice}`;
 
-  constructor(private readonly opts: SpeechOptions) {
+/**
+ * A call's speech through the providers of voice-mode-tts: each line goes to one provider whole, in
+ * one request, so it is voiced with one intonation, and its audio streams back as it is made. A
+ * transient failure before any audio is tried once more; then the next of [the active choice, its
+ * entry's fallback, the registry default] speaks, and the active one is skipped for
+ * TTS_RECOVERY_DELAY_MS and tried again on the next line after that. A failure after audio started
+ * ends the line: its start would be said twice. A choice the caller picks waits for the next line.
+ */
+export class LineSpeech {
+  private current: TtsChoice;
+  private pending?: { choice: TtsChoice; instance: TtsInstance };
+  /** The `settings` request that queued the last accepted choice. */
+  private gen?: number;
+  private readonly instances = new Map<string, TtsInstance>();
+  private downUntil = 0;
+  private closed = false;
+  private readonly now: () => number;
+  /** What the last line's audio came from. */
+  spokenBy?: TtsChoice;
+
+  constructor(private readonly opts: LineSpeechOptions) {
+    this.current = opts.choice;
     this.now = opts.now ?? (() => Date.now());
   }
 
-  /** The line's audio as it is made (24 kHz mono); throws when no model could say all of it. */
-  async *speak(text: string, signal: AbortSignal): AsyncGenerator<Int16Array> {
+  get active(): TtsChoice {
+    return this.current;
+  }
+
+  get state(): CallVoiceState {
+    return {
+      v: 1,
+      active: this.current,
+      ...(this.pending ? { pending: this.pending.choice } : {}),
+      ...(this.gen !== undefined ? { gen: this.gen } : {}),
+    };
+  }
+
+  /** The `settings` RPC's `tts` (request `gen`): from the next line on; a newer one replaces it. */
+  select(raw: unknown, gen: number): 'tts_invalid' | 'tts_unavailable' | undefined {
+    const read = readTtsChoice(raw);
+    if ('invalid' in read) return 'tts_invalid';
+    const { choice } = read;
+    if (this.closed) return 'tts_unavailable';
+    // Asked again: nothing changes.
+    if (sameTts(choice, this.pending?.choice ?? this.current)) return undefined;
+    if (sameTts(choice, this.current)) {
+      this.dropPending();
+    } else {
+      const key = this.opts.keys[choice.provider];
+      if (!key) return 'tts_unavailable';
+      let instance: TtsInstance;
+      try {
+        instance = this.build(choice, key);
+      } catch (err) {
+        this.opts.log.warn('voice-mode worker: could not set up a speech provider', {
+          provider: choice.provider,
+          err: err instanceof Error ? err.message : err,
+        });
+        return 'tts_unavailable';
+      }
+      this.dropPending();
+      this.pending = { choice, instance };
+    }
+    this.gen = gen;
+    this.opts.changed?.(this.state);
+    return undefined;
+  }
+
+  /** A line starts: the queued choice becomes the active one and the old instances are closed. Returns the active choice. */
+  take(): TtsChoice {
+    const next = this.pending;
+    if (!next) return this.current;
+    this.pending = undefined;
+    this.current = next.choice;
+    this.downUntil = 0;
+    // Lines are serialized: no old instance is speaking now.
+    for (const instance of this.instances.values()) void instance.close();
+    this.instances.clear();
+    this.instances.set(ttsKey(next.choice), next.instance);
+    this.opts.changed?.(this.state);
+    return this.current;
+  }
+
+  /** The line's audio as it is made; throws when no provider could say all of it. */
+  async *speak(text: string, signal: AbortSignal): AsyncGenerator<TtsAudio> {
     const line = text.replace(EMOJI, '').trim();
     if (!line) return;
-    const { model, fallbackModel } = this.opts;
-    const fallback = fallbackModel && fallbackModel !== model ? fallbackModel : '';
-    const order = !fallback ? [model] : this.now() < this.downUntil ? [fallback, model] : [model, fallback];
-    let lastError: unknown = new Error('no speech model');
-    for (const name of order) {
+    let lastError: unknown = new Error('no speech provider');
+    for (const choice of this.order()) {
       for (let attempt = 0; attempt < 2; attempt++) {
         if (signal.aborted) return;
         let spoke = false;
@@ -563,82 +670,105 @@ export class GeminiSpeech {
         const request = new AbortController();
         const forward = () => request.abort();
         signal.addEventListener('abort', forward, { once: true });
-        const stream = this.model(name).synthesize(
-          line,
-          { maxRetry: 0, retryIntervalMs: 0, timeoutMs: TTS_IDLE_TIMEOUT_MS },
-          request.signal,
-        );
         try {
-          for await (const audio of withIdleTimeout(stream, TTS_IDLE_TIMEOUT_MS)) {
+          const audio = this.instance(choice).synthesize(line, request.signal);
+          for await (const chunk of withIdleTimeout(audio, TTS_IDLE_TIMEOUT_MS)) {
             spoke = true;
-            this.spokenBy = name;
-            yield audio.frame.data;
+            this.spokenBy = choice;
+            yield chunk;
           }
-          error = stream.error ?? (spoke ? undefined : new Error(`speech model ${name} sent no audio`));
         } catch (err) {
-          // A stall (or a throwing stream) is a failure like any other: before audio the next model speaks.
+          // A stall (or a provider that cannot be set up) is a failure like any other: before audio the next one speaks.
           error = err instanceof Error ? err : new Error(String(err));
         } finally {
           signal.removeEventListener('abort', forward);
           request.abort();
-          stream.close?.();
         }
         if (signal.aborted) return;
         if (!error) {
-          this.markUp(name);
+          this.markUp(choice);
           return;
         }
         lastError = error;
-        this.opts.log.warn(`voice-mode worker: speech model ${name} failed`, { err: error.message, partial: spoke });
+        this.opts.log.warn(`voice-mode worker: speech ${choice.provider}/${choice.model} failed`, {
+          err: error.message,
+          partial: spoke,
+        });
         if (spoke) throw error;
         if (attempt > 0 || (error as { retryable?: boolean }).retryable !== true) break;
         await pause(TTS_RETRY_DELAY_MS);
       }
-      this.markDown(name);
+      this.markDown(choice);
     }
     throw lastError;
   }
 
-  private model(name: string): SpeechModel {
-    let speech = this.models.get(name);
-    if (!speech) {
-      speech =
-        this.opts.create?.(name) ??
-        (new google.beta.TTS({
-          apiKey: this.opts.apiKey,
-          model: name,
-          voiceName: this.opts.voice,
-          instructions: '',
-        }) as unknown as SpeechModel);
-      // The TTS reports a failed request as an event too; with no listener an EventEmitter would throw it.
-      speech.on('error', () => undefined);
-      this.models.set(name, speech);
-    }
-    return speech;
+  async close(): Promise<void> {
+    this.closed = true;
+    const all = [...this.instances.values(), ...(this.pending ? [this.pending.instance] : [])];
+    this.instances.clear();
+    this.pending = undefined;
+    await Promise.all(all.map((instance) => instance.close()));
   }
 
-  private markDown(model: string): void {
-    if (model !== this.opts.model || !this.opts.fallbackModel) return;
+  /** Who speaks a line, in order: the active choice (last while it is down), its fallback, the default; each once, with a key. */
+  private order(): TtsChoice[] {
+    const fallback = TTS_REGISTRY[this.current.provider].fallback(this.current);
+    const all = [this.current, ...(fallback ? [fallback] : []), TTS_DEFAULT_CHOICE].filter(
+      (choice, i, list) => list.findIndex((other) => sameTts(other, choice)) === i,
+    );
+    const order = this.now() < this.downUntil ? [...all.slice(1), all[0]] : all;
+    return order.filter((choice) => this.opts.keys[choice.provider]);
+  }
+
+  private instance(choice: TtsChoice): TtsInstance {
+    const key = ttsKey(choice);
+    let instance = this.instances.get(key);
+    if (!instance) {
+      instance = this.build(choice, this.opts.keys[choice.provider] ?? '');
+      this.instances.set(key, instance);
+    }
+    return instance;
+  }
+
+  private build(choice: TtsChoice, apiKey: string): TtsInstance {
+    return this.opts.build
+      ? this.opts.build(choice, apiKey)
+      : TTS_REGISTRY[choice.provider].build(choice, apiKey, this.opts.log);
+  }
+
+  private dropPending(): void {
+    void this.pending?.instance.close();
+    this.pending = undefined;
+  }
+
+  private markDown(choice: TtsChoice): void {
+    if (!sameTts(choice, this.current)) return;
     this.downUntil = this.now() + TTS_RECOVERY_DELAY_MS;
   }
 
-  private markUp(model: string): void {
-    if (model !== this.opts.model || this.downUntil === 0) return;
+  private markUp(choice: TtsChoice): void {
+    if (!sameTts(choice, this.current) || this.downUntil === 0) return;
     this.downUntil = 0;
-    this.opts.log.info(`voice-mode worker: speech model ${model} is back`);
+    this.opts.log.info(`voice-mode worker: speech ${choice.provider}/${choice.model} is back`);
   }
 }
 
 /** The stream's items until it ends, or until none came for `ms` (then it stops, as a stall). */
 async function* withIdleTimeout<T>(stream: AsyncIterable<T>, ms: number): AsyncGenerator<T> {
   const it = stream[Symbol.asyncIterator]();
-  for (;;) {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const stalled = new Promise<'stalled'>((resolve) => (timer = setTimeout(() => resolve('stalled'), ms)));
-    const next = await Promise.race([it.next(), stalled]).finally(() => clearTimeout(timer));
-    if (next === 'stalled') throw new Error(`speech stalled: no audio for ${ms} ms`);
-    if (next.done) return;
-    yield next.value;
+  try {
+    for (;;) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stalled = new Promise<'stalled'>((resolve) => (timer = setTimeout(() => resolve('stalled'), ms)));
+      const next = await Promise.race([it.next(), stalled]).finally(() => clearTimeout(timer));
+      if (next === 'stalled') throw new Error(`speech stalled: no audio for ${ms} ms`);
+      if (next.done) return;
+      yield next.value;
+    }
+  } finally {
+    // The stream finishes its own cleanup once the request's abort ended it.
+    void it.return?.()?.catch(() => undefined);
   }
 }
 
@@ -825,8 +955,11 @@ export function audioLevels(pcm: Int16Array): { peakDb: number; rmsDb: number } 
 /** One spoken line, as its `voice-mode.reply` event reports it: never its words. */
 export interface SpokenLine {
   outcome: 'spoken' | 'partial' | 'failed';
-  /** The speech model its audio came from; absent when none came. */
+  /** The speech provider and model its audio came from, as `<provider>/<model>`; absent when none came. */
   model?: string;
+  /** The voice its audio came from; absent when none came. */
+  voice?: string;
+  /** Its audio came from another choice than the line's active one. */
   fallback: boolean;
   /** From the synthesis request to the model's first audio. */
   firstAudioMs?: number;
@@ -875,15 +1008,20 @@ export class LineMeter {
 
   /**
    * The line's numbers, or null when it neither played nor failed (the call ended first).
-   * `cut`: the call ended while it played.
+   * `by`: what its audio came from; `primary`: the line's active choice. `cut`: the call ended while it played.
    */
-  done(o: { model: string; primary: string; failed: boolean; cut: boolean }): SpokenLine | null {
+  done(o: { by?: TtsChoice; primary: TtsChoice; failed: boolean; cut: boolean }): SpokenLine | null {
     if (!this.samples && !o.failed) return null;
     const outcome = o.failed ? (this.samples ? 'partial' : 'failed') : o.cut ? 'partial' : 'spoken';
     return {
       outcome,
-      ...(this.firstAudioAt
-        ? { model: o.model, fallback: o.model !== o.primary, firstAudioMs: this.firstAudioAt - this.startedAt }
+      ...(this.firstAudioAt && o.by
+        ? {
+            model: `${o.by.provider}/${o.by.model}`,
+            voice: o.by.voice,
+            fallback: !sameTts(o.by, o.primary),
+            firstAudioMs: this.firstAudioAt - this.startedAt,
+          }
         : { fallback: false }),
       ...(this.firstAudioAt && this.playingAt ? { heldMs: this.playingAt - this.firstAudioAt } : {}),
       durationMs: Math.round((this.samples * 1000) / TTS_SAMPLE_RATE),
@@ -987,6 +1125,11 @@ export interface CallVoice {
   caption?(segment: number, text: string, final: boolean, mark?: CaptionMark): void;
   /** Review mode's controls; absent where the room cannot run it. */
   review?: ReviewSession;
+  /**
+   * The `settings` RPC's `tts` of request `gen`: what speaks from the next line on. Returns the reply's
+   * error when it is refused; absent where the room cannot switch.
+   */
+  selectTts?(tts: NonNullable<ReviewRequest['tts']>, gen: number): ReviewReply['error'] | undefined;
   /** Play a sound cue on the call's cue track; resolves once the track took all of it (heard about 0.1 s later). */
   playCue?(kind: CueKind): Promise<void>;
   /** Loop the typing sound on the cue track (under no cue), or stop it. */
@@ -2772,8 +2915,8 @@ export interface ReviewDeps {
   setCaptureOpen(open: boolean): void;
   /** Entering review: the auto mode's open turn is not waited for any more (TurnTaking.resetCaller). */
   resetCaller(): void;
-  /** The `settings` RPC: auto mode's wake switch and the sound cues. */
-  configure?(req: ReviewRequest): void;
+  /** The `settings` RPC: auto mode's wake switch, the sound cues and the voice; returns the reply's error, if any. */
+  configure?(req: ReviewRequest): ReviewReply['error'] | undefined;
   /** Auto mode's wake state, sent with every review state. */
   wakeState?(): CallWakeState;
   cue?(kind: CueKind): void;
@@ -2857,9 +3000,9 @@ export class ReviewControl {
       : undefined;
     switch (op) {
       case 'settings': {
-        this.deps.configure?.(req);
+        const error = this.deps.configure?.(req);
         this.publish();
-        return reply();
+        return reply(error ? { error } : {});
       }
       case 'mode': {
         if (req.mode === undefined || req.mode === this.mode) {
@@ -3032,10 +3175,22 @@ export function readReviewRequest(payload: string): ReviewRequest | null {
       ...(typeof req.pauseSends === 'boolean' ? { pauseSends: req.pauseSends } : {}),
       ...(typeof req.cues === 'boolean' ? { cues: req.cues } : {}),
       ...(typeof req.typing === 'boolean' ? { typing: req.typing } : {}),
+      ...(req.tts !== undefined ? { tts: readTtsRequest(req.tts) } : {}),
     };
   } catch {
     return null;
   }
+}
+
+const ttsField = (value: unknown): value is string => typeof value === 'string' && value.length <= 64;
+
+/** A `settings` request's `tts` as sent; a malformed one names no provider, so it is refused as invalid. */
+function readTtsRequest(raw: unknown): NonNullable<ReviewRequest['tts']> {
+  const { provider, model, voice } = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>;
+  if (!ttsField(provider) || (model != null && !ttsField(model)) || (voice != null && !ttsField(voice))) {
+    return { provider: '' };
+  }
+  return { provider, ...(model != null ? { model } : {}), ...(voice != null ? { voice } : {}) };
 }
 
 /** The fields every job carries whatever its version, enough to answer a mismatched one. */
@@ -3082,7 +3237,8 @@ export type CallJob = Pick<
 
 /** What a call's room needs besides the job metadata. */
 export interface VoiceModeSettings {
-  geminiKey: string;
+  /** The speech providers' keys from the worker's settings; Gemini's is always there. */
+  providerKeys: ProviderKeys;
   /** Recordings are on: `spoke` gets each line's audio as it went to the speech track. */
   recordReplies?: boolean;
   /** De-ess the agent's speech (VOICE_MODE_TTS_DEESS). */
@@ -3341,9 +3497,139 @@ export class CallerInput {
   }
 }
 
+/** Where a call's spoken lines go: the speech track's audio source, or a test's. */
+export interface SpeechSink {
+  captureFrame(frame: AudioFrame): Promise<void>;
+  waitForPlayout(): Promise<void>;
+}
+
+export interface SpeechOutputOptions {
+  meta: Pick<LiveKitJobMetadata, 'tts'>;
+  settings: VoiceModeSettings;
+  sink: SpeechSink;
+  log: Pick<Console, 'info' | 'warn'>;
+  /** A line's first audio plays: the agent speaks it. */
+  started(text: string): void;
+  /** A line that played is over. */
+  stopped(): void;
+  /** What speaks or is queued changed. */
+  changed(state: CallVoiceState): void;
+  build?: LineSpeechOptions['build'];
+}
+
+/** The call's speech: its lines into the speech sink, and the caller's pick of what speaks them. */
+export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
+  selectTts: NonNullable<CallVoice['selectTts']>;
+  readonly speech: LineSpeech;
+  close(): Promise<void>;
+} {
+  const read = readTtsChoice(o.meta.tts);
+  if ('invalid' in read) {
+    o.log.warn('voice-mode worker: the call names no valid speech choice; the default speaks', {
+      field: read.invalid,
+    });
+  }
+  const speech = new LineSpeech({
+    choice: 'choice' in read ? read.choice : TTS_DEFAULT_CHOICE,
+    keys: o.settings.providerKeys,
+    log: o.log,
+    changed: o.changed,
+    ...(o.build ? { build: o.build } : {}),
+  });
+  const abort = new AbortController();
+  let closed = false;
+  /** One line into the speech sink: streamed as it is synthesized, resolved once it has played. */
+  const say = async (text: string, ready?: () => Promise<void>): Promise<boolean> => {
+    let heard = false;
+    let failed = false;
+    let rest: Int16Array | undefined;
+    const meter = new LineMeter();
+    const primary = speech.take();
+    /** The frames sent to the speech track, for the reply's recording. */
+    const sent: Int16Array[] = [];
+    // One resampler and one filter per line: their state runs across the line's frames. The filter
+    // is the one of the provider that speaks the line.
+    const resample = lineResampler();
+    let filter: ((pcm: Int16Array) => Int16Array) | undefined;
+    const capture = async (synthesized: Int16Array) => {
+      const frame = filter ? filter(synthesized) : synthesized;
+      meter.frame(frame);
+      if (o.settings.recordReplies) sent.push(frame);
+      await o.sink.captureFrame(new AudioFrame(frame, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
+    };
+    const play = async (pcm: Int16Array) => {
+      let data = pcm;
+      if (rest) {
+        data = new Int16Array(rest.length + pcm.length);
+        data.set(rest);
+        data.set(pcm, rest.length);
+      }
+      let at = 0;
+      for (; at + SPEECH_FRAME <= data.length; at += SPEECH_FRAME) await capture(data.slice(at, at + SPEECH_FRAME));
+      rest = at < data.length ? data.slice(at) : undefined;
+    };
+    try {
+      for await (const audio of speech.speak(text, abort.signal)) {
+        if (closed) break;
+        meter.audio();
+        filter ??= lineFilter({
+          deess: !!o.settings.deess,
+          notch: !!o.settings.notch && TTS_REGISTRY[(speech.spokenBy ?? primary).provider].filters.notch,
+        });
+        const pcm = resample(audio);
+        if (!heard) {
+          await ready?.();
+          if (closed) break;
+          heard = true;
+          meter.playing();
+          o.started(text);
+        }
+        await play(pcm);
+      }
+      if (rest) {
+        const tail = new Int16Array(SPEECH_FRAME);
+        tail.set(rest);
+        rest = undefined;
+        await capture(tail);
+      }
+      if (heard) await o.sink.waitForPlayout();
+      return heard && !closed;
+    } catch (err) {
+      failed = true;
+      o.log.warn('voice-mode worker: a line could not be synthesized', {
+        err: err instanceof Error ? err.message : err,
+      });
+      if (heard) await o.sink.waitForPlayout().catch(() => undefined);
+      return false;
+    } finally {
+      if (heard && !closed) o.stopped();
+      const line = meter.done({ by: speech.spokenBy, primary, failed, cut: closed });
+      if (line) {
+        let pcm: Int16Array | undefined;
+        if (sent.length) {
+          const all = new Int16Array(sent.length * SPEECH_FRAME);
+          sent.forEach((frame, i) => all.set(frame, i * SPEECH_FRAME));
+          pcm = all;
+        }
+        o.settings.spoke?.(line, pcm);
+      }
+    }
+  };
+  return {
+    say,
+    selectTts: (tts, gen) => speech.select(tts, gen),
+    speech,
+    async close() {
+      closed = true;
+      abort.abort();
+      await speech.close();
+    },
+  };
+}
+
 /**
  * The real room: the caller's microphone at 16 kHz into Silero and the call's turns, the agent's
- * speech track fed by Gemini TTS, the cue track, and what the page reads (captions, attributes,
+ * speech track fed by the call's speech output, the cue track, and what the page reads (captions, attributes,
  * topics, RPCs).
  */
 async function roomVoice(
@@ -3359,13 +3645,6 @@ async function roomVoice(
   const local = room.localParticipant;
   if (!local) throw new Error('no local participant');
   let closed = false;
-  const speech = new GeminiSpeech({
-    apiKey: settings.geminiKey,
-    model: meta.ttsModel,
-    fallbackModel: meta.ttsFallbackModel,
-    voice: meta.ttsVoice,
-    log,
-  });
   const speechSource = new AudioSource(TTS_SAMPLE_RATE, 1);
   const speechTrack = LocalAudioTrack.createAudioTrack(SPEECH_TRACK, speechSource);
   const speechPublication = await local.publishTrack(
@@ -3428,95 +3707,44 @@ async function roomVoice(
     }
   }
 
-  const sayAbort = new AbortController();
   let typing = false;
-  /** One line into the speech track: streamed as it is synthesized, resolved once it has played. */
-  const say = async (text: string, ready?: () => Promise<void>): Promise<boolean> => {
-    let heard = false;
-    let failed = false;
-    let rest: Int16Array | undefined;
-    const meter = new LineMeter();
-    /** The frames sent to the speech track, for the reply's recording. */
-    const sent: Int16Array[] = [];
-    // One filter per line: its state runs across the line's frames.
-    const filter = lineFilter({ deess: !!settings.deess, notch: !!settings.notch });
-    const capture = async (synthesized: Int16Array) => {
-      const frame = filter(synthesized);
-      meter.frame(frame);
-      if (settings.recordReplies) sent.push(frame);
-      await speechSource.captureFrame(new AudioFrame(frame, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
-    };
-    const play = async (pcm: Int16Array) => {
-      let data = pcm;
-      if (rest) {
-        data = new Int16Array(rest.length + pcm.length);
-        data.set(rest);
-        data.set(pcm, rest.length);
-      }
-      let at = 0;
-      for (; at + SPEECH_FRAME <= data.length; at += SPEECH_FRAME) await capture(data.slice(at, at + SPEECH_FRAME));
-      rest = at < data.length ? data.slice(at) : undefined;
-    };
-    try {
-      for await (const pcm of speech.speak(text, sayAbort.signal)) {
-        if (closed) break;
-        meter.audio();
-        if (!heard) {
-          await ready?.();
-          if (closed) break;
-          heard = true;
-          meter.playing();
-          setAttr(AGENT_STATE_ATTRIBUTE, 'speaking', 'the agent state');
-          events.onAgentSpeaking?.(true);
-          // The line's caption, on the agent's speech track, as its audio starts.
-          post('a caption', () =>
-            local.sendText(text, {
-              topic: TRANSCRIPTION_TOPIC,
-              attributes: {
-                [SEGMENT_ID]: `SG_${randomUUID()}`,
-                [TRANSCRIPTION_FINAL]: 'true',
-                ...(speechPublication.sid ? { [TRANSCRIBED_TRACK]: speechPublication.sid } : {}),
-              },
-            }),
-          );
-        }
-        await play(pcm);
-      }
-      if (rest) {
-        const tail = new Int16Array(SPEECH_FRAME);
-        tail.set(rest);
-        rest = undefined;
-        await capture(tail);
-      }
-      if (heard) await speechSource.waitForPlayout();
-      return heard && !closed;
-    } catch (err) {
-      failed = true;
-      log.warn('voice-mode worker: a line could not be synthesized', { err: err instanceof Error ? err.message : err });
-      if (heard) await speechSource.waitForPlayout().catch(() => undefined);
-      return false;
-    } finally {
-      if (heard && !closed) {
-        setAttr(AGENT_STATE_ATTRIBUTE, 'listening', 'the agent state');
-        events.onAgentSpeaking?.(false);
-      }
-      const line = meter.done({ model: speech.spokenBy, primary: meta.ttsModel, failed, cut: closed });
-      if (line) {
-        let pcm: Int16Array | undefined;
-        if (sent.length) {
-          const all = new Int16Array(sent.length * SPEECH_FRAME);
-          sent.forEach((frame, i) => all.set(frame, i * SPEECH_FRAME));
-          pcm = all;
-        }
-        settings.spoke?.(line, pcm);
-      }
-    }
+  // Each change is logged too: the journal shows what spoke when.
+  const publishVoice = (state: CallVoiceState) => {
+    log.info('voice-mode.voice', { voice: state });
+    setAttr(CALL_VOICE_ATTRIBUTE, JSON.stringify(state), 'the call voice');
   };
+  const speaker = speechOutput({
+    meta,
+    settings,
+    sink: speechSource,
+    log,
+    started: (text) => {
+      setAttr(AGENT_STATE_ATTRIBUTE, 'speaking', 'the agent state');
+      events.onAgentSpeaking?.(true);
+      // The line's caption, on the agent's speech track, as its audio starts.
+      post('a caption', () =>
+        local.sendText(text, {
+          topic: TRANSCRIPTION_TOPIC,
+          attributes: {
+            [SEGMENT_ID]: `SG_${randomUUID()}`,
+            [TRANSCRIPTION_FINAL]: 'true',
+            ...(speechPublication.sid ? { [TRANSCRIBED_TRACK]: speechPublication.sid } : {}),
+          },
+        }),
+      );
+    },
+    stopped: () => {
+      setAttr(AGENT_STATE_ATTRIBUTE, 'listening', 'the agent state');
+      events.onAgentSpeaking?.(false);
+    },
+    changed: publishVoice,
+  });
 
   // The first `listening` goes out with the review attributes, from review.serve: a page takes
   // `listening` as the call being live, so what the call offers is known with it.
   return {
-    say,
+    say: speaker.say,
+    selectTts: speaker.selectTts,
     setThinking: (thinking) => setAttr(CALL_THINKING_ATTRIBUTE, thinking ? '1' : '', 'the thinking state'),
     publishTurn: (status) => sendJson(CALL_TURN_TOPIC, status, 'a turn status'),
     publishDropped: (dropped) => sendJson(CALL_TURN_TOPIC, dropped, 'dropped words'),
@@ -3562,6 +3790,8 @@ async function roomVoice(
         for (const op of Object.keys(REVIEW_RPC) as ReviewOp[]) {
           local.registerRpcMethod(REVIEW_RPC[op], (data) => handle(op, data.payload, data.callerIdentity));
         }
+        const voice = speaker.speech.state;
+        log.info('voice-mode.voice', { voice });
         // Unkeyed: a `speaking` posted after it queues behind it instead of replacing it.
         post('the agent state and the review attributes', () =>
           local.setAttributes({
@@ -3570,13 +3800,14 @@ async function roomVoice(
             [CALL_REVIEW_ATTRIBUTE]: '1',
             [CALL_COMMANDS_ATTRIBUTE]: CALL_COMMANDS_VERSION,
             [CALL_COMMAND_WORDS_ATTRIBUTE]: COMMAND_WORDS_JSON,
+            [CALL_VOICE_ATTRIBUTE]: JSON.stringify(voice),
           }),
         );
       },
     },
     async close() {
       closed = true;
-      sayAbort.abort();
+      const speechClosed = speaker.close();
       room.off(RoomEvent.TrackSubscribed, listen);
       room.off(RoomEvent.TrackUnsubscribed, unlisten);
       // Each step on its own: a native close that throws, at once or later, skips none of the others.
@@ -3593,6 +3824,7 @@ async function roomVoice(
       await quietly(() => speechPublication.sid && local.unpublishTrack(speechPublication.sid));
       await quietly(() => speechTrack.close());
       await quietly(() => speechSource.close());
+      await quietly(() => speechClosed);
     },
   };
 }
@@ -3704,7 +3936,8 @@ let callEnv: Record<string, string | undefined> | undefined;
 
 function defaultDeps(): RunCallDeps {
   const env = (callEnv ??= workerEnv([
-    'GEMINI_API_KEY',
+    'VOICE_MODE_GEMINI_API_KEY',
+    'VOICE_MODE_ELEVENLABS_API_KEY',
     'LIVEKIT_API_SECRET',
     'LIVEKIT_HOST_URL',
     'VOICE_MODE_RECORDINGS_DAYS',
@@ -3782,8 +4015,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   } catch (err) {
     return abandon((err as Error).message);
   }
-  const geminiKey = deps.env.GEMINI_API_KEY;
-  if (!geminiKey) return abandon('GEMINI_API_KEY is not set for the worker');
+  const geminiKey = deps.env.VOICE_MODE_GEMINI_API_KEY;
+  if (!geminiKey) return abandon('VOICE_MODE_GEMINI_API_KEY is not set for the worker');
+  const providerKeys: ProviderKeys = {};
+  for (const entry of Object.values(TTS_REGISTRY)) {
+    const key = deps.env[entry.envKey];
+    if (key) providerKeys[entry.id] = key;
+  }
   const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
   /** Spoken lines so far, for those no label numbered. */
   let replies = 0;
@@ -4127,7 +4365,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       ctx,
       meta,
       {
-        geminiKey,
+        providerKeys,
         ...(record ? { recordReplies: true } : {}),
         ...(ttsDeess(deps.env.VOICE_MODE_TTS_DEESS) ? { deess: true } : {}),
         ...(ttsNotch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
@@ -4264,6 +4502,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         updateTyping();
         callTurns.configure(req.wake ?? callTurns.state.on, req.pauseSends ?? callTurns.state.pauseSends);
         readyCue();
+        if (!req.tts) return undefined;
+        return callVoice?.selectTts ? callVoice.selectTts(req.tts, req.gen) : 'tts_unavailable';
       },
       wakeState: () => callTurns.state,
       cue,

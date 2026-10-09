@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getEventListeners } from 'node:events';
+import { fileURLToPath } from 'node:url';
 
 import { AgentServer, InferenceRunner, initializeLogger, ServerOptions, VADEventType } from '@livekit/agents';
 import { AudioFrame, DisconnectReason } from '@livekit/rtc-node';
@@ -19,11 +20,13 @@ import {
   liveKitCallSecret,
   liveKitHostUrl,
   type CallReviewState,
+  type CallVoiceState,
   type LiveKitJobMetadata,
   type ReviewOp,
   type ReviewRequest,
 } from './channels/voice-mode-protocol.js';
 import type { Heard } from './voice-mode-gemini-live.js';
+import type { TtsAudio, TtsChoice, TtsInstance } from './voice-mode-tts.js';
 import {
   AWAIT_REPLY_MS,
   AudioRing,
@@ -40,10 +43,11 @@ import {
   CUT_LINES,
   DEFAULT_MAX_SPOKEN_CHARS,
   FAILURE_LINES,
-  GeminiSpeech,
   HostLink,
   hostLossReason,
   languageOf,
+  LineSpeech,
+  lineResampler,
   MAX_IDLE_WAIT_MS,
   maxSpokenChars,
   parseJobMetadata,
@@ -92,7 +96,7 @@ import {
   ReviewControl,
   type Recording,
   type ReviewDeps,
-  type SpeechModel,
+  speechOutput,
   type Transcription,
   writeTurnRecording,
   workerEnv,
@@ -125,6 +129,21 @@ describe('worker settings', () => {
       expect(workerEnv(['VOICE_MODE_TTS_VOICE'], root).VOICE_MODE_TTS_VOICE).toBe('Kore');
       expect(warn).toHaveBeenCalledTimes(1);
       expect(warn).toHaveBeenCalledWith('voice-mode: VOICE_TTS_VOICE is deprecated; use VOICE_MODE_TTS_VOICE');
+    } finally {
+      warn.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reads the old GEMINI_API_KEY as VOICE_MODE_GEMINI_API_KEY', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-mode-worker-env-'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      fs.writeFileSync(path.join(root, '.env'), 'GEMINI_API_KEY=gk-old\n');
+      const env = workerEnv(['VOICE_MODE_GEMINI_API_KEY', 'VOICE_MODE_ELEVENLABS_API_KEY'], root);
+      expect(env.VOICE_MODE_GEMINI_API_KEY).toBe('gk-old');
+      expect(env.VOICE_MODE_ELEVENLABS_API_KEY).toBeUndefined();
+      expect(warn).toHaveBeenCalledWith('voice-mode: GEMINI_API_KEY is deprecated; use VOICE_MODE_GEMINI_API_KEY');
     } finally {
       warn.mockRestore();
       fs.rmSync(root, { recursive: true, force: true });
@@ -624,9 +643,7 @@ const META: LiveKitJobMetadata = {
   vocabulary: ['NanoClaw'],
   sttModel: 'gemini-3.5-transcribe-live',
   sttFallbackModel: 'gemini-3.5-transcribe',
-  ttsModel: 'gemini-3.8-flash-tts',
-  ttsFallbackModel: 'gemini-3.8-flash-lite-tts',
-  ttsVoice: 'Alnilam',
+  tts: { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'Alnilam' },
   silenceMs: 2500,
   maxDurationMs: 60_000,
   joinTimeoutMs: 1000,
@@ -755,7 +772,14 @@ function fakeTranscription() {
 }
 
 /** The room as runCall sees it, with a fake transcription behind the call's turns. */
-function fakeVoice() {
+/** `speech`: the call's lines go through this speech output instead of playing at once. */
+function fakeVoice(
+  speech?: (
+    meta: LiveKitJobMetadata,
+    settings: VoiceModeSettings,
+    events: CallVoiceEvents,
+  ) => ReturnType<typeof speechOutput>,
+) {
   let events!: CallVoiceEvents;
   let handle!: (op: ReviewOp, payload: string, callerIdentity: string) => Promise<string>;
   const transcription = fakeTranscription();
@@ -770,6 +794,7 @@ function fakeVoice() {
       events.onAgentSpeaking?.(false);
       return true;
     }),
+    selectTts: undefined as CallVoice['selectTts'],
     setThinking: vi.fn(),
     publishTurn: vi.fn(),
     publishReply: vi.fn(),
@@ -791,6 +816,15 @@ function fakeVoice() {
   const createVoice = vi.fn(
     async (_ctx: CallJob, _meta: LiveKitJobMetadata, _settings: VoiceModeSettings, e: CallVoiceEvents) => {
       events = e;
+      if (speech) {
+        const output = speech(_meta, _settings, e);
+        voice.say.mockImplementation(output.say);
+        voice.selectTts = output.selectTts;
+        voice.close.mockImplementation(async () => {
+          await output.close();
+          return undefined;
+        });
+      }
       return voice;
     },
   );
@@ -813,6 +847,8 @@ function fakeVoice() {
     get position() {
       return position;
     },
+    /** One RPC as the room hands it over. */
+    handle: (op: ReviewOp, payload: string, callerIdentity: string) => handle(op, payload, callerIdentity),
     /** One RPC from the caller's page. */
     rpc: async (op: ReviewOp, fields: Partial<ReviewRequest> = {}) =>
       JSON.parse(await handle(op, JSON.stringify({ gen: ++gen, ...fields }), 'caller-1')) as Record<string, unknown>,
@@ -837,7 +873,7 @@ function fakeVoice() {
 }
 
 const ENV = {
-  GEMINI_API_KEY: 'gk-test',
+  VOICE_MODE_GEMINI_API_KEY: 'gk-test',
   LIVEKIT_API_SECRET: 'lk-secret',
   LIVEKIT_HOST_URL: 'http://127.0.0.1:3555',
 };
@@ -875,7 +911,7 @@ describe('runCall', () => {
     expect(v.createVoice).toHaveBeenCalledWith(
       ctx,
       expect.objectContaining({ callId: 'call-1' }),
-      { geminiKey: 'gk-test', deess: true, notch: true, spoke: expect.any(Function) },
+      { providerKeys: { gemini: 'gk-test' }, deess: true, notch: true, spoke: expect.any(Function) },
       v.events,
     );
     // The host address and secret come from the worker's settings, never from the dispatch.
@@ -1798,74 +1834,106 @@ describe('review mode', () => {
     expect(readReviewRequest('{"gen":5,"typing":"no"}')).toEqual({ gen: 5 });
     expect(readReviewRequest('{"draft":2}')).toBeNull();
     expect(readReviewRequest('nope')).toBeNull();
+    expect(readReviewRequest('{"gen":6,"tts":{"provider":"elevenlabs","voice":"bIHbv24MWmeRgasZH58o","x":1}}')).toEqual(
+      {
+        gen: 6,
+        tts: { provider: 'elevenlabs', voice: 'bIHbv24MWmeRgasZH58o' },
+      },
+    );
+    // A malformed tts names no provider: refused as invalid, never dropped silently.
+    for (const tts of ['"gemini"', '{"provider":"gemini","voice":7}', `{"provider":"${'g'.repeat(65)}"}`]) {
+      expect(readReviewRequest(`{"gen":7,"tts":${tts}}`)).toEqual({ gen: 7, tts: { provider: '' } });
+    }
   });
 });
 
-/** A speech model whose lines the test decides: audio chunks, then maybe an error. */
-function fakeSpeech(
-  plan: (text: string, call: number) => { chunks?: number; error?: Error & { retryable?: boolean } },
-) {
-  let calls = 0;
-  const said: string[] = [];
-  const model: SpeechModel = {
-    synthesize(text: string, _conn?: unknown, abortSignal?: AbortSignal) {
-      said.push(text);
-      // As the plugin's ChunkedStream does: a one-shot listener on the signal it is given, never removed.
-      abortSignal?.addEventListener('abort', () => undefined, { once: true });
-      const { chunks = 0, error } = plan(text, ++calls);
-      const stream = {
-        error: undefined as Error | undefined,
-        async *[Symbol.asyncIterator]() {
-          for (let i = 0; i < chunks; i++)
-            yield { frame: new AudioFrame(new Int16Array(480).fill(i + 1), 24_000, 1, 480) };
-          if (error) stream.error = error;
-        },
-      };
-      return stream;
-    },
-    on: () => undefined,
-  };
-  return { model, said };
+interface TtsPlan {
+  chunks?: number;
+  error?: Error & { retryable?: boolean };
+  sampleRate?: number;
+  numChannels?: number;
+  /** Samples per channel in each chunk. */
+  samples?: number;
+  /** Sample `n` of channel `c`; chunk number + 1 by default. */
+  value?: (n: number, c: number, rate: number) => number;
+  /** Awaited after the first chunk, or until the request is aborted. */
+  hold?: Promise<void>;
 }
+const untilAborted = (signal: AbortSignal) =>
+  new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+
+/** A provider instance whose lines the test decides, behaving as the SDK wrapper does: quiet on abort, `no audio` (retryable) for none. */
+function fakeTts(plan: (text: string, call: number) => TtsPlan) {
+  let calls = 0;
+  const t = { said: [] as string[], closed: 0, aborted: 0, instance: undefined as unknown as TtsInstance };
+  t.instance = {
+    sampleRate: 24_000,
+    numChannels: 1,
+    async *synthesize(text: string, signal: AbortSignal): AsyncGenerator<TtsAudio> {
+      t.said.push(text);
+      signal.addEventListener('abort', () => void t.aborted++, { once: true });
+      const p = plan(text, ++calls);
+      const rate = p.sampleRate ?? 24_000;
+      const channels = p.numChannels ?? 1;
+      const samples = p.samples ?? 480;
+      for (let i = 0; i < (p.chunks ?? 0); i++) {
+        if (signal.aborted) return;
+        const pcm = new Int16Array(samples * channels);
+        for (let n = 0; n < samples; n++) {
+          for (let c = 0; c < channels; c++) pcm[n * channels + c] = p.value?.(i * samples + n, c, rate) ?? i + 1;
+        }
+        yield { pcm, sampleRate: rate, numChannels: channels };
+        if (i === 0 && p.hold) await Promise.race([p.hold, untilAborted(signal)]);
+      }
+      if (signal.aborted) return;
+      if (p.error) throw p.error;
+      if (!p.chunks) throw Object.assign(new Error('no audio'), { retryable: true });
+    },
+    close: async () => void t.closed++,
+  };
+  return t;
+}
+type FakeTts = ReturnType<typeof fakeTts>;
+
+const GEMINI: TtsChoice = { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'Alnilam' };
+const GEMINI_LITE: TtsChoice = { ...GEMINI, model: 'gemini-3.8-flash-lite-tts' };
+const ELEVEN: TtsChoice = { provider: 'elevenlabs', model: 'eleven_turbo_v2_5', voice: 'bIHbv24MWmeRgasZH58o' };
+const ttsId = (c: TtsChoice) => `${c.provider}/${c.model}/${c.voice}`;
 
 describe('speech output', () => {
-  const speak = async (speech: GeminiSpeech, text: string) => {
-    const chunks: Int16Array[] = [];
-    for await (const pcm of speech.speak(text, new AbortController().signal)) chunks.push(pcm);
+  const speak = async (speech: LineSpeech, text: string) => {
+    const chunks: TtsAudio[] = [];
+    for await (const audio of speech.speak(text, new AbortController().signal)) chunks.push(audio);
     return chunks.length;
   };
   const retryable = (message: string) => Object.assign(new Error(message), { retryable: true });
-
-  it('speaks with the first model, emoji left out; an empty line makes no request', async () => {
-    const primary = fakeSpeech(() => ({ chunks: 3 }));
-    const speech = new GeminiSpeech({
-      apiKey: 'k',
-      model: 'a',
-      fallbackModel: 'b',
-      voice: 'v',
+  /** A LineSpeech over fake providers by choice. */
+  const lineSpeech = (fakes: Record<string, FakeTts>, o: { choice?: TtsChoice; now?: () => number } = {}) =>
+    new LineSpeech({
+      choice: o.choice ?? GEMINI,
+      keys: { gemini: 'gk', elevenlabs: 'ek' },
       log: silentLog,
-      create: () => primary.model,
+      build: (choice) => fakes[ttsId(choice)].instance,
+      ...(o.now ? { now: o.now } : {}),
     });
+
+  it('speaks with the active choice, emoji left out; an empty line makes no request', async () => {
+    const primary = fakeTts(() => ({ chunks: 3 }));
+    const speech = lineSpeech({ [ttsId(GEMINI)]: primary });
     expect(await speak(speech, 'Booked 🎉 for eight.')).toBe(3);
     expect(primary.said).toEqual(['Booked  for eight.']);
+    expect(speech.spokenBy).toEqual(GEMINI);
     expect(await speak(speech, '🎉')).toBe(0);
     expect(primary.said).toHaveLength(1);
   });
 
-  it('fails over before any audio, skips the failed model for a while, then tries it again', async () => {
+  it('fails over before any audio, skips the failed choice for a while, then tries it again', async () => {
     let now = 0;
-    const primary = fakeSpeech((_t, n) => (n === 1 ? { error: new Error('quota') } : { chunks: 1 }));
-    const fallback = fakeSpeech(() => ({ chunks: 2 }));
-    const speech = new GeminiSpeech({
-      apiKey: 'k',
-      model: 'a',
-      fallbackModel: 'b',
-      voice: 'v',
-      log: silentLog,
-      now: () => now,
-      create: (m) => (m === 'a' ? primary.model : fallback.model),
-    });
+    const primary = fakeTts((_t, n) => (n === 1 ? { error: new Error('quota') } : { chunks: 1 }));
+    const fallback = fakeTts(() => ({ chunks: 2 }));
+    const speech = lineSpeech({ [ttsId(GEMINI)]: primary, [ttsId(GEMINI_LITE)]: fallback }, { now: () => now });
     expect(await speak(speech, 'One.')).toBe(2);
+    expect(speech.spokenBy).toEqual(GEMINI_LITE);
     expect(await speak(speech, 'Two.')).toBe(2);
     expect(primary.said).toEqual(['One.']);
     now += TTS_RECOVERY_DELAY_MS;
@@ -1874,87 +1942,392 @@ describe('speech output', () => {
     expect(fallback.said).toEqual(['One.', 'Two.']);
   });
 
-  it('tries a transient failure once more on the same model; never after audio started', async () => {
-    vi.useFakeTimers();
-    const primary = fakeSpeech((_t, n) => (n === 1 ? { error: retryable('busy') } : { chunks: 1 }));
-    const speech = new GeminiSpeech({
-      apiKey: 'k',
-      model: 'a',
-      fallbackModel: '',
-      voice: 'v',
+  it('falls over across providers: an ElevenLabs line the provider cannot say goes to the registry default', async () => {
+    const eleven = fakeTts(() => ({ error: new Error('quota') }));
+    const gemini = fakeTts(() => ({ chunks: 1 }));
+    const speech = lineSpeech({ [ttsId(ELEVEN)]: eleven, [ttsId(GEMINI)]: gemini }, { choice: ELEVEN });
+    expect(await speak(speech, 'One.')).toBe(1);
+    expect(speech.spokenBy).toEqual(GEMINI);
+    expect(speech.active).toEqual(ELEVEN);
+    // Without its key a provider never speaks: the default does.
+    const keyless = new LineSpeech({
+      choice: ELEVEN,
+      keys: { gemini: 'gk' },
       log: silentLog,
-      create: () => primary.model,
+      build: (choice) => (choice.provider === 'gemini' ? gemini : eleven).instance,
     });
+    expect(await speak(keyless, 'Two.')).toBe(1);
+    expect(eleven.said).toEqual(['One.']);
+    expect(gemini.said).toEqual(['One.', 'Two.']);
+  });
+
+  it('tries a transient failure once more on the same choice; never after audio started', async () => {
+    vi.useFakeTimers();
+    const primary = fakeTts((_t, n) => (n === 1 ? { error: retryable('busy') } : { chunks: 1 }));
+    const speech = lineSpeech({ [ttsId(GEMINI)]: primary });
     const done = speak(speech, 'One.');
     await vi.advanceTimersByTimeAsync(1_000);
     expect(await done).toBe(1);
     expect(primary.said).toEqual(['One.', 'One.']);
     vi.useRealTimers();
 
-    const partial = fakeSpeech(() => ({ chunks: 2, error: retryable('cut') }));
-    const fallback = fakeSpeech(() => ({ chunks: 2 }));
-    const second = new GeminiSpeech({
-      apiKey: 'k',
-      model: 'a',
-      fallbackModel: 'b',
-      voice: 'v',
-      log: silentLog,
-      create: (m) => (m === 'a' ? partial.model : fallback.model),
-    });
+    const partial = fakeTts(() => ({ chunks: 2, error: retryable('cut') }));
+    const fallback = fakeTts(() => ({ chunks: 2 }));
+    const second = lineSpeech({ [ttsId(GEMINI)]: partial, [ttsId(GEMINI_LITE)]: fallback });
     await expect(speak(second, 'Long line.')).rejects.toThrow('cut');
     expect(partial.said).toEqual(['Long line.']);
     expect(fallback.said).toEqual([]);
   });
 
-  it('a model that stalls before audio is closed and the fallback speaks; finished requests leave no listener on the call signal', async () => {
+  it('a provider that stalls before audio is aborted and the fallback speaks; finished requests leave no listener on the call signal', async () => {
     vi.useFakeTimers();
-    let closed = 0;
-    const stalled: SpeechModel = {
-      synthesize: () => ({
-        error: undefined,
-        close: () => void closed++,
-        async *[Symbol.asyncIterator]() {
-          await new Promise(() => undefined);
-          yield* [];
-        },
-      }),
-      on: () => undefined,
+    const stalled = fakeTts(() => ({}));
+    // The stall comes before any audio: a stream that never yields.
+    stalled.instance.synthesize = async function* (text, signal) {
+      stalled.said.push(text);
+      signal.addEventListener('abort', () => void stalled.aborted++, { once: true });
+      await untilAborted(signal);
+      yield* [];
     };
-    const fallback = fakeSpeech(() => ({ chunks: 2 }));
-    const speech = new GeminiSpeech({
-      apiKey: 'k',
-      model: 'a',
-      fallbackModel: 'b',
-      voice: 'v',
-      log: silentLog,
-      create: (m) => (m === 'a' ? stalled : fallback.model),
-    });
+    const fallback = fakeTts(() => ({ chunks: 2 }));
+    const speech = lineSpeech({ [ttsId(GEMINI)]: stalled, [ttsId(GEMINI_LITE)]: fallback });
     const call = new AbortController();
-    const chunks: Int16Array[] = [];
+    const chunks: TtsAudio[] = [];
     const done = (async () => {
-      for await (const pcm of speech.speak('One.', call.signal)) chunks.push(pcm);
+      for await (const audio of speech.speak('One.', call.signal)) chunks.push(audio);
     })();
     await vi.advanceTimersByTimeAsync(60_000);
     await done;
-    expect(closed).toBe(1);
+    expect(stalled.aborted).toBe(1);
     expect(chunks).toHaveLength(2);
     expect(fallback.said).toEqual(['One.']);
     for (let i = 0; i < 5; i++) for await (const _ of speech.speak('Again.', call.signal));
     expect(getEventListeners(call.signal, 'abort')).toHaveLength(0);
   });
 
-  it('throws when no model speaks', async () => {
-    const down = fakeSpeech(() => ({ error: new Error('down') }));
-    const speech = new GeminiSpeech({
-      apiKey: 'k',
-      model: 'a',
-      fallbackModel: 'b',
-      voice: 'v',
-      log: silentLog,
-      create: () => down.model,
-    });
+  it('throws when no choice speaks', async () => {
+    const down = fakeTts(() => ({ error: new Error('down') }));
+    const speech = lineSpeech({ [ttsId(GEMINI)]: down, [ttsId(GEMINI_LITE)]: down });
     await expect(speak(speech, 'One.')).rejects.toThrow('down');
     expect(down.said).toEqual(['One.', 'One.']);
+  });
+
+  it('resamples a line to 24 kHz mono: linear across chunks, channels averaged, 24 kHz mono as is', () => {
+    const at22 = lineResampler();
+    let total = 0;
+    for (let i = 0; i < 10; i++)
+      total += at22({ pcm: new Int16Array(2205).fill(1000), sampleRate: 22_050, numChannels: 1 }).length;
+    expect(Math.abs(total - 24_000)).toBeLessThanOrEqual(1);
+    const ramp = lineResampler();
+    const up = [0, 1].flatMap((k) =>
+      Array.from(
+        ramp({ pcm: Int16Array.from({ length: 4 }, (_, i) => (k * 4 + i) * 100), sampleRate: 12_000, numChannels: 1 }),
+      ),
+    );
+    expect(up).toEqual([0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700]);
+    const stereo = lineResampler()({
+      pcm: Int16Array.from({ length: 960 }, (_, i) => (i % 2 ? 3000 : 1000)),
+      sampleRate: 48_000,
+      numChannels: 2,
+    });
+    expect(stereo).toEqual(new Int16Array(240).fill(2000));
+    const same = new Int16Array(480).fill(7);
+    expect(lineResampler()({ pcm: same, sampleRate: 24_000, numChannels: 1 })).toBe(same);
+  });
+});
+
+const fixtures = JSON.parse(
+  fs.readFileSync(fileURLToPath(new URL('./channels/voice-mode-tts.fixtures.json', import.meta.url)), 'utf8'),
+) as {
+  settingsRequestTts: ReviewRequest & { tts: { provider: string; voice: string } };
+  replyTtsInvalid: Record<string, unknown>;
+  voiceAttribute: CallVoiceState;
+};
+
+/** A call whose lines go through the real speech output, with fake providers planned by choice (one chunk by default). */
+function speakingCall(plans: Record<string, (text: string, call: number) => TtsPlan> = {}) {
+  const built: Array<{ choice: TtsChoice; apiKey: string; tts: FakeTts }> = [];
+  const states: CallVoiceState[] = [];
+  const frames: Int16Array[] = [];
+  let output!: ReturnType<typeof speechOutput>;
+  const v = fakeVoice((meta, settings, events) => {
+    output = speechOutput({
+      meta,
+      settings,
+      sink: {
+        captureFrame: async (frame) => void frames.push(frame.data),
+        waitForPlayout: async () => undefined,
+      },
+      log: silentLog,
+      started: () => events.onAgentSpeaking?.(true),
+      stopped: () => events.onAgentSpeaking?.(false),
+      changed: (state) => void states.push(state),
+      build: (choice, apiKey) => {
+        const tts = fakeTts(plans[ttsId(choice)] ?? (() => ({ chunks: 1 })));
+        built.push({ choice, apiKey, tts });
+        return tts.instance;
+      },
+    });
+    return output;
+  });
+  const info = vi.fn();
+  return {
+    v,
+    built,
+    states,
+    frames,
+    get output() {
+      return output;
+    },
+    log: { info, warn: () => undefined },
+    /** The `voice-mode.reply` events so far. */
+    lines: () => info.mock.calls.filter(([m]) => m === 'voice-mode.reply').map(([, f]) => f as Record<string, unknown>),
+    said: (choice: TtsChoice) => built.filter((b) => sameChoice(b.choice, choice)).flatMap((b) => b.tts.said),
+  };
+}
+const sameChoice = (a: TtsChoice, b: TtsChoice) => ttsId(a) === ttsId(b);
+
+describe('voice selection in a call (the settings RPC)', () => {
+  const env = (extra: Record<string, string> = {}) => ({
+    ...ENV,
+    VOICE_MODE_ELEVENLABS_API_KEY: 'ek-test',
+    VOICE_MODE_TTS_DEESS: 'off',
+    ...extra,
+  });
+  const start = async (call: ReturnType<typeof speakingCall>, extraEnv: Record<string, string> = {}) => {
+    const { ctx, job } = fakeJob();
+    const host = fakeHostFetch();
+    await runCall(ctx, callDeps(host.fetchImpl, call.v, { log: call.log, env: env(extraEnv) }));
+    /** One line from the agent, spoken to its end. */
+    const line = async (text: string) => {
+      const before = call.lines().length;
+      host.emit({ type: 'reply', text, turn: null });
+      await vi.waitFor(() => expect(call.lines().length).toBeGreaterThan(before), { timeout: 3_000 });
+      return call.lines()[before];
+    };
+    return { host, job, line };
+  };
+  const ELEVEN_FLASH: TtsChoice = { ...ELEVEN, model: 'eleven_flash_v2_5' };
+
+  it('a switch asked for mid-line applies at the next line: the old voice ends its line, then is closed once', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    const call = speakingCall({ [ttsId(GEMINI)]: (text) => (text === 'One.' ? { chunks: 3, hold } : { chunks: 1 }) });
+    const { host, job } = await start(call);
+    expect(call.output.speech.state).toEqual({ v: 1, active: GEMINI });
+    host.emit({ type: 'reply', text: 'One.', turn: null });
+    await vi.waitFor(() => expect(call.frames.length).toBeGreaterThan(0));
+    const reply = await call.v.rpc('settings', fixtures.settingsRequestTts);
+    expect(reply).toMatchObject({ gen: 7, ok: true });
+    expect(reply).not.toHaveProperty('error');
+    expect(call.states).toEqual([{ v: 1, active: GEMINI, pending: ELEVEN, gen: 7 }]);
+    expect(call.built.map((b) => [b.choice, b.apiKey])).toEqual([
+      [GEMINI, 'gk-test'],
+      [ELEVEN, 'ek-test'],
+    ]);
+    release();
+    await vi.waitFor(() => expect(call.lines()).toHaveLength(1));
+    expect(call.lines()[0]).toMatchObject({
+      outcome: 'spoken',
+      model: 'gemini/gemini-3.8-flash-tts',
+      voice: 'Alnilam',
+    });
+    expect(call.built[0].tts.closed).toBe(0);
+    host.emit({ type: 'reply', text: 'Two.', turn: null });
+    await vi.waitFor(() => expect(call.lines()).toHaveLength(2));
+    expect(call.lines()[1]).toMatchObject({
+      outcome: 'spoken',
+      model: 'elevenlabs/eleven_turbo_v2_5',
+      voice: ELEVEN.voice,
+      fallback: false,
+    });
+    expect(call.said(GEMINI)).toEqual(['One.']);
+    expect(call.said(ELEVEN)).toEqual(['Two.']);
+    expect(call.built[0].tts.closed).toBe(1);
+    expect(call.states).toEqual([
+      { v: 1, active: GEMINI, pending: ELEVEN, gen: 7 },
+      { v: 1, active: ELEVEN, gen: 7 },
+    ]);
+    host.emit({ type: 'end', reason: 'hangup' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+    await vi.waitFor(() => expect(call.built[1].tts.closed).toBe(1));
+    expect(call.built[0].tts.closed).toBe(1);
+  });
+
+  it('two settings in a row: the first pending instance is closed at once, the second wins with its gen', async () => {
+    const call = speakingCall();
+    const { line } = await start(call);
+    const kore: TtsChoice = { ...GEMINI, voice: 'Kore' };
+    expect(await call.v.rpc('settings', fixtures.settingsRequestTts)).toMatchObject({ gen: 7, ok: true });
+    expect(await call.v.rpc('settings', { gen: 8, tts: { provider: 'gemini', voice: 'Kore' } })).toMatchObject({
+      gen: 8,
+      ok: true,
+    });
+    expect(call.built.map((b) => b.choice)).toEqual([ELEVEN, kore]);
+    expect(call.built[0].tts.closed).toBe(1);
+    expect(call.states.at(-1)).toEqual({ v: 1, active: GEMINI, pending: kore, gen: 8 });
+    expect(await line('One.')).toMatchObject({ model: 'gemini/gemini-3.8-flash-tts', voice: 'Kore' });
+    expect(call.said(ELEVEN)).toEqual([]);
+    expect(call.built[0].tts.closed).toBe(1);
+    expect(call.states.at(-1)).toEqual({ v: 1, active: kore, gen: 8 });
+  });
+
+  it('switches across providers both ways with keys from the settings; the whistle notch runs on Gemini lines only', async () => {
+    // A loud tone where Gemini whistles: the notch takes it out, nothing else does.
+    const tone = (n: number, _c: number, rate: number) => Math.round(8000 * Math.sin((2 * Math.PI * 8_118 * n) / rate));
+    const call = speakingCall({
+      [ttsId(GEMINI)]: () => ({ chunks: 10, samples: 2_400, value: tone }),
+      [ttsId(ELEVEN)]: () => ({ chunks: 10, samples: 2_205, sampleRate: 22_050, value: tone }),
+    });
+    const { line } = await start(call);
+    const one = await line('One.');
+    await call.v.rpc('settings', fixtures.settingsRequestTts);
+    const two = await line('Two.');
+    expect(await call.v.rpc('settings', { gen: 9, tts: { provider: 'gemini' } })).toMatchObject({ ok: true });
+    const three = await line('Three.');
+    expect([one, two, three].map((l) => l.model)).toEqual([
+      'gemini/gemini-3.8-flash-tts',
+      'elevenlabs/eleven_turbo_v2_5',
+      'gemini/gemini-3.8-flash-tts',
+    ]);
+    expect(call.built.map((b) => b.apiKey)).toEqual(['gk-test', 'ek-test', 'gk-test']);
+    expect(one.rmsDb).toBeLessThan(-35);
+    expect(three.rmsDb).toBeLessThan(-35);
+    expect(two.rmsDb).toBeGreaterThan(-25);
+    expect(call.states.at(-1)).toEqual({ v: 1, active: GEMINI, gen: 9 });
+  });
+
+  it('plays 22.05 kHz mono and 48 kHz stereo audio at the right 24 kHz length', async () => {
+    const call = speakingCall({
+      [ttsId(ELEVEN)]: () => ({ chunks: 10, samples: 2_205, sampleRate: 22_050, value: () => 1000 }),
+      [ttsId(ELEVEN_FLASH)]: () => ({
+        chunks: 5,
+        samples: 9_600,
+        sampleRate: 48_000,
+        numChannels: 2,
+        value: (_n, c) => (c ? 3000 : 1000),
+      }),
+    });
+    const { line } = await start(call);
+    await call.v.rpc('settings', fixtures.settingsRequestTts);
+    const one = await line('One.');
+    expect(one.durationMs).toBeGreaterThanOrEqual(1000);
+    expect(one.durationMs).toBeLessThanOrEqual(1020);
+    await call.v.rpc('settings', {
+      gen: 8,
+      tts: { provider: 'elevenlabs', model: 'eleven_flash_v2_5', voice: ELEVEN.voice },
+    });
+    call.frames.length = 0;
+    const two = await line('Two.');
+    expect(two).toMatchObject({ model: 'elevenlabs/eleven_flash_v2_5', durationMs: 1000 });
+    expect(new Set(call.frames.flatMap((f) => Array.from(f)))).toEqual(new Set([2000]));
+  });
+
+  it('a pending choice that fails before audio: the fallback speaks that line once, the choice stays active', async () => {
+    const call = speakingCall({
+      [ttsId(ELEVEN)]: () => ({ error: new Error('quota') }),
+      [ttsId(GEMINI)]: () => ({ chunks: 5 }),
+    });
+    const { line } = await start(call);
+    await call.v.rpc('settings', fixtures.settingsRequestTts);
+    expect(await line('One.')).toMatchObject({
+      outcome: 'spoken',
+      model: 'gemini/gemini-3.8-flash-tts',
+      voice: 'Alnilam',
+      fallback: true,
+      durationMs: 100,
+    });
+    expect(call.said(ELEVEN)).toEqual(['One.']);
+    expect(call.said(GEMINI)).toEqual(['One.']);
+    expect(call.states.at(-1)).toEqual({ v: 1, active: ELEVEN, gen: 7 });
+  });
+
+  it('audio then a stream error ends the line there: no replay, no fallback', async () => {
+    const call = speakingCall({
+      [ttsId(ELEVEN)]: () => ({ chunks: 2, error: Object.assign(new Error('cut'), { retryable: true }) }),
+    });
+    const { line } = await start(call);
+    await call.v.rpc('settings', fixtures.settingsRequestTts);
+    expect(await line('One.')).toMatchObject({ outcome: 'partial', model: 'elevenlabs/eleven_turbo_v2_5' });
+    // What follows is the call's notice that the line broke off, never the line again.
+    await flush();
+    expect(call.said(ELEVEN).filter((text) => text === 'One.')).toHaveLength(1);
+    expect(call.said(GEMINI)).not.toContain('One.');
+  });
+
+  it('a provider with no audio for a line is tried once more, then the fallback speaks it', async () => {
+    const call = speakingCall({ [ttsId(ELEVEN)]: () => ({ chunks: 0 }) });
+    const { line } = await start(call);
+    await call.v.rpc('settings', fixtures.settingsRequestTts);
+    expect(await line('One.')).toMatchObject({
+      outcome: 'spoken',
+      model: 'gemini/gemini-3.8-flash-tts',
+      fallback: true,
+    });
+    expect(call.said(ELEVEN)).toEqual(['One.', 'One.']);
+    expect(call.said(GEMINI)).toEqual(['One.']);
+  });
+
+  it('refuses an invalid or unavailable voice and still applies the other settings', async () => {
+    const call = speakingCall();
+    await start(call, { VOICE_MODE_ELEVENLABS_API_KEY: '' });
+    const invalid = await call.v.rpc('settings', {
+      ...fixtures.settingsRequestTts,
+      tts: { provider: 'elevenlabs', voice: 'not a voice' },
+    });
+    expect(invalid).toEqual({ ...fixtures.replyTtsInvalid, seq: expect.any(Number) });
+    expect(Object.keys(invalid)).toEqual(Object.keys(fixtures.replyTtsInvalid));
+    expect(call.v.states.at(-1)?.wake).toMatchObject({ on: true });
+    expect(await call.v.rpc('settings', { ...fixtures.settingsRequestTts, gen: 8, wake: false })).toEqual({
+      gen: 8,
+      ok: false,
+      seq: expect.any(Number),
+      error: 'tts_unavailable',
+    });
+    expect(call.v.states.at(-1)?.wake).toMatchObject({ on: false });
+    expect(await call.v.rpc('settings', { gen: 9, tts: { provider: 'nope' } })).toMatchObject({ error: 'tts_invalid' });
+    expect(call.built).toEqual([]);
+    expect(call.states).toEqual([]);
+  });
+
+  it('the same choice twice is ok and rebuilds nothing; asking for the active one drops the pending one', async () => {
+    const call = speakingCall();
+    await start(call);
+    expect(await call.v.rpc('settings', fixtures.settingsRequestTts)).toMatchObject({ ok: true });
+    expect(await call.v.rpc('settings', { ...fixtures.settingsRequestTts, gen: 8 })).toMatchObject({
+      gen: 8,
+      ok: true,
+    });
+    expect(call.built).toHaveLength(1);
+    expect(call.states).toEqual([{ v: 1, active: GEMINI, pending: ELEVEN, gen: 7 }]);
+    expect(await call.v.rpc('settings', { gen: 9, tts: GEMINI })).toMatchObject({ ok: true });
+    expect(call.built[0].tts.closed).toBe(1);
+    expect(call.states.at(-1)).toEqual({ v: 1, active: GEMINI, gen: 9 });
+    expect(await call.v.rpc('settings', { gen: 10, tts: GEMINI })).toMatchObject({ ok: true });
+    expect(call.states).toHaveLength(2);
+    expect(call.built).toHaveLength(1);
+  });
+
+  it('takes no settings from anyone but the caller', async () => {
+    const call = speakingCall();
+    await start(call);
+    await expect(
+      call.v.handle('settings', JSON.stringify(fixtures.settingsRequestTts), 'someone-else'),
+    ).rejects.toThrow('not a review request from the caller');
+    expect(call.built).toEqual([]);
+    expect(call.states).toEqual([]);
+  });
+
+  it('a hangup mid-line aborts the line and closes its provider', async () => {
+    const call = speakingCall({ [ttsId(GEMINI)]: () => ({ chunks: 3, hold: new Promise(() => undefined) }) });
+    const { host, job } = await start(call);
+    host.emit({ type: 'reply', text: 'One.', turn: null });
+    await vi.waitFor(() => expect(call.frames.length).toBeGreaterThan(0));
+    host.emit({ type: 'end', reason: 'hangup' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
+    await vi.waitFor(() => expect(call.built[0].tts.closed).toBe(1));
+    expect(call.built[0].tts.aborted).toBe(1);
+    expect(call.said(GEMINI)).toEqual(['One.']);
   });
 });
 
@@ -3802,19 +4175,20 @@ describe('wide events', () => {
     });
   });
 
-  it('a spoken line reports its model, fallback, latency, length and levels', () => {
+  it('a spoken line reports its provider/model, voice, fallback, latency, length and levels', () => {
     let now = 1000;
     const meter = new LineMeter(() => now);
-    expect(meter.done({ model: 'a', primary: 'a', failed: false, cut: false })).toBeNull();
+    expect(meter.done({ by: GEMINI, primary: GEMINI, failed: false, cut: false })).toBeNull();
     now = 1800;
     meter.audio();
     now = 2000;
     meter.audio();
     meter.playing();
     meter.frame(Int16Array.from({ length: 24_000 }, (_, i) => (i % 2 ? 16384 : -16384)));
-    expect(meter.done({ model: 'b', primary: 'a', failed: false, cut: false })).toEqual({
+    expect(meter.done({ by: GEMINI, primary: ELEVEN, failed: false, cut: false })).toEqual({
       outcome: 'spoken',
-      model: 'b',
+      model: 'gemini/gemini-3.8-flash-tts',
+      voice: 'Alnilam',
       fallback: true,
       firstAudioMs: 800,
       heldMs: 200,
@@ -3822,9 +4196,14 @@ describe('wide events', () => {
       peakDb: -6,
       rmsDb: -6,
     });
-    expect(meter.done({ model: 'a', primary: 'a', failed: true, cut: false })?.outcome).toBe('partial');
-    expect(meter.done({ model: 'a', primary: 'a', failed: false, cut: true })?.outcome).toBe('partial');
-    expect(new LineMeter().done({ model: 'a', primary: 'a', failed: true, cut: false })).toEqual({
+    expect(meter.done({ by: ELEVEN, primary: ELEVEN, failed: false, cut: false })).toMatchObject({
+      model: 'elevenlabs/eleven_turbo_v2_5',
+      voice: ELEVEN.voice,
+      fallback: false,
+    });
+    expect(meter.done({ by: GEMINI, primary: GEMINI, failed: true, cut: false })?.outcome).toBe('partial');
+    expect(meter.done({ by: GEMINI, primary: GEMINI, failed: false, cut: true })?.outcome).toBe('partial');
+    expect(new LineMeter().done({ primary: GEMINI, failed: true, cut: false })).toEqual({
       outcome: 'failed',
       fallback: false,
       durationMs: 0,
