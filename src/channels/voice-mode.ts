@@ -49,7 +49,6 @@ import { expediteDelivery } from '../delivery.js';
 import { findVoiceModeLineByToken, getVoiceModeLineForAgent, hashLinkToken } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand } from './voice-mode-command.js';
-import { voiceLinesOf } from '../commands/index.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerResidentSkillGate } from '../project-doc-compose.js';
@@ -773,10 +772,8 @@ registerChannelAdapter(LEGACY_VOICE_CHANNEL, {
   defaults: VOICE_MODE_DEFAULTS,
 });
 
-// Call formatting reaches only agents that take calls: a voice_mode_lines row,
-// or a line from before the rename (a wired `voice` chat).
+// Call formatting reaches only agents that take calls: those with a voice_mode_lines row.
 registerResidentSkillGate(
   'voice-mode-formatting',
-  async (group) =>
-    (await getVoiceModeLineForAgent(group.id)) !== undefined || (await voiceLinesOf(group.id)).length > 0,
+  async (group) => (await getVoiceModeLineForAgent(group.id)) !== undefined,
 );

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
+import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from '../../channel-registry.js';
 import { closeDb, initTestDb } from '../../../db/connection.js';
 import { createAgentGroup } from '../../../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../../../db/messaging-groups.js';
@@ -118,7 +119,7 @@ describe('computeCommandGrants', () => {
     expect(dm[0].commands).toEqual(COMMAND_ORDER);
   });
 
-  it('adds /voice only in chats with an agent that has a voice line', async () => {
+  it('adds /voice to every chat only while the voice-mode channel runs', async () => {
     await makeAgentGroup('ag-1', 'Emma');
     await makeAgentGroup('ag-2', 'Stan');
     await grantRole({ user_id: OWNER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
@@ -126,20 +127,33 @@ describe('computeCommandGrants', () => {
     await makeMg('mg-group', 'telegram:-200', 1);
     await wire('mg-dm-owner', 'ag-1');
     await wire('mg-group', 'ag-2');
-    await createMessagingGroup({
-      id: 'mg-line',
-      channel_type: 'voice',
-      platform_id: 'voice:abc',
-      name: null,
-      is_group: 0,
-      unknown_sender_policy: 'strict',
-      created_at: now(),
-    });
-    await wire('mg-line', 'ag-1');
 
-    const grants = await computeCommandGrants();
-    expect(grants.find((g) => g.chatPlatformId === OWNER)?.commands).toEqual(['voice', ...COMMAND_ORDER]);
-    expect(grants.find((g) => g.chatPlatformId === 'telegram:-200')?.commands).toEqual(COMMAND_ORDER);
+    const off = await computeCommandGrants();
+    expect(off.find((g) => g.chatPlatformId === OWNER)?.commands).toEqual(COMMAND_ORDER);
+    registerChannelAdapter('voice-mode', {
+      factory: () => ({
+        name: 'voice-mode',
+        channelType: 'voice-mode',
+        supportsThreads: false,
+        setup: async () => {},
+        teardown: async () => {},
+        isConnected: () => true,
+        deliver: async () => undefined,
+      }),
+    });
+    await initChannelAdapters(() => ({
+      onInbound: () => {},
+      onInboundEvent: () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+    try {
+      const grants = await computeCommandGrants();
+      expect(grants.find((g) => g.chatPlatformId === OWNER)?.commands).toEqual(['voice', ...COMMAND_ORDER]);
+      expect(grants.find((g) => g.chatPlatformId === 'telegram:-200')?.commands).toEqual(['voice', ...COMMAND_ORDER]);
+    } finally {
+      await teardownChannelAdapters();
+    }
   });
 
   it('does not grant popups in a non-admin DM chat', async () => {

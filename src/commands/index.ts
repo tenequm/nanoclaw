@@ -13,11 +13,7 @@ export {
   setActivation,
   restartAgent,
   offersVoiceCommand,
-  rebindVoiceLines,
-  setVoiceTarget,
-  voiceLinesOf,
   runVoiceCommand,
-  type VoiceLinkFn,
 } from './service.js';
 export { statusAccess, voiceAccess, type StatusAccessDecision } from './auth.js';
 export { formatTokens, formatDateRel } from './format.js';

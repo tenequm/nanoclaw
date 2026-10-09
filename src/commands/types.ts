@@ -153,7 +153,6 @@ export type CommandFailureReason =
   | 'unknown-agent'
   | 'invalid-value'
   | 'unknown-field'
-  | 'no-voice-line'
   | 'voice-unavailable';
 
 /** Message-safe structured detail for a failed command (data, not prose). */
