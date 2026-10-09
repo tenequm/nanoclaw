@@ -259,6 +259,25 @@ describe('composeSessionSpec', () => {
     },
   );
 
+  it('matches the lockdown gateway alias case-insensitively', () => {
+    topology.lockdown = true;
+    try {
+      const spec = compose({
+        mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
+        gateway: {
+          env: { ...proxyEnv, NO_PROXY: 'localhost' },
+          networkAccess: {
+            endpoint: 'HOST.Docker.Internal.',
+            target: { kind: 'runtime', identity: 'fixture-gateway' },
+          },
+        },
+      });
+      expect(spec.containers[0].contributedEnv!.NO_PROXY).toBe('localhost');
+    } finally {
+      topology.lockdown = false;
+    }
+  });
+
   it.each(['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'])(
     'detects %s from every composed env source',
     (key) => {

@@ -2373,7 +2373,7 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
         !input.hostAddress &&
         EGRESS_LOCKDOWN &&
         gateway.networkAccess.target.kind === 'runtime' &&
-        mailboxHost === gateway.networkAccess.endpoint;
+        mailboxHost === gateway.networkAccess.endpoint.toLowerCase().replace(/\.$/, '');
       if (!gatewayAlias) bypass.add(mailboxHost);
     }
     contributedEnv.NO_PROXY = contributedEnv.no_proxy = [...bypass].join(',');
