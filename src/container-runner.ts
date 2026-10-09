@@ -187,11 +187,31 @@ function releaseGroupFence(agentGroupId: string, sessionId: string): void {
 }
 
 /**
- * Groups whose `driver` is being changed right now (`changeGroupDriver`):
- * spawn refuses them until the write lands, so no session can start on the
- * old driver between the emptiness check and the config write.
+ * The group admission lock that serializes spawns against driver changes.
+ * `driverChangesInFlight`: groups whose `driver` is being changed
+ * (`changeGroupDriver`), held from the change's validation through its write.
+ * `spawnsInFlight`: agent group id → sessions admitted to spawn (or to a
+ * pending-adoption retry), held from before the driver is selected until the
+ * wake settles, by which point the runtime is registered. Both sides check
+ * the other and mark themselves in one synchronous step, so a spawn can never
+ * capture the old kind mid-change and a change can never pass while a spawn
+ * is admitted.
  */
 const driverChangesInFlight = new Set<string>();
+const spawnsInFlight = new Map<string, Set<string>>();
+
+function admitGroupSpawn(agentGroupId: string, sessionId: string): void {
+  const sessions = spawnsInFlight.get(agentGroupId) ?? new Set<string>();
+  sessions.add(sessionId);
+  spawnsInFlight.set(agentGroupId, sessions);
+}
+
+function releaseGroupSpawn(agentGroupId: string, sessionId: string): void {
+  const sessions = spawnsInFlight.get(agentGroupId);
+  sessions?.delete(sessionId);
+  if (sessions?.size === 0) spawnsInFlight.delete(agentGroupId);
+}
+
 let gatewayUnavailableReason: string | undefined;
 let gatewayAdmissionGeneration = 0;
 
@@ -418,6 +438,7 @@ export function wakeContainer(session: Session, reason?: WakeReason): Promise<bo
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
+  admitGroupSpawn(session.agent_group_id, session.id);
   const promise = spawnContainer(session, reason)
     .then(() => true)
     .catch((err) => {
@@ -426,12 +447,18 @@ export function wakeContainer(session: Session, reason?: WakeReason): Promise<bo
     })
     .finally(() => {
       wakePromises.delete(session.id);
+      releaseGroupSpawn(session.agent_group_id, session.id);
     });
   wakePromises.set(session.id, promise);
   return promise;
 }
 
 async function spawnContainer(session: Session, wakeReason?: WakeReason): Promise<void> {
+  // Checked before the first await, and before the pending-adoption retry —
+  // both select a driver for the group, so both sit behind the same lock.
+  if (driverChangesInFlight.has(session.agent_group_id)) {
+    throw new Error(`group ${session.agent_group_id} is changing its session runtime driver; retrying later`);
+  }
   if (pendingAdoptions.has(session.id)) {
     // A running container is waiting to be re-fenced after a failed adoption
     // claim. Reclaim it rather than spawning a duplicate; its poll loop picks
@@ -442,10 +469,6 @@ async function spawnContainer(session: Session, wakeReason?: WakeReason): Promis
   if (!agentGroup) {
     log.error('Agent group not found', { agentGroupId: session.agent_group_id });
     return;
-  }
-
-  if (driverChangesInFlight.has(agentGroup.id)) {
-    throw new Error(`group '${agentGroup.folder}' is changing its session runtime driver; retrying later`);
   }
 
   // The group's runtime is resolved BEFORE any capability-sensitive
@@ -1356,11 +1379,12 @@ export async function assertGroupDriverChangeAllowed(agentGroupId: string, nextK
 }
 
 /**
- * Change a group's `driver` safely: spawns of the group are refused from the
- * moment the change starts, a spawn already in flight refuses the change, and
- * `assertGroupDriverChangeAllowed` then proves the old driver holds nothing
- * before `apply` writes. Without the hold, a wake landing between the check
- * and the write would start a session on the old driver.
+ * Change a group's `driver` safely, under the group admission lock: a spawn
+ * (or pending-adoption retry) of the group already admitted refuses the
+ * change, and from the moment the change is admitted every spawn of the
+ * group is refused until `apply` has written. `assertGroupDriverChangeAllowed`
+ * then proves the old driver holds nothing. The check and the mark are one
+ * synchronous step on both sides, so no wake can slip between them.
  */
 export async function changeGroupDriver(
   agentGroupId: string,
@@ -1370,16 +1394,15 @@ export async function changeGroupDriver(
   if (driverChangesInFlight.has(agentGroupId)) {
     throw new Error(`a driver change for group ${agentGroupId} is already in progress`);
   }
+  const starting = spawnsInFlight.get(agentGroupId);
+  if (starting && starting.size > 0) {
+    throw new Error(
+      `cannot change the driver of group ${agentGroupId}: session ${[...starting].join(', ')} is starting — ` +
+        'retry once it is up, then stop it first',
+    );
+  }
   driverChangesInFlight.add(agentGroupId);
   try {
-    for (const sessionId of wakePromises.keys()) {
-      if ((await getSession(sessionId))?.agent_group_id === agentGroupId) {
-        throw new Error(
-          `cannot change the driver of group ${agentGroupId}: session ${sessionId} is starting — retry once it is up, ` +
-            'then stop it first',
-        );
-      }
-    }
     await assertGroupDriverChangeAllowed(agentGroupId, nextKind);
     await apply();
   } finally {

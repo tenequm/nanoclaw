@@ -27,6 +27,7 @@ import {
   wakeContainer,
   _resetAdoptionRetryStateForTesting,
 } from '../container-runner.js';
+import * as coordination from '../db/coordination.js';
 import { closeDb, createAgentGroup, createSession, getDb, initTestDb, runMigrations } from '../db/index.js';
 import {
   ensureContainerConfig,
@@ -723,6 +724,103 @@ describe('composition on the spawn path', () => {
       expect.objectContaining({ messageId: 'msg-attach' }),
     );
     expect(await groupRefusesAttachments(GROUP_ID)).toBe(true);
+  });
+  // --- A1 fix round: astra's BLOCK findings, reproduced ---------------------
+
+  it('refuses a driver change while a spawn is paused in gateway acquisition; the next session stays on the old driver', async () => {
+    // Astra's interleaving: the old spawn has selected its driver and waits on
+    // the gateway when the operator changes the group's driver.
+    await setContainerConfigDriver(GROUP_ID, hostBind.kind);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let reached!: () => void;
+    const atGateway = new Promise<void>((resolve) => (reached = resolve));
+    resetGatewayProvider({
+      kind: 'slow-gateway',
+      agentSkills: [],
+      sessions: {
+        async ensure() {
+          reached();
+          await gate;
+          return { contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } } };
+        },
+      },
+      approvals: { subscribe: async () => {} },
+    });
+    try {
+      const first = await createGroupSession();
+      const waking = wakeContainer(first);
+      await atGateway;
+      await expect(
+        changeGroupDriver(GROUP_ID, groupVolume.kind, () => setContainerConfigDriver(GROUP_ID, groupVolume.kind)),
+      ).rejects.toThrow(/session sess-driver-selection is starting/);
+      release();
+      expect(await waking).toBe(true);
+      const second = await createGroupSession({ id: 'sess-driver-selection-2' });
+      expect(await wakeAndRefusal(second)).toBeUndefined();
+      expect((await sessionDriverForGroup(GROUP_ID)).kind).toBe(hostBind.kind);
+      expect(groupVolume.prepared).toHaveLength(0);
+      expect(hostBind.prepared.map((spec) => spec.key.sessionId)).toEqual([SESSION_ID, 'sess-driver-selection-2']);
+    } finally {
+      release();
+      resetGatewayProvider(null);
+    }
+  });
+
+  it('holds a pending-adoption retry behind an in-flight driver change, then reclaims once it is refused', async () => {
+    const row = await createGroupSession();
+    const survivor = {
+      handle: {
+        ...fakeHandle(
+          fixtureSpec({ key: { installSlug: INSTALL_SLUG, agentGroupId: GROUP_ID, sessionId: SESSION_ID } }),
+        ),
+        onTerminal: () => {},
+      },
+      phase: 'running',
+    } as unknown as SessionSnapshot;
+    let changing = false;
+    let wakeDuringChange: Promise<boolean> | undefined;
+    const origin = registerRecordingFake({
+      listSessions: async () => {
+        // The change's emptiness check lists the old driver: wake right there.
+        if (changing) wakeDuringChange ??= wakeContainer(row);
+        return [survivor];
+      },
+    });
+    await setContainerConfigDriver(GROUP_ID, origin.kind);
+    resetSessionDriver(getSessionDriver(hostBind.kind));
+    const claim = vi.spyOn(coordination, 'tryClaimSession').mockRejectedValueOnce(new Error('store down'));
+    try {
+      await adoptRunningSessions();
+    } finally {
+      claim.mockRestore();
+    }
+    expect(isContainerRunning(SESSION_ID)).toBe(false);
+
+    changing = true;
+    await expect(changeGroupDriver(GROUP_ID, hostBind.kind, async () => {})).rejects.toThrow(/still has/);
+    changing = false;
+    // The retry selected nothing while the change held the group.
+    expect(await wakeDuringChange).toBe(false);
+    expect(isContainerRunning(SESSION_ID)).toBe(false);
+    // Once the change is gone the surviving container is reclaimed, not re-spawned.
+    expect(await wakeContainer(row)).toBe(true);
+    expect(isContainerRunning(SESSION_ID)).toBe(true);
+    expect(origin.prepared).toHaveLength(0);
+  });
+
+  it('admits exactly one of two sessions of a one-session group woken at the same moment', async () => {
+    const first = await createGroupSession();
+    const second = await createGroupSession({ id: 'sess-driver-selection-2' });
+    const woke = await Promise.all([wakeContainer(first), wakeContainer(second)]);
+    expect(woke.filter(Boolean)).toHaveLength(1);
+    expect(groupVolume.prepared).toHaveLength(1);
+    expect(warn).toHaveBeenCalledWith(
+      'wakeContainer failed — host-sweep will retry',
+      expect.objectContaining({
+        err: expect.objectContaining({ message: expect.stringMatching(/already has active session/) }),
+      }),
+    );
   });
 });
 
