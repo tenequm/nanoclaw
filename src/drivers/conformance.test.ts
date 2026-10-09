@@ -7,15 +7,16 @@
  * `if (driver === 'x')` above this seam is the thing this file exists to make
  * unnecessary.
  *
- * Only the Docker driver ships in this tree, so the harness list has one
- * entry; an out-of-tree driver adds its own harness and must pass every case
- * unchanged. The suite asserts spec-realization fidelity (including *absence*:
+ * Docker uses a hermetic CLI harness. The explicitly gated kind harness
+ * exercises the group-volume contract against real Kubernetes objects.
+ * Named amendments below preserve the Docker floor while extending it. The suite asserts spec-realization fidelity (including *absence*:
  * no secret env, no extra mounts), the mount-class rules, prepare idempotency,
  * adoption from labels alone, stop-is-full-teardown, and failure-taxonomy
  * mapping.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { registerKubernetesConformance } from './conformance-kubernetes.js';
 import { DockerSessionDriver } from './docker-driver.js';
 import { FakeCli } from './fake-cli.js';
 import { withSessionEvents, type SessionEventsDriver } from './session-events.js';
@@ -29,7 +30,10 @@ vi.mock('../log.js', () => ({
 // The Docker realization re-checks that mount sources exist (a missing source
 // would silently become a fresh empty directory); fixture paths are not real
 // files on the test host.
-vi.mock('fs', () => ({ default: { existsSync: (): boolean => true } }));
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  return { ...actual, default: { ...actual, existsSync: (): boolean => true } };
+});
 
 /**
  * What a driver realized, in vocabulary no runtime owns. This is the
@@ -169,6 +173,7 @@ describe('conformance: spec realization fidelity', () => {
   });
 
   eachDriver('carries the group-folder label byte-identical on every driver (D9)', async (h) => {
+    // Named amendment (brief section 6): only non-admission labels may be projected.
     // Admission joins `groups/<folder>` hostPaths against this value verbatim,
     // so any driver that mangles it (projection, truncation, case-folding)
     // breaks the policy for every session of the group.
@@ -696,7 +701,7 @@ describe('conformance: lifecycle', () => {
     expect(terminal).toHaveBeenCalledOnce();
   });
 
-  eachDriver('stop is full teardown and reports no terminal event', async (h) => {
+  eachDriver('stop ends execution and reports no host-requested terminal event', async (h) => {
     // The driver still emits the end it observes — suppression is the hub's,
     // keyed on the stop() intent it saw through the handle. Note (contract):
     // that stop() blocks until the runtime object is gone is an implementation
@@ -712,7 +717,8 @@ describe('conformance: lifecycle', () => {
 
     expect(terminal).not.toHaveBeenCalled();
     const issued = h.cli.joined().join(' | ');
-    // Whatever the runtime calls it, nothing this key allocated may survive.
+    // Named amendment (brief Block B): retention is capability-declared; Docker
+    // has no listRetained and must still tear down every session resource.
     expect(issued).toMatch(/rm --force ncl-spike-s1/);
   });
 
@@ -781,3 +787,5 @@ describe('conformance: capabilities are honest', () => {
     expect(capabilities.imageBuild).toBe(true);
   });
 });
+
+registerKubernetesConformance();
