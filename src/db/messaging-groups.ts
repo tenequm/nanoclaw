@@ -402,3 +402,12 @@ export async function getMessagingGroupsByAgentGroup(agentGroupId: string): Prom
     agentGroupId,
   );
 }
+
+/** Distinct session modes across every wiring of an agent group. */
+export async function getWiringSessionModes(agentGroupId: string): Promise<MessagingGroupAgent['session_mode'][]> {
+  const rows = await getDb().all<{ session_mode: MessagingGroupAgent['session_mode'] }>(
+    'SELECT DISTINCT session_mode FROM messaging_group_agents WHERE agent_group_id = ?',
+    agentGroupId,
+  );
+  return rows.map((row) => row.session_mode);
+}

@@ -12,10 +12,10 @@
  * stable.
  */
 import { INSTALL_SLUG } from './config.js';
-import { stopOrphanedSessions } from './container-runner.js';
+import { reapRetainedSessions, stopOrphanedSessions } from './container-runner.js';
 import { ensureEgressNetwork } from './egress-lockdown.js';
 import { getActiveSessions } from './db/sessions.js';
-import { peekSessionDriver } from './drivers/index.js';
+import { onSessionDriverCreated, peekSessionDrivers, type SessionEventsDriver } from './drivers/index.js';
 import { sweepInboundStaging } from './inbox-safety.js';
 import type { SessionWatch } from './drivers/types.js';
 import { log } from './log.js';
@@ -50,7 +50,8 @@ export const RECONCILE_CONCURRENCY = 8;
 
 let running = false;
 let queue: InProcessReconcileQueue | null = null;
-let runtimeWatch: SessionWatch | null = null;
+let runtimeWatches: SessionWatch[] = [];
+let unsubscribeDriverCreated: (() => void) | null = null;
 
 /** Coalesced enqueue for the event feeds; drops harmlessly once stopped. */
 function feedEnqueue(sessionId: string): void {
@@ -59,25 +60,32 @@ function feedEnqueue(sessionId: string): void {
 }
 
 /**
- * Reconcile promptly when the runtime reports a session ended: due mail on a
+ * Reconcile promptly when a runtime reports a session ended: due mail on a
  * dead session waits one queue turn instead of the next resync tick. Arms
- * only against a driver that already exists — the sweep never instantiates
- * one, so suites (and hosts) that never selected a runtime are untouched.
- * Events are hints (they may drop, duplicate, or reference foreign keys);
- * the enqueue re-reads truth, so all of that is safe by construction.
+ * against every driver that already exists, and against each one built later
+ * (a group on another runtime spawning after boot) — the sweep never
+ * instantiates one, so suites (and hosts) that never selected a runtime are
+ * untouched. Events are hints (they may drop, duplicate, or reference foreign
+ * keys); the enqueue re-reads truth, so all of that is safe by construction.
  */
 function armRuntimeWatch(): void {
-  const driver = peekSessionDriver();
+  for (const driver of peekSessionDrivers()) watchDriver(driver);
+  unsubscribeDriverCreated = onSessionDriverCreated(watchDriver);
+}
+
+function watchDriver(driver: SessionEventsDriver): void {
   // Raw test fakes may lack watchSessions; never crash on them.
-  if (!driver || typeof driver.watchSessions !== 'function') return;
+  if (!running || typeof driver.watchSessions !== 'function') return;
   /* eslint-disable no-catch-all/no-catch-all -- a watch backend that cannot subscribe costs latency (the resync floor covers it), never the boot */
   try {
-    runtimeWatch = driver.watchSessions(INSTALL_SLUG, (event) => {
-      if (event.kind !== 'terminal' || !event.key.sessionId) return;
-      feedEnqueue(event.key.sessionId);
-    });
+    runtimeWatches.push(
+      driver.watchSessions(INSTALL_SLUG, (event) => {
+        if (event.kind !== 'terminal' || !event.key.sessionId) return;
+        feedEnqueue(event.key.sessionId);
+      }),
+    );
   } catch (err) {
-    log.warn('Runtime watch feed unavailable — the resync floor covers it', { err });
+    log.warn('Runtime watch feed unavailable — the resync floor covers it', { driver: driver.kind, err });
   }
   /* eslint-enable no-catch-all/no-catch-all */
 }
@@ -103,11 +111,19 @@ export function startHostSweep(): void {
       },
       // Stop containers whose session or agent group was deleted: the
       // per-session reconcile only visits sessions that still have a row.
+      // Then delete objects a retaining runtime kept across a stop whose
+      // session row is gone (Block B): the host decides from its rows, the
+      // driver deletes. A no-op on runtimes that retain nothing (Docker).
       'singleton:orphan-containers': async () => {
         try {
           await stopOrphanedSessions();
         } catch (err) {
           log.error('Orphaned container sweep failed', { err });
+        }
+        try {
+          await reapRetainedSessions();
+        } catch (err) {
+          log.error('Retained-object sweep failed', { err });
         }
       },
       // Drop inbound attachments an adapter staged on disk once routing has
@@ -145,9 +161,11 @@ export function startHostSweep(): void {
 export function stopHostSweep(): void {
   running = false;
   registerReconcileEnqueue(null);
-  const stoppingWatch = runtimeWatch;
-  runtimeWatch = null;
-  if (stoppingWatch) {
+  unsubscribeDriverCreated?.();
+  unsubscribeDriverCreated = null;
+  const stoppingWatches = runtimeWatches;
+  runtimeWatches = [];
+  for (const stoppingWatch of stoppingWatches) {
     /* eslint-disable no-catch-all/no-catch-all -- a watch backend that is already gone must not block shutdown */
     try {
       stoppingWatch.stop();

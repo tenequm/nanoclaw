@@ -15,20 +15,63 @@ vi.mock('../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
+import { DATA_DIR, GROUPS_DIR, INSTALL_SLUG } from '../config.js';
+import {
+  adaptSpecToDriver,
+  adoptRunningSessions,
+  assertGroupDriverChangeAllowed,
+  isContainerRunning,
+  killContainer,
+  reapRetainedSessions,
+  wakeContainer,
+  _resetAdoptionRetryStateForTesting,
+} from '../container-runner.js';
+import { closeDb, createAgentGroup, createSession, getDb, initTestDb, runMigrations } from '../db/index.js';
+import {
+  ensureContainerConfig,
+  listDriverKindsUsed,
+  recordDriverKindsUsed,
+  setContainerConfigDriver,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from '../db/container-configs.js';
+import { resetGatewayProvider } from '../gateway-providers/index.js';
+import { getAgentMailbox } from '../mailbox/index.js';
+import { groupRefusesAttachments, initSessionFolder, writeSessionMessage } from '../session-manager.js';
+import type { AgentGroup, Session } from '../types.js';
 import {
   configuredDriverKind,
   createSessionDriver,
   getSessionDriver,
   mountPolicy,
+  onSessionDriverCreated,
+  peekSessionDriver,
+  peekSessionDrivers,
   readSetting,
   resetSessionDriver,
+  sessionDriverForGroup,
 } from './index.js';
+import {
+  FIXTURE_GROUP_VOLUME_CAPABILITIES,
+  FIXTURE_PINNED_IMAGE,
+  FIXTURE_SURFACE_IMAGE,
+  fixtureSpec,
+} from './spec-fixture.js';
 // Imported from the registry module, not the barrel that re-exports it: this is
 // the entry point an overlay reaches for, and it has to work without the
 // selection module having been evaluated first.
 import { listSessionDriverKinds, registerSessionDriver } from './driver-registry.js';
 import { log } from '../log.js';
-import type { MountPolicy, SessionDriver } from './types.js';
+import type {
+  DriverCapabilities,
+  MountPolicy,
+  RetainedObject,
+  SessionDriver,
+  SessionHandle,
+  SessionKey,
+  SessionSnapshot,
+  SessionSpec,
+} from './types.js';
 
 let cwd: string;
 let previous: string;
@@ -216,5 +259,606 @@ describe('readSetting', () => {
   it('trims and treats blank as unset', () => {
     writeEnv('NANOCLAW_SESSION_MATERIAL_ROOT=   \n');
     expect(readSetting('NANOCLAW_SESSION_MATERIAL_ROOT', {})).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-group selection (ratified D1) and the composition gates a driver's
+// declarations drive. Everything below runs against registered FAKE drivers —
+// a 'group-volume' one declaring exactly the kubernetes capabilities — so the
+// gates are proven with no cluster, through the real spawn path.
+// ---------------------------------------------------------------------------
+
+interface FakeDriverOptions {
+  capabilities?: DriverCapabilities;
+  listSessions?: () => Promise<SessionSnapshot[]>;
+  listRetained?: () => Promise<RetainedObject[]>;
+  reapRetained?: (installSlug: string, keys: SessionKey[]) => Promise<void>;
+}
+
+interface FakeDriverRecord {
+  kind: string;
+  prepared: SessionSpec[];
+  reaped: SessionKey[][];
+  watches: number;
+}
+
+const HOST_BIND_CAPABILITIES: DriverCapabilities = {
+  isolationTiers: ['container'],
+  admissionEnforced: false,
+  networkPolicy: 'topology',
+  encryptedVolumes: false,
+  unrealized: [],
+  sharedNetworkNamespace: false,
+  auxiliaryContainers: false,
+  imageBuild: false,
+};
+
+function fakeHandle(spec: SessionSpec): SessionHandle {
+  return {
+    key: spec.key,
+    name: `fake-${spec.key.sessionId}`,
+    start: () => Promise.resolve(),
+    status: () => Promise.resolve({ phase: 'running' }),
+    stop: () => Promise.resolve(),
+    execSpec: () => ({ bin: 'true', argsTty: [], argsPlain: [] }),
+  };
+}
+
+/** Registers a fake under a fresh kind; the record exposes what the driver was handed. */
+function registerRecordingFake(options: FakeDriverOptions = {}): FakeDriverRecord {
+  const kind = `fake-${++uniqueKind}`;
+  const record: FakeDriverRecord = { kind, prepared: [], reaped: [], watches: 0 };
+  registerSessionDriver(kind, () => {
+    const driver: SessionDriver = {
+      kind,
+      capabilities: () => options.capabilities ?? HOST_BIND_CAPABILITIES,
+      prepare: (spec) => {
+        record.prepared.push(structuredClone(spec));
+        return Promise.resolve(fakeHandle(spec));
+      },
+      listSessions: options.listSessions ?? (() => Promise.resolve([])),
+      watchSessions: () => {
+        record.watches += 1;
+        return { stop: () => {} };
+      },
+    };
+    if (options.listRetained) driver.listRetained = options.listRetained;
+    if (options.reapRetained || options.listRetained) {
+      driver.reapRetained = async (installSlug, keys) => {
+        record.reaped.push(keys);
+        await options.reapRetained?.(installSlug, keys);
+      };
+    }
+    return driver;
+  });
+  return record;
+}
+
+describe('per-kind selection', () => {
+  it('memoizes one wrapped instance per kind, independently', () => {
+    const a = registerFake();
+    const b = registerFake();
+    const first = getSessionDriver(a.kind);
+    expect(getSessionDriver(a.kind)).toBe(first);
+    expect(getSessionDriver(b.kind)).not.toBe(first);
+    expect(peekSessionDrivers()).toEqual(expect.arrayContaining([first, getSessionDriver(b.kind)]));
+    // The install default is its own entry and stays the no-argument answer.
+    expect(getSessionDriver().kind).toBe('docker');
+    expect(getSessionDriver()).toBe(getSessionDriver('docker'));
+  });
+
+  it('announces every newly built driver exactly once, never a memo hit', () => {
+    const seen: string[] = [];
+    const unsubscribe = onSessionDriverCreated((driver) => seen.push(driver.kind));
+    try {
+      const { kind } = registerFake();
+      getSessionDriver(kind);
+      getSessionDriver(kind);
+      expect(seen).toEqual([kind]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('keeps one session-events hub per instance: a handle arms only its own driver', async () => {
+    const a = registerRecordingFake();
+    const b = registerRecordingFake();
+    const driverA = getSessionDriver(a.kind);
+    getSessionDriver(b.kind);
+    const handle = await driverA.prepare(fixtureSpec());
+    handle.onTerminal(() => {});
+    expect(a.watches).toBe(1);
+    expect(b.watches).toBe(0);
+  });
+
+  it('peeking never instantiates', () => {
+    resetSessionDriver(null);
+    expect(peekSessionDrivers()).toEqual([]);
+    expect(peekSessionDriver()).toBeNull();
+  });
+});
+
+describe('composition on the spawn path', () => {
+  const GROUP_ID = 'ag-driver-selection';
+  const FOLDER = 'driver-selection-pilot';
+  const SESSION_ID = 'sess-driver-selection';
+  let root: string;
+  let groupVolume: FakeDriverRecord;
+  let hostBind: FakeDriverRecord;
+  let warn: ReturnType<typeof vi.mocked<typeof log.warn>>;
+
+  const now = () => new Date().toISOString();
+  const groupDir = () => path.join(GROUPS_DIR, FOLDER);
+  const session = (overrides: Partial<Session> = {}): Session => ({
+    id: SESSION_ID,
+    agent_group_id: GROUP_ID,
+    messaging_group_id: null,
+    thread_id: null,
+    agent_provider: null,
+    status: 'active',
+    container_status: 'stopped',
+    last_active: null,
+    created_at: now(),
+    ...overrides,
+  });
+
+  async function createGroupSession(overrides: Partial<Session> = {}): Promise<Session> {
+    const row = session(overrides);
+    await createSession(row);
+    initSessionFolder(GROUP_ID, row.id);
+    return row;
+  }
+
+  /** Wake, then report what the spawn refused with (undefined = it spawned). */
+  async function wakeAndRefusal(row: Session): Promise<string | undefined> {
+    warn.mockClear();
+    const woke = await wakeContainer(row);
+    if (woke) return undefined;
+    const call = warn.mock.calls.find(([message]) => String(message).startsWith('wakeContainer failed'));
+    return String((call?.[1] as { err?: Error } | undefined)?.err?.message);
+  }
+
+  async function stopIfRunning(sessionId: string): Promise<void> {
+    if (!isContainerRunning(sessionId)) return;
+    killContainer(sessionId, 'test-teardown');
+    await vi.waitFor(() => expect(isContainerRunning(sessionId)).toBe(false));
+  }
+
+  beforeEach(async () => {
+    process.chdir(previous);
+    root = previous;
+    warn = vi.mocked(log.warn);
+    _resetAdoptionRetryStateForTesting();
+    groupVolume = registerRecordingFake({ capabilities: FIXTURE_GROUP_VOLUME_CAPABILITIES });
+    hostBind = registerRecordingFake();
+    await runMigrations(await initTestDb());
+    await createAgentGroup({
+      id: GROUP_ID,
+      name: 'Driver Selection',
+      folder: FOLDER,
+      agent_provider: null,
+      created_at: now(),
+    });
+    await ensureContainerConfig(GROUP_ID);
+    await updateContainerConfigScalars(GROUP_ID, { image_tag: FIXTURE_PINNED_IMAGE });
+    await setContainerConfigDriver(GROUP_ID, groupVolume.kind);
+  });
+
+  afterEach(async () => {
+    await stopIfRunning(SESSION_ID);
+    await stopIfRunning('sess-driver-selection-2');
+    await closeDb();
+    fs.rmSync(groupDir(), { recursive: true, force: true });
+    fs.rmSync(path.join(DATA_DIR, 'v2-sessions', GROUP_ID), { recursive: true, force: true });
+    expect(process.cwd()).toBe(root);
+  });
+
+  it('a group-volume group composes NO install-surface, plugins or pond mount, every mount classified', async () => {
+    const row = await createGroupSession();
+    expect(await wakeAndRefusal(row)).toBeUndefined();
+    expect(hostBind.prepared).toHaveLength(0);
+    const [spec] = groupVolume.prepared;
+    const agent = spec.containers[0];
+    const targets = agent.mounts.map((m) => m.containerPath);
+    expect(targets).not.toContain('/app/src');
+    expect(targets).not.toContain('/app/skills');
+    expect(targets).not.toContain('/workspace/agent/plugins');
+    expect(targets.some((t) => t.startsWith('/workspace/extra/pond'))).toBe(false);
+    expect(agent.mounts.some((m) => m.class === 'install-surface')).toBe(false);
+    const byTarget = new Map(agent.mounts.map((m) => [m.containerPath, m.realization]));
+    // The subPath rule: root-relative host paths, never container paths.
+    expect(byTarget.get('/workspace')).toEqual({
+      kind: 'group-volume',
+      subPath: `v2-sessions/${GROUP_ID}/${SESSION_ID}`,
+    });
+    expect(byTarget.get('/workspace/agent')).toEqual({ kind: 'group-volume', subPath: FOLDER });
+    expect(byTarget.get('/home/node/.claude')).toEqual({
+      kind: 'group-volume',
+      subPath: `v2-sessions/${GROUP_ID}/.claude-shared`,
+    });
+    for (const file of ['/app/.nanoclaw-session.json', '/workspace/agent/container.json']) {
+      expect(byTarget.get(file)).toEqual({ kind: 'file-snapshot' });
+    }
+    expect(agent.mounts.every((m) => m.realization !== undefined)).toBe(true);
+    expect(agent.image).toBe(FIXTURE_PINNED_IMAGE);
+    expect(spec.runAs).toEqual({ uid: 1000, gid: 1000 });
+    expect(spec.providerState).toEqual([
+      expect.objectContaining({
+        provider: 'claude',
+        subPath: `v2-sessions/${GROUP_ID}/.claude-shared`,
+        createIfMissing: [expect.objectContaining({ relativePath: 'settings.json' })],
+        skillLinks: expect.objectContaining({ relativeDir: 'skills', targetRoot: '/app/skills' }),
+      }),
+    ]);
+    // Baked mode: no surface image configured, none composed.
+    expect(agent.surfaceImage).toBeUndefined();
+    // The mailbox endpoint is advertised on the driver's declared host address.
+    const context = JSON.parse(
+      fs.readFileSync(path.join(DATA_DIR, 'v2-sessions', GROUP_ID, '.context', `${SESSION_ID}.json`), 'utf8'),
+    ) as { mailbox: { url: string } };
+    expect(context.mailbox.url.startsWith(`http://${FIXTURE_GROUP_VOLUME_CAPABILITIES.hostAddress}:`)).toBe(true);
+  });
+
+  it('a group with NO driver field composes exactly what it did before: host binds, no realization data', async () => {
+    resetSessionDriver(getSessionDriver(hostBind.kind));
+    await setContainerConfigDriver(GROUP_ID, null);
+    const row = await createGroupSession();
+    expect(await wakeAndRefusal(row)).toBeUndefined();
+    expect(groupVolume.prepared).toHaveLength(0);
+    const [spec] = hostBind.prepared;
+    const targets = spec.containers[0].mounts.map((m) => m.containerPath);
+    expect(targets).toEqual(expect.arrayContaining(['/app/src', '/workspace/agent/plugins']));
+    expect(spec.containers[0].mounts.every((m) => m.realization === undefined)).toBe(true);
+    expect(spec.providerState).toBeUndefined();
+    expect(spec.containers[0].surfaceImage).toBeUndefined();
+    const context = JSON.parse(
+      fs.readFileSync(path.join(DATA_DIR, 'v2-sessions', GROUP_ID, '.context', `${SESSION_ID}.json`), 'utf8'),
+    ) as { mailbox: { url: string } };
+    expect(context.mailbox.url).not.toContain(String(FIXTURE_GROUP_VOLUME_CAPABILITIES.hostAddress));
+  });
+
+  it('composes the digest-pinned surface image when the install configures one, and refuses a mutable one', async () => {
+    process.env.NANOCLAW_SURFACE_IMAGE = FIXTURE_SURFACE_IMAGE;
+    try {
+      const row = await createGroupSession();
+      expect(await wakeAndRefusal(row)).toBeUndefined();
+      expect(groupVolume.prepared[0].containers[0].surfaceImage).toEqual({
+        image: FIXTURE_SURFACE_IMAGE,
+        mounts: [
+          { imagePath: 'src', containerPath: '/app/src' },
+          { imagePath: 'skills', containerPath: '/app/skills' },
+        ],
+      });
+      await stopIfRunning(SESSION_ID);
+      process.env.NANOCLAW_SURFACE_IMAGE = 'ghcr.io/tenequm/nanoclaw-agent-src:dev';
+      expect(await wakeAndRefusal(row)).toMatch(/spec-invalid: NANOCLAW_SURFACE_IMAGE .* must be a digest/);
+    } finally {
+      delete process.env.NANOCLAW_SURFACE_IMAGE;
+    }
+  });
+
+  const refusals: { name: string; arrange: () => Promise<Partial<Session> | void>; expected: RegExp }[] = [
+    {
+      name: "the install's local default image",
+      arrange: async () => {
+        await getDb().run('UPDATE container_configs SET image_tag = NULL WHERE agent_group_id = ?', GROUP_ID);
+      },
+      expected: /spec-invalid: .*local default image/,
+    },
+    {
+      name: 'a :latest image',
+      arrange: () => updateContainerConfigScalars(GROUP_ID, { image_tag: 'ghcr.io/x/agent:latest' }),
+      expected: /spec-invalid: .*:latest/,
+    },
+    {
+      name: 'an untagged image',
+      arrange: () => updateContainerConfigScalars(GROUP_ID, { image_tag: 'ghcr.io/x/agent' }),
+      expected: /spec-invalid: .*untagged/,
+    },
+    {
+      name: 'stamped plugins (named)',
+      arrange: async () => {
+        fs.mkdirSync(path.join(groupDir(), 'plugins', 'acme-plugin'), { recursive: true });
+      },
+      expected: /spec-invalid: .*stamped plugins \(acme-plugin\)/,
+    },
+    {
+      name: 'operator additionalMounts (named)',
+      arrange: () =>
+        updateContainerConfigJson(GROUP_ID, 'additional_mounts', [
+          { hostPath: '/tmp', containerPath: '/workspace/extra/tmp', readonly: true },
+        ]),
+      expected: /spec-invalid: .*additionalMounts \(\/workspace\/extra\/tmp\)/,
+    },
+    {
+      name: 'a provider whose contract the driver does not realize',
+      arrange: () => updateContainerConfigScalars(GROUP_ID, { provider: 'opencode' }),
+      expected: /spec-invalid: provider 'opencode' has no host contract .* \(supported: claude\)/,
+    },
+    {
+      name: 'a task-series session',
+      arrange: async () => ({ thread_id: 'system:tasks:series-1' }),
+      expected: /spec-invalid: task-series session .* sessionsPerGroup 'one'/,
+    },
+    {
+      name: 'a wiring that is not agent-shared',
+      arrange: async () => {
+        await getDb().run(
+          "INSERT INTO messaging_groups (id, channel_type, platform_id, instance, created_at) VALUES ('mg-ds', 'cli', 'p-ds', 'cli', ?)",
+          now(),
+        );
+        await getDb().run(
+          "INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, session_mode, created_at) VALUES ('w-ds', 'mg-ds', ?, 'shared', ?)",
+          GROUP_ID,
+          now(),
+        );
+      },
+      expected: /spec-invalid: .*routed 'shared'.*'agent-shared'/,
+    },
+  ];
+
+  for (const { name, arrange, expected } of refusals) {
+    it(`refuses loudly, before prepare: ${name}`, async () => {
+      // initGroupFilesystem creates the folder on the first spawn; a case that
+      // stamps into it needs it now.
+      fs.mkdirSync(groupDir(), { recursive: true });
+      const overrides = (await arrange()) ?? {};
+      const row = await createGroupSession(overrides);
+      expect(await wakeAndRefusal(row)).toMatch(expected);
+      expect(groupVolume.prepared).toHaveLength(0);
+    });
+  }
+
+  it('refuses pond stores the group reads (named), and composes as plain when it reads none', async () => {
+    const pondDir = path.join(DATA_DIR, 'pond');
+    if (fs.existsSync(pondDir)) return; // never touch a real install's pond config
+    try {
+      fs.mkdirSync(path.join(pondDir, 'stores', 'team'), { recursive: true });
+      fs.writeFileSync(
+        path.join(pondDir, 'stores.json'),
+        JSON.stringify({ stores: { team: { read: [GROUP_ID] }, other: { read: ['ag-else'] } } }),
+      );
+      const row = await createGroupSession();
+      expect(await wakeAndRefusal(row)).toMatch(/spec-invalid: .*reads pond stores \(\/workspace\/extra\/pond\/team\)/);
+      expect(groupVolume.prepared).toHaveLength(0);
+    } finally {
+      fs.rmSync(pondDir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses the SQLite mailbox transport: no host mailbox file reaches the runtime', async () => {
+    const row = await createGroupSession();
+    const spy = vi.spyOn(getAgentMailbox(), 'runnerContext').mockResolvedValueOnce(null);
+    try {
+      expect(await wakeAndRefusal(row)).toMatch(/spec-invalid: .*HTTP mailbox transport/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(groupVolume.prepared).toHaveLength(0);
+  });
+
+  it('holds the group fence: a second session of the group waits while the first is active', async () => {
+    const first = await createGroupSession();
+    expect(await wakeAndRefusal(first)).toBeUndefined();
+    const second = await createGroupSession({ id: 'sess-driver-selection-2' });
+    expect(await wakeAndRefusal(second)).toMatch(/already has active session sess-driver-selection/);
+    await stopIfRunning(SESSION_ID);
+    // Released with the runtime: the second session is admitted now.
+    expect(await wakeAndRefusal(second)).toBeUndefined();
+    expect(groupVolume.prepared.map((s) => s.key.sessionId)).toEqual([SESSION_ID, 'sess-driver-selection-2']);
+  });
+
+  it('holds the fence against an old execution still terminating on the runtime', async () => {
+    const settling = registerRecordingFake({
+      capabilities: FIXTURE_GROUP_VOLUME_CAPABILITIES,
+      listRetained: async () => [
+        {
+          key: { installSlug: INSTALL_SLUG, agentGroupId: GROUP_ID, sessionId: 'sess-old' },
+          name: 'ncl-old',
+          kind: 'session',
+          state: 'stopping',
+        },
+      ],
+    });
+    await setContainerConfigDriver(GROUP_ID, settling.kind);
+    const row = await createGroupSession();
+    expect(await wakeAndRefusal(row)).toMatch(/still has runtime ncl-old of another session/);
+    expect(settling.prepared).toHaveLength(0);
+  });
+
+  it('refuses a gateway that composes auxiliary containers (capability-gated, Block E)', async () => {
+    resetGatewayProvider({
+      kind: 'aux-gateway',
+      agentSkills: [],
+      sessions: {
+        async ensure() {
+          return {
+            contribution: {
+              networkAccess: { endpoint: 'proxy', target: { kind: 'session-container', role: 'proxy' } },
+              containers: [{ role: 'proxy', image: 'proxy:1', env: {}, mounts: [] }],
+            },
+          };
+        },
+      },
+      approvals: { subscribe: async () => {} },
+    });
+    const row = await createGroupSession();
+    expect(await wakeAndRefusal(row)).toMatch(/spec-invalid: gateway provider composed auxiliary containers/);
+  });
+
+  it('refuses attachment bytes inbound for a group-volume group, visibly', async () => {
+    await createGroupSession();
+    await writeSessionMessage(GROUP_ID, SESSION_ID, {
+      id: 'msg-attach',
+      kind: 'chat',
+      timestamp: now(),
+      platformId: null,
+      channelType: 'cli',
+      threadId: null,
+      content: JSON.stringify({ text: 'see file', attachments: [{ name: 'a.txt', data: 'aGVsbG8=' }] }),
+      trigger: false,
+    });
+    expect(fs.existsSync(path.join(DATA_DIR, 'v2-sessions', GROUP_ID, SESSION_ID, 'inbox', 'msg-attach'))).toBe(false);
+    expect(log.error).toHaveBeenCalledWith(
+      expect.stringContaining('Refused inbound attachments'),
+      expect.objectContaining({ messageId: 'msg-attach' }),
+    );
+    expect(await groupRefusesAttachments(GROUP_ID)).toBe(true);
+  });
+});
+
+describe('retained objects and driver changes', () => {
+  const GROUP_ID = 'ag-retained';
+  const now = () => new Date().toISOString();
+  const key = (sessionId: string): SessionKey => ({ installSlug: INSTALL_SLUG, agentGroupId: GROUP_ID, sessionId });
+
+  beforeEach(async () => {
+    process.chdir(previous);
+    await runMigrations(await initTestDb());
+    await createAgentGroup({
+      id: GROUP_ID,
+      name: 'Retained',
+      folder: 'retained',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await ensureContainerConfig(GROUP_ID);
+    await createSession({
+      id: 'sess-live-row',
+      agent_group_id: GROUP_ID,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: now(),
+    });
+  });
+
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  it('reaps only retained session objects whose rows are gone; never group storage, never an active row', async () => {
+    const fake = registerRecordingFake({
+      capabilities: FIXTURE_GROUP_VOLUME_CAPABILITIES,
+      listRetained: async () => [
+        { key: key('sess-live-row'), name: 'ncl-live', kind: 'session', state: 'stopped' },
+        { key: key('sess-deleted'), name: 'ncl-gone', kind: 'session', state: 'stopped' },
+        { key: key(''), name: 'ncl-pvc', kind: 'group-storage' },
+      ],
+    });
+    getSessionDriver(fake.kind);
+    expect(await reapRetainedSessions()).toBe(1);
+    expect(fake.reaped).toEqual([[key('sess-deleted')]]);
+  });
+
+  it('reaps nothing when the runtime cannot be read — unreadable is never "gone"', async () => {
+    const fake = registerRecordingFake({
+      capabilities: FIXTURE_GROUP_VOLUME_CAPABILITIES,
+      listRetained: () => Promise.reject(new Error('apiserver unreachable')),
+    });
+    getSessionDriver(fake.kind);
+    expect(await reapRetainedSessions()).toBe(0);
+    expect(fake.reaped).toEqual([]);
+  });
+
+  it('refuses a driver change while the old driver retains anything for the group, and when it cannot be read', async () => {
+    const holding = registerRecordingFake({
+      capabilities: FIXTURE_GROUP_VOLUME_CAPABILITIES,
+      listRetained: async () => [{ key: key(''), name: 'ncl-pvc', kind: 'group-storage' }],
+    });
+    await setContainerConfigDriver(GROUP_ID, holding.kind);
+    await expect(assertGroupDriverChangeAllowed(GROUP_ID, null)).rejects.toThrow(/retained group-storage ncl-pvc/);
+
+    const unreadable = registerRecordingFake({
+      capabilities: FIXTURE_GROUP_VOLUME_CAPABILITIES,
+      listSessions: () => Promise.reject(new Error('apiserver unreachable')),
+    });
+    await setContainerConfigDriver(GROUP_ID, unreadable.kind);
+    await expect(assertGroupDriverChangeAllowed(GROUP_ID, null)).rejects.toThrow(/could not be read/);
+
+    const clean = registerRecordingFake({
+      capabilities: FIXTURE_GROUP_VOLUME_CAPABILITIES,
+      listRetained: async () => [],
+    });
+    await setContainerConfigDriver(GROUP_ID, clean.kind);
+    await expect(assertGroupDriverChangeAllowed(GROUP_ID, null)).resolves.toBeUndefined();
+  });
+
+  it('refuses an unregistered kind, naming what is installed', async () => {
+    await expect(assertGroupDriverChangeAllowed(GROUP_ID, 'no-such-driver')).rejects.toThrow(/installed: /);
+  });
+
+  it('resolves a group to its configured kind, else the install default, and records kinds ever used', async () => {
+    const { kind } = registerFake();
+    expect((await sessionDriverForGroup(GROUP_ID)).kind).toBe('docker');
+    await setContainerConfigDriver(GROUP_ID, kind);
+    expect((await sessionDriverForGroup(GROUP_ID)).kind).toBe(kind);
+    await setContainerConfigDriver(GROUP_ID, null);
+    expect((await sessionDriverForGroup(GROUP_ID)).kind).toBe('docker');
+    // Flipped back, but remembered: discovery keeps looking at it.
+    expect(await listDriverKindsUsed()).toContain(kind);
+  });
+
+  it('startup discovery skips an unreachable runtime without blocking the default one', async () => {
+    const unreachable = registerRecordingFake({
+      capabilities: FIXTURE_GROUP_VOLUME_CAPABILITIES,
+      listSessions: () => Promise.reject(new Error('apiserver unreachable')),
+    });
+    await recordDriverKindsUsed([unreachable.kind]);
+    const reapOrphans = vi.fn(async () => {});
+    resetGatewayProvider({
+      kind: 'reap-gateway',
+      agentSkills: [],
+      sessions: {
+        async ensure() {
+          return { contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } } };
+        },
+        reapOrphans,
+      },
+      approvals: { subscribe: async () => {} },
+    });
+    const defaultFake = registerRecordingFake({
+      listSessions: async () => [
+        { handle: fakeHandle(fixtureSpec({ key: key('sess-gone-row') })), phase: 'running' } as SessionSnapshot,
+      ],
+    });
+    resetSessionDriver(getSessionDriver(defaultFake.kind));
+    const result = await adoptRunningSessions();
+    // The default runtime's orphan was handled; the unreachable one blocked nothing...
+    expect(result).toEqual({ adopted: 0, stopped: 1 });
+    // ...but its live sessions' gateway resources were not reaped as orphans.
+    expect(reapOrphans).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(
+      'Failed to list existing sessions for adoption',
+      expect.objectContaining({ driver: unreachable.kind }),
+    );
+  });
+});
+
+describe('adaptSpecToDriver', () => {
+  const agentGroup = { id: 'g1', name: 'G', folder: 'agent-one' } as AgentGroup;
+  const context = { driverKind: 'fake', provider: 'claude', selectedSkills: () => [], agentGroup, env: {} };
+
+  it('returns the composed spec untouched for a driver declaring none of the gated capabilities', () => {
+    const spec = fixtureSpec();
+    const before = structuredClone(spec);
+    expect(adaptSpecToDriver(spec, HOST_BIND_CAPABILITIES, context)).toBe(spec);
+    expect(spec).toEqual(before);
+  });
+
+  it('accepts a digest or a non-latest tag on a pinned-images driver', () => {
+    const caps = { ...HOST_BIND_CAPABILITIES, pinnedImages: true };
+    for (const image of [FIXTURE_PINNED_IMAGE, 'registry:5000/agent:v1', 'agent:dev-abc123']) {
+      const spec = fixtureSpec();
+      spec.containers[0].image = image;
+      expect(() => adaptSpecToDriver(spec, caps, context)).not.toThrow();
+    }
+    const spec = fixtureSpec();
+    spec.containers[0].image = 'registry:5000/agent';
+    expect(() => adaptSpecToDriver(spec, caps, context)).toThrow(/untagged/);
   });
 });

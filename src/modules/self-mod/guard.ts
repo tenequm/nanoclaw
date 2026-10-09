@@ -16,8 +16,13 @@
  * satisfies a hold but NEVER a deny, an approval issued while the install
  * ran on Docker cannot execute after a switch to a driver without
  * imageBuild. add_mcp_server needs no rebuild and carries no gate.
+ *
+ * The capability is read from the REQUESTING group's runtime (per-group
+ * selection): a kubernetes group on a Docker install is denied, a Docker
+ * group beside it is not. Decide is async-capable, so the lookup re-runs on
+ * every consult, approved replays included.
  */
-import { getSessionDriver } from '../../drivers/index.js';
+import { sessionDriverForGroup } from '../../drivers/index.js';
 import { DENY, HOLD, defineGuardedAction, type GuardInput } from '../../guard/index.js';
 
 function selfModDecide(label: string) {
@@ -34,11 +39,12 @@ const holdInstallPackages = selfModDecide('install_packages');
 export const selfModInstallPackages = defineGuardedAction({
   action: 'self_mod.install_packages',
   grantActionName: 'install_packages',
-  decide: (input) => {
+  decide: async (input) => {
+    if (input.actor.kind !== 'agent') return holdInstallPackages(input);
     // The capability gate runs first: a deny for "this runtime cannot do it"
     // must win over a hold even for a request that would otherwise card an
     // admin. Gate on capabilities(), never on kind (drivers/index.ts).
-    if (!getSessionDriver().capabilities().imageBuild) {
+    if (!(await sessionDriverForGroup(input.actor.agentGroupId)).capabilities().imageBuild) {
       return DENY(
         "install_packages needs an image rebuild and the session runtime does not declare the 'imageBuild' " +
           'capability — packages cannot be installed on this runtime (image changes are built and imported out of band)',
