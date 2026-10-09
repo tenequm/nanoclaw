@@ -354,6 +354,66 @@ describe('kubernetes driver lifecycle', () => {
     expect([...h.boxes.values()][0].spec).toEqual(before.spec);
     expect(h.core.replaceNamespacedSecret.mock.calls.length).toBe(writes);
   });
+  it.each([0, 7])('handles exit %i before Ready without inventing a clean-exit failure', async (code) => {
+    const h = harness();
+    const handle = await h.driver.prepare(h.spec);
+    const patch = h.custom.patchNamespacedCustomObject.getMockImplementation()!;
+    h.custom.patchNamespacedCustomObject.mockImplementation(async (input) => {
+      const result = await patch(input);
+      if (input.body.spec?.operatingMode === 'Running') {
+        const pod = h.pods.get(handle.name)!;
+        pod.status = {
+          phase: code ? 'Failed' : 'Succeeded',
+          containerStatuses: [
+            {
+              name: 'agent',
+              image: 'test',
+              imageID: 'test',
+              ready: false,
+              restartCount: 0,
+              state: { terminated: { exitCode: code } },
+            },
+          ],
+        };
+        setCondition(h.boxes.get(handle.name)!, 'Ready', 'False', code ? 'PodFailed' : 'PodSucceeded');
+      }
+      return result;
+    });
+    if (code) await expect(handle.start()).rejects.toMatchObject({ kind: 'started-then-died', exitCode: code });
+    else {
+      await handle.start();
+      expect(await handle.status()).toEqual({ phase: 'stopped' });
+      await handle.stop('cleanup');
+      expect(await handle.status()).toEqual({ phase: 'stopped' });
+    }
+  });
+
+  it('refuses to dress a missing or terminating pod as running in discovery', async () => {
+    const h = harness();
+    const handle = await h.driver.prepare(h.spec);
+    await handle.start();
+    h.pods.get(handle.name)!.metadata!.deletionTimestamp = new Date();
+    expect((await h.driver.listSessions('spike'))[0].phase).toBe('starting');
+    h.pods.delete(handle.name);
+    expect((await h.driver.listSessions('spike'))[0].phase).toBe('starting');
+  });
+
+  it('reports real unschedulability promptly rather than waiting the startup bound', async () => {
+    const h = harness({ startTimeoutMs: 90_000 });
+    const handle = await h.driver.prepare(h.spec);
+    const patch = h.custom.patchNamespacedCustomObject.getMockImplementation()!;
+    h.custom.patchNamespacedCustomObject.mockImplementation(async (input) => {
+      const result = await patch(input);
+      if (input.body.spec?.operatingMode === 'Running')
+        h.pods.get(handle.name)!.status = {
+          phase: 'Pending',
+          conditions: [{ type: 'PodScheduled', status: 'False', reason: 'Unschedulable', message: 'Insufficient cpu' }],
+        };
+      return result;
+    });
+    await expect(handle.start()).rejects.toMatchObject({ kind: 'resources-exhausted' });
+  });
+
   it('blocks resume until current-generation suspension and old pod deletion', async () => {
     const h = harness();
     const handle = await h.driver.prepare(h.spec);
@@ -640,6 +700,7 @@ describe('kubernetes Sandbox informer', () => {
     const events: SessionEvent[] = [];
     const first = h.driver.watchSessions('spike', (e) => events.push(e));
     const second = h.driver.watchSessions('spike', () => {});
+    await vi.dynamicImportSettled();
     const box = sandboxManifest(h.spec, 'ns');
     box.metadata.generation = 1;
     box.spec.operatingMode = 'Running';
@@ -657,11 +718,29 @@ describe('kubernetes Sandbox informer', () => {
     fake.emit('error');
     expect(fake.informer.start).toHaveBeenCalledTimes(1);
   });
+  it('does not schedule a new restart from deliberately aborting the old watch', async () => {
+    vi.useFakeTimers();
+    const fake = fakeInformer();
+    fake.informer.stop.mockImplementation(async () => {
+      fake.emit('error', Object.assign(new Error('cancelled'), { name: 'AbortError' }));
+    });
+    const h = harness({ informerFactory: fake.factory });
+    const watch = h.driver.watchSessions('spike', () => {});
+    await vi.dynamicImportSettled();
+    fake.emit('error', new Error('fetch failed'));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fake.informer.start).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(fake.informer.start).toHaveBeenCalledTimes(2);
+    watch.stop();
+  });
+
   it('reconnects forever with bounded backoff and cancels pending retries on stop', async () => {
     vi.useFakeTimers();
     const fake = fakeInformer();
     const h = harness({ informerFactory: fake.factory });
     const watch = h.driver.watchSessions('spike', () => {});
+    await vi.dynamicImportSettled();
     for (let n = 0; n < 8; n++) {
       fake.emit('error');
       await vi.advanceTimersByTimeAsync(Math.min(1000 * 2 ** n, 30000));

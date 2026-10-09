@@ -99,6 +99,17 @@ try {
   assert.match(output, /NoNewPrivs:\s+1/);
   assert.match(output, /CapEff:\s+0000000000000000/);
   step('exec', output);
+  kubectl(
+    'exec',
+    handle.name,
+    '-c',
+    'agent',
+    '--',
+    'bash',
+    '-c',
+    `printf '%s\n' '{"preserved":true}' > /home/node/.claude/settings.json; ln -s /app/skills/obsolete /home/node/.claude/skills/obsolete; rm /home/node/.claude/skills/agent-browser; mkdir /home/node/.claude/skills/agent-browser`,
+  );
+
   await handle.stop('harness-resume');
   step('suspend-requested', await handle.status());
   for (const mount of agent.mounts.filter((m) => m.realization?.kind === 'file-snapshot'))
@@ -126,6 +137,19 @@ try {
   assert.match(resumed, /fixture-version-2/);
   assert.match(resumed, /resume/);
   step('resumed-bytes-and-env', resumed);
+  const reconciled = kubectl(
+    'exec',
+    handle.name,
+    '-c',
+    'agent',
+    '--',
+    'bash',
+    '-c',
+    `grep preserved /home/node/.claude/settings.json; test ! -L /home/node/.claude/skills/obsolete; test -d /home/node/.claude/skills/agent-browser; test ! -L /home/node/.claude/skills/agent-browser; test ! -w /app/.nanoclaw-session.json; test ! -w /app/src/index.ts; echo provider-state-and-readonly-mounts-verified`,
+  );
+  assert.match(reconciled, /provider-state-and-readonly-mounts-verified/);
+  step('provider-reconciliation', reconciled);
+
   assert.equal(newPod.spec!.containers[0].resources!.limits!.cpu, '500m');
   step(
     'list',
