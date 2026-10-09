@@ -143,3 +143,28 @@ describe('voice-mode environment compatibility', () => {
     expect(table.map((m) => m[1])).toEqual([...LEGACY_VOICE_KEYS]);
   });
 });
+
+describe('voice-mode provider key aliases', () => {
+  it('reads GEMINI_API_KEY as VOICE_MODE_GEMINI_API_KEY, prefers the new name and never prints values', async () => {
+    const { voiceModeEnv, voiceModeEnvKeys, LEGACY_VOICE_KEYS } = await import('./voice-mode-protocol.js');
+    const oldValue = 'private-' + 'gemini';
+    expect(voiceModeEnvKeys(['VOICE_MODE_GEMINI_API_KEY', 'VOICE_MODE_ELEVENLABS_API_KEY'])).toEqual([
+      'VOICE_MODE_GEMINI_API_KEY',
+      'GEMINI_API_KEY',
+      'VOICE_MODE_ELEVENLABS_API_KEY',
+    ]);
+    const warnings: string[] = [];
+    expect(voiceModeEnv({ GEMINI_API_KEY: oldValue }, (s) => warnings.push(s))).toMatchObject({
+      VOICE_MODE_GEMINI_API_KEY: oldValue,
+    });
+    expect(
+      voiceModeEnv({ GEMINI_API_KEY: oldValue, VOICE_MODE_GEMINI_API_KEY: 'new' }, (s) => warnings.push(s)),
+    ).toMatchObject({ VOICE_MODE_GEMINI_API_KEY: 'new' });
+    expect(warnings).toEqual([
+      'voice-mode: GEMINI_API_KEY is deprecated; use VOICE_MODE_GEMINI_API_KEY',
+      'voice-mode: GEMINI_API_KEY is ignored because VOICE_MODE_GEMINI_API_KEY is set; remove it',
+    ]);
+    expect(warnings.join(' ')).not.toContain(oldValue);
+    expect(LEGACY_VOICE_KEYS).not.toContain('GEMINI_API_KEY');
+  });
+});

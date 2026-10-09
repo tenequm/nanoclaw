@@ -5,6 +5,8 @@
  */
 import { createHmac } from 'node:crypto';
 
+import type { TtsChoice } from '../voice-mode-tts.js';
+
 export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice-mode';
 
 /** The host pings the worker's event stream this often, so silence means a dead link. */
@@ -24,9 +26,6 @@ export const CALL_PROTOCOL_ATTRIBUTE = 'nanoclaw.voice-mode.protocol';
 
 /** Transcription over the Gemini Live API, verbatim, one manual activity per caller turn. */
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
-export const DEFAULT_VOICE_TTS_MODEL = 'gemini-3.8-flash-tts';
-export const DEFAULT_VOICE_TTS_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
-export const DEFAULT_VOICE_TTS_VOICE = 'Alnilam';
 /** Silence that ends the caller's turn; shorter pauses mid-thought keep it open. */
 export const DEFAULT_VOICE_SILENCE_MS = 2500;
 /** Channel type of the default call chat when `/voice` has not set one (VOICE_MODE_MIRROR). */
@@ -81,10 +80,8 @@ export interface LiveKitJobMetadata {
   sttModel: string;
   /** Deprecated and ignored (there is no unary fallback any more); kept for the wire format, empty by default. */
   sttFallbackModel: string;
-  ttsModel: string;
-  /** Takes over while `ttsModel` fails; empty for none. */
-  ttsFallbackModel: string;
-  ttsVoice: string;
+  /** The line's effective speech choice at call start. */
+  tts: TtsChoice;
   silenceMs: number;
   /** Upper bound the worker enforces on itself if the host never ends the call. */
   maxDurationMs: number;
@@ -333,6 +330,8 @@ export interface ReviewRequest {
   cues?: boolean;
   /** For `settings`: the typing sound while the agent works (on unless the page says off; cues off silence it too). */
   typing?: boolean;
+  /** For `settings`: the speech choice from the next line on, for this call only (the line's saved one is unchanged). */
+  tts?: { provider: string; model?: string; voice?: string };
 }
 
 /**
@@ -355,7 +354,19 @@ export interface ReviewReply {
     | 'agent_speaking'
     | 'not_review'
     | 'unsendable'
-    | 'closed';
+    | 'closed'
+    | 'tts_invalid'
+    | 'tts_unavailable';
+}
+
+/** The worker's participant attribute with its `CallVoiceState` as compact JSON. */
+export const CALL_VOICE_ATTRIBUTE = 'nanoclaw.voice-mode.voice';
+/** JSON on the attribute: what speaks now, what is queued for the next line, and the request gen that queued it. */
+export interface CallVoiceState {
+  v: 1;
+  active: TtsChoice;
+  pending?: TtsChoice;
+  gen?: number;
 }
 
 /**
@@ -509,27 +520,35 @@ export const LEGACY_VOICE_KEYS: readonly string[] = [
   'VOICE_WORKER_HEALTH_PORT',
 ];
 
+/** Old names outside the `VOICE_<suffix>` rule, mapped to the `VOICE_MODE_*` names that replace them. */
+export const LEGACY_VOICE_ALIASES: Readonly<Record<string, string>> = { GEMINI_API_KEY: 'VOICE_MODE_GEMINI_API_KEY' };
+
 /** The keys to read from `.env`: each requested key, and the old name of a `VOICE_MODE_*` one that had one. */
 export function voiceModeEnvKeys(keys: readonly string[]): string[] {
   return [
     ...new Set(
       keys.flatMap((key) => {
         const old = key.replace(/^VOICE_MODE_/, 'VOICE_');
-        return old !== key && LEGACY_VOICE_KEYS.includes(old) ? [key, old] : [key];
+        const aliases = Object.keys(LEGACY_VOICE_ALIASES).filter((alias) => LEGACY_VOICE_ALIASES[alias] === key);
+        return [key, ...(old !== key && LEGACY_VOICE_KEYS.includes(old) ? [old] : []), ...aliases];
       }),
     ),
   ];
 }
 
 /**
- * `.env` values with each old LEGACY_VOICE_KEYS setting under its `VOICE_MODE_*` name, unless that
- * name is set too, in which case the old one is ignored. `warn` hears key names only, never values.
+ * `.env` values with each old LEGACY_VOICE_KEYS or LEGACY_VOICE_ALIASES setting under its
+ * `VOICE_MODE_*` name, unless that name is set too, in which case the old one is ignored. `warn`
+ * hears key names only, never values.
  */
 export function voiceModeEnv(env: Record<string, string>, warn: (message: string) => void): Record<string, string> {
   const out = { ...env };
-  for (const key of LEGACY_VOICE_KEYS) {
+  const renames: [string, string][] = [
+    ...LEGACY_VOICE_KEYS.map((key): [string, string] => [key, key.replace(/^VOICE_/, 'VOICE_MODE_')]),
+    ...Object.entries(LEGACY_VOICE_ALIASES),
+  ];
+  for (const [key, renamed] of renames) {
     if (env[key] === undefined) continue;
-    const renamed = key.replace(/^VOICE_/, 'VOICE_MODE_');
     if (env[renamed] === undefined) {
       out[renamed] = env[key];
       warn(`voice-mode: ${key} is deprecated; use ${renamed}`);
