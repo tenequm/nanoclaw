@@ -14,11 +14,10 @@ spec:
       labels:
         app.kubernetes.io/name: nanoclaw-agent
     spec:
-      restartPolicy: OnFailure
+      restartPolicy: Never
       containers:
         - name: agent
           image: __NANOCLAW_K8S_IMAGE__
-          # The image only exists inside the kind node (kind load), never in a
-          # registry, so a pull must never be attempted.
-          imagePullPolicy: Never
+          # Reuse the side-loaded pinned image; a missing load fails visibly.
+          imagePullPolicy: IfNotPresent
           command: ["/usr/bin/tini", "--", "sleep", "infinity"]
