@@ -957,6 +957,9 @@ export async function pruneRecordings(root: string, days: number, now = Date.now
   return removed;
 }
 
+/** VOICE_MODE_TRANSCRIPT_DEBUG: `1` logs every raw transcription message and what the turns made of it. */
+export const transcriptDebugOn = (value: string | undefined): boolean => value?.trim() === '1';
+
 /** VOICE_MODE_RECORDINGS_DAYS: 0 (the default) records nothing. */
 export function recordingDays(raw: string | undefined): number {
   const days = Number(raw?.trim() || 0);
@@ -2049,6 +2052,8 @@ export interface CallTurnsOptions {
   record?: boolean;
   sttModel: string;
   now?: () => number;
+  /** VOICE_MODE_TRANSCRIPT_DEBUG: log what the turns make of the transcription (`voice-mode.transcript-debug`). */
+  debug?: boolean;
 }
 
 /** A finished review recording. */
@@ -2214,6 +2219,7 @@ export class CallTurns {
   /** The VAD: speech started or ended at stream position `at`. */
   onSpeech(speaking: boolean, at: number): void {
     if (this.closed || speaking === this.speaking) return;
+    this.debug('speech', { speaking, at: Math.round(msOf(at)), agentSpeaking: this.agentSpeaking });
     this.speaking = speaking;
     if (speaking) {
       this.speechFrom = at;
@@ -2278,6 +2284,7 @@ export class CallTurns {
     const match =
       turn.kind === 'auto' && (turn.addressed || found) ? matchCommand(this.spoken(turn, text), true) : null;
     const shown = joinText(turn.carry, text);
+    this.debug('interim', { text, changed, addressed: turn.addressed, wake: !!found, match });
     this.deps.caption(turn.segment, shown, false, match ? captionMark(shown, match.command) : undefined);
     if (turn.kind !== 'auto') return;
     if (!turn.addressed) {
@@ -2298,6 +2305,7 @@ export class CallTurns {
     else turn.candidate = { command: match.command, count: 1 };
     if (changed || !match) this.unsettle();
     if (match && !this.settleTimer) this.settle(turn);
+    this.debug('candidate', { candidate: turn.candidate, settling: !!this.settleTimer, speaking: this.speaking });
     if (this.command()) return;
     // The idle clock restarts on new words only: an interim repeating the same text is no speech.
     if (changed) this.arm();
@@ -2425,9 +2433,19 @@ export class CallTurns {
   /** A stable command at the end of what the caller said, once they are silent: the turn ends to confirm it. */
   private command(): boolean {
     const turn = this.turn;
-    if (!turn || turn.kind !== 'auto' || !turn.addressed || this.speaking || this.agentSpeaking) return false;
+    if (!turn || turn.kind !== 'auto' || !turn.addressed || this.speaking || this.agentSpeaking) {
+      if (turn?.candidate) {
+        const why = this.speaking ? 'speaking' : this.agentSpeaking ? 'agent-speaking' : 'not-addressed';
+        this.debug('command', { acts: false, why, candidate: turn.candidate });
+      }
+      return false;
+    }
     const candidate = turn.candidate;
-    if (!candidate || (candidate.count < STABLE_COMMAND_INTERIMS && !candidate.settled)) return false;
+    if (!candidate || (candidate.count < STABLE_COMMAND_INTERIMS && !candidate.settled)) {
+      if (candidate) this.debug('command', { acts: false, why: 'unstable', candidate });
+      return false;
+    }
+    this.debug('command', { acts: true, candidate });
     void this.finish(candidate.command);
     return true;
   }
@@ -2437,7 +2455,9 @@ export class CallTurns {
     const candidate = turn.candidate;
     this.settleTimer = setTimeout(() => {
       this.settleTimer = undefined;
-      if (this.turn !== turn || turn.candidate !== candidate || !candidate) return;
+      const stale = this.turn !== turn || turn.candidate !== candidate || !candidate;
+      this.debug('settle', { stale, candidate });
+      if (stale) return;
       candidate.settled = true;
       this.command();
     }, COMMAND_SETTLE_MS);
@@ -2547,6 +2567,7 @@ export class CallTurns {
     if (this.finalizing?.turn === turn) this.finalizing = undefined;
     const chosen = turnText(heard);
     let said = joinText(turn.carry, chosen.text);
+    this.debug('heard', { seg: turn.segment, why, source: chosen.source, said, ...heard });
     const facts: TurnFacts = {
       segment: turn.segment,
       mode,
@@ -2633,6 +2654,7 @@ export class CallTurns {
       // final is the turn's text. Not `copy`: only a final that has it, as its own sentence, sends it.
       match = { command: nominated.command, rest: sentence(trimCut(text)) };
     }
+    this.debug('decision', { seg: turn.segment, why, source: chosen.source, text, match, nominated, missed });
     const scratch = () => {
       if (scratched) this.discarded(scratched);
     };
@@ -2700,6 +2722,16 @@ export class CallTurns {
     else if (turn.speechMs < MIN_LOST_SPEECH_MS) this.deps.noise(take);
     else this.deps.lost('empty', fields, take);
     return null;
+  }
+
+  /** One `voice-mode.transcript-debug` line (VOICE_MODE_TRANSCRIPT_DEBUG), at the call's audio position. */
+  private debug(event: string, fields: Record<string, unknown>): void {
+    if (!this.options.debug) return;
+    this.deps.log.info(`voice-mode.transcript-debug turns.${event}`, {
+      pos: Math.round(msOf(this.ring.position)),
+      seg: this.turn?.segment,
+      ...fields,
+    });
   }
 
   /** The turn goes on after a command that was words: the text so far leads its next activity. */
@@ -3716,6 +3748,7 @@ function defaultDeps(): RunCallDeps {
     'VOICE_MODE_WAKE_PHRASE',
     'VOICE_MODE_WAKE_START_SECONDS',
     'VOICE_MODE_WAKE_IDLE_SECONDS',
+    'VOICE_MODE_TRANSCRIPT_DEBUG',
   ]));
   const wake = wakeWordSettings(env);
   return {
@@ -3785,6 +3818,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const geminiKey = deps.env.GEMINI_API_KEY;
   if (!geminiKey) return abandon('GEMINI_API_KEY is not set for the worker');
   const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
+  const transcriptDebug = transcriptDebugOn(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG);
   /** Spoken lines so far, for those no label numbered. */
   let replies = 0;
   /** The label of the line being spoken: TurnTaking announces each line right before it. */
@@ -4065,6 +4099,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     sampleRate: INPUT_SAMPLE_RATE,
     onInterim: (text) => callTurns.onInterim(text),
     log: callLog,
+    ...(transcriptDebug ? { debug: true } : {}),
   });
   const callTurns: CallTurns = new CallTurns(
     {
@@ -4120,6 +4155,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       limits: awakeLimits(deps.env),
       record,
       sttModel: meta.sttModel,
+      ...(transcriptDebug ? { debug: true } : {}),
     },
   );
   try {
@@ -4410,6 +4446,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'VOICE_MODE_WORKER_HEALTH_PORT',
     'VOICE_MODE_RECORDINGS_DAYS',
     'VOICE_MODE_MAX_SPOKEN_CHARS',
+    'VOICE_MODE_TRANSCRIPT_DEBUG',
   ]);
   // agents-js initializes its logger once the CLI runs a command; console until then.
   let hostUrl: string;
@@ -4420,7 +4457,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     process.exit(1);
   }
   console.info(
-    `voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, dispatch name ${env.LIVEKIT_AGENT_NAME || DEFAULT_LIVEKIT_AGENT_NAME}, host URL ${hostUrl} (LIVEKIT_HOST_URL)`,
+    `voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, dispatch name ${env.LIVEKIT_AGENT_NAME || DEFAULT_LIVEKIT_AGENT_NAME}, host URL ${hostUrl} (LIVEKIT_HOST_URL)${transcriptDebugOn(env.VOICE_MODE_TRANSCRIPT_DEBUG) ? ', transcript debug on (VOICE_MODE_TRANSCRIPT_DEBUG)' : ''}`,
   );
   // agents-js's default ("adaptive") enables the debugger domain on a job's first loop stall to
   // sample stacks: that blocks the loop another ~250 ms mid-call and slows the call's JS by ~15%

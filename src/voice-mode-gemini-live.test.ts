@@ -71,7 +71,7 @@ class FakeSocket implements LiveSocket {
   }
 }
 
-function harness(vocabulary = ['Andy', 'send it', 'прийом']) {
+function harness(vocabulary = ['Andy', 'send it', 'прийом'], debug = false) {
   vi.useFakeTimers();
   const sockets: FakeSocket[] = [];
   const interims: string[] = [];
@@ -91,6 +91,7 @@ function harness(vocabulary = ['Andy', 'send it', 'прийом']) {
       return socket;
     },
     now: () => Date.now(),
+    ...(debug ? { debug } : {}),
   });
   const result = (p: Promise<Heard>) => {
     let out: Heard | undefined;
@@ -103,6 +104,34 @@ function harness(vocabulary = ['Andy', 'send it', 'прийом']) {
 const pcm = (ms: number) => new Int16Array(16 * ms).fill(7);
 
 describe('GeminiLiveTranscriber', () => {
+  it('logs the raw messages and what was forwarded only with debug on', async () => {
+    const debugLines = (info: ReturnType<typeof vi.fn>) =>
+      info.mock.calls.filter(([msg]) => String(msg).startsWith('voice-mode.transcript-debug'));
+    for (const debug of [false, true]) {
+      const h = harness(undefined, debug);
+      h.t.begin(pcm(100));
+      await h.tick(0);
+      h.sockets[0].ready();
+      await h.tick(0);
+      h.sockets[0].interim(' Copy.');
+      expect(h.interims).toEqual(['Copy.']);
+      const lines = debugLines(h.info);
+      if (!debug) {
+        expect(lines).toEqual([]);
+        continue;
+      }
+      expect(lines).toContainEqual([
+        'voice-mode.transcript-debug raw',
+        expect.objectContaining({ act: 1, sid: 1, role: 'current', interim: ' Copy.' }),
+      ]);
+      expect(lines).toContainEqual([
+        'voice-mode.transcript-debug forward',
+        expect.objectContaining({ kind: 'interim', text: 'Copy.', same: false }),
+      ]);
+      expect(lines.map(([msg]) => msg)).toContain('voice-mode.transcript-debug activityStart');
+    }
+  });
+
   it('sets up a manual-activity transcription, sends nothing before setupComplete, then the activity in 100 ms chunks', async () => {
     const h = harness();
     h.t.push(pcm(100));
