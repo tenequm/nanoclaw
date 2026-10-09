@@ -1,168 +1,180 @@
-# Local agent-sandbox playground (kind)
+# Local Kubernetes driver bench
 
-A throwaway Kubernetes cluster on your machine, running the
-[agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) controller
-(v1.0.2, pinned) and our agent image as a `Sandbox` claimed from a warm pool.
-It is the bench for the upcoming agent-sandbox `SessionDriver`: everything the
-driver will create (templates, pools, claims, lifecycle patches) can be tried
-here in seconds, without touching a real cluster.
+One long-lived [kind](https://kind.sigs.k8s.io/) cluster, pinned Kubernetes 1.37
+and [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) v1.0.6.
+The driver creates bare Sandboxes. Templates, warm pools and claims remain an
+optional playground. Plain runc; this bench does not provide production isolation.
 
-Plain runc, no gVisor. Isolation strength is not what this is for.
+## Start and edit loop
 
-## Prerequisites
-
-- Docker (tested on OrbStack; Docker Desktop should behave the same apart from
-  the host-reachability notes below), `kind` (`brew install kind`), `kubectl`.
-- The agent image in the local docker store: `./container/build.sh`
-  (a few minutes, ~4.6GB). It tags `nanoclaw-agent-v2-<slug>:latest`, where the
-  slug is derived from the checkout path. That is the default `up.sh` uses.
-
-## Usage
+Prerequisites: local Docker (validated on [OrbStack](https://orbstack.dev/)),
+kind and kubectl, plus an agent base image from `./container/build.sh`.
+For this fork's existing base image:
 
 ```sh
-./dev/k8s/up.sh                                  # create or converge; safe to re-run
-NANOCLAW_K8S_IMAGE=my-agent:tag ./dev/k8s/up.sh  # any other local image
-export KUBECONFIG=$PWD/dev/k8s/.kubeconfig       # then plain kubectl works
-./dev/k8s/down.sh                                # delete the cluster
+NANOCLAW_K8S_IMAGE=nanoclaw-agent-v2-bc64d37f:latest ./dev/k8s/up.sh
+SOURCE_IMAGE=$(./dev/k8s/build-source.sh)
+NS=$(./dev/k8s/namespace.sh create 'my-run')
+HOST_ADDRESS=$(./dev/k8s/host-address.sh)
+# Run the driver harness in $NS with the printed base reference and $SOURCE_IMAGE.
+./dev/k8s/namespace.sh delete "$NS"
 ```
 
-`down.sh` removes the node container and `dev/k8s/.kubeconfig`; the shared
-`kind` docker network stays, as it does for every kind cluster.
+Without `NANOCLAW_K8S_IMAGE`, `up.sh` uses the base built for this checkout.
+It creates or converges the cluster, installs the controller and loads both
+images. A re-run skips unchanged image loads. After editing runner source or
+skills, run `build-source.sh` and use its new digest in the next Sandbox
+podTemplate. Running pods retain their mounted bytes; suspend and resume with
+the updated podTemplate to pick up a change.
 
-The scripts never read or write `~/.kube/config`: the cluster's credentials
-live in `dev/k8s/.kubeconfig` (gitignored) and every call names the
-`kind-nanoclaw-dev` context, so a stray command can not land on a real
-cluster.
-
-`up.sh` creates the `nanoclaw-dev` cluster if absent, server-side-applies the
-v1.0.2 `sandbox-with-extensions.yaml` release manifest, waits for the CRDs and
-the controller rollout, loads the agent image into the node (skipped when the
-node already has that exact image), applies `sandbox-template.yaml` +
-`warm-pool.yaml`, waits for the pool to be warm, then applies
-`sample-claim.yaml` and waits for the claimed `Sandbox` to be `Ready`.
-
-Measured on an M-series Mac with OrbStack: about 70s from nothing (kind ~25s,
-image load ~35s, everything else under 5s); a re-run on a live cluster about 3s.
-
-Lifecycle by hand:
+All scripts use `dev/k8s/.kubeconfig` and context `kind-nanoclaw-dev`; they never
+use `~/.kube/config`. Use both explicitly for manual commands:
 
 ```sh
-S=$(kubectl get sandboxclaim nanoclaw-sample -o jsonpath='{.status.sandbox.name}')
-kubectl patch sandbox $S --type merge -p '{"spec":{"operatingMode":"Suspended"}}'
-kubectl wait --for=condition=Suspended sandbox/$S
-kubectl patch sandbox $S --type merge -p '{"spec":{"operatingMode":"Running"}}'
-kubectl wait --for=condition=Ready sandbox/$S
+kubectl --kubeconfig dev/k8s/.kubeconfig --context kind-nanoclaw-dev get sandboxes -A
+./dev/k8s/up.sh --playground   # optional template, warm pool, claim
+./dev/k8s/down.sh             # deletes this local cluster
 ```
 
-After rebuilding the image under the same tag, `up.sh` reloads it, but running
-pods keep the old one: delete the claim and the warm sandboxes, or
-`down.sh && up.sh`.
+## Image references and ImageVolume mounts
 
-## What it deliberately does not do yet
+`up.sh` retags the local base using its Docker content ID. The validated base is:
 
-- **No SessionDriver.** Nothing in `src/` knows this cluster exists.
-- **The agent-runner does not run.** The template runs
-  `tini -- sleep infinity` instead of the image's entrypoint: the runner needs
-  its mailbox mounts to start. This proves scheduling and lifecycle, not the
-  runner.
-- No PVCs, no sandbox-router, no Service, no secrets, no gVisor.
+```text
+nanoclaw-agent-dev:sha256-319e17ce64bf1ed761cc5f6f8d1b371634300565cc299975bf1523797fb41789
+```
 
-## Findings
+Set container `imagePullPolicy: IfNotPresent` explicitly. The tag is immutable
+by convention, includes the entire content ID, and avoids the `:latest` pull
+trap. It is local to this node, not published to a registry.
 
-Recorded 2026-10-08, kind v0.33.0 (node `kindest/node:v1.37.0`), OrbStack,
-agent-sandbox v1.0.2.
+`container/Dockerfile.k8s` has two targets: `baked` (the default complete image)
+and `source` (scratch with `/src` and `/skills`). The latter is a real image
+with config and rootfs layers, not an empty-config OCI artifact. The source
+builder loads it and registers a digest alias in the node's containerd image
+store; its **stdout contains only the digest reference**, build output goes to
+stderr. For the validated checkout that reference is:
 
-### Lifecycle
+```text
+docker.io/library/nanoclaw-source-dev@sha256:cd907d6dae39540eeb61939fabb0e3399875078c27f7b7bc2c831c9695444372
+```
 
-- **Warm adoption works and is instant.** With the pool at 1 ready replica, a
-  new `SandboxClaim` adopts the warm sandbox (name stays
-  `nanoclaw-agent-pool-xxxxx`, label `agents.x-k8s.io/launch-type: warm`) and is
-  `Ready` in ~0.2s; the pool replenishes within a second. Deleting the claim
-  (`shutdownPolicy: Delete`) and recreating it adopts the next warm sandbox in
-  ~0.2s. The adopted `Sandbox` becomes owned by the claim (ownerReference), so
-  claim deletion garbage-collects it.
-- **Suspend = delete the pod.** `operatingMode: Suspended` deletes the pod and
-  keeps the `Sandbox` object (`Suspended=True` reason `PodTerminated`,
-  `Ready=False` reason `SandboxSuspended`). Timings, three rounds: suspend
-  1.7-2.7s, resume to `Ready=True` 0.3s (image already on the node).
-- **A bare `sleep infinity` makes suspend take 31s.** As PID 1 it ignores
-  SIGTERM, so every suspend waited out the 30s grace period. Keeping the image's
-  `tini` as PID 1 fixes it; the real runner already runs under tini. A driver
-  should still budget for `terminationGracePeriodSeconds` on suspend.
-- **Every resume gets a new pod IP** (10.244.0.8 -> .9 -> .10 across three
-  rounds). Without PVCs nothing on the filesystem survives a suspend either.
-- **A template change never reaches a claimed sandbox.** With the default
-  `OnReplenish` strategy even warm sandboxes stay stale until handed out; the
-  pool here uses `Recreate`, which replaced the stale warm sandbox within
-  seconds while the claimed one kept the old spec.
+Use the reference printed by your build, since source edits change the digest.
+In a bare `agents.x-k8s.io/v1beta1` Sandbox podTemplate:
 
-### Secure-by-default network behaviour
+```yaml
+volumes:
+  - name: source
+    image:
+      reference: docker.io/library/nanoclaw-source-dev@sha256:<printed-digest>
+      pullPolicy: IfNotPresent
+containers:
+  - name: agent
+    # image, command, securityContext and other mounts omitted here
+    volumeMounts:
+      - name: source
+        mountPath: /app/src
+        subPath: src
+        readOnly: true
+      - name: source
+        mountPath: /app/skills
+        subPath: skills
+        readOnly: true
+```
 
-With `networkPolicyManagement` left at its default (`Managed`) and no
-`spec.networkPolicy`, the controller:
+Validated on kind's containerd 2.3.4: both subPaths are read-only; `/app/node_modules`
+and `/app/package.json` remain present. ImageVolume `IfNotPresent` and `Never`
+use the side-loaded digest alias. `Always` attempts a registry pull and fails
+for these unpublished images. This is a local delivery mechanism; production
+needs registry delivery and compatible Kubernetes/containerd, or the baked image.
 
-- creates one shared NetworkPolicy per template
-  (`<template>-network-policy`): ingress only from the sandbox-router pods in
-  `agent-sandbox-system`; egress to `0.0.0.0/0` and `::/0` **except** 10/8,
-  172.16/12, 192.168/16, 169.254/16, fc00::/7, fe80::/10;
-- rewrites the pod to `dnsPolicy: None` with nameservers 8.8.8.8 and 1.1.1.1,
-  so cluster DNS and any resolver-provided host names are gone;
-- sets `automountServiceAccountToken: false`.
+## Test namespaces and host reachability
 
-kind's kindnet enforces NetworkPolicy, so all of this is live here. Supplying
-any `spec.networkPolicy` (or `Unmanaged`) drops the DNS rewrite and the pod is
-back on `ClusterFirst`. The DNS rewrite is applied when the pod spec is built,
-so changing the template's policy later does not change DNS on existing pods.
+`namespace.sh create [suffix]` prints a fresh `nanoclaw-test-<suffix>` namespace.
+The optional suffix is lowercased, RFC1123-sanitized and capped at 63 total
+characters; omit it for a timestamp/random suffix. Explicit duplicate names
+fail rather than reuse state. `delete <name>` accepts only test namespaces and
+returns after requesting deletion (`--wait=false`). Scripts and vitest can call
+it with `execFile`; trim stdout for the returned name.
 
-### Reaching the Mac from a sandbox (mailbox-over-HTTP path)
+`host-address.sh` resolves `host.docker.internal` inside the node using
+`getent ahostsv4`; it never hardcodes an OrbStack address. Probe it from an
+actual bare Sandbox:
 
-A listener on the Mac at `0.0.0.0:3999`, probed with curl from inside pods:
+```sh
+./dev/k8s/probe-host.py --image nanoclaw-agent-dev:sha256-319e17ce64bf1ed761cc5f6f8d1b371634300565cc299975bf1523797fb41789
+```
 
-| Target | kind node | plain pod (no policy) | sandbox, default policy | sandbox, custom policy |
-|---|---|---|---|---|
-| `host.docker.internal` | 200 | 200 | DNS fails | 200 |
-| `0.250.250.254` (OrbStack's host IP) | 200 | 200 | 200 | 200 |
-| `192.168.97.1` (kind network gateway) | timeout | refused | timeout | - |
-| `192.168.8.141` (Mac LAN IP) | 200 | 200 | timeout | timeout |
-| `100.84.68.83` (Mac tailnet IP) | 200 | 200 | 200 | timeout |
+The probe starts two ephemeral Mac HTTP listeners, creates its own namespace
+and Sandbox, probes both from that Sandbox, then closes listeners and requests
+namespace deletion even on failure. On this OrbStack installation the resolved
+address was `0.250.250.254`, and both `0.0.0.0` and `127.0.0.1` listeners returned
+HTTP 200. Re-probe on another runtime; loopback forwarding is runtime-specific.
+Bare Sandboxes use permissive networking here. Template defaults can rewrite
+DNS and create NetworkPolicy, so the optional playground has different behavior.
 
-"custom policy" was a probe template whose `spec.networkPolicy` allowed only
-kube-dns:53 and `0.250.250.254/32:3999`; public egress (`example.com`) was then
-blocked as well, as expected.
+## Lifecycle and outage tests
 
-- **The default policy blocks the Docker Desktop host but not OrbStack's.**
-  OrbStack puts the host at `0.250.250.254`, outside every excluded range, so it
-  is reachable by IP even under the default policy, but not by name (public DNS
-  cannot resolve `host.docker.internal`). Docker Desktop's host address
-  (192.168.65.x, not tested here) falls inside 192.168/16 and would be blocked. The Mac's
-  tailnet IP (100.64/10, CGNAT) also slips through the default policy.
-- **The kind network gateway is not the Mac** under OrbStack; do not use the
-  pod or node default route to find the host.
-- **OrbStack's `host.docker.internal` reaches loopback-only listeners.** A
-  listener bound to `127.0.0.1:3998` on the Mac answered via
-  `host.docker.internal` from the node (the Mac logs the peer as 127.0.0.1),
-  while the LAN and tailnet IPs did not. The host does not need to bind
-  0.0.0.0 for this path.
-- **There is an enforcement gap at template creation.** A pool created in the
-  same instant as its template had unrestricted egress for its first few
-  seconds (LAN, tailnet and public all answered), and the policy was enforced
-  by the next probe ten seconds later. Seen with kindnet; not checked on other CNIs.
+Create group PVCs without waiting for Bound: the default local-path StorageClass
+is WaitForFirstConsumer. A Suspended Sandbox referencing a Pending PVC creates
+successfully; switching to Running schedules its pod and binds the PVC.
+Use `restartPolicy: Never`, fixed uid/gid 1000 with `fsGroup: 1000`, tini as PID 1,
+capabilities drop ALL, `allowPrivilegeEscalation: false`, no service-account token,
+and memory emptyDir for `/dev/shm`. Init containers can create PVC subdirectories
+as that uid before per-file Secret subPath mounts attach.
 
-What this means for the driver: the host endpoint should be passed in
-explicitly (env or claim), and the template should carry its own
-`spec.networkPolicy` that allows exactly that endpoint plus DNS, rather than
-relying on the default policy and host names.
+For every lifecycle wait, check the relevant condition's `observedGeneration`
+against `metadata.generation`. Suspend deletes the pod but retains the Sandbox,
+PVC and owned Secret. Wait for `Suspended=True` and pod deletion before updating
+Secret bytes and resuming; the new pod UID then sees the new per-file contents.
+Terminal pods report `Finished=True` with `PodSucceeded` or `PodFailed`; get the
+pod's terminated container status for the exit code.
 
-### Other notes
+For a real API outage, move the static-pod manifest out of its watched directory
+and restore it in a `finally`/trap:
 
-- v1.0.2 `SandboxClaim.spec.warmPoolRef` is required: no warm pool, no claim.
-- Claims can inject env (`spec.env`) and PVCs, but only when the template opts
-  in (`envVarsInjectionPolicy`, `volumeClaimTemplatesPolicy`, both default
-  `Disallowed`); left at the defaults here.
-- `kind load docker-image` never sees the image as present under Docker's
-  containerd image store (OrbStack and recent Docker Desktop): docker reports
-  the index digest, the node the config digest, so it re-copied ~4.6GB on every
-  run. `up.sh` compares the index digest against the node's containerd image
-  list itself.
-- agent-sandbox v1.0.5 is out; this stays on v1.0.2 until the driver work picks
-  a version.
+```sh
+docker exec nanoclaw-dev-control-plane mv /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/kube-apiserver.yaml
+# Observe API failure, then always restore:
+docker exec nanoclaw-dev-control-plane mv /tmp/kube-apiserver.yaml /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+Do not pause the node for this test: that leaves half-open sockets. client-node
+2.0.0 informers reconnect automatically for watch timeouts/410, but a fetch
+failure emits `error` and requires an application restart/backoff handler.
+
+## Driver-only harness
+
+The [driver harness](driver-harness.ts) feeds A1's group-volume fixture through
+prepare, start, status, exec, rapid suspend/resume, discovery and retained
+cleanup. It creates and deletes its own `nanoclaw-test-b1-*` namespace and uses
+synthetic file contents. A new pod UID, refreshed bytes/env, provider state,
+exact uid and skill-link targets, non-root posture, terminal watch delivery and
+group-PVC survival are asserted. Every multi-command shell check exits on its
+first failed assertion.
+
+```sh
+pnpm exec tsx dev/k8s/driver-harness.ts --help
+pnpm exec tsx dev/k8s/driver-harness.ts \
+  --kubeconfig dev/k8s/.kubeconfig \
+  --image nanoclaw-agent-dev:sha256-319e17ce64bf1ed761cc5f6f8d1b371634300565cc299975bf1523797fb41789 \
+  --surface-image "$(./dev/k8s/build-source.sh)"
+```
+
+Omit `--surface-image` only with a complete baked image. The harness attaches
+to a sleeping agent container; the full mailbox/model round trip belongs to
+the host milestone.
+
+The lazily constructed driver reads install settings from environment first,
+then `.env`: `NANOCLAW_KUBERNETES_KUBECONFIG` (explicit file),
+`NANOCLAW_KUBERNETES_CONTEXT` (explicit context), optional
+`NANOCLAW_KUBERNETES_NAMESPACE` (otherwise sanitized `nanoclaw-<installSlug>`)
+and `NANOCLAW_KUBERNETES_HOST_ADDRESS` (the address from `host-address.sh`).
+It never loads the default kubeconfig. An unreachable cluster affects the
+requesting session and does not run a startup readiness check.
+
+This MVP creates bare Sandboxes with permissive networking. The declared
+`declarative` network-policy capability describes the intended mechanism;
+this driver installs no NetworkPolicy. Session stop retains Sandbox and
+owned Secret; only host-named retained cleanup or terminal residue deletes
+session objects. Those paths always preserve the standalone group PVC.

@@ -32,6 +32,7 @@ vi.mock('../../log.js', () => ({
 import { buildAgentGroupImage } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { DockerSessionDriver } from '../../drivers/docker-driver.js';
+import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import { resetSessionDriver } from '../../drivers/index.js';
 import { FIXTURE_POLICY } from '../../drivers/spec-fixture.js';
 import type { SessionDriver } from '../../drivers/types.js';
@@ -53,11 +54,17 @@ function noImageBuildDriver(): SessionDriver {
   };
 }
 
-beforeEach(() => {
+// The gate resolves the target group's runtime from its config row; with no
+// row that is the install default — the driver each case installs.
+beforeEach(async () => {
   vi.clearAllMocks();
+  await runMigrations(await initTestDb());
 });
 
-afterEach(() => resetSessionDriver(null));
+afterEach(async () => {
+  resetSessionDriver(null);
+  await closeDb();
+});
 
 describe('groups restart --rebuild gates on the imageBuild capability', () => {
   it('rebuilds then restarts on a driver that declares imageBuild (docker)', async () => {

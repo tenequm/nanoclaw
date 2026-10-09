@@ -10,6 +10,7 @@
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';
+import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('./container-runner.js', () => ({
@@ -27,10 +28,16 @@ vi.mock('./config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
-import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
+import {
+  ensureContainerConfig,
+  setContainerConfigDriver,
+  updateContainerConfigScalars,
+} from './db/container-configs.js';
+import { listSessionDriverKinds, registerSessionDriver } from './drivers/driver-registry.js';
+import { FIXTURE_GROUP_VOLUME_CAPABILITIES } from './drivers/spec-fixture.js';
 import { getDeliveredIds } from './mailbox/sqlite/session-db.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
-import { resolveSession, resolveTaskSession, withMailboxSession } from './session-manager.js';
+import { resolveSession, resolveTaskSession, sessionDir, withMailboxSession } from './session-manager.js';
 import {
   deliverSessionMessages,
   registerDeliveryBatchPreview,
@@ -1427,5 +1434,92 @@ describe('deliverSessionMessages — reply box', () => {
     await updateContainerConfigScalars('ag-1', { rich_messages: 1 });
     insertOperation('ag-1', session.id, 'out-2', { operation: 'edit', messageId: '123:5:ag-1', text: 'b' });
     expect(await deliveredContent(session)).toEqual([{ operation: 'edit', messageId: '123:5', text: 'b', rich: true }]);
+  });
+});
+
+describe('deliverSessionMessages — files from a runtime with no host filesystem', () => {
+  const GROUP_VOLUME_KIND = 'delivery-group-volume-fake';
+
+  function selectGroupVolumeDriver(): Promise<void> {
+    if (!listSessionDriverKinds().includes(GROUP_VOLUME_KIND)) {
+      registerSessionDriver(GROUP_VOLUME_KIND, () => ({
+        kind: GROUP_VOLUME_KIND,
+        capabilities: () => FIXTURE_GROUP_VOLUME_CAPABILITIES,
+        prepare: () => Promise.reject(new Error('not under test')),
+        listSessions: async () => [],
+        watchSessions: () => ({ stop: () => {} }),
+      }));
+    }
+    return setContainerConfigDriver('ag-1', GROUP_VOLUME_KIND);
+  }
+
+  async function sessionWithFile(): Promise<Awaited<ReturnType<typeof resolveSession>>['session']> {
+    await seedAgentAndChannel();
+    await ensureContainerConfig('ag-1');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const outbox = path.join(sessionDir('ag-1', session.id), 'outbox', 'out-files');
+    fs.mkdirSync(outbox, { recursive: true });
+    fs.writeFileSync(path.join(outbox, 'report.txt'), 'bytes');
+    insertOperation('ag-1', session.id, 'out-files', { text: 'see attached', files: ['report.txt'] });
+    return session;
+  }
+
+  function attachmentNotes(sessionId: string): string[] {
+    const db = openInboundDb('ag-1', sessionId);
+    const rows = db.prepare("SELECT content FROM messages_in WHERE id = 'attachments-note-out-files'").all() as {
+      content: string;
+    }[];
+    db.close();
+    return rows.map((row) => (JSON.parse(row.content) as { text: string }).text);
+  }
+
+  it('delivers the text without the files, logs the refusal, and tells the agent after the send', async () => {
+    const session = await sessionWithFile();
+    await selectGroupVolumeDriver();
+    const error = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const sent: { content: string; files: unknown }[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content, files) {
+        sent.push({ content, files });
+        return 'plat-msg-files';
+      },
+    });
+    await deliverSessionMessages(session);
+    expect(sent).toHaveLength(1);
+    expect(JSON.parse(sent[0].content)).toMatchObject({ text: 'see attached' });
+    expect(sent[0].files).toBeUndefined();
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining('Refused outbound attachments'),
+      expect.objectContaining({ messageId: 'out-files', files: 1 }),
+    );
+    expect(attachmentNotes(session.id)).toEqual([expect.stringContaining('delivered WITHOUT its 1 attached file(s)')]);
+  });
+
+  it('writes no note when the send itself fails: nothing was delivered yet', async () => {
+    const session = await sessionWithFile();
+    await selectGroupVolumeDriver();
+    vi.spyOn(log, 'error').mockImplementation(() => {});
+    vi.spyOn(log, 'warn').mockImplementation(() => {});
+    setDeliveryAdapter({
+      async deliver() {
+        throw new Error('network timeout');
+      },
+    });
+    await deliverSessionMessages(session);
+    expect(attachmentNotes(session.id)).toEqual([]);
+  });
+
+  it('a group with no driver set still sends its files, exactly as before', async () => {
+    const session = await sessionWithFile();
+    const sent: unknown[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, _content, files) {
+        sent.push(files);
+        return 'plat-msg-files';
+      },
+    });
+    await deliverSessionMessages(session);
+    expect(sent).toEqual([[expect.objectContaining({ filename: 'report.txt' })]]);
+    expect(attachmentNotes(session.id)).toEqual([]);
   });
 });

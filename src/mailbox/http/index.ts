@@ -22,7 +22,7 @@ import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
 import { SqliteAgentMailbox } from '../sqlite/index.js';
 import { sessionMailboxDir, sessionMailboxPath } from '../sqlite/paths.js';
-import type { AgentMailbox, MailboxSession, MailboxSessionKey } from '../types.js';
+import type { AgentMailbox, MailboxSession, MailboxSessionKey, RunnerContextOptions } from '../types.js';
 import { createMailboxHttpServer, MAILBOX_HTTP_PATH, MAILBOX_HTTP_PROTOCOL } from './server.js';
 
 const SETTINGS = [
@@ -115,9 +115,23 @@ export function readMailboxHttpSettings(env: NodeJS.ProcessEnv = process.env): M
       // through Docker's host.docker.internal name.
       const host = resolveBind();
       const advertised = host === '127.0.0.1' || host === '0.0.0.0' || host === '::' ? 'host.docker.internal' : host;
-      return `http://${advertised.includes(':') ? `[${advertised}]` : advertised}:${port}`;
+      return httpBase(advertised, port);
     },
   };
+}
+
+function httpBase(host: string, port: number): string {
+  return `http://${host.includes(':') ? `[${host}]` : host}:${port}`;
+}
+
+/**
+ * The base URL a session's runtime reaches the endpoint on. A runtime that
+ * declares its own host address (a cluster cannot resolve Docker's
+ * `host.docker.internal`) gets that host on the configured port; every other
+ * one gets the install-wide URL.
+ */
+export function advertisedBase(settings: Pick<MailboxHttpSettings, 'url' | 'port'>, hostAddress?: string): string {
+  return hostAddress ? httpBase(hostAddress, settings.port) : settings.url;
 }
 
 const tokenId = (key: MailboxSessionKey) => `${key.agentGroupId}/${key.sessionId}`;
@@ -163,7 +177,7 @@ export class HttpServedAgentMailbox implements AgentMailbox {
    * A fresh token per spawn: the newest container of a session is the only one
    * the endpoint accepts, so a container the host replaced is fenced out.
    */
-  async runnerContext(key: MailboxSessionKey): Promise<HttpRunnerContext | null> {
+  async runnerContext(key: MailboxSessionKey, options: RunnerContextOptions = {}): Promise<HttpRunnerContext | null> {
     if (this.settings.transport === 'sqlite') return this.delegate.runnerContext(key);
     const token = randomBytes(32).toString('hex');
     const file = tokenPath(key);
@@ -173,7 +187,7 @@ export class HttpServedAgentMailbox implements AgentMailbox {
     return {
       transport: 'http',
       protocol: MAILBOX_HTTP_PROTOCOL,
-      url: `${this.settings.url}${MAILBOX_HTTP_PATH}`,
+      url: `${advertisedBase(this.settings, options.hostAddress)}${MAILBOX_HTTP_PATH}`,
       token,
     };
   }

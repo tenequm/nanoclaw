@@ -26,8 +26,10 @@ vi.mock('./container-runner.js', () => ({
     state.adopted = true;
   },
   abortGatewaySessionObservers: vi.fn(),
+  ensureSessionRuntimesReady: vi.fn(),
   resumeGatewaySessionAdmission: vi.fn(),
   stopGatewaySessionsForUnavailability: vi.fn(),
+  stopRuntimeReconciliation: vi.fn(),
 }));
 vi.mock('./host-instance.js', () => ({ startHostInstanceLease: vi.fn(), stopHostInstanceLease: vi.fn() }));
 vi.mock('./gateway-providers/index.js', () => ({ getGatewayProvider: () => ({}), resetGatewayProvider: vi.fn() }));

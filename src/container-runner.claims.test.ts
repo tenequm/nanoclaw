@@ -15,6 +15,8 @@ vi.mock('./drivers/index.js', () => ({
     capabilities: () => ({}),
   }),
   isSessionEventsDriver: () => false,
+  defaultSessionDriverKind: () => 'docker',
+  peekSessionDrivers: () => [],
 }));
 
 import {

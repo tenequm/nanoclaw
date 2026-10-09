@@ -16,10 +16,13 @@ vi.mock('./reconcile-session.js', () => ({
 vi.mock('./db/sessions.js', () => ({ getActiveSessions: vi.fn() }));
 vi.mock('./egress-lockdown.js', () => ({ ensureEgressNetwork: vi.fn() }));
 vi.mock('./modules/approvals/index.js', () => ({ sweepAwaitingReasonRejects: vi.fn() }));
-vi.mock('./drivers/index.js', () => ({ peekSessionDriver: vi.fn(() => null) }));
+vi.mock('./drivers/index.js', () => ({
+  peekSessionDrivers: vi.fn(() => []),
+  onSessionDriverCreated: vi.fn(() => () => {}),
+}));
 
 import { getActiveSessions } from './db/sessions.js';
-import { peekSessionDriver } from './drivers/index.js';
+import { onSessionDriverCreated, peekSessionDrivers, type SessionEventsDriver } from './drivers/index.js';
 import type { SessionEvent } from './drivers/types.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { enqueueSessionReconcile } from './reconcile-feeds.js';
@@ -31,15 +34,16 @@ const realSetTimeout = global.setTimeout;
 let setTimeoutSpy: ReturnType<typeof vi.spyOn>;
 
 let watchHandler: ((event: SessionEvent) => void) | null = null;
+let createdListener: ((driver: SessionEventsDriver) => void) | null = null;
 const watchStop = vi.fn();
 
-function fakeWatchingDriver(): ReturnType<typeof peekSessionDriver> {
+function fakeWatchingDriver(): SessionEventsDriver {
   return {
     watchSessions: (_slug: string, onEvent: (event: SessionEvent) => void) => {
       watchHandler = onEvent;
       return { stop: watchStop };
     },
-  } as unknown as ReturnType<typeof peekSessionDriver>;
+  } as unknown as SessionEventsDriver;
 }
 
 function terminalEvent(sessionId: string): SessionEvent {
@@ -56,7 +60,15 @@ async function startAndDrainFirstTick(): Promise<void> {
 beforeEach(() => {
   watchHandler = null;
   watchStop.mockReset();
-  vi.mocked(peekSessionDriver).mockReset().mockReturnValue(null);
+  vi.mocked(peekSessionDrivers).mockReset().mockReturnValue([]);
+  vi.mocked(onSessionDriverCreated)
+    .mockReset()
+    .mockImplementation((listener) => {
+      createdListener = listener;
+      return () => {
+        createdListener = null;
+      };
+    });
   vi.mocked(reconcileSession).mockReset().mockResolvedValue(undefined);
   vi.mocked(getActiveSessions).mockReset().mockResolvedValue([]);
 
@@ -77,7 +89,7 @@ afterEach(() => {
 
 describe('runtime terminal-event feed', () => {
   it('a terminal event reconciles the session without waiting for a tick', async () => {
-    vi.mocked(peekSessionDriver).mockReturnValue(fakeWatchingDriver());
+    vi.mocked(peekSessionDrivers).mockReturnValue([fakeWatchingDriver()]);
     await startAndDrainFirstTick();
     expect(watchHandler).not.toBeNull();
     expect(reconcileSession).not.toHaveBeenCalled();
@@ -89,7 +101,7 @@ describe('runtime terminal-event feed', () => {
   });
 
   it('ignores non-terminal events and keys without a session id', async () => {
-    vi.mocked(peekSessionDriver).mockReturnValue(fakeWatchingDriver());
+    vi.mocked(peekSessionDrivers).mockReturnValue([fakeWatchingDriver()]);
     await startAndDrainFirstTick();
 
     watchHandler!({ kind: 'phase', key: { installSlug: 'inst', agentGroupId: 'g-1', sessionId: 's-9' } });
@@ -98,13 +110,26 @@ describe('runtime terminal-event feed', () => {
     expect(reconcileSession).not.toHaveBeenCalled();
   });
 
+  it('also watches a driver instantiated after the sweep armed (a second runtime)', async () => {
+    await startAndDrainFirstTick();
+    expect(watchHandler).toBeNull();
+    createdListener!(fakeWatchingDriver());
+    watchHandler!(terminalEvent('s-late'));
+    await vi.waitFor(() => {
+      expect(reconcileSession).toHaveBeenCalledWith('s-late');
+    });
+    stopHostSweep();
+    expect(watchStop).toHaveBeenCalledTimes(1);
+    expect(createdListener).toBeNull();
+  });
+
   it('arms nothing when no driver has been selected', async () => {
     await startAndDrainFirstTick();
     expect(watchHandler).toBeNull();
   });
 
   it('stops the watch and drops feed enqueues once the sweep stops', async () => {
-    vi.mocked(peekSessionDriver).mockReturnValue(fakeWatchingDriver());
+    vi.mocked(peekSessionDrivers).mockReturnValue([fakeWatchingDriver()]);
     await startAndDrainFirstTick();
     const handler = watchHandler!;
 
@@ -118,7 +143,7 @@ describe('runtime terminal-event feed', () => {
   });
 
   it('a burst of events for one session coalesces to at most one rerun', async () => {
-    vi.mocked(peekSessionDriver).mockReturnValue(fakeWatchingDriver());
+    vi.mocked(peekSessionDrivers).mockReturnValue([fakeWatchingDriver()]);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;

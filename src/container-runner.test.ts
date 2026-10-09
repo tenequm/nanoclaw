@@ -24,17 +24,34 @@ import {
   toMountSpecs,
   watchGatewayAvailability,
 } from './container-runner.js';
+import { createSessionDriver } from './drivers/index.js';
 import type { SupervisedHandle } from './drivers/session-events.js';
 import { resetGatewayProvider } from './gateway-providers/index.js';
 import { log } from './log.js';
 import type { VolumeMount } from './providers/provider-container-registry.js';
 import type { AgentGroup, Session } from './types.js';
 
+const topology = vi.hoisted(() => ({ lockdown: false, execFileSync: vi.fn() }));
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  get EGRESS_LOCKDOWN() {
+    return topology.lockdown;
+  },
+  EGRESS_NETWORK: 'fixture-egress',
+}));
+vi.mock('child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('child_process')>()),
+  execFileSync: topology.execFileSync,
+}));
 vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-afterEach(() => resetGatewayProvider());
+afterEach(() => {
+  resetGatewayProvider();
+  topology.lockdown = false;
+  topology.execFileSync.mockReset();
+});
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -106,18 +123,24 @@ const mounts: VolumeMount[] = [
 
 function compose(
   overrides: {
+    hostAddress?: string;
+    mailboxUrl?: string;
+    mailboxEnvironment?: Record<string, string>;
     gateway?: Record<string, unknown>;
     contribution?: Record<string, unknown>;
     containerConfig?: ContainerConfig;
+    mounts?: VolumeMount[];
   } = {},
 ) {
   return composeSessionSpec({
     agentGroup,
     session,
     containerName: 'nanoclaw-v2-agent-one-1700000000000',
-    mounts,
+    mounts: overrides.mounts ?? mounts,
     containerConfig: overrides.containerConfig ?? containerConfig,
-    mailboxEnvironment: { NANOCLAW_MAILBOX_BACKEND: 'sqlite' },
+    mailboxEnvironment: overrides.mailboxEnvironment ?? { NANOCLAW_MAILBOX_BACKEND: 'sqlite' },
+    hostAddress: overrides.hostAddress,
+    mailboxUrl: overrides.mailboxUrl,
     contribution: (overrides.contribution ?? {}) as never,
     gateway: {
       networkAccess: { endpoint: 'localhost', target: { kind: 'host' } },
@@ -140,6 +163,156 @@ function composeWithFolder(folder: string) {
 }
 
 describe('composeSessionSpec', () => {
+  const proxyEnv = {
+    HTTP_PROXY: 'http://remote-gateway:15001',
+    HTTPS_PROXY: 'http://remote-gateway:15001',
+    http_proxy: 'http://remote-gateway:15001',
+    https_proxy: 'http://remote-gateway:15001',
+    NODE_USE_ENV_PROXY: '1',
+  };
+
+  it('exempts the driver host and mailbox host after merging gateway proxy env', () => {
+    const spec = compose({
+      hostAddress: '0.250.250.254',
+      mailboxUrl: 'http://mailbox.internal:3010/mailbox/v1',
+      gateway: { env: proxyEnv },
+    });
+    expect(spec.containers[0].contributedEnv).toEqual({
+      ...proxyEnv,
+      NO_PROXY: '0.250.250.254,mailbox.internal',
+      no_proxy: '0.250.250.254,mailbox.internal',
+    });
+  });
+
+  it('preserves and deduplicates both existing proxy bypass lists', () => {
+    const spec = compose({
+      hostAddress: '0.250.250.254',
+      mailboxUrl: 'http://0.250.250.254:3010/mailbox/v1',
+      gateway: { env: { ...proxyEnv, NO_PROXY: 'localhost, 0.250.250.254', no_proxy: 'localhost,internal,' } },
+    });
+    expect(spec.containers[0].contributedEnv).toEqual({
+      ...proxyEnv,
+      NO_PROXY: 'localhost,0.250.250.254,internal',
+      no_proxy: 'localhost,0.250.250.254,internal',
+    });
+  });
+
+  it.each(['host.docker.internal', '172.17.0.1', 'mailbox.internal'])(
+    'exempts the resolved Docker mailbox host %s without a declared host address',
+    (host) => {
+      const gatewayEnv = { ...proxyEnv, NO_PROXY: 'localhost, internal', no_proxy: 'internal,different' };
+      const spec = compose({ mailboxUrl: `http://${host}:3010/mailbox/v1`, gateway: { env: gatewayEnv } });
+      expect(spec.containers[0].contributedEnv).toEqual({
+        ...gatewayEnv,
+        NO_PROXY: `localhost,internal,different,${host}`,
+        no_proxy: `localhost,internal,different,${host}`,
+      });
+    },
+  );
+
+  it.each([false, true])(
+    'routes the mailbox consistently with actual Docker network selection (lockdown=%s)',
+    async (lockdown) => {
+      topology.lockdown = lockdown;
+      let attached = false;
+      topology.execFileSync.mockImplementation((_bin: string, args: string[]) => {
+        if (args[0] === 'inspect') throw new Error('no existing agent');
+        if (args[0] === 'network' && args[1] === 'connect') attached = true;
+        if (args[0] === 'network' && args.includes('--format')) return attached ? 'fixture-gateway ' : '';
+        return '';
+      });
+      const platform = vi.spyOn(os, 'platform').mockReturnValue('linux');
+      try {
+        const spec = compose({
+          mounts: [],
+          mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
+          gateway: {
+            env: { ...proxyEnv, NO_PROXY: 'localhost', no_proxy: 'internal' },
+            networkAccess: {
+              endpoint: 'host.docker.internal',
+              target: { kind: 'runtime', identity: 'fixture-gateway' },
+            },
+          },
+        });
+        await createSessionDriver('docker').prepare(spec);
+        const create = topology.execFileSync.mock.calls.find((call) => call[1][0] === 'create')![1] as string[];
+        const bypass = spec.containers[0].contributedEnv!;
+        const expected = lockdown ? 'localhost,internal' : 'localhost,internal,host.docker.internal';
+        expect(bypass.NO_PROXY).toBe(expected);
+        expect(bypass.no_proxy).toBe(expected);
+        expect(bypass).toMatchObject(proxyEnv);
+        if (lockdown) {
+          expect(create.slice(create.indexOf('--network'), create.indexOf('--network') + 2)).toEqual([
+            '--network',
+            'fixture-egress',
+          ]);
+          expect(create).not.toContain('--add-host=host.docker.internal:host-gateway');
+          expect(topology.execFileSync).toHaveBeenCalledWith(
+            'docker',
+            ['network', 'connect', '--alias', 'host.docker.internal', 'fixture-egress', 'fixture-gateway'],
+            expect.anything(),
+          );
+        } else {
+          expect(create).toContain('--add-host=host.docker.internal:host-gateway');
+          expect(create).not.toContain('--network');
+        }
+      } finally {
+        platform.mockRestore();
+      }
+    },
+  );
+
+  it.each([
+    ['host.docker.internal', 'HOST.Docker.Internal.'],
+    ['host.docker.internal.', 'host.docker.internal'],
+    ['host.docker.internal.', 'host.docker.internal.'],
+  ])('matches the lockdown gateway alias canonically (mailbox %s, endpoint %s)', (mailboxHost, endpoint) => {
+    topology.lockdown = true;
+    const spec = compose({
+      mailboxUrl: `http://${mailboxHost}:3010/mailbox/v1`,
+      gateway: {
+        env: { ...proxyEnv, NO_PROXY: 'localhost' },
+        networkAccess: {
+          endpoint,
+          target: { kind: 'runtime', identity: 'fixture-gateway' },
+        },
+      },
+    });
+    expect(spec.containers[0].contributedEnv!.NO_PROXY).toBe('localhost');
+  });
+
+  it.each(['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'])(
+    'detects %s from every composed env source',
+    (key) => {
+      for (const source of ['gateway', 'contribution', 'mailboxEnvironment']) {
+        const proxy = { [key]: 'http://remote-gateway:15001' };
+        const spec = compose({
+          mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
+          [source]: source === 'mailboxEnvironment' ? proxy : { env: proxy },
+        });
+        expect(spec.containers[0].contributedEnv).toMatchObject({
+          NO_PROXY: 'host.docker.internal',
+          no_proxy: 'host.docker.internal',
+        });
+      }
+    },
+  );
+
+  it('keeps env byte-identical without proxy variables for every driver', () => {
+    for (const hostAddress of [undefined, '0.250.250.254']) {
+      for (const gatewayEnv of [{}, { NO_PROXY: 'localhost, internal', no_proxy: 'different' }]) {
+        const baseline = compose({ gateway: { env: gatewayEnv } });
+        const spec = compose({
+          hostAddress,
+          mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
+          gateway: { env: gatewayEnv },
+        });
+        expect(JSON.stringify(spec.containers[0].env)).toBe(JSON.stringify(baseline.containers[0].env));
+        expect(JSON.stringify(spec.containers[0].contributedEnv)).toBe(JSON.stringify(gatewayEnv));
+      }
+    }
+  });
+
   it('carries gateway lineage without overriding reserved host labels', () => {
     const spec = compose({
       gateway: {

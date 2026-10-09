@@ -76,6 +76,8 @@ interface KeyState {
   cb: ((failure?: SessionFailure) => void) | null;
   stopIntent: boolean;
   fired: boolean;
+  /** Retained runtime truth belongs to the previous execution until start settles, then start() re-reads it. */
+  pendingStart: boolean;
   /** Terminal confirmed before a callback was armed; delivered on arming. */
   pending?: { failure?: SessionFailure };
   verifying: boolean;
@@ -90,12 +92,13 @@ class SessionEventsHub {
   constructor(private readonly driver: SessionDriver) {}
 
   /** A fresh incarnation resets the key: fired/stop-intent belong to the old one. */
-  trackPrepared(handle: SessionHandle): void {
+  trackPrepared(handle: SessionHandle, pendingStart: boolean): void {
     this.#states.set(idOf(handle.key), {
       handle,
       cb: null,
       stopIntent: false,
       fired: false,
+      pendingStart,
       verifying: false,
       recheck: false,
     });
@@ -105,7 +108,18 @@ class SessionEventsHub {
   trackListed(handle: SessionHandle): void {
     const state = this.#states.get(idOf(handle.key));
     if (state) state.handle = handle;
-    else this.trackPrepared(handle);
+    else this.trackPrepared(handle, false);
+  }
+
+  async start(handle: SessionHandle): Promise<void> {
+    const state = this.#states.get(idOf(handle.key));
+    if (!state?.pendingStart) return handle.start();
+    try {
+      await handle.start();
+    } finally {
+      state.pendingStart = false;
+      if (this.#states.get(idOf(handle.key)) === state) await this.#verify(state);
+    }
   }
 
   arm(key: SessionKey, cb: (failure?: SessionFailure) => void): void {
@@ -128,7 +142,7 @@ class SessionEventsHub {
 
   async resync(installSlug: string): Promise<void> {
     const armed = [...this.#states.values()].filter(
-      (s) => s.handle.key.installSlug === installSlug && s.cb && !s.fired && !s.stopIntent,
+      (s) => s.handle.key.installSlug === installSlug && s.cb && !s.fired && !s.stopIntent && !s.pendingStart,
     );
     if (armed.length === 0) return;
     const snapshots = await this.driver.listSessions(installSlug);
@@ -160,7 +174,7 @@ class SessionEventsHub {
 
   /** The hint discipline: re-read truth, then (maybe) fire — never fire on the event alone. */
   async #verify(state: KeyState): Promise<void> {
-    if (state.fired || state.stopIntent) return;
+    if (state.fired || state.stopIntent || state.pendingStart) return;
     if (state.verifying) {
       // Never drop a hint into an in-flight read: on a driver whose status()
       // is a remote round trip, the read may have snapshotted
@@ -210,7 +224,7 @@ class HubHandle implements SupervisedHandle {
     return this.inner.name;
   }
   start(): Promise<void> {
-    return this.inner.start();
+    return this.hub.start(this.inner);
   }
   status(): Promise<SessionStatus> {
     return this.inner.status();
@@ -239,7 +253,7 @@ export function withSessionEvents(driver: SessionDriver): SessionEventsDriver {
     capabilities: () => driver.capabilities(),
     prepare: async (spec) => {
       const handle = await driver.prepare(spec);
-      hub.trackPrepared(handle);
+      hub.trackPrepared(handle, !!driver.listRetained);
       return new HubHandle(handle, hub);
     },
     listSessions: async (installSlug) =>
@@ -254,5 +268,10 @@ export function withSessionEvents(driver: SessionDriver): SessionEventsDriver {
     wrapped.reconcileNetworkAccess = (access) => driver.reconcileNetworkAccess!(access);
   if (driver.ensureReady) wrapped.ensureReady = (): Promise<void> => driver.ensureReady!();
   if (driver.reapResidue) wrapped.reapResidue = (installSlug): Promise<void> => driver.reapResidue!(installSlug);
+  // Retention surface (Block B): pass-throughs, so a host holding the wrapped
+  // driver sees exactly what the raw one declares — absent stays absent.
+  if (driver.listRetained) wrapped.listRetained = (installSlug) => driver.listRetained!(installSlug);
+  if (driver.reapRetained) wrapped.reapRetained = (installSlug, keys) => driver.reapRetained!(installSlug, keys);
+  if (driver.runtimeName) wrapped.runtimeName = (key) => driver.runtimeName!(key);
   return wrapped;
 }
