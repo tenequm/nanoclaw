@@ -625,6 +625,14 @@ describe('kubernetes driver lifecycle', () => {
 });
 
 describe('kubernetes failure and admission mapping', () => {
+  it('retains the Sandbox UID for unexpected handle API failures', async () => {
+    const h = harness();
+    const handle = await h.driver.prepare(h.spec);
+    await handle.start();
+    h.custom.getNamespacedCustomObject.mockRejectedValue(new Error('opaque'));
+    for (const operation of [() => handle.status(), () => handle.start(), () => handle.stop('shutdown')])
+      await expect(operation()).rejects.toMatchObject({ kind: 'unknown', opaqueRef: 'sandbox-uid' });
+  });
   it.each([
     [{ code: 403, body: { message: 'exceeded quota: storage' } }, 'resources-exhausted'],
     [{ code: 403, body: { reason: 'Forbidden' } }, 'denied-by-policy'],
