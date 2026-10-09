@@ -700,6 +700,7 @@ describe('kubernetes Sandbox informer', () => {
     const events: SessionEvent[] = [];
     const first = h.driver.watchSessions('spike', (e) => events.push(e));
     const second = h.driver.watchSessions('spike', () => {});
+    await vi.dynamicImportSettled();
     const box = sandboxManifest(h.spec, 'ns');
     box.metadata.generation = 1;
     box.spec.operatingMode = 'Running';
@@ -717,11 +718,29 @@ describe('kubernetes Sandbox informer', () => {
     fake.emit('error');
     expect(fake.informer.start).toHaveBeenCalledTimes(1);
   });
+  it('does not schedule a new restart from deliberately aborting the old watch', async () => {
+    vi.useFakeTimers();
+    const fake = fakeInformer();
+    fake.informer.stop.mockImplementation(async () => {
+      fake.emit('error', Object.assign(new Error('cancelled'), { name: 'AbortError' }));
+    });
+    const h = harness({ informerFactory: fake.factory });
+    const watch = h.driver.watchSessions('spike', () => {});
+    await vi.dynamicImportSettled();
+    fake.emit('error', new Error('fetch failed'));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fake.informer.start).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(fake.informer.start).toHaveBeenCalledTimes(2);
+    watch.stop();
+  });
+
   it('reconnects forever with bounded backoff and cancels pending retries on stop', async () => {
     vi.useFakeTimers();
     const fake = fakeInformer();
     const h = harness({ informerFactory: fake.factory });
     const watch = h.driver.watchSessions('spike', () => {});
+    await vi.dynamicImportSettled();
     for (let n = 0; n < 8; n++) {
       fake.emit('error');
       await vi.advanceTimersByTimeAsync(Math.min(1000 * 2 ** n, 30000));

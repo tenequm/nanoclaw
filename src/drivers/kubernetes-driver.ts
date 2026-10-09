@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { isDeepStrictEqual } from 'util';
 
-import * as k8s from '@kubernetes/client-node';
+import type * as k8s from '@kubernetes/client-node';
 
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
@@ -374,12 +374,14 @@ interface InstallWatch {
   informer?: k8s.Informer<Sandbox>;
   timer?: NodeJS.Timeout;
   stopped: boolean;
+  starting: boolean;
   attempt: number;
   known: Map<string, SessionKey>;
 }
 
 export class KubernetesSessionDriver implements SessionDriver {
   readonly kind = 'kubernetes';
+  private library?: typeof k8s;
   private clients?: { core: k8s.CoreV1Api; custom: k8s.CustomObjectsApi; config: k8s.KubeConfig };
   private readonly watches = new Map<string, InstallWatch>();
   private readonly groupLocks = new Map<string, Promise<unknown>>();
@@ -414,10 +416,11 @@ export class KubernetesSessionDriver implements SessionDriver {
     return this.opts.namespace ?? kubernetesNamespace(installSlug);
   }
 
-  private api() {
+  private async api() {
     if (this.clients) return this.clients;
     try {
-      const config = this.opts.kubeConfig ?? new k8s.KubeConfig();
+      const library = (this.library ??= await import('@kubernetes/client-node'));
+      const config = this.opts.kubeConfig ?? new library.KubeConfig();
       if (!this.opts.coreApi || !this.opts.customObjectsApi) {
         if (!this.opts.kubeConfig) {
           if (!this.opts.kubeconfigPath || !this.opts.context)
@@ -429,8 +432,8 @@ export class KubernetesSessionDriver implements SessionDriver {
       }
       this.clients = {
         config,
-        core: this.opts.coreApi ?? config.makeApiClient(k8s.CoreV1Api),
-        custom: this.opts.customObjectsApi ?? config.makeApiClient(k8s.CustomObjectsApi),
+        core: this.opts.coreApi ?? config.makeApiClient(library.CoreV1Api),
+        custom: this.opts.customObjectsApi ?? config.makeApiClient(library.CustomObjectsApi),
       };
       return this.clients;
     } catch {
@@ -446,9 +449,9 @@ export class KubernetesSessionDriver implements SessionDriver {
           pre: (ctx: k8s.RequestContext) => {
             ctx.setSignal(AbortSignal.timeout(this.opts.requestTimeoutMs ?? 10_000));
             if (patch) ctx.setHeaderParam('Content-Type', 'application/merge-patch+json');
-            return new k8s.Observable(Promise.resolve(ctx));
+            return new this.library!.Observable(Promise.resolve(ctx));
           },
-          post: (ctx: k8s.ResponseContext) => new k8s.Observable(Promise.resolve(ctx)),
+          post: (ctx: k8s.ResponseContext) => new this.library!.Observable(Promise.resolve(ctx)),
         },
       ],
     };
@@ -460,10 +463,9 @@ export class KubernetesSessionDriver implements SessionDriver {
 
   private async readSandbox(key: SessionKey, name = this.runtimeName(key)): Promise<Sandbox | undefined> {
     try {
-      return (await this.api().custom.getNamespacedCustomObject(
-        { ...this.params(key.installSlug), name },
-        this.requestOptions(),
-      )) as Sandbox;
+      return (await (
+        await this.api()
+      ).custom.getNamespacedCustomObject({ ...this.params(key.installSlug), name }, this.requestOptions())) as Sandbox;
     } catch (error) {
       // A resource 404 is absence only if the CRD collection remains readable.
       if (apiCode(error) === 404) {
@@ -476,10 +478,9 @@ export class KubernetesSessionDriver implements SessionDriver {
 
   private async readPod(installSlug: string, name: string): Promise<k8s.V1Pod | undefined> {
     try {
-      return await this.api().core.readNamespacedPod(
-        { namespace: this.namespace(installSlug), name },
-        this.requestOptions(),
-      );
+      return await (
+        await this.api()
+      ).core.readNamespacedPod({ namespace: this.namespace(installSlug), name }, this.requestOptions());
     } catch (error) {
       if (apiCode(error) === 404) return;
       throw normalizeKubernetesError(error);
@@ -488,7 +489,9 @@ export class KubernetesSessionDriver implements SessionDriver {
 
   private async listSandboxes(installSlug: string): Promise<k8s.KubernetesListObject<Sandbox>> {
     try {
-      return (await this.api().custom.listNamespacedCustomObject(
+      return (await (
+        await this.api()
+      ).custom.listNamespacedCustomObject(
         { ...this.params(installSlug), labelSelector: `${LABELS.install}=${projectLabelValue(installSlug)}` },
         this.requestOptions(),
       )) as k8s.KubernetesListObject<Sandbox>;
@@ -499,7 +502,9 @@ export class KubernetesSessionDriver implements SessionDriver {
 
   private async patch(key: SessionKey, name: string, body: unknown): Promise<Sandbox> {
     try {
-      return (await this.api().custom.patchNamespacedCustomObject(
+      return (await (
+        await this.api()
+      ).custom.patchNamespacedCustomObject(
         { ...this.params(key.installSlug), name, body },
         this.requestOptions(true),
       )) as Sandbox;
@@ -526,7 +531,7 @@ export class KubernetesSessionDriver implements SessionDriver {
     const desired = sandboxManifest(spec, this.namespace(spec.key.installSlug));
     return this.locked(spec.key, async () => {
       try {
-        const { core, custom } = this.api();
+        const { core, custom } = await this.api();
         const namespace = this.namespace(spec.key.installSlug);
         try {
           await core.readNamespace({ name: namespace }, this.requestOptions());
@@ -659,7 +664,7 @@ export class KubernetesSessionDriver implements SessionDriver {
       },
       data,
     };
-    const { core } = this.api();
+    const { core } = await this.api();
     const namespace = this.namespace(spec.key.installSlug);
     try {
       const old = await core.readNamespacedSecret({ namespace, name: body.metadata!.name! }, this.requestOptions());
@@ -826,7 +831,9 @@ export class KubernetesSessionDriver implements SessionDriver {
     if (pod?.status?.phase === 'Pending' && box.spec.podTemplate.spec?.volumes?.some((v) => v.persistentVolumeClaim)) {
       for (const volume of box.spec.podTemplate.spec.volumes) {
         if (!volume.persistentVolumeClaim) continue;
-        const pvc = await this.api().core.readNamespacedPersistentVolumeClaim(
+        const pvc = await (
+          await this.api()
+        ).core.readNamespacedPersistentVolumeClaim(
           { namespace: box.metadata.namespace!, name: volume.persistentVolumeClaim.claimName },
           this.requestOptions(),
         );
@@ -887,7 +894,9 @@ export class KubernetesSessionDriver implements SessionDriver {
         (box) => !suspended(box) && keyFromLabels(box.metadata.labels),
       );
       if (!boxes.length) return [];
-      const pods = await this.api().core.listNamespacedPod(
+      const pods = await (
+        await this.api()
+      ).core.listNamespacedPod(
         {
           namespace: this.namespace(installSlug),
           labelSelector: `${LABELS.install}=${projectLabelValue(installSlug)}`,
@@ -932,7 +941,7 @@ export class KubernetesSessionDriver implements SessionDriver {
       const boxes = (await this.listSandboxes(installSlug)).items.filter(
         (box) => suspended(box) && keyFromLabels(box.metadata.labels),
       );
-      const { core } = this.api();
+      const { core } = await this.api();
       const namespace = this.namespace(installSlug);
       const selector = `${LABELS.install}=${projectLabelValue(installSlug)}`;
       const [pvcs, pods] = await Promise.all([
@@ -972,7 +981,9 @@ export class KubernetesSessionDriver implements SessionDriver {
   private async deleteSandbox(key: SessionKey, box: Sandbox): Promise<void> {
     try {
       if (box.metadata.uid) this.staleSince.delete(box.metadata.uid);
-      await this.api().custom.deleteNamespacedCustomObject(
+      await (
+        await this.api()
+      ).custom.deleteNamespacedCustomObject(
         {
           ...this.params(key.installSlug),
           name: box.metadata.name!,
@@ -1010,12 +1021,12 @@ export class KubernetesSessionDriver implements SessionDriver {
   watchSessions(installSlug: string, onEvent: (event: SessionEvent) => void): SessionWatch {
     let watch = this.watches.get(installSlug);
     if (!watch) {
-      watch = { subscribers: new Set(), stopped: false, attempt: 0, known: new Map() };
+      watch = { subscribers: new Set(), stopped: false, starting: false, attempt: 0, known: new Map() };
       this.watches.set(installSlug, watch);
     }
     const current = watch;
     current.subscribers.add(onEvent);
-    if (!current.informer && !current.timer) void this.startWatch(installSlug, current);
+    if (!current.informer && !current.timer && !current.starting) void this.startWatch(installSlug, current);
     let unsubscribed = false;
     return {
       stop: () => {
@@ -1042,12 +1053,14 @@ export class KubernetesSessionDriver implements SessionDriver {
   }
 
   private async startWatch(installSlug: string, watch: InstallWatch): Promise<void> {
-    if (watch.stopped) return;
+    if (watch.stopped || watch.starting) return;
+    watch.starting = true;
     try {
       if (!watch.informer) {
-        const { config } = this.api();
+        const { config } = await this.api();
+        if (watch.stopped) return;
         const selector = `${LABELS.install}=${projectLabelValue(installSlug)}`;
-        watch.informer = (this.opts.informerFactory ?? k8s.makeInformer<Sandbox>)(
+        watch.informer = (this.opts.informerFactory ?? this.library!.makeInformer<Sandbox>)(
           config,
           `/apis/${GROUP}/${VERSION}/namespaces/${this.namespace(installSlug)}/${PLURAL}`,
           async () => {
@@ -1081,12 +1094,18 @@ export class KubernetesSessionDriver implements SessionDriver {
           watch.known.delete(box.metadata.name!);
           this.emit(watch, { key, kind: 'terminal' });
         });
-        watch.informer.on('error', () => this.recoverWatch(installSlug, watch));
+        watch.informer.on('error', (error?: unknown) => {
+          // An intentional stop aborts the old watch; it must not schedule another restart.
+          if (error instanceof Error && error.name === 'AbortError') return;
+          this.recoverWatch(installSlug, watch);
+        });
       }
       await watch.informer.start();
       if (watch.stopped) await watch.informer.stop();
     } catch {
       this.recoverWatch(installSlug, watch);
+    } finally {
+      watch.starting = false;
     }
   }
 
