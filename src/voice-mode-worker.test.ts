@@ -2542,6 +2542,7 @@ function turnsHarness(
     wakeWord?: string;
     limits?: { startMs: number; idleMs: number };
     record?: boolean;
+    debug?: boolean;
   } = {},
 ) {
   vi.useFakeTimers();
@@ -2594,7 +2595,14 @@ function turnsHarness(
       unheard: () => void out.unheard++,
       log: { info: (msg: string) => void out.logs.push(msg), warn: () => undefined },
     },
-    { silenceMs: SILENCE, names: ['Andy'], limits: o.limits, record: o.record, sttModel: 'model' },
+    {
+      silenceMs: SILENCE,
+      names: ['Andy'],
+      limits: o.limits,
+      record: o.record,
+      sttModel: 'model',
+      ...(o.debug ? { debug: true } : {}),
+    },
   );
   turns.configure(o.wake ?? false, o.pauseSends ?? false);
   if (o.wakeWord) turns.useWakeWord(o.wakeWord);
@@ -2633,6 +2641,30 @@ function turnsHarness(
     },
   };
 }
+
+describe('CallTurns, transcript debug', () => {
+  it('logs the interims, speech and the decision only with debug on, and decides the same', async () => {
+    for (const debug of [false, true]) {
+      const h = turnsHarness({ debug });
+      h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+      await h.talk(1500);
+      await h.interim('Book a table. Zulu.');
+      await h.interim('Book a table. Zulu.');
+      expect(h.out.sent).toEqual(['Book a table.']);
+      const lines = h.out.logs.filter((msg) => msg.startsWith('voice-mode.transcript-debug'));
+      if (!debug) expect(lines).toEqual([]);
+      else
+        expect(lines).toEqual(
+          expect.arrayContaining([
+            'voice-mode.transcript-debug turns.speech',
+            'voice-mode.transcript-debug turns.interim',
+            'voice-mode.transcript-debug turns.command',
+            'voice-mode.transcript-debug turns.decision',
+          ]),
+        );
+    }
+  });
+});
 
 describe('CallTurns, hands-free', () => {
   it('opens a turn at the speech with a pre-roll and sends it after the closing silence, counted from the speech end', async () => {
