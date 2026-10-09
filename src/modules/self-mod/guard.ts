@@ -40,10 +40,12 @@ export const selfModInstallPackages = defineGuardedAction({
   action: 'self_mod.install_packages',
   grantActionName: 'install_packages',
   decide: async (input) => {
+    // Only an agent actor names a group whose runtime could be consulted; every
+    // other actor is denied by the shared decide.
     if (input.actor.kind !== 'agent') return holdInstallPackages(input);
-    // The capability gate runs first: a deny for "this runtime cannot do it"
-    // must win over a hold even for a request that would otherwise card an
-    // admin. Gate on capabilities(), never on kind (drivers/index.ts).
+    // The capability gate runs before the hold: a deny for "this runtime cannot
+    // do it" must win over a hold even for a request that would otherwise card
+    // an admin. Gate on capabilities(), never on kind (drivers/index.ts).
     if (!(await sessionDriverForGroup(input.actor.agentGroupId)).capabilities().imageBuild) {
       return DENY(
         "install_packages needs an image rebuild and the session runtime does not declare the 'imageBuild' " +

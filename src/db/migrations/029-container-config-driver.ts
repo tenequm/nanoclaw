@@ -9,8 +9,9 @@ import type { PortableMigration } from './index.js';
  * every existing group keeps exactly the runtime it runs on today.
  *
  * `runtime_driver_kinds`: every kind this install has ever configured. Startup
- * discovery, adoption and the retained-object sweep iterate it, so residue
- * from a group flipped back to Docker stays visible to the host that made it.
+ * discovery and adoption iterate it and build each kind's driver, which the
+ * retained-object sweep then consults — so residue from a group flipped back
+ * to Docker stays visible to the host that made it.
  * Rows are only ever added; purging a kind is later migration tooling.
  */
 export const migration029: PortableMigration = {

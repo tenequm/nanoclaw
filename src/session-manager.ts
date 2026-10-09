@@ -543,8 +543,9 @@ export function writeOutboundDirect(
  * with no view of the host filesystem (`storage: 'group-volume'`, the
  * kubernetes driver) has no path for attachment bytes in either direction
  * until an attachment transport exists (Block E amendment) — so they are
- * REFUSED loudly, never written somewhere the agent cannot read. Resolved
- * lazily (dynamic import) so the plain-text path never touches selection.
+ * REFUSED loudly, never written somewhere the agent cannot read. The driver
+ * module is imported dynamically to keep it (and the overlay registrations it
+ * loads) out of session-manager's static import graph.
  */
 export async function groupRefusesAttachments(agentGroupId: string): Promise<boolean> {
   const { sessionDriverForGroup } = await import('./drivers/index.js');
