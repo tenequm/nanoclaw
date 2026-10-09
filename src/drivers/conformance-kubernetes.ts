@@ -303,6 +303,7 @@ export function registerKubernetesConformance(): void {
         180_000,
       );
       // Repeated static-pod outages can leave the controller in Kubernetes' five-minute restart backoff.
+      const recoveredAt = Date.now();
       await eventually(
         async () => {
           const out = await kubectl([
@@ -316,7 +317,19 @@ export function registerKubernetesConformance(): void {
             'json',
           ]);
           const pods = (JSON.parse(out) as { items: KubeObject[] }).items;
-          return pods.some((pod) => pod.status?.conditions?.some((c) => c.type === 'Ready' && c.status === 'True'));
+          const readyPods = pods.filter((pod) =>
+            pod.status?.conditions?.some((c) => c.type === 'Ready' && c.status === 'True'),
+          );
+          // Pod Ready can be stale after an outage and the dev deployment has no readiness probe.
+          const leases = JSON.parse(
+            await kubectl(['--namespace', 'agent-sandbox-system', 'get', 'leases', '-o', 'json']),
+          ) as { items: KubeObject[] };
+          return leases.items.some(
+            (lease) =>
+              typeof lease.spec.renewTime === 'string' &&
+              new Date(lease.spec.renewTime).getTime() >= recoveredAt &&
+              readyPods.some((pod) => String(lease.spec.holderIdentity).startsWith(`${pod.metadata.name}_`)),
+          );
         },
         Boolean,
         360_000,
@@ -1196,9 +1209,9 @@ export function registerKubernetesConformance(): void {
           (count) => count > 0,
         );
         await chaos(async () => {
-          const connectedBefore = informerConnections;
           await command('docker', ['pause', NODE]);
           try {
+            const connectedBefore = informerConnections;
             await eventually(
               async () => informerConnections,
               (count) => count > connectedBefore,
