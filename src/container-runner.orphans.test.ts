@@ -21,6 +21,7 @@ vi.mock('./drivers/index.js', () => {
   const driver = { kind: 'fake', listSessions, prepare, capabilities: () => ({}) };
   return {
     getSessionDriver: () => driver,
+    sessionDriverForGroup: async () => driver,
     isSessionEventsDriver: () => false,
     defaultSessionDriverKind: () => 'docker',
     peekSessionDrivers: () => [],

@@ -8,7 +8,7 @@ import {
   type AdditionalMountConfig,
   type McpServerConfig,
 } from '../../container-config.js';
-import { assertGroupDriverChangeAllowed, buildAgentGroupImage, killContainer } from '../../container-runner.js';
+import { buildAgentGroupImage, changeGroupDriver, killContainer } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
@@ -17,7 +17,7 @@ import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
   getContainerConfig,
-  setContainerConfigDriver,
+  recordDriverKindsUsed,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
@@ -482,11 +482,16 @@ registerResource({
           );
         }
 
-        // Validated before anything is written, so a refused driver change
-        // leaves the whole update unapplied.
-        if (driver !== undefined) await assertGroupDriverChangeAllowed(id, driver);
-        await updateContainerConfigScalars(id, updates);
-        if (driver !== undefined) await setContainerConfigDriver(id, driver);
+        if (driver === undefined) {
+          await updateContainerConfigScalars(id, updates);
+        } else {
+          // One write, after the change is proven safe and with the group's
+          // spawns held: a refused driver change leaves the whole update unapplied.
+          await changeGroupDriver(id, driver, async () => {
+            await updateContainerConfigScalars(id, { ...updates, driver });
+            if (driver) await recordDriverKindsUsed([driver]);
+          });
+        }
 
         const updated = (await getContainerConfig(id))!;
         return presentConfig(updated);

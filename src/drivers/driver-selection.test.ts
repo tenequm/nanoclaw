@@ -20,6 +20,7 @@ import {
   adaptSpecToDriver,
   adoptRunningSessions,
   assertGroupDriverChangeAllowed,
+  changeGroupDriver,
   isContainerRunning,
   killContainer,
   reapRetainedSessions,
@@ -610,9 +611,9 @@ describe('composition on the spawn path', () => {
     });
   }
 
-  it('refuses pond stores the group reads (named), and composes as plain when it reads none', async () => {
+  it('refuses pond stores the group reads (named), and composes as plain when it reads none', async (ctx) => {
     const pondDir = path.join(DATA_DIR, 'pond');
-    if (fs.existsSync(pondDir)) return; // never touch a real install's pond config
+    if (fs.existsSync(pondDir)) ctx.skip(); // never touch a real install's pond config
     try {
       fs.mkdirSync(path.join(pondDir, 'stores', 'team'), { recursive: true });
       fs.writeFileSync(
@@ -647,6 +648,23 @@ describe('composition on the spawn path', () => {
     // Released with the runtime: the second session is admitted now.
     expect(await wakeAndRefusal(second)).toBeUndefined();
     expect(groupVolume.prepared.map((s) => s.key.sessionId)).toEqual([SESSION_ID, 'sess-driver-selection-2']);
+  });
+
+  it("holds the group's spawns while its driver changes, and refuses a change while a spawn is in flight", async () => {
+    const row = await createGroupSession();
+    let midChange: string | undefined;
+    await changeGroupDriver(GROUP_ID, hostBind.kind, async () => {
+      midChange = await wakeAndRefusal(row);
+    });
+    // A wake landing between the emptiness check and the write never starts on the old driver.
+    expect(midChange).toMatch(/is changing its session runtime driver/);
+    expect(groupVolume.prepared).toHaveLength(0);
+
+    const waking = wakeContainer(row);
+    await expect(changeGroupDriver(GROUP_ID, hostBind.kind, async () => {})).rejects.toThrow(
+      /session sess-driver-selection is starting/,
+    );
+    await waking;
   });
 
   it('holds the fence against an old execution still terminating on the runtime', async () => {
@@ -836,6 +854,61 @@ describe('retained objects and driver changes', () => {
       'Failed to list existing sessions for adoption',
       expect.objectContaining({ driver: unreachable.kind }),
     );
+  });
+});
+
+describe('startup discovery edge cases', () => {
+  const GROUP_ID = 'ag-discovery';
+  const key = (sessionId: string): SessionKey => ({ installSlug: INSTALL_SLUG, agentGroupId: GROUP_ID, sessionId });
+  let reapOrphans: ReturnType<typeof vi.fn<() => Promise<void>>>;
+
+  beforeEach(async () => {
+    process.chdir(previous);
+    await runMigrations(await initTestDb());
+    reapOrphans = vi.fn(async () => {});
+    resetGatewayProvider({
+      kind: 'discovery-gateway',
+      agentSkills: [],
+      sessions: {
+        async ensure() {
+          return { contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } } };
+        },
+        reapOrphans,
+      },
+      approvals: { subscribe: async () => {} },
+    });
+  });
+
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  it('treats a recorded kind whose driver cannot be built as unconsidered: no gateway orphan reap', async () => {
+    await recordDriverKindsUsed(['kind-whose-overlay-was-removed']);
+    const defaultFake = registerRecordingFake();
+    resetSessionDriver(getSessionDriver(defaultFake.kind));
+    await adoptRunningSessions();
+    expect(log.error).toHaveBeenCalledWith(
+      'Session runtime unavailable for discovery; its sessions are left untouched, not treated as gone',
+      expect.objectContaining({ driver: 'kind-whose-overlay-was-removed' }),
+    );
+    expect(reapOrphans).not.toHaveBeenCalled();
+  });
+
+  it('leaves two copies on ONE runtime to the pre-selection path: no cross-runtime arbitration', async () => {
+    const copy = (name: string) =>
+      ({
+        handle: { ...fakeHandle(fixtureSpec({ key: key('sess-no-row') })), name },
+        phase: 'running',
+      }) as SessionSnapshot;
+    const defaultFake = registerRecordingFake({ listSessions: async () => [copy('one'), copy('two')] });
+    resetSessionDriver(getSessionDriver(defaultFake.kind));
+    expect(await adoptRunningSessions()).toEqual({ adopted: 0, stopped: 2 });
+    expect(log.error).not.toHaveBeenCalledWith(
+      'Session discovered on two runtimes; stopping the copy that lost arbitration',
+      expect.anything(),
+    );
+    expect(reapOrphans).toHaveBeenCalledTimes(1);
   });
 });
 

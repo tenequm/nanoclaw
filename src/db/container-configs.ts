@@ -14,6 +14,7 @@ const SCALAR_COLUMNS = new Set([
   'timezone',
   'speed',
   'rich_messages',
+  'driver',
 ]);
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
 
@@ -92,6 +93,7 @@ export async function updateContainerConfigScalars(
       | 'timezone'
       | 'speed'
       | 'rich_messages'
+      | 'driver'
     >
   >,
 ): Promise<void> {
@@ -152,12 +154,7 @@ export async function getContainerConfigDriver(agentGroupId: string): Promise<st
  * on the old driver); this only writes.
  */
 export async function setContainerConfigDriver(agentGroupId: string, driver: string | null): Promise<void> {
-  await getDb().run(
-    'UPDATE container_configs SET driver = ?, updated_at = ? WHERE agent_group_id = ?',
-    driver,
-    new Date().toISOString(),
-    agentGroupId,
-  );
+  await updateContainerConfigScalars(agentGroupId, { driver });
   if (driver) await recordDriverKindsUsed([driver]);
 }
 

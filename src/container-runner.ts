@@ -27,12 +27,11 @@ import {
 import { CONTAINER_PLUGINS_DIR, materializeContainerJson } from './container-config.js';
 import {
   getContainerConfig,
-  getContainerConfigDriver,
   listConfiguredDriverKinds,
   listDriverKindsUsed,
   recordDriverKindsUsed,
+  updateContainerConfigScalars,
 } from './db/container-configs.js';
-import { updateContainerConfigScalars } from './db/container-configs.js';
 import { getWiringSessionModes } from './db/messaging-groups.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from './project-doc-compose.js';
@@ -51,11 +50,13 @@ import { getHostInstanceId } from './host-instance.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getSession, isTaskThread } from './db/sessions.js';
 import {
+  assertGroupDriverKindRegistered,
   defaultSessionDriverKind,
   getSessionDriver,
   isSessionEventsDriver,
   mountPolicy,
   peekSessionDrivers,
+  sessionDriverForGroup,
 } from './drivers/index.js';
 import type { SessionEventsDriver, SupervisedHandle, SupervisedSnapshot } from './drivers/session-events.js';
 import { GROUP_FOLDER_LABEL, labelValueLegal, specInvalid } from './drivers/types.js';
@@ -140,7 +141,6 @@ interface ActiveSessionRuntime {
    * lifetime. Never re-resolved from group config, which may have moved on.
    */
   driver: SessionEventsDriver;
-  agentGroupId: string;
   gateway: GatewaySessionControl;
   containerName: string;
   /**
@@ -172,10 +172,11 @@ const activeContainers = new Map<string, ActiveSessionRuntime>();
 /**
  * The group-level session fence (ruling 8b.2): for a driver declaring
  * `sessionsPerGroup: 'one'`, the agent group id → the one session admitted.
- * Taken synchronously at spawn admission (before any await), released when
- * that session's runtime is gone from the registry — so two sessions racing
- * one group cannot both pass. The driver-side half (an old execution still
- * terminating) is checked against the runtime at admission.
+ * Checked and taken in one synchronous step at spawn admission (no await
+ * between the read and the set), released when that session's runtime is gone
+ * from the registry — so two sessions racing one group cannot both pass. The
+ * driver-side half (an old execution still terminating) is checked against
+ * the runtime at admission.
  */
 const groupFence = new Map<string, string>();
 
@@ -184,6 +185,13 @@ function releaseGroupFence(agentGroupId: string, sessionId: string): void {
     groupFence.delete(agentGroupId);
   }
 }
+
+/**
+ * Groups whose `driver` is being changed right now (`changeGroupDriver`):
+ * spawn refuses them until the write lands, so no session can start on the
+ * old driver between the emptiness check and the config write.
+ */
+const driverChangesInFlight = new Set<string>();
 let gatewayUnavailableReason: string | undefined;
 let gatewayAdmissionGeneration = 0;
 
@@ -321,8 +329,8 @@ export function _resetAdoptionRetryStateForTesting(): void {
 async function retryPendingAdoption(session: Session): Promise<boolean> {
   // The driver that discovered the container, never a fresh lookup from group
   // config: the surviving runtime lives where it was found.
-  const driver =
-    pendingAdoptions.get(session.id) ?? getSessionDriver(await getContainerConfigDriver(session.agent_group_id));
+  const driver = pendingAdoptions.get(session.id);
+  if (!driver) return false;
   const snapshots = await driver.listSessions(INSTALL_SLUG);
   const snapshot = snapshots.find(({ handle, phase }) => handle.key.sessionId === session.id && phase === 'running');
   if (!snapshot) {
@@ -335,6 +343,24 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
     throw new Error(
       `session ${session.id} is claimed by another live host process — not adopting or spawning a duplicate`,
     );
+  }
+  // Same rule as startup adoption: a one-session group whose fence another
+  // session already holds gets this second live copy stopped, never adopted.
+  const oneSessionGroup = driver.capabilities().sessionsPerGroup === 'one';
+  if (oneSessionGroup) {
+    const holder = groupFence.get(session.agent_group_id);
+    if (holder && holder !== session.id) {
+      log.error('Second live session of a one-session group on adoption retry; stopping it', {
+        sessionId: session.id,
+        holder,
+        driver: driver.kind,
+      });
+      await snapshot.handle.stop('group-fence-at-adoption').catch(() => {});
+      await releaseClaimQuietly(session.id, claimIncarnation);
+      pendingAdoptions.delete(session.id);
+      return false;
+    }
+    groupFence.set(session.agent_group_id, session.id);
   }
   let gatewaySession: GatewaySessionControl;
   try {
@@ -349,6 +375,7 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
       capabilities: driver.capabilities(),
     });
   } catch (err) {
+    if (oneSessionGroup) releaseGroupFence(session.agent_group_id, session.id);
     await releaseClaimQuietly(session.id, claimIncarnation);
     throw err;
   }
@@ -417,16 +444,19 @@ async function spawnContainer(session: Session, wakeReason?: WakeReason): Promis
     return;
   }
 
+  if (driverChangesInFlight.has(agentGroup.id)) {
+    throw new Error(`group '${agentGroup.folder}' is changing its session runtime driver; retrying later`);
+  }
+
   // The group's runtime is resolved BEFORE any capability-sensitive
   // composition — the mailbox endpoint, the mounts and the gateway
   // contribution all depend on what it declares (ratified D1). A group with no
   // `driver` resolves the install default, exactly as before.
-  const driver = getSessionDriver(await getContainerConfigDriver(agentGroup.id));
+  const driver = await sessionDriverForGroup(agentGroup.id);
   const capabilities = driver.capabilities();
-  const groupVolume = capabilities.storage === 'group-volume';
   await admitToGroupFence(session, agentGroup, driver, capabilities);
   try {
-    await spawnOnDriver(session, agentGroup, driver, capabilities, groupVolume, wakeReason);
+    await spawnOnDriver(session, agentGroup, driver, capabilities, wakeReason);
   } catch (err) {
     releaseGroupFence(agentGroup.id, session.id);
     throw err;
@@ -455,8 +485,7 @@ async function admitToGroupFence(
         'session would be a second writer of the group storage',
     );
   }
-  const modes = await getWiringSessionModes(agentGroup.id);
-  const unsupported = modes.filter((mode) => mode !== 'agent-shared');
+  const unsupported = await nonAgentSharedWiringModes(agentGroup.id);
   if (unsupported.length > 0) {
     throw specInvalid(
       `group '${agentGroup.folder}' has wirings routed '${unsupported.join("', '")}': ${why}, which requires ` +
@@ -469,19 +498,21 @@ async function admitToGroupFence(
   }
   groupFence.set(agentGroup.id, session.id);
   try {
-    const others = (await driver.listSessions(INSTALL_SLUG)).filter(
+    const [sessions, retained] = await Promise.all([
+      driver.listSessions(INSTALL_SLUG),
+      driver.listRetained?.(INSTALL_SLUG) ?? [],
+    ]);
+    const others = sessions.filter(
       ({ handle, phase }) =>
         handle.key.agentGroupId === agentGroup.id && handle.key.sessionId !== session.id && phase !== 'terminal',
     );
-    const settling = driver.listRetained
-      ? (await driver.listRetained(INSTALL_SLUG)).filter(
-          (object) =>
-            object.kind === 'session' &&
-            object.key.agentGroupId === agentGroup.id &&
-            object.key.sessionId !== session.id &&
-            object.state === 'stopping',
-        )
-      : [];
+    const settling = retained.filter(
+      (object) =>
+        object.kind === 'session' &&
+        object.key.agentGroupId === agentGroup.id &&
+        object.key.sessionId !== session.id &&
+        object.state === 'stopping',
+    );
     const busy = [...others.map(({ handle }) => handle.name), ...settling.map((object) => object.name)];
     if (busy.length > 0) {
       throw new Error(
@@ -499,9 +530,9 @@ async function spawnOnDriver(
   agentGroup: AgentGroup,
   driver: SessionEventsDriver,
   capabilities: DriverCapabilities,
-  groupVolume: boolean,
   wakeReason?: WakeReason,
 ): Promise<void> {
+  const groupVolume = capabilities.storage === 'group-volume';
   // Refresh the destination map and current-thread routing so any admin
   // changes take effect on wake. Destinations come from the agent-to-agent
   // module — skip when the module isn't installed (table absent).
@@ -667,6 +698,11 @@ function isNetworkRunnerContext(context: unknown): boolean {
   );
 }
 
+/** A one-session driver needs every wiring of the group routed 'agent-shared'; these are the modes that are not. */
+async function nonAgentSharedWiringModes(agentGroupId: string): Promise<string[]> {
+  return (await getWiringSessionModes(agentGroupId)).filter((mode) => mode !== 'agent-shared');
+}
+
 /**
  * Ruling 8b.1: a 'group-volume' driver realizes provider state on group
  * storage only for the contracts it declares. An undeclared provider — or one
@@ -725,7 +761,6 @@ function registerRuntime(
   const runtime: ActiveSessionRuntime = {
     handle,
     driver,
-    agentGroupId: handle.key.agentGroupId,
     gateway,
     containerName,
     startedAtMs: Date.now(),
@@ -882,7 +917,7 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
       if (activeContainers.get(sessionId) === runtime) {
         activeContainers.delete(sessionId);
       }
-      releaseGroupFence(runtime.agentGroupId, sessionId);
+      releaseGroupFence(runtime.handle.key.agentGroupId, sessionId);
       return;
     }
   }
@@ -921,7 +956,7 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
   if (activeContainers.get(sessionId) === runtime) {
     activeContainers.delete(sessionId);
   }
-  releaseGroupFence(runtime.agentGroupId, sessionId);
+  releaseGroupFence(runtime.handle.key.agentGroupId, sessionId);
   if (runtime.claimIncarnation !== undefined) {
     await releaseClaimQuietly(sessionId, runtime.claimIncarnation);
   }
@@ -983,8 +1018,11 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
   // adoption, and its sessions are never read as gone.
   const listed: { driver: SessionEventsDriver; snapshot: SupervisedSnapshot }[] = [];
   const reachable: SessionEventsDriver[] = [];
-  let unreachable = 0;
-  for (const { kind, driver } of await discoveryDrivers()) {
+  const discovery = await discoveryDrivers();
+  // A kind that could not even be enumerated or built is as unconsidered as
+  // one whose listing failed.
+  let unreachable = discovery.skipped;
+  for (const { kind, driver } of discovery.drivers) {
     let snapshots: SupervisedSnapshot[];
     try {
       snapshots = await driver.listSessions(INSTALL_SLUG);
@@ -1004,7 +1042,7 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
   for (const { driver, snapshot } of listed) {
     const { handle, phase } = snapshot;
     if (duplicates.has(snapshot)) {
-      log.error('Session discovered on two runtimes; stopping the copy on the non-selected one', {
+      log.error('Session discovered on two runtimes; stopping the copy that lost arbitration', {
         sessionId: handle.key.sessionId,
         driver: driver.kind,
         name: handle.name,
@@ -1125,9 +1163,13 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
  * group's kind is remembered even after the group moves off it. A kind whose
  * driver cannot be built (its overlay was removed) is logged and skipped.
  */
-async function discoveryDrivers(): Promise<{ kind: string; driver: SessionEventsDriver }[]> {
+async function discoveryDrivers(): Promise<{
+  drivers: { kind: string; driver: SessionEventsDriver }[];
+  skipped: number;
+}> {
   const fallback = defaultSessionDriverKind();
   let kinds = [fallback];
+  let skipped = 0;
   try {
     await recordDriverKindsUsed([fallback, ...(await listConfiguredDriverKinds())]);
     kinds = [...new Set([fallback, ...(await listDriverKindsUsed())])];
@@ -1135,6 +1177,7 @@ async function discoveryDrivers(): Promise<{ kind: string; driver: SessionEvents
     log.warn('Could not read the driver kinds this install has used; discovering the install default only', {
       err,
     });
+    skipped += 1;
   }
   const drivers: { kind: string; driver: SessionEventsDriver }[] = [];
   for (const kind of kinds) {
@@ -1145,17 +1188,21 @@ async function discoveryDrivers(): Promise<{ kind: string; driver: SessionEvents
         driver: kind,
         err,
       });
+      skipped += 1;
     }
   }
-  return drivers;
+  return { drivers, skipped };
 }
 
 /**
  * One session key live on two runtimes (a group moved between drivers while a
- * host was down): the copy on the group's selected driver wins, or the first
- * listed when neither is; every other copy is returned for stopping. Without
- * this, the second registration would silently replace the first in the
- * key-indexed registry and leave a runner nobody supervises.
+ * host was down): a running copy beats one still starting or stopping, then
+ * the copy on the group's selected driver wins, else the first listed; the
+ * copies on every other driver are returned for stopping. Without this, the
+ * second registration would silently replace the first in the key-indexed
+ * registry and leave a runner nobody supervises. Copies on one driver are
+ * that driver's own business and are left exactly as before per-group
+ * selection existed.
  */
 async function arbitrateDuplicateKeys(
   listed: { driver: SessionEventsDriver; snapshot: SupervisedSnapshot }[],
@@ -1169,10 +1216,20 @@ async function arbitrateDuplicateKeys(
   }
   const losers = new Set<SupervisedSnapshot>();
   for (const copies of bySession.values()) {
-    if (copies.length < 2) continue;
-    const selected = getSessionDriver(await getContainerConfigDriver(copies[0].snapshot.handle.key.agentGroupId));
-    const winner = copies.find((copy) => copy.driver === selected) ?? copies[0];
-    for (const copy of copies) if (copy !== winner) losers.add(copy.snapshot);
+    if (new Set(copies.map((copy) => copy.driver)).size < 2) continue;
+    let selected: SessionEventsDriver | undefined;
+    try {
+      selected = await sessionDriverForGroup(copies[0].snapshot.handle.key.agentGroupId);
+    } catch (err) {
+      log.warn('Could not resolve the selected driver for a duplicated session; arbitrating without it', {
+        sessionId: copies[0].snapshot.handle.key.sessionId,
+        err,
+      });
+    }
+    const running = copies.filter((copy) => copy.snapshot.phase === 'running');
+    const pool = running.length > 0 ? running : copies;
+    const winner = pool.find((copy) => copy.driver === selected) ?? pool[0];
+    for (const copy of copies) if (copy.driver !== winner.driver) losers.add(copy.snapshot);
   }
   return losers;
 }
@@ -1259,13 +1316,13 @@ export async function reapRetainedSessions(): Promise<number> {
  * Also refuses a kind no driver is registered for.
  */
 export async function assertGroupDriverChangeAllowed(agentGroupId: string, nextKind: string | null): Promise<void> {
-  const currentKind = await getContainerConfigDriver(agentGroupId);
-  const current = getSessionDriver(currentKind);
+  const current = await sessionDriverForGroup(agentGroupId);
+  if (nextKind) assertGroupDriverKindRegistered(nextKind, `group ${agentGroupId}`);
   const next = getSessionDriver(nextKind ?? undefined);
   if (next === current) return;
   const blocking: string[] = [];
   for (const [sessionId, runtime] of activeContainers) {
-    if (runtime.agentGroupId === agentGroupId) blocking.push(`active session ${sessionId}`);
+    if (runtime.handle.key.agentGroupId === agentGroupId) blocking.push(`active session ${sessionId}`);
   }
   try {
     for (const { handle } of await current.listSessions(INSTALL_SLUG)) {
@@ -1288,13 +1345,45 @@ export async function assertGroupDriverChangeAllowed(agentGroupId: string, nextK
     );
   }
   if (next.capabilities().sessionsPerGroup === 'one') {
-    const modes = (await getWiringSessionModes(agentGroupId)).filter((mode) => mode !== 'agent-shared');
+    const modes = await nonAgentSharedWiringModes(agentGroupId);
     if (modes.length > 0) {
       throw new Error(
         `driver '${next.kind}' runs one session per group and requires every wiring to use session_mode ` +
           `'agent-shared'; this group has '${modes.join("', '")}'`,
       );
     }
+  }
+}
+
+/**
+ * Change a group's `driver` safely: spawns of the group are refused from the
+ * moment the change starts, a spawn already in flight refuses the change, and
+ * `assertGroupDriverChangeAllowed` then proves the old driver holds nothing
+ * before `apply` writes. Without the hold, a wake landing between the check
+ * and the write would start a session on the old driver.
+ */
+export async function changeGroupDriver(
+  agentGroupId: string,
+  nextKind: string | null,
+  apply: () => Promise<void>,
+): Promise<void> {
+  if (driverChangesInFlight.has(agentGroupId)) {
+    throw new Error(`a driver change for group ${agentGroupId} is already in progress`);
+  }
+  driverChangesInFlight.add(agentGroupId);
+  try {
+    for (const sessionId of wakePromises.keys()) {
+      if ((await getSession(sessionId))?.agent_group_id === agentGroupId) {
+        throw new Error(
+          `cannot change the driver of group ${agentGroupId}: session ${sessionId} is starting — retry once it is up, ` +
+            'then stop it first',
+        );
+      }
+    }
+    await assertGroupDriverChangeAllowed(agentGroupId, nextKind);
+    await apply();
+  } finally {
+    driverChangesInFlight.delete(agentGroupId);
   }
 }
 
@@ -1851,7 +1940,7 @@ export function adaptSpecToDriver(
   const groupVolume = capabilities.storage === 'group-volume';
   if (!groupVolume && !capabilities.pinnedImages && !capabilities.imageCarriedSurfaces) return spec;
   const agent = spec.containers.find((container) => container.role === 'agent');
-  if (!agent) throw specInvalid('spec must carry exactly one agent container');
+  if (!agent) throw specInvalid('spec must carry an agent container');
 
   if (capabilities.pinnedImages) assertPinnedImage(agent.image, context);
   if (capabilities.imageCarriedSurfaces) {
@@ -2119,7 +2208,7 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   // Image building is not on the runtime path (drivers never build) and shells
   // the local Docker daemon. Both call sites gate on the `imageBuild`
   // capability; this is the backstop for any future caller that forgets.
-  if (!getSessionDriver(await getContainerConfigDriver(agentGroup.id)).capabilities().imageBuild) {
+  if (!(await sessionDriverForGroup(agentGroup.id)).capabilities().imageBuild) {
     throw new Error('Per-agent-group image builds are unavailable on this runtime driver');
   }
 

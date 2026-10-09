@@ -149,13 +149,9 @@ const createdListeners = new Set<(driver: SessionEventsDriver) => void>();
 /** The install default, read once at first use like the selection always was. */
 let defaultKind: DriverKind | undefined;
 
-function defaultDriverKind(): DriverKind {
-  return (defaultKind ??= configuredDriverKind());
-}
-
 /** The install default kind (`NANOCLAW_RUNTIME_DRIVER`), as selection resolves it. */
 export function defaultSessionDriverKind(): DriverKind {
-  return defaultDriverKind();
+  return (defaultKind ??= configuredDriverKind());
 }
 
 /**
@@ -165,7 +161,7 @@ export function defaultSessionDriverKind(): DriverKind {
  * driver it came from, never a fresh lookup from mutable group config.
  */
 export function getSessionDriver(kind?: DriverKind): SessionEventsDriver {
-  const resolved = kind || defaultDriverKind();
+  const resolved = kind || defaultSessionDriverKind();
   let driver = instances.get(resolved);
   if (!driver) {
     driver = createSessionDriver(resolved);
@@ -175,14 +171,27 @@ export function getSessionDriver(kind?: DriverKind): SessionEventsDriver {
   return driver;
 }
 
-/** The kind a group runs on: its `container_configs.driver`, else the install default. */
-export async function groupDriverKind(agentGroupId: string): Promise<DriverKind> {
-  return (await getContainerConfigDriver(agentGroupId)) || defaultDriverKind();
+/**
+ * The memoized driver for the group's kind — its `container_configs.driver`,
+ * else the install default. Every capability gate about a group resolves here.
+ */
+export async function sessionDriverForGroup(agentGroupId: string): Promise<SessionEventsDriver> {
+  const configured = await getContainerConfigDriver(agentGroupId);
+  if (configured) assertGroupDriverKindRegistered(configured, `group ${agentGroupId}`);
+  return getSessionDriver(configured);
 }
 
-/** The memoized driver for the group's kind — every capability gate about a group resolves here. */
-export async function sessionDriverForGroup(agentGroupId: string): Promise<SessionEventsDriver> {
-  return getSessionDriver(await groupDriverKind(agentGroupId));
+/**
+ * A kind named per group rather than by `NANOCLAW_RUNTIME_DRIVER` gets its own
+ * refusal, so the operator is pointed at the group's setting, not the install's.
+ */
+export function assertGroupDriverKindRegistered(kind: DriverKind, subject: string): void {
+  if (getSessionDriverFactory(kind)) return;
+  throw new Error(
+    `${subject} selects driver '${kind}' (container_configs.driver) but no driver is registered for '${kind}'; ` +
+      `installed: ${listSessionDriverKinds().join(', ')}. ` +
+      'Install the driver skill, or return the group to the install default with `--driver ""`.',
+  );
 }
 
 export function createSessionDriver(kind: DriverKind, overrides: Partial<MountPolicy> = {}): SessionEventsDriver {
@@ -208,13 +217,12 @@ export function createSessionDriver(kind: DriverKind, overrides: Partial<MountPo
 }
 
 /**
- * The already-selected default driver, or null — never instantiates. For
- * consumers that must arm only when a runtime is actually in use: the boot
- * sequence selects the driver before the sweep starts, while a unit suite that
- * never selected one sees null instead of triggering selection as a side effect.
+ * The already-selected default driver, or null — never instantiates. The
+ * default-first anchor of `peekSessionDrivers`: a unit suite that never
+ * selected a runtime sees null instead of triggering selection as a side effect.
  */
 export function peekSessionDriver(): SessionEventsDriver | null {
-  return instances.get(defaultDriverKind()) ?? null;
+  return instances.get(defaultSessionDriverKind()) ?? null;
 }
 
 /** Every driver instantiated so far, default first when it exists — never instantiates. */
@@ -241,12 +249,7 @@ export function resetSessionDriver(next: SessionDriver | null = null): void {
   // and fake handles carry their own onTerminal where flows need it.
   instances.clear();
   defaultKind = undefined;
-  if (next) instances.set(defaultDriverKind(), next as SessionEventsDriver);
-}
-
-/** Test seam: install `driver` as the memoized instance for `kind`. */
-export function setSessionDriverForTesting(kind: DriverKind, driver: SessionDriver): void {
-  instances.set(kind, driver as SessionEventsDriver);
+  if (next) instances.set(defaultSessionDriverKind(), next as SessionEventsDriver);
 }
 
 export * from './driver-registry.js';
