@@ -494,7 +494,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     defaults: VOICE_MODE_DEFAULTS,
 
     callUrl,
-    handleVoiceCommand: (event: InboundEvent): Promise<boolean> => handleVoiceCommand(event, callUrl, callLink),
+    handleVoiceCommand: (event: InboundEvent): Promise<boolean> => handleVoiceCommand(event, callUrl),
     callLink,
 
     async setup(cfg: ChannelSetup): Promise<void> {
