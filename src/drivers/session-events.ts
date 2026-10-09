@@ -254,5 +254,10 @@ export function withSessionEvents(driver: SessionDriver): SessionEventsDriver {
     wrapped.reconcileNetworkAccess = (access) => driver.reconcileNetworkAccess!(access);
   if (driver.ensureReady) wrapped.ensureReady = (): Promise<void> => driver.ensureReady!();
   if (driver.reapResidue) wrapped.reapResidue = (installSlug): Promise<void> => driver.reapResidue!(installSlug);
+  // Retention surface (Block B): pass-throughs, so a host holding the wrapped
+  // driver sees exactly what the raw one declares — absent stays absent.
+  if (driver.listRetained) wrapped.listRetained = (installSlug) => driver.listRetained!(installSlug);
+  if (driver.reapRetained) wrapped.reapRetained = (installSlug, keys) => driver.reapRetained!(installSlug, keys);
+  if (driver.runtimeName) wrapped.runtimeName = (key) => driver.runtimeName!(key);
   return wrapped;
 }
