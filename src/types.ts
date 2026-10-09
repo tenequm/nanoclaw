@@ -38,6 +38,13 @@ export interface ContainerConfigRow {
   speed: ContainerSpeed | null; // NULL = install/provider default
   rich_messages: number; // 1 = the agent may send Telegram Rich Messages; 0 (default) = never
   /**
+   * Session runtime driver kind (migration 029); NULL = the install default
+   * (`NANOCLAW_RUNTIME_DRIVER`). Optional on the TS type so pre-migration
+   * fixtures need no update. Never materialized into container.json: the
+   * runner has no use for it, and Docker groups keep byte-identical files.
+   */
+  driver?: string | null;
+  /**
    * Session isolation tier ('container' | 'vm') — see SessionSpec.runtimeTier.
    * Optional on the TS type because the trunk schema does not carry the
    * column: a deployment whose driver realizes more than one tier adds it,

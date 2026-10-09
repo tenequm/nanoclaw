@@ -54,7 +54,7 @@ vi.mock('../env.js', () => ({
   }),
 }));
 
-import { contributionFromConfig, withProviderEnv } from './onecli.js';
+import { contributionFromConfig, withHostAddress, withProviderEnv } from './onecli.js';
 import { getGatewayProviderRegistration } from './gateway-provider-registry.js';
 
 const provider = getGatewayProviderRegistration('onecli')!;
@@ -342,4 +342,30 @@ it.each(compatibilityFixtures)('preserves native OneCLI approval content: $name'
   });
   controller.abort();
   await subscription;
+});
+
+describe('withHostAddress (per-driver gateway advertise address)', () => {
+  const contribution = {
+    env: {
+      HTTPS_PROXY: 'http://x:aoc_placeholder@host.docker.internal:10255',
+      ANTHROPIC_BASE_URL: 'http://host.docker.internal:10255',
+      SSL_CERT_FILE: '/tmp/onecli-combined-ca.pem',
+    },
+  };
+
+  it('leaves the contribution untouched when the runtime declares no host address (Docker)', () => {
+    expect(withHostAddress(contribution)).toBe(contribution);
+  });
+
+  it('rewrites only the host alias, keeping scheme, placeholder credentials, port and paths', () => {
+    expect(withHostAddress(contribution, '192.168.97.254').env).toEqual({
+      HTTPS_PROXY: 'http://x:aoc_placeholder@192.168.97.254:10255',
+      ANTHROPIC_BASE_URL: 'http://192.168.97.254:10255',
+      SSL_CERT_FILE: '/tmp/onecli-combined-ca.pem',
+    });
+  });
+
+  it('brackets an IPv6 host address', () => {
+    expect(withHostAddress(contribution, 'fd7a::1').env?.ANTHROPIC_BASE_URL).toBe('http://[fd7a::1]:10255');
+  });
 });

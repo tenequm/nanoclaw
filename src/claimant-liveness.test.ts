@@ -17,8 +17,9 @@ vi.mock('./drivers/index.js', () => ({
     listSessions: async () => snapshots,
     capabilities: () => ({}),
   }),
-  peekSessionDriver: () => null,
   isSessionEventsDriver: () => false,
+  defaultSessionDriverKind: () => 'docker',
+  peekSessionDrivers: () => [],
 }));
 
 import { resetGatewayProvider } from './gateway-providers/index.js';

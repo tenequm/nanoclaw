@@ -36,6 +36,7 @@ export type {
   ProcessingClaim,
   ProcessingAck,
   RecurringMessage,
+  RunnerContextOptions,
   SessionRouting,
   StateValue,
   Task,

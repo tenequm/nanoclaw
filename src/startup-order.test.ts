@@ -26,6 +26,7 @@ vi.mock('./container-runner.js', () => ({
     state.adopted = true;
   },
   abortGatewaySessionObservers: vi.fn(),
+  ensureSessionRuntimesReady: vi.fn(),
   resumeGatewaySessionAdmission: vi.fn(),
   stopGatewaySessionsForUnavailability: vi.fn(),
 }));

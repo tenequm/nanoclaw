@@ -8,7 +8,7 @@ import {
   type AdditionalMountConfig,
   type McpServerConfig,
 } from '../../container-config.js';
-import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
+import { buildAgentGroupImage, changeGroupDriver, killContainer } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
@@ -17,10 +17,11 @@ import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
   getContainerConfig,
+  recordDriverKindsUsed,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
-import { getSessionDriver } from '../../drivers/index.js';
+import { sessionDriverForGroup } from '../../drivers/index.js';
 import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { getProviderHostContract } from '../../provider-contracts/registry.js';
@@ -90,6 +91,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     cli_scope: row.cli_scope,
     timezone: row.timezone,
     rich_messages: row.rich_messages === 1 ? 'on' : 'off',
+    driver: row.driver ?? null,
     updated_at: row.updated_at,
   };
 }
@@ -341,7 +343,9 @@ registerResource({
           // on a nonexistent group id) and restart nothing: the operator asked
           // for rebuild-then-restart, and restarting after silently skipping
           // the rebuild would report success for a rebuild that never happened.
-          if (!getSessionDriver().capabilities().imageBuild) {
+          // The TARGET group's runtime decides, not the install default: a
+          // kubernetes group on a Docker install cannot rebuild in place.
+          if (!(await sessionDriverForGroup(id)).capabilities().imageBuild) {
             return {
               restarted: 0,
               rebuilt: false,
@@ -406,7 +410,9 @@ registerResource({
         'Use --id <group-id> and any of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --auto-compact-window, --cli-scope, ' +
         '--speed must be one of the speed tiers the group\'s provider declares (Claude: "standard", "fast"), or "" to follow the install default; a provider that declares none accepts only "". ' +
         '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart), ' +
-        '--rich-messages on|off (lets the agent send a Telegram message as a Rich Message, with real tables and headings; default off. The host applies it to new messages at once, the agent learns it after restart).',
+        '--rich-messages on|off (lets the agent send a Telegram message as a Rich Message, with real tables and headings; default off. The host applies it to new messages at once, the agent learns it after restart), ' +
+        '--driver <kind> (the session runtime for this group, e.g. kubernetes; "" returns it to the install default NANOCLAW_RUNTIME_DRIVER. ' +
+        'Refused while the group still has live or retained runtime objects on its current driver).',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -468,13 +474,24 @@ registerResource({
           else throw new Error('--rich-messages must be on or off');
         }
 
-        if (Object.keys(updates).length === 0) {
+        const driver = args.driver === undefined ? undefined : String(args.driver).trim().toLowerCase() || null;
+
+        if (Object.keys(updates).length === 0 && driver === undefined) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --auto-compact-window, --cli-scope, --timezone, --rich-messages',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --auto-compact-window, --cli-scope, --timezone, --rich-messages, --driver',
           );
         }
 
-        await updateContainerConfigScalars(id, updates);
+        if (driver === undefined) {
+          await updateContainerConfigScalars(id, updates);
+        } else {
+          // One write, after the change is proven safe and with the group's
+          // spawns held: a refused driver change leaves the whole update unapplied.
+          await changeGroupDriver(id, driver, async () => {
+            await updateContainerConfigScalars(id, { ...updates, driver });
+            if (driver) await recordDriverKindsUsed([driver]);
+          });
+        }
 
         const updated = (await getContainerConfig(id))!;
         return presentConfig(updated);

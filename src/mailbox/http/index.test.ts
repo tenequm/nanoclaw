@@ -20,7 +20,7 @@ vi.mock('../../config.js', async () => {
 
 import { heartbeatPath } from '../../session-manager.js';
 import { SqliteAgentMailbox } from '../sqlite/index.js';
-import { HttpServedAgentMailbox, readMailboxHttpSettings, type MailboxHttpSettings } from './index.js';
+import { HttpServedAgentMailbox, advertisedBase, readMailboxHttpSettings, type MailboxHttpSettings } from './index.js';
 import { MAILBOX_HTTP_PATH } from './server.js';
 
 const KEY = { agentGroupId: 'ag-1', sessionId: 'sess-1' };
@@ -201,5 +201,18 @@ describe('readMailboxHttpSettings', () => {
     expect(() => readMailboxHttpSettings({ NANOCLAW_MAILBOX_TRANSPORT: 'nfs' })).toThrow('http or sqlite');
     expect(() => readMailboxHttpSettings({ NANOCLAW_MAILBOX_HTTP_PORT: 'x' })).toThrow('valid port');
     expect(readMailboxHttpSettings({ NANOCLAW_MAILBOX_TRANSPORT: 'SQLite' }).transport).toBe('sqlite');
+  });
+});
+
+describe('advertisedBase (per-driver mailbox URL)', () => {
+  const settings = { url: 'http://host.docker.internal:3010', port: 3010 };
+
+  it("keeps the install-wide URL for a runtime that declares no host address (Docker's URL, unchanged)", () => {
+    expect(advertisedBase(settings)).toBe('http://host.docker.internal:3010');
+  });
+
+  it("advertises the runtime's own host address on the configured port", () => {
+    expect(advertisedBase(settings, '100.84.1.190')).toBe('http://100.84.1.190:3010');
+    expect(advertisedBase(settings, 'fd7a::1')).toBe('http://[fd7a::1]:3010');
   });
 });

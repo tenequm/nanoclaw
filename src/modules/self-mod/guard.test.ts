@@ -11,13 +11,14 @@
  * driver ships in this tree, so the incapable polarity is a stub declaring
  * what an out-of-tree driver (no build daemon on the node) actually declares.
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
 import { DockerSessionDriver } from '../../drivers/docker-driver.js';
+import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import { resetSessionDriver } from '../../drivers/index.js';
 import { FIXTURE_POLICY } from '../../drivers/spec-fixture.js';
 import type { SessionDriver } from '../../drivers/types.js';
@@ -41,7 +42,17 @@ function withoutImageBuild(): void {
   } satisfies SessionDriver);
 }
 
-afterEach(() => resetSessionDriver(null));
+// The gate resolves the requesting group's runtime from its config row; with
+// no row (no driver column set) that is the install default — the driver each
+// case installs.
+beforeEach(async () => {
+  await runMigrations(await initTestDb());
+});
+
+afterEach(async () => {
+  resetSessionDriver(null);
+  await closeDb();
+});
 
 describe('install_packages gates on the imageBuild capability', () => {
   it('holds for admin approval on a driver that declares imageBuild (docker)', async () => {

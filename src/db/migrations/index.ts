@@ -30,6 +30,7 @@ import { migration025 as migration025TelegramCommandScopes } from './025-telegra
 import { migration026 as migration026AutoCompactWindow } from './026-auto-compact-window.js';
 import { migration027 as migration027VoiceLines } from './027-voice-lines.js';
 import { migration028 as migration028RichMessages } from './028-container-config-rich-messages.js';
+import { migration029 as migration029ContainerConfigDriver } from './029-container-config-driver.js';
 
 interface MigrationBase {
   version: number;
@@ -101,6 +102,7 @@ export const migrations: Migration[] = [
   migration026AutoCompactWindow,
   migration027VoiceLines,
   migration028RichMessages,
+  migration029ContainerConfigDriver,
 ];
 
 /**
