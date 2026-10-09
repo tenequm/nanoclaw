@@ -9,10 +9,10 @@
  *
  * Docker uses a hermetic CLI harness. The explicitly gated kind harness
  * exercises the group-volume contract against real Kubernetes objects.
- * Named amendments below preserve the Docker floor while extending it. The suite asserts spec-realization fidelity (including *absence*:
- * no secret env, no extra mounts), the mount-class rules, prepare idempotency,
- * adoption from labels alone, stop-is-full-teardown, and failure-taxonomy
- * mapping.
+ * Named amendments below preserve the Docker floor while extending it. The
+ * suite asserts spec-realization fidelity (including absence: no secret env,
+ * no extra mounts), mount-class rules, prepare idempotency, adoption from labels
+ * alone, capability-declared retention after stop, and failure taxonomy.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 

@@ -42,6 +42,7 @@ const delay = (ms: number): Promise<void> => new Promise((done) => setTimeout(do
 type Metadata = {
   name: string;
   uid: string;
+  generation?: number;
   namespace?: string;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
@@ -82,8 +83,9 @@ type KubeObject = {
     podTemplate?: { metadata?: { labels?: Record<string, string> }; spec: PodSpec };
   } & Record<string, unknown>;
   status?: {
+    observedGeneration?: number;
     phase?: string;
-    conditions?: { type: string; status: string; reason?: string }[];
+    conditions?: { type: string; status: string; reason?: string; observedGeneration?: number }[];
     containerStatuses?: { state?: { waiting?: { reason?: string }; terminated?: { exitCode: number } } }[];
   };
   data?: Record<string, string>;
@@ -140,6 +142,7 @@ export function registerKubernetesConformance(): void {
     let serial = 0;
     let informerCreations = 0;
     let informerConnections = 0;
+    const informerErrors: string[] = [];
     let makeInformer: typeof import('@kubernetes/client-node').makeInformer;
     function tracedInformer<T extends import('@kubernetes/client-node').KubernetesObject>(
       ...args: Parameters<typeof makeInformer<T>>
@@ -147,6 +150,9 @@ export function registerKubernetesConformance(): void {
       informerCreations++;
       const informer = makeInformer<T>(...args);
       informer.on('connect', () => informerConnections++);
+      informer.on('error', (error: unknown) =>
+        informerErrors.push(error instanceof Error ? error.name : String(error)),
+      );
       return informer;
     }
     const watches: SessionWatch[] = [];
@@ -212,6 +218,50 @@ export function registerKubernetesConformance(): void {
       expect(description.argsPlain.slice(-args.length)).toEqual(args);
       return command(description.bin, description.argsPlain);
     };
+    const crash = (handle: SessionHandle) =>
+      eventually(
+        async () => {
+          const status = await handle.status();
+          if (status.phase === 'failed') return status;
+          await exec(handle, ['bash', '-c', 'read -r child rest < /proc/1/task/1/children; kill -KILL "$child"']);
+          return handle.status();
+        },
+        (status) =>
+          status.phase === 'failed' && status.failure.kind === 'started-then-died' && status.failure.exitCode === 137,
+        90_000,
+      );
+    const terminalHint = async (handle: SessionHandle, events: SessionEvent[], timeout: number): Promise<void> => {
+      // API readiness precedes controller recovery; the informer only observes Sandbox conditions.
+      const source = await eventually(
+        () => get(RESOURCE, handle.name),
+        (box) =>
+          box?.status?.conditions?.some(
+            (condition) =>
+              condition.type === 'Finished' &&
+              condition.status === 'True' &&
+              (condition.observedGeneration ?? box.status?.observedGeneration ?? 0) >= (box.metadata.generation ?? 1),
+          ) === true,
+        90_000,
+      );
+      try {
+        await eventually(
+          async () => events,
+          (all) => all.some((event) => event.kind === 'terminal' && event.key.sessionId === spec.key.sessionId),
+          timeout,
+        );
+      } catch (error) {
+        throw new Error(
+          JSON.stringify({
+            source: { generation: source?.metadata.generation, status: source?.status },
+            informerCreations,
+            informerConnections,
+            informerErrors,
+            events: events.map((event) => event.kind),
+          }),
+          { cause: error },
+        );
+      }
+    };
     const pvc = async (): Promise<KubeObject> => {
       const pvcs = await list('pvc', installSelector());
       expect(pvcs).toHaveLength(1);
@@ -246,12 +296,32 @@ export function registerKubernetesConformance(): void {
         await rm(lock, { recursive: true, force: true });
       }
     };
-    const apiReady = (): Promise<string> =>
-      eventually(
+    const apiReady = async (): Promise<void> => {
+      await eventually(
         () => kubectl(['get', '--raw', '/readyz']),
         (out) => out.trim() === 'ok',
-        90_000,
+        180_000,
       );
+      // Repeated static-pod outages can leave the controller in Kubernetes' five-minute restart backoff.
+      await eventually(
+        async () => {
+          const out = await kubectl([
+            '--namespace',
+            'agent-sandbox-system',
+            'get',
+            'pods',
+            '-l',
+            'app=agent-sandbox-controller',
+            '-o',
+            'json',
+          ]);
+          const pods = (JSON.parse(out) as { items: KubeObject[] }).items;
+          return pods.some((pod) => pod.status?.conditions?.some((c) => c.type === 'Ready' && c.status === 'True'));
+        },
+        Boolean,
+        360_000,
+      );
+    };
 
     beforeAll(async () => {
       makeInformer = (await import('@kubernetes/client-node')).makeInformer;
@@ -292,11 +362,12 @@ export function registerKubernetesConformance(): void {
       await apiReady();
       await kubectl(['get', 'crd', CRD, '-o', 'name']);
       await kubectl(['create', 'namespace', namespace]);
-    }, 120_000);
+    }, 600_000);
 
     beforeEach(async () => {
       informerCreations = 0;
       informerConnections = 0;
+      informerErrors.length = 0;
       policy = {
         groupsRoot: join(root, 'groups'),
         dataRoot: join(root, 'data'),
@@ -1086,14 +1157,8 @@ export function registerKubernetesConformance(): void {
           }
         });
         events.length = 0;
-        await exec(handle, ['bash', '-c', 'read -r child rest < /proc/1/task/1/children; kill -KILL "$child"']).catch(
-          () => {},
-        );
-        await eventually(
-          async () => events,
-          (all) => all.some((event) => event.kind === 'terminal' && event.key.sessionId === spec.key.sessionId),
-          60_000,
-        );
+        await crash(handle);
+        await terminalHint(handle, events, 60_000);
         await handle.stop('conformance');
         await podGone(handle);
         const resumed = await driver.prepare(spec);
@@ -1118,9 +1183,10 @@ export function registerKubernetesConformance(): void {
       } finally {
         watch.stop();
       }
-    }, 240_000);
+    }, 600_000);
 
     it('the same watch recovers from a half-open paused node within a liveness bound', async () => {
+      driver = driverFor({ startTimeoutMs: 90_000 });
       const events: SessionEvent[] = [];
       const watch = driver.watchSessions(spec.key.installSlug, (event) => events.push(event));
       try {
@@ -1144,20 +1210,14 @@ export function registerKubernetesConformance(): void {
           }
         });
         events.length = 0;
-        await exec(handle, ['bash', '-c', 'read -r child rest < /proc/1/task/1/children; kill -KILL "$child"']).catch(
-          () => {},
-        );
-        await eventually(
-          async () => events,
-          (all) => all.some((event) => event.kind === 'terminal'),
-          90_000,
-        );
+        await crash(handle);
+        await terminalHint(handle, events, 90_000);
         expect(driver.watchSessions).toHaveBeenCalledOnce();
         expect(informerCreations).toBe(1);
       } finally {
         watch.stop();
       }
-    }, 240_000);
+    }, 600_000);
 
     it('a deleted CRD maps runtime-unavailable and is restored in finally', async () => {
       await chaos(async () => {
