@@ -124,10 +124,14 @@ function harness(options: Partial<KubernetesDriverOptions> = {}) {
       const box = boxes.get(name)!;
       if (body.spec) {
         Object.assign(box.spec, body.spec);
+        for (const [key, value] of Object.entries(box.spec.podTemplate.metadata?.labels ?? {}))
+          if (value === null) delete box.spec.podTemplate.metadata!.labels![key];
         box.metadata.generation = (box.metadata.generation ?? 0) + 1;
       }
       if (body.metadata) {
         box.metadata.labels = { ...box.metadata.labels, ...body.metadata.labels };
+        for (const [key, value] of Object.entries(box.metadata.labels))
+          if (value === null) delete box.metadata.labels[key];
         box.metadata.annotations = { ...box.metadata.annotations, ...body.metadata.annotations };
       }
       if (body.spec?.operatingMode === 'Running') {
@@ -301,6 +305,20 @@ describe('kubernetes driver lifecycle', () => {
     expect(await handle.status()).toEqual({ phase: 'running' });
     expect([...h.boxes.values()][0].metadata.annotations![STARTED_ONCE]).toBe('true');
   });
+  it('removes lineage labels that are absent from a refreshed suspended spec', async () => {
+    const h = harness();
+    h.spec.labels['temporary-lineage'] = 'old';
+    const handle = await h.driver.prepare(h.spec);
+    await handle.start();
+    await handle.stop('refresh');
+    delete h.spec.labels['temporary-lineage'];
+    await h.driver.prepare(h.spec);
+    const box = h.boxes.get(handle.name)!;
+    expect(box.metadata.labels).not.toHaveProperty('temporary-lineage');
+    expect(box.spec.podTemplate.metadata!.labels).not.toHaveProperty('temporary-lineage');
+    expect(h.secrets.get(secretName(h.spec.key))!.metadata!.labels).not.toHaveProperty('temporary-lineage');
+  });
+
   it('syncs latest bytes at start even without another prepare', async () => {
     const h = harness();
     const handle = await h.driver.prepare(h.spec);
@@ -379,8 +397,11 @@ describe('kubernetes driver lifecycle', () => {
       }
       return result;
     });
-    if (code) await expect(handle.start()).rejects.toMatchObject({ kind: 'started-then-died', exitCode: code });
-    else {
+    if (code) {
+      await expect(handle.start()).rejects.toMatchObject({ kind: 'started-then-died', exitCode: code });
+      await handle.stop('cleanup');
+      expect(await handle.status()).toEqual({ phase: 'stopped' });
+    } else {
       await handle.start();
       expect(await handle.status()).toEqual({ phase: 'stopped' });
       await handle.stop('cleanup');

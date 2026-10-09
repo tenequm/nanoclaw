@@ -369,6 +369,17 @@ for (const state of data.states) {
   };
 }
 
+function labelPatch(existing: Record<string, string> | undefined, desired: Record<string, string> | undefined) {
+  return {
+    ...Object.fromEntries(
+      Object.keys(existing ?? {})
+        .filter((key) => !(key in (desired ?? {})))
+        .map((key) => [key, null]),
+    ),
+    ...desired,
+  };
+}
+
 interface InstallWatch {
   subscribers: Set<(event: SessionEvent) => void>;
   informer?: k8s.Informer<Sandbox>;
@@ -607,8 +618,19 @@ export class KubernetesSessionDriver implements SessionDriver {
           !isDeepStrictEqual(box.metadata.labels, desired.metadata.labels)
         ) {
           box = await this.patch(spec.key, box.metadata.name!, {
-            metadata: { labels: desired.metadata.labels, annotations: desired.metadata.annotations },
-            spec: { podTemplate: desired.spec.podTemplate },
+            metadata: {
+              labels: labelPatch(box.metadata.labels, desired.metadata.labels),
+              annotations: desired.metadata.annotations,
+            },
+            spec: {
+              podTemplate: {
+                ...desired.spec.podTemplate,
+                metadata: {
+                  ...desired.spec.podTemplate.metadata,
+                  labels: labelPatch(box.spec.podTemplate.metadata?.labels, desired.spec.podTemplate.metadata?.labels),
+                },
+              },
+            },
           });
         }
         await this.syncSecret(spec, box);
@@ -753,6 +775,16 @@ export class KubernetesSessionDriver implements SessionDriver {
                 }
                 pendingFailure = status.failure;
                 return;
+              }
+              if (status.failure.kind === 'started-then-died') {
+                await this.patch(key, name, {
+                  metadata: {
+                    annotations: {
+                      [STARTED_ONCE]: 'true',
+                      ...(backing?.metadata?.uid && { [LAST_POD_UID]: backing.metadata.uid }),
+                    },
+                  },
+                });
               }
               throw asFailureError(status.failure);
             }
