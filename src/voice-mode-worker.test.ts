@@ -4394,6 +4394,65 @@ describe('call voice names', () => {
     expect(posts.slice(1)).toEqual([taken, { ...taken, activeDetails: state.pendingDetails }]);
   });
 
+  it('asks again for names that could not be had while the call lasts, and posts them when they come', async () => {
+    vi.useFakeTimers();
+    try {
+      const posts: CallVoiceState[] = [];
+      const failed = {
+        ...state.activeDetails!,
+        voiceName: null,
+        language: null,
+        gender: null,
+        status: 'lookup_failed' as const,
+      };
+      const answers = [failed, failed, state.activeDetails!];
+      const lookUp = vi.fn(async () => answers.shift()!);
+      voiceAttribute((s) => void posts.push(s), lookUp, VOICE_NAMES_WAIT_MS, [100, 200, 400]).publish({
+        v: 1,
+        active: state.active,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(posts).toEqual([
+        { v: 1, active: state.active },
+        { v: 1, active: state.active, activeDetails: failed },
+      ]);
+      await vi.advanceTimersByTimeAsync(100);
+      // The same answer again posts nothing.
+      expect(posts).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(posts).toEqual([
+        { v: 1, active: state.active },
+        { v: 1, active: state.active, activeDetails: failed },
+        { v: 1, active: state.active, activeDetails: state.activeDetails },
+      ]);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(lookUp).toHaveBeenCalledTimes(3);
+      expect(posts).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('asks again a bounded number of times, and never once the call closed', async () => {
+    vi.useFakeTimers();
+    try {
+      const failed = { ...state.activeDetails!, voiceName: null, status: 'lookup_failed' as const };
+      const always = vi.fn(async () => failed);
+      voiceAttribute(() => undefined, always, VOICE_NAMES_WAIT_MS, [100, 200]).publish({ v: 1, active: state.active });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(always).toHaveBeenCalledTimes(3);
+      const closing = vi.fn(async () => failed);
+      const attribute = voiceAttribute(() => undefined, closing, VOICE_NAMES_WAIT_MS, [100, 200]);
+      attribute.publish({ v: 1, active: state.active });
+      await vi.advanceTimersByTimeAsync(0);
+      attribute.close();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(closing).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('posts nothing once the call closed', async () => {
     vi.useFakeTimers();
     try {

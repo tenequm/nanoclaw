@@ -354,7 +354,8 @@ Names come from the host's memory only: each provider's whole listing, loaded
 at start and refreshed hourly in the background, and an ElevenLabs voice
 outside it asked for by id (`/v1/voices/{id}`). The worker's call voice
 attribute carries the same `activeDetails` and `pendingDetails`, looked up only
-for the voices in use and never waited on. `GET /voice/voices?t=<token>&provider=gemini`
+for the voices in use and never waited on; a name it could not get is asked for
+again three times (after 20 s, 1 min and 3 min) while the call lasts. `GET /voice/voices?t=<token>&provider=gemini`
 (or `elevenlabs`, with optional `q`, `language`, `gender` (`female`, `male` or
 `neutral`), `cursor` and `limit` up to 100) pages the provider's voices: each
 page is the provider's own filtered listing (Gemini `voices.list` through

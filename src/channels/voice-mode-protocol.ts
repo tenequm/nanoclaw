@@ -364,7 +364,8 @@ export interface ReviewReply {
 export const CALL_VOICE_ATTRIBUTE = 'nanoclaw.voice-mode.voice';
 /**
  * JSON on the attribute: what speaks now, what is queued for the next line, and the request gen that
- * queued it. The worker sends each state again with both choices' names once it has looked them up.
+ * queued it. The worker sends each state again with both choices' names once it has looked them up,
+ * and again when a name it could not get arrives later in the call.
  */
 export interface CallVoiceState {
   v: 1;

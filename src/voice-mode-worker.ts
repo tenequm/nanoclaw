@@ -3671,45 +3671,68 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
 
 /** How long the call voice attribute goes without names before it says they could not be had. */
 export const VOICE_NAMES_WAIT_MS = 2_000;
+/** When names that could not be had are asked for again, while the call lasts: each past the catalog's 15 s for a failure. */
+export const VOICE_NAMES_RETRY_MS: readonly number[] = [20_000, 60_000, 180_000];
 
 /**
  * The call voice attribute: each state goes out at once, then again with its choices' names when they
- * arrive, or after VOICE_NAMES_WAIT_MS with `lookup_failed` ones (the real ones still follow). Nothing
- * waits on a lookup, and a lookup that finishes after a newer state, or after the call closed, posts nothing.
+ * arrive, or after VOICE_NAMES_WAIT_MS with `lookup_failed` ones (the real ones still follow). Names that
+ * could not be had are asked for again at VOICE_NAMES_RETRY_MS. Nothing waits on a lookup, a lookup that
+ * finishes after a newer state, or after the call closed, posts nothing, and the same names are not posted twice.
  */
 export function voiceAttribute(
   post: (state: CallVoiceState) => void,
   describe?: (choice: TtsChoice) => Promise<ChoiceDetails>,
   waitMs = VOICE_NAMES_WAIT_MS,
+  retryMs = VOICE_NAMES_RETRY_MS,
 ): { publish(state: CallVoiceState, options?: { posted?: boolean }): void; close(): void } {
   // The state's own `gen` cannot tell one from the next: a line taking the pending choice keeps it.
   let revision = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let retry: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
   return {
     publish(state, { posted = false } = {}) {
       if (closed) return;
       const current = ++revision;
       clearTimeout(timer);
+      clearTimeout(retry);
       if (!posted) post(state);
       if (!describe) return;
+      const live = () => !closed && current === revision;
+      let lastNamed: string | undefined;
       const postNamed = (active: ChoiceDetails, pending?: ChoiceDetails) => {
-        if (closed || current !== revision) return;
-        post({ ...state, activeDetails: active, ...(pending ? { pendingDetails: pending } : {}) });
+        if (!live()) return;
+        const named: CallVoiceState = {
+          ...state,
+          activeDetails: active,
+          ...(pending ? { pendingDetails: pending } : {}),
+        };
+        const json = JSON.stringify(named);
+        if (json === lastNamed) return;
+        lastNamed = json;
+        post(named);
       };
       const failed = (choice: TtsChoice) => choiceDetails(choice, { status: 'lookup_failed' });
       timer = setTimeout(() => postNamed(failed(state.active), state.pending && failed(state.pending)), waitMs);
-      void Promise.all([describe(state.active), state.pending && describe(state.pending)]).then(
-        ([active, pending]) => {
-          if (current === revision) clearTimeout(timer);
-          postNamed(active, pending);
-        },
-        () => undefined,
-      );
+      const name = (attempt: number) => {
+        void Promise.all([describe(state.active), state.pending && describe(state.pending)]).then(
+          ([active, pending]) => {
+            if (!live()) return;
+            clearTimeout(timer);
+            postNamed(active, pending);
+            const unnamed = active.status === 'lookup_failed' || pending?.status === 'lookup_failed';
+            if (unnamed && attempt < retryMs.length) retry = setTimeout(() => name(attempt + 1), retryMs[attempt]);
+          },
+          () => undefined,
+        );
+      };
+      name(0);
     },
     close() {
       closed = true;
       clearTimeout(timer);
+      clearTimeout(retry);
     },
   };
 }
