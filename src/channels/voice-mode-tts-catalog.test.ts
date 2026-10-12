@@ -3,7 +3,7 @@
  * client over the fetch seam, ElevenLabs' proxied directly. The routes over it are in
  * voice-mode-adapter.test.ts.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { createVoiceCatalog, ELEVENLABS_VOICES_URL } from './voice-mode-tts-catalog.js';
 
@@ -37,6 +37,7 @@ describe('voice catalog', () => {
                   description: 'Warm and low.',
                 },
                 { display_name: 'no id' },
+                null,
                 { id: 'd', gender: 'female' },
               ],
               next_page_token: 'p2',
@@ -68,10 +69,16 @@ describe('voice catalog', () => {
   });
 
   it('sends Gemini only the page size when nothing else is asked, and takes a page without voices as empty', async () => {
+    vi.stubEnv('GOOGLE_GEMINI_BASE_URL', 'https://elsewhere.invalid');
     const { urls, fetchFn } = fakeUpstream(() => Response.json({}));
-    expect(await createVoiceCatalog({ fetch: fetchFn }).page('gemini', 'key', { limit: 5 })).toEqual({
-      page: { provider: 'gemini', voices: [] },
-    });
+    try {
+      expect(await createVoiceCatalog({ fetch: fetchFn }).page('gemini', 'key', { limit: 5 })).toEqual({
+        page: { provider: 'gemini', voices: [] },
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(urls()[0].origin + urls()[0].pathname).toBe(GEMINI_VOICES_URL);
     expect(Object.fromEntries(urls()[0].searchParams)).toEqual({ page_size: '5' });
   });
 
@@ -84,6 +91,11 @@ describe('voice catalog', () => {
     expect(await catalog.page('gemini', 'key', { limit: 1 })).toEqual({ error: 'upstream' });
     const replies = [
       () => new Response('denied', { status: 403 }),
+      () =>
+        Response.json(
+          { error: { code: 400, status: 'INVALID_ARGUMENT', details: [{ reason: 'API_KEY_INVALID' }] } },
+          { status: 400 },
+        ),
       () => new Response('', { status: 503 }),
       () => new Response('<html>', { status: 200, headers: { 'content-type': 'text/html' } }),
       () => Promise.reject(new Error('socket hang up')),

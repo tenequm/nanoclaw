@@ -41,6 +41,7 @@ export interface VoiceCatalog {
 }
 
 export const ELEVENLABS_VOICES_URL = 'https://api.elevenlabs.io/v2/voices';
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com';
 const UPSTREAM_TIMEOUT_MS = 15_000;
 
 const text = (value: unknown): string | undefined =>
@@ -97,8 +98,8 @@ export function createVoiceCatalog(options: { fetch?: typeof fetch } = {}): Voic
     (body.voices as unknown[]).filter((v): v is Record<string, unknown> => !!v && typeof v === 'object');
 
   const geminiPage = async (apiKey: string, query: CatalogQuery): Promise<CatalogResult> => {
-    // Pinned off: GOOGLE_GENAI_USE_VERTEXAI in the host's environment would route the request to Vertex AI.
-    const ai = new GoogleGenAI({ apiKey, vertexai: false, httpOptions: { fetch: fetchFn } });
+    // Pinned: GOOGLE_GENAI_USE_VERTEXAI or GOOGLE_GEMINI_BASE_URL in the env would send the key elsewhere.
+    const ai = new GoogleGenAI({ apiKey, vertexai: false, httpOptions: { baseUrl: GEMINI_BASE_URL, fetch: fetchFn } });
     let body: Awaited<ReturnType<typeof ai.voices.list>>;
     try {
       body = await ai.voices.list(
@@ -109,16 +110,22 @@ export function createVoiceCatalog(options: { fetch?: typeof fetch } = {}): Voic
           gender: query.gender ? [query.gender] : undefined,
           page_token: query.cursor,
         },
-        { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS), retries: { strategy: 'none' } },
+        // Not `signal`: the SDK fetches a clone of its Request, which loses the caller's signal after a GC.
+        { timeout_ms: UPSTREAM_TIMEOUT_MS, retries: { strategy: 'none' } },
       );
     } catch (err) {
-      // A token that is not Gemini's, or one from a listing with other filters.
-      if (query.cursor && (err as { status?: unknown }).status === 400) return { error: 'bad_request' };
+      // A token that is not Gemini's, or one from a listing with other filters; a rejected key is a 400 too.
+      const apiError = err as { status?: unknown; error?: { error?: { details?: Array<{ reason?: unknown }> } } };
+      const keyRejected = apiError.error?.error?.details?.some((d) => d.reason === 'API_KEY_INVALID');
+      if (query.cursor && apiError.status === 400 && !keyRejected) return { error: 'bad_request' };
       throw err;
     }
     const page: VoiceCatalogPage = {
       provider: 'gemini',
-      voices: (body.voices ?? []).map(geminiVoice).filter((v): v is CatalogVoice => v !== null),
+      voices: (body.voices ?? [])
+        .filter((v) => !!v && typeof v === 'object')
+        .map(geminiVoice)
+        .filter((v): v is CatalogVoice => v !== null),
     };
     const next = text(body.next_page_token);
     if (next) page.next = next;
