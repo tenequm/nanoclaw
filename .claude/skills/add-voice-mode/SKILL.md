@@ -120,10 +120,10 @@ lacks them, install the exact versions. Do not bypass its package release-age
 or approved build-script policies.
 
 ```nc:dep
-@livekit/agents@1.9.1
-@livekit/agents-plugin-elevenlabs@1.9.1
-@livekit/agents-plugin-google@1.9.1
-@livekit/agents-plugin-silero@1.9.1
+@livekit/agents@1.9.2
+@livekit/agents-plugin-elevenlabs@1.9.2
+@livekit/agents-plugin-google@1.9.2
+@livekit/agents-plugin-silero@1.9.2
 @livekit/rtc-node@1.1.0
 livekit-server-sdk@2.19.1
 onnxruntime-node@1.24.3

@@ -33,17 +33,17 @@ importers:
         specifier: 2.3.0
         version: 2.3.0(grammy@1.46.0)
       '@livekit/agents':
-        specifier: 1.9.1
-        version: 1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)
+        specifier: 1.9.2
+        version: 1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)
       '@livekit/agents-plugin-elevenlabs':
-        specifier: 1.9.1
-        version: 1.9.1(@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)
+        specifier: 1.9.2
+        version: 1.9.2(@livekit/agents@1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)
       '@livekit/agents-plugin-google':
-        specifier: 1.9.1
-        version: 1.9.1(@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)(ws@8.21.3)(zod@4.6.5)
+        specifier: 1.9.2
+        version: 1.9.2(@livekit/agents@1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)(ws@8.21.3)(zod@4.6.5)
       '@livekit/agents-plugin-silero':
-        specifier: 1.9.1
-        version: 1.9.1(@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)
+        specifier: 1.9.2
+        version: 1.9.2(@livekit/agents@1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)
       '@livekit/rtc-node':
         specifier: 1.1.0
         version: 1.1.0
@@ -574,26 +574,26 @@ packages:
   '@jridgewell/sourcemap-codec@1.5.5':
     resolution: {integrity: sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==}
 
-  '@livekit/agents-plugin-elevenlabs@1.9.1':
-    resolution: {integrity: sha512-dtlEsKuF0DIP8ZBkTXQVPgM6+h0AZeqWzj8S2GSpj/rcsjhKGJM0/69RnRYfD7c33j8WuetEaJQhw2l3CycXnQ==}
+  '@livekit/agents-plugin-elevenlabs@1.9.2':
+    resolution: {integrity: sha512-b8hF2gumwrj7lNtt0W9vMDprlk4ZEganECD6/fwWrQWKPtQ/Tf9VIAaVo3VwBb2xaV7IEHQj8coO9TQu4lw6Zg==}
     peerDependencies:
-      '@livekit/agents': 1.9.1
+      '@livekit/agents': 1.9.2
       '@livekit/rtc-node': ^1.1.0
 
-  '@livekit/agents-plugin-google@1.9.1':
-    resolution: {integrity: sha512-c6jutVScd04qpcZ4BedGQrmElneCxedrJH95RINfOdP+acWMCquyH4A+mdouiR5mPhHAGpIAjHwO2y0G7AiAQw==}
+  '@livekit/agents-plugin-google@1.9.2':
+    resolution: {integrity: sha512-17BdJQEaOkRc9GkO3lEjvwlPcsH2v5/s6OHrnMgi9iZFqNBlySX73ahkL8ORsvKr67picIr92Ac3pafwksjhIQ==}
     peerDependencies:
-      '@livekit/agents': 1.9.1
+      '@livekit/agents': 1.9.2
       '@livekit/rtc-node': ^1.1.0
 
-  '@livekit/agents-plugin-silero@1.9.1':
-    resolution: {integrity: sha512-DpJIMT3XPD/9WftO7PPmbwhdV4wbrUJ+N48K7zFCyL0jPP7u6jRszYs4Ln9aFNM7JlSxvZDAOC+rFkAqIFnf0g==}
+  '@livekit/agents-plugin-silero@1.9.2':
+    resolution: {integrity: sha512-ORcSWmM1upcfMcPw1wer97oO4EvD6Rz//aDXqnHjZbFJam7MdHnKNCu37sW+jDVxb1tLJticgLPa8nON+h7NUg==}
     peerDependencies:
-      '@livekit/agents': 1.9.1
+      '@livekit/agents': 1.9.2
       '@livekit/rtc-node': ^1.1.0
 
-  '@livekit/agents@1.9.1':
-    resolution: {integrity: sha512-M8AxdKwzYzE9maO2cfPtGIXGqt9lpb3rsnBnC0vxZwRND+4y/GcW0t+c5CFDZGPHJ45bKvKALqI5aWnpCwgmWg==}
+  '@livekit/agents@1.9.2':
+    resolution: {integrity: sha512-l7vIb6xfana/nnWeentgktrSseTc6Yvi+eWgT+HNTvCKemwTyDBhTolF6jWm1XlvvYkSjD0cmByA2igdDikSag==}
     hasBin: true
     peerDependencies:
       '@livekit/rtc-node': ^1.1.0
@@ -3014,9 +3014,9 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 
-  '@livekit/agents-plugin-elevenlabs@1.9.1(@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)':
+  '@livekit/agents-plugin-elevenlabs@1.9.2(@livekit/agents@1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)':
     dependencies:
-      '@livekit/agents': 1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)
+      '@livekit/agents': 1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)
       '@livekit/mutex': 1.1.1
       '@livekit/rtc-node': 1.1.0
       ws: 8.21.3
@@ -3024,10 +3024,10 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@livekit/agents-plugin-google@1.9.1(@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)(ws@8.21.3)(zod@4.6.5)':
+  '@livekit/agents-plugin-google@1.9.2(@livekit/agents@1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)(ws@8.21.3)(zod@4.6.5)':
     dependencies:
       '@google/genai': 2.24.0
-      '@livekit/agents': 1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)
+      '@livekit/agents': 1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)
       '@livekit/mutex': 1.1.1
       '@livekit/rtc-node': 1.1.0
       '@types/json-schema': 7.0.15
@@ -3045,9 +3045,9 @@ snapshots:
       - ws
       - zod
 
-  '@livekit/agents-plugin-silero@1.9.1(@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)':
+  '@livekit/agents-plugin-silero@1.9.2(@livekit/agents@1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5))(@livekit/rtc-node@1.1.0)':
     dependencies:
-      '@livekit/agents': 1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)
+      '@livekit/agents': 1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)
       '@livekit/rtc-node': 1.1.0
       onnxruntime-node: 1.24.3
       ws: 8.21.3
@@ -3055,7 +3055,7 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@livekit/agents@1.9.1(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)':
+  '@livekit/agents@1.9.2(@livekit/rtc-node@1.1.0)(@types/node@22.19.17)(typescript@5.9.3)(zod@4.6.5)':
     dependencies:
       '@bufbuild/protobuf': 1.10.1
       '@livekit/av': 10.0.0
