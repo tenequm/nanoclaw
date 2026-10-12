@@ -1091,7 +1091,7 @@ const CALL_RECORDING_HEADER_MS = 5_000;
  */
 export class CallRecording {
   readonly base: string;
-  private readonly record: CallRecord;
+  private readonly record: Omit<CallRecord, 'durationMs'>;
   private readonly file: Promise<fs.promises.FileHandle>;
   /** Every write, in order: the audio appends, the header patches, the close. */
   private chain: Promise<unknown>;
@@ -1109,13 +1109,13 @@ export class CallRecording {
     const startedAt = new Date(at).toISOString();
     const dir = path.join(root, pathSegment(call.agent), startedAt.slice(0, 10));
     this.base = path.join(dir, `${pathSegment(call.callId)}-call`);
-    this.record = { ...call, startedAt, durationMs: 0, wakes: [] };
+    this.record = { ...call, startedAt, wakes: [] };
     this.file = fs.promises
       .mkdir(dir, { recursive: true, mode: 0o700 })
       .then(() => fs.promises.open(`${this.base}.wav`, 'w', 0o600));
     this.chain = this.file
       .then((file) => file.write(pcmToWav(new Int16Array(0), INPUT_SAMPLE_RATE), 0, 44, 0))
-      .then(() => this.writeJson());
+      .then(() => this.writeJson(0));
     this.chain.catch((err: unknown) => this.fail(err));
   }
 
@@ -1131,6 +1131,7 @@ export class CallRecording {
       this.sinceHeader = 0;
       const written = this.bytes;
       this.then((file) => this.patchHeader(file, written));
+      this.then(() => this.writeJson(written));
     }
   }
 
@@ -1151,7 +1152,7 @@ export class CallRecording {
     if (wake?.threshold !== undefined) this.record.wakeThreshold = wake.threshold;
     const written = this.bytes;
     this.then((file) => this.patchHeader(file, written));
-    this.then(() => this.writeJson());
+    this.then(() => this.writeJson(written));
     this.then((file) => file.close());
     await this.chain.catch(() => undefined);
   }
@@ -1170,9 +1171,10 @@ export class CallRecording {
     await file.write(sizes, 0, 4, 40);
   }
 
-  private writeJson(): Promise<void> {
-    this.record.durationMs = Math.round(msOf(this.bytes / 2));
-    return fs.promises.writeFile(`${this.base}.json`, `${JSON.stringify(this.record, null, 2)}\n`, { mode: 0o600 });
+  /** The sidecar for the audio written up to `bytes`, with the wakes so far: rewritten with the header. */
+  private writeJson(bytes: number): Promise<void> {
+    const record = { ...this.record, durationMs: Math.round(msOf(bytes / 2)) };
+    return fs.promises.writeFile(`${this.base}.json`, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   }
 
   private fail(err: unknown): void {

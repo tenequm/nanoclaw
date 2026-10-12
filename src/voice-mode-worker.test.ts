@@ -4156,14 +4156,22 @@ describe('whole-call recording', () => {
         Date.parse('2026-10-12T10:00:00Z'),
       );
       expect(recording.base).toBe(path.join(root, 'Andy-Bot', '2026-10-12', 'c-1-call'));
-      // 6 s in 20 ms frames: the header is brought up to date after 5 s.
-      for (let i = 0; i < 300; i++) recording.push(new Int16Array(320).fill(i));
+      // 6 s in 20 ms frames: the header and the sidecar are brought up to date after 5 s.
+      for (let i = 0; i < 300; i++) {
+        if (i === 100) recording.wake({ streamMs: 2000, score: 0.9 });
+        recording.push(new Int16Array(320).fill(i));
+      }
       const internals = recording as unknown as { chain: Promise<unknown> };
       await internals.chain;
       const wav = fs.readFileSync(`${recording.base}.wav`);
       expect(wav.length).toBe(44 + 6 * 32_000);
       expect(wav.readUInt32LE(40)).toBe(5 * 32_000);
       expect(wav.readInt16LE(44 + 299 * 640)).toBe(299);
+      expect(JSON.parse(fs.readFileSync(`${recording.base}.json`, 'utf8'))).toMatchObject({
+        durationMs: 5000,
+        wakes: [{ streamMs: 2000, score: 0.9 }],
+      });
+      expect(JSON.parse(fs.readFileSync(`${recording.base}.json`, 'utf8')).endedAt).toBeUndefined();
       expect(fs.statSync(path.dirname(recording.base)).mode & 0o777).toBe(0o700);
       // On close the header covers everything, and a second close changes nothing.
       await recording.close({ model: '/m.onnx', threshold: 0.76 });
