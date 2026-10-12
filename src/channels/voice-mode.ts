@@ -393,6 +393,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
   const livekit = createLiveKitVoice(config.livekit, {
     ui: config.ui,
+    // Deferred: resolveCallLine needs the catalog, declared below.
     resolveLine: (platformId, options) => resolveCallLine(platformId, options),
     admitStart,
     remainingTodayMs: (platformId, t) => maxCallMsPerDay - usedTodayMs(platformId, t),
@@ -463,7 +464,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       ...providers.map((entry) => describe({ provider: entry.id, ...entry.defaults })),
     ]);
     const effective = speakable(readable);
-    const effectiveDetails = effective === readable ? readableDetails : await describe(effective);
+    // The backup voice is Gemini's default, already described.
+    const effectiveDetails =
+      effective === readable
+        ? readableDetails
+        : defaultDetails[providers.findIndex((e) => e.id === effective.provider)];
     return {
       effective,
       saved,
@@ -519,12 +524,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       ]);
       clearTimeout(timer);
       if (found.status === 'unavailable') return replyJson(res, 400, { error: 'invalid', field: 'voice' });
-      // So can the lookup: the caller must still be one, and the save below only takes the link it started with.
-      if (!(await resolveLine(platformId))) {
-        return reply(res, 403, 'Caller access denied or voice line is not set up');
-      }
       choice = read.choice;
     }
+    // The body and the lookup can take their time: the caller must still be one, and the save below only
+    // takes the link it started with.
+    if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
     const updated = await setVoiceModeLineTts(lineId, choice, row);
     if (!updated) return reply(res, 403, 'Unknown call link');
     log.info('voice-mode: line voice saved', { platformId, tts: choice, ...('reset' in body ? { reset: true } : {}) });
@@ -707,6 +711,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
     async teardown(): Promise<void> {
       connected = false;
+      catalog.close();
       const server = pageServer;
       pageServer = undefined;
       try {

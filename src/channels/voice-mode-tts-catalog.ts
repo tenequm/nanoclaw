@@ -66,8 +66,9 @@ export interface ChoiceDetails {
 export interface VoiceCatalog {
   page(provider: TtsProvider, apiKey: string, query: CatalogQuery): Promise<CatalogResult>;
   /**
-   * A voice by its exact id; never throws, and waits on a listing a few seconds at most. `confirm` (a
-   * save) asks again before an answer of `unavailable`: Gemini by a fresh listing, ElevenLabs by id.
+   * A voice by its exact id; never throws. On the host it waits LOOKUP_WAIT_MS at most for each load it
+   * needs (a `confirm` can need two); the worker's (`lazy`) waits on its loads' own timeouts. `confirm`
+   * (a save) asks again before an answer of `unavailable`: Gemini by a fresh listing, ElevenLabs by id.
    */
   lookup(
     provider: TtsProvider,
@@ -79,8 +80,10 @@ export interface VoiceCatalog {
   known(provider: TtsProvider, apiKey: string | undefined, id: string): VoiceStatus | undefined;
   /** The choice's names, as lookup finds its voice. */
   details(choice: TtsChoice, apiKey: string | undefined): Promise<ChoiceDetails>;
-  /** Loads the name listings of the providers with a key, in the background. */
+  /** Loads the name listings of the providers with a key, in the background, and keeps them refreshed. */
   warm(keys: ProviderKeys): void;
+  /** Stops the refreshes warm scheduled. */
+  close(): void;
 }
 
 export const ELEVENLABS_VOICES_URL = 'https://api.elevenlabs.io/v2/voices';
@@ -97,6 +100,10 @@ const NAMES_RETRY_MS = 30_000;
 const CONFIRM_FRESH_MS = 10_000;
 /** How long a lookup waits on the provider. */
 const LOOKUP_WAIT_MS = 3_000;
+/** How often warmed listings are checked for a refresh that is due. */
+const REFRESH_CHECK_MS = 300_000;
+/** A listing this old (its refreshes never ran) no longer proves a voice it lacks is gone. */
+const ABSENCE_TTL_MS = 2 * NAMES_TTL_MS;
 /** How long an answer about one voice is kept, by what it was. */
 const VOICE_TTL_MS: Record<VoiceStatus, number> = {
   resolved: 3_600_000,
@@ -107,6 +114,8 @@ const NAMES_PAGE_SIZE: Record<TtsProvider, number> = { gemini: 1000, elevenlabs:
 const MAX_NAMES_PAGES = 20;
 const MAX_KEPT_VOICES = 500;
 const MAX_ACCOUNTS = 8;
+/** Lazy Gemini listings kept: one per key and language, and each key's whole one. */
+const MAX_LAZY_LISTINGS = 32;
 
 /**
  * The language Gemini lists a voice under: its id's locale prefix (`en-us-techagent-4`: en-US), or en-US
@@ -117,9 +126,29 @@ const geminiLanguage = (id: string): string => {
   return locale ? `${locale[1]}-${locale[2].toUpperCase()}` : 'en-US';
 };
 
+/** A voice id the provider could not have, by the registry's shape check alone. */
+const malformed = (provider: TtsProvider, id: string): boolean => {
+  const entry = TTS_REGISTRY[provider];
+  return entry.validate({ model: entry.defaults.model, voice: id }) !== null;
+};
+
 /** What everything kept is filed under: the provider and a digest of its key, never the key. */
 const accountOf = (provider: TtsProvider, apiKey: string): string =>
   `${provider}:${createHash('sha256').update(apiKey).digest('hex').slice(0, 16)}`;
+
+/** A failure this module describes itself; its message is safe to log. */
+class CatalogError extends Error {}
+
+/**
+ * What a log may say about a failure: its HTTP status, this module's own message, or the error's name.
+ * Never a provider's message: the SDK puts the upstream body there, which can echo the key.
+ */
+const failureOf = (err: unknown): string => {
+  const status = (err as { status?: unknown } | null)?.status;
+  if (typeof status === 'number') return `HTTP ${status}`;
+  if (err instanceof CatalogError) return err.message;
+  return err instanceof Error ? err.name : 'error';
+};
 
 /** The choice's names from what a lookup found. */
 export function choiceDetails(choice: TtsChoice, found: VoiceLookup): ChoiceDetails {
@@ -173,17 +202,35 @@ function elevenLabsVoice(raw: Record<string, unknown>): VoiceRecord | null {
   });
 }
 
+/** A voice asked for by id: shared while asked, then kept by what it was. */
+interface KeptLookup {
+  at: number;
+  found: Promise<VoiceLookup>;
+  status?: VoiceStatus;
+}
+
+/** A worker's Gemini listing: shared while it loads, then kept for its hour, or a short while when it failed. */
+interface LazyListing {
+  at: number;
+  ok?: boolean;
+  voices: Promise<Map<string, VoiceRecord> | undefined>;
+}
+
 /** One provider key's names: its last whole listing and the voices asked for by id. */
 interface Names {
   voices?: Map<string, VoiceRecord>;
+  /** When the load of `voices` started: it may lack a voice made while it ran. */
   loadedAt: number;
-  /** Listings loaded so far. */
-  loads: number;
   failedAt: number;
   /** The last load failed: what the listing lacks proves nothing until one succeeds. */
   stale: boolean;
   loading?: Promise<void>;
-  byId: Map<string, { at: number; found: Promise<VoiceLookup>; status?: VoiceStatus }>;
+  byId: Map<string, KeptLookup>;
+  /**
+   * Ids a save could not confirm missing, by when it asked: the listing lacking one proves nothing
+   * until a load started after that succeeds.
+   */
+  doubted: Map<string, number>;
 }
 
 export function createVoiceCatalog(
@@ -203,11 +250,11 @@ export function createVoiceCatalog(
     const res = await fetchFn(url, { headers, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
     if (!res.ok) {
       await res.body?.cancel().catch(() => undefined);
-      throw new Error(`HTTP ${res.status}`);
+      throw new CatalogError(`HTTP ${res.status}`);
     }
     const body: unknown = await res.json();
     if (!body || typeof body !== 'object' || !Array.isArray((body as { voices?: unknown }).voices)) {
-      throw new Error('no voices list');
+      throw new CatalogError('no voices list');
     }
     return body as Record<string, unknown>;
   };
@@ -271,13 +318,14 @@ export function createVoiceCatalog(
   };
 
   const fetchPage = async (provider: TtsProvider, apiKey: string, query: CatalogQuery): Promise<RecordResult> => {
+    const started = now();
     try {
       return await (provider === 'gemini' ? geminiPage(apiKey, query) : elevenLabsPage(apiKey, query));
     } catch (err) {
-      // The message names a status, a parse failure or the provider's error body; never the key or headers.
       log.warn('voice-mode: the voice catalog upstream failed', {
         provider,
-        err: err instanceof Error ? err.message : String(err),
+        failure: failureOf(err),
+        ms: now() - started,
       });
       return { error: 'upstream' };
     }
@@ -290,35 +338,33 @@ export function createVoiceCatalog(
 
   const pages = new Map<string, { at: number; result: Promise<CatalogResult> }>();
   const accounts = new Map<string, Names>();
-  /** Lazy Gemini lookups: one language's voices by id, or undefined when the listing failed. */
-  const languages = new Map<string, Promise<Map<string, VoiceRecord> | undefined>>();
 
   const namesOf = (provider: TtsProvider, apiKey: string, create = true): Names | undefined => {
     const account = accountOf(provider, apiKey);
     let names = accounts.get(account);
     if (!names && create) {
       makeRoom(accounts, MAX_ACCOUNTS);
-      names = { loadedAt: 0, loads: 0, failedAt: -Infinity, stale: false, byId: new Map() };
+      names = { loadedAt: 0, failedAt: -Infinity, stale: false, byId: new Map(), doubted: new Map() };
       accounts.set(account, names);
     }
     return names;
   };
 
-  /** Every page of the listing, or a throw: a listing cut short is no listing. */
-  const loadAll = async (provider: TtsProvider, apiKey: string): Promise<VoiceRecord[]> => {
+  /** Every page of the listing (of one language's voices, given one), or a throw: a listing cut short is no listing. */
+  const loadAll = async (provider: TtsProvider, apiKey: string, language?: string): Promise<VoiceRecord[]> => {
     const all: VoiceRecord[] = [];
     const seen = new Set<string>();
     let cursor: string | undefined;
     for (let n = 0; n < MAX_NAMES_PAGES; n++) {
-      const result = await fetchPage(provider, apiKey, { limit: NAMES_PAGE_SIZE[provider], cursor });
-      if ('error' in result) throw new Error(result.error);
+      const result = await fetchPage(provider, apiKey, { limit: NAMES_PAGE_SIZE[provider], language, cursor });
+      if ('error' in result) throw new CatalogError(result.error);
       all.push(...result.page.voices);
       cursor = result.page.next;
       if (!cursor) return all;
-      if (seen.has(cursor)) throw new Error('the listing repeated a page token');
+      if (seen.has(cursor)) throw new CatalogError('the listing repeated a page token');
       seen.add(cursor);
     }
-    throw new Error('the listing has too many pages');
+    throw new CatalogError('the listing has too many pages');
   };
 
   /**
@@ -334,9 +380,9 @@ export function createVoiceCatalog(
       .then(
         (voices) => {
           names.voices = new Map(voices.map((v) => [v.id, v]));
-          names.loadedAt = now();
-          names.loads++;
+          names.loadedAt = started;
           names.stale = false;
+          for (const [id, asked] of names.doubted) if (asked <= started) names.doubted.delete(id);
           log.info('voice-mode: voice names loaded', { provider, voices: voices.length, ms: now() - started });
         },
         (err: unknown) => {
@@ -344,8 +390,8 @@ export function createVoiceCatalog(
           names.stale = true;
           log.warn('voice-mode: loading the voice names failed', {
             provider,
+            failure: failureOf(err),
             ms: now() - started,
-            err: err instanceof Error ? err.message : String(err),
           });
         },
       )
@@ -388,19 +434,19 @@ export function createVoiceCatalog(
     return found;
   };
 
+  /** The status a kept by-id answer still stands for, or undefined once it is past its while (or still asked). */
+  const keptStatus = (kept: KeptLookup | undefined): VoiceStatus | undefined =>
+    kept?.status && now() - kept.at < VOICE_TTL_MS[kept.status] ? kept.status : undefined;
+
   /** An ElevenLabs voice by id, shared while asked and kept by what it was; `confirm` asks again unless it was found. */
   const elevenLabsKept = (names: Names, apiKey: string, id: string, confirm: boolean): Promise<VoiceLookup> => {
     const kept = names.byId.get(id);
     if (kept && !kept.status) return kept.found;
-    if (kept?.status && now() - kept.at < VOICE_TTL_MS[kept.status] && !(confirm && kept.status !== 'resolved')) {
-      return kept.found;
-    }
+    const status = keptStatus(kept);
+    if (kept && status && !(confirm && status !== 'resolved')) return kept.found;
     names.byId.delete(id);
     makeRoom(names.byId, MAX_KEPT_VOICES);
-    const entry: { at: number; found: Promise<VoiceLookup>; status?: VoiceStatus } = {
-      at: now(),
-      found: elevenLabsById(apiKey, id),
-    };
+    const entry: KeptLookup = { at: now(), found: elevenLabsById(apiKey, id) };
     void entry.found.then((r) => {
       entry.status = r.status;
       entry.at = now();
@@ -409,44 +455,73 @@ export function createVoiceCatalog(
     return entry.found;
   };
 
-  const lazyGemini = async (apiKey: string, id: string): Promise<VoiceLookup> => {
-    const key = `${accountOf('gemini', apiKey)}:${geminiLanguage(id)}`;
-    let listed = languages.get(key);
-    if (!listed) {
-      const loading = fetchPage('gemini', apiKey, { limit: NAMES_PAGE_SIZE.gemini, language: geminiLanguage(id) }).then(
-        (r) => ('page' in r ? new Map(r.page.voices.map((v) => [v.id, v])) : undefined),
-      );
-      makeRoom(languages, MAX_CACHED_PAGES);
-      languages.set(key, (listed = loading));
-      void loading.then((voices) => voices || languages.get(key) !== loading || languages.delete(key));
-    }
-    const voice = (await listed)?.get(id);
-    // One language's voices prove nothing about a voice missing from them.
-    return voice ? { status: 'resolved', voice } : { status: 'lookup_failed' };
+  /** Lazy Gemini listings by key and language (none: the whole listing). */
+  const listings = new Map<string, LazyListing>();
+
+  const lazyListing = (apiKey: string, language?: string): Promise<Map<string, VoiceRecord> | undefined> => {
+    const key = `${accountOf('gemini', apiKey)}:${language ?? ''}`;
+    const kept = listings.get(key);
+    const ttl = kept?.ok ? NAMES_TTL_MS : VOICE_TTL_MS.lookup_failed;
+    if (kept && (kept.ok === undefined || now() - kept.at < ttl)) return kept.voices;
+    listings.delete(key);
+    makeRoom(listings, MAX_LAZY_LISTINGS);
+    const entry: LazyListing = {
+      at: now(),
+      voices: loadAll('gemini', apiKey, language).then(
+        (voices) => new Map(voices.map((v) => [v.id, v])),
+        () => undefined,
+      ),
+    };
+    void entry.voices.then((voices) => {
+      entry.ok = voices !== undefined;
+      entry.at = now();
+    });
+    listings.set(key, entry);
+    return entry.voices;
   };
+
+  /** The language its id names first, then, since an id's prefix proves nothing, the whole listing. */
+  const lazyGemini = async (apiKey: string, id: string): Promise<VoiceLookup> => {
+    const voice = (await lazyListing(apiKey, geminiLanguage(id)))?.get(id);
+    if (voice) return { status: 'resolved', voice };
+    const all = await lazyListing(apiKey);
+    const listed = all?.get(id);
+    if (listed) return { status: 'resolved', voice: listed };
+    return { status: all ? 'unavailable' : 'lookup_failed' };
+  };
+
+  /** Whether the listing proves a voice it lacks is gone: whole, fresh, and no save left the id in doubt. */
+  const provesAbsent = (names: Names, id: string): boolean =>
+    !!names.voices && !names.stale && now() - names.loadedAt < ABSENCE_TTL_MS && !names.doubted.has(id);
 
   const lookup: VoiceCatalog['lookup'] = async (provider, apiKey, id, { confirm = false } = {}) => {
     if (!apiKey) return { status: 'lookup_failed' };
-    const entry = TTS_REGISTRY[provider];
-    if (entry.validate({ model: entry.defaults.model, voice: id }) !== null) return { status: 'unavailable' };
+    if (malformed(provider, id)) return { status: 'unavailable' };
+    if (options.lazy && provider === 'gemini') return lazyGemini(apiKey, id);
     const names = namesOf(provider, apiKey)!;
-    if (options.lazy)
-      return provider === 'gemini' ? lazyGemini(apiKey, id) : elevenLabsKept(names, apiKey, id, confirm);
+    if (options.lazy) return elevenLabsKept(names, apiKey, id, confirm);
+    const asked = now();
     const loading = refresh(names, provider, apiKey);
     if (!names.voices) await within(loading);
     let listed = names.voices?.get(id);
     if (!listed && provider === 'elevenlabs') return elevenLabsKept(names, apiKey, id, confirm);
-    if (!listed && names.voices && !names.stale && confirm && now() - names.loadedAt >= CONFIRM_FRESH_MS) {
+    if (!listed && confirm && names.voices && !names.stale && asked - names.loadedAt >= CONFIRM_FRESH_MS) {
       // A voice made since the listing loaded gets one more load before a save is refused.
-      const loads = names.loads;
       await within(refresh(names, provider, apiKey, true));
-      if (names.loads === loads) return { status: 'lookup_failed' };
-      listed = names.voices.get(id);
+      listed = names.voices?.get(id);
+      if (!listed && names.loadedAt < asked) {
+        // No load since the save asked: the save goes through, and nothing says the voice is gone until one does.
+        makeRoom(names.doubted, MAX_KEPT_VOICES);
+        names.doubted.set(id, asked);
+        return { status: 'lookup_failed' };
+      }
     }
     if (listed) return { status: 'resolved', voice: listed };
     // Gemini's listing holds the caller's own voices too, and its get covers only those.
-    return { status: names.voices && !names.stale ? 'unavailable' : 'lookup_failed' };
+    return { status: provesAbsent(names, id) ? 'unavailable' : 'lookup_failed' };
   };
+
+  let refreshing: ReturnType<typeof setInterval> | undefined;
 
   return {
     async page(provider, apiKey, query) {
@@ -474,20 +549,28 @@ export function createVoiceCatalog(
     lookup,
     known(provider, apiKey, id) {
       if (!apiKey || options.lazy) return undefined;
-      const entry = TTS_REGISTRY[provider];
-      if (entry.validate({ model: entry.defaults.model, voice: id }) !== null) return 'unavailable';
+      if (malformed(provider, id)) return 'unavailable';
       const names = namesOf(provider, apiKey, false);
       if (!names) return undefined;
       if (names.voices?.has(id)) return 'resolved';
-      if (provider === 'gemini') return names.voices && !names.stale ? 'unavailable' : undefined;
-      const kept = names.byId.get(id);
-      return kept?.status && now() - kept.at < VOICE_TTL_MS[kept.status] ? kept.status : undefined;
+      if (provider === 'gemini') return provesAbsent(names, id) ? 'unavailable' : undefined;
+      return keptStatus(names.byId.get(id));
     },
     details: async (choice, apiKey) => choiceDetails(choice, await lookup(choice.provider, apiKey, choice.voice)),
     warm(keys) {
-      for (const [provider, apiKey] of Object.entries(keys) as Array<[TtsProvider, string | undefined]>) {
-        if (apiKey) void refresh(namesOf(provider, apiKey)!, provider, apiKey);
-      }
+      const load = () => {
+        for (const [provider, apiKey] of Object.entries(keys) as Array<[TtsProvider, string | undefined]>) {
+          if (apiKey) void refresh(namesOf(provider, apiKey)!, provider, apiKey);
+        }
+      };
+      load();
+      clearInterval(refreshing);
+      refreshing = setInterval(load, REFRESH_CHECK_MS);
+      refreshing.unref();
+    },
+    close() {
+      clearInterval(refreshing);
+      refreshing = undefined;
     },
   };
 }

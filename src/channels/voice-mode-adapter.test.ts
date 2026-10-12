@@ -533,6 +533,29 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     expect(doubtful.details.effective.status).toBe('lookup_failed');
   });
 
+  it('resets nothing when the role is revoked while the body is on its way', async () => {
+    await getDb().run("UPDATE voice_mode_lines SET tts_voice = 'achernar'");
+    const encode = (s: string) => new TextEncoder().encode(s);
+    const res = await fetch(`${base}/tts?t=${token}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: new ReadableStream({
+        async start(stream) {
+          stream.enqueue(encode('{"reset":'));
+          // Long enough for the route to pass its token and role checks and wait on the rest.
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await revokeRole(OWNER, 'admin', 'ag-1');
+          stream.enqueue(encode('true}'));
+          stream.close();
+        },
+      }),
+      duplex: 'half',
+    } as RequestInit);
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe('Caller access denied or voice line is not set up');
+    expect(await getDb().get('SELECT tts_voice FROM voice_mode_lines')).toEqual({ tts_voice: 'achernar' });
+  });
+
   it('saves nothing when the link is re-minted while the body is on its way', async () => {
     const encode = (s: string) => new TextEncoder().encode(s);
     const res = await fetch(`${base}/tts?t=${token}`, {

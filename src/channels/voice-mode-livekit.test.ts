@@ -689,6 +689,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
         throw new Error('not asked');
       },
       warm: () => undefined,
+      close: () => undefined,
     };
     h = await startHarness({
       providerKeys: { gemini: 'gk', elevenlabs: 'ek' },
