@@ -19,6 +19,7 @@
     "@deltachat/stdio-rpc-server": "2.49.0",
     "@firecrawl/anydoc": "0.1.6",
     "@getdial/cli": "0.37.0",
+    "@google/genai": "2.24.0",
     "@grpc/grpc-js": "1.14.5",
     "@grpc/proto-loader": "0.8.1",
     "@livekit/agents": "1.9.2",
@@ -132,6 +133,12 @@
       "sources": [
         ".claude/skills/add-dial-tool/SKILL.md nc:run",
         ".claude/skills/add-dial-tool/SKILL.md nc:json-merge"
+      ]
+    },
+    "@google/genai": {
+      "version": "2.24.0",
+      "sources": [
+        ".claude/skills/add-voice-mode/SKILL.md nc:dep"
       ]
     },
     "@grpc/grpc-js": {

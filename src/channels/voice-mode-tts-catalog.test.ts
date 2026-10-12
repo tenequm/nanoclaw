@@ -1,108 +1,100 @@
 /**
- * The voice catalog against faked provider listings: how Gemini's full list is cached and paged
- * locally, and how ElevenLabs pages are proxied. The routes over it are in voice-mode-adapter.test.ts.
+ * The voice catalog against faked provider listings: Gemini's through the real `@google/genai`
+ * client over the fetch seam, ElevenLabs' proxied directly. The routes over it are in
+ * voice-mode-adapter.test.ts.
  */
 import { describe, expect, it } from 'vitest';
 
 import { createVoiceCatalog, ELEVENLABS_VOICES_URL } from './voice-mode-tts-catalog.js';
 
-const cursor = (offset: number) => Buffer.from(JSON.stringify({ o: offset })).toString('base64url');
+const GEMINI_VOICES_URL = 'https://generativelanguage.googleapis.com/v1beta/voices';
 
 function fakeUpstream(respond: (url: URL) => Response | Promise<Response>) {
-  const urls: URL[] = [];
-  const fetchFn = (async (input: string | URL | Request) => {
-    const url = new URL(String(input));
-    urls.push(url);
+  const calls: Array<{ url: URL; headers: Headers }> = [];
+  const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const url = new URL(request.url);
+    calls.push({ url, headers: request.headers });
     return respond(url);
   }) as typeof fetch;
-  return { urls, fetchFn };
+  return { calls, urls: () => calls.map((c) => c.url), fetchFn };
 }
 
 describe('voice catalog', () => {
-  it("keeps Gemini's list for an hour, shares one fetch between requests, then fetches it again", async () => {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => (release = resolve));
-    const { urls, fetchFn } = fakeUpstream(async () => {
-      await gate;
-      return Response.json({ voices: [{ id: 'kore', display_name: 'Kore', language_code: 'en-US' }] });
-    });
-    const clock = { now: 0 };
-    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => clock.now });
-    const pending = [1, 2].map(() => catalog.page('gemini', 'key', { limit: 10 }));
-    release();
-    for (const result of await Promise.all(pending)) {
-      expect(result).toEqual({
-        page: { provider: 'gemini', voices: [{ id: 'kore', name: 'Kore', language: 'en-US' }] },
-      });
-    }
-    clock.now = 3_599_999;
-    await catalog.page('gemini', 'key', { limit: 10 });
-    expect(urls).toHaveLength(1);
-    expect(urls[0].searchParams.get('pageSize')).toBe('1000');
-    clock.now = 3_600_000;
-    await catalog.page('gemini', 'key', { limit: 10 });
-    expect(urls).toHaveLength(2);
-  });
-
-  it('joins the persona and description, and pages past the filters with an offset cursor', async () => {
-    const voices = [
-      { id: 'a', display_name: 'Alpha', language_code: 'en-GB', persona: 'Narrator' },
-      { id: 'b', display_name: 'Beta', language_code: 'en-US', description: 'Warm and low.' },
-      { id: 'c', display_name: 'Gamma', language_code: 'en-US', persona: 'Host', description: 'Bright.' },
-      { display_name: 'no id' },
-      { id: 'd', language_code: 'fr-FR' },
-    ];
-    const { fetchFn } = fakeUpstream(() => Response.json({ voices }));
+  it("asks Gemini's listing to filter and page itself, with the key in a header only", async () => {
+    const { calls, fetchFn } = fakeUpstream((url) =>
+      Response.json(
+        url.searchParams.get('page_token') === 'p2'
+          ? { voices: [{ id: 'c', display_name: 'Gamma', language_code: 'en-US', gender: 'female' }] }
+          : {
+              voices: [
+                {
+                  id: 'b',
+                  display_name: 'Beta',
+                  language_code: 'en-US',
+                  gender: 'female',
+                  persona: 'Host',
+                  description: 'Warm and low.',
+                },
+                { display_name: 'no id' },
+                { id: 'd', gender: 'female' },
+              ],
+              next_page_token: 'p2',
+            },
+      ),
+    );
     const catalog = createVoiceCatalog({ fetch: fetchFn });
-    expect(await catalog.page('gemini', 'key', { limit: 1, language: 'en-us' })).toEqual({
+    const query = { limit: 2, q: 'warm', language: 'en-US', gender: 'female' };
+    expect(await catalog.page('gemini', 'gemini-key', query)).toEqual({
       page: {
         provider: 'gemini',
-        voices: [{ id: 'b', name: 'Beta', language: 'en-US', description: 'Warm and low.' }],
-        next: cursor(1),
+        voices: [
+          { id: 'b', name: 'Beta', language: 'en-US', gender: 'female', description: 'Host. Warm and low.' },
+          { id: 'd', name: 'd', gender: 'female' },
+        ],
+        next: 'p2',
       },
     });
-    expect(await catalog.page('gemini', 'key', { limit: 1, language: 'en-us', cursor: cursor(1) })).toEqual({
-      page: {
-        provider: 'gemini',
-        voices: [{ id: 'c', name: 'Gamma', language: 'en-US', description: 'Host. Bright.' }],
-      },
+    expect(await catalog.page('gemini', 'gemini-key', { ...query, cursor: 'p2' })).toEqual({
+      page: { provider: 'gemini', voices: [{ id: 'c', name: 'Gamma', language: 'en-US', gender: 'female' }] },
     });
-    const byText = await catalog.page('gemini', 'key', { limit: 10, q: 'narr' });
-    expect(byText).toEqual({
-      page: { provider: 'gemini', voices: [{ id: 'a', name: 'Alpha', language: 'en-GB', description: 'Narrator' }] },
-    });
-    expect(await catalog.page('gemini', 'key', { limit: 10, q: 'D' })).toMatchObject({
-      page: { voices: [{ id: 'b' }, { id: 'd', name: 'd' }] },
-    });
-    for (const bad of ['%%%', cursor(-1), Buffer.from('{"o":1.5}').toString('base64url'), 'bnVsbA']) {
-      expect(await catalog.page('gemini', 'key', { limit: 1, cursor: bad })).toEqual({ error: 'bad_request' });
-    }
+    expect(calls[0].url.origin + calls[0].url.pathname).toBe(GEMINI_VOICES_URL);
+    expect(calls.map((c) => Object.fromEntries(c.url.searchParams))).toEqual([
+      { page_size: '2', search: 'warm', language_code: 'en-US', gender: 'female' },
+      { page_size: '2', search: 'warm', language_code: 'en-US', gender: 'female', page_token: 'p2' },
+    ]);
+    expect(calls.every((c) => c.headers.get('x-goog-api-key') === 'gemini-key')).toBe(true);
+    expect(calls.every((c) => !c.url.href.includes('gemini-key'))).toBe(true);
   });
 
-  it('answers upstream for a failed, malformed or endless Gemini listing, and keeps none of them', async () => {
+  it('sends Gemini only the page size when nothing else is asked, and takes a page without voices as empty', async () => {
+    const { urls, fetchFn } = fakeUpstream(() => Response.json({}));
+    expect(await createVoiceCatalog({ fetch: fetchFn }).page('gemini', 'key', { limit: 5 })).toEqual({
+      page: { provider: 'gemini', voices: [] },
+    });
+    expect(Object.fromEntries(urls()[0].searchParams)).toEqual({ page_size: '5' });
+  });
+
+  it('answers bad_request for a cursor Gemini refuses, and upstream for any other failure, asking once', async () => {
+    const invalid = () =>
+      Response.json({ error: { code: 400, message: 'bad token', status: 'INVALID_ARGUMENT' } }, { status: 400 });
+    const refused = fakeUpstream(invalid);
+    const catalog = createVoiceCatalog({ fetch: refused.fetchFn });
+    expect(await catalog.page('gemini', 'key', { limit: 1, cursor: 'nope' })).toEqual({ error: 'bad_request' });
+    expect(await catalog.page('gemini', 'key', { limit: 1 })).toEqual({ error: 'upstream' });
     const replies = [
-      new Response('denied', { status: 403 }),
-      Response.json({ error: 'shape' }),
+      () => new Response('denied', { status: 403 }),
+      () => new Response('', { status: 503 }),
+      () => new Response('<html>', { status: 200, headers: { 'content-type': 'text/html' } }),
       () => Promise.reject(new Error('socket hang up')),
     ];
-    for (const r of replies) {
-      const { fetchFn } = fakeUpstream(() => (typeof r === 'function' ? r() : r));
-      expect(await createVoiceCatalog({ fetch: fetchFn }).page('gemini', 'key', { limit: 1 })).toEqual({
-        error: 'upstream',
-      });
+    for (const reply of replies) {
+      const upstream = fakeUpstream(reply);
+      expect(
+        await createVoiceCatalog({ fetch: upstream.fetchFn }).page('gemini', 'key', { limit: 1, cursor: 'p2' }),
+      ).toEqual({ error: 'upstream' });
+      expect(upstream.calls).toHaveLength(1);
     }
-    const endless = fakeUpstream(() => Response.json({ voices: [], next_page_token: 'again' }));
-    expect(await createVoiceCatalog({ fetch: endless.fetchFn }).page('gemini', 'key', { limit: 1 })).toEqual({
-      error: 'upstream',
-    });
-    expect(endless.urls).toHaveLength(50);
-    let calls = 0;
-    const flaky = fakeUpstream(() =>
-      ++calls === 1 ? new Response('', { status: 503 }) : Response.json({ voices: [] }),
-    );
-    const catalog = createVoiceCatalog({ fetch: flaky.fetchFn });
-    expect(await catalog.page('gemini', 'key', { limit: 1 })).toEqual({ error: 'upstream' });
-    expect(await catalog.page('gemini', 'key', { limit: 1 })).toEqual({ page: { provider: 'gemini', voices: [] } });
   });
 
   it('proxies an ElevenLabs page, sending only the parameters given and passing its token on', async () => {
@@ -113,14 +105,31 @@ describe('voice catalog', () => {
         next_page_token: 'page-2',
       }),
     );
-    expect(await createVoiceCatalog({ fetch: fetchFn }).page('elevenlabs', 'key', { limit: 5 })).toEqual({
+    const catalog = createVoiceCatalog({ fetch: fetchFn });
+    expect(await catalog.page('elevenlabs', 'key', { limit: 5 })).toEqual({
       page: {
         provider: 'elevenlabs',
         voices: [{ id: 'abcdefghij1234567890', name: 'Rachel', description: 'Calm.' }],
         next: 'page-2',
       },
     });
-    expect(urls[0].origin + urls[0].pathname).toBe(ELEVENLABS_VOICES_URL);
-    expect(Object.fromEntries(urls[0].searchParams)).toEqual({ page_size: '5', include_total_count: 'false' });
+    expect(urls()[0].origin + urls()[0].pathname).toBe(ELEVENLABS_VOICES_URL);
+    expect(Object.fromEntries(urls()[0].searchParams)).toEqual({ page_size: '5', include_total_count: 'false' });
+    await catalog.page('elevenlabs', 'key', { limit: 5, gender: 'male', cursor: 'page-2' });
+    expect(Object.fromEntries(urls()[1].searchParams)).toEqual({
+      page_size: '5',
+      gender: 'male',
+      next_page_token: 'page-2',
+      include_total_count: 'false',
+    });
+  });
+
+  it('answers upstream for a failed or malformed ElevenLabs page', async () => {
+    for (const reply of [() => new Response('denied', { status: 401 }), () => Response.json({ error: 'shape' })]) {
+      const { fetchFn } = fakeUpstream(reply);
+      expect(await createVoiceCatalog({ fetch: fetchFn }).page('elevenlabs', 'key', { limit: 1 })).toEqual({
+        error: 'upstream',
+      });
+    }
   });
 });

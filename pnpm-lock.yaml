@@ -17,6 +17,9 @@ importers:
       '@clack/prompts':
         specifier: ^1.2.0
         version: 1.2.0
+      '@google/genai':
+        specifier: 2.24.0
+        version: 2.24.0
       '@grammyjs/auto-retry':
         specifier: 2.0.2
         version: 2.0.2(grammy@1.46.0)

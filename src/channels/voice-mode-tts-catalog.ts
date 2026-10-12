@@ -1,9 +1,12 @@
 /**
- * The voices a line can pick, per provider, for `GET /voice/voices` (voice-mode.ts). Gemini's
- * `voices.list` has no server-side filter, so its whole list is fetched once an hour and paged and
- * filtered here; ElevenLabs' `/v2/voices` filters and pages itself, so each page is proxied. The
- * provider keys stay in request headers: no answer or log line carries them.
+ * The voices a line can pick, per provider, for `GET /voice/voices` (voice-mode.ts). Both providers
+ * filter and page their own listings, so each page is a proxied request: Gemini's `voices.list`
+ * through `@google/genai`, ElevenLabs' `/v2/voices` directly (the plugin's `listVoices()` reads the
+ * legacy v1 listing, without filters, labels or samples). The provider keys stay in request headers:
+ * no answer or log line carries them.
  */
+import { GoogleGenAI } from '@google/genai';
+
 import { log } from '../log.js';
 import type { TtsProvider } from '../voice-mode-tts.js';
 
@@ -26,6 +29,8 @@ export interface VoiceCatalogPage {
 export interface CatalogQuery {
   q?: string;
   language?: string;
+  /** Lowercase `female`, `male` or `neutral`. */
+  gender?: string;
   cursor?: string;
   limit: number;
 }
@@ -35,13 +40,7 @@ export interface VoiceCatalog {
   page(provider: TtsProvider, apiKey: string, query: CatalogQuery): Promise<CatalogResult>;
 }
 
-export const GEMINI_VOICES_URL = 'https://generativelanguage.googleapis.com/v1beta/voices';
 export const ELEVENLABS_VOICES_URL = 'https://api.elevenlabs.io/v2/voices';
-const GEMINI_CACHE_MS = 3_600_000;
-/** The listing's largest page; 2,089 voices took 3 pages on 2026-10-09 (21 at the default size). */
-const GEMINI_PAGE_SIZE = 1000;
-/** Headroom for a listing that grows or a page size the API caps lower. */
-const GEMINI_MAX_PAGES = 50;
 const UPSTREAM_TIMEOUT_MS = 15_000;
 
 const text = (value: unknown): string | undefined =>
@@ -78,25 +77,8 @@ function elevenLabsVoice(raw: Record<string, unknown>): CatalogVoice | null {
   });
 }
 
-const encodeOffset = (offset: number): string => Buffer.from(JSON.stringify({ o: offset })).toString('base64url');
-
-function decodeOffset(cursor: string): number | null {
-  try {
-    const parsed: unknown = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
-    const o = (parsed as { o?: unknown } | null)?.o;
-    return Number.isSafeInteger(o) && (o as number) >= 0 ? (o as number) : null;
-  } catch {
-    return null;
-  }
-}
-
-export function createVoiceCatalog(
-  options: { fetch?: typeof fetch; now?: () => number; cacheMs?: number } = {},
-): VoiceCatalog {
+export function createVoiceCatalog(options: { fetch?: typeof fetch } = {}): VoiceCatalog {
   const fetchFn = options.fetch ?? fetch;
-  const now = options.now ?? (() => Date.now());
-  const cacheMs = options.cacheMs ?? GEMINI_CACHE_MS;
-  let gemini: { at: number; voices: Promise<CatalogVoice[]> } | null = null;
 
   const getJson = async (url: URL, headers: Record<string, string>): Promise<Record<string, unknown>> => {
     const res = await fetchFn(url, { headers, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
@@ -114,48 +96,32 @@ export function createVoiceCatalog(
   const records = (body: Record<string, unknown>): Record<string, unknown>[] =>
     (body.voices as unknown[]).filter((v): v is Record<string, unknown> => !!v && typeof v === 'object');
 
-  const fetchGemini = async (apiKey: string): Promise<CatalogVoice[]> => {
-    const voices: CatalogVoice[] = [];
-    let pageToken: string | undefined;
-    for (let pages = 0; pages < GEMINI_MAX_PAGES; pages++) {
-      const url = new URL(GEMINI_VOICES_URL);
-      url.searchParams.set('pageSize', String(GEMINI_PAGE_SIZE));
-      if (pageToken) url.searchParams.set('pageToken', pageToken);
-      const body = await getJson(url, { 'x-goog-api-key': apiKey });
-      for (const raw of records(body)) {
-        const v = geminiVoice(raw);
-        if (v) voices.push(v);
-      }
-      pageToken = text(body.next_page_token);
-      if (!pageToken) return voices;
-    }
-    throw new Error(`more than ${GEMINI_MAX_PAGES} pages`);
-  };
-
-  /** The cached list; one fetch serves every request while it runs, and a failed one is not kept. */
-  const geminiVoices = (apiKey: string): Promise<CatalogVoice[]> => {
-    if (gemini && now() - gemini.at < cacheMs) return gemini.voices;
-    const entry = { at: now(), voices: fetchGemini(apiKey) };
-    gemini = entry;
-    entry.voices.catch(() => {
-      if (gemini === entry) gemini = null;
-    });
-    return entry.voices;
-  };
-
   const geminiPage = async (apiKey: string, query: CatalogQuery): Promise<CatalogResult> => {
-    const offset = query.cursor === undefined ? 0 : decodeOffset(query.cursor);
-    if (offset === null) return { error: 'bad_request' };
-    const q = query.q?.toLowerCase();
-    const language = query.language?.toLowerCase();
-    const matches = (await geminiVoices(apiKey)).filter(
-      (v) =>
-        (!language || v.language?.toLowerCase() === language) &&
-        (!q || [v.name, v.id, v.description ?? ''].some((f) => f.toLowerCase().includes(q))),
-    );
-    const end = offset + query.limit;
-    const page: VoiceCatalogPage = { provider: 'gemini', voices: matches.slice(offset, end) };
-    if (end < matches.length) page.next = encodeOffset(end);
+    // Pinned off: GOOGLE_GENAI_USE_VERTEXAI in the host's environment would route the request to Vertex AI.
+    const ai = new GoogleGenAI({ apiKey, vertexai: false, httpOptions: { fetch: fetchFn } });
+    let body: Awaited<ReturnType<typeof ai.voices.list>>;
+    try {
+      body = await ai.voices.list(
+        {
+          page_size: query.limit,
+          search: query.q,
+          language_code: query.language ? [query.language] : undefined,
+          gender: query.gender ? [query.gender] : undefined,
+          page_token: query.cursor,
+        },
+        { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS), retries: { strategy: 'none' } },
+      );
+    } catch (err) {
+      // A token that is not Gemini's, or one from a listing with other filters.
+      if (query.cursor && (err as { status?: unknown }).status === 400) return { error: 'bad_request' };
+      throw err;
+    }
+    const page: VoiceCatalogPage = {
+      provider: 'gemini',
+      voices: (body.voices ?? []).map(geminiVoice).filter((v): v is CatalogVoice => v !== null),
+    };
+    const next = text(body.next_page_token);
+    if (next) page.next = next;
     return { page };
   };
 
@@ -164,6 +130,7 @@ export function createVoiceCatalog(
     url.searchParams.set('page_size', String(query.limit));
     if (query.q) url.searchParams.set('search', query.q);
     if (query.language) url.searchParams.set('language', query.language);
+    if (query.gender) url.searchParams.set('gender', query.gender);
     if (query.cursor) url.searchParams.set('next_page_token', query.cursor);
     url.searchParams.set('include_total_count', 'false');
     const body = await getJson(url, { 'xi-api-key': apiKey });
@@ -183,7 +150,7 @@ export function createVoiceCatalog(
       try {
         return await (provider === 'gemini' ? geminiPage(apiKey, query) : elevenLabsPage(apiKey, query));
       } catch (err) {
-        // The message names a status or a parse failure, never the key or the request headers.
+        // The message names a status, a parse failure or the provider's error body; never the key or headers.
         log.warn('voice-mode: the voice catalog upstream failed', {
           provider,
           err: err instanceof Error ? err.message : String(err),

@@ -120,6 +120,7 @@ lacks them, install the exact versions. Do not bypass its package release-age
 or approved build-script policies.
 
 ```nc:dep
+@google/genai@2.24.0
 @livekit/agents@1.9.2
 @livekit/agents-plugin-elevenlabs@1.9.2
 @livekit/agents-plugin-google@1.9.2
@@ -338,9 +339,11 @@ provider with its models, defaults and whether its key is set.
 (`model` optional) or `{"reset":true}` saves it for the line's next calls; it
 needs the line's caller to still hold an owner or admin role, and a provider
 without its key answers 503. `GET /voice/voices?t=<token>&provider=gemini`
-(or `elevenlabs`, with optional `q`, `language`, `cursor` and `limit` up to
-100) pages the provider's voices: Gemini's list is cached on the host for an
-hour and filtered there, ElevenLabs pages are proxied. A running call keeps its
+(or `elevenlabs`, with optional `q`, `language`, `gender` (`female`, `male` or
+`neutral`), `cursor` and `limit` up to 100) pages the provider's voices: each
+page is the provider's own filtered listing (Gemini `voices.list` through
+`@google/genai`, ElevenLabs `/v2/voices`), and `cursor` is its page token. Gemini
+matches `q` against a voice's name and description. A running call keeps its
 voice; a client switches it mid-call through the worker's `settings` RPC.
 Provider keys never leave the host and worker.
 
