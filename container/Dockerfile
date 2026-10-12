@@ -148,10 +148,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # ---- DuckDB CLI: the v2.0 preview ---------------------------------------------
 # Pinned by staging path: the duckdb.org preview links are rebuilt in place. Same
 # build as the infra flake's nix/pkgs/duckdb.nix; bump both together.
-ARG DUCKDB_STAGED=df47ba32d9/v2.0.0-alpha44738
+ARG DUCKDB_STAGED=b15358c371/v2.0.0-alpha46057
 RUN ARCH=$(dpkg --print-architecture) && case "$ARCH" in \
-      arm64) DUCKDB_DIST=linux-arm64; DUCKDB_SHA256=b998a9e73844114588f6ae5fdb8759383218fa9bbd296bb0953b4b89fe7c5f9e ;; \
-      amd64) DUCKDB_DIST=linux-amd64; DUCKDB_SHA256=22fd0c3f1c01970c51e8ab0a12bbecda780c9323732f01e03c9d16f66bff47bf ;; \
+      arm64) DUCKDB_DIST=linux-arm64; DUCKDB_SHA256=0f4b9023aa587fbea969b8522bf398b9201be6bd0b5b04cfe3eae3716bdde931 ;; \
+      amd64) DUCKDB_DIST=linux-amd64; DUCKDB_SHA256=ff8f482c155f958d4a949720e678d2ba1050fbfe42c7a7086cc0ffc9e7c1c06c ;; \
       *) echo "unsupported arch: $ARCH" && exit 1 ;; \
     esac && \
     curl -fsSL -o /tmp/duckdb.tar.gz "https://duckdb-staging.duckdb.org/${DUCKDB_STAGED}/duckdb/duckdb/github_release/duckdb-cli-${DUCKDB_DIST}.tar.gz" && \
