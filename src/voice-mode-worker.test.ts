@@ -34,6 +34,9 @@ import {
   CALLER_REJOIN_MS,
   callerRejoinWaitMs,
   callLanguages,
+  type CallRecord,
+  CallRecording,
+  callRecordingOn,
   CallTurns,
   capSpokenText,
   COMMAND_SETTLE_MS,
@@ -4029,6 +4032,100 @@ describe('acoustic wake word in a call', () => {
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('caller left'));
   });
 
+  it('records no whole call unless VOICE_MODE_CALL_RECORDING is on', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-off-'));
+    try {
+      const { ctx, job, roomHandlers } = fakeJob();
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      const w = fakeWakeWord();
+      await runCall(ctx, { ...callDeps(host.fetchImpl, v, { recordingsRoot: root }), wakeWord: w.make });
+      await v.rpc('settings', { wake: true });
+      await vi.waitFor(() => expect(v.states.at(-1)?.wake).toMatchObject({ waiting: true }));
+      v.audio(3000);
+      w.events.onDetect(0.9, { start: w.pushed - 32_000, end: w.pushed });
+      roomHandlers.get('participantDisconnected')?.(HANG_UP);
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+      expect(fs.readdirSync(root)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('VOICE_MODE_CALL_RECORDING records the whole call as one WAV, waiting included, with its wake events', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-on-'));
+    try {
+      const { ctx, job, roomHandlers } = fakeJob();
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      const w = fakeWakeWord();
+      await runCall(ctx, {
+        ...callDeps(host.fetchImpl, v, {
+          env: { ...ENV, VOICE_MODE_CALL_RECORDING: 'true' },
+          recordingsRoot: root,
+        }),
+        wakeWord: w.make,
+      });
+      await v.rpc('settings', { wake: true });
+      await vi.waitFor(() => expect(v.states.at(-1)?.wake).toMatchObject({ waiting: true }));
+      // Waiting: none of this is a turn, all of it is in the recording.
+      v.audio(3000);
+      w.events.onDetect(0.9, { start: w.pushed - 32_000, end: w.pushed });
+      v.audio(1000);
+      roomHandlers.get('participantDisconnected')?.(HANG_UP);
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+
+      const base = path.join(root, 'Andy', new Date().toISOString().slice(0, 10), 'call-1-call');
+      const wav = fs.readFileSync(`${base}.wav`);
+      const samples = 16 * 4000;
+      expect(wav.length).toBe(44 + samples * 2);
+      expect(wav.toString('ascii', 0, 4)).toBe('RIFF');
+      expect(wav.readUInt32LE(4)).toBe(36 + samples * 2);
+      expect(wav.readUInt32LE(24)).toBe(16_000);
+      expect(wav.readUInt32LE(40)).toBe(samples * 2);
+      // The caller's audio as it came (the fake sends 100s), the waiting part too.
+      expect(wav.readInt16LE(44)).toBe(100);
+      expect(fs.statSync(`${base}.wav`).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(`${base}.json`).mode & 0o777).toBe(0o600);
+      const record = JSON.parse(fs.readFileSync(`${base}.json`, 'utf8')) as CallRecord;
+      expect(record).toMatchObject({
+        callId: 'call-1',
+        lineId: 'voice-mode:abc',
+        agent: 'Andy',
+        durationMs: 4000,
+        wakeModel: expect.stringMatching(/hey_livekit\.onnx$/),
+        wakeThreshold: 0.68,
+        wakes: [{ streamMs: 3000, score: 0.9 }],
+      });
+      expect(Date.parse(record.endedAt!)).toBeGreaterThanOrEqual(Date.parse(record.startedAt));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('a call whose audio could not be set up still leaves a valid, empty call recording', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-fail-'));
+    try {
+      const { ctx, job } = fakeJob();
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      await runCall(ctx, {
+        ...callDeps(host.fetchImpl, v, { env: { ...ENV, VOICE_MODE_CALL_RECORDING: '1' }, recordingsRoot: root }),
+        createVoice: vi.fn(async () => {
+          throw new Error('no room audio');
+        }),
+      });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+      const base = path.join(root, 'Andy', new Date().toISOString().slice(0, 10), 'call-1-call');
+      const wav = fs.readFileSync(`${base}.wav`);
+      expect(wav.length).toBe(44);
+      expect(wav.readUInt32LE(40)).toBe(0);
+      expect(JSON.parse(fs.readFileSync(`${base}.json`, 'utf8'))).toMatchObject({ durationMs: 0, wakes: [] });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('names the phrase while the model loads, and falls back to the transcript name when it does not', async () => {
     const { ctx } = fakeJob();
     const host = fakeHostFetch();
@@ -4039,6 +4136,92 @@ describe('acoustic wake word in a call', () => {
     w.fail(new Error('wake word model not found: x'));
     await vi.waitFor(() => expect(v.states.at(-1)?.wake).not.toHaveProperty('phrase'));
     host.endStream();
+  });
+});
+
+describe('whole-call recording', () => {
+  it('is on for VOICE_MODE_CALL_RECORDING `true` or `1` only', () => {
+    for (const value of [undefined, '', '0', 'false', 'yes', 'on']) expect(callRecordingOn(value)).toBe(false);
+    for (const value of ['1', 'true', ' true ']) expect(callRecordingOn(value)).toBe(true);
+  });
+
+  it('streams to disk and keeps the header current, so a call cut off without close still reads', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-rec-'));
+    try {
+      const warn = vi.fn();
+      const recording = new CallRecording(
+        root,
+        { callId: 'c/1', lineId: 'voice-mode:x', agent: 'Andy Bot' },
+        { warn },
+        Date.parse('2026-10-12T10:00:00Z'),
+      );
+      expect(recording.base).toBe(path.join(root, 'Andy-Bot', '2026-10-12', 'c-1-call'));
+      // 6 s in 20 ms frames: the header and the sidecar are brought up to date after 5 s.
+      for (let i = 0; i < 300; i++) {
+        if (i === 100) recording.wake({ streamMs: 2000, score: 0.9 });
+        recording.push(new Int16Array(320).fill(i));
+      }
+      const internals = recording as unknown as { chain: Promise<unknown> };
+      await internals.chain;
+      const wav = fs.readFileSync(`${recording.base}.wav`);
+      expect(wav.length).toBe(44 + 6 * 32_000);
+      expect(wav.readUInt32LE(40)).toBe(5 * 32_000);
+      expect(wav.readInt16LE(44 + 299 * 640)).toBe(299);
+      expect(JSON.parse(fs.readFileSync(`${recording.base}.json`, 'utf8'))).toMatchObject({
+        durationMs: 5000,
+        wakes: [{ streamMs: 2000, score: 0.9 }],
+      });
+      expect(JSON.parse(fs.readFileSync(`${recording.base}.json`, 'utf8')).endedAt).toBeUndefined();
+      expect(fs.statSync(path.dirname(recording.base)).mode & 0o777).toBe(0o700);
+      // On close the header covers everything, and a second close changes nothing.
+      await recording.close({ model: '/m.onnx', threshold: 0.76 });
+      await recording.close();
+      recording.push(new Int16Array(320));
+      const closed = fs.readFileSync(`${recording.base}.wav`);
+      expect(closed.length).toBe(44 + 6 * 32_000);
+      expect(closed.readUInt32LE(40)).toBe(6 * 32_000);
+      expect(JSON.parse(fs.readFileSync(`${recording.base}.json`, 'utf8'))).toMatchObject({
+        durationMs: 6000,
+        wakeModel: '/m.onnx',
+        wakeThreshold: 0.76,
+      });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('a recording that cannot be written warns once and never throws into the call', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-bad-'));
+    try {
+      // A file where the agent's directory should be.
+      fs.writeFileSync(path.join(root, 'Andy'), '');
+      const warn = vi.fn();
+      const recording = new CallRecording(root, { callId: 'c-1', lineId: 'l', agent: 'Andy' }, { warn });
+      recording.push(new Int16Array(320));
+      await recording.close();
+      recording.push(new Int16Array(320));
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith('voice-mode worker: the call recording stopped', expect.anything());
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('is pruned with the turn recordings', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-prune-'));
+    try {
+      const recording = new CallRecording(root, { callId: 'c-1', lineId: 'l', agent: 'Andy' }, { warn: vi.fn() });
+      recording.push(new Int16Array(320));
+      await recording.close();
+      const old = Date.now() / 1000 - 10 * 86_400;
+      fs.utimesSync(`${recording.base}.wav`, old, old);
+      fs.utimesSync(`${recording.base}.json`, old, old);
+      expect(await pruneRecordings(root, 7)).toBe(2);
+      expect(fs.existsSync(path.dirname(recording.base))).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
