@@ -3681,17 +3681,17 @@ export function voiceAttribute(
   post: (state: CallVoiceState) => void,
   describe?: (choice: TtsChoice) => Promise<ChoiceDetails>,
   waitMs = VOICE_NAMES_WAIT_MS,
-): { publish(state: CallVoiceState): void; close(): void } {
+): { publish(state: CallVoiceState, options?: { posted?: boolean }): void; close(): void } {
   // The state's own `gen` cannot tell one from the next: a line taking the pending choice keeps it.
   let revision = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
   return {
-    publish(state) {
+    publish(state, { posted = false } = {}) {
       if (closed) return;
       const current = ++revision;
       clearTimeout(timer);
-      post(state);
+      if (!posted) post(state);
       if (!describe) return;
       const postNamed = (active: ChoiceDetails, pending?: ChoiceDetails) => {
         if (closed || current !== revision) return;
@@ -3894,8 +3894,8 @@ async function roomVoice(
             [CALL_VOICE_ATTRIBUTE]: JSON.stringify(state),
           }),
         );
-        // The ids go out with `listening`, their names right after.
-        if (settings.voiceDetails) voice.publish(state);
+        // The ids went out with `listening`; their names follow.
+        voice.publish(state, { posted: true });
       },
     },
     async close() {

@@ -122,11 +122,7 @@ const ELEVENLABS_VOICE = /^[A-Za-z0-9]{10,40}$/;
 /** The backup voice: what speaks when a line's choice cannot, and what a saved value no longer offered reads as. */
 export const TTS_DEFAULT_CHOICE: TtsChoice = { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'alnilam' };
 /** What a new line, and a reset one, saves. */
-export const LINE_DEFAULT_CHOICE: TtsChoice = {
-  provider: 'gemini',
-  model: 'gemini-3.8-flash-tts',
-  voice: 'en-us-techagent-4',
-};
+export const LINE_DEFAULT_CHOICE: TtsChoice = { ...TTS_DEFAULT_CHOICE, voice: 'en-us-techagent-4' };
 
 export const TTS_REGISTRY: Readonly<Record<TtsProvider, TtsEntry>> = {
   gemini: {

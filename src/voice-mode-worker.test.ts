@@ -4317,7 +4317,7 @@ describe('call voice names', () => {
   /** Names that arrive when `answer` is called, per voice id. */
   const heldNames = () => {
     const waiting: Array<{ voice: string; resolve: () => void }> = [];
-    const describe = (choice: TtsChoice) =>
+    const lookUp = (choice: TtsChoice) =>
       new Promise<ChoiceDetails>((resolve) =>
         waiting.push({
           voice: choice.voice,
@@ -4325,14 +4325,14 @@ describe('call voice names', () => {
         }),
       );
     const answer = (voice: string) => waiting.filter((w) => w.voice === voice).forEach((w) => w.resolve());
-    return { describe, answer };
+    return { lookUp, answer };
   };
   const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
   it('posts the choice at once and its names when they arrive, as the fixture shows', async () => {
     const posts: CallVoiceState[] = [];
     const names = heldNames();
-    voiceAttribute((s) => void posts.push(s), names.describe).publish(ids);
+    voiceAttribute((s) => void posts.push(s), names.lookUp).publish(ids);
     expect(posts).toEqual([ids]);
     names.answer(state.active.voice);
     names.answer(state.pending!.voice);
@@ -4340,12 +4340,22 @@ describe('call voice names', () => {
     expect(posts[1]).toEqual(state);
   });
 
+  it('sends only the names of a state already posted', async () => {
+    const posts: CallVoiceState[] = [];
+    const names = heldNames();
+    voiceAttribute((s) => void posts.push(s), names.lookUp).publish(ids, { posted: true });
+    expect(posts).toEqual([]);
+    names.answer(state.active.voice);
+    names.answer(state.pending!.voice);
+    await vi.waitFor(() => expect(posts).toEqual([state]));
+  });
+
   it('says the names could not be had after a short wait, and still posts them when they come', async () => {
     vi.useFakeTimers();
     try {
       const posts: CallVoiceState[] = [];
       const names = heldNames();
-      voiceAttribute((s) => void posts.push(s), names.describe).publish({ v: 1, active: state.active });
+      voiceAttribute((s) => void posts.push(s), names.lookUp).publish({ v: 1, active: state.active });
       await vi.advanceTimersByTimeAsync(VOICE_NAMES_WAIT_MS);
       expect(posts).toEqual([
         { v: 1, active: state.active },
@@ -4372,7 +4382,7 @@ describe('call voice names', () => {
   it('drops names that finish after a newer state, the pending choice taken with the same gen included', async () => {
     const posts: CallVoiceState[] = [];
     const names = heldNames();
-    const attribute = voiceAttribute((s) => void posts.push(s), names.describe, 60_000);
+    const attribute = voiceAttribute((s) => void posts.push(s), names.lookUp, 60_000);
     attribute.publish({ v: 1, active: state.active, pending: state.pending, gen: 7 });
     const taken = { v: 1 as const, active: state.pending!, gen: 7 };
     attribute.publish(taken);
@@ -4389,7 +4399,7 @@ describe('call voice names', () => {
     try {
       const posts: CallVoiceState[] = [];
       const names = heldNames();
-      const attribute = voiceAttribute((s) => void posts.push(s), names.describe);
+      const attribute = voiceAttribute((s) => void posts.push(s), names.lookUp);
       attribute.publish({ v: 1, active: state.active });
       attribute.close();
       names.answer(state.active.voice);

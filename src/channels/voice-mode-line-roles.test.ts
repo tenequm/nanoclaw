@@ -130,6 +130,15 @@ describe('voice line access (real central DB)', () => {
       stamp(),
       stamp(),
     );
+    // A provider the registry lacks is left as it is, and never counted as filled.
+    await getDb().run(
+      `INSERT INTO voice_mode_lines (line_id, agent_group_id, token_hash, owner_user_id, tts_provider, created_at, updated_at)
+         VALUES ('old000000001', 'ag-4', ?, ?, 'openai', ?, ?)`,
+      'b'.repeat(64),
+      ADMIN,
+      stamp(),
+      stamp(),
+    );
     expect(await fillVoiceModeLineTts()).toBe(3);
     expect(await fillVoiceModeLineTts()).toBe(0);
     await mint(ADMIN);
@@ -146,6 +155,7 @@ describe('voice line access (real central DB)', () => {
       },
       { agent_group_id: 'ag-2', tts_provider: 'gemini', tts_model: 'gemini-3.8-flash-tts', tts_voice: 'alnilam' },
       { agent_group_id: 'ag-3', tts_provider: 'gemini', tts_model: 'gemini-3.8-flash-tts', tts_voice: 'alnilam' },
+      { agent_group_id: 'ag-4', tts_provider: 'openai', tts_model: null, tts_voice: null },
     ]);
   });
 

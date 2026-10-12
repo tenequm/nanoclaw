@@ -11,7 +11,14 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 
-import { isTtsProvider, LINE_DEFAULT_CHOICE, TTS_REGISTRY, type TtsChoice, type TtsSaved } from '../voice-mode-tts.js';
+import {
+  isTtsProvider,
+  LINE_DEFAULT_CHOICE,
+  TTS_DEFAULT_CHOICE,
+  TTS_REGISTRY,
+  type TtsChoice,
+  type TtsSaved,
+} from '../voice-mode-tts.js';
 import { getDb } from './connection.js';
 import type { DbDriver } from './driver.js';
 import { registerMigration } from './migrations/index.js';
@@ -96,16 +103,20 @@ export async function setVoiceModeLineTts(
 }
 
 /**
- * Give every line a whole speech choice, each missing field what the line already spoke with: a
- * missing provider the line default's, a missing model or voice that provider's default. Rows from
- * before every write stored one, or written by an older host after a rollback. Returns the rows changed.
+ * Give every line a whole speech choice, each missing field what the line already spoke with (see
+ * effectiveTts): a missing provider the backup's, a missing model or voice that provider's default. Rows
+ * from before every write stored one, or written by an older host after a rollback. Returns the rows
+ * changed; a row naming a provider the registry lacks is left as it is.
  */
 export async function fillVoiceModeLineTts(db: DbDriver = getDb()): Promise<number> {
-  const missing = await db.get<{ n: number }>(
-    'SELECT COUNT(*) AS n FROM voice_mode_lines WHERE tts_provider IS NULL OR tts_model IS NULL OR tts_voice IS NULL',
+  const providers = Object.keys(TTS_REGISTRY);
+  const fillable = await db.get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM voice_mode_lines WHERE tts_provider IS NULL
+       OR (tts_provider IN (${providers.map(() => '?').join(', ')}) AND (tts_model IS NULL OR tts_voice IS NULL))`,
+    ...providers,
   );
-  if (!missing?.n) return 0;
-  await db.run('UPDATE voice_mode_lines SET tts_provider = ? WHERE tts_provider IS NULL', LINE_DEFAULT_CHOICE.provider);
+  if (!fillable?.n) return 0;
+  await db.run('UPDATE voice_mode_lines SET tts_provider = ? WHERE tts_provider IS NULL', TTS_DEFAULT_CHOICE.provider);
   for (const entry of Object.values(TTS_REGISTRY)) {
     await db.run(
       `UPDATE voice_mode_lines SET tts_model = COALESCE(tts_model, ?), tts_voice = COALESCE(tts_voice, ?)
@@ -115,7 +126,7 @@ export async function fillVoiceModeLineTts(db: DbDriver = getDb()): Promise<numb
       entry.id,
     );
   }
-  return Number(missing.n);
+  return Number(fillable.n);
 }
 
 /** Hex SHA-256 of a call-link token: what the table stores and looks a link up by. */
