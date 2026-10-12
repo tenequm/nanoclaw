@@ -108,6 +108,12 @@ import {
   type ReviewRequest,
   type TurnMode,
 } from './channels/voice-mode-protocol.js';
+import {
+  choiceDetails,
+  createVoiceCatalog,
+  type ChoiceDetails,
+  type VoiceCatalog,
+} from './channels/voice-mode-tts-catalog.js';
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import { GeminiLiveTranscriber, type Heard, type TranscriberOptions } from './voice-mode-gemini-live.js';
@@ -3279,6 +3285,8 @@ export interface VoiceModeSettings {
   notch?: boolean;
   /** Each line that played or failed: how it went, and with recordReplies its audio. */
   spoke?(line: SpokenLine, pcm?: Int16Array): void;
+  /** A choice's names for the call voice attribute; none: the attribute carries the ids only. */
+  voiceDetails?(choice: TtsChoice): Promise<ChoiceDetails>;
 }
 
 export interface RunCallDeps {
@@ -3299,6 +3307,8 @@ export interface RunCallDeps {
   markUpdating(ctx: CallJob): Promise<void>;
   /** The call's acoustic wake word spotter, or none: then `hey <agent>` in the transcript opens a turn. */
   wakeWord?(events: WakeWordEvents): WakeWord | undefined;
+  /** Where the call voice's names come from; none: the attribute carries the ids only. */
+  voiceNames?: Pick<VoiceCatalog, 'details'>;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -3659,6 +3669,51 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
   };
 }
 
+/** How long the call voice attribute goes without names before it says they could not be had. */
+export const VOICE_NAMES_WAIT_MS = 2_000;
+
+/**
+ * The call voice attribute: each state goes out at once, then again with its choices' names when they
+ * arrive, or after VOICE_NAMES_WAIT_MS with `lookup_failed` ones (the real ones still follow). Nothing
+ * waits on a lookup, and a lookup that finishes after a newer state, or after the call closed, posts nothing.
+ */
+export function voiceAttribute(
+  post: (state: CallVoiceState) => void,
+  describe?: (choice: TtsChoice) => Promise<ChoiceDetails>,
+  waitMs = VOICE_NAMES_WAIT_MS,
+): { publish(state: CallVoiceState): void; close(): void } {
+  // The state's own `gen` cannot tell one from the next: a line taking the pending choice keeps it.
+  let revision = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let closed = false;
+  return {
+    publish(state) {
+      if (closed) return;
+      const current = ++revision;
+      clearTimeout(timer);
+      post(state);
+      if (!describe) return;
+      const postNamed = (active: ChoiceDetails, pending?: ChoiceDetails) => {
+        if (closed || current !== revision) return;
+        post({ ...state, activeDetails: active, ...(pending ? { pendingDetails: pending } : {}) });
+      };
+      const failed = (choice: TtsChoice) => choiceDetails(choice, { status: 'lookup_failed' });
+      timer = setTimeout(() => postNamed(failed(state.active), state.pending && failed(state.pending)), waitMs);
+      void Promise.all([describe(state.active), state.pending && describe(state.pending)]).then(
+        ([active, pending]) => {
+          if (current === revision) clearTimeout(timer);
+          postNamed(active, pending);
+        },
+        () => undefined,
+      );
+    },
+    close() {
+      closed = true;
+      clearTimeout(timer);
+    },
+  };
+}
+
 /**
  * The real room: the caller's microphone at 16 kHz into Silero and the call's turns, the agent's
  * speech track fed by the call's speech output, the cue track, and what the page reads (captions, attributes,
@@ -3740,10 +3795,14 @@ async function roomVoice(
   }
 
   let typing = false;
+  const voice = voiceAttribute(
+    (state) => setAttr(CALL_VOICE_ATTRIBUTE, JSON.stringify(state), 'the call voice'),
+    settings.voiceDetails,
+  );
   // Each change is logged too: the journal shows what spoke when.
   const publishVoice = (state: CallVoiceState) => {
     log.info('voice-mode.voice', { voice: state });
-    setAttr(CALL_VOICE_ATTRIBUTE, JSON.stringify(state), 'the call voice');
+    voice.publish(state);
   };
   const speaker = speechOutput({
     meta,
@@ -3822,8 +3881,8 @@ async function roomVoice(
         for (const op of Object.keys(REVIEW_RPC) as ReviewOp[]) {
           local.registerRpcMethod(REVIEW_RPC[op], (data) => handle(op, data.payload, data.callerIdentity));
         }
-        const voice = speaker.speech.state;
-        log.info('voice-mode.voice', { voice });
+        const state = speaker.speech.state;
+        log.info('voice-mode.voice', { voice: state });
         // Unkeyed: a `speaking` posted after it queues behind it instead of replacing it.
         post('the agent state and the review attributes', () =>
           local.setAttributes({
@@ -3832,13 +3891,16 @@ async function roomVoice(
             [CALL_REVIEW_ATTRIBUTE]: '1',
             [CALL_COMMANDS_ATTRIBUTE]: CALL_COMMANDS_VERSION,
             [CALL_COMMAND_WORDS_ATTRIBUTE]: COMMAND_WORDS_JSON,
-            [CALL_VOICE_ATTRIBUTE]: JSON.stringify(voice),
+            [CALL_VOICE_ATTRIBUTE]: JSON.stringify(state),
           }),
         );
+        // The ids go out with `listening`, their names right after.
+        if (settings.voiceDetails) voice.publish(state);
       },
     },
     async close() {
       closed = true;
+      voice.close();
       const speechClosed = speaker.close();
       room.off(RoomEvent.TrackSubscribed, listen);
       room.off(RoomEvent.TrackUnsubscribed, unlisten);
@@ -3965,6 +4027,8 @@ export class CallTelemetry {
 
 /** A call's settings, read once per job process and kept for every call it runs: a `.env` change reaches calls after a worker restart. */
 let callEnv: Record<string, string | undefined> | undefined;
+/** The names of the voices this job process's calls use, kept in its memory. */
+let callVoiceNames: VoiceCatalog | undefined;
 
 function defaultDeps(): RunCallDeps {
   const env = (callEnv ??= workerEnv([
@@ -3986,6 +4050,7 @@ function defaultDeps(): RunCallDeps {
   const wake = wakeWordSettings(env);
   return {
     env,
+    voiceNames: (callVoiceNames ??= createVoiceCatalog({ lazy: true, log: workerLog(agentsLog()) })),
     createVoice: (ctx, meta, settings, events) => roomVoice(ctx as JobContext, meta, settings, events),
     transcriber: (options) => new GeminiLiveTranscriber(options),
     markUpdating: (ctx) => setAttribute(ctx, CALL_UPDATING_ATTRIBUTE, '1'),
@@ -4401,6 +4466,9 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         ...(record ? { recordReplies: true } : {}),
         ...(ttsDeess(deps.env.VOICE_MODE_TTS_DEESS) ? { deess: true } : {}),
         ...(ttsNotch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
+        ...(deps.voiceNames
+          ? { voiceDetails: (choice) => deps.voiceNames!.details(choice, providerKeys[choice.provider]) }
+          : {}),
         spoke: (line, pcm) => {
           const label = speakingLine;
           const reply = label?.reply ?? ++replies;

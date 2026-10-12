@@ -26,6 +26,7 @@ import {
   type ReviewRequest,
 } from './channels/voice-mode-protocol.js';
 import type { Heard } from './voice-mode-gemini-live.js';
+import type { ChoiceDetails } from './channels/voice-mode-tts-catalog.js';
 import type { TtsAudio, TtsChoice, TtsInstance } from './voice-mode-tts.js';
 import {
   AWAIT_REPLY_MS,
@@ -97,6 +98,8 @@ import {
   type Recording,
   type ReviewDeps,
   speechOutput,
+  voiceAttribute,
+  VOICE_NAMES_WAIT_MS,
   type Transcription,
   writeTurnRecording,
   workerEnv,
@@ -643,7 +646,7 @@ const META: LiveKitJobMetadata = {
   vocabulary: ['NanoClaw'],
   sttModel: 'gemini-3.5-transcribe-live',
   sttFallbackModel: 'gemini-3.5-transcribe',
-  tts: { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'Alnilam' },
+  tts: { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'alnilam' },
   silenceMs: 2500,
   maxDurationMs: 60_000,
   joinTimeoutMs: 1000,
@@ -1895,7 +1898,7 @@ function fakeTts(plan: (text: string, call: number) => TtsPlan) {
 }
 type FakeTts = ReturnType<typeof fakeTts>;
 
-const GEMINI: TtsChoice = { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'Alnilam' };
+const GEMINI: TtsChoice = { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'alnilam' };
 const GEMINI_LITE: TtsChoice = { ...GEMINI, model: 'gemini-3.8-flash-lite-tts' };
 const ELEVEN: TtsChoice = { provider: 'elevenlabs', model: 'eleven_v4_turbo', voice: 'bIHbv24MWmeRgasZH58o' };
 const ttsId = (c: TtsChoice) => `${c.provider}/${c.model}/${c.voice}`;
@@ -2130,7 +2133,7 @@ describe('voice selection in a call (the settings RPC)', () => {
     expect(call.lines()[0]).toMatchObject({
       outcome: 'spoken',
       model: 'gemini/gemini-3.8-flash-tts',
-      voice: 'Alnilam',
+      voice: 'alnilam',
     });
     expect(call.built[0].tts.closed).toBe(0);
     host.emit({ type: 'reply', text: 'Two.', turn: null });
@@ -2233,7 +2236,7 @@ describe('voice selection in a call (the settings RPC)', () => {
     expect(await line('One.')).toMatchObject({
       outcome: 'spoken',
       model: 'gemini/gemini-3.8-flash-tts',
-      voice: 'Alnilam',
+      voice: 'alnilam',
       fallback: true,
       durationMs: 100,
     });
@@ -4220,7 +4223,7 @@ describe('wide events', () => {
     expect(meter.done({ by: GEMINI, primary: ELEVEN, failed: false, cut: false })).toEqual({
       outcome: 'spoken',
       model: 'gemini/gemini-3.8-flash-tts',
-      voice: 'Alnilam',
+      voice: 'alnilam',
       fallback: true,
       firstAudioMs: 800,
       heldMs: 200,
@@ -4305,5 +4308,96 @@ describe('wide events', () => {
     ]);
     // No words of the caller or the agent in any event.
     expect(JSON.stringify(info.mock.calls.filter(([m]) => String(m).startsWith('voice.')))).not.toMatch(/table|Booked/);
+  });
+});
+
+describe('call voice names', () => {
+  const state = fixtures.voiceAttribute;
+  const ids: CallVoiceState = { v: 1, active: state.active, pending: state.pending, gen: state.gen };
+  /** Names that arrive when `answer` is called, per voice id. */
+  const heldNames = () => {
+    const waiting: Array<{ voice: string; resolve: () => void }> = [];
+    const describe = (choice: TtsChoice) =>
+      new Promise<ChoiceDetails>((resolve) =>
+        waiting.push({
+          voice: choice.voice,
+          resolve: () => resolve(choice.provider === 'gemini' ? state.activeDetails! : state.pendingDetails!),
+        }),
+      );
+    const answer = (voice: string) => waiting.filter((w) => w.voice === voice).forEach((w) => w.resolve());
+    return { describe, answer };
+  };
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('posts the choice at once and its names when they arrive, as the fixture shows', async () => {
+    const posts: CallVoiceState[] = [];
+    const names = heldNames();
+    voiceAttribute((s) => void posts.push(s), names.describe).publish(ids);
+    expect(posts).toEqual([ids]);
+    names.answer(state.active.voice);
+    names.answer(state.pending!.voice);
+    await vi.waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1]).toEqual(state);
+  });
+
+  it('says the names could not be had after a short wait, and still posts them when they come', async () => {
+    vi.useFakeTimers();
+    try {
+      const posts: CallVoiceState[] = [];
+      const names = heldNames();
+      voiceAttribute((s) => void posts.push(s), names.describe).publish({ v: 1, active: state.active });
+      await vi.advanceTimersByTimeAsync(VOICE_NAMES_WAIT_MS);
+      expect(posts).toEqual([
+        { v: 1, active: state.active },
+        {
+          v: 1,
+          active: state.active,
+          activeDetails: {
+            ...state.activeDetails!,
+            voiceName: null,
+            language: null,
+            gender: null,
+            status: 'lookup_failed',
+          },
+        },
+      ]);
+      names.answer(state.active.voice);
+      await vi.waitFor(() => expect(posts).toHaveLength(3));
+      expect(posts[2]).toEqual({ v: 1, active: state.active, activeDetails: state.activeDetails });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops names that finish after a newer state, the pending choice taken with the same gen included', async () => {
+    const posts: CallVoiceState[] = [];
+    const names = heldNames();
+    const attribute = voiceAttribute((s) => void posts.push(s), names.describe, 60_000);
+    attribute.publish({ v: 1, active: state.active, pending: state.pending, gen: 7 });
+    const taken = { v: 1 as const, active: state.pending!, gen: 7 };
+    attribute.publish(taken);
+    // The newer state's names first, then the older's, reversed.
+    names.answer(state.pending!.voice);
+    await vi.waitFor(() => expect(posts).toHaveLength(3));
+    names.answer(state.active.voice);
+    await flush();
+    expect(posts.slice(1)).toEqual([taken, { ...taken, activeDetails: state.pendingDetails }]);
+  });
+
+  it('posts nothing once the call closed', async () => {
+    vi.useFakeTimers();
+    try {
+      const posts: CallVoiceState[] = [];
+      const names = heldNames();
+      const attribute = voiceAttribute((s) => void posts.push(s), names.describe);
+      attribute.publish({ v: 1, active: state.active });
+      attribute.close();
+      names.answer(state.active.voice);
+      await vi.advanceTimersByTimeAsync(VOICE_NAMES_WAIT_MS);
+      attribute.publish(ids);
+      expect(posts).toEqual([{ v: 1, active: state.active }]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

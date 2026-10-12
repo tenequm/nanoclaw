@@ -11,8 +11,9 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 
-import { isTtsProvider, type TtsSaved } from '../voice-mode-tts.js';
+import { isTtsProvider, LINE_DEFAULT_CHOICE, TTS_REGISTRY, type TtsChoice, type TtsSaved } from '../voice-mode-tts.js';
 import { getDb } from './connection.js';
+import type { DbDriver } from './driver.js';
 import { registerMigration } from './migrations/index.js';
 
 registerMigration({
@@ -55,7 +56,7 @@ export interface VoiceModeLineRow {
   /** The chat calls talk in, and its thread. */
   messaging_group_id: string | null;
   thread_id: string | null;
-  /** The line's saved speech choice; null fields take the defaults (see savedTts). */
+  /** The line's saved speech choice: every write stores all three; a read takes a null as a default (see savedTts). */
   tts_provider: string | null;
   tts_model: string | null;
   tts_voice: string | null;
@@ -72,20 +73,49 @@ export function savedTts(row: VoiceModeLineRow): TtsSaved {
   };
 }
 
-/** Save the line's speech choice, or clear it with null; undefined when there is no such line. */
+/**
+ * Save the line's speech choice while its link and caller are still `current`'s; undefined when there
+ * is no such line, or it was re-minted meanwhile.
+ */
 export async function setVoiceModeLineTts(
   lineId: string,
-  saved: TtsSaved | null,
+  choice: TtsChoice,
+  current: Pick<VoiceModeLineRow, 'token_hash' | 'owner_user_id'>,
 ): Promise<VoiceModeLineRow | undefined> {
   return getDb().get<VoiceModeLineRow>(
     `UPDATE voice_mode_lines SET tts_provider = ?, tts_model = ?, tts_voice = ?, updated_at = ?
-       WHERE line_id = ? RETURNING *`,
-    saved?.provider ?? null,
-    saved?.model ?? null,
-    saved?.voice ?? null,
+       WHERE line_id = ? AND token_hash = ? AND owner_user_id = ? RETURNING *`,
+    choice.provider,
+    choice.model,
+    choice.voice,
     new Date().toISOString(),
     lineId,
+    current.token_hash,
+    current.owner_user_id,
   );
+}
+
+/**
+ * Give every line a whole speech choice, each missing field what the line already spoke with: a
+ * missing provider the line default's, a missing model or voice that provider's default. Rows from
+ * before every write stored one, or written by an older host after a rollback. Returns the rows changed.
+ */
+export async function fillVoiceModeLineTts(db: DbDriver = getDb()): Promise<number> {
+  const missing = await db.get<{ n: number }>(
+    'SELECT COUNT(*) AS n FROM voice_mode_lines WHERE tts_provider IS NULL OR tts_model IS NULL OR tts_voice IS NULL',
+  );
+  if (!missing?.n) return 0;
+  await db.run('UPDATE voice_mode_lines SET tts_provider = ? WHERE tts_provider IS NULL', LINE_DEFAULT_CHOICE.provider);
+  for (const entry of Object.values(TTS_REGISTRY)) {
+    await db.run(
+      `UPDATE voice_mode_lines SET tts_model = COALESCE(tts_model, ?), tts_voice = COALESCE(tts_voice, ?)
+         WHERE tts_provider = ? AND (tts_model IS NULL OR tts_voice IS NULL)`,
+      entry.defaults.model,
+      entry.defaults.voice,
+      entry.id,
+    );
+  }
+  return Number(missing.n);
 }
 
 /** Hex SHA-256 of a call-link token: what the table stores and looks a link up by. */
@@ -148,8 +178,9 @@ async function insertLine(
   const now = new Date().toISOString();
   const line = await getDb().get<VoiceModeLineRow>(
     `INSERT INTO voice_mode_lines
-       (line_id, agent_group_id, token_hash, owner_user_id, messaging_group_id, thread_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       (line_id, agent_group_id, token_hash, owner_user_id, messaging_group_id, thread_id,
+        tts_provider, tts_model, tts_voice, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (agent_group_id) ${onConflict}
      RETURNING *`,
     randomBytes(6).toString('hex'),
@@ -158,6 +189,9 @@ async function insertLine(
     target.ownerUserId,
     target.messagingGroupId,
     target.threadId,
+    LINE_DEFAULT_CHOICE.provider,
+    LINE_DEFAULT_CHOICE.model,
+    LINE_DEFAULT_CHOICE.voice,
     now,
     now,
   );
@@ -202,5 +236,14 @@ registerMigration({
       DROP TABLE IF EXISTS voice_line_owners;
       DROP TABLE IF EXISTS voice_lines;
     `);
+  },
+});
+
+registerMigration({
+  version: 4,
+  name: 'module:voice-mode:lines-tts-concrete',
+  async up(db) {
+    // The host runs the same fill at every start too: an older host after a rollback writes nulls again.
+    await fillVoiceModeLineTts(db);
   },
 });

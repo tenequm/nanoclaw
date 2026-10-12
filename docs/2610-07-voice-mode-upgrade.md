@@ -92,7 +92,7 @@ keys are voice-mode's own:
 above) are no longer read, and the host warns when one is still set: each line
 keeps its own voice, and `/voice` makes the links. Before upgrading an install that set one,
 save it on every line with `PATCH /voice/tts` (see the skill's "Voice per
-line"), or its lines speak with the default `Alnilam`.
+line"), or its lines speak with the default `alnilam`.
 The build adds a separate page listener on `127.0.0.1:3100` (`VOICE_MODE_PORT`,
 `VOICE_MODE_PAGE_HOST`); main's existing `/voice` and `/webhook/voice/livekit`
 fronts still work on `WEBHOOK_PORT`. Do not move a working front during the

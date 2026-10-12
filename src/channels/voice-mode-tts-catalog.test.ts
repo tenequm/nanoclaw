@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createVoiceCatalog, ELEVENLABS_VOICES_URL } from './voice-mode-tts-catalog.js';
 
 const GEMINI_VOICES_URL = 'https://generativelanguage.googleapis.com/v1beta/voices';
+const quiet = { info: vi.fn(), warn: vi.fn() };
 
 function fakeUpstream(respond: (url: URL) => Response | Promise<Response>) {
   const calls: Array<{ url: URL; headers: Headers }> = [];
@@ -143,5 +144,323 @@ describe('voice catalog', () => {
         error: 'upstream',
       });
     }
+  });
+});
+
+describe('voice names', () => {
+  const alnilam = { id: 'alnilam', display_name: 'Alnilam', language_code: 'en-US', gender: 'male' };
+  const tech = { id: 'en-us-techagent-4', display_name: 'Tech Advisor 4', language_code: 'en-US', gender: 'male' };
+  /** Gemini's whole listing over two pages, or a failure while `down`. */
+  const gemini = (state: { down?: boolean; voices?: unknown[] } = {}) =>
+    fakeUpstream((url) => {
+      if (state.down) return new Response('', { status: 503 });
+      const voices = state.voices ?? [alnilam, tech];
+      return Response.json(
+        url.searchParams.get('page_token') === 'p1'
+          ? { voices: voices.slice(1) }
+          : { voices: voices.slice(0, 1), next_page_token: 'p1' },
+      );
+    });
+  const will = {
+    voice_id: 'bIHbv24MWmeRgasZH58o',
+    name: 'Will',
+    labels: { language: 'en', gender: 'male' },
+    preview_url: 'https://example.invalid/w.mp3',
+  };
+
+  it("names a voice from Gemini's whole listing by its exact id, and knows a voice it does not have", async () => {
+    const { urls, fetchFn } = gemini();
+    const catalog = createVoiceCatalog({ fetch: fetchFn });
+    catalog.warm({ gemini: 'key' });
+    expect(await catalog.lookup('gemini', 'key', 'alnilam')).toEqual({
+      status: 'resolved',
+      voice: { id: 'alnilam', name: 'Alnilam', language: 'en-US', gender: 'male' },
+    });
+    expect(await catalog.lookup('gemini', 'key', 'Alnilam')).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('gemini', 'key', 'kore')).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('gemini', 'key', 'not a voice')).toEqual({ status: 'unavailable' });
+    expect(
+      await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'en-us-techagent-4' }, 'key'),
+    ).toEqual({
+      provider: 'gemini',
+      providerName: 'Gemini',
+      model: 'gemini-3.8-flash-tts',
+      modelName: 'Gemini 3.8 Flash TTS',
+      voice: 'en-us-techagent-4',
+      voiceName: 'Tech Advisor 4',
+      language: 'en-US',
+      gender: 'male',
+      preview: null,
+      status: 'resolved',
+    });
+    expect(urls().map((u) => Object.fromEntries(u.searchParams))).toEqual([
+      { page_size: '1000' },
+      { page_size: '1000', page_token: 'p1' },
+    ]);
+  });
+
+  it('answers lookup_failed without a key or a listing, retries after a pause, and never throws', async () => {
+    let t = 0;
+    const state = { down: true };
+    const { calls, fetchFn } = gemini(state);
+    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
+    expect(await catalog.lookup('gemini', undefined, 'alnilam')).toEqual({ status: 'lookup_failed' });
+    expect(calls).toHaveLength(0);
+    const failed = {
+      provider: 'gemini',
+      providerName: 'Gemini',
+      model: 'gemini-9-tts',
+      modelName: 'gemini-9-tts',
+      voice: 'alnilam',
+      voiceName: null,
+      language: null,
+      gender: null,
+      preview: null,
+      status: 'lookup_failed',
+    };
+    expect(await catalog.details({ provider: 'gemini', model: 'gemini-9-tts', voice: 'alnilam' }, 'key')).toEqual(
+      failed,
+    );
+    state.down = false;
+    t = 29_000;
+    expect(await catalog.lookup('gemini', 'key', 'alnilam')).toEqual({ status: 'lookup_failed' });
+    expect(calls).toHaveLength(1);
+    t = 30_000;
+    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+  });
+
+  it('keeps answering from the old listing while one refresh runs, then from the new one', async () => {
+    let t = 0;
+    const state: { voices?: unknown[] } = {};
+    const { calls, fetchFn } = gemini(state);
+    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t });
+    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+    state.voices = [tech, { ...alnilam, id: 'kore', display_name: 'Kore' }];
+    t = 3_600_000;
+    const [during, again] = await Promise.all([
+      catalog.lookup('gemini', 'key', 'alnilam'),
+      catalog.lookup('gemini', 'key', 'alnilam'),
+    ]);
+    expect([during.status, again.status]).toEqual(['resolved', 'resolved']);
+    await vi.waitFor(async () => expect((await catalog.lookup('gemini', 'key', 'kore')).status).toBe('resolved'));
+    expect(await catalog.lookup('gemini', 'key', 'alnilam')).toEqual({ status: 'unavailable' });
+    expect(calls).toHaveLength(4);
+  });
+
+  it('asks ElevenLabs for a voice outside the listing by id, keeping each answer for its own while', async () => {
+    let t = 0;
+    let byIdFails = true;
+    const { urls, fetchFn } = fakeUpstream((url) => {
+      if (url.pathname === '/v2/voices') return Response.json({ voices: [will], has_more: false });
+      if (byIdFails) return new Response('', { status: 500 });
+      return url.pathname.endsWith('/S80713fa2M70CssGEBj5')
+        ? Response.json({ voice_id: 'S80713fa2M70CssGEBj5', name: 'Maks', labels: { gender: 'male' } })
+        : Response.json(
+            { detail: { status: 'voice_not_found', message: 'A voice with ID was not found.' } },
+            { status: 400 },
+          );
+    });
+    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
+    expect(await catalog.lookup('elevenlabs', 'key', 'bIHbv24MWmeRgasZH58o')).toEqual({
+      status: 'resolved',
+      voice: {
+        id: 'bIHbv24MWmeRgasZH58o',
+        name: 'Will',
+        language: 'en',
+        gender: 'male',
+        preview: 'https://example.invalid/w.mp3',
+      },
+    });
+    expect(await catalog.lookup('elevenlabs', 'key', 'S80713fa2M70CssGEBj5')).toEqual({ status: 'lookup_failed' });
+    byIdFails = false;
+    expect(await catalog.lookup('elevenlabs', 'key', 'S80713fa2M70CssGEBj5')).toEqual({ status: 'lookup_failed' });
+    t = 15_000;
+    for (let i = 0; i < 2; i++) {
+      expect(await catalog.lookup('elevenlabs', 'key', 'S80713fa2M70CssGEBj5')).toEqual({
+        status: 'resolved',
+        voice: { id: 'S80713fa2M70CssGEBj5', name: 'Maks', gender: 'male' },
+      });
+      expect(await catalog.lookup('elevenlabs', 'key', 'ZZZZZZZZZZZZZZZZZZZZ')).toEqual({ status: 'unavailable' });
+    }
+    // ElevenLabs ids are exact; a save asks again rather than trust a kept answer.
+    expect(await catalog.lookup('elevenlabs', 'key', 'BIHBV24MWMERGASZH58O')).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('elevenlabs', 'key', 'ZZZZZZZZZZZZZZZZZZZZ', { confirm: true })).toEqual({
+      status: 'unavailable',
+    });
+    expect(catalog.known('elevenlabs', 'key', 'ZZZZZZZZZZZZZZZZZZZZ')).toBe('unavailable');
+    // A miss is kept ten minutes, a voice found for the hour.
+    t = 15_000 + 600_000;
+    expect(catalog.known('elevenlabs', 'key', 'ZZZZZZZZZZZZZZZZZZZZ')).toBeUndefined();
+    expect(catalog.known('elevenlabs', 'key', 'S80713fa2M70CssGEBj5')).toBe('resolved');
+    expect(await catalog.lookup('elevenlabs', 'key', 'ZZZZZZZZZZZZZZZZZZZZ')).toEqual({ status: 'unavailable' });
+    expect(urls().map((u) => u.pathname)).toEqual([
+      '/v2/voices',
+      '/v1/voices/S80713fa2M70CssGEBj5',
+      '/v1/voices/S80713fa2M70CssGEBj5',
+      '/v1/voices/ZZZZZZZZZZZZZZZZZZZZ',
+      '/v1/voices/BIHBV24MWMERGASZH58O',
+      '/v1/voices/ZZZZZZZZZZZZZZZZZZZZ',
+      '/v1/voices/ZZZZZZZZZZZZZZZZZZZZ',
+    ]);
+  });
+
+  it("takes only ElevenLabs' own not-found as proof a voice is gone", async () => {
+    const replies: Array<[() => Response | Promise<Response>, string]> = [
+      [() => new Response('', { status: 404 }), 'unavailable'],
+      [() => Response.json({ detail: { status: 'voice_not_found' } }, { status: 400 }), 'unavailable'],
+      [() => Response.json({ detail: { status: 'invalid_uid' } }, { status: 400 }), 'lookup_failed'],
+      [() => Response.json({ detail: { status: 'voice_not_found' } }, { status: 401 }), 'lookup_failed'],
+      [() => new Response('', { status: 500 }), 'lookup_failed'],
+      [() => Promise.reject(new Error('timed out')), 'lookup_failed'],
+    ];
+    for (const [reply, status] of replies) {
+      const { fetchFn } = fakeUpstream((url) =>
+        url.pathname === '/v2/voices' ? Response.json({ voices: [], has_more: false }) : reply(),
+      );
+      const catalog = createVoiceCatalog({ fetch: fetchFn, log: quiet });
+      expect(await catalog.lookup('elevenlabs', 'key', 'S80713fa2M70CssGEBj5', { confirm: true })).toEqual({ status });
+    }
+  });
+
+  it("loads Gemini's listing once more, for every save waiting on it, before a save is refused", async () => {
+    let t = 0;
+    const state: { voices?: unknown[]; down?: boolean } = {};
+    const { calls, fetchFn } = gemini(state);
+    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
+    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+    expect(calls).toHaveLength(2);
+    // Plain lookups trust the listing, and so does a save while it is seconds old.
+    expect(await catalog.lookup('gemini', 'key', 'voice_new')).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('gemini', 'key', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
+    expect(calls).toHaveLength(2);
+    state.voices = [alnilam, { id: 'voice_new', display_name: 'New' }];
+    t = 10_000;
+    const saves = await Promise.all([
+      catalog.lookup('gemini', 'key', 'voice_new', { confirm: true }),
+      catalog.lookup('gemini', 'key', 'voice_new', { confirm: true }),
+    ]);
+    expect(saves.map((r) => r.status)).toEqual(['resolved', 'resolved']);
+    expect(calls).toHaveLength(4);
+    t = 20_000;
+    expect(await catalog.lookup('gemini', 'key', 'voice_gone', { confirm: true })).toEqual({ status: 'unavailable' });
+    expect(calls).toHaveLength(6);
+    // A listing that cannot load again proves nothing: the save goes through, and the next waits out the pause.
+    state.down = true;
+    t = 30_000;
+    expect(await catalog.lookup('gemini', 'key', 'voice_gone', { confirm: true })).toEqual({ status: 'lookup_failed' });
+    expect(await catalog.lookup('gemini', 'key', 'voice_gone', { confirm: true })).toEqual({ status: 'lookup_failed' });
+    expect(calls).toHaveLength(7);
+    // What the last whole listing had still resolves; what it lacked is no longer certain.
+    expect((await catalog.lookup('gemini', 'key', 'voice_new')).status).toBe('resolved');
+    expect(await catalog.lookup('gemini', 'key', 'voice_gone')).toEqual({ status: 'lookup_failed' });
+    expect(catalog.known('gemini', 'key', 'voice_gone')).toBeUndefined();
+  });
+
+  it('takes no listing cut short by a failed page or a repeated page token', async () => {
+    for (const second of [
+      () => new Response('', { status: 503 }),
+      () => Response.json({ voices: [tech], next_page_token: 'p1' }),
+    ]) {
+      let t = 0;
+      let broken = false;
+      const { fetchFn } = fakeUpstream((url) =>
+        url.searchParams.get('page_token') === 'p1'
+          ? broken
+            ? second()
+            : Response.json({ voices: [tech] })
+          : Response.json({ voices: [alnilam], next_page_token: 'p1' }),
+      );
+      const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
+      broken = true;
+      expect(await catalog.lookup('gemini', 'key', 'alnilam')).toEqual({ status: 'lookup_failed' });
+      broken = false;
+      t = 30_000;
+      expect((await catalog.lookup('gemini', 'key', 'en-us-techagent-4')).status).toBe('resolved');
+      broken = true;
+      t = 30_000 + 3_600_000;
+      await catalog.lookup('gemini', 'key', 'alnilam');
+      await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'kore')).toBeUndefined());
+      expect(catalog.known('gemini', 'key', 'alnilam')).toBe('resolved');
+      expect(await catalog.lookup('gemini', 'key', 'kore')).toEqual({ status: 'lookup_failed' });
+    }
+  });
+
+  it("keeps each key's names and pages apart, a bounded number of them", async () => {
+    const { calls, fetchFn } = gemini();
+    const catalog = createVoiceCatalog({ fetch: fetchFn });
+    expect((await catalog.lookup('gemini', 'key-a', 'alnilam')).status).toBe('resolved');
+    expect(catalog.known('gemini', 'key-b', 'alnilam')).toBeUndefined();
+    expect((await catalog.lookup('gemini', 'key-b', 'alnilam')).status).toBe('resolved');
+    expect(calls).toHaveLength(4);
+    expect(calls.map((c) => c.headers.get('x-goog-api-key'))).toEqual(['key-a', 'key-a', 'key-b', 'key-b']);
+    await catalog.page('gemini', 'key-a', { limit: 3 });
+    await catalog.page('gemini', 'key-b', { limit: 3 });
+    expect(calls).toHaveLength(6);
+    for (let i = 0; i < 250; i++) await catalog.page('gemini', 'key-a', { limit: 3, q: `q${i}` });
+    // The oldest pages gave way: asking for the first again goes upstream.
+    await catalog.page('gemini', 'key-a', { limit: 3 });
+    expect(calls).toHaveLength(6 + 250 + 1);
+  });
+
+  it('asks lazily for only the ids in use: one Gemini language, ElevenLabs by id, nothing ahead', async () => {
+    const { urls, fetchFn } = fakeUpstream((url) => {
+      if (url.hostname === 'api.elevenlabs.io') {
+        return Response.json({ voice_id: 'S80713fa2M70CssGEBj5', name: 'Maks', labels: {} });
+      }
+      return Response.json({ voices: url.searchParams.get('language_code') === 'en-US' ? [alnilam, tech] : [] });
+    });
+    const catalog = createVoiceCatalog({ fetch: fetchFn, lazy: true });
+    expect(urls()).toEqual([]);
+    expect((await catalog.lookup('gemini', 'key', 'en-us-techagent-4')).status).toBe('resolved');
+    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+    // Not in its language's voices: not proof it is gone.
+    expect(await catalog.lookup('gemini', 'key', 'de-de-voice-1')).toEqual({ status: 'lookup_failed' });
+    expect((await catalog.lookup('elevenlabs', 'key', 'S80713fa2M70CssGEBj5')).status).toBe('resolved');
+    expect(urls().map((u) => [u.pathname, Object.fromEntries(u.searchParams)])).toEqual([
+      ['/v1beta/voices', { page_size: '1000', language_code: 'en-US' }],
+      ['/v1beta/voices', { page_size: '1000', language_code: 'de-DE' }],
+      ['/v1/voices/S80713fa2M70CssGEBj5', {}],
+    ]);
+  });
+
+  it('resolves a voice the provider gave no name as nameless, while its page shows the id', async () => {
+    const { fetchFn } = fakeUpstream(() => Response.json({ voices: [{ id: 'nameless-1' }] }));
+    const catalog = createVoiceCatalog({ fetch: fetchFn });
+    expect(
+      await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'nameless-1' }, 'key'),
+    ).toMatchObject({ voice: 'nameless-1', voiceName: null, status: 'resolved' });
+    expect(await catalog.page('gemini', 'key', { limit: 1 })).toEqual({
+      page: { provider: 'gemini', voices: [{ id: 'nameless-1', name: 'nameless-1' }] },
+    });
+  });
+
+  it('asks once for the same page wanted twice at once', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { calls, fetchFn } = fakeUpstream(async () => {
+      await gate;
+      return Response.json({ voices: [will], has_more: false });
+    });
+    const catalog = createVoiceCatalog({ fetch: fetchFn });
+    const both = Promise.all([0, 1].map(() => catalog.page('elevenlabs', 'key', { limit: 5 })));
+    release();
+    const [a, b] = await both;
+    expect(a).toEqual(b);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('keeps a page for a minute, by provider and the whole query', async () => {
+    let t = 0;
+    const { calls, fetchFn } = fakeUpstream(() => Response.json({ voices: [will], has_more: false }));
+    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t });
+    const query = { limit: 5, gender: 'male' };
+    await catalog.page('elevenlabs', 'key', query);
+    await catalog.page('elevenlabs', 'key', query);
+    await catalog.page('elevenlabs', 'key', { ...query, gender: 'female' });
+    await catalog.page('gemini', 'key', query);
+    expect(calls).toHaveLength(3);
+    t = 60_000;
+    await catalog.page('elevenlabs', 'key', query);
+    expect(calls).toHaveLength(4);
   });
 });

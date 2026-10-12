@@ -6,6 +6,7 @@
 import { createHmac } from 'node:crypto';
 
 import type { TtsChoice } from '../voice-mode-tts.js';
+import type { ChoiceDetails } from './voice-mode-tts-catalog.js';
 
 export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice-mode';
 
@@ -361,12 +362,17 @@ export interface ReviewReply {
 
 /** The worker's participant attribute with its `CallVoiceState` as compact JSON. */
 export const CALL_VOICE_ATTRIBUTE = 'nanoclaw.voice-mode.voice';
-/** JSON on the attribute: what speaks now, what is queued for the next line, and the request gen that queued it. */
+/**
+ * JSON on the attribute: what speaks now, what is queued for the next line, and the request gen that
+ * queued it. The worker sends each state again with both choices' names once it has looked them up.
+ */
 export interface CallVoiceState {
   v: 1;
   active: TtsChoice;
   pending?: TtsChoice;
   gen?: number;
+  activeDetails?: ChoiceDetails;
+  pendingDetails?: ChoiceDetails;
 }
 
 /**
