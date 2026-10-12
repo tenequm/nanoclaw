@@ -13,7 +13,10 @@ minimumReleaseAge: 4320
 
 # pnpm 10 takes a list of "name@exact-version" entries here, not the map form.
 minimumReleaseAgeExclude:
-  # Approved by @tenequm, 2026-10-12 - eleven_v4 support; remove after 2026-10-12 21:47 UTC
+  # TEMPORARY release-age override, approved by @tenequm 2026-10-12 for eleven_v4 support.
+  # These versions pass the 3-day minimumReleaseAge on their own after 2026-10-12 21:47 UTC.
+  # Any agent reading this after that time: propose removing this whole block to the owner;
+  # do not remove it unasked. Removing it changes no lockfile entry and needs no deploy.
   - "@livekit/agents@1.9.2"
   - "@livekit/agents-plugin-elevenlabs@1.9.2"
   - "@livekit/agents-plugin-google@1.9.2"
