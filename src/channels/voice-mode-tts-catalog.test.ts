@@ -521,6 +521,60 @@ describe('voice names', () => {
     }
   });
 
+  it('keeps a voice in doubt when a save finds the listing cold or stale, past a load that started before it', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let t = 0;
+      const state = { down: false, held: true };
+      const held: Array<() => void> = [];
+      const { fetchFn } = fakeUpstream(async () => {
+        if (state.held) await new Promise<void>((resolve) => held.push(resolve));
+        return state.down ? new Response('', { status: 503 }) : Response.json({ voices: [alnilam] });
+      });
+      const release = () => held.splice(0).forEach((go) => go());
+      const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
+      // Cold: the start's load is still on its way when a save asks.
+      catalog.warm({ gemini: 'key' });
+      catalog.close();
+      t = 5_000;
+      const cold = catalog.lookup('gemini', 'key', 'voice_cold', { confirm: true });
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(await cold).toEqual({ status: 'lookup_failed' });
+      release();
+      await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'alnilam')).toBe('resolved'));
+      expect(catalog.known('gemini', 'key', 'voice_cold')).toBeUndefined();
+      // Stale: a refresh failed, its retry is under way when a save asks, and finishes without the voice.
+      state.held = false;
+      state.down = true;
+      t = 3_600_000;
+      await catalog.lookup('gemini', 'key', 'alnilam');
+      await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'kore')).toBeUndefined());
+      state.held = true;
+      state.down = false;
+      t = 3_630_000;
+      const retrying = catalog.lookup('gemini', 'key', 'alnilam');
+      t = 3_631_000;
+      expect(await catalog.lookup('gemini', 'key', 'voice_new', { confirm: true })).toEqual({
+        status: 'lookup_failed',
+      });
+      await vi.waitFor(() => expect(held).toHaveLength(1));
+      release();
+      expect((await retrying).status).toBe('resolved');
+      await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'kore')).toBe('unavailable'));
+      // The retry started after the cold save asked, so it proves that voice gone, but not the one asked during it.
+      expect(catalog.known('gemini', 'key', 'voice_cold')).toBe('unavailable');
+      expect(catalog.known('gemini', 'key', 'voice_new')).toBeUndefined();
+      expect(await catalog.lookup('gemini', 'key', 'voice_new')).toEqual({ status: 'lookup_failed' });
+      // A load started after the save asked proves it gone.
+      state.held = false;
+      t = 3_641_000;
+      expect(await catalog.lookup('gemini', 'key', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
+      expect(catalog.known('gemini', 'key', 'voice_new')).toBe('unavailable');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('refreshes warmed listings on its own until closed, and stops trusting an absence nobody refreshed', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     try {

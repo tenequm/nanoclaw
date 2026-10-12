@@ -509,14 +509,15 @@ export function createVoiceCatalog(
       // A voice made since the listing loaded gets one more load before a save is refused.
       await within(refresh(names, provider, apiKey, true));
       listed = names.voices?.get(id);
-      if (!listed && names.loadedAt < asked) {
-        // No load since the save asked: the save goes through, and nothing says the voice is gone until one does.
-        makeRoom(names.doubted, MAX_KEPT_VOICES);
-        names.doubted.set(id, asked);
-        return { status: 'lookup_failed' };
-      }
     }
     if (listed) return { status: 'resolved', voice: listed };
+    if (confirm && !(provesAbsent(names, id) && asked - names.loadedAt < CONFIRM_FRESH_MS)) {
+      // Nothing loaded since the save asked proves the voice gone (a cold, stale or older listing): the save
+      // goes through, and nothing says the voice is gone until a load started after it succeeds.
+      makeRoom(names.doubted, MAX_KEPT_VOICES);
+      names.doubted.set(id, asked);
+      return { status: 'lookup_failed' };
+    }
     // Gemini's listing holds the caller's own voices too, and its get covers only those.
     return { status: provesAbsent(names, id) ? 'unavailable' : 'lookup_failed' };
   };
