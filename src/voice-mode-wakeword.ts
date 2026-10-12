@@ -247,7 +247,7 @@ export interface WakeWordStats {
  * the window ending at every 80 ms of new audio is scored in the worker thread, one at a time, in
  * order (audio arrives in bursts, so a few wait; past WAKE_MAX_QUEUED the oldest is dropped). A score
  * at or over the threshold is a detection, at most one per `debounceMs`; the audio before it is
- * forgotten, so it cannot fire twice.
+ * forgotten (silenced), so it cannot fire twice.
  */
 export class WakeWordSpotter {
   readonly phrase: string;
@@ -259,7 +259,6 @@ export class WakeWordSpotter {
   /** The last window's audio: its length is the classifier's (2 s for 16 embeddings). */
   private ring = new Float32Array(WAKE_WINDOW_SAMPLES);
   private write = 0;
-  private filled = 0;
   /** Samples pushed so far: where the window just taken ends, for the thread to reuse work. */
   private position = 0;
   private sinceScore = 0;
@@ -302,7 +301,6 @@ export class WakeWordSpotter {
           if (size !== this.ring.length) {
             this.ring = new Float32Array(size);
             this.write = 0;
-            this.filled = 0;
           }
           this.loaded = true;
           return resolve();
@@ -324,15 +322,25 @@ export class WakeWordSpotter {
   }
 
   /**
-   * Score windows (on) or not (off). Turned on, the first window scored is all new audio: what was
-   * said while it was off (a phrase while the turn was open, the end of a review recording) never opens a turn.
+   * Score windows (on) or not (off). Turned on, what was said while it was off (a phrase while the turn
+   * was open, the end of a review recording) is forgotten, so it never opens a turn; the first window
+   * scores 80 ms on, not 2 s, so a phrase said right away is heard.
    */
   listen(on: boolean): void {
     if (on === this.listening) return;
     this.listening = on;
     this.sinceScore = 0;
     this.queued = [];
-    if (on) this.filled = 0;
+    if (on) this.forget();
+  }
+
+  /**
+   * Silence in place of the audio heard so far: none of it reaches a window again, and no window waits
+   * for 2 s of new audio, the part not heard yet scoring as quiet before speech. That is a shape the
+   * model trained on: livekit-wakeword pads each positive at the end of a 2 s clip of zeros.
+   */
+  private forget(): void {
+    this.ring.fill(0);
   }
 
   /** 16 kHz mono audio, in order. */
@@ -344,12 +352,11 @@ export class WakeWordSpotter {
       this.ring[this.write] = pcm[i] / 32768;
       this.write = (this.write + 1) % size;
       this.position++;
-      if (this.filled < size) this.filled++;
-      // Like the reference listener: a full window, then one every 80 ms, on the 80 ms boundary
-      // whatever the frame size, so consecutive windows share their embeddings.
+      // A window every 80 ms, on the 80 ms boundary whatever the frame size, so consecutive windows
+      // share their embeddings.
       if (!scoring || ++this.sinceScore < WAKE_HOP_SAMPLES) continue;
       this.sinceScore = 0;
-      if (this.filled >= size) this.take();
+      this.take();
     }
   }
 
@@ -418,7 +425,7 @@ export class WakeWordSpotter {
     this.stats.maxScore = Math.max(this.stats.maxScore, score);
     if (this.detects(id, score)) {
       // The phrase is in the window just scored: forget it, as the reference listener clears its buffer.
-      this.filled = 0;
+      this.forget();
       this.sinceScore = 0;
       this.queued = [];
       this.validFrom = this.nextId;

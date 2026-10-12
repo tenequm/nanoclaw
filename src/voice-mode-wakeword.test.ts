@@ -168,31 +168,43 @@ describe('WakeWordSpotter', () => {
     // The phrase ends right before listening turns on, so it is all in the 2 s ring.
     await feed(spotter, concat(silence(1), positive()));
     spotter.listen(true);
-    await feed(spotter, silence(1.9));
-    expect(spotter.summary.scored).toBe(0);
-    await feed(spotter, silence(1));
-    expect(spotter.summary.scored).toBeGreaterThan(0);
+    await feed(spotter, silence(0.08));
+    expect(spotter.summary.scored).toBe(1);
+    await feed(spotter, silence(2.9));
+    expect(spotter.summary.scored).toBeGreaterThan(30);
+    expect(spotter.summary.maxScore).toBeLessThan(0.1);
     expect(detections).toEqual([]);
   });
 
+  it('turned on, hears a phrase said right away: no 2 s wait for a full window', async () => {
+    const { spotter, detections, windows } = make();
+    await spotter.ready;
+    await feed(spotter, silence(3));
+    spotter.listen(true);
+    // positive.wav is silent until 1.2 s: 1.3 s of audio in all, the phrase ending 0.9 s after listening began.
+    await feed(spotter, concat(positive().subarray(17_600), silence(0.4)));
+    expect(detections).toHaveLength(1);
+    expect(detections[0]).toBeGreaterThan(0.9);
+    expect(windows[0].end - silence(3).length).toBeLessThan(WAKE_WINDOW_SAMPLES);
+  });
+
   it('scores the window at every 80 ms boundary, whatever the frame size, also when audio comes in a burst', async () => {
-    const { spotter, detections } = make();
+    const { spotter, detections, windows } = make();
     await spotter.ready;
     spotter.listen(true);
-    // In 30 ms frames: the 2 s fill, then 0.64 s at once (8 windows wait their turn), then the rest.
+    // In 30 ms frames, 0.64 s at once (8 windows: one scoring, seven waiting their turn).
     const audio = concat(silence(1), positive());
     const idle = () => vi.waitFor(() => expect((spotter as unknown as { inflight: boolean }).inflight).toBe(false));
-    const pushFrames = (from: number, to: number) => {
+    const burst = 8 * WAKE_HOP_SAMPLES;
+    for (let from = 0; from < audio.length; from += burst) {
+      const to = Math.min(from + burst, audio.length);
       for (let at = from; at < to; at += 480) spotter.push(audio.subarray(at, Math.min(at + 480, to)));
-    };
-    pushFrames(0, 32_000);
-    await idle();
-    pushFrames(32_000, 42_240);
-    await idle();
-    pushFrames(42_240, audio.length);
-    await idle();
-    expect(spotter.summary).toMatchObject({ scored: 13, skipped: 0, detections: 1 });
+      await idle();
+    }
+    expect(spotter.summary).toMatchObject({ skipped: 0, detections: 1 });
+    expect(spotter.summary.scored).toBeGreaterThan(30);
     expect(detections).toHaveLength(1);
+    expect(windows[0].end % WAKE_HOP_SAMPLES).toBe(0);
   });
 
   it('debounces: a second wake word within 2 s of the first is not a detection', async () => {
@@ -202,7 +214,7 @@ describe('WakeWordSpotter', () => {
       await spotter.ready;
       spotter.listen(true);
       const first = concat(silence(1), positive());
-      // The audio after a detection refills for 2 s before anything scores, so the clock decides.
+      // Scoring goes on right after a detection, over silence in place of the phrase: the clock decides.
       await feed(spotter, concat(first, silence(0.5), positive(), silence(1)), (at) => {
         if (at === first.length - (first.length % WAKE_HOP_SAMPLES)) clock += gapMs;
       });
