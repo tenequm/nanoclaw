@@ -329,7 +329,7 @@ describe('voice names', () => {
     const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
     expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
     expect(calls).toHaveLength(2);
-    // Plain lookups trust the listing, and so does a save while it is seconds old.
+    // Plain lookups trust the listing, and so does a save that asked no later than its load started.
     expect(await catalog.lookup('gemini', 'key', 'voice_new')).toEqual({ status: 'unavailable' });
     expect(await catalog.lookup('gemini', 'key', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
     expect(calls).toHaveLength(2);
@@ -554,11 +554,10 @@ describe('voice names', () => {
       t = 3_630_000;
       const retrying = catalog.lookup('gemini', 'key', 'alnilam');
       t = 3_631_000;
-      expect(await catalog.lookup('gemini', 'key', 'voice_new', { confirm: true })).toEqual({
-        status: 'lookup_failed',
-      });
+      const saving = catalog.lookup('gemini', 'key', 'voice_new', { confirm: true });
       await vi.waitFor(() => expect(held).toHaveLength(1));
       release();
+      expect(await saving).toEqual({ status: 'lookup_failed' });
       expect((await retrying).status).toBe('resolved');
       await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'kore')).toBe('unavailable'));
       // The retry started after the cold save asked, so it proves that voice gone, but not the one asked during it.
@@ -569,6 +568,44 @@ describe('voice names', () => {
       state.held = false;
       t = 3_641_000;
       expect(await catalog.lookup('gemini', 'key', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
+      expect(catalog.known('gemini', 'key', 'voice_new')).toBe('unavailable');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refuses a save only on a listing whose load started after it asked, never on one already under way', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let t = 0;
+      const state = { held: false };
+      const held: Array<() => void> = [];
+      const { calls, fetchFn } = fakeUpstream(async () => {
+        if (state.held) await new Promise<void>((resolve) => held.push(resolve));
+        return Response.json({ voices: [alnilam] });
+      });
+      const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
+      expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+      // The hourly reload starts, and a save asks while it runs; it lands inside the save's wait.
+      state.held = true;
+      t = 3_600_000;
+      expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+      t = 3_601_000;
+      const saving = catalog.lookup('gemini', 'key', 'voice_new', { confirm: true });
+      await vi.waitFor(() => expect(held).toHaveLength(1));
+      held.splice(0).forEach((go) => go());
+      expect(await saving).toEqual({ status: 'lookup_failed' });
+      expect(calls).toHaveLength(2);
+      expect(catalog.known('gemini', 'key', 'voice_new')).toBeUndefined();
+      expect(
+        (await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'voice_new' }, 'key'))
+          .status,
+      ).toBe('lookup_failed');
+      // The next save starts its own load, which proves the voice gone.
+      state.held = false;
+      t = 3_602_000;
+      expect(await catalog.lookup('gemini', 'key', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
+      expect(calls).toHaveLength(3);
       expect(catalog.known('gemini', 'key', 'voice_new')).toBe('unavailable');
     } finally {
       vi.useRealTimers();

@@ -96,8 +96,6 @@ const MAX_CACHED_PAGES = 200;
 const NAMES_TTL_MS = 3_600_000;
 /** After a listing failed to load, the next try waits this long. */
 const NAMES_RETRY_MS = 30_000;
-/** A listing this new answers a save's miss without another load. */
-const CONFIRM_FRESH_MS = 10_000;
 /** How long a lookup waits on the provider. */
 const LOOKUP_WAIT_MS = 3_000;
 /** How often warmed listings are checked for a refresh that is due. */
@@ -505,15 +503,15 @@ export function createVoiceCatalog(
     if (!names.voices) await within(loading);
     let listed = names.voices?.get(id);
     if (!listed && provider === 'elevenlabs') return elevenLabsKept(names, apiKey, id, confirm);
-    if (!listed && confirm && names.voices && !names.stale && asked - names.loadedAt >= CONFIRM_FRESH_MS) {
-      // A voice made since the listing loaded gets one more load before a save is refused.
+    if (!listed && confirm && names.voices && names.loadedAt < asked) {
+      // A save is refused only on a listing loaded since it asked: one more load, unless one is under way.
       await within(refresh(names, provider, apiKey, true));
       listed = names.voices?.get(id);
     }
     if (listed) return { status: 'resolved', voice: listed };
-    if (confirm && !(provesAbsent(names, id) && asked - names.loadedAt < CONFIRM_FRESH_MS)) {
-      // Nothing loaded since the save asked proves the voice gone (a cold, stale or older listing): the save
-      // goes through, and nothing says the voice is gone until a load started after it succeeds.
+    if (confirm && !(provesAbsent(names, id) && names.loadedAt >= asked)) {
+      // No whole listing loaded since the save asked (a cold, stale or older one): the save goes through,
+      // and nothing says the voice is gone until a load started after it succeeds.
       makeRoom(names.doubted, MAX_KEPT_VOICES);
       names.doubted.set(id, asked);
       return { status: 'lookup_failed' };
