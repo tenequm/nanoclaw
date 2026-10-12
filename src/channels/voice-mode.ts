@@ -87,8 +87,9 @@ const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 /** A `PATCH /voice/tts` body is one small object: `{provider, model?, voice?}` or `{"reset": true}`. */
 const MAX_TTS_BODY_BYTES = 1024;
 const MAX_CATALOG_LIMIT = 100;
-/** Longest `q`, `language` or `cursor` a catalog request takes. */
+/** Longest `q`, `language`, `gender` or `cursor` a catalog request takes. */
 const MAX_CATALOG_PARAM_CHARS = 512;
+const CATALOG_GENDERS = new Set(['female', 'male', 'neutral']);
 
 /**
  * The shared webhook server listens on every interface, and the voice routes are meant to be reached
@@ -476,7 +477,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     return replyJson(res, 200, ttsView(savedTts(updated)));
   };
 
-  /** One page of a provider's voices, filtered by `q` and `language`. */
+  /** One page of a provider's voices, filtered by `q`, `language` and `gender`. */
   const handleVoices = async (
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -492,19 +493,23 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     const provider = params.get('provider');
     const rawLimit = params.get('limit') ?? String(MAX_CATALOG_LIMIT);
     const limit = Number(rawLimit);
-    const [q, language, cursor] = ['q', 'language', 'cursor'].map((key) => params.get(key) || undefined);
+    const [q, language, rawGender, cursor] = ['q', 'language', 'gender', 'cursor'].map(
+      (key) => params.get(key) || undefined,
+    );
+    const gender = rawGender?.toLowerCase();
     if (
       !isTtsProvider(provider) ||
       !/^\d{1,3}$/.test(rawLimit) ||
       limit < 1 ||
       limit > MAX_CATALOG_LIMIT ||
-      [q, language, cursor].some((v) => v !== undefined && v.length > MAX_CATALOG_PARAM_CHARS)
+      [q, language, rawGender, cursor].some((v) => v !== undefined && v.length > MAX_CATALOG_PARAM_CHARS) ||
+      (gender !== undefined && !CATALOG_GENDERS.has(gender))
     ) {
       return replyJson(res, 400, { error: 'bad_request' });
     }
     const apiKey = providerKeys[provider];
     if (!apiKey) return replyJson(res, 503, { error: 'provider_unavailable', provider });
-    const result = await catalog.page(provider, apiKey, { q, language, cursor, limit });
+    const result = await catalog.page(provider, apiKey, { q, language, gender, cursor, limit });
     if ('error' in result) return replyJson(res, result.error === 'upstream' ? 502 : 400, { error: result.error });
     return replyJson(res, 200, result.page);
   };

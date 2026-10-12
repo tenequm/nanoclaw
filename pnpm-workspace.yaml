@@ -10,3 +10,11 @@ onlyBuiltDependencies:
 # a no-op. New package versions must exist on the registry this many minutes
 # (4320 = 3 days) before pnpm will resolve them.
 minimumReleaseAge: 4320
+
+# pnpm 10 takes a list of "name@exact-version" entries here, not the map form.
+minimumReleaseAgeExclude:
+  # Approved by @tenequm, 2026-10-12 - eleven_v4 support; remove after 2026-10-12 21:47 UTC
+  - "@livekit/agents@1.9.2"
+  - "@livekit/agents-plugin-elevenlabs@1.9.2"
+  - "@livekit/agents-plugin-google@1.9.2"
+  - "@livekit/agents-plugin-silero@1.9.2"

@@ -20,7 +20,7 @@ import { grantRole, revokeRole } from '../modules/permissions/db/user-roles.js';
 import { getWebhookStatus, stopWebhookServer } from '../webhook-server.js';
 import type { LiveKitServerApi } from './voice-mode-livekit.js';
 import fixtures from './voice-mode-tts.fixtures.json' with { type: 'json' };
-import { createVoiceCatalog, ELEVENLABS_VOICES_URL, GEMINI_VOICES_URL } from './voice-mode-tts-catalog.js';
+import { createVoiceCatalog, ELEVENLABS_VOICES_URL } from './voice-mode-tts-catalog.js';
 import {
   admitsVoiceModePeer,
   createVoiceModeAdapter,
@@ -199,9 +199,9 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
   let adapter: VoiceModeChannelAdapter;
   let base: string;
   let token: string;
-  let upstream: { calls: Array<{ url: URL; headers: Record<string, string> }>; fail: boolean };
+  let upstream: { calls: Array<{ url: URL; headers: Headers }>; fail: boolean };
 
-  /** Gemini's listing over two upstream pages: 101 voices, the two fixture voices at 98 and 99. */
+  /** Gemini's listing: 101 voices, the two fixture voices at 98 and 99. */
   const geminiVoices = Array.from({ length: 101 }, (_, i) =>
     i === 98
       ? {
@@ -224,16 +224,32 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
           }
         : { id: `de-de-voice-${i}`, display_name: `Stimme ${i}`, language_code: 'de-DE', gender: 'neutral' },
   );
-  const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = new URL(String(input));
-    upstream.calls.push({ url, headers: init?.headers as Record<string, string> });
-    if (upstream.fail) return new Response('nope', { status: 500 });
-    if (url.href.startsWith(GEMINI_VOICES_URL)) {
-      const second = url.searchParams.get('pageToken') === 'p2';
-      return Response.json(
-        second ? { voices: geminiVoices.slice(60) } : { voices: geminiVoices.slice(0, 60), next_page_token: 'p2' },
-      );
+  /** Gemini's `voices.list` as the service answers it: filtered, paged, with `p<offset>` page tokens. */
+  const geminiListing = (params: URLSearchParams): Response => {
+    const token = params.get('page_token');
+    if (token !== null && !/^p\d+$/.test(token)) {
+      return Response.json({ error: { code: 400, status: 'INVALID_ARGUMENT' } }, { status: 400 });
     }
+    const [gender, language, search] = ['gender', 'language_code', 'search'].map((k) => params.get(k)?.toLowerCase());
+    const matches = geminiVoices.filter(
+      (v) =>
+        (!gender || v.gender === gender) &&
+        (!language || v.language_code.toLowerCase() === language) &&
+        (!search || [v.display_name, v.description ?? ''].some((f) => f.toLowerCase().includes(search))),
+    );
+    const offset = token ? Number(token.slice(1)) : 0;
+    const end = offset + Number(params.get('page_size') ?? 50);
+    return Response.json({
+      voices: matches.slice(offset, end),
+      ...(end < matches.length && { next_page_token: `p${end}` }),
+    });
+  };
+  const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const url = new URL(request.url);
+    upstream.calls.push({ url, headers: request.headers });
+    if (upstream.fail) return new Response('nope', { status: 500 });
+    if (url.hostname === 'generativelanguage.googleapis.com') return geminiListing(url.searchParams);
     return Response.json({
       voices: [
         {
@@ -295,7 +311,6 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     fetch(`${base}/tts?t=${t}`, { method, body, headers: { 'Content-Type': 'application/json' } });
   const voices = (query: string, t = token) => fetch(`${base}/voices?t=${t}&${query}`);
   const json = async (res: Response) => ({ status: res.status, body: (await res.json()) as unknown });
-  const geminiCursor = (offset: number) => Buffer.from(JSON.stringify({ o: offset })).toString('base64url');
 
   it('refuses an unknown link on every voice route', async () => {
     const unknown = 'f'.repeat(32);
@@ -383,8 +398,8 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     expect(await res.text()).toBe('Unknown call link');
   });
 
-  it("pages Gemini's cached list with filters and a cursor, fetching it once", async () => {
-    expect(await json(await voices(`provider=gemini&limit=2&cursor=${geminiCursor(98)}`))).toEqual({
+  it("pages Gemini's listing with its own filters and page tokens", async () => {
+    expect(await json(await voices('provider=gemini&limit=2&cursor=p98'))).toEqual({
       status: 200,
       body: fixtures.catalogGemini,
     });
@@ -392,12 +407,20 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
       status: 200,
       body: { provider: 'gemini', voices: [fixtures.catalogGemini.voices[1]] },
     });
-    const first = (await json(await voices('provider=gemini'))).body as { voices: unknown[]; next: string };
+    expect(await json(await voices('provider=gemini&gender=FEMALE&language=en-US'))).toEqual({
+      status: 200,
+      body: { provider: 'gemini', voices: [fixtures.catalogGemini.voices[0]] },
+    });
+    const first = (await json(await voices('provider=gemini&gender='))).body as { voices: unknown[]; next: string };
     expect(first.voices).toHaveLength(100);
-    expect(first.next).toBe(geminiCursor(100));
-    // Two upstream pages for the whole list, once, with the key in a header only.
-    expect(upstream.calls.map((c) => c.url.searchParams.get('pageToken'))).toEqual([null, 'p2']);
-    expect(upstream.calls.every((c) => c.headers['x-goog-api-key'] === GEMINI_KEY)).toBe(true);
+    expect(first.next).toBe('p100');
+    expect(upstream.calls.map((c) => Object.fromEntries(c.url.searchParams))).toEqual([
+      { page_size: '2', page_token: 'p98' },
+      { page_size: '100', search: 'ADVISOR', language_code: 'EN-us' },
+      { page_size: '100', language_code: 'en-US', gender: 'female' },
+      { page_size: '100' },
+    ]);
+    expect(upstream.calls.every((c) => c.headers.get('x-goog-api-key') === GEMINI_KEY)).toBe(true);
     expect(upstream.calls.every((c) => !c.url.href.includes(GEMINI_KEY))).toBe(true);
   });
 
@@ -413,7 +436,7 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     });
     await adapter.setup({ onInbound: () => {}, onInboundEvent: () => {}, onMetadata: () => {}, onAction: () => {} });
     await vi.waitFor(() => expect(getWebhookStatus()?.port).toBe(port), { timeout: 2000, interval: 10 });
-    const res = await voices('provider=elevenlabs&q=will&language=en&cursor=tok-2&limit=10');
+    const res = await voices('provider=elevenlabs&q=will&language=en&gender=Male&cursor=tok-2&limit=10');
     const text = await res.text();
     expect(res.status).toBe(200);
     expect(JSON.parse(text)).toEqual(fixtures.catalogElevenLast);
@@ -424,16 +447,17 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
       page_size: '10',
       search: 'will',
       language: 'en',
+      gender: 'male',
       next_page_token: 'tok-2',
       include_total_count: 'false',
     });
-    expect(call.headers['xi-api-key']).toBe(ELEVEN_KEY);
+    expect(call.headers.get('xi-api-key')).toBe(ELEVEN_KEY);
     // With the key, the provider is offered and a pick of it saves.
     const pick = await json(await tts('PATCH', '{"provider":"elevenlabs"}'));
     expect(pick).toMatchObject({
       status: 200,
       body: {
-        effective: { provider: 'elevenlabs', model: 'eleven_turbo_v2_5', voice: 'bIHbv24MWmeRgasZH58o' },
+        effective: { provider: 'elevenlabs', model: 'eleven_v4_turbo', voice: 'bIHbv24MWmeRgasZH58o' },
         saved: { provider: 'elevenlabs', model: null, voice: null },
       },
     });
@@ -452,6 +476,9 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
       'provider=gemini&limit=2.5',
       'provider=gemini&cursor=bm9wZQ',
       `provider=gemini&q=${'x'.repeat(513)}`,
+      'provider=gemini&gender=other',
+      'provider=elevenlabs&gender=females',
+      `provider=gemini&gender=${'f'.repeat(513)}`,
     ]) {
       expect(await json(await voices(query))).toEqual({ status: 400, body: { error: 'bad_request' } });
     }
@@ -464,7 +491,7 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
       body: { error: 'upstream' },
     });
     expect(text).not.toContain(GEMINI_KEY);
-    // A failed fetch is not cached: the next request tries again.
+    // Nothing is kept: the next request asks again.
     upstream.fail = false;
     expect((await voices('provider=gemini&limit=1')).status).toBe(200);
   });

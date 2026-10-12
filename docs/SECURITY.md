@@ -274,7 +274,8 @@ This should be rare. When a zero-day fix or critical dependency requires an imme
 2. The entry must pin the **exact version** being excluded — never a range or wildcard
    ```yaml
    minimumReleaseAgeExclude:
-     some-package: "1.2.3"  # Approved by @user, 2026-04-14 — CVE-XXXX-YYYY fix
+     # Approved by @user, 2026-04-14 - CVE-XXXX-YYYY fix
+     - "some-package@1.2.3"
    ```
 3. The exclusion should be removed once the version ages past the threshold (i.e. after 3 days)
 4. Automated agents (Claude, CI bots) must never add exclusions without human sign-off

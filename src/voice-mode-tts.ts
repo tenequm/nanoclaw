@@ -110,7 +110,11 @@ export function wrapSdkTts(sdk: SdkTts, log: Pick<Console, 'info' | 'warn'>): Tt
 const GEMINI_MODEL = /^gemini-[a-z0-9.-]{1,48}-tts$/;
 const GEMINI_VOICE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const GEMINI_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
-const ELEVENLABS_MODELS = ['eleven_turbo_v2_5', 'eleven_flash_v2_5', 'eleven_multilingual_v2'];
+/** The first is the default. Widened to `string` after the check so `includes` takes any saved model. */
+const ELEVENLABS_MODELS: readonly string[] = [
+  'eleven_v4_turbo',
+  'eleven_v4',
+] as const satisfies readonly elevenlabs.TTSModels[];
 const ELEVENLABS_VOICE = /^[A-Za-z0-9]{10,40}$/;
 
 export const TTS_DEFAULT_CHOICE: TtsChoice = { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'Alnilam' };

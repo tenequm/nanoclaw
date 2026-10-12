@@ -142,7 +142,7 @@ describe('TTS choices', () => {
     });
     expect(effectiveTts({ provider: 'elevenlabs', model: null, voice: null })).toEqual({
       provider: 'elevenlabs',
-      model: 'eleven_turbo_v2_5',
+      model: 'eleven_v4_turbo',
       voice: 'bIHbv24MWmeRgasZH58o',
     });
     expect(effectiveTts({ provider: 'elevenlabs', model: 'gemini-3.8-flash-tts', voice: 'Alnilam' })).toEqual(
@@ -152,7 +152,7 @@ describe('TTS choices', () => {
 
   it('reads a requested choice and names the first invalid field', () => {
     expect(readTtsChoice({ provider: 'elevenlabs', voice: 'bIHbv24MWmeRgasZH58o' })).toEqual({
-      choice: { provider: 'elevenlabs', model: 'eleven_turbo_v2_5', voice: 'bIHbv24MWmeRgasZH58o' },
+      choice: { provider: 'elevenlabs', model: 'eleven_v4_turbo', voice: 'bIHbv24MWmeRgasZH58o' },
     });
     expect(readTtsChoice({ provider: 'gemini', model: 'gemini-3.8-flash-lite-tts', voice: 'achernar' })).toEqual({
       choice: { provider: 'gemini', model: 'gemini-3.8-flash-lite-tts', voice: 'achernar' },
@@ -160,7 +160,9 @@ describe('TTS choices', () => {
     expect(readTtsChoice({ provider: 'openai' })).toEqual({ invalid: 'provider' });
     expect(readTtsChoice({ provider: 'toString' })).toEqual({ invalid: 'provider' });
     expect(readTtsChoice(['gemini'])).toEqual({ invalid: 'provider' });
-    expect(readTtsChoice({ provider: 'elevenlabs', model: 'eleven_v3' })).toEqual({ invalid: 'model' });
+    for (const model of ['eleven_v3', 'eleven_turbo_v2_5', 'eleven_v3_conversational']) {
+      expect(readTtsChoice({ provider: 'elevenlabs', model })).toEqual({ invalid: 'model' });
+    }
     expect(readTtsChoice({ provider: 'gemini', model: 7 })).toEqual({ invalid: 'model' });
     expect(readTtsChoice({ provider: 'gemini', model: `gemini-${'x'.repeat(49)}-tts` })).toEqual({ invalid: 'model' });
     expect(readTtsChoice({ provider: 'gemini', voice: 'a b' })).toEqual({ invalid: 'voice' });
