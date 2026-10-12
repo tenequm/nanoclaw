@@ -1062,6 +1062,127 @@ export async function writeTurnRecording(root: string, record: TurnRecord, audio
   return base;
 }
 
+/** A wake word detection in a call recording: where its scored window ended, and its score. */
+export interface CallWakeEvent {
+  streamMs: number;
+  score: number;
+}
+
+/** What a call recording's sidecar JSON says about it. */
+export interface CallRecord {
+  callId: string;
+  lineId: string;
+  agent: string;
+  startedAt: string;
+  endedAt?: string;
+  durationMs: number;
+  wakeModel?: string;
+  wakeThreshold?: number;
+  wakes: CallWakeEvent[];
+}
+
+/** How often the WAV header is brought up to date, so a call cut off by a crash still reads. */
+const CALL_RECORDING_HEADER_MS = 5_000;
+
+/**
+ * The caller's whole call as the worker heard it (16 kHz mono, the agent's lines as silence), waiting
+ * included: `<root>/<agent>/<YYYY-MM-DD>/<callId>-call.wav` and `.json`, owner-only. Audio goes to
+ * disk as it comes, in order; the header's sizes are rewritten every few seconds and at `close`.
+ */
+export class CallRecording {
+  readonly base: string;
+  private readonly record: CallRecord;
+  private readonly file: Promise<fs.promises.FileHandle>;
+  /** Every write, in order: the audio appends, the header patches, the close. */
+  private chain: Promise<unknown>;
+  private bytes = 0;
+  private sinceHeader = 0;
+  private closed = false;
+  private failed = false;
+
+  constructor(
+    root: string,
+    call: { callId: string; lineId: string; agent: string },
+    private readonly log: Pick<Console, 'warn'>,
+    at = Date.now(),
+  ) {
+    const startedAt = new Date(at).toISOString();
+    const dir = path.join(root, pathSegment(call.agent), startedAt.slice(0, 10));
+    this.base = path.join(dir, `${pathSegment(call.callId)}-call`);
+    this.record = { ...call, startedAt, durationMs: 0, wakes: [] };
+    this.file = fs.promises
+      .mkdir(dir, { recursive: true, mode: 0o700 })
+      .then(() => fs.promises.open(`${this.base}.wav`, 'w', 0o600));
+    this.chain = this.file
+      .then((file) => file.write(pcmToWav(new Int16Array(0), INPUT_SAMPLE_RATE), 0, 44, 0))
+      .then(() => this.writeJson());
+    this.chain.catch((err: unknown) => this.fail(err));
+  }
+
+  push(pcm: Int16Array): void {
+    if (this.closed || pcm.length === 0) return;
+    const data = Buffer.alloc(pcm.length * 2);
+    for (let i = 0; i < pcm.length; i++) data.writeInt16LE(pcm[i], i * 2);
+    const at = 44 + this.bytes;
+    this.bytes += data.length;
+    this.sinceHeader += pcm.length;
+    this.then((file) => file.write(data, 0, data.length, at));
+    if (this.sinceHeader >= samplesOf(CALL_RECORDING_HEADER_MS)) {
+      this.sinceHeader = 0;
+      const written = this.bytes;
+      this.then((file) => this.patchHeader(file, written));
+    }
+  }
+
+  wake(event: CallWakeEvent): void {
+    if (!this.closed) this.record.wakes.push(event);
+  }
+
+  /** The header and the JSON with how the call ended; safe to call more than once. */
+  async close(wake?: { model?: string; threshold?: number }): Promise<void> {
+    if (this.closed)
+      return this.chain.then(
+        () => undefined,
+        () => undefined,
+      );
+    this.closed = true;
+    this.record.endedAt = new Date().toISOString();
+    if (wake?.model) this.record.wakeModel = wake.model;
+    if (wake?.threshold !== undefined) this.record.wakeThreshold = wake.threshold;
+    const written = this.bytes;
+    this.then((file) => this.patchHeader(file, written));
+    this.then(() => this.writeJson());
+    this.then((file) => file.close());
+    await this.chain.catch(() => undefined);
+  }
+
+  private then(step: (file: fs.promises.FileHandle) => Promise<unknown>): void {
+    this.chain = this.chain.then(() => this.file.then(step));
+    this.chain.catch((err: unknown) => this.fail(err));
+  }
+
+  /** The sizes in the header, for the audio written up to `bytes`. */
+  private async patchHeader(file: fs.promises.FileHandle, bytes: number): Promise<void> {
+    const sizes = Buffer.alloc(4);
+    sizes.writeUInt32LE(36 + bytes, 0);
+    await file.write(sizes, 0, 4, 4);
+    sizes.writeUInt32LE(bytes, 0);
+    await file.write(sizes, 0, 4, 40);
+  }
+
+  private writeJson(): Promise<void> {
+    this.record.durationMs = Math.round(msOf(this.bytes / 2));
+    return fs.promises.writeFile(`${this.base}.json`, `${JSON.stringify(this.record, null, 2)}\n`, { mode: 0o600 });
+  }
+
+  private fail(err: unknown): void {
+    if (this.failed) return;
+    this.failed = true;
+    this.closed = true;
+    this.log.warn('voice-mode worker: the call recording stopped', { err });
+  }
+}
+
 /** Deletes recordings older than `days`, and the directories that leaves empty; returns how many files went. */
 export async function pruneRecordings(root: string, days: number, now = Date.now()): Promise<number> {
   const cutoff = now - days * DAY_MS;
@@ -1101,6 +1222,9 @@ export async function pruneRecordings(root: string, days: number, now = Date.now
 
 /** VOICE_MODE_TRANSCRIPT_DEBUG: `1` logs every raw transcription message and what the turns made of it. */
 export const transcriptDebugOn = (value: string | undefined): boolean => value?.trim() === '1';
+
+/** VOICE_MODE_CALL_RECORDING: `true` or `1` records each caller's whole call, waiting included. */
+export const callRecordingOn = (value: string | undefined): boolean => ['1', 'true'].includes(value?.trim() ?? '');
 
 /** VOICE_MODE_RECORDINGS_DAYS: 0 (the default) records nothing. */
 export function recordingDays(raw: string | undefined): number {
@@ -2354,13 +2478,14 @@ export class CallTurns {
   }
 
   /** The caller's audio, every frame: kept for pre-rolls, and the open turn's while no agent line plays. */
-  audio(pcm: Int16Array): void {
+  audio(pcm: Int16Array): Int16Array {
     // Speech under the agent's line is not transcribed: the ring and the turn hear silence instead.
     const heard = this.agentSpeaking ? new Int16Array(pcm.length) : pcm;
     this.ring.push(heard);
-    if (!this.turn) return;
+    if (!this.turn) return heard;
     this.deps.transcriber.push(heard);
     this.capture?.push(heard);
+    return heard;
   }
 
   /** The VAD: speech started or ended at stream position `at`. */
@@ -4060,6 +4185,7 @@ function defaultDeps(): RunCallDeps {
     'LIVEKIT_API_SECRET',
     'LIVEKIT_HOST_URL',
     'VOICE_MODE_RECORDINGS_DAYS',
+    'VOICE_MODE_CALL_RECORDING',
     'VOICE_MODE_MAX_SPOKEN_CHARS',
     'VOICE_MODE_TTS_DEESS',
     'VOICE_MODE_TTS_NOTCH',
@@ -4140,6 +4266,9 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   if (!geminiKey) return abandon('VOICE_MODE_GEMINI_API_KEY is not set for the worker');
   const providerKeys = providerKeysFrom(deps.env);
   const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
+  const recordCall = callRecordingOn(deps.env.VOICE_MODE_CALL_RECORDING);
+  /** The whole call, when VOICE_MODE_CALL_RECORDING is on: opened once the caller's audio can flow. */
+  let callRecording: CallRecording | undefined;
   const transcriptDebug = transcriptDebugOn(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG);
   /** Spoken lines so far, for those no label numbered. */
   let replies = 0;
@@ -4334,6 +4463,9 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       callVoice?.close().catch(() => undefined),
       // Before the job exits: a process leaving with the wake word thread mid-inference aborts.
       spotter?.close().catch(() => undefined),
+      callRecording?.close(
+        spotter ? { model: wakeWordSettings(deps.env)?.classifier, threshold: spotter.threshold } : undefined,
+      ),
     ]);
     hostLink.abort();
     await ctx.deleteRoom().catch(() => undefined);
@@ -4480,6 +4612,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       ...(transcriptDebug ? { debug: true } : {}),
     },
   );
+  if (recordCall) {
+    callRecording = new CallRecording(
+      deps.recordingsRoot ?? recordingsRoot(),
+      { callId: meta.callId, lineId: meta.lineId, agent: meta.agentName },
+      callLog,
+    );
+  }
   try {
     callVoice = await deps.createVoice(
       ctx,
@@ -4519,7 +4658,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           // Scored only while it can open a turn: waiting in auto, and not while an agent line plays.
           wakeWord?.listen(callTurns.spotting);
           spotter?.push(pcm);
-          callTurns.audio(pcm);
+          const heard = callTurns.audio(pcm);
+          callRecording?.push(heard);
         },
         onSpeech: (speaking, at) => {
           callerSpeaking = speaking;
@@ -4551,6 +4691,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     turnTaking.close();
     callTurns.close();
     transcriber.close();
+    await callRecording?.close();
     return abandon('could not set up the call audio', { err });
   }
   if (!ending) {
@@ -4564,6 +4705,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
             score: Math.round(score * 1000) / 1000,
             scoredMsAgo: Math.round(msOf(callTurns.position - end)),
           });
+          callRecording?.wake({ streamMs: Math.round(msOf(end)), score: Math.round(score * 1000) / 1000 });
           if (ending || review?.reviewing) return;
           callTurns.onWake(end);
         },
@@ -4772,6 +4914,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'LIVEKIT_HOST_URL',
     'VOICE_MODE_WORKER_HEALTH_PORT',
     'VOICE_MODE_RECORDINGS_DAYS',
+    'VOICE_MODE_CALL_RECORDING',
     'VOICE_MODE_MAX_SPOKEN_CHARS',
     'VOICE_MODE_TRANSCRIPT_DEBUG',
   ]);
