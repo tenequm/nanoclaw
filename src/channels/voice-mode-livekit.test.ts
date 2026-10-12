@@ -1118,7 +1118,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it("turns the transcription fallback off when set to off, and sends the line's own voice", async () => {
     await h.stop();
-    const tts = { provider: 'elevenlabs', model: 'eleven_flash_v2_5', voice: 'bIHbv24MWmeRgasZH58o' } as const;
+    const tts = { provider: 'elevenlabs', model: 'eleven_v4', voice: 'bIHbv24MWmeRgasZH58o' } as const;
     h = await startHarness(
       {
         resolveLine: async (id) => ({

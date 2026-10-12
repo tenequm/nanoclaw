@@ -1897,7 +1897,7 @@ type FakeTts = ReturnType<typeof fakeTts>;
 
 const GEMINI: TtsChoice = { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'Alnilam' };
 const GEMINI_LITE: TtsChoice = { ...GEMINI, model: 'gemini-3.8-flash-lite-tts' };
-const ELEVEN: TtsChoice = { provider: 'elevenlabs', model: 'eleven_turbo_v2_5', voice: 'bIHbv24MWmeRgasZH58o' };
+const ELEVEN: TtsChoice = { provider: 'elevenlabs', model: 'eleven_v4_turbo', voice: 'bIHbv24MWmeRgasZH58o' };
 const ttsId = (c: TtsChoice) => `${c.provider}/${c.model}/${c.voice}`;
 
 describe('speech output', () => {
@@ -2107,7 +2107,7 @@ describe('voice selection in a call (the settings RPC)', () => {
     };
     return { host, job, line };
   };
-  const ELEVEN_FLASH: TtsChoice = { ...ELEVEN, model: 'eleven_flash_v2_5' };
+  const ELEVEN_V4: TtsChoice = { ...ELEVEN, model: 'eleven_v4' };
 
   it('a switch asked for mid-line applies at the next line: the old voice ends its line, then is closed once', async () => {
     let release!: () => void;
@@ -2137,7 +2137,7 @@ describe('voice selection in a call (the settings RPC)', () => {
     await vi.waitFor(() => expect(call.lines()).toHaveLength(2));
     expect(call.lines()[1]).toMatchObject({
       outcome: 'spoken',
-      model: 'elevenlabs/eleven_turbo_v2_5',
+      model: 'elevenlabs/eleven_v4_turbo',
       voice: ELEVEN.voice,
       fallback: false,
     });
@@ -2187,7 +2187,7 @@ describe('voice selection in a call (the settings RPC)', () => {
     const three = await line('Three.');
     expect([one, two, three].map((l) => l.model)).toEqual([
       'gemini/gemini-3.8-flash-tts',
-      'elevenlabs/eleven_turbo_v2_5',
+      'elevenlabs/eleven_v4_turbo',
       'gemini/gemini-3.8-flash-tts',
     ]);
     expect(call.built.map((b) => b.apiKey)).toEqual(['gk-test', 'ek-test', 'gk-test']);
@@ -2200,7 +2200,7 @@ describe('voice selection in a call (the settings RPC)', () => {
   it('plays 22.05 kHz mono and 48 kHz stereo audio at the right 24 kHz length', async () => {
     const call = speakingCall({
       [ttsId(ELEVEN)]: () => ({ chunks: 10, samples: 2_205, sampleRate: 22_050, value: () => 1000 }),
-      [ttsId(ELEVEN_FLASH)]: () => ({
+      [ttsId(ELEVEN_V4)]: () => ({
         chunks: 5,
         samples: 9_600,
         sampleRate: 48_000,
@@ -2215,11 +2215,11 @@ describe('voice selection in a call (the settings RPC)', () => {
     expect(one.durationMs).toBeLessThanOrEqual(1020);
     await call.v.rpc('settings', {
       gen: 8,
-      tts: { provider: 'elevenlabs', model: 'eleven_flash_v2_5', voice: ELEVEN.voice },
+      tts: { provider: 'elevenlabs', model: 'eleven_v4', voice: ELEVEN.voice },
     });
     call.frames.length = 0;
     const two = await line('Two.');
-    expect(two).toMatchObject({ model: 'elevenlabs/eleven_flash_v2_5', durationMs: 1000 });
+    expect(two).toMatchObject({ model: 'elevenlabs/eleven_v4', durationMs: 1000 });
     expect(new Set(call.frames.flatMap((f) => Array.from(f)))).toEqual(new Set([2000]));
   });
 
@@ -2248,7 +2248,7 @@ describe('voice selection in a call (the settings RPC)', () => {
     });
     const { line } = await start(call);
     await call.v.rpc('settings', fixtures.settingsRequestTts);
-    expect(await line('One.')).toMatchObject({ outcome: 'partial', model: 'elevenlabs/eleven_turbo_v2_5' });
+    expect(await line('One.')).toMatchObject({ outcome: 'partial', model: 'elevenlabs/eleven_v4_turbo' });
     // What follows is the call's notice that the line broke off, never the line again.
     await flush();
     expect(call.said(ELEVEN).filter((text) => text === 'One.')).toHaveLength(1);
@@ -4229,7 +4229,7 @@ describe('wide events', () => {
       rmsDb: -6,
     });
     expect(meter.done({ by: ELEVEN, primary: ELEVEN, failed: false, cut: false })).toMatchObject({
-      model: 'elevenlabs/eleven_turbo_v2_5',
+      model: 'elevenlabs/eleven_v4_turbo',
       voice: ELEVEN.voice,
       fallback: false,
     });

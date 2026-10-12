@@ -329,8 +329,9 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 
 **Voice per line.** Each line speaks with its own saved provider, model and
 voice; unset fields take the provider's default (Gemini `gemini-3.8-flash-tts`,
-`Alnilam`). A Gemini line falls back to `gemini-3.8-flash-lite-tts` before any
-audio; nothing is replayed after partial speech. With the line's link token:
+`Alnilam`; ElevenLabs `eleven_v4_turbo`, whose only other model is `eleven_v4`).
+A Gemini line falls back to `gemini-3.8-flash-lite-tts` before any audio, an
+ElevenLabs line to the Gemini default; nothing is replayed after partial speech. With the line's link token:
 `GET /voice/tts?t=<token>` answers the saved and effective choice and every
 provider with its models, defaults and whether its key is set.
 `PATCH /voice/tts?t=<token>` with `{"provider":"gemini","voice":"<id>"}`

@@ -433,7 +433,7 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     expect(pick).toMatchObject({
       status: 200,
       body: {
-        effective: { provider: 'elevenlabs', model: 'eleven_turbo_v2_5', voice: 'bIHbv24MWmeRgasZH58o' },
+        effective: { provider: 'elevenlabs', model: 'eleven_v4_turbo', voice: 'bIHbv24MWmeRgasZH58o' },
         saved: { provider: 'elevenlabs', model: null, voice: null },
       },
     });
