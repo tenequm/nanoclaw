@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   effectiveTts,
+  LINE_DEFAULT_CHOICE,
   readTtsChoice,
   TTS_DEFAULT_CHOICE,
   TTS_REGISTRY,
@@ -182,12 +183,36 @@ describe('TTS choices', () => {
     expect(TTS_REGISTRY.elevenlabs.filters.notch).toBe(false);
   });
 
-  it('matches the provider list the fixtures publish', () => {
+  it('matches the provider list the fixtures publish, with a name for every model', () => {
     const fixtures = JSON.parse(
       readFileSync(new URL('./channels/voice-mode-tts.fixtures.json', import.meta.url), 'utf8'),
-    ) as { ttsView: { providers: { id: string; name: string; models: string[]; default: unknown }[] } };
+    ) as {
+      ttsView: {
+        providers: { id: string; name: string; models: string[]; modelNames: unknown; default: unknown }[];
+      };
+    };
     expect(
-      Object.values(TTS_REGISTRY).map((e) => ({ id: e.id, name: e.name, models: e.models, default: e.defaults })),
-    ).toEqual(fixtures.ttsView.providers.map(({ id, name, models, default: d }) => ({ id, name, models, default: d })));
+      Object.values(TTS_REGISTRY).map((e) => ({
+        id: e.id,
+        name: e.name,
+        models: e.models,
+        modelNames: e.modelNames,
+        default: e.defaults,
+      })),
+    ).toEqual(
+      fixtures.ttsView.providers.map(({ id, name, models, modelNames, default: d }) => ({
+        id,
+        name,
+        models,
+        modelNames,
+        default: d,
+      })),
+    );
+    for (const entry of Object.values(TTS_REGISTRY)) expect(Object.keys(entry.modelNames)).toEqual(entry.models);
+  });
+
+  it('gives new lines a whole, valid choice', () => {
+    expect(readTtsChoice(LINE_DEFAULT_CHOICE)).toEqual({ choice: LINE_DEFAULT_CHOICE });
+    expect(effectiveTts(LINE_DEFAULT_CHOICE)).toEqual(LINE_DEFAULT_CHOICE);
   });
 });

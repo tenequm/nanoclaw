@@ -329,24 +329,40 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_UI` | empty | Page options: skin, colorway, layout, presence, brand, footer, shortcuts, timestamps, colorwayPicker. |
 
 **Voice per line.** Each line speaks with its own saved provider, model and
-voice; unset fields take the provider's default (Gemini `gemini-3.8-flash-tts`,
-`Alnilam`; ElevenLabs `eleven_v4_turbo`, whose only other model is `eleven_v4`).
-A Gemini line falls back to `gemini-3.8-flash-lite-tts` before any audio, an
-ElevenLabs line to the Gemini default; nothing is replayed after partial
-speech. With the line's link token: `GET /voice/tts?t=<token>` answers the
-saved and effective choice and every provider with its models, defaults and
-whether its key is set.
-`PATCH /voice/tts?t=<token>` with `{"provider":"gemini","voice":"<id>"}`
-(`model` optional) or `{"reset":true}` saves it for the line's next calls; it
-needs the line's caller to still hold an owner or admin role, and a provider
-without its key answers 503. `GET /voice/voices?t=<token>&provider=gemini`
+voice, always all three: a new line and a reset one save Gemini
+`gemini-3.8-flash-tts` with `en-us-techagent-4`, and a pick that leaves out the
+model or voice saves the provider's default (Gemini `gemini-3.8-flash-tts`,
+`alnilam`; ElevenLabs `eleven_v4_turbo`, whose only other model is
+`eleven_v4`). The `module:voice-mode:lines-tts-concrete` migration, and the host
+at every start, fill in any field a row lacks with what the line already spoke
+with. A Gemini line falls back to `gemini-3.8-flash-lite-tts` before any audio,
+an ElevenLabs line to Gemini `alnilam`; nothing is replayed after partial
+speech. A saved voice its provider certainly no longer has speaks `alnilam`
+too, and shows that as effective; a lookup that fails changes nothing. With the
+line's link token, and its caller still an owner or admin:
+`GET /voice/tts?t=<token>` answers the saved and effective choice, both with
+their names (`details`: provider, model and voice names, the voice's language,
+gender and sample, and `status` `resolved`, `unavailable` or `lookup_failed`),
+and every provider with its models and their names, defaults and whether its
+key is set. `PATCH /voice/tts?t=<token>` with `{"provider":"gemini","voice":"<id>"}`
+(`model` optional) or `{"reset":true}` saves it for the line's next calls; a
+provider without its key answers 503, and a voice the provider certainly does
+not have answers 400 `{"error":"invalid","field":"voice"}` (Gemini after one
+fresh listing, ElevenLabs on its own not-found); a lookup that fails or takes
+over 4 seconds saves. Voice ids match exactly as the provider spells them.
+Names come from the host's memory only: each provider's whole listing, loaded
+at start and refreshed hourly in the background, and an ElevenLabs voice
+outside it asked for by id (`/v1/voices/{id}`). The worker's call voice
+attribute carries the same `activeDetails` and `pendingDetails`, looked up only
+for the voices in use and never waited on; a name it could not get is asked for
+again three times (after 20 s, 1 min and 3 min) while the call lasts. `GET /voice/voices?t=<token>&provider=gemini`
 (or `elevenlabs`, with optional `q`, `language`, `gender` (`female`, `male` or
 `neutral`), `cursor` and `limit` up to 100) pages the provider's voices: each
 page is the provider's own filtered listing (Gemini `voices.list` through
-`@google/genai`, ElevenLabs `/v2/voices`), and `cursor` is its page token. Gemini
-matches `q` against a voice's name and description, not its id or the persona
-shown at the start of its description. A running call keeps its
-voice; a client switches it mid-call through the worker's `settings` RPC.
+`@google/genai`, ElevenLabs `/v2/voices`), kept for a minute, and `cursor` is its
+page token. Gemini matches `q` against a voice's name and description, not its
+id or the persona shown at the start of its description. A running call keeps
+its voice; a client switches it mid-call through the worker's `settings` RPC.
 Provider keys never leave the host and worker.
 
 `LIVEKIT_WORKER_URL` selects the worker/API-side LiveKit URL; default is

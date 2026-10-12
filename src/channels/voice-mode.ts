@@ -51,6 +51,7 @@ import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
 import {
+  fillVoiceModeLineTts,
   findVoiceModeLineByToken,
   getVoiceModeLine,
   getVoiceModeLineForAgent,
@@ -68,10 +69,13 @@ import { registerRootHandler, registerWebhookHandler } from '../webhook-server.j
 import {
   effectiveTts,
   isTtsProvider,
+  LINE_DEFAULT_CHOICE,
   providerKeysFrom,
   readTtsChoice,
+  TTS_DEFAULT_CHOICE,
   TTS_REGISTRY,
   type ProviderKeys,
+  type TtsChoice,
   type TtsSaved,
 } from '../voice-mode-tts.js';
 
@@ -87,6 +91,8 @@ const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 /** A `PATCH /voice/tts` body is one small object: `{provider, model?, voice?}` or `{"reset": true}`. */
 const MAX_TTS_BODY_BYTES = 1024;
 const MAX_CATALOG_LIMIT = 100;
+/** How long a save waits to hear whether the provider has its voice; then it saves (the app gives up at 12 s). */
+const SAVE_LOOKUP_BUDGET_MS = 4000;
 /** Longest `q`, `language`, `gender` or `cursor` a catalog request takes. */
 const MAX_CATALOG_PARAM_CHARS = 512;
 const CATALOG_GENDERS = new Set(['female', 'male', 'neutral']);
@@ -233,6 +239,8 @@ export interface VoiceModeConfig {
   providerKeys?: ProviderKeys;
   /** The voice catalog `GET /voice/voices` pages through. Test seam; defaults to the providers' live listings. */
   catalog?: VoiceCatalog;
+  /** How long a save waits on its voice lookup before it saves anyway. Test seam. */
+  saveLookupBudgetMs?: number;
   /** Look of the browser call page; injected at serve time, no rebuild needed (VOICE_MODE_UI). */
   ui?: VoiceModeUiConfig;
   /** The wake phrase the worker listens for (wakePhrase); null: `hey <agent>`. Unset: the page is not told. */
@@ -385,7 +393,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
   const livekit = createLiveKitVoice(config.livekit, {
     ui: config.ui,
-    resolveLine,
+    // Deferred: resolveCallLine needs the catalog, declared below.
+    resolveLine: (platformId, options) => resolveCallLine(platformId, options),
     admitStart,
     remainingTodayMs: (platformId, t) => maxCallMsPerDay - usedTodayMs(platformId, t),
     chargeUsage,
@@ -428,18 +437,53 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
   const providerKeys = config.providerKeys ?? {};
   const catalog = config.catalog ?? createVoiceCatalog();
 
-  /** What `/voice/tts` answers: the line's saved choice, what it speaks with, and every provider. */
-  const ttsView = (saved: TtsSaved) => ({
-    effective: effectiveTts(saved),
-    saved,
-    providers: Object.values(TTS_REGISTRY).map((entry) => ({
-      id: entry.id,
-      name: entry.name,
-      available: Boolean(providerKeys[entry.id]),
-      models: [...entry.models],
-      default: { ...entry.defaults },
-    })),
-  });
+  const describe = (choice: TtsChoice) => catalog.details(choice, providerKeys[choice.provider]);
+  /** What a call speaks a choice with: the backup voice for one its provider certainly does not have, never on a doubt. */
+  const speakable = (choice: TtsChoice): TtsChoice =>
+    catalog.known(choice.provider, providerKeys[choice.provider], choice.voice) === 'unavailable'
+      ? TTS_DEFAULT_CHOICE
+      : choice;
+  /** The calls' line: its choice as speakable takes it, so the worker speaks what `/voice/tts` shows as effective. */
+  const resolveCallLine = async (platformId: string, options?: ResolveLineOptions) => {
+    const line = await resolveLine(platformId, options);
+    return line?.tts && options?.forCall ? { ...line, tts: speakable(line.tts) } : line;
+  };
+
+  /** What `/voice/tts` answers: the line's saved choice, what it speaks with, every provider, and their names. */
+  const ttsView = async (saved: TtsSaved) => {
+    const readable = effectiveTts(saved);
+    const providers = Object.values(TTS_REGISTRY);
+    // A row from before every write stored a whole choice reads its missing fields as it speaks them.
+    const [savedDetails, readableDetails, ...defaultDetails] = await Promise.all([
+      describe({
+        provider: saved.provider ?? readable.provider,
+        model: saved.model ?? readable.model,
+        voice: saved.voice ?? readable.voice,
+      }),
+      describe(readable),
+      ...providers.map((entry) => describe({ provider: entry.id, ...entry.defaults })),
+    ]);
+    const effective = speakable(readable);
+    // The backup voice is Gemini's default, already described.
+    const effectiveDetails =
+      effective === readable
+        ? readableDetails
+        : defaultDetails[providers.findIndex((e) => e.id === effective.provider)];
+    return {
+      effective,
+      saved,
+      details: { saved: savedDetails, effective: effectiveDetails },
+      providers: providers.map((entry, i) => ({
+        id: entry.id,
+        name: entry.name,
+        available: Boolean(providerKeys[entry.id]),
+        models: [...entry.models],
+        modelNames: { ...entry.modelNames },
+        default: { ...entry.defaults },
+        defaultDetails: defaultDetails[i],
+      })),
+    };
+  };
 
   /** `GET` the line's voice; `PATCH` saves it for the line's next calls (a running call keeps its own). */
   const handleTts = async (req: http.IncomingMessage, res: http.ServerResponse, token: string): Promise<void> => {
@@ -449,32 +493,46 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     const lineId = lineIdOf(platformId);
     const row = lineId ? await getVoiceModeLine(lineId) : undefined;
     if (!lineId || !row) return reply(res, 403, 'Unknown call link');
-    if (req.method === 'GET') return replyJson(res, 200, ttsView(savedTts(row)));
-    // Changing the voice takes what a call takes: the line's caller, still an owner or admin of its agent.
+    // The voice takes what a call takes: the line's caller, still an owner or admin of its agent. Reading
+    // it too, since its names are asked of the providers on the host's keys.
     if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
+    if (req.method === 'GET') return replyJson(res, 200, await ttsView(savedTts(row)));
     const body = await readJsonObject(req, MAX_TTS_BODY_BYTES);
     // The body can take its time: a link re-minted meanwhile must not save.
     if ((await lineForToken(token)) !== platformId) return reply(res, 403, 'Unknown call link');
     if (!body) return replyJson(res, 400, { error: 'bad_request' });
-    let saved: TtsSaved | null = null;
+    let choice = LINE_DEFAULT_CHOICE;
     if ('reset' in body) {
       if (body.reset !== true || Object.keys(body).length !== 1) return replyJson(res, 400, { error: 'bad_request' });
     } else {
       const read = readTtsChoice(body);
       if ('invalid' in read) return replyJson(res, 400, { error: 'invalid', field: read.invalid });
-      const { provider } = read.choice;
-      if (!providerKeys[provider]) return replyJson(res, 503, { error: 'provider_unavailable', provider });
-      // A field left out stays unset, so it follows the provider's default instead of pinning today's.
-      saved = {
-        provider,
-        model: typeof body.model === 'string' ? body.model : null,
-        voice: typeof body.voice === 'string' ? body.voice : null,
-      };
+      const { provider, voice } = read.choice;
+      const apiKey = providerKeys[provider];
+      if (!apiKey) return replyJson(res, 503, { error: 'provider_unavailable', provider });
+      // Only a voice the provider says it does not have is refused; one it could not be asked about in time saves.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const found = await Promise.race([
+        catalog.lookup(provider, apiKey, voice, { confirm: true }),
+        new Promise<{ status: 'lookup_failed' }>(
+          (resolve) =>
+            (timer = setTimeout(
+              () => resolve({ status: 'lookup_failed' }),
+              config.saveLookupBudgetMs ?? SAVE_LOOKUP_BUDGET_MS,
+            )),
+        ),
+      ]);
+      clearTimeout(timer);
+      if (found.status === 'unavailable') return replyJson(res, 400, { error: 'invalid', field: 'voice' });
+      choice = read.choice;
     }
-    const updated = await setVoiceModeLineTts(lineId, saved);
+    // The body and the lookup can take their time: the caller must still be one, and the save below only
+    // takes the link it started with.
+    if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
+    const updated = await setVoiceModeLineTts(lineId, choice, row);
     if (!updated) return reply(res, 403, 'Unknown call link');
-    log.info('voice-mode: line voice saved', { platformId, tts: saved ?? 'default' });
-    return replyJson(res, 200, ttsView(savedTts(updated)));
+    log.info('voice-mode: line voice saved', { platformId, tts: choice, ...('reset' in body ? { reset: true } : {}) });
+    return replyJson(res, 200, await ttsView(savedTts(updated)));
   };
 
   /** One page of a provider's voices, filtered by `q`, `language` and `gender`. */
@@ -594,6 +652,12 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
+      const filled = await fillVoiceModeLineTts().catch((err: unknown) => {
+        log.warn('voice-mode: could not fill in the lines missing a voice', { err });
+        return 0;
+      });
+      if (filled > 0) log.info('voice-mode: filled in the lines missing a voice', { rows: filled });
+      catalog.warm(providerKeys);
       registerWebhookHandler(VOICE_MODE_CHANNEL, handleHttp);
       registerRootHandler('voice', handleHttp);
       registerWebhookHandler('voice', handleHttp);
@@ -647,6 +711,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
     async teardown(): Promise<void> {
       connected = false;
+      catalog.close();
       const server = pageServer;
       pageServer = undefined;
       try {

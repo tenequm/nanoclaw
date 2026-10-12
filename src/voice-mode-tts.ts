@@ -13,7 +13,7 @@ export interface TtsChoice {
   model: string;
   voice: string;
 }
-/** A line's saved choice; a null field takes the provider's default. */
+/** A line's saved choice as read: every write stores all three, and a read takes a null as the provider's default. */
 export interface TtsSaved {
   provider: TtsProvider | null;
   model: string | null;
@@ -42,6 +42,8 @@ export interface TtsEntry {
   readonly id: TtsProvider;
   readonly name: string;
   readonly models: readonly string[];
+  /** Each offered model's display name, as the provider names it. */
+  readonly modelNames: Readonly<Record<string, string>>;
   readonly defaults: { model: string; voice: string };
   readonly envKey: 'VOICE_MODE_GEMINI_API_KEY' | 'VOICE_MODE_ELEVENLABS_API_KEY';
   /** Shape only, no network. */
@@ -117,13 +119,20 @@ const ELEVENLABS_MODELS: readonly string[] = [
 ] as const satisfies readonly elevenlabs.TTSModels[];
 const ELEVENLABS_VOICE = /^[A-Za-z0-9]{10,40}$/;
 
-export const TTS_DEFAULT_CHOICE: TtsChoice = { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'Alnilam' };
+/** The backup voice: what speaks when a line's choice cannot, and what a saved value no longer offered reads as. */
+export const TTS_DEFAULT_CHOICE: TtsChoice = { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'alnilam' };
+/** What a new line, and a reset one, saves. */
+export const LINE_DEFAULT_CHOICE: TtsChoice = { ...TTS_DEFAULT_CHOICE, voice: 'en-us-techagent-4' };
 
 export const TTS_REGISTRY: Readonly<Record<TtsProvider, TtsEntry>> = {
   gemini: {
     id: 'gemini',
     name: 'Gemini',
     models: [TTS_DEFAULT_CHOICE.model, GEMINI_FALLBACK_MODEL],
+    modelNames: {
+      [TTS_DEFAULT_CHOICE.model]: 'Gemini 3.8 Flash TTS',
+      [GEMINI_FALLBACK_MODEL]: 'Gemini 3.8 Flash Lite TTS',
+    },
     defaults: { model: TTS_DEFAULT_CHOICE.model, voice: TTS_DEFAULT_CHOICE.voice },
     envKey: 'VOICE_MODE_GEMINI_API_KEY',
     validate: ({ model, voice }) => (!GEMINI_MODEL.test(model) ? 'model' : !GEMINI_VOICE.test(voice) ? 'voice' : null),
@@ -139,6 +148,7 @@ export const TTS_REGISTRY: Readonly<Record<TtsProvider, TtsEntry>> = {
     id: 'elevenlabs',
     name: 'ElevenLabs',
     models: ELEVENLABS_MODELS,
+    modelNames: { eleven_v4_turbo: 'Eleven v4 Turbo', eleven_v4: 'Eleven v4' },
     defaults: { model: ELEVENLABS_MODELS[0], voice: 'bIHbv24MWmeRgasZH58o' },
     envKey: 'VOICE_MODE_ELEVENLABS_API_KEY',
     validate: ({ model, voice }) =>

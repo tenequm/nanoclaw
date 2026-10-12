@@ -49,6 +49,7 @@ import {
 import { log } from '../log.js';
 import { getWebhookStatus, stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './voice-mode-page.js';
+import type { VoiceCatalog, VoiceStatus } from './voice-mode-tts-catalog.js';
 import { linePlatformId } from './voice-mode-line.js';
 
 /** A line /voice made: its calls need a chat to talk in. */
@@ -676,6 +677,42 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect((await post(`${h.hostUrl}/voice/livekit/end?t=tok123`, { callId })).status).toBe(204);
   });
 
+  it('speaks the backup voice for a saved voice its provider certainly lacks, and the saved one on a doubt', async () => {
+    await h.stop();
+    const gone = { provider: 'elevenlabs', model: 'eleven_v4_turbo', voice: 'ZZZZZZZZZZZZZZZZZZZZ' } as const;
+    let known: VoiceStatus | undefined = 'unavailable';
+    const catalog: VoiceCatalog = {
+      page: async () => ({ error: 'upstream' }),
+      lookup: async () => ({ status: 'lookup_failed' }),
+      known: () => known,
+      details: async () => {
+        throw new Error('not asked');
+      },
+      warm: () => undefined,
+      close: () => undefined,
+    };
+    h = await startHarness({
+      providerKeys: { gemini: 'gk', elevenlabs: 'ek' },
+      catalog,
+      resolveLine: async (id) => ({
+        caller: { id, name: 'Ethan' },
+        agentGroupId: 'ag-andy',
+        agent: { name: 'Andy' },
+        tts: gone,
+      }),
+    });
+    await startCall(h);
+    expect(h.lk.dispatches.at(-1)!.metadata.tts).toEqual({
+      provider: 'gemini',
+      model: 'gemini-3.8-flash-tts',
+      voice: 'alnilam',
+    });
+    known = undefined;
+    await post(`${h.base}/livekit/end?t=tok123`, { callId: h.lk.dispatches.at(-1)!.metadata.callId });
+    await startCall(h);
+    expect(h.lk.dispatches.at(-1)!.metadata.tts).toEqual(gone);
+  });
+
   it('opens a unique room, dispatches the worker with the call metadata and mints a room-only caller token', async () => {
     const res = await post(`${h.base}/livekit/token?v=6&t=tok123`);
     expect(res.status).toBe(200);
@@ -705,7 +742,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       sttModel: 'gemini-3.5-transcribe-live',
       sttFallbackModel: '',
       // A line with no saved choice speaks with the default.
-      tts: { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'Alnilam' },
+      tts: { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'alnilam' },
       silenceMs: 2500,
       maxDurationMs: 15 * MIN,
       joinTimeoutMs: 60_000,
