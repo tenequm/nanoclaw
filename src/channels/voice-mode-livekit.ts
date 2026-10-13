@@ -67,7 +67,6 @@ import { getVoiceModeLine } from '../db/voice-mode-lines.js';
 import { registerPostDeliveryHook, setOutboundPresentation, type OutboundAddress } from '../delivery.js';
 import { log } from '../log.js';
 import { platformMessageId } from '../platform-id.js';
-import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { registerTypingObserver } from '../modules/typing/index.js';
 import type { MessagingGroup } from '../types.js';
 import { TTS_DEFAULT_CHOICE } from '../voice-mode-tts.js';
@@ -164,12 +163,10 @@ export interface LiveKitServerApi {
   updateRoomMetadata(room: string, metadata: string): Promise<unknown>;
 }
 
-/** The `/voice` binding of a line, as stored; checked against the line before use. */
+/** The `/voice` binding of a line, as stored; checked against the agent's wiring before use. */
 export interface BoundCallChat {
   group: MessagingGroup;
   threadId: string | null;
-  /** The line's owner accounts, the only ones who can set the binding. */
-  ownerIds: string[];
 }
 
 /** The agent's chats a call can talk in; the central DB and live adapters by default, fakes in tests. */
@@ -178,7 +175,6 @@ export interface MirrorApi {
   adapter(key: string): Pick<ChannelAdapter, 'deliver'> | undefined;
   /** The chat `/voice` last pointed the line at, if any. */
   boundChat(lineId: string): Promise<BoundCallChat | null>;
-  isAdmin(userId: string, agentGroupId: string): Promise<boolean>;
 }
 
 /** A chat address as delivery and typing see it. */
@@ -364,9 +360,8 @@ const defaultMirrorApi: MirrorApi = {
     const current = id ? await getVoiceModeLine(id) : undefined;
     if (!current) return null;
     const group = current.messaging_group_id && (await getMessagingGroup(current.messaging_group_id));
-    return group ? { group, threadId: current.thread_id, ownerIds: [current.owner_user_id] } : null;
+    return group ? { group, threadId: current.thread_id } : null;
   },
-  isAdmin: (userId, agentGroupId) => hasAdminPrivilege(userId, agentGroupId),
 };
 
 /** How the page names the chat a call talks in. */
@@ -605,7 +600,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     });
   };
 
-  /** The `/voice` chat if it is still the agent's and an owner account of the line still administers the agent, else the VOICE_MODE_MIRROR pick. */
+  /**
+   * The `/voice` chat if it is still the agent's, else the VOICE_MODE_MIRROR pick. The line's one owner
+   * is its caller, whose role every access check of the line holds already.
+   */
   const resolveChat = async (call: ChatProbe): Promise<CallChat | null> => {
     const { line } = call;
     const groups = await mirrorApi.groupsFor(line.agentGroupId);
@@ -615,14 +613,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       const wired = !g.denied_at && !g.detached_at && groups.some((w) => w.id === g.id);
       if (!wired) {
         noteChat(call, 'binding', 'the /voice chat is no longer wired to the agent; using the default', {
-          chat: g.id,
-        });
-      } else if (
-        // A /voice line's one owner is its caller, whose role every access check of the line holds already.
-        !(bound.ownerIds.length > 0 && bound.ownerIds.every((id) => id === line.caller.id)) &&
-        !(await Promise.all(bound.ownerIds.map((id) => mirrorApi.isAdmin(id, line.agentGroupId)))).some(Boolean)
-      ) {
-        noteChat(call, 'binding', 'no line owner account is an admin of the agent; using the default', {
           chat: g.id,
         });
       } else {
