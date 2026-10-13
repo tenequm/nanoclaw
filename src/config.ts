@@ -110,8 +110,7 @@ export const EGRESS_LOCKDOWN = (process.env.NANOCLAW_EGRESS_LOCKDOWN || envConfi
 export const EGRESS_NETWORK =
   process.env.NANOCLAW_EGRESS_NETWORK || envConfig.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
 
-// Jev key for the ambient wake-gate. Empty means
-// it fails silent — see src/modules/jev-gate. The endpoint serves TypeSafe's System
+// Jev key for the ambient wake-gate. Empty means it fails silent - see src/modules/jev-gate. The endpoint serves TypeSafe's System
 // One shape: TypeSafe itself or OpenRouter (https://openrouter.ai/api/v1/systemone,
 // model jev-1.13) with that vendor's key.
 export const JEV_API_KEY = process.env.JEV_API_KEY || envConfig.JEV_API_KEY || '';

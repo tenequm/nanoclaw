@@ -5,9 +5,11 @@ adapter are gone; every line is a `voice_mode_lines` row. What this runbook says
 about env-backed links, saved links and the `voice` adapter describes the
 protocol 4 cutover only: a current build reads no link token from `.env`, so
 make each such line a row before upgrading. The `voice_lines` and
-`voice_line_owners` tables are gone too: builds from 2026-10-09 dropped them
-with the `module:voice-mode:drop-legacy-lines` migration, and a current build
-neither creates nor reads them (see Rollback).
+`voice_line_owners` tables are gone too: builds from 2026-10-09 to 2026-10-13
+dropped them with the `module:voice-mode:drop-legacy-lines` migration, and a
+current build neither creates nor reads them (see Rollback). A current build no
+longer carries that migration, so an install upgraded straight from before
+2026-10-09 keeps both tables, unused; drop them by hand once its lines are rows.
 
 This is an operator runbook. Building the fork's main branch performs no server
 actions. Use the complete fork build, with matching host and worker. Update

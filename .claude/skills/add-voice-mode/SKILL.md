@@ -93,7 +93,9 @@ import './voice-mode.js';
 
 This fork exports the router's `deliverToAgent`, supports `onStored` and
 host-addressed events, expedited reply delivery and the `voice-call` wake.
-The native Telegram command delegates to the adapter's command handler.
+The native Telegram command delegates to the adapter's command handler and
+gives it an ephemeral sender-only reply; `/voice` is registered as an
+ephemeral command in the Telegram menus (`scope-sync.ts`).
 The registration, router and native command tests guard these connections.
 
 Copy resident agent guidance separately so an implementation repair can
@@ -410,8 +412,8 @@ Remove via [REMOVE.md](REMOVE.md).
 
 ## Troubleshooting
 
-- Unknown link: a link is shown only once and cannot be read back; `/voice new`
-  replaces it.
+- Lost link: the caller's `/voice` shows it again (a link from before sealing
+  shows after its next call); `/voice new` replaces it and ends calls on the old one.
 - Caller denied: a `/voice` line needs its caller to hold a core owner or admin
   role over the agent.
 - No chat to talk in: the page says the line has no chat to talk in. Run

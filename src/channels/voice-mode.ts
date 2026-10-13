@@ -8,8 +8,9 @@
  * Shape: native adapter (no Chat SDK bridge). A *voice line* is one caller's
  * link to one agent: a voice_mode_lines row that `/voice` creates
  * (voice-mode-command.ts), with the platform id `voice-mode:<line id>` for a
- * random line id. The row keeps only the link token's SHA-256, so the token
- * itself never reaches the database, the logs or the agent's messages. There
+ * random line id. The row keeps the link token's SHA-256 (what a call is
+ * looked up by) and the token sealed under NANOCLAW_ENCRYPTION_KEY; the plain
+ * token never reaches the database, the logs or the agent's messages. There
  * are no threads. One call is active per line at a time; the newest wins.
  *
  * The link token gates the HTTP routes: a request without a known `t` gets a

@@ -1,9 +1,9 @@
 /**
  * Voice mode's own state: one voice line per agent group, in the skill's own table. The line holds
  * the SHA-256 of its current call-link token, the token itself sealed under the host's key (see
- * src/secret-seal.ts) so `/voice` can show the link to its caller again, who minted it (the caller),
- * the chat its calls talk in, and the speech choice its calls start with. `/voice` creates lines,
- * shows their link and moves their chat, `/voice new` re-mints their link
+ * src/secret-seal.ts) so `/voice` can show the link again, its caller (who minted the link), the
+ * chat its calls talk in, and the speech choice its calls start with. `/voice` creates lines, shows
+ * their link and moves their chat, `/voice new` re-mints their link
  * (src/channels/voice-mode-command.ts); the call page finds a line by its token's hash
  * (src/channels/voice-mode.ts), so calls never need the key.
  *
