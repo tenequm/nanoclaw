@@ -36,13 +36,13 @@ import {
   callLanguages,
   type CallRecord,
   CallRecording,
-  callRecordingOn,
   CallTurns,
   DISCARD_SETTLE_MS,
   COMMAND_VOCABULARY,
   COMMAND_WORDS_JSON,
   captionMark,
   type CaptionMark,
+  envSwitch,
   FAILURE_LINES,
   HostLink,
   hostLossReason,
@@ -70,8 +70,6 @@ import {
   lineFilter,
   whistleNotch,
   WHISTLE_NOTCHES,
-  ttsNotch,
-  ttsDeess,
   TTS_SAMPLE_RATE,
   matchCommand,
   matchWake,
@@ -226,9 +224,9 @@ describe('helpers', () => {
     // Off, the line goes out exactly as synthesized.
     const off = run([[7_000, 0.5]], lineFilter({ deess: false, notch: false }));
     expect(off.output).toEqual(off.input);
-    expect(ttsDeess(undefined)).toBe(true);
-    expect(ttsDeess('1')).toBe(true);
-    for (const raw of ['0', 'off', ' OFF ', 'false']) expect(ttsDeess(raw)).toBe(false);
+    expect(envSwitch(undefined)).toBe(true);
+    expect(envSwitch('1')).toBe(true);
+    for (const raw of ['0', 'off', ' OFF ', 'false']) expect(envSwitch(raw)).toBe(false);
 
     // The whistle notches: the model's loud whistle tones go, the voice stays.
     const notch = () => whistleNotch(rate);
@@ -253,8 +251,6 @@ describe('helpers', () => {
         notch(),
       ).output,
     ).toEqual(notch()(whole.input));
-    expect(ttsNotch(undefined)).toBe(true);
-    expect(ttsNotch('off')).toBe(false);
   });
 
   it('reads the language of a transcript from its script', () => {
@@ -4480,8 +4476,9 @@ describe('acoustic wake word in a call', () => {
 
 describe('whole-call recording', () => {
   it('is on for VOICE_MODE_CALL_RECORDING `true` or `1` only', () => {
-    for (const value of [undefined, '', '0', 'false', 'yes', 'on']) expect(callRecordingOn(value)).toBe(false);
-    for (const value of ['1', 'true', ' true ']) expect(callRecordingOn(value)).toBe(true);
+    const on = (value: string | undefined) => envSwitch(value, ['1', 'true']);
+    for (const value of [undefined, '', '0', 'false', 'yes', 'on', 'TRUE']) expect(on(value)).toBe(false);
+    for (const value of ['1', 'true', ' true ']) expect(on(value)).toBe(true);
   });
 
   it('streams to disk and keeps the header current, so a call cut off without close still reads', async () => {

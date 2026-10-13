@@ -324,11 +324,6 @@ export const FAILURE_LINES: Record<FailureKind, Record<CallLanguage, string>> = 
 };
 export type FailureKind = 'turn' | 'rejected' | 'rate_limited' | 'timeout' | 'timeout_no_chat' | 'reply';
 
-/** VOICE_MODE_TTS_DEESS: the de-esser runs unless it says 0, off or false. */
-export function ttsDeess(raw: string | undefined): boolean {
-  return !['0', 'off', 'false'].includes(raw?.trim().toLowerCase() ?? '');
-}
-
 export interface DeEsserOptions {
   sampleRate: number;
   /** Where the sibilance band starts. */
@@ -404,11 +399,6 @@ export function deEsser(o: DeEsserOptions): (pcm: Int16Array) => Int16Array {
     }
     return out;
   };
-}
-
-/** VOICE_MODE_TTS_NOTCH: the whistle notches run unless it says 0, off or false. */
-export function ttsNotch(raw: string | undefined): boolean {
-  return ttsDeess(raw);
 }
 
 /**
@@ -1172,11 +1162,15 @@ export async function pruneRecordings(root: string, days: number, now = Date.now
   return removed;
 }
 
-/** VOICE_MODE_TRANSCRIPT_DEBUG: `1` logs every raw transcription message and what the turns made of it. */
-export const transcriptDebugOn = (value: string | undefined): boolean => value?.trim() === '1';
-
-/** VOICE_MODE_CALL_RECORDING: `true` or `1` records each caller's whole call, waiting included. */
-export const callRecordingOn = (value: string | undefined): boolean => ['1', 'true'].includes(value?.trim() ?? '');
+/**
+ * A worker on/off setting. With no `on` list it is on unless it says 0, off or false in any case
+ * (VOICE_MODE_TTS_DEESS, VOICE_MODE_TTS_NOTCH); with one, on only for one of those values exactly
+ * (VOICE_MODE_TRANSCRIPT_DEBUG `1`, VOICE_MODE_CALL_RECORDING `1` or `true`).
+ */
+export function envSwitch(raw: string | undefined, on?: readonly string[]): boolean {
+  const value = raw?.trim() ?? '';
+  return on ? on.includes(value) : !['0', 'off', 'false'].includes(value.toLowerCase());
+}
 
 /** VOICE_MODE_RECORDINGS_DAYS: 0 (the default) records nothing. */
 export function recordingDays(raw: string | undefined): number {
@@ -4448,10 +4442,10 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   if (!geminiKey) return abandon('VOICE_MODE_GEMINI_API_KEY is not set for the worker');
   const providerKeys = providerKeysFrom(deps.env);
   const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
-  const recordCall = callRecordingOn(deps.env.VOICE_MODE_CALL_RECORDING);
+  const recordCall = envSwitch(deps.env.VOICE_MODE_CALL_RECORDING, ['1', 'true']);
   /** The whole call, when VOICE_MODE_CALL_RECORDING is on: opened once the caller's audio can flow. */
   let callRecording: CallRecording | undefined;
-  const transcriptDebug = transcriptDebugOn(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG);
+  const transcriptDebug = envSwitch(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG, ['1']);
   /** The label of the line being spoken: TurnTaking announces each line right before it. */
   let speakingLine: CallReplyInfo | undefined;
   if (meta.sttFallbackModel) {
@@ -4831,8 +4825,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       {
         providerKeys,
         ...(record ? { recordReplies: true } : {}),
-        ...(ttsDeess(deps.env.VOICE_MODE_TTS_DEESS) ? { deess: true } : {}),
-        ...(ttsNotch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
+        ...(envSwitch(deps.env.VOICE_MODE_TTS_DEESS) ? { deess: true } : {}),
+        ...(envSwitch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
         ...(deps.voiceNames ? { voiceDetails: (choice) => deps.voiceNames!.details(choice) } : {}),
         spoke: (line, pcm) => {
           // TurnTaking labels every line before it plays.
@@ -5127,7 +5121,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     process.exit(1);
   }
   console.info(
-    `voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, dispatch name ${env.LIVEKIT_AGENT_NAME || DEFAULT_LIVEKIT_AGENT_NAME}, host URL ${hostUrl} (LIVEKIT_HOST_URL)${transcriptDebugOn(env.VOICE_MODE_TRANSCRIPT_DEBUG) ? ', transcript debug on (VOICE_MODE_TRANSCRIPT_DEBUG)' : ''}`,
+    `voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, dispatch name ${env.LIVEKIT_AGENT_NAME || DEFAULT_LIVEKIT_AGENT_NAME}, host URL ${hostUrl} (LIVEKIT_HOST_URL)${envSwitch(env.VOICE_MODE_TRANSCRIPT_DEBUG, ['1']) ? ', transcript debug on (VOICE_MODE_TRANSCRIPT_DEBUG)' : ''}`,
   );
   // agents-js's default ("adaptive") enables the debugger domain on a job's first loop stall to
   // sample stacks: that blocks the loop another ~250 ms mid-call and slows the call's JS by ~15%
