@@ -536,7 +536,9 @@ export function lineResampler(converting: (sampleRate: number) => void, rate = T
         resampler = new AudioResampler(sampleRate, rate, 1, AudioResamplerQuality.HIGH);
         converting(sampleRate);
       }
-      return joined(resampler.push(new AudioFrame(mono, sampleRate, 1, length)));
+      // rtc-node hands the native side the buffer's start, not the view's: a view at an offset goes as a copy.
+      const whole = mono.byteOffset ? mono.slice() : mono;
+      return joined(resampler.push(new AudioFrame(whole, sampleRate, 1, length)));
     },
     flush: () => (resampler ? joined(resampler.flush()) : new Int16Array(0)),
     close() {

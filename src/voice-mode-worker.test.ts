@@ -2143,6 +2143,20 @@ describe('speech output', () => {
     // A steady level stays steady once the filter has settled: no interpolation ripple.
     for (const v of out.slice(2_400, 21_600)) expect(Math.abs(v - 1000)).toBeLessThanOrEqual(2);
   });
+
+  it('resamples a chunk that is a view into a larger buffer from the view, not the buffer start', () => {
+    const backing = new Int16Array(4_410).fill(-5000, 0, 2_205).fill(1000, 2_205);
+    const view = lineResampler(() => undefined);
+    const out: number[] = [];
+    try {
+      for (let i = 0; i < 4; i++)
+        out.push(...view.push({ pcm: backing.subarray(2_205), sampleRate: 22_050, numChannels: 1 }));
+      out.push(...view.flush());
+    } finally {
+      view.close();
+    }
+    expect(out.slice(480, -480).filter((v) => Math.abs(v - 1000) > 2)).toEqual([]);
+  });
 });
 
 const fixtures = JSON.parse(
