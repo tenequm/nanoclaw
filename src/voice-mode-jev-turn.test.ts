@@ -395,9 +395,12 @@ function turnsWithShadow(silenceMs: number, wake = false) {
   const turns = new CallTurns(
     {
       transcriber,
-      send: (text) => void sent.push(text),
-      lost: () => undefined,
-      noise: () => undefined,
+      reserve: () => ({
+        send: (text) => void sent.push(text),
+        lost: () => undefined,
+        noise: () => undefined,
+        skip: () => undefined,
+      }),
       drop: () => undefined,
       cue: () => undefined,
       caption: () => undefined,
