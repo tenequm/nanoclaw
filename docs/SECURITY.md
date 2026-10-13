@@ -215,6 +215,23 @@ relies on a **non-proxy-aware** tool reaching the internet directly will fail by
 design. Lockdown is **off by default**; opt in with
 `NANOCLAW_EGRESS_LOCKDOWN=true`.
 
+### 6. Sealed Host Secrets
+
+A few values the host must show again later (today: voice-mode call links) are
+stored sealed under one host-wide key, `NANOCLAW_ENCRYPTION_KEY` in `.env`: 32
+random bytes as canonical base64 (`openssl rand -base64 32`), validated
+strictly. `src/secret-seal.ts` seals with AES-256-GCM, a fresh 12-byte nonce and
+a `v1:` envelope, authenticating what the value is and which row holds it. The
+key is read with the host's `.env` reader only, never from or into
+`process.env`, so agent containers and the voice worker never see it. A missing
+or malformed key is logged once and turns off only what needs it.
+
+Rotating the key is an offline procedure: stop the host, back up the database
+and the old key, re-seal every sealed value under the new key, check each still
+opens to a token matching its stored hash, then swap the key and start. A lost
+key loses only the sealed copies (links still work and can be re-minted); a
+leaked key calls for re-minting the links, which re-sealing cannot revoke.
+
 ## Resource Limits
 
 Per-container CPU and memory caps are **opt-in and unset by default** — a runaway
