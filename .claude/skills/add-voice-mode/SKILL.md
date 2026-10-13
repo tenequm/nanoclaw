@@ -1,6 +1,6 @@
 ---
 name: add-voice-mode
-description: Add voice calls with a real NanoClaw agent through LiveKit and Gemini. Installs the voice-mode host adapter, browser page, worker, hashed call lines and role-based /voice commands. Use when an operator wants to talk to an agent by voice.
+description: Add voice calls with a real NanoClaw agent through LiveKit and Gemini. Installs the voice-mode host adapter, browser page, worker, sealed call lines and role-based /voice commands. Use when an operator wants to talk to an agent by voice.
 ---
 
 # Add voice mode
@@ -74,6 +74,8 @@ src/voice-mode-wakeword.ts
 src/voice-mode-worker.test.ts
 src/voice-mode-worker.ts
 src/db/voice-mode-lines.ts
+src/secret-seal.test.ts
+src/secret-seal.ts
 assets/voice-mode-wakeword/LICENSE
 assets/voice-mode-wakeword/NOTICE
 assets/voice-mode-wakeword/embedding_model.onnx
@@ -191,6 +193,13 @@ VOICE_MODE_ELEVENLABS_API_KEY={{elevenlabs_api_key}}
 Only `VOICE_MODE_*` names are read: rename an existing `GEMINI_API_KEY` or
 `VOICE_*` setting to its `VOICE_MODE_*` name.
 
+Call links are stored sealed under the host-wide `NANOCLAW_ENCRYPTION_KEY`, so
+`/voice` can show a caller their link again. If `.env` has none yet, add one:
+32 random bytes as base64 (`openssl rand -base64 32`), written straight into
+`.env` without printing it, and kept in the operator's secret store. Never
+replace an existing key: links sealed under it could no longer be shown. Without
+the key calls still work, but `/voice` neither shows nor mints links.
+
 The page listens on `127.0.0.1:3100` (`VOICE_MODE_PORT`, and
 `VOICE_MODE_PAGE_HOST` for another bind address), and also under `/voice` on
 the existing host webhook port. `VOICE_MODE_PORT=off` (or `0`) turns the
@@ -279,13 +288,17 @@ secrets. Both processes read their settings directly from `.env`.
 A worker started in a terminal stops with Ctrl-C.
 
 Run `/voice` in an existing chat wired to the agent, as a known owner or
-scoped/global admin. Slack callers type `!voice`. First use creates a line
-and sends its secret link once. In a group the link goes to the sender's DM;
-if that DM cannot be resolved, nothing is minted. Later `/voice` moves the
-call chat and keeps the link. Only the line's caller moves its call chat.
-`/voice new` re-mints it for an authorized sender and ends the old call.
-Lost links cannot be read back: only their SHA-256 is stored. Do not paste
-links into shared chats, agent messages or logs.
+scoped/global admin. Slack callers type `!voice`. First use creates the
+agent's line, makes the sender its caller and shows its secret link; later
+`/voice` by the caller shows the same link again and moves the call chat here,
+ending no call. One line per agent: a line's link and call chat belong to its
+caller, and any other admin is told whose line it is. `/voice new` re-mints the
+sender's own link and ends calls made with the old one. In a group the link
+reaches only the sender: on Telegram as an ephemeral reply (`/voice` is an
+ephemeral command), elsewhere or when that fails in their DM, and without a
+reachable DM the answer carries no link. A link minted before links were
+sealed shows after its next call. Do not paste links into shared chats, agent
+messages or logs.
 
 Calls use the caller's core role, checked at start, every turn and every five
 seconds. A revoked role or changed token ends the call. The call chat is the
@@ -301,6 +314,7 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
+| `NANOCLAW_ENCRYPTION_KEY` | none | Host-wide key sealing call links (32 bytes, canonical base64); without it `/voice` shows and mints no links. Never passed to the worker or containers. |
 | `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page and the worker routes. A taken default port is logged and skipped; an explicit port that cannot bind stops voice-mode from starting. |
 | `VOICE_MODE_PAGE_HOST` | `127.0.0.1` | Bind address of the separate page server. |
 | `VOICE_MODE_MAX_CALL_SECONDS` | `900` | Per-call duration limit. |
