@@ -561,10 +561,6 @@ export class LineSpeech {
     this.now = opts.now ?? (() => Date.now());
   }
 
-  get active(): TtsChoice {
-    return this.current;
-  }
-
   get state(): CallVoiceState {
     return {
       v: 1,
@@ -909,13 +905,6 @@ export const pathSegment = (name: string): string =>
     .replace(/[^\p{L}\p{N}_-]+/gu, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 64) || 'unnamed';
-
-/** A recording's peak and RMS, in dBFS. */
-export function audioLevels(pcm: Int16Array): { peakDb: number; rmsDb: number } {
-  const meter = new LineMeter();
-  meter.frame(pcm);
-  return meter.levels;
-}
 
 /** One spoken line, as its `voice-mode.reply` event reports it: never its words. */
 export interface SpokenLine {
@@ -1420,12 +1409,6 @@ export class TurnTaking {
     this.callerSpeaking = false;
     this.turnOpenUntil = 0;
     this.wake();
-  }
-
-  /** A finished caller turn; sent to the host in order, without holding up the session. */
-  onTurn(text: string, onSent?: TurnSent): void {
-    if (this.closed) return;
-    this.reserve().send(text, onSent);
   }
 
   /**
@@ -4469,8 +4452,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   /** The whole call, when VOICE_MODE_CALL_RECORDING is on: opened once the caller's audio can flow. */
   let callRecording: CallRecording | undefined;
   const transcriptDebug = transcriptDebugOn(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG);
-  /** Spoken lines so far, for those no label numbered. */
-  let replies = 0;
   /** The label of the line being spoken: TurnTaking announces each line right before it. */
   let speakingLine: CallReplyInfo | undefined;
   if (meta.sttFallbackModel) {
@@ -4854,8 +4835,10 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         ...(ttsNotch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
         ...(deps.voiceNames ? { voiceDetails: (choice) => deps.voiceNames!.details(choice) } : {}),
         spoke: (line, pcm) => {
+          // TurnTaking labels every line before it plays.
           const label = speakingLine;
-          const reply = label?.reply ?? ++replies;
+          if (!label) return;
+          const { reply } = label;
           if (pcm) {
             void writeReplyRecording(
               deps.recordingsRoot ?? recordingsRoot(),
@@ -4868,8 +4851,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           }
           telemetry.reply({
             reply,
-            kind: label?.notice ? 'notice' : 'reply',
-            ...(typeof label?.turn === 'number' ? { turn: label.turn, part: label.part } : {}),
+            kind: label.notice ? 'notice' : 'reply',
+            ...(typeof label.turn === 'number' ? { turn: label.turn, part: label.part } : {}),
             ...line,
             ...(pcm ? { recorded: true } : {}),
           });

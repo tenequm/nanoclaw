@@ -80,7 +80,6 @@ import {
   endsLike,
   Outbox,
   loadTypingSound,
-  audioLevels,
   CallTelemetry,
   CallerInput,
   LineMeter,
@@ -323,8 +322,8 @@ describe('TurnTaking', () => {
       return text === 'late' ? { accepted: false, turnKey: `key-${text}` } : { accepted: true, id: text };
     });
     const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
-    turnTaking.onTurn('late');
-    turnTaking.onTurn('next');
+    turnTaking.reserve().send('late');
+    turnTaking.reserve().send('next');
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['late']);
     turnTaking.stored('key-other', '1');
@@ -334,7 +333,7 @@ describe('TurnTaking', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['late', 'next']);
     // The end lets a waiting turn go too: a slot filled after it still posts.
-    turnTaking.onTurn('late');
+    turnTaking.reserve().send('late');
     const after = turnTaking.reserve();
     turnTaking.close();
     after.send('after the end');
@@ -355,8 +354,8 @@ describe('TurnTaking', () => {
       return { accepted: false, status: 504, turnKey: 'key-late' };
     });
     const results: SendResult[] = [];
-    turnTaking.onTurn('late', (result) => results.push(result));
-    turnTaking.onTurn('next');
+    turnTaking.reserve().send('late', (result) => results.push(result));
+    turnTaking.reserve().send('next');
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['late', 'next']);
     expect(results).toEqual([{ accepted: true, turnKey: 'key-late', id: '7' }]);
@@ -387,8 +386,8 @@ describe('TurnTaking', () => {
     const { deps, said, sent, statuses } = fakeTurnTakingDeps();
     const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
     const results: unknown[] = [];
-    turnTaking.onTurn('book a table', (r) => results.push(r));
-    turnTaking.onTurn('for two');
+    turnTaking.reserve().send('book a table', (r) => results.push(r));
+    turnTaking.reserve().send('for two');
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['book a table', 'for two']);
     expect(results).toEqual([{ accepted: true, id: '1' }]);
@@ -403,7 +402,7 @@ describe('TurnTaking', () => {
     vi.useFakeTimers();
     const { deps, statuses } = fakeTurnTakingDeps();
     const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
-    turnTaking.onTurn('thanks');
+    turnTaking.reserve().send('thanks');
     await vi.advanceTimersByTimeAsync(AWAIT_REPLY_MS - 1000);
     turnTaking.onThinking();
     await vi.advanceTimersByTimeAsync(5000);
@@ -424,7 +423,7 @@ describe('TurnTaking', () => {
     await vi.advanceTimersByTimeAsync(SILENCE);
     expect(said).toEqual([]);
     // The committed turn frees the channel at once.
-    turnTaking.onTurn('and another thing');
+    turnTaking.reserve().send('and another thing');
     await vi.advanceTimersByTimeAsync(1);
     expect(said).toEqual(['First.']);
 
@@ -488,11 +487,11 @@ describe('TurnTaking', () => {
     const { deps, said } = fakeTurnTakingDeps({ send: async () => answers.shift() ?? { accepted: true } });
     const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
     for (const text of ['what about the logs', 'and the disk', 'а диск', 'і пам’ять']) {
-      turnTaking.onTurn(text);
+      turnTaking.reserve().send(text);
       await turnTaking.idle();
     }
     turnTaking.onChat(true);
-    turnTaking.onTurn('а мережа');
+    turnTaking.reserve().send('а мережа');
     await turnTaking.idle();
     expect(said).toEqual([
       FAILURE_LINES.rate_limited.en,
@@ -604,14 +603,12 @@ describe('TurnTaking', () => {
   });
 
   it('stays silent once closed', async () => {
-    const { deps, said, sent } = fakeTurnTakingDeps();
+    const { deps, said } = fakeTurnTakingDeps();
     const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
     turnTaking.close();
-    turnTaking.onTurn('hello');
     turnTaking.onReply('Hi.');
     turnTaking.onTurnLost('empty');
     await turnTaking.idle();
-    expect(sent).toEqual([]);
     expect(said).toEqual([]);
   });
 });
@@ -1527,7 +1524,12 @@ describe('reply recordings', () => {
       );
       const settings = v.createVoice.mock.calls[0][2];
       expect(settings.recordReplies).toBe(true);
+      // Every line is labelled before it plays.
+      host.emit({ type: 'reply', text: 'Booked.', turn: null });
+      await vi.waitFor(() => expect(v.voice.publishReply).toHaveBeenCalled());
       const pcm = Int16Array.from({ length: 24_000 }, (_, i) => (i % 2 ? 16384 : -16384));
+      const meter = new LineMeter();
+      meter.frame(pcm);
       const line = {
         outcome: 'spoken' as const,
         model: 'gemini-3.8-flash-lite-tts',
@@ -1535,7 +1537,7 @@ describe('reply recordings', () => {
         firstAudioMs: 900,
         heldMs: 0,
         durationMs: 1000,
-        ...audioLevels(pcm),
+        ...meter.levels,
       };
       settings.spoke?.(line, pcm);
       const file = path.join(root, 'Andy', new Date().toISOString().slice(0, 10), 'call-1-reply-1.wav');
@@ -1570,7 +1572,6 @@ describe('reply recordings', () => {
     const v = fakeVoice();
     await runCall(ctx, callDeps(host.fetchImpl, v));
     expect(v.createVoice.mock.calls[0][2].recordReplies).toBeUndefined();
-    expect(audioLevels(new Int16Array(10))).toEqual({ peakDb: -Infinity, rmsDb: -Infinity });
     host.endStream();
   });
 });
@@ -1958,7 +1959,7 @@ describe('speech output', () => {
     const speech = lineSpeech({ [ttsId(ELEVEN)]: eleven, [ttsId(GEMINI)]: gemini }, { choice: ELEVEN });
     expect(await speak(speech, 'One.')).toBe(1);
     expect(speech.spokenBy).toEqual(GEMINI);
-    expect(speech.active).toEqual(ELEVEN);
+    expect(speech.state.active).toEqual(ELEVEN);
     // Without its key a provider never speaks: the default does.
     const keyless = new LineSpeech({
       choice: ELEVEN,
