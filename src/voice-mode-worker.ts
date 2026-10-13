@@ -1391,6 +1391,10 @@ export class TurnTaking {
   private readonly slots: Array<{ job?: (() => Promise<void>) | null }> = [];
   /** A turn the host did not answer in time and may still store: the turns after it wait for its `turn-stored`. */
   private unconfirmed?: { turnKey: string; resolve: () => void };
+  /** Turns the host stored before their timed-out POST came back (its event outran the 504), by key: their host id. */
+  private readonly storedEarly = new Map<string, string>();
+  /** Waiting in sent() for the slots to drain. */
+  private readonly drained = new Set<() => void>();
   private speech: Promise<void> = Promise.resolve();
   private readonly wakers = new Set<() => void>();
   private thinkingUntil = 0;
@@ -1498,19 +1502,31 @@ export class TurnTaking {
   }
 
   /** The host stored a turn it had not answered in time: the turns after it go now. */
-  stored(turnKey: string): void {
-    if (this.unconfirmed?.turnKey !== turnKey) return;
-    this.unconfirmed.resolve();
-    this.unconfirmed = undefined;
+  stored(turnKey: string, id: string): void {
+    if (this.unconfirmed?.turnKey === turnKey) {
+      this.unconfirmed.resolve();
+      this.unconfirmed = undefined;
+      return;
+    }
+    // Its 504 may still be on the way: that turn then counts as taken, and holds nothing back.
+    this.storedEarly.set(turnKey, id);
+    for (const key of this.storedEarly.keys()) {
+      if (this.storedEarly.size <= MAX_UNCONFIRMED_TURNS) break;
+      this.storedEarly.delete(key);
+    }
   }
 
-  /** Settles once every turn filled so far went to the host. */
+  /** Settles once every turn that closed so far went to the host or was skipped. */
   async sent(): Promise<void> {
-    let settled: Promise<void>;
-    do {
-      settled = this.sends;
+    for (;;) {
+      if (this.slots.length) {
+        await new Promise<void>((resolve) => this.drained.add(resolve));
+        continue;
+      }
+      const settled = this.sends;
       await settled;
-    } while (settled !== this.sends);
+      if (settled === this.sends && !this.slots.length) return;
+    }
   }
 
   private drain(): void {
@@ -1521,6 +1537,10 @@ export class TurnTaking {
           .then(job)
           .catch((err: unknown) => this.deps.log.warn('voice-mode worker: sending a turn failed', { err }));
       }
+    }
+    for (const wake of [...this.drained]) {
+      this.drained.delete(wake);
+      wake();
     }
   }
 
@@ -1605,10 +1625,15 @@ export class TurnTaking {
 
   private async sendTurn(text: string, onSent?: TurnSent): Promise<void> {
     const postAt = this.now();
-    const result = await this.deps.send(text).catch((err: unknown): SendResult => {
+    let result = await this.deps.send(text).catch((err: unknown): SendResult => {
       this.deps.log.warn('voice-mode worker: sending a turn threw', { err });
       return { accepted: false, error: err instanceof Error ? err.message : String(err) };
     });
+    const storedId = result.turnKey ? this.storedEarly.get(result.turnKey) : undefined;
+    if (!result.accepted && storedId !== undefined && hostLossReason(result) === 'timeout') {
+      this.storedEarly.delete(result.turnKey!);
+      result = { accepted: true, turnKey: result.turnKey, id: storedId };
+    }
     onSent?.(result, postAt);
     if (this.closed) return;
     if (!result.accepted) {
@@ -3058,6 +3083,8 @@ export class CallTurns {
     } finally {
       this.closing.delete(turn);
       slot?.skip();
+      // Never leaves the turn that went on waiting, whatever became of this one.
+      turn.handOff?.('');
       if (!this.closed) this.syncHold();
     }
   }
@@ -3087,15 +3114,17 @@ export class CallTurns {
     const recording: Recording = { text: said, failed: heard.failed && !said, take };
     if (!slot || turn.switched || turn.handOff || this.closed) {
       caption(said);
+      // The turn that went on waits for these words even once the call ended: a committed send may lead with them.
+      if (turn.handOff) {
+        turn.handOff(said);
+        if (!this.closed) this.syncHold();
+        return null;
+      }
       if (this.closed) return null;
       this.syncHold();
       if (why === 'review' || why === 'switch') return recording;
       if (turn.switched) {
         turn.switched(recording);
-        return null;
-      }
-      if (turn.handOff) {
-        turn.handOff(said);
         return null;
       }
       if (why === 'unaddressed') {
@@ -5207,7 +5236,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         }
       } else if (event.type === 'chat') turnTaking.onChat(event.chat);
       else if (event.type === 'turn-stored') {
-        turnTaking.stored(event.turnKey);
+        turnTaking.stored(event.turnKey, event.id);
         const late = unconfirmed.get(event.turnKey);
         if (!late) return;
         unconfirmed.delete(event.turnKey);

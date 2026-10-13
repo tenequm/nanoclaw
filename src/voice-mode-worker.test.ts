@@ -395,10 +395,10 @@ describe('TurnTaking', () => {
     turnTaking.onTurn('next');
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['late']);
-    turnTaking.stored('key-other');
+    turnTaking.stored('key-other', '1');
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['late']);
-    turnTaking.stored('key-late');
+    turnTaking.stored('key-late', '2');
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['late', 'next']);
     // The end lets a waiting turn go too: a slot filled after it still posts.
@@ -408,6 +408,45 @@ describe('TurnTaking', () => {
     after.send('after the end');
     await turnTaking.sent();
     expect(sent).toEqual(['late', 'next', 'late', 'after the end']);
+    vi.useRealTimers();
+  });
+
+  it('a turn-stored that outruns its own 504 counts the turn as taken: nothing waits on it, no failure line', async () => {
+    vi.useFakeTimers();
+    const { deps, sent, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'en' });
+    deps.send = vi.fn(async (text: string): Promise<SendResult> => {
+      sent.push(text);
+      if (text !== 'late') return { accepted: true, id: text };
+      // The host's event stream says it stored the turn before its 504 answer is read.
+      turnTaking.stored('key-late', '7');
+      return { accepted: false, status: 504, turnKey: 'key-late' };
+    });
+    const results: SendResult[] = [];
+    turnTaking.onTurn('late', (result) => results.push(result));
+    turnTaking.onTurn('next');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual(['late', 'next']);
+    expect(results).toEqual([{ accepted: true, turnKey: 'key-late', id: '7' }]);
+    await turnTaking.idle();
+    expect(said).toEqual([]);
+    vi.useRealTimers();
+  });
+
+  it('sent() waits for a turn that closed before it and is filled later, not only for the ones filled so far', async () => {
+    vi.useFakeTimers();
+    const { deps, sent } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    const first = turnTaking.reserve();
+    turnTaking.reserve().send('second');
+    let done = false;
+    void turnTaking.sent().then(() => (done = true));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(done).toBe(false);
+    first.skip();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual(['second']);
+    expect(done).toBe(true);
     vi.useRealTimers();
   });
 
@@ -3586,6 +3625,24 @@ describe('CallTurns, finalizing turns and the switch to Manual', () => {
     expect(h.turns.turnOpen).toBe(false);
     await h.pass(SILENCE + 500);
     expect(h.t.begins).toHaveLength(2);
+  });
+
+  it('a send committed after a discard phrase that went on still goes when the call ends before either final', async () => {
+    const h = turnsHarness();
+    h.t.hold = true;
+    h.t.results.push(heard('Remind me to, scratch that', 'Remind me to scratch that.'));
+    await h.talk(1500);
+    await h.interim('Remind me to, scratch that');
+    await h.interim('Remind me to, scratch that');
+    h.t.results.push(heard('the car tomorrow. Zulu.', 'the car tomorrow. Zulu.'));
+    await h.talk(1500);
+    await h.interim('the car tomorrow. Zulu.');
+    expect(h.t.ended).toBe(2);
+    // The call ends: the earlier activity is decided as closed, and still hands its words on.
+    h.turns.close();
+    h.t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual(['Remind me to scratch that. the car tomorrow.']);
   });
 });
 
