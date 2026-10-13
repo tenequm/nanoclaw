@@ -1736,62 +1736,28 @@ export type CueKind = 'listening' | 'wake' | 'sent' | 'discard' | 'turn' | 'nope
 /** A cue note's amplitude (of full scale): a sine about 6 dB under the agent's speech on the wire. */
 const CUE_LEVEL = 0.15;
 /**
- * Each cue's notes as [Hz, start s, length s], and their level (of full scale). Every note holds
- * its level, so a cue is 150-250 ms of tone that a phone speaker carries, about 6 dB under speech.
+ * Each cue's notes as [Hz, start s, length s], and their level (of full scale, CUE_LEVEL unless set).
+ * Every note holds its level, so a cue is 150-250 ms of tone that a phone speaker carries, about 6 dB
+ * under speech.
  */
-const CUES: Record<CueKind, { notes: ReadonlyArray<readonly [hz: number, at: number, len: number]>; level: number }> = {
+// prettier-ignore
+const CUES: Record<CueKind, { notes: ReadonlyArray<readonly [hz: number, at: number, len: number]>; level?: number }> = {
   // A rising fifth: the line is open.
-  listening: {
-    notes: [
-      [784, 0, 0.11],
-      [1175, 0.11, 0.13],
-    ],
-    level: CUE_LEVEL,
-  },
+  listening: { notes: [[784, 0, 0.11], [1175, 0.11, 0.13]] },
   // Higher and quicker than listening: heard, go on.
-  wake: {
-    notes: [
-      [1175, 0, 0.08],
-      [1568, 0.08, 0.11],
-    ],
-    level: CUE_LEVEL,
-  },
+  wake: { notes: [[1175, 0, 0.08], [1568, 0.08, 0.11]] },
   // One high note: the turn is on its way.
-  sent: { notes: [[1760, 0, 0.15]], level: CUE_LEVEL },
+  sent: { notes: [[1760, 0, 0.15]] },
   // A falling fifth, lower than the rest: dropped.
-  discard: {
-    notes: [
-      [784, 0, 0.09],
-      [523, 0.09, 0.14],
-    ],
-    level: CUE_LEVEL,
-  },
+  discard: { notes: [[784, 0, 0.09], [523, 0.09, 0.14]] },
   // A falling third, like a doorbell: over to the caller.
-  turn: {
-    notes: [
-      [1319, 0, 0.1],
-      [1047, 0.1, 0.14],
-    ],
-    level: CUE_LEVEL,
-  },
+  turn: { notes: [[1319, 0, 0.1], [1047, 0.1, 0.14]] },
   // One low note: nothing to do.
-  nope: { notes: [[370, 0, 0.18]], level: CUE_LEVEL },
+  nope: { notes: [[370, 0, 0.18]] },
   // Two soft low notes, quieter than the rest: words to read, nothing sent.
-  draft: {
-    notes: [
-      [523, 0, 0.1],
-      [659, 0.1, 0.12],
-    ],
-    level: CUE_LEVEL * 0.7,
-  },
+  draft: { notes: [[523, 0, 0.1], [659, 0.1, 0.12]], level: CUE_LEVEL * 0.7 },
   // A soft falling fourth, quietest of all: nothing more was said, back to waiting.
-  sleep: {
-    notes: [
-      [659, 0, 0.1],
-      [494, 0.1, 0.14],
-    ],
-    level: CUE_LEVEL * 0.6,
-  },
+  sleep: { notes: [[659, 0, 0.1], [494, 0.1, 0.14]], level: CUE_LEVEL * 0.6 },
 };
 /** The cue track's audio: 48 kHz mono in 20 ms frames. */
 const CUE_SAMPLE_RATE = 48_000;
@@ -1809,7 +1775,7 @@ const cueAudio = new Map<CueKind, AudioFrame[]>();
 export function cueFrames(kind: CueKind): AudioFrame[] {
   const cached = cueAudio.get(kind);
   if (cached) return cached;
-  const { notes, level } = CUES[kind];
+  const { notes, level = CUE_LEVEL } = CUES[kind];
   const end = Math.max(...notes.map(([, at, len]) => at + len));
   const frames = Math.ceil((end * CUE_SAMPLE_RATE) / CUE_FRAME);
   const pcm = new Float32Array(frames * CUE_FRAME);
@@ -1975,45 +1941,11 @@ async function publishCueTrack(room: Room, log: WorkerLog): Promise<{ feed: CueF
 }
 
 /** Cyrillic letters as Latin sounds, so a name matches in either script (`Енді` and `Andy`). */
-const CYRILLIC_LATIN: Record<string, string> = {
-  а: 'a',
-  б: 'b',
-  в: 'v',
-  г: 'h',
-  ґ: 'g',
-  д: 'd',
-  е: 'e',
-  є: 'ye',
-  ё: 'yo',
-  ж: 'zh',
-  з: 'z',
-  и: 'y',
-  і: 'i',
-  ї: 'yi',
-  й: 'y',
-  к: 'k',
-  л: 'l',
-  м: 'm',
-  н: 'n',
-  о: 'o',
-  п: 'p',
-  р: 'r',
-  с: 's',
-  т: 't',
-  у: 'u',
-  ф: 'f',
-  х: 'h',
-  ц: 'ts',
-  ч: 'ch',
-  ш: 'sh',
-  щ: 'shch',
-  ь: '',
-  ъ: '',
-  ы: 'y',
-  э: 'e',
-  ю: 'yu',
-  я: 'ya',
-};
+const CYRILLIC_LATIN: Record<string, string> = Object.fromEntries(
+  'а:a б:b в:v г:h ґ:g д:d е:e є:ye ё:yo ж:zh з:z и:y і:i ї:yi й:y к:k л:l м:m н:n о:o п:p р:r с:s т:t у:u ф:f х:h ц:ts ч:ch ш:sh щ:shch ь: ъ: ы:y э:e ю:yu я:ya'
+    .split(' ')
+    .map((pair) => pair.split(':')),
+);
 
 /** A spoken word, normalised: lower case, Latin letters without accents, `kh` as `h`. */
 function spokenWord(raw: string): string {
