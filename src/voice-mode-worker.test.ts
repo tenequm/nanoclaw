@@ -11,7 +11,7 @@ import { getEventListeners } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
 import { AgentServer, InferenceRunner, initializeLogger, ServerOptions, VADEventType } from '@livekit/agents';
-import { AudioFrame, DisconnectReason } from '@livekit/rtc-node';
+import { AudioFrame, AudioResampler, DisconnectReason } from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -2021,27 +2021,49 @@ describe('speech output', () => {
     expect(down.said).toEqual(['One.', 'One.']);
   });
 
-  it('resamples a line to 24 kHz mono: linear across chunks, channels averaged, 24 kHz mono as is', () => {
-    const at22 = lineResampler();
-    let total = 0;
-    for (let i = 0; i < 10; i++)
-      total += at22({ pcm: new Int16Array(2205).fill(1000), sampleRate: 22_050, numChannels: 1 }).length;
-    expect(Math.abs(total - 24_000)).toBeLessThanOrEqual(1);
-    const ramp = lineResampler();
-    const up = [0, 1].flatMap((k) =>
-      Array.from(
-        ramp({ pcm: Int16Array.from({ length: 4 }, (_, i) => (k * 4 + i) * 100), sampleRate: 12_000, numChannels: 1 }),
-      ),
-    );
-    expect(up).toEqual([0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700]);
-    const stereo = lineResampler()({
+  it('takes a line to 24 kHz mono: 24 kHz as is, channels averaged, other rates resampled with the tail flushed', () => {
+    const converting = vi.fn();
+    const same = new Int16Array(480).fill(7);
+    const direct = lineResampler(converting);
+    expect(direct.push({ pcm: same, sampleRate: 24_000, numChannels: 1 })).toBe(same);
+    const stereo = direct.push({
       pcm: Int16Array.from({ length: 960 }, (_, i) => (i % 2 ? 3000 : 1000)),
-      sampleRate: 48_000,
+      sampleRate: 24_000,
       numChannels: 2,
     });
-    expect(stereo).toEqual(new Int16Array(240).fill(2000));
-    const same = new Int16Array(480).fill(7);
-    expect(lineResampler()({ pcm: same, sampleRate: 24_000, numChannels: 1 })).toBe(same);
+    expect(stereo).toEqual(new Int16Array(480).fill(2000));
+    expect(direct.flush()).toHaveLength(0);
+    direct.close();
+    expect(converting).not.toHaveBeenCalled();
+
+    const at22 = lineResampler(converting);
+    const out: number[] = [];
+    try {
+      for (let i = 0; i < 10; i++)
+        out.push(...at22.push({ pcm: new Int16Array(2205).fill(1000), sampleRate: 22_050, numChannels: 1 }));
+      out.push(...at22.flush());
+    } finally {
+      at22.close();
+    }
+    expect(converting).toHaveBeenCalledTimes(1);
+    expect(converting).toHaveBeenCalledWith(22_050);
+    expect(Math.abs(out.length - 24_000)).toBeLessThanOrEqual(48);
+    // A steady level stays steady once the filter has settled: no interpolation ripple.
+    for (const v of out.slice(2_400, 21_600)) expect(Math.abs(v - 1000)).toBeLessThanOrEqual(2);
+  });
+
+  it('resamples a chunk that is a view into a larger buffer from the view, not the buffer start', () => {
+    const backing = new Int16Array(4_410).fill(-5000, 0, 2_205).fill(1000, 2_205);
+    const view = lineResampler(() => undefined);
+    const out: number[] = [];
+    try {
+      for (let i = 0; i < 4; i++)
+        out.push(...view.push({ pcm: backing.subarray(2_205), sampleRate: 22_050, numChannels: 1 }));
+      out.push(...view.flush());
+    } finally {
+      view.close();
+    }
+    expect(out.slice(480, -480).filter((v) => Math.abs(v - 1000) > 2)).toEqual([]);
   });
 });
 
@@ -2229,7 +2251,9 @@ describe('voice selection in a call (the settings RPC)', () => {
     call.frames.length = 0;
     const two = await line('Two.');
     expect(two).toMatchObject({ model: 'elevenlabs/eleven_v4', durationMs: 1000 });
-    expect(new Set(call.frames.flatMap((f) => Array.from(f)))).toEqual(new Set([2000]));
+    // Channels averaged to one level; the resampler's filter rings only at the line's edges.
+    const pcm = call.frames.flatMap((f) => Array.from(f));
+    expect(pcm.slice(480, -480).filter((v) => Math.abs(v - 2000) > 2)).toEqual([]);
   });
 
   it('a pending choice that fails before audio: the fallback speaks that line once, the choice stays active', async () => {
@@ -2262,6 +2286,42 @@ describe('voice selection in a call (the settings RPC)', () => {
     await flush();
     expect(call.said(ELEVEN).filter((text) => text === 'One.')).toHaveLength(1);
     expect(call.said(GEMINI)).not.toContain('One.');
+  });
+
+  it('a resampled line frees its resampler however it ends; only a line spoken to its end flushes the tail', async () => {
+    const push = vi.spyOn(AudioResampler.prototype, 'push');
+    const flushed = vi.spyOn(AudioResampler.prototype, 'flush');
+    const closed = vi.spyOn(AudioResampler.prototype, 'close');
+    try {
+      const at22 = { sampleRate: 22_050, samples: 2_205 };
+      const call = speakingCall({
+        [ttsId(ELEVEN)]: (text) =>
+          text === 'One.'
+            ? { ...at22, chunks: 2 }
+            : text === 'Two.'
+              ? { ...at22, chunks: 2, error: Object.assign(new Error('cut'), { retryable: true }) }
+              : text === 'Three.'
+                ? { ...at22, chunks: 3, hold: new Promise(() => undefined) }
+                : { chunks: 1 },
+      });
+      const { host, job, line } = await start(call);
+      await call.v.rpc('settings', fixtures.settingsRequestTts);
+      expect(await line('One.')).toMatchObject({ outcome: 'spoken' });
+      expect([flushed.mock.calls.length, closed.mock.calls.length]).toEqual([1, 1]);
+      expect(await line('Two.')).toMatchObject({ outcome: 'partial' });
+      expect([flushed.mock.calls.length, closed.mock.calls.length]).toEqual([1, 2]);
+      const pushes = push.mock.calls.length;
+      host.emit({ type: 'reply', text: 'Three.', turn: null });
+      await vi.waitFor(() => expect(push.mock.calls.length).toBeGreaterThan(pushes));
+      host.emit({ type: 'end', reason: 'hangup' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
+      await vi.waitFor(() => expect(closed).toHaveBeenCalledTimes(3));
+      expect(flushed).toHaveBeenCalledTimes(1);
+    } finally {
+      push.mockRestore();
+      flushed.mockRestore();
+      closed.mockRestore();
+    }
   });
 
   it('a provider with no audio for a line is tried once more, then the fallback speaks it', async () => {

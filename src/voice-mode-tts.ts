@@ -156,7 +156,16 @@ export const TTS_REGISTRY: Readonly<Record<TtsProvider, TtsEntry>> = {
     fallback: () => null,
     filters: { notch: false },
     build: (choice, apiKey, log) =>
-      wrapSdkTts(new elevenlabs.TTS({ apiKey, model: choice.model, voiceId: choice.voice }) as SdkTts, log),
+      wrapSdkTts(
+        new elevenlabs.TTS({
+          apiKey,
+          model: choice.model,
+          voiceId: choice.voice,
+          // The speech track's own rate, so no line is resampled; the plugin's type omits it but parses any pcm_N.
+          encoding: 'pcm_24000' as elevenlabs.TTSEncoding,
+        }) as SdkTts,
+        log,
+      ),
   },
 };
 

@@ -47,6 +47,8 @@ import {
 import * as silero from '@livekit/agents-plugin-silero';
 import {
   AudioFrame,
+  AudioResampler,
+  AudioResamplerQuality,
   AudioSource,
   AudioStream,
   DisconnectReason,
@@ -472,41 +474,58 @@ export function lineFilter(
   };
 }
 
+/** A line's audio on its way to the speech track; `flush` takes the converter's tail, `close` frees it. */
+export interface LineResampler {
+  push(audio: TtsAudio): Int16Array;
+  flush(): Int16Array;
+  close(): void;
+}
+
 /**
- * A line's audio as the speech track takes it: 24 kHz mono, channels averaged and the rate converted by
- * linear interpolation, its state running across the line's chunks. Audio already at 24 kHz mono passes as is.
+ * A line's audio as the speech track takes it: 24 kHz mono, channels averaged. Audio already at 24 kHz
+ * passes as is; any other rate goes through rtc-node's high-quality resampler, one per line (its state
+ * runs across the line's chunks), and `converting` is told the rate once when it is made.
  */
-export function lineResampler(rate = TTS_SAMPLE_RATE): (audio: TtsAudio) => Int16Array {
-  let prev = 0;
-  /** Where the next output sample falls, in input samples from the chunk's start (-1 is the last chunk's end). */
-  let at = 0;
-  return ({ pcm, sampleRate, numChannels }) => {
-    const channels = Math.max(1, numChannels);
-    const length = Math.floor(pcm.length / channels);
-    let mono = pcm;
-    if (channels > 1) {
-      mono = new Int16Array(length);
-      for (let i = 0; i < length; i++) {
-        let sum = 0;
-        for (let c = 0; c < channels; c++) sum += pcm[i * channels + c];
-        mono[i] = Math.round(sum / channels);
-      }
+export function lineResampler(converting: (sampleRate: number) => void, rate = TTS_SAMPLE_RATE): LineResampler {
+  let resampler: AudioResampler | undefined;
+  const joined = (frames: AudioFrame[]): Int16Array => {
+    if (frames.length === 1) return frames[0].data;
+    const out = new Int16Array(frames.reduce((n, f) => n + f.data.length, 0));
+    let at = 0;
+    for (const f of frames) {
+      out.set(f.data, at);
+      at += f.data.length;
     }
-    if (sampleRate === rate || !length) return mono;
-    const step = sampleRate / rate;
-    const count = at > length - 1 ? 0 : Math.floor((length - 1 - at) / step) + 1;
-    const out = new Int16Array(count);
-    for (let k = 0; k < count; k++) {
-      const t = at + k * step;
-      const i = Math.floor(t);
-      const frac = t - i;
-      const a = i < 0 ? prev : mono[i];
-      const b = frac ? mono[i + 1] : a;
-      out[k] = Math.round(a + (b - a) * frac);
-    }
-    at += count * step - length;
-    prev = mono[length - 1];
     return out;
+  };
+  return {
+    push({ pcm, sampleRate, numChannels }) {
+      const channels = Math.max(1, numChannels);
+      const length = Math.floor(pcm.length / channels);
+      let mono = pcm;
+      if (channels > 1) {
+        mono = new Int16Array(length);
+        for (let i = 0; i < length; i++) {
+          let sum = 0;
+          for (let c = 0; c < channels; c++) sum += pcm[i * channels + c];
+          mono[i] = Math.round(sum / channels);
+        }
+      }
+      if (sampleRate === rate || !length) return mono;
+      if (resampler?.inputRate !== sampleRate) {
+        resampler?.close();
+        resampler = new AudioResampler(sampleRate, rate, 1, AudioResamplerQuality.HIGH);
+        converting(sampleRate);
+      }
+      // rtc-node hands the native side the buffer's start, not the view's: a view at an offset goes as a copy.
+      const whole = mono.byteOffset ? mono.slice() : mono;
+      return joined(resampler.push(new AudioFrame(whole, sampleRate, 1, length)));
+    },
+    flush: () => (resampler ? joined(resampler.flush()) : new Int16Array(0)),
+    close() {
+      resampler?.close();
+      resampler = undefined;
+    },
   };
 }
 
@@ -3874,7 +3893,9 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
     const sent: Int16Array[] = [];
     // One resampler and one filter per line: their state runs across the line's frames. The filter
     // is the one of the provider that speaks the line.
-    const resample = lineResampler();
+    const resample = lineResampler((sampleRate) =>
+      o.log.warn('voice-mode worker: speech is not at the track rate; resampling the line', { sampleRate }),
+    );
     let filter: ((pcm: Int16Array) => Int16Array) | undefined;
     const capture = async (synthesized: Int16Array) => {
       const frame = filter ? filter(synthesized) : synthesized;
@@ -3901,7 +3922,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
           deess: !!o.settings.deess,
           notch: !!o.settings.notch && TTS_REGISTRY[(speech.spokenBy ?? primary).provider].filters.notch,
         });
-        const pcm = resample(audio);
+        const pcm = resample.push(audio);
         if (!heard) {
           await ready?.();
           if (closed) break;
@@ -3911,6 +3932,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
         }
         await play(pcm);
       }
+      if (heard && !closed) await play(resample.flush());
       if (rest) {
         const tail = new Int16Array(SPEECH_FRAME);
         tail.set(rest);
@@ -3927,6 +3949,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
       if (heard) await o.sink.waitForPlayout().catch(() => undefined);
       return false;
     } finally {
+      resample.close();
       if (heard && !closed) o.stopped();
       const line = meter.done({ by: speech.spokenBy, primary, failed, cut: closed });
       if (line) {
@@ -4042,7 +4065,14 @@ async function roomVoice(
   const speechTrack = LocalAudioTrack.createAudioTrack(SPEECH_TRACK, speechSource);
   const speechPublication = await local.publishTrack(
     speechTrack,
-    new TrackPublishOptions({ source: TrackSource.SOURCE_MICROPHONE }),
+    // Hi-fi speech: DTX off so a line's first milliseconds are never spent waking the track, and a
+    // 64 kbps Opus cap over the SDK's 48 kbps default. RED is the SDK default, kept explicit.
+    new TrackPublishOptions({
+      source: TrackSource.SOURCE_MICROPHONE,
+      dtx: false,
+      red: true,
+      audioEncoding: { maxBitrate: 64_000n },
+    }),
   );
   // The cues' own track: never the speech track, so a cue is never the agent speaking. Without it
   // the call runs silent of cues.
