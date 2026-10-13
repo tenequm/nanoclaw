@@ -89,7 +89,9 @@ keys are voice-mode's own:
 `VOICE_MODE_TTS_MODEL`, `VOICE_MODE_TTS_FALLBACK_MODEL`,
 `VOICE_MODE_TTS_VOICE` and `VOICE_MODE_LINK_TOKEN` (and their `VOICE_*` names
 above) are no longer read: each line keeps its own voice, and `/voice` makes
-the links. `VOICE_MODE_MIRROR` (`VOICE_MIRROR`) is not read either: a call
+the links. `VOICE_MODE_STT_FALLBACK_MODEL` (the unary fallback is gone) and
+`VOICE_MODE_MAX_SPOKEN_CHARS` (replies are spoken in full) are not read.
+`VOICE_MODE_MIRROR` (`VOICE_MIRROR`) is not read either: a call
 talks only in its line's `/voice` chat, and a line whose chat is gone is
 refused until `/voice` runs again. Before upgrading an install that set one, save it on every line
 with `PATCH /voice/tts` (see the skill's "Voice per line"), or its lines
