@@ -180,6 +180,14 @@ const MAX_RECORDED_TURN_MS = 120_000;
 const TURN_RETRY_DELAY_MS = 500;
 /** Timed-out turns kept for a late `turn-stored`; the host remembers no more turn keys than this either. */
 const MAX_UNCONFIRMED_TURNS = 32;
+/** `map.set`, then the oldest entries go past MAX_UNCONFIRMED_TURNS. */
+function setCapped<K, V>(map: Map<K, V>, key: K, value: V): void {
+  map.set(key, value);
+  for (const old of map.keys()) {
+    if (map.size <= MAX_UNCONFIRMED_TURNS) break;
+    map.delete(old);
+  }
+}
 /** A manual recording's text freezes at most this long after done. */
 const FINISH_TIMEOUT_MS = 4_000;
 /** A turn's audio starts this long before the speech that opened it: manual activity has no padding. */
@@ -1453,11 +1461,7 @@ export class TurnTaking {
       return;
     }
     // Its 504 may still be on the way: that turn then counts as taken, and holds nothing back.
-    this.storedEarly.set(turnKey, id);
-    for (const key of this.storedEarly.keys()) {
-      if (this.storedEarly.size <= MAX_UNCONFIRMED_TURNS) break;
-      this.storedEarly.delete(key);
-    }
+    setCapped(this.storedEarly, turnKey, id);
   }
 
   /** Settles once every turn that closed so far went to the host or was skipped. */
@@ -4744,11 +4748,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       lastSettled = Math.max(lastSettled, turn);
       if (host.accepted) lastAccepted = Math.max(lastAccepted, turn);
       if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {
-        unconfirmed.set(host.turnKey, { turn, text });
-        for (const key of unconfirmed.keys()) {
-          if (unconfirmed.size <= MAX_UNCONFIRMED_TURNS) break;
-          unconfirmed.delete(key);
-        }
+        setCapped(unconfirmed, host.turnKey, { turn, text });
       }
       publish(
         host.accepted ? { turn, status: 'sent', text } : { turn, status: 'lost', reason: hostLossReason(host), text },
@@ -5023,7 +5023,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     .events((event) => {
       if (event.type === 'end') void end(`host: ${event.reason}`, false);
       else if (event.type === 'reply') {
-        // A host that sends no turn at all predates reply labels: not known, so no label.
+        // A host id this worker never sent: not known, so no label.
         const turn = typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn;
         // Any agent message after the turns the host took answers the "did it get it" question.
         pickedUp = Math.max(pickedUp, lastAccepted, typeof turn === 'number' ? turn : 0);
