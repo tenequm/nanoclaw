@@ -12,8 +12,10 @@ import {
   WAKE_WINDOW_SAMPLES,
   WakeWordPipeline,
   WakeWordSpotter,
-  pcmToFloat,
 } from './voice-mode-wakeword.js';
+
+/** int16 PCM as the reference reads it: x / 32768. */
+const pcmToFloat = (pcm: Int16Array): Float32Array => Float32Array.from(pcm, (x) => x / 32768);
 
 const FIXTURES = fileURLToPath(new URL('./voice-mode-wakeword-fixtures/', import.meta.url));
 
@@ -119,6 +121,7 @@ describe('WakeWordSpotter', () => {
         detections.push(score);
         windows.push(window);
       },
+      onError: () => undefined,
       now,
     });
     spotters.push(spotter);
@@ -230,6 +233,7 @@ describe('WakeWordSpotter', () => {
       phrase: 'hey nobody',
       threshold: 0.5,
       onDetect: () => undefined,
+      onError: () => undefined,
     });
     spotters.push(spotter);
     await expect(spotter.ready).rejects.toThrow(/not found/);

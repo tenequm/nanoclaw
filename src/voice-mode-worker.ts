@@ -134,7 +134,7 @@ import {
   DEFAULT_WAKE_MODEL,
   DEFAULT_WAKE_THRESHOLD,
   WakeWordSpotter,
-  type WakeWordStats,
+  type WakeWordOptions,
 } from './voice-mode-wakeword.js';
 
 /** The worker's duration cap outlasts the host's by this; it only fires when the host is gone. */
@@ -2138,18 +2138,8 @@ export function awakeLimits(env: Record<string, string | undefined>): AwakeLimit
   };
 }
 
-/** What CallTurns needs of the transcription (GeminiLiveTranscriber; faked in tests). */
-export interface Transcription {
-  /** Set a socket up ahead of the next activity; resolves whether it is ready. */
-  prepare(): Promise<boolean>;
-  /** Open an activity, starting with `preRoll`. */
-  begin(preRoll: Int16Array): void;
-  /** Audio for the open activity. */
-  push(pcm: Int16Array): void;
-  /** Close the open activity; resolves with what it heard. */
-  end(): Promise<Heard>;
-  close(): void;
-}
+/** What CallTurns needs of the transcription; faked in tests. */
+export type Transcription = Pick<GeminiLiveTranscriber, 'prepare' | 'begin' | 'push' | 'end' | 'close'>;
 
 const wordCount = (text: string): number => (text.match(/[\p{L}\p{N}]+/gu) ?? []).length;
 /** A final this short may be only the turn's last phrase: a manual activity's final can collapse to it after a pause. */
@@ -3610,28 +3600,13 @@ export interface RunCallDeps {
   log: Pick<Console, 'info' | 'warn'>;
 }
 
-/** What a call needs of a wake word spotter (`WakeWordSpotter`); faked in tests. */
-export interface WakeWord {
-  readonly phrase: string;
-  readonly threshold: number;
-  /** Resolves once it can spot, rejects when its models cannot load. */
-  readonly ready: Promise<void>;
-  /** Score the audio (on) or only keep it (off). */
-  listen(on: boolean): void;
-  /** 16 kHz mono audio. */
-  push(pcm: Int16Array): void;
-  readonly summary: WakeWordStats;
-  /** Its thread's share of one core. */
-  readonly utilization: number;
-  close(): Promise<void>;
-}
+/** What a call needs of a wake word spotter; faked in tests. */
+export type WakeWord = Pick<
+  WakeWordSpotter,
+  'phrase' | 'threshold' | 'ready' | 'listen' | 'push' | 'summary' | 'utilization' | 'close'
+>;
 
-export interface WakeWordEvents {
-  /** The window that had the phrase, as positions (16 kHz samples) in the audio pushed to the spotter. */
-  onDetect(score: number, window: { start: number; end: number }): void;
-  /** It stopped for good after it loaded. */
-  onError(err: string): void;
-}
+export type WakeWordEvents = Pick<WakeWordOptions, 'onDetect' | 'onError'>;
 
 /** The command phrases, as spelling hints for the transcription: they must be in its vocabulary to be heard. */
 export const COMMAND_VOCABULARY: readonly string[] = [...CALL_COMMAND_WORDS.send, ...CALL_COMMAND_WORDS.discard].map(

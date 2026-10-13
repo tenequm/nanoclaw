@@ -82,13 +82,13 @@ export class WakeWordPipeline {
     this.embeddings = typeof steps === 'number' && steps > 0 ? steps : DEFAULT_EMBEDDINGS;
   }
 
-  static async load(classifier: string, featureDir = WAKE_MODEL_DIR): Promise<WakeWordPipeline> {
-    for (const file of [classifier, path.join(featureDir, 'melspectrogram.onnx')]) {
+  static async load(classifier: string): Promise<WakeWordPipeline> {
+    for (const file of [classifier, path.join(WAKE_MODEL_DIR, 'melspectrogram.onnx')]) {
       if (!fs.existsSync(file)) throw new Error(`wake word model not found: ${file}`);
     }
     const [mel, embedding, head] = await Promise.all([
-      ort.InferenceSession.create(path.join(featureDir, 'melspectrogram.onnx'), sessionOptions),
-      ort.InferenceSession.create(path.join(featureDir, 'embedding_model.onnx'), sessionOptions),
+      ort.InferenceSession.create(path.join(WAKE_MODEL_DIR, 'melspectrogram.onnx'), sessionOptions),
+      ort.InferenceSession.create(path.join(WAKE_MODEL_DIR, 'embedding_model.onnx'), sessionOptions),
       ort.InferenceSession.create(classifier, sessionOptions),
     ]);
     return new WakeWordPipeline(mel, embedding, head);
@@ -169,24 +169,16 @@ function sameBlock(a: Float32Array, aw: number, b: Float32Array, bw: number, siz
   return true;
 }
 
-/** int16 PCM as the reference reads it: x / 32768. */
-export function pcmToFloat(pcm: Int16Array): Float32Array {
-  const out = new Float32Array(pcm.length);
-  for (let i = 0; i < pcm.length; i++) out[i] = pcm[i] / 32768;
-  return out;
-}
-
 interface ThreadInit {
   wakeWordThread: true;
   classifier: string;
-  featureDir: string;
 }
 type ThreadReply = { ready: true; embeddings: number } | { error: string } | { id: number; score: number; ms: number };
 
 if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
   const init = workerData as ThreadInit;
   const port = parentPort!;
-  WakeWordPipeline.load(init.classifier, init.featureDir).then(
+  WakeWordPipeline.load(init.classifier).then(
     (pipeline) => {
       let scoring: Promise<unknown> = Promise.resolve();
       port.on('message', (msg: { id: number; audio: Float32Array; end: number } | { stop: true }) => {
@@ -213,13 +205,11 @@ if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
 }
 
 export interface WakeWordOptions {
-  /** The classifier .onnx; the feature models come from `featureDir`. */
+  /** The classifier .onnx; the feature models are the bundled ones. */
   classifier: string;
   /** What the classifier listens for, as the page names it (VOICE_MODE_WAKE_PHRASE). */
   phrase: string;
-  featureDir?: string;
   threshold: number;
-  debounceMs?: number;
   /**
    * A detection: its score, and the window that had the phrase, as positions in the audio pushed so
    * far (samples; `end` exclusive). Its end is where scoring stopped, not where the phrase did: the
@@ -227,7 +217,7 @@ export interface WakeWordOptions {
    */
   onDetect(score: number, window: { start: number; end: number }): void;
   /** The thread failed after it loaded: no more detections. */
-  onError?(err: string): void;
+  onError(err: string): void;
   now?: () => number;
 }
 
@@ -246,7 +236,7 @@ export interface WakeWordStats {
  * Spots the wake word in a call's 16 kHz mono audio. `push` keeps the last 2 s; while `listen` is on,
  * the window ending at every 80 ms of new audio is scored in the worker thread, one at a time, in
  * order (audio arrives in bursts, so a few wait; past WAKE_MAX_QUEUED the oldest is dropped). A score
- * at or over the threshold is a detection, at most one per `debounceMs`; the audio before it is
+ * at or over the threshold is a detection, at most one per WAKE_DEBOUNCE_MS; the audio before it is
  * forgotten (silenced), so it cannot fire twice.
  */
 export class WakeWordSpotter {
@@ -275,7 +265,6 @@ export class WakeWordSpotter {
   private validFrom = 0;
   private lastDetection = -Infinity;
   private readonly now: () => number;
-  private readonly debounceMs: number;
   private readonly stats = { scored: 0, skipped: 0, totalMs: 0, maxMs: 0, detections: 0, maxScore: 0 };
   private readonly options: WakeWordOptions;
 
@@ -284,13 +273,8 @@ export class WakeWordSpotter {
     this.phrase = options.phrase;
     this.threshold = options.threshold;
     this.now = options.now ?? (() => Date.now());
-    this.debounceMs = options.debounceMs ?? WAKE_DEBOUNCE_MS;
     this.thread = new Worker(new URL(import.meta.url), {
-      workerData: {
-        wakeWordThread: true,
-        classifier: options.classifier,
-        featureDir: options.featureDir ?? WAKE_MODEL_DIR,
-      } satisfies ThreadInit,
+      workerData: { wakeWordThread: true, classifier: options.classifier } satisfies ThreadInit,
     });
     this.thread.unref();
     this.exited = new Promise((resolve) => this.thread.once('exit', () => resolve()));
@@ -438,7 +422,7 @@ export class WakeWordSpotter {
   private detects(id: number, score: number): boolean {
     if (id < this.validFrom || !this.listening || this.closed || score < this.threshold) return false;
     const now = this.now();
-    if (now - this.lastDetection < this.debounceMs) return false;
+    if (now - this.lastDetection < WAKE_DEBOUNCE_MS) return false;
     this.lastDetection = now;
     this.stats.detections++;
     return true;
@@ -449,6 +433,6 @@ export class WakeWordSpotter {
     this.closed = true;
     this.listening = false;
     void this.stop();
-    this.options.onError?.(err);
+    this.options.onError(err);
   }
 }
