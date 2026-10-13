@@ -63,7 +63,6 @@ import {
 
 import {
   baseLanguage,
-  DEFAULT_VOICE_LANGUAGES,
   wakePhrase,
   DEFAULT_LIVEKIT_AGENT_NAME,
   HOST_SILENCE_MS,
@@ -317,9 +316,9 @@ export interface CallLanguages {
   ukrainian: boolean;
 }
 
-/** The call's languages from the job metadata; DEFAULT_VOICE_LANGUAGES when the host sent none. */
-export function callLanguages(languages: readonly string[] | undefined): CallLanguages {
-  const codes = languages?.length ? [...languages] : [...DEFAULT_VOICE_LANGUAGES];
+/** The call's languages from the job metadata. */
+export function callLanguages(languages: readonly string[]): CallLanguages {
+  const codes = [...languages];
   const ukrainian = codes.some((code) => baseLanguage(code) === 'uk');
   return { codes, initial: baseLanguage(codes[0]) === 'uk' ? 'uk' : 'en', ukrainian };
 }
@@ -4432,15 +4431,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const transcriptDebug = envSwitch(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG, ['1']);
   /** The label of the line being spoken: TurnTaking announces each line right before it. */
   let speakingLine: CallReplyInfo | undefined;
-  if (meta.sttFallbackModel) {
-    log.warn(
-      'voice-mode worker: VOICE_MODE_STT_FALLBACK_MODEL is ignored: turns are transcribed by the Live model only',
-      {
-        ...callFields,
-        model: meta.sttFallbackModel,
-      },
-    );
-  }
 
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
   try {

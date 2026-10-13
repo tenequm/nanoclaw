@@ -260,7 +260,6 @@ describe('helpers', () => {
   });
 
   it('starts the worker lines in the first configured language and hears Ukrainian only when it is configured', () => {
-    expect(callLanguages(undefined)).toEqual({ codes: ['uk-UA', 'en-US'], initial: 'uk', ukrainian: true });
     expect(callLanguages(['uk-UA', 'en-US'])).toEqual({ codes: ['uk-UA', 'en-US'], initial: 'uk', ukrainian: true });
     expect(callLanguages(['en-US'])).toEqual({ codes: ['en-US'], initial: 'en', ukrainian: false });
     expect(callLanguages(['en-GB', 'uk'])).toEqual({ codes: ['en-GB', 'uk'], initial: 'en', ukrainian: true });
@@ -637,8 +636,8 @@ const META: LiveKitJobMetadata = {
   callerName: 'Ethan',
   callerIdentity: 'caller-1',
   vocabulary: ['NanoClaw'],
+  languages: ['uk-UA', 'en-US'],
   sttModel: 'gemini-3.5-transcribe-live',
-  sttFallbackModel: 'gemini-3.5-transcribe',
   tts: { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'alnilam' },
   silenceMs: 2500,
   maxDurationMs: 60_000,
@@ -1312,14 +1311,14 @@ describe('runCall', () => {
   it("speaks an English-only call's first failure notice in English, and a default call's in Ukrainian", async () => {
     for (const [languages, line] of [
       [['en-US'], FAILURE_LINES.turn.en],
-      [undefined, FAILURE_LINES.turn.uk],
+      [['uk-UA', 'en-US'], FAILURE_LINES.turn.uk],
     ] as const) {
-      const { ctx } = fakeJob(languages ? { ...META, languages } : { ...META });
+      const { ctx } = fakeJob({ ...META, languages });
       const host = fakeHostFetch();
       const v = fakeVoice();
       const transcriber = vi.fn((_options: { languageCodes: readonly string[] }) => v.transcription);
       await runCall(ctx, { ...callDeps(host.fetchImpl, v), transcriber });
-      expect(transcriber.mock.calls[0][0].languageCodes).toEqual(languages ?? ['uk-UA', 'en-US']);
+      expect(transcriber.mock.calls[0][0].languageCodes).toEqual(languages);
       await v.turn('', { speechMs: 1200, failed: true });
       await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(line, expect.any(Function)));
       expect(v.voice.say).toHaveBeenCalledTimes(1);

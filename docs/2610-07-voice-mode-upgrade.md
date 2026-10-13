@@ -73,6 +73,7 @@ changing settings.
 | `VOICE_WAKE_START_SECONDS` | `VOICE_MODE_WAKE_START_SECONDS` |
 | `VOICE_WAKE_IDLE_SECONDS` | `VOICE_MODE_WAKE_IDLE_SECONDS` |
 | `VOICE_RECORDINGS_DAYS` | `VOICE_MODE_RECORDINGS_DAYS` |
+| `VOICE_MAX_SPOKEN_CHARS` | `VOICE_MODE_MAX_SPOKEN_CHARS` |
 | `VOICE_TTS_DEESS` | `VOICE_MODE_TTS_DEESS` |
 | `VOICE_TTS_NOTCH` | `VOICE_MODE_TTS_NOTCH` |
 | `VOICE_WORKER_HEALTH_PORT` | `VOICE_MODE_WORKER_HEALTH_PORT` |
@@ -294,12 +295,12 @@ address. Reload the browser page so it requests protocol 6. Old protocol 5
 starts are refused with 426 before a room or cost-bearing worker is created.
 
 Behavior changes from that worker: own Gemini Live manual activities replace
-AgentSession STT, unary fallback is ignored, wake is on by default, review and
+AgentSession STT, the unary fallback is gone, wake is on by default, review and
 spoken commands are available, and worker-side cues/captions/reconnect are
 retained from main. Turn wake off in the page for pause-send operation.
 Set `VOICE_MODE_LANGUAGES=en-US` if keeping the shared English default is
 intended; protocol 6 defaults to main's Ukrainian/English hints. Recordings
-stay off unless explicitly enabled. Replies are spoken in full unless capped.
+stay off unless explicitly enabled. Replies are spoken in full.
 
 ## Rollback
 

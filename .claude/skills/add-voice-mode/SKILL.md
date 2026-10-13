@@ -320,7 +320,6 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_MAX_MINUTES_PER_DAY` | `120` | Per-line UTC daily call time. These counters reset when the host restarts. |
 | `VOICE_MODE_LANGUAGES` | `uk-UA,en-US` | Up to four language hints, first is primary. Agent language guidance follows them; the worker's own notices start in the first one and use Ukrainian only when it is listed. |
 | `VOICE_MODE_STT_MODEL` | `gemini-3.5-transcribe-live` | Own Gemini Live pipeline, one manual activity per caller turn. |
-| `VOICE_MODE_STT_FALLBACK_MODEL` | ignored | Deprecated unary fallback; the next turn retries Live. |
 | `VOICE_MODE_ELEVENLABS_API_KEY` | empty | Offers ElevenLabs voices to the lines; without it only Gemini speaks. |
 | `VOICE_MODE_SILENCE_MS` | `2500` | Closing silence, valid range 300 to 30000 milliseconds. |
 | `VOICE_MODE_VOCABULARY` | empty | Comma-separated names, merged with the agent's `voice.vocabulary.txt`. |

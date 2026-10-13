@@ -190,8 +190,6 @@ export interface CallChat {
 
 export interface SpeechSettings {
   sttModel?: string;
-  /** Unset for the default; `off` (or empty) for no fallback. */
-  sttFallbackModel?: string;
   silenceMs?: number;
 }
 
@@ -515,8 +513,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const chatReplyNote = CALL_CHAT_REPLY_NOTE.replace(CALL_LANGUAGE_NOTE, languageNote);
   const speech = {
     sttModel: config.speech?.sttModel || DEFAULT_VOICE_STT_MODEL,
-    // Deprecated: no default, and a worker that is still sent one logs that it ignores it.
-    sttFallbackModel: (config.speech?.sttFallbackModel ?? '').trim().replace(/^(off|none)$/i, ''),
     silenceMs: config.speech?.silenceMs || DEFAULT_VOICE_SILENCE_MS,
   };
   const mirrorApi = config.mirrorApi ?? defaultMirrorApi;
@@ -876,7 +872,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       room: call.roomName,
       agent: line.agent.name,
       sttModel: speech.sttModel,
-      sttFallbackModel: speech.sttFallbackModel,
       tts: metadata.tts,
     });
     // What the page needs for its hints: the silence that sends a turn, and the cap that ends the

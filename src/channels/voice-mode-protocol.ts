@@ -85,19 +85,14 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
-  /**
-   * VOICE_MODE_LANGUAGES: the transcription's language hints, the first the call's default. The host
-   * always sends them; a worker falls back to DEFAULT_VOICE_LANGUAGES when they are absent.
-   */
-  languages?: string[];
+  /** VOICE_MODE_LANGUAGES: the transcription's language hints, the first the call's default; never empty. */
+  languages: string[];
   /**
    * The agent's own voice.vocabulary.txt entries: besides `agentName`, the names the wake phrase
    * `hey <agent>` takes (another script or spelling of it, say). Absent when the file has none.
    */
   wakeNames?: string[];
   sttModel: string;
-  /** Deprecated and ignored (there is no unary fallback any more); kept for the wire format, empty by default. */
-  sttFallbackModel: string;
   /** The line's effective speech choice at call start. */
   tts: TtsChoice;
   silenceMs: number;

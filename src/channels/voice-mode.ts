@@ -780,7 +780,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       'LIVEKIT_WORKER_URL',
       'LIVEKIT_AGENT_NAME',
       'VOICE_MODE_STT_MODEL',
-      'VOICE_MODE_STT_FALLBACK_MODEL',
       'VOICE_MODE_SILENCE_MS',
       'VOICE_MODE_WAKE_MODEL',
       'VOICE_MODE_WAKE_PHRASE',
@@ -815,7 +814,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
         agentName: env.LIVEKIT_AGENT_NAME,
         speech: {
           sttModel: env.VOICE_MODE_STT_MODEL,
-          sttFallbackModel: env.VOICE_MODE_STT_FALLBACK_MODEL,
           silenceMs: parseSilenceMs(env.VOICE_MODE_SILENCE_MS),
         },
       },

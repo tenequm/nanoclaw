@@ -745,7 +745,6 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       // The agent's own spellings of its name, for the wake phrase.
       wakeNames: ['Енді'],
       sttModel: 'gemini-3.5-transcribe-live',
-      sttFallbackModel: '',
       // A line with no saved choice speaks with the default.
       tts: { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'alnilam' },
       silenceMs: 2500,
@@ -1198,24 +1197,20 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     ]);
   });
 
-  it("turns the transcription fallback off when set to off, and sends the line's own voice", async () => {
+  it("sends the line's own voice", async () => {
     await h.stop();
     const tts = { provider: 'elevenlabs', model: 'eleven_v4', voice: 'bIHbv24MWmeRgasZH58o' } as const;
-    h = await startHarness(
-      {
-        resolveLine: async (id) => ({
-          caller: { id, name: 'Ethan' },
-          agentGroupId: 'ag-andy',
-          agent: { name: 'Andy' },
-          tts,
-        }),
-      },
-      { speech: { sttFallbackModel: 'off' } },
-    );
+    h = await startHarness({
+      resolveLine: async (id) => ({
+        caller: { id, name: 'Ethan' },
+        agentGroupId: 'ag-andy',
+        agent: { name: 'Andy' },
+        tts,
+      }),
+    });
     expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
     expect(h.lk.dispatches[0].metadata).toMatchObject({
       sttModel: 'gemini-3.5-transcribe-live',
-      sttFallbackModel: '',
       tts,
     });
     expect(h.lk.dispatches[0].metadata).not.toHaveProperty('ttsModel');
