@@ -120,7 +120,6 @@ import {
   type Heard,
   type TranscriberOptions,
 } from './voice-mode-gemini-live.js';
-import { JevTurnShadow, type TurnShadowSink } from './voice-mode-jev-turn.js';
 import {
   providerKeysFrom,
   readTtsChoice,
@@ -2437,8 +2436,6 @@ export interface CallTurnsDeps {
   unheard(): void;
   /** A turn that came to nothing for the agent: discarded, unaddressed, or a command alone. */
   ended?(facts: TurnFacts, outcome: TurnOutcome, reason: string): void;
-  /** Watches addressed auto turns and logs what it would do (src/voice-mode-jev-turn.ts); never acts. */
-  shadow?: TurnShadowSink;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -2747,9 +2744,6 @@ export class CallTurns {
       this.woke();
       if (!this.speaking) this.armPause();
     }
-    // After the wake resolves: the interim that holds the wake phrase can be the turn's only one. A
-    // repeat is no new text for the shadow, and cannot newly resolve the wake.
-    if (changed) this.deps.shadow?.interim(turn.segment, this.spoken(turn, shown));
     if (match) turn.seen = match;
     // The command acts only once the VAD heard this far: the interim describes the audio up to now.
     const at = this.ring.position;
@@ -2845,7 +2839,6 @@ export class CallTurns {
     clearTimeout(this.pauseTimer);
     this.disarm();
     this.unsettle();
-    if (this.turn) this.deps.shadow?.ended(this.turn.segment, 'hangup');
     this.turn = undefined;
     this.closing.clear();
   }
@@ -3042,7 +3035,6 @@ export class CallTurns {
     const turn = this.turn;
     if (!turn) return null;
     this.turn = undefined;
-    this.deps.shadow?.ended(turn.segment, why);
     clearTimeout(this.pauseTimer);
     this.disarm();
     this.unsettle();
@@ -4686,7 +4678,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turnCueTimer: ReturnType<typeof setTimeout> | undefined;
   let turnCuedAt = 0;
   let replyHoldTimer: ReturnType<typeof setTimeout> | undefined;
-  const jevTurn = new JevTurnShadow({ callId: meta.callId, log: (line, fields) => callLog.info(line, fields) });
   const languages = callLanguages(meta.languages);
   const turnTaking: TurnTaking = new TurnTaking(
     {
@@ -4717,7 +4708,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       // While the line is synthesized the caller is heard as ever, and a turn they start then holds
       // its audio back (`waitForCaller`); once it plays the caller is not transcribed (onAgentSpeaking).
       say: async (text): Promise<boolean> => {
-        jevTurn.context(text);
         try {
           return (await callVoice?.say(text, () => turnTaking.waitForCaller())) ?? false;
         } finally {
@@ -4973,7 +4963,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       changed: () => review?.republish(),
       hold: (open) => turnTaking.setCaptureOpen(open, 'turn'),
       noTurn: () => turnTaking.releaseTurn(),
-      shadow: jevTurn,
       unheard: () => {
         if (!ending && !review?.reviewing) callVoice?.publishUnheard?.();
       },

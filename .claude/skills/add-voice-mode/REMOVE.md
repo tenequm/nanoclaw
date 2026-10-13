@@ -75,8 +75,6 @@ rm -f src/channels/voice-mode-adapter.test.ts \
   src/channels/voice-mode.ts \
   src/voice-mode-gemini-live.test.ts \
   src/voice-mode-gemini-live.ts \
-  src/voice-mode-jev-turn.test.ts \
-  src/voice-mode-jev-turn.ts \
   src/voice-mode-tts.test.ts \
   src/voice-mode-tts.ts \
   src/voice-mode-wakeword.test.ts \

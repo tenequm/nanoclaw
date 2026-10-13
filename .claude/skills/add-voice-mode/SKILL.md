@@ -65,8 +65,6 @@ src/channels/voice-mode-tts.fixtures.json
 src/channels/voice-mode.ts
 src/voice-mode-gemini-live.test.ts
 src/voice-mode-gemini-live.ts
-src/voice-mode-jev-turn.test.ts
-src/voice-mode-jev-turn.ts
 src/voice-mode-tts.test.ts
 src/voice-mode-tts.ts
 src/voice-mode-wakeword.test.ts
@@ -405,17 +403,6 @@ A page that accepts only `2` leaves a `3` worker wake-gated until it reloads.
 Manual review treats these words as ordinary dictation. Cue and typing sound
 switches remain independent settings. Caller speech during agent speech is
 reported as unheard. Reconnect grace keeps a same-identity full rejoin alive.
-
-The Jev end-of-turn shadow is optional, off unless `data/jev-turn.json` enables
-it. It can only measure, never send or end a turn. No Jev credential, endpoint,
-model or service is required for voice installation. See
-[optional shadow configuration](../../../docs/jev-turn.md).
-Its settings are `JEV_API_KEY`, `JEV_URL` and `JEV_MODEL`.
-The daily cap counts one appended byte per judgement in a file per local day,
-`data/jev-turn-usage-<YYYY-MM-DD>`, with no lock: concurrent calls can only
-under-count, and a judgement that cannot be counted is skipped and logged once
-per call as `scope=usage`. Kill switch: `"enabled": false`, or delete
-`data/jev-turn.json`.
 
 ## Upgrade
 

@@ -120,15 +120,10 @@ needs no rename. `off` retains transcript `hey <agent>` wake.
 Saved log queries need the new names. Worker events `voice.turn`,
 `voice.reply`, `voice.call` and `voice.command near-miss` are now
 `voice-mode.turn`, `voice-mode.reply`, `voice-mode.call` and
-`voice-mode.command near-miss`; the Jev shadow's `voice.turn-end jev ...`
-lines are `voice-mode.turn-end jev ...`. Message prefixes moved the same way:
+`voice-mode.command near-miss`. Message prefixes moved the same way:
 `voice worker:` to `voice-mode worker:`, `livekit-voice:` to
 `livekit-voice-mode:` and `voice:` to `voice-mode:`. A selector on the worker
 unit's name must follow a renamed unit too.
-
-The Jev shadow's daily cap now counts in `data/jev-turn-usage-<day>` files.
-Main's `data/jev-turn-usage.json` and its `.lock` are removed automatically by
-the first judgement of a day; nothing needs deleting by hand.
 
 ### Backup and cutover
 
@@ -279,9 +274,8 @@ the first judgement of a day; nothing needs deleting by hand.
     test `/voice new` on a saved line unless retirement is intended. After the
     first call, confirm a `voice-mode.turn` line reaches the log store.
 
-The optional Jev shadow remains off without enabled `data/jev-turn.json`.
-Keep an existing generic endpoint/model configuration only if the operator
-wants that experiment. It is not part of voice service readiness.
+The Jev end-of-turn shadow is gone. A leftover `data/jev-turn.json` and
+`data/jev-turn-usage*` files are inert and can be deleted.
 
 ## Shared protocol 5 AgentSession installations
 
