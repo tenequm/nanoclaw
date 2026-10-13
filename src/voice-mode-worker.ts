@@ -18,10 +18,9 @@
  *    turn with thinking pauses is transcribed as one piece;
  *  - each finished turn goes to the host, which hands it to the agent as a spoken message;
  *  - each complete agent reply from the host's event stream is spoken once the caller is not
- *    mid-turn, in full (cut at a sentence end only when VOICE_MODE_MAX_SPOKEN_CHARS sets a cap),
- *    uninterruptible: while it plays the caller is not transcribed (no barge-in). The line's TTS
- *    provider (`voice-mode-tts.ts`) streams the whole reply from one request into the call's speech
- *    track, and a fallback speaks while it fails; the caller's page can switch it mid-call.
+ *    mid-turn, in full, uninterruptible: while it plays the caller is not transcribed (no barge-in).
+ *    The line's TTS provider (`voice-mode-tts.ts`) streams the whole reply from one request into the
+ *    call's speech track, and a fallback speaks while it fails; the caller's page can switch it mid-call.
  * The worker publishes the captions, `lk.agent.state` and its own attributes the page reads.
  */
 import { randomUUID } from 'node:crypto';
@@ -198,8 +197,6 @@ const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 /** `promise`, or nothing once `ms` passed; the timer keeps no process alive. */
 const atMost = (promise: Promise<unknown>, ms: number): Promise<unknown> =>
   Promise.race([promise, new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.())]);
-/** VOICE_MODE_MAX_SPOKEN_CHARS when unset: 0, no cap; a reply is spoken in full however long it runs. */
-export const DEFAULT_MAX_SPOKEN_CHARS = 0;
 const DAY_MS = 86_400_000;
 
 const samplesOf = (ms: number): number => Math.round((ms * INPUT_SAMPLE_RATE) / 1000);
@@ -326,23 +323,6 @@ export const FAILURE_LINES: Record<FailureKind, Record<CallLanguage, string>> = 
   reply: { uk: 'Не вийшло озвучити відповідь, вона є на екрані.', en: "Sorry, I couldn't read that reply out." },
 };
 export type FailureKind = 'turn' | 'rejected' | 'rate_limited' | 'timeout' | 'timeout_no_chat' | 'reply';
-
-/** Said after a message cut for speech: the full text is in the chat, or, on a call with no chat, nowhere to point at. */
-export const CUT_LINES: Record<'chat' | 'no_chat', Record<CallLanguage, string>> = {
-  chat: { uk: 'Решта - у чаті.', en: 'The rest is in the chat.' },
-  no_chat: { uk: 'Скорочую.', en: "I've cut it short." },
-};
-
-/** A sentence end earlier than this share of the cap wastes the budget: the cut goes to a word instead. */
-const MIN_SENTENCE_CUT = 0.6;
-
-/** VOICE_MODE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default (no cap). */
-export function maxSpokenChars(raw: string | undefined): number {
-  const value = raw?.trim();
-  if (!value) return DEFAULT_MAX_SPOKEN_CHARS;
-  const chars = Number(value);
-  return Number.isInteger(chars) && chars >= 0 ? chars : DEFAULT_MAX_SPOKEN_CHARS;
-}
 
 /** VOICE_MODE_TTS_DEESS: the de-esser runs unless it says 0, off or false. */
 export function ttsDeess(raw: string | undefined): boolean {
@@ -524,30 +504,6 @@ export function lineResampler(rate = TTS_SAMPLE_RATE): (audio: TtsAudio) => Int1
     prev = mono[length - 1];
     return out;
   };
-}
-
-/**
- * Speakable text cut to `max` characters for a call: up to the last sentence end within the cap when
- * that keeps most of it, else the last whole word, then a closing line (CUT_LINES; "the rest is in the
- * chat" only when `inChat`). Unchanged when it fits or `max` is 0.
- */
-export function capSpokenText(text: string, max: number, language: CallLanguage, inChat: boolean): string {
-  if (max <= 0 || text.length <= max) return text;
-  const closing = CUT_LINES[inChat ? 'chat' : 'no_chat'][language];
-  // One character past the cap shows whether the text breaks right at it.
-  const span = text.slice(0, max + 1);
-  let cut = 0;
-  for (const m of span.matchAll(/[.!?…]+["'»”)\]]*(?=\s)/g)) {
-    const end = m.index + m[0].length;
-    if (end <= max) cut = end;
-  }
-  if (cut < max * MIN_SENTENCE_CUT) cut = 0;
-  let head = text.slice(0, cut).trim();
-  if (!head) {
-    const space = span.search(/\s\S*$/);
-    head = space > 0 ? `${text.slice(0, space).replace(/[\s,;:–—-]+$/, '')}…` : '';
-  }
-  return head ? `${head} ${closing}` : closing;
 }
 
 /** The language a transcript is in, by its script; undefined when it has no letters. Cyrillic is Ukrainian only when the call speaks it. */
@@ -1421,7 +1377,6 @@ export class TurnTaking {
       language: CallLanguage;
       /** Whether the call's languages include Ukrainian (callLanguages); unset is yes. */
       ukrainian?: boolean;
-      maxSpokenChars?: number;
     },
   ) {
     this.now = deps.now ?? (() => Date.now());
@@ -1560,13 +1515,7 @@ export class TurnTaking {
     this.replyComing = !!full;
     this.refresh();
     if (!full) return;
-    const max = this.options.maxSpokenChars ?? DEFAULT_MAX_SPOKEN_CHARS;
-    if (max > 0 && full.length > max) {
-      this.deps.log.info('voice-mode worker: a long message is cut for speech', { chars: full.length, max });
-    }
     this.enqueue(async () => {
-      // Cut when spoken, so the closing line is in the language of the caller's latest turn.
-      const spoken = capSpokenText(full, max, this.options.language, this.inChat);
       let about: Omit<CallReplyInfo, 'reply' | 'more'>;
       if (typeof turn === 'number') {
         const part = (this.partsByTurn.get(turn) ?? 0) + 1;
@@ -1576,12 +1525,12 @@ export class TurnTaking {
         about = turn === null ? { unprompted: true } : {};
       }
       const reply = this.announce(about);
-      const heard = await this.say(spoken).finally(() => this.replyHeard());
+      const heard = await this.say(full).finally(() => this.replyHeard());
       if (heard) return;
       if (this.closed) return;
       this.deps.log.warn('voice-mode worker: a reply could not be synthesized');
       // Nothing was heard: the page shows the words instead.
-      this.deps.announce?.({ reply, ...about, unspoken: true, text: spoken });
+      this.deps.announce?.({ reply, ...about, unspoken: true, text: full });
       this.feedback('reply');
     });
   }
@@ -4520,7 +4469,6 @@ function defaultDeps(): RunCallDeps {
     'LIVEKIT_HOST_URL',
     'VOICE_MODE_RECORDINGS_DAYS',
     'VOICE_MODE_CALL_RECORDING',
-    'VOICE_MODE_MAX_SPOKEN_CHARS',
     'VOICE_MODE_TTS_DEESS',
     'VOICE_MODE_TTS_NOTCH',
     'VOICE_MODE_WAKE_MODEL',
@@ -4749,7 +4697,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       silenceMs: meta.silenceMs,
       language: languages.initial,
       ukrainian: languages.ukrainian,
-      maxSpokenChars: maxSpokenChars(deps.env.VOICE_MODE_MAX_SPOKEN_CHARS),
     },
   );
   let review: ReviewControl | undefined;
@@ -5284,7 +5231,6 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'VOICE_MODE_WORKER_HEALTH_PORT',
     'VOICE_MODE_RECORDINGS_DAYS',
     'VOICE_MODE_CALL_RECORDING',
-    'VOICE_MODE_MAX_SPOKEN_CHARS',
     'VOICE_MODE_TRANSCRIPT_DEBUG',
   ]);
   // agents-js initializes its logger once the CLI runs a command; console until then.

@@ -38,14 +38,11 @@ import {
   CallRecording,
   callRecordingOn,
   CallTurns,
-  capSpokenText,
   DISCARD_SETTLE_MS,
   COMMAND_VOCABULARY,
   COMMAND_WORDS_JSON,
   captionMark,
   type CaptionMark,
-  CUT_LINES,
-  DEFAULT_MAX_SPOKEN_CHARS,
   FAILURE_LINES,
   HostLink,
   hostLossReason,
@@ -53,7 +50,6 @@ import {
   LineSpeech,
   lineResampler,
   MAX_IDLE_WAIT_MS,
-  maxSpokenChars,
   parseJobMetadata,
   pathSegment,
   pruneRecordings,
@@ -178,53 +174,6 @@ describe('helpers', () => {
     expect(hostLossReason({ accepted: false, status: 500 })).toBe('rejected');
     expect(hostLossReason({ accepted: false, status: 504 })).toBe('timeout');
     expect(hostLossReason({ accepted: false, error: 'The operation was aborted due to timeout' })).toBe('timeout');
-  });
-
-  it('cuts long spoken text at the last sentence end within the cap and says the rest is in the chat', () => {
-    const rest = CUT_LINES.chat;
-    expect(capSpokenText('Short. Fine.', 20, 'en', true)).toBe('Short. Fine.');
-    expect(capSpokenText('x'.repeat(5000), 0, 'en', true)).toBe('x'.repeat(5000));
-    const text = 'First one here. Second sentence is right here! Third goes past the cap.';
-    expect(capSpokenText(text, 50, 'en', true)).toBe(`First one here. Second sentence is right here! ${rest.en}`);
-    // A sentence end that would need the character past the cap does not count.
-    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 10, 'uk', true)).toBe(`Aaaa bbbb. ${rest.uk}`);
-    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 9, 'uk', true)).toBe(`Aaaa… ${rest.uk}`);
-    // Decimals are not sentence ends; with none before the cap the cut is at a word, never inside one.
-    expect(capSpokenText('Version 2.4 of the release, with many words', 30, 'en', true)).toBe(
-      `Version 2.4 of the release… ${rest.en}`,
-    );
-    expect(capSpokenText('Слово слово слово слово', 13, 'uk', true)).toBe(`Слово слово… ${rest.uk}`);
-    expect(capSpokenText('a'.repeat(30), 10, 'en', true)).toBe(rest.en);
-    expect(rest).toEqual({ uk: 'Решта - у чаті.', en: 'The rest is in the chat.' });
-  });
-
-  it('cuts at a word instead of a sentence end that would drop most of the budget', () => {
-    const long = `Ок. ${'дуже довге речення '.repeat(60)}`;
-    const spoken = capSpokenText(long, 800, 'uk', true);
-    expect(spoken).toMatch(/^Ок\. дуже довге речення .*\S… Решта - у чаті\.$/);
-    expect(spoken.length).toBeGreaterThan(780);
-    // Past 60% of the cap, the sentence end still wins.
-    expect(capSpokenText('Aaaa bbbb ccc. Dddd eeee ffff gggg.', 20, 'en', true)).toBe(
-      `Aaaa bbbb ccc. ${CUT_LINES.chat.en}`,
-    );
-    expect(capSpokenText('Aaaa. Bbbb cccc dddd eeee ffff gggg.', 20, 'en', true)).toBe(
-      `Aaaa. Bbbb cccc dddd… ${CUT_LINES.chat.en}`,
-    );
-  });
-
-  it('closes a cut without pointing at a chat when the call has none', () => {
-    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 10, 'en', false)).toBe(`Aaaa bbbb. ${CUT_LINES.no_chat.en}`);
-    expect(capSpokenText('Слово слово слово слово', 13, 'uk', false)).toBe(`Слово слово… ${CUT_LINES.no_chat.uk}`);
-    expect(CUT_LINES.no_chat).toEqual({ uk: 'Скорочую.', en: "I've cut it short." });
-  });
-
-  it('reads VOICE_MODE_MAX_SPOKEN_CHARS, with no cap unless it sets one', () => {
-    expect(maxSpokenChars(undefined)).toBe(DEFAULT_MAX_SPOKEN_CHARS);
-    expect(DEFAULT_MAX_SPOKEN_CHARS).toBe(0);
-    expect(maxSpokenChars(' 400 ')).toBe(400);
-    expect(maxSpokenChars('0')).toBe(0);
-    expect(maxSpokenChars('-5')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
-    expect(maxSpokenChars('lots')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
   });
 
   it('de-esses the agent speech: flat through the voice band, about 6 dB off a lone sibilant, and off is a passthrough', () => {
@@ -448,27 +397,6 @@ describe('TurnTaking', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(said).toEqual(['Booked for eight.']);
     expect(statuses.at(-1)).toBe(false);
-  });
-
-  it("caps every spoken message, closing in the caller's latest language", async () => {
-    vi.useFakeTimers();
-    const { deps, said } = fakeTurnTakingDeps();
-    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 20 });
-    turnTaking.onTurn('what is new');
-    await vi.advanceTimersByTimeAsync(SILENCE + TURN_SETTLE_MS);
-    turnTaking.onReply('Two things now. A **third** one that is long.');
-    turnTaking.onReply('Fits.');
-    await vi.advanceTimersByTimeAsync(1);
-    // No `chat` event yet: no chat holds the rest.
-    expect(said).toEqual([`Two things now. ${CUT_LINES.no_chat.en}`, 'Fits.']);
-    turnTaking.onChat(true);
-    turnTaking.onReply('Two things now. A third one that is long.');
-    await vi.advanceTimersByTimeAsync(1);
-    expect(said.at(-1)).toBe(`Two things now. ${CUT_LINES.chat.en}`);
-    const uncapped = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 0 });
-    uncapped.onReply('Two things. A third one that is long.');
-    await vi.advanceTimersByTimeAsync(1);
-    expect(said.at(-1)).toBe('Two things. A third one that is long.');
   });
 
   it('drops thinking after a while without typing ticks, and holds it while they come', async () => {

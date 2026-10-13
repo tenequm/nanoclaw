@@ -324,7 +324,6 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_ELEVENLABS_API_KEY` | empty | Offers ElevenLabs voices to the lines; without it only Gemini speaks. |
 | `VOICE_MODE_SILENCE_MS` | `2500` | Closing silence, valid range 300 to 30000 milliseconds. |
 | `VOICE_MODE_VOCABULARY` | empty | Comma-separated names, merged with the agent's `voice.vocabulary.txt`. |
-| `VOICE_MODE_MAX_SPOKEN_CHARS` | `0` | No cap; positive values cut speech at a sentence or whole word. |
 | `VOICE_MODE_TTS_DEESS`, `VOICE_MODE_TTS_NOTCH` | on | De-essing and fixed whistle notches; `off`, `false` or `0` disables each. |
 | `VOICE_MODE_WAKE_MODEL` | bundled `hey_livekit.onnx` | Custom acoustic classifier path, or `off` for transcript wake. |
 | `VOICE_MODE_WAKE_PHRASE` | `Hey LiveKit` | Label of the acoustic phrase; it does not train or change the model. |
