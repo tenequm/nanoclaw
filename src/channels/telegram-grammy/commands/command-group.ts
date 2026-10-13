@@ -42,7 +42,7 @@ import {
 } from '../../../commands/index.js';
 import { getChannelAdapterExact } from '../../channel-registry.js';
 import type { InboundEvent } from '../../adapter.js';
-import { handleVoiceCommand, type PrivateReply } from '../../voice-mode-command.js';
+import type { PrivateReply } from '../../voice-mode-command.js';
 import type { VoiceModeChannelAdapter } from '../../voice-mode.js';
 import { mapGrammyError } from '../errors.js';
 import { log } from '../../../log.js';
@@ -309,7 +309,10 @@ export function buildCommandGroup(runtime: AdapterRuntime, menus: CommandMenus):
       };
       const privateReply = (text: string) => sendEphemeralReply(ctx.api, msg, from.id, text);
       const voice = getChannelAdapterExact('voice-mode') as VoiceModeChannelAdapter | undefined;
-      await (voice ? voice.handleVoiceCommand(event, privateReply) : handleVoiceCommand(event, null, privateReply));
+      if (voice) return void (await voice.handleVoiceCommand(event, privateReply));
+      // Loaded only here: the command module pulls in the router, too heavy for the adapter's own load.
+      const { handleVoiceCommand } = await import('../../voice-mode-command.js');
+      await handleVoiceCommand(event, null, privateReply);
     });
 
   group.command('status', COMMANDS.status.description, (ctx) => runtime.runPromise(onStatus(ctx)));
