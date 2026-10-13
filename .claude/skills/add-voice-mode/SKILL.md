@@ -202,8 +202,8 @@ A container proxy that cannot reach loopback needs the listener bound
 to an address it can reach, plus the trusted-proxy settings below. Worker
 routes live only on the host port under `/webhook/voice-mode/livekit/agent/`;
 never proxy them: a worker request with `X-Forwarded-For` or `Forwarded` is
-refused. The old `/webhook/voice/livekit` browser links remain valid on the
-host port; worker routes are not served under that prefix.
+refused. Browser routes live only under `/voice`; nothing is served under
+`/webhook/voice/`.
 
 For Tailscale Serve, mount only the page prefix and repeat it in the target
 because Serve strips the mount prefix:
@@ -302,7 +302,7 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page, worker routes and old links. A taken default port is logged and skipped; an explicit port that cannot bind stops voice-mode from starting. |
+| `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page and the worker routes. A taken default port is logged and skipped; an explicit port that cannot bind stops voice-mode from starting. |
 | `VOICE_MODE_PAGE_HOST` | `127.0.0.1` | Bind address of the separate page server. |
 | `VOICE_MODE_MAX_CALL_SECONDS` | `900` | Per-call duration limit. |
 | `VOICE_MODE_MAX_CALLS_PER_HOUR` | `12` | Start attempts per line, including failed starts. |

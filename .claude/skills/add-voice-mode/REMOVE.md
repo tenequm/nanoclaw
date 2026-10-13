@@ -26,7 +26,7 @@ tailscale serve --https=443 --set-path=/voice off
 tailscale serve status
 ```
 
-Remove the legacy `/webhook/voice` mount only if this install owned it. Keep
+Remove a leftover `/webhook/voice` mount only if this install owned it. Keep
 other mounts and a LiveKit service used elsewhere.
 
 ## 2. Retire line credentials

@@ -38,12 +38,13 @@ import {
 } from './voice-mode.js';
 
 describe('voice routes and the reverse-proxy gate', () => {
-  it('maps the prefixes to routes, the worker routes only under /webhook/voice-mode', () => {
-    expect(voiceRoute('/webhook/voice/livekit')).toBe('livekit');
-    expect(voiceRoute('/webhook/voice-mode/livekit')).toBe('livekit');
+  it('maps browser routes only under /voice and worker routes only under /webhook/voice-mode', () => {
     expect(voiceRoute('/webhook/voice-mode/livekit/agent/events')).toBe('livekit/agent/events');
+    expect(voiceRoute('/webhook/voice-mode/livekit/agent/joined/')).toBe('livekit/agent/joined');
+    expect(voiceRoute('/webhook/voice-mode/livekit')).toBeNull();
+    expect(voiceRoute('/webhook/voice-mode/tts')).toBeNull();
+    expect(voiceRoute('/webhook/voice/livekit')).toBeNull();
     expect(voiceRoute('/webhook/voice/livekit/agent/events')).toBeNull();
-    expect(voiceRoute('/webhook/voice/livekit/agent')).toBeNull();
     expect(voiceRoute('/voice')).toBe('livekit');
     expect(voiceRoute('/voice/')).toBe('livekit');
     expect(voiceRoute('/voice/info')).toBe('info');

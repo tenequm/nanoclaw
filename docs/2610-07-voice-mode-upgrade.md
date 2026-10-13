@@ -94,9 +94,9 @@ the links. Before upgrading an install that set one, save it on every line
 with `PATCH /voice/tts` (see the skill's "Voice per line"), or its lines
 speak with the default `alnilam`.
 The build adds a separate page listener on `127.0.0.1:3100` (`VOICE_MODE_PORT`,
-`VOICE_MODE_PAGE_HOST`); main's existing `/voice` and `/webhook/voice/livekit`
-fronts still work on `WEBHOOK_PORT`. Do not move a working front during the
-compatibility upgrade. An install whose front already forwards `/voice` to the
+`VOICE_MODE_PAGE_HOST`); main's existing `/voice` front still works on
+`WEBHOOK_PORT`, but `/webhook/voice/livekit` is no longer served: move a front
+or bookmark on that path to `/voice` before upgrading. An install whose front already forwards `/voice` to the
 webhook port does not need the listener: set `VOICE_MODE_PORT=off`. If the
 default port is taken, the host logs it and serves the page on `WEBHOOK_PORT`
 only; an explicit `VOICE_MODE_PORT` that cannot bind fails setup, and

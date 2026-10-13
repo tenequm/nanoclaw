@@ -170,30 +170,22 @@ export function admitsVoiceModePeer(
 
 /** Browser routes under the short /voice prefix a reverse proxy forwards; the bare prefix is the call page. */
 const CLEAN_PREFIX_ROUTES = new Set(['info', 'tts', 'voices', 'livekit', 'livekit/token', 'livekit/end']);
-const WEBHOOK_PREFIX = /^\/webhook\/(voice(?:-mode)?)(?:\/|$)/;
 const CLEAN_PREFIX = /^\/voice(?:\/|$)/;
+/** The worker's routes keep their own per-call secret and stay loopback-only, never admitted through a proxy. */
+const WORKER_PREFIX = /^\/webhook\/voice-mode\/(livekit\/agent(?:\/.*)?)$/;
 
 /**
- * The voice route of a request path: anything under /webhook/voice-mode, a browser route under
- * /webhook/voice (old links), or a browser route under /voice. Null for any other path, the
- * worker's routes outside /webhook/voice-mode included.
+ * The voice route of a request path: a browser route under /voice, or a worker route under
+ * /webhook/voice-mode/livekit/agent. Null for any other path.
  */
 export function voiceRoute(pathname: string): string | null {
-  const webhook = WEBHOOK_PREFIX.exec(pathname);
-  if (webhook) {
-    const route = pathname.slice(webhook[0].length).replace(/\/+$/, '');
-    // A front that forwards old /webhook/voice links may forward remote requests; the worker never uses it.
-    return webhook[1] === 'voice-mode' || !isWorkerRoute(route) ? route : null;
-  }
+  const worker = WORKER_PREFIX.exec(pathname);
+  if (worker) return worker[1].replace(/\/+$/, '');
   if (!CLEAN_PREFIX.test(pathname)) return null;
   const route = pathname.replace(CLEAN_PREFIX, '').replace(/\/+$/, '') || 'livekit';
   return CLEAN_PREFIX_ROUTES.has(route) ? route : null;
 }
 
-/**
- * The worker's routes, only under /webhook/voice-mode: they keep their own per-call secret and stay
- * loopback-only, never admitted through a proxy.
- */
 const isWorkerRoute = (route: string): boolean => /^livekit\/agent(?:\/|$)/.test(route);
 
 export interface VoiceModeConfig {
@@ -559,7 +551,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     return replyJson(res, 200, result.page);
   };
 
-  /** HTTP routes under /webhook/voice-mode/ and /webhook/voice/, and the browser's under /voice/, on the shared webhook server. */
+  /** The worker's HTTP routes under /webhook/voice-mode/ and the browser's under /voice/, on the shared webhook server. */
   const handleHttp = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     let url: URL;
     try {
@@ -647,7 +639,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       catalog.warm(providerKeys);
       registerWebhookHandler(VOICE_MODE_CHANNEL, handleHttp);
       registerRootHandler('voice', handleHttp);
-      registerWebhookHandler('voice', handleHttp);
       if (config.pagePort !== undefined) {
         const server = http.createServer((req, res) => {
           let pathname: string;

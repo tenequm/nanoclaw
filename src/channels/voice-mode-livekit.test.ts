@@ -281,7 +281,7 @@ async function openHarness(
     events,
     routing,
     hostUrl: `http://127.0.0.1:${port}`,
-    base: `http://127.0.0.1:${port}/webhook/voice`,
+    base: `http://127.0.0.1:${port}/voice`,
     inbound,
     clock,
     access,
@@ -636,7 +636,13 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   });
 
   it('serves no other page or route under either prefix', async () => {
-    for (const path of ['/voice/call', '/webhook/voice/call', '/voice/sip', '/voicemail']) {
+    for (const path of [
+      '/voice/call',
+      '/webhook/voice-mode/call',
+      '/webhook/voice-mode/livekit',
+      '/voice/sip',
+      '/voicemail',
+    ]) {
       expect((await fetch(`${h.hostUrl}${path}?t=tok123`)).status).toBe(404);
     }
     for (const route of ['sdp', 'hangup']) {
