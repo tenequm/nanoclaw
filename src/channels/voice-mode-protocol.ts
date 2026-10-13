@@ -114,7 +114,7 @@ export interface CallRoomMetadata {
 
 /**
  * What became of a caller turn: closed and on its way to the host (`sending`, once the closing
- * silence and the final transcript are in, before the host answers), sent to the agent, picked up
+ * silence and the final transcript are in, or at a spoken send, before the host answers), sent to the agent, picked up
  * by it (`working`: after `sent`, at most once per turn, when the host's `working` event says the
  * agent's runner works on what reached it after that turn, and no reply to it came first), or lost
  * because the transcription failed (`stt`) or heard no words (`empty`), or the host refused it
