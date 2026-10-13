@@ -51,7 +51,6 @@ import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
 import { expediteDelivery } from '../delivery.js';
 import {
-  fillVoiceModeLineTts,
   findVoiceModeLineByToken,
   getVoiceModeLine,
   getVoiceModeLineForAgent,
@@ -361,17 +360,19 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     usage.set(call.platformId, { day, usedMs: (used?.day === day ? used.usedMs : 0) + elapsedTodayMs(call, t) });
   };
 
-  /** Calls whose caller joined and that have not ended: each is woken for once, and never after its end. */
-  const joinedCalls = new Set<string>();
-
   /**
    * The caller is in: start the agent the first turn goes to, so that turn meets a running agent.
    * Nothing reaches the chat. A long silent call is reaped as idle like any session; its next turn
    * wakes the agent again.
    */
-  const prewarmCall = async (callId: string, route: Omit<InboundEvent, 'message'>, agentGroupId: string) => {
+  const prewarmCall = async (
+    callId: string,
+    route: Omit<InboundEvent, 'message'>,
+    agentGroupId: string,
+    live: () => boolean,
+  ) => {
     const session = await findSession(route, agentGroupId);
-    if (!session || !joinedCalls.has(callId)) return;
+    if (!session || !live()) return;
     if (await wakeSession(session))
       log.info('livekit-voice-mode: agent running for the call', { callId, sessionId: session.id });
   };
@@ -393,14 +394,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         throw err;
       }
     },
-    callJoined: (callId, route, agentGroupId) => {
-      if (joinedCalls.has(callId)) return;
-      joinedCalls.add(callId);
-      prewarmCall(callId, route, agentGroupId).catch((err: unknown) =>
+    callJoined: (callId, route, agentGroupId, live) => {
+      prewarmCall(callId, route, agentGroupId, live).catch((err: unknown) =>
         log.warn('livekit-voice-mode: could not start the agent for the call', { callId, err }),
       );
     },
-    callEnded: (callId) => void joinedCalls.delete(callId),
     isRunning: () => connected,
     now,
     maxCallDurationMs,
@@ -472,8 +470,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
     if (req.method === 'GET') return replyJson(res, 200, await ttsView(savedTts(row)));
     const body = await readJsonObject(req, MAX_TTS_BODY_BYTES);
-    // The body can take its time: a link re-minted meanwhile must not save.
-    if ((await lineForToken(token)) !== platformId) return reply(res, 403, 'Unknown call link');
     if (!body) return replyJson(res, 400, { error: 'bad_request' });
     let choice = LINE_DEFAULT_CHOICE;
     if ('reset' in body) {
@@ -617,11 +613,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
-      const filled = await fillVoiceModeLineTts().catch((err: unknown) => {
-        log.warn('voice-mode: could not fill in the lines missing a voice', { err });
-        return 0;
-      });
-      if (filled > 0) log.info('voice-mode: filled in the lines missing a voice', { rows: filled });
       catalog.warm();
       registerWebhookHandler(VOICE_MODE_CHANNEL, handleHttp);
       registerRootHandler('voice', handleHttp);

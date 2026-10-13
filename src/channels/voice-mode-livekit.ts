@@ -44,7 +44,7 @@ import { AccessToken, AgentDispatchClient, RoomServiceClient, TrackSource } from
 import type { ChannelAdapter, InboundEvent } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
 import { callPageHtml, type VoiceModeUiConfig } from './voice-mode-page.js';
-import type { VoiceModeTurn } from './voice-mode-route.js';
+import type { VoiceModeTurn, VoiceModeTurnEvent } from './voice-mode-route.js';
 import { lineIdOf, sameCallerAndAgent, type ResolveLineOptions, type VoiceModeLine } from './voice-mode-line.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
@@ -239,15 +239,14 @@ export interface LiveKitHost {
    * true once the agent's session stored it (to answer, or as context), false when the router dropped it;
    * rejects when routing threw.
    */
-  routeTurn(event: InboundEvent, turn: VoiceModeTurn): Promise<boolean>;
+  routeTurn(event: VoiceModeTurnEvent, turn: VoiceModeTurn): Promise<boolean>;
   /**
    * The caller joined: `route` is where the call's turns go now (`agentGroupId`: the line's agent).
-   * Wakes that agent's existing session once, before the first turn (none is created); a long
-   * silent call lets the session be reclaimed as usual, and the next turn wakes it again.
+   * Wakes that agent's existing session once, before the first turn (none is created), unless `live`
+   * says the call ended meanwhile; a long silent call lets the session be reclaimed as usual, and the
+   * next turn wakes it again.
    */
-  callJoined?(callId: string, route: Omit<InboundEvent, 'message'>, agentGroupId: string): void;
-  /** The call ended: it is no longer joined, so a session lookup still running wakes nothing. */
-  callEnded?(callId: string): void;
+  callJoined?(callId: string, route: Omit<InboundEvent, 'message'>, agentGroupId: string, live: () => boolean): void;
   isRunning(): boolean;
   now(): number;
   maxCallDurationMs: number;
@@ -652,10 +651,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     );
   };
 
-  /**
-   * Re-resolve where the call talks; `turn` marks a caller turn, where a chat
-   * left behind by a mid-call `/voice` ages out once it went quiet.
-   */
   /** resolveChat, with a failed lookup taken as no chat. */
   const probeChat = async (call: ChatProbe): Promise<CallChat | null> => {
     try {
@@ -666,6 +661,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
   };
 
+  /**
+   * Re-resolve where the call talks; `turn` marks a caller turn, where a chat
+   * left behind by a mid-call `/voice` ages out once it went quiet.
+   */
   const refreshChat = async (call: LiveKitCall, turn: boolean): Promise<CallChat | null> => {
     const refresh = ++call.chatRefreshes;
     const chat = await probeChat(call);
@@ -801,7 +800,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       }
     });
     call.cleanup = trackedDeleteRoom(call, call.announced);
-    host.callEnded?.(call.callId);
     log.info('livekit-voice-mode: call ended', { platformId: call.platformId, callId: call.callId, reason });
   };
 
@@ -954,7 +952,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
 
   /** Where a turn goes: the call chat. */
-  const turnRoute = (call: LiveKitCall, chat: CallChat): Omit<InboundEvent, 'message'> => ({
+  const turnRoute = (call: LiveKitCall, chat: CallChat): Omit<VoiceModeTurnEvent, 'message'> => ({
     channelType: chat.group.channel_type,
     instance: chat.group.instance ?? chat.group.channel_type,
     platformId: chat.group.platform_id,
@@ -993,7 +991,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     log.info('livekit-voice-mode: caller joined', { platformId: call.platformId, callId: call.callId });
     // Known before the first turn, so the agent's messages to that chat are spoken from the start.
     void refreshChat(call, false).then((chat) => {
-      if (chat && !call.ended) host.callJoined?.(call.callId, turnRoute(call, chat), call.line.agentGroupId);
+      if (chat && !call.ended) {
+        host.callJoined?.(call.callId, turnRoute(call, chat), call.line.agentGroupId, () => !call.ended);
+      }
     });
     reply(res, 200, JSON.stringify({ ok: true }), JSON_HEADERS);
   };

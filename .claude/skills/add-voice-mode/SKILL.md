@@ -330,10 +330,9 @@ voice, always all three: a new line and a reset one save Gemini
 `gemini-3.8-flash-tts` with `en-us-techagent-4`, and a pick that leaves out the
 model or voice saves the provider's default (Gemini `gemini-3.8-flash-tts`,
 `alnilam`; ElevenLabs `eleven_v4_turbo`, whose only other model is
-`eleven_v4`). The `module:voice-mode:lines-tts-concrete` migration, and the host
-at every start, fill in any field a row lacks with what the line already spoke
-with. A Gemini line falls back to `gemini-3.8-flash-lite-tts` before any audio,
-an ElevenLabs line to Gemini `alnilam`; nothing is replayed after partial
+`eleven_v4`). The `module:voice-mode:lines-tts-concrete` migration filled in
+any field an older row lacked with what the line already spoke with. A Gemini
+line falls back to `gemini-3.8-flash-lite-tts` before any audio, an ElevenLabs line to Gemini `alnilam`; nothing is replayed after partial
 speech. A saved voice its provider certainly no longer has speaks `alnilam`
 too, and shows that as effective; a lookup that fails changes nothing. With the
 line's link token, and its caller still an owner or admin:

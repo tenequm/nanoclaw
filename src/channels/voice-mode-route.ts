@@ -10,7 +10,7 @@
 import type { InboundEvent } from './adapter.js';
 import { wiringThreadsEnabled } from './channel-defaults.js';
 import { getAgentGroup } from '../db/agent-groups.js';
-import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
+import { getMessagingGroupAgentByPair } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { onHostStart } from '../host-lifecycle.js';
 import { deliverToAgent, resolveSenderRole } from '../router.js';
@@ -20,9 +20,12 @@ import type { MessagingGroup } from '../types.js';
 export interface VoiceModeTurn {
   /** The line's caller, who the turn is from. */
   callerId: string;
-  /** The call chat as the engine just resolved it; null to look it up by the event's chat. */
-  chat: MessagingGroup | null;
+  /** The call chat as the engine just resolved it. */
+  chat: MessagingGroup;
 }
+
+/** A turn's event: always addressed to the line's agent. */
+export type VoiceModeTurnEvent = InboundEvent & { agentGroupId: string };
 
 /**
  * The host takes inbound messages only once running sessions are adopted (src/index.ts); the page can
@@ -34,20 +37,17 @@ onHostStart(() => {
 });
 
 /**
- * Store a turn in the session of the agent the event names (`agentGroupId`) for the event's chat and
- * wake the agent. Resolves true once stored, false when the chat or its wiring to that agent is gone;
+ * Store a turn in the session of the agent the event names (`agentGroupId`) for the call chat and
+ * wake the agent. Resolves true once stored, false when the chat's wiring to that agent is gone;
  * rejects when storing threw.
  */
-export async function routeVoiceModeTurn(event: InboundEvent, turn: VoiceModeTurn): Promise<boolean> {
+export async function routeVoiceModeTurn(event: VoiceModeTurnEvent, turn: VoiceModeTurn): Promise<boolean> {
   if (!hostStarted) throw new Error('the host is still starting');
   const { agentGroupId } = event;
-  if (!agentGroupId) throw new Error('a voice turn must name its agent');
-  const mg =
-    turn.chat ??
-    (await getMessagingGroupByPlatform(event.channelType, event.platformId, event.instance ?? event.channelType));
-  const wiring = mg && !mg.denied_at ? await getMessagingGroupAgentByPair(mg.id, agentGroupId) : undefined;
+  const mg = turn.chat;
+  const wiring = !mg.denied_at ? await getMessagingGroupAgentByPair(mg.id, agentGroupId) : undefined;
   const agentGroup = wiring ? await getAgentGroup(agentGroupId) : undefined;
-  if (!mg || !wiring || !agentGroup) {
+  if (!wiring || !agentGroup) {
     log.warn('livekit-voice-mode: the turn has no wired chat to go to', {
       channelType: event.channelType,
       agentGroupId,

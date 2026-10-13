@@ -23,7 +23,6 @@ import {
 } from '../voice-mode-tts.js';
 import { openSealed, sealText } from '../secret-seal.js';
 import { getDb } from './connection.js';
-import type { DbDriver } from './driver.js';
 import { registerMigration } from './migrations/index.js';
 
 registerMigration({
@@ -105,33 +104,6 @@ export async function setVoiceModeLineTts(
     current.token_hash,
     current.owner_user_id,
   );
-}
-
-/**
- * Give every line a whole speech choice, each missing field what the line already spoke with (see
- * effectiveTts): a missing provider the backup's, a missing model or voice that provider's default. Rows
- * from before every write stored one, or written by an older host after a rollback. Returns the rows
- * changed; a row naming a provider the registry lacks is left as it is.
- */
-export async function fillVoiceModeLineTts(db: DbDriver = getDb()): Promise<number> {
-  const providers = Object.keys(TTS_REGISTRY);
-  const fillable = await db.get<{ n: number }>(
-    `SELECT COUNT(*) AS n FROM voice_mode_lines WHERE tts_provider IS NULL
-       OR (tts_provider IN (${providers.map(() => '?').join(', ')}) AND (tts_model IS NULL OR tts_voice IS NULL))`,
-    ...providers,
-  );
-  if (!fillable?.n) return 0;
-  await db.run('UPDATE voice_mode_lines SET tts_provider = ? WHERE tts_provider IS NULL', TTS_DEFAULT_CHOICE.provider);
-  for (const entry of Object.values(TTS_REGISTRY)) {
-    await db.run(
-      `UPDATE voice_mode_lines SET tts_model = COALESCE(tts_model, ?), tts_voice = COALESCE(tts_voice, ?)
-         WHERE tts_provider = ? AND (tts_model IS NULL OR tts_voice IS NULL)`,
-      entry.defaults.model,
-      entry.defaults.voice,
-      entry.id,
-    );
-  }
-  return Number(fillable.n);
 }
 
 /** Hex SHA-256 of a call-link token: what the table stores and looks a link up by. */
@@ -303,8 +275,20 @@ registerMigration({
   version: 4,
   name: 'module:voice-mode:lines-tts-concrete',
   async up(db) {
-    // The host runs the same fill at every start too: an older host after a rollback writes nulls again.
-    await fillVoiceModeLineTts(db);
+    // Each missing field becomes what the line already spoke with (see effectiveTts); a provider the registry lacks stays.
+    await db.run(
+      'UPDATE voice_mode_lines SET tts_provider = ? WHERE tts_provider IS NULL',
+      TTS_DEFAULT_CHOICE.provider,
+    );
+    for (const entry of Object.values(TTS_REGISTRY)) {
+      await db.run(
+        `UPDATE voice_mode_lines SET tts_model = COALESCE(tts_model, ?), tts_voice = COALESCE(tts_voice, ?)
+           WHERE tts_provider = ? AND (tts_model IS NULL OR tts_voice IS NULL)`,
+        entry.defaults.model,
+        entry.defaults.voice,
+        entry.id,
+      );
+    }
   },
 });
 

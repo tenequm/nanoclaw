@@ -528,14 +528,16 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
             messagingGroupId: 'mg-1',
             threadId: null,
           });
-          stream.enqueue(encode('"voice":"Kore"}'));
+          stream.enqueue(encode('"voice":"achernar"}'));
           stream.close();
         },
       }),
       duplex: 'half',
     } as RequestInit);
+    // The save itself only takes the link it started with.
     expect(res.status).toBe(403);
     expect(await res.text()).toBe('Unknown call link');
+    expect(await getDb().get('SELECT tts_voice FROM voice_mode_lines')).toEqual({ tts_voice: 'en-us-techagent-4' });
   });
 
   it("pages Gemini's listing with its own filters and page tokens", async () => {

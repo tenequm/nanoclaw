@@ -138,8 +138,7 @@ export interface CallRoomMetadata {
  * agent's runner works on what reached it after that turn, and no reply to it came first), or lost
  * because the transcription failed (`stt`) or heard no words (`empty`), or the host refused it
  * (`rejected`, `rate_limited`) or did not answer (`timeout`). Every turn handed to the host says
- * `sending` first; one lost to the transcription does not. A page that does not know `sending`
- * ignores it (and `working`), so neither needs a version bump.
+ * `sending` first; one lost to the transcription does not.
  */
 export interface CallTurnStatus {
   turn: number;
@@ -171,8 +170,7 @@ export interface CallDroppedSpeech {
 
 /**
  * On the turn topic: the caller started speaking while the agent's line played. Speech under the
- * agent's is not transcribed, so none of it reaches the agent; the page says so. Additive: a page
- * that does not know it ignores it.
+ * agent's is not transcribed, so none of it reaches the agent; the page says so.
  */
 export interface CallUnheardSpeech {
   unheard: 'agent_speaking';
@@ -227,18 +225,14 @@ export interface CallDraft {
  * worker's participant attribute is CALL_COMMANDS_VERSION when it understands them and the
  * `settings` RPC; a page offers the commands only for the values it knows. The worker starts
  * wake-gated until a client's `settings` say otherwise, so a page that does not know its value sends
- * none and leaves it waiting for words the page never names: reload the page with the worker. An
- * older worker sets none, and its auto mode has no commands.
+ * none and leaves it waiting for words the page never names: reload the page with the worker.
  */
 export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice-mode.commands';
 /**
- * The commands' vocabulary: "1" had `over` as the send word; "2" is `zulu`, `copy` and `copy that`
- * with the words announced in CALL_COMMAND_WORDS_ATTRIBUTE (the `send it` era also said "2"); "3" is
- * the same words, bumped so a page from the `send it` era, which drives any "2" and quotes its own
- * words, stops quoting the wrong ones. A page that accepts only "2" (the `send it` era's, or a
- * `zulu` one already open across the bump) offers no commands and sends no `settings` to a "3"
- * worker, which then stays wake-gated until that page is reloaded. A current page drives "2" and "3"
- * alike; a page takes the words themselves from CALL_COMMAND_WORDS_ATTRIBUTE.
+ * The commands' vocabulary: `zulu`, `copy` and `copy that` with the words announced in
+ * CALL_COMMAND_WORDS_ATTRIBUTE. A current page drives "2" and "3" alike and takes the words from that
+ * attribute; a page that accepts only "2" offers no commands and sends no `settings` to a "3" worker,
+ * which then stays wake-gated until that page is reloaded.
  */
 export const CALL_COMMANDS_VERSION = '3';
 
@@ -275,7 +269,7 @@ export const CALL_COMMAND_WORDS: CallCommandWords = {
 };
 /**
  * The worker's participant attribute with CALL_COMMAND_WORDS as compact JSON, set with
- * CALL_COMMANDS_ATTRIBUTE. Additive: a page without it uses its own list, and an old page ignores it.
+ * CALL_COMMANDS_ATTRIBUTE.
  */
 export const CALL_COMMAND_WORDS_ATTRIBUTE = 'nanoclaw.voice-mode.command-words';
 /**
@@ -325,7 +319,7 @@ export function wakePhrase(env: { VOICE_MODE_WAKE_MODEL?: string; VOICE_MODE_WAK
 /**
  * The worker's review state; `seq` grows with every change, so the page keeps the newest.
  * `preparing`: talk is setting up the recording's transcription; it answers once that can take audio
- * (at most a few seconds), so the page keeps talk off meanwhile. Absent from an older worker.
+ * (at most a few seconds), so the page keeps talk off meanwhile.
  */
 export interface CallReviewState {
   seq: number;
