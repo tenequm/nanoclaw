@@ -198,6 +198,9 @@ const TURN_CUE_REPEAT_MS = 3_000;
 export const READY_CUE_WAIT_MS = 2_000;
 /** Waits on the global timers (which tests can fake). */
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+/** `promise`, or nothing once `ms` passed; the timer keeps no process alive. */
+const atMost = (promise: Promise<unknown>, ms: number): Promise<unknown> =>
+  Promise.race([promise, new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.())]);
 /** VOICE_MODE_MAX_SPOKEN_CHARS when unset: 0, no cap; a reply is spoken in full however long it runs. */
 export const DEFAULT_MAX_SPOKEN_CHARS = 0;
 const DAY_MS = 86_400_000;
@@ -2491,6 +2494,9 @@ export class CallTurns {
   private readonly closing = new Set<OpenTurn>();
   /** Committed sends waiting for their text. */
   private readonly committed = new Set<Promise<void>>();
+  /** Settles once the call's end stopped waiting for finals: a committed send then goes with the words at the act. */
+  private abandon!: () => void;
+  private readonly abandoned = new Promise<Heard>((resolve) => (this.abandon = () => resolve(silentHeard)));
   /** What `hold` last said. */
   private holding = false;
   private speaking = false;
@@ -2568,6 +2574,11 @@ export class CallTurns {
   /** An auto turn for the agent is open or still finalizing undecided: a switch to review makes it a draft. A committed send is neither. */
   get turnOpen(): boolean {
     return (this.turn?.kind === 'auto' && this.turn.addressed) || this.closing.size > 0;
+  }
+
+  /** The call ended and its finals had their grace: committed sends still without one go with their words at the act. */
+  abandonFinals(): void {
+    this.abandon();
   }
 
   /** Settles once every committed send has its text; undefined when none waits for it. */
@@ -2869,7 +2880,7 @@ export class CallTurns {
           ? 'speaking'
           : this.agentSpeaking
             ? 'agent-speaking'
-            : this.vadAt < candidate.at || !this.quiet()
+            : this.vadAt + VAD_WINDOW <= candidate.at || !this.quiet()
               ? 'not-quiet'
               : candidate.command === 'discard' && candidate.count < STABLE_DISCARD_INTERIMS && !candidate.settled
                 ? 'unstable'
@@ -3240,7 +3251,7 @@ export class CallTurns {
     const done = (turn.before ?? Promise.resolve(''))
       .then((before) => {
         lead = before;
-        return ending;
+        return Promise.race([ending, this.abandoned]);
       })
       .catch((err: unknown): Heard => {
         this.deps.log.warn('voice-mode worker: a committed turn has no final; it goes with its words', { err });
@@ -3879,6 +3890,8 @@ export class Outbox {
 
 /** Silero's activationThreshold, which the call's VAD keeps: a window over it has speech in it. */
 const VAD_ACTIVATION = 0.5;
+/** Silero's window at 16 kHz: audio short of a whole one waits for the next frames before it is analyzed. */
+const VAD_WINDOW = 512;
 
 /** A VAD stream as CallerInput uses it: Silero's, or a test's. */
 export interface VadStream extends AsyncIterable<{
@@ -4749,11 +4762,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     // hands it the best text there is. It is answered before the host hears the call ended (it refuses
     // turns after that). Every wait here is bounded: a job that never ends is worse than a lost turn.
     const committing = callTurns.committing;
-    const settled = () => committing && Promise.race([committing, sleep(FINAL_GRACE_MS, undefined, { ref: false })]);
-    await settled();
+    if (committing) await atMost(committing, FINAL_GRACE_MS);
     transcriber.close();
-    await settled();
-    await Promise.race([turnTaking.sent(), sleep(WORKER_REQUEST_TIMEOUT_MS, undefined, { ref: false })]);
+    callTurns.abandonFinals();
+    if (committing) await atMost(committing, FINAL_GRACE_MS);
+    await atMost(turnTaking.sent(), WORKER_REQUEST_TIMEOUT_MS);
     if (wakeWord) {
       callLog.info('voice-mode worker: wake word use', {
         ...wakeWord.summary,
