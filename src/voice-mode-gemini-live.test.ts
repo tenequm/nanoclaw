@@ -104,6 +104,35 @@ function harness(vocabulary = ['Andy', 'send it', 'прийом'], debug = false
 const pcm = (ms: number) => new Int16Array(16 * ms).fill(7);
 
 describe('GeminiLiveTranscriber', () => {
+  it('closing settles every ended activity at once: its final if one came, its interim text if not, one still connecting too', async () => {
+    const h = harness();
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(0);
+    h.sockets[0].interim('Book a table. Zulu.');
+    const first = h.result(h.t.end());
+    await h.tick(0);
+    h.sockets[0].final('Book a table, please. Zulu.');
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[1].ready();
+    await h.tick(0);
+    h.sockets[1].interim('And a taxi. Zulu.');
+    const second = h.result(h.t.end());
+    // A third whose socket is still being set up.
+    h.t.begin(pcm(100));
+    const third = h.result(h.t.end());
+    await h.tick(0);
+    expect([first(), second(), third()]).toEqual([undefined, undefined, undefined]);
+    h.t.close();
+    await h.tick(0);
+    expect(first()).toMatchObject({ final: 'Book a table, please. Zulu.', finals: 1 });
+    expect(second()).toMatchObject({ interim: 'And a taxi. Zulu.', finals: 0 });
+    expect(second()?.final).toBeUndefined();
+    expect(third()).toMatchObject({ interim: '', finals: 0 });
+  });
+
   it('logs the raw messages and what was forwarded only with debug on', async () => {
     const debugLines = (info: ReturnType<typeof vi.fn>) =>
       info.mock.calls.filter(([msg]) => String(msg).startsWith('voice-mode.transcript-debug'));

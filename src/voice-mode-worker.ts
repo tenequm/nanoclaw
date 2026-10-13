@@ -116,7 +116,12 @@ import {
 } from './channels/voice-mode-tts-catalog.js';
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
-import { GeminiLiveTranscriber, type Heard, type TranscriberOptions } from './voice-mode-gemini-live.js';
+import {
+  FINAL_GRACE_MS,
+  GeminiLiveTranscriber,
+  type Heard,
+  type TranscriberOptions,
+} from './voice-mode-gemini-live.js';
 import { JevTurnShadow, type TurnShadowSink } from './voice-mode-jev-turn.js';
 import {
   providerKeysFrom,
@@ -193,6 +198,9 @@ const TURN_CUE_REPEAT_MS = 3_000;
 export const READY_CUE_WAIT_MS = 2_000;
 /** Waits on the global timers (which tests can fake). */
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+/** `promise`, or nothing once `ms` passed; the timer keeps no process alive. */
+const atMost = (promise: Promise<unknown>, ms: number): Promise<unknown> =>
+  Promise.race([promise, new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.())]);
 /** VOICE_MODE_MAX_SPOKEN_CHARS when unset: 0, no cap; a reply is spoken in full however long it runs. */
 export const DEFAULT_MAX_SPOKEN_CHARS = 0;
 const DAY_MS = 86_400_000;
@@ -1263,8 +1271,11 @@ export interface CallVoice {
    * error when it is refused; absent where the room cannot switch.
    */
   selectTts?(tts: NonNullable<ReviewRequest['tts']>, gen: number): ReviewReply['error'] | undefined;
-  /** Play a sound cue on the call's cue track; resolves once the track took all of it (heard about 0.1 s later). */
-  playCue?(kind: CueKind): Promise<void>;
+  /**
+   * Play a sound cue on the call's cue track; resolves once the track took all of it (heard about 0.1 s
+   * later). `started` once it took the first frame.
+   */
+  playCue?(kind: CueKind, started?: () => void): Promise<void>;
   /** Loop the typing sound on the cue track (under no cue), or stop it. */
   setTyping?(on: boolean): void;
   close(): Promise<void>;
@@ -1288,6 +1299,8 @@ export interface CallVoiceEvents {
   onAudio(pcm: Int16Array): void;
   /** The VAD: the caller's speech started or ended at stream position `at` (16 kHz samples). */
   onSpeech(speaking: boolean, at: number): void;
+  /** The VAD analyzed the audio through stream position `at`, its last window with speech ending at `quietFrom`. */
+  onVad?(at: number, quietFrom: number): void;
   /** The agent's audio started or stopped playing. */
   onAgentSpeaking?(speaking: boolean): void;
   onClosed(reason: string): void;
@@ -1323,6 +1336,13 @@ export interface TurnFacts {
   activityEndMs: number;
   /** Its text was in (the final, or the cap on waiting for one). */
   finalMs: number;
+  /** A spoken send: the interim ending in the send word came, the quiet was enough, the turn committed (its sent cue asked for), and the cue's first frame went out. */
+  candidateMs?: number;
+  quietMs?: number;
+  commitMs?: number;
+  cueMs?: number;
+  /** A committed send went with its words at the act: the final had none (`empty`), ended in a discard, or split differently at a wake phrase. */
+  fallback?: 'empty' | 'discard' | 'wake_split';
 }
 
 /** What became of a turn handed to the host. */
@@ -1335,6 +1355,9 @@ export interface SendResult {
   /** The key the turn went out under, for the host's `turn-stored` when it stores a timed-out turn after all. */
   turnKey?: string;
 }
+/** What became of a turn handed to the host, and when its POST started (wall clock). */
+export type TurnSent = (result: SendResult, postAt: number) => void;
+
 export interface TurnTakingDeps {
   send(text: string): Promise<SendResult>;
   say(text: string): Promise<boolean>;
@@ -1364,6 +1387,14 @@ export class TurnTaking {
   /** Until then, the caller's last speech may still be committed as a turn. */
   private turnOpenUntil = 0;
   private sends: Promise<void> = Promise.resolve();
+  /** Turns that closed and have not gone yet, in the order they closed: each goes once those before it went or were skipped. */
+  private readonly slots: Array<{ job?: (() => Promise<void>) | null }> = [];
+  /** A turn the host did not answer in time and may still store: the turns after it wait for its `turn-stored`. */
+  private unconfirmed?: { turnKey: string; resolve: () => void };
+  /** Turns the host stored before their timed-out POST came back (its event outran the 504), by key: their host id. */
+  private readonly storedEarly = new Map<string, string>();
+  /** Waiting in sent() for the slots to drain. */
+  private readonly drained = new Set<() => void>();
   private speech: Promise<void> = Promise.resolve();
   private readonly wakers = new Set<() => void>();
   private thinkingUntil = 0;
@@ -1441,14 +1472,76 @@ export class TurnTaking {
   }
 
   /** A finished caller turn; sent to the host in order, without holding up the session. */
-  onTurn(text: string, onSent?: (result: SendResult) => void): void {
+  onTurn(text: string, onSent?: TurnSent): void {
     if (this.closed) return;
-    this.turnOpenUntil = 0;
-    this.options.language = languageOf(text, this.options.ukrainian ?? true) ?? this.options.language;
-    this.wake();
-    this.sends = this.sends
-      .then(() => this.sendTurn(text, onSent))
-      .catch((err: unknown) => this.deps.log.warn('voice-mode worker: sending a turn failed', { err }));
+    this.reserve().send(text, onSent);
+  }
+
+  /**
+   * A place in the order turns go to the host in, taken as a turn closes, before its text is in: filled
+   * with its text, or skipped. A slot filled after the call ended still goes: its sent cue played.
+   */
+  reserve(): { send(text: string, onSent?: TurnSent): void; skip(): void } {
+    const slot: (typeof this.slots)[number] = {};
+    this.slots.push(slot);
+    const fill = (job: (() => Promise<void>) | null) => {
+      if (slot.job !== undefined) return;
+      slot.job = job;
+      this.drain();
+    };
+    return {
+      send: (text, onSent) => {
+        if (slot.job !== undefined) return;
+        this.turnOpenUntil = 0;
+        this.options.language = languageOf(text, this.options.ukrainian ?? true) ?? this.options.language;
+        this.wake();
+        fill(() => this.sendTurn(text, onSent));
+      },
+      skip: () => fill(null),
+    };
+  }
+
+  /** The host stored a turn it had not answered in time: the turns after it go now. */
+  stored(turnKey: string, id: string): void {
+    if (this.unconfirmed?.turnKey === turnKey) {
+      this.unconfirmed.resolve();
+      this.unconfirmed = undefined;
+      return;
+    }
+    // Its 504 may still be on the way: that turn then counts as taken, and holds nothing back.
+    this.storedEarly.set(turnKey, id);
+    for (const key of this.storedEarly.keys()) {
+      if (this.storedEarly.size <= MAX_UNCONFIRMED_TURNS) break;
+      this.storedEarly.delete(key);
+    }
+  }
+
+  /** Settles once every turn that closed so far went to the host or was skipped. */
+  async sent(): Promise<void> {
+    for (;;) {
+      if (this.slots.length) {
+        await new Promise<void>((resolve) => this.drained.add(resolve));
+        continue;
+      }
+      const settled = this.sends;
+      await settled;
+      if (settled === this.sends && !this.slots.length) return;
+    }
+  }
+
+  private drain(): void {
+    while (this.slots[0]?.job !== undefined) {
+      const job = this.slots.shift()!.job;
+      if (job) {
+        this.sends = this.sends
+          .then(job)
+          .catch((err: unknown) => this.deps.log.warn('voice-mode worker: sending a turn failed', { err }));
+      }
+    }
+    for (const wake of [...this.drained]) {
+      this.drained.delete(wake);
+      wake();
+    }
   }
 
   onTurnLost(reason: 'stt' | 'empty', fields: Record<string, unknown> = {}): void {
@@ -1515,6 +1608,8 @@ export class TurnTaking {
   close(): void {
     this.closed = true;
     clearTimeout(this.statusTimer);
+    this.unconfirmed?.resolve();
+    this.unconfirmed = undefined;
     this.wake();
   }
 
@@ -1528,14 +1623,27 @@ export class TurnTaking {
     } while (settled !== this.speech);
   }
 
-  private async sendTurn(text: string, onSent?: (result: SendResult) => void): Promise<void> {
-    const result = await this.deps.send(text).catch((err: unknown): SendResult => {
+  private async sendTurn(text: string, onSent?: TurnSent): Promise<void> {
+    const postAt = this.now();
+    let result = await this.deps.send(text).catch((err: unknown): SendResult => {
       this.deps.log.warn('voice-mode worker: sending a turn threw', { err });
       return { accepted: false, error: err instanceof Error ? err.message : String(err) };
     });
-    onSent?.(result);
+    const storedId = result.turnKey ? this.storedEarly.get(result.turnKey) : undefined;
+    if (!result.accepted && storedId !== undefined && hostLossReason(result) === 'timeout') {
+      this.storedEarly.delete(result.turnKey!);
+      result = { accepted: true, turnKey: result.turnKey, id: storedId };
+    }
+    onSent?.(result, postAt);
     if (this.closed) return;
-    if (!result.accepted) return this.feedback(hostLossReason(result));
+    if (!result.accepted) {
+      this.feedback(hostLossReason(result));
+      const turnKey = result.turnKey;
+      if (!turnKey || hostLossReason(result) !== 'timeout') return;
+      // The host may still store it: the turns after it wait for its `turn-stored`, or the call's end,
+      // so none overtakes it.
+      return new Promise<void>((resolve) => (this.unconfirmed = { turnKey, resolve }));
+    }
     this.awaitingReply = true;
     this.thinkingUntil = Math.max(this.thinkingUntil, this.now() + AWAIT_REPLY_MS);
     this.refresh();
@@ -1807,7 +1915,7 @@ export interface CueSink {
  * digital silence.
  */
 export class CueFeed {
-  private readonly cues: Array<{ frames: AudioFrame[]; done: () => void }> = [];
+  private readonly cues: Array<{ frames: AudioFrame[]; done: () => void; started?: () => void }> = [];
   private stopped = false;
   private noise = 0;
   /** A looped sound under no cue (the typing while the agent works); the noise floor without one. */
@@ -1826,10 +1934,10 @@ export class CueFeed {
     });
   }
 
-  /** Resolves once the sink took the cue's last frame. */
-  play(frames: AudioFrame[]): Promise<void> {
+  /** Resolves once the sink took the cue's last frame; `started` once it took the first. */
+  play(frames: AudioFrame[], started?: () => void): Promise<void> {
     if (this.stopped) return Promise.resolve();
-    return new Promise((done) => this.cues.push({ frames: [...frames], done }));
+    return new Promise((done) => this.cues.push({ frames: [...frames], done, started }));
   }
 
   stop(): void {
@@ -1854,6 +1962,8 @@ export class CueFeed {
       const frame =
         cue?.frames.shift() ?? (bed ? bed[this.bedAt++ % bed.length] : NOISE_FLOOR[this.noise++ % NOISE_FLOOR.length]);
       await this.sink.captureFrame(frame);
+      cue?.started?.();
+      if (cue) cue.started = undefined;
       if (cue && cue.frames.length === 0) {
         this.cues.shift();
         cue.done();
@@ -2040,8 +2150,9 @@ export type SpokenCommand = CallCommand;
 export type CommandMatch = { command: SpokenCommand; rest: string; ownSentence?: true };
 /**
  * CALL_COMMAND_WORDS, longest first, as the words that end an utterance (Cyrillic read as Latin:
- * `зулу` is `zulu`, `прийом` is `pryyom`). `copy` and `copy that` are everyday words too, so a
- * final takes them only as their own sentence (`ownSentence`): the whole utterance, or after punctuation.
+ * `зулу` is `zulu`, `прийом` is `pryyom`). `copy` and `copy that` are everyday words too, so any
+ * text takes them only as their own sentence (`ownSentence`): the whole utterance, or after
+ * punctuation. A capital letter alone is no boundary.
  */
 const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[], { ownSentence: true } | undefined]> = (
   ['send', 'discard'] as const
@@ -2056,13 +2167,9 @@ const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[], { ownS
 
 /**
  * The command phrase a transcript ends with and what was said before it; `missed` when it is an
- * `ownSentence` command inside a final's sentence (`send me a copy`). Interim text is mostly
- * unpunctuated, so there the final decides that.
+ * `ownSentence` command inside a sentence (`send me a copy`).
  */
-function commandEnd(
-  text: string,
-  interim = false,
-): (CommandMatch & { phrase: string; at: number; missed?: true }) | null {
+function commandEnd(text: string): (CommandMatch & { phrase: string; at: number; missed?: true }) | null {
   const words = spokenWords(text);
   for (const [command, phrase, guard] of COMMANDS) {
     if (words.length < phrase.length) continue;
@@ -2070,7 +2177,7 @@ function commandEnd(
     if (!tail.every((w, i) => w.word === phrase[i])) continue;
     const before = text.slice(0, tail[0].start);
     const found = { command, rest: sentence(before), phrase: phrase.join('-'), at: tail[0].start, ...guard };
-    if (guard?.ownSentence && !interim && !/(^|[.!?,;:–—-])\s*$/u.test(before)) return { ...found, missed: true };
+    if (guard?.ownSentence && !/(^|[.!?,;:–—-])\s*$/u.test(before)) return { ...found, missed: true };
     return found;
   }
   return null;
@@ -2080,8 +2187,8 @@ function commandEnd(
  * The command a transcript ends with, and what was said before it, or null. Only the end counts:
  * `zulu, call Anna` is words, while a sentence that really ends in `zulu` sends, even as a question.
  */
-export function matchCommand(text: string, interim = false): CommandMatch | null {
-  return endMatch(commandEnd(text, interim));
+export function matchCommand(text: string): CommandMatch | null {
+  return endMatch(commandEnd(text));
 }
 
 /** The command a commandEnd result acts as, or null when it is words. */
@@ -2099,7 +2206,7 @@ export interface CaptionMark {
 
 /** The mark for a caption the worker takes `command` from: its words are the text before the command, or all of it when the text left it out. */
 export function captionMark(text: string, command: SpokenCommand): CaptionMark {
-  const end = commandEnd(text, true);
+  const end = commandEnd(text);
   if (end?.command !== command) return { command, words: text.trim() };
   return {
     command,
@@ -2231,13 +2338,18 @@ const joinText = (...parts: string[]): string =>
 /** Text without the punctuation and spaces a cut left at its edges. */
 const trimCut = (text: string): string => text.replace(/^[\s,.;:!?–—-]+|[\s,;:–—-]+$/gu, '');
 
-/** A command acts once this many interims in a row ended with it, and the caller is silent. */
-const STABLE_COMMAND_INTERIMS = 2;
+/** A discard phrase acts once this many interims in a row ended with it, and the caller is quiet. */
+const STABLE_DISCARD_INTERIMS = 2;
 /**
  * Or once the interim text ending with it stayed unchanged this long: the transcription sends an
  * interim only when its text changes, so a short last word before silence often comes in just one.
  */
-export const COMMAND_SETTLE_MS = 700;
+export const DISCARD_SETTLE_MS = 700;
+/**
+ * The silence a spoken command waits for: the VAD's own closing silence (Silero's minSilenceDuration),
+ * counted over windows it analyzed, from its last one with speech in it.
+ */
+export const COMMAND_QUIET_MS = 550;
 
 /** Why a turn's activity ended. */
 export type TurnEnd =
@@ -2259,12 +2371,15 @@ interface OpenTurn {
   addressed: boolean;
   /** Waits for `hey <agent>` in its own transcript; the turn is the words after it. */
   textWake: boolean;
-  /** Text of an earlier activity of this turn (a command that turned out to be words). */
+  /** Text of an earlier activity of this turn (a discard phrase that turned out to be words). */
   carry: string;
   /** The activity's whole text so far. */
   heard: string;
-  /** The command the last interims ended with, in how many in a row, and whether their text settled (COMMAND_SETTLE_MS). */
-  candidate?: { command: SpokenCommand; count: number; settled?: boolean };
+  /**
+   * The command the latest interim ended with: where the call's audio was when it came (`at`), and when
+   * (`seenAt`); for a discard, in how many interims in a row, and whether their text settled (DISCARD_SETTLE_MS).
+   */
+  candidate?: { command: SpokenCommand; at: number; seenAt: number; count: number; settled?: boolean };
   /**
    * The last command any interim of this activity ended with, and the words before it: a later
    * interim, and the final, can leave it out again.
@@ -2277,8 +2392,12 @@ interface OpenTurn {
   lastSpeechEnd: number;
   /** Where its audio starts in the stream. */
   from: number;
+  /** Where its activity ended, once it did. */
+  endedAt?: number;
+  /** Ended by a discard phrase, the final not in yet: speech now continues it. */
+  discarding?: boolean;
   /**
-   * Set while it finalizes: the caller spoke again after its command, so the next activity carries its
+   * Set while it finalizes: the caller spoke again after its discard phrase, so the next activity carries its
    * text (`handOff`, which that activity awaits as `before`), or a switch to review took it (its draft).
    */
   handOff?: (said: string) => void;
@@ -2286,17 +2405,26 @@ interface OpenTurn {
   switched?: (recording: Recording) => void;
 }
 
-export interface CallTurnsDeps {
-  transcriber: Transcription;
-  /** A finished auto turn to the host. */
-  send(text: string, take: TurnTake): void;
+/** A turn's place in the order turns go to the host in, taken as it closes (TurnTaking.reserve). */
+export interface TurnSlot {
+  /** Its text, to the host once every turn that closed before it went; `cued`: its sent cue already played. */
+  send(text: string, take: TurnTake, cued: boolean): void;
   /** Speech that came to no text: the transcription failed (`stt`) or heard no words (`empty`). */
   lost(reason: 'stt' | 'empty', fields: Record<string, unknown>, take: TurnTake): void;
   /** Speech too short to be a turn, with nothing transcribed (a cough, a noise). */
   noise(take: TurnTake): void;
+  /** Nothing of it goes to the host; the turns after it need not wait. A no-op once it was filled. */
+  skip(): void;
+}
+
+export interface CallTurnsDeps {
+  transcriber: Transcription;
+  /** An auto turn for the agent closed: its place in the order turns go out in; `sending`: it is committed, and goes. */
+  reserve(sending?: boolean): TurnSlot;
   /** Words that will never be sent, for the page's captions; a lone command names itself and its caption's segment. */
   drop(reason: CallDroppedSpeech['dropped'], text: string, lone?: { command: SpokenCommand; segment: number }): void;
-  cue(kind: CueKind): void;
+  /** A cue; `started` once its first frame went out. */
+  cue(kind: CueKind, started?: () => void): void;
   /** The caller's caption for one turn; `mark` when its text ends in a command the worker takes. */
   caption(segment: number, text: string, final: boolean, mark?: CaptionMark): void;
   /** The page's send countdown: the speech ended at `at` (wall clock), or it is cleared. */
@@ -2337,6 +2465,18 @@ export interface Recording {
   take: TurnTake;
 }
 
+/** How a turn's activity ended, as its TurnFacts count it. */
+interface Closed {
+  endedAt: number;
+  endWall: number;
+  activityEndMs: number;
+  mode: TurnFacts['mode'];
+  take: TurnTake;
+  /** The wake switch and the names, as they were when it closed: later settings are the next turn's. */
+  wake: boolean;
+  names: WakeName[];
+}
+
 /**
  * The call's turns: one state machine over the caller's audio, the VAD, the wake word and the
  * transcription, for every mode. A turn is one transcription activity, so its text is transcribed
@@ -2350,14 +2490,16 @@ export interface Recording {
  * `pauseSends`); it goes back to waiting with no speech for a while (AwakeLimits). Without a
  * spotter the transcript's `hey <agent>` opens it instead.
  *
- * Spoken commands are nominated by the interim text: a send word (`zulu`, `copy`, `прийом`) or a discard phrase at
- * its end in STABLE_COMMAND_INTERIMS interims in a row, or in one whose text then stays unchanged for
- * COMMAND_SETTLE_MS, with the caller silent, ends the activity,
- * and the final text decides (turnText): a command it still ends with acts, one it does not was
- * words, and the turn goes on in a new activity carrying the text so far. A pause or sleep that
- * ends a turn applies a command its text ends with the same way, or one any interim of the activity
- * ended with that the final left out (`droppedCommand`). The wake phrase said again inside a woken
- * turn is never part of its words: a discard before it drops only the words before it.
+ * A send word (`zulu`, `copy`, `прийом`) the latest interim ends with, once the caller is quiet
+ * (COMMAND_QUIET_MS over the VAD's windows, analyzed past that interim), commits the turn: the sent cue
+ * plays then, the next turn can open at once, and nothing after takes it back. Its final only improves
+ * the words; it goes to the host in the order turns closed. A discard phrase is slower on purpose: it
+ * acts once STABLE_DISCARD_INTERIMS interims in a row ended with it, or one whose text stayed unchanged
+ * for DISCARD_SETTLE_MS, and the final decides: a discard it does not end with was words, and the turn
+ * goes on in a new activity carrying them. A pause or sleep that ends a turn applies a command its text
+ * ends with the same way, or one any interim of the activity ended with that the final left out
+ * (`droppedCommand`). The wake phrase said again inside a woken turn is never part of its words: a
+ * discard before it drops only the words before it.
  *
  * Review mode (manual): `record` opens a turn, `stopRecording` closes it into a draft, and the auto
  * rules stand aside. Speech while the agent's line plays is noted (`unheard`), never transcribed; speech
@@ -2373,9 +2515,13 @@ export class CallTurns {
   private loadingPhrase?: string;
   private reviewing = false;
   private turn?: OpenTurn;
-  /** An auto turn finalizing after a command: speech now continues it. */
-  /** An auto turn for the agent whose activity ended and whose text is not acted on yet; `command`: a spoken one ended it. */
-  private finalizing?: { turn: OpenTurn; endedAt: number; command: boolean };
+  /** Auto turns for the agent whose activity ended and whose text is not acted on yet: a switch to review takes them. */
+  private readonly closing = new Set<OpenTurn>();
+  /** Committed sends waiting for their text. */
+  private readonly committed = new Set<Promise<void>>();
+  /** Settles once the call's end stopped waiting for finals: a committed send then goes with the words at the act. */
+  private abandon!: () => void;
+  private readonly abandoned = new Promise<Heard>((resolve) => (this.abandon = () => resolve(silentHeard)));
   /** What `hold` last said. */
   private holding = false;
   private speaking = false;
@@ -2383,6 +2529,14 @@ export class CallTurns {
   private agentSpeaking = false;
   /** Detections from windows that ended before this position are stale: the wait they belonged to is over. */
   private waitingSince = 0;
+  /** Audio before this position belongs to a turn that already closed: no pre-roll takes it again. */
+  private ownedTo = 0;
+  /** The VAD analyzed the audio up to here, quiet since `quietFrom` (and never before `heardFrom`, where an agent line ended). */
+  private vadAt = 0;
+  private quietFrom = 0;
+  private heardFrom = 0;
+  /** When the quiet reached COMMAND_QUIET_MS; unset while it has not. */
+  private quietAt?: number;
   private readonly ring = new AudioRing();
   private readonly capture?: TurnCapture;
   private segments = 0;
@@ -2442,9 +2596,19 @@ export class CallTurns {
     return this.ring.position;
   }
 
-  /** An auto turn for the agent is open or still finalizing: a switch to review makes it a draft. */
+  /** An auto turn for the agent is open or still finalizing undecided: a switch to review makes it a draft. A committed send is neither. */
   get turnOpen(): boolean {
-    return (this.turn?.kind === 'auto' && this.turn.addressed) || !!this.finalizing;
+    return (this.turn?.kind === 'auto' && this.turn.addressed) || this.closing.size > 0;
+  }
+
+  /** The call ended and its finals had their grace: committed sends still without one go with their words at the act. */
+  abandonFinals(): void {
+    this.abandon();
+  }
+
+  /** Settles once every committed send has its text; undefined when none waits for it. */
+  get committing(): Promise<void> | undefined {
+    return this.committed.size ? Promise.all(this.committed).then(() => undefined) : undefined;
   }
 
   /** A wake word model loads for this phrase (`useWakeWord` once it is in use, or with none if it fails). */
@@ -2504,13 +2668,13 @@ export class CallTurns {
       this.unsettle();
       if (this.turn?.candidate) this.turn.candidate = undefined;
       if (this.turn || this.reviewing) return;
-      const finalizing = this.finalizing;
-      if (finalizing?.command) {
-        // The caller went on after a command: it was words, and this speech continues the turn. The
-        // new activity waits for the earlier one's text before it acts, so the words stay in order.
-        this.finalizing = undefined;
-        const before = new Promise<string>((resolve) => (finalizing.turn.handOff = resolve));
-        this.open('auto', Math.max(finalizing.endedAt, at - samplesOf(PRE_ROLL_MS)), true);
+      const discarding = [...this.closing].filter((t) => t.discarding).at(-1);
+      if (discarding) {
+        // The caller went on after a discard phrase: it may be words, and this speech continues the turn.
+        // The new activity waits for the earlier one's text before it acts, so the words stay in order.
+        this.closing.delete(discarding);
+        const before = new Promise<string>((resolve) => (discarding.handOff = resolve));
+        this.open('auto', at - samplesOf(PRE_ROLL_MS), true);
         const successor = this.turn as OpenTurn | undefined;
         if (successor) successor.before = before;
         return;
@@ -2526,6 +2690,22 @@ export class CallTurns {
     if (this.command()) return;
     this.armPause();
     this.arm();
+  }
+
+  /**
+   * The VAD analyzed the caller's audio through stream position `at`, its last window with speech in it
+   * ending at `quietFrom` (or its microphone track starting there): a spoken command waits for this.
+   */
+  onVad(at: number, quietFrom: number): void {
+    if (this.closed) return;
+    this.vadAt = at;
+    this.quietFrom = quietFrom;
+    if (!this.quiet()) {
+      this.quietAt = undefined;
+      return;
+    }
+    this.quietAt ??= this.now();
+    if (this.turn?.candidate && !this.speaking && !this.agentSpeaking) this.command();
   }
 
   /**
@@ -2555,8 +2735,7 @@ export class CallTurns {
     const changed = text !== turn.heard;
     turn.heard = text;
     const found = turn.kind === 'auto' && !turn.addressed ? matchWake(text, this.names) : null;
-    const match =
-      turn.kind === 'auto' && (turn.addressed || found) ? matchCommand(this.spoken(turn, text), true) : null;
+    const match = turn.kind === 'auto' && (turn.addressed || found) ? matchCommand(this.spoken(turn, text)) : null;
     const shown = joinText(turn.carry, text);
     this.debug('interim', { text, changed, addressed: turn.addressed, wake: !!found, match });
     this.deps.caption(turn.segment, shown, false, match ? captionMark(shown, match.command) : undefined);
@@ -2574,11 +2753,14 @@ export class CallTurns {
     // repeat is no new text for the shadow, and cannot newly resolve the wake.
     if (changed) this.deps.shadow?.interim(turn.segment, this.spoken(turn, shown));
     if (match) turn.seen = match;
+    // The command acts only once the VAD heard this far: the interim describes the audio up to now.
+    const at = this.ring.position;
     if (!match) turn.candidate = undefined;
-    else if (turn.candidate?.command === match.command) turn.candidate.count++;
-    else turn.candidate = { command: match.command, count: 1 };
+    else if (turn.candidate?.command === match.command)
+      Object.assign(turn.candidate, { at, count: turn.candidate.count + 1 });
+    else turn.candidate = { command: match.command, at, seenAt: this.now(), count: 1 };
     if (changed || !match) this.unsettle();
-    if (match && !this.settleTimer) this.settle(turn);
+    if (match?.command === 'discard' && !this.settleTimer) this.settle(turn);
     this.debug('candidate', { candidate: turn.candidate, settling: !!this.settleTimer, speaking: this.speaking });
     if (this.command()) return;
     // The idle clock restarts on new words only: an interim repeating the same text is no speech.
@@ -2592,6 +2774,9 @@ export class CallTurns {
     this.agentSpeaking = speaking;
     if (!speaking) {
       this.waitingSince = this.ring.position;
+      // A command waits for quiet heard after the line: what the microphone took under it is not the caller's.
+      this.heardFrom = this.ring.position;
+      this.quietAt = undefined;
       if (this.turn && !this.speaking) this.armPause();
       return this.arm();
     }
@@ -2616,13 +2801,11 @@ export class CallTurns {
     this.deps.countdown.clear();
     clearTimeout(this.pauseTimer);
     this.disarm();
-    // The words not acted on yet, in order: a turn still finalizing, then the open one.
+    // The words not acted on yet, in order: the turns still finalizing undecided, then the open one.
+    // A committed send is not among them: it goes out.
     const parts: Array<Promise<Recording | null>> = [];
-    const finalizing = this.finalizing;
-    if (finalizing) {
-      this.finalizing = undefined;
-      parts.push(new Promise((resolve) => (finalizing.turn.switched = resolve)));
-    }
+    for (const closing of this.closing) parts.push(new Promise((resolve) => (closing.switched = resolve)));
+    this.closing.clear();
     const turn = this.turn;
     if (turn?.kind === 'auto' && !turn.addressed) void this.finish('unaddressed');
     else if (turn?.kind === 'auto') parts.push(this.finish('switch'));
@@ -2658,6 +2841,7 @@ export class CallTurns {
     if (this.turn?.kind === 'review') void this.finish('dropped');
   }
 
+  /** The call ended: the open turn and the undecided ones go nowhere; a committed send still goes out. */
   close(): void {
     this.closed = true;
     clearTimeout(this.pauseTimer);
@@ -2665,10 +2849,10 @@ export class CallTurns {
     this.unsettle();
     if (this.turn) this.deps.shadow?.ended(this.turn.segment, 'hangup');
     this.turn = undefined;
-    this.finalizing = undefined;
+    this.closing.clear();
   }
 
-  /** Replies wait while an auto turn for the agent is open or finalizing. */
+  /** Replies wait while an auto turn for the agent is open or finalizing undecided. */
   private syncHold(): void {
     const open = this.turnOpen;
     if (open === this.holding) return;
@@ -2677,7 +2861,7 @@ export class CallTurns {
   }
 
   private open(kind: OpenTurn['kind'], from: number, addressed: boolean): void {
-    const start = Math.max(0, from);
+    const start = Math.max(0, from, this.ownedTo);
     const preRoll = this.ring.since(start);
     this.turn = {
       kind,
@@ -2704,27 +2888,35 @@ export class CallTurns {
     this.arm();
   }
 
-  /** A stable command at the end of what the caller said, once they are silent: the turn ends to confirm it. */
+  /** Whether the VAD heard COMMAND_QUIET_MS without speech up to the last window it analyzed (none of it under an agent line). */
+  private quiet(): boolean {
+    return this.vadAt - Math.max(this.quietFrom, this.heardFrom) >= samplesOf(COMMAND_QUIET_MS);
+  }
+
+  /** A command at the end of what the caller said, once they are quiet: a send commits, a stable discard ends the turn to confirm it. */
   private command(): boolean {
     const turn = this.turn;
-    if (!turn || turn.kind !== 'auto' || !turn.addressed || this.speaking || this.agentSpeaking) {
-      if (turn?.candidate) {
-        const why = this.speaking ? 'speaking' : this.agentSpeaking ? 'agent-speaking' : 'not-addressed';
-        this.debug('command', { acts: false, why, candidate: turn.candidate });
-      }
-      return false;
-    }
-    const candidate = turn.candidate;
-    if (!candidate || (candidate.count < STABLE_COMMAND_INTERIMS && !candidate.settled)) {
-      if (candidate) this.debug('command', { acts: false, why: 'unstable', candidate });
-      return false;
-    }
-    this.debug('command', { acts: true, candidate });
+    const candidate = turn?.candidate;
+    if (!turn || !candidate) return false;
+    const why =
+      turn.kind !== 'auto' || !turn.addressed
+        ? 'not-addressed'
+        : this.speaking
+          ? 'speaking'
+          : this.agentSpeaking
+            ? 'agent-speaking'
+            : this.vadAt + VAD_WINDOW <= candidate.at || !this.quiet()
+              ? 'not-quiet'
+              : candidate.command === 'discard' && candidate.count < STABLE_DISCARD_INTERIMS && !candidate.settled
+                ? 'unstable'
+                : undefined;
+    this.debug('command', { acts: !why, ...(why ? { why } : {}), candidate });
+    if (why) return false;
     void this.finish(candidate.command);
     return true;
   }
 
-  /** The interim text ending in the turn's candidate command starts settling: unchanged for COMMAND_SETTLE_MS, it is stable. */
+  /** The interim text ending in the turn's discard phrase starts settling: unchanged for DISCARD_SETTLE_MS, it is stable. */
   private settle(turn: OpenTurn): void {
     const candidate = turn.candidate;
     this.settleTimer = setTimeout(() => {
@@ -2734,7 +2926,7 @@ export class CallTurns {
       if (stale) return;
       candidate.settled = true;
       this.command();
-    }, COMMAND_SETTLE_MS);
+    }, DISCARD_SETTLE_MS);
     this.settleTimer.unref?.();
   }
 
@@ -2748,7 +2940,7 @@ export class CallTurns {
    * with, or one an earlier interim ended with that the text still ends like (the interim dropped it).
    */
   private pendingCommand(turn: OpenTurn, text = this.spoken(turn, turn.heard)): CommandMatch | null {
-    return matchCommand(text, true) ?? (turn.seen && droppedCommand(text, turn.seen.rest) ? turn.seen : null);
+    return matchCommand(text) ?? (turn.seen && droppedCommand(text, turn.seen.rest) ? turn.seen : null);
   }
 
   /** The send countdown shows while the closing silence runs, and not while a spoken command is pending. */
@@ -2763,12 +2955,26 @@ export class CallTurns {
   }
 
   /** The turn's own words in `text`: after `hey <agent>` when the transcript opened it. */
-  private spoken(turn: OpenTurn, text: string): string {
+  private spoken(turn: OpenTurn, text: string, names = this.names): string {
     if (turn.textWake) {
-      const found = matchWake(text, this.names);
+      const found = matchWake(text, names);
       return found ? trimCut(text.slice(found.end)) : text;
     }
     return text;
+  }
+
+  /**
+   * The wake phrase again inside a woken turn: never part of its words. What came before it ended in
+   * a discard is dropped (`scratched`); otherwise it stays, and the turn is the words around the phrase.
+   */
+  private rewake(text: string, closed: Closed): { text: string; scratched?: string } {
+    const rewoken = closed.wake ? matchWakes(text, closed.names).at(-1) : undefined;
+    if (!rewoken) return { text };
+    const before = trimCut(text.slice(0, rewoken.start));
+    const after = trimCut(text.slice(rewoken.end));
+    return matchCommand(before)?.command === 'discard'
+      ? { text: after, scratched: before }
+      : { text: joinText(before, after) };
   }
 
   /** The closing silence after the caller's speech, counted from where it ended. */
@@ -2808,6 +3014,31 @@ export class CallTurns {
     this.awakeTimer = undefined;
   }
 
+  /** What a finished activity reports in its `voice-mode.turn` event. */
+  private facts(
+    turn: OpenTurn,
+    why: TurnEnd,
+    closed: Closed,
+    heard: Heard,
+    source: TextSource,
+    said: string,
+  ): TurnFacts {
+    return {
+      segment: turn.segment,
+      mode: closed.mode,
+      endedBy: why,
+      source: source === 'final' || source === 'none' ? source : 'interim',
+      ...(source === 'collapse_interim' ? { collapsed: true } : {}),
+      finals: heard.finals,
+      ...(heard.failed ? { audioLost: true } : {}),
+      words: wordCount(said),
+      speechMs: Math.round(turn.speechMs),
+      speechEndAt: closed.endWall - closed.activityEndMs,
+      activityEndMs: closed.activityEndMs,
+      finalMs: closed.activityEndMs + (this.now() - closed.endWall),
+    };
+  }
+
   /** End the open turn's activity and act on what it heard. */
   private async finish(why: TurnEnd): Promise<Recording | null> {
     const turn = this.turn;
@@ -2819,68 +3050,81 @@ export class CallTurns {
     this.unsettle();
     this.deps.countdown.clear();
     const endedAt = this.ring.position;
+    this.ownedTo = endedAt;
     const endWall = this.now();
-    const activityEndMs = Math.round(msOf(endedAt - turn.lastSpeechEnd));
-    const mode = turn.kind === 'review' ? 'manual' : this.wake ? 'wake' : 'handsfree';
-    if (turn.kind === 'auto' && turn.addressed && why !== 'switch') {
-      this.finalizing = { turn, endedAt, command: why === 'send' || why === 'discard' };
-    }
     // The recording ends a pad after the last speech, not with the closing silence.
     const keep = turn.lastSpeechEnd - turn.from + samplesOf(RECORDING_PAD_MS);
-    const take: TurnTake = {
-      audio: this.capture?.take(turn.speechMs, Math.max(keep, 0)),
-      sttModel: this.options.sttModel,
+    const closed: Closed = {
+      endedAt,
+      endWall,
+      activityEndMs: Math.round(msOf(endedAt - turn.lastSpeechEnd)),
+      mode: turn.kind === 'review' ? 'manual' : this.wake ? 'wake' : 'handsfree',
+      take: { audio: this.capture?.take(turn.speechMs, Math.max(keep, 0)), sttModel: this.options.sttModel },
+      wake: this.wake,
+      names: this.names,
     };
-    // A turn that went on after a command that was words, and heard nothing since, has no final to wait for.
+    // A turn that went on after a discard that was words, and heard nothing since, has no final to wait for.
     const silent = !!turn.carry && !turn.heard && turn.speechMs === 0;
     const ending = this.deps.transcriber.end();
-    const heard = silent ? { interim: '', finals: 0, failed: false, finalizeMs: 0 } : await ending;
-    const finalMs = activityEndMs + (this.now() - endWall);
+    if (why === 'send') {
+      this.commit(turn, ending, closed);
+      return null;
+    }
+    // Undecided until its final is in: a switch to review can still take it, and it holds replies.
+    const undecided = turn.kind === 'auto' && turn.addressed && ['pause', 'asleep', 'agent', 'discard'].includes(why);
+    const slot = undecided ? this.deps.reserve() : undefined;
+    if (undecided) {
+      turn.endedAt = endedAt;
+      turn.discarding = why === 'discard';
+      this.closing.add(turn);
+    }
+    try {
+      return await this.decide(turn, why, closed, silent ? Promise.resolve(silentHeard) : ending, slot);
+    } finally {
+      this.closing.delete(turn);
+      slot?.skip();
+      // Never leaves the turn that went on waiting, whatever became of this one.
+      turn.handOff?.('');
+      if (!this.closed) this.syncHold();
+    }
+  }
+
+  /** A turn closed by a pause, sleep, the agent's line, a discard phrase, a switch, or review: its final decides. */
+  private async decide(
+    turn: OpenTurn,
+    why: Exclude<TurnEnd, 'send'>,
+    closed: Closed,
+    ending: Promise<Heard>,
+    slot: TurnSlot | undefined,
+  ): Promise<Recording | null> {
+    const { take } = closed;
+    const heard = await ending;
     // Words of an earlier activity of this turn, still finalizing when the caller went on, lead it.
     if (turn.before) turn.carry = joinText(await turn.before, turn.carry);
-    if (this.finalizing?.turn === turn) this.finalizing = undefined;
+    this.closing.delete(turn);
     const chosen = turnText(heard);
     let said = joinText(turn.carry, chosen.text);
     this.debug('heard', { seg: turn.segment, why, source: chosen.source, said, ...heard });
-    const facts: TurnFacts = {
-      segment: turn.segment,
-      mode,
-      endedBy: why,
-      source: chosen.source === 'final' || chosen.source === 'none' ? chosen.source : 'interim',
-      ...(chosen.source === 'collapse_interim' ? { collapsed: true } : {}),
-      finals: heard.finals,
-      ...(heard.failed ? { audioLost: true } : {}),
-      words: wordCount(said),
-      speechMs: Math.round(turn.speechMs),
-      speechEndAt: endWall - activityEndMs,
-      activityEndMs,
-      finalMs,
-    };
+    const facts = this.facts(turn, why, closed, heard, chosen.source, said);
     take.facts = facts;
     const ended = (outcome: TurnOutcome, reason: string) => this.deps.ended?.(facts, outcome, reason);
     const caption = (text: string, command?: SpokenCommand) => {
       if (text) this.deps.caption(turn.segment, text, true, command && captionMark(text, command));
     };
     const recording: Recording = { text: said, failed: heard.failed && !said, take };
-    const decides = !(
-      why === 'review' ||
-      why === 'switch' ||
-      turn.switched ||
-      turn.handOff ||
-      why === 'dropped' ||
-      why === 'unaddressed'
-    );
-    if (!decides || this.closed) {
+    if (!slot || turn.switched || turn.handOff || this.closed) {
       caption(said);
+      // The turn that went on waits for these words even once the call ended: a committed send may lead with them.
+      if (turn.handOff) {
+        turn.handOff(said);
+        if (!this.closed) this.syncHold();
+        return null;
+      }
       if (this.closed) return null;
       this.syncHold();
       if (why === 'review' || why === 'switch') return recording;
       if (turn.switched) {
         turn.switched(recording);
-        return null;
-      }
-      if (turn.handOff) {
-        turn.handOff(said);
         return null;
       }
       if (why === 'unaddressed') {
@@ -2892,58 +3136,36 @@ export class CallTurns {
       return null;
     }
     this.syncHold();
-    let text = this.spoken(turn, said);
-    /** Words before a second wake phrase that a discard ended: dropped on their own. */
-    let scratched: string | undefined;
-    const rewoken = this.wake ? matchWakes(text, this.names).at(-1) : undefined;
-    if (rewoken) {
-      // The wake phrase again inside the open turn: never part of its words. What came before it
-      // ended in a discard is dropped; otherwise it stays, and the turn is the words around the phrase.
-      const before = trimCut(text.slice(0, rewoken.start));
-      const after = trimCut(text.slice(rewoken.end));
-      if (matchCommand(before)?.command === 'discard') {
-        scratched = before;
-        text = after;
-      } else text = joinText(before, after);
-      said = text;
-    }
+    const spoken = this.spoken(turn, said, closed.names);
+    const { text, scratched } = this.rewake(spoken, closed);
+    if (text !== spoken) said = text;
     const end = commandEnd(text);
     let match = endMatch(end);
-    if (match?.ownSentence && chosen.source !== 'final') {
-      // The text is the interim's (the final collapsed or never came): it may carry the body, but
-      // only a final that ends in `copy` as its own sentence confirms the command.
-      const confirmed = matchCommand(heard.final ?? '');
-      if (confirmed?.command !== match.command || !confirmed.ownSentence) {
-        this.deps.log.info(`voice-mode.command near-miss word=${end?.phrase} reason=unconfirmed`);
-        match = null;
-      }
-    }
     // The command an interim ended with, the last one's or an earlier one's.
-    const nominated = turn.kind === 'auto' ? this.pendingCommand(turn) : null;
+    const nominated = this.pendingCommand(turn);
     // A final that ends in `copy` inside a sentence decided it was words: the interim text cannot overrule that.
     const missed = match ? null : end;
     if (missed?.missed) this.deps.log.info(`voice-mode.command near-miss word=${missed.phrase} reason=no-boundary`);
     if (!match && !missed?.missed && nominated && !nominated.ownSentence && endsLike(text, nominated.rest)) {
       // The final left out the command the interim text ended with: the command stands, and the
-      // final is the turn's text. Not `copy`: only a final that has it, as its own sentence, sends it.
+      // final is the turn's text. Not `copy`: only text that has it, as its own sentence, sends it.
       match = { command: nominated.command, rest: sentence(trimCut(text)) };
     }
     this.debug('decision', { seg: turn.segment, why, source: chosen.source, text, match, nominated, missed });
     const scratch = () => {
       if (scratched) this.discarded(scratched);
     };
-    // A command the final does not end with was words: the turn goes on.
-    if ((why === 'send' || why === 'discard') && match?.command !== why && !(why === 'discard' && scratched)) {
-      caption(scratched ?? said, scratched ? 'discard' : undefined);
-      scratch();
-      this.goOn(said, endedAt);
+    // A discard phrase the final does not end with was words: the turn goes on, and never sends from here.
+    if (why === 'discard' && match?.command !== 'discard' && !scratched) {
+      caption(said);
+      this.goOn(said, closed.endedAt);
       return null;
     }
     if (match?.command === 'discard') {
       caption(scratched ?? said, 'discard');
       scratch();
       // A discard with nothing said takes a wake back; in hands-free it has nothing to act on.
-      if (!match.rest && !this.wake) {
+      if (!match.rest && !closed.wake) {
         this.nope(text, 'discard', turn.segment);
         ended('empty', 'command_only');
       } else {
@@ -2961,14 +3183,17 @@ export class CallTurns {
     }
     const body = match ? match.rest : text;
     // A sent turn's caption is what the agent gets: the spoken command is not part of it.
-    if (scratched) caption(scratched, 'discard');
-    else if (match?.command === 'send') {
+    if (scratched) {
+      caption(scratched, 'discard');
+      // The words after the wake phrase are a turn of their own, on a caption line of their own.
+      if (body) this.deps.caption(++this.segments, body, true, match ? { command: 'send', words: body } : undefined);
+    } else if (match?.command === 'send') {
       const words = matchCommand(said)?.rest ?? said;
       if (words) this.deps.caption(turn.segment, words, true, { command: 'send', words });
     } else caption(said);
     scratch();
     if (scratched && !body) {
-      if (this.wake) this.deps.changed();
+      if (closed.wake) this.deps.changed();
       ended('discarded', 'command');
       return null;
     }
@@ -2982,20 +3207,118 @@ export class CallTurns {
       this.deps.changed();
       return null;
     }
-    if (this.wake) {
+    if (closed.wake) {
       this.waitingSince = this.ring.position;
       this.deps.changed();
     }
     if (body) {
-      this.deps.send(body, take);
+      slot.send(body, take, false);
       return null;
     }
     this.deps.noTurn();
     const fields = { speechMs: Math.round(turn.speechMs) };
-    if (heard.failed) this.deps.lost('stt', fields, take);
-    else if (turn.speechMs < MIN_LOST_SPEECH_MS) this.deps.noise(take);
-    else this.deps.lost('empty', fields, take);
+    if (heard.failed) slot.lost('stt', fields, take);
+    else if (turn.speechMs < MIN_LOST_SPEECH_MS) slot.noise(take);
+    else slot.lost('empty', fields, take);
     return null;
+  }
+
+  /**
+   * A send word and the caller's quiet: the turn is sent, and nothing after takes it back, not its
+   * final, more speech, a switch to review, nor the call's end. The sent cue plays now, and the next
+   * turn can open at once. Its final only improves the words; a final with none, with a discard, or
+   * with another wake split falls back on the words said at the act.
+   */
+  private commit(turn: OpenTurn, ending: Promise<Heard>, closed: Closed): void {
+    const said = this.spoken(turn, turn.heard, closed.names);
+    const act = this.rewake(said, closed);
+    // Words an earlier activity of the turn carried over lead it; ones still finalizing (`before`) too, once in.
+    const body = joinText(turn.carry, matchCommand(act.text)?.rest ?? '');
+    const facts = this.facts(
+      turn,
+      'send',
+      closed,
+      { interim: said, finals: 0, failed: false, finalizeMs: 0 },
+      'none',
+      body,
+    );
+    const since = (at: number) => Math.round(at - facts.speechEndAt);
+    Object.assign(facts, {
+      ...(turn.candidate ? { candidateMs: since(turn.candidate.seenAt) } : {}),
+      ...(this.quietAt !== undefined ? { quietMs: since(this.quietAt) } : {}),
+      commitMs: closed.activityEndMs,
+    });
+    const caption = (text: string, command: SpokenCommand) =>
+      this.deps.caption(turn.segment, text, true, captionMark(text, command));
+    if (act.scratched) {
+      caption(act.scratched, 'discard');
+      this.discarded(act.scratched);
+    }
+    if (!body && !turn.before) {
+      // A send word alone: nothing to send. A woken turn stays open for the words that may follow.
+      void ending.catch(() => undefined);
+      if (!act.scratched && said) caption(said, 'send');
+      this.nope(act.text, 'send', turn.segment);
+      this.deps.ended?.(facts, 'empty', 'command_only');
+      if (closed.wake && !this.closed && !this.reviewing) {
+        this.open('auto', closed.endedAt, true);
+        this.arm();
+      }
+      this.syncHold();
+      return;
+    }
+    const slot = this.deps.reserve(true);
+    // After a dropped prefix the sent words are a turn of their own, on a caption line of their own.
+    const segment = act.scratched ? ++this.segments : turn.segment;
+    this.deps.cue('sent', () => (facts.cueMs = Math.round(this.now() - facts.speechEndAt)));
+    if (closed.wake) {
+      this.waitingSince = closed.endedAt;
+      this.deps.changed();
+    }
+    this.syncHold();
+    let lead = '';
+    const done = (turn.before ?? Promise.resolve(''))
+      .then((before) => {
+        lead = before;
+        return Promise.race([ending, this.abandoned]);
+      })
+      .catch((err: unknown): Heard => {
+        this.deps.log.warn('voice-mode worker: a committed turn has no final; it goes with its words', { err });
+        return { interim: '', finals: 0, failed: true, finalizeMs: 0 };
+      })
+      .then((heard) => {
+        const chosen = turnText(heard);
+        const final = this.rewake(this.spoken(turn, chosen.text, closed.names), closed);
+        const end = commandEnd(final.text);
+        // The act chose to send: a final may change the words, never the action or what the turn covers.
+        const fallback =
+          !!final.scratched !== !!act.scratched
+            ? 'wake_split'
+            : end?.command === 'discard'
+              ? 'discard'
+              : !(end?.command === 'send' ? end.rest : final.text).trim()
+                ? 'empty'
+                : undefined;
+        const words = joinText(
+          lead,
+          fallback ? body : joinText(turn.carry, end?.command === 'send' ? end.rest : final.text),
+        );
+        Object.assign(facts, this.facts(turn, 'send', closed, heard, chosen.source, words), {
+          ...(fallback ? { fallback } : {}),
+        });
+        closed.take.facts = facts;
+        this.debug('committed', { seg: turn.segment, source: chosen.source, words, fallback, ...heard });
+        this.deps.caption(segment, words, true, { command: 'send', words });
+        if (words) slot.send(words, closed.take, true);
+        else slot.skip();
+      })
+      .catch((err: unknown) => {
+        this.deps.log.warn('voice-mode worker: a committed turn could not go out', { err });
+        if (joinText(lead, body)) slot.send(joinText(lead, body), closed.take, true);
+        else slot.skip();
+      })
+      .finally(() => this.committed.delete(done));
+    this.committed.add(done);
   }
 
   /** One `voice-mode.transcript-debug` line (VOICE_MODE_TRANSCRIPT_DEBUG), at the call's audio position. */
@@ -3008,7 +3331,7 @@ export class CallTurns {
     });
   }
 
-  /** The turn goes on after a command that was words: the text so far leads its next activity. */
+  /** The turn goes on after a discard phrase that was words: the text so far leads its next activity. */
   private goOn(said: string, endedAt: number): void {
     const next = this.turn;
     if (next?.kind === 'auto') {
@@ -3049,6 +3372,9 @@ export class CallTurns {
     if (this.wake) this.deps.changed();
   }
 }
+
+/** The text of an activity that heard nothing since it went on, with no final to wait for. */
+const silentHeard: Heard = { interim: '', finals: 0, failed: false, finalizeMs: 0 };
 
 /** What review mode needs of the call's turns (CallTurns) and the page. */
 export interface ReviewVoice {
@@ -3591,12 +3917,18 @@ export class Outbox {
   }
 }
 
+/** Silero's activationThreshold, which the call's VAD keeps: a window over it has speech in it. */
+const VAD_ACTIVATION = 0.5;
+/** Silero's window at 16 kHz: audio short of a whole one waits for the next frames before it is analyzed. */
+const VAD_WINDOW = 512;
+
 /** A VAD stream as CallerInput uses it: Silero's, or a test's. */
 export interface VadStream extends AsyncIterable<{
   type: VADEventType;
   samplesIndex: number;
   speechDuration: number;
   silenceDuration: number;
+  probability?: number;
 }> {
   pushFrame(frame: AudioFrame): void;
   close(): void;
@@ -3610,11 +3942,12 @@ export interface VadStream extends AsyncIterable<{
  */
 export class CallerInput {
   private position = 0;
-  private vad?: { stream: VadStream; from: number; speaking: boolean; closed: boolean };
+  /** `quietFrom`: where its last window with speech ended, or where it started: an earlier track's quiet does not count. */
+  private vad?: { stream: VadStream; from: number; speaking: boolean; closed: boolean; quietFrom: number };
 
   constructor(
     private readonly newVad: () => VadStream,
-    private readonly events: Pick<CallVoiceEvents, 'onAudio' | 'onSpeech' | 'onClosed'>,
+    private readonly events: Pick<CallVoiceEvents, 'onAudio' | 'onSpeech' | 'onVad' | 'onClosed'>,
     private readonly log: Pick<Console, 'error'>,
   ) {}
 
@@ -3644,12 +3977,23 @@ export class CallerInput {
   }
 
   private start() {
-    const vad = { stream: this.newVad(), from: this.position, speaking: false, closed: false };
+    const vad = {
+      stream: this.newVad(),
+      from: this.position,
+      speaking: false,
+      closed: false,
+      quietFrom: this.position,
+    };
     this.vad = vad;
     void (async () => {
       for await (const ev of vad.stream) {
         if (vad.closed) break;
-        if (ev.type === VADEventType.START_OF_SPEECH) {
+        if (ev.type === VADEventType.INFERENCE_DONE) {
+          // Each window's own result: speech too short to start a turn still breaks the quiet.
+          const at = vad.from + ev.samplesIndex;
+          if ((ev.probability ?? 0) > VAD_ACTIVATION) vad.quietFrom = at;
+          this.events.onVad?.(at, vad.quietFrom);
+        } else if (ev.type === VADEventType.START_OF_SPEECH) {
           vad.speaking = true;
           this.events.onSpeech(true, vad.from + ev.samplesIndex - samplesOf(ev.speechDuration));
         } else if (ev.type === VADEventType.END_OF_SPEECH) {
@@ -4010,8 +4354,8 @@ async function roomVoice(
         // A newer interim of the turn replaces one still waiting; its final keeps its place.
         final ? undefined : `caption ${segment}`,
       ),
-    async playCue(kind) {
-      await cueTrack?.feed.play(cueFrames(kind));
+    async playCue(kind, started) {
+      await cueTrack?.feed.play(cueFrames(kind), started);
     },
     setTyping(on) {
       typing = on;
@@ -4084,7 +4428,8 @@ export interface TurnEventFields {
   turn?: number;
   /** A review draft's number: the turn was taken in Manual. */
   draft?: number;
-  /** When the host answered the turn's POST (wall clock), and its status. */
+  /** When the turn's POST started and when the host answered it, storing it on a 202 (wall clock), and its status. */
+  postAt?: number;
   hostAt?: number;
   hostStatus?: number;
 }
@@ -4122,6 +4467,7 @@ export class CallTelemetry {
       ...(f.draft !== undefined ? { mode: 'manual' } : {}),
       outcome: f.outcome,
       ...(f.reason ? { reason: f.reason } : {}),
+      ...(f.postAt !== undefined && speechEndAt !== undefined ? { postMs: Math.round(f.postAt - speechEndAt) } : {}),
       ...(f.hostAt !== undefined && speechEndAt !== undefined ? { hostMs: Math.round(f.hostAt - speechEndAt) } : {}),
       ...(f.hostStatus !== undefined ? { hostStatus: f.hostStatus } : {}),
     };
@@ -4322,11 +4668,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let callerSpeaking = false;
   let cues: Promise<void> = Promise.resolve();
   /** Cues play one after another, none over the agent's speech and none once the call ends. */
-  const cue = (kind: CueKind) => {
+  const cue = (kind: CueKind, started?: () => void) => {
     cues = cues
       .then(async () => {
         if (ending || !cuesOn || agentSpeaking) return;
-        await callVoice?.playCue?.(kind);
+        await callVoice?.playCue?.(kind, started);
       })
       .catch((err: unknown) => callLog.warn('voice-mode worker: a cue did not play', { err, kind }));
   };
@@ -4424,18 +4770,32 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   /** Where the spotter's audio starts in the call's. */
   let spotterFrom = 0;
   let wakeWord: WakeWord | undefined;
-  /** `restart`: the worker is shutting down, so the caller's page says the service restarted. */
-  const end = async (reason: string, tellHost: boolean, restart = false) => {
-    if (ending) return;
+  /**
+   * `restart`: the worker is shutting down, so the caller's page says the service restarted. Every caller
+   * awaits the same end: the job's shutdown must not exit while a committed send still goes out.
+   */
+  let ended: Promise<void> | undefined;
+  const end = (reason: string, tellHost: boolean, restart = false): Promise<void> =>
+    (ended ??= endCall(reason, tellHost, restart));
+  const endCall = async (reason: string, tellHost: boolean, restart: boolean) => {
     ending = true;
     updateTyping();
     clearTimeout(readyTimer);
     clearTimeout(turnCueTimer);
     clearTimeout(replyHoldTimer);
+    // Closed first, so a turn waiting on an unconfirmed one goes now.
     turnTaking.close();
     review?.close();
     callTurns.close();
+    // A committed send still goes: its final gets the grace a final gets, then closing the transcription
+    // hands it the best text there is. It is answered before the host hears the call ended (it refuses
+    // turns after that). Every wait here is bounded: a job that never ends is worse than a lost turn.
+    const committing = callTurns.committing;
+    if (committing) await atMost(committing, FINAL_GRACE_MS);
     transcriber.close();
+    callTurns.abandonFinals();
+    if (committing) await atMost(committing, FINAL_GRACE_MS);
+    await atMost(turnTaking.sent(), WORKER_REQUEST_TIMEOUT_MS);
     if (wakeWord) {
       callLog.info('voice-mode worker: wake word use', {
         ...wakeWord.summary,
@@ -4511,14 +4871,52 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       callLog.warn('voice-mode worker: could not save a turn recording', { err, turn: index }),
     );
   };
-  /** A finished turn to the host: an auto turn, or a review draft (`draft`) the caller sent. */
-  const sendTurn = (text: string, take: TurnTake, draft?: number): number => {
+  /**
+   * A turn's number and its place in the order turns go to the host in, taken as it closes: an auto
+   * turn, or a review draft (`draft`) the caller sent. `sending`: a committed send, which the page
+   * hears goes out now.
+   */
+  const reserveTurn = (sending = false, draft?: number): TurnSlot & { turn: number } => {
     const turn = ++turns;
-    lastPosted = turn;
-    // The turn closed, before the host has answered: the page's mark, and the sent cue.
-    if (!ending) publish(draft === undefined ? { turn, status: 'sending' } : { turn, status: 'sending', text, draft });
-    cue('sent');
-    turnTaking.onTurn(text, (host) => {
+    const slot = turnTaking.reserve();
+    if (sending && !ending) publish({ turn, status: 'sending' });
+    return {
+      turn,
+      send: (text, take, cued) => {
+        lastPosted = Math.max(lastPosted, turn);
+        // The turn closed, before the host has answered: the page's mark, and the sent cue unless it played at the act.
+        if (!sending && !ending) {
+          publish(draft === undefined ? { turn, status: 'sending' } : { turn, status: 'sending', text, draft });
+        }
+        if (!cued) cue('sent');
+        slot.send(text, sent(turn, text, take, draft));
+      },
+      lost: (reason, fields, take) => {
+        slot.skip();
+        if (ending) return;
+        turnTaking.onTurnLost(reason, fields);
+        publish({ turn, status: 'lost', reason });
+        telemetry.turn({
+          facts: take.facts,
+          outcome: reason === 'stt' ? 'lost' : 'empty',
+          reason: reason === 'stt' ? 'stt' : 'no_words',
+          turn,
+        });
+        saveTurn(turn, take, '', { reason });
+      },
+      noise: (take) => {
+        slot.skip();
+        if (ending) return;
+        telemetry.turn({ facts: take.facts, outcome: 'empty', reason: 'noise', turn });
+        saveTurn(turn, take, '', { reason: 'noise' });
+      },
+      skip: () => slot.skip(),
+    };
+  };
+  /** What the host made of a turn: the page's mark, the wide event and the recording. */
+  const sent =
+    (turn: number, text: string, take: TurnTake, draft?: number): TurnSent =>
+    (host, postAt) => {
       if (host.accepted && host.id) turnsByHostId.set(host.id, turn);
       lastSettled = Math.max(lastSettled, turn);
       if (host.accepted) lastAccepted = Math.max(lastAccepted, turn);
@@ -4538,13 +4936,12 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         ...(host.accepted ? {} : { reason: `host_${hostLossReason(host)}` }),
         turn,
         ...(draft !== undefined ? { draft } : {}),
+        postAt,
         hostAt: Date.now(),
         ...(host.status !== undefined ? { hostStatus: host.status } : {}),
       });
       saveTurn(turn, take, text, { host });
-    });
-    return turn;
-  };
+    };
   const transcriber = (deps.transcriber ?? ((options) => new GeminiLiveTranscriber(options)))({
     apiKey: geminiKey,
     model: meta.sttModel,
@@ -4560,28 +4957,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const callTurns: CallTurns = new CallTurns(
     {
       transcriber,
-      send: (text, take) => {
-        if (!ending) sendTurn(text, take);
-      },
-      lost: (reason, fields, take) => {
-        if (ending) return;
-        const turn = ++turns;
-        turnTaking.onTurnLost(reason, fields);
-        publish({ turn, status: 'lost', reason });
-        telemetry.turn({
-          facts: take.facts,
-          outcome: reason === 'stt' ? 'lost' : 'empty',
-          reason: reason === 'stt' ? 'stt' : 'no_words',
-          turn,
-        });
-        saveTurn(turn, take, '', { reason });
-      },
-      noise: (take) => {
-        if (ending) return;
-        const turn = ++turns;
-        telemetry.turn({ facts: take.facts, outcome: 'empty', reason: 'noise', turn });
-        saveTurn(turn, take, '', { reason: 'noise' });
-      },
+      reserve: (sending) => reserveTurn(sending),
       ended: (facts, outcome, reason) => {
         if (!ending) telemetry.turn({ facts, outcome, reason });
       },
@@ -4663,6 +5039,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           const heard = callTurns.audio(pcm);
           callRecording?.push(heard);
         },
+        onVad: (at, quietFrom) => callTurns.onVad(at, quietFrom),
         onSpeech: (speaking, at) => {
           callerSpeaking = speaking;
           callTurns.onSpeech(speaking, at);
@@ -4759,7 +5136,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         dropRecording: () => callTurns.dropRecording(),
         publishReview: (state) => reviewSession.publishReview(state),
       },
-      post: (text, draft, take) => sendTurn(text, take, draft),
+      post: (text, draft, take) => {
+        const slot = reserveTurn(false, draft);
+        slot.send(text, take, false);
+        return slot.turn;
+      },
       lastPosted: () => lastPosted,
       setCaptureOpen: (open) => turnTaking.setCaptureOpen(open),
       resetCaller: () => turnTaking.resetCaller(),
@@ -4855,6 +5236,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         }
       } else if (event.type === 'chat') turnTaking.onChat(event.chat);
       else if (event.type === 'turn-stored') {
+        turnTaking.stored(event.turnKey, event.id);
         const late = unconfirmed.get(event.turnKey);
         if (!late) return;
         unconfirmed.delete(event.turnKey);

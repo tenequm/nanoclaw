@@ -22,6 +22,7 @@
  *  - `POST agent/utterance`  one transcribed caller turn, fed to the agent as
  *    an inbound message with the id `livekit:<callId>:<n>`; answered 202 only
  *    once the agent's session stored it, so the caller's "sent" mark is true;
+ *    after the caller's page hung up, still taken for HANGUP_GRACE_MS;
  *  - `POST agent/ended`      the worker's session is over.
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
@@ -89,6 +90,11 @@ const MAX_REMEMBERED_TURNS = 32;
 const MAX_TURN_KEY_LENGTH = 64;
 /** How long the room's end reason may hold up the hangup; past it the page shows a plain "ended". */
 const END_NOTICE_TIMEOUT_MS = 2_000;
+/**
+ * After the caller's page hangs up, the worker may still post a turn the caller already heard was
+ * sent (a spoken send whose final was still out): it is taken this long, or until the worker's `ended`.
+ */
+const HANGUP_GRACE_MS = 5_000;
 
 /** The transcription takes its language codes as a hint only, so a Ukrainian turn can come out in Russian spelling. */
 export const CALL_LANGUAGE_NOTE =
@@ -220,6 +226,8 @@ export interface LiveKitVoiceConfig {
   workerStreamTimeoutMs?: number;
   /** How long a turn may take to reach the agent's session before the worker hears it timed out. */
   routeTimeoutMs?: number;
+  /** HANGUP_GRACE_MS; a test seam. */
+  hangupGraceMs?: number;
   /** Test seam; defaults to the livekit-server-sdk clients. */
   api?: LiveKitServerApi;
 }
@@ -550,7 +558,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const mirrorApi = config.mirrorApi ?? defaultMirrorApi;
   const joinTimeoutMs = config.joinTimeoutMs ?? 60_000;
   const routeTimeoutMs = config.routeTimeoutMs ?? ROUTE_TIMEOUT_MS;
+  const hangupGraceMs = config.hangupGraceMs ?? HANGUP_GRACE_MS;
   const calls = new Map<string, LiveKitCall>();
+  /** Calls the caller's page hung up, by call id, while their worker may still post a turn (HANGUP_GRACE_MS). */
+  const hungUp = new Map<string, { call: LiveKitCall; timer: ReturnType<typeof setTimeout> }>();
   const cleanups = new Set<Promise<void>>();
   /** Per line, so transcripts land in the order they were spoken. */
   const mirrorChains = new Map<string, Promise<void>>();
@@ -565,6 +576,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
   const findCall = (callId: unknown): LiveKitCall | undefined =>
     typeof callId === 'string' ? [...calls.values()].find((c) => c.callId === callId) : undefined;
+
+  const endGrace = (callId: string): void => {
+    clearTimeout(hungUp.get(callId)?.timer);
+    hungUp.delete(callId);
+  };
+
+  /** A turn of `call` may still reach the agent: it is the line's live call, or its page hung up and the grace runs, with no newer call on the line. */
+  const takesTurns = (call: LiveKitCall): boolean =>
+    call.ended ? hungUp.has(call.callId) && !calls.has(call.platformId) : calls.get(call.platformId) === call;
 
   const push = (call: LiveKitCall, event: LiveKitHostEvent): void => {
     if (call.stream && !call.stream.writableEnded) {
@@ -813,15 +833,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
 
   const checkAccess = async (call: LiveKitCall): Promise<boolean> => {
-    if (call.ended) return false;
+    if (!takesTurns(call)) return false;
     try {
       const current = await host.resolveLine(call.platformId);
-      if (current && sameCallerAndAgent(call.line, current) && calls.get(call.platformId) === call && !call.ended)
-        return true;
+      if (current && sameCallerAndAgent(call.line, current) && takesTurns(call)) return true;
     } catch (err) {
       log.warn('livekit-voice-mode: call access check failed', { platformId: call.platformId, err });
     }
     endCall(call, 'caller access revoked or line changed', 'revoked');
+    endGrace(call.callId);
     return false;
   };
 
@@ -1086,7 +1106,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       if (!host.isRunning()) return { status: 503, body: 'The voice channel is shutting down' };
       const chat = await refreshChat(call, true);
       // The call can end or be replaced while the chat lookups run; its turn must not reach the agent then.
-      if (call.ended || calls.get(call.platformId) !== call) return { status: 409, body: 'The call has ended' };
+      if (!takesTurns(call)) return { status: 409, body: 'The call has ended' };
       if (!chat) {
         endCall(call, 'no chat to talk in');
         return { status: 409, body: 'The call has no chat to talk in' };
@@ -1174,6 +1194,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const body = await readJsonObject(req, MAX_AGENT_BODY_BYTES, {});
     if (!body) return reply(res, 400, 'Body must be a small JSON object');
     const call = findCall(body.callId);
+    const late = !call && typeof body.callId === 'string' ? hungUp.get(body.callId)?.call : undefined;
+    if (late && secret && sameSecret(secret, late.secret)) {
+      // The page hung up: the worker's turns still land within the grace; its `ended` closes it.
+      if (route === 'livekit/agent/utterance') return onUtterance(res, late, body);
+      if (route === 'livekit/agent/ended') {
+        endGrace(late.callId);
+        return reply(res, 204, '');
+      }
+    }
     // Unknown, ended and unauthenticated look alike to the caller of these routes.
     if (!call || call.ended || !secret || !sameSecret(secret, call.secret)) return reply(res, 409, 'No such call');
     if (route === 'livekit/agent/joined') return onJoined(res, call);
@@ -1240,6 +1269,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
                 ? 'the voice worker is on another protocol version'
                 : 'hangup';
           endCall(call, reason);
+          if (reason === 'hangup') {
+            const timer = setTimeout(() => hungUp.delete(call.callId), hangupGraceMs);
+            timer.unref();
+            hungUp.set(call.callId, { call, timer });
+          }
           await call.cleanup;
         }
         return reply(res, 204, '');
@@ -1298,6 +1332,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     async teardown() {
       engines.delete(engine);
       for (const call of [...calls.values()]) endCall(call, 'teardown', 'shutdown');
+      for (const callId of [...hungUp.keys()]) endGrace(callId);
       await Promise.all([...cleanups, ...mirrorChains.values()]);
     },
   };

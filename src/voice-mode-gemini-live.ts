@@ -184,6 +184,8 @@ const partText = (part: Part): string => words([...part.finals, part.interim].jo
 
 export class GeminiLiveTranscriber {
   private activity?: Activity;
+  /** Activities ended and not settled yet: close() settles them. */
+  private readonly ending = new Set<Activity>();
   /** A socket set up ahead of the next activity (review talk waits for it). */
   private prepared?: Promise<Socket | undefined>;
   private readonly sockets = new Set<Socket>();
@@ -254,12 +256,14 @@ export class GeminiLiveTranscriber {
     this.activity = undefined;
     activity.ending = true;
     activity.endedAt = this.now();
+    this.ending.add(activity);
     const heard = new Promise<Heard>((resolve) => (activity.resolve = resolve));
     if (activity.failed && !activity.socket) this.settle(activity);
     else this.pump(activity);
     return heard;
   }
 
+  /** Every activity, ended or not, settles now with what it has: its final if one came, else its interim text. */
   close(): void {
     this.closed = true;
     const activity = this.activity;
@@ -268,6 +272,7 @@ export class GeminiLiveTranscriber {
       activity.ending = true;
       this.settle(activity);
     }
+    for (const ending of [...this.ending]) this.settle(ending);
     for (const socket of [...this.sockets]) this.retire(socket);
     this.prepared = undefined;
   }
@@ -506,6 +511,7 @@ export class GeminiLiveTranscriber {
   }
 
   private settle(activity: Activity): void {
+    this.ending.delete(activity);
     clearTimeout(activity.timer);
     clearTimeout(activity.graceTimer);
     clearTimeout(activity.drainTimer);

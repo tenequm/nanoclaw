@@ -1082,8 +1082,73 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.deleted).toEqual([h.lk.rooms[0]]);
     await worker.streamClosed;
     expect(worker.events.at(-1)).toEqual({ type: 'end', reason: 'hangup' });
-    // The worker's routes are closed for this call now.
-    expect((await worker.post('utterance', { text: 'late' })).status).toBe(409);
+    // The worker's routes are closed for this call now, but for a turn it still posts (the grace below).
+    expect((await worker.post('joined')).status).toBe(409);
+    const events = await fetch(`${h.hostUrl}/webhook/voice-mode/livekit/agent/events?call=${call.callId}`, {
+      headers: workerAuth(call.callId),
+    });
+    expect(events.status).toBe(404);
+  });
+
+  it("takes the worker's turn for a while after the page hung up: the caller heard it sent; a retry is answered from its key", async () => {
+    const { call, worker } = await startCall(h);
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: call.callId })).status).toBe(204);
+    await worker.streamClosed;
+    const res = await worker.post('utterance', { text: 'Book a table.', turnKey: 'k1' });
+    expect(res.status).toBe(202);
+    expect(h.inbound).toHaveLength(1);
+    expect((await worker.post('utterance', { text: 'Book a table.', turnKey: 'k1' })).status).toBe(202);
+    expect(h.inbound).toHaveLength(1);
+    // Only the call's own worker: another secret is no one.
+    expect(
+      (
+        await post(
+          `${h.hostUrl}/webhook/voice-mode/livekit/agent/utterance`,
+          { callId: call.callId, text: 'x' },
+          { Authorization: 'Bearer nope' },
+        )
+      ).status,
+    ).toBe(409);
+    // The worker's own end closes the grace.
+    expect((await worker.post('ended', { reason: 'caller left' })).status).toBe(204);
+    expect((await worker.post('utterance', { text: 'And a taxi.' })).status).toBe(409);
+    expect(h.inbound).toHaveLength(1);
+  });
+
+  it('refuses a turn once the grace after a hang-up ran out, or for any other end', async () => {
+    await h.stop();
+    h = await startHarness({ accessCheckIntervalMs: 50 }, { hangupGraceMs: 100 });
+    const hungUp = await startCall(h);
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: hungUp.call.callId })).status).toBe(204);
+    await new Promise((r) => setTimeout(r, 150));
+    expect((await hungUp.worker.post('utterance', { text: 'late' })).status).toBe(409);
+    // A page that gave up on the worker is no hang-up.
+    const gaveUp = await startCall(h);
+    await post(`${h.base}/livekit/end?t=tok123`, { callId: gaveUp.call.callId, reason: 'no-agent' });
+    expect((await gaveUp.worker.post('utterance', { text: 'late' })).status).toBe(409);
+    // The worker's own end.
+    const workerEnded = await startCall(h);
+    expect((await workerEnded.worker.post('ended', { reason: 'session closed' })).status).toBe(204);
+    expect((await workerEnded.worker.post('utterance', { text: 'late' })).status).toBe(409);
+    expect(h.inbound).toHaveLength(0);
+  });
+
+  it('refuses a turn in the grace once the caller lost the line, or a newer call took it', async () => {
+    const revoked = await startCall(h);
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: revoked.call.callId })).status).toBe(204);
+    h.access.enabled = false;
+    expect((await revoked.worker.post('utterance', { text: 'late' })).status).toBe(403);
+    h.access.enabled = true;
+    expect((await revoked.worker.post('utterance', { text: 'late' })).status).toBe(409);
+    const older = await startCall(h);
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: older.call.callId })).status).toBe(204);
+    const newer = await startCall(h);
+    expect((await older.worker.post('utterance', { text: 'late' })).status).toBe(403);
+    expect(h.inbound).toHaveLength(0);
+    // The newer call's own turns are its own.
+    await newer.worker.utter('fresh');
+    expect(h.inbound).toHaveLength(1);
+    newer.worker.close();
   });
 
   it('puts why the call ended on its room before the worker hears of it, answers it or the room goes', async () => {
