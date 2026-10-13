@@ -12,7 +12,7 @@ binding handles them at the adapter.
 | `/model` | Admin only | Bare `/model` opens a model picker (active model checkmarked). `/model <alias-or-id>` switches directly. |
 | `/config` | Admin only | Bare `/config` opens the config menu (Model / Effort / Compact window / Activation / Restart). `/config set <field> <value>` writes one field. |
 | `/restart` | Admin only | Restarts the agent's running container(s) immediately. |
-| `/voice`, `/voice new` | Core owner or admin over the agent | Creates a private hashed call link, or moves the caller's existing line to this chat/topic. `new` replaces the link and ends calls using the old one. See the [voice mode skill](../.claude/skills/add-voice-mode/SKILL.md) and [upgrade runbook](2610-07-voice-mode-upgrade.md). |
+| `/voice`, `/voice new` | Core owner or admin over the agent | Shows the sender their call link (creating the agent's line on first use) and makes this chat/topic where its calls talk. A line is shown and moved only by its caller. `new` replaces the sender's own link and ends calls using the old one. See the [voice mode skill](../.claude/skills/add-voice-mode/SKILL.md) and [upgrade runbook](2610-07-voice-mode-upgrade.md). |
 
 ## Slack: the `!` prefix
 
@@ -64,14 +64,16 @@ For `/status`, the member gate uses `canAccessAgentGroup`. Unknown senders (no
 `users` row) are dropped silently, mirroring how the router treats their normal
 messages; known non-members get an explicit refusal. The installed voice-mode
 adapter checks core owner/admin roles on `/voice`, and rechecks access before
-every call turn. Only the current caller can move a line with plain `/voice`;
-another authorized admin must deliberately use `/voice new` to replace it.
-New tokens are stored only as hashes and returned once. A group invocation
-first resolves a private DM before minting, so a failed DM leaves the old line
-untouched. Replies bypass the agent session and disable previews/unfurls.
-Existing env-backed main lines keep their original owner-account checks and
-saved links until an explicit replacement; plain `/voice` only moves their
-chat binding. See the [upgrade runbook](2610-07-voice-mode-upgrade.md).
+every call turn. A line's link carries its caller's identity, so only the
+caller is shown it or moves the line; another admin is told whose line it is,
+and `/voice new` re-mints only the sender's own line. Tokens are stored as a
+hash (what a call is looked up by) and sealed under `NANOCLAW_ENCRYPTION_KEY`
+(what lets `/voice` show a link again); without the key `/voice` mints and
+shows nothing, while calls keep working. A link minted before sealing is sealed
+the next time a call opens it. In a group the reply goes only to the sender: on
+Telegram as an ephemeral message (checked to have come back ephemeral; one that
+did not is deleted and its link replaced), else in a DM, else without the link.
+Replies bypass the agent session and disable previews/unfurls.
 
 The pressing user is authoritative on a menu tap: the handler re-checks the
 tapper's privilege, NOT the original requester's. Someone who opened a picker
@@ -237,7 +239,9 @@ Grants are per chat, never per topic (Telegram command scopes cannot target a
 forum topic), so multiple topics that share one chat id are folded together and
 their wired-agent admin sets are unioned. `/voice` is added to a chat's grants
 when the voice-mode adapter is installed, so an authorized caller can create
-a first line. Without it, the legacy fallback requires an existing voice line.
+a first line. It is registered as an ephemeral command (`is_ephemeral`), so the
+command itself is visible only to its sender and its reply may answer it
+privately.
 
 ### Startup scope janitor
 
@@ -281,10 +285,9 @@ sorted order.
   (`/model`, `/config`, `/restart`) refuse politely with a hint to run the
   command in the agent's own topic or use `ncl` from the host.
 - **`/voice`** (both paths) acts like `/status`: for every agent of the chat
-  that the sender administers, it creates or moves the caller's line to this
-  chat/topic. New links are delivered privately; existing hashed links cannot
-  be recovered from storage. `/voice new` deliberately replaces those links.
-  Legacy env-backed lines keep their saved links on a plain invocation.
+  that the sender administers, it shows the sender's link and moves their line
+  to this chat/topic, or creates the line when the agent has none. Links are
+  delivered privately. `/voice new` replaces the sender's own links.
 
 ## Troubleshooting
 

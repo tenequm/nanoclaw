@@ -10,7 +10,6 @@ import { getRegisteredMigrations } from '../db/migrations/index.js';
 import {
   bindVoiceModeLineChat,
   createVoiceModeLine,
-  fillVoiceModeLineTts,
   getVoiceModeLine,
   mintVoiceModeLine,
   setVoiceModeLineTts,
@@ -109,56 +108,6 @@ describe('voice line access (real central DB)', () => {
     expect(await nulls()).toHaveLength(3);
   });
 
-  it('fills in what an older host wrote after a rollback, keeping every saved field and the re-mint', async () => {
-    const lineId = lineIdOf(await mint(ADMIN))!;
-    await setVoiceModeLineTts(
-      lineId,
-      { provider: 'elevenlabs', model: 'eleven_v4', voice: 'S80713fa2M70CssGEBj5' },
-      await current(lineId),
-    );
-    // The older host's writes: a pick that left the model out, a reset, and a line created without a voice.
-    await getDb().run('UPDATE voice_mode_lines SET tts_model = NULL WHERE line_id = ?', lineId);
-    await mintVoiceModeLine({ agentGroupId: 'ag-2', ownerUserId: ADMIN, messagingGroupId: 'mg-1', threadId: null });
-    await getDb().run(
-      "UPDATE voice_mode_lines SET tts_provider = NULL, tts_model = NULL, tts_voice = NULL WHERE agent_group_id = 'ag-2'",
-    );
-    await getDb().run(
-      `INSERT INTO voice_mode_lines (line_id, agent_group_id, token_hash, owner_user_id, created_at, updated_at)
-         VALUES ('old000000000', 'ag-3', ?, ?, ?, ?)`,
-      'a'.repeat(64),
-      ADMIN,
-      stamp(),
-      stamp(),
-    );
-    // A provider the registry lacks is left as it is, and never counted as filled.
-    await getDb().run(
-      `INSERT INTO voice_mode_lines (line_id, agent_group_id, token_hash, owner_user_id, tts_provider, created_at, updated_at)
-         VALUES ('old000000001', 'ag-4', ?, ?, 'openai', ?, ?)`,
-      'b'.repeat(64),
-      ADMIN,
-      stamp(),
-      stamp(),
-    );
-    expect(await fillVoiceModeLineTts()).toBe(3);
-    expect(await fillVoiceModeLineTts()).toBe(0);
-    await mint(ADMIN);
-    expect(
-      await getDb().all(
-        'SELECT agent_group_id, tts_provider, tts_model, tts_voice FROM voice_mode_lines ORDER BY agent_group_id',
-      ),
-    ).toEqual([
-      {
-        agent_group_id: 'ag-1',
-        tts_provider: 'elevenlabs',
-        tts_model: 'eleven_v4_turbo',
-        tts_voice: 'S80713fa2M70CssGEBj5',
-      },
-      { agent_group_id: 'ag-2', tts_provider: 'gemini', tts_model: 'gemini-3.8-flash-tts', tts_voice: 'alnilam' },
-      { agent_group_id: 'ag-3', tts_provider: 'gemini', tts_model: 'gemini-3.8-flash-tts', tts_voice: 'alnilam' },
-      { agent_group_id: 'ag-4', tts_provider: 'openai', tts_model: null, tts_voice: null },
-    ]);
-  });
-
   it('backfills every missing field with what the line spoke with', async () => {
     const backfill = getRegisteredMigrations().find((m) => m.name === 'module:voice-mode:lines-tts-concrete')!;
     for (const id of ['ag-2', 'ag-3', 'ag-4']) {
@@ -206,6 +155,7 @@ describe('voice line access (real central DB)', () => {
     const line = await mint(ADMIN);
     await revokeRole(ADMIN, 'admin', 'ag-1');
     expect(await resolveVoiceModeLine(line)).toBeNull();
+    await getDb().run('DELETE FROM voice_mode_lines');
     expect(await resolveVoiceModeLine(await mint(MEMBER))).toBeNull();
     expect(await resolveVoiceModeLine('voice-mode:000000000000')).toBeNull();
     expect(await resolveVoiceModeLine('telegram:7')).toBeNull();
@@ -231,11 +181,19 @@ describe('voice line access (real central DB)', () => {
     expect(sameCallerAndAgent(before, (await resolveVoiceModeLine(line))!)).toBe(true);
   });
 
-  it('names the caller by id when the user has no display name, and ends a call when someone else re-mints', async () => {
+  it('never lets another user re-mint a line, even an owner', async () => {
+    const line = await mint(ADMIN);
+    const before = await current(lineIdOf(line)!);
+    await grantRole({ user_id: MEMBER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: stamp() });
+    await expect(mint(MEMBER)).rejects.toThrow('the line was not stored');
+    expect(await current(lineIdOf(line)!)).toEqual(before);
+  });
+
+  it('names the caller by id when the user has no display name, and ends a call when its caller changes', async () => {
     const line = await mint(ADMIN);
     const before = (await resolveVoiceModeLine(line))!;
     await grantRole({ user_id: MEMBER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: stamp() });
-    expect(await mint(MEMBER)).toBe(line);
+    await getDb().run('UPDATE voice_mode_lines SET owner_user_id = ?', MEMBER);
     const after = (await resolveVoiceModeLine(line))!;
     expect(after.caller).toEqual({ id: MEMBER, name: MEMBER });
     expect(sameCallerAndAgent(before, after)).toBe(false);

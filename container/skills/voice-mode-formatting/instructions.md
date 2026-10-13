@@ -8,9 +8,8 @@ reply is read aloud; the note under each turn says how to write it.
   use another wired destination.
 - **No question cards or attachments** on this channel: ask one plain
   question at a time; send files through another destination.
-- **Reading material** (code, links, long lists): on a voice-line call, send it
-  as a separate written message and say so; on a chat call every message is
-  read aloud, so offer it for after the call.
+- **Reading material** (code, links, long lists): every message you send to
+  the call's chat is read aloud, so offer it for after the call.
 - **Misheard names:** add the correct spelling of a name the transcript got
   wrong (yours, a person's, a place's) to `/workspace/agent/voice.vocabulary.txt`,
   one per line. Used from the next call; at most 60 terms and 1 KB including the

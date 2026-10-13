@@ -28,7 +28,6 @@ import type {
   RestartView,
   StatusView,
   TargetAgent,
-  VoiceCommandOutcome,
 } from './types.js';
 import { MODEL_ALIASES } from './types.js';
 
@@ -224,39 +223,7 @@ export function failureMessage(failure: CommandFailure): string {
       }
       return `❌ Invalid ${field} value "${value}".${hint}`;
     }
-    case 'voice-unavailable':
-      return 'Voice calls are off on this host (the voice channel is not configured).';
     default:
       return 'That did not work.';
   }
-}
-
-/**
- * The /voice reply, or null when the sender gets no answer. The links are the
- * line's call credentials: this text goes to the chat /voice was run in only.
- */
-export function voiceCommandReply(outcome: VoiceCommandOutcome, fmt: CardFmt): string | null {
-  if (outcome.kind === 'drop') return null;
-  if (outcome.kind === 'refused') return failureMessage({ ok: false, reason: 'unauthorized' });
-  const blocks: string[] = [];
-  for (const { result } of outcome.results) {
-    if (!result.ok) continue;
-    const { agentName, links } = result.view;
-    for (const link of links) blocks.push(`🎙 Voice call with ${fmt.bold(agentName)}: ${link}`);
-  }
-  if (blocks.length > 0) {
-    blocks.push('Voice calls now talk in this chat, until /voice is run in another one.');
-    return blocks.join('\n\n');
-  }
-  // Nothing linked: say why, once per distinct reason.
-  const reasons = new Set(
-    outcome.results.map(({ agentName, result }) =>
-      result.ok
-        ? ''
-        : outcome.results.length > 1
-          ? `${fmt.bold(agentName)}: ${failureMessage(result)}`
-          : failureMessage(result),
-    ),
-  );
-  return [...reasons].filter(Boolean).join('\n');
 }

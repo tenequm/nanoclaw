@@ -9,6 +9,7 @@ import { createVoiceCatalog, ELEVENLABS_VOICES_URL } from './voice-mode-tts-cata
 
 const GEMINI_VOICES_URL = 'https://generativelanguage.googleapis.com/v1beta/voices';
 const quiet = { info: vi.fn(), warn: vi.fn() };
+const KEYS = { gemini: 'key', elevenlabs: 'key' };
 
 function fakeUpstream(respond: (url: URL) => Response | Promise<Response>) {
   const calls: Array<{ url: URL; headers: Headers }> = [];
@@ -45,9 +46,9 @@ describe('voice catalog', () => {
             },
       ),
     );
-    const catalog = createVoiceCatalog({ fetch: fetchFn });
+    const catalog = createVoiceCatalog({ keys: { gemini: 'gemini-key' }, fetch: fetchFn });
     const query = { limit: 2, q: 'warm', language: 'en-US', gender: 'female' };
-    expect(await catalog.page('gemini', 'gemini-key', query)).toEqual({
+    expect(await catalog.page('gemini', query)).toEqual({
       page: {
         provider: 'gemini',
         voices: [
@@ -57,7 +58,7 @@ describe('voice catalog', () => {
         next: 'p2',
       },
     });
-    expect(await catalog.page('gemini', 'gemini-key', { ...query, cursor: 'p2' })).toEqual({
+    expect(await catalog.page('gemini', { ...query, cursor: 'p2' })).toEqual({
       page: { provider: 'gemini', voices: [{ id: 'c', name: 'Gamma', language: 'en-US', gender: 'female' }] },
     });
     expect(calls[0].url.origin + calls[0].url.pathname).toBe(GEMINI_VOICES_URL);
@@ -73,7 +74,7 @@ describe('voice catalog', () => {
     vi.stubEnv('GOOGLE_GEMINI_BASE_URL', 'https://elsewhere.invalid');
     const { urls, fetchFn } = fakeUpstream(() => Response.json({}));
     try {
-      expect(await createVoiceCatalog({ fetch: fetchFn }).page('gemini', 'key', { limit: 5 })).toEqual({
+      expect(await createVoiceCatalog({ keys: KEYS, fetch: fetchFn }).page('gemini', { limit: 5 })).toEqual({
         page: { provider: 'gemini', voices: [] },
       });
     } finally {
@@ -87,9 +88,9 @@ describe('voice catalog', () => {
     const invalid = () =>
       Response.json({ error: { code: 400, message: 'bad token', status: 'INVALID_ARGUMENT' } }, { status: 400 });
     const refused = fakeUpstream(invalid);
-    const catalog = createVoiceCatalog({ fetch: refused.fetchFn });
-    expect(await catalog.page('gemini', 'key', { limit: 1, cursor: 'nope' })).toEqual({ error: 'bad_request' });
-    expect(await catalog.page('gemini', 'key', { limit: 1 })).toEqual({ error: 'upstream' });
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: refused.fetchFn });
+    expect(await catalog.page('gemini', { limit: 1, cursor: 'nope' })).toEqual({ error: 'bad_request' });
+    expect(await catalog.page('gemini', { limit: 1 })).toEqual({ error: 'upstream' });
     const replies = [
       () => new Response('denied', { status: 403 }),
       () =>
@@ -104,7 +105,7 @@ describe('voice catalog', () => {
     for (const reply of replies) {
       const upstream = fakeUpstream(reply);
       expect(
-        await createVoiceCatalog({ fetch: upstream.fetchFn }).page('gemini', 'key', { limit: 1, cursor: 'p2' }),
+        await createVoiceCatalog({ keys: KEYS, fetch: upstream.fetchFn }).page('gemini', { limit: 1, cursor: 'p2' }),
       ).toEqual({ error: 'upstream' });
       expect(upstream.calls).toHaveLength(1);
     }
@@ -118,8 +119,8 @@ describe('voice catalog', () => {
         next_page_token: 'page-2',
       }),
     );
-    const catalog = createVoiceCatalog({ fetch: fetchFn });
-    expect(await catalog.page('elevenlabs', 'key', { limit: 5 })).toEqual({
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn });
+    expect(await catalog.page('elevenlabs', { limit: 5 })).toEqual({
       page: {
         provider: 'elevenlabs',
         voices: [{ id: 'abcdefghij1234567890', name: 'Rachel', description: 'Calm.' }],
@@ -128,7 +129,7 @@ describe('voice catalog', () => {
     });
     expect(urls()[0].origin + urls()[0].pathname).toBe(ELEVENLABS_VOICES_URL);
     expect(Object.fromEntries(urls()[0].searchParams)).toEqual({ page_size: '5', include_total_count: 'false' });
-    await catalog.page('elevenlabs', 'key', { limit: 5, gender: 'male', cursor: 'page-2' });
+    await catalog.page('elevenlabs', { limit: 5, gender: 'male', cursor: 'page-2' });
     expect(Object.fromEntries(urls()[1].searchParams)).toEqual({
       page_size: '5',
       gender: 'male',
@@ -140,7 +141,7 @@ describe('voice catalog', () => {
   it('answers upstream for a failed or malformed ElevenLabs page', async () => {
     for (const reply of [() => new Response('denied', { status: 401 }), () => Response.json({ error: 'shape' })]) {
       const { fetchFn } = fakeUpstream(reply);
-      expect(await createVoiceCatalog({ fetch: fetchFn }).page('elevenlabs', 'key', { limit: 1 })).toEqual({
+      expect(await createVoiceCatalog({ keys: KEYS, fetch: fetchFn }).page('elevenlabs', { limit: 1 })).toEqual({
         error: 'upstream',
       });
     }
@@ -170,17 +171,17 @@ describe('voice names', () => {
 
   it("names a voice from Gemini's whole listing by its exact id, and knows a voice it does not have", async () => {
     const { urls, fetchFn } = gemini();
-    const catalog = createVoiceCatalog({ fetch: fetchFn });
-    catalog.warm({ gemini: 'key' });
-    expect(await catalog.lookup('gemini', 'key', 'alnilam')).toEqual({
+    const catalog = createVoiceCatalog({ keys: { gemini: 'key' }, fetch: fetchFn });
+    catalog.warm();
+    expect(await catalog.lookup('gemini', 'alnilam')).toEqual({
       status: 'resolved',
       voice: { id: 'alnilam', name: 'Alnilam', language: 'en-US', gender: 'male' },
     });
-    expect(await catalog.lookup('gemini', 'key', 'Alnilam')).toEqual({ status: 'unavailable' });
-    expect(await catalog.lookup('gemini', 'key', 'kore')).toEqual({ status: 'unavailable' });
-    expect(await catalog.lookup('gemini', 'key', 'not a voice')).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('gemini', 'Alnilam')).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('gemini', 'kore')).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('gemini', 'not a voice')).toEqual({ status: 'unavailable' });
     expect(
-      await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'en-us-techagent-4' }, 'key'),
+      await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'en-us-techagent-4' }),
     ).toEqual({
       provider: 'gemini',
       providerName: 'Gemini',
@@ -203,8 +204,10 @@ describe('voice names', () => {
     let t = 0;
     const state = { down: true };
     const { calls, fetchFn } = gemini(state);
-    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
-    expect(await catalog.lookup('gemini', undefined, 'alnilam')).toEqual({ status: 'lookup_failed' });
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, now: () => t, log: quiet });
+    expect(await createVoiceCatalog({ keys: {}, fetch: fetchFn }).lookup('gemini', 'alnilam')).toEqual({
+      status: 'lookup_failed',
+    });
     expect(calls).toHaveLength(0);
     const failed = {
       provider: 'gemini',
@@ -218,32 +221,30 @@ describe('voice names', () => {
       preview: null,
       status: 'lookup_failed',
     };
-    expect(await catalog.details({ provider: 'gemini', model: 'gemini-9-tts', voice: 'alnilam' }, 'key')).toEqual(
-      failed,
-    );
+    expect(await catalog.details({ provider: 'gemini', model: 'gemini-9-tts', voice: 'alnilam' })).toEqual(failed);
     state.down = false;
     t = 29_000;
-    expect(await catalog.lookup('gemini', 'key', 'alnilam')).toEqual({ status: 'lookup_failed' });
+    expect(await catalog.lookup('gemini', 'alnilam')).toEqual({ status: 'lookup_failed' });
     expect(calls).toHaveLength(1);
     t = 30_000;
-    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+    expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('resolved');
   });
 
   it('keeps answering from the old listing while one refresh runs, then from the new one', async () => {
     let t = 0;
     const state: { voices?: unknown[] } = {};
     const { calls, fetchFn } = gemini(state);
-    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t });
-    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, now: () => t });
+    expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('resolved');
     state.voices = [tech, { ...alnilam, id: 'kore', display_name: 'Kore' }];
     t = 3_600_000;
     const [during, again] = await Promise.all([
-      catalog.lookup('gemini', 'key', 'alnilam'),
-      catalog.lookup('gemini', 'key', 'alnilam'),
+      catalog.lookup('gemini', 'alnilam'),
+      catalog.lookup('gemini', 'alnilam'),
     ]);
     expect([during.status, again.status]).toEqual(['resolved', 'resolved']);
-    await vi.waitFor(async () => expect((await catalog.lookup('gemini', 'key', 'kore')).status).toBe('resolved'));
-    expect(await catalog.lookup('gemini', 'key', 'alnilam')).toEqual({ status: 'unavailable' });
+    await vi.waitFor(async () => expect((await catalog.lookup('gemini', 'kore')).status).toBe('resolved'));
+    expect(await catalog.lookup('gemini', 'alnilam')).toEqual({ status: 'unavailable' });
     expect(calls).toHaveLength(4);
   });
 
@@ -260,8 +261,8 @@ describe('voice names', () => {
             { status: 400 },
           );
     });
-    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
-    expect(await catalog.lookup('elevenlabs', 'key', 'bIHbv24MWmeRgasZH58o')).toEqual({
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, now: () => t, log: quiet });
+    expect(await catalog.lookup('elevenlabs', 'bIHbv24MWmeRgasZH58o')).toEqual({
       status: 'resolved',
       voice: {
         id: 'bIHbv24MWmeRgasZH58o',
@@ -271,28 +272,28 @@ describe('voice names', () => {
         preview: 'https://example.invalid/w.mp3',
       },
     });
-    expect(await catalog.lookup('elevenlabs', 'key', 'S80713fa2M70CssGEBj5')).toEqual({ status: 'lookup_failed' });
+    expect(await catalog.lookup('elevenlabs', 'S80713fa2M70CssGEBj5')).toEqual({ status: 'lookup_failed' });
     byIdFails = false;
-    expect(await catalog.lookup('elevenlabs', 'key', 'S80713fa2M70CssGEBj5')).toEqual({ status: 'lookup_failed' });
+    expect(await catalog.lookup('elevenlabs', 'S80713fa2M70CssGEBj5')).toEqual({ status: 'lookup_failed' });
     t = 15_000;
     for (let i = 0; i < 2; i++) {
-      expect(await catalog.lookup('elevenlabs', 'key', 'S80713fa2M70CssGEBj5')).toEqual({
+      expect(await catalog.lookup('elevenlabs', 'S80713fa2M70CssGEBj5')).toEqual({
         status: 'resolved',
         voice: { id: 'S80713fa2M70CssGEBj5', name: 'Maks', gender: 'male' },
       });
-      expect(await catalog.lookup('elevenlabs', 'key', 'ZZZZZZZZZZZZZZZZZZZZ')).toEqual({ status: 'unavailable' });
+      expect(await catalog.lookup('elevenlabs', 'ZZZZZZZZZZZZZZZZZZZZ')).toEqual({ status: 'unavailable' });
     }
     // ElevenLabs ids are exact; a save asks again rather than trust a kept answer.
-    expect(await catalog.lookup('elevenlabs', 'key', 'BIHBV24MWMERGASZH58O')).toEqual({ status: 'unavailable' });
-    expect(await catalog.lookup('elevenlabs', 'key', 'ZZZZZZZZZZZZZZZZZZZZ', { confirm: true })).toEqual({
+    expect(await catalog.lookup('elevenlabs', 'BIHBV24MWMERGASZH58O')).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('elevenlabs', 'ZZZZZZZZZZZZZZZZZZZZ', { confirm: true })).toEqual({
       status: 'unavailable',
     });
-    expect(catalog.known('elevenlabs', 'key', 'ZZZZZZZZZZZZZZZZZZZZ')).toBe('unavailable');
+    expect(catalog.known('elevenlabs', 'ZZZZZZZZZZZZZZZZZZZZ')).toBe('unavailable');
     // A miss is kept ten minutes, a voice found for the hour.
     t = 15_000 + 600_000;
-    expect(catalog.known('elevenlabs', 'key', 'ZZZZZZZZZZZZZZZZZZZZ')).toBeUndefined();
-    expect(catalog.known('elevenlabs', 'key', 'S80713fa2M70CssGEBj5')).toBe('resolved');
-    expect(await catalog.lookup('elevenlabs', 'key', 'ZZZZZZZZZZZZZZZZZZZZ')).toEqual({ status: 'unavailable' });
+    expect(catalog.known('elevenlabs', 'ZZZZZZZZZZZZZZZZZZZZ')).toBeUndefined();
+    expect(catalog.known('elevenlabs', 'S80713fa2M70CssGEBj5')).toBe('resolved');
+    expect(await catalog.lookup('elevenlabs', 'ZZZZZZZZZZZZZZZZZZZZ')).toEqual({ status: 'unavailable' });
     expect(urls().map((u) => u.pathname)).toEqual([
       '/v2/voices',
       '/v1/voices/S80713fa2M70CssGEBj5',
@@ -317,8 +318,8 @@ describe('voice names', () => {
       const { fetchFn } = fakeUpstream((url) =>
         url.pathname === '/v2/voices' ? Response.json({ voices: [], has_more: false }) : reply(),
       );
-      const catalog = createVoiceCatalog({ fetch: fetchFn, log: quiet });
-      expect(await catalog.lookup('elevenlabs', 'key', 'S80713fa2M70CssGEBj5', { confirm: true })).toEqual({ status });
+      const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, log: quiet });
+      expect(await catalog.lookup('elevenlabs', 'S80713fa2M70CssGEBj5', { confirm: true })).toEqual({ status });
     }
   });
 
@@ -326,34 +327,34 @@ describe('voice names', () => {
     let t = 0;
     const state: { voices?: unknown[]; down?: boolean } = {};
     const { calls, fetchFn } = gemini(state);
-    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
-    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, now: () => t, log: quiet });
+    expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('resolved');
     expect(calls).toHaveLength(2);
     // Plain lookups trust the listing, and so does a save that asked no later than its load started.
-    expect(await catalog.lookup('gemini', 'key', 'voice_new')).toEqual({ status: 'unavailable' });
-    expect(await catalog.lookup('gemini', 'key', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('gemini', 'voice_new')).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('gemini', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
     expect(calls).toHaveLength(2);
     state.voices = [alnilam, { id: 'voice_new', display_name: 'New' }];
     t = 10_000;
     const saves = await Promise.all([
-      catalog.lookup('gemini', 'key', 'voice_new', { confirm: true }),
-      catalog.lookup('gemini', 'key', 'voice_new', { confirm: true }),
+      catalog.lookup('gemini', 'voice_new', { confirm: true }),
+      catalog.lookup('gemini', 'voice_new', { confirm: true }),
     ]);
     expect(saves.map((r) => r.status)).toEqual(['resolved', 'resolved']);
     expect(calls).toHaveLength(4);
     t = 20_000;
-    expect(await catalog.lookup('gemini', 'key', 'voice_gone', { confirm: true })).toEqual({ status: 'unavailable' });
+    expect(await catalog.lookup('gemini', 'voice_gone', { confirm: true })).toEqual({ status: 'unavailable' });
     expect(calls).toHaveLength(6);
     // A listing that cannot load again proves nothing: the save goes through, and the next waits out the pause.
     state.down = true;
     t = 30_000;
-    expect(await catalog.lookup('gemini', 'key', 'voice_gone', { confirm: true })).toEqual({ status: 'lookup_failed' });
-    expect(await catalog.lookup('gemini', 'key', 'voice_gone', { confirm: true })).toEqual({ status: 'lookup_failed' });
+    expect(await catalog.lookup('gemini', 'voice_gone', { confirm: true })).toEqual({ status: 'lookup_failed' });
+    expect(await catalog.lookup('gemini', 'voice_gone', { confirm: true })).toEqual({ status: 'lookup_failed' });
     expect(calls).toHaveLength(7);
     // What the last whole listing had still resolves; what it lacked is no longer certain.
-    expect((await catalog.lookup('gemini', 'key', 'voice_new')).status).toBe('resolved');
-    expect(await catalog.lookup('gemini', 'key', 'voice_gone')).toEqual({ status: 'lookup_failed' });
-    expect(catalog.known('gemini', 'key', 'voice_gone')).toBeUndefined();
+    expect((await catalog.lookup('gemini', 'voice_new')).status).toBe('resolved');
+    expect(await catalog.lookup('gemini', 'voice_gone')).toEqual({ status: 'lookup_failed' });
+    expect(catalog.known('gemini', 'voice_gone')).toBeUndefined();
   });
 
   it('takes no listing cut short by a failed page or a repeated page token', async () => {
@@ -370,36 +371,29 @@ describe('voice names', () => {
             : Response.json({ voices: [tech] })
           : Response.json({ voices: [alnilam], next_page_token: 'p1' }),
       );
-      const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
+      const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, now: () => t, log: quiet });
       broken = true;
-      expect(await catalog.lookup('gemini', 'key', 'alnilam')).toEqual({ status: 'lookup_failed' });
+      expect(await catalog.lookup('gemini', 'alnilam')).toEqual({ status: 'lookup_failed' });
       broken = false;
       t = 30_000;
-      expect((await catalog.lookup('gemini', 'key', 'en-us-techagent-4')).status).toBe('resolved');
+      expect((await catalog.lookup('gemini', 'en-us-techagent-4')).status).toBe('resolved');
       broken = true;
       t = 30_000 + 3_600_000;
-      await catalog.lookup('gemini', 'key', 'alnilam');
-      await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'kore')).toBeUndefined());
-      expect(catalog.known('gemini', 'key', 'alnilam')).toBe('resolved');
-      expect(await catalog.lookup('gemini', 'key', 'kore')).toEqual({ status: 'lookup_failed' });
+      await catalog.lookup('gemini', 'alnilam');
+      await vi.waitFor(() => expect(catalog.known('gemini', 'kore')).toBeUndefined());
+      expect(catalog.known('gemini', 'alnilam')).toBe('resolved');
+      expect(await catalog.lookup('gemini', 'kore')).toEqual({ status: 'lookup_failed' });
     }
   });
 
-  it("keeps each key's names and pages apart, a bounded number of them", async () => {
+  it('keeps a bounded number of pages', async () => {
     const { calls, fetchFn } = gemini();
-    const catalog = createVoiceCatalog({ fetch: fetchFn });
-    expect((await catalog.lookup('gemini', 'key-a', 'alnilam')).status).toBe('resolved');
-    expect(catalog.known('gemini', 'key-b', 'alnilam')).toBeUndefined();
-    expect((await catalog.lookup('gemini', 'key-b', 'alnilam')).status).toBe('resolved');
-    expect(calls).toHaveLength(4);
-    expect(calls.map((c) => c.headers.get('x-goog-api-key'))).toEqual(['key-a', 'key-a', 'key-b', 'key-b']);
-    await catalog.page('gemini', 'key-a', { limit: 3 });
-    await catalog.page('gemini', 'key-b', { limit: 3 });
-    expect(calls).toHaveLength(6);
-    for (let i = 0; i < 250; i++) await catalog.page('gemini', 'key-a', { limit: 3, q: `q${i}` });
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn });
+    await catalog.page('gemini', { limit: 3 });
+    for (let i = 0; i < 250; i++) await catalog.page('gemini', { limit: 3, q: `q${i}` });
     // The oldest pages gave way: asking for the first again goes upstream.
-    await catalog.page('gemini', 'key-a', { limit: 3 });
-    expect(calls).toHaveLength(6 + 250 + 1);
+    await catalog.page('gemini', { limit: 3 });
+    expect(calls).toHaveLength(1 + 250 + 1);
   });
 
   it("asks lazily for only the ids in use: the id's language on every page, then the whole listing", async () => {
@@ -418,17 +412,17 @@ describe('voice names', () => {
       }
       return Response.json({ voices: language ? [] : [alnilam, tech, custom] });
     });
-    const catalog = createVoiceCatalog({ fetch: fetchFn, lazy: true });
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, lazy: true });
     expect(urls()).toEqual([]);
-    expect((await catalog.lookup('gemini', 'key', 'en-us-techagent-4')).status).toBe('resolved');
-    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+    expect((await catalog.lookup('gemini', 'en-us-techagent-4')).status).toBe('resolved');
+    expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('resolved');
     // An id's prefix is only where to look first: a custom voice is in the whole listing.
-    expect(await catalog.lookup('gemini', 'key', 'my_voice')).toEqual({
+    expect(await catalog.lookup('gemini', 'my_voice')).toEqual({
       status: 'resolved',
       voice: { id: 'my_voice', name: 'Mine', language: 'de-DE' },
     });
-    expect(await catalog.lookup('gemini', 'key', 'de-de-voice-1')).toEqual({ status: 'unavailable' });
-    expect((await catalog.lookup('elevenlabs', 'key', 'S80713fa2M70CssGEBj5')).status).toBe('resolved');
+    expect(await catalog.lookup('gemini', 'de-de-voice-1')).toEqual({ status: 'unavailable' });
+    expect((await catalog.lookup('elevenlabs', 'S80713fa2M70CssGEBj5')).status).toBe('resolved');
     expect(urls().map((u) => [u.pathname, Object.fromEntries(u.searchParams)])).toEqual([
       ['/v1beta/voices', { page_size: '1000', language_code: 'en-US' }],
       ['/v1beta/voices', { page_size: '1000', language_code: 'en-US', page_token: 'p1' }],
@@ -442,21 +436,21 @@ describe('voice names', () => {
     let t = 0;
     const state = { down: true };
     const { calls, fetchFn } = gemini(state);
-    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet, lazy: true });
-    expect(await catalog.lookup('gemini', 'key', 'alnilam')).toEqual({ status: 'lookup_failed' });
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, now: () => t, log: quiet, lazy: true });
+    expect(await catalog.lookup('gemini', 'alnilam')).toEqual({ status: 'lookup_failed' });
     expect(calls).toHaveLength(2);
     state.down = false;
     t = 14_000;
-    expect(await catalog.lookup('gemini', 'key', 'alnilam')).toEqual({ status: 'lookup_failed' });
+    expect(await catalog.lookup('gemini', 'alnilam')).toEqual({ status: 'lookup_failed' });
     expect(calls).toHaveLength(2);
     t = 15_000;
-    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+    expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('resolved');
     expect(calls).toHaveLength(4);
     t = 15_000 + 3_599_000;
-    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+    expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('resolved');
     expect(calls).toHaveLength(4);
     t = 15_000 + 3_600_000;
-    expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+    expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('resolved');
     expect(calls).toHaveLength(6);
   });
 
@@ -473,10 +467,10 @@ describe('voice names', () => {
       () => new Response(`{"voices": ${secret}`, { status: 200, headers: { 'content-type': 'application/json' } }),
     ]) {
       const { fetchFn } = fakeUpstream(reply);
-      const catalog = createVoiceCatalog({ fetch: fetchFn, log: { info: vi.fn(), warn } });
-      expect(await catalog.page('gemini', 'key', { limit: 1 })).toEqual({ error: 'upstream' });
-      expect(await catalog.page('elevenlabs', 'key', { limit: 1 })).toEqual({ error: 'upstream' });
-      expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('lookup_failed');
+      const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, log: { info: vi.fn(), warn } });
+      expect(await catalog.page('gemini', { limit: 1 })).toEqual({ error: 'upstream' });
+      expect(await catalog.page('elevenlabs', { limit: 1 })).toEqual({ error: 'upstream' });
+      expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('lookup_failed');
     }
     expect(warn).toHaveBeenCalled();
     expect(JSON.stringify(warn.mock.calls)).not.toContain(secret);
@@ -494,28 +488,27 @@ describe('voice names', () => {
         await new Promise<void>((resolve) => (release = resolve));
         return Response.json({ voices: state.voices });
       });
-      const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
-      expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
-      expect(catalog.known('gemini', 'key', 'voice_new')).toBe('unavailable');
+      const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, now: () => t, log: quiet });
+      expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('resolved');
+      expect(catalog.known('gemini', 'voice_new')).toBe('unavailable');
       // The save's own load hangs past the wait: the save goes through, and the voice is in doubt everywhere.
       release = () => undefined;
       t = 10_000;
-      const saving = catalog.lookup('gemini', 'key', 'voice_new', { confirm: true });
+      const saving = catalog.lookup('gemini', 'voice_new', { confirm: true });
       await vi.advanceTimersByTimeAsync(3_000);
       expect(await saving).toEqual({ status: 'lookup_failed' });
       expect(calls).toHaveLength(2);
-      expect(catalog.known('gemini', 'key', 'voice_new')).toBeUndefined();
-      expect(await catalog.lookup('gemini', 'key', 'voice_new')).toEqual({ status: 'lookup_failed' });
+      expect(catalog.known('gemini', 'voice_new')).toBeUndefined();
+      expect(await catalog.lookup('gemini', 'voice_new')).toEqual({ status: 'lookup_failed' });
       expect(
-        (await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'voice_new' }, 'key'))
-          .status,
+        (await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'voice_new' })).status,
       ).toBe('lookup_failed');
       // What the listing has still resolves, and what it lacks with no doubt on it is still gone.
-      expect(catalog.known('gemini', 'key', 'alnilam')).toBe('resolved');
-      expect(catalog.known('gemini', 'key', 'kore')).toBe('unavailable');
+      expect(catalog.known('gemini', 'alnilam')).toBe('resolved');
+      expect(catalog.known('gemini', 'kore')).toBe('unavailable');
       // That load finishing without the voice proves it gone.
       release();
-      await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'voice_new')).toBe('unavailable'));
+      await vi.waitFor(() => expect(catalog.known('gemini', 'voice_new')).toBe('unavailable'));
     } finally {
       vi.useRealTimers();
     }
@@ -532,43 +525,43 @@ describe('voice names', () => {
         return state.down ? new Response('', { status: 503 }) : Response.json({ voices: [alnilam] });
       });
       const release = () => held.splice(0).forEach((go) => go());
-      const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
+      const catalog = createVoiceCatalog({ keys: { gemini: 'key' }, fetch: fetchFn, now: () => t, log: quiet });
       // Cold: the start's load is still on its way when a save asks.
-      catalog.warm({ gemini: 'key' });
+      catalog.warm();
       catalog.close();
       t = 5_000;
-      const cold = catalog.lookup('gemini', 'key', 'voice_cold', { confirm: true });
+      const cold = catalog.lookup('gemini', 'voice_cold', { confirm: true });
       await vi.advanceTimersByTimeAsync(3_000);
       expect(await cold).toEqual({ status: 'lookup_failed' });
       release();
-      await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'alnilam')).toBe('resolved'));
-      expect(catalog.known('gemini', 'key', 'voice_cold')).toBeUndefined();
+      await vi.waitFor(() => expect(catalog.known('gemini', 'alnilam')).toBe('resolved'));
+      expect(catalog.known('gemini', 'voice_cold')).toBeUndefined();
       // Stale: a refresh failed, its retry is under way when a save asks, and finishes without the voice.
       state.held = false;
       state.down = true;
       t = 3_600_000;
-      await catalog.lookup('gemini', 'key', 'alnilam');
-      await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'kore')).toBeUndefined());
+      await catalog.lookup('gemini', 'alnilam');
+      await vi.waitFor(() => expect(catalog.known('gemini', 'kore')).toBeUndefined());
       state.held = true;
       state.down = false;
       t = 3_630_000;
-      const retrying = catalog.lookup('gemini', 'key', 'alnilam');
+      const retrying = catalog.lookup('gemini', 'alnilam');
       t = 3_631_000;
-      const saving = catalog.lookup('gemini', 'key', 'voice_new', { confirm: true });
+      const saving = catalog.lookup('gemini', 'voice_new', { confirm: true });
       await vi.waitFor(() => expect(held).toHaveLength(1));
       release();
       expect(await saving).toEqual({ status: 'lookup_failed' });
       expect((await retrying).status).toBe('resolved');
-      await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'kore')).toBe('unavailable'));
+      await vi.waitFor(() => expect(catalog.known('gemini', 'kore')).toBe('unavailable'));
       // The retry started after the cold save asked, so it proves that voice gone, but not the one asked during it.
-      expect(catalog.known('gemini', 'key', 'voice_cold')).toBe('unavailable');
-      expect(catalog.known('gemini', 'key', 'voice_new')).toBeUndefined();
-      expect(await catalog.lookup('gemini', 'key', 'voice_new')).toEqual({ status: 'lookup_failed' });
+      expect(catalog.known('gemini', 'voice_cold')).toBe('unavailable');
+      expect(catalog.known('gemini', 'voice_new')).toBeUndefined();
+      expect(await catalog.lookup('gemini', 'voice_new')).toEqual({ status: 'lookup_failed' });
       // A load started after the save asked proves it gone.
       state.held = false;
       t = 3_641_000;
-      expect(await catalog.lookup('gemini', 'key', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
-      expect(catalog.known('gemini', 'key', 'voice_new')).toBe('unavailable');
+      expect(await catalog.lookup('gemini', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
+      expect(catalog.known('gemini', 'voice_new')).toBe('unavailable');
     } finally {
       vi.useRealTimers();
     }
@@ -584,29 +577,28 @@ describe('voice names', () => {
         if (state.held) await new Promise<void>((resolve) => held.push(resolve));
         return Response.json({ voices: [alnilam] });
       });
-      const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t, log: quiet });
-      expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+      const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, now: () => t, log: quiet });
+      expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('resolved');
       // The hourly reload starts, and a save asks while it runs; it lands inside the save's wait.
       state.held = true;
       t = 3_600_000;
-      expect((await catalog.lookup('gemini', 'key', 'alnilam')).status).toBe('resolved');
+      expect((await catalog.lookup('gemini', 'alnilam')).status).toBe('resolved');
       t = 3_601_000;
-      const saving = catalog.lookup('gemini', 'key', 'voice_new', { confirm: true });
+      const saving = catalog.lookup('gemini', 'voice_new', { confirm: true });
       await vi.waitFor(() => expect(held).toHaveLength(1));
       held.splice(0).forEach((go) => go());
       expect(await saving).toEqual({ status: 'lookup_failed' });
       expect(calls).toHaveLength(2);
-      expect(catalog.known('gemini', 'key', 'voice_new')).toBeUndefined();
+      expect(catalog.known('gemini', 'voice_new')).toBeUndefined();
       expect(
-        (await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'voice_new' }, 'key'))
-          .status,
+        (await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'voice_new' })).status,
       ).toBe('lookup_failed');
       // The next save starts its own load, which proves the voice gone.
       state.held = false;
       t = 3_602_000;
-      expect(await catalog.lookup('gemini', 'key', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
+      expect(await catalog.lookup('gemini', 'voice_new', { confirm: true })).toEqual({ status: 'unavailable' });
       expect(calls).toHaveLength(3);
-      expect(catalog.known('gemini', 'key', 'voice_new')).toBe('unavailable');
+      expect(catalog.known('gemini', 'voice_new')).toBe('unavailable');
     } finally {
       vi.useRealTimers();
     }
@@ -617,9 +609,9 @@ describe('voice names', () => {
     try {
       let t = 0;
       const { calls, fetchFn } = gemini();
-      const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t });
-      catalog.warm({ gemini: 'key' });
-      await vi.waitFor(() => expect(catalog.known('gemini', 'key', 'alnilam')).toBe('resolved'));
+      const catalog = createVoiceCatalog({ keys: { gemini: 'key' }, fetch: fetchFn, now: () => t });
+      catalog.warm();
+      await vi.waitFor(() => expect(catalog.known('gemini', 'alnilam')).toBe('resolved'));
       expect(calls).toHaveLength(2);
       await vi.advanceTimersByTimeAsync(300_000);
       expect(calls).toHaveLength(2);
@@ -630,10 +622,10 @@ describe('voice names', () => {
       t = 2 * 3_600_000;
       await vi.advanceTimersByTimeAsync(3_600_000);
       expect(calls).toHaveLength(4);
-      expect(catalog.known('gemini', 'key', 'kore')).toBe('unavailable');
+      expect(catalog.known('gemini', 'kore')).toBe('unavailable');
       t = 3 * 3_600_000;
-      expect(catalog.known('gemini', 'key', 'kore')).toBeUndefined();
-      expect(catalog.known('gemini', 'key', 'alnilam')).toBe('resolved');
+      expect(catalog.known('gemini', 'kore')).toBeUndefined();
+      expect(catalog.known('gemini', 'alnilam')).toBe('resolved');
     } finally {
       vi.useRealTimers();
     }
@@ -641,11 +633,11 @@ describe('voice names', () => {
 
   it('resolves a voice the provider gave no name as nameless, while its page shows the id', async () => {
     const { fetchFn } = fakeUpstream(() => Response.json({ voices: [{ id: 'nameless-1' }] }));
-    const catalog = createVoiceCatalog({ fetch: fetchFn });
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn });
     expect(
-      await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'nameless-1' }, 'key'),
+      await catalog.details({ provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'nameless-1' }),
     ).toMatchObject({ voice: 'nameless-1', voiceName: null, status: 'resolved' });
-    expect(await catalog.page('gemini', 'key', { limit: 1 })).toEqual({
+    expect(await catalog.page('gemini', { limit: 1 })).toEqual({
       page: { provider: 'gemini', voices: [{ id: 'nameless-1', name: 'nameless-1' }] },
     });
   });
@@ -657,8 +649,8 @@ describe('voice names', () => {
       await gate;
       return Response.json({ voices: [will], has_more: false });
     });
-    const catalog = createVoiceCatalog({ fetch: fetchFn });
-    const both = Promise.all([0, 1].map(() => catalog.page('elevenlabs', 'key', { limit: 5 })));
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn });
+    const both = Promise.all([0, 1].map(() => catalog.page('elevenlabs', { limit: 5 })));
     release();
     const [a, b] = await both;
     expect(a).toEqual(b);
@@ -668,15 +660,15 @@ describe('voice names', () => {
   it('keeps a page for a minute, by provider and the whole query', async () => {
     let t = 0;
     const { calls, fetchFn } = fakeUpstream(() => Response.json({ voices: [will], has_more: false }));
-    const catalog = createVoiceCatalog({ fetch: fetchFn, now: () => t });
+    const catalog = createVoiceCatalog({ keys: KEYS, fetch: fetchFn, now: () => t });
     const query = { limit: 5, gender: 'male' };
-    await catalog.page('elevenlabs', 'key', query);
-    await catalog.page('elevenlabs', 'key', query);
-    await catalog.page('elevenlabs', 'key', { ...query, gender: 'female' });
-    await catalog.page('gemini', 'key', query);
+    await catalog.page('elevenlabs', query);
+    await catalog.page('elevenlabs', query);
+    await catalog.page('elevenlabs', { ...query, gender: 'female' });
+    await catalog.page('gemini', query);
     expect(calls).toHaveLength(3);
     t = 60_000;
-    await catalog.page('elevenlabs', 'key', query);
+    await catalog.page('elevenlabs', query);
     expect(calls).toHaveLength(4);
   });
 });

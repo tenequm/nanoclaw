@@ -5,16 +5,21 @@
  * central DB, answered as the contract fixtures say. The call routes are
  * exercised over HTTP in voice-mode-livekit.test.ts.
  */
-import { existsSync, readFileSync } from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/** The host key; null as on a host without one. */
+const hostKey = vi.hoisted(() => ({ value: null as Buffer | null }));
+vi.mock('../secret-seal.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../secret-seal.js')>()),
+  encryptionKey: () => hostKey.value,
+}));
 
 import { closeDb, getDb, initTestDb, runMigrations } from '../db/index.js';
 import { createAgentGroup } from '../db/agent-groups.js';
-import { mintVoiceModeLine } from '../db/voice-mode-lines.js';
+import { getVoiceModeLineForAgent, mintVoiceModeLine, openVoiceModeLink } from '../db/voice-mode-lines.js';
 import { createUser } from '../modules/permissions/db/users.js';
 import { grantRole, revokeRole } from '../modules/permissions/db/user-roles.js';
 import { TTS_DEFAULT_CHOICE } from '../voice-mode-tts.js';
@@ -33,12 +38,13 @@ import {
 } from './voice-mode.js';
 
 describe('voice routes and the reverse-proxy gate', () => {
-  it('maps the prefixes to routes, the worker routes only under /webhook/voice-mode', () => {
-    expect(voiceRoute('/webhook/voice/livekit')).toBe('livekit');
-    expect(voiceRoute('/webhook/voice-mode/livekit')).toBe('livekit');
+  it('maps browser routes only under /voice and worker routes only under /webhook/voice-mode', () => {
     expect(voiceRoute('/webhook/voice-mode/livekit/agent/events')).toBe('livekit/agent/events');
+    expect(voiceRoute('/webhook/voice-mode/livekit/agent/joined/')).toBe('livekit/agent/joined');
+    expect(voiceRoute('/webhook/voice-mode/livekit')).toBeNull();
+    expect(voiceRoute('/webhook/voice-mode/tts')).toBeNull();
+    expect(voiceRoute('/webhook/voice/livekit')).toBeNull();
     expect(voiceRoute('/webhook/voice/livekit/agent/events')).toBeNull();
-    expect(voiceRoute('/webhook/voice/livekit/agent')).toBeNull();
     expect(voiceRoute('/voice')).toBe('livekit');
     expect(voiceRoute('/voice/')).toBe('livekit');
     expect(voiceRoute('/voice/info')).toBe('info');
@@ -119,77 +125,11 @@ describe('voice routes and the reverse-proxy gate', () => {
   });
 });
 
-describe('voice-mode environment compatibility', () => {
-  it('reads old settings, prefers explicit new keys and never prints their values', async () => {
-    const { voiceModeEnv, voiceModeEnvKeys, parseVoiceLanguages } = await import('./voice-mode-protocol.js');
-    const warnings: string[] = [];
-    const oldValue = 'private-' + 'value';
-    expect(voiceModeEnvKeys(['VOICE_MODE_PUBLIC_URL', 'LIVEKIT_URL'])).toEqual([
-      'VOICE_MODE_PUBLIC_URL',
-      'VOICE_PUBLIC_URL',
-      'LIVEKIT_URL',
-    ]);
-    expect(
-      voiceModeEnv({ VOICE_PUBLIC_URL: oldValue, VOICE_MODE_PUBLIC_URL: 'new', VOICE_WAKE_MODEL: 'off' }, (s) =>
-        warnings.push(s),
-      ),
-    ).toMatchObject({ VOICE_MODE_PUBLIC_URL: 'new', VOICE_MODE_WAKE_MODEL: 'off' });
-    expect(warnings).toEqual([
-      'voice-mode: VOICE_PUBLIC_URL is ignored because VOICE_MODE_PUBLIC_URL is set; remove it',
-      'voice-mode: VOICE_WAKE_MODEL is deprecated; use VOICE_MODE_WAKE_MODEL',
-    ]);
-    expect(warnings.join(' ')).not.toContain(oldValue);
+describe('voice-mode settings', () => {
+  it('reads VOICE_MODE_LANGUAGES, dropping invalid and repeated codes', async () => {
+    const { parseVoiceLanguages } = await import('./voice-mode-protocol.js');
     expect(parseVoiceLanguages(undefined)).toEqual(['uk-UA', 'en-US']);
     expect(parseVoiceLanguages('de-DE,en-US,de-de,invalid!')).toEqual(['de-DE', 'en-US']);
-  });
-
-  it('aliases only the old keys main read: none for settings new to voice-mode', async () => {
-    const { voiceModeEnv, voiceModeEnvKeys } = await import('./voice-mode-protocol.js');
-    const fresh = ['VOICE_MODE_PORT', 'VOICE_MODE_PAGE_HOST', 'VOICE_MODE_LANGUAGES'];
-    expect(voiceModeEnvKeys(fresh)).toEqual(fresh);
-    const warnings: string[] = [];
-    const env = voiceModeEnv({ VOICE_PORT: '9', VOICE_PAGE_HOST: '0.0.0.0', VOICE_LANGUAGES: 'de-DE' }, (s) =>
-      warnings.push(s),
-    );
-    for (const key of fresh) expect(env[key]).toBeUndefined();
-    expect(warnings).toEqual([]);
-  });
-
-  it("aliases exactly the upgrade runbook's rename table", async () => {
-    const { LEGACY_VOICE_KEYS } = await import('./voice-mode-protocol.js');
-    const runbook = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      '../../docs/2610-07-voice-mode-upgrade.md',
-    );
-    expect(LEGACY_VOICE_KEYS).toHaveLength(27);
-    if (!existsSync(runbook)) return; // An installed payload does not carry the fork's docs.
-    const table = [...readFileSync(runbook, 'utf8').matchAll(/^\| `(VOICE_[A-Z_]+)` \| `VOICE_MODE_[A-Z_]+` \|$/gm)];
-    expect(table.map((m) => m[1])).toEqual([...LEGACY_VOICE_KEYS]);
-  });
-});
-
-describe('voice-mode provider key aliases', () => {
-  it('reads GEMINI_API_KEY as VOICE_MODE_GEMINI_API_KEY, prefers the new name and never prints values', async () => {
-    const { voiceModeEnv, voiceModeEnvKeys, LEGACY_VOICE_KEYS } = await import('./voice-mode-protocol.js');
-    const oldValue = 'private-' + 'gemini';
-    expect(voiceModeEnvKeys(['VOICE_MODE_GEMINI_API_KEY', 'VOICE_MODE_ELEVENLABS_API_KEY'])).toEqual([
-      'VOICE_MODE_GEMINI_API_KEY',
-      'GEMINI_API_KEY',
-      'VOICE_MODE_ELEVENLABS_API_KEY',
-    ]);
-    const warnings: string[] = [];
-    expect(voiceModeEnv({ GEMINI_API_KEY: oldValue }, (s) => warnings.push(s))).toMatchObject({
-      VOICE_MODE_GEMINI_API_KEY: oldValue,
-    });
-    expect(
-      voiceModeEnv({ GEMINI_API_KEY: oldValue, VOICE_MODE_GEMINI_API_KEY: 'new' }, (s) => warnings.push(s)),
-    ).toMatchObject({ VOICE_MODE_GEMINI_API_KEY: 'new' });
-    expect(warnings).toEqual([
-      'voice-mode: GEMINI_API_KEY is deprecated; use VOICE_MODE_GEMINI_API_KEY',
-      'voice-mode: GEMINI_API_KEY is ignored because VOICE_MODE_GEMINI_API_KEY is set; remove it',
-    ]);
-    expect(warnings.join(' ')).not.toContain(oldValue);
-    expect(LEGACY_VOICE_KEYS).not.toContain('GEMINI_API_KEY');
   });
 });
 
@@ -305,7 +245,7 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     adapter = createVoiceModeAdapter({
       publicUrl: `http://127.0.0.1:${port}`,
       providerKeys: { gemini: GEMINI_KEY },
-      catalog: createVoiceCatalog({ fetch: fakeFetch }),
+      catalog: createVoiceCatalog({ keys: { gemini: GEMINI_KEY }, fetch: fakeFetch }),
       livekit: { url: 'wss://lk.example.invalid', apiKey: 'k', apiSecret: 's'.repeat(48), api: {} as LiveKitServerApi },
     });
     await adapter.setup({ onInbound: () => {}, onInboundEvent: () => {}, onMetadata: () => {}, onAction: () => {} });
@@ -322,10 +262,11 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     await adapter.teardown();
     await stopWebhookServer();
     const port = Number(new URL(base).port);
+    const providerKeys = overrides.providerKeys ?? { gemini: GEMINI_KEY };
     adapter = createVoiceModeAdapter({
       publicUrl: `http://127.0.0.1:${port}`,
-      providerKeys: { gemini: GEMINI_KEY },
-      catalog: createVoiceCatalog({ fetch: fakeFetch }),
+      providerKeys,
+      catalog: createVoiceCatalog({ keys: providerKeys, fetch: fakeFetch }),
       livekit: { url: 'wss://lk.example.invalid', apiKey: 'k', apiSecret: 's'.repeat(48), api: {} as LiveKitServerApi },
       ...overrides,
     });
@@ -334,7 +275,7 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
   };
   /** A catalog whose lookups wait for `release`; `started` once one is waiting. */
   const heldLookups = () => {
-    const real = createVoiceCatalog({ fetch: fakeFetch });
+    const real = createVoiceCatalog({ keys: { gemini: GEMINI_KEY }, fetch: fakeFetch });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     let started!: () => void;
@@ -374,6 +315,19 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     }
   });
 
+  it('seals a link made before links were stored when it next opens the line, and only with a key', async () => {
+    hostKey.value = null;
+    expect((await tts()).status).toBe(200);
+    expect((await getVoiceModeLineForAgent('ag-1'))?.link_sealed).toBeNull();
+    hostKey.value = randomBytes(32);
+    expect((await tts('GET', undefined, 'f'.repeat(32))).status).toBe(403);
+    expect((await getVoiceModeLineForAgent('ag-1'))?.link_sealed).toBeNull();
+    expect((await tts()).status).toBe(200);
+    const line = (await getVoiceModeLineForAgent('ag-1'))!;
+    expect(await openVoiceModeLink(line, hostKey.value)).toEqual({ token });
+    hostKey.value = null;
+  });
+
   it("answers the line's saved and effective voice with their names, saves a pick and resets it", async () => {
     expect(await json(await tts())).toEqual({ status: 200, body: fixtures.ttsViewNew });
     const pick = JSON.stringify({ provider: 'gemini', model: 'gemini-3.8-flash-lite-tts', voice: 'achernar' });
@@ -387,7 +341,9 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
 
   it("matches ids exactly as the provider spells them, and loads Gemini's listing once more before refusing", async () => {
     let clock = 0;
-    await restart({ catalog: createVoiceCatalog({ fetch: fakeFetch, now: () => clock }) });
+    await restart({
+      catalog: createVoiceCatalog({ keys: { gemini: GEMINI_KEY }, fetch: fakeFetch, now: () => clock }),
+    });
     clock = 10_000;
     expect(await json(await tts('PATCH', '{"provider":"gemini","voice":"Achernar"}'))).toEqual({
       status: 400,
@@ -572,14 +528,16 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
             messagingGroupId: 'mg-1',
             threadId: null,
           });
-          stream.enqueue(encode('"voice":"Kore"}'));
+          stream.enqueue(encode('"voice":"achernar"}'));
           stream.close();
         },
       }),
       duplex: 'half',
     } as RequestInit);
+    // The save itself only takes the link it started with.
     expect(res.status).toBe(403);
     expect(await res.text()).toBe('Unknown call link');
+    expect(await getDb().get('SELECT tts_voice FROM voice_mode_lines')).toEqual({ tts_voice: 'en-us-techagent-4' });
   });
 
   it("pages Gemini's listing with its own filters and page tokens", async () => {

@@ -31,26 +31,29 @@ import {
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
+  getMessagingGroup,
   initTestDb,
   runMigrations,
 } from '../db/index.js';
 import { getSessionsByAgentGroup } from '../db/sessions.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
-import type { InboundEvent } from './adapter.js';
 import { getHostStartCallbacks } from '../host-lifecycle.js';
 import './index.js'; // the real channel barrel: registers the voice channel
-import { routeVoiceModeTurn } from './voice-mode-route.js';
+import { routeVoiceModeTurn, type VoiceModeTurn, type VoiceModeTurnEvent } from './voice-mode-route.js';
 
 const now = () => new Date().toISOString();
-/** The line's caller; the chat is looked up from the event. */
-const FROM_CALLER = { callerId: 'voice-mode:abc', chat: null };
+/** The line's caller, in the call chat the engine resolved: chat:G1, or a chat of another id. */
+const fromCaller = async (chatId = 'mg-1'): Promise<VoiceModeTurn> => ({
+  callerId: 'voice-mode:abc',
+  chat: { ...(await getMessagingGroup('mg-1'))!, id: chatId },
+});
 
 const sessionsCreated: SessionCreatedEvent[] = [];
 registerSessionCreatedHook((event) => {
   sessionsCreated.push(event);
 });
 
-const turn = (platformId = 'chat:G1', agentGroupId = 'ag-1'): InboundEvent => ({
+const turn = (platformId = 'chat:G1', agentGroupId = 'ag-1'): VoiceModeTurnEvent => ({
   channelType: 'chat',
   instance: 'chat',
   platformId,
@@ -110,7 +113,7 @@ afterEach(async () => {
 
 describe('routeVoiceModeTurn', () => {
   it('takes no turn before the host has started, as the router takes no inbound before then', async () => {
-    await expect(routeVoiceModeTurn(turn(), FROM_CALLER)).rejects.toThrow('still starting');
+    await expect(routeVoiceModeTurn(turn(), await fromCaller())).rejects.toThrow('still starting');
     expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
   });
 
@@ -120,7 +123,7 @@ describe('routeVoiceModeTurn', () => {
       for (const start of getHostStartCallbacks()) await start({} as never);
     });
     it("stores the turn as a waking message in the line agent's session only, and wakes it", async () => {
-      expect(await routeVoiceModeTurn(turn(), FROM_CALLER)).toBe(true);
+      expect(await routeVoiceModeTurn(turn(), await fromCaller())).toBe(true);
       const [session] = await getSessionsByAgentGroup('ag-1');
       expect(session).toMatchObject({ messaging_group_id: 'mg-1' });
       expect(await getSessionsByAgentGroup('ag-2')).toEqual([]);
@@ -135,13 +138,13 @@ describe('routeVoiceModeTurn', () => {
       const event = turn();
       event.message.content = JSON.stringify({ text: '/status', senderId: 'voice-mode:abc' });
       event.onStored = vi.fn();
-      expect(await routeVoiceModeTurn(event, FROM_CALLER)).toBe(false);
+      expect(await routeVoiceModeTurn(event, await fromCaller())).toBe(false);
       expect(event.onStored).not.toHaveBeenCalled();
       expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
     });
 
     it("tells core's session-created hooks about the session a first turn creates, once", async () => {
-      await routeVoiceModeTurn(turn(), FROM_CALLER);
+      await routeVoiceModeTurn(turn(), await fromCaller());
       const [session] = await getSessionsByAgentGroup('ag-1');
       expect(sessionsCreated).toHaveLength(1);
       expect(sessionsCreated[0]).toMatchObject({
@@ -152,13 +155,16 @@ describe('routeVoiceModeTurn', () => {
         sessionMode: 'shared',
         message: { id: 'livekit:call-1:1' },
       });
-      await routeVoiceModeTurn({ ...turn(), message: { ...turn().message, id: 'livekit:call-1:2' } }, FROM_CALLER);
+      await routeVoiceModeTurn(
+        { ...turn(), message: { ...turn().message, id: 'livekit:call-1:2' } },
+        await fromCaller(),
+      );
       expect(sessionsCreated).toHaveLength(1);
     });
 
     it('stores nothing when the chat or its wiring to the agent is gone', async () => {
-      expect(await routeVoiceModeTurn(turn('chat:unknown'), FROM_CALLER)).toBe(false);
-      expect(await routeVoiceModeTurn(turn('chat:G1', 'ag-unwired'), FROM_CALLER)).toBe(false);
+      expect(await routeVoiceModeTurn(turn('chat:unknown'), await fromCaller('mg-unknown'))).toBe(false);
+      expect(await routeVoiceModeTurn(turn('chat:G1', 'ag-unwired'), await fromCaller())).toBe(false);
       expect(await getSessionsByAgentGroup('ag-1')).toEqual([]);
       expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
     });

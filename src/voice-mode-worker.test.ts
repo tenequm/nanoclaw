@@ -36,16 +36,13 @@ import {
   callLanguages,
   type CallRecord,
   CallRecording,
-  callRecordingOn,
   CallTurns,
-  capSpokenText,
   DISCARD_SETTLE_MS,
   COMMAND_VOCABULARY,
   COMMAND_WORDS_JSON,
   captionMark,
   type CaptionMark,
-  CUT_LINES,
-  DEFAULT_MAX_SPOKEN_CHARS,
+  envSwitch,
   FAILURE_LINES,
   HostLink,
   hostLossReason,
@@ -53,8 +50,6 @@ import {
   LineSpeech,
   lineResampler,
   MAX_IDLE_WAIT_MS,
-  maxSpokenChars,
-  parseJobMetadata,
   pathSegment,
   pruneRecordings,
   readJobHeader,
@@ -74,8 +69,6 @@ import {
   lineFilter,
   whistleNotch,
   WHISTLE_NOTCHES,
-  ttsNotch,
-  ttsDeess,
   TTS_SAMPLE_RATE,
   matchCommand,
   matchWake,
@@ -84,7 +77,6 @@ import {
   endsLike,
   Outbox,
   loadTypingSound,
-  audioLevels,
   CallTelemetry,
   CallerInput,
   LineMeter,
@@ -127,31 +119,14 @@ afterEach(() => {
 });
 
 describe('worker settings', () => {
-  it('reads an old setting under its new name and warns about it', () => {
+  it('reads VOICE_MODE_* names only', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-mode-worker-env-'));
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
-      fs.writeFileSync(path.join(root, '.env'), 'VOICE_TTS_VOICE=Kore\n');
-      expect(workerEnv(['VOICE_MODE_TTS_VOICE'], root).VOICE_MODE_TTS_VOICE).toBe('Kore');
-      expect(warn).toHaveBeenCalledTimes(1);
-      expect(warn).toHaveBeenCalledWith('voice-mode: VOICE_TTS_VOICE is deprecated; use VOICE_MODE_TTS_VOICE');
-    } finally {
-      warn.mockRestore();
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it('reads the old GEMINI_API_KEY as VOICE_MODE_GEMINI_API_KEY', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-mode-worker-env-'));
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    try {
-      fs.writeFileSync(path.join(root, '.env'), 'GEMINI_API_KEY=gk-old\n');
+      fs.writeFileSync(path.join(root, '.env'), 'GEMINI_API_KEY=gk-old\nVOICE_MODE_ELEVENLABS_API_KEY=el-new\n');
       const env = workerEnv(['VOICE_MODE_GEMINI_API_KEY', 'VOICE_MODE_ELEVENLABS_API_KEY'], root);
-      expect(env.VOICE_MODE_GEMINI_API_KEY).toBe('gk-old');
-      expect(env.VOICE_MODE_ELEVENLABS_API_KEY).toBeUndefined();
-      expect(warn).toHaveBeenCalledWith('voice-mode: GEMINI_API_KEY is deprecated; use VOICE_MODE_GEMINI_API_KEY');
+      expect(env.VOICE_MODE_GEMINI_API_KEY).toBeUndefined();
+      expect(env.VOICE_MODE_ELEVENLABS_API_KEY).toBe('el-new');
     } finally {
-      warn.mockRestore();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -195,53 +170,6 @@ describe('helpers', () => {
     expect(hostLossReason({ accepted: false, status: 500 })).toBe('rejected');
     expect(hostLossReason({ accepted: false, status: 504 })).toBe('timeout');
     expect(hostLossReason({ accepted: false, error: 'The operation was aborted due to timeout' })).toBe('timeout');
-  });
-
-  it('cuts long spoken text at the last sentence end within the cap and says the rest is in the chat', () => {
-    const rest = CUT_LINES.chat;
-    expect(capSpokenText('Short. Fine.', 20, 'en', true)).toBe('Short. Fine.');
-    expect(capSpokenText('x'.repeat(5000), 0, 'en', true)).toBe('x'.repeat(5000));
-    const text = 'First one here. Second sentence is right here! Third goes past the cap.';
-    expect(capSpokenText(text, 50, 'en', true)).toBe(`First one here. Second sentence is right here! ${rest.en}`);
-    // A sentence end that would need the character past the cap does not count.
-    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 10, 'uk', true)).toBe(`Aaaa bbbb. ${rest.uk}`);
-    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 9, 'uk', true)).toBe(`Aaaa… ${rest.uk}`);
-    // Decimals are not sentence ends; with none before the cap the cut is at a word, never inside one.
-    expect(capSpokenText('Version 2.4 of the release, with many words', 30, 'en', true)).toBe(
-      `Version 2.4 of the release… ${rest.en}`,
-    );
-    expect(capSpokenText('Слово слово слово слово', 13, 'uk', true)).toBe(`Слово слово… ${rest.uk}`);
-    expect(capSpokenText('a'.repeat(30), 10, 'en', true)).toBe(rest.en);
-    expect(rest).toEqual({ uk: 'Решта - у чаті.', en: 'The rest is in the chat.' });
-  });
-
-  it('cuts at a word instead of a sentence end that would drop most of the budget', () => {
-    const long = `Ок. ${'дуже довге речення '.repeat(60)}`;
-    const spoken = capSpokenText(long, 800, 'uk', true);
-    expect(spoken).toMatch(/^Ок\. дуже довге речення .*\S… Решта - у чаті\.$/);
-    expect(spoken.length).toBeGreaterThan(780);
-    // Past 60% of the cap, the sentence end still wins.
-    expect(capSpokenText('Aaaa bbbb ccc. Dddd eeee ffff gggg.', 20, 'en', true)).toBe(
-      `Aaaa bbbb ccc. ${CUT_LINES.chat.en}`,
-    );
-    expect(capSpokenText('Aaaa. Bbbb cccc dddd eeee ffff gggg.', 20, 'en', true)).toBe(
-      `Aaaa. Bbbb cccc dddd… ${CUT_LINES.chat.en}`,
-    );
-  });
-
-  it('closes a cut without pointing at a chat when the call has none', () => {
-    expect(capSpokenText('Aaaa bbbb. Cccc dddd.', 10, 'en', false)).toBe(`Aaaa bbbb. ${CUT_LINES.no_chat.en}`);
-    expect(capSpokenText('Слово слово слово слово', 13, 'uk', false)).toBe(`Слово слово… ${CUT_LINES.no_chat.uk}`);
-    expect(CUT_LINES.no_chat).toEqual({ uk: 'Скорочую.', en: "I've cut it short." });
-  });
-
-  it('reads VOICE_MODE_MAX_SPOKEN_CHARS, with no cap unless it sets one', () => {
-    expect(maxSpokenChars(undefined)).toBe(DEFAULT_MAX_SPOKEN_CHARS);
-    expect(DEFAULT_MAX_SPOKEN_CHARS).toBe(0);
-    expect(maxSpokenChars(' 400 ')).toBe(400);
-    expect(maxSpokenChars('0')).toBe(0);
-    expect(maxSpokenChars('-5')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
-    expect(maxSpokenChars('lots')).toBe(DEFAULT_MAX_SPOKEN_CHARS);
   });
 
   it('de-esses the agent speech: flat through the voice band, about 6 dB off a lone sibilant, and off is a passthrough', () => {
@@ -295,9 +223,9 @@ describe('helpers', () => {
     // Off, the line goes out exactly as synthesized.
     const off = run([[7_000, 0.5]], lineFilter({ deess: false, notch: false }));
     expect(off.output).toEqual(off.input);
-    expect(ttsDeess(undefined)).toBe(true);
-    expect(ttsDeess('1')).toBe(true);
-    for (const raw of ['0', 'off', ' OFF ', 'false']) expect(ttsDeess(raw)).toBe(false);
+    expect(envSwitch(undefined)).toBe(true);
+    expect(envSwitch('1')).toBe(true);
+    for (const raw of ['0', 'off', ' OFF ', 'false']) expect(envSwitch(raw)).toBe(false);
 
     // The whistle notches: the model's loud whistle tones go, the voice stays.
     const notch = () => whistleNotch(rate);
@@ -322,8 +250,6 @@ describe('helpers', () => {
         notch(),
       ).output,
     ).toEqual(notch()(whole.input));
-    expect(ttsNotch(undefined)).toBe(true);
-    expect(ttsNotch('off')).toBe(false);
   });
 
   it('reads the language of a transcript from its script', () => {
@@ -334,7 +260,6 @@ describe('helpers', () => {
   });
 
   it('starts the worker lines in the first configured language and hears Ukrainian only when it is configured', () => {
-    expect(callLanguages(undefined)).toEqual({ codes: ['uk-UA', 'en-US'], initial: 'uk', ukrainian: true });
     expect(callLanguages(['uk-UA', 'en-US'])).toEqual({ codes: ['uk-UA', 'en-US'], initial: 'uk', ukrainian: true });
     expect(callLanguages(['en-US'])).toEqual({ codes: ['en-US'], initial: 'en', ukrainian: false });
     expect(callLanguages(['en-GB', 'uk'])).toEqual({ codes: ['en-GB', 'uk'], initial: 'en', ukrainian: true });
@@ -391,8 +316,8 @@ describe('TurnTaking', () => {
       return text === 'late' ? { accepted: false, turnKey: `key-${text}` } : { accepted: true, id: text };
     });
     const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
-    turnTaking.onTurn('late');
-    turnTaking.onTurn('next');
+    turnTaking.reserve().send('late');
+    turnTaking.reserve().send('next');
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['late']);
     turnTaking.stored('key-other', '1');
@@ -402,7 +327,7 @@ describe('TurnTaking', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['late', 'next']);
     // The end lets a waiting turn go too: a slot filled after it still posts.
-    turnTaking.onTurn('late');
+    turnTaking.reserve().send('late');
     const after = turnTaking.reserve();
     turnTaking.close();
     after.send('after the end');
@@ -423,8 +348,8 @@ describe('TurnTaking', () => {
       return { accepted: false, status: 504, turnKey: 'key-late' };
     });
     const results: SendResult[] = [];
-    turnTaking.onTurn('late', (result) => results.push(result));
-    turnTaking.onTurn('next');
+    turnTaking.reserve().send('late', (result) => results.push(result));
+    turnTaking.reserve().send('next');
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['late', 'next']);
     expect(results).toEqual([{ accepted: true, turnKey: 'key-late', id: '7' }]);
@@ -455,8 +380,8 @@ describe('TurnTaking', () => {
     const { deps, said, sent, statuses } = fakeTurnTakingDeps();
     const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
     const results: unknown[] = [];
-    turnTaking.onTurn('book a table', (r) => results.push(r));
-    turnTaking.onTurn('for two');
+    turnTaking.reserve().send('book a table', (r) => results.push(r));
+    turnTaking.reserve().send('for two');
     await vi.advanceTimersByTimeAsync(1);
     expect(sent).toEqual(['book a table', 'for two']);
     expect(results).toEqual([{ accepted: true, id: '1' }]);
@@ -467,32 +392,11 @@ describe('TurnTaking', () => {
     expect(statuses.at(-1)).toBe(false);
   });
 
-  it("caps every spoken message, closing in the caller's latest language", async () => {
-    vi.useFakeTimers();
-    const { deps, said } = fakeTurnTakingDeps();
-    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 20 });
-    turnTaking.onTurn('what is new');
-    await vi.advanceTimersByTimeAsync(SILENCE + TURN_SETTLE_MS);
-    turnTaking.onReply('Two things now. A **third** one that is long.');
-    turnTaking.onReply('Fits.');
-    await vi.advanceTimersByTimeAsync(1);
-    // No `chat` event yet: no chat holds the rest.
-    expect(said).toEqual([`Two things now. ${CUT_LINES.no_chat.en}`, 'Fits.']);
-    turnTaking.onChat(true);
-    turnTaking.onReply('Two things now. A third one that is long.');
-    await vi.advanceTimersByTimeAsync(1);
-    expect(said.at(-1)).toBe(`Two things now. ${CUT_LINES.chat.en}`);
-    const uncapped = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk', maxSpokenChars: 0 });
-    uncapped.onReply('Two things. A third one that is long.');
-    await vi.advanceTimersByTimeAsync(1);
-    expect(said.at(-1)).toBe('Two things. A third one that is long.');
-  });
-
   it('drops thinking after a while without typing ticks, and holds it while they come', async () => {
     vi.useFakeTimers();
     const { deps, statuses } = fakeTurnTakingDeps();
     const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
-    turnTaking.onTurn('thanks');
+    turnTaking.reserve().send('thanks');
     await vi.advanceTimersByTimeAsync(AWAIT_REPLY_MS - 1000);
     turnTaking.onThinking();
     await vi.advanceTimersByTimeAsync(5000);
@@ -513,7 +417,7 @@ describe('TurnTaking', () => {
     await vi.advanceTimersByTimeAsync(SILENCE);
     expect(said).toEqual([]);
     // The committed turn frees the channel at once.
-    turnTaking.onTurn('and another thing');
+    turnTaking.reserve().send('and another thing');
     await vi.advanceTimersByTimeAsync(1);
     expect(said).toEqual(['First.']);
 
@@ -577,11 +481,11 @@ describe('TurnTaking', () => {
     const { deps, said } = fakeTurnTakingDeps({ send: async () => answers.shift() ?? { accepted: true } });
     const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
     for (const text of ['what about the logs', 'and the disk', 'а диск', 'і пам’ять']) {
-      turnTaking.onTurn(text);
+      turnTaking.reserve().send(text);
       await turnTaking.idle();
     }
     turnTaking.onChat(true);
-    turnTaking.onTurn('а мережа');
+    turnTaking.reserve().send('а мережа');
     await turnTaking.idle();
     expect(said).toEqual([
       FAILURE_LINES.rate_limited.en,
@@ -693,14 +597,12 @@ describe('TurnTaking', () => {
   });
 
   it('stays silent once closed', async () => {
-    const { deps, said, sent } = fakeTurnTakingDeps();
+    const { deps, said } = fakeTurnTakingDeps();
     const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
     turnTaking.close();
-    turnTaking.onTurn('hello');
     turnTaking.onReply('Hi.');
     turnTaking.onTurnLost('empty');
     await turnTaking.idle();
-    expect(sent).toEqual([]);
     expect(said).toEqual([]);
   });
 });
@@ -734,8 +636,8 @@ const META: LiveKitJobMetadata = {
   callerName: 'Ethan',
   callerIdentity: 'caller-1',
   vocabulary: ['NanoClaw'],
+  languages: ['uk-UA', 'en-US'],
   sttModel: 'gemini-3.5-transcribe-live',
-  sttFallbackModel: 'gemini-3.5-transcribe',
   tts: { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'alnilam' },
   silenceMs: 2500,
   maxDurationMs: 60_000,
@@ -760,10 +662,11 @@ describe('local turn detector process', () => {
 
 describe('job metadata', () => {
   it('takes only a voice call of this version as a call to run', () => {
-    expect(() => parseJobMetadata('{}')).toThrow();
-    expect(() => parseJobMetadata('not json')).toThrow();
-    expect(() => parseJobMetadata(JSON.stringify({ ...META, v: 2 }))).toThrow();
-    expect(parseJobMetadata(JSON.stringify(META)).callId).toBe('call-1');
+    expect(() => readJobHeader('{}')).toThrow();
+    expect(() => readJobHeader('not json')).toThrow();
+    expect(readJobHeader(JSON.stringify({ ...META, v: 2 })).call).toBeUndefined();
+    expect(readJobHeader(JSON.stringify({ ...META, agentName: '' })).call).toBeUndefined();
+    expect(readJobHeader(JSON.stringify(META)).call).toEqual(META);
   });
 
   it('reads enough of any version to answer it', () => {
@@ -884,8 +787,8 @@ function fakeVoice(
     /** Plays at once: waits for the caller as the room's does, then speaks. */
     say: vi.fn(async (_text: string, ready?: () => Promise<void>) => {
       await ready?.();
-      events.onAgentSpeaking?.(true);
-      events.onAgentSpeaking?.(false);
+      events.onAgentSpeaking(true);
+      events.onAgentSpeaking(false);
       return true;
     }),
     selectTts: undefined as CallVoice['selectTts'],
@@ -959,7 +862,7 @@ function fakeVoice(
       const end = position;
       audio(SILENCE);
       events.onSpeech(true, start);
-      events.onVad?.(position, end);
+      events.onVad(position, end);
       events.onSpeech(false, end);
       await flush();
     },
@@ -967,7 +870,7 @@ function fakeVoice(
     quiet: (ms: number) => {
       const from = position;
       audio(ms);
-      events.onVad?.(position, from);
+      events.onVad(position, from);
     },
   };
   return v;
@@ -1108,12 +1011,12 @@ describe('runCall', () => {
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
     // The reply's speech is still being made: the page keeps "working" until its audio plays.
     expect(thinking()).toBe(true);
-    v.events.onAgentSpeaking?.(true);
+    v.events.onAgentSpeaking(true);
     expect(thinking()).toBe(true);
     // A moment into its audio (the page has the speaking state by then) it lets go.
     await vi.waitFor(() => expect(thinking()).toBe(false));
     speak();
-    v.events.onAgentSpeaking?.(false);
+    v.events.onAgentSpeaking(false);
     // The agent's typing after its answer: no "working" with nothing coming.
     host.emit({ type: 'thinking' });
     await new Promise((r) => setTimeout(r, 20));
@@ -1408,14 +1311,14 @@ describe('runCall', () => {
   it("speaks an English-only call's first failure notice in English, and a default call's in Ukrainian", async () => {
     for (const [languages, line] of [
       [['en-US'], FAILURE_LINES.turn.en],
-      [undefined, FAILURE_LINES.turn.uk],
+      [['uk-UA', 'en-US'], FAILURE_LINES.turn.uk],
     ] as const) {
-      const { ctx } = fakeJob(languages ? { ...META, languages } : { ...META });
+      const { ctx } = fakeJob({ ...META, languages });
       const host = fakeHostFetch();
       const v = fakeVoice();
       const transcriber = vi.fn((_options: { languageCodes: readonly string[] }) => v.transcription);
       await runCall(ctx, { ...callDeps(host.fetchImpl, v), transcriber });
-      expect(transcriber.mock.calls[0][0].languageCodes).toEqual(languages ?? ['uk-UA', 'en-US']);
+      expect(transcriber.mock.calls[0][0].languageCodes).toEqual(languages);
       await v.turn('', { speechMs: 1200, failed: true });
       await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(line, expect.any(Function)));
       expect(v.voice.say).toHaveBeenCalledTimes(1);
@@ -1616,7 +1519,12 @@ describe('reply recordings', () => {
       );
       const settings = v.createVoice.mock.calls[0][2];
       expect(settings.recordReplies).toBe(true);
+      // Every line is labelled before it plays.
+      host.emit({ type: 'reply', text: 'Booked.', turn: null });
+      await vi.waitFor(() => expect(v.voice.publishReply).toHaveBeenCalled());
       const pcm = Int16Array.from({ length: 24_000 }, (_, i) => (i % 2 ? 16384 : -16384));
+      const meter = new LineMeter();
+      meter.frame(pcm);
       const line = {
         outcome: 'spoken' as const,
         model: 'gemini-3.8-flash-lite-tts',
@@ -1624,7 +1532,7 @@ describe('reply recordings', () => {
         firstAudioMs: 900,
         heldMs: 0,
         durationMs: 1000,
-        ...audioLevels(pcm),
+        ...meter.levels,
       };
       settings.spoke?.(line, pcm);
       const file = path.join(root, 'Andy', new Date().toISOString().slice(0, 10), 'call-1-reply-1.wav');
@@ -1659,7 +1567,6 @@ describe('reply recordings', () => {
     const v = fakeVoice();
     await runCall(ctx, callDeps(host.fetchImpl, v));
     expect(v.createVoice.mock.calls[0][2].recordReplies).toBeUndefined();
-    expect(audioLevels(new Int16Array(10))).toEqual({ peakDb: -Infinity, rmsDb: -Infinity });
     host.endStream();
   });
 });
@@ -1780,13 +1687,13 @@ function reviewControl(overrides: Partial<ReviewDeps> = {}) {
         }),
     ),
     dropRecording: vi.fn(() => void (voice.recording = false)),
-    publishReview: vi.fn((state: CallReviewState) => void states.push(state)),
   };
   const posted: Array<{ text: string; draft: number }> = [];
   const capture: boolean[] = [];
   const cues: CueKind[] = [];
   const control = new ReviewControl({
     voice,
+    publishReview: vi.fn((state: CallReviewState) => void states.push(state)),
     post: vi.fn((text: string, draft: number) => {
       posted.push({ text, draft });
       return posted.length;
@@ -1794,14 +1701,15 @@ function reviewControl(overrides: Partial<ReviewDeps> = {}) {
     lastPosted: () => posted.length,
     setCaptureOpen: (open) => void capture.push(open),
     resetCaller: vi.fn(),
+    configure: () => undefined,
+    wakeState: () => ({ on: false, pauseSends: false, waiting: false }),
     cue: (kind) => void cues.push(kind),
-    sttModel: 'model',
+    ended: () => undefined,
     log: silentLog,
     ...overrides,
   });
   let gen = 0;
   const op = (name: ReviewOp, fields: Partial<ReviewRequest> = {}) => control.handle(name, { gen: ++gen, ...fields });
-  const take = { sttModel: 'model' };
   return {
     control,
     voice,
@@ -1813,7 +1721,7 @@ function reviewControl(overrides: Partial<ReviewDeps> = {}) {
     draft: () => states.at(-1)?.draft,
     /** The recording's text arrives. */
     stop: async (text: string, failed = false) => {
-      stop({ text, failed, take });
+      stop({ text, failed, take: {} });
       await flush();
     },
   };
@@ -1896,7 +1804,7 @@ describe('review mode', () => {
     expect(await r.op('mode', { mode: 'review' })).toMatchObject({ ok: true });
     expect(r.draft()).toMatchObject({ state: 'finishing', reason: 'switch' });
     expect(await r.op('mode', { mode: 'auto' })).toMatchObject({ ok: false, error: 'finishing' });
-    give({ text: 'Book a table', failed: false, take: { sttModel: 'model' } });
+    give({ text: 'Book a table', failed: false, take: {} });
     await flush();
     expect(r.draft()).toMatchObject({ state: 'ready', text: 'Book a table', reason: 'switch' });
     expect(r.posted).toEqual([]);
@@ -2049,7 +1957,7 @@ describe('speech output', () => {
     const speech = lineSpeech({ [ttsId(ELEVEN)]: eleven, [ttsId(GEMINI)]: gemini }, { choice: ELEVEN });
     expect(await speak(speech, 'One.')).toBe(1);
     expect(speech.spokenBy).toEqual(GEMINI);
-    expect(speech.active).toEqual(ELEVEN);
+    expect(speech.state.active).toEqual(ELEVEN);
     // Without its key a provider never speaks: the default does.
     const keyless = new LineSpeech({
       choice: ELEVEN,
@@ -2160,8 +2068,8 @@ function speakingCall(plans: Record<string, (text: string, call: number) => TtsP
         waitForPlayout: async () => undefined,
       },
       log: silentLog,
-      started: () => events.onAgentSpeaking?.(true),
-      stopped: () => events.onAgentSpeaking?.(false),
+      started: () => events.onAgentSpeaking(true),
+      stopped: () => events.onAgentSpeaking(false),
       changed: (state) => void states.push(state),
       build: (choice, apiKey) => {
         const tts = fakeTts(plans[ttsId(choice)] ?? (() => ({ chunks: 1 })));
@@ -2706,7 +2614,6 @@ function turnsHarness(
       names: ['Andy'],
       limits: o.limits,
       record: o.record,
-      sttModel: 'model',
       ...(o.debug ? { debug: true } : {}),
     },
   );
@@ -3419,22 +3326,16 @@ function reviewOverTurns(h: ReturnType<typeof turnsHarness>) {
   const states: CallReviewState[] = [];
   const posted: string[] = [];
   const control = new ReviewControl({
-    voice: {
-      get turnOpen() {
-        return h.turns.turnOpen;
-      },
-      setReviewing: (on) => h.turns.setReviewing(on),
-      prepare: () => h.turns.prepare(),
-      record: () => h.turns.record(),
-      stopRecording: () => h.turns.stopRecording(),
-      dropRecording: () => h.turns.dropRecording(),
-      publishReview: (state) => void states.push(state),
-    },
+    voice: h.turns,
+    publishReview: (state) => void states.push(state),
     post: (text) => posted.push(text),
     lastPosted: () => posted.length,
     setCaptureOpen: () => undefined,
     resetCaller: () => undefined,
-    sttModel: 'model',
+    configure: () => undefined,
+    wakeState: () => h.turns.state,
+    cue: () => undefined,
+    ended: () => undefined,
     log: silentLog,
   });
   let gen = 0;
@@ -3909,7 +3810,12 @@ describe('room output and the caller input', () => {
     const speech: Array<[boolean, number]> = [];
     const input = new CallerInput(
       newVad,
-      { onAudio: () => undefined, onSpeech: (on, at) => void speech.push([on, at]), onClosed: () => undefined },
+      {
+        onAudio: () => undefined,
+        onSpeech: (on, at) => void speech.push([on, at]),
+        onVad: () => undefined,
+        onClosed: () => undefined,
+      },
       { error: () => undefined },
     );
     const frame = () => input.frame(new AudioFrame(new Int16Array(320), 16_000, 1, 320));
@@ -4054,9 +3960,9 @@ describe('commands, cues and review in a call', () => {
     await runCall(ctx, callDeps(host.fetchImpl, v));
     await v.turn('Book a table');
     await vi.waitFor(() => expect(typing).toEqual([true]));
-    v.events.onAgentSpeaking?.(true);
+    v.events.onAgentSpeaking(true);
     expect(typing).toEqual([true, false]);
-    v.events.onAgentSpeaking?.(false);
+    v.events.onAgentSpeaking(false);
     host.emit({ type: 'working' });
     await vi.waitFor(() => expect(typing).toEqual([true, false, true]));
     await v.rpc('settings', { cues: false });
@@ -4094,9 +4000,9 @@ describe('commands, cues and review in a call', () => {
     let finish: (() => void) | undefined;
     v.voice.say.mockImplementation(async (_text: string, ready?: () => Promise<void>) => {
       await ready?.();
-      v.events.onAgentSpeaking?.(true);
+      v.events.onAgentSpeaking(true);
       await new Promise<void>((resolve) => (finish = resolve));
-      v.events.onAgentSpeaking?.(false);
+      v.events.onAgentSpeaking(false);
       return true;
     });
     await runCall(ctx, callDeps(host.fetchImpl, v));
@@ -4120,9 +4026,9 @@ describe('commands, cues and review in a call', () => {
     v.voice.say.mockImplementation(async (text: string, ready?: () => Promise<void>) => {
       await new Promise<void>((resolve) => (synthesized = resolve));
       await ready?.();
-      v.events.onAgentSpeaking?.(true);
+      v.events.onAgentSpeaking(true);
       played.push(text);
-      v.events.onAgentSpeaking?.(false);
+      v.events.onAgentSpeaking(false);
       return true;
     });
     await runCall(ctx, callDeps(host.fetchImpl, v));
@@ -4569,8 +4475,9 @@ describe('acoustic wake word in a call', () => {
 
 describe('whole-call recording', () => {
   it('is on for VOICE_MODE_CALL_RECORDING `true` or `1` only', () => {
-    for (const value of [undefined, '', '0', 'false', 'yes', 'on']) expect(callRecordingOn(value)).toBe(false);
-    for (const value of ['1', 'true', ' true ']) expect(callRecordingOn(value)).toBe(true);
+    const on = (value: string | undefined) => envSwitch(value, ['1', 'true']);
+    for (const value of [undefined, '', '0', 'false', 'yes', 'on', 'TRUE']) expect(on(value)).toBe(false);
+    for (const value of ['1', 'true', ' true ']) expect(on(value)).toBe(true);
   });
 
   it('streams to disk and keeps the header current, so a call cut off without close still reads', async () => {
@@ -4867,9 +4774,9 @@ describe('wide events', () => {
     const settings = v.createVoice.mock.calls[0][2];
     v.voice.say.mockImplementation(async (_text: string, ready?: () => Promise<void>) => {
       await ready?.();
-      v.events.onAgentSpeaking?.(true);
+      v.events.onAgentSpeaking(true);
       settings.spoke?.({ outcome: 'spoken', model: 'tts', fallback: false, durationMs: 800, peakDb: -3, rmsDb: -20 });
-      v.events.onAgentSpeaking?.(false);
+      v.events.onAgentSpeaking(false);
       return true;
     });
     await v.turn('Book a table');
@@ -5698,13 +5605,13 @@ describe('fast send words', () => {
     await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
     await c.wakeUp();
     await c.say(800);
-    c.v.events.onAgentSpeaking?.(true);
+    c.v.events.onAgentSpeaking(true);
     await c.say(600);
     await c.interim('Book a table. Zulu.');
     await c.quiet(900);
     expect(c.ended()).toBe(0);
     expect(utterances(c.host)).toEqual([]);
-    c.v.events.onAgentSpeaking?.(false);
+    c.v.events.onAgentSpeaking(false);
     await c.quiet(700);
     expect(c.ended()).toBe(1);
     expect(count(c.v, 'sent')).toBe(1);

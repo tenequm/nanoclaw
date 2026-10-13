@@ -10,6 +10,25 @@ import type { ChoiceDetails } from './voice-mode-tts-catalog.js';
 
 export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice-mode';
 
+/**
+ * `promise`'s value, or `fallback` once `ms` passed first. The timer is cleared either way and never
+ * holds the process open; a rejection of `promise` before then rejects.
+ */
+export async function settleWithin<T, F>(promise: Promise<T>, ms: number, fallback: F): Promise<T | F> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<F>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** The host pings the worker's event stream this often, so silence means a dead link. */
 export const PING_INTERVAL_MS = 15_000;
 /** The worker drops the host link after this long without a line: three missed pings. */
@@ -29,8 +48,6 @@ export const CALL_PROTOCOL_ATTRIBUTE = 'nanoclaw.voice-mode.protocol';
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
 /** Silence that ends the caller's turn; shorter pauses mid-thought keep it open. */
 export const DEFAULT_VOICE_SILENCE_MS = 2500;
-/** Channel type of the default call chat when `/voice` has not set one (VOICE_MODE_MIRROR). */
-export const DEFAULT_VOICE_MIRROR = 'telegram';
 
 /** The languages callers speak when VOICE_MODE_LANGUAGES is unset (BCP-47; the first is the default). */
 export const DEFAULT_VOICE_LANGUAGES: readonly string[] = ['uk-UA', 'en-US'];
@@ -68,19 +85,14 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
-  /**
-   * VOICE_MODE_LANGUAGES: the transcription's language hints, the first the call's default. The host
-   * always sends them; a worker falls back to DEFAULT_VOICE_LANGUAGES when they are absent.
-   */
-  languages?: string[];
+  /** VOICE_MODE_LANGUAGES: the transcription's language hints, the first the call's default; never empty. */
+  languages: string[];
   /**
    * The agent's own voice.vocabulary.txt entries: besides `agentName`, the names the wake phrase
    * `hey <agent>` takes (another script or spelling of it, say). Absent when the file has none.
    */
   wakeNames?: string[];
   sttModel: string;
-  /** Deprecated and ignored (there is no unary fallback any more); kept for the wire format, empty by default. */
-  sttFallbackModel: string;
   /** The line's effective speech choice at call start. */
   tts: TtsChoice;
   silenceMs: number;
@@ -119,8 +131,7 @@ export interface CallRoomMetadata {
  * agent's runner works on what reached it after that turn, and no reply to it came first), or lost
  * because the transcription failed (`stt`) or heard no words (`empty`), or the host refused it
  * (`rejected`, `rate_limited`) or did not answer (`timeout`). Every turn handed to the host says
- * `sending` first; one lost to the transcription does not. A page that does not know `sending`
- * ignores it (and `working`), so neither needs a version bump.
+ * `sending` first; one lost to the transcription does not.
  */
 export interface CallTurnStatus {
   turn: number;
@@ -152,8 +163,7 @@ export interface CallDroppedSpeech {
 
 /**
  * On the turn topic: the caller started speaking while the agent's line played. Speech under the
- * agent's is not transcribed, so none of it reaches the agent; the page says so. Additive: a page
- * that does not know it ignores it.
+ * agent's is not transcribed, so none of it reaches the agent; the page says so.
  */
 export interface CallUnheardSpeech {
   unheard: 'agent_speaking';
@@ -208,18 +218,14 @@ export interface CallDraft {
  * worker's participant attribute is CALL_COMMANDS_VERSION when it understands them and the
  * `settings` RPC; a page offers the commands only for the values it knows. The worker starts
  * wake-gated until a client's `settings` say otherwise, so a page that does not know its value sends
- * none and leaves it waiting for words the page never names: reload the page with the worker. An
- * older worker sets none, and its auto mode has no commands.
+ * none and leaves it waiting for words the page never names: reload the page with the worker.
  */
 export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice-mode.commands';
 /**
- * The commands' vocabulary: "1" had `over` as the send word; "2" is `zulu`, `copy` and `copy that`
- * with the words announced in CALL_COMMAND_WORDS_ATTRIBUTE (the `send it` era also said "2"); "3" is
- * the same words, bumped so a page from the `send it` era, which drives any "2" and quotes its own
- * words, stops quoting the wrong ones. A page that accepts only "2" (the `send it` era's, or a
- * `zulu` one already open across the bump) offers no commands and sends no `settings` to a "3"
- * worker, which then stays wake-gated until that page is reloaded. A current page drives "2" and "3"
- * alike; a page takes the words themselves from CALL_COMMAND_WORDS_ATTRIBUTE.
+ * The commands' vocabulary: `zulu`, `copy` and `copy that` with the words announced in
+ * CALL_COMMAND_WORDS_ATTRIBUTE. A current page drives "2" and "3" alike and takes the words from that
+ * attribute; a page that accepts only "2" offers no commands and sends no `settings` to a "3" worker,
+ * which then stays wake-gated until that page is reloaded.
  */
 export const CALL_COMMANDS_VERSION = '3';
 
@@ -256,7 +262,7 @@ export const CALL_COMMAND_WORDS: CallCommandWords = {
 };
 /**
  * The worker's participant attribute with CALL_COMMAND_WORDS as compact JSON, set with
- * CALL_COMMANDS_ATTRIBUTE. Additive: a page without it uses its own list, and an old page ignores it.
+ * CALL_COMMANDS_ATTRIBUTE.
  */
 export const CALL_COMMAND_WORDS_ATTRIBUTE = 'nanoclaw.voice-mode.command-words';
 /**
@@ -306,7 +312,7 @@ export function wakePhrase(env: { VOICE_MODE_WAKE_MODEL?: string; VOICE_MODE_WAK
 /**
  * The worker's review state; `seq` grows with every change, so the page keeps the newest.
  * `preparing`: talk is setting up the recording's transcription; it answers once that can take audio
- * (at most a few seconds), so the page keeps talk off meanwhile. Absent from an older worker.
+ * (at most a few seconds), so the page keeps talk off meanwhile.
  */
 export interface CallReviewState {
   seq: number;
@@ -490,78 +496,4 @@ export function liveKitHostUrl(env: { LIVEKIT_HOST_URL?: string; WEBHOOK_PORT?: 
     );
   }
   return raw;
-}
-
-/**
- * The settings main read as `VOICE_<suffix>`, still read for their `VOICE_MODE_<suffix>` names: the
- * upgrade runbook's rename table. Settings new to voice-mode (VOICE_MODE_PORT, VOICE_MODE_PAGE_HOST,
- * VOICE_MODE_LANGUAGES) have no old name.
- */
-export const LEGACY_VOICE_KEYS: readonly string[] = [
-  'VOICE_PUBLIC_URL',
-  'VOICE_LINK_TOKEN',
-  'VOICE_UI',
-  'VOICE_MAX_CALL_SECONDS',
-  'VOICE_MAX_CALLS_PER_HOUR',
-  'VOICE_MAX_MINUTES_PER_DAY',
-  'VOICE_ALLOW_NON_LOOPBACK',
-  'VOICE_TRUSTED_PROXY_CIDRS',
-  'VOICE_ALLOWED_CLIENT_CIDRS',
-  'VOICE_VOCABULARY',
-  'VOICE_STT_MODEL',
-  'VOICE_STT_FALLBACK_MODEL',
-  'VOICE_TTS_MODEL',
-  'VOICE_TTS_FALLBACK_MODEL',
-  'VOICE_TTS_VOICE',
-  'VOICE_SILENCE_MS',
-  'VOICE_MIRROR',
-  'VOICE_WAKE_MODEL',
-  'VOICE_WAKE_PHRASE',
-  'VOICE_WAKE_THRESHOLD',
-  'VOICE_WAKE_START_SECONDS',
-  'VOICE_WAKE_IDLE_SECONDS',
-  'VOICE_RECORDINGS_DAYS',
-  'VOICE_MAX_SPOKEN_CHARS',
-  'VOICE_TTS_DEESS',
-  'VOICE_TTS_NOTCH',
-  'VOICE_WORKER_HEALTH_PORT',
-];
-
-/** Old names outside the `VOICE_<suffix>` rule, mapped to the `VOICE_MODE_*` names that replace them. */
-export const LEGACY_VOICE_ALIASES: Readonly<Record<string, string>> = { GEMINI_API_KEY: 'VOICE_MODE_GEMINI_API_KEY' };
-
-/** The keys to read from `.env`: each requested key, and the old name of a `VOICE_MODE_*` one that had one. */
-export function voiceModeEnvKeys(keys: readonly string[]): string[] {
-  return [
-    ...new Set(
-      keys.flatMap((key) => {
-        const old = key.replace(/^VOICE_MODE_/, 'VOICE_');
-        const aliases = Object.keys(LEGACY_VOICE_ALIASES).filter((alias) => LEGACY_VOICE_ALIASES[alias] === key);
-        return [key, ...(old !== key && LEGACY_VOICE_KEYS.includes(old) ? [old] : []), ...aliases];
-      }),
-    ),
-  ];
-}
-
-/**
- * `.env` values with each old LEGACY_VOICE_KEYS or LEGACY_VOICE_ALIASES setting under its
- * `VOICE_MODE_*` name, unless that name is set too, in which case the old one is ignored. `warn`
- * hears key names only, never values.
- */
-export function voiceModeEnv(env: Record<string, string>, warn: (message: string) => void): Record<string, string> {
-  const out = { ...env };
-  const renames: [string, string][] = [
-    ...LEGACY_VOICE_KEYS.map((key): [string, string] => [key, key.replace(/^VOICE_/, 'VOICE_MODE_')]),
-    ...Object.entries(LEGACY_VOICE_ALIASES),
-  ];
-  for (const [key, renamed] of renames) {
-    if (env[key] === undefined) continue;
-    if (env[renamed] === undefined) {
-      out[renamed] = env[key];
-      warn(`voice-mode: ${key} is deprecated; use ${renamed}`);
-    } else {
-      warn(`voice-mode: ${key} is ignored because ${renamed} is set; remove it`);
-    }
-  }
-  return out;
 }

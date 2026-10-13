@@ -49,9 +49,17 @@ const ALWAYS_PURGE_SCOPES: BotCommandScope[] = [
   { type: 'all_chat_administrators' },
 ];
 
-/** The command list pushed to one admin scope (the grant's commands, in order, with descriptions). */
-function commandList(names: readonly CommandName[]): BotCommand[] {
-  return names.map((name) => ({ command: name, description: COMMANDS[name].description }));
+/**
+ * The command list pushed to one admin scope (the grant's commands, in order, with descriptions).
+ * /voice is ephemeral: the command stays private to its sender, and its reply (the call link) may
+ * answer it privately even where the bot is not a chat admin.
+ */
+export function commandList(names: readonly CommandName[]): BotCommand[] {
+  return names.map((name) => ({
+    command: name,
+    description: COMMANDS[name].description,
+    ...(name === 'voice' ? { is_ephemeral: true } : {}),
+  }));
 }
 
 /** Numeric id out of a `telegram:<id>` platform/user id. NaN-safe (returns null). */

@@ -5,14 +5,14 @@
  * `/v2/voices` directly (the plugin's `listVoices()` reads the legacy v1 listing, without filters,
  * labels or samples). The host names voices from each provider's whole listing, held in its memory
  * only and refreshed in the background; an ElevenLabs voice outside it (a library voice) is asked
- * for by id. The worker (`lazy`) asks only about the voices its calls use. Everything kept is per
- * provider key. The keys stay in request headers: no answer, cache key or log line carries them.
+ * for by id. The worker (`lazy`) asks only about the voices its calls use. A catalog holds one key per
+ * provider for its whole life. The keys stay in request headers: no answer, cache key or log line
+ * carries them.
  */
-import { createHash } from 'node:crypto';
-
 import { GoogleGenAI } from '@google/genai';
 
 import { log as hostLog } from '../log.js';
+import { settleWithin } from './voice-mode-protocol.js';
 import { TTS_REGISTRY, type ProviderKeys, type TtsChoice, type TtsProvider } from '../voice-mode-tts.js';
 
 export interface CatalogVoice {
@@ -64,24 +64,19 @@ export interface ChoiceDetails {
 }
 
 export interface VoiceCatalog {
-  page(provider: TtsProvider, apiKey: string, query: CatalogQuery): Promise<CatalogResult>;
+  page(provider: TtsProvider, query: CatalogQuery): Promise<CatalogResult>;
   /**
    * A voice by its exact id; never throws. On the host it waits LOOKUP_WAIT_MS at most for each load it
    * needs (a `confirm` can need two); the worker's (`lazy`) waits on its loads' own timeouts. `confirm`
    * (a save) asks again before an answer of `unavailable`: Gemini by a fresh listing, ElevenLabs by id.
    */
-  lookup(
-    provider: TtsProvider,
-    apiKey: string | undefined,
-    id: string,
-    options?: { confirm?: boolean },
-  ): Promise<VoiceLookup>;
+  lookup(provider: TtsProvider, id: string, options?: { confirm?: boolean }): Promise<VoiceLookup>;
   /** What memory already holds about a voice, asking nothing; undefined when it holds nothing certain. */
-  known(provider: TtsProvider, apiKey: string | undefined, id: string): VoiceStatus | undefined;
+  known(provider: TtsProvider, id: string): VoiceStatus | undefined;
   /** The choice's names, as lookup finds its voice. */
-  details(choice: TtsChoice, apiKey: string | undefined): Promise<ChoiceDetails>;
+  details(choice: TtsChoice): Promise<ChoiceDetails>;
   /** Loads the name listings of the providers with a key, in the background, and keeps them refreshed. */
-  warm(keys: ProviderKeys): void;
+  warm(): void;
   /** Stops the refreshes warm scheduled. */
   close(): void;
 }
@@ -111,8 +106,7 @@ const VOICE_TTL_MS: Record<VoiceStatus, number> = {
 const NAMES_PAGE_SIZE: Record<TtsProvider, number> = { gemini: 1000, elevenlabs: 100 };
 const MAX_NAMES_PAGES = 20;
 const MAX_KEPT_VOICES = 500;
-const MAX_ACCOUNTS = 8;
-/** Lazy Gemini listings kept: one per key and language, and each key's whole one. */
+/** Lazy Gemini listings kept: one per language, and the whole one. */
 const MAX_LAZY_LISTINGS = 32;
 
 /**
@@ -129,10 +123,6 @@ const malformed = (provider: TtsProvider, id: string): boolean => {
   const entry = TTS_REGISTRY[provider];
   return entry.validate({ model: entry.defaults.model, voice: id }) !== null;
 };
-
-/** What everything kept is filed under: the provider and a digest of its key, never the key. */
-const accountOf = (provider: TtsProvider, apiKey: string): string =>
-  `${provider}:${createHash('sha256').update(apiKey).digest('hex').slice(0, 16)}`;
 
 /** A failure this module describes itself; its message is safe to log. */
 class CatalogError extends Error {}
@@ -214,7 +204,7 @@ interface LazyListing {
   voices: Promise<Map<string, VoiceRecord> | undefined>;
 }
 
-/** One provider key's names: its last whole listing and the voices asked for by id. */
+/** One provider's names: its last whole listing and the voices asked for by id. */
 interface Names {
   voices?: Map<string, VoiceRecord>;
   /** When the load of `voices` started: it may lack a voice made while it ran. */
@@ -231,15 +221,16 @@ interface Names {
   doubted: Map<string, number>;
 }
 
-export function createVoiceCatalog(
-  options: {
-    fetch?: typeof fetch;
-    log?: Pick<Console, 'info' | 'warn'>;
-    now?: () => number;
-    /** Names only for the ids asked about, nothing loaded ahead (the worker): ElevenLabs by id, Gemini one language's voices. */
-    lazy?: boolean;
-  } = {},
-): VoiceCatalog {
+export function createVoiceCatalog(options: {
+  /** The providers' keys (VOICE_MODE_<PROVIDER>_API_KEY); one without a key answers nothing. */
+  keys: ProviderKeys;
+  fetch?: typeof fetch;
+  log?: Pick<Console, 'info' | 'warn'>;
+  now?: () => number;
+  /** Names only for the ids asked about, nothing loaded ahead (the worker): ElevenLabs by id, Gemini one language's voices. */
+  lazy?: boolean;
+}): VoiceCatalog {
+  const { keys } = options;
   const fetchFn = options.fetch ?? fetch;
   const log = options.log ?? hostLog;
   const now = options.now ?? (() => Date.now());
@@ -335,15 +326,13 @@ export function createVoiceCatalog(
   };
 
   const pages = new Map<string, { at: number; result: Promise<CatalogResult> }>();
-  const accounts = new Map<string, Names>();
+  const byProvider = new Map<TtsProvider, Names>();
 
-  const namesOf = (provider: TtsProvider, apiKey: string, create = true): Names | undefined => {
-    const account = accountOf(provider, apiKey);
-    let names = accounts.get(account);
-    if (!names && create) {
-      makeRoom(accounts, MAX_ACCOUNTS);
+  const namesOf = (provider: TtsProvider): Names => {
+    let names = byProvider.get(provider);
+    if (!names) {
       names = { loadedAt: 0, failedAt: -Infinity, stale: false, byId: new Map(), doubted: new Map() };
-      accounts.set(account, names);
+      byProvider.set(provider, names);
     }
     return names;
   };
@@ -400,9 +389,7 @@ export function createVoiceCatalog(
   };
 
   const within = async (pending: Promise<unknown> | undefined): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([pending, new Promise((resolve) => (timer = setTimeout(resolve, LOOKUP_WAIT_MS)))]);
-    clearTimeout(timer);
+    await settleWithin(Promise.resolve(pending), LOOKUP_WAIT_MS, undefined);
   };
 
   const elevenLabsById = async (apiKey: string, id: string): Promise<VoiceLookup> => {
@@ -453,11 +440,11 @@ export function createVoiceCatalog(
     return entry.found;
   };
 
-  /** Lazy Gemini listings by key and language (none: the whole listing). */
+  /** Lazy Gemini listings by language (none: the whole listing). */
   const listings = new Map<string, LazyListing>();
 
   const lazyListing = (apiKey: string, language?: string): Promise<Map<string, VoiceRecord> | undefined> => {
-    const key = `${accountOf('gemini', apiKey)}:${language ?? ''}`;
+    const key = language ?? '';
     const kept = listings.get(key);
     const ttl = kept?.ok ? NAMES_TTL_MS : VOICE_TTL_MS.lookup_failed;
     if (kept && (kept.ok === undefined || now() - kept.at < ttl)) return kept.voices;
@@ -492,11 +479,12 @@ export function createVoiceCatalog(
   const provesAbsent = (names: Names, id: string): boolean =>
     !!names.voices && !names.stale && now() - names.loadedAt < ABSENCE_TTL_MS && !names.doubted.has(id);
 
-  const lookup: VoiceCatalog['lookup'] = async (provider, apiKey, id, { confirm = false } = {}) => {
+  const lookup: VoiceCatalog['lookup'] = async (provider, id, { confirm = false } = {}) => {
+    const apiKey = keys[provider];
     if (!apiKey) return { status: 'lookup_failed' };
     if (malformed(provider, id)) return { status: 'unavailable' };
     if (options.lazy && provider === 'gemini') return lazyGemini(apiKey, id);
-    const names = namesOf(provider, apiKey)!;
+    const names = namesOf(provider);
     if (options.lazy) return elevenLabsKept(names, apiKey, id, confirm);
     const asked = now();
     const loading = refresh(names, provider, apiKey);
@@ -523,15 +511,10 @@ export function createVoiceCatalog(
   let refreshing: ReturnType<typeof setInterval> | undefined;
 
   return {
-    async page(provider, apiKey, query) {
-      const key = JSON.stringify([
-        accountOf(provider, apiKey),
-        query.q,
-        query.language,
-        query.gender,
-        query.cursor,
-        query.limit,
-      ]);
+    async page(provider, query) {
+      const apiKey = keys[provider];
+      if (!apiKey) return { error: 'upstream' };
+      const key = JSON.stringify([provider, query.q, query.language, query.gender, query.cursor, query.limit]);
       const kept = pages.get(key);
       if (kept && now() - kept.at < PAGE_TTL_MS) return kept.result;
       pages.delete(key);
@@ -546,20 +529,20 @@ export function createVoiceCatalog(
       return result;
     },
     lookup,
-    known(provider, apiKey, id) {
-      if (!apiKey || options.lazy) return undefined;
+    known(provider, id) {
+      if (!keys[provider] || options.lazy) return undefined;
       if (malformed(provider, id)) return 'unavailable';
-      const names = namesOf(provider, apiKey, false);
+      const names = byProvider.get(provider);
       if (!names) return undefined;
       if (names.voices?.has(id)) return 'resolved';
       if (provider === 'gemini') return provesAbsent(names, id) ? 'unavailable' : undefined;
       return keptStatus(names.byId.get(id));
     },
-    details: async (choice, apiKey) => choiceDetails(choice, await lookup(choice.provider, apiKey, choice.voice)),
-    warm(keys) {
+    details: async (choice) => choiceDetails(choice, await lookup(choice.provider, choice.voice)),
+    warm() {
       const load = () => {
         for (const [provider, apiKey] of Object.entries(keys) as Array<[TtsProvider, string | undefined]>) {
-          if (apiKey) void refresh(namesOf(provider, apiKey)!, provider, apiKey);
+          if (apiKey) void refresh(namesOf(provider), provider, apiKey);
         }
       };
       load();

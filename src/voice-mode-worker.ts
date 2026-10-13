@@ -18,10 +18,9 @@
  *    turn with thinking pauses is transcribed as one piece;
  *  - each finished turn goes to the host, which hands it to the agent as a spoken message;
  *  - each complete agent reply from the host's event stream is spoken once the caller is not
- *    mid-turn, in full (cut at a sentence end only when VOICE_MODE_MAX_SPOKEN_CHARS sets a cap),
- *    uninterruptible: while it plays the caller is not transcribed (no barge-in). The line's TTS
- *    provider (`voice-mode-tts.ts`) streams the whole reply from one request into the call's speech
- *    track, and a fallback speaks while it fails; the caller's page can switch it mid-call.
+ *    mid-turn, in full, uninterruptible: while it plays the caller is not transcribed (no barge-in).
+ *    The line's TTS provider (`voice-mode-tts.ts`) streams the whole reply from one request into the
+ *    call's speech track, and a fallback speaks while it fails; the caller's page can switch it mid-call.
  * The worker publishes the captions, `lk.agent.state` and its own attributes the page reads.
  */
 import { randomUUID } from 'node:crypto';
@@ -58,15 +57,12 @@ import {
   TrackSource,
   type RemoteTrack,
   type RemoteTrackPublication,
+  type LocalParticipant,
   type RemoteParticipant,
-  type Room,
 } from '@livekit/rtc-node';
 
 import {
   baseLanguage,
-  DEFAULT_VOICE_LANGUAGES,
-  voiceModeEnv,
-  voiceModeEnvKeys,
   wakePhrase,
   DEFAULT_LIVEKIT_AGENT_NAME,
   HOST_SILENCE_MS,
@@ -122,7 +118,6 @@ import {
   type Heard,
   type TranscriberOptions,
 } from './voice-mode-gemini-live.js';
-import { JevTurnShadow, type TurnShadowSink } from './voice-mode-jev-turn.js';
 import {
   providerKeysFrom,
   readTtsChoice,
@@ -138,7 +133,7 @@ import {
   DEFAULT_WAKE_MODEL,
   DEFAULT_WAKE_THRESHOLD,
   WakeWordSpotter,
-  type WakeWordStats,
+  type WakeWordOptions,
 } from './voice-mode-wakeword.js';
 
 /** The worker's duration cap outlasts the host's by this; it only fires when the host is gone. */
@@ -184,6 +179,14 @@ const MAX_RECORDED_TURN_MS = 120_000;
 const TURN_RETRY_DELAY_MS = 500;
 /** Timed-out turns kept for a late `turn-stored`; the host remembers no more turn keys than this either. */
 const MAX_UNCONFIRMED_TURNS = 32;
+/** `map.set`, then the oldest entries go past MAX_UNCONFIRMED_TURNS. */
+function setCapped<K, V>(map: Map<K, V>, key: K, value: V): void {
+  map.set(key, value);
+  for (const old of map.keys()) {
+    if (map.size <= MAX_UNCONFIRMED_TURNS) break;
+    map.delete(old);
+  }
+}
 /** A manual recording's text freezes at most this long after done. */
 const FINISH_TIMEOUT_MS = 4_000;
 /** A turn's audio starts this long before the speech that opened it: manual activity has no padding. */
@@ -201,8 +204,6 @@ const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 /** `promise`, or nothing once `ms` passed; the timer keeps no process alive. */
 const atMost = (promise: Promise<unknown>, ms: number): Promise<unknown> =>
   Promise.race([promise, new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.())]);
-/** VOICE_MODE_MAX_SPOKEN_CHARS when unset: 0, no cap; a reply is spoken in full however long it runs. */
-export const DEFAULT_MAX_SPOKEN_CHARS = 0;
 const DAY_MS = 86_400_000;
 
 const samplesOf = (ms: number): number => Math.round((ms * INPUT_SAMPLE_RATE) / 1000);
@@ -225,6 +226,13 @@ export class HostLink {
       body: JSON.stringify({ callId: this.link.callId, ...body }),
       signal: AbortSignal.timeout(WORKER_REQUEST_TIMEOUT_MS),
     });
+  }
+
+  /** Post and drop the response body; null when the host could not be reached. */
+  async tell(path: 'joined' | 'ended', body: Record<string, unknown> = {}): Promise<Response | null> {
+    const res = await this.post(path, body).catch(() => null);
+    await res?.body?.cancel().catch(() => undefined);
+    return res;
   }
 
   /** Read the host's event stream until it ends; rejects when it fails or goes silent. */
@@ -308,9 +316,9 @@ export interface CallLanguages {
   ukrainian: boolean;
 }
 
-/** The call's languages from the job metadata; DEFAULT_VOICE_LANGUAGES when the host sent none. */
-export function callLanguages(languages: readonly string[] | undefined): CallLanguages {
-  const codes = languages?.length ? [...languages] : [...DEFAULT_VOICE_LANGUAGES];
+/** The call's languages from the job metadata. */
+export function callLanguages(languages: readonly string[]): CallLanguages {
+  const codes = [...languages];
   const ukrainian = codes.some((code) => baseLanguage(code) === 'uk');
   return { codes, initial: baseLanguage(codes[0]) === 'uk' ? 'uk' : 'en', ukrainian };
 }
@@ -329,28 +337,6 @@ export const FAILURE_LINES: Record<FailureKind, Record<CallLanguage, string>> = 
   reply: { uk: 'Не вийшло озвучити відповідь, вона є на екрані.', en: "Sorry, I couldn't read that reply out." },
 };
 export type FailureKind = 'turn' | 'rejected' | 'rate_limited' | 'timeout' | 'timeout_no_chat' | 'reply';
-
-/** Said after a message cut for speech: the full text is in the chat, or, on a call with no chat, nowhere to point at. */
-export const CUT_LINES: Record<'chat' | 'no_chat', Record<CallLanguage, string>> = {
-  chat: { uk: 'Решта - у чаті.', en: 'The rest is in the chat.' },
-  no_chat: { uk: 'Скорочую.', en: "I've cut it short." },
-};
-
-/** A sentence end earlier than this share of the cap wastes the budget: the cut goes to a word instead. */
-const MIN_SENTENCE_CUT = 0.6;
-
-/** VOICE_MODE_MAX_SPOKEN_CHARS: a whole number of characters, 0 for no cap; anything else is the default (no cap). */
-export function maxSpokenChars(raw: string | undefined): number {
-  const value = raw?.trim();
-  if (!value) return DEFAULT_MAX_SPOKEN_CHARS;
-  const chars = Number(value);
-  return Number.isInteger(chars) && chars >= 0 ? chars : DEFAULT_MAX_SPOKEN_CHARS;
-}
-
-/** VOICE_MODE_TTS_DEESS: the de-esser runs unless it says 0, off or false. */
-export function ttsDeess(raw: string | undefined): boolean {
-  return !['0', 'off', 'false'].includes(raw?.trim().toLowerCase() ?? '');
-}
 
 export interface DeEsserOptions {
   sampleRate: number;
@@ -427,11 +413,6 @@ export function deEsser(o: DeEsserOptions): (pcm: Int16Array) => Int16Array {
     }
     return out;
   };
-}
-
-/** VOICE_MODE_TTS_NOTCH: the whistle notches run unless it says 0, off or false. */
-export function ttsNotch(raw: string | undefined): boolean {
-  return ttsDeess(raw);
 }
 
 /**
@@ -529,30 +510,6 @@ export function lineResampler(rate = TTS_SAMPLE_RATE): (audio: TtsAudio) => Int1
   };
 }
 
-/**
- * Speakable text cut to `max` characters for a call: up to the last sentence end within the cap when
- * that keeps most of it, else the last whole word, then a closing line (CUT_LINES; "the rest is in the
- * chat" only when `inChat`). Unchanged when it fits or `max` is 0.
- */
-export function capSpokenText(text: string, max: number, language: CallLanguage, inChat: boolean): string {
-  if (max <= 0 || text.length <= max) return text;
-  const closing = CUT_LINES[inChat ? 'chat' : 'no_chat'][language];
-  // One character past the cap shows whether the text breaks right at it.
-  const span = text.slice(0, max + 1);
-  let cut = 0;
-  for (const m of span.matchAll(/[.!?…]+["'»”)\]]*(?=\s)/g)) {
-    const end = m.index + m[0].length;
-    if (end <= max) cut = end;
-  }
-  if (cut < max * MIN_SENTENCE_CUT) cut = 0;
-  let head = text.slice(0, cut).trim();
-  if (!head) {
-    const space = span.search(/\s\S*$/);
-    head = space > 0 ? `${text.slice(0, space).replace(/[\s,;:–—-]+$/, '')}…` : '';
-  }
-  return head ? `${head} ${closing}` : closing;
-}
-
 /** The language a transcript is in, by its script; undefined when it has no letters. Cyrillic is Ukrainian only when the call speaks it. */
 export function languageOf(text: string, ukrainian: boolean): CallLanguage | undefined {
   if (/\p{Script=Cyrillic}/u.test(text)) return ukrainian ? 'uk' : 'en';
@@ -606,10 +563,6 @@ export class LineSpeech {
   constructor(private readonly opts: LineSpeechOptions) {
     this.current = opts.choice;
     this.now = opts.now ?? (() => Date.now());
-  }
-
-  get active(): TtsChoice {
-    return this.current;
   }
 
   get state(): CallVoiceState {
@@ -909,9 +862,14 @@ export class SendCountdown {
   }
 }
 
-function pcmToWav(pcm: Int16Array, sampleRate: number): Buffer {
+function pcmBytes(pcm: Int16Array): Buffer {
   const data = Buffer.alloc(pcm.length * 2);
   for (let i = 0; i < pcm.length; i++) data.writeInt16LE(pcm[i], i * 2);
+  return data;
+}
+
+function pcmToWav(pcm: Int16Array, sampleRate: number): Buffer {
+  const data = pcmBytes(pcm);
   const header = Buffer.alloc(44);
   header.write('RIFF', 0, 'ascii');
   header.writeUInt32LE(36 + data.length, 4);
@@ -939,7 +897,7 @@ export interface TurnRecord {
   endedAt: string;
   speechMs: number;
   truncated: boolean;
-  /** The model that transcribed the turn: the streaming one, the fallback, or both joined by '+'. */
+  /** The model that transcribed the turn. */
   sttModel: string;
   /** The text handed to the host; empty when the turn was dropped or lost, with `reason`. */
   transcript: string;
@@ -956,13 +914,6 @@ export const pathSegment = (name: string): string =>
     .replace(/[^\p{L}\p{N}_-]+/gu, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 64) || 'unnamed';
-
-/** A recording's peak and RMS, in dBFS. */
-export function audioLevels(pcm: Int16Array): { peakDb: number; rmsDb: number } {
-  const meter = new LineMeter();
-  meter.frame(pcm);
-  return meter.levels;
-}
 
 /** One spoken line, as its `voice-mode.reply` event reports it: never its words. */
 export interface SpokenLine {
@@ -1042,6 +993,12 @@ export class LineMeter {
   }
 }
 
+/** A recording's `<root>/<agent>/<YYYY-MM-DD>` directory (`at` an ISO time), and its `<callId>-<suffix>` path there. */
+const recordingPath = (root: string, call: { agent: string; callId: string }, at: string, suffix: string) => {
+  const dir = path.join(root, pathSegment(call.agent), at.slice(0, 10));
+  return { dir, base: path.join(dir, `${pathSegment(call.callId)}-${suffix}`) };
+};
+
 /**
  * Writes a spoken reply's audio, exactly as it went to the speech track (24 kHz mono), as
  * `<root>/<agent>/<YYYY-MM-DD>/<callId>-reply-<n>.wav`, next to the call's turn recordings, owner-only.
@@ -1053,18 +1010,17 @@ export async function writeReplyRecording(
   pcm: Int16Array,
   at = Date.now(),
 ): Promise<string> {
-  const dir = path.join(root, pathSegment(call.agent), new Date(at).toISOString().slice(0, 10));
+  const { dir, base } = recordingPath(root, call, new Date(at).toISOString(), `reply-${reply}`);
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
-  const file = path.join(dir, `${pathSegment(call.callId)}-reply-${reply}.wav`);
+  const file = `${base}.wav`;
   await fs.promises.writeFile(file, pcmToWav(pcm, TTS_SAMPLE_RATE), { mode: 0o600 });
   return file;
 }
 
 /** Writes `<root>/<agent>/<YYYY-MM-DD>/<callId>-<turn>.wav` and `.json`, owner-only. */
 export async function writeTurnRecording(root: string, record: TurnRecord, audio: TurnAudio): Promise<string> {
-  const dir = path.join(root, pathSegment(record.agent), record.startedAt.slice(0, 10));
+  const { dir, base } = recordingPath(root, record, record.startedAt, String(record.turn));
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
-  const base = path.join(dir, `${pathSegment(record.callId)}-${record.turn}`);
   await fs.promises.writeFile(`${base}.wav`, pcmToWav(audio.pcm, audio.sampleRate), { mode: 0o600 });
   await fs.promises.writeFile(`${base}.json`, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   return base;
@@ -1115,8 +1071,8 @@ export class CallRecording {
     at = Date.now(),
   ) {
     const startedAt = new Date(at).toISOString();
-    const dir = path.join(root, pathSegment(call.agent), startedAt.slice(0, 10));
-    this.base = path.join(dir, `${pathSegment(call.callId)}-call`);
+    const { dir, base } = recordingPath(root, call, startedAt, 'call');
+    this.base = base;
     this.record = { ...call, startedAt, wakes: [] };
     this.file = fs.promises
       .mkdir(dir, { recursive: true, mode: 0o700 })
@@ -1129,8 +1085,7 @@ export class CallRecording {
 
   push(pcm: Int16Array): void {
     if (this.closed || pcm.length === 0) return;
-    const data = Buffer.alloc(pcm.length * 2);
-    for (let i = 0; i < pcm.length; i++) data.writeInt16LE(pcm[i], i * 2);
+    const data = pcmBytes(pcm);
     const at = 44 + this.bytes;
     this.bytes += data.length;
     this.sinceHeader += pcm.length;
@@ -1230,11 +1185,15 @@ export async function pruneRecordings(root: string, days: number, now = Date.now
   return removed;
 }
 
-/** VOICE_MODE_TRANSCRIPT_DEBUG: `1` logs every raw transcription message and what the turns made of it. */
-export const transcriptDebugOn = (value: string | undefined): boolean => value?.trim() === '1';
-
-/** VOICE_MODE_CALL_RECORDING: `true` or `1` records each caller's whole call, waiting included. */
-export const callRecordingOn = (value: string | undefined): boolean => ['1', 'true'].includes(value?.trim() ?? '');
+/**
+ * A worker on/off setting. With no `on` list it is on unless it says 0, off or false in any case
+ * (VOICE_MODE_TTS_DEESS, VOICE_MODE_TTS_NOTCH); with one, on only for one of those values exactly
+ * (VOICE_MODE_TRANSCRIPT_DEBUG `1`, VOICE_MODE_CALL_RECORDING `1` or `true`).
+ */
+export function envSwitch(raw: string | undefined, on?: readonly string[]): boolean {
+  const value = raw?.trim() ?? '';
+  return on ? on.includes(value) : !['0', 'off', 'false'].includes(value.toLowerCase());
+}
 
 /** VOICE_MODE_RECORDINGS_DAYS: 0 (the default) records nothing. */
 export function recordingDays(raw: string | undefined): number {
@@ -1257,15 +1216,15 @@ export interface CallVoice {
   /** One message on the `nanoclaw.voice-mode.reply` topic, sent right before the line it describes is spoken. */
   publishReply(info: CallReplyInfo): void;
   /** Words that will never be sent, on the `nanoclaw.voice-mode.turn` topic. */
-  publishDropped?(dropped: CallDroppedSpeech): void;
+  publishDropped(dropped: CallDroppedSpeech): void;
   /** On the `nanoclaw.voice-mode.turn` topic: the caller spoke under the agent's line, unheard. */
-  publishUnheard?(): void;
+  publishUnheard(): void;
   /** The page's send countdown (the `nanoclaw.voice-mode.pending` attribute); '' clears it. */
-  setPending?(value: string): void;
+  setPending(value: string): void;
   /** The caller's caption for turn `segment`: interim text as it grows, then its final text; `mark` when it ends in a command. */
-  caption?(segment: number, text: string, final: boolean, mark?: CaptionMark): void;
-  /** Review mode's controls; absent where the room cannot run it. */
-  review?: ReviewSession;
+  caption(segment: number, text: string, final: boolean, mark?: CaptionMark): void;
+  /** Review mode's controls. */
+  review: ReviewSession;
   /**
    * The `settings` RPC's `tts` of request `gen`: what speaks from the next line on. Returns the reply's
    * error when it is refused; absent where the room cannot switch.
@@ -1275,7 +1234,7 @@ export interface CallVoice {
    * Play a sound cue on the call's cue track; resolves once the track took all of it (heard about 0.1 s
    * later). `started` once it took the first frame.
    */
-  playCue?(kind: CueKind, started?: () => void): Promise<void>;
+  playCue(kind: CueKind, started?: () => void): Promise<void>;
   /** Loop the typing sound on the cue track (under no cue), or stop it. */
   setTyping?(on: boolean): void;
   close(): Promise<void>;
@@ -1300,16 +1259,15 @@ export interface CallVoiceEvents {
   /** The VAD: the caller's speech started or ended at stream position `at` (16 kHz samples). */
   onSpeech(speaking: boolean, at: number): void;
   /** The VAD analyzed the audio through stream position `at`, its last window with speech ending at `quietFrom`. */
-  onVad?(at: number, quietFrom: number): void;
+  onVad(at: number, quietFrom: number): void;
   /** The agent's audio started or stopped playing. */
-  onAgentSpeaking?(speaking: boolean): void;
+  onAgentSpeaking(speaking: boolean): void;
   onClosed(reason: string): void;
 }
 
-/** A finished turn's recording, if turns are recorded, and which transcription model heard it. */
+/** A finished turn's recording, if turns are recorded. */
 export interface TurnTake {
   audio?: TurnAudio;
-  sttModel: string;
   /** How its activity went, for its `voice-mode.turn` event. */
   facts?: TurnFacts;
 }
@@ -1424,7 +1382,6 @@ export class TurnTaking {
       language: CallLanguage;
       /** Whether the call's languages include Ukrainian (callLanguages); unset is yes. */
       ukrainian?: boolean;
-      maxSpokenChars?: number;
     },
   ) {
     this.now = deps.now ?? (() => Date.now());
@@ -1471,12 +1428,6 @@ export class TurnTaking {
     this.wake();
   }
 
-  /** A finished caller turn; sent to the host in order, without holding up the session. */
-  onTurn(text: string, onSent?: TurnSent): void {
-    if (this.closed) return;
-    this.reserve().send(text, onSent);
-  }
-
   /**
    * A place in the order turns go to the host in, taken as a turn closes, before its text is in: filled
    * with its text, or skipped. A slot filled after the call ended still goes: its sent cue played.
@@ -1509,11 +1460,7 @@ export class TurnTaking {
       return;
     }
     // Its 504 may still be on the way: that turn then counts as taken, and holds nothing back.
-    this.storedEarly.set(turnKey, id);
-    for (const key of this.storedEarly.keys()) {
-      if (this.storedEarly.size <= MAX_UNCONFIRMED_TURNS) break;
-      this.storedEarly.delete(key);
-    }
+    setCapped(this.storedEarly, turnKey, id);
   }
 
   /** Settles once every turn that closed so far went to the host or was skipped. */
@@ -1563,13 +1510,7 @@ export class TurnTaking {
     this.replyComing = !!full;
     this.refresh();
     if (!full) return;
-    const max = this.options.maxSpokenChars ?? DEFAULT_MAX_SPOKEN_CHARS;
-    if (max > 0 && full.length > max) {
-      this.deps.log.info('voice-mode worker: a long message is cut for speech', { chars: full.length, max });
-    }
     this.enqueue(async () => {
-      // Cut when spoken, so the closing line is in the language of the caller's latest turn.
-      const spoken = capSpokenText(full, max, this.options.language, this.inChat);
       let about: Omit<CallReplyInfo, 'reply' | 'more'>;
       if (typeof turn === 'number') {
         const part = (this.partsByTurn.get(turn) ?? 0) + 1;
@@ -1579,12 +1520,12 @@ export class TurnTaking {
         about = turn === null ? { unprompted: true } : {};
       }
       const reply = this.announce(about);
-      const heard = await this.say(spoken).finally(() => this.replyHeard());
+      const heard = await this.say(full).finally(() => this.replyHeard());
       if (heard) return;
       if (this.closed) return;
       this.deps.log.warn('voice-mode worker: a reply could not be synthesized');
       // Nothing was heard: the page shows the words instead.
-      this.deps.announce?.({ reply, ...about, unspoken: true, text: spoken });
+      this.deps.announce?.({ reply, ...about, unspoken: true, text: full });
       this.feedback('reply');
     });
   }
@@ -1791,62 +1732,28 @@ export type CueKind = 'listening' | 'wake' | 'sent' | 'discard' | 'turn' | 'nope
 /** A cue note's amplitude (of full scale): a sine about 6 dB under the agent's speech on the wire. */
 const CUE_LEVEL = 0.15;
 /**
- * Each cue's notes as [Hz, start s, length s], and their level (of full scale). Every note holds
- * its level, so a cue is 150-250 ms of tone that a phone speaker carries, about 6 dB under speech.
+ * Each cue's notes as [Hz, start s, length s], and their level (of full scale, CUE_LEVEL unless set).
+ * Every note holds its level, so a cue is 150-250 ms of tone that a phone speaker carries, about 6 dB
+ * under speech.
  */
-const CUES: Record<CueKind, { notes: ReadonlyArray<readonly [hz: number, at: number, len: number]>; level: number }> = {
+// prettier-ignore
+const CUES: Record<CueKind, { notes: ReadonlyArray<readonly [hz: number, at: number, len: number]>; level?: number }> = {
   // A rising fifth: the line is open.
-  listening: {
-    notes: [
-      [784, 0, 0.11],
-      [1175, 0.11, 0.13],
-    ],
-    level: CUE_LEVEL,
-  },
+  listening: { notes: [[784, 0, 0.11], [1175, 0.11, 0.13]] },
   // Higher and quicker than listening: heard, go on.
-  wake: {
-    notes: [
-      [1175, 0, 0.08],
-      [1568, 0.08, 0.11],
-    ],
-    level: CUE_LEVEL,
-  },
+  wake: { notes: [[1175, 0, 0.08], [1568, 0.08, 0.11]] },
   // One high note: the turn is on its way.
-  sent: { notes: [[1760, 0, 0.15]], level: CUE_LEVEL },
+  sent: { notes: [[1760, 0, 0.15]] },
   // A falling fifth, lower than the rest: dropped.
-  discard: {
-    notes: [
-      [784, 0, 0.09],
-      [523, 0.09, 0.14],
-    ],
-    level: CUE_LEVEL,
-  },
+  discard: { notes: [[784, 0, 0.09], [523, 0.09, 0.14]] },
   // A falling third, like a doorbell: over to the caller.
-  turn: {
-    notes: [
-      [1319, 0, 0.1],
-      [1047, 0.1, 0.14],
-    ],
-    level: CUE_LEVEL,
-  },
+  turn: { notes: [[1319, 0, 0.1], [1047, 0.1, 0.14]] },
   // One low note: nothing to do.
-  nope: { notes: [[370, 0, 0.18]], level: CUE_LEVEL },
+  nope: { notes: [[370, 0, 0.18]] },
   // Two soft low notes, quieter than the rest: words to read, nothing sent.
-  draft: {
-    notes: [
-      [523, 0, 0.1],
-      [659, 0.1, 0.12],
-    ],
-    level: CUE_LEVEL * 0.7,
-  },
+  draft: { notes: [[523, 0, 0.1], [659, 0.1, 0.12]], level: CUE_LEVEL * 0.7 },
   // A soft falling fourth, quietest of all: nothing more was said, back to waiting.
-  sleep: {
-    notes: [
-      [659, 0, 0.1],
-      [494, 0.1, 0.14],
-    ],
-    level: CUE_LEVEL * 0.6,
-  },
+  sleep: { notes: [[659, 0, 0.1], [494, 0.1, 0.14]], level: CUE_LEVEL * 0.6 },
 };
 /** The cue track's audio: 48 kHz mono in 20 ms frames. */
 const CUE_SAMPLE_RATE = 48_000;
@@ -1864,7 +1771,7 @@ const cueAudio = new Map<CueKind, AudioFrame[]>();
 export function cueFrames(kind: CueKind): AudioFrame[] {
   const cached = cueAudio.get(kind);
   if (cached) return cached;
-  const { notes, level } = CUES[kind];
+  const { notes, level = CUE_LEVEL } = CUES[kind];
   const end = Math.max(...notes.map(([, at, len]) => at + len));
   const frames = Math.ceil((end * CUE_SAMPLE_RATE) / CUE_FRAME);
   const pcm = new Float32Array(frames * CUE_FRAME);
@@ -2010,11 +1917,12 @@ export function loadTypingSound(file = getBuiltinAudioPath(BuiltinAudioClip.KEYB
  * Publish the cue track (CALL_CUE_TRACK) on its own source. DTX off: the track never goes quiet on
  * the wire, so the first milliseconds of a cue are never spent waking it up.
  */
-async function publishCueTrack(room: Room, log: WorkerLog): Promise<{ feed: CueFeed; close(): Promise<void> }> {
+async function publishCueTrack(
+  local: LocalParticipant,
+  log: WorkerLog,
+): Promise<{ feed: CueFeed; close(): Promise<void> }> {
   const source = new AudioSource(CUE_SAMPLE_RATE, 1, CUE_QUEUE_MS);
   const track = LocalAudioTrack.createAudioTrack(CALL_CUE_TRACK, source);
-  const local = room.localParticipant;
-  if (!local) throw new Error('no local participant');
   const publication = await local.publishTrack(track, new TrackPublishOptions({ dtx: false }));
   const feed = new CueFeed(source, (err) => log.warn('voice-mode worker: the cue track stopped', { err }));
   return {
@@ -2030,45 +1938,11 @@ async function publishCueTrack(room: Room, log: WorkerLog): Promise<{ feed: CueF
 }
 
 /** Cyrillic letters as Latin sounds, so a name matches in either script (`Енді` and `Andy`). */
-const CYRILLIC_LATIN: Record<string, string> = {
-  а: 'a',
-  б: 'b',
-  в: 'v',
-  г: 'h',
-  ґ: 'g',
-  д: 'd',
-  е: 'e',
-  є: 'ye',
-  ё: 'yo',
-  ж: 'zh',
-  з: 'z',
-  и: 'y',
-  і: 'i',
-  ї: 'yi',
-  й: 'y',
-  к: 'k',
-  л: 'l',
-  м: 'm',
-  н: 'n',
-  о: 'o',
-  п: 'p',
-  р: 'r',
-  с: 's',
-  т: 't',
-  у: 'u',
-  ф: 'f',
-  х: 'h',
-  ц: 'ts',
-  ч: 'ch',
-  ш: 'sh',
-  щ: 'shch',
-  ь: '',
-  ъ: '',
-  ы: 'y',
-  э: 'e',
-  ю: 'yu',
-  я: 'ya',
-};
+const CYRILLIC_LATIN: Record<string, string> = Object.fromEntries(
+  'а:a б:b в:v г:h ґ:g д:d е:e є:ye ё:yo ж:zh з:z и:y і:i ї:yi й:y к:k л:l м:m н:n о:o п:p р:r с:s т:t у:u ф:f х:h ц:ts ч:ch ш:sh щ:shch ь: ъ: ы:y э:e ю:yu я:ya'
+    .split(' ')
+    .map((pair) => pair.split(':')),
+);
 
 /** A spoken word, normalised: lower case, Latin letters without accents, `kh` as `h`. */
 function spokenWord(raw: string): string {
@@ -2145,16 +2019,15 @@ export function matchWake(text: string, names: readonly WakeName[]): { start: nu
   return null;
 }
 
-export type SpokenCommand = CallCommand;
 /** A command a transcript ends with, and what was said before it; `ownSentence` for `copy` and `copy that`. */
-export type CommandMatch = { command: SpokenCommand; rest: string; ownSentence?: true };
+export type CommandMatch = { command: CallCommand; rest: string; ownSentence?: true };
 /**
  * CALL_COMMAND_WORDS, longest first, as the words that end an utterance (Cyrillic read as Latin:
  * `зулу` is `zulu`, `прийом` is `pryyom`). `copy` and `copy that` are everyday words too, so any
  * text takes them only as their own sentence (`ownSentence`): the whole utterance, or after
  * punctuation. A capital letter alone is no boundary.
  */
-const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[], { ownSentence: true } | undefined]> = (
+const COMMANDS: ReadonlyArray<readonly [CallCommand, readonly string[], { ownSentence: true } | undefined]> = (
   ['send', 'discard'] as const
 )
   .flatMap((command) =>
@@ -2200,12 +2073,12 @@ function endMatch(end: ReturnType<typeof commandEnd>): CommandMatch | null {
 
 /** A caption's command mark (CALL_CAPTION_COMMAND_ATTRIBUTE): the command, and the caption's words before it. */
 export interface CaptionMark {
-  command: SpokenCommand;
+  command: CallCommand;
   words: string;
 }
 
 /** The mark for a caption the worker takes `command` from: its words are the text before the command, or all of it when the text left it out. */
-export function captionMark(text: string, command: SpokenCommand): CaptionMark {
+export function captionMark(text: string, command: CallCommand): CaptionMark {
   const end = commandEnd(text);
   if (end?.command !== command) return { command, words: text.trim() };
   return {
@@ -2264,18 +2137,8 @@ export function awakeLimits(env: Record<string, string | undefined>): AwakeLimit
   };
 }
 
-/** What CallTurns needs of the transcription (GeminiLiveTranscriber; faked in tests). */
-export interface Transcription {
-  /** Set a socket up ahead of the next activity; resolves whether it is ready. */
-  prepare(): Promise<boolean>;
-  /** Open an activity, starting with `preRoll`. */
-  begin(preRoll: Int16Array): void;
-  /** Audio for the open activity. */
-  push(pcm: Int16Array): void;
-  /** Close the open activity; resolves with what it heard. */
-  end(): Promise<Heard>;
-  close(): void;
-}
+/** What CallTurns needs of the transcription; faked in tests. */
+export type Transcription = Pick<GeminiLiveTranscriber, 'prepare' | 'begin' | 'push' | 'end' | 'close'>;
 
 const wordCount = (text: string): number => (text.match(/[\p{L}\p{N}]+/gu) ?? []).length;
 /** A final this short may be only the turn's last phrase: a manual activity's final can collapse to it after a pause. */
@@ -2379,7 +2242,7 @@ interface OpenTurn {
    * The command the latest interim ended with: where the call's audio was when it came (`at`), and when
    * (`seenAt`); for a discard, in how many interims in a row, and whether their text settled (DISCARD_SETTLE_MS).
    */
-  candidate?: { command: SpokenCommand; at: number; seenAt: number; count: number; settled?: boolean };
+  candidate?: { command: CallCommand; at: number; seenAt: number; count: number; settled?: boolean };
   /**
    * The last command any interim of this activity ended with, and the words before it: a later
    * interim, and the final, can leave it out again.
@@ -2422,7 +2285,7 @@ export interface CallTurnsDeps {
   /** An auto turn for the agent closed: its place in the order turns go out in; `sending`: it is committed, and goes. */
   reserve(sending?: boolean): TurnSlot;
   /** Words that will never be sent, for the page's captions; a lone command names itself and its caption's segment. */
-  drop(reason: CallDroppedSpeech['dropped'], text: string, lone?: { command: SpokenCommand; segment: number }): void;
+  drop(reason: CallDroppedSpeech['dropped'], text: string, lone?: { command: CallCommand; segment: number }): void;
   /** A cue; `started` once its first frame went out. */
   cue(kind: CueKind, started?: () => void): void;
   /** The caller's caption for one turn; `mark` when its text ends in a command the worker takes. */
@@ -2439,8 +2302,6 @@ export interface CallTurnsDeps {
   unheard(): void;
   /** A turn that came to nothing for the agent: discarded, unaddressed, or a command alone. */
   ended?(facts: TurnFacts, outcome: TurnOutcome, reason: string): void;
-  /** Watches addressed auto turns and logs what it would do (src/voice-mode-jev-turn.ts); never acts. */
-  shadow?: TurnShadowSink;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -2451,7 +2312,6 @@ export interface CallTurnsOptions {
   limits?: AwakeLimits;
   /** Record turns (TurnTake.audio). */
   record?: boolean;
-  sttModel: string;
   now?: () => number;
   /** VOICE_MODE_TRANSCRIPT_DEBUG: log what the turns make of the transcription (`voice-mode.transcript-debug`). */
   debug?: boolean;
@@ -2749,9 +2609,6 @@ export class CallTurns {
       this.woke();
       if (!this.speaking) this.armPause();
     }
-    // After the wake resolves: the interim that holds the wake phrase can be the turn's only one. A
-    // repeat is no new text for the shadow, and cannot newly resolve the wake.
-    if (changed) this.deps.shadow?.interim(turn.segment, this.spoken(turn, shown));
     if (match) turn.seen = match;
     // The command acts only once the VAD heard this far: the interim describes the audio up to now.
     const at = this.ring.position;
@@ -2847,7 +2704,6 @@ export class CallTurns {
     clearTimeout(this.pauseTimer);
     this.disarm();
     this.unsettle();
-    if (this.turn) this.deps.shadow?.ended(this.turn.segment, 'hangup');
     this.turn = undefined;
     this.closing.clear();
   }
@@ -3044,7 +2900,6 @@ export class CallTurns {
     const turn = this.turn;
     if (!turn) return null;
     this.turn = undefined;
-    this.deps.shadow?.ended(turn.segment, why);
     clearTimeout(this.pauseTimer);
     this.disarm();
     this.unsettle();
@@ -3059,7 +2914,7 @@ export class CallTurns {
       endWall,
       activityEndMs: Math.round(msOf(endedAt - turn.lastSpeechEnd)),
       mode: turn.kind === 'review' ? 'manual' : this.wake ? 'wake' : 'handsfree',
-      take: { audio: this.capture?.take(turn.speechMs, Math.max(keep, 0)), sttModel: this.options.sttModel },
+      take: { audio: this.capture?.take(turn.speechMs, Math.max(keep, 0)) },
       wake: this.wake,
       names: this.names,
     };
@@ -3108,7 +2963,7 @@ export class CallTurns {
     const facts = this.facts(turn, why, closed, heard, chosen.source, said);
     take.facts = facts;
     const ended = (outcome: TurnOutcome, reason: string) => this.deps.ended?.(facts, outcome, reason);
-    const caption = (text: string, command?: SpokenCommand) => {
+    const caption = (text: string, command?: CallCommand) => {
       if (text) this.deps.caption(turn.segment, text, true, command && captionMark(text, command));
     };
     const recording: Recording = { text: said, failed: heard.failed && !said, take };
@@ -3234,21 +3089,14 @@ export class CallTurns {
     const act = this.rewake(said, closed);
     // Words an earlier activity of the turn carried over lead it; ones still finalizing (`before`) too, once in.
     const body = joinText(turn.carry, matchCommand(act.text)?.rest ?? '');
-    const facts = this.facts(
-      turn,
-      'send',
-      closed,
-      { interim: said, finals: 0, failed: false, finalizeMs: 0 },
-      'none',
-      body,
-    );
+    const facts = this.facts(turn, 'send', closed, { ...silentHeard, interim: said }, 'none', body);
     const since = (at: number) => Math.round(at - facts.speechEndAt);
     Object.assign(facts, {
       ...(turn.candidate ? { candidateMs: since(turn.candidate.seenAt) } : {}),
       ...(this.quietAt !== undefined ? { quietMs: since(this.quietAt) } : {}),
       commitMs: closed.activityEndMs,
     });
-    const caption = (text: string, command: SpokenCommand) =>
+    const caption = (text: string, command: CallCommand) =>
       this.deps.caption(turn.segment, text, true, captionMark(text, command));
     if (act.scratched) {
       caption(act.scratched, 'discard');
@@ -3284,7 +3132,7 @@ export class CallTurns {
       })
       .catch((err: unknown): Heard => {
         this.deps.log.warn('voice-mode worker: a committed turn has no final; it goes with its words', { err });
-        return { interim: '', finals: 0, failed: true, finalizeMs: 0 };
+        return { ...silentHeard, failed: true };
       })
       .then((heard) => {
         const chosen = turnText(heard);
@@ -3364,7 +3212,7 @@ export class CallTurns {
   }
 
   /** A command with nothing to act on. */
-  private nope(text: string, command: SpokenCommand, segment: number): void {
+  private nope(text: string, command: CallCommand, segment: number): void {
     this.deps.drop('command', text, { command, segment });
     this.deps.countdown.clear();
     this.deps.cue('nope');
@@ -3376,26 +3224,11 @@ export class CallTurns {
 /** The text of an activity that heard nothing since it went on, with no final to wait for. */
 const silentHeard: Heard = { interim: '', finals: 0, failed: false, finalizeMs: 0 };
 
-/** What review mode needs of the call's turns (CallTurns) and the page. */
-export interface ReviewVoice {
-  /** An auto turn for the agent is open: a switch to review makes it a draft. */
-  readonly turnOpen: boolean;
-  /** Review on or off; going on, an open auto turn comes back as its recording. */
-  setReviewing(on: boolean): Promise<Recording | null>;
-  /** Set the transcription up for a recording; resolves whether it can take one. */
-  prepare(): Promise<boolean>;
-  /** Open a recording: from here the caller's audio is transcribed. */
-  record(): void;
-  /** Close the recording; resolves with its frozen text. */
-  stopRecording(): Promise<Recording | null>;
-  /** Drop the open recording. */
-  dropRecording(): void;
+export interface ReviewDeps {
+  /** The call's turns: a recording is one of their transcription activities. */
+  voice: Pick<CallTurns, 'turnOpen' | 'setReviewing' | 'prepare' | 'record' | 'stopRecording' | 'dropRecording'>;
   /** One message on the `nanoclaw.voice-mode.review` topic. */
   publishReview(state: CallReviewState): void;
-}
-
-export interface ReviewDeps {
-  voice: ReviewVoice;
   /** Hand a sent draft's text to the host the way a finished auto turn goes; returns its turn number. */
   post(text: string, draft: number, take: TurnTake): number;
   /** The newest turn number handed to the host. */
@@ -3405,14 +3238,12 @@ export interface ReviewDeps {
   /** Entering review: the auto mode's open turn is not waited for any more (TurnTaking.resetCaller). */
   resetCaller(): void;
   /** The `settings` RPC: auto mode's wake switch, the sound cues and the voice; returns the reply's error, if any. */
-  configure?(req: ReviewRequest): ReviewReply['error'] | undefined;
+  configure(req: ReviewRequest): ReviewReply['error'] | undefined;
   /** Auto mode's wake state, sent with every review state. */
-  wakeState?(): CallWakeState;
-  cue?(kind: CueKind): void;
-  /** The model a draft's take names when it has none. */
-  sttModel: string;
+  wakeState(): CallWakeState;
+  cue(kind: CueKind): void;
   /** A draft that came to nothing: discarded, or nothing heard. */
-  ended?(draft: number, take: TurnTake | undefined, outcome: TurnOutcome, reason: string): void;
+  ended(draft: number, take: TurnTake | undefined, outcome: TurnOutcome, reason: string): void;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -3489,7 +3320,7 @@ export class ReviewControl {
       : undefined;
     switch (op) {
       case 'settings': {
-        const error = this.deps.configure?.(req);
+        const error = this.deps.configure(req);
         this.publish();
         return reply(error ? { error } : {});
       }
@@ -3533,7 +3364,7 @@ export class ReviewControl {
         this.deps.setCaptureOpen(true);
         this.deps.voice.record();
         this.publish();
-        this.deps.cue?.('listening');
+        this.deps.cue('listening');
         return reply({ draft: this.draft.id });
       }
       case 'done': {
@@ -3545,7 +3376,7 @@ export class ReviewControl {
       case 'send': {
         if (!draft || draft.id !== req.draft) return reply({ error: 'stale' });
         if (draft.state !== 'ready' || draft.tooLong) return reply({ error: 'unsendable' });
-        const take = this.take ?? { sttModel: this.deps.sttModel };
+        const take = this.take ?? {};
         this.draft = null;
         this.take = undefined;
         const turn = this.deps.post(draft.text, draft.id, take);
@@ -3555,7 +3386,7 @@ export class ReviewControl {
       case 'discard': {
         if (!draft || draft.id !== req.draft) return reply({ error: 'stale' });
         // An empty or failed draft was reported when it froze; a recording is when its activity ends.
-        if (draft.state === 'ready') this.deps.ended?.(draft.id, this.take, 'discarded', 'review');
+        if (draft.state === 'ready') this.deps.ended(draft.id, this.take, 'discarded', 'review');
         this.draft = null;
         this.take = undefined;
         if (draft.state === 'recording') {
@@ -3631,21 +3462,21 @@ export class ReviewControl {
         text,
         ...(Buffer.byteLength(text) > MAX_TURN_TEXT_BYTES ? { tooLong: true } : {}),
       };
-      if (state === 'ready' && !this.draft.tooLong) this.deps.cue?.('draft');
-      if (state === 'empty') this.deps.ended?.(draft.id, heard?.take, 'empty', 'no_words');
-      if (state === 'failed') this.deps.ended?.(draft.id, heard?.take, 'lost', 'stt');
+      if (state === 'ready' && !this.draft.tooLong) this.deps.cue('draft');
+      if (state === 'empty') this.deps.ended(draft.id, heard?.take, 'empty', 'no_words');
+      if (state === 'failed') this.deps.ended(draft.id, heard?.take, 'lost', 'stt');
     }
     this.publish();
   }
 
   private publish(): void {
     if (this.closed) return;
-    this.deps.voice.publishReview({
+    this.deps.publishReview({
       seq: ++this.seq,
       mode: this.mode,
       draft: this.draft,
       ...(this.preparing ? { preparing: true } : {}),
-      ...(this.deps.wakeState ? { wake: this.deps.wakeState() } : {}),
+      wake: this.deps.wakeState(),
     });
   }
 }
@@ -3684,26 +3515,29 @@ function readTtsRequest(raw: unknown): NonNullable<ReviewRequest['tts']> {
   return { provider, ...(model != null ? { model } : {}), ...(voice != null ? { voice } : {}) };
 }
 
-/** The fields every job carries whatever its version, enough to answer a mismatched one. */
-export function readJobHeader(raw: string): { v: unknown; callId: string; callerIdentity: string; agentName?: string } {
+/**
+ * The fields every job carries whatever its version, enough to answer a mismatched one; `call`, the
+ * whole metadata, only when it is a call of this version.
+ */
+export function readJobHeader(raw: string): {
+  v: unknown;
+  callId: string;
+  callerIdentity: string;
+  agentName?: string;
+  call?: LiveKitJobMetadata;
+} {
   const meta = JSON.parse(raw) as Record<string, unknown> | null;
   if (!meta || typeof meta.callId !== 'string' || !meta.callId || typeof meta.callerIdentity !== 'string') {
     throw new Error('voice-mode worker: job metadata is not a NanoClaw voice call');
   }
+  const current = meta.v === LIVEKIT_PROTOCOL_VERSION && meta.callerIdentity && meta.agentName;
   return {
     v: meta.v,
     callId: meta.callId,
     callerIdentity: meta.callerIdentity,
     agentName: typeof meta.agentName === 'string' && meta.agentName ? meta.agentName : undefined,
+    ...(current ? { call: meta as unknown as LiveKitJobMetadata } : {}),
   };
-}
-
-export function parseJobMetadata(raw: string): LiveKitJobMetadata {
-  const meta = JSON.parse(raw) as LiveKitJobMetadata;
-  if (meta?.v !== LIVEKIT_PROTOCOL_VERSION || !meta.callId || !meta.callerIdentity || !meta.agentName) {
-    throw new Error('voice-mode worker: job metadata is not a NanoClaw voice call of this version');
-  }
-  return meta;
 }
 
 const withTimeout = <T>(promise: Promise<T>, ms: number, message: string): Promise<T> =>
@@ -3752,8 +3586,8 @@ export interface RunCallDeps {
     settings: VoiceModeSettings,
     events: CallVoiceEvents,
   ): Promise<CallVoice>;
-  /** The call's transcription; Gemini Live by default. */
-  transcriber?(options: TranscriberOptions): Transcription;
+  /** The call's transcription. */
+  transcriber(options: TranscriberOptions): Transcription;
   /** Where turn recordings are written; NanoClaw's data directory by default. */
   recordingsRoot?: string;
   /** Tell the caller's page this worker cannot serve the host's protocol version. */
@@ -3765,28 +3599,13 @@ export interface RunCallDeps {
   log: Pick<Console, 'info' | 'warn'>;
 }
 
-/** What a call needs of a wake word spotter (`WakeWordSpotter`); faked in tests. */
-export interface WakeWord {
-  readonly phrase: string;
-  readonly threshold: number;
-  /** Resolves once it can spot, rejects when its models cannot load. */
-  readonly ready: Promise<void>;
-  /** Score the audio (on) or only keep it (off). */
-  listen(on: boolean): void;
-  /** 16 kHz mono audio. */
-  push(pcm: Int16Array): void;
-  readonly summary: WakeWordStats;
-  /** Its thread's share of one core. */
-  readonly utilization: number;
-  close(): Promise<void>;
-}
+/** What a call needs of a wake word spotter; faked in tests. */
+export type WakeWord = Pick<
+  WakeWordSpotter,
+  'phrase' | 'threshold' | 'ready' | 'listen' | 'push' | 'summary' | 'utilization' | 'close'
+>;
 
-export interface WakeWordEvents {
-  /** The window that had the phrase, as positions (16 kHz samples) in the audio pushed to the spotter. */
-  onDetect(score: number, window: { start: number; end: number }): void;
-  /** It stopped for good after it loaded. */
-  onError(err: string): void;
-}
+export type WakeWordEvents = Pick<WakeWordOptions, 'onDetect' | 'onError'>;
 
 /** The command phrases, as spelling hints for the transcription: they must be in its vocabulary to be heard. */
 export const COMMAND_VOCABULARY: readonly string[] = [...CALL_COMMAND_WORDS.send, ...CALL_COMMAND_WORDS.discard].map(
@@ -3811,14 +3630,10 @@ export function wakeWordSettings(
   };
 }
 
-/**
- * Settings from the working directory's .env (`root` in tests); WEBHOOK_PORT from the environment
- * wins, as on the host. Each read warns about every old setting it finds; the callers read once per
- * process (see callEnv).
- */
+/** Settings from the working directory's .env (`root` in tests); WEBHOOK_PORT from the environment wins, as on the host. */
 export function workerEnv(keys: string[], root?: string): Record<string, string | undefined> {
   return {
-    ...voiceModeEnv(readEnvFile(voiceModeEnvKeys([...keys, 'WEBHOOK_PORT']), root), (message) => console.warn(message)),
+    ...readEnvFile([...keys, 'WEBHOOK_PORT'], root),
     ...(process.env.WEBHOOK_PORT ? { WEBHOOK_PORT: process.env.WEBHOOK_PORT } : {}),
   };
 }
@@ -3828,9 +3643,6 @@ interface WorkerUserData {
 }
 
 const loadVad = (): Promise<VAD> => silero.VAD.load({ sampleRate: INPUT_SAMPLE_RATE });
-const setAttribute = async (ctx: CallJob, key: string, value: string): Promise<void> => {
-  await ctx.room.localParticipant?.setAttributes({ [key]: value });
-};
 
 type WorkerLog = Pick<Console, 'info' | 'warn' | 'error'>;
 
@@ -3992,7 +3804,7 @@ export class CallerInput {
           // Each window's own result: speech too short to start a turn still breaks the quiet.
           const at = vad.from + ev.samplesIndex;
           if ((ev.probability ?? 0) > VAD_ACTIVATION) vad.quietFrom = at;
-          this.events.onVad?.(at, vad.quietFrom);
+          this.events.onVad(at, vad.quietFrom);
         } else if (ev.type === VADEventType.START_OF_SPEECH) {
           vad.speaking = true;
           this.events.onSpeech(true, vad.from + ev.samplesIndex - samplesOf(ev.speechDuration));
@@ -4234,7 +4046,7 @@ async function roomVoice(
   );
   // The cues' own track: never the speech track, so a cue is never the agent speaking. Without it
   // the call runs silent of cues.
-  const cueTrack = await publishCueTrack(room, log).catch((err: unknown) => {
+  const cueTrack = await publishCueTrack(local, log).catch((err: unknown) => {
     log.warn('voice-mode worker: could not publish the cue track', { err });
     return undefined;
   });
@@ -4305,7 +4117,7 @@ async function roomVoice(
     log,
     started: (text) => {
       setAttr(AGENT_STATE_ATTRIBUTE, 'speaking', 'the agent state');
-      events.onAgentSpeaking?.(true);
+      events.onAgentSpeaking(true);
       // The line's caption, on the agent's speech track, as its audio starts.
       post('a caption', () =>
         local.sendText(text, {
@@ -4320,7 +4132,7 @@ async function roomVoice(
     },
     stopped: () => {
       setAttr(AGENT_STATE_ATTRIBUTE, 'listening', 'the agent state');
-      events.onAgentSpeaking?.(false);
+      events.onAgentSpeaking(false);
     },
     changed: publishVoice,
   });
@@ -4534,7 +4346,6 @@ function defaultDeps(): RunCallDeps {
     'LIVEKIT_HOST_URL',
     'VOICE_MODE_RECORDINGS_DAYS',
     'VOICE_MODE_CALL_RECORDING',
-    'VOICE_MODE_MAX_SPOKEN_CHARS',
     'VOICE_MODE_TTS_DEESS',
     'VOICE_MODE_TTS_NOTCH',
     'VOICE_MODE_WAKE_MODEL',
@@ -4547,10 +4358,16 @@ function defaultDeps(): RunCallDeps {
   const wake = wakeWordSettings(env);
   return {
     env,
-    voiceNames: (callVoiceNames ??= createVoiceCatalog({ lazy: true, log: workerLog(agentsLog()) })),
+    voiceNames: (callVoiceNames ??= createVoiceCatalog({
+      keys: providerKeysFrom(env),
+      lazy: true,
+      log: workerLog(agentsLog()),
+    })),
     createVoice: (ctx, meta, settings, events) => roomVoice(ctx as JobContext, meta, settings, events),
     transcriber: (options) => new GeminiLiveTranscriber(options),
-    markUpdating: (ctx) => setAttribute(ctx, CALL_UPDATING_ATTRIBUTE, '1'),
+    markUpdating: async (ctx) => {
+      await ctx.room.localParticipant?.setAttributes({ [CALL_UPDATING_ATTRIBUTE]: '1' });
+    },
     wakeWord: (events) => (wake ? new WakeWordSpotter({ ...wake, ...events }) : undefined),
     log: workerLog(agentsLog()),
   };
@@ -4567,10 +4384,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const abandon = async (reason: string, fields: Record<string, unknown> = {}): Promise<void> => {
     log.warn('voice-mode worker: ending the call', { ...callFields, ...fields, reason });
     telemetry.ended(reason);
-    await link
-      ?.post('ended', { reason })
-      .then((res) => res.body?.cancel())
-      .catch(() => undefined);
+    await link?.tell('ended', { reason });
     await ctx.deleteRoom().catch(() => undefined);
     ctx.shutdown(reason);
   };
@@ -4604,33 +4418,19 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     await sleep(MISMATCH_NOTICE_MS);
     return abandon(`protocol mismatch: host sent v${String(header.v)}, worker speaks v${LIVEKIT_PROTOCOL_VERSION}`);
   }
-  let meta: LiveKitJobMetadata;
-  try {
-    meta = parseJobMetadata(ctx.job.metadata);
-  } catch (err) {
-    return abandon((err as Error).message);
-  }
+  const meta = header.call;
+  if (!meta) return abandon('voice-mode worker: job metadata is not a NanoClaw voice call of this version');
   const geminiKey = deps.env.VOICE_MODE_GEMINI_API_KEY;
   if (!geminiKey) return abandon('VOICE_MODE_GEMINI_API_KEY is not set for the worker');
   const providerKeys = providerKeysFrom(deps.env);
   const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
-  const recordCall = callRecordingOn(deps.env.VOICE_MODE_CALL_RECORDING);
+  const recordings = deps.recordingsRoot ?? recordingsRoot();
+  const recordCall = envSwitch(deps.env.VOICE_MODE_CALL_RECORDING, ['1', 'true']);
   /** The whole call, when VOICE_MODE_CALL_RECORDING is on: opened once the caller's audio can flow. */
   let callRecording: CallRecording | undefined;
-  const transcriptDebug = transcriptDebugOn(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG);
-  /** Spoken lines so far, for those no label numbered. */
-  let replies = 0;
+  const transcriptDebug = envSwitch(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG, ['1']);
   /** The label of the line being spoken: TurnTaking announces each line right before it. */
   let speakingLine: CallReplyInfo | undefined;
-  if (meta.sttFallbackModel) {
-    log.warn(
-      'voice-mode worker: VOICE_MODE_STT_FALLBACK_MODEL is ignored: turns are transcribed by the Live model only',
-      {
-        ...callFields,
-        model: meta.sttFallbackModel,
-      },
-    );
-  }
 
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
   try {
@@ -4638,8 +4438,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   } catch (err) {
     return abandon((err as Error).message);
   }
-  const joined = await host.post('joined').catch(() => null);
-  void joined?.body?.cancel().catch(() => {});
+  const joined = await host.tell('joined');
   // The host starts billing here; without its yes, nothing is published or transcribed.
   if (!joined?.ok) return abandon(`host refused the call (${joined?.status ?? 'unreachable'})`, { hostUrl });
 
@@ -4672,7 +4471,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     cues = cues
       .then(async () => {
         if (ending || !cuesOn || agentSpeaking) return;
-        await callVoice?.playCue?.(kind, started);
+        await callVoice?.playCue(kind, started);
       })
       .catch((err: unknown) => callLog.warn('voice-mode worker: a cue did not play', { err, kind }));
   };
@@ -4688,7 +4487,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let turnCueTimer: ReturnType<typeof setTimeout> | undefined;
   let turnCuedAt = 0;
   let replyHoldTimer: ReturnType<typeof setTimeout> | undefined;
-  const jevTurn = new JevTurnShadow({ callId: meta.callId, log: (line, fields) => callLog.info(line, fields) });
   const languages = callLanguages(meta.languages);
   const turnTaking: TurnTaking = new TurnTaking(
     {
@@ -4719,7 +4517,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       // While the line is synthesized the caller is heard as ever, and a turn they start then holds
       // its audio back (`waitForCaller`); once it plays the caller is not transcribed (onAgentSpeaking).
       say: async (text): Promise<boolean> => {
-        jevTurn.context(text);
         try {
           return (await callVoice?.say(text, () => turnTaking.waitForCaller())) ?? false;
         } finally {
@@ -4761,7 +4558,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       silenceMs: meta.silenceMs,
       language: languages.initial,
       ukrainian: languages.ukrainian,
-      maxSpokenChars: maxSpokenChars(deps.env.VOICE_MODE_MAX_SPOKEN_CHARS),
     },
   );
   let review: ReviewControl | undefined;
@@ -4817,11 +4613,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     // The host link stays open until the host answered: closed first, it ends the call on its own
     // and answers this at once, before the room carries why the call ended.
     await Promise.all([
-      tellHost &&
-        host
-          .post('ended', restart ? { reason, restart } : { reason })
-          .then((res) => res.body?.cancel())
-          .catch(() => undefined),
+      tellHost && host.tell('ended', restart ? { reason, restart } : { reason }),
       callVoice?.close().catch(() => undefined),
       // Before the job exits: a process leaving with the wake word thread mid-inference aborts.
       spotter?.close().catch(() => undefined),
@@ -4849,7 +4641,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const publish = (status: CallTurnStatus) => callVoice?.publishTurn(status);
   const saveTurn = (
     index: number,
-    { audio, sttModel }: TurnTake,
+    { audio }: TurnTake,
     transcript: string,
     outcome: { reason?: string; host?: SendResult },
   ) => {
@@ -4863,11 +4655,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       endedAt: new Date(audio.endedAt).toISOString(),
       speechMs: audio.speechMs,
       truncated: audio.truncated,
-      sttModel,
+      sttModel: meta.sttModel,
       transcript,
       ...outcome,
     };
-    void writeTurnRecording(deps.recordingsRoot ?? recordingsRoot(), record, audio).catch((err: unknown) =>
+    void writeTurnRecording(recordings, record, audio).catch((err: unknown) =>
       callLog.warn('voice-mode worker: could not save a turn recording', { err, turn: index }),
     );
   };
@@ -4921,11 +4713,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       lastSettled = Math.max(lastSettled, turn);
       if (host.accepted) lastAccepted = Math.max(lastAccepted, turn);
       if (!host.accepted && host.turnKey && hostLossReason(host) === 'timeout') {
-        unconfirmed.set(host.turnKey, { turn, text });
-        for (const key of unconfirmed.keys()) {
-          if (unconfirmed.size <= MAX_UNCONFIRMED_TURNS) break;
-          unconfirmed.delete(key);
-        }
+        setCapped(unconfirmed, host.turnKey, { turn, text });
       }
       publish(
         host.accepted ? { turn, status: 'sent', text } : { turn, status: 'lost', reason: hostLossReason(host), text },
@@ -4942,7 +4730,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       });
       saveTurn(turn, take, text, { host });
     };
-  const transcriber = (deps.transcriber ?? ((options) => new GeminiLiveTranscriber(options)))({
+  const transcriber = deps.transcriber({
     apiKey: geminiKey,
     model: meta.sttModel,
     // The names (the host trimmed, deduplicated and capped them) and the commands, which the
@@ -4963,21 +4751,20 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       },
       drop: (dropped, text, lone) => {
         if (ending) return;
-        callVoice?.publishDropped?.(
+        callVoice?.publishDropped(
           lone ? { dropped, text, command: lone.command, segment: captionSegment(lone.segment) } : { dropped, text },
         );
       },
       cue,
       caption: (segment, text, final, mark) => {
-        if (!ending) callVoice?.caption?.(segment, text, final, mark);
+        if (!ending) callVoice?.caption(segment, text, final, mark);
       },
-      countdown: new SendCountdown((value) => callVoice?.setPending?.(value), meta.silenceMs),
+      countdown: new SendCountdown((value) => callVoice?.setPending(value), meta.silenceMs),
       changed: () => review?.republish(),
       hold: (open) => turnTaking.setCaptureOpen(open, 'turn'),
       noTurn: () => turnTaking.releaseTurn(),
-      shadow: jevTurn,
       unheard: () => {
-        if (!ending && !review?.reviewing) callVoice?.publishUnheard?.();
+        if (!ending && !review?.reviewing) callVoice?.publishUnheard();
       },
       log: callLog,
     },
@@ -4986,13 +4773,12 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       names: [meta.agentName, ...(meta.wakeNames ?? [])],
       limits: awakeLimits(deps.env),
       record,
-      sttModel: meta.sttModel,
       ...(transcriptDebug ? { debug: true } : {}),
     },
   );
   if (recordCall) {
     callRecording = new CallRecording(
-      deps.recordingsRoot ?? recordingsRoot(),
+      recordings,
       { callId: meta.callId, lineId: meta.lineId, agent: meta.agentName },
       callLog,
     );
@@ -5004,28 +4790,23 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       {
         providerKeys,
         ...(record ? { recordReplies: true } : {}),
-        ...(ttsDeess(deps.env.VOICE_MODE_TTS_DEESS) ? { deess: true } : {}),
-        ...(ttsNotch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
-        ...(deps.voiceNames
-          ? { voiceDetails: (choice) => deps.voiceNames!.details(choice, providerKeys[choice.provider]) }
-          : {}),
+        ...(envSwitch(deps.env.VOICE_MODE_TTS_DEESS) ? { deess: true } : {}),
+        ...(envSwitch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
+        ...(deps.voiceNames ? { voiceDetails: (choice) => deps.voiceNames!.details(choice) } : {}),
         spoke: (line, pcm) => {
+          // TurnTaking labels every line before it plays.
           const label = speakingLine;
-          const reply = label?.reply ?? ++replies;
+          if (!label) return;
+          const { reply } = label;
           if (pcm) {
-            void writeReplyRecording(
-              deps.recordingsRoot ?? recordingsRoot(),
-              { agent: meta.agentName, callId: meta.callId },
-              reply,
-              pcm,
-            ).catch((err: unknown) =>
-              callLog.warn('voice-mode worker: could not save a reply recording', { err, reply }),
+            void writeReplyRecording(recordings, { agent: meta.agentName, callId: meta.callId }, reply, pcm).catch(
+              (err: unknown) => callLog.warn('voice-mode worker: could not save a reply recording', { err, reply }),
             );
           }
           telemetry.reply({
             reply,
-            kind: label?.notice ? 'notice' : 'reply',
-            ...(typeof label?.turn === 'number' ? { turn: label.turn, part: label.part } : {}),
+            kind: label.notice ? 'notice' : 'reply',
+            ...(typeof label.turn === 'number' ? { turn: label.turn, part: label.part } : {}),
             ...line,
             ...(pcm ? { recorded: true } : {}),
           });
@@ -5123,19 +4904,10 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   }
   const reviewSession = callVoice.review;
   // A call that ended while its audio was set up gets no review controls.
-  if (reviewSession && !ending) {
+  if (!ending) {
     const control = new ReviewControl({
-      voice: {
-        get turnOpen() {
-          return callTurns.turnOpen;
-        },
-        setReviewing: (on) => callTurns.setReviewing(on),
-        prepare: () => callTurns.prepare(),
-        record: () => callTurns.record(),
-        stopRecording: () => callTurns.stopRecording(),
-        dropRecording: () => callTurns.dropRecording(),
-        publishReview: (state) => reviewSession.publishReview(state),
-      },
+      voice: callTurns,
+      publishReview: (state) => reviewSession.publishReview(state),
       post: (text, draft, take) => {
         const slot = reserveTurn(false, draft);
         slot.send(text, take, false);
@@ -5155,7 +4927,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       },
       wakeState: () => callTurns.state,
       cue,
-      sttModel: meta.sttModel,
       ended: (draft, take, outcome, reason) => telemetry.turn({ facts: take?.facts, outcome, reason, draft }),
       log: callLog,
     });
@@ -5217,7 +4988,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     .events((event) => {
       if (event.type === 'end') void end(`host: ${event.reason}`, false);
       else if (event.type === 'reply') {
-        // A host that sends no turn at all predates reply labels: not known, so no label.
+        // A host id this worker never sent: not known, so no label.
         const turn = typeof event.turn === 'string' ? turnsByHostId.get(event.turn) : event.turn;
         // Any agent message after the turns the host took answers the "did it get it" question.
         pickedUp = Math.max(pickedUp, lastAccepted, typeof turn === 'number' ? turn : 0);
@@ -5299,7 +5070,6 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'VOICE_MODE_WORKER_HEALTH_PORT',
     'VOICE_MODE_RECORDINGS_DAYS',
     'VOICE_MODE_CALL_RECORDING',
-    'VOICE_MODE_MAX_SPOKEN_CHARS',
     'VOICE_MODE_TRANSCRIPT_DEBUG',
   ]);
   // agents-js initializes its logger once the CLI runs a command; console until then.
@@ -5311,7 +5081,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     process.exit(1);
   }
   console.info(
-    `voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, dispatch name ${env.LIVEKIT_AGENT_NAME || DEFAULT_LIVEKIT_AGENT_NAME}, host URL ${hostUrl} (LIVEKIT_HOST_URL)${transcriptDebugOn(env.VOICE_MODE_TRANSCRIPT_DEBUG) ? ', transcript debug on (VOICE_MODE_TRANSCRIPT_DEBUG)' : ''}`,
+    `voice-mode worker: protocol v${LIVEKIT_PROTOCOL_VERSION}, dispatch name ${env.LIVEKIT_AGENT_NAME || DEFAULT_LIVEKIT_AGENT_NAME}, host URL ${hostUrl} (LIVEKIT_HOST_URL)${envSwitch(env.VOICE_MODE_TRANSCRIPT_DEBUG, ['1']) ? ', transcript debug on (VOICE_MODE_TRANSCRIPT_DEBUG)' : ''}`,
   );
   // agents-js's default ("adaptive") enables the debugger domain on a job's first loop stall to
   // sample stacks: that blocks the loop another ~250 ms mid-call and slows the call's JS by ~15%

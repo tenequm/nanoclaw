@@ -4,9 +4,12 @@ Retired 2026-10-09: env-backed `voice:` lines and the `voice` compatibility
 adapter are gone; every line is a `voice_mode_lines` row. What this runbook says
 about env-backed links, saved links and the `voice` adapter describes the
 protocol 4 cutover only: a current build reads no link token from `.env`, so
-make each such line a row before upgrading, and its
-`module:voice-mode:drop-legacy-lines` migration drops `voice_lines` and
-`voice_line_owners` (see Rollback).
+make each such line a row before upgrading. The `voice_lines` and
+`voice_line_owners` tables are gone too: builds from 2026-10-09 to 2026-10-13
+dropped them with the `module:voice-mode:drop-legacy-lines` migration, and a
+current build neither creates nor reads them (see Rollback). A current build no
+longer carries that migration, so an install upgraded straight from before
+2026-10-09 keeps both tables, unused; drop them by hand once its lines are rows.
 
 This is an operator runbook. Building the fork's main branch performs no server
 actions. Use the complete fork build, with matching host and worker. Update
@@ -41,9 +44,8 @@ that hands their replies, typing and call links to the live voice-mode engine.
 
 ### Configuration rename
 
-Every old key in the table below is accepted as its `VOICE_MODE_<suffix>`
-name, with a warning naming keys only; no other `VOICE_*` key is. An explicit
-new value wins when both are present, and the old key is reported as ignored.
+A current build reads only the `VOICE_MODE_<suffix>` names: rename every old
+key in the table below before upgrading, or its setting is silently ignored.
 The existing `.env` parser ignores empty values; use documented `off`/`0`
 switches rather than an empty line to disable a setting. Host and worker read
 `.env` when they start (the worker in each job process): restart both after
@@ -67,7 +69,6 @@ changing settings.
 | `VOICE_TTS_FALLBACK_MODEL` | `VOICE_MODE_TTS_FALLBACK_MODEL` |
 | `VOICE_TTS_VOICE` | `VOICE_MODE_TTS_VOICE` |
 | `VOICE_SILENCE_MS` | `VOICE_MODE_SILENCE_MS` |
-| `VOICE_MIRROR` | `VOICE_MODE_MIRROR` |
 | `VOICE_WAKE_MODEL` | `VOICE_MODE_WAKE_MODEL` |
 | `VOICE_WAKE_PHRASE` | `VOICE_MODE_WAKE_PHRASE` |
 | `VOICE_WAKE_THRESHOLD` | `VOICE_MODE_WAKE_THRESHOLD` |
@@ -84,19 +85,23 @@ keys are voice-mode's own:
 
 | Provider key read before | Voice-mode key | |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | `VOICE_MODE_GEMINI_API_KEY` | Required; the old name is still read, with a warning. |
+| `GEMINI_API_KEY` | `VOICE_MODE_GEMINI_API_KEY` | Required; the old name is not read. |
 | none | `VOICE_MODE_ELEVENLABS_API_KEY` | Optional; offers ElevenLabs voices to the lines. |
 
 `VOICE_MODE_TTS_MODEL`, `VOICE_MODE_TTS_FALLBACK_MODEL`,
 `VOICE_MODE_TTS_VOICE` and `VOICE_MODE_LINK_TOKEN` (and their `VOICE_*` names
-above) are no longer read, and the host warns when one is still set: each line
-keeps its own voice, and `/voice` makes the links. Before upgrading an install that set one,
-save it on every line with `PATCH /voice/tts` (see the skill's "Voice per
-line"), or its lines speak with the default `alnilam`.
+above) are no longer read: each line keeps its own voice, and `/voice` makes
+the links. `VOICE_MODE_STT_FALLBACK_MODEL` (the unary fallback is gone) and
+`VOICE_MODE_MAX_SPOKEN_CHARS` (replies are spoken in full) are not read.
+`VOICE_MODE_MIRROR` (`VOICE_MIRROR`) is not read either: a call
+talks only in its line's `/voice` chat, and a line whose chat is gone is
+refused until `/voice` runs again. Before upgrading an install that set one, save it on every line
+with `PATCH /voice/tts` (see the skill's "Voice per line"), or its lines
+speak with the default `alnilam`.
 The build adds a separate page listener on `127.0.0.1:3100` (`VOICE_MODE_PORT`,
-`VOICE_MODE_PAGE_HOST`); main's existing `/voice` and `/webhook/voice/livekit`
-fronts still work on `WEBHOOK_PORT`. Do not move a working front during the
-compatibility upgrade. An install whose front already forwards `/voice` to the
+`VOICE_MODE_PAGE_HOST`); main's existing `/voice` front still works on
+`WEBHOOK_PORT`, but `/webhook/voice/livekit` is no longer served: move a front
+or bookmark on that path to `/voice` before upgrading. An install whose front already forwards `/voice` to the
 webhook port does not need the listener: set `VOICE_MODE_PORT=off`. If the
 default port is taken, the host logs it and serves the page on `WEBHOOK_PORT`
 only; an explicit `VOICE_MODE_PORT` that cannot bind fails setup, and
@@ -119,15 +124,10 @@ needs no rename. `off` retains transcript `hey <agent>` wake.
 Saved log queries need the new names. Worker events `voice.turn`,
 `voice.reply`, `voice.call` and `voice.command near-miss` are now
 `voice-mode.turn`, `voice-mode.reply`, `voice-mode.call` and
-`voice-mode.command near-miss`; the Jev shadow's `voice.turn-end jev ...`
-lines are `voice-mode.turn-end jev ...`. Message prefixes moved the same way:
+`voice-mode.command near-miss`. Message prefixes moved the same way:
 `voice worker:` to `voice-mode worker:`, `livekit-voice:` to
 `livekit-voice-mode:` and `voice:` to `voice-mode:`. A selector on the worker
 unit's name must follow a renamed unit too.
-
-The Jev shadow's daily cap now counts in `data/jev-turn-usage-<day>` files.
-Main's `data/jev-turn-usage.json` and its `.lock` are removed automatically by
-the first judgement of a day; nothing needs deleting by hand.
 
 ### Backup and cutover
 
@@ -278,9 +278,8 @@ the first judgement of a day; nothing needs deleting by hand.
     test `/voice new` on a saved line unless retirement is intended. After the
     first call, confirm a `voice-mode.turn` line reaches the log store.
 
-The optional Jev shadow remains off without enabled `data/jev-turn.json`.
-Keep an existing generic endpoint/model configuration only if the operator
-wants that experiment. It is not part of voice service readiness.
+The Jev end-of-turn shadow is gone. A leftover `data/jev-turn.json` and
+`data/jev-turn-usage*` files are inert and can be deleted.
 
 ## Shared protocol 5 AgentSession installations
 
@@ -300,12 +299,12 @@ address. Reload the browser page so it requests protocol 6. Old protocol 5
 starts are refused with 426 before a room or cost-bearing worker is created.
 
 Behavior changes from that worker: own Gemini Live manual activities replace
-AgentSession STT, unary fallback is ignored, wake is on by default, review and
+AgentSession STT, the unary fallback is gone, wake is on by default, review and
 spoken commands are available, and worker-side cues/captions/reconnect are
 retained from main. Turn wake off in the page for pause-send operation.
 Set `VOICE_MODE_LANGUAGES=en-US` if keeping the shared English default is
 intended; protocol 6 defaults to main's Ukrainian/English hints. Recordings
-stay off unless explicitly enabled. Replies are spoken in full unless capped.
+stay off unless explicitly enabled. Replies are spoken in full.
 
 ## Rollback
 
@@ -362,9 +361,9 @@ and switch the native app to the build that speaks protocol 4. Keep the same
 public front.
 
 The `voice_mode_lines` table is additive, so an old main build can ignore it,
-but `module:voice-mode:drop-legacy-lines` drops the `voice_lines` and
-`voice_line_owners` tables a build from before it needs: rolling back past that
-migration takes the stopped DB snapshot from before it. Otherwise prefer
+but the `voice_lines` and `voice_line_owners` tables a build from before
+2026-10-09 needs were dropped: rolling back past that takes the stopped DB
+snapshot from before the drop. Otherwise prefer
 keeping the current DB to preserve messages created after cutover; restore the
 stopped DB snapshot only for a DB failure or a deliberate full-state rollback,
 which discards later changes. Back up current state before restoring it.

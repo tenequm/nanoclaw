@@ -1,6 +1,6 @@
 ---
 name: add-voice-mode
-description: Add voice calls with a real NanoClaw agent through LiveKit and Gemini. Installs the voice-mode host adapter, browser page, worker, hashed call lines and role-based /voice commands. Use when an operator wants to talk to an agent by voice.
+description: Add voice calls with a real NanoClaw agent through LiveKit and Gemini. Installs the voice-mode host adapter, browser page, worker, sealed call lines and role-based /voice commands. Use when an operator wants to talk to an agent by voice.
 ---
 
 # Add voice mode
@@ -49,7 +49,6 @@ src/channels/voice-mode-call-session.test.ts
 src/channels/voice-mode-command.test.ts
 src/channels/voice-mode-command.ts
 src/channels/voice-mode-line-roles.test.ts
-src/channels/voice-mode-line.test.ts
 src/channels/voice-mode-line.ts
 src/channels/voice-mode-livekit.test.ts
 src/channels/voice-mode-livekit.ts
@@ -66,8 +65,6 @@ src/channels/voice-mode-tts.fixtures.json
 src/channels/voice-mode.ts
 src/voice-mode-gemini-live.test.ts
 src/voice-mode-gemini-live.ts
-src/voice-mode-jev-turn.test.ts
-src/voice-mode-jev-turn.ts
 src/voice-mode-tts.test.ts
 src/voice-mode-tts.ts
 src/voice-mode-wakeword.test.ts
@@ -75,6 +72,8 @@ src/voice-mode-wakeword.ts
 src/voice-mode-worker.test.ts
 src/voice-mode-worker.ts
 src/db/voice-mode-lines.ts
+src/secret-seal.test.ts
+src/secret-seal.ts
 assets/voice-mode-wakeword/LICENSE
 assets/voice-mode-wakeword/NOTICE
 assets/voice-mode-wakeword/embedding_model.onnx
@@ -84,10 +83,7 @@ src/voice-mode-wakeword-fixtures/negative.wav
 src/voice-mode-wakeword-fixtures/positive.wav
 ```
 
-The `voice_mode_lines` table registers its own named migration through core.
-Its `module:voice-mode:drop-legacy-lines` migration drops the `voice_lines`
-and `voice_line_owners` tables from before the voice-mode rename: every line
-is a `voice_mode_lines` row.
+The `voice_mode_lines` table registers its own named migrations through core.
 
 Append `import './voice-mode.js';` to `src/channels/index.ts` once:
 
@@ -97,7 +93,9 @@ import './voice-mode.js';
 
 This fork exports the router's `deliverToAgent`, supports `onStored` and
 host-addressed events, expedited reply delivery and the `voice-call` wake.
-The native Telegram command delegates to the adapter's command handler.
+The native Telegram command delegates to the adapter's command handler and
+gives it an ephemeral sender-only reply; `/voice` is registered as an
+ephemeral command in the Telegram menus (`scope-sync.ts`).
 The registration, router and native command tests guard these connections.
 
 Copy resident agent guidance separately so an implementation repair can
@@ -192,8 +190,15 @@ VOICE_MODE_GEMINI_API_KEY={{gemini_api_key}}
 VOICE_MODE_ELEVENLABS_API_KEY={{elevenlabs_api_key}}
 ```
 
-An existing `GEMINI_API_KEY` is still read as `VOICE_MODE_GEMINI_API_KEY`, with
-a warning; rename it when convenient.
+Only `VOICE_MODE_*` names are read: rename an existing `GEMINI_API_KEY` or
+`VOICE_*` setting to its `VOICE_MODE_*` name.
+
+Call links are stored sealed under the host-wide `NANOCLAW_ENCRYPTION_KEY`, so
+`/voice` can show a caller their link again. If `.env` has none yet, add one:
+32 random bytes as base64 (`openssl rand -base64 32`), written straight into
+`.env` without printing it, and kept in the operator's secret store. Never
+replace an existing key: links sealed under it could no longer be shown. Without
+the key calls still work, but `/voice` neither shows nor mints links.
 
 The page listens on `127.0.0.1:3100` (`VOICE_MODE_PORT`, and
 `VOICE_MODE_PAGE_HOST` for another bind address), and also under `/voice` on
@@ -206,8 +211,8 @@ A container proxy that cannot reach loopback needs the listener bound
 to an address it can reach, plus the trusted-proxy settings below. Worker
 routes live only on the host port under `/webhook/voice-mode/livekit/agent/`;
 never proxy them: a worker request with `X-Forwarded-For` or `Forwarded` is
-refused. The old `/webhook/voice/livekit` browser links remain valid on the
-host port; worker routes are not served under that prefix.
+refused. Browser routes live only under `/voice`; nothing is served under
+`/webhook/voice/`.
 
 For Tailscale Serve, mount only the page prefix and repeat it in the target
 because Serve strips the mount prefix:
@@ -283,20 +288,23 @@ secrets. Both processes read their settings directly from `.env`.
 A worker started in a terminal stops with Ctrl-C.
 
 Run `/voice` in an existing chat wired to the agent, as a known owner or
-scoped/global admin. Slack callers type `!voice`. First use creates a line
-and sends its secret link once. In a group the link goes to the sender's DM;
-if that DM cannot be resolved, nothing is minted. Later `/voice` moves the
-call chat and keeps the link. Only the line's caller moves its call chat.
-`/voice new` re-mints it for an authorized sender and ends the old call.
-Lost links cannot be read back: only their SHA-256 is stored. Do not paste
-links into shared chats, agent messages or logs.
+scoped/global admin. Slack callers type `!voice`. First use creates the
+agent's line, makes the sender its caller and shows its secret link; later
+`/voice` by the caller shows the same link again and moves the call chat here,
+ending no call. One line per agent: a line's link and call chat belong to its
+caller, and any other admin is told whose line it is. `/voice new` re-mints the
+sender's own link and ends calls made with the old one. In a group the link
+reaches only the sender: on Telegram as an ephemeral reply (`/voice` is an
+ephemeral command), elsewhere or when that fails in their DM, and without a
+reachable DM the answer carries no link. A link minted before links were
+sealed shows after its next call. Do not paste links into shared chats, agent
+messages or logs.
 
-Calls use the caller's core role, checked at start, every turn, every five
-seconds and before replies. A revoked role or changed token ends the call.
-The current call chat must stay wired to the line's agent. When it disappears,
-`VOICE_MODE_MIRROR` picks an unambiguous fallback chat. A line `/voice` made
-with no usable chat is refused at call start, and a running call on it ends,
-until `/voice` runs in a chat with the agent.
+Calls use the caller's core role, checked at start, every turn and every five
+seconds. A revoked role or changed token ends the call. The call chat is the
+line's `/voice` chat and must stay wired to the line's agent: with no usable
+chat a call is refused at start, and a running call on it ends, until `/voice`
+runs in a chat with the agent. There is no fallback chat.
 
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use
@@ -306,19 +314,17 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page, worker routes and old links. A taken default port is logged and skipped; an explicit port that cannot bind stops voice-mode from starting. |
+| `NANOCLAW_ENCRYPTION_KEY` | none | Host-wide key sealing call links (32 bytes, canonical base64); without it `/voice` shows and mints no links. Never passed to the worker or containers. |
+| `VOICE_MODE_PORT` | `3100` | Separate page server; `off` or `0` disables it. `WEBHOOK_PORT` still serves the page and the worker routes. A taken default port is logged and skipped; an explicit port that cannot bind stops voice-mode from starting. |
 | `VOICE_MODE_PAGE_HOST` | `127.0.0.1` | Bind address of the separate page server. |
 | `VOICE_MODE_MAX_CALL_SECONDS` | `900` | Per-call duration limit. |
 | `VOICE_MODE_MAX_CALLS_PER_HOUR` | `12` | Start attempts per line, including failed starts. |
 | `VOICE_MODE_MAX_MINUTES_PER_DAY` | `120` | Per-line UTC daily call time. These counters reset when the host restarts. |
 | `VOICE_MODE_LANGUAGES` | `uk-UA,en-US` | Up to four language hints, first is primary. Agent language guidance follows them; the worker's own notices start in the first one and use Ukrainian only when it is listed. |
 | `VOICE_MODE_STT_MODEL` | `gemini-3.5-transcribe-live` | Own Gemini Live pipeline, one manual activity per caller turn. |
-| `VOICE_MODE_STT_FALLBACK_MODEL` | ignored | Deprecated unary fallback; the next turn retries Live. |
 | `VOICE_MODE_ELEVENLABS_API_KEY` | empty | Offers ElevenLabs voices to the lines; without it only Gemini speaks. |
 | `VOICE_MODE_SILENCE_MS` | `2500` | Closing silence, valid range 300 to 30000 milliseconds. |
-| `VOICE_MODE_MIRROR` | `telegram` | Fallback call-chat channel; `off` disables fallback. |
 | `VOICE_MODE_VOCABULARY` | empty | Comma-separated names, merged with the agent's `voice.vocabulary.txt`. |
-| `VOICE_MODE_MAX_SPOKEN_CHARS` | `0` | No cap; positive values cut speech at a sentence or whole word. |
 | `VOICE_MODE_TTS_DEESS`, `VOICE_MODE_TTS_NOTCH` | on | De-essing and fixed whistle notches; `off`, `false` or `0` disables each. |
 | `VOICE_MODE_WAKE_MODEL` | bundled `hey_livekit.onnx` | Custom acoustic classifier path, or `off` for transcript wake. |
 | `VOICE_MODE_WAKE_PHRASE` | `Hey LiveKit` | Label of the acoustic phrase; it does not train or change the model. |
@@ -334,10 +340,9 @@ voice, always all three: a new line and a reset one save Gemini
 `gemini-3.8-flash-tts` with `en-us-techagent-4`, and a pick that leaves out the
 model or voice saves the provider's default (Gemini `gemini-3.8-flash-tts`,
 `alnilam`; ElevenLabs `eleven_v4_turbo`, whose only other model is
-`eleven_v4`). The `module:voice-mode:lines-tts-concrete` migration, and the host
-at every start, fill in any field a row lacks with what the line already spoke
-with. A Gemini line falls back to `gemini-3.8-flash-lite-tts` before any audio,
-an ElevenLabs line to Gemini `alnilam`; nothing is replayed after partial
+`eleven_v4`). The `module:voice-mode:lines-tts-concrete` migration filled in
+any field an older row lacked with what the line already spoke with. A Gemini
+line falls back to `gemini-3.8-flash-lite-tts` before any audio, an ElevenLabs line to Gemini `alnilam`; nothing is replayed after partial
 speech. A saved voice its provider certainly no longer has speaks `alnilam`
 too, and shows that as effective; a lookup that fails changes nothing. With the
 line's link token, and its caller still an owner or admin:
@@ -399,17 +404,6 @@ Manual review treats these words as ordinary dictation. Cue and typing sound
 switches remain independent settings. Caller speech during agent speech is
 reported as unheard. Reconnect grace keeps a same-identity full rejoin alive.
 
-The Jev end-of-turn shadow is optional, off unless `data/jev-turn.json` enables
-it. It can only measure, never send or end a turn. No Jev credential, endpoint,
-model or service is required for voice installation. See
-[optional shadow configuration](../../../docs/jev-turn.md).
-Its settings are `JEV_API_KEY`, `JEV_URL` and `JEV_MODEL`.
-The daily cap counts one appended byte per judgement in a file per local day,
-`data/jev-turn-usage-<YYYY-MM-DD>`, with no lock: concurrent calls can only
-under-count, and a judgement that cannot be counted is skipped and logged once
-per call as `scope=usage`. Kill switch: `"enabled": false`, or delete
-`data/jev-turn.json`.
-
 ## Upgrade
 
 Upgrade an existing voice install with the [upgrade runbook](../../../docs/2610-07-voice-mode-upgrade.md).
@@ -418,13 +412,12 @@ Remove via [REMOVE.md](REMOVE.md).
 
 ## Troubleshooting
 
-- Unknown link: a link is shown only once and cannot be read back; `/voice new`
-  replaces it.
+- Lost link: the caller's `/voice` shows it again (a link from before sealing
+  shows after its next call); `/voice new` replaces it and ends calls on the old one.
 - Caller denied: a `/voice` line needs its caller to hold a core owner or admin
   role over the agent.
 - No chat to talk in: the page says the line has no chat to talk in. Run
-  `/voice` in a chat wired to the agent, or set `VOICE_MODE_MIRROR` to a channel
-  with one unambiguous chat for it.
+  `/voice` in a chat wired to the agent.
 - Updating: reload the page or update the native client to protocol 6. Host and
   worker must match; token requests need `v=6` and older starts get HTTP 426.
 - No worker: check the worker unit, LiveKit signaling, host loopback URL and
@@ -436,5 +429,5 @@ Remove via [REMOVE.md](REMOVE.md).
   native media/background support is outside this browser skill.
 - Slow first answer: prewarm needs an existing session; a first-ever chat turn
   still creates one. Idle containers can be reclaimed during a silent call.
-- No spoken reply after hangup: the voice line needs an active call. Use the
-  agent's ordinary chat for later delivery, files and question cards.
+- No spoken reply after hangup: only a live call speaks what reaches its chat;
+  later replies, files and question cards stay in the chat as written.

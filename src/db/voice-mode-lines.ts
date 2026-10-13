@@ -1,9 +1,11 @@
 /**
  * Voice mode's own state: one voice line per agent group, in the skill's own table. The line holds
- * the SHA-256 of its current call-link token (never the token), who minted it (the caller), the
- * chat its calls talk in, and the speech choice its calls start with. `/voice` creates lines and
- * moves their chat, `/voice new` re-mints their link (src/channels/voice-mode-command.ts);
- * the call page finds a line by its token's hash (src/channels/voice-mode.ts).
+ * the SHA-256 of its current call-link token, the token itself sealed under the host's key (see
+ * src/secret-seal.ts) so `/voice` can show the link again, its caller (who minted the link), the
+ * chat its calls talk in, and the speech choice its calls start with. `/voice` creates lines, shows
+ * their link and moves their chat, `/voice new` re-mints their link
+ * (src/channels/voice-mode-command.ts); the call page finds a line by its token's hash
+ * (src/channels/voice-mode.ts), so calls never need the key.
  *
  * Who may run `/voice` is core's business (owner and admin roles); this table only records what a
  * run produced. No foreign keys into core tables: a line whose chat was deleted, unwired or denied
@@ -19,8 +21,8 @@ import {
   type TtsChoice,
   type TtsSaved,
 } from '../voice-mode-tts.js';
+import { openSealed, sealText } from '../secret-seal.js';
 import { getDb } from './connection.js';
-import type { DbDriver } from './driver.js';
 import { registerMigration } from './migrations/index.js';
 
 registerMigration({
@@ -58,6 +60,8 @@ export interface VoiceModeLineRow {
   agent_group_id: string;
   /** Hex SHA-256 of the current call-link token. */
   token_hash: string;
+  /** The current token sealed for `voice-link:<line_id>`; null until a link made before sealing is next opened. */
+  link_sealed: string | null;
   /** The user who minted the current link; calls speak as them and need their admin role. */
   owner_user_id: string;
   /** The chat calls talk in, and its thread. */
@@ -102,33 +106,6 @@ export async function setVoiceModeLineTts(
   );
 }
 
-/**
- * Give every line a whole speech choice, each missing field what the line already spoke with (see
- * effectiveTts): a missing provider the backup's, a missing model or voice that provider's default. Rows
- * from before every write stored one, or written by an older host after a rollback. Returns the rows
- * changed; a row naming a provider the registry lacks is left as it is.
- */
-export async function fillVoiceModeLineTts(db: DbDriver = getDb()): Promise<number> {
-  const providers = Object.keys(TTS_REGISTRY);
-  const fillable = await db.get<{ n: number }>(
-    `SELECT COUNT(*) AS n FROM voice_mode_lines WHERE tts_provider IS NULL
-       OR (tts_provider IN (${providers.map(() => '?').join(', ')}) AND (tts_model IS NULL OR tts_voice IS NULL))`,
-    ...providers,
-  );
-  if (!fillable?.n) return 0;
-  await db.run('UPDATE voice_mode_lines SET tts_provider = ? WHERE tts_provider IS NULL', TTS_DEFAULT_CHOICE.provider);
-  for (const entry of Object.values(TTS_REGISTRY)) {
-    await db.run(
-      `UPDATE voice_mode_lines SET tts_model = COALESCE(tts_model, ?), tts_voice = COALESCE(tts_voice, ?)
-         WHERE tts_provider = ? AND (tts_model IS NULL OR tts_voice IS NULL)`,
-      entry.defaults.model,
-      entry.defaults.voice,
-      entry.id,
-    );
-  }
-  return Number(fillable.n);
-}
-
 /** Hex SHA-256 of a call-link token: what the table stores and looks a link up by. */
 export const hashLinkToken = (token: string): string => createHash('sha256').update(token).digest('hex');
 
@@ -163,10 +140,47 @@ export async function bindVoiceModeLineChat(target: {
   );
 }
 
-/** The line a call-link token opens, or undefined. Only hashes are compared: the token is stored nowhere. */
+/** The line a call-link token opens, or undefined. Only hashes are compared. */
 export async function findVoiceModeLineByToken(token: string): Promise<VoiceModeLineRow | undefined> {
   if (!/^[0-9a-f]{32}$/.test(token)) return undefined;
   return getDb().get<VoiceModeLineRow>('SELECT * FROM voice_mode_lines WHERE token_hash = ?', hashLinkToken(token));
+}
+
+const linkContext = (lineId: string): string => `voice-link:${lineId}`;
+
+/**
+ * Seal the token that just opened `line` if the line has none sealed yet (a link minted before
+ * sealing, or after a rollback cleared it): from then on `/voice` can show it. Guarded by the hash,
+ * so a link re-minted meanwhile is never overwritten with this older one.
+ */
+export async function sealVoiceModeLink(line: VoiceModeLineRow, token: string, key: Buffer): Promise<void> {
+  if (line.link_sealed !== null) return;
+  await getDb().run(
+    'UPDATE voice_mode_lines SET link_sealed = ? WHERE line_id = ? AND token_hash = ? AND link_sealed IS NULL',
+    sealText(token, linkContext(line.line_id), key),
+    line.line_id,
+    hashLinkToken(token),
+  );
+}
+
+/**
+ * The line's current token, opened from its sealed link: `unsealed` when none is stored or the stored
+ * one is not the current link (an older host re-minted it), `unreadable` when it does not open with
+ * this key. Either stored copy is cleared, so the next call made with the link seals it again.
+ */
+export async function openVoiceModeLink(
+  line: VoiceModeLineRow,
+  key: Buffer,
+): Promise<{ token: string } | { missing: 'unsealed' | 'unreadable' }> {
+  if (line.link_sealed === null) return { missing: 'unsealed' };
+  const token = openSealed(line.link_sealed, linkContext(line.line_id), key);
+  if (token !== null && hashLinkToken(token) === line.token_hash) return { token };
+  await getDb().run(
+    'UPDATE voice_mode_lines SET link_sealed = NULL WHERE line_id = ? AND link_sealed = ?',
+    line.line_id,
+    line.link_sealed,
+  );
+  return { missing: token === null ? 'unreadable' : 'unsealed' };
 }
 
 /** Who a minted link is for and where its calls talk. */
@@ -178,25 +192,29 @@ export interface VoiceModeLineTarget {
 }
 
 /**
- * Insert the agent's line with a fresh token, or apply `onConflict` (an `ON CONFLICT` action) to the
- * one it has. Undefined when the conflict action returned no row (`DO NOTHING`).
+ * Insert the agent's line with a fresh token, sealed when a key is given, or apply `onConflict` (an
+ * `ON CONFLICT` action) to the one it has. Undefined when the conflict action returned no row.
  */
 async function insertLine(
   target: VoiceModeLineTarget,
+  key: Buffer | null,
   onConflict: string,
 ): Promise<{ line: VoiceModeLineRow; token: string } | undefined> {
   const token = randomBytes(16).toString('hex');
+  // The seal is bound to the line id, so a re-mint seals for the id the line already has.
+  const lineId = (await getVoiceModeLineForAgent(target.agentGroupId))?.line_id ?? randomBytes(6).toString('hex');
   const now = new Date().toISOString();
   const line = await getDb().get<VoiceModeLineRow>(
     `INSERT INTO voice_mode_lines
-       (line_id, agent_group_id, token_hash, owner_user_id, messaging_group_id, thread_id,
+       (line_id, agent_group_id, token_hash, link_sealed, owner_user_id, messaging_group_id, thread_id,
         tts_provider, tts_model, tts_voice, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (agent_group_id) ${onConflict}
      RETURNING *`,
-    randomBytes(6).toString('hex'),
+    lineId,
     target.agentGroupId,
     hashLinkToken(token),
+    key ? sealText(token, linkContext(lineId), key) : null,
     target.ownerUserId,
     target.messagingGroupId,
     target.threadId,
@@ -206,23 +224,27 @@ async function insertLine(
     now,
     now,
   );
-  return line && { line, token };
+  return line ? { line, token } : undefined;
 }
 
 /**
- * Mint a new call link for the agent's line (creating the line on first use), make `ownerUserId` its
- * caller and the given chat its call chat. The previous link stops working; the saved speech choice
- * stays. Returns the line and the new token, which is stored nowhere: the caller hands it out once.
+ * Mint a new call link for the agent's line (creating the line on first use, with `ownerUserId` as its
+ * caller) and make the given chat its call chat. Only the line's own caller re-mints: another user's
+ * line is never taken over, and that throws. The previous link stops working; the saved speech choice
+ * stays. The token is sealed when a key is given (`/voice` always gives one).
  */
 export async function mintVoiceModeLine(
   target: VoiceModeLineTarget,
+  key: Buffer | null = null,
 ): Promise<{ line: VoiceModeLineRow; token: string }> {
   const minted = await insertLine(
     target,
+    key,
     `DO UPDATE SET
-       token_hash = excluded.token_hash, owner_user_id = excluded.owner_user_id,
+       token_hash = excluded.token_hash, link_sealed = excluded.link_sealed, owner_user_id = excluded.owner_user_id,
        messaging_group_id = excluded.messaging_group_id, thread_id = excluded.thread_id,
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at
+     WHERE voice_mode_lines.owner_user_id = excluded.owner_user_id`,
   );
   if (!minted) throw new Error('voice-mode: the line was not stored');
   return minted;
@@ -234,27 +256,36 @@ export async function mintVoiceModeLine(
  */
 export async function createVoiceModeLine(
   target: VoiceModeLineTarget,
+  key: Buffer | null = null,
 ): Promise<{ line: VoiceModeLineRow; token: string } | undefined> {
-  return insertLine(target, 'DO NOTHING');
+  return insertLine(target, key, 'DO NOTHING');
 }
-
-registerMigration({
-  version: 3,
-  name: 'module:voice-mode:drop-legacy-lines',
-  async up(db) {
-    // Every line is a voice_mode_lines row; core's 027 still creates the old tables on a fresh DB, and this runs after it.
-    await db.exec(`
-      DROP TABLE IF EXISTS voice_line_owners;
-      DROP TABLE IF EXISTS voice_lines;
-    `);
-  },
-});
 
 registerMigration({
   version: 4,
   name: 'module:voice-mode:lines-tts-concrete',
   async up(db) {
-    // The host runs the same fill at every start too: an older host after a rollback writes nulls again.
-    await fillVoiceModeLineTts(db);
+    // Each missing field becomes what the line already spoke with (see effectiveTts); a provider the registry lacks stays.
+    await db.run(
+      'UPDATE voice_mode_lines SET tts_provider = ? WHERE tts_provider IS NULL',
+      TTS_DEFAULT_CHOICE.provider,
+    );
+    for (const entry of Object.values(TTS_REGISTRY)) {
+      await db.run(
+        `UPDATE voice_mode_lines SET tts_model = COALESCE(tts_model, ?), tts_voice = COALESCE(tts_voice, ?)
+           WHERE tts_provider = ? AND (tts_model IS NULL OR tts_voice IS NULL)`,
+        entry.defaults.model,
+        entry.defaults.voice,
+        entry.id,
+      );
+    }
+  },
+});
+
+registerMigration({
+  version: 5,
+  name: 'module:voice-mode:lines-link-sealed',
+  async up(db) {
+    await db.exec('ALTER TABLE voice_mode_lines ADD COLUMN link_sealed TEXT');
   },
 });

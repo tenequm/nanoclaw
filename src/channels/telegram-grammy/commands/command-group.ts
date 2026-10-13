@@ -19,7 +19,8 @@
  * Typography: ASCII only ('-', '...', '->'); emoji allowed as UI glyphs.
  */
 import { Effect } from 'effect';
-import type { Context } from 'grammy';
+import type { Api, Context } from 'grammy';
+import type { Message } from 'grammy/types';
 import { CommandGroup } from '@grammyjs/commands';
 
 import {
@@ -31,7 +32,6 @@ import {
   getStatus,
   isActivationMode,
   restartAgent,
-  runVoiceCommand,
   setActivation,
   setConfigValue,
   setModel,
@@ -42,6 +42,7 @@ import {
 } from '../../../commands/index.js';
 import { getChannelAdapterExact } from '../../channel-registry.js';
 import type { InboundEvent } from '../../adapter.js';
+import { mapGrammyError } from '../errors.js';
 import { log } from '../../../log.js';
 import { hasAdminPrivilege } from '../../../modules/permissions/db/user-roles.js';
 import type { AdapterRuntime } from '../runtime.js';
@@ -65,7 +66,6 @@ import {
   reply,
   restartConfirmation,
   statusCard,
-  voiceCommandReply,
 } from './render.js';
 
 /** The telegram adapter is thread-less, so status/config chat context uses a null thread. */
@@ -91,8 +91,64 @@ async function isAdminOfAny(actor: string, agents: readonly TargetAgent[]): Prom
 const dropNoAgent = (command: string, ctx: Context): Effect.Effect<void> =>
   Effect.sync(() => log.debug('telegram-grammy: command in unwired chat dropped', { command, chatId: ctx.chat?.id }));
 
+/** A sender-only reply in the command's chat (see sendEphemeralReply). */
+type PrivateReply = (text: string) => Promise<'sent' | 'unavailable' | 'public'>;
+/** The voice-mode adapter's `/voice` handler (src/channels/voice-mode.ts), typed here so this file builds without the skill. */
+type VoiceCommandHandler = (event: InboundEvent, privateReply: PrivateReply) => Promise<boolean>;
+/** The voice-mode skill's command module, named by a variable so this file builds after REMOVE.md deletes it. */
+const VOICE_COMMAND_MODULE = '../../voice-mode-command.js';
+
 function commandArg(ctx: Context): string {
   return typeof ctx.match === 'string' ? ctx.match.trim() : '';
+}
+
+/**
+ * Send `text` to the command's sender only, as a Telegram ephemeral message in the command's chat and
+ * topic, answering the incoming ephemeral command when it was one (that reply is allowed for 15 s).
+ * A response that is not ephemeral to the sender may have been seen by others: it is deleted at once
+ * and reported as `public`. Errors are logged by kind and description only: the request holds the text.
+ */
+async function sendEphemeralReply(
+  api: Api,
+  msg: Pick<Message, 'chat' | 'ephemeral_message_id' | 'is_topic_message' | 'message_thread_id'>,
+  receiverId: number,
+  text: string,
+): ReturnType<PrivateReply> {
+  const chatId = msg.chat.id;
+  const failed = (method: string, err: unknown) => {
+    const mapped = mapGrammyError(err, method, String(chatId));
+    return { error: mapped._tag, description: 'description' in mapped ? mapped.description : undefined };
+  };
+  let sent: Message.TextMessage;
+  try {
+    sent = await api.sendMessage(chatId, text, {
+      ephemeral_message_parameters: { receiver_user_id: receiverId },
+      ...(msg.ephemeral_message_id !== undefined
+        ? { reply_parameters: { ephemeral_message_id: msg.ephemeral_message_id } }
+        : {}),
+      ...(msg.is_topic_message && msg.message_thread_id !== undefined
+        ? { message_thread_id: msg.message_thread_id }
+        : {}),
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (err) {
+    log.warn('telegram-grammy: ephemeral reply not sent', failed('sendMessage-ephemeral', err));
+    return 'unavailable';
+  }
+  if (sent.message_id === 0 && sent.receiver_user?.id === receiverId && sent.ephemeral_message_id !== undefined) {
+    return 'sent';
+  }
+  // An ephemeral message shown to someone else has no message id: it is deleted by its ephemeral id.
+  const { ephemeral_message_id: ephemeralId, receiver_user: receiver } = sent;
+  const method = ephemeralId !== undefined && receiver ? 'deleteEphemeralMessage' : 'deleteMessage';
+  const removal =
+    ephemeralId !== undefined && receiver
+      ? api.deleteEphemeralMessage(chatId, receiver.id, ephemeralId)
+      : api.deleteMessage(chatId, sent.message_id);
+  await removal.catch((err: unknown) =>
+    log.error('telegram-grammy: a private reply went public and could not be deleted', failed(method, err)),
+  );
+  return 'public';
 }
 
 export function buildCommandGroup(runtime: AdapterRuntime, menus: CommandMenus): CommandGroup<Context> {
@@ -241,40 +297,34 @@ export function buildCommandGroup(runtime: AdapterRuntime, menus: CommandMenus):
       yield* reply(ctx, 'This chat has multiple agents. Restart each from its own topic, or via /config -> Restart.');
     });
 
-  // /voice - admin only: replies with the agent's call links and makes this chat (topic) the
-  // line's call chat. Every agent of the chat the actor administers, like /status.
+  // /voice - answered by the voice-mode command (src/channels/voice-mode-command.ts), which checks
+  // the sender's role; in a group its reply goes out ephemeral, so only the sender sees the link.
   const onVoice = (ctx: Context): Effect.Effect<void> =>
-    Effect.gen(function* () {
-      const actor = actorUserId(ctx);
-      // The voice-mode channel answers /voice itself, as it does on every other channel.
-      const voice = getChannelAdapterExact('voice-mode') as
-        | { handleVoiceCommand?: (event: InboundEvent) => Promise<boolean> }
-        | undefined;
+    Effect.promise(async () => {
       const platformId = contextPlatformId(ctx);
-      if (voice?.handleVoiceCommand && platformId && ctx.msg) {
-        yield* Effect.promise(() =>
-          voice.handleVoiceCommand!({
-            channelType: CHANNEL,
-            instance: CHANNEL,
-            platformId,
-            threadId: null,
-            message: {
-              id: String(ctx.msg!.message_id),
-              kind: 'chat',
-              content: JSON.stringify({ text: `/voice ${commandArg(ctx)}`, senderId: actor }),
-              timestamp: new Date(ctx.msg!.date * 1000).toISOString(),
-            },
-          }),
-        );
-        return;
-      }
-      const res = yield* Effect.promise(() => resolveTargetsForContext(ctx));
-      const chatCtx = yield* Effect.promise(() => chatContext(ctx));
-      if (res.kind === 'none' || !chatCtx) return yield* dropNoAgent('voice', ctx);
-      const outcome = yield* Effect.promise(() => runVoiceCommand(res, chatCtx, actor));
-      const text = voiceCommandReply(outcome);
-      if (text === null) return yield* dropNoAgent('voice', ctx);
-      yield* reply(ctx, text);
+      const msg = ctx.msg;
+      const from = ctx.from;
+      if (!platformId || !msg || !from) return;
+      const event: InboundEvent = {
+        channelType: CHANNEL,
+        instance: CHANNEL,
+        platformId,
+        threadId: null,
+        message: {
+          id: String(msg.message_id),
+          kind: 'chat',
+          content: JSON.stringify({ text: `/voice ${commandArg(ctx)}`, senderId: actorUserId(ctx) }),
+          timestamp: new Date(msg.date * 1000).toISOString(),
+        },
+      };
+      const privateReply = (text: string) => sendEphemeralReply(ctx.api, msg, from.id, text);
+      const voice = getChannelAdapterExact('voice-mode') as { handleVoiceCommand?: VoiceCommandHandler } | undefined;
+      if (voice?.handleVoiceCommand) return void (await voice.handleVoiceCommand(event, privateReply));
+      // No voice-mode channel running: the skill's command module says calls are off, if the skill is installed.
+      const skill = (await import(VOICE_COMMAND_MODULE).catch(() => undefined)) as
+        | { handleVoiceCommand?: (event: InboundEvent, callUrl: null, reply: PrivateReply) => Promise<boolean> }
+        | undefined;
+      if (skill?.handleVoiceCommand) await skill.handleVoiceCommand(event, null, privateReply);
     });
 
   group.command('status', COMMANDS.status.description, (ctx) => runtime.runPromise(onStatus(ctx)));
