@@ -105,8 +105,8 @@ function commandArg(ctx: Context): string {
 /**
  * Send `text` to the command's sender only, as a Telegram ephemeral message in the command's chat and
  * topic, answering the incoming ephemeral command when it was one (that reply is allowed for 15 s).
- * A response that is not ephemeral was posted for everyone: it is deleted at once and reported as
- * `public`. Errors are logged by kind and description only: the request holds the text.
+ * A response that is not ephemeral to the sender may have been seen by others: it is deleted at once
+ * and reported as `public`. Errors are logged by kind and description only: the request holds the text.
  */
 async function sendEphemeralReply(
   api: Api,
@@ -138,11 +138,16 @@ async function sendEphemeralReply(
   if (sent.message_id === 0 && sent.receiver_user?.id === receiverId && sent.ephemeral_message_id !== undefined) {
     return 'sent';
   }
-  await api
-    .deleteMessage(chatId, sent.message_id)
-    .catch((err: unknown) =>
-      log.error('telegram-grammy: a private reply went public and could not be deleted', failed('deleteMessage', err)),
-    );
+  // An ephemeral message shown to someone else has no message id: it is deleted by its ephemeral id.
+  const { ephemeral_message_id: ephemeralId, receiver_user: receiver } = sent;
+  const method = ephemeralId !== undefined && receiver ? 'deleteEphemeralMessage' : 'deleteMessage';
+  const removal =
+    ephemeralId !== undefined && receiver
+      ? api.deleteEphemeralMessage(chatId, receiver.id, ephemeralId)
+      : api.deleteMessage(chatId, sent.message_id);
+  await removal.catch((err: unknown) =>
+    log.error('telegram-grammy: a private reply went public and could not be deleted', failed(method, err)),
+  );
   return 'public';
 }
 

@@ -864,6 +864,28 @@ describe('native Telegram /voice', () => {
     expect(texts[1]).toBe('Your call link is in our direct chat.');
   });
 
+  it('deletes an ephemeral reply shown to someone else by its ephemeral id, and replaces the link', async () => {
+    const bot = await nativeBot();
+    await chat('native-topic', 'telegram:-1001:7', 1);
+    await chat('native-dm', actor, 0);
+    answer = (method, payload) =>
+      method === 'sendMessage'
+        ? {
+            message_id: 0,
+            ephemeral_message_id: 57,
+            receiver_user: { id: 2, is_bot: false, first_name: 'Someone' },
+            date: 1,
+            chat: { id: -1001, type: 'supergroup', title: 'HQ' },
+            text: payload.text,
+          }
+        : true;
+    await bot.handleUpdate(topicCommand());
+    expect(api.map((c) => c.method)).toEqual(['sendMessage', 'deleteEphemeralMessage']);
+    expect(api[1].payload).toEqual({ chat_id: -1001, receiver_user_id: 2, ephemeral_message_id: 57 });
+    const leaked = tokenOf(String(api[0].payload.text).match(/https:\S+/)![0]);
+    expect(await findVoiceModeLineByToken(leaked)).toBeUndefined();
+  });
+
   it('falls back to the direct chat when Telegram refuses the ephemeral reply, logging no link', async () => {
     const bot = await nativeBot();
     await chat('native-topic', 'telegram:-1001:7', 1);
