@@ -148,12 +148,7 @@ export const CONFIG_FIELDS: readonly ConfigField[] = [
 
 // --- Command result union ---
 
-export type CommandFailureReason =
-  | 'unauthorized'
-  | 'unknown-agent'
-  | 'invalid-value'
-  | 'unknown-field'
-  | 'voice-unavailable';
+export type CommandFailureReason = 'unauthorized' | 'unknown-agent' | 'invalid-value' | 'unknown-field';
 
 /** Message-safe structured detail for a failed command (data, not prose). */
 export interface CommandFailureDetail {
@@ -295,20 +290,6 @@ export interface ActivationChangeView {
   /** The regex source when mode==='pattern', else null. */
   pattern: string | null;
 }
-
-/** /voice for one agent: its line(s) now talk in this chat; the links open the call page. */
-export interface VoiceTargetView {
-  agentName: string;
-  agentGroupId: string;
-  /** The call page (`/voice?t=`) of each of the agent's voice lines. Secrets: never log them. */
-  links: readonly string[];
-}
-
-/** What /voice did in a chat: nothing to say (unknown sender), a refusal, or one result per agent. */
-export type VoiceCommandOutcome =
-  | { kind: 'drop' }
-  | { kind: 'refused' }
-  | { kind: 'done'; results: ReadonlyArray<{ agentName: string; result: CommandResult<VoiceTargetView> }> };
 
 // --- Target resolution ---
 

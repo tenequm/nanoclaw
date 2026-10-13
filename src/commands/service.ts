@@ -49,7 +49,6 @@ import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { countDueMessages, openInboundDb } from '../mailbox/sqlite/session-db.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import type { ContainerConfigRow, EngageMode, Session } from '../types.js';
-import { voiceAccess } from './auth.js';
 import { readTranscriptStats } from './transcript.js';
 import {
   describeModel,
@@ -76,7 +75,6 @@ import {
   type StatusView,
   type TargetAgent,
   type TargetResolution,
-  type VoiceCommandOutcome,
 } from './types.js';
 
 /** Default cli_scope when no container_configs row exists yet. */
@@ -563,31 +561,4 @@ export async function restartAgent(agentGroupId: string, actorUserId: string): P
  */
 export async function offersVoiceCommand(_agentGroupIds: Iterable<string>): Promise<boolean> {
   return getRegisteredChannelNames().includes('voice-mode');
-}
-
-/**
- * /voice over a chat's wired agents, gated like /status but admin-only:
- * unknown senders are dropped silently and known non-admins refused. The
- * voice-mode channel answers /voice itself (src/channels/voice-mode-command.ts);
- * without it there is no line to bind, so every agent the actor administers
- * says voice is unavailable.
- */
-export async function runVoiceCommand(
-  targets: TargetResolution,
-  _chat: StatusChatContext,
-  actorUserId: string | null,
-): Promise<VoiceCommandOutcome> {
-  if (targets.kind === 'none') return { kind: 'drop' };
-  const agents = targets.kind === 'single' ? [targets.agent] : targets.agents;
-  const decided = await Promise.all(
-    agents.map(async (a) => [a, await voiceAccess(actorUserId, a.agentGroupId)] as const),
-  );
-  const allowed = decided.filter(([, d]) => d === 'allowed').map(([a]) => a);
-  if (allowed.length === 0 || !actorUserId) {
-    return decided.some(([, d]) => d === 'refuse') ? { kind: 'refused' } : { kind: 'drop' };
-  }
-  return {
-    kind: 'done',
-    results: allowed.map((a) => ({ agentName: a.agentName, result: fail('voice-unavailable') })),
-  };
 }

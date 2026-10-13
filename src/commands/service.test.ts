@@ -41,7 +41,6 @@ import type { MessagingGroupAgent, Session } from '../types.js';
 import { getMessagingGroupAgentByPair } from '../db/messaging-groups.js';
 import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from '../channels/channel-registry.js';
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
-import { MD_FMT, voiceCommandReply } from './cards.js';
 import {
   getConfigView,
   getModelPicker,
@@ -49,7 +48,6 @@ import {
   offersVoiceCommand,
   resolveTargets,
   restartAgent,
-  runVoiceCommand,
   setActivation,
   setConfigValue,
   setModel,
@@ -550,8 +548,6 @@ describe('restartAgent', () => {
 // --- /voice ---
 
 describe('/voice', () => {
-  const chat = { messagingGroupId: 'mg-dm', threadId: null };
-
   beforeEach(async () => {
     await makeAgentGroup('ag-1', 'Emma');
     await grantRole({ user_id: OWNER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
@@ -593,22 +589,5 @@ describe('/voice', () => {
     } finally {
       await teardownChannelAdapters();
     }
-  });
-
-  it('drops unknown senders, refuses members, and tells an admin voice is off without the voice-mode channel', async () => {
-    const targets = await resolveTargets('mg-dm');
-    expect(await runVoiceCommand(targets, chat, null)).toEqual({ kind: 'drop' });
-    expect(await runVoiceCommand(targets, chat, 'telegram:999')).toEqual({ kind: 'drop' });
-    const refused = await runVoiceCommand(targets, chat, NON_ADMIN);
-    expect(refused).toEqual({ kind: 'refused' });
-    expect(voiceCommandReply(refused, MD_FMT)).toBe('🚫 Admins only.');
-    const off = await runVoiceCommand(targets, chat, OWNER);
-    expect(off).toEqual({
-      kind: 'done',
-      results: [{ agentName: 'Emma', result: { ok: false, reason: 'voice-unavailable' } }],
-    });
-    expect(voiceCommandReply(off, MD_FMT)).toBe(
-      'Voice calls are off on this host (the voice channel is not configured).',
-    );
   });
 });
