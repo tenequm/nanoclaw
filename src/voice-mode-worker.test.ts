@@ -11,7 +11,7 @@ import { getEventListeners } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
 import { AgentServer, InferenceRunner, initializeLogger, ServerOptions, VADEventType } from '@livekit/agents';
-import { AudioFrame, DisconnectReason } from '@livekit/rtc-node';
+import { AudioFrame, AudioResampler, DisconnectReason } from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -2378,6 +2378,42 @@ describe('voice selection in a call (the settings RPC)', () => {
     await flush();
     expect(call.said(ELEVEN).filter((text) => text === 'One.')).toHaveLength(1);
     expect(call.said(GEMINI)).not.toContain('One.');
+  });
+
+  it('a resampled line frees its resampler however it ends; only a line spoken to its end flushes the tail', async () => {
+    const push = vi.spyOn(AudioResampler.prototype, 'push');
+    const flushed = vi.spyOn(AudioResampler.prototype, 'flush');
+    const closed = vi.spyOn(AudioResampler.prototype, 'close');
+    try {
+      const at22 = { sampleRate: 22_050, samples: 2_205 };
+      const call = speakingCall({
+        [ttsId(ELEVEN)]: (text) =>
+          text === 'One.'
+            ? { ...at22, chunks: 2 }
+            : text === 'Two.'
+              ? { ...at22, chunks: 2, error: Object.assign(new Error('cut'), { retryable: true }) }
+              : text === 'Three.'
+                ? { ...at22, chunks: 3, hold: new Promise(() => undefined) }
+                : { chunks: 1 },
+      });
+      const { host, job, line } = await start(call);
+      await call.v.rpc('settings', fixtures.settingsRequestTts);
+      expect(await line('One.')).toMatchObject({ outcome: 'spoken' });
+      expect([flushed.mock.calls.length, closed.mock.calls.length]).toEqual([1, 1]);
+      expect(await line('Two.')).toMatchObject({ outcome: 'partial' });
+      expect([flushed.mock.calls.length, closed.mock.calls.length]).toEqual([1, 2]);
+      const pushes = push.mock.calls.length;
+      host.emit({ type: 'reply', text: 'Three.', turn: null });
+      await vi.waitFor(() => expect(push.mock.calls.length).toBeGreaterThan(pushes));
+      host.emit({ type: 'end', reason: 'hangup' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
+      await vi.waitFor(() => expect(closed).toHaveBeenCalledTimes(3));
+      expect(flushed).toHaveBeenCalledTimes(1);
+    } finally {
+      push.mockRestore();
+      flushed.mockRestore();
+      closed.mockRestore();
+    }
   });
 
   it('a provider with no audio for a line is tried once more, then the fallback speaks it', async () => {

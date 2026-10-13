@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 
+import { initializeLogger } from '@livekit/agents';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -181,6 +182,20 @@ describe('TTS choices', () => {
     ).toBeNull();
     expect(TTS_REGISTRY.gemini.filters.notch).toBe(true);
     expect(TTS_REGISTRY.elevenlabs.filters.notch).toBe(false);
+  });
+
+  it('builds ElevenLabs at the speech track rate, 24 kHz, so its lines are never resampled', async () => {
+    initializeLogger({ pretty: false, level: 'error' });
+    const tts = TTS_REGISTRY.elevenlabs.build(
+      effectiveTts({ provider: 'elevenlabs', model: null, voice: null }),
+      'ek-test',
+      log,
+    );
+    try {
+      expect(tts.sampleRate).toBe(24_000);
+    } finally {
+      await tts.close();
+    }
   });
 
   it('matches the provider list the fixtures publish, with a name for every model', () => {
