@@ -48,8 +48,6 @@ export const CALL_PROTOCOL_ATTRIBUTE = 'nanoclaw.voice-mode.protocol';
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
 /** Silence that ends the caller's turn; shorter pauses mid-thought keep it open. */
 export const DEFAULT_VOICE_SILENCE_MS = 2500;
-/** Channel type of the default call chat when `/voice` has not set one (VOICE_MODE_MIRROR). */
-export const DEFAULT_VOICE_MIRROR = 'telegram';
 
 /** The languages callers speak when VOICE_MODE_LANGUAGES is unset (BCP-47; the first is the default). */
 export const DEFAULT_VOICE_LANGUAGES: readonly string[] = ['uk-UA', 'en-US'];

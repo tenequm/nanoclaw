@@ -41,7 +41,6 @@ import {
 import { createVoiceCatalog, type VoiceCatalog } from './voice-mode-tts-catalog.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
-  DEFAULT_VOICE_MIRROR,
   LIVEKIT_PROTOCOL_VERSION,
   settleWithin,
   wakePhrase,
@@ -783,7 +782,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       'VOICE_MODE_STT_MODEL',
       'VOICE_MODE_STT_FALLBACK_MODEL',
       'VOICE_MODE_SILENCE_MS',
-      'VOICE_MODE_MIRROR',
       'VOICE_MODE_WAKE_MODEL',
       'VOICE_MODE_WAKE_PHRASE',
     ]);
@@ -820,7 +818,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
           sttFallbackModel: env.VOICE_MODE_STT_FALLBACK_MODEL,
           silenceMs: parseSilenceMs(env.VOICE_MODE_SILENCE_MS),
         },
-        mirror: (env.VOICE_MODE_MIRROR || DEFAULT_VOICE_MIRROR).trim().toLowerCase(),
       },
     });
   },

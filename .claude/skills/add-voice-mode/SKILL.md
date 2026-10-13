@@ -287,12 +287,11 @@ call chat and keeps the link. Only the line's caller moves its call chat.
 Lost links cannot be read back: only their SHA-256 is stored. Do not paste
 links into shared chats, agent messages or logs.
 
-Calls use the caller's core role, checked at start, every turn, every five
-seconds and before replies. A revoked role or changed token ends the call.
-The current call chat must stay wired to the line's agent. When it disappears,
-`VOICE_MODE_MIRROR` picks an unambiguous fallback chat. A line `/voice` made
-with no usable chat is refused at call start, and a running call on it ends,
-until `/voice` runs in a chat with the agent.
+Calls use the caller's core role, checked at start, every turn and every five
+seconds. A revoked role or changed token ends the call. The call chat is the
+line's `/voice` chat and must stay wired to the line's agent: with no usable
+chat a call is refused at start, and a running call on it ends, until `/voice`
+runs in a chat with the agent. There is no fallback chat.
 
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use
@@ -312,7 +311,6 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_STT_FALLBACK_MODEL` | ignored | Deprecated unary fallback; the next turn retries Live. |
 | `VOICE_MODE_ELEVENLABS_API_KEY` | empty | Offers ElevenLabs voices to the lines; without it only Gemini speaks. |
 | `VOICE_MODE_SILENCE_MS` | `2500` | Closing silence, valid range 300 to 30000 milliseconds. |
-| `VOICE_MODE_MIRROR` | `telegram` | Fallback call-chat channel; `off` disables fallback. |
 | `VOICE_MODE_VOCABULARY` | empty | Comma-separated names, merged with the agent's `voice.vocabulary.txt`. |
 | `VOICE_MODE_MAX_SPOKEN_CHARS` | `0` | No cap; positive values cut speech at a sentence or whole word. |
 | `VOICE_MODE_TTS_DEESS`, `VOICE_MODE_TTS_NOTCH` | on | De-essing and fixed whistle notches; `off`, `false` or `0` disables each. |
@@ -418,8 +416,7 @@ Remove via [REMOVE.md](REMOVE.md).
 - Caller denied: a `/voice` line needs its caller to hold a core owner or admin
   role over the agent.
 - No chat to talk in: the page says the line has no chat to talk in. Run
-  `/voice` in a chat wired to the agent, or set `VOICE_MODE_MIRROR` to a channel
-  with one unambiguous chat for it.
+  `/voice` in a chat wired to the agent.
 - Updating: reload the page or update the native client to protocol 6. Host and
   worker must match; token requests need `v=6` and older starts get HTTP 426.
 - No worker: check the worker unit, LiveKit signaling, host loopback URL and

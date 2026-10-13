@@ -67,7 +67,6 @@ changing settings.
 | `VOICE_TTS_FALLBACK_MODEL` | `VOICE_MODE_TTS_FALLBACK_MODEL` |
 | `VOICE_TTS_VOICE` | `VOICE_MODE_TTS_VOICE` |
 | `VOICE_SILENCE_MS` | `VOICE_MODE_SILENCE_MS` |
-| `VOICE_MIRROR` | `VOICE_MODE_MIRROR` |
 | `VOICE_WAKE_MODEL` | `VOICE_MODE_WAKE_MODEL` |
 | `VOICE_WAKE_PHRASE` | `VOICE_MODE_WAKE_PHRASE` |
 | `VOICE_WAKE_THRESHOLD` | `VOICE_MODE_WAKE_THRESHOLD` |
@@ -90,7 +89,9 @@ keys are voice-mode's own:
 `VOICE_MODE_TTS_MODEL`, `VOICE_MODE_TTS_FALLBACK_MODEL`,
 `VOICE_MODE_TTS_VOICE` and `VOICE_MODE_LINK_TOKEN` (and their `VOICE_*` names
 above) are no longer read: each line keeps its own voice, and `/voice` makes
-the links. Before upgrading an install that set one, save it on every line
+the links. `VOICE_MODE_MIRROR` (`VOICE_MIRROR`) is not read either: a call
+talks only in its line's `/voice` chat, and a line whose chat is gone is
+refused until `/voice` runs again. Before upgrading an install that set one, save it on every line
 with `PATCH /voice/tts` (see the skill's "Voice per line"), or its lines
 speak with the default `alnilam`.
 The build adds a separate page listener on `127.0.0.1:3100` (`VOICE_MODE_PORT`,

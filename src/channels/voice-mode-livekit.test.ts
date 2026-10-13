@@ -20,7 +20,6 @@ import {
   liveKitChatPresentation,
   liveKitChatTyping,
   parseLiveKitUtteranceId,
-  pickMirrorTarget,
   spokenText,
   type BoundCallChat,
   turnMessageText,
@@ -242,9 +241,10 @@ async function openHarness(
       apiKey: API_KEY,
       apiSecret: API_SECRET,
       api: lk,
-      // Every call talks in the agent's one Telegram DM unless a test says otherwise.
-      mirror: 'telegram',
-      mirrorApi: fakeMirror([{ platform_id: 'telegram:100' }]).api,
+      // Every call talks in the agent's Telegram DM, the line's /voice chat, unless a test says otherwise.
+      mirrorApi: fakeMirror([{ platform_id: 'telegram:100' }], {
+        bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
+      }).api,
       ...lkOverrides,
     },
     // The LiveKit engine routes here; each turn is recorded, and the message it carries.
@@ -1388,42 +1388,16 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   });
 });
 
-describe('mirror target', () => {
-  it('picks the one live chat of the channel, or the one direct chat among several', () => {
-    expect(pickMirrorTarget([], 'telegram')).toEqual({ skip: 'no telegram chat is wired to the agent' });
-    expect(
-      pickMirrorTarget(
-        [
-          mg({ id: 'a', denied_at: '2026-01-01' }),
-          mg({ id: 'b', detached_at: '2026-01-01' }),
-          mg({ id: 'c', channel_type: 'slack' }),
-        ],
-        'telegram',
-      ),
-    ).toEqual({ skip: 'no telegram chat is wired to the agent' });
-    const dm = mg({ id: 'dm' });
-    expect(pickMirrorTarget([dm], 'telegram')).toEqual({ target: dm });
-    // The same chat reached through two wirings is one chat.
-    expect(pickMirrorTarget([dm, { ...dm }], 'telegram')).toEqual({ target: dm });
-    const group = mg({ id: 'g', platform_id: 'telegram:-200', is_group: 1 });
-    expect(pickMirrorTarget([group, dm], 'telegram')).toEqual({ target: dm });
-    expect(pickMirrorTarget([group], 'telegram')).toEqual({ target: group });
-    expect(pickMirrorTarget([dm, mg({ id: 'dm2', platform_id: 'telegram:101' })], 'telegram')).toMatchObject({
-      skip: expect.stringContaining('2 telegram chats'),
-    });
-    expect(pickMirrorTarget([group, mg({ id: 'g2', is_group: 1 })], 'telegram')).toHaveProperty('skip');
-  });
-});
-
 describe('livekit call talking in the agent chat', () => {
   let h: Harness;
   afterEach(async () => {
     await h.stop();
   });
 
-  const start = async (groups: Array<Partial<MessagingGroup>>, mirror = 'telegram', options = {}) => {
-    const fake = fakeMirror(groups, options);
-    h = await startHarness({ accessCheckIntervalMs: 60_000 }, { mirror, mirrorApi: fake.api });
+  /** The agent's chats; the line's /voice chat is the first of them unless `options` bind another. */
+  const start = async (groups: Array<Partial<MessagingGroup>>, options?: Parameters<typeof fakeMirror>[1]) => {
+    const fake = fakeMirror(groups, options ?? { bound: { group: { id: 'mg-0', ...groups[0] }, threadId: null } });
+    h = await startHarness({ accessCheckIntervalMs: 60_000 }, { mirrorApi: fake.api });
     return fake;
   };
 
@@ -1441,7 +1415,7 @@ describe('livekit call talking in the agent chat', () => {
       agentGroupId,
     );
 
-  it('routes each turn into the one Telegram chat as the line caller, posts the transcript and speaks the chat replies', async () => {
+  it('routes each turn into the /voice chat as the line caller, posts the transcript and speaks the chat replies', async () => {
     const { posts } = await start([{ platform_id: 'telegram:100', name: 'HQ' }]);
     const { call, worker } = await startCall(h);
     expect(call.chat).toBe('HQ');
@@ -1653,7 +1627,7 @@ describe('livekit call talking in the agent chat', () => {
 
     it('marks a reply in the chat a mid-call /voice left while that chat is still spoken', async () => {
       const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
-      const fake = await start([{ platform_id: 'telegram:100' }, topic], 'telegram');
+      const fake = await start([{ platform_id: 'telegram:100' }, topic]);
       const { worker } = await startCall(h);
       await worker.utter('one');
       fake.state.bound = { group: topic, threadId: null };
@@ -1672,9 +1646,9 @@ describe('livekit call talking in the agent chat', () => {
     expect(call.chat).toBe('telegram DM');
   });
 
-  it('talks in the chat /voice was run in, ahead of the default rule, still as the line caller', async () => {
+  it('talks in the thread /voice was run in, still as the line caller', async () => {
     const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
-    const { posts } = await start([{ platform_id: 'telegram:100' }, topic], 'telegram', {
+    const { posts } = await start([{ platform_id: 'telegram:100' }, topic], {
       bound: { group: topic, threadId: 'th-1' },
     });
     const { worker } = await startCall(h);
@@ -1705,36 +1679,22 @@ describe('livekit call talking in the agent chat', () => {
     worker.close();
   });
 
-  it("talks in a /voice line's chat with no default rule", async () => {
-    const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
-    await start([topic], 'off', { bound: { group: topic, threadId: null } });
-    const { worker } = await startCall(h);
-    await worker.utter('hello');
-    expect(h.events).toEqual([expect.objectContaining({ platformId: 'telegram:-300:7' })]);
-    worker.close();
-  });
-
-  it("ignores a /voice chat that is no longer the agent's", async () => {
+  it("refuses a call whose /voice chat is no longer the agent's, whatever other chats it has", async () => {
     const gone = { id: 'mg-gone', platform_id: 'telegram:-9' };
-    const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
-    const fake = await start([{ platform_id: 'telegram:100' }, topic], 'telegram', {
-      bound: { group: gone, threadId: null },
-    });
-    const { worker } = await startCall(h);
-    await worker.utter('one');
-    expect(h.events[0].platformId).toBe('telegram:100');
-    fake.state.bound = { group: topic, threadId: null };
-    await worker.utter('two');
-    expect(h.events[1].platformId).toBe('telegram:-300:7');
-    for (const event of h.events) {
-      expect(JSON.parse(event.message.content)).toMatchObject({ sender: 'Ethan', senderId: LINE });
+    const denied = { id: 'mg-denied', platform_id: 'telegram:-8', denied_at: '2026-10-01T00:00:00Z' };
+    const fake = await start([{ platform_id: 'telegram:100' }, denied]);
+    for (const group of [gone, denied]) {
+      fake.state.bound = { group, threadId: null };
+      const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+      expect(refused.status).toBe(409);
+      expect(await refused.json()).toMatchObject({ error: 'no-chat' });
     }
-    worker.close();
+    expect(h.lk.rooms).toEqual([]);
   });
 
   it('still speaks the answer in flight in the chat a mid-call /voice left, until that chat goes quiet for a turn', async () => {
     const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
-    const fake = await start([{ platform_id: 'telegram:100' }, topic], 'telegram');
+    const fake = await start([{ platform_id: 'telegram:100' }, topic]);
     const { worker } = await startCall(h);
     await worker.utter('one');
     expect(h.events[0].platformId).toBe('telegram:100');
@@ -1760,7 +1720,7 @@ describe('livekit call talking in the agent chat', () => {
 
   it('names why the call ended only after a chat move the page was still being told of', async () => {
     const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1, name: 'Ops' };
-    const fake = await start([{ platform_id: 'telegram:100', name: 'HQ' }, topic], 'telegram');
+    const fake = await start([{ platform_id: 'telegram:100', name: 'HQ' }, topic]);
     const { worker } = await startCall(h);
     await worker.utter('one');
     let release!: () => void;
@@ -1782,7 +1742,7 @@ describe('livekit call talking in the agent chat', () => {
 
   it('tells the page when a mid-call /voice moves the call to another chat', async () => {
     const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1, name: 'Ops' };
-    const fake = await start([{ platform_id: 'telegram:100', name: 'HQ' }, topic], 'telegram');
+    const fake = await start([{ platform_id: 'telegram:100', name: 'HQ' }, topic]);
     const { call, worker } = await startCall(h);
     expect(call.chat).toBe('HQ');
     await worker.utter('one');
@@ -1809,18 +1769,6 @@ describe('livekit call talking in the agent chat', () => {
     worker.close();
   });
 
-  it('refuses a call when no single chat could be meant', async () => {
-    for (const groups of [[], [{ platform_id: 'telegram:1' }, { id: 'x', platform_id: 'telegram:2' }]]) {
-      await start(groups);
-      const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
-      expect(refused.status).toBe(409);
-      expect(await refused.json()).toMatchObject({ error: 'no-chat' });
-      expect(h.lk.rooms).toEqual([]);
-      await h.stop();
-    }
-    h = await startHarness();
-  });
-
   it('refuses a /voice line with no chat to talk in: a start before it counts or opens anything, a turn once the chat is gone', async () => {
     const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
     const fake = fakeMirror([topic]);
@@ -1830,7 +1778,7 @@ describe('livekit call talking in the agent chat', () => {
         maxCallsPerHour: 1,
         lineForToken: async (token) => (token === 'tok123' ? LINE : null),
       },
-      { mirror: 'off', mirrorApi: fake.api },
+      { mirrorApi: fake.api },
     );
     const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
     expect(refused.status).toBe(409);
@@ -1862,12 +1810,12 @@ describe('livekit call talking in the agent chat', () => {
     const info = vi.spyOn(log, 'info');
     try {
       const fake = fakeMirror([]);
-      fake.api.groupsFor = async () => {
+      fake.api.boundChat = async () => {
         throw new Error('db gone');
       };
       h = await startHarness(
         { lineForToken: async (token) => (token === 'tok123' ? LINE : null) },
-        { mirror: 'telegram', mirrorApi: fake.api },
+        { mirrorApi: fake.api },
       );
       const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
       expect(refused.status).toBe(409);
@@ -1884,7 +1832,7 @@ describe('livekit call talking in the agent chat', () => {
 
   it('tells the worker when the call loses its chat, then ends the call', async () => {
     const topic = { id: 'mg-topic', platform_id: 'telegram:-300:7', is_group: 1 };
-    const fake = await start([topic], 'off', {
+    const fake = await start([topic], {
       bound: { group: topic, threadId: null },
     });
     const { worker } = await startCall(h);
