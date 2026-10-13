@@ -4135,6 +4135,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
       if (heard) await o.sink.waitForPlayout().catch(() => undefined);
       return false;
     } finally {
+      resample.close();
       if (heard && !closed) o.stopped();
       const line = meter.done({ by: speech.spokenBy, primary, failed, cut: closed });
       if (line) {
@@ -4250,7 +4251,14 @@ async function roomVoice(
   const speechTrack = LocalAudioTrack.createAudioTrack(SPEECH_TRACK, speechSource);
   const speechPublication = await local.publishTrack(
     speechTrack,
-    new TrackPublishOptions({ source: TrackSource.SOURCE_MICROPHONE }),
+    // Hi-fi speech: DTX off so a line's first milliseconds are never spent waking the track, a set
+    // Opus bitrate instead of the default.
+    new TrackPublishOptions({
+      source: TrackSource.SOURCE_MICROPHONE,
+      dtx: false,
+      red: true,
+      audioEncoding: { maxBitrate: 64_000n },
+    }),
   );
   // The cues' own track: never the speech track, so a cue is never the agent speaking. Without it
   // the call runs silent of cues.
