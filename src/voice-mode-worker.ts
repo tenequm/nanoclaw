@@ -57,8 +57,8 @@ import {
   TrackSource,
   type RemoteTrack,
   type RemoteTrackPublication,
+  type LocalParticipant,
   type RemoteParticipant,
-  type Room,
 } from '@livekit/rtc-node';
 
 import {
@@ -855,9 +855,14 @@ export class SendCountdown {
   }
 }
 
-function pcmToWav(pcm: Int16Array, sampleRate: number): Buffer {
+function pcmBytes(pcm: Int16Array): Buffer {
   const data = Buffer.alloc(pcm.length * 2);
   for (let i = 0; i < pcm.length; i++) data.writeInt16LE(pcm[i], i * 2);
+  return data;
+}
+
+function pcmToWav(pcm: Int16Array, sampleRate: number): Buffer {
+  const data = pcmBytes(pcm);
   const header = Buffer.alloc(44);
   header.write('RIFF', 0, 'ascii');
   header.writeUInt32LE(36 + data.length, 4);
@@ -981,6 +986,12 @@ export class LineMeter {
   }
 }
 
+/** A recording's `<root>/<agent>/<YYYY-MM-DD>` directory (`at` an ISO time), and its `<callId>-<suffix>` path there. */
+const recordingPath = (root: string, call: { agent: string; callId: string }, at: string, suffix: string) => {
+  const dir = path.join(root, pathSegment(call.agent), at.slice(0, 10));
+  return { dir, base: path.join(dir, `${pathSegment(call.callId)}-${suffix}`) };
+};
+
 /**
  * Writes a spoken reply's audio, exactly as it went to the speech track (24 kHz mono), as
  * `<root>/<agent>/<YYYY-MM-DD>/<callId>-reply-<n>.wav`, next to the call's turn recordings, owner-only.
@@ -992,18 +1003,17 @@ export async function writeReplyRecording(
   pcm: Int16Array,
   at = Date.now(),
 ): Promise<string> {
-  const dir = path.join(root, pathSegment(call.agent), new Date(at).toISOString().slice(0, 10));
+  const { dir, base } = recordingPath(root, call, new Date(at).toISOString(), `reply-${reply}`);
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
-  const file = path.join(dir, `${pathSegment(call.callId)}-reply-${reply}.wav`);
+  const file = `${base}.wav`;
   await fs.promises.writeFile(file, pcmToWav(pcm, TTS_SAMPLE_RATE), { mode: 0o600 });
   return file;
 }
 
 /** Writes `<root>/<agent>/<YYYY-MM-DD>/<callId>-<turn>.wav` and `.json`, owner-only. */
 export async function writeTurnRecording(root: string, record: TurnRecord, audio: TurnAudio): Promise<string> {
-  const dir = path.join(root, pathSegment(record.agent), record.startedAt.slice(0, 10));
+  const { dir, base } = recordingPath(root, record, record.startedAt, String(record.turn));
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
-  const base = path.join(dir, `${pathSegment(record.callId)}-${record.turn}`);
   await fs.promises.writeFile(`${base}.wav`, pcmToWav(audio.pcm, audio.sampleRate), { mode: 0o600 });
   await fs.promises.writeFile(`${base}.json`, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   return base;
@@ -1054,8 +1064,8 @@ export class CallRecording {
     at = Date.now(),
   ) {
     const startedAt = new Date(at).toISOString();
-    const dir = path.join(root, pathSegment(call.agent), startedAt.slice(0, 10));
-    this.base = path.join(dir, `${pathSegment(call.callId)}-call`);
+    const { dir, base } = recordingPath(root, call, startedAt, 'call');
+    this.base = base;
     this.record = { ...call, startedAt, wakes: [] };
     this.file = fs.promises
       .mkdir(dir, { recursive: true, mode: 0o700 })
@@ -1068,8 +1078,7 @@ export class CallRecording {
 
   push(pcm: Int16Array): void {
     if (this.closed || pcm.length === 0) return;
-    const data = Buffer.alloc(pcm.length * 2);
-    for (let i = 0; i < pcm.length; i++) data.writeInt16LE(pcm[i], i * 2);
+    const data = pcmBytes(pcm);
     const at = 44 + this.bytes;
     this.bytes += data.length;
     this.sinceHeader += pcm.length;
@@ -1905,11 +1914,12 @@ export function loadTypingSound(file = getBuiltinAudioPath(BuiltinAudioClip.KEYB
  * Publish the cue track (CALL_CUE_TRACK) on its own source. DTX off: the track never goes quiet on
  * the wire, so the first milliseconds of a cue are never spent waking it up.
  */
-async function publishCueTrack(room: Room, log: WorkerLog): Promise<{ feed: CueFeed; close(): Promise<void> }> {
+async function publishCueTrack(
+  local: LocalParticipant,
+  log: WorkerLog,
+): Promise<{ feed: CueFeed; close(): Promise<void> }> {
   const source = new AudioSource(CUE_SAMPLE_RATE, 1, CUE_QUEUE_MS);
   const track = LocalAudioTrack.createAudioTrack(CALL_CUE_TRACK, source);
-  const local = room.localParticipant;
-  if (!local) throw new Error('no local participant');
   const publication = await local.publishTrack(track, new TrackPublishOptions({ dtx: false }));
   const feed = new CueFeed(source, (err) => log.warn('voice-mode worker: the cue track stopped', { err }));
   return {
@@ -2006,16 +2016,15 @@ export function matchWake(text: string, names: readonly WakeName[]): { start: nu
   return null;
 }
 
-export type SpokenCommand = CallCommand;
 /** A command a transcript ends with, and what was said before it; `ownSentence` for `copy` and `copy that`. */
-export type CommandMatch = { command: SpokenCommand; rest: string; ownSentence?: true };
+export type CommandMatch = { command: CallCommand; rest: string; ownSentence?: true };
 /**
  * CALL_COMMAND_WORDS, longest first, as the words that end an utterance (Cyrillic read as Latin:
  * `зулу` is `zulu`, `прийом` is `pryyom`). `copy` and `copy that` are everyday words too, so any
  * text takes them only as their own sentence (`ownSentence`): the whole utterance, or after
  * punctuation. A capital letter alone is no boundary.
  */
-const COMMANDS: ReadonlyArray<readonly [SpokenCommand, readonly string[], { ownSentence: true } | undefined]> = (
+const COMMANDS: ReadonlyArray<readonly [CallCommand, readonly string[], { ownSentence: true } | undefined]> = (
   ['send', 'discard'] as const
 )
   .flatMap((command) =>
@@ -2061,12 +2070,12 @@ function endMatch(end: ReturnType<typeof commandEnd>): CommandMatch | null {
 
 /** A caption's command mark (CALL_CAPTION_COMMAND_ATTRIBUTE): the command, and the caption's words before it. */
 export interface CaptionMark {
-  command: SpokenCommand;
+  command: CallCommand;
   words: string;
 }
 
 /** The mark for a caption the worker takes `command` from: its words are the text before the command, or all of it when the text left it out. */
-export function captionMark(text: string, command: SpokenCommand): CaptionMark {
+export function captionMark(text: string, command: CallCommand): CaptionMark {
   const end = commandEnd(text);
   if (end?.command !== command) return { command, words: text.trim() };
   return {
@@ -2240,7 +2249,7 @@ interface OpenTurn {
    * The command the latest interim ended with: where the call's audio was when it came (`at`), and when
    * (`seenAt`); for a discard, in how many interims in a row, and whether their text settled (DISCARD_SETTLE_MS).
    */
-  candidate?: { command: SpokenCommand; at: number; seenAt: number; count: number; settled?: boolean };
+  candidate?: { command: CallCommand; at: number; seenAt: number; count: number; settled?: boolean };
   /**
    * The last command any interim of this activity ended with, and the words before it: a later
    * interim, and the final, can leave it out again.
@@ -2283,7 +2292,7 @@ export interface CallTurnsDeps {
   /** An auto turn for the agent closed: its place in the order turns go out in; `sending`: it is committed, and goes. */
   reserve(sending?: boolean): TurnSlot;
   /** Words that will never be sent, for the page's captions; a lone command names itself and its caption's segment. */
-  drop(reason: CallDroppedSpeech['dropped'], text: string, lone?: { command: SpokenCommand; segment: number }): void;
+  drop(reason: CallDroppedSpeech['dropped'], text: string, lone?: { command: CallCommand; segment: number }): void;
   /** A cue; `started` once its first frame went out. */
   cue(kind: CueKind, started?: () => void): void;
   /** The caller's caption for one turn; `mark` when its text ends in a command the worker takes. */
@@ -2961,7 +2970,7 @@ export class CallTurns {
     const facts = this.facts(turn, why, closed, heard, chosen.source, said);
     take.facts = facts;
     const ended = (outcome: TurnOutcome, reason: string) => this.deps.ended?.(facts, outcome, reason);
-    const caption = (text: string, command?: SpokenCommand) => {
+    const caption = (text: string, command?: CallCommand) => {
       if (text) this.deps.caption(turn.segment, text, true, command && captionMark(text, command));
     };
     const recording: Recording = { text: said, failed: heard.failed && !said, take };
@@ -3087,21 +3096,14 @@ export class CallTurns {
     const act = this.rewake(said, closed);
     // Words an earlier activity of the turn carried over lead it; ones still finalizing (`before`) too, once in.
     const body = joinText(turn.carry, matchCommand(act.text)?.rest ?? '');
-    const facts = this.facts(
-      turn,
-      'send',
-      closed,
-      { interim: said, finals: 0, failed: false, finalizeMs: 0 },
-      'none',
-      body,
-    );
+    const facts = this.facts(turn, 'send', closed, { ...silentHeard, interim: said }, 'none', body);
     const since = (at: number) => Math.round(at - facts.speechEndAt);
     Object.assign(facts, {
       ...(turn.candidate ? { candidateMs: since(turn.candidate.seenAt) } : {}),
       ...(this.quietAt !== undefined ? { quietMs: since(this.quietAt) } : {}),
       commitMs: closed.activityEndMs,
     });
-    const caption = (text: string, command: SpokenCommand) =>
+    const caption = (text: string, command: CallCommand) =>
       this.deps.caption(turn.segment, text, true, captionMark(text, command));
     if (act.scratched) {
       caption(act.scratched, 'discard');
@@ -3137,7 +3139,7 @@ export class CallTurns {
       })
       .catch((err: unknown): Heard => {
         this.deps.log.warn('voice-mode worker: a committed turn has no final; it goes with its words', { err });
-        return { interim: '', finals: 0, failed: true, finalizeMs: 0 };
+        return { ...silentHeard, failed: true };
       })
       .then((heard) => {
         const chosen = turnText(heard);
@@ -3217,7 +3219,7 @@ export class CallTurns {
   }
 
   /** A command with nothing to act on. */
-  private nope(text: string, command: SpokenCommand, segment: number): void {
+  private nope(text: string, command: CallCommand, segment: number): void {
     this.deps.drop('command', text, { command, segment });
     this.deps.countdown.clear();
     this.deps.cue('nope');
@@ -3588,8 +3590,8 @@ export interface RunCallDeps {
     settings: VoiceModeSettings,
     events: CallVoiceEvents,
   ): Promise<CallVoice>;
-  /** The call's transcription; Gemini Live by default. */
-  transcriber?(options: TranscriberOptions): Transcription;
+  /** The call's transcription. */
+  transcriber(options: TranscriberOptions): Transcription;
   /** Where turn recordings are written; NanoClaw's data directory by default. */
   recordingsRoot?: string;
   /** Tell the caller's page this worker cannot serve the host's protocol version. */
@@ -3660,9 +3662,6 @@ interface WorkerUserData {
 }
 
 const loadVad = (): Promise<VAD> => silero.VAD.load({ sampleRate: INPUT_SAMPLE_RATE });
-const setAttribute = async (ctx: CallJob, key: string, value: string): Promise<void> => {
-  await ctx.room.localParticipant?.setAttributes({ [key]: value });
-};
 
 type WorkerLog = Pick<Console, 'info' | 'warn' | 'error'>;
 
@@ -4066,7 +4065,7 @@ async function roomVoice(
   );
   // The cues' own track: never the speech track, so a cue is never the agent speaking. Without it
   // the call runs silent of cues.
-  const cueTrack = await publishCueTrack(room, log).catch((err: unknown) => {
+  const cueTrack = await publishCueTrack(local, log).catch((err: unknown) => {
     log.warn('voice-mode worker: could not publish the cue track', { err });
     return undefined;
   });
@@ -4385,7 +4384,9 @@ function defaultDeps(): RunCallDeps {
     })),
     createVoice: (ctx, meta, settings, events) => roomVoice(ctx as JobContext, meta, settings, events),
     transcriber: (options) => new GeminiLiveTranscriber(options),
-    markUpdating: (ctx) => setAttribute(ctx, CALL_UPDATING_ATTRIBUTE, '1'),
+    markUpdating: async (ctx) => {
+      await ctx.room.localParticipant?.setAttributes({ [CALL_UPDATING_ATTRIBUTE]: '1' });
+    },
     wakeWord: (events) => (wake ? new WakeWordSpotter({ ...wake, ...events }) : undefined),
     log: workerLog(agentsLog()),
   };
@@ -4446,6 +4447,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   if (!geminiKey) return abandon('VOICE_MODE_GEMINI_API_KEY is not set for the worker');
   const providerKeys = providerKeysFrom(deps.env);
   const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
+  const recordings = deps.recordingsRoot ?? recordingsRoot();
   const recordCall = envSwitch(deps.env.VOICE_MODE_CALL_RECORDING, ['1', 'true']);
   /** The whole call, when VOICE_MODE_CALL_RECORDING is on: opened once the caller's audio can flow. */
   let callRecording: CallRecording | undefined;
@@ -4689,7 +4691,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       transcript,
       ...outcome,
     };
-    void writeTurnRecording(deps.recordingsRoot ?? recordingsRoot(), record, audio).catch((err: unknown) =>
+    void writeTurnRecording(recordings, record, audio).catch((err: unknown) =>
       callLog.warn('voice-mode worker: could not save a turn recording', { err, turn: index }),
     );
   };
@@ -4764,7 +4766,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       });
       saveTurn(turn, take, text, { host });
     };
-  const transcriber = (deps.transcriber ?? ((options) => new GeminiLiveTranscriber(options)))({
+  const transcriber = deps.transcriber({
     apiKey: geminiKey,
     model: meta.sttModel,
     // The names (the host trimmed, deduplicated and capped them) and the commands, which the
@@ -4812,7 +4814,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   );
   if (recordCall) {
     callRecording = new CallRecording(
-      deps.recordingsRoot ?? recordingsRoot(),
+      recordings,
       { callId: meta.callId, lineId: meta.lineId, agent: meta.agentName },
       callLog,
     );
@@ -4833,13 +4835,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
           if (!label) return;
           const { reply } = label;
           if (pcm) {
-            void writeReplyRecording(
-              deps.recordingsRoot ?? recordingsRoot(),
-              { agent: meta.agentName, callId: meta.callId },
-              reply,
-              pcm,
-            ).catch((err: unknown) =>
-              callLog.warn('voice-mode worker: could not save a reply recording', { err, reply }),
+            void writeReplyRecording(recordings, { agent: meta.agentName, callId: meta.callId }, reply, pcm).catch(
+              (err: unknown) => callLog.warn('voice-mode worker: could not save a reply recording', { err, reply }),
             );
           }
           telemetry.reply({
