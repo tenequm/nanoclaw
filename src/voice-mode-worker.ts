@@ -892,7 +892,7 @@ export interface TurnRecord {
   endedAt: string;
   speechMs: number;
   truncated: boolean;
-  /** The model that transcribed the turn: the streaming one, the fallback, or both joined by '+'. */
+  /** The model that transcribed the turn. */
   sttModel: string;
   /** The text handed to the host; empty when the turn was dropped or lost, with `reason`. */
   transcript: string;
@@ -1259,10 +1259,9 @@ export interface CallVoiceEvents {
   onClosed(reason: string): void;
 }
 
-/** A finished turn's recording, if turns are recorded, and which transcription model heard it. */
+/** A finished turn's recording, if turns are recorded. */
 export interface TurnTake {
   audio?: TurnAudio;
-  sttModel: string;
   /** How its activity went, for its `voice-mode.turn` event. */
   facts?: TurnFacts;
 }
@@ -2395,7 +2394,6 @@ export interface CallTurnsOptions {
   limits?: AwakeLimits;
   /** Record turns (TurnTake.audio). */
   record?: boolean;
-  sttModel: string;
   now?: () => number;
   /** VOICE_MODE_TRANSCRIPT_DEBUG: log what the turns make of the transcription (`voice-mode.transcript-debug`). */
   debug?: boolean;
@@ -2998,7 +2996,7 @@ export class CallTurns {
       endWall,
       activityEndMs: Math.round(msOf(endedAt - turn.lastSpeechEnd)),
       mode: turn.kind === 'review' ? 'manual' : this.wake ? 'wake' : 'handsfree',
-      take: { audio: this.capture?.take(turn.speechMs, Math.max(keep, 0)), sttModel: this.options.sttModel },
+      take: { audio: this.capture?.take(turn.speechMs, Math.max(keep, 0)) },
       wake: this.wake,
       names: this.names,
     };
@@ -3315,26 +3313,11 @@ export class CallTurns {
 /** The text of an activity that heard nothing since it went on, with no final to wait for. */
 const silentHeard: Heard = { interim: '', finals: 0, failed: false, finalizeMs: 0 };
 
-/** What review mode needs of the call's turns (CallTurns) and the page. */
-export interface ReviewVoice {
-  /** An auto turn for the agent is open: a switch to review makes it a draft. */
-  readonly turnOpen: boolean;
-  /** Review on or off; going on, an open auto turn comes back as its recording. */
-  setReviewing(on: boolean): Promise<Recording | null>;
-  /** Set the transcription up for a recording; resolves whether it can take one. */
-  prepare(): Promise<boolean>;
-  /** Open a recording: from here the caller's audio is transcribed. */
-  record(): void;
-  /** Close the recording; resolves with its frozen text. */
-  stopRecording(): Promise<Recording | null>;
-  /** Drop the open recording. */
-  dropRecording(): void;
+export interface ReviewDeps {
+  /** The call's turns: a recording is one of their transcription activities. */
+  voice: Pick<CallTurns, 'turnOpen' | 'setReviewing' | 'prepare' | 'record' | 'stopRecording' | 'dropRecording'>;
   /** One message on the `nanoclaw.voice-mode.review` topic. */
   publishReview(state: CallReviewState): void;
-}
-
-export interface ReviewDeps {
-  voice: ReviewVoice;
   /** Hand a sent draft's text to the host the way a finished auto turn goes; returns its turn number. */
   post(text: string, draft: number, take: TurnTake): number;
   /** The newest turn number handed to the host. */
@@ -3348,8 +3331,6 @@ export interface ReviewDeps {
   /** Auto mode's wake state, sent with every review state. */
   wakeState?(): CallWakeState;
   cue?(kind: CueKind): void;
-  /** The model a draft's take names when it has none. */
-  sttModel: string;
   /** A draft that came to nothing: discarded, or nothing heard. */
   ended?(draft: number, take: TurnTake | undefined, outcome: TurnOutcome, reason: string): void;
   log: Pick<Console, 'info' | 'warn'>;
@@ -3484,7 +3465,7 @@ export class ReviewControl {
       case 'send': {
         if (!draft || draft.id !== req.draft) return reply({ error: 'stale' });
         if (draft.state !== 'ready' || draft.tooLong) return reply({ error: 'unsendable' });
-        const take = this.take ?? { sttModel: this.deps.sttModel };
+        const take = this.take ?? {};
         this.draft = null;
         this.take = undefined;
         const turn = this.deps.post(draft.text, draft.id, take);
@@ -3579,7 +3560,7 @@ export class ReviewControl {
 
   private publish(): void {
     if (this.closed) return;
-    this.deps.voice.publishReview({
+    this.deps.publishReview({
       seq: ++this.seq,
       mode: this.mode,
       draft: this.draft,
@@ -4784,7 +4765,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const publish = (status: CallTurnStatus) => callVoice?.publishTurn(status);
   const saveTurn = (
     index: number,
-    { audio, sttModel }: TurnTake,
+    { audio }: TurnTake,
     transcript: string,
     outcome: { reason?: string; host?: SendResult },
   ) => {
@@ -4798,7 +4779,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       endedAt: new Date(audio.endedAt).toISOString(),
       speechMs: audio.speechMs,
       truncated: audio.truncated,
-      sttModel,
+      sttModel: meta.sttModel,
       transcript,
       ...outcome,
     };
@@ -4920,7 +4901,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       names: [meta.agentName, ...(meta.wakeNames ?? [])],
       limits: awakeLimits(deps.env),
       record,
-      sttModel: meta.sttModel,
       ...(transcriptDebug ? { debug: true } : {}),
     },
   );
@@ -5057,17 +5037,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   // A call that ended while its audio was set up gets no review controls.
   if (reviewSession && !ending) {
     const control = new ReviewControl({
-      voice: {
-        get turnOpen() {
-          return callTurns.turnOpen;
-        },
-        setReviewing: (on) => callTurns.setReviewing(on),
-        prepare: () => callTurns.prepare(),
-        record: () => callTurns.record(),
-        stopRecording: () => callTurns.stopRecording(),
-        dropRecording: () => callTurns.dropRecording(),
-        publishReview: (state) => reviewSession.publishReview(state),
-      },
+      voice: callTurns,
+      publishReview: (state) => reviewSession.publishReview(state),
       post: (text, draft, take) => {
         const slot = reserveTurn(false, draft);
         slot.send(text, take, false);
@@ -5087,7 +5058,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       },
       wakeState: () => callTurns.state,
       cue,
-      sttModel: meta.sttModel,
       ended: (draft, take, outcome, reason) => telemetry.turn({ facts: take?.facts, outcome, reason, draft }),
       log: callLog,
     });

@@ -1691,13 +1691,13 @@ function reviewControl(overrides: Partial<ReviewDeps> = {}) {
         }),
     ),
     dropRecording: vi.fn(() => void (voice.recording = false)),
-    publishReview: vi.fn((state: CallReviewState) => void states.push(state)),
   };
   const posted: Array<{ text: string; draft: number }> = [];
   const capture: boolean[] = [];
   const cues: CueKind[] = [];
   const control = new ReviewControl({
     voice,
+    publishReview: vi.fn((state: CallReviewState) => void states.push(state)),
     post: vi.fn((text: string, draft: number) => {
       posted.push({ text, draft });
       return posted.length;
@@ -1706,13 +1706,11 @@ function reviewControl(overrides: Partial<ReviewDeps> = {}) {
     setCaptureOpen: (open) => void capture.push(open),
     resetCaller: vi.fn(),
     cue: (kind) => void cues.push(kind),
-    sttModel: 'model',
     log: silentLog,
     ...overrides,
   });
   let gen = 0;
   const op = (name: ReviewOp, fields: Partial<ReviewRequest> = {}) => control.handle(name, { gen: ++gen, ...fields });
-  const take = { sttModel: 'model' };
   return {
     control,
     voice,
@@ -1724,7 +1722,7 @@ function reviewControl(overrides: Partial<ReviewDeps> = {}) {
     draft: () => states.at(-1)?.draft,
     /** The recording's text arrives. */
     stop: async (text: string, failed = false) => {
-      stop({ text, failed, take });
+      stop({ text, failed, take: {} });
       await flush();
     },
   };
@@ -1807,7 +1805,7 @@ describe('review mode', () => {
     expect(await r.op('mode', { mode: 'review' })).toMatchObject({ ok: true });
     expect(r.draft()).toMatchObject({ state: 'finishing', reason: 'switch' });
     expect(await r.op('mode', { mode: 'auto' })).toMatchObject({ ok: false, error: 'finishing' });
-    give({ text: 'Book a table', failed: false, take: { sttModel: 'model' } });
+    give({ text: 'Book a table', failed: false, take: {} });
     await flush();
     expect(r.draft()).toMatchObject({ state: 'ready', text: 'Book a table', reason: 'switch' });
     expect(r.posted).toEqual([]);
@@ -2617,7 +2615,6 @@ function turnsHarness(
       names: ['Andy'],
       limits: o.limits,
       record: o.record,
-      sttModel: 'model',
       ...(o.debug ? { debug: true } : {}),
     },
   );
@@ -3330,22 +3327,12 @@ function reviewOverTurns(h: ReturnType<typeof turnsHarness>) {
   const states: CallReviewState[] = [];
   const posted: string[] = [];
   const control = new ReviewControl({
-    voice: {
-      get turnOpen() {
-        return h.turns.turnOpen;
-      },
-      setReviewing: (on) => h.turns.setReviewing(on),
-      prepare: () => h.turns.prepare(),
-      record: () => h.turns.record(),
-      stopRecording: () => h.turns.stopRecording(),
-      dropRecording: () => h.turns.dropRecording(),
-      publishReview: (state) => void states.push(state),
-    },
+    voice: h.turns,
+    publishReview: (state) => void states.push(state),
     post: (text) => posted.push(text),
     lastPosted: () => posted.length,
     setCaptureOpen: () => undefined,
     resetCaller: () => undefined,
-    sttModel: 'model',
     log: silentLog,
   });
   let gen = 0;
