@@ -65,8 +65,6 @@ import {
 import {
   baseLanguage,
   DEFAULT_VOICE_LANGUAGES,
-  voiceModeEnv,
-  voiceModeEnvKeys,
   wakePhrase,
   DEFAULT_LIVEKIT_AGENT_NAME,
   HOST_SILENCE_MS,
@@ -3811,14 +3809,10 @@ export function wakeWordSettings(
   };
 }
 
-/**
- * Settings from the working directory's .env (`root` in tests); WEBHOOK_PORT from the environment
- * wins, as on the host. Each read warns about every old setting it finds; the callers read once per
- * process (see callEnv).
- */
+/** Settings from the working directory's .env (`root` in tests); WEBHOOK_PORT from the environment wins, as on the host. */
 export function workerEnv(keys: string[], root?: string): Record<string, string | undefined> {
   return {
-    ...voiceModeEnv(readEnvFile(voiceModeEnvKeys([...keys, 'WEBHOOK_PORT']), root), (message) => console.warn(message)),
+    ...readEnvFile([...keys, 'WEBHOOK_PORT'], root),
     ...(process.env.WEBHOOK_PORT ? { WEBHOOK_PORT: process.env.WEBHOOK_PORT } : {}),
   };
 }

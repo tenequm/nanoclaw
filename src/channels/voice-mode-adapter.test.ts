@@ -5,11 +5,8 @@
  * central DB, answered as the contract fixtures say. The call routes are
  * exercised over HTTP in voice-mode-livekit.test.ts.
  */
-import { existsSync, readFileSync } from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -127,77 +124,11 @@ describe('voice routes and the reverse-proxy gate', () => {
   });
 });
 
-describe('voice-mode environment compatibility', () => {
-  it('reads old settings, prefers explicit new keys and never prints their values', async () => {
-    const { voiceModeEnv, voiceModeEnvKeys, parseVoiceLanguages } = await import('./voice-mode-protocol.js');
-    const warnings: string[] = [];
-    const oldValue = 'private-' + 'value';
-    expect(voiceModeEnvKeys(['VOICE_MODE_PUBLIC_URL', 'LIVEKIT_URL'])).toEqual([
-      'VOICE_MODE_PUBLIC_URL',
-      'VOICE_PUBLIC_URL',
-      'LIVEKIT_URL',
-    ]);
-    expect(
-      voiceModeEnv({ VOICE_PUBLIC_URL: oldValue, VOICE_MODE_PUBLIC_URL: 'new', VOICE_WAKE_MODEL: 'off' }, (s) =>
-        warnings.push(s),
-      ),
-    ).toMatchObject({ VOICE_MODE_PUBLIC_URL: 'new', VOICE_MODE_WAKE_MODEL: 'off' });
-    expect(warnings).toEqual([
-      'voice-mode: VOICE_PUBLIC_URL is ignored because VOICE_MODE_PUBLIC_URL is set; remove it',
-      'voice-mode: VOICE_WAKE_MODEL is deprecated; use VOICE_MODE_WAKE_MODEL',
-    ]);
-    expect(warnings.join(' ')).not.toContain(oldValue);
+describe('voice-mode settings', () => {
+  it('reads VOICE_MODE_LANGUAGES, dropping invalid and repeated codes', async () => {
+    const { parseVoiceLanguages } = await import('./voice-mode-protocol.js');
     expect(parseVoiceLanguages(undefined)).toEqual(['uk-UA', 'en-US']);
     expect(parseVoiceLanguages('de-DE,en-US,de-de,invalid!')).toEqual(['de-DE', 'en-US']);
-  });
-
-  it('aliases only the old keys main read: none for settings new to voice-mode', async () => {
-    const { voiceModeEnv, voiceModeEnvKeys } = await import('./voice-mode-protocol.js');
-    const fresh = ['VOICE_MODE_PORT', 'VOICE_MODE_PAGE_HOST', 'VOICE_MODE_LANGUAGES'];
-    expect(voiceModeEnvKeys(fresh)).toEqual(fresh);
-    const warnings: string[] = [];
-    const env = voiceModeEnv({ VOICE_PORT: '9', VOICE_PAGE_HOST: '0.0.0.0', VOICE_LANGUAGES: 'de-DE' }, (s) =>
-      warnings.push(s),
-    );
-    for (const key of fresh) expect(env[key]).toBeUndefined();
-    expect(warnings).toEqual([]);
-  });
-
-  it("aliases exactly the upgrade runbook's rename table", async () => {
-    const { LEGACY_VOICE_KEYS } = await import('./voice-mode-protocol.js');
-    const runbook = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      '../../docs/2610-07-voice-mode-upgrade.md',
-    );
-    expect(LEGACY_VOICE_KEYS).toHaveLength(27);
-    if (!existsSync(runbook)) return; // An installed payload does not carry the fork's docs.
-    const table = [...readFileSync(runbook, 'utf8').matchAll(/^\| `(VOICE_[A-Z_]+)` \| `VOICE_MODE_[A-Z_]+` \|$/gm)];
-    expect(table.map((m) => m[1])).toEqual([...LEGACY_VOICE_KEYS]);
-  });
-});
-
-describe('voice-mode provider key aliases', () => {
-  it('reads GEMINI_API_KEY as VOICE_MODE_GEMINI_API_KEY, prefers the new name and never prints values', async () => {
-    const { voiceModeEnv, voiceModeEnvKeys, LEGACY_VOICE_KEYS } = await import('./voice-mode-protocol.js');
-    const oldValue = 'private-' + 'gemini';
-    expect(voiceModeEnvKeys(['VOICE_MODE_GEMINI_API_KEY', 'VOICE_MODE_ELEVENLABS_API_KEY'])).toEqual([
-      'VOICE_MODE_GEMINI_API_KEY',
-      'GEMINI_API_KEY',
-      'VOICE_MODE_ELEVENLABS_API_KEY',
-    ]);
-    const warnings: string[] = [];
-    expect(voiceModeEnv({ GEMINI_API_KEY: oldValue }, (s) => warnings.push(s))).toMatchObject({
-      VOICE_MODE_GEMINI_API_KEY: oldValue,
-    });
-    expect(
-      voiceModeEnv({ GEMINI_API_KEY: oldValue, VOICE_MODE_GEMINI_API_KEY: 'new' }, (s) => warnings.push(s)),
-    ).toMatchObject({ VOICE_MODE_GEMINI_API_KEY: 'new' });
-    expect(warnings).toEqual([
-      'voice-mode: GEMINI_API_KEY is deprecated; use VOICE_MODE_GEMINI_API_KEY',
-      'voice-mode: GEMINI_API_KEY is ignored because VOICE_MODE_GEMINI_API_KEY is set; remove it',
-    ]);
-    expect(warnings.join(' ')).not.toContain(oldValue);
-    expect(LEGACY_VOICE_KEYS).not.toContain('GEMINI_API_KEY');
   });
 });
 

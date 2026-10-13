@@ -43,8 +43,6 @@ import {
   DEFAULT_VOICE_MIRROR,
   LIVEKIT_PROTOCOL_VERSION,
   wakePhrase,
-  voiceModeEnv,
-  voiceModeEnvKeys,
   parseVoiceLanguages,
 } from './voice-mode-protocol.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
@@ -824,52 +822,33 @@ function parseSilenceMs(raw: string | undefined): number | undefined {
  * default provider and the transcription); the host checks it is there and offers the voices it lists.
  */
 const LIVEKIT_REQUIRED = ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'VOICE_MODE_GEMINI_API_KEY'] as const;
-/** Settings nothing reads any more: lines come from /voice, and each line keeps its own voice. */
-const RETIRED_KEYS = [
-  'VOICE_MODE_LINK_TOKEN',
-  'VOICE_MODE_TTS_MODEL',
-  'VOICE_MODE_TTS_FALLBACK_MODEL',
-  'VOICE_MODE_TTS_VOICE',
-] as const;
 
 registerChannelAdapter(VOICE_MODE_CHANNEL, {
   factory: () => {
-    const env = voiceModeEnv(
-      readEnvFile(
-        voiceModeEnvKeys([
-          'VOICE_MODE_PUBLIC_URL',
-          'VOICE_MODE_PORT',
-          'VOICE_MODE_PAGE_HOST',
-          'VOICE_MODE_LANGUAGES',
-          'VOICE_MODE_UI',
-          'VOICE_MODE_MAX_CALL_SECONDS',
-          'VOICE_MODE_MAX_CALLS_PER_HOUR',
-          'VOICE_MODE_MAX_MINUTES_PER_DAY',
-          'VOICE_MODE_ALLOW_NON_LOOPBACK',
-          'VOICE_MODE_TRUSTED_PROXY_CIDRS',
-          'VOICE_MODE_ALLOWED_CLIENT_CIDRS',
-          'VOICE_MODE_VOCABULARY',
-          ...LIVEKIT_REQUIRED,
-          'VOICE_MODE_ELEVENLABS_API_KEY',
-          'LIVEKIT_WORKER_URL',
-          'LIVEKIT_AGENT_NAME',
-          'VOICE_MODE_STT_MODEL',
-          'VOICE_MODE_STT_FALLBACK_MODEL',
-          'VOICE_MODE_SILENCE_MS',
-          'VOICE_MODE_MIRROR',
-          'VOICE_MODE_WAKE_MODEL',
-          'VOICE_MODE_WAKE_PHRASE',
-          ...RETIRED_KEYS,
-        ]),
-      ),
-      (message) => log.warn(message),
-    );
-    const retired = RETIRED_KEYS.filter((key) => env[key] !== undefined);
-    if (retired.length > 0) {
-      log.warn('voice-mode: retired settings are ignored; /voice makes links and each line keeps its voice', {
-        keys: retired,
-      });
-    }
+    const env = readEnvFile([
+      'VOICE_MODE_PUBLIC_URL',
+      'VOICE_MODE_PORT',
+      'VOICE_MODE_PAGE_HOST',
+      'VOICE_MODE_LANGUAGES',
+      'VOICE_MODE_UI',
+      'VOICE_MODE_MAX_CALL_SECONDS',
+      'VOICE_MODE_MAX_CALLS_PER_HOUR',
+      'VOICE_MODE_MAX_MINUTES_PER_DAY',
+      'VOICE_MODE_ALLOW_NON_LOOPBACK',
+      'VOICE_MODE_TRUSTED_PROXY_CIDRS',
+      'VOICE_MODE_ALLOWED_CLIENT_CIDRS',
+      'VOICE_MODE_VOCABULARY',
+      ...LIVEKIT_REQUIRED,
+      'VOICE_MODE_ELEVENLABS_API_KEY',
+      'LIVEKIT_WORKER_URL',
+      'LIVEKIT_AGENT_NAME',
+      'VOICE_MODE_STT_MODEL',
+      'VOICE_MODE_STT_FALLBACK_MODEL',
+      'VOICE_MODE_SILENCE_MS',
+      'VOICE_MODE_MIRROR',
+      'VOICE_MODE_WAKE_MODEL',
+      'VOICE_MODE_WAKE_PHRASE',
+    ]);
     const missing = LIVEKIT_REQUIRED.filter((key) => !env[key]);
     if (missing.length > 0) {
       log.warn('voice-mode: LiveKit is not configured; the channel stays offline', { missing });

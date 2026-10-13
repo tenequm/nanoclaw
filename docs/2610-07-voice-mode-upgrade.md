@@ -41,9 +41,8 @@ that hands their replies, typing and call links to the live voice-mode engine.
 
 ### Configuration rename
 
-Every old key in the table below is accepted as its `VOICE_MODE_<suffix>`
-name, with a warning naming keys only; no other `VOICE_*` key is. An explicit
-new value wins when both are present, and the old key is reported as ignored.
+A current build reads only the `VOICE_MODE_<suffix>` names: rename every old
+key in the table below before upgrading, or its setting is silently ignored.
 The existing `.env` parser ignores empty values; use documented `off`/`0`
 switches rather than an empty line to disable a setting. Host and worker read
 `.env` when they start (the worker in each job process): restart both after
@@ -84,15 +83,15 @@ keys are voice-mode's own:
 
 | Provider key read before | Voice-mode key | |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | `VOICE_MODE_GEMINI_API_KEY` | Required; the old name is still read, with a warning. |
+| `GEMINI_API_KEY` | `VOICE_MODE_GEMINI_API_KEY` | Required; the old name is not read. |
 | none | `VOICE_MODE_ELEVENLABS_API_KEY` | Optional; offers ElevenLabs voices to the lines. |
 
 `VOICE_MODE_TTS_MODEL`, `VOICE_MODE_TTS_FALLBACK_MODEL`,
 `VOICE_MODE_TTS_VOICE` and `VOICE_MODE_LINK_TOKEN` (and their `VOICE_*` names
-above) are no longer read, and the host warns when one is still set: each line
-keeps its own voice, and `/voice` makes the links. Before upgrading an install that set one,
-save it on every line with `PATCH /voice/tts` (see the skill's "Voice per
-line"), or its lines speak with the default `alnilam`.
+above) are no longer read: each line keeps its own voice, and `/voice` makes
+the links. Before upgrading an install that set one, save it on every line
+with `PATCH /voice/tts` (see the skill's "Voice per line"), or its lines
+speak with the default `alnilam`.
 The build adds a separate page listener on `127.0.0.1:3100` (`VOICE_MODE_PORT`,
 `VOICE_MODE_PAGE_HOST`); main's existing `/voice` and `/webhook/voice/livekit`
 fronts still work on `WEBHOOK_PORT`. Do not move a working front during the

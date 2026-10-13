@@ -192,8 +192,8 @@ VOICE_MODE_GEMINI_API_KEY={{gemini_api_key}}
 VOICE_MODE_ELEVENLABS_API_KEY={{elevenlabs_api_key}}
 ```
 
-An existing `GEMINI_API_KEY` is still read as `VOICE_MODE_GEMINI_API_KEY`, with
-a warning; rename it when convenient.
+Only `VOICE_MODE_*` names are read: rename an existing `GEMINI_API_KEY` or
+`VOICE_*` setting to its `VOICE_MODE_*` name.
 
 The page listens on `127.0.0.1:3100` (`VOICE_MODE_PORT`, and
 `VOICE_MODE_PAGE_HOST` for another bind address), and also under `/voice` on
