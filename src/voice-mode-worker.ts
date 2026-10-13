@@ -4541,7 +4541,11 @@ function defaultDeps(): RunCallDeps {
   const wake = wakeWordSettings(env);
   return {
     env,
-    voiceNames: (callVoiceNames ??= createVoiceCatalog({ lazy: true, log: workerLog(agentsLog()) })),
+    voiceNames: (callVoiceNames ??= createVoiceCatalog({
+      keys: providerKeysFrom(env),
+      lazy: true,
+      log: workerLog(agentsLog()),
+    })),
     createVoice: (ctx, meta, settings, events) => roomVoice(ctx as JobContext, meta, settings, events),
     transcriber: (options) => new GeminiLiveTranscriber(options),
     markUpdating: (ctx) => setAttribute(ctx, CALL_UPDATING_ATTRIBUTE, '1'),
@@ -5000,9 +5004,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         ...(record ? { recordReplies: true } : {}),
         ...(ttsDeess(deps.env.VOICE_MODE_TTS_DEESS) ? { deess: true } : {}),
         ...(ttsNotch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
-        ...(deps.voiceNames
-          ? { voiceDetails: (choice) => deps.voiceNames!.details(choice, providerKeys[choice.provider]) }
-          : {}),
+        ...(deps.voiceNames ? { voiceDetails: (choice) => deps.voiceNames!.details(choice) } : {}),
         spoke: (line, pcm) => {
           const label = speakingLine;
           const reply = label?.reply ?? ++replies;

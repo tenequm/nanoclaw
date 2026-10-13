@@ -245,7 +245,7 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     adapter = createVoiceModeAdapter({
       publicUrl: `http://127.0.0.1:${port}`,
       providerKeys: { gemini: GEMINI_KEY },
-      catalog: createVoiceCatalog({ fetch: fakeFetch }),
+      catalog: createVoiceCatalog({ keys: { gemini: GEMINI_KEY }, fetch: fakeFetch }),
       livekit: { url: 'wss://lk.example.invalid', apiKey: 'k', apiSecret: 's'.repeat(48), api: {} as LiveKitServerApi },
     });
     await adapter.setup({ onInbound: () => {}, onInboundEvent: () => {}, onMetadata: () => {}, onAction: () => {} });
@@ -262,10 +262,11 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
     await adapter.teardown();
     await stopWebhookServer();
     const port = Number(new URL(base).port);
+    const providerKeys = overrides.providerKeys ?? { gemini: GEMINI_KEY };
     adapter = createVoiceModeAdapter({
       publicUrl: `http://127.0.0.1:${port}`,
-      providerKeys: { gemini: GEMINI_KEY },
-      catalog: createVoiceCatalog({ fetch: fakeFetch }),
+      providerKeys,
+      catalog: createVoiceCatalog({ keys: providerKeys, fetch: fakeFetch }),
       livekit: { url: 'wss://lk.example.invalid', apiKey: 'k', apiSecret: 's'.repeat(48), api: {} as LiveKitServerApi },
       ...overrides,
     });
@@ -274,7 +275,7 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
   };
   /** A catalog whose lookups wait for `release`; `started` once one is waiting. */
   const heldLookups = () => {
-    const real = createVoiceCatalog({ fetch: fakeFetch });
+    const real = createVoiceCatalog({ keys: { gemini: GEMINI_KEY }, fetch: fakeFetch });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     let started!: () => void;
@@ -340,7 +341,9 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
 
   it("matches ids exactly as the provider spells them, and loads Gemini's listing once more before refusing", async () => {
     let clock = 0;
-    await restart({ catalog: createVoiceCatalog({ fetch: fakeFetch, now: () => clock }) });
+    await restart({
+      catalog: createVoiceCatalog({ keys: { gemini: GEMINI_KEY }, fetch: fakeFetch, now: () => clock }),
+    });
     clock = 10_000;
     expect(await json(await tts('PATCH', '{"provider":"gemini","voice":"Achernar"}'))).toEqual({
       status: 400,

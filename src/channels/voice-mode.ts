@@ -218,7 +218,7 @@ export interface VoiceModeConfig {
   now?: () => number;
   /** Speech provider API keys (VOICE_MODE_<PROVIDER>_API_KEY): a provider without one is offered as unavailable. */
   providerKeys?: ProviderKeys;
-  /** The voice catalog `GET /voice/voices` pages through. Test seam; defaults to the providers' live listings. */
+  /** The voice catalog `GET /voice/voices` pages through, on providerKeys. Test seam; defaults to the providers' live listings. */
   catalog?: VoiceCatalog;
   /** How long a save waits on its voice lookup before it saves anyway. Test seam. */
   saveLookupBudgetMs?: number;
@@ -411,14 +411,12 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     reply(res, status, JSON.stringify(body), JSON_HEADERS);
 
   const providerKeys = config.providerKeys ?? {};
-  const catalog = config.catalog ?? createVoiceCatalog();
+  const catalog = config.catalog ?? createVoiceCatalog({ keys: providerKeys });
 
-  const describe = (choice: TtsChoice) => catalog.details(choice, providerKeys[choice.provider]);
+  const describe = (choice: TtsChoice) => catalog.details(choice);
   /** What a call speaks a choice with: the backup voice for one its provider certainly does not have, never on a doubt. */
   const speakable = (choice: TtsChoice): TtsChoice =>
-    catalog.known(choice.provider, providerKeys[choice.provider], choice.voice) === 'unavailable'
-      ? TTS_DEFAULT_CHOICE
-      : choice;
+    catalog.known(choice.provider, choice.voice) === 'unavailable' ? TTS_DEFAULT_CHOICE : choice;
   /** The calls' line: its choice as speakable takes it, so the worker speaks what `/voice/tts` shows as effective. */
   const resolveCallLine = async (platformId: string, options?: ResolveLineOptions) => {
     const line = await resolveLine(platformId, options);
@@ -484,11 +482,10 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       const read = readTtsChoice(body);
       if ('invalid' in read) return replyJson(res, 400, { error: 'invalid', field: read.invalid });
       const { provider, voice } = read.choice;
-      const apiKey = providerKeys[provider];
-      if (!apiKey) return replyJson(res, 503, { error: 'provider_unavailable', provider });
+      if (!providerKeys[provider]) return replyJson(res, 503, { error: 'provider_unavailable', provider });
       // Only a voice the provider says it does not have is refused; one it could not be asked about in time saves.
       const found = await settleWithin(
-        catalog.lookup(provider, apiKey, voice, { confirm: true }),
+        catalog.lookup(provider, voice, { confirm: true }),
         config.saveLookupBudgetMs ?? SAVE_LOOKUP_BUDGET_MS,
         { status: 'lookup_failed' } as const,
       );
@@ -534,9 +531,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     ) {
       return replyJson(res, 400, { error: 'bad_request' });
     }
-    const apiKey = providerKeys[provider];
-    if (!apiKey) return replyJson(res, 503, { error: 'provider_unavailable', provider });
-    const result = await catalog.page(provider, apiKey, { q, language, gender, cursor, limit });
+    if (!providerKeys[provider]) return replyJson(res, 503, { error: 'provider_unavailable', provider });
+    const result = await catalog.page(provider, { q, language, gender, cursor, limit });
     if ('error' in result) return replyJson(res, result.error === 'upstream' ? 502 : 400, { error: result.error });
     return replyJson(res, 200, result.page);
   };
@@ -626,7 +622,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         return 0;
       });
       if (filled > 0) log.info('voice-mode: filled in the lines missing a voice', { rows: filled });
-      catalog.warm(providerKeys);
+      catalog.warm();
       registerWebhookHandler(VOICE_MODE_CHANNEL, handleHttp);
       registerRootHandler('voice', handleHttp);
       if (config.pagePort !== undefined) {
