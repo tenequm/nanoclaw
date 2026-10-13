@@ -225,23 +225,13 @@ async function insertLine(
     now,
     now,
   );
-  if (!line) return undefined;
-  if (key && line.line_id !== lineId) {
-    // Another run created the line between the read and the insert: seal for its id instead.
-    await getDb().run(
-      'UPDATE voice_mode_lines SET link_sealed = ? WHERE line_id = ? AND token_hash = ?',
-      sealText(token, linkContext(line.line_id), key),
-      line.line_id,
-      line.token_hash,
-    );
-    return { line: (await getVoiceModeLine(line.line_id)) ?? line, token };
-  }
-  return { line, token };
+  return line ? { line, token } : undefined;
 }
 
 /**
- * Mint a new call link for the agent's line (creating the line on first use), make `ownerUserId` its
- * caller and the given chat its call chat. The previous link stops working; the saved speech choice
+ * Mint a new call link for the agent's line (creating the line on first use, with `ownerUserId` as its
+ * caller) and make the given chat its call chat. Only the line's own caller re-mints: another user's
+ * line is never taken over, and that throws. The previous link stops working; the saved speech choice
  * stays. The token is sealed when a key is given (`/voice` always gives one).
  */
 export async function mintVoiceModeLine(
@@ -254,7 +244,8 @@ export async function mintVoiceModeLine(
     `DO UPDATE SET
        token_hash = excluded.token_hash, link_sealed = excluded.link_sealed, owner_user_id = excluded.owner_user_id,
        messaging_group_id = excluded.messaging_group_id, thread_id = excluded.thread_id,
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at
+     WHERE voice_mode_lines.owner_user_id = excluded.owner_user_id`,
   );
   if (!minted) throw new Error('voice-mode: the line was not stored');
   return minted;

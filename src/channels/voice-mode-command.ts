@@ -235,6 +235,8 @@ export type PrivateReply = (text: string) => Promise<'sent' | 'unavailable' | 'p
 const noDirectChat = (cmd: string) =>
   `I cannot message you privately here: start a direct chat with me, then run ${cmd} again.`;
 const EXPOSED = 'The link I sent was visible to the whole chat, so it was replaced: calls made with it end.';
+const notReplaced = (cmd: string) =>
+  `The link I sent was visible to the whole chat and could not be replaced: send ${cmd} new to replace it.`;
 
 /** An error's kind only: delivery errors can carry the request, and with it a call link. */
 const errorKind = (err: unknown): string =>
@@ -279,6 +281,11 @@ export async function handleVoiceCommand(
   // Straight to the chat's adapter, never through a session: the agent must not hold the call link.
   const say = (text: string) => adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
   try {
+    // Without a private reply a group's links go to the direct chat: check it first, so /voice new ends no call for nothing.
+    if (command.renew && mg.is_group !== 0 && !privateReply && !(await directChat(userId, instance))) {
+      await say(noDirectChat(cmd));
+      return true;
+    }
     let outcome = await runVoiceCommand(mg, chatThread, userId, { callUrl, renew: command.renew });
     let text = voiceCommandReply(outcome, cmd);
     if (text === null) {
@@ -289,23 +296,39 @@ export async function handleVoiceCommand(
       await say(text);
       return true;
     }
-    let exposed = false;
+    /** What the group hears about a link that went public, once its replacement was tried. */
+    let exposedNote: string | null = null;
     if (privateReply) {
       const sent = await privateReply(text);
       if (sent === 'sent') return true;
-      if (sent === 'public') {
-        const shown = outcome.kind === 'done' ? outcome.results.filter((r) => r.ok).map((r) => r.agentGroupId) : [];
-        exposed = shown.length > 0;
-        // A reply without a link held nothing secret: it is answered in the chat below, as when unavailable.
-        if (exposed) {
-          log.warn('/voice private reply was posted publicly; replacing its links', { channelType: event.channelType });
+      const shown = outcome.kind === 'done' ? outcome.results.filter((r) => r.ok).map((r) => r.agentGroupId) : [];
+      // A reply without a link held nothing secret: it is answered in the chat below, as when unavailable.
+      if (sent === 'public' && shown.length > 0) {
+        log.warn('/voice private reply was posted publicly; replacing its links', { channelType: event.channelType });
+        const stale = (agentGroupIds: string[], err?: unknown) =>
+          log.error('/voice links posted publicly were not replaced', {
+            channelType: event.channelType,
+            agentGroupIds,
+            ...(err === undefined ? {} : { err: errorKind(err) }),
+          });
+        try {
           outcome = await runVoiceCommand(mg, chatThread, userId, {
             callUrl,
             renew: true,
             agentGroupIds: new Set(shown),
           });
-          text = [voiceCommandReply(outcome, cmd), EXPOSED].join('\n\n');
+        } catch (err) {
+          stale(shown, err);
+          await say(notReplaced(cmd));
+          return true;
         }
+        const replaced = new Set(
+          outcome.kind === 'done' ? outcome.results.filter((r) => r.ok && r.replaced).map((r) => r.agentGroupId) : [],
+        );
+        const left = shown.filter((id) => !replaced.has(id));
+        if (left.length > 0) stale(left);
+        exposedNote = left.length > 0 ? notReplaced(cmd) : EXPOSED;
+        text = [voiceCommandReply(outcome, cmd), exposedNote].filter((t) => t !== null).join('\n\n');
       }
     }
     if (voiceLinkLines(outcome).length === 0) {
@@ -317,18 +340,30 @@ export async function handleVoiceCommand(
       await say('Your call link is in our direct chat.');
       return true;
     }
-    await say(exposed ? `${EXPOSED} ${noDirectChat(cmd)}` : noDirectChat(cmd));
+    const replaced = outcome.kind === 'done' && outcome.results.some((r) => r.ok && r.replaced);
+    await say(
+      [exposedNote ?? (replaced ? 'Any earlier link no longer works.' : null), noDirectChat(cmd)]
+        .filter((t) => t !== null)
+        .join(' '),
+    );
   } catch (err) {
     log.warn('/voice reply could not be delivered', { channelType: event.channelType, err: errorKind(err) });
   }
   return true;
 }
 
-/** Deliver to the user's direct chat; false when there is none or the send failed. */
-async function sendDirect(userId: string, instance: string, text: string): Promise<boolean> {
+/** The user's direct chat and its adapter, or null when there is none. */
+async function directChat(userId: string, instance: string) {
   const dm = await ensureUserDm(userId, { privacySafeLogs: true, instance });
   const dmAdapter = dm ? getChannelAdapterExact(dm.instance ?? dm.channel_type) : undefined;
-  if (!dm || !dmAdapter) return false;
+  return dm && dmAdapter ? { dm, dmAdapter } : null;
+}
+
+/** Deliver to the user's direct chat; false when there is none or the send failed. */
+async function sendDirect(userId: string, instance: string, text: string): Promise<boolean> {
+  const direct = await directChat(userId, instance);
+  if (!direct) return false;
+  const { dm, dmAdapter } = direct;
   try {
     await dmAdapter.deliver(dm.platform_id, null, { kind: 'chat', content: { text } });
     return true;

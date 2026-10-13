@@ -67,7 +67,7 @@ import {
 } from '../db/voice-mode-lines.js';
 import { log } from '../log.js';
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
-import { grantRole } from '../modules/permissions/db/user-roles.js';
+import { grantRole, revokeRole } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { getSessionsByAgentGroup } from '../db/sessions.js';
 import { routeInbound } from '../router.js';
@@ -600,6 +600,61 @@ describe('handleVoiceCommand (the interceptor)', () => {
     const fresh = textOf(direct()[0]);
     expect(fresh).toContain('The link I sent was visible to the whole chat, so it was replaced');
     expect(await findVoiceModeLineByToken(tokenOf(fresh.match(/https:\S+/)![0]))).toBeDefined();
+  });
+
+  it('does not claim a public link was replaced when its replacement was refused', async () => {
+    await startChat(false);
+    await groupChat();
+    let exposed = '';
+    await handleVoiceCommand(event('/voice', OWNER, 'chat:G1'), callUrl, async (text) => {
+      exposed = text;
+      await revokeRole(OWNER, 'owner', null);
+      return 'public';
+    });
+    expect(await findVoiceModeLineByToken(tokenOf(exposed.match(/https:\S+/)![0]))).toBeDefined();
+    expect(inGroup().map(textOf).join('\n')).toContain(
+      'The link I sent was visible to the whole chat and could not be replaced: send /voice new to replace it.',
+    );
+    expect(JSON.stringify(delivered)).not.toContain('so it was replaced');
+    expect(log.error).toHaveBeenCalledWith('/voice links posted publicly were not replaced', {
+      channelType: 'chat',
+      agentGroupIds: ['ag-1'],
+    });
+  });
+
+  it('in a group without a private reply, /voice new ends no call when the direct chat is out of reach', async () => {
+    await startChat(false);
+    await groupChat();
+    await handleVoiceCommand(event('/voice', OWNER, 'chat:G1'), callUrl, async () => 'sent');
+    const [line] = await lines();
+    const chat = (await import('./channel-registry.js')).getChannelAdapterExact('chat')!;
+    chat.openDM = async () => {
+      throw new Error('Forbidden: bot was blocked by the user');
+    };
+    await getDb().run('DELETE FROM user_dms');
+    delivered.length = 0;
+    await handleVoiceCommand(event('/voice new', OWNER, 'chat:G1'), callUrl);
+    expect((await lines())[0].token_hash).toBe(line.token_hash);
+    expect(delivered.map(textOf)).toEqual([
+      'I cannot message you privately here: start a direct chat with me, then run /voice again.',
+    ]);
+  });
+
+  it('says the earlier link is gone when /voice new replaced it but neither private route works', async () => {
+    await startChat(false);
+    await groupChat();
+    await handleVoiceCommand(event('/voice', OWNER, 'chat:G1'), callUrl, async () => 'sent');
+    const chat = (await import('./channel-registry.js')).getChannelAdapterExact('chat')!;
+    const deliver = chat.deliver.bind(chat);
+    chat.deliver = async (platformId, threadId, message) => {
+      if (platformId !== 'chat:G1') throw new Error('Forbidden: bot was blocked by the user');
+      return deliver(platformId, threadId, message);
+    };
+    delivered.length = 0;
+    await handleVoiceCommand(event('/voice new', OWNER, 'chat:G1'), callUrl, async () => 'unavailable');
+    expect(delivered.map(textOf)).toEqual([
+      'Any earlier link no longer works. I cannot message you privately here: start a direct chat with me, then run /voice again.',
+    ]);
   });
 
   it('a refusal whose private reply is unavailable or went public is answered in the group, opening no direct chat', async () => {
