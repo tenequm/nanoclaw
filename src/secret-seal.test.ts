@@ -23,7 +23,8 @@ describe('parseEncryptionKey', () => {
     const last = raw.at(-2)!;
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
     const sloppy = raw.slice(0, -2) + alphabet[alphabet.indexOf(last) | 1] + '=';
-    if (sloppy !== raw) expect(parseEncryptionKey(sloppy)).toBeNull();
+    expect(sloppy).not.toBe(raw);
+    expect(parseEncryptionKey(sloppy)).toBeNull();
   });
 });
 
@@ -36,6 +37,13 @@ describe('sealText / openSealed', () => {
     expect(a).not.toContain('secret');
     expect(openSealed(a, 'voice-link:abc', key)).toBe('secret');
     expect(openSealed(b, 'voice-link:abc', key)).toBe('secret');
+  });
+
+  it('opens only a strictly spelled envelope', () => {
+    const a = sealText('secret', 'voice-link:abc', key);
+    for (const bent of [`${a} `, `${a}\n`, `v1: ${a.slice(3)}`, `v1:*${a.slice(3)}`]) {
+      expect(openSealed(bent, 'voice-link:abc', key)).toBeNull();
+    }
   });
 
   it('opens nothing under another key, another context, a tampered value or another version', () => {

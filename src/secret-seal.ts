@@ -13,7 +13,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { envValue } from './env.js';
 import { log } from './log.js';
 
-export const ENCRYPTION_KEY_ENV = 'NANOCLAW_ENCRYPTION_KEY';
+const ENCRYPTION_KEY_ENV = 'NANOCLAW_ENCRYPTION_KEY';
 
 const VERSION = 'v1:';
 const NONCE_BYTES = 12;
@@ -55,8 +55,9 @@ export function sealText(text: string, context: string, key: Buffer): string {
 
 /** The text sealed for `context`, or null for any other version, context or key, or a damaged value. */
 export function openSealed(sealed: string, context: string, key: Buffer): string | null {
-  if (!sealed.startsWith(VERSION)) return null;
-  const raw = Buffer.from(sealed.slice(VERSION.length), 'base64');
+  const body = sealed.slice(VERSION.length);
+  if (!sealed.startsWith(VERSION) || !/^[A-Za-z0-9+/]+={0,2}$/.test(body)) return null;
+  const raw = Buffer.from(body, 'base64');
   if (raw.length < NONCE_BYTES + TAG_BYTES) return null;
   try {
     const decipher = createDecipheriv('aes-256-gcm', key, raw.subarray(0, NONCE_BYTES), { authTagLength: TAG_BYTES });

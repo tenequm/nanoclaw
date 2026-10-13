@@ -613,6 +613,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
       catalog.warm();
+      // Says at startup, not at the first /voice, when link storage is off (no or a malformed key).
+      encryptionKey();
       registerWebhookHandler(VOICE_MODE_CHANNEL, handleHttp);
       registerRootHandler('voice', handleHttp);
       if (config.pagePort !== undefined) {

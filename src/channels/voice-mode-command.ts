@@ -92,7 +92,7 @@ export type VoiceNoLinkReason =
   | 'other-caller'
   /** A link minted before links were sealed; the next call made with it seals it. */
   | 'unsealed'
-  /** The sealed link does not open with this host's key. */
+  /** The sealed link does not open with this host's key; the next call made with it seals it again. */
   | 'unreadable';
 
 /** What /voice did for one agent of the chat: the sender's link, or why there is none. */
@@ -210,7 +210,7 @@ function noLinkLine(r: Extract<VoiceTargetResult, { ok: false }>, cmd: string): 
     case 'unsealed':
       return `${r.agentName}: calls now talk in this chat. Its link predates stored links: it shows here after its next call, or ${fresh}.`;
     case 'unreadable':
-      return `${r.agentName}: calls now talk in this chat, but its stored link cannot be read on this host; ${fresh}.`;
+      return `${r.agentName}: calls now talk in this chat, but its stored link cannot be read on this host: it shows here after its next call, or ${fresh}.`;
   }
 }
 

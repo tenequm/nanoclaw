@@ -165,8 +165,8 @@ export async function sealVoiceModeLink(line: VoiceModeLineRow, token: string, k
 
 /**
  * The line's current token, opened from its sealed link: `unsealed` when none is stored or the stored
- * one is not the current link (an older host re-minted it; it is cleared so the next call seals the
- * current one), `unreadable` when it does not open with this key.
+ * one is not the current link (an older host re-minted it), `unreadable` when it does not open with
+ * this key. Either stored copy is cleared, so the next call made with the link seals it again.
  */
 export async function openVoiceModeLink(
   line: VoiceModeLineRow,
@@ -174,14 +174,13 @@ export async function openVoiceModeLink(
 ): Promise<{ token: string } | { missing: 'unsealed' | 'unreadable' }> {
   if (line.link_sealed === null) return { missing: 'unsealed' };
   const token = openSealed(line.link_sealed, linkContext(line.line_id), key);
-  if (token === null) return { missing: 'unreadable' };
-  if (hashLinkToken(token) === line.token_hash) return { token };
+  if (token !== null && hashLinkToken(token) === line.token_hash) return { token };
   await getDb().run(
     'UPDATE voice_mode_lines SET link_sealed = NULL WHERE line_id = ? AND link_sealed = ?',
     line.line_id,
     line.link_sealed,
   );
-  return { missing: 'unsealed' };
+  return { missing: token === null ? 'unreadable' : 'unsealed' };
 }
 
 /** Who a minted link is for and where its calls talk. */

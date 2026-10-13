@@ -328,16 +328,19 @@ describe('runVoiceCommand', () => {
     expect(await lines()).toEqual([]);
   });
 
-  it('a sealed link that does not open with this key is reported, never replaced unasked', async () => {
-    await linkFrom(OWNER);
+  it('a sealed link that does not open with this key is reported, never replaced unasked, and sealed again by its next call', async () => {
+    const token = tokenOf(await linkFrom(OWNER));
     const [before] = await lines();
     hostKey.value = randomBytes(32);
     const outcome = await run(OWNER);
     expect(voiceLinkLines(outcome)).toEqual([]);
     expect(voiceCommandReply(outcome)).toBe(
-      'Andy: calls now talk in this chat, but its stored link cannot be read on this host; send /voice new for a fresh one (calls on the old link end).',
+      'Andy: calls now talk in this chat, but its stored link cannot be read on this host: it shows here after its next call, or send /voice new for a fresh one (calls on the old link end).',
     );
-    expect((await lines())[0]).toMatchObject({ token_hash: before.token_hash, link_sealed: before.link_sealed });
+    expect((await lines())[0]).toMatchObject({ token_hash: before.token_hash, link_sealed: null });
+    const line = (await findVoiceModeLineByToken(token))!;
+    await sealVoiceModeLink(line, token, hostKey.value!);
+    expect(tokenOf(await linkFrom(OWNER))).toBe(token);
   });
 
   it('a sealed link from another row does not open: the row id is authenticated', async () => {
