@@ -54,6 +54,7 @@ import {
   liveKitCallSecret,
   MAX_TURN_TEXT_BYTES,
   PING_INTERVAL_MS,
+  settleWithin,
   baseLanguage,
   DEFAULT_VOICE_LANGUAGES,
   WORKER_REQUEST_TIMEOUT_MS,
@@ -77,8 +78,6 @@ const MAX_AGENT_BODY_BYTES = 16 * 1024;
 const CALLER_TOKEN_TTL_SECONDS = 120;
 /** The worker opens its event stream right after it reports the caller in; without it nothing reaches the caller. */
 const WORKER_STREAM_TIMEOUT_MS = 30_000;
-/** A turn is at most 90 s of speech; Ukrainian runs about 4 KB of UTF-8 for that. */
-const MAX_UTTERANCE_BYTES = MAX_TURN_TEXT_BYTES;
 const MAX_UTTERANCES_PER_MINUTE = 20;
 /** The router has this long to store a turn in the agent's session, so the worker hears the 504 before it gives up. */
 const ROUTE_TIMEOUT_MS = WORKER_REQUEST_TIMEOUT_MS - 2_000;
@@ -456,7 +455,18 @@ registerPostDeliveryHook((msg, session) => liveKitChatDelivered(msg, session.age
 setOutboundPresentation((msg, content, session) => liveKitChatPresentation(msg, content, session.agent_group_id));
 registerTypingObserver(({ agentGroupId, working, ...chat }) => liveKitChatTyping(chat, agentGroupId, working));
 
-const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
+export const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
+
+/** Answers a voice route: plain text unless `headers` say otherwise, never cached. */
+export function reply(
+  res: http.ServerResponse,
+  status: number,
+  body: string,
+  headers: Record<string, string> = {},
+): void {
+  res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
+  res.end(body);
+}
 
 /** The 409 answer to a start on a line with no chat to talk in; the page tells it by `error`, not the status. */
 const NO_CHAT_REFUSAL = JSON.stringify({
@@ -549,11 +559,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   /** The last call-chat note logged per line and topic, so a line logs when it changes, not every turn. */
   const chatNotes = new Map<string, string>();
   let page: string | undefined;
-
-  const reply = (res: http.ServerResponse, status: number, body: string, headers: Record<string, string> = {}) => {
-    res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
-    res.end(body);
-  };
 
   const findCall = (callId: unknown): LiveKitCall | undefined =>
     typeof callId === 'string' ? [...calls.values()].find((c) => c.callId === callId) : undefined;
@@ -762,23 +767,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
   /** Room metadata the page reads when it is disconnected, so it can say why; best effort and bounded. */
   const announceEnd = async (call: LiveKitCall, code: CallEndReason): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([
-        // The whole metadata is replaced, so the chat label the page shows goes along.
-        (call.metadataWrite ?? Promise.resolve()).then(() =>
-          api.updateRoomMetadata(call.roomName, roomMetadata(call.chat, code)),
-        ),
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error('timed out')), END_NOTICE_TIMEOUT_MS);
-          timer.unref();
-        }),
-      ]);
+      // The whole metadata is replaced, so the chat label the page shows goes along.
+      const written = (call.metadataWrite ?? Promise.resolve())
+        .then(() => api.updateRoomMetadata(call.roomName, roomMetadata(call.chat, code)))
+        .then(() => true);
+      if (!(await settleWithin(written, END_NOTICE_TIMEOUT_MS, false))) throw new Error('timed out');
     } catch (err) {
       if (!isNotFound(err))
         log.info('livekit-voice-mode: could not set the end reason on the room', { callId: call.callId, err });
-    } finally {
-      clearTimeout(timer);
     }
   };
 
@@ -1031,8 +1028,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (call.state !== 'live') return reply(res, 409, 'The caller is not in the call');
     const text = typeof body.text === 'string' ? body.text.trim() : '';
     if (!text) return reply(res, 400, 'text is required');
-    if (Buffer.byteLength(text) > MAX_UTTERANCE_BYTES) {
-      return reply(res, 413, `utterance is too large (${MAX_UTTERANCE_BYTES / 1024} KB max)`);
+    if (Buffer.byteLength(text) > MAX_TURN_TEXT_BYTES) {
+      return reply(res, 413, `utterance is too large (${MAX_TURN_TEXT_BYTES / 1024} KB max)`);
     }
     const turnKey =
       typeof body.turnKey === 'string' && body.turnKey.length <= MAX_TURN_KEY_LENGTH ? body.turnKey : undefined;
@@ -1111,14 +1108,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         },
         () => undefined,
       );
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timedOut = new Promise<'timeout'>((resolve) => {
-        timer = setTimeout(() => resolve('timeout'), Math.max(0, routeTimeoutMs - (host.now() - receivedAt)));
-        timer.unref();
-      });
       const fields = { callId: call.callId, utteranceId };
       try {
-        const stored = await Promise.race([routed, timedOut]);
+        const budgetMs = Math.max(0, routeTimeoutMs - (host.now() - receivedAt));
+        const stored = await settleWithin(routed, budgetMs, 'timeout' as const);
         if (stored === 'timeout') {
           log.warn('livekit-voice-mode: a turn did not reach the agent in time', fields);
           void routed.then(
@@ -1141,8 +1134,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         return { status: 202, body: JSON.stringify({ id: utteranceId }) };
       } catch {
         return { status: 500, body: 'Routing the turn failed' };
-      } finally {
-        clearTimeout(timer);
       }
     } finally {
       if (routed) void routed.then(release, release);

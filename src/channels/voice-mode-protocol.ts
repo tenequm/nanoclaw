@@ -10,6 +10,25 @@ import type { ChoiceDetails } from './voice-mode-tts-catalog.js';
 
 export const DEFAULT_LIVEKIT_AGENT_NAME = 'nanoclaw-voice-mode';
 
+/**
+ * `promise`'s value, or `fallback` once `ms` passed first. The timer is cleared either way and never
+ * holds the process open; a rejection of `promise` before then rejects.
+ */
+export async function settleWithin<T, F>(promise: Promise<T>, ms: number, fallback: F): Promise<T | F> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<F>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** The host pings the worker's event stream this often, so silence means a dead link. */
 export const PING_INTERVAL_MS = 15_000;
 /** The worker drops the host link after this long without a line: three missed pings. */

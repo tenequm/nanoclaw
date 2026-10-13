@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto';
 import { GoogleGenAI } from '@google/genai';
 
 import { log as hostLog } from '../log.js';
+import { settleWithin } from './voice-mode-protocol.js';
 import { TTS_REGISTRY, type ProviderKeys, type TtsChoice, type TtsProvider } from '../voice-mode-tts.js';
 
 export interface CatalogVoice {
@@ -400,9 +401,7 @@ export function createVoiceCatalog(
   };
 
   const within = async (pending: Promise<unknown> | undefined): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([pending, new Promise((resolve) => (timer = setTimeout(resolve, LOOKUP_WAIT_MS)))]);
-    clearTimeout(timer);
+    await settleWithin(Promise.resolve(pending), LOOKUP_WAIT_MS, undefined);
   };
 
   const elevenLabsById = async (apiKey: string, id: string): Promise<VoiceLookup> => {

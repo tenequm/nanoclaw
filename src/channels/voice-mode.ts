@@ -31,12 +31,19 @@ import {
   type ResolveLineOptions,
   type VoiceModeLine,
 } from './voice-mode-line.js';
-import { createLiveKitVoice, readJsonObject, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
+import {
+  createLiveKitVoice,
+  JSON_HEADERS,
+  readJsonObject,
+  reply,
+  type LiveKitVoiceConfig,
+} from './voice-mode-livekit.js';
 import { createVoiceCatalog, type VoiceCatalog } from './voice-mode-tts-catalog.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_VOICE_MIRROR,
   LIVEKIT_PROTOCOL_VERSION,
+  settleWithin,
   wakePhrase,
   parseVoiceLanguages,
 } from './voice-mode-protocol.js';
@@ -82,7 +89,6 @@ const DAY_MS = 86_400_000;
 /** After a turn reaches the agent, its session's replies are picked up at once for this long, not on the 1 s poll. */
 const CALL_REPLY_EXPEDITE_MS = 60_000;
 
-const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 /** A `PATCH /voice/tts` body is one small object: `{provider, model?, voice?}` or `{"reset": true}`. */
 const MAX_TTS_BODY_BYTES = 1024;
 const MAX_CATALOG_LIMIT = 100;
@@ -401,15 +407,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     accessCheckIntervalMs,
   });
 
-  const reply = (
-    res: http.ServerResponse,
-    status: number,
-    body: string,
-    headers: Record<string, string> = {},
-  ): void => {
-    res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
-    res.end(body);
-  };
   const replyJson = (res: http.ServerResponse, status: number, body: unknown): void =>
     reply(res, status, JSON.stringify(body), JSON_HEADERS);
 
@@ -490,18 +487,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       const apiKey = providerKeys[provider];
       if (!apiKey) return replyJson(res, 503, { error: 'provider_unavailable', provider });
       // Only a voice the provider says it does not have is refused; one it could not be asked about in time saves.
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const found = await Promise.race([
+      const found = await settleWithin(
         catalog.lookup(provider, apiKey, voice, { confirm: true }),
-        new Promise<{ status: 'lookup_failed' }>(
-          (resolve) =>
-            (timer = setTimeout(
-              () => resolve({ status: 'lookup_failed' }),
-              config.saveLookupBudgetMs ?? SAVE_LOOKUP_BUDGET_MS,
-            )),
-        ),
-      ]);
-      clearTimeout(timer);
+        config.saveLookupBudgetMs ?? SAVE_LOOKUP_BUDGET_MS,
+        { status: 'lookup_failed' } as const,
+      );
       if (found.status === 'unavailable') return replyJson(res, 400, { error: 'invalid', field: 'voice' });
       choice = read.choice;
     }
