@@ -42,8 +42,6 @@ import {
 } from '../../../commands/index.js';
 import { getChannelAdapterExact } from '../../channel-registry.js';
 import type { InboundEvent } from '../../adapter.js';
-import type { PrivateReply } from '../../voice-mode-command.js';
-import type { VoiceModeChannelAdapter } from '../../voice-mode.js';
 import { mapGrammyError } from '../errors.js';
 import { log } from '../../../log.js';
 import { hasAdminPrivilege } from '../../../modules/permissions/db/user-roles.js';
@@ -93,6 +91,13 @@ async function isAdminOfAny(actor: string, agents: readonly TargetAgent[]): Prom
 const dropNoAgent = (command: string, ctx: Context): Effect.Effect<void> =>
   Effect.sync(() => log.debug('telegram-grammy: command in unwired chat dropped', { command, chatId: ctx.chat?.id }));
 
+/** A sender-only reply in the command's chat (see sendEphemeralReply). */
+type PrivateReply = (text: string) => Promise<'sent' | 'unavailable' | 'public'>;
+/** The voice-mode adapter's `/voice` handler (src/channels/voice-mode.ts), typed here so this file builds without the skill. */
+type VoiceCommandHandler = (event: InboundEvent, privateReply: PrivateReply) => Promise<boolean>;
+/** The voice-mode skill's command module, named by a variable so this file builds after REMOVE.md deletes it. */
+const VOICE_COMMAND_MODULE = '../../voice-mode-command.js';
+
 function commandArg(ctx: Context): string {
   return typeof ctx.match === 'string' ? ctx.match.trim() : '';
 }
@@ -103,7 +108,7 @@ function commandArg(ctx: Context): string {
  * A response that is not ephemeral was posted for everyone: it is deleted at once and reported as
  * `public`. Errors are logged by kind and description only: the request holds the text.
  */
-export async function sendEphemeralReply(
+async function sendEphemeralReply(
   api: Api,
   msg: Pick<Message, 'chat' | 'ephemeral_message_id' | 'is_topic_message' | 'message_thread_id'>,
   receiverId: number,
@@ -308,11 +313,13 @@ export function buildCommandGroup(runtime: AdapterRuntime, menus: CommandMenus):
         },
       };
       const privateReply = (text: string) => sendEphemeralReply(ctx.api, msg, from.id, text);
-      const voice = getChannelAdapterExact('voice-mode') as VoiceModeChannelAdapter | undefined;
-      if (voice) return void (await voice.handleVoiceCommand(event, privateReply));
-      // Loaded only here: the command module pulls in the router, too heavy for the adapter's own load.
-      const { handleVoiceCommand } = await import('../../voice-mode-command.js');
-      await handleVoiceCommand(event, null, privateReply);
+      const voice = getChannelAdapterExact('voice-mode') as { handleVoiceCommand?: VoiceCommandHandler } | undefined;
+      if (voice?.handleVoiceCommand) return void (await voice.handleVoiceCommand(event, privateReply));
+      // No voice-mode channel running: the skill's command module says calls are off, if the skill is installed.
+      const skill = (await import(VOICE_COMMAND_MODULE).catch(() => undefined)) as
+        | { handleVoiceCommand?: (event: InboundEvent, callUrl: null, reply: PrivateReply) => Promise<boolean> }
+        | undefined;
+      if (skill?.handleVoiceCommand) await skill.handleVoiceCommand(event, null, privateReply);
     });
 
   group.command('status', COMMANDS.status.description, (ctx) => runtime.runPromise(onStatus(ctx)));

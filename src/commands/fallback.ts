@@ -120,6 +120,10 @@ export async function runHostCommand(ctx: HostCommandContext): Promise<void> {
     case 'restart':
       await handleRestart(ctx, targets);
       return;
+    case 'voice':
+      // The voice-mode skill's interceptor answers /voice before the router gets here; without the skill there are no calls.
+      log.info('/voice dropped: voice mode is not installed', { channelType: ctx.event.channelType });
+      return;
     default:
       log.warn('Unknown host command', { command: ctx.command });
   }
