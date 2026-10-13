@@ -1199,15 +1199,15 @@ export interface CallVoice {
   /** One message on the `nanoclaw.voice-mode.reply` topic, sent right before the line it describes is spoken. */
   publishReply(info: CallReplyInfo): void;
   /** Words that will never be sent, on the `nanoclaw.voice-mode.turn` topic. */
-  publishDropped?(dropped: CallDroppedSpeech): void;
+  publishDropped(dropped: CallDroppedSpeech): void;
   /** On the `nanoclaw.voice-mode.turn` topic: the caller spoke under the agent's line, unheard. */
-  publishUnheard?(): void;
+  publishUnheard(): void;
   /** The page's send countdown (the `nanoclaw.voice-mode.pending` attribute); '' clears it. */
-  setPending?(value: string): void;
+  setPending(value: string): void;
   /** The caller's caption for turn `segment`: interim text as it grows, then its final text; `mark` when it ends in a command. */
-  caption?(segment: number, text: string, final: boolean, mark?: CaptionMark): void;
-  /** Review mode's controls; absent where the room cannot run it. */
-  review?: ReviewSession;
+  caption(segment: number, text: string, final: boolean, mark?: CaptionMark): void;
+  /** Review mode's controls. */
+  review: ReviewSession;
   /**
    * The `settings` RPC's `tts` of request `gen`: what speaks from the next line on. Returns the reply's
    * error when it is refused; absent where the room cannot switch.
@@ -1217,7 +1217,7 @@ export interface CallVoice {
    * Play a sound cue on the call's cue track; resolves once the track took all of it (heard about 0.1 s
    * later). `started` once it took the first frame.
    */
-  playCue?(kind: CueKind, started?: () => void): Promise<void>;
+  playCue(kind: CueKind, started?: () => void): Promise<void>;
   /** Loop the typing sound on the cue track (under no cue), or stop it. */
   setTyping?(on: boolean): void;
   close(): Promise<void>;
@@ -1242,9 +1242,9 @@ export interface CallVoiceEvents {
   /** The VAD: the caller's speech started or ended at stream position `at` (16 kHz samples). */
   onSpeech(speaking: boolean, at: number): void;
   /** The VAD analyzed the audio through stream position `at`, its last window with speech ending at `quietFrom`. */
-  onVad?(at: number, quietFrom: number): void;
+  onVad(at: number, quietFrom: number): void;
   /** The agent's audio started or stopped playing. */
-  onAgentSpeaking?(speaking: boolean): void;
+  onAgentSpeaking(speaking: boolean): void;
   onClosed(reason: string): void;
 }
 
@@ -3242,12 +3242,12 @@ export interface ReviewDeps {
   /** Entering review: the auto mode's open turn is not waited for any more (TurnTaking.resetCaller). */
   resetCaller(): void;
   /** The `settings` RPC: auto mode's wake switch, the sound cues and the voice; returns the reply's error, if any. */
-  configure?(req: ReviewRequest): ReviewReply['error'] | undefined;
+  configure(req: ReviewRequest): ReviewReply['error'] | undefined;
   /** Auto mode's wake state, sent with every review state. */
-  wakeState?(): CallWakeState;
-  cue?(kind: CueKind): void;
+  wakeState(): CallWakeState;
+  cue(kind: CueKind): void;
   /** A draft that came to nothing: discarded, or nothing heard. */
-  ended?(draft: number, take: TurnTake | undefined, outcome: TurnOutcome, reason: string): void;
+  ended(draft: number, take: TurnTake | undefined, outcome: TurnOutcome, reason: string): void;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -3324,7 +3324,7 @@ export class ReviewControl {
       : undefined;
     switch (op) {
       case 'settings': {
-        const error = this.deps.configure?.(req);
+        const error = this.deps.configure(req);
         this.publish();
         return reply(error ? { error } : {});
       }
@@ -3368,7 +3368,7 @@ export class ReviewControl {
         this.deps.setCaptureOpen(true);
         this.deps.voice.record();
         this.publish();
-        this.deps.cue?.('listening');
+        this.deps.cue('listening');
         return reply({ draft: this.draft.id });
       }
       case 'done': {
@@ -3390,7 +3390,7 @@ export class ReviewControl {
       case 'discard': {
         if (!draft || draft.id !== req.draft) return reply({ error: 'stale' });
         // An empty or failed draft was reported when it froze; a recording is when its activity ends.
-        if (draft.state === 'ready') this.deps.ended?.(draft.id, this.take, 'discarded', 'review');
+        if (draft.state === 'ready') this.deps.ended(draft.id, this.take, 'discarded', 'review');
         this.draft = null;
         this.take = undefined;
         if (draft.state === 'recording') {
@@ -3466,9 +3466,9 @@ export class ReviewControl {
         text,
         ...(Buffer.byteLength(text) > MAX_TURN_TEXT_BYTES ? { tooLong: true } : {}),
       };
-      if (state === 'ready' && !this.draft.tooLong) this.deps.cue?.('draft');
-      if (state === 'empty') this.deps.ended?.(draft.id, heard?.take, 'empty', 'no_words');
-      if (state === 'failed') this.deps.ended?.(draft.id, heard?.take, 'lost', 'stt');
+      if (state === 'ready' && !this.draft.tooLong) this.deps.cue('draft');
+      if (state === 'empty') this.deps.ended(draft.id, heard?.take, 'empty', 'no_words');
+      if (state === 'failed') this.deps.ended(draft.id, heard?.take, 'lost', 'stt');
     }
     this.publish();
   }
@@ -3480,7 +3480,7 @@ export class ReviewControl {
       mode: this.mode,
       draft: this.draft,
       ...(this.preparing ? { preparing: true } : {}),
-      ...(this.deps.wakeState ? { wake: this.deps.wakeState() } : {}),
+      wake: this.deps.wakeState(),
     });
   }
 }
@@ -3823,7 +3823,7 @@ export class CallerInput {
           // Each window's own result: speech too short to start a turn still breaks the quiet.
           const at = vad.from + ev.samplesIndex;
           if ((ev.probability ?? 0) > VAD_ACTIVATION) vad.quietFrom = at;
-          this.events.onVad?.(at, vad.quietFrom);
+          this.events.onVad(at, vad.quietFrom);
         } else if (ev.type === VADEventType.START_OF_SPEECH) {
           vad.speaking = true;
           this.events.onSpeech(true, vad.from + ev.samplesIndex - samplesOf(ev.speechDuration));
@@ -4136,7 +4136,7 @@ async function roomVoice(
     log,
     started: (text) => {
       setAttr(AGENT_STATE_ATTRIBUTE, 'speaking', 'the agent state');
-      events.onAgentSpeaking?.(true);
+      events.onAgentSpeaking(true);
       // The line's caption, on the agent's speech track, as its audio starts.
       post('a caption', () =>
         local.sendText(text, {
@@ -4151,7 +4151,7 @@ async function roomVoice(
     },
     stopped: () => {
       setAttr(AGENT_STATE_ATTRIBUTE, 'listening', 'the agent state');
-      events.onAgentSpeaking?.(false);
+      events.onAgentSpeaking(false);
     },
     changed: publishVoice,
   });
@@ -4504,7 +4504,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     cues = cues
       .then(async () => {
         if (ending || !cuesOn || agentSpeaking) return;
-        await callVoice?.playCue?.(kind, started);
+        await callVoice?.playCue(kind, started);
       })
       .catch((err: unknown) => callLog.warn('voice-mode worker: a cue did not play', { err, kind }));
   };
@@ -4792,20 +4792,20 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       },
       drop: (dropped, text, lone) => {
         if (ending) return;
-        callVoice?.publishDropped?.(
+        callVoice?.publishDropped(
           lone ? { dropped, text, command: lone.command, segment: captionSegment(lone.segment) } : { dropped, text },
         );
       },
       cue,
       caption: (segment, text, final, mark) => {
-        if (!ending) callVoice?.caption?.(segment, text, final, mark);
+        if (!ending) callVoice?.caption(segment, text, final, mark);
       },
-      countdown: new SendCountdown((value) => callVoice?.setPending?.(value), meta.silenceMs),
+      countdown: new SendCountdown((value) => callVoice?.setPending(value), meta.silenceMs),
       changed: () => review?.republish(),
       hold: (open) => turnTaking.setCaptureOpen(open, 'turn'),
       noTurn: () => turnTaking.releaseTurn(),
       unheard: () => {
-        if (!ending && !review?.reviewing) callVoice?.publishUnheard?.();
+        if (!ending && !review?.reviewing) callVoice?.publishUnheard();
       },
       log: callLog,
     },
@@ -4950,7 +4950,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   }
   const reviewSession = callVoice.review;
   // A call that ended while its audio was set up gets no review controls.
-  if (reviewSession && !ending) {
+  if (!ending) {
     const control = new ReviewControl({
       voice: callTurns,
       publishReview: (state) => reviewSession.publishReview(state),

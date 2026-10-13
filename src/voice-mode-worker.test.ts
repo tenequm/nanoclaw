@@ -792,8 +792,8 @@ function fakeVoice(
     /** Plays at once: waits for the caller as the room's does, then speaks. */
     say: vi.fn(async (_text: string, ready?: () => Promise<void>) => {
       await ready?.();
-      events.onAgentSpeaking?.(true);
-      events.onAgentSpeaking?.(false);
+      events.onAgentSpeaking(true);
+      events.onAgentSpeaking(false);
       return true;
     }),
     selectTts: undefined as CallVoice['selectTts'],
@@ -867,7 +867,7 @@ function fakeVoice(
       const end = position;
       audio(SILENCE);
       events.onSpeech(true, start);
-      events.onVad?.(position, end);
+      events.onVad(position, end);
       events.onSpeech(false, end);
       await flush();
     },
@@ -875,7 +875,7 @@ function fakeVoice(
     quiet: (ms: number) => {
       const from = position;
       audio(ms);
-      events.onVad?.(position, from);
+      events.onVad(position, from);
     },
   };
   return v;
@@ -1016,12 +1016,12 @@ describe('runCall', () => {
     await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
     // The reply's speech is still being made: the page keeps "working" until its audio plays.
     expect(thinking()).toBe(true);
-    v.events.onAgentSpeaking?.(true);
+    v.events.onAgentSpeaking(true);
     expect(thinking()).toBe(true);
     // A moment into its audio (the page has the speaking state by then) it lets go.
     await vi.waitFor(() => expect(thinking()).toBe(false));
     speak();
-    v.events.onAgentSpeaking?.(false);
+    v.events.onAgentSpeaking(false);
     // The agent's typing after its answer: no "working" with nothing coming.
     host.emit({ type: 'thinking' });
     await new Promise((r) => setTimeout(r, 20));
@@ -1706,7 +1706,10 @@ function reviewControl(overrides: Partial<ReviewDeps> = {}) {
     lastPosted: () => posted.length,
     setCaptureOpen: (open) => void capture.push(open),
     resetCaller: vi.fn(),
+    configure: () => undefined,
+    wakeState: () => ({ on: false, pauseSends: false, waiting: false }),
     cue: (kind) => void cues.push(kind),
+    ended: () => undefined,
     log: silentLog,
     ...overrides,
   });
@@ -2070,8 +2073,8 @@ function speakingCall(plans: Record<string, (text: string, call: number) => TtsP
         waitForPlayout: async () => undefined,
       },
       log: silentLog,
-      started: () => events.onAgentSpeaking?.(true),
-      stopped: () => events.onAgentSpeaking?.(false),
+      started: () => events.onAgentSpeaking(true),
+      stopped: () => events.onAgentSpeaking(false),
       changed: (state) => void states.push(state),
       build: (choice, apiKey) => {
         const tts = fakeTts(plans[ttsId(choice)] ?? (() => ({ chunks: 1 })));
@@ -3334,6 +3337,10 @@ function reviewOverTurns(h: ReturnType<typeof turnsHarness>) {
     lastPosted: () => posted.length,
     setCaptureOpen: () => undefined,
     resetCaller: () => undefined,
+    configure: () => undefined,
+    wakeState: () => h.turns.state,
+    cue: () => undefined,
+    ended: () => undefined,
     log: silentLog,
   });
   let gen = 0;
@@ -3808,7 +3815,12 @@ describe('room output and the caller input', () => {
     const speech: Array<[boolean, number]> = [];
     const input = new CallerInput(
       newVad,
-      { onAudio: () => undefined, onSpeech: (on, at) => void speech.push([on, at]), onClosed: () => undefined },
+      {
+        onAudio: () => undefined,
+        onSpeech: (on, at) => void speech.push([on, at]),
+        onVad: () => undefined,
+        onClosed: () => undefined,
+      },
       { error: () => undefined },
     );
     const frame = () => input.frame(new AudioFrame(new Int16Array(320), 16_000, 1, 320));
@@ -3953,9 +3965,9 @@ describe('commands, cues and review in a call', () => {
     await runCall(ctx, callDeps(host.fetchImpl, v));
     await v.turn('Book a table');
     await vi.waitFor(() => expect(typing).toEqual([true]));
-    v.events.onAgentSpeaking?.(true);
+    v.events.onAgentSpeaking(true);
     expect(typing).toEqual([true, false]);
-    v.events.onAgentSpeaking?.(false);
+    v.events.onAgentSpeaking(false);
     host.emit({ type: 'working' });
     await vi.waitFor(() => expect(typing).toEqual([true, false, true]));
     await v.rpc('settings', { cues: false });
@@ -3993,9 +4005,9 @@ describe('commands, cues and review in a call', () => {
     let finish: (() => void) | undefined;
     v.voice.say.mockImplementation(async (_text: string, ready?: () => Promise<void>) => {
       await ready?.();
-      v.events.onAgentSpeaking?.(true);
+      v.events.onAgentSpeaking(true);
       await new Promise<void>((resolve) => (finish = resolve));
-      v.events.onAgentSpeaking?.(false);
+      v.events.onAgentSpeaking(false);
       return true;
     });
     await runCall(ctx, callDeps(host.fetchImpl, v));
@@ -4019,9 +4031,9 @@ describe('commands, cues and review in a call', () => {
     v.voice.say.mockImplementation(async (text: string, ready?: () => Promise<void>) => {
       await new Promise<void>((resolve) => (synthesized = resolve));
       await ready?.();
-      v.events.onAgentSpeaking?.(true);
+      v.events.onAgentSpeaking(true);
       played.push(text);
-      v.events.onAgentSpeaking?.(false);
+      v.events.onAgentSpeaking(false);
       return true;
     });
     await runCall(ctx, callDeps(host.fetchImpl, v));
@@ -4766,9 +4778,9 @@ describe('wide events', () => {
     const settings = v.createVoice.mock.calls[0][2];
     v.voice.say.mockImplementation(async (_text: string, ready?: () => Promise<void>) => {
       await ready?.();
-      v.events.onAgentSpeaking?.(true);
+      v.events.onAgentSpeaking(true);
       settings.spoke?.({ outcome: 'spoken', model: 'tts', fallback: false, durationMs: 800, peakDb: -3, rmsDb: -20 });
-      v.events.onAgentSpeaking?.(false);
+      v.events.onAgentSpeaking(false);
       return true;
     });
     await v.turn('Book a table');
@@ -5597,13 +5609,13 @@ describe('fast send words', () => {
     await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
     await c.wakeUp();
     await c.say(800);
-    c.v.events.onAgentSpeaking?.(true);
+    c.v.events.onAgentSpeaking(true);
     await c.say(600);
     await c.interim('Book a table. Zulu.');
     await c.quiet(900);
     expect(c.ended()).toBe(0);
     expect(utterances(c.host)).toEqual([]);
-    c.v.events.onAgentSpeaking?.(false);
+    c.v.events.onAgentSpeaking(false);
     await c.quiet(700);
     expect(c.ended()).toBe(1);
     expect(count(c.v, 'sent')).toBe(1);
