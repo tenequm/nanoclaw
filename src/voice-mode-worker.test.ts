@@ -2113,27 +2113,35 @@ describe('speech output', () => {
     expect(down.said).toEqual(['One.', 'One.']);
   });
 
-  it('resamples a line to 24 kHz mono: linear across chunks, channels averaged, 24 kHz mono as is', () => {
-    const at22 = lineResampler();
-    let total = 0;
-    for (let i = 0; i < 10; i++)
-      total += at22({ pcm: new Int16Array(2205).fill(1000), sampleRate: 22_050, numChannels: 1 }).length;
-    expect(Math.abs(total - 24_000)).toBeLessThanOrEqual(1);
-    const ramp = lineResampler();
-    const up = [0, 1].flatMap((k) =>
-      Array.from(
-        ramp({ pcm: Int16Array.from({ length: 4 }, (_, i) => (k * 4 + i) * 100), sampleRate: 12_000, numChannels: 1 }),
-      ),
-    );
-    expect(up).toEqual([0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700]);
-    const stereo = lineResampler()({
+  it('takes a line to 24 kHz mono: 24 kHz as is, channels averaged, other rates resampled with the tail flushed', () => {
+    const converting = vi.fn();
+    const same = new Int16Array(480).fill(7);
+    const direct = lineResampler(converting);
+    expect(direct.push({ pcm: same, sampleRate: 24_000, numChannels: 1 })).toBe(same);
+    const stereo = direct.push({
       pcm: Int16Array.from({ length: 960 }, (_, i) => (i % 2 ? 3000 : 1000)),
-      sampleRate: 48_000,
+      sampleRate: 24_000,
       numChannels: 2,
     });
-    expect(stereo).toEqual(new Int16Array(240).fill(2000));
-    const same = new Int16Array(480).fill(7);
-    expect(lineResampler()({ pcm: same, sampleRate: 24_000, numChannels: 1 })).toBe(same);
+    expect(stereo).toEqual(new Int16Array(480).fill(2000));
+    expect(direct.flush()).toHaveLength(0);
+    direct.close();
+    expect(converting).not.toHaveBeenCalled();
+
+    const at22 = lineResampler(converting);
+    const out: number[] = [];
+    try {
+      for (let i = 0; i < 10; i++)
+        out.push(...at22.push({ pcm: new Int16Array(2205).fill(1000), sampleRate: 22_050, numChannels: 1 }));
+      out.push(...at22.flush());
+    } finally {
+      at22.close();
+    }
+    expect(converting).toHaveBeenCalledTimes(1);
+    expect(converting).toHaveBeenCalledWith(22_050);
+    expect(Math.abs(out.length - 24_000)).toBeLessThanOrEqual(48);
+    // A steady level stays steady once the filter has settled: no interpolation ripple.
+    for (const v of out.slice(2_400, 21_600)) expect(Math.abs(v - 1000)).toBeLessThanOrEqual(2);
   });
 });
 
@@ -2321,7 +2329,9 @@ describe('voice selection in a call (the settings RPC)', () => {
     call.frames.length = 0;
     const two = await line('Two.');
     expect(two).toMatchObject({ model: 'elevenlabs/eleven_v4', durationMs: 1000 });
-    expect(new Set(call.frames.flatMap((f) => Array.from(f)))).toEqual(new Set([2000]));
+    // Channels averaged to one level; the resampler's filter rings only at the line's edges.
+    const pcm = call.frames.flatMap((f) => Array.from(f));
+    expect(pcm.slice(480, -480).filter((v) => Math.abs(v - 2000) > 2)).toEqual([]);
   });
 
   it('a pending choice that fails before audio: the fallback speaks that line once, the choice stays active', async () => {
