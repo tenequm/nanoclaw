@@ -76,10 +76,9 @@ export interface TranscriberOptions {
   onInterim(text: string): void;
   log: Pick<Console, 'info' | 'warn'>;
   socket?: (url: string) => LiveSocket;
-  now?: () => number;
   /**
-   * VOICE_MODE_TRANSCRIPT_DEBUG: log every raw message, what was forwarded, the activity's start, end,
-   * audio (per second) and hand-overs, as `voice-mode.transcript-debug` lines. Observation only.
+   * VOICE_MODE_TRANSCRIPT_DEBUG: log every raw message, what was forwarded, the activity's start, end
+   * and hand-overs, as `voice-mode.transcript-debug` lines. Observation only.
    */
   debug?: boolean;
 }
@@ -110,10 +109,6 @@ interface Activity {
   /** Numbered for the debug log, and when it began (monotonic ms). */
   n: number;
   t0: number;
-  /** The debug log's audio tally for the current second of the activity. */
-  tally?: { second: number; chunks: number; samples: number; peak: number };
-  /** Audio sent so far, in samples, for the debug log. */
-  sentSamples: number;
   /** Text of sockets this activity outlived, in order (a slot fills when a handed-over socket drained). */
   kept: string[];
   part: Part;
@@ -192,11 +187,9 @@ export class GeminiLiveTranscriber {
   private closed = false;
   private activities = 0;
   private socketIds = 0;
-  private readonly now: () => number;
   private readonly chunkMax: number;
 
   constructor(private readonly opts: TranscriberOptions) {
-    this.now = opts.now ?? (() => Date.now());
     this.chunkMax = Math.round((opts.sampleRate * CHUNK_MS) / 1000);
   }
 
@@ -216,7 +209,6 @@ export class GeminiLiveTranscriber {
     const activity: Activity = {
       n: ++this.activities,
       t0: performance.now(),
-      sentSamples: 0,
       kept: [],
       part: { finals: [], interim: '' },
       heard: '',
@@ -244,7 +236,7 @@ export class GeminiLiveTranscriber {
   push(pcm: Int16Array): void {
     const activity = this.activity;
     if (!activity || activity.failed) return;
-    if (activity.socket && this.now() >= activity.socket.retireAt) this.handOver(activity, 'age');
+    if (activity.socket && Date.now() >= activity.socket.retireAt) this.handOver(activity, 'age');
     this.queue(activity, pcm);
     this.pump(activity);
   }
@@ -255,7 +247,7 @@ export class GeminiLiveTranscriber {
     if (!activity) return Promise.resolve({ interim: '', finals: 0, failed: false, finalizeMs: 0 });
     this.activity = undefined;
     activity.ending = true;
-    activity.endedAt = this.now();
+    activity.endedAt = Date.now();
     this.ending.add(activity);
     const heard = new Promise<Heard>((resolve) => (activity.resolve = resolve));
     if (activity.failed && !activity.socket) this.settle(activity);
@@ -328,8 +320,8 @@ export class GeminiLiveTranscriber {
     if (!socket || !activity.started || socket.closed || activity.endSent) return;
     while (activity.queued.length) {
       if ((socket.ws.bufferedAmount ?? 0) > SEND_HIGH_WATER) {
-        activity.stallSince ||= this.now();
-        if (this.now() - activity.stallSince > STALL_MS) return this.handOver(activity, 'stall');
+        activity.stallSince ||= Date.now();
+        if (Date.now() - activity.stallSince > STALL_MS) return this.handOver(activity, 'stall');
         activity.drainTimer = setTimeout(() => this.pump(activity), DRAIN_RETRY_MS);
         return;
       }
@@ -366,7 +358,6 @@ export class GeminiLiveTranscriber {
     activity.chunkSamples = 0;
     const data = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString('base64');
     this.send(socket, { realtimeInput: { audio: { data, mimeType: `audio/pcm;rate=${this.opts.sampleRate}` } } });
-    if (this.opts.debug) this.tallyAudio(activity, pcm);
   }
 
   /**
@@ -379,8 +370,7 @@ export class GeminiLiveTranscriber {
     this.flush(activity);
     activity.endSent = true;
     this.send(socket, { realtimeInput: { activityEnd: {} } });
-    this.debugAudio(activity);
-    this.debug('activityEnd', activity, { sid: socket.id, sentMs: this.ms(activity.sentSamples) });
+    this.debug('activityEnd', activity, { sid: socket.id });
     clearTimeout(activity.timer);
     activity.timer = setTimeout(() => {
       this.opts.log.warn('voice-mode worker: no final transcript in time; the turn keeps its interim text');
@@ -402,17 +392,9 @@ export class GeminiLiveTranscriber {
     const old = activity.socket;
     if (!old) return;
     this.opts.log.info('voice-mode worker: the transcription moves to a fresh socket mid-turn', { why });
-    this.debugAudio(activity);
-    this.debug('handover', activity, { why, sid: old.id, sentMs: this.ms(activity.sentSamples) });
-    clearTimeout(activity.drainTimer);
-    this.requeueChunk(activity);
-    activity.socket = undefined;
-    activity.started = false;
-    activity.endSent = false;
+    this.debug('handover', activity, { why, sid: old.id });
+    const { part, slot } = this.detach(activity);
     activity.stallSince = 0;
-    const part = activity.part;
-    activity.part = { finals: [], interim: '' };
-    const slot = activity.kept.push(partText(part)) - 1;
     activity.draining++;
     let done = false;
     let grace: ReturnType<typeof setTimeout> | undefined;
@@ -444,25 +426,29 @@ export class GeminiLiveTranscriber {
     void this.attach(activity, this.connect());
   }
 
-  /** The chunk not sent yet goes back to the front of the queue, for the next socket. */
-  private requeueChunk(activity: Activity): void {
+  /**
+   * The activity leaves its socket: the chunk not sent yet goes back to the front of the queue, for
+   * the next socket, and the socket's text keeps its place in `kept` (at `slot`).
+   */
+  private detach(activity: Activity): { part: Part; slot: number } {
+    clearTimeout(activity.drainTimer);
     activity.queued.unshift(...activity.chunk);
     activity.queuedSamples += activity.chunkSamples;
     activity.chunk = [];
     activity.chunkSamples = 0;
+    activity.socket = undefined;
+    activity.started = false;
+    activity.endSent = false;
+    const part = activity.part;
+    activity.part = { finals: [], interim: '' };
+    return { part, slot: activity.kept.push(partText(part)) - 1 };
   }
 
   /** The activity's socket closed under it: keep its words, and go on in a fresh one. */
   private lost(activity: Activity, socket: Socket): void {
     if (activity.socket !== socket) return;
     this.debug('lost', activity, { sid: socket.id, ending: activity.ending });
-    activity.socket = undefined;
-    activity.started = false;
-    activity.endSent = false;
-    clearTimeout(activity.drainTimer);
-    this.requeueChunk(activity);
-    activity.kept.push(partText(activity.part));
-    activity.part = { finals: [], interim: '' };
+    this.detach(activity);
     if (activity.ending) return this.settle(activity);
     this.opts.log.warn('voice-mode worker: the transcription socket closed mid-turn; the turn goes on in a fresh one');
     void this.attach(activity, this.connect());
@@ -526,21 +512,19 @@ export class GeminiLiveTranscriber {
       interim: activity.heard || this.text(activity),
       finals: finals.length,
       failed: activity.failed,
-      finalizeMs: activity.endedAt ? this.now() - activity.endedAt : 0,
+      finalizeMs: activity.endedAt ? Date.now() - activity.endedAt : 0,
     };
     this.debug('settle', activity, { ...heard });
     resolve(heard);
   }
 
-  private connect(): Promise<Socket | undefined> {
-    return (async () => {
-      for (let attempt = 0; attempt < CONNECT_TRIES && !this.closed; attempt++) {
-        if (attempt > 0) await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS));
-        const socket = await this.open();
-        if (socket) return socket;
-      }
-      return undefined;
-    })();
+  private async connect(): Promise<Socket | undefined> {
+    for (let attempt = 0; attempt < CONNECT_TRIES && !this.closed; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS));
+      const socket = await this.open();
+      if (socket) return socket;
+    }
+    return undefined;
   }
 
   private open(): Promise<Socket | undefined> {
@@ -558,7 +542,7 @@ export class GeminiLiveTranscriber {
       ws,
       ready: false,
       closed: false,
-      retireAt: this.now() + SOCKET_MAX_AGE_MS,
+      retireAt: Date.now() + SOCKET_MAX_AGE_MS,
     };
     this.sockets.add(socket);
     return new Promise((resolve) => {
@@ -599,7 +583,7 @@ export class GeminiLiveTranscriber {
         }
         if (msg.goAway !== undefined) {
           const left = parseDuration(msg.goAway?.timeLeft);
-          socket.retireAt = Math.min(socket.retireAt, this.now() + Math.max(0, left - GO_AWAY_MARGIN_MS));
+          socket.retireAt = Math.min(socket.retireAt, Date.now() + Math.max(0, left - GO_AWAY_MARGIN_MS));
         }
         if (msg.serverContent) socket.onContent?.(msg.serverContent);
       };
@@ -634,24 +618,6 @@ export class GeminiLiveTranscriber {
       ...(content.generationComplete ? { generationComplete: true } : {}),
       keys: Object.keys(content),
     });
-  }
-
-  /** The audio sent, tallied per second of the activity; a new second logs the last one. */
-  private tallyAudio(activity: Activity, pcm: Int16Array): void {
-    const second = Math.floor((performance.now() - activity.t0) / 1000);
-    if (activity.tally && activity.tally.second !== second) this.debugAudio(activity);
-    const tally = (activity.tally ??= { second, chunks: 0, samples: 0, peak: 0 });
-    tally.chunks++;
-    tally.samples += pcm.length;
-    for (const sample of pcm) tally.peak = Math.max(tally.peak, Math.abs(sample));
-    activity.sentSamples += pcm.length;
-  }
-
-  private debugAudio(activity: Activity): void {
-    const tally = activity.tally;
-    if (!tally) return;
-    activity.tally = undefined;
-    this.debug('audio', activity, { ...tally, sentMs: this.ms(activity.sentSamples) });
   }
 
   private ms(samples: number): number {

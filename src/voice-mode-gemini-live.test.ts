@@ -90,7 +90,6 @@ function harness(vocabulary = ['Andy', 'send it', 'прийом'], debug = false
       sockets.push(socket);
       return socket;
     },
-    now: () => Date.now(),
     ...(debug ? { debug } : {}),
   });
   const result = (p: Promise<Heard>) => {
