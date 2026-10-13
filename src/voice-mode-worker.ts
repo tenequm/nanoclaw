@@ -221,6 +221,13 @@ export class HostLink {
     });
   }
 
+  /** Post and drop the response body; null when the host could not be reached. */
+  async tell(path: 'joined' | 'ended', body: Record<string, unknown> = {}): Promise<Response | null> {
+    const res = await this.post(path, body).catch(() => null);
+    await res?.body?.cancel().catch(() => undefined);
+    return res;
+  }
+
   /** Read the host's event stream until it ends; rejects when it fails or goes silent. */
   async events(onEvent: (event: LiveKitHostEvent) => void, signal: AbortSignal): Promise<void> {
     const controller = new AbortController();
@@ -4395,10 +4402,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const abandon = async (reason: string, fields: Record<string, unknown> = {}): Promise<void> => {
     log.warn('voice-mode worker: ending the call', { ...callFields, ...fields, reason });
     telemetry.ended(reason);
-    await link
-      ?.post('ended', { reason })
-      .then((res) => res.body?.cancel())
-      .catch(() => undefined);
+    await link?.tell('ended', { reason });
     await ctx.deleteRoom().catch(() => undefined);
     ctx.shutdown(reason);
   };
@@ -4464,8 +4468,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   } catch (err) {
     return abandon((err as Error).message);
   }
-  const joined = await host.post('joined').catch(() => null);
-  void joined?.body?.cancel().catch(() => {});
+  const joined = await host.tell('joined');
   // The host starts billing here; without its yes, nothing is published or transcribed.
   if (!joined?.ok) return abandon(`host refused the call (${joined?.status ?? 'unreachable'})`, { hostUrl });
 
@@ -4640,11 +4643,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     // The host link stays open until the host answered: closed first, it ends the call on its own
     // and answers this at once, before the room carries why the call ended.
     await Promise.all([
-      tellHost &&
-        host
-          .post('ended', restart ? { reason, restart } : { reason })
-          .then((res) => res.body?.cancel())
-          .catch(() => undefined),
+      tellHost && host.tell('ended', restart ? { reason, restart } : { reason }),
       callVoice?.close().catch(() => undefined),
       // Before the job exits: a process leaving with the wake word thread mid-inference aborts.
       spotter?.close().catch(() => undefined),
