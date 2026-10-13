@@ -4,9 +4,10 @@ Retired 2026-10-09: env-backed `voice:` lines and the `voice` compatibility
 adapter are gone; every line is a `voice_mode_lines` row. What this runbook says
 about env-backed links, saved links and the `voice` adapter describes the
 protocol 4 cutover only: a current build reads no link token from `.env`, so
-make each such line a row before upgrading, and its
-`module:voice-mode:drop-legacy-lines` migration drops `voice_lines` and
-`voice_line_owners` (see Rollback).
+make each such line a row before upgrading. The `voice_lines` and
+`voice_line_owners` tables are gone too: builds from 2026-10-09 dropped them
+with the `module:voice-mode:drop-legacy-lines` migration, and a current build
+neither creates nor reads them (see Rollback).
 
 This is an operator runbook. Building the fork's main branch performs no server
 actions. Use the complete fork build, with matching host and worker. Update
@@ -361,9 +362,9 @@ and switch the native app to the build that speaks protocol 4. Keep the same
 public front.
 
 The `voice_mode_lines` table is additive, so an old main build can ignore it,
-but `module:voice-mode:drop-legacy-lines` drops the `voice_lines` and
-`voice_line_owners` tables a build from before it needs: rolling back past that
-migration takes the stopped DB snapshot from before it. Otherwise prefer
+but the `voice_lines` and `voice_line_owners` tables a build from before
+2026-10-09 needs were dropped: rolling back past that takes the stopped DB
+snapshot from before the drop. Otherwise prefer
 keeping the current DB to preserve messages created after cutover; restore the
 stopped DB snapshot only for a DB failure or a deliberate full-state rollback,
 which discards later changes. Back up current state before restoring it.

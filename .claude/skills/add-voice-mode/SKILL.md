@@ -49,7 +49,6 @@ src/channels/voice-mode-call-session.test.ts
 src/channels/voice-mode-command.test.ts
 src/channels/voice-mode-command.ts
 src/channels/voice-mode-line-roles.test.ts
-src/channels/voice-mode-line.test.ts
 src/channels/voice-mode-line.ts
 src/channels/voice-mode-livekit.test.ts
 src/channels/voice-mode-livekit.ts
@@ -84,10 +83,7 @@ src/voice-mode-wakeword-fixtures/negative.wav
 src/voice-mode-wakeword-fixtures/positive.wav
 ```
 
-The `voice_mode_lines` table registers its own named migration through core.
-Its `module:voice-mode:drop-legacy-lines` migration drops the `voice_lines`
-and `voice_line_owners` tables from before the voice-mode rename: every line
-is a `voice_mode_lines` row.
+The `voice_mode_lines` table registers its own named migrations through core.
 
 Append `import './voice-mode.js';` to `src/channels/index.ts` once:
 

@@ -300,18 +300,6 @@ export async function createVoiceModeLine(
 }
 
 registerMigration({
-  version: 3,
-  name: 'module:voice-mode:drop-legacy-lines',
-  async up(db) {
-    // Every line is a voice_mode_lines row; core's 027 still creates the old tables on a fresh DB, and this runs after it.
-    await db.exec(`
-      DROP TABLE IF EXISTS voice_line_owners;
-      DROP TABLE IF EXISTS voice_lines;
-    `);
-  },
-});
-
-registerMigration({
   version: 4,
   name: 'module:voice-mode:lines-tts-concrete',
   async up(db) {
