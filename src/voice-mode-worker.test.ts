@@ -50,7 +50,6 @@ import {
   LineSpeech,
   lineResampler,
   MAX_IDLE_WAIT_MS,
-  parseJobMetadata,
   pathSegment,
   pruneRecordings,
   readJobHeader,
@@ -664,10 +663,11 @@ describe('local turn detector process', () => {
 
 describe('job metadata', () => {
   it('takes only a voice call of this version as a call to run', () => {
-    expect(() => parseJobMetadata('{}')).toThrow();
-    expect(() => parseJobMetadata('not json')).toThrow();
-    expect(() => parseJobMetadata(JSON.stringify({ ...META, v: 2 }))).toThrow();
-    expect(parseJobMetadata(JSON.stringify(META)).callId).toBe('call-1');
+    expect(() => readJobHeader('{}')).toThrow();
+    expect(() => readJobHeader('not json')).toThrow();
+    expect(readJobHeader(JSON.stringify({ ...META, v: 2 })).call).toBeUndefined();
+    expect(readJobHeader(JSON.stringify({ ...META, agentName: '' })).call).toBeUndefined();
+    expect(readJobHeader(JSON.stringify(META)).call).toEqual(META);
   });
 
   it('reads enough of any version to answer it', () => {

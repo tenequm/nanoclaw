@@ -3522,26 +3522,29 @@ function readTtsRequest(raw: unknown): NonNullable<ReviewRequest['tts']> {
   return { provider, ...(model != null ? { model } : {}), ...(voice != null ? { voice } : {}) };
 }
 
-/** The fields every job carries whatever its version, enough to answer a mismatched one. */
-export function readJobHeader(raw: string): { v: unknown; callId: string; callerIdentity: string; agentName?: string } {
+/**
+ * The fields every job carries whatever its version, enough to answer a mismatched one; `call`, the
+ * whole metadata, only when it is a call of this version.
+ */
+export function readJobHeader(raw: string): {
+  v: unknown;
+  callId: string;
+  callerIdentity: string;
+  agentName?: string;
+  call?: LiveKitJobMetadata;
+} {
   const meta = JSON.parse(raw) as Record<string, unknown> | null;
   if (!meta || typeof meta.callId !== 'string' || !meta.callId || typeof meta.callerIdentity !== 'string') {
     throw new Error('voice-mode worker: job metadata is not a NanoClaw voice call');
   }
+  const current = meta.v === LIVEKIT_PROTOCOL_VERSION && meta.callerIdentity && meta.agentName;
   return {
     v: meta.v,
     callId: meta.callId,
     callerIdentity: meta.callerIdentity,
     agentName: typeof meta.agentName === 'string' && meta.agentName ? meta.agentName : undefined,
+    ...(current ? { call: meta as unknown as LiveKitJobMetadata } : {}),
   };
-}
-
-export function parseJobMetadata(raw: string): LiveKitJobMetadata {
-  const meta = JSON.parse(raw) as LiveKitJobMetadata;
-  if (meta?.v !== LIVEKIT_PROTOCOL_VERSION || !meta.callId || !meta.callerIdentity || !meta.agentName) {
-    throw new Error('voice-mode worker: job metadata is not a NanoClaw voice call of this version');
-  }
-  return meta;
 }
 
 const withTimeout = <T>(promise: Promise<T>, ms: number, message: string): Promise<T> =>
@@ -4437,12 +4440,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     await sleep(MISMATCH_NOTICE_MS);
     return abandon(`protocol mismatch: host sent v${String(header.v)}, worker speaks v${LIVEKIT_PROTOCOL_VERSION}`);
   }
-  let meta: LiveKitJobMetadata;
-  try {
-    meta = parseJobMetadata(ctx.job.metadata);
-  } catch (err) {
-    return abandon((err as Error).message);
-  }
+  const meta = header.call;
+  if (!meta) return abandon('voice-mode worker: job metadata is not a NanoClaw voice call of this version');
   const geminiKey = deps.env.VOICE_MODE_GEMINI_API_KEY;
   if (!geminiKey) return abandon('VOICE_MODE_GEMINI_API_KEY is not set for the worker');
   const providerKeys = providerKeysFrom(deps.env);
