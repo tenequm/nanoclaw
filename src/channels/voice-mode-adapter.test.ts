@@ -10,11 +10,19 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/** The host key; null as on a host without one. */
+const hostKey = vi.hoisted(() => ({ value: null as Buffer | null }));
+vi.mock('../secret-seal.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../secret-seal.js')>()),
+  encryptionKey: () => hostKey.value,
+}));
 
 import { closeDb, getDb, initTestDb, runMigrations } from '../db/index.js';
 import { createAgentGroup } from '../db/agent-groups.js';
-import { mintVoiceModeLine } from '../db/voice-mode-lines.js';
+import { getVoiceModeLineForAgent, mintVoiceModeLine, openVoiceModeLink } from '../db/voice-mode-lines.js';
 import { createUser } from '../modules/permissions/db/users.js';
 import { grantRole, revokeRole } from '../modules/permissions/db/user-roles.js';
 import { TTS_DEFAULT_CHOICE } from '../voice-mode-tts.js';
@@ -372,6 +380,19 @@ describe('line voice routes (real handleHttp, real central DB)', () => {
       expect(res.status).toBe(403);
       expect(await res.text()).toBe('Unknown call link');
     }
+  });
+
+  it('seals a link made before links were stored when it next opens the line, and only with a key', async () => {
+    hostKey.value = null;
+    expect((await tts()).status).toBe(200);
+    expect((await getVoiceModeLineForAgent('ag-1'))?.link_sealed).toBeNull();
+    hostKey.value = randomBytes(32);
+    expect((await tts('GET', undefined, 'f'.repeat(32))).status).toBe(403);
+    expect((await getVoiceModeLineForAgent('ag-1'))?.link_sealed).toBeNull();
+    expect((await tts()).status).toBe(200);
+    const line = (await getVoiceModeLineForAgent('ag-1'))!;
+    expect(await openVoiceModeLink(line, hostKey.value)).toEqual({ token });
+    hostKey.value = null;
   });
 
   it("answers the line's saved and effective voice with their names, saves a pick and resets it", async () => {

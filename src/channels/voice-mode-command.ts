@@ -1,16 +1,17 @@
 /**
  * `/voice` (on Slack `!voice`, since Slack's client eats unknown slash commands), run in a chat
- * wired to an agent by someone core grants an owner or admin role over that agent, makes this chat
- * (and thread) the chat the agent's calls talk in. The first run creates the agent's voice line,
- * mints its call link and sends it to the sender, who becomes the line's caller; later runs only
- * move the call chat, so the link and any live call stay. `/voice new` mints a fresh link instead:
- * only the hash is stored, so a lost link cannot be shown again, and re-minting is how a lost or
- * leaked one is replaced (a call made with the old link ends).
+ * wired to an agent by someone core grants an owner or admin role over that agent, shows the
+ * sender their call link for each such agent and makes this chat (and thread) the chat its calls
+ * talk in. The first run creates the agent's line and makes the sender its caller; later runs by
+ * the caller show the same link again (sealed under the host key, see src/secret-seal.ts) and end
+ * no call. A line is shown and moved only by its caller: another admin is told whose it is.
+ * `/voice new` re-mints the caller's own link, which ends a call made with the old one.
  *
  * A message interceptor, so the command never reaches an agent's session: the link is the line's
- * credential. In a direct chat the reply carries it; in a group chat it goes to the sender's direct
- * chat, so the other members never see it. A known sender without the role is refused; an unknown
- * sender or an unwired chat gets nothing.
+ * credential. In a direct chat the reply carries it. In a group it goes only to the sender: a
+ * private reply in the chat where the channel has one (Telegram's ephemeral messages), else their
+ * direct chat. A known sender without the role is refused; an unknown sender or an unwired chat
+ * gets nothing.
  */
 import type { InboundEvent } from './adapter.js';
 import { wiringThreadsEnabled } from './channel-defaults.js';
@@ -22,12 +23,14 @@ import {
   createVoiceModeLine,
   getVoiceModeLineForAgent,
   mintVoiceModeLine,
+  openVoiceModeLink,
 } from '../db/voice-mode-lines.js';
 import { log } from '../log.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { getUser } from '../modules/permissions/db/users.js';
 import { ensureUserDm } from '../modules/permissions/user-dm.js';
 import { registerMessageInterceptor } from '../router.js';
+import { encryptionKey } from '../secret-seal.js';
 import type { MessagingGroup } from '../types.js';
 import type { VoiceModeChannelAdapter } from './voice-mode.js';
 import { VOICE_MODE_CHANNEL } from './voice-mode-line.js';
@@ -44,16 +47,6 @@ const liveAdapter = () => getChannelAdapterExact(VOICE_MODE_CHANNEL) as VoiceMod
 function liveCallUrl(): CallUrlFn | null {
   const adapter = liveAdapter();
   return adapter ? (token) => adapter.callUrl(token) : null;
-}
-
-/** Whether /voice from this sender would mint a link: `new`, or an administered agent without a line yet. */
-async function mintsLink(mg: MessagingGroup, userId: string, renew: boolean): Promise<boolean> {
-  if (!(await getUser(userId))) return false;
-  for (const wiring of await getMessagingGroupAgents(mg.id)) {
-    if (!(await hasAdminPrivilege(userId, wiring.agent_group_id))) continue;
-    if (renew || !(await getVoiceModeLineForAgent(wiring.agent_group_id))) return true;
-  }
-  return false;
 }
 
 function messageText(content: string): string {
@@ -92,11 +85,20 @@ export function senderUserId(event: InboundEvent): string | null {
   return handle.includes(':') ? handle : `${event.channelType}:${handle}`;
 }
 
-/** What /voice did for one agent of the chat: a new link, the call chat moved, or nothing. */
+/** Why /voice shows no link for one agent. */
+export type VoiceNoLinkReason =
+  | 'voice-unavailable'
+  | 'no-key'
+  | 'other-caller'
+  /** A link minted before links were sealed; the next call made with it seals it. */
+  | 'unsealed'
+  /** The sealed link does not open with this host's key. */
+  | 'unreadable';
+
+/** What /voice did for one agent of the chat: the sender's link, or why there is none. */
 export type VoiceTargetResult =
-  | { ok: true; agentName: string; link: string; replaced: boolean }
-  | { ok: true; agentName: string; rebound: true }
-  | { ok: false; agentName: string; reason: 'voice-unavailable' | 'other-caller' };
+  | { ok: true; agentGroupId: string; agentName: string; link: string; replaced: boolean }
+  | { ok: false; agentGroupId: string; agentName: string; reason: VoiceNoLinkReason; caller?: string };
 
 /** What /voice did in a chat: nothing to say (unknown sender), a refusal, or one result per agent. */
 export type VoiceCommandOutcome =
@@ -104,140 +106,150 @@ export type VoiceCommandOutcome =
   | { kind: 'refused' }
   | { kind: 'done'; results: VoiceTargetResult[] };
 
+export interface VoiceRunOptions {
+  /** The call page URL of a token; null when the voice-mode channel is not running here. */
+  callUrl?: CallUrlFn | null;
+  /** `/voice new`: re-mint the sender's own links. */
+  renew?: boolean;
+  /** The host key sealing links; null when it is not set up. */
+  key?: Buffer | null;
+  /** Only these agents (re-minting links that went where they should not). */
+  agentGroupIds?: ReadonlySet<string>;
+}
+
 /**
  * /voice over a chat's wired agents: unknown senders are dropped silently, known senders without
- * an owner or admin role over any of them are refused, and for every agent the sender administers
- * this chat becomes its line's call chat. An agent without a line gets one with a fresh link; a
- * line only its caller moves, so another admin's call never starts talking in their chat. With
- * `renew` (`/voice new`) the line's link is re-minted for the sender, which ends a call made with
- * the old one.
+ * an owner or admin role over any of them are refused. For every agent the sender administers: a
+ * new line with this chat as its call chat, or, on the sender's own line, this chat as its call chat
+ * and its link shown again (a fresh one with `renew`). Another caller's line is left alone, and
+ * without a key nothing is minted or shown.
  */
 export async function runVoiceCommand(
   mg: MessagingGroup,
   threadId: string | null,
   userId: string | null,
-  callUrl: CallUrlFn | null = liveCallUrl(),
-  renew = false,
+  { callUrl = liveCallUrl(), renew = false, key = encryptionKey(), agentGroupIds }: VoiceRunOptions = {},
 ): Promise<VoiceCommandOutcome> {
   if (!userId || !(await getUser(userId))) return { kind: 'drop' };
   const wirings = await getMessagingGroupAgents(mg.id);
   if (wirings.length === 0) return { kind: 'drop' };
   const results: VoiceTargetResult[] = [];
   for (const wiring of wirings) {
+    if (agentGroupIds && !agentGroupIds.has(wiring.agent_group_id)) continue;
     if (!(await hasAdminPrivilege(userId, wiring.agent_group_id))) continue;
     const ag = await getAgentGroup(wiring.agent_group_id);
     if (!ag) continue;
-    // A host without the channel must not rotate a working link away.
-    if (!callUrl) {
-      results.push({ ok: false, agentName: ag.name, reason: 'voice-unavailable' });
+    const agent = { agentGroupId: ag.id, agentName: ag.name };
+    const noLink = (reason: VoiceNoLinkReason, caller?: string): VoiceTargetResult => ({
+      ok: false,
+      ...agent,
+      reason,
+      ...(caller ? { caller } : {}),
+    });
+    // A host without the channel or the key must not mint, rotate or move anything.
+    if (!callUrl || !key) {
+      results.push(noLink(callUrl ? 'no-key' : 'voice-unavailable'));
       continue;
     }
     // None when the wiring keeps no threads, else the one /voice was run in.
     const callThread = threadId !== null && wiringThreadsEnabled(wiring, mg) ? threadId : null;
-    const current = await getVoiceModeLineForAgent(ag.id);
-    /** This chat becomes the line's call chat if the sender is its caller; otherwise the line is another admin's. */
-    const bindHere = async (): Promise<VoiceTargetResult> => {
-      const moved = await bindVoiceModeLineChat({
-        agentGroupId: ag.id,
-        callerUserId: userId,
-        messagingGroupId: mg.id,
-        threadId: callThread,
-      });
-      if (!moved) return { ok: false, agentName: ag.name, reason: 'other-caller' };
-      log.info('Voice mode call chat moved via /voice', {
-        agentGroupId: ag.id,
-        line: moved.line_id,
-        messagingGroupId: mg.id,
-        threadId: callThread,
-        userId,
-      });
-      return { ok: true, agentName: ag.name, rebound: true };
-    };
-    if (!renew && current) {
-      results.push(await bindHere());
-      continue;
-    }
-    const replaced = renew && current !== undefined;
     const target = { agentGroupId: ag.id, ownerUserId: userId, messagingGroupId: mg.id, threadId: callThread };
-    // A plain run only creates a line: one another run created meanwhile keeps the link it handed out.
-    const minted = renew ? await mintVoiceModeLine(target) : await createVoiceModeLine(target);
-    if (!minted) {
-      results.push(await bindHere());
+    const minted = (token: string, lineId: string, replaced: boolean): VoiceTargetResult => {
+      log.info('Voice mode link minted via /voice', { ...target, line: lineId, replaced });
+      return { ok: true, ...agent, link: callUrl(token), replaced };
+    };
+    // A plain run only creates a line: one another run created meanwhile keeps its caller and link.
+    const created = (await getVoiceModeLineForAgent(ag.id)) ? undefined : await createVoiceModeLine(target, key);
+    if (created) {
+      results.push(minted(created.token, created.line.line_id, false));
       continue;
     }
-    const { line, token } = minted;
-    log.info('Voice mode link minted via /voice', {
+    const line = await bindVoiceModeLineChat({
       agentGroupId: ag.id,
-      line: line.line_id,
+      callerUserId: userId,
       messagingGroupId: mg.id,
       threadId: callThread,
-      replaced,
-      userId,
     });
-    results.push({ ok: true, agentName: ag.name, link: callUrl(token), replaced });
+    if (!line) {
+      const owner = (await getVoiceModeLineForAgent(ag.id))?.owner_user_id;
+      results.push(noLink('other-caller', owner ? ((await getUser(owner))?.display_name ?? undefined) : undefined));
+      continue;
+    }
+    log.info('Voice mode call chat set via /voice', { ...target, line: line.line_id });
+    if (renew) {
+      const fresh = await mintVoiceModeLine(target, key);
+      results.push(minted(fresh.token, fresh.line.line_id, true));
+      continue;
+    }
+    const opened = await openVoiceModeLink(line, key);
+    results.push(
+      'token' in opened ? { ok: true, ...agent, link: callUrl(opened.token), replaced: false } : noLink(opened.missing),
+    );
   }
   return results.length > 0 ? { kind: 'done', results } : { kind: 'refused' };
 }
 
-const UNAVAILABLE = 'Voice calls are off on this host (the voice-mode channel is not configured).';
-const NEW_LINK_NOTE = 'Any earlier link no longer works.';
-const boundNote = (cmd: string) => `Calls now talk in this chat, until ${cmd} is run in another one.`;
-const lostLinkNote = (cmd: string) => `Lost the link? Send ${cmd} new for a fresh one (the old one stops working).`;
-
 /** The command as the sender types it: Slack's client eats unknown slash commands. */
 export const voiceCommandName = (channelType: string): string => (BANG_CHANNELS.has(channelType) ? '!voice' : '/voice');
 
-/** The call links /voice hands out, one line each; they are credentials, so they go to the sender only. */
+/** The call links in an outcome, one line each; they are credentials, so they go to the sender only. */
 export function voiceLinkLines(outcome: VoiceCommandOutcome): string[] {
   if (outcome.kind !== 'done') return [];
-  return outcome.results.flatMap((r) => ('link' in r ? [`🎙 Talk to ${r.agentName}: ${r.link}`] : []));
+  return outcome.results.flatMap((r) => (r.ok ? [`🎙 Talk to ${r.agentName}: ${r.link}`] : []));
 }
 
-/** What the chat hears about agents whose call chat moved here, or stayed with another caller, links aside. */
-function chatLines(outcome: VoiceCommandOutcome, cmd: string): string[] {
-  if (outcome.kind !== 'done') return [];
-  const rebound = outcome.results.flatMap((r) => ('rebound' in r ? [r.agentName] : []));
-  const taken = outcome.results.flatMap((r) => (!r.ok && r.reason === 'other-caller' ? [r.agentName] : []));
-  return [
-    ...(rebound.length > 0 ? [`Calls with ${rebound.join(', ')} now talk in this chat. ${lostLinkNote(cmd)}`] : []),
-    ...(taken.length > 0
-      ? [
-          `Calls with ${taken.join(', ')} are on another admin's link, so they stay where they talk. Send ${cmd} new to take the line over (that link stops working).`,
-        ]
-      : []),
-  ];
+function noLinkLine(r: Extract<VoiceTargetResult, { ok: false }>, cmd: string): string {
+  const fresh = `send ${cmd} new for a fresh one (calls on the old link end)`;
+  switch (r.reason) {
+    case 'voice-unavailable':
+      return `${r.agentName}: voice calls are off on this host (the voice-mode channel is not configured).`;
+    case 'no-key':
+      return `${r.agentName}: call link storage is not set up on this host, so no link can be shown or made.`;
+    case 'other-caller':
+      return `${r.agentName}: this line is ${r.caller ?? 'another admin'}'s; only they can get its link or move its calls.`;
+    case 'unsealed':
+      return `${r.agentName}: calls now talk in this chat. Its link predates stored links: it shows here after its next call, or ${fresh}.`;
+    case 'unreadable':
+      return `${r.agentName}: calls now talk in this chat, but its stored link cannot be read on this host; ${fresh}.`;
+  }
 }
 
-const linkReplaced = (outcome: VoiceCommandOutcome): boolean =>
-  outcome.kind === 'done' && outcome.results.some((r) => 'link' in r && r.replaced);
-
-/** The /voice reply with the links, or null when the sender gets no answer. */
+/** The /voice reply, or null when the sender gets no answer. */
 export function voiceCommandReply(outcome: VoiceCommandOutcome, cmd = '/voice'): string | null {
   if (outcome.kind === 'drop') return null;
   if (outcome.kind === 'refused') return `Only an owner or admin of this agent can use ${cmd}.`;
   const links = voiceLinkLines(outcome);
-  const others = chatLines(outcome, cmd);
-  if (links.length > 0) {
-    const bound = boundNote(cmd);
-    return [...links, linkReplaced(outcome) ? `${bound} ${NEW_LINK_NOTE}` : bound, ...others].join('\n\n');
-  }
-  if (others.length > 0) return others.join('\n\n');
-  const several = outcome.results.length > 1;
-  return [...new Set(outcome.results.map((r) => (several ? `${r.agentName}: ${UNAVAILABLE}` : UNAVAILABLE)))].join(
-    '\n',
-  );
+  const notes = outcome.results.flatMap((r) => (r.ok ? [] : [noLinkLine(r, cmd)]));
+  const replaced = outcome.results.some((r) => r.ok && r.replaced);
+  const bound = `Calls talk in this chat, until ${cmd} is run in another one.${replaced ? ' Any earlier link no longer works.' : ''}`;
+  return [...links, ...(links.length > 0 ? [bound] : []), ...notes].join('\n\n');
 }
 
-const noDirectChat = (cmd: string) => `I cannot message you directly here: run ${cmd} in a direct chat with me.`;
-/** Only the hash is stored, so a lost link is only replaced by /voice new. */
-const undeliveredLink = (cmd: string) => `I could not deliver your call link; run ${cmd} new for a fresh link.`;
+/**
+ * Sends `text` so only the sender sees it, in the chat the command came from: `sent`, `unavailable`
+ * (nothing was posted; fall back to the direct chat) or `public` (it was posted for everyone and
+ * then deleted, so the links in it must be replaced).
+ */
+export type PrivateReply = (text: string) => Promise<'sent' | 'unavailable' | 'public'>;
+
+const noDirectChat = (cmd: string) =>
+  `I cannot message you privately here: start a direct chat with me, then run ${cmd} again.`;
+const EXPOSED = 'The link I sent was visible to the whole chat, so it was replaced: calls made with it end.';
+
+/** An error's kind only: delivery errors can carry the request, and with it a call link. */
+const errorKind = (err: unknown): string =>
+  (err as { _tag?: string })?._tag ?? (err instanceof Error ? err.name : typeof err);
 
 /**
  * Claims every /voice message; the agents never see one. Runs on every inbound message, so anything
  * that cannot be /voice leaves before parsing; `callUrlFor` defaults to the live adapter's, looked up
- * only for a command.
+ * only for a command. `privateReply` is the chat's own sender-only reply, where the channel has one.
  */
-export async function handleVoiceCommand(event: InboundEvent, callUrlFor?: CallUrlFn | null): Promise<boolean> {
+export async function handleVoiceCommand(
+  event: InboundEvent,
+  callUrlFor?: CallUrlFn | null,
+  privateReply?: PrivateReply,
+): Promise<boolean> {
   if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') return false;
   if (!/voice/i.test(event.message.content)) return false;
   const command = parseVoiceCommand(messageText(event.message.content), event.channelType);
@@ -264,55 +276,66 @@ export async function handleVoiceCommand(event: InboundEvent, callUrlFor?: CallU
     });
     return true;
   }
-  /** Set while links are on their way: if delivery fails, the sender must hear the link is lost. */
-  let sendingLinks: VoiceCommandOutcome | null = null;
+  // Straight to the chat's adapter, never through a session: the agent must not hold the call link.
+  const say = (text: string) => adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
   try {
-    // In a group the link must reach the sender privately; without a direct chat nothing is minted.
-    let direct: { adapter: typeof adapter; platformId: string } | null = null;
-    if (mg.is_group !== 0 && callUrl && (await mintsLink(mg, userId, command.renew))) {
-      const dm = await ensureUserDm(userId, { privacySafeLogs: true, instance });
-      const dmAdapter = dm ? getChannelAdapterExact(dm.instance ?? dm.channel_type) : undefined;
-      if (!dm || !dmAdapter) {
-        await adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text: noDirectChat(cmd) } });
-        return true;
-      }
-      direct = { adapter: dmAdapter, platformId: dm.platform_id };
-    }
-    const outcome = await runVoiceCommand(mg, chatThread, userId, callUrl, command.renew);
-    const text = voiceCommandReply(outcome, cmd);
+    let outcome = await runVoiceCommand(mg, chatThread, userId, { callUrl, renew: command.renew });
+    let text = voiceCommandReply(outcome, cmd);
     if (text === null) {
       log.info('/voice from an unknown sender dropped', { channelType: event.channelType });
       return true;
     }
-    const links = voiceLinkLines(outcome);
-    if (links.length > 0) sendingLinks = outcome;
-    if (mg.is_group !== 0 && links.length > 0) {
-      // A link is a credential: in a group it only ever goes to the sender's direct chat.
-      const groupText = direct
-        ? [`${boundNote(cmd)} Your call link is in our direct chat.`, ...chatLines(outcome, cmd)].join('\n\n')
-        : noDirectChat(`${cmd} new`);
-      if (direct) {
-        const directText = [...links, ...(linkReplaced(outcome) ? [NEW_LINK_NOTE] : [])].join('\n\n');
-        await direct.adapter.deliver(direct.platformId, null, { kind: 'chat', content: { text: directText } });
-        sendingLinks = null;
-      }
-      await adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text: groupText } });
+    if (mg.is_group === 0) {
+      await say(text);
       return true;
     }
-    // Straight to the chat's adapter, never through a session: the agent must not hold the call link.
-    await adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
-    sendingLinks = null;
-  } catch (err) {
-    log.warn('/voice reply could not be delivered', { channelType: event.channelType, err });
-    if (sendingLinks) {
-      await adapter
-        .deliver(event.platformId, threadId, { kind: 'chat', content: { text: undeliveredLink(cmd) } })
-        .catch((notice: unknown) =>
-          log.warn('/voice could not say its link was lost', { channelType: event.channelType, err: notice }),
-        );
+    let exposed = false;
+    if (privateReply) {
+      const sent = await privateReply(text);
+      if (sent === 'sent') return true;
+      if (sent === 'public') {
+        const shown = outcome.kind === 'done' ? outcome.results.filter((r) => r.ok).map((r) => r.agentGroupId) : [];
+        exposed = shown.length > 0;
+        // A reply without a link held nothing secret: it is answered in the chat below, as when unavailable.
+        if (exposed) {
+          log.warn('/voice private reply was posted publicly; replacing its links', { channelType: event.channelType });
+          outcome = await runVoiceCommand(mg, chatThread, userId, {
+            callUrl,
+            renew: true,
+            agentGroupIds: new Set(shown),
+          });
+          text = [voiceCommandReply(outcome, cmd), EXPOSED].join('\n\n');
+        }
+      }
     }
+    if (voiceLinkLines(outcome).length === 0) {
+      await say(text);
+      return true;
+    }
+    // A link is a credential: in a group without a private reply it only goes to the sender's direct chat.
+    if (await sendDirect(userId, instance, text)) {
+      await say('Your call link is in our direct chat.');
+      return true;
+    }
+    await say(exposed ? `${EXPOSED} ${noDirectChat(cmd)}` : noDirectChat(cmd));
+  } catch (err) {
+    log.warn('/voice reply could not be delivered', { channelType: event.channelType, err: errorKind(err) });
   }
   return true;
+}
+
+/** Deliver to the user's direct chat; false when there is none or the send failed. */
+async function sendDirect(userId: string, instance: string, text: string): Promise<boolean> {
+  const dm = await ensureUserDm(userId, { privacySafeLogs: true, instance });
+  const dmAdapter = dm ? getChannelAdapterExact(dm.instance ?? dm.channel_type) : undefined;
+  if (!dm || !dmAdapter) return false;
+  try {
+    await dmAdapter.deliver(dm.platform_id, null, { kind: 'chat', content: { text } });
+    return true;
+  } catch (err) {
+    log.warn('/voice could not reach the direct chat', { channelType: dm.channel_type, err: errorKind(err) });
+    return false;
+  }
 }
 
 registerMessageInterceptor((event) => handleVoiceCommand(event));

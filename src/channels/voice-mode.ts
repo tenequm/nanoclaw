@@ -56,11 +56,13 @@ import {
   getVoiceModeLine,
   getVoiceModeLineForAgent,
   savedTts,
+  sealVoiceModeLink,
   setVoiceModeLineTts,
 } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
-import { handleVoiceCommand } from './voice-mode-command.js';
+import { handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
 import { readEnvFile } from '../env.js';
+import { encryptionKey } from '../secret-seal.js';
 import { log } from '../log.js';
 import { registerResidentSkillGate } from '../project-doc-compose.js';
 import { requestWake } from '../request-wake.js';
@@ -293,8 +295,8 @@ export async function findCallSession(
 export interface VoiceModeChannelAdapter extends ChannelAdapter {
   /** The call page URL for a link token. */
   callUrl(token: string): string;
-  /** `/voice` in a chat, with this adapter's call URLs (voice-mode-command.ts). */
-  handleVoiceCommand(event: InboundEvent): Promise<boolean>;
+  /** `/voice` in a chat, with this adapter's call URLs and the chat's own private reply (voice-mode-command.ts). */
+  handleVoiceCommand(event: InboundEvent, privateReply?: PrivateReply): Promise<boolean>;
 }
 
 export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChannelAdapter {
@@ -302,7 +304,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     config.lineForToken ??
     (async (token: string) => {
       const line = await findVoiceModeLineByToken(token);
-      return line ? linePlatformId(line.line_id) : null;
+      if (!line) return null;
+      const key = line.link_sealed === null ? encryptionKey() : null;
+      // Seals a link minted before links were stored, so /voice can show it again; never blocks the call.
+      if (key) await sealVoiceModeLink(line, token, key).catch(() => log.warn('voice-mode: link sealing failed'));
+      return linePlatformId(line.line_id);
     });
   const callUrl = (token: string): string =>
     `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}`;
@@ -648,7 +654,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     defaults: VOICE_MODE_DEFAULTS,
 
     callUrl,
-    handleVoiceCommand: (event: InboundEvent): Promise<boolean> => handleVoiceCommand(event, callUrl),
+    handleVoiceCommand: (event: InboundEvent, privateReply?: PrivateReply): Promise<boolean> =>
+      handleVoiceCommand(event, callUrl, privateReply),
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
