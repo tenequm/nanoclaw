@@ -4253,8 +4253,8 @@ async function roomVoice(
   const speechTrack = LocalAudioTrack.createAudioTrack(SPEECH_TRACK, speechSource);
   const speechPublication = await local.publishTrack(
     speechTrack,
-    // Hi-fi speech: DTX off so a line's first milliseconds are never spent waking the track, a set
-    // Opus bitrate instead of the default.
+    // Hi-fi speech: DTX off so a line's first milliseconds are never spent waking the track, and a
+    // 64 kbps Opus cap over the SDK's 48 kbps default. RED is the SDK default, kept explicit.
     new TrackPublishOptions({
       source: TrackSource.SOURCE_MICROPHONE,
       dtx: false,
