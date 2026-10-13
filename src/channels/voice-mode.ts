@@ -19,7 +19,7 @@
 import http from 'node:http';
 import net from 'node:net';
 
-import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundEvent, OutboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundEvent } from './adapter.js';
 import { wiringThreadsEnabled } from './channel-defaults.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import type { VoiceModeUiConfig } from './voice-mode-page.js';
@@ -31,12 +31,7 @@ import {
   type ResolveLineOptions,
   type VoiceModeLine,
 } from './voice-mode-line.js';
-import {
-  createLiveKitVoice,
-  parseLiveKitUtteranceId,
-  readJsonObject,
-  type LiveKitVoiceConfig,
-} from './voice-mode-livekit.js';
+import { createLiveKitVoice, readJsonObject, type LiveKitVoiceConfig } from './voice-mode-livekit.js';
 import { createVoiceCatalog, type VoiceCatalog } from './voice-mode-tts-catalog.js';
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
@@ -200,18 +195,6 @@ export function voiceRoute(pathname: string): string | null {
  * loopback-only, never admitted through a proxy.
  */
 const isWorkerRoute = (route: string): boolean => /^livekit\/agent(?:\/|$)/.test(route);
-
-/**
- * A voice line is DM-shaped: every caller turn is for the agent (pattern '.'),
- * there are no threads and no platform mention concept. The link token is the
- * credential: whoever holds the link is the line's caller. A call needs the
- * hashed-line table's caller to hold an owner or admin role over the agent.
- */
-const VOICE_MODE_DEFAULTS: ChannelDefaults = {
-  dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'strict' },
-  group: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'strict' },
-  mentions: 'dm-only',
-};
 
 export interface VoiceModeConfig {
   /** Origin the caller's browser reaches the host at (for the call link). */
@@ -649,7 +632,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     name: VOICE_MODE_CHANNEL,
     channelType: VOICE_MODE_CHANNEL,
     supportsThreads: false,
-    defaults: VOICE_MODE_DEFAULTS,
 
     callUrl,
     handleVoiceCommand: (event: InboundEvent, privateReply?: PrivateReply): Promise<boolean> =>
@@ -735,21 +717,9 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       return connected;
     },
 
-    async deliver(platformId: string, _threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
-      const content = message.content as { text?: unknown; type?: unknown } | string;
-      if (typeof content === 'object' && content?.type === 'ask_question') {
-        throw new Error('voice-mode: question cards are unsupported; ask the caller in plain text');
-      }
-      if (message.files?.length) throw new Error('voice-mode: attachments cannot be delivered over a voice call');
-      const text = typeof content === 'string' ? content : typeof content?.text === 'string' ? content.text : '';
-      const target = message.inReplyTo ? parseLiveKitUtteranceId(message.inReplyTo) : null;
-      const spoken = await livekit.deliver(platformId, target, message.inReplyTo, text);
-      if (!spoken) throw new Error('voice-mode: no active call on this line');
-      return spoken.id;
-    },
-
-    async setTyping(platformId: string): Promise<void> {
-      await livekit.setTyping(platformId);
+    async deliver(): Promise<string | undefined> {
+      // A line never takes inbound, so nothing is addressed to it: a call speaks what reaches its chat.
+      throw new Error('voice-mode: a voice line takes no messages; its calls talk in a chat');
     },
   };
 }
@@ -886,7 +856,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       },
     });
   },
-  defaults: VOICE_MODE_DEFAULTS,
 });
 
 // Call formatting reaches only agents that take calls: those with a voice_mode_lines row.

@@ -432,5 +432,5 @@ Remove via [REMOVE.md](REMOVE.md).
   native media/background support is outside this browser skill.
 - Slow first answer: prewarm needs an existing session; a first-ever chat turn
   still creates one. Idle containers can be reclaimed during a silent call.
-- No spoken reply after hangup: the voice line needs an active call. Use the
-  agent's ordinary chat for later delivery, files and question cards.
+- No spoken reply after hangup: only a live call speaks what reaches its chat;
+  later replies, files and question cards stay in the chat as written.

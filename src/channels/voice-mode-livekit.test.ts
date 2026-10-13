@@ -831,13 +831,21 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const second = await worker.utter('And the day after?');
     expect(second).not.toBe(id);
 
-    const interim = await h.adapter.deliver(LINE, null, {
-      kind: 'chat',
-      content: { text: 'Checking.' },
-      inReplyTo: msg.id,
-    });
-    expect(interim).toBe(msg.id);
-    await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Dentist at nine.' }, inReplyTo: msg.id });
+    // The agent answers in the call chat, naming the turn agent-scoped as delivery hands it over.
+    for (const text of ['Checking.', 'Dentist at nine.']) {
+      liveKitChatDelivered(
+        {
+          id: `out-${text.length}`,
+          kind: 'chat',
+          content: JSON.stringify({ text }),
+          channelType: 'telegram',
+          platformId: 'telegram:100',
+          threadId: null,
+          inReplyTo: `${msg.id}:ag-andy`,
+        },
+        'ag-andy',
+      );
+    }
     await worker.waitFor((e) => e.type === 'reply' && e.text === 'Dentist at nine.');
     // Both answer the first turn, and say so: the page labels them with it.
     expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
@@ -1036,43 +1044,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.inbound).toEqual([]);
   });
 
-  it('speaks proactive agent messages and tells the worker the agent is thinking', async () => {
-    const { worker } = await startCall(h);
-    const id = await h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Your taxi is here.' } });
-    expect(id).toMatch(/^livekit:.*:out-1$/);
-    // It answers no turn, so it carries none.
-    expect(await worker.waitFor((e) => e.type === 'reply')).toEqual({
-      type: 'reply',
-      text: 'Your taxi is here.',
-      turn: null,
-    });
-    await h.adapter.setTyping!(LINE, null);
-    await worker.waitFor((e) => e.type === 'thinking');
-    worker.close();
-  });
-
-  it('refuses question cards, attachments and a reply with no call, instead of reporting them delivered', async () => {
-    const card = { kind: 'chat', content: { type: 'ask_question', question: 'Which one?' } };
-    await expect(h.adapter.deliver(LINE, null, card)).rejects.toThrow('question cards are unsupported');
-    const file = { kind: 'chat', content: { text: 'Here.' }, files: [{ filename: 'a.txt', data: Buffer.from('a') }] };
-    await expect(h.adapter.deliver(LINE, null, file)).rejects.toThrow('attachments cannot be delivered');
+  it('takes no message addressed to the line itself', async () => {
     await expect(h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Hello?' } })).rejects.toThrow(
-      'no active call on this line',
+      'takes no messages',
     );
-  });
-
-  it('drops a reply for an ended call instead of speaking it into the next one', async () => {
-    const first = await startCall(h);
-    await first.worker.utter('old question');
-    const oldId = h.inbound[0].id;
-    const second = await startCall(h);
-    await expect(
-      h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'stale' }, inReplyTo: oldId }),
-    ).resolves.toBeUndefined();
-    await settle();
-    expect(second.worker.events.some((e) => e.type === 'reply')).toBe(false);
-    first.worker.close();
-    second.worker.close();
   });
 
   it('ends the call on hangup by deleting the room and tells the worker', async () => {
@@ -1393,17 +1368,6 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(joined.status).toBe(200);
     await new Promise((r) => setTimeout(r, 250));
     expect(h.lk.deleted).toEqual([h.lk.rooms[0]]);
-  });
-
-  it('refuses a delivery once the caller lost access instead of reporting it sent', async () => {
-    await h.stop();
-    h = await startHarness({ accessCheckIntervalMs: 60_000 });
-    const { worker } = await startCall(h);
-    h.access.enabled = false;
-    await expect(
-      h.adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'Your taxi is here.' } }),
-    ).rejects.toThrow(/revoked/);
-    await worker.streamClosed;
   });
 
   it('refuses a start over the daily minutes without ending the running call', async () => {

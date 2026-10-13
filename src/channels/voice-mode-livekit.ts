@@ -285,7 +285,6 @@ interface LiveKitCall {
   /** What became of each turn, by the worker's turn key; a retry gets the same answer. */
   turnOutcomes: Map<string, Promise<TurnOutcome>>;
   turnsInFlight: number;
-  sent: number;
   /** Where the call talks; null while it has none (the next turn ends the call). Refreshed on join and every turn. */
   chat: CallChat | null;
   /** Orders chat refreshes: only the latest one started may set `chat`. */
@@ -318,18 +317,6 @@ export interface LiveKitVoice {
     url: URL,
     lineForToken: (token: string) => Promise<string | null>,
   ): Promise<void>;
-  /**
-   * Speak an agent message on the line's LiveKit call. `target` is the parsed
-   * livekit reply id, if the message answers one. Returns null when no call runs
-   * on the line and the message answers no livekit turn: nothing could take it.
-   */
-  deliver(
-    platformId: string,
-    target: { callId: string; utteranceId: string } | null,
-    inReplyTo: string | undefined,
-    text: string,
-  ): Promise<{ id: string | undefined } | null>;
-  setTyping(platformId: string): Promise<void>;
   /** An agent message reached a chat: speak it on the live call that talks there. `replyTo`: the call turn it answers. */
   chatMessage(
     chat: ChatAddress,
@@ -341,8 +328,7 @@ export interface LiveKitVoice {
   speaksChat(chat: ChatAddress, agentGroupId: string, replyTo: { callId: string; utteranceId: string } | null): boolean;
   /**
    * The agent is working in a chat: tell its live call that talks there. `working`: the runner has
-   * picked up what reached that chat last (the typing module's `TypingTick.working`), which the call
-   * hears whether it talks in that chat or on its own voice line.
+   * picked up what reached that chat last (the typing module's `TypingTick.working`).
    */
   chatTyping(chat: ChatAddress, agentGroupId: string, working?: boolean): void;
   /** The running call on a line, for the daily budget. */
@@ -879,7 +865,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       utterances: 0,
       turnOutcomes: new Map(),
       turnsInFlight: 0,
-      sent: 0,
       chat: null,
       chatRefreshes: 0,
       previousChat: null,
@@ -1279,25 +1264,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         return reply(res, 204, '');
       }
       reply(res, 404, 'Not found');
-    },
-
-    async deliver(platformId, target, inReplyTo, text) {
-      const call = calls.get(platformId);
-      if (target && (!call || call.callId !== target.callId)) {
-        // An answer for a call that is over must not be spoken into a later one; retrying cannot help.
-        log.info('livekit-voice-mode: dropping a reply for an ended call', { platformId, ...target });
-        return { id: undefined };
-      }
-      if (!call || call.state !== 'live') return target ? { id: undefined } : null;
-      if (!text.trim()) throw new Error('livekit-voice-mode: reply contains no speakable text');
-      if (!(await checkAccess(call))) throw new Error('livekit-voice-mode: caller access has been revoked');
-      push(call, { type: 'reply', text, turn: target ? target.utteranceId : null });
-      return { id: target ? inReplyTo : `${LIVEKIT_ID_PREFIX}${call.callId}:out-${++call.sent}` };
-    },
-
-    async setTyping(platformId) {
-      const call = calls.get(platformId);
-      if (call?.state === 'live' && !call.ended) push(call, { type: 'thinking' });
     },
 
     chatMessage(chat, agentGroupId, text, replyTo) {
