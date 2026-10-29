@@ -204,7 +204,7 @@ describe('rewriteInboundText', () => {
       supportsThreads: true,
       rewriteInboundText: async (raw) => {
         seen.push(raw);
-        return (text) => text.replace('@Boris', '@Boris (<@U2>)');
+        return () => (text) => text.replace('@Boris', '@Boris (<@U2>)');
       },
     });
     await bridge.setup(hostConfig);

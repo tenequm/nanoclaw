@@ -182,10 +182,7 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
   const bridge = createChatSdkBridge({
     adapter: slackAdapter,
     extractRawText: extractSlackRawText,
-    rewriteInboundText: createSlackMentionRewriter(
-      async (id) => (await slackAdapter.getUser(id))?.userName,
-      () => slackAdapter.botUserId,
-    ),
+    rewriteInboundText: createSlackMentionRewriter(() => slackAdapter.botUserId),
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)
     concurrency: 'concurrent',
     supportsThreads: true,

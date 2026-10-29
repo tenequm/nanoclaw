@@ -20,6 +20,7 @@ import {
   type AssistantThreadStartedEvent,
   type ConcurrencyStrategy,
   type Message as ChatMessage,
+  type StateAdapter,
 } from 'chat';
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
@@ -241,11 +242,16 @@ export type RawTextExtractor = (raw: Record<string, unknown>) => string | null;
 /**
  * Build a rewrite for the adapter-rendered message text from `message.raw`,
  * before `raw` is dropped. A platform whose adapter renders identity lossily
- * — Slack turns `<@U123>` into `@Display Name` — returns a function that puts
- * the lost part back; the bridge applies it to `text` and to every text node
- * of `formatted`. Return null when there is nothing to rewrite.
+ * — Slack turns `<@U123>` into `@Display Name` — returns a factory of
+ * rewrites that put the lost part back. The bridge runs one rewrite over
+ * `text` and a fresh one over all text nodes of `formatted` in document
+ * order, so a rewrite may pair occurrences by order. `state` holds the
+ * adapter's own caches. Return null when there is nothing to rewrite.
  */
-export type InboundTextRewriter = (raw: Record<string, unknown>) => Promise<((text: string) => string) | null>;
+export type InboundTextRewriter = (
+  raw: Record<string, unknown>,
+  state: StateAdapter,
+) => Promise<(() => (text: string) => string) | null>;
 
 // ---------------------------------------------------------------------------
 // Membership hook
@@ -485,12 +491,16 @@ export function appendRawText(
 }
 
 /**
- * Apply a text rewrite to the serialized `text` and every mdast text node of
- * `formatted`. The AST is rebuilt, not edited: toJSON() shares it with the
- * live Message.
+ * Apply one rewrite pass to the serialized `text` and another across every
+ * mdast text node of `formatted`. The AST is rebuilt, not edited: toJSON()
+ * shares it with the live Message.
  */
-export function applyTextRewrite(serialized: Record<string, unknown>, rewrite: (text: string) => string): void {
-  if (typeof serialized.text === 'string') serialized.text = rewrite(serialized.text);
+export function applyTextRewrite(
+  serialized: Record<string, unknown>,
+  newRewrite: () => (text: string) => string,
+): void {
+  if (typeof serialized.text === 'string') serialized.text = newRewrite()(serialized.text);
+  const rewrite = newRewrite();
   const map = (node: unknown): unknown => {
     if (typeof node !== 'object' || node === null) return node;
     const n = node as { type?: unknown; value?: unknown; children?: unknown };
@@ -563,7 +573,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     if (message.raw) {
       if (config.rewriteInboundText) {
         try {
-          const rewrite = await config.rewriteInboundText(message.raw as Record<string, unknown>);
+          const rewrite = await config.rewriteInboundText(message.raw as Record<string, unknown>, state);
           if (rewrite) applyTextRewrite(serialized, rewrite);
         } catch (err) {
           log.warn('Inbound text rewrite failed; keeping the adapter text', { adapter: adapter.name, err });

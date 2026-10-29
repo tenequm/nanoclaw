@@ -84,7 +84,7 @@ describe('applyTextRewrite', () => {
     };
     const serialized: Record<string, unknown> = { text: 'hi there', formatted };
 
-    applyTextRewrite(serialized, upper);
+    applyTextRewrite(serialized, () => upper);
 
     expect(serialized.text).toBe('HI THERE');
     expect(serialized.formatted).toEqual({
@@ -106,14 +106,14 @@ describe('applyTextRewrite', () => {
     const formatted = { type: 'root', children: [{ type: 'text', value: 'hi' }] };
     const serialized: Record<string, unknown> = { text: 'hi', formatted };
 
-    applyTextRewrite(serialized, upper);
+    applyTextRewrite(serialized, () => upper);
 
     expect(formatted.children[0]!.value).toBe('hi');
   });
 
   it('tolerates a body with no text or formatted', () => {
     const serialized: Record<string, unknown> = {};
-    applyTextRewrite(serialized, upper);
+    applyTextRewrite(serialized, () => upper);
     expect(serialized).toEqual({});
   });
 });

@@ -55,53 +55,66 @@ export function extractSlackRawText(raw: Record<string, unknown>): string | null
   return `${text.slice(0, MAX_TABLE_CHARS - 20)}\n[table truncated]`;
 }
 
-/** User ids mentioned in the raw event text, deduplicated, in first-mention order. */
+/** User ids of the mentions in the raw event text, one per occurrence, in order. */
 export function slackMentionedUserIds(raw: Record<string, unknown>): string[] {
   if (typeof raw.text !== 'string') return [];
-  return [...new Set(Array.from(raw.text.matchAll(USER_MENTION_RE), (m) => m[1]!))];
+  return Array.from(raw.text.matchAll(USER_MENTION_RE), (m) => m[1]);
 }
 
 /**
  * Re-attach the user id to each `@Display Name` the adapter rendered from a
- * mention: `@Boris` becomes `@Boris (<@U123>)`. `names` maps id to the display
- * name the adapter used, in mention order, so ids sharing one display name
- * pair up with its occurrences in order. A longer name wins over its prefix,
- * and an already annotated mention is left alone.
+ * mention: `@Boris` becomes `@Boris (<@U123>)`. `mentions` lists every raw
+ * mention as [id, display name] in order, so occurrences of a name shared by
+ * several people pair up with their ids in order; each call of the returned
+ * factory starts that pairing over, for one rendering of the message. A
+ * longer name wins over its prefix, and an already annotated mention is left
+ * alone.
  */
-export function annotateSlackMentions(text: string, names: ReadonlyMap<string, string>): string {
+export function slackMentionAnnotator(
+  mentions: ReadonlyArray<readonly [string, string]>,
+): () => (text: string) => string {
   const idsByName = new Map<string, string[]>();
-  for (const [id, name] of names) idsByName.set(name, [...(idsByName.get(name) ?? []), id]);
-  if (idsByName.size === 0) return text;
+  for (const [id, name] of mentions) idsByName.set(name, [...(idsByName.get(name) ?? []), id]);
   const alternation = [...idsByName.keys()]
     .sort((a, b) => b.length - a.length)
     .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
     .join('|');
-  const mention = new RegExp(`@(${alternation})(?![\\p{L}\\p{N}_]| \\(<@)`, 'gu');
-  const used = new Map<string, number>();
-  return text.replace(mention, (match, name: string) => {
-    const ids = idsByName.get(name)!;
-    const n = used.get(name) ?? 0;
-    used.set(name, n + 1);
-    return `${match} (<@${ids[Math.min(n, ids.length - 1)]}>)`;
-  });
+  const mention = new RegExp(`(?<![\\p{L}\\p{N}_])@(${alternation})(?![\\p{L}\\p{N}_]| \\(<@)`, 'gu');
+  return () => {
+    const used = new Map<string, number>();
+    return (text) =>
+      text.replace(mention, (match, name: string) => {
+        const ids = idsByName.get(name)!;
+        const n = used.get(name) ?? 0;
+        used.set(name, n + 1);
+        return `${match} (<@${ids[Math.min(n, ids.length - 1)]}>)`;
+      });
+  };
 }
 
 /**
- * The Slack bridge's InboundTextRewriter. `displayName` must resolve the same
- * cached name the adapter rendered. The bot's own mention is skipped: the
- * adapter leaves it unresolved as `@U…`, which already carries the id.
+ * The Slack bridge's InboundTextRewriter. Names come only from the adapter's
+ * own user cache (lookupUser's key), which its parse just filled for every
+ * mention it rendered by name; a miss means it rendered the bare `@U...` id,
+ * so calling users.info here would only add latency and retries. The bot's
+ * own mention is skipped for the same reason.
  */
-export function createSlackMentionRewriter(
-  displayName: (userId: string) => Promise<string | null | undefined>,
-  selfUserId: () => string | undefined,
-): InboundTextRewriter {
-  return async (raw) => {
+export function createSlackMentionRewriter(selfUserId: () => string | undefined): InboundTextRewriter {
+  return async (raw, state) => {
     const self = selfUserId();
     const ids = slackMentionedUserIds(raw).filter((id) => id !== self);
     if (ids.length === 0) return null;
-    const resolved = await Promise.all(ids.map(async (id) => [id, await displayName(id)] as const));
-    const names = new Map<string, string>();
-    for (const [id, name] of resolved) if (name && name !== id) names.set(id, name);
-    return names.size > 0 ? (text) => annotateSlackMentions(text, names) : null;
+    const names = new Map(
+      await Promise.all(
+        [...new Set(ids)].map(
+          async (id) => [id, (await state.get<{ displayName?: string }>(`slack:user:${id}`))?.displayName] as const,
+        ),
+      ),
+    );
+    const mentions = ids.flatMap((id) => {
+      const name = names.get(id);
+      return name && name !== id ? [[id, name] as const] : [];
+    });
+    return mentions.length > 0 ? slackMentionAnnotator(mentions) : null;
   };
 }
