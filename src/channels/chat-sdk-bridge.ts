@@ -20,6 +20,7 @@ import {
   type AssistantThreadStartedEvent,
   type ConcurrencyStrategy,
   type Message as ChatMessage,
+  type StateAdapter,
 } from 'chat';
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
@@ -238,6 +239,20 @@ export type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext |
  */
 export type RawTextExtractor = (raw: Record<string, unknown>) => string | null;
 
+/**
+ * Build a rewrite for the adapter-rendered message text from `message.raw`,
+ * before `raw` is dropped. A platform whose adapter renders identity lossily
+ * — Slack turns `<@U123>` into `@Display Name` — returns a factory of
+ * rewrites that put the lost part back. The bridge runs one rewrite over
+ * `text` and a fresh one over all text nodes of `formatted` in document
+ * order, so a rewrite may pair occurrences by order. `state` holds the
+ * adapter's own caches. Return null when there is nothing to rewrite.
+ */
+export type InboundTextRewriter = (
+  raw: Record<string, unknown>,
+  state: StateAdapter,
+) => Promise<(() => (text: string) => string) | null>;
+
 // ---------------------------------------------------------------------------
 // Membership hook
 // ---------------------------------------------------------------------------
@@ -359,6 +374,8 @@ export interface ChatSdkBridgeConfig {
    * provider payload is still dropped.
    */
   extractRawText?: RawTextExtractor;
+  /** Rewrite the adapter-rendered text from the raw payload (see InboundTextRewriter). */
+  rewriteInboundText?: InboundTextRewriter;
   /**
    * Whether this platform uses threads as the primary conversation unit.
    * See `ChannelAdapter.supportsThreads`. Declared by the calling channel
@@ -473,6 +490,27 @@ export function appendRawText(
   serialized.text = text ? `${text}\n\n${extra}` : extra;
 }
 
+/**
+ * Apply one rewrite pass to the serialized `text` and another across every
+ * mdast text node of `formatted`. The AST is rebuilt, not edited: toJSON()
+ * shares it with the live Message.
+ */
+export function applyTextRewrite(
+  serialized: Record<string, unknown>,
+  newRewrite: () => (text: string) => string,
+): void {
+  if (typeof serialized.text === 'string') serialized.text = newRewrite()(serialized.text);
+  const rewrite = newRewrite();
+  const map = (node: unknown): unknown => {
+    if (typeof node !== 'object' || node === null) return node;
+    const n = node as { type?: unknown; value?: unknown; children?: unknown };
+    if (n.type === 'text' && typeof n.value === 'string') return { ...n, value: rewrite(n.value) };
+    if (Array.isArray(n.children)) return { ...n, children: n.children.map(map) };
+    return node;
+  };
+  if (serialized.formatted !== undefined) serialized.formatted = map(serialized.formatted);
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   // The instance name becomes a webhook route segment (the route regex is
@@ -533,6 +571,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     // Recover platform content the Chat SDK omitted, while raw is still here.
     if (message.raw) {
+      if (config.rewriteInboundText) {
+        try {
+          const rewrite = await config.rewriteInboundText(message.raw as Record<string, unknown>, state);
+          if (rewrite) applyTextRewrite(serialized, rewrite);
+        } catch (err) {
+          log.warn('Inbound text rewrite failed; keeping the adapter text', { adapter: adapter.name, err });
+        }
+      }
       appendRawText(serialized, message.raw as Record<string, unknown>, config.extractRawText);
     }
 

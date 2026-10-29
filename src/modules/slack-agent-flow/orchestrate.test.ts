@@ -166,6 +166,11 @@ let brokerInstallUrl = '';
 let appStateQueue: Array<{ status?: string; bot_token?: string; http?: number }> = [];
 let appStateReads = 0;
 
+/** Slack Web API arguments as slackCall form-encodes them. */
+function slackArgs(body: string): Record<string, string> {
+  return Object.fromEntries(new URLSearchParams(body));
+}
+
 function jsonResponse(obj: unknown, status = 200): Response {
   return new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
 }
@@ -218,7 +223,7 @@ function fakeFetch(
     );
   }
   if (url.includes('/api/conversations.open')) {
-    const users = String((JSON.parse(body) as { users?: string }).users ?? '');
+    const users = slackArgs(body).users ?? '';
     return Promise.resolve(jsonResponse({ ok: true, channel: { id: users.includes(',') ? 'G0ROOM' : 'D0NEWDM' } }));
   }
   if (url.includes('/api/chat.postMessage')) {
@@ -387,7 +392,7 @@ describe('slack-aware create_agent — happy path (Slack-origin session)', () =>
     // and SLACK_A2A_ROOMS was in .env before it.
     const posts = fetchCalls.filter((c) => c.url.includes('chat.postMessage'));
     expect(posts).toHaveLength(1);
-    expect((JSON.parse(posts[0]!.body) as { channel: string }).channel).toBe('D0NEWDM');
+    expect(slackArgs(posts[0]!.body).channel).toBe('D0NEWDM');
     expect(posts[0]!.token).toBe(NEW_BOT_TOKEN);
     expect(postMessageEnvSnapshots).toHaveLength(1);
     expect(postMessageEnvSnapshots[0]).toMatch(/^SLACK_A2A_ROOMS=.*G0ROOM/m);
@@ -417,7 +422,7 @@ describe('slack-aware create_agent — happy path (Slack-origin session)', () =>
     // MPIM opened as the new bot with operator + origin bot.
     const opens = fetchCalls.filter((c) => c.url.includes('conversations.open'));
     expect(opens).toHaveLength(2);
-    expect(JSON.parse(opens[1]!.body)).toMatchObject({ users: 'U0OPERATOR,U0ORIGINBOT' });
+    expect(slackArgs(opens[1]!.body)).toMatchObject({ users: 'U0OPERATOR,U0ORIGINBOT' });
     expect(opens[1]!.token).toBe(NEW_BOT_TOKEN);
 
     // Requester heard ONLY the Slack success notify — the upstream "created —
@@ -463,7 +468,7 @@ describe("slack-aware create_agent — room:'none'", () => {
     // Only the operator-DM conversations.open — no MPIM.
     const opens = fetchCalls.filter((c) => c.url.includes('conversations.open'));
     expect(opens).toHaveLength(1);
-    expect(JSON.parse(opens[0]!.body)).toMatchObject({ users: 'U0OPERATOR' });
+    expect(slackArgs(opens[0]!.body)).toMatchObject({ users: 'U0OPERATOR' });
     // No room rows on any instance, no a2a allowlist, no canvas, no shadow wiring.
     expect((await getAllMessagingGroups()).filter((m) => m.platform_id === 'slack:G0ROOM')).toHaveLength(0);
     expect(fs.readFileSync(path.join(tmpDir, '.env'), 'utf-8')).not.toContain('SLACK_A2A_ROOMS');
@@ -472,7 +477,7 @@ describe("slack-aware create_agent — room:'none'", () => {
     // The DM intro still posts; the origin agent gets NO intro nudge.
     const posts = fetchCalls.filter((c) => c.url.includes('chat.postMessage'));
     expect(posts).toHaveLength(1);
-    expect((JSON.parse(posts[0]!.body) as { channel: string }).channel).toBe('D0NEWDM');
+    expect(slackArgs(posts[0]!.body).channel).toBe('D0NEWDM');
     expect(notifyTexts().filter((t) => t.includes('introduction'))).toHaveLength(0);
     // Success text is the no-room variant pointing at create_room.
     const success = notifyTexts().at(-1)!;
@@ -528,7 +533,7 @@ describe('slack-aware create_agent — room canvas contract', () => {
     // message either.
     const posts = fetchCalls.filter((c) => c.url.includes('chat.postMessage'));
     expect(posts).toHaveLength(1);
-    expect((JSON.parse(posts[0]!.body) as { channel: string }).channel).toBe('D0NEWDM');
+    expect(slackArgs(posts[0]!.body).channel).toBe('D0NEWDM');
   });
 });
 
@@ -557,7 +562,7 @@ describe('ensureAgentRoom — N-bot rooms', () => {
     // MPIM opened as the creator with operator + every OTHER participating bot.
     const open = fetchCalls.find((c) => c.url.includes('conversations.open'))!;
     expect(open.token).toBe(NEW_BOT_TOKEN);
-    expect(JSON.parse(open.body)).toMatchObject({ users: 'U0OPERATOR,U0ORIGINBOT,U0THIRD' });
+    expect(slackArgs(open.body)).toMatchObject({ users: 'U0OPERATOR,U0ORIGINBOT,U0THIRD' });
 
     // One mg row + mention/accumulate wiring PER participating instance.
     for (const p of participants) {
@@ -770,9 +775,7 @@ describe('slack-aware create_agent — workspace install approval', () => {
   }
 
   function postedTexts(): string[] {
-    return fetchCalls
-      .filter((c) => c.url.includes('chat.postMessage'))
-      .map((c) => (JSON.parse(c.body) as { text: string }).text);
+    return fetchCalls.filter((c) => c.url.includes('chat.postMessage')).map((c) => slackArgs(c.body).text);
   }
 
   it('tells the operator what to approve, then finishes the flow on the token the approval releases', async () => {
@@ -789,7 +792,7 @@ describe('slack-aware create_agent — workspace install approval', () => {
     expect(notice).toContain(INSTALL_URL);
     const noticeCall = fetchCalls.find((c) => c.url.includes('chat.postMessage'))!;
     expect(noticeCall.token).toBe(ORIGIN_BOT_TOKEN);
-    expect((JSON.parse(noticeCall.body) as { channel: string }).channel).toBe('D0OPDM');
+    expect(slackArgs(noticeCall.body).channel).toBe('D0OPDM');
 
     // From the token onward the flow is the ordinary one: adapter hot-add,
     // DM row + wiring, room, welcome DM.

@@ -11,7 +11,8 @@
  * Inbound is driven through the REAL bridge path: a stub adapter captures the
  * ChatInstance during `chat.initialize()` and pushes duck-typed messages via
  * `chat.processMessage(...)`, so the Chat SDK's own dispatch (dedupe,
- * pattern routing) delivers them to the bridge's handlers.
+ * pattern routing) delivers them to the bridge's handlers. The same harness
+ * pins the `rewriteInboundText` hook, which also runs on that path.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -58,7 +59,7 @@ function makeStubAdapter(name: string): { adapter: Adapter; chat: () => ChatDriv
 let nextMessageId = 0;
 
 /** Duck-typed Chat SDK message — the fields the SDK dispatch + bridge read. */
-function makeMessage(text: string): Record<string, unknown> {
+function makeMessage(text: string, raw?: Record<string, unknown>): Record<string, unknown> {
   const id = `msg-${++nextMessageId}`;
   const payload = {
     id,
@@ -70,8 +71,8 @@ function makeMessage(text: string): Record<string, unknown> {
     attachments: [],
     isMention: false,
     metadata: { dateSent: new Date('2026-01-01T00:00:00.000Z') },
-    raw: undefined,
-    toJSON: () => ({ ...payload }),
+    raw,
+    toJSON: () => ({ ...payload, raw }),
   };
 }
 
@@ -190,5 +191,51 @@ describe('registerBridgeInboundPolicy', () => {
 
     await defBridge.teardown();
     await namedBridge.teardown();
+  });
+});
+
+describe('rewriteInboundText', () => {
+  it('rewrites the persisted text from the raw payload, then drops raw', async () => {
+    const { adapter, chat } = makeStubAdapter('discord');
+    const { hostConfig, calls } = makeHostConfig();
+    const seen: unknown[] = [];
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      rewriteInboundText: async (raw) => {
+        seen.push(raw);
+        return () => (text) => text.replace('@Boris', '@Boris (<@U2>)');
+      },
+    });
+    await bridge.setup(hostConfig);
+
+    await chat().processMessage(adapter, 'discord:C1:T1', makeMessage('hi @Boris', { text: 'hi <@U2>' }));
+
+    expect(seen).toEqual([{ text: 'hi <@U2>' }]);
+    const content = calls[0].message.content as Record<string, unknown>;
+    expect(content.text).toBe('hi @Boris (<@U2>)');
+    expect(content.raw).toBeUndefined();
+
+    await bridge.teardown();
+  });
+
+  it('keeps the adapter text when the rewrite throws', async () => {
+    const { adapter, chat } = makeStubAdapter('discord');
+    const { hostConfig, calls } = makeHostConfig();
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      rewriteInboundText: async () => {
+        throw new Error('users.info down');
+      },
+    });
+    await bridge.setup(hostConfig);
+
+    await chat().processMessage(adapter, 'discord:C1:T1', makeMessage('hi @Boris', { text: 'hi <@U2>' }));
+
+    expect(calls).toHaveLength(1);
+    expect((calls[0].message.content as Record<string, unknown>).text).toBe('hi @Boris');
+
+    await bridge.teardown();
   });
 });

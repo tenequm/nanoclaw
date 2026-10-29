@@ -127,6 +127,11 @@ const BOT_IDS: Record<string, string> = {
   [DEVIN_BOT_TOKEN]: 'U0DEVINBOT',
 };
 
+/** Slack Web API arguments as slackCall form-encodes them. */
+function slackArgs(body: string): Record<string, string> {
+  return Object.fromEntries(new URLSearchParams(body));
+}
+
 function jsonResponse(obj: unknown): Response {
   return new Response(JSON.stringify(obj), { status: 200, headers: { 'content-type': 'application/json' } });
 }
@@ -332,7 +337,7 @@ describe('create_room', () => {
     const opens = roomOpens();
     expect(opens).toHaveLength(1);
     expect(opens[0]!.token).toBe(ANDY_BOT_TOKEN);
-    expect(JSON.parse(opens[0]!.body)).toMatchObject({ users: 'U0OPERATOR,U0PIXELBOT,U0DEVINBOT' });
+    expect(slackArgs(opens[0]!.body)).toMatchObject({ users: 'U0OPERATOR,U0PIXELBOT,U0DEVINBOT' });
 
     // One mg row + mention/accumulate wiring PER participating instance.
     for (const [instanceKey, groupId] of [
@@ -387,7 +392,7 @@ describe('create_room', () => {
     const opens = roomOpens();
     expect(opens).toHaveLength(1);
     expect(opens[0]!.token).toBe(PIXEL_BOT_TOKEN);
-    expect(JSON.parse(opens[0]!.body)).toMatchObject({ users: 'U0OPERATOR,U0DEVINBOT' });
+    expect(slackArgs(opens[0]!.body)).toMatchObject({ users: 'U0OPERATOR,U0DEVINBOT' });
 
     // No caller-instance row, no caller wiring.
     expect(await getMessagingGroupByPlatform('slack', 'slack:G0TEAM', 'slack')).toBeUndefined();
@@ -442,7 +447,7 @@ describe('add_to_room', () => {
     const opens = roomOpens();
     expect(opens).toHaveLength(1);
     expect(opens[0]!.token).toBe(DEVIN_BOT_TOKEN);
-    const users = String((JSON.parse(opens[0]!.body) as { users: string }).users).split(',');
+    const users = slackArgs(opens[0]!.body).users.split(',');
     expect(users).toHaveLength(3);
     expect(users).toContain('U0OPERATOR');
     expect(users).toContain('U0ANDYBOT');
@@ -483,7 +488,7 @@ describe('add_to_room', () => {
 
     const opens = roomOpens();
     expect(opens).toHaveLength(1);
-    const users = String((JSON.parse(opens[0]!.body) as { users: string }).users).split(',');
+    const users = slackArgs(opens[0]!.body).users.split(',');
     expect(users).toHaveLength(4);
     expect(users).toContain('U0COLLEAGUE');
     expect(notifyTexts().at(-1)).toContain('moved to a new conversation (G0FORK)');

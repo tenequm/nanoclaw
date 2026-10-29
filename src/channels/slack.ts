@@ -22,7 +22,7 @@ import { registerResidentSkillGate } from '../project-doc-compose.js';
 import type { ChannelAdapter, ChannelDefaults } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import { extractSlackRawText } from './slack-raw-text.js';
+import { createSlackMentionRewriter, extractSlackRawText } from './slack-raw-text.js';
 
 /** Assistant-status text for plain typing; Slack prefixes the bot's name. */
 const SLACK_TYPING_STATUS = 'is thinking...';
@@ -182,6 +182,7 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
   const bridge = createChatSdkBridge({
     adapter: slackAdapter,
     extractRawText: extractSlackRawText,
+    rewriteInboundText: createSlackMentionRewriter(() => slackAdapter.botUserId),
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)
     concurrency: 'concurrent',
     supportsThreads: true,
