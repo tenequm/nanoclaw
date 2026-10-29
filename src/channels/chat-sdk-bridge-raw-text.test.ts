@@ -12,7 +12,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { appendRawText } from './chat-sdk-bridge.js';
+import { appendRawText, applyTextRewrite } from './chat-sdk-bridge.js';
 
 describe('appendRawText', () => {
   it('leaves the body untouched when no extractor is configured', () => {
@@ -62,5 +62,58 @@ describe('appendRawText', () => {
       return null;
     });
     expect(seen).toEqual([{ blocks: [{ type: 'table' }] }]);
+  });
+});
+
+describe('applyTextRewrite', () => {
+  const upper = (t: string): string => t.toUpperCase();
+
+  it('rewrites text and every text node of formatted, leaving other nodes alone', () => {
+    const formatted = {
+      type: 'root',
+      children: [
+        {
+          type: 'paragraph',
+          children: [
+            { type: 'text', value: 'hi ' },
+            { type: 'strong', children: [{ type: 'text', value: 'there' }] },
+            { type: 'inlineCode', value: 'code' },
+          ],
+        },
+      ],
+    };
+    const serialized: Record<string, unknown> = { text: 'hi there', formatted };
+
+    applyTextRewrite(serialized, upper);
+
+    expect(serialized.text).toBe('HI THERE');
+    expect(serialized.formatted).toEqual({
+      type: 'root',
+      children: [
+        {
+          type: 'paragraph',
+          children: [
+            { type: 'text', value: 'HI ' },
+            { type: 'strong', children: [{ type: 'text', value: 'THERE' }] },
+            { type: 'inlineCode', value: 'code' },
+          ],
+        },
+      ],
+    });
+  });
+
+  it('leaves the AST it was given untouched (toJSON shares it with the live message)', () => {
+    const formatted = { type: 'root', children: [{ type: 'text', value: 'hi' }] };
+    const serialized: Record<string, unknown> = { text: 'hi', formatted };
+
+    applyTextRewrite(serialized, upper);
+
+    expect(formatted.children[0]!.value).toBe('hi');
+  });
+
+  it('tolerates a body with no text or formatted', () => {
+    const serialized: Record<string, unknown> = {};
+    applyTextRewrite(serialized, upper);
+    expect(serialized).toEqual({});
   });
 });

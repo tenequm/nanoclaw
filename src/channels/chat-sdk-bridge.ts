@@ -238,6 +238,15 @@ export type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext |
  */
 export type RawTextExtractor = (raw: Record<string, unknown>) => string | null;
 
+/**
+ * Build a rewrite for the adapter-rendered message text from `message.raw`,
+ * before `raw` is dropped. A platform whose adapter renders identity lossily
+ * — Slack turns `<@U123>` into `@Display Name` — returns a function that puts
+ * the lost part back; the bridge applies it to `text` and to every text node
+ * of `formatted`. Return null when there is nothing to rewrite.
+ */
+export type InboundTextRewriter = (raw: Record<string, unknown>) => Promise<((text: string) => string) | null>;
+
 // ---------------------------------------------------------------------------
 // Membership hook
 // ---------------------------------------------------------------------------
@@ -359,6 +368,8 @@ export interface ChatSdkBridgeConfig {
    * provider payload is still dropped.
    */
   extractRawText?: RawTextExtractor;
+  /** Rewrite the adapter-rendered text from the raw payload (see InboundTextRewriter). */
+  rewriteInboundText?: InboundTextRewriter;
   /**
    * Whether this platform uses threads as the primary conversation unit.
    * See `ChannelAdapter.supportsThreads`. Declared by the calling channel
@@ -473,6 +484,23 @@ export function appendRawText(
   serialized.text = text ? `${text}\n\n${extra}` : extra;
 }
 
+/**
+ * Apply a text rewrite to the serialized `text` and every mdast text node of
+ * `formatted`. The AST is rebuilt, not edited: toJSON() shares it with the
+ * live Message.
+ */
+export function applyTextRewrite(serialized: Record<string, unknown>, rewrite: (text: string) => string): void {
+  if (typeof serialized.text === 'string') serialized.text = rewrite(serialized.text);
+  const map = (node: unknown): unknown => {
+    if (typeof node !== 'object' || node === null) return node;
+    const n = node as { type?: unknown; value?: unknown; children?: unknown };
+    if (n.type === 'text' && typeof n.value === 'string') return { ...n, value: rewrite(n.value) };
+    if (Array.isArray(n.children)) return { ...n, children: n.children.map(map) };
+    return node;
+  };
+  if (serialized.formatted !== undefined) serialized.formatted = map(serialized.formatted);
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   // The instance name becomes a webhook route segment (the route regex is
@@ -533,6 +561,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     // Recover platform content the Chat SDK omitted, while raw is still here.
     if (message.raw) {
+      if (config.rewriteInboundText) {
+        try {
+          const rewrite = await config.rewriteInboundText(message.raw as Record<string, unknown>);
+          if (rewrite) applyTextRewrite(serialized, rewrite);
+        } catch (err) {
+          log.warn('Inbound text rewrite failed; keeping the adapter text', { adapter: adapter.name, err });
+        }
+      }
       appendRawText(serialized, message.raw as Record<string, unknown>, config.extractRawText);
     }
 
