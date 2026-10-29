@@ -447,7 +447,7 @@ describe('add_to_room', () => {
     const opens = roomOpens();
     expect(opens).toHaveLength(1);
     expect(opens[0]!.token).toBe(DEVIN_BOT_TOKEN);
-    const users = String(slackArgs(opens[0]!.body).users).split(',');
+    const users = slackArgs(opens[0]!.body).users.split(',');
     expect(users).toHaveLength(3);
     expect(users).toContain('U0OPERATOR');
     expect(users).toContain('U0ANDYBOT');
@@ -488,7 +488,7 @@ describe('add_to_room', () => {
 
     const opens = roomOpens();
     expect(opens).toHaveLength(1);
-    const users = String(slackArgs(opens[0]!.body).users).split(',');
+    const users = slackArgs(opens[0]!.body).users.split(',');
     expect(users).toHaveLength(4);
     expect(users).toContain('U0COLLEAGUE');
     expect(notifyTexts().at(-1)).toContain('moved to a new conversation (G0FORK)');

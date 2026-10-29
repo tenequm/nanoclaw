@@ -223,7 +223,7 @@ function fakeFetch(
     );
   }
   if (url.includes('/api/conversations.open')) {
-    const users = String(slackArgs(body).users ?? '');
+    const users = slackArgs(body).users ?? '';
     return Promise.resolve(jsonResponse({ ok: true, channel: { id: users.includes(',') ? 'G0ROOM' : 'D0NEWDM' } }));
   }
   if (url.includes('/api/chat.postMessage')) {

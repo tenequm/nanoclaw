@@ -64,7 +64,6 @@ describe('slackCall request shaping', () => {
     expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
-  // Slack's read methods answer a JSON body with invalid_arguments.
   it('form-encodes a read method whose arguments are all primitives', async () => {
     const fetchMock = mockFetch(async () => jsonResponse({ ok: true, members: [] }));
 
