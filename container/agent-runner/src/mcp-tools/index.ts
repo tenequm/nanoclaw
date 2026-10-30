@@ -9,6 +9,7 @@ import './core.js';
 import './interactive.js';
 import './agents.js';
 import './self-mod.js';
+import './workflow-dispatch.js';
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import '../modules/index.js';
 import { loadConfig } from '../config.js';

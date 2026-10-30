@@ -218,6 +218,8 @@ export interface RequestApprovalOptions {
   question: string;
   /** Deliver the card to this specific user instead of all of the session group's admins. */
   approverUserId?: string;
+  /** Restrict the eligible approvers to these user IDs (e.g. owners only); empty means nobody may approve. */
+  approvers?: string[];
 }
 
 /**
@@ -229,7 +231,9 @@ export interface RequestApprovalOptions {
 export async function requestApproval(opts: RequestApprovalOptions): Promise<void> {
   const { session, action, payload, title, question, agentName, approverUserId } = opts;
 
-  const approvers = approverUserId ? [approverUserId] : await pickApprover(session.agent_group_id);
+  const approvers = approverUserId
+    ? [approverUserId]
+    : (opts.approvers ?? (await pickApprover(session.agent_group_id)));
   if (approvers.length === 0) {
     await notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
     return;

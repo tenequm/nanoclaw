@@ -30,3 +30,4 @@ import './canvas-actions/index.js';
 import './slack-onboarding/index.js';
 import './slack-agent-flow/index.js';
 import './community-portal/index.js';
+import './workflow-dispatch/index.js';
