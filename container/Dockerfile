@@ -132,7 +132,7 @@ ENV GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem
 RUN git config --system credential.helper '!gh auth git-credential'
 
 # ---- pond: cross-session recall (read-only MCP over mounted stores) ----------
-ARG POND_VERSION=0.20.1
+ARG POND_VERSION=0.20.2
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends xz-utils && \
@@ -148,10 +148,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # ---- DuckDB CLI: the v2.0 preview ---------------------------------------------
 # Pinned by staging path: the duckdb.org preview links are rebuilt in place. Same
 # build as the infra flake's nix/pkgs/duckdb.nix; bump both together.
-ARG DUCKDB_STAGED=d9c3e9ae11/v2.0.0-alpha49591
+ARG DUCKDB_STAGED=910c73dabe/v2.0.1-alpha52096
 RUN ARCH=$(dpkg --print-architecture) && case "$ARCH" in \
-      arm64) DUCKDB_DIST=linux-arm64; DUCKDB_SHA256=9fce9d357aee51a541afc92c9900046b24ec0d0357d6e3e990884a6e9dc74fab ;; \
-      amd64) DUCKDB_DIST=linux-amd64; DUCKDB_SHA256=c60c2a93739dee78c562a3d954405b22de7bf96b9d416ec8d5a9c491c77509cf ;; \
+      arm64) DUCKDB_DIST=linux-arm64; DUCKDB_SHA256=fb0325a9b2bdc6e2942eaaa858dd0557de5a01bc1405927e587015778a88a6e9 ;; \
+      amd64) DUCKDB_DIST=linux-amd64; DUCKDB_SHA256=bbd8969171e2fa1b98339aee9a96f3330bcb2799644605f079860373707836f1 ;; \
       *) echo "unsupported arch: $ARCH" && exit 1 ;; \
     esac && \
     curl -fsSL -o /tmp/duckdb.tar.gz "https://duckdb-staging.duckdb.org/${DUCKDB_STAGED}/duckdb/duckdb/github_release/duckdb-cli-${DUCKDB_DIST}.tar.gz" && \
