@@ -103,6 +103,10 @@
           DisconnectReason.PARTICIPANT_REMOVED,
           DisconnectReason.DUPLICATE_IDENTITY,
         ]);
+        // Media reaches LiveKit only through its TURN/TLS relay on 443 (no public UDP or ICE/TCP), and
+        // livekit-client's own relay fallback takes 10-30 s, so relay is forced from the first offer.
+        const CONNECT_OPTIONS = { autoSubscribe: false, rtcConfig: { iceTransportPolicy: 'relay' } };
+        state.connectOptions = CONNECT_OPTIONS;
         let room = null;
         let meetingTrack = null;
         let attempt = 0;
@@ -215,7 +219,7 @@
           wire(r);
           setStatus(attempt ? 'Reconnecting' : 'Connecting');
           try {
-            await r.connect(wsUrl, token, { autoSubscribe: false });
+            await r.connect(wsUrl, token, CONNECT_OPTIONS);
             await republish(r);
             attempt = 0;
             r.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => consider(pub, p)));
