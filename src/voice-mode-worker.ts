@@ -3801,6 +3801,24 @@ const ROOM_SYNC_RELEASE_ATTRIBUTE = 'attendee.room_sync.release';
 export const MEETING_INPUT_ATTRIBUTE = 'nanoclaw.meeting_input';
 /** A meeting call ends once no meeting participant has been in the room for this long. */
 export const MEETING_EMPTY_MS = 30_000;
+/**
+ * A meeting's talk can run for minutes without the closing silence: its transcription moves to a
+ * fresh socket this often, ahead of Gemini Live's ~221 s stop inside one activity.
+ */
+export const MEETING_ACTIVITY_MAX_MS = 200_000;
+
+/**
+ * The names `hey <agent>` takes in a meeting: the agent's, its wake names, and the wake phrase's
+ * name (VOICE_MODE_WAKE_PHRASE `Hey Dan`: `Dan`), which the transcript opens a turn with there.
+ */
+export function meetingWakeNames(
+  meta: Pick<LiveKitJobMetadata, 'agentName' | 'wakeNames'>,
+  env: Record<string, string | undefined>,
+): string[] {
+  const phrase = env.VOICE_MODE_WAKE_PHRASE?.trim();
+  const name = phrase ? phraseName(phrase) : undefined;
+  return [meta.agentName, ...(meta.wakeNames ?? []), ...(name ? [name] : [])];
+}
 /** The meeting's audio is mixed in frames of this length, on the worker's own clock. */
 const MIX_FRAME_MS = 20;
 const MIX_FRAME = samplesOf(MIX_FRAME_MS);
@@ -5070,6 +5088,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     onInterim: (text) => callTurns.onInterim(text),
     log: callLog,
     ...(transcriptDebug ? { debug: true } : {}),
+    ...(meta.meeting ? { activityMaxMs: MEETING_ACTIVITY_MAX_MS } : {}),
   });
   const callTurns: CallTurns = new CallTurns(
     {
@@ -5099,15 +5118,22 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     },
     {
       silenceMs: meta.silenceMs,
-      names: [meta.agentName, ...(meta.wakeNames ?? [])],
+      names: meta.meeting ? meetingWakeNames(meta, deps.env) : [meta.agentName, ...(meta.wakeNames ?? [])],
       limits: awakeLimits(deps.env),
       record,
       ...(transcriptDebug ? { debug: true } : {}),
     },
   );
   // A meeting has no page to set the wake switch: the agent takes a turn only when addressed, and the
-  // pause after it sends it, since nobody in the meeting says a send word.
-  if (meta.meeting) callTurns.configure(true, true);
+  // pause after it sends it, since nobody in the meeting says a send word. It has no acoustic wake
+  // word either: the spotter fires only on a phrase followed by a pause, and a meeting says
+  // "Hey Dan, what's two plus two" in one breath, so `hey <agent>` in the transcript opens the turn.
+  if (meta.meeting) {
+    callTurns.configure(true, true);
+    callLog.info('voice-mode worker: a meeting wakes on "hey <agent>" in the transcript', {
+      names: meetingWakeNames(meta, deps.env),
+    });
+  }
   if (recordCall) {
     callRecording = new CallRecording(
       recordings,
@@ -5187,7 +5213,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     await callRecording?.close();
     return abandon('could not set up the call audio', { err });
   }
-  if (!ending) {
+  if (!ending && !meta.meeting) {
     try {
       // The spotter counts the audio it was pushed, from now on; the turns count it from the call's start.
       spotterFrom = callTurns.position;

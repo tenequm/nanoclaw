@@ -25,7 +25,7 @@ import {
   type ReviewOp,
   type ReviewRequest,
 } from './channels/voice-mode-protocol.js';
-import type { Heard } from './voice-mode-gemini-live.js';
+import type { Heard, TranscriberOptions } from './voice-mode-gemini-live.js';
 import type { ChoiceDetails } from './channels/voice-mode-tts-catalog.js';
 import type { TtsAudio, TtsChoice, TtsInstance } from './voice-mode-tts.js';
 import {
@@ -109,9 +109,11 @@ import {
   AudioMixer,
   isMeetingParticipant,
   jobIdentity,
+  MEETING_ACTIVITY_MAX_MS,
   MEETING_EMPTY_MS,
   MEETING_INPUT_ATTRIBUTE,
   meetingParticipantNames,
+  meetingWakeNames,
   type PublishedSpeech,
   waitForMeetingParticipant,
   MeetingPresence,
@@ -5782,14 +5784,14 @@ describe('meeting calls', () => {
   });
 
   /** A meeting room: participants by identity, every handler of each event kept. */
-  function meetingJob() {
+  function meetingJob(meta: LiveKitJobMetadata = MEETING_META) {
     const handlers = new Map<string, Set<(...args: unknown[]) => void>>();
     const remoteParticipants = new Map<string, ReturnType<typeof mirror>>();
     const emit = (event: string, ...args: unknown[]) => {
       for (const fn of [...(handlers.get(event) ?? [])]) fn(...args);
     };
     const job = {
-      job: { metadata: JSON.stringify(MEETING_META) },
+      job: { metadata: JSON.stringify(meta) },
       room: {
         remoteParticipants,
         on: vi.fn((event: string, fn: (...args: unknown[]) => void) => {
@@ -5919,6 +5921,120 @@ describe('meeting calls', () => {
     expect(listeners(dropped)).toBe(0);
     vi.advanceTimersByTime(1000);
     vi.useRealTimers();
+  });
+
+  const WAKE_ENV = { ...ENV, VOICE_MODE_WAKE_MODEL: '/models/hey_dan.onnx', VOICE_MODE_WAKE_PHRASE: 'Hey Dan' };
+
+  it('wakes on `hey <agent>` and on the wake phrase name in the transcript, whatever the punctuation or spelling', () => {
+    const names = wakeNameWords(meetingWakeNames({ agentName: 'Junior', wakeNames: ['NanoClaw'] }, WAKE_ENV));
+    const after = (text: string) => {
+      const found = matchWake(text, names);
+      return found ? text.slice(found.end) : null;
+    };
+    for (const text of [
+      "Hey Dan, what's two plus two?",
+      "hey dan what's two plus two?",
+      "Hey, Dan! What's two plus two?",
+      "HEY DAN... what's two plus two?",
+      "Hey Den, what's two plus two?",
+      "Hi Dan, what's two plus two?",
+      "Heydan, what's two plus two?",
+      "Hey Junior, what's two plus two?",
+      "hey junior what's two plus two?",
+      "Hey, Junior - what's two plus two?",
+      "So, hey Junior, what's two plus two?",
+    ]) {
+      expect(
+        after(text)
+          ?.replace(/^[\s,.!-]+/, '')
+          .toLowerCase(),
+        text,
+      ).toBe("what's two plus two?");
+    }
+    expect(after('Гей Ден, скільки буде два плюс два?')).toBe(', скільки буде два плюс два?');
+    for (const text of [
+      'Dan said hey to everyone',
+      'Hey everyone, Dan here',
+      'Hey Daniel, how was the trip?',
+      'They danced all night',
+      'Junior engineers joined today',
+      'The hidden cost is high',
+    ]) {
+      expect(matchWake(text, names), text).toBeNull();
+    }
+    // Without a wake phrase the meeting takes the agent's names only; a plain call never takes the phrase's.
+    expect(meetingWakeNames({ agentName: 'Junior' }, ENV)).toEqual(['Junior']);
+  });
+
+  it('never starts the acoustic spotter: the transcript wakes it mid-sentence, the words after the phrase are the turn, other talk drops', async () => {
+    const m = meetingJob({ ...MEETING_META, agentName: 'Junior' });
+    m.join(mirror('uuid-1', 'Misha'));
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    v.voice.review.serve = vi.fn();
+    const wakeWord = vi.fn();
+    await runCall(m.ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord }));
+    /** One breath of meeting talk with no pause after the wake phrase, its interim heard mid-speech, then the closing silence. */
+    const say = async (text: string) => {
+      await flush();
+      v.transcription.results.push(heard(text, text));
+      const start = v.position;
+      v.events.onSpeech(true, start);
+      v.audio(1500);
+      v.interim(text);
+      const end = v.position;
+      v.audio(SILENCE);
+      v.events.onVad(v.position, end);
+      v.events.onSpeech(false, end);
+      await flush();
+    };
+    const utterances = () => host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+
+    await say('I think the release is fine, we can ship it on Friday');
+    await say('Hey Dan, what is two plus two');
+    await vi.waitFor(() => expect(utterances()).toEqual(['what is two plus two']));
+    await say('Danny will take the notes today');
+    await say('ok so hey Junior, when is the next sprint review?');
+    await vi.waitFor(() => expect(utterances()).toEqual(['what is two plus two', 'when is the next sprint review?']));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(utterances()).toHaveLength(2);
+    expect(wakeWord).not.toHaveBeenCalled();
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(m.job.shutdown).toHaveBeenCalled());
+
+    // A plain call with the same settings still starts the spotter.
+    const plain = fakeJob();
+    const plainHost = fakeHostFetch();
+    const pv = fakeVoice();
+    const plainWake = vi.fn();
+    await runCall(plain.ctx, callDeps(plainHost.fetchImpl, pv, { env: WAKE_ENV, wakeWord: plainWake }));
+    expect(plainWake).toHaveBeenCalledTimes(1);
+    plainHost.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(plain.job.shutdown).toHaveBeenCalled());
+  });
+
+  it('asks the transcription to rotate long activities in a meeting only', async () => {
+    const options: TranscriberOptions[] = [];
+    const capture = (v: ReturnType<typeof fakeVoice>) => (o: TranscriberOptions) => {
+      options.push(o);
+      v.interim = (text) => o.onInterim(text);
+      return v.transcription;
+    };
+    const m = meetingJob();
+    m.join(mirror('uuid-1', 'Misha'));
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(m.ctx, { ...callDeps(host.fetchImpl, v), transcriber: capture(v) });
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(m.job.shutdown).toHaveBeenCalled());
+    const plain = fakeJob();
+    const plainHost = fakeHostFetch();
+    const pv = fakeVoice();
+    await runCall(plain.ctx, { ...callDeps(plainHost.fetchImpl, pv), transcriber: capture(pv) });
+    plainHost.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(plain.job.shutdown).toHaveBeenCalled());
+    expect(options[0].activityMaxMs).toBe(MEETING_ACTIVITY_MAX_MS);
+    expect(options[1]).not.toHaveProperty('activityMaxMs');
   });
 
   it('takes no turn until addressed when no page sets the switch, and ends once the meeting stayed empty', async () => {
