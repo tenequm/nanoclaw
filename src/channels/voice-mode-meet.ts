@@ -114,7 +114,10 @@ export function meetBridgeFromEnv(
 
 export type MeetCommand = { action: 'join'; url: string } | { action: 'leave' } | { action: 'usage' };
 
-/** A Google Meet link as typed, or as Slack wraps it (`<https://...>` or `<https://...|label>`); null otherwise. */
+/**
+ * A Google Meet link as typed, or as Slack wraps it (`<https://...>` or `<https://...|label>`), as its origin and
+ * path only; null for anything else, or one with credentials or a port.
+ */
 export function meetingUrl(raw: string): string | null {
   const unwrapped = raw.replace(/^<([^|>]+)(?:\|[^>]*)?>$/, '$1');
   let url: URL;
@@ -124,7 +127,9 @@ export function meetingUrl(raw: string): string | null {
     return null;
   }
   if (url.protocol !== 'https:' || url.hostname !== 'meet.google.com' || url.pathname.length < 2) return null;
-  return url.toString();
+  if (url.username || url.password || url.port) return null;
+  // Only the meeting code path goes on to the bot: no query or fragment.
+  return `${url.origin}${url.pathname}`;
 }
 
 /** `/meet <url>`, `/meet leave`, `/meet@<bot> ...` and, on Slack, `!meet ...`; null for any other message. */

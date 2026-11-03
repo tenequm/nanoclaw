@@ -82,6 +82,19 @@ describe('parseMeetCommand', () => {
     expect(meetingUrl('https://meet.google.com.evil.example/abc')).toBeNull();
     expect(meetingUrl('not a url')).toBeNull();
   });
+
+  it('refuses credentials and ports, and passes on only the origin and meeting code path', () => {
+    expect(meetingUrl('https://user@meet.google.com/abc-defg-hij')).toBeNull();
+    expect(meetingUrl('https://user:pw@meet.google.com/abc-defg-hij')).toBeNull();
+    expect(meetingUrl('https://meet.google.com:8443/abc-defg-hij')).toBeNull();
+    expect(meetingUrl('https://meet.google.com:443/abc-defg-hij')).toBe('https://meet.google.com/abc-defg-hij');
+    expect(meetingUrl('https://meet.google.com/abc-defg-hij?authuser=1&x=<y>#frag')).toBe(
+      'https://meet.google.com/abc-defg-hij',
+    );
+    expect(meetingUrl('<https://meet.google.com/abc-defg-hij?pli=1|Meet>')).toBe(
+      'https://meet.google.com/abc-defg-hij',
+    );
+  });
 });
 
 describe('Attendee bridge', () => {
