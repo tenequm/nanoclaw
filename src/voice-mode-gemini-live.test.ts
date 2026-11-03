@@ -71,7 +71,7 @@ class FakeSocket implements LiveSocket {
   }
 }
 
-function harness(vocabulary = ['Andy', 'send it', 'прийом'], debug = false) {
+function harness(vocabulary = ['Andy', 'send it', 'прийом'], debug = false, activityMaxMs?: number) {
   vi.useFakeTimers();
   const sockets: FakeSocket[] = [];
   const interims: string[] = [];
@@ -91,6 +91,7 @@ function harness(vocabulary = ['Andy', 'send it', 'прийом'], debug = false
       return socket;
     },
     ...(debug ? { debug } : {}),
+    ...(activityMaxMs ? { activityMaxMs } : {}),
   });
   const result = (p: Promise<Heard>) => {
     let out: Heard | undefined;
@@ -406,6 +407,81 @@ describe('GeminiLiveTranscriber', () => {
     h.sockets[1].final('for two.');
     await h.tick(FINAL_GRACE_MS);
     expect(done()).toMatchObject({ final: 'Book a table for two.' });
+  });
+
+  it('with activityMaxMs, a long activity rotates to a fresh socket before the server cap, its text kept in order', async () => {
+    const h = harness(undefined, false, 200_000);
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(0);
+    // 30 minutes of speech in one activity, 100 ms at a time: a fresh socket every 200 s.
+    for (let s = 1; s <= 1800; s++) {
+      h.t.push(pcm(1000));
+      await h.tick(1000);
+      const current = h.sockets.at(-1)!;
+      if (!current.sent.length) {
+        current.ready();
+        await h.tick(0);
+      }
+      if (s % 200 === 199) current.interim(`part ${h.sockets.length}`);
+    }
+    // 200 s on each socket, plus the second each fresh one takes to set up here.
+    expect(h.sockets).toHaveLength(9);
+    for (const socket of h.sockets.slice(0, -1)) {
+      expect(socket.kinds[0]).toBe('start');
+      expect(socket.kinds.at(-1)).toBe('end');
+      expect(socket.closed).toBe(1000);
+    }
+    expect(h.info).toHaveBeenCalledWith('voice-mode worker: the transcription moves to a fresh socket mid-turn', {
+      why: 'activity-age',
+      partMs: 200_000,
+    });
+    // Still transcribing at minute 30: a wake phrase there reaches the turns, after everything before it.
+    h.sockets.at(-1)!.interim('Hey Dan, what is two plus two');
+    expect(h.interims.at(-1)).toBe(
+      'part 1 part 2 part 3 part 4 part 5 part 6 part 7 part 8 Hey Dan, what is two plus two',
+    );
+    expect(h.warn).not.toHaveBeenCalled();
+  });
+
+  it('with activityMaxMs, the server finishing an open activity hands it over at once; after its end it settles as before', async () => {
+    const h = harness(undefined, false, 200_000);
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(0);
+    h.sockets[0].interim('We shipped the release');
+    h.sockets[0].say({ inputTranscription: { text: 'We shipped the release.' }, generationComplete: true });
+    expect(h.sockets[0].kinds.at(-1)).toBe('end');
+    await h.tick(0);
+    h.sockets[1].ready();
+    await h.tick(0);
+    h.t.push(pcm(100));
+    h.sockets[1].interim('Hey Dan, zulu');
+    expect(h.interims.at(-1)).toBe('We shipped the release. Hey Dan, zulu');
+    await h.tick(FINAL_TIMEOUT_MS);
+    const done = h.result(h.t.end());
+    await h.tick(0);
+    h.sockets[1].say({ inputTranscription: { text: 'Hey Dan, zulu.' }, generationComplete: true });
+    await h.tick(0);
+    expect(done()).toMatchObject({ final: 'We shipped the release. Hey Dan, zulu.' });
+    expect(h.sockets).toHaveLength(2);
+  });
+
+  it('without activityMaxMs, nothing rotates before the socket age and a mid-activity generationComplete is ignored', async () => {
+    const h = harness();
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(0);
+    for (let i = 0; i < 250; i++) {
+      h.t.push(pcm(1000));
+      await h.tick(1000);
+    }
+    h.sockets[0].say({ inputTranscription: { text: 'Long talk.' }, generationComplete: true });
+    expect(h.sockets).toHaveLength(1);
+    expect(h.sockets[0].kinds.at(-1)).not.toBe('end');
   });
 
   it('a full send buffer holds the audio without blocking, sends it when it drains, and the end waits for all of it', async () => {

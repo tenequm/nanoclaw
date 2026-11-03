@@ -75,6 +75,12 @@ export interface TranscriberOptions {
   /** The open activity's whole text so far, as it grows. */
   onInterim(text: string): void;
   log: Pick<Console, 'info' | 'warn'>;
+  /**
+   * Hand an activity to a fresh socket once its part on one socket is this old, and at once when the
+   * server says it is done before the activity's end: Gemini Live stops transcribing an activity
+   * ~221 s in (a final plus `generationComplete`, then nothing). Unset, neither happens.
+   */
+  activityMaxMs?: number;
   socket?: (url: string) => LiveSocket;
   /**
    * VOICE_MODE_TRANSCRIPT_DEBUG: log every raw message, what was forwarded, the activity's start, end
@@ -118,8 +124,9 @@ interface Activity {
    */
   heard: string;
   socket?: Socket;
-  /** activityStart went out on `socket`; `endSent`: activityEnd too. */
+  /** activityStart went out on `socket` (at `partFrom`, Date.now() ms); `endSent`: activityEnd too. */
   started: boolean;
+  partFrom: number;
   endSent: boolean;
   /** Audio waiting for `socket` to take it: before its setup, or while its send buffer is full. */
   queued: Int16Array[];
@@ -213,6 +220,7 @@ export class GeminiLiveTranscriber {
       part: { finals: [], interim: '' },
       heard: '',
       started: false,
+      partFrom: 0,
       endSent: false,
       queued: [],
       queuedSamples: 0,
@@ -237,6 +245,9 @@ export class GeminiLiveTranscriber {
     const activity = this.activity;
     if (!activity || activity.failed) return;
     if (activity.socket && Date.now() >= activity.socket.retireAt) this.handOver(activity, 'age');
+    else if (activity.started && this.partAge(activity) >= (this.opts.activityMaxMs ?? Infinity)) {
+      this.handOver(activity, 'activity-age');
+    }
     this.queue(activity, pcm);
     this.pump(activity);
   }
@@ -302,6 +313,7 @@ export class GeminiLiveTranscriber {
     activity.socket = socket;
     socket.activity = activity;
     activity.started = true;
+    activity.partFrom = Date.now();
     socket.onLost = () => this.lost(activity, socket);
     socket.onContent = (content) => this.onContent(activity, content);
     this.send(socket, { realtimeInput: { activityStart: {} } });
@@ -391,8 +403,9 @@ export class GeminiLiveTranscriber {
   private handOver(activity: Activity, why: string): void {
     const old = activity.socket;
     if (!old) return;
-    this.opts.log.info('voice-mode worker: the transcription moves to a fresh socket mid-turn', { why });
-    this.debug('handover', activity, { why, sid: old.id });
+    const partMs = this.partAge(activity);
+    this.opts.log.info('voice-mode worker: the transcription moves to a fresh socket mid-turn', { why, partMs });
+    this.debug('handover', activity, { why, sid: old.id, partMs });
     const { part, slot } = this.detach(activity);
     activity.stallSince = 0;
     activity.draining++;
@@ -487,9 +500,17 @@ export class GeminiLiveTranscriber {
       });
       if (activity.endSent) this.graceThenSettle(activity);
     }
-    if ((content.turnComplete || content.generationComplete) && activity.endSent && activity.part.finals.length) {
-      this.settleWhenDrained(activity);
+    const done = content.turnComplete || content.generationComplete;
+    if (done && activity.endSent && activity.part.finals.length) this.settleWhenDrained(activity);
+    else if (done && this.opts.activityMaxMs && activity.started && !activity.endSent && !activity.ending) {
+      // The server finished an activity still open: it would transcribe nothing more of it.
+      this.handOver(activity, 'server-done');
     }
+  }
+
+  /** How long the activity has run on its current socket, ms. */
+  private partAge(activity: Activity): number {
+    return Date.now() - activity.partFrom;
   }
 
   private settleWhenDrained(activity: Activity): void {
