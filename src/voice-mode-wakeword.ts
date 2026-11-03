@@ -7,14 +7,15 @@
  * the frozen mel model (x/10 + 2), the speech embedding on 76-frame mel windows every 8 frames, and
  * the classifier on the last 16 embeddings (or as many as its input takes, with a longer window:
  * openWakeWord classifiers load too). Like the reference listener, a window is scored every
- * 80 ms of new audio.
+ * 80 ms of new audio; with VOICE_MODE_WAKE_HOP_MS=40 (the default), on two such grids offset by 40 ms.
  *
- * Imports nothing local: the worker thread loads this same file, as `.js` from the build and as
- * `.ts` (type-stripped by Node) under the tests.
+ * Imports nothing local statically: the worker thread loads this same file, as `.js` from the build and
+ * as `.ts` (type-stripped by Node) under the tests. Only the main thread's logger is a dynamic import.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseEnv } from 'node:util';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 
 import * as ort from 'onnxruntime-node';
@@ -22,11 +23,23 @@ import * as ort from 'onnxruntime-node';
 export const WAKE_SAMPLE_RATE = 16_000;
 /** The audio one score looks at for a 16-embedding classifier: 2 s, as the reference listener's. */
 export const WAKE_WINDOW_SAMPLES = 32_000;
-/** New audio between scores: 80 ms, the reference listener's frame. */
+/**
+ * New audio between one grid's scores: 80 ms, the reference listener's frame and the embedding stride,
+ * so a grid's consecutive windows can share all but one embedding.
+ */
 export const WAKE_HOP_SAMPLES = 1_280;
+export const WAKE_HOP_ENV = 'VOICE_MODE_WAKE_HOP_MS';
+/**
+ * The hops between scores: 80 ms is one grid; 40 ms is two, offset by 40 ms. One 80 ms grid misses
+ * phrases that fall between its windows (on real calls a score swings 0.3-0.5 within 40 ms of offset),
+ * and a single grid at 40 ms shares no embeddings between neighbours: over a core on bl, behind real time.
+ */
+export const WAKE_HOPS_MS = [40, 80] as const;
+export type WakeHopMs = (typeof WAKE_HOPS_MS)[number];
+export const DEFAULT_WAKE_HOP_MS: WakeHopMs = 40;
 const WAKE_DEBOUNCE_MS = 2_000;
-/** Windows that may wait for the thread; more means it is slower than real time. */
-const WAKE_MAX_QUEUED = 8;
+/** Audio that may wait for the thread, in windows of one grid: 640 ms; more means it is slower than real time. */
+const WAKE_MAX_QUEUED_SAMPLES = 8 * WAKE_HOP_SAMPLES;
 /** How long a closing thread may take to finish its score and release the models. */
 const WAKE_STOP_MS = 3_000;
 /** livekit-wakeword's documented optimal threshold for its conv-attention `hey_livekit` model. */
@@ -69,8 +82,8 @@ export class WakeWordPipeline {
   readonly embeddings: number;
   /** Mel windows run through the embedding model so far: `embeddings` per score without reuse. */
   embedded = 0;
-  /** The last window scored, to reuse the embeddings of mel windows it shares with the next. */
-  private last?: { end: number; mel: Float32Array; embeddings: Float32Array };
+  /** Each grid's last window scored, to reuse the embeddings of mel windows it shares with that grid's next. */
+  private readonly last = new Map<number, { end: number; mel: Float32Array; embeddings: Float32Array }>();
 
   private constructor(mel: ort.InferenceSession, embedding: ort.InferenceSession, classifier: ort.InferenceSession) {
     this.mel = mel;
@@ -99,9 +112,10 @@ export class WakeWordPipeline {
    * classifier's embeddings. `end`, the stream position of the window's last sample, lets consecutive windows
    * share work: an embedding is reused only when its 76 mel frames are bit-for-bit the ones it was
    * computed from (the mel model clips to 80 dB under each window's own peak, so a window whose peak
-   * moved recomputes), so the score is the reference's.
+   * moved recomputes), so the score is the reference's. `grid` keeps that reuse per interleaved grid:
+   * windows 40 ms apart share no mel window (the embedding stride is 80 ms), each grid's 80 ms apart do.
    */
-  async score(audio: Float32Array, end?: number): Promise<number> {
+  async score(audio: Float32Array, end?: number, grid = 0): Promise<number> {
     const melOut = await this.mel.run({
       [this.mel.inputNames[0]]: new ort.Tensor('float32', audio, [1, audio.length]),
     });
@@ -111,7 +125,7 @@ export class WakeWordPipeline {
     const melDb = melTensor.data as Float32Array;
     const windows = frames < EMBEDDING_WINDOW ? 0 : Math.floor((frames - EMBEDDING_WINDOW) / EMBEDDING_STRIDE) + 1;
     if (windows < this.embeddings) {
-      this.last = undefined;
+      this.last.delete(grid);
       return 0;
     }
     const first = windows - this.embeddings;
@@ -123,7 +137,7 @@ export class WakeWordPipeline {
       for (let i = 0; i < perWindow; i++) mel[w * perWindow + i] = melDb[from + i] / 10 + 2;
     }
     const embeddings = new Float32Array(this.embeddings * EMBEDDING_DIM);
-    const last = this.last;
+    const last = this.last.get(grid);
     const hop = EMBEDDING_STRIDE * (WAKE_SAMPLE_RATE / 100);
     const shift = last && end !== undefined && (end - last.end) % hop === 0 ? (end - last.end) / hop : 0;
     const missing: number[] = [];
@@ -149,7 +163,8 @@ export class WakeWordPipeline {
         embeddings.set(computed.subarray(i * EMBEDDING_DIM, (i + 1) * EMBEDDING_DIM), w * EMBEDDING_DIM),
       );
     }
-    this.last = end === undefined ? undefined : { end, mel, embeddings };
+    if (end === undefined) this.last.delete(grid);
+    else this.last.set(grid, { end, mel, embeddings });
     this.embedded += missing.length;
     const scoreOut = await this.classifier.run({
       [this.classifier.inputNames[0]]: new ort.Tensor('float32', embeddings, [1, this.embeddings, EMBEDDING_DIM]),
@@ -174,6 +189,13 @@ interface ThreadInit {
   classifier: string;
 }
 type ThreadReply = { ready: true; embeddings: number } | { error: string } | { id: number; score: number; ms: number };
+/** A window to score; `grid` is which of the interleaved 80 ms grids it is on. */
+interface WakeWindow {
+  id: number;
+  audio: Float32Array<ArrayBuffer>;
+  end: number;
+  grid: number;
+}
 
 if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
   const init = workerData as ThreadInit;
@@ -181,7 +203,7 @@ if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
   WakeWordPipeline.load(init.classifier).then(
     (pipeline) => {
       let scoring: Promise<unknown> = Promise.resolve();
-      port.on('message', (msg: { id: number; audio: Float32Array; end: number } | { stop: true }) => {
+      port.on('message', (msg: WakeWindow | { stop: true }) => {
         if ('stop' in msg) {
           // Out of native code before the thread goes: terminated mid-inference, onnxruntime's
           // pending Napi::Error aborts the whole process.
@@ -192,7 +214,7 @@ if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
           return;
         }
         const started = performance.now();
-        scoring = pipeline.score(msg.audio, msg.end).then(
+        scoring = pipeline.score(msg.audio, msg.end, msg.grid).then(
           (score) => port.postMessage({ id: msg.id, score, ms: performance.now() - started } satisfies ThreadReply),
           (err: unknown) => port.postMessage({ error: String(err) } satisfies ThreadReply),
         );
@@ -204,12 +226,45 @@ if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
   );
 }
 
+type WarnLog = (message: string, data: Record<string, unknown>) => void;
+const logWarn: WarnLog = (message, data) =>
+  void import('./log.js').then(({ log }) => log.warn(message, data)).catch(() => console.warn(message, data));
+
+/** VOICE_MODE_WAKE_HOP_MS: 40 (the default) or 80. Anything else is logged and read as the default. */
+export function wakeHopMs(raw: string | undefined, warn: WarnLog = logWarn): WakeHopMs {
+  const value = raw?.trim();
+  if (!value) return DEFAULT_WAKE_HOP_MS;
+  const hop = WAKE_HOPS_MS.find((allowed) => allowed === Number(value));
+  if (hop !== undefined) return hop;
+  warn(`voice-mode: ${WAKE_HOP_ENV} must be one of ${WAKE_HOPS_MS.join(', ')}; using ${DEFAULT_WAKE_HOP_MS}`, {
+    value,
+    hopMs: DEFAULT_WAKE_HOP_MS,
+  });
+  return DEFAULT_WAKE_HOP_MS;
+}
+
+/** VOICE_MODE_WAKE_HOP_MS from `root`'s .env, where the call's other wake settings are read. */
+export function wakeHopFromEnv(root = process.cwd(), warn?: WarnLog): WakeHopMs {
+  let text: string;
+  try {
+    text = fs.readFileSync(path.join(root, '.env'), 'utf-8');
+  } catch {
+    return DEFAULT_WAKE_HOP_MS;
+  }
+  return wakeHopMs(parseEnv(text)[WAKE_HOP_ENV], warn);
+}
+
+/** Read once per process, as the call's other settings are: a `.env` change reaches calls after a worker restart. */
+let configuredHopMs: WakeHopMs | undefined;
+
 export interface WakeWordOptions {
   /** The classifier .onnx; the feature models are the bundled ones. */
   classifier: string;
   /** What the classifier listens for, as the page names it (VOICE_MODE_WAKE_PHRASE). */
   phrase: string;
   threshold: number;
+  /** Audio between scores; VOICE_MODE_WAKE_HOP_MS from the working directory's .env when not given. */
+  hopMs?: WakeHopMs;
   /**
    * A detection: its score, and the window that had the phrase, as positions in the audio pushed so
    * far (samples; `end` exclusive). Its end is where scoring stopped, not where the phrase did: the
@@ -223,8 +278,10 @@ export interface WakeWordOptions {
 
 /** What scoring cost so far, for the call's log. */
 export interface WakeWordStats {
+  /** The hop the windows were taken at (always set by the spotter). */
+  hopMs?: WakeHopMs;
   scored: number;
-  /** Windows dropped because scoring fell behind by more than WAKE_MAX_QUEUED: slower than real time. */
+  /** Windows dropped because scoring fell behind by more than WAKE_MAX_QUEUED_SAMPLES: slower than real time. */
   skipped: number;
   meanMs: number;
   maxMs: number;
@@ -234,14 +291,21 @@ export interface WakeWordStats {
 
 /**
  * Spots the wake word in a call's 16 kHz mono audio. `push` keeps the last 2 s; while `listen` is on,
- * the window ending at every 80 ms of new audio is scored in the worker thread, one at a time, in
- * order (audio arrives in bursts, so a few wait; past WAKE_MAX_QUEUED the oldest is dropped). A score
- * at or over the threshold is a detection, at most one per WAKE_DEBOUNCE_MS; the audio before it is
- * forgotten (silenced), so it cannot fire twice.
+ * the window ending at every hop of new audio is scored in the worker thread, one at a time, in order
+ * (audio arrives in bursts, so a few wait; past WAKE_MAX_QUEUED_SAMPLES the oldest is dropped). A 40 ms
+ * hop is two 80 ms grids taking turns, each reusing its own embeddings; both feed the one detection
+ * check. A score at or over the threshold is a detection, at most one per WAKE_DEBOUNCE_MS; the audio
+ * before it is forgotten (silenced) and every window taken before it dropped, whichever grid it was on,
+ * so one phrase is one detection.
  */
 export class WakeWordSpotter {
   readonly phrase: string;
   readonly threshold: number;
+  readonly hopMs: WakeHopMs;
+  private readonly hopSamples: number;
+  /** Interleaved 80 ms grids: 2 for a 40 ms hop. */
+  private readonly grids: number;
+  private readonly maxQueued: number;
   /** Resolves once the models are loaded, rejects when they cannot be. */
   readonly ready: Promise<void>;
   private readonly thread: Worker;
@@ -252,6 +316,8 @@ export class WakeWordSpotter {
   /** Samples pushed so far: where the window just taken ends, for the thread to reuse work. */
   private position = 0;
   private sinceScore = 0;
+  /** Windows taken since scoring last restarted (listen, a detection): the next one's grid, in turn. */
+  private taken = 0;
   private listening = false;
   private loaded = false;
   private closed = false;
@@ -259,7 +325,7 @@ export class WakeWordSpotter {
   /** Where the window being scored ends in the stream. */
   private inflightEnd = 0;
   /** Windows taken while one was being scored. */
-  private queued: Array<{ id: number; audio: Float32Array<ArrayBuffer>; end: number }> = [];
+  private queued: WakeWindow[] = [];
   private nextId = 0;
   /** Scores of windows taken before this id are stale (the audio was forgotten). */
   private validFrom = 0;
@@ -272,6 +338,10 @@ export class WakeWordSpotter {
     this.options = options;
     this.phrase = options.phrase;
     this.threshold = options.threshold;
+    this.hopMs = options.hopMs ?? (configuredHopMs ??= wakeHopFromEnv());
+    this.hopSamples = (this.hopMs * WAKE_SAMPLE_RATE) / 1000;
+    this.grids = WAKE_HOP_SAMPLES / this.hopSamples;
+    this.maxQueued = WAKE_MAX_QUEUED_SAMPLES / this.hopSamples;
     this.now = options.now ?? (() => Date.now());
     this.thread = new Worker(new URL(import.meta.url), {
       workerData: { wakeWordThread: true, classifier: options.classifier } satisfies ThreadInit,
@@ -308,12 +378,13 @@ export class WakeWordSpotter {
   /**
    * Score windows (on) or not (off). Turned on, what was said while it was off (a phrase while the turn
    * was open, the end of a review recording) is forgotten, so it never opens a turn; the first window
-   * scores 80 ms on, not 2 s, so a phrase said right away is heard.
+   * scores one hop on, not 2 s, so a phrase said right away is heard. Every grid restarts from here.
    */
   listen(on: boolean): void {
     if (on === this.listening) return;
     this.listening = on;
     this.sinceScore = 0;
+    this.taken = 0;
     this.queued = [];
     if (on) this.forget();
   }
@@ -336,9 +407,9 @@ export class WakeWordSpotter {
       this.ring[this.write] = pcm[i] / 32768;
       this.write = (this.write + 1) % size;
       this.position++;
-      // A window every 80 ms, on the 80 ms boundary whatever the frame size, so consecutive windows
-      // share their embeddings.
-      if (!scoring || ++this.sinceScore < WAKE_HOP_SAMPLES) continue;
+      // A window every hop, on the hop boundary whatever the frame size, so each grid's consecutive
+      // windows are 80 ms apart and share their embeddings.
+      if (!scoring || ++this.sinceScore < this.hopSamples) continue;
       this.sinceScore = 0;
       this.take();
     }
@@ -349,16 +420,16 @@ export class WakeWordSpotter {
     const audio = new Float32Array(size);
     audio.set(this.ring.subarray(this.write));
     audio.set(this.ring.subarray(0, this.write), size - this.write);
-    const window = { id: this.nextId++, audio, end: this.position };
+    const window = { id: this.nextId++, audio, end: this.position, grid: this.taken++ % this.grids };
     if (!this.inflight) return this.send(window);
     this.queued.push(window);
-    if (this.queued.length > WAKE_MAX_QUEUED) {
+    if (this.queued.length > this.maxQueued) {
       this.queued.shift();
       this.stats.skipped++;
     }
   }
 
-  private send(window: { id: number; audio: Float32Array<ArrayBuffer>; end: number }): void {
+  private send(window: WakeWindow): void {
     this.inflight = true;
     this.inflightEnd = window.end;
     this.thread.postMessage(window, [window.audio.buffer]);
@@ -367,6 +438,7 @@ export class WakeWordSpotter {
   get summary(): WakeWordStats {
     const { scored, skipped, totalMs, maxMs, detections, maxScore } = this.stats;
     return {
+      hopMs: this.hopMs,
       scored,
       skipped,
       meanMs: scored ? Math.round((totalMs / scored) * 10) / 10 : 0,
@@ -411,6 +483,7 @@ export class WakeWordSpotter {
       // The phrase is in the window just scored: forget it, as the reference listener clears its buffer.
       this.forget();
       this.sinceScore = 0;
+      this.taken = 0;
       this.queued = [];
       this.validFrom = this.nextId;
       this.options.onDetect(score, { start: Math.max(0, this.inflightEnd - this.ring.length), end: this.inflightEnd });
