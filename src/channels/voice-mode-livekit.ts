@@ -51,7 +51,6 @@ import {
   DEFAULT_VOICE_STT_MODEL,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
-  MAX_TURN_TEXT_BYTES,
   PING_INTERVAL_MS,
   settleWithin,
   baseLanguage,
@@ -73,7 +72,13 @@ import { TTS_DEFAULT_CHOICE } from '../voice-mode-tts.js';
 
 const MINUTE_MS = 60_000;
 const MAX_QUEUED_EVENTS = 50;
-const MAX_AGENT_BODY_BYTES = 16 * 1024;
+/**
+ * The longest utterance the host takes, in UTF-8 bytes: above MAX_TURN_TEXT_BYTES, which still caps review drafts on
+ * the worker and clients, so a long spoken turn (about 20 minutes of Ukrainian) is not refused.
+ */
+const MAX_UTTERANCE_TEXT_BYTES = 32 * 1024;
+/** Room for a full-length utterance even when JSON escapes double its text, plus the envelope. */
+const MAX_AGENT_BODY_BYTES = 2 * MAX_UTTERANCE_TEXT_BYTES + 1024;
 const CALLER_TOKEN_TTL_SECONDS = 120;
 /** The worker opens its event stream right after it reports the caller in; without it nothing reaches the caller. */
 const WORKER_STREAM_TIMEOUT_MS = 30_000;
@@ -971,8 +976,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (call.state !== 'live') return reply(res, 409, 'The caller is not in the call');
     const text = typeof body.text === 'string' ? body.text.trim() : '';
     if (!text) return reply(res, 400, 'text is required');
-    if (Buffer.byteLength(text) > MAX_TURN_TEXT_BYTES) {
-      return reply(res, 413, `utterance is too large (${MAX_TURN_TEXT_BYTES / 1024} KB max)`);
+    if (Buffer.byteLength(text) > MAX_UTTERANCE_TEXT_BYTES) {
+      return reply(res, 413, `utterance is too large (${MAX_UTTERANCE_TEXT_BYTES / 1024} KB max)`);
     }
     const turnKey =
       typeof body.turnKey === 'string' && body.turnKey.length <= MAX_TURN_KEY_LENGTH ? body.turnKey : undefined;
