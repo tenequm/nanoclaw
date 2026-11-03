@@ -66,6 +66,8 @@ import {
   TurnTaking,
   turnText,
   CueFeed,
+  speechTrackCues,
+  MEETING_CUE_GAIN,
   cueFrames,
   deEsser,
   lineFilter,
@@ -3801,6 +3803,44 @@ describe('cue audio', () => {
     expect(typing).not.toContain(taken.at(-1));
     feed.stop();
     await feed.running;
+  });
+
+  it('in a meeting, plays the cues and the typing into the speech track between lines only, quieter, at its rate', async () => {
+    const taken: AudioFrame[] = [];
+    const warns: unknown[] = [];
+    const cues = speechTrackCues(
+      { captureFrame: async (frame: AudioFrame) => void taken.push(frame) },
+      { warn: (...args: unknown[]) => void warns.push(args) },
+    );
+    const peak = (frames: AudioFrame[]) => Math.max(...frames.flatMap((f) => [...f.data].map(Math.abs)));
+    // The wake chime: every frame at the speech track's 24 kHz, the whole cue, at MEETING_CUE_GAIN.
+    const wake = cueFrames('wake');
+    let from = taken.length;
+    await cues.feed.play(wake);
+    let heard = taken.slice(from).filter((f) => peak([f]) > 2);
+    for (const f of taken) expect([f.sampleRate, f.channels, f.samplesPerChannel]).toEqual([TTS_SAMPLE_RATE, 1, 480]);
+    expect(heard).toHaveLength(wake.length);
+    expect(peak(heard)).toBeGreaterThan(peak(wake) * MEETING_CUE_GAIN * 0.9);
+    expect(peak(heard)).toBeLessThanOrEqual(Math.ceil(peak(wake) * MEETING_CUE_GAIN));
+    // The working sound loops while the agent works.
+    const typing = await loadTypingSound();
+    cues.feed.setBed(typing);
+    from = taken.length;
+    await vi.waitFor(() => expect(taken.slice(from).filter((f) => peak([f]) > 2).length).toBeGreaterThan(3));
+    // A line starts: nothing more reaches the track, a cue asked for meanwhile included, until it is over.
+    cues.speaking?.(true);
+    await new Promise((r) => setTimeout(r, 30));
+    from = taken.length;
+    await cues.feed.play(cueFrames('sent'));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(taken.length).toBe(from);
+    cues.feed.setBed(undefined);
+    cues.speaking?.(false);
+    await vi.waitFor(() => expect(taken.length).toBeGreaterThan(from + 2));
+    heard = taken.slice(from).filter((f) => peak([f]) > 2);
+    expect(heard).toEqual([]);
+    await cues.close();
+    expect(warns).toEqual([]);
   });
 
   it('ends on a failing source and lets every cue waiting on it go', async () => {

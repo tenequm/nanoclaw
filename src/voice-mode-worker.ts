@@ -1974,14 +1974,58 @@ async function publishSpeechTrack(local: LocalParticipant): Promise<PublishedSpe
   return { source, track, publication };
 }
 
+/** The call's cues: a feed, and once the agent speaks into the same track, whether it does. */
+export interface CallCues {
+  feed: CueFeed;
+  /** An agent line plays (true) or is over; only cues that share the speech track take it. */
+  speaking?(on: boolean): void;
+  close(): Promise<void>;
+}
+
+/** The cues under a meeting's speech: quieter than a call's, since everyone in the meeting hears them. */
+export const MEETING_CUE_GAIN = 0.5;
+
+/** A cue frame (48 kHz) at the speech track's rate (24 kHz) and MEETING_CUE_GAIN: each pair of samples averaged. */
+function speechRateCue(frame: AudioFrame): AudioFrame {
+  const ratio = CUE_SAMPLE_RATE / TTS_SAMPLE_RATE;
+  const samples = frame.samplesPerChannel / ratio;
+  const out = new Int16Array(samples);
+  for (let i = 0; i < samples; i++) {
+    let sum = 0;
+    for (let j = 0; j < ratio; j++) sum += frame.data[i * ratio + j];
+    out[i] = Math.round((sum / ratio) * MEETING_CUE_GAIN);
+  }
+  return new AudioFrame(out, TTS_SAMPLE_RATE, 1, samples);
+}
+
+/**
+ * A meeting's cues, on the speech track's own source: its bot streams one audio track of ours into
+ * the meeting, so the cues and the typing go between the agent's lines there. A line that starts
+ * silences them at once, cues still queued included: nothing plays over the agent.
+ */
+export function speechTrackCues(source: CueSink, log: Pick<Console, 'warn'>): CallCues {
+  let speaking = false;
+  const feed = new CueFeed(
+    { captureFrame: async (frame) => (speaking ? undefined : source.captureFrame(speechRateCue(frame))) },
+    (err) => log.warn('voice-mode worker: the meeting cues stopped', { err }),
+  );
+  return {
+    feed,
+    speaking(on) {
+      speaking = on;
+    },
+    async close() {
+      feed.stop();
+      await feed.running;
+    },
+  };
+}
+
 /**
  * Publish the cue track (CALL_CUE_TRACK) on its own source. DTX off: the track never goes quiet on
  * the wire, so the first milliseconds of a cue are never spent waking it up.
  */
-async function publishCueTrack(
-  local: LocalParticipant,
-  log: WorkerLog,
-): Promise<{ feed: CueFeed; close(): Promise<void> }> {
+async function publishCueTrack(local: LocalParticipant, log: WorkerLog): Promise<CallCues> {
   const source = new AudioSource(CUE_SAMPLE_RATE, 1, CUE_QUEUE_MS);
   const track = LocalAudioTrack.createAudioTrack(CALL_CUE_TRACK, source);
   const publication = await local.publishTrack(track, new TrackPublishOptions({ dtx: false }));
@@ -4403,10 +4447,10 @@ async function roomVoice(
     publication: speechPublication,
   } = settings.speech ?? (await publishSpeechTrack(local));
   // The cues' own track: never the speech track, so a cue is never the agent speaking. Without it
-  // the call runs silent of cues. A meeting gets none: its bot streams one audio track of ours into
-  // the meeting, the one subscribed last, which would be the cues'.
-  const cueTrack = meta.meeting
-    ? undefined
+  // the call runs silent of cues. A meeting publishes none: its bot streams one audio track of ours
+  // into the meeting, the one subscribed last, so its cues go into the speech track between lines.
+  const cueTrack: CallCues | undefined = meta.meeting
+    ? speechTrackCues(speechSource, log)
     : await publishCueTrack(local, log).catch((err: unknown) => {
         log.warn('voice-mode worker: could not publish the cue track', { err });
         return undefined;
@@ -4485,6 +4529,7 @@ async function roomVoice(
     sink: speechSource,
     log,
     started: (text) => {
+      cueTrack?.speaking?.(true);
       setAttr(AGENT_STATE_ATTRIBUTE, 'speaking', 'the agent state');
       events.onAgentSpeaking(true);
       // The line's caption, on the agent's speech track, as its audio starts.
@@ -4500,6 +4545,7 @@ async function roomVoice(
       );
     },
     stopped: () => {
+      cueTrack?.speaking?.(false);
       setAttr(AGENT_STATE_ATTRIBUTE, 'listening', 'the agent state');
       events.onAgentSpeaking(false);
     },
