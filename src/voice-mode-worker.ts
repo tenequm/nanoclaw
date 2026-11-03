@@ -2554,7 +2554,6 @@ export class CallTurns {
     if (this.turn && !this.speaking) this.armPause();
     this.arm();
     this.syncHold();
-    this.publish();
   }
 
   /** The caller's audio, every frame: kept for pre-rolls, and the open turn's while no agent line plays. */
@@ -2741,7 +2740,6 @@ export class CallTurns {
     if (turn?.kind === 'auto' && !turn.addressed) void this.finish('unaddressed');
     else if (turn?.kind === 'auto') parts.push(this.finish('switch'));
     this.syncHold();
-    this.publish();
     if (!parts.length) return null;
     const recordings = (await Promise.all(parts)).filter((r): r is Recording => !!r);
     if (!recordings.length) return null;
@@ -2911,7 +2909,6 @@ export class CallTurns {
     this.waitingSince = this.ring.position;
     this.deps.noTurn();
     this.syncHold();
-    this.publish();
   }
 
   /** Woken with nothing said within the start limit: back to waiting, with the sleep cue. No transcription was ever opened. */
@@ -2927,15 +2924,13 @@ export class CallTurns {
     this.deps.cue('sleep');
     this.deps.noTurn();
     this.syncHold();
-    this.publish();
   }
 
-  /** The wake phrase opened the turn. */
+  /** The wake phrase was heard: the awake state, or a transcript-woken turn addressed. */
   private woke(): void {
     this.wakes++;
     this.syncHold();
     this.deps.cue('wake');
-    this.publish();
     this.arm();
   }
 
@@ -3370,10 +3365,7 @@ export class CallTurns {
     // After a dropped prefix the sent words are a turn of their own, on a caption line of their own.
     const segment = act.scratched ? ++this.segments : turn.segment;
     this.deps.cue('sent', () => (facts.cueMs = Math.round(this.now() - facts.speechEndAt)));
-    if (closed.wake) {
-      this.waitingSince = closed.endedAt;
-      this.publish();
-    }
+    if (closed.wake) this.waitingSince = closed.endedAt;
     this.syncHold();
     let lead = '';
     const done = (turn.before ?? Promise.resolve(''))
