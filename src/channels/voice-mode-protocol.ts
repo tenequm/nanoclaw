@@ -169,7 +169,11 @@ export interface CallUnheardSpeech {
   unheard: 'agent_speaking';
 }
 
-/** The host takes a caller turn of at most this many UTF-8 bytes; a longer review draft cannot be sent. */
+/**
+ * A review draft of more than this many UTF-8 bytes cannot be sent (the worker marks it `tooLong`, the
+ * page and Hey Dan mirror it). It no longer bounds what the host takes: its utterance limit is the
+ * larger MAX_UTTERANCE_TEXT_BYTES in voice-mode-livekit.ts, so a long hands-free turn still goes.
+ */
 export const MAX_TURN_TEXT_BYTES = 8 * 1024;
 
 /**
