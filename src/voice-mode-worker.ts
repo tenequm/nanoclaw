@@ -1305,6 +1305,8 @@ export interface TurnFacts {
   finals: number;
   /** Some of its audio never reached the transcription. */
   audioLost?: boolean;
+  /** Its activity went on in a fresh transcription socket and activity this many times (Heard.rotations). */
+  rotations?: number;
   words: number;
   speechMs: number;
   /** Wall clock of the caller's last speech end, where the stage timings count from. */
@@ -3071,6 +3073,7 @@ export class CallTurns {
       ...(source === 'collapse_interim' ? { collapsed: true } : {}),
       finals: heard.finals,
       ...(heard.failed ? { audioLost: true } : {}),
+      ...(heard.rotations ? { rotations: heard.rotations } : {}),
       words: wordCount(said),
       speechMs: Math.round(turn.speechMs),
       speechEndAt: closed.endWall - closed.activityEndMs,

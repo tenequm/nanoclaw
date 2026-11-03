@@ -7,7 +7,9 @@
  * Every activity gets a fresh WebSocket, retired once its final came: the server does not order
  * transcriptions against other messages, so one socket per activity keeps one turn's text out of
  * the next. Audio goes out only inside an activity. A socket that closes, says it goes away, or gets
- * old inside an activity hands the activity to a fresh one, keeping the words heard so far.
+ * old inside an activity hands the activity to a fresh one, keeping the words heard so far; so does
+ * an activity that nears the server's own cap on one activity (ACTIVITY_MAX_MS), or that the server
+ * finished on its own before its activityEnd.
  *
  * Wire protocol per https://ai.google.dev/gemini-api/docs/live-api/live-transcribe and
  * https://ai.google.dev/api/live: setup first and nothing else before setupComplete, 16 kHz s16le
@@ -17,6 +19,12 @@ const LIVE_URL =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 /** A socket hands its activity to a fresh one at this age: Live connections last about ten minutes. */
 export const SOCKET_MAX_AGE_MS = 8 * 60_000;
+/**
+ * An activity goes on in a fresh socket and activity this long after its activityStart:
+ * transcribe-live stops transcribing an activity 221-223 s in (a final and generationComplete, then
+ * nothing, and no error), so a longer turn would lose everything said after that.
+ */
+export const ACTIVITY_MAX_MS = 200_000;
 /** A goAway's deadline is met this early. */
 const GO_AWAY_MARGIN_MS = 2_000;
 /** How long a new socket may take to say its setup is complete. */
@@ -63,6 +71,8 @@ export interface Heard {
   failed: boolean;
   /** From activityEnd to the result, ms. */
   finalizeMs: number;
+  /** How many times it went on in a fresh socket and activity (age, cap, goAway, stall, a close). */
+  rotations?: number;
 }
 
 export interface TranscriberOptions {
@@ -118,8 +128,10 @@ interface Activity {
    */
   heard: string;
   socket?: Socket;
-  /** activityStart went out on `socket`; `endSent`: activityEnd too. */
+  /** activityStart went out on `socket` (at `startedAt`); `endSent`: activityEnd too. */
   started: boolean;
+  startedAt: number;
+  rotations: number;
   endSent: boolean;
   /** Audio waiting for `socket` to take it: before its setup, or while its send buffer is full. */
   queued: Int16Array[];
@@ -213,6 +225,8 @@ export class GeminiLiveTranscriber {
       part: { finals: [], interim: '' },
       heard: '',
       started: false,
+      startedAt: 0,
+      rotations: 0,
       endSent: false,
       queued: [],
       queuedSamples: 0,
@@ -237,6 +251,7 @@ export class GeminiLiveTranscriber {
     const activity = this.activity;
     if (!activity || activity.failed) return;
     if (activity.socket && Date.now() >= activity.socket.retireAt) this.handOver(activity, 'age');
+    else if (activity.started && Date.now() - activity.startedAt >= ACTIVITY_MAX_MS) this.handOver(activity, 'cap');
     this.queue(activity, pcm);
     this.pump(activity);
   }
@@ -302,6 +317,7 @@ export class GeminiLiveTranscriber {
     activity.socket = socket;
     socket.activity = activity;
     activity.started = true;
+    activity.startedAt = Date.now();
     socket.onLost = () => this.lost(activity, socket);
     socket.onContent = (content) => this.onContent(activity, content);
     this.send(socket, { realtimeInput: { activityStart: {} } });
@@ -391,8 +407,10 @@ export class GeminiLiveTranscriber {
   private handOver(activity: Activity, why: string): void {
     const old = activity.socket;
     if (!old) return;
-    this.opts.log.info('voice-mode worker: the transcription moves to a fresh socket mid-turn', { why });
-    this.debug('handover', activity, { why, sid: old.id });
+    const ageMs = Math.round(Date.now() - activity.startedAt);
+    this.opts.log.info('voice-mode worker: the transcription moves to a fresh socket mid-turn', { why, ageMs });
+    this.debug('handover', activity, { why, sid: old.id, ageMs });
+    activity.rotations++;
     const { part, slot } = this.detach(activity);
     activity.stallSince = 0;
     activity.draining++;
@@ -421,7 +439,8 @@ export class GeminiLiveTranscriber {
         grace = setTimeout(finish, FINAL_GRACE_MS);
       }
     };
-    const cap = setTimeout(finish, FINAL_TIMEOUT_MS);
+    // A socket whose server already finished the activity sends nothing more: only a late final's grace.
+    const cap = setTimeout(finish, why === 'server-done' ? FINAL_GRACE_MS : FINAL_TIMEOUT_MS);
     this.send(old, { realtimeInput: { activityEnd: {} } });
     void this.attach(activity, this.connect());
   }
@@ -451,6 +470,7 @@ export class GeminiLiveTranscriber {
     this.detach(activity);
     if (activity.ending) return this.settle(activity);
     this.opts.log.warn('voice-mode worker: the transcription socket closed mid-turn; the turn goes on in a fresh one');
+    activity.rotations++;
     void this.attach(activity, this.connect());
   }
 
@@ -489,6 +509,10 @@ export class GeminiLiveTranscriber {
     }
     if ((content.turnComplete || content.generationComplete) && activity.endSent && activity.part.finals.length) {
       this.settleWhenDrained(activity);
+    } else if ((content.turnComplete || content.generationComplete) && !activity.endSent && !activity.ending) {
+      // Done before its activityEnd: the server's cap on one activity. Nothing more would be transcribed
+      // here, so the rest goes to a fresh one, after the words this one heard.
+      this.handOver(activity, 'server-done');
     }
   }
 
@@ -513,6 +537,7 @@ export class GeminiLiveTranscriber {
       finals: finals.length,
       failed: activity.failed,
       finalizeMs: activity.endedAt ? Date.now() - activity.endedAt : 0,
+      ...(activity.rotations ? { rotations: activity.rotations } : {}),
     };
     this.debug('settle', activity, { ...heard });
     resolve(heard);

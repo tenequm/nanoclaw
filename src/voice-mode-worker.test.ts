@@ -3707,6 +3707,30 @@ describe('CallTurns, the clocks of a woken turn', () => {
   });
 });
 
+describe('CallTurns, a turn longer than one transcription activity', () => {
+  it('a woken turn talking past 200 s keeps its words, and a send word at the end sends them all', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    const said: string[] = [];
+    // Four minutes of dictation with thinking pauses; the transcription rotated once under it.
+    for (let i = 0; i < 40; i++) {
+      await h.talk(5_000);
+      said.push(`Point ${i + 1}.`);
+      await h.interim(said.join(' '));
+      await h.pass(400);
+    }
+    expect(h.t.begins).toHaveLength(1);
+    expect(h.t.ended).toBe(0);
+    const whole = `${said.join(' ')} Zulu.`;
+    h.t.results.push({ ...heard(whole, whole), rotations: 1 });
+    await h.talk(600);
+    await h.interim(whole);
+    expect(h.out.sent).toEqual([said.join(' ')]);
+    expect(h.out.facts.at(-1)).toMatchObject({ endedBy: 'send', rotations: 1, words: 80 });
+  });
+});
+
 describe('CallTurns, the published wake state', () => {
   const waits = (states: CallWakeState[]) => states.map((s) => s.waiting);
 
