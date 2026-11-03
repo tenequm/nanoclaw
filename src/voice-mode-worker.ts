@@ -135,6 +135,8 @@ import {
   DEFAULT_WAKE_MODEL,
   DEFAULT_WAKE_THRESHOLD,
   WakeWordSpotter,
+  wakeHopMs,
+  type WakeHopMs,
   type WakeWordOptions,
 } from './voice-mode-wakeword.js';
 
@@ -3859,12 +3861,14 @@ export const COMMAND_VOCABULARY: readonly string[] = [...CALL_COMMAND_WORDS.send
 );
 /**
  * VOICE_MODE_WAKE_MODEL (a classifier .onnx; the bundled `hey_livekit` by default, `off` for none),
- * VOICE_MODE_WAKE_THRESHOLD (0-1; the bundled model's documented 0.68 by default, 0.5 for another model)
- * and VOICE_MODE_WAKE_PHRASE (what the model listens for, as the page names it; see wakePhrase).
+ * VOICE_MODE_WAKE_THRESHOLD (0-1; the bundled model's documented 0.68 by default, 0.5 for another model),
+ * VOICE_MODE_WAKE_PHRASE (what the model listens for, as the page names it; see wakePhrase) and
+ * VOICE_MODE_WAKE_HOP_MS (wakeHopMs), a bad one warned about in `log`, the worker's logger by default.
  */
 export function wakeWordSettings(
   env: Record<string, string | undefined>,
-): { classifier: string; threshold: number; phrase: string } | null {
+  log: Pick<WorkerLog, 'warn'> = { warn: (msg, fields) => workerLog(agentsLog()).warn(msg, fields) },
+): { classifier: string; threshold: number; phrase: string; hopMs: WakeHopMs } | null {
   const phrase = wakePhrase(env);
   if (phrase === null) return null;
   const model = env.VOICE_MODE_WAKE_MODEL?.trim();
@@ -3873,6 +3877,7 @@ export function wakeWordSettings(
     classifier: model ? path.resolve(model) : DEFAULT_WAKE_MODEL,
     phrase,
     threshold: threshold > 0 && threshold < 1 ? threshold : model ? CUSTOM_WAKE_THRESHOLD : DEFAULT_WAKE_THRESHOLD,
+    hopMs: wakeHopMs(env.VOICE_MODE_WAKE_HOP_MS, (msg, fields) => log.warn(msg, fields)),
   };
 }
 
@@ -4608,6 +4613,7 @@ function defaultDeps(): RunCallDeps {
     'VOICE_MODE_WAKE_MODEL',
     'VOICE_MODE_WAKE_THRESHOLD',
     'VOICE_MODE_WAKE_PHRASE',
+    'VOICE_MODE_WAKE_HOP_MS',
     'VOICE_MODE_WAKE_START_SECONDS',
     'VOICE_MODE_WAKE_IDLE_SECONDS',
     'VOICE_MODE_TRANSCRIPT_DEBUG',

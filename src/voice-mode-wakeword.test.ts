@@ -1,12 +1,10 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Worker } from 'node:worker_threads';
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { log } from './log.js';
 import {
   DEFAULT_WAKE_HOP_MS,
   DEFAULT_WAKE_MODEL,
@@ -18,7 +16,6 @@ import {
   type WakeHopMs,
   WakeWordPipeline,
   WakeWordSpotter,
-  wakeHopFromEnv,
   wakeHopMs,
 } from './voice-mode-wakeword.js';
 
@@ -147,36 +144,6 @@ describe('wake scoring hop (VOICE_MODE_WAKE_HOP_MS)', () => {
           hopMs: 40,
         },
       );
-    }
-  });
-
-  it("logs through the host's logger by default", async () => {
-    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
-    try {
-      expect(wakeHopMs('120')).toBe(40);
-      await vi.waitFor(() =>
-        expect(warn).toHaveBeenCalledWith(expect.stringContaining('VOICE_MODE_WAKE_HOP_MS'), {
-          value: '120',
-          hopMs: 40,
-        }),
-      );
-    } finally {
-      warn.mockRestore();
-    }
-  });
-
-  it("reads the working directory's .env", () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-hop-'));
-    try {
-      expect(wakeHopFromEnv(root)).toBe(40);
-      fs.writeFileSync(path.join(root, '.env'), 'VOICE_MODE_WAKE_MODEL=off\nVOICE_MODE_WAKE_HOP_MS="80"\n');
-      expect(wakeHopFromEnv(root)).toBe(80);
-      fs.writeFileSync(path.join(root, '.env'), 'VOICE_MODE_WAKE_HOP_MS=33\n');
-      const warn = vi.fn();
-      expect(wakeHopFromEnv(root, warn)).toBe(40);
-      expect(warn).toHaveBeenCalledOnce();
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -369,12 +336,11 @@ describe('WakeWordSpotter', () => {
       classifier: '/nonexistent/hey_nobody.onnx',
       phrase: 'hey nobody',
       threshold: 0.5,
+      hopMs: DEFAULT_WAKE_HOP_MS,
       onDetect: () => undefined,
       onError: () => undefined,
     });
     spotters.push(spotter);
-    // No hop given: the working directory's .env decides.
-    expect(spotter.hopMs).toBe(wakeHopFromEnv());
     await expect(spotter.ready).rejects.toThrow(/not found/);
   });
 });

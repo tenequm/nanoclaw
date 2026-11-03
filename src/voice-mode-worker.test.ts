@@ -4968,7 +4968,7 @@ describe('acoustic wake word in a call', () => {
       ready: load === 'ok' ? Promise.resolve() : new Promise<void>((_, reject) => (fail = reject)),
       listen: vi.fn((on: boolean) => void listening.push(on)),
       push: vi.fn((pcm: Int16Array) => void (pushed += pcm.length)),
-      summary: { scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
+      summary: { hopMs: 40, scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
       utilization: 0,
       close: vi.fn(async () => undefined),
     } satisfies WakeWord;
@@ -5242,6 +5242,7 @@ describe('acoustic wake word', () => {
       classifier: expect.stringMatching(/hey_livekit\.onnx$/),
       threshold: 0.68,
       phrase: 'Hey LiveKit',
+      hopMs: 40,
     });
     expect(wakeWordSettings({ VOICE_MODE_WAKE_MODEL: 'off' })).toBeNull();
     expect(
@@ -5253,9 +5254,30 @@ describe('acoustic wake word', () => {
       classifier: path.resolve('data/models/hey_jarvis.onnx'),
       threshold: 0.5,
       phrase: 'Hey Jarvis',
+      hopMs: 40,
     });
     expect(wakeWordSettings({ VOICE_MODE_WAKE_THRESHOLD: '0.8' })?.threshold).toBe(0.8);
     expect(wakeWordSettings({ VOICE_MODE_WAKE_THRESHOLD: '7' })?.threshold).toBe(0.68);
+  });
+
+  it("reads its scoring hop from the working directory's .env, and warns in the worker's log about a bad one", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-hop-'));
+    try {
+      const warn = vi.fn();
+      const settings = () => wakeWordSettings(workerEnv(['VOICE_MODE_WAKE_HOP_MS'], root), { warn });
+      expect(settings()?.hopMs).toBe(40);
+      fs.writeFileSync(path.join(root, '.env'), 'VOICE_MODE_WAKE_MODEL=data/m.onnx\nVOICE_MODE_WAKE_HOP_MS="80"\n');
+      expect(settings()?.hopMs).toBe(80);
+      expect(warn).not.toHaveBeenCalled();
+      fs.writeFileSync(path.join(root, '.env'), 'VOICE_MODE_WAKE_HOP_MS=33\n');
+      expect(settings()?.hopMs).toBe(40);
+      expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('VOICE_MODE_WAKE_HOP_MS'), {
+        value: '33',
+        hopMs: 40,
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('reads its limits from the settings, in seconds; 0 is never', () => {
@@ -5791,7 +5813,7 @@ describe('fast send words', () => {
       ready: Promise.resolve(),
       listen: vi.fn((on: boolean) => void listening.push(on)),
       push: vi.fn((pcm: Int16Array) => void (pushed += pcm.length)),
-      summary: { scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
+      summary: { hopMs: 40, scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
       utilization: 0,
       close: vi.fn(async () => undefined),
     } satisfies WakeWord;

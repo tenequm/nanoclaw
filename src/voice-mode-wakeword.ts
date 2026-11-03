@@ -10,12 +10,11 @@
  * 80 ms of new audio; with VOICE_MODE_WAKE_HOP_MS=40 (the default), on two such grids offset by 40 ms.
  *
  * Imports nothing local statically: the worker thread loads this same file, as `.js` from the build and
- * as `.ts` (type-stripped by Node) under the tests. Only the main thread's logger is a dynamic import.
+ * as `.ts` (type-stripped by Node) under the tests.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseEnv } from 'node:util';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 
 import * as ort from 'onnxruntime-node';
@@ -28,7 +27,7 @@ export const WAKE_WINDOW_SAMPLES = 32_000;
  * so a grid's consecutive windows can share all but one embedding.
  */
 export const WAKE_HOP_SAMPLES = 1_280;
-export const WAKE_HOP_ENV = 'VOICE_MODE_WAKE_HOP_MS';
+const WAKE_HOP_ENV = 'VOICE_MODE_WAKE_HOP_MS';
 /**
  * The hops between scores: 80 ms is one grid; 40 ms is two, offset by 40 ms. One 80 ms grid misses
  * phrases that fall between its windows (on real calls a score swings 0.3-0.5 within 40 ms of offset),
@@ -226,12 +225,11 @@ if (!isMainThread && (workerData as ThreadInit | undefined)?.wakeWordThread) {
   );
 }
 
-type WarnLog = (message: string, data: Record<string, unknown>) => void;
-const logWarn: WarnLog = (message, data) =>
-  void import('./log.js').then(({ log }) => log.warn(message, data)).catch(() => console.warn(message, data));
-
 /** VOICE_MODE_WAKE_HOP_MS: 40 (the default) or 80. Anything else is logged and read as the default. */
-export function wakeHopMs(raw: string | undefined, warn: WarnLog = logWarn): WakeHopMs {
+export function wakeHopMs(
+  raw: string | undefined,
+  warn: (message: string, data: Record<string, unknown>) => void,
+): WakeHopMs {
   const value = raw?.trim();
   if (!value) return DEFAULT_WAKE_HOP_MS;
   const hop = WAKE_HOPS_MS.find((allowed) => allowed === Number(value));
@@ -243,28 +241,14 @@ export function wakeHopMs(raw: string | undefined, warn: WarnLog = logWarn): Wak
   return DEFAULT_WAKE_HOP_MS;
 }
 
-/** VOICE_MODE_WAKE_HOP_MS from `root`'s .env, where the call's other wake settings are read. */
-export function wakeHopFromEnv(root = process.cwd(), warn?: WarnLog): WakeHopMs {
-  let text: string;
-  try {
-    text = fs.readFileSync(path.join(root, '.env'), 'utf-8');
-  } catch {
-    return DEFAULT_WAKE_HOP_MS;
-  }
-  return wakeHopMs(parseEnv(text)[WAKE_HOP_ENV], warn);
-}
-
-/** Read once per process, as the call's other settings are: a `.env` change reaches calls after a worker restart. */
-let configuredHopMs: WakeHopMs | undefined;
-
 export interface WakeWordOptions {
   /** The classifier .onnx; the feature models are the bundled ones. */
   classifier: string;
   /** What the classifier listens for, as the page names it (VOICE_MODE_WAKE_PHRASE). */
   phrase: string;
   threshold: number;
-  /** Audio between scores; VOICE_MODE_WAKE_HOP_MS from the working directory's .env when not given. */
-  hopMs?: WakeHopMs;
+  /** Audio between scores (VOICE_MODE_WAKE_HOP_MS). */
+  hopMs: WakeHopMs;
   /**
    * A detection: its score, and the window that had the phrase, as positions in the audio pushed so
    * far (samples; `end` exclusive). Its end is where scoring stopped, not where the phrase did: the
@@ -278,8 +262,8 @@ export interface WakeWordOptions {
 
 /** What scoring cost so far, for the call's log. */
 export interface WakeWordStats {
-  /** The hop the windows were taken at (always set by the spotter). */
-  hopMs?: WakeHopMs;
+  /** The hop the windows were taken at. */
+  hopMs: WakeHopMs;
   scored: number;
   /** Windows dropped because scoring fell behind by more than WAKE_MAX_QUEUED_SAMPLES: slower than real time. */
   skipped: number;
@@ -338,7 +322,7 @@ export class WakeWordSpotter {
     this.options = options;
     this.phrase = options.phrase;
     this.threshold = options.threshold;
-    this.hopMs = options.hopMs ?? (configuredHopMs ??= wakeHopFromEnv());
+    this.hopMs = options.hopMs;
     this.hopSamples = (this.hopMs * WAKE_SAMPLE_RATE) / 1000;
     this.grids = WAKE_HOP_SAMPLES / this.hopSamples;
     this.maxQueued = WAKE_MAX_QUEUED_SAMPLES / this.hopSamples;
