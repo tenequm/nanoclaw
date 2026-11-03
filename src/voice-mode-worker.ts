@@ -2416,9 +2416,10 @@ export class CallTurns {
   private turn?: OpenTurn;
   /**
    * The wake phrase was heard and no turn is open yet: the caller's next speech opens one, never with
-   * audio from before `from` (the detection point). `since`: when the start limit's clock began.
+   * audio from before `from` (the detection point). `since`: when the start limit's clock began;
+   * `speech`: where the VAD segment the phrase was heard in started, if it was heard in one.
    */
-  private awake?: { from: number; since: number };
+  private awake?: { from: number; since: number; speech?: number };
   /** Echoes ignored since the last turn opened. */
   private echoes = 0;
   /** Auto turns for the agent whose activity ended and whose text is not acted on yet: a switch to review takes them. */
@@ -2542,7 +2543,10 @@ export class CallTurns {
       if (wake || !turn.addressed) void this.finish('unaddressed');
     }
     // A wake with no turn yet belongs to the switch it was heard under.
-    if (wake !== this.wake) this.awake = undefined;
+    if (wake !== this.wake && this.awake) {
+      this.awake = undefined;
+      this.echoes = 0;
+    }
     this.wake = wake;
     this.pauseSends = pauseSends;
     this.cut = false;
@@ -2642,7 +2646,9 @@ export class CallTurns {
       this.deps.log.warn('voice-mode worker: the wake word window is older than the kept audio; no turn opens');
       return;
     }
-    this.awake = { from: at, since: this.now() };
+    this.awake = { from: at, since: this.now(), ...(this.speaking ? { speech: this.speechFrom } : {}) };
+    // The socket's setup overlaps the pause after the phrase; nothing reaches it before speech.
+    void this.deps.transcriber.prepare();
     this.cut = true;
     this.woke();
     this.follow();
@@ -2725,6 +2731,7 @@ export class CallTurns {
     clearTimeout(this.pauseTimer);
     this.disarm();
     this.awake = undefined;
+    this.echoes = 0;
     // The words not acted on yet, in order: the turns still finalizing undecided, then the open one.
     // A committed send is not among them: it goes out.
     const parts: Array<Promise<Recording | null>> = [];
@@ -2831,13 +2838,16 @@ export class CallTurns {
 
   /**
    * Woken with no turn: speech in the wake phrase's own VAD segment past SPEECH_FLOOR_MS after the
-   * detection point is the caller going on straight after the phrase, and opens the turn there.
+   * detection point is the caller going on straight after the phrase, and opens the turn there, or
+   * where an agent line that played meanwhile ended: the audio under it is no part of the turn.
    */
   private follow(): void {
     const awake = this.awake;
     if (!awake || this.turn || !this.speaking || this.agentSpeaking || this.reviewing) return;
-    if (this.quietFrom - awake.from < samplesOf(SPEECH_FLOOR_MS)) return;
-    this.openAwake(awake.from);
+    if (awake.speech !== this.speechFrom) return;
+    const from = Math.max(awake.from, this.heardFrom);
+    if (this.quietFrom - from < samplesOf(SPEECH_FLOOR_MS)) return;
+    this.openAwake(from);
   }
 
   /** The caller's speech in `turn` so far as the VAD heard it: its ended stretches, and the one under way to its last window with speech. */
@@ -2859,7 +2869,7 @@ export class CallTurns {
 
   /**
    * The transcription's echo of a command nobody said: the activity ends unheard, and nothing plays,
-   * shows, drops or sends. A woken turn goes back to the wake it came from, its start clock as it was.
+   * shows, drops or sends. A woken turn goes back to the wake it came from (wakeBack).
    */
   private echo(turn: OpenTurn, command: CallCommand): void {
     this.turn = undefined;
@@ -2870,20 +2880,33 @@ export class CallTurns {
     this.capture?.take(0);
     void this.deps.transcriber.end().catch(() => undefined);
     this.echoes = turn.echoes + 1;
-    this.deps.log.info('voice-mode worker: a lone command with no speech is an echo; ignored', {
-      command,
-      activityMs: Math.round(msOf(this.ring.position - turn.from)),
-    });
-    if (this.wake && !this.reviewing) {
-      this.awake = { from: turn.from, since: turn.wokeAt ?? this.now() };
+    this.logEcho(command, turn.from, this.ring.position);
+    this.wakeBack(turn, turn.from);
+    this.syncHold();
+  }
+
+  /**
+   * An echo ended `turn`: one the acoustic wake opened goes back to that wake, from `from`, its start
+   * clock as it was. Any other comes to no turn: a transcript wake may have been the echo's own words.
+   */
+  private wakeBack(turn: OpenTurn, from: number): void {
+    if (this.wake && !this.reviewing && turn.wokeAt !== undefined) {
+      this.awake = { from, since: turn.wokeAt };
       this.arm();
     } else this.deps.noTurn();
-    this.syncHold();
+  }
+
+  private logEcho(command: CallCommand, from: number, to: number): void {
+    this.deps.log.info('voice-mode worker: a lone command with no speech is an echo; ignored', {
+      command,
+      activityMs: Math.round(msOf(to - from)),
+    });
   }
 
   /** Woken with nothing said, and the wake is over: back to waiting, without a cue. */
   private unwake(): void {
     this.awake = undefined;
+    this.echoes = 0;
     this.disarm();
     this.waitingSince = this.ring.position;
     this.deps.noTurn();
@@ -3044,7 +3067,9 @@ export class CallTurns {
       return;
     }
     if (turn.kind !== 'auto' || !turn.addressed) return;
-    const said = turn.carry || this.spoken(turn, turn.heard) || this.heardMs(turn) >= SPEECH_FLOOR_MS;
+    // A transcript wake's VAD speech includes what came before the phrase: only its words count.
+    const said =
+      turn.carry || this.spoken(turn, turn.heard) || (!turn.textWake && this.heardMs(turn) >= SPEECH_FLOOR_MS);
     const ms = said ? this.limits.idleMs : this.limits.startMs;
     if (!(ms > 0)) return;
     this.awakeTimer = setTimeout(() => void this.finish('asleep'), ms);
@@ -3199,11 +3224,15 @@ export class CallTurns {
     }
     if (match && !scratched && this.lone(turn, match, closed.heardMs)) {
       // Nobody said it: the turn heard no words at all.
-      this.deps.log.info('voice-mode worker: a lone command with no speech is an echo; ignored', {
-        command: match.command,
-        activityMs: Math.round(msOf(closed.endedAt - turn.from)),
-      });
-      this.echoes++;
+      this.logEcho(match.command, turn.from, closed.endedAt);
+      if (why === 'discard') {
+        // Its discard was the echo too: nothing goes on, and the turn ends as echo() ends one.
+        this.echoes = turn.echoes + 1;
+        this.wakeBack(turn, closed.endedAt);
+        this.syncHold();
+        return null;
+      }
+      facts.echoes = turn.echoes + 1;
       match = null;
       text = said = '';
     }
@@ -3219,6 +3248,9 @@ export class CallTurns {
       this.syncHold();
       return null;
     }
+    const asleep = why === 'asleep' && !match && !(scratched && !text);
+    // Counted before the state goes out, so a sleep publishes once.
+    if (asleep) this.slept++;
     this.syncHold();
     if (match?.command === 'discard') {
       caption(scratched ?? said, 'discard');
@@ -3256,13 +3288,13 @@ export class CallTurns {
       ended('discarded', 'command');
       return null;
     }
-    if (why === 'asleep' && !match) {
+    if (asleep) {
       // Back to waiting, and nothing the caller said is lost there: words with MIN_LOST_SPEECH_MS of
-      // speech behind them go as a pause would send them, then the sleep cue; speech that came to no
-      // text is a lost turn ("didn't catch that"). Anything less (noise, an echo) sleeps as before.
-      this.slept++;
+      // speech behind them, or carried from an earlier activity, go as a pause would send them, then the
+      // sleep cue; speech that came to no text is a lost turn ("didn't catch that"). Anything less (noise,
+      // an echo) sleeps as before, and so does a transcript-woken turn, whose VAD speech predates its phrase.
       this.waitingSince = this.ring.position;
-      const spoke = closed.heardMs >= MIN_LOST_SPEECH_MS;
+      const spoke = !!turn.carry || (!turn.textWake && closed.heardMs >= MIN_LOST_SPEECH_MS);
       if (body && spoke) {
         slot.send(body, take, false);
         this.deps.cue('sleep');
