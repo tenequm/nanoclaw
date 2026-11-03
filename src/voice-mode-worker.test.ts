@@ -112,6 +112,8 @@ import {
   MEETING_EMPTY_MS,
   MEETING_INPUT_ATTRIBUTE,
   meetingParticipantNames,
+  type PublishedSpeech,
+  waitForMeetingParticipant,
   MeetingPresence,
 } from './voice-mode-worker.js';
 
@@ -5811,7 +5813,7 @@ describe('meeting calls', () => {
       remoteParticipants.delete(identity);
       emit(RoomEvent.ParticipantDisconnected, p);
     };
-    return { job, ctx: job as unknown as CallJob, join, leave };
+    return { job, ctx: job as unknown as CallJob, join, leave, emit };
   }
 
   it('starts when the first meeting participant appears, never waits for the caller, and names who is present', async () => {
@@ -5842,6 +5844,81 @@ describe('meeting calls', () => {
     );
     host.emit({ type: 'end', reason: 'test over' });
     await vi.waitFor(() => expect(m.job.shutdown).toHaveBeenCalled());
+  });
+
+  it('publishes the speech track once, right after connecting and before anyone is mirrored in, for the voice to use', async () => {
+    const m = meetingJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const speech = { publication: { sid: 'TR_speech' } } as unknown as PublishedSpeech;
+    const publishSpeech = vi.fn(async () => speech);
+    const running = runCall(m.ctx, callDeps(host.fetchImpl, v, { publishSpeech }));
+    await flush();
+    expect(m.job.connect).toHaveBeenCalled();
+    expect(publishSpeech).toHaveBeenCalledTimes(1);
+    expect(publishSpeech).toHaveBeenCalledWith(m.ctx);
+    expect(host.calls.some((c) => c.url.endsWith('/joined'))).toBe(false);
+    expect(v.createVoice).not.toHaveBeenCalled();
+    m.join(mirror('uuid-1', 'Misha'));
+    await running;
+    expect(publishSpeech).toHaveBeenCalledTimes(1);
+    expect(v.createVoice.mock.calls[0][2].speech).toBe(speech);
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(m.job.shutdown).toHaveBeenCalled());
+  });
+
+  it('leaves the speech track to the voice when the early publish fails, and never publishes early for a plain call', async () => {
+    const m = meetingJob();
+    m.join(mirror('uuid-1', 'Misha'));
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const failing = vi.fn(async () => {
+      throw new Error('publish failed');
+    });
+    await runCall(m.ctx, callDeps(host.fetchImpl, v, { publishSpeech: failing }));
+    expect(failing).toHaveBeenCalledTimes(1);
+    expect(v.createVoice).toHaveBeenCalledTimes(1);
+    expect(v.createVoice.mock.calls[0][2]).not.toHaveProperty('speech');
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(m.job.shutdown).toHaveBeenCalled());
+
+    const plain = fakeJob();
+    const plainHost = fakeHostFetch();
+    const pv = fakeVoice();
+    const publishSpeech = vi.fn();
+    await runCall(plain.ctx, callDeps(plainHost.fetchImpl, pv, { publishSpeech }));
+    expect(publishSpeech).not.toHaveBeenCalled();
+    expect(pv.createVoice.mock.calls[0][2]).not.toHaveProperty('speech');
+    plainHost.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(plain.job.shutdown).toHaveBeenCalled());
+  });
+
+  it('waits for a meeting participant with no listener left behind, whether it comes, times out or the room drops', async () => {
+    vi.useFakeTimers();
+    const listeners = (m: ReturnType<typeof meetingJob>) =>
+      m.job.room.on.mock.calls.length - m.job.room.off.mock.calls.length;
+
+    const joined = meetingJob();
+    const arrived = waitForMeetingParticipant(joined.job.room as never, 1000, 'nobody came');
+    joined.join(mirror('uuid-1', 'Misha'));
+    await expect(arrived).resolves.toBeUndefined();
+    expect(listeners(joined)).toBe(0);
+
+    const empty = meetingJob();
+    const timedOut = waitForMeetingParticipant(empty.job.room as never, 1000, 'nobody came');
+    const timedOutResult = expect(timedOut).rejects.toThrow('nobody came');
+    vi.advanceTimersByTime(1000);
+    await timedOutResult;
+    expect(listeners(empty)).toBe(0);
+
+    const dropped = meetingJob();
+    const gone = waitForMeetingParticipant(dropped.job.room as never, 1000, 'nobody came');
+    const goneResult = expect(gone).rejects.toThrow('room disconnected');
+    dropped.emit(RoomEvent.Disconnected);
+    await goneResult;
+    expect(listeners(dropped)).toBe(0);
+    vi.advanceTimersByTime(1000);
+    vi.useRealTimers();
   });
 
   it('takes no turn until addressed when no page sets the switch, and ends once the meeting stayed empty', async () => {

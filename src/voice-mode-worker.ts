@@ -61,6 +61,7 @@ import {
   type RemoteTrack,
   type RemoteTrackPublication,
   type LocalParticipant,
+  type LocalTrackPublication,
   type RemoteParticipant,
   type Room,
 } from '@livekit/rtc-node';
@@ -1934,6 +1935,31 @@ export function loadTypingSound(file = getBuiltinAudioPath(BuiltinAudioClip.KEYB
   return typingSound;
 }
 
+/** The agent's speech track, published once per call and never republished: a meeting bot plays only the newest track. */
+export interface PublishedSpeech {
+  source: AudioSource;
+  track: LocalAudioTrack;
+  publication: LocalTrackPublication;
+}
+
+/** Publish the speech track (SPEECH_TRACK), silent until the call speaks into its source. */
+async function publishSpeechTrack(local: LocalParticipant): Promise<PublishedSpeech> {
+  const source = new AudioSource(TTS_SAMPLE_RATE, 1);
+  const track = LocalAudioTrack.createAudioTrack(SPEECH_TRACK, source);
+  const publication = await local.publishTrack(
+    track,
+    // Hi-fi speech: DTX off so a line's first milliseconds are never spent waking the track, and a
+    // 64 kbps Opus cap over the SDK's 48 kbps default. RED is the SDK default, kept explicit.
+    new TrackPublishOptions({
+      source: TrackSource.SOURCE_MICROPHONE,
+      dtx: false,
+      red: true,
+      audioEncoding: { maxBitrate: 64_000n },
+    }),
+  );
+  return { source, track, publication };
+}
+
 /**
  * Publish the cue track (CALL_CUE_TRACK) on its own source. DTX off: the track never goes quiet on
  * the wire, so the first milliseconds of a cue are never spent waking it up.
@@ -3604,6 +3630,8 @@ export interface VoiceModeSettings {
   spoke?(line: SpokenLine, pcm?: Int16Array): void;
   /** A choice's names for the call voice attribute; none: the attribute carries the ids only. */
   voiceDetails?(choice: TtsChoice): Promise<ChoiceDetails>;
+  /** The speech track runCall already published (a meeting's, at connect); none: the voice publishes it. */
+  speech?: PublishedSpeech;
 }
 
 export interface RunCallDeps {
@@ -3616,6 +3644,8 @@ export interface RunCallDeps {
     settings: VoiceModeSettings,
     events: CallVoiceEvents,
   ): Promise<CallVoice>;
+  /** Publish the agent's speech track; a meeting call does it right after connecting. None: createVoice does. */
+  publishSpeech?(ctx: CallJob): Promise<PublishedSpeech>;
   /** The call's transcription. */
   transcriber(options: TranscriberOptions): Transcription;
   /** Where turn recordings are written; NanoClaw's data directory by default. */
@@ -3815,17 +3845,28 @@ export function meetingParticipantNames(
 /** The room as a meeting call watches it. */
 type MeetingRoom = Pick<Room, 'remoteParticipants' | 'on' | 'off'>;
 
-/** Resolves once a meeting participant is in the room. */
-export function waitForMeetingParticipant(room: MeetingRoom): Promise<void> {
-  return new Promise((resolve) => {
-    const check = () => {
-      if (![...room.remoteParticipants.values()].some(isMeetingParticipant)) return;
+/**
+ * Resolves once a meeting participant is in the room; rejects when the room disconnects first, or with
+ * `timeoutMessage` after `timeoutMs`. Every listener goes on whichever way it settles.
+ */
+export function waitForMeetingParticipant(room: MeetingRoom, timeoutMs: number, timeoutMessage: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const settle = (err?: Error) => {
+      clearTimeout(timer);
       room.off(RoomEvent.ParticipantConnected, check);
       room.off(RoomEvent.ParticipantAttributesChanged, check);
-      resolve();
+      room.off(RoomEvent.Disconnected, disconnected);
+      if (err) reject(err);
+      else resolve();
     };
+    const check = () => {
+      if ([...room.remoteParticipants.values()].some(isMeetingParticipant)) settle();
+    };
+    const disconnected = () => settle(new Error('room disconnected while waiting for the meeting'));
+    const timer = setTimeout(() => settle(new Error(timeoutMessage)), timeoutMs);
     room.on(RoomEvent.ParticipantConnected, check);
     room.on(RoomEvent.ParticipantAttributesChanged, check);
+    room.on(RoomEvent.Disconnected, disconnected);
     check();
   });
 }
@@ -4291,19 +4332,11 @@ async function roomVoice(
   const local = room.localParticipant;
   if (!local) throw new Error('no local participant');
   let closed = false;
-  const speechSource = new AudioSource(TTS_SAMPLE_RATE, 1);
-  const speechTrack = LocalAudioTrack.createAudioTrack(SPEECH_TRACK, speechSource);
-  const speechPublication = await local.publishTrack(
-    speechTrack,
-    // Hi-fi speech: DTX off so a line's first milliseconds are never spent waking the track, and a
-    // 64 kbps Opus cap over the SDK's 48 kbps default. RED is the SDK default, kept explicit.
-    new TrackPublishOptions({
-      source: TrackSource.SOURCE_MICROPHONE,
-      dtx: false,
-      red: true,
-      audioEncoding: { maxBitrate: 64_000n },
-    }),
-  );
+  const {
+    source: speechSource,
+    track: speechTrack,
+    publication: speechPublication,
+  } = settings.speech ?? (await publishSpeechTrack(local));
   // The cues' own track: never the speech track, so a cue is never the agent speaking. Without it
   // the call runs silent of cues. A meeting gets none: its bot streams one audio track of ours into
   // the meeting, the one subscribed last, which would be the cues'.
@@ -4636,6 +4669,11 @@ function defaultDeps(): RunCallDeps {
       log: workerLog(agentsLog()),
     })),
     createVoice: (ctx, meta, settings, events) => roomVoice(ctx as JobContext, meta, settings, events),
+    publishSpeech: async (ctx) => {
+      const local = ctx.room.localParticipant;
+      if (!local) throw new Error('no local participant');
+      return publishSpeechTrack(local);
+    },
     transcriber: (options) => new GeminiLiveTranscriber(options),
     markUpdating: async (ctx) => {
       await ctx.room.localParticipant?.setAttributes({ [CALL_UPDATING_ATTRIBUTE]: '1' });
@@ -4705,17 +4743,25 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   let speakingLine: CallReplyInfo | undefined;
 
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
+  // A meeting bot waits only briefly for our audio track once it is in the meeting, which can be before
+  // anyone is mirrored into the room: the track is up from the start. Failing here, the voice publishes it.
+  const speech =
+    meta.meeting && deps.publishSpeech
+      ? await deps.publishSpeech(ctx).catch((err: unknown) => {
+          log.warn('voice-mode worker: could not publish the speech track early', { ...callFields, err });
+          return undefined;
+        })
+      : undefined;
   try {
-    await withTimeout<unknown>(
-      meta.meeting ? waitForMeetingParticipant(ctx.room) : ctx.waitForParticipant(meta.callerIdentity),
-      meta.joinTimeoutMs,
-      meta.meeting ? 'nobody from the meeting joined' : 'caller never joined',
-    );
+    await (meta.meeting
+      ? waitForMeetingParticipant(ctx.room, meta.joinTimeoutMs, 'nobody from the meeting joined')
+      : withTimeout<unknown>(ctx.waitForParticipant(meta.callerIdentity), meta.joinTimeoutMs, 'caller never joined'));
   } catch (err) {
     return abandon((err as Error).message);
   }
   const joined = await host.tell('joined');
-  // The host starts billing here; without its yes, nothing is published or transcribed.
+  // The host starts billing here; without its yes, nothing is transcribed or spoken (a meeting's speech
+  // track is already up, silent).
   if (!joined?.ok) return abandon(`host refused the call (${joined?.status ?? 'unreachable'})`, { hostUrl });
 
   const hostLink = new AbortController();
@@ -5075,6 +5121,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       meta,
       {
         providerKeys,
+        ...(speech ? { speech } : {}),
         ...(record ? { recordReplies: true } : {}),
         ...(envSwitch(deps.env.VOICE_MODE_TTS_DEESS) ? { deess: true } : {}),
         ...(envSwitch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
