@@ -11,7 +11,7 @@ import { getEventListeners } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
 import { AgentServer, InferenceRunner, initializeLogger, ServerOptions, VADEventType } from '@livekit/agents';
-import { AudioFrame, AudioResampler, DisconnectReason } from '@livekit/rtc-node';
+import { AudioFrame, AudioResampler, DisconnectReason, ParticipantKind, RoomEvent } from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -106,6 +106,13 @@ import {
   type VoiceModeSettings,
   type SendResult,
   type TurnTakingDeps,
+  AudioMixer,
+  isMeetingParticipant,
+  jobIdentity,
+  MEETING_EMPTY_MS,
+  MEETING_INPUT_ATTRIBUTE,
+  meetingParticipantNames,
+  MeetingPresence,
 } from './voice-mode-worker.js';
 
 initializeLogger({ pretty: false, level: 'error' });
@@ -5698,5 +5705,164 @@ describe('fast send words', () => {
     await vi.advanceTimersByTimeAsync(50);
     expect(utterances(c.host)).toEqual(['Book a table.']);
     await c.done();
+  });
+});
+
+describe('meeting calls', () => {
+  const MIRROR = { 'attendee.room_sync.owner': 'bot-1' };
+  const mirror = (identity: string, name: string, attributes: Record<string, string> = MIRROR) => ({
+    identity,
+    name,
+    kind: ParticipantKind.STANDARD,
+    attributes,
+  });
+  const MEETING_META = { ...META, meeting: { url: 'https://meet.google.com/abc', agentIdentity: 'agent-meet-1' } };
+
+  it('takes Attendee mirrors and marked bridge inputs as meeting inputs, not released mirrors, agents or the caller', () => {
+    expect(isMeetingParticipant(mirror('uuid-1', 'Misha'))).toBe(true);
+    expect(isMeetingParticipant(mirror('mixed', 'Meeting', { [MEETING_INPUT_ATTRIBUTE]: '1' }))).toBe(true);
+    expect(isMeetingParticipant(mirror('mixed', 'Meeting', { [MEETING_INPUT_ATTRIBUTE]: '0' }))).toBe(false);
+    expect(
+      isMeetingParticipant(mirror('uuid-2', 'Taro', { ...MIRROR, 'attendee.room_sync.release': 'left_meeting' })),
+    ).toBe(false);
+    expect(isMeetingParticipant({ ...mirror('agent-x', 'Andy'), kind: ParticipantKind.AGENT })).toBe(false);
+    expect(isMeetingParticipant(mirror('attendee-room-sync-watcher-1', 'w'))).toBe(false);
+    expect(isMeetingParticipant({ identity: 'caller-1', attributes: {} })).toBe(false);
+    expect(
+      meetingParticipantNames([mirror('a', ' Misha '), mirror('b', ''), { identity: 'caller-1', name: 'X' }]),
+    ).toEqual(['Misha']);
+  });
+
+  it('joins a meeting job under its own identity, any other job under the default', () => {
+    expect(jobIdentity(readJobHeader(JSON.stringify(MEETING_META)))).toBe('agent-meet-1');
+    expect(jobIdentity(readJobHeader(JSON.stringify(META)))).toBe('');
+    const odd = { ...META, meeting: { url: 'x', agentIdentity: 'a b' } };
+    expect(jobIdentity(readJobHeader(JSON.stringify(odd)))).toBe('');
+  });
+
+  it('mixes the sources into one frame, clipped, with silence for a source that has nothing', () => {
+    const mixer = new AudioMixer(4, 8);
+    mixer.add('a');
+    mixer.add('b');
+    mixer.push('a', Int16Array.from([100, 200, 30000, -30000]));
+    mixer.push('b', Int16Array.from([1, 2, 30000, -30000, 7]));
+    expect([...mixer.pull()]).toEqual([101, 202, 32767, -32768]);
+    expect([...mixer.pull()]).toEqual([7, 0, 0, 0]);
+    mixer.remove('b');
+    expect(mixer.size).toBe(1);
+    // Over the backlog, only the newest samples stay.
+    mixer.push('a', Int16Array.from([1, 2, 3, 4, 5, 6]));
+    mixer.push('a', Int16Array.from([7, 8, 9, 10]));
+    expect([...mixer.pull()]).toEqual([3, 4, 5, 6]);
+    expect([...mixer.pull()]).toEqual([7, 8, 9, 10]);
+    mixer.push('nobody', Int16Array.from([1]));
+    expect([...mixer.pull()]).toEqual([0, 0, 0, 0]);
+  });
+
+  it('ends once nobody from the meeting has been in the room for the whole wait, not when someone comes back', () => {
+    vi.useFakeTimers();
+    const onEmpty = vi.fn();
+    const presence = new MeetingPresence(MEETING_EMPTY_MS, onEmpty);
+    presence.update(2);
+    presence.update(0);
+    vi.advanceTimersByTime(MEETING_EMPTY_MS - 1);
+    presence.update(1);
+    vi.advanceTimersByTime(MEETING_EMPTY_MS);
+    expect(onEmpty).not.toHaveBeenCalled();
+    presence.update(0);
+    presence.update(0);
+    vi.advanceTimersByTime(MEETING_EMPTY_MS);
+    expect(onEmpty).toHaveBeenCalledTimes(1);
+    presence.update(0);
+    presence.close();
+    vi.advanceTimersByTime(MEETING_EMPTY_MS);
+    expect(onEmpty).toHaveBeenCalledTimes(1);
+  });
+
+  /** A meeting room: participants by identity, every handler of each event kept. */
+  function meetingJob() {
+    const handlers = new Map<string, Set<(...args: unknown[]) => void>>();
+    const remoteParticipants = new Map<string, ReturnType<typeof mirror>>();
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const fn of [...(handlers.get(event) ?? [])]) fn(...args);
+    };
+    const job = {
+      job: { metadata: JSON.stringify(MEETING_META) },
+      room: {
+        remoteParticipants,
+        on: vi.fn((event: string, fn: (...args: unknown[]) => void) => {
+          if (!handlers.has(event)) handlers.set(event, new Set());
+          handlers.get(event)!.add(fn);
+        }),
+        off: vi.fn((event: string, fn: (...args: unknown[]) => void) => void handlers.get(event)?.delete(fn)),
+      },
+      connect: vi.fn(async () => undefined),
+      waitForParticipant: vi.fn(async () => ({ identity: 'caller-1' })),
+      deleteRoom: vi.fn(async () => undefined),
+      shutdown: vi.fn(),
+      addShutdownCallback: vi.fn(),
+    };
+    const join = (p: ReturnType<typeof mirror>) => {
+      remoteParticipants.set(p.identity, p);
+      emit(RoomEvent.ParticipantConnected, p);
+    };
+    const leave = (identity: string) => {
+      const p = remoteParticipants.get(identity);
+      remoteParticipants.delete(identity);
+      emit(RoomEvent.ParticipantDisconnected, p);
+    };
+    return { job, ctx: job as unknown as CallJob, join, leave };
+  }
+
+  it('starts when the first meeting participant appears, never waits for the caller, and names who is present', async () => {
+    const m = meetingJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const running = runCall(m.ctx, callDeps(host.fetchImpl, v));
+    await flush();
+    expect(host.calls.some((c) => c.url.endsWith('/joined'))).toBe(false);
+    m.join(mirror('attendee-room-sync-watcher-1', 'watcher'));
+    await flush();
+    expect(host.calls.some((c) => c.url.endsWith('/joined'))).toBe(false);
+    m.join(mirror('uuid-1', 'Misha'));
+    m.join(mirror('uuid-2', 'Taro'));
+    await running;
+    expect(m.job.waitForParticipant).not.toHaveBeenCalled();
+    expect(host.calls.some((c) => c.url.endsWith('/joined'))).toBe(true);
+
+    // The fake page turned the wake switch off: a hands-free turn goes out with the meeting's names.
+    await v.turn('What is the status');
+    await vi.waitFor(() =>
+      expect(host.calls.find((c) => c.url.endsWith('/utterance'))?.body).toEqual({
+        callId: 'call-1',
+        text: 'What is the status',
+        turnKey: expect.any(String),
+        participants: ['Misha', 'Taro'],
+      }),
+    );
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(m.job.shutdown).toHaveBeenCalled());
+  });
+
+  it('takes no turn until addressed when no page sets the switch, and ends once the meeting stayed empty', async () => {
+    const m = meetingJob();
+    m.join(mirror('uuid-1', 'Misha'));
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    v.voice.review.serve = vi.fn();
+    await runCall(m.ctx, callDeps(host.fetchImpl, v));
+    await v.turn('What is the status');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(host.calls.some((c) => c.url.endsWith('/utterance'))).toBe(false);
+
+    vi.useFakeTimers();
+    m.leave('uuid-1');
+    m.join(mirror('uuid-2', 'Taro', { ...MIRROR, 'attendee.room_sync.release': 'left_meeting' }));
+    vi.advanceTimersByTime(MEETING_EMPTY_MS);
+    vi.useRealTimers();
+    await vi.waitFor(() => expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(true));
+    expect(host.calls.find((c) => c.url.endsWith('/ended'))?.body).toMatchObject({
+      reason: 'nobody left in the meeting',
+    });
   });
 });

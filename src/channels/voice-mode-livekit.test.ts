@@ -27,7 +27,10 @@ import {
   CALL_DEPTH_NOTE,
   CALL_LANGUAGE_NOTE,
   callLanguageNote,
+  meetingReplyNote,
+  MEETING_MAX_DURATION_MS,
   type LiveKitServerApi,
+  type MeetBridge,
   type LiveKitVoiceConfig,
   type MirrorApi,
 } from './voice-mode-livekit.js';
@@ -1905,5 +1908,102 @@ describe('parseLiveKitUtteranceId', () => {
     expect(parseLiveKitUtteranceId('livekit:c-1:3:ag-other')).toBeNull();
     expect(parseLiveKitUtteranceId('livekit:c-1')).toBeNull();
     expect(parseLiveKitUtteranceId('tg-1')).toBeNull();
+  });
+});
+
+describe('/meet calls through a meeting bridge', () => {
+  let h: Harness;
+  afterEach(async () => {
+    await h.stop();
+  });
+  const MEET = 'https://meet.google.com/abc-defg-hij';
+
+  function fakeBridge() {
+    const joins: Array<Parameters<MeetBridge['join']>[0]> = [];
+    const left: string[] = [];
+    const state = { fail: false };
+    const bridge: MeetBridge = {
+      join: async (options) => {
+        joins.push(options);
+        if (state.fail) throw new Error('attendee down');
+        return { botId: 'bot_1' };
+      },
+      leave: async (botId) => void left.push(botId),
+    };
+    return { bridge, joins, left, state };
+  }
+
+  const start = async (bridge?: MeetBridge) => {
+    const mirror = fakeMirror([{ platform_id: 'telegram:100' }], {
+      bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
+    });
+    h = await startHarness({ accessCheckIntervalMs: 60_000 }, { mirrorApi: mirror.api, meetBridge: bridge });
+    const roomOptions: Array<Parameters<LiveKitServerApi['createRoom']>[0]> = [];
+    const createRoom = h.lk.createRoom.bind(h.lk);
+    h.lk.createRoom = async (options) => {
+      roomOptions.push(options);
+      return createRoom(options);
+    };
+    return { posts: mirror.posts, roomOptions };
+  };
+
+  it('is not configured without a bridge', async () => {
+    await start();
+    expect(h.adapter.meetingsEnabled).toBe(false);
+    expect(await h.adapter.startMeeting(LINE, MEET)).toEqual({ ok: false, error: 'not-configured' });
+    expect(h.lk.rooms).toEqual([]);
+  });
+
+  it('opens the room before the bot joins, mirrors the worker identity, notes the meeting on each turn and leaves on /meet leave', async () => {
+    const fake = fakeBridge();
+    const { posts, roomOptions } = await start(fake.bridge);
+    expect(h.adapter.meetingsEnabled).toBe(true);
+    expect(await h.adapter.startMeeting(LINE, MEET)).toEqual({ ok: true, agentName: 'Andy' });
+
+    const dispatch = h.lk.dispatches.at(-1)!;
+    const meta = dispatch.metadata;
+    expect(meta.meeting).toEqual({ url: MEET, agentIdentity: `agent-meet-${meta.callId.slice(0, 8)}` });
+    expect(meta.joinTimeoutMs).toBe(10 * MIN);
+    expect(meta.maxDurationMs).toBe(MEETING_MAX_DURATION_MS);
+    expect(roomOptions).toEqual([expect.objectContaining({ name: dispatch.room, maxParticipants: 40 })]);
+    expect(fake.joins).toEqual([
+      { meetingUrl: MEET, botName: 'Andy', roomName: dispatch.room, sourceIdentity: meta.meeting!.agentIdentity },
+    ]);
+
+    const worker = await attachWorker(h, meta);
+    expect((await worker.post('joined')).status).toBe(200);
+    await vi.waitFor(() => expect(posts.map((p) => p.text)).toContain('📞 Andy is in the meeting.'));
+    const res = await worker.post('utterance', {
+      text: 'Andy, what is the status?',
+      participants: ['Misha', ' Taro ', 7],
+    });
+    expect(res.status).toBe(202);
+    expect(JSON.parse(h.events.at(-1)!.message.content).text).toBe(
+      turnMessageText('Andy, what is the status?', meetingReplyNote(CALL_LANGUAGE_NOTE, ['Misha', 'Taro'])),
+    );
+
+    expect(h.adapter.leaveMeeting(LINE)).toBe(true);
+    await vi.waitFor(() => expect(fake.left).toEqual(['bot_1']));
+    expect(h.lk.deleted).toContain(dispatch.room);
+    await vi.waitFor(() => expect(posts.map((p) => p.text)).toContain('📞 Left the meeting (left by /meet leave).'));
+    expect(h.adapter.leaveMeeting(LINE)).toBe(false);
+  });
+
+  it('a call on the line link replaces the meeting and sends the bot away', async () => {
+    const fake = fakeBridge();
+    await start(fake.bridge);
+    expect((await h.adapter.startMeeting(LINE, MEET)).ok).toBe(true);
+    await startCall(h);
+    await vi.waitFor(() => expect(fake.left).toEqual(['bot_1']));
+    expect(h.adapter.leaveMeeting(LINE)).toBe(false);
+  });
+
+  it('a bot the bridge could not create ends the call and deletes its room', async () => {
+    const fake = fakeBridge();
+    fake.state.fail = true;
+    await start(fake.bridge);
+    expect(await h.adapter.startMeeting(LINE, MEET)).toEqual({ ok: false, error: 'bot' });
+    await vi.waitFor(() => expect(h.lk.deleted).toEqual(h.lk.rooms));
+    expect(fake.left).toEqual([]);
   });
 });

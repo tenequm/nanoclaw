@@ -92,6 +92,17 @@ const END_NOTICE_TIMEOUT_MS = 2_000;
  * sent (a spoken send whose final was still out): it is taken this long, or until the worker's `ended`.
  */
 const HANGUP_GRACE_MS = 5_000;
+/** A `/meet` bot can wait in the meeting's lobby until someone admits it. */
+export const MEETING_JOIN_TIMEOUT_MS = 10 * MINUTE_MS;
+/** A meeting runs longer than a call: this cap, under the line's daily minutes, instead of the call cap. */
+export const MEETING_MAX_DURATION_MS = 60 * MINUTE_MS;
+/**
+ * Each meeting participant is mirrored into the room as its own participant, besides the worker and the
+ * meeting bot's hidden watcher and source subscriber, which count toward the cap too.
+ */
+const MEETING_MAX_PARTICIPANTS = 40;
+const MAX_MEETING_NAMES = 30;
+const MAX_MEETING_NAME_CHARS = 80;
 
 /** The transcription takes its language codes as a hint only, so a Ukrainian turn can come out in Russian spelling. */
 export const CALL_LANGUAGE_NOTE =
@@ -113,6 +124,18 @@ export const CALL_CHAT_REPLY_NOTE =
   'Spoken on a live voice call; while it lasts, every message you send to this chat is read aloud word for ' +
   `word. ${CALL_DEPTH_NOTE} Offer anything meant for reading (code, links, long lists) for after the call ` +
   `instead of sending it now. ${CALL_LANGUAGE_NOTE}`;
+
+/** A `/meet` turn's note: who may have spoken, and that every message to the chat is said into the meeting. */
+export function meetingReplyNote(languageNote: string, participants: readonly string[]): string {
+  const present = participants.length > 0 ? ` (present: ${participants.join(', ')})` : '';
+  return (
+    `Spoken in a live Google Meet you joined as a voice participant${present}; someone there addressed you, ` +
+    'and the speaker may be any participant, not only the chat owner. While the meeting lasts, every message ' +
+    'you send to this chat is read aloud into the meeting word for word: keep it brief and conversational, lead ' +
+    'with the answer, no markdown, no links, no code blocks, numbers written as words. Offer anything meant for ' +
+    `reading for after the meeting. ${languageNote}`
+  );
+}
 
 /** Added to a non-default VOICE_MODE_LANGUAGES note when Ukrainian is listed. */
 const MISSPELLED_UKRAINIAN_NOTE =
@@ -193,6 +216,30 @@ export interface SpeechSettings {
   silenceMs?: number;
 }
 
+/**
+ * The meeting bot service a `/meet` call joins a meeting through (MEET_PROVIDER; see voice-mode-meet.ts):
+ * it sends a bot named `botName` to `meetingUrl`, brings the meeting's audio into `roomName` as meeting
+ * inputs the worker recognises, and streams `sourceIdentity`'s audio into the meeting. Faked in tests.
+ */
+export interface MeetBridge {
+  join(options: {
+    meetingUrl: string;
+    botName: string;
+    roomName: string;
+    sourceIdentity: string;
+  }): Promise<{ botId: string }>;
+  leave(botId: string): Promise<void>;
+}
+
+/** What `/meet` hears back: the meeting call started, or why not. */
+export type MeetingStart =
+  | { ok: true; agentName: string }
+  | {
+      ok: false;
+      error: 'not-configured' | 'no-line' | 'no-chat' | 'limit' | 'room' | 'bot' | 'stopped';
+      message?: string;
+    };
+
 export interface LiveKitVoiceConfig {
   /** VOICE_MODE_LANGUAGES as parseVoiceLanguages read it; DEFAULT_VOICE_LANGUAGES when unset. */
   languages?: readonly string[];
@@ -218,6 +265,10 @@ export interface LiveKitVoiceConfig {
   hangupGraceMs?: number;
   /** Test seam; defaults to the livekit-server-sdk clients. */
   api?: LiveKitServerApi;
+  /** The meeting bridge (MEET_PROVIDER and its settings); without one `/meet` is not configured. */
+  meetBridge?: MeetBridge;
+  /** MEETING_JOIN_TIMEOUT_MS; a test seam. */
+  meetingJoinTimeoutMs?: number;
 }
 
 /** What the voice adapter shares with this engine: limits, access, routing. */
@@ -287,6 +338,8 @@ interface LiveKitCall {
   metadataWrite?: Promise<void>;
   /** Settles once the room carries why the call ended (or that failed) and the worker was told. */
   announced?: Promise<void>;
+  /** A `/meet` call: its meeting, and the meeting bot's id once created (null when that failed). */
+  meeting?: { url: string; bot?: Promise<string | null> };
 }
 
 /** The host's answer to one utterance POST. */
@@ -320,6 +373,12 @@ export interface LiveKitVoice {
   chatTyping(chat: ChatAddress, agentGroupId: string, working?: boolean): void;
   /** The running call on a line, for the daily budget. */
   activeCall(platformId: string): { platformId: string; startedAt: number } | undefined;
+  /** Whether a meeting bot service is set up for `/meet`. */
+  readonly meetingsEnabled: boolean;
+  /** `/meet`: the line's agent joins a Google Meet through a meeting bot; ends the line's running call. */
+  startMeeting(platformId: string, meetingUrl: string): Promise<MeetingStart>;
+  /** `/meet leave`: ends the line's meeting call; false when the line has none. */
+  leaveMeeting(platformId: string): boolean;
   teardown(): Promise<void>;
 }
 
@@ -519,6 +578,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const joinTimeoutMs = config.joinTimeoutMs ?? 60_000;
   const routeTimeoutMs = config.routeTimeoutMs ?? ROUTE_TIMEOUT_MS;
   const hangupGraceMs = config.hangupGraceMs ?? HANGUP_GRACE_MS;
+  const meetingJoinTimeoutMs = config.meetingJoinTimeoutMs ?? MEETING_JOIN_TIMEOUT_MS;
+  const callMaxMs = (call: LiveKitCall): number => (call.meeting ? MEETING_MAX_DURATION_MS : host.maxCallDurationMs);
   const calls = new Map<string, LiveKitCall>();
   /** Calls the caller's page hung up, by call id, while their worker may still post a turn (HANGUP_GRACE_MS). */
   const hungUp = new Map<string, { call: LiveKitCall; timer: ReturnType<typeof setTimeout> }>();
@@ -744,7 +805,24 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       }
     });
     call.cleanup = trackedDeleteRoom(call, call.announced);
+    if (call.meeting) leaveMeetingBot(call, reason);
     log.info('livekit-voice-mode: call ended', { platformId: call.platformId, callId: call.callId, reason });
+  };
+
+  /** The meeting bot leaves once it exists (a creation still in flight is waited for); teardown awaits it. */
+  const leaveMeetingBot = (call: LiveKitCall, reason: string): void => {
+    const bots = config.meetBridge;
+    const bot = call.meeting?.bot;
+    if (call.chat && call.state === 'live')
+      mirror(call.platformId, call.chat, `\u{1F4DE} Left the meeting (${reason}).`);
+    if (!bots || !bot) return;
+    const left: Promise<void> = bot
+      .then((id) => (id ? bots.leave(id) : undefined))
+      .catch((err: unknown) =>
+        log.warn('livekit-voice-mode: the meeting bot did not leave', { callId: call.callId, err }),
+      )
+      .finally(() => cleanups.delete(left));
+    cleanups.add(left);
   };
 
   const checkAccess = async (call: LiveKitCall): Promise<boolean> => {
@@ -894,6 +972,106 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     );
   };
 
+  /**
+   * `/meet`: a call with no caller's page. The worker joins the room under an identity of the host's
+   * choosing, and the meeting bot mirrors every meeting participant into the room and streams that
+   * identity's audio back into the meeting. The call is live once the first participant is mirrored.
+   */
+  const startMeeting = async (platformId: string, meetingUrl: string): Promise<MeetingStart> => {
+    const bots = config.meetBridge;
+    if (!bots) return { ok: false, error: 'not-configured' };
+    const line = await host.resolveLine(platformId, { forCall: true });
+    if (!line) return { ok: false, error: 'no-line' };
+    if (!(await probeChat({ line, platformId }))) return { ok: false, error: 'no-chat' };
+    const t = host.now();
+    const refusal = host.admitStart(platformId, t);
+    if (refusal) return { ok: false, error: 'limit', message: refusal.body };
+    const capMs = Math.min(MEETING_MAX_DURATION_MS, host.remainingTodayMs(platformId, t));
+    const previous = calls.get(platformId);
+    if (previous) endCall(previous, 'replaced by a meeting', 'newer_call');
+    const callId = randomUUID();
+    const call: LiveKitCall = {
+      callId,
+      platformId,
+      line,
+      roomName: `meet-${platformId.replace(/^voice(?:-mode)?:/, '')}-${randomBytes(6).toString('hex')}`,
+      secret: liveKitCallSecret(config.apiSecret, callId),
+      callerIdentity: `caller-${callId.slice(0, 8)}`,
+      state: 'connecting',
+      ended: false,
+      queue: [],
+      utteranceStarts: [],
+      utterances: 0,
+      turnOutcomes: new Map(),
+      turnsInFlight: 0,
+      chat: null,
+      chatRefreshes: 0,
+      previousChat: null,
+      meeting: { url: meetingUrl },
+    };
+    calls.set(platformId, call);
+    call.joinTimer = setTimeout(() => endCall(call, 'nobody from the meeting joined'), meetingJoinTimeoutMs);
+    call.joinTimer.unref();
+    call.accessTimer = setInterval(() => void checkAccess(call), host.accessCheckIntervalMs);
+    call.accessTimer.unref();
+    const agentIdentity = `agent-meet-${callId.slice(0, 8)}`;
+    const metadata: LiveKitJobMetadata = {
+      v: LIVEKIT_PROTOCOL_VERSION,
+      callId,
+      lineId: platformId,
+      agentName: line.agent.name,
+      callerName: line.caller.name,
+      callerIdentity: call.callerIdentity,
+      vocabulary: [...(line.agent.vocabulary ?? [])],
+      languages,
+      ...(line.agent.wakeNames?.length ? { wakeNames: [...line.agent.wakeNames] } : {}),
+      ...speech,
+      tts: line.tts ?? TTS_DEFAULT_CHOICE,
+      maxDurationMs: capMs,
+      joinTimeoutMs: meetingJoinTimeoutMs,
+      meeting: { url: meetingUrl, agentIdentity },
+    };
+    try {
+      await api.createRoom({
+        name: call.roomName,
+        // The bot can sit in the meeting's lobby for minutes before anyone is mirrored in.
+        emptyTimeout: Math.ceil(meetingJoinTimeoutMs / 1000),
+        departureTimeout: 10,
+        maxParticipants: MEETING_MAX_PARTICIPANTS,
+      });
+      await api.createDispatch(call.roomName, agentName, { metadata: JSON.stringify(metadata) });
+    } catch (err) {
+      log.warn('livekit-voice-mode: meeting room setup failed', { platformId, callId, err });
+      if (call.ended) await trackedDeleteRoom(call);
+      else endCall(call, 'room setup failed');
+      return { ok: false, error: 'room' };
+    }
+    await refreshChat(call, false);
+    if (call.ended || !host.isRunning() || !call.chat) {
+      if (call.ended) await trackedDeleteRoom(call);
+      else endCall(call, call.chat ? 'replaced while connecting' : 'no chat to talk in');
+      return { ok: false, error: call.chat ? 'stopped' : 'no-chat' };
+    }
+    const bot = bots
+      .join({ meetingUrl, botName: line.agent.name, roomName: call.roomName, sourceIdentity: agentIdentity })
+      .then(
+        ({ botId }) => botId || null,
+        (err: unknown) => {
+          log.warn('livekit-voice-mode: the meeting bot could not be created', { platformId, callId, err });
+          return null;
+        },
+      );
+    call.meeting = { url: meetingUrl, bot };
+    const botId = await bot;
+    if (!botId) {
+      endCall(call, 'meeting bot could not be created');
+      return { ok: false, error: 'bot' };
+    }
+    if (call.ended) return { ok: false, error: 'stopped' };
+    log.info('livekit-voice-mode: meeting call started', { platformId, callId, room: call.roomName, botId });
+    return { ok: true, agentName: line.agent.name };
+  };
+
   /** Where a turn goes: the call chat. */
   const turnRoute = (call: LiveKitCall, chat: CallChat): Omit<VoiceModeTurnEvent, 'message'> => ({
     channelType: chat.group.channel_type,
@@ -916,13 +1094,14 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     call.state = 'live';
     call.startedAt = t;
     clearTimeout(call.joinTimer);
-    const budgetCaps = remainingMs < host.maxCallDurationMs;
+    const maxMs = callMaxMs(call);
+    const budgetCaps = remainingMs < maxMs;
     call.expires = setTimeout(
       () =>
         budgetCaps
           ? endCall(call, 'daily minute budget', 'limit_daily')
           : endCall(call, 'duration limit', 'limit_duration'),
-      Math.max(1, budgetCaps ? remainingMs : host.maxCallDurationMs),
+      Math.max(1, budgetCaps ? remainingMs : maxMs),
     );
     call.expires.unref();
     if (!call.stream) {
@@ -935,6 +1114,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     // Known before the first turn, so the agent's messages to that chat are spoken from the start.
     void refreshChat(call, false).then((chat) => {
       if (chat && !call.ended) {
+        if (call.meeting) mirror(call.platformId, chat, `\u{1F4DE} ${call.line.agent.name} is in the meeting.`);
         host.callJoined?.(call.callId, turnRoute(call, chat), call.line.agentGroupId, () => !call.ended);
       }
     });
@@ -988,7 +1168,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     call.utteranceStarts.push(t);
     call.turnsInFlight++;
-    const outcome = takeTurn(call, text, t, turnKey);
+    const outcome = takeTurn(call, text, t, turnKey, call.meeting ? meetingNames(body.participants) : undefined);
     if (turnKey) {
       call.turnOutcomes.set(turnKey, outcome);
       for (const key of call.turnOutcomes.keys()) {
@@ -998,6 +1178,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     answer(res, await outcome);
   };
+
+  /** The meeting participants a worker named with a turn, as far as they are names at all. */
+  const meetingNames = (raw: unknown): string[] =>
+    (Array.isArray(raw) ? raw : [])
+      .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
+      .map((name) => name.trim().slice(0, MAX_MEETING_NAME_CHARS))
+      .slice(0, MAX_MEETING_NAMES);
 
   const answer = (res: http.ServerResponse, outcome: TurnOutcome): void =>
     reply(res, outcome.status, outcome.body, outcome.status === 202 ? JSON_HEADERS : {});
@@ -1013,6 +1200,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     text: string,
     receivedAt: number,
     turnKey: string | undefined,
+    participants?: string[],
   ): Promise<TurnOutcome> => {
     const release = () => void call.turnsInFlight--;
     let routed: Promise<boolean> | undefined;
@@ -1033,7 +1221,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         id: liveKitUtteranceMessageId(call.callId, utteranceId),
         kind: 'chat',
         content: JSON.stringify({
-          text: turnMessageText(text, chatReplyNote),
+          text: turnMessageText(text, participants ? meetingReplyNote(languageNote, participants) : chatReplyNote),
           sender: sender.name,
           senderId: sender.id,
           livekit: { callId: call.callId, utteranceId },
@@ -1210,6 +1398,16 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         push(call, { type: 'thinking' });
         if (working) push(call, { type: 'working' });
       }
+    },
+
+    meetingsEnabled: !!config.meetBridge,
+    startMeeting,
+
+    leaveMeeting(platformId) {
+      const call = calls.get(platformId);
+      if (!call?.meeting) return false;
+      endCall(call, 'left by /meet leave');
+      return true;
     },
 
     activeCall(platformId) {

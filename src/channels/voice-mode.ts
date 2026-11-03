@@ -35,6 +35,7 @@ import {
 import {
   createLiveKitVoice,
   JSON_HEADERS,
+  type MeetingStart,
   readJsonObject,
   reply,
   type LiveKitVoiceConfig,
@@ -60,6 +61,7 @@ import {
 } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
+import { meetBridgeFromEnv } from './voice-mode-meet.js';
 import { readEnvFile } from '../env.js';
 import { encryptionKey } from '../secret-seal.js';
 import { log } from '../log.js';
@@ -275,6 +277,12 @@ export interface VoiceModeChannelAdapter extends ChannelAdapter {
   callUrl(token: string): string;
   /** `/voice` in a chat, with this adapter's call URLs and the chat's own private reply (voice-mode-command.ts). */
   handleVoiceCommand(event: InboundEvent, privateReply?: PrivateReply): Promise<boolean>;
+  /** Whether `/meet` can bring the agent into a meeting here (voice-mode-meet.ts). */
+  readonly meetingsEnabled: boolean;
+  /** `/meet`: the line's agent joins a Google Meet; the line's running call ends. */
+  startMeeting(platformId: string, meetingUrl: string): Promise<MeetingStart>;
+  /** `/meet leave`: false when the line is in no meeting. */
+  leaveMeeting(platformId: string): boolean;
 }
 
 export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChannelAdapter {
@@ -610,6 +618,12 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     callUrl,
     handleVoiceCommand: (event: InboundEvent, privateReply?: PrivateReply): Promise<boolean> =>
       handleVoiceCommand(event, callUrl, privateReply),
+    meetingsEnabled: livekit.meetingsEnabled,
+    startMeeting: (platformId: string, meetingUrl: string): Promise<MeetingStart> => {
+      if (!connected || !setup) return Promise.resolve({ ok: false, error: 'stopped' });
+      return livekit.startMeeting(platformId, meetingUrl);
+    },
+    leaveMeeting: (platformId: string): boolean => livekit.leaveMeeting(platformId),
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
@@ -662,6 +676,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         protocol: LIVEKIT_PROTOCOL_VERSION,
         agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
         speechProviders: Object.keys(providerKeys),
+        meetings: livekit.meetingsEnabled ? 'on' : 'off',
         pageListener: pageServer ? `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}` : 'off',
       });
     },
@@ -819,6 +834,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
           sttModel: env.VOICE_MODE_STT_MODEL,
           silenceMs: parseSilenceMs(env.VOICE_MODE_SILENCE_MS),
         },
+        meetBridge: meetBridgeFromEnv(),
       },
     });
   },

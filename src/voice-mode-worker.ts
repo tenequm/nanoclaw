@@ -53,6 +53,7 @@ import {
   AudioStream,
   DisconnectReason,
   LocalAudioTrack,
+  ParticipantKind,
   RoomEvent,
   TrackKind,
   TrackPublishOptions,
@@ -61,6 +62,7 @@ import {
   type RemoteTrackPublication,
   type LocalParticipant,
   type RemoteParticipant,
+  type Room,
 } from '@livekit/rtc-node';
 
 import {
@@ -3559,6 +3561,15 @@ export function readJobHeader(raw: string): {
   };
 }
 
+/**
+ * The identity a job's worker joins the room as: a meeting call's own (its bot streams that participant
+ * into the meeting), else '' for agents-js's default.
+ */
+export function jobIdentity(header: ReturnType<typeof readJobHeader>): string {
+  const identity = header.call?.meeting?.agentIdentity;
+  return typeof identity === 'string' && /^[\w-]{1,64}$/.test(identity) ? identity : '';
+}
+
 const withTimeout = <T>(promise: Promise<T>, ms: number, message: string): Promise<T> =>
   new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(message)), ms);
@@ -3752,6 +3763,225 @@ export class Outbox {
 const VAD_ACTIVATION = 0.5;
 /** Silero's window at 16 kHz: audio short of a whole one waits for the next frames before it is analyzed. */
 const VAD_WINDOW = 512;
+
+/** Attendee's room sync marks each meeting participant it mirrors into the room with these attributes. */
+const ROOM_SYNC_OWNER_ATTRIBUTE = 'attendee.room_sync.owner';
+const ROOM_SYNC_RELEASE_ATTRIBUTE = 'attendee.room_sync.release';
+/** Any other meeting bridge marks the participant(s) carrying the meeting's audio with this attribute, "1". */
+export const MEETING_INPUT_ATTRIBUTE = 'nanoclaw.meeting_input';
+/** A meeting call ends once no meeting participant has been in the room for this long. */
+export const MEETING_EMPTY_MS = 30_000;
+/** The meeting's audio is mixed in frames of this length, on the worker's own clock. */
+const MIX_FRAME_MS = 20;
+const MIX_FRAME = samplesOf(MIX_FRAME_MS);
+/** Audio a participant may be ahead of the mix; older audio is dropped so a stall cannot build latency. */
+const MIX_BACKLOG = samplesOf(200);
+/** Frames a late tick catches up on; a longer stall is skipped. */
+const MAX_MIX_CATCHUP = 5;
+
+/**
+ * A meeting input in the room: a participant a bridge marked with MEETING_INPUT_ATTRIBUTE, or one
+ * Attendee mirrored from the meeting (its owner attribute, not released: it left the meeting, or the
+ * bot shut down). Attendee's own watcher and source-subscriber participants are hidden and never show
+ * up; agents never count.
+ */
+export function isMeetingParticipant(p: {
+  identity: string;
+  kind?: ParticipantKind;
+  attributes?: Record<string, string>;
+}): boolean {
+  const attributes = p.attributes ?? {};
+  if (p.kind === ParticipantKind.AGENT) return false;
+  if (attributes[MEETING_INPUT_ATTRIBUTE] === '1') return true;
+  return (
+    !!attributes[ROOM_SYNC_OWNER_ATTRIBUTE] &&
+    !attributes[ROOM_SYNC_RELEASE_ATTRIBUTE] &&
+    !p.identity.startsWith('attendee-')
+  );
+}
+
+/** The display names of the meeting participants in the room, for the agent's turn note. */
+export function meetingParticipantNames(
+  participants: Iterable<{
+    identity: string;
+    name?: string;
+    kind?: ParticipantKind;
+    attributes?: Record<string, string>;
+  }>,
+): string[] {
+  return [...participants].filter(isMeetingParticipant).flatMap((p) => (p.name?.trim() ? [p.name.trim()] : []));
+}
+
+/** The room as a meeting call watches it. */
+type MeetingRoom = Pick<Room, 'remoteParticipants' | 'on' | 'off'>;
+
+/** Resolves once a meeting participant is in the room. */
+export function waitForMeetingParticipant(room: MeetingRoom): Promise<void> {
+  return new Promise((resolve) => {
+    const check = () => {
+      if (![...room.remoteParticipants.values()].some(isMeetingParticipant)) return;
+      room.off(RoomEvent.ParticipantConnected, check);
+      room.off(RoomEvent.ParticipantAttributesChanged, check);
+      resolve();
+    };
+    room.on(RoomEvent.ParticipantConnected, check);
+    room.on(RoomEvent.ParticipantAttributesChanged, check);
+    check();
+  });
+}
+
+/**
+ * A meeting call's end rule: `onEmpty` once no meeting participant has been in the room for `emptyMs`.
+ * Someone joining in that time keeps the call.
+ */
+export class MeetingPresence {
+  private timer?: ReturnType<typeof setTimeout>;
+  constructor(
+    private readonly emptyMs: number,
+    private readonly onEmpty: () => void,
+  ) {}
+
+  update(participants: number): void {
+    if (participants > 0) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    } else if (!this.timer) {
+      this.timer = setTimeout(() => {
+        this.timer = undefined;
+        this.onEmpty();
+      }, this.emptyMs);
+      this.timer.unref?.();
+    }
+  }
+
+  close(): void {
+    clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+}
+
+/**
+ * Several 16 kHz mono streams summed into one, a frame at a time, clipped to 16 bits. A source with
+ * nothing queued adds silence; each source keeps at most `maxBacklog` samples, the newest.
+ */
+export class AudioMixer {
+  private readonly sources = new Map<string, { buf: Int16Array; len: number }>();
+
+  constructor(
+    private readonly frameSamples: number,
+    private readonly maxBacklog: number,
+  ) {}
+
+  get size(): number {
+    return this.sources.size;
+  }
+
+  add(id: string): void {
+    if (!this.sources.has(id)) this.sources.set(id, { buf: new Int16Array(this.maxBacklog), len: 0 });
+  }
+
+  remove(id: string): void {
+    this.sources.delete(id);
+  }
+
+  push(id: string, pcm: Int16Array): void {
+    const source = this.sources.get(id);
+    if (!source) return;
+    if (pcm.length >= this.maxBacklog) {
+      source.buf.set(pcm.subarray(pcm.length - this.maxBacklog));
+      source.len = this.maxBacklog;
+      return;
+    }
+    const overflow = source.len + pcm.length - this.maxBacklog;
+    if (overflow > 0) {
+      source.buf.copyWithin(0, overflow, source.len);
+      source.len -= overflow;
+    }
+    source.buf.set(pcm, source.len);
+    source.len += pcm.length;
+  }
+
+  pull(): Int16Array {
+    const sum = new Int32Array(this.frameSamples);
+    for (const source of this.sources.values()) {
+      const n = Math.min(source.len, this.frameSamples);
+      for (let i = 0; i < n; i++) sum[i] += source.buf[i];
+      source.buf.copyWithin(0, n, source.len);
+      source.len -= n;
+    }
+    const out = new Int16Array(this.frameSamples);
+    for (let i = 0; i < out.length; i++) out[i] = Math.max(-32768, Math.min(32767, sum[i]));
+    return out;
+  }
+}
+
+/**
+ * A meeting call's input: every meeting participant's track mixed into the one stream the call's VAD
+ * and turns hear, on a fixed clock while any track is in. The last track leaving ends the speech
+ * under way, as a caller's track ending does.
+ */
+class MeetingInput {
+  private readonly mixer = new AudioMixer(MIX_FRAME, MIX_BACKLOG);
+  private readonly readers = new Map<string, ReadableStreamDefaultReader<AudioFrame>>();
+  private timer?: ReturnType<typeof setInterval>;
+  private startedAt = 0;
+  private emitted = 0;
+
+  constructor(
+    private readonly input: Pick<CallerInput, 'frame' | 'ended'>,
+    private readonly log: Pick<Console, 'warn'>,
+  ) {}
+
+  add(sid: string, track: RemoteTrack): void {
+    if (this.readers.has(sid)) return;
+    const reader = new AudioStream(track, { sampleRate: INPUT_SAMPLE_RATE, numChannels: 1 }).getReader();
+    this.readers.set(sid, reader);
+    this.mixer.add(sid);
+    void (async () => {
+      for (;;) {
+        const { done, value: frame } = await reader.read();
+        if (this.readers.get(sid) !== reader) return;
+        if (done) return this.remove(sid);
+        this.mixer.push(sid, frame.data);
+      }
+    })().catch((err: unknown) => {
+      this.log.warn('voice-mode worker: a meeting participant audio stopped', { err });
+      if (this.readers.get(sid) === reader) this.remove(sid);
+    });
+    if (!this.timer) {
+      this.startedAt = performance.now();
+      this.emitted = 0;
+      this.timer = setInterval(() => this.tick(), MIX_FRAME_MS);
+    }
+  }
+
+  remove(sid: string): void {
+    const reader = this.readers.get(sid);
+    if (!reader) return;
+    this.readers.delete(sid);
+    this.mixer.remove(sid);
+    void reader.cancel().catch(() => undefined);
+    if (this.readers.size > 0) return;
+    clearInterval(this.timer);
+    this.timer = undefined;
+    this.input.ended();
+  }
+
+  close(): void {
+    clearInterval(this.timer);
+    this.timer = undefined;
+    for (const reader of this.readers.values()) void reader.cancel().catch(() => undefined);
+    this.readers.clear();
+  }
+
+  private tick(): void {
+    const due = Math.floor((performance.now() - this.startedAt) / MIX_FRAME_MS) - this.emitted;
+    this.emitted += due;
+    for (let i = 0; i < Math.min(due, MAX_MIX_CATCHUP); i++) {
+      this.input.frame(new AudioFrame(this.mixer.pull(), INPUT_SAMPLE_RATE, 1, MIX_FRAME));
+    }
+  }
+}
 
 /** A VAD stream as CallerInput uses it: Silero's, or a test's. */
 export interface VadStream extends AsyncIterable<{
@@ -4075,11 +4305,14 @@ async function roomVoice(
     }),
   );
   // The cues' own track: never the speech track, so a cue is never the agent speaking. Without it
-  // the call runs silent of cues.
-  const cueTrack = await publishCueTrack(local, log).catch((err: unknown) => {
-    log.warn('voice-mode worker: could not publish the cue track', { err });
-    return undefined;
-  });
+  // the call runs silent of cues. A meeting gets none: its bot streams one audio track of ours into
+  // the meeting, the one subscribed last, which would be the cues'.
+  const cueTrack = meta.meeting
+    ? undefined
+    : await publishCueTrack(local, log).catch((err: unknown) => {
+        log.warn('voice-mode worker: could not publish the cue track', { err });
+        return undefined;
+      });
 
   const outbox = new Outbox(log);
   const post = (what: string, job: () => Promise<unknown>, key?: string) => outbox.post(what, job, key);
@@ -4091,6 +4324,8 @@ async function roomVoice(
   // The caller's microphone, from its first frame: the VAD and the turns count the same samples.
   const vads = userData.vad;
   const input = new CallerInput(() => vads.stream() as unknown as VadStream, events, log);
+  /** A meeting's participants, mixed into the input in place of a caller's microphone. */
+  const meeting = meta.meeting ? new MeetingInput(input, log) : undefined;
   let callerTrack: string | undefined;
   let callerAudio: ReadableStreamDefaultReader<AudioFrame> | undefined;
   /** The caller's track ended or was replaced: its reader stops, and speech under way ends. */
@@ -4101,6 +4336,11 @@ async function roomVoice(
     input.ended();
   };
   const listen = (track: RemoteTrack, publication: RemoteTrackPublication, participant: RemoteParticipant) => {
+    if (meeting) {
+      if (closed || track.kind !== TrackKind.KIND_AUDIO || !publication.sid || !isMeetingParticipant(participant))
+        return;
+      return meeting.add(publication.sid, track);
+    }
     if (closed || participant.identity !== meta.callerIdentity || track.kind !== TrackKind.KIND_AUDIO) return;
     if (publication.sid === callerTrack && callerAudio) return;
     stopListening();
@@ -4120,6 +4360,7 @@ async function roomVoice(
     });
   };
   const unlisten = (_track: RemoteTrack, publication: RemoteTrackPublication, participant: RemoteParticipant) => {
+    if (meeting) return void (publication.sid && meeting.remove(publication.sid));
     if (participant.identity === meta.callerIdentity && publication.sid === callerTrack) stopListening();
   };
   room.on(RoomEvent.TrackSubscribed, listen);
@@ -4249,6 +4490,7 @@ async function roomVoice(
         }
       };
       await quietly(() => callerAudio?.cancel());
+      await quietly(() => meeting?.close());
       await quietly(() => input.close());
       await quietly(() => cueTrack?.close());
       await quietly(() => speechPublication.sid && local.unpublishTrack(speechPublication.sid));
@@ -4464,7 +4706,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
 
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
   try {
-    await withTimeout(ctx.waitForParticipant(meta.callerIdentity), meta.joinTimeoutMs, 'caller never joined');
+    await withTimeout<unknown>(
+      meta.meeting ? waitForMeetingParticipant(ctx.room) : ctx.waitForParticipant(meta.callerIdentity),
+      meta.joinTimeoutMs,
+      meta.meeting ? 'nobody from the meeting joined' : 'caller never joined',
+    );
   } catch (err) {
     return abandon((err as Error).message);
   }
@@ -4525,11 +4771,15 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         const turnKey = randomUUID();
         let res: Response;
         try {
-          res = await host.post('utterance', { text, turnKey }).catch(async (err: unknown) => {
+          // A meeting turn names who is in the meeting: any of them may have spoken.
+          const body = meta.meeting
+            ? { text, turnKey, participants: meetingParticipantNames(ctx.room.remoteParticipants.values()) }
+            : { text, turnKey };
+          res = await host.post('utterance', body).catch(async (err: unknown) => {
             if ((err as Error | null)?.name === 'TimeoutError') throw err;
             callLog.warn('voice-mode worker: posting a turn failed; trying once more', { err });
             await sleep(TURN_RETRY_DELAY_MS);
-            return host.post('utterance', { text, turnKey });
+            return host.post('utterance', body);
           });
         } catch (err) {
           // Unanswered, not refused: the host may still store it and say so with `turn-stored`.
@@ -4601,10 +4851,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
    * awaits the same end: the job's shutdown must not exit while a committed send still goes out.
    */
   let ended: Promise<void> | undefined;
+  /** A meeting call's end rule, while it runs. */
+  let meetingPresence: MeetingPresence | undefined;
   const end = (reason: string, tellHost: boolean, restart = false): Promise<void> =>
     (ended ??= endCall(reason, tellHost, restart));
   const endCall = async (reason: string, tellHost: boolean, restart: boolean) => {
     ending = true;
+    meetingPresence?.close();
     updateTyping();
     clearTimeout(readyTimer);
     clearTimeout(turnCueTimer);
@@ -4806,6 +5059,9 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       ...(transcriptDebug ? { debug: true } : {}),
     },
   );
+  // A meeting has no page to set the wake switch: the agent takes a turn only when addressed, and the
+  // pause after it sends it, since nobody in the meeting says a send word.
+  if (meta.meeting) callTurns.configure(true, true);
   if (recordCall) {
     callRecording = new CallRecording(
       recordings,
@@ -4983,36 +5239,49 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     clearTimeout(deadline);
     await end('job shutdown', true, true);
   });
-  /** Set while the caller's identity is gone and may still rejoin. */
-  let callerGone: ReturnType<typeof setTimeout> | undefined;
-  ctx.room.on(RoomEvent.ParticipantConnected, (participant) => {
-    if (participant.identity !== meta.callerIdentity || !callerGone) return;
-    clearTimeout(callerGone);
-    callerGone = undefined;
-    callLog.info('voice-mode worker: the caller rejoined', { sid: participant.sid });
-    // The review state goes out as data: the new instance has not heard it. Its audio and RPCs
-    // follow the identity on their own.
-    review?.republish();
-  });
-  ctx.room.on(RoomEvent.ParticipantDisconnected, (participant) => {
-    if (participant.identity !== meta.callerIdentity || ending) return;
-    const reason = participant.disconnectReason;
-    const waitMs = callerRejoinWaitMs(reason);
-    if (!waitMs) return void end('caller left', true);
-    callLog.info('voice-mode worker: the caller dropped, waiting for it to rejoin', {
-      sid: participant.sid,
-      reason: reason === undefined ? 'unknown' : DisconnectReason[reason],
-      waitMs,
-    });
-    clearTimeout(callerGone);
-    callerGone = setTimeout(() => {
+  if (meta.meeting) {
+    // Ends once no meeting input has been in the room for a while; the meeting bot leaving takes them all.
+    const presence = new MeetingPresence(MEETING_EMPTY_MS, () => void end('nobody left in the meeting', true));
+    meetingPresence = presence;
+    const recount = () => {
+      if (!ending) presence.update([...ctx.room.remoteParticipants.values()].filter(isMeetingParticipant).length);
+    };
+    ctx.room.on(RoomEvent.ParticipantConnected, recount);
+    ctx.room.on(RoomEvent.ParticipantDisconnected, recount);
+    ctx.room.on(RoomEvent.ParticipantAttributesChanged, recount);
+    recount();
+  } else {
+    /** Set while the caller's identity is gone and may still rejoin. */
+    let callerGone: ReturnType<typeof setTimeout> | undefined;
+    ctx.room.on(RoomEvent.ParticipantConnected, (participant) => {
+      if (participant.identity !== meta.callerIdentity || !callerGone) return;
+      clearTimeout(callerGone);
       callerGone = undefined;
-      void end('caller left', true);
-    }, waitMs);
-    callerGone.unref?.();
-  });
-  // The caller may have left while the call was being set up.
-  if (!ctx.room.remoteParticipants.has(meta.callerIdentity)) void end('caller left', true);
+      callLog.info('voice-mode worker: the caller rejoined', { sid: participant.sid });
+      // The review state goes out as data: the new instance has not heard it. Its audio and RPCs
+      // follow the identity on their own.
+      review?.republish();
+    });
+    ctx.room.on(RoomEvent.ParticipantDisconnected, (participant) => {
+      if (participant.identity !== meta.callerIdentity || ending) return;
+      const reason = participant.disconnectReason;
+      const waitMs = callerRejoinWaitMs(reason);
+      if (!waitMs) return void end('caller left', true);
+      callLog.info('voice-mode worker: the caller dropped, waiting for it to rejoin', {
+        sid: participant.sid,
+        reason: reason === undefined ? 'unknown' : DisconnectReason[reason],
+        waitMs,
+      });
+      clearTimeout(callerGone);
+      callerGone = setTimeout(() => {
+        callerGone = undefined;
+        void end('caller left', true);
+      }, waitMs);
+      callerGone.unref?.();
+    });
+    // The caller may have left while the call was being set up.
+    if (!ctx.room.remoteParticipants.has(meta.callerIdentity)) void end('caller left', true);
+  }
 
   host
     .events((event) => {
@@ -5148,12 +5417,15 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
       // is taken too, to tell the caller's page the service is updating.
       requestFunc: async (req) => {
         let name: string;
+        let identity: string;
         try {
-          name = readJobHeader(req.job.metadata).agentName ?? DEFAULT_LIVEKIT_AGENT_NAME;
+          const header = readJobHeader(req.job.metadata);
+          name = header.agentName ?? DEFAULT_LIVEKIT_AGENT_NAME;
+          identity = jobIdentity(header);
         } catch {
           return req.reject();
         }
-        await req.accept(name).catch(() => req.reject().catch(() => undefined));
+        await req.accept(name, identity).catch(() => req.reject().catch(() => undefined));
       },
     }),
   );

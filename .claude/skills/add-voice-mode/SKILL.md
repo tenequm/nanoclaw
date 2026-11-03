@@ -52,6 +52,8 @@ src/channels/voice-mode-line-roles.test.ts
 src/channels/voice-mode-line.ts
 src/channels/voice-mode-livekit.test.ts
 src/channels/voice-mode-livekit.ts
+src/channels/voice-mode-meet.test.ts
+src/channels/voice-mode-meet.ts
 src/channels/voice-mode-page.test.ts
 src/channels/voice-mode-page.ts
 src/channels/voice-mode-protocol.ts
@@ -306,6 +308,20 @@ line's `/voice` chat and must stay wired to the line's agent: with no usable
 chat a call is refused at start, and a running call on it ends, until `/voice`
 runs in a chat with the agent. There is no fallback chat.
 
+`/meet <Google Meet link>` (Slack `!meet`) takes the agent into a meeting as
+a voice participant, with `/voice`'s rules: an owner or admin of the chat's one
+agent, on their own line (created here on first use), and this chat becomes the
+call chat. A meeting bridge (`MEET_PROVIDER`, default `attendee`: a self-hosted
+[Attendee](https://github.com/attendee-labs/attendee) whose LiveKit is this
+one) sends a bot named after the agent; someone admits it from the lobby
+(10 minutes). It mirrors each participant into the call's room, and the
+worker mixes them into one input and streams its speech back into the
+meeting. The wake phrase is always on and the pause sends; there are no cues.
+Each turn tells the agent who is present. The meeting runs up to 60 minutes
+under the line's daily minutes, and ends 30 seconds after the last participant
+leaves, on `/meet leave`, or when a call on the line's link replaces it. The
+bot records nothing (`recording_settings.format: none`).
+
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use
 fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
@@ -332,6 +348,8 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_WAKE_START_SECONDS`, `VOICE_MODE_WAKE_IDLE_SECONDS` | `8`, `20` | How long an addressed turn waits for first or more speech; zero disables each timer. |
 | `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`. |
 | `VOICE_MODE_CALL_RECORDING` | off | Debug: `true` or `1` also records each caller's whole call, waiting for the wake phrase included, as `data/voice-recordings/<agent>/<date>/<callId>-call.wav` (16 kHz mono, the agent's speech as silence) with a `.json` of wake detections. Local only, owner-only files; pruned by `VOICE_MODE_RECORDINGS_DAYS` when that is set, kept otherwise. |
+| `MEET_PROVIDER` | `attendee` | Meeting bridge for `/meet`; unset settings leave `/meet` off. |
+| `ATTENDEE_URL`, `ATTENDEE_API_KEY` | none | The Attendee API (`/api/v1/`, `Authorization: Token`) the host reaches; the room is created before the bot. |
 | `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | Worker health on loopback. |
 | `VOICE_MODE_UI` | empty | Page options: skin, colorway, layout, presence, brand, footer, shortcuts, timestamps, colorwayPicker. |
 

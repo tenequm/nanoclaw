@@ -62,6 +62,8 @@ rm -f src/channels/voice-mode-adapter.test.ts \
   src/channels/voice-mode-line.ts \
   src/channels/voice-mode-livekit.test.ts \
   src/channels/voice-mode-livekit.ts \
+  src/channels/voice-mode-meet.test.ts \
+  src/channels/voice-mode-meet.ts \
   src/channels/voice-mode-page.test.ts \
   src/channels/voice-mode-page.ts \
   src/channels/voice-mode-protocol.ts \

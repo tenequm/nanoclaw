@@ -99,6 +99,15 @@ export interface LiveKitJobMetadata {
   /** Upper bound the worker enforces on itself if the host never ends the call. */
   maxDurationMs: number;
   joinTimeoutMs: number;
+  /** A Google Meet joined through an Attendee bot (`/meet`): the meeting's participants are the callers. */
+  meeting?: MeetingJob;
+}
+
+/** What the worker needs of a `/meet` call; an older worker ignores it and waits for `callerIdentity`. */
+export interface MeetingJob {
+  url: string;
+  /** The identity the worker joins as: the meeting bot streams this participant's audio into the meeting. */
+  agentIdentity: string;
 }
 
 /**
