@@ -299,6 +299,13 @@ describe('GeminiLiveTranscriber', () => {
     ]) {
       expect(stripVocabularyEcho(said, vocabulary)).toBe(said);
     }
+    // A meeting's wake phrase in the vocabulary: its echo goes, the caller saying it stays.
+    const meeting = ['Junior', 'Hey Dan', ...vocabulary];
+    expect(stripVocabularyEcho("'Junior', 'Hey Dan', 'send it', 'прийом', 'scratch that'", meeting)).toBe('');
+    expect(stripVocabularyEcho('Junior, Hey Dan, send it', meeting)).toBe('');
+    for (const said of ["Hey Dan, what's two plus two? Copy.", 'Hey Dan.', 'Hey, Dan, can you respond to me? Copy.']) {
+      expect(stripVocabularyEcho(said, meeting)).toBe(said);
+    }
   });
 
   it('with no final, the interim text stands after the cap', async () => {

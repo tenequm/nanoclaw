@@ -116,6 +116,7 @@ import {
   MEETING_INPUT_ATTRIBUTE,
   meetingParticipantNames,
   meetingWakeNames,
+  meetingWakePhrase,
   type PublishedSpeech,
   waitForMeetingParticipant,
   MeetingPresence,
@@ -2769,6 +2770,43 @@ describe('CallTurns, transcript debug', () => {
           ]),
         );
     }
+  });
+});
+
+describe('CallTurns, the wake phrase only the final heard', () => {
+  it('wakes a transcript-woken turn whose interims missed the phrase, sending on the pause or on a command alone', async () => {
+    vi.useFakeTimers();
+    // The pause sends (a meeting): the words after the phrase go out, the words before it drop.
+    const h = turnsHarness({ wake: true, pauseSends: true });
+    h.t.results.push(heard('So Engineer, can you respond to me?', 'So, hey, Andy, can you respond to me?'));
+    await h.talk(1500);
+    await h.interim('So Engineer, can you respond to me?');
+    await h.pass(SILENCE + 500);
+    await vi.waitFor(() => expect(h.out.sent).toEqual(['can you respond to me?']));
+    expect(h.out.drops).toContainEqual(['unaddressed', 'So']);
+    expect(h.out.ended.map(([, outcome]) => outcome)).not.toContain('unaddressed');
+    // A final without the phrase still drops as before.
+    h.t.results.push(heard('Andy will take notes', 'Andy will take notes.'));
+    await h.talk(1500);
+    await h.interim('Andy will take notes');
+    await h.pass(SILENCE + 500);
+    await vi.waitFor(() => expect(h.out.ended.map(([, outcome]) => outcome)).toContain('unaddressed'));
+    expect(h.out.sent).toEqual(['can you respond to me?']);
+
+    // Only a spoken send sends (a call's default): a command the final ends with sends it; otherwise its words wait for one.
+    const c = turnsHarness({ wake: true });
+    c.t.results.push(heard('Engineer, what time is it?', 'Hey Andy, what time is it? Zulu.'));
+    await c.talk(1500);
+    await c.interim('Engineer, what time is it?');
+    await c.pass(SILENCE + 500);
+    await vi.waitFor(() => expect(c.out.sent).toEqual(['what time is it?']));
+    c.t.results.push(heard('Engineer, book a table', 'Hey Andy, book a table'));
+    await c.talk(1500);
+    await c.interim('Engineer, book a table');
+    await c.pass(SILENCE + 500);
+    await vi.waitFor(() => expect(c.turns.turnOpen).toBe(true));
+    expect(c.out.sent).toEqual(['what time is it?']);
+    vi.useRealTimers();
   });
 });
 
@@ -5943,8 +5981,8 @@ describe('meeting calls', () => {
 
   const WAKE_ENV = { ...ENV, VOICE_MODE_WAKE_MODEL: '/models/hey_dan.onnx', VOICE_MODE_WAKE_PHRASE: 'Hey Dan' };
 
-  it('wakes on `hey <agent>` and on the wake phrase name in the transcript, whatever the punctuation or spelling', () => {
-    const names = wakeNameWords(meetingWakeNames({ agentName: 'Junior', wakeNames: ['NanoClaw'] }, WAKE_ENV));
+  it('wakes on the wake phrase alone in the transcript, whatever the punctuation or spelling, never on the agent name', () => {
+    const names = wakeNameWords(meetingWakeNames(WAKE_ENV));
     const after = (text: string) => {
       const found = matchWake(text, names);
       return found ? text.slice(found.end) : null;
@@ -5957,10 +5995,9 @@ describe('meeting calls', () => {
       "Hey Den, what's two plus two?",
       "Hi Dan, what's two plus two?",
       "Heydan, what's two plus two?",
-      "Hey Junior, what's two plus two?",
-      "hey junior what's two plus two?",
-      "Hey, Junior - what's two plus two?",
-      "So, hey Junior, what's two plus two?",
+      "Hey Dun, what's two plus two?",
+      "Hey, Don - what's two plus two?",
+      "So, hey Dan, what's two plus two?",
     ]) {
       expect(
         after(text)
@@ -5977,11 +6014,19 @@ describe('meeting calls', () => {
       'They danced all night',
       'Junior engineers joined today',
       'The hidden cost is high',
+      "Hey Junior, what's two plus two?",
+      "Hey, junior, can you respond to me? Copy.",
+      "Hey NanoClaw, what's two plus two?",
     ]) {
       expect(matchWake(text, names), text).toBeNull();
     }
-    // Without a wake phrase the meeting takes the agent's names only; a plain call never takes the phrase's.
-    expect(meetingWakeNames({ agentName: 'Junior' }, ENV)).toEqual(['Junior']);
+    expect(meetingWakeNames(WAKE_ENV)).toEqual(['Dan']);
+    expect(meetingWakePhrase(WAKE_ENV)).toBe('Hey Dan');
+    // Without a wake phrase a meeting still wakes on Hey Dan; with another phrase, on that one alone.
+    expect(meetingWakeNames(ENV)).toEqual(['Dan']);
+    expect(meetingWakePhrase(ENV)).toBe('Hey Dan');
+    expect(meetingWakeNames({ ...ENV, VOICE_MODE_WAKE_PHRASE: ' Hey  Jarvis ' })).toEqual(['Jarvis']);
+    expect(meetingWakePhrase({ ...ENV, VOICE_MODE_WAKE_PHRASE: ' Hey  Jarvis ' })).toBe('Hey Jarvis');
   });
 
   it('never starts the acoustic spotter: the transcript wakes it mid-sentence, the words after the phrase are the turn, other talk drops', async () => {
@@ -5992,14 +6037,17 @@ describe('meeting calls', () => {
     v.voice.review.serve = vi.fn();
     const wakeWord = vi.fn();
     await runCall(m.ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord }));
-    /** One breath of meeting talk with no pause after the wake phrase, its interim heard mid-speech, then the closing silence. */
-    const say = async (text: string) => {
+    /**
+     * One breath of meeting talk with no pause after the wake phrase, its interim heard mid-speech
+     * (`interim`, the final's text unless set), then the closing silence.
+     */
+    const say = async (text: string, interim = text) => {
       await flush();
-      v.transcription.results.push(heard(text, text));
+      v.transcription.results.push(heard(interim, text));
       const start = v.position;
       v.events.onSpeech(true, start);
       v.audio(1500);
-      v.interim(text);
+      v.interim(interim);
       const end = v.position;
       v.audio(SILENCE);
       v.events.onVad(v.position, end);
@@ -6013,9 +6061,19 @@ describe('meeting calls', () => {
     await vi.waitFor(() => expect(utterances()).toEqual(['what is two plus two']));
     await say('Danny will take the notes today');
     await say('ok so hey Junior, when is the next sprint review?');
-    await vi.waitFor(() => expect(utterances()).toEqual(['what is two plus two', 'when is the next sprint review?']));
+    await say('Hey, junior, can you respond to me? Copy.');
+    // Only the final has the phrase (call 16f48dd3's interim heard `Engineer` for `Hey, junior`): it still wakes.
+    await say('Hey, Dan, can you respond to me? Copy.', 'Engineer, can you respond to me?');
+    await say('ok so hey dan when is the next sprint review?');
+    await vi.waitFor(() =>
+      expect(utterances()).toEqual([
+        'what is two plus two',
+        'can you respond to me?',
+        'when is the next sprint review?',
+      ]),
+    );
     await new Promise((r) => setTimeout(r, 50));
-    expect(utterances()).toHaveLength(2);
+    expect(utterances()).toHaveLength(3);
     expect(wakeWord).not.toHaveBeenCalled();
     host.emit({ type: 'end', reason: 'test over' });
     await vi.waitFor(() => expect(m.job.shutdown).toHaveBeenCalled());
@@ -6031,7 +6089,7 @@ describe('meeting calls', () => {
     await vi.waitFor(() => expect(plain.job.shutdown).toHaveBeenCalled());
   });
 
-  it('asks the transcription to rotate long activities in a meeting only', async () => {
+  it('asks the transcription to rotate long activities, and to hear Hey Dan, in a meeting only', async () => {
     const options: TranscriberOptions[] = [];
     const capture = (v: ReturnType<typeof fakeVoice>) => (o: TranscriberOptions) => {
       options.push(o);
@@ -6053,6 +6111,9 @@ describe('meeting calls', () => {
     await vi.waitFor(() => expect(plain.job.shutdown).toHaveBeenCalled());
     expect(options[0].activityMaxMs).toBe(MEETING_ACTIVITY_MAX_MS);
     expect(options[1]).not.toHaveProperty('activityMaxMs');
+    expect(options[0].vocabulary).toContain('Hey Dan');
+    expect(options[1].vocabulary).not.toContain('Hey Dan');
+    expect(options[0].vocabulary.filter((t) => t !== 'Hey Dan')).toEqual(options[1].vocabulary);
   });
 
   it('takes no turn until addressed when no page sets the switch, and ends once the meeting stayed empty', async () => {

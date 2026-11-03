@@ -2988,7 +2988,10 @@ export class CallTurns {
     }
     // Undecided until its final is in: a switch to review can still take it, and it holds replies.
     const undecided = turn.kind === 'auto' && turn.addressed && ['pause', 'asleep', 'agent', 'discard'].includes(why);
-    const slot = undecided ? this.deps.reserve() : undefined;
+    // The transcript may have `hey <agent>` only in its final (an interim heard `Engineer` for `Hey, junior`):
+    // such a turn keeps its place in the order until the final is in.
+    const wakeInFinal = turn.kind === 'auto' && turn.textWake && !turn.addressed && why === 'unaddressed';
+    const slot = undecided || wakeInFinal ? this.deps.reserve() : undefined;
     if (undecided) {
       turn.endedAt = endedAt;
       turn.discarding = why === 'discard';
@@ -3008,11 +3011,13 @@ export class CallTurns {
   /** A turn closed by a pause, sleep, the agent's line, a discard phrase, a switch, or review: its final decides. */
   private async decide(
     turn: OpenTurn,
-    why: Exclude<TurnEnd, 'send'>,
+    endedBy: Exclude<TurnEnd, 'send'>,
     closed: Closed,
     ending: Promise<Heard>,
-    slot: TurnSlot | undefined,
+    reserved: TurnSlot | undefined,
   ): Promise<Recording | null> {
+    let why = endedBy;
+    let slot = reserved;
     const { take } = closed;
     const heard = await ending;
     // Words of an earlier activity of this turn, still finalizing when the caller went on, lead it.
@@ -3020,6 +3025,29 @@ export class CallTurns {
     this.closing.delete(turn);
     const chosen = turnText(heard);
     let said = joinText(turn.carry, chosen.text);
+    if (slot && !turn.addressed) {
+      // A turn no interim woke: its final may have the wake phrase all the same.
+      const found = matchWake(said, closed.names);
+      if (found && !this.closed && !turn.switched && !turn.handOff) {
+        const before = trimCut(said.slice(0, found.start));
+        if (before) this.deps.drop('unaddressed', before);
+        turn.addressed = true;
+        this.wakes++;
+        this.cut = false;
+        this.deps.changed();
+        const words = this.spoken(turn, said, closed.names);
+        // Without the pause sending, only a command the final ends with sends it; its words go on otherwise.
+        if (!this.pausesSend && !matchCommand(words)) {
+          slot.skip();
+          this.goOn(words, closed.endedAt);
+          return null;
+        }
+        why = 'pause';
+      } else {
+        slot.skip();
+        slot = undefined;
+      }
+    }
     this.debug('heard', { seg: turn.segment, why, source: chosen.source, said, ...heard });
     const facts = this.facts(turn, why, closed, heard, chosen.source, said);
     take.facts = facts;
@@ -3821,17 +3849,22 @@ export const MEETING_EMPTY_MS = 30_000;
  */
 export const MEETING_ACTIVITY_MAX_MS = 200_000;
 
+/** The name a meeting wakes on without a VOICE_MODE_WAKE_PHRASE. */
+const MEETING_WAKE_NAME = 'Dan';
+
 /**
- * The names `hey <agent>` takes in a meeting: the agent's, its wake names, and the wake phrase's
- * name (VOICE_MODE_WAKE_PHRASE `Hey Dan`: `Dan`), which the transcript opens a turn with there.
+ * The one name `hey <name>` takes in a meeting: the wake phrase's (VOICE_MODE_WAKE_PHRASE `Hey Dan`:
+ * `Dan`), MEETING_WAKE_NAME without one. Never the agent's own names: a meeting wakes like a call.
  */
-export function meetingWakeNames(
-  meta: Pick<LiveKitJobMetadata, 'agentName' | 'wakeNames'>,
-  env: Record<string, string | undefined>,
-): string[] {
+export function meetingWakeNames(env: Record<string, string | undefined>): string[] {
   const phrase = env.VOICE_MODE_WAKE_PHRASE?.trim();
-  const name = phrase ? phraseName(phrase) : undefined;
-  return [meta.agentName, ...(meta.wakeNames ?? []), ...(name ? [name] : [])];
+  return [(phrase && phraseName(phrase)) || MEETING_WAKE_NAME];
+}
+
+/** The meeting's wake phrase as the transcription's vocabulary takes it (`Hey Dan`), so it is heard as said. */
+export function meetingWakePhrase(env: Record<string, string | undefined>): string {
+  const phrase = env.VOICE_MODE_WAKE_PHRASE?.trim().split(/\s+/).join(' ');
+  return phrase && phraseName(phrase) ? phrase : `Hey ${MEETING_WAKE_NAME}`;
 }
 /** The meeting's audio is mixed in frames of this length, on the worker's own clock. */
 const MIX_FRAME_MS = 20;
@@ -5096,7 +5129,13 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     model: meta.sttModel,
     // The names (the host trimmed, deduplicated and capped them) and the commands, which the
     // transcription does not hear reliably unless they are in its vocabulary.
-    vocabulary: [...new Set([...(meta.vocabulary ?? []), ...COMMAND_VOCABULARY])],
+    vocabulary: [
+      ...new Set([
+        ...(meta.vocabulary ?? []),
+        ...(meta.meeting ? [meetingWakePhrase(deps.env)] : []),
+        ...COMMAND_VOCABULARY,
+      ]),
+    ],
     languageCodes: languages.codes,
     sampleRate: INPUT_SAMPLE_RATE,
     onInterim: (text) => callTurns.onInterim(text),
@@ -5132,7 +5171,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     },
     {
       silenceMs: meta.silenceMs,
-      names: meta.meeting ? meetingWakeNames(meta, deps.env) : [meta.agentName, ...(meta.wakeNames ?? [])],
+      names: meta.meeting ? meetingWakeNames(deps.env) : [meta.agentName, ...(meta.wakeNames ?? [])],
       limits: awakeLimits(deps.env),
       record,
       ...(transcriptDebug ? { debug: true } : {}),
@@ -5141,11 +5180,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   // A meeting has no page to set the wake switch: the agent takes a turn only when addressed, and the
   // pause after it sends it, since nobody in the meeting says a send word. It has no acoustic wake
   // word either: the spotter fires only on a phrase followed by a pause, and a meeting says
-  // "Hey Dan, what's two plus two" in one breath, so `hey <agent>` in the transcript opens the turn.
+  // "Hey Dan, what's two plus two" in one breath, so the wake phrase in the transcript opens the turn.
   if (meta.meeting) {
     callTurns.configure(true, true);
-    callLog.info('voice-mode worker: a meeting wakes on "hey <agent>" in the transcript', {
-      names: meetingWakeNames(meta, deps.env),
+    callLog.info('voice-mode worker: a meeting wakes on its wake phrase in the transcript', {
+      phrase: meetingWakePhrase(deps.env),
     });
   }
   if (recordCall) {
