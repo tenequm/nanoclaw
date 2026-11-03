@@ -21,6 +21,7 @@ import {
   liveKitHostUrl,
   type CallReviewState,
   type CallVoiceState,
+  type CallWakeState,
   type LiveKitJobMetadata,
   type ReviewOp,
   type ReviewRequest,
@@ -38,6 +39,7 @@ import {
   CallRecording,
   CallTurns,
   DISCARD_SETTLE_MS,
+  SPEECH_FLOOR_MS,
   COMMAND_VOCABULARY,
   COMMAND_WORDS_JSON,
   captionMark,
@@ -113,6 +115,7 @@ initializeLogger({ pretty: false, level: 'error' });
 const flush = () => new Promise((r) => setTimeout(r, 5));
 const SILENCE = 2500;
 const silentLog = { info: () => undefined, warn: () => undefined };
+const echoLog = 'voice-mode worker: a lone command with no speech is an echo; ignored';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -2635,8 +2638,10 @@ function turnsHarness(
     facts: [] as Array<TurnFacts | undefined>,
     ended: [] as Array<[TurnFacts, string, string]>,
     logs: [] as string[],
+    /** The wake state at every `changed`, as a page would get it. */
+    states: [] as CallWakeState[],
   };
-  const turns = new CallTurns(
+  const turns: CallTurns = new CallTurns(
     {
       transcriber: t,
       reserve: () => ({
@@ -2663,7 +2668,7 @@ function turnsHarness(
         stopped: (at) => void out.countdown.push(`stopped ${Date.now() - at}`),
         clear: () => void out.countdown.push('clear'),
       },
-      changed: () => undefined,
+      changed: () => void out.states.push(turns.state),
       hold: (open) => void out.holds.push(open),
       noTurn: () => void out.noTurn++,
       unheard: () => void out.unheard++,
@@ -2703,12 +2708,29 @@ function turnsHarness(
     turns.onSpeech(false, end);
     await vi.advanceTimersByTimeAsync(0);
   };
+  /**
+   * The wake phrase as the call hears it: the VAD's speech starts `before` ms ahead of the detection and
+   * goes on `after` ms past it (the phrase's tail, or the caller going on), then ends 550 ms into the silence.
+   */
+  const wakeInSpeech = async (before: number, after: number) => {
+    const start = position;
+    await pass(Math.min(before, 100), 500);
+    turns.onSpeech(true, start);
+    await pass(Math.max(0, before - 100), 500);
+    turns.onWake(position);
+    await pass(after, 500);
+    const end = position;
+    await pass(550);
+    turns.onSpeech(false, end);
+    await vi.advanceTimersByTimeAsync(0);
+  };
   return {
     turns,
     t,
     out,
     pass,
     talk,
+    wakeInSpeech,
     get position() {
       return position;
     },
@@ -3106,7 +3128,7 @@ describe('CallTurns, hands-free', () => {
 });
 
 describe('CallTurns, wake', () => {
-  it('nothing is transcribed before the wake word; the turn starts where it was spotted; only send sends', async () => {
+  it('nothing is transcribed before the wake word; the turn starts at the next speech, never before the phrase; only send sends', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
     await h.pass(3000);
     await h.talk(1500);
@@ -3114,12 +3136,15 @@ describe('CallTurns, wake', () => {
     expect(h.turns.spotting).toBe(true);
     const end = h.position;
     h.turns.onWake(end);
-    // No audio from before the detection: the phrase (which ends there) is not in the turn.
-    expect(h.t.begins).toEqual([0]);
+    // Awake, and nothing goes to the transcription until the caller speaks.
+    expect(h.t.begins).toEqual([]);
     expect(h.out.cues).toEqual(['wake']);
+    expect(h.out.holds).toEqual([true]);
     expect(h.turns.state).toMatchObject({ on: true, waiting: false, heard: 1, phrase: 'Hey LiveKit', cut: true });
     h.t.results.push(heard('Book a table for two. Zulu.', 'Zulu.'));
     await h.talk(1500);
+    // No audio from before the detection: the phrase (which ends there) is not in the turn's pre-roll.
+    expect(h.t.begins).toEqual([16 * 100]);
     await h.pass(SILENCE + 500);
     expect(h.t.ended).toBe(0);
     await h.interim('Book a table for two. Zulu.');
@@ -3218,7 +3243,7 @@ describe('CallTurns, wake', () => {
     expect(h.out.sent).toEqual(['What time is it?']);
   });
 
-  it('goes back to waiting with the sleep cue: nothing said, then words held; a final ending in zulu still sends', async () => {
+  it('goes back to waiting with the sleep cue: nothing said, then words held, which go out; a final ending in zulu still sends', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
     await h.pass(100);
     h.turns.onWake(h.position);
@@ -3233,17 +3258,22 @@ describe('CallTurns, wake', () => {
     await h.pass(19_000);
     expect(h.out.cues).toHaveLength(3);
     await h.pass(1_100);
-    expect(h.out.drops).toEqual([['asleep', 'Remind me to buy bread.']]);
+    // A second of speech behind them: the words are sent as the turn goes back to waiting.
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.sent).toEqual(['Remind me to buy bread.']);
+    expect(h.out.facts.at(-1)).toMatchObject({ endedBy: 'asleep', words: 5 });
+    expect(h.out.cues).toEqual(['wake', 'sleep', 'wake', 'sleep']);
+    expect(h.turns.state).toMatchObject({ waiting: true, slept: 2 });
     await h.pass(100);
     h.turns.onWake(h.position);
     h.t.results.push(heard('Remind me to buy milk', 'Remind me to buy milk. Zulu.'));
     await h.talk(1000);
     await h.interim('Remind me to buy milk');
     await h.pass(20_100);
-    expect(h.out.sent).toEqual(['Remind me to buy milk.']);
+    expect(h.out.sent).toEqual(['Remind me to buy bread.', 'Remind me to buy milk.']);
   });
 
-  it('words held after the wake go back to waiting on time, however many interims repeat them', async () => {
+  it('words held after the wake go back to waiting on time, however many interims repeat them, and are sent', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
     await h.pass(100);
     h.turns.onWake(h.position);
@@ -3255,7 +3285,71 @@ describe('CallTurns, wake', () => {
       await h.interim('Remind me to stretch later.');
     }
     await h.pass(300);
-    expect(h.out.drops).toEqual([['asleep', 'Remind me to stretch later.']]);
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.sent).toEqual(['Remind me to stretch later.']);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+
+  it('a woken turn that sleeps with words but under 800 ms of speech drops them, as before', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Ah.', 'Ah.'));
+    await h.talk(300);
+    await h.interim('Ah.');
+    await h.pass(20_100);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['asleep', 'Ah.']]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.out.ended.map(([, outcome, reason]) => [outcome, reason])).toEqual([['discarded', 'asleep']]);
+  });
+
+  it('speech that came to no text at the sleep is a lost turn, not a sleep: the transcription failed, or heard nothing', async () => {
+    for (const failed of [true, false]) {
+      const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+      await h.pass(100);
+      h.turns.onWake(h.position);
+      h.t.results.push(heard('', undefined, failed));
+      await h.talk(1500);
+      // The idle limit, not the start limit: the caller spoke.
+      await h.pass(8_100);
+      expect(h.t.ended).toBe(0);
+      await h.pass(12_000);
+      expect(h.t.ended).toBe(1);
+      expect(h.out.lost).toEqual([failed ? 'stt' : 'empty']);
+      expect(h.out.cues).toEqual(['wake']);
+      expect(h.out.drops).toEqual([]);
+      expect(h.turns.state).toMatchObject({ waiting: true, slept: 1 });
+    }
+  });
+
+  it('a failed transcription of a click is no lost turn: under the floor it sleeps', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('', undefined, true));
+    await h.talk(100);
+    await h.pass(8_100);
+    expect(h.out.lost).toEqual([]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+
+  it('a reply plays over a woken turn holding words: it stays open, the idle limit restarts after it, and the words go', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Remind me to call mom.', 'Remind me to call mom.'));
+    await h.talk(1200);
+    await h.interim('Remind me to call mom.');
+    await h.pass(10_000);
+    h.turns.onAgentSpeaking(true);
+    await h.pass(15_000);
+    expect(h.t.ended).toBe(0);
+    h.turns.onAgentSpeaking(false);
+    await h.pass(19_900);
+    expect(h.t.ended).toBe(0);
+    await h.pass(200);
+    expect(h.out.sent).toEqual(['Remind me to call mom.']);
     expect(h.out.cues).toEqual(['wake', 'sleep']);
   });
 
@@ -3378,6 +3472,523 @@ describe('CallTurns, wake', () => {
     h.turns.configure(false, false);
     await h.pass(SILENCE);
     expect(h.out.sent).toEqual(['Book a table']);
+  });
+});
+
+describe('CallTurns, the wake and the speech after it', () => {
+  it('the phrase, a pause, then speech: the turn opens at the speech, with its pre-roll, and nothing before that', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(1000);
+    // VAD speech from 600 ms before the detection to 100 ms after it: the phrase and its tail.
+    await h.wakeInSpeech(600, 100);
+    expect(h.out.cues).toEqual(['wake']);
+    expect(h.turns.state).toMatchObject({ waiting: false, heard: 1 });
+    await h.pass(1000);
+    // A stray interim with no activity open belongs to nothing.
+    await h.interim('Прийом.');
+    expect(h.t.begins).toEqual([]);
+    expect(h.t.pushed).toBe(0);
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.talk(1500);
+    // The pre-roll (500 ms) and the speech the VAD had heard when it said so (100 ms).
+    expect(h.t.begins).toEqual([16 * 600]);
+    await h.interim('Book a table. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table.']);
+    expect(h.out.cues).toEqual(['wake', 'sent']);
+    expect(h.out.drops).toEqual([]);
+  });
+
+  it('speech going on straight after the phrase opens the turn at the wake point, once past the floor', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(1000);
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, h.position - 1600);
+    await h.pass(500, 500);
+    const spotted = h.position;
+    h.turns.onWake(spotted);
+    expect(h.t.begins).toEqual([]);
+    await h.pass(SPEECH_FLOOR_MS - 20, 500);
+    expect(h.t.begins).toEqual([]);
+    await h.pass(20, 500);
+    // Everything since the detection, and nothing of the phrase.
+    expect(h.t.begins).toEqual([16 * SPEECH_FLOOR_MS]);
+    h.t.results.push(heard('Book a table for two. Zulu.', 'Book a table for two. Zulu.'));
+    await h.pass(1000, 500);
+    const end = h.position;
+    await h.pass(550);
+    h.turns.onSpeech(false, end);
+    await h.interim('Book a table for two. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+  });
+
+  it('a speech floor already passed when the detection comes late opens the turn at once', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, 0);
+    const spotted = h.position;
+    // The spotter's thread ran behind: the caller has gone on 400 ms by the time it reports.
+    await h.pass(400, 500);
+    h.turns.onWake(spotted);
+    expect(h.t.begins).toEqual([16 * 400]);
+  });
+
+  it('the phrase then silence: back to waiting after the start limit, and no activity ever opened', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    await h.wakeInSpeech(600, 100);
+    // 8 s from the wake: 660 ms of it went by in the phrase's tail and the VAD's closing silence (frames of 20 ms).
+    await h.pass(8_000 - 660 - 40);
+    expect(h.out.cues).toEqual(['wake']);
+    expect(h.turns.state.waiting).toBe(false);
+    await h.pass(60);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.turns.state).toMatchObject({ waiting: true, slept: 1 });
+    expect(h.t.begins).toEqual([]);
+    expect(h.t.ended).toBe(0);
+    expect(h.out.holds).toEqual([true, false]);
+    expect(h.out.ended).toEqual([]);
+    expect(h.turns.spotting).toBe(true);
+  });
+
+  it('a lone command in an activity the caller did not speak in is an echo: nothing plays, shows, drops or sends', async () => {
+    for (const echo of ['Прийом.', 'Zulu.', 'Copy.', 'Scratch that.']) {
+      const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+      await h.pass(500);
+      h.turns.onWake(h.position);
+      await h.pass(1000);
+      // A click opens an activity: it is speech to the VAD, under the floor.
+      await h.talk(100);
+      expect(h.t.begins, echo).toHaveLength(1);
+      await h.interim(echo);
+      await h.interim(echo);
+      await h.pass(DISCARD_SETTLE_MS);
+      expect(h.t.ended, echo).toBe(1);
+      expect(h.out.cues, echo).toEqual(['wake']);
+      expect(h.out.drops, echo).toEqual([]);
+      expect(h.out.lone, echo).toEqual([]);
+      expect(h.out.sent, echo).toEqual([]);
+      expect(h.out.captions, echo).toEqual([]);
+      expect(h.out.ended, echo).toEqual([]);
+      expect(h.out.logs, echo).toContain(echoLog);
+      // Still woken: the wake is not taken back, and its start limit still runs from the wake.
+      expect(h.turns.state.waiting, echo).toBe(false);
+      await h.pass(8_000 - 1000 - 100 - 550 - DISCARD_SETTLE_MS - 40);
+      expect(h.out.cues, echo).toEqual(['wake']);
+      await h.pass(60);
+      expect(h.out.cues, echo).toEqual(['wake', 'sleep']);
+      expect(h.t.begins, echo).toHaveLength(1);
+    }
+  });
+
+  it('after an echo the caller is heard: the next speech opens a fresh activity, sent without the echo word', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    await h.talk(100);
+    await h.interim('Прийом.');
+    await h.pass(100);
+    expect(h.t.ended).toBe(1);
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.talk(1500);
+    expect(h.t.begins).toHaveLength(2);
+    await h.interim('Book a table. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table.']);
+    expect(h.out.facts.at(-1)).toMatchObject({ echoes: 1 });
+    expect(h.out.cues).toEqual(['wake', 'sent']);
+  });
+
+  it('a lone command the final alone brings, in a turn with no speech, is an echo too: the turn sleeps as if empty', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('', 'Прийом.'));
+    await h.talk(100);
+    await h.pass(8_100);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.out.lone).toEqual([]);
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.logs).toContain(echoLog);
+    expect(h.out.ended.map(([, outcome, reason]) => [outcome, reason])).toEqual([['empty', 'asleep']]);
+  });
+
+  it('a lone command after real speech still answers nope, and the wake stays for the words that follow', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Zulu.', 'Zulu.'));
+    await h.talk(500);
+    await h.interim('Zulu.');
+    expect(h.out.cues).toEqual(['wake', 'nope']);
+    expect(h.out.lone).toEqual([{ command: 'send', segment: 1 }]);
+    expect(h.out.ended.map(([, outcome, reason]) => [outcome, reason])).toEqual([['empty', 'command_only']]);
+    // No activity opens on the silence after it: the next speech opens one.
+    await h.pass(1000);
+    expect(h.t.begins).toHaveLength(1);
+    expect(h.turns.state.waiting).toBe(false);
+    h.t.results.push(heard('What time is it? Zulu.', 'What time is it? Zulu.'));
+    await h.talk(1200);
+    expect(h.t.begins).toHaveLength(2);
+    await h.interim('What time is it? Zulu.');
+    expect(h.out.sent).toEqual(['What time is it?']);
+  });
+
+  it('hands-free: a lone command with no speech is an echo as well, and ends nothing but its activity', async () => {
+    const h = turnsHarness();
+    await h.talk(100);
+    await h.interim('Zulu.');
+    await h.pass(100);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.cues).toEqual([]);
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.noTurn).toBe(1);
+    expect(h.out.logs).toContain(echoLog);
+  });
+
+  it('the wake sets the transcription up and sends it nothing before speech', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    expect(h.t.prepare).toHaveBeenCalledOnce();
+    await h.pass(1000);
+    expect(h.t.begins).toEqual([]);
+    expect(h.t.pushed).toBe(0);
+  });
+
+  it('speech that started under an agent line after the wake is not the phrase going on: no turn opens in it', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.turns.onAgentSpeaking(true);
+    await h.pass(3000);
+    const start = h.position;
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, start);
+    await h.pass(500, 500);
+    h.turns.onAgentSpeaking(false);
+    await h.pass(1000, 500);
+    expect(h.t.begins).toEqual([]);
+    expect(h.out.unheard).toBe(1);
+  });
+
+  it("the phrase's own speech going on under an agent line opens the turn where the line ended", async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    const start = h.position;
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, start);
+    await h.pass(500, 500);
+    h.turns.onWake(h.position);
+    h.turns.onAgentSpeaking(true);
+    await h.pass(2000, 500);
+    h.turns.onAgentSpeaking(false);
+    await h.pass(SPEECH_FLOOR_MS - 20, 500);
+    expect(h.t.begins).toEqual([]);
+    await h.pass(20, 500);
+    // Nothing from under the line, which the ring holds as silence.
+    expect(h.t.begins).toEqual([16 * SPEECH_FLOOR_MS]);
+  });
+
+  it('an echo in a turn the transcript woke takes no wake back: the speech after it is unaddressed', async () => {
+    const h = turnsHarness({ wake: true, limits: { startMs: 3_000, idleMs: 600 } });
+    await h.pass(500);
+    h.t.results.push(heard('Hey Andy, copy.', 'Hey Andy, copy.'));
+    // A click the transcription made a wake and a send word of.
+    await h.talk(200);
+    await h.interim('Hey Andy, copy.');
+    await h.pass(100);
+    expect(h.out.logs).toContain(echoLog);
+    expect(h.turns.state.waiting).toBe(true);
+    h.t.results.push(heard("I'll be there in five minutes.", "I'll be there in five minutes."));
+    await h.talk(1500);
+    await h.interim("I'll be there in five minutes.");
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['unaddressed', "I'll be there in five minutes."]]);
+  });
+
+  it("speech before the transcript's wake phrase is not said: it keeps the start limit, and a sleep sends nothing", async () => {
+    const h = turnsHarness({ wake: true, limits: { startMs: 3_000, idleMs: 600 } });
+    await h.pass(500);
+    h.t.results.push(heard("I'll be there in five. Hey Andy.", "I'll be there in five. Hey Andy."));
+    await h.talk(1500);
+    await h.interim("I'll be there in five. Hey Andy.");
+    expect(h.out.cues).toEqual(['wake']);
+    await h.pass(1_000);
+    expect(h.t.ended).toBe(0);
+    await h.pass(2_100);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.lost).toEqual([]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.out.drops).toEqual([['unaddressed', "I'll be there in five."]]);
+  });
+
+  it('a transcript-woken turn that sleeps on words drops them, however long the speech before its phrase', async () => {
+    const h = turnsHarness({ wake: true, limits: { startMs: 3_000, idleMs: 600 } });
+    await h.pass(500);
+    h.t.results.push(heard("I'll be there. Hey Andy, book", "I'll be there. Hey Andy, book."));
+    await h.talk(1500);
+    await h.interim("I'll be there. Hey Andy, book");
+    await h.pass(800);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([
+      ['unaddressed', "I'll be there."],
+      ['asleep', 'book.'],
+    ]);
+  });
+
+  it('a discard phrase whose final is a lone command nobody said goes on in no new activity: the wake stays', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Okay, scratch that.', 'Discard this turn.'));
+    await h.talk(200);
+    await h.interim('Okay, scratch that.');
+    await h.interim('Okay, scratch that.');
+    await h.pass(100);
+    expect(h.t.ended).toBe(1);
+    expect(h.t.begins).toHaveLength(1);
+    expect(h.out.logs).toContain(echoLog);
+    expect(h.out.cues).toEqual(['wake']);
+    expect(h.turns.state.waiting).toBe(false);
+    // The start limit still runs from the wake.
+    await h.pass(8_000);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.t.begins).toHaveLength(1);
+  });
+
+  it("an echo the final brings counts on its own turn's event; an awake state the line takes forgets its echoes", async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('', 'Прийом.'));
+    await h.talk(100);
+    await h.pass(8_100);
+    expect(h.out.ended.map(([facts, outcome]) => [outcome, facts.echoes])).toEqual([['empty', 1]]);
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.talk(1500);
+    await h.interim('Book a table. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table.']);
+    expect(h.out.facts.at(-1)?.echoes).toBeUndefined();
+
+    const p = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', pauseSends: true });
+    await p.pass(500);
+    p.turns.onWake(p.position);
+    await p.talk(100);
+    await p.interim('Прийом.');
+    await p.pass(100);
+    expect(p.out.logs).toContain(echoLog);
+    // A reply takes the wake the echo went back to.
+    p.turns.onAgentSpeaking(true);
+    p.turns.onAgentSpeaking(false);
+    await p.pass(500);
+    p.turns.onWake(p.position);
+    p.t.results.push(heard('Book a table.', 'Book a table.'));
+    await p.talk(1500);
+    await p.pass(SILENCE);
+    expect(p.out.sent).toEqual(['Book a table.']);
+    expect(p.out.facts.at(-1)?.echoes).toBeUndefined();
+  });
+
+  it('turning the wake switch off while woken leaves hands-free; a switch to Manual drops the wake', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.turns.configure(false, false);
+    expect(h.out.holds).toEqual([true, false]);
+    h.t.results.push(heard('Book a table', 'Book a table'));
+    await h.talk(1000);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Book a table']);
+    h.turns.configure(true, false);
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    expect(h.turns.state.waiting).toBe(false);
+    await h.turns.setReviewing(true);
+    expect(h.out.holds.at(-1)).toBe(false);
+    await h.talk(1000);
+    expect(h.t.begins).toHaveLength(1);
+  });
+});
+
+describe('CallTurns, the clocks of a woken turn', () => {
+  it('speech the VAD heard counts as said: a late first interim does not put the caller to sleep', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table for two. Zulu.', 'Book a table for two. Zulu.'));
+    await h.talk(1500);
+    // No interim yet, 10 s on: past the start limit, inside the idle one.
+    await h.pass(10_000);
+    expect(h.t.ended).toBe(0);
+    expect(h.out.cues).toEqual(['wake']);
+    expect(h.turns.state.waiting).toBe(false);
+    await h.interim('Book a table for two. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    expect(h.out.cues).toEqual(['wake', 'sent']);
+  });
+
+  it('with no interim at all, the idle limit ends the turn 20 s after the speech, not the start limit', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    await h.talk(1500);
+    await h.pass(19_900);
+    expect(h.t.ended).toBe(0);
+    await h.pass(200);
+    expect(h.t.ended).toBe(1);
+  });
+
+  it('words a discard phrase turned out to be are said: a sleep after the reopen sends them', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 400, idleMs: 800 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table, scratch that', 'Book a table, scratch that one and book the bar.'));
+    await h.talk(1500);
+    await h.interim('Book a table, scratch that');
+    await h.interim('Book a table, scratch that');
+    expect(h.t.begins).toHaveLength(2);
+    await h.pass(1000);
+    expect(h.out.sent).toEqual(['Book a table, scratch that one and book the bar.']);
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+
+  it('words the turn that went on after a discard phrase carries are said: its sleep sends them', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 400, idleMs: 800 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.hold = true;
+    h.t.results.push(heard('Book a table, scratch that', 'Book a table, scratch that one and book the bar.'));
+    await h.talk(1500);
+    await h.interim('Book a table, scratch that');
+    await h.interim('Book a table, scratch that');
+    expect(h.t.ended).toBe(1);
+    // The caller goes on, briefly, before that final is in: the next activity carries its words.
+    await h.talk(200);
+    expect(h.t.begins).toHaveLength(2);
+    h.t.hold = false;
+    h.t.release();
+    await h.pass(1000);
+    expect(h.t.ended).toBe(2);
+    expect(h.out.sent).toEqual(['Book a table, scratch that one and book the bar.']);
+    expect(h.out.drops).toEqual([]);
+  });
+
+  it('speech under the floor is not said: such a turn keeps the start limit', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    await h.talk(100);
+    await h.pass(7_900);
+    expect(h.t.ended).toBe(0);
+    await h.pass(200);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+});
+
+describe('CallTurns, a turn longer than one transcription activity', () => {
+  it('a woken turn talking past 200 s keeps its words, and a send word at the end sends them all', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    const said: string[] = [];
+    // Four minutes of dictation with thinking pauses; the transcription rotated once under it.
+    for (let i = 0; i < 40; i++) {
+      await h.talk(5_000);
+      said.push(`Point ${i + 1}.`);
+      await h.interim(said.join(' '));
+      await h.pass(400);
+    }
+    expect(h.t.begins).toHaveLength(1);
+    expect(h.t.ended).toBe(0);
+    const whole = `${said.join(' ')} Zulu.`;
+    h.t.results.push({ ...heard(whole, whole), rotations: 1 });
+    await h.talk(600);
+    await h.interim(whole);
+    expect(h.out.sent).toEqual([said.join(' ')]);
+    expect(h.out.facts.at(-1)).toMatchObject({ endedBy: 'send', rotations: 1, words: 80 });
+  });
+});
+
+describe('CallTurns, the published wake state', () => {
+  const waits = (states: CallWakeState[]) => states.map((s) => s.waiting);
+
+  it('a lone command after real speech: every publish from the wake on says awake, never waiting', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    const before = h.out.states.length;
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Zulu.', 'Zulu.'));
+    await h.talk(500);
+    await h.interim('Zulu.');
+    expect(h.out.cues).toEqual(['wake', 'nope']);
+    expect(waits(h.out.states.slice(before))).toEqual([false]);
+    expect(h.out.states.at(-1)).toMatchObject({ waiting: false, heard: 1 });
+    // The next speech opens the turn; still awake, and nothing new to publish.
+    h.t.results.push(heard('What time is it? Zulu.', 'What time is it? Zulu.'));
+    await h.talk(1200);
+    expect(waits(h.out.states.slice(before))).toEqual([false]);
+    await h.interim('What time is it? Zulu.');
+    expect(h.out.sent).toEqual(['What time is it?']);
+    expect(waits(h.out.states.slice(before))).toEqual([false, true]);
+  });
+
+  it('an echo publishes nothing: the wake it goes back to is the state already out', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    const at = h.out.states.length;
+    await h.talk(100);
+    await h.interim('Прийом.');
+    await h.pass(100);
+    expect(h.out.logs).toContain(echoLog);
+    expect(h.out.states.slice(at)).toEqual([]);
+    expect(h.out.states.at(-1)).toMatchObject({ waiting: false });
+  });
+
+  it('a discard phrase that was words goes on in a new activity, and the state stays awake throughout', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    const before = h.out.states.length;
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table, scratch that', 'Book a table, scratch that one and book the bar.'));
+    await h.talk(1500);
+    await h.interim('Book a table, scratch that');
+    await h.interim('Book a table, scratch that');
+    expect(h.t.begins).toHaveLength(2);
+    expect(waits(h.out.states.slice(before))).toEqual([false]);
+  });
+
+  it('an open woken turn that sleeps publishes the sleep once', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    await h.talk(100);
+    const at = h.out.states.length;
+    await h.pass(8_100);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.out.states.slice(at)).toEqual([expect.objectContaining({ waiting: true, slept: 1 })]);
+  });
+
+  it('a sleep, a wake and a switch each publish once, and only when the state changed', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    const before = h.out.states.length;
+    h.turns.onWake(h.position);
+    await h.pass(8_100);
+    expect(h.out.states.slice(before)).toEqual([
+      expect.objectContaining({ waiting: false, heard: 1 }),
+      expect.objectContaining({ waiting: true, heard: 1, slept: 1 }),
+    ]);
+    // The same settings again change nothing, so nothing goes out.
+    h.turns.configure(true, false);
+    expect(h.out.states.slice(before)).toHaveLength(2);
+    h.turns.configure(false, false);
+    expect(h.out.states.at(-1)).toMatchObject({ on: false, waiting: false });
+    expect(h.out.states.slice(before)).toHaveLength(3);
   });
 });
 
@@ -4357,7 +4968,7 @@ describe('acoustic wake word in a call', () => {
       ready: load === 'ok' ? Promise.resolve() : new Promise<void>((_, reject) => (fail = reject)),
       listen: vi.fn((on: boolean) => void listening.push(on)),
       push: vi.fn((pcm: Int16Array) => void (pushed += pcm.length)),
-      summary: { scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
+      summary: { hopMs: 40, scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
       utilization: 0,
       close: vi.fn(async () => undefined),
     } satisfies WakeWord;
@@ -4394,16 +5005,21 @@ describe('acoustic wake word in a call', () => {
     expect(w.listening.at(-1)).toBe(true);
     expect(v.transcription.begins).toEqual([]);
     // The spotter's own positions: it was pushed all of this call's audio since it started.
+    const spotted = 16 * 3000;
     w.events.onDetect(0.9, { start: w.pushed - 32_000, end: w.pushed });
-    expect(v.transcription.begins).toEqual([0]);
+    // Awake: the turn waits for the caller's speech.
+    expect(v.transcription.begins).toEqual([]);
     await vi.waitFor(() => expect(v.voice.playCue.mock.calls.map(([k]) => k)).toContain('wake'));
+    await vi.waitFor(() => expect(v.states.at(-1)?.wake).toMatchObject({ waiting: false, heard: 1 }));
     v.audio(20);
     expect(w.listening.at(-1)).toBe(false);
     v.transcription.results.push(heard('What is the time? Zulu.', 'Zulu.'));
-    v.events.onSpeech(true, 0);
+    v.events.onSpeech(true, spotted + 320);
+    // Opened at the speech, its pre-roll reaching back only to the detection.
+    expect(v.transcription.begins).toEqual([320]);
     v.audio(1000);
     v.quiet(600);
-    v.events.onSpeech(false, 0);
+    v.events.onSpeech(false, spotted + 320 + 16 * 1000);
     v.interim('What is the time? Zulu.');
     await vi.waitFor(() => expect(utterances(host)).toEqual(['What is the time?']));
     host.endStream();
@@ -4626,6 +5242,7 @@ describe('acoustic wake word', () => {
       classifier: expect.stringMatching(/hey_livekit\.onnx$/),
       threshold: 0.68,
       phrase: 'Hey LiveKit',
+      hopMs: 40,
     });
     expect(wakeWordSettings({ VOICE_MODE_WAKE_MODEL: 'off' })).toBeNull();
     expect(
@@ -4637,9 +5254,30 @@ describe('acoustic wake word', () => {
       classifier: path.resolve('data/models/hey_jarvis.onnx'),
       threshold: 0.5,
       phrase: 'Hey Jarvis',
+      hopMs: 40,
     });
     expect(wakeWordSettings({ VOICE_MODE_WAKE_THRESHOLD: '0.8' })?.threshold).toBe(0.8);
     expect(wakeWordSettings({ VOICE_MODE_WAKE_THRESHOLD: '7' })?.threshold).toBe(0.68);
+  });
+
+  it("reads its scoring hop from the working directory's .env, and warns in the worker's log about a bad one", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-hop-'));
+    try {
+      const warn = vi.fn();
+      const settings = () => wakeWordSettings(workerEnv(['VOICE_MODE_WAKE_HOP_MS'], root), { warn });
+      expect(settings()?.hopMs).toBe(40);
+      fs.writeFileSync(path.join(root, '.env'), 'VOICE_MODE_WAKE_MODEL=data/m.onnx\nVOICE_MODE_WAKE_HOP_MS="80"\n');
+      expect(settings()?.hopMs).toBe(80);
+      expect(warn).not.toHaveBeenCalled();
+      fs.writeFileSync(path.join(root, '.env'), 'VOICE_MODE_WAKE_HOP_MS=33\n');
+      expect(settings()?.hopMs).toBe(40);
+      expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('VOICE_MODE_WAKE_HOP_MS'), {
+        value: '33',
+        hopMs: 40,
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('reads its limits from the settings, in seconds; 0 is never', () => {
@@ -4823,6 +5461,26 @@ describe('wide events', () => {
       peakDb: -Infinity,
       rmsDb: -Infinity,
     });
+  });
+
+  it('logs what the settings RPC applied: the wake switch, pause sends, typing and cues', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const info = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { log: { info, warn: () => undefined } }));
+    await v.rpc('settings', { wake: false, pauseSends: true, typing: false, cues: false });
+    expect(info).toHaveBeenCalledWith(
+      'voice-mode worker: settings',
+      expect.objectContaining({ wake: false, pauseSends: true, typing: false, cues: false }),
+    );
+    // A request naming only some of them logs what runs: the rest as they were.
+    await v.rpc('settings', { wake: true });
+    expect(info).toHaveBeenLastCalledWith(
+      'voice-mode worker: settings',
+      expect.objectContaining({ wake: true, pauseSends: true, typing: false, cues: false }),
+    );
+    host.endStream();
   });
 
   it('in a call: the turn, its reply and the call each log one event', async () => {
@@ -5155,7 +5813,7 @@ describe('fast send words', () => {
       ready: Promise.resolve(),
       listen: vi.fn((on: boolean) => void listening.push(on)),
       push: vi.fn((pcm: Int16Array) => void (pushed += pcm.length)),
-      summary: { scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
+      summary: { hopMs: 40, scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
       utilization: 0,
       close: vi.fn(async () => undefined),
     } satisfies WakeWord;
@@ -5548,9 +6206,11 @@ describe('fast send words', () => {
     const c = await startCall({ wake: true, spotter: true });
     await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
     await c.wakeUp();
-    expect(c.begun()).toBe(1);
+    // A pause after the phrase: no activity until the caller goes on.
+    expect(c.begun()).toBe(0);
     const said = 'Remind me to buy bread. Scratch that. Hey Andy. What time is it? Zulu.';
     await c.say(3000);
+    expect(c.begun()).toBe(1);
     await c.interim(said);
     await c.quiet(700);
     expect(count(c.v, 'sent')).toBe(1);
@@ -5581,6 +6241,8 @@ describe('fast send words', () => {
     await c.quiet(700);
     expect(count(c.v, 'nope')).toBe(1);
     expect(count(c.v, 'sent')).toBe(0);
+    // The page and the app hear the truth: still awake, not waiting for the phrase.
+    expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: false });
     // No new wake phrase: the request right after is heard and sent.
     await c.say(1500);
     await c.interim('What time is it? Zulu.');
@@ -5597,6 +6259,53 @@ describe('fast send words', () => {
     await c.done();
   });
 
+  it('a woken turn that goes back to waiting with words sends them: the sent cue, then the sleep cue', async () => {
+    const c = await startCall({ wake: true, spotter: true });
+    await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
+    await c.wakeUp();
+    await c.quiet(700);
+    await c.say(1500);
+    await c.interim('Remind me to buy bread tomorrow morning.');
+    // The idle limit, from the VAD's speech end (its closing silence takes ~0.6 s).
+    await c.quiet(19_000);
+    expect(c.ended()).toBe(0);
+    await c.quiet(2_000);
+    expect(c.ended()).toBe(1);
+    await c.final(0, 'Remind me to buy bread tomorrow morning.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Remind me to buy bread tomorrow morning.']);
+    const cues = c.v.voice.playCue.mock.calls.map(([k]) => k);
+    expect(cues.slice(cues.indexOf('wake'))).toEqual(['wake', 'sent', 'sleep']);
+    expect(c.v.states.at(-1)?.wake).toMatchObject({ waiting: true, slept: 1 });
+    await c.done();
+  });
+
+  it('an echoed send word after a wake: no nope, nothing sent, and the page still hears awake', async () => {
+    const c = await startCall({ wake: true, spotter: true });
+    await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
+    await c.wakeUp();
+    await c.quiet(700);
+    expect(c.begun()).toBe(0);
+    // A click: VAD speech under the floor opens an activity, and the transcription makes up the word.
+    await c.say(100);
+    expect(c.begun()).toBe(1);
+    await c.interim('Прийом.');
+    await c.quiet(700);
+    expect(count(c.v, 'nope')).toBe(0);
+    expect(count(c.v, 'sent')).toBe(0);
+    expect(c.ended()).toBe(1);
+    expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: false, heard: 1 });
+    expect(c.v.voice.publishDropped).not.toHaveBeenCalled();
+    await c.say(1500);
+    await c.interim('What time is it? Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(1);
+    await c.final(1, 'What time is it? Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['What time is it?']);
+    await c.done();
+  });
+
   it('the wake word listens again at the commit: a new hey opens a turn while the first still waits for its final', async () => {
     const c = await startCall({ wake: true, spotter: true });
     await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
@@ -5609,9 +6318,10 @@ describe('fast send words', () => {
     expect(c.v.states.at(-1)?.wake).toMatchObject({ waiting: true });
     expect(c.spotter?.listening.at(-1)).toBe(true);
     await c.wakeUp();
-    expect(c.begun()).toBe(2);
+    expect(c.begun()).toBe(1);
     expect(count(c.v, 'wake')).toBe(2);
     await c.say(1500);
+    expect(c.begun()).toBe(2);
     await c.interim('What time is it? Zulu.');
     await c.quiet(700);
     expect(count(c.v, 'sent')).toBe(2);

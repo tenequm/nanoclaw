@@ -5,6 +5,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  ACTIVITY_MAX_MS,
   CONNECT_TIMEOUT_MS,
   FINAL_GRACE_MS,
   FINAL_TIMEOUT_MS,
@@ -406,6 +407,130 @@ describe('GeminiLiveTranscriber', () => {
     h.sockets[1].final('for two.');
     await h.tick(FINAL_GRACE_MS);
     expect(done()).toMatchObject({ final: 'Book a table for two.' });
+  });
+
+  it('an activity nearing the server cap goes on in a fresh one: the old part keeps its place, the final joins both', async () => {
+    const h = harness();
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(0);
+    h.sockets[0].interim('The first part of a long turn');
+    await h.tick(ACTIVITY_MAX_MS - 1_000);
+    h.t.push(pcm(100));
+    expect(h.sockets).toHaveLength(1);
+    await h.tick(1_000);
+    h.t.push(pcm(100));
+    // The old activity ended where its audio did; the new one takes the audio from here on.
+    expect(h.sockets[0].kinds.slice(-2)).toEqual(['audio:1600', 'end']);
+    expect(h.info).toHaveBeenCalledWith('voice-mode worker: the transcription moves to a fresh socket mid-turn', {
+      why: 'cap',
+      ageMs: ACTIVITY_MAX_MS,
+    });
+    await h.tick(0);
+    expect(h.sockets).toHaveLength(2);
+    h.sockets[1].ready();
+    await h.tick(0);
+    expect(h.sockets[1].kinds).toEqual(['start', 'audio:1600']);
+    h.sockets[1].interim('and the rest of it. Zulu.');
+    expect(h.interims.at(-1)).toBe('The first part of a long turn and the rest of it. Zulu.');
+    h.sockets[0].final('The first part of a long turn.');
+    await h.tick(FINAL_GRACE_MS);
+    expect(h.sockets[0].closed).toBe(1000);
+    const done = h.result(h.t.end());
+    h.sockets[1].final('And the rest of it. Zulu.');
+    await h.tick(FINAL_GRACE_MS);
+    expect(done()).toMatchObject({
+      final: 'The first part of a long turn. And the rest of it. Zulu.',
+      finals: 1,
+      rotations: 1,
+    });
+    // The fresh activity has its own clock: no second hand-over before another ACTIVITY_MAX_MS.
+    expect(h.sockets).toHaveLength(2);
+  });
+
+  it('a server that finishes the activity before its activityEnd hands it over at once; words after it still arrive', async () => {
+    const h = harness();
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(ACTIVITY_MAX_MS / 2);
+    h.sockets[0].interim('Book a table for two');
+    h.sockets[0].final('Book a table for two.');
+    h.sockets[0].say({ generationComplete: true });
+    expect(h.sockets[0].kinds.at(-1)).toBe('end');
+    expect(h.info).toHaveBeenCalledWith(
+      'voice-mode worker: the transcription moves to a fresh socket mid-turn',
+      expect.objectContaining({ why: 'server-done' }),
+    );
+    h.t.push(pcm(100));
+    await h.tick(0);
+    expect(h.sockets).toHaveLength(2);
+    h.sockets[1].ready();
+    await h.tick(0);
+    expect(h.sockets[1].kinds).toEqual(['start', 'audio:1600']);
+    h.sockets[1].interim('Zulu.');
+    expect(h.interims.at(-1)).toBe('Book a table for two. Zulu.');
+    await h.tick(FINAL_GRACE_MS);
+    const done = h.result(h.t.end());
+    h.sockets[1].final('Zulu.');
+    await h.tick(FINAL_GRACE_MS);
+    expect(done()).toMatchObject({ final: 'Book a table for two. Zulu.', rotations: 1 });
+  });
+
+  it('a server that finishes the activity long before its cap could be the reason: logged once, no hand-over', async () => {
+    const h = harness();
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(ACTIVITY_MAX_MS / 2 - 1_000);
+    h.sockets[0].interim('Book a table');
+    h.sockets[0].say({ turnComplete: true });
+    h.sockets[0].say({ generationComplete: true });
+    expect(h.sockets[0].kinds.at(-1)).not.toBe('end');
+    expect(h.warn).toHaveBeenCalledExactlyOnceWith(
+      'voice-mode worker: the transcription finished an activity early; it goes on',
+      { ageMs: ACTIVITY_MAX_MS / 2 - 1_000 },
+    );
+    h.t.push(pcm(100));
+    await h.tick(0);
+    expect(h.sockets).toHaveLength(1);
+    expect(h.info).not.toHaveBeenCalledWith(
+      'voice-mode worker: the transcription moves to a fresh socket mid-turn',
+      expect.anything(),
+    );
+    h.sockets[0].interim('Book a table for two');
+    const done = h.result(h.t.end());
+    h.sockets[0].final('Book a table for two.');
+    await h.tick(FINAL_GRACE_MS);
+    expect(done()).toMatchObject({ final: 'Book a table for two.' });
+    expect(done()?.rotations).toBeUndefined();
+  });
+
+  it('generationComplete after the activityEnd settles the activity as before: no hand-over', async () => {
+    const h = harness();
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(0);
+    h.sockets[0].interim('Book a table');
+    const done = h.result(h.t.end());
+    await h.tick(0);
+    h.sockets[0].final('Book a table.');
+    h.sockets[0].say({ generationComplete: true });
+    await h.tick(0);
+    expect(done()).toEqual({
+      final: 'Book a table.',
+      interim: 'Book a table',
+      finals: 1,
+      failed: false,
+      finalizeMs: 0,
+    });
+    expect(h.sockets).toHaveLength(1);
+    expect(h.info).not.toHaveBeenCalledWith(
+      'voice-mode worker: the transcription moves to a fresh socket mid-turn',
+      expect.anything(),
+    );
   });
 
   it('a full send buffer holds the audio without blocking, sends it when it drains, and the end waits for all of it', async () => {

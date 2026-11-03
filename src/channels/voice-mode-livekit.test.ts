@@ -797,7 +797,19 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       409,
     );
     expect((await fetch(`${url}/events?call=${meta.callId}`)).status).toBe(404);
+    // Without a secret the body is never read: an oversized one is refused like any other.
+    expect((await post(`${url}/utterance`, { callId: meta.callId, text: 'x'.repeat(100_000) })).status).toBe(409);
     expect((await post(`${url}/joined`, { callId: meta.callId }, workerAuth(meta.callId))).status).toBe(200);
+  });
+
+  it("takes a page's end only in a small body", async () => {
+    const { call, worker } = await startCall(h);
+    const padded = { callId: call.callId, reason: 'hangup', pad: 'x'.repeat(1024) };
+    expect((await post(`${h.base}/livekit/end?t=tok123`, padded)).status).toBe(204);
+    // Still live: the oversized end was no end.
+    expect((await worker.post('utterance', { text: 'Still here.' })).status).toBe(202);
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: call.callId })).status).toBe(204);
+    worker.close();
   });
 
   it('serves the worker routes only under the voice-mode prefix and never to a forwarded request', async () => {
@@ -862,7 +874,13 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('bounds utterance size and rate', async () => {
     const { worker } = await startCall(h);
     expect((await worker.post('utterance', { text: '   ' })).status).toBe(400);
-    expect((await worker.post('utterance', { text: 'я'.repeat(4200) })).status).toBe(413);
+    // 16384 two-byte letters are exactly 32 KB: taken; one byte more is refused.
+    const full = 'я'.repeat(16 * 1024);
+    expect((await worker.post('utterance', { text: `${full}a` })).status).toBe(413);
+    expect((await worker.post('utterance', { text: full })).status).toBe(202);
+    // Each quote is two bytes in JSON: a full-length turn of them still fits the body limit.
+    expect((await worker.post('utterance', { text: '"'.repeat(32 * 1024) })).status).toBe(202);
+    h.clock.now += MIN;
     for (let i = 0; i < 20; i++) expect((await worker.post('utterance', { text: `t${i}` })).status).toBe(202);
     const refused = await worker.post('utterance', { text: 'one too many' });
     expect(refused.status).toBe(429);
