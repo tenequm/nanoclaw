@@ -3597,6 +3597,47 @@ describe('CallTurns, the wake and the speech after it', () => {
   });
 });
 
+describe('CallTurns, the clocks of a woken turn', () => {
+  it('speech the VAD heard counts as said: a late first interim does not put the caller to sleep', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table for two. Zulu.', 'Book a table for two. Zulu.'));
+    await h.talk(1500);
+    // No interim yet, 10 s on: past the start limit, inside the idle one.
+    await h.pass(10_000);
+    expect(h.t.ended).toBe(0);
+    expect(h.out.cues).toEqual(['wake']);
+    expect(h.turns.state.waiting).toBe(false);
+    await h.interim('Book a table for two. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    expect(h.out.cues).toEqual(['wake', 'sent']);
+  });
+
+  it('with no interim at all, the idle limit ends the turn 20 s after the speech, not the start limit', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    await h.talk(1500);
+    await h.pass(19_900);
+    expect(h.t.ended).toBe(0);
+    await h.pass(200);
+    expect(h.t.ended).toBe(1);
+  });
+
+  it('speech under the floor is not said: such a turn keeps the start limit', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    await h.talk(100);
+    await h.pass(7_900);
+    expect(h.t.ended).toBe(0);
+    await h.pass(200);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+});
+
 describe('CallTurns, the published wake state', () => {
   const waits = (states: CallWakeState[]) => states.map((s) => s.waiting);
 

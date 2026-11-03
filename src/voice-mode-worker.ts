@@ -3025,7 +3025,8 @@ export class CallTurns {
 
   /**
    * While a turn the wake phrase opened is open and the caller silent, the clock to going back to
-   * waiting runs: from the wake while nothing of the turn was said, from the last speech once words are held.
+   * waiting runs: from the wake while nothing of the turn was said, from the last speech once words are
+   * held or the VAD heard the caller speak in it (a slow first interim is no reason to sleep).
    */
   private arm(): void {
     this.disarm();
@@ -3041,7 +3042,7 @@ export class CallTurns {
       return;
     }
     if (turn.kind !== 'auto' || !turn.addressed) return;
-    const said = turn.carry || this.spoken(turn, turn.heard);
+    const said = turn.carry || this.spoken(turn, turn.heard) || this.heardMs(turn) >= SPEECH_FLOOR_MS;
     const ms = said ? this.limits.idleMs : this.limits.startMs;
     if (!(ms > 0)) return;
     this.awakeTimer = setTimeout(() => void this.finish('asleep'), ms);
