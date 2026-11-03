@@ -72,6 +72,12 @@ interface ReviewLib {
   storedPrefs(): Prefs;
   storePrefs(prefs: Prefs): void;
   settingsNotTaken(ran: { on: boolean; pauseSends: boolean } | undefined): Record<string, unknown>;
+  settingsOutcome(
+    reply: { ok: boolean; seq: number } | null,
+    ran: { on: boolean; pauseSends: boolean } | undefined,
+    ranSeq: number,
+  ): { switches: Record<string, unknown>; follow: number; resync: boolean };
+  followsWorker(seq: number, follow: number | null): boolean;
   storedWakePhrase(): string | null;
   storeWakePhrase(phrase: string | null): void;
   modeCaption(
@@ -589,10 +595,58 @@ describe.skipIf(!existsSync(reviewLib))('review mode page view', async () => {
         pauseSends: true,
         note: "Settings didn't reach the call - try again.",
       });
-      // A worker that has not said yet starts waiting for the wake phrase.
-      expect(lib.settingsNotTaken(undefined)).toMatchObject({ wake: true, pauseSends: false });
+      // A worker that has not said what it runs: the caller's pick stays, never the defaults.
+      expect(lib.settingsNotTaken(undefined)).toEqual({ note: "Settings didn't reach the call - try again." });
       expect(store.setItem).not.toHaveBeenCalled();
       expect(lib.storedPrefs()).toEqual({ mode: 'auto', wake: false, pauseSends: false, typing: true });
+    });
+
+    it('settings never answered keep the pick, say so and read the worker again', () => {
+      // Two unanswered tries: no reply object to read, whatever the worker said before.
+      expect(lib.settingsOutcome(null, undefined, 0)).toEqual({
+        switches: { note: "Settings didn't reach the call - try again." },
+        follow: 0,
+        resync: true,
+      });
+      // The worker said what it runs before it went quiet: that is what the switches show.
+      expect(lib.settingsOutcome(null, { on: true, pauseSends: false }, 3)).toEqual({
+        switches: { wake: true, pauseSends: false, note: "Settings didn't reach the call - try again." },
+        follow: 0,
+        resync: true,
+      });
+    });
+
+    it('settings refused show what the worker runs; taken ones keep the pick', () => {
+      expect(lib.settingsOutcome({ ok: false, seq: 4 }, { on: true, pauseSends: true }, 3)).toEqual({
+        switches: { wake: true, pauseSends: true, note: "Settings didn't reach the call - try again." },
+        follow: 4,
+        resync: false,
+      });
+      expect(lib.settingsOutcome({ ok: false, seq: 4 }, undefined, 0)).toMatchObject({
+        switches: { note: "Settings didn't reach the call - try again." },
+        follow: 4,
+      });
+      // Taken: the worker's state from the reply on is the pick; an older one says nothing about it.
+      expect(lib.settingsOutcome({ ok: true, seq: 5 }, { on: true, pauseSends: false }, 4)).toEqual({
+        switches: {},
+        follow: 5,
+        resync: false,
+      });
+      expect(lib.settingsOutcome({ ok: true, seq: 5 }, { on: false, pauseSends: true }, 5)).toEqual({
+        switches: { wake: false, pauseSends: true },
+        follow: 5,
+        resync: false,
+      });
+    });
+
+    it("the switches follow the worker's state only after the settings outcome, from its state on", () => {
+      // Before the settings went out, and while a request is in flight, the worker still runs
+      // what it ran: following it would undo a pick made before the call.
+      for (const seq of [0, 1, 99]) expect(lib.followsWorker(seq, null)).toBe(false);
+      expect(lib.followsWorker(4, 5)).toBe(false);
+      expect(lib.followsWorker(5, 5)).toBe(true);
+      expect(lib.followsWorker(6, 5)).toBe(true);
+      expect(lib.followsWorker(1, 0)).toBe(true);
     });
 
     it('a fresh phrase replaces a stale stored one, case and all', () => {

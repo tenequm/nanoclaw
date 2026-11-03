@@ -28,7 +28,7 @@ import {
   type TurnMark,
   type VoiceModeCall,
 } from "./voice-call"
-import { COMMANDS_VERSIONS, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, captionCommand, reopensMic, infoWakePhrase, isLoneCommand, isReviewSnapshot, lineWords, norm, parseCommandWords, refusalNote, settingsNotTaken, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
+import { COMMANDS_VERSIONS, DEFAULT_PREFS, INITIAL_REVIEW, MODE_NAME, autoBlock, captionCommand, followsWorker, reopensMic, infoWakePhrase, isLoneCommand, isReviewSnapshot, lineWords, norm, parseCommandWords, refusalNote, settingsOutcome, storePrefs, storeWakePhrase, storedPrefs, storedWakePhrase, type Draft, type ReviewOp, type ReviewPrefs, type ReviewSnapshot, type ReviewState, type TurnMode } from "./review"
 import { voiceEndpoint } from "./voice-endpoint"
 
 /**
@@ -432,8 +432,11 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
   const announcedWords = agentAttributes?.[COMMAND_WORDS_ATTR]
   /** This call already gave the worker the page's settings. */
   const settingsSent = useRef(false)
-  /** The wake switch as the worker last said it runs it. */
+  /** The wake switch as the worker last said it runs it, and the review state that said so. */
   const workerWake = useRef<ReviewSnapshot["wake"]>(undefined)
+  const workerWakeSeq = useRef(0)
+  /** From this review state on, the switches show the worker's; null until the newest settings request has its outcome. */
+  const settingsFollow = useRef<number | null>(null)
 
   const setPhase = useCallback((p: Phase) => {
     phaseRef.current = p
@@ -896,7 +899,9 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     reviewSeq.current = 0
     reviewAsked.current = false
     settingsSent.current = false
+    settingsFollow.current = null
     workerWake.current = undefined
+    workerWakeSeq.current = 0
     awaitSeq.current = null
     maxTurn.current = 0
     doneReviewStreams.current.clear()
@@ -1136,7 +1141,9 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
     if (snap.wake) {
       if (workerWake.current?.phrase !== snap.wake.phrase || !workerWake.current) storeWakePhrase(snap.wake.phrase ?? null)
       workerWake.current = snap.wake
+      workerWakeSeq.current = snap.seq
     }
+    const ran = snap.wake && followsWorker(snap.seq, settingsFollow.current) ? { wake: snap.wake.on, pauseSends: snap.wake.pauseSends } : {}
     const awaitingWake = !!snap.wake?.on && snap.wake.waiting
     const heard = snap.wake?.heard
     if (typeof heard === "number" && heard > wakeHeard.current) {
@@ -1167,6 +1174,7 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       wakeHeard: wakeHeard.current,
       wakeSlept: wakeSlept.current,
       ...(snap.wake ? { wakePhrase: snap.wake.phrase ?? null } : {}),
+      ...ran,
       ...(done ? { pending: null } : {}),
     }))
     // The worker stopped the recording (a reply took the channel): the microphone follows it.
@@ -1289,12 +1297,13 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
 
   /**
    * The page's settings to the worker: the wake switch, the typing sound, and `?cues=0` (the worker plays the cues).
-   * Tried twice; if the worker never takes them, the switches go back to what it runs. Only switches
-   * the worker took are kept for the next call, and only from the newest request.
+   * Tried twice. Only switches the worker took are kept for the next call, and only from the newest
+   * request; from its outcome on the switches show what the worker says it runs (settingsOutcome).
    */
   const settingsGen = useRef(0)
   const sendSettings = useCallback(async () => {
     const gen = ++settingsGen.current
+    settingsFollow.current = null
     const ask = async () => {
       const { wake, pauseSends, typing } = reviewRef.current
       const reply = await rpc("settings", { wake, pauseSends, typing, cues: new URLSearchParams(location.search).get("cues") !== "0" })
@@ -1302,10 +1311,13 @@ export function useLiveKitCall(token: string, fallbackAgent = "your agent"): Voi
       return reply
     }
     let reply = await ask()
-    if (reply === null) reply = await ask()
-    if (reply === undefined || reply.ok || gen !== settingsGen.current) return
-    const ran = workerWake.current
-    updateReview((x) => ({ ...x, ...settingsNotTaken(ran) }))
+    if (reply === null && gen === settingsGen.current) reply = await ask()
+    if (reply === undefined || gen !== settingsGen.current) return
+    const { switches, follow, resync } = settingsOutcome(reply, workerWake.current, workerWakeSeq.current)
+    settingsFollow.current = follow
+    updateReview((x) => ({ ...x, ...switches }))
+    // A mode request naming no mode makes the worker send its state again, which the switches follow.
+    if (resync) void rpc("mode")
   }, [rpc, updateReview, keepPrefs])
 
   // Once per call, as soon as the worker says it takes them. The worker holds its first cue until then.

@@ -212,16 +212,41 @@ export function storedPrefs(): ReviewPrefs {
   }
 }
 
+type Switches = Partial<Pick<ReviewState, "wake" | "pauseSends" | "note">>
+const SETTINGS_NOT_TAKEN = "Settings didn't reach the call - try again."
+
 /**
- * The switches after the worker did not take the page's settings: what it runs, as it last said, or
- * what a worker starts with before it has said (waiting for the wake phrase). Never remembered.
+ * The switches after the worker did not take the page's settings: what it runs, as it last said.
+ * A worker that has not said keeps the caller's pick on show, never a guess. Never remembered.
  */
-export function settingsNotTaken(ran: ReviewSnapshot["wake"]): Pick<ReviewState, "wake" | "pauseSends" | "note"> {
-  return {
-    wake: ran?.on ?? DEFAULT_PREFS.wake,
-    pauseSends: ran?.pauseSends ?? DEFAULT_PREFS.pauseSends,
-    note: "Settings didn't reach the call - try again.",
-  }
+export function settingsNotTaken(ran: ReviewSnapshot["wake"]): Switches {
+  return ran ? { wake: ran.on, pauseSends: ran.pauseSends, note: SETTINGS_NOT_TAKEN } : { note: SETTINGS_NOT_TAKEN }
+}
+
+/**
+ * The page's newest settings request has its outcome: the worker's reply, or null when it never
+ * answered either try. `ran` is the wake switch from the worker's newest review state (`ranSeq`).
+ * From `follow` on, the switches show what each review state says the worker runs; unanswered,
+ * the worker may have taken them anyway, so its state is read again (`resync`).
+ */
+export function settingsOutcome(
+  reply: { ok: boolean; seq: number } | null,
+  ran: ReviewSnapshot["wake"],
+  ranSeq: number
+): { switches: Switches; follow: number; resync: boolean } {
+  if (!reply) return { switches: settingsNotTaken(ran), follow: 0, resync: true }
+  if (!reply.ok) return { switches: settingsNotTaken(ran), follow: reply.seq, resync: false }
+  // Taken: the state the reply names already carries the pick; an older one predates it.
+  return { switches: ran && ranSeq >= reply.seq ? { wake: ran.on, pauseSends: ran.pauseSends } : {}, follow: reply.seq, resync: false }
+}
+
+/**
+ * Whether the switches follow a review state's wake switch: only once the newest settings request
+ * has its outcome (`follow`, null before and while one is in flight, when the worker still runs
+ * what it ran and would undo a pick made before the call), and only a state from that outcome on.
+ */
+export function followsWorker(seq: number, follow: number | null): boolean {
+  return follow !== null && seq >= follow
 }
 
 /** Remember the caller's picks: one made before a call, or one the worker took during it. */
