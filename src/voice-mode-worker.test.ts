@@ -3242,7 +3242,7 @@ describe('CallTurns, wake', () => {
     expect(h.out.sent).toEqual(['What time is it?']);
   });
 
-  it('goes back to waiting with the sleep cue: nothing said, then words held; a final ending in zulu still sends', async () => {
+  it('goes back to waiting with the sleep cue: nothing said, then words held, which go out; a final ending in zulu still sends', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
     await h.pass(100);
     h.turns.onWake(h.position);
@@ -3257,17 +3257,22 @@ describe('CallTurns, wake', () => {
     await h.pass(19_000);
     expect(h.out.cues).toHaveLength(3);
     await h.pass(1_100);
-    expect(h.out.drops).toEqual([['asleep', 'Remind me to buy bread.']]);
+    // A second of speech behind them: the words are sent as the turn goes back to waiting.
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.sent).toEqual(['Remind me to buy bread.']);
+    expect(h.out.facts.at(-1)).toMatchObject({ endedBy: 'asleep', words: 5 });
+    expect(h.out.cues).toEqual(['wake', 'sleep', 'wake', 'sleep']);
+    expect(h.turns.state).toMatchObject({ waiting: true, slept: 2 });
     await h.pass(100);
     h.turns.onWake(h.position);
     h.t.results.push(heard('Remind me to buy milk', 'Remind me to buy milk. Zulu.'));
     await h.talk(1000);
     await h.interim('Remind me to buy milk');
     await h.pass(20_100);
-    expect(h.out.sent).toEqual(['Remind me to buy milk.']);
+    expect(h.out.sent).toEqual(['Remind me to buy bread.', 'Remind me to buy milk.']);
   });
 
-  it('words held after the wake go back to waiting on time, however many interims repeat them', async () => {
+  it('words held after the wake go back to waiting on time, however many interims repeat them, and are sent', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
     await h.pass(100);
     h.turns.onWake(h.position);
@@ -3279,7 +3284,71 @@ describe('CallTurns, wake', () => {
       await h.interim('Remind me to stretch later.');
     }
     await h.pass(300);
-    expect(h.out.drops).toEqual([['asleep', 'Remind me to stretch later.']]);
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.sent).toEqual(['Remind me to stretch later.']);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+
+  it('a woken turn that sleeps with words but under 800 ms of speech drops them, as before', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Ah.', 'Ah.'));
+    await h.talk(300);
+    await h.interim('Ah.');
+    await h.pass(20_100);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['asleep', 'Ah.']]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.out.ended.map(([, outcome, reason]) => [outcome, reason])).toEqual([['discarded', 'asleep']]);
+  });
+
+  it('speech that came to no text at the sleep is a lost turn, not a sleep: the transcription failed, or heard nothing', async () => {
+    for (const failed of [true, false]) {
+      const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+      await h.pass(100);
+      h.turns.onWake(h.position);
+      h.t.results.push(heard('', undefined, failed));
+      await h.talk(1500);
+      // The idle limit, not the start limit: the caller spoke.
+      await h.pass(8_100);
+      expect(h.t.ended).toBe(0);
+      await h.pass(12_000);
+      expect(h.t.ended).toBe(1);
+      expect(h.out.lost).toEqual([failed ? 'stt' : 'empty']);
+      expect(h.out.cues).toEqual(['wake']);
+      expect(h.out.drops).toEqual([]);
+      expect(h.turns.state).toMatchObject({ waiting: true, slept: 1 });
+    }
+  });
+
+  it('a failed transcription of a click is no lost turn: under the floor it sleeps', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('', undefined, true));
+    await h.talk(100);
+    await h.pass(8_100);
+    expect(h.out.lost).toEqual([]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+
+  it('a reply plays over a woken turn holding words: it stays open, the idle limit restarts after it, and the words go', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Remind me to call mom.', 'Remind me to call mom.'));
+    await h.talk(1200);
+    await h.interim('Remind me to call mom.');
+    await h.pass(10_000);
+    h.turns.onAgentSpeaking(true);
+    await h.pass(15_000);
+    expect(h.t.ended).toBe(0);
+    h.turns.onAgentSpeaking(false);
+    await h.pass(19_900);
+    expect(h.t.ended).toBe(0);
+    await h.pass(200);
+    expect(h.out.sent).toEqual(['Remind me to call mom.']);
     expect(h.out.cues).toEqual(['wake', 'sleep']);
   });
 
@@ -5928,6 +5997,27 @@ describe('fast send words', () => {
     await vi.advanceTimersByTimeAsync(200);
     expect(utterances(c.host)).toEqual(['What time is it?']);
     expect(count(c.v, 'nope')).toBe(1);
+    await c.done();
+  });
+
+  it('a woken turn that goes back to waiting with words sends them: the sent cue, then the sleep cue', async () => {
+    const c = await startCall({ wake: true, spotter: true });
+    await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
+    await c.wakeUp();
+    await c.quiet(700);
+    await c.say(1500);
+    await c.interim('Remind me to buy bread tomorrow morning.');
+    // The idle limit, from the VAD's speech end (its closing silence takes ~0.6 s).
+    await c.quiet(19_000);
+    expect(c.ended()).toBe(0);
+    await c.quiet(2_000);
+    expect(c.ended()).toBe(1);
+    await c.final(0, 'Remind me to buy bread tomorrow morning.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Remind me to buy bread tomorrow morning.']);
+    const cues = c.v.voice.playCue.mock.calls.map(([k]) => k);
+    expect(cues.slice(cues.indexOf('wake'))).toEqual(['wake', 'sent', 'sleep']);
+    expect(c.v.states.at(-1)?.wake).toMatchObject({ waiting: true, slept: 1 });
     await c.done();
   });
 

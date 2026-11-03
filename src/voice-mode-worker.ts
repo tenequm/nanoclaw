@@ -3254,10 +3254,26 @@ export class CallTurns {
       return null;
     }
     if (why === 'asleep' && !match) {
-      ended(body ? 'discarded' : 'empty', 'asleep');
-      if (body) this.deps.drop('asleep', body);
+      // Back to waiting, and nothing the caller said is lost there: words with MIN_LOST_SPEECH_MS of
+      // speech behind them go as a pause would send them, then the sleep cue; speech that came to no
+      // text is a lost turn ("didn't catch that"). Anything less (noise, an echo) sleeps as before.
       this.slept++;
       this.waitingSince = this.ring.position;
+      const spoke = closed.heardMs >= MIN_LOST_SPEECH_MS;
+      if (body && spoke) {
+        slot.send(body, take, false);
+        this.deps.cue('sleep');
+        this.publish();
+        return null;
+      }
+      if (!body && (spoke || (heard.failed && closed.heardMs >= SPEECH_FLOOR_MS))) {
+        this.deps.noTurn();
+        this.publish();
+        slot.lost(heard.failed ? 'stt' : 'empty', { speechMs: Math.round(turn.speechMs) }, take);
+        return null;
+      }
+      ended(body ? 'discarded' : 'empty', 'asleep');
+      if (body) this.deps.drop('asleep', body);
       this.deps.cue('sleep');
       this.deps.noTurn();
       this.publish();
