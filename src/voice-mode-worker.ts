@@ -1223,6 +1223,20 @@ export function recordingDays(raw: string | undefined): number {
   return Number.isInteger(days) && days > 0 ? days : 0;
 }
 
+/** VOICE_MODE_WORKER_MAX_JOBS: concurrent calls before the worker reports itself full; default 4. */
+export function workerMaxJobs(raw: string | undefined): number {
+  const jobs = Number(raw?.trim() || 4);
+  return Number.isInteger(jobs) && jobs > 0 ? jobs : 4;
+}
+
+/**
+ * The worker's load as LiveKit sees it: 0 below `maxJobs` calls, 1 at it. LiveKit server weighs a
+ * worker by 1 - load, so agents-js's default CPU load refused every call while bl was busy.
+ */
+export function jobLoad(activeJobs: number, maxJobs: number): number {
+  return activeJobs >= maxJobs ? 1 : 0;
+}
+
 /** The call's room: what the turn logic needs from the audio, tracks and data channels. Faked in tests. */
 export interface CallVoice {
   /**
@@ -5440,6 +5454,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     'LIVEKIT_AGENT_NAME',
     'LIVEKIT_HOST_URL',
     'VOICE_MODE_WORKER_HEALTH_PORT',
+    'VOICE_MODE_WORKER_MAX_JOBS',
     'VOICE_MODE_RECORDINGS_DAYS',
     'VOICE_MODE_CALL_RECORDING',
     'VOICE_MODE_TRANSCRIPT_DEBUG',
@@ -5471,6 +5486,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     setInterval(prune, DAY_MS).unref();
   }
   skipLocalTurnDetectorProcess();
+  const maxJobs = workerMaxJobs(env.VOICE_MODE_WORKER_MAX_JOBS);
   cli.runApp(
     new ServerOptions({
       agent: fileURLToPath(import.meta.url),
@@ -5482,6 +5498,9 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
       host: '127.0.0.1',
       port: Number(env.VOICE_MODE_WORKER_HEALTH_PORT || 8089),
       numIdleProcesses: 1,
+      // Busy CPU from unrelated work on the box must not refuse calls: load counts calls only.
+      loadFunc: async (server) => jobLoad(server.activeJobs.length, maxJobs),
+      loadThreshold: 1,
       // On SIGTERM the worker takes no new calls and gives running ones this long before closing
       // them; a call can run up to VOICE_MODE_MAX_CALL_SECONDS, so a restart cuts longer ones short.
       drainTimeout: 60_000,

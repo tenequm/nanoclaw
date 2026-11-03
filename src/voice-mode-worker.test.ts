@@ -54,6 +54,8 @@ import {
   pruneRecordings,
   readJobHeader,
   recordingDays,
+  jobLoad,
+  workerMaxJobs,
   runCall,
   SendCountdown,
   skipLocalTurnDetectorProcess,
@@ -668,6 +670,22 @@ describe('local turn detector process', () => {
       }),
     );
     expect(Object.keys(InferenceRunner.registeredRunners)).toEqual([]);
+  });
+});
+
+describe('worker load', () => {
+  it('reports full only at the call limit, whatever the CPU', () => {
+    expect(jobLoad(0, 4)).toBe(0);
+    expect(jobLoad(3, 4)).toBe(0);
+    expect(jobLoad(4, 4)).toBe(1);
+  });
+
+  it('reads the call limit, 4 unless a positive whole number', () => {
+    expect(workerMaxJobs(undefined)).toBe(4);
+    expect(workerMaxJobs('')).toBe(4);
+    expect(workerMaxJobs('0')).toBe(4);
+    expect(workerMaxJobs('2.5')).toBe(4);
+    expect(workerMaxJobs(' 2 ')).toBe(2);
   });
 });
 
