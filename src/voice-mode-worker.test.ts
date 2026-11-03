@@ -6015,7 +6015,7 @@ describe('meeting calls', () => {
       'Junior engineers joined today',
       'The hidden cost is high',
       "Hey Junior, what's two plus two?",
-      "Hey, junior, can you respond to me? Copy.",
+      'Hey, junior, can you respond to me? Copy.',
       "Hey NanoClaw, what's two plus two?",
     ]) {
       expect(matchWake(text, names), text).toBeNull();
