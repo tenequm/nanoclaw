@@ -213,6 +213,10 @@ export function storedPrefs(): ReviewPrefs {
 }
 
 type Switches = Partial<Pick<ReviewState, "wake" | "pauseSends" | "note">>
+
+/** The page's switches for the wake state a review state reports the worker runs. */
+export const workerSwitches = (ran: NonNullable<ReviewSnapshot["wake"]>): Pick<ReviewState, "wake" | "pauseSends"> => ({ wake: ran.on, pauseSends: ran.pauseSends })
+
 const SETTINGS_NOT_TAKEN = "Settings didn't reach the call - try again."
 
 /**
@@ -220,7 +224,7 @@ const SETTINGS_NOT_TAKEN = "Settings didn't reach the call - try again."
  * A worker that has not said keeps the caller's pick on show, never a guess. Never remembered.
  */
 export function settingsNotTaken(ran: ReviewSnapshot["wake"]): Switches {
-  return ran ? { wake: ran.on, pauseSends: ran.pauseSends, note: SETTINGS_NOT_TAKEN } : { note: SETTINGS_NOT_TAKEN }
+  return ran ? { ...workerSwitches(ran), note: SETTINGS_NOT_TAKEN } : { note: SETTINGS_NOT_TAKEN }
 }
 
 /**
@@ -237,7 +241,7 @@ export function settingsOutcome(
   if (!reply) return { switches: settingsNotTaken(ran), follow: 0, resync: true }
   if (!reply.ok) return { switches: settingsNotTaken(ran), follow: reply.seq, resync: false }
   // Taken: the state the reply names already carries the pick; an older one predates it.
-  return { switches: ran && ranSeq >= reply.seq ? { wake: ran.on, pauseSends: ran.pauseSends } : {}, follow: reply.seq, resync: false }
+  return { switches: ran && ranSeq >= reply.seq ? workerSwitches(ran) : {}, follow: reply.seq, resync: false }
 }
 
 /**
@@ -339,10 +343,10 @@ export interface ReviewInput {
 
 const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
 
-/** The host takes a turn of at most this many UTF-8 bytes (MAX_TURN_TEXT_BYTES in the protocol). */
+/** A review draft of more than this many UTF-8 bytes cannot be sent (MAX_TURN_TEXT_BYTES in the protocol). */
 const MAX_TURN_BYTES = 8 * 1024
 
-/** How many characters a draft has to lose to fit the host's limit (0 when it fits). */
+/** How many characters a draft has to lose to fit the review-draft limit (0 when it fits). */
 export function charsOver(text: string): number {
   const enc = new TextEncoder()
   let bytes = enc.encode(text).length
