@@ -5151,6 +5151,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         if (req.typing !== undefined) typingWanted = req.typing;
         updateTyping();
         callTurns.configure(req.wake ?? callTurns.state.on, req.pauseSends ?? callTurns.state.pauseSends);
+        const { on: wake, pauseSends } = callTurns.state;
+        callLog.info('voice-mode worker: settings', { wake, pauseSends, typing: typingWanted, cues: cuesOn });
         readyCue();
         if (!req.tts) return undefined;
         return callVoice?.selectTts ? callVoice.selectTts(req.tts, req.gen) : 'tts_unavailable';

@@ -5248,6 +5248,26 @@ describe('wide events', () => {
     });
   });
 
+  it('logs what the settings RPC applied: the wake switch, pause sends, typing and cues', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const info = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { log: { info, warn: () => undefined } }));
+    await v.rpc('settings', { wake: false, pauseSends: true, typing: false, cues: false });
+    expect(info).toHaveBeenCalledWith(
+      'voice-mode worker: settings',
+      expect.objectContaining({ wake: false, pauseSends: true, typing: false, cues: false }),
+    );
+    // A request naming only some of them logs what runs: the rest as they were.
+    await v.rpc('settings', { wake: true });
+    expect(info).toHaveBeenLastCalledWith(
+      'voice-mode worker: settings',
+      expect.objectContaining({ wake: true, pauseSends: true, typing: false, cues: false }),
+    );
+    host.endStream();
+  });
+
   it('in a call: the turn, its reply and the call each log one event', async () => {
     const { ctx } = fakeJob();
     const host = fakeHostFetch();
