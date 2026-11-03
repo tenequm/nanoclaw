@@ -2426,8 +2426,9 @@ export class CallTurns {
   /** Settles once the call's end stopped waiting for finals: a committed send then goes with the words at the act. */
   private abandon!: () => void;
   private readonly abandoned = new Promise<Heard>((resolve) => (this.abandon = () => resolve(silentHeard)));
-  /** What `hold` last said. */
+  /** What `hold` last said, and the wake state last published. */
   private holding = false;
+  private published?: string;
   private speaking = false;
   private speechFrom = 0;
   private agentSpeaking = false;
@@ -2518,7 +2519,7 @@ export class CallTurns {
   /** A wake word model loads for this phrase (`useWakeWord` once it is in use, or with none if it fails). */
   loadWakeWord(phrase: string): void {
     this.loadingPhrase = phrase;
-    this.deps.changed();
+    this.publish();
   }
 
   /** The acoustic wake word is in use (its phrase), or not, and `hey <agent>` in the transcript opens the turn. */
@@ -2528,7 +2529,7 @@ export class CallTurns {
     const name = phrase ? phraseName(phrase) : undefined;
     this.names = wakeNameWords([...this.options.names, ...(name ? [name] : [])]);
     this.waitingSince = this.ring.position;
-    this.deps.changed();
+    this.publish();
   }
 
   configure(wake: boolean, pauseSends: boolean): void {
@@ -2547,7 +2548,7 @@ export class CallTurns {
     if (this.turn && !this.speaking) this.armPause();
     this.arm();
     this.syncHold();
-    this.deps.changed();
+    this.publish();
   }
 
   /** The caller's audio, every frame: kept for pre-rolls, and the open turn's while no agent line plays. */
@@ -2731,7 +2732,7 @@ export class CallTurns {
     if (turn?.kind === 'auto' && !turn.addressed) void this.finish('unaddressed');
     else if (turn?.kind === 'auto') parts.push(this.finish('switch'));
     this.syncHold();
-    this.deps.changed();
+    this.publish();
     if (!parts.length) return null;
     const recordings = (await Promise.all(parts)).filter((r): r is Recording => !!r);
     if (!recordings.length) return null;
@@ -2774,12 +2775,26 @@ export class CallTurns {
     this.closing.clear();
   }
 
-  /** Replies wait while an auto turn for the agent is open or finalizing undecided, or a wake waits for its words. */
+  /**
+   * Replies wait while an auto turn for the agent is open or finalizing undecided, or a wake waits for its
+   * words; and the page and the app hear the wake state whenever it changed. Every change to the turns
+   * comes through here, so the published state is the turns' as they are, after any reopen.
+   */
   private syncHold(): void {
     const open = this.turnOpen || !!this.awake;
-    if (open === this.holding) return;
-    this.holding = open;
-    this.deps.hold(open);
+    if (open !== this.holding) {
+      this.holding = open;
+      this.deps.hold(open);
+    }
+    this.publish();
+  }
+
+  /** The wake state to the page, once per change: a republish bumps the review state's seq. */
+  private publish(): void {
+    const state = JSON.stringify(this.state);
+    if (state === this.published) return;
+    this.published = state;
+    this.deps.changed();
   }
 
   private open(kind: OpenTurn['kind'], from: number, addressed: boolean, wokeAt?: number): void {
@@ -2836,12 +2851,7 @@ export class CallTurns {
    */
   private lone(turn: OpenTurn, match: CommandMatch, heardMs = this.heardMs(turn)): boolean {
     return (
-      turn.kind === 'auto' &&
-      turn.addressed &&
-      !match.rest &&
-      !turn.carry &&
-      !turn.before &&
-      heardMs < SPEECH_FLOOR_MS
+      turn.kind === 'auto' && turn.addressed && !match.rest && !turn.carry && !turn.before && heardMs < SPEECH_FLOOR_MS
     );
   }
 
@@ -2876,7 +2886,7 @@ export class CallTurns {
     this.waitingSince = this.ring.position;
     this.deps.noTurn();
     this.syncHold();
-    this.deps.changed();
+    this.publish();
   }
 
   /** Woken with nothing said within the start limit: back to waiting, with the sleep cue. No transcription was ever opened. */
@@ -2892,7 +2902,7 @@ export class CallTurns {
     this.deps.cue('sleep');
     this.deps.noTurn();
     this.syncHold();
-    this.deps.changed();
+    this.publish();
   }
 
   /** The wake phrase opened the turn. */
@@ -2900,7 +2910,7 @@ export class CallTurns {
     this.wakes++;
     this.syncHold();
     this.deps.cue('wake');
-    this.deps.changed();
+    this.publish();
     this.arm();
   }
 
@@ -3166,7 +3176,6 @@ export class CallTurns {
       if (why === 'dropped') ended('discarded', 'dropped');
       return null;
     }
-    this.syncHold();
     const spoken = this.spoken(turn, said, closed.names);
     const rewoken = this.rewake(spoken, closed);
     const { scratched } = rewoken;
@@ -3202,8 +3211,11 @@ export class CallTurns {
     if (why === 'discard' && match?.command !== 'discard' && !scratched) {
       caption(said);
       this.goOn(said, closed.endedAt);
+      // After the reopen: the turn never stopped being open, and the state never says otherwise.
+      this.syncHold();
       return null;
     }
+    this.syncHold();
     if (match?.command === 'discard') {
       caption(scratched ?? said, 'discard');
       scratch();
@@ -3236,7 +3248,7 @@ export class CallTurns {
     } else caption(said);
     scratch();
     if (scratched && !body) {
-      if (closed.wake) this.deps.changed();
+      if (closed.wake) this.publish();
       ended('discarded', 'command');
       return null;
     }
@@ -3247,12 +3259,12 @@ export class CallTurns {
       this.waitingSince = this.ring.position;
       this.deps.cue('sleep');
       this.deps.noTurn();
-      this.deps.changed();
+      this.publish();
       return null;
     }
     if (closed.wake) {
       this.waitingSince = this.ring.position;
-      this.deps.changed();
+      this.publish();
     }
     if (body) {
       slot.send(body, take, false);
@@ -3295,12 +3307,10 @@ export class CallTurns {
       // they open the next activity, from here on.
       void ending.catch(() => undefined);
       if (!act.scratched && said) caption(said, 'send');
+      if (closed.wake && !this.closed && !this.reviewing) this.awake = { from: closed.endedAt, since: this.now() };
       this.nope(act.text, 'send', turn.segment);
       this.deps.ended?.(facts, 'empty', 'command_only');
-      if (closed.wake && !this.closed && !this.reviewing) {
-        this.awake = { from: closed.endedAt, since: this.now() };
-        this.arm();
-      }
+      this.arm();
       this.syncHold();
       return;
     }
@@ -3310,7 +3320,7 @@ export class CallTurns {
     this.deps.cue('sent', () => (facts.cueMs = Math.round(this.now() - facts.speechEndAt)));
     if (closed.wake) {
       this.waitingSince = closed.endedAt;
-      this.deps.changed();
+      this.publish();
     }
     this.syncHold();
     let lead = '';
@@ -3396,7 +3406,7 @@ export class CallTurns {
     this.deps.noTurn();
     if (this.wake) {
       this.waitingSince = this.ring.position;
-      this.deps.changed();
+      this.publish();
     }
   }
 
@@ -3406,7 +3416,7 @@ export class CallTurns {
     this.deps.countdown.clear();
     this.deps.cue('nope');
     this.deps.noTurn();
-    if (this.wake) this.deps.changed();
+    if (this.wake) this.publish();
   }
 }
 
