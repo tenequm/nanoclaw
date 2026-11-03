@@ -44,6 +44,8 @@ Stop on any failed fetch or copy; never leave empty source files. Reapplying
 these files is safe. Preserve agent vocabulary and local configuration.
 
 ```nc:copy from-branch:main
+src/channels/meet-recall.test.ts
+src/channels/meet-recall.ts
 src/channels/voice-mode-adapter.test.ts
 src/channels/voice-mode-call-session.test.ts
 src/channels/voice-mode-command.test.ts
@@ -81,6 +83,7 @@ assets/voice-mode-wakeword/NOTICE
 assets/voice-mode-wakeword/embedding_model.onnx
 assets/voice-mode-wakeword/hey_livekit.onnx
 assets/voice-mode-wakeword/melspectrogram.onnx
+assets/meet-recall-bridge/index.html
 src/voice-mode-wakeword-fixtures/negative.wav
 src/voice-mode-wakeword-fixtures/positive.wav
 ```
@@ -313,14 +316,17 @@ a voice participant, with `/voice`'s rules: an owner or admin of the chat's one
 agent, on their own line (created here on first use), and this chat becomes the
 call chat. A meeting bridge (`MEET_PROVIDER`, default `attendee`: a self-hosted
 [Attendee](https://github.com/attendee-labs/attendee) whose LiveKit is this
-one) sends a bot named after the agent; someone admits it from the lobby
+one, or `recall`: a [Recall.ai](https://docs.recall.ai/docs/stream-media) bot
+running `assets/meet-recall-bridge/index.html` as its camera) sends a bot named
+after the agent; someone admits it from the lobby
 (10 minutes). It mirrors each participant into the call's room, and the
 worker mixes them into one input and streams its speech back into the
 meeting. The wake phrase is always on and the pause sends; there are no cues.
 Each turn tells the agent who is present. The meeting runs up to 60 minutes
 under the line's daily minutes, and ends 30 seconds after the last participant
 leaves, on `/meet leave`, or when a call on the line's link replaces it. The
-bot records nothing (`recording_settings.format: none`).
+bot records nothing (Attendee `recording_settings.format: none`, Recall
+`video_mixed_mp4: null`).
 
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use
@@ -348,8 +354,12 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_WAKE_START_SECONDS`, `VOICE_MODE_WAKE_IDLE_SECONDS` | `8`, `20` | How long an addressed turn waits for first or more speech; zero disables each timer. |
 | `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`. |
 | `VOICE_MODE_CALL_RECORDING` | off | Debug: `true` or `1` also records each caller's whole call, waiting for the wake phrase included, as `data/voice-recordings/<agent>/<date>/<callId>-call.wav` (16 kHz mono, the agent's speech as silence) with a `.json` of wake detections. Local only, owner-only files; pruned by `VOICE_MODE_RECORDINGS_DAYS` when that is set, kept otherwise. |
-| `MEET_PROVIDER` | `attendee` | Meeting bridge for `/meet`; unset settings leave `/meet` off. |
+| `MEET_PROVIDER` | `attendee` | Meeting bridge for `/meet`: `attendee` or `recall`; only the chosen provider's settings are read, and missing or invalid ones leave `/meet` off. |
 | `ATTENDEE_URL`, `ATTENDEE_API_KEY` | none | The Attendee API (`/api/v1/`, `Authorization: Token`) the host reaches; the room is created before the bot. |
+| `RECALL_API_KEY` | none | Recall.ai API key (`Authorization: Token`). |
+| `RECALL_REGION` | `eu-central-1` | Recall.ai region: `us-east-1`, `us-west-2`, `eu-central-1` or `ap-northeast-1`. |
+| `MEET_RECALL_PAGE_URL` | none | Public `https` URL where `assets/meet-recall-bridge/index.html` is served; the Recall bot runs it as its camera. |
+| `MEET_RECALL_LIVEKIT_URL` | none | Public `wss` URL of this LiveKit, reachable from Recall's cloud (the bridge page joins the room with it). |
 | `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | Worker health on loopback. |
 | `VOICE_MODE_UI` | empty | Page options: skin, colorway, layout, presence, brand, footer, shortcuts, timestamps, colorwayPicker. |
 

@@ -21,6 +21,7 @@ import { getUser } from '../modules/permissions/db/users.js';
 import { registerMessageInterceptor } from '../router.js';
 import { encryptionKey } from '../secret-seal.js';
 import type { MessagingGroup } from '../types.js';
+import { createRecallMeetBridge, RECALL_MEET_ENV_KEYS, recallMeetConfigFromEnv } from './meet-recall.js';
 import type { VoiceModeChannelAdapter } from './voice-mode.js';
 import { senderUserId } from './voice-mode-command.js';
 import type { MeetBridge, MeetingStart } from './voice-mode-livekit.js';
@@ -69,7 +70,7 @@ export function createAttendeeBridge(
 
 /**
  * The meeting bridges MEET_PROVIDER picks from: each names the settings it reads from .env and builds
- * its bridge from them, or null when they are incomplete. A new provider (meet-recall.ts) registers here.
+ * its bridge from them, or null when they are incomplete or invalid.
  */
 const MEET_BRIDGES: Record<
   string,
@@ -81,6 +82,20 @@ const MEET_BRIDGES: Record<
       env.ATTENDEE_URL && env.ATTENDEE_API_KEY
         ? createAttendeeBridge({ url: env.ATTENDEE_URL, apiKey: env.ATTENDEE_API_KEY })
         : null,
+  },
+  recall: {
+    keys: [...RECALL_MEET_ENV_KEYS],
+    create: (env) => {
+      // Missing or invalid settings leave /meet off rather than stopping the voice channel from starting.
+      try {
+        return createRecallMeetBridge(recallMeetConfigFromEnv(env as Record<string, string>));
+      } catch (err) {
+        log.warn('voice-mode: Recall meeting bridge is not configured; /meet is off', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+        return null;
+      }
+    },
   },
 };
 

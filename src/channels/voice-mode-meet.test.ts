@@ -46,6 +46,17 @@ const MEMBER = 'chat:2';
 const OTHER_ADMIN = 'chat:3';
 const MEET = 'https://meet.google.com/abc-defg-hij';
 const now = () => new Date().toISOString();
+const RECALL_ENV = {
+  MEET_PROVIDER: 'recall',
+  RECALL_API_KEY: 'recall-key',
+  MEET_RECALL_PAGE_URL: 'https://pages.example.com/meet-recall-bridge/index.html',
+  MEET_RECALL_LIVEKIT_URL: 'wss://lk.example.com',
+  LIVEKIT_API_KEY: 'devkey',
+  LIVEKIT_API_SECRET: 'secret-secret-secret-secret-secret-1234',
+};
+/** A .env reader over fixed values, as meetBridgeFromEnv calls readEnvFile. */
+const envOf = (values: Record<string, string>) => (keys: string[]) =>
+  Object.fromEntries(keys.filter((k) => k in values).map((k) => [k, values[k]]));
 
 describe('parseMeetCommand', () => {
   it('takes /meet <link>, /meet leave, /meet@bot and, on Slack only, !meet', () => {
@@ -118,6 +129,33 @@ describe('Attendee bridge', () => {
     expect(
       meetBridgeFromEnv(env({ MEET_PROVIDER: 'nope', ATTENDEE_URL: 'http://a', ATTENDEE_API_KEY: 'k' })),
     ).toBeUndefined();
+  });
+
+  it('MEET_PROVIDER=recall selects the Recall bridge', async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      Response.json({ id: 'bot-1' }, { status: 201 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const bridge = meetBridgeFromEnv(envOf({ ...RECALL_ENV, ATTENDEE_URL: 'http://a', ATTENDEE_API_KEY: 'k' }));
+      expect(bridge).toBeDefined();
+      await expect(
+        bridge!.join({ meetingUrl: MEET, botName: 'Dan', roomName: 'r', sourceIdentity: 's' }),
+      ).resolves.toEqual({ botId: 'bot-1' });
+      expect(String(fetchMock.mock.calls[0][0])).toBe('https://eu-central-1.recall.ai/api/v1/bot/');
+      expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toMatchObject({
+        meeting_url: MEET,
+        output_media: { camera: { kind: 'webpage' } },
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('reads no Recall settings unless MEET_PROVIDER=recall', () => {
+    const read = vi.fn(envOf({ ATTENDEE_URL: 'http://a', ATTENDEE_API_KEY: 'k', MEET_RECALL_LIVEKIT_URL: 'bad' }));
+    expect(meetBridgeFromEnv(read)).toBeDefined();
+    expect(read.mock.calls.flatMap(([keys]) => keys)).not.toContain('RECALL_API_KEY');
   });
 });
 
@@ -234,6 +272,19 @@ describe('runMeetCommand', () => {
     });
     expect(m.started).toHaveLength(1);
     expect(m.left).toHaveLength(1);
+  });
+
+  it('answers not-configured when MEET_PROVIDER=recall lacks or garbles its settings', async () => {
+    const { RECALL_API_KEY: _key, ...missingKey } = RECALL_ENV;
+    for (const values of [missingKey, { ...RECALL_ENV, MEET_RECALL_LIVEKIT_URL: 'https://lk.example.com' }]) {
+      const bridge = meetBridgeFromEnv(envOf(values));
+      expect(bridge).toBeUndefined();
+      // The voice channel's meetingsEnabled is whether it got a bridge.
+      const meetings = { ...fakeMeetings().control, meetingsEnabled: !!bridge };
+      const outcome = await runMeetCommand(mg('mg-dm'), null, OWNER, join, { meetings });
+      expect(outcome).toEqual({ kind: 'not-configured', agentName: 'Andy' });
+      expect(meetCommandReply(outcome)).toContain('meetings are not configured on this host');
+    }
   });
 
   it('says when meetings or voice are off, or the bridge failed, and refuses a chat with several agents', async () => {

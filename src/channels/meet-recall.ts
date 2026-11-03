@@ -7,20 +7,9 @@
 import { AccessToken, TrackSource } from 'livekit-server-sdk';
 
 import { readEnvFile } from '../env.js';
+import type { MeetBridge } from './voice-mode-livekit.js';
 
-export interface MeetJoinOptions {
-  meetingUrl: string;
-  botName: string;
-  roomName: string;
-  sourceIdentity: string;
-}
-
-export interface MeetBridge {
-  join(opts: MeetJoinOptions): Promise<{ botId: string }>;
-  leave(botId: string): Promise<void>;
-}
-
-/** The worker mixes any participant carrying this attribute (value `1`) into its meeting input. */
+/** The worker mixes any participant carrying this attribute (value `1`) into its meeting input; mirrors voice-mode-worker.ts. */
 export const MEETING_INPUT_ATTRIBUTE = 'nanoclaw.meeting_input';
 
 export const RECALL_REGIONS = ['us-east-1', 'us-west-2', 'eu-central-1', 'ap-northeast-1'] as const;
