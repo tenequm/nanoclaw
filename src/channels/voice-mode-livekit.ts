@@ -125,6 +125,18 @@ export const CALL_CHAT_REPLY_NOTE =
   `word. ${CALL_DEPTH_NOTE} Offer anything meant for reading (code, links, long lists) for after the call ` +
   `instead of sending it now. ${CALL_LANGUAGE_NOTE}`;
 
+/**
+ * A meeting participant's display name as it may enter a turn's note: the meeting sets it, so control,
+ * format and line-break characters go, whitespace collapses and it is capped; empty when nothing is left.
+ */
+export function meetingParticipantName(raw: string): string {
+  const flat = raw
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return [...flat].slice(0, MAX_MEETING_NAME_CHARS).join('').trim();
+}
+
 /** A `/meet` turn's note: who may have spoken, and that every message to the chat is said into the meeting. */
 export function meetingReplyNote(languageNote: string, participants: readonly string[]): string {
   const present = participants.length > 0 ? ` (present: ${participants.join(', ')})` : '';
@@ -1182,8 +1194,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   /** The meeting participants a worker named with a turn, as far as they are names at all. */
   const meetingNames = (raw: unknown): string[] =>
     (Array.isArray(raw) ? raw : [])
-      .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
-      .map((name) => name.trim().slice(0, MAX_MEETING_NAME_CHARS))
+      .flatMap((name) => (typeof name === 'string' ? [meetingParticipantName(name)] : []))
+      .filter((name) => name.length > 0)
       .slice(0, MAX_MEETING_NAMES);
 
   const answer = (res: http.ServerResponse, outcome: TurnOutcome): void =>
