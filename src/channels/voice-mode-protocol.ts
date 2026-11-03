@@ -171,8 +171,8 @@ export interface CallUnheardSpeech {
 
 /**
  * A review draft of more than this many UTF-8 bytes cannot be sent (the worker marks it `tooLong`, the
- * page and Hey Dan mirror it). It no longer bounds what the host takes: its utterance limit is the
- * larger MAX_UTTERANCE_TEXT_BYTES in voice-mode-livekit.ts, so a long hands-free turn still goes.
+ * page and Hey Dan mirror it). It does not bound what the host takes: its utterance limit is the
+ * larger MAX_UTTERANCE_TEXT_BYTES in voice-mode-livekit.ts, so a long spoken turn still goes.
  */
 export const MAX_TURN_TEXT_BYTES = 8 * 1024;
 

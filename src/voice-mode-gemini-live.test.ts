@@ -454,7 +454,7 @@ describe('GeminiLiveTranscriber', () => {
     h.t.begin(pcm(100));
     await h.tick(0);
     h.sockets[0].ready();
-    await h.tick(0);
+    await h.tick(ACTIVITY_MAX_MS / 2);
     h.sockets[0].interim('Book a table for two');
     h.sockets[0].final('Book a table for two.');
     h.sockets[0].say({ generationComplete: true });
@@ -476,6 +476,35 @@ describe('GeminiLiveTranscriber', () => {
     h.sockets[1].final('Zulu.');
     await h.tick(FINAL_GRACE_MS);
     expect(done()).toMatchObject({ final: 'Book a table for two. Zulu.', rotations: 1 });
+  });
+
+  it('a server that finishes the activity long before its cap could be the reason: logged once, no hand-over', async () => {
+    const h = harness();
+    h.t.begin(pcm(100));
+    await h.tick(0);
+    h.sockets[0].ready();
+    await h.tick(ACTIVITY_MAX_MS / 2 - 1_000);
+    h.sockets[0].interim('Book a table');
+    h.sockets[0].say({ turnComplete: true });
+    h.sockets[0].say({ generationComplete: true });
+    expect(h.sockets[0].kinds.at(-1)).not.toBe('end');
+    expect(h.warn).toHaveBeenCalledExactlyOnceWith(
+      'voice-mode worker: the transcription finished an activity early; it goes on',
+      { ageMs: ACTIVITY_MAX_MS / 2 - 1_000 },
+    );
+    h.t.push(pcm(100));
+    await h.tick(0);
+    expect(h.sockets).toHaveLength(1);
+    expect(h.info).not.toHaveBeenCalledWith(
+      'voice-mode worker: the transcription moves to a fresh socket mid-turn',
+      expect.anything(),
+    );
+    h.sockets[0].interim('Book a table for two');
+    const done = h.result(h.t.end());
+    h.sockets[0].final('Book a table for two.');
+    await h.tick(FINAL_GRACE_MS);
+    expect(done()).toMatchObject({ final: 'Book a table for two.' });
+    expect(done()?.rotations).toBeUndefined();
   });
 
   it('generationComplete after the activityEnd settles the activity as before: no hand-over', async () => {

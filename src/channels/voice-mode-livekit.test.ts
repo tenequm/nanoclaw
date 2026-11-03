@@ -797,7 +797,19 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       409,
     );
     expect((await fetch(`${url}/events?call=${meta.callId}`)).status).toBe(404);
+    // Without a secret the body is never read: an oversized one is refused like any other.
+    expect((await post(`${url}/utterance`, { callId: meta.callId, text: 'x'.repeat(100_000) })).status).toBe(409);
     expect((await post(`${url}/joined`, { callId: meta.callId }, workerAuth(meta.callId))).status).toBe(200);
+  });
+
+  it("takes a page's end only in a small body", async () => {
+    const { call, worker } = await startCall(h);
+    const padded = { callId: call.callId, reason: 'hangup', pad: 'x'.repeat(1024) };
+    expect((await post(`${h.base}/livekit/end?t=tok123`, padded)).status).toBe(204);
+    // Still live: the oversized end was no end.
+    expect((await worker.post('utterance', { text: 'Still here.' })).status).toBe(202);
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: call.callId })).status).toBe(204);
+    worker.close();
   });
 
   it('serves the worker routes only under the voice-mode prefix and never to a forwarded request', async () => {

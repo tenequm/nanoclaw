@@ -79,6 +79,8 @@ const MAX_QUEUED_EVENTS = 50;
 const MAX_UTTERANCE_TEXT_BYTES = 32 * 1024;
 /** Room for a full-length utterance even when JSON escapes double its text, plus the envelope. */
 const MAX_AGENT_BODY_BYTES = 2 * MAX_UTTERANCE_TEXT_BYTES + 1024;
+/** The page's `livekit/end` body is a call id and a reason. */
+const MAX_END_BODY_BYTES = 1024;
 const CALLER_TOKEN_TTL_SECONDS = 120;
 /** The worker opens its event stream right after it reports the caller in; without it nothing reaches the caller. */
 const WORKER_STREAM_TIMEOUT_MS = 30_000;
@@ -1105,6 +1107,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       return onEvents(res, call);
     }
     if (req.method !== 'POST') return reply(res, 405, 'POST only');
+    // No secret, no body read: nothing unauthenticated is buffered.
+    if (!secret) return reply(res, 409, 'No such call');
     const body = await readJsonObject(req, MAX_AGENT_BODY_BYTES, {});
     if (!body) return reply(res, 400, 'Body must be a small JSON object');
     const call = findCall(body.callId);
@@ -1172,7 +1176,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         return startCall(res, platformId);
       }
       if (route === 'livekit/end') {
-        const body = await readJsonObject(req, MAX_AGENT_BODY_BYTES, {});
+        const body = await readJsonObject(req, MAX_END_BODY_BYTES, {});
         const call = calls.get(platformId);
         if (call && body && call.callId === body.callId) {
           // The page gave up waiting for the worker, or the worker said it runs another version.

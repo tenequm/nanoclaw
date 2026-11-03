@@ -71,7 +71,7 @@ export interface Heard {
   failed: boolean;
   /** From activityEnd to the result, ms. */
   finalizeMs: number;
-  /** How many times it went on in a fresh socket and activity (age, cap, goAway, stall, a close). */
+  /** How many times it went on in a fresh socket and activity (age, cap, goAway, stall, a close, the server finishing it early). */
   rotations?: number;
 }
 
@@ -144,6 +144,8 @@ interface Activity {
   /** Handed-over sockets still draining. */
   draining: number;
   stallSince: number;
+  /** The server said it finished too early to be its cap; logged once, and the activity ran on. */
+  doneEarly?: boolean;
   drainTimer?: ReturnType<typeof setTimeout>;
   resolve?: (heard: Heard) => void;
   timer?: ReturnType<typeof setTimeout>;
@@ -401,13 +403,14 @@ export class GeminiLiveTranscriber {
   }
 
   /**
-   * The activity goes on in a fresh socket (the old one got old, was told to go away, or stalled):
-   * the old one ends its part with activityEnd, and its text keeps its place before what follows.
+   * The activity goes on in a fresh socket (the old one got old, was told to go away, stalled, neared
+   * ACTIVITY_MAX_MS, or the server finished the activity before its activityEnd): the old one ends its
+   * part with activityEnd, and its text keeps its place before what follows.
    */
   private handOver(activity: Activity, why: string): void {
     const old = activity.socket;
     if (!old) return;
-    const ageMs = Math.round(Date.now() - activity.startedAt);
+    const ageMs = Date.now() - activity.startedAt;
     this.opts.log.info('voice-mode worker: the transcription moves to a fresh socket mid-turn', { why, ageMs });
     this.debug('handover', activity, { why, sid: old.id, ageMs });
     activity.rotations++;
@@ -507,12 +510,19 @@ export class GeminiLiveTranscriber {
       });
       if (activity.endSent) this.graceThenSettle(activity);
     }
-    if ((content.turnComplete || content.generationComplete) && activity.endSent && activity.part.finals.length) {
+    const done = content.turnComplete || content.generationComplete;
+    if (done && activity.endSent && activity.part.finals.length) {
       this.settleWhenDrained(activity);
-    } else if ((content.turnComplete || content.generationComplete) && !activity.endSent && !activity.ending) {
+    } else if (done && !activity.endSent && !activity.ending) {
       // Done before its activityEnd: the server's cap on one activity. Nothing more would be transcribed
-      // here, so the rest goes to a fresh one, after the words this one heard.
-      this.handOver(activity, 'server-done');
+      // here, so the rest goes to a fresh one, after the words this one heard. Much earlier it is not that
+      // cap, and a hand-over on every such message would rotate without bound: logged once, it runs on.
+      const ageMs = Date.now() - activity.startedAt;
+      if (ageMs >= ACTIVITY_MAX_MS / 2) this.handOver(activity, 'server-done');
+      else if (!activity.doneEarly) {
+        activity.doneEarly = true;
+        this.opts.log.warn('voice-mode worker: the transcription finished an activity early; it goes on', { ageMs });
+      }
     }
   }
 
