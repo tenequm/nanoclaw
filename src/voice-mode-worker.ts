@@ -1322,7 +1322,7 @@ export interface TurnFacts {
   cueMs?: number;
   /** A committed send went with its words at the act: the final had none (`empty`), ended in a discard, or split differently at a wake phrase. */
   fallback?: 'empty' | 'discard' | 'wake_split';
-  /** Lone commands nobody said (the transcription's echo of its vocabulary) ignored since the wake before it. */
+  /** Lone commands nobody said (the transcription's echo of its vocabulary) ignored since the turn before it. */
   echoes?: number;
 }
 
@@ -2136,11 +2136,14 @@ export function matchWakes(text: string, names: readonly WakeName[]): Array<{ st
   }
 }
 
-/** How long an open turn waits for speech before it goes back to waiting for the wake phrase; 0 never. */
+/**
+ * How long the awake state, and a turn the wake phrase opened, wait for speech before going back to
+ * waiting for the wake phrase; 0 never.
+ */
 export interface AwakeLimits {
   /** After the wake phrase, with nothing said since. */
   startMs: number;
-  /** After the caller's last speech, with words held. */
+  /** After the caller's last speech, with words held or SPEECH_FLOOR_MS of VAD speech heard. */
   idleMs: number;
 }
 const DEFAULT_AWAKE_LIMITS: AwakeLimits = { startMs: 8_000, idleMs: 20_000 };
@@ -2298,7 +2301,7 @@ interface OpenTurn {
   switched?: (recording: Recording) => void;
   /** Opened by a wake: when its start clock began, which an echo hands back to the wake. */
   wokeAt?: number;
-  /** Echoes ignored since the wake before it opened, for its `voice-mode.turn` event. */
+  /** Echoes ignored since the turn before it opened, for its `voice-mode.turn` event. */
   echoes: number;
 }
 

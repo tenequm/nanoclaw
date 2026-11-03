@@ -115,6 +115,7 @@ initializeLogger({ pretty: false, level: 'error' });
 const flush = () => new Promise((r) => setTimeout(r, 5));
 const SILENCE = 2500;
 const silentLog = { info: () => undefined, warn: () => undefined };
+const echoLog = 'voice-mode worker: a lone command with no speech is an echo; ignored';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -3475,8 +3476,6 @@ describe('CallTurns, wake', () => {
 });
 
 describe('CallTurns, the wake and the speech after it', () => {
-  const echoLog = 'voice-mode worker: a lone command with no speech is an echo; ignored';
-
   it('the phrase, a pause, then speech: the turn opens at the speech, with its pre-roll, and nothing before that', async () => {
     const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
     await h.pass(1000);
@@ -3945,7 +3944,7 @@ describe('CallTurns, the published wake state', () => {
     await h.talk(100);
     await h.interim('Прийом.');
     await h.pass(100);
-    expect(h.out.logs).toContain('voice-mode worker: a lone command with no speech is an echo; ignored');
+    expect(h.out.logs).toContain(echoLog);
     expect(h.out.states.slice(at)).toEqual([]);
     expect(h.out.states.at(-1)).toMatchObject({ waiting: false });
   });
