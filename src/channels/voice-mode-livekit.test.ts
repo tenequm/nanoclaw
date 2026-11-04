@@ -69,7 +69,7 @@ import { callPageHtml } from './voice-mode-page.js';
 import type { VoiceCatalog, VoiceStatus } from './voice-mode-tts-catalog.js';
 import { linePlatformId } from './voice-mode-line.js';
 import { MEETING_MAX_DURATION_MS, type RecallMeetBridge } from './meet-recall.js';
-import type { CallCore, CallEvent, Command, JevState } from '../modules/meet-jev/core/types.js';
+import type { CallCore, CallEvent, CallPolicy, Command, JevState } from '../modules/meet-jev/core/types.js';
 import type { TranscriberOptions } from '../voice-mode-gemini-live.js';
 
 /** A line /voice made: its calls need a chat to talk in. */
@@ -2137,10 +2137,11 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
   /** The participants' fake VADs and transcriptions, in the order their pipelines opened. */
   let vads: Array<{ onSpeech(speaking: boolean, position: number): void; pushed: number; closed: boolean }>;
   let stts: Array<{ options: TranscriberOptions; final: string; closed: boolean }>;
+  let policies: CallPolicy[];
 
   /** A final utterance is a turn; a reply is spoken. */
   const meetCore: CallCore<null> = {
-    initial: () => null,
+    initial: (policy) => (policies.push(policy), null),
     reduce: (state, event) => (seen.push(event), state),
     decide: (_state, event): Command[] => {
       if (event.kind === 'utterance' && event.final) {
@@ -2155,6 +2156,7 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
     bots = [];
     vads = [];
     stts = [];
+    policies = [];
     beforeCreate = async () => undefined;
     const chat = fakeMirror([{ platform_id: 'telegram:100' }], {
       bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
@@ -2191,7 +2193,11 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
           },
         },
       },
-      { mirrorApi: chat.api, jev: { core: meetCore, judge: async () => ({ verdict: null, ms: 0 }) } },
+      {
+        mirrorApi: chat.api,
+        wakeName: 'Dan',
+        jev: { core: meetCore, judge: async () => ({ verdict: null, ms: 0 }) },
+      },
     );
   });
   afterEach(async () => {
@@ -2264,6 +2270,10 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
     expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
     const meta = h.lk.dispatches.at(-1)!.metadata;
     expect(meta).toMatchObject({ jev: true, meeting: { pauseSends: false, jev: true } });
+    // The meeting's people call it by the wake phrase's name; the line's agent name is an alias, and the bot keeps it.
+    expect(policies).toEqual([
+      expect.objectContaining({ kind: 'meet', agentName: 'Dan', agentAliases: ['Andy', 'Енді'] }),
+    ]);
     expect(bots).toHaveLength(1);
     const { participantAudio, ...rest } = bots[0];
     expect(rest).toEqual({ meetingUrl: MEET, botName: 'Andy', roomName: h.lk.rooms[0] });
