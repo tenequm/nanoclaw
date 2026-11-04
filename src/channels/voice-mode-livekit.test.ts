@@ -2672,7 +2672,7 @@ describe('/voice jev with the real core', () => {
     await h.stop();
   });
 
-  it('wakes on the vocative, speaks the answer, takes the playback into the window, and judges the next words', async () => {
+  it('judges the vocative, speaks the answer, takes the playback into the window, and judges the next words', async () => {
     expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
     const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
     expect((await worker.post('joined')).status).toBe(200);
@@ -2689,7 +2689,8 @@ describe('/voice jev with the real core', () => {
     expect(text.startsWith('<voice source="livekit">Andy, what time is it?</voice>\n')).toBe(true);
     expect(text).toContain('You are on a live voice call');
     await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['\u{1F399} Andy, what time is it?']));
-    expect(asked).toEqual([]);
+    expect(asked).toHaveLength(1);
+    expect(asked[0].facts.addressed_by_name).toBe(true);
 
     liveKitChatDelivered(
       {
@@ -2719,8 +2720,8 @@ describe('/voice jev with the real core', () => {
     await vi.waitFor(() => expect(h.inbound).toHaveLength(2));
     await settle();
     expect(h.inbound).toHaveLength(2);
-    expect(asked).toHaveLength(1);
-    expect(asked[0].window).toEqual(
+    expect(asked).toHaveLength(2);
+    expect(asked[1].window).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ text: 'It is nine.', agent: true }),
         expect.objectContaining({ speaker: 'Ethan', text: 'And tomorrow?' }),
