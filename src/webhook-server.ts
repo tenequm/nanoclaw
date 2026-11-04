@@ -57,6 +57,11 @@ export function getWebhookStatus(): { id: string; host: string; port: number; pa
   };
 }
 
+/** A request URL for a log line: the path only, since a query can carry a credential (`?token=`). */
+function loggedPath(url: string | undefined): string {
+  return (url || '/').split(/[?#]/, 1)[0];
+}
+
 /** Convert Node.js IncomingMessage to a Web API Request. */
 async function toWebRequest(req: http.IncomingMessage): Promise<Request> {
   const chunks: Buffer[] = [];
@@ -166,7 +171,7 @@ export function registerUpgradeHandler(segment: string, handler: UpgradeHandler)
 
 function dispatchUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer): void {
   // Node detaches its own socket listeners on upgrade; an unhandled 'error' would crash the host.
-  socket.on('error', (err) => log.debug('Upgrade socket error', { url: req.url, err }));
+  socket.on('error', (err) => log.debug('Upgrade socket error', { path: loggedPath(req.url), err }));
   const segment = (req.url || '/').match(/^\/([^/?#]+)/)?.[1];
   const handler = segment === undefined ? undefined : upgradeRoutes.get(segment);
   if (!handler) {
@@ -179,7 +184,7 @@ function dispatchUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer
   try {
     handler(req, socket, head);
   } catch (err) {
-    log.error('Upgrade handler error', { url: req.url, err });
+    log.error('Upgrade handler error', { path: loggedPath(req.url), err });
     socket.destroy();
   }
 }
@@ -234,7 +239,7 @@ function ensureServer(): void {
         });
         await fromWebResponse(webRes, res);
       } catch (err) {
-        log.error('Webhook handler error', { adapter: adapterName, url: req.url, err });
+        log.error('Webhook handler error', { adapter: adapterName, path: loggedPath(req.url), err });
         if (!res.headersSent) {
           res.writeHead(500, { 'Content-Type': 'text/plain' });
           res.end('Internal Server Error');

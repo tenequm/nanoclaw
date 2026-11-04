@@ -15,6 +15,7 @@ vi.mock('../../../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+import { log } from '../../../log.js';
 import type { CallEvent, Speaker } from '../core/types.js';
 import {
   createRecallIngress,
@@ -279,6 +280,9 @@ describe('createRecallIngress', () => {
     expect(await connect(`${origin}/voice/recall/nope/?token=${token}`)).toEqual({ status: 401 });
     expect(await connect(`${origin}/voice/recall/call-1/extra?token=${token}`)).toEqual({ status: 404 });
     expect(await connect(`${origin}/voice/other?token=${token}`)).toEqual({ status: 404 });
+    const logged = JSON.stringify(Object.values(log).flatMap((fn) => vi.mocked(fn).mock.calls));
+    expect(logged).toContain('refused a websocket');
+    expect(logged).not.toContain(token);
     // A websocket client normalizes dot segments away; a raw upgrade request keeps them.
     const status = await new Promise<number>((resolve, reject) => {
       const req = http.request({

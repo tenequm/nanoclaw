@@ -5,9 +5,14 @@
  * refused with 404, request routes are untouched, and stopWebhookServer does not wait on open
  * websockets.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import WebSocket, { WebSocketServer } from 'ws';
 
+vi.mock('./log.js', () => ({
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+import { log } from './log.js';
 import { allocateFreePort } from './test-utils/free-port.js';
 import { registerRootHandler, registerUpgradeHandler, stopWebhookServer } from './webhook-server.js';
 
@@ -90,6 +95,25 @@ describe('webhook server upgrade routes', () => {
     });
     const outcome = await connect('/boom');
     expect('error' in outcome).toBe(true);
+  });
+
+  it('never logs the query of an upgrade it refuses, whose handler throws or whose socket errors', async () => {
+    const SECRET = 'per-call-secret-0123456789';
+    registerUpgradeHandler('erring', (_req, socket) => {
+      socket.emit('error', new Error('socket broke'));
+      socket.destroy();
+    });
+    const logged = () => JSON.stringify(Object.values(log).flatMap((fn) => vi.mocked(fn).mock.calls));
+    vi.clearAllMocks();
+
+    expect(await connect(`/unknown/c/?token=${SECRET}`)).toEqual({ status: 404 });
+    expect('error' in (await connect(`/boom/c/?token=${SECRET}`))).toBe(true);
+    expect('error' in (await connect(`/erring/c/?token=${SECRET}`))).toBe(true);
+
+    expect(log.error).toHaveBeenCalledWith('Upgrade handler error', expect.objectContaining({ path: '/boom/c/' }));
+    expect(log.debug).toHaveBeenCalledWith('Upgrade socket error', expect.objectContaining({ path: '/erring/c/' }));
+    expect(logged()).not.toContain(SECRET);
+    expect(logged()).not.toContain('token=');
   });
 
   it('rejects reserved and malformed segments', () => {
