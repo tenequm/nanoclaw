@@ -462,6 +462,20 @@ describe('update-nanoclaw transaction end to end', () => {
     expect(fs.readFileSync(path.join(fixture.install, 'nanoclaw.pid'), 'utf8')).toBe('1234\n');
   });
 
+  it('prepares for an operator whose git config signs every tag', () => {
+    const fixture = createForkFixture();
+    previousUpdateDir = process.env.NANOCLAW_UPDATE_DIR;
+    process.env.NANOCLAW_UPDATE_DIR = temp('nanoclaw-update-state-');
+    exec(fixture.install, 'git', ['config', 'tag.gpgSign', 'true']);
+    const { runtime } = fakeRuntime(fixture.install);
+
+    const state = prepareUpdate({ projectRoot: fixture.install, upstreamRef: 'upstream/main' }, runtime);
+    expect(state.phase).toBe('prepared');
+    // A lightweight tag on the pre-update commit: nothing to sign, no key needed.
+    expect(exec(fixture.install, 'git', ['cat-file', '-t', `refs/tags/${state.backupTag}`])).toBe('commit');
+    expect(exec(fixture.install, 'git', ['rev-parse', `refs/tags/${state.backupTag}`])).toBe(fixture.originalHead);
+  });
+
   it('snapshots and restores symlinked mutable roots without replacing the link', async () => {
     const fixture = createForkFixture();
     previousUpdateDir = process.env.NANOCLAW_UPDATE_DIR;
