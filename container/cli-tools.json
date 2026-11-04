@@ -8,5 +8,9 @@
     "name": "@anthropic-ai/claude-code",
     "version": "2.1.296",
     "onlyBuilt": true
+  },
+  {
+    "name": "@playwright/cli",
+    "version": "0.1.23"
   }
 ]
