@@ -30,9 +30,17 @@ const TEST_DIR = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
   return mkdtempSync(`${tmpdir()}/nanoclaw-test-voice-command-`);
 });
+/** The Jev key `/voice jev` needs; empty as on a host without one. */
+const jevKey = vi.hoisted(() => ({ value: 'jev-test-key' }));
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
-  return { ...actual, DATA_DIR: TEST_DIR };
+  return {
+    ...actual,
+    DATA_DIR: TEST_DIR,
+    get JEV_API_KEY() {
+      return jevKey.value;
+    },
+  };
 });
 
 /** Runs once right after the next lookup of an agent's line: what another /voice did in between. */
@@ -74,6 +82,7 @@ import { routeInbound } from '../router.js';
 import type { MessagingGroup } from '../types.js';
 import {
   handleVoiceCommand,
+  lineRunsJev,
   parseVoiceCommand,
   type PrivateReply,
   runVoiceCommand,
@@ -81,6 +90,7 @@ import {
   voiceLinkLines,
 } from './voice-mode-command.js';
 import { senderUserId } from './voice-mode-chat.js';
+import { linePlatformId } from './voice-mode-line.js';
 
 const OWNER = 'chat:1';
 const MEMBER = 'chat:2';
@@ -180,6 +190,9 @@ describe('parseVoiceCommand / senderUserId', () => {
     expect(parseVoiceCommand('/voice@', 'telegram')).toEqual({ renew: false });
     expect(parseVoiceCommand('/voice-mode', 'telegram')).toBeNull();
     expect(parseVoiceCommand('', 'telegram')).toBeNull();
+    expect(parseVoiceCommand('/voice jev', 'telegram')).toEqual({ renew: false, jev: true });
+    expect(parseVoiceCommand('!voice JEV', 'slack')).toEqual({ renew: false, jev: true });
+    expect(parseVoiceCommand('/voice jevv', 'telegram')).toEqual({ renew: false });
   });
 
   it('reads the sender the way the permissions module does, namespacing a bare handle', () => {
@@ -521,6 +534,32 @@ describe('handleVoiceCommand (the interceptor)', () => {
     expect(delivered).toEqual([]);
     expect(await lines()).toEqual([]);
     expect(await handleVoiceCommand(event('hello', OWNER), callUrl)).toBe(false);
+  });
+
+  it('/voice jev puts the line in jev mode and says so; /voice takes it out; no Jev key, nothing changes', async () => {
+    await startChat(false);
+    await handleVoiceCommand(event('/voice jev', OWNER), callUrl);
+    const [line] = await lines();
+    const platformId = linePlatformId(line.line_id);
+    expect(lineRunsJev(platformId)).toBe(true);
+    const text = (delivered.at(-1)!.message.content as { text: string }).text;
+    expect(text).toMatch(/voice\?t=[0-9a-f]{32}/);
+    expect(text).toContain('Calls on this link run in jev mode');
+    delivered.length = 0;
+    await handleVoiceCommand(event('/voice', OWNER), callUrl);
+    expect(lineRunsJev(platformId)).toBe(false);
+    expect((delivered[0].message.content as { text: string }).text).not.toContain('jev');
+    jevKey.value = '';
+    try {
+      delivered.length = 0;
+      await handleVoiceCommand(event('/voice jev', OWNER), callUrl);
+      expect(lineRunsJev(platformId)).toBe(false);
+      expect(delivered.map((d) => (d.message.content as { text: string }).text)).toEqual([
+        "jev mode needs the Jev gate's JEV_API_KEY on this host; send /voice without jev.",
+      ]);
+    } finally {
+      jevKey.value = 'jev-test-key';
+    }
   });
 
   async function groupChat() {
