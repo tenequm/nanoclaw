@@ -18,7 +18,7 @@ import { log } from '../../log.js';
 import { callCore } from './core/index.js';
 import type { CallCore, CallEvent, CallKind } from './core/types.js';
 import { createWorkerIngress } from './ingress/worker.js';
-import { askAction, askStillWanted } from './judge.js';
+import { askAction, askStillWanted, judgeQuestions } from './judge.js';
 import { policyFor } from './policy.js';
 import { createCallRuntime, type CallRuntime, type JevTurnResult } from './runtime.js';
 
@@ -80,6 +80,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const replyTurns = new Map<string, string | null>();
   let replies = 0;
   const fields = { callId: host.callId };
+  log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName) });
   const judgedAt: number[] = [];
   /** Lines the worker reported started and not yet over: `words` reaches it only while one plays. */
   const playing = new Set<string>();
@@ -94,16 +95,38 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
 
   const runtime: CallRuntime = createCallRuntime(core, policy, {
     now: host.now,
-    judge: async (state, signal) => {
-      if (!capped()) return judge(state, { signal });
+    judge: async (state, signal, windowVersion) => {
+      if (!capped()) return judge(state, { signal, ...fields, windowVersion });
       log.warn('meet-jev: Jev rate cap reached, judged without Jev', { ...fields, perMinute: MAX_JUDGES_PER_MINUTE });
+      log.info('meet-jev: judge', {
+        ...fields,
+        windowVersion,
+        question: 'action',
+        state,
+        model: null,
+        usage: null,
+        answer: null,
+        ms: 0,
+        failure: { category: 'rate_cap', message: 'Jev rate cap reached' },
+      });
       return { verdict: null, ms: 0 };
     },
-    recheck: async (state, signal) => {
-      if (!capped()) return recheck(state, { signal });
+    recheck: async (state, signal, windowVersion) => {
+      if (!capped()) return recheck(state, { signal, ...fields, windowVersion });
       log.warn('meet-jev: Jev rate cap reached, answer spoken unchecked', {
         ...fields,
         perMinute: MAX_JUDGES_PER_MINUTE,
+      });
+      log.info('meet-jev: judge', {
+        ...fields,
+        windowVersion,
+        question: 'still_wanted',
+        state,
+        model: null,
+        usage: null,
+        answer: null,
+        ms: 0,
+        failure: { category: 'rate_cap', message: 'Jev rate cap reached' },
       });
       return { verdict: null, ms: 0 };
     },

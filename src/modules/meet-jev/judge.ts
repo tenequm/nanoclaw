@@ -4,7 +4,8 @@
  * verdict: silence for `action` (fail-silent like the chat gate) unless the agent was called by name, which
  * still wakes it; speech for `still_wanted` (the answer was wanted a moment ago).
  */
-import { postSystemOne } from '../jev-gate/jev.js';
+import { log } from '../../log.js';
+import { postSystemOne, type JevFailure } from '../jev-gate/jev.js';
 import {
   ACTIONS,
   RECHECK_ACTIONS,
@@ -88,31 +89,67 @@ function stillWantedQuestion(agent: string) {
   };
 }
 
+export const judgeQuestions = (agent: string) => ({
+  action: actionQuestion(agent),
+  still_wanted: stillWantedQuestion(agent),
+});
+
+interface JudgeOptions {
+  signal?: AbortSignal;
+  callId?: string;
+  windowVersion?: number;
+}
+
 async function ask<V>(
   state: unknown,
   questions: Record<string, unknown>,
   parse: (body: unknown) => V | null,
-  signal: AbortSignal | undefined,
+  opts: JudgeOptions,
 ): Promise<{ verdict: V | null; ms: number }> {
   const started = Date.now();
+  const question = Object.keys(questions)[0];
+  let verdict: V | null = null;
+  let model: unknown = null;
+  let usage: unknown = null;
+  let answer: unknown = null;
+  let failure: JevFailure | null = null;
   try {
-    const result = await postSystemOne({ state, questions }, signal);
-    return { verdict: result.ok ? parse(result.body) : null, ms: Date.now() - started };
+    const result = await postSystemOne({ state, questions }, opts.signal);
+    if (result.ok) {
+      const body = result.body as { model?: unknown; usage?: unknown; answers?: Record<string, unknown> } | null;
+      model = body?.model ?? null;
+      usage = body?.usage ?? null;
+      answer = body?.answers?.[question] ?? null;
+      verdict = parse(result.body);
+      if (verdict === null) failure = { category: 'parse', message: `Invalid Choice answer for ${question}` };
+    } else {
+      failure = result.failure;
+    }
   } catch {
-    return { verdict: null, ms: Date.now() - started };
+    failure = { category: 'request', message: 'Unexpected Jev judge failure' };
   }
+  const ms = Date.now() - started;
+  log.info('meet-jev: judge', {
+    callId: opts.callId ?? null,
+    windowVersion: opts.windowVersion ?? null,
+    question,
+    state,
+    model,
+    usage,
+    answer,
+    ms,
+    failure,
+  });
+  return { verdict, ms };
 }
 
 /** Ask Jev what the agent should do about the window. Never throws; null on any failure. */
-export const askAction = (
-  state: JevState,
-  opts: { signal?: AbortSignal } = {},
-): Promise<{ verdict: Verdict | null; ms: number }> =>
-  ask(state, { action: actionQuestion(state.agent_name) }, parseAction, opts.signal);
+export const askAction = (state: JevState, opts: JudgeOptions = {}): Promise<{ verdict: Verdict | null; ms: number }> =>
+  ask(state, { action: actionQuestion(state.agent_name) }, parseAction, opts);
 
 /** Ask Jev whether a landed answer is still wanted. Never throws; null on any failure. */
 export const askStillWanted = (
   state: RecheckState,
-  opts: { signal?: AbortSignal } = {},
+  opts: JudgeOptions = {},
 ): Promise<{ verdict: RecheckVerdict | null; ms: number }> =>
-  ask(state, { still_wanted: stillWantedQuestion(state.agent_name) }, parseStillWanted, opts.signal);
+  ask(state, { still_wanted: stillWantedQuestion(state.agent_name) }, parseStillWanted, opts);

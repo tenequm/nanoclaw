@@ -24,9 +24,13 @@ export type JevTurnResult = { ok: true; turnId: string } | { ok: false; reason: 
 export interface RuntimePorts {
   now(): number;
   /** Never rejects in practice (askAction answers null on any failure); a rejection counts as a null verdict. */
-  judge(state: JevState, signal: AbortSignal): Promise<{ verdict: Verdict | null; ms: number }>;
+  judge(state: JevState, signal: AbortSignal, windowVersion: number): Promise<{ verdict: Verdict | null; ms: number }>;
   /** The answer-ready check; never rejects in practice either, and a rejection counts as a null verdict. */
-  recheck(state: RecheckState, signal: AbortSignal): Promise<{ verdict: RecheckVerdict | null; ms: number }>;
+  recheck(
+    state: RecheckState,
+    signal: AbortSignal,
+    windowVersion: number,
+  ): Promise<{ verdict: RecheckVerdict | null; ms: number }>;
   /** Submit a turn; an aborted `signal` (superseded, or the call ended) stops it being routed, or the wait for it. */
   turn(turn: { message: string; note: string }, signal: AbortSignal): Promise<JevTurnResult>;
   speak(replyId: string, text: string): void;
@@ -123,7 +127,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
       case 'judge':
         return judge(command.windowVersion, command.state);
       case 'recheck':
-        return recheck(command.wakeKey, command.state);
+        return recheck(command.wakeKey, command.state, command.windowVersion);
       case 'wait':
         return wait(command.key, command.ms);
       case 'cancel_wait':
@@ -154,7 +158,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
     const abort = new AbortController();
     judges.add(abort);
     void Promise.resolve()
-      .then(() => ports.judge(jevState, abort.signal))
+      .then(() => ports.judge(jevState, abort.signal, windowVersion))
       .catch(() => ({ verdict: null, ms: 0 }))
       .then(({ verdict, ms }) => {
         judges.delete(abort);
@@ -163,11 +167,11 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
   };
 
   /** Apart from `judge`: a new boundary's judge must not abort the check of an answer already landed. */
-  const recheck = (wakeKey: string, recheckState: RecheckState): void => {
+  const recheck = (wakeKey: string, recheckState: RecheckState, windowVersion: number): void => {
     const abort = new AbortController();
     rechecks.add(abort);
     void Promise.resolve()
-      .then(() => ports.recheck(recheckState, abort.signal))
+      .then(() => ports.recheck(recheckState, abort.signal, windowVersion))
       .catch(() => ({ verdict: null, ms: 0 }))
       .then(({ verdict, ms }) => {
         rechecks.delete(abort);

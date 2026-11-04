@@ -38,6 +38,25 @@ function jevCall() {
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe('createJevCall', () => {
+  it('logs both question texts once per call', async () => {
+    vi.mocked(log.info).mockClear();
+    const { call, say } = jevCall();
+    say('first thought');
+    await flush();
+    say('second thought');
+    await flush();
+    const questions = vi.mocked(log.info).mock.calls.filter(([message]) => message === 'meet-jev: questions');
+    expect(questions).toHaveLength(1);
+    expect(questions[0][1]).toMatchObject({
+      callId: 'c1',
+      questions: {
+        action: { instructions: expect.stringContaining('Andy') },
+        still_wanted: { instructions: expect.stringContaining('Andy') },
+      },
+    });
+    call.end('test');
+  });
+
   it('asks Jev at most MAX_JUDGES_PER_MINUTE times a minute; past it a boundary is judged silent', async () => {
     const { call, clock, judge, say } = jevCall();
     for (let i = 0; i <= MAX_JUDGES_PER_MINUTE; i++) {
@@ -74,7 +93,9 @@ describe('createJevCall', () => {
           initial: () => null,
           reduce: (state) => state,
           decide: (_state, event) =>
-            event.kind === 'reply' ? [{ kind: 'recheck', wakeKey: 'w1', state: {} as RecheckState }] : [],
+            event.kind === 'reply'
+              ? [{ kind: 'recheck', windowVersion: 1, wakeKey: 'w1', state: {} as RecheckState }]
+              : [],
         },
         judge: async () => ({ verdict: null, ms: 0 }),
         recheck,

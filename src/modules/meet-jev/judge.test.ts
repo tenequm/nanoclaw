@@ -19,6 +19,7 @@ vi.mock('../../config.js', async () => {
   };
 });
 
+import { log } from '../../log.js';
 import type { JevState } from './core/types.js';
 import { askAction, askStillWanted, parseAction, parseStillWanted } from './judge.js';
 
@@ -53,6 +54,7 @@ function respond(body: unknown, init: { ok?: boolean; status?: number } = {}) {
 }
 
 afterEach(() => {
+  vi.clearAllMocks();
   vi.unstubAllGlobals();
   env.apiKey = 'test-key';
 });
@@ -75,6 +77,72 @@ describe('askAction', () => {
     expect(Object.keys(body.questions.action.criteria).sort()).toEqual(['answer', 'continue', 'stay_silent', 'stop']);
     expect(body.questions.action.instructions).toContain('Dan');
   });
+
+  it('logs the exact state and response metadata with call and window identity', async () => {
+    const model = 'typesafe/jev-1.14-20261014';
+    const usage = { input_tokens: 120, output_tokens: 12 };
+    const fetchMock = respond({ model, usage, answers: { action: choice } });
+    await askAction(state, { callId: 'c1', windowVersion: 7 });
+    const sent = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(log.info).toHaveBeenCalledExactlyOnceWith('meet-jev: judge', {
+      callId: 'c1',
+      windowVersion: 7,
+      question: 'action',
+      state: sent.state,
+      model,
+      usage,
+      answer: choice,
+      ms: expect.any(Number),
+      failure: null,
+    });
+  });
+
+  it.each(['http', 'timeout', 'abort', 'bad_body', 'parse', 'request'])(
+    'logs a %s failure without credentials or request URLs',
+    async (category) => {
+      if (category === 'http') respond({}, { ok: false, status: 503 });
+      else if (category === 'parse') respond({ model: 'test-model', answers: { action: { choice: 'invalid' } } });
+      else if (category === 'bad_body')
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => {
+              throw new SyntaxError('secret query test-key');
+            },
+          }),
+        );
+      else
+        vi.stubGlobal(
+          'fetch',
+          vi
+            .fn()
+            .mockRejectedValue(
+              new DOMException(
+                'secret query test-key',
+                category === 'timeout' ? 'TimeoutError' : category === 'abort' ? 'AbortError' : 'Error',
+              ),
+            ),
+        );
+      const result = await askAction(state, { callId: 'c1', windowVersion: 8 });
+      expect(result.verdict).toBeNull();
+      expect(log.info).toHaveBeenCalledExactlyOnceWith(
+        'meet-jev: judge',
+        expect.objectContaining({
+          callId: 'c1',
+          windowVersion: 8,
+          state,
+          failure: expect.objectContaining({ category, message: expect.any(String) }),
+        }),
+      );
+      expect(JSON.stringify(vi.mocked(log.info).mock.calls)).not.toMatch(/test-key|secret query|authorization|https:/);
+      if (category === 'parse')
+        expect(log.info).toHaveBeenCalledWith(
+          'meet-jev: judge',
+          expect.objectContaining({ model: 'test-model', answer: { choice: 'invalid' } }),
+        );
+    },
+  );
 
   it('is null on a non-200, and releases its unread body', async () => {
     respond({}, { ok: false, status: 503 });
@@ -153,7 +221,18 @@ describe('askStillWanted', () => {
 
   it('asks one Choice still_wanted over speak and show with the recheck state', async () => {
     const fetchMock = respond({ answers: { still_wanted: stillWanted } });
-    const { verdict } = await askStillWanted(recheckState);
+    const { verdict } = await askStillWanted(recheckState, { callId: 'c2', windowVersion: 9 });
+    expect(log.info).toHaveBeenCalledExactlyOnceWith(
+      'meet-jev: judge',
+      expect.objectContaining({
+        callId: 'c2',
+        windowVersion: 9,
+        question: 'still_wanted',
+        state: recheckState,
+        answer: stillWanted,
+        failure: null,
+      }),
+    );
     expect(verdict).toEqual({ action: 'show', probabilities: { speak: 0.1, show: 0.9 }, confidence: 0.8 });
     const body = JSON.parse((fetchMock.mock.calls[0] as [string, { body: string }])[1].body);
     expect(Object.keys(body.questions)).toEqual(['still_wanted']);
