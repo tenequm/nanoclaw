@@ -97,3 +97,32 @@ describe('claude provider project document', () => {
     expect(composeGroupProjectDoc.mock.calls[0][3]).toEqual(['fixture-gateway']);
   });
 });
+
+describe('per-agent compact window', () => {
+  it('migrates fresh and existing columns, preserves values, and gives the group precedence', async () => {
+    const { initTestDb, runMigrations, closeDb, createAgentGroup, getDb } = await import('../db/index.js');
+    const { ensureContainerConfig, updateContainerConfigScalars, getContainerConfig } =
+      await import('../db/container-configs.js');
+    try {
+      await runMigrations(await initTestDb());
+      await createAgentGroup({
+        id: 'group-1',
+        name: 'compact-test',
+        folder: 'claude-env',
+        agent_provider: null,
+        created_at: new Date().toISOString(),
+      });
+      await ensureContainerConfig('group-1');
+      process.env[KEY] = '900000';
+      expect((await claudeEnv())?.[KEY]).toBe('900000');
+      await updateContainerConfigScalars('group-1', { auto_compact_window: 300000 });
+      expect((await claudeEnv())?.[KEY]).toBe('300000');
+      await getDb().run('DELETE FROM schema_version WHERE name = ?', 'module:auto-compact-window:column');
+      await runMigrations(getDb());
+      expect((await getContainerConfig('group-1'))?.auto_compact_window).toBe(300000);
+      expect((await claudeEnv())?.[KEY]).toBe('300000');
+    } finally {
+      await closeDb();
+    }
+  });
+});

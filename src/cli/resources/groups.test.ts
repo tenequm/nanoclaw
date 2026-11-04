@@ -539,3 +539,39 @@ describe('groups config (host-only)', () => {
     });
   });
 });
+
+describe('--auto-compact-window', () => {
+  beforeEach(async () => {
+    await runMigrations(await initTestDb());
+    await createAgentGroup({
+      id: 'compact-cli',
+      name: 'compact',
+      folder: 'compact',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await ensureContainerConfig('compact-cli');
+  });
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  it('persists a positive token count and rejects invalid values without changing it', async () => {
+    const setWindow = (value: unknown) =>
+      dispatch(
+        {
+          id: 'compact-update',
+          command: 'groups-config-update',
+          args: { id: 'compact-cli', auto_compact_window: value },
+        },
+        { caller: 'host' },
+      );
+    expect((await setWindow('400000')).ok).toBe(true);
+    expect((await getContainerConfig('compact-cli'))?.auto_compact_window).toBe(400000);
+    for (const value of ['0', '-1', '1.5', 'bad', '']) {
+      const result = await setWindow(value);
+      expect(errorMessage(result)).toBe('--auto-compact-window must be a positive integer (tokens)');
+      expect((await getContainerConfig('compact-cli'))?.auto_compact_window).toBe(400000);
+    }
+  });
+});
