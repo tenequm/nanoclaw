@@ -74,7 +74,7 @@ import { registerTypingObserver } from '../modules/typing/index.js';
 import type { MessagingGroup } from '../types.js';
 import { TTS_DEFAULT_CHOICE } from '../voice-mode-tts.js';
 
-const MINUTE_MS = 60_000;
+export const MINUTE_MS = 60_000;
 const MAX_QUEUED_EVENTS = 50;
 /**
  * The longest utterance the host takes, in UTF-8 bytes: above MAX_TURN_TEXT_BYTES, which still caps review drafts on

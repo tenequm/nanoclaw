@@ -33,8 +33,8 @@ function config(fetchImpl: FetchMock, overrides: Partial<RecallMeetConfig> = {})
   };
 }
 
-const json = (status: number, body: unknown) =>
-  new Response(body === undefined ? '' : typeof body === 'string' ? body : JSON.stringify(body), { status });
+const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
+  new Response(body === undefined ? '' : typeof body === 'string' ? body : JSON.stringify(body), { status, headers });
 
 /** Answers each request in turn; the last answer repeats. */
 function respond(...answers: Array<Response | Error>): FetchMock {
@@ -67,7 +67,8 @@ describe('createRecallMeetBridge', () => {
       metadata: { nanoclaw_room: 'meet-r1' },
       variant: { google_meet: 'web_4_core', zoom: 'web_4_core', microsoft_teams: 'web_4_core' },
       recording_config: { video_mixed_mp4: null },
-      automatic_leave: { in_call_not_recording_timeout: 3 * 3600 },
+      // The lobby wait plus the longest meeting call: a bot the host never sent away leaves after that.
+      automatic_leave: { in_call_not_recording_timeout: 70 * 60 },
     });
     // Recall's own default (2 s) ends the bot, and with it the call, when everyone left.
     expect(body.automatic_leave.everyone_left_timeout).toBeUndefined();
@@ -112,12 +113,42 @@ describe('createRecallMeetBridge', () => {
     expect(log.error).toHaveBeenCalledWith('meet-recall: the bot did not leave its meeting', expect.anything());
   });
 
-  it('takes a refused leave as a bot already gone: no retry, no error', async () => {
+  it.each([400, 404, 410])('takes a %i leave as a bot already gone: no retry, no error', async (status) => {
     vi.mocked(log.error).mockClear();
-    const gone = respond(json(400, { detail: 'Bot is not in a call.' }));
+    const gone = respond(json(status, { detail: 'Bot is not in a call.' }));
     await createRecallMeetBridge(config(gone)).leave('gone');
     expect(gone).toHaveBeenCalledTimes(1);
     expect(log.error).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403])('logs a %i leave as an error and does not retry it', async (status) => {
+    vi.mocked(log.error).mockClear();
+    const denied = respond(json(status, { detail: 'Invalid token.' }));
+    await createRecallMeetBridge(config(denied)).leave('bot-1');
+    expect(denied).toHaveBeenCalledTimes(1);
+    expect(log.error).toHaveBeenCalledWith('meet-recall: the bot did not leave its meeting', expect.anything());
+  });
+
+  it("retries a 408 or 429 leave after Recall's Retry-After, bounded", async () => {
+    const waits: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+      waits.push(ms ?? 0);
+      return realSetTimeout(fn, 0);
+    }) as typeof setTimeout);
+    try {
+      const busy = respond(json(429, 'slow down', { 'Retry-After': '2' }), json(408, 'timeout'), json(200, {}));
+      await createRecallMeetBridge(config(busy, { retryDelayMs: () => 7 })).leave('bot-1');
+      expect(busy).toHaveBeenCalledTimes(3);
+      expect(waits).toEqual([2000, 7]);
+
+      waits.length = 0;
+      const long = respond(json(429, 'slow down', { 'Retry-After': '3600' }), json(200, {}));
+      await createRecallMeetBridge(config(long)).leave('bot-2');
+      expect(waits).toEqual([30_000]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('refuses on a 4xx with the status and a redacted body, and looks for no bot', async () => {
@@ -154,6 +185,32 @@ describe('createRecallMeetBridge', () => {
       'POST https://eu-central-1.recall.ai/api/v1/bot/bot-a/leave_call/',
       'POST https://eu-central-1.recall.ai/api/v1/bot/bot-b/leave_call/',
     ]);
+  });
+
+  it('looks for the room bots once more a little later, for a bot Recall was still making', async () => {
+    const fetchMock = respond(
+      new Error('ECONNRESET'),
+      json(200, { next: null, results: [] }),
+      json(200, { next: null, results: [{ id: 'bot-late' }] }),
+      json(200, {}),
+    );
+    await expect(createRecallMeetBridge(config(fetchMock, { resweepDelayMs: 20 })).join(join)).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    expect(fetchMock.mock.calls.map(([url, init]) => `${init?.method} ${String(url)}`).slice(2)).toEqual([
+      'GET https://eu-central-1.recall.ai/api/v1/bot/?metadata__nanoclaw_room=meet-r1',
+      'POST https://eu-central-1.recall.ai/api/v1/bot/bot-late/leave_call/',
+    ]);
+  });
+
+  it('logs a bot list it cannot read instead of taking it as empty', async () => {
+    vi.mocked(log.error).mockClear();
+    const fetchMock = respond(new Error('ECONNRESET'), json(200, '<html>'));
+    await expect(createRecallMeetBridge(config(fetchMock)).join(join)).rejects.toThrow('ECONNRESET');
+    expect(log.error).toHaveBeenCalledWith(
+      'meet-recall: Recall listed the bots in a form it does not know',
+      expect.objectContaining({ roomName: 'meet-r1' }),
+    );
   });
 
   it('still reports the failed create when the bot lookup fails', async () => {

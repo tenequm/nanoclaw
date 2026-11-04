@@ -85,7 +85,7 @@
         document.title = label;
         avatar.textContent = label.charAt(0).toUpperCase();
 
-        // Exposed for Recall Remote DevTools and the local check.
+        // Exposed for Recall's Remote DevTools.
         const state = (window.__bridge = { status: 'starting', published: false, playing: 0, error: null });
         const setStatus = (text, error) => {
           state.status = text;
@@ -212,11 +212,14 @@
 
         async function connect() {
           if (stopped) return;
-          const r = new Room({ adaptiveStream: false, dynacast: false });
-          room = r;
-          wire(r);
           setStatus(attempt ? 'Reconnecting' : 'Connecting');
+          let r = null;
           try {
+            // The meeting's audio before the room: a caller that joins and fails then leaves, which ends the call.
+            await meetingAudio();
+            r = new Room({ adaptiveStream: false, dynacast: false });
+            room = r;
+            wire(r);
             await r.connect(wsUrl, token, CONNECT_OPTIONS);
             await republish(r);
             attempt = 0;
@@ -224,9 +227,11 @@
             refresh();
           } catch (err) {
             console.error('meet-recall-bridge: connect failed', err);
-            if (room === r) room = null;
-            clearPlayers();
-            await r.disconnect().catch(() => {});
+            if (r) {
+              if (room === r) room = null;
+              clearPlayers();
+              await r.disconnect().catch(() => {});
+            }
             scheduleRetry();
             setStatus('Reconnecting', err && err.message ? err.message : String(err));
           }

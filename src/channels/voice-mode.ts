@@ -42,6 +42,7 @@ import {
   chatLabel,
   createLiveKitVoice,
   JSON_HEADERS,
+  MINUTE_MS,
   readJsonObject,
   reply,
   type CallKind,
@@ -96,7 +97,6 @@ import {
   type TtsSaved,
 } from '../voice-mode-tts.js';
 
-const MINUTE_MS = 60_000;
 /** How often a running call rechecks that its caller may still use the line. */
 const ACCESS_CHECK_INTERVAL_MS = 5000;
 const HOUR_MS = 3_600_000;

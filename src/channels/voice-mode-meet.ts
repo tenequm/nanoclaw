@@ -21,7 +21,13 @@ import { getUser } from '../modules/permissions/db/users.js';
 import { registerMessageInterceptor } from '../router.js';
 import { encryptionKey } from '../secret-seal.js';
 import type { MessagingGroup } from '../types.js';
-import { bridgeIdentity, type RecallMeetBridge } from './meet-recall.js';
+import {
+  bridgeIdentity,
+  MEETING_JOIN_TIMEOUT_MS,
+  MEETING_MAX_DURATION_MS,
+  MEETING_SENDER,
+  type RecallMeetBridge,
+} from './meet-recall.js';
 import type { VoiceModeChannelAdapter } from './voice-mode.js';
 import {
   administeredWirings,
@@ -36,15 +42,8 @@ import {
 import { linePlatformId } from './voice-mode-line.js';
 import type { CallKind, CallRefusal, LiveKitVoice } from './voice-mode-livekit.js';
 
-const MINUTE_MS = 60_000;
-/** A meeting bot can wait in the meeting's lobby until someone admits it. */
-export const MEETING_JOIN_TIMEOUT_MS = 10 * MINUTE_MS;
-/** A meeting runs longer than a call: this cap, under the line's daily minutes, instead of the call cap. */
-export const MEETING_MAX_DURATION_MS = 60 * MINUTE_MS;
 /** The worker and the bridge page, with room for the page to reconnect before its old self is gone. */
 const MEETING_MAX_PARTICIPANTS = 3;
-/** Who a meeting turn comes from: anyone in the meeting may have spoken. */
-const MEETING_SENDER = 'Meeting';
 /** A `/meet ... jev` call's rolling transcript, in lines, that the Jev gate reads a candidate against. */
 export const MEETING_JEV_HISTORY_LINES = 12;
 /** An agent line in that transcript is clipped: the gist is enough to tell what was already answered. */

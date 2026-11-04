@@ -50,8 +50,7 @@ import { getWebhookStatus, stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './voice-mode-page.js';
 import type { VoiceCatalog, VoiceStatus } from './voice-mode-tts-catalog.js';
 import { linePlatformId } from './voice-mode-line.js';
-import type { RecallMeetBridge } from './meet-recall.js';
-import { MEETING_MAX_DURATION_MS } from './voice-mode-meet.js';
+import { MEETING_MAX_DURATION_MS, type RecallMeetBridge } from './meet-recall.js';
 
 /** A line /voice made: its calls need a chat to talk in. */
 const LINE = linePlatformId('0123456789ab');

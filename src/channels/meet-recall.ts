@@ -7,14 +7,28 @@
 import { AccessToken, TrackSource } from 'livekit-server-sdk';
 
 import { log } from '../log.js';
+import { MINUTE_MS } from './voice-mode-livekit.js';
 
-export const RECALL_REGIONS = ['us-east-1', 'us-west-2', 'eu-central-1', 'ap-northeast-1'] as const;
+const RECALL_REGIONS = ['us-east-1', 'us-west-2', 'eu-central-1', 'ap-northeast-1'] as const;
 export type RecallRegion = (typeof RECALL_REGIONS)[number];
+
+/** A meeting bot can wait in the meeting's lobby until someone admits it. */
+export const MEETING_JOIN_TIMEOUT_MS = 10 * MINUTE_MS;
+/** A meeting runs longer than a call: this cap, under the line's daily minutes, instead of the call cap. */
+export const MEETING_MAX_DURATION_MS = 60 * MINUTE_MS;
+/** Who the bridge page is in the room, and who a meeting turn comes from: anyone in the meeting may have spoken. */
+export const MEETING_SENDER = 'Meeting';
 
 const DEFAULT_REGION: RecallRegion = 'eu-central-1';
 const BRIDGE_TOKEN_TTL_SECONDS = 3 * 60 * 60;
+/** A bot the host never sent away (it crashed) leaves on its own once the longest meeting call is over. */
+const BOT_NOT_RECORDING_TIMEOUT_SECONDS = (MEETING_JOIN_TIMEOUT_MS + MEETING_MAX_DURATION_MS) / 1000;
 const RECALL_REQUEST_TIMEOUT_MS = 15_000;
 const LEAVE_ATTEMPTS = 3;
+/** The longest wait between leave attempts, whatever Recall's Retry-After asks. */
+const MAX_LEAVE_RETRY_DELAY_MS = 30_000;
+/** Recall can still be making a bot when the first look for it after an unanswered create comes back empty. */
+const RESWEEP_DELAY_MS = 20_000;
 /** The bot metadata key that names the call's room, so a bot whose create never answered can be found. */
 const ROOM_METADATA_KEY = 'nanoclaw_room';
 
@@ -27,10 +41,10 @@ export interface RecallMeetConfig {
   livekitUrl: string;
   livekitApiKey: string;
   livekitApiSecret: string;
-  tokenTtlSeconds?: number;
   /** Test seams. */
   fetch?: typeof fetch;
   retryDelayMs?: (attempt: number) => number;
+  resweepDelayMs?: number;
 }
 
 /** The Recall bots of `/meet` calls; faked in tests. */
@@ -47,13 +61,13 @@ export function bridgeIdentity(roomName: string): string {
 }
 
 export async function mintBridgeToken(
-  config: Pick<RecallMeetConfig, 'livekitApiKey' | 'livekitApiSecret' | 'tokenTtlSeconds'>,
+  config: Pick<RecallMeetConfig, 'livekitApiKey' | 'livekitApiSecret'>,
   roomName: string,
 ): Promise<string> {
   const at = new AccessToken(config.livekitApiKey, config.livekitApiSecret, {
     identity: bridgeIdentity(roomName),
-    name: 'Meeting',
-    ttl: config.tokenTtlSeconds ?? BRIDGE_TOKEN_TTL_SECONDS,
+    name: MEETING_SENDER,
+    ttl: BRIDGE_TOKEN_TTL_SECONDS,
   });
   at.addGrant({
     roomJoin: true,
@@ -77,8 +91,30 @@ export function buildBridgePageUrl(
   return url.toString();
 }
 
-/** Recall answered with an HTTP error: it said what happened, so nothing is left to find. */
-class RecallRefusal extends Error {}
+/** Recall answered with an HTTP error; `retryAfterMs` is its Retry-After, when it sent one. */
+class RecallHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryAfterMs: number | null,
+  ) {
+    super(message);
+  }
+}
+
+/** Retry-After as seconds or an HTTP date, in ms; null when absent or unreadable. */
+function retryAfterMs(header: string | null): number | null {
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const at = Date.parse(header);
+  return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
+}
+
+/** A leave Recall refused because the bot is not in a call any more (it left on its own, or never got in). */
+const BOT_GONE_STATUSES = new Set([400, 404, 410]);
+/** A leave worth trying again: Recall was busy, or did not answer in time. */
+const RETRIED_STATUSES = new Set([408, 429]);
 
 export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBridge {
   if (!RECALL_REGIONS.includes(config.region)) throw new Error(`meet-recall: unknown Recall region ${config.region}`);
@@ -86,9 +122,10 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
   assertUrl('MEET_RECALL_LIVEKIT_URL', config.livekitUrl, 'wss:');
   const doFetch = config.fetch ?? fetch;
   const retryDelayMs = config.retryDelayMs ?? ((attempt: number) => 1000 * 2 ** attempt);
+  const resweepDelayMs = config.resweepDelayMs ?? RESWEEP_DELAY_MS;
   const base = `https://${config.region}.recall.ai/api/v1`;
 
-  /** The response body as JSON; undefined when it is not JSON. */
+  /** The response body as JSON; null when it is empty, undefined when it is not JSON. */
   async function recall(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
     const res = await doFetch(`${base}${path}`, {
       method,
@@ -106,8 +143,7 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
       // Recall may echo the page URL, which carries the LiveKit token.
       const detail = text.slice(0, 500).replace(/token=[^&"\s]+/g, 'token=REDACTED');
       const message = `meet-recall: ${method} ${path} failed with ${res.status}: ${detail}`;
-      // A server error may come after the bot was made: only a 4xx is a clear no.
-      throw res.status < 500 ? new RecallRefusal(message) : new Error(message);
+      throw new RecallHttpError(message, res.status, retryAfterMs(res.headers.get('retry-after')));
     }
     if (!text) return null;
     try {
@@ -123,16 +159,19 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
         await recall('POST', `/bot/${encodeURIComponent(botId)}/leave_call/`);
         return;
       } catch (err) {
+        const status = err instanceof RecallHttpError ? err.status : undefined;
         // A bot that already left on its own (everyone left the meeting) is refused, not missed.
-        if (err instanceof RecallRefusal) {
+        if (status !== undefined && BOT_GONE_STATUSES.has(status)) {
           log.info('meet-recall: Recall refused the leave; the bot is likely gone already', { botId, err });
           return;
         }
-        if (attempt === LEAVE_ATTEMPTS - 1) {
+        const retried = status === undefined || status >= 500 || RETRIED_STATUSES.has(status);
+        if (!retried || attempt === LEAVE_ATTEMPTS - 1) {
           log.error('meet-recall: the bot did not leave its meeting', { botId, err });
           return;
         }
-        await new Promise((resolve) => setTimeout(resolve, retryDelayMs(attempt)).unref());
+        const delayMs = (err instanceof RecallHttpError ? err.retryAfterMs : null) ?? retryDelayMs(attempt);
+        await new Promise((resolve) => setTimeout(resolve, Math.min(delayMs, MAX_LEAVE_RETRY_DELAY_MS)).unref());
       }
     }
   }
@@ -142,7 +181,11 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
     try {
       const query = new URLSearchParams({ [`metadata__${ROOM_METADATA_KEY}`]: roomName });
       const listed = (await recall('GET', `/bot/?${query.toString()}`)) as { results?: unknown } | null | undefined;
-      const ids = (Array.isArray(listed?.results) ? listed.results : []).flatMap((bot: unknown) => {
+      if (!Array.isArray(listed?.results)) {
+        log.error('meet-recall: Recall listed the bots in a form it does not know', { roomName });
+        return;
+      }
+      const ids = listed.results.flatMap((bot: unknown) => {
         const id = (bot as { id?: unknown } | null)?.id;
         return typeof id === 'string' && id ? [id] : [];
       });
@@ -150,6 +193,12 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
     } catch (err) {
       log.error('meet-recall: could not look for a bot whose create did not answer', { roomName, err });
     }
+  }
+
+  /** sweep now, and once more later in the background for a bot Recall was still making. */
+  async function sweepTwice(roomName: string): Promise<void> {
+    setTimeout(() => void sweep(roomName), resweepDelayMs).unref();
+    await sweep(roomName);
   }
 
   return {
@@ -167,15 +216,16 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
           // The mixed mp4 is on by default; nothing here needs a recording or a transcript.
           recording_config: { video_mixed_mp4: null },
           // Default is 1h; a bot without a recording artifact may count as "not recording".
-          automatic_leave: { in_call_not_recording_timeout: BRIDGE_TOKEN_TTL_SECONDS },
+          automatic_leave: { in_call_not_recording_timeout: BOT_NOT_RECORDING_TIMEOUT_SECONDS },
         });
       } catch (err) {
-        if (!(err instanceof RecallRefusal)) await sweep(roomName);
+        // A server error may come after the bot was made: only a 4xx is a clear no.
+        if (!(err instanceof RecallHttpError && err.status < 500)) await sweepTwice(roomName);
         throw err;
       }
       const botId = (bot as { id?: unknown } | null | undefined)?.id;
       if (typeof botId !== 'string' || !botId) {
-        await sweep(roomName);
+        await sweepTwice(roomName);
         throw new Error('meet-recall: Recall returned no bot id');
       }
       return { botId };
