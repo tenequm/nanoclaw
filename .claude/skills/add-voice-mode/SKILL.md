@@ -312,6 +312,24 @@ line's `/voice` chat and must stay wired to the line's agent: with no usable
 chat a call is refused at start, and a running call on it ends, until `/voice`
 runs in a chat with the agent. There is no fallback chat.
 
+`/meet <Google Meet link>` (Slack `!meet`) takes the agent into a meeting as
+a voice participant, with `/voice`'s rules: an owner or admin of the chat's one
+agent, on their own line (created here on first use), and this chat becomes the
+call chat. A [Recall.ai](https://docs.recall.ai/docs/stream-media) bot named
+after the agent joins the meeting, running
+`assets/meet-recall-bridge/index.html` as its camera; someone admits it from
+the lobby (10 minutes). The page joins the call's room as the call's caller:
+it publishes the meeting's audio and plays the agent's speech and cues into
+the meeting. The meeting wakes on `VOICE_MODE_WAKE_PHRASE`'s name (`Hey Dan`
+without one) and a turn ends on the send word; `/meet <link> pause` makes a
+pause send it too, and `/meet <link> jev` lets the Jev gate let the agent join
+in unaddressed. Meeting turns come from "Meeting", never from the line's
+caller, so they carry no role. The meeting runs up to 60 minutes under the
+line's daily minutes and ends when everyone left the meeting (Recall's bot
+leaves, the page with it), on `/meet leave`, or when a call on the line's link
+replaces it. A meeting records nothing, whatever the recording settings say,
+and the bot keeps no recording (`video_mixed_mp4: null`).
+
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use
 fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
@@ -333,12 +351,16 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_VOCABULARY` | empty | Comma-separated names, merged with the agent's `voice.vocabulary.txt`. |
 | `VOICE_MODE_TTS_DEESS`, `VOICE_MODE_TTS_NOTCH` | on | De-essing and fixed whistle notches; `off`, `false` or `0` disables each. |
 | `VOICE_MODE_WAKE_MODEL` | bundled `hey_livekit.onnx` | Custom acoustic classifier path, or `off` for transcript wake. |
-| `VOICE_MODE_WAKE_PHRASE` | `Hey LiveKit` | Label of the acoustic phrase; it does not train or change the model. |
+| `VOICE_MODE_WAKE_PHRASE` | `Hey LiveKit` | Label of the acoustic phrase; it does not train or change the model. Its name (`Hey Dan`: `Dan`) is also the one name a `/meet` meeting wakes on, `Dan` when the phrase names none. |
 | `VOICE_MODE_WAKE_THRESHOLD` | `0.68` bundled, `0.5` custom | Acoustic confidence threshold between zero and one. |
 | `VOICE_MODE_WAKE_HOP_MS` | `40` | Acoustic scoring hop, `40` or `80` milliseconds; anything else is logged and read as `40`. `40` scores on two interleaved 80 ms grids, about 30% of one core during a call. |
 | `VOICE_MODE_WAKE_START_SECONDS`, `VOICE_MODE_WAKE_IDLE_SECONDS` | `8`, `20` | After the wake phrase, how long the wake waits for the caller's first speech, then how long after the caller's last speech, before it goes back to waiting; zero disables each timer. |
 | `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`. |
 | `VOICE_MODE_CALL_RECORDING` | off | Debug: `true` or `1` also records each caller's whole call, waiting for the wake phrase included, as `data/voice-recordings/<agent>/<date>/<callId>-call.wav` (16 kHz mono, the agent's speech as silence) with a `.json` of wake detections. Local only, owner-only files; pruned by `VOICE_MODE_RECORDINGS_DAYS` when that is set, kept otherwise. |
+| `RECALL_API_KEY` | none | Recall.ai API key; `/meet` is off without it, or with the two URLs below missing or invalid. |
+| `RECALL_REGION` | `eu-central-1` | Recall.ai region: `us-east-1`, `us-west-2`, `eu-central-1` or `ap-northeast-1`. |
+| `MEET_RECALL_PAGE_URL` | none | Public `https` URL where `assets/meet-recall-bridge/index.html` is served; the Recall bot runs it as its camera, its settings in the URL hash. |
+| `MEET_RECALL_LIVEKIT_URL` | none | Public `wss` URL of this LiveKit, reachable from Recall's cloud; the bridge page joins the room with it. The LiveKit key pair is `LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET`. |
 | `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | Worker health on loopback. |
 | `VOICE_MODE_UI` | empty | Page options: skin, colorway, layout, presence, brand, footer, shortcuts, timestamps, colorwayPicker. |
 
