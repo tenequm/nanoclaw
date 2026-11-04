@@ -2274,14 +2274,25 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
     );
   });
 
-  it('takes Recall events from before the bot create answers: the endpoint is registered first', async () => {
+  it('takes the Recall socket before the bot create answers, its events only once the call is live', async () => {
+    let recall: WebSocket | undefined;
     beforeCreate = async ({ participantAudio }) => {
-      const ws = await connect(participantAudio!.websocketUrl);
-      ws.send(JSON.stringify(chatLine(ALEX, 'hello all')));
-      await vi.waitFor(() => expect(seen).toHaveLength(1));
+      recall = await connect(participantAudio!.websocketUrl);
+      // The frame after it opens a pipeline: the chat line before it was handled by then.
+      recall.send(JSON.stringify(chatLine(ALEX, 'before the caller joined')));
+      recall.send(JSON.stringify(frame(ALEX, 1)));
+      await vi.waitFor(() => expect(vads).toHaveLength(1));
     };
     expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
-    expect(seen[0]).toMatchObject({ kind: 'chat', speaker: { id: '100', name: 'Alex' }, text: 'hello all' });
+    expect(seen).toEqual([]);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    expect((await worker.post('joined')).status).toBe(200);
+    recall!.send(JSON.stringify(chatLine(ALEX, 'hello all')));
+    await vi.waitFor(() => expect(seen.filter((e) => e.kind === 'chat')).toHaveLength(1));
+    expect(seen.find((e) => e.kind === 'chat')).toMatchObject({
+      speaker: { id: '100', name: 'Alex' },
+      text: 'hello all',
+    });
   });
 
   it("transcribes each participant with the call's speech settings, never the bot; a wake is a guest turn with the meeting note", async () => {

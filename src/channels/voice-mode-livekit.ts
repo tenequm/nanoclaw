@@ -398,7 +398,10 @@ export interface LiveKitVoice {
   endCall(platformId: string, callId: unknown, reason: string, options?: { grace?: boolean }): Promise<void>;
   /** Whether `callId` is still the line's running call: not ended, not replaced. */
   isLive(platformId: string, callId: string): boolean;
-  /** The jev loop of the running call `callId`, for a source outside the worker (a meeting's Recall transcript). */
+  /**
+   * The jev loop of the call `callId` while it is live, for a source outside the worker (a meeting's
+   * transcript from the host's per-participant transcription); undefined before the caller joined.
+   */
   jevCall(callId: string): JevCall | undefined;
   /** An agent message reached a chat: speak it on the live call that talks there. `replyTo`: the call turn it answers. */
   chatMessage(
@@ -1300,7 +1303,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
     jevCall(callId) {
       const call = findCall(callId);
-      return call && !call.ended ? call.jev : undefined;
+      return call && !call.ended && call.state === 'live' ? call.jev : undefined;
     },
 
     chatMessage(chat, agentGroupId, text, replyTo) {
