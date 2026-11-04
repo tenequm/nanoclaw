@@ -5,6 +5,7 @@
  *   /{segment}[/...]       -> raw handler from registerRootHandler(segment, ...)
  *   /webhook/{adapterName} → chat.webhooks[adapterName](request)
  *   /webhook/{path}        → raw handler from registerWebhookHandler(path, ...)
+ *   upgrade /{segment}[/...] -> handler from registerUpgradeHandler(segment, ...)
  *
  * Multiple Chat instances can register adapters — each adapter name maps
  * to its owning Chat instance. Raw routes let modules receive non-Chat-SDK
@@ -15,6 +16,7 @@
  */
 import http from 'http';
 import { randomUUID } from 'node:crypto';
+import type { Duplex } from 'node:stream';
 
 import type { Chat } from 'chat';
 
@@ -32,6 +34,11 @@ export type RawWebhookHandler = (req: http.IncomingMessage, res: http.ServerResp
 const routes = new Map<string, WebhookEntry>();
 const rawRoutes = new Map<string, RawWebhookHandler>();
 const rootRoutes = new Map<string, RawWebhookHandler>();
+/** Owns the socket of an HTTP upgrade (a websocket) from the first byte; `head` is what was read past the headers. */
+export type UpgradeHandler = (req: http.IncomingMessage, socket: Duplex, head: Buffer) => void;
+const upgradeRoutes = new Map<string, UpgradeHandler>();
+/** Sockets handed to upgrade handlers: server.close() waits for every connection, and a websocket stays open. */
+const upgradedSockets = new Set<Duplex>();
 let server: http.Server | null = null;
 let listenerId: string | null = null;
 
@@ -141,6 +148,42 @@ export function registerRootHandler(segment: string, handler: RawWebhookHandler)
   log.info('Root handler registered', { path: `/${segment}` });
 }
 
+/**
+ * Register an upgrade handler at /{segment} and every path below it; the handler owns the socket.
+ * The server listens for upgrades only once one is registered: until then an upgrade request
+ * reaches the request routes as it always has. After that, an upgrade to any other segment is
+ * answered 404 and its socket destroyed.
+ *
+ * Starts the server lazily on first call.
+ */
+export function registerUpgradeHandler(segment: string, handler: UpgradeHandler): void {
+  if (segment === 'webhook' || !/^[^/?#]+$/.test(segment)) throw new Error(`Invalid upgrade route segment: ${segment}`);
+  upgradeRoutes.set(segment, handler);
+  ensureServer();
+  if (server && server.listenerCount('upgrade') === 0) server.on('upgrade', dispatchUpgrade);
+  log.info('Upgrade handler registered', { path: `/${segment}` });
+}
+
+function dispatchUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer): void {
+  // Node detaches its own socket listeners on upgrade; an unhandled 'error' would crash the host.
+  socket.on('error', (err) => log.debug('Upgrade socket error', { url: req.url, err }));
+  const segment = (req.url || '/').match(/^\/([^/?#]+)/)?.[1];
+  const handler = segment === undefined ? undefined : upgradeRoutes.get(segment);
+  if (!handler) {
+    socket.once('finish', () => socket.destroy());
+    socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    return;
+  }
+  upgradedSockets.add(socket);
+  socket.once('close', () => upgradedSockets.delete(socket));
+  try {
+    handler(req, socket, head);
+  } catch (err) {
+    log.error('Upgrade handler error', { url: req.url, err });
+    socket.destroy();
+  }
+}
+
 function ensureServer(): void {
   if (server) return;
 
@@ -205,6 +248,7 @@ function ensureServer(): void {
   // release that singleton, though, or later registrations can never retry.
   server = candidate;
   listenerId = id;
+  if (upgradeRoutes.size > 0) candidate.on('upgrade', dispatchUpgrade);
   candidate.on('error', (err) => {
     if (!candidate.listening && server === candidate) server = null;
     log.error('Webhook server error', { host, port, err });
@@ -218,11 +262,15 @@ function ensureServer(): void {
 /** Shut down the webhook server. */
 export async function stopWebhookServer(): Promise<void> {
   if (server) {
-    await new Promise<void>((resolve) => server!.close(() => resolve()));
+    const closed = new Promise<void>((resolve) => server!.close(() => resolve()));
+    for (const socket of upgradedSockets) socket.destroy();
+    upgradedSockets.clear();
+    await closed;
     server = null;
     routes.clear();
     rawRoutes.clear();
     rootRoutes.clear();
+    upgradeRoutes.clear();
     log.info('Webhook server stopped');
   }
 }
