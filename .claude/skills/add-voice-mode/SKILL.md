@@ -306,6 +306,14 @@ reachable DM the answer carries no link. A link minted before links were
 sealed shows after its next call. Do not paste links into shared chats, agent
 messages or logs.
 
+With the Jev gate's `JEV_API_KEY` set, a line's calls run the meet-jev loop
+(`src/modules/meet-jev/`) by default: the agent decides from the conversation
+when to answer, with no review mode or spoken commands. `/voice plain` turns the
+line to the wake phrase and send word until the caller sends `/voice` (or
+`/voice jev`) again; that opt-out lives in host memory, so a host restart
+returns the line to jev. A client's `?jev=0` on `livekit/token` makes one call
+plain, and `?jev=1` one jev call. Without the key every call is plain.
+
 Calls use the caller's core role, checked at start, every turn and every five
 seconds. A revoked role or changed token ends the call. The call chat is the
 line's `/voice` chat and must stay wired to the line's agent: with no usable
@@ -320,14 +328,15 @@ after the agent joins the meeting, running
 `assets/meet-recall-bridge/index.html` as its camera; someone admits it from
 the lobby (10 minutes). The page joins the call's room as the call's caller:
 it publishes the meeting's audio and plays the agent's speech and cues into
-the meeting. The meeting wakes on `VOICE_MODE_WAKE_PHRASE`'s name (`Hey Dan`
-without one) and a turn ends on the send word; `/meet <link> pause` makes a
-pause send it too. `/meet <link> jev` runs the meet-jev loop instead
-(`src/modules/meet-jev/`): Recall streams each participant's own audio to
-`/voice/recall/<callId>/` on the webhook port, the host transcribes each one
-with its own Silero VAD and Gemini Live session (the call's languages), and Jev
-decides when the agent answers, addressed or invited. Meeting turns come from "Meeting", never from the line's
-caller, so they carry no role. The meeting runs up to 60 minutes under the
+the meeting. With `JEV_API_KEY` set the meeting runs the meet-jev loop
+(`src/modules/meet-jev/`) by default (`/meet <link> jev` says so too): Recall
+streams each participant's own audio to `/voice/recall/<callId>/` on the
+webhook port, the host transcribes each one with its own Silero VAD and Gemini
+Live session (the call's languages), and Jev decides when the agent answers,
+addressed or invited. `/meet <link> send`, and the default without the key,
+wakes on `VOICE_MODE_WAKE_PHRASE`'s name (`Hey Dan` without one) and ends a
+turn on the send word; `/meet <link> pause` makes a pause send it too. Meeting
+turns come from "Meeting", never from the line's caller, so they carry no role. The meeting runs up to 60 minutes under the
 line's daily minutes and ends when everyone left the meeting (Recall's bot
 leaves, the page with it), on `/meet leave`, or when a call on the line's link
 replaces it. A meeting records nothing here, whatever the recording settings
