@@ -177,6 +177,7 @@ export function createRecallTranscripts(
         log: {
           info: (msg: string, fields?: unknown) => log.info(msg, { callId, ...(fields as object) }),
           warn: (msg: string, fields?: unknown) => log.warn(msg, { callId, ...(fields as object) }),
+          debug: (msg: string, fields?: unknown) => log.debug(msg, { callId, ...(fields as object) }),
         },
       });
       const url = recallEndpointUrl(origin, ingress.register(callId, { botName }));

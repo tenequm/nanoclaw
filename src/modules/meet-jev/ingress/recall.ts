@@ -129,9 +129,9 @@ export class RecallTranslator {
     const at = relative === null || this.anchorMs === null ? arrivalMs : Math.round(this.anchorMs + relative * 1000);
     switch (event) {
       case RECALL_AUDIO_EVENT: {
-        if (typeof data.buffer !== 'string' || !data.buffer) return [];
-        const pcm = decodePcm(data.buffer);
-        return pcm.length ? [{ type: 'audio', speaker, pcm, at }] : [];
+        // An empty buffer (a silent, unmuted participant) still goes out: its arrival is cadence.
+        if (typeof data.buffer !== 'string') return [];
+        return [{ type: 'audio', speaker, pcm: decodePcm(data.buffer), at }];
       }
       case 'participant_events.join':
         return [{ type: 'presence', speaker, joined: true, at }];

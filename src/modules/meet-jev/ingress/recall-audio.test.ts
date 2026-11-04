@@ -5,6 +5,7 @@ import type { Heard, TranscriberOptions } from '../../../voice-mode-gemini-live.
 import type { CallEvent, Speaker } from '../core/types.js';
 import {
   AUDIO_GAP_MS,
+  CADENCE_LOG_MS,
   createMeetingAudio,
   PARTICIPANT_IDLE_MS,
   sileroDetectors,
@@ -37,6 +38,8 @@ function harness(overrides: Partial<MeetingAudioOptions> = {}) {
   const stts: FakeStt[] = [];
   const events: CallEvent[] = [];
   const warnings: string[] = [];
+  const infos: Array<[string, Record<string, unknown>]> = [];
+  const debugs: Array<[string, Record<string, unknown>]> = [];
   let words = 0;
   const clock = { now: T0 };
   const detector: SpeechDetectorFactory = (e) => {
@@ -71,7 +74,11 @@ function harness(overrides: Partial<MeetingAudioOptions> = {}) {
     },
     onEvent: (event) => void events.push(event),
     onWords: () => void words++,
-    log: { info: () => undefined, warn: (msg: string) => void warnings.push(msg) },
+    log: {
+      info: (msg: string, fields?: unknown) => void infos.push([msg, fields as Record<string, unknown>]),
+      warn: (msg: string) => void warnings.push(msg),
+      debug: (msg: string, fields?: unknown) => void debugs.push([msg, fields as Record<string, unknown>]),
+    },
     now: () => clock.now,
     ...overrides,
   });
@@ -86,7 +93,7 @@ function harness(overrides: Partial<MeetingAudioOptions> = {}) {
           ? `${e.speaker.id}:${e.uttId}:${e.final ? 'final' : 'partial'}:${e.text}`
           : e.kind,
     );
-  return { audio, vads, stts, events, warnings, clock, frame, summary, words: () => words };
+  return { audio, vads, stts, events, warnings, infos, debugs, clock, frame, summary, words: () => words };
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -252,6 +259,38 @@ describe('createMeetingAudio', () => {
     unloaded.frame(alex, 100, T0 + 100);
     expect(unloaded.audio.pipelines).toBe(0);
     expect(unloaded.warnings).toHaveLength(1);
+  });
+
+  it("logs each participant's frame cadence every CADENCE_LOG_MS at debug, and its totals at info when its pipeline closes", () => {
+    vi.useFakeTimers();
+    const h = harness();
+    h.frame(alex, 20, T0);
+    h.clock.now += 20;
+    h.audio.audio(alex, new Int16Array(0), T0 + 20);
+    h.clock.now += 500;
+    h.frame(alex, 20, T0 + 520);
+    vi.advanceTimersByTime(CADENCE_LOG_MS);
+    expect(h.debugs).toEqual([
+      [
+        'meet-jev audio: frame cadence',
+        { speaker: '100', ms: CADENCE_LOG_MS, frames: 3, bytes: 1_280, empty: 1, audioMs: 40, gaps: 1, maxGapMs: 500 },
+      ],
+    ]);
+    // A quiet window logs nothing.
+    vi.advanceTimersByTime(CADENCE_LOG_MS);
+    expect(h.debugs).toHaveLength(1);
+    h.audio.left(alex, T0 + 600);
+    expect(h.infos.at(-1)).toEqual([
+      'meet-jev audio: a participant pipeline closed',
+      {
+        speaker: '100',
+        why: 'left',
+        open: 0,
+        frames: { frames: 3, bytes: 1_280, empty: 1, audioMs: 40, gaps: 1, maxGapMs: 500 },
+      },
+    ]);
+    expect(JSON.stringify([h.debugs, h.infos])).not.toMatch(/pcm|buffer/);
+    h.audio.close();
   });
 
   it('closes the pipeline of a participant whose VAD failed', () => {

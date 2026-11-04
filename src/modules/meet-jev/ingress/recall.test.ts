@@ -109,7 +109,7 @@ describe('RecallTranslator', () => {
     ]);
   });
 
-  it('takes a participant beside the inner data too, and skips empty or missing buffers', () => {
+  it('takes a participant beside the inner data too; an empty buffer is an empty frame, a missing one none', () => {
     const beside = {
       event: 'audio_separate_raw.data',
       data: { data: { buffer: b64([9]), timestamp: stamp(2) }, participant: participant(BO), ...artifacts },
@@ -118,6 +118,7 @@ describe('RecallTranslator', () => {
     const missing = { ...frame(ALEX, 1, [1]), data: { data: { timestamp: stamp(1), participant: participant(ALEX) } } };
     expect(run([beside, empty, missing])).toEqual([
       { type: 'audio', speaker: bo, pcm: Int16Array.from([9]), at: START_MS + 2000 },
+      { type: 'audio', speaker: alex, pcm: new Int16Array(0), at: START_MS + 1000 },
     ]);
   });
 

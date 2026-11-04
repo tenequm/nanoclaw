@@ -28,6 +28,8 @@ const MAX_GAP_FILL_MS = 2_000;
 /** As the worker's PRE_ROLL_MS: the activity starts this far before the VAD's start of speech. */
 const PRE_ROLL_MS = 500;
 const RING_MS = 10_000;
+/** Each participant's frame cadence goes to the debug log this often, for the live test. */
+export const CADENCE_LOG_MS = 5_000;
 
 const samplesOf = (ms: number): number => Math.round((ms * SAMPLE_RATE) / 1000);
 const msOf = (samples: number): number => (samples * 1000) / SAMPLE_RATE;
@@ -60,7 +62,7 @@ export interface MeetingAudioOptions {
   onEvent(event: CallEvent): void;
   /** A participant's partial carried words: the worker reflex's text confirmation. */
   onWords(): void;
-  log: Pick<Console, 'info' | 'warn'>;
+  log: Pick<Console, 'info' | 'warn'> & { debug?(message: string, fields?: unknown): void };
   now?: () => number;
   idleMs?: number;
   maxPipelines?: number;
@@ -103,6 +105,41 @@ class Ring {
 }
 
 const audible = (pcm: Int16Array): boolean => pcm.some((v) => v !== 0);
+
+/** Frames as they arrived, never their audio: counts, sizes and the gaps between arrivals. */
+interface Counts {
+  frames: number;
+  bytes: number;
+  empty: number;
+  audioMs: number;
+  /** Arrival gaps over AUDIO_GAP_MS, and the longest one. */
+  gaps: number;
+  maxGapMs: number;
+}
+const noCounts = (): Counts => ({ frames: 0, bytes: 0, empty: 0, audioMs: 0, gaps: 0, maxGapMs: 0 });
+
+class Cadence {
+  private last?: number;
+  /** Since the last debug line. */
+  window = noCounts();
+  /** Since the participant's pipeline opened (or their first frame). */
+  total = noCounts();
+
+  add(samples: number, arrival: number): void {
+    const gap = this.last === undefined ? 0 : arrival - this.last;
+    this.last = arrival;
+    for (const c of [this.window, this.total]) {
+      c.frames++;
+      c.bytes += samples * 2;
+      if (!samples) c.empty++;
+      c.audioMs += msOf(samples);
+      if (gap > AUDIO_GAP_MS) c.gaps++;
+      c.maxGapMs = Math.max(c.maxGapMs, gap);
+    }
+  }
+}
+
+const rounded = (c: Counts): Counts => ({ ...c, audioMs: Math.round(c.audioMs) });
 
 class Pipeline {
   private readonly ring = new Ring();
@@ -279,14 +316,36 @@ export function createMeetingAudio(options: MeetingAudioOptions): MeetingAudio {
   const uttSeq = new Map<string, number>();
   /** Participants already told about once: no VAD yet, or over the cap. */
   const refused = new Set<string>();
+  const cadence = new Map<string, Cadence>();
   let closed = false;
+
+  const cadenceLog = setInterval(() => {
+    for (const [id, c] of cadence) {
+      if (!c.window.frames) continue;
+      options.log.debug?.('meet-jev audio: frame cadence', { speaker: id, ms: CADENCE_LOG_MS, ...rounded(c.window) });
+      c.window = noCounts();
+    }
+  }, CADENCE_LOG_MS);
+  cadenceLog.unref?.();
+
+  /** The pipeline's close line, with the frames since it opened. */
+  const closedLine = (id: string, why: string): void => {
+    const c = cadence.get(id);
+    options.log.info('meet-jev audio: a participant pipeline closed', {
+      speaker: id,
+      why,
+      open: pipelines.size,
+      ...(c ? { frames: rounded(c.total) } : {}),
+    });
+    if (c) c.total = noCounts();
+  };
 
   const drop = (id: string, why: string): void => {
     const pipeline = pipelines.get(id);
     if (!pipeline) return;
     pipelines.delete(id);
     pipeline.close();
-    options.log.info('meet-jev audio: a participant pipeline closed', { speaker: id, why, open: pipelines.size });
+    closedLine(id, why);
   };
 
   const open = (speaker: Speaker): Pipeline | null => {
@@ -318,7 +377,11 @@ export function createMeetingAudio(options: MeetingAudioOptions): MeetingAudio {
 
   return {
     audio(speaker, pcm, at) {
-      if (closed || !pcm.length) return;
+      if (closed) return;
+      let c = cadence.get(speaker.id);
+      if (!c) cadence.set(speaker.id, (c = new Cadence()));
+      c.add(pcm.length, opts.now());
+      if (!pcm.length) return;
       let pipeline = pipelines.get(speaker.id);
       if (!pipeline) {
         if (!audible(pcm)) return;
@@ -332,14 +395,11 @@ export function createMeetingAudio(options: MeetingAudioOptions): MeetingAudio {
       if (closed || !pipeline) return;
       pipelines.delete(speaker.id);
       pipeline.leave(at);
-      options.log.info('meet-jev audio: a participant pipeline closed', {
-        speaker: speaker.id,
-        why: 'left',
-        open: pipelines.size,
-      });
+      closedLine(speaker.id, 'left');
     },
     close() {
       closed = true;
+      clearInterval(cadenceLog);
       for (const id of [...pipelines.keys()]) drop(id, 'call ended');
     },
     get pipelines() {
