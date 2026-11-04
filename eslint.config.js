@@ -63,4 +63,20 @@ export default [
       '@typescript-eslint/no-misused-promises': 'error',
     },
   },
+  // The jev loop's core is pure: every decision is a function of the call's event log, so it
+  // replays from text fixtures. It imports only itself.
+  {
+    files: ['src/modules/meet-jev/core/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            { group: ['node:*', '@livekit/*', 'livekit-*', 'ws'], message: 'meet-jev core is pure: no I/O imports.' },
+            { group: ['../*', '!./*'], message: 'meet-jev core imports only from core/.' },
+          ],
+        },
+      ],
+    },
+  },
 ]

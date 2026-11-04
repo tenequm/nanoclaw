@@ -101,7 +101,40 @@ export interface LiveKitJobMetadata {
   joinTimeoutMs: number;
   /** A `/meet` call: the caller is the meeting's Recall bridge page. */
   meeting?: MeetingJob;
+  /**
+   * The call runs the jev loop (`/voice jev`): no turn state machine; the worker reports words,
+   * speech marks and playback on `agent/jev`, and speaks only what the host sends.
+   */
+  jev?: boolean;
 }
+
+/**
+ * What a jev call's worker reports on `POST agent/jev` as `{ callId, events: JevWorkerEvent[] }`,
+ * in order. `at` is the worker's epoch ms; the host converts. Speaker attribution is the host's:
+ * on `/voice jev` everything heard is the caller.
+ */
+export type JevWorkerEvent =
+  /** Words heard: partials of one `uttId` update it, its final replaces it. */
+  | { type: 'utterance'; uttId: string; text: string; final: boolean; at: number }
+  /** VAD start or end of speech on the call's input. */
+  | { type: 'speech'; on: boolean; at: number }
+  /**
+   * What became of a `reply` with a `replyId`: started playing, played out, aborted by the reflex
+   * or a `stop` (`cut_off`, with the approximate text that got out), or not synthesized (`failed`).
+   */
+  | {
+      type: 'playback';
+      replyId: string;
+      state: 'started' | 'completed' | 'cut_off' | 'failed';
+      delivered?: string;
+      at: number;
+    };
+
+/** Most events one `agent/jev` POST carries; the worker batches what piles up while one is in flight. */
+export const MAX_JEV_EVENTS_PER_POST = 64;
+
+/** The worker's participant attribute: "1" while the call runs the jev loop, "" otherwise. */
+export const CALL_JEV_ATTRIBUTE = 'nanoclaw.voice-mode.jev';
 
 /** One transcribed turn the worker posts to the host's `agent/utterance`. */
 export interface CallUtterance {
@@ -367,6 +400,8 @@ export interface ReviewRequest {
   cues?: boolean;
   /** For `settings`: the typing sound while the agent works (on unless the page says off; cues off silence it too). */
   typing?: boolean;
+  /** For `settings`: run the jev loop (true) or the turn state machine (false), from the next quiet moment on. */
+  jev?: boolean;
   /** For `settings`: the speech choice from the next line on, for this call only (the line's saved one is unchanged). */
   tts?: { provider: string; model?: string; voice?: string };
 }
@@ -477,9 +512,15 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * (`turn-stored`: its `turnKey` and the host's utterance id), the end of the
  * call, or a keepalive. A worker ignores a type it does not know, so new types
  * need no version bump.
+ *
+ * On a jev call the host sends only replies to speak, each with a `replyId` its playback reports
+ * name; `stop` aborts the line playing and drops the queue; `words` says a participant's words
+ * arrived, the reflex's text confirmation where the worker has no transcript of its own.
  */
 export type LiveKitHostEvent =
-  | { type: 'reply'; text: string; turn?: string | null }
+  | { type: 'reply'; text: string; turn?: string | null; replyId?: string }
+  | { type: 'stop' }
+  | { type: 'words' }
   | { type: 'thinking' }
   | { type: 'working' }
   | { type: 'chat'; chat: boolean }
