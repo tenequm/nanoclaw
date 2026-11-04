@@ -13,6 +13,7 @@ binding handles them at the adapter.
 | `/config` | Admin only | Bare `/config` opens the config menu (Model / Effort / Compact window / Activation / Restart). `/config set <field> <value>` writes one field. |
 | `/restart` | Admin only | Restarts the agent's running container(s) immediately. |
 | `/voice`, `/voice new` | Core owner or admin over the agent | Shows the sender their call link (creating the agent's line on first use) and makes this chat/topic where its calls talk. A line is shown and moved only by its caller. `new` replaces the sender's own link and ends calls using the old one. See the [voice mode skill](../.claude/skills/add-voice-mode/SKILL.md) and [upgrade runbook](2610-07-voice-mode-upgrade.md). |
+| `/meet <link> [pause] [jev]`, `/meet leave` | Core owner or admin over the chat's one agent | The agent joins a Google Meet as a voice participant through a Recall.ai bot, on the sender's own line, and this chat becomes where its calls talk. `pause` makes a pause end a turn, not only the send word; `jev` lets the [Jev gate](jev-gate.md) let it join in unaddressed. `leave` sends the bot away. See the [voice mode skill](../.claude/skills/add-voice-mode/SKILL.md). |
 
 ## Slack: the `!` prefix
 

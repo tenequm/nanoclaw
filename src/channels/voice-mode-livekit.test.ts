@@ -6,6 +6,7 @@
  */
 import http from 'node:http';
 import net, { type AddressInfo } from 'node:net';
+import { AccessToken } from 'livekit-server-sdk';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
@@ -24,6 +25,7 @@ import {
   type BoundCallChat,
   turnMessageText,
   CALL_CHAT_REPLY_NOTE,
+  callChatReplyNote,
   CALL_DEPTH_NOTE,
   CALL_LANGUAGE_NOTE,
   callLanguageNote,
@@ -50,6 +52,7 @@ import { getWebhookStatus, stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './voice-mode-page.js';
 import type { VoiceCatalog, VoiceStatus } from './voice-mode-tts-catalog.js';
 import { linePlatformId } from './voice-mode-line.js';
+import { MEETING_MAX_DURATION_MS, type RecallMeetBridge } from './meet-recall.js';
 
 /** A line /voice made: its calls need a chat to talk in. */
 const LINE = linePlatformId('0123456789ab');
@@ -59,6 +62,8 @@ const API_SECRET = 'fakesecretfakesecretfakesecretfakesecretfakesecr';
 
 interface FakeLiveKit extends LiveKitServerApi {
   rooms: string[];
+  /** Each created room's options, in order. */
+  roomOptions: Array<Parameters<LiveKitServerApi['createRoom']>[0]>;
   deleted: string[];
   dispatches: Array<{ room: string; agentName: string; metadata: LiveKitJobMetadata }>;
   /** Room metadata writes, in order. */
@@ -73,6 +78,7 @@ interface FakeLiveKit extends LiveKitServerApi {
 function fakeLiveKit(): FakeLiveKit {
   const fake: FakeLiveKit = {
     rooms: [],
+    roomOptions: [],
     deleted: [],
     dispatches: [],
     roomMetadata: [],
@@ -83,6 +89,7 @@ function fakeLiveKit(): FakeLiveKit {
       await fake.createGate;
       if (fake.failCreate) throw new Error('connection refused');
       fake.rooms.push(options.name);
+      fake.roomOptions.push(options);
       fake.ops.push(`create:${options.name}`);
       return {};
     },
@@ -1325,6 +1332,30 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.ops.lastIndexOf(`delete:${room}`)).toBeGreaterThan(h.lk.ops.indexOf(`create:${room}`));
   });
 
+  it('answers 409, not a token, to a call replaced while its token was being signed', async () => {
+    let release!: () => void;
+    const signing = new Promise<void>((r) => (release = r));
+    const sign = AccessToken.prototype.toJwt;
+    const spy = vi.spyOn(AccessToken.prototype, 'toJwt').mockImplementationOnce(async function (this: AccessToken) {
+      await signing;
+      return sign.call(this);
+    });
+    try {
+      const first = post(`${h.base}/livekit/token?v=6&t=tok123`);
+      await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+      const second = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+      expect(second.status).toBe(200);
+      release();
+      const answer = await first;
+      expect(answer.status).toBe(409);
+      expect(await answer.text()).toBe('This call attempt is no longer active');
+      const room = replacedRoom(h, (await second.json()) as TokenResponse);
+      await vi.waitFor(() => expect(h.lk.deleted).toContain(room));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('deletes the room when the page left while the room was being set up', async () => {
     let release!: () => void;
     h.lk.createGate = new Promise((r) => (release = r));
@@ -1907,6 +1938,12 @@ describe('turn message text', () => {
     expect(CALL_LANGUAGE_NOTE).toContain('never in Russian');
   });
 
+  it("builds a call's note for any language note, word for word as the default note with it swapped in", () => {
+    const note = callLanguageNote(['de-DE']);
+    expect(callChatReplyNote(note)).toBe(CALL_CHAT_REPLY_NOTE.replace(CALL_LANGUAGE_NOTE, note));
+    expect(callChatReplyNote(CALL_LANGUAGE_NOTE)).toBe(CALL_CHAT_REPLY_NOTE);
+  });
+
   it('names configured languages other than the default, and Ukrainian spelling only where Ukrainian is listed', () => {
     expect(callLanguageNote(['uk-UA', 'en-US'])).toBe(CALL_LANGUAGE_NOTE);
     expect(callLanguageNote(['en-US', 'uk-UA'])).toBe(
@@ -1923,5 +1960,253 @@ describe('parseLiveKitUtteranceId', () => {
     expect(parseLiveKitUtteranceId('livekit:c-1:3:ag-other')).toBeNull();
     expect(parseLiveKitUtteranceId('livekit:c-1')).toBeNull();
     expect(parseLiveKitUtteranceId('tg-1')).toBeNull();
+  });
+});
+
+describe('meetings: the /meet call kind on the call core', () => {
+  const MEET = 'https://meet.google.com/abc-defg-hij';
+  let h: Harness;
+  let chat: ReturnType<typeof fakeMirror>;
+  let bots: { joined: Array<Parameters<RecallMeetBridge['join']>[0]>; left: string[]; fail: boolean };
+  /** Jev's answers: whether it wakes the agent, and every state and name it was asked about. */
+  let jev: { wake: boolean; asked: Array<{ state: string; name: string }> };
+  /** While set, Jev answers only once it settles. */
+  const judge: { gate: Promise<void> | null } = { gate: null };
+
+  beforeEach(async () => {
+    bots = { joined: [], left: [], fail: false };
+    const meetBridge: RecallMeetBridge = {
+      join: async (options) => {
+        bots.joined.push(options);
+        if (bots.fail) throw new Error('recall down');
+        return { botId: `bot-${bots.joined.length}` };
+      },
+      leave: async (botId) => void bots.left.push(botId),
+    };
+    chat = fakeMirror([{ platform_id: 'telegram:100' }], {
+      bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
+    });
+    jev = { wake: false, asked: [] };
+    judge.gate = null;
+    const judgeJev = async (state: string, name: string) => {
+      jev.asked.push({ state, name });
+      await judge.gate;
+      const high = jev.wake ? 0.9 : 0;
+      return {
+        ok: true as const,
+        scores: { direct_invitation: high, unresolved: high, already_answered: 0, human_pingpong: 0 },
+      };
+    };
+    h = await startHarness({ accessCheckIntervalMs: 50, meetBridge, judgeJev }, { mirrorApi: chat.api });
+  });
+  afterEach(async () => {
+    await h.stop();
+  });
+
+  /** The agent's message reached the call chat. */
+  const delivered = (platformId: string, text: string) =>
+    liveKitChatDelivered(
+      {
+        id: `out-${text.length}`,
+        kind: 'chat',
+        content: JSON.stringify({ text }),
+        channelType: 'telegram',
+        platformId,
+        threadId: null,
+      },
+      'ag-andy',
+    );
+
+  /** Starts a meeting on the line and attaches its worker, the bridge page in the room. */
+  async function startMeeting(jevOn = false): Promise<FakeWorker> {
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: jevOn })).toEqual({ ok: true });
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    expect((await worker.post('joined')).status).toBe(200);
+    return worker;
+  }
+
+  it('is off without a Recall client', async () => {
+    const off = await startHarness({});
+    try {
+      expect(off.adapter.meetings).toBeNull();
+    } finally {
+      await off.stop();
+    }
+  });
+
+  it("opens a meet room whose caller is the bridge page, with the meeting's caps, and sends the bot there", async () => {
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false })).toEqual({ ok: true });
+    const [room] = h.lk.rooms;
+    expect(room).toMatch(/^meet-0123456789ab-[0-9a-f]{12}$/);
+    expect(h.lk.roomOptions).toEqual([{ name: room, emptyTimeout: 600, departureTimeout: 10, maxParticipants: 3 }]);
+    expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({
+      callerIdentity: `meet-bridge-${room}`,
+      meeting: { pauseSends: false, jev: false },
+      joinTimeoutMs: 10 * MIN,
+      maxDurationMs: MEETING_MAX_DURATION_MS,
+    });
+    expect(bots.joined).toEqual([{ meetingUrl: MEET, botName: 'Andy', roomName: room }]);
+  });
+
+  it("binds the meeting's chat only once the call is admitted, and refuses a call whose bind fails", async () => {
+    const binds: string[] = [];
+    await h.stop();
+    h = await startHarness(
+      { maxCallsPerHour: 1, meetBridge: { join: async () => ({ botId: 'b' }), leave: async () => {} } },
+      { mirrorApi: chat.api },
+    );
+    const bind = (ok: boolean) => async () => (binds.push(String(ok)), ok);
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false }, bind(false))).toEqual({
+      ok: false,
+      error: 'no-line',
+    });
+    expect(h.lk.rooms).toEqual([]);
+    const limited = await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false }, bind(true));
+    expect(limited).toMatchObject({ ok: false, error: 'limit' });
+    expect(binds).toEqual(['false']);
+  });
+
+  it('tells the worker a `pause` meeting sends on the pause', async () => {
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: true, jev: false })).toEqual({ ok: true });
+    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: true, jev: false });
+  });
+
+  it('routes meeting turns as guest turns with the meeting note, and says in the chat when it joined', async () => {
+    const worker = await startMeeting();
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toContain('\u{1F4DE} Andy is in the meeting.'));
+    await worker.utter('what is two plus two');
+    const content = h.inbound.at(-1)!.content as Record<string, unknown>;
+    expect(content).toMatchObject({ sender: 'Meeting' });
+    expect(content).not.toHaveProperty('senderId');
+    expect(content.text).toContain('<voice source="livekit">what is two plus two</voice>');
+    expect(content.text).toContain('Spoken in a live Google Meet you joined as a voice participant;');
+    expect(content.text).not.toContain('present:');
+    expect(content.text).toContain('keep it brief and conversational, lead with the answer. No markdown');
+    expect(content.text).not.toContain('Match the depth to the question');
+    expect(content.text).toContain(CALL_LANGUAGE_NOTE);
+  });
+
+  it('/meet leave ends the call and sends the bot away, once', async () => {
+    await startMeeting();
+    expect(h.adapter.meetings!.leave(LINE)).toBe(true);
+    await vi.waitFor(() => expect(bots.left).toEqual(['bot-1']));
+    await vi.waitFor(() => expect(h.lk.deleted).toEqual(h.lk.rooms));
+    await vi.waitFor(() =>
+      expect(chat.posts.map((p) => p.text)).toContain('\u{1F4DE} Left the meeting (left by /meet leave).'),
+    );
+    expect(h.adapter.meetings!.leave(LINE)).toBe(false);
+  });
+
+  it('ends the call when the bot cannot be created', async () => {
+    bots.fail = true;
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false })).toEqual({
+      ok: false,
+      error: 'bot',
+    });
+    await vi.waitFor(() => expect(h.lk.deleted).toEqual(h.lk.rooms));
+    expect(h.adapter.meetings!.leave(LINE)).toBe(false);
+  });
+
+  it('a call on the line ends the meeting, and its bot leaves', async () => {
+    await startMeeting();
+    await startCall(h);
+    await vi.waitFor(() => expect(bots.left).toEqual(['bot-1']));
+    expect(h.adapter.meetings!.leave(LINE)).toBe(false);
+  });
+
+  it('a jev meeting lets a candidate through only when Jev wakes the agent, judged against the meeting so far', async () => {
+    const worker = await startMeeting(true);
+    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: false, jev: true });
+    const candidate = (text: string) => worker.post('utterance', { text, candidate: true, wakeName: 'Dan\u202e' });
+
+    const kept = await candidate('Does anyone know when the release ships?');
+    expect(kept.status).toBe(200);
+    expect(await kept.text()).toBe('Not a turn: the call kept the agent out of it');
+    expect(h.events).toHaveLength(0);
+    // An addressed turn is never judged, and is part of what the next candidate is judged against.
+    await worker.utter('what is two plus two');
+    expect(jev.asked).toHaveLength(1);
+    delivered('telegram:100', 'Four.');
+
+    jev.wake = true;
+    const taken = await candidate('Dan, can you check the release date?');
+    expect(taken.status).toBe(202);
+    expect(h.events).toHaveLength(2);
+    expect(h.inbound.at(-1)!.content).toMatchObject({ sender: 'Meeting' });
+    const { state, name } = jev.asked.at(-1)!;
+    expect(name).toBe('Dan');
+    for (const line of ['Does anyone know when the release ships?', 'what is two plus two', 'Four.']) {
+      expect(state).toContain(line);
+    }
+    expect(state).toContain('Dan, can you check the release date?');
+  });
+
+  it('counts candidates toward the per-minute limit, short of the slots kept for addressed turns', async () => {
+    const worker = await startMeeting(true);
+    for (let i = 0; i < 15; i++) {
+      expect((await worker.post('utterance', { text: `chatter ${i}`, candidate: true })).status).toBe(200);
+    }
+    expect((await worker.post('utterance', { text: 'chatter 15', candidate: true })).status).toBe(429);
+    expect(h.events).toHaveLength(0);
+    for (let i = 0; i < 5; i++) expect((await worker.post('utterance', { text: `turn ${i}` })).status).toBe(202);
+    expect((await worker.post('utterance', { text: 'one too many' })).status).toBe(429);
+  });
+
+  it("refuses a candidate that would take the last in-flight slot, which stays an addressed turn's", async () => {
+    const worker = await startMeeting(true);
+    h.routing.mode = 'hang';
+    const first = worker.post('utterance', { text: 'first turn' });
+    const second = worker.post('utterance', { text: 'second turn' });
+    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(2));
+    expect((await worker.post('utterance', { text: 'chatter', candidate: true })).status).toBe(429);
+    expect(jev.asked).toHaveLength(0);
+    const third = worker.post('utterance', { text: 'third turn' });
+    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(3));
+    for (const hung of h.routing.hung.splice(0)) hung(true);
+    expect((await Promise.all([first, second, third])).map((r) => r.status)).toEqual([202, 202, 202]);
+  });
+
+  it('refuses a candidate as it would a turn when the call cannot take one, before judging it', async () => {
+    const worker = await startMeeting(true);
+    h.access.enabled = false;
+    expect((await worker.post('utterance', { text: 'chatter', candidate: true })).status).toBe(403);
+    expect(jev.asked).toHaveLength(0);
+  });
+
+  it('keeps a candidate in the transcript where it was said, even when a reply came while it was judged', async () => {
+    const worker = await startMeeting(true);
+    let release!: () => void;
+    const judging = new Promise<void>((r) => (release = r));
+    judge.gate = judging;
+    const first = worker.post('utterance', { text: 'Does anyone know when the release ships?', candidate: true });
+    await vi.waitFor(() => expect(jev.asked).toHaveLength(1));
+    delivered('telegram:100', 'Four.');
+    release();
+    expect((await first).status).toBe(200);
+    judge.gate = null;
+    await worker.post('utterance', { text: 'And the one after?', candidate: true });
+    const { state } = jev.asked.at(-1)!;
+    expect(state.indexOf('Does anyone know when the release ships?')).toBeLessThan(state.indexOf('Four.'));
+  });
+
+  it('teardown waits on a bot that will not leave only so long', async () => {
+    const stuck = await startHarness(
+      {
+        meetBridge: { join: async () => ({ botId: 'bot-stuck' }), leave: () => new Promise<void>(() => {}) },
+      },
+      { mirrorApi: chat.api, endHookTimeoutMs: 50 },
+    );
+    expect(await stuck.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false })).toEqual({ ok: true });
+    const started = Date.now();
+    await stuck.stop();
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it('takes no candidates on a call without a judge', async () => {
+    const { worker } = await startCall(h);
+    const res = await worker.post('utterance', { text: 'just chatting', candidate: true });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('Not a turn: this call takes no candidates');
+    expect(h.events).toHaveLength(0);
   });
 });

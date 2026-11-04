@@ -15,7 +15,10 @@
  *
  * The link token gates the HTTP routes: a request without a known `t` gets a
  * 403 before any room is created. The page is at `/voice?t=<token>` behind a
- * loopback front (or a trusted reverse proxy) that terminates TLS.
+ * loopback front (or a trusted reverse proxy) that terminates TLS. The page
+ * call is the `/voice` call kind of the call core: it and its page, token and
+ * end routes live in voice-mode-command.ts (createCallPage), as the meeting
+ * kind lives in voice-mode-meet.ts; this module wires both to the core.
  */
 import http from 'node:http';
 import net from 'node:net';
@@ -35,6 +38,7 @@ import {
 import {
   createLiveKitVoice,
   JSON_HEADERS,
+  MINUTE_MS,
   readJsonObject,
   reply,
   type LiveKitVoiceConfig,
@@ -59,8 +63,16 @@ import {
   setVoiceModeLineTts,
 } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
-import { handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
+import { createCallPage, handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
+import { createMeetings, type Meetings } from './voice-mode-meet.js';
+import {
+  createRecallMeetBridge,
+  RECALL_MEET_ENV_KEYS,
+  recallMeetConfigFromEnv,
+  type RecallMeetBridge,
+} from './meet-recall.js';
 import { readEnvFile } from '../env.js';
+import type { askJev } from '../modules/jev-gate/jev.js';
 import { encryptionKey } from '../secret-seal.js';
 import { log } from '../log.js';
 import { registerResidentSkillGate } from '../project-doc-compose.js';
@@ -80,7 +92,6 @@ import {
   type TtsSaved,
 } from '../voice-mode-tts.js';
 
-const MINUTE_MS = 60_000;
 /** How often a running call rechecks that its caller may still use the line. */
 const ACCESS_CHECK_INTERVAL_MS = 5000;
 const HOUR_MS = 3_600_000;
@@ -237,6 +248,10 @@ export interface VoiceModeConfig {
   allowedClientCidrs?: string;
   /** The session a call's turn went to: its replies are delivered without waiting on the poll. Test seam. */
   expediteReplies?: (session: Session) => void;
+  /** The Recall client `/meet` joins meetings through (voice-mode-meet.ts); none: `/meet` is not configured. */
+  meetBridge?: RecallMeetBridge;
+  /** The Jev client a `/meet ... jev` call judges candidates with; a test seam. */
+  judgeJev?: typeof askJev;
   /** How a call finds and starts the agent session it talks to (findCallSession, requestWake). Test seams. */
   prewarm?: {
     findSession?: (route: Omit<InboundEvent, 'message'>, agentGroupId: string) => Promise<Session | undefined>;
@@ -275,6 +290,8 @@ export interface VoiceModeChannelAdapter extends ChannelAdapter {
   callUrl(token: string): string;
   /** `/voice` in a chat, with this adapter's call URLs and the chat's own private reply (voice-mode-command.ts). */
   handleVoiceCommand(event: InboundEvent, privateReply?: PrivateReply): Promise<boolean>;
+  /** `/meet`'s meetings (voice-mode-meet.ts); null when no Recall client is configured. */
+  readonly meetings: Meetings | null;
 }
 
 export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChannelAdapter {
@@ -378,7 +395,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
   };
 
   const livekit = createLiveKitVoice(config.livekit, {
-    ui: config.ui,
     // Deferred: resolveCallLine needs the catalog, declared below.
     resolveLine: (platformId, options) => resolveCallLine(platformId, options),
     admitStart,
@@ -399,11 +415,14 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         log.warn('livekit-voice-mode: could not start the agent for the call', { callId, err }),
       );
     },
-    isRunning: () => connected,
+    isRunning: () => connected && !!setup,
     now,
-    maxCallDurationMs,
     accessCheckIntervalMs,
   });
+  const meetings: Meetings | null = config.meetBridge
+    ? createMeetings(livekit, config.meetBridge, { judgeJev: config.judgeJev, now })
+    : null;
+  const callPage = createCallPage(livekit, { livekit: config.livekit, maxCallDurationMs, ui: config.ui, lineForToken });
 
   const replyJson = (res: http.ServerResponse, status: number, body: unknown): void =>
     reply(res, status, JSON.stringify(body), JSON_HEADERS);
@@ -573,9 +592,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       // The shared webhook server has no unregister; after teardown the routes stay reachable
       // and must refuse rather than start calls for a channel that is no longer running.
       if (!connected || !setup) return reply(res, 503, 'Voice is not running');
-      if (route === 'livekit' || route.startsWith('livekit/')) {
-        return await livekit.handleHttp(req, res, route, url, lineForToken);
-      }
+      if (route.startsWith('livekit/agent/')) return await livekit.handleAgentHttp(req, res, route, url);
+      if (route === 'livekit' || route.startsWith('livekit/')) return await callPage.handle(req, res, route, url);
       if (route === 'info') {
         // Who answers this line, so the page can greet by name before the call.
         if (req.method !== 'GET') return reply(res, 405, 'GET only');
@@ -610,6 +628,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     callUrl,
     handleVoiceCommand: (event: InboundEvent, privateReply?: PrivateReply): Promise<boolean> =>
       handleVoiceCommand(event, callUrl, privateReply),
+    meetings,
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
@@ -662,6 +681,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         protocol: LIVEKIT_PROTOCOL_VERSION,
         agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
         speechProviders: Object.keys(providerKeys),
+        meetings: meetings ? 'on' : 'off',
         pageListener: pageServer ? `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}` : 'off',
       });
     },
@@ -786,6 +806,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       'VOICE_MODE_SILENCE_MS',
       'VOICE_MODE_WAKE_MODEL',
       'VOICE_MODE_WAKE_PHRASE',
+      ...RECALL_MEET_ENV_KEYS,
     ]);
     const missing = LIVEKIT_REQUIRED.filter((key) => !env[key]);
     if (missing.length > 0) {
@@ -793,6 +814,16 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       return null;
     }
     const page = pageListener(env.VOICE_MODE_PORT, env.VOICE_MODE_PAGE_HOST);
+    let meetBridge: RecallMeetBridge | undefined;
+    try {
+      const recall = recallMeetConfigFromEnv(env, { apiKey: env.LIVEKIT_API_KEY, apiSecret: env.LIVEKIT_API_SECRET });
+      meetBridge = recall ? createRecallMeetBridge(recall) : undefined;
+    } catch (err) {
+      // Bad Recall settings leave /meet off rather than stopping the voice channel from starting.
+      log.warn('voice-mode: Recall is not configured right; /meet is off', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
     return createVoiceModeAdapter({
       pagePort: page?.port,
       pageHost: page?.host,
@@ -808,6 +839,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       maxCallMsPerDay: Number(env.VOICE_MODE_MAX_MINUTES_PER_DAY ?? 120) * 60_000,
       vocabulary: env.VOICE_MODE_VOCABULARY,
       providerKeys: providerKeysFrom(env),
+      meetBridge,
       livekit: {
         url: env.LIVEKIT_URL,
         languages: parseVoiceLanguages(env.VOICE_MODE_LANGUAGES),

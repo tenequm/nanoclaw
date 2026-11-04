@@ -66,6 +66,7 @@ import {
 import {
   baseLanguage,
   wakePhrase,
+  configuredWakePhrase,
   DEFAULT_LIVEKIT_AGENT_NAME,
   HOST_SILENCE_MS,
   LIVEKIT_PROTOCOL_VERSION,
@@ -98,6 +99,7 @@ import {
   type CallVoiceState,
   type CallWakeState,
   type LiveKitHostEvent,
+  type CallUtterance,
   type LiveKitJobMetadata,
   type CallReplyInfo,
   type CallTurnStatus,
@@ -1610,6 +1612,12 @@ export class TurnTaking {
       // so none overtakes it.
       return new Promise<void>((resolve) => (this.unconfirmed = { turnKey, resolve }));
     }
+    this.tookTurn();
+  }
+
+  /** The host took a turn (one sent in order, or a meeting candidate it let through): the agent works on it. */
+  tookTurn(): void {
+    if (this.closed) return;
     this.awaitingReply = true;
     this.thinkingUntil = Math.max(this.thinkingUntil, this.now() + AWAIT_REPLY_MS);
     this.refresh();
@@ -2127,6 +2135,19 @@ function phraseName(phrase: string): string | undefined {
   return rest.length && WAKE_WORDS.has(spokenWord(lead)) ? rest.join(' ') : undefined;
 }
 
+/** The name a meeting wakes on when VOICE_MODE_WAKE_PHRASE names none. */
+const MEETING_WAKE_NAME = 'Dan';
+
+/**
+ * What a meeting wakes on: VOICE_MODE_WAKE_PHRASE's name (`Hey Dan`: `Dan`, a bare `Jarvis`: `Jarvis`) and
+ * the phrase as the transcription's vocabulary takes it; `Hey Dan` only when it is not set. Never the agent's own names.
+ */
+export function meetingWake(env: Record<string, string | undefined>): { name: string; phrase: string } {
+  const phrase = configuredWakePhrase(env);
+  if (!phrase) return { name: MEETING_WAKE_NAME, phrase: `Hey ${MEETING_WAKE_NAME}` };
+  return { name: phraseName(phrase) ?? phrase, phrase };
+}
+
 /** Every `hey <agent>` in a transcript, in order. */
 export function matchWakes(text: string, names: readonly WakeName[]): Array<{ start: number; end: number }> {
   const found: Array<{ start: number; end: number }> = [];
@@ -2341,6 +2362,11 @@ export interface CallTurnsDeps {
   unheard(): void;
   /** A turn that came to nothing for the agent: discarded, unaddressed, or a command alone. */
   ended?(facts: TurnFacts, outcome: TurnOutcome, reason: string): void;
+  /**
+   * `/meet ... jev`: words no wake phrase addressed go to the host as a candidate instead of ending
+   * unaddressed. Unset: they end unaddressed (`no_wake`).
+   */
+  candidate?(text: string, facts: TurnFacts): void;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -3200,7 +3226,8 @@ export class CallTurns {
       if (why === 'unaddressed') {
         if (said) this.deps.drop('unaddressed', said);
         this.deps.noTurn();
-        ended('unaddressed', 'no_wake');
+        if (said && this.deps.candidate) this.deps.candidate(said, facts);
+        else ended('unaddressed', 'no_wake');
       }
       if (why === 'dropped') ended('discarded', 'dropped');
       return null;
@@ -4686,9 +4713,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const geminiKey = deps.env.VOICE_MODE_GEMINI_API_KEY;
   if (!geminiKey) return abandon('VOICE_MODE_GEMINI_API_KEY is not set for the worker');
   const providerKeys = providerKeysFrom(deps.env);
-  const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
+  // A meeting records nothing: the people in it never agreed to it.
+  const record = !meta.meeting && recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
   const recordings = deps.recordingsRoot ?? recordingsRoot();
-  const recordCall = envSwitch(deps.env.VOICE_MODE_CALL_RECORDING, ['1', 'true']);
+  const recordCall = !meta.meeting && envSwitch(deps.env.VOICE_MODE_CALL_RECORDING, ['1', 'true']);
+  const wakeOfMeeting = meta.meeting ? { ...meta.meeting, ...meetingWake(deps.env) } : undefined;
   /** The whole call, when VOICE_MODE_CALL_RECORDING is on: opened once the caller's audio can flow. */
   let callRecording: CallRecording | undefined;
   const transcriptDebug = envSwitch(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG, ['1']);
@@ -4758,11 +4787,12 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         const turnKey = randomUUID();
         let res: Response;
         try {
-          res = await host.post('utterance', { text, turnKey }).catch(async (err: unknown) => {
+          const utterance: CallUtterance = { text, turnKey };
+          res = await host.post('utterance', { ...utterance }).catch(async (err: unknown) => {
             if ((err as Error | null)?.name === 'TimeoutError') throw err;
             callLog.warn('voice-mode worker: posting a turn failed; trying once more', { err });
             await sleep(TURN_RETRY_DELAY_MS);
-            return host.post('utterance', { text, turnKey });
+            return host.post('utterance', { ...utterance });
           });
         } catch (err) {
           // Unanswered, not refused: the host may still store it and say so with `turn-stored`.
@@ -4993,12 +5023,56 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       });
       saveTurn(turn, take, text, { host });
     };
+  /**
+   * `/meet ... jev`: words no wake phrase addressed go to the host as a candidate, outside the order turns
+   * go out in, so an addressed turn never waits on it. The host answers 202 only when it let the
+   * candidate through to the agent as a turn: then, and only then, it gets the sent cue and the typing.
+   * One at a time: while the host judges one, the next is dropped, so candidates never take an addressed turn's slot.
+   */
+  let candidateInFlight = false;
+  const postCandidate = async (text: string, facts: TurnFacts): Promise<void> => {
+    if (candidateInFlight) {
+      if (!ending) telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_busy' });
+      return;
+    }
+    const turnKey = randomUUID();
+    const postAt = Date.now();
+    let res: Response;
+    candidateInFlight = true;
+    try {
+      // The name the meeting wakes on, which the host's judge must take an invitation to, not the agent's own.
+      const utterance: CallUtterance = { text, turnKey, candidate: true, wakeName: wakeOfMeeting?.name };
+      res = await host.post('utterance', { ...utterance });
+    } catch (err) {
+      callLog.warn('voice-mode worker: could not hand a candidate to the host', { err });
+      if (!ending) telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_lost' });
+      return;
+    } finally {
+      candidateInFlight = false;
+    }
+    if (res.status !== 202) {
+      void res.body?.cancel().catch(() => {});
+      if (!ending)
+        telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_dropped', hostStatus: res.status });
+      return;
+    }
+    const accepted = (await res.json().catch(() => null)) as { id?: unknown } | null;
+    if (ending) return;
+    const turn = ++turns;
+    lastPosted = Math.max(lastPosted, turn);
+    cue('sent');
+    turnTaking.tookTurn();
+    const id = typeof accepted?.id === 'string' ? accepted.id : undefined;
+    sent(turn, text, { facts })({ accepted: true, status: 202, turnKey, id }, postAt);
+  };
   const transcriber = deps.transcriber({
     apiKey: geminiKey,
     model: meta.sttModel,
     // The names (the host trimmed, deduplicated and capped them) and the commands, which the
     // transcription does not hear reliably unless they are in its vocabulary.
-    vocabulary: [...new Set([...(meta.vocabulary ?? []), ...COMMAND_VOCABULARY])],
+    vocabulary: [
+      ...new Set([...(meta.vocabulary ?? []), ...(wakeOfMeeting ? [wakeOfMeeting.phrase] : []), ...COMMAND_VOCABULARY]),
+    ],
     languageCodes: languages.codes,
     sampleRate: INPUT_SAMPLE_RATE,
     onInterim: (text) => callTurns.onInterim(text),
@@ -5012,6 +5086,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       ended: (facts, outcome, reason) => {
         if (!ending) telemetry.turn({ facts, outcome, reason });
       },
+      ...(meta.meeting?.jev ? { candidate: (text: string, facts: TurnFacts) => void postCandidate(text, facts) } : {}),
       drop: (dropped, text, lone) => {
         if (ending) return;
         callVoice?.publishDropped(
@@ -5033,12 +5108,22 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     },
     {
       silenceMs: meta.silenceMs,
-      names: [meta.agentName, ...(meta.wakeNames ?? [])],
+      names: wakeOfMeeting ? [wakeOfMeeting.name] : [meta.agentName, ...(meta.wakeNames ?? [])],
       limits: awakeLimits(deps.env),
       record,
       ...(transcriptDebug ? { debug: true } : {}),
     },
   );
+  // A meeting has no page to set the switches: the agent takes a turn only when addressed, and a send
+  // word ends it, as on the page with "a pause also sends" off, unless the meeting asked for the pause.
+  if (wakeOfMeeting) {
+    callTurns.configure(true, wakeOfMeeting.pauseSends);
+    callLog.info('voice-mode worker: a meeting', {
+      wakePhrase: wakeOfMeeting.phrase,
+      pauseSends: wakeOfMeeting.pauseSends,
+      jev: wakeOfMeeting.jev,
+    });
+  }
   if (recordCall) {
     callRecording = new CallRecording(
       recordings,
@@ -5375,6 +5460,9 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
       host: '127.0.0.1',
       port: Number(env.VOICE_MODE_WORKER_HEALTH_PORT || 8089),
       numIdleProcesses: 1,
+      // agents-js marks a production worker full at 70% CPU of the whole host, so unrelated work on the
+      // box refused every call; the one worker never hands a call elsewhere anyway.
+      loadThreshold: Infinity,
       // On SIGTERM the worker takes no new calls and gives running ones this long before closing
       // them; a call can run up to VOICE_MODE_MAX_CALL_SECONDS, so a restart cuts longer ones short.
       drainTimeout: 60_000,

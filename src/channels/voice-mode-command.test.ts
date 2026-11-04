@@ -77,10 +77,10 @@ import {
   parseVoiceCommand,
   type PrivateReply,
   runVoiceCommand,
-  senderUserId,
   voiceCommandReply,
   voiceLinkLines,
 } from './voice-mode-command.js';
+import { senderUserId } from './voice-mode-chat.js';
 
 const OWNER = 'chat:1';
 const MEMBER = 'chat:2';

@@ -74,6 +74,7 @@ import {
   TTS_SAMPLE_RATE,
   matchCommand,
   matchWake,
+  meetingWake,
   wakeWordSettings,
   awakeLimits,
   endsLike,
@@ -6408,5 +6409,187 @@ describe('fast send words', () => {
     await vi.advanceTimersByTimeAsync(50);
     expect(utterances(c.host)).toEqual(['Book a table.']);
     await c.done();
+  });
+});
+
+describe('meeting calls', () => {
+  /** A `/meet` job: its caller is the Recall bridge page. */
+  const MEETING_META: LiveKitJobMetadata = {
+    ...META,
+    callerIdentity: 'meet-bridge-meet-r1',
+    meeting: { pauseSends: false, jev: false },
+  };
+  const WAKE_ENV = { ...ENV, VOICE_MODE_WAKE_MODEL: '/models/hey_dan.onnx', VOICE_MODE_WAKE_PHRASE: 'Hey Dan' };
+  const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+
+  /** One stretch of meeting speech, its interim, then the closing silence; `final` queues the activity's final. */
+  const say = async (v: ReturnType<typeof fakeVoice>, interim: string, final?: string) => {
+    await flush();
+    if (final !== undefined) v.transcription.results.push(heard(final, final));
+    const start = v.position;
+    v.events.onSpeech(true, start);
+    v.audio(1000);
+    v.interim(interim);
+    v.interim(interim);
+    const end = v.position;
+    v.audio(SILENCE);
+    v.events.onVad(v.position, end);
+    v.events.onSpeech(false, end);
+    await flush();
+  };
+
+  it("wakes on VOICE_MODE_WAKE_PHRASE's name, Hey Dan only without one, never on the agent's names", () => {
+    expect(meetingWake(WAKE_ENV)).toEqual({ name: 'Dan', phrase: 'Hey Dan' });
+    expect(meetingWake(ENV)).toEqual({ name: 'Dan', phrase: 'Hey Dan' });
+    expect(meetingWake({ ...ENV, VOICE_MODE_WAKE_PHRASE: ' Hey  Jarvis ' })).toEqual({
+      name: 'Jarvis',
+      phrase: 'Hey Jarvis',
+    });
+    expect(meetingWake({ ...ENV, VOICE_MODE_WAKE_PHRASE: ' Computer ' })).toEqual({
+      name: 'Computer',
+      phrase: 'Computer',
+    });
+    const names = wakeNameWords([meetingWake(WAKE_ENV).name]);
+    expect(matchWake("Hey Dan, what's two plus two?", names)).not.toBeNull();
+    expect(matchWake("Hey Andy, what's two plus two?", names)).toBeNull();
+  });
+
+  it('waits for the bridge page as its caller, hears the wake phrase, runs the spotter and records nothing', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-meeting-'));
+    try {
+      const { ctx, job, room } = fakeJob({ ...MEETING_META });
+      room.remoteParticipants.clear();
+      room.remoteParticipants.set('meet-bridge-meet-r1', {});
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      // A meeting has no page to send settings.
+      v.voice.review.serve = vi.fn();
+      const make = vi.fn((options: { onInterim(text: string): void }) => {
+        v.interim = (text) => options.onInterim(text);
+        return v.transcription;
+      });
+      const wakeWord = vi.fn();
+      const env = { ...WAKE_ENV, VOICE_MODE_RECORDINGS_DAYS: '7', VOICE_MODE_CALL_RECORDING: '1' };
+      await runCall(ctx, {
+        ...callDeps(host.fetchImpl, v, { env, recordingsRoot: root, wakeWord }),
+        transcriber: make,
+      });
+      expect(job.waitForParticipant).toHaveBeenCalledWith('meet-bridge-meet-r1');
+      expect(make).toHaveBeenCalledWith(
+        expect.objectContaining({ vocabulary: ['NanoClaw', 'Hey Dan', ...COMMAND_VOCABULARY] }),
+      );
+      expect(wakeWord).toHaveBeenCalledTimes(1);
+
+      // Wake mode is on: talk without the phrase drops, the agent's own name does not wake it.
+      // A pause does not send: the send word does, and only the words after the phrase go.
+      await say(v, 'I think we can ship on Friday', 'I think we can ship on Friday');
+      await say(v, 'Hey Andy, what is two plus two? Copy.', 'Hey Andy, what is two plus two? Copy.');
+      await say(v, 'Hey Dan, what is two plus two?');
+      await new Promise((r) => setTimeout(r, 50));
+      expect(utterances(host)).toEqual([]);
+      const all = 'Hey Dan, what is two plus two? Copy.';
+      await say(v, all, all);
+      await vi.waitFor(() => expect(utterances(host)).toEqual(['what is two plus two?']));
+      host.emit({ type: 'end', reason: 'test over' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+      expect(fs.readdirSync(root)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('a `pause` meeting sends the woken turn on the pause', async () => {
+    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: true, jev: false } });
+    room.remoteParticipants.clear();
+    room.remoteParticipants.set('meet-bridge-meet-r1', {});
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    v.voice.review.serve = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
+    await say(v, 'I think we can ship on Friday', 'I think we can ship on Friday');
+    await say(v, 'Hey Dan, what is two plus two?', 'Hey Dan, what is two plus two?');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['what is two plus two?']));
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+  });
+
+  it('`jev`: unaddressed talk goes to the host as a candidate on the pause, cued only once the host takes it', async () => {
+    for (const [jev, status] of [
+      [false, 202],
+      [true, 200],
+      [true, 202],
+    ] as const) {
+      const { ctx, job, room } = fakeJob({ ...MEETING_META, agentName: 'Junior', meeting: { pauseSends: false, jev } });
+      room.remoteParticipants.clear();
+      room.remoteParticipants.set('meet-bridge-meet-r1', {});
+      const host = fakeHostFetch(200, status);
+      const v = fakeVoice();
+      v.voice.review.serve = vi.fn();
+      await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
+      const posts = () => host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body);
+      const sentCues = () => v.voice.playCue.mock.calls.filter(([kind]) => kind === 'sent').length;
+
+      const chatter = 'Does anyone know when the release ships?';
+      await say(v, chatter, chatter);
+      if (!jev) {
+        await new Promise((r) => setTimeout(r, 50));
+        expect(posts()).toEqual([]);
+      } else {
+        // The agent is Junior; the meeting wakes on Hey Dan, so the host's judge hears of Dan.
+        await vi.waitFor(() =>
+          expect(posts()).toEqual([expect.objectContaining({ text: chatter, candidate: true, wakeName: 'Dan' })]),
+        );
+        await flush();
+        if (status === 202) {
+          await vi.waitFor(() => expect(sentCues()).toBe(1));
+          await vi.waitFor(() => expect(v.voice.setThinking).toHaveBeenCalledWith(true));
+        } else {
+          await new Promise((r) => setTimeout(r, 50));
+          expect(sentCues()).toBe(0);
+          expect(v.voice.setThinking).not.toHaveBeenCalledWith(true);
+        }
+      }
+      // A Hey Dan turn stays the instant path: a plain turn, never a candidate.
+      const addressed = 'Hey Dan, what is two plus two? Copy.';
+      await say(v, addressed, addressed);
+      await vi.waitFor(() => expect(posts().at(-1)).toMatchObject({ text: 'what is two plus two?' }));
+      expect(posts().at(-1)).not.toHaveProperty('candidate');
+      host.emit({ type: 'end', reason: 'test over' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+    }
+  });
+
+  it('`jev`: one candidate at a time; one said while the host judges another is dropped', async () => {
+    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: false, jev: true } });
+    room.remoteParticipants.clear();
+    room.remoteParticipants.set('meet-bridge-meet-r1', {});
+    const host = fakeHostFetch(200, 200);
+    const answer = host.fetchImpl.getMockImplementation()!;
+    let release!: () => void;
+    const judged = new Promise<void>((r) => (release = r));
+    host.fetchImpl.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/utterance') && String(init?.body).includes('"candidate":true')) await judged;
+      return answer(input, init);
+    });
+    const v = fakeVoice();
+    v.voice.review.serve = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
+    const candidates = () =>
+      host.fetchImpl.mock.calls.filter(
+        ([input, init]) => String(input).endsWith('/utterance') && String(init?.body).includes('"candidate":true'),
+      );
+
+    await say(v, 'Does anyone know when the release ships?', 'Does anyone know when the release ships?');
+    await vi.waitFor(() => expect(candidates()).toHaveLength(1));
+    await say(v, 'I think it was Friday', 'I think it was Friday');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(candidates()).toHaveLength(1);
+    release();
+    await flush();
+    await say(v, 'Or was it Monday', 'Or was it Monday');
+    await vi.waitFor(() => expect(candidates()).toHaveLength(2));
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
   });
 });

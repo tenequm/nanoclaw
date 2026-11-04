@@ -54,14 +54,19 @@ rm -f src/channels/index.ts.bak
 Remove these skill-owned files:
 
 ```bash
-rm -f src/channels/voice-mode-adapter.test.ts \
+rm -f src/channels/meet-recall.test.ts \
+  src/channels/meet-recall.ts \
+  src/channels/voice-mode-adapter.test.ts \
   src/channels/voice-mode-call-session.test.ts \
+  src/channels/voice-mode-chat.ts \
   src/channels/voice-mode-command.test.ts \
   src/channels/voice-mode-command.ts \
   src/channels/voice-mode-line-roles.test.ts \
   src/channels/voice-mode-line.ts \
   src/channels/voice-mode-livekit.test.ts \
   src/channels/voice-mode-livekit.ts \
+  src/channels/voice-mode-meet.test.ts \
+  src/channels/voice-mode-meet.ts \
   src/channels/voice-mode-page.test.ts \
   src/channels/voice-mode-page.ts \
   src/channels/voice-mode-protocol.ts \
@@ -82,7 +87,7 @@ rm -f src/channels/voice-mode-adapter.test.ts \
   src/voice-mode-worker.test.ts \
   src/voice-mode-worker.ts \
   src/db/voice-mode-lines.ts
-rm -rf src/voice-mode-wakeword-fixtures assets/voice-mode-wakeword container/skills/voice-mode-formatting
+rm -rf src/voice-mode-wakeword-fixtures assets/voice-mode-wakeword assets/meet-recall-bridge container/skills/voice-mode-formatting
 ```
 
 Keep operator-owned acoustic models and recordings unless explicitly retiring

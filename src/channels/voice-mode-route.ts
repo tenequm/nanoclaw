@@ -2,7 +2,7 @@
  * How a caller's turn reaches the agent: handed to the router's own engaged-message delivery
  * (`deliverToAgent`: thread policy, session, backfill, command gate, session-created hooks, typing,
  * wake, fan-out) for the one agent the line belongs to, in the call chat, as a message from the
- * line's caller. `routeInbound` is not used because a turn is addressed to that agent whatever
+ * call kind's sender: the line's caller, or a guest with no user id. `routeInbound` is not used because a turn is addressed to that agent whatever
  * else is wired to the chat and whatever its trigger; the caller's access to the agent and the
  * call chat's wiring are checked by the voice engine before every turn. The call hears the agent
  * thinking through core's typing observer (src/channels/voice-mode-livekit.ts).
@@ -18,8 +18,8 @@ import type { MessagingGroup } from '../types.js';
 
 /** What the voice engine knows of a turn besides its event. */
 export interface VoiceModeTurn {
-  /** The line's caller, who the turn is from. */
-  callerId: string;
+  /** Who the turn is from: the line's caller, or null for a guest (a meeting), who gets no role. */
+  callerId: string | null;
   /** The call chat as the engine just resolved it. */
   chat: MessagingGroup;
 }

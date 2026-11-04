@@ -134,6 +134,20 @@ describe('routeVoiceModeTurn', () => {
       expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
     });
 
+    it('stores a guest turn (a meeting) with no sender role', async () => {
+      const event = turn();
+      event.message.content = JSON.stringify({ text: '<voice source="livekit">hi</voice>', sender: 'Meeting' });
+      expect(await routeVoiceModeTurn(event, { ...(await fromCaller()), callerId: null })).toBe(true);
+      const [session] = await getSessionsByAgentGroup('ag-1');
+      const db = new Database(inboundDbPath('ag-1', session.id), { readonly: true });
+      const [row] = db.prepare('SELECT content FROM messages_in').all() as Array<{ content: string }>;
+      db.close();
+      const content = JSON.parse(row.content) as Record<string, unknown>;
+      expect(content).toMatchObject({ sender: 'Meeting' });
+      expect(content).not.toHaveProperty('senderId');
+      expect(content).not.toHaveProperty('senderRole');
+    });
+
     it('does not acknowledge a turn consumed by the core command gate', async () => {
       const event = turn();
       event.message.content = JSON.stringify({ text: '/status', senderId: 'voice-mode:abc' });
