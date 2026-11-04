@@ -2127,6 +2127,19 @@ function phraseName(phrase: string): string | undefined {
   return rest.length && WAKE_WORDS.has(spokenWord(lead)) ? rest.join(' ') : undefined;
 }
 
+/** The name a meeting wakes on when VOICE_MODE_WAKE_PHRASE names none. */
+const MEETING_WAKE_NAME = 'Dan';
+
+/**
+ * What a meeting wakes on: VOICE_MODE_WAKE_PHRASE's name (`Hey Dan`: `Dan`) and the phrase as the
+ * transcription's vocabulary takes it; `Hey Dan` when the setting names none. Never the agent's own names.
+ */
+export function meetingWake(env: Record<string, string | undefined>): { name: string; phrase: string } {
+  const phrase = env.VOICE_MODE_WAKE_PHRASE?.trim().split(/\s+/).join(' ');
+  const name = phrase && phraseName(phrase);
+  return name ? { name, phrase } : { name: MEETING_WAKE_NAME, phrase: `Hey ${MEETING_WAKE_NAME}` };
+}
+
 /** Every `hey <agent>` in a transcript, in order. */
 export function matchWakes(text: string, names: readonly WakeName[]): Array<{ start: number; end: number }> {
   const found: Array<{ start: number; end: number }> = [];
@@ -4686,9 +4699,11 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const geminiKey = deps.env.VOICE_MODE_GEMINI_API_KEY;
   if (!geminiKey) return abandon('VOICE_MODE_GEMINI_API_KEY is not set for the worker');
   const providerKeys = providerKeysFrom(deps.env);
-  const record = recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
+  // A meeting records nothing: the people in it never agreed to it.
+  const record = !meta.meeting && recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
   const recordings = deps.recordingsRoot ?? recordingsRoot();
-  const recordCall = envSwitch(deps.env.VOICE_MODE_CALL_RECORDING, ['1', 'true']);
+  const recordCall = !meta.meeting && envSwitch(deps.env.VOICE_MODE_CALL_RECORDING, ['1', 'true']);
+  const wakeOfMeeting = meta.meeting ? meetingWake(deps.env) : undefined;
   /** The whole call, when VOICE_MODE_CALL_RECORDING is on: opened once the caller's audio can flow. */
   let callRecording: CallRecording | undefined;
   const transcriptDebug = envSwitch(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG, ['1']);
@@ -4998,7 +5013,9 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     model: meta.sttModel,
     // The names (the host trimmed, deduplicated and capped them) and the commands, which the
     // transcription does not hear reliably unless they are in its vocabulary.
-    vocabulary: [...new Set([...(meta.vocabulary ?? []), ...COMMAND_VOCABULARY])],
+    vocabulary: [
+      ...new Set([...(meta.vocabulary ?? []), ...(wakeOfMeeting ? [wakeOfMeeting.phrase] : []), ...COMMAND_VOCABULARY]),
+    ],
     languageCodes: languages.codes,
     sampleRate: INPUT_SAMPLE_RATE,
     onInterim: (text) => callTurns.onInterim(text),
@@ -5033,12 +5050,21 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     },
     {
       silenceMs: meta.silenceMs,
-      names: [meta.agentName, ...(meta.wakeNames ?? [])],
+      names: wakeOfMeeting ? [wakeOfMeeting.name] : [meta.agentName, ...(meta.wakeNames ?? [])],
       limits: awakeLimits(deps.env),
       record,
       ...(transcriptDebug ? { debug: true } : {}),
     },
   );
+  // A meeting has no page to set the switches: the agent takes a turn only when addressed, and a send
+  // word ends it, as on the page with "a pause also sends" off, unless the meeting asked for the pause.
+  if (meta.meeting && wakeOfMeeting) {
+    callTurns.configure(true, meta.meeting.pauseSends);
+    callLog.info('voice-mode worker: a meeting', {
+      wakePhrase: wakeOfMeeting.phrase,
+      pauseSends: meta.meeting.pauseSends,
+    });
+  }
   if (recordCall) {
     callRecording = new CallRecording(
       recordings,

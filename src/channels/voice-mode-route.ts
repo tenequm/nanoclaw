@@ -18,8 +18,8 @@ import type { MessagingGroup } from '../types.js';
 
 /** What the voice engine knows of a turn besides its event. */
 export interface VoiceModeTurn {
-  /** The line's caller, who the turn is from. */
-  callerId: string;
+  /** Who the turn is from: the line's caller, or null for a guest (a meeting), who gets no role. */
+  callerId: string | null;
   /** The call chat as the engine just resolved it. */
   chat: MessagingGroup;
 }

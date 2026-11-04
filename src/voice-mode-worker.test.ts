@@ -74,6 +74,7 @@ import {
   TTS_SAMPLE_RATE,
   matchCommand,
   matchWake,
+  meetingWake,
   wakeWordSettings,
   awakeLimits,
   endsLike,
@@ -6408,5 +6409,90 @@ describe('fast send words', () => {
     await vi.advanceTimersByTimeAsync(50);
     expect(utterances(c.host)).toEqual(['Book a table.']);
     await c.done();
+  });
+});
+
+describe('meeting calls', () => {
+  /** A `/meet` job: its caller is the Recall bridge page. */
+  const MEETING_META: LiveKitJobMetadata = {
+    ...META,
+    callerIdentity: 'meet-bridge-meet-r1',
+    meeting: { pauseSends: false },
+  };
+  const WAKE_ENV = { ...ENV, VOICE_MODE_WAKE_MODEL: '/models/hey_dan.onnx', VOICE_MODE_WAKE_PHRASE: 'Hey Dan' };
+  const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+
+  /** One stretch of meeting speech, its interim, then the closing silence; `final` queues the activity's final. */
+  const say = async (v: ReturnType<typeof fakeVoice>, interim: string, final?: string) => {
+    await flush();
+    if (final !== undefined) v.transcription.results.push(heard(final, final));
+    const start = v.position;
+    v.events.onSpeech(true, start);
+    v.audio(1000);
+    v.interim(interim);
+    v.interim(interim);
+    const end = v.position;
+    v.audio(SILENCE);
+    v.events.onVad(v.position, end);
+    v.events.onSpeech(false, end);
+    await flush();
+  };
+
+  it("wakes on VOICE_MODE_WAKE_PHRASE's name, Hey Dan without one, never on the agent's names", () => {
+    expect(meetingWake(WAKE_ENV)).toEqual({ name: 'Dan', phrase: 'Hey Dan' });
+    expect(meetingWake(ENV)).toEqual({ name: 'Dan', phrase: 'Hey Dan' });
+    expect(meetingWake({ ...ENV, VOICE_MODE_WAKE_PHRASE: ' Hey  Jarvis ' })).toEqual({
+      name: 'Jarvis',
+      phrase: 'Hey Jarvis',
+    });
+    expect(meetingWake({ ...ENV, VOICE_MODE_WAKE_PHRASE: 'Computer' })).toEqual({ name: 'Dan', phrase: 'Hey Dan' });
+    const names = wakeNameWords([meetingWake(WAKE_ENV).name]);
+    expect(matchWake("Hey Dan, what's two plus two?", names)).not.toBeNull();
+    expect(matchWake("Hey Andy, what's two plus two?", names)).toBeNull();
+  });
+
+  it('waits for the bridge page as its caller, hears the wake phrase, runs the spotter and records nothing', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-meeting-'));
+    try {
+      const { ctx, job, room } = fakeJob({ ...MEETING_META });
+      room.remoteParticipants.clear();
+      room.remoteParticipants.set('meet-bridge-meet-r1', {});
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      // A meeting has no page to send settings.
+      v.voice.review.serve = vi.fn();
+      const make = vi.fn((options: { onInterim(text: string): void }) => {
+        v.interim = (text) => options.onInterim(text);
+        return v.transcription;
+      });
+      const wakeWord = vi.fn();
+      const env = { ...WAKE_ENV, VOICE_MODE_RECORDINGS_DAYS: '7', VOICE_MODE_CALL_RECORDING: '1' };
+      await runCall(ctx, {
+        ...callDeps(host.fetchImpl, v, { env, recordingsRoot: root, wakeWord }),
+        transcriber: make,
+      });
+      expect(job.waitForParticipant).toHaveBeenCalledWith('meet-bridge-meet-r1');
+      expect(make).toHaveBeenCalledWith(
+        expect.objectContaining({ vocabulary: ['NanoClaw', 'Hey Dan', ...COMMAND_VOCABULARY] }),
+      );
+      expect(wakeWord).toHaveBeenCalledTimes(1);
+
+      // Wake mode is on: talk without the phrase drops, the agent's own name does not wake it.
+      // A pause does not send: the send word does, and only the words after the phrase go.
+      await say(v, 'I think we can ship on Friday', 'I think we can ship on Friday');
+      await say(v, 'Hey Andy, what is two plus two? Copy.', 'Hey Andy, what is two plus two? Copy.');
+      await say(v, 'Hey Dan, what is two plus two?');
+      await new Promise((r) => setTimeout(r, 50));
+      expect(utterances(host)).toEqual([]);
+      const all = 'Hey Dan, what is two plus two? Copy.';
+      await say(v, all, all);
+      await vi.waitFor(() => expect(utterances(host)).toEqual(['what is two plus two?']));
+      host.emit({ type: 'end', reason: 'test over' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+      expect(fs.readdirSync(root)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

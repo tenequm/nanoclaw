@@ -131,17 +131,19 @@ export type LineClaim =
   | { kind: 'created'; line: VoiceModeLineRow; token: string }
   | { kind: 'bound'; line: VoiceModeLineRow }
   /** Another caller's line, left alone; `caller` is their display name. */
-  | { kind: 'other-caller'; caller?: string };
+  | { kind: 'other-caller'; caller?: string }
+  /** The agent has no line, and without the host key none can be made. */
+  | { kind: 'no-key' };
 
 /**
  * Makes the target chat the call chat of the agent's line: a new line with the sender as its caller,
  * or the sender's own line moved there. Only creates when the agent has no line yet: one another run
  * created meanwhile keeps its caller and link.
  */
-export async function claimLine(target: LineTarget, key: Buffer): Promise<LineClaim> {
-  const created = (await getVoiceModeLineForAgent(target.agentGroupId))
-    ? undefined
-    : await createVoiceModeLine(target, key);
+export async function claimLine(target: LineTarget, key: Buffer | null): Promise<LineClaim> {
+  const existing = await getVoiceModeLineForAgent(target.agentGroupId);
+  if (!existing && !key) return { kind: 'no-key' };
+  const created = existing ? undefined : await createVoiceModeLine(target, key);
   if (created) return { kind: 'created', line: created.line, token: created.token };
   const line = await bindVoiceModeLineChat({
     agentGroupId: target.agentGroupId,

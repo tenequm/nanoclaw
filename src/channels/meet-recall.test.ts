@@ -106,10 +106,18 @@ describe('createRecallMeetBridge', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
 
     vi.mocked(log.error).mockClear();
-    const failing = respond(json(404, { detail: 'Not found.' }));
-    await expect(createRecallMeetBridge(config(failing)).leave('gone')).resolves.toBeUndefined();
+    const failing = respond(new Error('socket hang up'));
+    await expect(createRecallMeetBridge(config(failing)).leave('bot-2')).resolves.toBeUndefined();
     expect(failing).toHaveBeenCalledTimes(3);
     expect(log.error).toHaveBeenCalledWith('meet-recall: the bot did not leave its meeting', expect.anything());
+  });
+
+  it('takes a refused leave as a bot already gone: no retry, no error', async () => {
+    vi.mocked(log.error).mockClear();
+    const gone = respond(json(400, { detail: 'Bot is not in a call.' }));
+    await createRecallMeetBridge(config(gone)).leave('gone');
+    expect(gone).toHaveBeenCalledTimes(1);
+    expect(log.error).not.toHaveBeenCalled();
   });
 
   it('refuses on a 4xx with the status and a redacted body, and looks for no bot', async () => {

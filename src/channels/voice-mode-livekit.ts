@@ -274,9 +274,9 @@ export interface CallKind {
   maxDurationMs: number;
   room: { emptyTimeout: number; departureTimeout: number; maxParticipants: number };
   /** The kind's part of the worker's job metadata. */
-  job(call: Pick<KindCall, 'callId' | 'roomName'>): Pick<LiveKitJobMetadata, 'callerIdentity'>;
-  /** Who each turn comes from. */
-  sender(line: VoiceModeLine): { id: string; name: string };
+  job(call: Pick<KindCall, 'callId' | 'roomName'>): Pick<LiveKitJobMetadata, 'callerIdentity' | 'meeting'>;
+  /** Who each turn comes from; a guest (no user id) gets no role over the agent. */
+  sender(line: VoiceModeLine): { id: string | null; name: string };
   /** What each turn tells the agent, given the caller's language note (callLanguageNote). */
   turnNote(languageNote: string): string;
   /** The caller joined and the call talks in a chat; `say` posts there. */
@@ -1048,7 +1048,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         content: JSON.stringify({
           text: turnMessageText(text, call.note),
           sender: sender.name,
-          senderId: sender.id,
+          ...(sender.id ? { senderId: sender.id } : {}),
           livekit: { callId: call.callId, utteranceId },
         }),
         timestamp: new Date().toISOString(),

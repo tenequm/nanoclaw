@@ -131,8 +131,8 @@ export async function runVoiceCommand(
       results.push(minted(claim.token, claim.line.line_id, false));
       continue;
     }
-    if (claim.kind === 'other-caller') {
-      results.push(noLink('other-caller', claim.caller));
+    if (claim.kind === 'other-caller' || claim.kind === 'no-key') {
+      results.push(noLink(claim.kind, claim.kind === 'other-caller' ? claim.caller : undefined));
       continue;
     }
     const line = claim.line;

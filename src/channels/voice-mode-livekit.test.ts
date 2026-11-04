@@ -50,6 +50,8 @@ import { getWebhookStatus, stopWebhookServer } from '../webhook-server.js';
 import { callPageHtml } from './voice-mode-page.js';
 import type { VoiceCatalog, VoiceStatus } from './voice-mode-tts-catalog.js';
 import { linePlatformId } from './voice-mode-line.js';
+import type { RecallMeetBridge } from './meet-recall.js';
+import { MEETING_MAX_DURATION_MS } from './voice-mode-meet.js';
 
 /** A line /voice made: its calls need a chat to talk in. */
 const LINE = linePlatformId('0123456789ab');
@@ -59,6 +61,8 @@ const API_SECRET = 'fakesecretfakesecretfakesecretfakesecretfakesecr';
 
 interface FakeLiveKit extends LiveKitServerApi {
   rooms: string[];
+  /** Each created room's options, in order. */
+  roomOptions: Array<Parameters<LiveKitServerApi['createRoom']>[0]>;
   deleted: string[];
   dispatches: Array<{ room: string; agentName: string; metadata: LiveKitJobMetadata }>;
   /** Room metadata writes, in order. */
@@ -73,6 +77,7 @@ interface FakeLiveKit extends LiveKitServerApi {
 function fakeLiveKit(): FakeLiveKit {
   const fake: FakeLiveKit = {
     rooms: [],
+    roomOptions: [],
     deleted: [],
     dispatches: [],
     roomMetadata: [],
@@ -83,6 +88,7 @@ function fakeLiveKit(): FakeLiveKit {
       await fake.createGate;
       if (fake.failCreate) throw new Error('connection refused');
       fake.rooms.push(options.name);
+      fake.roomOptions.push(options);
       fake.ops.push(`create:${options.name}`);
       return {};
     },
@@ -1923,5 +1929,100 @@ describe('parseLiveKitUtteranceId', () => {
     expect(parseLiveKitUtteranceId('livekit:c-1:3:ag-other')).toBeNull();
     expect(parseLiveKitUtteranceId('livekit:c-1')).toBeNull();
     expect(parseLiveKitUtteranceId('tg-1')).toBeNull();
+  });
+});
+
+describe('meetings: the /meet call kind on the call core', () => {
+  const MEET = 'https://meet.google.com/abc-defg-hij';
+  let h: Harness;
+  let chat: ReturnType<typeof fakeMirror>;
+  let bots: { joined: Array<Parameters<RecallMeetBridge['join']>[0]>; left: string[]; fail: boolean };
+
+  beforeEach(async () => {
+    bots = { joined: [], left: [], fail: false };
+    const meetBridge: RecallMeetBridge = {
+      join: async (options) => {
+        bots.joined.push(options);
+        if (bots.fail) throw new Error('recall down');
+        return { botId: `bot-${bots.joined.length}` };
+      },
+      leave: async (botId) => void bots.left.push(botId),
+    };
+    chat = fakeMirror([{ platform_id: 'telegram:100' }], {
+      bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
+    });
+    h = await startHarness({ accessCheckIntervalMs: 50, meetBridge }, { mirrorApi: chat.api });
+  });
+  afterEach(async () => {
+    await h.stop();
+  });
+
+  /** Starts a meeting on the line and attaches its worker, the bridge page in the room. */
+  async function startMeeting(): Promise<FakeWorker> {
+    expect(await h.adapter.meetings!.start(LINE, MEET)).toEqual({ ok: true });
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    expect((await worker.post('joined')).status).toBe(200);
+    return worker;
+  }
+
+  it('is off without a Recall client', async () => {
+    const off = await startHarness({});
+    try {
+      expect(off.adapter.meetings).toBeNull();
+    } finally {
+      await off.stop();
+    }
+  });
+
+  it("opens a meet room whose caller is the bridge page, with the meeting's caps, and sends the bot there", async () => {
+    expect(await h.adapter.meetings!.start(LINE, MEET)).toEqual({ ok: true });
+    const [room] = h.lk.rooms;
+    expect(room).toMatch(/^meet-0123456789ab-[0-9a-f]{12}$/);
+    expect(h.lk.roomOptions).toEqual([{ name: room, emptyTimeout: 600, departureTimeout: 10, maxParticipants: 3 }]);
+    expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({
+      callerIdentity: `meet-bridge-${room}`,
+      meeting: { pauseSends: false },
+      joinTimeoutMs: 10 * MIN,
+      maxDurationMs: MEETING_MAX_DURATION_MS,
+    });
+    expect(bots.joined).toEqual([{ meetingUrl: MEET, botName: 'Andy', roomName: room }]);
+  });
+
+  it('routes meeting turns as guest turns with the meeting note, and says in the chat when it joined', async () => {
+    const worker = await startMeeting();
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toContain('\u{1F4DE} Andy is in the meeting.'));
+    await worker.utter('what is two plus two');
+    const content = h.inbound.at(-1)!.content as Record<string, unknown>;
+    expect(content).toMatchObject({ sender: 'Meeting' });
+    expect(content).not.toHaveProperty('senderId');
+    expect(content.text).toContain('<voice source="livekit">what is two plus two</voice>');
+    expect(content.text).toContain('Spoken in a live Google Meet you joined as a voice participant;');
+    expect(content.text).not.toContain('present:');
+    expect(content.text).toContain(CALL_LANGUAGE_NOTE);
+  });
+
+  it('/meet leave ends the call and sends the bot away, once', async () => {
+    await startMeeting();
+    expect(h.adapter.meetings!.leave(LINE)).toBe(true);
+    await vi.waitFor(() => expect(bots.left).toEqual(['bot-1']));
+    await vi.waitFor(() => expect(h.lk.deleted).toEqual(h.lk.rooms));
+    await vi.waitFor(() =>
+      expect(chat.posts.map((p) => p.text)).toContain('\u{1F4DE} Left the meeting (left by /meet leave).'),
+    );
+    expect(h.adapter.meetings!.leave(LINE)).toBe(false);
+  });
+
+  it('ends the call when the bot cannot be created', async () => {
+    bots.fail = true;
+    expect(await h.adapter.meetings!.start(LINE, MEET)).toEqual({ ok: false, error: 'bot' });
+    await vi.waitFor(() => expect(h.lk.deleted).toEqual(h.lk.rooms));
+    expect(h.adapter.meetings!.leave(LINE)).toBe(false);
+  });
+
+  it('a call on the line ends the meeting, and its bot leaves', async () => {
+    await startMeeting();
+    await startCall(h);
+    await vi.waitFor(() => expect(bots.left).toEqual(['bot-1']));
+    expect(h.adapter.meetings!.leave(LINE)).toBe(false);
   });
 });

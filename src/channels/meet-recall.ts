@@ -123,6 +123,11 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
         await recall('POST', `/bot/${encodeURIComponent(botId)}/leave_call/`);
         return;
       } catch (err) {
+        // A bot that already left on its own (everyone left the meeting) is refused, not missed.
+        if (err instanceof RecallRefusal) {
+          log.info('meet-recall: Recall refused the leave; the bot is likely gone already', { botId, err });
+          return;
+        }
         if (attempt === LEAVE_ATTEMPTS - 1) {
           log.error('meet-recall: the bot did not leave its meeting', { botId, err });
           return;

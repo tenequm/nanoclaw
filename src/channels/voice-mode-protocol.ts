@@ -99,6 +99,14 @@ export interface LiveKitJobMetadata {
   /** Upper bound the worker enforces on itself if the host never ends the call. */
   maxDurationMs: number;
   joinTimeoutMs: number;
+  /** A `/meet` call: the caller is the meeting's Recall bridge page. */
+  meeting?: MeetingJob;
+}
+
+/** What a meeting call's worker does differently. */
+export interface MeetingJob {
+  /** A pause ends a turn too, not only the send word. */
+  pauseSends: boolean;
 }
 
 /**

@@ -68,6 +68,13 @@ import {
 } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
 import { handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
+import { createMeetings, type Meetings } from './voice-mode-meet.js';
+import {
+  createRecallMeetBridge,
+  RECALL_MEET_ENV_KEYS,
+  recallMeetConfigFromEnv,
+  type RecallMeetBridge,
+} from './meet-recall.js';
 import { readEnvFile } from '../env.js';
 import { encryptionKey } from '../secret-seal.js';
 import { log } from '../log.js';
@@ -280,6 +287,10 @@ export interface VoiceModeConfig {
   allowedClientCidrs?: string;
   /** The session a call's turn went to: its replies are delivered without waiting on the poll. Test seam. */
   expediteReplies?: (session: Session) => void;
+  /** The Recall client `/meet` joins meetings through (voice-mode-meet.ts); none: `/meet` is not configured. */
+  meetBridge?: RecallMeetBridge;
+  /** MEETING_JOIN_TIMEOUT_MS; a test seam. */
+  meetingJoinTimeoutMs?: number;
   /** How a call finds and starts the agent session it talks to (findCallSession, requestWake). Test seams. */
   prewarm?: {
     findSession?: (route: Omit<InboundEvent, 'message'>, agentGroupId: string) => Promise<Session | undefined>;
@@ -318,6 +329,8 @@ export interface VoiceModeChannelAdapter extends ChannelAdapter {
   callUrl(token: string): string;
   /** `/voice` in a chat, with this adapter's call URLs and the chat's own private reply (voice-mode-command.ts). */
   handleVoiceCommand(event: InboundEvent, privateReply?: PrivateReply): Promise<boolean>;
+  /** `/meet`'s meetings (voice-mode-meet.ts); null when no Recall client is configured. */
+  readonly meetings: Meetings | null;
 }
 
 export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChannelAdapter {
@@ -446,6 +459,16 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     accessCheckIntervalMs,
   });
   const pageCall = pageCallKind(maxCallDurationMs);
+  const meetingsOnCore = config.meetBridge
+    ? createMeetings(livekit, config.meetBridge, { joinTimeoutMs: config.meetingJoinTimeoutMs })
+    : null;
+  const meetings: Meetings | null = meetingsOnCore && {
+    start: (platformId, meetingUrl) =>
+      connected && setup
+        ? meetingsOnCore.start(platformId, meetingUrl)
+        : Promise.resolve({ ok: false, error: 'stopped' }),
+    leave: (platformId) => meetingsOnCore.leave(platformId),
+  };
   let page: string | undefined;
 
   /** The page call's token: it joins that room only, as the caller the worker waits for. */
@@ -789,6 +812,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     callUrl,
     handleVoiceCommand: (event: InboundEvent, privateReply?: PrivateReply): Promise<boolean> =>
       handleVoiceCommand(event, callUrl, privateReply),
+    meetings,
 
     async setup(cfg: ChannelSetup): Promise<void> {
       setup = cfg;
@@ -841,6 +865,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         protocol: LIVEKIT_PROTOCOL_VERSION,
         agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
         speechProviders: Object.keys(providerKeys),
+        meetings: meetings ? 'on' : 'off',
         pageListener: pageServer ? `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}` : 'off',
       });
     },
@@ -965,6 +990,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       'VOICE_MODE_SILENCE_MS',
       'VOICE_MODE_WAKE_MODEL',
       'VOICE_MODE_WAKE_PHRASE',
+      ...RECALL_MEET_ENV_KEYS,
     ]);
     const missing = LIVEKIT_REQUIRED.filter((key) => !env[key]);
     if (missing.length > 0) {
@@ -972,6 +998,16 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       return null;
     }
     const page = pageListener(env.VOICE_MODE_PORT, env.VOICE_MODE_PAGE_HOST);
+    let meetBridge: RecallMeetBridge | undefined;
+    try {
+      const recall = recallMeetConfigFromEnv(env, { apiKey: env.LIVEKIT_API_KEY, apiSecret: env.LIVEKIT_API_SECRET });
+      meetBridge = recall ? createRecallMeetBridge(recall) : undefined;
+    } catch (err) {
+      // Bad Recall settings leave /meet off rather than stopping the voice channel from starting.
+      log.warn('voice-mode: Recall is not configured right; /meet is off', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
     return createVoiceModeAdapter({
       pagePort: page?.port,
       pageHost: page?.host,
@@ -987,6 +1023,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       maxCallMsPerDay: Number(env.VOICE_MODE_MAX_MINUTES_PER_DAY ?? 120) * 60_000,
       vocabulary: env.VOICE_MODE_VOCABULARY,
       providerKeys: providerKeysFrom(env),
+      meetBridge,
       livekit: {
         url: env.LIVEKIT_URL,
         languages: parseVoiceLanguages(env.VOICE_MODE_LANGUAGES),
