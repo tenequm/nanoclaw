@@ -44,6 +44,8 @@ Stop on any failed fetch or copy; never leave empty source files. Reapplying
 these files is safe. Preserve agent vocabulary and local configuration.
 
 ```nc:copy from-branch:main
+src/channels/meet-recall.test.ts
+src/channels/meet-recall.ts
 src/channels/voice-mode-adapter.test.ts
 src/channels/voice-mode-call-session.test.ts
 src/channels/voice-mode-chat.ts
@@ -75,6 +77,7 @@ src/voice-mode-worker.ts
 src/db/voice-mode-lines.ts
 src/secret-seal.test.ts
 src/secret-seal.ts
+assets/meet-recall-bridge/index.html
 assets/voice-mode-wakeword/LICENSE
 assets/voice-mode-wakeword/NOTICE
 assets/voice-mode-wakeword/embedding_model.onnx
