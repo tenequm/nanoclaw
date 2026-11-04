@@ -366,6 +366,14 @@ export function wakePhrase(env: { VOICE_MODE_WAKE_MODEL?: string; VOICE_MODE_WAK
   return configuredWakePhrase(env) ?? DEFAULT_WAKE_PHRASE;
 }
 
+/** The name in VOICE_MODE_WAKE_PHRASE (`Hey Dan`: `Dan`, a bare `Jarvis`: `Jarvis`); null when it is not set. */
+export function wakePhraseName(env: { VOICE_MODE_WAKE_PHRASE?: string }): string | null {
+  const phrase = configuredWakePhrase(env);
+  if (!phrase) return null;
+  const [lead, ...rest] = phrase.split(' ');
+  return rest.length && /^(hey|hei|hej|hi|hai|hay|ok|okay)[,!.]?$/i.test(lead) ? rest.join(' ') : phrase;
+}
+
 /** VOICE_MODE_WAKE_PHRASE as set, trimmed and single-spaced; null when it is not set. */
 export function configuredWakePhrase(env: { VOICE_MODE_WAKE_PHRASE?: string }): string | null {
   return env.VOICE_MODE_WAKE_PHRASE?.trim().replace(/\s+/g, ' ') || null;

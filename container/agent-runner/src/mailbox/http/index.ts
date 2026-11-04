@@ -128,6 +128,15 @@ const bySequence = (a: { sequence: number | null }, b: { sequence: number | null
 const containsIgnoringCase = (haystack: string, needle: string) =>
   haystack.toLowerCase().includes(needle.toLowerCase());
 
+/** 0 when a runner that has not made progress has not created the file yet. */
+function heartbeatFileMtime(): number {
+  try {
+    return fs.statSync(heartbeatPath()).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
 function trim<V>(map: Map<number, V>): void {
   if (map.size <= REPLICA_WINDOW) return;
   const drop = [...map.keys()].sort((a, b) => a - b).slice(0, map.size - REPLICA_WINDOW);
@@ -442,12 +451,7 @@ export class HttpAgentMailbox implements AgentMailbox {
       throw this.fatal;
     }
     const batch = this.queue.slice();
-    let heartbeatMtime = 0;
-    try {
-      heartbeatMtime = fs.statSync(heartbeatPath()).mtimeMs;
-    } catch {
-      // A runner that has not made progress may not have created the file yet.
-    }
+    const heartbeatMtime = heartbeatFileMtime();
     const heartbeat = heartbeatMtime > this.heartbeatForwardedAt;
     const ops = [
       ...batch.map(({ op, args }) => ({ op, args })),
@@ -472,7 +476,10 @@ export class HttpAgentMailbox implements AgentMailbox {
       if (failure.permanent || now - this.failingSince > this.staleAfterMs) this.poison(failure);
       throw this.fatal ?? failure;
     }
-    if (heartbeat) this.heartbeatForwardedAt = heartbeatMtime;
+    // When the session dir is shared with the host, the host's touch lands on this
+    // same file before it replies; counting it as forwarded keeps an idle runner
+    // from re-forwarding its own echo forever, which would defeat the idle ceiling.
+    if (heartbeat) this.heartbeatForwardedAt = Math.max(heartbeatMtime, heartbeatFileMtime());
     this.failingSince = null;
     this.lastSuccessAt = Date.now();
     this.queue.splice(0, batch.length);

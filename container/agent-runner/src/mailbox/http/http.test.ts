@@ -328,6 +328,23 @@ describe('HTTP mailbox writes', () => {
     expect(allOps()).toEqual(['heartbeat']);
   });
 
+  test("does not re-forward the host's own touch of a shared heartbeat file", async () => {
+    const mailbox = await started({ syncIntervalMs: 60_000 });
+    touchHeartbeat();
+    // The host touches the same file while handling the beat, later than the runner did.
+    handler = (ops, request) => {
+      if (ops.some(({ op }) => op === 'heartbeat')) {
+        const later = new Date(Date.now() + 5_000);
+        fs.utimesSync(process.env.NANOCLAW_HEARTBEAT_PATH!, later, later);
+      }
+      return defaultHandler(ops, request);
+    };
+    await mailbox.run(() => undefined);
+    await mailbox.run(() => undefined);
+    await mailbox.run(() => undefined);
+    expect(allOps()).toEqual(['heartbeat']);
+  });
+
   test('forwards a heartbeat again after a failed exchange', async () => {
     const mailbox = await started({ syncIntervalMs: 10 });
     touchHeartbeat();

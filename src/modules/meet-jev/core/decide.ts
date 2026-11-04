@@ -23,7 +23,7 @@ const BOUNDARY_TIMER = 'boundary:';
 /** A speaker's STT final comes up to ~3 s after their VAD end; a boundary waits that long for it. */
 const FINAL_MARGIN_MS = 3_000;
 const WAKES_KEPT = 8;
-const STOP_WORDS = new Set(['stop', 'please stop', 'stop please', 'стоп']);
+const STOP_WORDS = new Set(['stop', 'please stop', 'stop please', 'стоп', 'стій', 'зупинись']);
 
 export function reduce(prev: CallState, event: CallEvent): CallState {
   const state = structuredClone<CallState>({ ...prev, commands: [] });
@@ -281,5 +281,36 @@ export function vocativeOf(text: string, names: string[]): { vocative: boolean; 
       new RegExp(`^(.*?)\\s*,\\s*${n}\\s*[.?!]*$`, 'u').exec(said);
     if (match) return { vocative: true, rest: unpunctuated(match[1]) };
   }
+  // One-word names in another script or case form ("Ден, ...", "Дене, ...", "..., Ден?").
+  const keys = new Set(names.filter((name) => !/\s/.test(name.trim())).map(nameKey));
+  const lead = /^(?:(?:hey|hi|гей|хей|эй|привіт)\s+)?([\p{L}]+)\s*[,!:]\s*(.*)$/u.exec(said);
+  if (lead && sameName(lead[1], keys)) return { vocative: true, rest: unpunctuated(lead[2]) };
+  const tail = /^(.*?)\s*,\s*([\p{L}]+)\s*[.?!]*$/u.exec(said);
+  if (tail && sameName(tail[2], keys)) return { vocative: true, rest: unpunctuated(tail[1]) };
   return { vocative: false, rest: unpunctuated(said) };
+}
+
+/** Cyrillic letters as Latin sounds (the worker's wake matching uses the same table). */
+const CYRILLIC_LATIN: Record<string, string> = Object.fromEntries(
+  'а:a б:b в:v г:h ґ:g д:d е:e є:ye ё:yo ж:zh з:z и:y і:i ї:yi й:y к:k л:l м:m н:n о:o п:p р:r с:s т:t у:u ф:f х:h ц:ts ч:ch ш:sh щ:shch ь: ъ: ы:y э:e ю:yu я:ya'
+    .split(' ')
+    .map((pair) => pair.split(':')),
+);
+
+/** A name's sound: Latin letters, every vowel one mark, doubled letters once (`Ден` and `Dan` agree). */
+function nameKey(word: string): string {
+  let latin = '';
+  for (const ch of word.normalize('NFKC').toLowerCase()) latin += CYRILLIC_LATIN[ch] ?? ch;
+  return latin
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .replace(/kh/g, 'h')
+    .replace(/[aeiouy]/g, '*')
+    .replace(/([^*])\1+/g, '$1');
+}
+
+/** A word is one of the names, also in a Cyrillic vocative case ending in -е or -у (`Дене`). */
+function sameName(word: string, keys: Set<string>): boolean {
+  if (keys.has(nameKey(word))) return true;
+  return /^[\p{Script=Cyrillic}]{4,}$/u.test(word) && /[еу]$/u.test(word) && keys.has(nameKey(word.slice(0, -1)));
 }
