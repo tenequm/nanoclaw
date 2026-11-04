@@ -351,7 +351,7 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_VOCABULARY` | empty | Comma-separated names, merged with the agent's `voice.vocabulary.txt`. |
 | `VOICE_MODE_TTS_DEESS`, `VOICE_MODE_TTS_NOTCH` | on | De-essing and fixed whistle notches; `off`, `false` or `0` disables each. |
 | `VOICE_MODE_WAKE_MODEL` | bundled `hey_livekit.onnx` | Custom acoustic classifier path, or `off` for transcript wake. |
-| `VOICE_MODE_WAKE_PHRASE` | `Hey LiveKit` | Label of the acoustic phrase; it does not train or change the model. Its name (`Hey Dan`: `Dan`) is also the one name a `/meet` meeting wakes on, `Dan` when the phrase names none. |
+| `VOICE_MODE_WAKE_PHRASE` | `Hey LiveKit` | Label of the acoustic phrase; it does not train or change the model. Its name (`Hey Dan`: `Dan`; a phrase with no wake word, such as `Jarvis`, is the name itself) is also the one name a `/meet` meeting wakes on, `Dan` only when the phrase is unset. |
 | `VOICE_MODE_WAKE_THRESHOLD` | `0.68` bundled, `0.5` custom | Acoustic confidence threshold between zero and one. |
 | `VOICE_MODE_WAKE_HOP_MS` | `40` | Acoustic scoring hop, `40` or `80` milliseconds; anything else is logged and read as `40`. `40` scores on two interleaved 80 ms grids, about 30% of one core during a call. |
 | `VOICE_MODE_WAKE_START_SECONDS`, `VOICE_MODE_WAKE_IDLE_SECONDS` | `8`, `20` | After the wake phrase, how long the wake waits for the caller's first speech, then how long after the caller's last speech, before it goes back to waiting; zero disables each timer. |
