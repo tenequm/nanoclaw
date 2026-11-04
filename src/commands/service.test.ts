@@ -26,7 +26,7 @@ vi.mock('../container-restart.js', () => ({
 // Isolate transcript reads (sessionsBaseDir) into the test dir.
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-commands' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-commands-${process.pid}` };
 });
 
 import { closeDb, initTestDb } from '../db/connection.js';
@@ -57,7 +57,7 @@ const OWNER = 'telegram:1';
 const NON_ADMIN = 'telegram:2';
 const SCOPED_ADMIN = 'telegram:3';
 
-const TEST_DIR = '/tmp/nanoclaw-test-commands';
+const TEST_DIR = `/tmp/nanoclaw-test-commands-${process.pid}`;
 
 function now() {
   return new Date().toISOString();

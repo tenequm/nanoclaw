@@ -14,7 +14,7 @@ import { ensureSchema, openInboundDb } from './session-db.js';
 import { insertTaskRow, getCompletedRecurring } from './tasks.js';
 import { wrapSqliteInbound } from './index.js';
 
-const TEST_DIR = '/tmp/nanoclaw-arm-next-task-test';
+const TEST_DIR = `/tmp/nanoclaw-arm-next-task-test-${process.pid}`;
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 function freshDb() {

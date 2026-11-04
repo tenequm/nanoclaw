@@ -63,7 +63,9 @@ describe('implicit gateway migration', () => {
   });
 });
 
-describe('real detector probe', () => {
+// Two real `pnpm exec tsx` runs, because pnpm's behaviour is what is under test; their pnpm and tsx
+// startup alone has passed vitest's 5s default under full-suite load.
+describe('real detector probe', { timeout: 30_000 }, () => {
   it('detects an installed gateway from inside a nested pnpm', () => {
     // An outer `pnpm exec` sets this. The inner pnpm then prints a WARN to stdout
     // for a nested package.json with a `pnpm` field, ahead of the detector's answer.

@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-mail-feed' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-mail-feed-${process.pid}` };
 });
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
@@ -16,7 +16,7 @@ import { registerReconcileEnqueue } from './reconcile-feeds.js';
 import { initSessionFolder, writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-mail-feed';
+const TEST_DIR = `/tmp/nanoclaw-test-mail-feed-${process.pid}`;
 const AG = 'ag-feed';
 const SESS = 'sess-feed';
 

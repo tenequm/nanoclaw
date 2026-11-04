@@ -6,7 +6,9 @@ import { describe, expect, it } from 'vitest';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-describe('standalone setup mailbox composition', () => {
+// Each case boots a fresh node that transpiles a setup entry's module graph: register.ts pulls in most
+// of the host, ~3.5s with a cold tsx cache before any full-suite load, past vitest's 5s default under it.
+describe('standalone setup mailbox composition', { timeout: 30_000 }, () => {
   it.each(['setup/migrate-v2/sessions.ts', 'setup/migrate-v2/tasks.ts'])(
     '%s loads before validating argv',
     (script) => {

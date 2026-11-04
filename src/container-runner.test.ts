@@ -12,7 +12,6 @@ import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { CONTAINER_CPU_LIMIT, CONTAINER_MEMORY_LIMIT } from './config.js';
 import type { ContainerConfig } from './container-config.js';
 import {
   armSessionLifecycle,
@@ -32,6 +31,13 @@ import type { AgentGroup, Session } from './types.js';
 
 vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+}));
+
+// The limits as an install without them sets them, not as this host's .env or environment does.
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  CONTAINER_CPU_LIMIT: '',
+  CONTAINER_MEMORY_LIMIT: '',
 }));
 
 afterEach(() => resetGatewayProvider());
@@ -356,11 +362,25 @@ describe('composeSessionSpec', () => {
     }
   });
 
-  it('leaves cpu and memory unset by default (unbounded, as today)', () => {
+  it('leaves cpu and memory unset by default (unbounded, as today)', async () => {
     // Guards the knobs' own defaults: an accidental default cap would OOM-kill
-    // workloads that run fine now.
-    expect(CONTAINER_CPU_LIMIT).toBe('');
-    expect(CONTAINER_MEMORY_LIMIT).toBe('');
+    // workloads that run fine now. Read from a fresh config in a cwd with no
+    // .env and with neither knob in the environment.
+    const originalCwd = process.cwd();
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-limits-default-'));
+    try {
+      process.chdir(empty);
+      vi.stubEnv('CONTAINER_CPU_LIMIT', undefined);
+      vi.stubEnv('CONTAINER_MEMORY_LIMIT', undefined);
+      vi.resetModules();
+      const defaults = await vi.importActual<typeof import('./config.js')>('./config.js');
+      expect(defaults.CONTAINER_CPU_LIMIT).toBe('');
+      expect(defaults.CONTAINER_MEMORY_LIMIT).toBe('');
+    } finally {
+      process.chdir(originalCwd);
+      vi.unstubAllEnvs();
+      fs.rmSync(empty, { recursive: true, force: true });
+    }
     const spec = compose();
     expect(spec.resources.cpus).toBeUndefined();
     expect(spec.resources.memoryMb).toBeUndefined();

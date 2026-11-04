@@ -23,7 +23,17 @@ import {
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-gateway-approval' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-gateway-approval-${process.pid}` };
+});
+
+// The read-policy flags come only from each case's process.env, never from a host's .env.
+vi.mock('./env.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./env.js')>();
+  return {
+    ...actual,
+    envValue: (key: string, root?: string) =>
+      key.startsWith('NANOCLAW_GATEWAY_') ? undefined : actual.envValue(key, root),
+  };
 });
 
 vi.mock('./modules/approvals/primitive.js', () => ({
@@ -41,7 +51,7 @@ vi.mock('./modules/approvals/primitive.js', () => ({
 
 vi.mock('./modules/approvals/response-handler.js', async (importOriginal) => importOriginal());
 
-const TEST_DIR = '/tmp/nanoclaw-test-gateway-approval';
+const TEST_DIR = `/tmp/nanoclaw-test-gateway-approval-${process.pid}`;
 const delivered: Array<{ content: string; instance?: string; threadId?: string | null }> = [];
 const delivery: ChannelDeliveryAdapter = {
   async deliver(_channelType, _platformId, _threadId, _kind, content, _files, instance) {
@@ -98,6 +108,9 @@ function request(overrides: Partial<GatewayApprovalRequest> = {}): GatewayApprov
 beforeEach(async () => {
   delivered.length = 0;
   failSubscription = undefined;
+  // Off unless a case opts in, whatever the shell running the suite exports.
+  vi.stubEnv('NANOCLAW_GATEWAY_UNCREDENTIALED_READS', undefined);
+  vi.stubEnv('NANOCLAW_GATEWAY_READ_ONLY_HOSTS', undefined);
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   const db = await initTestDb();
@@ -1057,7 +1070,7 @@ describe('uncredentialed reads', () => {
     ['the hold is an explicit policy', 'true', () => ({ ...read(), trigger: 'policy' as const })],
     ['the hold has no trigger', 'true', () => ({ ...read(), trigger: undefined })],
   ])('never asks the gateway when %s', async (_name, flag, held) => {
-    if (flag !== undefined) vi.stubEnv('NANOCLAW_GATEWAY_UNCREDENTIALED_READS', flag);
+    vi.stubEnv('NANOCLAW_GATEWAY_UNCREDENTIALED_READS', flag);
     const scope = vi.fn(async () => 'none' as const);
     const coordinator = await import('./gateway-approval-coordinator.js');
     await coordinator.startGatewayApprovalCoordinator(scoped(scope), delivery, vi.fn());

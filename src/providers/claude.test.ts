@@ -1,12 +1,12 @@
 import fs from 'fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-claude-provider-env-test';
+const TEST_ROOT = `/tmp/nanoclaw-claude-provider-env-test-${process.pid}`;
 
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-claude-provider-env-test/data',
-  GROUPS_DIR: '/tmp/nanoclaw-claude-provider-env-test/groups',
+  DATA_DIR: `/tmp/nanoclaw-claude-provider-env-test-${process.pid}/data`,
+  GROUPS_DIR: `/tmp/nanoclaw-claude-provider-env-test-${process.pid}/groups`,
 }));
 
 const dotenv = vi.hoisted(() => ({ values: {} as Record<string, string> }));
