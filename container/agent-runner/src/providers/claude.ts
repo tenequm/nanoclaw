@@ -362,7 +362,9 @@ export class ClaudeProvider implements AgentProvider {
               .filter((block) => block.type === 'text' && block.text)
               .map((block) => block.text)
               .join('');
-            if (text) yield { type: 'text', text };
+            // Subagent text is the subagent's report to the main thread, never
+            // chat output: only the main thread may open a delivery door.
+            if (text && !assistant.parent_tool_use_id) yield { type: 'text', text };
             // Subagent tool calls are the subagent's own work; the main
             // thread's Agent call already marks that work.
             if (!assistant.parent_tool_use_id) {

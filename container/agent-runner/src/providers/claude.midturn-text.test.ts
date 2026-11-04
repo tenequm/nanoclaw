@@ -75,6 +75,28 @@ describe('assistant text block surfacing', () => {
 
     expect(seen).toEqual(['text:checking', 'tool:mcp__nanoclaw__send_message', 'tool:Bash']);
   });
+  it('yields no text for subagent messages, even a wrapped <message> block', async () => {
+    sdkMessages.length = 0;
+    sdkMessages.push(
+      { type: 'system', subtype: 'init', session_id: 'sess-9' },
+      {
+        type: 'assistant',
+        parent_tool_use_id: 'toolu_agent',
+        message: { content: [{ type: 'text', text: '<message to="room">subagent report</message>' }] },
+      },
+      { type: 'assistant', message: { content: [{ type: 'text', text: '<message to="room">reply</message>' }] } },
+      { type: 'result', subtype: 'success', result: 'done' },
+    );
+
+    const provider = createProvider('claude');
+    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+    const q = provider.query({ prompt: 'hi', cwd: tmp });
+
+    const texts: string[] = [];
+    for await (const e of q.events) if (e.type === 'text') texts.push(e.text);
+
+    expect(texts).toEqual(['<message to="room">reply</message>']);
+  });
   it("passes the SDK result's stop_reason through as stopReason", async () => {
     sdkMessages.length = 0;
     sdkMessages.push(
