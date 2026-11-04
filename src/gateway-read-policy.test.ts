@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { permitsConfiguredGatewayRead, permitsUncredentialedGatewayRead } from './gateway-read-policy.js';
 
+// Each case sets the flags through process.env; a host's .env must not fill the ones it leaves unset.
+vi.mock('./env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./env.js')>()),
+  envValue: () => undefined,
+}));
+
 afterEach(() => vi.unstubAllEnvs());
 
 it.each(['GET', 'HEAD'])('allows configured %s destinations', (method) => {
@@ -48,7 +54,7 @@ describe('uncredentialed reads', () => {
     ['lower-case method', 'true', { method: 'get', sendsPayload: false }],
     ['missing method', 'true', { sendsPayload: false }],
   ])('refuses %s', (_name, flag, destination) => {
-    if (flag !== undefined) vi.stubEnv('NANOCLAW_GATEWAY_UNCREDENTIALED_READS', flag);
+    vi.stubEnv('NANOCLAW_GATEWAY_UNCREDENTIALED_READS', flag);
     expect(permitsUncredentialedGatewayRead(destination)).toBe(false);
   });
 });
