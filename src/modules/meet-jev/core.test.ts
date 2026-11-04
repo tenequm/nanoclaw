@@ -98,6 +98,74 @@ function wakeAndSpeak(call: Call, text: string, answer: string, n: number): stri
   return replyId;
 }
 
+describe('follow-up exchanges', () => {
+  it('has no exchange before a reply finishes', () => {
+    const call = new Call('meet');
+    expect(toJevState(call.state).facts).toMatchObject({ last_reply_to: null, in_exchange_with: null });
+    wakeAndSpeak(call, 'Dan, what is two plus two?', 'Four.', 1);
+    expect(toJevState(call.state).facts).toMatchObject({ last_reply_to: null, in_exchange_with: null });
+  });
+
+  it.each(['completed', 'cut_off'] as const)('sets the exchange after playback is %s', (state) => {
+    const call = new Call('meet');
+    const replyId = wakeAndSpeak(call, 'Dan, what is two plus two?', 'Four.', 1);
+    call.feed({ kind: 'playback', replyId, state, delivered: 'Four.' });
+    expect(toJevState(call.state).facts).toMatchObject({
+      last_reply_to: { speaker: 'Misha', s_ago: 0 },
+      in_exchange_with: 'Misha',
+    });
+    call.say(misha, 'u2', 'And three plus three?');
+    expect(toJevState(call.state).facts.in_exchange_with).toBe('Misha');
+  });
+
+  it('ends on another speaker final, and does not resume when the first speaker returns', () => {
+    const call = new Call('meet');
+    const replyId = wakeAndSpeak(call, 'Dan, what is two plus two?', 'Four.', 1);
+    call.feed({ kind: 'playback', replyId, state: 'completed' });
+    call.feed({ kind: 'utterance', speaker: olena, uttId: 'o1', text: 'My turn', final: false });
+    expect(toJevState(call.state).facts.in_exchange_with).toBe('Misha');
+    const version = call.state.windowVersion;
+    call.feed({ kind: 'utterance', speaker: olena, uttId: 'o1', text: 'My turn', final: true });
+    expect(toJevState(call.state).facts.in_exchange_with).toBeNull();
+    expect(call.state.windowVersion).toBeGreaterThan(version);
+    call.say(misha, 'u2', 'And three plus three?');
+    expect(toJevState(call.state).facts).toMatchObject({
+      last_reply_to: { speaker: 'Misha' },
+      in_exchange_with: null,
+    });
+  });
+
+  it('expires after 60 seconds and rejudges an in-flight verdict', () => {
+    const call = new Call('meet');
+    const replyId = wakeAndSpeak(call, 'Dan, what is two plus two?', 'Four.', 1);
+    call.feed({ kind: 'playback', replyId, state: 'completed' });
+    const endedAt = call.state.now;
+    const [judge] = only(call.say(misha, 'u2', 'And three plus three?'), 'judge');
+    const version = call.state.windowVersion;
+    call.feed({ kind: 'timer', key: 'clock', at: endedAt + 60_000 });
+    expect(toJevState(call.state).facts).toMatchObject({
+      last_reply_to: { speaker: 'Misha', s_ago: 60 },
+      in_exchange_with: 'Misha',
+    });
+    expect(call.state.windowVersion).toBe(version);
+    call.feed({ kind: 'timer', key: 'clock', at: endedAt + 60_001 });
+    expect(toJevState(call.state).facts.in_exchange_with).toBeNull();
+    expect(call.state.windowVersion).toBeGreaterThan(version);
+    const commands = call.verdict(judge.windowVersion, 'answer');
+    expect(only(commands, 'turn')).toEqual([]);
+    expect(only(commands, 'judge')).toHaveLength(1);
+  });
+
+  it('does not start an exchange for failed or unprompted replies', () => {
+    const call = new Call('meet');
+    const replyId = wakeAndSpeak(call, 'Dan, what is two plus two?', 'Four.', 1);
+    call.feed({ kind: 'playback', replyId, state: 'failed' });
+    call.feed({ kind: 'reply', replyId: 'unprompted', turnId: null, text: 'Hello.' });
+    call.feed({ kind: 'playback', replyId: 'unprompted', state: 'completed' });
+    expect(toJevState(call.state).facts).toMatchObject({ last_reply_to: null, in_exchange_with: null });
+  });
+});
+
 describe('a named question', () => {
   it('goes to Jev with addressed_by_name, and an answer wakes with the window in the note', () => {
     const call = new Call();
