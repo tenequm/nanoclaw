@@ -1,0 +1,117 @@
+# Publishes the agent image to GHCR, in two variants:
+#
+#   nanoclaw-agent      container/Dockerfile as-is - the same image
+#                       ./container/build.sh builds, for hosts that bind-mount
+#                       the runner source and skills at spawn.
+#   nanoclaw-agent-k8s  the above plus container/agent-runner/src at /app/src
+#                       and container/skills at /app/skills (Dockerfile.k8s),
+#                       for hosts that cannot mount a checkout.
+#
+# The k8s variant is built FROM the base by the digest pushed a step earlier,
+# so both always share the same underlying bytes. linux/amd64 only for now;
+# arm64 is a `platforms:` change on both builds (QEMU or an arm runner).
+name: agent-image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'container/**'
+      - '.github/workflows/agent-image.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BASE_IMAGE: ghcr.io/tenequm/nanoclaw-agent
+  K8S_IMAGE: ghcr.io/tenequm/nanoclaw-agent-k8s
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same label build.sh writes, so container/pull.sh accepts these images
+      # without NANOCLAW_ALLOW_UNLABELED_IMAGE.
+      - name: Hash the agent-runner lockfile
+        id: lock
+        run: echo "sha256=$(sha256sum container/agent-runner/bun.lock | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Tags for the base image
+        id: base-meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.BASE_IMAGE }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # IMAGE_SOURCE stays at the Dockerfile's `local`: this is a plain build
+      # of the public-base Dockerfile, not the vendor-hardened image, and any
+      # value other than hardened/local/derived reads as hardened in --status.
+      - name: Build and push the base image
+        id: base
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: container
+          file: container/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            AGENT_RUNNER_LOCK_SHA256=${{ steps.lock.outputs.sha256 }}
+          tags: ${{ steps.base-meta.outputs.tags }}
+          labels: ${{ steps.base-meta.outputs.labels }}
+          cache-from: type=gha,scope=agent-image-base
+          cache-to: type=gha,scope=agent-image-base,mode=max
+
+      - name: Tags for the k8s image
+        id: k8s-meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.K8S_IMAGE }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push the k8s image
+        id: k8s
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: container
+          file: container/Dockerfile.k8s
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}@${{ steps.base.outputs.digest }}
+            SOURCE_REVISION=${{ github.sha }}
+          tags: ${{ steps.k8s-meta.outputs.tags }}
+          labels: ${{ steps.k8s-meta.outputs.labels }}
+
+      - name: Summary
+        env:
+          BASE_DIGEST: ${{ steps.base.outputs.digest }}
+          K8S_DIGEST: ${{ steps.k8s.outputs.digest }}
+        run: |
+          {
+            echo '| Image | Pin |'
+            echo '|---|---|'
+            echo "| base | \`${BASE_IMAGE}@${BASE_DIGEST}\` |"
+            echo "| k8s | \`${K8S_IMAGE}@${K8S_DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

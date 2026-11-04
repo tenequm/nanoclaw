@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# Same frontend pin as container/Dockerfile; bump the two together.
+#
+# The agent image with the runner source and container skills baked in, for
+# hosts that cannot bind-mount a checkout (Kubernetes). The base image is the
+# stock one, unchanged; this only adds what the host would otherwise mount at
+# spawn. The source is frozen at build time - nothing overrides it at runtime
+# unless the pod mounts over /app/src or /app/skills itself.
+#
+# Build context is container/, like the base:
+#   docker build -f container/Dockerfile.k8s \
+#     --build-arg BASE_IMAGE=ghcr.io/tenequm/nanoclaw-agent@sha256:<digest> container
+
+ARG BASE_IMAGE=ghcr.io/tenequm/nanoclaw-agent:latest
+FROM ${BASE_IMAGE}
+
+# Root-owned and not writable by the `node` user the agent runs as, matching
+# the read-only bind mounts this replaces.
+COPY --chown=root:root agent-runner/src /app/src
+COPY --chown=root:root skills /app/skills
+
+# Last, so a new commit only rewrites metadata. The lock and image-source
+# labels are inherited from the base.
+ARG SOURCE_REVISION=
+LABEL dev.nanoclaw.baked-source-revision="${SOURCE_REVISION}"

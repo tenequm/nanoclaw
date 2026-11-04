@@ -621,6 +621,7 @@ export async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(batchIds);
+        await refreshMailbox();
         const resultText = event.text ?? '';
         const failed = event.isError === true;
         // A clean end_turn that leaves a <message to="..."> block open ends the
@@ -1079,6 +1080,15 @@ function trailingTagPrefixStart(masked: string): number {
     if (tailK.toLowerCase() === '<internal'.slice(0, k)) return masked.length - k;
   }
   return -1;
+}
+
+/** Failed syncs leave the result-door reads on the current replica. */
+async function refreshMailbox(): Promise<void> {
+  try {
+    await getAgentMailbox().run(() => undefined);
+  } catch (err) {
+    log(`mailbox refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /** Current outbound seq high-water mark (0 when the table is empty). */

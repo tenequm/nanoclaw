@@ -1,0 +1,13 @@
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: nanoclaw-agent-pool
+  namespace: default
+spec:
+  replicas: 1
+  # Replace warm sandboxes as soon as the template changes, instead of handing
+  # out stale ones until the pool next replenishes (the OnReplenish default).
+  updateStrategy:
+    type: Recreate
+  sandboxTemplateRef:
+    name: nanoclaw-agent

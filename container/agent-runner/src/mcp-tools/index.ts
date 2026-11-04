@@ -25,10 +25,12 @@ async function main(): Promise<void> {
   const mailbox = getAgentMailbox();
   if (loadConfig().richMessages) offerRichMessages();
   await mailbox.start(await readMailboxContext());
+  // Stdio attaches before tools finish; their HTTP replica must keep syncing.
   try {
     await startMcpServer((action) => mailbox.run(action));
-  } finally {
+  } catch (err) {
     await mailbox.stop();
+    throw err;
   }
 }
 

@@ -1,0 +1,514 @@
+/**
+ * The runner's view of a session mailbox, executed on the host for the HTTP
+ * transport. Same files and SQL semantics as the runner's own SQLite mailbox
+ * (container/agent-runner/src/mailbox/sqlite/operations.ts); records cross the
+ * wire in the canonical model shape.
+ *
+ * Adding an operation is one entry in RUNNER_OPS (plus the matching entry in
+ * the runner client's tables).
+ */
+import type Database from 'better-sqlite3';
+
+import { log } from '../../log.js';
+import {
+  createOutboundRecord,
+  parseDestinationRecord,
+  parseInboundRecord,
+  parseOutboundRecord,
+  parseOutboundWrite,
+  parseSessionRoutingRecord,
+  parseStateRecord,
+  type DestinationRecord,
+  type InboundRecord,
+  type OutboundRecord,
+  type ProcessingStatus,
+  type SessionRoutingRecord,
+  type StateRecord,
+} from '../model.js';
+
+import { OUTBOUND_SCHEMA } from '../sqlite/schema.js';
+
+const SQLITE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+
+function sqliteTimestamp(value: string): string {
+  const source = SQLITE_TIMESTAMP.test(value) ? `${value.replace(' ', 'T')}Z` : value;
+  const milliseconds = Date.parse(source);
+  return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : value;
+}
+
+/** How many recent rows a fresh replica receives per table. */
+const SNAPSHOT_WINDOW = 500;
+
+const PROCESSING_STATUSES = new Set<ProcessingStatus>(['processing', 'completed', 'failed', 'script-skip:error']);
+const TURN_STATES = new Set(['working', 'idle']);
+
+/** A caller mistake (HTTP 400): bad op name, bad arguments, or a record that fails validation. */
+export class MailboxRequestError extends Error {}
+
+export interface RunnerSession {
+  inbound: Database.Database;
+  outbound: Database.Database;
+  touchHeartbeat(): void;
+}
+
+export interface SnapshotCursor {
+  inbound: number;
+  outbound: number;
+  delivered: number;
+}
+
+export interface RunnerSnapshot {
+  cursor: SnapshotCursor;
+  /** Every pending inbound row, refreshed in full on each snapshot. */
+  pending: InboundRecord[];
+  /** processing_ack status for pending ids that the runner already claimed. */
+  claimed: Record<string, ProcessingStatus>;
+  /** Inbound rows past the cursor (a recent window on a fresh cursor). */
+  inbound: InboundRecord[];
+  /** Outbound rows past the cursor (a recent window on a fresh cursor). */
+  outbound: OutboundRecord[];
+  delivered: Array<{ messageOutId: string; platformMessageId: string | null; status: string }>;
+  latestRoutes: Array<{ channelType: string; platformId: string; threadId: string | null; inReplyTo: string }>;
+  /** findSeqByPlatformMessageId answered for every pending row's `replyTo.id`, so the formatter is exact. */
+  replySeqs: Array<{ channelType: string; platformId: string; platformMessageId: string; sequence: number | null }>;
+  destinations: DestinationRecord[];
+  routing: SessionRoutingRecord;
+  state: StateRecord[];
+}
+
+type Row = Record<string, unknown>;
+
+function nullableTimestamp(value: unknown): string | null {
+  return value === null || value === undefined ? null : sqliteTimestamp(String(value));
+}
+
+function inboundRecord(row: Row): InboundRecord | undefined {
+  try {
+    return parseInboundRecord({
+      id: row.id,
+      sequence: row.seq,
+      kind: row.kind,
+      timestamp: sqliteTimestamp(String(row.timestamp)),
+      status: row.status,
+      processAfter: nullableTimestamp(row.process_after),
+      recurrence: row.recurrence ?? null,
+      seriesId: row.series_id ?? null,
+      tries: row.tries ?? 0,
+      trigger: row.trigger === undefined ? true : row.trigger === 1,
+      platformId: row.platform_id ?? null,
+      channelType: row.channel_type ?? null,
+      threadId: row.thread_id ?? null,
+      content: row.content,
+      sourceSessionId: row.source_session_id ?? null,
+      onWake: row.on_wake === 1,
+    });
+  } catch (err) {
+    // Same containment as the runner's SQLite reader: one bad row never blocks the mailbox.
+    log.warn('Skipping invalid inbound mailbox row', { id: String(row.id), err });
+    return undefined;
+  }
+}
+
+function outboundRecord(row: Row): OutboundRecord | undefined {
+  try {
+    return parseOutboundRecord({
+      id: row.id,
+      sequence: row.seq,
+      inReplyTo: row.in_reply_to ?? null,
+      timestamp: sqliteTimestamp(String(row.timestamp)),
+      deliverAfter: nullableTimestamp(row.deliver_after),
+      recurrence: row.recurrence ?? null,
+      kind: row.kind,
+      platformId: row.platform_id ?? null,
+      channelType: row.channel_type ?? null,
+      threadId: row.thread_id ?? null,
+      content: row.content,
+    });
+  } catch (err) {
+    log.warn('Skipping invalid outbound mailbox row', { id: String(row.id), err });
+    return undefined;
+  }
+}
+
+/** Destination/state rows get the same containment: one bad row never blocks the mailbox. */
+function contained<T>(kind: string, parse: () => T): T | undefined {
+  try {
+    return parse();
+  } catch (err) {
+    log.warn(`Skipping invalid ${kind} mailbox row`, { err });
+    return undefined;
+  }
+}
+
+function defined<T>(value: T | undefined): value is T {
+  return value !== undefined;
+}
+
+function tableExists(db: Database.Database, name: string): boolean {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
+}
+
+function maxSeq(db: Database.Database, table: 'messages_in' | 'messages_out'): number {
+  return (db.prepare(`SELECT COALESCE(MAX(seq), 0) AS value FROM ${table}`).get() as { value: number }).value;
+}
+
+function windowRows(db: Database.Database, table: 'messages_in' | 'messages_out', after: number): Row[] {
+  if (after >= 0) return db.prepare(`SELECT * FROM ${table} WHERE seq > ? ORDER BY seq`).all(after) as Row[];
+  return db
+    .prepare(`SELECT * FROM (SELECT * FROM ${table} ORDER BY seq DESC LIMIT ?) ORDER BY seq`)
+    .all(SNAPSHOT_WINDOW) as Row[];
+}
+
+/**
+ * What the runner does lazily on its own first open (container/agent-runner/src/mailbox/sqlite/connection.ts):
+ * older outbound.db files lack tables and columns, and carry legacy empty `updated_at` values.
+ */
+export function ensureRunnerOutboundTables(outbound: Database.Database): void {
+  outbound.exec(OUTBOUND_SCHEMA);
+  const stateColumns = new Set(
+    (outbound.prepare("PRAGMA table_info('session_state')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!stateColumns.has('updated_at')) {
+    outbound.exec(`ALTER TABLE session_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'`);
+  }
+  outbound.exec(`UPDATE session_state SET updated_at = '1970-01-01T00:00:00.000Z' WHERE updated_at = ''`);
+  const containerColumns = new Set(
+    (outbound.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!containerColumns.has('turn')) outbound.exec('ALTER TABLE container_state ADD COLUMN turn TEXT');
+}
+
+/**
+ * Port of the runner's sqliteFindSeqByPlatformMessageId: an inbound row whose
+ * id is the platform id or the Telegram compound `<chat>:<msg>:<agent group>`
+ * (never a derived `:edit:`/`:reaction:` row), else a delivered outbound row.
+ */
+function findSeqByPlatformMessageId(
+  session: RunnerSession,
+  channelType: string,
+  platformId: string,
+  platformMessageId: string,
+): number | null {
+  const { inbound, outbound } = session;
+  const chat = platformId.startsWith(`${channelType}:`)
+    ? platformId.slice(channelType.length + 1).split(':')[0]
+    : platformId;
+  const prefix = `${chat}:${platformMessageId}:`;
+  const inboundRow = inbound
+    .prepare(
+      `SELECT seq FROM messages_in
+       WHERE channel_type = $channel_type AND platform_id = $platform_id AND seq IS NOT NULL
+         AND (id = $id OR (id >= $prefix AND id < $prefix_end AND instr(substr(id, length($prefix) + 1), ':') = 0))
+       ORDER BY seq LIMIT 1`,
+    )
+    .get({
+      channel_type: channelType,
+      platform_id: platformId,
+      id: platformMessageId,
+      prefix,
+      prefix_end: `${prefix.slice(0, -1)};`,
+    }) as { seq: number } | undefined;
+  if (inboundRow) return inboundRow.seq;
+  const outIds = (
+    inbound.prepare('SELECT message_out_id FROM delivered WHERE platform_message_id = ?').all(platformMessageId) as {
+      message_out_id: string;
+    }[]
+  ).map((row) => row.message_out_id);
+  if (outIds.length === 0) return null;
+  const outboundRow = outbound
+    .prepare(
+      `SELECT seq FROM messages_out
+       WHERE id IN (${outIds.map(() => '?').join(', ')}) AND channel_type = ? AND platform_id = ? AND seq IS NOT NULL
+       ORDER BY seq LIMIT 1`,
+    )
+    .get(...outIds, channelType, platformId) as { seq: number } | undefined;
+  return outboundRow?.seq ?? null;
+}
+
+function replyToId(content: unknown): string | null {
+  try {
+    const id = (JSON.parse(String(content)) as { replyTo?: { id?: unknown } } | null)?.replyTo?.id;
+    return id === null || id === undefined || id === '' ? null : String(id);
+  } catch {
+    return null;
+  }
+}
+
+function snapshot(session: RunnerSession, cursor: SnapshotCursor | null): RunnerSnapshot {
+  const { inbound, outbound } = session;
+  const pendingRows = inbound.prepare("SELECT * FROM messages_in WHERE status = 'pending' ORDER BY seq").all() as Row[];
+  const claimed: Record<string, ProcessingStatus> = {};
+  const ackStatement = outbound.prepare('SELECT message_id, status FROM processing_ack WHERE message_id = ?');
+  for (const row of pendingRows) {
+    const ack = ackStatement.get(row.id) as { message_id: string; status: ProcessingStatus } | undefined;
+    if (ack) claimed[ack.message_id] = ack.status;
+  }
+
+  const inboundRows = windowRows(inbound, 'messages_in', cursor ? cursor.inbound : -1);
+  const outboundRows = windowRows(outbound, 'messages_out', cursor ? cursor.outbound : -1);
+  const deliveredRows = (
+    cursor
+      ? inbound
+          .prepare(
+            'SELECT rowid, message_out_id, platform_message_id, status FROM delivered WHERE rowid > ? ORDER BY rowid',
+          )
+          .all(cursor.delivered)
+      : inbound
+          .prepare(
+            'SELECT * FROM (SELECT rowid, message_out_id, platform_message_id, status FROM delivered ORDER BY rowid DESC LIMIT ?) ORDER BY rowid',
+          )
+          .all(SNAPSHOT_WINDOW)
+  ) as Array<{ rowid: number; message_out_id: string; platform_message_id: string | null; status: string }>;
+
+  const latestRoutes = (
+    inbound
+      .prepare(
+        `SELECT id, channel_type, platform_id, thread_id FROM messages_in
+          WHERE seq IN (
+            SELECT MAX(seq) FROM messages_in
+             WHERE channel_type IS NOT NULL AND platform_id IS NOT NULL
+             GROUP BY channel_type, platform_id
+          )`,
+      )
+      .all() as Array<{ id: string; channel_type: string; platform_id: string; thread_id: string | null }>
+  ).map((row) => ({
+    channelType: row.channel_type,
+    platformId: row.platform_id,
+    threadId: row.thread_id,
+    inReplyTo: row.id,
+  }));
+
+  const replySeqs: RunnerSnapshot['replySeqs'] = [];
+  for (const row of pendingRows) {
+    const platformMessageId = replyToId(row.content);
+    if (platformMessageId === null || !row.channel_type || !row.platform_id) continue;
+    const channelType = String(row.channel_type);
+    const platformId = String(row.platform_id);
+    replySeqs.push({
+      channelType,
+      platformId,
+      platformMessageId,
+      sequence: findSeqByPlatformMessageId(session, channelType, platformId, platformMessageId),
+    });
+  }
+
+  const routingRow = tableExists(inbound, 'session_routing')
+    ? (inbound.prepare('SELECT channel_type, platform_id, thread_id FROM session_routing WHERE id = 1').get() as
+        | Row
+        | undefined)
+    : undefined;
+  const noRouting: SessionRoutingRecord = { channelType: null, platformId: null, threadId: null };
+
+  return {
+    // Advanced only past rows actually sent, so a row committed mid-snapshot is never skipped.
+    cursor: {
+      inbound: Math.max(cursor?.inbound ?? 0, Number(inboundRows.at(-1)?.seq ?? 0)),
+      outbound: Math.max(cursor?.outbound ?? 0, Number(outboundRows.at(-1)?.seq ?? 0)),
+      delivered: Math.max(cursor?.delivered ?? 0, deliveredRows.at(-1)?.rowid ?? 0),
+    },
+    pending: pendingRows.map(inboundRecord).filter(defined),
+    claimed,
+    inbound: inboundRows.map(inboundRecord).filter(defined),
+    outbound: outboundRows.map(outboundRecord).filter(defined),
+    delivered: deliveredRows.map((row) => ({
+      messageOutId: row.message_out_id,
+      platformMessageId: row.platform_message_id,
+      status: row.status,
+    })),
+    latestRoutes,
+    replySeqs,
+    destinations: (inbound.prepare('SELECT * FROM destinations ORDER BY name').all() as Row[])
+      .map((row) =>
+        contained('destination', () =>
+          parseDestinationRecord({
+            name: row.name,
+            displayName: row.display_name,
+            type: row.type,
+            channelType: row.channel_type,
+            platformId: row.platform_id,
+            agentGroupId: row.agent_group_id,
+          }),
+        ),
+      )
+      .filter(defined),
+    routing:
+      contained('session routing', () =>
+        parseSessionRoutingRecord({
+          channelType: routingRow?.channel_type ?? null,
+          platformId: routingRow?.platform_id ?? null,
+          threadId: routingRow?.thread_id ?? null,
+        }),
+      ) ?? noRouting,
+    state: (
+      outbound.prepare('SELECT key, value, updated_at FROM session_state ORDER BY key').all() as Array<{
+        key: string;
+        value: string;
+        updated_at: string;
+      }>
+    )
+      .map((row) =>
+        contained('session state', () =>
+          parseStateRecord({ key: row.key, value: row.value, updatedAt: sqliteTimestamp(row.updated_at) }),
+        ),
+      )
+      .filter(defined),
+  };
+}
+
+function writeMessageOut(session: RunnerSession, draft: unknown): number {
+  const { inbound, outbound } = session;
+  let message;
+  try {
+    message = parseOutboundWrite(draft);
+  } catch (err) {
+    throw new MailboxRequestError(err instanceof Error ? err.message : String(err));
+  }
+  // A client retry after a lost response replays the same id: answer with the
+  // committed row instead of failing on the primary key.
+  const existing = outbound.prepare('SELECT seq, kind, content FROM messages_out WHERE id = ?').get(message.id) as
+    | { seq: number; kind: string; content: string }
+    | undefined;
+  if (existing) {
+    if (existing.kind === message.kind && existing.content === message.content) return existing.seq;
+    throw new MailboxRequestError(`messages_out already holds a different row with id ${message.id}`);
+  }
+  const max = Math.max(maxSeq(outbound, 'messages_out'), maxSeq(inbound, 'messages_in'));
+  const sequence = max % 2 === 0 ? max + 1 : max + 2;
+  const record = createOutboundRecord(message, sequence, new Date().toISOString());
+  outbound
+    .prepare(
+      `INSERT INTO messages_out
+         (id, seq, in_reply_to, timestamp, deliver_after, recurrence, kind, platform_id, channel_type, thread_id, content)
+       VALUES
+         (@id, @sequence, @inReplyTo, @timestamp, @deliverAfter, @recurrence, @kind, @platformId, @channelType, @threadId, @content)`,
+    )
+    .run(record);
+  return sequence;
+}
+
+function upsertAcks(outbound: Database.Database, acks: Array<[string, string]>): void {
+  const statement = outbound.prepare(
+    'INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)',
+  );
+  for (const [id, status] of acks) statement.run(id, status, new Date().toISOString());
+}
+
+function stringArg(value: unknown, name: string): string {
+  if (typeof value !== 'string') throw new MailboxRequestError(`${name} must be a string`);
+  return value;
+}
+
+function stringArray(value: unknown, name: string): string[] {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) {
+    throw new MailboxRequestError(`${name} must be an array of strings`);
+  }
+  return value;
+}
+
+function parseCursor(value: unknown): SnapshotCursor | null {
+  if (value === null || value === undefined) return null;
+  const cursor = value as Partial<SnapshotCursor>;
+  for (const field of ['inbound', 'outbound', 'delivered'] as const) {
+    if (!Number.isSafeInteger(cursor[field]) || (cursor[field] as number) < 0) {
+      throw new MailboxRequestError(`cursor.${field} must be a nonnegative integer`);
+    }
+  }
+  return cursor as SnapshotCursor;
+}
+
+type RunnerOp = (session: RunnerSession, args: unknown[]) => unknown;
+
+export const RUNNER_OPS: Record<string, RunnerOp> = {
+  snapshot: (session, [cursor]) => snapshot(session, parseCursor(cursor)),
+  heartbeat: (session) => session.touchHeartbeat(),
+  writeMessageOut: (session, [draft]) => writeMessageOut(session, draft),
+  markMessages: (session, [ids, status]) => {
+    if (!PROCESSING_STATUSES.has(status as ProcessingStatus)) throw new MailboxRequestError('invalid status');
+    upsertAcks(
+      session.outbound,
+      stringArray(ids, 'ids').map((id) => [id, status as string]),
+    );
+  },
+  markScriptSkipped: (session, [skips]) => {
+    if (!Array.isArray(skips)) throw new MailboxRequestError('skips must be an array');
+    upsertAcks(
+      session.outbound,
+      skips.map((skip: { id?: unknown; reason?: unknown }) => [
+        stringArg(skip?.id, 'skip.id'),
+        stringArg(skip?.reason, 'skip.reason') === 'error' ? 'script-skip:error' : 'completed',
+      ]),
+    );
+  },
+  setState: (session, [key, value]) => {
+    session.outbound
+      .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(stringArg(key, 'key'), stringArg(value, 'value'), new Date().toISOString());
+  },
+  deleteState: (session, [key]) => {
+    session.outbound.prepare('DELETE FROM session_state WHERE key = ?').run(stringArg(key, 'key'));
+  },
+  setContainerToolInFlight: (session, [tool, declaredTimeoutMs]) => {
+    const timeout =
+      typeof declaredTimeoutMs === 'number' && Number.isSafeInteger(declaredTimeoutMs) && declaredTimeoutMs >= 0
+        ? declaredTimeoutMs
+        : null;
+    const now = new Date().toISOString();
+    session.outbound
+      .prepare(
+        `INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at, updated_at)
+         VALUES (1, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           current_tool = excluded.current_tool,
+           tool_declared_timeout_ms = excluded.tool_declared_timeout_ms,
+           tool_started_at = excluded.tool_started_at,
+           updated_at = excluded.updated_at`,
+      )
+      .run(stringArg(tool, 'tool'), timeout, now, now);
+  },
+  clearContainerToolInFlight: (session) => {
+    session.outbound
+      .prepare(
+        `INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at, updated_at)
+         VALUES (1, NULL, NULL, NULL, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           current_tool = NULL,
+           tool_declared_timeout_ms = NULL,
+           tool_started_at = NULL,
+           updated_at = excluded.updated_at`,
+      )
+      .run(new Date().toISOString());
+  },
+  markContainerTurn: (session, [turn]) => {
+    if (!TURN_STATES.has(turn as string)) throw new MailboxRequestError('turn must be working or idle');
+    session.outbound
+      .prepare(
+        `INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at, turn, updated_at)
+         VALUES (1, NULL, NULL, NULL, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           turn = excluded.turn,
+           updated_at = excluded.updated_at`,
+      )
+      .run(turn, new Date().toISOString());
+  },
+  clearStaleProcessingAcks: (session) => {
+    session.outbound.prepare("DELETE FROM processing_ack WHERE status = 'processing'").run();
+  },
+};
+
+export interface RunnerOpCall {
+  op: string;
+  args: unknown[];
+}
+
+/**
+ * Run a batch atomically on the outbound side: every write commits together or
+ * none does. Returns only after the synchronous SQLite commit; the caller
+ * answers the HTTP request after this, which is what makes the runner's async
+ * writes durable when their promise resolves.
+ */
+export function executeRunnerOps(session: RunnerSession, calls: RunnerOpCall[]): unknown[] {
+  for (const call of calls) {
+    if (!Object.hasOwn(RUNNER_OPS, call.op)) throw new MailboxRequestError(`unknown mailbox op: ${call.op}`);
+  }
+  return session.outbound.transaction(() => calls.map((call) => RUNNER_OPS[call.op](session, call.args) ?? null))();
+}
