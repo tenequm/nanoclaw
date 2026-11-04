@@ -689,6 +689,7 @@ async function deliverToAgent(
       event.platformId,
       effectiveThreadId,
       mg.instance,
+      event.message.id,
     );
     const freshSession = await getSession(session.id);
     if (freshSession) {

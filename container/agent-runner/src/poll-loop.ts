@@ -6,6 +6,7 @@ import {
   markScriptSkipped,
   type MessageInRow,
 } from './db/messages-in.js';
+import { markContainerTurn } from './db/container-state.js';
 import { getUndeliveredMessages, writeMessageOut, type MessageOutRow } from './db/messages-out.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
 import { resolveDestinationThread } from './db/session-routing.js';
@@ -37,6 +38,13 @@ import type { ProviderRuntimeContract } from './provider-contracts/registry.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+/**
+ * While a turn runs, re-mark it 'working' this often so the container_state
+ * row's updated_at keeps moving through a long generation. The host treats a
+ * 'working' report as stale after three of these, so it must be well under
+ * that window.
+ */
+const WORKING_REMARK_MS = 5000;
 
 /** Consecutive driver-classified failures before a fresh runner is required. */
 const MAILBOX_FAILURE_STREAK_EXIT = 10;
@@ -425,6 +433,35 @@ export async function processQuery(
   // push order (including retries) and advance at every result, mirroring
   // archivePrompts. An empty initial prompt (a pre-warmed query) starts idle.
   let answering = initialPrompt !== '';
+  // Report the turn state to the runner-owned mailbox so the host's typing
+  // indicator follows it (working while a turn runs, idle when it ends)
+  // instead of guessing from the heartbeat file. Best-effort throughout: a
+  // failed write logs and never breaks the loop.
+  let workingRemark: ReturnType<typeof setInterval> | null = null;
+  const markTurn = (turn: 'working' | 'idle'): void => {
+    try {
+      markContainerTurn(turn);
+    } catch (err) {
+      log(`Turn-state mark (${turn}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  const enterWorking = (): void => {
+    markTurn('working');
+    if (!workingRemark) {
+      workingRemark = setInterval(() => markTurn('working'), WORKING_REMARK_MS);
+      // unref so a lingering re-mark timer can't hold the process alive.
+      workingRemark.unref?.();
+    }
+  };
+  const enterIdle = (): void => {
+    if (workingRemark) {
+      clearInterval(workingRemark);
+      workingRemark = null;
+    }
+    markTurn('idle');
+  };
+  // An initial prompt means the turn is already running when we get here.
+  if (answering) enterWorking();
   type QueuedTurn = {
     routing: RoutingContext;
     unwrappedNudged: boolean;
@@ -443,6 +480,7 @@ export async function processQuery(
     nudgedWindow = next.nudgedWindow;
     publishReplyRoute(routing);
     answering = true;
+    enterWorking();
   };
   // A retry is another provider input, behind any follow-ups already pushed.
   // Preserve its original route, prompt and retry guards until it is answered.
@@ -710,7 +748,7 @@ export async function processQuery(
         nudgedWindow = undefined;
         const next = queuedTurns.shift();
         if (next) adoptTurn(next);
-        else answering = false;
+        else { answering = false; enterIdle(); }
       }
     }
   } catch (err) {
@@ -761,6 +799,7 @@ export async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    enterIdle();
   }
 
   return { continuation: queryContinuation };

@@ -119,6 +119,38 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
         ...(inReplyTo ? { inReplyTo } : {}),
       });
     },
+    async clearTyping(
+      channelType: string,
+      platformId: string,
+      threadId: string | null,
+      instance?: string,
+    ): Promise<void> {
+      const adapter = getChannelAdapterExact(instance ?? channelType);
+      await adapter?.clearTyping?.(platformId, threadId);
+    },
+    async addReaction(
+      channelType: string,
+      platformId: string,
+      messageId: string,
+      emoji: string,
+      instance?: string,
+    ): Promise<void> {
+      const adapter = getChannelAdapterExact(instance ?? channelType);
+      await adapter?.addReaction?.(platformId, messageId, emoji);
+    },
+    async removeReaction(
+      channelType: string,
+      platformId: string,
+      messageId: string,
+      emoji: string,
+      instance?: string,
+    ): Promise<void> {
+      const adapter = getChannelAdapterExact(instance ?? channelType);
+      await adapter?.removeReaction?.(platformId, messageId, emoji);
+    },
+    typingRequiresThread(channelType: string, instance?: string): boolean {
+      return getChannelAdapterExact(instance ?? channelType)?.typingRequiresThread === true;
+    },
     threadsReplies(channelType, instance) {
       return getChannelAdapterExact(instance ?? channelType)?.threadsReplies === true;
     },

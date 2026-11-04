@@ -34,7 +34,7 @@ import { platformMessageId } from './platform-id.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
-import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import { notePresence, pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
 import type { OutboundMessage } from './mailbox/index.js';
@@ -121,6 +121,22 @@ export interface ChannelDeliveryAdapter {
     instance?: string,
     inReplyTo?: string,
   ): Promise<string | undefined>;
+  clearTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
+  addReaction?(
+    channelType: string,
+    platformId: string,
+    messageId: string,
+    emoji: string,
+    instance?: string,
+  ): Promise<void>;
+  removeReaction?(
+    channelType: string,
+    platformId: string,
+    messageId: string,
+    emoji: string,
+    instance?: string,
+  ): Promise<void>;
+  typingRequiresThread?(channelType: string, instance?: string): boolean;
   threadsReplies?(channelType: string, instance?: string): boolean;
   setTyping?(
     channelType: string,
@@ -242,6 +258,15 @@ export async function deliverToSessions(sessions: readonly Session[]): Promise<v
   });
 }
 
+function readPresence<T>(sessionId: string, read: () => T): T | undefined {
+  try {
+    return read();
+  } catch (err) {
+    log.debug('Presence read failed', { sessionId, err: String(err) });
+    return undefined;
+  }
+}
+
 export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
@@ -272,11 +297,17 @@ async function drainSession(session: Session): Promise<void> {
       const delivered = mailbox.getDeliveredIds();
       return {
         delivered,
+        containerState: readPresence(session.id, () => mailbox.getContainerState()),
         pending: mailbox.getDueMessages(delivered).filter((candidate) => !delivered.has(candidate.id)),
       };
     });
     if (!existing) return;
     ({ delivered, pending } = existing);
+    const { containerState } = existing;
+    notePresence(session.id, {
+      turn: containerState?.turn ?? null,
+      updatedAtMs: containerState ? Date.parse(containerState.updatedAt) : null,
+    });
   } catch (err) {
     log.error('Session mailbox delivery failed', {
       agentGroupId: agentGroup.id,

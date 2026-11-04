@@ -23,6 +23,7 @@ export function resetAgentMailboxForTesting(): AgentMailboxFactory | undefined {
 export type {
   AgentMailbox,
   AgentMailboxFactory,
+  TurnState,
   ContainerState,
   Destination,
   DirectOutboundMessage,

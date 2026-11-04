@@ -48,7 +48,9 @@ import { slackRawTextExtractor } from './slack-raw-text.js';
  *   grants stay explicit (`ncl members add`). A deliberate, reviewed default
  *   change for Slack DM rows auto-created after this lands.
  */
-export const SLACK_DEFAULTS: ChannelDefaults = {
+export const SLACK_TYPING_STATUS = 'is thinking...';
+
+const SLACK_DEFAULTS: ChannelDefaults = {
   dm: {
     engageMode: 'pattern',
     engagePattern: '.',
@@ -201,6 +203,23 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
     } catch {
       return null;
     }
+  };
+  // Slack's assistant status is thread-scoped: startTyping no-ops without a
+  // threadTs, so a shared-session chat never gets one and falls back to the
+  // reaction ack.
+  bridge.typingRequiresThread = true;
+  // Plain typing (no runner-supplied status line) gets a short verb phrase
+  // rather than the adapter's generic default.
+  const setTyping = bridge.setTyping!;
+  bridge.setTyping = (platformId, threadId) => setTyping(platformId, threadId, SLACK_TYPING_STATUS);
+  // Clear through setAssistantStatus directly: startTyping('') would also
+  // send loading_messages: [''] — an empty rotation entry Slack has no
+  // documented handling for. setAssistantStatus omits the field entirely,
+  // leaving the documented empty-status clear.
+  bridge.clearTyping = async (platformId: string, threadId: string | null) => {
+    const [, channel, threadTs] = (threadId ?? platformId).split(':');
+    if (!(channel && threadTs)) return; // nothing was ever painted
+    await slackAdapter.setAssistantStatus(channel, threadTs, '');
   };
   // Conversation classification closes over THIS identity's adapter, so
   // every instance (default or named) resolves through its own token.

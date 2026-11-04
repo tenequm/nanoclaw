@@ -541,6 +541,14 @@ export function appendRawText(
   serialized.text = text ? `${text}\n\n${extra}` : extra;
 }
 
+const MAX_STATUS_TEXT_LENGTH = 200;
+
+/** One line, trimmed, capped — the shape every adapter can show. */
+export function normalizeStatusText(status: string): string {
+  const oneLine = status.replace(/\s+/g, ' ').trim();
+  return oneLine.length > MAX_STATUS_TEXT_LENGTH ? `${oneLine.slice(0, MAX_STATUS_TEXT_LENGTH - 3)}...` : oneLine;
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   // The instance name becomes a webhook route segment (the route regex is
@@ -1095,9 +1103,43 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
     },
 
-    async setTyping(platformId: string, threadId: string | null) {
+    async setTyping(platformId: string, threadId: string | null, status?: string) {
       const tid = threadId ?? platformId;
-      await adapter.startTyping(tid);
+      // The Chat SDK's startTyping takes an optional status line; the Slack
+      // adapter shows it as the thread's assistant status (a single line).
+      // Neither the adapter nor Slack documents a length limit and the
+      // adapter passes the text through untouched, so normalize here:
+      // one line, trimmed, capped.
+      const text = status ? normalizeStatusText(status) : undefined;
+      await adapter.startTyping(tid, text || undefined);
+    },
+
+    async addReaction(platformId: string, messageId: string, emoji: string) {
+      await adapter.addReaction(platformId, messageId, emoji);
+    },
+
+    async removeReaction(platformId: string, messageId: string, emoji: string) {
+      await adapter.removeReaction(platformId, messageId, emoji);
+    },
+
+    // The Chat SDK adapter contract has startTyping and no stop, so clearing
+    // is platform-specific. Slack's assistant status persists until a post, an
+    // explicit clear, or a two-minute timeout, and is cleared by setting it to
+    // empty; the Slack adapter exposes
+    // setAssistantStatus(channel, threadTs, status) and decodeThreadId
+    // publicly. Call it only when the adapter has both and the decoded thread
+    // carries a threadTs; otherwise there is nothing to clear.
+    async clearTyping(platformId: string, threadId: string | null) {
+      const clearable = adapter as Partial<{
+        setAssistantStatus(channelId: string, threadTs: string, status: string): Promise<void>;
+        decodeThreadId(threadId: string): { channel?: string; threadTs?: string };
+      }>;
+      if (typeof clearable.setAssistantStatus !== 'function' || typeof clearable.decodeThreadId !== 'function') return;
+      const tid = threadId ?? platformId;
+      const decoded = clearable.decodeThreadId(tid);
+      const channel = decoded?.channel ?? adapter.channelIdFromThreadId(tid);
+      if (!decoded?.threadTs || !channel) return;
+      await clearable.setAssistantStatus(channel, decoded.threadTs, '');
     },
 
     async teardown() {

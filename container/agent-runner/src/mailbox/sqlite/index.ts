@@ -3,6 +3,7 @@ import {
   readInbound,
   sqliteClearContainerToolInFlight,
   sqliteClearStaleProcessingAcks,
+  sqliteMarkContainerTurn,
   sqliteSetContainerToolInFlight,
 } from './connection.js';
 import {
@@ -44,6 +45,7 @@ import type {
   MailboxSessionKey,
   OutboundMessage,
   ProcessingStatus,
+  TurnState,
 } from '../types.js';
 
 function inboundMessage(row: MessageInRow): InboundMessage {
@@ -230,11 +232,24 @@ export class SqliteAgentMailbox implements AgentMailbox {
       currentTool: tool,
       toolDeclaredTimeoutMs: timeout,
       toolStartedAt: new Date().toISOString(),
+      turn: null,
       updatedAt: new Date().toISOString(),
     });
     sqliteSetContainerToolInFlight(record.currentTool!, record.toolDeclaredTimeoutMs);
   }
 
   clearContainerToolInFlight = sqliteClearContainerToolInFlight;
+
+  markContainerTurn(turn: TurnState): void {
+    const record = parseContainerRecord({
+      currentTool: null,
+      toolDeclaredTimeoutMs: null,
+      toolStartedAt: null,
+      turn,
+      updatedAt: new Date().toISOString(),
+    });
+    sqliteMarkContainerTurn(record.turn!);
+  }
+
   clearStaleProcessingAcks = sqliteClearStaleProcessingAcks;
 }

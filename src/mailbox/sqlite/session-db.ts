@@ -192,6 +192,7 @@ export interface ContainerState {
   current_tool: string | null;
   tool_declared_timeout_ms: number | null;
   tool_started_at: string | null;
+  turn: string | null;
   updated_at: string;
 }
 
@@ -203,13 +204,17 @@ export interface ContainerState {
  */
 export function getContainerState(outDb: Database.Database): ContainerState | null {
   try {
-    const row = outDb
-      .prepare(
-        `SELECT current_tool, tool_declared_timeout_ms, tool_started_at, updated_at
-           FROM container_state WHERE id = 1`,
-      )
-      .get() as ContainerState | undefined;
-    return row ?? null;
+    const row = outDb.prepare('SELECT * FROM container_state WHERE id = 1').get() as
+      | (Partial<ContainerState> & { updated_at: string })
+      | undefined;
+    if (!row) return null;
+    return {
+      current_tool: row.current_tool ?? null,
+      tool_declared_timeout_ms: row.tool_declared_timeout_ms ?? null,
+      tool_started_at: row.tool_started_at ?? null,
+      turn: row.turn ?? null,
+      updated_at: row.updated_at,
+    };
   } catch {
     // Table not present on older session DBs — treat as "no tool in flight".
     return null;

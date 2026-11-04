@@ -27,6 +27,7 @@ export type {
   SessionRoutingRecord,
   StateRecord,
   TaskStatus,
+  TurnState,
   TaskWrite,
 } from './model.js';
 
@@ -52,7 +53,7 @@ export interface ProcessingClaim {
   statusChanged: string;
 }
 
-export type ContainerState = Omit<ContainerRecord, 'updatedAt'>;
+export type ContainerState = ContainerRecord;
 export type OutboundMessage = OutboundDelivery;
 export type Task = TaskWrite;
 
