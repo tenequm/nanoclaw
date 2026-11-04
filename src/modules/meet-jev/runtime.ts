@@ -11,6 +11,7 @@ import type {
   CallCore,
   CallEvent,
   CallPolicy,
+  CallStatus,
   Command,
   JevState,
   RecheckState,
@@ -34,6 +35,7 @@ export interface RuntimePorts {
   drop(replyId: string): void;
   revoke(replyId: string): void;
   stopPlayback(): void;
+  status(status: CallStatus): void;
   log(event: string, fields: Record<string, unknown>): void;
   /** Every event as it is processed, numbered from 1: the call's replayable log. */
   record(seq: number, event: CallEvent): void;
@@ -120,6 +122,8 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
 
   const execute = (command: Command): void => {
     switch (command.kind) {
+      case 'status':
+        return ports.status(command.status);
       case 'judge':
         return judge(command.windowVersion, command.state);
       case 'recheck':

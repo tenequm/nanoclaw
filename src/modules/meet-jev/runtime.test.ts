@@ -64,6 +64,7 @@ function fakePorts(overrides: Partial<RuntimePorts> = {}) {
     drop: (replyId) => void calls.push(['drop', replyId]),
     revoke: (replyId) => void calls.push(['revoke', replyId]),
     stopPlayback: () => void calls.push(['stop']),
+    status: (status) => void calls.push(['status', status]),
     log: (event, fields) => void calls.push(['log', event, fields]),
     record: (seq, event) => void calls.push(['record', seq, event.kind]),
     ...overrides,

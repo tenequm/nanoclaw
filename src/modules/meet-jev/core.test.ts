@@ -21,13 +21,14 @@ const olena: Speaker = { id: 'p2', name: 'Olena' };
 class Call {
   state: CallState;
   logs: Extract<Command, { kind: 'log' }>[] = [];
+  statuses: Extract<Command, { kind: 'status' }>[] = [];
   private at = 1_000;
 
   constructor(kind: CallKind = 'voice') {
     this.state = callCore.initial(policyFor(kind, 'Dan', ['Ден']), 0);
   }
 
-  /** Feed events (each 100 ms after the last unless it says otherwise); returns the non-log commands. */
+  /** Feed events (each 100 ms after the last unless it says otherwise); returns the action commands. */
   feed(...events: Fed[]): Command[] {
     const out: Command[] = [];
     for (const partial of events) {
@@ -36,6 +37,7 @@ class Call {
       this.state = callCore.reduce(this.state, event);
       for (const command of callCore.decide(this.state, event)) {
         if (command.kind === 'log') this.logs.push(command);
+        else if (command.kind === 'status') this.statuses.push(command);
         else out.push(command);
       }
     }
@@ -800,5 +802,32 @@ describe('the answer-ready recheck', () => {
     expect(call.feed({ kind: 'reply', replyId: 'r3', turnId: 't1', text: 'On the coast.' })).toEqual([
       { kind: 'speak', replyId: 'r3', text: 'On the coast.' },
     ]);
+  });
+});
+
+describe('meeting tile cues', () => {
+  it.each(['voice', 'meet'] as const)('emits final, wake and playback cues on %s calls', (kind) => {
+    const call = new Call(kind);
+    call.feed({ kind: 'utterance', speaker: olena, uttId: 'empty', text: '...', final: true });
+    call.feed({ kind: 'utterance', speaker: misha, uttId: 'partial', text: 'Dan', final: false });
+    expect(call.statuses).toEqual([]);
+    const replyId = wakeAndSpeak(call, 'Dan, what time is it?', 'Noon.', 1);
+    expect(call.statuses.map((c) => c.status)).toEqual(['heard', 'thinking', 'speaking']);
+    call.feed({ kind: 'playback', replyId, state: 'completed' });
+    expect(call.statuses.at(-1)?.status).toBe('idle');
+  });
+
+  it.each(['cut_off', 'failed'] as const)('returns to idle when playback is %s', (state) => {
+    const call = new Call('meet');
+    const replyId = wakeAndSpeak(call, 'Dan, tell a story.', 'Once upon a time.', 1);
+    call.feed({ kind: 'playback', replyId, state });
+    expect(call.statuses.at(-1)?.status).toBe('idle');
+  });
+
+  it('returns to idle on stop before the worker acknowledges it', () => {
+    const call = new Call('meet');
+    wakeAndSpeak(call, 'Dan, tell a story.', 'Once upon a time.', 1);
+    call.say(misha, 'stop', 'Stop.');
+    expect(call.statuses.slice(-2).map((c) => c.status)).toEqual(['heard', 'idle']);
   });
 });

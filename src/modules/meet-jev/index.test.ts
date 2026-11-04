@@ -4,6 +4,14 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 
+const { sendData } = vi.hoisted(() => ({ sendData: vi.fn() }));
+vi.mock('livekit-server-sdk', () => ({
+  DataPacket_Kind: { RELIABLE: 0 },
+  RoomServiceClient: class {
+    sendData = sendData;
+  },
+}));
+
 vi.mock('../../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
@@ -238,4 +246,38 @@ describe('createJevCall on a meeting', () => {
     ]);
     call.end('test');
   });
+});
+
+it('sends ordered, text-free reliable room cues and tolerates a failed send', async () => {
+  sendData.mockReset().mockRejectedValueOnce(new Error('unavailable')).mockResolvedValue(undefined);
+  const call = createJevCall({
+    callId: 'status-call',
+    kind: 'meet',
+    statusRoom: { name: 'meeting-room', url: 'https://livekit.test', apiKey: 'test', apiSecret: 'test' },
+    callerName: 'Ethan',
+    agentName: 'Dan',
+    agentAliases: [],
+    maxTextBytes: 4096,
+    submitTurn: async () => ({ ok: false, reason: 'test' }),
+    push: () => undefined,
+    now: () => 1000,
+  });
+  for (const uttId of ['one', 'two']) {
+    call.transcript({ kind: 'speech', speaker: { id: 'p1', name: 'Ethan' }, on: true, at: 1000 });
+    call.transcript({
+      kind: 'utterance',
+      speaker: { id: 'p1', name: 'Ethan' },
+      uttId,
+      text: 'private meeting words',
+      final: true,
+      at: 1100,
+    });
+  }
+  await flush();
+  expect(sendData).toHaveBeenCalledTimes(2);
+  expect(sendData).toHaveBeenLastCalledWith('meeting-room', Buffer.from(JSON.stringify({ status: 'heard' })), 0, {
+    topic: 'nanoclaw.jev.status',
+  });
+  expect(log.debug).toHaveBeenCalledWith('meet-jev: status send failed', { callId: 'status-call' });
+  call.end('test');
 });

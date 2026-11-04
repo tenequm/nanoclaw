@@ -1233,6 +1233,12 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     createJevCall(
       {
         callId: call.callId,
+        statusRoom: {
+          name: call.roomName,
+          url: config.serverUrl || config.url,
+          apiKey: config.apiKey,
+          apiSecret: config.apiSecret,
+        },
         kind,
         callerName: call.line.caller.name,
         agentName: config.wakeName ?? call.line.agent.name,
