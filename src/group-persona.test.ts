@@ -1,3 +1,4 @@
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -6,7 +7,7 @@ vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-import { PERSONA_PREPEND_FILE, readGroupPersona, stageGroupPersona } from './group-persona.js';
+import { MAX_PERSONA_READ_BYTES, PERSONA_PREPEND_FILE, readGroupPersona, stageGroupPersona } from './group-persona.js';
 import { log } from './log.js';
 
 const TMP = '/tmp/nanoclaw-group-persona-test';
@@ -47,6 +48,20 @@ describe('readGroupPersona', () => {
       'Could not read group standing instructions; omitting persona',
       expect.objectContaining({ file: path.join(TMP, PERSONA_PREPEND_FILE) }),
     );
+  });
+
+  it('reads at most MAX_PERSONA_READ_BYTES of an oversized file', () => {
+    fs.writeFileSync(path.join(TMP, PERSONA_PREPEND_FILE), 'a'.repeat(MAX_PERSONA_READ_BYTES * 4));
+    expect(readGroupPersona(TMP)).toHaveLength(MAX_PERSONA_READ_BYTES);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Group standing instructions are oversized; reading only the start',
+      expect.objectContaining({ bytes: MAX_PERSONA_READ_BYTES * 4 }),
+    );
+  });
+
+  it.skipIf(process.platform === 'win32')('returns null for a named pipe without blocking on it', () => {
+    execFileSync('mkfifo', [path.join(TMP, PERSONA_PREPEND_FILE)]);
+    expect(readGroupPersona(TMP)).toBeNull();
   });
 });
 
