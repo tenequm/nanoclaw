@@ -31,10 +31,15 @@ function temp(prefix: string): string {
   return root;
 }
 
+// Keep the operator's global git config (signing, hooks, aliases) out of the
+// fixtures; a test that needs a setting puts it in the fixture repo's config.
+const ISOLATED_GIT_ENV = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+
 function exec(cwd: string, command: string, args: string[]): string {
   return execFileSync(command, args, {
     cwd,
     encoding: 'utf8',
+    env: { ...process.env, ...ISOLATED_GIT_ENV },
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
@@ -262,7 +267,12 @@ function stubCommands(): { env: NodeJS.ProcessEnv; calls: () => string[] } {
   fs.chmodSync(path.join(bin, 'stub'), 0o755);
   for (const name of ['pnpm', 'systemctl', 'docker']) fs.symlinkSync('stub', path.join(bin, name));
   return {
-    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, STUB_CALLS: log },
+    env: {
+      ...process.env,
+      ...ISOLATED_GIT_ENV,
+      PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
+      STUB_CALLS: log,
+    },
     calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []),
   };
 }
@@ -288,7 +298,9 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe('update-nanoclaw transaction end to end', () => {
+// Each case drives real git through ~50 subprocesses (spawning one costs 50-100ms on
+// macOS); allow for that and a loaded CI box, as the sibling controller-archive suite does.
+describe('update-nanoclaw transaction end to end', { timeout: 60_000 }, () => {
   it('applies an implicit OneCLI skill before stamping the extracted gateway selection', async () => {
     const fixture = createForkFixture({ gatewayExtraction: true });
     previousUpdateDir = process.env.NANOCLAW_UPDATE_DIR;
@@ -460,6 +472,20 @@ describe('update-nanoclaw transaction end to end', () => {
       '#!/bin/bash\nnode dist/index.js\n',
     );
     expect(fs.readFileSync(path.join(fixture.install, 'nanoclaw.pid'), 'utf8')).toBe('1234\n');
+  });
+
+  it('prepares for an operator whose git config signs every tag', () => {
+    const fixture = createForkFixture();
+    previousUpdateDir = process.env.NANOCLAW_UPDATE_DIR;
+    process.env.NANOCLAW_UPDATE_DIR = temp('nanoclaw-update-state-');
+    exec(fixture.install, 'git', ['config', 'tag.gpgSign', 'true']);
+    const { runtime } = fakeRuntime(fixture.install);
+
+    const state = prepareUpdate({ projectRoot: fixture.install, upstreamRef: 'upstream/main' }, runtime);
+    expect(state.phase).toBe('prepared');
+    // A lightweight tag on the pre-update commit: nothing to sign, no key needed.
+    expect(exec(fixture.install, 'git', ['cat-file', '-t', `refs/tags/${state.backupTag}`])).toBe('commit');
+    expect(exec(fixture.install, 'git', ['rev-parse', `refs/tags/${state.backupTag}`])).toBe(fixture.originalHead);
   });
 
   it('snapshots and restores symlinked mutable roots without replacing the link', async () => {

@@ -275,7 +275,8 @@ export function prepareUpdate(options: PrepareOptions, runtime = createUpdateRun
 
   fs.mkdirSync(transactionRoot, { recursive: true });
   git(runtime, projectRoot, ['branch', backupBranch, originalHead]);
-  git(runtime, projectRoot, ['tag', backupTag, originalHead]);
+  // Under the operator's `tag.gpgSign` a plain `git tag` turns annotated and dies with "no tag message?".
+  git(runtime, projectRoot, ['tag', '--no-sign', backupTag, originalHead]);
   git(runtime, projectRoot, ['worktree', 'add', '-b', stageBranch, stageRoot, originalHead]);
 
   const state: UpdateState = {
