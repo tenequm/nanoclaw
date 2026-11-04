@@ -23,7 +23,7 @@ export type JevTurnResult = { ok: true; turnId: string } | { ok: false; reason: 
 
 export interface RuntimePorts {
   now(): number;
-  /** Never rejects in practice (askAction is fail-silent); a rejection counts as a null verdict. */
+  /** Never rejects in practice (askAction answers null on any failure); a rejection counts as a null verdict. */
   judge(state: JevState, signal: AbortSignal): Promise<{ verdict: Verdict | null; ms: number }>;
   /** The answer-ready check; never rejects in practice either, and a rejection counts as a null verdict. */
   recheck(state: RecheckState, signal: AbortSignal): Promise<{ verdict: RecheckVerdict | null; ms: number }>;

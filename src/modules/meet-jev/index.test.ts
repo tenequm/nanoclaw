@@ -45,7 +45,7 @@ describe('createJevCall', () => {
       await flush();
     }
     expect(judge).toHaveBeenCalledTimes(MAX_JUDGES_PER_MINUTE);
-    expect(log.warn).toHaveBeenCalledWith('meet-jev: Jev rate cap reached, judged silent', {
+    expect(log.warn).toHaveBeenCalledWith('meet-jev: Jev rate cap reached, judged without Jev', {
       callId: 'c1',
       perMinute: MAX_JUDGES_PER_MINUTE,
     });

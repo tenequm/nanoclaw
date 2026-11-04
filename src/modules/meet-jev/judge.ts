@@ -1,8 +1,8 @@
 /**
  * The jev call loop's Jev client (JSON state, the pinned `JEV_MODEL`): the Choice `action` about the call
  * window, and the answer-ready Choice `still_wanted`. Any error, timeout or malformed answer is a null
- * verdict: silence for `action` (fail-silent like the chat gate), speech for `still_wanted` (the answer was
- * wanted a moment ago).
+ * verdict: silence for `action` (fail-silent like the chat gate) unless the agent was called by name, which
+ * still wakes it; speech for `still_wanted` (the answer was wanted a moment ago).
  */
 import { postSystemOne } from '../jev-gate/jev.js';
 import {

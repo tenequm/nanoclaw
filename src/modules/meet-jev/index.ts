@@ -96,7 +96,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
     now: host.now,
     judge: async (state, signal) => {
       if (!capped()) return judge(state, { signal });
-      log.warn('meet-jev: Jev rate cap reached, judged silent', { ...fields, perMinute: MAX_JUDGES_PER_MINUTE });
+      log.warn('meet-jev: Jev rate cap reached, judged without Jev', { ...fields, perMinute: MAX_JUDGES_PER_MINUTE });
       return { verdict: null, ms: 0 };
     },
     recheck: async (state, signal) => {

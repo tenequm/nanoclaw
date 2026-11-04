@@ -27,7 +27,7 @@ export interface Choice<A extends string> {
   confidence: number;
 }
 
-/** Jev's answer to the `action` Choice; null when the call failed or timed out (fail-silent). */
+/** Jev's answer to the `action` Choice; null when the call failed or timed out (silence, or a wake on a vocative). */
 export type Verdict = Choice<Action>;
 
 /** Whether a landed answer is still wanted, asked when people spoke after its trigger. */
