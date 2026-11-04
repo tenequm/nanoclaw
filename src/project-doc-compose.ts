@@ -159,6 +159,64 @@ const NCL_DEPENDENT_MODULES = new Set(['cli', 'scheduling']);
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 const SKILLS_HOST_SUBPATH = path.join('container', 'skills');
 
+/** A section a host module contributes for the agents it applies to; null for every other agent. */
+export type ProjectDocSectionProvider = (group: AgentGroup) => ProvidedSection | Promise<ProvidedSection>;
+type ProvidedSection = { name: string; body: string } | null;
+
+/** Whether a module's or resident skill's prose belongs in this agent's document at all. */
+export type SectionGate = (group: AgentGroup) => boolean | Promise<boolean>;
+
+const sectionProviders: ProjectDocSectionProvider[] = [];
+const moduleSectionGates = new Map<string, SectionGate>();
+const residentSkillGates = new Map<string, SectionGate>();
+
+/**
+ * Host modules register agent-specific prose here at import time, so the
+ * composer never imports them and core composes the same with none installed.
+ */
+export function registerProjectDocSection(provider: ProjectDocSectionProvider): void {
+  sectionProviders.push(provider);
+}
+
+/**
+ * Narrow a module's `<name>.instructions.md` to the agents the gate admits:
+ * every module's prose otherwise reaches every agent, whatever its channels.
+ * Prose only; the module's tools stay registered.
+ */
+export function registerModuleSectionGate(moduleName: string, gate: SectionGate): void {
+  if (moduleSectionGates.has(moduleName)) log.warn('Module section gate overwritten', { moduleName });
+  moduleSectionGates.set(moduleName, gate);
+}
+
+/**
+ * Narrow a resident skill to the agents the gate admits, whatever the
+ * selection says: `"all"` would otherwise teach every agent a channel's rules.
+ */
+export function registerResidentSkillGate(skillName: string, gate: SectionGate): void {
+  if (residentSkillGates.has(skillName)) log.warn('Resident skill gate overwritten', { skillName });
+  residentSkillGates.set(skillName, gate);
+}
+
+/**
+ * A gate that throws keeps its section out: a missing rule costs that agent the
+ * rule until its next spawn, a wrong one teaches every agent the channel's rules.
+ */
+async function sectionAdmitted(
+  gates: Map<string, SectionGate>,
+  kind: 'module' | 'skill',
+  name: string,
+  group: AgentGroup,
+): Promise<boolean> {
+  const gate = gates.get(name);
+  if (!gate) return true;
+  try {
+    return await gate(group);
+  } catch (err) {
+    log.error('Project document section gate threw; section left out', { kind, name, group: group.name, err });
+    return false;
+  }
+}
+
 /**
  * Regenerate `groups/<folder>/<spec.fileName>` from every instruction source
  * the group has switched on. Deterministic: same inputs, same file.
@@ -222,7 +280,19 @@ export async function composeGroupProjectDoc(
       if (!match) continue;
       const moduleName = match[1];
       if (cliDisabled && NCL_DEPENDENT_MODULES.has(moduleName)) continue;
+      if (!(await sectionAdmitted(moduleSectionGates, 'module', moduleName, group))) continue;
       push(`NanoClaw Module: ${moduleName}`, fs.readFileSync(path.join(mcpToolsHostDir, entry), 'utf-8'), true);
+    }
+  }
+
+  // Agent-specific sections from host modules. A provider that throws loses
+  // only its own section, never the spawn.
+  for (const provider of sectionProviders) {
+    try {
+      const section = await provider(group);
+      if (section) push(section.name, section.body, true);
+    } catch (err) {
+      log.error('Project document section provider threw; section left out', { group: group.name, err });
     }
   }
 
@@ -236,6 +306,7 @@ export async function composeGroupProjectDoc(
       if (selectedSkills !== 'all' && !selectedSkills.includes(skillName)) continue;
       const hostFragment = path.join(skillsHostDir, skillName, 'instructions.md');
       if (!fs.existsSync(hostFragment)) continue;
+      if (!(await sectionAdmitted(residentSkillGates, 'skill', skillName, group))) continue;
       push(`NanoClaw Skill: ${skillName}`, fs.readFileSync(hostFragment, 'utf-8'), true);
     }
   }

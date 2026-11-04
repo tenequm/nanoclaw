@@ -23,6 +23,9 @@ import {
   DEFAULT_PROJECT_DOC,
   MEMORY_NOTE_PLACEHOLDER,
   renderBaseInstructions,
+  registerModuleSectionGate,
+  registerResidentSkillGate,
+  registerProjectDocSection,
   type ProjectDocSpec,
 } from './project-doc-compose.js';
 import type { AgentGroup } from './types.js';
@@ -51,8 +54,12 @@ function writePersona(folder: string, text: string): void {
   fs.writeFileSync(path.join(groupDirOf(folder), PERSONA_PREPEND_FILE), text);
 }
 
-async function compose(ag: AgentGroup, spec: ProjectDocSpec = CLAUDE_SPEC): Promise<string> {
-  await composeGroupProjectDoc(ag, groupDirOf(ag.folder), spec);
+async function compose(
+  ag: AgentGroup,
+  spec: ProjectDocSpec = CLAUDE_SPEC,
+  runtimeSkills?: readonly string[],
+): Promise<string> {
+  await composeGroupProjectDoc(ag, groupDirOf(ag.folder), spec, runtimeSkills);
   return fs.readFileSync(path.join(groupDirOf(ag.folder), spec.fileName), 'utf-8');
 }
 
@@ -452,4 +459,66 @@ describe('composeGroupProjectDoc size cap', () => {
     expect(log.warn).toHaveBeenCalled();
     expect(log.error).not.toHaveBeenCalled();
   });
+});
+
+it('composes a forced gateway skill the stored selection leaves out', async () => {
+  const ag = await seed('ag-forced', 'forced-group');
+  await updateContainerConfigJson(ag.id, 'skills', ['welcome']);
+
+  const doc = await compose(ag, CLAUDE_SPEC, ['welcome', 'fixture-gateway']);
+
+  expect(doc).toContain('# NanoClaw Skill: fixture-gateway');
+  expect(doc).toContain('Fixture credential guidance.');
+});
+
+it('leaves a module out, and logs at error, when its gate throws', async () => {
+  const ag = await seed('ag-gate-throws', 'gate-throws-group');
+  registerModuleSectionGate('self-mod', (g) => {
+    if (g.id === ag.id) throw new Error('gate down');
+    return true;
+  });
+
+  const doc = await compose(ag);
+
+  expect(doc).not.toContain('# NanoClaw Module: self-mod\n');
+  expect(doc).toContain('# NanoClaw Module: core');
+  expect(log.error).toHaveBeenCalledWith(
+    'Project document section gate threw; section left out',
+    expect.objectContaining({ kind: 'module', name: 'self-mod', group: ag.name }),
+  );
+});
+
+it('composes registered sections only for the matching agent and isolates provider errors', async () => {
+  const ag = await seed('ag-section-hook', 'section-hook');
+  registerProjectDocSection((g) =>
+    g.id === ag.id ? { name: 'Fixture section', body: 'Agent-specific prose.' } : null,
+  );
+  registerProjectDocSection((g) => {
+    if (g.id === ag.id) throw new Error('provider down');
+    return null;
+  });
+  const doc = await compose(ag);
+  expect(doc).toContain('# Fixture section\n\nAgent-specific prose.');
+  expect(log.error).toHaveBeenCalledWith(
+    'Project document section provider threw; section left out',
+    expect.objectContaining({ group: ag.name }),
+  );
+  expect(await compose(await seed('ag-other-hook', 'other-hook'))).not.toContain('# Fixture section');
+});
+
+it('gates resident skill prose by agent and fails closed on errors', async () => {
+  const ag = await seed('ag-skill-hook', 'skill-hook');
+  registerResidentSkillGate('fixture-gateway', (g) => {
+    if (g.id === ag.id) throw new Error('skill gate down');
+    return g.id !== 'ag-skill-denied';
+  });
+  expect(await compose(ag)).not.toContain('# NanoClaw Skill: fixture-gateway');
+  expect(log.error).toHaveBeenCalledWith(
+    'Project document section gate threw; section left out',
+    expect.objectContaining({ kind: 'skill', name: 'fixture-gateway' }),
+  );
+  expect(await compose(await seed('ag-skill-denied', 'skill-denied'))).not.toContain(
+    '# NanoClaw Skill: fixture-gateway',
+  );
+  expect(await compose(await seed('ag-skill-allowed', 'skill-allowed'))).toContain('# NanoClaw Skill: fixture-gateway');
 });
