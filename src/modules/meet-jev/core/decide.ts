@@ -375,7 +375,12 @@ function onReply(state: CallState, replyId: string, turnId: string | null, raw: 
   const since = utterancesSince(state, latest).length;
   if (since > 0 && latest.rechecked?.since !== since) {
     state.recheck = { wakeKey: latest.key, since, replies: [{ replyId, text }] };
-    state.commands.push({ kind: 'recheck', wakeKey: latest.key, state: toRecheckState(state, latest, text) });
+    state.commands.push({
+      kind: 'recheck',
+      windowVersion: state.windowVersion,
+      wakeKey: latest.key,
+      state: toRecheckState(state, latest, text),
+    });
     log(state, 'reply', { ...fields, outcome: 'held', reason: 'recheck', since });
     return;
   }

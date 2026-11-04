@@ -71,7 +71,7 @@ export type Command =
   /** Ask Jev about the window as of `windowVersion`; the answer comes back as a `verdict`. */
   | { kind: 'judge'; windowVersion: number; state: JevState }
   /** Ask Jev whether the wake's landed answer is still wanted; the answer comes back as a `recheck_verdict`. */
-  | { kind: 'recheck'; wakeKey: string; state: RecheckState }
+  | { kind: 'recheck'; windowVersion: number; wakeKey: string; state: RecheckState }
   /** Fire a `timer` event with `key` after `ms`; a new `wait` with the same key replaces it. */
   | { kind: 'wait'; key: string; ms: number }
   | { kind: 'cancel_wait'; key: string }

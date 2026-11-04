@@ -124,7 +124,7 @@ describe('createCallRuntime', () => {
     const rechecks: Array<{ signal: AbortSignal; resolve: (v: { verdict: null; ms: number }) => void }> = [];
     const core = scriptedCore((event) =>
       event.kind === 'utterance' && event.text === 'a'
-        ? [{ kind: 'recheck', wakeKey: 'w1', state: {} as RecheckState }]
+        ? [{ kind: 'recheck', windowVersion: 1, wakeKey: 'w1', state: {} as RecheckState }]
         : event.kind === 'utterance'
           ? [{ kind: 'judge', windowVersion: 2, state: STATE }]
           : [],
