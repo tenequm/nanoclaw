@@ -299,6 +299,9 @@ it('sends ordered, text-free reliable room cues and tolerates a failed send', as
   expect(sendData).toHaveBeenLastCalledWith('meeting-room', Buffer.from(JSON.stringify({ status: 'heard' })), 0, {
     topic: 'nanoclaw.jev.status',
   });
-  expect(log.debug).toHaveBeenCalledWith('meet-jev: status send failed', { callId: 'status-call' });
+  expect(log.warn).toHaveBeenCalledWith(
+    'meet-jev: status send failed',
+    expect.objectContaining({ callId: 'status-call' }),
+  );
   call.end('test');
 });
