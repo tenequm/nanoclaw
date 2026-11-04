@@ -80,7 +80,6 @@ import {
   CALL_COMMANDS_ATTRIBUTE,
   CALL_COMMANDS_VERSION,
   CALL_CUE_TRACK,
-  CALL_JEV_ATTRIBUTE,
   CALL_PENDING_ATTRIBUTE,
   CALL_REPLY_TOPIC,
   CALL_REVIEW_ATTRIBUTE,
@@ -4548,7 +4547,6 @@ async function roomVoice(
             [CALL_REVIEW_ATTRIBUTE]: meta.jev ? '' : '1',
             [CALL_COMMANDS_ATTRIBUTE]: meta.jev ? '' : CALL_COMMANDS_VERSION,
             [CALL_COMMAND_WORDS_ATTRIBUTE]: meta.jev ? '' : COMMAND_WORDS_JSON,
-            [CALL_JEV_ATTRIBUTE]: meta.jev ? '1' : '',
             [CALL_VOICE_ATTRIBUTE]: JSON.stringify(state),
           }),
         );

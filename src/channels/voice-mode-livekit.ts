@@ -66,6 +66,7 @@ import {
   baseLanguage,
   DEFAULT_VOICE_LANGUAGES,
   MAX_JEV_EVENTS_PER_POST,
+  MAX_JEV_POST_BYTES,
   WORKER_REQUEST_TIMEOUT_MS,
   type CallUtterance,
   type LiveKitHostEvent,
@@ -93,7 +94,7 @@ const MAX_UTTERANCE_TEXT_BYTES = 32 * 1024;
 /** Room for a full-length utterance even when JSON escapes double its text, plus the envelope. */
 const MAX_AGENT_BODY_BYTES = 2 * MAX_UTTERANCE_TEXT_BYTES + 1024;
 /** An `agent/jev` batch: up to MAX_JEV_EVENTS_PER_POST mostly short partials, or a few long finals. */
-const MAX_JEV_BODY_BYTES = 4 * MAX_AGENT_BODY_BYTES;
+const MAX_JEV_BODY_BYTES = MAX_JEV_POST_BYTES;
 /** The worker opens its event stream right after it reports the caller in; without it nothing reaches the caller. */
 const WORKER_STREAM_TIMEOUT_MS = 30_000;
 const MAX_UTTERANCES_PER_MINUTE = 20;

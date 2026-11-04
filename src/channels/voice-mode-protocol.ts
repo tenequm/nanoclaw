@@ -132,9 +132,8 @@ export type JevWorkerEvent =
 
 /** Most events one `agent/jev` POST carries; the worker batches what piles up while one is in flight. */
 export const MAX_JEV_EVENTS_PER_POST = 64;
-
-/** The worker's participant attribute: "1" while the call runs the jev loop, "" otherwise. */
-export const CALL_JEV_ATTRIBUTE = 'nanoclaw.voice-mode.jev';
+/** Most bytes of JSON one `agent/jev` POST body carries; the host refuses a larger one. */
+export const MAX_JEV_POST_BYTES = 256 * 1024;
 
 /** One transcribed turn the worker posts to the host's `agent/utterance`. */
 export interface CallUtterance {
@@ -400,8 +399,6 @@ export interface ReviewRequest {
   cues?: boolean;
   /** For `settings`: the typing sound while the agent works (on unless the page says off; cues off silence it too). */
   typing?: boolean;
-  /** For `settings`: run the jev loop (true) or the turn state machine (false), from the next quiet moment on. */
-  jev?: boolean;
   /** For `settings`: the speech choice from the next line on, for this call only (the line's saved one is unchanged). */
   tts?: { provider: string; model?: string; voice?: string };
 }
