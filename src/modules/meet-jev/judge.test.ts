@@ -73,7 +73,21 @@ describe('askAction', () => {
     const body = JSON.parse(init.body);
     expect(body.model).toBe('jev-1.14');
     expect(body.state).toEqual(state);
-    expect(Object.keys(body.questions)).toEqual(['action']);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(Object.keys(body.questions)).toEqual([
+      'action',
+      'wants_reply_now',
+      'for_someone_else',
+      'unfinished',
+      'already_answered',
+    ]);
+    for (const key of ['wants_reply_now', 'for_someone_else', 'unfinished', 'already_answered']) {
+      expect(body.questions[key]).toMatchObject({
+        type: 'noul',
+        instructions: expect.stringContaining('`latest`'),
+        criteria: { true: expect.any(String), false: expect.any(String) },
+      });
+    }
     expect(body.questions.action.type).toBe('choice');
     expect(Object.keys(body.questions.action.criteria).sort()).toEqual(['answer', 'continue', 'stay_silent', 'stop']);
     expect(body.questions.action.instructions).toContain('Dan');
@@ -93,9 +107,101 @@ describe('askAction', () => {
       model,
       usage,
       answer: choice,
+      shadow: { wants_reply_now: null, for_someone_else: null, unfinished: null, already_answered: null },
+      shadow_rule: 'stay_silent',
       ms: expect.any(Number),
       failure: null,
     });
+  });
+
+  it.each(['answer', 'stay_silent', 'stop', 'continue'])(
+    'preserves the %s verdict with and without shadow answers',
+    async (action) => {
+      const actionAnswer = { ...choice, choice: action };
+      respond({ answers: { action: actionAnswer } });
+      const baseline = (await askAction(state)).verdict;
+      for (const wantsReply of [0, 1]) {
+        respond({
+          answers: {
+            action: actionAnswer,
+            wants_reply_now: { type: 'noul', noul: wantsReply },
+            for_someone_else: { type: 'noul', noul: 0 },
+            unfinished: { type: 'noul', noul: 0 },
+            already_answered: { type: 'noul', noul: 0 },
+          },
+        });
+        expect((await askAction(state)).verdict).toEqual(baseline);
+      }
+    },
+  );
+
+  it.each([
+    undefined,
+    null,
+    false,
+    0.9,
+    [],
+    {},
+    { noul: 0.9 },
+    { type: 'choice', noul: 0.9 },
+    { type: 'noul', noul: '0.9' },
+    { type: 'noul', noul: -0.1 },
+    { type: 'noul', noul: 1.1 },
+    { type: 'noul', noul: Number.NaN },
+    { type: 'noul', noul: Number.POSITIVE_INFINITY },
+  ])('logs malformed shadow answers as null without changing the verdict: %j', async (malformed) => {
+    respond({
+      answers: {
+        action: choice,
+        wants_reply_now: malformed,
+        for_someone_else: malformed,
+        unfinished: malformed,
+        already_answered: malformed,
+      },
+    });
+    expect((await askAction(state)).verdict).toEqual(parseAction({ answers: { action: choice } }));
+    expect(log.info).toHaveBeenCalledWith(
+      'meet-jev: judge',
+      expect.objectContaining({
+        shadow: { wants_reply_now: null, for_someone_else: null, unfinished: null, already_answered: null },
+        shadow_rule: 'stay_silent',
+        failure: null,
+      }),
+    );
+  });
+
+  it.each([
+    [0.7, 0, 0, 0, 'answer'],
+    [1, 0.29, 0.29, 0.49, 'answer'],
+    [0.69, 0, 0, 0, 'stay_silent'],
+    [1, 0.3, 0, 0, 'stay_silent'],
+    [1, 0, 0.3, 0, 'stay_silent'],
+    [1, 0, 0, 0.5, 'stay_silent'],
+    [null, 0, 0, 0, 'stay_silent'],
+    [1, null, 0, 0, 'stay_silent'],
+    [1, 0, null, 0, 'stay_silent'],
+    [1, 0, 0, null, 'stay_silent'],
+  ])('logs the shadow rule for %j, %j, %j, %j', async (wants, other, unfinished, answered, rule) => {
+    const shadow = {
+      wants_reply_now: wants,
+      for_someone_else: other,
+      unfinished,
+      already_answered: answered,
+    };
+    respond({
+      answers: {
+        action: choice,
+        ...Object.fromEntries(Object.entries(shadow).map(([key, noul]) => [key, { type: 'noul', noul }])),
+      },
+    });
+    await askAction(state);
+    expect(log.info).toHaveBeenCalledWith(
+      'meet-jev: judge',
+      expect.objectContaining({
+        shadow,
+        shadow_rule: rule,
+      }),
+    );
   });
 
   it.each(['http', 'timeout', 'abort', 'bad_body', 'parse', 'request'])(
