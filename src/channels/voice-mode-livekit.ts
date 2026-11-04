@@ -28,7 +28,12 @@
  *    an inbound message with the id `livekit:<callId>:<n>`; answered 202 only
  *    once the agent's session stored it, so the caller's "sent" mark is true;
  *    after the caller's page hung up, still taken for HANGUP_GRACE_MS;
- *  - `POST agent/ended`      the worker's session is over.
+ *  - `POST agent/ended`      the worker's session is over;
+ *  - `POST agent/jev`        a jev call's words, speech marks and playback reports (meet-jev).
+ *
+ * A jev call (`/voice jev`, the job's `jev`) takes no `agent/utterance` turns from the worker: the
+ * meet-jev module decides when the agent gets a turn (submitTurn, with the same checks) and which of its
+ * replies are spoken; the rest are only in the call chat.
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
  * line: the line's `/voice` chat (its voice_mode_lines binding), while that
@@ -60,6 +65,8 @@ import {
   settleWithin,
   baseLanguage,
   DEFAULT_VOICE_LANGUAGES,
+  MAX_JEV_EVENTS_PER_POST,
+  MAX_JEV_POST_BYTES,
   WORKER_REQUEST_TIMEOUT_MS,
   type CallUtterance,
   type LiveKitHostEvent,
@@ -73,6 +80,7 @@ import { registerPostDeliveryHook, setOutboundPresentation, type OutboundAddress
 import { log } from '../log.js';
 import { platformMessageId } from '../platform-id.js';
 import { registerTypingObserver } from '../modules/typing/index.js';
+import { createJevCall, type JevCall, type JevDeps, type JevTurnResult } from '../modules/meet-jev/index.js';
 import type { MessagingGroup } from '../types.js';
 import { TTS_DEFAULT_CHOICE } from '../voice-mode-tts.js';
 
@@ -85,9 +93,11 @@ const MAX_QUEUED_EVENTS = 50;
 const MAX_UTTERANCE_TEXT_BYTES = 32 * 1024;
 /** Room for a full-length utterance even when JSON escapes double its text, plus the envelope. */
 const MAX_AGENT_BODY_BYTES = 2 * MAX_UTTERANCE_TEXT_BYTES + 1024;
+/** An `agent/jev` batch: up to MAX_JEV_EVENTS_PER_POST mostly short partials, or a few long finals. */
+const MAX_JEV_BODY_BYTES = MAX_JEV_POST_BYTES;
 /** The worker opens its event stream right after it reports the caller in; without it nothing reaches the caller. */
 const WORKER_STREAM_TIMEOUT_MS = 30_000;
-const MAX_UTTERANCES_PER_MINUTE = 20;
+export const MAX_UTTERANCES_PER_MINUTE = 20;
 /** The router has this long to store a turn in the agent's session, so the worker hears the 504 before it gives up. */
 const ROUTE_TIMEOUT_MS = WORKER_REQUEST_TIMEOUT_MS - 2_000;
 /** Turns routing at once on a call. The worker sends one at a time, so more is a worker gone wrong. */
@@ -237,6 +247,8 @@ export interface LiveKitVoiceConfig {
   endHookTimeoutMs?: number;
   /** Test seam; defaults to the livekit-server-sdk clients. */
   api?: LiveKitServerApi;
+  /** Test seam: what a jev call runs on; the meet-jev core and Jev client by default. */
+  jev?: Partial<JevDeps>;
 }
 
 /** What the voice adapter shares with this engine: limits, access, routing. */
@@ -287,7 +299,7 @@ export interface CallKind {
   maxDurationMs: number;
   room: { emptyTimeout: number; departureTimeout: number; maxParticipants: number };
   /** The kind's part of the worker's job metadata. */
-  job(call: Pick<KindCall, 'callId' | 'roomName'>): Pick<LiveKitJobMetadata, 'callerIdentity' | 'meeting'>;
+  job(call: Pick<KindCall, 'callId' | 'roomName'>): Pick<LiveKitJobMetadata, 'callerIdentity' | 'meeting' | 'jev'>;
   /** Who each turn comes from; a guest (no user id) gets no role over the agent. */
   sender(line: VoiceModeLine): { id: string | null; name: string };
   /** What each turn tells the agent, given the caller's language note (callLanguageNote). */
@@ -367,12 +379,16 @@ interface LiveKitCall extends KindCall {
   metadataWrite?: Promise<void>;
   /** Settles once the room carries why the call ended (or that failed) and the worker was told. */
   announced?: Promise<void>;
+  /** A jev call's loop; set from the start for a job with `jev`. */
+  jev?: JevCall;
 }
 
 /** The host's answer to one utterance POST. */
 interface TurnOutcome {
   status: number;
   body: string;
+  /** On a 202: the host's utterance id for the turn. */
+  id?: string;
 }
 
 export interface LiveKitVoice {
@@ -794,6 +810,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const endCall = (call: LiveKitCall, reason: string, end?: CallEndReason): void => {
     if (call.ended) return;
     call.ended = true;
+    call.jev?.end(reason);
     clearTimeout(call.joinTimer);
     clearTimeout(call.streamTimer);
     clearTimeout(call.expires);
@@ -891,6 +908,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       chatRefreshes: 0,
       previousChat: null,
     };
+    if (job.jev) call.jev = openJev(call);
     calls.set(platformId, call);
     call.joinTimer = setTimeout(() => endCall(call, 'caller never joined'), kind.joinTimeoutMs);
     call.joinTimer.unref();
@@ -1020,6 +1038,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     body: Record<string, unknown>,
   ): Promise<void> => {
     if (call.state !== 'live') return reply(res, 409, 'The caller is not in the call');
+    if (call.jev) return reply(res, 409, 'A jev call takes its turns from agent/jev');
     const utterance: { [K in keyof CallUtterance]?: unknown } = body;
     const text = typeof utterance.text === 'string' ? utterance.text.trim() : '';
     if (!text) return reply(res, 400, 'text is required');
@@ -1035,20 +1054,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const candidates = call.kind.candidates;
     const candidate = utterance.candidate === true;
     if (candidate && !candidates) return reply(res, 200, 'Not a turn: this call takes no candidates');
-    // A candidate leaves a slot of each limit to an addressed turn, which it must never crowd out.
-    if (call.turnsInFlight >= MAX_TURNS_IN_FLIGHT - (candidate ? 1 : 0)) {
-      return reply(res, 429, 'Too many turns are still being routed');
+    const admitted = admitTurn(call, candidate);
+    if (!admitted.ok) {
+      return reply(res, 429, admitted.body, admitted.retryAfter ? { 'Retry-After': admitted.retryAfter } : {});
     }
-    const t = host.now();
-    call.utteranceStarts = call.utteranceStarts.filter((at) => at > t - MINUTE_MS);
-    if (call.utteranceStarts.length >= MAX_UTTERANCES_PER_MINUTE - (candidate ? ADDRESSED_TURNS_HEADROOM : 0)) {
-      return reply(res, 429, 'Too many utterances this minute', {
-        'Retry-After': String(Math.max(1, Math.ceil((call.utteranceStarts[0] + MINUTE_MS - t) / 1000))),
-      });
-    }
-    // A candidate counts toward both limits: judging it holds a turn's slot.
-    call.utteranceStarts.push(t);
-    call.turnsInFlight++;
+    const t = admitted.t;
     if (candidates) {
       const refused = candidate ? await turnRefusal(call) : null;
       if (refused) {
@@ -1076,6 +1086,32 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     answer(res, await outcome);
   };
 
+  /**
+   * A turn's place under the call's limits: taken (it counts toward both until routing ends), with its
+   * start on the config clock, or why not. A candidate leaves a slot of each limit to an addressed turn,
+   * which it must never crowd out; judging one holds a turn's slot.
+   */
+  const admitTurn = (
+    call: LiveKitCall,
+    candidate: boolean,
+  ): { ok: true; t: number } | { ok: false; body: string; retryAfter?: string } => {
+    if (call.turnsInFlight >= MAX_TURNS_IN_FLIGHT - (candidate ? 1 : 0)) {
+      return { ok: false, body: 'Too many turns are still being routed' };
+    }
+    const t = host.now();
+    call.utteranceStarts = call.utteranceStarts.filter((at) => at > t - MINUTE_MS);
+    if (call.utteranceStarts.length >= MAX_UTTERANCES_PER_MINUTE - (candidate ? ADDRESSED_TURNS_HEADROOM : 0)) {
+      return {
+        ok: false,
+        body: 'Too many utterances this minute',
+        retryAfter: String(Math.max(1, Math.ceil((call.utteranceStarts[0] + MINUTE_MS - t) / 1000))),
+      };
+    }
+    call.utteranceStarts.push(t);
+    call.turnsInFlight++;
+    return { ok: true, t };
+  };
+
   const answer = (res: http.ServerResponse, outcome: TurnOutcome): void =>
     reply(res, outcome.status, outcome.body, outcome.status === 202 ? JSON_HEADERS : {});
 
@@ -1090,13 +1126,16 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
    * The turn keeps its in-flight slot until routing ends, which can be after the 504: the router may
    * still store the turn then, and the worker hears `turn-stored` for its `turnKey`. The route timeout
    * counts from `receivedAt`, so the lookups before routing cannot push the answer past the worker's
-   * own request timeout.
+   * own request timeout. `jev`: a jev call's turn, its note added to the kind's; one superseded
+   * (`signal`) before routing is not routed. Nobody waits on a jev turn's HTTP answer, so it has no
+   * route timeout: it waits for routing to finish, or for `signal`, and its outcome is then real.
    */
   const takeTurn = async (
     call: LiveKitCall,
     text: string,
     receivedAt: number,
     turnKey: string | undefined,
+    jev?: { note: string; signal: AbortSignal },
   ): Promise<TurnOutcome> => {
     const release = () => void call.turnsInFlight--;
     let routed: Promise<boolean> | undefined;
@@ -1110,13 +1149,14 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         endCall(call, 'no chat to talk in');
         return { status: 409, body: 'The call has no chat to talk in' };
       }
+      if (jev?.signal.aborted) return { status: 409, body: 'The turn was superseded' };
       const utteranceId = String(++call.utterances);
       const sender = call.kind.sender(call.line);
       const message: InboundEvent['message'] = {
         id: liveKitUtteranceMessageId(call.callId, utteranceId),
         kind: 'chat',
         content: JSON.stringify({
-          text: turnMessageText(text, call.note),
+          text: turnMessageText(text, jev ? `${call.note}\n${jev.note}` : call.note),
           sender: sender.name,
           ...(sender.id ? { senderId: sender.id } : {}),
           livekit: { callId: call.callId, utteranceId },
@@ -1137,7 +1177,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       const fields = { callId: call.callId, utteranceId };
       try {
         const budgetMs = Math.max(0, routeTimeoutMs - (host.now() - receivedAt));
-        const stored = await settleWithin(routed, budgetMs, 'timeout' as const);
+        const stored = jev
+          ? await untilAborted(routed, jev.signal)
+          : await settleWithin(routed, budgetMs, 'timeout' as const);
+        if (stored === 'aborted') return { status: 409, body: 'The turn was superseded' };
         if (stored === 'timeout') {
           log.warn('livekit-voice-mode: a turn did not reach the agent in time', fields);
           void routed.then(
@@ -1157,7 +1200,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
           log.warn('livekit-voice-mode: the router did not hand a turn to the agent', fields);
           return { status: 422, body: 'The agent did not take the turn' };
         }
-        return { status: 202, body: JSON.stringify({ id: utteranceId }) };
+        return { status: 202, body: JSON.stringify({ id: utteranceId }), id: utteranceId };
       } catch {
         return { status: 500, body: 'Routing the turn failed' };
       }
@@ -1165,6 +1208,48 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       if (routed) void routed.then(release, release);
       else release();
     }
+  };
+
+  /** A jev call's turn, under the same admission, access and limit checks as a worker's turn. */
+  const submitTurn = async (
+    call: LiveKitCall,
+    message: string,
+    note: string,
+    signal: AbortSignal,
+  ): Promise<JevTurnResult> => {
+    if (call.state !== 'live' || !takesTurns(call)) return { ok: false, reason: 'the call has ended' };
+    const admitted = admitTurn(call, false);
+    if (!admitted.ok) return { ok: false, reason: admitted.body };
+    const outcome = await takeTurn(call, message, admitted.t, undefined, { note, signal });
+    return outcome.id ? { ok: true, turnId: outcome.id } : { ok: false, reason: `${outcome.status}: ${outcome.body}` };
+  };
+
+  const openJev = (call: LiveKitCall): JevCall =>
+    createJevCall(
+      {
+        callId: call.callId,
+        callerName: call.line.caller.name,
+        agentName: call.line.agent.name,
+        agentAliases: call.line.agent.wakeNames ?? [],
+        maxTextBytes: MAX_UTTERANCE_TEXT_BYTES,
+        submitTurn: (message, note, signal) => submitTurn(call, message, note, signal),
+        push: (event) => {
+          if (!call.ended) push(call, event);
+        },
+        now: () => host.now(),
+      },
+      config.jev,
+    );
+
+  /** `agent/jev`: a jev call's worker events, in order, into its loop. */
+  const onJev = (res: http.ServerResponse, call: LiveKitCall, body: Record<string, unknown>): void => {
+    if (!call.jev) return reply(res, 409, 'Not a jev call');
+    if (call.state !== 'live') return reply(res, 409, 'The caller is not in the call');
+    const events = body.events;
+    if (!Array.isArray(events) || events.length > MAX_JEV_EVENTS_PER_POST) {
+      return reply(res, 400, `events must be an array of at most ${MAX_JEV_EVENTS_PER_POST}`);
+    }
+    reply(res, 200, JSON.stringify(call.jev.workerEvents(events)), JSON_HEADERS);
   };
 
   /** /webhook/voice-mode/livekit/agent/*: the worker's side, authenticated by the per-call secret. */
@@ -1185,7 +1270,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (req.method !== 'POST') return reply(res, 405, 'POST only');
     // No secret, no body read: nothing unauthenticated is buffered.
     if (!secret) return reply(res, 409, 'No such call');
-    const body = await readJsonObject(req, MAX_AGENT_BODY_BYTES, {});
+    const body = await readJsonObject(
+      req,
+      route === 'livekit/agent/jev' ? MAX_JEV_BODY_BYTES : MAX_AGENT_BODY_BYTES,
+      {},
+    );
     if (!body) return reply(res, 400, 'Body must be a small JSON object');
     const call = findCall(body.callId);
     const late = !call && typeof body.callId === 'string' ? hungUp.get(body.callId)?.call : undefined;
@@ -1201,6 +1290,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (!call || call.ended || !secret || !sameSecret(secret, call.secret)) return reply(res, 409, 'No such call');
     if (route === 'livekit/agent/joined') return onJoined(res, call);
     if (route === 'livekit/agent/utterance') return onUtterance(res, call, body);
+    if (route === 'livekit/agent/jev') return onJev(res, call, body);
     if (route === 'livekit/agent/ended') {
       endCall(
         call,
@@ -1240,19 +1330,25 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         const at = speechChat(call, chat, agentGroupId, replyTo ?? null);
         if (!at) continue;
         if (at === 'previous' && call.previousChat) call.previousChat.active = true;
+        // The loop decides whether it is spoken; its own lines enter its window from playback reports.
+        if (call.jev) {
+          call.jev.reply(text, replyTo ? replyTo.utteranceId : null);
+          continue;
+        }
         push(call, { type: 'reply', text, turn: replyTo ? replyTo.utteranceId : null });
         call.kind.candidates?.heard('out', text);
       }
     },
 
     speaksChat(chat, agentGroupId, replyTo) {
-      return [...calls.values()].some((call) => speechChat(call, chat, agentGroupId, replyTo) !== null);
+      // A jev call has not decided yet whether it speaks the message.
+      return [...calls.values()].some((call) => !call.jev && speechChat(call, chat, agentGroupId, replyTo) !== null);
     },
 
     chatTyping(chat, agentGroupId, working = false) {
       for (const call of calls.values()) {
         if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
-        if (!callChatAt(call, chat)) continue;
+        if (!callChatAt(call, chat) || call.jev) continue;
         push(call, { type: 'thinking' });
         if (working) push(call, { type: 'working' });
       }
@@ -1274,4 +1370,23 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
   engines.add(engine);
   return engine;
+}
+
+/** `promise`'s outcome, or 'aborted' as soon as `signal` aborts. */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T | 'aborted'> {
+  if (signal.aborted) return Promise.resolve('aborted');
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve('aborted');
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
 }

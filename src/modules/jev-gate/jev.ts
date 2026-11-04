@@ -59,17 +59,24 @@ function readNoul(answers: unknown, id: JevQuestionId): number | null {
   return typeof noul === 'number' && Number.isFinite(noul) ? Math.min(1, Math.max(0, noul)) : null;
 }
 
-/** Ask Jev the rubric about `state`. Never throws. */
-export async function askJev(state: string, agentName: string): Promise<JevResult> {
+/**
+ * POST one System One request (`state` and `questions`; the pinned model is added) within
+ * `JEV_TIMEOUT_MS`, or sooner if `signal` aborts. Never throws.
+ */
+export async function postSystemOne(
+  request: { state: unknown; questions: Record<string, unknown> },
+  signal?: AbortSignal,
+): Promise<{ ok: true; body: unknown } | { ok: false; reason: string }> {
   if (!JEV_API_KEY) return { ok: false, reason: 'no_key' };
 
   let response: Response;
   try {
+    const timeout = AbortSignal.timeout(JEV_TIMEOUT_MS);
     response = await fetch(JEV_URL, {
       method: 'POST',
       headers: { authorization: `Bearer ${JEV_API_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ state, model: JEV_MODEL, questions: buildQuestions(agentName) }),
-      signal: AbortSignal.timeout(JEV_TIMEOUT_MS),
+      body: JSON.stringify({ state: request.state, model: JEV_MODEL, questions: request.questions }),
+      signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
     });
   } catch (err) {
     const timedOut = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
@@ -78,19 +85,26 @@ export async function askJev(state: string, agentName: string): Promise<JevResul
   }
 
   if (!response.ok) {
+    // An unread body holds the connection until it is collected.
+    void response.body?.cancel().catch(() => {});
     log.debug('Jev returned non-200', { status: response.status });
     return { ok: false, reason: `http_${response.status}` };
   }
 
-  let body: unknown;
   try {
-    body = await response.json();
+    return { ok: true, body: await response.json() };
   } catch (err) {
     log.debug('Jev returned an unparseable body', { err });
     return { ok: false, reason: 'bad_body' };
   }
+}
 
-  const answers = (body as { answers?: unknown } | null)?.answers;
+/** Ask Jev the rubric about `state`. Never throws. */
+export async function askJev(state: string, agentName: string): Promise<JevResult> {
+  const result = await postSystemOne({ state, questions: buildQuestions(agentName) });
+  if (!result.ok) return result;
+
+  const answers = (result.body as { answers?: unknown } | null)?.answers;
   const scores: Partial<JevScores> = {};
   for (const id of JEV_QUESTION_IDS) {
     const value = readNoul(answers, id);

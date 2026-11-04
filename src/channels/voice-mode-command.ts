@@ -5,7 +5,9 @@
  * talk in. The first run creates the agent's line and makes the sender its caller; later runs by
  * the caller show the same link again (sealed under the host key, see src/secret-seal.ts) and end
  * no call. A line is shown and moved only by its caller: another admin is told whose it is.
- * `/voice new` re-mints the caller's own link, which ends a call made with the old one.
+ * `/voice new` re-mints the caller's own link, which ends a call made with the old one. `/voice jev`
+ * makes the line's page calls run the jev loop (src/modules/meet-jev/: the agent decides from the
+ * conversation when to answer) until `/voice` is sent without it; the mode lives in host memory.
  *
  * A message interceptor, so the command never reaches an agent's session: the link is the line's
  * credential. In a direct chat the reply carries it. In a group it goes only to the sender: a
@@ -22,6 +24,7 @@ import { AccessToken, TrackSource } from 'livekit-server-sdk';
 
 import type { InboundEvent } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
+import { JEV_API_KEY } from '../config.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { mintVoiceModeLine, openVoiceModeLink } from '../db/voice-mode-lines.js';
 import { log } from '../log.js';
@@ -40,6 +43,7 @@ import {
   messageText,
 } from './voice-mode-chat.js';
 import {
+  CALL_SPEECH_FORMAT_NOTE,
   callChatReplyNote,
   chatLabel,
   JSON_HEADERS,
@@ -49,6 +53,7 @@ import {
   type LiveKitVoice,
   type LiveKitVoiceConfig,
 } from './voice-mode-livekit.js';
+import { linePlatformId } from './voice-mode-line.js';
 import { callPageHtml, type VoiceModeUiConfig } from './voice-mode-page.js';
 import { LIVEKIT_PROTOCOL_VERSION } from './voice-mode-protocol.js';
 
@@ -62,15 +67,23 @@ function liveCallUrl(): CallUrlFn | null {
 }
 
 /**
- * `/voice`, `/voice@<bot>` (Telegram groups) and, on Slack, `!voice`, with `new` as the only argument
- * that matters (`renew`: mint a fresh link); null for any other message.
+ * `/voice`, `/voice@<bot>` (Telegram groups) and, on Slack, `!voice`, with `new` (`renew`: mint a fresh
+ * link) or `jev` (the line's calls run the jev loop) as the only arguments that matter; null for any
+ * other message. `jev` only when on.
  */
-export function parseVoiceCommand(text: string, channelType: string): { renew: boolean } | null {
+export function parseVoiceCommand(text: string, channelType: string): { renew: boolean; jev?: true } | null {
   const match = /^\s*([!/]voice(?:@\S*)?)(?!\S)(?:\s+(\S+))?/i.exec(text);
   if (!match) return null;
   if (match[1][0] === '!' && !BANG_CHANNELS.has(channelType)) return null;
-  return { renew: match[2]?.toLowerCase() === 'new' };
+  const arg = match[2]?.toLowerCase();
+  return { renew: arg === 'new', ...(arg === 'jev' ? { jev: true as const } : {}) };
 }
+
+/** Lines whose page calls run the jev loop, by platform id: `/voice jev` adds one, `/voice` removes it. */
+const jevLines = new Set<string>();
+
+/** Whether the line's next page call runs the jev loop. */
+export const lineRunsJev = (platformId: string): boolean => jevLines.has(platformId);
 
 /** Why /voice shows no link for one agent. */
 export type VoiceNoLinkReason =
@@ -84,7 +97,7 @@ export type VoiceNoLinkReason =
 
 /** What /voice did for one agent of the chat: the sender's link, or why there is none. */
 export type VoiceTargetResult =
-  | { ok: true; agentGroupId: string; agentName: string; link: string; replaced: boolean }
+  | { ok: true; agentGroupId: string; agentName: string; link: string; replaced: boolean; lineId: string }
   | { ok: false; agentGroupId: string; agentName: string; reason: VoiceNoLinkReason; caller?: string };
 
 /** What /voice did in a chat: nothing to say (unknown sender), a refusal, or one result per agent. */
@@ -143,7 +156,7 @@ export async function runVoiceCommand(
     };
     const minted = (token: string, lineId: string, replaced: boolean): VoiceTargetResult => {
       log.info('Voice mode link minted via /voice', { ...target, line: lineId, replaced });
-      return { ok: true, ...agent, link: callUrl(token), replaced };
+      return { ok: true, ...agent, link: callUrl(token), replaced, lineId };
     };
     const claim = await claimLine(target, key);
     if (claim.kind === 'created') {
@@ -163,7 +176,9 @@ export async function runVoiceCommand(
     }
     const opened = await openVoiceModeLink(line, key);
     results.push(
-      'token' in opened ? { ok: true, ...agent, link: callUrl(opened.token), replaced: false } : noLink(opened.missing),
+      'token' in opened
+        ? { ok: true, ...agent, link: callUrl(opened.token), replaced: false, lineId: line.line_id }
+        : noLink(opened.missing),
     );
   }
   return results.length > 0 ? { kind: 'done', results } : { kind: 'refused' };
@@ -194,16 +209,22 @@ function noLinkLine(r: Extract<VoiceTargetResult, { ok: false }>, cmd: string): 
   }
 }
 
-/** The /voice reply, or null when the sender gets no answer. */
-export function voiceCommandReply(outcome: VoiceCommandOutcome, cmd = '/voice'): string | null {
+/** The /voice reply, or null when the sender gets no answer. `jev`: the reply to `/voice jev`. */
+export function voiceCommandReply(outcome: VoiceCommandOutcome, cmd = '/voice', jev = false): string | null {
   if (outcome.kind === 'drop') return null;
   if (outcome.kind === 'refused') return `Only an owner or admin of this agent can use ${cmd}.`;
   const links = voiceLinkLines(outcome);
   const notes = outcome.results.flatMap((r) => (r.ok ? [] : [noLinkLine(r, cmd)]));
   const replaced = outcome.results.some((r) => r.ok && r.replaced);
   const bound = `Calls talk in this chat, until ${cmd} is run in another one.${replaced ? ' Any earlier link no longer works.' : ''}`;
-  return [...links, ...(links.length > 0 ? [bound] : []), ...notes].join('\n\n');
+  const mode = `Calls on this link run in jev mode: the agent decides from the conversation when to answer. Send ${cmd} to go back.`;
+  return [...links, ...(links.length > 0 ? [bound] : []), ...(links.length > 0 && jev ? [mode] : []), ...notes].join(
+    '\n\n',
+  );
 }
+
+/** `/voice jev` needs the Jev key: without it every verdict fails silent and the agent never answers unaddressed. */
+const noJev = (cmd: string) => `jev mode needs the Jev gate's JEV_API_KEY on this host; send ${cmd} without jev.`;
 
 /**
  * Sends `text` so only the sender sees it, in the chat the command came from: `sent`, `unavailable`
@@ -244,14 +265,33 @@ export async function handleVoiceCommand(
   const cmd = voiceCommandName(event.channelType);
   // Straight to the chat's adapter, never through a session: the agent must not hold the call link.
   const say = (text: string) => adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
+  const jev = command.jev === true;
   try {
+    if (jev && !JEV_API_KEY) {
+      // Only someone who may run /voice here hears about the host's setup; others as for /voice.
+      const mine = await administeredWirings(mg, userId);
+      if (!mine) {
+        log.info('/voice from an unknown sender dropped', { channelType: event.channelType });
+        return true;
+      }
+      const text = mine.length > 0 ? noJev(cmd) : voiceCommandReply({ kind: 'refused' }, cmd)!;
+      if (mg.is_group === 0 || !privateReply || (await privateReply(text)) !== 'sent') await say(text);
+      return true;
+    }
     // Without a private reply a group's links go to the direct chat: check it first, so /voice new ends no call for nothing.
     if (command.renew && mg.is_group !== 0 && !privateReply && !(await directChat(userId, instance))) {
       await say(noDirectChat(cmd));
       return true;
     }
     let outcome = await runVoiceCommand(mg, chatThread, userId, { callUrl, renew: command.renew });
-    let text = voiceCommandReply(outcome, cmd);
+    if (outcome.kind === 'done') {
+      for (const r of outcome.results) {
+        if (!r.ok) continue;
+        if (jev) jevLines.add(linePlatformId(r.lineId));
+        else jevLines.delete(linePlatformId(r.lineId));
+      }
+    }
+    let text = voiceCommandReply(outcome, cmd, jev);
     if (text === null) {
       log.info('/voice from an unknown sender dropped', { channelType: event.channelType });
       return true;
@@ -292,7 +332,7 @@ export async function handleVoiceCommand(
         const left = shown.filter((id) => !replaced.has(id));
         if (left.length > 0) stale(left);
         exposedNote = left.length > 0 ? notReplaced(cmd) : EXPOSED;
-        text = [voiceCommandReply(outcome, cmd), exposedNote].filter((t) => t !== null).join('\n\n');
+        text = [voiceCommandReply(outcome, cmd, jev), exposedNote].filter((t) => t !== null).join('\n\n');
       }
     }
     if (voiceLinkLines(outcome).length === 0) {
@@ -361,17 +401,25 @@ const PROTOCOL_REFUSAL = JSON.stringify({
   message: `The voice service is updating. Reload the page or update your client to protocol ${LIVEKIT_PROTOCOL_VERSION}.`,
 });
 
-/** The `/voice` call: the caller's own page joins the room, as the line's caller. */
-function pageCallKind(maxCallDurationMs: number): CallKind {
+/**
+ * What every jev call turn tells the agent besides the loop's own note (the conversation and when to
+ * stay silent): the loop, not every message, decides what is read aloud.
+ */
+export const jevCallReplyNote = (languageNote: string): string =>
+  'Spoken on a live voice call; a reply you send to this chat is read aloud word for word unless the ' +
+  `conversation has moved on. ${CALL_SPEECH_FORMAT_NOTE} ${languageNote}`;
+
+/** The `/voice` call: the caller's own page joins the room, as the line's caller. `jev`: it runs the jev loop. */
+function pageCallKind(maxCallDurationMs: number, jev = false): CallKind {
   return {
     roomPrefix: 'voice',
     joinTimeoutMs: CALL_JOIN_TIMEOUT_MS,
     maxDurationMs: maxCallDurationMs,
     room: { emptyTimeout: 60, departureTimeout: 10, maxParticipants: 2 },
-    job: ({ callId }) => ({ callerIdentity: `caller-${callId.slice(0, 8)}` }),
+    job: ({ callId }) => ({ callerIdentity: `caller-${callId.slice(0, 8)}`, ...(jev ? { jev: true } : {}) }),
     // Always the line's own caller, wherever the call talks: the line is that person's, not whoever ran /voice.
     sender: (line) => line.caller,
-    turnNote: callChatReplyNote,
+    turnNote: jev ? jevCallReplyNote : callChatReplyNote,
   };
 }
 
@@ -391,6 +439,7 @@ export function createCallPage(
 ): { handle(req: http.IncomingMessage, res: http.ServerResponse, route: string, url: URL): Promise<void> } {
   const { lineForToken } = config;
   const pageCall = pageCallKind(config.maxCallDurationMs);
+  const jevPageCall = pageCallKind(config.maxCallDurationMs, true);
   let page: string | undefined;
 
   /** The page call's token: it joins that room only, as the caller the worker waits for. */
@@ -415,9 +464,9 @@ export function createCallPage(
     return at.toJwt();
   };
 
-  /** Open a page call and hand the caller a token for its room only. */
-  const startPageCall = async (res: http.ServerResponse, platformId: string): Promise<void> => {
-    const opened = await core.openCall(platformId, pageCall);
+  /** Open a page call and hand the caller a token for its room only. `jev`: the call runs the jev loop. */
+  const startPageCall = async (res: http.ServerResponse, platformId: string, jev: boolean): Promise<void> => {
+    const opened = await core.openCall(platformId, jev ? jevPageCall : pageCall);
     if (!opened.ok) {
       switch (opened.error) {
         case 'no-line':
@@ -456,6 +505,7 @@ export function createCallPage(
       agent: job.agentName,
       sttModel: job.sttModel,
       tts: job.tts,
+      ...(job.jev ? { jev: true } : {}),
     });
     // What the page needs for its hints: the silence that sends a turn, and the cap that ends the call.
     reply(
@@ -513,7 +563,11 @@ export function createCallPage(
       if (url.searchParams.get('v') !== String(LIVEKIT_PROTOCOL_VERSION)) {
         return reply(res, 426, PROTOCOL_REFUSAL, JSON_HEADERS);
       }
-      return startPageCall(res, platformId);
+      // A client may choose per call (`jev=1` / `jev=0`); otherwise the line's mode from /voice jev.
+      // Without the Jev key every verdict fails silent, so the call is a plain one.
+      const asked = url.searchParams.get('jev');
+      const jev = asked === '1' ? true : asked === '0' ? false : lineRunsJev(platformId);
+      return startPageCall(res, platformId, jev && !!JEV_API_KEY);
     }
     if (route === 'livekit/end') {
       const body = await readJsonObject(req, MAX_END_BODY_BYTES, {});

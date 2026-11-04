@@ -9,6 +9,18 @@ import net, { type AddressInfo } from 'node:net';
 import { AccessToken } from 'livekit-server-sdk';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+/** The Jev key a jev call needs; a test empties it for a host without one. */
+const jevKey = vi.hoisted(() => ({ value: 'jev-test-key' }));
+vi.mock('../config.js', async () => {
+  const actual = await vi.importActual('../config.js');
+  return {
+    ...actual,
+    get JEV_API_KEY() {
+      return jevKey.value;
+    },
+  };
+});
+
 import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
 import {
   createVoiceModeAdapter,
@@ -29,6 +41,7 @@ import {
   CALL_DEPTH_NOTE,
   CALL_LANGUAGE_NOTE,
   callLanguageNote,
+  MAX_UTTERANCES_PER_MINUTE,
   type LiveKitServerApi,
   type LiveKitVoiceConfig,
   type MirrorApi,
@@ -45,6 +58,8 @@ import {
   CALL_THINKING_ATTRIBUTE,
   CALL_TURN_TOPIC,
   CALL_UPDATING_ATTRIBUTE,
+  MAX_JEV_EVENTS_PER_POST,
+  MAX_JEV_POST_BYTES,
   wakePhrase,
 } from './voice-mode-protocol.js';
 import { log } from '../log.js';
@@ -53,6 +68,7 @@ import { callPageHtml } from './voice-mode-page.js';
 import type { VoiceCatalog, VoiceStatus } from './voice-mode-tts-catalog.js';
 import { linePlatformId } from './voice-mode-line.js';
 import { MEETING_MAX_DURATION_MS, type RecallMeetBridge } from './meet-recall.js';
+import type { CallCore, CallEvent, Command, JevState } from '../modules/meet-jev/core/types.js';
 
 /** A line /voice made: its calls need a chat to talk in. */
 const LINE = linePlatformId('0123456789ab');
@@ -2208,5 +2224,382 @@ describe('meetings: the /meet call kind on the call core', () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toBe('Not a turn: this call takes no candidates');
     expect(h.events).toHaveLength(0);
+  });
+});
+
+describe('/voice jev on the call core', () => {
+  let h: Harness;
+  let chat: ReturnType<typeof fakeMirror>;
+  /** Every event the loop's core was fed, in order. */
+  let seen: CallEvent[];
+
+  /**
+   * A core for the host seams only: a final utterance is a turn (`stop` stops playback instead; one
+   * starting `instead:` supersedes `u1`); a reply is spoken, shown (`show: ...`) or dropped (`[silent]`).
+   */
+  const hostCore: CallCore<null> = {
+    initial: () => null,
+    reduce: (state, event) => {
+      seen.push(event);
+      return state;
+    },
+    decide: (_state, event): Command[] => {
+      if (event.kind === 'utterance' && event.final) {
+        if (event.text === 'stop') return [{ kind: 'stop_playback' }];
+        const supersedes = event.text.startsWith('instead:') ? { supersedes: 'u1' } : {};
+        return [
+          { kind: 'turn', key: event.uttId, message: event.text, note: `WINDOW [Ethan] ${event.text}`, ...supersedes },
+        ];
+      }
+      if (event.kind !== 'reply') return [];
+      if (event.text === '[silent]') return [{ kind: 'drop', replyId: event.replyId }];
+      if (event.text.startsWith('show:')) return [{ kind: 'show', replyId: event.replyId, text: event.text }];
+      return [{ kind: 'speak', replyId: event.replyId, text: event.text }];
+    },
+  };
+
+  beforeEach(async () => {
+    seen = [];
+    chat = fakeMirror([{ platform_id: 'telegram:100' }], {
+      bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
+    });
+    h = await startHarness(
+      { accessCheckIntervalMs: 60_000 },
+      { mirrorApi: chat.api, jev: { core: hostCore, judge: async () => ({ verdict: null, ms: 0 }) } },
+    );
+  });
+  afterEach(async () => {
+    await h.stop();
+  });
+
+  const startJevCall = async (): Promise<FakeWorker> => {
+    const res = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
+    expect(res.status).toBe(200);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    expect((await worker.post('joined')).status).toBe(200);
+    return worker;
+  };
+
+  const final = (uttId: string, text: string) => ({ type: 'utterance', uttId, text, final: true, at: Date.now() });
+
+  /** The agent's message reached the call chat, answering the call's turn `utteranceId` (or none). */
+  const delivered = (worker: FakeWorker, text: string, utteranceId?: string) =>
+    liveKitChatDelivered(
+      {
+        id: `out-${text}`,
+        kind: 'chat',
+        content: JSON.stringify({ text }),
+        channelType: 'telegram',
+        platformId: 'telegram:100',
+        threadId: null,
+        ...(utteranceId ? { inReplyTo: `livekit:${worker.meta.callId}:${utteranceId}:ag-andy` } : {}),
+      },
+      'ag-andy',
+    );
+
+  const turnEvent = (key: string) =>
+    vi.waitFor(() => {
+      const hit = seen.find((e) => (e.kind === 'turn' || e.kind === 'turn_failed') && e.key === key);
+      if (!hit) throw new Error(`no turn event for ${key}`);
+      return hit;
+    });
+
+  it('puts jev in the job only when asked; a plain call has none', async () => {
+    const plain = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    expect(plain.status).toBe(200);
+    expect(h.lk.dispatches.at(-1)!.metadata).not.toHaveProperty('jev');
+    const worker = await startJevCall();
+    expect(worker.meta.jev).toBe(true);
+    worker.close();
+  });
+
+  it('starts a plain call for jev=1 on a host without the Jev key', async () => {
+    jevKey.value = '';
+    try {
+      expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+      expect(h.lk.dispatches.at(-1)!.metadata).not.toHaveProperty('jev');
+    } finally {
+      jevKey.value = 'jev-test-key';
+    }
+  });
+
+  it('waits out a slow route for a jev turn: one stored after the route timeout is a turn, not a failure', async () => {
+    await h.stop();
+    h = await startHarness(
+      { accessCheckIntervalMs: 60_000 },
+      {
+        mirrorApi: chat.api,
+        routeTimeoutMs: 100,
+        jev: { core: hostCore, judge: async () => ({ verdict: null, ms: 0 }) },
+      },
+    );
+    const worker = await startJevCall();
+    h.routing.mode = 'hang';
+    await worker.post('jev', { events: [final('u1', 'Dan, a slow one?')] });
+    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(seen.some((e) => e.kind === 'turn' || e.kind === 'turn_failed')).toBe(false);
+    h.routing.hung[0](true);
+    expect(await turnEvent('u1')).toMatchObject({ kind: 'turn', turnId: '1' });
+    worker.close();
+  });
+
+  it('stops waiting for a jev turn being routed once a newer one supersedes it', async () => {
+    const worker = await startJevCall();
+    h.routing.mode = 'hang';
+    await worker.post('jev', { events: [final('u1', 'Dan, first?')] });
+    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(1));
+    await worker.post('jev', { events: [final('u2', 'instead: Dan, second?')] });
+    expect(await turnEvent('u1')).toMatchObject({ kind: 'turn_failed', reason: '409: The turn was superseded' });
+    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(2));
+    h.routing.hung[1](true);
+    expect(await turnEvent('u2')).toMatchObject({ kind: 'turn', turnId: '2' });
+    h.routing.hung[0](true);
+    worker.close();
+  });
+
+  it('turns a wake into a turn: the trigger is the message and what the chat shows, the window is in the note', async () => {
+    const worker = await startJevCall();
+    const res = await worker.post('jev', {
+      events: [{ type: 'speech', on: true, at: Date.now() }, final('u1', 'Dan, what is on tomorrow?')],
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ accepted: 2, dropped: 0 });
+    const turn = await turnEvent('u1');
+    expect(turn).toMatchObject({ kind: 'turn', turnId: '1' });
+    expect(seen[0]).toMatchObject({ kind: 'speech', speaker: { id: 'caller', name: 'Ethan' }, on: true });
+    const msg = h.inbound[0];
+    expect(msg.id).toBe(`livekit:${worker.meta.callId}:1`);
+    const text = (msg.content as { text: string }).text;
+    expect(text.startsWith('<voice source="livekit">Dan, what is on tomorrow?</voice>\n')).toBe(true);
+    expect(text).toContain('WINDOW [Ethan] Dan, what is on tomorrow?');
+    expect(text).not.toContain('every message you send to this chat is read aloud');
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toContain('\u{1F399} Dan, what is on tomorrow?'));
+    expect(chat.posts.some((p) => p.text.includes('WINDOW'))).toBe(false);
+    worker.close();
+  });
+
+  it('speaks only what the loop says: speak pushes a reply with its id, show and drop push nothing, stop pushes stop', async () => {
+    const worker = await startJevCall();
+    await worker.post('jev', { events: [final('u1', 'Dan, the weather?')] });
+    await turnEvent('u1');
+    delivered(worker, 'show: an old answer', '1');
+    delivered(worker, '[silent]', '1');
+    delivered(worker, 'Sunny all day.', '1');
+    delivered(worker, 'Unprompted note.');
+    await worker.waitFor((e) => e.type === 'reply' && e.text === 'Unprompted note.');
+    expect(worker.events.filter((e) => e.type === 'reply')).toEqual([
+      { type: 'reply', text: 'Sunny all day.', turn: '1', replyId: 'r3' },
+      { type: 'reply', text: 'Unprompted note.', turn: null, replyId: 'r4' },
+    ]);
+    expect(seen.filter((e) => e.kind === 'reply').map((e) => e.kind === 'reply' && [e.replyId, e.turnId])).toEqual([
+      ['r1', '1'],
+      ['r2', '1'],
+      ['r3', '1'],
+      ['r4', null],
+    ]);
+    await worker.post('jev', { events: [final('u2', 'stop')] });
+    await worker.waitFor((e) => e.type === 'stop');
+    worker.close();
+  });
+
+  it('feeds playback reports to the loop; the agent lines are not heard at push time', async () => {
+    const worker = await startJevCall();
+    await worker.post('jev', { events: [final('u1', 'Dan?')] });
+    await turnEvent('u1');
+    delivered(worker, 'Yes?', '1');
+    await worker.waitFor((e) => e.type === 'reply');
+    const res = await worker.post('jev', {
+      events: [
+        { type: 'playback', replyId: 'r1', state: 'started', at: Date.now() },
+        { type: 'playback', replyId: 'r1', state: 'cut_off', delivered: 'Ye', at: Date.now() },
+      ],
+    });
+    expect(await res.json()).toEqual({ accepted: 2, dropped: 0 });
+    expect(seen.filter((e) => e.kind === 'playback')).toEqual([
+      { kind: 'playback', replyId: 'r1', state: 'started', at: expect.any(Number) },
+      { kind: 'playback', replyId: 'r1', state: 'cut_off', delivered: 'Ye', at: expect.any(Number) },
+    ]);
+    worker.close();
+  });
+
+  it('sends a jev call no thinking or working, and does not mark its chat copies as spoken', async () => {
+    const worker = await startJevCall();
+    liveKitChatTyping({ channelType: 'telegram', platformId: 'telegram:100', threadId: null }, 'ag-andy', true);
+    const presented = liveKitChatPresentation(
+      { id: 'out-1', kind: 'chat', channelType: 'telegram', platformId: 'telegram:100', threadId: null } as never,
+      { text: 'Hello' },
+      'ag-andy',
+    );
+    expect(presented).toBeNull();
+    await settle();
+    expect(worker.events.filter((e) => e.type === 'thinking' || e.type === 'working')).toEqual([]);
+    worker.close();
+  });
+
+  it('takes agent/jev only from the call worker, bounded, and only on a jev call', async () => {
+    const worker = await startJevCall();
+    const jevUrl = `${h.hostUrl}/webhook/voice-mode/livekit/agent/jev`;
+    const events = [final('u1', 'hi')];
+    expect((await post(jevUrl, { callId: worker.meta.callId, events })).status).toBe(409);
+    expect(
+      (await post(jevUrl, { callId: worker.meta.callId, events }, { Authorization: 'Bearer nope-nope-nope' })).status,
+    ).toBe(409);
+    expect((await post(jevUrl, { callId: 'other', events }, workerAuth(worker.meta.callId))).status).toBe(409);
+    expect((await worker.post('jev', { events: 'hi' })).status).toBe(400);
+    const tooMany = Array.from({ length: MAX_JEV_EVENTS_PER_POST + 1 }, () => ({ type: 'speech', on: true, at: 1 }));
+    expect((await worker.post('jev', { events: tooMany })).status).toBe(400);
+    const mixed = await worker.post('jev', { events: [{ type: 'speech', on: true, at: 1 }, { type: 'nope' }] });
+    expect(await mixed.json()).toEqual({ accepted: 1, dropped: 1 });
+    // The worker's turn route is closed on a jev call: turns come from the loop only.
+    expect((await worker.post('utterance', { text: 'hello' })).status).toBe(409);
+    expect(seen.filter((e) => e.kind === 'utterance')).toEqual([]);
+    // A body over the bound is refused unread: the host drops the connection mid-body, so the client sees
+    // a 400 or a reset, on a connection of its own; nothing of it reaches the loop.
+    const huge = JSON.stringify({
+      callId: worker.meta.callId,
+      // Two UTF-8 bytes a character: twice the bound.
+      events: Array.from({ length: MAX_JEV_EVENTS_PER_POST }, (_, i) =>
+        final(`u${i}`, 'я'.repeat(MAX_JEV_POST_BYTES / MAX_JEV_EVENTS_PER_POST)),
+      ),
+    });
+    const outcome = await new Promise<number | 'reset' | undefined>((resolve) => {
+      const req = http.request(
+        jevUrl,
+        { method: 'POST', agent: false, headers: workerAuth(worker.meta.callId) },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode);
+        },
+      );
+      req.on('error', () => resolve('reset'));
+      req.end(huge);
+    });
+    expect([400, 'reset']).toContain(outcome);
+    await settle();
+    expect(seen.filter((e) => e.kind === 'utterance')).toEqual([]);
+    worker.close();
+  });
+
+  it('refuses agent/jev on a call that is not a jev call', async () => {
+    const { worker } = await startCall(h);
+    const res = await worker.post('jev', { events: [final('u1', 'hi')] });
+    expect(res.status).toBe(409);
+    expect(await res.text()).toBe('Not a jev call');
+    worker.close();
+  });
+
+  it('holds a jev turn to the call limits and access, as a worker turn', async () => {
+    const worker = await startJevCall();
+    const batch = Array.from({ length: MAX_UTTERANCES_PER_MINUTE + 1 }, (_, i) => final(`u${i}`, `q${i}`));
+    await worker.post('jev', { events: batch });
+    expect(await turnEvent(`u${MAX_UTTERANCES_PER_MINUTE}`)).toMatchObject({
+      kind: 'turn_failed',
+      reason: 'Too many utterances this minute',
+    });
+    expect(seen.filter((e) => e.kind === 'turn')).toHaveLength(MAX_UTTERANCES_PER_MINUTE);
+    h.clock.now += MIN;
+    h.access.enabled = false;
+    // A caller who lost access gets no turn in: the check ends the call, and the loop with it.
+    await worker.post('jev', { events: [final('late', 'still there?')] });
+    await worker.waitFor((e) => e.type === 'end');
+    expect(h.events).toHaveLength(MAX_UTTERANCES_PER_MINUTE);
+    expect(seen.some((e) => 'key' in e && e.key === 'late')).toBe(false);
+    worker.close();
+  });
+
+  it('ends the loop with the call', async () => {
+    const worker = await startJevCall();
+    expect((await worker.post('ended', { reason: 'caller left' })).status).toBe(204);
+    expect((await worker.post('jev', { events: [final('u1', 'hi')] })).status).toBe(409);
+    expect(seen).toEqual([]);
+    worker.close();
+  });
+});
+
+describe('/voice jev with the real core', () => {
+  let h: Harness;
+  let chat: ReturnType<typeof fakeMirror>;
+  /** Every state Jev was asked about; it answers `answer` with confidence. */
+  let asked: JevState[];
+
+  beforeEach(async () => {
+    asked = [];
+    chat = fakeMirror([{ platform_id: 'telegram:100' }], {
+      bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
+    });
+    const judge = async (state: JevState) => {
+      asked.push(state);
+      return {
+        verdict: {
+          action: 'answer' as const,
+          probabilities: { answer: 0.9, stay_silent: 0.1, stop: 0, continue: 0 },
+          confidence: 0.8,
+        },
+        ms: 5,
+      };
+    };
+    h = await startHarness({ accessCheckIntervalMs: 60_000 }, { mirrorApi: chat.api, jev: { judge } });
+  });
+  afterEach(async () => {
+    await h.stop();
+  });
+
+  it('wakes on the vocative, speaks the answer, takes the playback into the window, and judges the next words', async () => {
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    expect((await worker.post('joined')).status).toBe(200);
+    const at = () => Date.now();
+    await worker.post('jev', {
+      events: [
+        { type: 'speech', on: true, at: at() },
+        { type: 'utterance', uttId: 'u1', text: 'Andy, what time is it?', final: true, at: at() },
+        { type: 'speech', on: false, at: at() },
+      ],
+    });
+    await vi.waitFor(() => expect(h.inbound).toHaveLength(1));
+    const text = (h.inbound[0].content as { text: string }).text;
+    expect(text.startsWith('<voice source="livekit">Andy, what time is it?</voice>\n')).toBe(true);
+    expect(text).toContain('You are on a live voice call');
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['\u{1F399} Andy, what time is it?']));
+    expect(asked).toEqual([]);
+
+    liveKitChatDelivered(
+      {
+        id: 'out-1',
+        kind: 'chat',
+        content: JSON.stringify({ text: 'It is nine.' }),
+        channelType: 'telegram',
+        platformId: 'telegram:100',
+        threadId: null,
+        inReplyTo: `${h.inbound[0].id}:ag-andy`,
+      },
+      'ag-andy',
+    );
+    const spoken = await worker.waitFor((e) => e.type === 'reply');
+    expect(spoken).toEqual({ type: 'reply', text: 'It is nine.', turn: '1', replyId: 'r1' });
+    await worker.post('jev', {
+      events: [
+        { type: 'playback', replyId: 'r1', state: 'started', at: at() },
+        { type: 'playback', replyId: 'r1', state: 'completed', at: at() },
+        // The worker's order: its final lands after its VAD end, and differs from the partial.
+        { type: 'speech', on: true, at: at() },
+        { type: 'utterance', uttId: 'u2', text: 'and tomorrow', final: false, at: at() },
+        { type: 'speech', on: false, at: at() },
+        { type: 'utterance', uttId: 'u2', text: 'And tomorrow?', final: true, at: at() },
+      ],
+    });
+    await vi.waitFor(() => expect(h.inbound).toHaveLength(2));
+    await settle();
+    expect(h.inbound).toHaveLength(2);
+    expect(asked).toHaveLength(1);
+    expect(asked[0].window).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ text: 'It is nine.', agent: true }),
+        expect.objectContaining({ speaker: 'Ethan', text: 'And tomorrow?' }),
+      ]),
+    );
+    expect((h.inbound[1].content as { text: string }).text).toContain('<voice source="livekit">And tomorrow?</voice>');
+    worker.close();
   });
 });
