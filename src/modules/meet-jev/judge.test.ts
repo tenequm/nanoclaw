@@ -29,6 +29,7 @@ const state: JevState = {
   latest: { speaker: 'Misha', text: 'Dan, what time is it?' },
   window: [{ t: 0.4, speaker: 'Misha', text: 'Dan, what time is it?' }],
   facts: {
+    humans_in_room: 1,
     agent_speaking: false,
     pending_answer: false,
     cut_off_after: null,

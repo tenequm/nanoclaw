@@ -9,6 +9,7 @@ import {
   applyWindow,
   floorTaken,
   hasWords,
+  humansInRoom,
   isHandled,
   latestUtterance,
   latestWake,
@@ -30,7 +31,15 @@ const BOUNDARY_TIMER = 'boundary:';
 /** A speaker's STT final comes up to ~3 s after their VAD end; a boundary waits that long for it. */
 const FINAL_MARGIN_MS = 3_000;
 const WAKES_KEPT = 8;
-const STOP_WORDS = new Set(['stop', 'please stop', 'stop please', 'стоп', 'стій', 'зупинись']);
+const STOP_WORDS = new Set([
+  'stop',
+  'wait',
+  '\u0441\u0442\u043e\u043f',
+  '\u0441\u0442\u0456\u0439',
+  '\u0437\u0443\u043f\u0438\u043d\u0438\u0441\u044c',
+  '\u043f\u043e\u0447\u0435\u043a\u0430\u0439',
+  '\u0437\u0430\u0447\u0435\u043a\u0430\u0439',
+]);
 
 export function reduce(prev: CallState, event: CallEvent): CallState {
   const state = structuredClone<CallState>({ ...prev, commands: [] });
@@ -144,7 +153,15 @@ function decideLatest(state: CallState, speakerId: string): boolean {
 
   const trigger = { trigger: utt.text, speaker: speaker.name };
   const { vocative, rest } = vocativeOf(utt.text, [state.policy.agentName, ...state.policy.agentAliases]);
-  if (STOP_WORDS.has(rest)) {
+  if (
+    rest === 'please stop' ||
+    rest === 'stop please' ||
+    (rest.length > 0 &&
+      rest
+        .replace(/\bhold on\b/g, 'wait')
+        .split(' ')
+        .every((word) => STOP_WORDS.has(word)))
+  ) {
     if (agentSpeaking(state) || pendingAnswer(state)) {
       stop(state);
       log(state, 'decision', { ...trigger, rule: 'stop', action: 'stop' });
@@ -248,8 +265,11 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
 /** The action to take: `stop` and `continue` only when the facts allow them, each over its threshold. */
 function chosen(state: CallState, verdict: Verdict): Action {
   const { thresholds } = state.policy;
-  const over = (action: Exclude<Action, 'stay_silent'>) =>
-    verdict.probabilities[action] >= thresholds[action].p && verdict.confidence >= thresholds[action].confidence;
+  const over = (action: Exclude<Action, 'stay_silent'>) => {
+    const threshold =
+      action === 'answer' && humansInRoom(state) <= 1 ? state.policy.oneCaller.answer : thresholds[action];
+    return verdict.action === action && verdict.probabilities[action] >= threshold.p;
+  };
   if ((agentSpeaking(state) || pendingAnswer(state)) && over('stop')) return 'stop';
   if (state.cutOffAfter !== null && !agentSpeaking(state) && over('continue')) return 'continue';
   if (over('answer')) return 'answer';
@@ -380,10 +400,8 @@ function onRecheck(state: CallState, wakeKey: string, verdict: RecheckVerdict | 
   if (!recheck || recheck.wakeKey !== wakeKey) return;
   state.recheck = null;
   const wake = state.wakes.find((w) => w.key === wakeKey);
-  const { p, confidence } = state.policy.recheckShow;
-  const show =
-    !wake ||
-    (!!verdict && verdict.action === 'show' && verdict.probabilities.show >= p && verdict.confidence >= confidence);
+  const { p } = state.policy.recheckShow;
+  const show = !wake || (!!verdict && verdict.action === 'show' && verdict.probabilities.show >= p);
   if (wake) wake.rechecked = { outcome: show ? 'show' : 'speak', since: recheck.since };
   log(state, 'recheck', {
     trigger: wake?.trigger,

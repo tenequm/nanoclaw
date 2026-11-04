@@ -12,15 +12,16 @@ const POLICY: CallPolicy = {
   agentName: 'Dan',
   agentAliases: [],
   paragraph: '',
+  oneCaller: { paragraph: '', answer: { p: 0.5 } },
   boundaryFallbackMs: 700,
   windowMs: 90_000,
   windowBytes: 16_384,
   thresholds: {
-    answer: { p: 0.7, confidence: 0.5 },
-    stop: { p: 0.7, confidence: 0.5 },
-    continue: { p: 0.7, confidence: 0.5 },
+    answer: { p: 0.7 },
+    stop: { p: 0.7 },
+    continue: { p: 0.7 },
   },
-  recheckShow: { p: 0.7, confidence: 0.5 },
+  recheckShow: { p: 0.7 },
 };
 
 const SPEAKER = { id: 'caller', name: 'Ethan' };

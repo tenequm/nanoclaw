@@ -186,7 +186,7 @@ describe('a third-person mention', () => {
     const [judge] = only(commands, 'judge');
     expect(judge.state.window.map((l) => l.speaker)).toEqual(['Olena', 'Misha']);
     expect(judge.state.latest).toEqual({ speaker: 'Misha', text: expect.any(String) });
-    expect(judge.state.participants).toEqual(['Olena', 'Misha']);
+    expect(judge.state.facts.humans_in_room).toBe(2);
     expect(call.verdict(judge.windowVersion, 'stay_silent')).toEqual([]);
   });
 
@@ -489,15 +489,15 @@ describe('verdicts', () => {
     expect(call.lastLog('decision')).toMatchObject({ jev: null, action: 'stay_silent', reason: 'jev_failed' });
   });
 
-  it('answers only over both thresholds', () => {
+  it('answers at the probability threshold regardless of confidence', () => {
     const call = new Call();
     const [judge] = only(call.say(misha, 'u1', 'what is the capital of Peru'), 'judge');
-    expect(call.verdict(judge.windowVersion, 'answer', 0.9, 0.3)).toEqual([]);
+    expect(call.verdict(judge.windowVersion, 'answer', 0.49, 0.9)).toEqual([]);
     const [again] = only(call.say(misha, 'u2', 'the capital of Peru, anyone?'), 'judge');
-    const [turn] = only(call.verdict(again.windowVersion, 'answer', 0.75, 0.6), 'turn');
+    const [turn] = only(call.verdict(again.windowVersion, 'answer', 0.5, 0.1), 'turn');
     expect(turn.message).toBe('the capital of Peru, anyone?');
     expect(call.lastLog('decision')).toMatchObject({
-      jev: { choice: 'answer', confidence: 0.6 },
+      jev: { choice: 'answer', confidence: 0.1 },
       action: 'answer',
       ms: 400,
     });
@@ -757,8 +757,14 @@ describe('the answer-ready recheck', () => {
   it('speaks unless the show is over its thresholds', () => {
     const call = new Call('meet');
     answeredMeanwhile(call, 'Hmm, good question.');
-    expect(recheckVerdict(call, 'show', 0.9, 0.3)).toEqual([{ kind: 'speak', replyId: 'r1', text: 'Lima.' }]);
+    expect(recheckVerdict(call, 'show', 0.74, 0.9)).toEqual([{ kind: 'speak', replyId: 'r1', text: 'Lima.' }]);
     expect(call.lastLog('recheck')).toMatchObject({ outcome: 'spoken' });
+  });
+
+  it('shows at 0.75 even with low confidence', () => {
+    const call = new Call('meet');
+    answeredMeanwhile(call);
+    expect(recheckVerdict(call, 'show', 0.75, 0)).toEqual([{ kind: 'show', replyId: 'r1', text: 'Lima.' }]);
   });
 
   it('a failed Jev call speaks: the answer was wanted a moment ago', () => {
@@ -801,4 +807,102 @@ describe('the answer-ready recheck', () => {
       { kind: 'speak', replyId: 'r3', text: 'On the coast.' },
     ]);
   });
+});
+
+describe('room size and probability-only routing', () => {
+  it('tracks silent participants, duplicate joins and leaves', () => {
+    const call = new Call('meet');
+    call.feed({ kind: 'presence', speaker: misha, joined: true });
+    expect(toJevState(call.state)).toMatchObject({ participants: ['Misha'], facts: { humans_in_room: 1 } });
+    expect(toJevState(call.state).policy).toContain('one person');
+    const version = call.state.windowVersion;
+    call.feed({ kind: 'presence', speaker: misha, joined: true });
+    expect(call.state.windowVersion).toBe(version);
+    call.feed({ kind: 'presence', speaker: olena, joined: true });
+    expect(toJevState(call.state)).toMatchObject({ participants: ['Misha', 'Olena'], facts: { humans_in_room: 2 } });
+    expect(toJevState(call.state).policy).toContain('several people');
+    call.feed({ kind: 'presence', speaker: olena, joined: false });
+    expect(toJevState(call.state).facts.humans_in_room).toBe(1);
+  });
+
+  it('uses recent speakers as a floor for incomplete rosters, expiring them with the window', () => {
+    const call = new Call('meet');
+    call.feed({ kind: 'presence', speaker: misha, joined: true });
+    call.say(misha, 'u1', 'hello');
+    call.say(olena, 'u2', 'hello');
+    expect(toJevState(call.state).facts.humans_in_room).toBe(2);
+    call.feed({ kind: 'timer', key: 'tick', at: 100_000 });
+    expect(toJevState(call.state).facts.humans_in_room).toBe(1);
+  });
+
+  it.each(['voice', 'meet'] as const)('accepts a 0.5 answer for one human in %s', (kind) => {
+    const call = new Call(kind);
+    const [judge] = only(call.say(misha, 'u1', 'What time is it?'), 'judge');
+    expect(only(call.verdict(judge.windowVersion, 'answer', 0.5, 0), 'turn')).toHaveLength(1);
+  });
+
+  it('keeps voice at one human regardless of presence events', () => {
+    const call = new Call();
+    call.feed({ kind: 'presence', speaker: misha, joined: true }, { kind: 'presence', speaker: olena, joined: true });
+    expect(toJevState(call.state).facts.humans_in_room).toBe(1);
+  });
+
+  it.each([0.69, 0.7])('requires 0.7 for multiple humans: %s', (p) => {
+    const call = new Call('meet');
+    call.feed({ kind: 'presence', speaker: misha, joined: true }, { kind: 'presence', speaker: olena, joined: true });
+    const [judge] = only(call.say(misha, 'u1', 'What time is it?'), 'judge');
+    expect(only(call.verdict(judge.windowVersion, 'answer', p, 0), 'turn')).toHaveLength(p >= 0.7 ? 1 : 0);
+  });
+
+  it('makes a verdict stale when a silent human joins', () => {
+    const call = new Call('meet');
+    const [judge] = only(call.say(misha, 'u1', 'What time is it?'), 'judge');
+    call.feed({ kind: 'presence', speaker: misha, joined: true }, { kind: 'presence', speaker: olena, joined: true });
+    const commands = call.verdict(judge.windowVersion, 'answer', 0.6, 0);
+    expect(only(commands, 'turn')).toEqual([]);
+    expect(only(commands, 'judge')).toHaveLength(1);
+  });
+
+  it.each([0.59, 0.6])('stops on probability alone at 0.6: %s', (p) => {
+    const call = new Call();
+    wakeAndSpeak(call, 'Dan, hello', 'Hello there.', 1);
+    const [judge] = only(call.say(misha, 'u2', 'Enough of that'), 'judge');
+    expect(only(call.verdict(judge.windowVersion, 'stop', p, 0), 'stop_playback')).toHaveLength(p >= 0.6 ? 1 : 0);
+  });
+
+  it.each([0.69, 0.7])('continues on probability alone at 0.7: %s', (p) => {
+    const call = new Call();
+    const replyId = wakeAndSpeak(call, 'Dan, hello', 'Hello there.', 1);
+    call.feed({ kind: 'playback', replyId, state: 'cut_off', delivered: 'Hello' });
+    const [judge] = only(call.say(misha, 'u2', 'Go on'), 'judge');
+    expect(only(call.verdict(judge.windowVersion, 'continue', p, 0), 'turn')).toHaveLength(p >= 0.7 ? 1 : 0);
+  });
+});
+
+describe('repeated stop commands', () => {
+  it.each([
+    'stop stop',
+    '\u0441\u0442\u0456\u0439 \u0441\u0442\u0456\u0439',
+    '\u043f\u043e\u0447\u0435\u043a\u0430\u0439, \u043f\u043e\u0447\u0435\u043a\u0430\u0439, \u0441\u0442\u0456\u0439',
+    '\u0437\u0430\u0447\u0435\u043a\u0430\u0439',
+    'wait',
+    'hold on',
+    'hold on, stop',
+  ])('stops only while speaking or pending: %s', (text) => {
+    for (const phase of ['idle', 'pending', 'speaking']) {
+      const call = new Call();
+      if (phase === 'pending') call.sayAnswered(misha, 'u1', 'Dan, hello');
+      if (phase === 'speaking') wakeAndSpeak(call, 'Dan, hello', 'Hello there.', 1);
+      expect(only(call.say(misha, 'u2', text), 'stop_playback')).toHaveLength(phase === 'idle' ? 0 : 1);
+    }
+  });
+
+  it.each(['wait for Anna', 'hold on to that thought', 'stop the timer', 'please'])(
+    'leaves other utterances to Jev: %s',
+    (text) => {
+      const call = new Call();
+      wakeAndSpeak(call, 'Dan, hello', 'Hello there.', 1);
+      expect(only(call.say(misha, 'u2', text), 'stop_playback')).toEqual([]);
+    },
+  );
 });

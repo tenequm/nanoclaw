@@ -17,6 +17,7 @@ import { JEV_API_KEY } from '../config.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getVoiceModeLineForAgent } from '../db/voice-mode-lines.js';
 import { log } from '../log.js';
+import type { CallEvent } from '../modules/meet-jev/core/types.js';
 import {
   createMeetingAudio,
   sileroDetectors,
@@ -139,14 +140,25 @@ export function createRecallTranscripts(
 ): MeetingTranscripts & Pick<RecallIngress, 'handleUpgrade' | 'close'> {
   const loadDetectors = seams.detectors ?? sileroDetectors;
   let detector: SpeechDetectorFactory | null = null;
-  const calls = new Map<string, { audio: MeetingAudio; logged: number }>();
+  const calls = new Map<string, { audio: MeetingAudio; logged: number; presence: Map<string, CallEvent> }>();
+  const activeCall = (callId: string) => {
+    const runtime = core.jevCall(callId);
+    const pending = calls.get(callId)?.presence;
+    if (runtime && pending) {
+      for (const event of pending.values()) runtime.transcript(event);
+      pending.clear();
+    }
+    return runtime;
+  };
   const ingress = createRecallIngress({
     // Nothing is transcribed (or judged) before the call is live: its bridge page has not joined to speak yet.
     onAudio: (callId, speaker, pcm, at) => {
-      if (core.jevCall(callId)) calls.get(callId)?.audio.audio(speaker, pcm, at);
+      if (activeCall(callId)) calls.get(callId)?.audio.audio(speaker, pcm, at);
     },
-    onEvent: (callId, event) => core.jevCall(callId)?.transcript(event),
+    onEvent: (callId, event) => activeCall(callId)?.transcript(event),
     onPresence: (callId, speaker, joined, at) => {
+      calls.get(callId)?.presence.set(speaker.id, { kind: 'presence', speaker, joined, at });
+      activeCall(callId);
       if (!joined) calls.get(callId)?.audio.left(speaker, at);
     },
     onRaw: (callId, message, seq) => {
@@ -185,7 +197,7 @@ export function createRecallTranscripts(
           debug: (msg: string, fields?: unknown) => log.debug(msg, { callId, ...(fields as object) }),
         },
       });
-      calls.set(callId, { audio, logged: 0 });
+      calls.set(callId, { audio, logged: 0, presence: new Map() });
       return url;
     },
     unregister,

@@ -163,7 +163,7 @@ export interface RecallIngressOptions {
   onAudio(callId: string, speaker: Speaker, pcm: Int16Array, at: number): void;
   /** A chat line. */
   onEvent(callId: string, event: CallEvent): void;
-  /** A participant joined or left; not a `CallEvent`, for the participant list. */
+  /** A non-bot participant joined or left. */
   onPresence?(callId: string, speaker: Speaker, joined: boolean, at: number): void;
   /** Every parsed message as Recall sent it, for the phase 2 raw log; `seq` counts the call's messages from 1. */
   onRaw?(callId: string, message: unknown, seq: number): void;

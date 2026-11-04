@@ -30,6 +30,7 @@ export interface ChatLine {
 
 export interface SpeakerState {
   name: string;
+  lastHeardAt: number | null;
   speaking: boolean;
   /** The speaker's current utterance: the newest in source order, never moved back by a late final. */
   lastUttId: string | null;
@@ -99,6 +100,7 @@ export interface CallState {
   /** Bumps whenever what Jev would see changes; a verdict for an older version is stale. */
   windowVersion: number;
   fingerprint: string;
+  roster: Record<string, string>;
   speakers: Record<string, SpeakerState>;
   utterances: Utterance[];
   chat: ChatLine[];
@@ -130,6 +132,7 @@ export function initial(policy: CallPolicy, at: number): CallState {
     seq: 0,
     windowVersion: 0,
     fingerprint: '',
+    roster: {},
     speakers: {},
     utterances: [],
     chat: [],
@@ -192,8 +195,13 @@ export function applyWindow(state: CallState, event: CallEvent): void {
   state.seq += 1;
   state.now = Math.max(state.now, event.at);
   switch (event.kind) {
+    case 'presence':
+      if (event.joined) state.roster[event.speaker.id] = event.speaker.name;
+      else delete state.roster[event.speaker.id];
+      break;
     case 'utterance': {
       const speaker = touchSpeaker(state, event.speaker.id, event.speaker.name);
+      speaker.lastHeardAt = event.at;
       const text = event.text.trim();
       const utt = state.utterances.find((u) => u.speakerId === event.speaker.id && u.uttId === event.uttId);
       if (utt) {
@@ -223,6 +231,7 @@ export function applyWindow(state: CallState, event: CallEvent): void {
     case 'speech': {
       const speaker = touchSpeaker(state, event.speaker.id, event.speaker.name);
       if (event.on && !speaker.speaking) speaker.speeches += 1;
+      speaker.lastHeardAt = event.at;
       speaker.speaking = event.on;
       break;
     }
@@ -273,6 +282,7 @@ export function refreshVersion(state: CallState): void {
 function touchSpeaker(state: CallState, id: string, name: string): SpeakerState {
   const speaker = (state.speakers[id] ??= {
     name,
+    lastHeardAt: null,
     speaking: false,
     lastUttId: null,
     handled: [],
@@ -345,16 +355,28 @@ function lines(state: CallState): Line[] {
 
 const secondsAgo = (state: CallState, at: number): number => Math.round((state.now - at) / 100) / 10;
 
+export function humansInRoom(state: CallState): number {
+  if (state.policy.kind === 'voice') return 1;
+  const heard = Object.values(state.speakers).filter(
+    (speaker) => speaker.lastHeardAt !== null && speaker.lastHeardAt >= state.now - state.policy.windowMs,
+  ).length;
+  return Math.max(Object.keys(state.roster).length, heard);
+}
+
 /** The JSON `state` of a Jev request: the window as of the newest event, the facts and the policy. */
 export function toJevState(state: CallState, latest: JevState['latest'] = null, addressedByName = false): JevState {
-  const participants = [...new Set(Object.values(state.speakers).map((s) => s.name))];
+  const participants =
+    state.policy.kind === 'meet'
+      ? Object.values(state.roster)
+      : [...new Set(Object.values(state.speakers).map((s) => s.name))];
   return {
-    policy: state.policy.paragraph,
+    policy: humansInRoom(state) <= 1 ? state.policy.oneCaller.paragraph : state.policy.paragraph,
     agent_name: state.policy.agentName,
     participants,
     latest,
     window: lines(state).map(({ at, ...line }): JevLine => ({ t: secondsAgo(state, at), ...line })),
     facts: {
+      humans_in_room: humansInRoom(state),
       agent_speaking: agentSpeaking(state),
       pending_answer: pendingAnswer(state),
       cut_off_after: state.cutOffAfter,
@@ -372,6 +394,7 @@ export function toJevState(state: CallState, latest: JevState['latest'] = null, 
 function fingerprint(state: CallState): string {
   const jev = toJevState(state);
   return JSON.stringify({
+    roster: state.roster,
     participants: jev.participants,
     window: jev.window.map(({ t: _t, partial: _p, ...line }) => ({ ...line, text: comparable(line.text) })),
     facts: { ...jev.facts, agent_last_spoke_s_ago: null },

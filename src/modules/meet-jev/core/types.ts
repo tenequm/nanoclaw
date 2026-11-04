@@ -36,6 +36,7 @@ export const RECHECK_ACTIONS: readonly RecheckAction[] = ['speak', 'show'];
 export type RecheckVerdict = Choice<RecheckAction>;
 
 export type CallEvent =
+  | { kind: 'presence'; speaker: Speaker; joined: boolean; at: number }
   /** A participant's words: partials update the utterance, the final replaces it. */
   | { kind: 'utterance'; speaker: Speaker; uttId: string; text: string; final: boolean; at: number }
   /** A participant started or stopped speaking (the worker's VAD, or a meeting participant's own). */
@@ -121,6 +122,7 @@ export interface JevState {
   latest: { speaker: string; text: string } | null;
   window: JevLine[];
   facts: {
+    humans_in_room: number;
     agent_speaking: boolean;
     pending_answer: boolean;
     /** What the agent had said when it was last cut off, while that is the latest thing it did. */
@@ -144,7 +146,6 @@ export interface RecheckState extends Omit<JevState, 'latest'> {
 /** Thresholds for acting on a verdict's chosen action. */
 export interface ActionThreshold {
   p: number;
-  confidence: number;
 }
 
 /** Everything that differs between the two kinds; the core knows nothing else about them. */
@@ -156,6 +157,7 @@ export interface CallPolicy {
   agentAliases: string[];
   /** Who the agent is and when it speaks, spliced into the Jev state. */
   paragraph: string;
+  oneCaller: { paragraph: string; answer: ActionThreshold };
   /** After a speaker's VAD end with no STT final, the partial is decided on after this long (plus the final's margin). */
   boundaryFallbackMs: number;
   /** The window keeps this much history and at most `windowBytes` of text. */

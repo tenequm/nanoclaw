@@ -2247,6 +2247,20 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
     return { worker, recall, url };
   }
 
+  it('forwards human joins and leaves to the core, excluding the bot', async () => {
+    const { recall } = await startJevMeeting();
+    for (const participant of [ALEX, BOT]) {
+      recall.send(JSON.stringify(envelope('participant_events.join', { participant, timestamp: stamp(0) })));
+      recall.send(JSON.stringify(envelope('participant_events.leave', { participant, timestamp: stamp(1) })));
+    }
+    recall.send(JSON.stringify(chatLine(ALEX, 'done')));
+    await vi.waitFor(() => expect(seen.some((event) => event.kind === 'chat')).toBe(true));
+    expect(seen.filter((event) => event.kind === 'presence')).toEqual([
+      { kind: 'presence', speaker: { id: '100', name: 'Alex' }, joined: true, at: recordingStart },
+      { kind: 'presence', speaker: { id: '100', name: 'Alex' }, joined: false, at: recordingStart + 1000 },
+    ]);
+  });
+
   /** Alex says `text`: their frames open a pipeline, and its VAD and transcription hear it. */
   async function alexSays(recall: WebSocket, text: string, interim = text) {
     recall.send(JSON.stringify(frame(ALEX, 1)));
