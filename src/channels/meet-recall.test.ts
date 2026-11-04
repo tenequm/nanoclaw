@@ -25,6 +25,7 @@ function config(fetchImpl: FetchMock, overrides: Partial<RecallMeetConfig> = {})
     region: 'eu-central-1',
     pageUrl: 'https://pages.example.com/meet-recall-bridge/index.html',
     livekitUrl: 'wss://lk.example.com',
+    transcriptOrigin: 'wss://pages.example.com',
     livekitApiKey: LK_KEY,
     livekitApiSecret: LK_SECRET,
     fetch: fetchImpl as unknown as typeof fetch,
@@ -92,7 +93,7 @@ describe('createRecallMeetBridge', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('https://us-west-2.recall.ai/api/v1/bot/');
   });
 
-  it('creates a bot without a transcription with exactly the body it always sent', async () => {
+  it('creates a bot without participant audio with exactly the body it always sent', async () => {
     const fetchMock = respond(json(201, { id: 'b' }));
     await createRecallMeetBridge(config(fetchMock)).join(join);
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
@@ -106,24 +107,21 @@ describe('createRecallMeetBridge', () => {
     });
   });
 
-  it('adds per-participant low-latency transcription and one websocket for a jev meeting', async () => {
+  it("streams each participant's audio on one websocket for a jev meeting, with no transcript and nothing kept", async () => {
     const fetchMock = respond(json(201, { id: 'b' }));
     const websocketUrl = 'wss://meet.example.com/voice/recall/call-1/?token=t0k3n';
-    await createRecallMeetBridge(config(fetchMock)).join({ ...join, transcription: { websocketUrl } });
+    await createRecallMeetBridge(config(fetchMock)).join({ ...join, participantAudio: { websocketUrl } });
     const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
     expect(body.recording_config).toEqual({
       video_mixed_mp4: null,
-      transcript: {
-        provider: { recallai_streaming: { mode: 'prioritize_low_latency', language_code: 'en' } },
-        diarization: { use_separate_streams_when_available: true },
-      },
+      audio_separate_raw: {},
+      retention: null,
       realtime_endpoints: [
         {
           type: 'websocket',
           url: websocketUrl,
           events: [
-            'transcript.partial_data',
-            'transcript.data',
+            'audio_separate_raw.data',
             'participant_events.speech_on',
             'participant_events.speech_off',
             'participant_events.join',
@@ -133,13 +131,14 @@ describe('createRecallMeetBridge', () => {
         },
       ],
     });
+    expect(body.recording_config).not.toHaveProperty('transcript');
     expect(body.automatic_leave).toEqual({ in_call_not_recording_timeout: 70 * 60 });
   });
 
-  it('refuses a transcription websocket URL Recall would not take, before any request', async () => {
+  it('refuses a participant audio websocket URL Recall would not take, before any request', async () => {
     const fetchMock = respond(json(201, { id: 'b' }));
     const bridge = createRecallMeetBridge(config(fetchMock));
-    const withUrl = (websocketUrl: string) => bridge.join({ ...join, transcription: { websocketUrl } });
+    const withUrl = (websocketUrl: string) => bridge.join({ ...join, participantAudio: { websocketUrl } });
     await expect(withUrl('ws://meet.example.com/voice/recall/c/?token=t')).rejects.toThrow(/must use wss:/);
     await expect(withUrl('wss://meet.example.com/voice/recall/c?token=t')).rejects.toThrow(/a \/ before its query/);
     await expect(withUrl('not a url')).rejects.toThrow(/is not a URL/);
@@ -343,6 +342,15 @@ describe('recallMeetConfigFromEnv', () => {
       livekitApiSecret: 's',
     });
     expect(recallMeetConfigFromEnv({ ...full, RECALL_REGION: 'us-east-1' }, livekit)?.region).toBe('us-east-1');
+  });
+
+  it("streams a jev meeting's transcript to the bridge page's host unless MEET_RECALL_TRANSCRIPT_URL says otherwise", () => {
+    expect(recallMeetConfigFromEnv(full, livekit)?.transcriptOrigin).toBe('wss://p.example');
+    const own = { ...full, MEET_RECALL_TRANSCRIPT_URL: 'wss://in.example:8443/ignored' };
+    expect(recallMeetConfigFromEnv(own, livekit)?.transcriptOrigin).toBe('wss://in.example:8443');
+    expect(() =>
+      recallMeetConfigFromEnv({ ...full, MEET_RECALL_TRANSCRIPT_URL: 'https://in.example' }, livekit),
+    ).toThrow('MEET_RECALL_TRANSCRIPT_URL must use wss:');
   });
 
   it('names every missing key', () => {

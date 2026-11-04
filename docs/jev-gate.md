@@ -71,28 +71,15 @@ thresholds can be refitted from logged decisions
 
 ## Meetings (`/meet <link> jev`)
 
-A `/meet` meeting started with `jev` reuses the same rubric and `decide()`
-math, run by the voice channel on the host instead of the router (the
-meeting call kind's candidate handler, `src/channels/voice-mode-meet.ts`):
-
-- **Candidates:** speech with no wake phrase, ended by the normal pause, is
-  POSTed by the worker as an utterance with `candidate: true`. Addressed
-  (`Hey Dan`) turns never wait on Jev; they go straight to the agent.
-- **History:** the host keeps a rolling transcript of the last 12 meeting
-  lines, speaker-agnostic (`Meeting: ...`), holding every utterance,
-  candidate or addressed, plus the agent's spoken replies (clipped).
-- **Agent name:** the name the meeting wakes on (`VOICE_MODE_WAKE_PHRASE`
-  `Hey Dan` gives `Dan`), which the worker sends with each candidate. It is
-  used in the questions and in the agent's own transcript lines; the line's
-  agent name is used only when none arrives.
-- **Thresholds:** the agent group's gate entry when it has an enabled one,
-  else the defaults. The levers (cap, cooldown, bot streak) and modes do not
-  apply here; every verdict is logged with its scores.
-- **Fail-silent:** a Jev error, timeout or throw drops the candidate, as
-  does a silent verdict. A wake is routed as a normal meeting turn.
-- **Limits:** a candidate is judged only after the call's in-flight and
-  per-minute utterance limits pass, holds a turn slot while judged, and
-  counts toward the per-minute limit whatever the verdict.
+A `/meet` meeting started with `jev` does not use this gate's rubric. It runs
+the meet-jev loop (`src/modules/meet-jev/`), the same one as `/voice jev`:
+Recall.ai streams each participant's own audio to the host over a websocket at
+`/voice/recall/<callId>/?token=...` (`ingress/recall.ts`, Zero Data Retention:
+Recall keeps nothing), the host runs a Silero VAD and a Gemini Live
+transcription per participant (`ingress/recall-audio.ts`, the call's languages
+and vocabulary, as the worker does for `/voice jev`), and one Jev Choice per
+speaker boundary decides whether the agent answers, stays silent, stops or
+continues. The gate's entries, thresholds and levers do not apply there.
 
 
 ## Kill switch

@@ -31,9 +31,10 @@
  *  - `POST agent/ended`      the worker's session is over;
  *  - `POST agent/jev`        a jev call's words, speech marks and playback reports (meet-jev).
  *
- * A jev call (`/voice jev`, the job's `jev`) takes no `agent/utterance` turns from the worker: the
- * meet-jev module decides when the agent gets a turn (submitTurn, with the same checks) and which of its
- * replies are spoken; the rest are only in the call chat.
+ * A jev call (`/voice jev` or `/meet <link> jev`, the job's `jev`) takes no `agent/utterance` turns from
+ * the worker: the meet-jev module decides when the agent gets a turn (submitTurn, with the same checks)
+ * and which of its replies are spoken; the rest are only in the call chat. A jev meeting's transcript
+ * reaches its loop from Recall (`jevCall`), not from the worker.
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
  * line: the line's `/voice` chat (its voice_mode_lines binding), while that
@@ -406,6 +407,8 @@ export interface LiveKitVoice {
   endCall(platformId: string, callId: unknown, reason: string, options?: { grace?: boolean }): Promise<void>;
   /** Whether `callId` is still the line's running call: not ended, not replaced. */
   isLive(platformId: string, callId: string): boolean;
+  /** The jev loop of the running call `callId`, for a source outside the worker (a meeting's Recall transcript). */
+  jevCall(callId: string): JevCall | undefined;
   /** An agent message reached a chat: speak it on the live call that talks there. `replyTo`: the call turn it answers. */
   chatMessage(
     chat: ChatAddress,
@@ -908,7 +911,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       chatRefreshes: 0,
       previousChat: null,
     };
-    if (job.jev) call.jev = openJev(call);
+    if (job.jev) call.jev = openJev(call, job.meeting ? 'meet' : 'voice');
     calls.set(platformId, call);
     call.joinTimer = setTimeout(() => endCall(call, 'caller never joined'), kind.joinTimeoutMs);
     call.joinTimer.unref();
@@ -1224,10 +1227,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     return outcome.id ? { ok: true, turnId: outcome.id } : { ok: false, reason: `${outcome.status}: ${outcome.body}` };
   };
 
-  const openJev = (call: LiveKitCall): JevCall =>
+  const openJev = (call: LiveKitCall, kind: 'voice' | 'meet'): JevCall =>
     createJevCall(
       {
         callId: call.callId,
+        kind,
         callerName: call.line.caller.name,
         agentName: call.line.agent.name,
         agentAliases: call.line.agent.wakeNames ?? [],
@@ -1323,6 +1327,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     isLive(platformId, callId) {
       const call = calls.get(platformId);
       return call?.callId === callId && !call.ended;
+    },
+
+    jevCall(callId) {
+      const call = findCall(callId);
+      return call && !call.ended ? call.jev : undefined;
     },
 
     chatMessage(chat, agentGroupId, text, replyTo) {

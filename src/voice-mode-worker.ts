@@ -122,9 +122,12 @@ import { readEnvFile } from './env.js';
 import {
   FINAL_GRACE_MS,
   GeminiLiveTranscriber,
+  turnText,
   type Heard,
+  type TextSource,
   type TranscriberOptions,
 } from './voice-mode-gemini-live.js';
+export { turnText, type TextSource };
 import {
   providerKeysFrom,
   readTtsChoice,
@@ -2198,27 +2201,6 @@ export function awakeLimits(env: Record<string, string | undefined>): AwakeLimit
 export type Transcription = Pick<GeminiLiveTranscriber, 'prepare' | 'begin' | 'push' | 'end' | 'close'>;
 
 const wordCount = (text: string): number => (text.match(/[\p{L}\p{N}]+/gu) ?? []).length;
-/** A final this short may be only the turn's last phrase: a manual activity's final can collapse to it after a pause. */
-const COLLAPSED_FINAL_WORDS = 3;
-
-/** Where a turn's text came from, logged with every turn. */
-export type TextSource = 'final' | 'collapse_interim' | 'no_final_interim' | 'none';
-
-/**
- * A turn's text: the final transcript, unless it collapsed (COLLAPSED_FINAL_WORDS or fewer while
- * the last interim text of the activity had more) or never came, then the last interim text.
- */
-export function turnText(heard: Pick<Heard, 'final' | 'interim'>): { text: string; source: TextSource } {
-  const final = heard.final?.trim() ?? '';
-  const interim = heard.interim.trim();
-  if (!final) return interim ? { text: interim, source: 'no_final_interim' } : { text: '', source: 'none' };
-  const finalWords = wordCount(final);
-  if (finalWords <= COLLAPSED_FINAL_WORDS && wordCount(interim) > finalWords) {
-    return { text: interim, source: 'collapse_interim' };
-  }
-  return { text: final, source: 'final' };
-}
-
 /** A word's sound, roughly: Latin letters, vowel runs as one mark, doubled letters as one (`проєктом` = `proektom`). */
 const wordSound = (word: string): string =>
   spokenWord(word)
@@ -4687,7 +4669,9 @@ export class CallTelemetry {
 // no wake word, no cues: the VAD opens a transcription activity at the caller's speech and closes it
 // at its end, every partial and final goes to the host as an utterance with the speech marks, and the
 // worker speaks only what the host sends, reporting what became of each line. The host decides the
-// rest (`src/modules/meet-jev/`).
+// rest (`src/modules/meet-jev/`). On a meeting (`meta.meeting`) Recall transcribes each participant for
+// the host, so the worker transcribes nothing: it reports its VAD marks and playback, and the reflex's
+// words come from the host's `words`.
 // ---------------------------------------------------------------------------------------------
 
 /**
@@ -4809,7 +4793,8 @@ export class JevReporter {
 }
 
 export interface JevLoopDeps {
-  transcriber: Transcription;
+  /** None on a meeting: the host has Recall's transcript, and the reflex its `words`. */
+  transcriber?: Transcription;
   /** One line into the room; `ready` is awaited before its first audio, `signal` aborts its playout. */
   speak(text: string, ready: () => Promise<void>, signal: AbortSignal): Promise<LineOutcome>;
   /** One event for the host, in order. */
@@ -4867,6 +4852,7 @@ export class JevLoop {
 
   /** The caller's audio, every frame: kept for the pre-roll, and the open activity's. */
   audio(pcm: Int16Array): void {
+    if (!this.deps.transcriber) return;
     this.ring.push(pcm);
     if (this.utterance) this.deps.transcriber.push(pcm);
   }
@@ -4876,13 +4862,16 @@ export class JevLoop {
     if (this.closed || speaking === this.speaking) return;
     this.speaking = speaking;
     this.deps.report({ type: 'speech', on: speaking, at: this.now() });
+    const transcriber = this.deps.transcriber;
     if (speaking) {
       this.speechSince = this.now();
       this.wordsHeard = false;
-      this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
-      this.deps.transcriber.begin(this.ring.since(Math.max(0, at - samplesOf(PRE_ROLL_MS))));
-      // The next activity's socket, set up while this one runs: no connect latency at the next speech.
-      void this.deps.transcriber.prepare();
+      if (transcriber) {
+        this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
+        transcriber.begin(this.ring.since(Math.max(0, at - samplesOf(PRE_ROLL_MS))));
+        // The next activity's socket, set up while this one runs: no connect latency at the next speech.
+        void transcriber.prepare();
+      }
       clearTimeout(this.bargeTimer);
       this.bargeTimer = setTimeout(() => this.reflex(), JEV_BARGE_MS);
       this.bargeTimer.unref?.();
@@ -4892,8 +4881,8 @@ export class JevLoop {
     const utterance = this.utterance;
     this.utterance = undefined;
     this.wake();
-    if (!utterance) return;
-    this.deps.transcriber.end().then(
+    if (!utterance || !transcriber) return;
+    transcriber.end().then(
       (heard) => {
         if (this.closed) return;
         const { text } = turnText(heard);
@@ -5086,18 +5075,20 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   let replies = 0;
   const reporter = new JevReporter((events) => host.post('jev', { events }), callLog);
   const languages = callLanguages(meta.languages);
-  const transcriber = deps.transcriber({
-    apiKey: s.geminiKey,
-    model: meta.sttModel,
-    vocabulary: [...new Set(meta.vocabulary ?? [])],
-    languageCodes: languages.codes,
-    sampleRate: INPUT_SAMPLE_RATE,
-    onInterim: (text) => loop.onInterim(text),
-    log: callLog,
-    ...(s.transcriptDebug ? { debug: true } : {}),
-  });
+  const transcriber = meta.meeting
+    ? undefined
+    : deps.transcriber({
+        apiKey: s.geminiKey,
+        model: meta.sttModel,
+        vocabulary: [...new Set(meta.vocabulary ?? [])],
+        languageCodes: languages.codes,
+        sampleRate: INPUT_SAMPLE_RATE,
+        onInterim: (text) => loop.onInterim(text),
+        log: callLog,
+        ...(s.transcriptDebug ? { debug: true } : {}),
+      });
   const loop: JevLoop = new JevLoop({
-    transcriber,
+    ...(transcriber ? { transcriber } : {}),
     speak: async (text, ready, signal) => {
       if (!callVoice) return { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
       return callVoice.speak(text, ready, signal);
@@ -5119,7 +5110,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   const endCall = async (reason: string, tellHost: boolean, restart: boolean) => {
     ending = true;
     loop.close();
-    transcriber.close();
+    transcriber?.close();
     // What was reported goes out before the host hears the call ended; bounded, like every wait here.
     await atMost(reporter.drain(), WORKER_REQUEST_TIMEOUT_MS);
     const mem = process.memoryUsage();
@@ -5154,10 +5145,12 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     );
   } catch (err) {
     loop.close();
-    transcriber.close();
+    transcriber?.close();
     return s.abandon('could not set up the call audio', { err });
   }
-  callLog.info('voice-mode worker: a jev call', { languages: languages.codes });
+  callLog.info('voice-mode worker: a jev call', {
+    ...(meta.meeting ? { meeting: true, transcription: 'recall' } : { languages: languages.codes }),
+  });
   // The page's RPCs: only its settings do anything here (the speech choice); review mode is not offered.
   if (!ending) {
     const voice = callVoice;

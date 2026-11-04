@@ -231,7 +231,16 @@ describe('runMeetCommand', () => {
     );
     expect(withJev).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, jev: true });
     expect(m.started.at(-1)).toMatchObject({ pauseSends: false, jev: true });
-    expect(meetCommandReply(withJev)).toContain('It may also join in unaddressed when the conversation invites it.');
+    const jevReply = meetCommandReply(withJev)!;
+    expect(jevReply).toContain(
+      'it answers when someone addresses it by name or invites it and nobody else takes it up.',
+    );
+    expect(jevReply).toContain(
+      "Each participant's speech is transcribed on this host, and Recall keeps nothing of the meeting.",
+    );
+    expect(jevReply).not.toContain('wake phrase');
+    expect(jevReply).not.toContain('send word');
+    expect(meetCommandReply(paused)).not.toContain('transcript');
     expect(meetCommandReply({ kind: 'usage' })).toContain('/meet <link> jev');
   });
 

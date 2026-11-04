@@ -39,6 +39,11 @@ export interface RecallMeetConfig {
   pageUrl: string;
   /** Public wss URL of LiveKit, reachable from Recall's cloud (not nanoclaw's internal one). */
   livekitUrl: string;
+  /**
+   * Public `wss://` origin a jev meeting's bot streams each participant's audio to (`/voice/recall/...`
+   * on the host's webhook server behind it). MEET_RECALL_TRANSCRIPT_URL, by default the bridge page's host.
+   */
+  transcriptOrigin: string;
   livekitApiKey: string;
   livekitApiSecret: string;
   /** Test seams. */
@@ -48,12 +53,11 @@ export interface RecallMeetConfig {
 }
 
 /**
- * The real-time events a jev meeting's websocket takes: words, speaker turns, presence, chat
- * (names per https://docs.recall.ai/docs/real-time-websocket-endpoints#event-types).
+ * The real-time events a jev meeting's websocket takes: each participant's audio, speaker turns,
+ * presence, chat (names per https://docs.recall.ai/docs/real-time-websocket-endpoints#event-types).
  */
 export const RECALL_JEV_EVENTS = [
-  'transcript.partial_data',
-  'transcript.data',
+  'audio_separate_raw.data',
   'participant_events.speech_on',
   'participant_events.speech_off',
   'participant_events.join',
@@ -61,8 +65,8 @@ export const RECALL_JEV_EVENTS = [
   'participant_events.chat_message',
 ] as const;
 
-/** A jev meeting's transcription: Recall transcribes each participant and streams to `websocketUrl`. */
-export interface RecallTranscription {
+/** A jev meeting's audio: Recall streams each participant's own audio to `websocketUrl`; the host transcribes it. */
+export interface RecallParticipantAudio {
   /** `wss://` with a `/` before the query, as Recall requires (`.../<callId>/?token=...`). */
   websocketUrl: string;
 }
@@ -71,13 +75,13 @@ export interface RecallTranscription {
 export interface RecallMeetBridge {
   /**
    * Sends a bot named `botName` to `meetingUrl`, its bridge page joining `roomName`; with
-   * `transcription` (jev meetings only) the bot also transcribes the meeting in real time.
+   * `participantAudio` (jev meetings only) the bot also streams each participant's audio in real time.
    */
   join(options: {
     meetingUrl: string;
     botName: string;
     roomName: string;
-    transcription?: RecallTranscription;
+    participantAudio?: RecallParticipantAudio;
   }): Promise<{ botId: string }>;
   /** Makes the bot leave its meeting, retried; never rejects (a final failure is logged). */
   leave(botId: string): Promise<void>;
@@ -140,28 +144,25 @@ function retryAfterMs(header: string | null): number | null {
 }
 
 /**
- * The bot's recording config. Without transcription: no artifact at all (the mixed mp4 is on by
- * default). With it: Recall's low-latency streaming model per participant stream, and one websocket.
- * Fields per https://docs.recall.ai/docs/bot-real-time-transcription and
- * https://docs.recall.ai/docs/recallai-transcription (`prioritize_low_latency` takes only
- * `language_code: "en"`; its default `auto` fails) and the Create Bot schema
- * (https://docs.recall.ai/reference/bot_create).
+ * The bot's recording config. Without participant audio: no artifact at all (the mixed mp4 is on by
+ * default). With it: each participant's raw audio on one websocket
+ * (https://docs.recall.ai/docs/how-to-get-separate-audio-per-participant-realtime), no Recall
+ * transcript, and Zero Data Retention (`retention: null`,
+ * https://docs.recall.ai/docs/zero-data-retention): left out, Recall keeps the media indefinitely.
  */
-function botRecordingConfig(transcription?: RecallTranscription): Record<string, unknown> {
-  if (!transcription) return { video_mixed_mp4: null };
-  assertUrl('the transcription websocket URL', transcription.websocketUrl, 'wss:');
-  const url = new URL(transcription.websocketUrl);
+function botRecordingConfig(participantAudio?: RecallParticipantAudio): Record<string, unknown> {
+  if (!participantAudio) return { video_mixed_mp4: null };
+  assertUrl('the participant audio websocket URL', participantAudio.websocketUrl, 'wss:');
+  const url = new URL(participantAudio.websocketUrl);
   // https://docs.recall.ai/docs/real-time-websocket-endpoints#verification: Recall answers 400 otherwise.
   if (url.search && !url.pathname.endsWith('/')) {
-    throw new Error('meet-recall: the transcription websocket URL needs a / before its query');
+    throw new Error('meet-recall: the participant audio websocket URL needs a / before its query');
   }
   return {
     video_mixed_mp4: null,
-    transcript: {
-      provider: { recallai_streaming: { mode: 'prioritize_low_latency', language_code: 'en' } },
-      diarization: { use_separate_streams_when_available: true },
-    },
-    realtime_endpoints: [{ type: 'websocket', url: transcription.websocketUrl, events: [...RECALL_JEV_EVENTS] }],
+    audio_separate_raw: {},
+    retention: null,
+    realtime_endpoints: [{ type: 'websocket', url: participantAudio.websocketUrl, events: [...RECALL_JEV_EVENTS] }],
   };
 }
 
@@ -256,8 +257,8 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
   }
 
   return {
-    async join({ meetingUrl, botName, roomName, transcription }) {
-      const recordingConfig = botRecordingConfig(transcription);
+    async join({ meetingUrl, botName, roomName, participantAudio }) {
+      const recordingConfig = botRecordingConfig(participantAudio);
       const token = await mintBridgeToken(config, roomName);
       const pageUrl = buildBridgePageUrl(config.pageUrl, { livekitUrl: config.livekitUrl, token, name: botName });
       let bot: unknown;
@@ -294,6 +295,7 @@ export const RECALL_MEET_ENV_KEYS = [
   'RECALL_REGION',
   'MEET_RECALL_PAGE_URL',
   'MEET_RECALL_LIVEKIT_URL',
+  'MEET_RECALL_TRANSCRIPT_URL',
 ] as const;
 
 /** The client's settings, or null when RECALL_API_KEY is unset (`/meet` is off); throws naming what else is missing. */
@@ -307,11 +309,14 @@ export function recallMeetConfigFromEnv(
     const missing = [!pageUrl && 'MEET_RECALL_PAGE_URL', !livekitUrl && 'MEET_RECALL_LIVEKIT_URL'].filter(Boolean);
     throw new Error(`meet-recall: missing ${missing.join(', ')}`);
   }
+  const transcriptUrl = env.MEET_RECALL_TRANSCRIPT_URL || pageUrl.replace(/^https:/, 'wss:');
+  assertUrl('MEET_RECALL_TRANSCRIPT_URL', transcriptUrl, 'wss:');
   return {
     recallApiKey,
     region: (env.RECALL_REGION || DEFAULT_REGION) as RecallRegion,
     pageUrl,
     livekitUrl,
+    transcriptOrigin: new URL(transcriptUrl).origin,
     livekitApiKey: livekit.apiKey,
     livekitApiSecret: livekit.apiSecret,
   };

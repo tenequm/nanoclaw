@@ -322,13 +322,17 @@ the lobby (10 minutes). The page joins the call's room as the call's caller:
 it publishes the meeting's audio and plays the agent's speech and cues into
 the meeting. The meeting wakes on `VOICE_MODE_WAKE_PHRASE`'s name (`Hey Dan`
 without one) and a turn ends on the send word; `/meet <link> pause` makes a
-pause send it too, and `/meet <link> jev` lets the Jev gate let the agent join
-in unaddressed. Meeting turns come from "Meeting", never from the line's
+pause send it too. `/meet <link> jev` runs the meet-jev loop instead
+(`src/modules/meet-jev/`): Recall streams each participant's own audio to
+`/voice/recall/<callId>/` on the webhook port, the host transcribes each one
+with its own Silero VAD and Gemini Live session (the call's languages), and Jev
+decides when the agent answers, addressed or invited. Meeting turns come from "Meeting", never from the line's
 caller, so they carry no role. The meeting runs up to 60 minutes under the
 line's daily minutes and ends when everyone left the meeting (Recall's bot
 leaves, the page with it), on `/meet leave`, or when a call on the line's link
-replaces it. A meeting records nothing, whatever the recording settings say,
-and the bot keeps no recording (`video_mixed_mp4: null`).
+replaces it. A meeting records nothing here, whatever the recording settings
+say, and the bot keeps no recording (`video_mixed_mp4: null`); a `jev` meeting's
+bot runs with Zero Data Retention (`retention: null`).
 
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use
@@ -361,6 +365,7 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `RECALL_REGION` | `eu-central-1` | Recall.ai region: `us-east-1`, `us-west-2`, `eu-central-1` or `ap-northeast-1`. |
 | `MEET_RECALL_PAGE_URL` | none | Public `https` URL where `assets/meet-recall-bridge/index.html` is served; the Recall bot runs it as its camera, its settings in the URL hash. |
 | `MEET_RECALL_LIVEKIT_URL` | none | Public `wss` URL of this LiveKit, reachable from Recall's cloud; the bridge page joins the room with it. The LiveKit key pair is `LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET`. |
+| `MEET_RECALL_TRANSCRIPT_URL` | `MEET_RECALL_PAGE_URL`'s host as `wss` | Public `wss` origin a `jev` meeting's bot streams its participants' audio to; the front must forward `/voice/recall/*` (websocket upgrades) to the webhook port. |
 | `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | Worker health on loopback. |
 | `VOICE_MODE_UI` | empty | Page options: skin, colorway, layout, presence, brand, footer, shortcuts, timestamps, colorwayPicker. |
 

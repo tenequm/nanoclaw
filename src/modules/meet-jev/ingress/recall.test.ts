@@ -1,8 +1,9 @@
 /**
  * The Recall ingress against Recall's documented payloads
- * (https://docs.recall.ai/docs/real-time-event-payloads): the fixtures below are those schemas
- * with concrete values. The translator is pure; the websocket half runs on a real HTTP server
- * with a real `ws` client.
+ * (https://docs.recall.ai/docs/real-time-event-payloads,
+ * https://docs.recall.ai/docs/how-to-get-separate-audio-per-participant-realtime): the fixtures below
+ * are those schemas with concrete values. The translator is pure; the websocket half runs on a real
+ * HTTP server with a real `ws` client.
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -17,7 +18,9 @@ vi.mock('../../../log.js', () => ({
 import type { CallEvent, Speaker } from '../core/types.js';
 import {
   createRecallIngress,
+  decodePcm,
   recallEndpointUrl,
+  recallRawSummary,
   RecallTranslator,
   type RecallIngress,
   type RecallIngressOptions,
@@ -42,36 +45,25 @@ const participant = (p: P) => ({
 const ALEX: P = { id: 100, name: 'Alex', is_host: true };
 const BO: P = { id: 200, name: 'Bo' };
 
-/** `[text, start, end]` per word, relative seconds. */
-type W = [string, number, number | null];
-const words = (ws: W[]) =>
-  ws.map(([text, start, end]) => ({
-    text,
-    start_timestamp: { relative: start },
-    end_timestamp: end === null ? null : { relative: end },
-  }));
-
-const partial = (p: P, ws: W[]) => ({
-  event: 'transcript.partial_data',
-  data: {
-    data: { words: words(ws), participant: participant(p) },
-    transcript: { id: 'tr-1', metadata: {} },
-    ...artifacts,
-  },
-});
-
-const final = (p: P, ws: W[]) => ({
-  event: 'transcript.data',
-  data: {
-    data: { words: words(ws), language_code: 'en', participant: participant(p) },
-    transcript: { id: 'tr-1', metadata: {} },
-    ...artifacts,
-  },
-});
-
 /** Recording began at this absolute time; `relative` counts from it. */
 const START_MS = Date.parse('2026-11-04T12:00:00.000Z');
 const stamp = (relative: number) => ({ absolute: new Date(START_MS + relative * 1000).toISOString(), relative });
+
+/** Samples as Recall's base64 S16LE. */
+const b64 = (samples: number[]) => {
+  const buf = Buffer.alloc(samples.length * 2);
+  samples.forEach((v, i) => buf.writeInt16LE(v, i * 2));
+  return buf.toString('base64');
+};
+
+const frame = (p: P, relative: number, samples: number[]) => ({
+  event: 'audio_separate_raw.data',
+  data: {
+    data: { buffer: b64(samples), timestamp: stamp(relative), participant: participant(p) },
+    audio_separate: { id: 'as-1', metadata: {} },
+    ...artifacts,
+  },
+});
 
 const participantEvent = (event: string, p: P, relative: number) => ({
   event,
@@ -94,151 +86,97 @@ const chat = (p: P, relative: number, text: string) => ({
 const alex: Speaker = { id: '100', name: 'Alex' };
 const bo: Speaker = { id: '200', name: 'Bo' };
 
-/** Feeds messages in order; arrival is a fixed late host time so anchoring is visible. */
-function run(messages: unknown[], arrivalMs = START_MS + 60_000) {
-  const t = new RecallTranslator();
+function run(messages: unknown[], botName?: string, arrivalMs = START_MS + 60_000) {
+  const t = new RecallTranslator(botName);
   return messages.flatMap((m) => t.translate(m, arrivalMs));
 }
-const eventsOf = (out: ReturnType<typeof run>): CallEvent[] =>
-  out.flatMap((o) => (o.type === 'event' ? [o.event] : []));
+
+describe('decodePcm', () => {
+  it('reads base64 16-bit little-endian samples, dropping an odd trailing byte', () => {
+    expect([...decodePcm(b64([0, 1, -1, 32767, -32768]))]).toEqual([0, 1, -1, 32767, -32768]);
+    expect([...decodePcm(Buffer.from([1, 0, 7]).toString('base64'))]).toEqual([1]);
+    expect(decodePcm('')).toHaveLength(0);
+  });
+});
 
 describe('RecallTranslator', () => {
-  it('correlates a participant’s partials and the final that replaces them, then opens a new utterance', () => {
-    const out = run([
-      participantEvent('participant_events.speech_on', ALEX, 1.0),
-      partial(ALEX, [['hel', 1.1, 1.3]]),
-      partial(ALEX, [
-        ['hello', 1.1, 1.4],
-        ['how', 1.5, 1.6],
-      ]),
-      final(ALEX, [
-        ['Hello,', 1.1, 1.4],
-        ['how', 1.5, 1.6],
-        ['are', 1.7, 1.8],
-        ['you?', 1.9, 2.1],
-      ]),
-      partial(ALEX, [['Dan', 3.0, 3.2]]),
-    ]);
-    expect(eventsOf(out)).toEqual([
-      { kind: 'speech', speaker: alex, on: true, at: START_MS + 1000 },
-      { kind: 'utterance', speaker: alex, uttId: '100-0', text: 'hel', final: false, at: START_MS + 1300 },
-      { kind: 'utterance', speaker: alex, uttId: '100-0', text: 'hello how', final: false, at: START_MS + 1600 },
-      {
-        kind: 'utterance',
-        speaker: alex,
-        uttId: '100-0',
-        text: 'Hello, how are you?',
-        final: true,
-        at: START_MS + 2100,
-      },
-      { kind: 'utterance', speaker: alex, uttId: '100-1', text: 'Dan', final: false, at: START_MS + 3200 },
-    ]);
-    expect(out.filter((o) => o.type === 'words')).toEqual([
-      { type: 'words', speaker: alex },
-      { type: 'words', speaker: alex },
-      { type: 'words', speaker: alex },
+  it("routes each participant's frames apart, as samples at Recall's time on the host clock", () => {
+    const out = run([frame(ALEX, 1.0, [1, 2, 3]), frame(BO, 1.02, [4]), frame(ALEX, 1.04, [5])]);
+    expect(out.map((o) => o.type === 'audio' && [o.speaker.id, [...o.pcm], o.at])).toEqual([
+      ['100', [1, 2, 3], START_MS + 1000],
+      ['200', [4], START_MS + 1020],
+      ['100', [5], START_MS + 1040],
     ]);
   });
 
-  it('keeps each participant’s utterance in flight apart', () => {
-    const out = eventsOf(
-      run([
-        partial(ALEX, [['one', 1, 1.2]]),
-        partial(BO, [['two', 1.1, 1.3]]),
-        final(BO, [['two.', 1.1, 1.3]]),
-        final(ALEX, [['one.', 1, 1.2]]),
-      ]),
+  it('takes a participant beside the inner data too, and skips empty or missing buffers', () => {
+    const beside = {
+      event: 'audio_separate_raw.data',
+      data: { data: { buffer: b64([9]), timestamp: stamp(2) }, participant: participant(BO), ...artifacts },
+    };
+    const empty = frame(ALEX, 1, []);
+    const missing = { ...frame(ALEX, 1, [1]), data: { data: { timestamp: stamp(1), participant: participant(ALEX) } } };
+    expect(run([beside, empty, missing])).toEqual([
+      { type: 'audio', speaker: bo, pcm: Int16Array.from([9]), at: START_MS + 2000 },
+    ]);
+  });
+
+  it("leaves out the bot's own participant, by its name in any case, and says so once", () => {
+    const BOT: P = { id: 300, name: 'andy' };
+    const out = run(
+      [
+        participantEvent('participant_events.join', BOT, 0.1),
+        frame(BOT, 1, [1, 2]),
+        frame(ALEX, 1.5, [3]),
+        frame(BOT, 2, [4]),
+        chat(BOT, 2.5, 'hello'),
+      ],
+      ' Andy ',
     );
-    expect(out.map((e) => e.kind === 'utterance' && [e.speaker.id, e.uttId, e.final])).toEqual([
-      ['100', '100-0', false],
-      ['200', '200-0', false],
-      ['200', '200-0', true],
-      ['100', '100-0', true],
-    ]);
+    expect(out.map((o) => o.type)).toEqual(['self', 'audio']);
+    expect(out[0]).toEqual({ type: 'self', speaker: { id: '300', name: 'andy' } });
+    // Without a bot name nobody is left out.
+    expect(run([frame(BOT, 1, [1])])).toHaveLength(1);
   });
 
-  it('drops a late partial of an utterance that is already final', () => {
-    const out = eventsOf(
-      run([
-        partial(ALEX, [['hello', 1.0, 1.2]]),
-        final(ALEX, [['hello', 1.0, 1.2]]),
-        partial(ALEX, [['hello', 1.0, 1.2]]),
-        partial(ALEX, [['next', 2.0, 2.2]]),
-      ]),
-    );
-    expect(out.map((e) => e.kind === 'utterance' && `${e.uttId}:${e.text}:${e.final}`)).toEqual([
-      '100-0:hello:false',
-      '100-0:hello:true',
-      '100-1:next:false',
-    ]);
-  });
-
-  it('gives a final with no partials its own utterance, and lets an empty final close partials', () => {
-    const out = eventsOf(
-      run([
-        final(ALEX, [['Yes.', 1, 1.2]]),
-        partial(ALEX, [['um', 2, 2.1]]),
-        final(ALEX, []),
-        final(ALEX, []),
-        partial(ALEX, []),
-      ]),
-    );
-    expect(out.map((e) => e.kind === 'utterance' && `${e.uttId}:${e.text}:${e.final}`)).toEqual([
-      '100-0:Yes.:true',
-      '100-1:um:false',
-      '100-1::true',
-    ]);
-  });
-
-  it('estimates the recording start from arrival until a participant event pins it', () => {
-    const t = new RecallTranslator();
-    const arrival = START_MS + 5_400; // 400 ms of delivery latency the estimate cannot see
-    const [first] = t.translate(partial(ALEX, [['hi', 4.8, 5.0]]), arrival);
-    expect(first).toMatchObject({ type: 'event', event: { at: arrival } });
-    t.translate(participantEvent('participant_events.speech_off', ALEX, 5.2), START_MS + 5_600);
-    const [next] = t.translate(final(ALEX, [['hi', 4.8, 5.0]]), START_MS + 7_000);
-    expect(next).toMatchObject({ type: 'event', event: { at: START_MS + 5_000 } });
-  });
-
-  it('maps speech, presence and chat; a leave mid-speech ends the speech', () => {
+  it("maps presence and chat; Recall's speech_on/off are not events: the host's VAD decides", () => {
     const out = run([
       participantEvent('participant_events.join', BO, 0.5),
       participantEvent('participant_events.speech_on', BO, 2),
       chat(BO, 3, '  link: https://example.com  '),
       chat(BO, 3.5, '   '),
+      participantEvent('participant_events.speech_off', BO, 3.8),
       participantEvent('participant_events.leave', BO, 4),
-      participantEvent('participant_events.speech_off', ALEX, 4.5),
-      participantEvent('participant_events.leave', ALEX, 5),
     ]);
     expect(out).toEqual([
       { type: 'presence', speaker: bo, joined: true, at: START_MS + 500 },
-      { type: 'event', event: { kind: 'speech', speaker: bo, on: true, at: START_MS + 2000 } },
       { type: 'event', event: { kind: 'chat', speaker: bo, text: 'link: https://example.com', at: START_MS + 3000 } },
-      { type: 'event', event: { kind: 'speech', speaker: bo, on: false, at: START_MS + 4000 } },
       { type: 'presence', speaker: bo, joined: false, at: START_MS + 4000 },
-      { type: 'event', event: { kind: 'speech', speaker: alex, on: false, at: START_MS + 4500 } },
-      { type: 'presence', speaker: alex, joined: false, at: START_MS + 5000 },
     ]);
   });
 
   it('names a nameless participant by id, follows a rename, and ignores what it does not know', () => {
     const out = run([
-      partial({ id: 7, name: null }, [['hey', 1, 1.1]]),
-      partial({ id: 7, name: 'Kim' }, [
-        ['hey', 1, 1.1],
-        ['there', 1.2, 1.3],
-      ]),
+      frame({ id: 7, name: null }, 1, [1]),
+      frame({ id: 7, name: 'Kim' }, 1.1, [1]),
       participantEvent('participant_events.webcam_on', ALEX, 1),
-      { event: 'transcript.data' },
-      { event: 'transcript.data', data: { data: { words: 'nope', participant: participant(ALEX) } } },
-      { event: 'transcript.data', data: { data: { words: [], participant: { id: null } } } },
+      { event: 'audio_separate_raw.data' },
+      { event: 'audio_separate_raw.data', data: { data: { buffer: b64([1]), participant: { id: null } } } },
       'not an object',
       null,
     ]);
-    expect(eventsOf(out).map((e) => e.kind === 'utterance' && e.speaker)).toEqual([
+    expect(out.map((o) => o.type === 'audio' && o.speaker)).toEqual([
       { id: '7', name: 'Participant 7' },
       { id: '7', name: 'Kim' },
     ]);
+  });
+
+  it('places a message without a timestamp on its arrival', () => {
+    const noStamp = {
+      event: 'audio_separate_raw.data',
+      data: { data: { buffer: b64([1]), participant: participant(ALEX) } },
+    };
+    expect(run([noStamp], undefined, 12_345)).toMatchObject([{ type: 'audio', at: 12_345 }]);
   });
 });
 
@@ -257,21 +195,21 @@ describe('createRecallIngress', () => {
 
   async function start(overrides: Partial<RecallIngressOptions> = {}) {
     const events: Array<[string, CallEvent]> = [];
-    const words: Array<[string, Speaker]> = [];
+    const audio: Array<[string, string, number[]]> = [];
     const presence: Array<[string, string, boolean]> = [];
     const raw: unknown[] = [];
     ingress = createRecallIngress({
+      onAudio: (callId, s, pcm) => audio.push([callId, s.id, [...pcm]]),
       onEvent: (callId, e) => events.push([callId, e]),
-      onWords: (callId, s) => words.push([callId, s]),
       onPresence: (callId, s, joined) => presence.push([callId, s.id, joined]),
-      onRaw: (_callId, m) => raw.push(m),
+      onRaw: (_callId, m, seq) => raw.push([seq, m]),
       ...overrides,
     });
     server = http.createServer((_req, res) => res.writeHead(500).end());
     server.on('upgrade', ingress.handleUpgrade);
     await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
     const origin = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
-    return { ingress, origin, events, words, presence, raw };
+    return { ingress, origin, events, audio, presence, raw };
   }
 
   type Outcome = { open: WebSocket } | { status: number };
@@ -309,21 +247,19 @@ describe('createRecallIngress', () => {
     expect(() => ingress.register('../x')).toThrow(/unusable call id/);
   });
 
-  it('delivers a connected call’s events, words, presence and raw messages', async () => {
-    const { ingress, origin, events, words, presence, raw } = await start();
-    const ws = await open(recallEndpointUrl(origin, ingress.register('call-1')));
+  it('delivers a connected call’s audio, chat, presence and raw messages; never the bot’s', async () => {
+    const { ingress, origin, events, audio, presence, raw } = await start();
+    const ws = await open(recallEndpointUrl(origin, ingress.register('call-1', { botName: 'Andy' })));
     ws.send(JSON.stringify(participantEvent('participant_events.join', ALEX, 0.2)));
     ws.send('not json');
-    ws.send(JSON.stringify(partial(ALEX, [['Dan', 1, 1.2]])));
-    ws.send(JSON.stringify(final(ALEX, [['Dan,', 1, 1.2]])));
-    await until(() => events.length === 2);
-    expect(events).toEqual([
-      ['call-1', { kind: 'utterance', speaker: alex, uttId: '100-0', text: 'Dan', final: false, at: START_MS + 1200 }],
-      ['call-1', { kind: 'utterance', speaker: alex, uttId: '100-0', text: 'Dan,', final: true, at: START_MS + 1200 }],
-    ]);
-    expect(words).toEqual([['call-1', alex]]);
+    ws.send(JSON.stringify(frame({ id: 300, name: 'Andy' }, 0.9, [7, 7])));
+    ws.send(JSON.stringify(frame(ALEX, 1, [1, -1])));
+    ws.send(JSON.stringify(chat(ALEX, 1.2, 'hi')));
+    await until(() => events.length === 1);
+    expect(audio).toEqual([['call-1', '100', [1, -1]]]);
+    expect(events).toEqual([['call-1', { kind: 'chat', speaker: alex, text: 'hi', at: START_MS + 1200 }]]);
     expect(presence).toEqual([['call-1', '100', true]]);
-    expect(raw).toHaveLength(3);
+    expect(raw.map((r) => (r as [number, unknown])[0])).toEqual([1, 2, 3, 4]);
   });
 
   it('accepts the path without the trailing slash too', async () => {
@@ -383,17 +319,17 @@ describe('createRecallIngress', () => {
     const firstClosed = closeOf(first);
     const second = await open(url);
     expect(await firstClosed).toBe(1000);
-    second.send(JSON.stringify(final(BO, [['hi', 1, 1.1]])));
+    second.send(JSON.stringify(chat(BO, 1, 'hi')));
     await until(() => events.length === 1);
   });
 
   it('closes a connection that sends a frame over the bound', async () => {
-    const { ingress, origin, events } = await start({ maxFrameBytes: 1024 });
+    const { ingress, origin, audio } = await start({ maxFrameBytes: 1024 });
     const ws = await open(recallEndpointUrl(origin, ingress.register('call-1')));
     const closed = closeOf(ws);
-    ws.send(JSON.stringify(final(ALEX, [['x'.repeat(2048), 1, 1.1]])));
+    ws.send(JSON.stringify(frame(ALEX, 1, new Array(2048).fill(1))));
     expect(await closed).toBe(1009);
-    expect(events).toEqual([]);
+    expect(audio).toEqual([]);
   });
 
   it('keeps the connection when a consumer throws', async () => {
@@ -405,9 +341,30 @@ describe('createRecallIngress', () => {
       },
     });
     const ws = await open(recallEndpointUrl(origin, ingress.register('call-1')));
-    ws.send(JSON.stringify(final(ALEX, [['one', 1, 1.1]])));
-    ws.send(JSON.stringify(final(ALEX, [['two', 2, 2.1]])));
+    ws.send(JSON.stringify(chat(ALEX, 1, 'one')));
+    ws.send(JSON.stringify(chat(ALEX, 2, 'two')));
     await until(() => calls === 2);
     expect(ws.readyState).toBe(WebSocket.OPEN);
+  });
+});
+
+describe('recallRawSummary', () => {
+  it('keeps the event, participant, times and a frame size, never the audio or the words', () => {
+    expect(recallRawSummary(frame(ALEX, 1.5, [1, 2, 3, 4]))).toEqual({
+      event: 'audio_separate_raw.data',
+      participant: { id: 100, name: 'Alex', is_host: true },
+      relative: 1.5,
+      absolute: new Date(START_MS + 1500).toISOString(),
+      bytes: 8,
+    });
+    expect(recallRawSummary(participantEvent('participant_events.speech_off', BO, 2.5))).toEqual({
+      event: 'participant_events.speech_off',
+      participant: { id: 200, name: 'Bo', is_host: false },
+      relative: 2.5,
+      absolute: new Date(START_MS + 2500).toISOString(),
+    });
+    expect(recallRawSummary(chat(BO, 3, 'my secret'))).toMatchObject({ chars: 9 });
+    expect(JSON.stringify(recallRawSummary(chat(BO, 3, 'my secret')))).not.toContain('secret');
+    expect(recallRawSummary('nope')).toEqual({ event: null });
   });
 });

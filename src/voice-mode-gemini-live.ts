@@ -155,6 +155,27 @@ interface Activity {
 const words = (s: string): string => s.replace(/\s+/g, ' ').trim();
 const wordCount = (s: string): number => (s.match(/[\p{L}\p{N}]+/gu) ?? []).length;
 
+/** A final this short may be only the turn's last phrase: a manual activity's final can collapse to it after a pause. */
+const COLLAPSED_FINAL_WORDS = 3;
+
+/** Where a turn's text came from, logged with every turn. */
+export type TextSource = 'final' | 'collapse_interim' | 'no_final_interim' | 'none';
+
+/**
+ * A turn's text: the final transcript, unless it collapsed (COLLAPSED_FINAL_WORDS or fewer while
+ * the last interim text of the activity had more) or never came, then the last interim text.
+ */
+export function turnText(heard: Pick<Heard, 'final' | 'interim'>): { text: string; source: TextSource } {
+  const final = heard.final?.trim() ?? '';
+  const interim = heard.interim.trim();
+  if (!final) return interim ? { text: interim, source: 'no_final_interim' } : { text: '', source: 'none' };
+  const finalWords = wordCount(final);
+  if (finalWords <= COLLAPSED_FINAL_WORDS && wordCount(interim) > finalWords) {
+    return { text: interim, source: 'collapse_interim' };
+  }
+  return { text: final, source: 'final' };
+}
+
 /** A run of two or more quoted items in a list (`'Ava', 'Max', 'send it'`); the last may be cut off. */
 const QUOTED_LIST = /(?<=^|[\s([])(?:['‘’"“”«][^'‘’"“”«»,\n]{1,60}(?:['‘’"“”»]|(?=\s*$))[\s.]*(?:,[\s]*|$)){2,}/gu;
 const QUOTED_ITEM = /['‘’"“”«]([^'‘’"“”«»,\n]{1,60})/gu;

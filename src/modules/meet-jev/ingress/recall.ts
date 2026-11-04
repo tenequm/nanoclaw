@@ -1,21 +1,15 @@
 /**
  * `/meet <link> jev` ingress: the Recall bot's real-time websocket endpoint
  * (https://docs.recall.ai/docs/real-time-websocket-endpoints), one connection per call at
- * `/voice/recall/<callId>/?token=<per-call random>`, turned into `CallEvent`s.
- *
- * Payloads per https://docs.recall.ai/docs/real-time-event-payloads. Recall sends no utterance id,
- * so partials and finals are correlated per participant: with per-participant streams
- * (`diarization.use_separate_streams_when_available`) each participant has at most one utterance in
- * flight; its partials carry the words so far (`hel` -> `hello` -> `hello how`, per
- * https://docs.recall.ai/docs/bot-real-time-transcription#lowest-latency-partial-transcript-data)
- * and its next `transcript.data` is that utterance's final. After a final, the next partial opens a
- * new utterance; a partial whose words start before the last final's end is a late revision of
- * that final and is dropped.
+ * `/voice/recall/<callId>/?token=<per-call random>`. Recall sends each participant's own audio
+ * (`audio_separate_raw.data`, base64 16 kHz mono S16LE, per
+ * https://docs.recall.ai/docs/how-to-get-separate-audio-per-participant-realtime) and participant
+ * events (https://docs.recall.ai/docs/real-time-event-payloads); the host transcribes the audio
+ * itself (recall-audio.ts). Recall's `speech_on/off` are only logged: the boundary is the host's VAD.
  *
  * Times: `relative` is seconds since the recording began
- * (https://docs.recall.ai/docs/speaker-timeline#timestamps). Participant and chat events also carry
- * `absolute`, which pins the recording start in host ms; until one arrives, a transcript event
- * estimates it from its arrival.
+ * (https://docs.recall.ai/docs/speaker-timeline#timestamps), and every frame and event also carries
+ * `absolute`, which pins the recording start in host ms; a message without it is placed on arrival.
  */
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type http from 'node:http';
@@ -30,11 +24,12 @@ import type { CallEvent, Speaker } from '../core/types.js';
 export const RECALL_UPGRADE_SEGMENT = 'voice';
 const PATH_PREFIX = '/voice/recall/';
 const PATH_RE = /^\/voice\/recall\/([^/]+)\/?$/;
-/** Recall events are small JSON; a long monologue's cumulative partial stays far below this. */
+/** An audio frame is tens of ms of 16 kHz PCM in base64, a few KB; events are smaller. */
 const DEFAULT_MAX_FRAME_BYTES = 256 * 1024;
 /** Recall's FAQ: ping every 30 s so no proxy on the way drops the connection as idle. */
 const DEFAULT_PING_INTERVAL_MS = 30_000;
 const CALL_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+export const RECALL_AUDIO_EVENT = 'audio_separate_raw.data';
 
 export interface RecallCallRegistration {
   /** The URL path Recall connects to, with the trailing slash Recall requires before a query. */
@@ -49,101 +44,99 @@ export function recallEndpointUrl(origin: string, registration: RecallCallRegist
 
 /** What one Recall message became. */
 export type RecallOutput =
+  /** A participant's audio: 16 kHz mono samples, `at` the host ms of its first sample. */
+  | { type: 'audio'; speaker: Speaker; pcm: Int16Array; at: number }
+  /** A typed chat line, as a `CallEvent`. */
   | { type: 'event'; event: CallEvent }
-  /** A participant's partial carried words: the worker reflex's text confirmation. */
-  | { type: 'words'; speaker: Speaker }
-  | { type: 'presence'; speaker: Speaker; joined: boolean; at: number };
-
-interface Participant {
-  speaker: Speaker;
-  /** Finals so far: the next utterance's sequence number. */
-  seq: number;
-  /** The utterance whose partials are in flight. */
-  open: string | null;
-  /** Relative seconds at the end of the last final; earlier partials are stale. */
-  lastFinalEnd: number;
-  speaking: boolean;
-}
-
-interface RecallWord {
-  text: string;
-  start: number;
-  end: number | null;
-}
+  | { type: 'presence'; speaker: Speaker; joined: boolean; at: number }
+  /** The bot's own participant, the first time it shows: none of its frames or events reach the call. */
+  | { type: 'self'; speaker: Speaker };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null;
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
-function parseWords(raw: unknown): RecallWord[] | null {
-  if (!Array.isArray(raw)) return null;
-  const words: RecallWord[] = [];
-  for (const w of raw) {
-    if (!isRecord(w) || typeof w.text !== 'string') continue;
-    const start = num(isRecord(w.start_timestamp) ? w.start_timestamp.relative : null);
-    if (start === null) continue;
-    const end = num(isRecord(w.end_timestamp) ? w.end_timestamp.relative : null);
-    words.push({ text: w.text, start, end });
-  }
-  return words;
+/** The message's inner `data` and its participant (inside it per the docs; beside it is taken too). */
+function payloadOf(message: unknown): { event: string; data: Record<string, unknown>; participant: unknown } | null {
+  if (!isRecord(message) || typeof message.event !== 'string') return null;
+  const outer = isRecord(message.data) ? message.data : null;
+  const data = outer && isRecord(outer.data) ? outer.data : null;
+  if (!data) return null;
+  return { event: message.event, data, participant: data.participant ?? outer?.participant };
 }
 
-const wordsText = (words: RecallWord[]) =>
-  words
-    .map((w) => w.text.trim())
-    .filter(Boolean)
-    .join(' ');
+/** A frame's base64 S16LE buffer as samples; an odd trailing byte is dropped. */
+export function decodePcm(base64: string): Int16Array {
+  const bytes = Buffer.from(base64, 'base64');
+  const out = new Int16Array(bytes.length >> 1);
+  for (let i = 0; i < out.length; i++) out[i] = bytes.readInt16LE(i * 2);
+  return out;
+}
 
 /**
- * Per call, pure: Recall messages in, outputs out. Holds the participants' utterance state and the
- * recording's start; the websocket part only feeds it.
+ * A Recall message for an info log line, without what was said or heard: the event, the participant,
+ * the timestamps, a frame's size.
+ */
+export function recallRawSummary(message: unknown): Record<string, unknown> {
+  const payload = payloadOf(message);
+  if (!payload) return { event: isRecord(message) && typeof message.event === 'string' ? message.event : null };
+  const { event, data } = payload;
+  const p = isRecord(payload.participant) ? payload.participant : null;
+  const stamp = isRecord(data.timestamp) ? data.timestamp : null;
+  return {
+    event,
+    ...(p ? { participant: { id: p.id, name: p.name, is_host: p.is_host } } : {}),
+    ...(stamp ? { relative: stamp.relative, absolute: stamp.absolute } : {}),
+    ...(typeof data.buffer === 'string' ? { bytes: Buffer.byteLength(data.buffer, 'base64') } : {}),
+    ...(isRecord(data.data) && typeof data.data.text === 'string' ? { chars: data.data.text.length } : {}),
+  };
+}
+
+/**
+ * Per call, pure: Recall messages in, outputs out. Holds the participants and the recording's start;
+ * the websocket part only feeds it.
  */
 export class RecallTranslator {
   private anchorMs: number | null = null;
-  private anchorExact = false;
-  private readonly participants = new Map<string, Participant>();
+  private readonly selfIds = new Set<string>();
+  private readonly selfName: string | null;
+
+  /**
+   * `botName`: the bot's own `bot_name`. Recall flags no participant as the bot, and the bot is one
+   * (https://docs.recall.ai/docs/bot-overview), its output media audio included: one with this name is
+   * taken for it and left out.
+   */
+  constructor(botName?: string) {
+    this.selfName = botName?.trim() ? botName.trim().toLowerCase() : null;
+  }
 
   translate(message: unknown, arrivalMs: number): RecallOutput[] {
-    if (!isRecord(message) || typeof message.event !== 'string') return [];
-    const outer = isRecord(message.data) ? message.data : null;
-    const data = outer && isRecord(outer.data) ? outer.data : null;
-    if (!data || !isRecord(data.participant)) return [];
-    const p = this.participant(data.participant);
-    if (!p) return [];
-    const event = message.event;
-
-    if (event === 'transcript.partial_data' || event === 'transcript.data') {
-      const words = parseWords(data.words);
-      if (!words) return [];
-      return this.transcript(p, words, event === 'transcript.data', arrivalMs);
+    const payload = payloadOf(message);
+    if (!payload || !isRecord(payload.participant)) return [];
+    const speaker = this.speaker(payload.participant);
+    if (!speaker) return [];
+    if (this.selfIds.has(speaker.id)) return [];
+    if (this.selfName !== null && speaker.name.toLowerCase() === this.selfName) {
+      this.selfIds.add(speaker.id);
+      return [{ type: 'self', speaker }];
     }
-
+    const { event, data } = payload;
     const stamp = isRecord(data.timestamp) ? data.timestamp : null;
     const relative = num(stamp?.relative);
-    if (relative !== null && typeof stamp?.absolute === 'string' && !this.anchorExact) {
+    if (relative !== null && this.anchorMs === null && typeof stamp?.absolute === 'string') {
       const absolute = Date.parse(stamp.absolute);
-      if (!Number.isNaN(absolute)) {
-        this.anchorMs = absolute - relative * 1000;
-        this.anchorExact = true;
-      }
+      if (!Number.isNaN(absolute)) this.anchorMs = absolute - relative * 1000;
     }
-    const at = relative === null ? arrivalMs : this.toHostMs(relative, arrivalMs);
-    const speaker = p.speaker;
+    const at = relative === null || this.anchorMs === null ? arrivalMs : Math.round(this.anchorMs + relative * 1000);
     switch (event) {
-      case 'participant_events.speech_on':
-      case 'participant_events.speech_off': {
-        p.speaking = event === 'participant_events.speech_on';
-        return [{ type: 'event', event: { kind: 'speech', speaker, on: p.speaking, at } }];
+      case RECALL_AUDIO_EVENT: {
+        if (typeof data.buffer !== 'string' || !data.buffer) return [];
+        const pcm = decodePcm(data.buffer);
+        return pcm.length ? [{ type: 'audio', speaker, pcm, at }] : [];
       }
       case 'participant_events.join':
         return [{ type: 'presence', speaker, joined: true, at }];
-      case 'participant_events.leave': {
-        const out: RecallOutput[] = [];
-        // A participant who leaves mid-turn gets no speech_off of their own.
-        if (p.speaking) out.push({ type: 'event', event: { kind: 'speech', speaker, on: false, at } });
-        p.speaking = false;
-        out.push({ type: 'presence', speaker, joined: false, at });
-        return out;
-      }
+      case 'participant_events.leave':
+        return [{ type: 'presence', speaker, joined: false, at }];
       case 'participant_events.chat_message': {
         const text = isRecord(data.data) && typeof data.data.text === 'string' ? data.data.text.trim() : '';
         return text ? [{ type: 'event', event: { kind: 'chat', speaker, text, at } }] : [];
@@ -153,70 +146,34 @@ export class RecallTranslator {
     }
   }
 
-  private participant(raw: Record<string, unknown>): Participant | null {
+  private speaker(raw: Record<string, unknown>): Speaker | null {
     const id = typeof raw.id === 'number' || (typeof raw.id === 'string' && raw.id) ? String(raw.id) : null;
     if (id === null) return null;
     const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : `Participant ${id}`;
-    let p = this.participants.get(id);
-    if (!p) {
-      p = { speaker: { id, name }, seq: 0, open: null, lastFinalEnd: -Infinity, speaking: false };
-      this.participants.set(id, p);
-    } else if (p.speaker.name !== name) {
-      p.speaker = { id, name };
-    }
-    return p;
-  }
-
-  private transcript(p: Participant, words: RecallWord[], final: boolean, arrivalMs: number): RecallOutput[] {
-    const last = words.at(-1);
-    const endRel = last ? (last.end ?? last.start) : null;
-    if (endRel !== null && this.anchorMs === null) this.anchorMs = arrivalMs - endRel * 1000;
-    const at = endRel === null ? arrivalMs : this.toHostMs(endRel, arrivalMs);
-    const text = wordsText(words);
-    const speaker = p.speaker;
-
-    if (!final) {
-      if (!text) return [];
-      if (p.open === null) {
-        if (words[0].start < p.lastFinalEnd) return [];
-        p.open = `${speaker.id}-${p.seq}`;
-      }
-      return [
-        { type: 'event', event: { kind: 'utterance', speaker, uttId: p.open, text, final: false, at } },
-        { type: 'words', speaker },
-      ];
-    }
-
-    // An empty final still closes partials in flight: the provider dropped what it had heard.
-    if (!text && p.open === null) return [];
-    const uttId = p.open ?? `${speaker.id}-${p.seq}`;
-    p.open = null;
-    p.seq++;
-    if (endRel !== null) p.lastFinalEnd = Math.max(p.lastFinalEnd, endRel);
-    return [{ type: 'event', event: { kind: 'utterance', speaker, uttId, text, final: true, at } }];
-  }
-
-  private toHostMs(relative: number, arrivalMs: number): number {
-    return this.anchorMs === null ? arrivalMs : Math.round(this.anchorMs + relative * 1000);
+    return { id, name };
   }
 }
 
 export interface RecallIngressOptions {
+  /** A participant's audio frame (never the bot's). */
+  onAudio(callId: string, speaker: Speaker, pcm: Int16Array, at: number): void;
+  /** A chat line. */
   onEvent(callId: string, event: CallEvent): void;
-  /** A participant's partial carried words (the bot itself is not transcribed: `include_bot_in_recording.audio` is off). */
-  onWords?(callId: string, speaker: Speaker): void;
   /** A participant joined or left; not a `CallEvent`, for the participant list. */
   onPresence?(callId: string, speaker: Speaker, joined: boolean, at: number): void;
-  /** Every parsed message as Recall sent it, for the phase 2 raw log. */
-  onRaw?(callId: string, message: unknown): void;
+  /** Every parsed message as Recall sent it, for the phase 2 raw log; `seq` counts the call's messages from 1. */
+  onRaw?(callId: string, message: unknown, seq: number): void;
   now?: () => number;
   maxFrameBytes?: number;
   pingIntervalMs?: number;
 }
 
 export interface RecallIngress {
-  /** A call's endpoint, before the bot create: events can race the create's answer. */
-  register(callId: string): RecallCallRegistration;
+  /**
+   * A call's endpoint, before the bot create: events can race the create's answer. `botName`: the
+   * bot's name in the meeting, whose participant is left out (RecallTranslator).
+   */
+  register(callId: string, options?: { botName?: string }): RecallCallRegistration;
   /** Closes the call's connection and forgets its token. */
   unregister(callId: string): void;
   /** For `registerUpgradeHandler(RECALL_UPGRADE_SEGMENT, ...)`. */
@@ -259,12 +216,18 @@ export function createRecallIngress(options: RecallIngressOptions): RecallIngres
       log.warn('meet-jev recall: a frame that is not JSON', { callId: entry.callId });
       return;
     }
-    if (entry.messages++ === 0) log.info('meet-jev recall: events flowing', { callId: entry.callId });
+    const seq = ++entry.messages;
+    if (seq === 1) log.info('meet-jev recall: events flowing', { callId: entry.callId });
     try {
-      options.onRaw?.(entry.callId, message);
+      options.onRaw?.(entry.callId, message, seq);
       for (const out of entry.translator.translate(message, now())) {
-        if (out.type === 'event') options.onEvent(entry.callId, out.event);
-        else if (out.type === 'words') options.onWords?.(entry.callId, out.speaker);
+        if (out.type === 'audio') options.onAudio(entry.callId, out.speaker, out.pcm, out.at);
+        else if (out.type === 'event') options.onEvent(entry.callId, out.event);
+        else if (out.type === 'self')
+          log.info("meet-jev recall: the bot's own participant; its events are left out", {
+            callId: entry.callId,
+            participantId: out.speaker.id,
+          });
         else options.onPresence?.(entry.callId, out.speaker, out.joined, out.at);
       }
     } catch (err) {
@@ -309,14 +272,14 @@ export function createRecallIngress(options: RecallIngressOptions): RecallIngres
   }
 
   return {
-    register(callId) {
+    register(callId, { botName } = {}) {
       if (!CALL_ID_RE.test(callId)) throw new Error(`meet-jev recall: unusable call id ${callId}`);
       if (calls.has(callId)) throw new Error(`meet-jev recall: call ${callId} is registered already`);
       const token = randomBytes(32).toString('base64url');
       calls.set(callId, {
         callId,
         tokenDigest: digest(token),
-        translator: new RecallTranslator(),
+        translator: new RecallTranslator(botName),
         sockets: new Set(),
         messages: 0,
       });

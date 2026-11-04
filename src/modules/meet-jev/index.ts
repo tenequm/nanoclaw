@@ -1,7 +1,13 @@
 /**
- * The jev call loop as the voice channel uses it: one `JevCall` per `/voice jev` call, which takes the
- * worker's events and the agent's replies for that call, and turns the core's commands into turns for
- * the agent and host events for the worker. See runtime.ts (the executor) and core/ (every decision).
+ * The jev call loop as the voice channel uses it: one `JevCall` per `/voice jev` or `/meet <link> jev`
+ * call, which takes the call's transcript, the worker's reports and the agent's replies, and turns the
+ * core's commands into turns for the agent and host events for the worker. See runtime.ts (the
+ * executor) and core/ (every decision).
+ *
+ * The transcript comes from one source per kind: on `voice` the worker's STT and VAD (`workerEvents`),
+ * one speaker; on `meet` each participant's own audio from Recall through the host's VAD and Gemini
+ * transcription (`transcript`, ingress/recall-audio.ts), where the worker reports playback only and
+ * its VAD marks (the meeting's mixed audio) are logged, never a boundary.
  *
  * On a jev call the host pushes the worker only what the core says to: a `reply` (with its `replyId`)
  * for `speak`, a `stop` for `stop_playback`. `show` and `drop` push nothing: the agent's message is
@@ -10,7 +16,7 @@
 import type { LiveKitHostEvent } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
 import { callCore } from './core/index.js';
-import type { CallCore } from './core/types.js';
+import type { CallCore, CallEvent, CallKind } from './core/types.js';
 import { createWorkerIngress } from './ingress/worker.js';
 import { askAction } from './judge.js';
 import { policyFor } from './policy.js';
@@ -27,6 +33,8 @@ const MINUTE_MS = 60_000;
 /** What a jev call needs of the voice channel. */
 export interface JevCallHost {
   callId: string;
+  /** Which call this is; `voice` when left out. */
+  kind?: CallKind;
   callerName: string;
   agentName: string;
   /** Other names the agent goes by (the vocabulary file's wake names). */
@@ -49,6 +57,10 @@ export interface JevDeps {
 export interface JevCall {
   /** A worker POST's events, in order; malformed ones are skipped. */
   workerEvents(raw: readonly unknown[]): { accepted: number; dropped: number };
+  /** A `meet` call's transcript event (a participant's pipeline, on the host clock); ignored on a `voice` call. */
+  transcript(event: CallEvent): void;
+  /** A participant's words arrived: while the agent's line plays, the worker's reflex hears of it. */
+  words(): void;
   /** An agent message for this call: `turnId` is the turn it answers, null when unprompted. */
   reply(text: string, turnId: string | null): void;
   end(reason: string): void;
@@ -57,12 +69,15 @@ export interface JevCall {
 export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): JevCall {
   const core = deps.core ?? callCore;
   const judge = deps.judge ?? askAction;
-  const policy = policyFor('voice', host.agentName, [...host.agentAliases]);
+  const kind = host.kind ?? 'voice';
+  const policy = policyFor(kind, host.agentName, [...host.agentAliases]);
   const ingress = createWorkerIngress({ name: host.callerName }, host.maxTextBytes);
   const replyTurns = new Map<string, string | null>();
   let replies = 0;
   const fields = { callId: host.callId };
   const judgedAt: number[] = [];
+  /** Lines the worker reported started and not yet over: `words` reaches it only while one plays. */
+  const playing = new Set<string>();
 
   const capped = (): boolean => {
     const now = host.now();
@@ -107,8 +122,24 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
     workerEvents(raw) {
       const { events, dropped } = ingress.convert(raw, host.now());
       if (dropped > 0) log.warn('meet-jev: malformed worker events skipped', { ...fields, dropped });
-      for (const event of events) runtime.feed(event);
+      for (const event of events) {
+        if (event.kind === 'playback') {
+          if (event.state === 'started') playing.add(event.replyId);
+          else playing.delete(event.replyId);
+        } else if (kind === 'meet') {
+          // The meeting's mixed audio, not a participant: its VAD times go to the log, to read the pipelines' against.
+          if (event.kind === 'speech') log.info('meet-jev: worker vad', { ...fields, on: event.on, at: event.at });
+          continue;
+        }
+        runtime.feed(event);
+      }
       return { accepted: events.length, dropped };
+    },
+    transcript(event) {
+      if (kind === 'meet') runtime.feed(event);
+    },
+    words() {
+      if (playing.size > 0 && !runtime.ended) host.push({ type: 'words' });
     },
     reply(text, turnId) {
       const replyId = `r${++replies}`;

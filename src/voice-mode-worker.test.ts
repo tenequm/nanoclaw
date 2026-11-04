@@ -6771,8 +6771,8 @@ describe('jev: the reporter', () => {
   });
 });
 
-/** A JevLoop over a fake transcription and a speech output the test drives line by line. */
-function jevLoop() {
+/** A JevLoop over a fake transcription (none: a meeting's) and a speech output the test drives line by line. */
+function jevLoop({ transcribed = true }: { transcribed?: boolean } = {}) {
   const transcription = fakeTranscription();
   const events: JevWorkerEvent[] = [];
   const captions: Array<[number, string, boolean]> = [];
@@ -6807,7 +6807,7 @@ function jevLoop() {
     });
   });
   const loop = new JevLoop({
-    transcriber: transcription,
+    ...(transcribed ? { transcriber: transcription } : {}),
     speak,
     report: (event) => void events.push(event),
     caption: (segment, text, final) => void captions.push([segment, text, final]),
@@ -6990,6 +6990,42 @@ describe('jev: the loop', () => {
     vi.useRealTimers();
   });
 
+  it("without a transcriber (a meeting): VAD marks only, no utterance; the host's words are the reflex's only confirmation", async () => {
+    vi.useFakeTimers();
+    const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
+    const h = jevLoop({ transcribed: false });
+    const cut = () => h.lines.filter((l) => l.signal.aborted).length;
+    h.loop.audio(new Int16Array(16_000));
+    h.loop.onSpeech(true, 16_000);
+    h.loop.onSpeech(false, 20_000);
+    await tick(1);
+    expect(h.kinds()).toEqual(['speech:on', 'speech:off']);
+    expect(h.transcription.begins).toEqual([]);
+    expect(h.transcription.pushed).toBe(0);
+
+    h.loop.onReply('r1', 'One.');
+    await tick(1);
+    h.start(h.lines[0]);
+    // Words from the host before the floor: the floor decides, once it passes.
+    h.loop.onSpeech(true, 22_000);
+    h.loop.onWords();
+    await tick(100);
+    expect(cut()).toBe(0);
+    await tick(JEV_BARGE_MS);
+    expect(cut()).toBe(1);
+    expect(h.kinds().at(-1)).toBe('r1:cut_off');
+    h.loop.onSpeech(false, 30_000);
+    await tick(1);
+    // VAD alone, however long, leaves the line.
+    h.loop.onReply('r2', 'Two.');
+    await tick(1);
+    h.start(h.lines[1]);
+    h.loop.onSpeech(true, 32_000);
+    await tick(JEV_BARGE_MS * 3);
+    expect(cut()).toBe(1);
+    vi.useRealTimers();
+  });
+
   it('a synthesis failure is reported, not spoken about; one that fails mid-line reports what got out', async () => {
     const h = jevLoop();
     h.loop.onReply('r1', 'One.');
@@ -7108,6 +7144,54 @@ describe('jev calls', () => {
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
     expect(v.voice.close).toHaveBeenCalled();
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+  });
+
+  it("a jev meeting transcribes nothing: VAD marks and playback go to agent/jev, and the host's words cut a line", async () => {
+    const { ctx, job, room } = fakeJob({
+      ...JEV_META,
+      callerIdentity: 'meet-bridge-meet-r1',
+      meeting: { pauseSends: false, jev: true },
+    });
+    room.remoteParticipants.clear();
+    room.remoteParticipants.set('meet-bridge-meet-r1', {});
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    // A meeting has no page to send settings.
+    v.voice.review.serve = vi.fn();
+    const make = vi.fn(() => v.transcription);
+    let signal: AbortSignal | undefined;
+    v.voice.speak.mockImplementation(async (_text: string, ready: () => Promise<void>, s: AbortSignal) => {
+      signal = s;
+      await ready();
+      v.events.onAgentSpeaking(true);
+      await untilAborted(s);
+      v.events.onAgentSpeaking(false);
+      return { heard: true, failed: false, cut: true, audioMs: 2_000, playedMs: 1_000, complete: true };
+    });
+    await runCall(ctx, { ...callDeps(host.fetchImpl, v), transcriber: make });
+    expect(make).not.toHaveBeenCalled();
+    v.audio(600);
+    v.events.onSpeech(true, v.position);
+    v.audio(1000);
+    v.events.onSpeech(false, v.position);
+    await vi.waitFor(() => expect(jevEvents(host).flat().map(summary)).toEqual(['speech:on', 'speech:off']));
+
+    host.emit({ type: 'reply', text: 'Two plus two is four.', replyId: 'r1' });
+    await vi.waitFor(() => expect(jevEvents(host).flat().map(summary).at(-1)).toBe('r1:started'));
+    v.events.onSpeech(true, v.position);
+    await new Promise((r) => setTimeout(r, JEV_BARGE_MS + 50));
+    expect(signal?.aborted).toBe(false);
+    host.emit({ type: 'words' });
+    await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+    await vi.waitFor(() => expect(jevEvents(host).flat().map(summary).at(-1)).toBe('r1:cut_off'));
+    expect(
+      jevEvents(host)
+        .flat()
+        .some((e) => e.type === 'utterance'),
+    ).toBe(false);
+    expect(v.transcription.begins).toEqual([]);
+    host.emit({ type: 'end', reason: 'done' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
   });
 
   it("the host's stop cuts the line through the room's abortable speech, and the end tells the host", async () => {

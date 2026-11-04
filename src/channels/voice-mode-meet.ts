@@ -8,16 +8,29 @@
  * never from the line's caller. `/meet leave` sends the bot away; a call on the line's link ends a meeting,
  * as any newer call does. Off until RECALL_API_KEY and its settings are there. A meeting turn ends on a send
  * word, as on the call page with "a pause also sends" off; `pause` after the link makes the pause send it too.
- * `jev` also lets the agent join in unaddressed, when the Jev gate judges the conversation invites it.
+ * `jev` runs the meet-jev loop instead (src/modules/meet-jev/): Recall transcribes each participant and
+ * streams it to the host, and the loop decides when the agent speaks, addressed or invited.
  */
 import type { InboundEvent } from './adapter.js';
 import { JEV_API_KEY } from '../config.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getVoiceModeLineForAgent } from '../db/voice-mode-lines.js';
 import { log } from '../log.js';
-import { DEFAULT_THRESHOLDS, gateEntryFor } from '../modules/jev-gate/config.js';
-import { renderState, type GateHistoryRow } from '../modules/jev-gate/history.js';
-import { askJev, decide } from '../modules/jev-gate/jev.js';
+import {
+  createMeetingAudio,
+  sileroDetectors,
+  type MeetingAudio,
+  type MeetingAudioOptions,
+  type SpeechDetectorFactory,
+} from '../modules/meet-jev/ingress/recall-audio.js';
+import {
+  createRecallIngress,
+  RECALL_AUDIO_EVENT,
+  recallEndpointUrl,
+  recallRawSummary,
+  type RecallIngress,
+} from '../modules/meet-jev/ingress/recall.js';
+import type { LiveKitJobMetadata } from './voice-mode-protocol.js';
 import { registerMessageInterceptor } from '../router.js';
 import { encryptionKey } from '../secret-seal.js';
 import type { MessagingGroup } from '../types.js';
@@ -45,39 +58,6 @@ import { CALL_SPEECH_FORMAT_NOTE, type CallKind, type CallRefusal, type LiveKitV
 
 /** The worker and the bridge page, with room for the page to reconnect before its old self is gone. */
 const MEETING_MAX_PARTICIPANTS = 3;
-/** A `/meet ... jev` call's rolling transcript, in lines, that the Jev gate reads a candidate against. */
-const MEETING_JEV_HISTORY_LINES = 12;
-/** A line in that transcript is clipped: the gist is enough to tell what was already said or answered. */
-const MEETING_JEV_LINE_CHARS = 600;
-const MAX_WAKE_NAME_CHARS = 80;
-
-/**
- * A meeting line as the Jev gate's state renders it: speaker-agnostic, since a meeting's audio comes
- * mixed, and the agent's own lines as `<agent> [assistant]`.
- */
-function meetingLine(direction: 'in' | 'out', text: string, at: number): GateHistoryRow {
-  return {
-    timestamp: new Date(at).toISOString(),
-    direction,
-    kind: 'chat',
-    text,
-    sender: direction === 'in' ? MEETING_SENDER : '',
-    isBot: false,
-    jev: null,
-    role: null,
-    replyTo: null,
-    hasMedia: false,
-  };
-}
-
-/** The worker's wake name as it may enter Jev's questions: no control or format characters, capped. */
-function wakeNameOf(raw: string): string {
-  const flat = raw
-    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return [...flat].slice(0, MAX_WAKE_NAME_CHARS).join('').trim();
-}
 
 /** A `/meet` turn's note: anyone may have spoken, and every message to the chat is said into the meeting. */
 function meetingReplyNote(languageNote: string): string {
@@ -90,6 +70,16 @@ function meetingReplyNote(languageNote: string): string {
   );
 }
 
+/** A `/meet ... jev` turn's note besides the loop's own (the window, when to stay silent): the loop decides what is said aloud. */
+export function meetingJevReplyNote(languageNote: string): string {
+  return (
+    'Spoken in a live Google Meet you joined as a voice participant; the speaker may be any participant, not ' +
+    'only the chat owner. A reply you send to this chat is read aloud into the meeting word for word unless the ' +
+    `conversation has moved on: keep it brief and conversational, lead with the answer. ${CALL_SPEECH_FORMAT_NOTE} ` +
+    `Offer anything meant for reading for after the meeting. ${languageNote}`
+  );
+}
+
 /** What `/meet` hears back: the meeting call started, or why not. */
 export type MeetingStart = { ok: true } | CallRefusal | { ok: false; error: 'bot' };
 
@@ -97,7 +87,7 @@ export type MeetingStart = { ok: true } | CallRefusal | { ok: false; error: 'bot
 export interface MeetingOptions {
   /** `pause`: a pause sends the turn, not only the send word. */
   pauseSends: boolean;
-  /** `jev`: unaddressed speech is a candidate the Jev gate may let through. */
+  /** `jev`: the meet-jev loop on each participant's own transcribed audio decides when the agent speaks. */
   jev: boolean;
 }
 
@@ -114,6 +104,94 @@ export interface Meetings {
   leave(platformId: string): boolean;
 }
 
+/** What a jev meeting's transcription takes from the call's job, as the worker takes it for `/voice jev`. */
+export type MeetingSpeechJob = Pick<LiveKitJobMetadata, 'sttModel' | 'vocabulary' | 'languages'>;
+
+/** Where a jev meeting's Recall bot streams each participant's audio (ingress/recall.ts behind it). */
+export interface MeetingTranscripts {
+  /**
+   * The call's `wss://` endpoint URL, taken before the bot create; `botName` is left out as a speaker,
+   * `job` sets the transcription up.
+   */
+  register(callId: string, botName: string, job: MeetingSpeechJob): string;
+  unregister(callId: string): void;
+}
+
+/** Each call's first Recall events (audio frames aside) logged at info, without their words. */
+export const RECALL_RAW_INFO_MESSAGES = 200;
+
+/** Test seams of the participants' transcription; Silero and Gemini Live by default. */
+export interface MeetingAudioSeams {
+  detectors?: () => Promise<SpeechDetectorFactory>;
+  transcriber?: MeetingAudioOptions['transcriber'];
+}
+
+/**
+ * The Recall websocket ingress of the jev meetings, each participant's audio transcribed on the host
+ * (recall-audio.ts) into the call's loop: `handleUpgrade` for the shared webhook server's `voice`
+ * segment, `origin` the public `wss://` origin in front of it, `geminiKey` the worker's
+ * VOICE_MODE_GEMINI_API_KEY.
+ */
+export function createRecallTranscripts(
+  core: Pick<LiveKitVoice, 'jevCall'>,
+  { origin, geminiKey, seams = {} }: { origin: string; geminiKey: string; seams?: MeetingAudioSeams },
+): MeetingTranscripts & Pick<RecallIngress, 'handleUpgrade' | 'close'> {
+  const loadDetectors = seams.detectors ?? sileroDetectors;
+  let detector: SpeechDetectorFactory | null = null;
+  const calls = new Map<string, { audio: MeetingAudio; logged: number }>();
+  const ingress = createRecallIngress({
+    onAudio: (callId, speaker, pcm, at) => calls.get(callId)?.audio.audio(speaker, pcm, at),
+    onEvent: (callId, event) => core.jevCall(callId)?.transcript(event),
+    onPresence: (callId, speaker, joined, at) => {
+      if (!joined) calls.get(callId)?.audio.left(speaker, at);
+    },
+    onRaw: (callId, message, seq) => {
+      const call = calls.get(callId);
+      // Frames are base64 audio, dozens a second: their pipelines log instead.
+      if (!call || (message as { event?: unknown } | null)?.event === RECALL_AUDIO_EVENT) return;
+      log.debug('meet-jev recall: raw', { callId, seq, message });
+      if (++call.logged <= RECALL_RAW_INFO_MESSAGES)
+        log.info('meet-jev recall: event', { callId, seq, ...recallRawSummary(message) });
+    },
+  });
+  const unregister = (callId: string): void => {
+    calls.get(callId)?.audio.close();
+    calls.delete(callId);
+    ingress.unregister(callId);
+  };
+  return {
+    register(callId, botName, job) {
+      // Loads once per host, while the bot is still being made and admitted.
+      if (!detector)
+        void loadDetectors().then(
+          (loaded) => (detector = loaded),
+          (err: unknown) =>
+            log.error('meet-jev audio: the VAD did not load; meeting speech is not transcribed', { err }),
+        );
+      const audio = createMeetingAudio({
+        speech: { apiKey: geminiKey, model: job.sttModel, vocabulary: job.vocabulary, languageCodes: job.languages },
+        detector: () => detector,
+        ...(seams.transcriber ? { transcriber: seams.transcriber } : {}),
+        onEvent: (event) => core.jevCall(callId)?.transcript(event),
+        onWords: () => core.jevCall(callId)?.words(),
+        log: {
+          info: (msg: string, fields?: unknown) => log.info(msg, { callId, ...(fields as object) }),
+          warn: (msg: string, fields?: unknown) => log.warn(msg, { callId, ...(fields as object) }),
+        },
+      });
+      const url = recallEndpointUrl(origin, ingress.register(callId, { botName }));
+      calls.set(callId, { audio, logged: 0 });
+      return url;
+    },
+    unregister,
+    handleUpgrade: (req, socket, head) => ingress.handleUpgrade(req, socket, head),
+    close() {
+      for (const callId of [...calls.keys()]) unregister(callId);
+      ingress.close();
+    },
+  };
+}
+
 /**
  * The meeting call kind over the call core: the bridge page is the caller, turns come from the meeting,
  * and the Recall bot comes and goes with the call.
@@ -121,44 +199,10 @@ export interface Meetings {
 export function createMeetings(
   core: Pick<LiveKitVoice, 'openCall' | 'endCall'>,
   bridge: RecallMeetBridge,
-  { judgeJev = askJev, now = () => Date.now() }: { judgeJev?: typeof askJev; now?: () => number } = {},
+  transcripts: MeetingTranscripts,
 ): Meetings {
   /** The meeting call running on each line, by call id. */
   const live = new Map<string, string>();
-
-  /**
-   * Jev's judge of a candidate against the meeting's rolling transcript, with the agent's gate thresholds
-   * (the defaults without a live gate entry); an error or timeout keeps it out. The agent goes by
-   * `wakeName`, the name the meeting wakes on, and by the line's agent name only without one.
-   */
-  const jevCandidates = (): NonNullable<CallKind['candidates']> => {
-    const lines: GateHistoryRow[] = [];
-    return {
-      async judge(call, text, rawWakeName) {
-        const agentName = wakeNameOf(rawWakeName) || call.line.agent.name;
-        const fields = { callId: call.callId };
-        const result = await judgeJev(renderState(lines, meetingLine('in', text, now()), agentName), agentName);
-        if (!result.ok) {
-          log.info('meet: jev candidate dropped', { ...fields, error: result.reason });
-          return false;
-        }
-        const thresholds = gateEntryFor(call.line.agentGroupId)?.thresholds ?? DEFAULT_THRESHOLDS;
-        const decision = decide(result.scores, thresholds);
-        log.info(`meet: jev candidate ${decision.wake ? 'wakes the agent' : 'dropped'}`, {
-          ...fields,
-          value: decision.value,
-          veto: decision.veto,
-          ...(decision.reason ? { reason: decision.reason } : {}),
-          ...result.scores,
-        });
-        return decision.wake;
-      },
-      heard(direction, text) {
-        lines.push(meetingLine(direction, text.slice(0, MEETING_JEV_LINE_CHARS), now()));
-        lines.splice(0, Math.max(0, lines.length - MEETING_JEV_HISTORY_LINES));
-      },
-    };
-  };
 
   const start: Meetings['start'] = async (platformId, meetingUrl, options, bindChat) => {
     /** The bot, once its create was sent; whether the call already ended. */
@@ -177,30 +221,40 @@ export function createMeetings(
       job: ({ roomName }) => ({
         callerIdentity: bridgeIdentity(roomName),
         meeting: { pauseSends: options.pauseSends, jev: options.jev },
+        ...(options.jev ? { jev: true } : {}),
       }),
       sender: () => ({ id: null, name: MEETING_SENDER }),
-      turnNote: meetingReplyNote,
+      turnNote: options.jev ? meetingJevReplyNote : meetingReplyNote,
       joined: (call, say) => say(`\u{1F4DE} ${call.line.agent.name} is in the meeting.`),
       ended: (call, reason, say) => {
         meeting.ended = true;
+        if (options.jev) transcripts.unregister(call.callId);
         if (live.get(call.platformId) === call.callId) live.delete(call.platformId);
         say?.(`\u{1F4DE} Left the meeting (${reason}).`);
         return leaveBot();
       },
-      ...(options.jev ? { candidates: jevCandidates() } : {}),
       ...(bindChat ? { bindChat } : {}),
     };
     const opened = await core.openCall(platformId, kind);
     if (!opened.ok) return opened;
     const { call } = opened;
     live.set(platformId, call.callId);
-    meeting.bot = bridge.join({ meetingUrl, botName: call.line.agent.name, roomName: call.roomName }).then(
-      ({ botId }) => botId,
-      (err: unknown) => {
-        log.warn('meet: the meeting bot could not be created', { platformId, callId: call.callId, err });
-        return null;
-      },
-    );
+    const botName = call.line.agent.name;
+    // Before the create: Recall can stream events before it answers.
+    const participantAudio = options.jev
+      ? { websocketUrl: transcripts.register(call.callId, botName, opened.job) }
+      : undefined;
+    // Ended while connecting: its end hook ran before there was anything to unregister.
+    if (participantAudio && meeting.ended) transcripts.unregister(call.callId);
+    meeting.bot = bridge
+      .join({ meetingUrl, botName, roomName: call.roomName, ...(participantAudio && { participantAudio }) })
+      .then(
+        ({ botId }) => botId,
+        (err: unknown) => {
+          log.warn('meet: the meeting bot could not be created', { platformId, callId: call.callId, err });
+          return null;
+        },
+      );
     // Ended between the room opening and the create: the end hook had no bot to send away.
     if (meeting.ended) void leaveBot();
     const botId = await meeting.bot;
@@ -375,8 +429,8 @@ export function meetCommandReply(outcome: MeetOutcome, cmd = '/meet'): string | 
     case 'usage':
       return (
         `Send ${cmd} <Google Meet link> to bring the agent into a meeting, or ${cmd} leave to send it away. ` +
-        `A turn ends on a send word; add pause (${cmd} <link> pause) to send it on a pause too, and jev ` +
-        `(${cmd} <link> jev) to let it join in unaddressed when the conversation invites it.`
+        `A turn ends on a send word; add pause (${cmd} <link> pause) to send it on a pause too, or jev ` +
+        `(${cmd} <link> jev) to let it follow the conversation and answer when addressed or invited.`
       );
     case 'voice-unavailable':
       return `${outcome.agentName}: voice calls are off on this host (the voice-mode channel is not configured).`;
@@ -391,10 +445,13 @@ export function meetCommandReply(outcome: MeetOutcome, cmd = '/meet'): string | 
     case 'started':
       return (
         `\u{1F4DE} ${outcome.agentName} is asking to join ${outcome.url}. ` +
-        `Admit "${outcome.agentName}" from the meeting's lobby; it answers when someone says its wake phrase, ` +
-        `and a turn ends on a send word${outcome.pauseSends ? ' or a pause' : ''}. What it is asked and its answers ` +
-        `show here.${outcome.jev ? ' It may also join in unaddressed when the conversation invites it.' : ''} ` +
-        `${cmd} leave sends it away.`
+        `Admit "${outcome.agentName}" from the meeting's lobby; ` +
+        (outcome.jev
+          ? `it answers when someone addresses it by name or invites it and nobody else takes it up. Each ` +
+            `participant's speech is transcribed on this host, and Recall keeps nothing of the meeting. `
+          : `it answers when someone says its wake phrase, and a turn ends on a send word` +
+            `${outcome.pauseSends ? ' or a pause' : ''}. `) +
+        `What it is asked and its answers show here. ${cmd} leave sends it away.`
       );
     case 'failed':
       return `${outcome.agentName} could not join the meeting: ${failureText(outcome.start)}`;
