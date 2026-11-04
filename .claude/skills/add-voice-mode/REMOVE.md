@@ -56,6 +56,7 @@ Remove these skill-owned files:
 ```bash
 rm -f src/channels/voice-mode-adapter.test.ts \
   src/channels/voice-mode-call-session.test.ts \
+  src/channels/voice-mode-chat.ts \
   src/channels/voice-mode-command.test.ts \
   src/channels/voice-mode-command.ts \
   src/channels/voice-mode-line-roles.test.ts \

@@ -14,48 +14,32 @@
  * gets nothing.
  */
 import type { InboundEvent } from './adapter.js';
-import { wiringThreadsEnabled } from './channel-defaults.js';
-import { getChannelAdapter, getChannelAdapterExact } from './channel-registry.js';
+import { getChannelAdapterExact } from './channel-registry.js';
 import { getAgentGroup } from '../db/agent-groups.js';
-import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
-import {
-  bindVoiceModeLineChat,
-  createVoiceModeLine,
-  getVoiceModeLineForAgent,
-  mintVoiceModeLine,
-  openVoiceModeLink,
-} from '../db/voice-mode-lines.js';
+import { mintVoiceModeLine, openVoiceModeLink } from '../db/voice-mode-lines.js';
 import { log } from '../log.js';
-import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
-import { getUser } from '../modules/permissions/db/users.js';
 import { ensureUserDm } from '../modules/permissions/user-dm.js';
 import { registerMessageInterceptor } from '../router.js';
 import { encryptionKey } from '../secret-seal.js';
 import type { MessagingGroup } from '../types.js';
-import type { VoiceModeChannelAdapter } from './voice-mode.js';
-import { VOICE_MODE_CHANNEL } from './voice-mode-line.js';
-
-/** Channels whose client intercepts `/`: the command is typed `!voice` there. */
-const BANG_CHANNELS = new Set(['slack']);
+import {
+  administeredWirings,
+  BANG_CHANNELS,
+  callThread,
+  claimLine,
+  commandChat,
+  commandName,
+  liveVoiceAdapter,
+  messageText,
+} from './voice-mode-chat.js';
 
 /** The call page URL for a token. */
 export type CallUrlFn = (token: string) => string;
 
-const liveAdapter = () => getChannelAdapterExact(VOICE_MODE_CHANNEL) as VoiceModeChannelAdapter | undefined;
-
 /** The live voice-mode adapter's page URLs (it knows the public origin), or null when the channel is not running. */
 function liveCallUrl(): CallUrlFn | null {
-  const adapter = liveAdapter();
+  const adapter = liveVoiceAdapter();
   return adapter ? (token) => adapter.callUrl(token) : null;
-}
-
-function messageText(content: string): string {
-  try {
-    const parsed = JSON.parse(content) as { text?: unknown };
-    return typeof parsed.text === 'string' ? parsed.text.trim() : '';
-  } catch {
-    return content.trim();
-  }
 }
 
 /**
@@ -67,22 +51,6 @@ export function parseVoiceCommand(text: string, channelType: string): { renew: b
   if (!match) return null;
   if (match[1][0] === '!' && !BANG_CHANNELS.has(channelType)) return null;
   return { renew: match[2]?.toLowerCase() === 'new' };
-}
-
-/** The sender's namespaced user id, read the way the permissions module reads it; no row is created. */
-export function senderUserId(event: InboundEvent): string | null {
-  let content: Record<string, unknown>;
-  try {
-    content = JSON.parse(event.message.content) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  const author = typeof content.author === 'object' && content.author !== null ? content.author : undefined;
-  const handle = [content.senderId, content.sender, (author as { userId?: unknown } | undefined)?.userId].find(
-    (v): v is string => typeof v === 'string' && v.length > 0,
-  );
-  if (!handle) return null;
-  return handle.includes(':') ? handle : `${event.channelType}:${handle}`;
 }
 
 /** Why /voice shows no link for one agent. */
@@ -130,13 +98,10 @@ export async function runVoiceCommand(
   userId: string | null,
   { callUrl = liveCallUrl(), renew = false, key = encryptionKey(), agentGroupIds }: VoiceRunOptions = {},
 ): Promise<VoiceCommandOutcome> {
-  if (!userId || !(await getUser(userId))) return { kind: 'drop' };
-  const wirings = await getMessagingGroupAgents(mg.id);
-  if (wirings.length === 0) return { kind: 'drop' };
+  const wirings = await administeredWirings(mg, userId, agentGroupIds);
+  if (!wirings || !userId) return { kind: 'drop' };
   const results: VoiceTargetResult[] = [];
   for (const wiring of wirings) {
-    if (agentGroupIds && !agentGroupIds.has(wiring.agent_group_id)) continue;
-    if (!(await hasAdminPrivilege(userId, wiring.agent_group_id))) continue;
     const ag = await getAgentGroup(wiring.agent_group_id);
     if (!ag) continue;
     const agent = { agentGroupId: ag.id, agentName: ag.name };
@@ -151,30 +116,26 @@ export async function runVoiceCommand(
       results.push(noLink(callUrl ? 'no-key' : 'voice-unavailable'));
       continue;
     }
-    // None when the wiring keeps no threads, else the one /voice was run in.
-    const callThread = threadId !== null && wiringThreadsEnabled(wiring, mg) ? threadId : null;
-    const target = { agentGroupId: ag.id, ownerUserId: userId, messagingGroupId: mg.id, threadId: callThread };
+    const target = {
+      agentGroupId: ag.id,
+      ownerUserId: userId,
+      messagingGroupId: mg.id,
+      threadId: callThread(wiring, mg, threadId),
+    };
     const minted = (token: string, lineId: string, replaced: boolean): VoiceTargetResult => {
       log.info('Voice mode link minted via /voice', { ...target, line: lineId, replaced });
       return { ok: true, ...agent, link: callUrl(token), replaced };
     };
-    // A plain run only creates a line: one another run created meanwhile keeps its caller and link.
-    const created = (await getVoiceModeLineForAgent(ag.id)) ? undefined : await createVoiceModeLine(target, key);
-    if (created) {
-      results.push(minted(created.token, created.line.line_id, false));
+    const claim = await claimLine(target, key);
+    if (claim.kind === 'created') {
+      results.push(minted(claim.token, claim.line.line_id, false));
       continue;
     }
-    const line = await bindVoiceModeLineChat({
-      agentGroupId: ag.id,
-      callerUserId: userId,
-      messagingGroupId: mg.id,
-      threadId: callThread,
-    });
-    if (!line) {
-      const owner = (await getVoiceModeLineForAgent(ag.id))?.owner_user_id;
-      results.push(noLink('other-caller', owner ? ((await getUser(owner))?.display_name ?? undefined) : undefined));
+    if (claim.kind === 'other-caller') {
+      results.push(noLink('other-caller', claim.caller));
       continue;
     }
+    const line = claim.line;
     log.info('Voice mode call chat set via /voice', { ...target, line: line.line_id });
     if (renew) {
       const fresh = await mintVoiceModeLine(target, key);
@@ -190,7 +151,7 @@ export async function runVoiceCommand(
 }
 
 /** The command as the sender types it: Slack's client eats unknown slash commands. */
-export const voiceCommandName = (channelType: string): string => (BANG_CHANNELS.has(channelType) ? '!voice' : '/voice');
+export const voiceCommandName = (channelType: string): string => commandName('voice', channelType);
 
 /** The call links in an outcome, one line each; they are credentials, so they go to the sender only. */
 export function voiceLinkLines(outcome: VoiceCommandOutcome): string[] {
@@ -258,26 +219,10 @@ export async function handleVoiceCommand(
   if (!command) return false;
   const callUrl = callUrlFor === undefined ? liveCallUrl() : callUrlFor;
 
-  const instance = event.instance ?? event.channelType;
-  const adapter = getChannelAdapterExact(instance);
-  if (!adapter) {
-    log.warn('/voice dropped: the chat adapter is offline', { channelType: event.channelType });
-    return true;
-  }
-  // Mirror the router: a platform without threads collapses them to the chat.
-  const threadId = getChannelAdapter(instance)?.supportsThreads ? event.threadId : null;
-  // Slack gives every top-level message a thread of its own (its ts); a top-level command means the chat itself.
-  const chatThread = threadId !== null && threadId === `${event.platformId}:${event.message.id}` ? null : threadId;
-  const mg = await getMessagingGroupByPlatform(event.channelType, event.platformId, instance);
-  const userId = senderUserId(event);
+  const chat = await commandChat(event, '/voice');
+  if (!chat) return true;
+  const { adapter, instance, threadId, chatThread, mg, userId } = chat;
   const cmd = voiceCommandName(event.channelType);
-  if (!mg || mg.denied_at || !userId) {
-    log.info('/voice from an unknown sender or an unwired chat dropped', {
-      channelType: event.channelType,
-      platformId: event.platformId,
-    });
-    return true;
-  }
   // Straight to the chat's adapter, never through a session: the agent must not hold the call link.
   const say = (text: string) => adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
   try {

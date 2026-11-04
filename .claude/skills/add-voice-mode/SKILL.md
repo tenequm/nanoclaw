@@ -46,6 +46,7 @@ these files is safe. Preserve agent vocabulary and local configuration.
 ```nc:copy from-branch:main
 src/channels/voice-mode-adapter.test.ts
 src/channels/voice-mode-call-session.test.ts
+src/channels/voice-mode-chat.ts
 src/channels/voice-mode-command.test.ts
 src/channels/voice-mode-command.ts
 src/channels/voice-mode-line-roles.test.ts
