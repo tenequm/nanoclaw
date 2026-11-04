@@ -118,6 +118,11 @@ describe('a named question', () => {
     expect(vocativeOf('Ден, котра година?', ['Dan', 'Ден'])).toEqual({ vocative: true, rest: 'котра година' });
     expect(vocativeOf('Hey Dan! Stop.', ['Dan'])).toEqual({ vocative: true, rest: 'stop' });
     expect(vocativeOf("Dan's result was wrong", ['Dan']).vocative).toBe(false);
+    expect(vocativeOf('Ден, можеш відповісти?', ['Dan'])).toEqual({ vocative: true, rest: 'можеш відповісти' });
+    expect(vocativeOf('Дене, ти тут?', ['Dan'])).toEqual({ vocative: true, rest: 'ти тут' });
+    expect(vocativeOf('Яка погода, Ден?', ['Dan'])).toEqual({ vocative: true, rest: 'яка погода' });
+    expect(vocativeOf('Денис, ти тут?', ['Dan']).vocative).toBe(false);
+    expect(vocativeOf('Я сказав Дену, що все добре.', ['Dan']).vocative).toBe(false);
     expect(vocativeOf('I told Dan to stop', ['Dan']).vocative).toBe(false);
     expect(vocativeOf('Danny, hi', ['Dan']).vocative).toBe(false);
   });

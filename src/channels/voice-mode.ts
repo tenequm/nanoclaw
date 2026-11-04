@@ -49,6 +49,7 @@ import {
   LIVEKIT_PROTOCOL_VERSION,
   settleWithin,
   wakePhrase,
+  wakePhraseName,
   parseVoiceLanguages,
 } from './voice-mode-protocol.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
@@ -843,6 +844,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       livekit: {
         url: env.LIVEKIT_URL,
         languages: parseVoiceLanguages(env.VOICE_MODE_LANGUAGES),
+        wakeName: wakePhraseName(env) ?? undefined,
         serverUrl: env.LIVEKIT_WORKER_URL,
         apiKey: env.LIVEKIT_API_KEY,
         apiSecret: env.LIVEKIT_API_SECRET,

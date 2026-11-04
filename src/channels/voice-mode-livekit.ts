@@ -223,6 +223,8 @@ export interface SpeechSettings {
 }
 
 export interface LiveKitVoiceConfig {
+  /** The wake phrase's name (wakePhraseName): what a jev call's people call the agent, over the line's agent name. */
+  wakeName?: string;
   /** VOICE_MODE_LANGUAGES as parseVoiceLanguages read it; DEFAULT_VOICE_LANGUAGES when unset. */
   languages?: readonly string[];
   /** Signaling URL the caller's browser connects to (LIVEKIT_URL). */
@@ -1229,8 +1231,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       {
         callId: call.callId,
         callerName: call.line.caller.name,
-        agentName: call.line.agent.name,
-        agentAliases: call.line.agent.wakeNames ?? [],
+        agentName: config.wakeName ?? call.line.agent.name,
+        agentAliases: [call.line.agent.name, ...(call.line.agent.wakeNames ?? [])].filter(
+          (name) => name !== (config.wakeName ?? call.line.agent.name),
+        ),
         maxTextBytes: MAX_UTTERANCE_TEXT_BYTES,
         submitTurn: (message, note, signal) => submitTurn(call, message, note, signal),
         push: (event) => {
