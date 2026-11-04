@@ -36,6 +36,7 @@ import {
   registerPostDeliveryHook,
   setDeliveryAdapter,
 } from './delivery.js';
+import * as typing from './modules/typing/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -81,16 +82,6 @@ function insertOperation(agentGroupId: string, sessionId: string, msgId: string,
   db.close();
 }
 
-function setLiveStatus(agentGroupId: string, sessionId: string, text: string, updatedAt: string): void {
-  const db = new Database(outboundDbPath(agentGroupId, sessionId));
-  db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
-    'live_status',
-    text,
-    updatedAt,
-  );
-  db.close();
-}
-
 function setContainerTurn(agentGroupId: string, sessionId: string, turn: string, updatedAt: string): void {
   const db = new Database(outboundDbPath(agentGroupId, sessionId));
   db.prepare(
@@ -114,6 +105,67 @@ afterEach(async () => {
 });
 
 describe('deliverSessionMessages — concurrent invocations', () => {
+  it('forwards a not-reported turn (no container_state row) as null', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    setDeliveryAdapter({
+      async deliver() {
+        return undefined;
+      },
+    });
+
+    const spy = vi.spyOn(typing, 'notePresence');
+    try {
+      await deliverSessionMessages(session);
+      expect(spy).toHaveBeenCalledWith(session.id, { turn: null, updatedAtMs: null });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+  it('a turn report that fails to parse reads as not reported and never blocks delivery', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    setContainerTurn('ag-1', session.id, 'resting', new Date().toISOString());
+    insertOutbound('ag-1', session.id, 'out-1');
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        calls.push(content);
+        return 'plat-msg-1';
+      },
+    });
+
+    const spy = vi.spyOn(typing, 'notePresence');
+    try {
+      await deliverSessionMessages(session);
+      expect(calls).toHaveLength(1);
+      expect(spy).toHaveBeenCalledWith(session.id, { turn: null, updatedAtMs: null });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+  it('reads the runner turn report on the poll and forwards it to the typing module', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const updatedAt = new Date().toISOString();
+    setContainerTurn('ag-1', session.id, 'working', updatedAt);
+    setDeliveryAdapter({
+      async deliver() {
+        return undefined;
+      },
+    });
+
+    const spy = vi.spyOn(typing, 'notePresence');
+    try {
+      await deliverSessionMessages(session);
+      expect(spy).toHaveBeenCalledWith(session.id, {
+        turn: 'working',
+        updatedAtMs: Date.parse(updatedAt),
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
   it('logs mailbox failures with session context and retries on the next poll', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');

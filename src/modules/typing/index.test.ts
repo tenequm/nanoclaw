@@ -9,14 +9,35 @@
  */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 
+vi.mock('../../log.js', () => ({
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
 });
 
-import { setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';
+import fs from 'fs';
+import path from 'path';
 
-type Call = { channelType: string; platformId: string; threadId: string | null; instance?: string };
+import { heartbeatPath } from '../../session-manager.js';
+import {
+  notePresence,
+  pauseTypingRefreshAfterDelivery,
+  setTypingAdapter,
+  startTypingRefresh,
+  stopTypingRefresh,
+} from './index.js';
+
+type Call = {
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  instance?: string;
+  status?: string;
+  statusKind?: 'auto' | 'agent';
+};
 
 function captureAdapter() {
   const calls: Call[] = [];
@@ -28,12 +49,39 @@ function captureAdapter() {
   return calls;
 }
 
+/** Adapter that records both set and clear calls. */
+function captureSetAndClear() {
+  const sets: Call[] = [];
+  const clears: Call[] = [];
+  setTypingAdapter({
+    async setTyping(channelType, platformId, threadId, instance, status, statusKind) {
+      sets.push({ channelType, platformId, threadId, instance, status, statusKind });
+    },
+    async clearTyping(channelType, platformId, threadId, instance) {
+      clears.push({ channelType, platformId, threadId, instance });
+    },
+  });
+  return { sets, clears };
+}
+
+/** Write a heartbeat file with an mtime at the current (fake) clock. */
+function touchHeartbeat(agentGroupId: string, sessionId: string): void {
+  const hbPath = heartbeatPath(agentGroupId, sessionId);
+  fs.mkdirSync(path.dirname(hbPath), { recursive: true });
+  fs.writeFileSync(hbPath, '');
+  const seconds = Date.now() / 1000;
+  fs.utimesSync(hbPath, seconds, seconds);
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
 });
 
 afterEach(() => {
   stopTypingRefresh('sess-1');
+  stopTypingRefresh('sess-turn');
+  if (fs.existsSync('/tmp/nanoclaw-test-typing'))
+    fs.rmSync('/tmp/nanoclaw-test-typing', { recursive: true, force: true });
   vi.useRealTimers();
 });
 
@@ -119,5 +167,379 @@ describe('startTypingRefresh — instance forwarding', () => {
         instance: 'telegram',
       });
     }
+  });
+});
+
+describe('typing follows the runner turn state', () => {
+  const SESS = 'sess-turn';
+  const AG = 'ag-turn';
+
+  /** Advance past the 15s grace, keeping a working report live throughout. */
+  async function advancePastGraceWorking(): Promise<void> {
+    for (let elapsed = 0; elapsed < 20_000; elapsed += 4_000) {
+      notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+  }
+
+  it('quiet turn: an idle report with no delivery stops the refresh and clears exactly once', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    await advancePastGraceWorking();
+    const setsWhileWorking = sets.length;
+    expect(setsWhileWorking).toBeGreaterThan(1); // still refreshing past grace
+
+    // Turn ends without delivering anything.
+    notePresence(SESS, { turn: 'idle', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    expect(clears).toHaveLength(1);
+    expect(clears[0]).toEqual({ channelType: 'slack', platformId: 'C1', threadId: 'T1', instance: 'slack-inst' });
+
+    // No more refreshes and no second clear once the refresher has ended.
+    const setsAfterEnd = sets.length;
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(sets.length).toBe(setsAfterEnd);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('multi-message turn: two deliveries pause and resume, then a single clear at idle', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+    await advancePastGraceWorking();
+
+    // First delivery pauses the refresh; ticks inside the pause skip setTyping.
+    pauseTypingRefreshAfterDelivery(SESS);
+    let before = sets.length;
+    notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(8_000); // inside the 10s pause
+    expect(sets.length).toBe(before); // no refresh while paused
+
+    // Pause expires; a live working report resumes refreshing.
+    notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(sets.length).toBeGreaterThan(before);
+
+    // Second delivery pauses again.
+    pauseTypingRefreshAfterDelivery(SESS);
+    before = sets.length;
+    notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(sets.length).toBe(before);
+    notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(sets.length).toBeGreaterThan(before);
+
+    // Turn ends: exactly one clear across the whole turn.
+    notePresence(SESS, { turn: 'idle', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('dead runner: a working report that stops advancing clears after it goes stale', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+    await advancePastGraceWorking();
+
+    // The runner dies: the last working report stops advancing. It stays live
+    // for TURN_STALE_MS, then the next tick ends the refresh.
+    const setsBeforeDeath = sets.length;
+    notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    // Under the stale window: still refreshing.
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(sets.length).toBeGreaterThan(setsBeforeDeath);
+    expect(clears).toHaveLength(0);
+
+    // Past the 15s stale window with no new report: clear once.
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(clears).toHaveLength(1);
+    const setsAtClear = sets.length;
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(sets.length).toBe(setsAtClear);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('old runner: with no turn ever reported, the heartbeat file still gates the refresh', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Never call notePresence. Past grace, a fresh heartbeat keeps typing on.
+    for (let elapsed = 0; elapsed < 20_000; elapsed += 4_000) {
+      touchHeartbeat(AG, SESS);
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    const setsWhileFresh = sets.length;
+    expect(setsWhileFresh).toBeGreaterThan(1);
+    expect(clears).toHaveLength(0);
+
+    // Heartbeat goes stale (no more touches): the refresh ends.
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(clears).toHaveLength(1);
+    const setsAtEnd = sets.length;
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(sets.length).toBe(setsAtEnd);
+  });
+
+  it('stopTypingRefresh clears the indicator once', async () => {
+    const { clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    stopTypingRefresh(SESS);
+    expect(clears).toHaveLength(1);
+    // A second stop finds no refresher — no double clear.
+    stopTypingRefresh(SESS);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('notePresence with no active refresher creates none', async () => {
+    const { sets } = captureSetAndClear();
+    notePresence('sess-never', { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(sets).toHaveLength(0);
+  });
+});
+
+describe('typing guards', () => {
+  const SESS = 'sess-turn';
+  const AG = 'ag-turn';
+
+  it('ceiling: a working report that never changes stops typing after five minutes', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The runner keeps re-marking `working` with fresh stamps — a stuck turn
+    // looks exactly like a long one. Hold it for 5 minutes.
+    for (let elapsed = 0; elapsed < 300_000; elapsed += 4_000) {
+      notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(clears).toHaveLength(1);
+
+    // Still working, still fresh: no more painting.
+    const setsAtCap = sets.length;
+    for (let elapsed = 0; elapsed < 40_000; elapsed += 4_000) {
+      notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(sets.length).toBe(setsAtCap);
+    expect(clears).toHaveLength(1);
+
+    // A new inbound is a new wake: typing resumes.
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sets.length).toBe(setsAtCap + 1);
+  });
+
+  it("stale idle: a previous run's idle report does not end the first turn's typing", async () => {
+    const { sets, clears } = captureSetAndClear();
+    // The last run left `idle` in its container record a minute ago.
+    const leftoverIdle = { turn: 'idle' as const, updatedAtMs: Date.now() - 60_000 };
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Slow cold start: past grace the runner has not reported this wake, and
+    // the heartbeat file was removed at spawn. The leftover must read as
+    // "not yet reported", not end the refresh.
+    for (let elapsed = 0; elapsed < 24_000; elapsed += 4_000) {
+      notePresence(SESS, leftoverIdle);
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(clears).toHaveLength(0);
+    const setsBeforeTurn = sets.length;
+
+    // The runner's first report of this wake takes over.
+    notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(sets.length).toBeGreaterThan(setsBeforeTurn);
+    notePresence(SESS, { turn: 'idle', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('stale idle: a runner that never reports this wake stops typing after the leftover budget', async () => {
+    const { clears } = captureSetAndClear();
+    const leftoverIdle = { turn: 'idle' as const, updatedAtMs: Date.now() - 60_000 };
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    await vi.advanceTimersByTimeAsync(0);
+
+    for (let elapsed = 0; elapsed < 56_000; elapsed += 4_000) {
+      notePresence(SESS, leftoverIdle);
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(clears).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('ceiling: a delivered reply restarts the ceiling clock', async () => {
+    const { clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
+    const holdWorking = async (ms: number) => {
+      for (let elapsed = 0; elapsed < ms; elapsed += 4_000) {
+        notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+        await vi.advanceTimersByTimeAsync(4_000);
+      }
+    };
+    await holdWorking(240_000);
+    pauseTypingRefreshAfterDelivery(SESS);
+    await holdWorking(240_000);
+    expect(clears).toHaveLength(0);
+    await holdWorking(64_000);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('ceiling: a new turn after the cap repaints a status but never re-adds the ack', async () => {
+    const { statuses, reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh(SESS, AG, 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+    for (let elapsed = 0; elapsed < 300_000; elapsed += 4_000) {
+      notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(reactions.map((r) => r.op)).toEqual(['add', 'remove']);
+
+    // The turn ends and another starts before a tick sees the idle.
+    notePresence(SESS, { turn: 'idle', updatedAtMs: Date.now() });
+    notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(reactions.map((r) => r.op)).toEqual(['add', 'remove']);
+    expect(statuses).toEqual([]);
+  });
+});
+
+/**
+ * The two renderings of the "agent is working" signal, and the teardown
+ * that takes each of them down.
+ *
+ * Slack's assistant status is thread-scoped and persistent: it paints only
+ * inside a thread and clears only when the app next posts. So a turn that
+ * ends without a user-facing reply — mention-sticky wakes the agent on
+ * plenty of messages it reasonably won't answer — leaves a stale indicator
+ * until the platform's own two-minute timeout, and a threadless (shared-
+ * session) chat can never show one at all. Hence the explicit clear on
+ * every teardown path, and the reaction-ack fallback.
+ */
+type Reaction = { op: 'add' | 'remove'; platformId: string; messageId: string; emoji: string; instance?: string };
+
+function signalAdapter(opts: { requiresThread?: boolean } = {}) {
+  const statuses: Array<string | undefined> = [];
+  const clears: Array<{ platformId: string; threadId: string | null }> = [];
+  const reactions: Reaction[] = [];
+  setTypingAdapter({
+    async setTyping(_channelType, _platformId, _threadId, _instance, status) {
+      statuses.push(status);
+    },
+    async clearTyping(_channelType, platformId, threadId) {
+      clears.push({ platformId, threadId });
+    },
+    async addReaction(_channelType, platformId, messageId, emoji, instance) {
+      reactions.push({ op: 'add', platformId, messageId, emoji, instance });
+    },
+    async removeReaction(_channelType, platformId, messageId, emoji, instance) {
+      reactions.push({ op: 'remove', platformId, messageId, emoji, instance });
+    },
+    typingRequiresThread: () => opts.requiresThread === true,
+  });
+  return { statuses, clears, reactions };
+}
+
+describe('reaction-ack rendering (threadless chat on a thread-only platform)', () => {
+  it('acks the triggering message instead of painting a status', async () => {
+    const { statuses, reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(statuses).toEqual([]);
+    expect(reactions).toEqual([
+      { op: 'add', platformId: 'slack:D1', messageId: 'msg-1', emoji: 'eyes', instance: 'slack-emma' },
+    ]);
+  });
+
+  it('acks once, not on every refresh tick', async () => {
+    const { reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+
+    // Several ticks inside the grace window: a reaction does not expire,
+    // so re-adding it every 4s would be pure API noise.
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(reactions.filter((r) => r.op === 'add')).toHaveLength(1);
+  });
+
+  it('removes the ack when the reply is delivered', async () => {
+    const { reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    pauseTypingRefreshAfterDelivery('sess-1');
+    expect(reactions[reactions.length - 1]).toEqual({
+      op: 'remove',
+      platformId: 'slack:D1',
+      messageId: 'msg-1',
+      emoji: 'eyes',
+      instance: 'slack-emma',
+    });
+    // Already removed — going idle later must not fire a second remove.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(reactions.filter((r) => r.op === 'remove')).toHaveLength(1);
+  });
+
+  it('removes the ack when the turn ends with no reply', async () => {
+    const { reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(reactions.map((r) => r.op)).toEqual(['add', 'remove']);
+  });
+
+  it('moves the ack to the message that re-triggered the session', async () => {
+    const { reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-2');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toEqual([
+      { op: 'add', platformId: 'slack:D1', messageId: 'msg-1', emoji: 'eyes', instance: 'slack-emma' },
+      { op: 'remove', platformId: 'slack:D1', messageId: 'msg-1', emoji: 'eyes', instance: 'slack-emma' },
+      { op: 'add', platformId: 'slack:D1', messageId: 'msg-2', emoji: 'eyes', instance: 'slack-emma' },
+    ]);
+  });
+
+  it('falls back to the status rendering once the chat has a thread', async () => {
+    const { statuses, reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'slack:C1:1', 'slack-tester', 'msg-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toEqual([]);
+    expect(statuses).toEqual([undefined]);
+  });
+});
+
+describe('failure reporting', () => {
+  it('logs a failed ack instead of swallowing it, and never throws', async () => {
+    const { log } = (await import('../../log.js')) as unknown as { log: { warn: ReturnType<typeof vi.fn> } };
+    log.warn.mockClear();
+    setTypingAdapter({
+      addReaction: async () => {
+        throw new Error('message_not_found');
+      },
+      typingRequiresThread: () => true,
+    });
+
+    // The signal is decoration: a broken reaction must not reach routing.
+    expect(() => startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:D1', null, 'slack-emma', 'msg-1')).not.toThrow();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(log.warn).toHaveBeenCalledWith(
+      'activity signal failed',
+      expect.objectContaining({ op: 'addReaction', messageId: 'msg-1', err: 'Error: message_not_found' }),
+    );
   });
 });

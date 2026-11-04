@@ -11,6 +11,7 @@ import { CardTooLongError } from './ask-question.js';
 import {
   attachmentBytesToBase64,
   CARD_TEXT_BLOCK_LENGTH,
+  normalizeStatusText,
   createChatSdkBridge,
   splitCardText,
   splitForLimit,
@@ -39,6 +40,75 @@ function makePostCapture() {
 }
 
 describe('splitForLimit', () => {
+  it('setTyping passes a status line to startTyping, normalized to one trimmed line', async () => {
+    const typingCalls: Array<{ threadId: string; status?: string }> = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        startTyping: async (threadId: string, status?: string) => {
+          typingCalls.push({ threadId, status });
+        },
+      }),
+      supportsThreads: true,
+    });
+    await bridge.setTyping!('C123', 'C123:1700000000.000100');
+    await bridge.setTyping!('C123', 'C123:1700000000.000100', '  Reading\nthe   thread  ', 'agent');
+    await bridge.setTyping!('C123', 'C123:1700000000.000100', '   ');
+    expect(typingCalls).toEqual([
+      { threadId: 'C123:1700000000.000100', status: undefined },
+      { threadId: 'C123:1700000000.000100', status: 'Reading the thread' },
+      { threadId: 'C123:1700000000.000100', status: undefined },
+    ]);
+  });
+
+  it('normalizeStatusText caps an over-long line', () => {
+    const long = 'x'.repeat(500);
+    const out = normalizeStatusText(long);
+    expect(out.length).toBe(200);
+    expect(out.endsWith('...')).toBe(true);
+    expect(normalizeStatusText('short line')).toBe('short line');
+  });
+
+  it('clearTyping clears a Slack-shaped assistant status with an empty string', async () => {
+    const statusCalls: Array<{ channelId: string; threadTs: string; status: string }> = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        decodeThreadId: (threadId: string) => {
+          const [channel, threadTs] = threadId.split(':');
+          return { channel, threadTs };
+        },
+        setAssistantStatus: async (channelId: string, threadTs: string, status: string) => {
+          statusCalls.push({ channelId, threadTs, status });
+        },
+      } as unknown as Partial<Adapter>),
+      supportsThreads: true,
+    });
+    await bridge.clearTyping!('C123', 'C123:1700000000.000100');
+    expect(statusCalls).toEqual([{ channelId: 'C123', threadTs: '1700000000.000100', status: '' }]);
+  });
+
+  it('clearTyping is a no-op when the adapter cannot clear (no setAssistantStatus)', async () => {
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({}),
+      supportsThreads: true,
+    });
+    // No throw, nothing to assert beyond "does not reject".
+    await expect(bridge.clearTyping!('C123', 'thread-1')).resolves.toBeUndefined();
+  });
+
+  it('clearTyping is a no-op when the decoded thread has no threadTs', async () => {
+    const statusCalls: string[] = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        decodeThreadId: (_threadId: string) => ({ channel: 'C123' }),
+        setAssistantStatus: async (_channelId: string, _threadTs: string, _status: string) => {
+          statusCalls.push('called');
+        },
+      } as unknown as Partial<Adapter>),
+      supportsThreads: true,
+    });
+    await bridge.clearTyping!('C123', 'C123');
+    expect(statusCalls).toHaveLength(0);
+  });
   it('returns a single chunk when text fits', () => {
     expect(splitForLimit('short text', 100)).toEqual(['short text']);
   });
@@ -1132,5 +1202,49 @@ describe('createChatSdkBridge — local Gateway webhook', () => {
     } finally {
       await bridge.teardown();
     }
+  });
+});
+
+describe('createChatSdkBridge — typing and reaction primitives', () => {
+  function typingCapture() {
+    const typing: Array<{ threadId: string; status?: string }> = [];
+    const reactions: Array<{ op: string; threadId: string; messageId: string; emoji: string }> = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        startTyping: async (threadId: string, status?: string) => {
+          typing.push({ threadId, status });
+        },
+        addReaction: async (threadId: string, messageId: string, emoji: string) => {
+          reactions.push({ op: 'add', threadId, messageId, emoji });
+        },
+        removeReaction: async (threadId: string, messageId: string, emoji: string) => {
+          reactions.push({ op: 'remove', threadId, messageId, emoji });
+        },
+      }),
+      supportsThreads: true,
+    });
+    return { bridge, typing, reactions };
+  }
+
+  it('forwards the status text through to the adapter', async () => {
+    const { bridge, typing } = typingCapture();
+    await bridge.setTyping!('slack:C1', 'slack:C1:171', 'is thinking...');
+    expect(typing).toEqual([{ threadId: 'slack:C1:171', status: 'is thinking...' }]);
+  });
+
+  it('addresses the channel itself when the session has no thread', async () => {
+    const { bridge, typing } = typingCapture();
+    await bridge.setTyping!('slack:D1', null);
+    expect(typing).toEqual([{ threadId: 'slack:D1', status: undefined }]);
+  });
+
+  it('passes reactions straight through, keyed on the channel not the thread', async () => {
+    const { bridge, reactions } = typingCapture();
+    await bridge.addReaction!('slack:D1', '1788.001', 'eyes');
+    await bridge.removeReaction!('slack:D1', '1788.001', 'eyes');
+    expect(reactions).toEqual([
+      { op: 'add', threadId: 'slack:D1', messageId: '1788.001', emoji: 'eyes' },
+      { op: 'remove', threadId: 'slack:D1', messageId: '1788.001', emoji: 'eyes' },
+    ]);
   });
 });

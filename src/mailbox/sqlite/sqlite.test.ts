@@ -11,6 +11,49 @@ describe('SQLite mailbox canonical serialization', () => {
     for (const database of databases.splice(0)) database.close();
   });
 
+  it('returns null when the row was never written', () => {
+    const outboundDb = new Database(':memory:');
+    databases.push(outboundDb);
+    outboundDb.exec(OUTBOUND_SCHEMA);
+    const outbound = wrapSqliteOutbound(
+      () => outboundDb,
+      () => outboundDb,
+      () => 2,
+    );
+    expect(outbound.getContainerState()).toBeNull();
+  });
+  it('reads a container_state row written before the turn column existed', () => {
+    // An outbound.db owned by an older runner: the table predates `turn` and
+    // that runner will never add the column. The host read must still work.
+    const outboundDb = new Database(':memory:');
+    databases.push(outboundDb);
+    outboundDb.exec(`
+      CREATE TABLE container_state (
+        id                       INTEGER PRIMARY KEY CHECK (id = 1),
+        current_tool             TEXT,
+        tool_declared_timeout_ms INTEGER,
+        tool_started_at          TEXT,
+        updated_at               TEXT NOT NULL
+      );
+    `);
+    outboundDb
+      .prepare(
+        'INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at, updated_at) VALUES (1, ?, ?, ?, ?)',
+      )
+      .run('Bash', null, '2026-01-01 00:00:00', '2026-01-01 00:00:01');
+    const outbound = wrapSqliteOutbound(
+      () => outboundDb,
+      () => outboundDb,
+      () => 2,
+    );
+    expect(outbound.getContainerState()).toEqual({
+      currentTool: 'Bash',
+      toolDeclaredTimeoutMs: null,
+      toolStartedAt: '2026-01-01T00:00:00.000Z',
+      turn: null,
+      updatedAt: '2026-01-01T00:00:01.000Z',
+    });
+  });
   it('round-trips full lifecycle records through the SQLite adapter', async () => {
     const inboundDb = new Database(':memory:');
     const outboundDb = new Database(':memory:');
@@ -104,6 +147,8 @@ describe('SQLite mailbox canonical serialization', () => {
       currentTool: 'Bash',
       toolDeclaredTimeoutMs: 30_000,
       toolStartedAt: '2026-01-01T00:00:00.000Z',
+      turn: null,
+      updatedAt: '2026-01-01T00:00:01.000Z',
     });
 
     await outbound.writeDirect({
