@@ -332,7 +332,9 @@ line's daily minutes and ends when everyone left the meeting (Recall's bot
 leaves, the page with it), on `/meet leave`, or when a call on the line's link
 replaces it. A meeting records nothing here, whatever the recording settings
 say, and the bot keeps no recording (`video_mixed_mp4: null`) and runs with
-Zero Data Retention (`retention: null`): Recall keeps nothing of the meeting.
+Zero Data Retention (`retention: null`): Recall stores no recording of the
+meeting (its API metadata, such as the bot and participant records, is outside
+that). Each participant's speech is transcribed on this host.
 
 Verify one real call after both processes start: wake, send, manual draft,
 discard, reply, captions, mute, reconnect and hangup. This skill's tests use

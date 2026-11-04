@@ -448,8 +448,8 @@ export function meetCommandReply(outcome: MeetOutcome, cmd = '/meet'): string | 
         `\u{1F4DE} ${outcome.agentName} is asking to join ${outcome.url}. ` +
         `Admit "${outcome.agentName}" from the meeting's lobby; ` +
         (outcome.jev
-          ? `it answers when someone addresses it by name or invites it and nobody else takes it up. Each ` +
-            `participant's speech is transcribed on this host, and Recall keeps nothing of the meeting. `
+          ? `it answers when someone addresses it by name or invites it and nobody else takes it up. Recall ` +
+            `stores no recording of the meeting; each participant's speech is transcribed on this host. `
           : `it answers when someone says its wake phrase, and a turn ends on a send word` +
             `${outcome.pauseSends ? ' or a pause' : ''}. `) +
         `What it is asked and its answers show here. ${cmd} leave sends it away.`

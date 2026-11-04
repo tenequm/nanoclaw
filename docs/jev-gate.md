@@ -75,11 +75,13 @@ A `/meet` meeting started with `jev` does not use this gate's rubric. It runs
 the meet-jev loop (`src/modules/meet-jev/`), the same one as `/voice jev`:
 Recall.ai streams each participant's own audio to the host over a websocket at
 `/voice/recall/<callId>/?token=...` (`ingress/recall.ts`, Zero Data Retention:
-Recall keeps nothing), the host runs a Silero VAD and a Gemini Live
-transcription per participant (`ingress/recall-audio.ts`, the call's languages
-and vocabulary, as the worker does for `/voice jev`), and one Jev Choice per
+Recall stores no recording of the meeting, only API metadata), the host runs
+a Silero VAD and a Gemini Live transcription per participant
+(`ingress/recall-audio.ts`, the call's languages and vocabulary, as the worker does for `/voice jev`), and one Jev Choice per
 speaker boundary decides whether the agent answers, stays silent, stops or
 continues. The gate's entries, thresholds and levers do not apply there.
+The bot is left out by its display name (Recall flags no participant as the
+bot), so a person who joins under that name is left out too, with a warning logged.
 
 
 ## Kill switch

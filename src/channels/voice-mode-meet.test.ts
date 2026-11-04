@@ -236,8 +236,9 @@ describe('runMeetCommand', () => {
       'it answers when someone addresses it by name or invites it and nobody else takes it up.',
     );
     expect(jevReply).toContain(
-      "Each participant's speech is transcribed on this host, and Recall keeps nothing of the meeting.",
+      "Recall stores no recording of the meeting; each participant's speech is transcribed on this host.",
     );
+    expect(jevReply).not.toContain('keeps nothing');
     expect(jevReply).not.toContain('wake phrase');
     expect(jevReply).not.toContain('send word');
     expect(meetCommandReply(paused)).not.toContain('transcript');
