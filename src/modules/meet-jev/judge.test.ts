@@ -35,6 +35,8 @@ const state: JevState = {
     pending_answer: false,
     cut_off_after: null,
     agent_last_spoke_s_ago: null,
+    last_reply_to: null,
+    in_exchange_with: null,
     addressed_by_name: true,
   },
 };

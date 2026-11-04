@@ -116,6 +116,8 @@ export interface CallState {
   stoppedSeq: number | null;
   cutOffAfter: string | null;
   agentLastSpokeAt: number | null;
+  lastReplyTo: { speakerId: string; at: number } | null;
+  exchangeSpeakerId: string | null;
   judging: Judging | null;
   /** The answer-ready check in flight: one at a time, the latest wake's. */
   recheck: Recheck | null;
@@ -144,6 +146,8 @@ export function initial(policy: CallPolicy, at: number): CallState {
     stoppedSeq: null,
     cutOffAfter: null,
     agentLastSpokeAt: null,
+    lastReplyTo: null,
+    exchangeSpeakerId: null,
     judging: null,
     deferred: null,
     recheck: null,
@@ -203,6 +207,14 @@ export function applyWindow(state: CallState, event: CallEvent): void {
       const speaker = touchSpeaker(state, event.speaker.id, event.speaker.name);
       speaker.lastHeardAt = event.at;
       const text = event.text.trim();
+      if (
+        event.final &&
+        hasWords(text) &&
+        state.lastReplyTo !== null &&
+        event.at >= state.lastReplyTo.at &&
+        event.speaker.id !== state.exchangeSpeakerId
+      )
+        state.exchangeSpeakerId = null;
       const utt = state.utterances.find((u) => u.speakerId === event.speaker.id && u.uttId === event.uttId);
       if (utt) {
         // A late final updates its own line; it never makes an older utterance the current one again.
@@ -261,11 +273,17 @@ export function applyWindow(state: CallState, event: CallEvent): void {
       else state.agentLines.push({ replyId: event.replyId, text: delivered, state: 'done', at: event.at });
       state.agentLastSpokeAt = event.at;
       state.cutOffAfter = event.state === 'cut_off' ? delivered : null;
+      const wake = state.wakes.find((w) => w.key === playing.wakeKey);
+      if (wake) {
+        state.lastReplyTo = { speakerId: wake.speakerId, at: event.at };
+        state.exchangeSpeakerId = wake.speakerId;
+      }
       break;
     }
     default:
       break;
   }
+  if (state.lastReplyTo !== null && state.now - state.lastReplyTo.at > 60_000) state.exchangeSpeakerId = null;
   trim(state);
   refreshVersion(state);
 }
@@ -381,6 +399,17 @@ export function toJevState(state: CallState, latest: JevState['latest'] = null, 
       pending_answer: pendingAnswer(state),
       cut_off_after: state.cutOffAfter,
       agent_last_spoke_s_ago: state.agentLastSpokeAt === null ? null : secondsAgo(state, state.agentLastSpokeAt),
+      last_reply_to:
+        state.lastReplyTo === null
+          ? null
+          : {
+              speaker: state.speakers[state.lastReplyTo.speakerId]?.name ?? state.lastReplyTo.speakerId,
+              s_ago: secondsAgo(state, state.lastReplyTo.at),
+            },
+      in_exchange_with:
+        state.exchangeSpeakerId === null
+          ? null
+          : (state.speakers[state.exchangeSpeakerId]?.name ?? state.exchangeSpeakerId),
       addressed_by_name: addressedByName,
     },
   };
@@ -397,7 +426,11 @@ function fingerprint(state: CallState): string {
     roster: state.roster,
     participants: jev.participants,
     window: jev.window.map(({ t: _t, partial: _p, ...line }) => ({ ...line, text: comparable(line.text) })),
-    facts: { ...jev.facts, agent_last_spoke_s_ago: null },
+    facts: {
+      ...jev.facts,
+      agent_last_spoke_s_ago: null,
+      last_reply_to: jev.facts.last_reply_to === null ? null : { ...jev.facts.last_reply_to, s_ago: null },
+    },
   });
 }
 

@@ -6,7 +6,7 @@ export function policyFor(kind: CallKind, agentName: string, agentAliases: strin
   const paragraph =
     kind === 'voice'
       ? oneCaller
-      : `${agentName} is an AI assistant in a live meeting with several people. ${agentName} speaks only when someone addresses it by name or invites it to answer, and nobody else is taking it up; otherwise it stays silent.`;
+      : `${agentName} is an AI assistant in a live meeting with several people. ${agentName} speaks only when someone addresses it by name or invites it to answer, and nobody else is taking it up; otherwise it stays silent. A finished question from the person in \`facts.in_exchange_with\` is usually a follow-up to ${agentName}, even without the name.`;
   return {
     kind,
     agentName,

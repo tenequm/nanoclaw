@@ -131,6 +131,8 @@ export interface JevState {
     /** What the agent had said when it was last cut off, while that is the latest thing it did. */
     cut_off_after: string | null;
     agent_last_spoke_s_ago: number | null;
+    last_reply_to: { speaker: string; s_ago: number } | null;
+    in_exchange_with: string | null;
     /** `latest` opens or ends with the agent's name as a vocative ("Dan, ...", "..., Dan?"): addressed, not proof a reply is wanted. */
     addressed_by_name: boolean;
   };
