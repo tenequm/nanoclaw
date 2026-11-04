@@ -11,19 +11,20 @@ Privilege is **user-level**, persisted in the `user_roles` table (owner /
 admin, global or scoped to an agent group) plus `agent_group_members` (the
 unprivileged access gate).
 
-| Entity | Trust Level | Rationale |
-|--------|-------------|-----------|
-| Owners / admins (`user_roles`) | Trusted | Hold owner/admin roles; gate admin commands and approve credentialed actions |
+| Entity                                | Trust Level  | Rationale                                                                                |
+| ------------------------------------- | ------------ | ---------------------------------------------------------------------------------------- |
+| Owners / admins (`user_roles`)        | Trusted      | Hold owner/admin roles; gate admin commands and approve credentialed actions             |
 | Group members (`agent_group_members`) | Access-gated | Membership grants access to an agent group, but their messages are still untrusted input |
-| Unregistered senders | Untrusted | Subject to each messaging group's `unknown_sender_policy` |
-| Agent containers | Sandboxed | Long-lived per-session container; isolated by mounts, non-root, no host reach |
-| Incoming messages | User input | Potential prompt injection regardless of who sent them |
+| Unregistered senders                  | Untrusted    | Subject to each messaging group's `unknown_sender_policy`                                |
+| Agent containers                      | Sandboxed    | Long-lived per-session container; isolated by mounts, non-root, no host reach            |
+| Incoming messages                     | User input   | Potential prompt injection regardless of who sent them                                   |
 
 ## Security Boundaries
 
 ### 1. Container Isolation (Primary Boundary)
 
 Agents execute in containers (Docker), providing:
+
 - **Process isolation** — container processes cannot affect the host
 - **Filesystem isolation** — only explicitly mounted directories are visible
 - **Non-root execution** — runs as an unprivileged user (`node`, uid 1000, or the host uid remapped in)
@@ -37,16 +38,16 @@ permission checks, the attack surface is limited by what's mounted.
 `buildMounts` (`src/container-runner.ts`) composes a fixed set of mounts per
 spawn. For the default (Claude) provider these are:
 
-| Container path | Host source | Mode | Purpose |
-|---|---|---|---|
-| `/workspace` | `data/v2-sessions/<group>/<session>/` | RW | Session folder — `inbound.db`, `outbound.db`, `outbox/`, `.claude/` |
-| `/workspace/agent` | `groups/<folder>/` | RW | Agent working files, standing instructions, and shared memory tree |
-| `/workspace/agent/container.json` | group `container.json` | RO | Container config — readable, not writable |
-| `/workspace/agent/CLAUDE.md` | composed `CLAUDE.md` | RO | The complete project document, every instruction source inlined; regenerated every spawn |
-| `/home/node/.claude` | `data/v2-sessions/<group>/.claude-shared/` | RW | Claude state, settings, skill symlinks |
-| `/app/src` | `container/agent-runner/src/` | RO | Shared agent-runner source (same for all groups) |
-| `/app/skills` | `container/skills/` | RO | Shared container skills |
-| `/workspace/extra/<name>` | allowlisted host dir | RO (RW only if allowed) | Operator-configured additional mounts |
+| Container path                    | Host source                                | Mode                    | Purpose                                                                                  |
+| --------------------------------- | ------------------------------------------ | ----------------------- | ---------------------------------------------------------------------------------------- |
+| `/workspace`                      | `data/v2-sessions/<group>/<session>/`      | RW                      | Session folder — `inbound.db`, `outbound.db`, `outbox/`, `.claude/`                      |
+| `/workspace/agent`                | `groups/<folder>/`                         | RW                      | Agent working files, standing instructions, and shared memory tree                       |
+| `/workspace/agent/container.json` | group `container.json`                     | RO                      | Container config — readable, not writable                                                |
+| `/workspace/agent/CLAUDE.md`      | composed `CLAUDE.md`                       | RO                      | The complete project document, every instruction source inlined; regenerated every spawn |
+| `/home/node/.claude`              | `data/v2-sessions/<group>/.claude-shared/` | RW                      | Claude state, settings, skill symlinks                                                   |
+| `/app/src`                        | `container/agent-runner/src/`              | RO                      | Shared agent-runner source (same for all groups)                                         |
+| `/app/skills`                     | `container/skills/`                        | RO                      | Shared container skills                                                                  |
+| `/workspace/extra/<name>`         | allowlisted host dir                       | RO (RW only if allowed) | Operator-configured additional mounts                                                    |
 
 The config mounts (`container.json`, `CLAUDE.md`, `plugins/`) are
 **nested read-only mounts on top of the read-write group dir** — the agent can
@@ -82,6 +83,7 @@ that touches these trees should use `AnchoredDir`.
 **Additional-mount allowlist** — extra mounts from a group's container config
 are validated against an allowlist at `~/.config/nanoclaw/mount-allowlist.json`,
 which is:
+
 - Outside the project root
 - Never mounted into containers
 - Not modifiable by agents
@@ -101,6 +103,7 @@ Its schema:
 **Default blocked patterns** (merged with any in the file). They filter
 additional mounts only, and play no part in host file I/O inside the fixed
 mounts above:
+
 ```
 .ssh, .gnupg, .gpg, .aws, .azure, .gcloud, .kube, .docker,
 credentials, .env, .netrc, .npmrc, .pypirc, id_rsa, id_ed25519,
@@ -108,17 +111,19 @@ private_key, .secret
 ```
 
 **Enforcement** (`src/modules/mount-security/index.ts`):
+
 - **No allowlist file ⇒ every additional mount is blocked** — the fixed mounts above are unaffected, but nothing extra is granted until the operator creates the file.
 - Symlinks are resolved to their real path (`realpathSync`) before any check, defeating traversal via symlink.
 - The real path is rejected if it matches a blocked pattern, and rejected unless it sits under one of `allowedRoots`.
 - The container path is validated: relative, non-empty, no `..`, no leading `/`, no `:` (blocks Docker `-v` option injection). It is mounted under `/workspace/extra/`.
-- **Read-write is granted only when the mount requests it (`readonly: false`) *and* the matched root has `allowReadWrite: true`.** Otherwise the mount is forced read-only.
+- **Read-write is granted only when the mount requests it (`readonly: false`) _and_ the matched root has `allowReadWrite: true`.** Otherwise the mount is forced read-only.
 
 ### 3. Session Isolation
 
 Per-session state lives under `data/v2-sessions/<agent-group>/<session>/`
 (`inbound.db`, `outbound.db`, `outbox/`, `.claude/`). Claude state
 (`.claude-shared`) and the working folder are scoped to the agent group, so:
+
 - Different agent groups cannot see each other's conversation history or files.
 - A group's sessions share that group's memory but keep separate message DBs.
 
@@ -135,6 +140,7 @@ with none registered the host refuses to start, so there is no configuration in
 which agents run with no gateway at all.
 
 **How it works:**
+
 1. Credentials are registered once with the gateway, which stores and manages them.
 2. When NanoClaw spawns a session, the provider's `sessions.ensure` returns a
    typed contribution — env, mounts, a network intent — that routes the
@@ -156,7 +162,7 @@ can differ per group (e.g. your sales agent vs. support agent). Rate limits,
 time-bound access, and approval flows are gateway features; what each one
 supports is documented by its skill.
 
-**Human approval** is core's, not the gateway's. A gateway decides *when* to
+**Human approval** is core's, not the gateway's. A gateway decides _when_ to
 hold a request; `src/gateway-approval-coordinator.ts` then runs the same flow
 for every provider — validate, route to an approver from `user_roles`, persist
 the card, authorize the click, expire on deadline. Every failure path denies;
@@ -165,6 +171,7 @@ denied, running sessions stop, and session admission closes until a supervised
 reconnect proves the bridge is back.
 
 **Never on the container filesystem:**
+
 - The project root and `.env` — never mounted; the container only receives the paths in the mount table above.
 - The mount allowlist — external (`~/.config/nanoclaw/…`), never mounted.
 - Real credentials — injected per request by the gateway, never written into any mount.
@@ -178,7 +185,7 @@ install's `data/gateway-trust/` root so a private key cannot borrow the class.
 
 ### 5. Egress Lockdown (Forced Proxy)
 
-The `HTTPS_PROXY` env var only redirects *proxy-aware* clients — a tool that
+The `HTTPS_PROXY` env var only redirects _proxy-aware_ clients — a tool that
 ignores it (or a raw socket) could reach the internet directly and bypass
 credential injection, approvals, and audit. Egress lockdown closes that hole at
 the network layer.
@@ -187,7 +194,7 @@ the network layer.
 (`nanoclaw-egress`) that has **no route to the internet**. The selected
 gateway's runtime object is attached to that network under the endpoint alias
 its provider declared, so the injected proxy URL resolves to the gateway
-*container-to-container*. The gateway is therefore the **only reachable hop** —
+_container-to-container_. The gateway is therefore the **only reachable hop** —
 anything else has nowhere to go. The agent is non-root with no `NET_ADMIN`, so
 it cannot undo this. Identical mechanism on macOS and Linux (no host firewall,
 no `host-gateway` route).
@@ -222,11 +229,11 @@ not confined to the internal network.
 
 **Configuration:**
 
-| Env | Default | Meaning |
-| --- | --- | --- |
-| `NANOCLAW_EGRESS_LOCKDOWN` | `false` | Set `true` to opt in (otherwise the host-gateway path is used). |
-| `NANOCLAW_EGRESS_NETWORK` | `nanoclaw-egress` | Network name. |
-| `NANOCLAW_GATEWAY_PROVIDER` | *(none)* | Which installed gateway this copy runs. The container to attach and its alias come from that provider, not from an env var. |
+| Env                         | Default           | Meaning                                                                                                                     |
+| --------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `NANOCLAW_EGRESS_LOCKDOWN`  | `false`           | Set `true` to opt in (otherwise the host-gateway path is used).                                                             |
+| `NANOCLAW_EGRESS_NETWORK`   | `nanoclaw-egress` | Network name.                                                                                                               |
+| `NANOCLAW_GATEWAY_PROVIDER` | _(none)_          | Which installed gateway this copy runs. The container to attach and its alias come from that provider, not from an env var. |
 
 These variables are read from the **host process** environment (the service's
 environment / `.env`), not from inside the container. The agent container is
@@ -263,12 +270,12 @@ leaked key calls for re-minting the links, which re-sealing cannot revoke.
 Per-container CPU and memory caps are **opt-in and unset by default** — a runaway
 agent is not throttled unless the operator configures a limit:
 
-| Env | Default | Meaning |
-| --- | --- | --- |
-| `CONTAINER_CPU_LIMIT` | *(empty — unbounded)* | Passed to `--cpus` when set (e.g. `2`). |
-| `CONTAINER_MEMORY_LIMIT` | *(empty — unbounded)* | Passed to `--memory` when set (e.g. `8g`). |
+| Env                      | Default               | Meaning                                    |
+| ------------------------ | --------------------- | ------------------------------------------ |
+| `CONTAINER_CPU_LIMIT`    | _(empty — unbounded)_ | Passed to `--cpus` when set (e.g. `2`).    |
+| `CONTAINER_MEMORY_LIMIT` | _(empty — unbounded)_ | Passed to `--memory` when set (e.g. `8g`). |
 
-Only `--memory` is a container-level cap; whether it's a *hard* cap depends on
+Only `--memory` is a container-level cap; whether it's a _hard_ cap depends on
 the host having no swap (a deployment concern). On a swapless host a runaway is
 OOM-killed at the limit.
 
@@ -317,7 +324,8 @@ This should be rare. When a zero-day fix or critical dependency requires an imme
 2. The entry must pin the **exact version** being excluded — never a range or wildcard
    ```yaml
    minimumReleaseAgeExclude:
-     some-package: "1.2.3"  # Approved by @user, 2026-04-14 — CVE-XXXX-YYYY fix
+     # Approved by @user, 2026-04-14 - CVE-XXXX-YYYY fix
+     - 'some-package@1.2.3'
    ```
 3. The exclusion should be removed once the version ages past the threshold (i.e. after 3 days)
 4. Automated agents (Claude, CI bots) must never add exclusions without human sign-off
