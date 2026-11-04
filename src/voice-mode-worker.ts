@@ -5206,28 +5206,31 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     try {
       // The spotter counts the audio it was pushed, from now on; the turns count it from the call's start.
       spotterFrom = callTurns.position;
-      spotter = deps.wakeWord?.({
-        onDetect: (score, window) => {
-          const end = window.end + spotterFrom;
-          callLog.info('voice-mode worker: wake word spotted', {
-            score: Math.round(score * 1000) / 1000,
-            scoredMsAgo: Math.round(msOf(callTurns.position - end)),
-          });
-          callRecording?.wake({ streamMs: Math.round(msOf(end)), score: Math.round(score * 1000) / 1000 });
-          if (ending || review?.reviewing) return;
-          callTurns.onWake(end);
-        },
-        onError: (err) => {
-          callLog.warn(
-            'voice-mode worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn',
-            {
-              err,
+      // Jev judges the segments nobody addressed, and with a spotter nothing is transcribed until it fires.
+      spotter = wakeOfMeeting?.jev
+        ? undefined
+        : deps.wakeWord?.({
+            onDetect: (score, window) => {
+              const end = window.end + spotterFrom;
+              callLog.info('voice-mode worker: wake word spotted', {
+                score: Math.round(score * 1000) / 1000,
+                scoredMsAgo: Math.round(msOf(callTurns.position - end)),
+              });
+              callRecording?.wake({ streamMs: Math.round(msOf(end)), score: Math.round(score * 1000) / 1000 });
+              if (ending || review?.reviewing) return;
+              callTurns.onWake(end);
             },
-          );
-          wakeWord = undefined;
-          callTurns.useWakeWord(undefined);
-        },
-      });
+            onError: (err) => {
+              callLog.warn(
+                'voice-mode worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn',
+                {
+                  err,
+                },
+              );
+              wakeWord = undefined;
+              callTurns.useWakeWord(undefined);
+            },
+          });
     } catch (err) {
       callLog.warn('voice-mode worker: could not start the wake word spotter', { err });
     }

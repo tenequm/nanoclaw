@@ -6560,6 +6560,22 @@ describe('meeting calls', () => {
     }
   });
 
+  it('`jev` meetings run no wake word spotter, so unaddressed speech is transcribed; other meetings keep it', async () => {
+    for (const jev of [true, false]) {
+      const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: false, jev } });
+      room.remoteParticipants.clear();
+      room.remoteParticipants.set('meet-bridge-meet-r1', {});
+      const host = fakeHostFetch(200, 200);
+      const wakeWord = vi.fn();
+      const v = fakeVoice();
+      v.voice.review.serve = vi.fn();
+      await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord }));
+      expect(wakeWord).toHaveBeenCalledTimes(jev ? 0 : 1);
+      host.emit({ type: 'end', reason: 'test over' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+    }
+  });
+
   it('`jev`: one candidate at a time; one said while the host judges another is dropped', async () => {
     const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: false, jev: true } });
     room.remoteParticipants.clear();
