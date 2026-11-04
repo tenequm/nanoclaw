@@ -5375,6 +5375,9 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
       host: '127.0.0.1',
       port: Number(env.VOICE_MODE_WORKER_HEALTH_PORT || 8089),
       numIdleProcesses: 1,
+      // agents-js marks a production worker full at 70% CPU of the whole host, so unrelated work on the
+      // box refused every call; the one worker never hands a call elsewhere anyway.
+      loadThreshold: Infinity,
       // On SIGTERM the worker takes no new calls and gives running ones this long before closing
       // them; a call can run up to VOICE_MODE_MAX_CALL_SECONDS, so a restart cuts longer ones short.
       drainTimeout: 60_000,
