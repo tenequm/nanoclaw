@@ -4179,6 +4179,29 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
     // The call's close and the caller's signal both end the line, also when either already fired.
     const lineSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
     const cut = () => !!signal?.aborted && !closed;
+    /** Set by the line's abort, in whichever phase it lands: what had played by then. */
+    let cutPlayedMs: number | undefined;
+    // The abort silences the line at once, not at the next provider chunk or after the queue drained.
+    const cutNow = () => {
+      if (closed || cutPlayedMs !== undefined) return;
+      cutPlayedMs = Math.max(0, audioMs - o.sink.queuedDuration);
+      o.sink.clearQueue();
+    };
+    let abortedResolve!: () => void;
+    const aborted = new Promise<void>((resolve) => (abortedResolve = resolve));
+    const onAbort = () => {
+      cutNow();
+      abortedResolve();
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
+    const cutResult = () => {
+      cutNow();
+      return {
+        outcome: { heard, failed: false, cut: true, audioMs, playedMs: cutPlayedMs ?? 0, complete },
+        said: false,
+      };
+    };
     const capture = async (synthesized: Int16Array) => {
       const frame = filter ? filter(synthesized) : synthesized;
       meter.frame(frame);
@@ -4217,32 +4240,39 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
         }
         await play(pcm);
       }
-      if (cut()) {
-        // What the sink still holds never plays; what it already played is the line's delivered part.
-        playedMs = Math.max(0, audioMs - o.sink.queuedDuration);
-        o.sink.clearQueue();
-        return { outcome: { heard, failed, cut: true, audioMs, playedMs, complete }, said: false };
-      }
+      // What the sink still held never plays; what it already played is the line's delivered part.
+      if (cut()) return cutResult();
       complete = !closed;
       if (heard && !closed) await play(resample.flush());
-      if (rest) {
+      if (rest && !signal?.aborted) {
         const tail = new Int16Array(SPEECH_FRAME);
         tail.set(rest);
         rest = undefined;
         await capture(tail);
       }
-      if (heard) await o.sink.waitForPlayout();
+      if (heard && !signal?.aborted) {
+        const playout = o.sink.waitForPlayout();
+        if (signal) {
+          playout.catch(() => undefined);
+          await Promise.race([playout, aborted]);
+        } else await playout;
+      }
+      // Cut while its last audio drained: the share that played is delivered, not the whole line.
+      if (cut()) return cutResult();
       playedMs = audioMs;
       return { outcome: { heard, failed, cut: false, audioMs, playedMs, complete }, said: heard && !closed };
     } catch (err) {
+      // An abort that made synthesis throw is a cut, not a failure: the queue is dropped, not drained.
+      if (cut()) return cutResult();
       failed = true;
       o.log.warn('voice-mode worker: a line could not be synthesized', {
         err: err instanceof Error ? err.message : err,
       });
       if (heard) await o.sink.waitForPlayout().catch(() => undefined);
       playedMs = audioMs;
-      return { outcome: { heard, failed, cut: cut(), audioMs, playedMs, complete }, said: false };
+      return { outcome: { heard, failed, cut: false, audioMs, playedMs, complete }, said: false };
     } finally {
+      signal?.removeEventListener('abort', onAbort);
       resample.close();
       if (heard && !closed) o.stopped();
       const spoken = meter.done({ by: speech.spokenBy, primary, failed, cut: closed || cut() });
@@ -4680,6 +4710,12 @@ export class CallTelemetry {
  * interruption.
  */
 export const JEV_BARGE_MS = 300;
+/**
+ * How far the host's `words` (a meeting's) may miss the worker's VAD: Recall's partial and the local
+ * speech marks run on separate clocks and transports, so the words of one speech can land just before
+ * its speech-on or just after its speech-off.
+ */
+export const JEV_WORDS_WINDOW_MS = 1_500;
 /** Events kept for the host while it cannot be reached; past it the oldest partials go, with a log line. */
 const JEV_REPORT_BACKLOG = 4 * MAX_JEV_EVENTS_PER_POST;
 /** A POST body's bytes besides its events (`callId`, the keys), kept out of MAX_JEV_POST_BYTES. */
@@ -4839,6 +4875,12 @@ export class JevLoop {
   private speechSince = 0;
   /** The host said a participant's words arrived during this speech. */
   private wordsHeard = false;
+  /** When the host's last `words` came while no speech was on and none had just ended: the next speech's. */
+  private earlyWordsAt?: number;
+  /** The line that had started playing when this speech began: the one it talks over. */
+  private speechOver?: JevPlayout;
+  /** The speech that ended last: `words` landing soon after it are its own. */
+  private lastSpeech?: { endedAt: number; over?: JevPlayout; sustained: boolean; confirmed: boolean };
   private bargeTimer?: ReturnType<typeof setTimeout>;
   private readonly queue: JevPlayout[] = [];
   private playing?: JevPlayout;
@@ -4865,7 +4907,10 @@ export class JevLoop {
     const transcriber = this.deps.transcriber;
     if (speaking) {
       this.speechSince = this.now();
-      this.wordsHeard = false;
+      this.wordsHeard = this.earlyWordsAt !== undefined && this.speechSince - this.earlyWordsAt <= JEV_WORDS_WINDOW_MS;
+      this.earlyWordsAt = undefined;
+      this.lastSpeech = undefined;
+      this.speechOver = this.playing?.started ? this.playing : undefined;
       if (transcriber) {
         this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
         transcriber.begin(this.ring.since(Math.max(0, at - samplesOf(PRE_ROLL_MS))));
@@ -4880,6 +4925,14 @@ export class JevLoop {
     clearTimeout(this.bargeTimer);
     const utterance = this.utterance;
     this.utterance = undefined;
+    const endedAt = this.now();
+    this.lastSpeech = {
+      endedAt,
+      ...(this.speechOver ? { over: this.speechOver } : {}),
+      sustained: endedAt - this.speechSince >= JEV_BARGE_MS,
+      confirmed: this.wordsHeard || !!utterance?.worded,
+    };
+    this.speechOver = undefined;
     this.wake();
     if (!utterance || !transcriber) return;
     transcriber.end().then(
@@ -4910,9 +4963,28 @@ export class JevLoop {
 
   /** The host's `words`: a participant's words arrived (the reflex's confirmation where the worker has no transcript). */
   onWords(): void {
-    if (!this.speaking) return;
-    this.wordsHeard = true;
-    this.reflex();
+    if (this.closed) return;
+    if (this.speaking) {
+      this.wordsHeard = true;
+      this.reflex();
+      return;
+    }
+    // Between speeches: words soon after one ended are that speech's (late), else the next one's (early).
+    const at = this.now();
+    const last = this.lastSpeech;
+    if (!last || at - last.endedAt > JEV_WORDS_WINDOW_MS) {
+      this.earlyWordsAt = at;
+      return;
+    }
+    // A late confirmation cuts only what the reflex would have: sustained speech over the line still playing.
+    const line = this.playing;
+    if (last.confirmed || !last.sustained || !last.over || last.over !== line || line.abort.signal.aborted) return;
+    last.confirmed = true;
+    this.deps.log.info('voice-mode worker: words came for speech over the agent that just ended; the line is cut', {
+      replyId: line.replyId,
+      wordsLateMs: at - last.endedAt,
+    });
+    line.abort.abort();
   }
 
   /** The room: the agent's audio started or stopped playing. */
@@ -4944,6 +5016,32 @@ export class JevLoop {
     });
     this.dropQueue();
     this.playing?.abort.abort();
+  }
+
+  /**
+   * The host's `revoke`: the line, superseded before it was heard, never plays. Queued, it is dropped;
+   * taken but its first audio not out (synthesizing, or waiting for the caller's quiet), it is aborted,
+   * which the speech output checks right before that audio. Either way it is reported `cut_off` with
+   * nothing delivered. A line already heard is left to play: the host revokes only lines it has not
+   * seen start, so this is a revoke that crossed the line's `started`.
+   */
+  onRevoke(replyId: string): void {
+    if (this.closed) return;
+    const queued = this.queue.findIndex((line) => line.replyId === replyId);
+    if (queued >= 0) {
+      this.queue.splice(queued, 1);
+      this.deps.log.info('voice-mode worker: the host revoked a queued line', { replyId });
+      this.deps.report({ type: 'playback', replyId, state: 'cut_off', delivered: '', at: this.now() });
+      return;
+    }
+    const line = this.playing;
+    if (line?.replyId !== replyId) return;
+    if (line.started) {
+      this.deps.log.info('voice-mode worker: the host revoked a line already playing; it plays on', { replyId });
+      return;
+    }
+    this.deps.log.info('voice-mode worker: the host revoked a line before its first audio', { replyId });
+    line.abort.abort();
   }
 
   /** A line is queued or playing. */
@@ -5219,6 +5317,10 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         loop.onReply(event.replyId, event.text);
       } else if (event.type === 'stop') loop.onStop();
       else if (event.type === 'words') loop.onWords();
+      else {
+        const revoke = event as { type: string; replyId?: unknown };
+        if (revoke.type === 'revoke' && typeof revoke.replyId === 'string') loop.onRevoke(revoke.replyId);
+      }
     }, hostLink.signal)
     .then(
       () => end('host link closed', true),
