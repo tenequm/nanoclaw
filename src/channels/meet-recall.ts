@@ -144,14 +144,14 @@ function retryAfterMs(header: string | null): number | null {
 }
 
 /**
- * The bot's recording config. Without participant audio: no artifact at all (the mixed mp4 is on by
- * default). With it: each participant's raw audio on one websocket
- * (https://docs.recall.ai/docs/how-to-get-separate-audio-per-participant-realtime), no Recall
- * transcript, and Zero Data Retention (`retention: null`,
- * https://docs.recall.ai/docs/zero-data-retention): left out, Recall keeps the media indefinitely.
+ * The bot's recording config, always with Zero Data Retention (`retention: null`,
+ * https://docs.recall.ai/docs/zero-data-retention): left out, Recall keeps the recording media (participant
+ * events included) indefinitely, and nothing here reads it back. Without participant audio: no artifact
+ * at all (the mixed mp4 is on by default). With it: each participant's raw audio on one websocket
+ * (https://docs.recall.ai/docs/how-to-get-separate-audio-per-participant-realtime), no Recall transcript.
  */
 function botRecordingConfig(participantAudio?: RecallParticipantAudio): Record<string, unknown> {
-  if (!participantAudio) return { video_mixed_mp4: null };
+  if (!participantAudio) return { video_mixed_mp4: null, retention: null };
   assertUrl('the participant audio websocket URL', participantAudio.websocketUrl, 'wss:');
   const url = new URL(participantAudio.websocketUrl);
   // https://docs.recall.ai/docs/real-time-websocket-endpoints#verification: Recall answers 400 otherwise.

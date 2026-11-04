@@ -67,7 +67,7 @@ describe('createRecallMeetBridge', () => {
       bot_name: 'Andy',
       metadata: { nanoclaw_room: 'meet-r1' },
       variant: { google_meet: 'web_4_core', zoom: 'web_4_core', microsoft_teams: 'web_4_core' },
-      recording_config: { video_mixed_mp4: null },
+      recording_config: { video_mixed_mp4: null, retention: null },
       // The lobby wait plus the longest meeting call: a bot the host never sent away leaves after that.
       automatic_leave: { in_call_not_recording_timeout: 70 * 60 },
     });
@@ -93,7 +93,7 @@ describe('createRecallMeetBridge', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('https://us-west-2.recall.ai/api/v1/bot/');
   });
 
-  it('creates a bot without participant audio with exactly the body it always sent', async () => {
+  it('creates a bot without participant audio with no artifact and nothing kept (Zero Data Retention)', async () => {
     const fetchMock = respond(json(201, { id: 'b' }));
     await createRecallMeetBridge(config(fetchMock)).join(join);
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
@@ -102,7 +102,7 @@ describe('createRecallMeetBridge', () => {
       metadata: { nanoclaw_room: 'meet-r1' },
       output_media: { camera: { kind: 'webpage', config: { url: expect.any(String) } } },
       variant: { google_meet: 'web_4_core', zoom: 'web_4_core', microsoft_teams: 'web_4_core' },
-      recording_config: { video_mixed_mp4: null },
+      recording_config: { video_mixed_mp4: null, retention: null },
       automatic_leave: { in_call_not_recording_timeout: 70 * 60 },
     });
   });
