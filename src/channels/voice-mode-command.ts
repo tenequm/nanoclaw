@@ -268,7 +268,14 @@ export async function handleVoiceCommand(
   const jev = command.jev === true;
   try {
     if (jev && !JEV_API_KEY) {
-      await say(noJev(cmd));
+      // Only someone who may run /voice here hears about the host's setup; others as for /voice.
+      const mine = await administeredWirings(mg, userId);
+      if (!mine) {
+        log.info('/voice from an unknown sender dropped', { channelType: event.channelType });
+        return true;
+      }
+      const text = mine.length > 0 ? noJev(cmd) : voiceCommandReply({ kind: 'refused' }, cmd)!;
+      if (mg.is_group === 0 || !privateReply || (await privateReply(text)) !== 'sent') await say(text);
       return true;
     }
     // Without a private reply a group's links go to the direct chat: check it first, so /voice new ends no call for nothing.
@@ -557,8 +564,10 @@ export function createCallPage(
         return reply(res, 426, PROTOCOL_REFUSAL, JSON_HEADERS);
       }
       // A client may choose per call (`jev=1` / `jev=0`); otherwise the line's mode from /voice jev.
+      // Without the Jev key every verdict fails silent, so the call is a plain one.
       const asked = url.searchParams.get('jev');
-      return startPageCall(res, platformId, asked === '1' ? true : asked === '0' ? false : lineRunsJev(platformId));
+      const jev = asked === '1' ? true : asked === '0' ? false : lineRunsJev(platformId);
+      return startPageCall(res, platformId, jev && !!JEV_API_KEY);
     }
     if (route === 'livekit/end') {
       const body = await readJsonObject(req, MAX_END_BODY_BYTES, {});

@@ -30,7 +30,7 @@ const TEST_DIR = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
   return mkdtempSync(`${tmpdir()}/nanoclaw-test-voice-command-`);
 });
-/** The Jev key `/voice jev` needs; empty as on a host without one. */
+/** The Jev key `/voice jev` needs; a test empties it for a host without one. */
 const jevKey = vi.hoisted(() => ({ value: 'jev-test-key' }));
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
@@ -556,6 +556,13 @@ describe('handleVoiceCommand (the interceptor)', () => {
       expect(lineRunsJev(platformId)).toBe(false);
       expect(delivered.map((d) => (d.message.content as { text: string }).text)).toEqual([
         "jev mode needs the Jev gate's JEV_API_KEY on this host; send /voice without jev.",
+      ]);
+      // Only who may run /voice hears about the key: a member is refused as for /voice, a stranger hears nothing.
+      delivered.length = 0;
+      await handleVoiceCommand(event('/voice jev', MEMBER), callUrl);
+      await handleVoiceCommand(event('/voice jev', 'chat:999'), callUrl);
+      expect(delivered.map((d) => (d.message.content as { text: string }).text)).toEqual([
+        'Only an owner or admin of this agent can use /voice.',
       ]);
     } finally {
       jevKey.value = 'jev-test-key';
