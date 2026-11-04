@@ -935,3 +935,52 @@ describe('meeting tile cues', () => {
     expect(call.statuses.slice(-2).map((c) => c.status)).toEqual(['heard', 'idle']);
   });
 });
+
+describe('latest language facts', () => {
+  it.each([
+    ['\u0427\u0438 \u0442\u0438 \u0433\u043e\u0442\u043e\u0432\u0438\u0439', true, true, 'uk'],
+    [
+      '\u00ab\u041f\u043e\u044f\u0441\u043d\u0438\u00bb, \u0431\u0443\u0434\u044c \u043b\u0430\u0441\u043a\u0430.',
+      true,
+      false,
+      'uk',
+    ],
+    ['\u0426\u0435 \u0442\u0432\u043e\u0454.', false, true, 'uk'],
+    ['\u041f\u0440\u0438\u0432\u0456\u0442 \u0443\u0441\u0456\u043c.', false, false, 'uk'],
+    ['"COULD" YOU explain.', true, true, 'en'],
+    ['That is yours!', false, true, 'en'],
+    ['Yourself and young people.', false, false, 'en'],
+    ['Really?  ', true, false, 'en'],
+    ['Someone asks why it works.', false, false, 'en'],
+    ['\u042f\u043a \u043f\u0440\u0430\u0446\u044e\u0454 your code', true, true, 'mixed'],
+    ['Hello, \u0441\u0432\u0456\u0442.', false, false, 'mixed'],
+    ['123 !!!', false, false, 'other'],
+    ['\u4f60\u597d?', true, false, 'other'],
+  ])('classifies %s', (text, question, toYou, language) => {
+    const call = new Call();
+    expect(toJevState(call.state, { speaker: misha.name, text }).facts).toMatchObject({
+      latest_is_question: question,
+      latest_to_you: toYou,
+      latest_language: language,
+    });
+  });
+
+  it('defaults to false and other without latest', () => {
+    expect(toJevState(new Call().state).facts).toMatchObject({
+      latest_is_question: false,
+      latest_to_you: false,
+      latest_language: 'other',
+    });
+  });
+
+  it('fingerprints question punctuation but ignores punctuation that leaves facts unchanged', () => {
+    const call = new Call();
+    call.feed({ kind: 'utterance', speaker: misha, uttId: 'u1', text: 'Your answer', final: false });
+    const version = call.state.windowVersion;
+    call.feed({ kind: 'utterance', speaker: misha, uttId: 'u1', text: 'Your answer?', final: false });
+    expect(call.state.windowVersion).toBeGreaterThan(version);
+    const questionVersion = call.state.windowVersion;
+    call.feed({ kind: 'utterance', speaker: misha, uttId: 'u1', text: 'Your answer???', final: true });
+    expect(call.state.windowVersion).toBe(questionVersion);
+  });
+});

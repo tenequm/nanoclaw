@@ -363,8 +363,69 @@ export function humansInRoom(state: CallState): number {
   return Math.max(Object.keys(state.roster).length, heard);
 }
 
+const QUESTION_WORDS = new Set([
+  '\u0447\u0438',
+  '\u0449\u043e',
+  '\u044f\u043a',
+  '\u0434\u0435',
+  '\u043a\u043e\u043b\u0438',
+  '\u0447\u043e\u043c\u0443',
+  '\u043d\u0430\u0432\u0456\u0449\u043e',
+  '\u0441\u043a\u0456\u043b\u044c\u043a\u0438',
+  '\u0445\u0442\u043e',
+  '\u044f\u043a\u0438\u0439',
+  '\u044f\u043a\u0430',
+  '\u044f\u043a\u0435',
+  '\u044f\u043a\u0456',
+  '\u043c\u043e\u0436\u0435\u0448',
+  '\u043c\u043e\u0436\u0435\u0442\u0435',
+  '\u043f\u0456\u0434\u043a\u0430\u0436\u0438',
+  '\u0441\u043a\u0430\u0436\u0438',
+  '\u0440\u043e\u0437\u043a\u0430\u0436\u0438',
+  '\u043f\u043e\u044f\u0441\u043d\u0438',
+  'who',
+  'what',
+  'when',
+  'where',
+  'why',
+  'how',
+  'which',
+  'can',
+  'could',
+  'would',
+  'will',
+  'do',
+  'does',
+  'did',
+  'is',
+  'are',
+  'tell',
+  'explain',
+]);
+const SECOND_PERSON_WORDS = new Set([
+  '\u0442\u0438',
+  '\u0442\u0435\u0431\u0435',
+  '\u0442\u043e\u0431\u0456',
+  '\u0442\u043e\u0431\u043e\u044e',
+  '\u0442\u0432\u0456\u0439',
+  '\u0442\u0432\u043e\u044f',
+  '\u0442\u0432\u043e\u0454',
+  '\u0442\u0432\u043e\u0457',
+  '\u0432\u0438',
+  '\u0432\u0430\u0441',
+  '\u0432\u0430\u043c',
+  '\u0432\u0430\u0448',
+  'you',
+  'your',
+  'yours',
+]);
+
 /** The JSON `state` of a Jev request: the window as of the newest event, the facts and the policy. */
 export function toJevState(state: CallState, latest: JevState['latest'] = null, addressedByName = false): JevState {
+  const text = latest?.text ?? '';
+  const words = normalize(text).match(/\p{L}+/gu) ?? [];
+  const cyrillic = /(?=\p{L})\p{Script=Cyrillic}/u.test(text);
+  const latin = /(?=\p{L})\p{Script=Latin}/u.test(text);
   const participants =
     state.policy.kind === 'meet'
       ? Object.values(state.roster)
@@ -382,17 +443,23 @@ export function toJevState(state: CallState, latest: JevState['latest'] = null, 
       cut_off_after: state.cutOffAfter,
       agent_last_spoke_s_ago: state.agentLastSpokeAt === null ? null : secondsAgo(state, state.agentLastSpokeAt),
       addressed_by_name: addressedByName,
+      latest_is_question: text.trimEnd().endsWith('?') || QUESTION_WORDS.has(words[0] ?? ''),
+      latest_to_you: words.some((word) => SECOND_PERSON_WORDS.has(word)),
+      latest_language: cyrillic ? (latin ? 'mixed' : 'uk') : latin ? 'en' : 'other',
     },
   };
 }
 
 /**
  * What Jev would see, without the clock: equal fingerprints mean an unchanged window. A partial
- * turning final with the same words (case and punctuation aside) is no change, so a final that only
- * adds punctuation does not make the verdict on the partial stale.
+ * turning final with the same words is no change unless punctuation changes a language fact.
  */
 function fingerprint(state: CallState): string {
-  const jev = toJevState(state);
+  const latest = state.utterances.reduce<Utterance | null>(
+    (newest, utterance) => (!newest || utterance.startedAt >= newest.startedAt ? utterance : newest),
+    null,
+  );
+  const jev = toJevState(state, latest ? { speaker: latest.speakerId, text: latest.text } : null);
   return JSON.stringify({
     roster: state.roster,
     participants: jev.participants,

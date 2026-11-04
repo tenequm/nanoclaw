@@ -36,6 +36,9 @@ const state: JevState = {
     cut_off_after: null,
     agent_last_spoke_s_ago: null,
     addressed_by_name: true,
+    latest_is_question: true,
+    latest_to_you: false,
+    latest_language: 'en',
   },
 };
 
