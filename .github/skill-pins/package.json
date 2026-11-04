@@ -34,7 +34,7 @@
     "@opencode-ai/sdk": "1.18.25",
     "@resend/chat-sdk-adapter": "0.3.0",
     "@types/qrcode": "1.5.6",
-    "@types/ws": "8.18.1",
+    "@types/ws": "8.18.2",
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "agent-browser": "0.41.2",
     "chat-adapter-imessage": "0.1.1",
@@ -47,7 +47,7 @@
     "spectrum-ts": "11.0.0",
     "vercel": "52.2.1",
     "wechat-ilink-client": "0.1.0",
-    "ws": "8.21.3",
+    "ws": "8.22.1",
     "zod": "4.6.5"
   },
   "skillPins": {
@@ -228,7 +228,7 @@
       ]
     },
     "@types/ws": {
-      "version": "8.18.1",
+      "version": "8.18.2",
       "sources": [
         ".claude/skills/add-mattermost/SKILL.md nc:dep"
       ]
@@ -308,9 +308,10 @@
       ]
     },
     "ws": {
-      "version": "8.21.3",
+      "version": "8.22.1",
       "sources": [
-        ".claude/skills/add-mattermost/SKILL.md nc:dep"
+        ".claude/skills/add-mattermost/SKILL.md nc:dep",
+        ".claude/skills/add-voice-mode/SKILL.md nc:dep"
       ]
     },
     "zod": {

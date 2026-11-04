@@ -166,8 +166,8 @@ Install the vendored adapter's direct WebSocket dependencies at the exact
 supported versions.
 
 ```nc:dep
-ws@8.21.3
-@types/ws@8.18.1
+ws@8.22.1
+@types/ws@8.18.2
 ```
 
 ### 4. Create and authenticate the bot

@@ -82,7 +82,10 @@ Zero Data Retention: Recall stores no recording of the meeting, only API
 metadata), the host runs a Silero VAD and a Gemini Live transcription per
 participant (`ingress/recall-audio.ts`, the call's languages and vocabulary),
 and one Jev Choice per speaker boundary decides whether the agent answers,
-stays silent, stops or continues.
+stays silent, stops or continues. When people spoke after the utterance an
+answer was asked for, a second Choice (`still_wanted`) decides whether the
+landed answer is still said aloud or only shown in the chat. Both count toward
+one per-call cap of 30 Jev requests a minute.
 The bot is left out by its display name (Recall flags no participant as the
 bot), so a person who joins under that name is left out too, with a warning logged.
 
