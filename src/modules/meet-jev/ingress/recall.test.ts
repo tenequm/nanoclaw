@@ -247,14 +247,14 @@ describe('createRecallIngress', () => {
     expect(a.path).toBe('/voice/recall/call-1/');
     expect(a.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(a.token).not.toBe(b.token);
-    expect(recallEndpointUrl('wss://meet.opx.one/', a)).toBe(
-      `wss://meet.opx.one/voice/recall/call-1/?token=${a.token}`,
+    expect(recallEndpointUrl('wss://meet.example.com/', a)).toBe(
+      `wss://meet.example.com/voice/recall/call-1/?token=${a.token}`,
     );
     expect(() => ingress.register('call-1')).toThrow(/registered already/);
     expect(() => ingress.register('../x')).toThrow(/unusable call id/);
   });
 
-  it('delivers a connected call’s audio, chat, presence and raw messages; never the bot’s', async () => {
+  it("delivers a connected call's audio, chat, presence and raw messages; never the bot's", async () => {
     const { ingress, origin, events, audio, presence, raw } = await start();
     const ws = await open(recallEndpointUrl(origin, ingress.register('call-1', { botName: 'Andy' })));
     ws.send(JSON.stringify(participantEvent('participant_events.join', ALEX, 0.2)));
@@ -269,7 +269,7 @@ describe('createRecallIngress', () => {
     expect(raw.map((r) => (r as [number, unknown])[0])).toEqual([1, 2, 3, 4]);
   });
 
-  it('warns once when a second participant has the bot’s name', async () => {
+  it("warns once when a second participant has the bot's name", async () => {
     const { ingress, origin } = await start();
     const ws = await open(recallEndpointUrl(origin, ingress.register('call-1', { botName: 'Andy' })));
     vi.mocked(log.warn).mockClear();
@@ -326,7 +326,7 @@ describe('createRecallIngress', () => {
     expect(status).toBe(400);
   });
 
-  it('closes the call’s connection on unregister and refuses it after', async () => {
+  it("closes the call's connection on unregister and refuses it after", async () => {
     const { ingress, origin } = await start();
     const reg = ingress.register('call-1');
     const ws = await open(recallEndpointUrl(origin, reg));

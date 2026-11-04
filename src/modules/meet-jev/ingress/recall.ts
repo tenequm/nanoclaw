@@ -308,7 +308,8 @@ export function createRecallIngress(options: RecallIngressOptions): RecallIngres
       // Dot segments would route on a path the checks below never saw.
       if (url.pathname !== raw.split('?')[0]) return refuse(socket, 400, 'Bad Request');
       const match = PATH_RE.exec(url.pathname);
-      if (!match) return refuse(socket, 404, 'Not Found');
+      // Before any log line: the segment is the caller's, and no call is registered under an id of another shape.
+      if (!match || !CALL_ID_RE.test(match[1])) return refuse(socket, 404, 'Not Found');
       const entry = calls.get(match[1]);
       const token = url.searchParams.get('token') ?? '';
       if (!entry || !timingSafeEqual(digest(token), entry.tokenDigest)) {
