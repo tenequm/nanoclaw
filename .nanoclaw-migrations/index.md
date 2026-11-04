@@ -21,8 +21,8 @@ merges into fork `main`; then re-extract it and update "Fork HEAD at generation"
 2. Item tags: **[COPY]** a new file, copied verbatim with `git show 098ed630:<path>`; **[MERGE]**
    both sides changed the file, so start from upstream's version and re-apply the intent;
    **[ADAPT]** upstream moved something the replay must fit; **[DROP]** deliberately not replayed.
-3. After each commit, run the per-commit gate from "Execution plan" below; the full `pnpm test`
-   runs once at the end against the upstream baseline. Fix only what the replay broke.
+3. Gate every commit with `check.sh` (see "Execution plan"); run `check.sh full --baseline ...`
+   once at the end. Fix only what the replay broke.
 4. Prefer upstream's additive seams over editing upstream files: `registerTools` / `extendTool`
    (runner MCP tools), `registerMigration()` (module migrations), `onHostStart`, module barrel
    imports, `registerProviderContainerConfig`, the mailbox slot in `compose.ts`, skill payloads.
@@ -61,7 +61,7 @@ order above.
 | Wave | Lane | Commits | Starts when | Executor |
 |---|---|---|---|---|
 | 0 | foundation | 0, 1, 5 | now | GPT-6 Astra, high effort |
-| 0 | container | 8, 9 (and start the agent-image build) | now | GPT-6 Astra, medium |
+| 0 | container | 8, 9 (then a local `./container/build.sh build` to prove the slim block) | now | GPT-6 Astra, medium |
 | 1 | foundation | 2, 3, 4 (one lane: 3 and 4 both edit `poll-loop.ts`) | after 1 | GPT-6 Astra, high |
 | 1 | telegram | 6 (published first so voice can branch), 7, 11 | after 1 and 5 | GPT-6 Astra, high |
 | 1 | slack | 10 (the typing hunk lands with 3 at assembly) | after 1 | GPT-6 Astra, medium |
@@ -77,20 +77,29 @@ is dominated by edit-check-fix loops, so first-time accuracy beats raw speed.
 Rules that keep the lanes fast:
 
 - **Pin the upstream target** at `f7440e85` for the whole replay; anchors in this guide assume it.
-- **Never merge lockfiles.** Lanes edit `package.json` only; the assembler unions dependencies
-  and runs `pnpm install` per commit.
+- **Never merge lockfiles.** Lanes commit whatever `pnpm install` writes; at assembly a
+  lockfile conflict is resolved by taking either side and re-running `pnpm install`.
 - **COPY items go in one scripted pass** (`git show 098ed630:<path> > <path>` per listed file);
   agent effort goes to MERGE and ADAPT items.
-- **Per-commit gate, in parallel** (about 18 s instead of 43 s):
-  `pnpm -s typecheck & p1=$!; pnpm -s lint & p2=$!; pnpm -s format:check & p3=$!;
-  pnpm exec vitest run <touched dirs> >/tmp/vt.log 2>&1 & p4=$!;
-  wait $p1 && wait $p2 && wait $p3 && wait $p4 && echo GATE-OK || tail -40 /tmp/vt.log`,
-  plus `bun test` in `container/agent-runner` when the commit touches the runner. While
-  iterating, run only the touched test file.
-- **Full `pnpm test` once, at the end**, against a baseline measured on clean upstream
-  (`f7440e85`). Fork `main` at `098ed630` already fails 34 tests in
-  `scripts/update/transaction.e2e.test.ts` and `setup/verify-slack.test.ts`; compare against
-  the baseline, never against zero.
+- **One gate script: [`check.sh`](check.sh)**, run from the repo root. Every job runs in
+  parallel with tool caches (incremental `tsc`, `eslint --cache`, `prettier --cache`), host
+  tests are only those affected by the change (`vitest run --changed <ref>`), and runner tests
+  run only when runner files change (`bun test --parallel --changed=<ref>`). It installs first
+  when a `package.json` or lockfile changed, prints one PASS/FAIL line per job and the tail of
+  each failing log, and ends with `GATE-OK`.
+  - `check.sh` - uncommitted changes; use it while iterating and before each commit.
+  - `check.sh --base <ref>` - everything changed since `<ref>` (a whole lane).
+  - `check.sh full --baseline .nanoclaw-migrations/baseline-upstream.txt` - every CI check and
+    both full suites; fails only on test files outside the baseline. Once per lane, at the end.
+  - Measured on clean upstream (10-core Mac): 3 s on a clean tree, 18 s after editing
+    `src/router.ts` and `poll-loop.ts`, 81 s for `full` (was about 130 s run serially: `pnpm test`
+    77 s, then runner tests 32 s, then the other checks; `bun test --parallel` alone is 32 s ->
+    6 s). Rejected after measuring: `vitest --pool=threads` (181 failing tests),
+    `--maxWorkers=100%` (slower and flakier).
+- **The baseline is upstream's own.** Clean upstream (`f7440e85`) fails 34 tests in
+  `scripts/update/transaction.e2e.test.ts` and `setup/verify-slack.test.ts`, and
+  `scripts/update/controller-archive.test.ts` is flaky; [`baseline-upstream.txt`](baseline-upstream.txt)
+  lists the three files. Compare against it, never against zero.
 - **Known conflict points at assembly:** `src/router.ts`, `src/delivery.ts`,
   `src/container-runner.ts`, `src/modules/index.ts`, the runner's `mcp-tools/index.ts`,
   `src/db/container-configs.ts`, `package.json`. Resolve with this guide's anchors.

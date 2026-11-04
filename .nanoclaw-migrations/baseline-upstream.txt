@@ -1,0 +1,3 @@
+scripts/update/controller-archive.test.ts
+scripts/update/transaction.e2e.test.ts
+setup/verify-slack.test.ts
