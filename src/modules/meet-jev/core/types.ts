@@ -8,6 +8,8 @@
  * frame timestamps, the worker's marks) on arrival.
  */
 
+export type CallStatus = 'heard' | 'thinking' | 'speaking' | 'idle';
+
 export type CallKind = 'voice' | 'meet';
 
 /** A person in the call. `id` is stable for one participant session (a Meet rejoin is a new id). */
@@ -68,6 +70,7 @@ export type CallEvent =
     };
 
 export type Command =
+  | { kind: 'status'; status: CallStatus }
   /** Ask Jev about the window as of `windowVersion`; the answer comes back as a `verdict`. */
   | { kind: 'judge'; windowVersion: number; state: JevState }
   /** Ask Jev whether the wake's landed answer is still wanted; the answer comes back as a `recheck_verdict`. */

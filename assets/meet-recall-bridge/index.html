@@ -51,6 +51,15 @@
       #avatar.speaking {
         box-shadow: 0 0 0 14px rgba(110, 170, 230, 0.35);
       }
+      #avatar[data-cue='heard'] {
+        box-shadow: 0 0 0 14px rgba(245, 180, 50, 0.5);
+      }
+      #avatar[data-cue='thinking'] {
+        box-shadow: 0 0 0 14px rgba(70, 145, 245, 0.5);
+      }
+      #avatar[data-cue='speaking'] {
+        box-shadow: 0 0 0 14px rgba(60, 200, 120, 0.5);
+      }
       #name {
         font-size: 64px;
         font-weight: 600;
@@ -142,15 +151,30 @@
           if (wanted(pub) && !pub.isSubscribed) pub.setSubscribed(true);
         };
 
+        let cue = 'idle';
+        let cueTimer = null;
+        const cueLabels = { heard: 'Heard', thinking: 'Thinking', speaking: 'Speaking', idle: 'Live' };
+        function setCue(next) {
+          clearTimeout(cueTimer);
+          cue = next;
+          avatar.dataset.cue = next;
+          setStatus(cueLabels[next]);
+          if (next === 'heard') cueTimer = setTimeout(() => setCue('idle'), 2000);
+        }
+
         function refresh() {
           if (!room || room.state !== 'connected') return;
           state.playing = playersEl.childElementCount;
-          if (state.playing > 0) setStatus('Live');
+          if (cue !== 'idle') setStatus(cueLabels[cue]);
+          else if (state.playing > 0) setStatus('Live');
           else if (room.remoteParticipants.size > 0) setStatus(`Waiting for ${label}'s audio`);
           else setStatus(`Waiting for ${label}`);
         }
 
         function clearPlayers() {
+          clearTimeout(cueTimer);
+          cue = 'idle';
+          delete avatar.dataset.cue;
           playersEl.replaceChildren();
           avatar.classList.remove('speaking');
           state.playing = 0;
@@ -168,6 +192,15 @@
         }
 
         function wire(r) {
+          r.on(RoomEvent.DataReceived, (payload, participant, _kind, topic) => {
+            if (r !== room || participant || topic !== 'nanoclaw.jev.status') return;
+            try {
+              const { status } = JSON.parse(new TextDecoder().decode(payload));
+              if (Object.hasOwn(cueLabels, status)) setCue(status);
+            } catch {
+              // Malformed cues must not interrupt meeting audio.
+            }
+          });
           r.on(RoomEvent.ParticipantConnected, (p) => {
             p.trackPublications.forEach(consider);
             refresh();
@@ -194,7 +227,12 @@
               speakers.some((s) => s.identity !== r.localParticipant.identity),
             );
           });
-          r.on(RoomEvent.Reconnecting, () => setStatus('Reconnecting'));
+          r.on(RoomEvent.Reconnecting, () => {
+            clearTimeout(cueTimer);
+            cue = 'idle';
+            delete avatar.dataset.cue;
+            setStatus('Reconnecting');
+          });
           r.on(RoomEvent.Reconnected, refresh);
           r.on(RoomEvent.Disconnected, (reason) => {
             if (r !== room) return;

@@ -13,6 +13,8 @@
  * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`. `show` and `drop` push nothing: the agent's message is
  * already in the call chat, since a reply reaches this module from the post-delivery hook.
  */
+import { DataPacket_Kind, RoomServiceClient } from 'livekit-server-sdk';
+
 import type { LiveKitHostEvent } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
 import { callCore } from './core/index.js';
@@ -36,6 +38,7 @@ const MINUTE_MS = 60_000;
 /** What a jev call needs of the voice channel. */
 export interface JevCallHost {
   callId: string;
+  statusRoom?: { name: string; url: string; apiKey: string; apiSecret: string };
   /** Which call this is; `voice` when left out. */
   kind?: CallKind;
   callerName: string;
@@ -93,8 +96,29 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
     return false;
   };
 
+  const statusRoom = host.statusRoom;
+  let statusClient: RoomServiceClient | undefined;
+  let statusSend = Promise.resolve();
+
   const runtime: CallRuntime = createCallRuntime(core, policy, {
     now: host.now,
+    status: (status) => {
+      if (!statusRoom) return;
+      statusSend = statusSend
+        .then(async () => {
+          if (runtime.ended) return;
+          statusClient ??= new RoomServiceClient(statusRoom.url, statusRoom.apiKey, statusRoom.apiSecret, {
+            requestTimeout: 2,
+          });
+          await statusClient.sendData(
+            statusRoom.name,
+            Buffer.from(JSON.stringify({ status })),
+            DataPacket_Kind.RELIABLE,
+            { topic: 'nanoclaw.jev.status' },
+          );
+        })
+        .catch(() => log.debug('meet-jev: status send failed', fields));
+    },
     judge: async (state, signal, windowVersion) => {
       if (!capped()) return judge(state, { signal, ...fields, windowVersion });
       log.warn('meet-jev: Jev rate cap reached, judged without Jev', { ...fields, perMinute: MAX_JUDGES_PER_MINUTE });

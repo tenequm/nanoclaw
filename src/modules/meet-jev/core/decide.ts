@@ -47,6 +47,7 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
   const out = state.commands;
   switch (event.kind) {
     case 'utterance':
+      if (event.final && hasWords(event.text)) out.push({ kind: 'status', status: 'heard' });
       // Both kinds decide on the final, which comes after the speaker's own VAD end (the worker's, or the
       // host's per-participant pipeline in a meeting). Only the current utterance's final is a boundary: a late
       // final of an older one updates the window and decides nothing.
@@ -90,6 +91,7 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
     case 'turn_failed': {
       const wake = state.wakes.find((w) => w.key === event.key);
       if (wake) wake.dropped = true;
+      if (wake && wake === latestWake(state)) out.push({ kind: 'status', status: 'idle' });
       log(state, 'turn_failed', { key: event.key, reason: event.reason });
       break;
     }
@@ -98,6 +100,7 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       break;
     case 'playback': {
       const playing = prev.playout[event.replyId] ?? prev.stoppedPlayout[event.replyId];
+      if (playing) out.push({ kind: 'status', status: event.state === 'started' ? 'speaking' : 'idle' });
       if (playing && event.state !== 'started') logPlayback(state, event, playing.wakeKey);
       break;
     }
@@ -297,7 +300,7 @@ function stop(state: CallState): void {
   state.judging = null;
   endRecheck(state, 'stopped');
   takeBackUnstarted(state);
-  state.commands.push({ kind: 'stop_playback' });
+  state.commands.push({ kind: 'stop_playback' }, { kind: 'status', status: 'idle' });
 }
 
 /**
@@ -337,6 +340,7 @@ function wake(state: CallState, speakerId: string, uttId: string, message: strin
     },
   ].slice(-WAKES_KEPT);
   state.cutOffAfter = null;
+  state.commands.push({ kind: 'status', status: 'thinking' });
   state.commands.push({ kind: 'turn', key, message, note, ...(supersedes ? { supersedes } : {}) });
 }
 
@@ -347,6 +351,7 @@ function onReply(state: CallState, replyId: string, turnId: string | null, raw: 
   const fields = { replyId, turnId };
 
   if (text.toLowerCase() === '[silent]') {
+    if (wake && wake === latestWake(state)) state.commands.push({ kind: 'status', status: 'idle' });
     state.commands.push({ kind: 'drop', replyId });
     log(state, 'reply', { ...fields, outcome: 'dropped', reason: 'silent' });
     return;
@@ -416,6 +421,7 @@ function onRecheck(state: CallState, wakeKey: string, verdict: RecheckVerdict | 
     outcome: show ? 'shown' : 'spoken',
     ...(verdict ? {} : { reason: 'jev_failed' }),
   });
+  if (show) state.commands.push({ kind: 'status', status: 'idle' });
   for (const { replyId, text } of recheck.replies) {
     if (show || !wake) state.commands.push({ kind: 'show', replyId, text });
     else speak(state, replyId, text, wake);
