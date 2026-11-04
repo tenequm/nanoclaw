@@ -18,6 +18,9 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 
 async function handleInteractiveResponse(payload: ResponsePayload): Promise<boolean> {
+  // Host-command cards are handled without waking a container, regardless of registration order.
+  if (payload.questionId.startsWith('hcmd-')) return false;
+
   if (!(await hasTable(getDb(), 'pending_questions'))) return false;
 
   const pq = await getPendingQuestion(payload.questionId);

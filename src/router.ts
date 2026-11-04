@@ -19,7 +19,8 @@
  */
 import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
-import { gateCommand } from './command-gate.js';
+import { applyNormalizedText, classifyHostCommand, gateCommand } from './command-gate.js';
+import { runHostCommand } from './commands/fallback.js';
 import { getDeliveryAdapter } from './delivery.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
@@ -378,6 +379,35 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   //    we need their actual rows for fan-out).
   const agents = await getMessagingGroupAgents(mg.id);
 
+  // 3b. Host chat-commands (/model, /status, /config, /restart, /voice) are owned by
+  //     the host and answered ONCE per message, independent of per-agent
+  //     engage rules (a slash command need not @mention the bot to be
+  //     honored). On Telegram the native binding intercepts these at the
+  //     adapter so they never reach here; this is the channel-agnostic
+  //     backstop for every other channel (Slack types them as `!name`,
+  //     normalized by the gate), and for Telegram when the native binding is
+  //     absent. No channel-specific branching: the fallback renders uniformly.
+  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+    const host = classifyHostCommand(event.message.content, event.channelType);
+    if (host) {
+      try {
+        await runHostCommand({
+          command: host.command,
+          args: host.args,
+          mg,
+          event,
+          userId,
+          agents,
+          adapterSupportsThreads: adapter?.supportsThreads === true,
+        });
+        // eslint-disable-next-line no-catch-all/no-catch-all -- host command failures must not fail routing
+      } catch (err) {
+        log.error('Host command handler threw', { command: host.command, messagingGroupId: mg.id, err });
+      }
+      return;
+    }
+  }
+
   // 4. Fan-out: evaluate each wired agent independently against engage_mode,
   //    sender_scope, and access gate. An agent that engages gets its own
   //    session and container wake. An agent that declines but has
@@ -549,7 +579,7 @@ async function evaluateEngage(
   }
 }
 
-async function deliverToAgent(
+export async function deliverToAgent(
   agent: MessagingGroupAgent,
   agentGroup: AgentGroup,
   mg: MessagingGroup,
@@ -591,15 +621,21 @@ async function deliverToAgent(
     threadId: effectiveThreadId,
   };
 
+  let normalizedText: string | undefined;
+
   // Command gate: classify slash commands before they reach the container.
   // Filtered commands are dropped silently. Denied admin commands get a
   // permission-denied reply sent straight to the chat: outbound.db belongs to
   // the container, and a host write there can collide with its writes.
   if (isChat) {
-    const gate = await gateCommand(event.message.content, userId, agent.agent_group_id);
+    const gate = await gateCommand(event.message.content, userId, agent.agent_group_id, event.channelType);
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
       return;
+    }
+    if (gate.action === 'host') return;
+    if (gate.action === 'pass' && gate.normalizedText !== undefined) {
+      normalizedText = gate.normalizedText;
     }
     if (gate.action === 'deny') {
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
@@ -637,7 +673,9 @@ async function deliverToAgent(
   }
 
   const messageId = messageIdForAgent(event.message.id, agent.agent_group_id);
-  const content = isChat ? stampSenderRole(event.message.content, senderRole) : event.message.content;
+  const rawContent =
+    normalizedText !== undefined ? applyNormalizedText(event.message.content, normalizedText) : event.message.content;
+  const content = isChat ? stampSenderRole(rawContent, senderRole) : rawContent;
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: messageId,
     kind: event.message.kind,

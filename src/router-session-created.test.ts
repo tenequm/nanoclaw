@@ -23,6 +23,10 @@ import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } 
 import { registerSessionCreatedHook, routeInbound, type SessionCreatedEvent } from './router.js';
 import type { ChannelAdapter, ChannelDefaults } from './channels/adapter.js';
 import type { MessagingGroupAgent } from './types.js';
+import { runHostCommand } from './commands/fallback.js';
+import { getSessionsByAgentGroup } from './db/sessions.js';
+
+vi.mock('./commands/fallback.js', () => ({ runHostCommand: vi.fn().mockResolvedValue(undefined) }));
 
 // Mock container runner to prevent actual Docker spawning
 vi.mock('./container-runner.js', () => ({
@@ -233,5 +237,46 @@ describe('registerSessionCreatedHook', () => {
     // still woke the container.
     expect(after).toHaveLength(1);
     expect(vi.mocked(wakeContainer)).toHaveBeenCalled();
+  });
+});
+
+describe('host commands before fan-out', () => {
+  it('claims a command once for multiple wirings without engagement, storing or waking', async () => {
+    await activate();
+    await seedWiring({ engageMode: 'mention', ignoredMessagePolicy: 'accumulate' });
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Second Agent',
+      folder: 'second-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await createMessagingGroupAgent({
+      id: 'mga-2',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-2',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'shared',
+      priority: 1,
+      threads: 1,
+      created_at: now(),
+    });
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+    vi.mocked(runHostCommand).mockClear();
+
+    await inbound('host-status', null, '/status', false);
+
+    expect(runHostCommand).toHaveBeenCalledTimes(1);
+    expect(runHostCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ command: 'status', args: '', agents: expect.any(Array) }),
+    );
+    expect(vi.mocked(runHostCommand).mock.calls[0][0].agents).toHaveLength(2);
+    expect(await getSessionsByAgentGroup('ag-1')).toEqual([]);
+    expect(await getSessionsByAgentGroup('ag-2')).toEqual([]);
+    expect(wakeContainer).not.toHaveBeenCalled();
   });
 });
