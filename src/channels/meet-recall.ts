@@ -47,10 +47,38 @@ export interface RecallMeetConfig {
   resweepDelayMs?: number;
 }
 
+/**
+ * The real-time events a jev meeting's websocket takes: words, speaker turns, presence, chat
+ * (names per https://docs.recall.ai/docs/real-time-websocket-endpoints#event-types).
+ */
+export const RECALL_JEV_EVENTS = [
+  'transcript.partial_data',
+  'transcript.data',
+  'participant_events.speech_on',
+  'participant_events.speech_off',
+  'participant_events.join',
+  'participant_events.leave',
+  'participant_events.chat_message',
+] as const;
+
+/** A jev meeting's transcription: Recall transcribes each participant and streams to `websocketUrl`. */
+export interface RecallTranscription {
+  /** `wss://` with a `/` before the query, as Recall requires (`.../<callId>/?token=...`). */
+  websocketUrl: string;
+}
+
 /** The Recall bots of `/meet` calls; faked in tests. */
 export interface RecallMeetBridge {
-  /** Sends a bot named `botName` to `meetingUrl`, its bridge page joining `roomName`. */
-  join(options: { meetingUrl: string; botName: string; roomName: string }): Promise<{ botId: string }>;
+  /**
+   * Sends a bot named `botName` to `meetingUrl`, its bridge page joining `roomName`; with
+   * `transcription` (jev meetings only) the bot also transcribes the meeting in real time.
+   */
+  join(options: {
+    meetingUrl: string;
+    botName: string;
+    roomName: string;
+    transcription?: RecallTranscription;
+  }): Promise<{ botId: string }>;
   /** Makes the bot leave its meeting, retried; never rejects (a final failure is logged). */
   leave(botId: string): Promise<void>;
 }
@@ -109,6 +137,32 @@ function retryAfterMs(header: string | null): number | null {
   if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
   const at = Date.parse(header);
   return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
+}
+
+/**
+ * The bot's recording config. Without transcription: no artifact at all (the mixed mp4 is on by
+ * default). With it: Recall's low-latency streaming model per participant stream, and one websocket.
+ * Fields per https://docs.recall.ai/docs/bot-real-time-transcription and
+ * https://docs.recall.ai/docs/recallai-transcription (`prioritize_low_latency` takes only
+ * `language_code: "en"`; its default `auto` fails) and the Create Bot schema
+ * (https://docs.recall.ai/reference/bot_create).
+ */
+function botRecordingConfig(transcription?: RecallTranscription): Record<string, unknown> {
+  if (!transcription) return { video_mixed_mp4: null };
+  assertUrl('the transcription websocket URL', transcription.websocketUrl, 'wss:');
+  const url = new URL(transcription.websocketUrl);
+  // https://docs.recall.ai/docs/real-time-websocket-endpoints#verification: Recall answers 400 otherwise.
+  if (url.search && !url.pathname.endsWith('/')) {
+    throw new Error('meet-recall: the transcription websocket URL needs a / before its query');
+  }
+  return {
+    video_mixed_mp4: null,
+    transcript: {
+      provider: { recallai_streaming: { mode: 'prioritize_low_latency', language_code: 'en' } },
+      diarization: { use_separate_streams_when_available: true },
+    },
+    realtime_endpoints: [{ type: 'websocket', url: transcription.websocketUrl, events: [...RECALL_JEV_EVENTS] }],
+  };
 }
 
 /** A leave Recall refused because the bot is not in a call any more (it left on its own, or never got in). */
@@ -202,7 +256,8 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
   }
 
   return {
-    async join({ meetingUrl, botName, roomName }) {
+    async join({ meetingUrl, botName, roomName, transcription }) {
+      const recordingConfig = botRecordingConfig(transcription);
       const token = await mintBridgeToken(config, roomName);
       const pageUrl = buildBridgePageUrl(config.pageUrl, { livekitUrl: config.livekitUrl, token, name: botName });
       let bot: unknown;
@@ -213,8 +268,7 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
           metadata: { [ROOM_METADATA_KEY]: roomName },
           output_media: { camera: { kind: 'webpage', config: { url: pageUrl } } },
           variant: { google_meet: 'web_4_core', zoom: 'web_4_core', microsoft_teams: 'web_4_core' },
-          // The mixed mp4 is on by default; nothing here needs a recording or a transcript.
-          recording_config: { video_mixed_mp4: null },
+          recording_config: recordingConfig,
           // Default is 1h; a bot without a recording artifact may count as "not recording".
           automatic_leave: { in_call_not_recording_timeout: BOT_NOT_RECORDING_TIMEOUT_SECONDS },
         });

@@ -92,6 +92,60 @@ describe('createRecallMeetBridge', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('https://us-west-2.recall.ai/api/v1/bot/');
   });
 
+  it('creates a bot without a transcription with exactly the body it always sent', async () => {
+    const fetchMock = respond(json(201, { id: 'b' }));
+    await createRecallMeetBridge(config(fetchMock)).join(join);
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
+      meeting_url: join.meetingUrl,
+      bot_name: 'Andy',
+      metadata: { nanoclaw_room: 'meet-r1' },
+      output_media: { camera: { kind: 'webpage', config: { url: expect.any(String) } } },
+      variant: { google_meet: 'web_4_core', zoom: 'web_4_core', microsoft_teams: 'web_4_core' },
+      recording_config: { video_mixed_mp4: null },
+      automatic_leave: { in_call_not_recording_timeout: 70 * 60 },
+    });
+  });
+
+  it('adds per-participant low-latency transcription and one websocket for a jev meeting', async () => {
+    const fetchMock = respond(json(201, { id: 'b' }));
+    const websocketUrl = 'wss://meet.example.com/voice/recall/call-1/?token=t0k3n';
+    await createRecallMeetBridge(config(fetchMock)).join({ ...join, transcription: { websocketUrl } });
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(body.recording_config).toEqual({
+      video_mixed_mp4: null,
+      transcript: {
+        provider: { recallai_streaming: { mode: 'prioritize_low_latency', language_code: 'en' } },
+        diarization: { use_separate_streams_when_available: true },
+      },
+      realtime_endpoints: [
+        {
+          type: 'websocket',
+          url: websocketUrl,
+          events: [
+            'transcript.partial_data',
+            'transcript.data',
+            'participant_events.speech_on',
+            'participant_events.speech_off',
+            'participant_events.join',
+            'participant_events.leave',
+            'participant_events.chat_message',
+          ],
+        },
+      ],
+    });
+    expect(body.automatic_leave).toEqual({ in_call_not_recording_timeout: 70 * 60 });
+  });
+
+  it('refuses a transcription websocket URL Recall would not take, before any request', async () => {
+    const fetchMock = respond(json(201, { id: 'b' }));
+    const bridge = createRecallMeetBridge(config(fetchMock));
+    const withUrl = (websocketUrl: string) => bridge.join({ ...join, transcription: { websocketUrl } });
+    await expect(withUrl('ws://meet.example.com/voice/recall/c/?token=t')).rejects.toThrow(/must use wss:/);
+    await expect(withUrl('wss://meet.example.com/voice/recall/c?token=t')).rejects.toThrow(/a \/ before its query/);
+    await expect(withUrl('not a url')).rejects.toThrow(/is not a URL/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('leaves through leave_call with the bot id escaped', async () => {
     const fetchMock = respond(json(200, { id: 'x' }));
     await createRecallMeetBridge(config(fetchMock)).leave('a/b c');
