@@ -29,7 +29,12 @@ vi.mock('../../container-restart.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-cli-groups-${process.pid}` };
+  return {
+    ...actual,
+    DATA_DIR: `/tmp/nanoclaw-test-cli-groups-${process.pid}`,
+    // The stock default provider, not one a host's .env sets: the --speed cases expect Claude's tiers.
+    DEFAULT_AGENT_PROVIDER: 'claude',
+  };
 });
 
 const TEST_DIR = `/tmp/nanoclaw-test-cli-groups-${process.pid}`;
