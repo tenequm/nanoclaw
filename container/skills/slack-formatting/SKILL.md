@@ -36,6 +36,8 @@ Check your group folder name or workspace path:
 <!channel>                           # @channel
 ```
 
+Incoming messages show a user mention as `@Display Name (<@U1234567890>)`. To mention that person back, write the `<@U1234567890>` part.
+
 ### Lists
 
 Slack supports simple bullet lists but NOT numbered lists:

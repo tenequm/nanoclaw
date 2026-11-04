@@ -15,6 +15,8 @@ import {
   updateContainerConfigJson,
 } from './db/container-configs.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
+import './channels/slack.js';
+import { createMessagingGroup, createMessagingGroupAgent } from './db/messaging-groups.js';
 import { PERSONA_PREPEND_FILE } from './group-persona.js';
 import { log } from './log.js';
 import {
@@ -521,4 +523,65 @@ it('gates resident skill prose by agent and fails closed on errors', async () =>
     '# NanoClaw Skill: fixture-gateway',
   );
   expect(await compose(await seed('ag-skill-allowed', 'skill-allowed'))).toContain('# NanoClaw Skill: fixture-gateway');
+});
+
+async function withRealContainer<T>(fn: () => Promise<T>): Promise<T> {
+  const root = fs.mkdtempSync(path.join(TEST_ROOT, 'real-skills-'));
+  fs.mkdirSync(path.join(root, 'container'));
+  for (const entry of ['CLAUDE.md', 'agent-runner', 'skills']) {
+    fs.symlinkSync(path.join(REPO_ROOT, 'container', entry), path.join(root, 'container', entry));
+  }
+  const previousCwd = process.cwd();
+  process.chdir(root);
+  try {
+    return await fn();
+  } finally {
+    process.chdir(previousCwd);
+  }
+}
+
+describe('Slack resident instructions', () => {
+  async function wire(ag: AgentGroup, mgId: string, channelType: string, instance = channelType): Promise<void> {
+    const createdAt = new Date().toISOString();
+    await createMessagingGroup({
+      id: mgId,
+      channel_type: channelType,
+      platform_id: `${channelType}:${mgId}`,
+      instance,
+      name: mgId,
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: createdAt,
+    });
+    await createMessagingGroupAgent({
+      id: `mga-${mgId}`,
+      messaging_group_id: mgId,
+      agent_group_id: ag.id,
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      threads: 0,
+      created_at: createdAt,
+    });
+  }
+
+  it.each(['all', ['slack-construct']] as const)(
+    'gates room prose by Slack wiring with selection %j',
+    async (selection) => {
+      const slack = await seed('ag-slack-skills', 'slack-skills');
+      await wire(slack, 'mg-slack-skills', 'slack', 'slack-secondary');
+      await updateContainerConfigJson(slack.id, 'skills', selection);
+      const slackDoc = await withRealContainer(() => compose(slack));
+      expect(slackDoc).toContain('# NanoClaw Skill: slack-construct');
+      expect(slackDoc).toContain(
+        fs.readFileSync(path.join(REPO_ROOT, 'container/skills/slack-construct/instructions.md'), 'utf8').trim(),
+      );
+      const other = await seed('ag-other-skills', 'other-skills');
+      await wire(other, 'mg-other-skills', 'telegram');
+      expect(await withRealContainer(() => compose(other))).not.toContain('# NanoClaw Skill: slack-construct');
+    },
+  );
 });
