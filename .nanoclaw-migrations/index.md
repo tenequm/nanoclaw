@@ -21,9 +21,8 @@ merges into fork `main`; then re-extract it and update "Fork HEAD at generation"
 2. Item tags: **[COPY]** a new file, copied verbatim with `git show 098ed630:<path>`; **[MERGE]**
    both sides changed the file, so start from upstream's version and re-apply the intent;
    **[ADAPT]** upstream moved something the replay must fit; **[DROP]** deliberately not replayed.
-3. After each commit: `pnpm install && pnpm run build && pnpm test`, plus
-   `cd container/agent-runner && bun test` when the commit touches the runner. Fix only what the
-   replay broke.
+3. After each commit, run the per-commit gate from "Execution plan" below; the full `pnpm test`
+   runs once at the end against the upstream baseline. Fix only what the replay broke.
 4. Prefer upstream's additive seams over editing upstream files: `registerTools` / `extendTool`
    (runner MCP tools), `registerMigration()` (module migrations), `onHostStart`, module barrel
    imports, `registerProviderContainerConfig`, the mailbox slot in `compose.ts`, skill payloads.
@@ -51,6 +50,50 @@ merges into fork `main`; then re-extract it and update "Fork HEAD at generation"
 Dependencies: 7, 10, 11 and 12 register prose through commit 1's hooks. Commit 13 implements the
 mailbox operations added by commits 2 and 3, so it comes after them. Commit 7's `/context` command
 reads commit 5's column.
+
+## Execution plan (minimum wall time)
+
+Commit order is for the final history; build order follows dependencies. Lanes run in
+parallel, each in its own isolated checkout (one worktree of this repo, so lane branches are
+visible to each other without pushing); an assembler cherry-picks every lane commit into the
+order above.
+
+| Wave | Lane | Commits | Starts when | Executor |
+|---|---|---|---|---|
+| 0 | foundation | 0, 1, 5 | now | GPT-6 Astra, high effort |
+| 0 | container | 8, 9 (and start the agent-image build) | now | GPT-6 Astra, medium |
+| 1 | foundation | 2, 3, 4 (one lane: 3 and 4 both edit `poll-loop.ts`) | after 1 | GPT-6 Astra, high |
+| 1 | telegram | 6 (published first so voice can branch), 7, 11 | after 1 and 5 | GPT-6 Astra, high |
+| 1 | slack | 10 (the typing hunk lands with 3 at assembly) | after 1 | GPT-6 Astra, medium |
+| 2 | mailbox | 13 | after 2 and 3 | GPT-6 Astra, high |
+| 2 | voice | 12 | after `feat/meet` merges, from foundation + 6 | GPT-6 Astra, high |
+| 3 | assembly | cherry-pick 0-14 in order, then 14 | all lanes done | the driving session |
+
+Model choice (Artificial Analysis Intelligence Index v5, 2026-11-04): GPT-6 Astra high scores 55
+at 7.7 min per task, against Claude Opus 5.5 high at 52 and 9.3 min; xhigh/max tiers roughly
+double the time for a few points and are used only for a lane that keeps failing. Lane wall time
+is dominated by edit-check-fix loops, so first-time accuracy beats raw speed.
+
+Rules that keep the lanes fast:
+
+- **Pin the upstream target** at `f7440e85` for the whole replay; anchors in this guide assume it.
+- **Never merge lockfiles.** Lanes edit `package.json` only; the assembler unions dependencies
+  and runs `pnpm install` per commit.
+- **COPY items go in one scripted pass** (`git show 098ed630:<path> > <path>` per listed file);
+  agent effort goes to MERGE and ADAPT items.
+- **Per-commit gate, in parallel** (about 18 s instead of 43 s):
+  `pnpm -s typecheck & p1=$!; pnpm -s lint & p2=$!; pnpm -s format:check & p3=$!;
+  pnpm exec vitest run <touched dirs> >/tmp/vt.log 2>&1 & p4=$!;
+  wait $p1 && wait $p2 && wait $p3 && wait $p4 && echo GATE-OK || tail -40 /tmp/vt.log`,
+  plus `bun test` in `container/agent-runner` when the commit touches the runner. While
+  iterating, run only the touched test file.
+- **Full `pnpm test` once, at the end**, against a baseline measured on clean upstream
+  (`f7440e85`). Fork `main` at `098ed630` already fails 34 tests in
+  `scripts/update/transaction.e2e.test.ts` and `setup/verify-slack.test.ts`; compare against
+  the baseline, never against zero.
+- **Known conflict points at assembly:** `src/router.ts`, `src/delivery.ts`,
+  `src/container-runner.ts`, `src/modules/index.ts`, the runner's `mcp-tools/index.ts`,
+  `src/db/container-configs.ts`, `package.json`. Resolve with this guide's anchors.
 
 ## Owner decisions (2026-11-04)
 
