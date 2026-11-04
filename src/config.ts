@@ -19,6 +19,9 @@ const envConfig = readEnvFile([
   'CONTAINER_PIDS_LIMIT',
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
+  'JEV_API_KEY',
+  'JEV_URL',
+  'JEV_MODEL',
   'WEBHOOK_PORT',
   'WEBHOOK_HOST',
   'NANOCLAW_ABSOLUTE_CEILING_MS',
@@ -151,3 +154,7 @@ function resolveConfigTimezone(): string {
   return 'UTC';
 }
 export const TIMEZONE = resolveConfigTimezone();
+
+export const JEV_API_KEY = process.env.JEV_API_KEY || envConfig.JEV_API_KEY || '';
+export const JEV_URL = process.env.JEV_URL || envConfig.JEV_URL || 'https://api.typesafe.ai/v1/systemone';
+export const JEV_MODEL = process.env.JEV_MODEL || envConfig.JEV_MODEL || 'jev-latest';

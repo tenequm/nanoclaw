@@ -19,6 +19,7 @@
  */
 import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
+import { runJevGate } from './modules/jev-gate/index.js';
 import { applyNormalizedText, classifyHostCommand, gateCommand } from './command-gate.js';
 import { runHostCommand } from './commands/fallback.js';
 import { getDeliveryAdapter } from './delivery.js';
@@ -454,14 +455,35 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     );
     const effectiveThreadId = threadsEnabled ? event.threadId : null;
 
-    const engages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
+    const ruleEngages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
 
-    const accessOk = engages && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);
-    const scopeOk = engages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
+    const accessOk =
+      ruleEngages && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);
+    const scopeOk = ruleEngages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
 
     const senderRole = await resolveSenderRole(event, userId, agent.agent_group_id);
+    let engages = ruleEngages;
+    let deliveryEvent = event;
+    if (ruleEngages && accessOk && scopeOk && !isMention && mg.is_group !== 0) {
+      const gated = await runJevGate({ agent, mg, event, threadId: effectiveThreadId, senderRole });
+      if (gated) {
+        log.info('Jev gate', { agentGroupId: agent.agent_group_id, verdict: gated.annotation });
+        deliveryEvent = gated.event;
+        if (gated.silence) engages = false;
+      }
+    }
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, true, senderRole);
+      await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        deliveryEvent,
+        userId,
+        threadsEnabled,
+        effectiveThreadId,
+        true,
+        senderRole,
+      );
       engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
@@ -485,7 +507,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
           log.warn('adapter.subscribe failed', { channelType: event.channelType, threadId: effectiveThreadId, err });
         });
       }
-    } else if (agent.ignored_message_policy === 'accumulate' && !(engages && (!accessOk || !scopeOk))) {
+    } else if (agent.ignored_message_policy === 'accumulate' && !(ruleEngages && (!accessOk || !scopeOk))) {
       // Accumulate stores the message as silent context. We allow it when
       // engagement simply didn't fire, but NOT when engagement fired and
       // the access/scope gate refused — those refusals are security
@@ -493,7 +515,17 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       // message (which also stages their attachments to disk via
       // writeSessionMessage → extractAttachmentFiles) is exactly what the
       // gate is meant to prevent.
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, false, senderRole);
+      await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        deliveryEvent,
+        userId,
+        threadsEnabled,
+        effectiveThreadId,
+        false,
+        senderRole,
+      );
       accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {

@@ -1,0 +1,394 @@
+/**
+ * The Jev wake-gate seen from the router, through the REAL routeInbound path.
+ *
+ * Two wirings share one group chat: one has a gate entry, one does not. The
+ * fan-out loop reuses a single `event` across both, so the load-bearing
+ * assertion here is that the gated wiring's annotation lands ONLY in its own
+ * session — the ungated wiring must see the message exactly as it arrived.
+ */
+import fs from 'fs';
+import path from 'path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('./log.js', () => ({
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+vi.mock('./container-runner.js', () => ({
+  wakeContainer: vi.fn().mockResolvedValue(true),
+  isContainerRunning: vi.fn().mockReturnValue(false),
+  getActiveContainerCount: vi.fn().mockReturnValue(0),
+  killContainer: vi.fn(),
+}));
+
+vi.mock('./config.js', async () => {
+  const actual = await vi.importActual('./config.js');
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-router-jev',
+    TIMEZONE: 'UTC',
+    JEV_API_KEY: 'test-key',
+  };
+});
+
+import {
+  initTestDb,
+  closeDb,
+  runMigrations,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+} from './db/index.js';
+import { getSessionsByAgentGroup } from './db/sessions.js';
+import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from './channels/channel-registry.js';
+import { wakeContainer } from './container-runner.js';
+import { resetGateConfigCache } from './modules/jev-gate/index.js';
+import { withExistingMailboxSession } from './session-manager.js';
+import { grantRole } from './modules/permissions/db/user-roles.js';
+import { createUser } from './modules/permissions/db/users.js';
+import { routeInbound, setSenderResolver } from './router.js';
+import type { ChannelAdapter, ChannelDefaults } from './channels/adapter.js';
+
+const TEST_DIR = '/tmp/nanoclaw-test-router-jev';
+const GATED = 'ag-gated';
+const PLAIN = 'ag-plain';
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+const channelDefaults: ChannelDefaults = {
+  dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
+  group: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
+  mentions: 'platform',
+};
+
+function makeAdapter(): ChannelAdapter {
+  return {
+    name: 'testchat',
+    channelType: 'testchat',
+    supportsThreads: false,
+    defaults: channelDefaults,
+    setup: async () => {},
+    teardown: async () => {},
+    isConnected: () => true,
+    deliver: async () => undefined,
+  };
+}
+
+async function activate(): Promise<void> {
+  registerChannelAdapter('testchat', { factory: () => makeAdapter(), defaults: channelDefaults });
+  await initChannelAdapters(() => ({
+    onInbound: () => {},
+    onInboundEvent: () => {},
+    onMetadata: () => {},
+    onAction: () => {},
+  }));
+}
+
+async function seed(): Promise<void> {
+  await createMessagingGroup({
+    id: 'mg-1',
+    channel_type: 'testchat',
+    platform_id: 'testchat:C1',
+    instance: 'testchat',
+    name: 'Pondarium',
+    // Legacy rows carry NULL here (the real pondarium row does); the gate
+    // must treat that as a group — only an explicit 0 means DM.
+    is_group: null as unknown as number, // insert type says number; live legacy rows hold NULL
+    unknown_sender_policy: 'public',
+    created_at: now(),
+  });
+  let n = 0;
+  for (const agentGroupId of [GATED, PLAIN]) {
+    await createAgentGroup({
+      id: agentGroupId,
+      name: agentGroupId,
+      folder: agentGroupId,
+      agent_provider: null,
+      created_at: now(),
+    });
+    await createMessagingGroupAgent({
+      id: `mga-${++n}`,
+      messaging_group_id: 'mg-1',
+      agent_group_id: agentGroupId,
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'shared',
+      priority: 0,
+      threads: 0,
+      created_at: now(),
+    });
+  }
+}
+
+function writeGateConfig(entry: Record<string, unknown>): void {
+  fs.mkdirSync(TEST_DIR, { recursive: true });
+  fs.writeFileSync(path.join(TEST_DIR, 'jev-gate.json'), JSON.stringify({ [GATED]: entry }));
+  resetGateConfigCache();
+}
+
+function stubJev(direct_invitation: number): void {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        answers: {
+          direct_invitation: { type: 'noul', noul: direct_invitation },
+          unresolved: { type: 'noul', noul: 0 },
+          already_answered: { type: 'noul', noul: 0 },
+          human_pingpong: { type: 'noul', noul: 0 },
+        },
+      }),
+    }),
+  );
+}
+
+async function inbound(id: string, text: string): Promise<void> {
+  await routeInbound({
+    channelType: 'testchat',
+    platformId: 'testchat:C1',
+    threadId: null,
+    message: {
+      id,
+      kind: 'chat',
+      content: JSON.stringify({
+        text,
+        sender: 'Alex',
+        senderId: 'testchat:U1',
+        senderName: 'Alex',
+        author: { userId: 'testchat:U1', fullName: 'Alex', userName: 'alex', isBot: false },
+        attachments: [],
+      }),
+      timestamp: now(),
+      isMention: false,
+      isGroup: true,
+    },
+  });
+}
+
+/** The stored inbound contents for one agent group's only session. */
+async function storedContents(
+  agentGroupId: string,
+): Promise<Array<{ text?: string; jev?: { v?: string; mode?: string } }>> {
+  const sessions = await getSessionsByAgentGroup(agentGroupId);
+  const contents: Array<{ text?: string; jev?: { v?: string; mode?: string } }> = [];
+  for (const session of sessions) {
+    const rows = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => mailbox.getInboundHistory(50));
+    for (const row of rows ?? []) contents.push(JSON.parse(row.content) as { text?: string; jev?: { v?: string } });
+  }
+  return contents;
+}
+
+/** The stored inbound texts for one agent group's only session. */
+async function storedTexts(agentGroupId: string): Promise<string[]> {
+  return (await storedContents(agentGroupId)).map((c) => c.text ?? '');
+}
+
+/**
+ * An inbound photo whose download is deferred, wired the way src/index.ts
+ * wires it: the adapter mutates its own payload, and the memoized hook
+ * re-serializes it into the ORIGINAL event — never into a copy.
+ */
+async function inboundWithPhoto(id: string): Promise<{ download: ReturnType<typeof vi.fn> }> {
+  const payload = {
+    text: 'look at this',
+    sender: 'Alex',
+    senderId: 'testchat:U1',
+    author: { userId: 'testchat:U1', fullName: 'Alex', userName: 'alex', isBot: false },
+    attachments: [{ type: 'photo', fileId: 'F1' } as Record<string, unknown>],
+  };
+  const event: Parameters<typeof routeInbound>[0] = {
+    channelType: 'testchat',
+    platformId: 'testchat:C1',
+    threadId: null,
+    message: { id, kind: 'chat', content: JSON.stringify(payload), timestamp: now(), isMention: false, isGroup: true },
+  };
+  const stagedPath = path.join(TEST_DIR, 'inbound-staging', 'telegram', id, 'photo.jpg');
+  const download = vi.fn(async () => {
+    fs.mkdirSync(path.dirname(stagedPath), { recursive: true });
+    fs.writeFileSync(stagedPath, 'jpeg-bytes');
+    Object.assign(payload.attachments[0], { name: 'photo.jpg', stagedPath });
+  });
+  let pending: Promise<void> | undefined;
+  event.materialize = () => {
+    pending ??= (async () => {
+      try {
+        await download();
+      } finally {
+        event.message.content = JSON.stringify(payload);
+      }
+    })();
+    return pending;
+  };
+  await routeInbound(event);
+  return { download };
+}
+
+/** The stored first-attachment localPath and verdict for one agent group's rows. */
+async function storedAttachments(agentGroupId: string): Promise<Array<{ localPath: unknown; jev: unknown }>> {
+  const out: Array<{ localPath: unknown; jev: unknown }> = [];
+  for (const session of await getSessionsByAgentGroup(agentGroupId)) {
+    const rows = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => mailbox.getInboundHistory(50));
+    for (const row of rows ?? []) {
+      const content = JSON.parse(row.content) as { attachments?: Array<{ localPath?: string }>; jev?: { v?: string } };
+      out.push({ localPath: content.attachments?.[0]?.localPath ?? null, jev: content.jev?.v ?? null });
+    }
+  }
+  return out;
+}
+
+beforeEach(async () => {
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  fs.mkdirSync(TEST_DIR, { recursive: true });
+  resetGateConfigCache();
+  await runMigrations(await initTestDb());
+  vi.clearAllMocks();
+});
+
+afterEach(async () => {
+  vi.unstubAllGlobals();
+  await teardownChannelAdapters();
+  await closeDb();
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+});
+
+describe('routeInbound with the Jev wake-gate', () => {
+  it('silences the gated wiring and leaves the other wiring untouched', async () => {
+    writeGateConfig({ enabled: true, mode: 'live', daily_cap: 0, cooldown_minutes: 0, max_consecutive_bot: 0 });
+    stubJev(0.1);
+    await activate();
+    await seed();
+
+    await inbound('m1', 'two humans chatting about lunch');
+
+    const gated = await storedContents(GATED);
+    expect(gated).toHaveLength(1);
+    // The verdict is metadata only: what the agent reads stays the chat's own text.
+    expect(gated[0].text).toBe('two humans chatting about lunch');
+    expect(gated[0].jev).toMatchObject({ v: 'silent', mode: 'live' });
+
+    // The fan-out loop shares one event object: the verdict must not have
+    // reached the other wiring's copy.
+    const plain = await storedContents(PLAIN);
+    expect(plain.map((c) => c.text)).toEqual(['two humans chatting about lunch']);
+    expect(plain[0].jev).toBeUndefined();
+
+    // Only the ungated wiring woke a container.
+    expect(wakeContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it('wakes the gated wiring when Jev says reply, annotating only its own copy', async () => {
+    writeGateConfig({ enabled: true, mode: 'live', daily_cap: 0, cooldown_minutes: 0, max_consecutive_bot: 0 });
+    stubJev(0.95);
+    await activate();
+    await seed();
+
+    await inbound('m1', 'can someone check the deploy?');
+
+    const [gated] = await storedContents(GATED);
+    expect(gated.text).toBe('can someone check the deploy?');
+    expect(gated.jev).toMatchObject({ v: 'reply', mode: 'live' });
+    expect(await storedTexts(PLAIN)).toEqual(['can someone check the deploy?']);
+    expect(wakeContainer).toHaveBeenCalledTimes(2);
+  });
+
+  it('shadow mode annotates but suppresses the wake (pre-gate baseline)', async () => {
+    writeGateConfig({ enabled: true, mode: 'shadow', daily_cap: 0, cooldown_minutes: 0, max_consecutive_bot: 0 });
+    stubJev(0.95);
+    await activate();
+    await seed();
+
+    await inbound('m1', 'can someone check the deploy?');
+
+    const [gated] = await storedContents(GATED);
+    expect(gated.text).toBe('can someone check the deploy?');
+    expect(gated.jev).toMatchObject({ v: 'reply', mode: 'shadow' });
+    expect(wakeContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it('behaves exactly as upstream when no gate config exists', async () => {
+    stubJev(0.05);
+    await activate();
+    await seed();
+
+    await inbound('m1', 'two humans chatting about lunch');
+
+    expect(await storedTexts(GATED)).toEqual(['two humans chatting about lunch']);
+    expect(await storedTexts(PLAIN)).toEqual(['two humans chatting about lunch']);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(wakeContainer).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not judge an @mention — those wake on the platform signal alone', async () => {
+    writeGateConfig({ enabled: true, mode: 'live', daily_cap: 0, cooldown_minutes: 0, max_consecutive_bot: 0 });
+    stubJev(0.05);
+    await activate();
+    await seed();
+
+    await routeInbound({
+      channelType: 'testchat',
+      platformId: 'testchat:C1',
+      threadId: null,
+      message: {
+        id: 'm1',
+        kind: 'chat',
+        content: JSON.stringify({ text: '@bot hello', sender: 'Alex', senderId: 'testchat:U1' }),
+        timestamp: now(),
+        isMention: true,
+        isGroup: true,
+      },
+    });
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await storedTexts(GATED))[0]).toBe('@bot hello');
+    expect(wakeContainer).toHaveBeenCalledTimes(2);
+  });
+
+  for (const [verdict, invitation] of [
+    ['silent', 0.1],
+    ['reply', 0.95],
+  ] as const) {
+    it(`stores the downloaded attachment path on a ${verdict} verdict, downloading once`, async () => {
+      writeGateConfig({ enabled: true, mode: 'live', daily_cap: 0, cooldown_minutes: 0, max_consecutive_bot: 0 });
+      stubJev(invitation);
+      await activate();
+      await seed();
+
+      const { download } = await inboundWithPhoto('m1');
+
+      // The gated copy used to keep its pre-download snapshot: fileId only,
+      // no localPath, so the agent was never told where the file landed.
+      const inboxPath = expect.stringMatching(/^inbox\/[^/]+\/photo\.jpg$/);
+      expect(await storedAttachments(GATED)).toEqual([{ localPath: inboxPath, jev: verdict }]);
+      expect(await storedAttachments(PLAIN)).toEqual([{ localPath: inboxPath, jev: null }]);
+      expect(download).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  // Last: the sender resolver is module state the other tests run without.
+  it('judges the new message with the sender role the host stamps', async () => {
+    writeGateConfig({ enabled: true, mode: 'live', daily_cap: 0, cooldown_minutes: 0, max_consecutive_bot: 0 });
+    stubJev(0.95);
+    await activate();
+    await seed();
+    await createUser({ id: 'testchat:U1', kind: 'testchat', display_name: 'Alex', created_at: now() });
+    await grantRole({
+      user_id: 'testchat:U1',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
+    setSenderResolver(() => 'testchat:U1');
+
+    await inbound('m1', 'can someone check the deploy?');
+
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as { body: string }).body) as { state: string };
+    expect(body.state).toContain('NEW MESSAGE:\nAlex [owner]: can someone check the deploy?');
+  });
+});

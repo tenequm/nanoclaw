@@ -16,3 +16,4 @@ import './approvals.js';
 import './sessions.js';
 import './tasks.js';
 import './templates.js';
+import './jev-gate.js';

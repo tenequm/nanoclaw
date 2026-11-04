@@ -19,6 +19,8 @@ import type { CallerContext } from './frame.js';
  */
 export const GROUP_SCOPE_RESOURCES = new Set(['groups', 'sessions', 'destinations', 'members', 'tasks', 'templates']);
 
+export const GROUP_SCOPE_PARTIAL_RESOURCES = new Set(['wirings', 'jev-gate']);
+
 export type Access = 'open' | 'approval' | 'hidden';
 
 export type CommandDef<TArgs = unknown, TData = unknown> = {

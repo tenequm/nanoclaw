@@ -1,3 +1,8 @@
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  DATA_DIR: `/tmp/nanoclaw-project-doc-compose-test-${process.pid}/data`,
+}));
+import { resetGateConfigCache, writeGateEntry } from './modules/jev-gate/index.js';
 import {
   FORMATTING_BODY,
   FORMATTING_SECTION,
@@ -642,4 +647,34 @@ describe('Slack resident instructions', () => {
       expect(await withRealContainer(() => compose(other))).not.toContain('# NanoClaw Skill: slack-construct');
     },
   );
+});
+
+describe('Jev project sections', () => {
+  const JEV_SECTION = 'NanoClaw Module: jev-gate';
+  beforeEach(() => {
+    fs.mkdirSync(path.join(TEST_ROOT, 'data'), { recursive: true });
+    resetGateConfigCache();
+  });
+  it('adds the jev-gate note for an agent whose gate is live', async () => {
+    const ag = await seed('ag-jev-live', 'jev-live-group');
+    writeGateEntry(ag.id, { enabled: true, mode: 'live' });
+
+    const doc = await compose(ag);
+
+    expect(composedSection(doc, JEV_SECTION)).toContain('A gate wake is an invitation, not an order');
+  });
+
+  // Shadow silences every ambient message, so the note's "the gate wakes you" would be false.
+  it.each([
+    ['no entry', 'none', undefined],
+    ['a disabled entry', 'disabled', { enabled: false, mode: 'live' as const }],
+    ['a shadow entry', 'shadow', { enabled: true, mode: 'shadow' as const }],
+  ])('leaves the jev-gate note out with %s', async (_label, key, entry) => {
+    const ag = await seed(`ag-jev-${key}`, `jev-off-${key}`);
+    if (entry) writeGateEntry(ag.id, entry);
+
+    const doc = await compose(ag);
+
+    expect(doc).not.toContain(`# ${JEV_SECTION}`);
+  });
 });
