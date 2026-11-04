@@ -7,6 +7,7 @@
 // self-registration import below.
 
 import './cli.js';
+import './telegram-grammy/index.js';
 
 import './slack.js';
 import './slack-a2a-guard.js';

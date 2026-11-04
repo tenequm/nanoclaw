@@ -18,13 +18,15 @@
  * This test asserts the SECURE behaviour (nothing written outside). It FAILS
  * against the current code, demonstrating the gap.
  */
+import { sweepInboundStaging } from './inbound-staging.js';
+import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-saveatt-gap' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-saveatt-gap-${process.pid}` };
 });
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
@@ -32,7 +34,7 @@ import { createSession } from './db/sessions.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-saveatt-gap';
+const TEST_DIR = `/tmp/nanoclaw-test-saveatt-gap-${process.pid}`;
 const AG = 'ag-saveatt';
 const SESS = 'sess-saveatt';
 
@@ -174,5 +176,106 @@ describe('extractAttachmentFiles — inbox-root symlink containment (#2828 sibli
     const escaped = path.join(canaryDir, 'evil-inbox-root', 'pwn.txt');
     expect(fs.existsSync(escaped)).toBe(false);
     expect(fs.readdirSync(canaryDir)).toHaveLength(0);
+  });
+});
+
+describe('extractAttachmentFiles: staged adapter downloads', () => {
+  const STAGING = path.join(TEST_DIR, 'inbound-staging', 'telegram', 'stage-1');
+
+  async function write(id: string, attachment: Record<string, unknown>): Promise<Record<string, unknown>> {
+    await writeSessionMessage(AG, SESS, {
+      id,
+      kind: 'chat-sdk',
+      timestamp: now(),
+      platformId: 'telegram:123',
+      channelType: 'telegram',
+      threadId: null,
+      content: JSON.stringify({ text: '', attachments: [attachment] }),
+    });
+    const db = new Database(path.join(sessionDir(AG, SESS), 'inbound.db'), { readonly: true });
+    const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(id) as { content: string };
+    db.close();
+    return JSON.parse(row.content).attachments[0];
+  }
+
+  beforeEach(() => fs.mkdirSync(STAGING, { recursive: true }));
+
+  it('copies a staged file into the inbox under its staged name, keeping the display name', async () => {
+    const staged = path.join(STAGING, 'photo.jpg');
+    fs.writeFileSync(staged, 'jpeg-bytes');
+
+    const att = await write('-100:7:ag', { type: 'sticker', name: 'a sticker (from Pack)', stagedPath: staged });
+
+    expect(att).toMatchObject({ name: 'a sticker (from Pack)', localPath: 'inbox/-100:7:ag/photo.jpg' });
+    expect(att).not.toHaveProperty('stagedPath');
+    expect(fs.readFileSync(path.join(sessionDir(AG, SESS), 'inbox', '-100:7:ag', 'photo.jpg'), 'utf8')).toBe(
+      'jpeg-bytes',
+    );
+    // Copied, not moved: the same message can be routed to another session.
+    expect(fs.existsSync(staged)).toBe(true);
+  });
+
+  it.each([
+    ['a path outside the staging root', () => path.join(TEST_DIR, 'host-secret.txt')],
+    [
+      'a symlink inside the staging root pointing out',
+      () => {
+        const link = path.join(STAGING, 'link.txt');
+        fs.symlinkSync(path.join(TEST_DIR, 'host-secret.txt'), link);
+        return link;
+      },
+    ],
+  ])('refuses %s and never lets the host path reach the container', async (_label, stagedPath) => {
+    fs.writeFileSync(path.join(TEST_DIR, 'host-secret.txt'), 'secret');
+
+    const att = await write('forged', { type: 'document', name: 'x.txt', stagedPath: stagedPath() });
+
+    expect(att).not.toHaveProperty('stagedPath');
+    expect(att).not.toHaveProperty('localPath');
+    expect(att.error).toBe('the file is no longer available');
+    expect(fs.existsSync(path.join(sessionDir(AG, SESS), 'inbox', 'forged'))).toBe(false);
+  });
+
+  it('keeps the message, and says why, when a staged file cannot be copied', async () => {
+    const staged = path.join(STAGING, 'locked.pdf');
+    fs.writeFileSync(staged, 'pdf');
+    fs.chmodSync(staged, 0o000);
+
+    const att = await write('locked', { type: 'document', name: 'locked.pdf', stagedPath: staged });
+
+    expect(att).not.toHaveProperty('localPath');
+    expect(att.error).toMatch(/^could not be saved \(E[A-Z]+\)$/);
+  });
+
+  it('strips a stagedPath even when the message id is refused', async () => {
+    const staged = path.join(STAGING, 'photo.jpg');
+    fs.writeFileSync(staged, 'jpeg-bytes');
+
+    const att = await write('../escape', { type: 'photo', name: 'photo.jpg', stagedPath: staged });
+
+    expect(att).not.toHaveProperty('stagedPath');
+    expect(att).not.toHaveProperty('localPath');
+  });
+});
+
+describe('sweepInboundStaging', () => {
+  it('removes staged entries past the routing window and keeps fresh ones and outside targets', async () => {
+    const adapterDir = path.join(TEST_DIR, 'inbound-staging', 'telegram');
+    const stale = path.join(adapterDir, 'stale');
+    const fresh = path.join(adapterDir, 'fresh');
+    const outside = path.join(TEST_DIR, 'outside');
+    for (const dir of [stale, fresh, outside]) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'keep.txt'), 'keep');
+    fs.symlinkSync(outside, path.join(adapterDir, 'link'));
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    fs.utimesSync(stale, twoHoursAgo, twoHoursAgo);
+    fs.lutimesSync(path.join(adapterDir, 'link'), twoHoursAgo, twoHoursAgo);
+
+    await sweepInboundStaging();
+
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(fresh)).toBe(true);
+    expect(fs.existsSync(path.join(adapterDir, 'link'))).toBe(false);
+    expect(fs.readFileSync(path.join(outside, 'keep.txt'), 'utf8')).toBe('keep');
   });
 });

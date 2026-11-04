@@ -1,8 +1,15 @@
+import {
+  FORMATTING_BODY,
+  FORMATTING_SECTION,
+  RICH_MESSAGES_BODY,
+  RICH_MESSAGES_SECTION,
+} from './channels/telegram-grammy/agent-docs.js';
+import { createMessagingGroup, createMessagingGroupAgent } from './db/messaging-groups.js';
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-project-doc-compose-test';
+const TEST_ROOT = `/tmp/nanoclaw-project-doc-compose-test-${process.pid}`;
 const REPO_ROOT = process.cwd();
 
 vi.mock('./log.js', () => ({
@@ -521,4 +528,97 @@ it('gates resident skill prose by agent and fails closed on errors', async () =>
     '# NanoClaw Skill: fixture-gateway',
   );
   expect(await compose(await seed('ag-skill-allowed', 'skill-allowed'))).toContain('# NanoClaw Skill: fixture-gateway');
+});
+async function withRealContainer<T>(fn: () => Promise<T>): Promise<T> {
+  const root = fs.mkdtempSync(path.join(TEST_ROOT, 'real-skills-'));
+  fs.mkdirSync(path.join(root, 'container'));
+  for (const entry of ['CLAUDE.md', 'agent-runner', 'skills']) {
+    fs.symlinkSync(path.join(REPO_ROOT, 'container', entry), path.join(root, 'container', entry));
+  }
+  const previousCwd = process.cwd();
+  process.chdir(root);
+  try {
+    return await fn();
+  } finally {
+    process.chdir(previousCwd);
+  }
+}
+
+/** One composed section, up to the next composed heading; the base has headings of its own. */
+function composedSection(doc: string, name: string): string {
+  const start = doc.indexOf(`# ${name}\n\n`);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const rest = doc.slice(start);
+  const next = rest.slice(1).search(/\n\n# (NanoClaw (Module|Skill): |MCP Server: |Native Runtime Skills\n)/);
+  return next === -1 ? rest : rest.slice(0, next + 1);
+}
+
+describe('Telegram project sections', () => {
+  async function wire(ag: AgentGroup, mgId: string, channelType: string, instance = channelType): Promise<void> {
+    const createdAt = new Date().toISOString();
+    await createMessagingGroup({
+      id: mgId,
+      channel_type: channelType,
+      platform_id: `${channelType}:${mgId}`,
+      instance,
+      name: mgId,
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: createdAt,
+    });
+    await createMessagingGroupAgent({
+      id: `mga-${mgId}`,
+      messaging_group_id: mgId,
+      agent_group_id: ag.id,
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      threads: 0,
+      created_at: createdAt,
+    });
+  }
+
+  it('composes the Telegram formatting guide for a Telegram-wired agent, whatever its skill list', async () => {
+    const tg = await seed('ag-tg-fmt', 'tg-fmt-group');
+    await wire(tg, 'mg-tg-fmt', 'telegram');
+    await updateContainerConfigJson(tg.id, 'skills', ['welcome']);
+    expect(composedSection(await withRealContainer(() => compose(tg)), FORMATTING_SECTION)).toContain(FORMATTING_BODY);
+
+    const slack = await seed('ag-slack-fmt', 'slack-fmt-group');
+    await wire(slack, 'mg-slack-fmt', 'slack');
+    const doc = await withRealContainer(() => compose(slack));
+    expect(doc).toContain('# NanoClaw Skill: onecli-gateway');
+    expect(doc).not.toContain(`# ${FORMATTING_SECTION}`);
+  });
+
+  it('puts the formatting guide before the Rich messages section', async () => {
+    const ag = await seed('ag-tg-order', 'tg-order-group');
+    await wire(ag, 'mg-tg-order', 'telegram');
+    await updateContainerConfigScalars(ag.id, { rich_messages: 1 });
+
+    const doc = await compose(ag);
+
+    const formatting = doc.indexOf(`# ${FORMATTING_SECTION}\n`);
+    expect(formatting).toBeGreaterThanOrEqual(0);
+    expect(doc.indexOf(`# ${RICH_MESSAGES_SECTION}\n`)).toBeGreaterThan(formatting);
+  });
+
+  it('composes the Rich Messages section only for a Telegram-wired agent with rich_messages on', async () => {
+    const on = await seed('ag-rich-on', 'rich-on-group');
+    await wire(on, 'mg-rich-on', 'telegram');
+    await updateContainerConfigScalars(on.id, { rich_messages: 1 });
+    expect(composedSection(await compose(on), RICH_MESSAGES_SECTION)).toContain(RICH_MESSAGES_BODY);
+
+    const off = await seed('ag-rich-off', 'rich-off-group');
+    await wire(off, 'mg-rich-off', 'telegram');
+    expect(await compose(off)).not.toContain(`# ${RICH_MESSAGES_SECTION}`);
+
+    const slackOnly = await seed('ag-rich-slack', 'rich-slack-group');
+    await wire(slackOnly, 'mg-rich-slack', 'slack');
+    await updateContainerConfigScalars(slackOnly.id, { rich_messages: 1 });
+    expect(await compose(slackOnly)).not.toContain(`# ${RICH_MESSAGES_SECTION}`);
+  });
 });

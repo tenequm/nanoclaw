@@ -673,6 +673,11 @@ export async function deliverToAgent(
   }
 
   const messageId = messageIdForAgent(event.message.id, agent.agent_group_id);
+  try {
+    await event.materialize?.();
+  } catch (err) {
+    log.warn('Inbound message materialization failed', { err });
+  }
   const rawContent =
     normalizedText !== undefined ? applyNormalizedText(event.message.content, normalizedText) : event.message.content;
   const content = isChat ? stampSenderRole(rawContent, senderRole) : rawContent;

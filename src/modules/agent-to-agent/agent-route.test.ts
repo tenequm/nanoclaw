@@ -23,10 +23,10 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-a2a-route' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-a2a-route-${process.pid}` };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-a2a-route';
+const TEST_DIR = `/tmp/nanoclaw-test-a2a-route-${process.pid}`;
 
 function now(): string {
   return new Date().toISOString();
@@ -219,6 +219,26 @@ describe('routeAgentMessage return-path', () => {
     vi.restoreAllMocks();
     await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('drops a stagedPath the sending agent put on an attachment, so the host copies nothing', async () => {
+    const staged = path.join(TEST_DIR, 'inbound-staging', 'telegram', 'other-chat', 'photo.jpg');
+    fs.mkdirSync(path.dirname(staged), { recursive: true });
+    fs.writeFileSync(staged, 'someone else');
+
+    await routeAgentMessage(
+      {
+        id: 'msg-claims-staged',
+        platform_id: B,
+        content: JSON.stringify({ text: 'look', attachments: [{ name: 'photo.jpg', stagedPath: staged }] }),
+        in_reply_to: null,
+      },
+      S1,
+    );
+
+    const [row] = readInbound(B, SB.id);
+    expect(JSON.parse(row.content)).toEqual({ text: 'look', attachments: [{ name: 'photo.jpg' }] });
+    expect(fs.existsSync(path.join(sessionDir(B, SB.id), 'inbox'))).toBe(false);
   });
 
   it('drops a senderRole the sending agent put in its content', async () => {

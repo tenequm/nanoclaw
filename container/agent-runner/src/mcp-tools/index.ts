@@ -6,6 +6,9 @@
  * at module scope, and append the import here. No central list.
  */
 import './core.js';
+import './media-group.js';
+import { offerRichMessages } from './rich-messages.js';
+import { loadConfig } from '../config.js';
 import './interactive.js';
 import './agents.js';
 import './self-mod.js';
@@ -20,6 +23,7 @@ function log(msg: string): void {
 
 async function main(): Promise<void> {
   const mailbox = getAgentMailbox();
+  if (loadConfig().richMessages) offerRichMessages();
   await mailbox.start(await readMailboxContext());
   try {
     await startMcpServer((action) => mailbox.run(action));

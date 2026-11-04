@@ -61,7 +61,7 @@ import './cli/commands/index.js';
 import './cli/delivery-action.js';
 import { startCliServer, stopCliServer } from './cli/socket-server.js';
 
-import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundEvent } from './channels/adapter.js';
 import {
   initChannelAdapters,
   teardownChannelAdapters,
@@ -105,25 +105,37 @@ async function main(): Promise<void> {
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
       onInbound(platformId, threadId, message) {
+        const event: InboundEvent = {
+          channelType: adapter.channelType,
+          // The one host-side stamping seam: adapters stay instance-blind,
+          // the host stamps the receiving instance on every inbound event.
+          instance: adapter.instance ?? adapter.channelType,
+          platformId,
+          threadId,
+          message: {
+            id: message.id,
+            kind: message.kind,
+            content: JSON.stringify(message.content),
+            timestamp: message.timestamp,
+            isMention: message.isMention,
+            isGroup: message.isGroup,
+          },
+        };
+        if (message.materialize) {
+          let materializePromise: Promise<void> | undefined;
+          event.materialize = () => {
+            materializePromise ??= (async () => {
+              try {
+                await message.materialize!();
+              } finally {
+                event.message.content = JSON.stringify(message.content);
+              }
+            })();
+            return materializePromise;
+          };
+        }
         inboundReady
-          .then(() =>
-            routeInbound({
-              channelType: adapter.channelType,
-              // The one host-side stamping seam: adapters stay instance-blind,
-              // the host stamps the receiving instance on every inbound event.
-              instance: adapter.instance ?? adapter.channelType,
-              platformId,
-              threadId,
-              message: {
-                id: message.id,
-                kind: message.kind,
-                content: JSON.stringify(message.content),
-                timestamp: message.timestamp,
-                isMention: message.isMention,
-                isGroup: message.isGroup,
-              },
-            }),
-          )
+          .then(() => routeInbound(event))
           .catch((err) => {
             log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
           });

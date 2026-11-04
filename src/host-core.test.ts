@@ -41,14 +41,14 @@ vi.mock('./container-runner.js', () => ({
 // Override DATA_DIR for tests
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-host' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-host-${process.pid}` };
 });
 
 function now() {
   return new Date().toISOString();
 }
 
-const TEST_DIR = '/tmp/nanoclaw-test-host';
+const TEST_DIR = `/tmp/nanoclaw-test-host-${process.pid}`;
 
 beforeEach(async () => {
   // Clean test directory
@@ -493,6 +493,100 @@ describe('router', () => {
 
     // Verify container was woken
     expect(wakeContainer).toHaveBeenCalled();
+  });
+
+  it('does not materialize a message refused by the access gate', async () => {
+    const { routeInbound, setAccessGate } = await import('./router.js');
+    const materialize = vi.fn(async () => {});
+    setAccessGate((event) =>
+      event.message.id === 'msg-refused' ? { allowed: false, reason: 'test_refusal' } : { allowed: true },
+    );
+
+    await routeInbound({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      threadId: null,
+      materialize,
+      message: {
+        id: 'msg-refused',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'Unknown', text: 'blocked' }),
+        timestamp: now(),
+      },
+    });
+
+    expect(materialize).not.toHaveBeenCalled();
+    expect(await findSession('mg-1', null)).toBeUndefined();
+  });
+
+  it('materializes once across two agent wirings and copies the staged file into each inbox', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { getSessionsByAgentGroup } = await import('./db/sessions.js');
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Second Agent',
+      folder: 'second-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await createMessagingGroupAgent({
+      id: 'mga-2',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-2',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+
+    const content: { text: string; attachments: Array<{ fileId: string; name?: string; stagedPath?: string }> } = {
+      text: 'photo',
+      attachments: [{ fileId: 'photo-1' }],
+    };
+    const stagedPath = path.join(TEST_DIR, 'inbound-staging', 'telegram', 'stage-1', 'photo.jpg');
+    const runMaterialize = vi.fn(async () => {
+      fs.mkdirSync(path.dirname(stagedPath), { recursive: true });
+      fs.writeFileSync(stagedPath, 'jpeg-bytes');
+      content.attachments[0] = { ...content.attachments[0], name: 'photo.jpg', stagedPath };
+    });
+    const event: InboundEvent = {
+      channelType: 'discord',
+      platformId: 'chan-123',
+      threadId: null,
+      message: {
+        id: 'msg-materialize',
+        kind: 'chat',
+        content: JSON.stringify(content),
+        timestamp: now(),
+      },
+    };
+    let materializePromise: Promise<void> | undefined;
+    event.materialize = () => {
+      materializePromise ??= (async () => {
+        await runMaterialize();
+        event.message.content = JSON.stringify(content);
+      })();
+      return materializePromise;
+    };
+
+    await routeInbound(event);
+
+    expect(runMaterialize).toHaveBeenCalledTimes(1);
+    for (const agentGroupId of ['ag-1', 'ag-2']) {
+      const sessions = await getSessionsByAgentGroup(agentGroupId);
+      expect(sessions).toHaveLength(1);
+      const db = new Database(inboundDbPath(agentGroupId, sessions[0].id));
+      const row = db.prepare('SELECT id, content FROM messages_in LIMIT 1').get() as { id: string; content: string };
+      db.close();
+      const [attachment] = JSON.parse(row.content).attachments;
+      expect(attachment).toMatchObject({ name: 'photo.jpg', localPath: `inbox/${row.id}/photo.jpg` });
+      expect(attachment).not.toHaveProperty('stagedPath');
+      const inboxCopy = path.join(TEST_DIR, 'v2-sessions', agentGroupId, sessions[0].id, attachment.localPath);
+      expect(fs.readFileSync(inboxCopy, 'utf8')).toBe('jpeg-bytes');
+    }
   });
 
   it('auto-creates messaging group only when the bot is addressed (mention/DM)', async () => {

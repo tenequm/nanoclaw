@@ -1,0 +1,429 @@
+/**
+ * Coverage for the id-shape decoder used by outbound edit/reaction ops.
+ *
+ * The agent-runner's `getMessageIdBySeq` hands us three formats depending
+ * on where the id came from (bare numeric for delivered outbound, 2-part
+ * for legacy inbound, 3-part for inbound wrapped by `messageIdForAgent`),
+ * and the adapter has to decode all of them without losing the chat id.
+ */
+import { describe, expect, it } from 'vitest';
+import type { MessageEntity } from 'grammy/types';
+
+import type { Message } from 'grammy/types';
+
+import { TIMEZONE } from '../../config.js';
+import { formatLocalTime } from '../../timezone.js';
+import {
+  callbackCardAddress,
+  entitiesToMarkdown,
+  extractReplyContext,
+  extractTelegramMessageId,
+  parseChatId,
+  parseTopicId,
+  platformIdFor,
+  richMessageToMarkdown,
+  resolveMessageThreadId,
+  toInboundMessage,
+  type InboundContent,
+} from './inbound.js';
+
+const e = (obj: unknown): MessageEntity[] => obj as MessageEntity[];
+
+describe('platformIdFor (forum topics become first-class platform ids)', () => {
+  it('returns the 2-part base id for plain chats and DMs', () => {
+    expect(platformIdFor(-1000000000001)).toBe('telegram:-1000000000001');
+    expect(platformIdFor(1000001, { message_id: 1 } as Message)).toBe('telegram:1000001');
+  });
+
+  it('suffixes the topic id for forum-topic messages', () => {
+    const msg = { message_id: 7, is_topic_message: true, message_thread_id: 42 } as Message;
+    expect(platformIdFor(-1000000000001, msg)).toBe('telegram:-1000000000001:42');
+  });
+
+  it('ignores message_thread_id on non-topic messages (plain reply threads)', () => {
+    const msg = { message_id: 7, message_thread_id: 42 } as Message;
+    expect(platformIdFor(-100123, msg)).toBe('telegram:-100123');
+  });
+});
+
+describe('callbackCardAddress (a tapped card, in the ids an approval row stores)', () => {
+  it('uses the bare message id outbound returned and the DM platform id', () => {
+    const msg = { message_id: 812, chat: { id: 1000001, type: 'private' } } as Message;
+    expect(callbackCardAddress(msg)).toEqual({ messageId: '812', platformId: 'telegram:1000001' });
+  });
+
+  it('keeps the forum topic in the platform id', () => {
+    const msg = {
+      message_id: 9,
+      chat: { id: -1000000000001, type: 'supergroup' },
+      is_topic_message: true,
+      message_thread_id: 42,
+    } as Message;
+    expect(callbackCardAddress(msg)).toEqual({ messageId: '9', platformId: 'telegram:-1000000000001:42' });
+  });
+});
+
+describe('toInboundMessage drops content-free service messages', () => {
+  const ctxFor = (msg: Record<string, unknown>) =>
+    ({
+      chat: { id: -1000000000001, type: 'supergroup', title: 'Test group' },
+      msg,
+      from: { id: 1000001, first_name: 'Sender', is_bot: false },
+      update: {},
+    }) as unknown as Parameters<typeof toInboundMessage>[0];
+
+  it('returns null for a service message with no text and no attachments (e.g. new_chat_photo)', () => {
+    expect(toInboundMessage(ctxFor({ message_id: 19, date: 1_700_000_000 }), 'bot', 1)).toBeNull();
+  });
+
+  it('keeps a normal text message', () => {
+    const env = toInboundMessage(ctxFor({ message_id: 20, date: 1_700_000_000, text: 'hi' }), 'bot', 1);
+    expect(env).not.toBeNull();
+    expect(env!.platformId).toBe('telegram:-1000000000001');
+  });
+
+  it('keeps an attachment-only message', () => {
+    const env = toInboundMessage(
+      ctxFor({
+        message_id: 21,
+        date: 1_700_000_000,
+        photo: [{ file_id: 'f', width: 10, height: 10, file_size: 5 }],
+      }),
+      'bot',
+      1,
+    );
+    expect(env).not.toBeNull();
+  });
+
+  it('omits attachments from edited messages', () => {
+    const ctx = ctxFor({
+      message_id: 22,
+      date: 1_700_000_000,
+      edit_date: 1_700_000_100,
+      caption: 'updated caption',
+      photo: [{ file_id: 'edited-photo', width: 10, height: 10, file_size: 5 }],
+    });
+    (ctx.update as { edited_message?: unknown }).edited_message = ctx.msg;
+
+    const env = toInboundMessage(ctx, 'bot', 1);
+    const content = env!.message.content as InboundContent;
+
+    expect(env).not.toBeNull();
+    expect(content.attachments).toEqual([]);
+    expect(content.text).toContain('updated caption');
+    expect(content.replyTo?.id).toBe('22');
+  });
+
+  it('renders forwarded-message dates in the install timezone', () => {
+    const forwardedAt = 1_700_000_000;
+    const ctx = ctxFor({
+      message_id: 23,
+      date: forwardedAt + 60,
+      text: 'forwarded body',
+      forward_origin: {
+        type: 'hidden_user',
+        sender_user_name: 'Original Sender',
+        date: forwardedAt,
+      },
+    });
+
+    const env = toInboundMessage(ctx, 'bot', 1)!;
+    const content = env.message.content as InboundContent;
+    const displayed = formatLocalTime(new Date(forwardedAt * 1000).toISOString(), TIMEZONE);
+
+    expect(content.text).toContain(`[forwarded from Original Sender (hidden profile), ${displayed}]`);
+    expect(content.text).not.toContain(' UTC]');
+  });
+});
+
+// The ambient wake-gate needs to know whether a message came from another bot
+// (bot-loop guard, and the veto rubric), and Telegram tells us on every `from`.
+describe('toInboundMessage propagates author.isBot', () => {
+  const ctxFor = (isBot: boolean) =>
+    ({
+      chat: { id: -1000000000001, type: 'supergroup', title: 'Test group' },
+      msg: { message_id: 30, date: 1_700_000_000, text: 'hello' },
+      from: { id: 1000002, first_name: 'Levi', username: 'LeviBot', is_bot: isBot },
+      update: {},
+    }) as unknown as Parameters<typeof toInboundMessage>[0];
+
+  it('is true for a bot sender', () => {
+    const content = toInboundMessage(ctxFor(true), 'bot', 1)!.message.content as InboundContent;
+    expect(content.author.isBot).toBe(true);
+  });
+
+  it('is false for a human sender', () => {
+    const content = toInboundMessage(ctxFor(false), 'bot', 1)!.message.content as InboundContent;
+    expect(content.author.isBot).toBe(false);
+  });
+});
+
+describe('extractReplyContext keeps voice call links out of the agent', () => {
+  it('redacts the link of a quoted /voice reply, whole message or highlighted fragment', () => {
+    const text =
+      '🎙 Voice call with Emma: https://host.example/voice?t=0123abcd\n\nVoice calls now talk in this chat, until /voice is run in another one.';
+    const reply = { message_id: 9, text, from: { first_name: 'Bot' } };
+    expect(extractReplyContext({ message_id: 10, reply_to_message: reply } as unknown as Message)).toEqual({
+      id: '9',
+      sender: 'Bot',
+      text: '🎙 Voice call with Emma: [voice call link]\n\nVoice calls now talk in this chat, until /voice is run in another one.',
+    });
+    const quoted = {
+      message_id: 10,
+      reply_to_message: reply,
+      quote: { text: 'link: host.example/webhook/voice/call?t=ab12.' },
+    };
+    expect(extractReplyContext(quoted as unknown as Message)?.quote).toBe('link: [voice call link]');
+  });
+
+  it('keeps the full original next to the highlighted fragment', () => {
+    const reply = { message_id: 9, text: 'lunch at noon, then the gym', from: { first_name: 'Ann' } };
+    const quoted = { message_id: 10, reply_to_message: reply, quote: { text: 'at noon' } };
+    expect(extractReplyContext(quoted as unknown as Message)).toEqual({
+      id: '9',
+      sender: 'Ann',
+      text: 'lunch at noon, then the gym',
+      quote: 'at noon',
+    });
+  });
+
+  it('redacts the short /voice links too', () => {
+    const text = 'talk https://host.example/voice?t=0123abcd call https://host.example/voice/call/?t=0123abcd';
+    const reply = { message_id: 9, text, from: { first_name: 'Bot' } };
+    expect(extractReplyContext({ message_id: 10, reply_to_message: reply } as unknown as Message)?.text).toBe(
+      'talk [voice call link] call [voice call link]',
+    );
+  });
+
+  it('leaves other links alone', () => {
+    const reply = { message_id: 9, text: 'see https://example.com/webhook/other?t=1', from: { first_name: 'A' } };
+    expect(extractReplyContext({ message_id: 10, reply_to_message: reply } as unknown as Message)?.text).toBe(
+      'see https://example.com/webhook/other?t=1',
+    );
+  });
+
+  it('stays linear on a long word that keeps almost matching', () => {
+    const text = '/webhook/voice/'.repeat(273);
+    const reply = { message_id: 9, text, from: { first_name: 'A' } };
+    const started = Date.now();
+    expect(extractReplyContext({ message_id: 10, reply_to_message: reply } as unknown as Message)?.text).toBe(text);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
+
+describe('parseChatId', () => {
+  it('parses the 2-part base form', () => {
+    expect(parseChatId('telegram:-1000000000001')).toBe(-1000000000001);
+  });
+
+  it('parses the chat id out of a 3-part per-topic form', () => {
+    expect(parseChatId('telegram:-1000000000001:42')).toBe(-1000000000001);
+  });
+
+  it('throws on garbage', () => {
+    expect(() => parseChatId('telegram:not-a-number')).toThrow();
+    expect(() => parseChatId('telegram:')).toThrow();
+  });
+});
+
+describe('parseTopicId', () => {
+  it('extracts the topic from a 3-part per-topic id', () => {
+    expect(parseTopicId('telegram:-1000000000001:42')).toBe(42);
+  });
+
+  it('returns undefined for the 2-part base form', () => {
+    expect(parseTopicId('telegram:-1000000000001')).toBeUndefined();
+  });
+
+  it('returns undefined when the 3rd segment is not numeric', () => {
+    expect(parseTopicId('telegram:-100123:abc')).toBeUndefined();
+  });
+});
+
+describe('resolveMessageThreadId', () => {
+  it('derives the topic from a per-topic platformId when threadId is null', () => {
+    expect(resolveMessageThreadId('telegram:-1000000000001:42', null)).toBe(42);
+    expect(resolveMessageThreadId('telegram:-1000000000001', null)).toBeUndefined();
+  });
+
+  it('prefers an explicit threadId over the platformId topic', () => {
+    expect(resolveMessageThreadId('telegram:-1000000000001:42', '7')).toBe(7);
+  });
+});
+
+describe('extractTelegramMessageId', () => {
+  it('accepts bare numeric id and uses fallback chatId', () => {
+    expect(extractTelegramMessageId('1710', 1000001)).toEqual({ chatId: 1000001, messageId: 1710 });
+  });
+
+  it('accepts 2-part compound and prefers the embedded chatId', () => {
+    expect(extractTelegramMessageId('1000001:1710', 99)).toEqual({ chatId: 1000001, messageId: 1710 });
+  });
+
+  it('accepts 3-part compound (agent-wrapped inbound id)', () => {
+    expect(extractTelegramMessageId('1000001:1716:ag-1700000000000-abc123', 99)).toEqual({
+      chatId: 1000001,
+      messageId: 1716,
+    });
+  });
+
+  it('returns null for a UUID-style id that is not a number', () => {
+    expect(extractTelegramMessageId('msg-abc-def', 99)).toBeNull();
+  });
+});
+
+describe('entitiesToMarkdown', () => {
+  it('returns text unchanged when no entities', () => {
+    expect(entitiesToMarkdown('hello world', [])).toBe('hello world');
+    expect(entitiesToMarkdown('hello world', undefined)).toBe('hello world');
+  });
+
+  it('wraps bold / italic / strikethrough / code with markdown delimiters', () => {
+    const text = 'a b c d';
+    const entities = [
+      { type: 'bold', offset: 0, length: 1 },
+      { type: 'italic', offset: 2, length: 1 },
+      { type: 'strikethrough', offset: 4, length: 1 },
+      { type: 'code', offset: 6, length: 1 },
+    ];
+    expect(entitiesToMarkdown(text, e(entities))).toBe('**a** _b_ ~~c~~ `d`');
+  });
+
+  it('emits `__X__` for underline and `||X||` for spoiler (matches the outbound renderer)', () => {
+    const text = 'secret hidden';
+    const entities = [
+      { type: 'underline', offset: 0, length: 6 },
+      { type: 'spoiler', offset: 7, length: 6 },
+    ];
+    expect(entitiesToMarkdown(text, e(entities))).toBe('__secret__ ||hidden||');
+  });
+
+  it('renders text_link as `[label](url)`', () => {
+    const text = 'click here';
+    const entities = [{ type: 'text_link', offset: 6, length: 4, url: 'https://example.com' }];
+    expect(entitiesToMarkdown(text, e(entities))).toBe('click [here](https://example.com)');
+  });
+
+  it('renders pre with language tag when present', () => {
+    const text = 'x = 1';
+    const entities = [{ type: 'pre', offset: 0, length: 5, language: 'ts' }];
+    expect(entitiesToMarkdown(text, e(entities))).toBe('```ts\nx = 1\n```');
+  });
+
+  it('skips unknown entity types and still preserves the text', () => {
+    const text = '@alice hey';
+    const entities = [{ type: 'mention', offset: 0, length: 6 }];
+    expect(entitiesToMarkdown(text, e(entities))).toBe('@alice hey');
+  });
+
+  it('closes before opening at the same position so adjacent spans do not interleave', () => {
+    const text = 'ab';
+    const entities = [
+      { type: 'bold', offset: 0, length: 1 },
+      { type: 'italic', offset: 1, length: 1 },
+    ];
+    // Close `bold` at pos 1 before opening `italic` at pos 1.
+    expect(entitiesToMarkdown(text, e(entities))).toBe('**a**_b_');
+  });
+});
+
+describe('inbound rich messages are flattened, not dropped', () => {
+  const rich = {
+    blocks: [
+      { type: 'heading', size: 2, text: 'Plan' },
+      {
+        type: 'paragraph',
+        text: [
+          'Ship ',
+          { type: 'bold', text: 'today' },
+          ' at ',
+          { type: 'date_time', text: '15:00', unix_time: 1760108400, date_time_format: 't' },
+        ],
+      },
+      {
+        type: 'list',
+        items: [
+          { label: '\u2022', blocks: [{ type: 'paragraph', text: 'tests' }], has_checkbox: true, is_checked: true },
+          {
+            label: '\u2022',
+            blocks: [
+              { type: 'paragraph', text: 'docs' },
+              { type: 'list', items: [{ label: '1.', blocks: [{ type: 'paragraph', text: 'KB' }] }] },
+            ],
+            has_checkbox: true,
+          },
+        ],
+      },
+      {
+        type: 'table',
+        cells: [
+          [
+            { text: 'host', is_header: true, align: 'left', valign: 'top' },
+            { text: 'state', is_header: true, align: 'left', valign: 'top' },
+          ],
+          [
+            { text: 'bl', align: 'left', valign: 'top' },
+            { text: { type: 'code', text: 'up' }, align: 'left', valign: 'top' },
+          ],
+        ],
+      },
+      { type: 'pre', language: 'sh', text: 'ls' },
+      { type: 'details', summary: 'More', blocks: [{ type: 'paragraph', text: 'hidden' }] },
+    ],
+  } as unknown as NonNullable<Message['rich_message']>;
+
+  it('renders blocks and inline styles as markdown', () => {
+    expect(richMessageToMarkdown(rich)).toBe(
+      [
+        '## Plan',
+        'Ship **today** at [15:00](tg://time?unix=1760108400&format=t)',
+        '- [x] tests\n- [ ] docs\n      1. KB',
+        '| host | state |\n| --- | --- |\n| bl | `up` |',
+        '```sh\nls\n```',
+        '**More**\nhidden',
+      ].join('\n\n'),
+    );
+  });
+
+  const ctxFor = (msg: Record<string, unknown>, chatType = 'private') =>
+    ({
+      chat: { id: 1000001, type: chatType, title: 'Chat' },
+      msg,
+      from: { id: 1000001, first_name: 'Sender', is_bot: false },
+      update: {},
+    }) as unknown as Parameters<typeof toInboundMessage>[0];
+
+  it('keeps a text-less rich message as the inbound body', () => {
+    const env = toInboundMessage(ctxFor({ message_id: 30, date: 1_700_000_000, rich_message: rich }), 'bot', 1);
+    expect(env).not.toBeNull();
+    expect((env!.message.content as InboundContent).text).toContain('## Plan');
+  });
+
+  it('counts an @mention of the bot inside a rich message in a group', () => {
+    const mention = {
+      blocks: [{ type: 'paragraph', text: [{ type: 'mention', text: '@dan_bot', username: 'dan_bot' }, ' look'] }],
+    };
+    const env = toInboundMessage(
+      ctxFor({ message_id: 31, date: 1_700_000_000, rich_message: mention }, 'supergroup'),
+      'dan_bot',
+      1,
+    );
+    expect(env!.message.isMention).toBe(true);
+  });
+
+  it('uses a replied-to rich message as the reply context text', () => {
+    const ctx = extractReplyContext({
+      message_id: 32,
+      date: 1_700_000_000,
+      chat: { id: 1, type: 'private' },
+      reply_to_message: {
+        message_id: 5,
+        date: 1,
+        chat: { id: 1, type: 'private' },
+        from: { id: 2, first_name: 'Dan', is_bot: true },
+        rich_message: rich,
+      },
+    } as unknown as Message);
+    expect(ctx?.text).toContain('| host | state |');
+  });
+});

@@ -73,6 +73,12 @@ export interface InboundEvent {
     /** True when the source is a group/channel thread, false for DMs. */
     isGroup?: boolean;
   };
+  /**
+   * The router invokes this once immediately before persisting an accepted
+   * message, so adapters can defer byte downloads or paid work until after
+   * the engage, access, and scope gates have passed.
+   */
+  materialize?: () => Promise<void>;
   replyTo?: DeliveryAddress;
 }
 
@@ -100,6 +106,12 @@ export interface InboundMessage {
   isMention?: boolean;
   /** True when the source is a group/channel thread, false for DMs. */
   isGroup?: boolean;
+  /**
+   * The router invokes this once immediately before persisting an accepted
+   * message, so adapters can defer byte downloads or paid work until after
+   * the engage, access, and scope gates have passed.
+   */
+  materialize?: () => Promise<void>;
 }
 
 /** A file attachment to deliver alongside a message. */
@@ -272,6 +284,7 @@ export interface ChannelAdapter {
   addReaction?(platformId: string, messageId: string, emoji: string): Promise<void>;
   removeReaction?(platformId: string, messageId: string, emoji: string): Promise<void>;
 
+  resolveReaction?(emoji: string): ResolvedReaction;
   syncConversations?(): Promise<ConversationInfo[]>;
   /** Resolve conversation type and human-readable metadata for host UI. */
   resolveConversation?(platformId: string): Promise<ResolvedConversation | null>;
@@ -351,4 +364,15 @@ export interface ChannelRegistration {
     mounts?: Array<{ hostPath: string; containerPath: string; readonly: boolean }>;
     env?: Record<string, string>;
   };
+}
+
+export interface ResolvedReaction {
+  /** Glyph to actually send, or null when the set has no stand-in for the intent. */
+  emoji: string | null;
+  /** true when `emoji` is a nearest-allowed stand-in, not what the agent asked for. */
+  substituted: boolean;
+  /** Platform whose set applied, for the note the host writes back to the agent. */
+  platform: string;
+  /** The full allowed set, spelled out to the agent when nothing maps. */
+  allowed: readonly string[];
 }

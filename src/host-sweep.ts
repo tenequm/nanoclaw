@@ -16,6 +16,7 @@ import { retryPendingAdoptions, stopOrphanedSessions } from './container-runner.
 import { ensureEgressNetwork } from './egress-lockdown.js';
 import { getActiveSessions } from './db/sessions.js';
 import { peekSessionDriver } from './drivers/index.js';
+import { sweepInboundStaging } from './inbound-staging.js';
 import type { SessionWatch } from './drivers/types.js';
 import { log } from './log.js';
 import { registerReconcileEnqueue } from './reconcile-feeds.js';
@@ -103,6 +104,13 @@ export function startHostSweep(): void {
       // Stop containers whose session or agent group was deleted: the
       // per-session reconcile only visits sessions that still have a row.
       // Then retry adoptions a failed claim write deferred (never throws).
+      'singleton:inbound-staging': async () => {
+        try {
+          await sweepInboundStaging();
+        } catch (err) {
+          log.error('Inbound staging sweep failed', { err });
+        }
+      },
       'singleton:orphan-containers': async () => {
         try {
           await stopOrphanedSessions();
@@ -173,6 +181,7 @@ async function sweep(): Promise<void> {
   }
   tickQueue.add('singleton:approvals-scan');
   tickQueue.add('singleton:orphan-containers');
+  tickQueue.add('singleton:inbound-staging');
 
   // The tick ends — and the next one is armed — only after everything this
   // tick enqueued has run. Delayed backoff retries don't hold the tick open.

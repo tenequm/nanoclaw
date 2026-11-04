@@ -7,8 +7,8 @@
  * and rendering.
  */
 
-/** Chat SDK button styles — Slack maps primary→green, danger→red; platforms
- *  without button colors (Telegram) ignore it. */
+/** Button styles. Slack maps primary to green and danger to red; Telegram
+ *  maps primary to blue and danger to red. `default` keeps each platform's own look. */
 export type OptionStyle = 'primary' | 'danger' | 'default';
 
 export interface OptionInput {

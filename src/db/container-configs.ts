@@ -21,6 +21,7 @@ const SCALAR_COLUMNS = new Set([
   'assistant_name',
   'max_messages_per_prompt',
   'auto_compact_window',
+  'rich_messages',
   'cli_scope',
   'timezone',
   'speed',
@@ -41,11 +42,11 @@ export async function createContainerConfig(config: ContainerConfigRow): Promise
     `INSERT INTO container_configs (
         agent_group_id, provider, model, effort, image_tag, assistant_name,
         max_messages_per_prompt, auto_compact_window, skills, mcp_servers, packages_apt, packages_npm,
-        additional_mounts, cli_scope, timezone, speed, updated_at
+        additional_mounts, cli_scope, timezone, speed, rich_messages, updated_at
       ) VALUES (
         @agent_group_id, @provider, @model, @effort, @image_tag, @assistant_name,
         @max_messages_per_prompt, @auto_compact_window, @skills, @mcp_servers, @packages_apt, @packages_npm,
-        @additional_mounts, @cli_scope, @timezone, @speed, @updated_at
+        @additional_mounts, @cli_scope, @timezone, @speed, @rich_messages, @updated_at
       )`,
     config,
   );
@@ -98,6 +99,7 @@ export async function updateContainerConfigScalars(
       | 'assistant_name'
       | 'max_messages_per_prompt'
       | 'auto_compact_window'
+      | 'rich_messages'
       | 'cli_scope'
       | 'timezone'
       | 'speed'
@@ -141,3 +143,12 @@ export async function updateContainerConfigJson(
 export async function deleteContainerConfig(agentGroupId: string): Promise<void> {
   await getDb().run('DELETE FROM container_configs WHERE agent_group_id = ?', agentGroupId);
 }
+
+registerMigration({
+  version: 28,
+  name: 'module:telegram:rich-messages',
+  async up(db) {
+    if ((await db.columnOwners?.('rich_messages'))?.includes('container_configs')) return;
+    await db.exec('ALTER TABLE container_configs ADD COLUMN rich_messages INTEGER NOT NULL DEFAULT 0');
+  },
+});

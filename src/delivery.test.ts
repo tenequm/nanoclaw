@@ -9,6 +9,7 @@
  * the channel API has already fired twice → user sees the message twice.
  */
 import Database from 'better-sqlite3';
+import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import fs from 'fs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -21,10 +22,14 @@ vi.mock('./container-runner.js', () => ({
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-delivery', GROUPS_DIR: '/tmp/nanoclaw-test-delivery/groups' };
+  return {
+    ...actual,
+    DATA_DIR: `/tmp/nanoclaw-test-delivery-${process.pid}`,
+    GROUPS_DIR: `/tmp/nanoclaw-test-delivery-${process.pid}/groups`,
+  };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-delivery';
+const TEST_DIR = `/tmp/nanoclaw-test-delivery-${process.pid}`;
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
 import { getDeliveredIds } from './mailbox/sqlite/session-db.js';
@@ -1047,6 +1052,15 @@ describe('deliverSessionMessages — reply box', () => {
     expect((await deliveredContent(other))[0].threadReply).toBeUndefined();
   });
 
+  it('threads a media group like any new message', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'question');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { operation: 'send_media_group', items: [], replyIntent: {} });
+
+    expect((await deliveredContent(session))[0].threadReply).toEqual({});
+  });
+
   it('replies plain when the reply target cannot be read', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
@@ -1059,5 +1073,197 @@ describe('deliverSessionMessages — reply box', () => {
 
     const [content] = await deliveredContent(session);
     expect(content).toEqual({ text: 'answer' });
+  });
+
+  it('carries rich only for a group with rich_messages on, and strips it otherwise', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertInbound(session.id, '123:1:ag-1', 'latest');
+    insertReply(session.id, 'out-1', '123:1:ag-1', { text: '| a |', rich: true });
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    try {
+      const [refused] = await deliveredContent(session);
+      expect(refused).toEqual({ text: '| a |' });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('Rich message requested'), expect.anything());
+    } finally {
+      warn.mockRestore();
+    }
+
+    await ensureContainerConfig('ag-1');
+    await updateContainerConfigScalars('ag-1', { rich_messages: 1 });
+    insertReply(session.id, 'out-2', '123:1:ag-1', { text: '| b |', rich: true });
+    insertReply(session.id, 'out-3', '123:1:ag-1', { text: 'plain' });
+    expect(await deliveredContent(session)).toEqual([{ text: '| b |', rich: true }, { text: 'plain' }]);
+  });
+
+  it('lets the rich_messages setting alone decide whether an edit is rich', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOperation('ag-1', session.id, 'out-1', { operation: 'edit', messageId: '123:5:ag-1', text: 'a', rich: true });
+    expect(await deliveredContent(session)).toEqual([{ operation: 'edit', messageId: '123:5', text: 'a' }]);
+
+    await ensureContainerConfig('ag-1');
+    await updateContainerConfigScalars('ag-1', { rich_messages: 1 });
+    insertOperation('ag-1', session.id, 'out-2', { operation: 'edit', messageId: '123:5:ag-1', text: 'b' });
+    expect(await deliveredContent(session)).toEqual([{ operation: 'edit', messageId: '123:5', text: 'b', rich: true }]);
+  });
+});
+
+describe('deliverSessionMessages — reaction fallback and feedback', () => {
+  interface NoteRow {
+    kind: string;
+    channel_type: string | null;
+    platform_id: string | null;
+    thread_id: string | null;
+    trigger: number;
+    content: string;
+  }
+
+  function insertReaction(agentGroupId: string, sessionId: string, msgId: string, emoji: string): void {
+    insertOperation(agentGroupId, sessionId, msgId, { operation: 'reaction', messageId: '4242', emoji });
+  }
+
+  function notes(sessionId: string): NoteRow[] {
+    const db = openInboundDb('ag-1', sessionId);
+    const rows = db
+      .prepare(
+        `SELECT kind, channel_type, platform_id, thread_id, trigger, content FROM messages_in
+          WHERE id LIKE 'reaction-note-%' ORDER BY seq ASC`,
+      )
+      .all() as NoteRow[];
+    db.close();
+    return rows;
+  }
+
+  /** Telegram-shaped resolver: ✅ substitutes to 👌, 🍕 has no stand-in. */
+  function reactionAdapter(delivered: string[]): void {
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(content);
+        return 'plat-msg-1';
+      },
+      resolveReaction(_channelType, emoji) {
+        const allowed = ['👍', '👌', '👀'];
+        if (allowed.includes(emoji)) return { emoji, substituted: false, platform: 'Telegram', allowed };
+        if (emoji === '✅' || emoji === 'white_check_mark') {
+          return { emoji: '👌', substituted: true, platform: 'Telegram', allowed };
+        }
+        return { emoji: null, substituted: false, platform: 'Telegram', allowed };
+      },
+    });
+  }
+
+  it('delivers the substituted glyph and tells the agent what went out instead', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-sub', 'white_check_mark');
+
+    const delivered: string[] = [];
+    reactionAdapter(delivered);
+    await deliverSessionMessages(session);
+
+    expect(delivered).toHaveLength(1);
+    expect(JSON.parse(delivered[0]!).emoji).toBe('👌');
+
+    const rows = notes(session.id);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.content).text).toBe(
+      'Your reaction "white_check_mark" is not in Telegram\'s allowed set; sent 👌 instead.',
+    );
+  });
+
+  it('drops an unmappable reaction, delivers nothing, and reports the allowed set', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-drop', '🍕');
+
+    const delivered: string[] = [];
+    reactionAdapter(delivered);
+    await deliverSessionMessages(session);
+
+    expect(delivered).toEqual([]);
+    const rows = notes(session.id);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.content).text).toBe(
+      'Your reaction "🍕" was not sent: Telegram only allows a fixed reaction set. Allowed: 👍 👌 👀.',
+    );
+    // Marked delivered all the same — nothing is retryable about an illegal emoji.
+    const inDb = openInboundDb('ag-1', session.id);
+    expect(getDeliveredIds(inDb).has('out-drop')).toBe(true);
+    inDb.close();
+  });
+
+  it('notes are non-waking context rows, never a chat surface', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-shape', '🍕');
+    reactionAdapter([]);
+    await deliverSessionMessages(session);
+
+    const [row] = notes(session.id);
+    // trigger=0: rides along as context, never wakes a container. channel_type
+    // 'agent' + null platform id: not a chat surface, so it is never routed,
+    // judged or echo-fanned. kind 'chat', NOT 'system' — the container's poll
+    // loop filters 'system' rows out of agent batches.
+    expect(row!.trigger).toBe(0);
+    expect(row!.kind).toBe('chat');
+    expect(row!.channel_type).toBe('agent');
+    expect(row!.platform_id).toBeNull();
+    expect(row!.thread_id).toBeNull();
+    expect(JSON.parse(row!.content).sender).toBe('system');
+  });
+
+  it('an exact match is delivered byte-identical, with no note', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-exact', '👀');
+
+    const delivered: string[] = [];
+    reactionAdapter(delivered);
+    await deliverSessionMessages(session);
+
+    expect(JSON.parse(delivered[0]!).emoji).toBe('👀');
+    expect(notes(session.id)).toEqual([]);
+  });
+
+  it('does not claim a substituted glyph was sent when the send fails', async () => {
+    // The note phrases a completed action ("sent 👌 instead"), so writing it
+    // before deliver() would leave the agent believing in a send that a failed
+    // delivery never made — and after MAX_DELIVERY_ATTEMPTS nothing retracts it.
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-subfail', 'white_check_mark');
+
+    setDeliveryAdapter({
+      deliver() {
+        throw new Error('telegram down');
+      },
+      resolveReaction(_channelType, emoji) {
+        const allowed = ['👍', '👌', '👀'];
+        if (emoji === 'white_check_mark') return { emoji: '👌', substituted: true, platform: 'Telegram', allowed };
+        return { emoji, substituted: false, platform: 'Telegram', allowed };
+      },
+    });
+    await deliverSessionMessages(session);
+
+    expect(notes(session.id)).toEqual([]);
+  });
+
+  it('an adapter with no fixed set forwards the emoji untouched', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReaction('ag-1', session.id, 'out-free', '🍕');
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(content);
+        return 'plat-msg-1';
+      },
+    });
+    await deliverSessionMessages(session);
+
+    expect(JSON.parse(delivered[0]!).emoji).toBe('🍕');
+    expect(notes(session.id)).toEqual([]);
   });
 });

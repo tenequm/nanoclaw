@@ -411,7 +411,15 @@ function withoutHostStamps(content: string): string {
   }
   if (typeof parsed !== 'object' || parsed === null) return content;
   const { senderRole: _claimed, ...rest } = parsed as Record<string, unknown>;
-  const changed = 'senderRole' in parsed;
+  let changed = 'senderRole' in parsed;
+  if (Array.isArray(rest.attachments)) {
+    rest.attachments = rest.attachments.map((att: unknown) => {
+      if (typeof att !== 'object' || att === null || !('stagedPath' in att)) return att;
+      changed = true;
+      const { stagedPath: _staged, ...kept } = att as Record<string, unknown>;
+      return kept;
+    });
+  }
   return changed ? JSON.stringify(rest) : content;
 }
 

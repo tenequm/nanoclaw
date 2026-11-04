@@ -20,10 +20,10 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cli-msggroups' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-cli-msggroups-${process.pid}` };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-cli-msggroups';
+const TEST_DIR = `/tmp/nanoclaw-test-cli-msggroups-${process.pid}`;
 
 import type { ChannelDefaults } from '../../channels/adapter.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';

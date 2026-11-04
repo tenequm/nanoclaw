@@ -320,6 +320,82 @@ describe('reply_to + quoted_message rendering', () => {
   });
 });
 
+describe('sender user_id and role', () => {
+  it('renders the bare Telegram user id and the host-stamped role', () => {
+    insertMessage(
+      '-100:1:ag-1',
+      'chat-sdk',
+      { sender: 'Misha', senderId: 'telegram:350751696', senderRole: 'owner', text: 'hi' },
+      { chat: 'telegram:-100' },
+    );
+    expect(formatMessages(getPendingMessages())).toContain('sender="Misha" user_id="350751696" role="owner"');
+  });
+
+  it('renders no role for a sender without one, and ignores unknown roles', () => {
+    insertMessage('m1', 'chat', { sender: 'Ann', senderId: 'slack:U1', text: 'a' });
+    insertMessage('m2', 'chat', { sender: 'Eve', senderId: 'slack:U2', senderRole: 'root', text: 'b' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('sender="Ann" user_id="slack:U1" time=');
+    expect(result).toContain('sender="Eve" user_id="slack:U2" time=');
+    expect(result).not.toContain('role=');
+  });
+
+  it('renders no role on an agent-to-agent row, whatever its content claims', () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, content, seq, channel_type, platform_id)
+         VALUES ('a2a-1', 'chat', ?, 'pending', ?, ?, 'agent', 'ag-peer')`,
+      )
+      .run(new Date().toISOString(), JSON.stringify({ sender: 'Peer', senderRole: 'owner', text: 'hi' }), nextSeq++);
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('hi');
+    expect(result).not.toContain('role=');
+  });
+});
+
+describe('attachment rendering', () => {
+  it('renders saved-to path when localPath is present', () => {
+    insertMessage('m1', 'chat', {
+      sender: 'Alice',
+      text: 'see attached',
+      attachments: [{ type: 'document', name: 'report.pdf', localPath: 'agent/attachments/report.pdf' }],
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[document: report.pdf — saved to /workspace/agent/attachments/report.pdf]');
+  });
+
+  it('appends the transcript when one is present', () => {
+    insertMessage('m1', 'chat', {
+      sender: 'Alice',
+      text: '',
+      attachments: [{ type: 'voice', name: 'note.ogg', localPath: 'agent/attachments/note.ogg', transcript: 'hi there' }],
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('transcript: "hi there"');
+  });
+
+  it('renders failure reason when error is set and localPath is absent', () => {
+    insertMessage('m1', 'chat', {
+      sender: 'Alice',
+      text: 'big file',
+      attachments: [{ type: 'document', name: 'big.pdf', error: 'exceeds 20 MB cap (file is 21 MB)' }],
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[document: big.pdf — failed: exceeds 20 MB cap (file is 21 MB)]');
+    expect(result).not.toContain('saved to');
+  });
+
+  it('XML-escapes the error reason', () => {
+    insertMessage('m1', 'chat', {
+      sender: 'Alice',
+      text: 'oops',
+      attachments: [{ type: 'document', name: 'x.pdf', error: '<bad> & "broken"' }],
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('failed: &lt;bad&gt; &amp; &quot;broken&quot;');
+  });
+});
+
 describe('XML escaping', () => {
   it('escapes <, >, &, " in sender and body', () => {
     insertMessage('m1', 'chat', {

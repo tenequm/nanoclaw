@@ -6,7 +6,8 @@ import { AsyncLocalStorage } from 'async_hooks';
 import fs from 'fs';
 import path from 'path';
 
-import { AnchoredDir } from './anchored-dir.js';
+import { inboundStagingRoot, isPathInside } from './inbound-staging.js';
+import { copyRegularFile, AnchoredDir } from './anchored-dir.js';
 import { deriveAttachmentName } from './attachment-naming.js';
 import { inboxFolderName, isSafeAttachmentName } from './attachment-safety.js';
 import type { OutboundFile } from './channels/adapter.js';
@@ -369,22 +370,33 @@ function extractAttachmentFiles(
   const attachments = parsed.attachments as Array<Record<string, unknown>> | undefined;
   if (!Array.isArray(attachments)) return contentStr;
 
+  const stagedPaths = new Map<Record<string, unknown>, string>();
+  for (const att of attachments) {
+    if (typeof att.stagedPath === 'string') stagedPaths.set(att, att.stagedPath);
+    delete att.stagedPath;
+  }
   const folder = inboxFolderName(messageId);
   if (folder === null) {
     log.warn('Rejecting unsafe inbound message id', { messageId });
-    return contentStr;
+    return JSON.stringify(parsed);
   }
 
   // Opened lazily on the first attachment that actually carries bytes, so a
   // message whose attachments have no inline `data` never creates an inbox dir.
   let inbox: AnchoredDir | null | undefined;
 
-  let changed = false;
+  let changed = true;
   try {
     for (const att of attachments) {
-      if (typeof att.data !== 'string') continue;
+      const staged = stagedPaths.get(att);
+      const stagedSource = staged ? containedStagedFile(staged) : null;
+      if (staged && !stagedSource) {
+        att.error = 'the file is no longer available';
+        continue;
+      }
+      if (!stagedSource && typeof att.data !== 'string') continue;
 
-      const rawName = deriveAttachmentName(att);
+      const rawName = stagedSource ? path.basename(stagedSource) : deriveAttachmentName(att);
       const filename = isSafeAttachmentName(rawName) ? rawName : `attachment-${Date.now()}`;
       if (filename !== rawName) {
         log.warn('Refused unsafe attachment filename, would escape inbox', {
@@ -406,7 +418,15 @@ function extractAttachmentFiles(
       if (!inbox) break;
 
       try {
-        inbox.writeNewFile(filename, Buffer.from(att.data as string, 'base64'));
+        if (stagedSource) {
+          const src = AnchoredDir.open(path.dirname(stagedSource), []);
+          if (!src) throw new Error('Staged source unavailable');
+          try {
+            copyRegularFile(src, path.basename(stagedSource), inbox, filename);
+          } finally {
+            src.close();
+          }
+        } else inbox.writeNewFile(filename, Buffer.from(att.data as string, 'base64'));
       } catch (err: unknown) {
         const e = err as NodeJS.ErrnoException;
         if (e.code === 'EEXIST') {
@@ -416,10 +436,14 @@ function extractAttachmentFiles(
           });
           continue;
         }
+        if (stagedSource) {
+          att.error = `could not be saved (${e.code ?? 'copy failed'})`;
+          continue;
+        }
         throw err;
       }
 
-      att.name = filename;
+      if (!staged) att.name = filename;
       att.localPath = `inbox/${folder}/${filename}`;
       delete att.data;
       changed = true;
@@ -601,4 +625,14 @@ export async function markContainerIdle(sessionId: string): Promise<void> {
 /** Mark a container as stopped for a session. */
 export async function markContainerStopped(sessionId: string): Promise<void> {
   await updateSession(sessionId, { container_status: 'stopped' });
+}
+
+function containedStagedFile(stagedPath: string): string | null {
+  try {
+    if (!fs.lstatSync(stagedPath).isFile()) return null;
+    const real = fs.realpathSync(stagedPath);
+    return isPathInside(fs.realpathSync(inboundStagingRoot()), real) ? real : null;
+  } catch {
+    return null;
+  }
 }

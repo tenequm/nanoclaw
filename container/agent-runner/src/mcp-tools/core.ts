@@ -139,6 +139,7 @@ export const sendMessage: McpToolDefinition = {
       thread_id: routing.thread_id,
       content: JSON.stringify({
         text,
+        ...(args.rich === true && "rich" in (sendMessage.tool.inputSchema.properties ?? {}) ? { rich: true } : {}),
         ...(explicit ? { replyIntent: quote ? { quote } : {} } : {}),
       }),
     });
@@ -234,6 +235,9 @@ export const editMessage: McpToolDefinition = {
   },
 };
 
+const TELEGRAM_REACTION_GLYPHS =
+  '👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡';
+
 export const addReaction: McpToolDefinition = {
   tool: {
     name: 'add_reaction',
@@ -242,7 +246,14 @@ export const addReaction: McpToolDefinition = {
       type: 'object' as const,
       properties: {
         messageId: { type: 'integer', description: 'Message ID (the numeric id shown in messages)' },
-        emoji: { type: 'string', description: 'Emoji name (e.g., thumbs_up, heart, check)' },
+        emoji: {
+          type: 'string',
+          description:
+            'Reaction emoji. Pick one of the glyphs below — Telegram allows a FIXED reaction set for everyone in the chat, bots and humans alike, and rejects anything else. ' +
+            `On Telegram the legal set is: ${TELEGRAM_REACTION_GLYPHS}. ` +
+            'Semantic slugs naming one of those work too (thumbs_up, thumbs_down, heart, fire, party, eyes, ok_hand, salute, trophy, zap, rofl, pray, clap, ...), as do the same glyphs with a variation selector. ' +
+            'On Telegram anything outside the set (✅, 🚀, ❌, 💪, ⭐, ...) is nearest-matched to the closest allowed glyph and you are told what was sent instead; if nothing fits, the reaction is not sent and you are told that too. Channels with no fixed set forward your emoji untouched.',
+        },
       },
       required: ['messageId', 'emoji'],
     },

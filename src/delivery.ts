@@ -33,9 +33,10 @@ import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { platformMessageId } from './platform-id.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
+import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
 import { notePresence, pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
-import type { OutboundFile } from './channels/adapter.js';
+import { getContainerConfig } from './db/container-configs.js';
+import type { OutboundFile, ResolvedReaction } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
 import type { OutboundMessage } from './mailbox/index.js';
 
@@ -121,6 +122,7 @@ export interface ChannelDeliveryAdapter {
     instance?: string,
     inReplyTo?: string,
   ): Promise<string | undefined>;
+  resolveReaction?(channelType: string, emoji: string, instance?: string): ResolvedReaction | undefined;
   clearTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
   addReaction?(
     channelType: string,
@@ -427,6 +429,86 @@ async function resolveThreadReply(
   }
 }
 
+async function writeOutboundNote(session: Session, messageId: string, text: string): Promise<void> {
+  try {
+    await writeSessionMessage(session.agent_group_id, session.id, {
+      id: `reaction-note-${messageId}`,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: null,
+      channelType: 'agent',
+      threadId: null,
+      content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
+      trigger: false,
+    });
+  } catch (err) {
+    log.warn('Failed to write outbound note back to the session', { messageId, sessionId: session.id, err });
+  }
+}
+
+/**
+ * Resolve a reaction operation against the delivering platform's fixed
+ * reaction set. Pure — it decides and phrases, the caller writes, because the
+ * two notes are owed to the agent at different moments:
+ *
+ * `drop` — nothing in the allowed set carries the intent. Nothing is sent (the
+ * Bot API would 400 REACTION_INVALID), so its note is true the moment the
+ * decision is made and is written before the adapter is ever called.
+ * `substituted` — a nearest-allowed stand-in goes out instead. Its note names a
+ * completed send ("sent ⚡ instead"), so it is only true once `deliver` has
+ * returned; writing it earlier would tell the agent about a send that a failed
+ * delivery then never makes.
+ * `untouched` — exact match, no fixed set, or not a reaction.
+ */
+type ReactionOutcome =
+  | { kind: 'untouched' }
+  | { kind: 'drop'; note: string }
+  | { kind: 'substituted'; emoji: string; note: string };
+
+function resolveOutboundReaction(
+  msg: { id: string; channelType: string },
+  content: Record<string, unknown>,
+  session: Session,
+  instance?: string,
+): ReactionOutcome {
+  // An empty emoji CLEARS the reaction — a legitimate operation, nothing to resolve.
+  if (content.operation !== 'reaction' || typeof content.emoji !== 'string' || !content.emoji) {
+    return { kind: 'untouched' };
+  }
+  const input = content.emoji;
+  const resolved = deliveryAdapter?.resolveReaction?.(msg.channelType, input, instance);
+  if (!resolved) return { kind: 'untouched' };
+
+  if (resolved.emoji === null) {
+    log.warn('Reaction dropped — outside the platform set, reported back to the agent', {
+      messageId: msg.id,
+      sessionId: session.id,
+      channelType: msg.channelType,
+      input,
+    });
+    return {
+      kind: 'drop',
+      note:
+        `Your reaction "${input}" was not sent: ${resolved.platform} only allows a fixed reaction set. ` +
+        `Allowed: ${resolved.allowed.join(' ')}.`,
+    };
+  }
+
+  if (!resolved.substituted) return { kind: 'untouched' };
+
+  log.info('Reaction substituted with the nearest allowed glyph', {
+    messageId: msg.id,
+    sessionId: session.id,
+    input,
+    sent: resolved.emoji,
+  });
+  return {
+    kind: 'substituted',
+    emoji: resolved.emoji,
+    note: `Your reaction "${input}" is not in ${resolved.platform}'s allowed set; sent ${resolved.emoji} instead.`,
+  };
+}
+
 async function deliverMessage(
   msg: {
     id: string;
@@ -591,6 +673,17 @@ async function deliverMessage(
     return;
   }
 
+  const reaction = resolveOutboundReaction(
+    { id: msg.id, channelType: msg.channelType },
+    content,
+    session,
+    deliverInstance,
+  );
+  if (reaction.kind === 'drop') {
+    await writeOutboundNote(session, msg.id, reaction.note);
+    return;
+  }
+
   // Read file attachments from outbox if the content declares files.
   // File I/O lives in session-manager.ts (symmetric with inbound
   // extractAttachmentFiles) — delivery just hands buffers to the adapter.
@@ -603,14 +696,16 @@ async function deliverMessage(
   if (typeof content.messageId === 'string') {
     rewritten.messageId = platformMessageId(content.messageId, session.agent_group_id);
   }
+  if (reaction.kind === 'substituted') rewritten.emoji = reaction.emoji;
+  if (await richAllowed(msg.id, content, session)) rewritten.rich = true;
   const threadReply = await resolveThreadReply(msg, content, session, deliverInstance);
   if (threadReply) rewritten.threadReply = threadReply;
   // Agent-asked questions keep their own markup (U).
   if (content.type === 'ask_question') rewritten.fromAgent = true;
   // Only the host decides on a reply box; the stored content's own key is not carried.
-  const { threadReply: _stored, ...base } = content;
+  const { threadReply: _stored, rich: _rich, ...base } = content;
   const deliveredContent =
-    Object.keys(rewritten).length > 0 || 'threadReply' in content
+    Object.keys(rewritten).length > 0 || 'threadReply' in content || 'rich' in content
       ? JSON.stringify({ ...base, ...rewritten })
       : msg.content;
   const platformMsgId = await deliveryAdapter.deliver(
@@ -631,6 +726,7 @@ async function deliverMessage(
     fileCount: files?.length,
   });
 
+  if (reaction.kind === 'substituted') await writeOutboundNote(session, msg.id, reaction.note);
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
   return platformMsgId;
@@ -790,4 +886,16 @@ async function handleSystemAction(content: Record<string, unknown>, session: Ses
 export function stopDeliveryPolls(): void {
   activePolling = false;
   sweepPolling = false;
+}
+
+async function richAllowed(messageId: string, content: Record<string, unknown>, session: Session): Promise<boolean> {
+  const isEdit = content.operation === 'edit';
+  if (!isEdit && content.rich !== true) return false;
+  if ((await getContainerConfig(session.agent_group_id))?.rich_messages === 1) return true;
+  if (isEdit) return false;
+  log.warn('Rich message requested by a group without rich_messages; sending it as a normal message', {
+    id: messageId,
+    agentGroupId: session.agent_group_id,
+  });
+  return false;
 }
