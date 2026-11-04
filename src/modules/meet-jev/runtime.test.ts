@@ -92,7 +92,7 @@ describe('createCallRuntime', () => {
     runtime.feed(utt('a'));
     runtime.feed(utt('b'));
     expect(order).toEqual(['decide:a', 'speak', 'speak-returned', 'decide:c', 'decide:b']);
-    expect(runtime.events().map((e) => (e.kind === 'utterance' ? e.text : e.kind))).toEqual(['a', 'c', 'b']);
+    expect(core.seen.map((e) => (e.kind === 'utterance' ? e.text : e.kind))).toEqual(['a', 'c', 'b']);
   });
 
   it('runs speak, show, drop, stop and log commands through their ports and records every event', () => {
@@ -125,6 +125,20 @@ describe('createCallRuntime', () => {
     expect(judges).toHaveLength(1);
     judges[0].resolve({ verdict: null, ms: 412 });
     await vi.waitFor(() => expect(core.seen.at(-1)).toMatchObject({ kind: 'verdict', windowVersion: 7, ms: 412 }));
+  });
+
+  it('aborts the judges in flight when a newer one starts', async () => {
+    const { ports, judges } = fakePorts();
+    let version = 0;
+    const core = scriptedCore((event) =>
+      event.kind === 'utterance' ? [{ kind: 'judge', windowVersion: ++version, state: STATE }] : [],
+    );
+    const runtime = createCallRuntime(core, POLICY, ports);
+    runtime.feed(utt('a'));
+    await flush();
+    runtime.feed(utt('b'));
+    await flush();
+    expect(judges.map((j) => j.signal.aborted)).toEqual([true, false]);
   });
 
   it('takes a rejected judge as a null verdict', async () => {
@@ -206,7 +220,7 @@ describe('createCallRuntime', () => {
       reason: 'superseded',
       at: expect.any(Number),
     });
-    turns[0].resolve({ ok: false, reason: '409: superseded' });
+    turns[0].resolve({ ok: false, reason: '409: The turn was superseded' });
     await vi.waitFor(() => expect(turns.map((t) => t.message)).toEqual(['one', 'three']));
   });
 
@@ -228,17 +242,6 @@ describe('createCallRuntime', () => {
       ['log', 'port_error', { command: 'speak', err: 'stream gone' }],
       ['stop'],
     ]);
-  });
-
-  it('keeps the newest events only', () => {
-    const runtime = createCallRuntime(
-      scriptedCore(() => []),
-      POLICY,
-      fakePorts().ports,
-      { maxEvents: 2 },
-    );
-    for (const t of ['a', 'b', 'c']) runtime.feed(utt(t));
-    expect(runtime.events().map((e) => (e.kind === 'utterance' ? e.text : ''))).toEqual(['b', 'c']);
   });
 
   it('shuts down cleanly: no timer fires, late results and feeds are ignored, in-flight work is aborted', async () => {

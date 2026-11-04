@@ -10,9 +10,9 @@ import type { JevWorkerEvent } from '../../../channels/voice-mode-protocol.js';
 import type { CallEvent, Speaker } from '../core/types.js';
 
 /** The caller's speaker id on a page call. */
-export const CALLER_SPEAKER_ID = 'caller';
+const CALLER_SPEAKER_ID = 'caller';
 /** Longest `uttId` or `replyId` taken. */
-export const MAX_JEV_ID_CHARS = 64;
+const MAX_JEV_ID_CHARS = 64;
 
 const PLAYBACK_STATES = new Set(['started', 'completed', 'cut_off', 'failed']);
 

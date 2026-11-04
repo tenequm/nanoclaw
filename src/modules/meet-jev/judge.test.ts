@@ -69,9 +69,13 @@ describe('askAction', () => {
     expect(body.questions.action.instructions).toContain('Dan');
   });
 
-  it('is null on a non-200', async () => {
+  it('is null on a non-200, and releases its unread body', async () => {
     respond({}, { ok: false, status: 503 });
     expect((await askAction(state)).verdict).toBeNull();
+    const cancel = vi.fn(async () => {});
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 429, body: { cancel } }));
+    expect((await askAction(state)).verdict).toBeNull();
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it('is null on a timeout or a rejected fetch, never throwing', async () => {

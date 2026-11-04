@@ -10,7 +10,7 @@
 import type { LiveKitHostEvent } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
 import { callCore } from './core/index.js';
-import type { CallCore, CallEvent } from './core/types.js';
+import type { CallCore } from './core/types.js';
 import { createWorkerIngress } from './ingress/worker.js';
 import { askAction } from './judge.js';
 import { policyFor } from './policy.js';
@@ -20,6 +20,9 @@ export type { JevTurnResult } from './runtime.js';
 
 /** Replies a call remembers the turn of, for the `reply` push that speaks one. */
 const MAX_REMEMBERED_REPLIES = 64;
+/** Jev requests one call may make per rolling minute; past it a judge is a null verdict (silence). */
+export const MAX_JUDGES_PER_MINUTE = 30;
+const MINUTE_MS = 60_000;
 
 /** What a jev call needs of the voice channel. */
 export interface JevCallHost {
@@ -41,7 +44,6 @@ export interface JevCallHost {
 export interface JevDeps {
   core: CallCore<unknown>;
   judge: typeof askAction;
-  policy: typeof policyFor;
 }
 
 export interface JevCall {
@@ -50,22 +52,33 @@ export interface JevCall {
   /** An agent message for this call: `turnId` is the turn it answers, null when unprompted. */
   reply(text: string, turnId: string | null): void;
   end(reason: string): void;
-  /** The call's processed events, for replay. */
-  events(): readonly CallEvent[];
 }
 
 export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): JevCall {
   const core = deps.core ?? callCore;
   const judge = deps.judge ?? askAction;
-  const policy = (deps.policy ?? policyFor)('voice', host.agentName, [...host.agentAliases]);
+  const policy = policyFor('voice', host.agentName, [...host.agentAliases]);
   const ingress = createWorkerIngress({ name: host.callerName }, host.maxTextBytes);
   const replyTurns = new Map<string, string | null>();
   let replies = 0;
   const fields = { callId: host.callId };
+  const judgedAt: number[] = [];
+
+  const capped = (): boolean => {
+    const now = host.now();
+    while (judgedAt.length > 0 && judgedAt[0] <= now - MINUTE_MS) judgedAt.shift();
+    if (judgedAt.length >= MAX_JUDGES_PER_MINUTE) return true;
+    judgedAt.push(now);
+    return false;
+  };
 
   const runtime: CallRuntime = createCallRuntime(core, policy, {
     now: host.now,
-    judge: (state, signal) => judge(state, { signal }),
+    judge: async (state, signal) => {
+      if (!capped()) return judge(state, { signal });
+      log.warn('meet-jev: Jev rate cap reached, judged silent', { ...fields, perMinute: MAX_JUDGES_PER_MINUTE });
+      return { verdict: null, ms: 0 };
+    },
     turn: ({ message, note }, signal) => host.submitTurn(message, note, signal),
     speak: (replyId, text) => {
       const turn = replyTurns.get(replyId) ?? null;
@@ -75,7 +88,19 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
     drop: () => undefined,
     stopPlayback: () => host.push({ type: 'stop' }),
     log: (event, data) => log.info(`meet-jev: ${event}`, { ...fields, ...data }),
-    record: (seq, event) => log.info('meet-jev: event', { ...fields, seq, ...event }),
+    // Partials are many and say what the caller is still saying: their size only, and at debug.
+    record: (seq, event) =>
+      event.kind === 'utterance' && !event.final
+        ? log.debug('meet-jev: event', {
+            ...fields,
+            seq,
+            kind: event.kind,
+            uttId: event.uttId,
+            chars: event.text.length,
+            final: false,
+            at: event.at,
+          })
+        : log.info('meet-jev: event', { ...fields, seq, ...event }),
   });
 
   return {
@@ -95,6 +120,5 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
       runtime.feed({ kind: 'reply', replyId, turnId, text, at: host.now() });
     },
     end: (reason) => runtime.end(reason),
-    events: () => runtime.events(),
   };
 }
