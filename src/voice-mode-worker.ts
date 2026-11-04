@@ -1626,8 +1626,8 @@ export class TurnTaking {
     this.tookTurn();
   }
 
-  /** The host took a turn (one sent in order, or a meeting candidate it let through): the agent works on it. */
-  tookTurn(): void {
+  /** The host took a turn: the agent works on it. */
+  private tookTurn(): void {
     if (this.closed) return;
     this.awaitingReply = true;
     this.thinkingUntil = Math.max(this.thinkingUntil, this.now() + AWAIT_REPLY_MS);
@@ -2352,11 +2352,6 @@ export interface CallTurnsDeps {
   unheard(): void;
   /** A turn that came to nothing for the agent: discarded, unaddressed, or a command alone. */
   ended?(facts: TurnFacts, outcome: TurnOutcome, reason: string): void;
-  /**
-   * `/meet ... jev`: words no wake phrase addressed go to the host as a candidate instead of ending
-   * unaddressed. Unset: they end unaddressed (`no_wake`).
-   */
-  candidate?(text: string, facts: TurnFacts): void;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -3216,8 +3211,7 @@ export class CallTurns {
       if (why === 'unaddressed') {
         if (said) this.deps.drop('unaddressed', said);
         this.deps.noTurn();
-        if (said && this.deps.candidate) this.deps.candidate(said, facts);
-        else ended('unaddressed', 'no_wake');
+        ended('unaddressed', 'no_wake');
       }
       if (why === 'dropped') ended('discarded', 'dropped');
       return null;
@@ -5747,48 +5741,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       });
       saveTurn(turn, take, text, { host });
     };
-  /**
-   * `/meet ... jev`: words no wake phrase addressed go to the host as a candidate, outside the order turns
-   * go out in, so an addressed turn never waits on it. The host answers 202 only when it let the
-   * candidate through to the agent as a turn: then, and only then, it gets the sent cue and the typing.
-   * One at a time: while the host judges one, the next is dropped, so candidates never take an addressed turn's slot.
-   */
-  let candidateInFlight = false;
-  const postCandidate = async (text: string, facts: TurnFacts): Promise<void> => {
-    if (candidateInFlight) {
-      if (!ending) telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_busy' });
-      return;
-    }
-    const turnKey = randomUUID();
-    const postAt = Date.now();
-    let res: Response;
-    candidateInFlight = true;
-    try {
-      // The name the meeting wakes on, which the host's judge must take an invitation to, not the agent's own.
-      const utterance: CallUtterance = { text, turnKey, candidate: true, wakeName: wakeOfMeeting?.name };
-      res = await host.post('utterance', { ...utterance });
-    } catch (err) {
-      callLog.warn('voice-mode worker: could not hand a candidate to the host', { err });
-      if (!ending) telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_lost' });
-      return;
-    } finally {
-      candidateInFlight = false;
-    }
-    if (res.status !== 202) {
-      void res.body?.cancel().catch(() => {});
-      if (!ending)
-        telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_dropped', hostStatus: res.status });
-      return;
-    }
-    const accepted = (await res.json().catch(() => null)) as { id?: unknown } | null;
-    if (ending) return;
-    const turn = ++turns;
-    lastPosted = Math.max(lastPosted, turn);
-    cue('sent');
-    turnTaking.tookTurn();
-    const id = typeof accepted?.id === 'string' ? accepted.id : undefined;
-    sent(turn, text, { facts })({ accepted: true, status: 202, turnKey, id }, postAt);
-  };
   const transcriber = deps.transcriber({
     apiKey: geminiKey,
     model: meta.sttModel,
@@ -5810,7 +5762,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       ended: (facts, outcome, reason) => {
         if (!ending) telemetry.turn({ facts, outcome, reason });
       },
-      ...(meta.meeting?.jev ? { candidate: (text: string, facts: TurnFacts) => void postCandidate(text, facts) } : {}),
       drop: (dropped, text, lone) => {
         if (ending) return;
         callVoice?.publishDropped(
@@ -5845,7 +5796,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     callLog.info('voice-mode worker: a meeting', {
       wakePhrase: wakeOfMeeting.phrase,
       pauseSends: wakeOfMeeting.pauseSends,
-      jev: wakeOfMeeting.jev,
     });
   }
   if (recordCall) {
@@ -5930,31 +5880,28 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     try {
       // The spotter counts the audio it was pushed, from now on; the turns count it from the call's start.
       spotterFrom = callTurns.position;
-      // Jev judges the segments nobody addressed, and with a spotter nothing is transcribed until it fires.
-      spotter = wakeOfMeeting?.jev
-        ? undefined
-        : deps.wakeWord?.({
-            onDetect: (score, window) => {
-              const end = window.end + spotterFrom;
-              callLog.info('voice-mode worker: wake word spotted', {
-                score: Math.round(score * 1000) / 1000,
-                scoredMsAgo: Math.round(msOf(callTurns.position - end)),
-              });
-              callRecording?.wake({ streamMs: Math.round(msOf(end)), score: Math.round(score * 1000) / 1000 });
-              if (ending || review?.reviewing) return;
-              callTurns.onWake(end);
-            },
-            onError: (err) => {
-              callLog.warn(
-                'voice-mode worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn',
-                {
-                  err,
-                },
-              );
-              wakeWord = undefined;
-              callTurns.useWakeWord(undefined);
-            },
+      spotter = deps.wakeWord?.({
+        onDetect: (score, window) => {
+          const end = window.end + spotterFrom;
+          callLog.info('voice-mode worker: wake word spotted', {
+            score: Math.round(score * 1000) / 1000,
+            scoredMsAgo: Math.round(msOf(callTurns.position - end)),
           });
+          callRecording?.wake({ streamMs: Math.round(msOf(end)), score: Math.round(score * 1000) / 1000 });
+          if (ending || review?.reviewing) return;
+          callTurns.onWake(end);
+        },
+        onError: (err) => {
+          callLog.warn(
+            'voice-mode worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn',
+            {
+              err,
+            },
+          );
+          wakeWord = undefined;
+          callTurns.useWakeWord(undefined);
+        },
+      });
     } catch (err) {
       callLog.warn('voice-mode worker: could not start the wake word spotter', { err });
     }

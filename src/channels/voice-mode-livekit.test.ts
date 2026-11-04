@@ -2030,7 +2030,7 @@ describe('meetings: the /meet call kind on the call core', () => {
     expect(h.lk.roomOptions).toEqual([{ name: room, emptyTimeout: 600, departureTimeout: 10, maxParticipants: 3 }]);
     expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({
       callerIdentity: `meet-bridge-${room}`,
-      meeting: { pauseSends: false, jev: false },
+      meeting: { pauseSends: false },
       joinTimeoutMs: 10 * MIN,
       maxDurationMs: MEETING_MAX_DURATION_MS,
     });
@@ -2058,7 +2058,7 @@ describe('meetings: the /meet call kind on the call core', () => {
 
   it('tells the worker a `pause` meeting sends on the pause', async () => {
     expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: true, jev: false })).toEqual({ ok: true });
-    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: true, jev: false });
+    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: true });
   });
 
   it('routes meeting turns as guest turns with the meeting note, and says in the chat when it joined', async () => {
@@ -2115,14 +2115,6 @@ describe('meetings: the /meet call kind on the call core', () => {
     const started = Date.now();
     await stuck.stop();
     expect(Date.now() - started).toBeLessThan(2000);
-  });
-
-  it('takes no candidates on a call without a judge', async () => {
-    const { worker } = await startCall(h);
-    const res = await worker.post('utterance', { text: 'just chatting', candidate: true });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe('Not a turn: this call takes no candidates');
-    expect(h.events).toHaveLength(0);
   });
 });
 
@@ -2269,7 +2261,7 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
   it("runs the jev loop for the meeting: jev and the meeting in the job, the participants' audio endpoint on the bot create", async () => {
     expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
     const meta = h.lk.dispatches.at(-1)!.metadata;
-    expect(meta).toMatchObject({ jev: true, meeting: { pauseSends: false, jev: true } });
+    expect(meta).toMatchObject({ jev: true, meeting: { pauseSends: false } });
     // The meeting's people call it by the wake phrase's name; the line's agent name is an alias, and the bot keeps it.
     expect(policies).toEqual([
       expect.objectContaining({ kind: 'meet', agentName: 'Dan', agentAliases: ['Andy', 'Енді'] }),
