@@ -136,7 +136,12 @@ describe('RecallTranslator', () => {
       ' Andy ',
     );
     expect(out.map((o) => o.type)).toEqual(['self', 'audio']);
-    expect(out[0]).toEqual({ type: 'self', speaker: { id: '300', name: 'andy' } });
+    expect(out[0]).toEqual({ type: 'self', speaker: { id: '300', name: 'andy' }, again: false });
+    // A second participant of that name is left out as well, flagged: it may be a person.
+    expect(run([frame(BOT, 1, [1]), frame({ id: 301, name: 'Andy' }, 2, [2])], 'Andy')).toEqual([
+      { type: 'self', speaker: { id: '300', name: 'andy' }, again: false },
+      { type: 'self', speaker: { id: '301', name: 'Andy' }, again: true },
+    ]);
     // Without a bot name nobody is left out.
     expect(run([frame(BOT, 1, [1])])).toHaveLength(1);
   });
@@ -262,6 +267,20 @@ describe('createRecallIngress', () => {
     expect(events).toEqual([['call-1', { kind: 'chat', speaker: alex, text: 'hi', at: START_MS + 1200 }]]);
     expect(presence).toEqual([['call-1', '100', true]]);
     expect(raw.map((r) => (r as [number, unknown])[0])).toEqual([1, 2, 3, 4]);
+  });
+
+  it('warns once when a second participant has the bot’s name', async () => {
+    const { ingress, origin } = await start();
+    const ws = await open(recallEndpointUrl(origin, ingress.register('call-1', { botName: 'Andy' })));
+    vi.mocked(log.warn).mockClear();
+    ws.send(JSON.stringify(frame({ id: 300, name: 'Andy' }, 1, [1])));
+    ws.send(JSON.stringify(frame({ id: 301, name: 'andy' }, 2, [2])));
+    ws.send(JSON.stringify(frame({ id: 301, name: 'andy' }, 3, [3])));
+    await until(() => vi.mocked(log.warn).mock.calls.length > 0);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(vi.mocked(log.warn).mock.calls).toEqual([
+      [expect.stringContaining("another participant has the bot's name"), { callId: 'call-1', participantId: '301' }],
+    ]);
   });
 
   it('accepts the path without the trailing slash too', async () => {

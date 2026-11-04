@@ -49,8 +49,11 @@ export type RecallOutput =
   /** A typed chat line, as a `CallEvent`. */
   | { type: 'event'; event: CallEvent }
   | { type: 'presence'; speaker: Speaker; joined: boolean; at: number }
-  /** The bot's own participant, the first time it shows: none of its frames or events reach the call. */
-  | { type: 'self'; speaker: Speaker };
+  /**
+   * A participant with the bot's name, the first time it shows: none of its frames or events reach the
+   * call. `again`: one with that name was taken for the bot already, so this may be a human of that name.
+   */
+  | { type: 'self'; speaker: Speaker; again: boolean };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null;
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -116,8 +119,9 @@ export class RecallTranslator {
     if (!speaker) return [];
     if (this.selfIds.has(speaker.id)) return [];
     if (this.selfName !== null && speaker.name.toLowerCase() === this.selfName) {
+      const again = this.selfIds.size > 0;
       this.selfIds.add(speaker.id);
-      return [{ type: 'self', speaker }];
+      return [{ type: 'self', speaker, again }];
     }
     const { event, data } = payload;
     const stamp = isRecord(data.timestamp) ? data.timestamp : null;
@@ -223,6 +227,11 @@ export function createRecallIngress(options: RecallIngressOptions): RecallIngres
       for (const out of entry.translator.translate(message, now())) {
         if (out.type === 'audio') options.onAudio(entry.callId, out.speaker, out.pcm, out.at);
         else if (out.type === 'event') options.onEvent(entry.callId, out.event);
+        else if (out.type === 'self' && out.again)
+          log.warn("meet-jev recall: another participant has the bot's name; left out too, though it may be a person", {
+            callId: entry.callId,
+            participantId: out.speaker.id,
+          });
         else if (out.type === 'self')
           log.info("meet-jev recall: the bot's own participant; its events are left out", {
             callId: entry.callId,
