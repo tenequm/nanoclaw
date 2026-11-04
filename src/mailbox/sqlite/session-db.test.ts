@@ -9,7 +9,13 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { ensureSchema, getInboundSourceSessionId, migrateMessagesInTable, syncProcessingAcks } from './session-db.js';
+import {
+  ensureSchema,
+  getInboundSourceSessionId,
+  migrateDeliveredTable,
+  migrateMessagesInTable,
+  syncProcessingAcks,
+} from './session-db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -88,6 +94,21 @@ describe('migrateMessagesInTable', () => {
 
     expect(getInboundSourceSessionId(db, 'legacy-2')).toBeNull();
     expect(getInboundSourceSessionId(db, 'does-not-exist')).toBeNull();
+    db.close();
+  });
+});
+
+describe('delivered platform_message_id index', () => {
+  const indexes = (db: Database.Database) =>
+    (db.prepare("PRAGMA index_list('delivered')").all() as Array<{ name: string }>).map((i) => i.name);
+
+  it('is created on a legacy delivered table, idempotently', () => {
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const db = new Database(DB_PATH);
+    db.exec('CREATE TABLE delivered (message_out_id TEXT PRIMARY KEY, delivered_at TEXT NOT NULL)');
+    migrateDeliveredTable(db);
+    migrateDeliveredTable(db);
+    expect(indexes(db)).toContain('idx_delivered_platform_message');
     db.close();
   });
 });

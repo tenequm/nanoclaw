@@ -112,6 +112,7 @@ export interface OutboundFile {
 export interface OutboundMessage {
   kind: string;
   content: unknown; // parsed JSON from messages_out
+  inReplyTo?: string;
   files?: OutboundFile[]; // file attachments from the session outbox
 }
 
@@ -246,6 +247,7 @@ export interface ChannelAdapter {
     status?: string,
     statusKind?: 'auto' | 'agent',
   ): Promise<void>;
+  threadsReplies?: boolean;
   syncConversations?(): Promise<ConversationInfo[]>;
   /** Resolve conversation type and human-readable metadata for host UI. */
   resolveConversation?(platformId: string): Promise<ResolvedConversation | null>;

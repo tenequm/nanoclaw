@@ -23,3 +23,33 @@ export function namespacedPlatformId(channel: string, raw: string): string {
   if (channel === 'deltachat') return raw;
   return `${channel}:${raw}`;
 }
+
+/**
+ * Suffix an inbound message id with its agent group.
+ *
+ * One platform message fans out to a `messages_in` row per agent group, and
+ * `id` is that table's PRIMARY KEY, so the raw platform id would collide
+ * across sessions (and within one session on a re-route after a retry).
+ */
+export function agentScopedMessageId(baseId: string, agentGroupId: string): string {
+  return `${baseId}:${agentGroupId}`;
+}
+
+/**
+ * Recover the platform's own id from an agent-scoped one.
+ *
+ * The container addresses a message by the inbound ROW id (that is what
+ * `getMessageIdBySeq` returns for an inbound seq), so every id reaching an
+ * adapter through `edit_message` / `add_reaction` carries the scope suffix.
+ * Telegram tolerates it by accident — `extractTelegramMessageId` reads only
+ * the first two colon-separated parts — but Slack hands the whole string to
+ * `reactions.add` as a `ts` and gets `message_not_found`.
+ *
+ * Exact-suffix match, never a heuristic split: an id that was never scoped
+ * (an outbound row's id, which resolves through `delivered.platform_message_id`
+ * and is already clean) passes through untouched.
+ */
+export function platformMessageId(scopedId: string, agentGroupId: string): string {
+  const suffix = `:${agentGroupId}`;
+  return scopedId.endsWith(suffix) ? scopedId.slice(0, -suffix.length) : scopedId;
+}

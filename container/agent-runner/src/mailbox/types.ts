@@ -53,6 +53,7 @@ export interface MailboxOperations {
   writeMessageOut(message: OutboundMessageDraft): Promise<number>;
   getMessageIdBySeq(sequence: number): string | null;
   getRoutingBySeq(sequence: number): SessionRouting | null;
+  findSeqByPlatformMessageId(channelType: string, platformId: string, platformMessageId: string): number | null;
   getLatestInboundRoute(channelType: string, platformId: string): { threadId: string | null; inReplyTo: string } | null;
   getUndeliveredMessages(): OutboundMessage[];
   /**
