@@ -7,14 +7,18 @@ import type { Action, CallEvent, Command, Verdict } from './types.js';
 import {
   agentSpeaking,
   applyWindow,
+  floorTaken,
   hasWords,
+  isHandled,
   latestUtterance,
   latestWake,
+  markHandled,
   normalize,
   pendingAnswer,
   refreshVersion,
   renderWindow,
   toJevState,
+  unmarkHandled,
   unpunctuated,
   type CallState,
 } from './window.js';
@@ -32,8 +36,14 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
   switch (event.kind) {
     case 'utterance':
       // Both kinds decide on the final, which comes after the speaker's own VAD end (the worker's, or the
-      // host's per-participant pipeline in a meeting).
-      if (event.final && !stillSpeaking(state, event.speaker.id)) boundary(state, event.speaker.id);
+      // host's per-participant pipeline in a meeting). Only the current utterance's final is a boundary: a late
+      // final of an older one updates the window and decides nothing.
+      if (
+        event.final &&
+        state.speakers[event.speaker.id]?.lastUttId === event.uttId &&
+        !stillSpeaking(state, event.speaker.id)
+      )
+        boundary(state, event.speaker.id);
       break;
     case 'speech':
       if (event.on) break;
@@ -96,14 +106,35 @@ function log(state: CallState, event: string, fields: Record<string, unknown>): 
   state.commands.push({ kind: 'log', event, fields: { windowVersion: state.windowVersion, ...fields } });
 }
 
-/** A speaker finished an utterance: rules first, then Jev. Each utterance's words are decided once. */
+/**
+ * A speaker's boundary: their current utterance is decided, or, when it has nothing new and nobody speaks, an
+ * utterance deferred while someone spoke is.
+ */
 function boundary(state: CallState, speakerId: string): void {
+  if (decideLatest(state, speakerId)) return;
+  const deferred = state.deferred;
+  if (!deferred || floorTaken(state)) return;
+  state.deferred = null;
+  if (state.speakers[deferred.speakerId]?.lastUttId === deferred.uttId) decideLatest(state, deferred.speakerId);
+}
+
+/**
+ * The stop rule first, then Jev, on the speaker's current utterance; false when it has no words or was decided
+ * already. A vocative is a fact for Jev, not a wake: "Dan, wait for Anna" or an unfinished "Dan, I was
+ * wondering" are Jev's to read; only a failed Jev call on one still wakes.
+ */
+function decideLatest(state: CallState, speakerId: string): boolean {
   const speaker = state.speakers[speakerId];
   const utt = latestUtterance(state, speakerId);
-  if (!speaker || !utt || !hasWords(utt.text)) return;
-  const key = utt.uttId;
-  if (speaker.handled === key) return;
-  speaker.handled = key;
+  if (!speaker || !utt || !hasWords(utt.text) || isHandled(speaker, utt.uttId)) return false;
+  markHandled(speaker, utt.uttId);
+  // A newer decision sees the deferred utterance in its window; it is not decided again after it.
+  const deferred = state.deferred;
+  if (deferred) {
+    const owner = state.speakers[deferred.speakerId];
+    if (owner) markHandled(owner, deferred.uttId);
+    state.deferred = null;
+  }
 
   const trigger = { trigger: utt.text, speaker: speaker.name };
   const { vocative, rest } = vocativeOf(utt.text, [state.policy.agentName, ...state.policy.agentAliases]);
@@ -111,25 +142,40 @@ function boundary(state: CallState, speakerId: string): void {
     if (agentSpeaking(state) || pendingAnswer(state)) {
       stop(state);
       log(state, 'decision', { ...trigger, rule: 'stop', action: 'stop' });
-      return;
+      return true;
     }
     if (vocative) {
       log(state, 'decision', { ...trigger, rule: 'stop', action: 'none', reason: 'nothing_to_stop' });
-      return;
+      return true;
     }
   }
-  if (vocative && hasWords(rest)) {
-    log(state, 'decision', { ...trigger, rule: 'vocative', action: 'answer' });
-    wake(state, speakerId, utt.text);
-    return;
-  }
-  judge(state, speakerId, utt.text, false);
+  judge(state, speakerId, utt.uttId, utt.text, false);
+  return true;
 }
 
-function judge(state: CallState, speakerId: string, trigger: string, retried: boolean): void {
-  state.judging = { version: state.windowVersion, speakerId, trigger, seq: state.seq, retried };
+/** The agent called by name with words after it ("Dan, ..."), not the name alone. */
+function addressedByName(state: CallState, text: string): boolean {
+  const { vocative, rest } = vocativeOf(text, [state.policy.agentName, ...state.policy.agentAliases]);
+  return vocative && hasWords(rest);
+}
+
+function judge(state: CallState, speakerId: string, uttId: string, trigger: string, retried: boolean): void {
+  const named = addressedByName(state, trigger);
+  state.judging = {
+    version: state.windowVersion,
+    speakerId,
+    uttId,
+    trigger,
+    addressedByName: named,
+    seq: state.seq,
+    retried,
+  };
   const latest = { speaker: state.speakers[speakerId]?.name ?? speakerId, text: trigger };
-  state.commands.push({ kind: 'judge', windowVersion: state.windowVersion, state: toJevState(state, latest) });
+  state.commands.push({
+    kind: 'judge',
+    windowVersion: state.windowVersion,
+    state: toJevState(state, latest, named),
+  });
 }
 
 function onVerdict(state: CallState, version: number, verdict: Verdict | null, ms: number): void {
@@ -142,20 +188,22 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
   const speaker = state.speakers[judging.speakerId];
   const trigger = { trigger: judging.trigger, speaker: speaker?.name };
 
+  // The pause the verdict was asked on is over: acting now would talk into live speech, or start a turn on a
+  // thought still being finished. The utterance stays undecided for the next boundary.
+  if (floorTaken(state)) {
+    if (speaker) unmarkHandled(speaker, judging.uttId);
+    state.deferred = { speakerId: judging.speakerId, uttId: judging.uttId };
+    log(state, 'verdict_deferred', { ...trigger, verdictVersion: version, choice: verdict?.action ?? null });
+    return;
+  }
+
   if (version !== state.windowVersion) {
     const wokeSince = state.wakes.some((w) => w.seq > judging.seq);
     const utt = latestUtterance(state, judging.speakerId);
-    if (
-      !judging.retried &&
-      !wokeSince &&
-      speaker &&
-      !stillSpeaking(state, judging.speakerId) &&
-      utt &&
-      hasWords(utt.text)
-    ) {
+    if (!judging.retried && !wokeSince && speaker && utt && hasWords(utt.text)) {
       log(state, 'verdict_stale', { ...trigger, verdictVersion: version, action: 'rejudge' });
-      speaker.handled = utt.uttId;
-      judge(state, judging.speakerId, utt.text, true);
+      markHandled(speaker, utt.uttId);
+      judge(state, judging.speakerId, utt.uttId, utt.text, true);
     } else {
       log(state, 'verdict_stale', { ...trigger, verdictVersion: version, action: 'none' });
     }
@@ -163,7 +211,10 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
   }
 
   if (!verdict) {
-    log(state, 'decision', { ...trigger, jev: null, ms, action: 'stay_silent', reason: 'jev_failed' });
+    // Never deaf to its name: without Jev, a vocative wakes; anything else is silence.
+    const action = judging.addressedByName ? 'answer' : 'stay_silent';
+    log(state, 'decision', { ...trigger, jev: null, ms, action, reason: 'jev_failed' });
+    if (action === 'answer') wake(state, judging.speakerId, judging.trigger);
     return;
   }
   const action = chosen(state, verdict);
@@ -192,18 +243,36 @@ function chosen(state: CallState, verdict: Verdict): Action {
   return 'stay_silent';
 }
 
-function stop(state: CallState): void {
-  state.stoppedSeq = state.seq;
-  // Lines not started yet are no pending answer; the worker may have started one already, so its reports still count.
+/**
+ * Take the lines not started yet out of `playout`: they are no pending answer. The worker may have started one
+ * already, so its reports still count.
+ */
+function takeBackUnstarted(state: CallState): string[] {
+  const taken: string[] = [];
   for (const [replyId, entry] of Object.entries(state.playout)) {
     if (state.agentLines.some((l) => l.replyId === replyId && l.state === 'playing')) continue;
     state.stoppedPlayout[replyId] = entry;
     delete state.playout[replyId];
+    taken.push(replyId);
   }
+  return taken;
+}
+
+function stop(state: CallState): void {
+  state.stoppedSeq = state.seq;
+  takeBackUnstarted(state);
   state.commands.push({ kind: 'stop_playback' });
 }
 
+/**
+ * A new turn for the agent. An answer to an older turn that has not started playing is revoked: the newer turn
+ * replaces it. One already playing plays on; the reflex and a stop cover talking over it.
+ */
 function wake(state: CallState, speakerId: string, message: string, extra?: string): void {
+  for (const replyId of takeBackUnstarted(state)) {
+    state.commands.push({ kind: 'revoke', replyId });
+    log(state, 'reply', { replyId, outcome: 'revoked', reason: 'replaced' });
+  }
   const prev = latestWake(state);
   const supersedes = prev && prev.turnId === null && !prev.dropped ? prev.key : undefined;
   if (prev && supersedes) prev.dropped = true;
@@ -282,11 +351,11 @@ export function vocativeOf(text: string, names: string[]): { vocative: boolean; 
     if (match) return { vocative: true, rest: unpunctuated(match[1]) };
   }
   // One-word names in another script or case form ("Ден, ...", "Дене, ...", "..., Ден?").
-  const keys = new Set(names.filter((name) => !/\s/.test(name.trim())).map(nameKey));
+  const words = names.map(normalize).filter((name) => name && !/\s/.test(name));
   const lead = /^(?:(?:hey|hi|гей|хей|эй|привіт)\s+)?([\p{L}]+)\s*[,!:]\s*(.*)$/u.exec(said);
-  if (lead && sameName(lead[1], keys)) return { vocative: true, rest: unpunctuated(lead[2]) };
+  if (lead && sameName(lead[1], words)) return { vocative: true, rest: unpunctuated(lead[2]) };
   const tail = /^(.*?)\s*,\s*([\p{L}]+)\s*[.?!]*$/u.exec(said);
-  if (tail && sameName(tail[2], keys)) return { vocative: true, rest: unpunctuated(tail[1]) };
+  if (tail && sameName(tail[2], words)) return { vocative: true, rest: unpunctuated(tail[1]) };
   return { vocative: false, rest: unpunctuated(said) };
 }
 
@@ -309,8 +378,20 @@ function nameKey(word: string): string {
     .replace(/([^*])\1+/g, '$1');
 }
 
-/** A word is one of the names, also in a Cyrillic vocative case ending in -е or -у (`Дене`). */
-function sameName(word: string, keys: Set<string>): boolean {
-  if (keys.has(nameKey(word))) return true;
-  return /^[\p{Script=Cyrillic}]{4,}$/u.test(word) && /[еу]$/u.test(word) && keys.has(nameKey(word.slice(0, -1)));
+const scriptOf = (word: string): 'cyrillic' | 'latin' | null =>
+  /\p{Script=Cyrillic}/u.test(word) ? 'cyrillic' : /\p{Script=Latin}/u.test(word) ? 'latin' : null;
+
+/**
+ * A word is one of the (normalized, one-word) names: spelled the same in the same script, or sounding the same
+ * across Cyrillic and Latin (`Ден` for `Dan`, never `Don` for `Dan`); also in a Cyrillic vocative case ending in
+ * -е or -у (`Дене`).
+ */
+function sameName(word: string, names: string[]): boolean {
+  const forms = /^[\p{Script=Cyrillic}]{4,}$/u.test(word) && /[еу]$/u.test(word) ? [word, word.slice(0, -1)] : [word];
+  return forms.some((form) =>
+    names.some((name) => {
+      const [a, b] = [scriptOf(form), scriptOf(name)];
+      return a !== null && b !== null && a !== b ? nameKey(form) === nameKey(name) : form === name;
+    }),
+  );
 }

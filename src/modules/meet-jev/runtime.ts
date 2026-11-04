@@ -21,6 +21,7 @@ export interface RuntimePorts {
   speak(replyId: string, text: string): void;
   show(replyId: string, text: string): void;
   drop(replyId: string): void;
+  revoke(replyId: string): void;
   stopPlayback(): void;
   log(event: string, fields: Record<string, unknown>): void;
   /** Every event as it is processed, numbered from 1: the call's replayable log. */
@@ -123,6 +124,8 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
         return ports.show(command.replyId, command.text);
       case 'drop':
         return ports.drop(command.replyId);
+      case 'revoke':
+        return ports.revoke(command.replyId);
       case 'stop_playback':
         return ports.stopPlayback();
       case 'log':

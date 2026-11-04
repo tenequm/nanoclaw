@@ -9,15 +9,15 @@ import { ACTIONS, type Action, type JevState, type Verdict } from './core/types.
 function actionQuestion(agent: string) {
   return {
     type: 'choice',
-    instructions: `A live call. \`latest\` is the utterance just finished, the one to decide on; \`window\` is the conversation up to and including it, oldest first, for context (\`t\` = seconds ago; \`agent\` lines are what ${agent} said; \`cut_off\` marks where ${agent} was interrupted; \`partial\` lines are still being spoken). \`policy\` says when ${agent} speaks and \`facts\` what ${agent} is doing now. What should ${agent} do about \`latest\`?`,
+    instructions: `A live call. \`latest\` is the utterance just finished, the one to decide on; \`window\` is the conversation up to and including it, oldest first, for context (\`t\` = seconds ago; \`agent\` lines are what ${agent} said; \`cut_off\` marks where ${agent} was interrupted; \`partial\` lines are still being spoken). \`policy\` says when ${agent} speaks and \`facts\` what ${agent} is doing now; \`facts.addressed_by_name\` says \`latest\` calls ${agent} by name, which makes it addressed to ${agent} but not necessarily a request to answer now. What should ${agent} do about \`latest\`?`,
     criteria: {
       answer: {
-        what: `The latest utterance is for ${agent} and needs a reply now: it addresses ${agent} by name, or, as the policy allows, asks a question or makes a request that nobody else is taking up, and the speaker has finished the thought.`,
-        not_for: `A remark to another person, a thought still being finished, small talk, or something already answered; ${agent} merely mentioned in the third person.`,
+        what: `The latest utterance is for ${agent} and needs a reply now: a question or request to ${agent} by name (facts.addressed_by_name), or, as the policy allows, a question or request that nobody else is taking up; and the speaker has finished the thought.`,
+        not_for: `A remark to another person, a thought still being finished (also after ${agent}'s name, "${agent}, I was wondering..."), small talk, or something already answered; ${agent} merely mentioned in the third person; ${agent} told by name not to answer or to wait ("${agent}, don't answer that", "${agent}, wait for Anna").`,
       },
       stay_silent: {
-        what: `${agent} should not speak: the utterance is addressed to a person, is small talk or a reaction, is unfinished, was already answered, or people are talking among themselves.`,
-        not_for: `A request addressed to ${agent}, or an instruction about what ${agent} is saying or about to say.`,
+        what: `${agent} should not speak: the utterance is addressed to a person, is small talk or a reaction, is unfinished, was already answered, people are talking among themselves, or ${agent} is told by name to hold back ("${agent}, don't answer that", "${agent}, wait for Anna", an unfinished "${agent}, I was wondering").`,
+        not_for: `A finished question or request to ${agent}, or an instruction about what ${agent} is saying or about to say.`,
       },
       stop: {
         what: `Someone tells ${agent} to stop or be quiet, or says the answer ${agent} is giving or preparing is no longer needed.`,
@@ -31,20 +31,31 @@ function actionQuestion(agent: string) {
   };
 }
 
-const unit = (value: unknown): number | null =>
-  typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : null;
+/** How far a distribution's sum may be from 1 (rounding in Jev's answer) before it is malformed. */
+const SUM_TOLERANCE = 0.02;
 
-/** Read the `action` answer; null unless it is a well-formed Choice over our four options. */
+const unit = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+
+/**
+ * Read the `action` answer; null unless it is a well-formed Choice over our four options: every option's
+ * probability in 0..1, summing to 1, and a confidence in 0..1. A partly valid answer is not acted on.
+ */
 export function parseAction(body: unknown): Verdict | null {
   const answer = (body as { answers?: { action?: unknown } } | null)?.answers?.action;
   if (!answer || typeof answer !== 'object') return null;
   const { choice, confidence, probabilities } = answer as Record<string, unknown>;
   if (!ACTIONS.includes(choice as Action) || !probabilities || typeof probabilities !== 'object') return null;
-  const conf = unit(confidence);
-  if (conf === null) return null;
+  if (!unit(confidence)) return null;
   const probs = {} as Record<Action, number>;
-  for (const action of ACTIONS) probs[action] = unit((probabilities as Record<string, unknown>)[action]) ?? 0;
-  return { action: choice as Action, probabilities: probs, confidence: conf };
+  for (const action of ACTIONS) {
+    const p = (probabilities as Record<string, unknown>)[action];
+    if (!unit(p)) return null;
+    probs[action] = p;
+  }
+  const sum = ACTIONS.reduce((total, action) => total + probs[action], 0);
+  if (Math.abs(sum - 1) > SUM_TOLERANCE) return null;
+  return { action: choice as Action, probabilities: probs, confidence };
 }
 
 /** Ask Jev what the agent should do about the window. Never throws; null on any failure. */

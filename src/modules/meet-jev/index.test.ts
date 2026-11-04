@@ -150,6 +150,33 @@ describe('createJevCall on a meeting', () => {
     expect(words()).toBe(2);
   });
 
+  it("pushes a revoke for the core's revoke: the worker drops that queued line", () => {
+    const pushed: LiveKitHostEvent[] = [];
+    const call = createJevCall(
+      {
+        callId: 'v2',
+        callerName: 'Ethan',
+        agentName: 'Andy',
+        agentAliases: [],
+        maxTextBytes: 4096,
+        submitTurn: async () => ({ ok: false, reason: 'test' }),
+        push: (event) => void pushed.push(event),
+        now: () => 1_000,
+      },
+      {
+        core: {
+          initial: () => null,
+          reduce: (state) => state,
+          decide: (_state, event) => (event.kind === 'reply' ? [{ kind: 'revoke', replyId: 'r0' }] : []),
+        },
+        judge: async () => ({ verdict: null, ms: 0 }),
+      },
+    );
+    call.reply('Tuesday.', 't1');
+    expect(pushed).toEqual([{ type: 'revoke', replyId: 'r0' }]);
+    call.end('test');
+  });
+
   it("ignores a transcript on a voice call: its words are the worker's", () => {
     const fed: CallEvent[] = [];
     const call = createJevCall(

@@ -519,12 +519,15 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * need no version bump.
  *
  * On a jev call the host sends only replies to speak, each with a `replyId` its playback reports
- * name; `stop` aborts the line playing and drops the queue; `words` says a participant's words
- * arrived, the reflex's text confirmation where the worker has no transcript of its own.
+ * name; `stop` aborts the line playing and drops the queue; `revoke` drops one queued line that has
+ * not started (a newer wake replaced its turn; reported `cut_off` with nothing delivered, and a line
+ * already playing plays on); `words` says a participant's words arrived, the reflex's text
+ * confirmation where the worker has no transcript of its own.
  */
 export type LiveKitHostEvent =
   | { type: 'reply'; text: string; turn?: string | null; replyId?: string }
   | { type: 'stop' }
+  | { type: 'revoke'; replyId: string }
   | { type: 'words' }
   | { type: 'thinking' }
   | { type: 'working' }

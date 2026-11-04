@@ -28,7 +28,13 @@ const state: JevState = {
   participants: ['Misha'],
   latest: { speaker: 'Misha', text: 'Dan, what time is it?' },
   window: [{ t: 0.4, speaker: 'Misha', text: 'Dan, what time is it?' }],
-  facts: { agent_speaking: false, pending_answer: false, cut_off_after: null, agent_last_spoke_s_ago: null },
+  facts: {
+    agent_speaking: false,
+    pending_answer: false,
+    cut_off_after: null,
+    agent_last_spoke_s_ago: null,
+    addressed_by_name: true,
+  },
 };
 
 const choice = {
@@ -113,14 +119,24 @@ describe('parseAction', () => {
     expect(parseAction({ answers: { action: { ...choice, probabilities: undefined } } })).toBeNull();
   });
 
-  it('clamps probabilities and reads a missing option as 0', () => {
-    const verdict = parseAction({
-      answers: { action: { ...choice, confidence: 1.2, probabilities: { answer: 1.01, stay_silent: -0.01 } } },
-    });
-    expect(verdict).toEqual({
+  it('rejects a malformed distribution instead of clamping or defaulting it', () => {
+    const with_ = (action: Record<string, unknown>) => parseAction({ answers: { action: { ...choice, ...action } } });
+    expect(with_({ probabilities: { answer: 0.9, stay_silent: 0.1 } })).toBeNull();
+    expect(with_({ probabilities: { answer: 1.01, stay_silent: -0.01, stop: 0, continue: 0 } })).toBeNull();
+    expect(with_({ probabilities: { answer: 0.5, stay_silent: 0.1, stop: 0.1, continue: 0.1 } })).toBeNull();
+    expect(with_({ probabilities: { answer: 0.9, stay_silent: 0.5, stop: 0.1, continue: 0.1 } })).toBeNull();
+    expect(with_({ probabilities: { answer: '0.86', stay_silent: 0.1, stop: 0.03, continue: 0.01 } })).toBeNull();
+    expect(with_({ probabilities: { answer: Number.NaN, stay_silent: 0.1, stop: 0.03, continue: 0.01 } })).toBeNull();
+    expect(with_({ confidence: 1.2 })).toBeNull();
+    expect(with_({ confidence: -0.1 })).toBeNull();
+  });
+
+  it('takes a distribution that sums to 1 within rounding', () => {
+    const probabilities = { answer: 0.86, stay_silent: 0.1, stop: 0.03, continue: 0.02 };
+    expect(parseAction({ answers: { action: { ...choice, probabilities } } })).toEqual({
       action: 'answer',
-      probabilities: { answer: 1, stay_silent: 0, stop: 0, continue: 0 },
-      confidence: 1,
+      probabilities,
+      confidence: 0.72,
     });
   });
 });

@@ -10,7 +10,7 @@
  * its VAD marks (the meeting's mixed audio) are logged, never a boundary.
  *
  * On a jev call the host pushes the worker only what the core says to: a `reply` (with its `replyId`)
- * for `speak`, a `stop` for `stop_playback`. `show` and `drop` push nothing: the agent's message is
+ * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`. `show` and `drop` push nothing: the agent's message is
  * already in the call chat, since a reply reaches this module from the post-delivery hook.
  */
 import type { LiveKitHostEvent } from '../../channels/voice-mode-protocol.js';
@@ -101,6 +101,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
     },
     show: () => undefined,
     drop: () => undefined,
+    revoke: (replyId) => host.push({ type: 'revoke', replyId }),
     stopPlayback: () => host.push({ type: 'stop' }),
     log: (event, data) => log.info(`meet-jev: ${event}`, { ...fields, ...data }),
     // Partials are many and say what the caller is still saying: their size only, and at debug.

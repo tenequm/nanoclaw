@@ -75,6 +75,11 @@ export type Command =
   | { kind: 'show'; replyId: string; text: string }
   /** Drop a reply: the agent answered `[silent]`. */
   | { kind: 'drop'; replyId: string }
+  /**
+   * Take back a `speak` whose line has not started: a newer wake replaced its turn. The worker drops
+   * it from its queue (reported `cut_off`, nothing delivered); a line already playing plays on.
+   */
+  | { kind: 'revoke'; replyId: string }
   /** Stop the line playing now and every line queued behind it. */
   | { kind: 'stop_playback' }
   /** One structured log line: every decision and every playback outcome. */
@@ -110,6 +115,8 @@ export interface JevState {
     /** What the agent had said when it was last cut off, while that is the latest thing it did. */
     cut_off_after: string | null;
     agent_last_spoke_s_ago: number | null;
+    /** `latest` opens or ends with the agent's name as a vocative ("Dan, ...", "..., Dan?"): addressed, not proof a reply is wanted. */
+    addressed_by_name: boolean;
   };
 }
 
@@ -122,7 +129,7 @@ export interface ActionThreshold {
 /** Everything that differs between the two kinds; the core knows nothing else about them. */
 export interface CallPolicy {
   kind: CallKind;
-  /** The agent's name as people say it, for the vocative rule and the state. */
+  /** The agent's name as people say it, for the vocative fact, the stop rule and the state. */
   agentName: string;
   /** Other spellings or scripts of the name (voice.vocabulary.txt). */
   agentAliases: string[];

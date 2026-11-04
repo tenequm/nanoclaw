@@ -31,9 +31,26 @@ export interface ChatLine {
 export interface SpeakerState {
   name: string;
   speaking: boolean;
+  /** The speaker's current utterance: the newest in source order, never moved back by a late final. */
   lastUttId: string | null;
-  /** The uttId the last boundary was decided on, so each utterance is decided once. */
-  handled: string | null;
+  /** The uttIds already decided on, newest last (at most `HANDLED_KEPT`), so each utterance is decided once. */
+  handled: string[];
+  /** Speech starts so far. Both sources open one utterance per speech start. */
+  speeches: number;
+  /** The speech start whose utterance was seen during that speech; null before any. */
+  claimed: number | null;
+}
+
+const HANDLED_KEPT = 32;
+
+export const isHandled = (speaker: SpeakerState, uttId: string): boolean => speaker.handled.includes(uttId);
+
+export function markHandled(speaker: SpeakerState, uttId: string): void {
+  if (!isHandled(speaker, uttId)) speaker.handled = [...speaker.handled, uttId].slice(-HANDLED_KEPT);
+}
+
+export function unmarkHandled(speaker: SpeakerState, uttId: string): void {
+  speaker.handled = speaker.handled.filter((id) => id !== uttId);
 }
 
 /** A `turn` command and what became of it. */
@@ -52,7 +69,10 @@ export interface Wake {
 export interface Judging {
   version: number;
   speakerId: string;
+  uttId: string;
   trigger: string;
+  /** The trigger calls the agent by name: a failed Jev call still wakes it. */
+  addressedByName: boolean;
   seq: number;
   retried: boolean;
 }
@@ -82,6 +102,8 @@ export interface CallState {
   cutOffAfter: string | null;
   agentLastSpokeAt: number | null;
   judging: Judging | null;
+  /** An utterance whose verdict came while someone spoke: decided again at the next boundary that decides nothing newer. */
+  deferred: { speakerId: string; uttId: string } | null;
   /** What the last `reduce` decided; `decide` returns it. */
   commands: Command[];
 }
@@ -105,6 +127,7 @@ export function initial(policy: CallPolicy, at: number): CallState {
     cutOffAfter: null,
     agentLastSpokeAt: null,
     judging: null,
+    deferred: null,
     commands: [],
   };
   state.fingerprint = fingerprint(state);
@@ -135,6 +158,9 @@ export function agentSpeaking(state: CallState): boolean {
   return state.agentLines.some((line) => line.state === 'playing');
 }
 
+/** A person is speaking now (on a voice call, the caller). */
+export const floorTaken = (state: CallState): boolean => Object.values(state.speakers).some((s) => s.speaking);
+
 /** An answer is on its way: the latest wake awaits its reply (and no stop came), or a reply is still to play. */
 export function pendingAnswer(state: CallState): boolean {
   if (Object.keys(state.playout).length > 0) return true;
@@ -155,26 +181,35 @@ export function applyWindow(state: CallState, event: CallEvent): void {
       const text = event.text.trim();
       const utt = state.utterances.find((u) => u.speakerId === event.speaker.id && u.uttId === event.uttId);
       if (utt) {
+        // A late final updates its own line; it never makes an older utterance the current one again.
         utt.text = text;
         utt.final = event.final;
         utt.at = event.at;
-      } else {
-        const fresh = {
-          speakerId: event.speaker.id,
-          uttId: event.uttId,
-          text,
-          final: event.final,
-          startedAt: event.at,
-          at: event.at,
-        };
-        state.utterances.push(fresh);
+        break;
       }
+      // A new uttId while the current speech already showed its own utterance belongs to an earlier speech: a final
+      // that settled late, placed before the current line and not made current.
+      const late = speaker.claimed !== null && speaker.claimed === speaker.speeches;
+      const current = late ? latestUtterance(state, event.speaker.id) : undefined;
+      state.utterances.push({
+        speakerId: event.speaker.id,
+        uttId: event.uttId,
+        text,
+        final: event.final,
+        startedAt: current ? Math.min(event.at, current.startedAt - 1) : event.at,
+        at: event.at,
+      });
+      if (late) break;
       speaker.lastUttId = event.uttId;
+      if (speaker.speaking) speaker.claimed = speaker.speeches;
       break;
     }
-    case 'speech':
-      touchSpeaker(state, event.speaker.id, event.speaker.name).speaking = event.on;
+    case 'speech': {
+      const speaker = touchSpeaker(state, event.speaker.id, event.speaker.name);
+      if (event.on && !speaker.speaking) speaker.speeches += 1;
+      speaker.speaking = event.on;
       break;
+    }
     case 'chat':
       touchSpeaker(state, event.speaker.id, event.speaker.name);
       state.chat.push({ speakerId: event.speaker.id, text: event.text.trim(), at: event.at });
@@ -191,11 +226,12 @@ export function applyWindow(state: CallState, event: CallEvent): void {
       }
       delete state.playout[event.replyId];
       delete state.stoppedPlayout[event.replyId];
-      if (event.state === 'failed') {
+      const delivered = event.state === 'cut_off' ? (event.delivered ?? '').trim() : playing.text;
+      // Failed, or dropped before it started (a stop, a revoke): nothing got out.
+      if (event.state === 'failed' || (!line && !delivered)) {
         state.agentLines = state.agentLines.filter((l) => l.replyId !== event.replyId);
         break;
       }
-      const delivered = event.state === 'cut_off' ? (event.delivered ?? '').trim() : playing.text;
       if (line) Object.assign(line, { text: delivered, state: event.state === 'cut_off' ? 'cut_off' : 'done' });
       else state.agentLines.push({ replyId: event.replyId, text: delivered, state: 'done', at: event.at });
       state.agentLastSpokeAt = event.at;
@@ -219,7 +255,14 @@ export function refreshVersion(state: CallState): void {
 }
 
 function touchSpeaker(state: CallState, id: string, name: string): SpeakerState {
-  const speaker = (state.speakers[id] ??= { name, speaking: false, lastUttId: null, handled: null });
+  const speaker = (state.speakers[id] ??= {
+    name,
+    speaking: false,
+    lastUttId: null,
+    handled: [],
+    speeches: 0,
+    claimed: null,
+  });
   speaker.name = name;
   return speaker;
 }
@@ -287,7 +330,7 @@ function lines(state: CallState): Line[] {
 const secondsAgo = (state: CallState, at: number): number => Math.round((state.now - at) / 100) / 10;
 
 /** The JSON `state` of a Jev request: the window as of the newest event, the facts and the policy. */
-export function toJevState(state: CallState, latest: JevState['latest'] = null): JevState {
+export function toJevState(state: CallState, latest: JevState['latest'] = null, addressedByName = false): JevState {
   const participants = [...new Set(Object.values(state.speakers).map((s) => s.name))];
   return {
     policy: state.policy.paragraph,
@@ -300,6 +343,7 @@ export function toJevState(state: CallState, latest: JevState['latest'] = null):
       pending_answer: pendingAnswer(state),
       cut_off_after: state.cutOffAfter,
       agent_last_spoke_s_ago: state.agentLastSpokeAt === null ? null : secondsAgo(state, state.agentLastSpokeAt),
+      addressed_by_name: addressedByName,
     },
   };
 }
