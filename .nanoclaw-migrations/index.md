@@ -10,7 +10,7 @@ Supersedes the v3 guide (`guide.md`, generated 2026-08-31, removed in this commi
 `.claude/skills/migrate-nanoclaw` terms: start from a clean upstream checkout and replay every
 customization as ONE focused commit, in the order below. Nothing is merged.
 
-**Status:** replay starting (2026-11-04). The `/meet` rebuild is merged and deployed; section 07 is
+**Status:** replay in progress (2026-11-04). The `/meet` rebuild is merged and deployed; section 07 is
 re-extracted from `83dc1e00`. Between `098ed630` and `83dc1e00` the only non-voice changes are
 `package.json` and the lockfile (voice dependencies, owned by commit 12), `CLAUDE.md` (commit 14),
 `docs/jev-gate.md` (meeting candidates, commit 12) and `docs/chat-commands.md` (`/voice` and
@@ -47,11 +47,12 @@ re-extracted from `83dc1e00`. Between `098ed630` and `83dc1e00` the only non-voi
 | 9 | `feat(container): fork tools, rules and skills` | [04](04-pond-container.md) |
 | 10 | `feat(slack): multi-instance, a2a guard, room membership, onboarding` | [05](05-slack-jev.md) |
 | 11 | `feat(jev): Jev gate` | [05](05-slack-jev.md) |
-| 12 | `feat(voice-mode): voice and meet` | [07](07-voice.md) (pending) |
+| 12 | `feat(voice-mode): voice and meet` | [07](07-voice.md) |
 | 13 | `feat(mailbox): HTTP transport and k8s dev kit` | [06](06-mailbox-k8s.md) |
 | 14 | `docs: fork docs and migration guide` | all |
 
-Dependencies: 7, 10, 11 and 12 register prose through commit 1's hooks. Commit 13 implements the
+Dependencies: 7, 10, 11 and 12 register prose through commit 1's hooks. Commit 12 also needs 7
+(`ES2023` lib for `findLast`) and 11 (the jev-gate exports `/meet` uses). Commit 13 implements the
 mailbox operations added by commits 2 and 3, so it comes after them. Commit 7's `/context` command
 reads commit 5's column.
 
@@ -70,7 +71,7 @@ order above.
 | 1 | telegram | 6 (published first so voice can branch), 7, 11 | after 1 and 5 | GPT-6 Astra, high |
 | 1 | slack | 10 (the typing hunk lands with 3 at assembly) | after 1 | GPT-6 Astra, medium |
 | 2 | mailbox | 13 | after 2 and 3 | GPT-6 Astra, high |
-| 2 | voice | 12 | after foundation (0-5) and telegram's commit 6 | GPT-6 Astra, high |
+| 2 | voice | 12 (needs 7's `ES2023` tsconfig and 11's jev-gate exports before its gate) | after foundation (0-5) and telegram's commit 6 | GPT-6 Astra, high |
 | 3 | assembly | cherry-pick 0-14 in order, then 14 | all lanes done | the driving session |
 
 Model choice (Artificial Analysis Intelligence Index v5, 2026-11-04): GPT-6 Astra high scores 55
@@ -134,7 +135,8 @@ Rules that keep the lanes fast:
 - The Slack agent flow (creating Slack bots and rooms from chat) and the Slack canvas tools are
   dropped and archived (below). Multi-instance, the a2a guard, room membership and onboarding stay.
 - The fork's core migrations 025, 026 and 028 become idempotent module migrations.
-- OneCLI comes from re-running `/add-onecli`; the fork keeps no patches on its installed files.
+- OneCLI comes from re-running `/add-onecli`. One fork patch survives: the cleanup warning in
+  `onecli-files.ts` (installed file and payload copy), because U's payload fails lint without it.
 
 ## Dropped, not replayed
 
@@ -143,8 +145,9 @@ Rules that keep the lanes fast:
   later re-add.
 - `src/env-file.ts` and the Slack agent flow's copy; room membership keeps its own two helpers.
 - duckdb, openssh-client, AtomicParsley and the pip packages `secretstorage` and `xattr`.
-- The `install-cli-tools.sh` patch, the fork's OneCLI file diffs, the typing status text, the
-  runner's compact-window plumbing, and the fork's edits to upstream's migration list.
+- The `install-cli-tools.sh` patch, the fork's OneCLI file diffs (except the cleanup warning), the
+  typing status text, the runner's compact-window plumbing, and the fork's edits to upstream's
+  migration list.
 - From the `/meet` rebuild: the meeting front desk and the Attendee bridge.
 
 ## Cutover outline

@@ -53,13 +53,15 @@ What changes versus the fork's installed copy (all by taking U's payload, nothin
   in B's and U's payloads. `onecli-install.ts` does not exist on any ref; `onecli-install.test.ts`
   is payload and tests the skill's `scripts/setup.ts` helpers.
 
-### onecli-files.ts cleanup-warning patch [DROP]
+### onecli-files.ts cleanup-warning patch [MERGE] (kept, commit 0)
 **Intent:** S logs a leftover staged temp file instead of throwing from `stageOnecliFile`'s
-`finally` (S `src/gateway-providers/onecli-files.ts:5`, `:105-107`).
-**Files:** `src/gateway-providers/onecli-files.ts`.
-**How to apply on U:** do not. Owner decision D10: take U's payload as is (it still throws at
-`payload/src/gateway-providers/onecli-files.ts:103`). A refresh of the skill overwrites installed
-files with `copyFileSync` anyway, so an installed-file patch would not survive.
+`finally` (S `src/gateway-providers/onecli-files.ts:5`, `:105-107`; fork commit `699b8f31`).
+**Files:** `src/gateway-providers/onecli-files.ts` and the skill's own copy
+`.claude/skills/add-onecli/payload/src/gateway-providers/onecli-files.ts`.
+**How to apply on U:** re-apply `699b8f31` to both files inside `setup: apply add-onecli`. Planned
+as a DROP, reversed during the replay: U's payload throws in `finally` (`:103`), which fails ESLint
+`no-unsafe-finally`, so commit 0 cannot pass the lint gate without it. Patching the payload copy
+too keeps a later skill refresh (`copyFileSync` over the installed file) from undoing it.
 
 ### Behavior change the deploy must expect [ADAPT]
 **Intent:** none to replay; U's adapter now grants the group's model credential itself.
@@ -117,7 +119,7 @@ OneCLI notes (grants by hand are in `/add-onecli`):
 docs/onecli-upgrades.md -> 0 (skill apply; fork copy DROP)
 src/gateway-providers/installed.ts -> 0 (skill apply)
 src/gateway-providers/onecli-files.test.ts -> 0 (skill apply)
-src/gateway-providers/onecli-files.ts -> 0 (skill apply; fork patch DROP)
+src/gateway-providers/onecli-files.ts -> 0 (skill apply plus the kept cleanup-warning patch)
 src/gateway-providers/onecli-install.test.ts -> 0 (skill apply)
 src/gateway-providers/onecli.test.ts -> 0 (skill apply; fork copy DROP)
 src/gateway-providers/onecli.ts -> 0 (skill apply; fork copy DROP)
