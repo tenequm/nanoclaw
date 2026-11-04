@@ -14,6 +14,7 @@ import {
   getInboundSourceSessionId,
   getMessageForRetry,
   getMostRecentPeerSourceSessionId,
+  getReplyTarget,
   getProcessingClaims,
   insertMessage,
   markDelivered,
@@ -215,6 +216,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
     markDelivered: (messageOutId, platformMessageId) => markDelivered(db, messageOutId, platformMessageId),
     markDeliveryFailed: (messageOutId) => markDeliveryFailed(db, messageOutId),
     getInboundSourceSessionId: (messageId) => getInboundSourceSessionId(db, messageId),
+    getReplyTarget: (messageId) => getReplyTarget(db, messageId),
     getMostRecentPeerSourceSessionId: (peerAgentGroupId) => getMostRecentPeerSourceSessionId(db, peerAgentGroupId),
     hasMessagesFromOtherAgents: (selfAgentGroupId) =>
       db

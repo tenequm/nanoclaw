@@ -30,6 +30,7 @@ import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from 
 import { isUnguarded, type Unguarded } from './guard/index.js';
 import { mapConcurrent } from './concurrency.js';
 import { fanOutboundMessage } from './modules/cross-session-context/index.js';
+import { platformMessageId } from './platform-id.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
@@ -118,7 +119,9 @@ export interface ChannelDeliveryAdapter {
     /** Delivering adapter instance (defaults to channelType downstream).
      *  Host-internal only — containers never see instance. */
     instance?: string,
+    inReplyTo?: string,
   ): Promise<string | undefined>;
+  threadsReplies?(channelType: string, instance?: string): boolean;
   setTyping?(
     channelType: string,
     platformId: string,
@@ -362,6 +365,37 @@ async function drainSession(session: Session): Promise<void> {
   }
 }
 
+async function resolveThreadReply(
+  msg: { channelType: string | null; platformId: string | null; inReplyTo: string | null },
+  content: Record<string, unknown>,
+  session: Session,
+  instance: string | undefined,
+): Promise<{ quote?: string } | undefined> {
+  if (!msg.inReplyTo || !msg.channelType || !msg.platformId) return undefined;
+  // Edits, reactions and questions are not new messages; a media group is.
+  if (typeof content.operation === 'string' && content.operation !== 'send_media_group') return undefined;
+  if (content.type === 'ask_question') return undefined;
+  if (!deliveryAdapter?.threadsReplies?.(msg.channelType, instance)) return undefined;
+
+  const intent = content.replyIntent;
+  if (typeof intent === 'object' && intent !== null) {
+    const quote = (intent as { quote?: unknown }).quote;
+    return typeof quote === 'string' && quote ? { quote } : {};
+  }
+
+  const { channelType, platformId, inReplyTo } = msg;
+  try {
+    const target = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getReplyTarget(inReplyTo),
+    );
+    const sameChat = target?.channelType === channelType && target.platformId === platformId;
+    return sameChat && target.newerInChat ? {} : undefined;
+  } catch (err) {
+    log.debug('Reply target unreadable, replying plain', { messageId: inReplyTo, sessionId: session.id, err });
+    return undefined;
+  }
+}
+
 async function deliverMessage(
   msg: {
     id: string;
@@ -534,10 +568,20 @@ async function deliverMessage(
       ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
       : undefined;
 
-  // Agent-asked questions keep their own markup; host-built cards never come
-  // through here, so only they get a channel's card-text escape.
+  const rewritten: Record<string, unknown> = {};
+  if (typeof content.messageId === 'string') {
+    rewritten.messageId = platformMessageId(content.messageId, session.agent_group_id);
+  }
+  const threadReply = await resolveThreadReply(msg, content, session, deliverInstance);
+  if (threadReply) rewritten.threadReply = threadReply;
+  // Agent-asked questions keep their own markup (U).
+  if (content.type === 'ask_question') rewritten.fromAgent = true;
+  // Only the host decides on a reply box; the stored content's own key is not carried.
+  const { threadReply: _stored, ...base } = content;
   const deliveredContent =
-    content.type === 'ask_question' ? JSON.stringify({ ...content, fromAgent: true }) : msg.content;
+    Object.keys(rewritten).length > 0 || 'threadReply' in content
+      ? JSON.stringify({ ...base, ...rewritten })
+      : msg.content;
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channelType,
     msg.platformId,
@@ -546,6 +590,7 @@ async function deliverMessage(
     deliveredContent,
     files,
     deliverInstance,
+    msg.inReplyTo ? platformMessageId(msg.inReplyTo, session.agent_group_id) : undefined,
   );
   log.info('Message delivered', {
     id: msg.id,

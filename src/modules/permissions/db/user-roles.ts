@@ -61,6 +61,18 @@ export async function isAdminOfAgentGroup(userId: string, agentGroupId: string):
   return !!row;
 }
 
+/** The user's role over this agent group. Owner wins over admin; a role scoped to another agent group does not count. */
+export async function getRoleOverAgentGroup(userId: string, agentGroupId: string): Promise<UserRoleKind | undefined> {
+  const rows = await getDb().all<{ role: UserRoleKind }>(
+    'SELECT role FROM user_roles WHERE user_id = ? AND (agent_group_id IS NULL OR agent_group_id = ?)',
+    userId,
+    agentGroupId,
+  );
+  if (rows.some((r) => r.role === 'owner')) return 'owner';
+  if (rows.some((r) => r.role === 'admin')) return 'admin';
+  return undefined;
+}
+
 /** Any admin privilege over this agent group: global admin OR scoped admin. */
 export async function hasAdminPrivilege(userId: string, agentGroupId: string): Promise<boolean> {
   return (await isOwner(userId)) || (await isGlobalAdmin(userId)) || (await isAdminOfAgentGroup(userId, agentGroupId));

@@ -13,3 +13,8 @@ Use `mcp__nanoclaw__add_reaction({ messageId, emoji })` to react to a specific i
 ### Internal thoughts
 
 Wrap reasoning in `<internal>...</internal>` tags to mark it as scratchpad — logged but not sent.
+
+
+### Replies and mentions
+
+Every `<message>` id, and its `reply_to`, uses the same `#N` numbering the tools take. `send_message` answers the current message by default and shows a reply box only when newer messages arrived after it; pass `reply_to: N` to answer a specific earlier message, and `quote` (copied verbatim from that message's text) to highlight the part you answer.

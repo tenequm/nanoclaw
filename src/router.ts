@@ -30,12 +30,14 @@ import {
 } from './db/messaging-groups.js';
 import { findSessionForAgent } from './db/sessions.js';
 import { backfillSession, fanInboundMessage } from './modules/cross-session-context/index.js';
+import { getRoleOverAgentGroup } from './modules/permissions/db/user-roles.js';
+import { agentScopedMessageId } from './platform-id.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage } from './session-manager.js';
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
-import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
+import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session, UserRoleKind } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
 function generateId(): string {
@@ -199,6 +201,37 @@ function dispatchSessionCreated(event: SessionCreatedEvent): void {
       log.error('Session-created hook threw', { sessionId: event.session.id, err });
     }
   }
+}
+
+function isChatKind(kind: string): boolean {
+  return kind === 'chat' || kind === 'chat-sdk';
+}
+
+/** The sender's nanoclaw role over this agent group, for a chat message; none for anything else. */
+export async function resolveSenderRole(
+  event: InboundEvent,
+  userId: string | null,
+  agentGroupId: string,
+): Promise<UserRoleKind | undefined> {
+  return userId && isChatKind(event.message.kind) ? getRoleOverAgentGroup(userId, agentGroupId) : undefined;
+}
+
+/**
+ * Stamp `senderRole` into inbound content for the agent's envelope - the
+ * container cannot read user_roles. Any `senderRole` the adapter passed
+ * through is dropped, so only the host can claim one.
+ */
+export function stampSenderRole(content: string, role: UserRoleKind | undefined): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return content;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return content;
+  if (!role && !('senderRole' in parsed)) return content;
+  const { senderRole: _claimed, ...rest } = parsed as Record<string, unknown>;
+  return JSON.stringify(role ? { ...rest, senderRole: role } : rest);
 }
 
 function safeParseContent(raw: string): { text?: string; sender?: string; senderId?: string } {
@@ -396,8 +429,9 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     const accessOk = engages && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);
     const scopeOk = engages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
 
+    const senderRole = await resolveSenderRole(event, userId, agent.agent_group_id);
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, true);
+      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, true, senderRole);
       engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
@@ -429,7 +463,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       // message (which also stages their attachments to disk via
       // writeSessionMessage → extractAttachmentFiles) is exactly what the
       // gate is meant to prevent.
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, false);
+      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, false, senderRole);
       accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {
@@ -524,7 +558,9 @@ async function deliverToAgent(
   threadsEnabled: boolean,
   effectiveThreadId: string | null,
   wake: boolean,
+  senderRole: UserRoleKind | undefined,
 ): Promise<void> {
+  const isChat = isChatKind(event.message.kind);
   // Apply the resolved thread policy (wiring override AND channel declaration
   // AND adapter capability — resolveThreadPolicy at fanout): thread-enabled
   // wiring in a group chat → per-thread session regardless of wiring
@@ -559,7 +595,7 @@ async function deliverToAgent(
   // Filtered commands are dropped silently. Denied admin commands get a
   // permission-denied reply sent straight to the chat: outbound.db belongs to
   // the container, and a host write there can collide with its writes.
-  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+  if (isChat) {
     const gate = await gateCommand(event.message.content, userId, agent.agent_group_id);
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
@@ -601,6 +637,7 @@ async function deliverToAgent(
   }
 
   const messageId = messageIdForAgent(event.message.id, agent.agent_group_id);
+  const content = isChat ? stampSenderRole(event.message.content, senderRole) : event.message.content;
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: messageId,
     kind: event.message.kind,
@@ -608,7 +645,7 @@ async function deliverToAgent(
     platformId: deliveryAddr.platformId,
     channelType: deliveryAddr.channelType,
     threadId: deliveryAddr.threadId,
-    content: event.message.content,
+    content,
     trigger: wake,
   });
 
@@ -624,7 +661,7 @@ async function deliverToAgent(
       message: {
         id: event.message.id,
         kind: event.message.kind,
-        content: event.message.content,
+        content,
         timestamp: event.message.timestamp,
       },
     });
@@ -675,7 +712,7 @@ async function deliverToAgent(
       messageId,
       kind: event.message.kind,
       channelType: deliveryAddr.channelType,
-      content: event.message.content,
+      content,
       timestamp: event.message.timestamp,
     });
   }
@@ -689,5 +726,6 @@ async function deliverToAgent(
  */
 function messageIdForAgent(baseId: string | undefined, agentGroupId: string): string {
   const id = baseId && baseId.length > 0 ? baseId : generateId();
-  return `${id}:${agentGroupId}`;
+  // Inverse: platformMessageId, applied at delivery.
+  return agentScopedMessageId(id, agentGroupId);
 }
