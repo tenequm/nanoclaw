@@ -34,6 +34,7 @@
     "chat": "tsx scripts/chat.ts",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
+    "check": "bash .nanoclaw-migrations/check.sh",
     "test": "vitest run",
     "test:watch": "vitest",
     "voice-mode-worker": "node dist/voice-mode-worker.js start"
