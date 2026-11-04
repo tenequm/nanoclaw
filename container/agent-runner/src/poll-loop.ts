@@ -437,6 +437,7 @@ export async function processQuery(
   // indicator follows it (working while a turn runs, idle when it ends)
   // instead of guessing from the heartbeat file. Best-effort throughout: a
   // failed write logs and never breaks the loop.
+  let providerPushes = 0;
   let workingRemark: ReturnType<typeof setInterval> | null = null;
   const markTurn = (turn: 'working' | 'idle'): void => {
     try {
@@ -486,6 +487,7 @@ export async function processQuery(
   // Preserve its original route, prompt and retry guards until it is answered.
   const pushRetry = (prompt: string, retryOf?: SeqWindow): void => {
     query.push(prompt);
+    providerPushes += 1;
     queuedTurns.push({ routing: { ...routing }, unwrappedNudged, taskBlockNudged, nudgedWindow: retryOf });
     archivePrompts.push(archivePrompts[0] ?? initialPrompt);
   };
@@ -577,6 +579,7 @@ export async function processQuery(
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         query.push(prompt);
+        providerPushes += 1;
         archivePrompts.push(prompt);
         const next: QueuedTurn = {
           routing: extractRouting(keep),
@@ -646,7 +649,12 @@ export async function processQuery(
           midTurnReplied += scan.replied;
           midTurnTail = scan.tail;
         }
+      } else if (event.type === 'tool_call') {
+        if (midTurnCompleteDelivery && !routing.taskRun && !REPLY_NEUTRAL_TOOLS.has(bareToolName(event.name))) {
+          midTurnReplied = 0;
+        }
       } else if (event.type === 'result') {
+        const pushesAtResult = providerPushes;
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
         // stale 'processing' claims while the query stays open for
@@ -656,6 +664,19 @@ export async function processQuery(
         markCompleted(initialBatchIds);
         const resultText = event.text ?? '';
         const failed = event.isError === true;
+        // A clean end_turn that leaves a <message to="..."> block open ends the
+        // block: the model addressed it and finished the turn, only the close
+        // tag is missing. Truncation and failures keep the fragment undelivered;
+        // an open <internal> or unknown destination still delivers nothing.
+        // Runs before the nudge decision, which then sees the delivery.
+        if (midTurnCompleteDelivery && !failed && event.stopReason === 'end_turn' && OPEN_BLOCK_RE.test(midTurnTail)) {
+          const closed = await deliverMidTurnBlocks('</message>', routing, turnStartSeq, midTurnTail, nudgedWindow);
+          if (closed.delivered > 0) log('Closed an unterminated <message> block at end of turn');
+          midTurnSent += closed.delivered;
+          midTurnReplied += closed.replied;
+          midTurnTail = '';
+        }
+
         if (resultText || failed) {
           const { hasUnwrapped, taskBlocks, undelivered } = await dispatchResultText(resultText, routing, {
             midTurnSent,
@@ -746,9 +767,22 @@ export async function processQuery(
         turnStartSeq = maxOutboundSeq();
         midTurnTail = '';
         nudgedWindow = undefined;
+        // The SDK may coalesce queued sends into fewer turns, so one result can
+        // answer several pushed turns. A result reporting no queued sends, with
+        // nothing pushed while it was handled, answered them all: drop the
+        // leftover routes and prompts so the loop goes idle and the next push
+        // adopts its own route instead of an already-answered one.
+        if (event.queuedTurnCount === 0 && providerPushes === pushesAtResult && queuedTurns.length > 0) {
+          log(`Result reports no queued sends: ${queuedTurns.length + 1} pushed turns coalesced into one result`);
+          queuedTurns.length = 0;
+          archivePrompts.length = 0;
+        }
         const next = queuedTurns.shift();
         if (next) adoptTurn(next);
-        else { answering = false; enterIdle(); }
+        else {
+          answering = false;
+          enterIdle();
+        }
       }
     }
   } catch (err) {
@@ -1026,7 +1060,16 @@ function answersBatch(dest: DestinationEntry, routing: RoutingContext): boolean 
   return routing.channelType === 'agent' && routing.platformId === dest.agentGroupId;
 }
 
+const OPEN_BLOCK_RE = /^<message\s+to="[^"]+"\s*>/;
 const OPEN_INTERNAL_RE = /<internal\b/i;
+/** Tools that are themselves a send or a reaction: calling one does not turn an earlier reply into an ack. */
+const REPLY_NEUTRAL_TOOLS = new Set(['send_message', 'send_file', 'send_media_group', 'edit_message', 'add_reaction']);
+
+/** `mcp__nanoclaw__send_message` -> `send_message`; plain names pass through. */
+function bareToolName(name: string): string {
+  return name.replace(/^mcp__nanoclaw__/, '');
+}
+
 const OPEN_MESSAGE_RE = /<message\b/;
 
 /**

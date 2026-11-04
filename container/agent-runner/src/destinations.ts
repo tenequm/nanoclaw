@@ -128,7 +128,7 @@ function buildDestinationsSection(mode: SessionMode): string {
   }
 
   lines.push(
-    'Wrap each delivered message in a `<message to="name">…</message>` block; include several blocks in one response to address several destinations. `<internal>…</internal>` marks thinking you don\'t want sent.',
+    'Wrap each delivered message in a `<message to="name">…</message>` block; include several blocks in one response to address several destinations. `<internal>…</internal>` marks thinking you don\'t want sent. Text outside a `<message>` block is never shown to anyone. To stay silent, write nothing or only `<internal>`.',
   );
   lines.push('');
   lines.push(

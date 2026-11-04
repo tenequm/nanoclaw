@@ -160,8 +160,24 @@ export type ProviderEvent =
    * `text` is model output; `error` is an optional user-facing provider error
    * (e.g. a billing/quota notice), kept separate from model scratchpad and
    * raw diagnostics. Failures without `error` receive a generic notice.
+   * `queuedTurnCount` is the provider's count of pushed sends still waiting
+   * when the result was produced (undefined when the provider can't say).
+   * Queued sends may coalesce into fewer turns, so 0 means every send the
+   * provider had received by then is answered, even if more prompts were
+   * pushed than results seen.
+   * `stopReason` is the model's stop reason for the turn's final response
+   * (e.g. 'end_turn', 'max_tokens'); undefined when the provider can't say.
+   * Only an explicit 'end_turn' lets the poll-loop close a still-open
+   * <message> block at the turn boundary.
    */
-  | { type: 'result'; text: string | null; isError?: boolean; error?: string }
+  | {
+      type: 'result';
+      text: string | null;
+      isError?: boolean;
+      error?: string;
+      queuedTurnCount?: number;
+      stopReason?: string | null;
+    }
   /**
    * An assistant text segment emitted mid-turn (e.g. between tool calls).
    * The SDK's final `result` carries only the LAST assistant text, so a
@@ -174,6 +190,14 @@ export type ProviderEvent =
    * gets the wrap-nudge instead.
    */
   | { type: 'text'; text: string }
+  /**
+   * A main-thread tool call the model just issued (`name` as the provider
+   * sees it, e.g. `mcp__nanoclaw__send_message`). Optional for providers:
+   * the poll-loop uses it only to tell an early acknowledgment followed by
+   * more work from a finished reply, when deciding whether an unwrapped
+   * final text needs a nudge.
+   */
+  | { type: 'tool_call'; name: string }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   | { type: 'file'; path: string }
