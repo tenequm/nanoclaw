@@ -3,7 +3,7 @@
  * the judge in flight), so `reduce` makes it and records its commands in the state; `decide`
  * returns them. Replaying the event log through `reduce` reproduces every decision.
  */
-import type { Action, CallEvent, Command, Verdict } from './types.js';
+import type { Action, CallEvent, Command, RecheckVerdict, Verdict } from './types.js';
 import {
   agentSpeaking,
   applyWindow,
@@ -18,9 +18,12 @@ import {
   refreshVersion,
   renderWindow,
   toJevState,
+  toRecheckState,
   unmarkHandled,
   unpunctuated,
+  utterancesSince,
   type CallState,
+  type Wake,
 } from './window.js';
 
 const BOUNDARY_TIMER = 'boundary:';
@@ -66,6 +69,9 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       break;
     case 'verdict':
       onVerdict(state, event.windowVersion, event.verdict, event.ms);
+      break;
+    case 'recheck_verdict':
+      onRecheck(state, event.wakeKey, event.verdict, event.ms);
       break;
     case 'turn': {
       const wake = state.wakes.find((w) => w.key === event.key);
@@ -214,7 +220,7 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     // Never deaf to its name: without Jev, a vocative wakes; anything else is silence.
     const action = judging.addressedByName ? 'answer' : 'stay_silent';
     log(state, 'decision', { ...trigger, jev: null, ms, action, reason: 'jev_failed' });
-    if (action === 'answer') wake(state, judging.speakerId, judging.trigger);
+    if (action === 'answer') wake(state, judging.speakerId, judging.uttId, judging.trigger);
     return;
   }
   const action = chosen(state, verdict);
@@ -225,10 +231,10 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     action,
   });
   if (action === 'stop') stop(state);
-  else if (action === 'answer') wake(state, judging.speakerId, judging.trigger);
+  else if (action === 'answer') wake(state, judging.speakerId, judging.uttId, judging.trigger);
   else if (action === 'continue') {
     const cutOff = `You were cut off after "${state.cutOffAfter ?? ''}"; ${speaker?.name ?? 'the caller'} asked you to go on. Continue briefly from there.`;
-    wake(state, judging.speakerId, judging.trigger, cutOff);
+    wake(state, judging.speakerId, judging.uttId, judging.trigger, cutOff);
   }
 }
 
@@ -260,6 +266,7 @@ function takeBackUnstarted(state: CallState): string[] {
 
 function stop(state: CallState): void {
   state.stoppedSeq = state.seq;
+  endRecheck(state, 'stopped');
   takeBackUnstarted(state);
   state.commands.push({ kind: 'stop_playback' });
 }
@@ -268,7 +275,8 @@ function stop(state: CallState): void {
  * A new turn for the agent. An answer to an older turn that has not started playing is revoked: the newer turn
  * replaces it. One already playing plays on; the reflex and a stop cover talking over it.
  */
-function wake(state: CallState, speakerId: string, message: string, extra?: string): void {
+function wake(state: CallState, speakerId: string, uttId: string, message: string, extra?: string): void {
+  endRecheck(state, 'replaced');
   for (const replyId of takeBackUnstarted(state)) {
     state.commands.push({ kind: 'revoke', replyId });
     log(state, 'reply', { replyId, outcome: 'revoked', reason: 'replaced' });
@@ -283,9 +291,21 @@ function wake(state: CallState, speakerId: string, message: string, extra?: stri
     ...(extra ? [extra] : []),
     'Reply in one or two short spoken sentences; your reply is read aloud. If nothing needs saying, reply exactly [silent].',
   ].join('\n\n');
+  const triggerAt = state.utterances.find((u) => u.speakerId === speakerId && u.uttId === uttId)?.startedAt;
   state.wakes = [
     ...state.wakes,
-    { key, speakerId, seq: state.seq, at: state.now, turnId: null, dropped: false, replied: false },
+    {
+      key,
+      speakerId,
+      seq: state.seq,
+      at: state.now,
+      turnId: null,
+      dropped: false,
+      replied: false,
+      trigger: message,
+      triggerAt: triggerAt ?? state.now,
+      rechecked: null,
+    },
   ].slice(-WAKES_KEPT);
   state.cutOffAfter = null;
   state.commands.push({ kind: 'turn', key, message, note, ...(supersedes ? { supersedes } : {}) });
@@ -311,14 +331,72 @@ function onReply(state: CallState, replyId: string, turnId: string | null, raw: 
         : state.stoppedSeq !== null && state.stoppedSeq > latest.seq
           ? 'stopped'
           : null;
-  if (reason) {
+  if (reason || !latest) {
     state.commands.push({ kind: 'show', replyId, text });
     log(state, 'reply', { ...fields, outcome: 'shown', reason });
     return;
   }
-  state.playout[replyId] = { text, wakeKey: latest?.key ?? null };
+  // People spoke after the trigger: the answer may no longer be wanted. Ask Jev once before speaking (held
+  // meanwhile; a stop or a newer wake shows it); nobody spoke, or the same people since the last check: no call.
+  if (state.recheck?.wakeKey === latest.key) {
+    state.recheck.replies.push({ replyId, text });
+    log(state, 'reply', { ...fields, outcome: 'held', reason: 'recheck' });
+    return;
+  }
+  const since = utterancesSince(state, latest).length;
+  if (since > 0 && latest.rechecked?.since !== since) {
+    state.recheck = { wakeKey: latest.key, since, replies: [{ replyId, text }] };
+    state.commands.push({ kind: 'recheck', wakeKey: latest.key, state: toRecheckState(state, latest, text) });
+    log(state, 'reply', { ...fields, outcome: 'held', reason: 'recheck', since });
+    return;
+  }
+  if (since > 0 && latest.rechecked?.outcome === 'show') {
+    state.commands.push({ kind: 'show', replyId, text });
+    log(state, 'reply', { ...fields, outcome: 'shown', reason: 'not_wanted' });
+    return;
+  }
+  speak(state, replyId, text, latest);
+}
+
+function speak(state: CallState, replyId: string, text: string, wake: Wake): void {
+  state.playout[replyId] = { text, wakeKey: wake.key };
   state.commands.push({ kind: 'speak', replyId, text });
-  log(state, 'reply', { ...fields, outcome: 'speak' });
+  log(state, 'reply', { replyId, turnId: wake.turnId, outcome: 'speak' });
+}
+
+/** The answer-ready check's verdict: speak the held replies unless Jev is sure they are no longer wanted. */
+function onRecheck(state: CallState, wakeKey: string, verdict: RecheckVerdict | null, ms: number): void {
+  const recheck = state.recheck;
+  // A stop or a newer wake already showed them.
+  if (!recheck || recheck.wakeKey !== wakeKey) return;
+  state.recheck = null;
+  const wake = state.wakes.find((w) => w.key === wakeKey);
+  const { p, confidence } = state.policy.recheckShow;
+  const show =
+    !wake ||
+    (!!verdict && verdict.action === 'show' && verdict.probabilities.show >= p && verdict.confidence >= confidence);
+  if (wake) wake.rechecked = { outcome: show ? 'show' : 'speak', since: recheck.since };
+  log(state, 'recheck', {
+    trigger: wake?.trigger,
+    replyIds: recheck.replies.map((r) => r.replyId),
+    jev: verdict && { choice: verdict.action, probabilities: verdict.probabilities, confidence: verdict.confidence },
+    ms,
+    outcome: show ? 'shown' : 'spoken',
+    ...(verdict ? {} : { reason: 'jev_failed' }),
+  });
+  for (const { replyId, text } of recheck.replies) {
+    if (show || !wake) state.commands.push({ kind: 'show', replyId, text });
+    else speak(state, replyId, text, wake);
+  }
+}
+
+/** A stop or a newer wake during the answer-ready check: its held replies are shown, and its verdict ignored. */
+function endRecheck(state: CallState, reason: 'stopped' | 'replaced'): void {
+  const recheck = state.recheck;
+  if (!recheck) return;
+  state.recheck = null;
+  log(state, 'recheck', { replyIds: recheck.replies.map((r) => r.replyId), outcome: 'shown', reason });
+  for (const { replyId, text } of recheck.replies) state.commands.push({ kind: 'show', replyId, text });
 }
 
 function logPlayback(state: CallState, event: Extract<CallEvent, { kind: 'playback' }>, wakeKey: string | null): void {

@@ -18,7 +18,7 @@ import { log } from '../../log.js';
 import { callCore } from './core/index.js';
 import type { CallCore, CallEvent, CallKind } from './core/types.js';
 import { createWorkerIngress } from './ingress/worker.js';
-import { askAction } from './judge.js';
+import { askAction, askStillWanted } from './judge.js';
 import { policyFor } from './policy.js';
 import { createCallRuntime, type CallRuntime, type JevTurnResult } from './runtime.js';
 
@@ -26,7 +26,10 @@ export type { JevTurnResult } from './runtime.js';
 
 /** Replies a call remembers the turn of, for the `reply` push that speaks one. */
 const MAX_REMEMBERED_REPLIES = 64;
-/** Jev requests one call may make per rolling minute; past it a judge is a null verdict (silence). */
+/**
+ * Jev requests (judges and answer-ready rechecks) one call may make per rolling minute; past it a judge is a
+ * null verdict (silence, or a wake on a vocative) and a recheck speaks unchecked.
+ */
 export const MAX_JUDGES_PER_MINUTE = 30;
 const MINUTE_MS = 60_000;
 
@@ -52,6 +55,7 @@ export interface JevCallHost {
 export interface JevDeps {
   core: CallCore<unknown>;
   judge: typeof askAction;
+  recheck: typeof askStillWanted;
 }
 
 export interface JevCall {
@@ -69,6 +73,7 @@ export interface JevCall {
 export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): JevCall {
   const core = deps.core ?? callCore;
   const judge = deps.judge ?? askAction;
+  const recheck = deps.recheck ?? askStillWanted;
   const kind = host.kind ?? 'voice';
   const policy = policyFor(kind, host.agentName, [...host.agentAliases]);
   const ingress = createWorkerIngress({ name: host.callerName }, host.maxTextBytes);
@@ -92,6 +97,14 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
     judge: async (state, signal) => {
       if (!capped()) return judge(state, { signal });
       log.warn('meet-jev: Jev rate cap reached, judged silent', { ...fields, perMinute: MAX_JUDGES_PER_MINUTE });
+      return { verdict: null, ms: 0 };
+    },
+    recheck: async (state, signal) => {
+      if (!capped()) return recheck(state, { signal });
+      log.warn('meet-jev: Jev rate cap reached, answer spoken unchecked', {
+        ...fields,
+        perMinute: MAX_JUDGES_PER_MINUTE,
+      });
       return { verdict: null, ms: 0 };
     },
     turn: ({ message, note }, signal) => host.submitTurn(message, note, signal),

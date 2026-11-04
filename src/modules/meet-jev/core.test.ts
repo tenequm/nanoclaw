@@ -676,3 +676,104 @@ describe('a verdict after the speaker resumed', () => {
     expect(call.feed({ kind: 'timer', key: 'boundary:p1' })).toEqual([]);
   });
 });
+
+describe('the answer-ready recheck', () => {
+  /** Misha asks in a meeting, Olena speaks before the reply lands: returns the commands of the landed reply. */
+  function answeredMeanwhile(call: Call, olenaSays = 'It is Lima.'): Command[] {
+    const [turn] = only(call.sayAnswered(misha, 'u1', 'Dan, what is the capital of Peru?'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    const [judge] = only(call.say(olena, 'o1', olenaSays), 'judge');
+    call.verdict(judge.windowVersion, 'stay_silent');
+    return call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Lima.' });
+  }
+
+  const recheckVerdict = (call: Call, action: 'speak' | 'show' | null, p = 0.9, confidence = 0.8) =>
+    call.feed({
+      kind: 'recheck_verdict',
+      wakeKey: 'w1',
+      verdict: action && {
+        action,
+        probabilities: { speak: action === 'speak' ? p : 1 - p, show: action === 'show' ? p : 1 - p },
+        confidence,
+      },
+      ms: 300,
+    });
+
+  it('nobody spoke since the trigger: speaks at once, no Jev call', () => {
+    const call = new Call('meet');
+    const [turn] = only(call.sayAnswered(misha, 'u1', 'Dan, what is the capital of Peru?'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Lima.' })).toEqual([
+      { kind: 'speak', replyId: 'r1', text: 'Lima.' },
+    ]);
+  });
+
+  it('someone answered meanwhile: holds the reply, asks with the trigger, reply and lines since, and shows it', () => {
+    const call = new Call('meet');
+    const [recheck] = answeredMeanwhile(call);
+    expect(recheck).toMatchObject({ kind: 'recheck', wakeKey: 'w1' });
+    if (recheck.kind !== 'recheck') throw new Error('no recheck');
+    expect(recheck.state.trigger).toEqual({ speaker: 'Misha', text: 'Dan, what is the capital of Peru?' });
+    expect(recheck.state.reply).toBe('Lima.');
+    expect(recheck.state.since).toEqual([expect.objectContaining({ speaker: 'Olena', text: 'It is Lima.' })]);
+    expect(recheck.state.window.map((l) => l.speaker)).toEqual(['Misha', 'Olena']);
+    expect(toJevState(call.state).facts.pending_answer).toBe(true);
+    expect(recheckVerdict(call, 'show')).toEqual([{ kind: 'show', replyId: 'r1', text: 'Lima.' }]);
+    expect(call.lastLog('recheck')).toMatchObject({
+      trigger: 'Dan, what is the capital of Peru?',
+      replyIds: ['r1'],
+      jev: { choice: 'show', probabilities: { show: 0.9 }, confidence: 0.8 },
+      ms: 300,
+      outcome: 'shown',
+    });
+    expect(toJevState(call.state).facts.pending_answer).toBe(false);
+  });
+
+  it('speaks unless the show is over its thresholds', () => {
+    const call = new Call('meet');
+    answeredMeanwhile(call, 'Hmm, good question.');
+    expect(recheckVerdict(call, 'show', 0.9, 0.3)).toEqual([{ kind: 'speak', replyId: 'r1', text: 'Lima.' }]);
+    expect(call.lastLog('recheck')).toMatchObject({ outcome: 'spoken' });
+  });
+
+  it('a failed Jev call speaks: the answer was wanted a moment ago', () => {
+    const call = new Call('meet');
+    answeredMeanwhile(call);
+    expect(recheckVerdict(call, null)).toEqual([{ kind: 'speak', replyId: 'r1', text: 'Lima.' }]);
+    expect(call.lastLog('recheck')).toMatchObject({ jev: null, outcome: 'spoken', reason: 'jev_failed' });
+  });
+
+  it('a stop during the check shows the held reply, and the late verdict is ignored', () => {
+    const call = new Call('meet');
+    answeredMeanwhile(call);
+    const commands = call.say(misha, 'u2', 'Dan, stop.');
+    expect(only(commands, 'show')).toEqual([{ kind: 'show', replyId: 'r1', text: 'Lima.' }]);
+    expect(only(commands, 'stop_playback')).toHaveLength(1);
+    expect(call.lastLog('recheck')).toMatchObject({ outcome: 'shown', reason: 'stopped' });
+    expect(recheckVerdict(call, 'speak')).toEqual([]);
+  });
+
+  it('a newer wake during the check shows the held reply', () => {
+    const call = new Call('meet');
+    answeredMeanwhile(call);
+    const commands = call.sayAnswered(misha, 'u2', 'Dan, and of Chile?');
+    expect(only(commands, 'show')).toEqual([{ kind: 'show', replyId: 'r1', text: 'Lima.' }]);
+    expect(only(commands, 'turn')).toHaveLength(1);
+    expect(call.lastLog('recheck')).toMatchObject({ outcome: 'shown', reason: 'replaced' });
+    expect(recheckVerdict(call, 'speak')).toEqual([]);
+  });
+
+  it('a second reply to the same turn waits with the first and follows its verdict; a later one reuses it', () => {
+    const call = new Call('meet');
+    answeredMeanwhile(call);
+    expect(call.feed({ kind: 'reply', replyId: 'r2', turnId: 't1', text: 'In Peru.' })).toEqual([]);
+    expect(recheckVerdict(call, 'speak')).toEqual([
+      { kind: 'speak', replyId: 'r1', text: 'Lima.' },
+      { kind: 'speak', replyId: 'r2', text: 'In Peru.' },
+    ]);
+    // Nobody spoke since the check: no second Jev call.
+    expect(call.feed({ kind: 'reply', replyId: 'r3', turnId: 't1', text: 'On the coast.' })).toEqual([
+      { kind: 'speak', replyId: 'r3', text: 'On the coast.' },
+    ]);
+  });
+});

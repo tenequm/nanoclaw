@@ -19,5 +19,6 @@ export function policyFor(kind: CallKind, agentName: string, agentAliases: strin
       stop: { p: 0.7, confidence: 0.5 },
       continue: { p: 0.7, confidence: 0.5 },
     },
+    recheckShow: { p: 0.7, confidence: 0.5 },
   };
 }

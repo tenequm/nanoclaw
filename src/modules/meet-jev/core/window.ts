@@ -3,7 +3,7 @@
  * the bookkeeping the decisions need (wakes, replies in playout, the stop mark), and the
  * renderings of it for Jev (`toJevState`) and for the agent's turn note (`renderWindow`).
  */
-import type { CallEvent, CallPolicy, Command, JevLine, JevState } from './types.js';
+import type { CallEvent, CallPolicy, Command, JevLine, JevState, RecheckAction, RecheckState } from './types.js';
 
 export interface Utterance {
   speakerId: string;
@@ -63,6 +63,19 @@ export interface Wake {
   /** Refused, or replaced before delivery: no answer will come. */
   dropped: boolean;
   replied: boolean;
+  /** The utterance it answers and when that started: people speaking after it make a landed answer rechecked. */
+  trigger: string;
+  triggerAt: number;
+  /** The last recheck's outcome and how many utterances followed the trigger then; reused while that holds. */
+  rechecked: { outcome: RecheckAction; since: number } | null;
+}
+
+/** Replies held for the answer-ready check of their wake, in arrival order. */
+export interface Recheck {
+  wakeKey: string;
+  /** `utterancesSince` the trigger when the check was asked. */
+  since: number;
+  replies: { replyId: string; text: string }[];
 }
 
 /** The `judge` in flight: one at a time, the newest boundary's. */
@@ -102,6 +115,8 @@ export interface CallState {
   cutOffAfter: string | null;
   agentLastSpokeAt: number | null;
   judging: Judging | null;
+  /** The answer-ready check in flight: one at a time, the latest wake's. */
+  recheck: Recheck | null;
   /** An utterance whose verdict came while someone spoke: decided again at the next boundary that decides nothing newer. */
   deferred: { speakerId: string; uttId: string } | null;
   /** What the last `reduce` decided; `decide` returns it. */
@@ -128,6 +143,7 @@ export function initial(policy: CallPolicy, at: number): CallState {
     agentLastSpokeAt: null,
     judging: null,
     deferred: null,
+    recheck: null,
     commands: [],
   };
   state.fingerprint = fingerprint(state);
@@ -163,7 +179,7 @@ export const floorTaken = (state: CallState): boolean => Object.values(state.spe
 
 /** An answer is on its way: the latest wake awaits its reply (and no stop came), or a reply is still to play. */
 export function pendingAnswer(state: CallState): boolean {
-  if (Object.keys(state.playout).length > 0) return true;
+  if (Object.keys(state.playout).length > 0 || state.recheck !== null) return true;
   const wake = latestWake(state);
   return !!wake && !wake.dropped && !wake.replied && (state.stoppedSeq === null || state.stoppedSeq < wake.seq);
 }
@@ -360,6 +376,24 @@ function fingerprint(state: CallState): string {
     window: jev.window.map(({ t: _t, partial: _p, ...line }) => ({ ...line, text: comparable(line.text) })),
     facts: { ...jev.facts, agent_last_spoke_s_ago: null },
   });
+}
+
+/** People's finished utterances with words that started after the wake's trigger. */
+export const utterancesSince = (state: CallState, wake: Wake): Utterance[] =>
+  state.utterances.filter((u) => u.final && hasWords(u.text) && u.startedAt > wake.triggerAt);
+
+/** The JSON `state` of the answer-ready check for `wake`'s `reply`. */
+export function toRecheckState(state: CallState, wake: Wake, reply: string): RecheckState {
+  const { latest: _latest, ...jev } = toJevState(state);
+  const name = state.speakers[wake.speakerId]?.name ?? wake.speakerId;
+  return {
+    ...jev,
+    trigger: { speaker: name, text: wake.trigger },
+    reply,
+    since: lines(state)
+      .filter((line) => line.at > wake.triggerAt && !line.agent && !line.partial)
+      .map(({ at, ...line }): JevLine => ({ t: secondsAgo(state, at), ...line })),
+  };
 }
 
 /** The window as speaker-labelled lines for the agent's turn note. */

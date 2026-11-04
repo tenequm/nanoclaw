@@ -10,7 +10,7 @@ vi.mock('../../log.js', () => ({
 
 import type { LiveKitHostEvent } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
-import type { CallCore, CallEvent, CallPolicy } from './core/types.js';
+import type { CallCore, CallEvent, CallPolicy, RecheckState } from './core/types.js';
 import { createJevCall, MAX_JUDGES_PER_MINUTE } from './index.js';
 
 function jevCall() {
@@ -53,6 +53,42 @@ describe('createJevCall', () => {
     say('a minute later');
     await flush();
     expect(judge).toHaveBeenCalledTimes(MAX_JUDGES_PER_MINUTE + 1);
+    call.end('test');
+  });
+
+  it('counts answer-ready rechecks toward the same cap; past it an answer is spoken unchecked', async () => {
+    const recheck = vi.fn(async () => ({ verdict: null, ms: 1 }));
+    const call = createJevCall(
+      {
+        callId: 'c2',
+        callerName: 'Ethan',
+        agentName: 'Andy',
+        agentAliases: [],
+        maxTextBytes: 4096,
+        submitTurn: async () => ({ ok: false, reason: 'test' }),
+        push: () => undefined,
+        now: () => 1_000_000,
+      },
+      {
+        core: {
+          initial: () => null,
+          reduce: (state) => state,
+          decide: (_state, event) =>
+            event.kind === 'reply' ? [{ kind: 'recheck', wakeKey: 'w1', state: {} as RecheckState }] : [],
+        },
+        judge: async () => ({ verdict: null, ms: 0 }),
+        recheck,
+      },
+    );
+    for (let i = 0; i <= MAX_JUDGES_PER_MINUTE; i++) {
+      call.reply(`answer ${i}`, 't1');
+      await flush();
+    }
+    expect(recheck).toHaveBeenCalledTimes(MAX_JUDGES_PER_MINUTE);
+    expect(log.warn).toHaveBeenCalledWith('meet-jev: Jev rate cap reached, answer spoken unchecked', {
+      callId: 'c2',
+      perMinute: MAX_JUDGES_PER_MINUTE,
+    });
     call.end('test');
   });
 

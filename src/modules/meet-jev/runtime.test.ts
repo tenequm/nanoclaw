@@ -4,7 +4,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { CallCore, CallEvent, CallPolicy, Command, JevState } from './core/types.js';
+import type { CallCore, CallEvent, CallPolicy, Command, JevState, RecheckState } from './core/types.js';
 import { createCallRuntime, type JevTurnResult, type RuntimePorts } from './runtime.js';
 
 const POLICY: CallPolicy = {
@@ -20,6 +20,7 @@ const POLICY: CallPolicy = {
     stop: { p: 0.7, confidence: 0.5 },
     continue: { p: 0.7, confidence: 0.5 },
   },
+  recheckShow: { p: 0.7, confidence: 0.5 },
 };
 
 const SPEAKER = { id: 'caller', name: 'Ethan' };
@@ -56,6 +57,7 @@ function fakePorts(overrides: Partial<RuntimePorts> = {}) {
   const ports: RuntimePorts = {
     now: () => Date.now(),
     judge: (_state, signal) => new Promise((resolve) => judges.push({ signal, resolve })),
+    recheck: async () => ({ verdict: null, ms: 0 }),
     turn: ({ message, note }, signal) => new Promise((resolve) => turns.push({ message, note, signal, resolve })),
     speak: (replyId, text) => void calls.push(['speak', replyId, text]),
     show: (replyId, text) => void calls.push(['show', replyId, text]),
@@ -114,6 +116,33 @@ describe('createCallRuntime', () => {
       ['stop'],
       ['log', 'decision', { verdict: 'answer' }],
     ]);
+  });
+
+  it('posts a recheck verdict back for its wake, and a new judge does not abort the check', async () => {
+    const { ports, judges } = fakePorts();
+    const rechecks: Array<{ signal: AbortSignal; resolve: (v: { verdict: null; ms: number }) => void }> = [];
+    const core = scriptedCore((event) =>
+      event.kind === 'utterance' && event.text === 'a'
+        ? [{ kind: 'recheck', wakeKey: 'w1', state: {} as RecheckState }]
+        : event.kind === 'utterance'
+          ? [{ kind: 'judge', windowVersion: 2, state: STATE }]
+          : [],
+    );
+    const runtime = createCallRuntime(core, POLICY, {
+      ...ports,
+      recheck: (_state, signal) => new Promise((resolve) => rechecks.push({ signal, resolve })),
+    });
+    runtime.feed(utt('a'));
+    runtime.feed(utt('b'));
+    await flush();
+    expect(judges).toHaveLength(1);
+    expect(rechecks).toHaveLength(1);
+    expect(rechecks[0].signal.aborted).toBe(false);
+    rechecks[0].resolve({ verdict: null, ms: 250 });
+    await vi.waitFor(() =>
+      expect(core.seen.at(-1)).toMatchObject({ kind: 'recheck_verdict', wakeKey: 'w1', verdict: null, ms: 250 }),
+    );
+    runtime.end('test');
   });
 
   it('posts a verdict back with the window version it was asked on', async () => {

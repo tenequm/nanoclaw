@@ -1,10 +1,19 @@
 /**
- * The jev call loop's Jev client: one Choice `action` about the call window (JSON state, the
- * pinned `JEV_MODEL`). Fail-silent like the chat gate: any error, timeout or malformed answer is a
- * null verdict, which the core treats as silence.
+ * The jev call loop's Jev client (JSON state, the pinned `JEV_MODEL`): the Choice `action` about the call
+ * window, and the answer-ready Choice `still_wanted`. Any error, timeout or malformed answer is a null
+ * verdict: silence for `action` (fail-silent like the chat gate), speech for `still_wanted` (the answer was
+ * wanted a moment ago).
  */
 import { postSystemOne } from '../jev-gate/jev.js';
-import { ACTIONS, type Action, type JevState, type Verdict } from './core/types.js';
+import {
+  ACTIONS,
+  RECHECK_ACTIONS,
+  type Choice,
+  type JevState,
+  type RecheckState,
+  type RecheckVerdict,
+  type Verdict,
+} from './core/types.js';
 
 function actionQuestion(agent: string) {
   return {
@@ -38,36 +47,72 @@ const unit = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
 
 /**
- * Read the `action` answer; null unless it is a well-formed Choice over our four options: every option's
+ * Read the answer to Choice `question`; null unless it is well-formed over `options`: every option's
  * probability in 0..1, summing to 1, and a confidence in 0..1. A partly valid answer is not acted on.
  */
-export function parseAction(body: unknown): Verdict | null {
-  const answer = (body as { answers?: { action?: unknown } } | null)?.answers?.action;
+function parseChoice<A extends string>(body: unknown, question: string, options: readonly A[]): Choice<A> | null {
+  const answer = (body as { answers?: Record<string, unknown> } | null)?.answers?.[question];
   if (!answer || typeof answer !== 'object') return null;
   const { choice, confidence, probabilities } = answer as Record<string, unknown>;
-  if (!ACTIONS.includes(choice as Action) || !probabilities || typeof probabilities !== 'object') return null;
+  if (!options.includes(choice as A) || !probabilities || typeof probabilities !== 'object') return null;
   if (!unit(confidence)) return null;
-  const probs = {} as Record<Action, number>;
-  for (const action of ACTIONS) {
-    const p = (probabilities as Record<string, unknown>)[action];
+  const probs = {} as Record<A, number>;
+  for (const option of options) {
+    const p = (probabilities as Record<string, unknown>)[option];
     if (!unit(p)) return null;
-    probs[action] = p;
+    probs[option] = p;
   }
-  const sum = ACTIONS.reduce((total, action) => total + probs[action], 0);
+  const sum = options.reduce((total, option) => total + probs[option], 0);
   if (Math.abs(sum - 1) > SUM_TOLERANCE) return null;
-  return { action: choice as Action, probabilities: probs, confidence };
+  return { action: choice as A, probabilities: probs, confidence };
 }
 
-/** Ask Jev what the agent should do about the window. Never throws; null on any failure. */
-export async function askAction(
-  state: JevState,
-  opts: { signal?: AbortSignal } = {},
-): Promise<{ verdict: Verdict | null; ms: number }> {
+export const parseAction = (body: unknown): Verdict | null => parseChoice(body, 'action', ACTIONS);
+export const parseStillWanted = (body: unknown): RecheckVerdict | null =>
+  parseChoice(body, 'still_wanted', RECHECK_ACTIONS);
+
+function stillWantedQuestion(agent: string) {
+  return {
+    type: 'choice',
+    instructions: `A live call. ${agent} was asked \`trigger\` and has just prepared \`reply\`, not yet spoken. \`since\` is what people said after \`trigger\` (\`t\` = seconds ago); \`window\` is the whole conversation, oldest first, and \`facts\` what ${agent} is doing now. Should ${agent} still say \`reply\` aloud, or only show it in the chat?`,
+    criteria: {
+      speak: {
+        what: `The reply is still wanted: nobody answered \`trigger\` meanwhile, it was not withdrawn, and what people said since leaves room for it (also a follow-up to ${agent}, or small talk while waiting).`,
+        not_for: `\`trigger\` already answered by a person, withdrawn ("never mind", "forget it"), or the conversation clearly moved on.`,
+      },
+      show: {
+        what: `Saying the reply now would talk past the room: a person already answered \`trigger\`, it was withdrawn, or the conversation moved on to something else.`,
+        not_for: `Anything that still leaves the reply useful; when unsure, speak.`,
+      },
+    },
+  };
+}
+
+async function ask<V>(
+  state: unknown,
+  questions: Record<string, unknown>,
+  parse: (body: unknown) => V | null,
+  signal: AbortSignal | undefined,
+): Promise<{ verdict: V | null; ms: number }> {
   const started = Date.now();
   try {
-    const result = await postSystemOne({ state, questions: { action: actionQuestion(state.agent_name) } }, opts.signal);
-    return { verdict: result.ok ? parseAction(result.body) : null, ms: Date.now() - started };
+    const result = await postSystemOne({ state, questions }, signal);
+    return { verdict: result.ok ? parse(result.body) : null, ms: Date.now() - started };
   } catch {
     return { verdict: null, ms: Date.now() - started };
   }
 }
+
+/** Ask Jev what the agent should do about the window. Never throws; null on any failure. */
+export const askAction = (
+  state: JevState,
+  opts: { signal?: AbortSignal } = {},
+): Promise<{ verdict: Verdict | null; ms: number }> =>
+  ask(state, { action: actionQuestion(state.agent_name) }, parseAction, opts.signal);
+
+/** Ask Jev whether a landed answer is still wanted. Never throws; null on any failure. */
+export const askStillWanted = (
+  state: RecheckState,
+  opts: { signal?: AbortSignal } = {},
+): Promise<{ verdict: RecheckVerdict | null; ms: number }> =>
+  ask(state, { still_wanted: stillWantedQuestion(state.agent_name) }, parseStillWanted, opts.signal);

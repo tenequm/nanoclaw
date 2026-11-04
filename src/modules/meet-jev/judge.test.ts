@@ -20,7 +20,7 @@ vi.mock('../../config.js', async () => {
 });
 
 import type { JevState } from './core/types.js';
-import { askAction, parseAction } from './judge.js';
+import { askAction, askStillWanted, parseAction, parseStillWanted } from './judge.js';
 
 const state: JevState = {
   policy: 'Dan answers the caller.',
@@ -138,5 +138,38 @@ describe('parseAction', () => {
       probabilities,
       confidence: 0.72,
     });
+  });
+});
+
+describe('askStillWanted', () => {
+  const recheckState = {
+    ...state,
+    latest: undefined,
+    trigger: { speaker: 'Misha', text: 'Dan, what is the capital of Peru?' },
+    reply: 'Lima.',
+    since: [{ t: 1.2, speaker: 'Olena', text: 'It is Lima.' }],
+  };
+  const stillWanted = { type: 'choice', choice: 'show', confidence: 0.8, probabilities: { speak: 0.1, show: 0.9 } };
+
+  it('asks one Choice still_wanted over speak and show with the recheck state', async () => {
+    const fetchMock = respond({ answers: { still_wanted: stillWanted } });
+    const { verdict } = await askStillWanted(recheckState);
+    expect(verdict).toEqual({ action: 'show', probabilities: { speak: 0.1, show: 0.9 }, confidence: 0.8 });
+    const body = JSON.parse((fetchMock.mock.calls[0] as [string, { body: string }])[1].body);
+    expect(Object.keys(body.questions)).toEqual(['still_wanted']);
+    expect(Object.keys(body.questions.still_wanted.criteria).sort()).toEqual(['show', 'speak']);
+    expect(body.state).toMatchObject({ reply: 'Lima.', trigger: recheckState.trigger, since: recheckState.since });
+  });
+
+  it('is null on a failure or a malformed distribution', async () => {
+    respond({}, { ok: false, status: 503 });
+    expect((await askStillWanted(recheckState)).verdict).toBeNull();
+    expect(
+      parseStillWanted({ answers: { still_wanted: { ...stillWanted, probabilities: { show: 0.9 } } } }),
+    ).toBeNull();
+    expect(
+      parseStillWanted({ answers: { still_wanted: { ...stillWanted, probabilities: { speak: 0.5, show: 0.9 } } } }),
+    ).toBeNull();
+    expect(parseStillWanted({ answers: { action: stillWanted } })).toBeNull();
   });
 });
