@@ -74,6 +74,16 @@ function formatDestinationNames(names: string[]): string {
 }
 
 if (import.meta.main) {
-  const names = getAllDestinations().map((destination) => destination.name);
-  console.log(buildCompactInstructions(names, getTaskSeriesId()));
+  // A hook runs as its own Bun process: load the mailbox composition and start
+  // it like every other entry point (upstream #3984).
+  await import('./modules/index.js');
+  const { getAgentMailbox, readMailboxContext } = await import('./mailbox/index.js');
+  const mailbox = getAgentMailbox();
+  await mailbox.start(await readMailboxContext());
+  try {
+    const names = getAllDestinations().map((destination) => destination.name);
+    console.log(buildCompactInstructions(names, getTaskSeriesId()));
+  } finally {
+    await mailbox.stop();
+  }
 }

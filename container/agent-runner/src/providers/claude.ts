@@ -351,21 +351,37 @@ export class ClaudeProvider implements AgentProvider {
           // result reports. Blocks split across ASSISTANT MESSAGES (a tool
           // call between them) remain unparseable mid-turn by design; the
           // poll-loop's midTurnSent===0 fallback and wrap-nudge cover that.
-          const content = (message as { message?: { content?: Array<{ type?: string; text?: string }> } }).message
-            ?.content;
+          const assistant = message as {
+            parent_tool_use_id?: string | null;
+            message?: { content?: Array<{ type?: string; text?: string; name?: string }> };
+          };
+          const content = assistant.message?.content;
           if (Array.isArray(content)) {
             const text = content
               .filter((block) => block.type === 'text' && block.text)
               .map((block) => block.text)
               .join('');
             if (text) yield { type: 'text', text };
+            // Subagent tool calls are the subagent's own work; the main
+            // thread's Agent call already marks that work.
+            if (!assistant.parent_tool_use_id) {
+              for (const block of content) {
+                if (block.type === 'tool_use' && block.name) yield { type: 'tool_call', name: block.name };
+              }
+            }
           }
         } else if (message.type === 'result') {
           // `result` text exists only on subtype:"success"; error subtypes
           // (e.g. a non-retryable 403 billing_error) carry their message in
           // `errors[]` instead. Keep that actionable notice separate from
           // model output so the poll-loop can deliver it without scratchpad.
-          const m = message as { result?: string; is_error?: boolean; errors?: string[] };
+          const m = message as {
+            result?: string;
+            is_error?: boolean;
+            errors?: string[];
+            queued_turn_count?: number;
+            stop_reason?: string | null;
+          };
           const isError = m.is_error === true;
           // Some failures (e.g. an invalid API key) leave errors[] empty and put
           // the SDK's own notice in `result`. Other result text can echo upstream
@@ -379,6 +395,8 @@ export class ClaudeProvider implements AgentProvider {
             text: resultAsError ? null : (m.result ?? null),
             isError,
             error: m.errors?.length ? m.errors.join('\n') : resultAsError || undefined,
+            queuedTurnCount: m.queued_turn_count,
+            stopReason: m.stop_reason,
           };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };

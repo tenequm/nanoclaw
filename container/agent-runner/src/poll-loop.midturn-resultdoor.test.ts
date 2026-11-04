@@ -1138,3 +1138,34 @@ describe('buildInformedWrapNudge', () => {
     expect(nudge.match(/<\/undelivered_text>/g)).toHaveLength(1);
   });
 });
+
+describe('streamed ack, then tool work, then an unwrapped answer', () => {
+  it('a non-delivery tool call after a streamed reply gets the unwrapped answer the informed nudge', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">looking into it</message>' };
+      yield { type: 'tool_call', name: 'mcp__glim__glim_web_search' };
+      yield { type: 'text', text: 'The answer, unwrapped.' };
+      yield { type: 'result', text: 'The answer, unwrapped.' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+    expect(deliveredTexts()).toEqual(['looking into it']);
+    expect(informedNudges(pushes)).toHaveLength(1);
+  });
+
+  it('a send or reaction tool after a streamed reply keeps it the reply', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">the answer</message>' };
+      yield { type: 'tool_call', name: 'mcp__nanoclaw__add_reaction' };
+      yield { type: 'text', text: 'Reacted too.' };
+      yield { type: 'result', text: 'Reacted too.' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+    expect(nudges(pushes)).toHaveLength(0);
+  });
+});
