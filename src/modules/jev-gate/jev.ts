@@ -85,6 +85,8 @@ export async function postSystemOne(
   }
 
   if (!response.ok) {
+    // An unread body holds the connection until it is collected.
+    void response.body?.cancel().catch(() => {});
     log.debug('Jev returned non-200', { status: response.status });
     return { ok: false, reason: `http_${response.status}` };
   }
