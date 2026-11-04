@@ -2030,7 +2030,7 @@ describe('meetings: the /meet call kind on the call core', () => {
     expect(h.lk.roomOptions).toEqual([{ name: room, emptyTimeout: 600, departureTimeout: 10, maxParticipants: 3 }]);
     expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({
       callerIdentity: `meet-bridge-${room}`,
-      meeting: { pauseSends: false, jev: false },
+      meeting: { pauseSends: false },
       joinTimeoutMs: 10 * MIN,
       maxDurationMs: MEETING_MAX_DURATION_MS,
     });
@@ -2058,7 +2058,7 @@ describe('meetings: the /meet call kind on the call core', () => {
 
   it('tells the worker a `pause` meeting sends on the pause', async () => {
     expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: true, jev: false })).toEqual({ ok: true });
-    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: true, jev: false });
+    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: true });
   });
 
   it('routes meeting turns as guest turns with the meeting note, and says in the chat when it joined', async () => {
@@ -2115,14 +2115,6 @@ describe('meetings: the /meet call kind on the call core', () => {
     const started = Date.now();
     await stuck.stop();
     expect(Date.now() - started).toBeLessThan(2000);
-  });
-
-  it('takes no candidates on a call without a judge', async () => {
-    const { worker } = await startCall(h);
-    const res = await worker.post('utterance', { text: 'just chatting', candidate: true });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe('Not a turn: this call takes no candidates');
-    expect(h.events).toHaveLength(0);
   });
 });
 
@@ -2283,7 +2275,7 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
   it("runs the jev loop for the meeting: jev and the meeting in the job, the participants' audio endpoint on the bot create", async () => {
     expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
     const meta = h.lk.dispatches.at(-1)!.metadata;
-    expect(meta).toMatchObject({ jev: true, meeting: { pauseSends: false, jev: true } });
+    expect(meta).toMatchObject({ jev: true, meeting: { pauseSends: false } });
     // The meeting's people call it by the wake phrase's name; the line's agent name is an alias, and the bot keeps it.
     expect(policies).toEqual([
       expect.objectContaining({ kind: 'meet', agentName: 'Dan', agentAliases: ['Andy', 'Енді'] }),
@@ -2296,14 +2288,37 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
     );
   });
 
-  it('takes Recall events from before the bot create answers: the endpoint is registered first', async () => {
+  it('takes the Recall socket before the bot create answers, its events only once the call is live', async () => {
+    let recall: WebSocket | undefined;
+    const info = vi.spyOn(log, 'info');
     beforeCreate = async ({ participantAudio }) => {
-      const ws = await connect(participantAudio!.websocketUrl);
-      ws.send(JSON.stringify(chatLine(ALEX, 'hello all')));
-      await vi.waitFor(() => expect(seen).toHaveLength(1));
+      recall = await connect(participantAudio!.websocketUrl);
+      // The chat line is logged once handled; the frame before it was handled by then too.
+      recall.send(JSON.stringify(frame(ALEX, 1)));
+      recall.send(JSON.stringify(chatLine(ALEX, 'before the caller joined')));
+      await vi.waitFor(() =>
+        expect(info).toHaveBeenCalledWith(
+          'meet-jev recall: event',
+          expect.objectContaining({ event: 'participant_events.chat_message' }),
+        ),
+      );
     };
-    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
-    expect(seen[0]).toMatchObject({ kind: 'chat', speaker: { id: '100', name: 'Alex' }, text: 'hello all' });
+    try {
+      expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
+    } finally {
+      info.mockRestore();
+    }
+    expect(seen).toEqual([]);
+    // Nor is anything transcribed before the call is live.
+    expect(vads).toHaveLength(0);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    expect((await worker.post('joined')).status).toBe(200);
+    recall!.send(JSON.stringify(chatLine(ALEX, 'hello all')));
+    await vi.waitFor(() => expect(seen.filter((e) => e.kind === 'chat')).toHaveLength(1));
+    expect(seen.find((e) => e.kind === 'chat')).toMatchObject({
+      speaker: { id: '100', name: 'Alex' },
+      text: 'hello all',
+    });
   });
 
   it("transcribes each participant with the call's speech settings, never the bot; a wake is a guest turn with the meeting note", async () => {

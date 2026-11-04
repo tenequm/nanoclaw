@@ -34,7 +34,8 @@
  * A jev call (`/voice jev` or `/meet <link> jev`, the job's `jev`) takes no `agent/utterance` turns from
  * the worker: the meet-jev module decides when the agent gets a turn (submitTurn, with the same checks)
  * and which of its replies are spoken; the rest are only in the call chat. A jev meeting's transcript
- * reaches its loop from Recall (`jevCall`), not from the worker.
+ * reaches its loop from the host's transcription of each participant's Recall audio (`jevCall`), not
+ * from the worker.
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
  * line: the line's `/voice` chat (its voice_mode_lines binding), while that
@@ -103,8 +104,6 @@ export const MAX_UTTERANCES_PER_MINUTE = 20;
 const ROUTE_TIMEOUT_MS = WORKER_REQUEST_TIMEOUT_MS - 2_000;
 /** Turns routing at once on a call. The worker sends one at a time, so more is a worker gone wrong. */
 const MAX_TURNS_IN_FLIGHT = 3;
-/** Per-minute utterances only an addressed turn may take: candidates never crowd one out. */
-const ADDRESSED_TURNS_HEADROOM = 5;
 /** How long teardown waits on a call kind's end (a meeting bot leaving); past it the kind goes on alone. */
 const END_HOOK_TIMEOUT_MS = 10_000;
 /** Outcomes a call keeps by the worker's turn key, so a retried turn is answered, not routed again. */
@@ -316,15 +315,6 @@ export interface CallKind {
   bindChat?(): Promise<boolean>;
   /** The call ended; `say` posts to its chat, null when it never went live there. Teardown awaits what it returns. */
   ended?(call: KindCall, reason: string, say: ((text: string) => void) | null): Promise<void> | void;
-  /**
-   * Candidates: speech the worker sent unaddressed, which a kind without this takes no turn from. `judge`
-   * says whether one goes to the agent as a turn (it never rejects) and reads what was heard before its
-   * first await; `heard` sees every utterance and every reply spoken on the call, in order.
-   */
-  candidates?: {
-    judge(call: KindCall, text: string, wakeName: string): Promise<boolean>;
-    heard(direction: 'in' | 'out', text: string): void;
-  };
 }
 
 /** Why `openCall` opened no call. */
@@ -409,7 +399,10 @@ export interface LiveKitVoice {
   endCall(platformId: string, callId: unknown, reason: string, options?: { grace?: boolean }): Promise<void>;
   /** Whether `callId` is still the line's running call: not ended, not replaced. */
   isLive(platformId: string, callId: string): boolean;
-  /** The jev loop of the running call `callId`, for a source outside the worker (a meeting's Recall transcript). */
+  /**
+   * The jev loop of the call `callId` while it is live, for a source outside the worker (a meeting's
+   * transcript from the host's per-participant transcription); undefined before the caller joined.
+   */
   jevCall(callId: string): JevCall | undefined;
   /** An agent message reached a chat: speak it on the live call that talks there. `replyTo`: the call turn it answers. */
   chatMessage(
@@ -1056,31 +1049,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         : undefined;
     const known = turnKey && call.turnOutcomes.get(turnKey);
     if (known) return answer(res, await known);
-    const candidates = call.kind.candidates;
-    const candidate = utterance.candidate === true;
-    if (candidate && !candidates) return reply(res, 200, 'Not a turn: this call takes no candidates');
-    const admitted = admitTurn(call, candidate);
+    const admitted = admitTurn(call);
     if (!admitted.ok) {
       return reply(res, 429, admitted.body, admitted.retryAfter ? { 'Retry-After': admitted.retryAfter } : {});
     }
-    const t = admitted.t;
-    if (candidates) {
-      const refused = candidate ? await turnRefusal(call) : null;
-      if (refused) {
-        call.turnsInFlight--;
-        return answer(res, refused);
-      }
-      const wakeName = typeof utterance.wakeName === 'string' ? utterance.wakeName : '';
-      const judged = candidate ? candidates.judge(call, text, wakeName).catch(() => false) : true;
-      // Heard before the judge answers, so a turn or reply meanwhile lands after it.
-      candidates.heard('in', text);
-      if (!(await judged)) {
-        call.turnsInFlight--;
-        return reply(res, 200, 'Not a turn: the call kept the agent out of it');
-      }
-    }
-    // The route timeout counts from `t`, judging included: the worker's request timeout does.
-    const outcome = takeTurn(call, text, t, turnKey);
+    const outcome = takeTurn(call, text, admitted.t, turnKey);
     if (turnKey) {
       call.turnOutcomes.set(turnKey, outcome);
       for (const key of call.turnOutcomes.keys()) {
@@ -1093,19 +1066,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
   /**
    * A turn's place under the call's limits: taken (it counts toward both until routing ends), with its
-   * start on the config clock, or why not. A candidate leaves a slot of each limit to an addressed turn,
-   * which it must never crowd out; judging one holds a turn's slot.
+   * start on the config clock, or why not.
    */
-  const admitTurn = (
-    call: LiveKitCall,
-    candidate: boolean,
-  ): { ok: true; t: number } | { ok: false; body: string; retryAfter?: string } => {
-    if (call.turnsInFlight >= MAX_TURNS_IN_FLIGHT - (candidate ? 1 : 0)) {
+  const admitTurn = (call: LiveKitCall): { ok: true; t: number } | { ok: false; body: string; retryAfter?: string } => {
+    if (call.turnsInFlight >= MAX_TURNS_IN_FLIGHT) {
       return { ok: false, body: 'Too many turns are still being routed' };
     }
     const t = host.now();
     call.utteranceStarts = call.utteranceStarts.filter((at) => at > t - MINUTE_MS);
-    if (call.utteranceStarts.length >= MAX_UTTERANCES_PER_MINUTE - (candidate ? ADDRESSED_TURNS_HEADROOM : 0)) {
+    if (call.utteranceStarts.length >= MAX_UTTERANCES_PER_MINUTE) {
       return {
         ok: false,
         body: 'Too many utterances this minute',
@@ -1223,7 +1192,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     signal: AbortSignal,
   ): Promise<JevTurnResult> => {
     if (call.state !== 'live' || !takesTurns(call)) return { ok: false, reason: 'the call has ended' };
-    const admitted = admitTurn(call, false);
+    const admitted = admitTurn(call);
     if (!admitted.ok) return { ok: false, reason: admitted.body };
     const outcome = await takeTurn(call, message, admitted.t, undefined, { note, signal });
     return outcome.id ? { ok: true, turnId: outcome.id } : { ok: false, reason: `${outcome.status}: ${outcome.body}` };
@@ -1341,7 +1310,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
     jevCall(callId) {
       const call = findCall(callId);
-      return call && !call.ended ? call.jev : undefined;
+      return call && !call.ended && call.state === 'live' ? call.jev : undefined;
     },
 
     chatMessage(chat, agentGroupId, text, replyTo) {
@@ -1355,7 +1324,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
           continue;
         }
         push(call, { type: 'reply', text, turn: replyTo ? replyTo.utteranceId : null });
-        call.kind.candidates?.heard('out', text);
       }
     },
 

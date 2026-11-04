@@ -237,7 +237,7 @@ export function createMeetings(
       },
       job: ({ roomName }) => ({
         callerIdentity: bridgeIdentity(roomName),
-        meeting: { pauseSends: options.pauseSends, jev: options.jev },
+        meeting: { pauseSends: options.pauseSends },
         ...(options.jev ? { jev: true } : {}),
       }),
       sender: () => ({ id: null, name: MEETING_SENDER }),

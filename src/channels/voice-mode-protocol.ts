@@ -102,8 +102,9 @@ export interface LiveKitJobMetadata {
   /** A `/meet` call: the caller is the meeting's Recall bridge page. */
   meeting?: MeetingJob;
   /**
-   * The call runs the jev loop (`/voice jev`): no turn state machine; the worker reports words,
-   * speech marks and playback on `agent/jev`, and speaks only what the host sends.
+   * The call runs the jev loop (`/voice jev`, `/meet <link> jev`): no turn state machine; the worker
+   * reports words (none on a meeting), speech marks and playback on `agent/jev`, and speaks only what
+   * the host sends.
    */
   jev?: boolean;
 }
@@ -140,18 +141,12 @@ export interface CallUtterance {
   text: string;
   /** The worker's key for the turn: a retry under it gets the first answer, not a second turn. */
   turnKey?: string;
-  /** `/meet ... jev`: words no wake phrase addressed, a turn only if the host's judge lets them through. */
-  candidate?: boolean;
-  /** On a candidate: the name the meeting wakes on, which the judge takes an invitation to. */
-  wakeName?: string;
 }
 
 /** What a meeting call's worker does differently. */
 export interface MeetingJob {
   /** A pause ends a turn too, not only the send word. */
   pauseSends: boolean;
-  /** `/meet ... jev`: words no wake phrase addressed go to the host as candidates its judge may let through. */
-  jev: boolean;
 }
 
 /**
