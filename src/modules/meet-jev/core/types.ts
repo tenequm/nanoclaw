@@ -135,6 +135,9 @@ export interface JevState {
     in_exchange_with: string | null;
     /** `latest` opens or ends with the agent's name as a vocative ("Dan, ...", "..., Dan?"): addressed, not proof a reply is wanted. */
     addressed_by_name: boolean;
+    latest_is_question: boolean;
+    latest_to_you: boolean;
+    latest_language: 'uk' | 'en' | 'mixed' | 'other';
   };
 }
 

@@ -38,6 +38,9 @@ const state: JevState = {
     last_reply_to: null,
     in_exchange_with: null,
     addressed_by_name: true,
+    latest_is_question: true,
+    latest_to_you: false,
+    latest_language: 'en',
   },
 };
 
