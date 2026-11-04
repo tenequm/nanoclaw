@@ -52,6 +52,8 @@ export interface DeliveryAddress {
  * their terminal. Agents cannot set `replyTo`; it is a router-layer concept
  * set only by external adapters carrying operator intent.
  */
+import type { Session } from '../types.js';
+
 export interface InboundEvent {
   channelType: string;
   /** Receiving adapter instance; stamped host-side (src/index.ts onInbound) or
@@ -80,6 +82,10 @@ export interface InboundEvent {
    */
   materialize?: () => Promise<void>;
   replyTo?: DeliveryAddress;
+  /** Host-only target for a turn addressed to one wired agent. */
+  agentGroupId?: string;
+  /** Notifies the host caller once the turn is stored. */
+  onStored?: (session: Session) => void;
 }
 
 /** Inbound message from adapter to host. */

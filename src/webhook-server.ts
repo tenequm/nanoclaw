@@ -2,6 +2,7 @@
  * Minimal HTTP server for Chat SDK adapter webhooks.
  *
  * Starts lazily on first adapter registration. Routes requests by path:
+ *   /{segment}[/...]       -> raw handler from registerRootHandler(segment, ...)
  *   /webhook/{adapterName} → chat.webhooks[adapterName](request)
  *   /webhook/{path}        → raw handler from registerWebhookHandler(path, ...)
  *
@@ -30,6 +31,7 @@ export type RawWebhookHandler = (req: http.IncomingMessage, res: http.ServerResp
 
 const routes = new Map<string, WebhookEntry>();
 const rawRoutes = new Map<string, RawWebhookHandler>();
+const rootRoutes = new Map<string, RawWebhookHandler>();
 let server: http.Server | null = null;
 let listenerId: string | null = null;
 
@@ -41,7 +43,10 @@ export function getWebhookStatus(): { id: string; host: string; port: number; pa
     id: listenerId,
     host: address.address,
     port: address.port,
-    paths: [...new Set([...routes.keys(), ...rawRoutes.keys()])].map((p) => `/webhook/${p}`),
+    paths: [
+      ...[...new Set([...routes.keys(), ...rawRoutes.keys()])].map((p) => `/webhook/${p}`),
+      ...[...rootRoutes.keys()].map((s) => `/${s}`),
+    ],
   };
 }
 
@@ -122,6 +127,20 @@ export function registerWebhookHandler(path: string, handler: RawWebhookHandler)
   log.info('Webhook handler registered', { path: `/webhook/${path}` });
 }
 
+/**
+ * Register a raw handler at /{segment} and every path below it, outside /webhook: for
+ * browser-facing pages a reverse proxy forwards by a short path prefix. The handler sees the
+ * original URL. `webhook` is reserved.
+ *
+ * Starts the server lazily on first call.
+ */
+export function registerRootHandler(segment: string, handler: RawWebhookHandler): void {
+  if (segment === 'webhook' || !/^[^/?#]+$/.test(segment)) throw new Error(`Invalid root route segment: ${segment}`);
+  rootRoutes.set(segment, handler);
+  ensureServer();
+  log.info('Root handler registered', { path: `/${segment}` });
+}
+
 function ensureServer(): void {
   if (server) return;
 
@@ -134,19 +153,21 @@ function ensureServer(): void {
     void (async () => {
       const url = req.url || '/';
 
-      // Route: /webhook/{adapterName}
+      // Route: /webhook/{adapterName}, else a root route /{segment}
       const match = url.match(/^\/webhook\/([^/?]+)/);
-      if (!match) {
+      const segment = match ? undefined : url.match(/^\/([^/?#]+)/)?.[1];
+      const rootHandler = segment === undefined ? undefined : rootRoutes.get(segment);
+      if (!match && !rootHandler) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not found');
         return;
       }
 
-      const adapterName = match[1];
+      const adapterName = match?.[1] ?? segment ?? '';
 
       try {
         // Raw routes take priority — the handler writes the response itself.
-        const rawHandler = rawRoutes.get(adapterName);
+        const rawHandler = rootHandler ?? rawRoutes.get(adapterName);
         if (rawHandler) {
           await rawHandler(req, res);
           return;
@@ -201,6 +222,7 @@ export async function stopWebhookServer(): Promise<void> {
     server = null;
     routes.clear();
     rawRoutes.clear();
+    rootRoutes.clear();
     log.info('Webhook server stopped');
   }
 }

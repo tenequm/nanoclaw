@@ -437,6 +437,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   let subscribed = false;
 
   for (const agent of agents) {
+    if (event.agentGroupId && agent.agent_group_id !== event.agentGroupId) continue;
     const agentGroup = await getAgentGroup(agent.agent_group_id);
     if (!agentGroup) continue;
 
@@ -724,6 +725,8 @@ export async function deliverToAgent(
     trigger: wake,
   });
 
+  event.onStored?.(session);
+
   if (wake && created) {
     // A brand-new engaged session: notify registered modules with the
     // resolved wiring context (fire-and-forget — see dispatchSessionCreated).
@@ -764,7 +767,7 @@ export async function deliverToAgent(
       event.platformId,
       effectiveThreadId,
       mg.instance,
-      event.message.id,
+      event.agentGroupId ? undefined : event.message.id,
     );
     const freshSession = await getSession(session.id);
     if (freshSession) {

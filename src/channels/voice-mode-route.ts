@@ -1,0 +1,80 @@
+/**
+ * How a caller's turn reaches the agent: handed to the router's own engaged-message delivery
+ * (`deliverToAgent`: thread policy, session, backfill, command gate, session-created hooks, typing,
+ * wake, fan-out) for the one agent the line belongs to, in the call chat, as a message from the
+ * call kind's sender: the line's caller, or a guest with no user id. `routeInbound` is not used because a turn is addressed to that agent whatever
+ * else is wired to the chat and whatever its trigger; the caller's access to the agent and the
+ * call chat's wiring are checked by the voice engine before every turn. The call hears the agent
+ * thinking through core's typing observer (src/channels/voice-mode-livekit.ts).
+ */
+import type { InboundEvent } from './adapter.js';
+import { wiringThreadsEnabled } from './channel-defaults.js';
+import { getAgentGroup } from '../db/agent-groups.js';
+import { getMessagingGroupAgentByPair } from '../db/messaging-groups.js';
+import { log } from '../log.js';
+import { onHostStart } from '../host-lifecycle.js';
+import { deliverToAgent, resolveSenderRole } from '../router.js';
+import type { MessagingGroup } from '../types.js';
+
+/** What the voice engine knows of a turn besides its event. */
+export interface VoiceModeTurn {
+  /** Who the turn is from: the line's caller, or null for a guest (a meeting), who gets no role. */
+  callerId: string | null;
+  /** The call chat as the engine just resolved it. */
+  chat: MessagingGroup;
+}
+
+/** A turn's event: always addressed to the line's agent. */
+export type VoiceModeTurnEvent = InboundEvent & { agentGroupId: string };
+
+/**
+ * The host takes inbound messages only once running sessions are adopted (src/index.ts); the page can
+ * take a call before that, so turns wait for the same point: host modules start right after it.
+ */
+let hostStarted = false;
+onHostStart(() => {
+  hostStarted = true;
+});
+
+/**
+ * Store a turn in the session of the agent the event names (`agentGroupId`) for the call chat and
+ * wake the agent. Resolves true once stored, false when the chat's wiring to that agent is gone;
+ * rejects when storing threw.
+ */
+export async function routeVoiceModeTurn(event: VoiceModeTurnEvent, turn: VoiceModeTurn): Promise<boolean> {
+  if (!hostStarted) throw new Error('the host is still starting');
+  const { agentGroupId } = event;
+  const mg = turn.chat;
+  const wiring = !mg.denied_at ? await getMessagingGroupAgentByPair(mg.id, agentGroupId) : undefined;
+  const agentGroup = wiring ? await getAgentGroup(agentGroupId) : undefined;
+  if (!wiring || !agentGroup) {
+    log.warn('livekit-voice-mode: the turn has no wired chat to go to', {
+      channelType: event.channelType,
+      agentGroupId,
+    });
+    return false;
+  }
+
+  // The router's own thread policy and engaged-message delivery, for this one wiring.
+  const threadsEnabled = wiringThreadsEnabled(wiring, mg);
+  const threadId = threadsEnabled ? event.threadId : null;
+  let stored = false;
+  await deliverToAgent(
+    wiring,
+    agentGroup,
+    mg,
+    {
+      ...event,
+      onStored: (session) => {
+        stored = true;
+        event.onStored?.(session);
+      },
+    },
+    turn.callerId,
+    threadsEnabled,
+    threadId,
+    true,
+    await resolveSenderRole(event, turn.callerId, agentGroupId),
+  );
+  return stored;
+}

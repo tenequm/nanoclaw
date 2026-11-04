@@ -33,6 +33,8 @@ export interface AgentProvider {
 
   /** Start a new query. Returns a handle for streaming input and output. */
   query(input: QueryInput): AgentQuery;
+  /** An empty prompt opens a query that waits for its first pushed turn. */
+  readonly startsIdle?: boolean;
 
   /**
    * True if the given error indicates the stored continuation is invalid

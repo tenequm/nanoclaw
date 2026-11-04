@@ -4,7 +4,7 @@ import type { Session } from './types.js';
 
 const wakeContainer = vi.fn();
 vi.mock('./container-runner.js', () => ({
-  wakeContainer: (session: Session) => wakeContainer(session),
+  wakeContainer: (session: Session, reason?: string) => wakeContainer(session, reason),
 }));
 
 import { requestWake } from './request-wake.js';
@@ -15,7 +15,7 @@ describe('requestWake', () => {
   it('is a pure delegation to wakeContainer (role=all byte-equivalence)', async () => {
     wakeContainer.mockResolvedValueOnce(true);
     expect(await requestWake(session, 'inbound-message')).toBe(true);
-    expect(wakeContainer).toHaveBeenCalledWith(session);
+    expect(wakeContainer).toHaveBeenCalledWith(session, 'inbound-message');
 
     wakeContainer.mockResolvedValueOnce(false);
     expect(await requestWake(session, 'due-message')).toBe(false);

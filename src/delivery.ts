@@ -193,6 +193,43 @@ export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
   }
 }
 
+/** A session someone waits on in real time is drained this often, instead of on the active poll alone. */
+const EXPEDITED_POLL_MS = 200;
+/** Sessions drained every EXPEDITED_POLL_MS, each until its deadline. */
+const expedited = new Map<string, { session: Session; until: number }>();
+let expediteTimer: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * Drain one session's outbound queue every EXPEDITED_POLL_MS for the next `forMs`: for a caller
+ * waiting on the reply live (a voice call's turn), the ~1 s active poll alone adds half a second
+ * on average. The per-session re-entry guard keeps it from racing the regular polls.
+ */
+export function expediteDelivery(session: Session, forMs: number): void {
+  if (!activePolling) return;
+  expedited.set(session.id, { session, until: Date.now() + forMs });
+  if (expediteTimer) return;
+  expediteTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [id, entry] of expedited) {
+      if (entry.until <= now) {
+        expedited.delete(id);
+        continue;
+      }
+      void deliverSessionMessages(entry.session).catch((err: unknown) =>
+        log.error('Session delivery failed', { sessionId: id, err }),
+      );
+    }
+    if (expedited.size === 0) stopExpediting();
+  }, EXPEDITED_POLL_MS);
+  expediteTimer.unref?.();
+}
+
+function stopExpediting(): void {
+  clearInterval(expediteTimer);
+  expediteTimer = undefined;
+  expedited.clear();
+}
+
 /** Start the active container poll loop (~1s). */
 export function startActiveDeliveryPoll(): void {
   if (activePolling) return;
@@ -713,7 +750,18 @@ async function deliverMessage(
     msg.platformId,
     msg.threadId,
     msg.kind,
-    deliveredContent,
+    presentOutbound(
+      {
+        id: msg.id,
+        kind: msg.kind,
+        channelType: msg.channelType,
+        platformId: msg.platformId,
+        threadId: msg.threadId,
+        inReplyTo: msg.inReplyTo,
+      },
+      deliveredContent,
+      session,
+    ),
     files,
     deliverInstance,
     msg.inReplyTo ? platformMessageId(msg.inReplyTo, session.agent_group_id) : undefined,
@@ -730,6 +778,50 @@ async function deliverMessage(
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
   return platformMsgId;
+}
+
+/**
+ * Outbound presentation: how the platform shows a message, never what it is.
+ *
+ * One optional transform a channel module may register (the voice module marks
+ * a chat reply its live call speaks). It sees a copy of the content about to go
+ * to the adapter and returns replacement content, or null for none; it must not
+ * send, store or mutate anything. The stored row, the post-delivery hooks and
+ * every retry start from the original content, so a retry is never decorated
+ * twice. A transform that throws leaves the message as it was.
+ */
+export interface OutboundAddress {
+  id: string;
+  kind: string;
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  inReplyTo: string | null;
+}
+
+export type OutboundPresentation = (
+  msg: OutboundAddress,
+  content: Readonly<Record<string, unknown>>,
+  session: Session,
+) => Record<string, unknown> | null;
+
+let outboundPresentation: OutboundPresentation | null = null;
+
+export function setOutboundPresentation(transform: OutboundPresentation | null): void {
+  outboundPresentation = transform;
+}
+
+function presentOutbound(msg: OutboundAddress, outboundContent: string, session: Session): string {
+  if (!outboundPresentation) return outboundContent;
+  try {
+    const content = JSON.parse(outboundContent) as unknown;
+    if (!content || typeof content !== 'object' || Array.isArray(content)) return outboundContent;
+    const presented = outboundPresentation(msg, Object.freeze(content as Record<string, unknown>), session);
+    return presented ? JSON.stringify(presented) : outboundContent;
+  } catch (err) {
+    log.warn('Outbound presentation failed; delivering the message as it is', { messageId: msg.id, err });
+    return outboundContent;
+  }
 }
 
 /**
@@ -886,6 +978,7 @@ async function handleSystemAction(content: Record<string, unknown>, session: Ses
 export function stopDeliveryPolls(): void {
   activePolling = false;
   sweepPolling = false;
+  stopExpediting();
 }
 
 async function richAllowed(messageId: string, content: Record<string, unknown>, session: Session): Promise<boolean> {

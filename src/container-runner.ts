@@ -44,6 +44,7 @@ import { getHostInstanceId } from './host-instance.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getSession } from './db/sessions.js';
 import { getSessionDriver, isSessionEventsDriver } from './drivers/index.js';
+import type { WakeReason } from './request-wake.js';
 import type { SupervisedHandle, SupervisedSnapshot } from './drivers/session-events.js';
 import { GROUP_FOLDER_LABEL, labelValueLegal, specInvalid } from './drivers/types.js';
 import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './drivers/types.js';
@@ -387,8 +388,11 @@ async function retryPendingAdoption(sessionId: string): Promise<boolean> {
  * transient spawn failure (e.g. the selected gateway is unreachable). Callers don't
  * need to wrap — the inbound row stays pending and host-sweep retries on its
  * next tick.
+ *
+ * The reason reaches the runner only when this wake spawns a container.
+ * A wake joining a running or in-flight container drops it.
  */
-export function wakeContainer(session: Session): Promise<boolean> {
+export function wakeContainer(session: Session, reason?: WakeReason): Promise<boolean> {
   // The sweep is re-fencing this session's survivor (checked first: it may be
   // registered and mid-stop). Once it settles cleanly, wake again from a fresh
   // read, so a container it stopped or found gone is replaced now, not a tick
@@ -399,7 +403,7 @@ export function wakeContainer(session: Session): Promise<boolean> {
       .then(async (settled) => {
         if (!settled) return false;
         const current = await getSession(session.id);
-        return current?.status === 'active' ? wakeContainer(current) : false;
+        return current?.status === 'active' ? wakeContainer(current, reason) : false;
       })
       .catch((err: unknown) => {
         log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
@@ -415,7 +419,7 @@ export function wakeContainer(session: Session): Promise<boolean> {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
-  const promise = spawnContainer(session)
+  const promise = spawnContainer(session, reason)
     .then(() => true)
     .catch((err) => {
       log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
@@ -428,7 +432,7 @@ export function wakeContainer(session: Session): Promise<boolean> {
   return promise;
 }
 
-async function spawnContainer(session: Session): Promise<void> {
+async function spawnContainer(session: Session, wakeReason?: WakeReason): Promise<void> {
   if (pendingAdoptions.has(session.id)) {
     // A running container is waiting to be re-fenced after a failed adoption
     // claim. Reclaim it rather than spawning a duplicate; its poll loop picks
@@ -511,6 +515,7 @@ async function spawnContainer(session: Session): Promise<void> {
       contribution,
       gateway,
       mailboxEnvironment,
+      wakeReason,
     });
 
     log.info('Spawning session', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -1400,6 +1405,8 @@ export interface ComposeSessionSpecInput {
   gateway: GatewayContribution;
   /** Non-secret configuration supplied by the selected mailbox implementation. */
   mailboxEnvironment: Record<string, string>;
+  /** Why this spawn happened, for the runner. */
+  wakeReason?: WakeReason;
 }
 
 /**
@@ -1426,6 +1433,7 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
   const env: Record<string, string> = {
     TZ: containerConfig.timezone ?? TIMEZONE,
     ...mailboxEnvironment,
+    ...(input.wakeReason && { NANOCLAW_WAKE_REASON: input.wakeReason }),
   };
   // The contributed lane (ContainerSpec.contributedEnv): registry-sourced env,
   // exempt from the credential-NAME check and still refused credential VALUES.

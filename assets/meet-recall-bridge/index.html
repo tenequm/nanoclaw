@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1280, height=720" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Meeting bridge</title>
+    <!--
+      Recall.ai Output Media page (src/channels/meet-recall.ts). Recall's bot opens it as its camera:
+      getUserMedia returns the meeting's mixed audio (minus the bot's own output), and whatever this page
+      plays goes into the meeting. It publishes that audio into the call's LiveKit room and plays every
+      remote audio track there (the voice worker's speech and cues). Hash, never the query (no server or
+      referrer sees it): url (LiveKit wss), token (LiveKit JWT), name (card label).
+    -->
+    <script
+      src="https://cdn.jsdelivr.net/npm/livekit-client@2.22.4/dist/livekit-client.umd.js"
+      integrity="sha384-5qI/UmLG0CvuWCt6vqjMW1oRwzXu+MNhbw4x6yo9NARdlqi94LwQfq9wvDTIcfrD"
+      crossorigin="anonymous"
+    ></script>
+    <style>
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #111418;
+        color: #e9edf1;
+        font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      }
+      main {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 28px;
+      }
+      #avatar {
+        width: 240px;
+        height: 240px;
+        border-radius: 50%;
+        background: #2f5d8a;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 120px;
+        font-weight: 600;
+        transition: box-shadow 120ms ease-out;
+      }
+      #avatar.speaking {
+        box-shadow: 0 0 0 14px rgba(110, 170, 230, 0.35);
+      }
+      #name {
+        font-size: 64px;
+        font-weight: 600;
+        margin: 0;
+      }
+      #status {
+        font-size: 24px;
+        color: #8d99a6;
+      }
+      #players {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div id="avatar"></div>
+      <h1 id="name"></h1>
+      <div id="status">Starting</div>
+    </main>
+    <div id="players"></div>
+    <script>
+      (() => {
+        const q = new URLSearchParams(location.hash.slice(1));
+        const wsUrl = q.get('url');
+        const token = q.get('token');
+        const label = q.get('name') || 'Agent';
+        const statusEl = document.getElementById('status');
+        const avatar = document.getElementById('avatar');
+        const playersEl = document.getElementById('players');
+        document.getElementById('name').textContent = label;
+        document.title = label;
+        avatar.textContent = label.charAt(0).toUpperCase();
+
+        // Exposed for Recall's Remote DevTools.
+        const state = (window.__bridge = { status: 'starting', published: false, playing: 0, error: null });
+        const setStatus = (text, error) => {
+          state.status = text;
+          state.error = error || null;
+          statusEl.textContent = error ? `${text}: ${error}` : text;
+        };
+
+        const LK = window.LivekitClient;
+        if (!LK) return setStatus('Error', 'livekit-client failed to load');
+        if (!wsUrl || !token) return setStatus('Error', 'missing url or token');
+
+        const { Room, RoomEvent, Track, DisconnectReason } = LK;
+        const TERMINAL = new Set([
+          DisconnectReason.ROOM_DELETED,
+          DisconnectReason.PARTICIPANT_REMOVED,
+          DisconnectReason.DUPLICATE_IDENTITY,
+        ]);
+        // Media reaches LiveKit only through its TURN/TLS relay on 443 (no public UDP or ICE/TCP), and
+        // livekit-client's own relay fallback takes 10-30 s, so relay is forced from the first offer.
+        const CONNECT_OPTIONS = { autoSubscribe: false, rtcConfig: { iceTransportPolicy: 'relay' } };
+        let room = null;
+        let meetingTrack = null;
+        let attempt = 0;
+        let retryTimer = null;
+        let stopped = false;
+
+        async function meetingAudio() {
+          if (meetingTrack && meetingTrack.readyState === 'live') return meetingTrack;
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+          });
+          const track = stream.getAudioTracks()[0];
+          if (!track) throw new Error('no meeting audio track');
+          track.addEventListener('ended', () => {
+            if (meetingTrack !== track || !room || room.state !== 'connected') return;
+            republish(room).catch((err) => setStatus('Error', String(err)));
+          });
+          meetingTrack = track;
+          return track;
+        }
+
+        async function republish(r) {
+          state.published = false;
+          for (const pub of r.localParticipant.audioTrackPublications.values()) {
+            if (pub.track) await r.localParticipant.unpublishTrack(pub.track, true);
+          }
+          const track = await meetingAudio();
+          await r.localParticipant.publishTrack(track, { name: 'meeting-audio', source: Track.Source.Microphone });
+          state.published = true;
+        }
+
+        const wanted = (pub) => pub.kind === Track.Kind.Audio;
+        const consider = (pub) => {
+          if (wanted(pub) && !pub.isSubscribed) pub.setSubscribed(true);
+        };
+
+        function refresh() {
+          if (!room || room.state !== 'connected') return;
+          state.playing = playersEl.childElementCount;
+          if (state.playing > 0) setStatus('Live');
+          else if (room.remoteParticipants.size > 0) setStatus(`Waiting for ${label}'s audio`);
+          else setStatus(`Waiting for ${label}`);
+        }
+
+        function clearPlayers() {
+          playersEl.replaceChildren();
+          avatar.classList.remove('speaking');
+          state.playing = 0;
+        }
+
+        function scheduleRetry() {
+          if (stopped || retryTimer) return;
+          const delay = Math.min(1000 * 2 ** attempt, 15000);
+          attempt += 1;
+          setStatus('Reconnecting');
+          retryTimer = setTimeout(() => {
+            retryTimer = null;
+            void connect();
+          }, delay);
+        }
+
+        function wire(r) {
+          r.on(RoomEvent.ParticipantConnected, (p) => {
+            p.trackPublications.forEach(consider);
+            refresh();
+          });
+          r.on(RoomEvent.ParticipantDisconnected, refresh);
+          r.on(RoomEvent.TrackPublished, consider);
+          r.on(RoomEvent.TrackSubscribed, (track, pub) => {
+            if (!wanted(pub)) return;
+            const el = track.attach();
+            playersEl.appendChild(el);
+            el.play().catch(() => r.startAudio().catch(() => {}));
+            refresh();
+          });
+          r.on(RoomEvent.TrackUnsubscribed, (track) => {
+            track.detach().forEach((el) => el.remove());
+            refresh();
+          });
+          r.on(RoomEvent.AudioPlaybackStatusChanged, () => {
+            if (!r.canPlaybackAudio) r.startAudio().catch(() => setStatus('Error', 'audio playback blocked'));
+          });
+          r.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+            avatar.classList.toggle(
+              'speaking',
+              speakers.some((s) => s.identity !== r.localParticipant.identity),
+            );
+          });
+          r.on(RoomEvent.Reconnecting, () => setStatus('Reconnecting'));
+          r.on(RoomEvent.Reconnected, refresh);
+          r.on(RoomEvent.Disconnected, (reason) => {
+            if (r !== room) return;
+            room = null;
+            state.published = false;
+            clearPlayers();
+            if (TERMINAL.has(reason)) {
+              stopped = true;
+              setStatus('Meeting ended');
+              return;
+            }
+            scheduleRetry();
+          });
+        }
+
+        async function connect() {
+          if (stopped) return;
+          setStatus(attempt ? 'Reconnecting' : 'Connecting');
+          let r = null;
+          try {
+            // The meeting's audio before the room: a caller that joins and fails then leaves, which ends the call.
+            await meetingAudio();
+            r = new Room({ adaptiveStream: false, dynacast: false });
+            room = r;
+            wire(r);
+            await r.connect(wsUrl, token, CONNECT_OPTIONS);
+            await republish(r);
+            attempt = 0;
+            r.remoteParticipants.forEach((p) => p.trackPublications.forEach(consider));
+            refresh();
+          } catch (err) {
+            console.error('meet-recall-bridge: connect failed', err);
+            if (r) {
+              if (room === r) room = null;
+              clearPlayers();
+              await r.disconnect().catch(() => {});
+            }
+            scheduleRetry();
+            setStatus('Reconnecting', err && err.message ? err.message : String(err));
+          }
+        }
+
+        void connect();
+      })();
+    </script>
+  </body>
+</html>

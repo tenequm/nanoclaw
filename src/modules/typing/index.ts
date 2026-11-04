@@ -1,4 +1,6 @@
 /**
+ * One observer hook (registerTypingObserver) lets the voice channel follow a chat's ticks.
+ *
  * Typing indicator refresh — default module.
  *
  * Most platforms expire a typing indicator after 5–10s, so a one-shot
@@ -217,8 +219,61 @@ function resolveMode(channelType: string, threadId: string | null, instance?: st
   return adapter?.typingRequiresThread?.(channelType, instance) ? 'reaction' : 'status';
 }
 
+/** One working tick of an agent in a chat. */
+export interface TypingTick {
+  agentGroupId: string;
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  /**
+   * The runner reports a live `working` turn stamped after the inbound that started this stretch:
+   * it has picked the message up. False until such a report arrives, and always for a runner that
+   * never reports a turn (the heartbeat fallback).
+   */
+  working: boolean;
+}
+
+/**
+ * Sees every working tick, whatever the chat's rendering (a status, or the
+ * one-shot reaction ack), so an agent's activity can be shown elsewhere too
+ * (a live voice call). Besides the refresh ticks, an observer gets one extra tick the moment the
+ * runner's report first says it works on this stretch's inbound (`working`), without waiting for the
+ * next refresh.
+ */
+export type TypingObserver = (tick: TypingTick) => void;
+
+const typingObservers: TypingObserver[] = [];
+
+export function registerTypingObserver(observer: TypingObserver): void {
+  typingObservers.push(observer);
+}
+
+/** The runner's report says it works on this entry's latest inbound: a fresh `working` stamped after it. */
+function workingSinceInbound(entry: TypingTarget, now = Date.now()): boolean {
+  const report = entry.presence;
+  return (
+    report?.turn === 'working' &&
+    report.updatedAtMs !== null &&
+    report.updatedAtMs >= entry.startedAt &&
+    now - report.updatedAtMs < TURN_STALE_MS
+  );
+}
+
+function notifyObservers(entry: TypingTarget): void {
+  const { agentGroupId, channelType, platformId, threadId } = entry;
+  const working = workingSinceInbound(entry);
+  for (const observe of typingObservers) {
+    try {
+      observe({ agentGroupId, channelType, platformId, threadId, working });
+    } catch (err) {
+      signalFailed('typingObserver', { channelType, platformId, threadId }, err);
+    }
+  }
+}
+
 /** Paint the entry's signal: a typing tick, or the one-shot reaction ack. */
 function paintSignal(entry: TypingTarget): void {
+  notifyObservers(entry);
   if (entry.mode === 'status') {
     triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
     return;
@@ -258,7 +313,9 @@ function clearSignal(entry: TypingTarget): void {
 }
 
 function refresh(entry: TypingTarget): void {
-  if (entry.capped || entry.mode !== 'status') return;
+  if (entry.capped) return;
+  notifyObservers(entry);
+  if (entry.mode !== 'status') return;
   triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
 }
 
@@ -433,7 +490,10 @@ export function notePresence(sessionId: string, report: PresenceReport): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
   const wasWorking = entry.presence?.turn === 'working';
+  const pickedUp = workingSinceInbound(entry);
   entry.presence = report;
+  if (!pickedUp && !entry.capped && entry.pausedUntil <= Date.now() && workingSinceInbound(entry))
+    notifyObservers(entry);
   if (report.turn === 'working' && !wasWorking) {
     entry.typingSince = Date.now();
     entry.capped = false;

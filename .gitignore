@@ -62,3 +62,5 @@ forks.md
 # Library templates copied in by setup or create_agent are install state.
 /templates/*
 !/templates/README.md
+
+.voice-mode-upgrade-backup/

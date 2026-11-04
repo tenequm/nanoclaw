@@ -7,7 +7,7 @@
  * must forward the adapter instance, or a named instance's typing indicator
  * fires through the wrong bot.
  */
-import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeAll, beforeEach, vi } from 'vitest';
 
 vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -24,6 +24,8 @@ import path from 'path';
 import { heartbeatPath } from '../../session-manager.js';
 import {
   notePresence,
+  registerTypingObserver,
+  type TypingTick,
   pauseTypingRefreshAfterDelivery,
   setTypingAdapter,
   startTypingRefresh,
@@ -541,5 +543,84 @@ describe('failure reporting', () => {
       'activity signal failed',
       expect.objectContaining({ op: 'addReaction', messageId: 'msg-1', err: 'Error: message_not_found' }),
     );
+  });
+});
+
+describe('typing observers', () => {
+  const seen: TypingTick[] = [];
+  // Observers cannot be unregistered; added here, after every other suite of this file has run.
+  beforeAll(() => {
+    registerTypingObserver(() => {
+      throw new Error('observer down');
+    });
+    registerTypingObserver((tick) => seen.push(tick));
+  });
+  beforeEach(() => {
+    seen.length = 0;
+  });
+
+  it('see every tick with its agent and chat address, and a throwing one never stops the adapter call', async () => {
+    const calls = captureAdapter();
+    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'telegram:100', null, 'telegram');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual([
+      { agentGroupId: 'ag-1', channelType: 'telegram', platformId: 'telegram:100', threadId: null, working: false },
+    ]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('keep ticking in a threadless chat that shows a one-shot reaction ack instead of typing', async () => {
+    const { reactions } = signalAdapter({ requiresThread: true });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', null, 'slack', 'm-1');
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(reactions.filter((r) => r.op === 'add')).toHaveLength(1);
+    expect(seen).toHaveLength(3);
+    expect(seen[0]).toEqual({
+      agentGroupId: 'ag-1',
+      channelType: 'slack',
+      platformId: 'slack:C1',
+      threadId: null,
+      working: false,
+    });
+  });
+
+  it('hear the runner pick an inbound up at once, once, and only from a report stamped after that inbound', async () => {
+    const calls = captureAdapter();
+    startTypingRefresh('sess-pick', 'ag-1', 'voice', 'voice:line', null);
+    await vi.advanceTimersByTimeAsync(0);
+    const painted = calls.length;
+    seen.length = 0;
+    // A leftover report from before this inbound says nothing about it.
+    notePresence('sess-pick', { turn: 'working', updatedAtMs: Date.now() - 1_000 });
+    expect(seen).toEqual([]);
+    await vi.advanceTimersByTimeAsync(500);
+    notePresence('sess-pick', { turn: 'working', updatedAtMs: Date.now() });
+    expect(seen).toEqual([expect.objectContaining({ platformId: 'voice:line', working: true })]);
+    // Observers only: the platform indicator keeps its own cadence.
+    expect(calls).toHaveLength(painted);
+    // A re-mark of the same turn is no second pickup; the refresh ticks carry the flag.
+    notePresence('sess-pick', { turn: 'working', updatedAtMs: Date.now() });
+    expect(seen).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(3_600);
+    expect(seen.at(-1)).toEqual(expect.objectContaining({ working: true }));
+    // The next inbound starts a new stretch: not working on it until a report says so.
+    seen.length = 0;
+    startTypingRefresh('sess-pick', 'ag-1', 'voice', 'voice:line', null);
+    expect(seen).toEqual([expect.objectContaining({ working: false })]);
+    await vi.advanceTimersByTimeAsync(1);
+    notePresence('sess-pick', { turn: 'working', updatedAtMs: Date.now() });
+    expect(seen.at(-1)).toEqual(expect.objectContaining({ working: true }));
+    stopTypingRefresh('sess-pick');
+  });
+
+  it('stay quiet about a pickup inside the post-delivery pause, like the refresh ticks', async () => {
+    captureAdapter();
+    startTypingRefresh('sess-pause', 'ag-1', 'voice', 'voice:line', null);
+    await vi.advanceTimersByTimeAsync(1);
+    pauseTypingRefreshAfterDelivery('sess-pause');
+    seen.length = 0;
+    notePresence('sess-pause', { turn: 'working', updatedAtMs: Date.now() });
+    expect(seen).toEqual([]);
+    stopTypingRefresh('sess-pause');
   });
 });

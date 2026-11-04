@@ -125,7 +125,7 @@ describe('restartAgentGroupContainers', () => {
     onExit();
 
     expect(mockGetSession).toHaveBeenCalledWith('s1');
-    await vi.waitFor(() => expect(mockWakeContainer).toHaveBeenCalledWith(freshSession));
+    await vi.waitFor(() => expect(mockWakeContainer).toHaveBeenCalledWith(freshSession, 'container-restart'));
   });
 
   it('onExit callback does not wake if session no longer exists', async () => {

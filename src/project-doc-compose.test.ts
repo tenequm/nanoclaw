@@ -9,10 +9,13 @@ import {
   RICH_MESSAGES_BODY,
   RICH_MESSAGES_SECTION,
 } from './channels/telegram-grammy/agent-docs.js';
+import { createVoiceModeLine } from './db/voice-mode-lines.js';
+import './channels/voice-mode.js';
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const VOICE_SECTION = 'NanoClaw Skill: voice-mode-formatting';
 const TEST_ROOT = `/tmp/nanoclaw-project-doc-compose-test-${process.pid}`;
 const REPO_ROOT = process.cwd();
 
@@ -586,6 +589,45 @@ function composedSection(doc: string, name: string): string {
   const next = rest.slice(1).search(/\n\n# (NanoClaw (Module|Skill): |MCP Server: |Native Runtime Skills\n)/);
   return next === -1 ? rest : rest.slice(0, next + 1);
 }
+
+describe('Voice project sections', () => {
+  it('composes voice-mode-formatting for an agent with a voice-mode line', async () => {
+    const ag = await seed('ag-voice', 'voice-group');
+    await wire(ag, 'mg-voice-chat', 'telegram');
+    await createVoiceModeLine({
+      agentGroupId: ag.id,
+      ownerUserId: 'telegram:owner',
+      messagingGroupId: 'mg-voice-chat',
+      threadId: null,
+    });
+
+    const doc = await withRealContainer(() => compose(ag));
+
+    expect(composedSection(doc, VOICE_SECTION)).toContain(
+      fs.readFileSync(path.join(REPO_ROOT, 'container/skills/voice-mode-formatting/instructions.md'), 'utf-8').trim(),
+    );
+  });
+
+  it('leaves voice-mode-formatting out for an agent wired only to a `voice` chat from before the rename', async () => {
+    const ag = await seed('ag-voice-legacy', 'voice-legacy-group');
+    await wire(ag, 'mg-voice-legacy', 'voice');
+
+    const doc = await withRealContainer(() => compose(ag));
+
+    expect(doc).not.toContain(`# ${VOICE_SECTION}`);
+  });
+
+  it('leaves voice-mode-formatting out for a non-voice agent on the "all" selection', async () => {
+    const ag = await seed('ag-no-voice', 'no-voice-group');
+    await wire(ag, 'mg-text-only', 'telegram');
+
+    const doc = await withRealContainer(() => compose(ag));
+
+    // Proves the walk ran on the real tree at "all": the ungated resident skill is there.
+    expect(doc).toContain('# NanoClaw Skill: onecli-gateway');
+    expect(doc).not.toContain(`# ${VOICE_SECTION}`);
+  });
+});
 
 describe('Telegram project sections', () => {
   it('composes the Telegram formatting guide for a Telegram-wired agent, whatever its skill list', async () => {

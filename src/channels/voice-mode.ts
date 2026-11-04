@@ -1,0 +1,863 @@
+/**
+ * Voice channel: browser calls with a NanoClaw agent. The caller talks to the
+ * line's real agent: each turn of speech is transcribed and handed to the
+ * agent, and the agent's own reply is spoken back. The call itself runs on
+ * LiveKit (src/channels/voice-mode-livekit.ts, with the worker in
+ * src/voice-mode-worker.ts); this module is the channel adapter around it.
+ *
+ * Shape: native adapter (no Chat SDK bridge). A *voice line* is one caller's
+ * link to one agent: a voice_mode_lines row that `/voice` creates
+ * (voice-mode-command.ts), with the platform id `voice-mode:<line id>` for a
+ * random line id. The row keeps the link token's SHA-256 (what a call is
+ * looked up by) and the token sealed under NANOCLAW_ENCRYPTION_KEY; the plain
+ * token never reaches the database, the logs or the agent's messages. There
+ * are no threads. One call is active per line at a time; the newest wins.
+ *
+ * The link token gates the HTTP routes: a request without a known `t` gets a
+ * 403 before any room is created. The page is at `/voice?t=<token>` behind a
+ * loopback front (or a trusted reverse proxy) that terminates TLS. The page
+ * call is the `/voice` call kind of the call core: it and its page, token and
+ * end routes live in voice-mode-command.ts (createCallPage), as the meeting
+ * kind lives in voice-mode-meet.ts; this module wires both to the core.
+ */
+import http from 'node:http';
+import net from 'node:net';
+
+import type { ChannelAdapter, ChannelSetup, InboundEvent } from './adapter.js';
+import { wiringThreadsEnabled } from './channel-defaults.js';
+import { registerChannelAdapter } from './channel-registry.js';
+import type { VoiceModeUiConfig } from './voice-mode-page.js';
+import {
+  lineIdOf,
+  linePlatformId,
+  resolveVoiceModeLine,
+  VOICE_MODE_CHANNEL,
+  type ResolveLineOptions,
+  type VoiceModeLine,
+} from './voice-mode-line.js';
+import {
+  createLiveKitVoice,
+  JSON_HEADERS,
+  MINUTE_MS,
+  readJsonObject,
+  reply,
+  type LiveKitVoiceConfig,
+} from './voice-mode-livekit.js';
+import { createVoiceCatalog, type VoiceCatalog } from './voice-mode-tts-catalog.js';
+import {
+  DEFAULT_LIVEKIT_AGENT_NAME,
+  LIVEKIT_PROTOCOL_VERSION,
+  settleWithin,
+  wakePhrase,
+  parseVoiceLanguages,
+} from './voice-mode-protocol.js';
+import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
+import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
+import { expediteDelivery } from '../delivery.js';
+import {
+  findVoiceModeLineByToken,
+  getVoiceModeLine,
+  getVoiceModeLineForAgent,
+  savedTts,
+  sealVoiceModeLink,
+  setVoiceModeLineTts,
+} from '../db/voice-mode-lines.js';
+import { routeVoiceModeTurn } from './voice-mode-route.js';
+import { createCallPage, handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
+import { createMeetings, type Meetings } from './voice-mode-meet.js';
+import {
+  createRecallMeetBridge,
+  RECALL_MEET_ENV_KEYS,
+  recallMeetConfigFromEnv,
+  type RecallMeetBridge,
+} from './meet-recall.js';
+import { readEnvFile } from '../env.js';
+import type { askJev } from '../modules/jev-gate/jev.js';
+import { encryptionKey } from '../secret-seal.js';
+import { log } from '../log.js';
+import { registerResidentSkillGate } from '../project-doc-compose.js';
+import { requestWake } from '../request-wake.js';
+import type { Session } from '../types.js';
+import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
+import {
+  effectiveTts,
+  isTtsProvider,
+  LINE_DEFAULT_CHOICE,
+  providerKeysFrom,
+  readTtsChoice,
+  TTS_DEFAULT_CHOICE,
+  TTS_REGISTRY,
+  type ProviderKeys,
+  type TtsChoice,
+  type TtsSaved,
+} from '../voice-mode-tts.js';
+
+/** How often a running call rechecks that its caller may still use the line. */
+const ACCESS_CHECK_INTERVAL_MS = 5000;
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
+/** After a turn reaches the agent, its session's replies are picked up at once for this long, not on the 1 s poll. */
+const CALL_REPLY_EXPEDITE_MS = 60_000;
+
+/** A `PATCH /voice/tts` body is one small object: `{provider, model?, voice?}` or `{"reset": true}`. */
+const MAX_TTS_BODY_BYTES = 1024;
+const MAX_CATALOG_LIMIT = 100;
+/** How long a save waits to hear whether the provider has its voice; then it saves (the app gives up at 12 s). */
+const SAVE_LOOKUP_BUDGET_MS = 4000;
+/** Longest `q`, `language`, `gender` or `cursor` a catalog request takes. */
+const MAX_CATALOG_PARAM_CHARS = 512;
+const CATALOG_GENDERS = new Set(['female', 'male', 'neutral']);
+
+/**
+ * The shared webhook server listens on every interface, and the voice routes are meant to be reached
+ * through a loopback front (Tailscale Serve or a local reverse proxy) that terminates TLS.
+ */
+export function isLoopbackAddress(address: string | undefined): boolean {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+/** A set of address ranges from a comma-separated CIDR list (VOICE_MODE_TRUSTED_PROXY_CIDRS, VOICE_MODE_ALLOWED_CLIENT_CIDRS). */
+export interface CidrSet {
+  /** Whether any range was configured, valid or not: a list whose every entry is invalid matches nothing. */
+  configured: boolean;
+  has(address: string | undefined): boolean;
+}
+
+/** Parses `10.0.0.0/8, fd7a::/48, 192.0.2.7`; invalid entries are skipped with a warning (they match nothing). */
+export function parseCidrs(raw: string | undefined, key: string): CidrSet {
+  const list = new net.BlockList();
+  const entries = (raw ?? '')
+    .split(',')
+    .map((e) => e.trim())
+    .filter(Boolean);
+  for (const entry of entries) {
+    const [address, bits, extra] = entry.split('/');
+    const type = net.isIPv4(address) ? 'ipv4' : net.isIPv6(address) ? 'ipv6' : null;
+    const max = type === 'ipv4' ? 32 : 128;
+    const prefix = bits === undefined ? max : /^\d{1,3}$/.test(bits) ? Number(bits) : NaN;
+    if (!type || extra !== undefined || !(prefix >= 0 && prefix <= max)) {
+      log.warn(`voice-mode: ignoring an invalid ${key} entry`, { entry });
+      continue;
+    }
+    list.addSubnet(address, prefix, type);
+  }
+  return {
+    configured: entries.length > 0,
+    has(address) {
+      // An IPv4 peer on a dual-stack socket arrives as ::ffff:a.b.c.d.
+      const plain = address?.trim().replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/i, '');
+      if (!plain) return false;
+      const type = net.isIPv4(plain) ? 'ipv4' : net.isIPv6(plain) ? 'ipv6' : null;
+      return type !== null && list.check(plain, type);
+    },
+  };
+}
+
+/** Who may reach the browser-facing voice routes besides loopback peers. */
+export interface VoiceModeProxyPolicy {
+  /** Reverse proxies whose X-Forwarded-For is believed; empty means none, today's loopback-only behaviour. */
+  trustedProxies: CidrSet;
+  /** Clients a trusted proxy may forward; not configured means any client it forwards. */
+  allowedClients: CidrSet;
+}
+
+/**
+ * Whether a browser-facing voice request is admitted: a loopback peer, or a trusted proxy forwarding
+ * an allowed client. The client is the rightmost X-Forwarded-For hop outside the trusted proxies (the
+ * leftmost when every hop is one): hops to its left are whatever the client claimed.
+ */
+export function admitsVoiceModePeer(
+  policy: VoiceModeProxyPolicy,
+  peer: string | undefined,
+  forwardedFor: string | string[] | undefined,
+): boolean {
+  const trusted = policy.trustedProxies.has(peer);
+  if (isLoopbackAddress(peer) && !(trusted && policy.allowedClients.configured)) return true;
+  if (!trusted) return false;
+  if (!policy.allowedClients.configured) return true;
+  const hops = [forwardedFor ?? []]
+    .flat()
+    .flatMap((h) => h.split(','))
+    .map((h) => h.trim())
+    .filter(Boolean);
+  const client = hops.findLast((h) => !policy.trustedProxies.has(h)) ?? hops[0] ?? peer;
+  return policy.allowedClients.has(client);
+}
+
+/** Browser routes under the short /voice prefix a reverse proxy forwards; the bare prefix is the call page. */
+const CLEAN_PREFIX_ROUTES = new Set(['info', 'tts', 'voices', 'livekit', 'livekit/token', 'livekit/end']);
+const CLEAN_PREFIX = /^\/voice(?:\/|$)/;
+/** The worker's routes keep their own per-call secret and stay loopback-only, never admitted through a proxy. */
+const WORKER_PREFIX = /^\/webhook\/voice-mode\/(livekit\/agent(?:\/.*)?)$/;
+
+/**
+ * The voice route of a request path: a browser route under /voice, or a worker route under
+ * /webhook/voice-mode/livekit/agent. Null for any other path.
+ */
+export function voiceRoute(pathname: string): string | null {
+  const worker = WORKER_PREFIX.exec(pathname);
+  if (worker) return worker[1].replace(/\/+$/, '');
+  if (!CLEAN_PREFIX.test(pathname)) return null;
+  const route = pathname.replace(CLEAN_PREFIX, '').replace(/\/+$/, '') || 'livekit';
+  return CLEAN_PREFIX_ROUTES.has(route) ? route : null;
+}
+
+const isWorkerRoute = (route: string): boolean => /^livekit\/agent(?:\/|$)/.test(route);
+
+export interface VoiceModeConfig {
+  /** Origin the caller's browser reaches the host at (for the call link). */
+  publicUrl: string;
+  /** The separate page listener's port; unset: no separate listener (the host's webhook port still serves the page). */
+  pagePort?: number;
+  /** The address the page listener binds; loopback unless set (VOICE_MODE_PAGE_HOST). */
+  pageHost?: string;
+  /** VOICE_MODE_PORT was set: a page listener that cannot bind fails setup instead of being skipped. */
+  pagePortRequired?: boolean;
+  /** The line a link token opens, by platform id, or null. Defaults to the hashed-line table. */
+  lineForToken?: (token: string) => Promise<string | null>;
+  /** Routes a turn instead of routeVoiceModeTurn; resolves true once the agent's session stored it. Test seam. */
+  routeTurn?: (event: InboundEvent) => Promise<boolean>;
+  /** The LiveKit server the calls run on. */
+  livekit: LiveKitVoiceConfig;
+  /** Resolves the named caller, single wiring and explicit access. Defaults to the central DB. */
+  resolveLine?: (platformId: string, options?: ResolveLineOptions) => Promise<VoiceModeLine | null>;
+  /** VOICE_MODE_VOCABULARY: comma-separated names every call's transcription is told; used by the default resolveLine. */
+  vocabulary?: string;
+  accessCheckIntervalMs?: number;
+  /** Clock, overridable for tests. */
+  now?: () => number;
+  /** Speech provider API keys (VOICE_MODE_<PROVIDER>_API_KEY): a provider without one is offered as unavailable. */
+  providerKeys?: ProviderKeys;
+  /** The voice catalog `GET /voice/voices` pages through, on providerKeys. Test seam; defaults to the providers' live listings. */
+  catalog?: VoiceCatalog;
+  /** How long a save waits on its voice lookup before it saves anyway. Test seam. */
+  saveLookupBudgetMs?: number;
+  /** Look of the browser call page; injected at serve time, no rebuild needed (VOICE_MODE_UI). */
+  ui?: VoiceModeUiConfig;
+  /** The wake phrase the worker listens for (wakePhrase); null: `hey <agent>`. Unset: the page is not told. */
+  wakePhrase?: string | null;
+  maxCallDurationMs?: number;
+  maxCallsPerHour?: number;
+  /** Call time one line may use per UTC day. */
+  maxCallMsPerDay?: number;
+  /** Serve the voice routes to non-loopback peers too (VOICE_MODE_ALLOW_NON_LOOPBACK); for local development only. */
+  allowNonLoopback?: boolean;
+  /** VOICE_MODE_TRUSTED_PROXY_CIDRS: reverse proxies (e.g. a Docker bridge subnet) admitted for the browser routes. */
+  trustedProxyCidrs?: string;
+  /** VOICE_MODE_ALLOWED_CLIENT_CIDRS: clients those proxies may forward (X-Forwarded-For); unset is any. */
+  allowedClientCidrs?: string;
+  /** The session a call's turn went to: its replies are delivered without waiting on the poll. Test seam. */
+  expediteReplies?: (session: Session) => void;
+  /** The Recall client `/meet` joins meetings through (voice-mode-meet.ts); none: `/meet` is not configured. */
+  meetBridge?: RecallMeetBridge;
+  /** The Jev client a `/meet ... jev` call judges candidates with; a test seam. */
+  judgeJev?: typeof askJev;
+  /** How a call finds and starts the agent session it talks to (findCallSession, requestWake). Test seams. */
+  prewarm?: {
+    findSession?: (route: Omit<InboundEvent, 'message'>, agentGroupId: string) => Promise<Session | undefined>;
+    wake?: (session: Session) => Promise<boolean>;
+  };
+}
+
+/**
+ * The active session a turn to `route` would be stored in, found without creating anything: the
+ * router's own resolution (routeInbound / deliverToAgent in src/router.ts) for the one agent. None
+ * when the chat, the wiring or the session does not exist yet; the first turn then creates it.
+ */
+export async function findCallSession(
+  route: Omit<InboundEvent, 'message'>,
+  agentGroupId: string,
+): Promise<Session | undefined> {
+  const mg = await getMessagingGroupByPlatform(
+    route.channelType,
+    route.platformId,
+    route.instance ?? route.channelType,
+  );
+  if (!mg) return undefined;
+  const wiring = await getMessagingGroupAgentByPair(mg.id, agentGroupId);
+  if (!wiring) return undefined;
+  const threadsEnabled = wiringThreadsEnabled(wiring, mg);
+  const threadId = threadsEnabled ? route.threadId : null;
+  const mode =
+    threadsEnabled && wiring.session_mode !== 'agent-shared' && mg.is_group !== 0 ? 'per-thread' : wiring.session_mode;
+  if (mode === 'agent-shared') return findSessionByAgentGroup(agentGroupId);
+  return findSessionForAgent(agentGroupId, mg.id, mode === 'shared' ? null : threadId);
+}
+
+/** The voice adapter, plus the call URL of a link token for the `/voice` command. */
+export interface VoiceModeChannelAdapter extends ChannelAdapter {
+  /** The call page URL for a link token. */
+  callUrl(token: string): string;
+  /** `/voice` in a chat, with this adapter's call URLs and the chat's own private reply (voice-mode-command.ts). */
+  handleVoiceCommand(event: InboundEvent, privateReply?: PrivateReply): Promise<boolean>;
+  /** `/meet`'s meetings (voice-mode-meet.ts); null when no Recall client is configured. */
+  readonly meetings: Meetings | null;
+}
+
+export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChannelAdapter {
+  const lineForToken =
+    config.lineForToken ??
+    (async (token: string) => {
+      const line = await findVoiceModeLineByToken(token);
+      if (!line) return null;
+      const key = line.link_sealed === null ? encryptionKey() : null;
+      // Seals a link minted before links were stored, so /voice can show it again; never blocks the call.
+      if (key) await sealVoiceModeLink(line, token, key).catch(() => log.warn('voice-mode: link sealing failed'));
+      return linePlatformId(line.line_id);
+    });
+  const callUrl = (token: string): string =>
+    `${config.publicUrl.replace(/\/+$/, '')}/voice?t=${encodeURIComponent(token)}`;
+  const proxyPolicy: VoiceModeProxyPolicy = {
+    trustedProxies: parseCidrs(config.trustedProxyCidrs, 'VOICE_MODE_TRUSTED_PROXY_CIDRS'),
+    allowedClients: parseCidrs(config.allowedClientCidrs, 'VOICE_MODE_ALLOWED_CLIENT_CIDRS'),
+  };
+  const resolveLine =
+    config.resolveLine ??
+    ((platformId: string, options?: ResolveLineOptions) =>
+      resolveVoiceModeLine(platformId, { vocabulary: config.vocabulary, ...options }));
+  const now = config.now ?? (() => Date.now());
+  const expediteReplies =
+    config.expediteReplies ?? ((session: Session) => expediteDelivery(session, CALL_REPLY_EXPEDITE_MS));
+  const findSession = config.prewarm?.findSession ?? findCallSession;
+  const wakeSession = config.prewarm?.wake ?? ((session: Session) => requestWake(session, 'voice-call'));
+  const maxCallDurationMs = config.maxCallDurationMs ?? 15 * 60_000;
+  const maxCallsPerHour = config.maxCallsPerHour ?? 12;
+  const maxCallMsPerDay = config.maxCallMsPerDay ?? 120 * MINUTE_MS;
+  const accessCheckIntervalMs = config.accessCheckIntervalMs ?? ACCESS_CHECK_INTERVAL_MS;
+  for (const [name, value] of Object.entries({ maxCallDurationMs, maxCallsPerHour })) {
+    if (!Number.isSafeInteger(value) || value <= 0 || value > 2_147_483_647) {
+      throw new Error(`voice-mode: ${name} must be a positive bounded integer`);
+    }
+  }
+  if (!Number.isSafeInteger(maxCallMsPerDay) || maxCallMsPerDay <= 0) {
+    throw new Error('voice-mode: maxCallMsPerDay must be a positive integer');
+  }
+  const starts = new Map<string, number[]>();
+  let setup: ChannelSetup | null = null;
+  let connected = false;
+  let pageServer: http.Server | undefined;
+  /** Call time already used per line, for the UTC day (epoch day number) it was used on. */
+  const usage = new Map<string, { day: number; usedMs: number }>();
+  const utcDay = (t: number): number => Math.floor(t / DAY_MS);
+  /** Time a call has run today; a call that started before midnight counts from midnight. */
+  const elapsedTodayMs = (call: { startedAt: number }, t: number): number =>
+    Math.max(0, t - Math.max(call.startedAt, utcDay(t) * DAY_MS));
+
+  /** Today's call time on a line, including the call still running on it. */
+  const usedTodayMs = (platformId: string, t: number): number => {
+    const used = usage.get(platformId);
+    const active = livekit.activeCall(platformId);
+    return (used?.day === utcDay(t) ? used.usedMs : 0) + (active ? elapsedTodayMs(active, t) : 0);
+  };
+
+  /** Hourly start cap and daily minutes. Records the start when admitted. */
+  const admitStart = (platformId: string, t: number): { body: string; retryAfter: string } | null => {
+    const recent = (starts.get(platformId) ?? []).filter((at) => at > t - HOUR_MS);
+    if (recent.length >= maxCallsPerHour) {
+      return {
+        body: 'This voice line has reached its hourly call limit. Try again later.',
+        retryAfter: String(Math.max(1, Math.ceil((recent[0] + HOUR_MS - t) / 1000))),
+      };
+    }
+    if (usedTodayMs(platformId, t) >= maxCallMsPerDay) {
+      return {
+        body: 'This voice line has used its call minutes for today. Try again tomorrow.',
+        retryAfter: String(Math.max(1, Math.ceil((DAY_MS - (t % DAY_MS)) / 1000))),
+      };
+    }
+    starts.set(platformId, [...recent, t]);
+    return null;
+  };
+
+  /** Add an ended call's time today to the line's counter. */
+  const chargeUsage = (call: { platformId: string; startedAt: number }): void => {
+    const t = now();
+    const day = utcDay(t);
+    const used = usage.get(call.platformId);
+    usage.set(call.platformId, { day, usedMs: (used?.day === day ? used.usedMs : 0) + elapsedTodayMs(call, t) });
+  };
+
+  /**
+   * The caller is in: start the agent the first turn goes to, so that turn meets a running agent.
+   * Nothing reaches the chat. A long silent call is reaped as idle like any session; its next turn
+   * wakes the agent again.
+   */
+  const prewarmCall = async (
+    callId: string,
+    route: Omit<InboundEvent, 'message'>,
+    agentGroupId: string,
+    live: () => boolean,
+  ) => {
+    const session = await findSession(route, agentGroupId);
+    if (!session || !live()) return;
+    if (await wakeSession(session))
+      log.info('livekit-voice-mode: agent running for the call', { callId, sessionId: session.id });
+  };
+
+  const livekit = createLiveKitVoice(config.livekit, {
+    // Deferred: resolveCallLine needs the catalog, declared below.
+    resolveLine: (platformId, options) => resolveCallLine(platformId, options),
+    admitStart,
+    remainingTodayMs: (platformId, t) => maxCallMsPerDay - usedTodayMs(platformId, t),
+    chargeUsage,
+    routeTurn: async (event, turn) => {
+      if (!setup) throw new Error('the voice-mode channel is not running');
+      const routed = { ...event, onStored: expediteReplies };
+      try {
+        return await (config.routeTurn ? config.routeTurn(routed) : routeVoiceModeTurn(routed, turn));
+      } catch (err) {
+        log.error('livekit-voice-mode: routing a turn failed', { platformId: event.platformId, err });
+        throw err;
+      }
+    },
+    callJoined: (callId, route, agentGroupId, live) => {
+      prewarmCall(callId, route, agentGroupId, live).catch((err: unknown) =>
+        log.warn('livekit-voice-mode: could not start the agent for the call', { callId, err }),
+      );
+    },
+    isRunning: () => connected && !!setup,
+    now,
+    accessCheckIntervalMs,
+  });
+  const meetings: Meetings | null = config.meetBridge
+    ? createMeetings(livekit, config.meetBridge, { judgeJev: config.judgeJev, now })
+    : null;
+  const callPage = createCallPage(livekit, { livekit: config.livekit, maxCallDurationMs, ui: config.ui, lineForToken });
+
+  const replyJson = (res: http.ServerResponse, status: number, body: unknown): void =>
+    reply(res, status, JSON.stringify(body), JSON_HEADERS);
+
+  const providerKeys = config.providerKeys ?? {};
+  const catalog = config.catalog ?? createVoiceCatalog({ keys: providerKeys });
+
+  const describe = (choice: TtsChoice) => catalog.details(choice);
+  /** What a call speaks a choice with: the backup voice for one its provider certainly does not have, never on a doubt. */
+  const speakable = (choice: TtsChoice): TtsChoice =>
+    catalog.known(choice.provider, choice.voice) === 'unavailable' ? TTS_DEFAULT_CHOICE : choice;
+  /** The calls' line: its choice as speakable takes it, so the worker speaks what `/voice/tts` shows as effective. */
+  const resolveCallLine = async (platformId: string, options?: ResolveLineOptions) => {
+    const line = await resolveLine(platformId, options);
+    return line?.tts && options?.forCall ? { ...line, tts: speakable(line.tts) } : line;
+  };
+
+  /** What `/voice/tts` answers: the line's saved choice, what it speaks with, every provider, and their names. */
+  const ttsView = async (saved: TtsSaved) => {
+    const readable = effectiveTts(saved);
+    const providers = Object.values(TTS_REGISTRY);
+    // A row from before every write stored a whole choice reads its missing fields as it speaks them.
+    const [savedDetails, readableDetails, ...defaultDetails] = await Promise.all([
+      describe({
+        provider: saved.provider ?? readable.provider,
+        model: saved.model ?? readable.model,
+        voice: saved.voice ?? readable.voice,
+      }),
+      describe(readable),
+      ...providers.map((entry) => describe({ provider: entry.id, ...entry.defaults })),
+    ]);
+    const effective = speakable(readable);
+    // The backup voice is Gemini's default, already described.
+    const effectiveDetails =
+      effective === readable
+        ? readableDetails
+        : defaultDetails[providers.findIndex((e) => e.id === effective.provider)];
+    return {
+      effective,
+      saved,
+      details: { saved: savedDetails, effective: effectiveDetails },
+      providers: providers.map((entry, i) => ({
+        id: entry.id,
+        name: entry.name,
+        available: Boolean(providerKeys[entry.id]),
+        models: [...entry.models],
+        modelNames: { ...entry.modelNames },
+        default: { ...entry.defaults },
+        defaultDetails: defaultDetails[i],
+      })),
+    };
+  };
+
+  /** `GET` the line's voice; `PATCH` saves it for the line's next calls (a running call keeps its own). */
+  const handleTts = async (req: http.IncomingMessage, res: http.ServerResponse, token: string): Promise<void> => {
+    if (req.method !== 'GET' && req.method !== 'PATCH') return reply(res, 405, 'GET or PATCH only');
+    const platformId = await lineForToken(token);
+    if (!platformId) return reply(res, 403, 'Unknown call link');
+    const lineId = lineIdOf(platformId);
+    const row = lineId ? await getVoiceModeLine(lineId) : undefined;
+    if (!lineId || !row) return reply(res, 403, 'Unknown call link');
+    // The voice takes what a call takes: the line's caller, still an owner or admin of its agent. Reading
+    // it too, since its names are asked of the providers on the host's keys.
+    if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
+    if (req.method === 'GET') return replyJson(res, 200, await ttsView(savedTts(row)));
+    const body = await readJsonObject(req, MAX_TTS_BODY_BYTES);
+    if (!body) return replyJson(res, 400, { error: 'bad_request' });
+    let choice = LINE_DEFAULT_CHOICE;
+    if ('reset' in body) {
+      if (body.reset !== true || Object.keys(body).length !== 1) return replyJson(res, 400, { error: 'bad_request' });
+    } else {
+      const read = readTtsChoice(body);
+      if ('invalid' in read) return replyJson(res, 400, { error: 'invalid', field: read.invalid });
+      const { provider, voice } = read.choice;
+      if (!providerKeys[provider]) return replyJson(res, 503, { error: 'provider_unavailable', provider });
+      // Only a voice the provider says it does not have is refused; one it could not be asked about in time saves.
+      const found = await settleWithin(
+        catalog.lookup(provider, voice, { confirm: true }),
+        config.saveLookupBudgetMs ?? SAVE_LOOKUP_BUDGET_MS,
+        { status: 'lookup_failed' } as const,
+      );
+      if (found.status === 'unavailable') return replyJson(res, 400, { error: 'invalid', field: 'voice' });
+      choice = read.choice;
+    }
+    // The body and the lookup can take their time: the caller must still be one, and the save below only
+    // takes the link it started with.
+    if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
+    const updated = await setVoiceModeLineTts(lineId, choice, row);
+    if (!updated) return reply(res, 403, 'Unknown call link');
+    log.info('voice-mode: line voice saved', { platformId, tts: choice, ...('reset' in body ? { reset: true } : {}) });
+    return replyJson(res, 200, await ttsView(savedTts(updated)));
+  };
+
+  /** One page of a provider's voices, filtered by `q`, `language` and `gender`. */
+  const handleVoices = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    url: URL,
+    token: string,
+  ): Promise<void> => {
+    if (req.method !== 'GET') return reply(res, 405, 'GET only');
+    const platformId = await lineForToken(token);
+    if (!platformId) return reply(res, 403, 'Unknown call link');
+    // The listing spends the host's provider key: only a caller who may still call gets it.
+    if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
+    const params = url.searchParams;
+    const provider = params.get('provider');
+    const rawLimit = params.get('limit') ?? String(MAX_CATALOG_LIMIT);
+    const limit = Number(rawLimit);
+    const [q, language, rawGender, cursor] = ['q', 'language', 'gender', 'cursor'].map(
+      (key) => params.get(key) || undefined,
+    );
+    const gender = rawGender?.toLowerCase();
+    if (
+      !isTtsProvider(provider) ||
+      !/^\d{1,3}$/.test(rawLimit) ||
+      limit < 1 ||
+      limit > MAX_CATALOG_LIMIT ||
+      [q, language, rawGender, cursor].some((v) => v !== undefined && v.length > MAX_CATALOG_PARAM_CHARS) ||
+      (gender !== undefined && !CATALOG_GENDERS.has(gender))
+    ) {
+      return replyJson(res, 400, { error: 'bad_request' });
+    }
+    if (!providerKeys[provider]) return replyJson(res, 503, { error: 'provider_unavailable', provider });
+    const result = await catalog.page(provider, { q, language, gender, cursor, limit });
+    if ('error' in result) return replyJson(res, result.error === 'upstream' ? 502 : 400, { error: result.error });
+    return replyJson(res, 200, result.page);
+  };
+
+  /** The worker's HTTP routes under /webhook/voice-mode/ and the browser's under /voice/, on the shared webhook server. */
+  const handleHttp = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      return reply(res, 400, 'Bad request');
+    }
+    // Dot segments (`/voice/../webhook/...`, `%2e%2e`) would route on a path the listener never checked.
+    if (url.pathname !== (req.url ?? '/').split('?')[0]) return reply(res, 400, 'Bad request');
+    const parsed = voiceRoute(url.pathname);
+    const token = url.searchParams.get('t') ?? '';
+    // The worker calls from the same host; a forwarded request came through a front from elsewhere.
+    if (parsed !== null && isWorkerRoute(parsed) && (req.headers['x-forwarded-for'] || req.headers.forwarded)) {
+      return reply(res, 403, 'Voice worker routes are not served through a proxy');
+    }
+    // Before any token check: a link must not be usable, or probed, from the LAN over plain HTTP.
+    const peer = req.socket.remoteAddress;
+    if (!config.allowNonLoopback) {
+      const browserRoute = parsed !== null && !isWorkerRoute(parsed);
+      if (
+        browserRoute
+          ? !admitsVoiceModePeer(proxyPolicy, peer, req.headers['x-forwarded-for'])
+          : !isLoopbackAddress(peer)
+      ) {
+        if (proxyPolicy.trustedProxies.has(peer)) {
+          log.warn('voice-mode: refused a proxied voice request', {
+            peer,
+            forwardedFor: req.headers['x-forwarded-for'],
+          });
+        }
+        return reply(res, 403, 'Voice calls are served through the host front only');
+      }
+    }
+    if (parsed === null) return reply(res, 404, 'Not found');
+    const route = parsed;
+    try {
+      // The shared webhook server has no unregister; after teardown the routes stay reachable
+      // and must refuse rather than start calls for a channel that is no longer running.
+      if (!connected || !setup) return reply(res, 503, 'Voice is not running');
+      if (route.startsWith('livekit/agent/')) return await livekit.handleAgentHttp(req, res, route, url);
+      if (route === 'livekit' || route.startsWith('livekit/')) return await callPage.handle(req, res, route, url);
+      if (route === 'info') {
+        // Who answers this line, so the page can greet by name before the call.
+        if (req.method !== 'GET') return reply(res, 405, 'GET only');
+        const platformId = await lineForToken(token);
+        if (!platformId) return reply(res, 403, 'Unknown call link');
+        const line = await resolveLine(platformId);
+        if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
+        const info = {
+          protocol: LIVEKIT_PROTOCOL_VERSION,
+          agent: line.agent.name,
+          caller: line.caller.name,
+          wakePhrase: config.wakePhrase,
+        };
+        return replyJson(res, 200, info);
+      }
+      if (route === 'tts') return await handleTts(req, res, token);
+      if (route === 'voices') return await handleVoices(req, res, url, token);
+      reply(res, 404, 'Not found');
+    } catch (err) {
+      // The shared webhook server has no other way to answer the browser.
+      log.error('voice-mode: http route failed', { route, err });
+      if (!res.headersSent) reply(res, 500, 'voice error');
+      else res.end();
+    }
+  };
+
+  return {
+    name: VOICE_MODE_CHANNEL,
+    channelType: VOICE_MODE_CHANNEL,
+    supportsThreads: false,
+
+    callUrl,
+    handleVoiceCommand: (event: InboundEvent, privateReply?: PrivateReply): Promise<boolean> =>
+      handleVoiceCommand(event, callUrl, privateReply),
+    meetings,
+
+    async setup(cfg: ChannelSetup): Promise<void> {
+      setup = cfg;
+      catalog.warm();
+      // Says at startup, not at the first /voice, when link storage is off (no or a malformed key).
+      encryptionKey();
+      registerWebhookHandler(VOICE_MODE_CHANNEL, handleHttp);
+      registerRootHandler('voice', handleHttp);
+      if (config.pagePort !== undefined) {
+        const server = http.createServer((req, res) => {
+          let pathname: string;
+          try {
+            pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+          } catch {
+            // A request line like `GET //` is not a parsable URL.
+            return reply(res, 400, 'Bad request');
+          }
+          if (!CLEAN_PREFIX.test(pathname)) return reply(res, 404, 'Not found');
+          handleHttp(req, res).catch((err: unknown) => {
+            log.error('voice-mode: page request failed', { err });
+            if (!res.headersSent) reply(res, 500, 'voice error');
+            else res.end();
+          });
+        });
+        const address = `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}`;
+        try {
+          await new Promise<void>((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(config.pagePort, config.pageHost ?? DEFAULT_PAGE_HOST, () => {
+              server.off('error', reject);
+              resolve();
+            });
+          });
+          server.on('error', (err) => log.error('voice-mode: page listener error', { address, err }));
+          pageServer = server;
+        } catch (err) {
+          if (config.pagePortRequired) throw err;
+          // The webhook port still serves the page; a default port that is taken must not take the channel down.
+          log.error('voice-mode: the page listener could not bind; serving the page on the webhook port only', {
+            address,
+            err,
+          });
+        }
+      }
+      connected = true;
+      log.info('voice-mode: ready', {
+        callUrl: `${callUrl('')}<link token>`,
+        trustedProxies: config.trustedProxyCidrs?.trim() || 'none',
+        livekit: config.livekit.url,
+        protocol: LIVEKIT_PROTOCOL_VERSION,
+        agentName: config.livekit.agentName || DEFAULT_LIVEKIT_AGENT_NAME,
+        speechProviders: Object.keys(providerKeys),
+        meetings: meetings ? 'on' : 'off',
+        pageListener: pageServer ? `${config.pageHost ?? DEFAULT_PAGE_HOST}:${config.pagePort}` : 'off',
+      });
+    },
+
+    async teardown(): Promise<void> {
+      connected = false;
+      catalog.close();
+      const server = pageServer;
+      pageServer = undefined;
+      try {
+        await livekit.teardown();
+      } finally {
+        if (server) {
+          // A half-sent request would otherwise hold close() open until the headers timeout.
+          server.closeAllConnections();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        setup = null;
+      }
+    },
+
+    isConnected(): boolean {
+      return connected;
+    },
+
+    async deliver(): Promise<string | undefined> {
+      // A line never takes inbound, so nothing is addressed to it: a call speaks what reaches its chat.
+      throw new Error('voice-mode: a voice line takes no messages; its calls talk in a chat');
+    },
+  };
+}
+
+const UI_CONFIG_KEYS = [
+  'skin',
+  'colorway',
+  'layout',
+  'presence',
+  'brand',
+  'footer',
+  'shortcuts',
+  'timestamps',
+  'colorwayPicker',
+] as const;
+
+/** VOICE_MODE_UI is a JSON object; anything unparsable falls back to the page defaults with a warning. */
+export function parseUiConfig(raw: string | undefined): VoiceModeUiConfig | undefined {
+  if (!raw || !raw.trim()) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      // Only the documented keys travel to the page; the page validates values.
+      const src = parsed as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const key of UI_CONFIG_KEYS) if (key in src) out[key] = src[key];
+      return out as VoiceModeUiConfig;
+    }
+    log.warn('voice-mode: VOICE_MODE_UI must be a JSON object; using the default look');
+  } catch (err) {
+    log.warn('voice-mode: VOICE_MODE_UI is not valid JSON; using the default look', { err });
+  }
+  return undefined;
+}
+
+const DEFAULT_PAGE_PORT = 3100;
+const DEFAULT_PAGE_HOST = '127.0.0.1';
+
+/**
+ * VOICE_MODE_PORT and VOICE_MODE_PAGE_HOST: where the separate page listener binds, by default
+ * 127.0.0.1:3100. `0` or `off` turns it off, for installs whose front already forwards /voice to the
+ * host's webhook port. An unusable port falls back to the default with a warning. `explicit`: the
+ * port was set, so a failed bind fails setup; the default is skipped instead.
+ */
+export function pageListener(
+  rawPort: string | undefined,
+  rawHost: string | undefined,
+): { port: number; host: string; explicit: boolean } | null {
+  const value = rawPort?.trim().toLowerCase();
+  if (value === '0' || value === 'off') return null;
+  const host = rawHost?.trim() || DEFAULT_PAGE_HOST;
+  if (!value) return { port: DEFAULT_PAGE_PORT, host, explicit: false };
+  const port = Number(value);
+  if (Number.isInteger(port) && port > 0 && port < 65_536) return { port, host, explicit: true };
+  log.warn(`voice-mode: VOICE_MODE_PORT must be a port number, 0 or off; using ${DEFAULT_PAGE_PORT}`);
+  return { port: DEFAULT_PAGE_PORT, host, explicit: false };
+}
+
+/** VOICE_MODE_SILENCE_MS: how long the caller is silent before their turn ends; nonsense falls back to the default. */
+function parseSilenceMs(raw: string | undefined): number | undefined {
+  if (!raw?.trim()) return undefined;
+  const ms = Number(raw);
+  if (Number.isInteger(ms) && ms >= 300 && ms <= 30_000) return ms;
+  log.warn('voice-mode: VOICE_MODE_SILENCE_MS must be whole milliseconds between 300 and 30000; using the default');
+  return undefined;
+}
+
+/**
+ * The settings a call cannot run without, beyond the link token. The worker speaks with the Gemini key (the
+ * default provider and the transcription); the host checks it is there and offers the voices it lists.
+ */
+const LIVEKIT_REQUIRED = ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'VOICE_MODE_GEMINI_API_KEY'] as const;
+
+registerChannelAdapter(VOICE_MODE_CHANNEL, {
+  factory: () => {
+    const env = readEnvFile([
+      'VOICE_MODE_PUBLIC_URL',
+      'VOICE_MODE_PORT',
+      'VOICE_MODE_PAGE_HOST',
+      'VOICE_MODE_LANGUAGES',
+      'VOICE_MODE_UI',
+      'VOICE_MODE_MAX_CALL_SECONDS',
+      'VOICE_MODE_MAX_CALLS_PER_HOUR',
+      'VOICE_MODE_MAX_MINUTES_PER_DAY',
+      'VOICE_MODE_ALLOW_NON_LOOPBACK',
+      'VOICE_MODE_TRUSTED_PROXY_CIDRS',
+      'VOICE_MODE_ALLOWED_CLIENT_CIDRS',
+      'VOICE_MODE_VOCABULARY',
+      ...LIVEKIT_REQUIRED,
+      'VOICE_MODE_ELEVENLABS_API_KEY',
+      'LIVEKIT_WORKER_URL',
+      'LIVEKIT_AGENT_NAME',
+      'VOICE_MODE_STT_MODEL',
+      'VOICE_MODE_SILENCE_MS',
+      'VOICE_MODE_WAKE_MODEL',
+      'VOICE_MODE_WAKE_PHRASE',
+      ...RECALL_MEET_ENV_KEYS,
+    ]);
+    const missing = LIVEKIT_REQUIRED.filter((key) => !env[key]);
+    if (missing.length > 0) {
+      log.warn('voice-mode: LiveKit is not configured; the channel stays offline', { missing });
+      return null;
+    }
+    const page = pageListener(env.VOICE_MODE_PORT, env.VOICE_MODE_PAGE_HOST);
+    let meetBridge: RecallMeetBridge | undefined;
+    try {
+      const recall = recallMeetConfigFromEnv(env, { apiKey: env.LIVEKIT_API_KEY, apiSecret: env.LIVEKIT_API_SECRET });
+      meetBridge = recall ? createRecallMeetBridge(recall) : undefined;
+    } catch (err) {
+      // Bad Recall settings leave /meet off rather than stopping the voice channel from starting.
+      log.warn('voice-mode: Recall is not configured right; /meet is off', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return createVoiceModeAdapter({
+      pagePort: page?.port,
+      pageHost: page?.host,
+      pagePortRequired: page?.explicit,
+      publicUrl: (env.VOICE_MODE_PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, ''),
+      ui: parseUiConfig(env.VOICE_MODE_UI),
+      wakePhrase: wakePhrase(env),
+      allowNonLoopback: env.VOICE_MODE_ALLOW_NON_LOOPBACK === '1',
+      trustedProxyCidrs: env.VOICE_MODE_TRUSTED_PROXY_CIDRS,
+      allowedClientCidrs: env.VOICE_MODE_ALLOWED_CLIENT_CIDRS,
+      maxCallDurationMs: Number(env.VOICE_MODE_MAX_CALL_SECONDS ?? 900) * 1000,
+      maxCallsPerHour: Number(env.VOICE_MODE_MAX_CALLS_PER_HOUR ?? 12),
+      maxCallMsPerDay: Number(env.VOICE_MODE_MAX_MINUTES_PER_DAY ?? 120) * 60_000,
+      vocabulary: env.VOICE_MODE_VOCABULARY,
+      providerKeys: providerKeysFrom(env),
+      meetBridge,
+      livekit: {
+        url: env.LIVEKIT_URL,
+        languages: parseVoiceLanguages(env.VOICE_MODE_LANGUAGES),
+        serverUrl: env.LIVEKIT_WORKER_URL,
+        apiKey: env.LIVEKIT_API_KEY,
+        apiSecret: env.LIVEKIT_API_SECRET,
+        agentName: env.LIVEKIT_AGENT_NAME,
+        speech: {
+          sttModel: env.VOICE_MODE_STT_MODEL,
+          silenceMs: parseSilenceMs(env.VOICE_MODE_SILENCE_MS),
+        },
+      },
+    });
+  },
+});
+
+// Call formatting reaches only agents that take calls: those with a voice_mode_lines row.
+registerResidentSkillGate(
+  'voice-mode-formatting',
+  async (group) => (await getVoiceModeLineForAgent(group.id)) !== undefined,
+);

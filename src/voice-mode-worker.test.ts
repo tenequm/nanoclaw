@@ -1,0 +1,6611 @@
+/**
+ * The voice call worker: the turn-taking rules (turn order, reply gating, thinking, failure
+ * lines) against fake host and voice, the call's turn state machine (CallTurns) against a fake
+ * transcription, review mode, the speech output against fake speech models, the text helpers, and
+ * runCall end to end with a fake room. LiveKit, Silero and Gemini themselves are not loaded here.
+ */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { getEventListeners } from 'node:events';
+import { fileURLToPath } from 'node:url';
+
+import { AgentServer, InferenceRunner, initializeLogger, ServerOptions, VADEventType } from '@livekit/agents';
+import { AudioFrame, AudioResampler, DisconnectReason } from '@livekit/rtc-node';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  CALL_COMMAND_WORDS,
+  LIVEKIT_PROTOCOL_VERSION,
+  liveKitCallSecret,
+  liveKitHostUrl,
+  type CallReviewState,
+  type CallVoiceState,
+  type CallWakeState,
+  type LiveKitJobMetadata,
+  type ReviewOp,
+  type ReviewRequest,
+} from './channels/voice-mode-protocol.js';
+import type { Heard } from './voice-mode-gemini-live.js';
+import type { ChoiceDetails } from './channels/voice-mode-tts-catalog.js';
+import type { TtsAudio, TtsChoice, TtsInstance } from './voice-mode-tts.js';
+import {
+  AWAIT_REPLY_MS,
+  AudioRing,
+  CALLER_REJOIN_MS,
+  callerRejoinWaitMs,
+  callLanguages,
+  type CallRecord,
+  CallRecording,
+  CallTurns,
+  DISCARD_SETTLE_MS,
+  SPEECH_FLOOR_MS,
+  COMMAND_VOCABULARY,
+  COMMAND_WORDS_JSON,
+  captionMark,
+  type CaptionMark,
+  envSwitch,
+  FAILURE_LINES,
+  HostLink,
+  hostLossReason,
+  languageOf,
+  LineSpeech,
+  lineResampler,
+  MAX_IDLE_WAIT_MS,
+  pathSegment,
+  pruneRecordings,
+  readJobHeader,
+  recordingDays,
+  runCall,
+  SendCountdown,
+  skipLocalTurnDetectorProcess,
+  speakableText,
+  TTS_RECOVERY_DELAY_MS,
+  TURN_SETTLE_MS,
+  TurnCapture,
+  TurnTaking,
+  turnText,
+  CueFeed,
+  cueFrames,
+  deEsser,
+  lineFilter,
+  whistleNotch,
+  WHISTLE_NOTCHES,
+  TTS_SAMPLE_RATE,
+  matchCommand,
+  matchWake,
+  meetingWake,
+  wakeWordSettings,
+  awakeLimits,
+  endsLike,
+  Outbox,
+  loadTypingSound,
+  CallTelemetry,
+  CallerInput,
+  LineMeter,
+  TURN_EVENT_WAIT_MS,
+  type TurnFacts,
+  type VadStream,
+  type WakeWord,
+  type WakeWordEvents,
+  TURN_CUE_DELAY_MS,
+  wakeNameWords,
+  type CueKind,
+  readReviewRequest,
+  ReviewControl,
+  type Recording,
+  type ReviewDeps,
+  speechOutput,
+  voiceAttribute,
+  VOICE_NAMES_WAIT_MS,
+  type Transcription,
+  writeTurnRecording,
+  workerEnv,
+  type CallJob,
+  type CallVoice,
+  type CallVoiceEvents,
+  type TurnAudio,
+  type TurnRecord,
+  type VoiceModeSettings,
+  type SendResult,
+  type TurnTakingDeps,
+} from './voice-mode-worker.js';
+
+initializeLogger({ pretty: false, level: 'error' });
+
+const flush = () => new Promise((r) => setTimeout(r, 5));
+const SILENCE = 2500;
+const silentLog = { info: () => undefined, warn: () => undefined };
+const echoLog = 'voice-mode worker: a lone command with no speech is an echo; ignored';
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe('worker settings', () => {
+  it('reads VOICE_MODE_* names only', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-mode-worker-env-'));
+    try {
+      fs.writeFileSync(path.join(root, '.env'), 'GEMINI_API_KEY=gk-old\nVOICE_MODE_ELEVENLABS_API_KEY=el-new\n');
+      const env = workerEnv(['VOICE_MODE_GEMINI_API_KEY', 'VOICE_MODE_ELEVENLABS_API_KEY'], root);
+      expect(env.VOICE_MODE_GEMINI_API_KEY).toBeUndefined();
+      expect(env.VOICE_MODE_ELEVENLABS_API_KEY).toBe('el-new');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('speakable text', () => {
+  it('strips markdown, links, URLs, code and markup to sentences', () => {
+    const md = [
+      '# Plan',
+      'Here is **the plan** for _today_:',
+      '- Call [Anna](https://t.me/anna) at ten',
+      '1. Check https://example.com/x?y=1 later',
+      '```ts',
+      'const x = 1;',
+      '```',
+      'Use `ncl` then <b>rest</b>.',
+      '| a | b |',
+      '|---|---|',
+      '> quoted line',
+      '---',
+      'snake_case_name stays.',
+    ].join('\n');
+    expect(speakableText(md)).toBe(
+      'Plan. Here is the plan for today: Call Anna at ten. Check later. Use ncl then rest. a, b. quoted line. snake_case_name stays.',
+    );
+  });
+
+  it('keeps comparisons, decimals and abbreviations as written', () => {
+    expect(speakableText('Version 2.4 costs 3.50 dollars, e.g. cheap. If x < 5 and y > 3 then ok.')).toBe(
+      'Version 2.4 costs 3.50 dollars, e.g. cheap. If x < 5 and y > 3 then ok.',
+    );
+    expect(speakableText('Use <code class="x">this</code> or <br/> that')).toBe('Use this or that.');
+  });
+});
+
+describe('helpers', () => {
+  it('names why the host did not take a turn', () => {
+    expect(hostLossReason({ accepted: false, status: 429 })).toBe('rate_limited');
+    expect(hostLossReason({ accepted: false, status: 409 })).toBe('rejected');
+    expect(hostLossReason({ accepted: false, status: 422 })).toBe('rejected');
+    expect(hostLossReason({ accepted: false, status: 500 })).toBe('rejected');
+    expect(hostLossReason({ accepted: false, status: 504 })).toBe('timeout');
+    expect(hostLossReason({ accepted: false, error: 'The operation was aborted due to timeout' })).toBe('timeout');
+  });
+
+  it('de-esses the agent speech: flat through the voice band, about 6 dB off a lone sibilant, and off is a passthrough', () => {
+    const rate = TTS_SAMPLE_RATE;
+    const frame = rate / 50;
+    /** One second of tones (Hz to linear amplitude), through one line's filter in 20 ms frames. */
+    const run = (tones: Array<[number, number]>, filter = deEsser({ sampleRate: rate })) => {
+      const input = new Int16Array(rate);
+      for (let i = 0; i < input.length; i++) {
+        input[i] = Math.round(
+          tones.reduce((sum, [hz, amp]) => sum + amp * Math.sin((2 * Math.PI * hz * i) / rate), 0) * 32767,
+        );
+      }
+      const output = new Int16Array(input.length);
+      for (let at = 0; at < input.length; at += frame) output.set(filter(input.subarray(at, at + frame)), at);
+      return { input, output };
+    };
+    // The level after the first 200 ms (the filters and the detector settled), in dB against the input's.
+    const gainDb = ({ input, output }: { input: Int16Array; output: Int16Array }) => {
+      const rms = (pcm: Int16Array) => {
+        let sum = 0;
+        for (let i = rate / 5; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+        return Math.sqrt(sum / (pcm.length - rate / 5));
+      };
+      return 20 * Math.log10(rms(output) / rms(input));
+    };
+    for (const hz of [300, 2_000, 4_500]) expect(Math.abs(gainDb(run([[hz, 0.5]])))).toBeLessThan(0.1);
+    // The band is cut by the full 6 dB; what the low band still passes there (LR4) leaves -5.1 dB at
+    // 6.5 kHz, -5.8 dB at 8 kHz.
+    for (const hz of [6_500, 7_200, 8_000]) {
+      const db = gainDb(run([[hz, 0.5]]));
+      expect(db).toBeLessThan(-5);
+      expect(db).toBeGreaterThan(-6.1);
+    }
+    // A voice's body with quieter hiss over it is left alone: once the tones are in (the hiss's first
+    // millisecond outruns the body's envelope), what the crossover alone gives, to the last bit.
+    const voiced = run([
+      [300, 0.5],
+      [6_500, 0.1],
+    ]);
+    const uncut = run(
+      [
+        [300, 0.5],
+        [6_500, 0.1],
+      ],
+      deEsser({ sampleRate: rate, maxDb: 0 }),
+    );
+    let most = 0;
+    for (let i = rate / 2; i < rate; i++) most = Math.max(most, Math.abs(voiced.output[i] - uncut.output[i]));
+    expect(most).toBeLessThanOrEqual(1);
+    // Off, the line goes out exactly as synthesized.
+    const off = run([[7_000, 0.5]], lineFilter({ deess: false, notch: false }));
+    expect(off.output).toEqual(off.input);
+    expect(envSwitch(undefined)).toBe(true);
+    expect(envSwitch('1')).toBe(true);
+    for (const raw of ['0', 'off', ' OFF ', 'false']) expect(envSwitch(raw)).toBe(false);
+
+    // The whistle notches: the model's loud whistle tones go, the voice stays.
+    const notch = () => whistleNotch(rate);
+    for (const [hz] of WHISTLE_NOTCHES.slice(0, 3)) expect(gainDb(run([[hz, 0.5]], notch()))).toBeLessThan(-30);
+    for (const [hz] of WHISTLE_NOTCHES.slice(3)) expect(gainDb(run([[hz, 0.5]], notch()))).toBeLessThan(-15);
+    for (const hz of [150, 300, 1_000, 2_000, 3_500, 5_000, 6_000]) {
+      expect(Math.abs(gainDb(run([[hz, 0.5]], notch())))).toBeLessThan(0.1);
+    }
+    // Between the notches a voice's hiss passes nearly whole.
+    for (const hz of [7_700, 8_600, 9_600, 11_500]) expect(gainDb(run([[hz, 0.5]], notch()))).toBeGreaterThan(-2);
+    // Fed in 20 ms frames it is the same filter as over the whole line at once.
+    const whole = run([
+      [300, 0.3],
+      [8_118, 0.3],
+    ]);
+    expect(
+      run(
+        [
+          [300, 0.3],
+          [8_118, 0.3],
+        ],
+        notch(),
+      ).output,
+    ).toEqual(notch()(whole.input));
+  });
+
+  it('reads the language of a transcript from its script', () => {
+    expect(languageOf('Привіт, як справи?', true)).toBe('uk');
+    expect(languageOf('Привіт, як справи?', false)).toBe('en');
+    expect(languageOf('check the grafana logs', true)).toBe('en');
+    expect(languageOf('1, 2, 3', true)).toBeUndefined();
+  });
+
+  it('starts the worker lines in the first configured language and hears Ukrainian only when it is configured', () => {
+    expect(callLanguages(['uk-UA', 'en-US'])).toEqual({ codes: ['uk-UA', 'en-US'], initial: 'uk', ukrainian: true });
+    expect(callLanguages(['en-US'])).toEqual({ codes: ['en-US'], initial: 'en', ukrainian: false });
+    expect(callLanguages(['en-GB', 'uk'])).toEqual({ codes: ['en-GB', 'uk'], initial: 'en', ukrainian: true });
+    expect(callLanguages(['de-DE'])).toEqual({ codes: ['de-DE'], initial: 'en', ukrainian: false });
+  });
+});
+
+function fakeTurnTakingDeps(overrides: Partial<TurnTakingDeps> = {}) {
+  const said: string[] = [];
+  const sent: string[] = [];
+  const statuses: boolean[] = [];
+  const deps: TurnTakingDeps = {
+    send: vi.fn(async (text: string) => {
+      sent.push(text);
+      return { accepted: true, id: String(sent.length) };
+    }),
+    say: vi.fn(async (text: string) => {
+      said.push(text);
+      return true;
+    }),
+    setThinking: (thinking) => statuses.push(thinking),
+    log: { info: () => undefined, warn: () => undefined },
+    ...overrides,
+  };
+  return { deps, said, sent, statuses };
+}
+
+describe('TurnTaking', () => {
+  it('sends turns in the order their slots were taken, whenever each is filled; a skip lets the next go', async () => {
+    vi.useFakeTimers();
+    const { deps, sent } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    const a = turnTaking.reserve();
+    const b = turnTaking.reserve();
+    const c = turnTaking.reserve();
+    c.send('third');
+    b.skip();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual([]);
+    a.send('first');
+    // Filled twice: the first fill stands.
+    a.skip();
+    c.send('again');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual(['first', 'third']);
+    vi.useRealTimers();
+  });
+
+  it('after a turn the host did not answer in time, the next waits for its turn-stored, or the end', async () => {
+    vi.useFakeTimers();
+    const { deps, sent } = fakeTurnTakingDeps();
+    deps.send = vi.fn(async (text: string): Promise<SendResult> => {
+      sent.push(text);
+      return text === 'late' ? { accepted: false, turnKey: `key-${text}` } : { accepted: true, id: text };
+    });
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.reserve().send('late');
+    turnTaking.reserve().send('next');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual(['late']);
+    turnTaking.stored('key-other', '1');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual(['late']);
+    turnTaking.stored('key-late', '2');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual(['late', 'next']);
+    // The end lets a waiting turn go too: a slot filled after it still posts.
+    turnTaking.reserve().send('late');
+    const after = turnTaking.reserve();
+    turnTaking.close();
+    after.send('after the end');
+    await turnTaking.sent();
+    expect(sent).toEqual(['late', 'next', 'late', 'after the end']);
+    vi.useRealTimers();
+  });
+
+  it('a turn-stored that outruns its own 504 counts the turn as taken: nothing waits on it, no failure line', async () => {
+    vi.useFakeTimers();
+    const { deps, sent, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'en' });
+    deps.send = vi.fn(async (text: string): Promise<SendResult> => {
+      sent.push(text);
+      if (text !== 'late') return { accepted: true, id: text };
+      // The host's event stream says it stored the turn before its 504 answer is read.
+      turnTaking.stored('key-late', '7');
+      return { accepted: false, status: 504, turnKey: 'key-late' };
+    });
+    const results: SendResult[] = [];
+    turnTaking.reserve().send('late', (result) => results.push(result));
+    turnTaking.reserve().send('next');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual(['late', 'next']);
+    expect(results).toEqual([{ accepted: true, turnKey: 'key-late', id: '7' }]);
+    await turnTaking.idle();
+    expect(said).toEqual([]);
+    vi.useRealTimers();
+  });
+
+  it('sent() waits for a turn that closed before it and is filled later, not only for the ones filled so far', async () => {
+    vi.useFakeTimers();
+    const { deps, sent } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    const first = turnTaking.reserve();
+    turnTaking.reserve().send('second');
+    let done = false;
+    void turnTaking.sent().then(() => (done = true));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(done).toBe(false);
+    first.skip();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual(['second']);
+    expect(done).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it('sends turns in order and shows thinking until a reply, then speaks it as plain text', async () => {
+    vi.useFakeTimers();
+    const { deps, said, sent, statuses } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    const results: unknown[] = [];
+    turnTaking.reserve().send('book a table', (r) => results.push(r));
+    turnTaking.reserve().send('for two');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual(['book a table', 'for two']);
+    expect(results).toEqual([{ accepted: true, id: '1' }]);
+    expect(statuses).toEqual([false, true]);
+    turnTaking.onReply('**Booked** for [eight](https://x.y).');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(said).toEqual(['Booked for eight.']);
+    expect(statuses.at(-1)).toBe(false);
+  });
+
+  it('drops thinking after a while without typing ticks, and holds it while they come', async () => {
+    vi.useFakeTimers();
+    const { deps, statuses } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.reserve().send('thanks');
+    await vi.advanceTimersByTimeAsync(AWAIT_REPLY_MS - 1000);
+    turnTaking.onThinking();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(statuses.at(-1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(statuses.at(-1)).toBe(false);
+  });
+
+  it('holds a reply while the caller talks and until their turn could still be committed', async () => {
+    vi.useFakeTimers();
+    const { deps, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.onCallerSpeaking(true);
+    turnTaking.onReply('First.');
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(said).toEqual([]);
+    turnTaking.onCallerSpeaking(false);
+    await vi.advanceTimersByTimeAsync(SILENCE);
+    expect(said).toEqual([]);
+    // The committed turn frees the channel at once.
+    turnTaking.reserve().send('and another thing');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(said).toEqual(['First.']);
+
+    // A caller who stops and never gets a turn committed (a cough) frees it after the settle time.
+    turnTaking.onCallerSpeaking(true);
+    turnTaking.onCallerSpeaking(false);
+    turnTaking.onReply('Second.');
+    await vi.advanceTimersByTimeAsync(SILENCE + TURN_SETTLE_MS - 10);
+    expect(said).toEqual(['First.']);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(said).toEqual(['First.', 'Second.']);
+  });
+
+  it('frees the channel at once when the caller speech came to no turn', async () => {
+    vi.useFakeTimers();
+    const { deps, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.onCallerSpeaking(true);
+    turnTaking.onReply('First.');
+    turnTaking.onCallerSpeaking(false);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(said).toEqual([]);
+    // Words before the wake phrase, a discard, noise: nothing will be committed.
+    turnTaking.releaseTurn();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(said).toEqual(['First.']);
+  });
+
+  it('lets a reply take the channel from a caller who never stops', async () => {
+    vi.useFakeTimers();
+    const { deps, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.onCallerSpeaking(true);
+    turnTaking.onReply('Done.');
+    await vi.advanceTimersByTimeAsync(SILENCE + MAX_IDLE_WAIT_MS - 10);
+    expect(said).toEqual([]);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(said).toEqual(['Done.']);
+  });
+
+  it("says it didn't catch a turn the STT lost, in the caller's language, once", async () => {
+    const { deps, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.onTurnLost('empty');
+    turnTaking.onTurnLost('empty');
+    await turnTaking.idle();
+    expect(said).toEqual([FAILURE_LINES.turn.uk]);
+    turnTaking.onTurnLost('stt');
+    await turnTaking.idle();
+    expect(said).toEqual([FAILURE_LINES.turn.uk, FAILURE_LINES.turn.uk]);
+  });
+
+  it("never asks to repeat a turn the host refused or did not confirm, in the caller's language", async () => {
+    const answers: SendResult[] = [
+      { accepted: false, status: 429 },
+      { accepted: false, status: 422 },
+      { accepted: false, status: 504 },
+      { accepted: false, error: 'The operation was aborted due to timeout' },
+      { accepted: false, status: 504 },
+    ];
+    const { deps, said } = fakeTurnTakingDeps({ send: async () => answers.shift() ?? { accepted: true } });
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    for (const text of ['what about the logs', 'and the disk', 'а диск', 'і пам’ять']) {
+      turnTaking.reserve().send(text);
+      await turnTaking.idle();
+    }
+    turnTaking.onChat(true);
+    turnTaking.reserve().send('а мережа');
+    await turnTaking.idle();
+    expect(said).toEqual([
+      FAILURE_LINES.rate_limited.en,
+      FAILURE_LINES.rejected.en,
+      // On the voice line no chat shows the turn, so the line does not send the caller to one.
+      FAILURE_LINES.timeout_no_chat.uk,
+      FAILURE_LINES.timeout_no_chat.uk,
+      FAILURE_LINES.timeout.uk,
+    ]);
+    expect(FAILURE_LINES.timeout).toEqual({
+      uk: 'Не впевнений, що це дійшло - перевір чат.',
+      en: 'Not sure that got through - check the chat.',
+    });
+  });
+
+  it('says so when a reply could not be synthesized, and keeps speaking after a failure', async () => {
+    const said: string[] = [];
+    let calls = 0;
+    const { deps } = fakeTurnTakingDeps({
+      say: async (text) => {
+        calls++;
+        if (calls === 1) return false;
+        if (calls === 3) throw new Error('room gone');
+        said.push(text);
+        return true;
+      },
+    });
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'en' });
+    turnTaking.onReply('Reply one.');
+    await turnTaking.idle();
+    expect(said).toEqual([FAILURE_LINES.reply.en]);
+    turnTaking.onReply('Reply two.');
+    turnTaking.onReply('Reply three.');
+    await turnTaking.idle();
+    expect(said).toEqual([FAILURE_LINES.reply.en, 'Reply three.']);
+  });
+
+  it('a reply the speech model failed on goes to the page as text, and no line was heard: no hand-over', async () => {
+    const announced: unknown[] = [];
+    const handOvers: boolean[] = [];
+    let ok = false;
+    const { deps } = fakeTurnTakingDeps({
+      say: async () => ok,
+      announce: (info) => announced.push(info),
+      spokenAll: (spoken) => handOvers.push(spoken),
+    });
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'en' });
+    turnTaking.onReply('Booked for **eight**.', 2);
+    await turnTaking.idle();
+    expect(announced).toEqual([
+      { reply: 1, turn: 2, part: 1 },
+      { reply: 1, turn: 2, part: 1, unspoken: true, text: 'Booked for eight.' },
+      // The spoken failure line failed too.
+      { reply: 2, notice: true },
+    ]);
+    expect(handOvers).toEqual([false]);
+    ok = true;
+    turnTaking.onReply('Done.');
+    await turnTaking.idle();
+    expect(handOvers).toEqual([false, true]);
+  });
+
+  it('a line queued while another plays says so again on the playing line: another follows', async () => {
+    const announced: unknown[] = [];
+    let finish!: () => void;
+    const { deps } = fakeTurnTakingDeps({
+      announce: (info) => announced.push(info),
+      say: vi.fn(async (text: string) => {
+        if (text === 'One.') await new Promise<void>((r) => (finish = r));
+        return true;
+      }),
+    });
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'en' });
+    turnTaking.onReply('One.', 1);
+    await flush();
+    expect(announced).toEqual([{ reply: 1, turn: 1, part: 1 }]);
+    turnTaking.onReply('Two.', 1);
+    expect(announced.at(-1)).toEqual({ reply: 1, turn: 1, part: 1, more: true });
+    finish();
+    await turnTaking.idle();
+    expect(announced.at(-1)).toEqual({ reply: 2, turn: 1, part: 2 });
+    // Nothing plays now: a new line labels only itself.
+    turnTaking.onReply('Three.', 1);
+    await turnTaking.idle();
+    expect(announced).toHaveLength(4);
+  });
+
+  it('describes each line before it is spoken: the turn it answers, unprompted, or its own notice', async () => {
+    vi.useFakeTimers();
+    const announced: unknown[] = [];
+    const { deps, said } = fakeTurnTakingDeps({
+      announce: (info) => announced.push({ ...info, before: said.length }),
+    });
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'en' });
+    turnTaking.onReply('One.', 3);
+    turnTaking.onReply('Two.', 3);
+    turnTaking.onReply('Three.', null);
+    await turnTaking.idle();
+    turnTaking.onTurnLost('stt');
+    await turnTaking.idle();
+    expect(said).toEqual(['One.', 'Two.', 'Three.', FAILURE_LINES.turn.en]);
+    expect(announced).toEqual([
+      // Queued together, so each but the last knows another line follows it.
+      { reply: 1, turn: 3, part: 1, more: true, before: 0 },
+      { reply: 2, turn: 3, part: 2, more: true, before: 1 },
+      { reply: 3, unprompted: true, before: 2 },
+      { reply: 4, notice: true, before: 3 },
+    ]);
+  });
+
+  it('stays silent once closed', async () => {
+    const { deps, said } = fakeTurnTakingDeps();
+    const turnTaking = new TurnTaking(deps, { silenceMs: SILENCE, language: 'uk' });
+    turnTaking.close();
+    turnTaking.onReply('Hi.');
+    turnTaking.onTurnLost('empty');
+    await turnTaking.idle();
+    expect(said).toEqual([]);
+  });
+});
+
+describe('HostLink', () => {
+  it('reads NDJSON events split across chunks and authenticates with the call secret', async () => {
+    const lines = ['{"type":"reply","te', 'xt":"hi"}\n{"type":"ping"}\n', '{"type":"end","reason":"hangup"}\n'];
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer s3cret');
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const l of lines) controller.enqueue(new TextEncoder().encode(l));
+          controller.close();
+        },
+      });
+      return new Response(body, { status: 200 });
+    });
+    const link = new HostLink({ hostUrl: 'http://127.0.0.1:3001', secret: 's3cret', callId: 'c1' }, fetchImpl);
+    const events: unknown[] = [];
+    await link.events((e) => events.push(e), new AbortController().signal);
+    expect(fetchImpl.mock.calls[0][0]).toBe('http://127.0.0.1:3001/webhook/voice-mode/livekit/agent/events?call=c1');
+    expect(events).toEqual([{ type: 'reply', text: 'hi' }, { type: 'ping' }, { type: 'end', reason: 'hangup' }]);
+  });
+});
+
+const META: LiveKitJobMetadata = {
+  v: LIVEKIT_PROTOCOL_VERSION,
+  callId: 'call-1',
+  lineId: 'voice-mode:abc',
+  agentName: 'Andy',
+  callerName: 'Ethan',
+  callerIdentity: 'caller-1',
+  vocabulary: ['NanoClaw'],
+  languages: ['uk-UA', 'en-US'],
+  sttModel: 'gemini-3.5-transcribe-live',
+  tts: { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'alnilam' },
+  silenceMs: 2500,
+  maxDurationMs: 60_000,
+  joinTimeoutMs: 1000,
+};
+
+describe('local turn detector process', () => {
+  it('leaves agents-js no inference runner to fork a process for', () => {
+    skipLocalTurnDetectorProcess();
+    new AgentServer(
+      new ServerOptions({
+        agent: 'unused',
+        wsURL: 'ws://127.0.0.1:9',
+        apiKey: 'key',
+        apiSecret: 'secret',
+        simulation: true,
+      }),
+    );
+    expect(Object.keys(InferenceRunner.registeredRunners)).toEqual([]);
+  });
+});
+
+describe('job metadata', () => {
+  it('takes only a voice call of this version as a call to run', () => {
+    expect(() => readJobHeader('{}')).toThrow();
+    expect(() => readJobHeader('not json')).toThrow();
+    expect(readJobHeader(JSON.stringify({ ...META, v: 2 })).call).toBeUndefined();
+    expect(readJobHeader(JSON.stringify({ ...META, agentName: '' })).call).toBeUndefined();
+    expect(readJobHeader(JSON.stringify(META)).call).toEqual(META);
+  });
+
+  it('reads enough of any version to answer it', () => {
+    expect(readJobHeader(JSON.stringify({ ...META, v: 2 }))).toEqual({
+      v: 2,
+      callId: 'call-1',
+      callerIdentity: 'caller-1',
+      agentName: 'Andy',
+    });
+    expect(() => readJobHeader(JSON.stringify({ v: 2 }))).toThrow();
+  });
+});
+
+interface FakeParticipant {
+  identity: string;
+  sid?: string;
+  disconnectReason?: DisconnectReason;
+}
+
+/** The caller hanging up: its client leaves the room. */
+const HANG_UP: FakeParticipant = { identity: 'caller-1', disconnectReason: DisconnectReason.CLIENT_INITIATED };
+
+function fakeJob(meta: Record<string, unknown> = { ...META }) {
+  const roomHandlers = new Map<string, (p: FakeParticipant) => void>();
+  const job = {
+    job: { metadata: JSON.stringify(meta) },
+    room: {
+      on: vi.fn((event: string, fn: (p: FakeParticipant) => void) => roomHandlers.set(event, fn)),
+      remoteParticipants: new Map([['caller-1', {}]]),
+    },
+    connect: vi.fn(async () => undefined),
+    waitForParticipant: vi.fn(async () => ({ identity: 'caller-1' })),
+    deleteRoom: vi.fn(async () => undefined),
+    shutdown: vi.fn(),
+    addShutdownCallback: vi.fn(),
+  };
+  return { job, ctx: job as unknown as CallJob, roomHandlers, room: job.room };
+}
+
+/** The host over fetch: routes by path, an NDJSON event stream fed by `emit`. */
+function fakeHostFetch(joinedStatus = 200, utteranceStatus = 202) {
+  const calls: Array<{ url: string; auth: string | undefined; body: Record<string, unknown> | null }> = [];
+  let push!: (line: string) => void;
+  let endStream!: () => void;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      push = (line) => controller.enqueue(new TextEncoder().encode(`${line}\n`));
+      endStream = () => controller.close();
+    },
+  });
+  const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
+    const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+    calls.push({ url, auth, body });
+    if (url.includes('/events')) return new Response(stream, { status: 200 });
+    if (url.endsWith('/joined')) return new Response('{}', { status: joinedStatus });
+    if (url.endsWith('/utterance')) return new Response(JSON.stringify({ id: '1' }), { status: utteranceStatus });
+    return new Response(null, { status: 204 });
+  });
+  return { fetchImpl, calls, emit: (e: unknown) => push(JSON.stringify(e)), endStream };
+}
+
+const heard = (interim: string, final?: string, failed = false): Heard => ({
+  ...(final !== undefined ? { final } : {}),
+  interim,
+  finals: final ? 1 : 0,
+  failed,
+  finalizeMs: 0,
+});
+
+/** A transcription whose activities end with the results the test queued (heard('') when none). */
+function fakeTranscription() {
+  const t = {
+    /** Pre-roll length of each activity begun. */
+    begins: [] as number[],
+    pushed: 0,
+    ended: 0,
+    results: [] as Heard[],
+    /** While set, end() waits for `release()`. */
+    hold: false,
+    waiting: [] as Array<() => void>,
+    prepared: true,
+    prepare: vi.fn(async () => t.prepared),
+    begin: vi.fn((pre: Int16Array) => void t.begins.push(pre.length)),
+    push: vi.fn((pcm: Int16Array) => void (t.pushed += pcm.length)),
+    end: vi.fn((): Promise<Heard> => {
+      t.ended++;
+      const result = t.results.shift() ?? heard('');
+      if (!t.hold) return Promise.resolve(result);
+      return new Promise((resolve) => t.waiting.push(() => resolve(result)));
+    }),
+    // As the real one: closing settles every activity still waiting for its final.
+    close: vi.fn(() => t.release()),
+    release: () => {
+      for (const go of t.waiting.splice(0)) go();
+    },
+  };
+  return t satisfies Transcription;
+}
+
+/** The room as runCall sees it, with a fake transcription behind the call's turns. */
+/** `speech`: the call's lines go through this speech output instead of playing at once. */
+function fakeVoice(
+  speech?: (
+    meta: LiveKitJobMetadata,
+    settings: VoiceModeSettings,
+    events: CallVoiceEvents,
+  ) => ReturnType<typeof speechOutput>,
+) {
+  let events!: CallVoiceEvents;
+  let handle!: (op: ReviewOp, payload: string, callerIdentity: string) => Promise<string>;
+  const transcription = fakeTranscription();
+  const states: CallReviewState[] = [];
+  let gen = 0;
+  let position = 0;
+  const voice = {
+    /** Plays at once: waits for the caller as the room's does, then speaks. */
+    say: vi.fn(async (_text: string, ready?: () => Promise<void>) => {
+      await ready?.();
+      events.onAgentSpeaking(true);
+      events.onAgentSpeaking(false);
+      return true;
+    }),
+    selectTts: undefined as CallVoice['selectTts'],
+    setThinking: vi.fn(),
+    publishTurn: vi.fn(),
+    publishReply: vi.fn(),
+    publishDropped: vi.fn(),
+    publishUnheard: vi.fn(),
+    setPending: vi.fn(),
+    caption: vi.fn(),
+    playCue: vi.fn(async (_kind: CueKind) => undefined),
+    review: {
+      publishReview: vi.fn((state: CallReviewState) => void states.push(state)),
+      serve: vi.fn((h: typeof handle) => {
+        handle = h;
+        // The page sends its settings first; these tests run hands-free unless they say otherwise.
+        void h('settings', JSON.stringify({ gen: ++gen, wake: false, pauseSends: false, cues: true }), 'caller-1');
+      }),
+    },
+    close: vi.fn(async () => undefined),
+  } satisfies CallVoice;
+  const createVoice = vi.fn(
+    async (_ctx: CallJob, _meta: LiveKitJobMetadata, _settings: VoiceModeSettings, e: CallVoiceEvents) => {
+      events = e;
+      if (speech) {
+        const output = speech(_meta, _settings, e);
+        voice.say.mockImplementation(output.say);
+        voice.selectTts = output.selectTts;
+        voice.close.mockImplementation(async () => {
+          await output.close();
+          return undefined;
+        });
+      }
+      return voice;
+    },
+  );
+  const audio = (ms: number) => {
+    const samples = Math.round(ms * 16);
+    events.onAudio(new Int16Array(samples).fill(100));
+    position += samples;
+  };
+  const v = {
+    voice,
+    createVoice,
+    transcription,
+    states,
+    /** The call's interim text, as the transcription reports it. */
+    interim: (_text: string) => undefined as void,
+    get events() {
+      return events;
+    },
+    /** The caller's audio so far, as the call counts it. */
+    get position() {
+      return position;
+    },
+    /** One RPC as the room hands it over. */
+    handle: (op: ReviewOp, payload: string, callerIdentity: string) => handle(op, payload, callerIdentity),
+    /** One RPC from the caller's page. */
+    rpc: async (op: ReviewOp, fields: Partial<ReviewRequest> = {}) =>
+      JSON.parse(await handle(op, JSON.stringify({ gen: ++gen, ...fields }), 'caller-1')) as Record<string, unknown>,
+    audio,
+    /**
+     * One stretch of speech (`speechMs`), then the closing silence: the turn's activity ends with `text`
+     * (as its final, unless `final` says otherwise, or its transcription failed).
+     */
+    turn: async (text: string, o: { speechMs?: number; final?: string; failed?: boolean } = {}) => {
+      await flush();
+      transcription.results.push(heard(text, o.final ?? (text || undefined), o.failed));
+      const start = position;
+      audio(o.speechMs ?? 1000);
+      const end = position;
+      audio(SILENCE);
+      events.onSpeech(true, start);
+      events.onVad(position, end);
+      events.onSpeech(false, end);
+      await flush();
+    },
+    /** `ms` of the caller's quiet, the VAD analyzing all of it. */
+    quiet: (ms: number) => {
+      const from = position;
+      audio(ms);
+      events.onVad(position, from);
+    },
+  };
+  return v;
+}
+
+const ENV = {
+  VOICE_MODE_GEMINI_API_KEY: 'gk-test',
+  LIVEKIT_API_SECRET: 'lk-secret',
+  LIVEKIT_HOST_URL: 'http://127.0.0.1:3555',
+};
+const deps = (
+  fetchImpl: typeof fetch,
+  createVoice: ReturnType<typeof fakeVoice>['createVoice'],
+  extra: Record<string, unknown> = {},
+  transcription: Transcription = fakeTranscription(),
+) => ({
+  env: ENV as Record<string, string | undefined>,
+  fetchImpl,
+  createVoice,
+  transcriber: () => transcription,
+  markUpdating: vi.fn(async () => undefined),
+  log: silentLog,
+  ...extra,
+});
+/** deps() for a fakeVoice: its own transcription behind the call. */
+const callDeps = (fetchImpl: typeof fetch, v: ReturnType<typeof fakeVoice>, extra: Record<string, unknown> = {}) => ({
+  ...deps(fetchImpl, v.createVoice, extra, v.transcription),
+  transcriber: (options: { onInterim(text: string): void }) => {
+    v.interim = (text) => options.onInterim(text);
+    return v.transcription;
+  },
+});
+
+describe('runCall', () => {
+  it('runs a call: caller joins, host says yes, turns go out, replies are spoken, host end closes all', async () => {
+    const { job, ctx } = fakeJob({ ...META, hostUrl: 'http://169.254.169.254', secret: 'from-dispatch' });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+
+    expect(job.waitForParticipant).toHaveBeenCalledWith('caller-1');
+    expect(v.createVoice).toHaveBeenCalledWith(
+      ctx,
+      expect.objectContaining({ callId: 'call-1' }),
+      { providerKeys: { gemini: 'gk-test' }, deess: true, notch: true, spoke: expect.any(Function) },
+      v.events,
+    );
+    // The host address and secret come from the worker's settings, never from the dispatch.
+    const secret = liveKitCallSecret('lk-secret', 'call-1');
+    for (const call of host.calls) {
+      expect(call.url.startsWith('http://127.0.0.1:3555/webhook/voice-mode/livekit/agent/')).toBe(true);
+      expect(call.auth).toBe(`Bearer ${secret}`);
+    }
+
+    await v.turn('Book a table');
+    await vi.waitFor(() =>
+      expect(host.calls.find((c) => c.url.endsWith('/utterance'))?.body).toEqual({
+        callId: 'call-1',
+        text: 'Book a table',
+        turnKey: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      }),
+    );
+    expect(v.voice.setThinking).toHaveBeenCalledWith(true);
+    // The page hears the turn closed before the host answers, then that the agent has it.
+    expect(v.voice.publishTurn.mock.calls.map(([status]) => status)).toEqual([
+      { turn: 1, status: 'sending' },
+      { turn: 1, status: 'sent', text: 'Book a table' },
+    ]);
+
+    host.emit({ type: 'reply', text: 'Booked for eight.', turn: null });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked for eight.', expect.any(Function)));
+    // It answers no turn: a message nobody asked for, and the page is told so first.
+    expect(v.voice.publishReply).toHaveBeenCalledWith({ reply: 1, unprompted: true });
+    // review.serve carries the agent's first `listening` with the review attributes: the call is
+    // served before any state, caption or line of it can reach the page.
+    expect(v.voice.review.serve).toHaveBeenCalledTimes(1);
+    const served = v.voice.review.serve.mock.invocationCallOrder[0];
+    for (const later of [
+      v.voice.say,
+      v.voice.setThinking,
+      v.voice.publishTurn,
+      v.voice.publishReply,
+      v.voice.caption,
+    ]) {
+      for (const order of later.mock.invocationCallOrder) expect(order).toBeGreaterThan(served);
+    }
+
+    host.emit({ type: 'end', reason: 'hangup' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
+    expect(v.voice.close).toHaveBeenCalled();
+    expect(job.deleteRoom).toHaveBeenCalled();
+    // The host ended it, so the worker does not report back.
+    expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+  });
+
+  it('tells the page which of its turns a reply answers, by the host id each sent turn got', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    // A noise is turn 1 here (it is recorded), so the host's first turn is this worker's second.
+    await v.turn('', { speechMs: 200 });
+    await v.turn('Book a table');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 2, status: 'sent', text: 'Book a table' }),
+    );
+    host.emit({ type: 'reply', text: 'Checking.', turn: '1' });
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    host.emit({ type: 'reply', text: 'Answer to a turn this worker never sent.', turn: '9' });
+    host.emit({ type: 'reply', text: 'From a host that names no turns.' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledTimes(4));
+    expect(v.voice.publishReply.mock.calls.map(([{ more: _more, ...info }]) => info)).toEqual([
+      { reply: 1, turn: 2, part: 1 },
+      { reply: 2, turn: 2, part: 2 },
+      // Not known here, so not labelled at all: never a guessed link.
+      { reply: 3 },
+      { reply: 4 },
+    ]);
+    host.endStream();
+  });
+
+  it('working shows while a turn awaits its reply and until the reply is heard, not for typing after it', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    let speak!: () => void;
+    v.voice.say.mockImplementation(() => new Promise<boolean>((resolve) => (speak = () => resolve(true))));
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    const thinking = () => v.voice.setThinking.mock.calls.at(-1)?.[0];
+    // Typing with no turn waiting for its answer says nothing.
+    host.emit({ type: 'thinking' });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(v.voice.setThinking).not.toHaveBeenCalled();
+
+    await v.turn('Book a table');
+    await vi.waitFor(() => expect(thinking()).toBe(true));
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
+    // The reply's speech is still being made: the page keeps "working" until its audio plays.
+    expect(thinking()).toBe(true);
+    v.events.onAgentSpeaking(true);
+    expect(thinking()).toBe(true);
+    // A moment into its audio (the page has the speaking state by then) it lets go.
+    await vi.waitFor(() => expect(thinking()).toBe(false));
+    speak();
+    v.events.onAgentSpeaking(false);
+    // The agent's typing after its answer: no "working" with nothing coming.
+    host.emit({ type: 'thinking' });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(thinking()).toBe(false);
+    host.endStream();
+  });
+
+  it('tells the page once per turn that the agent picked it up, never before the host took it or after its answer', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    const working = () => v.voice.publishTurn.mock.calls.filter(([s]) => s.status === 'working').map(([s]) => s);
+    // No turn yet: the agent working on something else says nothing about this call's turns.
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(v.voice.setThinking).toHaveBeenCalledWith(true));
+    expect(working()).toEqual([]);
+
+    await v.turn('Book a table');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' }),
+    );
+    host.emit({ type: 'working' });
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(working()).toEqual([{ turn: 1, status: 'working' }]));
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
+
+    // Turn 2 (the fake host names it '1' too) is answered before any pickup is heard: no late "working".
+    await v.turn('And a taxi');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 2, status: 'sent', text: 'And a taxi' }),
+    );
+    host.emit({ type: 'reply', text: 'Taxi on its way.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Taxi on its way.', expect.any(Function)));
+    host.emit({ type: 'working' });
+    // A message naming no turn (unprompted, or a chat reply) also answers it: no "working" after it.
+    await v.turn('One more');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 3, status: 'sent', text: 'One more' }),
+    );
+    host.emit({ type: 'reply', text: 'Your taxi is here.', turn: null });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Your taxi is here.', expect.any(Function)));
+    host.emit({ type: 'working' });
+    // Turn 4 is picked up while its answer is still to come.
+    await v.turn('Thanks');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 4, status: 'sent', text: 'Thanks' }),
+    );
+    host.emit({ type: 'working' });
+    await vi.waitFor(() =>
+      expect(working()).toEqual([
+        { turn: 1, status: 'working' },
+        { turn: 4, status: 'working' },
+      ]),
+    );
+    host.endStream();
+  });
+
+  it('holds a pickup while a newer turn waits for the host, so it is never read as that one', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let utterances = 0;
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('/utterance') && ++utterances === 2) await held;
+      return host.fetchImpl(input, init);
+    });
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(fetchImpl, v));
+    const working = () => v.voice.publishTurn.mock.calls.filter(([s]) => s.status === 'working').map(([s]) => s);
+    await v.turn('Book a table');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' }),
+    );
+    await v.turn('For two');
+    await vi.waitFor(() => expect(utterances).toBe(2));
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(v.voice.setThinking).toHaveBeenCalledWith(true));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(working()).toEqual([]);
+    release();
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 2, status: 'sent', text: 'For two' }),
+    );
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(working()).toEqual([{ turn: 2, status: 'working' }]));
+    host.endStream();
+  });
+
+  it('speaks the lost-turn line when the host refuses a turn', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch(200, 429);
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.turn('Привіт');
+    await vi.waitFor(() =>
+      expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.rate_limited.uk, expect.any(Function)),
+    );
+    expect(v.voice.publishTurn).toHaveBeenCalledWith({
+      turn: 1,
+      status: 'lost',
+      reason: 'rate_limited',
+      text: 'Привіт',
+    });
+    await v.turn('', { speechMs: 1200, failed: true });
+    expect(v.voice.publishTurn).toHaveBeenLastCalledWith({ turn: 2, status: 'lost', reason: 'stt' });
+  });
+
+  it('marks a timed-out turn sent once the host says it was stored after all, and points at the chat once there is one', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch(200, 504);
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.turn('Book a table');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({
+        turn: 1,
+        status: 'lost',
+        reason: 'timeout',
+        text: 'Book a table',
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.timeout_no_chat.en, expect.any(Function)),
+    );
+    const turnKey = host.calls.find((c) => c.url.endsWith('/utterance'))?.body?.turnKey;
+    // Another worker's key, or one already settled, changes nothing.
+    host.emit({ type: 'turn-stored', turnKey: 'not-ours', id: '7' });
+    host.emit({ type: 'turn-stored', turnKey, id: '1' });
+    host.emit({ type: 'turn-stored', turnKey, id: '1' });
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenLastCalledWith({ turn: 1, status: 'sent', text: 'Book a table' }),
+    );
+    // sending, lost (timeout), then sent once stored.
+    expect(v.voice.publishTurn).toHaveBeenCalledTimes(3);
+    // The late turn's answer is labelled with it.
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
+    expect(v.voice.publishReply).toHaveBeenLastCalledWith(expect.objectContaining({ turn: 1, part: 1 }));
+
+    host.emit({ type: 'chat', chat: true });
+    await v.turn('And a taxi');
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.timeout.en, expect.any(Function)));
+    host.endStream();
+  });
+
+  it('posts a turn once more under the same key when the connection drops, but not after a timeout', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    let failures = [new TypeError('fetch failed')] as Error[];
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const failure = String(input).endsWith('/utterance') && failures.shift();
+      if (failure) {
+        host.calls.push({ url: String(input), auth: undefined, body: JSON.parse(String(init?.body)) });
+        throw failure;
+      }
+      return host.fetchImpl(input, init);
+    });
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(fetchImpl, v));
+    await v.turn('Book a table');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' }),
+    );
+    const posts = host.calls.filter((c) => c.url.endsWith('/utterance'));
+    expect(posts).toHaveLength(2);
+    expect(posts[1].body).toEqual(posts[0].body);
+
+    failures = [new DOMException('The operation was aborted due to timeout', 'TimeoutError')];
+    await v.turn('And a taxi');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({
+        turn: 2,
+        status: 'lost',
+        reason: 'timeout',
+        text: 'And a taxi',
+      }),
+    );
+    expect(host.calls.filter((c) => c.url.endsWith('/utterance'))).toHaveLength(3);
+    // A different turn, a different key.
+    expect(host.calls.at(-1)?.body?.turnKey).not.toBe(posts[0].body?.turnKey);
+  });
+
+  it('names the host URL when the host is unreachable at join', async () => {
+    const { job, ctx } = fakeJob();
+    const warn = vi.fn();
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    });
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(fetchImpl, v, { log: { info: () => undefined, warn } }));
+    expect(warn).toHaveBeenCalledWith('voice-mode worker: ending the call', {
+      callId: 'call-1',
+      hostUrl: 'http://127.0.0.1:3555',
+      reason: 'host refused the call (unreachable)',
+    });
+    expect(job.shutdown).toHaveBeenCalledWith('host refused the call (unreachable)');
+  });
+
+  it('starts no session when the host refuses the call', async () => {
+    const { job, ctx } = fakeJob();
+    const host = fakeHostFetch(409);
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    expect(v.createVoice).not.toHaveBeenCalled();
+    expect(host.calls.at(-1)).toMatchObject({ body: { callId: 'call-1', reason: 'host refused the call (409)' } });
+    expect(job.deleteRoom).toHaveBeenCalled();
+    expect(job.shutdown).toHaveBeenCalledWith('host refused the call (409)');
+  });
+
+  it('ends the call when the caller never joins', async () => {
+    const { job, ctx } = fakeJob({ ...META, joinTimeoutMs: 20 });
+    job.waitForParticipant.mockImplementation(() => new Promise(() => undefined));
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    expect(v.createVoice).not.toHaveBeenCalled();
+    expect(job.shutdown).toHaveBeenCalledWith('caller never joined');
+  });
+
+  it('ends the call when the caller left while it was being set up', async () => {
+    const { job, ctx, room } = fakeJob();
+    room.remoteParticipants.clear();
+    const host = fakeHostFetch();
+    await runCall(ctx, deps(host.fetchImpl, fakeVoice().createVoice));
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('caller left'));
+    expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(true);
+  });
+
+  it('ends a job of this version that is not a whole voice call, and tells the host', async () => {
+    const { job, ctx } = fakeJob({ ...META, agentName: '' });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    expect(v.createVoice).not.toHaveBeenCalled();
+    expect(host.calls.at(-1)?.url.endsWith('/ended')).toBe(true);
+    expect(job.deleteRoom).toHaveBeenCalled();
+  });
+
+  it('takes a local http origin only: the host serves the worker on loopback, in plain HTTP', () => {
+    expect(liveKitHostUrl({})).toBe('http://127.0.0.1:3000');
+    expect(liveKitHostUrl({ WEBHOOK_PORT: '3555' })).toBe('http://127.0.0.1:3555');
+    expect(liveKitHostUrl({ LIVEKIT_HOST_URL: 'http://localhost:3000/' })).toBe('http://localhost:3000');
+    expect(liveKitHostUrl({ LIVEKIT_HOST_URL: 'http://[::1]:3000' })).toBe('http://[::1]:3000');
+    for (const bad of [
+      // A local TLS proxy would add X-Forwarded-For, which the worker routes refuse.
+      'https://[::1]:3000',
+      'https://127.0.0.1:3443',
+      'http://192.168.1.5:3000',
+      'http://127.0.0.2:3000',
+      'https://voice.example.com',
+      'ws://127.0.0.1:3000',
+      'nonsense',
+      'http://user:hunter2@127.0.0.1:3000',
+    ]) {
+      expect(() => liveKitHostUrl({ LIVEKIT_HOST_URL: bad })).toThrow('LIVEKIT_HOST_URL must be a local');
+    }
+    expect(() => liveKitHostUrl({ WEBHOOK_PORT: 'abc' })).toThrow('LIVEKIT_HOST_URL must be a local');
+    // The diagnostic names the origin, never the credentials in it.
+    expect(() => liveKitHostUrl({ LIVEKIT_HOST_URL: 'https://user:hunter2@voice.example.com/x?k=v' })).toThrow(
+      /got https:\/\/voice\.example\.com with credentials\)/,
+    );
+    try {
+      liveKitHostUrl({ LIVEKIT_HOST_URL: 'https://user:hunter2@voice.example.com/x?k=v' });
+    } catch (err) {
+      expect(String(err)).not.toMatch(/hunter2|user|k=v/);
+    }
+  });
+
+  it('ends the job without a word to a host that is not local', async () => {
+    const { job, ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const warn = vi.fn();
+    await runCall(
+      ctx,
+      callDeps(host.fetchImpl, v, {
+        env: { ...ENV, LIVEKIT_HOST_URL: 'https://user:hunter2@remote.example.invalid' },
+        log: { info: () => undefined, warn },
+      }),
+    );
+    expect(host.calls).toEqual([]);
+    expect(job.connect).not.toHaveBeenCalled();
+    expect(v.createVoice).not.toHaveBeenCalled();
+    expect(job.deleteRoom).toHaveBeenCalled();
+    expect(job.shutdown).toHaveBeenCalledWith(expect.stringContaining('LIVEKIT_HOST_URL must be a local'));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('hunter2');
+  });
+
+  it("speaks an English-only call's first failure notice in English, and a default call's in Ukrainian", async () => {
+    for (const [languages, line] of [
+      [['en-US'], FAILURE_LINES.turn.en],
+      [['uk-UA', 'en-US'], FAILURE_LINES.turn.uk],
+    ] as const) {
+      const { ctx } = fakeJob({ ...META, languages });
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      const transcriber = vi.fn((_options: { languageCodes: readonly string[] }) => v.transcription);
+      await runCall(ctx, { ...callDeps(host.fetchImpl, v), transcriber });
+      expect(transcriber.mock.calls[0][0].languageCodes).toEqual(languages);
+      await v.turn('', { speechMs: 1200, failed: true });
+      await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(line, expect.any(Function)));
+      expect(v.voice.say).toHaveBeenCalledTimes(1);
+      host.endStream();
+    }
+  });
+
+  it('refuses to start without the LiveKit secret it derives the host credential from', async () => {
+    const { job, ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { env: { ...ENV, LIVEKIT_API_SECRET: undefined } }));
+    expect(job.connect).not.toHaveBeenCalled();
+    expect(job.shutdown).toHaveBeenCalledWith('LIVEKIT_API_SECRET is not set for the worker');
+  });
+
+  it('records each turn with its outcome once the host answered, when recordings are on', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-rec-'));
+    try {
+      const { ctx } = fakeJob();
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      await runCall(
+        ctx,
+        callDeps(host.fetchImpl, v, { env: { ...ENV, VOICE_MODE_RECORDINGS_DAYS: '7' }, recordingsRoot: root }),
+      );
+      await v.turn('Book a table');
+      await v.turn('', { speechMs: 900 });
+      await v.turn('', { speechMs: 200 });
+      const dir = path.join(root, 'Andy', new Date().toISOString().slice(0, 10));
+      await vi.waitFor(() => expect(fs.readdirSync(dir).sort()).toHaveLength(6));
+      const first = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-1.json'), 'utf8')) as TurnRecord;
+      expect(first).toMatchObject({
+        callId: 'call-1',
+        lineId: 'voice-mode:abc',
+        agent: 'Andy',
+        turn: 1,
+        sttModel: 'gemini-3.5-transcribe-live',
+        transcript: 'Book a table',
+        speechMs: 1000,
+        host: { accepted: true, status: 202, id: '1' },
+      });
+      const lost = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-2.json'), 'utf8')) as TurnRecord;
+      expect(lost).toMatchObject({ turn: 2, transcript: '', reason: 'empty' });
+      const noise = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-3.json'), 'utf8')) as TurnRecord;
+      expect(noise).toMatchObject({ turn: 3, reason: 'noise' });
+      const wav = fs.readFileSync(path.join(dir, 'call-1-1.wav'));
+      expect(wav.subarray(0, 4).toString()).toBe('RIFF');
+      // The speech (the call opened with it: no audio before it) and a pad after it, not the closing silence.
+      expect(wav.length - 44).toBe(2 * 16 * (1000 + 300));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('tells the page it is updating when the host speaks another version, then lets the host end it', async () => {
+    vi.useFakeTimers();
+    const { job, ctx } = fakeJob({ ...META, v: 2 });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const d = callDeps(host.fetchImpl, v);
+    const done = runCall(ctx, d);
+    await vi.advanceTimersByTimeAsync(5000);
+    await done;
+    expect(d.markUpdating).toHaveBeenCalledWith(ctx);
+    expect(v.createVoice).not.toHaveBeenCalled();
+    expect(host.calls.at(-1)).toMatchObject({
+      url: 'http://127.0.0.1:3555/webhook/voice-mode/livekit/agent/ended',
+      body: { callId: 'call-1', reason: `protocol mismatch: host sent v2, worker speaks v${LIVEKIT_PROTOCOL_VERSION}` },
+    });
+    expect(job.shutdown).toHaveBeenCalled();
+  });
+
+  it("keeps the call through the caller's full reconnect: a new instance under the same identity", async () => {
+    const { job, ctx, roomHandlers } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await vi.waitFor(() => expect(v.states.length).toBeGreaterThan(0));
+    const published = v.states.length;
+    vi.useFakeTimers();
+    // The server removes the old instance, then the new one joins.
+    roomHandlers.get('participantDisconnected')?.({
+      identity: 'caller-1',
+      sid: 'PA_old',
+      disconnectReason: DisconnectReason.DUPLICATE_IDENTITY,
+    });
+    roomHandlers.get('participantConnected')?.({ identity: 'caller-1', sid: 'PA_new' });
+    // Or the SDK drops the old one itself, with no reason, as the new one's update arrives.
+    roomHandlers.get('participantDisconnected')?.({ identity: 'caller-1', sid: 'PA_new' });
+    roomHandlers.get('participantConnected')?.({ identity: 'caller-1', sid: 'PA_newer' });
+    await vi.advanceTimersByTimeAsync(CALLER_REJOIN_MS * 2);
+    expect(job.shutdown).not.toHaveBeenCalled();
+    expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+    // The new instance hears the review state it missed.
+    expect(v.states.length).toBeGreaterThan(published);
+    vi.useRealTimers();
+    // A hang-up still ends it at once.
+    roomHandlers.get('participantDisconnected')?.(HANG_UP);
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('caller left'));
+  });
+
+  it('ends the call when a replaced caller never rejoins', async () => {
+    const { job, ctx, roomHandlers } = fakeJob();
+    const host = fakeHostFetch();
+    await runCall(ctx, callDeps(host.fetchImpl, fakeVoice()));
+    vi.useFakeTimers();
+    roomHandlers.get('participantDisconnected')?.({
+      identity: 'caller-1',
+      disconnectReason: DisconnectReason.DUPLICATE_IDENTITY,
+    });
+    await vi.advanceTimersByTimeAsync(CALLER_REJOIN_MS - 100);
+    expect(job.shutdown).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(200);
+    vi.useRealTimers();
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('caller left'));
+  });
+
+  it('waits for a rejoin only when the caller was replaced or left for no reason', () => {
+    expect(callerRejoinWaitMs(DisconnectReason.DUPLICATE_IDENTITY)).toBe(CALLER_REJOIN_MS);
+    expect(callerRejoinWaitMs(undefined)).toBe(CALLER_REJOIN_MS);
+    expect(callerRejoinWaitMs(DisconnectReason.CLIENT_INITIATED)).toBe(0);
+    expect(callerRejoinWaitMs(DisconnectReason.ROOM_DELETED)).toBe(0);
+  });
+
+  it('reports the end to the host when the host link drops, the caller leaves or the session closes', async () => {
+    const first = fakeJob();
+    const host = fakeHostFetch();
+    await runCall(first.ctx, deps(host.fetchImpl, fakeVoice().createVoice));
+    host.endStream();
+    await vi.waitFor(() => expect(first.job.shutdown).toHaveBeenCalledWith('host link closed'));
+    expect(host.calls.at(-1)).toMatchObject({ body: { reason: 'host link closed' } });
+    expect(host.calls.at(-1)?.body).not.toHaveProperty('restart');
+
+    const second = fakeJob();
+    await runCall(second.ctx, deps(fakeHostFetch().fetchImpl, fakeVoice().createVoice));
+    second.roomHandlers.get('participantDisconnected')?.(HANG_UP);
+    await vi.waitFor(() => expect(second.job.shutdown).toHaveBeenCalledWith('caller left'));
+
+    const third = fakeJob();
+    const v = fakeVoice();
+    await runCall(third.ctx, deps(fakeHostFetch().fetchImpl, v.createVoice));
+    v.events.onClosed('vad failed');
+    await vi.waitFor(() => expect(third.job.shutdown).toHaveBeenCalledWith('vad failed'));
+    await flush();
+  });
+
+  it('keeps the host link open until the host answered that the call ended', async () => {
+    // Closed first, the host ends the call on its own and answers at once, before the room says why.
+    const { job, ctx } = fakeJob();
+    const host = fakeHostFetch();
+    let link: AbortSignal | undefined;
+    let openWhenEnded: boolean | undefined;
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/events')) link = init?.signal ?? undefined;
+      if (url.endsWith('/ended')) openWhenEnded = !!link && !link.aborted;
+      return host.fetchImpl(input, init);
+    });
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(fetchImpl as typeof fetch, v));
+    await vi.waitFor(() => expect(link).toBeDefined());
+    v.events.onClosed('vad failed');
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('vad failed'));
+    expect(openWhenEnded).toBe(true);
+    expect(link?.aborted).toBe(true);
+  });
+
+  it('tells the host a call ended by the worker shutting down is a restart', async () => {
+    const { job, ctx } = fakeJob();
+    const host = fakeHostFetch();
+    await runCall(ctx, deps(host.fetchImpl, fakeVoice().createVoice));
+    const onShutdown = job.addShutdownCallback.mock.calls[0][0] as () => Promise<void>;
+    await onShutdown();
+    expect(host.calls.at(-1)).toMatchObject({
+      url: 'http://127.0.0.1:3555/webhook/voice-mode/livekit/agent/ended',
+      body: { callId: 'call-1', reason: 'job shutdown', restart: true },
+    });
+    expect(job.shutdown).toHaveBeenCalledWith('job shutdown');
+  });
+});
+
+describe('reply recordings', () => {
+  it('a call with recordings on writes each spoken line as it was played, next to the turns, and reports it', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-rec-'));
+    try {
+      const { ctx } = fakeJob();
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      const info = vi.fn();
+      await runCall(
+        ctx,
+        callDeps(host.fetchImpl, v, {
+          env: { ...ENV, VOICE_MODE_RECORDINGS_DAYS: '7' },
+          recordingsRoot: root,
+          log: { info, warn: () => undefined },
+        }),
+      );
+      const settings = v.createVoice.mock.calls[0][2];
+      expect(settings.recordReplies).toBe(true);
+      // Every line is labelled before it plays.
+      host.emit({ type: 'reply', text: 'Booked.', turn: null });
+      await vi.waitFor(() => expect(v.voice.publishReply).toHaveBeenCalled());
+      const pcm = Int16Array.from({ length: 24_000 }, (_, i) => (i % 2 ? 16384 : -16384));
+      const meter = new LineMeter();
+      meter.frame(pcm);
+      const line = {
+        outcome: 'spoken' as const,
+        model: 'gemini-3.8-flash-lite-tts',
+        fallback: false,
+        firstAudioMs: 900,
+        heldMs: 0,
+        durationMs: 1000,
+        ...meter.levels,
+      };
+      settings.spoke?.(line, pcm);
+      const file = path.join(root, 'Andy', new Date().toISOString().slice(0, 10), 'call-1-reply-1.wav');
+      await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
+      const wav = fs.readFileSync(file);
+      expect(wav.readUInt32LE(24)).toBe(24_000);
+      expect(wav.length - 44).toBe(2 * 24_000);
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+      expect(info).toHaveBeenCalledWith('voice-mode.reply', {
+        callId: 'call-1',
+        reply: 1,
+        kind: 'reply',
+        outcome: 'spoken',
+        model: 'gemini-3.8-flash-lite-tts',
+        fallback: false,
+        firstAudioMs: 900,
+        heldMs: 0,
+        durationMs: 1000,
+        peakDb: -6,
+        rmsDb: -6,
+        recorded: true,
+      });
+      host.endStream();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('records nothing with recordings off', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    expect(v.createVoice.mock.calls[0][2].recordReplies).toBeUndefined();
+    host.endStream();
+  });
+});
+
+describe('turn recordings', () => {
+  it('writes owner-only files under agent and day, and prunes old ones with their empty folders', async () => {
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'voice-rec-')), 'voice-recordings');
+    try {
+      const record: TurnRecord = {
+        callId: 'c/../1',
+        lineId: 'voice-mode:abc',
+        agent: '../Andy Bot',
+        turn: 2,
+        startedAt: '2026-10-02T12:00:00.000Z',
+        endedAt: '2026-10-02T12:00:01.000Z',
+        speechMs: 700,
+        truncated: false,
+        sttModel: 'gemini-3.5-transcribe-live',
+        transcript: 'hello',
+        host: { accepted: true, id: '4', status: 202 },
+      };
+      const audio: TurnAudio = {
+        pcm: new Int16Array(16_000),
+        sampleRate: 16_000,
+        startedAt: 0,
+        endedAt: 1000,
+        speechMs: 700,
+        truncated: false,
+      };
+      const base = await writeTurnRecording(root, record, audio);
+      expect(base).toBe(path.join(root, 'Andy-Bot', '2026-10-02', 'c-1-2'));
+      expect(fs.statSync(`${base}.wav`).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(`${base}.json`).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.dirname(base)).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(root).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(`${base}.wav`).size).toBe(44 + 32_000);
+      expect(JSON.parse(fs.readFileSync(`${base}.json`, 'utf8'))).toEqual(record);
+
+      const fresh = await writeTurnRecording(
+        root,
+        { ...record, turn: 3, startedAt: '2026-10-09T12:00:00.000Z' },
+        audio,
+      );
+      const old = Date.now() / 1000 - 10 * 86_400;
+      fs.utimesSync(`${base}.wav`, old, old);
+      fs.utimesSync(`${base}.json`, old, old);
+      expect(await pruneRecordings(root, 7)).toBe(2);
+      expect(fs.existsSync(path.dirname(base))).toBe(false);
+      expect(fs.existsSync(`${fresh}.wav`)).toBe(true);
+      expect(fs.existsSync(root)).toBe(true);
+      expect(await pruneRecordings(path.join(root, 'missing'), 7)).toBe(0);
+    } finally {
+      fs.rmSync(path.dirname(root), { recursive: true, force: true });
+    }
+  });
+
+  it('reads the retention setting, off unless a positive whole number of days', () => {
+    expect(recordingDays(undefined)).toBe(0);
+    expect(recordingDays('')).toBe(0);
+    expect(recordingDays('0')).toBe(0);
+    expect(recordingDays('-3')).toBe(0);
+    expect(recordingDays('1.5')).toBe(0);
+    expect(recordingDays(' 14 ')).toBe(14);
+    expect(pathSegment('..')).toBe('unnamed');
+  });
+});
+
+describe('SendCountdown', () => {
+  it('says how far into the closing silence a stopped caller is, one wait at a time, and clears once', () => {
+    let now = 10_000;
+    const published: string[] = [];
+    const countdown = new SendCountdown(
+      (value) => published.push(value),
+      2500,
+      () => now,
+    );
+    countdown.clear();
+    expect(published).toEqual([]);
+    countdown.stopped(now - 600);
+    now += 4000;
+    countdown.clear();
+    countdown.clear();
+    // Reported late, it is never past the whole silence.
+    countdown.stopped(now - 9000);
+    expect(published).toEqual(['1:600:2500', '', '2:2500:2500']);
+    countdown.clear();
+  });
+
+  it('clears itself once the turn is overdue, so a turn that never commits does not leave it up', () => {
+    vi.useFakeTimers();
+    const published: string[] = [];
+    const countdown = new SendCountdown((value) => published.push(value), 2500);
+    countdown.stopped(Date.now() - 500);
+    vi.advanceTimersByTime(2000 + TURN_SETTLE_MS - 1);
+    expect(published).toEqual(['1:500:2500']);
+    vi.advanceTimersByTime(1);
+    expect(published).toEqual(['1:500:2500', '']);
+    vi.useRealTimers();
+  });
+});
+
+/** Review mode over a fake call-turns: recordings resolve with what the test gives `stop`. */
+function reviewControl(overrides: Partial<ReviewDeps> = {}) {
+  const states: CallReviewState[] = [];
+  let stop: (r: Recording | null) => void = () => undefined;
+  const voice = {
+    turnOpen: false,
+    prepared: true,
+    recording: false,
+    prepare: vi.fn(async () => voice.prepared),
+    setReviewing: vi.fn(async (_on: boolean): Promise<Recording | null> => null),
+    record: vi.fn(() => void (voice.recording = true)),
+    stopRecording: vi.fn(
+      () =>
+        new Promise<Recording | null>((resolve) => {
+          voice.recording = false;
+          stop = resolve;
+        }),
+    ),
+    dropRecording: vi.fn(() => void (voice.recording = false)),
+  };
+  const posted: Array<{ text: string; draft: number }> = [];
+  const capture: boolean[] = [];
+  const cues: CueKind[] = [];
+  const control = new ReviewControl({
+    voice,
+    publishReview: vi.fn((state: CallReviewState) => void states.push(state)),
+    post: vi.fn((text: string, draft: number) => {
+      posted.push({ text, draft });
+      return posted.length;
+    }),
+    lastPosted: () => posted.length,
+    setCaptureOpen: (open) => void capture.push(open),
+    resetCaller: vi.fn(),
+    configure: () => undefined,
+    wakeState: () => ({ on: false, pauseSends: false, waiting: false }),
+    cue: (kind) => void cues.push(kind),
+    ended: () => undefined,
+    log: silentLog,
+    ...overrides,
+  });
+  let gen = 0;
+  const op = (name: ReviewOp, fields: Partial<ReviewRequest> = {}) => control.handle(name, { gen: ++gen, ...fields });
+  return {
+    control,
+    voice,
+    states,
+    posted,
+    capture,
+    cues,
+    op,
+    draft: () => states.at(-1)?.draft,
+    /** The recording's text arrives. */
+    stop: async (text: string, failed = false) => {
+      stop({ text, failed, take: {} });
+      await flush();
+    },
+  };
+}
+
+describe('review mode', () => {
+  it('talk sets the transcription up before it answers; done freezes the text without posting; send posts exactly it', async () => {
+    const r = reviewControl();
+    expect(await r.op('mode', { mode: 'review' })).toMatchObject({ ok: true });
+    expect(await r.op('talk')).toMatchObject({ ok: true, draft: 1 });
+    expect(r.states.some((s) => s.preparing)).toBe(true);
+    expect(r.voice.prepare).toHaveBeenCalledBefore(r.voice.record);
+    expect(r.states.at(-1)).not.toHaveProperty('preparing');
+    expect(r.draft()).toMatchObject({ id: 1, state: 'recording' });
+    expect(r.cues).toEqual(['listening']);
+    expect(await r.op('done', { draft: 1 })).toMatchObject({ ok: true });
+    expect(r.draft()).toMatchObject({ state: 'finishing' });
+    await r.stop('Remind me to zulu. Zulu.');
+    expect(r.draft()).toMatchObject({ state: 'ready', text: 'Remind me to zulu. Zulu.' });
+    expect(r.posted).toEqual([]);
+    expect(r.cues).toEqual(['listening', 'draft']);
+    expect(await r.op('send', { draft: 1 })).toMatchObject({ ok: true, turn: 1 });
+    expect(r.posted).toEqual([{ text: 'Remind me to zulu. Zulu.', draft: 1 }]);
+    expect(r.draft()).toBeNull();
+    expect(await r.op('send', { draft: 1 })).toMatchObject({ ok: false, error: 'stale' });
+  });
+
+  it('talk stays off when the transcription cannot be set up, or the agent started speaking meanwhile', async () => {
+    const r = reviewControl();
+    await r.op('mode', { mode: 'review' });
+    r.voice.prepared = false;
+    expect(await r.op('talk')).toMatchObject({ ok: false, error: 'closed' });
+    expect(r.voice.record).not.toHaveBeenCalled();
+    r.voice.prepared = true;
+    r.control.onAgentSpeaking(true);
+    expect(await r.op('talk')).toMatchObject({ ok: false, error: 'agent_speaking' });
+  });
+
+  it('empty, failed and oversize drafts; a draft whose text never comes fails after four seconds', async () => {
+    const r = reviewControl();
+    await r.op('mode', { mode: 'review' });
+    await r.op('talk');
+    await r.op('done', { draft: 1 });
+    await r.stop('');
+    expect(r.draft()).toMatchObject({ state: 'empty' });
+    await r.op('talk');
+    await r.op('done', { draft: 2 });
+    await r.stop('', true);
+    expect(r.draft()).toMatchObject({ state: 'failed' });
+    await r.op('discard', { draft: 2 });
+    await r.op('talk');
+    await r.op('done', { draft: 3 });
+    await r.stop('слово '.repeat(1000));
+    expect(r.draft()).toMatchObject({ state: 'ready', tooLong: true });
+    expect(await r.op('send', { draft: 3 })).toMatchObject({ ok: false, error: 'unsendable' });
+    await r.op('discard', { draft: 3 });
+    vi.useFakeTimers();
+    await r.op('talk');
+    await r.op('done', { draft: 4 });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(r.draft()).toMatchObject({ id: 4, state: 'failed' });
+  });
+
+  it('a discard during finishing wins: the late text never shows and nothing is posted', async () => {
+    const r = reviewControl();
+    await r.op('mode', { mode: 'review' });
+    await r.op('talk');
+    await r.op('done', { draft: 1 });
+    await r.op('discard', { draft: 1 });
+    await r.stop('too late');
+    expect(r.draft()).toBeNull();
+    expect(r.posted).toEqual([]);
+  });
+
+  it('switching mid-turn makes the open words a draft, unsent; back to auto waits for it', async () => {
+    const r = reviewControl();
+    r.voice.turnOpen = true;
+    let give!: (rec: Recording | null) => void;
+    r.voice.setReviewing.mockImplementation(async (on: boolean) => (on ? new Promise((res) => (give = res)) : null));
+    expect(await r.op('mode', { mode: 'review' })).toMatchObject({ ok: true });
+    expect(r.draft()).toMatchObject({ state: 'finishing', reason: 'switch' });
+    expect(await r.op('mode', { mode: 'auto' })).toMatchObject({ ok: false, error: 'finishing' });
+    give({ text: 'Book a table', failed: false, take: {} });
+    await flush();
+    expect(r.draft()).toMatchObject({ state: 'ready', text: 'Book a table', reason: 'switch' });
+    expect(r.posted).toEqual([]);
+    await r.op('discard', { draft: 1 });
+    expect(await r.op('mode', { mode: 'auto' })).toMatchObject({ ok: true });
+  });
+
+  it('names a turn auto mode already sent, and a switch with nothing heard leaves no draft', async () => {
+    const r = reviewControl({ lastPosted: () => 3 });
+    expect(await r.op('mode', { mode: 'review', afterTurn: 2 })).toMatchObject({ ok: true, submitted: 3 });
+    expect(r.draft()).toBeNull();
+  });
+
+  it('a reply taking the channel stops a recording into a draft', async () => {
+    const r = reviewControl();
+    await r.op('mode', { mode: 'review' });
+    await r.op('talk');
+    r.control.beforeAgentSpeaks();
+    expect(r.draft()).toMatchObject({ state: 'finishing', reason: 'agent' });
+    expect(r.capture).toEqual([true, false]);
+    await r.stop('Book a table');
+    expect(r.draft()).toMatchObject({ state: 'ready', reason: 'agent' });
+  });
+
+  it('refuses everything once the call ended, and reads only well-formed requests', async () => {
+    const r = reviewControl();
+    r.control.close();
+    expect(await r.op('talk')).toMatchObject({ ok: false, error: 'closed' });
+    expect(readReviewRequest('{"gen":3,"draft":2,"mode":"review","wake":true,"x":1}')).toEqual({
+      gen: 3,
+      draft: 2,
+      mode: 'review',
+      wake: true,
+    });
+    expect(readReviewRequest('{"gen":4,"typing":false,"cues":true}')).toEqual({ gen: 4, typing: false, cues: true });
+    expect(readReviewRequest('{"gen":5,"typing":"no"}')).toEqual({ gen: 5 });
+    expect(readReviewRequest('{"draft":2}')).toBeNull();
+    expect(readReviewRequest('nope')).toBeNull();
+    expect(readReviewRequest('{"gen":6,"tts":{"provider":"elevenlabs","voice":"bIHbv24MWmeRgasZH58o","x":1}}')).toEqual(
+      {
+        gen: 6,
+        tts: { provider: 'elevenlabs', voice: 'bIHbv24MWmeRgasZH58o' },
+      },
+    );
+    // A malformed tts names no provider: refused as invalid, never dropped silently.
+    for (const tts of ['"gemini"', '{"provider":"gemini","voice":7}', `{"provider":"${'g'.repeat(65)}"}`]) {
+      expect(readReviewRequest(`{"gen":7,"tts":${tts}}`)).toEqual({ gen: 7, tts: { provider: '' } });
+    }
+  });
+});
+
+interface TtsPlan {
+  chunks?: number;
+  error?: Error & { retryable?: boolean };
+  sampleRate?: number;
+  numChannels?: number;
+  /** Samples per channel in each chunk. */
+  samples?: number;
+  /** Sample `n` of channel `c`; chunk number + 1 by default. */
+  value?: (n: number, c: number, rate: number) => number;
+  /** Awaited after the first chunk, or until the request is aborted. */
+  hold?: Promise<void>;
+}
+const untilAborted = (signal: AbortSignal) =>
+  new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+
+/** A provider instance whose lines the test decides, behaving as the SDK wrapper does: quiet on abort, `no audio` (retryable) for none. */
+function fakeTts(plan: (text: string, call: number) => TtsPlan) {
+  let calls = 0;
+  const t = { said: [] as string[], closed: 0, aborted: 0, instance: undefined as unknown as TtsInstance };
+  t.instance = {
+    sampleRate: 24_000,
+    numChannels: 1,
+    async *synthesize(text: string, signal: AbortSignal): AsyncGenerator<TtsAudio> {
+      t.said.push(text);
+      signal.addEventListener('abort', () => void t.aborted++, { once: true });
+      const p = plan(text, ++calls);
+      const rate = p.sampleRate ?? 24_000;
+      const channels = p.numChannels ?? 1;
+      const samples = p.samples ?? 480;
+      for (let i = 0; i < (p.chunks ?? 0); i++) {
+        if (signal.aborted) return;
+        const pcm = new Int16Array(samples * channels);
+        for (let n = 0; n < samples; n++) {
+          for (let c = 0; c < channels; c++) pcm[n * channels + c] = p.value?.(i * samples + n, c, rate) ?? i + 1;
+        }
+        yield { pcm, sampleRate: rate, numChannels: channels };
+        if (i === 0 && p.hold) await Promise.race([p.hold, untilAborted(signal)]);
+      }
+      if (signal.aborted) return;
+      if (p.error) throw p.error;
+      if (!p.chunks) throw Object.assign(new Error('no audio'), { retryable: true });
+    },
+    close: async () => void t.closed++,
+  };
+  return t;
+}
+type FakeTts = ReturnType<typeof fakeTts>;
+
+const GEMINI: TtsChoice = { provider: 'gemini', model: 'gemini-3.8-flash-tts', voice: 'alnilam' };
+const GEMINI_LITE: TtsChoice = { ...GEMINI, model: 'gemini-3.8-flash-lite-tts' };
+const ELEVEN: TtsChoice = { provider: 'elevenlabs', model: 'eleven_v4_turbo', voice: 'bIHbv24MWmeRgasZH58o' };
+const ttsId = (c: TtsChoice) => `${c.provider}/${c.model}/${c.voice}`;
+
+describe('speech output', () => {
+  const speak = async (speech: LineSpeech, text: string) => {
+    const chunks: TtsAudio[] = [];
+    for await (const audio of speech.speak(text, new AbortController().signal)) chunks.push(audio);
+    return chunks.length;
+  };
+  const retryable = (message: string) => Object.assign(new Error(message), { retryable: true });
+  /** A LineSpeech over fake providers by choice. */
+  const lineSpeech = (fakes: Record<string, FakeTts>, o: { choice?: TtsChoice; now?: () => number } = {}) =>
+    new LineSpeech({
+      choice: o.choice ?? GEMINI,
+      keys: { gemini: 'gk', elevenlabs: 'ek' },
+      log: silentLog,
+      build: (choice) => fakes[ttsId(choice)].instance,
+      ...(o.now ? { now: o.now } : {}),
+    });
+
+  it('speaks with the active choice, emoji left out; an empty line makes no request', async () => {
+    const primary = fakeTts(() => ({ chunks: 3 }));
+    const speech = lineSpeech({ [ttsId(GEMINI)]: primary });
+    expect(await speak(speech, 'Booked 🎉 for eight.')).toBe(3);
+    expect(primary.said).toEqual(['Booked  for eight.']);
+    expect(speech.spokenBy).toEqual(GEMINI);
+    expect(await speak(speech, '🎉')).toBe(0);
+    expect(primary.said).toHaveLength(1);
+  });
+
+  it('fails over before any audio, skips the failed choice for a while, then tries it again', async () => {
+    let now = 0;
+    const primary = fakeTts((_t, n) => (n === 1 ? { error: new Error('quota') } : { chunks: 1 }));
+    const fallback = fakeTts(() => ({ chunks: 2 }));
+    const speech = lineSpeech({ [ttsId(GEMINI)]: primary, [ttsId(GEMINI_LITE)]: fallback }, { now: () => now });
+    expect(await speak(speech, 'One.')).toBe(2);
+    expect(speech.spokenBy).toEqual(GEMINI_LITE);
+    expect(await speak(speech, 'Two.')).toBe(2);
+    expect(primary.said).toEqual(['One.']);
+    now += TTS_RECOVERY_DELAY_MS;
+    expect(await speak(speech, 'Three.')).toBe(1);
+    expect(primary.said).toEqual(['One.', 'Three.']);
+    expect(fallback.said).toEqual(['One.', 'Two.']);
+  });
+
+  it('falls over across providers: an ElevenLabs line the provider cannot say goes to the registry default', async () => {
+    const eleven = fakeTts(() => ({ error: new Error('quota') }));
+    const gemini = fakeTts(() => ({ chunks: 1 }));
+    const speech = lineSpeech({ [ttsId(ELEVEN)]: eleven, [ttsId(GEMINI)]: gemini }, { choice: ELEVEN });
+    expect(await speak(speech, 'One.')).toBe(1);
+    expect(speech.spokenBy).toEqual(GEMINI);
+    expect(speech.state.active).toEqual(ELEVEN);
+    // Without its key a provider never speaks: the default does.
+    const keyless = new LineSpeech({
+      choice: ELEVEN,
+      keys: { gemini: 'gk' },
+      log: silentLog,
+      build: (choice) => (choice.provider === 'gemini' ? gemini : eleven).instance,
+    });
+    expect(await speak(keyless, 'Two.')).toBe(1);
+    expect(eleven.said).toEqual(['One.']);
+    expect(gemini.said).toEqual(['One.', 'Two.']);
+  });
+
+  it('tries a transient failure once more on the same choice; never after audio started', async () => {
+    vi.useFakeTimers();
+    const primary = fakeTts((_t, n) => (n === 1 ? { error: retryable('busy') } : { chunks: 1 }));
+    const speech = lineSpeech({ [ttsId(GEMINI)]: primary });
+    const done = speak(speech, 'One.');
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await done).toBe(1);
+    expect(primary.said).toEqual(['One.', 'One.']);
+    vi.useRealTimers();
+
+    const partial = fakeTts(() => ({ chunks: 2, error: retryable('cut') }));
+    const fallback = fakeTts(() => ({ chunks: 2 }));
+    const second = lineSpeech({ [ttsId(GEMINI)]: partial, [ttsId(GEMINI_LITE)]: fallback });
+    await expect(speak(second, 'Long line.')).rejects.toThrow('cut');
+    expect(partial.said).toEqual(['Long line.']);
+    expect(fallback.said).toEqual([]);
+  });
+
+  it('a provider that stalls before audio is aborted and the fallback speaks; finished requests leave no listener on the call signal', async () => {
+    vi.useFakeTimers();
+    const stalled = fakeTts(() => ({}));
+    // The stall comes before any audio: a stream that never yields.
+    stalled.instance.synthesize = async function* (text, signal) {
+      stalled.said.push(text);
+      signal.addEventListener('abort', () => void stalled.aborted++, { once: true });
+      await untilAborted(signal);
+      yield* [];
+    };
+    const fallback = fakeTts(() => ({ chunks: 2 }));
+    const speech = lineSpeech({ [ttsId(GEMINI)]: stalled, [ttsId(GEMINI_LITE)]: fallback });
+    const call = new AbortController();
+    const chunks: TtsAudio[] = [];
+    const done = (async () => {
+      for await (const audio of speech.speak('One.', call.signal)) chunks.push(audio);
+    })();
+    await vi.advanceTimersByTimeAsync(60_000);
+    await done;
+    expect(stalled.aborted).toBe(1);
+    expect(chunks).toHaveLength(2);
+    expect(fallback.said).toEqual(['One.']);
+    for (let i = 0; i < 5; i++) for await (const _ of speech.speak('Again.', call.signal));
+    expect(getEventListeners(call.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('throws when no choice speaks', async () => {
+    const down = fakeTts(() => ({ error: new Error('down') }));
+    const speech = lineSpeech({ [ttsId(GEMINI)]: down, [ttsId(GEMINI_LITE)]: down });
+    await expect(speak(speech, 'One.')).rejects.toThrow('down');
+    expect(down.said).toEqual(['One.', 'One.']);
+  });
+
+  it('takes a line to 24 kHz mono: 24 kHz as is, channels averaged, other rates resampled with the tail flushed', () => {
+    const converting = vi.fn();
+    const same = new Int16Array(480).fill(7);
+    const direct = lineResampler(converting);
+    expect(direct.push({ pcm: same, sampleRate: 24_000, numChannels: 1 })).toBe(same);
+    const stereo = direct.push({
+      pcm: Int16Array.from({ length: 960 }, (_, i) => (i % 2 ? 3000 : 1000)),
+      sampleRate: 24_000,
+      numChannels: 2,
+    });
+    expect(stereo).toEqual(new Int16Array(480).fill(2000));
+    expect(direct.flush()).toHaveLength(0);
+    direct.close();
+    expect(converting).not.toHaveBeenCalled();
+
+    const at22 = lineResampler(converting);
+    const out: number[] = [];
+    try {
+      for (let i = 0; i < 10; i++)
+        out.push(...at22.push({ pcm: new Int16Array(2205).fill(1000), sampleRate: 22_050, numChannels: 1 }));
+      out.push(...at22.flush());
+    } finally {
+      at22.close();
+    }
+    expect(converting).toHaveBeenCalledTimes(1);
+    expect(converting).toHaveBeenCalledWith(22_050);
+    expect(Math.abs(out.length - 24_000)).toBeLessThanOrEqual(48);
+    // A steady level stays steady once the filter has settled: no interpolation ripple.
+    for (const v of out.slice(2_400, 21_600)) expect(Math.abs(v - 1000)).toBeLessThanOrEqual(2);
+  });
+
+  it('resamples a chunk that is a view into a larger buffer from the view, not the buffer start', () => {
+    const backing = new Int16Array(4_410).fill(-5000, 0, 2_205).fill(1000, 2_205);
+    const view = lineResampler(() => undefined);
+    const out: number[] = [];
+    try {
+      for (let i = 0; i < 4; i++)
+        out.push(...view.push({ pcm: backing.subarray(2_205), sampleRate: 22_050, numChannels: 1 }));
+      out.push(...view.flush());
+    } finally {
+      view.close();
+    }
+    expect(out.slice(480, -480).filter((v) => Math.abs(v - 1000) > 2)).toEqual([]);
+  });
+});
+
+const fixtures = JSON.parse(
+  fs.readFileSync(fileURLToPath(new URL('./channels/voice-mode-tts.fixtures.json', import.meta.url)), 'utf8'),
+) as {
+  settingsRequestTts: ReviewRequest & { tts: { provider: string; voice: string } };
+  replyTtsInvalid: Record<string, unknown>;
+  voiceAttribute: CallVoiceState;
+};
+
+/** A call whose lines go through the real speech output, with fake providers planned by choice (one chunk by default). */
+function speakingCall(plans: Record<string, (text: string, call: number) => TtsPlan> = {}) {
+  const built: Array<{ choice: TtsChoice; apiKey: string; tts: FakeTts }> = [];
+  const states: CallVoiceState[] = [];
+  const frames: Int16Array[] = [];
+  let output!: ReturnType<typeof speechOutput>;
+  const v = fakeVoice((meta, settings, events) => {
+    output = speechOutput({
+      meta,
+      settings,
+      sink: {
+        captureFrame: async (frame) => void frames.push(frame.data),
+        waitForPlayout: async () => undefined,
+      },
+      log: silentLog,
+      started: () => events.onAgentSpeaking(true),
+      stopped: () => events.onAgentSpeaking(false),
+      changed: (state) => void states.push(state),
+      build: (choice, apiKey) => {
+        const tts = fakeTts(plans[ttsId(choice)] ?? (() => ({ chunks: 1 })));
+        built.push({ choice, apiKey, tts });
+        return tts.instance;
+      },
+    });
+    return output;
+  });
+  const info = vi.fn();
+  return {
+    v,
+    built,
+    states,
+    frames,
+    get output() {
+      return output;
+    },
+    log: { info, warn: () => undefined },
+    /** The `voice-mode.reply` events so far. */
+    lines: () => info.mock.calls.filter(([m]) => m === 'voice-mode.reply').map(([, f]) => f as Record<string, unknown>),
+    said: (choice: TtsChoice) => built.filter((b) => sameChoice(b.choice, choice)).flatMap((b) => b.tts.said),
+  };
+}
+const sameChoice = (a: TtsChoice, b: TtsChoice) => ttsId(a) === ttsId(b);
+
+describe('voice selection in a call (the settings RPC)', () => {
+  const env = (extra: Record<string, string> = {}) => ({
+    ...ENV,
+    VOICE_MODE_ELEVENLABS_API_KEY: 'ek-test',
+    VOICE_MODE_TTS_DEESS: 'off',
+    ...extra,
+  });
+  const start = async (call: ReturnType<typeof speakingCall>, extraEnv: Record<string, string> = {}) => {
+    const { ctx, job } = fakeJob();
+    const host = fakeHostFetch();
+    await runCall(ctx, callDeps(host.fetchImpl, call.v, { log: call.log, env: env(extraEnv) }));
+    /** One line from the agent, spoken to its end. */
+    const line = async (text: string) => {
+      const before = call.lines().length;
+      host.emit({ type: 'reply', text, turn: null });
+      await vi.waitFor(() => expect(call.lines().length).toBeGreaterThan(before), { timeout: 3_000 });
+      return call.lines()[before];
+    };
+    return { host, job, line };
+  };
+  const ELEVEN_V4: TtsChoice = { ...ELEVEN, model: 'eleven_v4' };
+
+  it('a switch asked for mid-line applies at the next line: the old voice ends its line, then is closed once', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    const call = speakingCall({ [ttsId(GEMINI)]: (text) => (text === 'One.' ? { chunks: 3, hold } : { chunks: 1 }) });
+    const { host, job } = await start(call);
+    expect(call.output.speech.state).toEqual({ v: 1, active: GEMINI });
+    host.emit({ type: 'reply', text: 'One.', turn: null });
+    await vi.waitFor(() => expect(call.frames.length).toBeGreaterThan(0));
+    const reply = await call.v.rpc('settings', fixtures.settingsRequestTts);
+    expect(reply).toMatchObject({ gen: 7, ok: true });
+    expect(reply).not.toHaveProperty('error');
+    expect(call.states).toEqual([{ v: 1, active: GEMINI, pending: ELEVEN, gen: 7 }]);
+    expect(call.built.map((b) => [b.choice, b.apiKey])).toEqual([
+      [GEMINI, 'gk-test'],
+      [ELEVEN, 'ek-test'],
+    ]);
+    release();
+    await vi.waitFor(() => expect(call.lines()).toHaveLength(1));
+    expect(call.lines()[0]).toMatchObject({
+      outcome: 'spoken',
+      model: 'gemini/gemini-3.8-flash-tts',
+      voice: 'alnilam',
+    });
+    expect(call.built[0].tts.closed).toBe(0);
+    host.emit({ type: 'reply', text: 'Two.', turn: null });
+    await vi.waitFor(() => expect(call.lines()).toHaveLength(2));
+    expect(call.lines()[1]).toMatchObject({
+      outcome: 'spoken',
+      model: 'elevenlabs/eleven_v4_turbo',
+      voice: ELEVEN.voice,
+      fallback: false,
+    });
+    expect(call.said(GEMINI)).toEqual(['One.']);
+    expect(call.said(ELEVEN)).toEqual(['Two.']);
+    expect(call.built[0].tts.closed).toBe(1);
+    expect(call.states).toEqual([
+      { v: 1, active: GEMINI, pending: ELEVEN, gen: 7 },
+      { v: 1, active: ELEVEN, gen: 7 },
+    ]);
+    host.emit({ type: 'end', reason: 'hangup' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+    await vi.waitFor(() => expect(call.built[1].tts.closed).toBe(1));
+    expect(call.built[0].tts.closed).toBe(1);
+  });
+
+  it('two settings in a row: the first pending instance is closed at once, the second wins with its gen', async () => {
+    const call = speakingCall();
+    const { line } = await start(call);
+    const kore: TtsChoice = { ...GEMINI, voice: 'Kore' };
+    expect(await call.v.rpc('settings', fixtures.settingsRequestTts)).toMatchObject({ gen: 7, ok: true });
+    expect(await call.v.rpc('settings', { gen: 8, tts: { provider: 'gemini', voice: 'Kore' } })).toMatchObject({
+      gen: 8,
+      ok: true,
+    });
+    expect(call.built.map((b) => b.choice)).toEqual([ELEVEN, kore]);
+    expect(call.built[0].tts.closed).toBe(1);
+    expect(call.states.at(-1)).toEqual({ v: 1, active: GEMINI, pending: kore, gen: 8 });
+    expect(await line('One.')).toMatchObject({ model: 'gemini/gemini-3.8-flash-tts', voice: 'Kore' });
+    expect(call.said(ELEVEN)).toEqual([]);
+    expect(call.built[0].tts.closed).toBe(1);
+    expect(call.states.at(-1)).toEqual({ v: 1, active: kore, gen: 8 });
+  });
+
+  it('switches across providers both ways with keys from the settings; the whistle notch runs on Gemini lines only', async () => {
+    // A loud tone where Gemini whistles: the notch takes it out, nothing else does.
+    const tone = (n: number, _c: number, rate: number) => Math.round(8000 * Math.sin((2 * Math.PI * 8_118 * n) / rate));
+    const call = speakingCall({
+      [ttsId(GEMINI)]: () => ({ chunks: 10, samples: 2_400, value: tone }),
+      [ttsId(ELEVEN)]: () => ({ chunks: 10, samples: 2_205, sampleRate: 22_050, value: tone }),
+    });
+    const { line } = await start(call);
+    const one = await line('One.');
+    await call.v.rpc('settings', fixtures.settingsRequestTts);
+    const two = await line('Two.');
+    expect(await call.v.rpc('settings', { gen: 9, tts: { provider: 'gemini' } })).toMatchObject({ ok: true });
+    const three = await line('Three.');
+    expect([one, two, three].map((l) => l.model)).toEqual([
+      'gemini/gemini-3.8-flash-tts',
+      'elevenlabs/eleven_v4_turbo',
+      'gemini/gemini-3.8-flash-tts',
+    ]);
+    expect(call.built.map((b) => b.apiKey)).toEqual(['gk-test', 'ek-test', 'gk-test']);
+    expect(one.rmsDb).toBeLessThan(-35);
+    expect(three.rmsDb).toBeLessThan(-35);
+    expect(two.rmsDb).toBeGreaterThan(-25);
+    expect(call.states.at(-1)).toEqual({ v: 1, active: GEMINI, gen: 9 });
+  });
+
+  it('plays 22.05 kHz mono and 48 kHz stereo audio at the right 24 kHz length', async () => {
+    const call = speakingCall({
+      [ttsId(ELEVEN)]: () => ({ chunks: 10, samples: 2_205, sampleRate: 22_050, value: () => 1000 }),
+      [ttsId(ELEVEN_V4)]: () => ({
+        chunks: 5,
+        samples: 9_600,
+        sampleRate: 48_000,
+        numChannels: 2,
+        value: (_n, c) => (c ? 3000 : 1000),
+      }),
+    });
+    const { line } = await start(call);
+    await call.v.rpc('settings', fixtures.settingsRequestTts);
+    const one = await line('One.');
+    expect(one.durationMs).toBeGreaterThanOrEqual(1000);
+    expect(one.durationMs).toBeLessThanOrEqual(1020);
+    await call.v.rpc('settings', {
+      gen: 8,
+      tts: { provider: 'elevenlabs', model: 'eleven_v4', voice: ELEVEN.voice },
+    });
+    call.frames.length = 0;
+    const two = await line('Two.');
+    expect(two).toMatchObject({ model: 'elevenlabs/eleven_v4', durationMs: 1000 });
+    // Channels averaged to one level; the resampler's filter rings only at the line's edges.
+    const pcm = call.frames.flatMap((f) => Array.from(f));
+    expect(pcm.slice(480, -480).filter((v) => Math.abs(v - 2000) > 2)).toEqual([]);
+  });
+
+  it('a pending choice that fails before audio: the fallback speaks that line once, the choice stays active', async () => {
+    const call = speakingCall({
+      [ttsId(ELEVEN)]: () => ({ error: new Error('quota') }),
+      [ttsId(GEMINI)]: () => ({ chunks: 5 }),
+    });
+    const { line } = await start(call);
+    await call.v.rpc('settings', fixtures.settingsRequestTts);
+    expect(await line('One.')).toMatchObject({
+      outcome: 'spoken',
+      model: 'gemini/gemini-3.8-flash-tts',
+      voice: 'alnilam',
+      fallback: true,
+      durationMs: 100,
+    });
+    expect(call.said(ELEVEN)).toEqual(['One.']);
+    expect(call.said(GEMINI)).toEqual(['One.']);
+    expect(call.states.at(-1)).toEqual({ v: 1, active: ELEVEN, gen: 7 });
+  });
+
+  it('audio then a stream error ends the line there: no replay, no fallback', async () => {
+    const call = speakingCall({
+      [ttsId(ELEVEN)]: () => ({ chunks: 2, error: Object.assign(new Error('cut'), { retryable: true }) }),
+    });
+    const { line } = await start(call);
+    await call.v.rpc('settings', fixtures.settingsRequestTts);
+    expect(await line('One.')).toMatchObject({ outcome: 'partial', model: 'elevenlabs/eleven_v4_turbo' });
+    // What follows is the call's notice that the line broke off, never the line again.
+    await flush();
+    expect(call.said(ELEVEN).filter((text) => text === 'One.')).toHaveLength(1);
+    expect(call.said(GEMINI)).not.toContain('One.');
+  });
+
+  it('a resampled line frees its resampler however it ends; only a line spoken to its end flushes the tail', async () => {
+    const push = vi.spyOn(AudioResampler.prototype, 'push');
+    const flushed = vi.spyOn(AudioResampler.prototype, 'flush');
+    const closed = vi.spyOn(AudioResampler.prototype, 'close');
+    try {
+      const at22 = { sampleRate: 22_050, samples: 2_205 };
+      const call = speakingCall({
+        [ttsId(ELEVEN)]: (text) =>
+          text === 'One.'
+            ? { ...at22, chunks: 2 }
+            : text === 'Two.'
+              ? { ...at22, chunks: 2, error: Object.assign(new Error('cut'), { retryable: true }) }
+              : text === 'Three.'
+                ? { ...at22, chunks: 3, hold: new Promise(() => undefined) }
+                : { chunks: 1 },
+      });
+      const { host, job, line } = await start(call);
+      await call.v.rpc('settings', fixtures.settingsRequestTts);
+      expect(await line('One.')).toMatchObject({ outcome: 'spoken' });
+      expect([flushed.mock.calls.length, closed.mock.calls.length]).toEqual([1, 1]);
+      expect(await line('Two.')).toMatchObject({ outcome: 'partial' });
+      expect([flushed.mock.calls.length, closed.mock.calls.length]).toEqual([1, 2]);
+      const pushes = push.mock.calls.length;
+      host.emit({ type: 'reply', text: 'Three.', turn: null });
+      await vi.waitFor(() => expect(push.mock.calls.length).toBeGreaterThan(pushes));
+      host.emit({ type: 'end', reason: 'hangup' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
+      await vi.waitFor(() => expect(closed).toHaveBeenCalledTimes(3));
+      expect(flushed).toHaveBeenCalledTimes(1);
+    } finally {
+      push.mockRestore();
+      flushed.mockRestore();
+      closed.mockRestore();
+    }
+  });
+
+  it('a provider with no audio for a line is tried once more, then the fallback speaks it', async () => {
+    const call = speakingCall({ [ttsId(ELEVEN)]: () => ({ chunks: 0 }) });
+    const { line } = await start(call);
+    await call.v.rpc('settings', fixtures.settingsRequestTts);
+    expect(await line('One.')).toMatchObject({
+      outcome: 'spoken',
+      model: 'gemini/gemini-3.8-flash-tts',
+      fallback: true,
+    });
+    expect(call.said(ELEVEN)).toEqual(['One.', 'One.']);
+    expect(call.said(GEMINI)).toEqual(['One.']);
+  });
+
+  it('refuses an invalid or unavailable voice and still applies the other settings', async () => {
+    const call = speakingCall();
+    await start(call, { VOICE_MODE_ELEVENLABS_API_KEY: '' });
+    const invalid = await call.v.rpc('settings', {
+      ...fixtures.settingsRequestTts,
+      tts: { provider: 'elevenlabs', voice: 'not a voice' },
+    });
+    expect(invalid).toEqual({ ...fixtures.replyTtsInvalid, seq: expect.any(Number) });
+    expect(Object.keys(invalid)).toEqual(Object.keys(fixtures.replyTtsInvalid));
+    expect(call.v.states.at(-1)?.wake).toMatchObject({ on: true });
+    expect(await call.v.rpc('settings', { ...fixtures.settingsRequestTts, gen: 8, wake: false })).toEqual({
+      gen: 8,
+      ok: false,
+      seq: expect.any(Number),
+      error: 'tts_unavailable',
+    });
+    expect(call.v.states.at(-1)?.wake).toMatchObject({ on: false });
+    expect(await call.v.rpc('settings', { gen: 9, tts: { provider: 'nope' } })).toMatchObject({ error: 'tts_invalid' });
+    expect(call.built).toEqual([]);
+    expect(call.states).toEqual([]);
+  });
+
+  it('the same choice twice is ok and rebuilds nothing; asking for the active one drops the pending one', async () => {
+    const call = speakingCall();
+    await start(call);
+    expect(await call.v.rpc('settings', fixtures.settingsRequestTts)).toMatchObject({ ok: true });
+    expect(await call.v.rpc('settings', { ...fixtures.settingsRequestTts, gen: 8 })).toMatchObject({
+      gen: 8,
+      ok: true,
+    });
+    expect(call.built).toHaveLength(1);
+    expect(call.states).toEqual([{ v: 1, active: GEMINI, pending: ELEVEN, gen: 7 }]);
+    expect(await call.v.rpc('settings', { gen: 9, tts: GEMINI })).toMatchObject({ ok: true });
+    expect(call.built[0].tts.closed).toBe(1);
+    expect(call.states.at(-1)).toEqual({ v: 1, active: GEMINI, gen: 9 });
+    expect(await call.v.rpc('settings', { gen: 10, tts: GEMINI })).toMatchObject({ ok: true });
+    expect(call.states).toHaveLength(2);
+    expect(call.built).toHaveLength(1);
+  });
+
+  it('takes no settings from anyone but the caller', async () => {
+    const call = speakingCall();
+    await start(call);
+    await expect(
+      call.v.handle('settings', JSON.stringify(fixtures.settingsRequestTts), 'someone-else'),
+    ).rejects.toThrow('not a review request from the caller');
+    expect(call.built).toEqual([]);
+    expect(call.states).toEqual([]);
+  });
+
+  it('a hangup mid-line aborts the line and closes its provider', async () => {
+    const call = speakingCall({ [ttsId(GEMINI)]: () => ({ chunks: 3, hold: new Promise(() => undefined) }) });
+    const { host, job } = await start(call);
+    host.emit({ type: 'reply', text: 'One.', turn: null });
+    await vi.waitFor(() => expect(call.frames.length).toBeGreaterThan(0));
+    host.emit({ type: 'end', reason: 'hangup' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
+    await vi.waitFor(() => expect(call.built[0].tts.closed).toBe(1));
+    expect(call.built[0].tts.aborted).toBe(1);
+    expect(call.said(GEMINI)).toEqual(['One.']);
+  });
+});
+
+describe('spoken command matching', () => {
+  it('announces the one list it matches and gives the transcription', () => {
+    expect(JSON.parse(COMMAND_WORDS_JSON)).toEqual(CALL_COMMAND_WORDS);
+    expect(COMMAND_VOCABULARY).toEqual([...CALL_COMMAND_WORDS.send, ...CALL_COMMAND_WORDS.discard].map((w) => w.say));
+    for (const command of ['send', 'discard'] as const) {
+      for (const { say, ownSentence } of CALL_COMMAND_WORDS[command]) {
+        const spoken = `${say[0].toUpperCase()}${say.slice(1)}.`;
+        expect(matchCommand(spoken), say).toEqual({ command, rest: '', ...(ownSentence ? { ownSentence } : {}) });
+        expect(matchCommand(`Book a table. ${spoken}`), say).toMatchObject({ command, rest: 'Book a table.' });
+        // Inside a sentence only the ownSentence words are words.
+        expect(matchCommand(`Book a table ${say}`) === null, say).toBe(!!ownSentence);
+      }
+    }
+  });
+
+  it("marks a caption's command with the words before it", () => {
+    expect(captionMark('Book a table for two. Zulu.', 'send')).toEqual({
+      command: 'send',
+      words: 'Book a table for two.',
+    });
+    expect(captionMark('book a table, zulu', 'send')).toEqual({ command: 'send', words: 'book a table' });
+    expect(captionMark('Скільки буде? Прийом.', 'send')).toEqual({ command: 'send', words: 'Скільки буде?' });
+    expect(captionMark('Zulu.', 'send')).toEqual({ command: 'send', words: '' });
+    expect(captionMark('Book it. Scratch that.', 'discard')).toEqual({ command: 'discard', words: 'Book it.' });
+    // A final that left the command out: all of it is words.
+    expect(captionMark('Book a table.', 'discard')).toEqual({ command: 'discard', words: 'Book a table.' });
+    for (const [text, command] of [
+      ['Book a table for two. Zulu.', 'send'],
+      ['Скільки буде? Прийом.', 'send'],
+      ['Book it, copy that.', 'send'],
+    ] as const) {
+      const { words } = captionMark(text, command);
+      expect(text.startsWith(words), text).toBe(true);
+    }
+  });
+
+  it('finds a command only at the end of an utterance, with what was said before it', () => {
+    expect(matchCommand('Book a table for two. Zulu.')).toEqual({ command: 'send', rest: 'Book a table for two.' });
+    // The comma before the command goes, and the words keep their period.
+    expect(matchCommand('book a table, zulu')).toEqual({ command: 'send', rest: 'book a table.' });
+    expect(matchCommand('ZULU!')).toEqual({ command: 'send', rest: '' });
+    expect(matchCommand('Зулу.')).toEqual({ command: 'send', rest: '' });
+    // Mid-sentence it is words.
+    expect(matchCommand('Zulu, call Anna tomorrow')).toBeNull();
+    // `over` and `send it` are no commands any more.
+    expect(matchCommand('Book a table. Over.')).toBeNull();
+    expect(matchCommand('Book a table. Send it.')).toBeNull();
+    expect(matchCommand('Book a table. Send.')).toBeNull();
+    expect(matchCommand('Book a table, sendit')).toBeNull();
+    // Plain `zulu` needs no sentence of its own: the price of hands-free.
+    expect(matchCommand('Book a table zulu')).toEqual({ command: 'send', rest: 'Book a table.' });
+  });
+
+  it('takes copy and copy that only as their own sentence in any text, and the Ukrainian прийом anywhere', () => {
+    const rest = (text: string) => {
+      const m = matchCommand(text);
+      return m?.command === 'send' ? m.rest : null;
+    };
+    expect(rest('Book a table. Copy.')).toBe('Book a table.');
+    expect(rest('Copy')).toBe('');
+    expect(rest('Book a table, copy that.')).toBe('Book a table.');
+    expect(rest('Is it ready? Copy.')).toBe('Is it ready?');
+    expect(rest('Book a table - copy that')).toBe('Book a table.');
+    expect(rest('send me a copy')).toBeNull();
+    expect(rest('rewrite the landing page copy')).toBeNull();
+    expect(rest('can you copy that?')).toBeNull();
+    // A trailing "?" takes nothing away from a command.
+    expect(rest('Is it ready? Copy?')).toBe('Is it ready?');
+    expect(rest('Book a table. Copy?')).toBe('Book a table.');
+    expect(rest('Zulu?')).toBe('');
+    expect(rest('Прийом?')).toBe('');
+    // Interim text is held to the same boundary; a capital letter alone is none.
+    expect(rest('rewrite the landing page Copy')).toBeNull();
+    expect(rest('1 + 2 Copy.')).toBeNull();
+    expect(rest('Please make a, copy')).toBe('Please make a.');
+    expect(rest('Скільки зараз часу? Прийом.')).toBe('Скільки зараз часу?');
+    expect(rest('Скільки зараз часу прийом')).toBe('Скільки зараз часу.');
+    expect(rest('Прийом')).toBe('');
+    expect(rest('zulu again')).toBeNull();
+  });
+
+  it('knows the discard phrases, longest first, and only at the end', () => {
+    expect(matchCommand('Call the plumber. Discard this turn.')).toEqual({
+      command: 'discard',
+      rest: 'Call the plumber.',
+    });
+    expect(matchCommand('call the plumber discard turn')).toEqual({ command: 'discard', rest: 'call the plumber.' });
+    expect(matchCommand('No wait - scratch that!')).toEqual({ command: 'discard', rest: 'No wait.' });
+    expect(matchCommand('Scratch that.')).toEqual({ command: 'discard', rest: '' });
+    expect(matchCommand('scratch that idea and call the plumber')).toBeNull();
+  });
+
+  it('finds the wake phrase by the agent name or its vocabulary spellings, across scripts and punctuation', () => {
+    const names = wakeNameWords(['Andy', 'Енді', 'Nano Claw', 'Al']);
+    const after = (text: string) => {
+      const found = matchWake(text, names);
+      return found && text.slice(found.end);
+    };
+    expect(after('Hey, Andy. What is on today?')).toBe('. What is on today?');
+    // It starts at its hey, glued or not.
+    expect(matchWake('So I said hey Andy', names)).toEqual({ start: 10, end: 18 });
+    expect(matchWake('Ok. Heyandy, go', wakeNameWords(['Andy']))).toEqual({ start: 4, end: 11 });
+    expect(after('hey andy')).toBe('');
+    expect(after('Гей, Енді, що там?')).toBe(', що там?');
+    expect(after('Хей Енді')).toBe('');
+    // A spelling that sounds alike counts; one that sounds different does not.
+    expect(after('Хей Енди')).toBe('');
+    expect(after('hey Endy, go')).toBe(', go');
+    expect(after('Hey, and then what?')).toBeNull();
+    expect(after('Hey Andrew')).toBeNull();
+    // The name alone, or hey alone, is not the phrase.
+    expect(after('Andy, what is on today?')).toBeNull();
+    expect(after('Hey there')).toBeNull();
+    // A name of two words is the two words; the text before the phrase is not part of it.
+    expect(after('So I said hey Nano Claw, start')).toBe(', start');
+    expect(after('hey nano')).toBeNull();
+    // A name under three letters counts only as spelled.
+    expect(after('hey Al, go')).toBe(', go');
+    expect(after('hey all, go')).toBeNull();
+  });
+
+  it('takes hi and хай for hey, a Ukrainian vocative, and hey glued to the name', () => {
+    const ben = wakeNameWords(['Ben']);
+    const sam = wakeNameWords(['Sam']);
+    const after = (text: string, names = ben) => {
+      const found = matchWake(text, names);
+      return found && text.slice(found.end);
+    };
+    expect(after('Hi Ben, what time is it?')).toBe(', what time is it?');
+    expect(after('Хай Бен')).toBe('');
+    expect(after('Hai Ben')).toBe('');
+    expect(after('Гей, Бене, що там?')).toBe(', що там?');
+    expect(after('Гей, Семе', sam)).toBe('');
+    expect(after('Heyben, go')).toBe(', go');
+    // Not every word that starts like hey: `hidden` is no `hi Den`.
+    expect(after('It was hidden', wakeNameWords(['Den']))).toBeNull();
+    expect(after('Hey Bena')).toBeNull();
+    // The vocative ending only counts in Cyrillic: `Hey, bone` is not `Hey, Ben`.
+    expect(after('Hey, bone')).toBeNull();
+  });
+});
+
+describe('turn text', () => {
+  it('takes the final, unless it collapsed to a short last phrase or never came: then the last interim', () => {
+    expect(turnText(heard('Book a table for two. Zulu.', 'Book a table for two. Zulu.'))).toEqual({
+      text: 'Book a table for two. Zulu.',
+      source: 'final',
+    });
+    expect(turnText(heard('Book a table for two. Zulu.', 'Zulu.'))).toEqual({
+      text: 'Book a table for two. Zulu.',
+      source: 'collapse_interim',
+    });
+    expect(turnText(heard('А ти можеш відповідати? Прийом.', 'прийом'))).toEqual({
+      text: 'А ти можеш відповідати? Прийом.',
+      source: 'collapse_interim',
+    });
+    // A short turn whose final is as long as its interim is the final.
+    expect(turnText(heard('Yes, zulu.', 'Yes. Zulu.'))).toEqual({ text: 'Yes. Zulu.', source: 'final' });
+    // A longer final is never replaced, however long the interim.
+    expect(turnText(heard('Book a table for two at eight please', 'Book a table for two.'))).toEqual({
+      text: 'Book a table for two.',
+      source: 'final',
+    });
+    expect(turnText(heard('Book a table'))).toEqual({ text: 'Book a table', source: 'no_final_interim' });
+    expect(turnText(heard(''))).toEqual({ text: '', source: 'none' });
+  });
+});
+
+describe('audio ring and turn capture', () => {
+  it('keeps the last seconds by stream position, across the wrap', () => {
+    const ring = new AudioRing();
+    const total = 16_000 * 12;
+    for (let i = 0; i < total; i += 1600) ring.push(Int16Array.from({ length: 1600 }, (_, j) => (i + j) % 30000));
+    expect(ring.position).toBe(total);
+    const last = ring.since(total - 3);
+    expect([...last]).toEqual([(total - 3) % 30000, (total - 2) % 30000, (total - 1) % 30000]);
+    // Older than the ring keeps: from its oldest sample.
+    expect(ring.since(0).length).toBe(16_000 * 10);
+    expect(ring.since(total).length).toBe(0);
+  });
+
+  it('records a turn from its pre-roll, trimmed where asked, capped, and only once', () => {
+    let now = 10_000;
+    const capture = new TurnCapture(() => now);
+    expect(capture.take(0)).toBeUndefined();
+    capture.start(new Int16Array(16 * 500).fill(1));
+    capture.push(new Int16Array(16 * 1000).fill(9));
+    now = 12_000;
+    const audio = capture.take(1000, 16 * 1200)!;
+    expect(audio.pcm.length).toBe(16 * 1200);
+    expect(audio.pcm[16 * 500]).toBe(9);
+    expect(audio).toMatchObject({
+      sampleRate: 16_000,
+      startedAt: 9_500,
+      endedAt: 10_700,
+      speechMs: 1000,
+      truncated: false,
+    });
+    expect(capture.take(0)).toBeUndefined();
+    capture.start(new Int16Array(0));
+    for (let i = 0; i < 130; i++) capture.push(new Int16Array(16_000));
+    expect(capture.take(0)?.truncated).toBe(true);
+  });
+});
+
+/** CallTurns against a fake transcription, on fake timers; the audio and the clock move together. */
+function turnsHarness(
+  o: {
+    wake?: boolean;
+    pauseSends?: boolean;
+    wakeWord?: string;
+    limits?: { startMs: number; idleMs: number };
+    record?: boolean;
+    debug?: boolean;
+  } = {},
+) {
+  vi.useFakeTimers();
+  const t = fakeTranscription();
+  const out = {
+    sent: [] as string[],
+    lost: [] as string[],
+    noise: 0,
+    drops: [] as Array<[string, string]>,
+    lone: [] as Array<{ command: string; segment: number }>,
+    cues: [] as CueKind[],
+    captions: [] as Array<[number, string, boolean]>,
+    marks: [] as Array<[number, string, boolean, CaptionMark]>,
+    countdown: [] as string[],
+    holds: [] as boolean[],
+    noTurn: 0,
+    unheard: 0,
+    takes: [] as Array<TurnAudio | undefined>,
+    facts: [] as Array<TurnFacts | undefined>,
+    ended: [] as Array<[TurnFacts, string, string]>,
+    logs: [] as string[],
+    /** The wake state at every `changed`, as a page would get it. */
+    states: [] as CallWakeState[],
+  };
+  const turns: CallTurns = new CallTurns(
+    {
+      transcriber: t,
+      reserve: () => ({
+        send: (text, take) => {
+          out.sent.push(text);
+          out.takes.push(take.audio);
+          out.facts.push(take.facts);
+        },
+        lost: (reason) => void out.lost.push(reason),
+        noise: () => void out.noise++,
+        skip: () => undefined,
+      }),
+      ended: (facts, outcome, reason) => void out.ended.push([facts, outcome, reason]),
+      drop: (reason, text, lone) => {
+        out.drops.push([reason, text]);
+        if (lone) out.lone.push(lone);
+      },
+      cue: (kind) => void out.cues.push(kind),
+      caption: (segment, text, final, mark) => {
+        out.captions.push([segment, text, final]);
+        if (mark) out.marks.push([segment, text, final, mark]);
+      },
+      countdown: {
+        stopped: (at) => void out.countdown.push(`stopped ${Date.now() - at}`),
+        clear: () => void out.countdown.push('clear'),
+      },
+      changed: () => void out.states.push(turns.state),
+      hold: (open) => void out.holds.push(open),
+      noTurn: () => void out.noTurn++,
+      unheard: () => void out.unheard++,
+      log: { info: (msg: string) => void out.logs.push(msg), warn: () => undefined },
+    },
+    {
+      silenceMs: SILENCE,
+      names: ['Andy'],
+      limits: o.limits,
+      record: o.record,
+      ...(o.debug ? { debug: true } : {}),
+    },
+  );
+  turns.configure(o.wake ?? false, o.pauseSends ?? false);
+  if (o.wakeWord) turns.useWakeWord(o.wakeWord);
+  let position = 0;
+  /** Where the VAD's last window with speech in it ended. */
+  let quietFrom = 0;
+  /** `ms` of audio, in 20 ms frames, with the clock; the VAD analyzes each frame as it comes (speech: a level), unless `vad` is off. */
+  const pass = async (ms: number, level = 0, vad = true) => {
+    for (let at = 0; at < ms; at += 20) {
+      turns.audio(new Int16Array(320).fill(level));
+      position += 320;
+      if (level) quietFrom = position;
+      if (vad) turns.onVad(position, quietFrom);
+      await vi.advanceTimersByTimeAsync(20);
+    }
+  };
+  /** The caller speaks `ms`; the VAD reports the start then, and the end 550 ms into the silence after. */
+  const talk = async (ms: number) => {
+    const start = position;
+    await pass(Math.min(ms, 100), 500);
+    turns.onSpeech(true, start);
+    await pass(Math.max(0, ms - 100), 500);
+    const end = position;
+    await pass(550);
+    turns.onSpeech(false, end);
+    await vi.advanceTimersByTimeAsync(0);
+  };
+  /**
+   * The wake phrase as the call hears it: the VAD's speech starts `before` ms ahead of the detection and
+   * goes on `after` ms past it (the phrase's tail, or the caller going on), then ends 550 ms into the silence.
+   */
+  const wakeInSpeech = async (before: number, after: number) => {
+    const start = position;
+    await pass(Math.min(before, 100), 500);
+    turns.onSpeech(true, start);
+    await pass(Math.max(0, before - 100), 500);
+    turns.onWake(position);
+    await pass(after, 500);
+    const end = position;
+    await pass(550);
+    turns.onSpeech(false, end);
+    await vi.advanceTimersByTimeAsync(0);
+  };
+  return {
+    turns,
+    t,
+    out,
+    pass,
+    talk,
+    wakeInSpeech,
+    get position() {
+      return position;
+    },
+    interim: async (text: string) => {
+      turns.onInterim(text);
+      await vi.advanceTimersByTimeAsync(0);
+    },
+  };
+}
+
+describe('CallTurns, transcript debug', () => {
+  it('logs the interims, speech and the decision only with debug on, and decides the same', async () => {
+    for (const debug of [false, true]) {
+      const h = turnsHarness({ debug });
+      h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+      await h.talk(1500);
+      await h.interim('Book a table. Zulu.');
+      await h.interim('Book a table. Zulu.');
+      expect(h.out.sent).toEqual(['Book a table.']);
+      const lines = h.out.logs.filter((msg) => msg.startsWith('voice-mode.transcript-debug'));
+      if (!debug) expect(lines).toEqual([]);
+      else
+        expect(lines).toEqual(
+          expect.arrayContaining([
+            'voice-mode.transcript-debug turns.speech',
+            'voice-mode.transcript-debug turns.interim',
+            'voice-mode.transcript-debug turns.command',
+            'voice-mode.transcript-debug turns.committed',
+          ]),
+        );
+    }
+  });
+});
+
+describe('CallTurns, hands-free', () => {
+  it('opens a turn at the speech with a pre-roll and sends it after the closing silence, counted from the speech end', async () => {
+    const h = turnsHarness();
+    await h.pass(2000);
+    h.t.results.push(heard('Book a table for two', 'Book a table for two.'));
+    await h.talk(1000);
+    // The pre-roll (500 ms) and the speech heard so far when the VAD reported it (100 ms).
+    expect(h.t.begins).toEqual([16 * 600]);
+    expect(h.out.holds).toEqual([true]);
+    expect(h.out.countdown.at(-1)).toBe('stopped 560');
+    await h.pass(SILENCE - 600);
+    expect(h.t.ended).toBe(0);
+    await h.pass(100);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    expect(h.out.holds).toEqual([true, false]);
+    expect(h.out.captions.at(-1)).toEqual([1, 'Book a table for two.', true]);
+  });
+
+  it('keeps a thinking pause in the same turn: one activity, one text', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('з купівлею нового столу', 'З купівлею, не знаю, нового столу.'));
+    await h.talk(1000);
+    await h.pass(1500);
+    await h.talk(800);
+    await h.pass(SILENCE);
+    expect(h.t.begins).toHaveLength(1);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual(['З купівлею, не знаю, нового столу.']);
+  });
+
+  it('a send word in one interim, with the caller quiet, commits the turn at once: the cue then, the final stripped', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Book a table for two. Zulu.', 'Zulu.'));
+    await h.talk(1500);
+    await h.interim('Book a table for two. Zulu.');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.cues).toEqual(['sent']);
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    expect(h.out.holds).toEqual([true, false]);
+    // A repeat of the interim after the commit belongs to no turn.
+    await h.interim('Book a table for two. Zulu.');
+    expect(h.t.ended).toBe(1);
+    // Each caption says the command it ends in: the interim as heard, the sent final as only its words.
+    expect(h.out.marks).toEqual([
+      [1, 'Book a table for two. Zulu.', false, { command: 'send', words: 'Book a table for two.' }],
+      [1, 'Book a table for two.', true, { command: 'send', words: 'Book a table for two.' }],
+    ]);
+  });
+
+  it('holds a command while the caller still talks; new words make it words', async () => {
+    const h = turnsHarness();
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, 0);
+    await h.interim('Book a table. Zulu.');
+    await h.interim('Book a table. Zulu.');
+    expect(h.t.ended).toBe(0);
+    await h.interim('Book a table. Zulu to Anna');
+    await h.pass(600);
+    h.turns.onSpeech(false, h.position - 16 * 600);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.t.ended).toBe(0);
+    // The send word again once they stopped: it acts.
+    h.t.results.push(heard('Book a table. Zulu to Anna. Zulu.', 'Book a table. Zulu to Anna. Zulu.'));
+    await h.interim('Book a table. Zulu to Anna. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table. Zulu to Anna.']);
+  });
+
+  it('a send word waits for the VAD: not before it analyzed past the interim, nor in under 550 ms of quiet, nor after a blip', async () => {
+    const h = turnsHarness();
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, 0);
+    await h.pass(400, 500);
+    const end = h.position;
+    // The VAD said the speech ended, but its windows run behind the interim.
+    await h.pass(600, 0, false);
+    h.turns.onVad(end + 16 * 560, end);
+    h.turns.onSpeech(false, end);
+    await h.interim('Book a table. Zulu.');
+    expect(h.t.ended).toBe(0);
+    // Analyzed past it, but a short blip of speech (too short for a speech start) broke the quiet.
+    await h.pass(40, 500);
+    expect(h.t.ended).toBe(0);
+    await h.pass(500);
+    expect(h.t.ended).toBe(0);
+    await h.pass(60);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual(['Book a table.']);
+  });
+
+  it('a send word heard under the agent line waits for quiet after it', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'hey_andy' });
+    h.turns.onWake(h.position + 1);
+    await h.pass(20);
+    await h.talk(800);
+    h.turns.onAgentSpeaking(true);
+    await h.interim('What is the time? Zulu.');
+    await h.pass(1000);
+    expect(h.t.ended).toBe(0);
+    h.turns.onAgentSpeaking(false);
+    await h.pass(500);
+    expect(h.t.ended).toBe(0);
+    h.t.results.push(heard('What is the time? Zulu.', 'What is the time? Zulu.'));
+    await h.pass(60);
+    expect(h.out.sent).toEqual(['What is the time?']);
+  });
+
+  it('a send word the final does not end with still sends, with the final words; the next speech is a turn of its own', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Book a table, zulu', 'Book a table, zulu to Anna tomorrow.'));
+    await h.talk(1500);
+    await h.interim('Book a table, zulu');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual(['Book a table, zulu to Anna tomorrow.']);
+    expect(h.out.cues).toEqual(['sent']);
+    h.t.results.push(heard('And for eight.', 'And for eight.'));
+    await h.talk(800);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Book a table, zulu to Anna tomorrow.', 'And for eight.']);
+    expect(h.out.cues).toEqual(['sent']);
+  });
+
+  it('a discard phrase the final does not end with was words: the turn goes on, carrying them, from where it ended', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Book a table, scratch that', 'Book a table, scratch that one and book the bar.'));
+    await h.talk(1500);
+    await h.interim('Book a table, scratch that');
+    expect(h.t.ended).toBe(0);
+    await h.interim('Book a table, scratch that');
+    expect(h.t.ended).toBe(1);
+    // A successor activity from where the first ended: no pre-roll twice.
+    expect(h.t.begins).toEqual([16 * 100, 0]);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.cues).toEqual([]);
+    h.t.results.push(heard('And for eight.', 'And for eight.'));
+    await h.talk(800);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Book a table, scratch that one and book the bar. And for eight.']);
+  });
+
+  it('a final that leaves the command out but ends where the interim text did still confirms it', async () => {
+    const h = turnsHarness();
+    h.t.results.push(
+      heard('перевір мій список, що саме там треба купити? Прийом.', 'Перевір мій список, і що саме там треба купити?'),
+    );
+    await h.talk(1500);
+    await h.interim('перевір мій список, що саме там треба купити? Прийом.');
+    await h.interim('перевір мій список, що саме там треба купити? Прийом.');
+    expect(h.out.sent).toEqual(['Перевір мій список, і що саме там треба купити?']);
+    expect(h.t.begins).toHaveLength(1);
+  });
+
+  it('a pause after a command the final left out still applies it: a discard never sends', async () => {
+    const h = turnsHarness();
+    h.t.results.push(
+      heard(
+        'а можеш мені нагадати коли ми почали з проєктом Бета? Scratch that.',
+        'А можеш мені нагадати, коли ми почали з Бета проектом?',
+      ),
+    );
+    await h.talk(2000);
+    await h.interim('а можеш мені нагадати коли ми почали з проєктом Бета?');
+    await h.interim('а можеш мені нагадати коли ми почали з проєктом Бета? Scratch that.');
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['discarded', 'А можеш мені нагадати, коли ми почали з Бета проектом?']]);
+    // An interim command the final does not end like is not taken: the final's words win.
+    h.t.results.push(heard('Remind me to zulu.', 'Remind me to zulu to Anna tomorrow.'));
+    await h.talk(1500);
+    await h.interim('Remind me to zulu.');
+    // The settled interim ends the activity; the final's words go on, and its own closing silence sends them.
+    await h.pass(DISCARD_SETTLE_MS + SILENCE);
+    expect(h.out.sent).toEqual(['Remind me to zulu to Anna tomorrow.']);
+  });
+
+  it('a command a final asks as a question still acts', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('is the table booked zulu', 'Is the table booked? Zulu?'));
+    await h.talk(1500);
+    await h.interim('is the table booked zulu');
+    await h.interim('is the table booked zulu');
+    expect(h.out.sent).toEqual(['Is the table booked?']);
+    expect(h.out.logs).toEqual([]);
+  });
+
+  it('a copy inside a sentence stays words: it never ends the activity, and the final logs a near-miss', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('can you copy that', 'Can you copy that?'));
+    await h.talk(1500);
+    await h.interim('can you copy that');
+    await h.interim('can you copy that');
+    expect(h.t.ended).toBe(0);
+    expect(h.out.marks).toEqual([]);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Can you copy that?']);
+    expect(h.out.logs).toContain('voice-mode.command near-miss word=copy-that reason=no-boundary');
+  });
+
+  it('reads where a final ends by sound, across spellings and scripts', () => {
+    expect(endsLike('коли ми почали з Бета проектом?', 'коли ми почали з проєктом Бета?')).toBe(true);
+    expect(endsLike('що саме там треба купити?', 'і сказати, що саме там треба купити?')).toBe(true);
+    expect(endsLike('Zulu to Anna tomorrow.', 'Remind me to')).toBe(false);
+    expect(endsLike('Yes.', 'Yes')).toBe(false);
+  });
+
+  it('speech after a committed send, before its final, is a turn of its own; its pre-roll takes none of the first', async () => {
+    const h = turnsHarness();
+    h.t.hold = true;
+    h.t.results.push(heard('Remind me to zulu', 'Remind me to zulu.'));
+    await h.talk(1500);
+    await h.interim('Remind me to zulu');
+    expect(h.t.ended).toBe(1);
+    h.t.results.push(heard('to Anna tomorrow.', 'to Anna tomorrow.'));
+    await h.talk(800);
+    await h.pass(SILENCE);
+    expect(h.t.ended).toBe(2);
+    expect(h.t.begins).toEqual([16 * 100, 16 * 100]);
+    expect(h.out.sent).toEqual([]);
+    h.t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    // Both go; the order they go to the host in is TurnTaking's (the order they closed).
+    expect(h.out.sent).toHaveLength(2);
+    expect(h.out.sent).toEqual(expect.arrayContaining(['Remind me to.', 'to Anna tomorrow.']));
+    expect(h.out.cues).toEqual(['sent']);
+  });
+
+  it('a pause sends a turn whose final has a command the interims missed, without it; a discard drops it', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Скільки буде два плюс три?', 'Скільки буде два плюс три? Прийом.'));
+    await h.talk(1500);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Скільки буде два плюс три?']);
+    h.t.results.push(
+      heard('Remind me to call the plumber. Scratch that.', 'Remind me to call the plumber. Scratch that.'),
+    );
+    await h.talk(1500);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toHaveLength(1);
+    expect(h.out.drops).toEqual([['discarded', 'Remind me to call the plumber. Scratch that.']]);
+    expect(h.out.cues).toEqual(['discard']);
+    // No interim showed either command; the finals carry what the worker did with them.
+    expect(h.out.marks).toEqual([
+      [1, 'Скільки буде два плюс три?', true, { command: 'send', words: 'Скільки буде два плюс три?' }],
+      [
+        2,
+        'Remind me to call the plumber. Scratch that.',
+        true,
+        { command: 'discard', words: 'Remind me to call the plumber.' },
+      ],
+    ]);
+    expect(h.out.lone).toEqual([]);
+  });
+
+  it('a command one interim showed and the next and the final left out still discards at the pause, with no countdown', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Remind me to call the plumber.', 'Remind me to call the plumber.'));
+    await h.talk(1500);
+    expect(h.out.countdown.at(-1)).toMatch(/^stopped/);
+    await h.interim('Remind me to call the plumber. Scratch that.');
+    // A command is pending: the countdown goes, so nothing looks like it is being sent.
+    expect(h.out.countdown.at(-1)).toBe('clear');
+    await h.interim('Remind me to call the plumber.');
+    expect(h.out.countdown.at(-1)).toBe('clear');
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['discarded', 'Remind me to call the plumber.']]);
+    expect(h.out.cues).toEqual(['discard']);
+    // New words after the command, or the same words said again, make it words.
+    h.t.results.push(
+      heard(
+        'Remind me to call mom. Scratch that. Remind me to call mom tomorrow.',
+        'Remind me to call mom. Scratch that. Remind me to call mom tomorrow.',
+      ),
+    );
+    await h.talk(1500);
+    await h.interim('Remind me to call mom. Scratch that.');
+    await h.talk(1500);
+    await h.interim('Remind me to call mom. Scratch that. Remind me to call mom tomorrow.');
+    expect(h.out.countdown.at(-1)).toMatch(/^stopped/);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Remind me to call mom. Scratch that. Remind me to call mom tomorrow.']);
+  });
+
+  it('a sent turn shows what the agent got: no spoken command in its caption, the period kept', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Answer in one word, zulu.', 'Answer in one word, zulu.'));
+    await h.talk(1500);
+    await h.interim('Answer in one word, zulu.');
+    await h.interim('Answer in one word, zulu.');
+    expect(h.out.sent).toEqual(['Answer in one word.']);
+    expect(h.out.captions.at(-1)).toEqual([1, 'Answer in one word.', true]);
+  });
+
+  it('a command alone sends nothing, asked or not', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Zulu.', 'Zulu.'));
+    await h.talk(600);
+    await h.interim('Zulu.');
+    await h.interim('Zulu.');
+    expect(h.out.drops).toEqual([['command', 'Zulu.']]);
+    expect(h.out.lone).toEqual([{ command: 'send', segment: 1 }]);
+    expect(h.out.marks.at(-1)).toEqual([1, 'Zulu.', true, { command: 'send', words: '' }]);
+    expect(h.out.cues).toEqual(['nope']);
+    h.t.results.push(heard('Zulu?', 'Zulu?'));
+    await h.talk(800);
+    await h.interim('Zulu?');
+    await h.interim('Zulu?');
+    expect(h.out.drops).toEqual([
+      ['command', 'Zulu.'],
+      ['command', 'Zulu?'],
+    ]);
+    expect(h.out.sent).toEqual([]);
+  });
+
+  it('noise, a turn heard as nothing, and a failed transcription; interim text is never lost', async () => {
+    const h = turnsHarness();
+    await h.talk(300);
+    await h.pass(SILENCE);
+    expect(h.out.noise).toBe(1);
+    await h.talk(1500);
+    await h.pass(SILENCE);
+    expect(h.out.lost).toEqual(['empty']);
+    h.t.results.push(heard('', undefined, true));
+    await h.talk(1500);
+    await h.pass(SILENCE);
+    expect(h.out.lost).toEqual(['empty', 'stt']);
+    h.t.results.push(heard('Book a table', undefined, true));
+    await h.talk(1500);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Book a table']);
+  });
+
+  it('under the agent line: no turn opens, the caller is unheard, and the turn hears silence', async () => {
+    const h = turnsHarness();
+    h.turns.onAgentSpeaking(true);
+    await h.talk(1000);
+    expect(h.out.unheard).toBe(1);
+    expect(h.t.begins).toEqual([]);
+    h.turns.onAgentSpeaking(false);
+    // A reply that waited its longest takes the channel from an open turn: it goes out as it is.
+    h.t.results.push(heard('Book a table', 'Book a table'));
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, h.position - 1600);
+    await h.pass(500, 500);
+    const pushedBefore = h.t.pushed;
+    h.turns.onAgentSpeaking(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual(['Book a table']);
+    expect(h.t.pushed).toBe(pushedBefore);
+  });
+
+  it('records each turn when asked: its pre-roll and speech, cut a pad after its last speech', async () => {
+    const h = turnsHarness({ record: true });
+    await h.pass(2000);
+    h.t.results.push(heard('Book a table', 'Book a table'));
+    await h.talk(1000);
+    await h.pass(SILENCE);
+    expect(h.out.takes[0]?.pcm.length).toBe(16 * (500 + 1000 + 300));
+    expect(h.out.takes[0]?.speechMs).toBe(1000);
+  });
+});
+
+describe('CallTurns, wake', () => {
+  it('nothing is transcribed before the wake word; the turn starts at the next speech, never before the phrase; only send sends', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(3000);
+    await h.talk(1500);
+    expect(h.t.begins).toEqual([]);
+    expect(h.turns.spotting).toBe(true);
+    const end = h.position;
+    h.turns.onWake(end);
+    // Awake, and nothing goes to the transcription until the caller speaks.
+    expect(h.t.begins).toEqual([]);
+    expect(h.out.cues).toEqual(['wake']);
+    expect(h.out.holds).toEqual([true]);
+    expect(h.turns.state).toMatchObject({ on: true, waiting: false, heard: 1, phrase: 'Hey LiveKit', cut: true });
+    h.t.results.push(heard('Book a table for two. Zulu.', 'Zulu.'));
+    await h.talk(1500);
+    // No audio from before the detection: the phrase (which ends there) is not in the turn's pre-roll.
+    expect(h.t.begins).toEqual([16 * 100]);
+    await h.pass(SILENCE + 500);
+    expect(h.t.ended).toBe(0);
+    await h.interim('Book a table for two. Zulu.');
+    await h.interim('Book a table for two. Zulu.');
+    // The text is not searched for the phrase: words like it after the wake stay words.
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    expect(h.turns.state.waiting).toBe(true);
+  });
+
+  it('a copy with no boundary before it never ends the activity; one as its own sentence then sends it all', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(
+      heard('copy the file then copy. Book a table. Copy.', 'Copy the file then copy. Book a table. Copy.'),
+    );
+    await h.talk(1500);
+    await h.interim('copy the file then copy');
+    await h.interim('copy the file then copy');
+    expect(h.t.ended).toBe(0);
+    expect(h.turns.state.waiting).toBe(false);
+    await h.talk(1200);
+    await h.interim('copy the file then copy. Book a table. Copy.');
+    expect(h.out.sent).toEqual(['Copy the file then copy. Book a table.']);
+    expect(h.turns.state.waiting).toBe(true);
+  });
+
+  it('a committed copy the final left out or rewrote still sends: the final words as they are', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Rewrite the landing page. Copy.', 'Rewrite the landing page'));
+    await h.talk(1500);
+    await h.interim('Rewrite the landing page. Copy.');
+    expect(h.out.sent).toEqual(['Rewrite the landing page']);
+    h.turns.onWake(h.position + 1);
+    await h.pass(20);
+    h.t.results.push(heard('Can you do that? Copy.', 'Can you do that? Okay.'));
+    await h.talk(1200);
+    await h.interim('Can you do that? Copy.');
+    expect(h.out.sent).toEqual(['Rewrite the landing page', 'Can you do that? Okay.']);
+    expect(h.out.logs).toEqual([]);
+  });
+
+  it('a committed copy sends the interim words when the short final collapsed', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    // Three words: turnText takes the interim text, which has the copy as its own sentence.
+    h.t.results.push(heard('Book a table. Copy.', 'Book a table'));
+    await h.talk(1500);
+    await h.interim('Book a table. Copy.');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual(['Book a table.']);
+    expect(h.turns.state.waiting).toBe(true);
+  });
+
+  it('a committed copy sends the interim words when no final came', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table. Copy.'));
+    await h.talk(1500);
+    await h.interim('Book a table. Copy.');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual(['Book a table.']);
+    expect(h.out.facts.at(-1)).toMatchObject({ endedBy: 'send', source: 'interim', commitMs: expect.any(Number) });
+  });
+
+  it('a final that collapsed to its copy still sends the interim text before it', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table for two. Copy.', 'Copy.'));
+    await h.talk(1500);
+    await h.interim('Book a table for two. Copy.');
+    await h.interim('Book a table for two. Copy.');
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    expect(h.turns.state.waiting).toBe(true);
+  });
+
+  it('a pause sends too with pauseSends; a detection from an earlier wait opens nothing', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', pauseSends: true });
+    await h.pass(3000);
+    const old = h.position;
+    h.turns.configure(true, true);
+    h.turns.configure(false, true);
+    h.turns.configure(true, true);
+    h.turns.onWake(old);
+    expect(h.t.begins).toEqual([]);
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('what time is it', 'What time is it?'));
+    await h.talk(1000);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['What time is it?']);
+  });
+
+  it('goes back to waiting with the sleep cue: nothing said, then words held, which go out; a final ending in zulu still sends', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    await h.pass(8_000);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.turns.state).toMatchObject({ waiting: true, slept: 1 });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Remind me to buy bread', 'Remind me to buy bread.'));
+    await h.talk(1000);
+    await h.interim('Remind me to buy bread');
+    await h.pass(19_000);
+    expect(h.out.cues).toHaveLength(3);
+    await h.pass(1_100);
+    // A second of speech behind them: the words are sent as the turn goes back to waiting.
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.sent).toEqual(['Remind me to buy bread.']);
+    expect(h.out.facts.at(-1)).toMatchObject({ endedBy: 'asleep', words: 5 });
+    expect(h.out.cues).toEqual(['wake', 'sleep', 'wake', 'sleep']);
+    expect(h.turns.state).toMatchObject({ waiting: true, slept: 2 });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Remind me to buy milk', 'Remind me to buy milk. Zulu.'));
+    await h.talk(1000);
+    await h.interim('Remind me to buy milk');
+    await h.pass(20_100);
+    expect(h.out.sent).toEqual(['Remind me to buy bread.', 'Remind me to buy milk.']);
+  });
+
+  it('words held after the wake go back to waiting on time, however many interims repeat them, and are sent', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Remind me to stretch later.', 'Remind me to stretch later.'));
+    await h.talk(1000);
+    await h.interim('Remind me to stretch later.');
+    for (let i = 0; i < 4; i++) {
+      await h.pass(5_000);
+      await h.interim('Remind me to stretch later.');
+    }
+    await h.pass(300);
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.sent).toEqual(['Remind me to stretch later.']);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+
+  it('a woken turn that sleeps with words but under 800 ms of speech drops them, as before', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Ah.', 'Ah.'));
+    await h.talk(300);
+    await h.interim('Ah.');
+    await h.pass(20_100);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['asleep', 'Ah.']]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.out.ended.map(([, outcome, reason]) => [outcome, reason])).toEqual([['discarded', 'asleep']]);
+  });
+
+  it('speech that came to no text at the sleep is a lost turn, not a sleep: the transcription failed, or heard nothing', async () => {
+    for (const failed of [true, false]) {
+      const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+      await h.pass(100);
+      h.turns.onWake(h.position);
+      h.t.results.push(heard('', undefined, failed));
+      await h.talk(1500);
+      // The idle limit, not the start limit: the caller spoke.
+      await h.pass(8_100);
+      expect(h.t.ended).toBe(0);
+      await h.pass(12_000);
+      expect(h.t.ended).toBe(1);
+      expect(h.out.lost).toEqual([failed ? 'stt' : 'empty']);
+      expect(h.out.cues).toEqual(['wake']);
+      expect(h.out.drops).toEqual([]);
+      expect(h.turns.state).toMatchObject({ waiting: true, slept: 1 });
+    }
+  });
+
+  it('a failed transcription of a click is no lost turn: under the floor it sleeps', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('', undefined, true));
+    await h.talk(100);
+    await h.pass(8_100);
+    expect(h.out.lost).toEqual([]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+
+  it('a reply plays over a woken turn holding words: it stays open, the idle limit restarts after it, and the words go', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Remind me to call mom.', 'Remind me to call mom.'));
+    await h.talk(1200);
+    await h.interim('Remind me to call mom.');
+    await h.pass(10_000);
+    h.turns.onAgentSpeaking(true);
+    await h.pass(15_000);
+    expect(h.t.ended).toBe(0);
+    h.turns.onAgentSpeaking(false);
+    await h.pass(19_900);
+    expect(h.t.ended).toBe(0);
+    await h.pass(200);
+    expect(h.out.sent).toEqual(['Remind me to call mom.']);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+
+  it('a scratch that the interims showed once discards when the woken turn goes back to waiting', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Remind me to buy some bread.', 'Remind me to buy some bread.'));
+    await h.talk(1500);
+    await h.interim('Remind me to buy some bread. Scratch that.');
+    await h.interim('Remind me to buy some bread.');
+    await h.pass(20_100);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['discarded', 'Remind me to buy some bread.']]);
+    expect(h.out.cues).toEqual(['wake', 'discard']);
+  });
+
+  it('the wake phrase again in an open turn: never in its text, and a discard before it drops only those words', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    // No interim showed the discard: the second wake phrase and the send are what the caller relies on.
+    h.t.results.push(
+      heard(
+        'Remind me to buy some bread. Hey Andy. What is the capital of Germany? Zulu.',
+        'Remind me to buy some bread, scratch that. Hey Andy. What is the capital of Germany? Zulu.',
+      ),
+    );
+    await h.talk(1500);
+    await h.interim('Remind me to buy some bread.');
+    await h.pass(10_000);
+    await h.talk(2000);
+    await h.interim('Remind me to buy some bread, scratch that. Hey Andy. What is the capital of Germany? Zulu.');
+    expect(h.out.drops).toEqual([['discarded', 'Remind me to buy some bread, scratch that.']]);
+    expect(h.out.sent).toEqual(['What is the capital of Germany?']);
+    expect(h.out.cues).toEqual(['wake', 'discard', 'sent']);
+    // The dropped words and the sent ones are two caption lines.
+    expect(h.out.marks.slice(-2)).toEqual([
+      [
+        1,
+        'Remind me to buy some bread, scratch that.',
+        true,
+        { command: 'discard', words: 'Remind me to buy some bread' },
+      ],
+      [2, 'What is the capital of Germany?', true, { command: 'send', words: 'What is the capital of Germany?' }],
+    ]);
+    // Without a discard the words before it stay; the phrase (here the acoustic one's own name) goes.
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(
+      heard(
+        'Remind me to stretch. Hey LiveKit, and buy bread. Zulu.',
+        'Remind me to stretch. Hey LiveKit, and buy bread. Zulu.',
+      ),
+    );
+    await h.talk(2000);
+    await h.interim('Remind me to stretch. Hey LiveKit, and buy bread. Zulu.');
+    expect(h.out.sent.at(-1)).toBe('Remind me to stretch. and buy bread.');
+  });
+
+  it('a discard only the final shows before a second wake phrase cannot cut a committed send: it goes as said at the act', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(
+      heard(
+        'Remind me to buy some bread. Hey Andy. What is the capital of Germany? Zulu.',
+        'Remind me to buy some bread, scratch that. Hey Andy. What is the capital of Germany? Zulu.',
+      ),
+    );
+    await h.talk(2000);
+    await h.interim('Remind me to buy some bread. Hey Andy. What is the capital of Germany? Zulu.');
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.sent).toEqual(['Remind me to buy some bread. What is the capital of Germany?']);
+    expect(h.out.facts.at(-1)).toMatchObject({ fallback: 'wake_split' });
+    expect(h.out.cues).toEqual(['wake', 'sent']);
+  });
+
+  it('a discard right after the wake word takes it back', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Scratch that.', 'Scratch that.'));
+    await h.talk(700);
+    await h.interim('Scratch that.');
+    await h.interim('Scratch that.');
+    expect(h.out.drops).toEqual([['discarded', 'Scratch that.']]);
+    expect(h.out.cues).toEqual(['wake', 'discard']);
+    expect(h.turns.state.waiting).toBe(true);
+  });
+
+  it('without a spotter, hey <agent> in the transcript opens the turn; speech without it is dropped as ignored', async () => {
+    const h = turnsHarness({ wake: true });
+    h.t.results.push(heard('So the weekend plan is settled.', 'So the weekend plan is settled.'));
+    await h.talk(1500);
+    expect(h.t.begins).toHaveLength(1);
+    expect(h.out.holds).toEqual([]);
+    await h.pass(SILENCE);
+    expect(h.out.drops).toEqual([['unaddressed', 'So the weekend plan is settled.']]);
+    h.t.results.push(heard('OK. Hi Andy, what time is it? Zulu.', 'OK. Hi Andy, what time is it? Zulu.'));
+    await h.talk(2000);
+    await h.interim('OK. Hi Andy, what time is it? Zulu.');
+    expect(h.out.cues).toEqual(['wake', 'sent']);
+    expect(h.out.drops.at(-1)).toEqual(['unaddressed', 'OK.']);
+    expect(h.out.sent).toEqual(['what time is it?']);
+  });
+
+  it('turning the wake switch on drops an open hands-free turn; off keeps a woken one and lets the pause send it', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('half a thought', 'half a thought'));
+    await h.talk(1000);
+    h.turns.configure(true, false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.drops).toEqual([['unaddressed', 'half a thought']]);
+    h.turns.useWakeWord('Hey LiveKit');
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table', 'Book a table'));
+    await h.talk(1000);
+    h.turns.configure(false, false);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Book a table']);
+  });
+});
+
+describe('CallTurns, the wake and the speech after it', () => {
+  it('the phrase, a pause, then speech: the turn opens at the speech, with its pre-roll, and nothing before that', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(1000);
+    // VAD speech from 600 ms before the detection to 100 ms after it: the phrase and its tail.
+    await h.wakeInSpeech(600, 100);
+    expect(h.out.cues).toEqual(['wake']);
+    expect(h.turns.state).toMatchObject({ waiting: false, heard: 1 });
+    await h.pass(1000);
+    // A stray interim with no activity open belongs to nothing.
+    await h.interim('Прийом.');
+    expect(h.t.begins).toEqual([]);
+    expect(h.t.pushed).toBe(0);
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.talk(1500);
+    // The pre-roll (500 ms) and the speech the VAD had heard when it said so (100 ms).
+    expect(h.t.begins).toEqual([16 * 600]);
+    await h.interim('Book a table. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table.']);
+    expect(h.out.cues).toEqual(['wake', 'sent']);
+    expect(h.out.drops).toEqual([]);
+  });
+
+  it('speech going on straight after the phrase opens the turn at the wake point, once past the floor', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(1000);
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, h.position - 1600);
+    await h.pass(500, 500);
+    const spotted = h.position;
+    h.turns.onWake(spotted);
+    expect(h.t.begins).toEqual([]);
+    await h.pass(SPEECH_FLOOR_MS - 20, 500);
+    expect(h.t.begins).toEqual([]);
+    await h.pass(20, 500);
+    // Everything since the detection, and nothing of the phrase.
+    expect(h.t.begins).toEqual([16 * SPEECH_FLOOR_MS]);
+    h.t.results.push(heard('Book a table for two. Zulu.', 'Book a table for two. Zulu.'));
+    await h.pass(1000, 500);
+    const end = h.position;
+    await h.pass(550);
+    h.turns.onSpeech(false, end);
+    await h.interim('Book a table for two. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+  });
+
+  it('a speech floor already passed when the detection comes late opens the turn at once', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, 0);
+    const spotted = h.position;
+    // The spotter's thread ran behind: the caller has gone on 400 ms by the time it reports.
+    await h.pass(400, 500);
+    h.turns.onWake(spotted);
+    expect(h.t.begins).toEqual([16 * 400]);
+  });
+
+  it('the phrase then silence: back to waiting after the start limit, and no activity ever opened', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    await h.wakeInSpeech(600, 100);
+    // 8 s from the wake: 660 ms of it went by in the phrase's tail and the VAD's closing silence (frames of 20 ms).
+    await h.pass(8_000 - 660 - 40);
+    expect(h.out.cues).toEqual(['wake']);
+    expect(h.turns.state.waiting).toBe(false);
+    await h.pass(60);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.turns.state).toMatchObject({ waiting: true, slept: 1 });
+    expect(h.t.begins).toEqual([]);
+    expect(h.t.ended).toBe(0);
+    expect(h.out.holds).toEqual([true, false]);
+    expect(h.out.ended).toEqual([]);
+    expect(h.turns.spotting).toBe(true);
+  });
+
+  it('a lone command in an activity the caller did not speak in is an echo: nothing plays, shows, drops or sends', async () => {
+    for (const echo of ['Прийом.', 'Zulu.', 'Copy.', 'Scratch that.']) {
+      const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+      await h.pass(500);
+      h.turns.onWake(h.position);
+      await h.pass(1000);
+      // A click opens an activity: it is speech to the VAD, under the floor.
+      await h.talk(100);
+      expect(h.t.begins, echo).toHaveLength(1);
+      await h.interim(echo);
+      await h.interim(echo);
+      await h.pass(DISCARD_SETTLE_MS);
+      expect(h.t.ended, echo).toBe(1);
+      expect(h.out.cues, echo).toEqual(['wake']);
+      expect(h.out.drops, echo).toEqual([]);
+      expect(h.out.lone, echo).toEqual([]);
+      expect(h.out.sent, echo).toEqual([]);
+      expect(h.out.captions, echo).toEqual([]);
+      expect(h.out.ended, echo).toEqual([]);
+      expect(h.out.logs, echo).toContain(echoLog);
+      // Still woken: the wake is not taken back, and its start limit still runs from the wake.
+      expect(h.turns.state.waiting, echo).toBe(false);
+      await h.pass(8_000 - 1000 - 100 - 550 - DISCARD_SETTLE_MS - 40);
+      expect(h.out.cues, echo).toEqual(['wake']);
+      await h.pass(60);
+      expect(h.out.cues, echo).toEqual(['wake', 'sleep']);
+      expect(h.t.begins, echo).toHaveLength(1);
+    }
+  });
+
+  it('after an echo the caller is heard: the next speech opens a fresh activity, sent without the echo word', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    await h.talk(100);
+    await h.interim('Прийом.');
+    await h.pass(100);
+    expect(h.t.ended).toBe(1);
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.talk(1500);
+    expect(h.t.begins).toHaveLength(2);
+    await h.interim('Book a table. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table.']);
+    expect(h.out.facts.at(-1)).toMatchObject({ echoes: 1 });
+    expect(h.out.cues).toEqual(['wake', 'sent']);
+  });
+
+  it('a lone command the final alone brings, in a turn with no speech, is an echo too: the turn sleeps as if empty', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('', 'Прийом.'));
+    await h.talk(100);
+    await h.pass(8_100);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.out.lone).toEqual([]);
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.logs).toContain(echoLog);
+    expect(h.out.ended.map(([, outcome, reason]) => [outcome, reason])).toEqual([['empty', 'asleep']]);
+  });
+
+  it('a lone command after real speech still answers nope, and the wake stays for the words that follow', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Zulu.', 'Zulu.'));
+    await h.talk(500);
+    await h.interim('Zulu.');
+    expect(h.out.cues).toEqual(['wake', 'nope']);
+    expect(h.out.lone).toEqual([{ command: 'send', segment: 1 }]);
+    expect(h.out.ended.map(([, outcome, reason]) => [outcome, reason])).toEqual([['empty', 'command_only']]);
+    // No activity opens on the silence after it: the next speech opens one.
+    await h.pass(1000);
+    expect(h.t.begins).toHaveLength(1);
+    expect(h.turns.state.waiting).toBe(false);
+    h.t.results.push(heard('What time is it? Zulu.', 'What time is it? Zulu.'));
+    await h.talk(1200);
+    expect(h.t.begins).toHaveLength(2);
+    await h.interim('What time is it? Zulu.');
+    expect(h.out.sent).toEqual(['What time is it?']);
+  });
+
+  it('hands-free: a lone command with no speech is an echo as well, and ends nothing but its activity', async () => {
+    const h = turnsHarness();
+    await h.talk(100);
+    await h.interim('Zulu.');
+    await h.pass(100);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.cues).toEqual([]);
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.noTurn).toBe(1);
+    expect(h.out.logs).toContain(echoLog);
+  });
+
+  it('the wake sets the transcription up and sends it nothing before speech', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    expect(h.t.prepare).toHaveBeenCalledOnce();
+    await h.pass(1000);
+    expect(h.t.begins).toEqual([]);
+    expect(h.t.pushed).toBe(0);
+  });
+
+  it('speech that started under an agent line after the wake is not the phrase going on: no turn opens in it', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.turns.onAgentSpeaking(true);
+    await h.pass(3000);
+    const start = h.position;
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, start);
+    await h.pass(500, 500);
+    h.turns.onAgentSpeaking(false);
+    await h.pass(1000, 500);
+    expect(h.t.begins).toEqual([]);
+    expect(h.out.unheard).toBe(1);
+  });
+
+  it("the phrase's own speech going on under an agent line opens the turn where the line ended", async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    const start = h.position;
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, start);
+    await h.pass(500, 500);
+    h.turns.onWake(h.position);
+    h.turns.onAgentSpeaking(true);
+    await h.pass(2000, 500);
+    h.turns.onAgentSpeaking(false);
+    await h.pass(SPEECH_FLOOR_MS - 20, 500);
+    expect(h.t.begins).toEqual([]);
+    await h.pass(20, 500);
+    // Nothing from under the line, which the ring holds as silence.
+    expect(h.t.begins).toEqual([16 * SPEECH_FLOOR_MS]);
+  });
+
+  it('an echo in a turn the transcript woke takes no wake back: the speech after it is unaddressed', async () => {
+    const h = turnsHarness({ wake: true, limits: { startMs: 3_000, idleMs: 600 } });
+    await h.pass(500);
+    h.t.results.push(heard('Hey Andy, copy.', 'Hey Andy, copy.'));
+    // A click the transcription made a wake and a send word of.
+    await h.talk(200);
+    await h.interim('Hey Andy, copy.');
+    await h.pass(100);
+    expect(h.out.logs).toContain(echoLog);
+    expect(h.turns.state.waiting).toBe(true);
+    h.t.results.push(heard("I'll be there in five minutes.", "I'll be there in five minutes."));
+    await h.talk(1500);
+    await h.interim("I'll be there in five minutes.");
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['unaddressed', "I'll be there in five minutes."]]);
+  });
+
+  it("speech before the transcript's wake phrase is not said: it keeps the start limit, and a sleep sends nothing", async () => {
+    const h = turnsHarness({ wake: true, limits: { startMs: 3_000, idleMs: 600 } });
+    await h.pass(500);
+    h.t.results.push(heard("I'll be there in five. Hey Andy.", "I'll be there in five. Hey Andy."));
+    await h.talk(1500);
+    await h.interim("I'll be there in five. Hey Andy.");
+    expect(h.out.cues).toEqual(['wake']);
+    await h.pass(1_000);
+    expect(h.t.ended).toBe(0);
+    await h.pass(2_100);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.lost).toEqual([]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.out.drops).toEqual([['unaddressed', "I'll be there in five."]]);
+  });
+
+  it('a transcript-woken turn that sleeps on words drops them, however long the speech before its phrase', async () => {
+    const h = turnsHarness({ wake: true, limits: { startMs: 3_000, idleMs: 600 } });
+    await h.pass(500);
+    h.t.results.push(heard("I'll be there. Hey Andy, book", "I'll be there. Hey Andy, book."));
+    await h.talk(1500);
+    await h.interim("I'll be there. Hey Andy, book");
+    await h.pass(800);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([
+      ['unaddressed', "I'll be there."],
+      ['asleep', 'book.'],
+    ]);
+  });
+
+  it('a discard phrase whose final is a lone command nobody said goes on in no new activity: the wake stays', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Okay, scratch that.', 'Discard this turn.'));
+    await h.talk(200);
+    await h.interim('Okay, scratch that.');
+    await h.interim('Okay, scratch that.');
+    await h.pass(100);
+    expect(h.t.ended).toBe(1);
+    expect(h.t.begins).toHaveLength(1);
+    expect(h.out.logs).toContain(echoLog);
+    expect(h.out.cues).toEqual(['wake']);
+    expect(h.turns.state.waiting).toBe(false);
+    // The start limit still runs from the wake.
+    await h.pass(8_000);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.t.begins).toHaveLength(1);
+  });
+
+  it("an echo the final brings counts on its own turn's event; an awake state the line takes forgets its echoes", async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('', 'Прийом.'));
+    await h.talk(100);
+    await h.pass(8_100);
+    expect(h.out.ended.map(([facts, outcome]) => [outcome, facts.echoes])).toEqual([['empty', 1]]);
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.talk(1500);
+    await h.interim('Book a table. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table.']);
+    expect(h.out.facts.at(-1)?.echoes).toBeUndefined();
+
+    const p = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', pauseSends: true });
+    await p.pass(500);
+    p.turns.onWake(p.position);
+    await p.talk(100);
+    await p.interim('Прийом.');
+    await p.pass(100);
+    expect(p.out.logs).toContain(echoLog);
+    // A reply takes the wake the echo went back to.
+    p.turns.onAgentSpeaking(true);
+    p.turns.onAgentSpeaking(false);
+    await p.pass(500);
+    p.turns.onWake(p.position);
+    p.t.results.push(heard('Book a table.', 'Book a table.'));
+    await p.talk(1500);
+    await p.pass(SILENCE);
+    expect(p.out.sent).toEqual(['Book a table.']);
+    expect(p.out.facts.at(-1)?.echoes).toBeUndefined();
+  });
+
+  it('turning the wake switch off while woken leaves hands-free; a switch to Manual drops the wake', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.turns.configure(false, false);
+    expect(h.out.holds).toEqual([true, false]);
+    h.t.results.push(heard('Book a table', 'Book a table'));
+    await h.talk(1000);
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Book a table']);
+    h.turns.configure(true, false);
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    expect(h.turns.state.waiting).toBe(false);
+    await h.turns.setReviewing(true);
+    expect(h.out.holds.at(-1)).toBe(false);
+    await h.talk(1000);
+    expect(h.t.begins).toHaveLength(1);
+  });
+});
+
+describe('CallTurns, the clocks of a woken turn', () => {
+  it('speech the VAD heard counts as said: a late first interim does not put the caller to sleep', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table for two. Zulu.', 'Book a table for two. Zulu.'));
+    await h.talk(1500);
+    // No interim yet, 10 s on: past the start limit, inside the idle one.
+    await h.pass(10_000);
+    expect(h.t.ended).toBe(0);
+    expect(h.out.cues).toEqual(['wake']);
+    expect(h.turns.state.waiting).toBe(false);
+    await h.interim('Book a table for two. Zulu.');
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    expect(h.out.cues).toEqual(['wake', 'sent']);
+  });
+
+  it('with no interim at all, the idle limit ends the turn 20 s after the speech, not the start limit', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    await h.talk(1500);
+    await h.pass(19_900);
+    expect(h.t.ended).toBe(0);
+    await h.pass(200);
+    expect(h.t.ended).toBe(1);
+  });
+
+  it('words a discard phrase turned out to be are said: a sleep after the reopen sends them', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 400, idleMs: 800 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table, scratch that', 'Book a table, scratch that one and book the bar.'));
+    await h.talk(1500);
+    await h.interim('Book a table, scratch that');
+    await h.interim('Book a table, scratch that');
+    expect(h.t.begins).toHaveLength(2);
+    await h.pass(1000);
+    expect(h.out.sent).toEqual(['Book a table, scratch that one and book the bar.']);
+    expect(h.out.drops).toEqual([]);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+
+  it('words the turn that went on after a discard phrase carries are said: its sleep sends them', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 400, idleMs: 800 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    h.t.hold = true;
+    h.t.results.push(heard('Book a table, scratch that', 'Book a table, scratch that one and book the bar.'));
+    await h.talk(1500);
+    await h.interim('Book a table, scratch that');
+    await h.interim('Book a table, scratch that');
+    expect(h.t.ended).toBe(1);
+    // The caller goes on, briefly, before that final is in: the next activity carries its words.
+    await h.talk(200);
+    expect(h.t.begins).toHaveLength(2);
+    h.t.hold = false;
+    h.t.release();
+    await h.pass(1000);
+    expect(h.t.ended).toBe(2);
+    expect(h.out.sent).toEqual(['Book a table, scratch that one and book the bar.']);
+    expect(h.out.drops).toEqual([]);
+  });
+
+  it('speech under the floor is not said: such a turn keeps the start limit', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    await h.talk(100);
+    await h.pass(7_900);
+    expect(h.t.ended).toBe(0);
+    await h.pass(200);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+  });
+});
+
+describe('CallTurns, a turn longer than one transcription activity', () => {
+  it('a woken turn talking past 200 s keeps its words, and a send word at the end sends them all', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(100);
+    h.turns.onWake(h.position);
+    const said: string[] = [];
+    // Four minutes of dictation with thinking pauses; the transcription rotated once under it.
+    for (let i = 0; i < 40; i++) {
+      await h.talk(5_000);
+      said.push(`Point ${i + 1}.`);
+      await h.interim(said.join(' '));
+      await h.pass(400);
+    }
+    expect(h.t.begins).toHaveLength(1);
+    expect(h.t.ended).toBe(0);
+    const whole = `${said.join(' ')} Zulu.`;
+    h.t.results.push({ ...heard(whole, whole), rotations: 1 });
+    await h.talk(600);
+    await h.interim(whole);
+    expect(h.out.sent).toEqual([said.join(' ')]);
+    expect(h.out.facts.at(-1)).toMatchObject({ endedBy: 'send', rotations: 1, words: 80 });
+  });
+});
+
+describe('CallTurns, the published wake state', () => {
+  const waits = (states: CallWakeState[]) => states.map((s) => s.waiting);
+
+  it('a lone command after real speech: every publish from the wake on says awake, never waiting', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    const before = h.out.states.length;
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Zulu.', 'Zulu.'));
+    await h.talk(500);
+    await h.interim('Zulu.');
+    expect(h.out.cues).toEqual(['wake', 'nope']);
+    expect(waits(h.out.states.slice(before))).toEqual([false]);
+    expect(h.out.states.at(-1)).toMatchObject({ waiting: false, heard: 1 });
+    // The next speech opens the turn; still awake, and nothing new to publish.
+    h.t.results.push(heard('What time is it? Zulu.', 'What time is it? Zulu.'));
+    await h.talk(1200);
+    expect(waits(h.out.states.slice(before))).toEqual([false]);
+    await h.interim('What time is it? Zulu.');
+    expect(h.out.sent).toEqual(['What time is it?']);
+    expect(waits(h.out.states.slice(before))).toEqual([false, true]);
+  });
+
+  it('an echo publishes nothing: the wake it goes back to is the state already out', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    const at = h.out.states.length;
+    await h.talk(100);
+    await h.interim('Прийом.');
+    await h.pass(100);
+    expect(h.out.logs).toContain(echoLog);
+    expect(h.out.states.slice(at)).toEqual([]);
+    expect(h.out.states.at(-1)).toMatchObject({ waiting: false });
+  });
+
+  it('a discard phrase that was words goes on in a new activity, and the state stays awake throughout', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    const before = h.out.states.length;
+    h.turns.onWake(h.position);
+    h.t.results.push(heard('Book a table, scratch that', 'Book a table, scratch that one and book the bar.'));
+    await h.talk(1500);
+    await h.interim('Book a table, scratch that');
+    await h.interim('Book a table, scratch that');
+    expect(h.t.begins).toHaveLength(2);
+    expect(waits(h.out.states.slice(before))).toEqual([false]);
+  });
+
+  it('an open woken turn that sleeps publishes the sleep once', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    await h.talk(100);
+    const at = h.out.states.length;
+    await h.pass(8_100);
+    expect(h.out.cues).toEqual(['wake', 'sleep']);
+    expect(h.out.states.slice(at)).toEqual([expect.objectContaining({ waiting: true, slept: 1 })]);
+  });
+
+  it('a sleep, a wake and a switch each publish once, and only when the state changed', async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit', limits: { startMs: 8_000, idleMs: 20_000 } });
+    await h.pass(500);
+    const before = h.out.states.length;
+    h.turns.onWake(h.position);
+    await h.pass(8_100);
+    expect(h.out.states.slice(before)).toEqual([
+      expect.objectContaining({ waiting: false, heard: 1 }),
+      expect.objectContaining({ waiting: true, heard: 1, slept: 1 }),
+    ]);
+    // The same settings again change nothing, so nothing goes out.
+    h.turns.configure(true, false);
+    expect(h.out.states.slice(before)).toHaveLength(2);
+    h.turns.configure(false, false);
+    expect(h.out.states.at(-1)).toMatchObject({ on: false, waiting: false });
+    expect(h.out.states.slice(before)).toHaveLength(3);
+  });
+});
+
+/** Review mode over a real CallTurns (turnsHarness): what the page sees and what was posted. */
+function reviewOverTurns(h: ReturnType<typeof turnsHarness>) {
+  const states: CallReviewState[] = [];
+  const posted: string[] = [];
+  const control = new ReviewControl({
+    voice: h.turns,
+    publishReview: (state) => void states.push(state),
+    post: (text) => posted.push(text),
+    lastPosted: () => posted.length,
+    setCaptureOpen: () => undefined,
+    resetCaller: () => undefined,
+    configure: () => undefined,
+    wakeState: () => h.turns.state,
+    cue: () => undefined,
+    ended: () => undefined,
+    log: silentLog,
+  });
+  let gen = 0;
+  return {
+    control,
+    states,
+    posted,
+    op: (op: ReviewOp, f: Partial<ReviewRequest> = {}) => control.handle(op, { gen: ++gen, ...f }),
+  };
+}
+
+describe('CallTurns, a send word in one interim, a discard that settles', () => {
+  const woken = async () => {
+    const h = turnsHarness({ wake: true, wakeWord: 'Hey LiveKit' });
+    await h.pass(500);
+    h.turns.onWake(h.position);
+    return h;
+  };
+
+  it('silence first: one interim ending in zulu commits at once and sends', async () => {
+    const h = await woken();
+    h.t.results.push(heard('Book a table for two. Zulu.', 'Book a table for two. Zulu.'));
+    await h.talk(1500);
+    await h.interim('Book a table for two. Zulu.');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    expect(h.out.facts[0]?.endedBy).toBe('send');
+    expect(h.turns.state.waiting).toBe(true);
+  });
+
+  it('a copy as its own sentence sends the same way', async () => {
+    const h = await woken();
+    const said = 'Rewrite the landing page copy for the pricing section. Copy.';
+    h.t.results.push(heard(said, said));
+    await h.talk(3000);
+    await h.interim('Rewrite the landing page copy for the pricing section.');
+    await h.pass(1500);
+    await h.talk(500);
+    await h.interim(said);
+    expect(h.out.sent).toEqual(['Rewrite the landing page copy for the pricing section.']);
+    expect(h.out.facts[0]?.endedBy).toBe('send');
+  });
+
+  it('transcript first: the interim comes while the caller talks, and it commits once the VAD heard 550 ms of quiet', async () => {
+    const h = await woken();
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, h.position - 1600);
+    await h.interim('Book a table. Zulu.');
+    await h.pass(800, 500);
+    expect(h.t.ended).toBe(0);
+    await h.pass(540);
+    expect(h.t.ended).toBe(0);
+    await h.pass(20);
+    h.turns.onSpeech(false, h.position - 16 * 560);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual(['Book a table.']);
+  });
+
+  it('new text before the quiet clears the send word', async () => {
+    const h = await woken();
+    await h.pass(100, 500);
+    h.turns.onSpeech(true, h.position - 1600);
+    await h.interim('Book a table. Zulu.');
+    await h.interim('Book a table. Zulu to Anna');
+    await h.pass(1000);
+    h.turns.onSpeech(false, h.position - 16 * 1000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.t.ended).toBe(0);
+  });
+
+  it('a discard phrase in two interims in a row acts at once; in one, once its text settled', async () => {
+    const h = await woken();
+    h.t.results.push(heard('Book a table. Scratch that.', 'Book a table. Scratch that.'));
+    await h.talk(1500);
+    await h.interim('Book a table.');
+    await h.interim('Book a table. Scratch that.');
+    expect(h.t.ended).toBe(0);
+    await h.interim('Book a table. Scratch that.');
+    expect(h.t.ended).toBe(1);
+    expect(h.out.drops).toEqual([['discarded', 'Book a table. Scratch that.']]);
+    expect(h.out.sent).toEqual([]);
+  });
+
+  it('a discard phrase settles once its text stayed unchanged', async () => {
+    const h = await woken();
+    const said = 'Remind me to call the plumber. Scratch that.';
+    h.t.results.push(heard(said, said));
+    await h.talk(2000);
+    await h.interim(said);
+    await h.pass(DISCARD_SETTLE_MS - 20);
+    expect(h.t.ended).toBe(0);
+    await h.pass(20);
+    expect(h.t.ended).toBe(1);
+    expect(h.out.sent).toEqual([]);
+    expect(h.out.drops).toEqual([['discarded', said]]);
+  });
+
+  it('a settling discard never fires for a turn that already ended', async () => {
+    const h = await woken();
+    h.t.results.push(heard('Book a table. Scratch that.', 'Book a table. Scratch that.'));
+    await h.talk(1500);
+    await h.interim('Book a table. Scratch that.');
+    const draft = h.turns.setReviewing(true);
+    await h.pass(DISCARD_SETTLE_MS * 2);
+    expect(await draft).toMatchObject({ text: 'Book a table. Scratch that.' });
+    expect(h.t.ended).toBe(1);
+    expect(h.out.drops).toEqual([]);
+
+    const g = await woken();
+    await g.talk(1500);
+    await g.interim('Book a table. Scratch that.');
+    g.turns.close();
+    await g.pass(DISCARD_SETTLE_MS * 2);
+    expect(g.t.ended).toBe(0);
+    expect(g.out.drops).toEqual([]);
+  });
+});
+
+describe('CallTurns, finalizing turns and the switch to Manual', () => {
+  it('a switch while a pause-ended turn finalizes makes it the draft, never a POST', async () => {
+    const h = turnsHarness();
+    const r = reviewOverTurns(h);
+    h.t.hold = true;
+    h.t.results.push(heard('Book a table.', 'Book a table.'));
+    await h.talk(1000);
+    await h.pass(SILENCE);
+    expect(h.t.ended).toBe(1);
+    expect(await r.op('mode', { mode: 'review' })).toMatchObject({ ok: true });
+    expect(r.states.at(-1)?.draft).toMatchObject({ state: 'finishing', reason: 'switch' });
+    h.t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual([]);
+    expect(r.states.at(-1)?.draft).toMatchObject({ state: 'ready', text: 'Book a table.', reason: 'switch' });
+  });
+
+  it('a switch while a discard phrase is confirmed keeps the words as the draft', async () => {
+    const h = turnsHarness();
+    const r = reviewOverTurns(h);
+    h.t.hold = true;
+    h.t.results.push(heard('Book a table. Scratch that.', 'Book a table. Scratch that.'));
+    await h.talk(1000);
+    await h.interim('Book a table. Scratch that.');
+    await h.interim('Book a table. Scratch that.');
+    expect(h.turns.turnOpen).toBe(true);
+    await r.op('mode', { mode: 'review' });
+    h.t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.drops).toEqual([]);
+    expect(r.posted).toEqual([]);
+    expect(r.states.at(-1)?.draft).toMatchObject({ state: 'ready', text: 'Book a table. Scratch that.' });
+  });
+
+  it('a committed send is no draft: a switch to Manual before its final leaves it going out', async () => {
+    const h = turnsHarness();
+    const r = reviewOverTurns(h);
+    h.t.hold = true;
+    h.t.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    await h.talk(1000);
+    await h.interim('Book a table. Zulu.');
+    expect(h.turns.turnOpen).toBe(false);
+    expect(await r.op('mode', { mode: 'review' })).toMatchObject({ ok: true });
+    expect(r.states.at(-1)?.draft).toBeNull();
+    h.t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual(['Book a table.']);
+  });
+
+  it('speech after a discard phrase waits for the earlier words: one turn, in order, sent once', async () => {
+    const h = turnsHarness();
+    h.t.hold = true;
+    h.t.results.push(heard('Remind me to, scratch that', 'Remind me to scratch that.'));
+    await h.talk(1500);
+    await h.interim('Remind me to, scratch that');
+    await h.interim('Remind me to, scratch that');
+    expect(h.t.ended).toBe(1);
+    // The caller goes on and sends while the first part is still being finalized.
+    h.t.hold = false;
+    h.t.results.push(heard('the car tomorrow. Zulu.', 'the car tomorrow. Zulu.'));
+    await h.talk(1500);
+    await h.interim('the car tomorrow. Zulu.');
+    expect(h.t.ended).toBe(2);
+    expect(h.out.sent).toEqual([]);
+    h.t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual(['Remind me to scratch that. the car tomorrow.']);
+    expect(h.out.drops).toEqual([]);
+    expect(h.turns.turnOpen).toBe(false);
+    await h.pass(SILENCE + 500);
+    expect(h.t.begins).toHaveLength(2);
+  });
+
+  it('a send committed after a discard phrase that went on still goes when the call ends before either final', async () => {
+    const h = turnsHarness();
+    h.t.hold = true;
+    h.t.results.push(heard('Remind me to, scratch that', 'Remind me to scratch that.'));
+    await h.talk(1500);
+    await h.interim('Remind me to, scratch that');
+    await h.interim('Remind me to, scratch that');
+    h.t.results.push(heard('the car tomorrow. Zulu.', 'the car tomorrow. Zulu.'));
+    await h.talk(1500);
+    await h.interim('the car tomorrow. Zulu.');
+    expect(h.t.ended).toBe(2);
+    // The call ends: the earlier activity is decided as closed, and still hands its words on.
+    h.turns.close();
+    h.t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.out.sent).toEqual(['Remind me to scratch that. the car tomorrow.']);
+  });
+});
+
+describe('CallTurns, review', () => {
+  it('an open auto turn becomes the switch draft; a recording is words, commands included', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Book a table', 'Book a table'));
+    await h.talk(1000);
+    expect(h.turns.turnOpen).toBe(true);
+    const switched = await h.turns.setReviewing(true);
+    expect(switched).toMatchObject({ text: 'Book a table', failed: false });
+    expect(h.out.sent).toEqual([]);
+    expect(await h.turns.prepare()).toBe(true);
+    h.turns.record();
+    h.t.results.push(heard('Remind me to zulu. Zulu.', 'Zulu.'));
+    await h.talk(1500);
+    await h.interim('Remind me to zulu. Zulu.');
+    await h.interim('Remind me to zulu. Zulu.');
+    await h.pass(SILENCE + 500);
+    expect(h.t.ended).toBe(1);
+    expect(await h.turns.stopRecording()).toMatchObject({ text: 'Remind me to zulu. Zulu.' });
+    expect(h.out.sent).toEqual([]);
+  });
+
+  it('a switch while a discard phrase is being confirmed takes that turn as the draft, undiscarded', async () => {
+    const h = turnsHarness();
+    h.t.hold = true;
+    h.t.results.push(heard('Book a table. Scratch that.', 'Book a table. Scratch that.'));
+    await h.talk(1000);
+    await h.interim('Book a table. Scratch that.');
+    await h.interim('Book a table. Scratch that.');
+    const switched = h.turns.setReviewing(true);
+    h.t.release();
+    expect(await switched).toMatchObject({ text: 'Book a table. Scratch that.' });
+    expect(h.out.drops).toEqual([]);
+  });
+});
+
+describe('cue audio', () => {
+  it('is 20 ms frames of 48 kHz mono: 150-250 ms of tone held near its level, with soft edges', () => {
+    for (const kind of ['listening', 'wake', 'sent', 'discard', 'turn', 'nope', 'draft', 'sleep'] as const) {
+      const frames = cueFrames(kind);
+      for (const f of frames) expect([f.sampleRate, f.channels, f.samplesPerChannel]).toEqual([48_000, 1, 960]);
+      const pcm = Int16Array.from(frames.flatMap((f) => [...f.data]));
+      const ms = pcm.length / 48;
+      expect(ms).toBeGreaterThanOrEqual(150);
+      expect(ms).toBeLessThanOrEqual(260);
+      // 5 ms windows: most of the cue holds within 6 dB of its loudest window; a decay to a click would not.
+      const rms: number[] = [];
+      for (let i = 0; i + 240 <= pcm.length; i += 240) {
+        let sum = 0;
+        for (let j = i; j < i + 240; j++) sum += pcm[j] * pcm[j];
+        rms.push(Math.sqrt(sum / 240));
+      }
+      const loudest = Math.max(...rms);
+      expect(rms.filter((r) => r >= loudest / 2).length / rms.length).toBeGreaterThan(0.75);
+      expect(loudest).toBeGreaterThan(0.06 * 32767);
+      expect(Math.max(...pcm.map(Math.abs))).toBeLessThanOrEqual(0.2 * 32767);
+      // No click at either end.
+      expect(Math.abs(pcm[0])).toBeLessThan(200);
+      expect(Math.abs(pcm[pcm.length - 1])).toBeLessThan(200);
+    }
+    expect(cueFrames('sent')).toBe(cueFrames('sent'));
+  });
+
+  it('feeds the track a faint noise floor, a cue as soon as it is asked for, and says when the track took it', async () => {
+    const taken: AudioFrame[] = [];
+    let release!: () => void;
+    let gate = Promise.resolve();
+    const sink = {
+      captureFrame: async (frame: AudioFrame) => {
+        taken.push(frame);
+        await gate;
+      },
+    };
+    gate = new Promise((r) => (release = r));
+    const feed = new CueFeed(sink);
+    await flush();
+    // The source is full: the feed waits on it, one noise frame in.
+    expect(taken).toHaveLength(1);
+    const noise = taken[0].data;
+    expect(Math.max(...noise.map(Math.abs))).toBeGreaterThan(0);
+    expect(Math.max(...noise.map(Math.abs))).toBeLessThanOrEqual(2);
+    let played = false;
+    let started = 0;
+    const cue = cueFrames('sent');
+    void feed.play(cue, () => started++).then(() => (played = true));
+    gate = Promise.resolve();
+    release();
+    await vi.waitFor(() => expect(played).toBe(true));
+    // Its first frame went out once, for the call's cue latency.
+    expect(started).toBe(1);
+    // Right after the frame that was waiting: the whole cue, in order.
+    expect(taken.slice(1, 1 + cue.length)).toEqual(cue);
+    feed.stop();
+    await feed.running;
+    // Stopped: a cue asked for now resolves at once.
+    await feed.play(cue);
+  });
+
+  it('loops the typing sound under no cue: a cue takes its place, and the noise floor is back once it stops', async () => {
+    const typing = await loadTypingSound();
+    expect(typing.length).toBeGreaterThan(50);
+    for (const f of typing.slice(0, 3))
+      expect([f.sampleRate, f.channels, f.samplesPerChannel]).toEqual([48_000, 1, 960]);
+    // Quiet: well under the cues' level.
+    let peak = 0;
+    for (const f of typing) for (const v of f.data) peak = Math.max(peak, Math.abs(v));
+    expect(peak).toBeGreaterThan(100);
+    expect(peak).toBeLessThan(0.15 * 32767);
+    expect(await loadTypingSound()).toBe(typing);
+
+    const taken: AudioFrame[] = [];
+    const sink = { captureFrame: async (frame: AudioFrame) => void taken.push(frame) };
+    const feed = new CueFeed(sink);
+    feed.setBed(typing);
+    await vi.waitFor(() => expect(taken.length).toBeGreaterThan(3));
+    const start = taken.findIndex((f) => f === typing[0]);
+    expect(taken.slice(start, start + 3)).toEqual(typing.slice(0, 3));
+    const cue = cueFrames('sent');
+    await feed.play(cue);
+    const cueAt = taken.indexOf(cue[0]);
+    // The cue alone, never mixed with the typing, then the typing goes on.
+    expect(taken.slice(cueAt, cueAt + cue.length)).toEqual(cue);
+    feed.setBed(undefined);
+    const off = taken.length;
+    await vi.waitFor(() => expect(taken.length).toBeGreaterThan(off + 2));
+    expect(typing).not.toContain(taken.at(-1));
+    feed.stop();
+    await feed.running;
+  });
+
+  it('ends on a failing source and lets every cue waiting on it go', async () => {
+    let fail!: (err: Error) => void;
+    const errors: unknown[] = [];
+    const feed = new CueFeed({ captureFrame: () => new Promise((_, reject) => (fail = reject)) }, (err) =>
+      errors.push(err),
+    );
+    await flush();
+    const waiting = feed.play(cueFrames('sent'));
+    fail(new Error('source closed'));
+    await waiting;
+    await feed.running;
+    expect(errors).toHaveLength(1);
+    await feed.play(cueFrames('sent'));
+  });
+});
+
+describe('room output and the caller input', () => {
+  it('publishes in order, replaces a waiting interim with a newer one, and moves past a stuck publication', async () => {
+    vi.useFakeTimers();
+    const warnings: string[] = [];
+    const sent: string[] = [];
+    const outbox = new Outbox({ warn: (msg: string) => void warnings.push(msg) });
+    let release!: () => void;
+    outbox.post('first', () => new Promise<void>((r) => (release = () => (sent.push('first'), r()))));
+    outbox.post('interim', async () => void sent.push('interim 1'), 'caption 1');
+    outbox.post('interim', async () => void sent.push('interim 2'), 'caption 1');
+    outbox.post('final', async () => void sent.push('final'));
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual(['first', 'interim 2', 'final']);
+    // The first agent state after a join that never resolves: the call goes on, later updates flow.
+    outbox.post('the agent state', () => new Promise(() => undefined), 'attribute lk.agent.state');
+    outbox.post('status', async () => void sent.push('status'));
+    outbox.post('a native throw', () => {
+      throw new Error('closed');
+    });
+    outbox.post('the agent state', async () => void sent.push('state listening'), 'attribute lk.agent.state');
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sent).toEqual(['first', 'interim 2', 'final', 'status', 'state listening']);
+    expect(warnings.some((w) => w.includes('slow'))).toBe(true);
+    expect(warnings.some((w) => w.includes('could not publish a native throw'))).toBe(true);
+    // A room that takes nothing for a while drops superseded updates first, and never stops the queue.
+    const full = new Outbox({ warn: (msg: string) => void warnings.push(msg) }, 60_000, 3);
+    const order: string[] = [];
+    full.post('stuck', () => new Promise(() => undefined));
+    full.post('label', async () => void order.push('label'));
+    full.post('interim', async () => void order.push('interim'), 'caption 2');
+    full.post('final', async () => void order.push('final'));
+    full.post('status', async () => void order.push('status'));
+    expect(warnings.at(-1)).toContain('dropped interim');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(order).toEqual(['label', 'final', 'status']);
+    vi.useRealTimers();
+  });
+
+  it("reports every VAD window: how far it analyzed, and where its last speech ended, never before the track's start", async () => {
+    const streams: Array<{ push: (ev: unknown) => void }> = [];
+    const newVad = () => {
+      const events: unknown[] = [];
+      let wake: (() => void) | undefined;
+      let closed = false;
+      streams.push({ push: (ev: unknown) => (events.push(ev), wake?.()) });
+      return {
+        pushFrame: () => undefined,
+        close: () => ((closed = true), wake?.()),
+        async *[Symbol.asyncIterator]() {
+          for (;;) {
+            if (events.length) yield events.shift() as never;
+            else if (closed) return;
+            else await new Promise<void>((r) => (wake = r));
+          }
+        },
+      } as unknown as VadStream;
+    };
+    const vad: Array<[number, number]> = [];
+    const input = new CallerInput(
+      newVad,
+      {
+        onAudio: () => undefined,
+        onSpeech: () => undefined,
+        onVad: (at, quietFrom) => void vad.push([at, quietFrom]),
+        onClosed: () => undefined,
+      },
+      { error: () => undefined },
+    );
+    const frame = () => input.frame(new AudioFrame(new Int16Array(512), 16_000, 1, 512));
+    const window = (n: number, probability: number) =>
+      streams.at(-1)!.push({
+        type: VADEventType.INFERENCE_DONE,
+        samplesIndex: n * 512,
+        speechDuration: 0,
+        silenceDuration: 0,
+        probability,
+      });
+    for (let i = 0; i < 4; i++) frame();
+    window(1, 0.1);
+    window(2, 0.9);
+    window(3, 0.2);
+    await flush();
+    expect(vad).toEqual([
+      [512, 0],
+      [1024, 1024],
+      [1536, 1024],
+    ]);
+    input.ended();
+    frame();
+    window(1, 0.1);
+    await flush();
+    // The new track's quiet counts from where it started.
+    expect(vad.at(-1)).toEqual([2048 + 512, 2048]);
+  });
+
+  it('a microphone track that ends mid-speech ends the speech; the next track gets a fresh VAD on the same positions', async () => {
+    const streams: Array<{ push: (ev: unknown) => void; frames: number; closed: boolean }> = [];
+    const newVad = () => {
+      const events: unknown[] = [];
+      let wake: (() => void) | undefined;
+      const entry = { push: (ev: unknown) => (events.push(ev), wake?.()), frames: 0, closed: false };
+      streams.push(entry);
+      return {
+        pushFrame: () => void entry.frames++,
+        close: () => ((entry.closed = true), wake?.()),
+        async *[Symbol.asyncIterator]() {
+          for (;;) {
+            if (events.length) yield events.shift() as never;
+            else if (entry.closed) return;
+            else await new Promise<void>((r) => (wake = r));
+          }
+        },
+      } as unknown as VadStream;
+    };
+    const speech: Array<[boolean, number]> = [];
+    const input = new CallerInput(
+      newVad,
+      {
+        onAudio: () => undefined,
+        onSpeech: (on, at) => void speech.push([on, at]),
+        onVad: () => undefined,
+        onClosed: () => undefined,
+      },
+      { error: () => undefined },
+    );
+    const frame = () => input.frame(new AudioFrame(new Int16Array(320), 16_000, 1, 320));
+    for (let i = 0; i < 50; i++) frame();
+    streams[0].push({
+      type: VADEventType.START_OF_SPEECH,
+      samplesIndex: 16_000,
+      speechDuration: 200,
+      silenceDuration: 0,
+    });
+    await flush();
+    expect(speech).toEqual([[true, 16_000 - 3_200]]);
+    input.ended();
+    expect(speech).toEqual([
+      [true, 12_800],
+      [false, 16_000],
+    ]);
+    // The old VAD's late events are ignored; the new track's positions continue the call's.
+    streams[0].push({
+      type: VADEventType.END_OF_SPEECH,
+      samplesIndex: 30_000,
+      speechDuration: 0,
+      silenceDuration: 600,
+    });
+    for (let i = 0; i < 50; i++) frame();
+    streams[1].push({
+      type: VADEventType.START_OF_SPEECH,
+      samplesIndex: 8_000,
+      speechDuration: 100,
+      silenceDuration: 0,
+    });
+    await flush();
+    expect(streams[0].closed).toBe(true);
+    expect(speech.at(-1)).toEqual([true, 16_000 + 8_000 - 1_600]);
+    expect(speech).toHaveLength(3);
+  });
+});
+
+describe('commands, cues and review in a call', () => {
+  const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+  const played = (v: ReturnType<typeof fakeVoice>) => v.voice.playCue.mock.calls.map(([kind]) => kind);
+
+  it('hears the names and the commands: they are the transcription vocabulary', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const make = vi.fn(() => v.transcription);
+    await runCall(ctx, { ...callDeps(host.fetchImpl, v), transcriber: make });
+    expect(make).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: 'gemini-3.5-transcribe-live',
+        languageCodes: ['uk-UA', 'en-US'],
+        sampleRate: 16_000,
+        vocabulary: ['NanoClaw', ...COMMAND_VOCABULARY],
+      }),
+    );
+    host.endStream();
+  });
+
+  it('plays listening once the page sent its settings, sent on a turn, none over speech; cues=0 plays nothing', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await vi.waitFor(() => expect(played(v)).toEqual(['listening']));
+    await v.turn('Book a table');
+    await vi.waitFor(() => expect(played(v)).toEqual(['listening', 'sent']));
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
+    await vi.waitFor(() => expect(played(v)).toEqual(['listening', 'sent', 'turn']));
+    await v.rpc('settings', { cues: false });
+    await v.turn('And a taxi');
+    await vi.waitFor(() => expect(utterances(host)).toHaveLength(2));
+    await flush();
+    expect(played(v)).toEqual(['listening', 'sent', 'turn']);
+    host.endStream();
+  });
+
+  it('a command said alone names itself and its caption line', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.turn('Scratch that.');
+    await vi.waitFor(() =>
+      expect(v.voice.publishDropped).toHaveBeenCalledWith({
+        dropped: 'command',
+        text: 'Scratch that.',
+        command: 'discard',
+        segment: expect.stringMatching(/^SG_turn_\d+$/),
+      }),
+    );
+    const segment = v.voice.publishDropped.mock.calls.at(-1)?.[0].segment as string;
+    expect(v.voice.caption).toHaveBeenCalledWith(Number(segment.slice('SG_turn_'.length)), 'Scratch that.', true, {
+      command: 'discard',
+      words: '',
+    });
+    host.endStream();
+  });
+
+  it('a spoken discard posts nothing, marks the words dropped and plays the discard cue', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.turn('Remind me to call the plumber. Scratch that.');
+    await vi.waitFor(() =>
+      expect(v.voice.publishDropped).toHaveBeenCalledWith({
+        dropped: 'discarded',
+        text: 'Remind me to call the plumber. Scratch that.',
+      }),
+    );
+    await vi.waitFor(() => expect(played(v)).toContain('discard'));
+    expect(utterances(host)).toEqual([]);
+    host.endStream();
+  });
+
+  it('starts wake-gated until the page says otherwise: speech before the wake phrase is ignored', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    v.voice.review.serve.mockImplementation(() => undefined);
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.turn('So the weekend plan is settled.');
+    await vi.waitFor(() =>
+      expect(v.voice.publishDropped).toHaveBeenCalledWith({
+        dropped: 'unaddressed',
+        text: 'So the weekend plan is settled.',
+      }),
+    );
+    expect(utterances(host)).toEqual([]);
+    host.endStream();
+  });
+
+  it('types while the agent works: stops as it speaks, and with cues off', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const typing: boolean[] = [];
+    Object.assign(v.voice, { setTyping: vi.fn((on: boolean) => void typing.push(on)) });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.turn('Book a table');
+    await vi.waitFor(() => expect(typing).toEqual([true]));
+    v.events.onAgentSpeaking(true);
+    expect(typing).toEqual([true, false]);
+    v.events.onAgentSpeaking(false);
+    host.emit({ type: 'working' });
+    await vi.waitFor(() => expect(typing).toEqual([true, false, true]));
+    await v.rpc('settings', { cues: false });
+    expect(typing).toEqual([true, false, true, false]);
+    host.endStream();
+  });
+
+  it("the page's typing switch: off, no typing while the agent works; off mid-work stops it at once", async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const typing: boolean[] = [];
+    Object.assign(v.voice, { setTyping: vi.fn((on: boolean) => void typing.push(on)) });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.rpc('settings', { typing: false });
+    await v.turn('Book a table');
+    host.emit({ type: 'working' });
+    await flush();
+    expect(typing).toEqual([]);
+    // Back on while the agent still works: it types; off again, it stops right there.
+    await v.rpc('settings', { typing: true });
+    expect(typing).toEqual([true]);
+    await v.rpc('settings', { typing: false });
+    expect(typing).toEqual([true, false]);
+    // Settings that leave the switch out keep it as it is.
+    await v.rpc('settings', { wake: false });
+    expect(typing).toEqual([true, false]);
+    host.endStream();
+  });
+
+  it('speech while a line plays is reported unheard and opens no turn', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    let finish: (() => void) | undefined;
+    v.voice.say.mockImplementation(async (_text: string, ready?: () => Promise<void>) => {
+      await ready?.();
+      v.events.onAgentSpeaking(true);
+      await new Promise<void>((resolve) => (finish = resolve));
+      v.events.onAgentSpeaking(false);
+      return true;
+    });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await flush();
+    host.emit({ type: 'reply', text: 'A long story.', turn: null });
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    v.events.onSpeech(true, 0);
+    expect(v.voice.publishUnheard).toHaveBeenCalledTimes(1);
+    v.events.onSpeech(false, 0);
+    expect(v.transcription.begins).toEqual([]);
+    finish?.();
+    host.endStream();
+  });
+
+  it('speech while a reply is synthesized is a turn: the reply waits for it, and no sentence of three is lost', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    let synthesized: (() => void) | undefined;
+    const played: string[] = [];
+    v.voice.say.mockImplementation(async (text: string, ready?: () => Promise<void>) => {
+      await new Promise<void>((resolve) => (synthesized = resolve));
+      await ready?.();
+      v.events.onAgentSpeaking(true);
+      played.push(text);
+      v.events.onAgentSpeaking(false);
+      return true;
+    });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await flush();
+    // Three sentences with 3 s thinking pauses: the 2.5 s closing silence sends each as it ends.
+    await v.turn('The first sentence.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['The first sentence.']));
+    host.emit({ type: 'reply', text: 'Noted.', turn: '1' });
+    await vi.waitFor(() => expect(synthesized).toBeDefined());
+    v.audio(500);
+    // The second sentence starts while the reply is synthesized: heard, never "not heard".
+    v.transcription.results.push(heard('The second sentence.', 'The second sentence.'));
+    const start = v.position;
+    v.audio(100);
+    v.events.onSpeech(true, start);
+    expect(v.transcription.begins).toHaveLength(2);
+    synthesized?.();
+    await flush();
+    expect(played).toEqual([]);
+    v.audio(900);
+    const end = v.position;
+    v.audio(SILENCE);
+    v.events.onSpeech(false, end);
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['The first sentence.', 'The second sentence.']));
+    // Its turn sent, the reply plays.
+    await vi.waitFor(() => expect(played).toEqual(['Noted.']));
+    v.audio(500);
+    await v.turn('The third sentence.');
+    await vi.waitFor(() =>
+      expect(utterances(host)).toEqual(['The first sentence.', 'The second sentence.', 'The third sentence.']),
+    );
+    expect(v.voice.publishUnheard).not.toHaveBeenCalled();
+    host.endStream();
+  });
+
+  it('a reply nobody heard shows as text, says why, and plays no your-turn cue', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    v.voice.say.mockImplementation(async (text: string) => !text.startsWith('It is sunny'));
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await vi.waitFor(() => expect(played(v)).toEqual(['listening']));
+    host.emit({ type: 'reply', text: 'It is sunny.', turn: null });
+    await vi.waitFor(() =>
+      expect(v.voice.publishReply).toHaveBeenCalledWith(
+        expect.objectContaining({ unspoken: true, text: 'It is sunny.' }),
+      ),
+    );
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.reply.uk, expect.any(Function)));
+    await new Promise((r) => setTimeout(r, TURN_CUE_DELAY_MS + 50));
+    expect(played(v)).toEqual(['listening', 'turn']);
+    host.endStream();
+  });
+
+  it('review in a call: talk records, done posts nothing, send posts the frozen text once', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    expect(await v.rpc('mode', { mode: 'review' })).toMatchObject({ ok: true });
+    expect(await v.rpc('talk')).toMatchObject({ ok: true, draft: 1 });
+    expect(v.transcription.prepare).toHaveBeenCalled();
+    expect(v.transcription.begins).toHaveLength(1);
+    v.transcription.results.push(heard('Book a table. Zulu.', 'Book a table. Zulu.'));
+    v.audio(1500);
+    expect(await v.rpc('done', { draft: 1 })).toMatchObject({ ok: true });
+    await vi.waitFor(() =>
+      expect(v.states.at(-1)?.draft).toMatchObject({ state: 'ready', text: 'Book a table. Zulu.' }),
+    );
+    expect(utterances(host)).toEqual([]);
+    expect(await v.rpc('send', { draft: 1 })).toMatchObject({ ok: true, turn: 1 });
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table. Zulu.']));
+    expect(v.voice.publishTurn).toHaveBeenCalledWith({
+      turn: 1,
+      status: 'sending',
+      text: 'Book a table. Zulu.',
+      draft: 1,
+    });
+    host.endStream();
+  });
+
+  it('answers only the caller', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    const handle = v.voice.review.serve.mock.calls[0][0];
+    await expect(handle('talk', JSON.stringify({ gen: 9 }), 'someone-else')).rejects.toThrow();
+    host.endStream();
+  });
+});
+
+describe('spoken sends in a call: the cue at the act, the order turns closed in, the end', () => {
+  const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+  const played = (v: ReturnType<typeof fakeVoice>) => v.voice.playCue.mock.calls.map(([kind]) => kind);
+  /** The caller says `text` and goes quiet; the interim ending in its send word commits the turn. */
+  const commit = (v: ReturnType<typeof fakeVoice>, text: string, final = text) => {
+    v.transcription.results.push(heard(text, final));
+    v.events.onSpeech(true, v.position);
+    v.audio(1000);
+    const end = v.position;
+    v.quiet(600);
+    v.events.onSpeech(false, end);
+    v.interim(text);
+  };
+
+  it('plays sent at the act, before the final, and says sending; the turn posts once its final is in', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await vi.waitFor(() => expect(played(v)).toEqual(['listening']));
+    v.transcription.hold = true;
+    commit(v, 'Book a table. Zulu.');
+    await vi.waitFor(() => expect(played(v)).toEqual(['listening', 'sent']));
+    expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sending' });
+    await flush();
+    expect(utterances(host)).toEqual([]);
+    v.transcription.release();
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table.']));
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table.' }),
+    );
+    expect(played(v)).toEqual(['listening', 'sent']);
+    expect(v.voice.publishTurn.mock.calls.filter(([s]) => s.status === 'sending')).toHaveLength(1);
+    host.endStream();
+  });
+
+  it('turns go out in the order they closed: a committed send before a later pause-ended turn whose final came first', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await flush();
+    v.transcription.hold = true;
+    commit(v, 'Book a table. Zulu.');
+    await v.turn('And a taxi');
+    expect(v.transcription.ended).toBe(2);
+    for (const go of v.transcription.waiting.splice(0).reverse()) go();
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table.', 'And a taxi']));
+    // One sent cue per turn: at the act for the spoken send, as it went for the pause.
+    expect(played(v)).toEqual(['listening', 'sent', 'sent']);
+    host.endStream();
+  });
+
+  it('a Manual send waits for a committed send closed before it; the switch does not take that one', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await flush();
+    v.transcription.hold = true;
+    commit(v, 'Book a table. Zulu.');
+    v.transcription.hold = false;
+    expect(await v.rpc('mode', { mode: 'review' })).toMatchObject({ ok: true });
+    expect(v.states.at(-1)?.draft).toBeNull();
+    expect(await v.rpc('talk')).toMatchObject({ ok: true, draft: 1 });
+    v.transcription.results.push(heard('And a taxi.', 'And a taxi.'));
+    v.audio(500);
+    await v.rpc('done', { draft: 1 });
+    await vi.waitFor(() => expect(v.states.at(-1)?.draft).toMatchObject({ state: 'ready' }));
+    expect(await v.rpc('send', { draft: 1 })).toMatchObject({ ok: true, turn: 2 });
+    await flush();
+    expect(utterances(host)).toEqual([]);
+    v.transcription.release();
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table.', 'And a taxi.']));
+    host.endStream();
+  });
+
+  it('a turn the host did not answer in time holds the next one back until its turn-stored', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const answers = [504];
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const res = await host.fetchImpl(input, init);
+      const status = String(input).endsWith('/utterance') ? answers.shift() : undefined;
+      return status ? new Response('late', { status }) : res;
+    });
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(fetchImpl as unknown as typeof fetch, v));
+    await flush();
+    await v.turn('Book a table');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith({
+        turn: 1,
+        status: 'lost',
+        reason: 'timeout',
+        text: 'Book a table',
+      }),
+    );
+    await v.turn('And a taxi');
+    await flush();
+    expect(utterances(host)).toEqual(['Book a table']);
+    // The failure line still plays: nothing waits on the hold it reports.
+    await vi.waitFor(() =>
+      expect(v.voice.say).toHaveBeenCalledWith(FAILURE_LINES.timeout_no_chat.en, expect.any(Function)),
+    );
+    const turnKey = host.calls.find((c) => c.url.endsWith('/utterance'))?.body?.turnKey;
+    host.emit({ type: 'turn-stored', turnKey, id: '7' });
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['Book a table', 'And a taxi']));
+    expect(v.voice.publishTurn).toHaveBeenCalledWith({ turn: 1, status: 'sent', text: 'Book a table' });
+    host.endStream();
+  });
+
+  it('a host-side hang-up while a committed send waits for its final: the send still posts before the job shuts down', async () => {
+    const { job, ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await flush();
+    v.transcription.hold = true;
+    commit(v, 'Book a table. Zulu.', 'Book a table, please. Zulu.');
+    await vi.waitFor(() => expect(played(v)).toContain('sent'));
+    host.emit({ type: 'end', reason: 'hangup' });
+    await vi.waitFor(() => expect(v.transcription.close).toHaveBeenCalled());
+    // The room going away shuts the job down: that waits for the same end.
+    const onShutdown = job.addShutdownCallback.mock.calls[0][0] as () => Promise<void>;
+    await onShutdown();
+    expect(utterances(host)).toEqual(['Book a table, please.']);
+    expect(job.shutdown).toHaveBeenCalled();
+  });
+
+  it('the caller leaving while a committed send waits: it posts and is answered before the host hears the call ended', async () => {
+    const { job, ctx, roomHandlers } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await flush();
+    v.transcription.hold = true;
+    commit(v, 'Book a table. Zulu.');
+    await vi.waitFor(() => expect(played(v)).toContain('sent'));
+    roomHandlers.get('participantDisconnected')?.(HANG_UP);
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+    const paths = host.calls.map((c) => c.url.split('/').at(-1));
+    expect(paths.indexOf('utterance')).toBeGreaterThan(-1);
+    expect(paths.indexOf('utterance')).toBeLessThan(paths.indexOf('ended'));
+    expect(utterances(host)).toEqual(['Book a table.']);
+  });
+
+  it('a pause-ended turn still waiting for its final at the end goes nowhere', async () => {
+    const { job, ctx, roomHandlers } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await flush();
+    v.transcription.hold = true;
+    await v.turn('Book a table');
+    roomHandlers.get('participantDisconnected')?.(HANG_UP);
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+    expect(utterances(host)).toEqual([]);
+  });
+});
+
+describe('acoustic wake word in a call', () => {
+  const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+  function fakeWakeWord(load: 'ok' | 'later' = 'ok') {
+    let events!: WakeWordEvents;
+    let fail: (err: Error) => void = () => undefined;
+    const listening: boolean[] = [];
+    let pushed = 0;
+    const wake = {
+      phrase: 'Hey LiveKit',
+      threshold: 0.68,
+      ready: load === 'ok' ? Promise.resolve() : new Promise<void>((_, reject) => (fail = reject)),
+      listen: vi.fn((on: boolean) => void listening.push(on)),
+      push: vi.fn((pcm: Int16Array) => void (pushed += pcm.length)),
+      summary: { hopMs: 40, scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
+      utilization: 0,
+      close: vi.fn(async () => undefined),
+    } satisfies WakeWord;
+    wake.ready.catch(() => undefined);
+    const make = vi.fn((e: WakeWordEvents) => {
+      events = e;
+      return wake;
+    });
+    return {
+      wake,
+      make,
+      listening,
+      fail: (err: Error) => fail(err),
+      get pushed() {
+        return pushed;
+      },
+      get events() {
+        return events;
+      },
+    };
+  }
+
+  it('a detection opens the turn where it was spotted; audio is scored only while waiting', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const w = fakeWakeWord();
+    await runCall(ctx, { ...callDeps(host.fetchImpl, v), wakeWord: w.make });
+    await v.rpc('settings', { wake: true });
+    await vi.waitFor(() =>
+      expect(v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true, phrase: 'Hey LiveKit' }),
+    );
+    v.audio(3000);
+    expect(w.listening.at(-1)).toBe(true);
+    expect(v.transcription.begins).toEqual([]);
+    // The spotter's own positions: it was pushed all of this call's audio since it started.
+    const spotted = 16 * 3000;
+    w.events.onDetect(0.9, { start: w.pushed - 32_000, end: w.pushed });
+    // Awake: the turn waits for the caller's speech.
+    expect(v.transcription.begins).toEqual([]);
+    await vi.waitFor(() => expect(v.voice.playCue.mock.calls.map(([k]) => k)).toContain('wake'));
+    await vi.waitFor(() => expect(v.states.at(-1)?.wake).toMatchObject({ waiting: false, heard: 1 }));
+    v.audio(20);
+    expect(w.listening.at(-1)).toBe(false);
+    v.transcription.results.push(heard('What is the time? Zulu.', 'Zulu.'));
+    v.events.onSpeech(true, spotted + 320);
+    // Opened at the speech, its pre-roll reaching back only to the detection.
+    expect(v.transcription.begins).toEqual([320]);
+    v.audio(1000);
+    v.quiet(600);
+    v.events.onSpeech(false, spotted + 320 + 16 * 1000);
+    v.interim('What is the time? Zulu.');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['What is the time?']));
+    host.endStream();
+  });
+
+  it('the job shuts down only once the spotter thread stopped: a process leaving mid-inference aborts', async () => {
+    const { ctx, job, roomHandlers } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const w = fakeWakeWord();
+    let stopped!: () => void;
+    w.wake.close.mockImplementation(() => new Promise<undefined>((resolve) => (stopped = () => resolve(undefined))));
+    await runCall(ctx, { ...callDeps(host.fetchImpl, v), wakeWord: w.make });
+    await vi.waitFor(() => expect(v.states.some((s) => s.wake?.phrase === 'Hey LiveKit')).toBe(true));
+    roomHandlers.get('participantDisconnected')?.(HANG_UP);
+    await vi.waitFor(() => expect(w.wake.close).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(job.shutdown).not.toHaveBeenCalled();
+    stopped();
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('caller left'));
+  });
+
+  it('records no whole call unless VOICE_MODE_CALL_RECORDING is on', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-off-'));
+    try {
+      const { ctx, job, roomHandlers } = fakeJob();
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      const w = fakeWakeWord();
+      await runCall(ctx, { ...callDeps(host.fetchImpl, v, { recordingsRoot: root }), wakeWord: w.make });
+      await v.rpc('settings', { wake: true });
+      await vi.waitFor(() => expect(v.states.at(-1)?.wake).toMatchObject({ waiting: true }));
+      v.audio(3000);
+      w.events.onDetect(0.9, { start: w.pushed - 32_000, end: w.pushed });
+      roomHandlers.get('participantDisconnected')?.(HANG_UP);
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+      expect(fs.readdirSync(root)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('VOICE_MODE_CALL_RECORDING records the whole call as one WAV, waiting included, with its wake events', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-on-'));
+    try {
+      const { ctx, job, roomHandlers } = fakeJob();
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      const w = fakeWakeWord();
+      await runCall(ctx, {
+        ...callDeps(host.fetchImpl, v, {
+          env: { ...ENV, VOICE_MODE_CALL_RECORDING: 'true' },
+          recordingsRoot: root,
+        }),
+        wakeWord: w.make,
+      });
+      await v.rpc('settings', { wake: true });
+      await vi.waitFor(() => expect(v.states.at(-1)?.wake).toMatchObject({ waiting: true }));
+      // Waiting: none of this is a turn, all of it is in the recording.
+      v.audio(3000);
+      w.events.onDetect(0.9, { start: w.pushed - 32_000, end: w.pushed });
+      v.audio(1000);
+      roomHandlers.get('participantDisconnected')?.(HANG_UP);
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+
+      const base = path.join(root, 'Andy', new Date().toISOString().slice(0, 10), 'call-1-call');
+      const wav = fs.readFileSync(`${base}.wav`);
+      const samples = 16 * 4000;
+      expect(wav.length).toBe(44 + samples * 2);
+      expect(wav.toString('ascii', 0, 4)).toBe('RIFF');
+      expect(wav.readUInt32LE(4)).toBe(36 + samples * 2);
+      expect(wav.readUInt32LE(24)).toBe(16_000);
+      expect(wav.readUInt32LE(40)).toBe(samples * 2);
+      // The caller's audio as it came (the fake sends 100s), the waiting part too.
+      expect(wav.readInt16LE(44)).toBe(100);
+      expect(fs.statSync(`${base}.wav`).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(`${base}.json`).mode & 0o777).toBe(0o600);
+      const record = JSON.parse(fs.readFileSync(`${base}.json`, 'utf8')) as CallRecord;
+      expect(record).toMatchObject({
+        callId: 'call-1',
+        lineId: 'voice-mode:abc',
+        agent: 'Andy',
+        durationMs: 4000,
+        wakeModel: expect.stringMatching(/hey_livekit\.onnx$/),
+        wakeThreshold: 0.68,
+        wakes: [{ streamMs: 3000, score: 0.9 }],
+      });
+      expect(Date.parse(record.endedAt!)).toBeGreaterThanOrEqual(Date.parse(record.startedAt));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('a call whose audio could not be set up still leaves a valid, empty call recording', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-fail-'));
+    try {
+      const { ctx, job } = fakeJob();
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      await runCall(ctx, {
+        ...callDeps(host.fetchImpl, v, { env: { ...ENV, VOICE_MODE_CALL_RECORDING: '1' }, recordingsRoot: root }),
+        createVoice: vi.fn(async () => {
+          throw new Error('no room audio');
+        }),
+      });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+      const base = path.join(root, 'Andy', new Date().toISOString().slice(0, 10), 'call-1-call');
+      const wav = fs.readFileSync(`${base}.wav`);
+      expect(wav.length).toBe(44);
+      expect(wav.readUInt32LE(40)).toBe(0);
+      expect(JSON.parse(fs.readFileSync(`${base}.json`, 'utf8'))).toMatchObject({ durationMs: 0, wakes: [] });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('names the phrase while the model loads, and falls back to the transcript name when it does not', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const w = fakeWakeWord('later');
+    await runCall(ctx, { ...callDeps(host.fetchImpl, v), wakeWord: w.make });
+    await vi.waitFor(() => expect(v.states.some((s) => s.wake?.phrase === 'Hey LiveKit')).toBe(true));
+    w.fail(new Error('wake word model not found: x'));
+    await vi.waitFor(() => expect(v.states.at(-1)?.wake).not.toHaveProperty('phrase'));
+    host.endStream();
+  });
+});
+
+describe('whole-call recording', () => {
+  it('is on for VOICE_MODE_CALL_RECORDING `true` or `1` only', () => {
+    const on = (value: string | undefined) => envSwitch(value, ['1', 'true']);
+    for (const value of [undefined, '', '0', 'false', 'yes', 'on', 'TRUE']) expect(on(value)).toBe(false);
+    for (const value of ['1', 'true', ' true ']) expect(on(value)).toBe(true);
+  });
+
+  it('streams to disk and keeps the header current, so a call cut off without close still reads', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-rec-'));
+    try {
+      const warn = vi.fn();
+      const recording = new CallRecording(
+        root,
+        { callId: 'c/1', lineId: 'voice-mode:x', agent: 'Andy Bot' },
+        { warn },
+        Date.parse('2026-10-12T10:00:00Z'),
+      );
+      expect(recording.base).toBe(path.join(root, 'Andy-Bot', '2026-10-12', 'c-1-call'));
+      // 6 s in 20 ms frames: the header and the sidecar are brought up to date after 5 s.
+      for (let i = 0; i < 300; i++) {
+        if (i === 100) recording.wake({ streamMs: 2000, score: 0.9 });
+        recording.push(new Int16Array(320).fill(i));
+      }
+      const internals = recording as unknown as { chain: Promise<unknown> };
+      await internals.chain;
+      const wav = fs.readFileSync(`${recording.base}.wav`);
+      expect(wav.length).toBe(44 + 6 * 32_000);
+      expect(wav.readUInt32LE(40)).toBe(5 * 32_000);
+      expect(wav.readInt16LE(44 + 299 * 640)).toBe(299);
+      expect(JSON.parse(fs.readFileSync(`${recording.base}.json`, 'utf8'))).toMatchObject({
+        durationMs: 5000,
+        wakes: [{ streamMs: 2000, score: 0.9 }],
+      });
+      expect(JSON.parse(fs.readFileSync(`${recording.base}.json`, 'utf8')).endedAt).toBeUndefined();
+      expect(fs.statSync(path.dirname(recording.base)).mode & 0o777).toBe(0o700);
+      // On close the header covers everything, and a second close changes nothing.
+      await recording.close({ model: '/m.onnx', threshold: 0.76 });
+      await recording.close();
+      recording.push(new Int16Array(320));
+      const closed = fs.readFileSync(`${recording.base}.wav`);
+      expect(closed.length).toBe(44 + 6 * 32_000);
+      expect(closed.readUInt32LE(40)).toBe(6 * 32_000);
+      expect(JSON.parse(fs.readFileSync(`${recording.base}.json`, 'utf8'))).toMatchObject({
+        durationMs: 6000,
+        wakeModel: '/m.onnx',
+        wakeThreshold: 0.76,
+      });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('a recording that cannot be written warns once and never throws into the call', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-bad-'));
+    try {
+      // A file where the agent's directory should be.
+      fs.writeFileSync(path.join(root, 'Andy'), '');
+      const warn = vi.fn();
+      const recording = new CallRecording(root, { callId: 'c-1', lineId: 'l', agent: 'Andy' }, { warn });
+      recording.push(new Int16Array(320));
+      await recording.close();
+      recording.push(new Int16Array(320));
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith('voice-mode worker: the call recording stopped', expect.anything());
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('is pruned with the turn recordings', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-call-prune-'));
+    try {
+      const recording = new CallRecording(root, { callId: 'c-1', lineId: 'l', agent: 'Andy' }, { warn: vi.fn() });
+      recording.push(new Int16Array(320));
+      await recording.close();
+      const old = Date.now() / 1000 - 10 * 86_400;
+      fs.utimesSync(`${recording.base}.wav`, old, old);
+      fs.utimesSync(`${recording.base}.json`, old, old);
+      expect(await pruneRecordings(root, 7)).toBe(2);
+      expect(fs.existsSync(path.dirname(recording.base))).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('acoustic wake word', () => {
+  it('reads the model, threshold and phrase from the settings', () => {
+    expect(wakeWordSettings({})).toEqual({
+      classifier: expect.stringMatching(/hey_livekit\.onnx$/),
+      threshold: 0.68,
+      phrase: 'Hey LiveKit',
+      hopMs: 40,
+    });
+    expect(wakeWordSettings({ VOICE_MODE_WAKE_MODEL: 'off' })).toBeNull();
+    expect(
+      wakeWordSettings({
+        VOICE_MODE_WAKE_MODEL: 'data/models/hey_jarvis.onnx',
+        VOICE_MODE_WAKE_PHRASE: ' Hey  Jarvis ',
+      }),
+    ).toEqual({
+      classifier: path.resolve('data/models/hey_jarvis.onnx'),
+      threshold: 0.5,
+      phrase: 'Hey Jarvis',
+      hopMs: 40,
+    });
+    expect(wakeWordSettings({ VOICE_MODE_WAKE_THRESHOLD: '0.8' })?.threshold).toBe(0.8);
+    expect(wakeWordSettings({ VOICE_MODE_WAKE_THRESHOLD: '7' })?.threshold).toBe(0.68);
+  });
+
+  it("reads its scoring hop from the working directory's .env, and warns in the worker's log about a bad one", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-hop-'));
+    try {
+      const warn = vi.fn();
+      const settings = () => wakeWordSettings(workerEnv(['VOICE_MODE_WAKE_HOP_MS'], root), { warn });
+      expect(settings()?.hopMs).toBe(40);
+      fs.writeFileSync(path.join(root, '.env'), 'VOICE_MODE_WAKE_MODEL=data/m.onnx\nVOICE_MODE_WAKE_HOP_MS="80"\n');
+      expect(settings()?.hopMs).toBe(80);
+      expect(warn).not.toHaveBeenCalled();
+      fs.writeFileSync(path.join(root, '.env'), 'VOICE_MODE_WAKE_HOP_MS=33\n');
+      expect(settings()?.hopMs).toBe(40);
+      expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('VOICE_MODE_WAKE_HOP_MS'), {
+        value: '33',
+        hopMs: 40,
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reads its limits from the settings, in seconds; 0 is never', () => {
+    expect(awakeLimits({})).toEqual({ startMs: 8_000, idleMs: 20_000 });
+    expect(awakeLimits({ VOICE_MODE_WAKE_START_SECONDS: '5', VOICE_MODE_WAKE_IDLE_SECONDS: '0' })).toEqual({
+      startMs: 5_000,
+      idleMs: 0,
+    });
+    expect(awakeLimits({ VOICE_MODE_WAKE_START_SECONDS: 'soon', VOICE_MODE_WAKE_IDLE_SECONDS: '-1' })).toEqual({
+      startMs: 8_000,
+      idleMs: 20_000,
+    });
+  });
+});
+
+describe('wide events', () => {
+  it('a turn reports its mode, text source and stage timings from the speech end, never its words', async () => {
+    const h = turnsHarness();
+    h.t.results.push(heard('Book a table for two', 'Book a table for two.'));
+    await h.talk(1000);
+    // talk() reports the speech end 560 ms (whole 20 ms frames) into the silence.
+    const speechEnd = Date.now() - 560;
+    await h.pass(SILENCE);
+    expect(h.out.sent).toEqual(['Book a table for two.']);
+    const facts = h.out.facts[0];
+    expect(facts).toMatchObject({
+      segment: 1,
+      mode: 'handsfree',
+      endedBy: 'pause',
+      source: 'final',
+      finals: 1,
+      words: 5,
+      activityEndMs: SILENCE,
+      finalMs: SILENCE,
+    });
+    expect(facts?.speechEndAt).toBe(speechEnd);
+    expect(JSON.stringify(facts)).not.toContain('table');
+
+    // A spoken discard comes to nothing: reported as discarded by the command.
+    h.t.results.push(
+      heard('Remind me to call the plumber. Scratch that.', 'Remind me to call the plumber. Scratch that.'),
+    );
+    await h.talk(1500);
+    await h.pass(SILENCE);
+    expect(h.out.ended.map(([f, outcome, reason]) => [f.segment, outcome, reason])).toEqual([
+      [2, 'discarded', 'command'],
+    ]);
+  });
+
+  it('a woken turn says so, and the words before the wake phrase are unaddressed', async () => {
+    const h = turnsHarness({ wake: true, pauseSends: true });
+    h.t.results.push(heard('Just thinking aloud', 'Just thinking aloud.'));
+    await h.talk(1000);
+    await h.pass(SILENCE);
+    expect(h.out.ended.map(([f, outcome, reason]) => [f.mode, outcome, reason])).toEqual([
+      ['wake', 'unaddressed', 'no_wake'],
+    ]);
+  });
+
+  it('a sent turn waits for its reply to play; the call event counts what happened', () => {
+    vi.useFakeTimers();
+    const info = vi.fn();
+    const telemetry = new CallTelemetry({ info });
+    const facts: TurnFacts = {
+      segment: 1,
+      mode: 'handsfree',
+      endedBy: 'pause',
+      source: 'final',
+      finals: 1,
+      words: 3,
+      speechMs: 900,
+      speechEndAt: Date.now(),
+      activityEndMs: 2500,
+      finalMs: 2700,
+    };
+    vi.advanceTimersByTime(2900);
+    telemetry.turn({ facts, outcome: 'sent', turn: 1, hostAt: Date.now(), hostStatus: 202 });
+    telemetry.turn({ facts: { ...facts, segment: 2 }, outcome: 'empty', reason: 'noise', turn: 2 });
+    // Not out yet: its reply has not played.
+    expect(info.mock.calls.map(([, f]) => f.turn)).toEqual([2]);
+    vi.advanceTimersByTime(4100);
+    telemetry.replyStarted(1);
+    expect(info).toHaveBeenLastCalledWith('voice-mode.turn', {
+      turn: 1,
+      segment: 1,
+      mode: 'handsfree',
+      endedBy: 'pause',
+      source: 'final',
+      finals: 1,
+      words: 3,
+      speechMs: 900,
+      activityEndMs: 2500,
+      finalMs: 2700,
+      outcome: 'sent',
+      hostMs: 2900,
+      hostStatus: 202,
+      replyMs: 7000,
+    });
+    // Another sent turn whose reply never comes goes out on its own after a while, without replyMs.
+    telemetry.turn({ facts, outcome: 'sent', turn: 3, hostAt: Date.now() });
+    vi.advanceTimersByTime(TURN_EVENT_WAIT_MS);
+    expect(info.mock.calls.at(-1)?.[1]).toMatchObject({ turn: 3, outcome: 'sent' });
+    expect(info.mock.calls.at(-1)?.[1]).not.toHaveProperty('replyMs');
+    // A Manual draft says so, whatever its activity was.
+    telemetry.turn({ facts, outcome: 'discarded', reason: 'review', draft: 4 });
+    expect(info.mock.calls.at(-1)?.[1]).toMatchObject({ draft: 4, mode: 'manual', outcome: 'discarded' });
+
+    telemetry.reply({
+      reply: 1,
+      kind: 'reply',
+      turn: 1,
+      part: 1,
+      outcome: 'spoken',
+      fallback: false,
+      durationMs: 1,
+      peakDb: -1,
+      rmsDb: -2,
+    });
+    telemetry.reply({
+      reply: 2,
+      kind: 'notice',
+      outcome: 'failed',
+      fallback: false,
+      durationMs: 0,
+      peakDb: -1,
+      rmsDb: -2,
+    });
+    telemetry.turn({ facts, outcome: 'sent', turn: 5, hostAt: Date.now() });
+    telemetry.ended('caller left', { wakes: 2 });
+    telemetry.ended('twice');
+    const events = info.mock.calls.map(([msg]) => msg);
+    // The waiting turn goes out before the call's event, and the call's event goes out once.
+    expect(events.slice(-2)).toEqual(['voice-mode.turn', 'voice-mode.call']);
+    expect(info.mock.calls.at(-1)?.[1]).toEqual({
+      reason: 'caller left',
+      durationMs: 2900 + 4100 + TURN_EVENT_WAIT_MS,
+      turnsSent: 3,
+      turnsDiscarded: 1,
+      turnsEmpty: 1,
+      turnsLost: 0,
+      turnsUnaddressed: 0,
+      repliesSpoken: 1,
+      repliesPartial: 0,
+      repliesFailed: 1,
+      wakes: 2,
+    });
+  });
+
+  it('a spoken line reports its provider/model, voice, fallback, latency, length and levels', () => {
+    let now = 1000;
+    const meter = new LineMeter(() => now);
+    expect(meter.done({ by: GEMINI, primary: GEMINI, failed: false, cut: false })).toBeNull();
+    now = 1800;
+    meter.audio();
+    now = 2000;
+    meter.audio();
+    meter.playing();
+    meter.frame(Int16Array.from({ length: 24_000 }, (_, i) => (i % 2 ? 16384 : -16384)));
+    expect(meter.done({ by: GEMINI, primary: ELEVEN, failed: false, cut: false })).toEqual({
+      outcome: 'spoken',
+      model: 'gemini/gemini-3.8-flash-tts',
+      voice: 'alnilam',
+      fallback: true,
+      firstAudioMs: 800,
+      heldMs: 200,
+      durationMs: 1000,
+      peakDb: -6,
+      rmsDb: -6,
+    });
+    expect(meter.done({ by: ELEVEN, primary: ELEVEN, failed: false, cut: false })).toMatchObject({
+      model: 'elevenlabs/eleven_v4_turbo',
+      voice: ELEVEN.voice,
+      fallback: false,
+    });
+    expect(meter.done({ by: GEMINI, primary: GEMINI, failed: true, cut: false })?.outcome).toBe('partial');
+    expect(meter.done({ by: GEMINI, primary: GEMINI, failed: false, cut: true })?.outcome).toBe('partial');
+    expect(new LineMeter().done({ primary: GEMINI, failed: true, cut: false })).toEqual({
+      outcome: 'failed',
+      fallback: false,
+      durationMs: 0,
+      peakDb: -Infinity,
+      rmsDb: -Infinity,
+    });
+  });
+
+  it('logs what the settings RPC applied: the wake switch, pause sends, typing and cues', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const info = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { log: { info, warn: () => undefined } }));
+    await v.rpc('settings', { wake: false, pauseSends: true, typing: false, cues: false });
+    expect(info).toHaveBeenCalledWith(
+      'voice-mode worker: settings',
+      expect.objectContaining({ wake: false, pauseSends: true, typing: false, cues: false }),
+    );
+    // A request naming only some of them logs what runs: the rest as they were.
+    await v.rpc('settings', { wake: true });
+    expect(info).toHaveBeenLastCalledWith(
+      'voice-mode worker: settings',
+      expect.objectContaining({ wake: true, pauseSends: true, typing: false, cues: false }),
+    );
+    host.endStream();
+  });
+
+  it('in a call: the turn, its reply and the call each log one event', async () => {
+    const { ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const info = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { log: { info, warn: () => undefined } }));
+    const settings = v.createVoice.mock.calls[0][2];
+    v.voice.say.mockImplementation(async (_text: string, ready?: () => Promise<void>) => {
+      await ready?.();
+      v.events.onAgentSpeaking(true);
+      settings.spoke?.({ outcome: 'spoken', model: 'tts', fallback: false, durationMs: 800, peakDb: -3, rmsDb: -20 });
+      v.events.onAgentSpeaking(false);
+      return true;
+    });
+    await v.turn('Book a table');
+    await vi.waitFor(() =>
+      expect(v.voice.publishTurn).toHaveBeenCalledWith(expect.objectContaining({ status: 'sent' })),
+    );
+    host.emit({ type: 'reply', text: 'Booked.', turn: '1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalled());
+    host.emit({ type: 'end', reason: 'caller hung up' });
+    await vi.waitFor(() => expect(info.mock.calls.some(([msg]) => msg === 'voice-mode.call')).toBe(true));
+    const event = (msg: string) => info.mock.calls.filter(([m]) => m === msg).map(([, f]) => f);
+    expect(event('voice-mode.turn')).toEqual([
+      expect.objectContaining({
+        callId: 'call-1',
+        turn: 1,
+        mode: 'handsfree',
+        outcome: 'sent',
+        source: 'final',
+        hostStatus: 202,
+        hostMs: expect.any(Number),
+        replyMs: expect.any(Number),
+      }),
+    ]);
+    expect(event('voice-mode.reply')).toEqual([
+      {
+        callId: 'call-1',
+        reply: 1,
+        kind: 'reply',
+        turn: 1,
+        part: 1,
+        outcome: 'spoken',
+        model: 'tts',
+        fallback: false,
+        durationMs: 800,
+        peakDb: -3,
+        rmsDb: -20,
+      },
+    ]);
+    expect(event('voice-mode.call')).toEqual([
+      expect.objectContaining({
+        callId: 'call-1',
+        reason: 'host: caller hung up',
+        turnsSent: 1,
+        repliesSpoken: 1,
+        wakes: 0,
+      }),
+    ]);
+    // No words of the caller or the agent in any event.
+    expect(JSON.stringify(info.mock.calls.filter(([m]) => String(m).startsWith('voice.')))).not.toMatch(/table|Booked/);
+  });
+});
+
+describe('call voice names', () => {
+  const state = fixtures.voiceAttribute;
+  const ids: CallVoiceState = { v: 1, active: state.active, pending: state.pending, gen: state.gen };
+  /** Names that arrive when `answer` is called, per voice id. */
+  const heldNames = () => {
+    const waiting: Array<{ voice: string; resolve: () => void }> = [];
+    const lookUp = (choice: TtsChoice) =>
+      new Promise<ChoiceDetails>((resolve) =>
+        waiting.push({
+          voice: choice.voice,
+          resolve: () => resolve(choice.provider === 'gemini' ? state.activeDetails! : state.pendingDetails!),
+        }),
+      );
+    const answer = (voice: string) => waiting.filter((w) => w.voice === voice).forEach((w) => w.resolve());
+    return { lookUp, answer };
+  };
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('posts the choice at once and its names when they arrive, as the fixture shows', async () => {
+    const posts: CallVoiceState[] = [];
+    const names = heldNames();
+    voiceAttribute((s) => void posts.push(s), names.lookUp).publish(ids);
+    expect(posts).toEqual([ids]);
+    names.answer(state.active.voice);
+    names.answer(state.pending!.voice);
+    await vi.waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1]).toEqual(state);
+  });
+
+  it('sends only the names of a state already posted', async () => {
+    const posts: CallVoiceState[] = [];
+    const names = heldNames();
+    voiceAttribute((s) => void posts.push(s), names.lookUp).publish(ids, { posted: true });
+    expect(posts).toEqual([]);
+    names.answer(state.active.voice);
+    names.answer(state.pending!.voice);
+    await vi.waitFor(() => expect(posts).toEqual([state]));
+  });
+
+  it('says the names could not be had after a short wait, and still posts them when they come', async () => {
+    vi.useFakeTimers();
+    try {
+      const posts: CallVoiceState[] = [];
+      const names = heldNames();
+      voiceAttribute((s) => void posts.push(s), names.lookUp).publish({ v: 1, active: state.active });
+      await vi.advanceTimersByTimeAsync(VOICE_NAMES_WAIT_MS);
+      expect(posts).toEqual([
+        { v: 1, active: state.active },
+        {
+          v: 1,
+          active: state.active,
+          activeDetails: {
+            ...state.activeDetails!,
+            voiceName: null,
+            language: null,
+            gender: null,
+            status: 'lookup_failed',
+          },
+        },
+      ]);
+      names.answer(state.active.voice);
+      await vi.waitFor(() => expect(posts).toHaveLength(3));
+      expect(posts[2]).toEqual({ v: 1, active: state.active, activeDetails: state.activeDetails });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops names that finish after a newer state, the pending choice taken with the same gen included', async () => {
+    const posts: CallVoiceState[] = [];
+    const names = heldNames();
+    const attribute = voiceAttribute((s) => void posts.push(s), names.lookUp, 60_000);
+    attribute.publish({ v: 1, active: state.active, pending: state.pending, gen: 7 });
+    const taken = { v: 1 as const, active: state.pending!, gen: 7 };
+    attribute.publish(taken);
+    // The newer state's names first, then the older's, reversed.
+    names.answer(state.pending!.voice);
+    await vi.waitFor(() => expect(posts).toHaveLength(3));
+    names.answer(state.active.voice);
+    await flush();
+    expect(posts.slice(1)).toEqual([taken, { ...taken, activeDetails: state.pendingDetails }]);
+  });
+
+  it('asks again for names that could not be had while the call lasts, and posts them when they come', async () => {
+    vi.useFakeTimers();
+    try {
+      const posts: CallVoiceState[] = [];
+      const failed = {
+        ...state.activeDetails!,
+        voiceName: null,
+        language: null,
+        gender: null,
+        status: 'lookup_failed' as const,
+      };
+      const answers = [failed, failed, state.activeDetails!];
+      const lookUp = vi.fn(async () => answers.shift()!);
+      voiceAttribute((s) => void posts.push(s), lookUp, VOICE_NAMES_WAIT_MS, [100, 200, 400]).publish({
+        v: 1,
+        active: state.active,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(posts).toEqual([
+        { v: 1, active: state.active },
+        { v: 1, active: state.active, activeDetails: failed },
+      ]);
+      await vi.advanceTimersByTimeAsync(100);
+      // The same answer again posts nothing.
+      expect(posts).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(posts).toEqual([
+        { v: 1, active: state.active },
+        { v: 1, active: state.active, activeDetails: failed },
+        { v: 1, active: state.active, activeDetails: state.activeDetails },
+      ]);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(lookUp).toHaveBeenCalledTimes(3);
+      expect(posts).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('asks again a bounded number of times, and never once the call closed', async () => {
+    vi.useFakeTimers();
+    try {
+      const failed = { ...state.activeDetails!, voiceName: null, status: 'lookup_failed' as const };
+      const always = vi.fn(async () => failed);
+      voiceAttribute(() => undefined, always, VOICE_NAMES_WAIT_MS, [100, 200]).publish({ v: 1, active: state.active });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(always).toHaveBeenCalledTimes(3);
+      const closing = vi.fn(async () => failed);
+      const attribute = voiceAttribute(() => undefined, closing, VOICE_NAMES_WAIT_MS, [100, 200]);
+      attribute.publish({ v: 1, active: state.active });
+      await vi.advanceTimersByTimeAsync(0);
+      attribute.close();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(closing).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('posts nothing once the call closed', async () => {
+    vi.useFakeTimers();
+    try {
+      const posts: CallVoiceState[] = [];
+      const names = heldNames();
+      const attribute = voiceAttribute((s) => void posts.push(s), names.lookUp);
+      attribute.publish({ v: 1, active: state.active });
+      attribute.close();
+      names.answer(state.active.voice);
+      await vi.advanceTimersByTimeAsync(VOICE_NAMES_WAIT_MS);
+      attribute.publish(ids);
+      expect(posts).toEqual([{ v: 1, active: state.active }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/**
+ * Fast send words, black box: a whole call (runCall) with the real CallerInput over a Silero-like VAD,
+ * the fake host and room, and a transcription whose finals the test hands out one activity at a time.
+ * What is checked is what the caller and the host see: the cues, the utterances posted, the page's
+ * turn status and captions, the wake state and which transcription activities run.
+ */
+describe('fast send words', () => {
+  const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+  const cues = (v: ReturnType<typeof fakeVoice>) => v.voice.playCue.mock.calls.map(([kind]) => kind);
+  const count = (v: ReturnType<typeof fakeVoice>, kind: CueKind) => cues(v).filter((k) => k === kind).length;
+
+  /**
+   * Silero as the worker loads it (agents-plugin-silero defaults): 32 ms windows at 16 kHz, speech above
+   * 0.5, START_OF_SPEECH after 50 ms of it, END_OF_SPEECH after more than 550 ms of quiet. A window is
+   * speech when any sample in it is loud. Every window reports INFERENCE_DONE, as Silero does.
+   */
+  function sileroVad() {
+    const WINDOW = 512;
+    const WINDOW_MS = 32;
+    return (): VadStream => {
+      const queue: unknown[] = [];
+      let wake: (() => void) | undefined;
+      let closed = false;
+      let pending: number[] = [];
+      let index = 0;
+      let speaking = false;
+      let speechMs = 0;
+      let silenceMs = 0;
+      let speechRun = 0;
+      let silenceRun = 0;
+      const emit = (type: VADEventType, probability: number) => {
+        queue.push({
+          type,
+          samplesIndex: index,
+          timestamp: (index / 16_000) * 1000,
+          speechDuration: speechMs,
+          silenceDuration: silenceMs,
+          probability,
+          inferenceDuration: 1,
+          frames: [],
+          speaking,
+          rawAccumulatedSilence: type === VADEventType.INFERENCE_DONE ? silenceRun : 0,
+          rawAccumulatedSpeech: type === VADEventType.INFERENCE_DONE ? speechRun : 0,
+        });
+        wake?.();
+      };
+      return {
+        pushFrame: (frame: AudioFrame) => {
+          if (closed) return;
+          pending = pending.concat(Array.from(frame.data));
+          while (pending.length >= WINDOW) {
+            const window = pending.slice(0, WINDOW);
+            pending = pending.slice(WINDOW);
+            index += WINDOW;
+            const p = window.some((s) => Math.abs(s) > 1000) ? 0.95 : 0.02;
+            if (speaking) speechMs += WINDOW_MS;
+            else silenceMs += WINDOW_MS;
+            emit(VADEventType.INFERENCE_DONE, p);
+            if (p > 0.5) {
+              speechRun += WINDOW_MS;
+              silenceRun = 0;
+              if (!speaking && speechRun >= 50) {
+                speaking = true;
+                silenceMs = 0;
+                speechMs = speechRun;
+                emit(VADEventType.START_OF_SPEECH, p);
+              }
+            } else {
+              silenceRun += WINDOW_MS;
+              speechRun = 0;
+              if (speaking && silenceRun > 550) {
+                speaking = false;
+                speechMs = 0;
+                silenceMs = silenceRun;
+                emit(VADEventType.END_OF_SPEECH, p);
+              }
+            }
+          }
+        },
+        close: () => {
+          closed = true;
+          wake?.();
+        },
+        async *[Symbol.asyncIterator]() {
+          for (;;) {
+            if (queue.length) yield queue.shift() as never;
+            else if (closed) return;
+            else await new Promise<void>((r) => (wake = r));
+          }
+        },
+      } as unknown as VadStream;
+    };
+  }
+
+  /** The acoustic wake word: the test says when it spotted the phrase. */
+  function fakeSpotter() {
+    let events!: WakeWordEvents;
+    const listening: boolean[] = [];
+    let pushed = 0;
+    const wake = {
+      phrase: 'Hey LiveKit',
+      threshold: 0.68,
+      ready: Promise.resolve(),
+      listen: vi.fn((on: boolean) => void listening.push(on)),
+      push: vi.fn((pcm: Int16Array) => void (pushed += pcm.length)),
+      summary: { hopMs: 40, scored: 0, skipped: 0, meanMs: 0, maxMs: 0, detections: 0, maxScore: 0 },
+      utilization: 0,
+      close: vi.fn(async () => undefined),
+    } satisfies WakeWord;
+    const make = vi.fn((e: WakeWordEvents) => {
+      events = e;
+      return wake;
+    });
+    return {
+      make,
+      listening,
+      /** The phrase ended at the newest audio. */
+      detect: () => events.onDetect(0.9, { start: Math.max(0, pushed - 16_000), end: pushed }),
+    };
+  }
+
+  async function startCall(o: { wake?: boolean; spotter?: boolean; utteranceDelayMs?: number } = {}) {
+    vi.useFakeTimers();
+    const { ctx, job, roomHandlers } = fakeJob();
+    const host = fakeHostFetch();
+    /** What reached the host, in order: requests, and when each utterance POST was answered. */
+    const order: string[] = [];
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const what = url.endsWith('/utterance') ? 'utterance' : url.endsWith('/ended') ? 'ended' : '';
+      if (what) order.push(what);
+      if (what === 'utterance' && o.utteranceDelayMs) await new Promise((r) => setTimeout(r, o.utteranceDelayMs));
+      const res = await host.fetchImpl(input, init);
+      if (what === 'utterance') order.push('utterance answered');
+      return res;
+    }) as typeof fetch;
+    const v = fakeVoice();
+    const spotter = o.spotter ? fakeSpotter() : undefined;
+    // Each activity's end() waits for the final the test hands it (`final(n, ...)`), however late.
+    const finals: Array<(h: Heard) => void> = [];
+    v.transcription.end.mockImplementation(() => new Promise<Heard>((resolve) => finals.push(resolve)));
+    await runCall(ctx, { ...callDeps(fetchImpl, v), ...(spotter ? { wakeWord: spotter.make } : {}) });
+    const input = new CallerInput(sileroVad(), v.events, { error: () => undefined });
+    await vi.advanceTimersByTimeAsync(0);
+    if (o.wake) await v.rpc('settings', { wake: true });
+    await vi.advanceTimersByTimeAsync(0);
+    const frames = async (ms: number, level: number) => {
+      for (let at = 0; at < ms; at += 20) {
+        input.frame(new AudioFrame(new Int16Array(320).fill(level), 16_000, 1, 320));
+        await vi.advanceTimersByTimeAsync(20);
+      }
+    };
+    const call = {
+      host,
+      v,
+      job,
+      order,
+      spotter,
+      /** The caller speaks for `ms`. */
+      say: (ms: number) => frames(ms, 3000),
+      /** `ms` of the caller's quiet. */
+      quiet: (ms: number) => frames(ms, 0),
+      /** The transcription's whole text of the open activity so far. */
+      interim: async (text: string) => {
+        v.interim(text);
+        await vi.advanceTimersByTimeAsync(0);
+      },
+      /** The n-th activity's (0-based) result arrives: its final (none when undefined) and last interim. */
+      final: async (n: number, final: string | undefined, interim = final ?? '') => {
+        expect(finals.length, `activity ${n} was ended`).toBeGreaterThan(n);
+        finals[n](heard(interim, final));
+        await vi.advanceTimersByTimeAsync(0);
+      },
+      /** How many activities were ended (transcriber.end()). */
+      ended: () => v.transcription.end.mock.calls.length,
+      begun: () => v.transcription.begins.length,
+      hangUp: () => roomHandlers.get('participantDisconnected')?.(HANG_UP),
+      /** The wake phrase said, and the spotter hearing it at its end. */
+      wakeUp: async () => {
+        await frames(600, 3000);
+        spotter?.detect();
+        await vi.advanceTimersByTimeAsync(0);
+        await frames(200, 0);
+      },
+      done: async () => {
+        input.close();
+        // A call that already ended cancelled the host's stream.
+        try {
+          host.endStream();
+        } catch {
+          // already closed
+        }
+        await vi.advanceTimersByTimeAsync(100);
+      },
+    };
+    return call;
+  }
+
+  /** `p` settles within `ms` of the call's time. */
+  const within = async <T>(p: Promise<T>, ms = 200): Promise<T> => {
+    let settled = false;
+    let value!: T;
+    void p.then((r) => {
+      settled = true;
+      value = r;
+    });
+    await vi.advanceTimersByTimeAsync(ms);
+    expect(settled, `settled within ${ms} ms`).toBe(true);
+    return value;
+  };
+
+  it('zulu, прийом and copy: the sent cue at the first such interim plus quiet, before the final; the final is what is sent', async () => {
+    for (const [interim, final, body] of [
+      ['book a table for two zulu', 'Book a table for two. Zulu.', 'Book a table for two.'],
+      ['скільки буде два плюс три прийом', 'Скільки буде два плюс три? Прийом.', 'Скільки буде два плюс три?'],
+      ['Book a table for two. Copy.', 'Book a table for two, please. Copy.', 'Book a table for two, please.'],
+    ]) {
+      const c = await startCall();
+      await c.say(1500);
+      // Transcript first: the interim ends in the word while the VAD still counts the quiet.
+      await c.interim(interim);
+      await c.quiet(400);
+      expect(count(c.v, 'sent'), `${interim}: no cue before 550 ms of quiet`).toBe(0);
+      await c.quiet(300);
+      expect(count(c.v, 'sent'), interim).toBe(1);
+      expect(c.ended(), interim).toBe(1);
+      // Committed, not stored: the page shows it sending; nothing reached the host without its final.
+      expect(c.v.voice.publishTurn).toHaveBeenCalledWith(expect.objectContaining({ status: 'sending' }));
+      expect(utterances(c.host)).toEqual([]);
+      await c.final(0, final, interim);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(utterances(c.host), interim).toEqual([body]);
+      expect(c.v.voice.publishTurn).toHaveBeenCalledWith(expect.objectContaining({ status: 'sent', text: body }));
+      expect(c.v.voice.caption).toHaveBeenCalledWith(expect.any(Number), body, true, { command: 'send', words: body });
+      // Stored by the host: still the one cue.
+      expect(count(c.v, 'sent'), interim).toBe(1);
+      await c.done();
+    }
+  });
+
+  it('silence first: the word arriving after the quiet commits at once', async () => {
+    const c = await startCall();
+    await c.say(1500);
+    await c.quiet(700);
+    expect(c.ended()).toBe(0);
+    await c.interim('Book a table. Zulu.');
+    await vi.advanceTimersByTimeAsync(40);
+    expect(count(c.v, 'sent')).toBe(1);
+    expect(c.ended()).toBe(1);
+    await c.final(0, 'Book a table. Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Book a table.']);
+    expect(count(c.v, 'sent')).toBe(1);
+    await c.done();
+  });
+
+  it('a final that rewrites the word or leaves it out still sends what it heard, and the turn does not reopen', async () => {
+    for (const [interim, final, sent] of [
+      ['Can you check the weather? Copy.', 'Can you check the weather? Okay.', 'Can you check the weather? Okay.'],
+      ['Book a table for two. Zulu.', 'Book a table for two.', 'Book a table for two.'],
+      ['Book a table. Copy.', 'Book a table.', 'Book a table.'],
+    ]) {
+      const c = await startCall();
+      await c.say(1500);
+      await c.interim(interim);
+      await c.quiet(700);
+      expect(count(c.v, 'sent'), interim).toBe(1);
+      await c.final(0, final, interim);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(utterances(c.host), interim).toEqual([sent]);
+      // No new activity carries the words on, and the closing silence sends nothing more.
+      await c.quiet(SILENCE + 500);
+      expect(c.begun(), interim).toBe(1);
+      expect(utterances(c.host), interim).toEqual([sent]);
+      expect(count(c.v, 'sent'), interim).toBe(1);
+      expect(count(c.v, 'nope'), interim).toBe(0);
+      await c.done();
+    }
+  });
+
+  it('copy is a word inside a sentence and after a capital alone; after punctuation it sends', async () => {
+    for (const said of ['Can you copy that?', 'please send me a copy', 'Rewrite the landing page Copy']) {
+      const c = await startCall();
+      await c.say(1500);
+      await c.interim(said);
+      await c.quiet(1200);
+      // No send word: the activity goes on, no cue, nothing posted.
+      expect(c.ended(), said).toBe(0);
+      expect(count(c.v, 'sent'), said).toBe(0);
+      expect(utterances(c.host), said).toEqual([]);
+      // The closing silence sends it as words, copy and all.
+      await c.quiet(SILENCE - 1200 + 100);
+      expect(c.ended(), said).toBe(1);
+      await c.final(0, said);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(utterances(c.host), said).toEqual([said]);
+      expect(count(c.v, 'sent'), said).toBe(1);
+      await c.done();
+    }
+    for (const [said, body] of [
+      ['Is it ready? Copy.', 'Is it ready?'],
+      ['Book a table, copy that.', 'Book a table.'],
+    ]) {
+      const c = await startCall();
+      await c.say(1500);
+      await c.interim(said);
+      await c.quiet(700);
+      expect(count(c.v, 'sent'), said).toBe(1);
+      await c.final(0, said);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(utterances(c.host), said).toEqual([body]);
+      await c.done();
+    }
+  });
+
+  it('a hang-up right after the cue still submits the turn, before the call is reported ended, with the best text', async () => {
+    // No final ever: the interim's words go, within the grace, and the call ends on time.
+    let c = await startCall({ utteranceDelayMs: 150 });
+    await c.say(1500);
+    await c.interim('Book a table for two. Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(1);
+    c.hangUp();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(utterances(c.host)).toEqual(['Book a table for two.']);
+    // The host takes no utterance once told the call ended: the submission is answered first.
+    expect(c.order.indexOf('utterance answered')).toBeGreaterThanOrEqual(0);
+    expect(c.order.indexOf('utterance answered')).toBeLessThan(c.order.indexOf('ended'));
+    expect(c.job.shutdown).toHaveBeenCalledWith('caller left');
+    await c.done();
+
+    // The final arrives within the grace: its words go.
+    c = await startCall({ utteranceDelayMs: 150 });
+    await c.say(1500);
+    await c.interim('Book a table for two. Zulu.');
+    await c.quiet(700);
+    c.hangUp();
+    await vi.advanceTimersByTimeAsync(100);
+    await c.final(0, 'Book a table for two, please. Zulu.', 'Book a table for two. Zulu.');
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(utterances(c.host)).toEqual(['Book a table for two, please.']);
+    expect(c.order.indexOf('utterance answered')).toBeLessThan(c.order.indexOf('ended'));
+    expect(c.job.shutdown).toHaveBeenCalled();
+    await c.done();
+  });
+
+  it('a hang-up while the committed activity cannot finish (its transcription still setting up, or failing on close) still submits, bounded', async () => {
+    for (const closing of ['never settles', 'rejects on close'] as const) {
+      const c = await startCall();
+      // The activity's end() never answers on its own; closing the transcription fails it, or not.
+      const pending: Array<(err: Error) => void> = [];
+      c.v.transcription.end.mockImplementation(
+        () => new Promise<Heard>((_resolve, reject) => void pending.push(reject)),
+      );
+      if (closing === 'rejects on close') {
+        c.v.transcription.close.mockImplementation(() => {
+          for (const reject of pending.splice(0)) reject(new Error('socket closed during setup'));
+        });
+      }
+      await c.say(1200);
+      await c.interim('Remind me to buy bread. Прийом.');
+      await c.quiet(700);
+      expect(count(c.v, 'sent'), closing).toBe(1);
+      c.hangUp();
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(utterances(c.host), closing).toEqual(['Remind me to buy bread.']);
+      expect(c.order.indexOf('utterance answered'), closing).toBeLessThan(c.order.indexOf('ended'));
+      expect(c.job.shutdown, closing).toHaveBeenCalledWith('caller left');
+      await c.done();
+    }
+  });
+
+  it('speech after the commit is the next turn: the committed send goes unchanged, on its own', async () => {
+    const c = await startCall();
+    await c.say(1500);
+    await c.interim('Book a table for two. Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(1);
+    // The caller goes on at once, while the first final is still out.
+    await c.say(900);
+    expect(c.begun()).toBe(2);
+    await c.interim('And for eight.');
+    await c.final(0, 'Book a table for two. Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Book a table for two.']);
+    await c.quiet(SILENCE + 100);
+    await c.final(1, 'And for eight.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Book a table for two.', 'And for eight.']);
+    expect(count(c.v, 'sent')).toBe(2);
+    await c.done();
+  });
+
+  it('a switch to Manual after the commit takes nothing from it: it is posted, and no draft holds its words', async () => {
+    const c = await startCall();
+    await c.say(1500);
+    await c.interim('Remind me to buy bread. Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(1);
+    expect(await within(c.v.rpc('mode', { mode: 'review' }))).toMatchObject({ ok: true });
+    await c.final(0, 'Remind me to buy bread. Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Remind me to buy bread.']);
+    expect(c.v.states.some((s) => s.draft?.text.includes('bread'))).toBe(false);
+    expect(count(c.v, 'sent')).toBe(1);
+    await c.done();
+  });
+
+  it('a second wake phrase after the commit opens the next turn; both go, separately and in order', async () => {
+    // No spotter: `hey <agent>` in the transcript addresses a turn.
+    const c = await startCall({ wake: true });
+    await c.say(1800);
+    await c.interim('Hey Andy, remind me to buy bread. Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(1);
+    await c.say(1500);
+    await c.interim('Hey Andy, what time is it? Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(2);
+    // The second final first: the host still gets the first turn first.
+    await c.final(1, 'Hey Andy, what time is it? Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual([]);
+    await c.final(0, 'Hey Andy, remind me to buy bread. Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['remind me to buy bread.', 'what time is it?']);
+    await c.done();
+  });
+
+  it('a committed send waiting for a slow final goes before a later pause-ended turn whose final came first', async () => {
+    const c = await startCall();
+    await c.say(1500);
+    await c.interim('Book a table for two. Zulu.');
+    await c.quiet(700);
+    await c.say(900);
+    await c.interim('And a taxi at seven.');
+    await c.quiet(SILENCE + 100);
+    expect(c.ended()).toBe(2);
+    await c.final(1, 'And a taxi at seven.');
+    await vi.advanceTimersByTimeAsync(200);
+    expect(utterances(c.host)).toEqual([]);
+    await c.final(0, 'Book a table for two. Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Book a table for two.', 'And a taxi at seven.']);
+    expect(count(c.v, 'sent')).toBe(2);
+    await c.done();
+  });
+
+  it('a committed send waiting for a slow final goes before a Manual Send made after it', async () => {
+    const c = await startCall();
+    await c.say(1500);
+    await c.interim('Book a table for two. Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(1);
+    expect(await within(c.v.rpc('mode', { mode: 'review' }))).toMatchObject({ ok: true });
+    const talk = await within(c.v.rpc('talk'));
+    expect(talk).toMatchObject({ ok: true });
+    const draft = talk.draft as number;
+    await c.say(1000);
+    const done = c.v.rpc('done', { draft });
+    await vi.advanceTimersByTimeAsync(0);
+    await c.final(1, 'And a taxi at seven.');
+    await within(done);
+    expect(await within(c.v.rpc('send', { draft }))).toMatchObject({ ok: true });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(utterances(c.host)).toEqual([]);
+    await c.final(0, 'Book a table for two. Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Book a table for two.', 'And a taxi at seven.']);
+    expect(count(c.v, 'sent')).toBe(2);
+    await c.done();
+  });
+
+  it('a discard stays careful: one interim ending in scratch that does not drop the words at once', async () => {
+    const c = await startCall();
+    const said = 'Remind me to call the plumber. Scratch that.';
+    await c.say(1500);
+    await c.quiet(700);
+    await c.interim(said);
+    // Where a send word would have committed, a discard has not acted yet.
+    await vi.advanceTimersByTimeAsync(40);
+    expect(c.ended()).toBe(0);
+    expect(count(c.v, 'discard')).toBe(0);
+    await c.quiet(800);
+    expect(c.ended()).toBe(1);
+    await c.final(0, said);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(c.v.voice.publishDropped).toHaveBeenCalledWith({ dropped: 'discarded', text: said });
+    expect(count(c.v, 'discard')).toBe(1);
+    expect(count(c.v, 'sent')).toBe(0);
+    expect(utterances(c.host)).toEqual([]);
+    await c.done();
+  });
+
+  it('old words, scratch that, the wake phrase, new words, zulu: only the new words are sent, each part its own caption', async () => {
+    const c = await startCall({ wake: true, spotter: true });
+    await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
+    await c.wakeUp();
+    // A pause after the phrase: no activity until the caller goes on.
+    expect(c.begun()).toBe(0);
+    const said = 'Remind me to buy bread. Scratch that. Hey Andy. What time is it? Zulu.';
+    await c.say(3000);
+    expect(c.begun()).toBe(1);
+    await c.interim(said);
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(1);
+    await c.final(0, said);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['What time is it?']);
+    expect(c.v.voice.publishDropped).toHaveBeenCalledWith({
+      dropped: 'discarded',
+      text: 'Remind me to buy bread. Scratch that.',
+    });
+    expect(count(c.v, 'discard')).toBe(1);
+    expect(count(c.v, 'sent')).toBe(1);
+    const finals = c.v.voice.caption.mock.calls.filter(([, , final]) => final);
+    const prefix = finals.find(([, , , mark]) => mark?.command === 'discard');
+    const suffix = finals.find(([, text, , mark]) => mark?.command === 'send' && text === 'What time is it?');
+    expect(prefix?.[1]).toBe('Remind me to buy bread. Scratch that.');
+    expect(suffix).toBeDefined();
+    expect(prefix?.[0]).not.toBe(suffix?.[0]);
+    await c.done();
+  });
+
+  it('a lone zulu is a nope at once, never a send, and in wake mode the next request is still heard', async () => {
+    const c = await startCall({ wake: true, spotter: true });
+    await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
+    await c.wakeUp();
+    await c.say(500);
+    await c.interim('Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'nope')).toBe(1);
+    expect(count(c.v, 'sent')).toBe(0);
+    // The page and the app hear the truth: still awake, not waiting for the phrase.
+    expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: false });
+    // No new wake phrase: the request right after is heard and sent.
+    await c.say(1500);
+    await c.interim('What time is it? Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(1);
+    await c.final(c.ended() - 1, 'What time is it? Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['What time is it?']);
+    // The lone command's own late final cannot make it a send.
+    await c.final(0, 'Book it. Zulu.', 'Zulu.');
+    await vi.advanceTimersByTimeAsync(200);
+    expect(utterances(c.host)).toEqual(['What time is it?']);
+    expect(count(c.v, 'nope')).toBe(1);
+    await c.done();
+  });
+
+  it('a woken turn that goes back to waiting with words sends them: the sent cue, then the sleep cue', async () => {
+    const c = await startCall({ wake: true, spotter: true });
+    await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
+    await c.wakeUp();
+    await c.quiet(700);
+    await c.say(1500);
+    await c.interim('Remind me to buy bread tomorrow morning.');
+    // The idle limit, from the VAD's speech end (its closing silence takes ~0.6 s).
+    await c.quiet(19_000);
+    expect(c.ended()).toBe(0);
+    await c.quiet(2_000);
+    expect(c.ended()).toBe(1);
+    await c.final(0, 'Remind me to buy bread tomorrow morning.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Remind me to buy bread tomorrow morning.']);
+    const cues = c.v.voice.playCue.mock.calls.map(([k]) => k);
+    expect(cues.slice(cues.indexOf('wake'))).toEqual(['wake', 'sent', 'sleep']);
+    expect(c.v.states.at(-1)?.wake).toMatchObject({ waiting: true, slept: 1 });
+    await c.done();
+  });
+
+  it('an echoed send word after a wake: no nope, nothing sent, and the page still hears awake', async () => {
+    const c = await startCall({ wake: true, spotter: true });
+    await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
+    await c.wakeUp();
+    await c.quiet(700);
+    expect(c.begun()).toBe(0);
+    // A click: VAD speech under the floor opens an activity, and the transcription makes up the word.
+    await c.say(100);
+    expect(c.begun()).toBe(1);
+    await c.interim('Прийом.');
+    await c.quiet(700);
+    expect(count(c.v, 'nope')).toBe(0);
+    expect(count(c.v, 'sent')).toBe(0);
+    expect(c.ended()).toBe(1);
+    expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: false, heard: 1 });
+    expect(c.v.voice.publishDropped).not.toHaveBeenCalled();
+    await c.say(1500);
+    await c.interim('What time is it? Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(1);
+    await c.final(1, 'What time is it? Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['What time is it?']);
+    await c.done();
+  });
+
+  it('the wake word listens again at the commit: a new hey opens a turn while the first still waits for its final', async () => {
+    const c = await startCall({ wake: true, spotter: true });
+    await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
+    await c.wakeUp();
+    await c.say(1500);
+    await c.interim('Remind me to buy bread. Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(1);
+    // The first final is still out: the page shows waiting, and the spotter scores the audio.
+    expect(c.v.states.at(-1)?.wake).toMatchObject({ waiting: true });
+    expect(c.spotter?.listening.at(-1)).toBe(true);
+    await c.wakeUp();
+    expect(c.begun()).toBe(1);
+    expect(count(c.v, 'wake')).toBe(2);
+    await c.say(1500);
+    expect(c.begun()).toBe(2);
+    await c.interim('What time is it? Zulu.');
+    await c.quiet(700);
+    expect(count(c.v, 'sent')).toBe(2);
+    await c.final(1, 'What time is it? Zulu.');
+    await c.final(0, 'Remind me to buy bread. Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Remind me to buy bread.', 'What time is it?']);
+    await c.done();
+  });
+
+  it('pause-ended and Manual sends keep their cue at submission: one sent cue per turn', async () => {
+    const c = await startCall();
+    // A pause-ended turn: no cue until its final is in and it goes to the host.
+    await c.say(1500);
+    await c.interim('Book a table for two');
+    await c.quiet(SILENCE + 100);
+    expect(c.ended()).toBe(1);
+    expect(count(c.v, 'sent')).toBe(0);
+    await c.final(0, 'Book a table for two.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Book a table for two.']);
+    expect(count(c.v, 'sent')).toBe(1);
+    // A pause-ended turn whose final has the send word the interims missed: sent without it, one cue.
+    await c.say(1500);
+    await c.interim('And a taxi');
+    await c.quiet(SILENCE + 100);
+    expect(count(c.v, 'sent')).toBe(1);
+    await c.final(1, 'And a taxi. Zulu.', 'And a taxi');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Book a table for two.', 'And a taxi.']);
+    expect(count(c.v, 'sent')).toBe(2);
+    // Manual: the cue comes with Send, once.
+    expect(await within(c.v.rpc('mode', { mode: 'review' }))).toMatchObject({ ok: true });
+    const talk = await within(c.v.rpc('talk'));
+    const draft = talk.draft as number;
+    await c.say(1000);
+    const done = c.v.rpc('done', { draft });
+    await vi.advanceTimersByTimeAsync(0);
+    await c.final(2, 'Book a table. Zulu.');
+    await within(done);
+    expect(count(c.v, 'sent')).toBe(2);
+    expect(await within(c.v.rpc('send', { draft }))).toMatchObject({ ok: true });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Book a table for two.', 'And a taxi.', 'Book a table. Zulu.']);
+    expect(count(c.v, 'sent')).toBe(3);
+    await c.done();
+  });
+
+  it('speech under the agent line cannot commit; once it ends, fresh quiet does', async () => {
+    const c = await startCall({ wake: true, spotter: true });
+    await vi.waitFor(() => expect(c.v.states.at(-1)?.wake).toMatchObject({ on: true, waiting: true }));
+    await c.wakeUp();
+    await c.say(800);
+    c.v.events.onAgentSpeaking(true);
+    await c.say(600);
+    await c.interim('Book a table. Zulu.');
+    await c.quiet(900);
+    expect(c.ended()).toBe(0);
+    expect(utterances(c.host)).toEqual([]);
+    c.v.events.onAgentSpeaking(false);
+    await c.quiet(700);
+    expect(c.ended()).toBe(1);
+    expect(count(c.v, 'sent')).toBe(1);
+    await c.final(0, 'Book a table. Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Book a table.']);
+    await c.done();
+  });
+
+  it('the quiet must be fresh: a blip too short to be speech restarts its 550 ms', async () => {
+    const c = await startCall();
+    await c.say(1500);
+    await c.interim('Book a table. Zulu.');
+    await c.quiet(300);
+    await c.say(20);
+    await c.quiet(400);
+    // 720 ms after the speech, but only 400 ms after the blip.
+    expect(c.ended()).toBe(0);
+    expect(count(c.v, 'sent')).toBe(0);
+    await c.quiet(260);
+    expect(c.ended()).toBe(1);
+    expect(count(c.v, 'sent')).toBe(1);
+    await c.final(0, 'Book a table. Zulu.');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(utterances(c.host)).toEqual(['Book a table.']);
+    await c.done();
+  });
+});
+
+describe('meeting calls', () => {
+  /** A `/meet` job: its caller is the Recall bridge page. */
+  const MEETING_META: LiveKitJobMetadata = {
+    ...META,
+    callerIdentity: 'meet-bridge-meet-r1',
+    meeting: { pauseSends: false, jev: false },
+  };
+  const WAKE_ENV = { ...ENV, VOICE_MODE_WAKE_MODEL: '/models/hey_dan.onnx', VOICE_MODE_WAKE_PHRASE: 'Hey Dan' };
+  const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body?.text);
+
+  /** One stretch of meeting speech, its interim, then the closing silence; `final` queues the activity's final. */
+  const say = async (v: ReturnType<typeof fakeVoice>, interim: string, final?: string) => {
+    await flush();
+    if (final !== undefined) v.transcription.results.push(heard(final, final));
+    const start = v.position;
+    v.events.onSpeech(true, start);
+    v.audio(1000);
+    v.interim(interim);
+    v.interim(interim);
+    const end = v.position;
+    v.audio(SILENCE);
+    v.events.onVad(v.position, end);
+    v.events.onSpeech(false, end);
+    await flush();
+  };
+
+  it("wakes on VOICE_MODE_WAKE_PHRASE's name, Hey Dan only without one, never on the agent's names", () => {
+    expect(meetingWake(WAKE_ENV)).toEqual({ name: 'Dan', phrase: 'Hey Dan' });
+    expect(meetingWake(ENV)).toEqual({ name: 'Dan', phrase: 'Hey Dan' });
+    expect(meetingWake({ ...ENV, VOICE_MODE_WAKE_PHRASE: ' Hey  Jarvis ' })).toEqual({
+      name: 'Jarvis',
+      phrase: 'Hey Jarvis',
+    });
+    expect(meetingWake({ ...ENV, VOICE_MODE_WAKE_PHRASE: ' Computer ' })).toEqual({
+      name: 'Computer',
+      phrase: 'Computer',
+    });
+    const names = wakeNameWords([meetingWake(WAKE_ENV).name]);
+    expect(matchWake("Hey Dan, what's two plus two?", names)).not.toBeNull();
+    expect(matchWake("Hey Andy, what's two plus two?", names)).toBeNull();
+  });
+
+  it('waits for the bridge page as its caller, hears the wake phrase, runs the spotter and records nothing', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-meeting-'));
+    try {
+      const { ctx, job, room } = fakeJob({ ...MEETING_META });
+      room.remoteParticipants.clear();
+      room.remoteParticipants.set('meet-bridge-meet-r1', {});
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      // A meeting has no page to send settings.
+      v.voice.review.serve = vi.fn();
+      const make = vi.fn((options: { onInterim(text: string): void }) => {
+        v.interim = (text) => options.onInterim(text);
+        return v.transcription;
+      });
+      const wakeWord = vi.fn();
+      const env = { ...WAKE_ENV, VOICE_MODE_RECORDINGS_DAYS: '7', VOICE_MODE_CALL_RECORDING: '1' };
+      await runCall(ctx, {
+        ...callDeps(host.fetchImpl, v, { env, recordingsRoot: root, wakeWord }),
+        transcriber: make,
+      });
+      expect(job.waitForParticipant).toHaveBeenCalledWith('meet-bridge-meet-r1');
+      expect(make).toHaveBeenCalledWith(
+        expect.objectContaining({ vocabulary: ['NanoClaw', 'Hey Dan', ...COMMAND_VOCABULARY] }),
+      );
+      expect(wakeWord).toHaveBeenCalledTimes(1);
+
+      // Wake mode is on: talk without the phrase drops, the agent's own name does not wake it.
+      // A pause does not send: the send word does, and only the words after the phrase go.
+      await say(v, 'I think we can ship on Friday', 'I think we can ship on Friday');
+      await say(v, 'Hey Andy, what is two plus two? Copy.', 'Hey Andy, what is two plus two? Copy.');
+      await say(v, 'Hey Dan, what is two plus two?');
+      await new Promise((r) => setTimeout(r, 50));
+      expect(utterances(host)).toEqual([]);
+      const all = 'Hey Dan, what is two plus two? Copy.';
+      await say(v, all, all);
+      await vi.waitFor(() => expect(utterances(host)).toEqual(['what is two plus two?']));
+      host.emit({ type: 'end', reason: 'test over' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+      expect(fs.readdirSync(root)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('a `pause` meeting sends the woken turn on the pause', async () => {
+    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: true, jev: false } });
+    room.remoteParticipants.clear();
+    room.remoteParticipants.set('meet-bridge-meet-r1', {});
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    v.voice.review.serve = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
+    await say(v, 'I think we can ship on Friday', 'I think we can ship on Friday');
+    await say(v, 'Hey Dan, what is two plus two?', 'Hey Dan, what is two plus two?');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['what is two plus two?']));
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+  });
+
+  it('`jev`: unaddressed talk goes to the host as a candidate on the pause, cued only once the host takes it', async () => {
+    for (const [jev, status] of [
+      [false, 202],
+      [true, 200],
+      [true, 202],
+    ] as const) {
+      const { ctx, job, room } = fakeJob({ ...MEETING_META, agentName: 'Junior', meeting: { pauseSends: false, jev } });
+      room.remoteParticipants.clear();
+      room.remoteParticipants.set('meet-bridge-meet-r1', {});
+      const host = fakeHostFetch(200, status);
+      const v = fakeVoice();
+      v.voice.review.serve = vi.fn();
+      await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
+      const posts = () => host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body);
+      const sentCues = () => v.voice.playCue.mock.calls.filter(([kind]) => kind === 'sent').length;
+
+      const chatter = 'Does anyone know when the release ships?';
+      await say(v, chatter, chatter);
+      if (!jev) {
+        await new Promise((r) => setTimeout(r, 50));
+        expect(posts()).toEqual([]);
+      } else {
+        // The agent is Junior; the meeting wakes on Hey Dan, so the host's judge hears of Dan.
+        await vi.waitFor(() =>
+          expect(posts()).toEqual([expect.objectContaining({ text: chatter, candidate: true, wakeName: 'Dan' })]),
+        );
+        await flush();
+        if (status === 202) {
+          await vi.waitFor(() => expect(sentCues()).toBe(1));
+          await vi.waitFor(() => expect(v.voice.setThinking).toHaveBeenCalledWith(true));
+        } else {
+          await new Promise((r) => setTimeout(r, 50));
+          expect(sentCues()).toBe(0);
+          expect(v.voice.setThinking).not.toHaveBeenCalledWith(true);
+        }
+      }
+      // A Hey Dan turn stays the instant path: a plain turn, never a candidate.
+      const addressed = 'Hey Dan, what is two plus two? Copy.';
+      await say(v, addressed, addressed);
+      await vi.waitFor(() => expect(posts().at(-1)).toMatchObject({ text: 'what is two plus two?' }));
+      expect(posts().at(-1)).not.toHaveProperty('candidate');
+      host.emit({ type: 'end', reason: 'test over' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+    }
+  });
+
+  it('`jev` meetings run no wake word spotter, so unaddressed speech is transcribed; other meetings keep it', async () => {
+    for (const jev of [true, false]) {
+      const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: false, jev } });
+      room.remoteParticipants.clear();
+      room.remoteParticipants.set('meet-bridge-meet-r1', {});
+      const host = fakeHostFetch(200, 200);
+      const wakeWord = vi.fn();
+      const v = fakeVoice();
+      v.voice.review.serve = vi.fn();
+      await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord }));
+      expect(wakeWord).toHaveBeenCalledTimes(jev ? 0 : 1);
+      host.emit({ type: 'end', reason: 'test over' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+    }
+  });
+
+  it('`jev`: one candidate at a time; one said while the host judges another is dropped', async () => {
+    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: false, jev: true } });
+    room.remoteParticipants.clear();
+    room.remoteParticipants.set('meet-bridge-meet-r1', {});
+    const host = fakeHostFetch(200, 200);
+    const answer = host.fetchImpl.getMockImplementation()!;
+    let release!: () => void;
+    const judged = new Promise<void>((r) => (release = r));
+    host.fetchImpl.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/utterance') && String(init?.body).includes('"candidate":true')) await judged;
+      return answer(input, init);
+    });
+    const v = fakeVoice();
+    v.voice.review.serve = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
+    const candidates = () =>
+      host.fetchImpl.mock.calls.filter(
+        ([input, init]) => String(input).endsWith('/utterance') && String(init?.body).includes('"candidate":true'),
+      );
+
+    await say(v, 'Does anyone know when the release ships?', 'Does anyone know when the release ships?');
+    await vi.waitFor(() => expect(candidates()).toHaveLength(1));
+    await say(v, 'I think it was Friday', 'I think it was Friday');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(candidates()).toHaveLength(1);
+    release();
+    await flush();
+    await say(v, 'Or was it Monday', 'Or was it Monday');
+    await vi.waitFor(() => expect(candidates()).toHaveLength(2));
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+  });
+});
