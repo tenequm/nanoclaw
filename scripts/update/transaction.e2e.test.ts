@@ -298,7 +298,9 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe('update-nanoclaw transaction end to end', () => {
+// Each case drives real git through ~50 subprocesses (spawning one costs 50-100ms on
+// macOS); allow for that and a loaded CI box, as the sibling controller-archive suite does.
+describe('update-nanoclaw transaction end to end', { timeout: 60_000 }, () => {
   it('applies an implicit OneCLI skill before stamping the extracted gateway selection', async () => {
     const fixture = createForkFixture({ gatewayExtraction: true });
     previousUpdateDir = process.env.NANOCLAW_UPDATE_DIR;
