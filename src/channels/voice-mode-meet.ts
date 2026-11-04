@@ -141,7 +141,10 @@ export function createRecallTranscripts(
   let detector: SpeechDetectorFactory | null = null;
   const calls = new Map<string, { audio: MeetingAudio; logged: number }>();
   const ingress = createRecallIngress({
-    onAudio: (callId, speaker, pcm, at) => calls.get(callId)?.audio.audio(speaker, pcm, at),
+    // Nothing is transcribed (or judged) before the call is live: its bridge page has not joined to speak yet.
+    onAudio: (callId, speaker, pcm, at) => {
+      if (core.jevCall(callId)) calls.get(callId)?.audio.audio(speaker, pcm, at);
+    },
     onEvent: (callId, event) => core.jevCall(callId)?.transcript(event),
     onPresence: (callId, speaker, joined, at) => {
       if (!joined) calls.get(callId)?.audio.left(speaker, at);
@@ -169,6 +172,7 @@ export function createRecallTranscripts(
           (err: unknown) =>
             log.error('meet-jev audio: the VAD did not load; meeting speech is not transcribed', { err }),
         );
+      const url = recallEndpointUrl(origin, ingress.register(callId, { botName }));
       const audio = createMeetingAudio({
         speech: { apiKey: geminiKey, model: job.sttModel, vocabulary: job.vocabulary, languageCodes: job.languages },
         detector: () => detector,
@@ -181,7 +185,6 @@ export function createRecallTranscripts(
           debug: (msg: string, fields?: unknown) => log.debug(msg, { callId, ...(fields as object) }),
         },
       });
-      const url = recallEndpointUrl(origin, ingress.register(callId, { botName }));
       calls.set(callId, { audio, logged: 0 });
       return url;
     },
@@ -246,8 +249,11 @@ export function createMeetings(
     const participantAudio = options.jev
       ? { websocketUrl: transcripts.register(call.callId, botName, opened.job) }
       : undefined;
-    // Ended while connecting: its end hook ran before there was anything to unregister.
-    if (participantAudio && meeting.ended) transcripts.unregister(call.callId);
+    if (meeting.ended) {
+      // Ended while connecting: its end hook ran before there was anything to unregister, or a bot to create.
+      if (participantAudio) transcripts.unregister(call.callId);
+      return { ok: false, error: 'stopped' };
+    }
     meeting.bot = bridge
       .join({ meetingUrl, botName, roomName: call.roomName, ...(participantAudio && { participantAudio }) })
       .then(
@@ -257,8 +263,6 @@ export function createMeetings(
           return null;
         },
       );
-    // Ended between the room opening and the create: the end hook had no bot to send away.
-    if (meeting.ended) void leaveBot();
     const botId = await meeting.bot;
     if (!botId) {
       await core.endCall(platformId, call.callId, 'meeting bot could not be created');
