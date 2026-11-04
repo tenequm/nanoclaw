@@ -253,7 +253,7 @@ export interface VoiceModeConfig {
   /** The Recall client `/meet` joins meetings through (voice-mode-meet.ts); none: `/meet` is not configured. */
   meetBridge?: RecallMeetBridge;
   /** Public `wss://` origin a jev meeting's bot streams its participants' audio to; `publicUrl`'s by default. */
-  meetTranscriptOrigin?: string;
+  meetAudioOrigin?: string;
   /** How a jev meeting's participants are transcribed; test seams. */
   meetAudio?: MeetingAudioSeams;
   /** How a call finds and starts the agent session it talks to (findCallSession, requestWake). Test seams. */
@@ -425,7 +425,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
   });
   const transcripts = config.meetBridge
     ? createRecallTranscripts(livekit, {
-        origin: config.meetTranscriptOrigin ?? new URL(config.publicUrl).origin.replace(/^http/, 'ws'),
+        origin: config.meetAudioOrigin ?? new URL(config.publicUrl).origin.replace(/^http/, 'ws'),
         // The worker's transcription key: LIVEKIT_REQUIRED has it wherever the channel runs.
         geminiKey: config.providerKeys?.gemini ?? '',
         ...(config.meetAudio ? { seams: config.meetAudio } : {}),
@@ -855,7 +855,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       vocabulary: env.VOICE_MODE_VOCABULARY,
       providerKeys: providerKeysFrom(env),
       meetBridge,
-      ...(recallConfig ? { meetTranscriptOrigin: recallConfig.transcriptOrigin } : {}),
+      ...(recallConfig ? { meetAudioOrigin: recallConfig.audioOrigin } : {}),
       livekit: {
         url: env.LIVEKIT_URL,
         languages: parseVoiceLanguages(env.VOICE_MODE_LANGUAGES),

@@ -25,7 +25,7 @@ function config(fetchImpl: FetchMock, overrides: Partial<RecallMeetConfig> = {})
     region: 'eu-central-1',
     pageUrl: 'https://pages.example.com/meet-recall-bridge/index.html',
     livekitUrl: 'wss://lk.example.com',
-    transcriptOrigin: 'wss://pages.example.com',
+    audioOrigin: 'wss://pages.example.com',
     livekitApiKey: LK_KEY,
     livekitApiSecret: LK_SECRET,
     fetch: fetchImpl as unknown as typeof fetch,
@@ -344,13 +344,13 @@ describe('recallMeetConfigFromEnv', () => {
     expect(recallMeetConfigFromEnv({ ...full, RECALL_REGION: 'us-east-1' }, livekit)?.region).toBe('us-east-1');
   });
 
-  it("streams a jev meeting's transcript to the bridge page's host unless MEET_RECALL_TRANSCRIPT_URL says otherwise", () => {
-    expect(recallMeetConfigFromEnv(full, livekit)?.transcriptOrigin).toBe('wss://p.example');
-    const own = { ...full, MEET_RECALL_TRANSCRIPT_URL: 'wss://in.example:8443/ignored' };
-    expect(recallMeetConfigFromEnv(own, livekit)?.transcriptOrigin).toBe('wss://in.example:8443');
-    expect(() =>
-      recallMeetConfigFromEnv({ ...full, MEET_RECALL_TRANSCRIPT_URL: 'https://in.example' }, livekit),
-    ).toThrow('MEET_RECALL_TRANSCRIPT_URL must use wss:');
+  it("streams a jev meeting's audio to the bridge page's host unless MEET_RECALL_AUDIO_URL says otherwise", () => {
+    expect(recallMeetConfigFromEnv(full, livekit)?.audioOrigin).toBe('wss://p.example');
+    const own = { ...full, MEET_RECALL_AUDIO_URL: 'wss://in.example:8443/ignored' };
+    expect(recallMeetConfigFromEnv(own, livekit)?.audioOrigin).toBe('wss://in.example:8443');
+    expect(() => recallMeetConfigFromEnv({ ...full, MEET_RECALL_AUDIO_URL: 'https://in.example' }, livekit)).toThrow(
+      'MEET_RECALL_AUDIO_URL must use wss:',
+    );
   });
 
   it('names every missing key', () => {

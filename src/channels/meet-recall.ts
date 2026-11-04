@@ -41,9 +41,9 @@ export interface RecallMeetConfig {
   livekitUrl: string;
   /**
    * Public `wss://` origin a jev meeting's bot streams each participant's audio to (`/voice/recall/...`
-   * on the host's webhook server behind it). MEET_RECALL_TRANSCRIPT_URL, by default the bridge page's host.
+   * on the host's webhook server behind it). MEET_RECALL_AUDIO_URL, by default the bridge page's host.
    */
-  transcriptOrigin: string;
+  audioOrigin: string;
   livekitApiKey: string;
   livekitApiSecret: string;
   /** Test seams. */
@@ -295,7 +295,7 @@ export const RECALL_MEET_ENV_KEYS = [
   'RECALL_REGION',
   'MEET_RECALL_PAGE_URL',
   'MEET_RECALL_LIVEKIT_URL',
-  'MEET_RECALL_TRANSCRIPT_URL',
+  'MEET_RECALL_AUDIO_URL',
 ] as const;
 
 /** The client's settings, or null when RECALL_API_KEY is unset (`/meet` is off); throws naming what else is missing. */
@@ -309,14 +309,14 @@ export function recallMeetConfigFromEnv(
     const missing = [!pageUrl && 'MEET_RECALL_PAGE_URL', !livekitUrl && 'MEET_RECALL_LIVEKIT_URL'].filter(Boolean);
     throw new Error(`meet-recall: missing ${missing.join(', ')}`);
   }
-  const transcriptUrl = env.MEET_RECALL_TRANSCRIPT_URL || pageUrl.replace(/^https:/, 'wss:');
-  assertUrl('MEET_RECALL_TRANSCRIPT_URL', transcriptUrl, 'wss:');
+  const audioUrl = env.MEET_RECALL_AUDIO_URL || pageUrl.replace(/^https:/, 'wss:');
+  assertUrl('MEET_RECALL_AUDIO_URL', audioUrl, 'wss:');
   return {
     recallApiKey,
     region: (env.RECALL_REGION || DEFAULT_REGION) as RecallRegion,
     pageUrl,
     livekitUrl,
-    transcriptOrigin: new URL(transcriptUrl).origin,
+    audioOrigin: new URL(audioUrl).origin,
     livekitApiKey: livekit.apiKey,
     livekitApiSecret: livekit.apiSecret,
   };
