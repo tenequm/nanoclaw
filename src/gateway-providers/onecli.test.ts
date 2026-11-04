@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { GatewayApprovalRequest, GatewaySessionInput } from './gateway-provider-registry.js';
 
@@ -50,6 +50,22 @@ vi.mock('../config.js', async (original) => ({
 vi.mock('../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
+// The module reads process.env ahead of `.env` at import time, so a real
+// OneCLI login in the shell (a developer's, or a host's deploy) would replace
+// the fixture values below.
+vi.hoisted(() => {
+  for (const key of [
+    'ONECLI_URL',
+    'ONECLI_API_KEY',
+    'ONECLI_GATEWAY_CONTAINER',
+    'ONECLI_GATEWAY_URL',
+    'ONECLI_PROJECT_ID',
+    'ONECLI_CONSOLE_URL',
+    'ANTHROPIC_BASE_URL',
+  ]) {
+    vi.stubEnv(key, undefined);
+  }
+});
 vi.mock('../env.js', () => ({
   readEnvFile: () => ({
     ONECLI_URL: 'http://localhost:1',
@@ -92,6 +108,8 @@ afterEach(() => {
   vi.useRealTimers();
   fs.rmSync(ADAPTER_DATA, { recursive: true, force: true });
 });
+
+afterAll(() => vi.unstubAllEnvs());
 
 describe('OneCLI gateway package', () => {
   it.each(['copy-a', 'copy-b'])('leaves foreign requests untouched by the real SDK poller: %s', async (owned) => {
