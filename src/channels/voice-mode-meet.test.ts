@@ -63,25 +63,18 @@ describe('parseMeetCommand', () => {
     expect(parseMeetCommand('lets meet', 'telegram')).toBeNull();
   });
 
-  it('takes pause on either side of the link, once', () => {
-    const pause = { action: 'join', url: MEET, pauseSends: true };
-    expect(parseMeetCommand(`/meet ${MEET} pause`, 'telegram')).toEqual(pause);
-    expect(parseMeetCommand(`/meet PAUSE ${MEET}`, 'telegram')).toEqual(pause);
-    expect(parseMeetCommand(`!meet <${MEET}> pause`, 'slack')).toEqual(pause);
-    expect(parseMeetCommand(`/meet ${MEET} pause pause`, 'telegram')).toEqual({ action: 'usage' });
-    expect(parseMeetCommand('/meet pause', 'telegram')).toEqual({ action: 'usage' });
-    expect(parseMeetCommand(`/meet ${MEET} pause please`, 'telegram')).toEqual({ action: 'usage' });
-  });
-
-  it('takes jev in any order with the link and pause, once', () => {
-    const jev = { action: 'join', url: MEET, jev: true };
-    expect(parseMeetCommand(`/meet ${MEET} jev`, 'telegram')).toEqual(jev);
-    expect(parseMeetCommand(`/meet JEV ${MEET}`, 'telegram')).toEqual(jev);
-    expect(parseMeetCommand(`!meet <${MEET}> jev`, 'slack')).toEqual(jev);
-    expect(parseMeetCommand(`/meet ${MEET} jev pause`, 'telegram')).toEqual({ ...jev, pauseSends: true });
-    expect(parseMeetCommand(`/meet pause jev ${MEET}`, 'telegram')).toEqual({ ...jev, pauseSends: true });
-    expect(parseMeetCommand(`/meet ${MEET} jev jev`, 'telegram')).toEqual({ action: 'usage' });
-    expect(parseMeetCommand('/meet jev', 'telegram')).toEqual({ action: 'usage' });
+  it('takes one mode, jev, send or pause, on either side of the link', () => {
+    for (const mode of ['jev', 'send', 'pause'] as const) {
+      const joined = { action: 'join', url: MEET, mode };
+      expect(parseMeetCommand(`/meet ${MEET} ${mode}`, 'telegram')).toEqual(joined);
+      expect(parseMeetCommand(`/meet ${mode.toUpperCase()} ${MEET}`, 'telegram')).toEqual(joined);
+      expect(parseMeetCommand(`!meet <${MEET}> ${mode}`, 'slack')).toEqual(joined);
+      expect(parseMeetCommand(`/meet ${MEET} ${mode} ${mode}`, 'telegram')).toEqual({ action: 'usage' });
+      expect(parseMeetCommand(`/meet ${mode}`, 'telegram')).toEqual({ action: 'usage' });
+      expect(parseMeetCommand(`/meet ${MEET} ${mode} please`, 'telegram')).toEqual({ action: 'usage' });
+    }
+    expect(parseMeetCommand(`/meet ${MEET} jev pause`, 'telegram')).toEqual({ action: 'usage' });
+    expect(parseMeetCommand(`/meet send ${MEET} pause`, 'telegram')).toEqual({ action: 'usage' });
   });
 
   it('accepts only https Google Meet links', () => {
@@ -193,61 +186,92 @@ describe('runMeetCommand', () => {
     expect(m.started).toEqual([]);
   });
 
-  it("creates the admin's line bound to this chat and starts the meeting on it", async () => {
+  it("creates the admin's line bound to this chat and starts the meeting on it, in jev mode by default", async () => {
     const m = fakeMeetings();
-    const outcome = await runMeetCommand(mg('mg-dm'), null, OWNER, join, {
+    const withJev = await runMeetCommand(mg('mg-dm'), null, OWNER, join, {
       meetings: m.control,
       key: randomBytes(32),
+      jevAvailable: true,
     });
-    expect(outcome).toEqual({ kind: 'started', agentName: 'Andy', url: MEET });
+    expect(withJev).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, mode: 'jev' });
     const line = await getVoiceModeLineForAgent('ag-1');
     expect(line).toMatchObject({ owner_user_id: OWNER, messaging_group_id: 'mg-dm' });
-    expect(m.started).toEqual([
-      { platformId: linePlatformId(line!.line_id), url: MEET, pauseSends: false, jev: false },
-    ]);
-    expect(meetCommandReply(outcome)).toContain('Andy is asking to join https://meet.google.com/abc-defg-hij');
-    expect(meetCommandReply(outcome)).toContain('a turn ends on a send word.');
+    expect(m.started).toEqual([{ platformId: linePlatformId(line!.line_id), url: MEET, pauseSends: false, jev: true }]);
+    // `jev` says the default out loud.
+    const explicit = await runMeetCommand(
+      mg('mg-dm'),
+      null,
+      OWNER,
+      { ...join, mode: 'jev' },
+      { meetings: m.control, jevAvailable: true },
+    );
+    expect(explicit).toEqual(withJev);
     expect(meetCommandReply({ kind: 'usage' }, '!meet')).toContain('!meet <Google Meet link>');
+    expect(meetCommandReply({ kind: 'usage' }, '!meet')).toContain('!meet <link> send');
     expect(meetCommandReply({ kind: 'usage' }, '!meet')).toContain('!meet <link> pause');
+
+    const sent = await runMeetCommand(
+      mg('mg-dm'),
+      null,
+      OWNER,
+      { ...join, mode: 'send' },
+      { meetings: m.control, jevAvailable: true },
+    );
+    expect(sent).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, mode: 'send' });
+    expect(m.started.at(-1)).toMatchObject({ pauseSends: false, jev: false });
+    expect(meetCommandReply(sent)).toContain('Andy is asking to join https://meet.google.com/abc-defg-hij');
+    expect(meetCommandReply(sent)).toContain('a turn ends on a send word.');
 
     const paused = await runMeetCommand(
       mg('mg-dm'),
       null,
       OWNER,
-      { ...join, pauseSends: true },
-      { meetings: m.control },
-    );
-    expect(paused).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, pauseSends: true });
-    expect(m.started.at(-1)?.pauseSends).toBe(true);
-    expect(meetCommandReply(paused)).toContain('a turn ends on a send word or a pause.');
-    expect(meetCommandReply(paused)).not.toContain('unaddressed');
-
-    const withJev = await runMeetCommand(
-      mg('mg-dm'),
-      null,
-      OWNER,
-      { ...join, jev: true },
+      { ...join, mode: 'pause' },
       { meetings: m.control, jevAvailable: true },
     );
-    expect(withJev).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, jev: true });
-    expect(m.started.at(-1)).toMatchObject({ pauseSends: false, jev: true });
-    expect(meetCommandReply(withJev)).toContain('It may also join in unaddressed when the conversation invites it.');
-    expect(meetCommandReply({ kind: 'usage' })).toContain('/meet <link> jev');
+    expect(paused).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, mode: 'pause' });
+    expect(m.started.at(-1)).toMatchObject({ pauseSends: true, jev: false });
+    expect(meetCommandReply(paused)).toContain('a turn ends on a send word or a pause.');
+    expect(meetCommandReply(paused)).not.toContain('jev');
+
+    const jevReply = meetCommandReply(withJev)!;
+    expect(jevReply).toContain(
+      'in jev mode it answers when someone addresses it by name or invites it and nobody else takes it up.',
+    );
+    expect(jevReply).toContain('For the wake phrase and a spoken send word instead, send /meet <link> send.');
+    expect(jevReply).toContain(
+      "Recall stores no recording of the meeting; each participant's speech is transcribed on this host.",
+    );
+    expect(jevReply).not.toContain('keeps nothing');
+    expect(meetCommandReply(paused)).not.toContain('transcribed');
+    expect(meetCommandReply({ kind: 'usage' })).toContain('jev mode');
   });
 
-  it('refuses jev without the Jev key, before any line is made or call started', async () => {
+  it('refuses an explicit jev without the Jev key, before any line is made or call started', async () => {
     const m = fakeMeetings();
     const outcome = await runMeetCommand(
       mg('mg-dm'),
       null,
       OWNER,
-      { ...join, jev: true },
+      { ...join, mode: 'jev' },
       { meetings: m.control, key: randomBytes(32), jevAvailable: false },
     );
     expect(outcome).toEqual({ kind: 'no-jev', agentName: 'Andy' });
     expect(meetCommandReply(outcome)).toContain('JEV_API_KEY');
+    expect(meetCommandReply(outcome)).toContain('/meet <link> send');
     expect(m.started).toEqual([]);
     expect(await getVoiceModeLineForAgent('ag-1')).toBeUndefined();
+  });
+
+  it('runs a send-word meeting by default without the Jev key', async () => {
+    const m = fakeMeetings();
+    const outcome = await runMeetCommand(mg('mg-dm'), null, OWNER, join, {
+      meetings: m.control,
+      key: randomBytes(32),
+      jevAvailable: false,
+    });
+    expect(outcome).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, mode: 'send' });
+    expect(m.started.at(-1)).toMatchObject({ pauseSends: false, jev: false });
   });
 
   it('moves an existing line to this chat only once the meeting call is admitted', async () => {
@@ -269,11 +293,9 @@ describe('runMeetCommand', () => {
       agentName: 'Andy',
     });
     await runMeetCommand(mg('mg-dm'), null, OWNER, join, { meetings: m.control, key: randomBytes(32) });
-    expect(await runMeetCommand(mg('mg-dm'), null, OWNER, join, { meetings: m.control, key: null })).toEqual({
-      kind: 'started',
-      agentName: 'Andy',
-      url: MEET,
-    });
+    expect(
+      await runMeetCommand(mg('mg-dm'), null, OWNER, join, { meetings: m.control, key: null, jevAvailable: false }),
+    ).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, mode: 'send' });
   });
 
   it("leaves another admin's line alone, and leave works only for the line's caller", async () => {

@@ -132,6 +132,7 @@ or approved build-script policies.
 @livekit/rtc-node@1.2.1
 livekit-server-sdk@2.19.1
 onnxruntime-node@1.24.3
+ws@8.22.1
 zod@4.6.5
 ```
 
@@ -146,7 +147,7 @@ pnpm run build
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/voice-mode*.test.ts src/voice-mode*.test.ts
+pnpm exec vitest run src/channels/voice-mode*.test.ts src/voice-mode*.test.ts src/modules/meet-jev src/webhook-server-upgrade.test.ts
 ```
 
 The page is already generated. To change it, run `pnpm build` in
@@ -306,6 +307,14 @@ reachable DM the answer carries no link. A link minted before links were
 sealed shows after its next call. Do not paste links into shared chats, agent
 messages or logs.
 
+With the Jev gate's `JEV_API_KEY` set, a line's calls run the meet-jev loop
+(`src/modules/meet-jev/`) by default: the agent decides from the conversation
+when to answer, with no review mode or spoken commands. `/voice plain` turns the
+line to the wake phrase and send word until the caller sends `/voice` (or
+`/voice jev`) again; that opt-out lives in host memory, so a host restart
+returns the line to jev. A client's `?jev=0` on `livekit/token` makes one call
+plain, and `?jev=1` one jev call. Without the key every call is plain.
+
 Calls use the caller's core role, checked at start, every turn and every five
 seconds. A revoked role or changed token ends the call. The call chat is the
 line's `/voice` chat and must stay wired to the line's agent: with no usable
@@ -320,18 +329,28 @@ after the agent joins the meeting, running
 `assets/meet-recall-bridge/index.html` as its camera; someone admits it from
 the lobby (10 minutes). The page joins the call's room as the call's caller:
 it publishes the meeting's audio and plays the agent's speech and cues into
-the meeting. The meeting wakes on `VOICE_MODE_WAKE_PHRASE`'s name (`Hey Dan`
-without one) and a turn ends on the send word; `/meet <link> pause` makes a
-pause send it too, and `/meet <link> jev` lets the Jev gate let the agent join
-in unaddressed. Meeting turns come from "Meeting", never from the line's
-caller, so they carry no role. The meeting runs up to 60 minutes under the
+the meeting. With `JEV_API_KEY` set the meeting runs the meet-jev loop
+(`src/modules/meet-jev/`) by default (`/meet <link> jev` says so too): Recall
+streams each participant's own audio to `/voice/recall/<callId>/` on the
+webhook port, the host transcribes each one with its own Silero VAD and Gemini
+Live session (the call's languages), and Jev decides when the agent answers,
+addressed or invited. `/meet <link> send`, and the default without the key,
+wakes on `VOICE_MODE_WAKE_PHRASE`'s name (`Hey Dan` without one) and ends a
+turn on the send word; `/meet <link> pause` makes a pause send it too. Meeting
+turns come from "Meeting", never from the line's caller, so they carry no role. The meeting runs up to 60 minutes under the
 line's daily minutes and ends when everyone left the meeting (Recall's bot
 leaves, the page with it), on `/meet leave`, or when a call on the line's link
-replaces it. A meeting records nothing, whatever the recording settings say,
-and the bot keeps no recording (`video_mixed_mp4: null`).
+replaces it. A meeting records nothing here, whatever the recording settings
+say, and the bot keeps no recording (`video_mixed_mp4: null`) and runs with
+Zero Data Retention (`retention: null`): Recall stores no recording of the
+meeting (its API metadata, such as the bot and participant records, is outside
+that). Each participant's speech is transcribed on this host, and the host log
+keeps the jev loop's transcript lines and decisions (who said what), to tune it.
 
-Verify one real call after both processes start: wake, send, manual draft,
-discard, reply, captions, mute, reconnect and hangup. This skill's tests use
+Verify one real call after both processes start. A jev call (the default with
+`JEV_API_KEY`): a question answered, a remark to someone else left silent, a
+talk-over cut and "go on" continued. A `/voice plain` call: wake, send, manual
+draft, discard, reply, captions, mute, reconnect and hangup. This skill's tests use
 fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 
 ## Settings and behavior
@@ -361,6 +380,7 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `RECALL_REGION` | `eu-central-1` | Recall.ai region: `us-east-1`, `us-west-2`, `eu-central-1` or `ap-northeast-1`. |
 | `MEET_RECALL_PAGE_URL` | none | Public `https` URL where `assets/meet-recall-bridge/index.html` is served; the Recall bot runs it as its camera, its settings in the URL hash. |
 | `MEET_RECALL_LIVEKIT_URL` | none | Public `wss` URL of this LiveKit, reachable from Recall's cloud; the bridge page joins the room with it. The LiveKit key pair is `LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET`. |
+| `MEET_RECALL_AUDIO_URL` | `MEET_RECALL_PAGE_URL`'s host as `wss` | Public `wss` origin a `jev` meeting's bot streams its participants' audio to; the front must forward `/voice/recall/*` (websocket upgrades) to the webhook port. |
 | `VOICE_MODE_WORKER_HEALTH_PORT` | `8089` | Worker health on loopback. |
 | `VOICE_MODE_UI` | empty | Page options: skin, colorway, layout, presence, brand, footer, shortcuts, timestamps, colorwayPicker. |
 

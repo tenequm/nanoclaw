@@ -25,6 +25,7 @@ function config(fetchImpl: FetchMock, overrides: Partial<RecallMeetConfig> = {})
     region: 'eu-central-1',
     pageUrl: 'https://pages.example.com/meet-recall-bridge/index.html',
     livekitUrl: 'wss://lk.example.com',
+    audioOrigin: 'wss://pages.example.com',
     livekitApiKey: LK_KEY,
     livekitApiSecret: LK_SECRET,
     fetch: fetchImpl as unknown as typeof fetch,
@@ -66,7 +67,7 @@ describe('createRecallMeetBridge', () => {
       bot_name: 'Andy',
       metadata: { nanoclaw_room: 'meet-r1' },
       variant: { google_meet: 'web_4_core', zoom: 'web_4_core', microsoft_teams: 'web_4_core' },
-      recording_config: { video_mixed_mp4: null },
+      recording_config: { video_mixed_mp4: null, retention: null },
       // The lobby wait plus the longest meeting call: a bot the host never sent away leaves after that.
       automatic_leave: { in_call_not_recording_timeout: 70 * 60 },
     });
@@ -90,6 +91,58 @@ describe('createRecallMeetBridge', () => {
     const fetchMock = respond(json(201, { id: 'b' }));
     await createRecallMeetBridge(config(fetchMock, { region: 'us-west-2' })).join(join);
     expect(fetchMock.mock.calls[0][0]).toBe('https://us-west-2.recall.ai/api/v1/bot/');
+  });
+
+  it('creates a bot without participant audio with no artifact and nothing kept (Zero Data Retention)', async () => {
+    const fetchMock = respond(json(201, { id: 'b' }));
+    await createRecallMeetBridge(config(fetchMock)).join(join);
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
+      meeting_url: join.meetingUrl,
+      bot_name: 'Andy',
+      metadata: { nanoclaw_room: 'meet-r1' },
+      output_media: { camera: { kind: 'webpage', config: { url: expect.any(String) } } },
+      variant: { google_meet: 'web_4_core', zoom: 'web_4_core', microsoft_teams: 'web_4_core' },
+      recording_config: { video_mixed_mp4: null, retention: null },
+      automatic_leave: { in_call_not_recording_timeout: 70 * 60 },
+    });
+  });
+
+  it("streams each participant's audio on one websocket for a jev meeting, with no transcript and nothing kept", async () => {
+    const fetchMock = respond(json(201, { id: 'b' }));
+    const websocketUrl = 'wss://meet.example.com/voice/recall/call-1/?token=t0k3n';
+    await createRecallMeetBridge(config(fetchMock)).join({ ...join, participantAudio: { websocketUrl } });
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(body.recording_config).toEqual({
+      video_mixed_mp4: null,
+      audio_separate_raw: {},
+      retention: null,
+      realtime_endpoints: [
+        {
+          type: 'websocket',
+          url: websocketUrl,
+          events: [
+            'audio_separate_raw.data',
+            'participant_events.speech_on',
+            'participant_events.speech_off',
+            'participant_events.join',
+            'participant_events.leave',
+            'participant_events.chat_message',
+          ],
+        },
+      ],
+    });
+    expect(body.recording_config).not.toHaveProperty('transcript');
+    expect(body.automatic_leave).toEqual({ in_call_not_recording_timeout: 70 * 60 });
+  });
+
+  it('refuses a participant audio websocket URL Recall would not take, before any request', async () => {
+    const fetchMock = respond(json(201, { id: 'b' }));
+    const bridge = createRecallMeetBridge(config(fetchMock));
+    const withUrl = (websocketUrl: string) => bridge.join({ ...join, participantAudio: { websocketUrl } });
+    await expect(withUrl('ws://meet.example.com/voice/recall/c/?token=t')).rejects.toThrow(/must use wss:/);
+    await expect(withUrl('wss://meet.example.com/voice/recall/c?token=t')).rejects.toThrow(/a \/ before its query/);
+    await expect(withUrl('not a url')).rejects.toThrow(/is not a URL/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('leaves through leave_call with the bot id escaped', async () => {
@@ -289,6 +342,15 @@ describe('recallMeetConfigFromEnv', () => {
       livekitApiSecret: 's',
     });
     expect(recallMeetConfigFromEnv({ ...full, RECALL_REGION: 'us-east-1' }, livekit)?.region).toBe('us-east-1');
+  });
+
+  it("streams a jev meeting's audio to the bridge page's host unless MEET_RECALL_AUDIO_URL says otherwise", () => {
+    expect(recallMeetConfigFromEnv(full, livekit)?.audioOrigin).toBe('wss://p.example');
+    const own = { ...full, MEET_RECALL_AUDIO_URL: 'wss://in.example:8443/ignored' };
+    expect(recallMeetConfigFromEnv(own, livekit)?.audioOrigin).toBe('wss://in.example:8443');
+    expect(() => recallMeetConfigFromEnv({ ...full, MEET_RECALL_AUDIO_URL: 'https://in.example' }, livekit)).toThrow(
+      'MEET_RECALL_AUDIO_URL must use wss:',
+    );
   });
 
   it('names every missing key', () => {

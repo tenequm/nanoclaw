@@ -69,30 +69,25 @@ thresholds can be refitted from logged decisions
 - **The gated agent itself** (group scope): guard special-case allows
   `jev-gate get|update` for its OWN group, also behind the approval flow.
 
-## Meetings (`/meet <link> jev`)
+## Voice calls and meetings (`/voice`, `/meet <link>`)
 
-A `/meet` meeting started with `jev` reuses the same rubric and `decide()`
-math, run by the voice channel on the host instead of the router (the
-meeting call kind's candidate handler, `src/channels/voice-mode-meet.ts`):
-
-- **Candidates:** speech with no wake phrase, ended by the normal pause, is
-  POSTed by the worker as an utterance with `candidate: true`. Addressed
-  (`Hey Dan`) turns never wait on Jev; they go straight to the agent.
-- **History:** the host keeps a rolling transcript of the last 12 meeting
-  lines, speaker-agnostic (`Meeting: ...`), holding every utterance,
-  candidate or addressed, plus the agent's spoken replies (clipped).
-- **Agent name:** the name the meeting wakes on (`VOICE_MODE_WAKE_PHRASE`
-  `Hey Dan` gives `Dan`), which the worker sends with each candidate. It is
-  used in the questions and in the agent's own transcript lines; the line's
-  agent name is used only when none arrives.
-- **Thresholds:** the agent group's gate entry when it has an enabled one,
-  else the defaults. The levers (cap, cooldown, bot streak) and modes do not
-  apply here; every verdict is logged with its scores.
-- **Fail-silent:** a Jev error, timeout or throw drops the candidate, as
-  does a silent verdict. A wake is routed as a normal meeting turn.
-- **Limits:** a candidate is judged only after the call's in-flight and
-  per-minute utterance limits pass, holds a turn slot while judged, and
-  counts toward the per-minute limit whatever the verdict.
+With `JEV_API_KEY` set, `/voice` page calls and `/meet` meetings run the
+meet-jev loop (`src/modules/meet-jev/`) by default; `/voice plain`,
+`/meet <link> send` and `/meet <link> pause` choose the wake phrase and send
+word instead. The loop does not use this gate's rubric: its entries, thresholds
+and levers do not apply there. On a `/voice` call the worker transcribes the
+caller. In a meeting Recall.ai streams each participant's own audio to the host
+over a websocket at `/voice/recall/<callId>/?token=...` (`ingress/recall.ts`,
+Zero Data Retention: Recall stores no recording of the meeting, only API
+metadata), the host runs a Silero VAD and a Gemini Live transcription per
+participant (`ingress/recall-audio.ts`, the call's languages and vocabulary),
+and one Jev Choice per speaker boundary decides whether the agent answers,
+stays silent, stops or continues. When people spoke after the utterance an
+answer was asked for, a second Choice (`still_wanted`) decides whether the
+landed answer is still said aloud or only shown in the chat. Both count toward
+one per-call cap of 30 Jev requests a minute.
+The bot is left out by its display name (Recall flags no participant as the
+bot), so a person who joins under that name is left out too, with a warning logged.
 
 
 ## Kill switch

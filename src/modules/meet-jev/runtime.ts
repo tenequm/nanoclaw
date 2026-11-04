@@ -7,21 +7,39 @@
  * async commands (a verdict, a turn reaching the agent, a timer) join the end of the queue. After
  * `end` nothing more is processed and nothing pending fires.
  */
-import type { CallCore, CallEvent, CallPolicy, Command, JevState, Verdict } from './core/types.js';
+import type {
+  CallCore,
+  CallEvent,
+  CallPolicy,
+  CallStatus,
+  Command,
+  JevState,
+  RecheckState,
+  RecheckVerdict,
+  Verdict,
+} from './core/types.js';
 
 /** What a turn submission came to: the host's utterance id for it, or why it did not reach the agent. */
 export type JevTurnResult = { ok: true; turnId: string } | { ok: false; reason: string };
 
 export interface RuntimePorts {
   now(): number;
-  /** Never rejects in practice (askAction is fail-silent); a rejection counts as a null verdict. */
-  judge(state: JevState, signal: AbortSignal): Promise<{ verdict: Verdict | null; ms: number }>;
+  /** Never rejects in practice (askAction answers null on any failure); a rejection counts as a null verdict. */
+  judge(state: JevState, signal: AbortSignal, windowVersion: number): Promise<{ verdict: Verdict | null; ms: number }>;
+  /** The answer-ready check; never rejects in practice either, and a rejection counts as a null verdict. */
+  recheck(
+    state: RecheckState,
+    signal: AbortSignal,
+    windowVersion: number,
+  ): Promise<{ verdict: RecheckVerdict | null; ms: number }>;
   /** Submit a turn; an aborted `signal` (superseded, or the call ended) stops it being routed, or the wait for it. */
   turn(turn: { message: string; note: string }, signal: AbortSignal): Promise<JevTurnResult>;
   speak(replyId: string, text: string): void;
   show(replyId: string, text: string): void;
   drop(replyId: string): void;
+  revoke(replyId: string): void;
   stopPlayback(): void;
+  status(status: CallStatus): void;
   log(event: string, fields: Record<string, unknown>): void;
   /** Every event as it is processed, numbered from 1: the call's replayable log. */
   record(seq: number, event: CallEvent): void;
@@ -56,6 +74,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
   const timers = new Map<string, { gen: number; handle: ReturnType<typeof setTimeout> }>();
   let timerGen = 0;
   const judges = new Set<AbortController>();
+  const rechecks = new Set<AbortController>();
   const turnQueue: PendingTurn[] = [];
   let turnInFlight: PendingTurn | null = null;
 
@@ -107,8 +126,12 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
 
   const execute = (command: Command): void => {
     switch (command.kind) {
+      case 'status':
+        return ports.status(command.status);
       case 'judge':
         return judge(command.windowVersion, command.state);
+      case 'recheck':
+        return recheck(command.wakeKey, command.state, command.windowVersion);
       case 'wait':
         return wait(command.key, command.ms);
       case 'cancel_wait':
@@ -123,6 +146,8 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
         return ports.show(command.replyId, command.text);
       case 'drop':
         return ports.drop(command.replyId);
+      case 'revoke':
+        return ports.revoke(command.replyId);
       case 'stop_playback':
         return ports.stopPlayback();
       case 'log':
@@ -137,11 +162,24 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
     const abort = new AbortController();
     judges.add(abort);
     void Promise.resolve()
-      .then(() => ports.judge(jevState, abort.signal))
+      .then(() => ports.judge(jevState, abort.signal, windowVersion))
       .catch(() => ({ verdict: null, ms: 0 }))
       .then(({ verdict, ms }) => {
         judges.delete(abort);
         enqueue({ event: { kind: 'verdict', windowVersion, verdict, ms, at: ports.now() } });
+      });
+  };
+
+  /** Apart from `judge`: a new boundary's judge must not abort the check of an answer already landed. */
+  const recheck = (wakeKey: string, recheckState: RecheckState, windowVersion: number): void => {
+    const abort = new AbortController();
+    rechecks.add(abort);
+    void Promise.resolve()
+      .then(() => ports.recheck(recheckState, abort.signal, windowVersion))
+      .catch(() => ({ verdict: null, ms: 0 }))
+      .then(({ verdict, ms }) => {
+        rechecks.delete(abort);
+        enqueue({ event: { kind: 'recheck_verdict', wakeKey, verdict, ms, at: ports.now() } });
       });
   };
 
@@ -208,8 +246,9 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
       queue.length = 0;
       for (const { handle } of timers.values()) clearTimeout(handle);
       timers.clear();
-      for (const abort of judges) abort.abort();
+      for (const abort of [...judges, ...rechecks]) abort.abort();
       judges.clear();
+      rechecks.clear();
       turnInFlight?.abort.abort();
       for (const pending of turnQueue) pending.abort.abort();
       turnQueue.length = 0;

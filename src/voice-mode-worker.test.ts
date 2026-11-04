@@ -28,7 +28,7 @@ import {
   type ReviewOp,
   type ReviewRequest,
 } from './channels/voice-mode-protocol.js';
-import type { Heard } from './voice-mode-gemini-live.js';
+import { turnText, type Heard } from './voice-mode-gemini-live.js';
 import type { ChoiceDetails } from './channels/voice-mode-tts-catalog.js';
 import type { TtsAudio, TtsChoice, TtsInstance } from './voice-mode-tts.js';
 import {
@@ -66,7 +66,6 @@ import {
   TURN_SETTLE_MS,
   TurnCapture,
   TurnTaking,
-  turnText,
   CueFeed,
   cueFrames,
   deEsser,
@@ -113,6 +112,7 @@ import {
   type TurnTakingDeps,
   deliveredText,
   JEV_BARGE_MS,
+  JEV_WORDS_WINDOW_MS,
   JevLoop,
   JevReporter,
   PRE_ROLL_MS,
@@ -6442,7 +6442,7 @@ describe('meeting calls', () => {
   const MEETING_META: LiveKitJobMetadata = {
     ...META,
     callerIdentity: 'meet-bridge-meet-r1',
-    meeting: { pauseSends: false, jev: false },
+    meeting: { pauseSends: false },
   };
   const WAKE_ENV = { ...ENV, VOICE_MODE_WAKE_MODEL: '/models/hey_dan.onnx', VOICE_MODE_WAKE_PHRASE: 'Hey Dan' };
   const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
@@ -6525,7 +6525,7 @@ describe('meeting calls', () => {
   });
 
   it('a `pause` meeting sends the woken turn on the pause', async () => {
-    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: true, jev: false } });
+    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: true } });
     room.remoteParticipants.clear();
     room.remoteParticipants.set('meet-bridge-meet-r1', {});
     const host = fakeHostFetch();
@@ -6535,101 +6535,6 @@ describe('meeting calls', () => {
     await say(v, 'I think we can ship on Friday', 'I think we can ship on Friday');
     await say(v, 'Hey Dan, what is two plus two?', 'Hey Dan, what is two plus two?');
     await vi.waitFor(() => expect(utterances(host)).toEqual(['what is two plus two?']));
-    host.emit({ type: 'end', reason: 'test over' });
-    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
-  });
-
-  it('`jev`: unaddressed talk goes to the host as a candidate on the pause, cued only once the host takes it', async () => {
-    for (const [jev, status] of [
-      [false, 202],
-      [true, 200],
-      [true, 202],
-    ] as const) {
-      const { ctx, job, room } = fakeJob({ ...MEETING_META, agentName: 'Junior', meeting: { pauseSends: false, jev } });
-      room.remoteParticipants.clear();
-      room.remoteParticipants.set('meet-bridge-meet-r1', {});
-      const host = fakeHostFetch(200, status);
-      const v = fakeVoice();
-      v.voice.review.serve = vi.fn();
-      await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
-      const posts = () => host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body);
-      const sentCues = () => v.voice.playCue.mock.calls.filter(([kind]) => kind === 'sent').length;
-
-      const chatter = 'Does anyone know when the release ships?';
-      await say(v, chatter, chatter);
-      if (!jev) {
-        await new Promise((r) => setTimeout(r, 50));
-        expect(posts()).toEqual([]);
-      } else {
-        // The agent is Junior; the meeting wakes on Hey Dan, so the host's judge hears of Dan.
-        await vi.waitFor(() =>
-          expect(posts()).toEqual([expect.objectContaining({ text: chatter, candidate: true, wakeName: 'Dan' })]),
-        );
-        await flush();
-        if (status === 202) {
-          await vi.waitFor(() => expect(sentCues()).toBe(1));
-          await vi.waitFor(() => expect(v.voice.setThinking).toHaveBeenCalledWith(true));
-        } else {
-          await new Promise((r) => setTimeout(r, 50));
-          expect(sentCues()).toBe(0);
-          expect(v.voice.setThinking).not.toHaveBeenCalledWith(true);
-        }
-      }
-      // A Hey Dan turn stays the instant path: a plain turn, never a candidate.
-      const addressed = 'Hey Dan, what is two plus two? Copy.';
-      await say(v, addressed, addressed);
-      await vi.waitFor(() => expect(posts().at(-1)).toMatchObject({ text: 'what is two plus two?' }));
-      expect(posts().at(-1)).not.toHaveProperty('candidate');
-      host.emit({ type: 'end', reason: 'test over' });
-      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
-    }
-  });
-
-  it('`jev` meetings run no wake word spotter, so unaddressed speech is transcribed; other meetings keep it', async () => {
-    for (const jev of [true, false]) {
-      const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: false, jev } });
-      room.remoteParticipants.clear();
-      room.remoteParticipants.set('meet-bridge-meet-r1', {});
-      const host = fakeHostFetch(200, 200);
-      const wakeWord = vi.fn();
-      const v = fakeVoice();
-      v.voice.review.serve = vi.fn();
-      await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord }));
-      expect(wakeWord).toHaveBeenCalledTimes(jev ? 0 : 1);
-      host.emit({ type: 'end', reason: 'test over' });
-      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
-    }
-  });
-
-  it('`jev`: one candidate at a time; one said while the host judges another is dropped', async () => {
-    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: false, jev: true } });
-    room.remoteParticipants.clear();
-    room.remoteParticipants.set('meet-bridge-meet-r1', {});
-    const host = fakeHostFetch(200, 200);
-    const answer = host.fetchImpl.getMockImplementation()!;
-    let release!: () => void;
-    const judged = new Promise<void>((r) => (release = r));
-    host.fetchImpl.mockImplementation(async (input, init) => {
-      if (String(input).endsWith('/utterance') && String(init?.body).includes('"candidate":true')) await judged;
-      return answer(input, init);
-    });
-    const v = fakeVoice();
-    v.voice.review.serve = vi.fn();
-    await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
-    const candidates = () =>
-      host.fetchImpl.mock.calls.filter(
-        ([input, init]) => String(input).endsWith('/utterance') && String(init?.body).includes('"candidate":true'),
-      );
-
-    await say(v, 'Does anyone know when the release ships?', 'Does anyone know when the release ships?');
-    await vi.waitFor(() => expect(candidates()).toHaveLength(1));
-    await say(v, 'I think it was Friday', 'I think it was Friday');
-    await new Promise((r) => setTimeout(r, 50));
-    expect(candidates()).toHaveLength(1);
-    release();
-    await flush();
-    await say(v, 'Or was it Monday', 'Or was it Monday');
-    await vi.waitFor(() => expect(candidates()).toHaveLength(2));
     host.emit({ type: 'end', reason: 'test over' });
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
   });
@@ -6778,8 +6683,8 @@ describe('jev: the reporter', () => {
   });
 });
 
-/** A JevLoop over a fake transcription and a speech output the test drives line by line. */
-function jevLoop() {
+/** A JevLoop over a fake transcription (none: a meeting's) and a speech output the test drives line by line. */
+function jevLoop({ transcribed = true }: { transcribed?: boolean } = {}) {
   const transcription = fakeTranscription();
   const events: JevWorkerEvent[] = [];
   const captions: Array<[number, string, boolean]> = [];
@@ -6814,7 +6719,7 @@ function jevLoop() {
     });
   });
   const loop = new JevLoop({
-    transcriber: transcription,
+    ...(transcribed ? { transcriber: transcription } : {}),
     speak,
     report: (event) => void events.push(event),
     caption: (segment, text, final) => void captions.push([segment, text, final]),
@@ -6997,6 +6902,42 @@ describe('jev: the loop', () => {
     vi.useRealTimers();
   });
 
+  it("without a transcriber (a meeting): VAD marks only, no utterance; the host's words are the reflex's only confirmation", async () => {
+    vi.useFakeTimers();
+    const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
+    const h = jevLoop({ transcribed: false });
+    const cut = () => h.lines.filter((l) => l.signal.aborted).length;
+    h.loop.audio(new Int16Array(16_000));
+    h.loop.onSpeech(true, 16_000);
+    h.loop.onSpeech(false, 20_000);
+    await tick(1);
+    expect(h.kinds()).toEqual(['speech:on', 'speech:off']);
+    expect(h.transcription.begins).toEqual([]);
+    expect(h.transcription.pushed).toBe(0);
+
+    h.loop.onReply('r1', 'One.');
+    await tick(1);
+    h.start(h.lines[0]);
+    // Words from the host before the floor: the floor decides, once it passes.
+    h.loop.onSpeech(true, 22_000);
+    h.loop.onWords();
+    await tick(100);
+    expect(cut()).toBe(0);
+    await tick(JEV_BARGE_MS);
+    expect(cut()).toBe(1);
+    expect(h.kinds().at(-1)).toBe('r1:cut_off');
+    h.loop.onSpeech(false, 30_000);
+    await tick(1);
+    // VAD alone, however long, leaves the line.
+    h.loop.onReply('r2', 'Two.');
+    await tick(1);
+    h.start(h.lines[1]);
+    h.loop.onSpeech(true, 32_000);
+    await tick(JEV_BARGE_MS * 3);
+    expect(cut()).toBe(1);
+    vi.useRealTimers();
+  });
+
   it('a synthesis failure is reported, not spoken about; one that fails mid-line reports what got out', async () => {
     const h = jevLoop();
     h.loop.onReply('r1', 'One.');
@@ -7025,6 +6966,158 @@ describe('jev: the loop', () => {
     await flush();
     expect(h.kinds().at(-1)).toBe('r3:failed');
     expect(h.speak).toHaveBeenCalledTimes(2);
+  });
+
+  it("the host's revoke drops a queued line and aborts one not heard yet, each cut_off with nothing delivered; a line heard plays on", async () => {
+    const h = jevLoop();
+    const playbacks = () => h.events.filter((e) => e.type === 'playback');
+    h.loop.onReply('r1', 'One.');
+    h.loop.onReply('r2', 'Two.');
+    h.loop.onReply('r3', 'Three.');
+    await flush();
+    h.start(h.lines[0]);
+    // Heard already: the revoke crossed its start, and it plays on.
+    h.loop.onRevoke('r1');
+    h.loop.onRevoke('r2');
+    h.loop.onRevoke('nobody');
+    await flush();
+    expect(h.lines[0].signal.aborted).toBe(false);
+    expect(h.kinds()).toEqual(['r1:started', 'r2:cut_off']);
+    expect(playbacks()[1]).toEqual({
+      type: 'playback',
+      replyId: 'r2',
+      state: 'cut_off',
+      delivered: '',
+      at: expect.any(Number),
+    });
+    h.finish(h.lines[0]);
+    await flush();
+    // The revoked line never reaches the speech output; the next one does.
+    expect(h.speak.mock.calls.map(([text]) => text)).toEqual(['One.', 'Three.']);
+    expect(h.kinds()).toEqual(['r1:started', 'r2:cut_off', 'r1:completed']);
+
+    // Taken and synthesizing, but waiting for the caller's quiet: aborted before its first audio.
+    h.start(h.lines[1]);
+    h.loop.onSpeech(true, 0);
+    h.finish(h.lines[1]);
+    await flush();
+    h.loop.onReply('r4', 'Four.');
+    await flush();
+    expect(h.lines[2].waited).toBe(false);
+    h.loop.onRevoke('r4');
+    await flush();
+    expect(h.lines[2].signal.aborted).toBe(true);
+    h.loop.onSpeech(false, 16_000);
+    await flush();
+    expect(h.lines[2].waited).toBe(false);
+    expect(playbacks().at(-1)).toEqual({
+      type: 'playback',
+      replyId: 'r4',
+      state: 'cut_off',
+      delivered: '',
+      at: expect.any(Number),
+    });
+    expect(h.kinds().filter((k) => k.startsWith('r4'))).toEqual(['r4:cut_off']);
+    expect(h.loop.busy).toBe(false);
+  });
+
+  it("a meeting's words that land just before the speech-on still confirm it; ones from an earlier speech do not", async () => {
+    vi.useFakeTimers();
+    const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
+    const h = jevLoop({ transcribed: false });
+    const cut = () => h.lines.filter((l) => l.signal.aborted).length;
+    h.loop.onReply('r1', 'One.');
+    await tick(1);
+    h.start(h.lines[0]);
+    // The host's partial beat the VAD: the words come first, then the speech that carries them.
+    h.loop.onWords();
+    await tick(200);
+    h.loop.onSpeech(true, 0);
+    await tick(JEV_BARGE_MS - 10);
+    expect(cut()).toBe(0);
+    await tick(20);
+    expect(cut()).toBe(1);
+    h.loop.onSpeech(false, 16_000);
+    await tick(JEV_WORDS_WINDOW_MS + 100);
+
+    // Words that came too long before the speech are not its own.
+    h.loop.onReply('r2', 'Two.');
+    await tick(1);
+    h.start(h.lines[1]);
+    h.loop.onWords();
+    await tick(JEV_WORDS_WINDOW_MS + 100);
+    h.loop.onSpeech(true, 32_000);
+    await tick(JEV_BARGE_MS * 3);
+    expect(cut()).toBe(1);
+    h.loop.onSpeech(false, 48_000);
+    await tick(JEV_WORDS_WINDOW_MS + 100);
+    h.finish(h.lines[1]);
+    await tick(1);
+
+    // The question before a line: its late words land as the answer plays, and neither cut the answer
+    // nor confirm the caller's next wordless speech.
+    h.loop.onSpeech(true, 64_000);
+    h.loop.onReply('r3', 'Three.');
+    await tick(1);
+    await tick(JEV_BARGE_MS * 2);
+    h.loop.onSpeech(false, 80_000);
+    await tick(1);
+    h.start(h.lines[2]);
+    await tick(200);
+    h.loop.onWords();
+    await tick(100);
+    expect(h.lines[2].signal.aborted).toBe(false);
+    h.loop.onSpeech(true, 96_000);
+    await tick(JEV_BARGE_MS * 3);
+    expect(h.lines[2].signal.aborted).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it("a meeting's words that land just after a sustained speech over the line ended still cut it; a short one's do not", async () => {
+    vi.useFakeTimers();
+    const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
+    const h = jevLoop({ transcribed: false });
+    const cut = () => h.lines.filter((l) => l.signal.aborted).length;
+    h.loop.onReply('r1', 'One.');
+    await tick(1);
+    h.start(h.lines[0]);
+    // A backchannel shorter than the floor, its words late: not an interruption, and not the next speech's.
+    h.loop.onSpeech(true, 0);
+    await tick(100);
+    h.loop.onSpeech(false, 1_600);
+    await tick(300);
+    h.loop.onWords();
+    await tick(1);
+    expect(cut()).toBe(0);
+    h.loop.onSpeech(true, 8_000);
+    await tick(JEV_BARGE_MS * 2);
+    expect(cut()).toBe(0);
+    h.loop.onSpeech(false, 16_000);
+    await tick(JEV_WORDS_WINDOW_MS + 100);
+
+    // Sustained speech over the line whose only words come after its speech-off: the line is cut then.
+    h.loop.onSpeech(true, 32_000);
+    await tick(JEV_BARGE_MS + 100);
+    h.loop.onSpeech(false, 40_000);
+    await tick(400);
+    expect(cut()).toBe(0);
+    h.loop.onWords();
+    await tick(1);
+    expect(cut()).toBe(1);
+    expect(h.kinds().at(-1)).toBe('r1:cut_off');
+
+    // Too late: words past the window after the speech ended leave the line.
+    h.loop.onReply('r2', 'Two.');
+    await tick(1);
+    h.start(h.lines[1]);
+    h.loop.onSpeech(true, 48_000);
+    await tick(JEV_BARGE_MS + 100);
+    h.loop.onSpeech(false, 56_000);
+    await tick(JEV_WORDS_WINDOW_MS + 100);
+    h.loop.onWords();
+    await tick(1);
+    expect(cut()).toBe(1);
+    vi.useRealTimers();
   });
 
   it('close cuts the line playing, drops the queue and reports nothing after', async () => {
@@ -7117,6 +7210,54 @@ describe('jev calls', () => {
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
   });
 
+  it("a jev meeting transcribes nothing: VAD marks and playback go to agent/jev, and the host's words cut a line", async () => {
+    const { ctx, job, room } = fakeJob({
+      ...JEV_META,
+      callerIdentity: 'meet-bridge-meet-r1',
+      meeting: { pauseSends: false },
+    });
+    room.remoteParticipants.clear();
+    room.remoteParticipants.set('meet-bridge-meet-r1', {});
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    // A meeting has no page to send settings.
+    v.voice.review.serve = vi.fn();
+    const make = vi.fn(() => v.transcription);
+    let signal: AbortSignal | undefined;
+    v.voice.speak.mockImplementation(async (_text: string, ready: () => Promise<void>, s: AbortSignal) => {
+      signal = s;
+      await ready();
+      v.events.onAgentSpeaking(true);
+      await untilAborted(s);
+      v.events.onAgentSpeaking(false);
+      return { heard: true, failed: false, cut: true, audioMs: 2_000, playedMs: 1_000, complete: true };
+    });
+    await runCall(ctx, { ...callDeps(host.fetchImpl, v), transcriber: make });
+    expect(make).not.toHaveBeenCalled();
+    v.audio(600);
+    v.events.onSpeech(true, v.position);
+    v.audio(1000);
+    v.events.onSpeech(false, v.position);
+    await vi.waitFor(() => expect(jevEvents(host).flat().map(summary)).toEqual(['speech:on', 'speech:off']));
+
+    host.emit({ type: 'reply', text: 'Two plus two is four.', replyId: 'r1' });
+    await vi.waitFor(() => expect(jevEvents(host).flat().map(summary).at(-1)).toBe('r1:started'));
+    v.events.onSpeech(true, v.position);
+    await new Promise((r) => setTimeout(r, JEV_BARGE_MS + 50));
+    expect(signal?.aborted).toBe(false);
+    host.emit({ type: 'words' });
+    await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+    await vi.waitFor(() => expect(jevEvents(host).flat().map(summary).at(-1)).toBe('r1:cut_off'));
+    expect(
+      jevEvents(host)
+        .flat()
+        .some((e) => e.type === 'utterance'),
+    ).toBe(false);
+    expect(v.transcription.begins).toEqual([]);
+    host.emit({ type: 'end', reason: 'done' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
+  });
+
   it("the host's stop cuts the line through the room's abortable speech, and the end tells the host", async () => {
     const { ctx, job } = fakeJob({ ...JEV_META });
     const host = fakeHostFetch();
@@ -7150,6 +7291,35 @@ describe('jev calls', () => {
     v.events.onClosed('vad failed');
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('vad failed'));
     expect(host.calls.find((c) => c.url.endsWith('/ended'))?.body).toEqual({ callId: 'call-1', reason: 'vad failed' });
+  });
+
+  it("the host's revoke reaches the loop: a line waiting for the caller's quiet never plays and is cut_off with nothing delivered", async () => {
+    const { ctx, job } = fakeJob({ ...JEV_META });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    let signal: AbortSignal | undefined;
+    v.voice.speak.mockImplementation(async (_text: string, ready: () => Promise<void>, s: AbortSignal) => {
+      signal = s;
+      await ready();
+      if (s.aborted) return { heard: false, failed: false, cut: true, audioMs: 0, playedMs: 0, complete: false };
+      v.events.onAgentSpeaking(true);
+      return { heard: true, failed: false, cut: false, audioMs: 1_000, playedMs: 1_000, complete: true };
+    });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    v.events.onSpeech(true, v.position);
+    host.emit({ type: 'reply', text: 'Booked.', replyId: 'r1' });
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    host.emit({ type: 'revoke', replyId: 'r1' });
+    await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+    await vi.waitFor(() =>
+      expect(
+        jevEvents(host)
+          .flat()
+          .filter((e) => e.type === 'playback'),
+      ).toEqual([{ type: 'playback', replyId: 'r1', state: 'cut_off', delivered: '', at: expect.any(Number) }]),
+    );
+    host.emit({ type: 'end', reason: 'done' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
   });
 
   it('an end that fails is logged once and never an unhandled rejection, however many paths start it', async () => {
@@ -7216,6 +7386,110 @@ describe('jev: an abortable line in the speech output', () => {
     expect(whole).toEqual({ heard: true, failed: false, cut: false, audioMs: 300, playedMs: 300, complete: true });
     expect(sink.clearQueue).toHaveBeenCalledTimes(1);
     expect(sink.waitForPlayout).toHaveBeenCalledTimes(1);
+    await output.close();
+  });
+
+  /** A sink like the room's audio source: its playout waits until the queue drains or is cleared. */
+  const drainingSink = () => {
+    let release: (() => void) | undefined;
+    const sink = {
+      queuedDuration: 0,
+      captureFrame: vi.fn(async () => undefined),
+      waitForPlayout: vi.fn(() => new Promise<void>((resolve) => (release = resolve))),
+      clearQueue: vi.fn(() => release?.()),
+      /** The queue played out on its own. */
+      drained: () => release?.(),
+    };
+    return sink;
+  };
+  const abortableOutput = (sink: ReturnType<typeof drainingSink>, tts: FakeTts, spoke = vi.fn()) => {
+    const stopped = vi.fn();
+    const output = speechOutput({
+      meta: META,
+      settings: { providerKeys: { gemini: 'gk' }, spoke },
+      sink,
+      log: silentLog,
+      started: () => undefined,
+      stopped,
+      changed: () => undefined,
+      build: () => tts.instance,
+    });
+    return { output, stopped, spoke };
+  };
+
+  it('an abort while the last audio drains clears the sink at once and reports the share that played, not the whole line', async () => {
+    const sink = drainingSink();
+    const { output, stopped, spoke } = abortableOutput(
+      sink,
+      fakeTts(() => ({ chunks: 3, samples: 2_400 })),
+    );
+    const abort = new AbortController();
+    let settled = false;
+    const line = output.speak('A line of some length.', async () => undefined, abort.signal);
+    void line.then(() => (settled = true));
+    // All 300 ms synthesized and sent; 200 ms of it still queued when the caller talks over it.
+    await vi.waitFor(() => expect(sink.waitForPlayout).toHaveBeenCalledTimes(1));
+    sink.queuedDuration = 200;
+    expect(settled).toBe(false);
+    abort.abort();
+    expect(sink.clearQueue).toHaveBeenCalledTimes(1);
+    const outcome = await line;
+    expect(outcome).toEqual({ heard: true, failed: false, cut: true, audioMs: 300, playedMs: 100, complete: true });
+    expect(sink.clearQueue).toHaveBeenCalledTimes(1);
+    expect(stopped).toHaveBeenCalledTimes(1);
+    expect(spoke).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'partial' }), undefined);
+
+    // The abort lands even when the sink would never let its playout go.
+    const stuck = { ...drainingSink(), waitForPlayout: vi.fn(() => new Promise<void>(() => undefined)) };
+    const second = abortableOutput(
+      stuck,
+      fakeTts(() => ({ chunks: 1, samples: 2_400 })),
+    );
+    const again = new AbortController();
+    const held = second.output.speak('Short.', async () => undefined, again.signal);
+    await vi.waitFor(() => expect(stuck.waitForPlayout).toHaveBeenCalledTimes(1));
+    again.abort();
+    expect(await held).toMatchObject({ cut: true, complete: true, playedMs: 100 });
+    expect(stuck.clearQueue).toHaveBeenCalledTimes(1);
+
+    // Nobody aborts: the line drains and is whole, as before; a late abort changes nothing.
+    const whole = output.speak('Short.', async () => undefined, new AbortController().signal);
+    await vi.waitFor(() => expect(sink.waitForPlayout).toHaveBeenCalledTimes(2));
+    sink.drained();
+    expect(await whole).toEqual({
+      heard: true,
+      failed: false,
+      cut: false,
+      audioMs: 300,
+      playedMs: 300,
+      complete: true,
+    });
+    expect(sink.clearQueue).toHaveBeenCalledTimes(1);
+    await output.close();
+    await second.output.close();
+  });
+
+  it('an abort that makes synthesis throw is a cut: the sink is cleared, not drained, and it is no failure', async () => {
+    const sink = drainingSink();
+    const { output, stopped } = abortableOutput(
+      sink,
+      fakeTts(() => ({ chunks: 1 })),
+    );
+    vi.spyOn(output.speech, 'speak').mockImplementation(async function* (_text: string, signal: AbortSignal) {
+      yield { pcm: new Int16Array(2_400), sampleRate: 24_000, numChannels: 1 };
+      await untilAborted(signal);
+      throw new Error('the request was aborted');
+    });
+    const abort = new AbortController();
+    const line = output.speak('A line of some length.', async () => undefined, abort.signal);
+    await vi.waitFor(() => expect(sink.captureFrame).toHaveBeenCalledTimes(5));
+    sink.queuedDuration = 60;
+    abort.abort();
+    expect(sink.clearQueue).toHaveBeenCalledTimes(1);
+    expect(await line).toEqual({ heard: true, failed: false, cut: true, audioMs: 100, playedMs: 40, complete: false });
+    expect(sink.waitForPlayout).not.toHaveBeenCalled();
+    expect(sink.clearQueue).toHaveBeenCalledTimes(1);
+    expect(stopped).toHaveBeenCalledTimes(1);
     await output.close();
   });
 

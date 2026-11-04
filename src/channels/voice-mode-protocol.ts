@@ -102,8 +102,9 @@ export interface LiveKitJobMetadata {
   /** A `/meet` call: the caller is the meeting's Recall bridge page. */
   meeting?: MeetingJob;
   /**
-   * The call runs the jev loop (`/voice jev`): no turn state machine; the worker reports words,
-   * speech marks and playback on `agent/jev`, and speaks only what the host sends.
+   * The call runs the jev loop (`/voice jev`, `/meet <link> jev`): no turn state machine; the worker
+   * reports words (none on a meeting), speech marks and playback on `agent/jev`, and speaks only what
+   * the host sends.
    */
   jev?: boolean;
 }
@@ -140,18 +141,12 @@ export interface CallUtterance {
   text: string;
   /** The worker's key for the turn: a retry under it gets the first answer, not a second turn. */
   turnKey?: string;
-  /** `/meet ... jev`: words no wake phrase addressed, a turn only if the host's judge lets them through. */
-  candidate?: boolean;
-  /** On a candidate: the name the meeting wakes on, which the judge takes an invitation to. */
-  wakeName?: string;
 }
 
 /** What a meeting call's worker does differently. */
 export interface MeetingJob {
   /** A pause ends a turn too, not only the send word. */
   pauseSends: boolean;
-  /** `/meet ... jev`: words no wake phrase addressed go to the host as candidates its judge may let through. */
-  jev: boolean;
 }
 
 /**
@@ -519,12 +514,15 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * need no version bump.
  *
  * On a jev call the host sends only replies to speak, each with a `replyId` its playback reports
- * name; `stop` aborts the line playing and drops the queue; `words` says a participant's words
- * arrived, the reflex's text confirmation where the worker has no transcript of its own.
+ * name; `stop` aborts the line playing and drops the queue; `revoke` drops one queued line that has
+ * not started (a newer wake replaced its turn; reported `cut_off` with nothing delivered, and a line
+ * already playing plays on); `words` says a participant's words arrived, the reflex's text
+ * confirmation where the worker has no transcript of its own.
  */
 export type LiveKitHostEvent =
   | { type: 'reply'; text: string; turn?: string | null; replyId?: string }
   | { type: 'stop' }
+  | { type: 'revoke'; replyId: string }
   | { type: 'words' }
   | { type: 'thinking' }
   | { type: 'working' }

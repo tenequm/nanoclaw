@@ -65,21 +65,22 @@ import {
 } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
 import { createCallPage, handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
-import { createMeetings, type Meetings } from './voice-mode-meet.js';
+import { createMeetings, createRecallTranscripts, type MeetingAudioSeams, type Meetings } from './voice-mode-meet.js';
 import {
   createRecallMeetBridge,
   RECALL_MEET_ENV_KEYS,
   recallMeetConfigFromEnv,
   type RecallMeetBridge,
+  type RecallMeetConfig,
 } from './meet-recall.js';
 import { readEnvFile } from '../env.js';
-import type { askJev } from '../modules/jev-gate/jev.js';
+import { RECALL_UPGRADE_SEGMENT } from '../modules/meet-jev/ingress/recall.js';
 import { encryptionKey } from '../secret-seal.js';
 import { log } from '../log.js';
 import { registerResidentSkillGate } from '../project-doc-compose.js';
 import { requestWake } from '../request-wake.js';
 import type { Session } from '../types.js';
-import { registerRootHandler, registerWebhookHandler } from '../webhook-server.js';
+import { registerRootHandler, registerUpgradeHandler, registerWebhookHandler } from '../webhook-server.js';
 import {
   effectiveTts,
   isTtsProvider,
@@ -251,8 +252,10 @@ export interface VoiceModeConfig {
   expediteReplies?: (session: Session) => void;
   /** The Recall client `/meet` joins meetings through (voice-mode-meet.ts); none: `/meet` is not configured. */
   meetBridge?: RecallMeetBridge;
-  /** The Jev client a `/meet ... jev` call judges candidates with; a test seam. */
-  judgeJev?: typeof askJev;
+  /** Public `wss://` origin a jev meeting's bot streams its participants' audio to; `publicUrl`'s by default. */
+  meetAudioOrigin?: string;
+  /** How a jev meeting's participants are transcribed; test seams. */
+  meetAudio?: MeetingAudioSeams;
   /** How a call finds and starts the agent session it talks to (findCallSession, requestWake). Test seams. */
   prewarm?: {
     findSession?: (route: Omit<InboundEvent, 'message'>, agentGroupId: string) => Promise<Session | undefined>;
@@ -420,9 +423,16 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     now,
     accessCheckIntervalMs,
   });
-  const meetings: Meetings | null = config.meetBridge
-    ? createMeetings(livekit, config.meetBridge, { judgeJev: config.judgeJev, now })
+  const transcripts = config.meetBridge
+    ? createRecallTranscripts(livekit, {
+        origin: config.meetAudioOrigin ?? new URL(config.publicUrl).origin.replace(/^http/, 'ws'),
+        // The worker's transcription key: LIVEKIT_REQUIRED has it wherever the channel runs.
+        geminiKey: config.providerKeys?.gemini ?? '',
+        ...(config.meetAudio ? { seams: config.meetAudio } : {}),
+      })
     : null;
+  const meetings: Meetings | null =
+    config.meetBridge && transcripts ? createMeetings(livekit, config.meetBridge, transcripts) : null;
   const callPage = createCallPage(livekit, { livekit: config.livekit, maxCallDurationMs, ui: config.ui, lineForToken });
 
   const replyJson = (res: http.ServerResponse, status: number, body: unknown): void =>
@@ -638,6 +648,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       encryptionKey();
       registerWebhookHandler(VOICE_MODE_CHANNEL, handleHttp);
       registerRootHandler('voice', handleHttp);
+      // Recall's websocket is the only upgrade under /voice; its per-call token is its gate, not the peer policy.
+      if (transcripts) registerUpgradeHandler(RECALL_UPGRADE_SEGMENT, transcripts.handleUpgrade);
       if (config.pagePort !== undefined) {
         const server = http.createServer((req, res) => {
           let pathname: string;
@@ -695,6 +707,7 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       try {
         await livekit.teardown();
       } finally {
+        transcripts?.close();
         if (server) {
           // A half-sent request would otherwise hold close() open until the headers timeout.
           server.closeAllConnections();
@@ -816,9 +829,10 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
     }
     const page = pageListener(env.VOICE_MODE_PORT, env.VOICE_MODE_PAGE_HOST);
     let meetBridge: RecallMeetBridge | undefined;
+    let recallConfig: RecallMeetConfig | null = null;
     try {
-      const recall = recallMeetConfigFromEnv(env, { apiKey: env.LIVEKIT_API_KEY, apiSecret: env.LIVEKIT_API_SECRET });
-      meetBridge = recall ? createRecallMeetBridge(recall) : undefined;
+      recallConfig = recallMeetConfigFromEnv(env, { apiKey: env.LIVEKIT_API_KEY, apiSecret: env.LIVEKIT_API_SECRET });
+      meetBridge = recallConfig ? createRecallMeetBridge(recallConfig) : undefined;
     } catch (err) {
       // Bad Recall settings leave /meet off rather than stopping the voice channel from starting.
       log.warn('voice-mode: Recall is not configured right; /meet is off', {
@@ -841,6 +855,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       vocabulary: env.VOICE_MODE_VOCABULARY,
       providerKeys: providerKeysFrom(env),
       meetBridge,
+      ...(recallConfig ? { meetAudioOrigin: recallConfig.audioOrigin } : {}),
       livekit: {
         url: env.LIVEKIT_URL,
         languages: parseVoiceLanguages(env.VOICE_MODE_LANGUAGES),

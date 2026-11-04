@@ -59,6 +59,12 @@ function readNoul(answers: unknown, id: JevQuestionId): number | null {
   return typeof noul === 'number' && Number.isFinite(noul) ? Math.min(1, Math.max(0, noul)) : null;
 }
 
+export interface JevFailure {
+  category: string;
+  message: string;
+  status?: number;
+}
+
 /**
  * POST one System One request (`state` and `questions`; the pinned model is added) within
  * `JEV_TIMEOUT_MS`, or sooner if `signal` aborts. Never throws.
@@ -66,12 +72,29 @@ function readNoul(answers: unknown, id: JevQuestionId): number | null {
 export async function postSystemOne(
   request: { state: unknown; questions: Record<string, unknown> },
   signal?: AbortSignal,
-): Promise<{ ok: true; body: unknown } | { ok: false; reason: string }> {
-  if (!JEV_API_KEY) return { ok: false, reason: 'no_key' };
+): Promise<{ ok: true; body: unknown } | { ok: false; reason: string; failure: JevFailure }> {
+  if (!JEV_API_KEY)
+    return { ok: false, reason: 'no_key', failure: { category: 'no_key', message: 'Jev API key is not configured' } };
 
   let response: Response;
+  const timeout = AbortSignal.timeout(JEV_TIMEOUT_MS);
+  const failure = (err: unknown, fallback: 'request' | 'bad_body') => {
+    const category = signal?.aborted
+      ? 'abort'
+      : timeout.aborted || (err instanceof Error && err.name === 'TimeoutError')
+        ? 'timeout'
+        : err instanceof Error && err.name === 'AbortError'
+          ? 'abort'
+          : fallback;
+    const messages = {
+      abort: 'Jev request aborted',
+      timeout: 'Jev request timed out',
+      request: 'Jev request failed',
+      bad_body: 'Jev response is not valid JSON',
+    };
+    return { ok: false as const, reason: category, failure: { category, message: messages[category] } };
+  };
   try {
-    const timeout = AbortSignal.timeout(JEV_TIMEOUT_MS);
     response = await fetch(JEV_URL, {
       method: 'POST',
       headers: { authorization: `Bearer ${JEV_API_KEY}`, 'content-type': 'application/json' },
@@ -79,23 +102,24 @@ export async function postSystemOne(
       signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
     });
   } catch (err) {
-    const timedOut = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
-    log.debug('Jev request failed', { err });
-    return { ok: false, reason: timedOut ? 'timeout' : 'request' };
+    return failure(err, 'request');
   }
 
   if (!response.ok) {
     // An unread body holds the connection until it is collected.
     void response.body?.cancel().catch(() => {});
     log.debug('Jev returned non-200', { status: response.status });
-    return { ok: false, reason: `http_${response.status}` };
+    return {
+      ok: false,
+      reason: `http_${response.status}`,
+      failure: { category: 'http', status: response.status, message: `Jev returned HTTP ${response.status}` },
+    };
   }
 
   try {
     return { ok: true, body: await response.json() };
   } catch (err) {
-    log.debug('Jev returned an unparseable body', { err });
-    return { ok: false, reason: 'bad_body' };
+    return failure(err, 'bad_body');
   }
 }
 

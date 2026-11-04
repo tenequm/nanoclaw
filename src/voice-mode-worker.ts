@@ -122,7 +122,9 @@ import { readEnvFile } from './env.js';
 import {
   FINAL_GRACE_MS,
   GeminiLiveTranscriber,
+  turnText,
   type Heard,
+  type TextSource,
   type TranscriberOptions,
 } from './voice-mode-gemini-live.js';
 import {
@@ -1623,8 +1625,8 @@ export class TurnTaking {
     this.tookTurn();
   }
 
-  /** The host took a turn (one sent in order, or a meeting candidate it let through): the agent works on it. */
-  tookTurn(): void {
+  /** The host took a turn: the agent works on it. */
+  private tookTurn(): void {
     if (this.closed) return;
     this.awaitingReply = true;
     this.thinkingUntil = Math.max(this.thinkingUntil, this.now() + AWAIT_REPLY_MS);
@@ -2198,27 +2200,6 @@ export function awakeLimits(env: Record<string, string | undefined>): AwakeLimit
 export type Transcription = Pick<GeminiLiveTranscriber, 'prepare' | 'begin' | 'push' | 'end' | 'close'>;
 
 const wordCount = (text: string): number => (text.match(/[\p{L}\p{N}]+/gu) ?? []).length;
-/** A final this short may be only the turn's last phrase: a manual activity's final can collapse to it after a pause. */
-const COLLAPSED_FINAL_WORDS = 3;
-
-/** Where a turn's text came from, logged with every turn. */
-export type TextSource = 'final' | 'collapse_interim' | 'no_final_interim' | 'none';
-
-/**
- * A turn's text: the final transcript, unless it collapsed (COLLAPSED_FINAL_WORDS or fewer while
- * the last interim text of the activity had more) or never came, then the last interim text.
- */
-export function turnText(heard: Pick<Heard, 'final' | 'interim'>): { text: string; source: TextSource } {
-  const final = heard.final?.trim() ?? '';
-  const interim = heard.interim.trim();
-  if (!final) return interim ? { text: interim, source: 'no_final_interim' } : { text: '', source: 'none' };
-  const finalWords = wordCount(final);
-  if (finalWords <= COLLAPSED_FINAL_WORDS && wordCount(interim) > finalWords) {
-    return { text: interim, source: 'collapse_interim' };
-  }
-  return { text: final, source: 'final' };
-}
-
 /** A word's sound, roughly: Latin letters, vowel runs as one mark, doubled letters as one (`проєктом` = `proektom`). */
 const wordSound = (word: string): string =>
   spokenWord(word)
@@ -2370,11 +2351,6 @@ export interface CallTurnsDeps {
   unheard(): void;
   /** A turn that came to nothing for the agent: discarded, unaddressed, or a command alone. */
   ended?(facts: TurnFacts, outcome: TurnOutcome, reason: string): void;
-  /**
-   * `/meet ... jev`: words no wake phrase addressed go to the host as a candidate instead of ending
-   * unaddressed. Unset: they end unaddressed (`no_wake`).
-   */
-  candidate?(text: string, facts: TurnFacts): void;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -3234,8 +3210,7 @@ export class CallTurns {
       if (why === 'unaddressed') {
         if (said) this.deps.drop('unaddressed', said);
         this.deps.noTurn();
-        if (said && this.deps.candidate) this.deps.candidate(said, facts);
-        else ended('unaddressed', 'no_wake');
+        ended('unaddressed', 'no_wake');
       }
       if (why === 'dropped') ended('discarded', 'dropped');
       return null;
@@ -4197,6 +4172,29 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
     // The call's close and the caller's signal both end the line, also when either already fired.
     const lineSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
     const cut = () => !!signal?.aborted && !closed;
+    /** Set by the line's abort, in whichever phase it lands: what had played by then. */
+    let cutPlayedMs: number | undefined;
+    // The abort silences the line at once, not at the next provider chunk or after the queue drained.
+    const cutNow = () => {
+      if (closed || cutPlayedMs !== undefined) return;
+      cutPlayedMs = Math.max(0, audioMs - o.sink.queuedDuration);
+      o.sink.clearQueue();
+    };
+    let abortedResolve!: () => void;
+    const aborted = new Promise<void>((resolve) => (abortedResolve = resolve));
+    const onAbort = () => {
+      cutNow();
+      abortedResolve();
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
+    const cutResult = () => {
+      cutNow();
+      return {
+        outcome: { heard, failed: false, cut: true, audioMs, playedMs: cutPlayedMs ?? 0, complete },
+        said: false,
+      };
+    };
     const capture = async (synthesized: Int16Array) => {
       const frame = filter ? filter(synthesized) : synthesized;
       meter.frame(frame);
@@ -4235,32 +4233,39 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
         }
         await play(pcm);
       }
-      if (cut()) {
-        // What the sink still holds never plays; what it already played is the line's delivered part.
-        playedMs = Math.max(0, audioMs - o.sink.queuedDuration);
-        o.sink.clearQueue();
-        return { outcome: { heard, failed, cut: true, audioMs, playedMs, complete }, said: false };
-      }
+      // What the sink still held never plays; what it already played is the line's delivered part.
+      if (cut()) return cutResult();
       complete = !closed;
       if (heard && !closed) await play(resample.flush());
-      if (rest) {
+      if (rest && !signal?.aborted) {
         const tail = new Int16Array(SPEECH_FRAME);
         tail.set(rest);
         rest = undefined;
         await capture(tail);
       }
-      if (heard) await o.sink.waitForPlayout();
+      if (heard && !signal?.aborted) {
+        const playout = o.sink.waitForPlayout();
+        if (signal) {
+          playout.catch(() => undefined);
+          await Promise.race([playout, aborted]);
+        } else await playout;
+      }
+      // Cut while its last audio drained: the share that played is delivered, not the whole line.
+      if (cut()) return cutResult();
       playedMs = audioMs;
       return { outcome: { heard, failed, cut: false, audioMs, playedMs, complete }, said: heard && !closed };
     } catch (err) {
+      // An abort that made synthesis throw is a cut, not a failure: the queue is dropped, not drained.
+      if (cut()) return cutResult();
       failed = true;
       o.log.warn('voice-mode worker: a line could not be synthesized', {
         err: err instanceof Error ? err.message : err,
       });
       if (heard) await o.sink.waitForPlayout().catch(() => undefined);
       playedMs = audioMs;
-      return { outcome: { heard, failed, cut: cut(), audioMs, playedMs, complete }, said: false };
+      return { outcome: { heard, failed, cut: false, audioMs, playedMs, complete }, said: false };
     } finally {
+      signal?.removeEventListener('abort', onAbort);
       resample.close();
       if (heard && !closed) o.stopped();
       const spoken = meter.done({ by: speech.spokenBy, primary, failed, cut: closed || cut() });
@@ -4687,7 +4692,9 @@ export class CallTelemetry {
 // no wake word, no cues: the VAD opens a transcription activity at the caller's speech and closes it
 // at its end, every partial and final goes to the host as an utterance with the speech marks, and the
 // worker speaks only what the host sends, reporting what became of each line. The host decides the
-// rest (`src/modules/meet-jev/`).
+// rest (`src/modules/meet-jev/`). On a meeting (`meta.meeting`) Recall streams each participant's audio
+// to the host, which transcribes it, so the worker transcribes nothing: it reports its VAD marks and
+// playback, and the reflex's words come from the host's `words`.
 // ---------------------------------------------------------------------------------------------
 
 /**
@@ -4696,6 +4703,12 @@ export class CallTelemetry {
  * interruption.
  */
 export const JEV_BARGE_MS = 300;
+/**
+ * How far the host's `words` (a meeting's) may miss the worker's VAD: the host's partial and the local
+ * speech marks run on separate clocks and transports, so the words of one speech can land just before
+ * its speech-on or just after its speech-off.
+ */
+export const JEV_WORDS_WINDOW_MS = 1_500;
 /** Events kept for the host while it cannot be reached; past it the oldest partials go, with a log line. */
 const JEV_REPORT_BACKLOG = 4 * MAX_JEV_EVENTS_PER_POST;
 /** A POST body's bytes besides its events (`callId`, the keys), kept out of MAX_JEV_POST_BYTES. */
@@ -4809,7 +4822,8 @@ export class JevReporter {
 }
 
 export interface JevLoopDeps {
-  transcriber: Transcription;
+  /** None on a meeting: the host transcribes each participant, and the reflex has its `words`. */
+  transcriber?: Transcription;
   /** One line into the room; `ready` is awaited before its first audio, `signal` aborts its playout. */
   speak(text: string, ready: () => Promise<void>, signal: AbortSignal): Promise<LineOutcome>;
   /** One event for the host, in order. */
@@ -4854,6 +4868,12 @@ export class JevLoop {
   private speechSince = 0;
   /** The host said a participant's words arrived during this speech. */
   private wordsHeard = false;
+  /** When the host's last `words` came while no speech was on and none had just ended: the next speech's. */
+  private earlyWordsAt?: number;
+  /** The line that had started playing when this speech began: the one it talks over. */
+  private speechOver?: JevPlayout;
+  /** The speech that ended last: `words` landing soon after it are its own. */
+  private lastSpeech?: { endedAt: number; over?: JevPlayout; sustained: boolean; confirmed: boolean };
   private bargeTimer?: ReturnType<typeof setTimeout>;
   private readonly queue: JevPlayout[] = [];
   private playing?: JevPlayout;
@@ -4867,6 +4887,7 @@ export class JevLoop {
 
   /** The caller's audio, every frame: kept for the pre-roll, and the open activity's. */
   audio(pcm: Int16Array): void {
+    if (!this.deps.transcriber) return;
     this.ring.push(pcm);
     if (this.utterance) this.deps.transcriber.push(pcm);
   }
@@ -4876,13 +4897,19 @@ export class JevLoop {
     if (this.closed || speaking === this.speaking) return;
     this.speaking = speaking;
     this.deps.report({ type: 'speech', on: speaking, at: this.now() });
+    const transcriber = this.deps.transcriber;
     if (speaking) {
       this.speechSince = this.now();
-      this.wordsHeard = false;
-      this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
-      this.deps.transcriber.begin(this.ring.since(Math.max(0, at - samplesOf(PRE_ROLL_MS))));
-      // The next activity's socket, set up while this one runs: no connect latency at the next speech.
-      void this.deps.transcriber.prepare();
+      this.wordsHeard = this.earlyWordsAt !== undefined && this.speechSince - this.earlyWordsAt <= JEV_WORDS_WINDOW_MS;
+      this.earlyWordsAt = undefined;
+      this.lastSpeech = undefined;
+      this.speechOver = this.playing?.started ? this.playing : undefined;
+      if (transcriber) {
+        this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
+        transcriber.begin(this.ring.since(Math.max(0, at - samplesOf(PRE_ROLL_MS))));
+        // The next activity's socket, set up while this one runs: no connect latency at the next speech.
+        void transcriber.prepare();
+      }
       clearTimeout(this.bargeTimer);
       this.bargeTimer = setTimeout(() => this.reflex(), JEV_BARGE_MS);
       this.bargeTimer.unref?.();
@@ -4891,9 +4918,17 @@ export class JevLoop {
     clearTimeout(this.bargeTimer);
     const utterance = this.utterance;
     this.utterance = undefined;
+    const endedAt = this.now();
+    this.lastSpeech = {
+      endedAt,
+      ...(this.speechOver ? { over: this.speechOver } : {}),
+      sustained: endedAt - this.speechSince >= JEV_BARGE_MS,
+      confirmed: this.wordsHeard || !!utterance?.worded,
+    };
+    this.speechOver = undefined;
     this.wake();
-    if (!utterance) return;
-    this.deps.transcriber.end().then(
+    if (!utterance || !transcriber) return;
+    transcriber.end().then(
       (heard) => {
         if (this.closed) return;
         const { text } = turnText(heard);
@@ -4921,9 +4956,28 @@ export class JevLoop {
 
   /** The host's `words`: a participant's words arrived (the reflex's confirmation where the worker has no transcript). */
   onWords(): void {
-    if (!this.speaking) return;
-    this.wordsHeard = true;
-    this.reflex();
+    if (this.closed) return;
+    if (this.speaking) {
+      this.wordsHeard = true;
+      this.reflex();
+      return;
+    }
+    // Between speeches: words soon after one ended are that speech's (late), else the next one's (early).
+    const at = this.now();
+    const last = this.lastSpeech;
+    if (!last || at - last.endedAt > JEV_WORDS_WINDOW_MS) {
+      this.earlyWordsAt = at;
+      return;
+    }
+    // A late confirmation cuts only what the reflex would have: sustained speech over the line still playing.
+    const line = this.playing;
+    if (last.confirmed || !last.sustained || !last.over || last.over !== line || line.abort.signal.aborted) return;
+    last.confirmed = true;
+    this.deps.log.info('voice-mode worker: words came for speech over the agent that just ended; the line is cut', {
+      replyId: line.replyId,
+      wordsLateMs: at - last.endedAt,
+    });
+    line.abort.abort();
   }
 
   /** The room: the agent's audio started or stopped playing. */
@@ -4955,6 +5009,32 @@ export class JevLoop {
     });
     this.dropQueue();
     this.playing?.abort.abort();
+  }
+
+  /**
+   * The host's `revoke`: the line, superseded before it was heard, never plays. Queued, it is dropped;
+   * taken but its first audio not out (synthesizing, or waiting for the caller's quiet), it is aborted,
+   * which the speech output checks right before that audio. Either way it is reported `cut_off` with
+   * nothing delivered. A line already heard is left to play: the host revokes only lines it has not
+   * seen start, so this is a revoke that crossed the line's `started`.
+   */
+  onRevoke(replyId: string): void {
+    if (this.closed) return;
+    const queued = this.queue.findIndex((line) => line.replyId === replyId);
+    if (queued >= 0) {
+      this.queue.splice(queued, 1);
+      this.deps.log.info('voice-mode worker: the host revoked a queued line', { replyId });
+      this.deps.report({ type: 'playback', replyId, state: 'cut_off', delivered: '', at: this.now() });
+      return;
+    }
+    const line = this.playing;
+    if (line?.replyId !== replyId) return;
+    if (line.started) {
+      this.deps.log.info('voice-mode worker: the host revoked a line already playing; it plays on', { replyId });
+      return;
+    }
+    this.deps.log.info('voice-mode worker: the host revoked a line before its first audio', { replyId });
+    line.abort.abort();
   }
 
   /** A line is queued or playing. */
@@ -5086,18 +5166,20 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   let replies = 0;
   const reporter = new JevReporter((events) => host.post('jev', { events }), callLog);
   const languages = callLanguages(meta.languages);
-  const transcriber = deps.transcriber({
-    apiKey: s.geminiKey,
-    model: meta.sttModel,
-    vocabulary: [...new Set(meta.vocabulary ?? [])],
-    languageCodes: languages.codes,
-    sampleRate: INPUT_SAMPLE_RATE,
-    onInterim: (text) => loop.onInterim(text),
-    log: callLog,
-    ...(s.transcriptDebug ? { debug: true } : {}),
-  });
+  const transcriber = meta.meeting
+    ? undefined
+    : deps.transcriber({
+        apiKey: s.geminiKey,
+        model: meta.sttModel,
+        vocabulary: [...new Set(meta.vocabulary ?? [])],
+        languageCodes: languages.codes,
+        sampleRate: INPUT_SAMPLE_RATE,
+        onInterim: (text) => loop.onInterim(text),
+        log: callLog,
+        ...(s.transcriptDebug ? { debug: true } : {}),
+      });
   const loop: JevLoop = new JevLoop({
-    transcriber,
+    ...(transcriber ? { transcriber } : {}),
     speak: async (text, ready, signal) => {
       if (!callVoice) return { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
       return callVoice.speak(text, ready, signal);
@@ -5119,7 +5201,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   const endCall = async (reason: string, tellHost: boolean, restart: boolean) => {
     ending = true;
     loop.close();
-    transcriber.close();
+    transcriber?.close();
     // What was reported goes out before the host hears the call ended; bounded, like every wait here.
     await atMost(reporter.drain(), WORKER_REQUEST_TIMEOUT_MS);
     const mem = process.memoryUsage();
@@ -5154,10 +5236,12 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     );
   } catch (err) {
     loop.close();
-    transcriber.close();
+    transcriber?.close();
     return s.abandon('could not set up the call audio', { err });
   }
-  callLog.info('voice-mode worker: a jev call', { languages: languages.codes });
+  callLog.info('voice-mode worker: a jev call', {
+    ...(meta.meeting ? { meeting: true, transcription: 'host' } : { languages: languages.codes }),
+  });
   // The page's RPCs: only its settings do anything here (the speech choice); review mode is not offered.
   if (!ending) {
     const voice = callVoice;
@@ -5226,6 +5310,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         loop.onReply(event.replyId, event.text);
       } else if (event.type === 'stop') loop.onStop();
       else if (event.type === 'words') loop.onWords();
+      else if (event.type === 'revoke') loop.onRevoke(event.replyId);
     }, hostLink.signal)
     .then(
       () => end('host link closed', true),
@@ -5652,48 +5737,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       });
       saveTurn(turn, take, text, { host });
     };
-  /**
-   * `/meet ... jev`: words no wake phrase addressed go to the host as a candidate, outside the order turns
-   * go out in, so an addressed turn never waits on it. The host answers 202 only when it let the
-   * candidate through to the agent as a turn: then, and only then, it gets the sent cue and the typing.
-   * One at a time: while the host judges one, the next is dropped, so candidates never take an addressed turn's slot.
-   */
-  let candidateInFlight = false;
-  const postCandidate = async (text: string, facts: TurnFacts): Promise<void> => {
-    if (candidateInFlight) {
-      if (!ending) telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_busy' });
-      return;
-    }
-    const turnKey = randomUUID();
-    const postAt = Date.now();
-    let res: Response;
-    candidateInFlight = true;
-    try {
-      // The name the meeting wakes on, which the host's judge must take an invitation to, not the agent's own.
-      const utterance: CallUtterance = { text, turnKey, candidate: true, wakeName: wakeOfMeeting?.name };
-      res = await host.post('utterance', { ...utterance });
-    } catch (err) {
-      callLog.warn('voice-mode worker: could not hand a candidate to the host', { err });
-      if (!ending) telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_lost' });
-      return;
-    } finally {
-      candidateInFlight = false;
-    }
-    if (res.status !== 202) {
-      void res.body?.cancel().catch(() => {});
-      if (!ending)
-        telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_dropped', hostStatus: res.status });
-      return;
-    }
-    const accepted = (await res.json().catch(() => null)) as { id?: unknown } | null;
-    if (ending) return;
-    const turn = ++turns;
-    lastPosted = Math.max(lastPosted, turn);
-    cue('sent');
-    turnTaking.tookTurn();
-    const id = typeof accepted?.id === 'string' ? accepted.id : undefined;
-    sent(turn, text, { facts })({ accepted: true, status: 202, turnKey, id }, postAt);
-  };
   const transcriber = deps.transcriber({
     apiKey: geminiKey,
     model: meta.sttModel,
@@ -5715,7 +5758,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       ended: (facts, outcome, reason) => {
         if (!ending) telemetry.turn({ facts, outcome, reason });
       },
-      ...(meta.meeting?.jev ? { candidate: (text: string, facts: TurnFacts) => void postCandidate(text, facts) } : {}),
       drop: (dropped, text, lone) => {
         if (ending) return;
         callVoice?.publishDropped(
@@ -5750,7 +5792,6 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     callLog.info('voice-mode worker: a meeting', {
       wakePhrase: wakeOfMeeting.phrase,
       pauseSends: wakeOfMeeting.pauseSends,
-      jev: wakeOfMeeting.jev,
     });
   }
   if (recordCall) {
@@ -5835,31 +5876,28 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     try {
       // The spotter counts the audio it was pushed, from now on; the turns count it from the call's start.
       spotterFrom = callTurns.position;
-      // Jev judges the segments nobody addressed, and with a spotter nothing is transcribed until it fires.
-      spotter = wakeOfMeeting?.jev
-        ? undefined
-        : deps.wakeWord?.({
-            onDetect: (score, window) => {
-              const end = window.end + spotterFrom;
-              callLog.info('voice-mode worker: wake word spotted', {
-                score: Math.round(score * 1000) / 1000,
-                scoredMsAgo: Math.round(msOf(callTurns.position - end)),
-              });
-              callRecording?.wake({ streamMs: Math.round(msOf(end)), score: Math.round(score * 1000) / 1000 });
-              if (ending || review?.reviewing) return;
-              callTurns.onWake(end);
-            },
-            onError: (err) => {
-              callLog.warn(
-                'voice-mode worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn',
-                {
-                  err,
-                },
-              );
-              wakeWord = undefined;
-              callTurns.useWakeWord(undefined);
-            },
+      spotter = deps.wakeWord?.({
+        onDetect: (score, window) => {
+          const end = window.end + spotterFrom;
+          callLog.info('voice-mode worker: wake word spotted', {
+            score: Math.round(score * 1000) / 1000,
+            scoredMsAgo: Math.round(msOf(callTurns.position - end)),
           });
+          callRecording?.wake({ streamMs: Math.round(msOf(end)), score: Math.round(score * 1000) / 1000 });
+          if (ending || review?.reviewing) return;
+          callTurns.onWake(end);
+        },
+        onError: (err) => {
+          callLog.warn(
+            'voice-mode worker: the wake word spotter stopped; "hey <agent>" in the transcript opens a turn',
+            {
+              err,
+            },
+          );
+          wakeWord = undefined;
+          callTurns.useWakeWord(undefined);
+        },
+      });
     } catch (err) {
       callLog.warn('voice-mode worker: could not start the wake word spotter', { err });
     }

@@ -8,6 +8,7 @@ import http from 'node:http';
 import net, { type AddressInfo } from 'node:net';
 import { AccessToken } from 'livekit-server-sdk';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import WebSocket from 'ws';
 
 /** The Jev key a jev call needs; a test empties it for a host without one. */
 const jevKey = vi.hoisted(() => ({ value: 'jev-test-key' }));
@@ -68,7 +69,8 @@ import { callPageHtml } from './voice-mode-page.js';
 import type { VoiceCatalog, VoiceStatus } from './voice-mode-tts-catalog.js';
 import { linePlatformId } from './voice-mode-line.js';
 import { MEETING_MAX_DURATION_MS, type RecallMeetBridge } from './meet-recall.js';
-import type { CallCore, CallEvent, Command, JevState } from '../modules/meet-jev/core/types.js';
+import type { CallCore, CallEvent, CallPolicy, Command, JevState } from '../modules/meet-jev/core/types.js';
+import type { TranscriberOptions } from '../voice-mode-gemini-live.js';
 
 /** A line /voice made: its calls need a chat to talk in. */
 const LINE = linePlatformId('0123456789ab');
@@ -406,7 +408,7 @@ async function attachWorker(h: Harness, meta: LiveKitJobMetadata): Promise<FakeW
 }
 
 async function startCall(h: Harness): Promise<{ call: TokenResponse; worker: FakeWorker }> {
-  const res = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+  const res = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
   expect(res.status).toBe(200);
   const call = (await res.json()) as TokenResponse;
   const dispatch = h.lk.dispatches.at(-1)!;
@@ -528,7 +530,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     const port = await freePort();
     await h.stop();
     h = await startHarness({ pagePort: port });
-    await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     const { callId } = h.lk.dispatches[0].metadata;
     const body = JSON.stringify({ callId });
     const hostPort = Number(new URL(h.hostUrl).port);
@@ -678,14 +680,14 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     await h.adapter.teardown();
     expect((await fetch(`${h.hostUrl}/voice?t=tok123`)).status).toBe(503);
     expect((await fetch(`${h.base}/info?t=tok123`)).status).toBe(503);
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(503);
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(503);
     expect(h.lk.rooms).toEqual([]);
   });
 
   it('refuses unknown links and callers without access before touching LiveKit', async () => {
     expect((await post(`${h.base}/livekit/token?v=6&t=nope`)).status).toBe(403);
     h.access.enabled = false;
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(403);
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(403);
     expect(h.lk.rooms).toEqual([]);
   });
 
@@ -695,7 +697,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(await page.text()).toBe(callPageHtml());
     expect((await fetch(`${h.hostUrl}/voice/?t=tok123`)).status).toBe(200);
     expect((await fetch(`${h.hostUrl}/voice/info?t=tok123`)).status).toBe(200);
-    const res = await post(`${h.hostUrl}/voice/livekit/token?v=6&t=tok123`);
+    const res = await post(`${h.hostUrl}/voice/livekit/token?v=6&t=tok123&jev=0`);
     expect(res.status).toBe(200);
     const { callId } = (await res.json()) as TokenResponse;
     expect(h.lk.rooms).toHaveLength(1);
@@ -742,7 +744,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   });
 
   it('opens a unique room, dispatches the worker with the call metadata and mints a room-only caller token', async () => {
-    const res = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    const res = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(res.status).toBe(200);
     const body = (await res.json()) as TokenResponse;
     expect(body.url).toBe('wss://lk.example.ts.net:47880');
@@ -801,13 +803,13 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
 
   it('answers 502 and cleans up when the LiveKit server is unreachable', async () => {
     h.lk.failCreate = true;
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(502);
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(502);
     await settle();
     expect(h.lk.deleted).toHaveLength(1);
   });
 
   it('authenticates the worker routes with the per-call secret derived from the API secret', async () => {
-    await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     const meta = h.lk.dispatches[0].metadata;
     const url = `${h.hostUrl}/webhook/voice-mode/livekit/agent`;
     const secret = liveKitCallSecret(API_SECRET, meta.callId);
@@ -836,7 +838,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   });
 
   it('serves the worker routes only under the voice-mode prefix and never to a forwarded request', async () => {
-    await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     const meta = h.lk.dispatches[0].metadata;
     const auth = workerAuth(meta.callId);
     expect((await post(`${h.hostUrl}/webhook/voice/livekit/agent/joined`, { callId: meta.callId }, auth)).status).toBe(
@@ -1081,7 +1083,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   });
 
   it('refuses an utterance before the caller is in and after access is gone', async () => {
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(200);
     const meta = h.lk.dispatches[0].metadata;
     const url = `${h.hostUrl}/webhook/voice-mode/livekit/agent/utterance`;
     expect((await post(url, { callId: meta.callId, text: 'hi' }, workerAuth(meta.callId))).status).toBe(409);
@@ -1249,7 +1251,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
         tts,
       }),
     });
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(200);
     expect(h.lk.dispatches[0].metadata).toMatchObject({
       sttModel: 'gemini-3.5-transcribe-live',
       tts,
@@ -1298,7 +1300,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     h.clock.now += 90_000;
     await post(`${h.base}/livekit/end?t=tok123`, { callId: first.call.callId });
     // 30 s of the day left: the next call is capped there by a host-side timer.
-    const res = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    const res = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(res.status).toBe(200);
     expect(h.lk.dispatches.at(-1)!.metadata.maxDurationMs).toBe(30_000);
     expect(((await res.json()) as TokenResponse).limit).toEqual({ ms: 30_000, kind: 'daily' });
@@ -1307,7 +1309,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     h.clock.now += 30_000;
     await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId });
     // The day's minutes are gone.
-    const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    const refused = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(refused.status).toBe(429);
   });
 
@@ -1324,9 +1326,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('refuses starts over the hourly cap with a retry time', async () => {
     await h.stop();
     h = await startHarness({ maxCallsPerHour: 2 });
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
-    const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(200);
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(200);
+    const refused = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(refused.status).toBe(429);
     expect(refused.headers.get('retry-after')).toBeTruthy();
   });
@@ -1334,11 +1336,11 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('deletes the room of a call that was replaced while it was connecting', async () => {
     let release!: () => void;
     h.lk.createGate = new Promise((r) => (release = r));
-    const first = post(`${h.base}/livekit/token?v=6&t=tok123`);
+    const first = post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     await settle();
     // A newer call takes the line while the room is still being created.
     h.lk.createGate = null;
-    const second = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    const second = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(second.status).toBe(200);
     release();
     expect((await first).status).toBe(409);
@@ -1357,9 +1359,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       return sign.call(this);
     });
     try {
-      const first = post(`${h.base}/livekit/token?v=6&t=tok123`);
+      const first = post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
       await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
-      const second = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+      const second = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
       expect(second.status).toBe(200);
       release();
       const answer = await first;
@@ -1376,7 +1378,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     let release!: () => void;
     h.lk.createGate = new Promise((r) => (release = r));
     const controller = new AbortController();
-    const pending = fetch(`${h.base}/livekit/token?v=6&t=tok123`, { method: 'POST', signal: controller.signal });
+    const pending = fetch(`${h.base}/livekit/token?v=6&t=tok123&jev=0`, { method: 'POST', signal: controller.signal });
     await settle();
     controller.abort();
     await expect(pending).rejects.toThrow();
@@ -1391,10 +1393,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('teardown awaits the delete of a room replaced while connecting', async () => {
     let release!: () => void;
     h.lk.createGate = new Promise((r) => (release = r));
-    const first = post(`${h.base}/livekit/token?v=6&t=tok123`);
+    const first = post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     await settle();
     h.lk.createGate = null;
-    const second = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    const second = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(second.status).toBe(200);
     let releaseDelete!: () => void;
     const deleteGate = new Promise<void>((r) => (releaseDelete = r));
@@ -1423,7 +1425,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
         workerStreamTimeoutMs: 100,
       },
     );
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(200);
     const meta = h.lk.dispatches[0].metadata;
     const joined = await post(
       `${h.hostUrl}/webhook/voice-mode/livekit/agent/joined`,
@@ -1440,7 +1442,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     h = await startHarness({ maxCallMsPerDay: 2 * MIN });
     const { worker } = await startCall(h);
     h.clock.now += 2 * MIN;
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(429);
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(429);
     await settle();
     expect(h.lk.deleted).toEqual([]);
     expect(worker.events.some((e) => e.type === 'end')).toBe(false);
@@ -1745,7 +1747,7 @@ describe('livekit call talking in the agent chat', () => {
     const fake = await start([{ platform_id: 'telegram:100' }, denied]);
     for (const group of [gone, denied]) {
       fake.state.bound = { group, threadId: null };
-      const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+      const refused = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
       expect(refused.status).toBe(409);
       expect(await refused.json()).toMatchObject({ error: 'no-chat' });
     }
@@ -1840,7 +1842,7 @@ describe('livekit call talking in the agent chat', () => {
       },
       { mirrorApi: fake.api },
     );
-    const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+    const refused = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(refused.status).toBe(409);
     expect(refused.headers.get('content-type')).toContain('application/json');
     // The page names the cause by `error`, not by a status it shares with a replaced attempt.
@@ -1877,7 +1879,7 @@ describe('livekit call talking in the agent chat', () => {
         { lineForToken: async (token) => (token === 'tok123' ? LINE : null) },
         { mirrorApi: fake.api },
       );
-      const refused = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+      const refused = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
       expect(refused.status).toBe(409);
       expect(await refused.json()).toMatchObject({ error: 'no-chat' });
       expect(h.lk.rooms).toEqual([]);
@@ -1984,10 +1986,6 @@ describe('meetings: the /meet call kind on the call core', () => {
   let h: Harness;
   let chat: ReturnType<typeof fakeMirror>;
   let bots: { joined: Array<Parameters<RecallMeetBridge['join']>[0]>; left: string[]; fail: boolean };
-  /** Jev's answers: whether it wakes the agent, and every state and name it was asked about. */
-  let jev: { wake: boolean; asked: Array<{ state: string; name: string }> };
-  /** While set, Jev answers only once it settles. */
-  const judge: { gate: Promise<void> | null } = { gate: null };
 
   beforeEach(async () => {
     bots = { joined: [], left: [], fail: false };
@@ -2002,40 +2000,15 @@ describe('meetings: the /meet call kind on the call core', () => {
     chat = fakeMirror([{ platform_id: 'telegram:100' }], {
       bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
     });
-    jev = { wake: false, asked: [] };
-    judge.gate = null;
-    const judgeJev = async (state: string, name: string) => {
-      jev.asked.push({ state, name });
-      await judge.gate;
-      const high = jev.wake ? 0.9 : 0;
-      return {
-        ok: true as const,
-        scores: { direct_invitation: high, unresolved: high, already_answered: 0, human_pingpong: 0 },
-      };
-    };
-    h = await startHarness({ accessCheckIntervalMs: 50, meetBridge, judgeJev }, { mirrorApi: chat.api });
+    h = await startHarness({ accessCheckIntervalMs: 50, meetBridge }, { mirrorApi: chat.api });
   });
   afterEach(async () => {
     await h.stop();
   });
 
-  /** The agent's message reached the call chat. */
-  const delivered = (platformId: string, text: string) =>
-    liveKitChatDelivered(
-      {
-        id: `out-${text.length}`,
-        kind: 'chat',
-        content: JSON.stringify({ text }),
-        channelType: 'telegram',
-        platformId,
-        threadId: null,
-      },
-      'ag-andy',
-    );
-
   /** Starts a meeting on the line and attaches its worker, the bridge page in the room. */
-  async function startMeeting(jevOn = false): Promise<FakeWorker> {
-    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: jevOn })).toEqual({ ok: true });
+  async function startMeeting(): Promise<FakeWorker> {
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false })).toEqual({ ok: true });
     const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
     expect((await worker.post('joined')).status).toBe(200);
     return worker;
@@ -2057,10 +2030,11 @@ describe('meetings: the /meet call kind on the call core', () => {
     expect(h.lk.roomOptions).toEqual([{ name: room, emptyTimeout: 600, departureTimeout: 10, maxParticipants: 3 }]);
     expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({
       callerIdentity: `meet-bridge-${room}`,
-      meeting: { pauseSends: false, jev: false },
+      meeting: { pauseSends: false },
       joinTimeoutMs: 10 * MIN,
       maxDurationMs: MEETING_MAX_DURATION_MS,
     });
+    expect(h.lk.dispatches.at(-1)!.metadata).not.toHaveProperty('jev');
     expect(bots.joined).toEqual([{ meetingUrl: MEET, botName: 'Andy', roomName: room }]);
   });
 
@@ -2084,7 +2058,7 @@ describe('meetings: the /meet call kind on the call core', () => {
 
   it('tells the worker a `pause` meeting sends on the pause', async () => {
     expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: true, jev: false })).toEqual({ ok: true });
-    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: true, jev: false });
+    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: true });
   });
 
   it('routes meeting turns as guest turns with the meeting note, and says in the chat when it joined', async () => {
@@ -2130,81 +2104,6 @@ describe('meetings: the /meet call kind on the call core', () => {
     expect(h.adapter.meetings!.leave(LINE)).toBe(false);
   });
 
-  it('a jev meeting lets a candidate through only when Jev wakes the agent, judged against the meeting so far', async () => {
-    const worker = await startMeeting(true);
-    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: false, jev: true });
-    const candidate = (text: string) => worker.post('utterance', { text, candidate: true, wakeName: 'Dan\u202e' });
-
-    const kept = await candidate('Does anyone know when the release ships?');
-    expect(kept.status).toBe(200);
-    expect(await kept.text()).toBe('Not a turn: the call kept the agent out of it');
-    expect(h.events).toHaveLength(0);
-    // An addressed turn is never judged, and is part of what the next candidate is judged against.
-    await worker.utter('what is two plus two');
-    expect(jev.asked).toHaveLength(1);
-    delivered('telegram:100', 'Four.');
-
-    jev.wake = true;
-    const taken = await candidate('Dan, can you check the release date?');
-    expect(taken.status).toBe(202);
-    expect(h.events).toHaveLength(2);
-    expect(h.inbound.at(-1)!.content).toMatchObject({ sender: 'Meeting' });
-    const { state, name } = jev.asked.at(-1)!;
-    expect(name).toBe('Dan');
-    for (const line of ['Does anyone know when the release ships?', 'what is two plus two', 'Four.']) {
-      expect(state).toContain(line);
-    }
-    expect(state).toContain('Dan, can you check the release date?');
-  });
-
-  it('counts candidates toward the per-minute limit, short of the slots kept for addressed turns', async () => {
-    const worker = await startMeeting(true);
-    for (let i = 0; i < 15; i++) {
-      expect((await worker.post('utterance', { text: `chatter ${i}`, candidate: true })).status).toBe(200);
-    }
-    expect((await worker.post('utterance', { text: 'chatter 15', candidate: true })).status).toBe(429);
-    expect(h.events).toHaveLength(0);
-    for (let i = 0; i < 5; i++) expect((await worker.post('utterance', { text: `turn ${i}` })).status).toBe(202);
-    expect((await worker.post('utterance', { text: 'one too many' })).status).toBe(429);
-  });
-
-  it("refuses a candidate that would take the last in-flight slot, which stays an addressed turn's", async () => {
-    const worker = await startMeeting(true);
-    h.routing.mode = 'hang';
-    const first = worker.post('utterance', { text: 'first turn' });
-    const second = worker.post('utterance', { text: 'second turn' });
-    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(2));
-    expect((await worker.post('utterance', { text: 'chatter', candidate: true })).status).toBe(429);
-    expect(jev.asked).toHaveLength(0);
-    const third = worker.post('utterance', { text: 'third turn' });
-    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(3));
-    for (const hung of h.routing.hung.splice(0)) hung(true);
-    expect((await Promise.all([first, second, third])).map((r) => r.status)).toEqual([202, 202, 202]);
-  });
-
-  it('refuses a candidate as it would a turn when the call cannot take one, before judging it', async () => {
-    const worker = await startMeeting(true);
-    h.access.enabled = false;
-    expect((await worker.post('utterance', { text: 'chatter', candidate: true })).status).toBe(403);
-    expect(jev.asked).toHaveLength(0);
-  });
-
-  it('keeps a candidate in the transcript where it was said, even when a reply came while it was judged', async () => {
-    const worker = await startMeeting(true);
-    let release!: () => void;
-    const judging = new Promise<void>((r) => (release = r));
-    judge.gate = judging;
-    const first = worker.post('utterance', { text: 'Does anyone know when the release ships?', candidate: true });
-    await vi.waitFor(() => expect(jev.asked).toHaveLength(1));
-    delivered('telegram:100', 'Four.');
-    release();
-    expect((await first).status).toBe(200);
-    judge.gate = null;
-    await worker.post('utterance', { text: 'And the one after?', candidate: true });
-    const { state } = jev.asked.at(-1)!;
-    expect(state.indexOf('Does anyone know when the release ships?')).toBeLessThan(state.indexOf('Four.'));
-  });
-
   it('teardown waits on a bot that will not leave only so long', async () => {
     const stuck = await startHarness(
       {
@@ -2217,13 +2116,270 @@ describe('meetings: the /meet call kind on the call core', () => {
     await stuck.stop();
     expect(Date.now() - started).toBeLessThan(2000);
   });
+});
 
-  it('takes no candidates on a call without a judge', async () => {
-    const { worker } = await startCall(h);
-    const res = await worker.post('utterance', { text: 'just chatting', candidate: true });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe('Not a turn: this call takes no candidates');
-    expect(h.events).toHaveLength(0);
+describe("/meet <link> jev: the loop on each participant's own audio", () => {
+  const MEET = 'https://meet.google.com/abc-defg-hij';
+  let h: Harness;
+  let bots: Array<Parameters<RecallMeetBridge['join']>[0]>;
+  /** What the bot create does before it answers; Recall may stream events by then. */
+  let beforeCreate: (options: Parameters<RecallMeetBridge['join']>[0]) => Promise<void>;
+  let seen: CallEvent[];
+  const sockets: WebSocket[] = [];
+  /** The participants' fake VADs and transcriptions, in the order their pipelines opened. */
+  let vads: Array<{ onSpeech(speaking: boolean, position: number): void; pushed: number; closed: boolean }>;
+  let stts: Array<{ options: TranscriberOptions; final: string; closed: boolean }>;
+  let policies: CallPolicy[];
+
+  /** A final utterance is a turn; a reply is spoken. */
+  const meetCore: CallCore<null> = {
+    initial: (policy) => (policies.push(policy), null),
+    reduce: (state, event) => (seen.push(event), state),
+    decide: (_state, event): Command[] => {
+      if (event.kind === 'utterance' && event.final) {
+        return [{ kind: 'turn', key: event.uttId, message: event.text, note: `WINDOW [${event.speaker.name}]` }];
+      }
+      return event.kind === 'reply' ? [{ kind: 'speak', replyId: event.replyId, text: event.text }] : [];
+    },
+  };
+
+  beforeEach(async () => {
+    seen = [];
+    bots = [];
+    vads = [];
+    stts = [];
+    policies = [];
+    beforeCreate = async () => undefined;
+    const chat = fakeMirror([{ platform_id: 'telegram:100' }], {
+      bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
+    });
+    const meetBridge: RecallMeetBridge = {
+      join: async (options) => {
+        bots.push(options);
+        await beforeCreate(options);
+        return { botId: `bot-${bots.length}` };
+      },
+      leave: async () => undefined,
+    };
+    h = await startHarness(
+      {
+        accessCheckIntervalMs: 60_000,
+        meetBridge,
+        providerKeys: { gemini: 'gemini-test-key' },
+        meetAudio: {
+          detectors: async () => (events) => {
+            const vad = { onSpeech: events.onSpeech, pushed: 0, closed: false };
+            vads.push(vad);
+            return { push: (pcm) => void (vad.pushed += pcm.length), close: () => void (vad.closed = true) };
+          },
+          transcriber: (options) => {
+            const stt = { options, final: '', closed: false };
+            stts.push(stt);
+            return {
+              prepare: async () => true,
+              begin: () => undefined,
+              push: () => undefined,
+              end: async () => ({ final: stt.final, interim: '', finals: 1, failed: false, finalizeMs: 0 }),
+              close: () => void (stt.closed = true),
+            };
+          },
+        },
+      },
+      {
+        mirrorApi: chat.api,
+        wakeName: 'Dan',
+        jev: { core: meetCore, judge: async () => ({ verdict: null, ms: 0 }) },
+      },
+    );
+  });
+  afterEach(async () => {
+    for (const ws of sockets.splice(0)) ws.terminate();
+    await h.stop();
+  });
+
+  const ALEX = { id: 100, name: 'Alex', is_host: true, platform: 'google_meet', extra_data: {}, email: null };
+  const BOT = { ...ALEX, id: 300, name: 'Andy', is_host: false };
+  const recordingStart = Date.now() - 60_000;
+  const envelope = (event: string, data: Record<string, unknown>) => ({
+    event,
+    data: { data, realtime_endpoint: { id: 're-1', metadata: {} }, bot: { id: 'bot-1', metadata: {} } },
+  });
+  const stamp = (relative: number) => ({
+    absolute: new Date(recordingStart + relative * 1000).toISOString(),
+    relative,
+  });
+  const frame = (p: typeof ALEX, relative: number) =>
+    envelope('audio_separate_raw.data', {
+      buffer: Buffer.from(new Int16Array(320).fill(500).buffer).toString('base64'),
+      timestamp: stamp(relative),
+      participant: p,
+    });
+  const chatLine = (p: typeof ALEX, text: string) =>
+    envelope('participant_events.chat_message', {
+      participant: p,
+      timestamp: stamp(0.5),
+      data: { text, to: 'everyone' },
+    });
+
+  const connect = (url: string) =>
+    new Promise<WebSocket>((resolve, reject) => {
+      const ws = new WebSocket(url);
+      sockets.push(ws);
+      ws.once('open', () => resolve(ws));
+      ws.once('unexpected-response', (_req, res) => reject(new Error(`refused with ${res.statusCode}`)));
+      ws.once('error', reject);
+    });
+
+  async function startJevMeeting(): Promise<{ worker: FakeWorker; recall: WebSocket; url: string }> {
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
+    const url = bots.at(-1)!.participantAudio!.websocketUrl;
+    const recall = await connect(url);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    expect((await worker.post('joined')).status).toBe(200);
+    return { worker, recall, url };
+  }
+
+  it('forwards human joins and leaves to the core, excluding the bot', async () => {
+    const { recall } = await startJevMeeting();
+    for (const participant of [ALEX, BOT]) {
+      recall.send(JSON.stringify(envelope('participant_events.join', { participant, timestamp: stamp(0) })));
+      recall.send(JSON.stringify(envelope('participant_events.leave', { participant, timestamp: stamp(1) })));
+    }
+    recall.send(JSON.stringify(chatLine(ALEX, 'done')));
+    await vi.waitFor(() => expect(seen.some((event) => event.kind === 'chat')).toBe(true));
+    expect(seen.filter((event) => event.kind === 'presence')).toEqual([
+      { kind: 'presence', speaker: { id: '100', name: 'Alex' }, joined: true, at: recordingStart },
+      { kind: 'presence', speaker: { id: '100', name: 'Alex' }, joined: false, at: recordingStart + 1000 },
+    ]);
+  });
+
+  /** Alex says `text`: their frames open a pipeline, and its VAD and transcription hear it. */
+  async function alexSays(recall: WebSocket, text: string, interim = text) {
+    recall.send(JSON.stringify(frame(ALEX, 1)));
+    await vi.waitFor(() => expect(vads.length).toBeGreaterThan(0));
+    const vad = vads.at(-1)!;
+    const stt = stts.at(-1)!;
+    vad.onSpeech(true, 0);
+    stt.options.onInterim(interim);
+    stt.final = text;
+    vad.onSpeech(false, 320);
+  }
+
+  const turnEvent = (key: string) =>
+    vi.waitFor(() => {
+      const hit = seen.find((e) => (e.kind === 'turn' || e.kind === 'turn_failed') && e.key === key);
+      if (!hit) throw new Error(`no turn event for ${key}`);
+      return hit;
+    });
+
+  it("runs the jev loop for the meeting: jev and the meeting in the job, the participants' audio endpoint on the bot create", async () => {
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
+    const meta = h.lk.dispatches.at(-1)!.metadata;
+    expect(meta).toMatchObject({ jev: true, meeting: { pauseSends: false } });
+    // The meeting's people call it by the wake phrase's name; the line's agent name is an alias, and the bot keeps it.
+    expect(policies).toEqual([
+      expect.objectContaining({ kind: 'meet', agentName: 'Dan', agentAliases: ['Andy', 'Енді'] }),
+    ]);
+    expect(bots).toHaveLength(1);
+    const { participantAudio, ...rest } = bots[0];
+    expect(rest).toEqual({ meetingUrl: MEET, botName: 'Andy', roomName: h.lk.rooms[0] });
+    expect(participantAudio?.websocketUrl).toMatch(
+      new RegExp(`^ws://127\\.0\\.0\\.1:\\d+/voice/recall/${meta.callId}/\\?token=[A-Za-z0-9_-]{43}$`),
+    );
+  });
+
+  it('takes the Recall socket before the bot create answers, its events only once the call is live', async () => {
+    let recall: WebSocket | undefined;
+    const info = vi.spyOn(log, 'info');
+    beforeCreate = async ({ participantAudio }) => {
+      recall = await connect(participantAudio!.websocketUrl);
+      // The chat line is logged once handled; the frame before it was handled by then too.
+      recall.send(JSON.stringify(frame(ALEX, 1)));
+      recall.send(JSON.stringify(chatLine(ALEX, 'before the caller joined')));
+      await vi.waitFor(() =>
+        expect(info).toHaveBeenCalledWith(
+          'meet-jev recall: event',
+          expect.objectContaining({ event: 'participant_events.chat_message' }),
+        ),
+      );
+    };
+    try {
+      expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
+    } finally {
+      info.mockRestore();
+    }
+    expect(seen).toEqual([]);
+    // Nor is anything transcribed before the call is live.
+    expect(vads).toHaveLength(0);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    expect((await worker.post('joined')).status).toBe(200);
+    recall!.send(JSON.stringify(chatLine(ALEX, 'hello all')));
+    await vi.waitFor(() => expect(seen.filter((e) => e.kind === 'chat')).toHaveLength(1));
+    expect(seen.find((e) => e.kind === 'chat')).toMatchObject({
+      speaker: { id: '100', name: 'Alex' },
+      text: 'hello all',
+    });
+  });
+
+  it("transcribes each participant with the call's speech settings, never the bot; a wake is a guest turn with the meeting note", async () => {
+    const { worker, recall } = await startJevMeeting();
+    recall.send(JSON.stringify(frame(BOT, 0.5)));
+    await worker.post('jev', {
+      events: [
+        { type: 'speech', on: true, at: Date.now() },
+        { type: 'utterance', uttId: 'w1', text: 'the worker heard this', final: true, at: Date.now() },
+      ],
+    });
+    await alexSays(recall, 'Andy, what is two plus two?', 'Andy, what is');
+    const turn = await turnEvent('100-0');
+    expect(turn).toMatchObject({ kind: 'turn', turnId: '1' });
+    expect(vads).toHaveLength(1);
+    expect(stts[0].options).toMatchObject({
+      apiKey: 'gemini-test-key',
+      model: worker.meta.sttModel,
+      languageCodes: worker.meta.languages,
+    });
+    expect(seen.map((e) => e.kind)).toEqual(['speech', 'utterance', 'speech', 'utterance', 'turn']);
+    expect(seen.filter((e) => 'speaker' in e).every((e) => 'speaker' in e && e.speaker.name === 'Alex')).toBe(true);
+    const content = h.inbound.at(-1)!.content as Record<string, unknown>;
+    expect(content).toMatchObject({ sender: 'Meeting' });
+    expect(content).not.toHaveProperty('senderId');
+    const text = content.text as string;
+    expect(text.startsWith('<voice source="livekit">Andy, what is two plus two?</voice>\n')).toBe(true);
+    expect(text).toContain('Spoken in a live Google Meet you joined as a voice participant;');
+    expect(text).toContain('read aloud into the meeting word for word unless the conversation has moved on');
+    expect(text).not.toContain('every message you send to this chat is read aloud');
+    expect(text).toContain('WINDOW [Alex]');
+    expect(text).toContain(CALL_LANGUAGE_NOTE);
+    worker.close();
+  });
+
+  it("tells the worker a participant's words came only while the agent's line plays", async () => {
+    const { worker, recall } = await startJevMeeting();
+    const words = () => worker.events.filter((e) => e.type === 'words').length;
+    await alexSays(recall, 'so anyway');
+    await vi.waitFor(() => expect(seen.filter((e) => e.kind === 'utterance')).toHaveLength(2));
+    await worker.post('jev', { events: [{ type: 'playback', replyId: 'r1', state: 'started', at: Date.now() }] });
+    await alexSays(recall, 'wait, Andy');
+    await worker.waitFor((e) => e.type === 'words');
+    await worker.post('jev', { events: [{ type: 'playback', replyId: 'r1', state: 'completed', at: Date.now() }] });
+    await alexSays(recall, 'never mind');
+    await vi.waitFor(() => expect(seen.filter((e) => e.kind === 'utterance')).toHaveLength(6));
+    await settle();
+    expect(words()).toBe(1);
+    worker.close();
+  });
+
+  it("closes the call's Recall endpoint and its participants' pipelines when the meeting ends", async () => {
+    const { worker, recall, url } = await startJevMeeting();
+    recall.send(JSON.stringify(frame(ALEX, 1)));
+    await vi.waitFor(() => expect(vads).toHaveLength(1));
+    const closed = new Promise<number>((resolve) => recall.once('close', resolve));
+    expect(h.adapter.meetings!.leave(LINE)).toBe(true);
+    expect(await closed).toBe(1000);
+    expect(vads[0].closed && stts[0].closed).toBe(true);
+    await expect(connect(url)).rejects.toThrow('refused with 401');
+    worker.close();
   });
 });
 
@@ -2304,13 +2460,15 @@ describe('/voice jev on the call core', () => {
       return hit;
     });
 
-  it('puts jev in the job only when asked; a plain call has none', async () => {
-    const plain = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+  it('runs jev by default; jev=0 makes a plain call, which has none in its job', async () => {
+    const plain = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(plain.status).toBe(200);
     expect(h.lk.dispatches.at(-1)!.metadata).not.toHaveProperty('jev');
     const worker = await startJevCall();
     expect(worker.meta.jev).toBe(true);
     worker.close();
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
+    expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({ jev: true });
   });
 
   it('starts a plain call for jev=1 on a host without the Jev key', async () => {
@@ -2545,7 +2703,7 @@ describe('/voice jev with the real core', () => {
     await h.stop();
   });
 
-  it('wakes on the vocative, speaks the answer, takes the playback into the window, and judges the next words', async () => {
+  it('judges the vocative, speaks the answer, takes the playback into the window, and judges the next words', async () => {
     expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
     const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
     expect((await worker.post('joined')).status).toBe(200);
@@ -2562,7 +2720,8 @@ describe('/voice jev with the real core', () => {
     expect(text.startsWith('<voice source="livekit">Andy, what time is it?</voice>\n')).toBe(true);
     expect(text).toContain('You are on a live voice call');
     await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['\u{1F399} Andy, what time is it?']));
-    expect(asked).toEqual([]);
+    expect(asked).toHaveLength(1);
+    expect(asked[0].facts.addressed_by_name).toBe(true);
 
     liveKitChatDelivered(
       {
@@ -2592,8 +2751,8 @@ describe('/voice jev with the real core', () => {
     await vi.waitFor(() => expect(h.inbound).toHaveLength(2));
     await settle();
     expect(h.inbound).toHaveLength(2);
-    expect(asked).toHaveLength(1);
-    expect(asked[0].window).toEqual(
+    expect(asked).toHaveLength(2);
+    expect(asked[1].window).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ text: 'It is nine.', agent: true }),
         expect.objectContaining({ speaker: 'Ethan', text: 'And tomorrow?' }),

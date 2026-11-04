@@ -39,6 +39,11 @@ export interface RecallMeetConfig {
   pageUrl: string;
   /** Public wss URL of LiveKit, reachable from Recall's cloud (not nanoclaw's internal one). */
   livekitUrl: string;
+  /**
+   * Public `wss://` origin a jev meeting's bot streams each participant's audio to (`/voice/recall/...`
+   * on the host's webhook server behind it). MEET_RECALL_AUDIO_URL, by default the bridge page's host.
+   */
+  audioOrigin: string;
   livekitApiKey: string;
   livekitApiSecret: string;
   /** Test seams. */
@@ -47,10 +52,37 @@ export interface RecallMeetConfig {
   resweepDelayMs?: number;
 }
 
+/**
+ * The real-time events a jev meeting's websocket takes: each participant's audio, speaker turns,
+ * presence, chat (names per https://docs.recall.ai/docs/real-time-websocket-endpoints#event-types).
+ */
+export const RECALL_JEV_EVENTS = [
+  'audio_separate_raw.data',
+  'participant_events.speech_on',
+  'participant_events.speech_off',
+  'participant_events.join',
+  'participant_events.leave',
+  'participant_events.chat_message',
+] as const;
+
+/** A jev meeting's audio: Recall streams each participant's own audio to `websocketUrl`; the host transcribes it. */
+export interface RecallParticipantAudio {
+  /** `wss://` with a `/` before the query, as Recall requires (`.../<callId>/?token=...`). */
+  websocketUrl: string;
+}
+
 /** The Recall bots of `/meet` calls; faked in tests. */
 export interface RecallMeetBridge {
-  /** Sends a bot named `botName` to `meetingUrl`, its bridge page joining `roomName`. */
-  join(options: { meetingUrl: string; botName: string; roomName: string }): Promise<{ botId: string }>;
+  /**
+   * Sends a bot named `botName` to `meetingUrl`, its bridge page joining `roomName`; with
+   * `participantAudio` (jev meetings only) the bot also streams each participant's audio in real time.
+   */
+  join(options: {
+    meetingUrl: string;
+    botName: string;
+    roomName: string;
+    participantAudio?: RecallParticipantAudio;
+  }): Promise<{ botId: string }>;
   /** Makes the bot leave its meeting, retried; never rejects (a final failure is logged). */
   leave(botId: string): Promise<void>;
 }
@@ -109,6 +141,29 @@ function retryAfterMs(header: string | null): number | null {
   if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
   const at = Date.parse(header);
   return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
+}
+
+/**
+ * The bot's recording config, always with Zero Data Retention (`retention: null`,
+ * https://docs.recall.ai/docs/zero-data-retention): left out, Recall keeps the recording media (participant
+ * events included) indefinitely, and nothing here reads it back. Without participant audio: no artifact
+ * at all (the mixed mp4 is on by default). With it: each participant's raw audio on one websocket
+ * (https://docs.recall.ai/docs/how-to-get-separate-audio-per-participant-realtime), no Recall transcript.
+ */
+function botRecordingConfig(participantAudio?: RecallParticipantAudio): Record<string, unknown> {
+  if (!participantAudio) return { video_mixed_mp4: null, retention: null };
+  assertUrl('the participant audio websocket URL', participantAudio.websocketUrl, 'wss:');
+  const url = new URL(participantAudio.websocketUrl);
+  // https://docs.recall.ai/docs/real-time-websocket-endpoints#verification: Recall answers 400 otherwise.
+  if (url.search && !url.pathname.endsWith('/')) {
+    throw new Error('meet-recall: the participant audio websocket URL needs a / before its query');
+  }
+  return {
+    video_mixed_mp4: null,
+    audio_separate_raw: {},
+    retention: null,
+    realtime_endpoints: [{ type: 'websocket', url: participantAudio.websocketUrl, events: [...RECALL_JEV_EVENTS] }],
+  };
 }
 
 /** A leave Recall refused because the bot is not in a call any more (it left on its own, or never got in). */
@@ -202,7 +257,8 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
   }
 
   return {
-    async join({ meetingUrl, botName, roomName }) {
+    async join({ meetingUrl, botName, roomName, participantAudio }) {
+      const recordingConfig = botRecordingConfig(participantAudio);
       const token = await mintBridgeToken(config, roomName);
       const pageUrl = buildBridgePageUrl(config.pageUrl, { livekitUrl: config.livekitUrl, token, name: botName });
       let bot: unknown;
@@ -213,8 +269,7 @@ export function createRecallMeetBridge(config: RecallMeetConfig): RecallMeetBrid
           metadata: { [ROOM_METADATA_KEY]: roomName },
           output_media: { camera: { kind: 'webpage', config: { url: pageUrl } } },
           variant: { google_meet: 'web_4_core', zoom: 'web_4_core', microsoft_teams: 'web_4_core' },
-          // The mixed mp4 is on by default; nothing here needs a recording or a transcript.
-          recording_config: { video_mixed_mp4: null },
+          recording_config: recordingConfig,
           // Default is 1h; a bot without a recording artifact may count as "not recording".
           automatic_leave: { in_call_not_recording_timeout: BOT_NOT_RECORDING_TIMEOUT_SECONDS },
         });
@@ -240,6 +295,7 @@ export const RECALL_MEET_ENV_KEYS = [
   'RECALL_REGION',
   'MEET_RECALL_PAGE_URL',
   'MEET_RECALL_LIVEKIT_URL',
+  'MEET_RECALL_AUDIO_URL',
 ] as const;
 
 /** The client's settings, or null when RECALL_API_KEY is unset (`/meet` is off); throws naming what else is missing. */
@@ -253,11 +309,14 @@ export function recallMeetConfigFromEnv(
     const missing = [!pageUrl && 'MEET_RECALL_PAGE_URL', !livekitUrl && 'MEET_RECALL_LIVEKIT_URL'].filter(Boolean);
     throw new Error(`meet-recall: missing ${missing.join(', ')}`);
   }
+  const audioUrl = env.MEET_RECALL_AUDIO_URL || pageUrl.replace(/^https:/, 'wss:');
+  assertUrl('MEET_RECALL_AUDIO_URL', audioUrl, 'wss:');
   return {
     recallApiKey,
     region: (env.RECALL_REGION || DEFAULT_REGION) as RecallRegion,
     pageUrl,
     livekitUrl,
+    audioOrigin: new URL(audioUrl).origin,
     livekitApiKey: livekit.apiKey,
     livekitApiSecret: livekit.apiSecret,
   };
