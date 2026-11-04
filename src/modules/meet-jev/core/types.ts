@@ -93,11 +93,16 @@ export interface JevLine {
   partial?: true;
 }
 
-/** The JSON `state` of the Jev request: the window, the facts and the policy paragraph. */
+/**
+ * The JSON `state` of the Jev request: the utterance to decide on, the window, the facts and the
+ * policy paragraph. `latest` is named apart from the window: with the window alone, Jev 1.14 judges a
+ * question after earlier lines as if those lines were what it decides on.
+ */
 export interface JevState {
   policy: string;
   agent_name: string;
   participants: string[];
+  latest: { speaker: string; text: string } | null;
   window: JevLine[];
   facts: {
     agent_speaking: boolean;

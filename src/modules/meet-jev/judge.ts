@@ -9,7 +9,7 @@ import { ACTIONS, type Action, type JevState, type Verdict } from './core/types.
 function actionQuestion(agent: string) {
   return {
     type: 'choice',
-    instructions: `A live call: \`window\` is what was said, oldest first (\`t\` = seconds ago; \`agent\` lines are what ${agent} said; \`cut_off\` marks where ${agent} was interrupted; \`partial\` lines are still being spoken). \`policy\` says when ${agent} speaks and \`facts\` what ${agent} is doing now. What should ${agent} do about the latest thing a person said?`,
+    instructions: `A live call. \`latest\` is the utterance just finished, the one to decide on; \`window\` is the conversation up to and including it, oldest first, for context (\`t\` = seconds ago; \`agent\` lines are what ${agent} said; \`cut_off\` marks where ${agent} was interrupted; \`partial\` lines are still being spoken). \`policy\` says when ${agent} speaks and \`facts\` what ${agent} is doing now. What should ${agent} do about \`latest\`?`,
     criteria: {
       answer: {
         what: `The latest utterance is for ${agent} and needs a reply now: it addresses ${agent} by name, or, as the policy allows, asks a question or makes a request that nobody else is taking up, and the speaker has finished the thought.`,

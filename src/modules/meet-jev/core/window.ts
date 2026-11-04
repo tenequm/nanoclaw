@@ -287,12 +287,13 @@ function lines(state: CallState): Line[] {
 const secondsAgo = (state: CallState, at: number): number => Math.round((state.now - at) / 100) / 10;
 
 /** The JSON `state` of a Jev request: the window as of the newest event, the facts and the policy. */
-export function toJevState(state: CallState): JevState {
+export function toJevState(state: CallState, latest: JevState['latest'] = null): JevState {
   const participants = [...new Set(Object.values(state.speakers).map((s) => s.name))];
   return {
     policy: state.policy.paragraph,
     agent_name: state.policy.agentName,
     participants,
+    latest,
     window: lines(state).map(({ at, ...line }): JevLine => ({ t: secondsAgo(state, at), ...line })),
     facts: {
       agent_speaking: agentSpeaking(state),

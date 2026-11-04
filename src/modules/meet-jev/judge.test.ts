@@ -26,6 +26,7 @@ const state: JevState = {
   policy: 'Dan answers the caller.',
   agent_name: 'Dan',
   participants: ['Misha'],
+  latest: { speaker: 'Misha', text: 'Dan, what time is it?' },
   window: [{ t: 0.4, speaker: 'Misha', text: 'Dan, what time is it?' }],
   facts: { agent_speaking: false, pending_answer: false, cut_off_after: null, agent_last_spoke_s_ago: null },
 };

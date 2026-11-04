@@ -141,7 +141,8 @@ function boundary(state: CallState, speakerId: string): void {
 
 function judge(state: CallState, speakerId: string, trigger: string, retried: boolean): void {
   state.judging = { version: state.windowVersion, speakerId, trigger, seq: state.seq, retried };
-  state.commands.push({ kind: 'judge', windowVersion: state.windowVersion, state: toJevState(state) });
+  const latest = { speaker: state.speakers[speakerId]?.name ?? speakerId, text: trigger };
+  state.commands.push({ kind: 'judge', windowVersion: state.windowVersion, state: toJevState(state, latest) });
 }
 
 function onVerdict(state: CallState, version: number, verdict: Verdict | null, ms: number): void {

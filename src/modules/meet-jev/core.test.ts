@@ -131,6 +131,7 @@ describe('a third-person mention', () => {
     expect(only(commands, 'turn')).toEqual([]);
     const [judge] = only(commands, 'judge');
     expect(judge.state.window.map((l) => l.speaker)).toEqual(['Olena', 'Misha']);
+    expect(judge.state.latest).toEqual({ speaker: 'Misha', text: expect.any(String) });
     expect(judge.state.participants).toEqual(['Olena', 'Misha']);
     expect(call.verdict(judge.windowVersion, 'stay_silent')).toEqual([]);
   });
