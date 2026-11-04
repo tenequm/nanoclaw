@@ -20,7 +20,7 @@ vi.mock('../../config.js', async () => {
 });
 
 import type { JevState } from './core/types.js';
-import { askAction, parseAction } from './judge.js';
+import { askAction, askStillWanted, parseAction, parseStillWanted } from './judge.js';
 
 const state: JevState = {
   policy: 'Dan answers the caller.',
@@ -28,7 +28,13 @@ const state: JevState = {
   participants: ['Misha'],
   latest: { speaker: 'Misha', text: 'Dan, what time is it?' },
   window: [{ t: 0.4, speaker: 'Misha', text: 'Dan, what time is it?' }],
-  facts: { agent_speaking: false, pending_answer: false, cut_off_after: null, agent_last_spoke_s_ago: null },
+  facts: {
+    agent_speaking: false,
+    pending_answer: false,
+    cut_off_after: null,
+    agent_last_spoke_s_ago: null,
+    addressed_by_name: true,
+  },
 };
 
 const choice = {
@@ -113,14 +119,57 @@ describe('parseAction', () => {
     expect(parseAction({ answers: { action: { ...choice, probabilities: undefined } } })).toBeNull();
   });
 
-  it('clamps probabilities and reads a missing option as 0', () => {
-    const verdict = parseAction({
-      answers: { action: { ...choice, confidence: 1.2, probabilities: { answer: 1.01, stay_silent: -0.01 } } },
-    });
-    expect(verdict).toEqual({
+  it('rejects a malformed distribution instead of clamping or defaulting it', () => {
+    const with_ = (action: Record<string, unknown>) => parseAction({ answers: { action: { ...choice, ...action } } });
+    expect(with_({ probabilities: { answer: 0.9, stay_silent: 0.1 } })).toBeNull();
+    expect(with_({ probabilities: { answer: 1.01, stay_silent: -0.01, stop: 0, continue: 0 } })).toBeNull();
+    expect(with_({ probabilities: { answer: 0.5, stay_silent: 0.1, stop: 0.1, continue: 0.1 } })).toBeNull();
+    expect(with_({ probabilities: { answer: 0.9, stay_silent: 0.5, stop: 0.1, continue: 0.1 } })).toBeNull();
+    expect(with_({ probabilities: { answer: '0.86', stay_silent: 0.1, stop: 0.03, continue: 0.01 } })).toBeNull();
+    expect(with_({ probabilities: { answer: Number.NaN, stay_silent: 0.1, stop: 0.03, continue: 0.01 } })).toBeNull();
+    expect(with_({ confidence: 1.2 })).toBeNull();
+    expect(with_({ confidence: -0.1 })).toBeNull();
+  });
+
+  it('takes a distribution that sums to 1 within rounding', () => {
+    const probabilities = { answer: 0.86, stay_silent: 0.1, stop: 0.03, continue: 0.02 };
+    expect(parseAction({ answers: { action: { ...choice, probabilities } } })).toEqual({
       action: 'answer',
-      probabilities: { answer: 1, stay_silent: 0, stop: 0, continue: 0 },
-      confidence: 1,
+      probabilities,
+      confidence: 0.72,
     });
+  });
+});
+
+describe('askStillWanted', () => {
+  const recheckState = {
+    ...state,
+    latest: undefined,
+    trigger: { speaker: 'Misha', text: 'Dan, what is the capital of Peru?' },
+    reply: 'Lima.',
+    since: [{ t: 1.2, speaker: 'Olena', text: 'It is Lima.' }],
+  };
+  const stillWanted = { type: 'choice', choice: 'show', confidence: 0.8, probabilities: { speak: 0.1, show: 0.9 } };
+
+  it('asks one Choice still_wanted over speak and show with the recheck state', async () => {
+    const fetchMock = respond({ answers: { still_wanted: stillWanted } });
+    const { verdict } = await askStillWanted(recheckState);
+    expect(verdict).toEqual({ action: 'show', probabilities: { speak: 0.1, show: 0.9 }, confidence: 0.8 });
+    const body = JSON.parse((fetchMock.mock.calls[0] as [string, { body: string }])[1].body);
+    expect(Object.keys(body.questions)).toEqual(['still_wanted']);
+    expect(Object.keys(body.questions.still_wanted.criteria).sort()).toEqual(['show', 'speak']);
+    expect(body.state).toMatchObject({ reply: 'Lima.', trigger: recheckState.trigger, since: recheckState.since });
+  });
+
+  it('is null on a failure or a malformed distribution', async () => {
+    respond({}, { ok: false, status: 503 });
+    expect((await askStillWanted(recheckState)).verdict).toBeNull();
+    expect(
+      parseStillWanted({ answers: { still_wanted: { ...stillWanted, probabilities: { show: 0.9 } } } }),
+    ).toBeNull();
+    expect(
+      parseStillWanted({ answers: { still_wanted: { ...stillWanted, probabilities: { speak: 0.5, show: 0.9 } } } }),
+    ).toBeNull();
+    expect(parseStillWanted({ answers: { action: stillWanted } })).toBeNull();
   });
 });

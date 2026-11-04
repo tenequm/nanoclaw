@@ -19,14 +19,21 @@ export interface Speaker {
 export type Action = 'answer' | 'stay_silent' | 'stop' | 'continue';
 export const ACTIONS: readonly Action[] = ['answer', 'stay_silent', 'stop', 'continue'];
 
-/** Jev's answer to the `action` Choice; null when the call failed or timed out (fail-silent). */
-export interface Verdict {
-  action: Action;
-  /** Probability of every option; sums to 1. */
-  probabilities: Record<Action, number>;
+/** Jev's answer to a Choice: the chosen option, every option's probability (sums to 1) and the confidence. */
+export interface Choice<A extends string> {
+  action: A;
+  probabilities: Record<A, number>;
   /** How concentrated `probabilities` is (Jev's `confidence`), not how likely it is right. */
   confidence: number;
 }
+
+/** Jev's answer to the `action` Choice; null when the call failed or timed out (fail-silent). */
+export type Verdict = Choice<Action>;
+
+/** Whether a landed answer is still wanted, asked when people spoke after its trigger. */
+export type RecheckAction = 'speak' | 'show';
+export const RECHECK_ACTIONS: readonly RecheckAction[] = ['speak', 'show'];
+export type RecheckVerdict = Choice<RecheckAction>;
 
 export type CallEvent =
   /** A participant's words: partials update the utterance, the final replaces it. */
@@ -37,6 +44,8 @@ export type CallEvent =
   | { kind: 'chat'; speaker: Speaker; text: string; at: number }
   /** The answer to a `judge` command, for the window version it was asked on. */
   | { kind: 'verdict'; windowVersion: number; verdict: Verdict | null; ms: number; at: number }
+  /** The answer to a `recheck` command for the wake's held replies; null when Jev failed (they are spoken). */
+  | { kind: 'recheck_verdict'; wakeKey: string; verdict: RecheckVerdict | null; ms: number; at: number }
   /** A `wait` command's timer fired. */
   | { kind: 'timer'; key: string; at: number }
   /** A `turn` command reached the agent's session; `turnId` is the host's utterance id for it. */
@@ -60,6 +69,8 @@ export type CallEvent =
 export type Command =
   /** Ask Jev about the window as of `windowVersion`; the answer comes back as a `verdict`. */
   | { kind: 'judge'; windowVersion: number; state: JevState }
+  /** Ask Jev whether the wake's landed answer is still wanted; the answer comes back as a `recheck_verdict`. */
+  | { kind: 'recheck'; wakeKey: string; state: RecheckState }
   /** Fire a `timer` event with `key` after `ms`; a new `wait` with the same key replaces it. */
   | { kind: 'wait'; key: string; ms: number }
   | { kind: 'cancel_wait'; key: string }
@@ -75,6 +86,11 @@ export type Command =
   | { kind: 'show'; replyId: string; text: string }
   /** Drop a reply: the agent answered `[silent]`. */
   | { kind: 'drop'; replyId: string }
+  /**
+   * Take back a `speak` whose line has not started: a newer wake replaced its turn. The worker drops
+   * it from its queue (reported `cut_off`, nothing delivered); a line already playing plays on.
+   */
+  | { kind: 'revoke'; replyId: string }
   /** Stop the line playing now and every line queued behind it. */
   | { kind: 'stop_playback' }
   /** One structured log line: every decision and every playback outcome. */
@@ -110,7 +126,19 @@ export interface JevState {
     /** What the agent had said when it was last cut off, while that is the latest thing it did. */
     cut_off_after: string | null;
     agent_last_spoke_s_ago: number | null;
+    /** `latest` opens or ends with the agent's name as a vocative ("Dan, ...", "..., Dan?"): addressed, not proof a reply is wanted. */
+    addressed_by_name: boolean;
   };
+}
+
+/**
+ * The JSON `state` of the answer-ready check: the window and facts as for `action`, the utterance the answer
+ * was asked for (`trigger`), the answer (`reply`), and what people said after the trigger (`since`).
+ */
+export interface RecheckState extends Omit<JevState, 'latest'> {
+  trigger: { speaker: string; text: string };
+  reply: string;
+  since: JevLine[];
 }
 
 /** Thresholds for acting on a verdict's chosen action. */
@@ -122,7 +150,7 @@ export interface ActionThreshold {
 /** Everything that differs between the two kinds; the core knows nothing else about them. */
 export interface CallPolicy {
   kind: CallKind;
-  /** The agent's name as people say it, for the vocative rule and the state. */
+  /** The agent's name as people say it, for the vocative fact, the stop rule and the state. */
   agentName: string;
   /** Other spellings or scripts of the name (voice.vocabulary.txt). */
   agentAliases: string[];
@@ -134,6 +162,8 @@ export interface CallPolicy {
   windowMs: number;
   windowBytes: number;
   thresholds: Record<Exclude<Action, 'stay_silent'>, ActionThreshold>;
+  /** A landed answer is shown instead of spoken only when the recheck says `show` over this. */
+  recheckShow: ActionThreshold;
 }
 
 /**
