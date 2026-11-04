@@ -12,7 +12,14 @@
  * private reply in the chat where the channel has one (Telegram's ephemeral messages), else their
  * direct chat. A known sender without the role is refused; an unknown sender or an unwired chat
  * gets nothing.
+ *
+ * The page call that link opens is here too (createCallPage): the `/voice` call kind of the call core
+ * and the page's `livekit`, `livekit/token` and `livekit/end` routes, which voice-mode.ts serves.
  */
+import type http from 'node:http';
+
+import { AccessToken, TrackSource } from 'livekit-server-sdk';
+
 import type { InboundEvent } from './adapter.js';
 import { getChannelAdapterExact } from './channel-registry.js';
 import { getAgentGroup } from '../db/agent-groups.js';
@@ -32,6 +39,18 @@ import {
   liveVoiceAdapter,
   messageText,
 } from './voice-mode-chat.js';
+import {
+  callChatReplyNote,
+  chatLabel,
+  JSON_HEADERS,
+  readJsonObject,
+  reply,
+  type CallKind,
+  type LiveKitVoice,
+  type LiveKitVoiceConfig,
+} from './voice-mode-livekit.js';
+import { callPageHtml, type VoiceModeUiConfig } from './voice-mode-page.js';
+import { LIVEKIT_PROTOCOL_VERSION } from './voice-mode-protocol.js';
 
 /** The call page URL for a token. */
 export type CallUrlFn = (token: string) => string;
@@ -319,3 +338,199 @@ async function sendDirect(userId: string, instance: string, text: string): Promi
 }
 
 registerMessageInterceptor((event) => handleVoiceCommand(event));
+
+/** How long the caller's page has to join the room after it got its token. */
+const CALL_JOIN_TIMEOUT_MS = 60_000;
+const CALLER_TOKEN_TTL_SECONDS = 120;
+/** The page's `livekit/end` body is a call id and a reason. */
+const MAX_END_BODY_BYTES = 1024;
+
+/** The 409 answer to a start on a line with no chat to talk in; the page tells it by `error`, not the status. */
+const NO_CHAT_REFUSAL = JSON.stringify({
+  error: 'no-chat',
+  message: 'This voice line has no chat to talk in. Run /voice in a chat with the agent.',
+});
+
+/**
+ * The 426 answer to a start from a client of another protocol version, before any room exists. Native
+ * clients match the status and the words "update your client".
+ */
+const PROTOCOL_REFUSAL = JSON.stringify({
+  error: 'protocol',
+  protocol: LIVEKIT_PROTOCOL_VERSION,
+  message: `The voice service is updating. Reload the page or update your client to protocol ${LIVEKIT_PROTOCOL_VERSION}.`,
+});
+
+/** The `/voice` call: the caller's own page joins the room, as the line's caller. */
+function pageCallKind(maxCallDurationMs: number): CallKind {
+  return {
+    roomPrefix: 'voice',
+    joinTimeoutMs: CALL_JOIN_TIMEOUT_MS,
+    maxDurationMs: maxCallDurationMs,
+    room: { emptyTimeout: 60, departureTimeout: 10, maxParticipants: 2 },
+    job: ({ callId }) => ({ callerIdentity: `caller-${callId.slice(0, 8)}` }),
+    // Always the line's own caller, wherever the call talks: the line is that person's, not whoever ran /voice.
+    sender: (line) => line.caller,
+    turnNote: callChatReplyNote,
+  };
+}
+
+/** What the page call needs of the voice adapter. */
+export interface CallPageConfig {
+  livekit: Pick<LiveKitVoiceConfig, 'url' | 'apiKey' | 'apiSecret'>;
+  maxCallDurationMs: number;
+  ui?: VoiceModeUiConfig;
+  /** The line a link token opens, by platform id, or null. */
+  lineForToken(token: string): Promise<string | null>;
+}
+
+/** The `/voice` page call over the call core: its kind and the page's `livekit`, `livekit/token` and `livekit/end` routes. */
+export function createCallPage(
+  core: Pick<LiveKitVoice, 'openCall' | 'endCall' | 'isLive'>,
+  config: CallPageConfig,
+): { handle(req: http.IncomingMessage, res: http.ServerResponse, route: string, url: URL): Promise<void> } {
+  const { lineForToken } = config;
+  const pageCall = pageCallKind(config.maxCallDurationMs);
+  let page: string | undefined;
+
+  /** The page call's token: it joins that room only, as the caller the worker waits for. */
+  const callerToken = (call: { roomName: string; callerIdentity: string }, name: string): Promise<string> => {
+    const at = new AccessToken(config.livekit.apiKey, config.livekit.apiSecret, {
+      identity: call.callerIdentity,
+      name,
+      ttl: CALLER_TOKEN_TTL_SECONDS,
+    });
+    at.addGrant({
+      roomJoin: true,
+      room: call.roomName,
+      canPublish: true,
+      canPublishSources: [TrackSource.MICROPHONE],
+      canSubscribe: true,
+      // Review mode's RPCs to the worker travel as data packets; LiveKit has no grant for RPC alone.
+      // The worker answers its review methods only from this identity, and closes agents-js's own
+      // session control topic, so this reaches nothing else.
+      canPublishData: true,
+      canUpdateOwnMetadata: false,
+    });
+    return at.toJwt();
+  };
+
+  /** Open a page call and hand the caller a token for its room only. */
+  const startPageCall = async (res: http.ServerResponse, platformId: string): Promise<void> => {
+    const opened = await core.openCall(platformId, pageCall);
+    if (!opened.ok) {
+      switch (opened.error) {
+        case 'no-line':
+          return reply(res, 403, 'Caller access denied or voice line is not set up');
+        case 'no-chat':
+          return reply(res, 409, NO_CHAT_REFUSAL, JSON_HEADERS);
+        case 'limit':
+          return reply(res, 429, opened.body, { 'Retry-After': opened.retryAfter });
+        case 'room':
+          return reply(res, 502, 'livekit-voice-mode: could not open the call room');
+        case 'stopped':
+          return reply(res, 409, 'This call attempt is no longer active');
+      }
+    }
+    const { call, chat, job, limit } = opened;
+    let token: string;
+    try {
+      token = await callerToken(call, call.line.caller.name);
+    } catch (err) {
+      log.warn('livekit-voice-mode: room setup failed', { platformId, callId: call.callId, err });
+      void core.endCall(platformId, call.callId, 'room setup failed');
+      return reply(res, 502, 'livekit-voice-mode: could not open the call room');
+    }
+    // Replaced, ended or torn down while the token was signed: its own end deleted the room.
+    if (!core.isLive(platformId, call.callId)) return reply(res, 409, 'This call attempt is no longer active');
+    if (res.destroyed) {
+      // The page went away during setup and never gets the token, so nobody joins the room.
+      log.info('livekit-voice-mode: page left during call setup', { platformId, callId: call.callId });
+      void core.endCall(platformId, call.callId, 'page left during call setup');
+      return;
+    }
+    log.info('livekit-voice-mode: call started', {
+      platformId,
+      callId: call.callId,
+      room: call.roomName,
+      agent: job.agentName,
+      sttModel: job.sttModel,
+      tts: job.tts,
+    });
+    // What the page needs for its hints: the silence that sends a turn, and the cap that ends the call.
+    reply(
+      res,
+      200,
+      JSON.stringify({
+        protocol: LIVEKIT_PROTOCOL_VERSION,
+        url: config.livekit.url,
+        token,
+        callId: call.callId,
+        agent: job.agentName,
+        chat: chatLabel(chat.group),
+        silenceMs: job.silenceMs,
+        limit,
+      }),
+      JSON_HEADERS,
+    );
+  };
+
+  const pageHeaders = (): Record<string, string> => {
+    const lk = new URL(config.livekit.url);
+    const https = `${lk.protocol === 'ws:' ? 'http:' : 'https:'}//${lk.host}`;
+    return {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+      'X-Frame-Options': 'DENY',
+      // The voice page as one self-contained document (inline module script and styles, data: fonts
+      // and images); signaling to the LiveKit server. WebRTC media is not governed by connect-src.
+      'Content-Security-Policy':
+        "default-src 'self' 'unsafe-inline' blob: data:; " +
+        `connect-src 'self' ${lk.protocol}//${lk.host} ${https}; media-src 'self' blob: mediastream:; ` +
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    };
+  };
+
+  /** The page call's routes: `livekit` (the page), `livekit/token` (start a call) and `livekit/end`. */
+  const handleCallPage = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    route: string,
+    url: URL,
+  ): Promise<void> => {
+    if (route === 'livekit') {
+      if (req.method !== 'GET') return reply(res, 405, 'GET only');
+      page ??= callPageHtml(config.ui);
+      res.writeHead(200, pageHeaders());
+      res.end(page);
+      return;
+    }
+    if (req.method !== 'POST') return reply(res, 405, 'POST only');
+    const platformId = await lineForToken(url.searchParams.get('t') ?? '');
+    if (!platformId) return reply(res, 403, 'Unknown call link');
+    if (route === 'livekit/token') {
+      if (url.searchParams.get('v') !== String(LIVEKIT_PROTOCOL_VERSION)) {
+        return reply(res, 426, PROTOCOL_REFUSAL, JSON_HEADERS);
+      }
+      return startPageCall(res, platformId);
+    }
+    if (route === 'livekit/end') {
+      const body = await readJsonObject(req, MAX_END_BODY_BYTES, {});
+      if (body) {
+        // The page gave up waiting for the worker, or the worker said it runs another version.
+        const reason =
+          body.reason === 'no-agent'
+            ? 'no voice worker joined (worker down, or not on this protocol version)'
+            : body.reason === 'updating'
+              ? 'the voice worker is on another protocol version'
+              : 'hangup';
+        await core.endCall(platformId, body.callId, reason, { grace: reason === 'hangup' });
+      }
+      return reply(res, 204, '');
+    }
+    reply(res, 404, 'Not found');
+  };
+
+  return { handle: handleCallPage };
+}
