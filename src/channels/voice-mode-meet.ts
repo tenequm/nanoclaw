@@ -117,11 +117,7 @@ export interface Meetings {
 export function createMeetings(
   core: Pick<LiveKitVoice, 'openCall' | 'endCall'>,
   bridge: RecallMeetBridge,
-  {
-    joinTimeoutMs = MEETING_JOIN_TIMEOUT_MS,
-    judgeJev = askJev,
-    now = () => Date.now(),
-  }: { joinTimeoutMs?: number; judgeJev?: typeof askJev; now?: () => number } = {},
+  { judgeJev = askJev, now = () => Date.now() }: { judgeJev?: typeof askJev; now?: () => number } = {},
 ): Meetings {
   /** The meeting call running on each line, by call id. */
   const live = new Map<string, string>();
@@ -158,7 +154,7 @@ export function createMeetings(
           return false;
         }
       },
-      heard(_call, direction, text) {
+      heard(direction, text) {
         lines.push(meetingLine(direction, direction === 'out' ? text.slice(0, MEETING_JEV_REPLY_CHARS) : text, now()));
         lines.splice(0, Math.max(0, lines.length - MEETING_JEV_HISTORY_LINES));
       },
@@ -171,11 +167,11 @@ export function createMeetings(
     const leaveBot = (): Promise<void> | undefined => meeting.bot?.then((id) => (id ? bridge.leave(id) : undefined));
     const kind: CallKind = {
       roomPrefix: 'meet',
-      joinTimeoutMs,
+      joinTimeoutMs: MEETING_JOIN_TIMEOUT_MS,
       maxDurationMs: MEETING_MAX_DURATION_MS,
       // The bot can sit in the meeting's lobby for minutes before its page joins.
       room: {
-        emptyTimeout: Math.ceil(joinTimeoutMs / 1000),
+        emptyTimeout: MEETING_JOIN_TIMEOUT_MS / 1000,
         departureTimeout: 10,
         maxParticipants: MEETING_MAX_PARTICIPANTS,
       },

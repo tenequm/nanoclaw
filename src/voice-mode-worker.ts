@@ -66,6 +66,7 @@ import {
 import {
   baseLanguage,
   wakePhrase,
+  configuredWakePhrase,
   DEFAULT_LIVEKIT_AGENT_NAME,
   HOST_SILENCE_MS,
   LIVEKIT_PROTOCOL_VERSION,
@@ -98,6 +99,7 @@ import {
   type CallVoiceState,
   type CallWakeState,
   type LiveKitHostEvent,
+  type CallUtterance,
   type LiveKitJobMetadata,
   type CallReplyInfo,
   type CallTurnStatus,
@@ -2137,13 +2139,13 @@ function phraseName(phrase: string): string | undefined {
 const MEETING_WAKE_NAME = 'Dan';
 
 /**
- * What a meeting wakes on: VOICE_MODE_WAKE_PHRASE's name (`Hey Dan`: `Dan`) and the phrase as the
- * transcription's vocabulary takes it; `Hey Dan` when the setting names none. Never the agent's own names.
+ * What a meeting wakes on: VOICE_MODE_WAKE_PHRASE's name (`Hey Dan`: `Dan`, a bare `Jarvis`: `Jarvis`) and
+ * the phrase as the transcription's vocabulary takes it; `Hey Dan` only when it is not set. Never the agent's own names.
  */
 export function meetingWake(env: Record<string, string | undefined>): { name: string; phrase: string } {
-  const phrase = env.VOICE_MODE_WAKE_PHRASE?.trim().split(/\s+/).join(' ');
-  const name = phrase && phraseName(phrase);
-  return name ? { name, phrase } : { name: MEETING_WAKE_NAME, phrase: `Hey ${MEETING_WAKE_NAME}` };
+  const phrase = configuredWakePhrase(env);
+  if (!phrase) return { name: MEETING_WAKE_NAME, phrase: `Hey ${MEETING_WAKE_NAME}` };
+  return { name: phraseName(phrase) ?? phrase, phrase };
 }
 
 /** Every `hey <agent>` in a transcript, in order. */
@@ -4715,7 +4717,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const record = !meta.meeting && recordingDays(deps.env.VOICE_MODE_RECORDINGS_DAYS) > 0;
   const recordings = deps.recordingsRoot ?? recordingsRoot();
   const recordCall = !meta.meeting && envSwitch(deps.env.VOICE_MODE_CALL_RECORDING, ['1', 'true']);
-  const wakeOfMeeting = meta.meeting ? meetingWake(deps.env) : undefined;
+  const wakeOfMeeting = meta.meeting ? { ...meta.meeting, ...meetingWake(deps.env) } : undefined;
   /** The whole call, when VOICE_MODE_CALL_RECORDING is on: opened once the caller's audio can flow. */
   let callRecording: CallRecording | undefined;
   const transcriptDebug = envSwitch(deps.env.VOICE_MODE_TRANSCRIPT_DEBUG, ['1']);
@@ -4785,11 +4787,12 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         const turnKey = randomUUID();
         let res: Response;
         try {
-          res = await host.post('utterance', { text, turnKey }).catch(async (err: unknown) => {
+          const utterance: CallUtterance = { text, turnKey };
+          res = await host.post('utterance', { ...utterance }).catch(async (err: unknown) => {
             if ((err as Error | null)?.name === 'TimeoutError') throw err;
             callLog.warn('voice-mode worker: posting a turn failed; trying once more', { err });
             await sleep(TURN_RETRY_DELAY_MS);
-            return host.post('utterance', { text, turnKey });
+            return host.post('utterance', { ...utterance });
           });
         } catch (err) {
           // Unanswered, not refused: the host may still store it and say so with `turn-stored`.
@@ -5024,18 +5027,28 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
    * `/meet ... jev`: words no wake phrase addressed go to the host as a candidate, outside the order turns
    * go out in, so an addressed turn never waits on it. The host answers 202 only when it let the
    * candidate through to the agent as a turn: then, and only then, it gets the sent cue and the typing.
+   * One at a time: while the host judges one, the next is dropped, so candidates never take an addressed turn's slot.
    */
+  let candidateInFlight = false;
   const postCandidate = async (text: string, facts: TurnFacts): Promise<void> => {
+    if (candidateInFlight) {
+      if (!ending) telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_busy' });
+      return;
+    }
     const turnKey = randomUUID();
     const postAt = Date.now();
     let res: Response;
+    candidateInFlight = true;
     try {
       // The name the meeting wakes on, which the host's judge must take an invitation to, not the agent's own.
-      res = await host.post('utterance', { text, turnKey, candidate: true, wakeName: wakeOfMeeting?.name });
+      const utterance: CallUtterance = { text, turnKey, candidate: true, wakeName: wakeOfMeeting?.name };
+      res = await host.post('utterance', { ...utterance });
     } catch (err) {
       callLog.warn('voice-mode worker: could not hand a candidate to the host', { err });
       if (!ending) telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_lost' });
       return;
+    } finally {
+      candidateInFlight = false;
     }
     if (res.status !== 202) {
       void res.body?.cancel().catch(() => {});
@@ -5103,12 +5116,12 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   );
   // A meeting has no page to set the switches: the agent takes a turn only when addressed, and a send
   // word ends it, as on the page with "a pause also sends" off, unless the meeting asked for the pause.
-  if (meta.meeting && wakeOfMeeting) {
-    callTurns.configure(true, meta.meeting.pauseSends);
+  if (wakeOfMeeting) {
+    callTurns.configure(true, wakeOfMeeting.pauseSends);
     callLog.info('voice-mode worker: a meeting', {
       wakePhrase: wakeOfMeeting.phrase,
-      pauseSends: meta.meeting.pauseSends,
-      jev: meta.meeting.jev,
+      pauseSends: wakeOfMeeting.pauseSends,
+      jev: wakeOfMeeting.jev,
     });
   }
   if (recordCall) {

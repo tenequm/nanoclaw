@@ -103,6 +103,17 @@ export interface LiveKitJobMetadata {
   meeting?: MeetingJob;
 }
 
+/** One transcribed turn the worker posts to the host's `agent/utterance`. */
+export interface CallUtterance {
+  text: string;
+  /** The worker's key for the turn: a retry under it gets the first answer, not a second turn. */
+  turnKey?: string;
+  /** `/meet ... jev`: words no wake phrase addressed, a turn only if the host's judge lets them through. */
+  candidate?: boolean;
+  /** On a candidate: the name the meeting wakes on, which the judge takes an invitation to. */
+  wakeName?: string;
+}
+
 /** What a meeting call's worker does differently. */
 export interface MeetingJob {
   /** A pause ends a turn too, not only the send word. */
@@ -320,7 +331,12 @@ export const DEFAULT_WAKE_PHRASE = 'Hey LiveKit';
  */
 export function wakePhrase(env: { VOICE_MODE_WAKE_MODEL?: string; VOICE_MODE_WAKE_PHRASE?: string }): string | null {
   if (/^(off|none|0|false)$/i.test(env.VOICE_MODE_WAKE_MODEL?.trim() ?? '')) return null;
-  return env.VOICE_MODE_WAKE_PHRASE?.trim().replace(/\s+/g, ' ') || DEFAULT_WAKE_PHRASE;
+  return configuredWakePhrase(env) ?? DEFAULT_WAKE_PHRASE;
+}
+
+/** VOICE_MODE_WAKE_PHRASE as set, trimmed and single-spaced; null when it is not set. */
+export function configuredWakePhrase(env: { VOICE_MODE_WAKE_PHRASE?: string }): string | null {
+  return env.VOICE_MODE_WAKE_PHRASE?.trim().replace(/\s+/g, ' ') || null;
 }
 
 /**

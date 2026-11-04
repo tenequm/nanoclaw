@@ -6,6 +6,7 @@
  */
 import http from 'node:http';
 import net, { type AddressInfo } from 'node:net';
+import { AccessToken } from 'livekit-server-sdk';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
@@ -1330,6 +1331,30 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.ops.lastIndexOf(`delete:${room}`)).toBeGreaterThan(h.lk.ops.indexOf(`create:${room}`));
   });
 
+  it('answers 409, not a token, to a call replaced while its token was being signed', async () => {
+    let release!: () => void;
+    const signing = new Promise<void>((r) => (release = r));
+    const sign = AccessToken.prototype.toJwt;
+    const spy = vi.spyOn(AccessToken.prototype, 'toJwt').mockImplementationOnce(async function (this: AccessToken) {
+      await signing;
+      return sign.call(this);
+    });
+    try {
+      const first = post(`${h.base}/livekit/token?v=6&t=tok123`);
+      await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+      const second = await post(`${h.base}/livekit/token?v=6&t=tok123`);
+      expect(second.status).toBe(200);
+      release();
+      const answer = await first;
+      expect(answer.status).toBe(409);
+      expect(await answer.text()).toBe('This call attempt is no longer active');
+      const room = replacedRoom(h, (await second.json()) as TokenResponse);
+      await vi.waitFor(() => expect(h.lk.deleted).toContain(room));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('deletes the room when the page left while the room was being set up', async () => {
     let release!: () => void;
     h.lk.createGate = new Promise((r) => (release = r));
@@ -1938,6 +1963,8 @@ describe('meetings: the /meet call kind on the call core', () => {
   let bots: { joined: Array<Parameters<RecallMeetBridge['join']>[0]>; left: string[]; fail: boolean };
   /** Jev's answers: whether it wakes the agent, and every state and name it was asked about. */
   let jev: { wake: boolean; asked: Array<{ state: string; name: string }> };
+  /** While set, Jev answers only once it settles. */
+  const judge: { gate: Promise<void> | null } = { gate: null };
 
   beforeEach(async () => {
     bots = { joined: [], left: [], fail: false };
@@ -1953,8 +1980,10 @@ describe('meetings: the /meet call kind on the call core', () => {
       bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
     });
     jev = { wake: false, asked: [] };
+    judge.gate = null;
     const judgeJev = async (state: string, name: string) => {
       jev.asked.push({ state, name });
+      await judge.gate;
       const high = jev.wake ? 0.9 : 0;
       return {
         ok: true as const,
@@ -2085,13 +2114,65 @@ describe('meetings: the /meet call kind on the call core', () => {
     expect(state).toContain('Dan, can you check the release date?');
   });
 
-  it('counts candidates toward the per-minute limit', async () => {
+  it('counts candidates toward the per-minute limit, short of the slots kept for addressed turns', async () => {
     const worker = await startMeeting(true);
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 15; i++) {
       expect((await worker.post('utterance', { text: `chatter ${i}`, candidate: true })).status).toBe(200);
     }
-    expect((await worker.post('utterance', { text: 'Hey Dan, one more' })).status).toBe(429);
+    expect((await worker.post('utterance', { text: 'chatter 15', candidate: true })).status).toBe(429);
     expect(h.events).toHaveLength(0);
+    for (let i = 0; i < 5; i++) expect((await worker.post('utterance', { text: `turn ${i}` })).status).toBe(202);
+    expect((await worker.post('utterance', { text: 'one too many' })).status).toBe(429);
+  });
+
+  it("refuses a candidate that would take the last in-flight slot, which stays an addressed turn's", async () => {
+    const worker = await startMeeting(true);
+    h.routing.mode = 'hang';
+    const first = worker.post('utterance', { text: 'first turn' });
+    const second = worker.post('utterance', { text: 'second turn' });
+    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(2));
+    expect((await worker.post('utterance', { text: 'chatter', candidate: true })).status).toBe(429);
+    expect(jev.asked).toHaveLength(0);
+    const third = worker.post('utterance', { text: 'third turn' });
+    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(3));
+    for (const hung of h.routing.hung.splice(0)) hung(true);
+    expect((await Promise.all([first, second, third])).map((r) => r.status)).toEqual([202, 202, 202]);
+  });
+
+  it('refuses a candidate as it would a turn when the call cannot take one, before judging it', async () => {
+    const worker = await startMeeting(true);
+    h.access.enabled = false;
+    expect((await worker.post('utterance', { text: 'chatter', candidate: true })).status).toBe(403);
+    expect(jev.asked).toHaveLength(0);
+  });
+
+  it('keeps a candidate in the transcript where it was said, even when a reply came while it was judged', async () => {
+    const worker = await startMeeting(true);
+    let release!: () => void;
+    const judging = new Promise<void>((r) => (release = r));
+    judge.gate = judging;
+    const first = worker.post('utterance', { text: 'Does anyone know when the release ships?', candidate: true });
+    await vi.waitFor(() => expect(jev.asked).toHaveLength(1));
+    delivered('telegram:100', 'Four.');
+    release();
+    expect((await first).status).toBe(200);
+    judge.gate = null;
+    await worker.post('utterance', { text: 'And the one after?', candidate: true });
+    const { state } = jev.asked.at(-1)!;
+    expect(state.indexOf('Does anyone know when the release ships?')).toBeLessThan(state.indexOf('Four.'));
+  });
+
+  it('teardown waits on a bot that will not leave only so long', async () => {
+    const stuck = await startHarness(
+      {
+        meetBridge: { join: async () => ({ botId: 'bot-stuck' }), leave: () => new Promise<void>(() => {}) },
+      },
+      { mirrorApi: chat.api, endHookTimeoutMs: 50 },
+    );
+    expect(await stuck.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false })).toEqual({ ok: true });
+    const started = Date.now();
+    await stuck.stop();
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 
   it('takes no candidates on a call without a judge', async () => {

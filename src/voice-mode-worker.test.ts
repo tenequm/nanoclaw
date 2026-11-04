@@ -6439,14 +6439,17 @@ describe('meeting calls', () => {
     await flush();
   };
 
-  it("wakes on VOICE_MODE_WAKE_PHRASE's name, Hey Dan without one, never on the agent's names", () => {
+  it("wakes on VOICE_MODE_WAKE_PHRASE's name, Hey Dan only without one, never on the agent's names", () => {
     expect(meetingWake(WAKE_ENV)).toEqual({ name: 'Dan', phrase: 'Hey Dan' });
     expect(meetingWake(ENV)).toEqual({ name: 'Dan', phrase: 'Hey Dan' });
     expect(meetingWake({ ...ENV, VOICE_MODE_WAKE_PHRASE: ' Hey  Jarvis ' })).toEqual({
       name: 'Jarvis',
       phrase: 'Hey Jarvis',
     });
-    expect(meetingWake({ ...ENV, VOICE_MODE_WAKE_PHRASE: 'Computer' })).toEqual({ name: 'Dan', phrase: 'Hey Dan' });
+    expect(meetingWake({ ...ENV, VOICE_MODE_WAKE_PHRASE: ' Computer ' })).toEqual({
+      name: 'Computer',
+      phrase: 'Computer',
+    });
     const names = wakeNameWords([meetingWake(WAKE_ENV).name]);
     expect(matchWake("Hey Dan, what's two plus two?", names)).not.toBeNull();
     expect(matchWake("Hey Andy, what's two plus two?", names)).toBeNull();
@@ -6555,5 +6558,38 @@ describe('meeting calls', () => {
       host.emit({ type: 'end', reason: 'test over' });
       await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
     }
+  });
+
+  it('`jev`: one candidate at a time; one said while the host judges another is dropped', async () => {
+    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: false, jev: true } });
+    room.remoteParticipants.clear();
+    room.remoteParticipants.set('meet-bridge-meet-r1', {});
+    const host = fakeHostFetch(200, 200);
+    const answer = host.fetchImpl.getMockImplementation()!;
+    let release!: () => void;
+    const judged = new Promise<void>((r) => (release = r));
+    host.fetchImpl.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/utterance') && String(init?.body).includes('"candidate":true')) await judged;
+      return answer(input, init);
+    });
+    const v = fakeVoice();
+    v.voice.review.serve = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
+    const candidates = () =>
+      host.fetchImpl.mock.calls.filter(
+        ([input, init]) => String(input).endsWith('/utterance') && String(init?.body).includes('"candidate":true'),
+      );
+
+    await say(v, 'Does anyone know when the release ships?', 'Does anyone know when the release ships?');
+    await vi.waitFor(() => expect(candidates()).toHaveLength(1));
+    await say(v, 'I think it was Friday', 'I think it was Friday');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(candidates()).toHaveLength(1);
+    release();
+    await flush();
+    await say(v, 'Or was it Monday', 'Or was it Monday');
+    await vi.waitFor(() => expect(candidates()).toHaveLength(2));
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
   });
 });

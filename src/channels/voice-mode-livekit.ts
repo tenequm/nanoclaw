@@ -33,8 +33,9 @@
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
  * line: the line's `/voice` chat (its voice_mode_lines binding), while that
  * chat stays wired to the agent. Each turn is routed into that chat's session
- * through the normal inbound path as a message from the line's own caller,
- * addressed to the line's agent only; the transcript is posted into the chat,
+ * through the normal inbound path as a message from the call kind's sender
+ * (the line's own caller, or a guest with no role over the agent), addressed
+ * to the line's agent only; the transcript is posted into the chat,
  * and the agent answers there as it always does. While the call is live, every
  * message the agent delivers to that chat is also spoken, and its typing there
  * is the worker's `thinking`. With no call chat a call is refused, and a
@@ -60,6 +61,7 @@ import {
   baseLanguage,
   DEFAULT_VOICE_LANGUAGES,
   WORKER_REQUEST_TIMEOUT_MS,
+  type CallUtterance,
   type LiveKitHostEvent,
   type LiveKitJobMetadata,
   type CallEndReason,
@@ -90,6 +92,10 @@ const MAX_UTTERANCES_PER_MINUTE = 20;
 const ROUTE_TIMEOUT_MS = WORKER_REQUEST_TIMEOUT_MS - 2_000;
 /** Turns routing at once on a call. The worker sends one at a time, so more is a worker gone wrong. */
 const MAX_TURNS_IN_FLIGHT = 3;
+/** Per-minute utterances only an addressed turn may take: candidates never crowd one out. */
+const ADDRESSED_TURNS_HEADROOM = 5;
+/** How long teardown waits on a call kind's end (a meeting bot leaving); past it the kind goes on alone. */
+const END_HOOK_TIMEOUT_MS = 10_000;
 /** Outcomes a call keeps by the worker's turn key, so a retried turn is answered, not routed again. */
 const MAX_REMEMBERED_TURNS = 32;
 const MAX_TURN_KEY_LENGTH = 64;
@@ -190,7 +196,7 @@ export interface ChatAddress {
   threadId: string | null;
 }
 
-/** The chat a call talks in, set by `/voice`. The caller there is always the line's own caller. */
+/** The chat a call talks in: the line's binding, which `/voice` and `/meet` set. */
 export interface CallChat {
   group: MessagingGroup;
   threadId: string | null;
@@ -222,6 +228,8 @@ export interface LiveKitVoiceConfig {
   routeTimeoutMs?: number;
   /** HANGUP_GRACE_MS; a test seam. */
   hangupGraceMs?: number;
+  /** END_HOOK_TIMEOUT_MS; a test seam. */
+  endHookTimeoutMs?: number;
   /** Test seam; defaults to the livekit-server-sdk clients. */
   api?: LiveKitServerApi;
 }
@@ -285,12 +293,12 @@ export interface CallKind {
   ended?(call: KindCall, reason: string, say: ((text: string) => void) | null): Promise<void> | void;
   /**
    * Candidates: speech the worker sent unaddressed, which a kind without this takes no turn from. `judge`
-   * says whether one goes to the agent as a turn (it never rejects); `heard` sees every utterance and
-   * every reply spoken on the call, in order, for the context it judges against.
+   * says whether one goes to the agent as a turn (it never rejects) and reads what was heard before its
+   * first await; `heard` sees every utterance and every reply spoken on the call, in order.
    */
   candidates?: {
     judge(call: KindCall, text: string, wakeName: string): Promise<boolean>;
-    heard(call: KindCall, direction: 'in' | 'out', text: string): void;
+    heard(direction: 'in' | 'out', text: string): void;
   };
 }
 
@@ -366,10 +374,12 @@ export interface LiveKitVoice {
    */
   openCall(platformId: string, kind: CallKind): Promise<OpenCallResult>;
   /**
-   * Ends the line's call `callId`, as its own side asked; nothing when that is not the line's call.
-   * `grace`: its worker's turns are still taken for HANGUP_GRACE_MS. Resolves once its room is gone.
+   * Ends the line's call `callId` when it still is the line's call, and resolves once its room is gone.
+   * `grace`: its worker's turns are still taken for HANGUP_GRACE_MS.
    */
   endCall(platformId: string, callId: unknown, reason: string, options?: { grace?: boolean }): Promise<void>;
+  /** Whether `callId` is still the line's running call: not ended, not replaced. */
+  isLive(platformId: string, callId: string): boolean;
   /** An agent message reached a chat: speak it on the live call that talks there. `replyTo`: the call turn it answers. */
   chatMessage(
     chat: ChatAddress,
@@ -567,6 +577,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const mirrorApi = config.mirrorApi ?? defaultMirrorApi;
   const routeTimeoutMs = config.routeTimeoutMs ?? ROUTE_TIMEOUT_MS;
   const hangupGraceMs = config.hangupGraceMs ?? HANGUP_GRACE_MS;
+  const endHookTimeoutMs = config.endHookTimeoutMs ?? END_HOOK_TIMEOUT_MS;
   const calls = new Map<string, LiveKitCall>();
   /** Calls the caller's page hung up, by call id, while their worker may still post a turn (HANGUP_GRACE_MS). */
   const hungUp = new Map<string, { call: LiveKitCall; timer: ReturnType<typeof setTimeout> }>();
@@ -795,15 +806,20 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     log.info('livekit-voice-mode: call ended', { platformId: call.platformId, callId: call.callId, reason });
   };
 
-  /** The kind hears of the end; whatever it still does (a bot leaving) is awaited by teardown. */
+  /** The kind hears of the end; teardown awaits what it still does (a bot leaving) for END_HOOK_TIMEOUT_MS. */
   const endedHook = (call: LiveKitCall, ended: NonNullable<CallKind['ended']>, reason: string): void => {
     const chat = call.chat;
     const say = chat && call.state === 'live' ? (text: string) => mirror(call.platformId, chat, text) : null;
-    const done: Promise<void> = Promise.resolve()
+    const hook = Promise.resolve()
       .then(() => ended(call, reason, say))
       .catch((err: unknown) =>
         log.warn('livekit-voice-mode: the call kind failed at the end', { callId: call.callId, err }),
-      )
+      );
+    const done: Promise<void> = settleWithin(hook, endHookTimeoutMs, 'timeout' as const)
+      .then((settled) => {
+        if (settled === 'timeout')
+          log.warn('livekit-voice-mode: the call kind is still ending; going on without it', { callId: call.callId });
+      })
       .finally(() => cleanups.delete(done));
     cleanups.add(done);
   };
@@ -823,6 +839,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
   /** Admit the call, open its room and dispatch the worker to it. */
   const openCall = async (platformId: string, kind: CallKind): Promise<OpenCallResult> => {
+    if (!host.isRunning()) return { ok: false, error: 'stopped' };
     const line = await host.resolveLine(platformId, { forCall: true });
     if (!line) return { ok: false, error: 'no-line' };
     // Before anything is spent or ended: a line with no chat to talk in is refused outright.
@@ -992,22 +1009,28 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     body: Record<string, unknown>,
   ): Promise<void> => {
     if (call.state !== 'live') return reply(res, 409, 'The caller is not in the call');
-    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    const utterance: { [K in keyof CallUtterance]?: unknown } = body;
+    const text = typeof utterance.text === 'string' ? utterance.text.trim() : '';
     if (!text) return reply(res, 400, 'text is required');
     if (Buffer.byteLength(text) > MAX_UTTERANCE_TEXT_BYTES) {
       return reply(res, 413, `utterance is too large (${MAX_UTTERANCE_TEXT_BYTES / 1024} KB max)`);
     }
     const turnKey =
-      typeof body.turnKey === 'string' && body.turnKey.length <= MAX_TURN_KEY_LENGTH ? body.turnKey : undefined;
+      typeof utterance.turnKey === 'string' && utterance.turnKey.length <= MAX_TURN_KEY_LENGTH
+        ? utterance.turnKey
+        : undefined;
     const known = turnKey && call.turnOutcomes.get(turnKey);
     if (known) return answer(res, await known);
     const candidates = call.kind.candidates;
-    const candidate = body.candidate === true;
+    const candidate = utterance.candidate === true;
     if (candidate && !candidates) return reply(res, 200, 'Not a turn: this call takes no candidates');
-    if (call.turnsInFlight >= MAX_TURNS_IN_FLIGHT) return reply(res, 429, 'Too many turns are still being routed');
+    // A candidate leaves a slot of each limit to an addressed turn, which it must never crowd out.
+    if (call.turnsInFlight >= MAX_TURNS_IN_FLIGHT - (candidate ? 1 : 0)) {
+      return reply(res, 429, 'Too many turns are still being routed');
+    }
     const t = host.now();
     call.utteranceStarts = call.utteranceStarts.filter((at) => at > t - MINUTE_MS);
-    if (call.utteranceStarts.length >= MAX_UTTERANCES_PER_MINUTE) {
+    if (call.utteranceStarts.length >= MAX_UTTERANCES_PER_MINUTE - (candidate ? ADDRESSED_TURNS_HEADROOM : 0)) {
       return reply(res, 429, 'Too many utterances this minute', {
         'Retry-After': String(Math.max(1, Math.ceil((call.utteranceStarts[0] + MINUTE_MS - t) / 1000))),
       });
@@ -1016,10 +1039,16 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     call.utteranceStarts.push(t);
     call.turnsInFlight++;
     if (candidates) {
-      const wakeName = typeof body.wakeName === 'string' ? body.wakeName : '';
-      const wakes = !candidate || (await candidates.judge(call, text, wakeName).catch(() => false));
-      candidates.heard(call, 'in', text);
-      if (!wakes) {
+      const refused = candidate ? await turnRefusal(call) : null;
+      if (refused) {
+        call.turnsInFlight--;
+        return answer(res, refused);
+      }
+      const wakeName = typeof utterance.wakeName === 'string' ? utterance.wakeName : '';
+      const judged = candidate ? candidates.judge(call, text, wakeName).catch(() => false) : true;
+      // Heard before the judge answers, so a turn or reply meanwhile lands after it.
+      candidates.heard('in', text);
+      if (!(await judged)) {
         call.turnsInFlight--;
         return reply(res, 200, 'Not a turn: the call kept the agent out of it');
       }
@@ -1039,6 +1068,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const answer = (res: http.ServerResponse, outcome: TurnOutcome): void =>
     reply(res, outcome.status, outcome.body, outcome.status === 202 ? JSON_HEADERS : {});
 
+  /** Why a turn of `call` cannot go to the agent now (its caller lost access, the channel stops), or null. */
+  const turnRefusal = async (call: LiveKitCall): Promise<TurnOutcome | null> => {
+    if (!(await checkAccess(call))) return { status: 403, body: 'Caller access denied' };
+    if (!host.isRunning()) return { status: 503, body: 'The voice channel is shutting down' };
+    return null;
+  };
+
   /**
    * The turn keeps its in-flight slot until routing ends, which can be after the 504: the router may
    * still store the turn then, and the worker hears `turn-stored` for its `turnKey`. The route timeout
@@ -1054,8 +1090,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const release = () => void call.turnsInFlight--;
     let routed: Promise<boolean> | undefined;
     try {
-      if (!(await checkAccess(call))) return { status: 403, body: 'Caller access denied' };
-      if (!host.isRunning()) return { status: 503, body: 'The voice channel is shutting down' };
+      const refused = await turnRefusal(call);
+      if (refused) return refused;
       const chat = await refreshChat(call, true);
       // The call can end or be replaced while the chat lookups run; its turn must not reach the agent then.
       if (!takesTurns(call)) return { status: 409, body: 'The call has ended' };
@@ -1183,13 +1219,18 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       await call.cleanup;
     },
 
+    isLive(platformId, callId) {
+      const call = calls.get(platformId);
+      return call?.callId === callId && !call.ended;
+    },
+
     chatMessage(chat, agentGroupId, text, replyTo) {
       for (const call of calls.values()) {
         const at = speechChat(call, chat, agentGroupId, replyTo ?? null);
         if (!at) continue;
         if (at === 'previous' && call.previousChat) call.previousChat.active = true;
         push(call, { type: 'reply', text, turn: replyTo ? replyTo.utteranceId : null });
-        call.kind.candidates?.heard(call, 'out', text);
+        call.kind.candidates?.heard('out', text);
       }
     },
 

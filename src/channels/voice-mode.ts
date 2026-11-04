@@ -290,8 +290,6 @@ export interface VoiceModeConfig {
   expediteReplies?: (session: Session) => void;
   /** The Recall client `/meet` joins meetings through (voice-mode-meet.ts); none: `/meet` is not configured. */
   meetBridge?: RecallMeetBridge;
-  /** MEETING_JOIN_TIMEOUT_MS; a test seam. */
-  meetingJoinTimeoutMs?: number;
   /** The Jev client a `/meet ... jev` call judges candidates with; a test seam. */
   judgeJev?: typeof askJev;
   /** How a call finds and starts the agent session it talks to (findCallSession, requestWake). Test seams. */
@@ -457,25 +455,14 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         log.warn('livekit-voice-mode: could not start the agent for the call', { callId, err }),
       );
     },
-    isRunning: () => connected,
+    isRunning: () => connected && !!setup,
     now,
     accessCheckIntervalMs,
   });
   const pageCall = pageCallKind(maxCallDurationMs);
-  const meetingsOnCore = config.meetBridge
-    ? createMeetings(livekit, config.meetBridge, {
-        joinTimeoutMs: config.meetingJoinTimeoutMs,
-        judgeJev: config.judgeJev,
-        now,
-      })
+  const meetings: Meetings | null = config.meetBridge
+    ? createMeetings(livekit, config.meetBridge, { judgeJev: config.judgeJev, now })
     : null;
-  const meetings: Meetings | null = meetingsOnCore && {
-    start: (platformId, meetingUrl, options) =>
-      connected && setup
-        ? meetingsOnCore.start(platformId, meetingUrl, options)
-        : Promise.resolve({ ok: false, error: 'stopped' }),
-    leave: (platformId) => meetingsOnCore.leave(platformId),
-  };
   let page: string | undefined;
 
   /** The page call's token: it joins that room only, as the caller the worker waits for. */
@@ -526,6 +513,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       void livekit.endCall(platformId, call.callId, 'room setup failed');
       return reply(res, 502, 'livekit-voice-mode: could not open the call room');
     }
+    // Replaced, ended or torn down while the token was signed: its own end deleted the room.
+    if (!livekit.isLive(platformId, call.callId)) return reply(res, 409, 'This call attempt is no longer active');
     if (res.destroyed) {
       // The page went away during setup and never gets the token, so nobody joins the room.
       log.info('livekit-voice-mode: page left during call setup', { platformId, callId: call.callId });
