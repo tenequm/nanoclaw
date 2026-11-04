@@ -2,15 +2,19 @@
 
 **Generated:** 2026-11-04
 **Base (merge-base with upstream):** `66f0823a` (2026-10-06)
-**Fork HEAD at generation:** `098ed630` (fork `main`)
+**Fork HEAD at generation:** `098ed630` (fork `main`) for sections 00-06; `83dc1e00` (fork `main`
+after the `/meet` rebuild, PR #43 merged as `99174d16`, plus one fix) for section 07
 **Upstream target:** `f7440e85` (`upstream/main`: v2026.10.1-rc.2 plus three fixes)
 
 Supersedes the v3 guide (`guide.md`, generated 2026-08-31, removed in this commit). Tier 3 in
 `.claude/skills/migrate-nanoclaw` terms: start from a clean upstream checkout and replay every
 customization as ONE focused commit, in the order below. Nothing is merged.
 
-**Status:** draft. Section 07 (voice-mode) is a placeholder until the `/meet` rebuild on `feat/meet`
-merges into fork `main`; then re-extract it and update "Fork HEAD at generation" above.
+**Status:** replay starting (2026-11-04). The `/meet` rebuild is merged and deployed; section 07 is
+re-extracted from `83dc1e00`. Between `098ed630` and `83dc1e00` the only non-voice changes are
+`package.json` and the lockfile (voice dependencies, owned by commit 12), `CLAUDE.md` (commit 14),
+`docs/jev-gate.md` (meeting candidates, commit 12) and `docs/chat-commands.md` (`/voice` and
+`/meet`, commit 12); take those files from `83dc1e00`, not `098ed630`.
 
 ## How to use
 
@@ -66,13 +70,22 @@ order above.
 | 1 | telegram | 6 (published first so voice can branch), 7, 11 | after 1 and 5 | GPT-6 Astra, high |
 | 1 | slack | 10 (the typing hunk lands with 3 at assembly) | after 1 | GPT-6 Astra, medium |
 | 2 | mailbox | 13 | after 2 and 3 | GPT-6 Astra, high |
-| 2 | voice | 12 | after `feat/meet` merges, from foundation + 6 | GPT-6 Astra, high |
+| 2 | voice | 12 | after foundation (0-5) and telegram's commit 6 | GPT-6 Astra, high |
 | 3 | assembly | cherry-pick 0-14 in order, then 14 | all lanes done | the driving session |
 
 Model choice (Artificial Analysis Intelligence Index v5, 2026-11-04): GPT-6 Astra high scores 55
 at 7.7 min per task, against Claude Opus 5.5 high at 52 and 9.3 min; xhigh/max tiers roughly
 double the time for a few points and are used only for a lane that keeps failing. Lane wall time
 is dominated by edit-check-fix loops, so first-time accuracy beats raw speed.
+
+How a lane runs: one `acpx codex` session (model `gpt-6-astra`, effort per the table) in its own
+worktree, fed a lane brief (shared lane rules plus its commits) and judged by a report file
+(`.lane/report.md`) it writes after every commit, not by its exit code. A blocked lane writes
+`BLOCKED: <what>` at the top of the report and stops. Codex runs with full agent access
+(`INITIAL_AGENT_MODE=agent-full-access`), because a worktree's commits write to the shared `.git`
+outside the worktree and `pnpm install` writes to the global store; codex's sandbox allows
+neither. Briefs forbid touching other worktrees, pushing, and anything that talks to a live
+install.
 
 Rules that keep the lanes fast:
 
@@ -139,7 +152,8 @@ Rules that keep the lanes fast:
 Host-specific steps (service units, proxy routes, backups, the deploy chain) are kept in the
 owner's private infra repo, not here. In outline:
 
-1. `feat/meet` is merged and deployed; section 07 is re-extracted; the tree is clean.
+1. `feat/meet` is merged and deployed (done 2026-11-04, `83dc1e00`); section 07 is re-extracted;
+   the tree is clean.
 2. Safety net: a `backup/pre-migrate-<hash>-<timestamp>` branch and tag, and
    `archive/slack-agent-flow`, all pushed to origin before anything is rewritten.
 3. Replay commits 0-14 on a fresh branch from `upstream/main` in an isolated checkout, validating
