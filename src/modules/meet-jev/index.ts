@@ -116,8 +116,15 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
             DataPacket_Kind.RELIABLE,
             { topic: 'nanoclaw.jev.status' },
           );
+          log.info('meet-jev: status sent', { ...fields, status });
         })
-        .catch(() => log.debug('meet-jev: status send failed', fields));
+        .catch((err: unknown) =>
+          log.warn('meet-jev: status send failed', {
+            ...fields,
+            status,
+            err: err instanceof Error ? err.message : String(err),
+          }),
+        );
     },
     judge: async (state, signal, windowVersion) => {
       if (!capped()) return judge(state, { signal, ...fields, windowVersion });
