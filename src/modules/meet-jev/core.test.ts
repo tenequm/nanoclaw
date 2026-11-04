@@ -168,12 +168,29 @@ describe('a half sentence, then its rest', () => {
 });
 
 describe('the boundary', () => {
-  it('arms the fallback on every partial, and a meet timer is a boundary without speech_off', () => {
+  it("in a meeting, decides each speaker on their own VAD end and final, never another's speech", () => {
     const call = new Call('meet');
-    const armed = call.feed({ kind: 'utterance', speaker: misha, uttId: 'u1', text: 'Any news', final: false });
-    expect(armed).toEqual([{ kind: 'wait', key: 'boundary:p1', ms: 700 }]);
-    call.feed({ kind: 'speech', speaker: misha, on: true });
-    expect(only(call.feed({ kind: 'timer', key: 'boundary:p1' }), 'judge')).toHaveLength(1);
+    call.feed(
+      { kind: 'speech', speaker: misha, on: true },
+      { kind: 'speech', speaker: olena, on: true },
+      { kind: 'utterance', speaker: misha, uttId: 'p1-0', text: 'Dan, what is', final: false },
+    );
+    // A partial is no boundary; a final while the speaker still speaks is none either.
+    expect(call.feed({ kind: 'utterance', speaker: misha, uttId: 'p1-0', text: 'Dan, what is', final: true })).toEqual(
+      [],
+    );
+    // Misha's VAD end, Olena still talking: Misha's utterance is decided.
+    const [turn] = only(call.feed({ kind: 'speech', speaker: misha, on: false }), 'turn');
+    expect(turn.message).toBe('Dan, what is');
+    // Olena's VAD end before her final: the fallback waits for it, then the final decides.
+    call.feed({ kind: 'utterance', speaker: olena, uttId: 'p2-0', text: 'I think', final: false });
+    expect(call.feed({ kind: 'speech', speaker: olena, on: false })).toEqual([
+      { kind: 'wait', key: 'boundary:p2', ms: 3_700 },
+    ]);
+    expect(
+      only(call.feed({ kind: 'utterance', speaker: olena, uttId: 'p2-0', text: 'I think so', final: true }), 'judge'),
+    ).toHaveLength(1);
+    expect(call.feed({ kind: 'timer', key: 'boundary:p2' })).toEqual([]);
   });
 
   it('on a voice call, a timer is no boundary while the VAD says the caller still speaks', () => {
@@ -183,21 +200,6 @@ describe('the boundary', () => {
       { kind: 'utterance', speaker: misha, uttId: 'u1', text: 'So the thing', final: false },
     );
     expect(call.feed({ kind: 'timer', key: 'boundary:p1' })).toEqual([]);
-  });
-
-  it('in a meeting, keeps the verdict on a partial when the final differs only in case and punctuation', () => {
-    const call = new Call('meet');
-    const [judge] = only(
-      call.feed(
-        { kind: 'speech', speaker: misha, on: true },
-        { kind: 'utterance', speaker: misha, uttId: 'u1', text: 'what is two plus two', final: false },
-        { kind: 'speech', speaker: misha, on: false },
-      ),
-      'judge',
-    );
-    call.feed({ kind: 'utterance', speaker: misha, uttId: 'u1', text: 'What is two plus two?', final: true });
-    expect(call.feed({ kind: 'timer', key: 'boundary:p1' })).toEqual([]);
-    expect(only(call.verdict(judge.windowVersion, 'answer'), 'turn')).toHaveLength(1);
   });
 
   it('on a voice call, waits past speech off for the final: a vocative in worker order is one turn', () => {

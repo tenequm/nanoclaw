@@ -5,7 +5,7 @@
  * call's event log, which is also the test fixture and the replay input.
  *
  * Times (`at`) are host epoch milliseconds; an ingress converts its source's clock (Recall's
- * relative seconds, the worker's marks) on arrival.
+ * frame timestamps, the worker's marks) on arrival.
  */
 
 export type CallKind = 'voice' | 'meet';
@@ -31,7 +31,7 @@ export interface Verdict {
 export type CallEvent =
   /** A participant's words: partials update the utterance, the final replaces it. */
   | { kind: 'utterance'; speaker: Speaker; uttId: string; text: string; final: boolean; at: number }
-  /** A participant started or stopped speaking (worker VAD, Recall `speech_on/off`). */
+  /** A participant started or stopped speaking (the worker's VAD, or a meeting participant's own). */
   | { kind: 'speech'; speaker: Speaker; on: boolean; at: number }
   /** A typed chat line (Meet chat): context only, never a boundary. */
   | { kind: 'chat'; speaker: Speaker; text: string; at: number }
@@ -128,7 +128,7 @@ export interface CallPolicy {
   agentAliases: string[];
   /** Who the agent is and when it speaks, spliced into the Jev state. */
   paragraph: string;
-  /** Without a `speech_off`, a speaker's utterance ends after this long with no new words. */
+  /** After a speaker's VAD end with no STT final, the partial is decided on after this long (plus the final's margin). */
   boundaryFallbackMs: number;
   /** The window keeps this much history and at most `windowBytes` of text. */
   windowMs: number;

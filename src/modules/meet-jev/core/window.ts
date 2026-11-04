@@ -32,7 +32,7 @@ export interface SpeakerState {
   name: string;
   speaking: boolean;
   lastUttId: string | null;
-  /** The utterance the last boundary was decided on (`handledKey`), so it is decided once. */
+  /** The uttId the last boundary was decided on, so each utterance is decided once. */
   handled: string | null;
 }
 
