@@ -73,6 +73,66 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # ~300MB Chromium. We've already installed the system one above.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
+# ---- Fork additions (tenequm/nanoclaw) --------------------------------------
+# One contiguous block through the pond section; upstream lines stay untouched.
+
+# ---- Media stack (yt-dlp / instaloader / ffmpeg) + git-lfs -------------------
+# Used by the media-download container skill (ffmpeg also by tts). The yt-dlp
+# `default` extra pulls yt-dlp-ejs, mutagen, pycryptodomex, brotli, websockets,
+# requests and certifi; `curl-cffi` adds impersonation. pip goes through
+# --break-system-packages since apt-packaged Python on Debian slim is PEP 668
+# managed and pip would otherwise refuse.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        git-lfs \
+        ffmpeg \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --break-system-packages --no-cache-dir \
+        "yt-dlp[default,curl-cffi]" instaloader
+
+# yt-dlp needs Deno for modern YouTube signature extractors.
+ARG DENO_VERSION=2.9.6
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s v${DENO_VERSION}
+
+# ---- uv / uvx ----------------------------------------------------------------
+# General Python capability for agents, and the launcher for Python MCP servers
+# (the `npx -y` equivalent that Debian bookworm has no package for - neither `uv`
+# nor `python3-uv` is in the repos). Copied from Astral's official image rather
+# than piped from an install script: two static binaries, no network fetch at
+# container start, no dependency on the PEP 668 managed system Python. The tag is
+# literal because BuildKit expands no ARG in a COPY --from image reference.
+COPY --from=ghcr.io/astral-sh/uv:0.12.7 /uv /uvx /usr/local/bin/
+
+# ---- GitHub CLI (gh) ---------------------------------------------------------
+# Install gh so agents can run `gh pr list`, `gh repo view`, etc. Auth follows
+# the OneCLI "Pattern D" model (onecli.sh/docs/guides/credential-stubs/general-app):
+# the sentinel env value only satisfies gh's local auth check; real credentials
+# are injected at the network level by the OneCLI gateway (HTTPS_PROXY), via the
+# GitHub OAuth app connection. No real token ever enters the container env.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV GH_TOKEN=onecli-managed
+
+# git-over-HTTPS through the gateway. Two gaps the injected env doesn't cover
+# (verified against the @onecli-sh/sdk version pinned in package.json - re-check
+# on upgrades): git reads GIT_SSL_CAINFO, not SSL_CERT_FILE, for the MITM CA; and
+# the gateway only swaps credentials git actually sends, so gh acts as git's
+# credential helper to supply the sentinel. The CA path is hardcoded in the
+# OneCLI SDK (applyContainerConfig mounts the combined gateway+system bundle
+# there), so public hosts still verify normally.
+ENV GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem
+RUN git config --system credential.helper '!gh auth git-credential'
+
 # ---- pond: cross-session recall (read-only MCP over mounted stores) ----------
 ARG POND_VERSION=0.20.3
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
