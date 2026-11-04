@@ -155,6 +155,13 @@ function decideLatest(state: CallState, speakerId: string): boolean {
       return true;
     }
   }
+  // Someone else took the floor before this boundary: a verdict now would be deferred anyway, so Jev is not asked.
+  if (floorTaken(state)) {
+    unmarkHandled(speaker, utt.uttId);
+    state.deferred = { speakerId, uttId: utt.uttId };
+    log(state, 'boundary_deferred', trigger);
+    return true;
+  }
   judge(state, speakerId, utt.uttId, utt.text, false);
   return true;
 }
@@ -264,8 +271,10 @@ function takeBackUnstarted(state: CallState): string[] {
   return taken;
 }
 
+/** The stop also answers a judge in flight: its verdict, asked before the stop, is dropped as superseded. */
 function stop(state: CallState): void {
   state.stoppedSeq = state.seq;
+  state.judging = null;
   endRecheck(state, 'stopped');
   takeBackUnstarted(state);
   state.commands.push({ kind: 'stop_playback' });

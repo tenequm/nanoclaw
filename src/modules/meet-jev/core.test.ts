@@ -233,18 +233,43 @@ describe('the boundary', () => {
     expect(call.feed({ kind: 'utterance', speaker: misha, uttId: 'p1-0', text: 'Dan, what is', final: true })).toEqual(
       [],
     );
-    // Misha's VAD end, Olena still talking: Misha's utterance is decided.
-    const [judge] = only(call.feed({ kind: 'speech', speaker: misha, on: false }), 'judge');
-    expect(judge.state.latest).toEqual({ speaker: 'Misha', text: 'Dan, what is' });
-    // Olena's VAD end before her final: the fallback waits for it, then the final decides.
+    // Misha's VAD end, Olena still talking: Misha's utterance waits for the floor, and Jev is not asked yet.
+    expect(only(call.feed({ kind: 'speech', speaker: misha, on: false }), 'judge')).toEqual([]);
+    // Olena's VAD end before her final: the fallback waits for it, then the final decides, Misha's line in its window.
     call.feed({ kind: 'utterance', speaker: olena, uttId: 'p2-0', text: 'I think', final: false });
     expect(call.feed({ kind: 'speech', speaker: olena, on: false })).toEqual([
       { kind: 'wait', key: 'boundary:p2', ms: 3_700 },
     ]);
-    expect(
-      only(call.feed({ kind: 'utterance', speaker: olena, uttId: 'p2-0', text: 'I think so', final: true }), 'judge'),
-    ).toHaveLength(1);
+    const [judge] = only(
+      call.feed({ kind: 'utterance', speaker: olena, uttId: 'p2-0', text: 'I think so', final: true }),
+      'judge',
+    );
+    expect(judge.state.latest).toEqual({ speaker: 'Olena', text: 'I think so' });
+    expect(judge.state.window.map((line) => line.text)).toContain('Dan, what is');
     expect(call.feed({ kind: 'timer', key: 'boundary:p2' })).toEqual([]);
+  });
+
+  it('in a meeting, an utterance deferred for the floor is decided once the floor is free and nothing newer came', () => {
+    const call = new Call('meet');
+    call.feed(
+      { kind: 'speech', speaker: misha, on: true },
+      { kind: 'speech', speaker: olena, on: true },
+      { kind: 'utterance', speaker: misha, uttId: 'p1-0', text: 'Dan, what time is it?', final: true },
+    );
+    expect(only(call.feed({ kind: 'speech', speaker: misha, on: false }), 'judge')).toEqual([]);
+    // Olena's speech heard nothing: past her final's wait the floor is free, and Misha's question is judged.
+    expect(only(call.feed({ kind: 'speech', speaker: olena, on: false }), 'wait')).toHaveLength(1);
+    const [judge] = only(call.feed({ kind: 'timer', key: 'boundary:p2' }), 'judge');
+    expect(judge.state.latest).toEqual({ speaker: 'Misha', text: 'Dan, what time is it?' });
+  });
+
+  it('a stop drops the judge in flight: its verdict, asked before the stop, acts on nothing', () => {
+    const call = new Call();
+    wakeAndSpeak(call, 'Dan, tell me a long story.', 'Once upon a time...', 1);
+    const [inFlight] = only(call.say(misha, 'u2', 'And then a joke.'), 'judge');
+    expect(only(call.say(misha, 'u3', 'Stop.'), 'stop_playback')).toHaveLength(1);
+    expect(call.verdict(inFlight.windowVersion, 'answer')).toEqual([]);
+    expect(call.lastLog('verdict_dropped')).toMatchObject({ reason: 'superseded' });
   });
 
   it('on a voice call, a timer is no boundary while the VAD says the caller still speaks', () => {
