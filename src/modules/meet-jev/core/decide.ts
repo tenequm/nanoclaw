@@ -250,7 +250,7 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     if (action === 'answer') wake(state, judging.speakerId, judging.uttId, judging.trigger);
     return;
   }
-  const action = chosen(state, verdict);
+  const action = chosen(state, verdict, judging.addressedByName);
   log(state, 'decision', {
     ...trigger,
     jev: { choice: verdict.action, probabilities: verdict.probabilities, confidence: verdict.confidence },
@@ -265,12 +265,15 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
   }
 }
 
-/** The action to take: `stop` and `continue` only when the facts allow them, each over its threshold. */
-function chosen(state: CallState, verdict: Verdict): Action {
+/**
+ * The action to take: `stop` and `continue` only when the facts allow them, each over its threshold. Answering
+ * a lone human or a vocative is low-risk, so both take the one-caller bar; named hold-backs score near zero.
+ */
+function chosen(state: CallState, verdict: Verdict, addressedByName: boolean): Action {
   const { thresholds } = state.policy;
+  const lowRisk = humansInRoom(state) <= 1 || addressedByName;
   const over = (action: Exclude<Action, 'stay_silent'>) => {
-    const threshold =
-      action === 'answer' && humansInRoom(state) <= 1 ? state.policy.oneCaller.answer : thresholds[action];
+    const threshold = action === 'answer' && lowRisk ? state.policy.oneCaller.answer : thresholds[action];
     return verdict.action === action && verdict.probabilities[action] >= threshold.p;
   };
   if ((agentSpeaking(state) || pendingAnswer(state)) && over('stop')) return 'stop';

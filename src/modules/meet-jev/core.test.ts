@@ -924,6 +924,13 @@ describe('room size and probability-only routing', () => {
     expect(only(call.verdict(judge.windowVersion, 'answer', p, 0), 'turn')).toHaveLength(p >= 0.7 ? 1 : 0);
   });
 
+  it.each([0.49, 0.5])('accepts 0.5 for a named question in a group: %s', (p) => {
+    const call = new Call('meet');
+    call.feed({ kind: 'presence', speaker: misha, joined: true }, { kind: 'presence', speaker: olena, joined: true });
+    const [judge] = only(call.say(misha, 'u1', 'Dan, what time is it?'), 'judge');
+    expect(only(call.verdict(judge.windowVersion, 'answer', p, 0), 'turn')).toHaveLength(p >= 0.5 ? 1 : 0);
+  });
+
   it('makes a verdict stale when a silent human joins', () => {
     const call = new Call('meet');
     const [judge] = only(call.say(misha, 'u1', 'What time is it?'), 'judge');
