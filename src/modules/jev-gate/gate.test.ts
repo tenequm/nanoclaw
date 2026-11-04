@@ -24,6 +24,9 @@ vi.mock('../../config.js', async () => {
     ...actual,
     DATA_DIR: '/tmp/nanoclaw-test-jev-gate',
     TIMEZONE: 'UTC',
+    // The defaults, not a host's .env (bl routes Jev through OpenRouter).
+    JEV_URL: 'https://api.typesafe.ai/v1/systemone',
+    JEV_MODEL: 'jev-latest',
     get JEV_API_KEY() {
       return env.apiKey;
     },
