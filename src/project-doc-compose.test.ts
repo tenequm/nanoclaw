@@ -4,7 +4,6 @@ import {
   RICH_MESSAGES_BODY,
   RICH_MESSAGES_SECTION,
 } from './channels/telegram-grammy/agent-docs.js';
-import { createMessagingGroup, createMessagingGroupAgent } from './db/messaging-groups.js';
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -22,6 +21,8 @@ import {
   updateContainerConfigJson,
 } from './db/container-configs.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
+import './channels/slack.js';
+import { createMessagingGroup, createMessagingGroupAgent } from './db/messaging-groups.js';
 import { PERSONA_PREPEND_FILE } from './group-persona.js';
 import { log } from './log.js';
 import {
@@ -529,6 +530,7 @@ it('gates resident skill prose by agent and fails closed on errors', async () =>
   );
   expect(await compose(await seed('ag-skill-allowed', 'skill-allowed'))).toContain('# NanoClaw Skill: fixture-gateway');
 });
+
 async function withRealContainer<T>(fn: () => Promise<T>): Promise<T> {
   const root = fs.mkdtempSync(path.join(TEST_ROOT, 'real-skills-'));
   fs.mkdirSync(path.join(root, 'container'));
@@ -544,6 +546,33 @@ async function withRealContainer<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+async function wire(ag: AgentGroup, mgId: string, channelType: string, instance = channelType): Promise<void> {
+  const createdAt = new Date().toISOString();
+  await createMessagingGroup({
+    id: mgId,
+    channel_type: channelType,
+    platform_id: `${channelType}:${mgId}`,
+    instance,
+    name: mgId,
+    is_group: 1,
+    unknown_sender_policy: 'public',
+    created_at: createdAt,
+  });
+  await createMessagingGroupAgent({
+    id: `mga-${mgId}`,
+    messaging_group_id: mgId,
+    agent_group_id: ag.id,
+    engage_mode: 'mention',
+    engage_pattern: null,
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'shared',
+    priority: 0,
+    threads: 0,
+    created_at: createdAt,
+  });
+}
+
 /** One composed section, up to the next composed heading; the base has headings of its own. */
 function composedSection(doc: string, name: string): string {
   const start = doc.indexOf(`# ${name}\n\n`);
@@ -554,33 +583,6 @@ function composedSection(doc: string, name: string): string {
 }
 
 describe('Telegram project sections', () => {
-  async function wire(ag: AgentGroup, mgId: string, channelType: string, instance = channelType): Promise<void> {
-    const createdAt = new Date().toISOString();
-    await createMessagingGroup({
-      id: mgId,
-      channel_type: channelType,
-      platform_id: `${channelType}:${mgId}`,
-      instance,
-      name: mgId,
-      is_group: 1,
-      unknown_sender_policy: 'public',
-      created_at: createdAt,
-    });
-    await createMessagingGroupAgent({
-      id: `mga-${mgId}`,
-      messaging_group_id: mgId,
-      agent_group_id: ag.id,
-      engage_mode: 'mention',
-      engage_pattern: null,
-      sender_scope: 'all',
-      ignored_message_policy: 'drop',
-      session_mode: 'shared',
-      priority: 0,
-      threads: 0,
-      created_at: createdAt,
-    });
-  }
-
   it('composes the Telegram formatting guide for a Telegram-wired agent, whatever its skill list', async () => {
     const tg = await seed('ag-tg-fmt', 'tg-fmt-group');
     await wire(tg, 'mg-tg-fmt', 'telegram');
@@ -621,4 +623,23 @@ describe('Telegram project sections', () => {
     await updateContainerConfigScalars(slackOnly.id, { rich_messages: 1 });
     expect(await compose(slackOnly)).not.toContain(`# ${RICH_MESSAGES_SECTION}`);
   });
+});
+
+describe('Slack resident instructions', () => {
+  it.each(['all', ['slack-construct']] as const)(
+    'gates room prose by Slack wiring with selection %j',
+    async (selection) => {
+      const slack = await seed('ag-slack-skills', 'slack-skills');
+      await wire(slack, 'mg-slack-skills', 'slack', 'slack-secondary');
+      await updateContainerConfigJson(slack.id, 'skills', selection);
+      const slackDoc = await withRealContainer(() => compose(slack));
+      expect(slackDoc).toContain('# NanoClaw Skill: slack-construct');
+      expect(slackDoc).toContain(
+        fs.readFileSync(path.join(REPO_ROOT, 'container/skills/slack-construct/instructions.md'), 'utf8').trim(),
+      );
+      const other = await seed('ag-other-skills', 'other-skills');
+      await wire(other, 'mg-other-skills', 'telegram');
+      expect(await withRealContainer(() => compose(other))).not.toContain('# NanoClaw Skill: slack-construct');
+    },
+  );
 });

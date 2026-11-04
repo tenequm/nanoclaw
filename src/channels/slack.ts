@@ -16,12 +16,14 @@
  */
 import { createSlackAdapter, type SlackAdapter } from '@chat-adapter/slack';
 
+import { isAgentWiredToChannel } from '../db/messaging-groups.js';
+import { registerResidentSkillGate } from '../project-doc-compose.js';
 import { readEnvFile } from '../env.js';
 import type { ChannelAdapter, ChannelDefaults } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { setSlackAuthorIsBotResolver } from './slack-a2a-guard.js';
-import { slackRawTextExtractor } from './slack-raw-text.js';
+import { createSlackMentionRewriter, slackRawTextExtractor } from './slack-raw-text.js';
 
 /**
  * Dedicated bot app on a threaded platform. group threads:true keeps
@@ -191,6 +193,7 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
   const bridge = createChatSdkBridge({
     adapter: slackAdapter,
     extractRawText: slackRawTextExtractor(slackAdapter),
+    rewriteInboundText: createSlackMentionRewriter(() => slackAdapter.botUserId),
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)
     concurrency: 'concurrent',
     supportsThreads: true,
@@ -267,3 +270,5 @@ for (const raw of (readEnvFile(['SLACK_INSTANCES']).SLACK_INSTANCES ?? '').split
     defaults: SLACK_DEFAULTS,
   });
 }
+
+registerResidentSkillGate('slack-construct', (group) => isAgentWiredToChannel(group.id, 'slack'));

@@ -30,10 +30,26 @@ export class SlackApiError extends Error {
   }
 }
 
+function encodeSlackBody(body: Record<string, unknown>): { contentType: string; encoded: string } {
+  const entries = Object.entries(body).filter(([, v]) => v !== undefined);
+  const primitive = entries.every(([, v]) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean');
+  if (!primitive) {
+    return { contentType: 'application/json; charset=utf-8', encoded: JSON.stringify(body) };
+  }
+  return {
+    contentType: 'application/x-www-form-urlencoded',
+    encoded: new URLSearchParams(entries.map(([k, v]): [string, string] => [k, String(v)])).toString(),
+  };
+}
+
 /**
- * POST one Web API method with a JSON body. Returns the parsed response when
- * `ok: true`; throws SlackApiError otherwise (network failure, timeout,
- * non-JSON body, or a Slack-side error string).
+ * POST one Web API method. A body of only primitive values goes
+ * form-encoded: Slack's read methods (conversations.members, …) reject JSON
+ * arguments with `invalid_arguments`, and every method accepts form
+ * encoding. A body carrying nested values (canvas changes, criteria) needs
+ * JSON. Returns the parsed response when `ok: true`; throws SlackApiError
+ * otherwise (network failure, timeout, non-JSON body, or a Slack-side error
+ * string).
  */
 export async function slackCall(
   token: string,
@@ -41,15 +57,16 @@ export async function slackCall(
   body: Record<string, unknown>,
   step: string,
 ): Promise<Record<string, unknown>> {
+  const { contentType, encoded } = encodeSlackBody(body);
   let res: Response;
   try {
     res = await fetch(`${SLACK_API}/${method}`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Type': contentType,
       },
-      body: JSON.stringify(body),
+      body: encoded,
       signal: AbortSignal.timeout(30_000),
     });
   } catch (err) {

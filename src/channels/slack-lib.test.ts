@@ -31,6 +31,10 @@ function mockFetch(impl: (url: string, init: RequestInit) => Promise<Response>) 
   return fn;
 }
 
+function formBody(init: RequestInit): Record<string, string> {
+  return Object.fromEntries(new URLSearchParams(init.body as string));
+}
+
 async function captureError(promise: Promise<unknown>): Promise<SlackApiError> {
   try {
     await promise;
@@ -46,7 +50,7 @@ afterEach(() => {
 });
 
 describe('slackCall request shaping', () => {
-  it('POSTs the method to slack.com/api with a JSON body, bearer token, and a timeout signal', async () => {
+  it('POSTs the method to slack.com/api with a bearer token and a timeout signal', async () => {
     const fetchMock = mockFetch(async () => jsonResponse({ ok: true, stuff: 1 }));
 
     const json = await slackCall(TOKEN, 'chat.postMessage', { channel: 'C1', text: 'hi' }, 'my-step');
@@ -57,9 +61,43 @@ describe('slackCall request shaping', () => {
     expect(url).toBe('https://slack.com/api/chat.postMessage');
     expect(init.method).toBe('POST');
     expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${TOKEN}`);
-    expect((init.headers as Record<string, string>)['Content-Type']).toContain('application/json');
-    expect(JSON.parse(init.body as string)).toEqual({ channel: 'C1', text: 'hi' });
     expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('form-encodes a read method whose arguments are all primitives', async () => {
+    const fetchMock = mockFetch(async () => jsonResponse({ ok: true, members: [] }));
+
+    await slackCall(
+      TOKEN,
+      'conversations.members',
+      { channel: 'G1', limit: 200, include_locale: true, cursor: undefined },
+      's',
+    );
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/x-www-form-urlencoded');
+    expect(init.body).toBe('channel=G1&limit=200&include_locale=true');
+  });
+
+  it('form-encodes an empty body', async () => {
+    const fetchMock = mockFetch(async () => jsonResponse({ ok: true, user_id: 'U1' }));
+
+    await slackCall(TOKEN, 'auth.test', {}, 's');
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/x-www-form-urlencoded');
+    expect(init.body).toBe('');
+  });
+
+  it('sends JSON when any argument is nested', async () => {
+    const fetchMock = mockFetch(async () => jsonResponse({ ok: true }));
+    const body = { canvas_id: 'F1', changes: [{ operation: 'delete', section_id: 'temp:1' }] };
+
+    await slackCall(TOKEN, 'canvases.edit', body, 's');
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/json; charset=utf-8');
+    expect(JSON.parse(init.body as string)).toEqual(body);
   });
 });
 
@@ -135,7 +173,7 @@ describe('slackConversationsOpen', () => {
     await expect(slackConversationsOpen(TOKEN, ['U1', 'U2', 'U3'], 's')).resolves.toBe('D777');
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toEqual({ users: 'U1,U2,U3' });
+    expect(formBody(init)).toEqual({ users: 'U1,U2,U3' });
   });
 
   it('throws when the response has no channel id', async () => {
@@ -156,7 +194,7 @@ describe('slackPostMessage', () => {
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('https://slack.com/api/chat.postMessage');
-    expect(JSON.parse(init.body as string)).toEqual({ channel: 'C1', text: 'hello there' });
+    expect(formBody(init)).toEqual({ channel: 'C1', text: 'hello there' });
   });
 
   it('tags failures with the generic default step unless the caller passes one', async () => {
@@ -210,10 +248,10 @@ describe('slackConversationsMembers', () => {
     await expect(slackConversationsMembers(TOKEN, 'G1', 's')).resolves.toEqual(['U1', 'U2', 'U3']);
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    const firstBody = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string);
-    const secondBody = JSON.parse((fetchMock.mock.calls[1] as [string, RequestInit])[1].body as string);
-    expect(firstBody).toEqual({ channel: 'G1', limit: 200 });
-    expect(secondBody).toEqual({ channel: 'G1', limit: 200, cursor: 'cur2' });
+    const firstBody = formBody((fetchMock.mock.calls[0] as [string, RequestInit])[1]);
+    const secondBody = formBody((fetchMock.mock.calls[1] as [string, RequestInit])[1]);
+    expect(firstBody).toEqual({ channel: 'G1', limit: '200' });
+    expect(secondBody).toEqual({ channel: 'G1', limit: '200', cursor: 'cur2' });
   });
 
   it('stops at the page cap even if Slack keeps returning cursors', async () => {

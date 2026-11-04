@@ -26,3 +26,5 @@ import './agent-to-agent/index.js';
 import './self-mod/index.js';
 import './topic-autowire/index.js';
 import './community-portal/index.js';
+import './slack-room-membership/index.js';
+import './slack-onboarding/index.js';
