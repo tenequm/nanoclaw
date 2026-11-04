@@ -6495,4 +6495,19 @@ describe('meeting calls', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('a `pause` meeting sends the woken turn on the pause', async () => {
+    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: true } });
+    room.remoteParticipants.clear();
+    room.remoteParticipants.set('meet-bridge-meet-r1', {});
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    v.voice.review.serve = vi.fn();
+    await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
+    await say(v, 'I think we can ship on Friday', 'I think we can ship on Friday');
+    await say(v, 'Hey Dan, what is two plus two?', 'Hey Dan, what is two plus two?');
+    await vi.waitFor(() => expect(utterances(host)).toEqual(['what is two plus two?']));
+    host.emit({ type: 'end', reason: 'test over' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+  });
 });

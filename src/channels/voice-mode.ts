@@ -463,9 +463,9 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     ? createMeetings(livekit, config.meetBridge, { joinTimeoutMs: config.meetingJoinTimeoutMs })
     : null;
   const meetings: Meetings | null = meetingsOnCore && {
-    start: (platformId, meetingUrl) =>
+    start: (platformId, meetingUrl, options) =>
       connected && setup
-        ? meetingsOnCore.start(platformId, meetingUrl)
+        ? meetingsOnCore.start(platformId, meetingUrl, options)
         : Promise.resolve({ ok: false, error: 'stopped' }),
     leave: (platformId) => meetingsOnCore.leave(platformId),
   };

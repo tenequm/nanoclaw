@@ -6,7 +6,8 @@
  * speech plays into the meeting. The call talks in this chat, which becomes the line's call chat, so the
  * turns addressed to the agent and its answers land here. Meeting turns come from the meeting as a guest,
  * never from the line's caller. `/meet leave` sends the bot away; a call on the line's link ends a meeting,
- * as any newer call does. Off until RECALL_API_KEY and its settings are there.
+ * as any newer call does. Off until RECALL_API_KEY and its settings are there. A meeting turn ends on a send
+ * word, as on the call page with "a pause also sends" off; `pause` after the link makes the pause send it too.
  */
 import type { InboundEvent } from './adapter.js';
 import { getAgentGroup } from '../db/agent-groups.js';
@@ -58,9 +59,15 @@ export type MeetingStart =
   | { ok: false; error: Exclude<CallRefusal['error'], 'limit'> | 'bot' }
   | { ok: false; error: 'limit'; message: string };
 
+/** How a meeting runs, from the command's words after the link. */
+export interface MeetingOptions {
+  /** `pause`: a pause sends the turn, not only the send word. */
+  pauseSends: boolean;
+}
+
 /** The voice channel's meetings: one per line at most, as calls are. */
 export interface Meetings {
-  start(platformId: string, meetingUrl: string): Promise<MeetingStart>;
+  start(platformId: string, meetingUrl: string, options: MeetingOptions): Promise<MeetingStart>;
   /** Ends the line's meeting call; false when it has none. */
   leave(platformId: string): boolean;
 }
@@ -77,7 +84,7 @@ export function createMeetings(
   /** The meeting call running on each line, by call id. */
   const live = new Map<string, string>();
 
-  const start = async (platformId: string, meetingUrl: string): Promise<MeetingStart> => {
+  const start = async (platformId: string, meetingUrl: string, options: MeetingOptions): Promise<MeetingStart> => {
     /** The bot, once its create was sent; whether the call already ended. */
     const meeting: { bot?: Promise<string | null>; ended: boolean } = { ended: false };
     const leaveBot = (): Promise<void> | undefined => meeting.bot?.then((id) => (id ? bridge.leave(id) : undefined));
@@ -91,7 +98,10 @@ export function createMeetings(
         departureTimeout: 10,
         maxParticipants: MEETING_MAX_PARTICIPANTS,
       },
-      job: ({ roomName }) => ({ callerIdentity: bridgeIdentity(roomName), meeting: { pauseSends: false } }),
+      job: ({ roomName }) => ({
+        callerIdentity: bridgeIdentity(roomName),
+        meeting: { pauseSends: options.pauseSends },
+      }),
       sender: () => ({ id: null, name: MEETING_SENDER }),
       turnNote: meetingReplyNote,
       joined: (call, say) => say(`\u{1F4DE} ${call.line.agent.name} is in the meeting.`),
@@ -121,7 +131,7 @@ export function createMeetings(
       return { ok: false, error: 'bot' };
     }
     if (meeting.ended) return { ok: false, error: 'stopped' };
-    log.info('meet: meeting call started', { platformId, callId: call.callId, room: call.roomName, botId });
+    log.info('meet: meeting call started', { platformId, callId: call.callId, room: call.roomName, botId, ...options });
     return { ok: true };
   };
 
@@ -136,7 +146,11 @@ export function createMeetings(
   };
 }
 
-export type MeetCommand = { action: 'join'; url: string } | { action: 'leave' } | { action: 'usage' };
+/** `pauseSends` only when on. */
+export type MeetCommand =
+  | { action: 'join'; url: string; pauseSends?: true }
+  | { action: 'leave' }
+  | { action: 'usage' };
 
 /**
  * A Google Meet link as typed, or as Slack wraps it (`<https://...>` or `<https://...|label>`), as its origin and
@@ -156,15 +170,21 @@ export function meetingUrl(raw: string): string | null {
   return `${url.origin}${url.pathname}`;
 }
 
-/** `/meet <url>`, `/meet leave`, `/meet@<bot> ...` and, on Slack, `!meet ...`; null for any other message. */
+/**
+ * `/meet <url>`, `/meet <url> pause` (in either order), `/meet leave`, `/meet@<bot> ...` and, on Slack,
+ * `!meet ...`; null for any other message.
+ */
 export function parseMeetCommand(text: string, channelType: string): MeetCommand | null {
   const match = /^\s*([!/]meet(?:@\S*)?)(?!\S)(.*)$/is.exec(text);
   if (!match) return null;
   if (match[1][0] === '!' && !BANG_CHANNELS.has(channelType)) return null;
   const args = match[2].trim().split(/\s+/).filter(Boolean);
   if (args.length === 1 && args[0].toLowerCase() === 'leave') return { action: 'leave' };
-  const url = args.length === 1 ? meetingUrl(args[0]) : null;
-  return url ? { action: 'join', url } : { action: 'usage' };
+  const pauses = args.filter((arg) => arg.toLowerCase() === 'pause');
+  const links = args.filter((arg) => arg.toLowerCase() !== 'pause');
+  const url = pauses.length <= 1 && links.length === 1 ? meetingUrl(links[0]) : null;
+  if (!url) return { action: 'usage' };
+  return { action: 'join', url, ...(pauses.length ? { pauseSends: true as const } : {}) };
 }
 
 /** What `/meet` needs of the voice channel: its meetings, null when they are not configured. */
@@ -177,7 +197,7 @@ export type MeetOutcome =
   | { kind: 'usage' }
   | { kind: 'voice-unavailable' | 'not-configured' | 'no-key'; agentName: string }
   | { kind: 'other-caller'; agentName: string; caller?: string }
-  | { kind: 'started'; agentName: string; url: string }
+  | { kind: 'started'; agentName: string; url: string; pauseSends?: true }
   | { kind: 'failed'; agentName: string; start: Extract<MeetingStart, { ok: false }> }
   | { kind: 'left' | 'no-meeting'; agentName: string };
 
@@ -231,9 +251,11 @@ export async function runMeetCommand(
   if (claim.kind === 'no-key') return { kind: 'no-key', agentName };
   if (claim.kind === 'other-caller') return { kind: 'other-caller', agentName, caller: claim.caller };
   log.info('/meet: joining a meeting', { agentGroupId: ag.id, messagingGroupId: mg.id, line: claim.line.line_id });
-  const start = await meetings.start(linePlatformId(claim.line.line_id), command.url);
+  const start = await meetings.start(linePlatformId(claim.line.line_id), command.url, {
+    pauseSends: command.pauseSends === true,
+  });
   if (!start.ok) return { kind: 'failed', agentName, start };
-  return { kind: 'started', agentName, url: command.url };
+  return { kind: 'started', agentName, url: command.url, ...(command.pauseSends ? { pauseSends: true as const } : {}) };
 }
 
 /** The /meet reply, or null when the sender gets no answer. */
@@ -246,7 +268,10 @@ export function meetCommandReply(outcome: MeetOutcome, cmd = '/meet'): string | 
     case 'several-agents':
       return `This chat has several agents you administer; run ${cmd} in a chat with just one of them.`;
     case 'usage':
-      return `Send ${cmd} <Google Meet link> to bring the agent into a meeting, or ${cmd} leave to send it away.`;
+      return (
+        `Send ${cmd} <Google Meet link> to bring the agent into a meeting, or ${cmd} leave to send it away. ` +
+        `A turn ends on a send word; add pause (${cmd} <link> pause) to send it on a pause too.`
+      );
     case 'voice-unavailable':
       return `${outcome.agentName}: voice calls are off on this host (the voice-mode channel is not configured).`;
     case 'not-configured':
@@ -259,7 +284,8 @@ export function meetCommandReply(outcome: MeetOutcome, cmd = '/meet'): string | 
       return (
         `\u{1F4DE} ${outcome.agentName} is asking to join ${outcome.url}. ` +
         `Admit "${outcome.agentName}" from the meeting's lobby; it answers when someone says its wake phrase, ` +
-        `and a turn ends on a send word. What it is asked and its answers show here. ${cmd} leave sends it away.`
+        `and a turn ends on a send word${outcome.pauseSends ? ' or a pause' : ''}. What it is asked and its answers ` +
+        `show here. ${cmd} leave sends it away.`
       );
     case 'failed':
       return `${outcome.agentName} could not join the meeting: ${failureText(outcome.start)}`;

@@ -63,6 +63,16 @@ describe('parseMeetCommand', () => {
     expect(parseMeetCommand('lets meet', 'telegram')).toBeNull();
   });
 
+  it('takes pause on either side of the link, once', () => {
+    const pause = { action: 'join', url: MEET, pauseSends: true };
+    expect(parseMeetCommand(`/meet ${MEET} pause`, 'telegram')).toEqual(pause);
+    expect(parseMeetCommand(`/meet PAUSE ${MEET}`, 'telegram')).toEqual(pause);
+    expect(parseMeetCommand(`!meet <${MEET}> pause`, 'slack')).toEqual(pause);
+    expect(parseMeetCommand(`/meet ${MEET} pause pause`, 'telegram')).toEqual({ action: 'usage' });
+    expect(parseMeetCommand('/meet pause', 'telegram')).toEqual({ action: 'usage' });
+    expect(parseMeetCommand(`/meet ${MEET} pause please`, 'telegram')).toEqual({ action: 'usage' });
+  });
+
   it('accepts only https Google Meet links', () => {
     expect(meetingUrl(MEET)).toBe(MEET);
     expect(meetingUrl('http://meet.google.com/abc')).toBeNull();
@@ -114,12 +124,12 @@ describe('runMeetCommand', () => {
   const mg = (id: string) => ({ id, instance: null, channel_type: 'chat', is_group: 0 }) as unknown as MessagingGroup;
 
   function fakeMeetings(start: MeetingStart = { ok: true }) {
-    const started: Array<{ platformId: string; url: string }> = [];
+    const started: Array<{ platformId: string; url: string; pauseSends: boolean }> = [];
     const left: string[] = [];
     const control: MeetingControl = {
       meetings: {
-        start: async (platformId, url) => {
-          started.push({ platformId, url });
+        start: async (platformId, url, { pauseSends }) => {
+          started.push({ platformId, url, pauseSends });
           return start;
         },
         leave: (platformId) => {
@@ -179,9 +189,22 @@ describe('runMeetCommand', () => {
     expect(outcome).toEqual({ kind: 'started', agentName: 'Andy', url: MEET });
     const line = await getVoiceModeLineForAgent('ag-1');
     expect(line).toMatchObject({ owner_user_id: OWNER, messaging_group_id: 'mg-dm' });
-    expect(m.started).toEqual([{ platformId: linePlatformId(line!.line_id), url: MEET }]);
+    expect(m.started).toEqual([{ platformId: linePlatformId(line!.line_id), url: MEET, pauseSends: false }]);
     expect(meetCommandReply(outcome)).toContain('Andy is asking to join https://meet.google.com/abc-defg-hij');
+    expect(meetCommandReply(outcome)).toContain('a turn ends on a send word.');
     expect(meetCommandReply({ kind: 'usage' }, '!meet')).toContain('!meet <Google Meet link>');
+    expect(meetCommandReply({ kind: 'usage' }, '!meet')).toContain('!meet <link> pause');
+
+    const paused = await runMeetCommand(
+      mg('mg-dm'),
+      null,
+      OWNER,
+      { ...join, pauseSends: true },
+      { meetings: m.control },
+    );
+    expect(paused).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, pauseSends: true });
+    expect(m.started.at(-1)?.pauseSends).toBe(true);
+    expect(meetCommandReply(paused)).toContain('a turn ends on a send word or a pause.');
   });
 
   it('needs the host key only to make a first line', async () => {

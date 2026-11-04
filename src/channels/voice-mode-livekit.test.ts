@@ -1959,7 +1959,7 @@ describe('meetings: the /meet call kind on the call core', () => {
 
   /** Starts a meeting on the line and attaches its worker, the bridge page in the room. */
   async function startMeeting(): Promise<FakeWorker> {
-    expect(await h.adapter.meetings!.start(LINE, MEET)).toEqual({ ok: true });
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false })).toEqual({ ok: true });
     const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
     expect((await worker.post('joined')).status).toBe(200);
     return worker;
@@ -1975,7 +1975,7 @@ describe('meetings: the /meet call kind on the call core', () => {
   });
 
   it("opens a meet room whose caller is the bridge page, with the meeting's caps, and sends the bot there", async () => {
-    expect(await h.adapter.meetings!.start(LINE, MEET)).toEqual({ ok: true });
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false })).toEqual({ ok: true });
     const [room] = h.lk.rooms;
     expect(room).toMatch(/^meet-0123456789ab-[0-9a-f]{12}$/);
     expect(h.lk.roomOptions).toEqual([{ name: room, emptyTimeout: 600, departureTimeout: 10, maxParticipants: 3 }]);
@@ -1986,6 +1986,11 @@ describe('meetings: the /meet call kind on the call core', () => {
       maxDurationMs: MEETING_MAX_DURATION_MS,
     });
     expect(bots.joined).toEqual([{ meetingUrl: MEET, botName: 'Andy', roomName: room }]);
+  });
+
+  it('tells the worker a `pause` meeting sends on the pause', async () => {
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: true })).toEqual({ ok: true });
+    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: true });
   });
 
   it('routes meeting turns as guest turns with the meeting note, and says in the chat when it joined', async () => {
@@ -2014,7 +2019,7 @@ describe('meetings: the /meet call kind on the call core', () => {
 
   it('ends the call when the bot cannot be created', async () => {
     bots.fail = true;
-    expect(await h.adapter.meetings!.start(LINE, MEET)).toEqual({ ok: false, error: 'bot' });
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false })).toEqual({ ok: false, error: 'bot' });
     await vi.waitFor(() => expect(h.lk.deleted).toEqual(h.lk.rooms));
     expect(h.adapter.meetings!.leave(LINE)).toBe(false);
   });
