@@ -28,7 +28,7 @@ import {
   type ReviewOp,
   type ReviewRequest,
 } from './channels/voice-mode-protocol.js';
-import type { Heard } from './voice-mode-gemini-live.js';
+import { turnText, type Heard } from './voice-mode-gemini-live.js';
 import type { ChoiceDetails } from './channels/voice-mode-tts-catalog.js';
 import type { TtsAudio, TtsChoice, TtsInstance } from './voice-mode-tts.js';
 import {
@@ -66,7 +66,6 @@ import {
   TURN_SETTLE_MS,
   TurnCapture,
   TurnTaking,
-  turnText,
   CueFeed,
   cueFrames,
   deEsser,

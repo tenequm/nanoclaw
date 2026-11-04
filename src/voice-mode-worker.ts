@@ -127,7 +127,6 @@ import {
   type TextSource,
   type TranscriberOptions,
 } from './voice-mode-gemini-live.js';
-export { turnText, type TextSource };
 import {
   providerKeysFrom,
   readTtsChoice,
@@ -5311,10 +5310,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         loop.onReply(event.replyId, event.text);
       } else if (event.type === 'stop') loop.onStop();
       else if (event.type === 'words') loop.onWords();
-      else {
-        const revoke = event as { type: string; replyId?: unknown };
-        if (revoke.type === 'revoke' && typeof revoke.replyId === 'string') loop.onRevoke(revoke.replyId);
-      }
+      else if (event.type === 'revoke') loop.onRevoke(event.replyId);
     }, hostLink.signal)
     .then(
       () => end('host link closed', true),
