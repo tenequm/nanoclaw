@@ -34,7 +34,8 @@
  * A jev call (`/voice jev` or `/meet <link> jev`, the job's `jev`) takes no `agent/utterance` turns from
  * the worker: the meet-jev module decides when the agent gets a turn (submitTurn, with the same checks)
  * and which of its replies are spoken; the rest are only in the call chat. A jev meeting's transcript
- * reaches its loop from Recall (`jevCall`), not from the worker.
+ * reaches its loop from the host's transcription of each participant's Recall audio (`jevCall`), not
+ * from the worker.
  *
  * A call talks in one of the agent's chats (its *call chat*), not on the voice
  * line: the line's `/voice` chat (its voice_mode_lines binding), while that

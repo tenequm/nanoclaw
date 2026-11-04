@@ -7030,7 +7030,7 @@ describe('jev: the loop', () => {
     h.loop.onReply('r1', 'One.');
     await tick(1);
     h.start(h.lines[0]);
-    // Recall's partial beat the VAD: the words come first, then the speech that carries them.
+    // The host's partial beat the VAD: the words come first, then the speech that carries them.
     h.loop.onWords();
     await tick(200);
     h.loop.onSpeech(true, 0);

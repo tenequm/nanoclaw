@@ -4693,9 +4693,9 @@ export class CallTelemetry {
 // no wake word, no cues: the VAD opens a transcription activity at the caller's speech and closes it
 // at its end, every partial and final goes to the host as an utterance with the speech marks, and the
 // worker speaks only what the host sends, reporting what became of each line. The host decides the
-// rest (`src/modules/meet-jev/`). On a meeting (`meta.meeting`) Recall transcribes each participant for
-// the host, so the worker transcribes nothing: it reports its VAD marks and playback, and the reflex's
-// words come from the host's `words`.
+// rest (`src/modules/meet-jev/`). On a meeting (`meta.meeting`) Recall streams each participant's audio
+// to the host, which transcribes it, so the worker transcribes nothing: it reports its VAD marks and
+// playback, and the reflex's words come from the host's `words`.
 // ---------------------------------------------------------------------------------------------
 
 /**
@@ -4705,7 +4705,7 @@ export class CallTelemetry {
  */
 export const JEV_BARGE_MS = 300;
 /**
- * How far the host's `words` (a meeting's) may miss the worker's VAD: Recall's partial and the local
+ * How far the host's `words` (a meeting's) may miss the worker's VAD: the host's partial and the local
  * speech marks run on separate clocks and transports, so the words of one speech can land just before
  * its speech-on or just after its speech-off.
  */
@@ -4823,7 +4823,7 @@ export class JevReporter {
 }
 
 export interface JevLoopDeps {
-  /** None on a meeting: the host has Recall's transcript, and the reflex its `words`. */
+  /** None on a meeting: the host transcribes each participant, and the reflex has its `words`. */
   transcriber?: Transcription;
   /** One line into the room; `ready` is awaited before its first audio, `signal` aborts its playout. */
   speak(text: string, ready: () => Promise<void>, signal: AbortSignal): Promise<LineOutcome>;
@@ -5241,7 +5241,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     return s.abandon('could not set up the call audio', { err });
   }
   callLog.info('voice-mode worker: a jev call', {
-    ...(meta.meeting ? { meeting: true, transcription: 'recall' } : { languages: languages.codes }),
+    ...(meta.meeting ? { meeting: true, transcription: 'host' } : { languages: languages.codes }),
   });
   // The page's RPCs: only its settings do anything here (the speech choice); review mode is not offered.
   if (!ending) {
