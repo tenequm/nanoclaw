@@ -9,6 +9,18 @@ import net, { type AddressInfo } from 'node:net';
 import { AccessToken } from 'livekit-server-sdk';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+/** The Jev key a jev call needs; a test empties it for a host without one. */
+const jevKey = vi.hoisted(() => ({ value: 'jev-test-key' }));
+vi.mock('../config.js', async () => {
+  const actual = await vi.importActual('../config.js');
+  return {
+    ...actual,
+    get JEV_API_KEY() {
+      return jevKey.value;
+    },
+  };
+});
+
 import type { InboundEvent, InboundMessage, OutboundMessage } from './adapter.js';
 import {
   createVoiceModeAdapter,
@@ -29,6 +41,7 @@ import {
   CALL_DEPTH_NOTE,
   CALL_LANGUAGE_NOTE,
   callLanguageNote,
+  MAX_UTTERANCES_PER_MINUTE,
   type LiveKitServerApi,
   type LiveKitVoiceConfig,
   type MirrorApi,
@@ -46,6 +59,7 @@ import {
   CALL_TURN_TOPIC,
   CALL_UPDATING_ATTRIBUTE,
   MAX_JEV_EVENTS_PER_POST,
+  MAX_JEV_POST_BYTES,
   wakePhrase,
 } from './voice-mode-protocol.js';
 import { log } from '../log.js';
@@ -2220,8 +2234,8 @@ describe('/voice jev on the call core', () => {
   let seen: CallEvent[];
 
   /**
-   * A core for the host seams only: a final utterance is a turn (`stop` stops playback instead); a reply
-   * is spoken, shown (`show: ...`) or dropped (`[silent]`).
+   * A core for the host seams only: a final utterance is a turn (`stop` stops playback instead; one
+   * starting `instead:` supersedes `u1`); a reply is spoken, shown (`show: ...`) or dropped (`[silent]`).
    */
   const hostCore: CallCore<null> = {
     initial: () => null,
@@ -2232,7 +2246,10 @@ describe('/voice jev on the call core', () => {
     decide: (_state, event): Command[] => {
       if (event.kind === 'utterance' && event.final) {
         if (event.text === 'stop') return [{ kind: 'stop_playback' }];
-        return [{ kind: 'turn', key: event.uttId, message: event.text, note: `WINDOW [Ethan] ${event.text}` }];
+        const supersedes = event.text.startsWith('instead:') ? { supersedes: 'u1' } : {};
+        return [
+          { kind: 'turn', key: event.uttId, message: event.text, note: `WINDOW [Ethan] ${event.text}`, ...supersedes },
+        ];
       }
       if (event.kind !== 'reply') return [];
       if (event.text === '[silent]') return [{ kind: 'drop', replyId: event.replyId }];
@@ -2293,6 +2310,51 @@ describe('/voice jev on the call core', () => {
     expect(h.lk.dispatches.at(-1)!.metadata).not.toHaveProperty('jev');
     const worker = await startJevCall();
     expect(worker.meta.jev).toBe(true);
+    worker.close();
+  });
+
+  it('starts a plain call for jev=1 on a host without the Jev key', async () => {
+    jevKey.value = '';
+    try {
+      expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+      expect(h.lk.dispatches.at(-1)!.metadata).not.toHaveProperty('jev');
+    } finally {
+      jevKey.value = 'jev-test-key';
+    }
+  });
+
+  it('waits out a slow route for a jev turn: one stored after the route timeout is a turn, not a failure', async () => {
+    await h.stop();
+    h = await startHarness(
+      { accessCheckIntervalMs: 60_000 },
+      {
+        mirrorApi: chat.api,
+        routeTimeoutMs: 100,
+        jev: { core: hostCore, judge: async () => ({ verdict: null, ms: 0 }) },
+      },
+    );
+    const worker = await startJevCall();
+    h.routing.mode = 'hang';
+    await worker.post('jev', { events: [final('u1', 'Dan, a slow one?')] });
+    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(seen.some((e) => e.kind === 'turn' || e.kind === 'turn_failed')).toBe(false);
+    h.routing.hung[0](true);
+    expect(await turnEvent('u1')).toMatchObject({ kind: 'turn', turnId: '1' });
+    worker.close();
+  });
+
+  it('stops waiting for a jev turn being routed once a newer one supersedes it', async () => {
+    const worker = await startJevCall();
+    h.routing.mode = 'hang';
+    await worker.post('jev', { events: [final('u1', 'Dan, first?')] });
+    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(1));
+    await worker.post('jev', { events: [final('u2', 'instead: Dan, second?')] });
+    expect(await turnEvent('u1')).toMatchObject({ kind: 'turn_failed', reason: '409: The turn was superseded' });
+    await vi.waitFor(() => expect(h.routing.hung).toHaveLength(2));
+    h.routing.hung[1](true);
+    expect(await turnEvent('u2')).toMatchObject({ kind: 'turn', turnId: '2' });
+    h.routing.hung[0](true);
     worker.close();
   });
 
@@ -2396,7 +2458,10 @@ describe('/voice jev on the call core', () => {
     // a 400 or a reset, on a connection of its own; nothing of it reaches the loop.
     const huge = JSON.stringify({
       callId: worker.meta.callId,
-      events: Array.from({ length: 64 }, (_, i) => final(`u${i}`, 'я'.repeat(4096))),
+      // Two UTF-8 bytes a character: twice the bound.
+      events: Array.from({ length: MAX_JEV_EVENTS_PER_POST }, (_, i) =>
+        final(`u${i}`, 'я'.repeat(MAX_JEV_POST_BYTES / MAX_JEV_EVENTS_PER_POST)),
+      ),
     });
     const outcome = await new Promise<number | 'reset' | undefined>((resolve) => {
       const req = http.request(
@@ -2426,19 +2491,19 @@ describe('/voice jev on the call core', () => {
 
   it('holds a jev turn to the call limits and access, as a worker turn', async () => {
     const worker = await startJevCall();
-    const batch = Array.from({ length: 21 }, (_, i) => final(`u${i}`, `q${i}`));
+    const batch = Array.from({ length: MAX_UTTERANCES_PER_MINUTE + 1 }, (_, i) => final(`u${i}`, `q${i}`));
     await worker.post('jev', { events: batch });
-    expect(await turnEvent('u20')).toMatchObject({
+    expect(await turnEvent(`u${MAX_UTTERANCES_PER_MINUTE}`)).toMatchObject({
       kind: 'turn_failed',
       reason: 'Too many utterances this minute',
     });
-    expect(seen.filter((e) => e.kind === 'turn')).toHaveLength(20);
+    expect(seen.filter((e) => e.kind === 'turn')).toHaveLength(MAX_UTTERANCES_PER_MINUTE);
     h.clock.now += MIN;
     h.access.enabled = false;
     // A caller who lost access gets no turn in: the check ends the call, and the loop with it.
     await worker.post('jev', { events: [final('late', 'still there?')] });
     await worker.waitFor((e) => e.type === 'end');
-    expect(h.events).toHaveLength(20);
+    expect(h.events).toHaveLength(MAX_UTTERANCES_PER_MINUTE);
     expect(seen.some((e) => 'key' in e && e.key === 'late')).toBe(false);
     worker.close();
   });
@@ -2517,20 +2582,24 @@ describe('/voice jev with the real core', () => {
       events: [
         { type: 'playback', replyId: 'r1', state: 'started', at: at() },
         { type: 'playback', replyId: 'r1', state: 'completed', at: at() },
+        // The worker's order: its final lands after its VAD end, and differs from the partial.
         { type: 'speech', on: true, at: at() },
-        { type: 'utterance', uttId: 'u2', text: 'and tomorrow?', final: true, at: at() },
+        { type: 'utterance', uttId: 'u2', text: 'and tomorrow', final: false, at: at() },
         { type: 'speech', on: false, at: at() },
+        { type: 'utterance', uttId: 'u2', text: 'And tomorrow?', final: true, at: at() },
       ],
     });
     await vi.waitFor(() => expect(h.inbound).toHaveLength(2));
+    await settle();
+    expect(h.inbound).toHaveLength(2);
     expect(asked).toHaveLength(1);
     expect(asked[0].window).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ text: 'It is nine.', agent: true }),
-        expect.objectContaining({ speaker: 'Ethan', text: 'and tomorrow?' }),
+        expect.objectContaining({ speaker: 'Ethan', text: 'And tomorrow?' }),
       ]),
     );
-    expect((h.inbound[1].content as { text: string }).text).toContain('<voice source="livekit">and tomorrow?</voice>');
+    expect((h.inbound[1].content as { text: string }).text).toContain('<voice source="livekit">And tomorrow?</voice>');
     worker.close();
   });
 });

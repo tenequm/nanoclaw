@@ -97,7 +97,7 @@ const MAX_AGENT_BODY_BYTES = 2 * MAX_UTTERANCE_TEXT_BYTES + 1024;
 const MAX_JEV_BODY_BYTES = MAX_JEV_POST_BYTES;
 /** The worker opens its event stream right after it reports the caller in; without it nothing reaches the caller. */
 const WORKER_STREAM_TIMEOUT_MS = 30_000;
-const MAX_UTTERANCES_PER_MINUTE = 20;
+export const MAX_UTTERANCES_PER_MINUTE = 20;
 /** The router has this long to store a turn in the agent's session, so the worker hears the 504 before it gives up. */
 const ROUTE_TIMEOUT_MS = WORKER_REQUEST_TIMEOUT_MS - 2_000;
 /** Turns routing at once on a call. The worker sends one at a time, so more is a worker gone wrong. */
@@ -1127,7 +1127,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
    * still store the turn then, and the worker hears `turn-stored` for its `turnKey`. The route timeout
    * counts from `receivedAt`, so the lookups before routing cannot push the answer past the worker's
    * own request timeout. `jev`: a jev call's turn, its note added to the kind's; one superseded
-   * (`signal`) before routing is not routed.
+   * (`signal`) before routing is not routed. Nobody waits on a jev turn's HTTP answer, so it has no
+   * route timeout: it waits for routing to finish, or for `signal`, and its outcome is then real.
    */
   const takeTurn = async (
     call: LiveKitCall,
@@ -1148,7 +1149,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         endCall(call, 'no chat to talk in');
         return { status: 409, body: 'The call has no chat to talk in' };
       }
-      if (jev?.signal.aborted) return { status: 409, body: 'superseded' };
+      if (jev?.signal.aborted) return { status: 409, body: 'The turn was superseded' };
       const utteranceId = String(++call.utterances);
       const sender = call.kind.sender(call.line);
       const message: InboundEvent['message'] = {
@@ -1176,7 +1177,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       const fields = { callId: call.callId, utteranceId };
       try {
         const budgetMs = Math.max(0, routeTimeoutMs - (host.now() - receivedAt));
-        const stored = await settleWithin(routed, budgetMs, 'timeout' as const);
+        const stored = jev
+          ? await untilAborted(routed, jev.signal)
+          : await settleWithin(routed, budgetMs, 'timeout' as const);
+        if (stored === 'aborted') return { status: 409, body: 'The turn was superseded' };
         if (stored === 'timeout') {
           log.warn('livekit-voice-mode: a turn did not reach the agent in time', fields);
           void routed.then(
@@ -1366,4 +1370,23 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
   engines.add(engine);
   return engine;
+}
+
+/** `promise`'s outcome, or 'aborted' as soon as `signal` aborts. */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T | 'aborted'> {
+  if (signal.aborted) return Promise.resolve('aborted');
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve('aborted');
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
 }
