@@ -6,10 +6,11 @@
  * speech plays into the meeting. The call talks in this chat, which becomes the line's call chat, so the
  * turns addressed to the agent and its answers land here. Meeting turns come from the meeting as a guest,
  * never from the line's caller. `/meet leave` sends the bot away; a call on the line's link ends a meeting,
- * as any newer call does. Off until RECALL_API_KEY and its settings are there. A meeting turn ends on a send
- * word, as on the call page with "a pause also sends" off; `pause` after the link makes the pause send it too.
- * `jev` runs the meet-jev loop instead (src/modules/meet-jev/): Recall transcribes each participant and
- * streams it to the host, and the loop decides when the agent speaks, addressed or invited.
+ * as any newer call does. Off until RECALL_API_KEY and its settings are there. A meeting runs the meet-jev
+ * loop (src/modules/meet-jev/) by default (`jev` after the link says so too): Recall streams each
+ * participant's own audio to the host, which transcribes it, and the loop decides when the agent speaks,
+ * addressed or invited. Without the Jev key, or with `send` after the link, a turn ends on a spoken send word,
+ * as on the call page with "a pause also sends" off; `pause` makes the pause send it too.
  */
 import type { InboundEvent } from './adapter.js';
 import { JEV_API_KEY } from '../config.js';
@@ -279,11 +280,15 @@ export function createMeetings(
   };
 }
 
-/** `pauseSends` and `jev` only when on. */
-export type MeetCommand =
-  | { action: 'join'; url: string; pauseSends?: true; jev?: true }
-  | { action: 'leave' }
-  | { action: 'usage' };
+/**
+ * How a meeting's turns are taken: `jev` the meet-jev loop, `send` a spoken send word, `pause` a send word
+ * or a pause.
+ */
+export type MeetMode = 'jev' | 'send' | 'pause';
+const MEET_MODES: readonly string[] = ['jev', 'send', 'pause'] satisfies MeetMode[];
+
+/** `mode` only when one was given: jev where the host has the Jev key, else send. */
+export type MeetCommand = { action: 'join'; url: string; mode?: MeetMode } | { action: 'leave' } | { action: 'usage' };
 
 /**
  * A Google Meet link as typed, or as Slack wraps it (`<https://...>` or `<https://...|label>`), as its origin and
@@ -304,8 +309,8 @@ export function meetingUrl(raw: string): string | null {
 }
 
 /**
- * `/meet <url>`, `/meet <url> pause`, `/meet <url> jev` (`pause` and `jev` in any order around the link),
- * `/meet leave`, `/meet@<bot> ...` and, on Slack, `!meet ...`; null for any other message.
+ * `/meet <url>`, with at most one of `jev`, `send` or `pause` before or after the link, `/meet leave`,
+ * `/meet@<bot> ...` and, on Slack, `!meet ...`; null for any other message.
  */
 export function parseMeetCommand(text: string, channelType: string): MeetCommand | null {
   const match = /^\s*([!/]meet(?:@\S*)?)(?!\S)(.*)$/is.exec(text);
@@ -313,17 +318,11 @@ export function parseMeetCommand(text: string, channelType: string): MeetCommand
   if (match[1][0] === '!' && !BANG_CHANNELS.has(channelType)) return null;
   const args = match[2].trim().split(/\s+/).filter(Boolean);
   if (args.length === 1 && args[0].toLowerCase() === 'leave') return { action: 'leave' };
-  const pauses = args.filter((arg) => arg.toLowerCase() === 'pause');
-  const jevs = args.filter((arg) => arg.toLowerCase() === 'jev');
-  const links = args.filter((arg) => !['pause', 'jev'].includes(arg.toLowerCase()));
-  const url = pauses.length <= 1 && jevs.length <= 1 && links.length === 1 ? meetingUrl(links[0]) : null;
+  const modes = args.map((arg) => arg.toLowerCase()).filter((arg) => MEET_MODES.includes(arg)) as MeetMode[];
+  const links = args.filter((arg) => !MEET_MODES.includes(arg.toLowerCase()));
+  const url = modes.length <= 1 && links.length === 1 ? meetingUrl(links[0]) : null;
   if (!url) return { action: 'usage' };
-  return {
-    action: 'join',
-    url,
-    ...(pauses.length ? { pauseSends: true as const } : {}),
-    ...(jevs.length ? { jev: true as const } : {}),
-  };
+  return { action: 'join', url, ...(modes.length ? { mode: modes[0] } : {}) };
 }
 
 /** What `/meet` needs of the voice channel: its meetings, null when they are not configured. */
@@ -336,7 +335,7 @@ export type MeetOutcome =
   | { kind: 'usage' }
   | { kind: 'voice-unavailable' | 'not-configured' | 'no-key' | 'no-jev'; agentName: string }
   | { kind: 'other-caller'; agentName: string; caller?: string }
-  | { kind: 'started'; agentName: string; url: string; pauseSends?: true; jev?: true }
+  | { kind: 'started'; agentName: string; url: string; mode: MeetMode }
   | { kind: 'failed'; agentName: string; start: Extract<MeetingStart, { ok: false }> }
   | { kind: 'left' | 'no-meeting'; agentName: string };
 
@@ -344,7 +343,7 @@ export interface MeetRunOptions {
   /** The voice channel; null when it is not running here. The live adapter by default. */
   meetings?: MeetingControl | null;
   key?: Buffer | null;
-  /** Whether the Jev gate has its JEV_API_KEY here, which `jev` needs. */
+  /** Whether the Jev gate has its JEV_API_KEY here, which the jev mode needs. */
   jevAvailable?: boolean;
 }
 
@@ -385,7 +384,8 @@ export async function runMeetCommand(
     if (!existing) return { kind: 'no-meeting', agentName };
     return { kind: meetings.leave(linePlatformId(existing.line_id)) ? 'left' : 'no-meeting', agentName };
   }
-  if (command.jev && !jevAvailable) return { kind: 'no-jev', agentName };
+  if (command.mode === 'jev' && !jevAvailable) return { kind: 'no-jev', agentName };
+  const mode = command.mode ?? (jevAvailable ? 'jev' : 'send');
   const target = {
     agentGroupId: ag.id,
     ownerUserId: userId,
@@ -404,18 +404,12 @@ export async function runMeetCommand(
   const start = await meetings.start(
     linePlatformId(lineId),
     command.url,
-    { pauseSends: command.pauseSends === true, jev: command.jev === true },
+    { pauseSends: mode === 'pause', jev: mode === 'jev' },
     // An existing line moves to this chat only once the meeting call is admitted.
     async () => (await claimLine(target, key)).kind === 'bound',
   );
   if (!start.ok) return { kind: 'failed', agentName, start };
-  return {
-    kind: 'started',
-    agentName,
-    url: command.url,
-    ...(command.pauseSends ? { pauseSends: true as const } : {}),
-    ...(command.jev ? { jev: true as const } : {}),
-  };
+  return { kind: 'started', agentName, url: command.url, mode };
 }
 
 /** The /meet reply, or null when the sender gets no answer. */
@@ -430,8 +424,8 @@ export function meetCommandReply(outcome: MeetOutcome, cmd = '/meet'): string | 
     case 'usage':
       return (
         `Send ${cmd} <Google Meet link> to bring the agent into a meeting, or ${cmd} leave to send it away. ` +
-        `A turn ends on a send word; add pause (${cmd} <link> pause) to send it on a pause too, or jev ` +
-        `(${cmd} <link> jev) to let it follow the conversation and answer when addressed or invited.`
+        `It follows the conversation and answers when addressed or invited (jev mode). For the wake phrase ` +
+        `and a spoken send word instead, send ${cmd} <link> send, or ${cmd} <link> pause to send on a pause too.`
       );
     case 'voice-unavailable':
       return `${outcome.agentName}: voice calls are off on this host (the voice-mode channel is not configured).`;
@@ -440,18 +434,19 @@ export function meetCommandReply(outcome: MeetOutcome, cmd = '/meet'): string | 
     case 'no-key':
       return `${outcome.agentName}: call link storage is not set up on this host, so it has no voice line to join with.`;
     case 'no-jev':
-      return `${outcome.agentName}: jev needs the Jev gate's JEV_API_KEY on this host; send ${cmd} <link> without jev.`;
+      return `${outcome.agentName}: jev mode needs the Jev gate's JEV_API_KEY on this host; send ${cmd} <link> send instead.`;
     case 'other-caller':
       return `${outcome.agentName}: this voice line is ${outcome.caller ?? 'another admin'}'s; only they can take it into a meeting.`;
     case 'started':
       return (
         `\u{1F4DE} ${outcome.agentName} is asking to join ${outcome.url}. ` +
         `Admit "${outcome.agentName}" from the meeting's lobby; ` +
-        (outcome.jev
-          ? `it answers when someone addresses it by name or invites it and nobody else takes it up. Recall ` +
-            `stores no recording of the meeting; each participant's speech is transcribed on this host. `
+        (outcome.mode === 'jev'
+          ? `in jev mode it answers when someone addresses it by name or invites it and nobody else takes it up. ` +
+            `Recall stores no recording of the meeting; each participant's speech is transcribed on this host. ` +
+            `For the wake phrase and a spoken send word instead, send ${cmd} <link> send. `
           : `it answers when someone says its wake phrase, and a turn ends on a send word` +
-            `${outcome.pauseSends ? ' or a pause' : ''}. `) +
+            `${outcome.mode === 'pause' ? ' or a pause' : ''}. `) +
         `What it is asked and its answers show here. ${cmd} leave sends it away.`
       );
     case 'failed':

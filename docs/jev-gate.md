@@ -69,17 +69,20 @@ thresholds can be refitted from logged decisions
 - **The gated agent itself** (group scope): guard special-case allows
   `jev-gate get|update` for its OWN group, also behind the approval flow.
 
-## Meetings (`/meet <link> jev`)
+## Voice calls and meetings (`/voice`, `/meet <link>`)
 
-A `/meet` meeting started with `jev` does not use this gate's rubric. It runs
-the meet-jev loop (`src/modules/meet-jev/`), the same one as `/voice jev`:
-Recall.ai streams each participant's own audio to the host over a websocket at
-`/voice/recall/<callId>/?token=...` (`ingress/recall.ts`, Zero Data Retention:
-Recall stores no recording of the meeting, only API metadata), the host runs
-a Silero VAD and a Gemini Live transcription per participant
-(`ingress/recall-audio.ts`, the call's languages and vocabulary, as the worker does for `/voice jev`), and one Jev Choice per
-speaker boundary decides whether the agent answers, stays silent, stops or
-continues. The gate's entries, thresholds and levers do not apply there.
+With `JEV_API_KEY` set, `/voice` page calls and `/meet` meetings run the
+meet-jev loop (`src/modules/meet-jev/`) by default; `/voice plain`,
+`/meet <link> send` and `/meet <link> pause` choose the wake phrase and send
+word instead. The loop does not use this gate's rubric: its entries, thresholds
+and levers do not apply there. On a `/voice` call the worker transcribes the
+caller. In a meeting Recall.ai streams each participant's own audio to the host
+over a websocket at `/voice/recall/<callId>/?token=...` (`ingress/recall.ts`,
+Zero Data Retention: Recall stores no recording of the meeting, only API
+metadata), the host runs a Silero VAD and a Gemini Live transcription per
+participant (`ingress/recall-audio.ts`, the call's languages and vocabulary),
+and one Jev Choice per speaker boundary decides whether the agent answers,
+stays silent, stops or continues.
 The bot is left out by its display name (Recall flags no participant as the
 bot), so a person who joins under that name is left out too, with a warning logged.
 

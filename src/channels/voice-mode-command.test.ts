@@ -193,6 +193,8 @@ describe('parseVoiceCommand / senderUserId', () => {
     expect(parseVoiceCommand('/voice jev', 'telegram')).toEqual({ renew: false, jev: true });
     expect(parseVoiceCommand('!voice JEV', 'slack')).toEqual({ renew: false, jev: true });
     expect(parseVoiceCommand('/voice jevv', 'telegram')).toEqual({ renew: false });
+    expect(parseVoiceCommand('/voice plain', 'telegram')).toEqual({ renew: false, plain: true });
+    expect(parseVoiceCommand('!voice PLAIN', 'slack')).toEqual({ renew: false, plain: true });
   });
 
   it('reads the sender the way the permissions module does, namespacing a bare handle', () => {
@@ -536,21 +538,37 @@ describe('handleVoiceCommand (the interceptor)', () => {
     expect(await handleVoiceCommand(event('hello', OWNER), callUrl)).toBe(false);
   });
 
-  it('/voice jev puts the line in jev mode and says so; /voice takes it out; no Jev key, nothing changes', async () => {
+  it('runs a line in jev mode by default and says so; /voice plain opts it out until /voice or /voice jev', async () => {
     await startChat(false);
-    await handleVoiceCommand(event('/voice jev', OWNER), callUrl);
+    const lastText = () => (delivered.at(-1)!.message.content as { text: string }).text;
+    await handleVoiceCommand(event('/voice', OWNER), callUrl);
     const [line] = await lines();
     const platformId = linePlatformId(line.line_id);
     expect(lineRunsJev(platformId)).toBe(true);
-    const text = (delivered.at(-1)!.message.content as { text: string }).text;
-    expect(text).toMatch(/voice\?t=[0-9a-f]{32}/);
-    expect(text).toContain('Calls on this link run in jev mode');
-    delivered.length = 0;
-    await handleVoiceCommand(event('/voice', OWNER), callUrl);
+    expect(lastText()).toMatch(/voice\?t=[0-9a-f]{32}/);
+    expect(lastText()).toContain('Calls on this link run in jev mode');
+    expect(lastText()).toContain('Send /voice plain for the wake phrase and send word instead.');
+    await handleVoiceCommand(event('/voice plain', OWNER), callUrl);
     expect(lineRunsJev(platformId)).toBe(false);
-    expect((delivered[0].message.content as { text: string }).text).not.toContain('jev');
+    expect(lastText()).toContain(
+      'Calls on this link use the wake phrase and send word. Send /voice to go back to jev mode.',
+    );
+    await handleVoiceCommand(event('/voice new', OWNER), callUrl);
+    expect(lineRunsJev(platformId)).toBe(true);
+    await handleVoiceCommand(event('/voice plain', OWNER), callUrl);
+    await handleVoiceCommand(event('/voice jev', OWNER), callUrl);
+    expect(lineRunsJev(platformId)).toBe(true);
+    expect(lastText()).toContain('Calls on this link run in jev mode');
     jevKey.value = '';
     try {
+      // Without the Jev key every call is plain, so the reply names no mode.
+      delivered.length = 0;
+      await handleVoiceCommand(event('/voice', OWNER), callUrl);
+      expect(lastText()).toMatch(/voice\?t=[0-9a-f]{32}/);
+      expect(lastText()).not.toContain('jev');
+      expect(lastText()).not.toContain('send word');
+      // An explicit /voice jev is refused and changes nothing.
+      await handleVoiceCommand(event('/voice plain', OWNER), callUrl);
       delivered.length = 0;
       await handleVoiceCommand(event('/voice jev', OWNER), callUrl);
       expect(lineRunsJev(platformId)).toBe(false);
