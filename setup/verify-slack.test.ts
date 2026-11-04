@@ -39,7 +39,7 @@ vi.mock('./lib/registry-state.js', () => ({
 vi.mock('./status.js', () => ({ emitStatus: vi.fn() }));
 
 import { emitStatus } from './status.js';
-import { run } from './verify.js';
+import { CHANNEL_ENV_KEYS, run } from './verify.js';
 import { readSlackJob, withSetupLock } from '../src/community-portal/slack-job.js';
 
 beforeEach(() => {
@@ -47,6 +47,9 @@ beforeEach(() => {
   host.service = 'running';
   host.groups = 0;
   host.channels = {};
+  // verify reads channel credentials from the environment before `.env`, so a
+  // token exported in the shell running the tests would count as a channel.
+  for (const key of CHANNEL_ENV_KEYS) vi.stubEnv(key, undefined);
   fs.mkdirSync(path.join(host.root, 'data'));
   fs.writeFileSync(path.join(host.root, '.env'), 'ANTHROPIC_API_KEY=fixture-only\n');
   vi.spyOn(process, 'cwd').mockReturnValue(host.root);
@@ -57,6 +60,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   fs.rmSync(host.root, { recursive: true, force: true });
 });
 
