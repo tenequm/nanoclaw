@@ -2276,15 +2276,27 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
 
   it('takes the Recall socket before the bot create answers, its events only once the call is live', async () => {
     let recall: WebSocket | undefined;
+    const info = vi.spyOn(log, 'info');
     beforeCreate = async ({ participantAudio }) => {
       recall = await connect(participantAudio!.websocketUrl);
-      // The frame after it opens a pipeline: the chat line before it was handled by then.
-      recall.send(JSON.stringify(chatLine(ALEX, 'before the caller joined')));
+      // The chat line is logged once handled; the frame before it was handled by then too.
       recall.send(JSON.stringify(frame(ALEX, 1)));
-      await vi.waitFor(() => expect(vads).toHaveLength(1));
+      recall.send(JSON.stringify(chatLine(ALEX, 'before the caller joined')));
+      await vi.waitFor(() =>
+        expect(info).toHaveBeenCalledWith(
+          'meet-jev recall: event',
+          expect.objectContaining({ event: 'participant_events.chat_message' }),
+        ),
+      );
     };
-    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
+    try {
+      expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: true })).toEqual({ ok: true });
+    } finally {
+      info.mockRestore();
+    }
     expect(seen).toEqual([]);
+    // Nor is anything transcribed before the call is live.
+    expect(vads).toHaveLength(0);
     const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
     expect((await worker.post('joined')).status).toBe(200);
     recall!.send(JSON.stringify(chatLine(ALEX, 'hello all')));
