@@ -24,7 +24,7 @@ import {
   type CallWakeState,
   type JevWorkerEvent,
   type LiveKitJobMetadata,
-  MAX_JEV_EVENTS_PER_POST,
+  MAX_JEV_POST_BYTES,
   type ReviewOp,
   type ReviewRequest,
 } from './channels/voice-mode-protocol.js';
@@ -803,6 +803,13 @@ function fakeVoice(
       events.onAgentSpeaking(false);
       return true;
     }),
+    /** The jev loop's line: plays at once and whole, as `say` does. */
+    speak: vi.fn(async (_text: string, ready: () => Promise<void>, _signal: AbortSignal): Promise<LineOutcome> => {
+      await ready();
+      events.onAgentSpeaking(true);
+      events.onAgentSpeaking(false);
+      return { heard: true, failed: false, cut: false, audioMs: 0, playedMs: 0, complete: true };
+    }),
     selectTts: undefined as CallVoice['selectTts'],
     setThinking: vi.fn(),
     publishTurn: vi.fn(),
@@ -828,6 +835,7 @@ function fakeVoice(
       if (speech) {
         const output = speech(_meta, _settings, e);
         voice.say.mockImplementation(output.say);
+        voice.speak.mockImplementation(output.speak);
         voice.selectTts = output.selectTts;
         voice.close.mockImplementation(async () => {
           await output.close();
@@ -2100,6 +2108,8 @@ function speakingCall(plans: Record<string, (text: string, call: number) => TtsP
       sink: {
         captureFrame: async (frame) => void frames.push(frame.data),
         waitForPlayout: async () => undefined,
+        clearQueue: () => undefined,
+        queuedDuration: 0,
       },
       log: silentLog,
       started: () => events.onAgentSpeaking(true),
@@ -6649,10 +6659,9 @@ describe('jev: the reporter', () => {
     release();
     await reporter.drain();
     expect(posted).toEqual([[jevEvent(1)], [jevEvent(2), jevEvent(3)], [jevEvent(4), jevEvent(5)]]);
-    expect(MAX_JEV_EVENTS_PER_POST).toBeGreaterThan(2);
   });
 
-  it('drops a batch the host cannot take, with a log line, and goes on; a backlog loses its oldest', async () => {
+  it('drops a batch the host cannot take, with a log line, and goes on', async () => {
     const warnings: string[] = [];
     const log = { warn: (msg: string) => void warnings.push(msg) };
     const posted: JevWorkerEvent[][] = [];
@@ -6673,25 +6682,92 @@ describe('jev: the reporter', () => {
       expect.stringContaining('could not reach the host with jev events'),
       expect.stringContaining('the host refused jev events'),
     ]);
+  });
 
-    let free!: () => void;
-    const stuck = new Promise<void>((r) => (free = r));
-    const late: JevWorkerEvent[][] = [];
-    const slow = new JevReporter(
+  /** A reporter whose first POST is held until `release`. */
+  const heldReporter = (perPost?: number, backlog?: number, maxBytes?: number) => {
+    const warnings: string[] = [];
+    const posted: JevWorkerEvent[][] = [];
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const reporter = new JevReporter(
       async (events) => {
-        late.push(events);
-        if (late.length === 1) await stuck;
+        posted.push(events);
+        if (posted.length === 1) await held;
         return new Response(null, { status: 204 });
       },
-      log,
-      2,
-      3,
+      { warn: (msg: string) => void warnings.push(msg) },
+      perPost,
+      backlog,
+      maxBytes,
     );
-    for (let n = 1; n <= 5; n++) slow.report(jevEvent(n));
-    free();
-    await slow.drain();
-    expect(late).toEqual([[jevEvent(1)], [jevEvent(3), jevEvent(4)], [jevEvent(5)]]);
-    expect(warnings.filter((w) => w.includes('behind on jev events'))).toHaveLength(1);
+    return { reporter, posted, warnings, release };
+  };
+  const partial = (uttId: string, text: string): JevWorkerEvent => ({
+    type: 'utterance',
+    uttId,
+    text,
+    final: false,
+    at: 0,
+  });
+
+  it("a queued partial is replaced by its utterance's next one, which goes where it was heard; finals never merge", async () => {
+    const h = heldReporter();
+    const started: JevWorkerEvent = { type: 'playback', replyId: 'r1', state: 'started', at: 0 };
+    const final: JevWorkerEvent = { type: 'utterance', uttId: 'u1', text: 'Book a table.', final: true, at: 0 };
+    h.reporter.report(jevEvent(0));
+    h.reporter.report(partial('u1', 'Book'));
+    h.reporter.report(started);
+    h.reporter.report(partial('u2', 'And'));
+    h.reporter.report(partial('u1', 'Book a'));
+    h.reporter.report(partial('u1', 'Book a table'));
+    h.reporter.report(final);
+    h.release();
+    await h.reporter.drain();
+    expect(h.posted).toEqual([[jevEvent(0)], [started, partial('u2', 'And'), partial('u1', 'Book a table'), final]]);
+  });
+
+  it('a backlog sheds the oldest partials, never speech marks, finals or playback: those stay past it, with a log line', async () => {
+    const h = heldReporter(10, 3);
+    const final: JevWorkerEvent = { type: 'utterance', uttId: 'u1', text: 'Yes.', final: true, at: 0 };
+    h.reporter.report(jevEvent(1));
+    h.reporter.report(jevEvent(2));
+    h.reporter.report(partial('u1', 'Yes'));
+    h.reporter.report(jevEvent(3));
+    h.reporter.report(final);
+    h.reporter.report(jevEvent(4));
+    h.reporter.report(partial('u2', 'No'));
+    h.reporter.report(jevEvent(5));
+    h.release();
+    await h.reporter.drain();
+    expect(h.posted).toEqual([[jevEvent(1)], [jevEvent(2), jevEvent(3), final, jevEvent(4), jevEvent(5)]]);
+    expect(h.warnings).toEqual([
+      expect.stringContaining('dropping the oldest partials'),
+      expect.stringContaining('keeping them all'),
+    ]);
+  });
+
+  it('a POST stays within the body cap; an event too big for any POST is dropped with a log line', async () => {
+    const h = heldReporter();
+    const big = (n: number, bytes = Math.floor(MAX_JEV_POST_BYTES * 0.4)): JevWorkerEvent => ({
+      type: 'utterance',
+      uttId: `u${n}`,
+      text: 'a'.repeat(bytes),
+      final: true,
+      at: n,
+    });
+    const huge = big(9, MAX_JEV_POST_BYTES);
+    h.reporter.report(jevEvent(0));
+    h.reporter.report(big(1));
+    h.reporter.report(huge);
+    h.reporter.report(big(2));
+    h.reporter.report(big(3));
+    h.release();
+    await h.reporter.drain();
+    expect(h.posted).toEqual([[jevEvent(0)], [big(1), big(2)], [big(3)]]);
+    for (const batch of h.posted)
+      expect(JSON.stringify({ callId: 'call-1', events: batch }).length).toBeLessThan(MAX_JEV_POST_BYTES);
+    expect(h.warnings).toEqual([expect.stringContaining('too big for the host')]);
   });
 });
 
@@ -6801,7 +6877,6 @@ describe('jev: the loop', () => {
     expect(h.transcription.pushed).toBe(1_600);
     h.loop.onSpeech(true, 20_000);
     h.loop.onInterim('And');
-    expect(h.events.filter((e) => e.type === 'utterance').map((e) => e.uttId)).not.toContain([...ids][0] + 'x');
     expect(new Set(h.events.filter((e) => e.type === 'utterance').map((e) => e.uttId)).size).toBe(2);
     // Speech that came to nothing is marks only: the host never hears of a noise.
     h.loop.onSpeech(false, 21_000);
@@ -6998,30 +7073,33 @@ describe('jev calls', () => {
     await vi.waitFor(() =>
       expect(jevEvents(host).flat().map(summary)).toEqual([
         'speech:on',
-        'partial:Book a',
+        // 'Book a' was still queued when 'Book a table' came: replaced.
         'partial:Book a table',
         'speech:off',
         'final:Book a table.',
       ]),
     );
     // Batched: fewer POSTs than events, each with the call id; never a turn.
-    expect(jevEvents(host).length).toBeLessThan(5);
+    expect(jevEvents(host).length).toBeLessThan(4);
     for (const call of host.calls.filter((c) => c.url.endsWith('/jev'))) expect(call.body?.callId).toBe('call-1');
     expect(host.calls.some((c) => c.url.endsWith('/utterance'))).toBe(false);
     expect(v.voice.caption).toHaveBeenCalledWith(1, 'Book a table.', true);
     expect(v.voice.publishTurn).not.toHaveBeenCalled();
 
     host.emit({ type: 'reply', text: 'Booked.', replyId: 'r1' });
-    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
     await vi.waitFor(() =>
-      expect(jevEvents(host).flat().map(summary).slice(5)).toEqual(['r1:started', 'r1:completed']),
+      expect(v.voice.speak).toHaveBeenCalledWith('Booked.', expect.any(Function), expect.any(AbortSignal)),
+    );
+    await vi.waitFor(() =>
+      expect(jevEvents(host).flat().map(summary).slice(4)).toEqual(['r1:started', 'r1:completed']),
     );
     // A reply the host did not label is not spoken: nothing could be reported about it.
     host.emit({ type: 'reply', text: 'Unlabelled.' });
     host.emit({ type: 'thinking' });
     host.emit({ type: 'working' });
     await new Promise((r) => setTimeout(r, 30));
-    expect(v.voice.say).toHaveBeenCalledTimes(1);
+    expect(v.voice.speak).toHaveBeenCalledTimes(1);
+    expect(v.voice.say).not.toHaveBeenCalled();
     expect(v.voice.playCue).not.toHaveBeenCalled();
     expect(v.voice.setThinking).not.toHaveBeenCalled();
     expect(v.voice.publishReply).not.toHaveBeenCalled();
@@ -7037,7 +7115,7 @@ describe('jev calls', () => {
     const host = fakeHostFetch();
     const v = fakeVoice();
     let signal: AbortSignal | undefined;
-    (v.voice as CallVoice).speak = vi.fn(async (_text: string, ready: () => Promise<void>, s: AbortSignal) => {
+    v.voice.speak.mockImplementation(async (_text: string, ready: () => Promise<void>, s: AbortSignal) => {
       signal = s;
       await ready();
       v.events.onAgentSpeaking(true);
@@ -7065,6 +7143,24 @@ describe('jev calls', () => {
     v.events.onClosed('vad failed');
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('vad failed'));
     expect(host.calls.find((c) => c.url.endsWith('/ended'))?.body).toEqual({ callId: 'call-1', reason: 'vad failed' });
+  });
+
+  it('an end that fails is logged once and never an unhandled rejection, however many paths start it', async () => {
+    const { ctx, job } = fakeJob({ ...JEV_META });
+    job.shutdown.mockImplementation(() => {
+      throw new Error('job gone');
+    });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const warnings: string[] = [];
+    const log = { info: () => undefined, warn: (msg: string) => void warnings.push(msg) };
+    await runCall(ctx, callDeps(host.fetchImpl, v, { log }));
+    v.events.onClosed('vad failed');
+    host.emit({ type: 'end', reason: 'done' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('vad failed'));
+    await vi.waitFor(() => expect(warnings).toContain('voice-mode worker: ending the jev call failed'));
+    await flush();
+    expect(warnings.filter((w) => w.includes('ending the jev call failed'))).toHaveLength(1);
   });
 });
 
@@ -7114,5 +7210,53 @@ describe('jev: an abortable line in the speech output', () => {
     expect(sink.clearQueue).toHaveBeenCalledTimes(1);
     expect(sink.waitForPlayout).toHaveBeenCalledTimes(1);
     await output.close();
+  });
+
+  it('after close a line asks no provider, through say or speak', async () => {
+    const tts = fakeTts(() => ({ chunks: 1 }));
+    const started = vi.fn();
+    const output = speechOutput({
+      meta: META,
+      settings: { providerKeys: { gemini: 'gk' } },
+      sink: {
+        captureFrame: async () => undefined,
+        waitForPlayout: async () => undefined,
+        clearQueue: vi.fn(),
+        queuedDuration: 0,
+      },
+      log: silentLog,
+      started,
+      stopped: () => undefined,
+      changed: () => undefined,
+      build: () => tts.instance,
+    });
+    await output.close();
+    expect(await output.say('Late.')).toBe(false);
+    const outcome = await output.speak('Late.', async () => undefined, new AbortController().signal);
+    expect(outcome).toMatchObject({ heard: false, cut: false, audioMs: 0 });
+    expect(tts.said).toEqual([]);
+    expect(started).not.toHaveBeenCalled();
+  });
+
+  it('say answers as the line ends: a close landing after it played keeps it said', async () => {
+    const tts = fakeTts(() => ({ chunks: 1 }));
+    const output: ReturnType<typeof speechOutput> = speechOutput({
+      meta: META,
+      settings: { providerKeys: { gemini: 'gk' } },
+      sink: {
+        captureFrame: async () => undefined,
+        waitForPlayout: async () => undefined,
+        clearQueue: vi.fn(),
+        queuedDuration: 0,
+      },
+      log: silentLog,
+      started: () => undefined,
+      // The call ends as the line's end is announced, before `say` hands back its answer.
+      stopped: () => void output.close(),
+      changed: () => undefined,
+      build: () => tts.instance,
+    });
+    expect(await output.say('Done.')).toBe(true);
+    expect(tts.said).toEqual(['Done.']);
   });
 });
