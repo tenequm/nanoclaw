@@ -47,12 +47,7 @@ export type SpeechDetectorFactory = (events: {
 export type MeetingTranscription = Pick<GeminiLiveTranscriber, 'prepare' | 'begin' | 'push' | 'end' | 'close'>;
 
 /** The transcription settings, as the call's job gives them to the worker. */
-export interface MeetingSpeech {
-  apiKey: string;
-  model: string;
-  vocabulary: readonly string[];
-  languageCodes: readonly string[];
-}
+export type MeetingSpeech = Pick<TranscriberOptions, 'apiKey' | 'model' | 'vocabulary' | 'languageCodes'>;
 
 export interface MeetingAudioOptions {
   speech: MeetingSpeech;
@@ -148,6 +143,8 @@ class Pipeline {
   private clockAt = 0;
   private lastFrameAt: number;
   private speaking = false;
+  /** When the participant last stopped speaking (or the pipeline opened); null while they speak. */
+  quietSince: number | null;
   private utterance?: { uttId: string; text: string };
   private gapTimer?: ReturnType<typeof setInterval>;
   private idleTimer?: ReturnType<typeof setTimeout>;
@@ -165,10 +162,13 @@ class Pipeline {
     private readonly onDone: (why: string) => void,
   ) {
     this.lastFrameAt = opts.now();
+    this.quietSince = opts.now();
     this.vad = detector({
       onSpeech: (speaking, position) => this.onSpeech(speaking, position),
       onError: (err) => {
         opts.log.warn('meet-jev audio: a participant VAD failed; their pipeline closes', { speaker: speaker.id, err });
+        // Speech under way ends here: otherwise the loop takes this participant for speaking for the rest of the call.
+        if (this.speaking) void this.endSpeech(this.atOf(this.position));
         this.onDone('vad failed');
       },
     });
@@ -240,6 +240,7 @@ class Pipeline {
       return;
     }
     this.speaking = true;
+    this.quietSince = null;
     clearTimeout(this.idleTimer);
     this.emit({ kind: 'speech', speaker: this.speaker, on: true, at: this.atOf(position) });
     this.utterance = { uttId: this.nextUttId(), text: '' };
@@ -253,6 +254,7 @@ class Pipeline {
   /** The speech mark, then the activity's final once it settles; resolves when that went out. */
   private endSpeech(at: number): Promise<void> {
     this.speaking = false;
+    this.quietSince = this.opts.now();
     clearInterval(this.gapTimer);
     this.emit({ kind: 'speech', speaker: this.speaker, on: false, at });
     const utterance = this.utterance;
@@ -348,9 +350,20 @@ export function createMeetingAudio(options: MeetingAudioOptions): MeetingAudio {
     closedLine(id, why);
   };
 
+  /** At the cap, the pipeline quiet the longest gives its place to a new speaker; none while all speak. */
+  const evictQuietest = (): boolean => {
+    let quietest: [string, number] | undefined;
+    for (const [id, p] of pipelines) {
+      if (p.quietSince !== null && (!quietest || p.quietSince < quietest[1])) quietest = [id, p.quietSince];
+    }
+    if (quietest) drop(quietest[0], 'evicted for a new speaker');
+    return !!quietest;
+  };
+
   const open = (speaker: Speaker): Pipeline | null => {
     const detector = options.detector();
-    const why = !detector ? 'the VAD is still loading' : pipelines.size >= maxPipelines ? 'too many speakers' : null;
+    const full = !!detector && pipelines.size >= maxPipelines && !evictQuietest();
+    const why = !detector ? 'the VAD is still loading' : full ? 'too many speakers' : null;
     if (why || !detector) {
       if (!refused.has(speaker.id)) {
         refused.add(speaker.id);

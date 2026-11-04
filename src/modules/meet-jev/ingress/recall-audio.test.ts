@@ -250,10 +250,17 @@ describe('createMeetingAudio', () => {
   it('transcribes at most maxPipelines participants, and nobody before the VAD loaded, saying so once each', () => {
     const h = harness({ maxPipelines: 1 });
     h.frame(alex, 100, T0);
+    h.vads[0].onSpeech(true, 0);
     h.frame(bo, 100, T0);
     h.frame(bo, 100, T0 + 100);
     expect(h.audio.pipelines).toBe(1);
     expect(h.warnings).toEqual(["meet-jev audio: a participant's audio is not transcribed"]);
+    // At the cap, the participant quiet the longest gives their place to a new speaker.
+    h.vads[0].onSpeech(false, 1_600);
+    h.frame(bo, 100, T0 + 200);
+    expect(h.audio.pipelines).toBe(1);
+    expect(h.vads[0].closed).toBe(true);
+    expect(h.infos.at(-2)?.[1]).toMatchObject({ speaker: '100', why: 'evicted for a new speaker' });
     const unloaded = harness({ detector: () => null });
     unloaded.frame(alex, 100, T0);
     unloaded.frame(alex, 100, T0 + 100);
@@ -305,6 +312,23 @@ describe('createMeetingAudio', () => {
     fail(new Error('onnx'));
     expect(h.audio.pipelines).toBe(0);
     expect(h.warnings).toContain('meet-jev audio: a participant VAD failed; their pipeline closes');
+  });
+
+  it('a VAD that fails mid-speech still ends that speech, so the loop does not take them for speaking on', () => {
+    let speech!: (speaking: boolean, position: number) => void;
+    let fail!: (err: unknown) => void;
+    const h = harness({
+      detector: () => (e) => {
+        speech = e.onSpeech;
+        fail = e.onError;
+        return { push: () => undefined, close: () => undefined };
+      },
+    });
+    h.frame(alex, 100, T0);
+    speech(true, 0);
+    fail(new Error('onnx'));
+    expect(h.summary()).toEqual(['100:speech:on', '100:speech:off']);
+    expect(h.audio.pipelines).toBe(0);
   });
 });
 
