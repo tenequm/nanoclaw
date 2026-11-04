@@ -22,7 +22,9 @@ import {
   type CallReviewState,
   type CallVoiceState,
   type CallWakeState,
+  type JevWorkerEvent,
   type LiveKitJobMetadata,
+  MAX_JEV_EVENTS_PER_POST,
   type ReviewOp,
   type ReviewRequest,
 } from './channels/voice-mode-protocol.js';
@@ -109,6 +111,12 @@ import {
   type VoiceModeSettings,
   type SendResult,
   type TurnTakingDeps,
+  deliveredText,
+  JEV_BARGE_MS,
+  JevLoop,
+  JevReporter,
+  PRE_ROLL_MS,
+  type LineOutcome,
 } from './voice-mode-worker.js';
 
 initializeLogger({ pretty: false, level: 'error' });
@@ -6607,5 +6615,504 @@ describe('meeting calls', () => {
     await vi.waitFor(() => expect(candidates()).toHaveLength(2));
     host.emit({ type: 'end', reason: 'test over' });
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+  });
+});
+
+describe('jev: delivered text', () => {
+  it('cuts at a word boundary before the share, whole or nothing at the ends', () => {
+    const text = 'Booked for eight, at the usual place.';
+    expect(deliveredText(text, 0.4)).toBe('Booked for');
+    expect(deliveredText(text, 0.5)).toBe('Booked for eight,');
+    expect(deliveredText(text, 0.05)).toBe('');
+    expect(deliveredText(text, 0)).toBe('');
+    expect(deliveredText(text, 1)).toBe(text);
+    expect(deliveredText(text, 1.5)).toBe(text);
+    expect(deliveredText(text, NaN)).toBe('');
+  });
+});
+
+const jevEvent = (n: number): JevWorkerEvent => ({ type: 'speech', on: n % 2 === 0, at: n });
+
+describe('jev: the reporter', () => {
+  it('posts in order, batching what piles up while one POST is in flight, at most the cap per POST', async () => {
+    const posted: JevWorkerEvent[][] = [];
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const post = vi.fn(async (events: JevWorkerEvent[]) => {
+      posted.push(events);
+      if (posted.length === 1) await held;
+      return new Response(null, { status: 204 });
+    });
+    const reporter = new JevReporter(post, silentLog, 2);
+    for (let n = 1; n <= 5; n++) reporter.report(jevEvent(n));
+    expect(posted).toEqual([[jevEvent(1)]]);
+    release();
+    await reporter.drain();
+    expect(posted).toEqual([[jevEvent(1)], [jevEvent(2), jevEvent(3)], [jevEvent(4), jevEvent(5)]]);
+    expect(MAX_JEV_EVENTS_PER_POST).toBeGreaterThan(2);
+  });
+
+  it('drops a batch the host cannot take, with a log line, and goes on; a backlog loses its oldest', async () => {
+    const warnings: string[] = [];
+    const log = { warn: (msg: string) => void warnings.push(msg) };
+    const posted: JevWorkerEvent[][] = [];
+    let calls = 0;
+    const post = vi.fn(async (events: JevWorkerEvent[]) => {
+      calls++;
+      if (calls === 1) throw new Error('ECONNREFUSED');
+      posted.push(events);
+      return new Response(null, { status: calls === 2 ? 503 : 204 });
+    });
+    const reporter = new JevReporter(post, log, 1);
+    reporter.report(jevEvent(1));
+    reporter.report(jevEvent(2));
+    reporter.report(jevEvent(3));
+    await reporter.drain();
+    expect(posted).toEqual([[jevEvent(2)], [jevEvent(3)]]);
+    expect(warnings).toEqual([
+      expect.stringContaining('could not reach the host with jev events'),
+      expect.stringContaining('the host refused jev events'),
+    ]);
+
+    let free!: () => void;
+    const stuck = new Promise<void>((r) => (free = r));
+    const late: JevWorkerEvent[][] = [];
+    const slow = new JevReporter(
+      async (events) => {
+        late.push(events);
+        if (late.length === 1) await stuck;
+        return new Response(null, { status: 204 });
+      },
+      log,
+      2,
+      3,
+    );
+    for (let n = 1; n <= 5; n++) slow.report(jevEvent(n));
+    free();
+    await slow.drain();
+    expect(late).toEqual([[jevEvent(1)], [jevEvent(3), jevEvent(4)], [jevEvent(5)]]);
+    expect(warnings.filter((w) => w.includes('behind on jev events'))).toHaveLength(1);
+  });
+});
+
+/** A JevLoop over a fake transcription and a speech output the test drives line by line. */
+function jevLoop() {
+  const transcription = fakeTranscription();
+  const events: JevWorkerEvent[] = [];
+  const captions: Array<[number, string, boolean]> = [];
+  interface Line {
+    text: string;
+    signal: AbortSignal;
+    /** `speak` got past `ready`: the caller was quiet. */
+    waited: boolean;
+    started: boolean;
+    resolve: (outcome: LineOutcome) => void;
+  }
+  const lines: Line[] = [];
+  const outcome = (line: Line, o: Partial<LineOutcome>): LineOutcome => ({
+    heard: line.started,
+    failed: false,
+    cut: false,
+    audioMs: 2_000,
+    playedMs: 2_000,
+    complete: true,
+    ...o,
+  });
+  const speak = vi.fn(async (text: string, ready: () => Promise<void>, signal: AbortSignal) => {
+    const line: Line = { text, signal, waited: false, started: false, resolve: () => undefined };
+    lines.push(line);
+    await ready();
+    // As the room's speech output: aborted while it waited, nothing of it plays.
+    if (signal.aborted) return outcome(line, { cut: true, playedMs: 0 });
+    line.waited = true;
+    return new Promise<LineOutcome>((resolve) => {
+      line.resolve = resolve;
+      signal.addEventListener('abort', () => resolve(outcome(line, { cut: true, playedMs: 800 })), { once: true });
+    });
+  });
+  const loop = new JevLoop({
+    transcriber: transcription,
+    speak,
+    report: (event) => void events.push(event),
+    caption: (segment, text, final) => void captions.push([segment, text, final]),
+    log: silentLog,
+  });
+  return {
+    loop,
+    transcription,
+    events,
+    captions,
+    speak,
+    lines,
+    /** The events so far, one word each. */
+    kinds: () =>
+      events.map((e) =>
+        e.type === 'playback'
+          ? `${e.replyId}:${e.state}`
+          : e.type === 'speech'
+            ? `speech:${e.on ? 'on' : 'off'}`
+            : `${e.final ? 'final' : 'partial'}:${e.text}`,
+      ),
+    /** The line's first audio plays. */
+    start: (line: Line) => {
+      line.started = true;
+      loop.onAgentSpeaking(true);
+    },
+    /** The line played out. */
+    finish: (line: Line, o: Partial<LineOutcome> = {}) => {
+      loop.onAgentSpeaking(false);
+      line.resolve(outcome(line, o));
+    },
+  };
+}
+
+describe('jev: the loop', () => {
+  it('VAD speech opens an activity with the pre-roll and warms the next socket; its partials and final go out under one uttId with the speech marks, in order', async () => {
+    const h = jevLoop();
+    h.loop.audio(new Int16Array(16_000));
+    h.loop.onSpeech(true, 16_000);
+    expect(h.transcription.begins).toEqual([PRE_ROLL_MS * 16]);
+    expect(h.transcription.prepare).toHaveBeenCalledTimes(1);
+    h.loop.audio(new Int16Array(1_600));
+    expect(h.transcription.pushed).toBe(1_600);
+    h.loop.onInterim('Book a');
+    h.loop.onInterim('Book a');
+    h.loop.onInterim('Book a table');
+    h.transcription.results.push(heard('Book a table', 'Book a table.'));
+    h.loop.onSpeech(false, 17_600);
+    expect(h.transcription.ended).toBe(1);
+    await flush();
+    expect(h.kinds()).toEqual([
+      'speech:on',
+      'partial:Book a',
+      'partial:Book a table',
+      'speech:off',
+      'final:Book a table.',
+    ]);
+    const ids = new Set(h.events.filter((e) => e.type === 'utterance').map((e) => e.uttId));
+    expect(ids.size).toBe(1);
+    expect(h.captions).toEqual([
+      [1, 'Book a', false],
+      [1, 'Book a table', false],
+      [1, 'Book a table.', true],
+    ]);
+    // Audio after the activity ended goes nowhere; the next speech is a new utterance.
+    h.loop.audio(new Int16Array(1_600));
+    expect(h.transcription.pushed).toBe(1_600);
+    h.loop.onSpeech(true, 20_000);
+    h.loop.onInterim('And');
+    expect(h.events.filter((e) => e.type === 'utterance').map((e) => e.uttId)).not.toContain([...ids][0] + 'x');
+    expect(new Set(h.events.filter((e) => e.type === 'utterance').map((e) => e.uttId)).size).toBe(2);
+    // Speech that came to nothing is marks only: the host never hears of a noise.
+    h.loop.onSpeech(false, 21_000);
+    await flush();
+    const before = h.events.length;
+    h.loop.onSpeech(true, 22_000);
+    h.loop.onSpeech(false, 22_500);
+    await flush();
+    expect(h.kinds().slice(before)).toEqual(['speech:on', 'speech:off']);
+  });
+
+  it('a reply is spoken once the caller is quiet, and reported started then completed; never over live speech', async () => {
+    const h = jevLoop();
+    h.loop.onSpeech(true, 0);
+    h.loop.onReply('r1', 'Booked for eight.');
+    await flush();
+    expect(h.speak).toHaveBeenCalledWith('Booked for eight.', expect.any(Function), expect.any(AbortSignal));
+    expect(h.lines[0].waited).toBe(false);
+    h.loop.onSpeech(false, 16_000);
+    await flush();
+    expect(h.lines[0].waited).toBe(true);
+    expect(h.kinds().filter((k) => k.startsWith('r1'))).toEqual([]);
+    h.start(h.lines[0]);
+    expect(h.kinds().filter((k) => k.startsWith('r1'))).toEqual(['r1:started']);
+    h.finish(h.lines[0]);
+    await flush();
+    expect(h.kinds().filter((k) => k.startsWith('r1'))).toEqual(['r1:started', 'r1:completed']);
+    expect(h.loop.busy).toBe(false);
+  });
+
+  it("the host's stop cuts the line playing, with the words that got out, and drops every queued line", async () => {
+    const h = jevLoop();
+    h.loop.onReply('r1', 'Booked for eight, at the usual place.');
+    h.loop.onReply('r2', 'Anything else?');
+    await flush();
+    h.start(h.lines[0]);
+    expect(h.loop.busy).toBe(true);
+    h.loop.onStop();
+    await flush();
+    expect(h.events.filter((e) => e.type === 'playback')).toEqual([
+      { type: 'playback', replyId: 'r1', state: 'started', at: expect.any(Number) },
+      { type: 'playback', replyId: 'r2', state: 'cut_off', delivered: '', at: expect.any(Number) },
+      { type: 'playback', replyId: 'r1', state: 'cut_off', delivered: 'Booked for', at: expect.any(Number) },
+    ]);
+    expect(h.speak).toHaveBeenCalledTimes(1);
+    expect(h.loop.busy).toBe(false);
+    // A stop with nothing playing is nothing.
+    h.loop.onStop();
+    expect(h.events).toHaveLength(3);
+  });
+
+  it('the reflex needs both: speech past the floor and words (a partial of it, or the host says so); VAD alone leaves the line', async () => {
+    vi.useFakeTimers();
+    const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
+    const h = jevLoop();
+    const cut = () => h.lines.filter((l) => l.signal.aborted).length;
+    h.loop.onReply('r1', 'One.');
+    await tick(1);
+    h.start(h.lines[0]);
+    // Sustained speech with no words: "yeah yeah".
+    h.loop.onSpeech(true, 0);
+    await tick(JEV_BARGE_MS + 100);
+    expect(cut()).toBe(0);
+    // Words come: the line is cut, and reported with what got out.
+    h.loop.onInterim('wait, stop');
+    await tick(1);
+    expect(cut()).toBe(1);
+    expect(h.kinds().at(-1)).toBe('r1:cut_off');
+    h.loop.onSpeech(false, 8_000);
+    await tick(1);
+
+    // Words before the floor: the floor decides, once it passes.
+    h.loop.onReply('r2', 'Two.');
+    await tick(1);
+    h.start(h.lines[1]);
+    h.loop.onSpeech(true, 10_000);
+    await tick(100);
+    h.loop.onInterim('no');
+    expect(cut()).toBe(1);
+    await tick(JEV_BARGE_MS);
+    expect(cut()).toBe(2);
+    h.loop.onSpeech(false, 12_000);
+    await tick(1);
+
+    // Short worded speech that ended before the floor: a backchannel, not an interruption.
+    h.loop.onReply('r3', 'Three.');
+    await tick(1);
+    h.start(h.lines[2]);
+    h.loop.onSpeech(true, 14_000);
+    h.loop.onInterim('yes');
+    h.loop.onSpeech(false, 14_100);
+    await tick(JEV_BARGE_MS + 100);
+    expect(cut()).toBe(2);
+
+    // The host's `words` is the text confirmation where the worker has no transcript (a meeting).
+    h.loop.onSpeech(true, 16_000);
+    await tick(JEV_BARGE_MS + 10);
+    expect(cut()).toBe(2);
+    h.loop.onWords();
+    await tick(1);
+    expect(cut()).toBe(3);
+    h.loop.onSpeech(false, 20_000);
+    await tick(1);
+
+    // Nothing playing: speech with words is only an utterance.
+    h.loop.onSpeech(true, 22_000);
+    h.loop.onInterim('are you there');
+    await tick(JEV_BARGE_MS + 10);
+    h.loop.onWords();
+    expect(cut()).toBe(3);
+    vi.useRealTimers();
+  });
+
+  it('a synthesis failure is reported, not spoken about; one that fails mid-line reports what got out', async () => {
+    const h = jevLoop();
+    h.loop.onReply('r1', 'One.');
+    await flush();
+    h.lines[0].resolve({ heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false });
+    await flush();
+    expect(h.kinds()).toEqual(['r1:failed']);
+    expect(h.speak).toHaveBeenCalledTimes(1);
+
+    h.loop.onReply('r2', 'Booked for eight, at the usual place.');
+    await flush();
+    h.start(h.lines[1]);
+    h.finish(h.lines[1], { failed: true, audioMs: 1_000, playedMs: 1_000, complete: false });
+    await flush();
+    // Half the line, at the synthesis rate assumed for a line still being made (37 chars at 14/s is 2.6 s).
+    expect(h.events.at(-1)).toEqual({
+      type: 'playback',
+      replyId: 'r2',
+      state: 'cut_off',
+      delivered: 'Booked for',
+      at: expect.any(Number),
+    });
+
+    // Nothing to say: failed at once, no request made.
+    h.loop.onReply('r3', '   ');
+    await flush();
+    expect(h.kinds().at(-1)).toBe('r3:failed');
+    expect(h.speak).toHaveBeenCalledTimes(2);
+  });
+
+  it('close cuts the line playing, drops the queue and reports nothing after', async () => {
+    const h = jevLoop();
+    h.loop.onSpeech(true, 0);
+    h.loop.onInterim('Book a');
+    h.loop.onReply('r1', 'One.');
+    h.loop.onReply('r2', 'Two.');
+    await flush();
+    h.loop.close();
+    await flush();
+    expect(h.kinds()).toEqual(['speech:on', 'partial:Book a', 'r2:cut_off', 'r1:cut_off']);
+    h.loop.onSpeech(false, 8_000);
+    h.loop.onReply('r3', 'Three.');
+    await flush();
+    expect(h.events).toHaveLength(4);
+    expect(h.speak).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('jev calls', () => {
+  const JEV_META: LiveKitJobMetadata = { ...META, jev: true };
+  const jevEvents = (host: ReturnType<typeof fakeHostFetch>) =>
+    host.calls.filter((c) => c.url.endsWith('/jev')).map((c) => c.body!.events as JevWorkerEvent[]);
+  const summary = (e: JevWorkerEvent) =>
+    e.type === 'playback'
+      ? `${e.replyId}:${e.state}`
+      : e.type === 'speech'
+        ? `speech:${e.on ? 'on' : 'off'}`
+        : `${e.final ? 'final' : 'partial'}:${e.text}`;
+
+  it('runs the loop: no turns, no cues, no spotter; words and marks go to agent/jev in order, replies are spoken by replyId', async () => {
+    const { ctx, job } = fakeJob({ ...JEV_META });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const wakeWord = vi.fn();
+    const env = { ...ENV, VOICE_MODE_WAKE_MODEL: '/models/hey_dan.onnx', VOICE_MODE_WAKE_PHRASE: 'Hey Dan' };
+    await runCall(ctx, callDeps(host.fetchImpl, v, { env, wakeWord }));
+    expect(wakeWord).not.toHaveBeenCalled();
+    expect(v.voice.review.serve).toHaveBeenCalledTimes(1);
+    // The page's settings are answered (its speech choice would apply); review mode is not on offer.
+    expect(await v.rpc('settings', { cues: false })).toMatchObject({ ok: true });
+    expect(await v.rpc('talk')).toMatchObject({ ok: false, error: 'not_review' });
+    expect(v.states.at(-1)).toMatchObject({ mode: 'auto', draft: null, wake: { on: false } });
+
+    v.transcription.results.push(heard('Book a table', 'Book a table.'));
+    v.audio(600);
+    v.events.onSpeech(true, v.position);
+    v.audio(1000);
+    v.interim('Book a');
+    v.interim('Book a table');
+    v.events.onSpeech(false, v.position);
+    await vi.waitFor(() =>
+      expect(jevEvents(host).flat().map(summary)).toEqual([
+        'speech:on',
+        'partial:Book a',
+        'partial:Book a table',
+        'speech:off',
+        'final:Book a table.',
+      ]),
+    );
+    // Batched: fewer POSTs than events, each with the call id; never a turn.
+    expect(jevEvents(host).length).toBeLessThan(5);
+    for (const call of host.calls.filter((c) => c.url.endsWith('/jev'))) expect(call.body?.callId).toBe('call-1');
+    expect(host.calls.some((c) => c.url.endsWith('/utterance'))).toBe(false);
+    expect(v.voice.caption).toHaveBeenCalledWith(1, 'Book a table.', true);
+    expect(v.voice.publishTurn).not.toHaveBeenCalled();
+
+    host.emit({ type: 'reply', text: 'Booked.', replyId: 'r1' });
+    await vi.waitFor(() => expect(v.voice.say).toHaveBeenCalledWith('Booked.', expect.any(Function)));
+    await vi.waitFor(() =>
+      expect(jevEvents(host).flat().map(summary).slice(5)).toEqual(['r1:started', 'r1:completed']),
+    );
+    // A reply the host did not label is not spoken: nothing could be reported about it.
+    host.emit({ type: 'reply', text: 'Unlabelled.' });
+    host.emit({ type: 'thinking' });
+    host.emit({ type: 'working' });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(v.voice.say).toHaveBeenCalledTimes(1);
+    expect(v.voice.playCue).not.toHaveBeenCalled();
+    expect(v.voice.setThinking).not.toHaveBeenCalled();
+    expect(v.voice.publishReply).not.toHaveBeenCalled();
+
+    host.emit({ type: 'end', reason: 'done' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
+    expect(v.voice.close).toHaveBeenCalled();
+    expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+  });
+
+  it("the host's stop cuts the line through the room's abortable speech, and the end tells the host", async () => {
+    const { ctx, job } = fakeJob({ ...JEV_META });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    let signal: AbortSignal | undefined;
+    (v.voice as CallVoice).speak = vi.fn(async (_text: string, ready: () => Promise<void>, s: AbortSignal) => {
+      signal = s;
+      await ready();
+      v.events.onAgentSpeaking(true);
+      await untilAborted(s);
+      v.events.onAgentSpeaking(false);
+      return { heard: true, failed: false, cut: true, audioMs: 3_000, playedMs: 1_500, complete: true };
+    });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    host.emit({ type: 'reply', text: 'Booked for eight, at the usual place.', replyId: 'r1' });
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    await vi.waitFor(() => expect(jevEvents(host).flat().map(summary)).toEqual(['r1:started']));
+    host.emit({ type: 'stop' });
+    await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+    await vi.waitFor(() =>
+      expect(jevEvents(host).flat().at(-1)).toEqual({
+        type: 'playback',
+        replyId: 'r1',
+        state: 'cut_off',
+        delivered: 'Booked for eight,',
+        at: expect.any(Number),
+      }),
+    );
+    expect(v.voice.say).not.toHaveBeenCalled();
+    // The worker ends it: the host hears why.
+    v.events.onClosed('vad failed');
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('vad failed'));
+    expect(host.calls.find((c) => c.url.endsWith('/ended'))?.body).toEqual({ callId: 'call-1', reason: 'vad failed' });
+  });
+});
+
+describe('jev: an abortable line in the speech output', () => {
+  it('an abort stops the frame loop, clears the sink and flushes no tail; it is not a synthesis failure', async () => {
+    const frames: Int16Array[] = [];
+    const sink = {
+      captureFrame: vi.fn(async (frame: AudioFrame) => void frames.push(frame.data)),
+      waitForPlayout: vi.fn(async () => undefined),
+      clearQueue: vi.fn(),
+      queuedDuration: 100,
+    };
+    let release!: () => void;
+    const hold = new Promise<void>((r) => (release = r));
+    const tts = fakeTts(() => ({ chunks: 3, samples: 2_400, hold }));
+    const started = vi.fn();
+    const stopped = vi.fn();
+    const spoke = vi.fn();
+    const output = speechOutput({
+      meta: META,
+      settings: { providerKeys: { gemini: 'gk' }, spoke },
+      sink,
+      log: silentLog,
+      started,
+      stopped,
+      changed: () => undefined,
+      build: () => tts.instance,
+    });
+    const abort = new AbortController();
+    const line = output.speak('A line of some length.', async () => undefined, abort.signal);
+    await vi.waitFor(() => expect(started).toHaveBeenCalled());
+    // The first 100 ms chunk went to the sink (five 20 ms frames); the provider holds the rest.
+    expect(frames).toHaveLength(5);
+    abort.abort();
+    const outcome = await line;
+    expect(outcome).toEqual({ heard: true, failed: false, cut: true, audioMs: 100, playedMs: 0, complete: false });
+    expect(sink.clearQueue).toHaveBeenCalledTimes(1);
+    expect(sink.waitForPlayout).not.toHaveBeenCalled();
+    expect(frames).toHaveLength(5);
+    expect(stopped).toHaveBeenCalledTimes(1);
+    expect(spoke).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'partial' }), undefined);
+    release();
+
+    // A line nobody aborts plays whole, as before.
+    const whole = await output.speak('Short.', async () => undefined, new AbortController().signal);
+    expect(whole).toEqual({ heard: true, failed: false, cut: false, audioMs: 300, playedMs: 300, complete: true });
+    expect(sink.clearQueue).toHaveBeenCalledTimes(1);
+    expect(sink.waitForPlayout).toHaveBeenCalledTimes(1);
+    await output.close();
   });
 });
