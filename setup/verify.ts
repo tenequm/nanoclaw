@@ -137,24 +137,7 @@ export async function run(_args: string[]): Promise<void> {
   }
 
   // 4. Check channel auth (detect configured channels by credentials)
-  const envVars = readEnvFile([
-    'TELEGRAM_BOT_TOKEN',
-    'SLACK_BOT_TOKEN',
-    'SLACK_APP_TOKEN',
-    'DISCORD_BOT_TOKEN',
-    'GITHUB_TOKEN',
-    'LINEAR_API_KEY',
-    'GCHAT_CREDENTIALS',
-    'TEAMS_APP_ID',
-    'TEAMS_APP_PASSWORD',
-    'WEBEX_BOT_TOKEN',
-    'MATRIX_ACCESS_TOKEN',
-    'RESEND_API_KEY',
-    'WHATSAPP_ACCESS_TOKEN',
-    'IMESSAGE_ENABLED',
-    'PHOTON_PROJECT_ID',
-    'PHOTON_PROJECT_SECRET',
-  ]);
+  const envVars = readEnvFile([...CHANNEL_ENV_KEYS]);
 
   const has = (key: string) => !!(process.env[key] || envVars[key]);
   const channelAuth: Record<string, string> = {};
@@ -278,6 +261,26 @@ export async function run(_args: string[]): Promise<void> {
 
   if (status === 'failed') process.exit(1);
 }
+
+/** Channel credentials, read from the environment ahead of `.env`. */
+export const CHANNEL_ENV_KEYS = [
+  'TELEGRAM_BOT_TOKEN',
+  'SLACK_BOT_TOKEN',
+  'SLACK_APP_TOKEN',
+  'DISCORD_BOT_TOKEN',
+  'GITHUB_TOKEN',
+  'LINEAR_API_KEY',
+  'GCHAT_CREDENTIALS',
+  'TEAMS_APP_ID',
+  'TEAMS_APP_PASSWORD',
+  'WEBEX_BOT_TOKEN',
+  'MATRIX_ACCESS_TOKEN',
+  'RESEND_API_KEY',
+  'WHATSAPP_ACCESS_TOKEN',
+  'IMESSAGE_ENABLED',
+  'PHOTON_PROJECT_ID',
+  'PHOTON_PROJECT_SECRET',
+] as const;
 
 /**
  * Channels whose wiring only completes after the first inbound message —
