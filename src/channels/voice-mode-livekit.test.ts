@@ -2081,6 +2081,8 @@ describe('meetings: the /meet call kind on the call core', () => {
     expect(content.text).toContain('<voice source="livekit">what is two plus two</voice>');
     expect(content.text).toContain('Spoken in a live Google Meet you joined as a voice participant;');
     expect(content.text).not.toContain('present:');
+    expect(content.text).toContain('keep it brief and conversational, lead with the answer. No markdown');
+    expect(content.text).not.toContain('Match the depth to the question');
     expect(content.text).toContain(CALL_LANGUAGE_NOTE);
   });
 

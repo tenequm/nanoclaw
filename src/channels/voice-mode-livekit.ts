@@ -113,14 +113,16 @@ export const CALL_LANGUAGE_NOTE =
   'recognition, so answer in Ukrainian (in English if the caller spoke English), never in Russian.';
 
 /**
- * How long a spoken answer runs and how it is shaped for the ear. Every format rule for a spoken reply
- * lives here, on each turn; the resident voice-mode-formatting instructions carry only what no turn's note can.
+ * How a spoken reply is shaped for the ear. Every format rule for a spoken reply lives in the turn notes; the
+ * resident voice-mode-formatting instructions carry only what no turn's note can.
  */
+export const CALL_SPEECH_FORMAT_NOTE = 'No markdown, no links, no code blocks, numbers written as words.';
+
+/** How long a /voice answer runs, then the speech format. */
 export const CALL_DEPTH_NOTE =
   'Match the depth to the question: brief for simple ones; for design, strategy or anything that needs care, ' +
   'take the time to think and verify, and give the full considered answer in plain speech. Lead with the ' +
-  'answer; for a long one, say how many points there are, then take them one at a time. No markdown, no ' +
-  'links, no code blocks, numbers written as words.';
+  `answer; for a long one, say how many points there are, then take them one at a time. ${CALL_SPEECH_FORMAT_NOTE}`;
 
 /** How the agent learns a message was spoken on a call in its chat, where every message it sends there is heard. */
 export const callChatReplyNote = (languageNote: string): string =>

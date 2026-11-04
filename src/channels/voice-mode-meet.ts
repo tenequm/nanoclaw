@@ -41,7 +41,7 @@ import {
   messageText,
 } from './voice-mode-chat.js';
 import { linePlatformId } from './voice-mode-line.js';
-import { CALL_DEPTH_NOTE, type CallKind, type CallRefusal, type LiveKitVoice } from './voice-mode-livekit.js';
+import { CALL_SPEECH_FORMAT_NOTE, type CallKind, type CallRefusal, type LiveKitVoice } from './voice-mode-livekit.js';
 
 /** The worker and the bridge page, with room for the page to reconnect before its old self is gone. */
 const MEETING_MAX_PARTICIPANTS = 3;
@@ -84,7 +84,8 @@ function meetingReplyNote(languageNote: string): string {
   return (
     'Spoken in a live Google Meet you joined as a voice participant; someone there addressed you, ' +
     'and the speaker may be any participant, not only the chat owner. While the meeting lasts, every message ' +
-    `you send to this chat is read aloud into the meeting word for word. ${CALL_DEPTH_NOTE} Offer anything ` +
+    `you send to this chat is read aloud into the meeting word for word: keep it brief and conversational, lead ` +
+    `with the answer. ${CALL_SPEECH_FORMAT_NOTE} Offer anything ` +
     `meant for reading for after the meeting. ${languageNote}`
   );
 }
