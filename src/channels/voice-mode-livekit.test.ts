@@ -54,7 +54,7 @@ import { callPageHtml } from './voice-mode-page.js';
 import type { VoiceCatalog, VoiceStatus } from './voice-mode-tts-catalog.js';
 import { linePlatformId } from './voice-mode-line.js';
 import { MEETING_MAX_DURATION_MS, type RecallMeetBridge } from './meet-recall.js';
-import type { CallCore, CallEvent, Command } from '../modules/meet-jev/core/types.js';
+import type { CallCore, CallEvent, Command, JevState } from '../modules/meet-jev/core/types.js';
 
 /** A line /voice made: its calls need a chat to talk in. */
 const LINE = linePlatformId('0123456789ab');
@@ -2448,6 +2448,89 @@ describe('/voice jev on the call core', () => {
     expect((await worker.post('ended', { reason: 'caller left' })).status).toBe(204);
     expect((await worker.post('jev', { events: [final('u1', 'hi')] })).status).toBe(409);
     expect(seen).toEqual([]);
+    worker.close();
+  });
+});
+
+describe('/voice jev with the real core', () => {
+  let h: Harness;
+  let chat: ReturnType<typeof fakeMirror>;
+  /** Every state Jev was asked about; it answers `answer` with confidence. */
+  let asked: JevState[];
+
+  beforeEach(async () => {
+    asked = [];
+    chat = fakeMirror([{ platform_id: 'telegram:100' }], {
+      bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
+    });
+    const judge = async (state: JevState) => {
+      asked.push(state);
+      return {
+        verdict: {
+          action: 'answer' as const,
+          probabilities: { answer: 0.9, stay_silent: 0.1, stop: 0, continue: 0 },
+          confidence: 0.8,
+        },
+        ms: 5,
+      };
+    };
+    h = await startHarness({ accessCheckIntervalMs: 60_000 }, { mirrorApi: chat.api, jev: { judge } });
+  });
+  afterEach(async () => {
+    await h.stop();
+  });
+
+  it('wakes on the vocative, speaks the answer, takes the playback into the window, and judges the next words', async () => {
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    expect((await worker.post('joined')).status).toBe(200);
+    const at = () => Date.now();
+    await worker.post('jev', {
+      events: [
+        { type: 'speech', on: true, at: at() },
+        { type: 'utterance', uttId: 'u1', text: 'Andy, what time is it?', final: true, at: at() },
+        { type: 'speech', on: false, at: at() },
+      ],
+    });
+    await vi.waitFor(() => expect(h.inbound).toHaveLength(1));
+    const text = (h.inbound[0].content as { text: string }).text;
+    expect(text.startsWith('<voice source="livekit">Andy, what time is it?</voice>\n')).toBe(true);
+    expect(text).toContain('You are on a live voice call');
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['\u{1F399} Andy, what time is it?']));
+    expect(asked).toEqual([]);
+
+    liveKitChatDelivered(
+      {
+        id: 'out-1',
+        kind: 'chat',
+        content: JSON.stringify({ text: 'It is nine.' }),
+        channelType: 'telegram',
+        platformId: 'telegram:100',
+        threadId: null,
+        inReplyTo: `${h.inbound[0].id}:ag-andy`,
+      },
+      'ag-andy',
+    );
+    const spoken = await worker.waitFor((e) => e.type === 'reply');
+    expect(spoken).toEqual({ type: 'reply', text: 'It is nine.', turn: '1', replyId: 'r1' });
+    await worker.post('jev', {
+      events: [
+        { type: 'playback', replyId: 'r1', state: 'started', at: at() },
+        { type: 'playback', replyId: 'r1', state: 'completed', at: at() },
+        { type: 'speech', on: true, at: at() },
+        { type: 'utterance', uttId: 'u2', text: 'and tomorrow?', final: true, at: at() },
+        { type: 'speech', on: false, at: at() },
+      ],
+    });
+    await vi.waitFor(() => expect(h.inbound).toHaveLength(2));
+    expect(asked).toHaveLength(1);
+    expect(asked[0].window).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ text: 'It is nine.', agent: true }),
+        expect.objectContaining({ speaker: 'Ethan', text: 'and tomorrow?' }),
+      ]),
+    );
+    expect((h.inbound[1].content as { text: string }).text).toContain('<voice source="livekit">and tomorrow?</voice>');
     worker.close();
   });
 });
