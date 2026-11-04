@@ -41,11 +41,76 @@ function actionQuestion(agent: string) {
   };
 }
 
+function shadowQuestions(agent: string) {
+  return {
+    wants_reply_now: {
+      type: 'noul',
+      instructions: `Does \`latest\` ask ${agent} something or ask it to do or say something, with the thought finished? Use \`window\` for context.`,
+      criteria: {
+        true: `A finished question or request for ${agent}, in English ("${agent}, explain that") or Ukrainian ("${agent}, poyasny tse").`,
+        false: `Small talk, a third-person mention, a request to wait or not answer, or a thought still being finished, even after ${agent}'s name.`,
+      },
+    },
+    for_someone_else: {
+      type: 'noul',
+      instructions: `Is \`latest\` said to a person other than ${agent}? Use \`window\` to resolve who is addressed.`,
+      criteria: {
+        true: `A remark or request to another person, in English ("Anna, what do you think?") or Ukrainian ("Anno, shcho ty dumayesh?").`,
+        false: `An utterance for ${agent}, or an open question without another person as its addressee.`,
+      },
+    },
+    unfinished: {
+      type: 'noul',
+      instructions: `Is the speaker still finishing the thought in \`latest\`? Use \`window\` for context, including partial lines still being spoken.`,
+      criteria: {
+        true: `An incomplete thought, in English ("${agent}, I was wondering...") or Ukrainian ("${agent}, ya khotiv zapytaty..."). Saying the agent's name alone does not finish a request.`,
+        false: `A complete thought or request that can be understood without the speaker adding more.`,
+      },
+    },
+    already_answered: {
+      type: 'noul',
+      instructions: `Was what \`latest\` asks already answered in \`window\`, by ${agent} or another person?`,
+      criteria: {
+        true: `The requested information was already supplied in the conversation, in English ("It is Lima") or Ukrainian ("Tse Lima").`,
+        false: `No answer in the window, or latest asks a new question, clarification, or further detail the earlier answer did not cover.`,
+      },
+    },
+  };
+}
+
 /** How far a distribution's sum may be from 1 (rounding in Jev's answer) before it is malformed. */
 const SUM_TOLERANCE = 0.02;
 
 const unit = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+
+function shadowLog(body: unknown) {
+  const answers = (body as { answers?: Record<string, unknown> } | null)?.answers;
+  const probability = (key: string): number | null => {
+    const answer = answers?.[key];
+    if (!answer || typeof answer !== 'object' || Array.isArray(answer)) return null;
+    const { type, noul } = answer as Record<string, unknown>;
+    return type === 'noul' && unit(noul) ? noul : null;
+  };
+  const shadow = {
+    wants_reply_now: probability('wants_reply_now'),
+    for_someone_else: probability('for_someone_else'),
+    unfinished: probability('unfinished'),
+    already_answered: probability('already_answered'),
+  };
+  const shadow_rule =
+    shadow.wants_reply_now !== null &&
+    shadow.wants_reply_now >= 0.7 &&
+    shadow.for_someone_else !== null &&
+    shadow.for_someone_else < 0.3 &&
+    shadow.unfinished !== null &&
+    shadow.unfinished < 0.3 &&
+    shadow.already_answered !== null &&
+    shadow.already_answered < 0.5
+      ? 'answer'
+      : 'stay_silent';
+  return { shadow, shadow_rule };
+}
 
 /**
  * Read the answer to Choice `question`; null unless it is well-formed over `options`: every option's
@@ -91,6 +156,7 @@ function stillWantedQuestion(agent: string) {
 
 export const judgeQuestions = (agent: string) => ({
   action: actionQuestion(agent),
+  ...shadowQuestions(agent),
   still_wanted: stillWantedQuestion(agent),
 });
 
@@ -112,10 +178,12 @@ async function ask<V>(
   let model: unknown = null;
   let usage: unknown = null;
   let answer: unknown = null;
+  let responseBody: unknown = null;
   let failure: JevFailure | null = null;
   try {
     const result = await postSystemOne({ state, questions }, opts.signal);
     if (result.ok) {
+      responseBody = result.body;
       const body = result.body as { model?: unknown; usage?: unknown; answers?: Record<string, unknown> } | null;
       model = body?.model ?? null;
       usage = body?.usage ?? null;
@@ -139,13 +207,14 @@ async function ask<V>(
     answer,
     ms,
     failure,
+    ...(question === 'action' ? shadowLog(responseBody) : {}),
   });
   return { verdict, ms };
 }
 
 /** Ask Jev what the agent should do about the window. Never throws; null on any failure. */
 export const askAction = (state: JevState, opts: JudgeOptions = {}): Promise<{ verdict: Verdict | null; ms: number }> =>
-  ask(state, { action: actionQuestion(state.agent_name) }, parseAction, opts);
+  ask(state, { action: actionQuestion(state.agent_name), ...shadowQuestions(state.agent_name) }, parseAction, opts);
 
 /** Ask Jev whether a landed answer is still wanted. Never throws; null on any failure. */
 export const askStillWanted = (
