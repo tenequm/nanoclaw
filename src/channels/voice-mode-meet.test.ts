@@ -139,8 +139,10 @@ describe('runMeetCommand', () => {
     const left: string[] = [];
     const control: MeetingControl = {
       meetings: {
-        start: async (platformId, url, { pauseSends, jev }) => {
+        // The core binds the chat only once it admitted the call.
+        start: async (platformId, url, { pauseSends, jev }, bindChat) => {
           started.push({ platformId, url, pauseSends, jev });
+          if (start.ok && bindChat && !(await bindChat())) return { ok: false, error: 'no-line' };
           return start;
         },
         leave: (platformId) => {
@@ -220,11 +222,44 @@ describe('runMeetCommand', () => {
     expect(meetCommandReply(paused)).toContain('a turn ends on a send word or a pause.');
     expect(meetCommandReply(paused)).not.toContain('unaddressed');
 
-    const withJev = await runMeetCommand(mg('mg-dm'), null, OWNER, { ...join, jev: true }, { meetings: m.control });
+    const withJev = await runMeetCommand(
+      mg('mg-dm'),
+      null,
+      OWNER,
+      { ...join, jev: true },
+      { meetings: m.control, jevAvailable: true },
+    );
     expect(withJev).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, jev: true });
     expect(m.started.at(-1)).toMatchObject({ pauseSends: false, jev: true });
     expect(meetCommandReply(withJev)).toContain('It may also join in unaddressed when the conversation invites it.');
     expect(meetCommandReply({ kind: 'usage' })).toContain('/meet <link> jev');
+  });
+
+  it('refuses jev without the Jev key, before any line is made or call started', async () => {
+    const m = fakeMeetings();
+    const outcome = await runMeetCommand(
+      mg('mg-dm'),
+      null,
+      OWNER,
+      { ...join, jev: true },
+      { meetings: m.control, key: randomBytes(32), jevAvailable: false },
+    );
+    expect(outcome).toEqual({ kind: 'no-jev', agentName: 'Andy' });
+    expect(meetCommandReply(outcome)).toContain('JEV_API_KEY');
+    expect(m.started).toEqual([]);
+    expect(await getVoiceModeLineForAgent('ag-1')).toBeUndefined();
+  });
+
+  it('moves an existing line to this chat only once the meeting call is admitted', async () => {
+    await chat('mg-other', 'chat:other');
+    await wire('mg-other', 'ag-1');
+    await runMeetCommand(mg('mg-other'), null, OWNER, join, { meetings: fakeMeetings().control, key: randomBytes(32) });
+    expect(await getVoiceModeLineForAgent('ag-1')).toMatchObject({ messaging_group_id: 'mg-other' });
+    const refused = fakeMeetings({ ok: false, error: 'limit', body: 'No calls left this hour.', retryAfter: '60' });
+    await runMeetCommand(mg('mg-dm'), null, OWNER, join, { meetings: refused.control });
+    expect(await getVoiceModeLineForAgent('ag-1')).toMatchObject({ messaging_group_id: 'mg-other' });
+    await runMeetCommand(mg('mg-dm'), null, OWNER, join, { meetings: fakeMeetings().control });
+    expect(await getVoiceModeLineForAgent('ag-1')).toMatchObject({ messaging_group_id: 'mg-dm' });
   });
 
   it('needs the host key only to make a first line', async () => {
@@ -277,9 +312,12 @@ describe('runMeetCommand', () => {
       'Andy could not join the meeting: the meeting bot service refused or did not answer.',
     );
     const limited = await runMeetCommand(mg('mg-dm'), null, OWNER, join, {
-      meetings: fakeMeetings({ ok: false, error: 'limit', message: 'No minutes left.' }).control,
+      meetings: fakeMeetings({ ok: false, error: 'limit', body: 'No minutes left.', retryAfter: '60' }).control,
     });
     expect(meetCommandReply(limited)).toBe('Andy could not join the meeting: No minutes left.');
+    expect(meetCommandReply({ kind: 'failed', agentName: 'Andy', start: { ok: false, error: 'no-line' } })).toBe(
+      'Andy could not join the meeting: its voice line is gone, or its caller no longer owns or administers the agent.',
+    );
     await createAgentGroup({ id: 'ag-2', name: 'Dan', folder: 'ag-2', agent_provider: null, created_at: now() });
     await wire('mg-dm', 'ag-2');
     expect(await runMeetCommand(mg('mg-dm'), null, OWNER, join, { meetings: fakeMeetings().control })).toEqual({

@@ -11,13 +11,13 @@
  * `jev` also lets the agent join in unaddressed, when the Jev gate judges the conversation invites it.
  */
 import type { InboundEvent } from './adapter.js';
+import { JEV_API_KEY } from '../config.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getVoiceModeLineForAgent } from '../db/voice-mode-lines.js';
 import { log } from '../log.js';
 import { DEFAULT_THRESHOLDS, gateEntryFor } from '../modules/jev-gate/config.js';
 import { renderState, type GateHistoryRow } from '../modules/jev-gate/history.js';
 import { askJev, decide } from '../modules/jev-gate/jev.js';
-import { getUser } from '../modules/permissions/db/users.js';
 import { registerMessageInterceptor } from '../router.js';
 import { encryptionKey } from '../secret-seal.js';
 import type { MessagingGroup } from '../types.js';
@@ -36,18 +36,19 @@ import {
   claimLine,
   commandChat,
   commandName,
+  displayNameOf,
   liveVoiceAdapter,
   messageText,
 } from './voice-mode-chat.js';
 import { linePlatformId } from './voice-mode-line.js';
-import type { CallKind, CallRefusal, LiveKitVoice } from './voice-mode-livekit.js';
+import { CALL_DEPTH_NOTE, type CallKind, type CallRefusal, type LiveKitVoice } from './voice-mode-livekit.js';
 
 /** The worker and the bridge page, with room for the page to reconnect before its old self is gone. */
 const MEETING_MAX_PARTICIPANTS = 3;
 /** A `/meet ... jev` call's rolling transcript, in lines, that the Jev gate reads a candidate against. */
-export const MEETING_JEV_HISTORY_LINES = 12;
-/** An agent line in that transcript is clipped: the gist is enough to tell what was already answered. */
-const MEETING_JEV_REPLY_CHARS = 600;
+const MEETING_JEV_HISTORY_LINES = 12;
+/** A line in that transcript is clipped: the gist is enough to tell what was already said or answered. */
+const MEETING_JEV_LINE_CHARS = 600;
 const MAX_WAKE_NAME_CHARS = 80;
 
 /**
@@ -79,21 +80,17 @@ function wakeNameOf(raw: string): string {
 }
 
 /** A `/meet` turn's note: anyone may have spoken, and every message to the chat is said into the meeting. */
-export function meetingReplyNote(languageNote: string): string {
+function meetingReplyNote(languageNote: string): string {
   return (
     'Spoken in a live Google Meet you joined as a voice participant; someone there addressed you, ' +
     'and the speaker may be any participant, not only the chat owner. While the meeting lasts, every message ' +
-    'you send to this chat is read aloud into the meeting word for word: keep it brief and conversational, lead ' +
-    'with the answer, no markdown, no links, no code blocks, numbers written as words. Offer anything meant for ' +
-    `reading for after the meeting. ${languageNote}`
+    `you send to this chat is read aloud into the meeting word for word. ${CALL_DEPTH_NOTE} Offer anything ` +
+    `meant for reading for after the meeting. ${languageNote}`
   );
 }
 
 /** What `/meet` hears back: the meeting call started, or why not. */
-export type MeetingStart =
-  | { ok: true }
-  | { ok: false; error: Exclude<CallRefusal['error'], 'limit'> | 'bot' }
-  | { ok: false; error: 'limit'; message: string };
+export type MeetingStart = { ok: true } | CallRefusal | { ok: false; error: 'bot' };
 
 /** How a meeting runs, from the command's words after the link. */
 export interface MeetingOptions {
@@ -105,7 +102,13 @@ export interface MeetingOptions {
 
 /** The voice channel's meetings: one per line at most, as calls are. */
 export interface Meetings {
-  start(platformId: string, meetingUrl: string, options: MeetingOptions): Promise<MeetingStart>;
+  /** `bindChat`: makes the command's chat the line's call chat, once the call is admitted (CallKind.bindChat). */
+  start(
+    platformId: string,
+    meetingUrl: string,
+    options: MeetingOptions,
+    bindChat?: () => Promise<boolean>,
+  ): Promise<MeetingStart>;
   /** Ends the line's meeting call; false when it has none. */
   leave(platformId: string): boolean;
 }
@@ -123,9 +126,9 @@ export function createMeetings(
   const live = new Map<string, string>();
 
   /**
-   * Jev's judge of a candidate against the meeting's rolling transcript: the agent's own gate thresholds
-   * when it has a live gate entry, the defaults otherwise. Fail-silent: an error or timeout keeps it out.
-   * The agent goes by `wakeName`, the name the meeting wakes on, by the line's agent name only without one.
+   * Jev's judge of a candidate against the meeting's rolling transcript, with the agent's gate thresholds
+   * (the defaults without a live gate entry); an error or timeout keeps it out. The agent goes by
+   * `wakeName`, the name the meeting wakes on, and by the line's agent name only without one.
    */
   const jevCandidates = (): NonNullable<CallKind['candidates']> => {
     const lines: GateHistoryRow[] = [];
@@ -133,35 +136,30 @@ export function createMeetings(
       async judge(call, text, rawWakeName) {
         const agentName = wakeNameOf(rawWakeName) || call.line.agent.name;
         const fields = { callId: call.callId };
-        try {
-          const result = await judgeJev(renderState(lines, meetingLine('in', text, now()), agentName), agentName);
-          if (!result.ok) {
-            log.info('meet: jev candidate dropped', { ...fields, error: result.reason });
-            return false;
-          }
-          const thresholds = gateEntryFor(call.line.agentGroupId)?.thresholds ?? DEFAULT_THRESHOLDS;
-          const decision = decide(result.scores, thresholds);
-          log.info(`meet: jev candidate ${decision.wake ? 'wakes the agent' : 'dropped'}`, {
-            ...fields,
-            value: decision.value,
-            veto: decision.veto,
-            ...(decision.reason ? { reason: decision.reason } : {}),
-            ...result.scores,
-          });
-          return decision.wake;
-        } catch (err) {
-          log.warn('meet: jev candidate judging threw; dropped', { ...fields, err });
+        const result = await judgeJev(renderState(lines, meetingLine('in', text, now()), agentName), agentName);
+        if (!result.ok) {
+          log.info('meet: jev candidate dropped', { ...fields, error: result.reason });
           return false;
         }
+        const thresholds = gateEntryFor(call.line.agentGroupId)?.thresholds ?? DEFAULT_THRESHOLDS;
+        const decision = decide(result.scores, thresholds);
+        log.info(`meet: jev candidate ${decision.wake ? 'wakes the agent' : 'dropped'}`, {
+          ...fields,
+          value: decision.value,
+          veto: decision.veto,
+          ...(decision.reason ? { reason: decision.reason } : {}),
+          ...result.scores,
+        });
+        return decision.wake;
       },
       heard(direction, text) {
-        lines.push(meetingLine(direction, direction === 'out' ? text.slice(0, MEETING_JEV_REPLY_CHARS) : text, now()));
+        lines.push(meetingLine(direction, text.slice(0, MEETING_JEV_LINE_CHARS), now()));
         lines.splice(0, Math.max(0, lines.length - MEETING_JEV_HISTORY_LINES));
       },
     };
   };
 
-  const start = async (platformId: string, meetingUrl: string, options: MeetingOptions): Promise<MeetingStart> => {
+  const start: Meetings['start'] = async (platformId, meetingUrl, options, bindChat) => {
     /** The bot, once its create was sent; whether the call already ended. */
     const meeting: { bot?: Promise<string | null>; ended: boolean } = { ended: false };
     const leaveBot = (): Promise<void> | undefined => meeting.bot?.then((id) => (id ? bridge.leave(id) : undefined));
@@ -189,9 +187,10 @@ export function createMeetings(
         return leaveBot();
       },
       ...(options.jev ? { candidates: jevCandidates() } : {}),
+      ...(bindChat ? { bindChat } : {}),
     };
     const opened = await core.openCall(platformId, kind);
-    if (!opened.ok) return opened.error === 'limit' ? { ok: false, error: 'limit', message: opened.body } : opened;
+    if (!opened.ok) return opened;
     const { call } = opened;
     live.set(platformId, call.callId);
     meeting.bot = bridge.join({ meetingUrl, botName: call.line.agent.name, roomName: call.roomName }).then(
@@ -279,7 +278,7 @@ export type MeetOutcome =
   | { kind: 'refused' }
   | { kind: 'several-agents' }
   | { kind: 'usage' }
-  | { kind: 'voice-unavailable' | 'not-configured' | 'no-key'; agentName: string }
+  | { kind: 'voice-unavailable' | 'not-configured' | 'no-key' | 'no-jev'; agentName: string }
   | { kind: 'other-caller'; agentName: string; caller?: string }
   | { kind: 'started'; agentName: string; url: string; pauseSends?: true; jev?: true }
   | { kind: 'failed'; agentName: string; start: Extract<MeetingStart, { ok: false }> }
@@ -289,6 +288,8 @@ export interface MeetRunOptions {
   /** The voice channel; null when it is not running here. The live adapter by default. */
   meetings?: MeetingControl | null;
   key?: Buffer | null;
+  /** Whether the Jev gate has its JEV_API_KEY here, which `jev` needs. */
+  jevAvailable?: boolean;
 }
 
 /**
@@ -302,7 +303,11 @@ export async function runMeetCommand(
   threadId: string | null,
   userId: string | null,
   command: MeetCommand,
-  { meetings: control = liveVoiceAdapter() ?? null, key = encryptionKey() }: MeetRunOptions = {},
+  {
+    meetings: control = liveVoiceAdapter() ?? null,
+    key = encryptionKey(),
+    jevAvailable = Boolean(JEV_API_KEY),
+  }: MeetRunOptions = {},
 ): Promise<MeetOutcome> {
   const mine = await administeredWirings(mg, userId);
   if (!mine || !userId) return { kind: 'drop' };
@@ -316,29 +321,37 @@ export async function runMeetCommand(
   if (!control) return { kind: 'voice-unavailable', agentName };
   const meetings = control.meetings;
   if (!meetings) return { kind: 'not-configured', agentName };
-  const otherCaller = async (owner: string): Promise<MeetOutcome> => ({
-    kind: 'other-caller',
-    agentName,
-    caller: (await getUser(owner))?.display_name ?? undefined,
-  });
+  const existing = await getVoiceModeLineForAgent(ag.id);
+  if (existing && existing.owner_user_id !== userId) {
+    return { kind: 'other-caller', agentName, caller: await displayNameOf(existing.owner_user_id) };
+  }
   if (command.action === 'leave') {
-    const existing = await getVoiceModeLineForAgent(ag.id);
     if (!existing) return { kind: 'no-meeting', agentName };
-    if (existing.owner_user_id !== userId) return otherCaller(existing.owner_user_id);
     return { kind: meetings.leave(linePlatformId(existing.line_id)) ? 'left' : 'no-meeting', agentName };
   }
-  // A first line, as /voice makes one: its link stays sealed until /voice shows it.
-  const claim = await claimLine(
-    { agentGroupId: ag.id, ownerUserId: userId, messagingGroupId: mg.id, threadId: callThread(wiring, mg, threadId) },
-    key,
+  if (command.jev && !jevAvailable) return { kind: 'no-jev', agentName };
+  const target = {
+    agentGroupId: ag.id,
+    ownerUserId: userId,
+    messagingGroupId: mg.id,
+    threadId: callThread(wiring, mg, threadId),
+  };
+  let lineId = existing?.line_id;
+  if (!lineId) {
+    // A first line, as /voice makes one: its link stays sealed until /voice shows it.
+    const claim = await claimLine(target, key);
+    if (claim.kind === 'no-key') return { kind: 'no-key', agentName };
+    if (claim.kind === 'other-caller') return { kind: 'other-caller', agentName, caller: claim.caller };
+    lineId = claim.line.line_id;
+  }
+  log.info('/meet: joining a meeting', { agentGroupId: ag.id, messagingGroupId: mg.id, line: lineId });
+  const start = await meetings.start(
+    linePlatformId(lineId),
+    command.url,
+    { pauseSends: command.pauseSends === true, jev: command.jev === true },
+    // An existing line moves to this chat only once the meeting call is admitted.
+    async () => (await claimLine(target, key)).kind === 'bound',
   );
-  if (claim.kind === 'no-key') return { kind: 'no-key', agentName };
-  if (claim.kind === 'other-caller') return { kind: 'other-caller', agentName, caller: claim.caller };
-  log.info('/meet: joining a meeting', { agentGroupId: ag.id, messagingGroupId: mg.id, line: claim.line.line_id });
-  const start = await meetings.start(linePlatformId(claim.line.line_id), command.url, {
-    pauseSends: command.pauseSends === true,
-    jev: command.jev === true,
-  });
   if (!start.ok) return { kind: 'failed', agentName, start };
   return {
     kind: 'started',
@@ -370,6 +383,8 @@ export function meetCommandReply(outcome: MeetOutcome, cmd = '/meet'): string | 
       return `${outcome.agentName}: meetings are not configured on this host (RECALL_API_KEY, MEET_RECALL_PAGE_URL and MEET_RECALL_LIVEKIT_URL).`;
     case 'no-key':
       return `${outcome.agentName}: call link storage is not set up on this host, so it has no voice line to join with.`;
+    case 'no-jev':
+      return `${outcome.agentName}: jev needs the Jev gate's JEV_API_KEY on this host; send ${cmd} <link> without jev.`;
     case 'other-caller':
       return `${outcome.agentName}: this voice line is ${outcome.caller ?? 'another admin'}'s; only they can take it into a meeting.`;
     case 'started':
@@ -392,10 +407,11 @@ export function meetCommandReply(outcome: MeetOutcome, cmd = '/meet'): string | 
 function failureText(start: Extract<MeetingStart, { ok: false }>): string {
   switch (start.error) {
     case 'no-line':
+      return 'its voice line is gone, or its caller no longer owns or administers the agent.';
     case 'no-chat':
       return 'its voice line has no chat to talk in here.';
     case 'limit':
-      return start.message;
+      return start.body;
     case 'room':
       return 'the call room could not be opened.';
     case 'bot':
@@ -406,7 +422,7 @@ function failureText(start: Extract<MeetingStart, { ok: false }>): string {
 }
 
 /** Claims every /meet message; the agents never see one. Anything that cannot be /meet leaves before parsing. */
-export async function handleMeetCommand(event: InboundEvent, options?: MeetRunOptions): Promise<boolean> {
+async function handleMeetCommand(event: InboundEvent): Promise<boolean> {
   if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') return false;
   if (!/meet/i.test(event.message.content)) return false;
   const command = parseMeetCommand(messageText(event.message.content), event.channelType);
@@ -415,7 +431,7 @@ export async function handleMeetCommand(event: InboundEvent, options?: MeetRunOp
   if (!chat) return true;
   const { adapter, threadId, chatThread, mg, userId } = chat;
   try {
-    const outcome = await runMeetCommand(mg, chatThread, userId, command, options);
+    const outcome = await runMeetCommand(mg, chatThread, userId, command);
     const text = meetCommandReply(outcome, commandName('meet', event.channelType));
     if (text !== null) await adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
   } catch (err) {

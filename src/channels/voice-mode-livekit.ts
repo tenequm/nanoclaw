@@ -123,10 +123,13 @@ export const CALL_DEPTH_NOTE =
   'links, no code blocks, numbers written as words.';
 
 /** How the agent learns a message was spoken on a call in its chat, where every message it sends there is heard. */
-export const CALL_CHAT_REPLY_NOTE =
+export const callChatReplyNote = (languageNote: string): string =>
   'Spoken on a live voice call; while it lasts, every message you send to this chat is read aloud word for ' +
   `word. ${CALL_DEPTH_NOTE} Offer anything meant for reading (code, links, long lists) for after the call ` +
-  `instead of sending it now. ${CALL_LANGUAGE_NOTE}`;
+  `instead of sending it now. ${languageNote}`;
+
+/** callChatReplyNote for the default languages. */
+export const CALL_CHAT_REPLY_NOTE = callChatReplyNote(CALL_LANGUAGE_NOTE);
 
 /** Added to a non-default VOICE_MODE_LANGUAGES note when Ukrainian is listed. */
 const MISSPELLED_UKRAINIAN_NOTE =
@@ -289,6 +292,11 @@ export interface CallKind {
   turnNote(languageNote: string): string;
   /** The caller joined and the call talks in a chat; `say` posts there. */
   joined?(call: KindCall, say: (text: string) => void): void;
+  /**
+   * Makes the kind's own chat the line's call chat once the call is admitted, so a refused call moves no line;
+   * false: the line is no longer its caller's. A kind with it is not refused for the line's old chat.
+   */
+  bindChat?(): Promise<boolean>;
   /** The call ended; `say` posts to its chat, null when it never went live there. Teardown awaits what it returns. */
   ended?(call: KindCall, reason: string, say: ((text: string) => void) | null): Promise<void> | void;
   /**
@@ -843,13 +851,14 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const line = await host.resolveLine(platformId, { forCall: true });
     if (!line) return { ok: false, error: 'no-line' };
     // Before anything is spent or ended: a line with no chat to talk in is refused outright.
-    if (!(await probeChat({ line, platformId }))) {
+    if (!kind.bindChat && !(await probeChat({ line, platformId }))) {
       log.info('livekit-voice-mode: call refused: the line has no chat to talk in', { platformId });
       return { ok: false, error: 'no-chat' };
     }
     const t = host.now();
     const refusal = host.admitStart(platformId, t);
     if (refusal) return { ok: false, error: 'limit', ...refusal };
+    if (kind.bindChat && !(await kind.bindChat())) return { ok: false, error: 'no-line' };
     // admitStart refused a day with no minutes left. The running call's time is already in the
     // day's total, so ending it below does not change what is left.
     const remainingMs = host.remainingTodayMs(platformId, t);

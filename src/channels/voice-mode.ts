@@ -37,8 +37,7 @@ import {
   type VoiceModeLine,
 } from './voice-mode-line.js';
 import {
-  CALL_CHAT_REPLY_NOTE,
-  CALL_LANGUAGE_NOTE,
+  callChatReplyNote,
   chatLabel,
   createLiveKitVoice,
   JSON_HEADERS,
@@ -135,7 +134,7 @@ const PROTOCOL_REFUSAL = JSON.stringify({
 });
 
 /** The `/voice` call: the caller's own page joins the room, as the line's caller. */
-export function pageCallKind(maxCallDurationMs: number): CallKind {
+function pageCallKind(maxCallDurationMs: number): CallKind {
   return {
     roomPrefix: 'voice',
     joinTimeoutMs: CALL_JOIN_TIMEOUT_MS,
@@ -144,7 +143,7 @@ export function pageCallKind(maxCallDurationMs: number): CallKind {
     job: ({ callId }) => ({ callerIdentity: `caller-${callId.slice(0, 8)}` }),
     // Always the line's own caller, wherever the call talks: the line is that person's, not whoever ran /voice.
     sender: (line) => line.caller,
-    turnNote: (languageNote) => CALL_CHAT_REPLY_NOTE.replace(CALL_LANGUAGE_NOTE, languageNote),
+    turnNote: callChatReplyNote,
   };
 }
 

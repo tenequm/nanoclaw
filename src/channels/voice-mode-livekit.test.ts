@@ -25,6 +25,7 @@ import {
   type BoundCallChat,
   turnMessageText,
   CALL_CHAT_REPLY_NOTE,
+  callChatReplyNote,
   CALL_DEPTH_NOTE,
   CALL_LANGUAGE_NOTE,
   callLanguageNote,
@@ -1937,6 +1938,12 @@ describe('turn message text', () => {
     expect(CALL_LANGUAGE_NOTE).toContain('never in Russian');
   });
 
+  it("builds a call's note for any language note, word for word as the default note with it swapped in", () => {
+    const note = callLanguageNote(['de-DE']);
+    expect(callChatReplyNote(note)).toBe(CALL_CHAT_REPLY_NOTE.replace(CALL_LANGUAGE_NOTE, note));
+    expect(callChatReplyNote(CALL_LANGUAGE_NOTE)).toBe(CALL_CHAT_REPLY_NOTE);
+  });
+
   it('names configured languages other than the default, and Ukrainian spelling only where Ukrainian is listed', () => {
     expect(callLanguageNote(['uk-UA', 'en-US'])).toBe(CALL_LANGUAGE_NOTE);
     expect(callLanguageNote(['en-US', 'uk-UA'])).toBe(
@@ -2039,6 +2046,24 @@ describe('meetings: the /meet call kind on the call core', () => {
       maxDurationMs: MEETING_MAX_DURATION_MS,
     });
     expect(bots.joined).toEqual([{ meetingUrl: MEET, botName: 'Andy', roomName: room }]);
+  });
+
+  it("binds the meeting's chat only once the call is admitted, and refuses a call whose bind fails", async () => {
+    const binds: string[] = [];
+    await h.stop();
+    h = await startHarness(
+      { maxCallsPerHour: 1, meetBridge: { join: async () => ({ botId: 'b' }), leave: async () => {} } },
+      { mirrorApi: chat.api },
+    );
+    const bind = (ok: boolean) => async () => (binds.push(String(ok)), ok);
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false }, bind(false))).toEqual({
+      ok: false,
+      error: 'no-line',
+    });
+    expect(h.lk.rooms).toEqual([]);
+    const limited = await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false }, bind(true));
+    expect(limited).toMatchObject({ ok: false, error: 'limit' });
+    expect(binds).toEqual(['false']);
   });
 
   it('tells the worker a `pause` meeting sends on the pause', async () => {

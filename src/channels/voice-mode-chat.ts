@@ -153,5 +153,10 @@ export async function claimLine(target: LineTarget, key: Buffer | null): Promise
   });
   if (line) return { kind: 'bound', line };
   const owner = (await getVoiceModeLineForAgent(target.agentGroupId))?.owner_user_id;
-  return { kind: 'other-caller', caller: owner ? ((await getUser(owner))?.display_name ?? undefined) : undefined };
+  return { kind: 'other-caller', caller: owner ? await displayNameOf(owner) : undefined };
+}
+
+/** A user's display name, as replies name another line's caller; undefined when it has none. */
+export async function displayNameOf(userId: string): Promise<string | undefined> {
+  return (await getUser(userId))?.display_name ?? undefined;
 }
