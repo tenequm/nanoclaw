@@ -5,9 +5,10 @@
  * talk in. The first run creates the agent's line and makes the sender its caller; later runs by
  * the caller show the same link again (sealed under the host key, see src/secret-seal.ts) and end
  * no call. A line is shown and moved only by its caller: another admin is told whose it is.
- * `/voice new` re-mints the caller's own link, which ends a call made with the old one. `/voice jev`
- * makes the line's page calls run the jev loop (src/modules/meet-jev/: the agent decides from the
- * conversation when to answer) until `/voice` is sent without it; the mode lives in host memory.
+ * `/voice new` re-mints the caller's own link, which ends a call made with the old one. The line's page
+ * calls run the jev loop (src/modules/meet-jev/: the agent decides from the conversation when to answer)
+ * where the host has the Jev key; `/voice plain` turns the line to the wake phrase and send word until
+ * `/voice` (or `/voice jev`) is sent again. That opt-out lives in host memory: a restart returns it to jev.
  *
  * A message interceptor, so the command never reaches an agent's session: the link is the line's
  * credential. In a direct chat the reply carries it. In a group it goes only to the sender: a
@@ -68,22 +69,29 @@ function liveCallUrl(): CallUrlFn | null {
 
 /**
  * `/voice`, `/voice@<bot>` (Telegram groups) and, on Slack, `!voice`, with `new` (`renew`: mint a fresh
- * link) or `jev` (the line's calls run the jev loop) as the only arguments that matter; null for any
- * other message. `jev` only when on.
+ * link), `plain` (the line's calls leave the jev loop) or `jev` (the default, said out loud) as the only
+ * arguments that matter; null for any other message. `plain` and `jev` only when given.
  */
-export function parseVoiceCommand(text: string, channelType: string): { renew: boolean; jev?: true } | null {
+export function parseVoiceCommand(
+  text: string,
+  channelType: string,
+): { renew: boolean; jev?: true; plain?: true } | null {
   const match = /^\s*([!/]voice(?:@\S*)?)(?!\S)(?:\s+(\S+))?/i.exec(text);
   if (!match) return null;
   if (match[1][0] === '!' && !BANG_CHANNELS.has(channelType)) return null;
   const arg = match[2]?.toLowerCase();
-  return { renew: arg === 'new', ...(arg === 'jev' ? { jev: true as const } : {}) };
+  return {
+    renew: arg === 'new',
+    ...(arg === 'jev' ? { jev: true as const } : {}),
+    ...(arg === 'plain' ? { plain: true as const } : {}),
+  };
 }
 
-/** Lines whose page calls run the jev loop, by platform id: `/voice jev` adds one, `/voice` removes it. */
-const jevLines = new Set<string>();
+/** Lines opted out of the jev loop, by platform id: `/voice plain` adds one, any other `/voice` removes it. */
+const plainLines = new Set<string>();
 
-/** Whether the line's next page call runs the jev loop. */
-export const lineRunsJev = (platformId: string): boolean => jevLines.has(platformId);
+/** Whether the line's next page call runs the jev loop (where the host has the Jev key). */
+export const lineRunsJev = (platformId: string): boolean => !plainLines.has(platformId);
 
 /** Why /voice shows no link for one agent. */
 export type VoiceNoLinkReason =
@@ -209,21 +217,28 @@ function noLinkLine(r: Extract<VoiceTargetResult, { ok: false }>, cmd: string): 
   }
 }
 
-/** The /voice reply, or null when the sender gets no answer. `jev`: the reply to `/voice jev`. */
-export function voiceCommandReply(outcome: VoiceCommandOutcome, cmd = '/voice', jev = false): string | null {
+/** The line's mode after a /voice: none named where the host has no Jev key, as every call is plain then. */
+export type VoiceMode = 'jev' | 'plain' | null;
+
+/** The /voice reply, or null when the sender gets no answer. `mode`: what the line's calls now run. */
+export function voiceCommandReply(outcome: VoiceCommandOutcome, cmd = '/voice', mode: VoiceMode = null): string | null {
   if (outcome.kind === 'drop') return null;
   if (outcome.kind === 'refused') return `Only an owner or admin of this agent can use ${cmd}.`;
   const links = voiceLinkLines(outcome);
   const notes = outcome.results.flatMap((r) => (r.ok ? [] : [noLinkLine(r, cmd)]));
   const replaced = outcome.results.some((r) => r.ok && r.replaced);
   const bound = `Calls talk in this chat, until ${cmd} is run in another one.${replaced ? ' Any earlier link no longer works.' : ''}`;
-  const mode = `Calls on this link run in jev mode: the agent decides from the conversation when to answer. Send ${cmd} to go back.`;
-  return [...links, ...(links.length > 0 ? [bound] : []), ...(links.length > 0 && jev ? [mode] : []), ...notes].join(
-    '\n\n',
-  );
+  const modeLine =
+    mode === 'jev'
+      ? `Calls on this link run in jev mode: the agent decides from the conversation when to answer. Send ${cmd} plain for the wake phrase and send word instead.`
+      : mode === 'plain'
+        ? `Calls on this link use the wake phrase and send word. Send ${cmd} to go back to jev mode.`
+        : null;
+  const shown = links.length > 0 ? [bound, ...(modeLine ? [modeLine] : [])] : [];
+  return [...links, ...shown, ...notes].join('\n\n');
 }
 
-/** `/voice jev` needs the Jev key: without it every verdict fails silent and the agent never answers unaddressed. */
+/** An explicit `/voice jev` needs the Jev key: without it every verdict fails silent and the agent never answers unaddressed. */
 const noJev = (cmd: string) => `jev mode needs the Jev gate's JEV_API_KEY on this host; send ${cmd} without jev.`;
 
 /**
@@ -265,9 +280,9 @@ export async function handleVoiceCommand(
   const cmd = voiceCommandName(event.channelType);
   // Straight to the chat's adapter, never through a session: the agent must not hold the call link.
   const say = (text: string) => adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
-  const jev = command.jev === true;
+  const mode: VoiceMode = !JEV_API_KEY ? null : command.plain ? 'plain' : 'jev';
   try {
-    if (jev && !JEV_API_KEY) {
+    if (command.jev && !JEV_API_KEY) {
       // Only someone who may run /voice here hears about the host's setup; others as for /voice.
       const mine = await administeredWirings(mg, userId);
       if (!mine) {
@@ -287,11 +302,11 @@ export async function handleVoiceCommand(
     if (outcome.kind === 'done') {
       for (const r of outcome.results) {
         if (!r.ok) continue;
-        if (jev) jevLines.add(linePlatformId(r.lineId));
-        else jevLines.delete(linePlatformId(r.lineId));
+        if (command.plain) plainLines.add(linePlatformId(r.lineId));
+        else plainLines.delete(linePlatformId(r.lineId));
       }
     }
-    let text = voiceCommandReply(outcome, cmd, jev);
+    let text = voiceCommandReply(outcome, cmd, mode);
     if (text === null) {
       log.info('/voice from an unknown sender dropped', { channelType: event.channelType });
       return true;
@@ -332,7 +347,7 @@ export async function handleVoiceCommand(
         const left = shown.filter((id) => !replaced.has(id));
         if (left.length > 0) stale(left);
         exposedNote = left.length > 0 ? notReplaced(cmd) : EXPOSED;
-        text = [voiceCommandReply(outcome, cmd, jev), exposedNote].filter((t) => t !== null).join('\n\n');
+        text = [voiceCommandReply(outcome, cmd, mode), exposedNote].filter((t) => t !== null).join('\n\n');
       }
     }
     if (voiceLinkLines(outcome).length === 0) {
@@ -563,7 +578,7 @@ export function createCallPage(
       if (url.searchParams.get('v') !== String(LIVEKIT_PROTOCOL_VERSION)) {
         return reply(res, 426, PROTOCOL_REFUSAL, JSON_HEADERS);
       }
-      // A client may choose per call (`jev=1` / `jev=0`); otherwise the line's mode from /voice jev.
+      // A client may choose per call (`jev=1` / `jev=0`); otherwise jev, unless /voice plain opted the line out.
       // Without the Jev key every verdict fails silent, so the call is a plain one.
       const asked = url.searchParams.get('jev');
       const jev = asked === '1' ? true : asked === '0' ? false : lineRunsJev(platformId);
