@@ -32,7 +32,7 @@ export interface SpeakerState {
   name: string;
   speaking: boolean;
   lastUttId: string | null;
-  /** The utterance (`uttId` + text) the last boundary was decided on, so it is decided once. */
+  /** The utterance the last boundary was decided on (`handledKey`), so it is decided once. */
   handled: string | null;
 }
 
@@ -72,6 +72,8 @@ export interface CallState {
   agentLines: AgentLine[];
   /** Replies sent to `speak` that have not finished playing: replyId -> text and the wake. */
   playout: Record<string, { text: string; wakeKey: string | null }>;
+  /** Replies a stop took out of `playout` before the host heard them start: the worker still reports them. */
+  stoppedPlayout: Record<string, { text: string; wakeKey: string | null }>;
   /** The newest few wakes, oldest first. */
   wakes: Wake[];
   wakeCount: number;
@@ -96,6 +98,7 @@ export function initial(policy: CallPolicy, at: number): CallState {
     chat: [],
     agentLines: [],
     playout: {},
+    stoppedPlayout: {},
     wakes: [],
     wakeCount: 0,
     stoppedSeq: null,
@@ -109,6 +112,15 @@ export function initial(policy: CallPolicy, at: number): CallState {
 }
 
 export const hasWords = (text: string): boolean => /[\p{L}\p{N}]/u.test(text);
+
+export const normalize = (text: string): string => text.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
+export const unpunctuated = (text: string): string =>
+  text
+    .replace(/\p{P}+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+/** Text as compared for change: case, Unicode form, punctuation and spacing aside. */
+export const comparable = (text: string): string => unpunctuated(normalize(text));
 
 export function latestUtterance(state: CallState, speakerId: string): Utterance | undefined {
   const id = state.speakers[speakerId]?.lastUttId;
@@ -168,7 +180,7 @@ export function applyWindow(state: CallState, event: CallEvent): void {
       state.chat.push({ speakerId: event.speaker.id, text: event.text.trim(), at: event.at });
       break;
     case 'playback': {
-      const playing = state.playout[event.replyId];
+      const playing = state.playout[event.replyId] ?? state.stoppedPlayout[event.replyId];
       if (!playing) break;
       const line = state.agentLines.find((l) => l.replyId === event.replyId);
       if (event.state === 'started') {
@@ -178,6 +190,7 @@ export function applyWindow(state: CallState, event: CallEvent): void {
         break;
       }
       delete state.playout[event.replyId];
+      delete state.stoppedPlayout[event.replyId];
       if (event.state === 'failed') {
         state.agentLines = state.agentLines.filter((l) => l.replyId !== event.replyId);
         break;
@@ -292,14 +305,14 @@ export function toJevState(state: CallState): JevState {
 
 /**
  * What Jev would see, without the clock: equal fingerprints mean an unchanged window. A partial
- * turning final with the same words is no change, so the worker's final landing just after its
- * VAD end does not make the verdict on the partial stale.
+ * turning final with the same words (case and punctuation aside) is no change, so a final that only
+ * adds punctuation does not make the verdict on the partial stale.
  */
 function fingerprint(state: CallState): string {
   const jev = toJevState(state);
   return JSON.stringify({
     participants: jev.participants,
-    window: jev.window.map(({ t: _t, partial: _p, ...line }) => line),
+    window: jev.window.map(({ t: _t, partial: _p, ...line }) => ({ ...line, text: comparable(line.text) })),
     facts: { ...jev.facts, agent_last_spoke_s_ago: null },
   });
 }

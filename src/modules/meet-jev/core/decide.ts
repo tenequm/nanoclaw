@@ -7,33 +7,52 @@ import type { Action, CallEvent, Command, Verdict } from './types.js';
 import {
   agentSpeaking,
   applyWindow,
+  comparable,
   hasWords,
   latestUtterance,
   latestWake,
+  normalize,
   pendingAnswer,
   refreshVersion,
   renderWindow,
   toJevState,
+  unpunctuated,
   type CallState,
+  type Utterance,
 } from './window.js';
 
 const BOUNDARY_TIMER = 'boundary:';
+/** The worker reports its STT final up to ~3 s after the VAD end; a voice boundary waits that long for it. */
+const FINAL_MARGIN_MS = 3_000;
 const WAKES_KEPT = 8;
 const STOP_WORDS = new Set(['stop', 'please stop', 'stop please', 'стоп']);
 
 export function reduce(prev: CallState, event: CallEvent): CallState {
-  const state = structuredClone(prev);
-  state.commands = [];
+  const state = structuredClone<CallState>({ ...prev, commands: [] });
   applyWindow(state, event);
   const out = state.commands;
+  const voice = state.policy.kind === 'voice';
   switch (event.kind) {
     case 'utterance':
-      if (hasWords(event.text)) {
+      // A voice call decides on the final, which the worker sends after its VAD end; a meeting on a pause.
+      if (voice) {
+        if (event.final && !stillSpeaking(state, event.speaker.id)) boundary(state, event.speaker.id);
+      } else if (hasWords(event.text)) {
         out.push({ kind: 'wait', key: BOUNDARY_TIMER + event.speaker.id, ms: state.policy.boundaryFallbackMs });
       }
       break;
     case 'speech':
-      if (!event.on) boundary(state, event.speaker.id);
+      if (event.on) break;
+      if (voice && !latestUtterance(state, event.speaker.id)?.final) {
+        // The timer decides on the partial only when the final never comes.
+        out.push({
+          kind: 'wait',
+          key: BOUNDARY_TIMER + event.speaker.id,
+          ms: state.policy.boundaryFallbackMs + FINAL_MARGIN_MS,
+        });
+      } else {
+        boundary(state, event.speaker.id);
+      }
       break;
     case 'timer':
       if (event.key.startsWith(BOUNDARY_TIMER)) {
@@ -59,7 +78,7 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       onReply(state, event.replyId, event.turnId, event.text);
       break;
     case 'playback': {
-      const playing = prev.playout[event.replyId];
+      const playing = prev.playout[event.replyId] ?? prev.stoppedPlayout[event.replyId];
       if (playing && event.state !== 'started') logPlayback(state, event, playing.wakeKey);
       break;
     }
@@ -83,12 +102,19 @@ function log(state: CallState, event: string, fields: Record<string, unknown>): 
   state.commands.push({ kind: 'log', event, fields: { windowVersion: state.windowVersion, ...fields } });
 }
 
+/**
+ * What `SpeakerState.handled` compares: a voice utterance is decided once; a meeting's again when its
+ * words change, since Recall's boundary is a pause, not the end of the utterance.
+ */
+const handledKey = (state: CallState, utt: Utterance): string =>
+  state.policy.kind === 'voice' ? utt.uttId : `${utt.uttId}\n${comparable(utt.text)}`;
+
 /** A speaker finished an utterance: rules first, then Jev. Each utterance's words are decided once. */
 function boundary(state: CallState, speakerId: string): void {
   const speaker = state.speakers[speakerId];
   const utt = latestUtterance(state, speakerId);
   if (!speaker || !utt || !hasWords(utt.text)) return;
-  const key = `${utt.uttId}\n${utt.text}`;
+  const key = handledKey(state, utt);
   if (speaker.handled === key) return;
   speaker.handled = key;
 
@@ -140,7 +166,7 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
       hasWords(utt.text)
     ) {
       log(state, 'verdict_stale', { ...trigger, verdictVersion: version, action: 'rejudge' });
-      speaker.handled = `${utt.uttId}\n${utt.text}`;
+      speaker.handled = handledKey(state, utt);
       judge(state, judging.speakerId, utt.text, true);
     } else {
       log(state, 'verdict_stale', { ...trigger, verdictVersion: version, action: 'none' });
@@ -180,9 +206,11 @@ function chosen(state: CallState, verdict: Verdict): Action {
 
 function stop(state: CallState): void {
   state.stoppedSeq = state.seq;
-  // Lines not started yet will never play; the playing one reports its cut-off.
-  for (const replyId of Object.keys(state.playout)) {
-    if (!state.agentLines.some((l) => l.replyId === replyId && l.state === 'playing')) delete state.playout[replyId];
+  // Lines not started yet are no pending answer; the worker may have started one already, so its reports still count.
+  for (const [replyId, entry] of Object.entries(state.playout)) {
+    if (state.agentLines.some((l) => l.replyId === replyId && l.state === 'playing')) continue;
+    state.stoppedPlayout[replyId] = entry;
+    delete state.playout[replyId];
   }
   state.commands.push({ kind: 'stop_playback' });
 }
@@ -249,12 +277,6 @@ function logPlayback(state: CallState, event: Extract<CallEvent, { kind: 'playba
   });
 }
 
-const normalize = (text: string): string => text.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
-const unpunctuated = (text: string): string =>
-  text
-    .replace(/\p{P}+/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**

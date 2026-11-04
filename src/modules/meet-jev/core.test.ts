@@ -42,15 +42,17 @@ class Call {
     return out;
   }
 
-  /** A speaker says `text` as one utterance: speech on, a partial, the final, speech off. */
-  say(who: Speaker, uttId: string, text: string): Command[] {
-    const half = text.slice(0, Math.ceil(text.length / 2));
-    return this.feed(
-      { kind: 'speech', speaker: who, on: true },
-      { kind: 'utterance', speaker: who, uttId, text: half, final: false },
-      { kind: 'utterance', speaker: who, uttId, text, final: true },
-      { kind: 'speech', speaker: who, on: false },
-    );
+  /**
+   * A speaker says `text` as one utterance: speech on, a partial, the final, speech off. `worker`: in
+   * the worker's order instead, the final (`final`, or `text`) after speech off and `partial` before it.
+   */
+  say(who: Speaker, uttId: string, text: string, worker?: { partial?: string; final?: string }): Command[] {
+    const half = worker?.partial ?? text.slice(0, Math.ceil(text.length / 2));
+    const partial: Fed = { kind: 'utterance', speaker: who, uttId, text: half, final: false };
+    const final: Fed = { kind: 'utterance', speaker: who, uttId, text: worker?.final ?? text, final: true };
+    const on: Fed = { kind: 'speech', speaker: who, on: true };
+    const off: Fed = { kind: 'speech', speaker: who, on: false };
+    return this.feed(on, partial, ...(worker ? [off, final] : [final, off]));
   }
 
   verdict(windowVersion: number, action: Action | null, p = 0.9, confidence = 0.8): Command[] {
@@ -182,8 +184,8 @@ describe('the boundary', () => {
     expect(call.feed({ kind: 'timer', key: 'boundary:p1' })).toEqual([]);
   });
 
-  it('keeps the verdict on a partial when the final lands with the same words', () => {
-    const call = new Call();
+  it('in a meeting, keeps the verdict on a partial when the final differs only in case and punctuation', () => {
+    const call = new Call('meet');
     const [judge] = only(
       call.feed(
         { kind: 'speech', speaker: misha, on: true },
@@ -192,8 +194,56 @@ describe('the boundary', () => {
       ),
       'judge',
     );
-    call.feed({ kind: 'utterance', speaker: misha, uttId: 'u1', text: 'what is two plus two', final: true });
+    call.feed({ kind: 'utterance', speaker: misha, uttId: 'u1', text: 'What is two plus two?', final: true });
+    expect(call.feed({ kind: 'timer', key: 'boundary:p1' })).toEqual([]);
     expect(only(call.verdict(judge.windowVersion, 'answer'), 'turn')).toHaveLength(1);
+  });
+
+  it('on a voice call, waits past speech off for the final: a vocative in worker order is one turn', () => {
+    const call = new Call();
+    const commands = call.say(misha, 'u1', 'Dan, what is the weather', { final: 'Dan, what is the weather in Kyiv?' });
+    const turns = only(commands, 'turn');
+    expect(turns).toHaveLength(1);
+    expect(turns[0].message).toBe('Dan, what is the weather in Kyiv?');
+    expect(only(commands, 'judge')).toEqual([]);
+    call.feed({ kind: 'turn', key: turns[0].key, turnId: 't1' });
+    expect(call.feed({ kind: 'timer', key: 'boundary:p1' })).toEqual([]);
+  });
+
+  it('on a voice call, a final in worker order that differs only in punctuation is one judge and one turn', () => {
+    const call = new Call();
+    const commands = call.say(misha, 'u1', 'what is the weather', {
+      partial: 'what is the weather',
+      final: 'What is the weather?',
+    });
+    const judges = only(commands, 'judge');
+    expect(judges).toHaveLength(1);
+    expect(judges[0].state.window).toEqual([{ t: 0.2, speaker: 'Misha', text: 'What is the weather?' }]);
+    expect(call.feed({ kind: 'timer', key: 'boundary:p1' })).toEqual([]);
+    const [turn] = only(call.verdict(judges[0].windowVersion, 'answer'), 'turn');
+    expect(turn.message).toBe('What is the weather?');
+    expect(call.logs.filter((l) => l.event === 'decision')).toHaveLength(1);
+  });
+
+  it('on a voice call whose final never comes, decides on the partial once the fallback runs out', () => {
+    const call = new Call();
+    const waits = only(
+      call.feed(
+        { kind: 'speech', speaker: misha, on: true },
+        { kind: 'utterance', speaker: misha, uttId: 'u1', text: 'what is the weather', final: false },
+        { kind: 'speech', speaker: misha, on: false },
+      ),
+      'wait',
+    );
+    expect(waits).toEqual([{ kind: 'wait', key: 'boundary:p1', ms: 3_700 }]);
+    const [judge] = only(call.feed({ kind: 'timer', key: 'boundary:p1' }), 'judge');
+    expect(judge.state.window).toEqual([expect.objectContaining({ text: 'what is the weather', partial: true })]);
+    // A final after all is no second decision: it makes the verdict stale, which re-judges once.
+    expect(
+      call.feed({ kind: 'utterance', speaker: misha, uttId: 'u1', text: 'what is the weather in Kyiv', final: true }),
+    ).toEqual([]);
+    const [rejudge] = only(call.verdict(judge.windowVersion, 'answer'), 'judge');
+    expect(rejudge.state.window.at(-1)).toMatchObject({ text: 'what is the weather in Kyiv' });
   });
 });
 
@@ -225,6 +275,22 @@ describe('"Dan, stop"', () => {
       delivered: 'First, the weather.',
       spoke_since_trigger: ['Misha'],
     });
+  });
+
+  it('a line the worker started before the stop reached it is still cut off into the window', () => {
+    const call = new Call();
+    const [turn] = only(call.say(misha, 'u1', 'Dan, read me the news.'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'First, the weather. Then sport.' });
+    expect(only(call.say(misha, 'u2', 'Dan, stop.'), 'stop_playback')).toHaveLength(1);
+    expect(toJevState(call.state).facts).toMatchObject({ agent_speaking: false, pending_answer: false });
+    call.feed({ kind: 'playback', replyId: 'r1', state: 'started' });
+    expect(toJevState(call.state).facts).toMatchObject({ agent_speaking: true, pending_answer: false });
+    call.feed({ kind: 'playback', replyId: 'r1', state: 'cut_off', delivered: 'First,' });
+    const jev = toJevState(call.state);
+    expect(jev.window.find((l) => l.agent)).toMatchObject({ text: 'First,', cut_off: true });
+    expect(jev.facts).toMatchObject({ agent_speaking: false, cut_off_after: 'First,' });
+    expect(call.lastLog('playback')).toMatchObject({ replyId: 'r1', outcome: 'cut_off' });
   });
 
   it('"Dan, stop" with nothing to stop does nothing', () => {
