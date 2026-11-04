@@ -248,12 +248,17 @@ Show the output and wait for approval. Installation-specific files (group files,
 
 Run commands directly — don't tell the user to run them.
 
+Before committing, run `pnpm check` (`.nanoclaw-migrations/check.sh`): it is much faster than a full `vitest run` (seconds on a small change) and runs the same checks CI does for what changed. Use `pnpm check full` before a merge or a release.
+
 ```bash
 # Host (Node + pnpm)
 pnpm run dev          # Host via tsx (no watch)
 pnpm run build        # Compile host TypeScript (src/)
 ./container/build.sh  # Rebuild agent container image (nanoclaw-agent:latest)
-pnpm test             # Host tests (vitest)
+pnpm check            # The gate to prefer: cached typecheck/lint/format + only the tests your change affects (host and agent-runner), in parallel
+pnpm check --base main   # the same, "changed" = changed since main (a branch's whole diff)
+pnpm check full       # every CI check and the full vitest and bun suites
+pnpm test             # Host tests (vitest), the whole suite serially; slower than `pnpm check`
 
 # Agent-runner (Bun — separate package tree under container/agent-runner/)
 cd container/agent-runner && bun install   # After editing agent-runner deps
