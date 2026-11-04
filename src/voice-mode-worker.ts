@@ -1610,6 +1610,12 @@ export class TurnTaking {
       // so none overtakes it.
       return new Promise<void>((resolve) => (this.unconfirmed = { turnKey, resolve }));
     }
+    this.tookTurn();
+  }
+
+  /** The host took a turn (one sent in order, or a meeting candidate it let through): the agent works on it. */
+  tookTurn(): void {
+    if (this.closed) return;
     this.awaitingReply = true;
     this.thinkingUntil = Math.max(this.thinkingUntil, this.now() + AWAIT_REPLY_MS);
     this.refresh();
@@ -2354,6 +2360,11 @@ export interface CallTurnsDeps {
   unheard(): void;
   /** A turn that came to nothing for the agent: discarded, unaddressed, or a command alone. */
   ended?(facts: TurnFacts, outcome: TurnOutcome, reason: string): void;
+  /**
+   * `/meet ... jev`: words no wake phrase addressed go to the host as a candidate instead of ending
+   * unaddressed. Unset: they end unaddressed (`no_wake`).
+   */
+  candidate?(text: string, facts: TurnFacts): void;
   log: Pick<Console, 'info' | 'warn'>;
 }
 
@@ -3213,7 +3224,8 @@ export class CallTurns {
       if (why === 'unaddressed') {
         if (said) this.deps.drop('unaddressed', said);
         this.deps.noTurn();
-        ended('unaddressed', 'no_wake');
+        if (said && this.deps.candidate) this.deps.candidate(said, facts);
+        else ended('unaddressed', 'no_wake');
       }
       if (why === 'dropped') ended('discarded', 'dropped');
       return null;
@@ -5008,6 +5020,38 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       });
       saveTurn(turn, take, text, { host });
     };
+  /**
+   * `/meet ... jev`: words no wake phrase addressed go to the host as a candidate, outside the order turns
+   * go out in, so an addressed turn never waits on it. The host answers 202 only when it let the
+   * candidate through to the agent as a turn: then, and only then, it gets the sent cue and the typing.
+   */
+  const postCandidate = async (text: string, facts: TurnFacts): Promise<void> => {
+    const turnKey = randomUUID();
+    const postAt = Date.now();
+    let res: Response;
+    try {
+      // The name the meeting wakes on, which the host's judge must take an invitation to, not the agent's own.
+      res = await host.post('utterance', { text, turnKey, candidate: true, wakeName: wakeOfMeeting?.name });
+    } catch (err) {
+      callLog.warn('voice-mode worker: could not hand a candidate to the host', { err });
+      if (!ending) telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_lost' });
+      return;
+    }
+    if (res.status !== 202) {
+      void res.body?.cancel().catch(() => {});
+      if (!ending)
+        telemetry.turn({ facts, outcome: 'unaddressed', reason: 'candidate_dropped', hostStatus: res.status });
+      return;
+    }
+    const accepted = (await res.json().catch(() => null)) as { id?: unknown } | null;
+    if (ending) return;
+    const turn = ++turns;
+    lastPosted = Math.max(lastPosted, turn);
+    cue('sent');
+    turnTaking.tookTurn();
+    const id = typeof accepted?.id === 'string' ? accepted.id : undefined;
+    sent(turn, text, { facts })({ accepted: true, status: 202, turnKey, id }, postAt);
+  };
   const transcriber = deps.transcriber({
     apiKey: geminiKey,
     model: meta.sttModel,
@@ -5029,6 +5073,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       ended: (facts, outcome, reason) => {
         if (!ending) telemetry.turn({ facts, outcome, reason });
       },
+      ...(meta.meeting?.jev ? { candidate: (text: string, facts: TurnFacts) => void postCandidate(text, facts) } : {}),
       drop: (dropped, text, lone) => {
         if (ending) return;
         callVoice?.publishDropped(
@@ -5063,6 +5108,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     callLog.info('voice-mode worker: a meeting', {
       wakePhrase: wakeOfMeeting.phrase,
       pauseSends: meta.meeting.pauseSends,
+      jev: meta.meeting.jev,
     });
   }
   if (recordCall) {

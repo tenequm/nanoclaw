@@ -76,6 +76,7 @@ import {
   type RecallMeetBridge,
 } from './meet-recall.js';
 import { readEnvFile } from '../env.js';
+import type { askJev } from '../modules/jev-gate/jev.js';
 import { encryptionKey } from '../secret-seal.js';
 import { log } from '../log.js';
 import { registerResidentSkillGate } from '../project-doc-compose.js';
@@ -291,6 +292,8 @@ export interface VoiceModeConfig {
   meetBridge?: RecallMeetBridge;
   /** MEETING_JOIN_TIMEOUT_MS; a test seam. */
   meetingJoinTimeoutMs?: number;
+  /** The Jev client a `/meet ... jev` call judges candidates with; a test seam. */
+  judgeJev?: typeof askJev;
   /** How a call finds and starts the agent session it talks to (findCallSession, requestWake). Test seams. */
   prewarm?: {
     findSession?: (route: Omit<InboundEvent, 'message'>, agentGroupId: string) => Promise<Session | undefined>;
@@ -460,7 +463,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
   });
   const pageCall = pageCallKind(maxCallDurationMs);
   const meetingsOnCore = config.meetBridge
-    ? createMeetings(livekit, config.meetBridge, { joinTimeoutMs: config.meetingJoinTimeoutMs })
+    ? createMeetings(livekit, config.meetBridge, {
+        joinTimeoutMs: config.meetingJoinTimeoutMs,
+        judgeJev: config.judgeJev,
+        now,
+      })
     : null;
   const meetings: Meetings | null = meetingsOnCore && {
     start: (platformId, meetingUrl, options) =>

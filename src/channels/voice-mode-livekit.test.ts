@@ -1937,6 +1937,8 @@ describe('meetings: the /meet call kind on the call core', () => {
   let h: Harness;
   let chat: ReturnType<typeof fakeMirror>;
   let bots: { joined: Array<Parameters<RecallMeetBridge['join']>[0]>; left: string[]; fail: boolean };
+  /** Jev's answers: whether it wakes the agent, and every state and name it was asked about. */
+  let jev: { wake: boolean; asked: Array<{ state: string; name: string }> };
 
   beforeEach(async () => {
     bots = { joined: [], left: [], fail: false };
@@ -1951,15 +1953,38 @@ describe('meetings: the /meet call kind on the call core', () => {
     chat = fakeMirror([{ platform_id: 'telegram:100' }], {
       bound: { group: { id: 'mg-0', platform_id: 'telegram:100' }, threadId: null },
     });
-    h = await startHarness({ accessCheckIntervalMs: 50, meetBridge }, { mirrorApi: chat.api });
+    jev = { wake: false, asked: [] };
+    const judgeJev = async (state: string, name: string) => {
+      jev.asked.push({ state, name });
+      const high = jev.wake ? 0.9 : 0;
+      return {
+        ok: true as const,
+        scores: { direct_invitation: high, unresolved: high, already_answered: 0, human_pingpong: 0 },
+      };
+    };
+    h = await startHarness({ accessCheckIntervalMs: 50, meetBridge, judgeJev }, { mirrorApi: chat.api });
   });
   afterEach(async () => {
     await h.stop();
   });
 
+  /** The agent's message reached the call chat. */
+  const delivered = (platformId: string, text: string) =>
+    liveKitChatDelivered(
+      {
+        id: `out-${text.length}`,
+        kind: 'chat',
+        content: JSON.stringify({ text }),
+        channelType: 'telegram',
+        platformId,
+        threadId: null,
+      },
+      'ag-andy',
+    );
+
   /** Starts a meeting on the line and attaches its worker, the bridge page in the room. */
-  async function startMeeting(): Promise<FakeWorker> {
-    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false })).toEqual({ ok: true });
+  async function startMeeting(jevOn = false): Promise<FakeWorker> {
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: jevOn })).toEqual({ ok: true });
     const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
     expect((await worker.post('joined')).status).toBe(200);
     return worker;
@@ -1975,13 +2000,13 @@ describe('meetings: the /meet call kind on the call core', () => {
   });
 
   it("opens a meet room whose caller is the bridge page, with the meeting's caps, and sends the bot there", async () => {
-    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false })).toEqual({ ok: true });
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false })).toEqual({ ok: true });
     const [room] = h.lk.rooms;
     expect(room).toMatch(/^meet-0123456789ab-[0-9a-f]{12}$/);
     expect(h.lk.roomOptions).toEqual([{ name: room, emptyTimeout: 600, departureTimeout: 10, maxParticipants: 3 }]);
     expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({
       callerIdentity: `meet-bridge-${room}`,
-      meeting: { pauseSends: false },
+      meeting: { pauseSends: false, jev: false },
       joinTimeoutMs: 10 * MIN,
       maxDurationMs: MEETING_MAX_DURATION_MS,
     });
@@ -1989,8 +2014,8 @@ describe('meetings: the /meet call kind on the call core', () => {
   });
 
   it('tells the worker a `pause` meeting sends on the pause', async () => {
-    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: true })).toEqual({ ok: true });
-    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: true });
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: true, jev: false })).toEqual({ ok: true });
+    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: true, jev: false });
   });
 
   it('routes meeting turns as guest turns with the meeting note, and says in the chat when it joined', async () => {
@@ -2019,7 +2044,10 @@ describe('meetings: the /meet call kind on the call core', () => {
 
   it('ends the call when the bot cannot be created', async () => {
     bots.fail = true;
-    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false })).toEqual({ ok: false, error: 'bot' });
+    expect(await h.adapter.meetings!.start(LINE, MEET, { pauseSends: false, jev: false })).toEqual({
+      ok: false,
+      error: 'bot',
+    });
     await vi.waitFor(() => expect(h.lk.deleted).toEqual(h.lk.rooms));
     expect(h.adapter.meetings!.leave(LINE)).toBe(false);
   });
@@ -2029,5 +2057,49 @@ describe('meetings: the /meet call kind on the call core', () => {
     await startCall(h);
     await vi.waitFor(() => expect(bots.left).toEqual(['bot-1']));
     expect(h.adapter.meetings!.leave(LINE)).toBe(false);
+  });
+
+  it('a jev meeting lets a candidate through only when Jev wakes the agent, judged against the meeting so far', async () => {
+    const worker = await startMeeting(true);
+    expect(h.lk.dispatches.at(-1)!.metadata.meeting).toEqual({ pauseSends: false, jev: true });
+    const candidate = (text: string) => worker.post('utterance', { text, candidate: true, wakeName: 'Dan\u202e' });
+
+    const kept = await candidate('Does anyone know when the release ships?');
+    expect(kept.status).toBe(200);
+    expect(await kept.text()).toBe('Not a turn: the call kept the agent out of it');
+    expect(h.events).toHaveLength(0);
+    // An addressed turn is never judged, and is part of what the next candidate is judged against.
+    await worker.utter('what is two plus two');
+    expect(jev.asked).toHaveLength(1);
+    delivered('telegram:100', 'Four.');
+
+    jev.wake = true;
+    const taken = await candidate('Dan, can you check the release date?');
+    expect(taken.status).toBe(202);
+    expect(h.events).toHaveLength(2);
+    expect(h.inbound.at(-1)!.content).toMatchObject({ sender: 'Meeting' });
+    const { state, name } = jev.asked.at(-1)!;
+    expect(name).toBe('Dan');
+    for (const line of ['Does anyone know when the release ships?', 'what is two plus two', 'Four.']) {
+      expect(state).toContain(line);
+    }
+    expect(state).toContain('Dan, can you check the release date?');
+  });
+
+  it('counts candidates toward the per-minute limit', async () => {
+    const worker = await startMeeting(true);
+    for (let i = 0; i < 20; i++) {
+      expect((await worker.post('utterance', { text: `chatter ${i}`, candidate: true })).status).toBe(200);
+    }
+    expect((await worker.post('utterance', { text: 'Hey Dan, one more' })).status).toBe(429);
+    expect(h.events).toHaveLength(0);
+  });
+
+  it('takes no candidates on a call without a judge', async () => {
+    const { worker } = await startCall(h);
+    const res = await worker.post('utterance', { text: 'just chatting', candidate: true });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('Not a turn: this call takes no candidates');
+    expect(h.events).toHaveLength(0);
   });
 });

@@ -283,6 +283,15 @@ export interface CallKind {
   joined?(call: KindCall, say: (text: string) => void): void;
   /** The call ended; `say` posts to its chat, null when it never went live there. Teardown awaits what it returns. */
   ended?(call: KindCall, reason: string, say: ((text: string) => void) | null): Promise<void> | void;
+  /**
+   * Candidates: speech the worker sent unaddressed, which a kind without this takes no turn from. `judge`
+   * says whether one goes to the agent as a turn (it never rejects); `heard` sees every utterance and
+   * every reply spoken on the call, in order, for the context it judges against.
+   */
+  candidates?: {
+    judge(call: KindCall, text: string, wakeName: string): Promise<boolean>;
+    heard(call: KindCall, direction: 'in' | 'out', text: string): void;
+  };
 }
 
 /** Why `openCall` opened no call. */
@@ -992,6 +1001,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       typeof body.turnKey === 'string' && body.turnKey.length <= MAX_TURN_KEY_LENGTH ? body.turnKey : undefined;
     const known = turnKey && call.turnOutcomes.get(turnKey);
     if (known) return answer(res, await known);
+    const candidates = call.kind.candidates;
+    const candidate = body.candidate === true;
+    if (candidate && !candidates) return reply(res, 200, 'Not a turn: this call takes no candidates');
     if (call.turnsInFlight >= MAX_TURNS_IN_FLIGHT) return reply(res, 429, 'Too many turns are still being routed');
     const t = host.now();
     call.utteranceStarts = call.utteranceStarts.filter((at) => at > t - MINUTE_MS);
@@ -1000,8 +1012,19 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         'Retry-After': String(Math.max(1, Math.ceil((call.utteranceStarts[0] + MINUTE_MS - t) / 1000))),
       });
     }
+    // A candidate counts toward both limits: judging it holds a turn's slot.
     call.utteranceStarts.push(t);
     call.turnsInFlight++;
+    if (candidates) {
+      const wakeName = typeof body.wakeName === 'string' ? body.wakeName : '';
+      const wakes = !candidate || (await candidates.judge(call, text, wakeName).catch(() => false));
+      candidates.heard(call, 'in', text);
+      if (!wakes) {
+        call.turnsInFlight--;
+        return reply(res, 200, 'Not a turn: the call kept the agent out of it');
+      }
+    }
+    // The route timeout counts from `t`, judging included: the worker's request timeout does.
     const outcome = takeTurn(call, text, t, turnKey);
     if (turnKey) {
       call.turnOutcomes.set(turnKey, outcome);
@@ -1166,6 +1189,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         if (!at) continue;
         if (at === 'previous' && call.previousChat) call.previousChat.active = true;
         push(call, { type: 'reply', text, turn: replyTo ? replyTo.utteranceId : null });
+        call.kind.candidates?.heard(call, 'out', text);
       }
     },
 

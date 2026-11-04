@@ -73,6 +73,17 @@ describe('parseMeetCommand', () => {
     expect(parseMeetCommand(`/meet ${MEET} pause please`, 'telegram')).toEqual({ action: 'usage' });
   });
 
+  it('takes jev in any order with the link and pause, once', () => {
+    const jev = { action: 'join', url: MEET, jev: true };
+    expect(parseMeetCommand(`/meet ${MEET} jev`, 'telegram')).toEqual(jev);
+    expect(parseMeetCommand(`/meet JEV ${MEET}`, 'telegram')).toEqual(jev);
+    expect(parseMeetCommand(`!meet <${MEET}> jev`, 'slack')).toEqual(jev);
+    expect(parseMeetCommand(`/meet ${MEET} jev pause`, 'telegram')).toEqual({ ...jev, pauseSends: true });
+    expect(parseMeetCommand(`/meet pause jev ${MEET}`, 'telegram')).toEqual({ ...jev, pauseSends: true });
+    expect(parseMeetCommand(`/meet ${MEET} jev jev`, 'telegram')).toEqual({ action: 'usage' });
+    expect(parseMeetCommand('/meet jev', 'telegram')).toEqual({ action: 'usage' });
+  });
+
   it('accepts only https Google Meet links', () => {
     expect(meetingUrl(MEET)).toBe(MEET);
     expect(meetingUrl('http://meet.google.com/abc')).toBeNull();
@@ -124,12 +135,12 @@ describe('runMeetCommand', () => {
   const mg = (id: string) => ({ id, instance: null, channel_type: 'chat', is_group: 0 }) as unknown as MessagingGroup;
 
   function fakeMeetings(start: MeetingStart = { ok: true }) {
-    const started: Array<{ platformId: string; url: string; pauseSends: boolean }> = [];
+    const started: Array<{ platformId: string; url: string; pauseSends: boolean; jev: boolean }> = [];
     const left: string[] = [];
     const control: MeetingControl = {
       meetings: {
-        start: async (platformId, url, { pauseSends }) => {
-          started.push({ platformId, url, pauseSends });
+        start: async (platformId, url, { pauseSends, jev }) => {
+          started.push({ platformId, url, pauseSends, jev });
           return start;
         },
         leave: (platformId) => {
@@ -189,7 +200,9 @@ describe('runMeetCommand', () => {
     expect(outcome).toEqual({ kind: 'started', agentName: 'Andy', url: MEET });
     const line = await getVoiceModeLineForAgent('ag-1');
     expect(line).toMatchObject({ owner_user_id: OWNER, messaging_group_id: 'mg-dm' });
-    expect(m.started).toEqual([{ platformId: linePlatformId(line!.line_id), url: MEET, pauseSends: false }]);
+    expect(m.started).toEqual([
+      { platformId: linePlatformId(line!.line_id), url: MEET, pauseSends: false, jev: false },
+    ]);
     expect(meetCommandReply(outcome)).toContain('Andy is asking to join https://meet.google.com/abc-defg-hij');
     expect(meetCommandReply(outcome)).toContain('a turn ends on a send word.');
     expect(meetCommandReply({ kind: 'usage' }, '!meet')).toContain('!meet <Google Meet link>');
@@ -205,6 +218,13 @@ describe('runMeetCommand', () => {
     expect(paused).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, pauseSends: true });
     expect(m.started.at(-1)?.pauseSends).toBe(true);
     expect(meetCommandReply(paused)).toContain('a turn ends on a send word or a pause.');
+    expect(meetCommandReply(paused)).not.toContain('unaddressed');
+
+    const withJev = await runMeetCommand(mg('mg-dm'), null, OWNER, { ...join, jev: true }, { meetings: m.control });
+    expect(withJev).toEqual({ kind: 'started', agentName: 'Andy', url: MEET, jev: true });
+    expect(m.started.at(-1)).toMatchObject({ pauseSends: false, jev: true });
+    expect(meetCommandReply(withJev)).toContain('It may also join in unaddressed when the conversation invites it.');
+    expect(meetCommandReply({ kind: 'usage' })).toContain('/meet <link> jev');
   });
 
   it('needs the host key only to make a first line', async () => {

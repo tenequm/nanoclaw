@@ -6417,7 +6417,7 @@ describe('meeting calls', () => {
   const MEETING_META: LiveKitJobMetadata = {
     ...META,
     callerIdentity: 'meet-bridge-meet-r1',
-    meeting: { pauseSends: false },
+    meeting: { pauseSends: false, jev: false },
   };
   const WAKE_ENV = { ...ENV, VOICE_MODE_WAKE_MODEL: '/models/hey_dan.onnx', VOICE_MODE_WAKE_PHRASE: 'Hey Dan' };
   const utterances = (host: ReturnType<typeof fakeHostFetch>) =>
@@ -6497,7 +6497,7 @@ describe('meeting calls', () => {
   });
 
   it('a `pause` meeting sends the woken turn on the pause', async () => {
-    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: true } });
+    const { ctx, job, room } = fakeJob({ ...MEETING_META, meeting: { pauseSends: true, jev: false } });
     room.remoteParticipants.clear();
     room.remoteParticipants.set('meet-bridge-meet-r1', {});
     const host = fakeHostFetch();
@@ -6509,5 +6509,51 @@ describe('meeting calls', () => {
     await vi.waitFor(() => expect(utterances(host)).toEqual(['what is two plus two?']));
     host.emit({ type: 'end', reason: 'test over' });
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+  });
+
+  it('`jev`: unaddressed talk goes to the host as a candidate on the pause, cued only once the host takes it', async () => {
+    for (const [jev, status] of [
+      [false, 202],
+      [true, 200],
+      [true, 202],
+    ] as const) {
+      const { ctx, job, room } = fakeJob({ ...MEETING_META, agentName: 'Junior', meeting: { pauseSends: false, jev } });
+      room.remoteParticipants.clear();
+      room.remoteParticipants.set('meet-bridge-meet-r1', {});
+      const host = fakeHostFetch(200, status);
+      const v = fakeVoice();
+      v.voice.review.serve = vi.fn();
+      await runCall(ctx, callDeps(host.fetchImpl, v, { env: WAKE_ENV, wakeWord: vi.fn() }));
+      const posts = () => host.calls.filter((c) => c.url.endsWith('/utterance')).map((c) => c.body);
+      const sentCues = () => v.voice.playCue.mock.calls.filter(([kind]) => kind === 'sent').length;
+
+      const chatter = 'Does anyone know when the release ships?';
+      await say(v, chatter, chatter);
+      if (!jev) {
+        await new Promise((r) => setTimeout(r, 50));
+        expect(posts()).toEqual([]);
+      } else {
+        // The agent is Junior; the meeting wakes on Hey Dan, so the host's judge hears of Dan.
+        await vi.waitFor(() =>
+          expect(posts()).toEqual([expect.objectContaining({ text: chatter, candidate: true, wakeName: 'Dan' })]),
+        );
+        await flush();
+        if (status === 202) {
+          await vi.waitFor(() => expect(sentCues()).toBe(1));
+          await vi.waitFor(() => expect(v.voice.setThinking).toHaveBeenCalledWith(true));
+        } else {
+          await new Promise((r) => setTimeout(r, 50));
+          expect(sentCues()).toBe(0);
+          expect(v.voice.setThinking).not.toHaveBeenCalledWith(true);
+        }
+      }
+      // A Hey Dan turn stays the instant path: a plain turn, never a candidate.
+      const addressed = 'Hey Dan, what is two plus two? Copy.';
+      await say(v, addressed, addressed);
+      await vi.waitFor(() => expect(posts().at(-1)).toMatchObject({ text: 'what is two plus two?' }));
+      expect(posts().at(-1)).not.toHaveProperty('candidate');
+      host.emit({ type: 'end', reason: 'test over' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+    }
   });
 });

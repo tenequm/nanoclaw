@@ -107,6 +107,8 @@ export interface LiveKitJobMetadata {
 export interface MeetingJob {
   /** A pause ends a turn too, not only the send word. */
   pauseSends: boolean;
+  /** `/meet ... jev`: words no wake phrase addressed go to the host as candidates its judge may let through. */
+  jev: boolean;
 }
 
 /**
