@@ -95,7 +95,7 @@ describe('askAction', () => {
     }
     expect(body.questions.action.type).toBe('choice');
     expect(Object.keys(body.questions.action.criteria).sort()).toEqual(['answer', 'continue', 'stay_silent', 'stop']);
-    expect(body.questions.action.instructions).toContain('Dan');
+    expect(JSON.stringify(body.questions.action.instructions)).toContain('Dan');
   });
 
   it('logs the exact state and response metadata with call and window identity', async () => {

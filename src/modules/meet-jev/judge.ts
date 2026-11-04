@@ -19,23 +19,47 @@ import {
 function actionQuestion(agent: string) {
   return {
     type: 'choice',
-    instructions: `A live call. \`latest\` is the utterance just finished, the one to decide on; \`window\` is the conversation up to and including it, oldest first, for context (\`t\` = seconds ago; \`agent\` lines are what ${agent} said; \`cut_off\` marks where ${agent} was interrupted; \`partial\` lines are still being spoken). \`policy\` says when ${agent} speaks and \`facts\` what ${agent} is doing now; \`facts.addressed_by_name\` says \`latest\` calls ${agent} by name, which makes it addressed to ${agent} but not necessarily a request to answer now. What should ${agent} do about \`latest\`?`,
+    instructions: {
+      question: `A live call: what should ${agent} do about \`latest\`?`,
+      state_guide: `\`latest\` is the utterance just finished, the one to decide on. \`window\` is the conversation up to and including it, oldest first (\`t\` = seconds ago; \`agent\` lines are what ${agent} said; \`cut_off\` marks where ${agent} was interrupted; \`partial\` lines are still being spoken). \`policy\` says when ${agent} speaks; \`facts\` is computed from the call by code (\`facts.addressed_by_name\` means \`latest\` calls ${agent} by name - addressed, not necessarily a request to answer now; \`facts.latest_is_question\` and \`facts.latest_to_you\` come from the words of \`latest\`). People speak Ukrainian and English, often mixed.`,
+    },
     criteria: {
       answer: {
-        what: `The latest utterance is for ${agent} and needs a reply now: a question or request to ${agent} by name (facts.addressed_by_name), or, as the policy allows, a question or request that nobody else is taking up; and the speaker has finished the thought. facts.latest_is_question and facts.latest_to_you are computed from the words of latest; people speak Ukrainian and English, often mixed.`,
+        what: `\`latest\` is for ${agent} and needs a reply now, and the speaker has finished the thought.`,
+        for_agent_when: [
+          `${agent} is called by name (facts.addressed_by_name)`,
+          `it continues an exchange with ${agent} (facts.in_exchange_with is the speaker)`,
+          `one human is in the room (facts.humans_in_room is 1) and it is a question or request`,
+          `an open question or request to the room that nobody else is taking up`,
+        ],
         not_for: `A remark to another person, a thought still being finished (also after ${agent}'s name, "${agent}, I was wondering..."), small talk, or something already answered; ${agent} merely mentioned in the third person; ${agent} told by name not to answer or to wait ("${agent}, don't answer that", "${agent}, wait for Anna").`,
+        examples: [
+          `"${agent}, what time is it?" - answer`,
+          `"Чому ти мені не відповідаєш?" with one human in the room - answer`,
+          `"А скільки там людей живе?" right after ${agent} answered that speaker about a city - answer`,
+          `"Does anyone remember what year it was finished?" and nobody takes it up - answer`,
+        ],
       },
       stay_silent: {
-        what: `${agent} should not speak: the utterance is addressed to a person, is small talk or a reaction, is unfinished, was already answered, people are talking among themselves, or ${agent} is told by name to hold back ("${agent}, don't answer that", "${agent}, wait for Anna", an unfinished "${agent}, I was wondering").`,
+        what: `${agent} should not speak: the utterance is addressed to a person, is small talk or a reaction, is unfinished, was already answered, or people are talking among themselves.`,
+        also_when: `${agent} is told by name to hold back ("${agent}, don't answer that", "${agent}, wait for Anna", an unfinished "${agent}, I was wondering").`,
         not_for: `A finished question or request to ${agent}, or an instruction about what ${agent} is saying or about to say.`,
+        examples: [
+          `"Bob, did the deploy finish on your side?" - stay_silent`,
+          `"Ден, зачекай, хай Анна скаже" - stay_silent`,
+          `"I asked ${agent} about it yesterday" - third person, stay_silent`,
+          `"${agent}, I was wondering" then a pause - unfinished, stay_silent`,
+        ],
       },
       stop: {
         what: `Someone tells ${agent} to stop or be quiet, or says the answer ${agent} is giving or preparing is no longer needed.`,
         not_for: `Anything said while ${agent} is neither speaking nor preparing an answer (facts.agent_speaking and facts.pending_answer both false); "stop" said to a person.`,
+        examples: [`"Окей, стоп, далі я сам" while ${agent} is speaking - stop`],
       },
       continue: {
         what: `Someone asks ${agent} to go on with what ${agent} was saying when cut off (facts.cut_off_after).`,
         not_for: `Any request when ${agent} was not cut off (facts.cut_off_after is null); a new question.`,
+        examples: [`"Go on" after ${agent} was cut off - continue`],
       },
     },
   };

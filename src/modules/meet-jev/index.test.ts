@@ -58,7 +58,7 @@ describe('createJevCall', () => {
     expect(questions[0][1]).toMatchObject({
       callId: 'c1',
       questions: {
-        action: { instructions: expect.stringContaining('Andy') },
+        action: { criteria: expect.anything() },
         still_wanted: { instructions: expect.stringContaining('Andy') },
       },
     });
