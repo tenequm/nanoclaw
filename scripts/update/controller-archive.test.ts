@@ -80,9 +80,16 @@ function extract(into: string, paths: string[]): void {
   }
 }
 
+/**
+ * No package resolves from `dir`: every `node_modules` above it is absent or holds only
+ * dot entries, which no bare specifier names (tools park caches like
+ * `$TMPDIR/node_modules/.cache` there).
+ */
 function assertNoNodeModulesAbove(dir: string): void {
   for (let current = dir; ; current = path.dirname(current)) {
-    expect(fs.existsSync(path.join(current, 'node_modules')), `${current}/node_modules`).toBe(false);
+    const modules = path.join(current, 'node_modules');
+    const packages = fs.existsSync(modules) ? fs.readdirSync(modules).filter((name) => !name.startsWith('.')) : [];
+    expect(packages, `${modules}`).toEqual([]);
     if (path.dirname(current) === current) return;
   }
 }
