@@ -89,6 +89,7 @@ import {
   CALL_UPDATING_ATTRIBUTE,
   CALL_VOICE_ATTRIBUTE,
   MAX_JEV_EVENTS_PER_POST,
+  MAX_JEV_POST_BYTES,
   MAX_TURN_TEXT_BYTES,
   REVIEW_RPC,
   WORKER_REQUEST_TIMEOUT_MS,
@@ -1236,9 +1237,9 @@ export interface CallVoice {
   say(text: string, ready?: () => Promise<void>): Promise<boolean>;
   /**
    * `say` for the jev loop: `signal` aborts the line's playout (not a synthesis failure), and the
-   * outcome says how much of it played. Absent where the room cannot abort a line.
+   * outcome says how much of it played.
    */
-  speak?(text: string, ready: () => Promise<void>, signal: AbortSignal): Promise<LineOutcome>;
+  speak(text: string, ready: () => Promise<void>, signal: AbortSignal): Promise<LineOutcome>;
   /** The `nanoclaw.voice-mode.thinking` attribute. */
   setThinking(thinking: boolean): void;
   /** One message on the `nanoclaw.voice-mode.turn` topic. */
@@ -4111,10 +4112,10 @@ export class CallerInput {
 export interface SpeechSink {
   captureFrame(frame: AudioFrame): Promise<void>;
   waitForPlayout(): Promise<void>;
-  /** Drop the audio queued and not played yet (an aborted line); a sink without it only stops taking frames. */
-  clearQueue?(): void;
+  /** Drop the audio queued and not played yet (an aborted line). */
+  clearQueue(): void;
   /** Milliseconds of audio captured and not played yet. */
-  readonly queuedDuration?: number;
+  readonly queuedDuration: number;
 }
 
 /** How one line went, for a caller that may abort it (`speechOutput().speak`). */
@@ -4147,8 +4148,7 @@ export interface SpeechOutputOptions {
 }
 
 /** The call's speech: its lines into the speech sink, and the caller's pick of what speaks them. */
-export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
-  speak: NonNullable<CallVoice['speak']>;
+export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 'speak'> & {
   selectTts: NonNullable<CallVoice['selectTts']>;
   readonly speech: LineSpeech;
   close(): Promise<void>;
@@ -4170,9 +4170,14 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
   let closed = false;
   /**
    * One line into the speech sink: streamed as it is synthesized, resolved once it has played. `signal`
-   * aborts it: the frame loop stops, the sink's queue is cleared and no tail is flushed.
+   * aborts it: the frame loop stops, the sink's queue is cleared and no tail is flushed. `said` is `say`'s
+   * answer, read as the line ends: a close landing after it played does not unsay it.
    */
-  const speak = async (text: string, ready?: () => Promise<void>, signal?: AbortSignal): Promise<LineOutcome> => {
+  const playLine = async (
+    text: string,
+    ready?: () => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<{ outcome: LineOutcome; said: boolean }> => {
     let heard = false;
     let failed = false;
     let complete = false;
@@ -4189,11 +4194,8 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
       o.log.warn('voice-mode worker: speech is not at the track rate; resampling the line', { sampleRate }),
     );
     let filter: ((pcm: Int16Array) => Int16Array) | undefined;
-    // The line's own abort: the call's close and the caller's signal both end it.
-    const line = new AbortController();
-    const stop = () => line.abort();
-    abort.signal.addEventListener('abort', stop, { once: true });
-    signal?.addEventListener('abort', stop, { once: true });
+    // The call's close and the caller's signal both end the line, also when either already fired.
+    const lineSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
     const cut = () => !!signal?.aborted && !closed;
     const capture = async (synthesized: Int16Array) => {
       const frame = filter ? filter(synthesized) : synthesized;
@@ -4216,8 +4218,8 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
       rest = at < data.length ? data.slice(at) : undefined;
     };
     try {
-      for await (const audio of speech.speak(text, line.signal)) {
-        if (closed || line.signal.aborted) break;
+      for await (const audio of speech.speak(text, lineSignal)) {
+        if (closed || lineSignal.aborted) break;
         meter.audio();
         filter ??= lineFilter({
           deess: !!o.settings.deess,
@@ -4226,7 +4228,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
         const pcm = resample.push(audio);
         if (!heard) {
           await ready?.();
-          if (closed || line.signal.aborted) break;
+          if (closed || lineSignal.aborted) break;
           heard = true;
           meter.playing();
           o.started(text);
@@ -4235,9 +4237,9 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
       }
       if (cut()) {
         // What the sink still holds never plays; what it already played is the line's delivered part.
-        playedMs = Math.max(0, audioMs - (o.sink.queuedDuration ?? 0));
-        o.sink.clearQueue?.();
-        return { heard, failed, cut: true, audioMs, playedMs, complete };
+        playedMs = Math.max(0, audioMs - o.sink.queuedDuration);
+        o.sink.clearQueue();
+        return { outcome: { heard, failed, cut: true, audioMs, playedMs, complete }, said: false };
       }
       complete = !closed;
       if (heard && !closed) await play(resample.flush());
@@ -4249,7 +4251,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
       }
       if (heard) await o.sink.waitForPlayout();
       playedMs = audioMs;
-      return { heard, failed, cut: false, audioMs, playedMs, complete };
+      return { outcome: { heard, failed, cut: false, audioMs, playedMs, complete }, said: heard && !closed };
     } catch (err) {
       failed = true;
       o.log.warn('voice-mode worker: a line could not be synthesized', {
@@ -4257,10 +4259,8 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
       });
       if (heard) await o.sink.waitForPlayout().catch(() => undefined);
       playedMs = audioMs;
-      return { heard, failed, cut: cut(), audioMs, playedMs, complete };
+      return { outcome: { heard, failed, cut: cut(), audioMs, playedMs, complete }, said: false };
     } finally {
-      abort.signal.removeEventListener('abort', stop);
-      signal?.removeEventListener('abort', stop);
       resample.close();
       if (heard && !closed) o.stopped();
       const spoken = meter.done({ by: speech.spokenBy, primary, failed, cut: closed || cut() });
@@ -4275,11 +4275,10 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say'> & {
       }
     }
   };
-  /** `speak` as the turn-taking rules use it: whether the line was heard, all of it synthesized. */
-  const say = async (text: string, ready?: () => Promise<void>): Promise<boolean> => {
-    const outcome = await speak(text, ready);
-    return !outcome.failed && outcome.heard && !closed;
-  };
+  const speak = async (text: string, ready?: () => Promise<void>, signal?: AbortSignal): Promise<LineOutcome> =>
+    (await playLine(text, ready, signal)).outcome;
+  /** A line as the turn-taking rules use it: whether it was heard, all of it synthesized. */
+  const say = async (text: string, ready?: () => Promise<void>): Promise<boolean> => (await playLine(text, ready)).said;
   return {
     say,
     speak,
@@ -4697,8 +4696,10 @@ export class CallTelemetry {
  * interruption.
  */
 export const JEV_BARGE_MS = 300;
-/** Events kept for the host while it cannot be reached; past it the oldest go, with a log line. */
+/** Events kept for the host while it cannot be reached; past it the oldest partials go, with a log line. */
 const JEV_REPORT_BACKLOG = 4 * MAX_JEV_EVENTS_PER_POST;
+/** A POST body's bytes besides its events (`callId`, the keys), kept out of MAX_JEV_POST_BYTES. */
+const JEV_POST_ENVELOPE_BYTES = 1024;
 /** Speech at about this rate, to place a cut in a line whose audio was still being synthesized. */
 const JEV_SPEECH_CHARS_PER_SECOND = 14;
 
@@ -4716,30 +4717,49 @@ export function deliveredText(text: string, share: number): string {
   return out;
 }
 
+const isPartial = (e: JevWorkerEvent): e is Extract<JevWorkerEvent, { type: 'utterance' }> =>
+  e.type === 'utterance' && !e.final;
+
 /**
  * The worker's events to the host's `agent/jev`, in order: what piles up while one POST is in flight
- * goes in the next, MAX_JEV_EVENTS_PER_POST at a time. A host that cannot be reached, or refuses a
- * batch, loses that batch with a log line; audio never waits on it.
+ * goes in the next, MAX_JEV_EVENTS_PER_POST and MAX_JEV_POST_BYTES at a time. A queued partial is
+ * replaced by its utterance's next one. A host that cannot be reached, or refuses a batch, loses that
+ * batch with a log line; audio never waits on it. A backlog sheds partials only: speech marks, finals
+ * and playback are what the host decides on.
  */
 export class JevReporter {
   private readonly queue: JevWorkerEvent[] = [];
   private inFlight?: Promise<void>;
-  private dropped = 0;
+  private shed = 0;
+  private overBacklog = 0;
 
   constructor(
     private readonly post: (events: JevWorkerEvent[]) => Promise<Response>,
     private readonly log: Pick<Console, 'warn'>,
     private readonly perPost = MAX_JEV_EVENTS_PER_POST,
     private readonly backlog = JEV_REPORT_BACKLOG,
+    private readonly maxBytes = MAX_JEV_POST_BYTES,
   ) {}
 
   report(event: JevWorkerEvent): void {
-    if (this.queue.length >= this.backlog) {
-      this.queue.shift();
-      if (this.dropped++ === 0)
-        this.log.warn('voice-mode worker: the host is behind on jev events; dropping the oldest');
+    if (isPartial(event)) {
+      // The newer partial goes at the end, so the queue stays in the order things were heard.
+      const stale = this.queue.findIndex((e) => isPartial(e) && e.uttId === event.uttId);
+      if (stale >= 0) this.queue.splice(stale, 1);
     }
     this.queue.push(event);
+    if (this.queue.length > this.backlog) {
+      const oldest = this.queue.findIndex(isPartial);
+      if (oldest >= 0) {
+        this.queue.splice(oldest, 1);
+        if (this.shed++ === 0)
+          this.log.warn('voice-mode worker: the host is behind on jev events; dropping the oldest partials');
+      } else if (this.overBacklog++ === 0) {
+        this.log.warn('voice-mode worker: the host is behind on jev events; keeping them all, none is a partial', {
+          queued: this.queue.length,
+        });
+      }
+    }
     this.inFlight ??= this.flush().finally(() => (this.inFlight = undefined));
   }
 
@@ -4748,9 +4768,31 @@ export class JevReporter {
     while (this.inFlight) await this.inFlight;
   }
 
+  /** The next POST's events: within the count and the body size; one too big for any POST is dropped. */
+  private nextBatch(): JevWorkerEvent[] {
+    const batch: JevWorkerEvent[] = [];
+    let bytes = JEV_POST_ENVELOPE_BYTES;
+    while (this.queue.length && batch.length < this.perPost) {
+      const size = Buffer.byteLength(JSON.stringify(this.queue[0])) + 1;
+      if (JEV_POST_ENVELOPE_BYTES + size > this.maxBytes) {
+        const event = this.queue.shift()!;
+        this.log.warn('voice-mode worker: a jev event is too big for the host; dropped', {
+          type: event.type,
+          bytes: size,
+        });
+        continue;
+      }
+      if (bytes + size > this.maxBytes) break;
+      bytes += size;
+      batch.push(this.queue.shift()!);
+    }
+    return batch;
+  }
+
   private async flush(): Promise<void> {
     while (this.queue.length) {
-      const batch = this.queue.splice(0, this.perPost);
+      const batch = this.nextBatch();
+      if (!batch.length) continue;
       try {
         const res = await this.post(batch);
         void res.body?.cancel().catch(() => undefined);
@@ -4787,7 +4829,7 @@ interface JevUtterance {
   worded: boolean;
 }
 
-interface JevLine {
+interface JevPlayout {
   replyId: string;
   text: string;
   abort: AbortController;
@@ -4813,8 +4855,8 @@ export class JevLoop {
   /** The host said a participant's words arrived during this speech. */
   private wordsHeard = false;
   private bargeTimer?: ReturnType<typeof setTimeout>;
-  private readonly queue: JevLine[] = [];
-  private playing?: JevLine;
+  private readonly queue: JevPlayout[] = [];
+  private playing?: JevPlayout;
   private pumping = false;
   private readonly wakers = new Set<() => void>();
   private closed = false;
@@ -4964,7 +5006,7 @@ export class JevLoop {
     })();
   }
 
-  private async play(line: JevLine): Promise<void> {
+  private async play(line: JevPlayout): Promise<void> {
     this.playing = line;
     const { signal } = line.abort;
     // Synthesized while the caller may still talk; its first audio waits for their quiet (`ready`).
@@ -5058,10 +5100,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     transcriber,
     speak: async (text, ready, signal) => {
       if (!callVoice) return { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
-      if (callVoice.speak) return callVoice.speak(text, ready, signal);
-      // A room that cannot abort a line: it plays whole, and a cut reports nothing delivered.
-      const heard = await callVoice.say(text, ready);
-      return { heard, failed: !heard, cut: false, audioMs: 0, playedMs: 0, complete: heard };
+      return callVoice.speak(text, ready, signal);
     },
     report: (event) => {
       if (!ending) reporter.report(event);
@@ -5072,8 +5111,11 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     log: callLog,
   });
   let ended: Promise<void> | undefined;
+  // Never rejects: most callers start the end and do not wait for it.
   const end = (reason: string, tellHost: boolean, restart = false): Promise<void> =>
-    (ended ??= endCall(reason, tellHost, restart));
+    (ended ??= endCall(reason, tellHost, restart).catch((err: unknown) =>
+      log.warn('voice-mode worker: ending the jev call failed', { ...callFields, reason, err }),
+    ));
   const endCall = async (reason: string, tellHost: boolean, restart: boolean) => {
     ending = true;
     loop.close();
