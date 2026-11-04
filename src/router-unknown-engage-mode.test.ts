@@ -27,7 +27,7 @@ vi.mock('./container-runner.js', () => ({
 // Override DATA_DIR for tests
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-unknown-engage-mode' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-unknown-engage-mode-${process.pid}` };
 });
 
 import {
@@ -44,7 +44,7 @@ import { routeInbound } from './router.js';
 import { log } from './log.js';
 import type { ChannelAdapter, ChannelDefaults } from './channels/adapter.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-unknown-engage-mode';
+const TEST_DIR = `/tmp/nanoclaw-test-unknown-engage-mode-${process.pid}`;
 
 function now(): string {
   return new Date().toISOString();

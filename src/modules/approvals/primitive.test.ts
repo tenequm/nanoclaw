@@ -35,7 +35,7 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-approval-primitive' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-approval-primitive-${process.pid}` };
 });
 
 vi.mock('../../session-manager.js', async () => {
@@ -43,7 +43,7 @@ vi.mock('../../session-manager.js', async () => {
   return { ...actual, writeSessionMessage: vi.fn() };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-approval-primitive';
+const TEST_DIR = `/tmp/nanoclaw-test-approval-primitive-${process.pid}`;
 const DM_CHANNEL = 'slack';
 const DM_PLATFORM = 'D-admin-1';
 

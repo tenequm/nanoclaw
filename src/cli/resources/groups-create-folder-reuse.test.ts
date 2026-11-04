@@ -30,12 +30,12 @@ vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-groups-create-folder-reuse/data',
-    GROUPS_DIR: '/tmp/nanoclaw-test-groups-create-folder-reuse/groups',
+    DATA_DIR: `/tmp/nanoclaw-test-groups-create-folder-reuse-${process.pid}/data`,
+    GROUPS_DIR: `/tmp/nanoclaw-test-groups-create-folder-reuse-${process.pid}/groups`,
   };
 });
 
-const TEST_ROOT = '/tmp/nanoclaw-test-groups-create-folder-reuse';
+const TEST_ROOT = `/tmp/nanoclaw-test-groups-create-folder-reuse-${process.pid}`;
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 
 import { initTestDb, closeDb, runMigrations, getDb } from '../../db/index.js';

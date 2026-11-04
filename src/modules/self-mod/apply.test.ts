@@ -11,7 +11,7 @@ vi.mock('../../container-runner.js', () => ({
 vi.mock('../../session-manager.js', () => ({ writeSessionMessage: vi.fn() }));
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-self-mod-apply' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-self-mod-apply-${process.pid}` };
 });
 
 import {
@@ -25,7 +25,7 @@ import {
 import { updateContainerConfigJson } from '../../db/container-configs.js';
 import { applyAddMcpServer } from './apply.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-self-mod-apply';
+const TEST_DIR = `/tmp/nanoclaw-test-self-mod-apply-${process.pid}`;
 const session = { id: 'session-1', agent_group_id: 'ag-1' } as Session;
 
 beforeEach(async () => {

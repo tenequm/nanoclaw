@@ -2,12 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_DIR = '/tmp/nanoclaw-test-cli-templates';
+const TEST_DIR = `/tmp/nanoclaw-test-cli-templates-${process.pid}`;
 
 vi.mock('../../config.js', async () => ({
   ...(await vi.importActual<typeof import('../../config.js')>('../../config.js')),
-  DATA_DIR: '/tmp/nanoclaw-test-cli-templates',
-  TEMPLATES_DIR: '/tmp/nanoclaw-test-cli-templates/templates',
+  DATA_DIR: `/tmp/nanoclaw-test-cli-templates-${process.pid}`,
+  TEMPLATES_DIR: `/tmp/nanoclaw-test-cli-templates-${process.pid}/templates`,
 }));
 
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';

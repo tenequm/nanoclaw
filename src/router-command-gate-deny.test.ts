@@ -34,10 +34,10 @@ vi.mock('./container-runner.js', () => ({
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-command-gate-deny' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-command-gate-deny-${process.pid}` };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-command-gate-deny';
+const TEST_DIR = `/tmp/nanoclaw-test-command-gate-deny-${process.pid}`;
 
 const channelDefaults: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: true, unknownSenderPolicy: 'public' },

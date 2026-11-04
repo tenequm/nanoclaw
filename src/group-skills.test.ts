@@ -2,14 +2,14 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-group-skills-test';
+const TEST_ROOT = `/tmp/nanoclaw-group-skills-test-${process.pid}`;
 const DATA_DIR = path.join(TEST_ROOT, 'data');
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-group-skills-test/data',
-  GROUPS_DIR: '/tmp/nanoclaw-group-skills-test/groups',
+  DATA_DIR: `/tmp/nanoclaw-group-skills-test-${process.pid}/data`,
+  GROUPS_DIR: `/tmp/nanoclaw-group-skills-test-${process.pid}/groups`,
 }));
 
 import { materializeTemplateSkills } from './group-skills.js';

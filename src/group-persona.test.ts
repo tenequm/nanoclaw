@@ -10,7 +10,7 @@ vi.mock('./log.js', () => ({
 import { MAX_PERSONA_READ_BYTES, PERSONA_PREPEND_FILE, readGroupPersona, stageGroupPersona } from './group-persona.js';
 import { log } from './log.js';
 
-const TMP = '/tmp/nanoclaw-group-persona-test';
+const TMP = `/tmp/nanoclaw-group-persona-test-${process.pid}`;
 
 beforeEach(() => {
   vi.clearAllMocks();

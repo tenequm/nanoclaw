@@ -3,14 +3,14 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-provider-surfaces-test';
+const TEST_ROOT = `/tmp/nanoclaw-provider-surfaces-test-${process.pid}`;
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 const DATA_DIR = path.join(TEST_ROOT, 'data');
 
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-provider-surfaces-test/data',
-  GROUPS_DIR: '/tmp/nanoclaw-provider-surfaces-test/groups',
+  DATA_DIR: `/tmp/nanoclaw-provider-surfaces-test-${process.pid}/data`,
+  GROUPS_DIR: `/tmp/nanoclaw-provider-surfaces-test-${process.pid}/groups`,
 }));
 
 vi.mock('./log.js', () => ({

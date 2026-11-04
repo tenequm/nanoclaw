@@ -28,10 +28,10 @@ vi.mock('../container-runner.js', () => ({
   killContainer: vi.fn(),
 }));
 
-const TEST_DIR = '/tmp/nanoclaw-test-voice-call-session';
+const TEST_DIR = `/tmp/nanoclaw-test-voice-call-session-${process.pid}`;
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-voice-call-session' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-voice-call-session-${process.pid}` };
 });
 
 const now = () => new Date().toISOString();

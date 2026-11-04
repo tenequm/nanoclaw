@@ -25,7 +25,7 @@ vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-router-jev',
+    DATA_DIR: `/tmp/nanoclaw-test-router-jev-${process.pid}`,
     TIMEZONE: 'UTC',
     JEV_API_KEY: 'test-key',
   };
@@ -49,7 +49,7 @@ import { createUser } from './modules/permissions/db/users.js';
 import { routeInbound, setSenderResolver } from './router.js';
 import type { ChannelAdapter, ChannelDefaults } from './channels/adapter.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-router-jev';
+const TEST_DIR = `/tmp/nanoclaw-test-router-jev-${process.pid}`;
 const GATED = 'ag-gated';
 const PLAIN = 'ag-plain';
 

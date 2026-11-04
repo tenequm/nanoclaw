@@ -29,10 +29,10 @@ vi.mock('../approvals/index.js', async (importActual) => {
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-a2a-gate' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-a2a-gate-${process.pid}` };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-a2a-gate';
+const TEST_DIR = `/tmp/nanoclaw-test-a2a-gate-${process.pid}`;
 const A = 'ag-A';
 const B = 'ag-B';
 

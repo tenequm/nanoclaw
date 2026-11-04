@@ -10,12 +10,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-outbox-root' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-outbox-root-${process.pid}` };
 });
 
 import { clearOutbox, readOutboxFiles, sessionDir } from './session-manager.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-outbox-root';
+const TEST_DIR = `/tmp/nanoclaw-test-outbox-root-${process.pid}`;
 const AG = 'ag-outbox';
 const SESS = 'sess-outbox';
 

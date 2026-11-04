@@ -23,7 +23,7 @@ vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-host-sweep-grace',
+    DATA_DIR: `/tmp/nanoclaw-test-host-sweep-grace-${process.pid}`,
     ABSOLUTE_CEILING_MS_RAW: '',
     CLAIM_STUCK_MS_RAW: '',
   };
@@ -46,7 +46,7 @@ import { getAgentMailbox } from './mailbox/index.js';
 import { outboundDbPath } from './mailbox/sqlite/paths.js';
 import { initSessionFolder, writeSessionMessage } from './session-manager.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-host-sweep-grace';
+const TEST_DIR = `/tmp/nanoclaw-test-host-sweep-grace-${process.pid}`;
 const AG = 'ag-test';
 const SESS = 'sess-test';
 // Mirrors SWEEP_INTERVAL_MS in host-sweep.ts — identifies the sweep's

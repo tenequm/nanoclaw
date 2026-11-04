@@ -23,7 +23,7 @@ import {
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-gateway-approval' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-gateway-approval-${process.pid}` };
 });
 
 vi.mock('./modules/approvals/primitive.js', () => ({
@@ -41,7 +41,7 @@ vi.mock('./modules/approvals/primitive.js', () => ({
 
 vi.mock('./modules/approvals/response-handler.js', async (importOriginal) => importOriginal());
 
-const TEST_DIR = '/tmp/nanoclaw-test-gateway-approval';
+const TEST_DIR = `/tmp/nanoclaw-test-gateway-approval-${process.pid}`;
 const delivered: Array<{ content: string; instance?: string; threadId?: string | null }> = [];
 const delivery: ChannelDeliveryAdapter = {
   async deliver(_channelType, _platformId, _threadId, _kind, content, _files, instance) {

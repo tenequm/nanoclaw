@@ -2,12 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-legacy-provider-compat-test';
+const TEST_ROOT = `/tmp/nanoclaw-legacy-provider-compat-test-${process.pid}`;
 
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-legacy-provider-compat-test/data',
-  GROUPS_DIR: '/tmp/nanoclaw-legacy-provider-compat-test/groups',
+  DATA_DIR: `/tmp/nanoclaw-legacy-provider-compat-test-${process.pid}/data`,
+  GROUPS_DIR: `/tmp/nanoclaw-legacy-provider-compat-test-${process.pid}/groups`,
 }));
 
 import { resolveProviderContribution } from '../container-runner.js';

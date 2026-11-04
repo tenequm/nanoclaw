@@ -21,8 +21,8 @@ vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-delivery-poll',
-    GROUPS_DIR: '/tmp/nanoclaw-test-delivery-poll/groups',
+    DATA_DIR: `/tmp/nanoclaw-test-delivery-poll-${process.pid}`,
+    GROUPS_DIR: `/tmp/nanoclaw-test-delivery-poll-${process.pid}/groups`,
   };
 });
 
@@ -42,7 +42,7 @@ vi.mock('./db/sessions.js', async () => {
   return { ...actual, getRunningSessions: vi.fn(actual.getRunningSessions) };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-delivery-poll';
+const TEST_DIR = `/tmp/nanoclaw-test-delivery-poll-${process.pid}`;
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from './db/index.js';
 import { getRunningSessions } from './db/sessions.js';
