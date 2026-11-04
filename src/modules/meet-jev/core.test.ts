@@ -525,10 +525,10 @@ describe('the window', () => {
   it('keeps windowMs of history and at most windowBytes of text', () => {
     const call = new Call();
     call.feed({ kind: 'utterance', speaker: misha, uttId: 'old', text: 'long ago', final: true, at: 1_000 });
-    call.feed({ kind: 'utterance', speaker: misha, uttId: 'new', text: 'just now', final: true, at: 100_000 });
+    call.feed({ kind: 'utterance', speaker: misha, uttId: 'new', text: 'just now', final: true, at: 400_000 });
     expect(toJevState(call.state).window.map((l) => l.text)).toEqual(['just now']);
 
-    const big = 'x'.repeat(5_000);
+    const big = 'x'.repeat(10_000);
     for (const id of ['a', 'b', 'c']) call.feed({ kind: 'chat', speaker: olena, text: `${id}${big}` });
     const texts = toJevState(call.state).window.map((l) => l.text[0]);
     expect(texts).toEqual(['b', 'c']);
@@ -833,7 +833,7 @@ describe('room size and probability-only routing', () => {
     call.say(misha, 'u1', 'hello');
     call.say(olena, 'u2', 'hello');
     expect(toJevState(call.state).facts.humans_in_room).toBe(2);
-    call.feed({ kind: 'timer', key: 'tick', at: 100_000 });
+    call.feed({ kind: 'timer', key: 'tick', at: 400_000 });
     expect(toJevState(call.state).facts.humans_in_room).toBe(1);
   });
 

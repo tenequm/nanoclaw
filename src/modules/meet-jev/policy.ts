@@ -17,8 +17,8 @@ export function policyFor(kind: CallKind, agentName: string, agentAliases: strin
       answer: { p: 0.5 },
     },
     boundaryFallbackMs: 700,
-    windowMs: 90_000,
-    windowBytes: 12_000,
+    windowMs: 300_000,
+    windowBytes: 24_000,
     thresholds: {
       answer: { p: 0.7 },
       stop: { p: 0.6 },
