@@ -22,7 +22,7 @@ vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-jev-gate',
+    DATA_DIR: `/tmp/nanoclaw-test-jev-gate-${process.pid}`,
     TIMEZONE: 'UTC',
     // The defaults, not a host's .env (bl routes Jev through OpenRouter).
     JEV_URL: 'https://api.typesafe.ai/v1/systemone',
@@ -79,7 +79,7 @@ import { decide, jevQuestions } from './jev.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-jev-gate';
+const TEST_DIR = `/tmp/nanoclaw-test-jev-gate-${process.pid}`;
 const AGENT_GROUP = 'ag-jev';
 const AGENT_NAME = 'Robo';
 

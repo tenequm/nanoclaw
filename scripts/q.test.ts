@@ -15,6 +15,13 @@ import Database from 'better-sqlite3';
  */
 
 const Q = path.resolve(__dirname, 'q.ts');
+const REPO_ROOT = path.resolve(__dirname, '..');
+
+// Node with the tsx loader directly, not `pnpm exec tsx`: pnpm's own startup cost each
+// call ~0.7s idle and over vitest's 5s default under full-suite load.
+function q(...args: string[]): ReturnType<typeof spawnSync<string>> {
+  return spawnSync(process.execPath, ['--import', 'tsx', Q, ...args], { encoding: 'utf-8', cwd: REPO_ROOT });
+}
 
 describe('scripts/q.ts', () => {
   let tempDir: string;
@@ -36,10 +43,7 @@ describe('scripts/q.ts', () => {
   });
 
   function run(sql: string): { stdout: string; stderr: string; status: number } {
-    const r = spawnSync('pnpm', ['--silent', 'exec', 'tsx', Q, dbPath, sql], {
-      encoding: 'utf-8',
-      cwd: path.resolve(__dirname, '..'),
-    });
+    const r = q(dbPath, sql);
     return { stdout: r.stdout ?? '', stderr: r.stderr ?? '', status: r.status ?? -1 };
   }
 
@@ -141,10 +145,7 @@ describe('scripts/q.ts', () => {
   });
 
   it('exits 2 with usage when args are missing', () => {
-    const r = spawnSync('pnpm', ['--silent', 'exec', 'tsx', Q], {
-      encoding: 'utf-8',
-      cwd: path.resolve(__dirname, '..'),
-    });
+    const r = q();
     expect(r.status).toBe(2);
     expect(r.stderr).toMatch(/Usage/);
   });

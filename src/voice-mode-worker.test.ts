@@ -1370,8 +1370,14 @@ describe('runCall', () => {
       await v.turn('', { speechMs: 900 });
       await v.turn('', { speechMs: 200 });
       const dir = path.join(root, 'Andy', new Date().toISOString().slice(0, 10));
-      await vi.waitFor(() => expect(fs.readdirSync(dir).sort()).toHaveLength(6));
-      const first = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-1.json'), 'utf8')) as TurnRecord;
+      // Recordings are written fire-and-forget: a listed file can still be empty. Each turn's JSON goes
+      // after its WAV, so a whole JSON means the turn is on disk.
+      const [first, lost, noise] = await vi.waitFor(() =>
+        [1, 2, 3].map(
+          (turn) => JSON.parse(fs.readFileSync(path.join(dir, `call-1-${turn}.json`), 'utf8')) as TurnRecord,
+        ),
+      );
+      expect(fs.readdirSync(dir)).toHaveLength(6);
       expect(first).toMatchObject({
         callId: 'call-1',
         lineId: 'voice-mode:abc',
@@ -1382,9 +1388,7 @@ describe('runCall', () => {
         speechMs: 1000,
         host: { accepted: true, status: 202, id: '1' },
       });
-      const lost = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-2.json'), 'utf8')) as TurnRecord;
       expect(lost).toMatchObject({ turn: 2, transcript: '', reason: 'empty' });
-      const noise = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-3.json'), 'utf8')) as TurnRecord;
       expect(noise).toMatchObject({ turn: 3, reason: 'noise' });
       const wav = fs.readFileSync(path.join(dir, 'call-1-1.wav'));
       expect(wav.subarray(0, 4).toString()).toBe('RIFF');
@@ -1557,10 +1561,13 @@ describe('reply recordings', () => {
       };
       settings.spoke?.(line, pcm);
       const file = path.join(root, 'Andy', new Date().toISOString().slice(0, 10), 'call-1-reply-1.wav');
-      await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
-      const wav = fs.readFileSync(file);
+      // Written fire-and-forget: the file exists before its bytes do.
+      const wav = await vi.waitFor(() => {
+        const bytes = fs.readFileSync(file);
+        expect(bytes.length - 44).toBe(2 * 24_000);
+        return bytes;
+      });
       expect(wav.readUInt32LE(24)).toBe(24_000);
-      expect(wav.length - 44).toBe(2 * 24_000);
       expect(fs.statSync(file).mode & 0o777).toBe(0o600);
       expect(info).toHaveBeenCalledWith('voice-mode.reply', {
         callId: 'call-1',

@@ -5,10 +5,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-upgrade-state' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-upgrade-state-${process.pid}` };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-upgrade-state';
+const TEST_DIR = `/tmp/nanoclaw-test-upgrade-state-${process.pid}`;
 
 import {
   currentUpgradeState,

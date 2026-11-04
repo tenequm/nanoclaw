@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-restart-honesty' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-restart-honesty-${process.pid}` };
 });
 
 vi.mock('./primitive.js', () => ({
@@ -37,7 +37,7 @@ import {
   stopGatewayApprovalCoordinator,
 } from '../../gateway-approval-coordinator.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-restart-honesty';
+const TEST_DIR = `/tmp/nanoclaw-test-restart-honesty-${process.pid}`;
 
 function iso(offsetMs: number): string {
   return new Date(Date.now() + offsetMs).toISOString();

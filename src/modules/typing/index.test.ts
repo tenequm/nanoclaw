@@ -15,7 +15,7 @@ vi.mock('../../log.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-typing-${process.pid}` };
 });
 
 import fs from 'fs';
@@ -82,8 +82,8 @@ beforeEach(() => {
 afterEach(() => {
   stopTypingRefresh('sess-1');
   stopTypingRefresh('sess-turn');
-  if (fs.existsSync('/tmp/nanoclaw-test-typing'))
-    fs.rmSync('/tmp/nanoclaw-test-typing', { recursive: true, force: true });
+  if (fs.existsSync(`/tmp/nanoclaw-test-typing-${process.pid}`))
+    fs.rmSync(`/tmp/nanoclaw-test-typing-${process.pid}`, { recursive: true, force: true });
   vi.useRealTimers();
 });
 

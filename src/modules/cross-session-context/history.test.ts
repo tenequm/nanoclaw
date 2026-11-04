@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cross-session-history' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-cross-session-history-${process.pid}` };
 });
 
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
@@ -17,7 +17,7 @@ import { initSessionFolder, writeOutboundDirect, writeSessionMessage } from '../
 import type { CallerContext } from '../../cli/frame.js';
 import { formatHistoryLines, sessionHistory } from './history.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-cross-session-history';
+const TEST_DIR = `/tmp/nanoclaw-test-cross-session-history-${process.pid}`;
 const AG = 'ag-hist';
 const SESS = 'sess-hist';
 

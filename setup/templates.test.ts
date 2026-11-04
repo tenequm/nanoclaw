@@ -4,15 +4,15 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const CONTRACT_ROOT = '/tmp/nanoclaw-setup-templates-contract';
+const CONTRACT_ROOT = `/tmp/nanoclaw-setup-templates-contract-${process.pid}`;
 
 // The contract test drives the REAL dispatch pipeline; point its filesystem
 // at a scratch root so stamping never touches the checkout.
 vi.mock('../src/config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/config.js')>()),
-  GROUPS_DIR: '/tmp/nanoclaw-setup-templates-contract/groups',
-  DATA_DIR: '/tmp/nanoclaw-setup-templates-contract/data',
-  TEMPLATES_DIR: '/tmp/nanoclaw-setup-templates-contract/templates',
+  GROUPS_DIR: `/tmp/nanoclaw-setup-templates-contract-${process.pid}/groups`,
+  DATA_DIR: `/tmp/nanoclaw-setup-templates-contract-${process.pid}/data`,
+  TEMPLATES_DIR: `/tmp/nanoclaw-setup-templates-contract-${process.pid}/templates`,
 }));
 
 vi.mock('../src/container-runner.js', () => ({

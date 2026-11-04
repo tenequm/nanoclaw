@@ -8,11 +8,11 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-test-run-log';
+const TEST_ROOT = `/tmp/nanoclaw-test-run-log-${process.pid}`;
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
-  return { ...actual, GROUPS_DIR: '/tmp/nanoclaw-test-run-log/groups' };
+  return { ...actual, GROUPS_DIR: `/tmp/nanoclaw-test-run-log-${process.pid}/groups` };
 });
 vi.mock('../../db/agent-groups.js', () => ({
   getAgentGroup: vi.fn(async () => ({ id: 'ag', folder: 'grp', name: 'G' })),

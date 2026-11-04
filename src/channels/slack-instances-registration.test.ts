@@ -37,12 +37,16 @@ import { getChannelDefaults, getRegisteredChannelNames, hasDeclaredChannelDefaul
 
 const originalCwd = process.cwd();
 
+// Transforming and loading every channel adapter and its SDK takes 3-10s alone, past the 10s hook
+// default under full-suite load.
+const BARREL_IMPORT_TIMEOUT_MS = 60_000;
+
 beforeAll(async () => {
   const dir = mkdtempSync(join(tmpdir(), 'slack-instances-'));
   writeFileSync(join(dir, '.env'), 'SLACK_INSTANCES=alpha,gh-bot\n');
   process.chdir(dir);
   await import('./index.js'); // the real barrel — triggers every channel's self-registration
-});
+}, BARREL_IMPORT_TIMEOUT_MS);
 
 afterAll(() => {
   process.chdir(originalCwd);

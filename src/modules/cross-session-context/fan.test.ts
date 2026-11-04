@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cross-session-fan' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-cross-session-fan-${process.pid}` };
 });
 
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
@@ -41,7 +41,7 @@ import {
   HOT_SESSION_LIMIT,
 } from './config.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-cross-session-fan';
+const TEST_DIR = `/tmp/nanoclaw-test-cross-session-fan-${process.pid}`;
 const AG = 'ag-1';
 const NOW = new Date().toISOString();
 

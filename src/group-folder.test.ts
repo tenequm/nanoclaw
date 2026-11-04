@@ -8,12 +8,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // below only check the `groups/<folder>` suffix, so they hold either way.
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
-  return { ...actual, GROUPS_DIR: '/tmp/nanoclaw-test-group-folder/groups' };
+  return { ...actual, GROUPS_DIR: `/tmp/nanoclaw-test-group-folder-${process.pid}/groups` };
 });
 
 import { groupFolderExistsOnDisk, isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 
-const TEST_ROOT = '/tmp/nanoclaw-test-group-folder';
+const TEST_ROOT = `/tmp/nanoclaw-test-group-folder-${process.pid}`;
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 
 describe('group folder validation', () => {

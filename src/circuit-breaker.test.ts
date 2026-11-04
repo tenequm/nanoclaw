@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // vi.mock factories are hoisted above imports, so they can't close over local
 // consts. vi.hoisted is hoisted alongside the mock and runs before any
 // `import` — so it can only use globals (no path/os modules).
-const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: '/tmp/nanoclaw-cb-test' }));
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: `/tmp/nanoclaw-cb-test-${process.pid}` }));
 const CB_PATH = path.join(TEST_DIR, 'circuit-breaker.json');
 
 vi.mock('./config.js', async () => {

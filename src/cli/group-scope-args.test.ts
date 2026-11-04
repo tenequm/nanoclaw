@@ -28,10 +28,10 @@ vi.mock('../container-restart.js', () => ({
 
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cli-group-scope-args' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-cli-group-scope-args-${process.pid}` };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-cli-group-scope-args';
+const TEST_DIR = `/tmp/nanoclaw-test-cli-group-scope-args-${process.pid}`;
 
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../db/index.js';
 import { ensureContainerConfig, getContainerConfig } from '../db/container-configs.js';

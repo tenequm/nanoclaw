@@ -9,11 +9,11 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_ROOT = '/tmp/nanoclaw-test-cli-jev-gate';
+const TEST_ROOT = `/tmp/nanoclaw-test-cli-jev-gate-${process.pid}`;
 
 vi.mock('../../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-test-cli-jev-gate/data',
+  DATA_DIR: `/tmp/nanoclaw-test-cli-jev-gate-${process.pid}/data`,
 }));
 
 vi.mock('../../log.js', () => ({

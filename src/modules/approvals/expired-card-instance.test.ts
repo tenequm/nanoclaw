@@ -17,10 +17,10 @@ import type { PendingApproval } from '../../types.js';
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-expired-card-instance' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-expired-card-instance-${process.pid}` };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-expired-card-instance';
+const TEST_DIR = `/tmp/nanoclaw-test-expired-card-instance-${process.pid}`;
 const delivered: Array<{ platformId: string; instance: string | undefined }> = [];
 const captureAdapter: ChannelDeliveryAdapter = {
   async deliver(_channelType, platformId, _threadId, _kind, _content, _files, instance) {

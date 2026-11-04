@@ -26,10 +26,10 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-approval-resolved' };
+  return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-approval-resolved-${process.pid}` };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-approval-resolved';
+const TEST_DIR = `/tmp/nanoclaw-test-approval-resolved-${process.pid}`;
 
 function now() {
   return new Date().toISOString();
