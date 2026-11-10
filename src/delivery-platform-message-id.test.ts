@@ -21,6 +21,14 @@ describe('withPlatformMessageId', () => {
     });
   });
 
+  it('strips it from an edit target too', () => {
+    expect(run({ operation: 'edit', messageId: `-1001234567890:449:${ag}`, text: 'fixed' })).toEqual({
+      operation: 'edit',
+      messageId: '-1001234567890:449',
+      text: 'fixed',
+    });
+  });
+
   it('leaves ids without the suffix alone', () => {
     const content = { operation: 'reaction', messageId: '-1001234567890:449', emoji: 'heart' };
     expect(run(content)).toEqual(content);

@@ -265,7 +265,6 @@ export interface ChannelAdapter {
     status?: string,
     statusKind?: 'auto' | 'agent',
   ): Promise<void>;
-  threadsReplies?: boolean;
   /**
    * Clear an indicator painted by setTyping.
    *
@@ -290,7 +289,6 @@ export interface ChannelAdapter {
   addReaction?(platformId: string, messageId: string, emoji: string): Promise<void>;
   removeReaction?(platformId: string, messageId: string, emoji: string): Promise<void>;
 
-  resolveReaction?(emoji: string): ResolvedReaction;
   syncConversations?(): Promise<ConversationInfo[]>;
   /** Resolve conversation type and human-readable metadata for host UI. */
   resolveConversation?(platformId: string): Promise<ResolvedConversation | null>;
@@ -370,15 +368,4 @@ export interface ChannelRegistration {
     mounts?: Array<{ hostPath: string; containerPath: string; readonly: boolean }>;
     env?: Record<string, string>;
   };
-}
-
-export interface ResolvedReaction {
-  /** Glyph to actually send, or null when the set has no stand-in for the intent. */
-  emoji: string | null;
-  /** true when `emoji` is a nearest-allowed stand-in, not what the agent asked for. */
-  substituted: boolean;
-  /** Platform whose set applied, for the note the host writes back to the agent. */
-  platform: string;
-  /** The full allowed set, spelled out to the agent when nothing maps. */
-  allowed: readonly string[];
 }

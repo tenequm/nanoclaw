@@ -5,7 +5,6 @@
  * Kept apart from the adapter so tests can compose a document without loading
  * the adapter: both sections are pure DB reads, registered at import time.
  */
-import { getContainerConfig } from '../../db/container-configs.js';
 import { isAgentWiredToChannel } from '../../db/messaging-groups.js';
 import { registerProjectDocSection } from '../../project-doc-compose.js';
 import type { AgentGroup } from '../../types.js';
@@ -38,16 +37,17 @@ export const FORMATTING_BODY = [
 export const RICH_MESSAGES_SECTION = 'Rich messages';
 
 export const RICH_MESSAGES_BODY = [
-  'On Telegram, `send_message` takes `rich: true` to send a Rich Message. Telegram then renders real tables, headings (`#`), nested and task lists (`- [ ]`, `- [x]`) and collapsible `<details><summary>Title</summary>...</details>` blocks, up to 32768 characters in one message.',
+  'On Telegram, `send_message` takes `rich: true` to send a Rich Message. Telegram then renders real tables, headings (`#`), nested and task lists (`- [ ]`, `- [x]`) and collapsible `<details><summary>Title</summary>...</details>` blocks.',
+  'One Rich Message holds at most 32768 characters, 20 table columns and 500 non-empty lines. The tool refuses a message over any of these with an error naming the limit; split it into several messages, or send it without `rich`.',
   'This is a capability, off by default: messages go out normally unless you set `rich: true`. Consider it when the content truly needs structure that a normal message cannot carry well, such as a real table or a long structured report, and set it on that one message.',
   'A Rich Message reads standard markdown, so a single line break joins two lines into one paragraph; leave a blank line between lines you want apart. `**bold**` and `_italic_` mean the same in both kinds of message. If Telegram refuses a Rich Message it goes out as a normal message, so the text still arrives.',
 ].join('\n\n');
 
-/** Rich Messages are taught only where they work: a Telegram-wired agent whose group has them on. */
+/** Rich Messages are taught only where they work: a Telegram-wired agent. */
 async function richMessagesSection(group: AgentGroup): Promise<{ name: string; body: string } | null> {
-  if ((await getContainerConfig(group.id))?.rich_messages !== 1) return null;
-  if (!(await isAgentWiredToChannel(group.id, CHANNEL_TYPE))) return null;
-  return { name: RICH_MESSAGES_SECTION, body: RICH_MESSAGES_BODY };
+  return (await isAgentWiredToChannel(group.id, CHANNEL_TYPE))
+    ? { name: RICH_MESSAGES_SECTION, body: RICH_MESSAGES_BODY }
+    : null;
 }
 
 /** Every Telegram-wired agent gets the guide, whatever its skill selection. */

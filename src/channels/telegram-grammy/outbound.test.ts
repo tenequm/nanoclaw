@@ -1,15 +1,21 @@
 /**
  * Reply threading on the outbound path: `reply_parameters` rides only the
- * first send, only when the host marked the message `threadReply`, and a
- * quote Telegram rejects is retried once without it.
+ * first send, only for an explicit reply (`replyIntent`) or when a newer
+ * inbound message came in after the target, and a quote Telegram rejects is
+ * retried once without it.
  */
 import { Effect, Layer } from 'effect';
 import { GrammyError } from 'grammy';
-import type { UserFromGetMe } from 'grammy/types';
+import type { Update, UserFromGetMe } from 'grammy/types';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { OutboundMessage } from '../adapter.js';
-import { _clearSentKindsForTest, dispatchOutbound } from './outbound.js';
+import {
+  _clearLatestInboundForTest,
+  _clearSentKindsForTest,
+  dispatchOutbound,
+  rememberInboundMessage,
+} from './outbound.js';
 import { BotService, type HydratedBot } from './services.js';
 import { TELEGRAM_TEXT_LIMIT } from './formatter.js';
 
@@ -52,13 +58,16 @@ function fakeBot(fail?: (call: Call) => unknown) {
   });
   return {
     calls,
-    run: (msg: OutboundMessage) =>
-      Effect.runPromise(dispatchOutbound('telegram:42', null, msg).pipe(Effect.provide(layer))),
+    run: (msg: OutboundMessage, platformId = 'telegram:42') =>
+      Effect.runPromise(dispatchOutbound(platformId, null, msg).pipe(Effect.provide(layer))),
   };
 }
 
 // Every fakeBot numbers from 100, so a kind remembered by one test must not leak into the next.
-beforeEach(() => _clearSentKindsForTest());
+beforeEach(() => {
+  _clearSentKindsForTest();
+  _clearLatestInboundForTest();
+});
 
 const file = (filename: string) => ({ filename, data: Buffer.from('x') });
 
@@ -74,21 +83,56 @@ describe('telegram outbound reply threading', () => {
   it('sets reply_parameters on the first chunk only', async () => {
     const bot = fakeBot();
     const long = `${'a'.repeat(TELEGRAM_TEXT_LIMIT - 10)}\n\n${'b'.repeat(200)}`;
-    await bot.run({ kind: 'chat', content: { text: long, threadReply: {} }, inReplyTo: '42:7' });
+    await bot.run({ kind: 'chat', content: { text: long, replyIntent: {} }, inReplyTo: '42:7' });
     expect(bot.calls.length).toBeGreaterThan(1);
     expect(bot.calls[0].other.reply_parameters).toEqual({ message_id: 7, allow_sending_without_reply: true });
     expect(bot.calls.slice(1).every((c) => c.other.reply_parameters === undefined)).toBe(true);
   });
 
-  it('sends plain when the host did not mark the message threadReply', async () => {
+  it('shows a default reply as a reply only once a newer message came in after its target', async () => {
+    const inbound = (update: Partial<Update>, platformId = 'telegram:42') =>
+      rememberInboundMessage({ update_id: 1, ...update } as Update, platformId);
+    const message = (id: number) => ({ message_id: id, date: 0, chat: { id: 42, type: 'private' as const } });
+    const boxedTo = async (inReplyTo: string) => {
+      const bot = fakeBot();
+      await bot.run({ kind: 'chat', content: { text: 'hi' }, inReplyTo });
+      return (bot.calls[0].other.reply_parameters as { message_id?: number } | undefined)?.message_id;
+    };
+
+    // Nothing remembered (a fresh host): no implicit box.
+    expect(await boxedTo('42:7')).toBeUndefined();
+    inbound({ message: message(7) } as Partial<Update>);
+    expect(await boxedTo('42:7')).toBeUndefined();
+
+    // An edit, a reaction, or a message in another topic is not a newer message here.
+    inbound({ edited_message: { ...message(9), edit_date: 1 } } as Partial<Update>);
+    inbound({ message_reaction: { chat: message(9).chat, message_id: 7 } } as Partial<Update>);
+    inbound({ message: message(9) } as Partial<Update>, 'telegram:42:5');
+    expect(await boxedTo('42:7')).toBeUndefined();
+
+    inbound({ message: message(8) } as Partial<Update>);
+    expect(await boxedTo('42:7')).toBe(7);
+    expect(await boxedTo('42:8')).toBeUndefined();
+    // A lower id arriving late never lowers the remembered one.
+    inbound({ message: message(3) } as Partial<Update>);
+    expect(await boxedTo('42:7')).toBe(7);
+  });
+
+  it('does not box an edit or a reaction, even after newer messages', async () => {
+    rememberInboundMessage({ update_id: 1, message: { message_id: 50 } } as Update, 'telegram:42');
     const bot = fakeBot();
-    await bot.run({ kind: 'chat', content: { text: 'hi' }, inReplyTo: '42:7' });
-    expect(bot.calls[0].other.reply_parameters).toBeUndefined();
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: '42:7', text: 'x' }, inReplyTo: '42:7' });
+    await bot.run({
+      kind: 'chat',
+      content: { operation: 'reaction', messageId: '42:7', emoji: '👍' },
+      inReplyTo: '42:7',
+    });
+    expect(bot.calls.every((c) => c.other.reply_parameters === undefined)).toBe(true);
   });
 
   it('never threads to a message from another chat', async () => {
     const bot = fakeBot();
-    await bot.run({ kind: 'chat', content: { text: 'hi', threadReply: {} }, inReplyTo: '99:7' });
+    await bot.run({ kind: 'chat', content: { text: 'hi', replyIntent: {} }, inReplyTo: '99:7' });
     expect(bot.calls[0].other.reply_parameters).toBeUndefined();
   });
 
@@ -96,7 +140,7 @@ describe('telegram outbound reply threading', () => {
     const single = fakeBot();
     await single.run({
       kind: 'chat',
-      content: { text: 'pic', threadReply: {} },
+      content: { text: 'pic', replyIntent: {} },
       files: [file('a.jpg')],
       inReplyTo: '7',
     });
@@ -105,7 +149,7 @@ describe('telegram outbound reply threading', () => {
     const many = fakeBot();
     await many.run({
       kind: 'chat',
-      content: { text: 'docs', threadReply: {} },
+      content: { text: 'docs', replyIntent: {} },
       files: [file('a.pdf'), file('b.pdf')],
       inReplyTo: '7',
     });
@@ -127,7 +171,7 @@ describe('telegram outbound reply threading', () => {
     );
     const id = await bot.run({
       kind: 'chat',
-      content: { text: 'yes', threadReply: { quote: 'at noon' } },
+      content: { text: 'yes', replyIntent: { quote: 'at noon' } },
       inReplyTo: '42:7',
     });
     expect(bot.calls.map((c) => c.other.reply_parameters)).toEqual([
@@ -144,7 +188,7 @@ describe('telegram outbound reply threading', () => {
         : undefined,
     );
     const long = `${'a'.repeat(TELEGRAM_TEXT_LIMIT - 10)}\n\n${'b'.repeat(200)}`;
-    await bot.run({ kind: 'chat', content: { text: long, threadReply: { quote: 'aaa' } }, inReplyTo: '42:7' });
+    await bot.run({ kind: 'chat', content: { text: long, replyIntent: { quote: 'aaa' } }, inReplyTo: '42:7' });
     expect(bot.calls.map((c) => c.other.reply_parameters)).toEqual([
       { message_id: 7, allow_sending_without_reply: true, quote: 'aaa' },
       { message_id: 7, allow_sending_without_reply: true },
@@ -155,7 +199,7 @@ describe('telegram outbound reply threading', () => {
   it('does not retry an error that is not about the quote', async () => {
     const bot = fakeBot(() => badRequest('chat not found'));
     await expect(
-      bot.run({ kind: 'chat', content: { text: 'yes', threadReply: { quote: 'at noon' } }, inReplyTo: '42:7' }),
+      bot.run({ kind: 'chat', content: { text: 'yes', replyIntent: { quote: 'at noon' } }, inReplyTo: '42:7' }),
     ).rejects.toBeDefined();
     expect(bot.calls).toHaveLength(1);
   });
@@ -165,7 +209,7 @@ describe('telegram outbound reply threading', () => {
     const long = `${'a'.repeat(TELEGRAM_TEXT_LIMIT - 10)}\n\n${'b'.repeat(200)}`;
     const id = await bot.run({
       kind: 'chat',
-      content: { text: long, threadReply: { quote: 'aaa' } },
+      content: { text: long, replyIntent: { quote: 'aaa' } },
       inReplyTo: '42:7',
     });
     expect(id).toBe('100');
@@ -285,7 +329,7 @@ describe('telegram outbound rich messages', () => {
     const bot = fakeBot();
     const id = await bot.run({
       kind: 'chat',
-      content: { text: table, rich: true, threadReply: { quote: 'status?' } },
+      content: { text: table, rich: true, replyIntent: { quote: 'status?' } },
       inReplyTo: '42:7',
     });
     expect(bot.calls).toHaveLength(1);
@@ -314,7 +358,7 @@ describe('telegram outbound rich messages', () => {
     expect(bot.calls.length).toBeGreaterThan(1);
   });
 
-  it('ignores rich for files and when the host did not set it', async () => {
+  it('ignores rich for files and when it is not set', async () => {
     const bot = fakeBot();
     await bot.run({ kind: 'chat', content: { text: table, rich: true }, files: [file('a.pdf')] });
     await bot.run({ kind: 'chat', content: { text: table } });
@@ -328,20 +372,20 @@ describe('telegram outbound rich messages', () => {
         : undefined,
     );
     const id = await bot.run({ kind: 'chat', content: { text: table, rich: true } });
-    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '# new', rich: true } });
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '# new' } });
     expect(bot.calls[1].method).toBe('editMessageText');
     expect(bot.calls[1].args.slice(0, 3)).toEqual([42, Number(id), { markdown: '# new' }]);
 
-    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: 'bad', rich: true } });
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: 'bad' } });
     expect(bot.calls.slice(2).map((c) => [c.method, c.args[2]])).toEqual([
       ['editMessageText', { markdown: 'bad' }],
       ['editMessageText', 'bad'],
     ]);
   });
 
-  it('edits a rich message in the normal form when the host did not allow rich', async () => {
+  it('edits a message that was not sent rich in the normal form', async () => {
     const bot = fakeBot();
-    const id = await bot.run({ kind: 'chat', content: { text: table, rich: true } });
+    const id = await bot.run({ kind: 'chat', content: { text: '**old**' } });
     await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '**new**' } });
     expect(bot.calls[1]).toMatchObject({ method: 'editMessageText', other: { entities: [{ type: 'bold' }] } });
     expect(bot.calls[1].args.slice(0, 3)).toEqual([42, Number(id), 'new']);
@@ -406,7 +450,7 @@ describe('telegram outbound never sends twice', () => {
     );
     await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: '42:7', text: 'same' } });
     const id = await bot.run({ kind: 'chat', content: { text: '| a |', rich: true } });
-    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '| a |', rich: true } });
+    await bot.run({ kind: 'chat', content: { operation: 'edit', messageId: `42:${id}`, text: '| a |' } });
     expect(bot.calls.map((c) => c.method)).toEqual(['editMessageText', 'sendRichMessage', 'editMessageText']);
   });
 
