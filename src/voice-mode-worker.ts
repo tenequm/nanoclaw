@@ -1054,6 +1054,27 @@ export async function writeTurnRecording(root: string, record: TurnRecord, audio
   return base;
 }
 
+/** A turn recording's sidecar: the call, the turn's number and timing, and what it was heard as. */
+const turnRecordOf = (
+  meta: LiveKitJobMetadata,
+  turn: number,
+  audio: TurnAudio,
+  transcript: string,
+  outcome: { reason?: string; host?: SendResult } = {},
+): TurnRecord => ({
+  callId: meta.callId,
+  lineId: meta.lineId,
+  agent: meta.agentName,
+  turn,
+  startedAt: new Date(audio.startedAt).toISOString(),
+  endedAt: new Date(audio.endedAt).toISOString(),
+  speechMs: audio.speechMs,
+  truncated: audio.truncated,
+  sttModel: meta.sttModel,
+  transcript,
+  ...outcome,
+});
+
 /** A wake word detection in a call recording: where its scored window ended, and its score. */
 export interface CallWakeEvent {
   streamMs: number;
@@ -1077,8 +1098,8 @@ export interface CallRecord {
 const CALL_RECORDING_HEADER_MS = 5_000;
 
 /**
- * The caller's whole call as the worker heard it (16 kHz mono, the agent's lines as silence), waiting
- * included: `<root>/<agent>/<YYYY-MM-DD>/<callId>-call.wav` and `.json`, owner-only. Audio goes to
+ * The caller's whole call as the worker heard it (16 kHz mono; on a plain call the agent's lines as
+ * silence, on a jev call the caller's audio throughout), waiting included: `<root>/<agent>/<YYYY-MM-DD>/<callId>-call.wav` and `.json`, owner-only. Audio goes to
  * disk as it comes, in order; the header's sizes are rewritten every few seconds and at `close`.
  */
 export class CallRecording {
@@ -4830,6 +4851,8 @@ export interface JevLoopDeps {
   report(event: JevWorkerEvent): void;
   /** The caller's caption for the utterance numbered `segment`. */
   caption?(segment: number, text: string, final: boolean): void;
+  /** An utterance's audio and what it was heard as, for its recording; `reason` when it has no final. */
+  recorded?(segment: number, audio: TurnAudio, transcript: string, reason?: string): void;
   log: Pick<Console, 'info' | 'warn'>;
   now?: () => number;
 }
@@ -4879,17 +4902,21 @@ export class JevLoop {
   private playing?: JevPlayout;
   private pumping = false;
   private readonly wakers = new Set<() => void>();
+  private readonly capture?: TurnCapture;
   private closed = false;
 
   constructor(private readonly deps: JevLoopDeps) {
     this.now = deps.now ?? (() => Date.now());
+    if (deps.recorded && deps.transcriber) this.capture = new TurnCapture(this.now);
   }
 
   /** The caller's audio, every frame: kept for the pre-roll, and the open activity's. */
   audio(pcm: Int16Array): void {
     if (!this.deps.transcriber) return;
     this.ring.push(pcm);
-    if (this.utterance) this.deps.transcriber.push(pcm);
+    if (!this.utterance) return;
+    this.deps.transcriber.push(pcm);
+    this.capture?.push(pcm);
   }
 
   /** The VAD: the caller's speech started or ended at stream position `at`. */
@@ -4906,7 +4933,9 @@ export class JevLoop {
       this.speechOver = this.playing?.started ? this.playing : undefined;
       if (transcriber) {
         this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
-        transcriber.begin(this.ring.since(Math.max(0, at - samplesOf(PRE_ROLL_MS))));
+        const preRoll = this.ring.since(Math.max(0, at - samplesOf(PRE_ROLL_MS)));
+        transcriber.begin(preRoll);
+        this.capture?.start(preRoll);
         // The next activity's socket, set up while this one runs: no connect latency at the next speech.
         void transcriber.prepare();
       }
@@ -4927,17 +4956,23 @@ export class JevLoop {
     };
     this.speechOver = undefined;
     this.wake();
+    const audio = this.capture?.take(endedAt - this.speechSince);
     if (!utterance || !transcriber) return;
     transcriber.end().then(
       (heard) => {
-        if (this.closed) return;
         const { text } = turnText(heard);
         // Nothing heard and nothing shown: a noise, which the host never hears of.
         if (!text && !utterance.text) return;
+        // Recorded even when the call ended first: the last words before a hang-up are worth keeping.
+        if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text);
+        if (this.closed) return;
         this.deps.report({ type: 'utterance', uttId: utterance.uttId, text, final: true, at: this.now() });
         if (text) this.deps.caption?.(utterance.segment, text, true);
       },
-      (err: unknown) => this.deps.log.warn('voice-mode worker: an utterance has no final', { err }),
+      (err: unknown) => {
+        this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
+        if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'no final transcript');
+      },
     );
   }
 
@@ -5150,6 +5185,10 @@ interface JevCallSetup {
   providerKeys: ProviderKeys;
   callFields: Record<string, unknown>;
   transcriptDebug: boolean;
+  /** Where recordings go, and which are on: each utterance with the replies, and the whole call. Never a meeting's. */
+  recordings: string;
+  record: boolean;
+  recordCall: boolean;
 }
 
 /** The jev call's lifecycle: the room, the loop, the host's event stream and the end. */
@@ -5163,6 +5202,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   const hostLink = new AbortController();
   let ending = false;
   let callVoice: CallVoice | undefined;
+  let callRecording: CallRecording | undefined;
   let replies = 0;
   const reporter = new JevReporter((events) => host.post('jev', { events }), callLog);
   const languages = callLanguages(meta.languages);
@@ -5190,6 +5230,18 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     caption: (segment, text, final) => {
       if (!ending) callVoice?.caption(segment, text, final);
     },
+    ...(s.record
+      ? {
+          recorded: (segment, audio, transcript, reason) =>
+            void writeTurnRecording(
+              s.recordings,
+              turnRecordOf(meta, segment, audio, transcript, reason ? { reason } : {}),
+              audio,
+            ).catch((err: unknown) =>
+              callLog.warn('voice-mode worker: could not save a turn recording', { err, turn: segment }),
+            ),
+        }
+      : {}),
     log: callLog,
   });
   let ended: Promise<void> | undefined;
@@ -5210,24 +5262,44 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     await Promise.all([
       tellHost && host.tell('ended', restart ? { reason, restart } : { reason }),
       callVoice?.close().catch(() => undefined),
+      callRecording?.close(),
     ]);
     hostLink.abort();
     await ctx.deleteRoom().catch(() => undefined);
     ctx.shutdown(reason);
   };
+  if (s.recordCall) {
+    callRecording = new CallRecording(
+      s.recordings,
+      { callId: meta.callId, lineId: meta.lineId, agent: meta.agentName },
+      callLog,
+    );
+  }
   try {
     callVoice = await deps.createVoice(
       ctx,
       meta,
       {
         providerKeys: s.providerKeys,
+        ...(s.record ? { recordReplies: true } : {}),
         ...(envSwitch(deps.env.VOICE_MODE_TTS_DEESS) ? { deess: true } : {}),
         ...(envSwitch(deps.env.VOICE_MODE_TTS_NOTCH) ? { notch: true } : {}),
         ...(deps.voiceNames ? { voiceDetails: (choice) => deps.voiceNames!.details(choice) } : {}),
-        spoke: (line) => telemetry.reply({ reply: ++replies, kind: 'reply', ...line }),
+        spoke: (line, pcm) => {
+          const reply = ++replies;
+          if (pcm) {
+            void writeReplyRecording(s.recordings, { agent: meta.agentName, callId: meta.callId }, reply, pcm).catch(
+              (err: unknown) => callLog.warn('voice-mode worker: could not save a reply recording', { err, reply }),
+            );
+          }
+          telemetry.reply({ reply, kind: 'reply', ...line, ...(pcm ? { recorded: true } : {}) });
+        },
       },
       {
-        onAudio: (pcm) => loop.audio(pcm),
+        onAudio: (pcm) => {
+          loop.audio(pcm);
+          callRecording?.push(pcm);
+        },
         onVad: () => undefined,
         onSpeech: (speaking, at) => loop.onSpeech(speaking, at),
         onAgentSpeaking: (speaking) => loop.onAgentSpeaking(speaking),
@@ -5237,6 +5309,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   } catch (err) {
     loop.close();
     transcriber?.close();
+    await callRecording?.close();
     return s.abandon('could not set up the call audio', { err });
   }
   callLog.info('voice-mode worker: a jev call', {
@@ -5445,6 +5518,9 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       providerKeys,
       callFields,
       transcriptDebug,
+      recordings,
+      record,
+      recordCall,
     });
   }
 
@@ -5653,21 +5729,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     outcome: { reason?: string; host?: SendResult },
   ) => {
     if (!audio) return;
-    const record: TurnRecord = {
-      callId: meta.callId,
-      lineId: meta.lineId,
-      agent: meta.agentName,
-      turn: index,
-      startedAt: new Date(audio.startedAt).toISOString(),
-      endedAt: new Date(audio.endedAt).toISOString(),
-      speechMs: audio.speechMs,
-      truncated: audio.truncated,
-      sttModel: meta.sttModel,
-      transcript,
-      ...outcome,
-    };
-    void writeTurnRecording(recordings, record, audio).catch((err: unknown) =>
-      callLog.warn('voice-mode worker: could not save a turn recording', { err, turn: index }),
+    void writeTurnRecording(recordings, turnRecordOf(meta, index, audio, transcript, outcome), audio).catch(
+      (err: unknown) => callLog.warn('voice-mode worker: could not save a turn recording', { err, turn: index }),
     );
   };
   /**
