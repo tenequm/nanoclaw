@@ -644,7 +644,10 @@ describe('a replacement wake', () => {
     expect(only(commands, 'revoke')).toEqual([{ kind: 'revoke', replyId: 'r1' }]);
     expect(call.lastLog('reply')).toMatchObject({ replyId: 'r1', outcome: 'revoked' });
     // The worker drops it before its first audio and reports it cut off with nothing delivered.
+    call.statuses = [];
     call.feed({ kind: 'playback', replyId: 'r1', state: 'cut_off', delivered: '' });
+    // The old line is gone, the agent still works on the new turn: never `idle` here.
+    expect(call.statuses.map((s) => s.status)).toEqual(['thinking']);
     const jev = toJevState(call.state);
     expect(jev.window.some((l) => l.agent)).toBe(false);
     expect(jev.facts).toMatchObject({ agent_speaking: false, pending_answer: true, cut_off_after: null });
@@ -990,6 +993,22 @@ describe('room size and probability-only routing', () => {
 });
 
 describe('one caller', () => {
+  it('says idle once the line of the latest turn played out, and thinking while a newer turn still waits', () => {
+    const call = new Call();
+    const replyId = wakeAndSpeak(call, 'what time is it?', 'Noon.', 1);
+    // A short remark while the line plays wakes a second turn; the first line then ends.
+    const [second] = only(call.sayAnswered(misha, 'u2', 'and in Kyiv?'), 'turn');
+    call.feed({ kind: 'turn', key: second.key, turnId: 't2' });
+    call.statuses = [];
+    call.feed({ kind: 'playback', replyId, state: 'completed' });
+    expect(call.statuses.map((s) => s.status)).toEqual(['thinking']);
+    call.feed({ kind: 'reply', replyId: 'r2', turnId: 't2', text: 'Two in the afternoon.' });
+    call.feed({ kind: 'playback', replyId: 'r2', state: 'started' });
+    call.statuses = [];
+    call.feed({ kind: 'playback', replyId: 'r2', state: 'completed' });
+    expect(call.statuses.map((s) => s.status)).toEqual(['idle']);
+  });
+
   const silentWith = (call: Call, windowVersion: number, answer: number) =>
     call.feed({
       kind: 'verdict',

@@ -206,11 +206,15 @@ export function agentSpeaking(state: CallState): boolean {
 /** A person is speaking now (on a voice call, the caller). */
 export const floorTaken = (state: CallState): boolean => Object.values(state.speakers).some((s) => s.speaking);
 
-/** An answer is on its way: the latest wake awaits its reply (and no stop came), or a reply is still to play. */
-export function pendingAnswer(state: CallState): boolean {
-  if (Object.keys(state.playout).length > 0 || state.recheck !== null) return true;
+/** The latest wake still waits on the agent: no reply yet, not dropped, and no stop since. */
+export function awaitingAgent(state: CallState): boolean {
   const wake = latestWake(state);
   return !!wake && !wake.dropped && !wake.replied && (state.stoppedSeq === null || state.stoppedSeq < wake.seq);
+}
+
+/** An answer is on its way: the latest wake awaits its reply (and no stop came), or a reply is still to play. */
+export function pendingAnswer(state: CallState): boolean {
+  return Object.keys(state.playout).length > 0 || state.recheck !== null || awaitingAgent(state);
 }
 
 /**

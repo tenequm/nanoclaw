@@ -7,6 +7,7 @@ import type { Action, CallEvent, Command, RecheckVerdict, Verdict } from './type
 import {
   agentSpeaking,
   applyWindow,
+  awaitingAgent,
   floorTaken,
   hasWords,
   humansInRoom,
@@ -101,7 +102,11 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       break;
     case 'playback': {
       const playing = prev.playout[event.replyId] ?? prev.stoppedPlayout[event.replyId];
-      if (playing) out.push({ kind: 'status', status: event.state === 'started' ? 'speaking' : 'idle' });
+      // An older line that ends, or was revoked, says nothing about the turn the agent still works on.
+      if (playing) {
+        const over = awaitingAgent(state) ? 'thinking' : 'idle';
+        out.push({ kind: 'status', status: event.state === 'started' ? 'speaking' : over });
+      }
       if (playing && event.state !== 'started') logPlayback(state, event, playing.wakeKey);
       break;
     }

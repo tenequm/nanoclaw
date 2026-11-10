@@ -2571,7 +2571,7 @@ describe('/voice jev on the call core', () => {
     worker.close();
   });
 
-  it('sends a jev call no thinking or working, and does not mark its chat copies as spoken', async () => {
+  it("sends a jev voice call the agent's thinking ticks but no working, and does not mark its chat copies as spoken", async () => {
     const worker = await startJevCall();
     liveKitChatTyping({ channelType: 'telegram', platformId: 'telegram:100', threadId: null }, 'ag-andy', true);
     const presented = liveKitChatPresentation(
@@ -2581,7 +2581,8 @@ describe('/voice jev on the call core', () => {
     );
     expect(presented).toBeNull();
     await settle();
-    expect(worker.events.filter((e) => e.type === 'thinking' || e.type === 'working')).toEqual([]);
+    // The worker holds its typing sound on the tick; the loop, not the tick, decides what is spoken.
+    expect(worker.events.filter((e) => e.type === 'thinking' || e.type === 'working')).toEqual([{ type: 'thinking' }]);
     worker.close();
   });
 

@@ -10,7 +10,8 @@
  * its VAD marks (the meeting's mixed audio) are logged, never a boundary.
  *
  * On a jev call the host pushes the worker only what the core says to: a `reply` (with its `replyId`)
- * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`. `show` and `drop` push nothing: the agent's message is
+ * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`, and on a voice call each `status`.
+ * `show` and `drop` push nothing: the agent's message is
  * already in the call chat, since a reply reaches this module from the post-delivery hook.
  */
 import { DataPacket_Kind, RoomServiceClient } from 'livekit-server-sdk';
@@ -62,6 +63,7 @@ export interface JevDeps {
 }
 
 export interface JevCall {
+  readonly kind: CallKind;
   /** A worker POST's events, in order; malformed ones are skipped. */
   workerEvents(raw: readonly unknown[]): { accepted: number; dropped: number };
   /** A `meet` call's transcript event (a participant's pipeline, on the host clock); ignored on a `voice` call. */
@@ -103,6 +105,8 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const runtime: CallRuntime = createCallRuntime(core, policy, {
     now: host.now,
     status: (status) => {
+      // A voice call's worker plays its cues from it; a meeting shows it on the bot's tile only.
+      if (kind === 'voice') host.push({ type: 'status', status });
       if (!statusRoom) return;
       statusSend = statusSend
         .then(async () => {
@@ -187,6 +191,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   });
 
   return {
+    kind,
     workerEvents(raw) {
       const { events, dropped } = ingress.convert(raw, host.now());
       if (dropped > 0) log.warn('meet-jev: malformed worker events skipped', { ...fields, dropped });
