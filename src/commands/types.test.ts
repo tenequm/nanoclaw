@@ -18,7 +18,7 @@ describe('resolveModelInput', () => {
     expect(resolveModelInput('sonnet-5')).toEqual({ ok: true, id: 'claude-sonnet-5', label: 'Sonnet 5' });
     expect(resolveModelInput('fable')).toEqual({ ok: true, id: 'claude-fable-5', label: 'Fable 5' });
     expect(resolveModelInput('opus-5.5')).toEqual({ ok: true, id: 'claude-opus-5-5', label: 'Opus 5.5' });
-    expect(resolveModelInput('fable-5.1')).toEqual({ ok: true, id: 'claude-fable-5-1', label: 'Fable 5.1' });
+    expect(resolveModelInput('fable-5.2')).toEqual({ ok: true, id: 'claude-fable-5-2', label: 'Fable 5.2' });
   });
 
   it('is case-insensitive and trims whitespace on aliases', () => {
@@ -57,7 +57,7 @@ describe('resolveModelInput', () => {
 
 describe('modelLabelFor / describeModel', () => {
   it('labels catalogued ids and nulls the rest', () => {
-    expect(modelLabelFor('claude-fable-5-1')).toBe('Fable 5.1');
+    expect(modelLabelFor('claude-fable-5-2')).toBe('Fable 5.2');
     expect(modelLabelFor('claude-opus-4-6')).toBeNull();
   });
 
@@ -109,7 +109,7 @@ describe('MODEL_CATALOG shape', () => {
       { alias: 'opus', label: 'Opus 5', id: 'claude-opus-5' },
       { alias: 'opus-5.5', label: 'Opus 5.5', id: 'claude-opus-5-5' },
       { alias: 'fable', label: 'Fable 5', id: 'claude-fable-5' },
-      { alias: 'fable-5.1', label: 'Fable 5.1', id: 'claude-fable-5-1' },
+      { alias: 'fable-5.2', label: 'Fable 5.2', id: 'claude-fable-5-2' },
     ]);
   });
 });
