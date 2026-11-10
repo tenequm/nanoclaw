@@ -23,10 +23,11 @@ Shape of the rebuilt feature (all in the COPY set):
   `jev` meeting, and a meeting records nothing. A jev voice call records each utterance, each
   reply and (with `VOICE_MODE_CALL_RECORDING`) the whole call, and plays the listening, typing
   and your-turn cues through the shared `callCues` helper, typing held through `JevLoop.preparing`.
-- Host `src/modules/meet-jev/`: `policy.ts`'s `oneCaller` block (join gap, `speak` 0.3, `continue`
-  0.5) and `nameAlone` in `core/decide.ts` apply only to a voice call; `index.ts` pushes `status` to
-  the worker only on a voice call, and `voice-mode-livekit.ts`'s `chatTyping`
-  pushes `thinking` on the agent's typing ticks.
+- Host `src/modules/meet-jev/`: `policy.ts`'s `oneCaller` block (its paragraph, the join gap,
+  `speak` 0.3, `continue` 0.5) and `nameAlone` in `core/decide.ts` apply whenever
+  `humansInRoom(state) <= 1`, in a voice call or a meeting down to one person; `index.ts` pushes
+  `status` to the worker only on a voice call, and `voice-mode-livekit.ts`'s `chatTyping` pushes
+  `thinking` on the agent's typing ticks.
 
 Depends on: 1 (`registerResidentSkillGate`), 2 (`platformMessageId`, `resolveSenderRole`, the
 `senderRole` parameter of `deliverToAgent`), 3 (typing module with `notePresence`/turn state, the 7th

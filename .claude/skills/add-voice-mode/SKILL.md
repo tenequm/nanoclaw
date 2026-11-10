@@ -315,14 +315,15 @@ line to the wake phrase and send word until the caller sends `/voice` (or
 returns the line to jev. A client's `?jev=0` on `livekit/token` makes one call
 plain, and `?jev=1` one jev call. Without the key every call is plain.
 
-A jev voice call has one human in it, so its policy (`oneCaller` in
-`src/modules/meet-jev/policy.ts`) answers more readily than a meeting. The
-caller's pieces split by a pause are joined into one `latest`, back to their
-last answered turn or the agent's last line, across pauses up to 10 seconds.
-The agent answers when Jev gives `answer` a probability of at least 0.3 while
-the agent is idle and the top choice is not `stop` (0.5 when `answer` is the
-top choice), and `continue` takes 0.5. The agent's name alone ("Dan", "Hey
-Dan.") wakes it without a Jev call unless an answer is already on its way.
+With one human in the room (a jev voice call, or a meeting down to one
+person) the loop answers more readily, by the `oneCaller` block in
+`src/modules/meet-jev/policy.ts`. Jev gets the one-person policy paragraph.
+The caller's pieces split by a pause are joined into one `latest`, back to
+their last answered turn or the agent's last line, across pauses up to 10
+seconds. The agent answers when Jev gives `answer` a probability of at least
+0.3 while the agent is idle, whatever the top choice is unless it is `stop`,
+and `continue` takes 0.5. The agent's name alone ("Dan", "Hey Dan.") wakes it
+without a Jev call unless an answer is already on its way.
 
 A jev voice call plays three cues, by the plain call's `cues` and `typing`
 switches: listening once at call start; the typing sound and the "working"
