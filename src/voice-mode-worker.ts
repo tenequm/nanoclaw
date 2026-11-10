@@ -5144,6 +5144,11 @@ export class JevLoop {
     return !!this.playing || this.queue.length > 0;
   }
 
+  /** A line is on its way to the room: queued, or taken with its first audio not out yet. */
+  get preparing(): boolean {
+    return this.queue.length > 0 || (!!this.playing && !this.playing.started);
+  }
+
   close(): void {
     this.closed = true;
     clearTimeout(this.bargeTimer);
@@ -5303,8 +5308,10 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       thinkingTimer = setTimeout(refreshThinking, left + 1);
       thinkingTimer.unref?.();
     }
-    if (left > 0 === thinking) return;
-    thinking = left > 0;
+    // A reply on its way to the room is still the agent at work, until its first audio (a plain call's `replyComing`).
+    const on = voiceCall && (left > 0 || loop.preparing);
+    if (on === thinking) return;
+    thinking = on;
     callVoice?.setThinking(thinking);
     updateTyping();
   };
@@ -5339,6 +5346,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     report: (event) => {
       if (ending) return;
       reporter.report(event);
+      if (event.type === 'playback') refreshThinking();
       // Over to the caller once the queue drained, if any line of it played out (as a plain call's `spokenAll`).
       if (event.type !== 'playback' || event.state === 'started') return;
       if (event.state === 'completed') heardLine = true;
@@ -5438,6 +5446,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
           agentSpeaking = speaking;
           updateTyping();
           loop.onAgentSpeaking(speaking);
+          refreshThinking();
         },
         onClosed: (reason) => void end(reason, true),
       },
@@ -5527,8 +5536,8 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         }
         // The answer came: what the agent types from here on is new work.
         awaitingUntil = typingUntil = 0;
-        refreshThinking();
         loop.onReply(event.replyId, event.text);
+        refreshThinking();
       } else if (event.type === 'stop') loop.onStop();
       else if (event.type === 'words') loop.onWords();
       else if (event.type === 'revoke') loop.onRevoke(event.replyId);
