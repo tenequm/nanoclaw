@@ -16,7 +16,7 @@
  *   - ask_question     ({ type: 'ask_question', questionId, title, question?, options })
  *
  * A default message or media group carries `reply_parameters` on its first
- * send when the host marked it `threadReply` (see delivery.ts).
+ * send when it is shown as a reply (see `replyParametersFor`).
  */
 import path from 'path';
 
@@ -29,6 +29,7 @@ import type {
   InputMediaPhoto,
   InputMediaVideo,
   ReplyParameters,
+  Update,
 } from 'grammy/types';
 
 import type { OutboundFile, OutboundMessage } from '../adapter.js';
@@ -64,7 +65,7 @@ function mediaKindFromFilename(filename: string): MediaKind {
 
 interface ContentView {
   text: string;
-  /** The host allowed a Rich Message (see `richAllowed` in src/delivery.ts). */
+  /** The agent asked for a Rich Message; `send_message` already checked the limits. */
   rich: boolean;
   isEdit: boolean;
   editMessageId?: string;
@@ -115,15 +116,37 @@ function viewContent(message: OutboundMessage): ContentView {
 }
 
 /**
- * `reply_parameters` for a message the host decided to show as a reply:
- * `content.threadReply` is set and `inReplyTo` names a message in this chat.
+ * Highest new inbound message id per platformId (chat plus topic). Telegram
+ * ids increase per chat, so a reply target below it has a newer message after
+ * it. Wiped by a host restart: until the next inbound, only an explicit reply
+ * shows a reply box.
  */
-function replyParametersFor(message: OutboundMessage, chatId: number): ReplyParameters | undefined {
-  const thread = (message.content as Record<string, unknown> | null | undefined)?.threadReply;
-  if (!message.inReplyTo || typeof thread !== 'object' || thread === null) return undefined;
+const latestInbound = new Map<string, number>();
+
+/** Record an inbound update handed to the host; only `message` is a new message, not an edit or a reaction. */
+export function rememberInboundMessage(update: Update, platformId: string): void {
+  const messageId = update.message?.message_id;
+  if (messageId === undefined) return;
+  if (messageId > (latestInbound.get(platformId) ?? -Infinity)) latestInbound.set(platformId, messageId);
+}
+
+export function _clearLatestInboundForTest(): void {
+  latestInbound.clear();
+}
+
+/**
+ * `reply_parameters` when `inReplyTo` names a message in this chat and the
+ * agent asked for the reply (`replyIntent`, with its optional quote), or a
+ * newer message came in after the target.
+ */
+function replyParametersFor(message: OutboundMessage, platformId: string, chatId: number): ReplyParameters | undefined {
+  if (!message.inReplyTo) return undefined;
   const parsed = extractTelegramMessageId(message.inReplyTo, chatId);
   if (!parsed || parsed.chatId !== chatId) return undefined;
-  const quote = (thread as { quote?: unknown }).quote;
+  const intent = (message.content as Record<string, unknown> | null | undefined)?.replyIntent;
+  const explicit = typeof intent === 'object' && intent !== null;
+  if (!explicit && !((latestInbound.get(platformId) ?? -Infinity) > parsed.messageId)) return undefined;
+  const quote = explicit ? (intent as { quote?: unknown }).quote : undefined;
   return {
     message_id: parsed.messageId,
     allow_sending_without_reply: true,
@@ -537,9 +560,8 @@ const editRich = (
   });
 
 /**
- * Edit a message the bot sent. A Rich Message is edited in the rich form while
- * the host allows it (`rich`, the group's toggle), otherwise as a normal
- * message; a media message gets its caption edited (known from what was sent, or learned
+ * Edit a message the bot sent. A Rich Message is edited in the rich form,
+ * anything else as a normal message; a media message gets its caption edited (known from what was sent, or learned
  * from Telegram's "no text" answer). Text beyond the message's limit is sent
  * right after as new messages, so each long edit appends a fresh tail.
  */
@@ -548,7 +570,6 @@ const editMessage = Effect.fn('telegram-grammy.editMessage')(function* (
   messageThreadId: number | undefined,
   compound: string,
   text: string,
-  rich: boolean,
 ) {
   const parsed = extractTelegramMessageId(compound, chatId);
   if (!parsed) {
@@ -564,7 +585,7 @@ const editMessage = Effect.fn('telegram-grammy.editMessage')(function* (
     return undefined;
   }
   const kind = sentKinds.get(parsed.chatId, parsed.messageId);
-  if (kind === 'rich' && rich && (yield* editRich(parsed.chatId, parsed.messageId, text))) return undefined;
+  if (kind === 'rich' && (yield* editRich(parsed.chatId, parsed.messageId, text))) return undefined;
   const fs = renderFS(text);
   const rest =
     kind === 'media'
@@ -605,10 +626,8 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
   // input Telegram would reject is nearest-matched, and only unmappable input
   // is dropped (the alternative is a guaranteed REACTION_INVALID 400 from the
   // Bot API). See resolveReactionEmoji for the slug map, the fallback table
-  // and the rationale. Delivery resolves the same way before it gets here (so
-  // it can tell the agent what happened, which this seam cannot); resolving
-  // again is the last line against a future caller that reaches `deliver`
-  // without going through the host's reaction guard.
+  // and the rationale. `add_reaction` already refuses a glyph outside the set;
+  // slug names arrive unresolved, so this is where they are matched.
   const reactions: Array<{ type: 'emoji'; emoji: TelegramReactionEmoji }> = [];
   if (emoji) {
     const { glyph } = resolveReactionEmoji(emoji);
@@ -797,12 +816,12 @@ export const dispatchOutbound = Effect.fn('telegram-grammy.dispatchOutbound')(fu
   const messageThreadId = resolveMessageThreadId(platformId, threadId);
   const topicScoped = parseTopicId(platformId) !== undefined;
   const files = message.files ?? [];
-  const reply = replyParametersFor(message, chatId);
+  const reply = replyParametersFor(message, platformId, chatId);
 
   let result: string | undefined = undefined;
 
   if (view.isEdit && view.editMessageId != null) {
-    result = yield* editMessage(chatId, messageThreadId, view.editMessageId, view.text, view.rich);
+    result = yield* editMessage(chatId, messageThreadId, view.editMessageId, view.text);
   } else if (view.isReaction && view.reactionMessageId != null) {
     result = yield* reactToMessage(chatId, view.reactionMessageId, view.reactionEmoji);
   } else if (view.isMediaGroup && view.mediaGroupItems) {

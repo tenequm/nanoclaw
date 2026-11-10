@@ -79,6 +79,41 @@ function resolveSeqTarget(
 
 const MAX_QUOTE_LENGTH = 1024;
 
+const TELEGRAM_CHANNEL = 'telegram';
+const RICH_MAX_CHARS = 32768;
+const RICH_MAX_TABLE_COLUMNS = 20;
+const RICH_MAX_LINES = 500;
+
+function tableCells(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((cell) => cell.trim());
+}
+
+function isTableDelimiter(line: string): boolean {
+  return line.includes('|') && tableCells(line).every((cell) => /^:?-+:?$/.test(cell));
+}
+
+/** Simple upper bounds on Telegram's Rich Message limits; whatever slips through hits the adapter's fallback. */
+function richLimitError(text: string): string | null {
+  const chars = [...text].length;
+  if (chars > RICH_MAX_CHARS) return `rich text is ${chars} characters; the limit is ${RICH_MAX_CHARS}`;
+  const lines = text.split('\n');
+  for (let i = 1; i < lines.length; i++) {
+    if (!isTableDelimiter(lines[i])) continue;
+    const columns = tableCells(lines[i - 1]).length;
+    if (columns > RICH_MAX_TABLE_COLUMNS) {
+      return `a rich table has ${columns} columns; the limit is ${RICH_MAX_TABLE_COLUMNS}`;
+    }
+  }
+  const nonEmpty = lines.filter((line) => line.trim()).length;
+  if (nonEmpty > RICH_MAX_LINES) return `rich text has ${nonEmpty} non-empty lines; the limit is ${RICH_MAX_LINES}`;
+  return null;
+}
+
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
@@ -100,6 +135,10 @@ export const sendMessage: McpToolDefinition = {
           type: 'string',
           description: `Part of the replied message to highlight, copied verbatim from its text (max ${MAX_QUOTE_LENGTH} chars). Dropped if it does not match.`,
         },
+        rich: {
+          type: 'boolean',
+          description: `Telegram only: send as a Rich Message, with real tables, headings, task lists and collapsible <details> blocks. Limits: ${RICH_MAX_CHARS} characters, ${RICH_MAX_TABLE_COLUMNS} table columns, ${RICH_MAX_LINES} non-empty lines; a message over them is refused, so split it or drop rich. Single line breaks collapse there, so separate lines with a blank line. Leave it off for normal chat; other channels ignore it.`,
+        },
       },
       required: ['to', 'text'],
     },
@@ -113,8 +152,14 @@ export const sendMessage: McpToolDefinition = {
     const routing = resolveRouting(to);
     if ('error' in routing) return err(routing.error);
 
-    // An explicit reply_to or quote always shows as a reply; the host decides
-    // for the default one (see resolveThreadReply in src/delivery.ts).
+    const rich = args.rich === true && routing.channel_type === TELEGRAM_CHANNEL;
+    if (rich) {
+      const limit = richLimitError(text);
+      if (limit) return err(`${limit}. Split the message, or send it without rich.`);
+    }
+
+    // An explicit reply_to or quote always shows as a reply; the channel
+    // adapter decides for the default one.
     let inReplyTo = getCurrentInReplyTo();
     const quote = typeof args.quote === 'string' && args.quote ? args.quote : undefined;
     if (quote && quote.length > MAX_QUOTE_LENGTH) return err(`quote is longer than ${MAX_QUOTE_LENGTH} characters`);
@@ -139,7 +184,7 @@ export const sendMessage: McpToolDefinition = {
       thread_id: routing.thread_id,
       content: JSON.stringify({
         text,
-        ...(args.rich === true && "rich" in (sendMessage.tool.inputSchema.properties ?? {}) ? { rich: true } : {}),
+        ...(rich ? { rich: true } : {}),
         ...(explicit ? { replyIntent: quote ? { quote } : {} } : {}),
       }),
     });
@@ -238,6 +283,15 @@ export const editMessage: McpToolDefinition = {
 const TELEGRAM_REACTION_GLYPHS =
   '👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡';
 
+const TELEGRAM_REACTION_SET = new Set(TELEGRAM_REACTION_GLYPHS.split(' '));
+
+/** Slug names (ASCII) pass through: the adapter resolves them, nearest-matching silently. */
+function isAllowedTelegramReaction(emoji: string): boolean {
+  const trimmed = emoji.trim();
+  if ([...trimmed].every((char) => char.codePointAt(0)! <= 0x7f)) return true;
+  return TELEGRAM_REACTION_SET.has(trimmed.replace(/\uFE0F/g, ''));
+}
+
 export const addReaction: McpToolDefinition = {
   tool: {
     name: 'add_reaction',
@@ -252,7 +306,7 @@ export const addReaction: McpToolDefinition = {
             'Reaction emoji. Pick one of the glyphs below — Telegram allows a FIXED reaction set for everyone in the chat, bots and humans alike, and rejects anything else. ' +
             `On Telegram the legal set is: ${TELEGRAM_REACTION_GLYPHS}. ` +
             'Semantic slugs naming one of those work too (thumbs_up, thumbs_down, heart, fire, party, eyes, ok_hand, salute, trophy, zap, rofl, pray, clap, ...), as do the same glyphs with a variation selector. ' +
-            'On Telegram anything outside the set (✅, 🚀, ❌, 💪, ⭐, ...) is nearest-matched to the closest allowed glyph and you are told what was sent instead; if nothing fits, the reaction is not sent and you are told that too. Channels with no fixed set forward your emoji untouched.',
+            'On Telegram a glyph outside the set (✅, 🚀, ❌, 💪, ⭐, ...) is refused with an error; pick an allowed one instead. Channels with no fixed set forward your emoji untouched.',
         },
       },
       required: ['messageId', 'emoji'],
@@ -266,6 +320,9 @@ export const addReaction: McpToolDefinition = {
     const target = resolveSeqTarget(seq);
     if ('error' in target) return err(target.error);
     const { messageId: platformId, routing } = target;
+    if (routing.channel_type === TELEGRAM_CHANNEL && !isAllowedTelegramReaction(emoji)) {
+      return err(`"${emoji}" is not an allowed Telegram reaction. Allowed: ${TELEGRAM_REACTION_GLYPHS}`);
+    }
 
     const id = generateId();
     await writeMessageOut({

@@ -13,11 +13,10 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { sendMediaGroup } from './media-group.js';
-import { offerRichMessages } from './rich-messages.js';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import { sendFile, sendMessage } from './core.js';
+import { addReaction, sendFile, sendMessage } from './core.js';
 
 /**
  * Publish the reply stamp the way the poll loop does: a direct write to
@@ -232,7 +231,7 @@ describe('send_message — reply_to and quote', () => {
     return { inReplyTo: row.in_reply_to, content: JSON.parse(row.content) };
   }
 
-  it('keeps the default reply target and leaves threading to the host', async () => {
+  it('keeps the default reply target and leaves threading to the adapter', async () => {
     await sendMessage.handler({ to: 'dm', text: 'hi' });
     expect(lastOut()).toEqual({ inReplyTo: '42:8:ag-1', content: { text: 'hi' } });
   });
@@ -332,19 +331,82 @@ describe('send_media_group MCP tool', () => {
 });
 
 describe('send_message - rich', () => {
-  const props = () => sendMessage.tool.inputSchema.properties as Record<string, unknown>;
+  const lastContent = () => JSON.parse(getUndeliveredMessages().at(-1)!.content) as Record<string, unknown>;
+  const send = (text: string, to = 'tg') =>
+    sendMessage.handler({ to, text, rich: true }) as Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+
+  beforeEach(() => seedChannelDestination('tg', 'telegram', 'telegram:42'));
+
+  it('always offers rich and stores it only for a Telegram destination', async () => {
+    expect((sendMessage.tool.inputSchema.properties as Record<string, unknown>).rich).toMatchObject({ type: 'boolean' });
+    await send('| a |');
+    expect(lastContent()).toEqual({ text: '| a |', rich: true });
+    await send('| a |', 'peer');
+    expect(lastContent()).toEqual({ text: '| a |' });
+    await sendMessage.handler({ to: 'tg', text: 'plain' });
+    expect(lastContent()).toEqual({ text: 'plain' });
+  });
+
+  it('refuses text over 32768 code points and names the measured length', async () => {
+    const result = await send('😀'.repeat(32769));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('32769 characters; the limit is 32768');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect((await send('😀'.repeat(32768))).isError).toBeUndefined();
+  });
+
+  it('refuses a table whose header row has more than 20 cells', async () => {
+    const table = (n: number) =>
+      `intro\n\n| ${Array.from({ length: n }, (_, i) => `c${i}`).join(' | ')} |\n|${'---|'.repeat(n)}\n| x |`;
+    const result = await send(table(21));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('21 columns; the limit is 20');
+    expect((await send(table(20))).isError).toBeUndefined();
+    // Pipes outside a table are not counted.
+    expect((await send(`${'a | '.repeat(30)}\n\nno delimiter`)).isError).toBeUndefined();
+  });
+
+  it('refuses more than 500 non-empty lines, not counting blank ones', async () => {
+    const result = await send(Array.from({ length: 501 }, (_, i) => `line ${i}`).join('\n'));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('501 non-empty lines; the limit is 500');
+    expect((await send(Array.from({ length: 500 }, (_, i) => `line ${i}`).join('\n\n'))).isError).toBeUndefined();
+  });
+
+  it('does not check limits for a destination that ignores rich', async () => {
+    expect((await send('a'.repeat(40000), 'peer')).isError).toBeUndefined();
+  });
+});
+
+describe('add_reaction - Telegram glyphs', () => {
+  const react = (emoji: string, messageId = 2) =>
+    addReaction.handler({ messageId, emoji }) as Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
   const lastContent = () => JSON.parse(getUndeliveredMessages().at(-1)!.content) as Record<string, unknown>;
 
-  it('offers rich only once the group may send Rich Messages, and only then writes it', async () => {
-    expect(props().rich).toBeUndefined();
-    await sendMessage.handler({ to: 'peer', text: '| a |', rich: true });
-    expect(lastContent()).toEqual({ text: '| a |' });
+  beforeEach(() => {
+    seedInbound('42:7:ag-1', 'telegram', 'telegram:42', null);
+    seedInbound('s:1:ag-1', 'slack', 'slack:C1', null);
+  });
 
-    offerRichMessages();
-    expect(props().rich).toMatchObject({ type: 'boolean' });
-    await sendMessage.handler({ to: 'peer', text: '| a |', rich: true });
-    expect(lastContent()).toEqual({ text: '| a |', rich: true });
-    await sendMessage.handler({ to: 'peer', text: 'plain' });
-    expect(lastContent()).toEqual({ text: 'plain' });
+  it('accepts an allowed glyph, with or without a variation selector', async () => {
+    expect((await react('👍')).isError).toBeUndefined();
+    expect((await react('❤️')).isError).toBeUndefined();
+    expect((await react('❤️‍🔥')).isError).toBeUndefined();
+    expect(lastContent()).toEqual({ operation: 'reaction', messageId: '42:7:ag-1', emoji: '❤️‍🔥' });
+  });
+
+  it('refuses a glyph outside the set and lists the allowed ones', async () => {
+    const result = await react('🚀');
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('"🚀" is not an allowed Telegram reaction');
+    expect(result.content[0].text).toContain('👍 👎 ❤');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('passes slug names through and leaves other channels alone', async () => {
+    expect((await react('thumbs_up')).isError).toBeUndefined();
+    expect(lastContent().emoji).toBe('thumbs_up');
+    expect((await react('🚀', 4)).isError).toBeUndefined();
+    expect(lastContent().emoji).toBe('🚀');
   });
 });

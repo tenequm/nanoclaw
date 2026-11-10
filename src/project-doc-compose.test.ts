@@ -646,7 +646,6 @@ describe('Telegram project sections', () => {
   it('puts the formatting guide before the Rich messages section', async () => {
     const ag = await seed('ag-tg-order', 'tg-order-group');
     await wire(ag, 'mg-tg-order', 'telegram');
-    await updateContainerConfigScalars(ag.id, { rich_messages: 1 });
 
     const doc = await compose(ag);
 
@@ -655,19 +654,15 @@ describe('Telegram project sections', () => {
     expect(doc.indexOf(`# ${RICH_MESSAGES_SECTION}\n`)).toBeGreaterThan(formatting);
   });
 
-  it('composes the Rich Messages section only for a Telegram-wired agent with rich_messages on', async () => {
-    const on = await seed('ag-rich-on', 'rich-on-group');
-    await wire(on, 'mg-rich-on', 'telegram');
-    await updateContainerConfigScalars(on.id, { rich_messages: 1 });
-    expect(composedSection(await compose(on), RICH_MESSAGES_SECTION)).toContain(RICH_MESSAGES_BODY);
-
-    const off = await seed('ag-rich-off', 'rich-off-group');
-    await wire(off, 'mg-rich-off', 'telegram');
-    expect(await compose(off)).not.toContain(`# ${RICH_MESSAGES_SECTION}`);
+  it('composes the Rich Messages section, with its limits, for every Telegram-wired agent only', async () => {
+    const tg = await seed('ag-rich-tg', 'rich-tg-group');
+    await wire(tg, 'mg-rich-tg', 'telegram');
+    const section = composedSection(await compose(tg), RICH_MESSAGES_SECTION);
+    expect(section).toContain(RICH_MESSAGES_BODY);
+    expect(section).toContain('32768 characters, 20 table columns and 500 non-empty lines');
 
     const slackOnly = await seed('ag-rich-slack', 'rich-slack-group');
     await wire(slackOnly, 'mg-rich-slack', 'slack');
-    await updateContainerConfigScalars(slackOnly.id, { rich_messages: 1 });
     expect(await compose(slackOnly)).not.toContain(`# ${RICH_MESSAGES_SECTION}`);
   });
 });

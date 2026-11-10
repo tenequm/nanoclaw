@@ -4,14 +4,7 @@
  * Channels self-register on import. The host calls initChannelAdapters() at startup
  * to instantiate and set up all registered adapters.
  */
-import type {
-  ChannelAdapter,
-  ChannelDefaults,
-  ChannelRegistration,
-  ChannelSetup,
-  OutboundFile,
-  ResolvedReaction,
-} from './adapter.js';
+import type { ChannelAdapter, ChannelDefaults, ChannelRegistration, ChannelSetup, OutboundFile } from './adapter.js';
 import type { ChannelDeliveryAdapter } from '../delivery.js';
 import { log } from '../log.js';
 
@@ -157,16 +150,6 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
     },
     typingRequiresThread(channelType: string, instance?: string): boolean {
       return getChannelAdapterExact(instance ?? channelType)?.typingRequiresThread === true;
-    },
-    threadsReplies(channelType, instance) {
-      return getChannelAdapterExact(instance ?? channelType)?.threadsReplies === true;
-    },
-    resolveReaction(channelType: string, emoji: string, instance?: string): ResolvedReaction | undefined {
-      // undefined = the platform has no fixed reaction set (or its adapter is
-      // offline, in which case deliver() throws into the retry path anyway) —
-      // delivery forwards the agent's emoji untouched.
-      const adapter = getChannelAdapterExact(instance ?? channelType);
-      return adapter?.resolveReaction?.(emoji);
     },
     async setTyping(
       channelType: string,

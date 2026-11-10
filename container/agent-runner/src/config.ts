@@ -20,7 +20,6 @@ export interface RunnerConfig {
   mcpServers: Record<string, McpServerConfig>;
   model?: string;
   effort?: string;
-  richMessages: boolean;
   speed?: ProviderSpeed;
 }
 
@@ -59,7 +58,6 @@ export function runnerConfigFromRaw(raw: Record<string, unknown>): RunnerConfig 
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,
     speed: readSpeed(raw),
-    richMessages: raw.richMessages === true,
   };
 }
 
