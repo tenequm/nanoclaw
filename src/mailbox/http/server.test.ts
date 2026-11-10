@@ -4,11 +4,12 @@ import os from 'os';
 import path from 'path';
 
 import Database from 'better-sqlite3';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ensureSchema } from '../sqlite/session-db.js';
+import { log } from '../../log.js';
 import type { RunnerSnapshot } from './runner-ops.js';
-import { createMailboxHttpServer, MAILBOX_HTTP_PATH } from './server.js';
+import { createMailboxHttpServer, MAILBOX_HTTP_PATH, type MailboxCommitListener } from './server.js';
 
 const KEY = { agentGroupId: 'ag-1', sessionId: 'sess-1' };
 const TOKEN = 'a'.repeat(64);
@@ -19,6 +20,7 @@ let base: string;
 let inboundPath: string;
 let outboundPath: string;
 let heartbeatPath: string;
+let onCommitted: MailboxCommitListener | undefined;
 
 function post(
   ops: unknown,
@@ -73,12 +75,14 @@ beforeEach(async () => {
   inboundPath = path.join(dir, 'inbound.db');
   outboundPath = path.join(dir, 'outbound.db');
   heartbeatPath = path.join(dir, '.heartbeat');
+  onCommitted = undefined;
   ensureSchema(inboundPath, 'inbound');
   ensureSchema(outboundPath, 'outbound');
   server = createMailboxHttpServer({
     exists: async (key) => key.agentGroupId === KEY.agentGroupId && key.sessionId === KEY.sessionId,
     verifyToken: (key, token) => key.sessionId !== 'unauthorized' && token === TOKEN,
     paths: () => ({ inbound: inboundPath, outbound: outboundPath, heartbeat: heartbeatPath }),
+    onCommitted: (key, calls) => onCommitted?.(key, calls),
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address() as { port: number };
@@ -268,5 +272,45 @@ describe('mailbox HTTP server: operations', () => {
         ])
       ).status,
     ).toBe(200);
+  });
+});
+
+describe('mailbox HTTP server: commit listener', () => {
+  it('reports a committed batch with its key and calls, and never a failed one', async () => {
+    const seen: unknown[] = [];
+    onCommitted = (key, calls) => {
+      // Committed and closed: a fresh connection already sees the row.
+      const db = new Database(outboundPath, { readonly: true });
+      seen.push({ key, calls, rows: db.prepare('SELECT COUNT(*) AS n FROM messages_out').get() });
+      db.close();
+    };
+    const write = { op: 'writeMessageOut', args: [{ id: 'out-1', kind: 'chat', content: 'x' }] };
+    const turn = { op: 'markContainerTurn', args: ['working'] };
+    expect((await call([write, turn])).status).toBe(200);
+    expect(seen).toEqual([{ key: KEY, calls: [write, turn], rows: { n: 1 } }]);
+
+    expect((await call([turn, { op: 'markMessages', args: [['m'], 'nope'] }])).status).toBe(400);
+    expect((await call([{ op: 'dropTables' }])).status).toBe(400);
+    expect(seen).toHaveLength(1);
+  });
+
+  it('answers the batch even when the listener throws', async () => {
+    const logSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    onCommitted = () => {
+      throw new Error('listener exploded');
+    };
+    try {
+      const { status, results } = await call([
+        { op: 'writeMessageOut', args: [{ id: 'out-1', kind: 'chat', content: 'x' }] },
+      ]);
+      expect(status).toBe(200);
+      expect(results).toEqual([1]);
+      expect(logSpy).toHaveBeenCalledWith(
+        'Mailbox commit listener failed',
+        expect.objectContaining({ sessionId: 'sess-1' }),
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });

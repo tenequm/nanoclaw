@@ -38,7 +38,11 @@ interface MailboxHttpServerOptions {
   exists(key: MailboxSessionKey): Promise<boolean>;
   verifyToken(key: MailboxSessionKey, token: string): boolean;
   paths(key: MailboxSessionKey): { inbound: string; outbound: string; heartbeat: string };
+  /** Runs once a batch has committed and both databases are closed; a throw is logged, never answered. */
+  onCommitted?: MailboxCommitListener;
 }
+
+export type MailboxCommitListener = (key: MailboxSessionKey, calls: readonly RunnerOpCall[]) => void;
 
 class HttpError extends Error {
   constructor(
@@ -130,6 +134,7 @@ export function createMailboxHttpServer(options: MailboxHttpServerOptions): http
     const paths = options.paths(key);
     const inbound = new Database(paths.inbound, { readonly: true });
     let outbound: Database.Database | undefined;
+    let results: unknown[];
     try {
       inbound.pragma('busy_timeout = 5000');
       outbound = openOutbound(paths.outbound);
@@ -137,11 +142,17 @@ export function createMailboxHttpServer(options: MailboxHttpServerOptions): http
         ensureRunnerOutboundTables(outbound);
         prepared.add(paths.outbound);
       }
-      return executeRunnerOps({ inbound, outbound, touchHeartbeat: () => touch(paths.heartbeat) }, calls);
+      results = executeRunnerOps({ inbound, outbound, touchHeartbeat: () => touch(paths.heartbeat) }, calls);
     } finally {
       inbound.close();
       outbound?.close();
     }
+    try {
+      options.onCommitted?.(key, calls);
+    } catch (err) {
+      log.error('Mailbox commit listener failed', { sessionId, err });
+    }
+    return results;
   }
 
   return http.createServer((req, res) => {
