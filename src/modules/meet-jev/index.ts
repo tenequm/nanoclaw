@@ -10,7 +10,8 @@
  * its VAD marks (the meeting's mixed audio) are logged, never a boundary.
  *
  * On a jev call the host pushes the worker only what the core says to: a `reply` (with its `replyId`)
- * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`. `show` and `drop` push nothing: the agent's message is
+ * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`, and on a voice call each `status`.
+ * `show` and `drop` push nothing: the agent's message is
  * already in the call chat, since a reply reaches this module from the post-delivery hook.
  */
 import { DataPacket_Kind, RoomServiceClient } from 'livekit-server-sdk';
@@ -103,6 +104,8 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const runtime: CallRuntime = createCallRuntime(core, policy, {
     now: host.now,
     status: (status) => {
+      // A voice call's worker plays its cues from it; a meeting shows it on the bot's tile only.
+      if (kind === 'voice') host.push({ type: 'status', status });
       if (!statusRoom) return;
       statusSend = statusSend
         .then(async () => {

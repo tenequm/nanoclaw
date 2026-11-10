@@ -4710,7 +4710,8 @@ export class CallTelemetry {
 
 // ---------------------------------------------------------------------------------------------
 // The jev loop (`LiveKitJobMetadata.jev`): the worker is the audio part only. No turn state machine,
-// no wake word, no cues: the VAD opens a transcription activity at the caller's speech and closes it
+// no wake word, and of the cues a voice call keeps the listening and your-turn ones and the typing sound
+// (a meeting gets speech only): the VAD opens a transcription activity at the caller's speech and closes it
 // at its end, every partial and final goes to the host as an utterance with the speech marks, and the
 // worker speaks only what the host sends, reporting what became of each line. The host decides the
 // rest (`src/modules/meet-jev/`). On a meeting (`meta.meeting`) Recall streams each participant's audio
@@ -4730,6 +4731,8 @@ export const JEV_BARGE_MS = 300;
  * its speech-on or just after its speech-off.
  */
 export const JEV_WORDS_WINDOW_MS = 1_500;
+/** The longest the typing sound runs on one `thinking`: the host's next status ends it, a lost one must not leave it on. */
+export const JEV_THINKING_MAX_MS = 60_000;
 /** Events kept for the host while it cannot be reached; past it the oldest partials go, with a log line. */
 const JEV_REPORT_BACKLOG = 4 * MAX_JEV_EVENTS_PER_POST;
 /** A POST body's bytes besides its events (`callId`, the keys), kept out of MAX_JEV_POST_BYTES. */
@@ -5204,6 +5207,66 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   let callVoice: CallVoice | undefined;
   let callRecording: CallRecording | undefined;
   let replies = 0;
+  /** A voice call's cues, by the plain call's rules; a meeting gets speech only. */
+  const cued = !meta.meeting;
+  /** The page's cue and typing switches, through the `settings` RPC. */
+  let cuesOn = true;
+  let typingWanted = true;
+  let agentSpeaking = false;
+  let callerSpeaking = false;
+  /** The host's loop says the agent works on an answer. */
+  let thinking = false;
+  let thinkingTimer: ReturnType<typeof setTimeout> | undefined;
+  let typingOn = false;
+  const updateTyping = () => {
+    const on = cued && thinking && !agentSpeaking && cuesOn && typingWanted && !ending;
+    if (on === typingOn) return;
+    typingOn = on;
+    callVoice?.setTyping?.(on);
+  };
+  const setThinking = (on: boolean) => {
+    clearTimeout(thinkingTimer);
+    if (on) {
+      thinkingTimer = setTimeout(() => setThinking(false), JEV_THINKING_MAX_MS);
+      thinkingTimer.unref?.();
+    }
+    if (on === thinking) return;
+    thinking = on;
+    callVoice?.setThinking(on);
+    updateTyping();
+  };
+  let cues: Promise<void> = Promise.resolve();
+  /** Cues play one after another, none over the agent's speech and none once the call ends. */
+  const cue = (kind: CueKind) => {
+    if (!cued) return;
+    cues = cues
+      .then(async () => {
+        if (ending || !cuesOn || agentSpeaking) return;
+        await callVoice?.playCue(kind);
+      })
+      .catch((err: unknown) => callLog.warn('voice-mode worker: a cue did not play', { err, kind }));
+  };
+  let readyCued = false;
+  let readyTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The listening cue, once: when the page has said whether it wants cues, or after a wait for that. */
+  const readyCue = () => {
+    clearTimeout(readyTimer);
+    if (readyCued) return;
+    readyCued = true;
+    cue('listening');
+  };
+  let turnCueTimer: ReturnType<typeof setTimeout> | undefined;
+  let turnCuedAt = 0;
+  /** Over to the caller once a line played out, unless another follows, the agent still works or the caller talks. */
+  const turnCue = () => {
+    clearTimeout(turnCueTimer);
+    turnCueTimer = setTimeout(() => {
+      if (loop.busy || thinking || callerSpeaking || Date.now() - turnCuedAt < TURN_CUE_REPEAT_MS) return;
+      turnCuedAt = Date.now();
+      cue('turn');
+    }, TURN_CUE_DELAY_MS);
+    turnCueTimer.unref?.();
+  };
   const reporter = new JevReporter((events) => host.post('jev', { events }), callLog);
   const languages = callLanguages(meta.languages);
   const transcriber = meta.meeting
@@ -5226,6 +5289,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     },
     report: (event) => {
       if (!ending) reporter.report(event);
+      if (event.type === 'playback' && event.state === 'completed') turnCue();
     },
     caption: (segment, text, final) => {
       if (!ending) callVoice?.caption(segment, text, final);
@@ -5252,6 +5316,10 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     ));
   const endCall = async (reason: string, tellHost: boolean, restart: boolean) => {
     ending = true;
+    clearTimeout(readyTimer);
+    clearTimeout(turnCueTimer);
+    clearTimeout(thinkingTimer);
+    updateTyping();
     loop.close();
     transcriber?.close();
     // What was reported goes out before the host hears the call ended; bounded, like every wait here.
@@ -5301,8 +5369,15 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
           callRecording?.push(pcm);
         },
         onVad: () => undefined,
-        onSpeech: (speaking, at) => loop.onSpeech(speaking, at),
-        onAgentSpeaking: (speaking) => loop.onAgentSpeaking(speaking),
+        onSpeech: (speaking, at) => {
+          callerSpeaking = speaking;
+          loop.onSpeech(speaking, at);
+        },
+        onAgentSpeaking: (speaking) => {
+          agentSpeaking = speaking;
+          updateTyping();
+          loop.onAgentSpeaking(speaking);
+        },
         onClosed: (reason) => void end(reason, true),
       },
     );
@@ -5315,7 +5390,8 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   callLog.info('voice-mode worker: a jev call', {
     ...(meta.meeting ? { meeting: true, transcription: 'host' } : { languages: languages.codes }),
   });
-  // The page's RPCs: only its settings do anything here (the speech choice); review mode is not offered.
+  // The page's RPCs: only its settings do anything here (the speech choice, the cue and typing switches);
+  // review mode is not offered.
   if (!ending) {
     const voice = callVoice;
     let seq = 0;
@@ -5324,7 +5400,13 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       if (!req) throw new Error('not a review request from the caller');
       let error: ReviewReply['error'];
       if (op !== 'settings') error = 'not_review';
-      else if (req.tts) error = voice.selectTts ? voice.selectTts(req.tts, req.gen) : 'tts_unavailable';
+      else {
+        if (req.cues !== undefined) cuesOn = req.cues;
+        if (req.typing !== undefined) typingWanted = req.typing;
+        updateTyping();
+        readyCue();
+        if (req.tts) error = voice.selectTts ? voice.selectTts(req.tts, req.gen) : 'tts_unavailable';
+      }
       voice.review.publishReview({
         seq: ++seq,
         mode: 'auto',
@@ -5334,6 +5416,11 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       const reply: ReviewReply = { gen: req.gen, ok: !error, seq, ...(error ? { error } : {}) };
       return JSON.stringify(reply);
     });
+  }
+  // A page says whether it wants cues first; a call with no page to ask gets them after a moment.
+  if (cued && !ending) {
+    readyTimer = setTimeout(readyCue, READY_CUE_WAIT_MS);
+    readyTimer.unref?.();
   }
   // Defense in depth: the host ends the call on time; this stops a worker that lost the host.
   const deadline = setTimeout(
@@ -5384,6 +5471,8 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       } else if (event.type === 'stop') loop.onStop();
       else if (event.type === 'words') loop.onWords();
       else if (event.type === 'revoke') loop.onRevoke(event.replyId);
+      // `heard` says nothing about the agent: it may still work on the turn before.
+      else if (event.type === 'status' && cued && event.status !== 'heard') setThinking(event.status === 'thinking');
     }, hostLink.signal)
     .then(
       () => end('host link closed', true),

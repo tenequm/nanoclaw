@@ -46,6 +46,36 @@ function jevCall() {
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe('createJevCall', () => {
+  it.each([
+    ['voice', 1],
+    ['meet', 0],
+  ] as const)("pushes the loop's status to the worker on a %s call: %s", (kind, pushes) => {
+    const push = vi.fn();
+    const core: CallCore<null> = {
+      initial: () => null,
+      reduce: () => null,
+      decide: () => [{ kind: 'status', status: 'thinking' }],
+    };
+    const call = createJevCall(
+      {
+        callId: 'c1',
+        kind,
+        callerName: 'Ethan',
+        agentName: 'Andy',
+        agentAliases: [],
+        maxTextBytes: 4096,
+        submitTurn: async () => ({ ok: false, reason: 'test' }),
+        push,
+        now: () => 1_000_000,
+      },
+      { core },
+    );
+    call.reply('Hello.', null);
+    expect(push.mock.calls.filter(([event]) => event.type === 'status')).toEqual(
+      pushes ? [[{ type: 'status', status: 'thinking' }]] : [],
+    );
+  });
+
   it('logs both question texts once per call', async () => {
     vi.mocked(log.info).mockClear();
     const { call, say } = jevCall();

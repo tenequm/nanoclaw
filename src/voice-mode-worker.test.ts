@@ -112,6 +112,7 @@ import {
   type TurnTakingDeps,
   deliveredText,
   JEV_BARGE_MS,
+  JEV_THINKING_MAX_MS,
   JEV_WORDS_WINDOW_MS,
   JevLoop,
   JevReporter,
@@ -7201,7 +7202,7 @@ describe('jev calls', () => {
         ? `speech:${e.on ? 'on' : 'off'}`
         : `${e.final ? 'final' : 'partial'}:${e.text}`;
 
-  it('runs the loop: no turns, no cues, no spotter; words and marks go to agent/jev in order, replies are spoken by replyId', async () => {
+  it('runs the loop: no turns, no spotter; words and marks go to agent/jev in order, replies are spoken by replyId', async () => {
     const { ctx, job } = fakeJob({ ...JEV_META });
     const host = fakeHostFetch();
     const v = fakeVoice();
@@ -7252,7 +7253,10 @@ describe('jev calls', () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(v.voice.speak).toHaveBeenCalledTimes(1);
     expect(v.voice.say).not.toHaveBeenCalled();
-    expect(v.voice.playCue).not.toHaveBeenCalled();
+    // The page asked for cues as it joined, then turned them off: the listening cue, and none after it.
+    expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
+    await new Promise((r) => setTimeout(r, TURN_CUE_DELAY_MS + 100));
+    expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
     expect(v.voice.setThinking).not.toHaveBeenCalled();
     expect(v.voice.publishReply).not.toHaveBeenCalled();
 
@@ -7260,6 +7264,94 @@ describe('jev calls', () => {
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
     expect(v.voice.close).toHaveBeenCalled();
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+  });
+
+  it("a voice call plays its cues from the host's status: listening, typing while the agent works, your turn after a line", async () => {
+    const { ctx, job } = fakeJob({ ...JEV_META });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const typing: boolean[] = [];
+    Object.assign(v.voice, { setTyping: vi.fn((on: boolean) => void typing.push(on)) });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await vi.waitFor(() => expect(v.voice.playCue.mock.calls).toEqual([['listening']]));
+
+    host.emit({ type: 'status', status: 'thinking' });
+    await vi.waitFor(() => expect(typing).toEqual([true]));
+    expect(v.voice.setThinking.mock.calls).toEqual([[true]]);
+    // `heard` is about the caller: the agent still works on the turn before.
+    host.emit({ type: 'status', status: 'heard' });
+    await flush();
+    expect(typing).toEqual([true]);
+    // Never over the agent's speech; back when it stops and the host still says thinking.
+    v.events.onAgentSpeaking(true);
+    expect(typing).toEqual([true, false]);
+    v.events.onAgentSpeaking(false);
+    expect(typing).toEqual([true, false, true]);
+    await v.rpc('settings', { typing: false });
+    expect(typing).toEqual([true, false, true, false]);
+    await v.rpc('settings', { typing: true });
+    host.emit({ type: 'status', status: 'idle' });
+    await vi.waitFor(() => expect(v.voice.setThinking.mock.calls).toEqual([[true], [false]]));
+    expect(typing).toEqual([true, false, true, false, true, false]);
+
+    // A line that played out hands over to the caller; one cue, a moment after it.
+    host.emit({ type: 'reply', text: 'Booked.', replyId: 'r1' });
+    await vi.waitFor(() => expect(v.voice.playCue.mock.calls).toEqual([['listening'], ['turn']]), { timeout: 2_000 });
+
+    host.emit({ type: 'end', reason: 'done' });
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
+  });
+
+  it('holds the your-turn cue while the agent still works or the caller talks, and stops typing on its own after a lost status', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const { ctx } = fakeJob({ ...JEV_META });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const typing: boolean[] = [];
+    Object.assign(v.voice, { setTyping: vi.fn((on: boolean) => void typing.push(on)) });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await vi.advanceTimersByTimeAsync(10);
+    expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
+
+    host.emit({ type: 'status', status: 'thinking' });
+    host.emit({ type: 'reply', text: 'One moment.', replyId: 'r1' });
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
+    // Still working on the answer: no hand-over yet.
+    expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
+    expect(typing.at(-1)).toBe(true);
+    // The host never says idle: the typing ends by itself.
+    await vi.advanceTimersByTimeAsync(JEV_THINKING_MAX_MS);
+    expect(typing.at(-1)).toBe(false);
+    expect(v.voice.setThinking).toHaveBeenLastCalledWith(false);
+
+    v.events.onSpeech(true, v.position);
+    host.emit({ type: 'reply', text: 'Done.', replyId: 'r2' });
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
+    expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
+    host.endStream();
+  });
+
+  it('a jev meeting gets no cues, whatever the host sends', async () => {
+    const { ctx, room } = fakeJob({
+      ...JEV_META,
+      callerIdentity: 'meet-bridge-meet-r1',
+      meeting: { pauseSends: false },
+    });
+    room.remoteParticipants.clear();
+    room.remoteParticipants.set('meet-bridge-meet-r1', {});
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    v.voice.review.serve = vi.fn();
+    const setTyping = vi.fn();
+    Object.assign(v.voice, { setTyping });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    host.emit({ type: 'status', status: 'thinking' });
+    host.emit({ type: 'reply', text: 'Booked.', replyId: 'r1' });
+    await new Promise((r) => setTimeout(r, TURN_CUE_DELAY_MS + 150));
+    expect(v.voice.playCue).not.toHaveBeenCalled();
+    expect(v.voice.setThinking).not.toHaveBeenCalled();
+    expect(setTyping).not.toHaveBeenCalled();
+    host.endStream();
   });
 
   it('records like a plain call when the switches are on: each utterance, each reply and the whole call', async () => {

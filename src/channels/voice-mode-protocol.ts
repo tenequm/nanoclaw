@@ -526,6 +526,8 @@ export type LiveKitHostEvent =
   | { type: 'words' }
   | { type: 'thinking' }
   | { type: 'working' }
+  /** A jev voice call's state as the host's loop sees it: the worker plays its cues from it. */
+  | { type: 'status'; status: 'heard' | 'thinking' | 'speaking' | 'idle' }
   | { type: 'chat'; chat: boolean }
   | { type: 'turn-stored'; turnKey: string; id: string }
   | { type: 'end'; reason: string }
