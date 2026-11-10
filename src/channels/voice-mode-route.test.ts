@@ -151,9 +151,7 @@ describe('routeVoiceModeTurn', () => {
     it('does not acknowledge a turn consumed by the core command gate', async () => {
       const event = turn();
       event.message.content = JSON.stringify({ text: '/status', senderId: 'voice-mode:abc' });
-      event.onStored = vi.fn();
       expect(await routeVoiceModeTurn(event, await fromCaller())).toBe(false);
-      expect(event.onStored).not.toHaveBeenCalled();
       expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
     });
 

@@ -331,23 +331,27 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
   inflightDeliveries.add(session.id);
 
   try {
-    await drainSession(session);
-    if (drainAgain.delete(session.id)) await drainSession(session);
+    // A row that just failed waits for the next tick instead of being retried
+    // at once by the second pass, which would spend its attempts back to back.
+    const failed = await drainSession(session);
+    if (drainAgain.delete(session.id)) await drainSession(session, failed);
   } finally {
     inflightDeliveries.delete(session.id);
     drainAgain.delete(session.id);
   }
 }
 
-async function drainSession(session: Session): Promise<void> {
+/** Delivers a session's due rows, except `skip`; returns the ids whose send failed. */
+async function drainSession(session: Session, skip: ReadonlySet<string> = new Set()): Promise<Set<string>> {
+  const failed = new Set<string>();
   const agentGroup = await getAgentGroup(session.agent_group_id);
-  if (!agentGroup) return;
+  if (!agentGroup) return failed;
 
   // Snapshot parked rows BEFORE reading the queue: a parked row is recorded
   // before it leaves overdueDeliveries, so a row whose send may still land
   // reads as parked or recorded, never as neither.
   const parked = new Set(overdueDeliveries.get(session.id));
-  if (parked.size >= MAX_PARKED_PER_SESSION) return;
+  if (parked.size >= MAX_PARKED_PER_SESSION) return failed;
 
   // Read the queue in one short mailbox session, then deliver with NO
   // session held open: delivery handlers (agent-to-agent routing, approval
@@ -364,10 +368,10 @@ async function drainSession(session: Session): Promise<void> {
         delivered,
         pending: mailbox
           .getDueMessages(delivered)
-          .filter((candidate) => !delivered.has(candidate.id) && !parked.has(candidate.id)),
+          .filter((candidate) => !delivered.has(candidate.id) && !parked.has(candidate.id) && !skip.has(candidate.id)),
       };
     });
-    if (!existing) return;
+    if (!existing) return failed;
     ({ delivered, pending } = existing);
   } catch (err) {
     log.error('Session mailbox delivery failed', {
@@ -375,7 +379,7 @@ async function drainSession(session: Session): Promise<void> {
       sessionId: session.id,
       err,
     });
-    return;
+    return failed;
   }
 
   for (const hook of batchPreviewHooks) {
@@ -396,15 +400,17 @@ async function drainSession(session: Session): Promise<void> {
       parkOverdueDelivery(msg, session, agentGroup, send, firstDelivery);
       // Later rows wait for the next tick, so a stuck channel costs this
       // session one deadline per tick at most.
-      return;
+      return failed;
     }
     try {
       await completeDelivery(msg, session, agentGroup, await send, firstDelivery);
       delivered.add(msg.id);
     } catch (err) {
+      failed.add(msg.id);
       await failDelivery(msg, session, agentGroup, err);
     }
   }
+  return failed;
 }
 
 /** True when `promise` settles, either way, within `ms`. Never rejects. */

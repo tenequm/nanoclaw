@@ -5,12 +5,11 @@
  *   1. `canonicalizeReactionEmoji` — exact match: a Telegram-allowed glyph
  *      (with or without VS-16) or a slug that names one.
  *   2. `resolveReactionEmoji` — layer 1, then a curated nearest-allowed
- *      fallback for input Telegram will never accept (`✅`, `🚀`, `x`, ...),
- *      reporting whether the glyph it returns is a substitution.
+ *      fallback for input Telegram will never accept (`✅`, `🚀`, `x`, ...).
  *
- * Callers that can report back to the agent use `resolveReactionEmoji`, so a
- * reaction is never silently dropped: a substitution is delivered and named,
- * and unmappable input is reported as a drop.
+ * The adapter sends a substitution without telling the agent, and drops
+ * unmappable input with a host log line. The `add_reaction` tool already
+ * refuses a glyph outside the allowed set, so only slug names reach here.
  */
 import type { ReactionTypeEmoji } from 'grammy/types';
 
@@ -241,13 +240,11 @@ const SLUG_TO_REACTION_EMOJI: Readonly<Record<string, TelegramReactionEmoji>> = 
  * This table maps INTENT, not codepoints. `✅` is not a legal reaction for
  * any chat member — not us, not a human — so there is no "correct" glyph to
  * translate it into; but the agent that reached for it meant *acknowledged /
- * done*, and `👌` is the closest thing the allowed set has. A hit here is a
- * substitution, and `resolveReactionEmoji` says so, so the caller can tell
- * the agent what actually went out instead of letting it believe otherwise.
+ * done*, and `👌` is the closest thing the allowed set has.
  *
  * Deliberately small and hand-curated: input in neither this table nor the
- * allowed set still resolves to `null`. Reporting a drop beats inventing a
- * reaction that means something the agent never said.
+ * allowed set still resolves to `null`. A drop beats inventing a reaction
+ * that means something the agent never said.
  *
  * Keys are lowercase and VS-16-free — lookup normalizes input the same way.
  */
@@ -386,24 +383,15 @@ export function canonicalizeReactionEmoji(input: string): TelegramReactionEmoji 
   return null;
 }
 
-export interface ReactionResolution {
-  /** Glyph to send, or `null` when nothing allowed carries the intent. */
-  glyph: TelegramReactionEmoji | null;
-  /** `true` when `glyph` is a nearest-allowed stand-in, not what was asked for. */
-  substituted: boolean;
-}
-
 /**
  * Resolve an `add_reaction` emoji argument all the way: exact match first,
- * then the curated nearest-allowed fallback. `substituted` is the point of
- * the shape — it lets the caller deliver the stand-in *and* tell the agent
- * its reaction was changed, instead of pretending the request went through
- * as written.
+ * then the curated nearest-allowed fallback. `null` when nothing allowed
+ * carries the intent.
  */
-export function resolveReactionEmoji(input: string): ReactionResolution {
+export function resolveReactionEmoji(input: string): TelegramReactionEmoji | null {
   const exact = canonicalizeReactionEmoji(input);
-  if (exact) return { glyph: exact, substituted: false };
+  if (exact) return exact;
   const key = input.trim().replace(/️/g, '').toLowerCase();
   const fallback = Object.hasOwn(NEAREST_ALLOWED_FALLBACK, key) ? NEAREST_ALLOWED_FALLBACK[key] : undefined;
-  return fallback ? { glyph: fallback, substituted: true } : { glyph: null, substituted: false };
+  return fallback ?? null;
 }

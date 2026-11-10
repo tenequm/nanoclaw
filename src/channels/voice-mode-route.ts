@@ -65,9 +65,8 @@ export async function routeVoiceModeTurn(event: VoiceModeTurnEvent, turn: VoiceM
     mg,
     {
       ...event,
-      onStored: (session) => {
+      onStored: () => {
         stored = true;
-        event.onStored?.(session);
       },
     },
     turn.callerId,

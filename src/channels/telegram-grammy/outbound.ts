@@ -630,7 +630,7 @@ const reactToMessage = Effect.fn('telegram-grammy.reactToMessage')(function* (
   // slug names arrive unresolved, so this is where they are matched.
   const reactions: Array<{ type: 'emoji'; emoji: TelegramReactionEmoji }> = [];
   if (emoji) {
-    const { glyph } = resolveReactionEmoji(emoji);
+    const glyph = resolveReactionEmoji(emoji);
     if (!glyph) {
       yield* Effect.logWarning('telegram-grammy: dropping reaction with unknown emoji', {
         input: emoji,

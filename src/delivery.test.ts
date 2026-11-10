@@ -181,6 +181,38 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(calls).toEqual(['one', 'two', 'three']);
   });
 
+  it('leaves a row that failed in the first pass to the next tick, not the follow-up pass', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOperation('ag-1', session.id, 'out-1', { text: 'one' });
+
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        const { text } = JSON.parse(content) as { text: string };
+        calls.push(text);
+        await new Promise((r) => setTimeout(r, 50));
+        if (text === 'one') throw new Error('slow failure');
+        return `plat-${calls.length}`;
+      },
+    });
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+
+    try {
+      const running = deliverSessionMessages(session);
+      await vi.waitFor(() => expect(calls).toEqual(['one']));
+      insertOperation('ag-1', session.id, 'out-2', { text: 'two' });
+      await deliverSessionMessages(session);
+      await running;
+      expect(calls).toEqual(['one', 'two']);
+
+      await deliverSessionMessages(session);
+      expect(calls).toEqual(['one', 'two', 'one']);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('still delivers on a subsequent call after the first finishes', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
