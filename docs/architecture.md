@@ -272,7 +272,7 @@ One-shot and recurring tasks use the same tables — no separate scheduler.
 - `outbound.db` → due `messages_out` rows not yet in the host's `delivered` table (in `inbound.db`) → deliver
 - After completing/delivering a row with `recurrence`, insert next occurrence
 
-**Active container poll** (~1s) checks the same conditions but only for sessions with running containers. Both delivery polls drain up to 8 sessions at a time and re-arm at a fixed rate from each tick's start, so many sessions on a slow mailbox don't serialize into one long tick.
+**Active container poll** (~1s) checks the same conditions but only for sessions with running containers. Both delivery polls drain up to 8 sessions at a time and re-arm at a fixed rate from each tick's start, so many sessions on a slow mailbox don't serialize into one long tick. On the HTTP mailbox transport a runner's `messages_out` write also drains its session the moment it commits (`src/modules/mailbox-http/index.ts`); the polls carry retries, scheduled and parked rows, host-written rows and the sqlite transport.
 
 **Agent-runner creates schedules** by emitting a `messages_out` row with `kind: 'system'` and an `action` (`schedule_task`, `cancel_task`, …) — it cannot write host-owned `inbound.db` directly. The host applies the action during delivery (`src/modules/scheduling/actions.ts`), inserting/updating the `kind: 'task'` `messages_in` row with `process_after` and optionally `recurrence`.
 

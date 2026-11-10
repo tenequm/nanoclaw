@@ -42,7 +42,6 @@ import {
   setDeliveryAdapter,
   setOutboundPresentation,
 } from './delivery.js';
-import * as typing from './modules/typing/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -88,16 +87,6 @@ function insertOperation(agentGroupId: string, sessionId: string, msgId: string,
   db.close();
 }
 
-function setContainerTurn(agentGroupId: string, sessionId: string, turn: string, updatedAt: string): void {
-  const db = new Database(outboundDbPath(agentGroupId, sessionId));
-  db.prepare(
-    `INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at, turn, updated_at)
-     VALUES (1, NULL, NULL, NULL, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET turn = excluded.turn, updated_at = excluded.updated_at`,
-  ).run(turn, updatedAt);
-  db.close();
-}
-
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -111,67 +100,6 @@ afterEach(async () => {
 });
 
 describe('deliverSessionMessages — concurrent invocations', () => {
-  it('forwards a not-reported turn (no container_state row) as null', async () => {
-    await seedAgentAndChannel();
-    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
-    setDeliveryAdapter({
-      async deliver() {
-        return undefined;
-      },
-    });
-
-    const spy = vi.spyOn(typing, 'notePresence');
-    try {
-      await deliverSessionMessages(session);
-      expect(spy).toHaveBeenCalledWith(session.id, { turn: null, updatedAtMs: null });
-    } finally {
-      spy.mockRestore();
-    }
-  });
-  it('a turn report that fails to parse reads as not reported and never blocks delivery', async () => {
-    await seedAgentAndChannel();
-    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
-    setContainerTurn('ag-1', session.id, 'resting', new Date().toISOString());
-    insertOutbound('ag-1', session.id, 'out-1');
-    const calls: string[] = [];
-    setDeliveryAdapter({
-      async deliver(_channelType, _platformId, _threadId, _kind, content) {
-        calls.push(content);
-        return 'plat-msg-1';
-      },
-    });
-
-    const spy = vi.spyOn(typing, 'notePresence');
-    try {
-      await deliverSessionMessages(session);
-      expect(calls).toHaveLength(1);
-      expect(spy).toHaveBeenCalledWith(session.id, { turn: null, updatedAtMs: null });
-    } finally {
-      spy.mockRestore();
-    }
-  });
-  it('reads the runner turn report on the poll and forwards it to the typing module', async () => {
-    await seedAgentAndChannel();
-    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
-    const updatedAt = new Date().toISOString();
-    setContainerTurn('ag-1', session.id, 'working', updatedAt);
-    setDeliveryAdapter({
-      async deliver() {
-        return undefined;
-      },
-    });
-
-    const spy = vi.spyOn(typing, 'notePresence');
-    try {
-      await deliverSessionMessages(session);
-      expect(spy).toHaveBeenCalledWith(session.id, {
-        turn: 'working',
-        updatedAtMs: Date.parse(updatedAt),
-      });
-    } finally {
-      spy.mockRestore();
-    }
-  });
   it('logs mailbox failures with session context and retries on the next poll', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
@@ -216,6 +144,42 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     await Promise.all([deliverSessionMessages(session), deliverSessionMessages(session)]);
 
     expect(calls).toHaveLength(1);
+  });
+
+  it('drains exactly once more when asked during an in-flight drain', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOperation('ag-1', session.id, 'out-1', { text: 'one' });
+
+    const calls: string[] = [];
+    let sending = 0;
+    let maxSending = 0;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        calls.push((JSON.parse(content) as { text: string }).text);
+        maxSending = Math.max(maxSending, ++sending);
+        await new Promise((r) => setTimeout(r, 50));
+        sending--;
+        return `plat-${calls.length}`;
+      },
+    });
+
+    const running = deliverSessionMessages(session);
+    await vi.waitFor(() => expect(calls).toEqual(['one']));
+    // Written after the running drain read its queue: two requests, one follow-up pass.
+    insertOperation('ag-1', session.id, 'out-2', { text: 'two' });
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    await vi.waitFor(() => expect(calls).toEqual(['one', 'two']));
+    // A request during the follow-up pass is left to the next poll tick.
+    insertOperation('ag-1', session.id, 'out-3', { text: 'three' });
+    await deliverSessionMessages(session);
+    await running;
+    expect(calls).toEqual(['one', 'two']);
+    expect(maxSending).toBe(1);
+
+    await deliverSessionMessages(session);
+    expect(calls).toEqual(['one', 'two', 'three']);
   });
 
   it('still delivers on a subsequent call after the first finishes', async () => {

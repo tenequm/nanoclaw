@@ -54,7 +54,6 @@ import {
 } from './voice-mode-protocol.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
-import { expediteDelivery } from '../delivery.js';
 import {
   findVoiceModeLineByToken,
   getVoiceModeLine,
@@ -98,8 +97,6 @@ import {
 const ACCESS_CHECK_INTERVAL_MS = 5000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
-/** After a turn reaches the agent, its session's replies are picked up at once for this long, not on the 1 s poll. */
-const CALL_REPLY_EXPEDITE_MS = 60_000;
 
 /** A `PATCH /voice/tts` body is one small object: `{provider, model?, voice?}` or `{"reset": true}`. */
 const MAX_TTS_BODY_BYTES = 1024;
@@ -248,8 +245,6 @@ export interface VoiceModeConfig {
   trustedProxyCidrs?: string;
   /** VOICE_MODE_ALLOWED_CLIENT_CIDRS: clients those proxies may forward (X-Forwarded-For); unset is any. */
   allowedClientCidrs?: string;
-  /** The session a call's turn went to: its replies are delivered without waiting on the poll. Test seam. */
-  expediteReplies?: (session: Session) => void;
   /** The Recall client `/meet` joins meetings through (voice-mode-meet.ts); none: `/meet` is not configured. */
   meetBridge?: RecallMeetBridge;
   /** Public `wss://` origin a jev meeting's bot streams its participants' audio to; `publicUrl`'s by default. */
@@ -320,8 +315,6 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     ((platformId: string, options?: ResolveLineOptions) =>
       resolveVoiceModeLine(platformId, { vocabulary: config.vocabulary, ...options }));
   const now = config.now ?? (() => Date.now());
-  const expediteReplies =
-    config.expediteReplies ?? ((session: Session) => expediteDelivery(session, CALL_REPLY_EXPEDITE_MS));
   const findSession = config.prewarm?.findSession ?? findCallSession;
   const wakeSession = config.prewarm?.wake ?? ((session: Session) => requestWake(session, 'voice-call'));
   const maxCallDurationMs = config.maxCallDurationMs ?? 15 * 60_000;
@@ -406,9 +399,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     chargeUsage,
     routeTurn: async (event, turn) => {
       if (!setup) throw new Error('the voice-mode channel is not running');
-      const routed = { ...event, onStored: expediteReplies };
       try {
-        return await (config.routeTurn ? config.routeTurn(routed) : routeVoiceModeTurn(routed, turn));
+        return await (config.routeTurn ? config.routeTurn(event) : routeVoiceModeTurn(event, turn));
       } catch (err) {
         log.error('livekit-voice-mode: routing a turn failed', { platformId: event.platformId, err });
         throw err;

@@ -185,8 +185,6 @@ interface Harness {
   access: { enabled: boolean };
   /** What the router does with the next turns: store them, drop them, hang until `hung` is called (storing it on `true`), or throw. */
   routing: { mode: 'store' | 'drop' | 'hang' | 'throw'; hung: Array<(store?: boolean | Error) => void> };
-  /** Sessions whose replies a stored turn expedited. */
-  expedited: string[];
   /** Call starts: where the agent was looked up, and which sessions were woken. */
   prewarm: {
     lookups: Array<{ route: Omit<InboundEvent, 'message'>; agentGroupId: string }>;
@@ -233,7 +231,6 @@ async function openHarness(
   const clock = { now: Date.UTC(2026, 9, 2, 1, 0, 0) };
   const access = { enabled: true };
   const routing: Harness['routing'] = { mode: 'store', hung: [] };
-  const expedited: string[] = [];
   const prewarm: Harness['prewarm'] = { lookups: [], woke: [] };
   const session = { id: 'sess-andy', agent_group_id: 'ag-andy' } as Session;
   const lk = fakeLiveKit();
@@ -249,7 +246,6 @@ async function openHarness(
           }
         : null,
     now: () => clock.now,
-    expediteReplies: (stored) => void expedited.push(stored.id),
     prewarm: {
       findSession: async (route, agentGroupId) => {
         prewarm.lookups.push({ route, agentGroupId });
@@ -273,20 +269,18 @@ async function openHarness(
       ...lkOverrides,
     },
     // The LiveKit engine routes here; each turn is recorded, and the message it carries.
-    routeTurn: async ({ onStored, ...event }) => {
+    routeTurn: async (event) => {
       events.push(event);
       inbound.push({ ...event.message, content: JSON.parse(event.message.content) as unknown });
       if (routing.mode === 'hang') {
         return new Promise<boolean>((resolve, reject) =>
           routing.hung.push((store) => {
             if (store instanceof Error) return reject(store);
-            if (store) onStored?.(session);
             resolve(store === true);
           }),
         );
       }
       if (routing.mode === 'throw') throw new Error('router exploded');
-      if (routing.mode === 'store') onStored?.(session);
       return routing.mode === 'store';
     },
     ...overrides,
@@ -311,7 +305,6 @@ async function openHarness(
     clock,
     access,
     lk,
-    expedited,
     prewarm,
     stop: async () => {
       await adapter.teardown();
@@ -925,12 +918,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect((await worker.post('utterance', { text: 'broken' })).status).toBe(500);
     h.routing.mode = 'hang';
     expect((await worker.post('utterance', { text: 'stuck' })).status).toBe(504);
-    expect(h.expedited).toEqual([]);
     h.routing.mode = 'store';
     expect((await worker.post('utterance', { text: 'taken' })).status).toBe(202);
     expect(h.inbound).toHaveLength(4);
-    // The session that took it hands its reply over without waiting on the delivery poll.
-    expect(h.expedited).toEqual(['sess-andy']);
     worker.close();
   });
 
@@ -951,9 +941,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
       },
     ]);
     expect(h.inbound).toEqual([]);
-    // A turn is routed and expedited as usual; it does not wake the agent a second time.
+    // A turn is routed as usual; it does not wake the agent a second time.
     await worker.utter('hello');
-    expect(h.expedited).toEqual(['sess-andy']);
+    expect(h.inbound).toHaveLength(1);
     expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: call.callId })).status).toBe(204);
     await settle();
     expect(h.prewarm.woke).toEqual(['sess-andy']);
@@ -987,7 +977,7 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.prewarm.woke).toEqual([]);
     // The first turn creates the session, as with no call start at all.
     await worker.utter('hello');
-    expect(h.expedited).toEqual(['sess-andy']);
+    expect(h.inbound).toHaveLength(1);
     worker.close();
   });
 

@@ -34,7 +34,7 @@ import { platformMessageId } from './platform-id.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
-import { notePresence, pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { getContainerConfig } from './db/container-configs.js';
 import type { OutboundFile, ResolvedReaction } from './channels/adapter.js';
 import type { AgentGroup, PendingApproval, Session } from './types.js';
@@ -122,10 +122,14 @@ async function clearAttemptRow(messageId: string): Promise<void> {
  * the channel adapter, both markDelivered (idempotent in the DB via
  * INSERT OR IGNORE — but the user has already seen the message twice).
  *
- * Skipping (vs. queueing) is correct: any message left over when the
- * second caller skips will be picked up on the next poll tick (~1s).
+ * The second caller skips rather than queueing: the running drain may have
+ * read the queue before the caller's row landed, so it records the session
+ * in drainAgain and the running drain makes exactly one more pass when it
+ * ends. A request during that pass is left to the next poll tick (~1s), so
+ * a drain never chains indefinitely.
  */
 const inflightDeliveries = new Set<string>();
+const drainAgain = new Set<string>();
 
 /**
  * Per session, ids of rows whose send passed its deadline and has not settled. Drains skip them, so a send that
@@ -154,9 +158,9 @@ const backgroundDrains = new Set<Promise<void>>();
 
 export function _resetDeliveryStateForTesting(): void {
   inflightDeliveries.clear();
+  drainAgain.clear();
   overdueDeliveries.clear();
   backgroundDrains.clear();
-  stopExpediting();
 }
 
 export interface ChannelDeliveryAdapter {
@@ -243,43 +247,6 @@ export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
   }
 }
 
-/** A session someone waits on in real time is drained this often, instead of on the active poll alone. */
-const EXPEDITED_POLL_MS = 200;
-/** Sessions drained every EXPEDITED_POLL_MS, each until its deadline. */
-const expedited = new Map<string, { session: Session; until: number }>();
-let expediteTimer: ReturnType<typeof setInterval> | undefined;
-
-/**
- * Drain one session's outbound queue every EXPEDITED_POLL_MS for the next `forMs`: for a caller
- * waiting on the reply live (a voice call's turn), the ~1 s active poll alone adds half a second
- * on average. The per-session re-entry guard keeps it from racing the regular polls.
- */
-export function expediteDelivery(session: Session, forMs: number): void {
-  if (!activePolling) return;
-  expedited.set(session.id, { session, until: Date.now() + forMs });
-  if (expediteTimer) return;
-  expediteTimer = setInterval(() => {
-    const now = Date.now();
-    for (const [id, entry] of expedited) {
-      if (entry.until <= now) {
-        expedited.delete(id);
-        continue;
-      }
-      void deliverSessionMessages(entry.session).catch((err: unknown) =>
-        log.error('Session delivery failed', { sessionId: id, err }),
-      );
-    }
-    if (expedited.size === 0) stopExpediting();
-  }, EXPEDITED_POLL_MS);
-  expediteTimer.unref?.();
-}
-
-function stopExpediting(): void {
-  clearInterval(expediteTimer);
-  expediteTimer = undefined;
-  expedited.clear();
-}
-
 /** Start the active container poll loop (~1s). */
 export function startActiveDeliveryPoll(): void {
   if (activePolling) return;
@@ -347,15 +314,6 @@ export async function deliverToSessions(sessions: readonly Session[]): Promise<v
   });
 }
 
-function readPresence<T>(sessionId: string, read: () => T): T | undefined {
-  try {
-    return read();
-  } catch (err) {
-    log.debug('Presence read failed', { sessionId, err: String(err) });
-    return undefined;
-  }
-}
-
 /** Drain a session, but hand it to the background past TICK_DRAIN_WAIT_MS. */
 async function drainWithinTick(session: Session): Promise<void> {
   const drain = deliverSessionMessages(session);
@@ -369,13 +327,18 @@ async function drainWithinTick(session: Session): Promise<void> {
 export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
-  if (inflightDeliveries.has(session.id)) return;
+  if (inflightDeliveries.has(session.id)) {
+    drainAgain.add(session.id);
+    return;
+  }
   inflightDeliveries.add(session.id);
 
   try {
     await drainSession(session);
+    if (drainAgain.delete(session.id)) await drainSession(session);
   } finally {
     inflightDeliveries.delete(session.id);
+    drainAgain.delete(session.id);
   }
 }
 
@@ -402,7 +365,6 @@ async function drainSession(session: Session): Promise<void> {
       const delivered = mailbox.getDeliveredIds();
       return {
         delivered,
-        containerState: readPresence(session.id, () => mailbox.getContainerState()),
         pending: mailbox
           .getDueMessages(delivered)
           .filter((candidate) => !delivered.has(candidate.id) && !parked.has(candidate.id)),
@@ -410,11 +372,6 @@ async function drainSession(session: Session): Promise<void> {
     });
     if (!existing) return;
     ({ delivered, pending } = existing);
-    const { containerState } = existing;
-    notePresence(session.id, {
-      turn: containerState?.turn ?? null,
-      updatedAtMs: containerState ? Date.parse(containerState.updatedAt) : null,
-    });
   } catch (err) {
     log.error('Session mailbox delivery failed', {
       agentGroupId: agentGroup.id,
@@ -1155,7 +1112,6 @@ async function handleSystemAction(content: Record<string, unknown>, session: Ses
 export function stopDeliveryPolls(): void {
   activePolling = false;
   sweepPolling = false;
-  stopExpediting();
 }
 
 async function richAllowed(messageId: string, content: Record<string, unknown>, session: Session): Promise<boolean> {
