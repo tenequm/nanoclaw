@@ -7264,7 +7264,8 @@ describe('jev calls', () => {
     expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
     await new Promise((r) => setTimeout(r, TURN_CUE_DELAY_MS + 100));
     expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
-    expect(v.voice.setThinking).not.toHaveBeenCalled();
+    // The one spoken reply was the agent at work from its arrival to its first audio.
+    expect(v.voice.setThinking.mock.calls).toEqual([[true], [false]]);
     expect(v.voice.publishReply).not.toHaveBeenCalled();
 
     host.emit({ type: 'end', reason: 'done' });
@@ -7347,6 +7348,36 @@ describe('jev calls', () => {
     host.emit({ type: 'reply', text: 'Anything else?', replyId: 'r3' });
     await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
     expect(v.voice.playCue.mock.calls).toEqual([['listening'], ['turn']]);
+    host.endStream();
+  });
+
+  it("types on from the reply's arrival until its first audio, not only until the reply", async () => {
+    const { ctx } = fakeJob({ ...JEV_META });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const typing: boolean[] = [];
+    Object.assign(v.voice, { setTyping: vi.fn((on: boolean) => void typing.push(on)) });
+    // A line whose speech takes a moment to come, as a real synthesis does.
+    let firstAudio = () => undefined as void;
+    v.voice.speak.mockImplementation(async (_text: string, ready: () => Promise<void>) => {
+      await ready();
+      await new Promise<void>((resolve) => (firstAudio = resolve));
+      v.events.onAgentSpeaking(true);
+      v.events.onAgentSpeaking(false);
+      return { heard: true, failed: false, cut: false, audioMs: 0, playedMs: 0, complete: true };
+    });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    host.emit({ type: 'status', status: 'thinking' });
+    await vi.waitFor(() => expect(typing).toEqual([true]));
+    host.emit({ type: 'reply', text: 'Tuesday.', replyId: 'r1' });
+    await vi.waitFor(() => expect(v.voice.speak).toHaveBeenCalledTimes(1));
+    await flush();
+    // The reply is here and being synthesized: still typing, still thinking.
+    expect(typing).toEqual([true]);
+    expect(v.voice.setThinking.mock.calls).toEqual([[true]]);
+    firstAudio();
+    await vi.waitFor(() => expect(v.voice.setThinking).toHaveBeenLastCalledWith(false));
+    expect(typing.at(-1)).toBe(false);
     host.endStream();
   });
 
