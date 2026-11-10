@@ -315,6 +315,23 @@ line to the wake phrase and send word until the caller sends `/voice` (or
 returns the line to jev. A client's `?jev=0` on `livekit/token` makes one call
 plain, and `?jev=1` one jev call. Without the key every call is plain.
 
+A jev voice call has one human in it, so its policy (`oneCaller` in
+`src/modules/meet-jev/policy.ts`) answers more readily than a meeting. The
+caller's pieces split by a pause are joined into one `latest`, back to their
+last answered turn or the agent's last line, across pauses up to 10 seconds.
+The agent answers when Jev gives `answer` a probability of at least 0.3 while
+the agent is idle and the top choice is not `stop` (0.5 when `answer` is the
+top choice), and `continue` takes 0.5. The agent's name alone ("Dan", "Hey
+Dan.") wakes it without a Jev call unless an answer is already on its way.
+
+A jev voice call plays three cues, by the plain call's `cues` and `typing`
+switches: listening once at call start; the typing sound and the "working"
+indicator while the host's loop reports `thinking` (a `status` event to the
+worker; held 20 seconds after a wake, 10 seconds per agent typing tick, and
+through the reply's synthesis until its first audio); and your turn 600 ms
+after a reply finishes. The loop reports `idle` only when the latest wake no
+longer waits on the agent. A meeting plays no cues.
+
 Calls use the caller's core role, checked at start, every turn and every five
 seconds. A revoked role or changed token ends the call. The call chat is the
 line's `/voice` chat and must stay wired to the line's agent: with no usable
@@ -374,8 +391,8 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_WAKE_THRESHOLD` | `0.68` bundled, `0.5` custom | Acoustic confidence threshold between zero and one. |
 | `VOICE_MODE_WAKE_HOP_MS` | `40` | Acoustic scoring hop, `40` or `80` milliseconds; anything else is logged and read as `40`. `40` scores on two interleaved 80 ms grids, about 30% of one core during a call. |
 | `VOICE_MODE_WAKE_START_SECONDS`, `VOICE_MODE_WAKE_IDLE_SECONDS` | `8`, `20` | After the wake phrase, how long the wake waits for the caller's first speech, then how long after the caller's last speech, before it goes back to waiting; zero disables each timer. |
-| `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`. |
-| `VOICE_MODE_CALL_RECORDING` | off | Debug: `true` or `1` also records each caller's whole call, waiting for the wake phrase included, as `data/voice-recordings/<agent>/<date>/<callId>-call.wav` (16 kHz mono, the agent's speech as silence) with a `.json` of wake detections. Local only, owner-only files; pruned by `VOICE_MODE_RECORDINGS_DAYS` when that is set, kept otherwise. |
+| `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`: one file per turn on a plain call, one per utterance on a jev call (those with no transcript included), and each spoken reply. Meetings record nothing. |
+| `VOICE_MODE_CALL_RECORDING` | off | Debug: `true` or `1` also records each caller's whole call, waiting for the wake phrase included, as `data/voice-recordings/<agent>/<date>/<callId>-call.wav` (16 kHz mono; a plain call keeps the agent's speech as silence, a jev call keeps the caller's audio throughout) with a `.json` of wake detections. Local only, owner-only files; pruned by `VOICE_MODE_RECORDINGS_DAYS` when that is set, kept otherwise. |
 | `RECALL_API_KEY` | none | Recall.ai API key; `/meet` is off without it, or with the two URLs below missing or invalid. |
 | `RECALL_REGION` | `eu-central-1` | Recall.ai region: `us-east-1`, `us-west-2`, `eu-central-1` or `ap-northeast-1`. |
 | `MEET_RECALL_PAGE_URL` | none | Public `https` URL where `assets/meet-recall-bridge/index.html` is served; the Recall bot runs it as its camera, its settings in the URL hash. |

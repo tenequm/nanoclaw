@@ -15,10 +15,18 @@ Shape of the rebuilt feature (all in the COPY set):
   LiveKit room as the caller).
 - Shared chat plumbing `voice-mode-chat.ts`; composition root `voice-mode.ts`.
 - `voice-mode-protocol.ts` is the only host-worker contract: optional `meeting` job field,
-  `CallUtterance` (with `candidate` for `/meet ... jev`); `LIVEKIT_PROTOCOL_VERSION` stays `6`.
+  `CallUtterance` (with `candidate` for `/meet ... jev`), the host-to-worker
+  `{ type: 'status', status: 'heard' | 'thinking' | 'speaking' | 'idle' }` event (a jev voice
+  call's cues); `LIVEKIT_PROTOCOL_VERSION` stays `6`.
 - Worker `src/voice-mode-worker.ts`: `loadThreshold: Infinity` (never refuses a call on host CPU
   load), meeting turns are guest turns (no sender role), the acoustic wake spotter runs except in a
-  `jev` meeting, and a meeting records nothing.
+  `jev` meeting, and a meeting records nothing. A jev voice call records each utterance, each
+  reply and (with `VOICE_MODE_CALL_RECORDING`) the whole call, and plays the listening, typing
+  and your-turn cues through the shared `callCues` helper, typing held through `JevLoop.preparing`.
+- Host `src/modules/meet-jev/`: `policy.ts`'s `oneCaller` block (join gap, `speak` 0.3, `continue`
+  0.5) and `nameAlone` in `core/decide.ts` apply only to a voice call; `index.ts` pushes `status` to
+  the worker only on a voice call, and `voice-mode-livekit.ts`'s `chatTyping`
+  pushes `thinking` on the agent's typing ticks.
 
 Depends on: 1 (`registerResidentSkillGate`), 2 (`platformMessageId`, `resolveSenderRole`, the
 `senderRole` parameter of `deliverToAgent`), 3 (typing module with `notePresence`/turn state, the 7th
