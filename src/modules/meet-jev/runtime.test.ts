@@ -12,7 +12,7 @@ const POLICY: CallPolicy = {
   agentName: 'Dan',
   agentAliases: [],
   paragraph: '',
-  oneCaller: { paragraph: '', answer: { p: 0.5 } },
+  oneCaller: { paragraph: '', answer: { p: 0.5 }, speak: { p: 0.3 }, continue: { p: 0.5 }, joinGapMs: 10_000 },
   boundaryFallbackMs: 700,
   windowMs: 90_000,
   windowBytes: 16_384,

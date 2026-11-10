@@ -15,6 +15,9 @@ export function policyFor(kind: CallKind, agentName: string, agentAliases: strin
     oneCaller: {
       paragraph: oneCaller,
       answer: { p: 0.5 },
+      speak: { p: 0.3 },
+      continue: { p: 0.5 },
+      joinGapMs: 10_000,
     },
     boundaryFallbackMs: 700,
     windowMs: 300_000,

@@ -40,6 +40,8 @@ export interface SpeakerState {
   speeches: number;
   /** The speech start whose utterance was seen during that speech; null before any. */
   claimed: number | null;
+  /** Utterances that started at or before this belong to a closed turn: answered, or a stop. */
+  closedAt: number;
 }
 
 const HANDLED_KEPT = 32;
@@ -175,6 +177,26 @@ export function latestUtterance(state: CallState, speakerId: string): Utterance 
     : state.utterances.find((u) => u.speakerId === speakerId && u.uttId === id);
 }
 
+/**
+ * The speaker's turn so far, oldest piece first: their current utterance and, with one human in the call, the
+ * pieces before it that a pause split off, back to their last closed turn or the agent's last line.
+ */
+export function openTurn(state: CallState, speakerId: string): Utterance[] {
+  const current = latestUtterance(state, speakerId);
+  if (!current) return [];
+  const pieces = [current];
+  if (humansInRoom(state) > 1) return pieces;
+  const closedAt = Math.max(state.speakers[speakerId]?.closedAt ?? 0, ...state.agentLines.map((line) => line.at));
+  const earlier = state.utterances
+    .filter((u) => u.speakerId === speakerId && u.startedAt < current.startedAt && hasWords(u.text))
+    .sort((a, b) => b.startedAt - a.startedAt);
+  for (const piece of earlier) {
+    if (piece.startedAt <= closedAt || pieces[0].startedAt - piece.at > state.policy.oneCaller.joinGapMs) break;
+    pieces.unshift(piece);
+  }
+  return pieces;
+}
+
 export const latestWake = (state: CallState): Wake | undefined => state.wakes[state.wakes.length - 1];
 
 export function agentSpeaking(state: CallState): boolean {
@@ -306,6 +328,7 @@ function touchSpeaker(state: CallState, id: string, name: string): SpeakerState 
     handled: [],
     speeches: 0,
     claimed: null,
+    closedAt: 0,
   });
   speaker.name = name;
   return speaker;
