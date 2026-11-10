@@ -253,11 +253,11 @@ describe('getStatus', () => {
 describe('getModelPicker', () => {
   it('marks the current model active', async () => {
     await makeAgentGroup('ag-1', 'Emma');
-    await updateContainerConfigScalars('ag-1', { model: 'claude-fable-5-1' });
+    await updateContainerConfigScalars('ag-1', { model: 'claude-fable-5-2' });
     const res = await getModelPicker('ag-1');
     if (!res.ok) throw new Error('expected ok');
-    expect(res.view.current).toEqual({ id: 'claude-fable-5-1', label: 'Fable 5.1' });
-    expect(res.view.options.find((o) => o.id === 'claude-fable-5-1')?.active).toBe(true);
+    expect(res.view.current).toEqual({ id: 'claude-fable-5-2', label: 'Fable 5.2' });
+    expect(res.view.options.find((o) => o.id === 'claude-fable-5-2')?.active).toBe(true);
     expect(res.view.options.filter((o) => o.active)).toHaveLength(1);
   });
 });
@@ -296,7 +296,7 @@ describe('setModel', () => {
     if (res.ok) throw new Error('expected failure');
     expect(res.reason).toBe('invalid-value');
     expect(res.detail?.field).toBe('model');
-    expect(res.detail?.allowed).toEqual(['sonnet', 'sonnet-5', 'opus', 'opus-5.5', 'fable', 'fable-5.1']);
+    expect(res.detail?.allowed).toEqual(['sonnet', 'sonnet-5', 'opus', 'opus-5.5', 'fable', 'fable-5.2']);
   });
 
   it('writes the resolved id and returns old/new labels', async () => {
@@ -426,10 +426,10 @@ describe('setConfigValue', () => {
   });
 
   it('model field returns friendly labels for previous/current', async () => {
-    await updateContainerConfigScalars('ag-1', { model: 'claude-fable-5-1' });
+    await updateContainerConfigScalars('ag-1', { model: 'claude-fable-5-2' });
     const res = await setConfigValue('ag-1', 'model', 'opus', OWNER);
     if (!res.ok) throw new Error('expected ok');
-    expect(res.view.previousLabel).toBe('Fable 5.1');
+    expect(res.view.previousLabel).toBe('Fable 5.2');
     expect(res.view.currentLabel).toBe('Opus 5');
     expect(res.view.current).toBe('claude-opus-5');
   });
