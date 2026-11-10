@@ -17,14 +17,7 @@
 import { Effect, Semaphore } from 'effect';
 import type { Context } from 'grammy';
 
-import type {
-  ChannelAdapter,
-  ChannelDefaults,
-  ChannelSetup,
-  ConversationInfo,
-  OutboundMessage,
-  ResolvedReaction,
-} from '../adapter.js';
+import type { ChannelAdapter, ChannelDefaults, ChannelSetup, ConversationInfo, OutboundMessage } from '../adapter.js';
 import { registerChannelAdapter } from '../channel-registry.js';
 import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
@@ -48,8 +41,7 @@ import {
 } from './inbound.js';
 import { rememberTopicMessage, resolveTopicPlatformId } from './topic-map.js';
 import { tryPair } from './pairing-interceptor.js';
-import { dispatchOutbound } from './outbound.js';
-import { ALLOWED_REACTION_GLYPHS, resolveReactionEmoji } from './reactions.js';
+import { dispatchOutbound, rememberInboundMessage } from './outbound.js';
 import { runSupervisedPolling } from './supervise.js';
 import { buildRuntime, type AdapterRuntime } from './runtime.js';
 import { installChatCommands } from './commands/index.js';
@@ -66,7 +58,6 @@ class TelegramGrammyAdapter implements ChannelAdapter {
   readonly name = CHANNEL_TYPE;
   readonly channelType = CHANNEL_TYPE;
   readonly supportsThreads = false;
-  readonly threadsReplies = true;
   readonly defaults: ChannelDefaults = TELEGRAM_DEFAULTS;
 
   private runtime: AdapterRuntime | null = null;
@@ -140,6 +131,7 @@ class TelegramGrammyAdapter implements ChannelAdapter {
           const paired = yield* tryPair(chatId, platformId, isGroup, chatName, message);
           if (paired) return;
 
+          rememberInboundMessage(ctx.update, platformId);
           yield* onInbound(platformId, threadId, message);
         });
 
@@ -302,16 +294,6 @@ class TelegramGrammyAdapter implements ChannelAdapter {
         );
       }),
     );
-  }
-
-  /**
-   * Telegram's reaction set is fixed for every chat member, bot or human, so
-   * the host resolves an agent's emoji here before delivery and reports the
-   * outcome into the session. Pure lookup — no runtime, no network.
-   */
-  resolveReaction(emoji: string): ResolvedReaction {
-    const { glyph, substituted } = resolveReactionEmoji(emoji);
-    return { emoji: glyph, substituted, platform: 'Telegram', allowed: ALLOWED_REACTION_GLYPHS };
   }
 
   async syncConversations(): Promise<ConversationInfo[]> {

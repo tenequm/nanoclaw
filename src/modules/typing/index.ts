@@ -8,9 +8,10 @@
  * thinking. This module keeps it alive by re-firing `setTyping` on a
  * short interval while the agent is actually working.
  *
- * "Working" is decided from the runner's own presence report, read on the
- * delivery poll (`notePresence`): the turn state the runner writes to its
- * container record (`working` while a turn runs, `idle` when it ends) .
+ * "Working" is decided from the runner's own presence report, pushed by the
+ * HTTP mailbox as each turn write commits (`notePresence`): the turn state the
+ * runner writes to its container record (`working` while a turn runs, `idle`
+ * when it ends). The sqlite transport has no push, so it is never reported there.
  * The host no longer has to guess from a heartbeat FILE — which is
  * invisible when the delivering process doesn't share a filesystem with
  * the runner, and never says "stop". A runner that predates the turn
@@ -121,7 +122,7 @@ interface TypingAdapter {
   typingRequiresThread?(channelType: string, instance?: string): boolean;
 }
 
-/** The runner's latest presence report, as read on the delivery poll. */
+/** The runner's latest presence report, as pushed by the HTTP mailbox. */
 export interface PresenceReport {
   /** 'working' | 'idle', or null when the runner never reported (older runner). */
   turn: 'working' | 'idle' | null;
@@ -479,8 +480,8 @@ export function startTypingRefresh(
 }
 
 /**
- * Record the runner's latest presence report for a session, read on the
- * delivery poll: turn state plus optional status text. Stores it on the
+ * Record the runner's latest presence report for a session, pushed by the
+ * HTTP mailbox when a turn write commits. Stores it on the
  * active refresher entry; creates no entry if none is active (typing is
  * only ever started by an inbound message). A missing record or a null turn
  * (older runner) reads as "not reported" and leaves the heartbeat-file

@@ -188,7 +188,7 @@ Access: `container/agent-runner/src/db/session-state.ts`.
 Single-row (`id=1`) container status. Two things live here:
 
 - **Tool in flight.** The container records the currently-running tool on `PreToolUse` and clears it on `PostToolUse`/`PostToolUseFailure`; the host reads it during the stale-container sweep to widen its stuck-tolerance window when `Bash` is running with a user-declared `timeout` over the normal threshold, so long-running scripts aren't killed as "stuck".
-- **Turn state.** The poll loop writes `turn = 'working'` when it starts answering (and re-marks it every 5 s while a turn runs, so `updated_at` keeps moving) and `turn = 'idle'` when the turn ends. The host reads it on the delivery poll and drives the typing indicator from it: refresh while `working` and fresh, clear on `idle` or when the report goes stale. `NULL` means the runner never reported (a runner predating the column) - the host falls back to the heartbeat-file rule.
+- **Turn state.** The poll loop writes `turn = 'working'` when it starts answering (and re-marks it every 5 s while a turn runs, so `updated_at` keeps moving) and `turn = 'idle'` when the turn ends. On the HTTP transport the host hears each write as it commits and drives the typing indicator from it: refresh while `working` and fresh, clear on `idle` or when the report goes stale. `NULL` means the runner never reported (a runner predating the column) - the host falls back to the heartbeat-file rule, as it does on the sqlite transport, which pushes nothing.
 
 ```sql
 CREATE TABLE container_state (
@@ -202,7 +202,7 @@ CREATE TABLE container_state (
 ```
 
 - **Writer (container):** the SQLite mailbox driver records tool state and turn state in `container/agent-runner/src/mailbox/sqlite/connection.ts`. A turn write moves only `turn` and `updated_at`; a tool write leaves `turn` alone.
-- **Reader (host):** `getContainerState()` in `src/mailbox/sqlite/session-db.ts`; consumed through the mailbox contract by the sweep and by the delivery poll (typing).
+- **Reader (host):** `getContainerState()` in `src/mailbox/sqlite/session-db.ts`; consumed through the mailbox contract by the sweep. Typing takes the turn from the HTTP mailbox's commit hook (`src/modules/mailbox-http/index.ts`), not from this read.
 - `CREATE TABLE IF NOT EXISTS` - forward-compatible with `outbound.db` files created before this table existed; `getContainerState()` returns `null` if the table or row is absent. `turn` was added later: the runner adds the column on start (`ALTER TABLE ... ADD COLUMN`, guarded by `PRAGMA table_info`), and the host read tolerates a table that still lacks it (an older runner owns that file), reporting `turn: null`.
 
 ---

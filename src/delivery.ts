@@ -33,10 +33,9 @@ import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { platformMessageId } from './platform-id.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
-import { notePresence, pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
-import { getContainerConfig } from './db/container-configs.js';
-import type { OutboundFile, ResolvedReaction } from './channels/adapter.js';
+import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
+import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import type { OutboundFile } from './channels/adapter.js';
 import type { AgentGroup, PendingApproval, Session } from './types.js';
 import type { OutboundMessage } from './mailbox/index.js';
 
@@ -122,10 +121,14 @@ async function clearAttemptRow(messageId: string): Promise<void> {
  * the channel adapter, both markDelivered (idempotent in the DB via
  * INSERT OR IGNORE — but the user has already seen the message twice).
  *
- * Skipping (vs. queueing) is correct: any message left over when the
- * second caller skips will be picked up on the next poll tick (~1s).
+ * The second caller skips rather than queueing: the running drain may have
+ * read the queue before the caller's row landed, so it records the session
+ * in drainAgain and the running drain makes exactly one more pass when it
+ * ends. A request during that pass is left to the next poll tick (~1s), so
+ * a drain never chains indefinitely.
  */
 const inflightDeliveries = new Set<string>();
+const drainAgain = new Set<string>();
 
 /**
  * Per session, ids of rows whose send passed its deadline and has not settled. Drains skip them, so a send that
@@ -154,9 +157,9 @@ const backgroundDrains = new Set<Promise<void>>();
 
 export function _resetDeliveryStateForTesting(): void {
   inflightDeliveries.clear();
+  drainAgain.clear();
   overdueDeliveries.clear();
   backgroundDrains.clear();
-  stopExpediting();
 }
 
 export interface ChannelDeliveryAdapter {
@@ -172,7 +175,6 @@ export interface ChannelDeliveryAdapter {
     instance?: string,
     inReplyTo?: string,
   ): Promise<string | undefined>;
-  resolveReaction?(channelType: string, emoji: string, instance?: string): ResolvedReaction | undefined;
   clearTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
   addReaction?(
     channelType: string,
@@ -189,7 +191,6 @@ export interface ChannelDeliveryAdapter {
     instance?: string,
   ): Promise<void>;
   typingRequiresThread?(channelType: string, instance?: string): boolean;
-  threadsReplies?(channelType: string, instance?: string): boolean;
   setTyping?(
     channelType: string,
     platformId: string,
@@ -241,43 +242,6 @@ export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
       .then(() => cb(adapter))
       .catch((err) => log.error('onDeliveryAdapterReady callback threw', { err }));
   }
-}
-
-/** A session someone waits on in real time is drained this often, instead of on the active poll alone. */
-const EXPEDITED_POLL_MS = 200;
-/** Sessions drained every EXPEDITED_POLL_MS, each until its deadline. */
-const expedited = new Map<string, { session: Session; until: number }>();
-let expediteTimer: ReturnType<typeof setInterval> | undefined;
-
-/**
- * Drain one session's outbound queue every EXPEDITED_POLL_MS for the next `forMs`: for a caller
- * waiting on the reply live (a voice call's turn), the ~1 s active poll alone adds half a second
- * on average. The per-session re-entry guard keeps it from racing the regular polls.
- */
-export function expediteDelivery(session: Session, forMs: number): void {
-  if (!activePolling) return;
-  expedited.set(session.id, { session, until: Date.now() + forMs });
-  if (expediteTimer) return;
-  expediteTimer = setInterval(() => {
-    const now = Date.now();
-    for (const [id, entry] of expedited) {
-      if (entry.until <= now) {
-        expedited.delete(id);
-        continue;
-      }
-      void deliverSessionMessages(entry.session).catch((err: unknown) =>
-        log.error('Session delivery failed', { sessionId: id, err }),
-      );
-    }
-    if (expedited.size === 0) stopExpediting();
-  }, EXPEDITED_POLL_MS);
-  expediteTimer.unref?.();
-}
-
-function stopExpediting(): void {
-  clearInterval(expediteTimer);
-  expediteTimer = undefined;
-  expedited.clear();
 }
 
 /** Start the active container poll loop (~1s). */
@@ -347,15 +311,6 @@ export async function deliverToSessions(sessions: readonly Session[]): Promise<v
   });
 }
 
-function readPresence<T>(sessionId: string, read: () => T): T | undefined {
-  try {
-    return read();
-  } catch (err) {
-    log.debug('Presence read failed', { sessionId, err: String(err) });
-    return undefined;
-  }
-}
-
 /** Drain a session, but hand it to the background past TICK_DRAIN_WAIT_MS. */
 async function drainWithinTick(session: Session): Promise<void> {
   const drain = deliverSessionMessages(session);
@@ -369,13 +324,18 @@ async function drainWithinTick(session: Session): Promise<void> {
 export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
-  if (inflightDeliveries.has(session.id)) return;
+  if (inflightDeliveries.has(session.id)) {
+    drainAgain.add(session.id);
+    return;
+  }
   inflightDeliveries.add(session.id);
 
   try {
     await drainSession(session);
+    if (drainAgain.delete(session.id)) await drainSession(session);
   } finally {
     inflightDeliveries.delete(session.id);
+    drainAgain.delete(session.id);
   }
 }
 
@@ -402,7 +362,6 @@ async function drainSession(session: Session): Promise<void> {
       const delivered = mailbox.getDeliveredIds();
       return {
         delivered,
-        containerState: readPresence(session.id, () => mailbox.getContainerState()),
         pending: mailbox
           .getDueMessages(delivered)
           .filter((candidate) => !delivered.has(candidate.id) && !parked.has(candidate.id)),
@@ -410,11 +369,6 @@ async function drainSession(session: Session): Promise<void> {
     });
     if (!existing) return;
     ({ delivered, pending } = existing);
-    const { containerState } = existing;
-    notePresence(session.id, {
-      turn: containerState?.turn ?? null,
-      updatedAtMs: containerState ? Date.parse(containerState.updatedAt) : null,
-    });
   } catch (err) {
     log.error('Session mailbox delivery failed', {
       agentGroupId: agentGroup.id,
@@ -510,117 +464,6 @@ async function completeDelivery(
       }
     }
   }
-}
-
-async function resolveThreadReply(
-  msg: { channelType: string | null; platformId: string | null; inReplyTo: string | null },
-  content: Record<string, unknown>,
-  session: Session,
-  instance: string | undefined,
-): Promise<{ quote?: string } | undefined> {
-  if (!msg.inReplyTo || !msg.channelType || !msg.platformId) return undefined;
-  // Edits, reactions and questions are not new messages; a media group is.
-  if (typeof content.operation === 'string' && content.operation !== 'send_media_group') return undefined;
-  if (content.type === 'ask_question') return undefined;
-  if (!deliveryAdapter?.threadsReplies?.(msg.channelType, instance)) return undefined;
-
-  const intent = content.replyIntent;
-  if (typeof intent === 'object' && intent !== null) {
-    const quote = (intent as { quote?: unknown }).quote;
-    return typeof quote === 'string' && quote ? { quote } : {};
-  }
-
-  const { channelType, platformId, inReplyTo } = msg;
-  try {
-    const target = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox.getReplyTarget(inReplyTo),
-    );
-    const sameChat = target?.channelType === channelType && target.platformId === platformId;
-    return sameChat && target.newerInChat ? {} : undefined;
-  } catch (err) {
-    log.debug('Reply target unreadable, replying plain', { messageId: inReplyTo, sessionId: session.id, err });
-    return undefined;
-  }
-}
-
-async function writeOutboundNote(session: Session, messageId: string, text: string): Promise<void> {
-  try {
-    await writeSessionMessage(session.agent_group_id, session.id, {
-      id: `reaction-note-${messageId}`,
-      kind: 'chat',
-      timestamp: new Date().toISOString(),
-      platformId: null,
-      channelType: 'agent',
-      threadId: null,
-      content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
-      trigger: false,
-    });
-  } catch (err) {
-    log.warn('Failed to write outbound note back to the session', { messageId, sessionId: session.id, err });
-  }
-}
-
-/**
- * Resolve a reaction operation against the delivering platform's fixed
- * reaction set. Pure — it decides and phrases, the caller writes, because the
- * two notes are owed to the agent at different moments:
- *
- * `drop` — nothing in the allowed set carries the intent. Nothing is sent (the
- * Bot API would 400 REACTION_INVALID), so its note is true the moment the
- * decision is made and is written before the adapter is ever called.
- * `substituted` — a nearest-allowed stand-in goes out instead. Its note names a
- * completed send ("sent ⚡ instead"), so it is only true once `deliver` has
- * returned; writing it earlier would tell the agent about a send that a failed
- * delivery then never makes.
- * `untouched` — exact match, no fixed set, or not a reaction.
- */
-type ReactionOutcome =
-  | { kind: 'untouched' }
-  | { kind: 'drop'; note: string }
-  | { kind: 'substituted'; emoji: string; note: string };
-
-function resolveOutboundReaction(
-  msg: { id: string; channelType: string },
-  content: Record<string, unknown>,
-  session: Session,
-  instance?: string,
-): ReactionOutcome {
-  // An empty emoji CLEARS the reaction — a legitimate operation, nothing to resolve.
-  if (content.operation !== 'reaction' || typeof content.emoji !== 'string' || !content.emoji) {
-    return { kind: 'untouched' };
-  }
-  const input = content.emoji;
-  const resolved = deliveryAdapter?.resolveReaction?.(msg.channelType, input, instance);
-  if (!resolved) return { kind: 'untouched' };
-
-  if (resolved.emoji === null) {
-    log.warn('Reaction dropped — outside the platform set, reported back to the agent', {
-      messageId: msg.id,
-      sessionId: session.id,
-      channelType: msg.channelType,
-      input,
-    });
-    return {
-      kind: 'drop',
-      note:
-        `Your reaction "${input}" was not sent: ${resolved.platform} only allows a fixed reaction set. ` +
-        `Allowed: ${resolved.allowed.join(' ')}.`,
-    };
-  }
-
-  if (!resolved.substituted) return { kind: 'untouched' };
-
-  log.info('Reaction substituted with the nearest allowed glyph', {
-    messageId: msg.id,
-    sessionId: session.id,
-    input,
-    sent: resolved.emoji,
-  });
-  return {
-    kind: 'substituted',
-    emoji: resolved.emoji,
-    note: `Your reaction "${input}" is not in ${resolved.platform}'s allowed set; sent ${resolved.emoji} instead.`,
-  };
 }
 
 /** Never throws. */
@@ -885,17 +728,6 @@ async function deliverMessage(
     return;
   }
 
-  const reaction = resolveOutboundReaction(
-    { id: msg.id, channelType: msg.channelType },
-    content,
-    session,
-    deliverInstance,
-  );
-  if (reaction.kind === 'drop') {
-    await writeOutboundNote(session, msg.id, reaction.note);
-    return;
-  }
-
   // Read file attachments from outbox if the content declares files.
   // File I/O lives in session-manager.ts (symmetric with inbound
   // extractAttachmentFiles) — delivery just hands buffers to the adapter.
@@ -904,22 +736,12 @@ async function deliverMessage(
       ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
       : undefined;
 
-  const rewritten: Record<string, unknown> = {};
-  if (typeof content.messageId === 'string') {
-    rewritten.messageId = platformMessageId(content.messageId, session.agent_group_id);
-  }
-  if (reaction.kind === 'substituted') rewritten.emoji = reaction.emoji;
-  if (await richAllowed(msg.id, content, session)) rewritten.rich = true;
-  const threadReply = await resolveThreadReply(msg, content, session, deliverInstance);
-  if (threadReply) rewritten.threadReply = threadReply;
-  // Agent-asked questions keep their own markup (U).
-  if (content.type === 'ask_question') rewritten.fromAgent = true;
-  // Only the host decides on a reply box; the stored content's own key is not carried.
-  const { threadReply: _stored, rich: _rich, ...base } = content;
+  // Agent-asked questions keep their own markup; host-built cards never come
+  // through here, so only they get a channel's card-text escape.
   const deliveredContent =
-    Object.keys(rewritten).length > 0 || 'threadReply' in content || 'rich' in content
-      ? JSON.stringify({ ...base, ...rewritten })
-      : msg.content;
+    content.type === 'ask_question'
+      ? JSON.stringify({ ...content, fromAgent: true })
+      : withPlatformMessageId(content, msg.content, session.agent_group_id);
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channelType,
     msg.platformId,
@@ -949,7 +771,6 @@ async function deliverMessage(
     fileCount: files?.length,
   });
 
-  if (reaction.kind === 'substituted') await writeOutboundNote(session, msg.id, reaction.note);
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
   return platformMsgId;
@@ -1155,19 +976,6 @@ async function handleSystemAction(content: Record<string, unknown>, session: Ses
 export function stopDeliveryPolls(): void {
   activePolling = false;
   sweepPolling = false;
-  stopExpediting();
-}
-
-async function richAllowed(messageId: string, content: Record<string, unknown>, session: Session): Promise<boolean> {
-  const isEdit = content.operation === 'edit';
-  if (!isEdit && content.rich !== true) return false;
-  if ((await getContainerConfig(session.agent_group_id))?.rich_messages === 1) return true;
-  if (isEdit) return false;
-  log.warn('Rich message requested by a group without rich_messages; sending it as a normal message', {
-    id: messageId,
-    agentGroupId: session.agent_group_id,
-  });
-  return false;
 }
 
 /**

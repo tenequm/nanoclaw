@@ -23,7 +23,12 @@ import { log } from '../../log.js';
 import { SqliteAgentMailbox } from '../sqlite/index.js';
 import { sessionMailboxDir, sessionMailboxPath } from '../sqlite/paths.js';
 import type { MailboxSessionKey } from '../types.js';
-import { createMailboxHttpServer, MAILBOX_HTTP_PATH, MAILBOX_HTTP_PROTOCOL } from './server.js';
+import {
+  createMailboxHttpServer,
+  MAILBOX_HTTP_PATH,
+  MAILBOX_HTTP_PROTOCOL,
+  type MailboxCommitListener,
+} from './server.js';
 
 const SETTINGS = [
   'NANOCLAW_MAILBOX_TRANSPORT',
@@ -182,8 +187,11 @@ export class HttpServedAgentMailbox extends SqliteAgentMailbox {
     return a.length === b.length && timingSafeEqual(a, b);
   }
 
-  /** Start the endpoint (host startup). A no-op on the sqlite transport. */
-  async listen(): Promise<void> {
+  /**
+   * Start the endpoint (host startup). A no-op on the sqlite transport.
+   * `onCommitted` is the host's reaction to each committed runner batch, injected so this layer imports none of it.
+   */
+  async listen(onCommitted?: MailboxCommitListener): Promise<void> {
     if (this.server || this.settings.transport === 'sqlite') return;
     const server = createMailboxHttpServer({
       exists: (key) => this.exists(key),
@@ -193,6 +201,7 @@ export class HttpServedAgentMailbox extends SqliteAgentMailbox {
         outbound: sessionMailboxPath(key, 'outbound'),
         heartbeat: path.join(sessionMailboxDir(key), '.heartbeat'),
       }),
+      onCommitted,
     });
     const { bind, port } = this.settings;
     await new Promise<void>((resolve, reject) => {
