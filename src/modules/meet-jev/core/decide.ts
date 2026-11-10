@@ -15,6 +15,7 @@ import {
   latestWake,
   markHandled,
   normalize,
+  openTurn,
   pendingAnswer,
   refreshVersion,
   renderWindow,
@@ -154,8 +155,9 @@ function decideLatest(state: CallState, speakerId: string): boolean {
     state.deferred = null;
   }
 
-  const trigger = { trigger: utt.text, speaker: speaker.name };
-  const { vocative, rest } = vocativeOf(utt.text, [state.policy.agentName, ...state.policy.agentAliases]);
+  const names = [state.policy.agentName, ...state.policy.agentAliases];
+  const piece = { trigger: utt.text, speaker: speaker.name };
+  const { vocative, rest } = vocativeOf(utt.text, names);
   if (
     rest === 'please stop' ||
     rest === 'stop please' ||
@@ -166,15 +168,18 @@ function decideLatest(state: CallState, speakerId: string): boolean {
         .every((word) => STOP_WORDS.has(word)))
   ) {
     if (agentSpeaking(state) || pendingAnswer(state)) {
+      speaker.closedAt = utt.startedAt;
       stop(state);
-      log(state, 'decision', { ...trigger, rule: 'stop', action: 'stop' });
+      log(state, 'decision', { ...piece, rule: 'stop', action: 'stop' });
       return true;
     }
     if (vocative) {
-      log(state, 'decision', { ...trigger, rule: 'stop', action: 'none', reason: 'nothing_to_stop' });
+      speaker.closedAt = utt.startedAt;
+      log(state, 'decision', { ...piece, rule: 'stop', action: 'none', reason: 'nothing_to_stop' });
       return true;
     }
   }
+  const trigger = { trigger: openTurnOf(state, speakerId).text, speaker: speaker.name };
   // Someone else took the floor before this boundary: a verdict now would be deferred anyway, so Jev is not asked.
   if (floorTaken(state)) {
     unmarkHandled(speaker, utt.uttId);
@@ -182,8 +187,21 @@ function decideLatest(state: CallState, speakerId: string): boolean {
     log(state, 'boundary_deferred', trigger);
     return true;
   }
-  judge(state, speakerId, utt.uttId, utt.text, false);
+  // One caller saying only the name is checking the agent is there; mid-answer it is Jev's to read.
+  if (humansInRoom(state) <= 1 && nameAlone(utt.text, names) && !agentSpeaking(state) && !pendingAnswer(state)) {
+    log(state, 'decision', { ...trigger, rule: 'name_alone', action: 'answer' });
+    wake(state, speakerId, utt.uttId, trigger.trigger);
+    return true;
+  }
+  judge(state, speakerId, utt.uttId, false);
   return true;
+}
+
+/** The speaker's open turn as one text, and whether any of it calls the agent by name with words after. */
+function openTurnOf(state: CallState, speakerId: string): { text: string; named: boolean } {
+  const pieces = openTurn(state, speakerId).map((utterance) => utterance.text);
+  const text = pieces.join(' ');
+  return { text, named: [...pieces, text].some((said) => addressedByName(state, said)) };
 }
 
 /** The agent called by name with words after it ("Dan, ..."), not the name alone. */
@@ -192,8 +210,8 @@ function addressedByName(state: CallState, text: string): boolean {
   return vocative && hasWords(rest);
 }
 
-function judge(state: CallState, speakerId: string, uttId: string, trigger: string, retried: boolean): void {
-  const named = addressedByName(state, trigger);
+function judge(state: CallState, speakerId: string, uttId: string, retried: boolean): void {
+  const { text: trigger, named } = openTurnOf(state, speakerId);
   state.judging = {
     version: state.windowVersion,
     speakerId,
@@ -236,7 +254,7 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     if (!judging.retried && !wokeSince && speaker && utt && hasWords(utt.text)) {
       log(state, 'verdict_stale', { ...trigger, verdictVersion: version, action: 'rejudge' });
       markHandled(speaker, utt.uttId);
-      judge(state, judging.speakerId, utt.uttId, utt.text, true);
+      judge(state, judging.speakerId, utt.uttId, true);
     } else {
       log(state, 'verdict_stale', { ...trigger, verdictVersion: version, action: 'none' });
     }
@@ -270,15 +288,24 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
  * a lone human or a vocative is low-risk, so both take the one-caller bar; named hold-backs score near zero.
  */
 function chosen(state: CallState, verdict: Verdict, addressedByName: boolean): Action {
-  const { thresholds } = state.policy;
-  const lowRisk = humansInRoom(state) <= 1 || addressedByName;
+  const { thresholds, oneCaller } = state.policy;
+  const alone = humansInRoom(state) <= 1;
+  const lowRisk = alone || addressedByName;
+  const busy = agentSpeaking(state) || pendingAnswer(state);
   const over = (action: Exclude<Action, 'stay_silent'>) => {
-    const threshold = action === 'answer' && lowRisk ? state.policy.oneCaller.answer : thresholds[action];
+    const threshold =
+      action === 'answer' && lowRisk
+        ? oneCaller.answer
+        : action === 'continue' && alone
+          ? oneCaller.continue
+          : thresholds[action];
     return verdict.action === action && verdict.probabilities[action] >= threshold.p;
   };
-  if ((agentSpeaking(state) || pendingAnswer(state)) && over('stop')) return 'stop';
+  if (busy && over('stop')) return 'stop';
   if (state.cutOffAfter !== null && !agentSpeaking(state) && over('continue')) return 'continue';
   if (over('answer')) return 'answer';
+  // One human has nobody else to talk to: a fair chance of `answer` is enough while the agent is idle.
+  if (alone && !busy && verdict.action !== 'stop' && verdict.probabilities.answer >= oneCaller.speak.p) return 'answer';
   return 'stay_silent';
 }
 
@@ -327,6 +354,8 @@ function wake(state: CallState, speakerId: string, uttId: string, message: strin
     'Reply in one or two short spoken sentences; your reply is read aloud. If nothing needs saying, reply exactly [silent].',
   ].join('\n\n');
   const triggerAt = state.utterances.find((u) => u.speakerId === speakerId && u.uttId === uttId)?.startedAt;
+  const speaker = state.speakers[speakerId];
+  if (speaker) speaker.closedAt = triggerAt ?? state.now;
   state.wakes = [
     ...state.wakes,
     {
@@ -476,6 +505,20 @@ export function vocativeOf(text: string, names: string[]): { vocative: boolean; 
   const tail = /^(.*?)\s*,\s*([\p{L}]+)\s*[.?!]*$/u.exec(said);
   if (tail && sameName(tail[2], words)) return { vocative: true, rest: unpunctuated(tail[1]) };
   return { vocative: false, rest: unpunctuated(said) };
+}
+
+/** The agent's name and nothing else ("Dan", "Hey Dan.", "Ден?"). */
+export function nameAlone(text: string, names: string[]): boolean {
+  const said = unpunctuated(normalize(text)).replace(/^(?:hey|hi|ok|okay|гей|хей|привіт|окей) /u, '');
+  const known = names.map((name) => unpunctuated(normalize(name))).filter(Boolean);
+  return (
+    known.includes(said) ||
+    (!/\s/.test(said) &&
+      sameName(
+        said,
+        known.filter((name) => !/\s/.test(name)),
+      ))
+  );
 }
 
 /** Cyrillic letters as Latin sounds (the worker's wake matching uses the same table). */

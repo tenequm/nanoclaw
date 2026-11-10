@@ -200,12 +200,36 @@ describe('a named question', () => {
   });
 
   it('a name alone or a third-person mention is not addressed_by_name', () => {
-    const call = new Call();
+    const call = new Call('meet');
+    call.feed({ kind: 'presence', speaker: misha, joined: true }, { kind: 'presence', speaker: olena, joined: true });
     const [named] = only(call.say(misha, 'u1', 'Dan?'), 'judge');
     expect(named.state.facts.addressed_by_name).toBe(false);
     call.verdict(named.windowVersion, 'stay_silent');
     const [mention] = only(call.say(misha, 'u2', 'I told Dan about it.'), 'judge');
     expect(mention.state.facts.addressed_by_name).toBe(false);
+  });
+
+  it.each(['Dan', 'Hey Dan.', 'Ден?', 'Дене!'])('one caller saying only the name wakes without Jev: %s', (text) => {
+    const call = new Call();
+    const commands = call.say(misha, 'u1', text);
+    expect(only(commands, 'judge')).toEqual([]);
+    expect(only(commands, 'turn')).toMatchObject([{ message: text }]);
+    expect(call.lastLog('decision')).toMatchObject({ rule: 'name_alone', action: 'answer' });
+  });
+
+  it('the name alone carries what the caller said just before it', () => {
+    const call = new Call();
+    const [judge] = only(call.say(misha, 'u1', 'what time is it'), 'judge');
+    call.verdict(judge.windowVersion, 'stay_silent');
+    expect(only(call.say(misha, 'u2', 'Dan?'), 'turn')).toMatchObject([{ message: 'what time is it Dan?' }]);
+  });
+
+  it('the name alone is left to Jev while an answer is on its way', () => {
+    const call = new Call();
+    call.sayAnswered(misha, 'u1', 'Dan, what time is it?');
+    const commands = call.say(misha, 'u2', 'Dan?');
+    expect(only(commands, 'turn')).toEqual([]);
+    expect(only(commands, 'judge')).toHaveLength(1);
   });
 
   it('speaks the reply and puts the agent line in the window from the playback reports', () => {
@@ -274,13 +298,14 @@ describe('a half sentence, then its rest', () => {
     const call = new Call();
     const [first] = only(call.say(misha, 'u1', 'So what I want to know is'), 'judge');
     expect(first.state.window).toEqual([{ t: 0.2, speaker: 'Misha', text: 'So what I want to know is' }]);
-    expect(call.verdict(first.windowVersion, 'answer', 0.3, 0.4)).toEqual([]);
+    expect(call.verdict(first.windowVersion, 'answer', 0.29, 0.4)).toEqual([]);
     expect(call.lastLog('decision')).toMatchObject({ action: 'stay_silent' });
 
     const [second] = only(call.say(misha, 'u2', 'whether it rains tomorrow'), 'judge');
     expect(second.state.window.map((l) => l.text)).toEqual(['So what I want to know is', 'whether it rains tomorrow']);
     const [turn] = only(call.verdict(second.windowVersion, 'answer'), 'turn');
-    expect(turn.message).toBe('whether it rains tomorrow');
+    expect(second.state.latest?.text).toBe('So what I want to know is whether it rains tomorrow');
+    expect(turn.message).toBe('So what I want to know is whether it rains tomorrow');
     expect(turn.note).toContain('Misha: So what I want to know is\nMisha: whether it rains tomorrow');
   });
 
@@ -562,10 +587,10 @@ describe('verdicts', () => {
   it('answers at the probability threshold regardless of confidence', () => {
     const call = new Call();
     const [judge] = only(call.say(misha, 'u1', 'what is the capital of Peru'), 'judge');
-    expect(call.verdict(judge.windowVersion, 'answer', 0.49, 0.9)).toEqual([]);
+    expect(call.verdict(judge.windowVersion, 'answer', 0.29, 0.9)).toEqual([]);
     const [again] = only(call.say(misha, 'u2', 'the capital of Peru, anyone?'), 'judge');
     const [turn] = only(call.verdict(again.windowVersion, 'answer', 0.5, 0.1), 'turn');
-    expect(turn.message).toBe('the capital of Peru, anyone?');
+    expect(turn.message).toBe('what is the capital of Peru the capital of Peru, anyone?');
     expect(call.lastLog('decision')).toMatchObject({
       jev: { choice: 'answer', confidence: 0.1 },
       action: 'answer',
@@ -676,7 +701,7 @@ describe('late finals', () => {
     expect(toJevState(call.state).window.map((l) => l.text)).toEqual(['Dan, hello', 'what time is it']);
     // The verdict on B is stale (A's line arrived) and B is re-judged, not A.
     const [rejudge] = only(call.verdict(judge.windowVersion, 'answer'), 'judge');
-    expect(rejudge.state.latest?.text).toBe('what time is it');
+    expect(rejudge.state.latest?.text).toBe('Dan, hello what time is it');
   });
 
   it("an older utterance's final while the current one awaits its own is no boundary for the current one", () => {
@@ -690,7 +715,8 @@ describe('late finals', () => {
       call.feed({ kind: 'utterance', speaker: misha, uttId: 'b', text: 'Dan, what is the time?', final: true }),
       'judge',
     );
-    expect(judge.state.latest?.text).toBe('Dan, what is the time?');
+    expect(judge.state.latest).toEqual({ speaker: 'Misha', text: 'so Dan, what is the time?' });
+    expect(judge.state.facts.addressed_by_name).toBe(true);
   });
 
   it('two finals of utterances never seen as partials, in order, are each decided', () => {
@@ -725,7 +751,7 @@ describe('a verdict after the speaker resumed', () => {
       call.feed({ kind: 'utterance', speaker: misha, uttId: 'u2', text: 'and of Spain?', final: true }),
       'judge',
     );
-    expect(next.state.latest?.text).toBe('and of Spain?');
+    expect(next.state.latest?.text).toBe('what is the capital of France and of Spain?');
     expect(next.state.window.map((l) => l.text)).toEqual(['what is the capital of France', 'and of Spain?']);
     expect(only(call.verdict(next.windowVersion, 'answer'), 'turn')).toHaveLength(1);
   });
@@ -947,12 +973,93 @@ describe('room size and probability-only routing', () => {
     expect(only(call.verdict(judge.windowVersion, 'stop', p, 0), 'stop_playback')).toHaveLength(p >= 0.6 ? 1 : 0);
   });
 
-  it.each([0.69, 0.7])('continues on probability alone at 0.7: %s', (p) => {
-    const call = new Call();
+  it.each([
+    ['voice', 0.49, 0],
+    ['voice', 0.5, 1],
+    ['meet', 0.69, 0],
+    ['meet', 0.7, 1],
+  ] as const)('continues on probability alone, at 0.5 for one caller and 0.7 in a group: %s %s', (kind, p, turns) => {
+    const call = new Call(kind);
+    if (kind === 'meet')
+      call.feed({ kind: 'presence', speaker: misha, joined: true }, { kind: 'presence', speaker: olena, joined: true });
     const replyId = wakeAndSpeak(call, 'Dan, hello', 'Hello there.', 1);
     call.feed({ kind: 'playback', replyId, state: 'cut_off', delivered: 'Hello' });
     const [judge] = only(call.say(misha, 'u2', 'Go on'), 'judge');
-    expect(only(call.verdict(judge.windowVersion, 'continue', p, 0), 'turn')).toHaveLength(p >= 0.7 ? 1 : 0);
+    expect(only(call.verdict(judge.windowVersion, 'continue', p, 0), 'turn')).toHaveLength(turns);
+  });
+});
+
+describe('one caller', () => {
+  const silentWith = (call: Call, windowVersion: number, answer: number) =>
+    call.feed({
+      kind: 'verdict',
+      windowVersion,
+      verdict: {
+        action: 'stay_silent',
+        probabilities: { answer, stay_silent: 1 - answer, stop: 0, continue: 0 },
+        confidence: 0.3,
+      },
+      ms: 300,
+    });
+
+  it.each([0.29, 0.3])('answers on p(answer) alone from 0.3, whatever Jev chose: %s', (p) => {
+    const call = new Call();
+    const [judge] = only(call.say(misha, 'u1', 'I have to be there at 17:12.'), 'judge');
+    expect(only(silentWith(call, judge.windowVersion, p), 'turn')).toHaveLength(p >= 0.3 ? 1 : 0);
+  });
+
+  it('keeps the group bar with several humans', () => {
+    const call = new Call('meet');
+    call.feed({ kind: 'presence', speaker: misha, joined: true }, { kind: 'presence', speaker: olena, joined: true });
+    const [judge] = only(call.say(misha, 'u1', 'I have to be there at 17:12.'), 'judge');
+    expect(silentWith(call, judge.windowVersion, 0.45)).toEqual([]);
+  });
+
+  it('does not start a second turn on a weak answer while one is on its way', () => {
+    const call = new Call();
+    call.sayAnswered(misha, 'u1', 'what time is it?');
+    const [judge] = only(call.say(misha, 'u2', 'in Lisbon I mean'), 'judge');
+    expect(only(silentWith(call, judge.windowVersion, 0.4), 'turn')).toEqual([]);
+  });
+
+  it('joins the pieces a pause split, the first with its final landing after the caller resumed', () => {
+    const call = new Call();
+    const on: Fed = { kind: 'speech', speaker: misha, on: true };
+    const off: Fed = { kind: 'speech', speaker: misha, on: false };
+    call.feed(on, { kind: 'utterance', speaker: misha, uttId: 'a', text: 'Dan, tell me', final: false }, off, on);
+    expect(
+      call.feed({ kind: 'utterance', speaker: misha, uttId: 'a', text: 'Dan, tell me please', final: true }),
+    ).toEqual([]);
+    call.feed({ kind: 'utterance', speaker: misha, uttId: 'b', text: 'which', final: false }, off);
+    const [judge] = only(
+      call.feed({ kind: 'utterance', speaker: misha, uttId: 'b', text: 'which films are on today', final: true }),
+      'judge',
+    );
+    expect(judge.state.latest?.text).toBe('Dan, tell me please which films are on today');
+    expect(judge.state.facts.addressed_by_name).toBe(true);
+    const [turn] = only(call.verdict(judge.windowVersion, 'answer'), 'turn');
+    expect(turn.message).toBe('Dan, tell me please which films are on today');
+  });
+
+  it('starts a new turn after an answer or a long gap', () => {
+    const call = new Call();
+    const replyId = wakeAndSpeak(call, 'what time is it?', 'Noon.', 1);
+    call.feed({ kind: 'playback', replyId, state: 'completed' });
+    const [next] = only(call.say(misha, 'u2', 'and the weather?'), 'judge');
+    expect(next.state.latest?.text).toBe('and the weather?');
+    call.verdict(next.windowVersion, 'stay_silent');
+    call.feed({ kind: 'timer', key: 'idle', at: 60_000 });
+    const [late] = only(call.say(misha, 'u3', 'never mind'), 'judge');
+    expect(late.state.latest?.text).toBe('never mind');
+  });
+
+  it('does not join pieces with several humans in the room', () => {
+    const call = new Call('meet');
+    call.feed({ kind: 'presence', speaker: misha, joined: true }, { kind: 'presence', speaker: olena, joined: true });
+    const [first] = only(call.say(misha, 'u1', 'Olena, did it deploy'), 'judge');
+    call.verdict(first.windowVersion, 'stay_silent');
+    const [second] = only(call.say(misha, 'u2', 'Dan, what time is it?'), 'judge');
+    expect(second.state.latest?.text).toBe('Dan, what time is it?');
   });
 });
 

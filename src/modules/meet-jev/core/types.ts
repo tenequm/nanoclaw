@@ -165,7 +165,17 @@ export interface CallPolicy {
   agentAliases: string[];
   /** Who the agent is and when it speaks, spliced into the Jev state. */
   paragraph: string;
-  oneCaller: { paragraph: string; answer: ActionThreshold };
+  /**
+   * With one human in the call. `answer` is the low-risk bar (a vocative's too); `speak` answers on p(answer) alone,
+   * whatever Jev's top choice; `joinGapMs` is the longest pause that still joins a speaker's pieces into one turn.
+   */
+  oneCaller: {
+    paragraph: string;
+    answer: ActionThreshold;
+    speak: ActionThreshold;
+    continue: ActionThreshold;
+    joinGapMs: number;
+  };
   /** After a speaker's VAD end with no STT final, the partial is decided on after this long (plus the final's margin). */
   boundaryFallbackMs: number;
   /** The window keeps this much history and at most `windowBytes` of text. */
