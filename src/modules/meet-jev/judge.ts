@@ -10,8 +10,10 @@ import { postSystemOne, type JevFailure } from '../jev-gate/jev.js';
 import {
   ACTIONS,
   RECHECK_ACTIONS,
+  type Action,
   type Choice,
   type JevState,
+  type RecheckAction,
   type RecheckState,
   type RecheckVerdict,
   type Verdict,
@@ -24,21 +26,21 @@ import {
  * real decisions.
  */
 
-export interface ChoiceDecision {
+interface ChoiceDecision {
   kind: 'choice';
   prompt: string;
   options: Record<string, { what: string; not_for: string }>;
 }
 
-export interface ProbabilityDecision {
+interface ProbabilityDecision {
   kind: 'probability';
   prompt: string;
   criteria: { true: string; false: string };
 }
 
-export type Decision = ChoiceDecision | ProbabilityDecision;
+type Decision = ChoiceDecision | ProbabilityDecision;
 
-export interface ChoiceResult {
+interface ChoiceResult {
   kind: 'choice';
   value: string;
   /** Every option's probability, each in 0..1, summing to 1. */
@@ -46,14 +48,14 @@ export interface ChoiceResult {
   confidence: number;
 }
 
-export interface ProbabilityResult {
+interface ProbabilityResult {
   kind: 'probability';
   value: number;
 }
 
-export type DecisionResult = ChoiceResult | ProbabilityResult;
+type DecisionResult = ChoiceResult | ProbabilityResult;
 
-export interface DecisionResponse {
+interface DecisionResponse {
   /** Well-formed answers by decision name; each requested name is here or in `errors`. */
   results: Record<string, DecisionResult>;
   errors: Record<string, string>;
@@ -64,7 +66,7 @@ export interface DecisionResponse {
 }
 
 /** A request that got no usable response; `evaluate` rejects with it. */
-export class DecisionError extends Error {
+class DecisionError extends Error {
   readonly failure: JevFailure;
   constructor(failure: JevFailure) {
     super(failure.message);
@@ -73,7 +75,7 @@ export class DecisionError extends Error {
   }
 }
 
-export interface DecisionModel {
+interface DecisionModel {
   evaluate(request: {
     input: unknown;
     decisions: Readonly<Record<string, Decision>>;
@@ -230,26 +232,27 @@ const jev: DecisionModel = {
       const parsed =
         decision.kind === 'choice' ? choiceResult(answer, Object.keys(decision.options)) : probabilityResult(answer);
       if (parsed) response.results[name] = parsed;
-      else response.errors[name] = `Invalid ${decision.kind} answer`;
+      else
+        response.errors[name] = `Invalid ${decision.kind === 'choice' ? 'Choice' : 'Probability'} answer for ${name}`;
     }
     return response;
   },
 };
 
-function verdictOf<A extends string>(result: DecisionResult | undefined, options: readonly A[]): Choice<A> | null {
-  if (result?.kind !== 'choice' || !options.includes(result.value as A)) return null;
-  const probabilities = {} as Record<A, number>;
-  for (const option of options) {
-    if (!(option in result.probabilities)) return null;
-    probabilities[option] = result.probabilities[option];
-  }
-  return { action: result.value as A, probabilities, confidence: result.confidence };
-}
+/** A Choice result as a verdict: `choiceResult` already held it to the question's options. */
+const verdictOf = <A extends string>(result: DecisionResult | undefined): Choice<A> | null =>
+  result?.kind === 'choice'
+    ? {
+        action: result.value as A,
+        probabilities: result.probabilities as Record<A, number>,
+        confidence: result.confidence,
+      }
+    : null;
 
 export const parseAction = (body: unknown): Verdict | null =>
-  verdictOf(choiceResult(answersOf(body)?.action, ACTIONS) ?? undefined, ACTIONS);
+  verdictOf<Action>(choiceResult(answersOf(body)?.action, ACTIONS) ?? undefined);
 export const parseStillWanted = (body: unknown): RecheckVerdict | null =>
-  verdictOf(choiceResult(answersOf(body)?.still_wanted, RECHECK_ACTIONS) ?? undefined, RECHECK_ACTIONS);
+  verdictOf<RecheckAction>(choiceResult(answersOf(body)?.still_wanted, RECHECK_ACTIONS) ?? undefined);
 
 function shadowLog(response: DecisionResponse | null) {
   const probability = (name: string): number | null => {
@@ -286,18 +289,20 @@ interface JudgeOptions {
 async function ask<V>(
   state: unknown,
   decisions: Record<string, Decision>,
-  verdict: (result: DecisionResult | undefined) => V | null,
+  toVerdict: (result: DecisionResult | undefined) => V | null,
   opts: JudgeOptions,
 ): Promise<{ verdict: V | null; ms: number }> {
   const started = Date.now();
   const question = Object.keys(decisions)[0];
   let response: DecisionResponse | null = null;
-  let answer: V | null = null;
+  let verdict: V | null = null;
   let failure: JevFailure | null = null;
   try {
     response = await jev.evaluate({ input: state, decisions, signal: opts.signal });
-    answer = verdict(response.results[question]);
-    if (answer === null) failure = { category: 'parse', message: `Invalid Choice answer for ${question}` };
+    verdict = toVerdict(response.results[question]);
+    if (verdict === null) {
+      failure = { category: 'parse', message: response.errors[question] ?? `Invalid Choice answer for ${question}` };
+    }
   } catch (err) {
     failure =
       err instanceof DecisionError ? err.failure : { category: 'request', message: 'Unexpected Jev judge failure' };
@@ -315,7 +320,7 @@ async function ask<V>(
     failure,
     ...(question === 'action' ? shadowLog(response) : {}),
   });
-  return { verdict: answer, ms };
+  return { verdict, ms };
 }
 
 /** Ask Jev what the agent should do about the window. Never throws; null on any failure. */
@@ -323,7 +328,7 @@ export const askAction = (state: JevState, opts: JudgeOptions = {}): Promise<{ v
   ask(
     state,
     { action: actionDecision(state.agent_name), ...shadowDecisions(state.agent_name) },
-    (result) => verdictOf(result, ACTIONS),
+    (result) => verdictOf<Action>(result),
     opts,
   );
 
@@ -335,6 +340,6 @@ export const askStillWanted = (
   ask(
     state,
     { still_wanted: stillWantedDecision(state.agent_name) },
-    (result) => verdictOf(result, RECHECK_ACTIONS),
+    (result) => verdictOf<RecheckAction>(result),
     opts,
   );

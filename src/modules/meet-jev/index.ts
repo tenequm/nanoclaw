@@ -63,6 +63,7 @@ export interface JevDeps {
 }
 
 export interface JevCall {
+  readonly kind: CallKind;
   /** A worker POST's events, in order; malformed ones are skipped. */
   workerEvents(raw: readonly unknown[]): { accepted: number; dropped: number };
   /** A `meet` call's transcript event (a participant's pipeline, on the host clock); ignored on a `voice` call. */
@@ -190,6 +191,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   });
 
   return {
+    kind,
     workerEvents(raw) {
       const { events, dropped } = ingress.convert(raw, host.now());
       if (dropped > 0) log.warn('meet-jev: malformed worker events skipped', { ...fields, dropped });

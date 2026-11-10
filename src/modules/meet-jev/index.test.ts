@@ -70,6 +70,7 @@ describe('createJevCall', () => {
       },
       { core },
     );
+    expect(call.kind).toBe(kind);
     call.reply('Hello.', null);
     expect(push.mock.calls.filter(([event]) => event.type === 'status')).toEqual(
       pushes ? [[{ type: 'status', status: 'thinking' }]] : [],

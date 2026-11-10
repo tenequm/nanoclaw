@@ -90,6 +90,7 @@ import {
   type WakeWord,
   type WakeWordEvents,
   TURN_CUE_DELAY_MS,
+  READY_CUE_WAIT_MS,
   wakeNameWords,
   type CueKind,
   readReviewRequest,
@@ -112,7 +113,7 @@ import {
   type TurnTakingDeps,
   deliveredText,
   JEV_BARGE_MS,
-  JEV_THINKING_MAX_MS,
+  THINKING_HOLD_MS,
   JEV_WORDS_WINDOW_MS,
   JevLoop,
   JevReporter,
@@ -6759,7 +6760,7 @@ function jevLoop({ transcribed = true }: { transcribed?: boolean } = {}) {
 }
 
 describe('jev: the loop', () => {
-  it("keeps each utterance's audio from its pre-roll to its end with what it was heard as; a noise is not kept", async () => {
+  it("keeps each utterance's audio from its pre-roll to its end with what it was heard as; a noise too, marked", async () => {
     const h = jevLoop();
     h.loop.audio(new Int16Array(16_000));
     h.loop.onSpeech(true, 16_000);
@@ -6778,7 +6779,16 @@ describe('jev: the loop', () => {
     h.loop.audio(new Int16Array(800));
     h.loop.onSpeech(false, 20_800);
     await flush();
-    expect(h.recorded).toHaveLength(1);
+    expect(h.recorded.map(([segment, , text, why]) => [segment, text, why])).toEqual([
+      [1, 'Book a table.', undefined],
+      [2, '', 'noise'],
+    ]);
+    // Speech with no words that the transcription failed on is a miss, not a noise.
+    h.transcription.results.push(heard('', undefined, true));
+    h.loop.onSpeech(true, 30_000);
+    h.loop.onSpeech(false, 30_800);
+    await flush();
+    expect(h.recorded.at(-1)?.slice(2)).toEqual(['', 'stt']);
   });
 
   it('keeps the last utterance when the call ends before its final, and one whose final never comes', async () => {
@@ -6803,9 +6813,7 @@ describe('jev: the loop', () => {
     lost.loop.onInterim('Half a');
     lost.loop.onSpeech(false, 1_600);
     await flush();
-    expect(lost.recorded.map(([, , transcript, reason]) => [transcript, reason])).toEqual([
-      ['Half a', 'no final transcript'],
-    ]);
+    expect(lost.recorded.map(([, , transcript, reason]) => [transcript, reason])).toEqual([['Half a', 'stt']]);
   });
 
   it('VAD speech opens an activity with the pre-roll and warms the next socket; its partials and final go out under one uttId with the speech marks, in order', async () => {
@@ -6858,7 +6866,7 @@ describe('jev: the loop', () => {
     h.loop.onSpeech(true, 0);
     h.loop.onReply('r1', 'Booked for eight.');
     await flush();
-    expect(h.speak).toHaveBeenCalledWith('Booked for eight.', expect.any(Function), expect.any(AbortSignal));
+    expect(h.speak).toHaveBeenCalledWith('Booked for eight.', expect.any(Function), expect.any(AbortSignal), 'r1');
     expect(h.lines[0].waited).toBe(false);
     h.loop.onSpeech(false, 16_000);
     await flush();
@@ -7248,7 +7256,6 @@ describe('jev calls', () => {
     );
     // A reply the host did not label is not spoken: nothing could be reported about it.
     host.emit({ type: 'reply', text: 'Unlabelled.' });
-    host.emit({ type: 'thinking' });
     host.emit({ type: 'working' });
     await new Promise((r) => setTimeout(r, 30));
     expect(v.voice.speak).toHaveBeenCalledTimes(1);
@@ -7302,7 +7309,7 @@ describe('jev calls', () => {
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
   });
 
-  it('holds the your-turn cue while the agent still works or the caller talks, and stops typing on its own after a lost status', async () => {
+  it("holds the your-turn cue while the agent's typing ticks say it still works, and while the caller talks", async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     const { ctx } = fakeJob({ ...JEV_META });
     const host = fakeHostFetch();
@@ -7313,25 +7320,69 @@ describe('jev calls', () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
 
+    // An interim line, as the host sends it: the agent types on while it plays.
     host.emit({ type: 'status', status: 'thinking' });
     host.emit({ type: 'reply', text: 'One moment.', replyId: 'r1' });
+    host.emit({ type: 'thinking' });
+    host.emit({ type: 'status', status: 'speaking' });
+    host.emit({ type: 'status', status: 'idle' });
     await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
-    // Still working on the answer: no hand-over yet.
+    expect(v.voice.speak).toHaveBeenCalledTimes(1);
     expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
     expect(typing.at(-1)).toBe(true);
-    // The host never says idle: the typing ends by itself.
-    await vi.advanceTimersByTimeAsync(JEV_THINKING_MAX_MS);
+    // No more ticks: the agent is done, and the typing ends by itself.
+    await vi.advanceTimersByTimeAsync(THINKING_HOLD_MS);
     expect(typing.at(-1)).toBe(false);
-    expect(v.voice.setThinking).toHaveBeenLastCalledWith(false);
 
-    v.events.onSpeech(true, v.position);
+    // A line that played out, and the caller already talking when its cue is due: no cue.
     host.emit({ type: 'reply', text: 'Done.', replyId: 'r2' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(v.voice.speak).toHaveBeenCalledTimes(2);
+    v.events.onSpeech(true, v.position);
     await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
     expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
+    // The same with the caller quiet: the cue.
+    v.events.onSpeech(false, v.position);
+    await vi.advanceTimersByTimeAsync(3_100);
+    host.emit({ type: 'reply', text: 'Anything else?', replyId: 'r3' });
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
+    expect(v.voice.playCue.mock.calls).toEqual([['listening'], ['turn']]);
+    host.endStream();
+  });
+
+  it('thinking ends by itself after a wake with no reply, and typing ticks keep it up', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const { ctx } = fakeJob({ ...JEV_META });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await vi.advanceTimersByTimeAsync(10);
+
+    host.emit({ type: 'status', status: 'thinking' });
+    await vi.advanceTimersByTimeAsync(AWAIT_REPLY_MS - 100);
+    expect(v.voice.setThinking.mock.calls).toEqual([[true]]);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(v.voice.setThinking.mock.calls).toEqual([[true], [false]]);
+
+    // A long turn: the agent's ticks, every few seconds, hold it well past both waits.
+    host.emit({ type: 'status', status: 'thinking' });
+    for (let waited = 0; waited < 3 * AWAIT_REPLY_MS; waited += 4_000) {
+      host.emit({ type: 'thinking' });
+      await vi.advanceTimersByTimeAsync(4_000);
+    }
+    expect(v.voice.setThinking.mock.calls).toEqual([[true], [false], [true]]);
+    // The loop's `idle` does not end what the ticks say; the reply does.
+    host.emit({ type: 'status', status: 'idle' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(v.voice.setThinking).toHaveBeenLastCalledWith(true);
+    host.emit({ type: 'reply', text: 'Here it is.', replyId: 'r1' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(v.voice.setThinking).toHaveBeenLastCalledWith(false);
     host.endStream();
   });
 
   it('a jev meeting gets no cues, whatever the host sends', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     const { ctx, room } = fakeJob({
       ...JEV_META,
       callerIdentity: 'meet-bridge-meet-r1',
@@ -7346,8 +7397,11 @@ describe('jev calls', () => {
     Object.assign(v.voice, { setTyping });
     await runCall(ctx, callDeps(host.fetchImpl, v));
     host.emit({ type: 'status', status: 'thinking' });
+    host.emit({ type: 'thinking' });
     host.emit({ type: 'reply', text: 'Booked.', replyId: 'r1' });
-    await new Promise((r) => setTimeout(r, TURN_CUE_DELAY_MS + 150));
+    // Past the listening cue's wait and the your-turn delay.
+    await vi.advanceTimersByTimeAsync(READY_CUE_WAIT_MS + TURN_CUE_DELAY_MS + 200);
+    expect(v.voice.speak).toHaveBeenCalledTimes(1);
     expect(v.voice.playCue).not.toHaveBeenCalled();
     expect(v.voice.setThinking).not.toHaveBeenCalled();
     expect(setTyping).not.toHaveBeenCalled();
@@ -7376,6 +7430,7 @@ describe('jev calls', () => {
         () => JSON.parse(fs.readFileSync(path.join(dir, 'call-1-1.json'), 'utf8')) as TurnRecord,
       );
       expect(turn).toMatchObject({ callId: 'call-1', agent: 'Andy', turn: 1, transcript: 'Book a table.' });
+      expect(turn).not.toHaveProperty('reason');
       expect(fs.readFileSync(path.join(dir, 'call-1-1.wav')).readUInt32LE(24)).toBe(16_000);
 
       const pcm = new Int16Array(2_400).fill(9);
@@ -7391,6 +7446,13 @@ describe('jev calls', () => {
       expect(fs.readFileSync(path.join(dir, 'call-1-call.wav')).length).toBe(44 + 2 * 16 * 1600);
       const call = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-call.json'), 'utf8')) as CallRecord;
       expect(call).toMatchObject({ callId: 'call-1', durationMs: 1600, wakes: [] });
+      expect(fs.readdirSync(dir).sort()).toEqual([
+        'call-1-1.json',
+        'call-1-1.wav',
+        'call-1-call.json',
+        'call-1-call.wav',
+        'call-1-reply-1.wav',
+      ]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -7400,9 +7462,19 @@ describe('jev calls', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-jev-norec-'));
     try {
       const plain = fakeJob({ ...JEV_META });
+      const plainHost = fakeHostFetch();
       const v = fakeVoice();
-      await runCall(plain.ctx, callDeps(fakeHostFetch().fetchImpl, v, { recordingsRoot: root }));
+      await runCall(plain.ctx, callDeps(plainHost.fetchImpl, v, { recordingsRoot: root }));
       expect(v.createVoice.mock.calls[0][2].recordReplies).toBeUndefined();
+      // An utterance with its final reaches the host and leaves no file.
+      v.transcription.results.push(heard('Book a table', 'Book a table.'));
+      v.events.onSpeech(true, v.position);
+      v.audio(600);
+      v.interim('Book a table');
+      v.events.onSpeech(false, v.position);
+      await vi.waitFor(() => expect(jevEvents(plainHost).flat().map(summary)).toContain('final:Book a table.'));
+      await flush();
+      expect(fs.readdirSync(root)).toEqual([]);
 
       const meeting = fakeJob({ ...JEV_META, callerIdentity: 'meet-bridge-meet-r1', meeting: { pauseSends: false } });
       meeting.room.remoteParticipants.clear();

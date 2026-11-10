@@ -1335,7 +1335,12 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     chatTyping(chat, agentGroupId, working = false) {
       for (const call of calls.values()) {
         if (call.state !== 'live' || call.ended || call.line.agentGroupId !== agentGroupId) continue;
-        if (!callChatAt(call, chat) || call.jev) continue;
+        if (!callChatAt(call, chat)) continue;
+        // A jev voice call's worker keeps its typing sound on these ticks; its loop says the rest by `status`.
+        if (call.jev) {
+          if (call.jev.kind === 'voice') push(call, { type: 'thinking' });
+          continue;
+        }
         push(call, { type: 'thinking' });
         if (working) push(call, { type: 'working' });
       }

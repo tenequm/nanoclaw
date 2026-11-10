@@ -472,7 +472,7 @@ describe('the request to Jev', () => {
     });
   });
 
-  it('logs the questions it asks', () => {
+  it('names every question it can ask, as Jev gets them', () => {
     expect(judgeQuestions('Dan')).toStrictEqual({ ...pinnedActionQuestions, ...pinnedStillWantedQuestions });
   });
 });
