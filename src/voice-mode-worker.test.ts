@@ -6688,6 +6688,7 @@ function jevLoop({ transcribed = true }: { transcribed?: boolean } = {}) {
   const transcription = fakeTranscription();
   const events: JevWorkerEvent[] = [];
   const captions: Array<[number, string, boolean]> = [];
+  const recorded: Array<[number, TurnAudio, string, string | undefined]> = [];
   interface Line {
     text: string;
     signal: AbortSignal;
@@ -6723,6 +6724,7 @@ function jevLoop({ transcribed = true }: { transcribed?: boolean } = {}) {
     speak,
     report: (event) => void events.push(event),
     caption: (segment, text, final) => void captions.push([segment, text, final]),
+    recorded: (segment, audio, transcript, reason) => void recorded.push([segment, audio, transcript, reason]),
     log: silentLog,
   });
   return {
@@ -6730,6 +6732,7 @@ function jevLoop({ transcribed = true }: { transcribed?: boolean } = {}) {
     transcription,
     events,
     captions,
+    recorded,
     speak,
     lines,
     /** The events so far, one word each. */
@@ -6755,6 +6758,55 @@ function jevLoop({ transcribed = true }: { transcribed?: boolean } = {}) {
 }
 
 describe('jev: the loop', () => {
+  it("keeps each utterance's audio from its pre-roll to its end with what it was heard as; a noise is not kept", async () => {
+    const h = jevLoop();
+    h.loop.audio(new Int16Array(16_000));
+    h.loop.onSpeech(true, 16_000);
+    h.loop.audio(new Int16Array(1_600).fill(7));
+    h.loop.onInterim('Book a table');
+    h.transcription.results.push(heard('Book a table', 'Book a table.'));
+    h.loop.onSpeech(false, 17_600);
+    await flush();
+    expect(h.recorded).toHaveLength(1);
+    const [segment, audio, transcript, reason] = h.recorded[0];
+    expect([segment, transcript, reason]).toEqual([1, 'Book a table.', undefined]);
+    expect(audio.sampleRate).toBe(16_000);
+    expect(audio.pcm.length).toBe(PRE_ROLL_MS * 16 + 1_600);
+    expect(audio.pcm.at(-1)).toBe(7);
+    h.loop.onSpeech(true, 20_000);
+    h.loop.audio(new Int16Array(800));
+    h.loop.onSpeech(false, 20_800);
+    await flush();
+    expect(h.recorded).toHaveLength(1);
+  });
+
+  it('keeps the last utterance when the call ends before its final, and one whose final never comes', async () => {
+    const h = jevLoop();
+    h.transcription.hold = true;
+    h.loop.onSpeech(true, 0);
+    h.loop.audio(new Int16Array(1_600));
+    h.loop.onInterim('Remind me');
+    h.transcription.results.push(heard('Remind me', 'Remind me at five.'));
+    h.loop.onSpeech(false, 1_600);
+    h.loop.close();
+    h.transcription.release();
+    await flush();
+    expect(h.recorded.map(([segment, , transcript]) => [segment, transcript])).toEqual([[1, 'Remind me at five.']]);
+    // Nothing more goes to the host once the call ended.
+    expect(h.kinds()).not.toContain('final:Remind me at five.');
+
+    const lost = jevLoop();
+    lost.transcription.end.mockRejectedValueOnce(new Error('socket closed'));
+    lost.loop.onSpeech(true, 0);
+    lost.loop.audio(new Int16Array(1_600));
+    lost.loop.onInterim('Half a');
+    lost.loop.onSpeech(false, 1_600);
+    await flush();
+    expect(lost.recorded.map(([, , transcript, reason]) => [transcript, reason])).toEqual([
+      ['Half a', 'no final transcript'],
+    ]);
+  });
+
   it('VAD speech opens an activity with the pre-roll and warms the next socket; its partials and final go out under one uttId with the speech marks, in order', async () => {
     const h = jevLoop();
     h.loop.audio(new Int16Array(16_000));
@@ -7208,6 +7260,72 @@ describe('jev calls', () => {
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
     expect(v.voice.close).toHaveBeenCalled();
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+  });
+
+  it('records like a plain call when the switches are on: each utterance, each reply and the whole call', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-jev-rec-'));
+    try {
+      const { ctx, job } = fakeJob({ ...JEV_META });
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      const env = { ...ENV, VOICE_MODE_RECORDINGS_DAYS: '7', VOICE_MODE_CALL_RECORDING: '1' };
+      await runCall(ctx, callDeps(host.fetchImpl, v, { env, recordingsRoot: root }));
+      const settings = v.createVoice.mock.calls[0][2];
+      expect(settings.recordReplies).toBe(true);
+
+      v.transcription.results.push(heard('Book a table', 'Book a table.'));
+      v.audio(600);
+      v.events.onSpeech(true, v.position);
+      v.audio(1000);
+      v.interim('Book a table');
+      v.events.onSpeech(false, v.position);
+      const dir = path.join(root, 'Andy', new Date().toISOString().slice(0, 10));
+      const turn = await vi.waitFor(
+        () => JSON.parse(fs.readFileSync(path.join(dir, 'call-1-1.json'), 'utf8')) as TurnRecord,
+      );
+      expect(turn).toMatchObject({ callId: 'call-1', agent: 'Andy', turn: 1, transcript: 'Book a table.' });
+      expect(fs.readFileSync(path.join(dir, 'call-1-1.wav')).readUInt32LE(24)).toBe(16_000);
+
+      const pcm = new Int16Array(2_400).fill(9);
+      settings.spoke?.(
+        { outcome: 'spoken', model: 'tts', fallback: false, durationMs: 100, peakDb: -3, rmsDb: -20 },
+        pcm,
+      );
+      await vi.waitFor(() => expect(fs.readFileSync(path.join(dir, 'call-1-reply-1.wav')).length).toBe(44 + 2 * 2_400));
+
+      host.emit({ type: 'end', reason: 'done' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
+      // The whole call: every frame the caller sent, in and out of an utterance.
+      expect(fs.readFileSync(path.join(dir, 'call-1-call.wav')).length).toBe(44 + 2 * 16 * 1600);
+      const call = JSON.parse(fs.readFileSync(path.join(dir, 'call-1-call.json'), 'utf8')) as CallRecord;
+      expect(call).toMatchObject({ callId: 'call-1', durationMs: 1600, wakes: [] });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('records nothing with the switches off, and never a meeting', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-jev-norec-'));
+    try {
+      const plain = fakeJob({ ...JEV_META });
+      const v = fakeVoice();
+      await runCall(plain.ctx, callDeps(fakeHostFetch().fetchImpl, v, { recordingsRoot: root }));
+      expect(v.createVoice.mock.calls[0][2].recordReplies).toBeUndefined();
+
+      const meeting = fakeJob({ ...JEV_META, callerIdentity: 'meet-bridge-meet-r1', meeting: { pauseSends: false } });
+      meeting.room.remoteParticipants.clear();
+      meeting.room.remoteParticipants.set('meet-bridge-meet-r1', {});
+      const m = fakeVoice();
+      m.voice.review.serve = vi.fn();
+      const env = { ...ENV, VOICE_MODE_RECORDINGS_DAYS: '7', VOICE_MODE_CALL_RECORDING: '1' };
+      await runCall(meeting.ctx, callDeps(fakeHostFetch().fetchImpl, m, { env, recordingsRoot: root }));
+      expect(m.createVoice.mock.calls[0][2].recordReplies).toBeUndefined();
+      m.audio(500);
+      await flush();
+      expect(fs.readdirSync(root)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("a jev meeting transcribes nothing: VAD marks and playback go to agent/jev, and the host's words cut a line", async () => {

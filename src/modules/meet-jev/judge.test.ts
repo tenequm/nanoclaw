@@ -21,7 +21,7 @@ vi.mock('../../config.js', async () => {
 
 import { log } from '../../log.js';
 import type { JevState } from './core/types.js';
-import { askAction, askStillWanted, parseAction, parseStillWanted } from './judge.js';
+import { askAction, askStillWanted, judgeQuestions, parseAction, parseStillWanted } from './judge.js';
 
 const state: JevState = {
   policy: 'Dan answers the caller.',
@@ -42,6 +42,14 @@ const state: JevState = {
     latest_to_you: false,
     latest_language: 'en',
   },
+};
+
+const recheckState = {
+  ...state,
+  latest: undefined,
+  trigger: { speaker: 'Misha', text: 'Dan, what is the capital of Peru?' },
+  reply: 'Lima.',
+  since: [{ t: 1.2, speaker: 'Olena', text: 'It is Lima.' }],
 };
 
 const choice = {
@@ -322,13 +330,6 @@ describe('parseAction', () => {
 });
 
 describe('askStillWanted', () => {
-  const recheckState = {
-    ...state,
-    latest: undefined,
-    trigger: { speaker: 'Misha', text: 'Dan, what is the capital of Peru?' },
-    reply: 'Lima.',
-    since: [{ t: 1.2, speaker: 'Olena', text: 'It is Lima.' }],
-  };
   const stillWanted = { type: 'choice', choice: 'show', confidence: 0.8, probabilities: { speak: 0.1, show: 0.9 } };
 
   it('asks one Choice still_wanted over speak and show with the recheck state', async () => {
@@ -362,5 +363,116 @@ describe('askStillWanted', () => {
       parseStillWanted({ answers: { still_wanted: { ...stillWanted, probabilities: { speak: 0.5, show: 0.9 } } } }),
     ).toBeNull();
     expect(parseStillWanted({ answers: { action: stillWanted } })).toBeNull();
+  });
+});
+
+// Captured from the request on main before the judge went through a DecisionModel: the body must stay byte-equal.
+const pinnedActionQuestions = {
+  action: {
+    type: 'choice',
+    instructions:
+      'A live call. `latest` is the utterance just finished, the one to decide on; `window` is the conversation up to and including it, oldest first, for context (`t` = seconds ago; `agent` lines are what Dan said; `cut_off` marks where Dan was interrupted; `partial` lines are still being spoken). `policy` says when Dan speaks and `facts` what Dan is doing now; `facts.addressed_by_name` says `latest` calls Dan by name, which makes it addressed to Dan but not necessarily a request to answer now. What should Dan do about `latest`?',
+    criteria: {
+      answer: {
+        what: "The latest utterance is for Dan and needs a reply now: a question or request to Dan by name (facts.addressed_by_name); an answer or information the speaker gives right after Dan asked them something (Dan's last line in `window` is a question to them); or, as the policy allows, a question or request that nobody else is taking up; and the speaker has finished the thought. facts.latest_is_question and facts.latest_to_you are computed from the words of latest; people speak Ukrainian and English, often mixed.",
+        not_for:
+          'A remark to another person, a thought still being finished (also after Dan\'s name, "Dan, I was wondering..."), small talk, or something already answered; Dan merely mentioned in the third person; Dan told by name not to answer or to wait ("Dan, don\'t answer that", "Dan, wait for Anna").',
+      },
+      stay_silent: {
+        what: 'Dan should not speak: the utterance is addressed to a person, is small talk or a reaction, is unfinished, was already answered, people are talking among themselves, or Dan is told by name to hold back ("Dan, don\'t answer that", "Dan, wait for Anna", an unfinished "Dan, I was wondering").',
+        not_for:
+          'A finished question or request to Dan, an answer to a question Dan just asked, or an instruction about what Dan is saying or about to say.',
+      },
+      stop: {
+        what: 'Someone tells Dan to stop or be quiet, or says the answer Dan is giving or preparing is no longer needed.',
+        not_for:
+          'Anything said while Dan is neither speaking nor preparing an answer (facts.agent_speaking and facts.pending_answer both false); "stop" said to a person.',
+      },
+      continue: {
+        what: 'Someone asks Dan to go on with what Dan was saying when cut off (facts.cut_off_after).',
+        not_for: 'Any request when Dan was not cut off (facts.cut_off_after is null); a new question.',
+      },
+    },
+  },
+  wants_reply_now: {
+    type: 'noul',
+    instructions:
+      'Does `latest` ask Dan something or ask it to do or say something, with the thought finished? Use `window` for context.',
+    criteria: {
+      true: 'A finished question or request for Dan, in English ("Dan, explain that") or Ukrainian ("Dan, poyasny tse").',
+      false:
+        "Small talk, a third-person mention, a request to wait or not answer, or a thought still being finished, even after Dan's name.",
+    },
+  },
+  for_someone_else: {
+    type: 'noul',
+    instructions: 'Is `latest` said to a person other than Dan? Use `window` to resolve who is addressed.',
+    criteria: {
+      true: 'A remark or request to another person, in English ("Anna, what do you think?") or Ukrainian ("Anno, shcho ty dumayesh?").',
+      false: 'An utterance for Dan, or an open question without another person as its addressee.',
+    },
+  },
+  unfinished: {
+    type: 'noul',
+    instructions:
+      'Is the speaker still finishing the thought in `latest`? Use `window` for context, including partial lines still being spoken.',
+    criteria: {
+      true: 'An incomplete thought, in English ("Dan, I was wondering...") or Ukrainian ("Dan, ya khotiv zapytaty..."). Saying the agent\'s name alone does not finish a request.',
+      false: 'A complete thought or request that can be understood without the speaker adding more.',
+    },
+  },
+  already_answered: {
+    type: 'noul',
+    instructions: 'Was what `latest` asks already answered in `window`, by Dan or another person?',
+    criteria: {
+      true: 'The requested information was already supplied in the conversation, in English ("It is Lima") or Ukrainian ("Tse Lima").',
+      false:
+        'No answer in the window, or latest asks a new question, clarification, or further detail the earlier answer did not cover.',
+    },
+  },
+};
+const pinnedStillWantedQuestions = {
+  still_wanted: {
+    type: 'choice',
+    instructions:
+      'A live call. Dan was asked `trigger` and has just prepared `reply`, not yet spoken. `since` is what people said after `trigger` (`t` = seconds ago); `window` is the whole conversation, oldest first, and `facts` what Dan is doing now. Should Dan still say `reply` aloud, or only show it in the chat?',
+    criteria: {
+      speak: {
+        what: 'The reply is still wanted: nobody answered `trigger` meanwhile, it was not withdrawn, and what people said since leaves room for it (also a follow-up to Dan, or small talk while waiting).',
+        not_for:
+          '`trigger` already answered by a person, withdrawn ("never mind", "forget it"), or the conversation clearly moved on.',
+      },
+      show: {
+        what: 'Saying the reply now would talk past the room: a person already answered `trigger`, it was withdrawn, or the conversation moved on to something else.',
+        not_for: 'Anything that still leaves the reply useful; when unsure, speak.',
+      },
+    },
+  },
+};
+
+describe('the request to Jev', () => {
+  it.each([
+    ['action', () => askAction(state), { state, model: 'jev-1.14', questions: pinnedActionQuestions }],
+    [
+      'still_wanted',
+      () => askStillWanted(recheckState),
+      { state: recheckState, model: 'jev-1.14', questions: pinnedStillWantedQuestions },
+    ],
+  ])('is byte-identical to the pinned %s request', async (_question, ask, expected) => {
+    const fetchMock = respond({});
+    await ask();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, { signal, ...init }] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://jev.test/v1/systemone');
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(init).toStrictEqual({
+      method: 'POST',
+      headers: { authorization: 'Bearer test-key', 'content-type': 'application/json' },
+      body: JSON.stringify(expected),
+    });
+  });
+
+  it('logs the questions it asks', () => {
+    expect(judgeQuestions('Dan')).toStrictEqual({ ...pinnedActionQuestions, ...pinnedStillWantedQuestions });
   });
 });
