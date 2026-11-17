@@ -37,7 +37,8 @@ export function configuredFeatures(config: AppConfig): string[] {
     });
   return [
     ...(config.ticketKey ? ['files'] : []),
-    ...(config.livekitUrl ? ['calls', 'voice-picker'] : []),
+    ...(config.livekitUrl ? ['calls'] : []),
     ...(pushReady ? ['push'] : []),
+    ...(config.livekitUrl ? ['voice-picker'] : []),
   ];
 }
