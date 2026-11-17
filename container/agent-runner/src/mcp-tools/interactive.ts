@@ -229,6 +229,7 @@ export const askUserQuestion: McpToolDefinition = {
       thread_id: r.thread_id,
       content: JSON.stringify({
         type: 'ask_question',
+        expiresAt: Date.now() + timeout,
         questionId,
         title,
         question,

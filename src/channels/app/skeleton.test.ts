@@ -41,12 +41,15 @@ it('serves hello with the contract shape without credentials', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(fixtures.hello.serverTime);
   expect(await request('GET', '/app/hello')).toEqual({ status: 200, body: { ...fixtures.hello, features: [] } });
 });
-it.each(routes.filter((route) => route.lane !== 'N0'))('$method $path is an explicit stub', async (route) => {
-  expect(await request(route.method, route.path.replace(/:[A-Za-z]+/g, 'test'))).toEqual({
-    status: 501,
-    body: { error: 'not_implemented', message: `This feature is awaiting ${route.lane}.` },
-  });
-});
+it.each(routes.filter((route) => !['N0', 'N2a'].includes(route.lane)))(
+  '$method $path is an explicit stub',
+  async (route) => {
+    expect(await request(route.method, route.path.replace(/:[A-Za-z]+/g, 'test'))).toEqual({
+      status: 501,
+      body: { error: 'not_implemented', message: `This feature is awaiting ${route.lane}.` },
+    });
+  },
+);
 it('rejects unknown routes and methods without reading a body', async () => {
   expect((await request('POST', '/app/hello')).status).toBe(404);
   expect((await request('GET', '/app/hellox')).status).toBe(404);

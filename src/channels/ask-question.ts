@@ -46,6 +46,7 @@ export function normalizeOptions(raws: RawOption[]): NormalizedOption[] {
 
 export interface AskQuestionPayload {
   type: 'ask_question';
+  expiresAt?: number;
   questionId: string;
   title: string;
   question: string;
