@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import re
 import shutil
 import signal
 import socket
@@ -190,12 +191,12 @@ def ncl(state, *args):
     p = subprocess.run(NODE + ['node', 'dist/cli/client.js', *args, '--json'],
                        cwd=ROOT, env=clean_env(), capture_output=True, text=True)
     if p.returncode:
-        raise RuntimeError('ncl ' + ' '.join(args[:2]) + ' failed: ' + p.stdout[:500])
+        raise RuntimeError('ncl ' + ' '.join(args[:2]) + f' failed ({p.returncode}); response withheld')
     return json.loads(p.stdout)['data']
 
 
 def seed(state):
-    owner = os.environ.get('LOCAL_OWNER_ID', 'telegram:95307956')
+    owner = state['owner']
     ncl(state, 'users', 'create', '--id', owner, '--kind', 'telegram', '--display-name', 'Local owner')
     ncl(state, 'roles', 'grant', '--user', owner, '--role', 'owner')
     folder = state['folder']
@@ -215,8 +216,10 @@ def seed(state):
     cli = ncl(state, 'messaging-groups', 'create', '--channel-type', 'cli', '--platform-id', 'local', '--name', 'Local CLI')
     ncl(state, 'wirings', 'create', '--agent-group-id', group['id'], '--messaging-group-id', cli['id'])
     mg = ncl(state, 'messaging-groups', 'create', '--channel-type', 'telegram',
-             '--platform-id', owner.split(':', 1)[1], '--name', 'Local test DM')
+             '--platform-id', owner, '--name', 'Local test DM')
     ncl(state, 'wirings', 'create', '--agent-group-id', group['id'], '--messaging-group-id', mg['id'])
+    if mg['platform_id'] != owner:
+        raise RuntimeError('Seeded Telegram DM platform id does not match owner')
     result(state, 'seed', 'pass', 'Fresh DB, owner, role, group and DM wiring created; no inbound messages')
 
 
@@ -226,13 +229,16 @@ def up(args):
     for path in ['.env', 'data', 'store']:
         if (ROOT / path).exists() or (ROOT / path).is_symlink():
             raise RuntimeError(f'Refusing existing {path}; use a disposable checkout')
+    owner = os.environ.get('LOCAL_OWNER_ID', 'telegram:1' if args.profile == 'fast' or args.proof else '')
+    if not re.fullmatch(r'telegram:[1-9][0-9]*', owner):
+        raise RuntimeError('Set LOCAL_OWNER_ID to telegram:<positive numeric user id>')
     b = int(os.environ.get('LOCAL_PORT_BASE', '4100'))
     if b < 1024 or b > 65400:
         raise RuntimeError('LOCAL_PORT_BASE must be 1024..65400')
     run_dir = Path(os.environ.get('HEYDAN_RUN_DIR', str(LOCAL / 'runs' /
         datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')))).resolve()
     (run_dir / 'logs').mkdir(parents=True, exist_ok=True)
-    state = dict(run=str(run_dir), root=str(ROOT), base=b, profile=args.profile,
+    state = dict(run=str(run_dir), root=str(ROOT), owner=owner, base=b, profile=args.profile,
                  livekit=('cloud' if args.profile == 'full' else args.livekit), processes=[], folder='local-' + secrets.token_hex(6), lock=False)
     if args.profile == 'full':
         try:
@@ -326,7 +332,7 @@ def up(args):
         wait_port(b+9, state, 'worker')
         result(state, 'boot', 'pass', 'Host CLI and worker health ready' + ('; local LiveKit ready' if state['livekit'] == 'dev' else '; Cloud configured'))
         if args.proof:
-            result(state, 'full-boundary', 'pass', 'Placeholder seed; local read-only gateway; no bot poller or agent spawn')
+            result(state, 'full-boundary', 'pass', 'Placeholder seed; local gateway stand-in; no bot poller or agent spawn')
         status()
     except BaseException:
         result(state, 'up', 'fail', 'Startup failed; see command error and logs')
@@ -403,7 +409,7 @@ def report():
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, epilog='Settings: LOCAL_PORT_BASE (4100), HEYDAN_RUN_DIR, LOCAL_AGENT_PROVIDER (fast: stand-in), LOCAL_TEST_AGENT and LOCAL_ANTHROPIC_SECRET_ID (required for full), LOCAL_OWNER_ID (telegram:95307956), LOCAL_ONECLI_URL, LOCAL_JEV_URL, LOCAL_JEV_MODEL, LOCAL_VOICE_MODE_<key>. Full starts real services only after owner approval; --proof uses a local read-only gateway and disables the bot. No command sends a message. A real full bot may receive messages and spawn agents. Requires Python 3, mise, Docker, openssl, gopass and livekit-server. Check the stack with python3 -B scripts/local/verify.py.')
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Settings: LOCAL_PORT_BASE (4100), HEYDAN_RUN_DIR, LOCAL_AGENT_PROVIDER (fast: stand-in), LOCAL_TEST_AGENT and LOCAL_ANTHROPIC_SECRET_ID (required for full), LOCAL_OWNER_ID (required for full; synthetic telegram:1 for fast/proof), LOCAL_ONECLI_URL, LOCAL_JEV_URL, LOCAL_JEV_MODEL, LOCAL_VOICE_MODE_<key>. Full starts real services only after owner approval; --proof uses a local gateway stand-in and disables the bot. No command sends a message. A real full bot may receive messages and spawn agents. Requires Python 3, mise, Docker, openssl, gopass and livekit-server. Check the stack with python3 -B scripts/local/verify.py.')
     parser.add_argument('command', choices=['up', 'down', 'status', 'report'])
     parser.add_argument('--profile', choices=['fast', 'full'], default='fast')
     parser.add_argument('--livekit', choices=['dev', 'cloud'], default='dev')

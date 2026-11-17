@@ -9,7 +9,7 @@ import stack
 state = json.loads(stack.STATE.read_text())
 if state['profile'] != 'fast' or state['root'] != str(stack.ROOT):
     raise RuntimeError('Proofs require this checkout local fast stack')
-owner = os.environ.get('LOCAL_OWNER_ID', 'telegram:95307956')
+owner = state['owner']
 
 def send(text):
     stack.ncl(state, 'messaging-groups', 'send', '--channel-type', 'cli', '--platform-id', 'local', '--sender-id', owner, '--text', text)

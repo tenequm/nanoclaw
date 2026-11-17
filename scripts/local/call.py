@@ -16,7 +16,7 @@ if state['root'] != str(stack.ROOT):
 ios = Path(sys.argv[1]).resolve()
 mode = sys.argv[2] if len(sys.argv) > 2 else 'plain'
 if mode not in ('plain', 'jev'): raise ValueError('Mode must be plain or jev')
-owner = os.environ.get('LOCAL_OWNER_ID', 'telegram:95307956')
+owner = state['owner']
 sock = socket.socket(socket.AF_UNIX)
 sock.settimeout(30)
 sock.connect(str(stack.ROOT / 'data/cli.sock'))

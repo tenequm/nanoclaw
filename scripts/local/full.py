@@ -11,7 +11,7 @@ import stack
 state = json.loads(stack.STATE.read_text())
 if state['profile'] != 'full' or state['root'] != str(stack.ROOT):
     raise RuntimeError('Requires this checkout full stack')
-owner = os.environ.get('LOCAL_OWNER_ID', 'telegram:95307956')
+owner = state['owner']
 values = dict(line.split('=', 1) for line in (stack.ROOT / '.env').read_text().splitlines())
 try:
     with urllib.request.urlopen('https://api.telegram.org/bot' + values['TELEGRAM_BOT_TOKEN'] + '/getMe', timeout=20) as response:
@@ -20,8 +20,8 @@ except Exception:
     bot_ok = False
 stack.result(state, 'test-bot-getme', 'pass' if bot_ok else 'fail', 'Test bot getMe checked; response identity and token withheld')
 with sqlite3.connect(stack.ROOT / 'data/v2.db') as db:
-    wired = db.execute('SELECT 1 FROM messaging_groups m JOIN messaging_group_agents w ON w.messaging_group_id=m.id WHERE m.channel_type=? AND m.platform_id=? AND w.agent_group_id=?', ('telegram', owner.split(':', 1)[1], state['group'])).fetchone()
-stack.result(state, 'owner-dm-wiring', 'pass' if wired else 'fail', 'Owner DM wiring exists; no Telegram message sent')
+    wired = db.execute('SELECT 1 FROM messaging_groups m JOIN messaging_group_agents w ON w.messaging_group_id=m.id WHERE m.channel_type=? AND m.platform_id=? AND w.agent_group_id=?', ('telegram', owner, state['group'])).fetchone()
+stack.result(state, 'owner-dm-wiring', 'pass' if wired else 'fail', 'Owner DM platform id and wiring ' + ('match' if wired else 'do not match') + '; no Telegram message sent')
 stack.ncl(state, 'messaging-groups', 'send', '--channel-type', 'cli', '--platform-id', 'local', '--sender-id', owner,
           '--text', 'Reply with exactly LOCAL_MODEL_OK. Do not use tools other than send_message to this chat.')
 deadline = time.monotonic() + 120
