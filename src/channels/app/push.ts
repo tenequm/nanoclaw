@@ -2,8 +2,7 @@ import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import type { DbDriver } from '../../db/driver.js';
-import type { DeviceRow } from '../../modules/device-auth/db.js';
-import { readSignedBody } from '../../modules/device-auth/verify.js';
+import { readSignedBody, liveDevices, reachableAgentIds, onDeviceRevoked } from '../../modules/device-auth/verify.js';
 import { json, type AppHandler } from './routes.js';
 import { parseAuthorization, type Badge, type Message, type Question, type PushPayload } from './contract.js';
 import type { EventRow, PushTokenRow } from './db.js';
@@ -58,9 +57,6 @@ export const registerPushToken = pushTokenHandler();
 
 export interface PushDependencies {
   onEventAppended(listener: (event: EventRow) => void): () => void;
-  onDeviceRevoked(listener: (deviceId: string) => void): () => void;
-  liveDevices(userId: string): Promise<DeviceRow[]>;
-  reachableAgentIds(deviceId: string): Promise<string[]>;
   badgeFor(userId: string, agentIds: string[]): Promise<Badge>;
   plainPreview(text: string): string;
 }
@@ -128,10 +124,10 @@ export function subscribePush(
         }
         return;
       }
-      for (const device of await deps.liveDevices(event.user_id)) {
+      for (const device of await liveDevices(event.user_id)) {
         if (device.revoked_at !== null || device.user_id !== event.user_id) continue;
         enqueue(async () => {
-          const agentIds = await deps.reachableAgentIds(device.id);
+          const agentIds = await reachableAgentIds(device.id);
           if (!agentIds.includes(event.agent_group_id)) return;
           const row = await db().get<PushTokenRow>('SELECT * FROM app_push_tokens WHERE device_id = ?', device.id);
           if (!row || (row.environment !== 'sandbox' && row.environment !== 'production')) return;
@@ -156,7 +152,7 @@ export function subscribePush(
               a: { id: sender.id, name: sender.name },
             },
           };
-          if (stopped || !(await deps.reachableAgentIds(device.id)).includes(event.agent_group_id)) return;
+          if (stopped || !(await reachableAgentIds(device.id)).includes(event.agent_group_id)) return;
           const result = await send({ token: row.token, environment: row.environment }, entity.id, payload);
           const fields = {
             deviceId: device.id,
@@ -181,15 +177,18 @@ export function subscribePush(
       }
     });
   });
-  const unrevoked = deps.onDeviceRevoked((deviceId) => {
-    void db()
-      .run('DELETE FROM app_push_tokens WHERE device_id = ?', deviceId)
-      .catch(() => warn('TokenCleanupFailed'));
-  });
   return () => {
     stopped = true;
     queue.length = 0;
     unsubscribe();
-    unrevoked();
   };
 }
+
+onDeviceRevoked((deviceId) => {
+  void getDb()
+    .run('DELETE FROM app_push_tokens WHERE device_id = ?', deviceId)
+    .then(({ changes }) => {
+      if (changes) log.warn('PushTokenCleared', { deviceId, reason: 'DeviceRevoked' });
+    })
+    .catch(() => log.warn('TokenCleanupFailed', { deviceId }));
+});

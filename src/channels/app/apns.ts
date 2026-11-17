@@ -153,8 +153,9 @@ export function createApnsClient(options: {
     async sendPush(destination: PushDestination, entityId: string, payload: PushPayload): Promise<PushResult> {
       const body = JSON.stringify(payload);
       if (Buffer.byteLength(body) >= 4096) return { status: 0, reason: 'PayloadTooLarge', clearToken: false };
-      let token = jwt(destination.environment);
-      if (!token) return { status: 0, reason: 'EnvironmentDisabled', clearToken: false };
+      const initialToken = jwt(destination.environment);
+      if (!initialToken) return { status: 0, reason: 'EnvironmentDisabled', clearToken: false };
+      let token: string = initialToken;
       let refreshed = false;
       let retries = 0;
       let transportRetried = false;

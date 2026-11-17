@@ -1,3 +1,4 @@
+import * as deviceAuth from '../../modules/device-auth/verify.js';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -15,7 +16,6 @@ import { tmpdir } from 'node:os';
 let db: DbDriver;
 let directory: string;
 let event: (event: EventRow) => void;
-let revoke: (id: string) => void;
 let stop: (() => void) | undefined;
 let deps: PushDependencies;
 const send = vi.fn(async () => ({ status: 200, clearToken: false }));
@@ -30,32 +30,31 @@ beforeEach(async () => {
       event = listener;
       return vi.fn();
     },
-    onDeviceRevoked: (listener) => {
-      revoke = listener;
-      return vi.fn();
-    },
-    liveDevices: async () =>
-      ['first', 'second', 'other', 'revoked', 'empty'].map((id) => ({
-        id,
-        user_id: 'user',
-        revoked_at: id === 'revoked' ? 1 : null,
-        name: '',
-        public_key: '',
-        app_json: '',
-        created_at: 0,
-        last_seen_at: null,
-      })),
-    reachableAgentIds: async (id) =>
-      id === 'other' ? ['ag_other'] : ['ag_stan', ...(id === 'second' ? ['ag_extra'] : [])],
     badgeFor: async (_user, ids) => ({ kind: 'badge', rev: 1, unreadTotal: ids.length === 1 ? 3 : 7 }),
     plainPreview: (text) => text,
   };
+  vi.spyOn(deviceAuth, 'liveDevices').mockImplementation(async () =>
+    ['first', 'second', 'other', 'revoked', 'empty'].map((id) => ({
+      id,
+      user_id: 'user',
+      revoked_at: id === 'revoked' ? 1 : null,
+      name: '',
+      public_key: '',
+      app_json: '',
+      created_at: 0,
+      last_seen_at: null,
+    })),
+  );
+  vi.spyOn(deviceAuth, 'reachableAgentIds').mockImplementation(async (id) =>
+    id === 'other' ? ['ag_other'] : ['ag_stan', ...(id === 'second' ? ['ag_extra'] : [])],
+  );
   for (const id of ['first', 'second', 'other', 'revoked'])
     await db.run('INSERT INTO app_push_tokens VALUES (?, ?, ?, ?)', id, id, 'sandbox', 1);
 });
 afterEach(async () => {
   stop?.();
   stop = undefined;
+  vi.restoreAllMocks();
   await closeDb();
   rmSync(directory, { recursive: true, force: true });
 });
@@ -114,7 +113,7 @@ it('clears rejected and revoked tokens', async () => {
   await vi.waitFor(async () =>
     expect(await db.get('SELECT * FROM app_push_tokens WHERE device_id = ?', 'first')).toBeUndefined(),
   );
-  revoke('other');
+  await deviceAuth.revokeDevice('other');
   await vi.waitFor(async () =>
     expect(await db.get('SELECT * FROM app_push_tokens WHERE device_id = ?', 'other')).toBeUndefined(),
   );
@@ -170,7 +169,7 @@ it('rechecks access after queued work and bounds sends in flight', async () => {
   start({ send: slow, concurrency: 1 });
   emit();
   await vi.waitFor(() => expect(slow).toHaveBeenCalledTimes(1));
-  deps.reachableAgentIds = async () => [];
+  vi.mocked(deviceAuth.reachableAgentIds).mockImplementation(async () => []);
   release();
   await vi.waitFor(() => expect(slow).toHaveResolvedTimes(1));
   expect(slow).toHaveBeenCalledTimes(1);
@@ -220,8 +219,7 @@ it('rechecks access after badge lookup before sending', async () => {
     return { kind: 'badge' as const, rev: 1, unreadTotal: 3 };
   });
   deps.badgeFor = badge;
-  const access = vi.fn(deps.reachableAgentIds);
-  deps.reachableAgentIds = access;
+  const access = vi.mocked(deviceAuth.reachableAgentIds);
   start();
   emit();
   await vi.waitFor(() => expect(badge).toHaveBeenCalledTimes(2));

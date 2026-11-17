@@ -83,7 +83,7 @@ beforeEach(async () => {
     },
     origins: { sandbox, production },
     now: () => now,
-    timeoutMs: 100,
+    timeoutMs: 1000,
     sleep: async () => {},
     warn,
   });
