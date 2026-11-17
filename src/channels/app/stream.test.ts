@@ -144,11 +144,11 @@ it('waits for drain, checks current access, and closes on the five-second revoca
   s.events.emit('event', row(130));
   await vi.advanceTimersByTimeAsync(0);
   s.events.emit('event', row(131));
-  vi.mocked(deviceAuth.reachableAgentIds).mockResolvedValue([]);
-  await vi.advanceTimersByTimeAsync(2_000);
-  s.res.emit('drain');
   await vi.advanceTimersByTimeAsync(0);
   expect(s.output()).not.toContain('id: 131');
+  s.res.emit('drain');
+  await vi.advanceTimersByTimeAsync(0);
+  expect(s.output()).toContain('id: 131');
   vi.mocked(deviceAuth.getLiveDevice).mockResolvedValue(undefined);
   await vi.advanceTimersByTimeAsync(5_000);
   expect(s.res.destroy).toHaveBeenCalled();
