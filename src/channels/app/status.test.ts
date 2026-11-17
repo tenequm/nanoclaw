@@ -1,3 +1,4 @@
+import { log } from '../../log.js';
 import Database from 'better-sqlite3';
 import { parseIsoTimestamp, type ContainerRecord } from '../../mailbox/model.js';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -116,6 +117,7 @@ it('survives failed boot reads and continues initializing other conversations', 
     "CREATE TABLE app_statuses (conversation_id TEXT PRIMARY KEY, rev INTEGER, state TEXT, label TEXT, at INTEGER); CREATE TABLE app_conversations (id TEXT); INSERT INTO app_conversations VALUES ('a'), ('b');",
   );
   await db.run("INSERT INTO app_statuses VALUES ('a', 7, 'idle', NULL, 0)");
+  const logged = vi.spyOn(log, 'error').mockImplementation(() => {});
   const deps: StatusDeps = {
     db: () => db,
     containerStates: async () => [],
@@ -141,6 +143,11 @@ it('survives failed boot reads and continues initializing other conversations', 
   } finally {
     await restarted.stop();
     all.mockRestore();
+    expect(logged.mock.calls).toEqual([
+      ['App status failed', { kind: 'Error' }],
+      ['App status failed', { kind: 'Error' }],
+    ]);
+    logged.mockRestore();
     await db.close();
   }
 });

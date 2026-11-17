@@ -1,3 +1,4 @@
+import { log } from '../../log.js';
 import type { Message } from './contract.js';
 import { appendEvent, appTransaction } from './log.js';
 import { stopStatus } from './status.js';
@@ -359,4 +360,20 @@ it('cleans up when the response closes during an asynchronous replay read', asyn
   expect(s.res.write).not.toHaveBeenCalled();
   expect(s.events.eventNames()).toEqual([]);
   expect(s.res.listenerCount('drain')).toBe(0);
+});
+
+it.each(['replay', 'live'])('logs only device and error kind for malformed %s events', async (phase) => {
+  vi.useFakeTimers();
+  const s = setup();
+  const logged = vi.spyOn(log, 'error').mockImplementation(() => {});
+  const malformed = { ...row(130), entity_json: 'private message content' };
+  if (phase === 'replay') s.deps.readEventsAfter = async () => [{ ...malformed, seq: 119 }];
+  await openStream(s.ctx, s.deps);
+  if (phase === 'live') {
+    s.events.emit('event', malformed);
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  expect(logged).toHaveBeenCalledWith('App stream failed', { deviceId: 'd', kind: 'SyntaxError' });
+  expect(JSON.stringify(logged.mock.calls)).not.toContain('private message content');
+  expect(s.res.destroy).toHaveBeenCalled();
 });

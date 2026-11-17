@@ -1,3 +1,4 @@
+import { log } from '../../log.js';
 import { setImmediate as yieldToHost } from 'node:timers/promises';
 import { lastEventSeq, readEventsAfter, onEventAppended } from './log.js';
 import { onBadgeChanged, conversationsFor, badgeFor } from './conversations.js';
@@ -129,6 +130,13 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
       allowed = current;
     }
   }
+  function failed(error: unknown): void {
+    log.error('App stream failed', {
+      deviceId: identity!.deviceId,
+      kind: error instanceof Error ? error.name : typeof error,
+    });
+    close();
+  }
   async function pump(): Promise<void> {
     if (replaying || pumping || closed) return;
     pumping = true;
@@ -143,8 +151,8 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
           await write(formatEvent({ comment: 'ping' }));
         }
       }
-    } catch {
-      close();
+    } catch (error) {
+      failed(error);
     } finally {
       pumping = false;
     }
@@ -173,7 +181,7 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
     );
     const ping = setInterval(() => enqueue({ ping: true }), 20_000);
     const recheck = setInterval(() => {
-      void agents().catch(close);
+      void agents().catch(failed);
     }, 5_000);
     ping.unref();
     recheck.unref();
@@ -211,7 +219,7 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
     cursor = high;
     replaying = false;
     await pump();
-  } catch {
-    close();
+  } catch (error) {
+    failed(error);
   }
 }

@@ -1,3 +1,4 @@
+import { log } from '../../log.js';
 import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
 import { getConversationByPlatformId } from './conversations.js';
 import { openQuestionConversationIds } from './questions.js';
@@ -53,6 +54,9 @@ export function createStatusService(deps: StatusDeps) {
   const labels = new Map<string, { readAt: number; label: string }>();
   let tail: Promise<unknown> = Promise.resolve();
   let stopped = false;
+  function failed(error: unknown): void {
+    log.error('App status failed', { kind: error instanceof Error ? error.name : typeof error });
+  }
   function serial<T>(work: () => Promise<T>): Promise<T> {
     const next = tail.then(work);
     tail = next.catch(() => {});
@@ -116,11 +120,11 @@ export function createStatusService(deps: StatusDeps) {
         if (fresh)
           ticks.set(c.id, { at: Date.parse(fresh.updatedAt), readAt: Date.now(), label: toolLabel(fresh.currentTool) });
         await refresh(c.id, true);
-      } catch {
-        // Keep other conversations available after a transient boot failure.
+      } catch (error) {
+        failed(error);
       }
     }
-  }).catch(() => {});
+  }).catch(failed);
   const unsubscribe = deps.onEventAppended((event) => {
     if (stopped) return;
     void serial(async () => {
@@ -129,7 +133,7 @@ export function createStatusService(deps: StatusDeps) {
         ticks.delete(event.conversation_id);
         await refresh(event.conversation_id);
       } else if (event.kind === 'question') await refresh(event.conversation_id);
-    }).catch(() => {});
+    }).catch(failed);
   });
   const timer = setInterval(() => {
     void serial(async () => {
@@ -138,7 +142,7 @@ export function createStatusService(deps: StatusDeps) {
           ticks.delete(id);
           await refresh(id);
         }
-    }).catch(() => {});
+    }).catch(failed);
   }, 1_000);
   timer.unref();
   deps.setAppHooks({ statuses });
