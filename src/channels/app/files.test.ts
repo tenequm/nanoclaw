@@ -28,6 +28,7 @@ beforeEach(async () => {
   db = await initDb(path.join(directory, 'test.db'), { role: 'test' });
   await runMigrations(db);
   live = true;
+  revoked = undefined!;
   service = createFileService({
     db: () => db,
     root: path.join(directory, 'files'),
@@ -125,15 +126,32 @@ it('fileInitResponse and fileTicketRenewResponse: lost mint and upload answers a
   const renewed = await request(service.renewFileTicket, Buffer.alloc(0), { id: first.body.fileId });
   expect(renewed.status).toBe(200);
   expect(readTicket(renewed.body.ticket, secret)?.fileId).toBe(first.body.fileId);
-  expect((await mint({ uploadKey, name: 'other.txt' })).body.error).toBe('upload_key_conflict');
+  expect(await mint({ uploadKey, name: 'other.txt' })).toMatchObject({
+    status: 409,
+    body: { error: 'upload_key_conflict' },
+  });
 });
 it('tooLarge, lengthRequired, badBody, forged tickets and uploadConflict', async () => {
-  expect((await mint({ size: 26_214_401 })).body.error).toBe('too_large');
+  expect(await mint({ size: 26_214_401 })).toMatchObject({
+    status: 413,
+    body: { error: 'too_large', maxBytes: 26_214_400 },
+  });
   const { body } = await mint();
   const options = { id: body.fileId, ticket: body.ticket };
-  expect((await request(service.uploadFile, content, { ...options, length: null })).body.error).toBe('length_required');
+  const other = await mint();
+  expect(await request(service.uploadFile, content, { ...options, id: other.body.fileId })).toMatchObject({
+    status: 401,
+    body: { error: 'bad_signature' },
+  });
+  expect(await request(service.uploadFile, content, { ...options, length: null })).toMatchObject({
+    status: 411,
+    body: { error: 'length_required' },
+  });
   expect((await request(service.uploadFile, content, { ...options, length: '1' })).body.error).toBe('bad_request');
-  expect((await request(service.uploadFile, Buffer.alloc(content.length), options)).body.error).toBe('bad_body');
+  expect(await request(service.uploadFile, Buffer.alloc(content.length), options)).toMatchObject({
+    status: 400,
+    body: { error: 'bad_body' },
+  });
   expect(
     (
       await request(service.uploadFile, Buffer.concat([content, content]), {
@@ -147,7 +165,10 @@ it('tooLarge, lengthRequired, badBody, forged tickets and uploadConflict', async
   );
   await request(service.uploadFile, content, options);
   await writeFile(path.join(directory, 'files', body.fileId), 'different');
-  expect((await request(service.uploadFile, content, options)).body.error).toBe('conflict');
+  expect(await request(service.uploadFile, content, options)).toMatchObject({
+    status: 409,
+    body: { error: 'conflict' },
+  });
   expect(await readdir(path.join(directory, 'files', 'tmp'))).toEqual([]);
 });
 it('ticketExpired and device revoked during upload never publish', async () => {
@@ -161,11 +182,10 @@ it('ticketExpired and device revoked during upload never publish', async () => {
     id: body.fileId,
     ticket: body.ticket,
     beforeEnd: () => {
-      live = false;
       revoked('dev');
     },
   });
-  expect(result.body.error).toBe('device_revoked');
+  expect(result).toMatchObject({ status: 401, body: { error: 'device_revoked' } });
   expect(await readdir(path.join(directory, 'files'))).toEqual(['tmp']);
   expect(await readdir(path.join(directory, 'files', 'tmp'))).toEqual([]);
 });
@@ -182,7 +202,20 @@ it('userWithFile: rejects badFile, claims atomically and stages independent copi
     (await db.get<{ message_id: string | null }>('SELECT message_id FROM app_files WHERE id=?', body.fileId))
       ?.message_id,
   ).toBeNull();
-  expect((await db.transaction(() => service.claimFiles(db, claim))).ok).toBe(true);
+  expect(await db.transaction(() => service.claimFiles(db, claim))).toEqual({
+    ok: true,
+    files: [
+      {
+        id: body.fileId,
+        name: 'test.txt',
+        mimeType: 'text/plain',
+        size: content.length,
+        kind: 'file',
+        width: null,
+        height: null,
+      },
+    ],
+  });
   expect((await db.transaction(() => service.claimFiles(db, claim))).ok).toBe(true);
   expect((await service.claimFiles(db, { ...claim, messageId: 'different' })).ok).toBe(false);
   const staged = await service.stageFiles('msg');
@@ -211,6 +244,9 @@ it('agentWithFiles: detects PNG and PDF bytes and retains sent files during clea
   });
   expect(files[0]).toMatchObject({ mimeType: 'image/png', kind: 'image', width: 17, height: 23 });
   expect(files[1]).toMatchObject({ mimeType: 'application/pdf', kind: 'file', width: null, height: null });
+  await db.run(
+    "INSERT INTO app_messages (id,conversation_id,user_id,item_order,seq,role,text,files_json,reactions_json,created_at) VALUES ('msg','conv','user',1,1,'agent','','[]','[]',1)",
+  );
   await mint();
   await service.cleanup(Date.now() + 86_400_001);
   expect(await db.all('SELECT id FROM app_files')).toHaveLength(2);
@@ -237,6 +273,7 @@ it('another device of the same user downloads with safe response headers', async
     messageId: 'msg',
     files: [{ filename: "a'b.txt", data: content }],
   });
+  await db.run('UPDATE app_files SET mime_type=? WHERE id=?', 'text/html', file.id);
   const server = createServer((req, res) => {
     void service
       .downloadFile({
@@ -249,12 +286,17 @@ it('another device of the same user downloads with safe response headers', async
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(4601, '127.0.0.1', resolve);
+    server.listen(0, '127.0.0.1', resolve);
   });
   try {
-    const response = await fetch('http://127.0.0.1:4601/app/files/' + file.id, { headers: { Authorization: auth } });
+    const port = (server.address() as import('node:net').AddressInfo).port;
+    const response = await fetch('http://127.0.0.1:' + port + '/app/files/' + file.id, {
+      headers: { Authorization: auth },
+    });
     expect(response.status).toBe(200);
-    expect(response.headers.get('content-type')).toBe('text/plain');
+    expect(response.headers.get('content-type')).toBe('application/octet-stream');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(response.headers.get('content-security-policy')).toBe('sandbox');
     expect(response.headers.get('content-length')).toBe(String(content.length));
     expect(response.headers.get('content-disposition')).toBe("attachment; filename*=UTF-8''a%27b.txt");
     expect(response.headers.get('cache-control')).toBe('private, no-store');
@@ -266,6 +308,7 @@ it('another device of the same user downloads with safe response headers', async
 });
 it('fileUpload fixture ticket validates and its expired authorization is distinguishable', () => {
   const fixture = fixtures.fileUpload;
+  expect(readTicket(fixture.expiredAuthorization.slice(14), fixture.ticketSecretForTests, 0)).not.toBeNull();
   expect(
     readTicket(fixture.authorization.slice(14), fixture.ticketSecretForTests, fixture.ticketClaims.exp - 1),
   ).toEqual(fixture.ticketClaims);
@@ -309,4 +352,42 @@ it('uploads delayed segments over HTTP beyond 64 KiB without blocking timers', a
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+it('renewal hides outbound files and files outside the device agent set', async () => {
+  const { body } = await mint();
+  await db.run('UPDATE app_files SET conversation_id=? WHERE id=?', 'conv', body.fileId);
+  expect(await request(service.renewFileTicket, Buffer.alloc(0), { id: body.fileId, agents: ['other'] })).toMatchObject(
+    { status: 404, body: { error: 'not_found' } },
+  );
+  expect((await request(service.renewFileTicket, Buffer.alloc(0), { id: body.fileId })).status).toBe(200);
+  const [file] = await service.storeOutboundFiles({
+    userId: 'user',
+    conversationId: 'conv',
+    messageId: 'missing',
+    files: [{ filename: 'ok.txt', data: content }],
+  });
+  expect((await request(service.renewFileTicket, Buffer.alloc(0), { id: file.id })).status).toBe(404);
+});
+
+it('boot sweeps interrupted uploads and cleanup removes orphan outbound files with safe substitute names', async () => {
+  const files = await service.storeOutboundFiles({
+    userId: 'user',
+    conversationId: 'conv',
+    messageId: 'missing',
+    files: [
+      { filename: 'ok.txt', data: content },
+      { filename: 'x'.repeat(300), data: content },
+      { filename: '..', data: content },
+    ],
+  });
+  expect(files.map((file) => file.name)).toEqual(['ok.txt', 'attachment', 'attachment']);
+  await import('node:fs/promises').then((fs) => fs.mkdir(path.join(directory, 'files', 'tmp')));
+  await writeFile(path.join(directory, 'files', 'tmp', 'interrupted'), content);
+  const stop = await service.startCleanup(() => {});
+  stop();
+  await expect(readdir(path.join(directory, 'files', 'tmp'))).rejects.toMatchObject({ code: 'ENOENT' });
+  await service.cleanup(Date.now() + 86_400_001);
+  expect(await db.all('SELECT id FROM app_files')).toEqual([]);
+  expect(await readdir(path.join(directory, 'files'))).toEqual([]);
 });

@@ -18,6 +18,18 @@ import { json, type AppHandler, type AppRequest } from './routes.js';
 
 const MAX_BYTES = 26_214_400;
 const DAY = 86_400_000;
+const SERVED_TYPES = new Set([
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'application/json',
+  'application/pdf',
+  'application/zip',
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+]);
 type StoredFile = FileRow & { sha256: string };
 type Claim = { userId: string; conversationId: string; messageId: string; fileIds: string[] };
 type Outbound = { userId: string; conversationId: string; messageId: string; files: OutboundFile[] };
@@ -275,6 +287,15 @@ export function createFileService(deps: FileDeps) {
   const renewFileTicket = wrap(async (ctx) => {
     await signedBody(ctx);
     const row = await own(ctx);
+    const conversation = row.conversation_id ? await deps.getConversation(row.conversation_id) : undefined;
+    if (
+      !row.upload_key ||
+      (row.conversation_id &&
+        (!conversation ||
+          conversation.user_id !== ctx.identity!.userId ||
+          !ctx.identity!.agentIds.includes(conversation.agent_group_id)))
+    )
+      refuse(404, 'not_found', 'File not found.');
     json(ctx.res, 200, await ticket(row, ctx.identity!.deviceId));
   });
   const uploadFile = wrap(async (ctx) => {
@@ -375,13 +396,20 @@ export function createFileService(deps: FileDeps) {
       row.uploaded_at === null
     )
       refuse(404, 'not_found', 'File not found.');
-    ctx.res.writeHead(200, {
-      'Content-Type': row.mime_type,
-      'Content-Length': row.size,
-      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(row.name).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`,
-      'Cache-Control': 'private, no-store',
-    });
-    await pipeline(createReadStream(row.storage_path), ctx.res);
+    const handle = await fs.open(row.storage_path, 'r');
+    try {
+      ctx.res.writeHead(200, {
+        'Content-Type': SERVED_TYPES.has(row.mime_type) ? row.mime_type : 'application/octet-stream',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': 'sandbox',
+        'Content-Length': row.size,
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(row.name).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`,
+        'Cache-Control': 'private, no-store',
+      });
+      await pipeline(handle.createReadStream(), ctx.res);
+    } finally {
+      await handle.close();
+    }
   });
   async function claimFiles(
     db: DbDriver,
@@ -426,9 +454,15 @@ export function createFileService(deps: FileDeps) {
     await fs.mkdir(root, { recursive: true });
     const result: FileAttachment[] = [];
     for (const file of input.files) {
-      const id = `file_${randomUUID()}`,
-        name = cleanName(file.filename),
-        target = path.join(root, id);
+      const id = `file_${randomUUID()}`;
+      let name: string;
+      try {
+        name = cleanName(file.filename);
+      } catch (error) {
+        if (!(error instanceof FileError)) throw error;
+        name = 'attachment';
+      }
+      const target = path.join(root, id);
       const metadata = fileMetadata(file.data, name);
       await fs.writeFile(target, file.data, { flag: 'wx', mode: 0o600 });
       try {
@@ -461,19 +495,24 @@ export function createFileService(deps: FileDeps) {
   }
   async function cleanup(now = Date.now()) {
     // Claiming and pruning share the DB transaction so a just-sent file cannot be deleted.
-    await deps.db().transaction(async () => {
+    const removed = await deps.db().transaction(async () => {
       const rows = await deps
         .db()
-        .all<StoredFile>('SELECT * FROM app_files WHERE message_id IS NULL AND created_at < ?', now - DAY);
+        .all<StoredFile>(
+          'SELECT * FROM app_files WHERE created_at < ? AND (message_id IS NULL OR NOT EXISTS (SELECT 1 FROM app_messages WHERE app_messages.id = app_files.message_id))',
+          now - DAY,
+        );
       for (const row of rows) {
-        await fs.rm(path.join(root, row.id), { force: true });
         await deps.db().run('DELETE FROM app_file_tickets WHERE file_id=?', row.id);
         await deps.db().run('DELETE FROM app_files WHERE id=?', row.id);
       }
       await deps.db().run('DELETE FROM app_file_tickets WHERE expires_at <= ?', now);
+      return rows;
     });
+    for (const row of removed) await fs.rm(path.join(root, row.id), { force: true });
   }
   async function startCleanup(onError: (error: unknown) => void) {
+    await fs.rm(tempRoot, { recursive: true, force: true });
     await cleanup();
     const timer = setInterval(() => {
       void cleanup().catch(onError);
