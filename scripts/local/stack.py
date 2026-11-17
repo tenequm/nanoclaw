@@ -151,7 +151,9 @@ def chain(state):
     write(config / 'routes.json', json.dumps({
         'tls': {'certificates': [{'certFile': str(ca / 'server.crt'), 'keyFile': str(ca / 'server.key')}]},
         'http': {'routers': {'voice': {'entryPoints': ['websecure'],
-            'rule': f'Host(`{host}`) && PathPrefix(`/voice`)', 'service': 'host', 'tls': {}}},
+            'rule': f'Host(`{host}`) && PathPrefix(`/voice`)', 'service': 'host', 'tls': {}},
+            'app': {'entryPoints': ['websecure'],
+                'rule': f'Host(`{host}`) && PathPrefix(`/app`)', 'service': 'host', 'tls': {}}},
             'services': {'host': {'loadBalancer': {'servers': [{'url': f'http://127.0.0.1:{b}'}]}}}}}))
     write(config / 'Caddyfile', f'''{{
     admin off
@@ -163,6 +165,10 @@ def chain(state):
 https://{host}:{b+6} {{
     bind 127.0.0.1
     tls {ca}/server.crt {ca}/server.key
+    @app path /app /app/*
+    request_body @app {{
+        max_size 26MiB
+    }}
     reverse_proxy https://127.0.0.1:{b+7} {{
         stream_close_delay 5m
         header_up Host {{host}}
@@ -304,6 +310,21 @@ def up(args):
         if args.profile == 'fast' and args.livekit == 'cloud':
             for key in ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET']:
                 env[key] = secret('misc/' + key)
+        env['APP_PUBLIC_BASE'] = env['VOICE_MODE_PUBLIC_URL']
+        env['APP_LIVEKIT_URL'] = env['LIVEKIT_URL']
+        if os.environ.get('LOCAL_APNS') == '1':
+            key_path = LOCAL / 'apns-sandbox.p8'
+            write(key_path, '')
+            key_path.chmod(0o600)
+            with open(key_path, 'wb') as key_file:
+                proc = subprocess.run(['gopass', 'show', '-n', 'fleet/nanoclaw/apns/sandbox-key'],
+                                      env=clean_env(), stdout=key_file, stderr=subprocess.DEVNULL)
+            if proc.returncode or not key_path.stat().st_size:
+                key_path.unlink(missing_ok=True)
+                raise RuntimeError('APNs sandbox key unavailable')
+            env['APP_APNS_TEAM_ID'] = os.environ.get('LOCAL_APNS_TEAM_ID', '4L9YA7S99L')
+            env['APP_APNS_SANDBOX_KEY_ID'] = secret('fleet/nanoclaw/apns/sandbox-key-id')
+            env['APP_APNS_SANDBOX_KEY_PATH'] = str(key_path)
         write(ROOT / '.env', ''.join(k + '=' + v + '\n' for k, v in env.items()))
         result(state, 'env', 'pass', 'Profile allowlist rendered at mode 0600; fresh encryption key')
         if args.profile == 'fast' or args.proof:
@@ -367,6 +388,7 @@ def down():
     if remaining:
         result(state, 'down', 'fail', 'Owned processes still present; retained state and data for retry')
         raise RuntimeError('Cleanup could not verify process exit; retry just local down')
+    (LOCAL / 'apns-sandbox.p8').unlink(missing_ok=True)
     for item in ['.env', 'data', 'store', 'groups/' + state['folder']]:
         path = ROOT / item
         if path.is_symlink() or path.is_file():
@@ -409,7 +431,7 @@ def report():
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, epilog='Settings: LOCAL_PORT_BASE (4100), HEYDAN_RUN_DIR, LOCAL_AGENT_PROVIDER (fast: stand-in), LOCAL_TEST_AGENT and LOCAL_ANTHROPIC_SECRET_ID (required for full), LOCAL_OWNER_ID (required for full; synthetic telegram:1 for fast/proof), LOCAL_ONECLI_URL, LOCAL_JEV_URL, LOCAL_JEV_MODEL, LOCAL_VOICE_MODE_<key>. Full starts real services only after owner approval; --proof uses a local gateway stand-in and disables the bot. No command sends a message. A real full bot may receive messages and spawn agents. Requires Python 3, mise, Docker, openssl, gopass and livekit-server. Check the stack with python3 -B scripts/local/verify.py.')
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Settings: LOCAL_PORT_BASE (4100), HEYDAN_RUN_DIR, LOCAL_AGENT_PROVIDER (fast: stand-in), LOCAL_TEST_AGENT and LOCAL_ANTHROPIC_SECRET_ID (required for full), LOCAL_OWNER_ID (required for full; synthetic telegram:1 for fast/proof), LOCAL_ONECLI_URL, LOCAL_APNS (1 enables sandbox push), LOCAL_APNS_TEAM_ID, LOCAL_JEV_URL, LOCAL_JEV_MODEL, LOCAL_VOICE_MODE_<key>. Full starts real services only after owner approval; --proof uses a local gateway stand-in and disables the bot. No command sends a message. A real full bot may receive messages and spawn agents. Requires Python 3, mise, Docker, openssl, gopass and livekit-server. Check the stack with python3 -B scripts/local/verify.py.')
     parser.add_argument('command', choices=['up', 'down', 'status', 'report'])
     parser.add_argument('--profile', choices=['fast', 'full'], default='fast')
     parser.add_argument('--livekit', choices=['dev', 'cloud'], default='dev')
