@@ -3,6 +3,7 @@ import argparse
 import base64
 from contextlib import closing
 import datetime
+import functools
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ from pathlib import Path
 import platform
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -33,7 +35,41 @@ CADDY, CADDY_L4 = 'v2.11.9', 'v0.1.3'
 TRAEFIK = 'v3.6.14'
 TRAEFIK_SHA256 = dict(arm64='b38f6cf569f1579205ac6b7e6d1f2dff8dddded5a3eeb3c14e926e6dea9f971e',
                       amd64='e596cb52b7c5a47b4fd86255130afcf9d9703aacbac24518b845531d0ea7db42')
-WAKE_MODEL_SHA256 = '1b19ba6248fa3f353f9bc6484ba511234976c0877324bb883928230d22c09e22'
+# Operator-specific names live outside the checkout, so every disposable checkout shares them.
+SETTINGS = Path(os.environ.get('NANOCLAW_LOCAL_SETTINGS') or Path.home() / '.config/nanoclaw/local-stack.env')
+# Rendered .env key -> the setting naming its secret-store entry.
+VOICE_SECRETS = dict(VOICE_MODE_GEMINI_API_KEY='LOCAL_GEMINI_API_KEY_ENTRY', JEV_API_KEY='LOCAL_JEV_API_KEY_ENTRY')
+CLOUD_SECRETS = dict(LIVEKIT_URL='LOCAL_LIVEKIT_URL_ENTRY', LIVEKIT_API_KEY='LOCAL_LIVEKIT_API_KEY_ENTRY',
+                     LIVEKIT_API_SECRET='LOCAL_LIVEKIT_API_SECRET_ENTRY')
+WAKE_MODEL = 'data/voice-models/wake.onnx'
+
+
+@functools.cache
+def file_settings():
+    try:
+        lines = SETTINGS.read_text().splitlines()
+    except FileNotFoundError:
+        return {}
+    values = {}
+    for number, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        key, sep, value = line.partition('=')
+        if not sep:
+            raise RuntimeError(f'{SETTINGS}:{number} is not KEY=VALUE')
+        values[key.strip()] = value.strip()
+    return values
+
+
+def setting(key, default=None):
+    return os.environ.get(key) or file_settings().get(key) or default
+
+
+def require(*keys):
+    missing = [key for key in keys if not setting(key)]
+    if missing:
+        raise RuntimeError('Set ' + ', '.join(missing) + f' in the environment or {SETTINGS}; see docs/local-stack.md')
 
 
 def write(path, value):
@@ -111,15 +147,19 @@ def wait_port(port, name):
     raise RuntimeError(f'{name} did not listen on {port}; see logs/{name}.log')
 
 
-def secret(entry):
-    proc = subprocess.run(['gopass', 'show', '--password', entry], env=clean_env(),
-                          capture_output=True, text=True)
+def secret(key):
+    command = shlex.split(setting('LOCAL_SECRET_CMD', 'gopass show --password')) + [setting(key)]
+    proc = subprocess.run(command, env=clean_env(), capture_output=True, text=True)
     if proc.returncode:
-        raise RuntimeError(f'gopass entry unavailable: {entry}')
+        raise RuntimeError(f'Secret store entry named by {key} is unavailable')
     value = proc.stdout.strip()
     if not value or '\n' in value or '\r' in value:
-        raise RuntimeError(f'gopass entry is not a single value: {entry}')
+        raise RuntimeError(f'Secret store entry named by {key} is not a single value')
     return value
+
+
+def wake_cache():
+    return LOCAL / 'cache' / f"wake-{setting('LOCAL_WAKE_MODEL_SHA256')[:16]}.onnx"
 
 
 def sha256(path):
@@ -271,7 +311,7 @@ def seed(state):
     folder = state['folder']
     if state['profile'] == 'full':
         # ncl generates IDs; seed the approved identifier before its idempotent filesystem setup.
-        ident = os.environ['LOCAL_TEST_AGENT']
+        ident = setting('LOCAL_TEST_AGENT')
         sql = "INSERT INTO agent_groups (id,name,folder,created_at) VALUES (" + ','.join(
             "'" + v.replace("'", "''") + "'" for v in [ident, 'Local test', folder,
             datetime.datetime.now(datetime.timezone.utc).isoformat()]) + ')'
@@ -279,7 +319,7 @@ def seed(state):
     group = ncl('groups', 'create', '--folder', folder, '--name', 'Local test')
     state['group'] = group['id']
     save(state)
-    provider = os.environ.get('LOCAL_AGENT_PROVIDER', 'stand-in' if state['profile'] == 'fast' else '')
+    provider = setting('LOCAL_AGENT_PROVIDER', 'stand-in' if state['profile'] == 'fast' else '')
     if provider:
         ncl('groups', 'config', 'update', '--id', group['id'], '--provider', provider)
     cli = ncl('messaging-groups', 'create', '--channel-type', 'cli', '--platform-id', CLI_PLATFORM_ID, '--name', 'Local CLI')
@@ -298,23 +338,31 @@ def up(args):
     for path in ['.env', 'data', 'store']:
         if (ROOT / path).exists() or (ROOT / path).is_symlink():
             raise RuntimeError(f'Refusing existing {path}; use a disposable checkout')
-    owner = os.environ.get('LOCAL_OWNER_ID', 'telegram:1' if args.profile == 'fast' or args.proof else '')
+    livekit = 'cloud' if args.profile == 'full' else args.livekit
+    needed = [*VOICE_SECRETS.values(), 'LOCAL_WAKE_MODEL_SHA256', *(CLOUD_SECRETS.values() if livekit == 'cloud' else [])]
+    if args.profile == 'full':
+        needed += ['LOCAL_TEST_AGENT', 'LOCAL_ANTHROPIC_SECRET_ID']
+        if not args.proof:
+            needed += ['LOCAL_OWNER_ID', 'LOCAL_ONECLI_URL', 'LOCAL_TEST_BOT_TOKEN_ENTRY']
+    require(*needed)
+    if not re.fullmatch(r'[0-9a-f]{64}', setting('LOCAL_WAKE_MODEL_SHA256')):
+        raise RuntimeError('LOCAL_WAKE_MODEL_SHA256 must be 64 lowercase hex digits')
+    if not wake_cache().exists():
+        require('LOCAL_WAKE_MODEL_SOURCE')
+    owner = setting('LOCAL_OWNER_ID', 'telegram:1' if args.profile == 'fast' or args.proof else '')
     if not re.fullmatch(r'telegram:[1-9][0-9]*', owner):
         raise RuntimeError('Set LOCAL_OWNER_ID to telegram:<positive numeric user id>')
-    b = int(os.environ.get('LOCAL_PORT_BASE', '4100'))
+    b = int(setting('LOCAL_PORT_BASE', '4100'))
     if b < 1024 or b > 65400:
         raise RuntimeError('LOCAL_PORT_BASE must be 1024..65400')
-    run_dir = Path(os.environ.get('LOCAL_RUN_DIR', str(LOCAL / 'runs' /
+    run_dir = Path(setting('LOCAL_RUN_DIR', str(LOCAL / 'runs' /
         datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')))).resolve()
     (run_dir / 'logs').mkdir(parents=True, exist_ok=True)
     state = dict(run=str(run_dir), root=str(ROOT), owner=owner, base=b, profile=args.profile, proof=args.proof,
-                 livekit=('cloud' if args.profile == 'full' else args.livekit), processes=[], folder='local-' + secrets.token_hex(6), lock=False)
+                 livekit=livekit, processes=[], folder='local-' + secrets.token_hex(6), lock=False)
     claim(state)
     try:
         if args.profile == 'full':
-            for key in ['LOCAL_TEST_AGENT', 'LOCAL_ANTHROPIC_SECRET_ID']:
-                if not os.environ.get(key):
-                    raise RuntimeError('Set ' + key)
             try:
                 LOCK.mkdir(mode=0o700)
             except FileExistsError:
@@ -334,41 +382,42 @@ def up(args):
                    VOICE_MODE_PUBLIC_URL=(f'https://{PROXY_HOST}:{b+6}' if args.chain or args.profile == 'full' else f'http://127.0.0.1:{b}'),
                    LIVEKIT_AGENT_NAME='local-' + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12],
                    NANOCLAW_ENCRYPTION_KEY=base64.b64encode(secrets.token_bytes(32)).decode(),
-                   VOICE_MODE_GEMINI_API_KEY=secret('fleet/nanoclaw/gemini/api-key'),
-                   JEV_API_KEY=secret('fleet/nanoclaw/JEV_OPENROUTER_API_KEY'),
-                   JEV_URL=os.environ.get('LOCAL_JEV_URL', 'https://openrouter.ai/api/v1/systemone'),
-                   JEV_MODEL=os.environ.get('LOCAL_JEV_MODEL', 'jev-1.14'))
-        voice_defaults = dict(WAKE_MODEL='data/voice-models/hey_dan_v4.onnx',
-            WAKE_THRESHOLD='0.75', WAKE_PHRASE='Hey Dan', WAKE_HOP_MS='40',
-            SILENCE_MS='1500', MAX_CALLS_PER_HOUR='40', MAX_CALL_SECONDS='3600',
-            MAX_SPOKEN_CHARS='0', VOCABULARY='Dan,Stan,Emma,Concierge')
-        for key, value in voice_defaults.items():
-            env['VOICE_MODE_' + key] = os.environ.get('LOCAL_VOICE_MODE_' + key, value)
-        overridden = [k for k in ['LOCAL_JEV_URL', 'LOCAL_JEV_MODEL', *('LOCAL_VOICE_MODE_' + key for key in voice_defaults)] if k in os.environ]
-        model = LOCAL / 'cache/hey_dan_v4.onnx'
+                   JEV_URL=setting('LOCAL_JEV_URL', 'https://openrouter.ai/api/v1/systemone'),
+                   JEV_MODEL=setting('LOCAL_JEV_MODEL', 'jev-1.14'), VOICE_MODE_WAKE_MODEL=WAKE_MODEL)
+        for key, entry_setting in VOICE_SECRETS.items():
+            env[key] = secret(entry_setting)
+        # WAKE_PHRASE and VOCABULARY name the agent, so they come only from settings.
+        voice = dict(WAKE_THRESHOLD='0.75', WAKE_HOP_MS='40', SILENCE_MS='1500', MAX_CALLS_PER_HOUR='40',
+                     MAX_CALL_SECONDS='3600', MAX_SPOKEN_CHARS='0', WAKE_PHRASE=None, VOCABULARY=None)
+        for key, default in voice.items():
+            value = setting('LOCAL_VOICE_MODE_' + key, default)
+            if value is not None:
+                env['VOICE_MODE_' + key] = value
+        configured = [k for k in ['LOCAL_JEV_URL', 'LOCAL_JEV_MODEL', *('LOCAL_VOICE_MODE_' + key for key in voice)] if setting(k)]
+        model = wake_cache()
         if not model.exists():
             partial = model.with_name(model.name + '.part')
             partial.parent.mkdir(parents=True, exist_ok=True)
-            run(['scp', 'bl:pj/nanoclaw/data/voice-models/hey_dan_v4.onnx', str(partial)], state, 'wake-model')
+            run(['scp', setting('LOCAL_WAKE_MODEL_SOURCE'), str(partial)], state, 'wake-model')
             partial.rename(model)
-        if sha256(model) != WAKE_MODEL_SHA256:
+        if sha256(model) != setting('LOCAL_WAKE_MODEL_SHA256'):
             raise RuntimeError(f'Wake model checksum mismatch; remove {model} to fetch it again')
-        target = ROOT / 'data/voice-models/hey_dan_v4.onnx'
+        target = ROOT / WAKE_MODEL
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(model, target)
-        result(state, 'voice-parity', 'skip' if overridden else 'pass', 'Wake model SHA-256 verified; ' + (
-            'overridden: ' + ', '.join(overridden) if overridden else 'Jev and voice settings are the defaults copied from bl'))
+        result(state, 'voice-settings', 'pass', 'Wake model SHA-256 verified; from settings: ' + (
+            ', '.join(configured) or 'none') + '; other voice values are the stack.py defaults')
         if state['livekit'] == 'cloud':
-            for key in ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET']:
-                env[key] = secret('misc/' + key)
+            for key, entry_setting in CLOUD_SECRETS.items():
+                env[key] = secret(entry_setting)
         else:
             env.update(LIVEKIT_URL=f'ws://127.0.0.1:{b+2}', LIVEKIT_API_KEY='devkey', LIVEKIT_API_SECRET='secret')
         if args.profile == 'full':
             if not args.proof:
-                env['TELEGRAM_BOT_TOKEN'] = secret('misc/NANOCLAW_TEST_BOT_TOKEN')
-                env['ONECLI_URL'] = os.environ.get('LOCAL_ONECLI_URL', 'https://onecli.opx.one')
+                env['TELEGRAM_BOT_TOKEN'] = secret('LOCAL_TEST_BOT_TOKEN_ENTRY')
+                env['ONECLI_URL'] = setting('LOCAL_ONECLI_URL')
             write(ROOT / 'data/onecli/provider-credentials.json', json.dumps({
-                'providers': {'claude': [os.environ['LOCAL_ANTHROPIC_SECRET_ID']]}, 'matched': ['claude']}))
+                'providers': {'claude': [setting('LOCAL_ANTHROPIC_SECRET_ID')]}, 'matched': ['claude']}))
         write(ROOT / '.env', ''.join(k + '=' + v + '\n' for k, v in env.items()))
         result(state, 'env', 'pass', 'Profile allowlist rendered at mode 0600; fresh encryption key')
         if args.profile == 'fast' or args.proof:
@@ -486,7 +535,7 @@ def status():
 
 
 def report():
-    directory = os.environ.get('LOCAL_RUN_DIR')
+    directory = setting('LOCAL_RUN_DIR')
     if not directory:
         directory = json.loads(STATE.read_text())['run'] if STATE.exists() else (LOCAL / 'last-run').read_text()
     run_dir = Path(directory)

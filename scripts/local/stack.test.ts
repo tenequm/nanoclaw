@@ -6,7 +6,7 @@ import { getInstallSlug } from '../../src/install-slug.js';
 function python(source: string, ...args: string[]): string {
   return execFileSync('python3', ['-B', '-c', `import sys\nsys.path.insert(0, 'scripts/local')\n${source}`, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, LOCAL_AGENT_PROVIDER: 'stand-in' },
+    env: { ...process.env, LOCAL_AGENT_PROVIDER: 'stand-in', NANOCLAW_LOCAL_SETTINGS: '/nonexistent' },
   });
 }
 

@@ -17,6 +17,9 @@ if not ios.is_dir():
 mode = sys.argv[2] if len(sys.argv) > 2 else 'plain'
 if mode not in ('plain', 'jev'):
     raise ValueError('Mode must be plain or jev')
+phrase = stack.read_env().get('VOICE_MODE_WAKE_PHRASE')
+if mode == 'plain' and not phrase:
+    raise RuntimeError('Set LOCAL_VOICE_MODE_WAKE_PHRASE before just local up; a plain call opens with it')
 sock = socket.socket(socket.AF_UNIX)
 sock.connect(str(stack.ROOT / 'data/cli.sock'))
 # Claim the CLI delivery connection with a host-owned read-only command.
@@ -55,7 +58,7 @@ def deliveries():
 before = deliveries()
 call_run = Path(state['run']) / ('call-' + mode)
 env = stack.clean_env() | {'HEYDAN_E2E_CALL_LINK': link, 'HEYDAN_LOCAL_CA': state['ca'], 'HEYDAN_RUN_DIR': str(call_run),
-    'HEYDAN_E2E_ATTEMPTS': '1', 'HEYDAN_E2E_SAY': 'Hey Dan. What is two plus two? Zulu.'}
+    'HEYDAN_E2E_ATTEMPTS': '1', 'HEYDAN_E2E_SAY': (phrase + '. ' if phrase else '') + 'What is two plus two? Zulu.'}
 code = subprocess.run(['just', 'sim-e2e'], cwd=ios, env=env).returncode
 new = deliveries() - before
 stack.result(state, mode + '-agent-delivery', 'pass' if code == 0 and new else 'fail',
