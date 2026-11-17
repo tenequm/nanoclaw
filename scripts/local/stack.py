@@ -430,9 +430,23 @@ def report():
     print(run_dir / 'report.md')
 
 
+def client(args):
+    state = json.loads(STATE.read_text())
+    if args.chain and 'ca' not in state:
+        raise RuntimeError('Start the local stack with --chain first')
+    base = state['url'] if args.chain else f"http://127.0.0.1:{state['base']}"
+    env = clean_env() | {'HEYDAN_RUN_DIR': state['run'], 'LOCAL_OWNER_ID': state['owner']}
+    if args.chain:
+        env['NODE_EXTRA_CA_CERTS'] = state['ca']
+    run(NODE + ['pnpm', 'exec', 'tsx', 'scripts/app-client.ts', args.scenario,
+                '--base', base], state, 'n9b-client-command', env)
+    print('Client results: ' + state['run'])
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, epilog='Settings: LOCAL_PORT_BASE (4100), HEYDAN_RUN_DIR, LOCAL_AGENT_PROVIDER (fast: stand-in), LOCAL_TEST_AGENT and LOCAL_ANTHROPIC_SECRET_ID (required for full), LOCAL_OWNER_ID (required for full; synthetic telegram:1 for fast/proof), LOCAL_ONECLI_URL, LOCAL_APNS (1 enables sandbox push), LOCAL_APNS_TEAM_ID, LOCAL_JEV_URL, LOCAL_JEV_MODEL, LOCAL_VOICE_MODE_<key>. Full starts real services only after owner approval; --proof uses a local gateway stand-in and disables the bot. No command sends a message. A real full bot may receive messages and spawn agents. Requires Python 3, mise, Docker, openssl, gopass and livekit-server. Check the stack with python3 -B scripts/local/verify.py.')
-    parser.add_argument('command', choices=['up', 'down', 'status', 'report'])
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Settings: LOCAL_PORT_BASE (4100), HEYDAN_RUN_DIR, LOCAL_AGENT_PROVIDER (fast: stand-in), LOCAL_TEST_AGENT and LOCAL_ANTHROPIC_SECRET_ID (required for full), LOCAL_OWNER_ID (required for full; synthetic telegram:1 for fast/proof), LOCAL_ONECLI_URL, LOCAL_APNS (1 enables sandbox push), LOCAL_APNS_TEAM_ID, LOCAL_JEV_URL, LOCAL_JEV_MODEL, LOCAL_VOICE_MODE_<key>. Full starts real services only after owner approval; --proof uses a local gateway stand-in and disables the bot. The client command sends scripted messages to the local test agent. A real full bot may receive messages and spawn agents. Requires Python 3, mise, Docker, openssl, gopass and livekit-server. Check the stack with python3 -B scripts/local/verify.py.')
+    parser.add_argument('command', choices=['up', 'down', 'status', 'report', 'client'])
+    parser.add_argument('scenario', nargs='?', default='all', choices=['pair', 'send', 'stream', 'upload', 'security', 'all'])
     parser.add_argument('--profile', choices=['fast', 'full'], default='fast')
     parser.add_argument('--livekit', choices=['dev', 'cloud'], default='dev')
     parser.add_argument('--chain', action='store_true')
@@ -444,6 +458,8 @@ def main():
     try:
         if args.command == 'up':
             up(args)
+        elif args.command == 'client':
+            client(args)
         else:
             globals()[args.command]()
     except (RuntimeError, OSError, ValueError) as error:
