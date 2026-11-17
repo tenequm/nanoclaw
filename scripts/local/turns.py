@@ -1,57 +1,62 @@
 """Check stand-in turns against the real host delivery ledger."""
-import os
-import json
+from contextlib import closing
 import sqlite3
+import sys
 import time
-from pathlib import Path
 import stack
 
-state = json.loads(stack.STATE.read_text())
-if state['profile'] != 'fast' or state['root'] != str(stack.ROOT):
-    raise RuntimeError('Proofs require this checkout local fast stack')
-owner = state['owner']
+state = stack.load_state('fast')
+UNPROVEN = ('; the CLI adapter has no file rendering, message IDs/edit support or question-response input, '
+            'so end-to-end behavior is unproven')
 
-def send(text):
-    stack.ncl(state, 'messaging-groups', 'send', '--channel-type', 'cli', '--platform-id', 'local', '--sender-id', owner, '--text', text)
-
-def rows():
-    paths = list((stack.ROOT / 'data/v2-sessions').rglob('outbound.db'))
-    output = []
-    for path in paths:
-        with sqlite3.connect(path) as db, sqlite3.connect(path.with_name('inbound.db')) as inbound:
-            delivered = dict(inbound.execute('select message_out_id,status from delivered'))
-            output.extend((r[0], json.loads(r[1]), delivered.get(r[0])) for r in db.execute('select id,content from messages_out'))
-    return output
 
 def wait(predicate, seconds=45):
     until = time.monotonic() + seconds
     while time.monotonic() < until:
-        if predicate(): return True
+        if predicate():
+            return True
         time.sleep(.25)
     return False
 
-for mode in ['reply', 'multi', 'long', 'file', 'edit', 'question']:
-    before = {r[0] for r in rows()}
-    send(mode)
-    fresh = lambda: [r for r in rows() if r[0] not in before]
-    active = False
-    if mode == 'long':
-        def tool():
-            for p in (stack.ROOT / 'data/v2-sessions').rglob('outbound.db'):
-                with sqlite3.connect(p) as d:
-                    if d.execute("select 1 from container_state where current_tool='stand_in_wait'").fetchone(): return True
-            return False
-        active = wait(tool, 10)
+
+def long_tool_active():
+    for path in (stack.ROOT / 'data/v2-sessions').rglob('outbound.db'):
+        try:
+            with closing(stack.connect_ro(path)) as db:
+                if db.execute("select 1 from container_state where current_tool='stand_in_wait'").fetchone():
+                    return True
+        except sqlite3.OperationalError:
+            continue
+    return False
+
+
+failed = False
+# `question 5` lets the unanswered card time out before a rerun can queue behind it.
+for mode, command in [('reply', 'reply'), ('multi', 'multi'), ('long', 'long'),
+                      ('file', 'file'), ('edit', 'edit'), ('question', 'question 5')]:
+    before = {row[:2] for row in stack.outbound_rows()}
+    stack.send_cli(state, command)
+
+    def fresh():
+        return [(content, status) for path, ident, content, status in stack.outbound_rows() if (path, ident) not in before]
+
+    active = mode == 'long' and wait(long_tool_active, 10)
     count = 3 if mode == 'multi' else 2 if mode == 'file' else 1
-    wait(lambda: len([r for r in fresh() if r[2] == 'delivered']) >= count)
+    wait(lambda: sum(status == 'delivered' for _, status in fresh()) >= count)
     current = fresh()
-    passed = False
-    if mode == 'reply': passed = any(c.get('text') == 'Stand-in reply.' and d == 'delivered' for _, c, d in current)
-    if mode == 'multi': passed = [c.get('text') for _,c,d in current if d == 'delivered'] == ['First message.', 'Second message.', 'Third message.']
-    if mode == 'long': passed = active and any(c.get('text') == 'Long tool complete.' and d == 'delivered' for _,c,d in current)
-    detail = f'{len(current)} outbound rows; {sum(r[2] == "delivered" for r in current)} acknowledged by host'
-    if mode in ['file', 'edit', 'question']:
-        detail += '; CLI adapter has no file rendering, message IDs/edit support or question-response input; end-to-end behavior unproven'
-    if mode == 'long': detail += f'; current tool observed={active}'
-    stack.result(state, 'turn-' + mode, 'pass' if passed else 'fail', detail)
-    print(mode + ': ' + ('pass' if passed else 'fail'), flush=True)
+    delivered = [content.get('text') for content, status in current if status == 'delivered']
+    detail = f'{len(current)} outbound rows; {len(delivered)} acknowledged by host'
+    if mode == 'reply':
+        status = 'pass' if 'Stand-in reply.' in delivered else 'fail'
+    elif mode == 'multi':
+        status = 'pass' if delivered == ['First message.', 'Second message.', 'Third message.'] else 'fail'
+    elif mode == 'long':
+        status = 'pass' if active and 'Long tool complete.' in delivered else 'fail'
+        detail += f'; current tool observed={active}'
+    else:
+        status = 'skip'
+        detail += UNPROVEN
+    failed |= status == 'fail'
+    stack.result(state, 'turn-' + mode, status, detail)
+    print(mode + ': ' + status, flush=True)
+sys.exit(1 if failed else 0)

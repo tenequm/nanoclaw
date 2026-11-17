@@ -176,7 +176,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
           'devices',
           'pair',
           '--user',
-          process.env.LOCAL_OWNER_ID ?? stack.owner ?? 'telegram:95307956',
+          process.env.LOCAL_OWNER_ID ?? stack.owner,
           '--agents',
           stack.group,
           '--json',
@@ -563,7 +563,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   });
   if (values.help) console.log('Usage: app-client.ts <pair|send|stream|upload|security|all> --base <url> [--remote]');
   else
-    runAppClient(values.base ?? 'http://127.0.0.1:5000', process.env.HEYDAN_RUN_DIR ?? '.local/app-client/run', {
+    runAppClient(values.base ?? 'http://127.0.0.1:5000', process.env.LOCAL_RUN_DIR ?? '.local/app-client/run', {
       scenario: positionals[0],
       remote: values.remote,
     }).catch(() => {

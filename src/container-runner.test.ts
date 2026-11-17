@@ -168,14 +168,14 @@ describe('composeSessionSpec', () => {
           contribution: { env: { no_proxy: 'shared, provider', ...(source === 'contribution' && proxy) } },
           gateway: {
             env: {
-              NO_PROXY: 'gateway, host.docker.internal',
+              NO_PROXY: 'gateway',
               no_proxy: 'shared, internal,',
               ...(source === 'gateway' && proxy),
             },
           },
         });
         const env = spec.containers[0].contributedEnv!;
-        expect(env.NO_PROXY).toBe('localhost,shared,gateway,host.docker.internal,internal');
+        expect(env.NO_PROXY).toBe('localhost,shared,gateway,internal,host.docker.internal:3010');
         expect(env.no_proxy).toBe(env.NO_PROXY);
         expect({ ...spec.containers[0].env, ...env }[key]).toBe(proxy[key]);
       }
@@ -185,23 +185,20 @@ describe('composeSessionSpec', () => {
   it.each([
     { lockdown: false, endpoint: 'host.docker.internal', kind: 'runtime', bypass: true },
     { lockdown: true, endpoint: 'host.docker.internal', kind: 'runtime', bypass: false },
-    { lockdown: true, endpoint: 'remote-gateway', kind: 'runtime', bypass: true },
-    { lockdown: true, endpoint: 'host.docker.internal', kind: 'host', bypass: true },
-  ])('respects the lockdown gateway alias: %j', ({ lockdown, endpoint, kind, bypass }) => {
+    { lockdown: true, endpoint: 'remote-gateway', kind: 'runtime', bypass: false },
+    { lockdown: true, endpoint: 'localhost', kind: 'session-container', bypass: true },
+  ])('keeps the mailbox proxied on the lockdown network only: %j', ({ lockdown, endpoint, kind, bypass }) => {
     topology.lockdown = lockdown;
+    const gatewayEnv = { HTTPS_PROXY: 'http://remote-gateway:15001', NO_PROXY: 'localhost', no_proxy: 'internal' };
+    const target = kind === 'runtime' ? { kind, identity: 'fixture-gateway' } : { kind, role: 'fixture-gateway' };
     const spec = compose({
       mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
-      gateway: {
-        env: { HTTPS_PROXY: 'http://remote-gateway:15001', NO_PROXY: 'localhost', no_proxy: 'internal' },
-        networkAccess: { endpoint, target: { kind, ...(kind === 'runtime' && { identity: 'fixture-gateway' }) } },
-      },
+      gateway: { env: gatewayEnv, networkAccess: { endpoint, target } },
     });
-    const expected = bypass ? 'localhost,internal,host.docker.internal' : 'localhost,internal';
-    expect(spec.containers[0].contributedEnv).toEqual({
-      HTTPS_PROXY: 'http://remote-gateway:15001',
-      NO_PROXY: expected,
-      no_proxy: expected,
-    });
+    const merged = 'localhost,internal,host.docker.internal:3010';
+    expect(spec.containers[0].contributedEnv).toEqual(
+      bypass ? { ...gatewayEnv, NO_PROXY: merged, no_proxy: merged } : gatewayEnv,
+    );
   });
 
   it('leaves bypass lists unchanged without a proxy or a mailbox URL', () => {
