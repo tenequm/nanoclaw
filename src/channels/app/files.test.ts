@@ -11,8 +11,9 @@ import type { DbDriver } from '../../db/driver.js';
 import type { DeviceRow } from '../../modules/device-auth/db.js';
 import type { AppHandler } from './routes.js';
 import './db.js';
-import { createFileService, fileMetadata } from './files.js';
+import { configureFiles, createFileService, fileMetadata } from './files.js';
 import { readTicket } from './contract.js';
+import { getHostStartCallbacks, getHostShutdownCallbacks } from '../../host-lifecycle.js';
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
 
 let directory: string, db: DbDriver, service: ReturnType<typeof createFileService>;
@@ -126,16 +127,10 @@ it('fileInitResponse and fileTicketRenewResponse: lost mint and upload answers a
   const renewed = await request(service.renewFileTicket, Buffer.alloc(0), { id: first.body.fileId });
   expect(renewed.status).toBe(200);
   expect(readTicket(renewed.body.ticket, secret)?.fileId).toBe(first.body.fileId);
-  expect(await mint({ uploadKey, name: 'other.txt' })).toMatchObject({
-    status: 409,
-    body: { error: 'upload_key_conflict' },
-  });
+  expect(await mint({ uploadKey, name: 'other.txt' })).toEqual(fixtures.errors.uploadKeyConflict);
 });
 it('tooLarge, lengthRequired, badBody, forged tickets and uploadConflict', async () => {
-  expect(await mint({ size: 26_214_401 })).toMatchObject({
-    status: 413,
-    body: { error: 'too_large', maxBytes: 26_214_400 },
-  });
+  expect(await mint({ size: 26_214_401 })).toEqual(fixtures.errors.tooLarge);
   const { body } = await mint();
   const options = { id: body.fileId, ticket: body.ticket };
   const other = await mint();
@@ -143,15 +138,11 @@ it('tooLarge, lengthRequired, badBody, forged tickets and uploadConflict', async
     status: 401,
     body: { error: 'bad_signature' },
   });
-  expect(await request(service.uploadFile, content, { ...options, length: null })).toMatchObject({
-    status: 411,
-    body: { error: 'length_required' },
-  });
+  expect(await request(service.uploadFile, content, { ...options, length: null })).toEqual(
+    fixtures.errors.lengthRequired,
+  );
   expect((await request(service.uploadFile, content, { ...options, length: '1' })).body.error).toBe('bad_request');
-  expect(await request(service.uploadFile, Buffer.alloc(content.length), options)).toMatchObject({
-    status: 400,
-    body: { error: 'bad_body' },
-  });
+  expect(await request(service.uploadFile, Buffer.alloc(content.length), options)).toEqual(fixtures.errors.badBody);
   expect(
     (
       await request(service.uploadFile, Buffer.concat([content, content]), {
@@ -165,10 +156,7 @@ it('tooLarge, lengthRequired, badBody, forged tickets and uploadConflict', async
   );
   await request(service.uploadFile, content, options);
   await writeFile(path.join(directory, 'files', body.fileId), 'different');
-  expect(await request(service.uploadFile, content, options)).toMatchObject({
-    status: 409,
-    body: { error: 'conflict' },
-  });
+  expect(await request(service.uploadFile, content, options)).toEqual(fixtures.errors.uploadConflict);
   expect(await readdir(path.join(directory, 'files', 'tmp'))).toEqual([]);
 });
 it('ticketExpired and device revoked during upload never publish', async () => {
@@ -390,4 +378,76 @@ it('boot sweeps interrupted uploads and cleanup removes orphan outbound files wi
   await service.cleanup(Date.now() + 86_400_001);
   expect(await db.all('SELECT id FROM app_files')).toEqual([]);
   expect(await readdir(path.join(directory, 'files'))).toEqual([]);
+});
+
+it('expired fixture authorization reaches the upload handler', async () => {
+  const fixtureService = createFileService({
+    db: () => db,
+    getLiveDevice: async () => device,
+    onDeviceRevoked: () => () => {},
+    getConversation: async () => undefined,
+    ticketKey: () => Buffer.from(fixtures.fileUpload.ticketSecretForTests),
+  });
+  expect(
+    await request(fixtureService.uploadFile, content, {
+      id: fixtures.fileUpload.ticketClaims.fileId,
+      ticket: fixtures.fileUpload.expiredAuthorization.slice(14),
+    }),
+  ).toEqual(fixtures.errors.ticketExpired);
+});
+
+it('production wiring registers hooks and catches boot cleanup failures', async () => {
+  const setAppHooks = vi.fn();
+  const wired = configureFiles({ getConversation: async () => undefined, setAppHooks });
+  expect(setAppHooks).toHaveBeenCalledWith(wired);
+  const failed = vi.spyOn(wired, 'startCleanup').mockRejectedValue(new Error('test failure'));
+  const start = getHostStartCallbacks().at(-1)!;
+  await expect(
+    start({ db, signal: new AbortController().signal, deliveryAdapter: {} as never }),
+  ).resolves.toBeUndefined();
+  failed.mockRestore();
+  const stop = vi.fn();
+  vi.spyOn(wired, 'startCleanup').mockResolvedValue(stop);
+  await start({ db, signal: new AbortController().signal, deliveryAdapter: {} as never });
+  await getHostShutdownCallbacks().at(-1)!();
+  expect(stop).toHaveBeenCalledOnce();
+});
+
+it.each(['abort', 'revoke'] as const)('HTTP %s mid-body removes temporary bytes without publishing', async (action) => {
+  const { body } = await mint({ size: 200_000 });
+  let complete!: () => void;
+  const handled = new Promise<void>((resolve) => {
+    complete = resolve;
+  });
+  const server = createServer((req, res) => {
+    void service
+      .uploadFile({ req, res, params: { id: body.fileId } })
+      .catch(() => res.destroy())
+      .finally(complete);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as import('node:net').AddressInfo).port;
+  const req = httpRequest(
+    {
+      hostname: '127.0.0.1',
+      port,
+      method: 'PUT',
+      headers: { authorization: 'HeyDan-Ticket ' + body.ticket, 'content-length': 200_000 },
+    },
+    (res) => res.resume(),
+  );
+  req.on('error', () => {});
+  try {
+    req.write(Buffer.alloc(1000));
+    await vi.waitFor(() => expect(revoked).toBeTypeOf('function'));
+    if (action === 'abort') req.destroy();
+    else revoked('dev');
+    await handled;
+    expect(await readdir(path.join(directory, 'files'))).toEqual(['tmp']);
+    expect(await readdir(path.join(directory, 'files', 'tmp'))).toEqual([]);
+  } finally {
+    req.destroy();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

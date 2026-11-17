@@ -4,12 +4,15 @@ import { createReadStream } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
+import { getDb } from '../../db/connection.js';
+import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
+import { log } from '../../log.js';
 import { DATA_DIR } from '../../config.js';
 import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { inboundStagingRoot } from '../../inbound-staging.js';
 import type { DbDriver } from '../../db/driver.js';
 import type { DeviceRow } from '../../modules/device-auth/db.js';
-import { readSignedBody } from '../../modules/device-auth/verify.js';
+import { getLiveDevice, onDeviceRevoked, readSignedBody } from '../../modules/device-auth/verify.js';
 import type { OutboundFile } from '../adapter.js';
 import { readAppConfig } from './config.js';
 import { mintTicket, readTicket, parseAuthorization, type FileAttachment } from './contract.js';
@@ -241,7 +244,7 @@ export function createFileService(deps: FileDeps) {
     if (!input || typeof input !== 'object') refuse(400, 'bad_request', 'Invalid file metadata.');
     const { uploadKey, size, sha256, mimeType } = input;
     if (!Number.isSafeInteger(size) || Number(size) < 1 || Number(size) > MAX_BYTES)
-      throw new FileError(413, 'too_large', 'Files must be between 1 byte and 25 MiB.', { maxBytes: MAX_BYTES });
+      throw new FileError(413, 'too_large', 'A file can be at most 25 MB.', { maxBytes: MAX_BYTES });
     if (
       typeof uploadKey !== 'string' ||
       !/^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i.test(uploadKey) ||
@@ -279,7 +282,7 @@ export function createFileService(deps: FileDeps) {
         existing.size !== size ||
         existing.sha256 !== sha256
       )
-        refuse(409, 'upload_key_conflict', 'That upload key has different file metadata.');
+        refuse(409, 'upload_key_conflict', 'This upload key was already used for another file.');
       return existing;
     });
     json(ctx.res, 200, await ticket(row, identity.deviceId));
@@ -307,7 +310,7 @@ export function createFileService(deps: FileDeps) {
       refuse(
         401,
         readTicket(value, secret, 0) ? 'ticket_expired' : 'bad_signature',
-        'The upload ticket is invalid or expired.',
+        readTicket(value, secret, 0) ? 'The upload link expired.' : 'The upload ticket is invalid.',
       );
     if (claims.fileId !== ctx.params.id) refuse(401, 'bad_signature', 'The ticket is for another file.');
     const live = async () => {
@@ -319,9 +322,9 @@ export function createFileService(deps: FileDeps) {
     const row = await get(claims.fileId);
     if (!row || row.user_id !== claims.userId) refuse(404, 'not_found', 'File not found.');
     if (row.size !== claims.size || row.sha256 !== claims.sha256)
-      refuse(409, 'conflict', 'The file has different bytes.');
+      refuse(409, 'conflict', 'Different bytes were already uploaded for this file.');
     const length = ctx.req.headers['content-length'];
-    if (length === undefined) refuse(411, 'length_required', 'Content-Length is required.');
+    if (length === undefined) refuse(411, 'length_required', 'The upload needs a Content-Length.');
     if (!/^\d+$/.test(length) || Number(length) !== claims.size)
       refuse(400, 'bad_request', 'Content-Length does not match the ticket.');
     await fs.mkdir(tempRoot, { recursive: true });
@@ -346,7 +349,7 @@ export function createFileService(deps: FileDeps) {
         count += bytes.length;
       }
       if (count !== claims.size || hash.digest('hex') !== claims.sha256)
-        refuse(400, 'bad_body', 'Upload does not match its declared hash.');
+        refuse(400, 'bad_body', 'The request body does not match its signature.');
       await handle.close();
       await live();
       if (revoked) refuse(401, 'device_revoked', 'This device is no longer paired.');
@@ -357,7 +360,8 @@ export function createFileService(deps: FileDeps) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         const hash = createHash('sha256');
         for await (const chunk of createReadStream(target)) hash.update(chunk);
-        if (hash.digest('hex') !== claims.sha256) refuse(409, 'conflict', 'The file has different bytes.');
+        if (hash.digest('hex') !== claims.sha256)
+          refuse(409, 'conflict', 'Different bytes were already uploaded for this file.');
       }
       await live();
       if (revoked) refuse(401, 'device_revoked', 'This device is no longer paired.');
@@ -533,18 +537,37 @@ export function createFileService(deps: FileDeps) {
   };
 }
 
-let service: ReturnType<typeof createFileService> | undefined;
-export function configureFiles(deps: FileDeps) {
-  service = createFileService(deps);
+type FileHooks = Pick<ReturnType<typeof createFileService>, 'claimFiles' | 'stageFiles' | 'storeOutboundFiles'>;
+const productionDeps = { db: getDb, getLiveDevice, onDeviceRevoked };
+let service = createFileService({
+  ...productionDeps,
+  getConversation: async () => undefined,
+});
+export function configureFiles(
+  deps: Pick<FileDeps, 'getConversation'> & {
+    setAppHooks(hooks: FileHooks): void;
+  },
+) {
+  service = createFileService({ ...productionDeps, getConversation: deps.getConversation });
+  deps.setAppHooks(service);
   return service;
 }
+let stopCleanup: (() => void) | undefined;
+const cleanupError = () => log.warn('App file cleanup failed');
+onHostStart(async () => {
+  stopCleanup?.();
+  stopCleanup = await service.startCleanup(cleanupError).catch(() => {
+    cleanupError();
+    return undefined;
+  });
+});
+onHostShutdown(() => {
+  stopCleanup?.();
+  stopCleanup = undefined;
+});
 const handler =
   (name: 'mintFile' | 'renewFileTicket' | 'uploadFile' | 'downloadFile'): AppHandler =>
   async (ctx) => {
-    if (!service) {
-      json(ctx.res, 503, { error: 'unavailable', message: 'Files are unavailable.' });
-      return;
-    }
     await service[name](ctx);
   };
 export const mintFile = handler('mintFile');
