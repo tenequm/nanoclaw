@@ -756,7 +756,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     }
     await adapter.deliver(chat.group.platform_id, chat.threadId, {
       kind: 'chat',
-      content: { text, ...(voice ? { voice } : {}) },
+      content: { text, ...(voice && chat.group.channel_type === 'app' ? { voice } : {}) },
     });
   };
 

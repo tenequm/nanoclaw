@@ -93,6 +93,24 @@ import {
   type TtsSaved,
 } from '../voice-mode-tts.js';
 
+export const appVoiceErrorMessages: Record<string, string> = {
+  bad_signature: 'The request signature is not valid.',
+  bad_request: 'The request is malformed.',
+  forbidden: 'This device cannot reach that agent.',
+  not_found: 'Not found.',
+  attempt_conflict: 'This call attempt was already used for another conversation.',
+  protocol: 'The voice service is updating. Update Hey Dan to make calls.',
+  no_line: 'Calls are not set up for this agent.',
+  no_chat: 'This agent has no conversation to call in.',
+  limit: 'The call limit is reached.',
+  room: 'Could not open the call room.',
+  stopped: 'This call attempt is no longer active.',
+  voice_offline: 'Calls are offline right now.',
+  provider_unavailable: 'That voice provider is not set up.',
+  invalid: 'That voice setting is not valid.',
+  upstream: 'Could not load voices. Try again.',
+};
+
 /** How often a running call rechecks that its caller may still use the line. */
 const ACCESS_CHECK_INTERVAL_MS = 5000;
 const HOUR_MS = 3_600_000;
@@ -300,6 +318,7 @@ export interface VoiceModeChannelAdapter extends ChannelAdapter {
     res: http.ServerResponse,
     platformId: string | null,
     catalog: boolean,
+    createLine?: () => Promise<string>,
   ): Promise<void>;
 }
 
@@ -496,19 +515,20 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     platformId: string | null,
     error: PickerError,
     defaultView = false,
+    createLine?: () => Promise<string>,
   ): Promise<void> => {
     if (req.method !== 'GET' && req.method !== 'PATCH') return reply(res, 405, 'GET or PATCH only');
     if (defaultView && !platformId && req.method === 'GET')
       return replyJson(res, 200, await ttsView(LINE_DEFAULT_CHOICE));
-    if (!platformId) return error(403, { error: 'no_line' }, 'Unknown call link');
-    const lineId = lineIdOf(platformId);
-    const row = lineId ? await getVoiceModeLine(lineId) : undefined;
-    if (!lineId || !row) return error(403, { error: 'no_line' }, 'Unknown call link');
+    if (!platformId && !createLine) return error(403, { error: 'no_line' }, 'Unknown call link');
+    let lineId = platformId ? lineIdOf(platformId) : null;
+    let row = lineId ? await getVoiceModeLine(lineId) : undefined;
+    if (platformId && (!lineId || !row)) return error(403, { error: 'no_line' }, 'Unknown call link');
     // The voice takes what a call takes: the line's caller, still an owner or admin of its agent. Reading
     // it too, since its names are asked of the providers on the host's keys.
     if (platformId && !(await resolveLine(platformId)))
       return error(403, { error: 'no_line' }, 'Caller access denied or voice line is not set up');
-    if (req.method === 'GET') return replyJson(res, 200, await ttsView(savedTts(row)));
+    if (req.method === 'GET') return replyJson(res, 200, await ttsView(savedTts(row!)));
     const body = await readJsonObject(req, MAX_TTS_BODY_BYTES);
     if (!body) return error(400, { error: 'bad_request' });
     let choice = LINE_DEFAULT_CHOICE;
@@ -528,6 +548,12 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       if (found.status === 'unavailable') return error(400, { error: 'invalid', field: 'voice' });
       choice = read.choice;
     }
+    if (!platformId && createLine) {
+      platformId = await createLine();
+      lineId = lineIdOf(platformId);
+      row = lineId ? await getVoiceModeLine(lineId) : undefined;
+    }
+    if (!lineId || !row) return error(403, { error: 'no_line' }, 'Unknown call link');
     // The body and the lookup can take their time: the caller must still be one, and the save below only
     // takes the link it started with.
     if (platformId && !(await resolveLine(platformId)))
@@ -658,26 +684,26 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     callUrl,
     async startAppCall(...args) {
       if (!connected)
-        throw Object.assign(new Error('Calls are offline right now.'), { status: 503, error: 'voice_offline' });
+        throw Object.assign(new Error(appVoiceErrorMessages.voice_offline), { status: 503, error: 'voice_offline' });
       return callPage.start(...args);
     },
     async resumeAppCall(...args) {
       if (!connected)
-        throw Object.assign(new Error('Calls are offline right now.'), { status: 503, error: 'voice_offline' });
+        throw Object.assign(new Error(appVoiceErrorMessages.voice_offline), { status: 503, error: 'voice_offline' });
       return callPage.resume(...args);
     },
     async endAppCall(...args) {
       if (!connected)
-        throw Object.assign(new Error('Calls are offline right now.'), { status: 503, error: 'voice_offline' });
+        throw Object.assign(new Error(appVoiceErrorMessages.voice_offline), { status: 503, error: 'voice_offline' });
       return callPage.end(...args);
     },
-    async lineVoiceHttp(req, res, platformId, catalogRequest) {
-      const error: PickerError = (status, body, text) =>
-        replyJson(res, status, { ...body, message: text ?? body.error });
+    async lineVoiceHttp(req, res, platformId, catalogRequest, createLine) {
+      const error: PickerError = (status, body) =>
+        replyJson(res, status, { ...body, message: appVoiceErrorMessages[body.error] });
       if (!connected) return error(503, { error: 'voice_offline' });
       if (catalogRequest)
         return handleVoices(req, res, new URL(req.url ?? '/', 'http://localhost'), platformId, error, true);
-      return handleTts(req, res, platformId, error, true);
+      return handleTts(req, res, platformId, error, true, createLine);
     },
     handleVoiceCommand: (event: InboundEvent, privateReply?: PrivateReply): Promise<boolean> =>
       handleVoiceCommand(event, callUrl, privateReply),

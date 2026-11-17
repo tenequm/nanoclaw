@@ -1,3 +1,4 @@
+import { appVoiceErrorMessages as messages } from '../voice-mode.js';
 import { getDb } from '../../db/connection.js';
 import { bindVoiceModeLineChat, createVoiceModeLine, getVoiceModeLineForAgent } from '../../db/voice-mode-lines.js';
 import { hasAdminPrivilege } from '../../modules/permissions/db/user-roles.js';
@@ -17,14 +18,6 @@ export interface CallDeps {
   getConversation(id: string): Promise<ConversationRow | undefined>;
   setAppHooks(hooks: { callAvailability: typeof callAvailability }): void;
 }
-const messages: Record<string, string> = {
-  no_line: 'Calls are not set up for this agent.',
-  voice_offline: 'Calls are offline right now.',
-  no_chat: 'This agent has no conversation to call in.',
-  room: 'Could not open the call room.',
-  stopped: 'This call attempt is no longer active.',
-  attempt_conflict: 'This call attempt belongs to another conversation.',
-};
 export class AppCallError extends Error {
   constructor(
     readonly status: number,
@@ -42,7 +35,7 @@ export const guarded =
     } catch (err) {
       if (!(err instanceof AppCallError)) {
         if (err instanceof Error && 'error' in err && err.error === 'voice_offline')
-          return json(ctx.res, 503, { error: 'voice_offline', message: err.message });
+          return json(ctx.res, 503, { error: 'voice_offline', message: messages.voice_offline });
         throw err;
       }
       json(ctx.res, err.status, { error: err.error, message: err.message });
@@ -50,7 +43,7 @@ export const guarded =
   };
 export async function signedObject(ctx: AppRequest): Promise<Record<string, unknown>> {
   const auth = parseAuthorization(ctx.req.headers.authorization);
-  if (!auth || !ctx.identity) throw new AppCallError(401, 'unauthorized');
+  if (!auth || !ctx.identity) throw new AppCallError(401, 'bad_signature');
   const bytes = await readSignedBody(ctx.req, auth.bodyHash, 4096);
   try {
     const value: unknown = JSON.parse(bytes.toString('utf8'));
@@ -61,7 +54,7 @@ export async function signedObject(ctx: AppRequest): Promise<Record<string, unkn
   }
 }
 export async function conversationFor(ctx: AppRequest, id: string, deps: CallDeps, picker = false) {
-  if (!ctx.identity) throw new AppCallError(401, 'unauthorized');
+  if (!ctx.identity) throw new AppCallError(401, 'bad_signature');
   const c = await deps.getConversation(id);
   if (!c || c.user_id !== ctx.identity.userId) throw new AppCallError(404, 'not_found');
   if (!ctx.identity.agentIds.includes(c.agent_group_id))
@@ -109,8 +102,7 @@ const reasonText = (reason: unknown) =>
     : reason === 'updating'
       ? 'the voice worker is on another protocol version'
       : 'hangup';
-const validReason = (reason: unknown) =>
-  typeof reason === 'string' && ['hangup', 'no-agent', 'updating'].includes(reason);
+const normalizedReason = (reason: unknown) => (reason === 'no-agent' || reason === 'updating' ? reason : 'hangup');
 const uuid = (value: unknown): value is string =>
   typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 
@@ -124,17 +116,19 @@ export function createCallHandlers(deps: CallDeps) {
     const c = await deps.getConversation(row.conversation_id);
     if (!c) return;
     const line = await getVoiceModeLineForAgent(c.agent_group_id);
-    if (line?.owner_user_id === row.user_id)
-      await runningVoice().endAppCall(linePlatformId(line.line_id), row.call_id, reason, {
+    const voice = liveVoiceAdapter();
+    if (line?.owner_user_id === row.user_id && voice?.isConnected())
+      await voice.endAppCall(linePlatformId(line.line_id), row.call_id, reason, {
         grace: reason === 'hangup',
       });
   };
   const startCall = guarded(async (ctx) => {
     const body = await signedObject(ctx);
+    const jev = body.jev ?? null;
     if (
       typeof body.conversationId !== 'string' ||
       !uuid(body.attemptId) ||
-      ![null, true, false].includes(body.jev as null | boolean)
+      ![null, true, false].includes(jev as null | boolean)
     )
       throw new AppCallError(400, 'bad_request');
     const c = await conversationFor(ctx, body.conversationId, deps);
@@ -142,7 +136,7 @@ export function createCallHandlers(deps: CallDeps) {
       return json(ctx.res, 426, {
         error: 'protocol',
         protocol: LIVEKIT_PROTOCOL_VERSION,
-        message: 'The voice service is updating. Update Hey Dan to make calls.',
+        message: messages.protocol,
       });
     }
     const url = readAppConfig().livekitUrl;
@@ -162,7 +156,7 @@ export function createCallHandlers(deps: CallDeps) {
         id,
         deviceId,
         c.id,
-        body.jev === null ? null : Number(body.jev),
+        jev === null ? null : Number(jev),
         now,
         now,
       );
@@ -178,7 +172,7 @@ export function createCallHandlers(deps: CallDeps) {
         : await voice.startAppCall(
             platform,
             url,
-            (body.jev === null ? lineRunsJev(platform) : body.jev === true) && !!JEV_API_KEY,
+            (jev === null ? lineRunsJev(platform) : jev === true) && !!JEV_API_KEY,
             async () => {
               if ((await attempt(userId, id))?.state !== 'opening') return false;
               return !!(await bindVoiceModeLineChat({
@@ -199,7 +193,7 @@ export function createCallHandlers(deps: CallDeps) {
         );
         if (result.error === 'limit') {
           ctx.res.setHeader('Retry-After', result.retryAfter);
-          return json(ctx.res, 429, { error: 'limit', message: result.body, retryAfter: Number(result.retryAfter) });
+          return json(ctx.res, 429, { error: 'limit', message: messages.limit, retryAfter: Number(result.retryAfter) });
         }
         const error = result.error.replaceAll('-', '_');
         throw new AppCallError(result.error === 'no-line' ? 403 : result.error === 'room' ? 502 : 409, error);
@@ -218,7 +212,16 @@ export function createCallHandlers(deps: CallDeps) {
       }
       json(ctx.res, 200, { ...result.grant, attemptId: id });
     };
-    const work = run();
+    const work = run().catch(async (err: unknown) => {
+      await getDb().run(
+        "UPDATE app_call_attempts SET state = 'stopped', updated_at = ? WHERE user_id = ? AND attempt_id = ? AND conversation_id = ? AND state = 'opening'",
+        Date.now(),
+        userId,
+        id,
+        c.id,
+      );
+      throw err;
+    });
     opening.set(key, work);
     try {
       await work;
@@ -228,8 +231,7 @@ export function createCallHandlers(deps: CallDeps) {
   });
   const endCall = guarded(async (ctx) => {
     const body = await signedObject(ctx);
-    if (!validReason(body.reason)) throw new AppCallError(400, 'bad_request');
-    runningVoice();
+
     const row = await getDb().get<CallAttemptRow>(
       'SELECT * FROM app_call_attempts WHERE user_id = ? AND call_id = ?',
       ctx.identity!.userId,
@@ -239,7 +241,7 @@ export function createCallHandlers(deps: CallDeps) {
     if (row.state !== 'stopped') {
       await getDb().run(
         "UPDATE app_call_attempts SET state = 'stopped', reason = ?, updated_at = ? WHERE user_id = ? AND attempt_id = ?",
-        body.reason,
+        normalizedReason(body.reason),
         Date.now(),
         row.user_id,
         row.attempt_id,
@@ -251,7 +253,7 @@ export function createCallHandlers(deps: CallDeps) {
   });
   const cancelCallAttempt = guarded(async (ctx) => {
     const body = await signedObject(ctx);
-    if (!validReason(body.reason) || !uuid(ctx.params.attemptId)) throw new AppCallError(400, 'bad_request');
+    if (!uuid(ctx.params.attemptId)) throw new AppCallError(400, 'bad_request');
     const { userId, deviceId } = ctx.identity!;
     const now = Date.now();
     await getDb().run(
@@ -260,7 +262,7 @@ export function createCallHandlers(deps: CallDeps) {
       userId,
       ctx.params.attemptId,
       deviceId,
-      body.reason,
+      normalizedReason(body.reason),
       now,
       now,
     );
@@ -272,7 +274,7 @@ export function createCallHandlers(deps: CallDeps) {
 }
 export const callDeps: CallDeps = {
   async getConversation() {
-    throw new AppCallError(503, 'voice_offline', 'Conversation service is unavailable.');
+    throw new AppCallError(503, 'voice_offline');
   },
   setAppHooks() {},
 };

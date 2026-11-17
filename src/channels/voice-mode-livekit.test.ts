@@ -142,12 +142,14 @@ function fakeMirror(
   groups: Array<Partial<MessagingGroup>>,
   options: { bound?: Omit<BoundCallChat, 'group'> & { group: Partial<MessagingGroup> } } = {},
 ) {
+  const contents: Record<string, unknown>[] = [];
   const posts: Array<{ instance: string; platformId: string; threadId?: string | null; text: string }> = [];
   const state = { bound: options.bound };
   const api: MirrorApi = {
     groupsFor: async () => groups.map((g, i) => mg({ id: `mg-${i}`, ...g })),
     adapter: (instance) => ({
       deliver: async (platformId: string, threadId: string | null, message: OutboundMessage) => {
+        contents.push(message.content as Record<string, unknown>);
         const text = (message.content as { text: string }).text;
         posts.push(threadId ? { instance, platformId, threadId, text } : { instance, platformId, text });
         return 'tg-1';
@@ -155,7 +157,7 @@ function fakeMirror(
     }),
     boundChat: async () => (state.bound ? { ...state.bound, group: mg(state.bound.group) } : null),
   };
-  return { api, posts, state };
+  return { api, posts, state, contents };
 }
 
 function mg(overrides: Partial<MessagingGroup>): MessagingGroup {
@@ -1466,6 +1468,30 @@ describe('livekit call talking in the agent chat', () => {
       },
       agentGroupId,
     );
+
+  it.each(['app', 'telegram', 'slack'])(
+    'keeps emoji and adds structured voice markers only for %s app traffic',
+    async (channelType) => {
+      const { contents } = await start([
+        { channel_type: channelType, instance: channelType, platform_id: 'test-chat' },
+      ]);
+      const { worker } = await startCall(h);
+      await worker.utter('Book a table');
+      await vi.waitFor(() => expect(contents).toHaveLength(1));
+      expect(contents[0]).toEqual({
+        text: '\u{1F399} Book a table',
+        ...(channelType === 'app' ? { voice: 'caller' } : {}),
+      });
+      expect(
+        liveKitChatPresentation(
+          { id: 'out-1', kind: 'chat', channelType, platformId: 'test-chat', threadId: null, inReplyTo: null },
+          { text: 'Booked.' },
+          'ag-andy',
+        ),
+      ).toEqual({ text: '\u{1F50A} Booked.', ...(channelType === 'app' ? { voice: 'spoken' } : {}) });
+      worker.close();
+    },
+  );
 
   it('routes each turn into the /voice chat as the line caller, posts the transcript and speaks the chat replies', async () => {
     const { posts } = await start([{ platform_id: 'telegram:100', name: 'HQ' }]);

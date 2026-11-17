@@ -502,15 +502,26 @@ export function createCallPage(core: Pick<LiveKitVoice, 'openCall' | 'endCall' |
     let token: string;
     try {
       token = await callerToken(call, call.line.caller.name, grants.has(call.callId));
-    } catch {
+    } catch (err) {
+      log.warn('livekit-voice-mode: room setup failed', { platformId, callId: call.callId, err });
       await core.endCall(platformId, call.callId, 'room setup failed');
       return { ok: false, error: 'room' } as const;
     }
     if (!core.isLive(platformId, call.callId)) return { ok: false, error: 'stopped' } as const;
     if (gone()) {
+      log.info('livekit-voice-mode: page left during call setup', { platformId, callId: call.callId });
       await core.endCall(platformId, call.callId, 'page left during call setup');
       return { ok: false, error: 'stopped' } as const;
     }
+    log.info('livekit-voice-mode: call started', {
+      platformId,
+      callId: call.callId,
+      room: call.roomName,
+      agent: job.agentName,
+      sttModel: job.sttModel,
+      tts: job.tts,
+      ...(job.jev ? { jev: true } : {}),
+    });
     return {
       ok: true,
       grant: {

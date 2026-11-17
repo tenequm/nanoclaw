@@ -33,7 +33,7 @@ import { grantRole } from '../../modules/permissions/db/user-roles.js';
 import { getVoiceModeLineForAgent, bindVoiceModeLineChat, openVoiceModeLink } from '../../db/voice-mode-lines.js';
 import { createVoiceModeAdapter, type VoiceModeChannelAdapter } from '../voice-mode.js';
 import { createVoiceCatalog } from '../voice-mode-tts-catalog.js';
-import { createCallHandlers, callAvailability } from './calls.js';
+import { createCallHandlers, callAvailability, callDeps, startCall } from './calls.js';
 import { createVoiceHandlers } from './voice.js';
 import type { AppHandler } from './routes.js';
 import type { ConversationRow } from './db.js';
@@ -128,7 +128,18 @@ beforeEach(async () => {
     providerKeys: { gemini: 'test' },
     catalog: createVoiceCatalog({
       keys: { gemini: 'test' },
-      fetch: vi.fn(async () => {
+      fetch: vi.fn(async (input) => {
+        if (new URL(input instanceof Request ? input.url : String(input)).searchParams.get('page_size') === '2')
+          return Response.json({
+            voices: tts.catalogGemini.voices.map((v) => ({
+              id: v.id,
+              display_name: v.name,
+              language_code: v.language,
+              gender: v.gender,
+              description: v.description,
+            })),
+            next_page_token: 'p100',
+          });
         return Response.json({
           voices: [
             { id: 'en-us-techagent-4', display_name: 'Tech Advisor 4', language_code: 'en-US', gender: 'male' },
@@ -192,10 +203,10 @@ it('opens once concurrently, retries with a fresh token and ends idempotently', 
   });
   const line = (await getVoiceModeLineForAgent(c.agent_group_id))!;
   expect(line.messaging_group_id).toBe(c.messaging_group_id);
-  expect((await openVoiceModeLink(line, Buffer.alloc(32, 7))) !== null).toBe(true);
+  expect('token' in (await openVoiceModeLink(line, Buffer.alloc(32, 7)))).toBe(true);
   expect((await request(handlers.endCall, { reason: 'hangup' }, { callId: a.body.callId })).status).toBe(204);
   expect((await request(handlers.endCall, { reason: 'hangup' }, { callId: a.body.callId })).status).toBe(204);
-  expect((await request(handlers.startCall, requestBody)).body.error).toBe('stopped');
+  expect(await request(handlers.startCall, requestBody)).toMatchObject(fixtures.callErrors.stopped);
 });
 it('cancels during room setup and before a late start', async () => {
   let release!: () => void;
@@ -228,17 +239,19 @@ it('does not rebind on a limit refusal', async () => {
     attemptId: '22222222-2222-4222-8222-222222222222',
   });
   expect(result.status).toBe(429);
-  expect(result.body.error).toBe('limit');
+  expect(result.body).toEqual({ ...fixtures.callErrors.limit.body, retryAfter: Number(result.headers['Retry-After']) });
   expect(Number(result.headers['Retry-After'])).toBeGreaterThan(0);
   expect((await getVoiceModeLineForAgent(c.agent_group_id))?.messaging_group_id).toBe('old-chat');
 });
 it('enforces protocol, device scope, ownership, and room failures', async () => {
-  expect((await request(handlers.startCall, { ...requestBody, voiceProtocol: 5 })).status).toBe(426);
-  expect((await request(handlers.startCall, requestBody, {}, [])).status).toBe(403);
+  expect(await request(handlers.startCall, { ...requestBody, voiceProtocol: 5 })).toMatchObject(
+    fixtures.callErrors.protocol,
+  );
+  expect(await request(handlers.startCall, requestBody, {}, [])).toMatchObject(fixtures.errors.forbidden);
   failRoom = true;
   const result = await request(handlers.startCall, requestBody);
   expect(result.status).toBe(502);
-  expect(result.body.error).toBe('room');
+  expect(result).toMatchObject(fixtures.callErrors.room);
   const { getDb } = await import('../../db/connection.js');
   await getDb().run('UPDATE voice_mode_lines SET owner_user_id = ?', 'telegram:other');
   expect((await callAvailability(c.user_id, c.agent_group_id)).callRefusal).toEqual(
@@ -270,15 +283,15 @@ it('returns no-chat, offline, not-found and attempt-conflict without extra rooms
   chatPresent = false;
   const noChat = await request(handlers.startCall, requestBody);
   expect(noChat.status).toBe(409);
-  expect(noChat.body.error).toBe('no_chat');
+  expect(noChat).toMatchObject(fixtures.callErrors.noChat);
   chatPresent = true;
   const { getDb } = await import('../../db/connection.js');
   await getDb().run('UPDATE app_call_attempts SET conversation_id = ?', 'another-conversation');
-  expect((await request(handlers.startCall, requestBody)).body.error).toBe('attempt_conflict');
+  expect(await request(handlers.startCall, requestBody)).toMatchObject(fixtures.errors.attemptConflict);
   expect((await request(handlers.startCall, { ...requestBody, conversationId: 'unknown' })).status).toBe(404);
   expect((await request(handlers.endCall, { reason: 'hangup' }, { callId: 'someone-elses-call' })).status).toBe(404);
   await adapter.teardown();
-  expect((await request(handlers.startCall, requestBody)).body.error).toBe('voice_offline');
+  expect(await request(handlers.startCall, requestBody)).toMatchObject(fixtures.callErrors.voiceOffline);
   expect((await request(picker.getVoice, undefined, { id: c.id }, undefined, 'GET')).status).toBe(503);
 });
 it('shapes picker provider and query errors for paired clients', async () => {
@@ -287,16 +300,93 @@ it('shapes picker provider and query errors for paired clients', async () => {
   expect(result.body).toMatchObject({
     error: 'provider_unavailable',
     provider: 'elevenlabs',
-    message: expect.any(String),
+    message: fixtures.callErrors.providerUnavailable.body.message,
   });
   const invalid = await request(picker.listVoices, undefined, { id: c.id }, undefined, 'GET', '/?provider=bad');
   expect(invalid.status).toBe(400);
-  expect(invalid.body.error).toBe('bad_request');
+  expect(invalid).toMatchObject(fixtures.errors.badRequest);
 });
 
-it('rejects array end reasons instead of coercing them to a valid string', async () => {
-  expect((await request(handlers.endCall, { reason: ['hangup'] }, { callId: 'unknown' })).status).toBe(400);
+it('starts through the module export with the conversation seam faked and jev omitted', async () => {
+  const seam = vi.spyOn(callDeps, 'getConversation').mockImplementation(deps.getConversation);
+  try {
+    const result = await request(startCall, {
+      conversationId: c.id,
+      attemptId: requestBody.attemptId,
+      voiceProtocol: 6,
+    });
+    expect(result.status).toBe(200);
+    expect(rooms).toBe(1);
+    const { getDb } = await import('../../db/connection.js');
+    expect(await getDb().get('SELECT jev FROM app_call_attempts')).toEqual({ jev: null });
+  } finally {
+    seam.mockRestore();
+  }
+});
+it('ends and cancels offline, normalizing unknown and missing reasons to hangup', async () => {
+  const started = await request(handlers.startCall, requestBody);
+  const end = vi.spyOn(adapter, 'endAppCall');
+  await adapter.teardown();
+  expect((await request(handlers.endCall, { reason: 'future-reason' }, { callId: started.body.callId })).status).toBe(
+    204,
+  );
+  expect((await request(handlers.endCall, {}, { callId: started.body.callId })).status).toBe(204);
+  expect((await request(handlers.cancelCallAttempt, {}, { attemptId: requestBody.attemptId })).status).toBe(204);
+  expect(end).not.toHaveBeenCalled();
+  const { getDb } = await import('../../db/connection.js');
+  expect(await getDb().get('SELECT state, reason FROM app_call_attempts')).toEqual({
+    state: 'stopped',
+    reason: 'hangup',
+  });
+});
+it('unknown reasons end a live call with hangup grace', async () => {
+  const started = await request(handlers.startCall, requestBody);
+  const end = vi.spyOn(adapter, 'endAppCall');
+  expect((await request(handlers.endCall, { reason: ['hangup'] }, { callId: started.body.callId })).status).toBe(204);
+  expect(end).toHaveBeenCalledWith(expect.any(String), started.body.callId, 'hangup', { grace: true });
+  expect((await request(handlers.cancelCallAttempt, [], { attemptId: requestBody.attemptId })).status).toBe(400);
+});
+it('refuses another owner and stops the failed opening attempt', async () => {
+  await request(picker.patchVoice, { reset: true }, { id: c.id }, undefined, 'PATCH');
+  const { getDb } = await import('../../db/connection.js');
+  await getDb().run('UPDATE voice_mode_lines SET owner_user_id = ?', 'telegram:other');
+  expect(await request(handlers.startCall, requestBody)).toMatchObject(fixtures.callErrors.noLine);
+  expect(await getDb().get('SELECT state FROM app_call_attempts')).toEqual({ state: 'stopped' });
+  expect(rooms).toBe(0);
+});
+it('hides real conversations and calls owned by another user', async () => {
+  const started = await request(handlers.startCall, requestBody);
+  const { getDb } = await import('../../db/connection.js');
+  await getDb().run('UPDATE app_call_attempts SET user_id = ?', 'telegram:other');
+  expect(await request(handlers.endCall, {}, { callId: started.body.callId })).toMatchObject(fixtures.errors.notFound);
+  const other = createCallHandlers({ ...deps, getConversation: async () => ({ ...c, user_id: 'telegram:other' }) });
+  expect(await request(other.startCall, requestBody)).toMatchObject(fixtures.errors.notFound);
+});
+it('lists Gemini voices in the picker fixture shape', async () => {
+  const result = await request(
+    picker.listVoices,
+    undefined,
+    { id: c.id },
+    undefined,
+    'GET',
+    '/?provider=gemini&limit=2',
+  );
+  expect(result.status).toBe(200);
+  expect(result.body).toEqual(tts.catalogGemini);
+});
+
+it('does not create a line on a refused picker save', async () => {
+  expect((await request(picker.patchVoice, { provider: 'bad' }, { id: c.id }, undefined, 'PATCH')).status).toBe(400);
   expect(
-    (await request(handlers.cancelCallAttempt, { reason: ['hangup'] }, { attemptId: requestBody.attemptId })).status,
-  ).toBe(400);
+    (
+      await request(
+        picker.patchVoice,
+        { provider: 'elevenlabs', model: 'eleven_v4', voice: 'bIHbv24MWmeRgasZH58o' },
+        { id: c.id },
+        undefined,
+        'PATCH',
+      )
+    ).status,
+  ).toBe(503);
+  expect(await getVoiceModeLineForAgent(c.agent_group_id)).toBeUndefined();
 });
