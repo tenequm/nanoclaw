@@ -261,8 +261,24 @@ def up(args):
                    NANOCLAW_ENCRYPTION_KEY=base64.b64encode(secrets.token_bytes(32)).decode(),
                    VOICE_MODE_GEMINI_API_KEY=secret('fleet/nanoclaw/gemini/api-key'),
                    JEV_API_KEY=secret('fleet/nanoclaw/JEV_OPENROUTER_API_KEY'),
-                   JEV_URL=os.environ.get('LOCAL_JEV_URL', 'https://api.typesafe.ai/v1/systemone'),
-                   JEV_MODEL=os.environ.get('LOCAL_JEV_MODEL', 'jev-latest'))
+                   JEV_URL=os.environ.get('LOCAL_JEV_URL', 'https://openrouter.ai/api/v1/systemone'),
+                   JEV_MODEL=os.environ.get('LOCAL_JEV_MODEL', 'jev-1.14'))
+        voice_defaults = dict(WAKE_MODEL='data/voice-models/hey_dan_v4.onnx',
+            WAKE_THRESHOLD='0.75', WAKE_PHRASE='Hey Dan', WAKE_HOP_MS='40',
+            SILENCE_MS='1500', MAX_CALLS_PER_HOUR='40', MAX_CALL_SECONDS='3600',
+            MAX_SPOKEN_CHARS='0', VOCABULARY='Dan,Stan,Emma,Concierge')
+        for key, value in voice_defaults.items():
+            env['VOICE_MODE_' + key] = os.environ.get('LOCAL_VOICE_MODE_' + key, value)
+        model = LOCAL / 'cache/hey_dan_v4.onnx'
+        if not model.exists():
+            model.parent.mkdir(parents=True, exist_ok=True)
+            run(['scp', 'bl:pj/nanoclaw/data/voice-models/hey_dan_v4.onnx', str(model)], state, 'wake-model')
+        if not hashlib.sha256(model.read_bytes()).hexdigest().startswith('1b19ba6248fa3f35'):
+            raise RuntimeError('Cached Hey Dan wake model checksum mismatch')
+        target = ROOT / 'data/voice-models/hey_dan_v4.onnx'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(model, target)
+        result(state, 'voice-parity', 'pass', 'Jev and acoustic wake defaults match bl; wake model SHA-256 verified')
         if args.profile == 'full':
             for key in ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET']:
                 env[key] = secret('misc/' + key)
@@ -294,7 +310,8 @@ def up(args):
             wait_port(b+2, state, 'livekit')
         if args.chain or args.profile == 'full':
             chain(state)
-        hostenv = clean_env() | {'LOCAL_ADDRESS_LOG': str(run_dir / 'logs/address.jsonl')}
+        hostenv = clean_env() | {'LOCAL_ADDRESS_LOG': str(run_dir / 'logs/address.jsonl'),
+            'LOCAL_MAILBOX_LOG': str(run_dir / 'logs/mailbox.jsonl'), 'LOCAL_MAILBOX_PORT': str(b+1)}
         if args.profile == 'fast':
             hostenv['NANOCLAW_LOCAL_STAND_IN'] = '1'
         start(NODE + ['node', '--import', str(ROOT / 'scripts/local/observe.mjs'), 'dist/index.js'], state, 'host', hostenv)
@@ -386,7 +403,7 @@ def report():
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, epilog='Settings: LOCAL_PORT_BASE (4100), HEYDAN_RUN_DIR, LOCAL_AGENT_PROVIDER (fast: stand-in), LOCAL_TEST_AGENT and LOCAL_ANTHROPIC_SECRET_ID (required for full), LOCAL_OWNER_ID (telegram:95307956), LOCAL_ONECLI_URL, LOCAL_JEV_URL, LOCAL_JEV_MODEL. Full starts real services only after owner approval; --proof uses a local read-only gateway and disables the bot. No command sends a message. A real full bot may receive messages and spawn agents. Requires Python 3, mise, Docker, openssl, gopass and livekit-server. Check the stack with python3 -B scripts/local/verify.py.')
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Settings: LOCAL_PORT_BASE (4100), HEYDAN_RUN_DIR, LOCAL_AGENT_PROVIDER (fast: stand-in), LOCAL_TEST_AGENT and LOCAL_ANTHROPIC_SECRET_ID (required for full), LOCAL_OWNER_ID (telegram:95307956), LOCAL_ONECLI_URL, LOCAL_JEV_URL, LOCAL_JEV_MODEL, LOCAL_VOICE_MODE_<key>. Full starts real services only after owner approval; --proof uses a local read-only gateway and disables the bot. No command sends a message. A real full bot may receive messages and spawn agents. Requires Python 3, mise, Docker, openssl, gopass and livekit-server. Check the stack with python3 -B scripts/local/verify.py.')
     parser.add_argument('command', choices=['up', 'down', 'status', 'report'])
     parser.add_argument('--profile', choices=['fast', 'full'], default='fast')
     parser.add_argument('--livekit', choices=['dev', 'cloud'], default='dev')

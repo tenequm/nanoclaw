@@ -10,7 +10,7 @@ if (mode === 'supervise') {
   // Runtime logs may contain caller text and call links; retain only fixed lifecycle events.
   const events = ['registered worker', 'starting worker', 'starting server', 'server is listening',
     'CLI socket server', 'Host sweep started', 'Delivery polls started', 'Channel adapter started',
-    'Gateway approval', 'error', 'Error', 'failed', 'Failed'];
+    'Gateway approval', 'Spawning session', 'Session failed', 'Session ended', '409: Conflict', 'error', 'Error', 'failed', 'Failed'];
   for (const stream of [child.stdout, child.stderr]) {
     createInterface({ input: stream }).on('line', (line) => {
       const event = events.find((item) => line.includes(item));
