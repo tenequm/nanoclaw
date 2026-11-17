@@ -91,6 +91,21 @@ export class StreamParser {
     }
   }
 }
+export async function revokedStreamClosed(done: Promise<void>): Promise<void> {
+  try {
+    await done;
+  } catch (error) {
+    // Revocation destroys the HTTP response rather than ending the SSE body cleanly.
+    if (
+      !(
+        error instanceof TypeError &&
+        error.message === 'terminated' &&
+        (error.cause as { code?: string })?.code === 'UND_ERR_SOCKET'
+      )
+    )
+      throw error;
+  }
+}
 class Skip extends Error {}
 class RateLimited extends Error {}
 interface Device {
@@ -590,7 +605,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
         const opened = await stream(disposable, live!.parser.cursor);
         assert.equal((await request(disposable, 'DELETE', '/app/devices/me')).status, 204);
         await Promise.race([
-          opened.done,
+          revokedStreamClosed(opened.done),
           delay(5000).then(() => {
             throw new Error('revocation stream deadline');
           }),

@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
-import { StreamParser, guard, target } from './app-client.js';
+import { StreamParser, guard, target, revokedStreamClosed } from './app-client.js';
 import { signRequest } from './app-sign.js';
 import { canonicalSigningText, parseAuthorization, verifyRequestSignature } from '../src/channels/app/contract.js';
 const fixture = JSON.parse(
@@ -154,4 +154,12 @@ it('stops mid-chunk and resumes without losing or duplicating versions', () => {
   resumed.feed(wire.subarray(wire.indexOf('event: message', 1)));
   expect(seen).toEqual([1, 2]);
   expect(resumed.cursor).toBe(2);
+});
+
+it('accepts a revoked socket closing but propagates parser failures', async () => {
+  await expect(revokedStreamClosed(Promise.resolve())).resolves.toBeUndefined();
+  await expect(
+    revokedStreamClosed(Promise.reject(new TypeError('terminated', { cause: { code: 'UND_ERR_SOCKET' } }))),
+  ).resolves.toBeUndefined();
+  await expect(revokedStreamClosed(Promise.reject(new SyntaxError('bad event')))).rejects.toThrow('bad event');
 });
