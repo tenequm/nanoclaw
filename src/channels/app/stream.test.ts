@@ -170,11 +170,10 @@ it('evicts the oldest fourth stream and closes immediately on revocation', async
 it('delivers read-driven badge changes to both devices', async () => {
   vi.useFakeTimers();
   const clients = [setup('a'), setup('b')];
-  for (const s of clients) {
-    await openStream(s.ctx, s.deps);
-    s.deps.badgeFor = async () => ({ kind: 'badge', rev: 8, unreadTotal: 0 });
-    s.events.emit('badge', 'u');
-  }
+  const shared = clients[0];
+  for (const s of clients) await openStream(s.ctx, shared.deps);
+  shared.deps.badgeFor = async () => ({ kind: 'badge', rev: 8, unreadTotal: 0 });
+  shared.events.emit('badge', 'u');
   await vi.advanceTimersByTimeAsync(0);
   for (const s of clients) {
     expect(s.output()).toContain('"unreadTotal":0');
