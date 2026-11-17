@@ -1,3 +1,4 @@
+import { allocateFreePort } from '../../test-utils/free-port.js';
 import http from 'node:http';
 import { once } from 'node:events';
 import { connect } from 'node:net';
@@ -10,7 +11,8 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 it('configures uploads and keepalive and lets a stream outlive the receive timeout', async () => {
-  vi.stubEnv('WEBHOOK_PORT', '4501');
+  const port = await allocateFreePort('127.0.0.1');
+  vi.stubEnv('WEBHOOK_PORT', String(port));
   vi.stubEnv('WEBHOOK_HOST', '127.0.0.1');
   const original = http.createServer;
   const spy = vi.spyOn(http, 'createServer').mockImplementation((...args: Parameters<typeof http.createServer>) => {
@@ -39,7 +41,7 @@ it('configures uploads and keepalive and lets a stream outlive the receive timeo
   server.headersTimeout = 900;
   const upload = new Promise<string>((resolve, reject) => {
     const request = http.request(
-      'http://127.0.0.1:4501/n2b-timeout',
+      `http://127.0.0.1:${port}/n2b-timeout`,
       { method: 'POST', headers: { 'Content-Length': 2 } },
       (res) => {
         let body = '';
@@ -54,11 +56,12 @@ it('configures uploads and keepalive and lets a stream outlive the receive timeo
     setTimeout(() => request.end('b'), 450);
   });
   expect(await upload).toBe('uploaded');
-  expect(await (await fetch('http://127.0.0.1:4501/n2b-timeout')).text()).toContain('survived');
+  expect(await (await fetch(`http://127.0.0.1:${port}/n2b-timeout`)).text()).toContain('survived');
 });
 
 it('shuts down promptly with a streaming response and an incomplete HTTP request', async () => {
-  vi.stubEnv('WEBHOOK_PORT', '4501');
+  const port = await allocateFreePort('127.0.0.1');
+  vi.stubEnv('WEBHOOK_PORT', String(port));
   vi.stubEnv('WEBHOOK_HOST', '127.0.0.1');
   const spy = vi.spyOn(http, 'createServer');
   registerRootHandler('n2b-shutdown', (_req, res) => {
@@ -67,10 +70,10 @@ it('shuts down promptly with a streaming response and an incomplete HTTP request
   });
   const server = spy.mock.results[0].value as http.Server;
   if (!server.listening) await once(server, 'listening');
-  const incomplete = connect(4501, '127.0.0.1');
+  const incomplete = connect(port, '127.0.0.1');
   await once(incomplete, 'connect');
   incomplete.write('GET /n2b-shutdown HTTP/1.1\r\n');
-  const response = await fetch('http://127.0.0.1:4501/n2b-shutdown');
+  const response = await fetch(`http://127.0.0.1:${port}/n2b-shutdown`);
   const reader = response.body!.getReader();
   await reader.read();
   try {
