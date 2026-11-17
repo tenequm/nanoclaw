@@ -308,6 +308,8 @@ export interface SavedVoiceSelection {
 }
 
 export interface VoicePatchRequest {
+  /** `{reset: true}` alone (no other key) clears the saved voice, as `/voice/tts` takes it. */
+  reset?: boolean;
   provider?: string | null;
   model?: string | null;
   voice?: string | null;
