@@ -26,12 +26,14 @@ import type { Message } from './contract.js';
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
 
 const mocks = vi.hoisted(() => ({ bodies: new WeakMap<IncomingMessage, Buffer>(), response: vi.fn() }));
-vi.mock('../../modules/device-auth/verify.js', () => ({
+vi.mock('../../modules/device-auth/verify.js', async (original) => ({
+  ...(await original<typeof import('../../modules/device-auth/verify.js')>()),
   readSignedBody: (req: IncomingMessage) => Promise.resolve(mocks.bodies.get(req)!),
 }));
 vi.mock('../../response-registry.js', () => ({ getResponseHandlers: () => [mocks.response] }));
 vi.mock('../../router.js', () => ({ routeInbound: vi.fn(), registerMessageInterceptor: vi.fn() }));
-vi.mock('../voice-mode-command.js', () => ({
+vi.mock('../voice-mode-command.js', async (original) => ({
+  ...(await original<typeof import('../voice-mode-command.js')>()),
   parseVoiceCommand: (text: string) => (/^\s*\/voice(?:@\S*)?(?!\S)/i.test(text) ? {} : null),
 }));
 let conversationId: string;
