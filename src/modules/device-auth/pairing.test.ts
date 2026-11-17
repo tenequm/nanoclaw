@@ -89,7 +89,20 @@ it('registers host-only pair, list and revoke commands with the link in data', a
   if (response.ok)
     expect(typeof response.data === 'string' && response.data.startsWith('https://example.test/app/pair#')).toBe(true);
   expect(await call('list', { user: 'telegram:u' })).toMatchObject({ ok: true, data: [] });
-  expect(await call('revoke', { id: 'missing' })).toMatchObject({ ok: true });
+  expect(await call('revoke', { id: 'missing' })).toMatchObject({ ok: false, error: { message: 'No such device' } });
+  await getDb().run(
+    "INSERT INTO device_auth_devices (id,user_id,name,public_key,app_json,created_at) VALUES ('d','telegram:u','test','unused','{}',1)",
+  );
+  expect(await call('list', { user: 'telegram:u' })).toMatchObject({ ok: true, data: [{ id: 'd', revoked_at: null }] });
+  expect(await call('revoke', { id: 'd' })).toMatchObject({ ok: true, data: { revoked: 'd', status: 'revoked' } });
+  expect(await call('revoke', { id: 'd' })).toMatchObject({
+    ok: true,
+    data: { status: 'already_revoked', message: 'Already revoked' },
+  });
+  expect(await call('list', { user: 'telegram:u' })).toMatchObject({
+    ok: true,
+    data: [{ id: 'd', revoked_at: expect.any(Number) }],
+  });
   for (const command of ['pair', 'list', 'revoke'])
     expect(await call(command, { user: 'telegram:u', agents: 'a', id: 'd' }, true)).toMatchObject({
       ok: false,
