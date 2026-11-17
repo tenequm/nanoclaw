@@ -108,6 +108,11 @@ awaiting cleanup so a cleanup failure cannot leak the claim.
 into the `SessionSpec` _before_ validation, so admission judges the whole
 session including the gateway's part of it. A provider that emits argv natively
 parses it at its own boundary and fails the spawn on anything it cannot type.
+Core changes one thing in it: when the session env sets an HTTP(S) proxy and the runner
+reaches its mailbox over HTTP, the mailbox's `host:port` joins `NO_PROXY` and
+`no_proxy` (both set to one merged list), so mailbox calls go to the host
+directly. Under egress lockdown the gateway is the only reachable hop, and the
+env stays as the provider gave it.
 
 **`networkAccess` is an intent, not a topology.** `{ kind: 'host' }`,
 `{ kind: 'runtime', identity }`, or `{ kind: 'session-container', role }`. The

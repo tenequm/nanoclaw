@@ -1458,20 +1458,17 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
   const hasProxy = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'].some(
     (key) => (contributedEnv[key] ?? env[key]) !== undefined,
   );
-  if (hasProxy && input.mailboxUrl) {
+  // On the lockdown network the gateway is the agent's only reachable hop, so mailbox calls stay proxied.
+  const lockedDown = EGRESS_LOCKDOWN && gateway.networkAccess.target.kind === 'runtime';
+  if (hasProxy && input.mailboxUrl && !lockedDown) {
     const bypass = new Set(
       [env.NO_PROXY, env.no_proxy, contributedEnv.NO_PROXY, contributedEnv.no_proxy]
         .flatMap((value) => value?.split(',') ?? [])
         .map((host) => host.trim())
         .filter(Boolean),
     );
-    const mailboxHost = new URL(input.mailboxUrl).hostname;
-    // On the lockdown network this alias names the gateway container, so the mailbox must stay proxied.
-    const gatewayAlias =
-      EGRESS_LOCKDOWN &&
-      gateway.networkAccess.target.kind === 'runtime' &&
-      mailboxHost === gateway.networkAccess.endpoint;
-    if (!gatewayAlias) bypass.add(mailboxHost);
+    // host:port, not the bare host: Bun suffix-matches a bare entry, taking every port there off the gateway.
+    bypass.add(new URL(input.mailboxUrl).host);
     contributedEnv.NO_PROXY = contributedEnv.no_proxy = [...bypass].join(',');
   }
 

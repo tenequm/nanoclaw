@@ -155,8 +155,8 @@ export class HttpServedAgentMailbox extends SqliteAgentMailbox {
    * A fresh token per spawn: the newest container of a session is the only one
    * the endpoint accepts, so a container the host replaced is fenced out.
    */
-  override async runnerContext(key: MailboxSessionKey): Promise<any> {
-    if (this.settings.transport === 'sqlite') return super.runnerContext(key);
+  override async runnerContext(key: MailboxSessionKey): Promise<HttpRunnerContext | null> {
+    if (this.settings.transport === 'sqlite') return null;
     const token = randomBytes(32).toString('hex');
     const file = tokenPath(key);
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });

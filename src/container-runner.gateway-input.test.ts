@@ -1,7 +1,8 @@
 /**
  * A new runtime's gateway input names the agent provider it runs, resolved the
  * same way spawn resolves it, so a gateway that grants model credentials per
- * agent can attach the right one. Adoption passes none.
+ * agent can attach the right one. Adoption passes none. Behind a proxy, the
+ * HTTP mailbox address the runner context names joins the bypass list.
  */
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -23,12 +24,16 @@ vi.mock('./drivers/index.js', () => {
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import { ensureContainerConfig } from './db/container-configs.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createSession } from './db/index.js';
-import { type GatewaySessionInput, resetGatewayProvider } from './gateway-providers/index.js';
+import { type GatewayContribution, type GatewaySessionInput, resetGatewayProvider } from './gateway-providers/index.js';
+import { HttpServedAgentMailbox } from './mailbox/http/index.js';
+import { registerAgentMailbox, resetAgentMailboxForTesting } from './mailbox/index.js';
 import type { Session } from './types.js';
 
-const ensure = vi.fn(async (_input: GatewaySessionInput) => ({
-  contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' as const } } },
-}));
+const ensure = vi.fn(
+  async (_input: GatewaySessionInput): Promise<{ contribution: GatewayContribution }> => ({
+    contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } },
+  }),
+);
 
 function session(agentProvider: string | null): Session {
   const now = new Date().toISOString();
@@ -106,5 +111,38 @@ describe('gateway session input on spawn', () => {
     expect(ensure.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({ disposition: 'create', provider: 'fixture-provider' }),
     );
+  });
+});
+
+describe('mailbox proxy bypass on spawn', () => {
+  it("adds the runner context's mailbox address to a proxied gateway's bypass list", async () => {
+    const composed = resetAgentMailboxForTesting()!;
+    registerAgentMailbox(
+      () =>
+        new HttpServedAgentMailbox(() => ({
+          transport: 'http',
+          bind: '127.0.0.1',
+          port: 3010,
+          url: 'http://mailbox.test:3010',
+        })),
+    );
+    ensure.mockResolvedValueOnce({
+      contribution: {
+        env: { HTTPS_PROXY: 'http://remote-gateway:15001' },
+        networkAccess: { endpoint: 'localhost', target: { kind: 'host' } },
+      },
+    });
+    try {
+      await createSession(session(null));
+      expect(await wakeContainer(session(null))).toBe(true);
+    } finally {
+      resetAgentMailboxForTesting();
+      registerAgentMailbox(composed);
+    }
+    expect(prepare.mock.calls[0]?.[0].containers[0].contributedEnv).toEqual({
+      HTTPS_PROXY: 'http://remote-gateway:15001',
+      NO_PROXY: 'mailbox.test:3010',
+      no_proxy: 'mailbox.test:3010',
+    });
   });
 });
