@@ -148,38 +148,11 @@ export function fileMetadata(data: Buffer, name: string) {
 }
 
 async function* boundedBody(req: IncomingMessage, size: number) {
-  let remaining = size;
-  while (!req.readableEnded) {
-    if (req.errored) throw req.errored;
-    if (req.destroyed) refuse(400, 'bad_body', 'Upload was interrupted.');
-    if (remaining === 0 && req.readableLength > 0) refuse(400, 'bad_body', 'Upload exceeds its declared size.');
-    const chunk = req.read(Math.min(remaining, 64 * 1024)) as Buffer | null;
-    if (chunk) {
-      remaining -= chunk.length;
-      yield chunk;
-      continue;
-    }
-    if (req.readableEnded) break;
-    await new Promise<void>((resolve, reject) => {
-      const clean = () => {
-        req.off('readable', ready);
-        req.off('end', ready);
-        req.off('error', failed);
-        req.off('close', ready);
-      };
-      const ready = () => {
-        clean();
-        resolve();
-      };
-      const failed = (error: Error) => {
-        clean();
-        reject(error);
-      };
-      req.once('readable', ready);
-      req.once('end', ready);
-      req.once('error', failed);
-      req.once('close', ready);
-    });
+  let count = 0;
+  for await (const chunk of req) {
+    count += chunk.length;
+    if (count > size) refuse(400, 'bad_body', 'Upload exceeds its declared size.');
+    yield chunk as Buffer;
   }
 }
 

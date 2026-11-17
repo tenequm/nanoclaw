@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, rm, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createServer, IncomingMessage, ServerResponse } from 'node:http';
+import { request as httpRequest, createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { initDb, closeDb } from '../../db/connection.js';
@@ -272,4 +272,41 @@ it('fileUpload fixture ticket validates and its expired authorization is disting
   expect(
     readTicket(fixture.expiredAuthorization.slice(14), fixture.ticketSecretForTests, fixture.ticketClaims.exp),
   ).toBeNull();
+});
+
+it('uploads delayed segments over HTTP beyond 64 KiB without blocking timers', async () => {
+  const bytes = Buffer.alloc(200_000, 7);
+  const { body } = await mint({ size: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
+  const server = createServer((req, res) => {
+    void service.uploadFile({ req, res, params: { id: body.fileId } }).catch((error) => res.destroy(error));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address() as import('node:net').AddressInfo;
+    const status = await new Promise<number | undefined>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          hostname: '127.0.0.1',
+          port: address.port,
+          method: 'PUT',
+          headers: { authorization: 'HeyDan-Ticket ' + body.ticket, 'content-length': bytes.length },
+        },
+        (res) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode));
+        },
+      );
+      req.on('error', reject);
+      req.write(bytes.subarray(0, 1000));
+      setTimeout(() => {
+        req.write(bytes.subarray(1000, 100_000));
+        setTimeout(() => req.end(bytes.subarray(100_000)), 20);
+      }, 20);
+    });
+    expect(status).toBe(204);
+    expect(await readFile(path.join(directory, 'files', body.fileId))).toEqual(bytes);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
