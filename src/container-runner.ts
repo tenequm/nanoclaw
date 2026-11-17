@@ -20,6 +20,7 @@ import {
   CONTAINER_MEMORY_LIMIT,
   CONTAINER_PIDS_LIMIT,
   DATA_DIR,
+  EGRESS_LOCKDOWN,
   GROUPS_DIR,
   INSTALL_SLUG,
   TIMEZONE,
@@ -457,7 +458,8 @@ async function spawnContainer(session: Session, wakeReason?: WakeReason): Promis
   await writeSessionRouting(agentGroup.id, session.id);
   const mailboxKey = { agentGroupId: agentGroup.id, sessionId: session.id };
   const mailbox = getAgentMailbox();
-  writeSessionContext(agentGroup.id, session.id, await mailbox.runnerContext(mailboxKey));
+  const runnerContext = await mailbox.runnerContext(mailboxKey);
+  writeSessionContext(agentGroup.id, session.id, runnerContext);
 
   // Materialize container.json from DB — writes fresh file and returns
   // the config object, threaded through provider resolution, buildMounts,
@@ -515,6 +517,13 @@ async function spawnContainer(session: Session, wakeReason?: WakeReason): Promis
       contribution,
       gateway,
       mailboxEnvironment,
+      mailboxUrl:
+        runnerContext &&
+        typeof runnerContext === 'object' &&
+        'url' in runnerContext &&
+        typeof runnerContext.url === 'string'
+          ? runnerContext.url
+          : undefined,
       wakeReason,
     });
 
@@ -1405,6 +1414,7 @@ export interface ComposeSessionSpecInput {
   gateway: GatewayContribution;
   /** Non-secret configuration supplied by the selected mailbox implementation. */
   mailboxEnvironment: Record<string, string>;
+  mailboxUrl?: string;
   /** Why this spawn happened, for the runner. */
   wakeReason?: WakeReason;
 }
@@ -1444,6 +1454,26 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     ...(contribution.env ?? {}),
     ...(gateway.env ?? {}),
   };
+
+  const hasProxy = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'].some(
+    (key) => (contributedEnv[key] ?? env[key]) !== undefined,
+  );
+  if (hasProxy && input.mailboxUrl) {
+    const bypass = new Set(
+      [env.NO_PROXY, env.no_proxy, contributedEnv.NO_PROXY, contributedEnv.no_proxy]
+        .flatMap((value) => value?.split(',') ?? [])
+        .map((host) => host.trim())
+        .filter(Boolean),
+    );
+    const mailboxHost = new URL(input.mailboxUrl).hostname;
+    // On the lockdown network this alias names the gateway container, so the mailbox must stay proxied.
+    const gatewayAlias =
+      EGRESS_LOCKDOWN &&
+      gateway.networkAccess.target.kind === 'runtime' &&
+      mailboxHost === gateway.networkAccess.endpoint;
+    if (!gatewayAlias) bypass.add(mailboxHost);
+    contributedEnv.NO_PROXY = contributedEnv.no_proxy = [...bypass].join(',');
+  }
 
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
