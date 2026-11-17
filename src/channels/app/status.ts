@@ -110,13 +110,17 @@ export function createStatusService(deps: StatusDeps) {
   const ready = serial(async () => {
     const conversations = await db().all<ConversationRow>('SELECT * FROM app_conversations');
     for (const c of conversations) {
-      const states = await readStates(c).catch(() => []);
-      const fresh = states.find((s) => s.turn === 'working' && Date.now() - Date.parse(s.updatedAt) < 30_000);
-      if (fresh)
-        ticks.set(c.id, { at: Date.parse(fresh.updatedAt), readAt: Date.now(), label: toolLabel(fresh.currentTool) });
-      await refresh(c.id, true);
+      try {
+        const states = await readStates(c).catch(() => []);
+        const fresh = states.find((s) => s.turn === 'working' && Date.now() - Date.parse(s.updatedAt) < 30_000);
+        if (fresh)
+          ticks.set(c.id, { at: Date.parse(fresh.updatedAt), readAt: Date.now(), label: toolLabel(fresh.currentTool) });
+        await refresh(c.id, true);
+      } catch {
+        // Keep other conversations available after a transient boot failure.
+      }
     }
-  });
+  }).catch(() => {});
   const unsubscribe = deps.onEventAppended((event) => {
     if (stopped) return;
     void serial(async () => {

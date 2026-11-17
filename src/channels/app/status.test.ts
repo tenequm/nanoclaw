@@ -109,3 +109,38 @@ it.each([
   ['mcp__secret_name', 'Using a tool'],
   ['unknown', 'Working'],
 ])('maps %s without exposing tool names', (tool, label) => expect(toolLabel(tool)).toBe(label));
+
+it('survives failed boot reads and continues initializing other conversations', async () => {
+  const db = new SqliteDriver(new Database(':memory:'));
+  await db.exec(
+    "CREATE TABLE app_statuses (conversation_id TEXT PRIMARY KEY, rev INTEGER, state TEXT, label TEXT, at INTEGER); CREATE TABLE app_conversations (id TEXT); INSERT INTO app_conversations VALUES ('a'), ('b');",
+  );
+  await db.run("INSERT INTO app_statuses VALUES ('a', 7, 'idle', NULL, 0)");
+  const deps: StatusDeps = {
+    db: () => db,
+    containerStates: async () => [],
+    getConversationByPlatformId: async (id) => ({ id }) as ConversationRow,
+    openQuestionConversationIds: vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue([]),
+    onEventAppended: () => () => {},
+    setAppHooks: vi.fn(),
+  };
+  const service = createStatusService(deps);
+  try {
+    await service.ready;
+    expect(await service.statuses(['a', 'b', 'missing'])).toMatchObject([{ rev: 7 }, { rev: 1 }, { rev: 0 }]);
+    await service.setTyping('a');
+    expect((await service.statuses(['a']))[0]).toMatchObject({ rev: 8, state: 'working' });
+  } finally {
+    await service.stop();
+  }
+  const all = vi.spyOn(db, 'all').mockRejectedValueOnce(new Error('boot unavailable'));
+  const restarted = createStatusService(deps);
+  try {
+    await restarted.ready;
+    expect((await restarted.statuses(['a']))[0].rev).toBe(8);
+  } finally {
+    await restarted.stop();
+    all.mockRestore();
+    await db.close();
+  }
+});
