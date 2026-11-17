@@ -47,7 +47,7 @@ function setup(device = 'd') {
       output += bytes;
       return true;
     }),
-    end: vi.fn(() => {
+    destroy: vi.fn(() => {
       res.emit('close');
     }),
   });
@@ -150,7 +150,7 @@ it('waits for drain, checks current access, and closes on the five-second revoca
   expect(s.output()).not.toContain('id: 131');
   vi.mocked(deviceAuth.getLiveDevice).mockResolvedValue(undefined);
   await vi.advanceTimersByTimeAsync(5_000);
-  expect(s.res.end).toHaveBeenCalled();
+  expect(s.res.destroy).toHaveBeenCalled();
   expect(s.events.eventNames()).toEqual([]);
 });
 it('evicts the oldest fourth stream and closes immediately on revocation', async () => {
@@ -160,10 +160,10 @@ it('evicts the oldest fourth stream and closes immediately on revocation', async
     await openStream(s.ctx, s.deps);
     clients.push(s);
   }
-  expect(clients[0].res.end).toHaveBeenCalled();
+  expect(clients[0].res.destroy).toHaveBeenCalled();
   for (const s of clients.slice(1)) {
     s.events.emit('revoke', 'd');
-    expect(s.res.end).toHaveBeenCalled();
+    expect(s.res.destroy).toHaveBeenCalled();
   }
 });
 it('delivers read-driven badge changes to both devices', async () => {
@@ -240,7 +240,7 @@ it('uses signed dispatch and real device access and revocation seams', async () 
     await vi.advanceTimersByTimeAsync(0);
     expect(s.output()).not.toContain('id: 130');
     await deviceAuth.revokeDevice(vector.deviceId);
-    expect(s.res.end).toHaveBeenCalled();
+    expect(s.res.destroy).toHaveBeenCalled();
     expect(s.events.eventNames()).toEqual([]);
   } finally {
     s.res.emit('close');
@@ -299,4 +299,32 @@ it('yields between replay pages and caches access for at most two seconds', asyn
   expect(deviceAuth.reachableAgentIds).toHaveBeenCalledTimes(2);
   expect(s.output()).not.toContain('id: 301');
   s.res.emit('close');
+});
+
+it('destroys a stalled stream after 45 seconds and removes every subscription', async () => {
+  vi.useFakeTimers();
+  const s = setup();
+  await openStream(s.ctx, s.deps);
+  s.res.write.mockReturnValue(false);
+  s.events.emit('event', row(130));
+  await vi.advanceTimersByTimeAsync(44_999);
+  expect(s.res.destroy).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(1);
+  expect(s.res.destroy).toHaveBeenCalledOnce();
+  expect(s.res.listenerCount('drain')).toBe(0);
+  expect(s.events.eventNames()).toEqual([]);
+  expect(vi.getTimerCount()).toBe(0);
+});
+it('bounds pending events while the client is not draining', async () => {
+  vi.useFakeTimers();
+  const s = setup();
+  await openStream(s.ctx, s.deps);
+  s.res.write.mockReturnValue(false);
+  s.events.emit('event', row(130));
+  await vi.advanceTimersByTimeAsync(0);
+  for (let i = 0; i < 257; i++) s.events.emit('event', row(131));
+  expect(s.res.destroy).toHaveBeenCalledOnce();
+  expect(s.events.eventNames()).toEqual([]);
+  expect(s.res.listenerCount('drain')).toBe(0);
+  expect(vi.getTimerCount()).toBe(0);
 });

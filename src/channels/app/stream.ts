@@ -57,7 +57,7 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
     const active = streams.get(identity.deviceId);
     active?.delete(close);
     if (!active?.size) streams.delete(identity.deviceId);
-    res.end();
+    res.destroy();
   };
   res.once('close', close);
   res.once('error', close);
@@ -87,12 +87,15 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
     if (!res.write(bytes))
       await new Promise<void>((resolve) => {
         const done = () => {
+          clearTimeout(deadline);
           res.off('drain', done);
           res.off('close', done);
           res.off('error', done);
           cancelDrain = undefined;
           resolve();
         };
+        const deadline = setTimeout(close, 45_000);
+        deadline.unref();
         cancelDrain = done;
         res.once('drain', done);
         res.once('close', done);
@@ -146,6 +149,7 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
   }
   function enqueue(item: Pending): void {
     if (closed) return;
+    if (pending.length >= 256) return close();
     pending.push(item);
     void pump();
   }
