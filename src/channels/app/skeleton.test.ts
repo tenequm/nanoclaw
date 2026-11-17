@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { IncomingMessage, ServerResponse } from 'node:http';
-import { createHash, randomBytes, sign } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { canonicalSigningText } from './contract.js';
 import { consumeRateLimit } from '../../modules/device-auth/rate-limit.js';
 import { onDeviceRevoked } from '../../modules/device-auth/verify.js';
@@ -115,7 +115,7 @@ it('advertises only configured features and derives a domain-separated ticket ke
     APP_APNS_SANDBOX_KEY_PATH: '/test.p8',
   };
   const config = readAppConfig((key) => env[key]);
-  expect(configuredFeatures(config)).toEqual(['files', 'calls', 'voice-picker', 'push']);
+  expect(configuredFeatures(config)).toEqual(['files', 'calls', 'voice-picker']);
   expect(config.ticketKey).toHaveLength(32);
   expect(config.ticketKey).not.toEqual(Buffer.alloc(32, 7));
   expect(config.apns.production).toBeNull();
@@ -206,4 +206,30 @@ it('pairs, revokes through dispatch, then refuses the revoked device', async () 
   } finally {
     off();
   }
+});
+
+it('advertises push only with a public base and a usable APNs environment', () => {
+  databaseDirectory = mkdtempSync(join(tmpdir(), 'app-push-config-'));
+  const keyPath = join(databaseDirectory, 'test.p8');
+  const config = readAppConfig(() => undefined);
+  config.apns.teamId = 'team';
+  config.apns.sandbox = { keyId: 'key', keyPath };
+  config.publicBase = 'https://example.test';
+  expect(configuredFeatures(config)).not.toContain('push');
+  writeFileSync(keyPath, 'invalid key');
+  expect(configuredFeatures(config)).not.toContain('push');
+  const wrong = generateKeyPairSync('ec', { namedCurve: 'secp384r1' }).privateKey;
+  writeFileSync(keyPath, wrong.export({ type: 'pkcs8', format: 'pem' }));
+  expect(configuredFeatures(config)).not.toContain('push');
+  const key = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey;
+  writeFileSync(keyPath, key.export({ type: 'pkcs8', format: 'pem' }));
+  expect(configuredFeatures(config)).toContain('push');
+  config.publicBase = null;
+  expect(configuredFeatures(config)).not.toContain('push');
+  config.publicBase = 'https://example.test';
+  config.apns.production = config.apns.sandbox;
+  config.apns.sandbox = { keyId: 'missing', keyPath: join(databaseDirectory, 'missing') };
+  expect(configuredFeatures(config)).toContain('push');
+  config.apns.teamId = null;
+  expect(configuredFeatures(config)).not.toContain('push');
 });

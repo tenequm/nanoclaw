@@ -1,4 +1,5 @@
-import { hkdfSync } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { createPrivateKey, hkdfSync } from 'node:crypto';
 import { envValue } from '../../env.js';
 import { parseEncryptionKey } from '../../secret-seal.js';
 
@@ -23,9 +24,20 @@ export function readAppConfig(read: (key: string) => string | undefined = envVal
 }
 export type AppConfig = ReturnType<typeof readAppConfig>;
 export function configuredFeatures(config: AppConfig): string[] {
+  const pushReady =
+    config.publicBase &&
+    config.apns.teamId &&
+    [config.apns.sandbox, config.apns.production].some((key) => {
+      if (!key) return false;
+      try {
+        return createPrivateKey(readFileSync(key.keyPath)).asymmetricKeyDetails?.namedCurve === 'prime256v1';
+      } catch {
+        return false;
+      }
+    });
   return [
     ...(config.ticketKey ? ['files'] : []),
     ...(config.livekitUrl ? ['calls', 'voice-picker'] : []),
-    ...(config.apns.teamId && (config.apns.sandbox || config.apns.production) ? ['push'] : []),
+    ...(pushReady ? ['push'] : []),
   ];
 }
