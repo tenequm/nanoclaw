@@ -128,6 +128,7 @@ export interface OutboundFile {
 
 /** Outbound message from host to adapter. */
 export interface OutboundMessage {
+  sourceId?: string;
   kind: string;
   content: unknown; // parsed JSON from messages_out
   inReplyTo?: string;

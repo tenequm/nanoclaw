@@ -497,6 +497,7 @@ export function liveKitChatDelivered(
   for (const engine of engines) engine.chatMessage(target.chat, agentGroupId, text, target.replyTo);
 }
 
+export const CALLER_MARK = '\u{1F399} ';
 /** Leads the chat's copy of an agent message a live call was given to speak (not proof it was heard). */
 export const SPOKEN_MARK = '\u{1F50A} ';
 
@@ -515,7 +516,11 @@ export function liveKitChatPresentation(
   if (!target || ![...engines].some((engine) => engine.speaksChat(target.chat, agentGroupId, target.replyTo))) {
     return null;
   }
-  return { ...content, text: `${SPOKEN_MARK}${content.text as string}` };
+  return {
+    ...content,
+    text: `${SPOKEN_MARK}${content.text as string}`,
+    ...(msg.channelType === 'app' ? { voice: 'spoken' } : {}),
+  };
 }
 
 /** Typing tap: the agent works in a chat; its live call talking there hears it is thinking, and when it picked a turn up. */
@@ -743,19 +748,22 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     return null;
   };
 
-  const postToChat = async (chat: CallChat, text: string): Promise<void> => {
+  const postToChat = async (chat: CallChat, text: string, voice?: 'caller'): Promise<void> => {
     const adapter = mirrorApi.adapter(chat.group.instance ?? chat.group.channel_type);
     if (!adapter) {
       log.warn('livekit-voice-mode: the call chat adapter is offline', { chat: chat.group.id });
       return;
     }
-    await adapter.deliver(chat.group.platform_id, chat.threadId, { kind: 'chat', content: { text } });
+    await adapter.deliver(chat.group.platform_id, chat.threadId, {
+      kind: 'chat',
+      content: { text, ...(voice && chat.group.channel_type === 'app' ? { voice } : {}) },
+    });
   };
 
   /** Best effort and off the caller's path; ordered per line. */
-  const mirror = (platformId: string, chat: CallChat, text: string): void => {
+  const mirror = (platformId: string, chat: CallChat, text: string, voice?: 'caller'): void => {
     const next = (mirrorChains.get(platformId) ?? Promise.resolve())
-      .then(() => postToChat(chat, text))
+      .then(() => postToChat(chat, text, voice))
       .catch((err: unknown) =>
         log.warn('livekit-voice-mode: transcript post failed', { platformId, chat: chat.group.id, err }),
       );
@@ -1144,7 +1152,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       void routed.then(
         (stored) => {
           // The chat shows the words alone; the turn itself still comes from the caller by name.
-          if (stored) mirror(call.platformId, chat, `\u{1F399} ${text}`);
+          if (stored) mirror(call.platformId, chat, `${CALLER_MARK}${text}`, 'caller');
         },
         () => undefined,
       );
