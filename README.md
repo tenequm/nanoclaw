@@ -172,6 +172,8 @@ If you want to add a new channel or agent provider, don't add it to trunk. New c
 
 This keeps trunk as pure registry and infra, and every fork stays lean — users get the channels and providers they asked for and nothing else.
 
+To exercise agent turns and voice calls on a Mac before a change ships, use the disposable [local stack](docs/local-stack.md).
+
 ### RFS (Request for Skills)
 
 No channel or provider skills are currently requested — propose one via an issue.
