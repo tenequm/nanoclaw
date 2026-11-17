@@ -251,6 +251,9 @@ function ensureServer(): void {
   // Keep the candidate as the singleton while listen is pending so concurrent
   // registrations cannot create competing listeners. A failed listen must
   // release that singleton, though, or later registrations can never retry.
+  candidate.requestTimeout = 15 * 60_000;
+  candidate.headersTimeout = 60_000;
+  candidate.keepAliveTimeout = 95_000;
   server = candidate;
   listenerId = id;
   if (upgradeRoutes.size > 0) candidate.on('upgrade', dispatchUpgrade);
@@ -268,6 +271,8 @@ function ensureServer(): void {
 export async function stopWebhookServer(): Promise<void> {
   if (server) {
     const closed = new Promise<void>((resolve) => server!.close(() => resolve()));
+    // Shutdown must also release streaming responses and sockets still receiving headers.
+    server.closeAllConnections();
     for (const socket of upgradedSockets) socket.destroy();
     upgradedSockets.clear();
     await closed;
