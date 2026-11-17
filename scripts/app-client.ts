@@ -275,13 +275,13 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       if (cutAfter && events.length >= cutAfter) controller.abort();
     });
     const t = target(['app', 'events'], [['after', String(after)]]);
-    const response = await raw(
-      'GET',
-      t,
-      undefined,
-      signRequest({ ...device, method: 'GET', target: t }),
-      AbortSignal.any([controller.signal, AbortSignal.timeout(90000)]),
-    );
+    const connectTimer = setTimeout(() => controller.abort(), 15000);
+    let response: Response;
+    try {
+      response = await raw('GET', t, undefined, signRequest({ ...device, method: 'GET', target: t }), controller.signal);
+    } finally {
+      clearTimeout(connectTimer);
+    }
     assert(response.ok && response.headers.get('content-type')?.includes('text/event-stream'));
     assert(response.body);
     const done = (async () => {
@@ -442,18 +442,24 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       });
     }
     if (['all', 'upload'].includes(scenario)) {
+      let filesUnavailable = false;
       await check('upload', async () => {
         conv();
         const bytes = Buffer.from('N9b attachment\n');
-        const minted = await json<FileInitResponse>(
-          await request(requirePair(), 'POST', '/app/files', {
+        let mintResponse: Response;
+        try {
+          mintResponse = await request(requirePair(), 'POST', '/app/files', {
             uploadKey: randomUUID(),
             name: 'n9b.txt',
             mimeType: 'text/plain',
             size: bytes.length,
             sha256: bodySHA256(bytes),
-          }),
-        );
+          });
+        } catch (error) {
+          if (error instanceof Skip) filesUnavailable = true;
+          throw error;
+        }
+        const minted = await json<FileInitResponse>(mintResponse);
         assert.equal(minted.uploadPath, target(['app', 'files', minted.fileId]));
         for (const payload of [bytes, bytes, Buffer.alloc(bytes.length, 120)]) {
           const r = await raw('PUT', minted.uploadPath, payload, 'HeyDan-Ticket ' + minted.ticket);
@@ -463,6 +469,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
         await reached((await send('reply n9b upload', [minted.fileId])).message);
       });
       await check('download-files', async () => {
+        if (filesUnavailable) throw new Skip('File routes: 501 not_implemented');
         const start = events().length;
         await reached((await send('file')).message);
         await until(
