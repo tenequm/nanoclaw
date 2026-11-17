@@ -328,3 +328,15 @@ it('bounds pending events while the client is not draining', async () => {
   expect(s.res.listenerCount('drain')).toBe(0);
   expect(vi.getTimerCount()).toBe(0);
 });
+
+it('resets an ahead-of-log cursor to the synchronized watermark', async () => {
+  vi.useFakeTimers();
+  const s = setup();
+  s.ctx.req.url = '/app/events?after=500';
+  await openStream(s.ctx, s.deps);
+  expect(s.output()).toContain('event: synchronized\ndata: {"seq":129}');
+  s.events.emit('event', row(130));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(s.output()).toContain('id: 130');
+  s.res.emit('close');
+});

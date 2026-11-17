@@ -206,7 +206,7 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
     await badge();
     await agents();
     await write(formatEvent({ kind: 'synchronized', data: { seq: high } }));
-    cursor = Math.max(cursor, high);
+    cursor = high;
     replaying = false;
     await pump();
   } catch {
