@@ -1,3 +1,5 @@
+import { listConversations } from './conversations.js';
+import { stopStatus } from './status.js';
 import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -192,6 +194,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await adapter.teardown();
+  await stopStatus();
   await closeDb();
   vi.unstubAllEnvs();
 });
@@ -403,4 +406,20 @@ it('does not create a line on a refused picker save', async () => {
     ).status,
   ).toBe(503);
   expect(await getVoiceModeLineForAgent(c.agent_group_id)).toBeUndefined();
+});
+
+it('reports call availability from the module-level hook in the real conversation list', async () => {
+  const result = await request(listConversations, undefined, {}, undefined, 'GET', '/app/conversations');
+  expect(result.status).toBe(200);
+  expect(result.body.conversations).toEqual([
+    expect.objectContaining({ agent: { id: c.agent_group_id, name: 'Stan' }, canCall: true, callRefusal: null }),
+  ]);
+  expect(rooms).toBe(0);
+  await adapter.teardown();
+  const offline = await request(listConversations, undefined, {}, undefined, 'GET', '/app/conversations');
+  expect(offline.body.conversations[0]).toMatchObject({
+    canCall: false,
+    callRefusal: { error: 'voice_offline', message: 'Calls are offline right now.' },
+  });
+  expect(rooms).toBe(0);
 });

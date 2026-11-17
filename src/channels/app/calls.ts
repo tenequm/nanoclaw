@@ -1,3 +1,5 @@
+import { getConversation } from './conversations.js';
+import { setAppHooks } from './log.js';
 import { getDb } from '../../db/connection.js';
 import { bindVoiceModeLineChat, createVoiceModeLine, getVoiceModeLineForAgent } from '../../db/voice-mode-lines.js';
 import { hasAdminPrivilege } from '../../modules/permissions/db/user-roles.js';
@@ -271,10 +273,5 @@ export function createCallHandlers(deps: CallDeps) {
   });
   return { startCall, endCall, cancelCallAttempt };
 }
-export const callDeps: CallDeps = {
-  async getConversation() {
-    throw new AppCallError(503, 'voice_offline');
-  },
-  setAppHooks() {},
-};
+export const callDeps: CallDeps = { getConversation: (id) => getConversation(id), setAppHooks };
 export const { startCall, endCall, cancelCallAttempt } = createCallHandlers(callDeps);
