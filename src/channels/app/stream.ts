@@ -1,3 +1,6 @@
+import { lastEventSeq, readEventsAfter, onEventAppended } from './log.js';
+import { onBadgeChanged, conversationsFor, badgeFor } from './conversations.js';
+import { statuses, onStatusChanged } from './status.js';
 import { getLiveDevice, reachableAgentIds, onDeviceRevoked } from '../../modules/device-auth/verify.js';
 import { formatEvent, type Badge, type Status } from './contract.js';
 import type { ConversationRow, EventRow } from './db.js';
@@ -13,8 +16,18 @@ export interface StreamDeps {
   badgeFor(userId: string, agentIds: string[]): Promise<Badge>;
   statuses(ids: string[]): Promise<Status[]>;
 }
-let configured: StreamDeps | undefined;
-export function configureStream(deps: StreamDeps): void {
+const defaults: StreamDeps = {
+  lastEventSeq,
+  readEventsAfter,
+  onEventAppended,
+  onBadgeChanged,
+  conversationsFor,
+  badgeFor,
+  statuses: (ids) => statuses(ids),
+  onStatusChanged: (listener) => onStatusChanged(listener),
+};
+let configured: StreamDeps = defaults;
+export function configureStream(deps: StreamDeps = defaults): void {
   configured = deps;
 }
 const streams = new Map<string, Set<() => void>>();

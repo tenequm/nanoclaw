@@ -1,3 +1,5 @@
+import { appendEvent, appTransaction } from './log.js';
+import { stopStatus } from './status.js';
 import { initDb, closeDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { dispatchApp } from './routes.js';
@@ -240,5 +242,29 @@ it('uses signed dispatch and real device access and revocation seams', async () 
   } finally {
     s.res.emit('close');
     await closeDb();
+  }
+});
+
+it('streams committed messages through the module-level event log wiring', async () => {
+  const s = setup();
+  const db = await initDb(':memory:', { role: 'test' });
+  await runMigrations(db);
+  configureStream();
+  s.ctx.req.url = '/app/events?after=0';
+  try {
+    await openModuleStream();
+    expect(s.output()).toContain('event: synchronized');
+    const message = { ...fixtures.messages.agentMarkdown, id: 'msg_integration', seq: 0, order: 0 };
+    await appTransaction(() => appendEvent(db, 'u', 'ag_stan', message));
+    await vi.waitFor(() => expect(s.output()).toContain('msg_integration'));
+    expect(s.output()).toContain('event: message');
+  } finally {
+    s.res.emit('close');
+    await stopStatus();
+    await closeDb();
+  }
+  async function openModuleStream() {
+    const { streamEvents } = await import('./stream.js');
+    await streamEvents(s.ctx);
   }
 });

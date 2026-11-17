@@ -1,3 +1,7 @@
+import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
+import { getConversationByPlatformId } from './conversations.js';
+import { openQuestionConversationIds } from './questions.js';
+import { onEventAppended, setAppHooks } from './log.js';
 import type { ChannelAdapter } from '../adapter.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
@@ -178,14 +182,31 @@ export function createStatusService(deps: StatusDeps) {
   };
 }
 let service: ReturnType<typeof createStatusService> | undefined;
-export function configureStatus(deps: StatusDeps): ReturnType<typeof createStatusService> {
-  if (service) throw new Error('App status service already configured');
-  service = createStatusService(deps);
+export function startStatus() {
+  service ??= createStatusService({
+    getConversationByPlatformId,
+    openQuestionConversationIds,
+    onEventAppended,
+    setAppHooks,
+  });
   return service;
 }
+export async function stopStatus(): Promise<void> {
+  await service?.stop();
+  service = undefined;
+  setAppHooks({ statuses });
+}
+export const statuses = (ids: string[]) => startStatus().statuses(ids);
+export const onStatusChanged = (listener: (status: Status) => void) => startStatus().onStatusChanged(listener);
+setAppHooks({ statuses });
 export const setTyping: NonNullable<ChannelAdapter['setTyping']> = async (platformId) => {
-  await service?.setTyping(platformId);
+  await startStatus().setTyping(platformId);
 };
 export const clearTyping: NonNullable<ChannelAdapter['clearTyping']> = async (platformId) => {
-  await service?.clearTyping(platformId);
+  await startStatus().clearTyping(platformId);
 };
+
+onHostStart(async () => {
+  await startStatus().ready;
+});
+onHostShutdown(stopStatus);
