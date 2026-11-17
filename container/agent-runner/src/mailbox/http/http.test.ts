@@ -142,6 +142,28 @@ describe('HTTP mailbox context', () => {
     expect(headers.get('x-nanoclaw-session')).toBe('sess');
     expect(requests[0].ops).toEqual([{ op: 'snapshot', args: [null] }]);
   });
+
+  test('reaches the host past a proxy when NO_PROXY names the mailbox host and port, as the host composes it', async () => {
+    const names = ['HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy'] as const;
+    const saved = names.map((name) => process.env[name]);
+    const proxyEnv = (bypass: string) => {
+      process.env.HTTP_PROXY = process.env.http_proxy = 'http://127.0.0.1:9';
+      process.env.NO_PROXY = process.env.no_proxy = bypass;
+    };
+    try {
+      proxyEnv(`127.0.0.1:${Number(server.port) + 1}`);
+      await expect(started()).rejects.toThrow('HTTP mailbox request failed');
+      expect(requests).toEqual([]);
+      proxyEnv(server.url.host);
+      await started();
+      expect(requests).toHaveLength(1);
+    } finally {
+      names.forEach((name, index) => {
+        if (saved[index] === undefined) delete process.env[name];
+        else process.env[name] = saved[index];
+      });
+    }
+  });
 });
 
 describe('HTTP mailbox reads (served from the replica)', () => {

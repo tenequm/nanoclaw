@@ -37,7 +37,7 @@
     "@types/qrcode": "1.5.6",
     "@types/ws": "8.18.2",
     "@whiskeysockets/baileys": "7.0.0-rc14",
-    "agent-browser": "0.41.2",
+    "agent-browser": "0.43.0",
     "chat-adapter-imessage": "0.1.1",
     "livekit-server-sdk": "2.19.1",
     "mcp-remote": "0.1.38",
@@ -247,7 +247,7 @@
       ]
     },
     "agent-browser": {
-      "version": "0.41.2",
+      "version": "0.43.0",
       "sources": [
         "container/cli-tools.json"
       ]

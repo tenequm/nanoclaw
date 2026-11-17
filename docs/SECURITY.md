@@ -225,7 +225,9 @@ degrading.
 
 **Default: egress is open.** Lockdown is **off** unless you opt in; by default
 the agent reaches the gateway over the host-gateway path and outbound traffic is
-not confined to the internal network.
+not confined to the internal network. The runner's own mailbox calls skip the
+proxy then: core adds the mailbox's `host:port` to `NO_PROXY`. Under lockdown
+they stay on the gateway.
 
 **Configuration:**
 
