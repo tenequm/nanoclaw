@@ -340,3 +340,23 @@ it('resets an ahead-of-log cursor to the synchronized watermark', async () => {
   expect(s.output()).toContain('id: 130');
   s.res.emit('close');
 });
+
+it.each(['destroyed', 'writableEnded'])('does not subscribe when the response is already %s', async (flag) => {
+  const s = setup();
+  Object.assign(s.res, { [flag]: true });
+  await openStream(s.ctx, s.deps);
+  expect(s.events.eventNames()).toEqual([]);
+  expect(s.res.eventNames()).toEqual([]);
+  expect(s.res.write).not.toHaveBeenCalled();
+});
+it('cleans up when the response closes during an asynchronous replay read', async () => {
+  const s = setup();
+  s.deps.readEventsAfter = async () => {
+    Object.assign(s.res, { destroyed: true });
+    return [row(119)];
+  };
+  await openStream(s.ctx, s.deps);
+  expect(s.res.write).not.toHaveBeenCalled();
+  expect(s.events.eventNames()).toEqual([]);
+  expect(s.res.listenerCount('drain')).toBe(0);
+});
