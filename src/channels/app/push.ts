@@ -1,3 +1,5 @@
+import { onEventAppended } from './log.js';
+import { badgeFor, plainPreview } from './conversations.js';
 import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
@@ -192,3 +194,5 @@ onDeviceRevoked((deviceId) => {
     })
     .catch(() => log.warn('TokenCleanupFailed', { deviceId }));
 });
+
+subscribePush({ onEventAppended, badgeFor, plainPreview });

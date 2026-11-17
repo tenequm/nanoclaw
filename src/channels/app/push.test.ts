@@ -1,3 +1,6 @@
+import { appendEvent, appTransaction } from './log.js';
+import * as apns from './apns.js';
+import type { Message } from './contract.js';
 import * as deviceAuth from '../../modules/device-auth/verify.js';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
@@ -18,6 +21,11 @@ let directory: string;
 let event: (event: EventRow) => void;
 let stop: (() => void) | undefined;
 let deps: PushDependencies;
+vi.mock('../../env.js', async (original) => ({
+  ...(await original<typeof import('../../env.js')>()),
+  envValue: (key: string) => process.env[key],
+}));
+vi.mock('./apns.js', () => ({ sendPush: vi.fn(async () => ({ status: 200, clearToken: false })) }));
 const send = vi.fn(async () => ({ status: 200, clearToken: false }));
 beforeEach(async () => {
   directory = mkdtempSync(join(tmpdir(), 'n4-push-'));
@@ -55,6 +63,7 @@ afterEach(async () => {
   stop?.();
   stop = undefined;
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   await closeDb();
   rmSync(directory, { recursive: true, force: true });
 });
@@ -113,7 +122,10 @@ it('clears rejected and revoked tokens', async () => {
   await vi.waitFor(async () =>
     expect(await db.get('SELECT * FROM app_push_tokens WHERE device_id = ?', 'first')).toBeUndefined(),
   );
-  await deviceAuth.revokeDevice('other');
+  await db.run(
+    "INSERT INTO device_auth_devices (id,user_id,name,public_key,app_json,created_at) VALUES ('other','user','Test','test','{}',0)",
+  );
+  expect(await deviceAuth.revokeDevice('other')).toBe('revoked');
   await vi.waitFor(async () =>
     expect(await db.get('SELECT * FROM app_push_tokens WHERE device_id = ?', 'other')).toBeUndefined(),
   );
@@ -238,4 +250,20 @@ it('logs rejected sends and actual token removals without payloads or tokens', a
     expect(warn).toHaveBeenCalledWith('PushRejected', fields);
     expect(warn).toHaveBeenCalledWith('PushTokenCleared', fields);
   }
+});
+
+it('queues committed agent messages through the module-level push subscription', async () => {
+  vi.stubEnv('APP_PUBLIC_BASE', 'https://app.opx.one');
+  await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_stan','Stan','stan','now')");
+  vi.mocked(apns.sendPush).mockClear();
+  const message = { ...fixtures.messages.agentMarkdown, seq: 0, order: 0 } as Message;
+  await appTransaction(() => appendEvent(db, 'user', 'ag_stan', message));
+  await vi.waitFor(() => expect(apns.sendPush).toHaveBeenCalledTimes(2));
+  expect(apns.sendPush).toHaveBeenCalledWith(
+    { token: 'first', environment: 'sandbox' },
+    message.id,
+    expect.objectContaining({
+      hd: expect.objectContaining({ m: message.id, k: 'message', a: { id: 'ag_stan', name: 'Stan' } }),
+    }),
+  );
 });

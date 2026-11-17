@@ -1,3 +1,4 @@
+import type { Message } from './contract.js';
 import { appendEvent, appTransaction } from './log.js';
 import { stopStatus } from './status.js';
 import { initDb, closeDb } from '../../db/connection.js';
@@ -254,7 +255,7 @@ it('streams committed messages through the module-level event log wiring', async
   try {
     await openModuleStream();
     expect(s.output()).toContain('event: synchronized');
-    const message = { ...fixtures.messages.agentMarkdown, id: 'msg_integration', seq: 0, order: 0 };
+    const message = { ...fixtures.messages.agentMarkdown, id: 'msg_integration', seq: 0, order: 0 } as Message;
     await appTransaction(() => appendEvent(db, 'u', 'ag_stan', message));
     await vi.waitFor(() => expect(s.output()).toContain('msg_integration'));
     expect(s.output()).toContain('event: message');
