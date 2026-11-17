@@ -455,7 +455,7 @@ export class SqliteAgentMailbox implements AgentMailbox {
     }
   }
 
-  async runnerContext(_key: MailboxSessionKey): Promise<null> {
+  async runnerContext(_key: MailboxSessionKey): Promise<unknown> {
     return null;
   }
 
