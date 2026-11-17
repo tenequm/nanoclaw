@@ -158,8 +158,12 @@ def secret(key):
     return value
 
 
-def wake_cache():
-    return LOCAL / 'cache' / f"wake-{setting('LOCAL_WAKE_MODEL_SHA256')[:16]}.onnx"
+def wake_model():
+    # A local file is read in place; any other source is an scp source, fetched once into a per-digest cache.
+    source = setting('LOCAL_WAKE_MODEL_SOURCE', '')
+    if source.startswith(('/', '~', '.')):
+        return Path(source).expanduser(), None
+    return LOCAL / 'cache' / f"wake-{setting('LOCAL_WAKE_MODEL_SHA256')[:16]}.onnx", source
 
 
 def sha256(path):
@@ -347,7 +351,10 @@ def up(args):
     require(*needed)
     if not re.fullmatch(r'[0-9a-f]{64}', setting('LOCAL_WAKE_MODEL_SHA256')):
         raise RuntimeError('LOCAL_WAKE_MODEL_SHA256 must be 64 lowercase hex digits')
-    if not wake_cache().exists():
+    model, remote = wake_model()
+    if not model.exists():
+        if remote is None and setting('LOCAL_WAKE_MODEL_SOURCE'):
+            raise RuntimeError(f'LOCAL_WAKE_MODEL_SOURCE file not found: {model}')
         require('LOCAL_WAKE_MODEL_SOURCE')
     owner = setting('LOCAL_OWNER_ID', 'telegram:1' if args.profile == 'fast' or args.proof else '')
     if not re.fullmatch(r'telegram:[1-9][0-9]*', owner):
@@ -394,14 +401,14 @@ def up(args):
             if value is not None:
                 env['VOICE_MODE_' + key] = value
         configured = [k for k in ['LOCAL_JEV_URL', 'LOCAL_JEV_MODEL', *('LOCAL_VOICE_MODE_' + key for key in voice)] if setting(k)]
-        model = wake_cache()
         if not model.exists():
             partial = model.with_name(model.name + '.part')
             partial.parent.mkdir(parents=True, exist_ok=True)
-            run(['scp', setting('LOCAL_WAKE_MODEL_SOURCE'), str(partial)], state, 'wake-model')
+            run(['scp', remote, str(partial)], state, 'wake-model')
             partial.rename(model)
         if sha256(model) != setting('LOCAL_WAKE_MODEL_SHA256'):
-            raise RuntimeError(f'Wake model checksum mismatch; remove {model} to fetch it again')
+            raise RuntimeError(f'Wake model {model} does not match LOCAL_WAKE_MODEL_SHA256'
+                               + ('' if remote is None else '; remove it to fetch it again'))
         target = ROOT / WAKE_MODEL
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(model, target)

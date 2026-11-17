@@ -18,8 +18,10 @@ just local report
 
 Fast selects the stand-in agent with a local in-memory gateway and no model
 credential. Voice still reads the Gemini and Jev credentials from the secret
-store, and the first run copies the wake model from `LOCAL_WAKE_MODEL_SOURCE`
-with scp. Fast is therefore not an offline bootstrap. Omit `--chain` for direct
+store, and the wake model comes from `LOCAL_WAKE_MODEL_SOURCE`: a local file,
+or an scp source fetched on the first run. Either way it must match
+`LOCAL_WAKE_MODEL_SHA256` before it is copied into `data/`. Fast is therefore
+not an offline bootstrap. Omit `--chain` for direct
 access; use `--livekit cloud` for Cloud instead of the local development
 server.
 
@@ -45,28 +47,28 @@ store the `_ENTRY` settings name. Keep per-checkout values (`LOCAL_PORT_BASE`,
 `LOCAL_RUN_DIR`) in the environment. `up` refuses to start and names every
 missing setting its profile needs.
 
-| Setting                            | Needed by   | Example or default                                                                     |
-| ---------------------------------- | ----------- | -------------------------------------------------------------------------------------- |
-| `LOCAL_SECRET_CMD`                 | -           | `gopass show --password` (default); the entry name is appended, one line is expected   |
-| `LOCAL_GEMINI_API_KEY_ENTRY`       | fast, full  | `example/gemini-api-key`                                                               |
-| `LOCAL_JEV_API_KEY_ENTRY`          | fast, full  | `example/jev-api-key`                                                                  |
-| `LOCAL_WAKE_MODEL_SHA256`          | fast, full  | 64 lowercase hex digits of the wake model                                              |
-| `LOCAL_WAKE_MODEL_SOURCE`          | first run   | `models.example.com:wake/model.onnx` (any scp source); cached per digest in `.local/`  |
-| `LOCAL_LIVEKIT_URL_ENTRY`          | Cloud       | `example/livekit-url`                                                                  |
-| `LOCAL_LIVEKIT_API_KEY_ENTRY`      | Cloud       | `example/livekit-api-key`                                                              |
-| `LOCAL_LIVEKIT_API_SECRET_ENTRY`   | Cloud       | `example/livekit-api-secret`                                                           |
-| `LOCAL_OWNER_ID`                   | full        | `telegram:123456789`; synthetic `telegram:1` for fast and proof; saved with run state  |
-| `LOCAL_TEST_AGENT`                 | full, proof | `local-test-agent`, an approved test agent identifier                                  |
-| `LOCAL_ANTHROPIC_SECRET_ID`        | full, proof | `secret-id-example`, the gateway's approved Anthropic secret id                        |
-| `LOCAL_ONECLI_URL`                 | full        | `https://onecli.example.com`                                                           |
-| `LOCAL_TEST_BOT_TOKEN_ENTRY`       | full        | `example/test-bot-token`                                                               |
-| `LOCAL_AGENT_PROVIDER`             | -           | `stand-in` for fast; the installed default for full                                    |
-| `LOCAL_JEV_URL`, `LOCAL_JEV_MODEL` | -           | `https://openrouter.ai/api/v1/systemone`, `jev-1.14`                                   |
-| `LOCAL_VOICE_MODE_WAKE_PHRASE`     | plain calls | `Hey Agent`; unset leaves the worker default                                           |
-| `LOCAL_VOICE_MODE_VOCABULARY`      | -           | `Agent,Assistant`; unset leaves the worker default                                     |
-| `LOCAL_VOICE_MODE_<key>`           | -           | Overrides `WAKE_THRESHOLD`, `WAKE_HOP_MS`, `SILENCE_MS`, call limits and spoken length |
-| `LOCAL_PORT_BASE`                  | -           | 4100; reserves ten consecutive ports                                                   |
-| `LOCAL_RUN_DIR`                    | -           | `.local/runs/<UTC timestamp>`; result JSON and filtered logs                           |
+| Setting                            | Needed by   | Example or default                                                                                                            |
+| ---------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `LOCAL_SECRET_CMD`                 | -           | `gopass show --password` (default); the entry name is appended, one line is expected                                          |
+| `LOCAL_GEMINI_API_KEY_ENTRY`       | fast, full  | `example/gemini-api-key`                                                                                                      |
+| `LOCAL_JEV_API_KEY_ENTRY`          | fast, full  | `example/jev-api-key`                                                                                                         |
+| `LOCAL_WAKE_MODEL_SHA256`          | fast, full  | 64 lowercase hex digits of the wake model                                                                                     |
+| `LOCAL_WAKE_MODEL_SOURCE`          | fast, full  | `~/models/wake.onnx`, read in place; or any scp source such as `models.example.com:wake.onnx`, cached per digest in `.local/` |
+| `LOCAL_LIVEKIT_URL_ENTRY`          | Cloud       | `example/livekit-url`                                                                                                         |
+| `LOCAL_LIVEKIT_API_KEY_ENTRY`      | Cloud       | `example/livekit-api-key`                                                                                                     |
+| `LOCAL_LIVEKIT_API_SECRET_ENTRY`   | Cloud       | `example/livekit-api-secret`                                                                                                  |
+| `LOCAL_OWNER_ID`                   | full        | `telegram:123456789`; synthetic `telegram:1` for fast and proof; saved with run state                                         |
+| `LOCAL_TEST_AGENT`                 | full, proof | `local-test-agent`, an approved test agent identifier                                                                         |
+| `LOCAL_ANTHROPIC_SECRET_ID`        | full, proof | `secret-id-example`, the gateway's approved Anthropic secret id                                                               |
+| `LOCAL_ONECLI_URL`                 | full        | `https://onecli.example.com`                                                                                                  |
+| `LOCAL_TEST_BOT_TOKEN_ENTRY`       | full        | `example/test-bot-token`                                                                                                      |
+| `LOCAL_AGENT_PROVIDER`             | -           | `stand-in` for fast; the installed default for full                                                                           |
+| `LOCAL_JEV_URL`, `LOCAL_JEV_MODEL` | -           | `https://openrouter.ai/api/v1/systemone`, `jev-1.14`                                                                          |
+| `LOCAL_VOICE_MODE_WAKE_PHRASE`     | plain calls | `Hey Agent`; unset leaves the worker default                                                                                  |
+| `LOCAL_VOICE_MODE_VOCABULARY`      | -           | `Agent,Assistant`; unset leaves the worker default                                                                            |
+| `LOCAL_VOICE_MODE_<key>`           | -           | Overrides `WAKE_THRESHOLD`, `WAKE_HOP_MS`, `SILENCE_MS`, call limits and spoken length                                        |
+| `LOCAL_PORT_BASE`                  | -           | 4100; reserves ten consecutive ports                                                                                          |
+| `LOCAL_RUN_DIR`                    | -           | `.local/runs/<UTC timestamp>`; result JSON and filtered logs                                                                  |
 
 Secret values go directly into a mode-0600 local environment file; inherited
 channel credentials are excluded.
