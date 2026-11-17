@@ -4,3 +4,5 @@ import './claude.js';
 // per-session directories) self-register on import.
 //
 // Skills add a new provider by appending one import line below.
+
+import './stand-in.js';
