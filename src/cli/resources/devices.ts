@@ -1,13 +1,58 @@
 import type { DeviceRow } from '../../modules/device-auth/db.js';
-/** N1 registers guarded ncl devices list, pair and revoke commands. */
-export async function listDevices(_userId: string): Promise<DeviceRow[]> {
-  throw new Error('not_implemented');
+import { getDb } from '../../db/connection.js';
+import { mintPairingLink } from '../../modules/device-auth/pairing.js';
+import { revokeDevice } from '../../modules/device-auth/verify.js';
+import { registerResource } from '../crud.js';
+export { revokeDevice };
+export async function listDevices(userId: string): Promise<DeviceRow[]> {
+  return getDb().all<DeviceRow>('SELECT * FROM device_auth_devices WHERE user_id = ? ORDER BY created_at, id', userId);
 }
-/** N1 creates an expiring pairing link for the specified agent subset. */
-export async function pairDevice(_userId: string, _agentIds: string[]): Promise<string> {
-  throw new Error('not_implemented');
+export async function pairDevice(userId: string, agentIds: string[]): Promise<string> {
+  return mintPairingLink(userId, [...new Set(agentIds)]);
 }
-/** N1 revokes a device and closes its live streams. */
-export async function revokeDevice(_deviceId: string): Promise<void> {
-  throw new Error('not_implemented');
-}
+registerResource({
+  name: 'device',
+  plural: 'devices',
+  table: 'device_auth_devices',
+  idColumn: 'id',
+  description: 'Paired app devices.',
+  columns: [],
+  operations: {},
+  customOperations: {
+    list: {
+      access: 'open',
+      hostOnly: true,
+      description: 'List devices for a user.',
+      args: [{ name: 'user', type: 'string', required: true, description: 'User id.' }],
+      handler: (args) => listDevices(args.user as string),
+    },
+    pair: {
+      access: 'open',
+      hostOnly: true,
+      description: 'Mint a one-time pairing link.',
+      args: [
+        { name: 'user', type: 'string', required: true, description: 'User id.' },
+        { name: 'agents', type: 'string', required: true, description: 'Comma-separated agent ids.' },
+      ],
+      handler: (args) => {
+        const ids = (args.agents as string)
+          .split(',')
+          .map((id) => id.trim())
+          .filter(Boolean);
+        if (!ids.length) throw new Error('--agents must name at least one agent');
+        return pairDevice(args.user as string, ids);
+      },
+      formatHuman: (data) => String(data),
+    },
+    revoke: {
+      access: 'open',
+      hostOnly: true,
+      description: 'Revoke a device.',
+      args: [{ name: 'id', type: 'string', required: true, description: 'Device id.' }],
+      handler: async (args) => {
+        await revokeDevice(args.id as string);
+        return { revoked: args.id };
+      },
+    },
+  },
+});
