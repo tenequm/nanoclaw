@@ -1,12 +1,5 @@
 # Hey Dan app channel
 
-Implementation status: this branch has the channel skeleton and formatting instructions.
-Pairing, signed dispatch, chat, streaming, files, push and calls await the implementation
-lanes. The operational behavior below is the protocol 1 contract, not a claim that the
-skeleton can be deployed. Configuration and the route table already exist in
-[src/channels/app/config.ts](../src/channels/app/config.ts) and
-[src/channels/app/routes.ts](../src/channels/app/routes.ts).
-
 The app is its own channel, independent of voice-mode availability. Each user and agent
 have a separate app conversation with a shared-session wiring: the agent's workspace and
 memory are shared with its other channels, but the app's conversation context is separate.
@@ -15,35 +8,41 @@ API. Whole messages arrive after a working status, without token streaming.
 
 ## Configuration
 
-| Key | Purpose | Advertised feature |
-| --- | --- | --- |
-| `APP_PUBLIC_BASE` | Public HTTPS base used in pairing and push host identity. | None by itself. |
-| `NANOCLAW_ENCRYPTION_KEY` | Host-only encryption key; HKDF-SHA256 derives a separate 32-byte upload-ticket key with info `heydan-app-ticket-v1`. | `files` when the key parses. |
-| `APP_LIVEKIT_URL` | Public WebSocket address returned in app call grants. | `calls`, `voice-picker` when set. |
-| `APP_APNS_TEAM_ID` | Apple developer team for push signing. | `push` with at least one complete environment key pair. |
-| `APP_APNS_TOPIC` | App bundle topic; defaults to `com.tenequm.HeyDan`. | None by itself. |
-| `APP_APNS_SANDBOX_KEY_ID`, `APP_APNS_SANDBOX_KEY_PATH` | Sandbox signing key identifier and host-local key file. | Both required for sandbox credentials. |
-| `APP_APNS_PRODUCTION_KEY_ID`, `APP_APNS_PRODUCTION_KEY_PATH` | Production signing key identifier and host-local key file. | Both required for production credentials. |
+| Key                                                          | Purpose                                                                                                              | Advertised feature                                                         |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `APP_PUBLIC_BASE`                                            | Public HTTPS base, such as `https://app.example.com`, used in pairing and push host identity.                        | None by itself.                                                            |
+| `NANOCLAW_ENCRYPTION_KEY`                                    | Host-only encryption key; HKDF-SHA256 derives a separate 32-byte upload-ticket key with info `heydan-app-ticket-v1`. | `files` when the key parses.                                               |
+| `APP_LIVEKIT_URL`                                            | Public WebSocket address returned in app call grants.                                                                | `calls`, `voice-picker` when set.                                          |
+| `APP_APNS_TEAM_ID`                                           | Apple developer team for push signing.                                                                               | `push` with a public base and at least one readable P-256 environment key. |
+| `APP_APNS_TOPIC`                                             | App bundle topic; set this to your application bundle identifier.                                                    | None by itself.                                                            |
+| `APP_APNS_SANDBOX_KEY_ID`, `APP_APNS_SANDBOX_KEY_PATH`       | Sandbox signing key identifier and host-local key file.                                                              | Both required for sandbox credentials.                                     |
+| `APP_APNS_PRODUCTION_KEY_ID`, `APP_APNS_PRODUCTION_KEY_PATH` | Production signing key identifier and host-local key file.                                                           | Both required for production credentials.                                  |
 
 `GET /app/hello` returns protocol 1, minimum protocol 1, voice protocol 6, server time in
 milliseconds, and `configuredFeatures`. These are configuration checks, not service health
 probes: a configured call URL does not prove the voice worker is online, and the push
-feature does not prove a key file is readable. Chat remains usable when voice is offline.
+feature checks the local key but does not probe APNs connectivity. Chat remains usable when voice is offline.
 Keep signing keys on the host, outside agent containers and source control.
 
 ## Pairing and revocation
 
-The pairing contract starts with `/pair` in Telegram, restricted to an owner or admin over
+Pairing starts with `/pair` in Telegram, restricted to an owner or admin over
 the target agent. Paste its single-use link into the app within 10 minutes. The code is in
 the URL fragment and is submitted only in the pairing body. The phone proves possession
 of its P-256 private key; the host stores its public key and the permitted agent set.
 Only paired agents appear, not every agent the user's role could otherwise access.
 
-The administrative interface is `ncl devices list`, `ncl devices pair` and
-`ncl devices revoke`; pairing selects a user and can restrict agents with `--agents`.
-Consult `ncl devices help` for installed flags once the device-auth lane lands. To retire a
-lost phone, list devices, identify the phone and revoke that device. The contract requires
-revocation to close its event stream and reject subsequent signatures and upload tickets.
+The host-only administrative interface is:
+
+```sh
+ncl devices list --user <user-id>
+ncl devices pair --user <user-id> --agents <agent-id>,<another-agent-id>
+ncl devices revoke --id <device-id>
+```
+
+Both user and agent selection are required when pairing from the CLI. To retire a lost
+phone, list devices, identify the phone and revoke its id. Revocation closes its event
+stream and rejects subsequent signatures and upload tickets.
 `DELETE /app/devices/me` removes the requesting phone's access.
 
 Requests use `HeyDan-Sig` authorization: protocol, device id, timestamp, fresh nonce, body
@@ -56,28 +55,28 @@ device revocation. Never paste links or authorization headers into logs or repor
 
 All paths below are under `/app`. `:id` denotes an opaque identifier.
 
-| Method | Path | Purpose | Authorization |
-| --- | --- | --- | --- |
-| GET | `/hello` | Versions and configured features | None |
-| POST | `/pair` | Consume pairing code and proof | Pairing proof |
-| GET | `/conversations` | Conversations, statuses and badge | Signature |
-| GET | `/conversations/:id/messages` | History; `before` or `after`, optional `limit` | Signature |
-| POST | `/conversations/:id/messages` | Store and enqueue a message | Signature |
-| POST | `/conversations/:id/read` | Advance shared read order | Signature |
-| POST | `/questions/:id/answer` | Claim an option | Signature |
-| GET | `/events` | SSE replay and live events after `after` | Signature |
-| POST | `/files` | Mint an upload | Signature |
-| POST | `/files/:id/ticket` | Renew upload ticket | Signature |
-| PUT | `/files/:id` | Upload exact bytes | Ticket |
-| GET | `/files/:id` | Download an authorized attachment | Signature |
-| POST | `/calls` | Start or recover an attempt | Signature |
-| POST | `/calls/:callId/end` | End that call | Signature |
-| POST | `/calls/attempts/:attemptId/cancel` | Cancel a pending start | Signature |
-| GET | `/conversations/:id/voice` | Read saved voice | Signature |
-| PATCH | `/conversations/:id/voice` | Update saved voice | Signature |
-| GET | `/conversations/:id/voices` | Browse voice catalog | Signature |
-| PUT | `/devices/me/push-token` | Register token and environment | Signature |
-| DELETE | `/devices/me` | Revoke this device | Signature |
+| Method | Path                                | Purpose                                        | Authorization |
+| ------ | ----------------------------------- | ---------------------------------------------- | ------------- |
+| GET    | `/hello`                            | Versions and configured features               | None          |
+| POST   | `/pair`                             | Consume pairing code and proof                 | Pairing proof |
+| GET    | `/conversations`                    | Conversations, statuses and badge              | Signature     |
+| GET    | `/conversations/:id/messages`       | History; `before` or `after`, optional `limit` | Signature     |
+| POST   | `/conversations/:id/messages`       | Store and enqueue a message                    | Signature     |
+| POST   | `/conversations/:id/read`           | Advance shared read order                      | Signature     |
+| POST   | `/questions/:id/answer`             | Claim an option                                | Signature     |
+| GET    | `/events`                           | SSE replay and live events after `after`       | Signature     |
+| POST   | `/files`                            | Mint an upload                                 | Signature     |
+| POST   | `/files/:id/ticket`                 | Renew upload ticket                            | Signature     |
+| PUT    | `/files/:id`                        | Upload exact bytes                             | Ticket        |
+| GET    | `/files/:id`                        | Download an authorized attachment              | Signature     |
+| POST   | `/calls`                            | Start or recover an attempt                    | Signature     |
+| POST   | `/calls/:callId/end`                | End that call                                  | Signature     |
+| POST   | `/calls/attempts/:attemptId/cancel` | Cancel a pending start                         | Signature     |
+| GET    | `/conversations/:id/voice`          | Read saved voice                               | Signature     |
+| PATCH  | `/conversations/:id/voice`          | Update saved voice                             | Signature     |
+| GET    | `/conversations/:id/voices`         | Browse voice catalog                           | Signature     |
+| PUT    | `/devices/me/push-token`            | Register token and environment                 | Signature     |
+| DELETE | `/devices/me`                       | Revoke this device                             | Signature     |
 
 Errors have a stable `error` code and display-ready `message`, with extra fields where
 needed. The app must not infer state from prose. The authoritative examples are
@@ -85,22 +84,22 @@ needed. The app must not infer state from prose. The authoritative examples are
 
 ## Network boundary
 
-The planned `/app` gate admits loopback or a trusted proxy peer on `172.18.0.0/16`.
+The `/app` gate admits loopback or a peer explicitly trusted by
+`VOICE_MODE_TRUSTED_PROXY_CIDRS` (comma-separated IPv4 or IPv6 CIDRs). There is no
+hard-coded container subnet. Trust configuration is refreshed at most once a minute.
 It must not inherit `VOICE_MODE_ALLOWED_CLIENT_CIDRS`: public app clients are not restricted
 to tailnet addresses. Rate limiting uses the rightmost untrusted `X-Forwarded-For` hop,
 not the client-controlled `Forwarded` header. A trusted network path never replaces device
-signature verification. In this skeleton the dispatch gate and verifier are not wired yet.
+signature verification.
 
 The external proxy serves only `/app` and its children, with a 26 MiB request-body cap.
-SSE and uploads need suitable proxy timeouts, without compression or redirects. Do not
-expose the skeleton publicly while its authentication handlers remain stubs.
+SSE and uploads need suitable proxy timeouts, without compression or redirects. Configure that boundary in your deployment proxy; the channel does not configure the proxy.
 
 ## Files, questions and sync
 
-The file store pairs metadata in `app_files` with host-local bytes; its disk location and
-cleanup implementation belong to the file lane. Uploads have a 25 MiB limit and a stable
+The file store pairs metadata in `app_files` with bytes under `data/app-files/`. Uploads have a 25 MiB limit and a stable
 `uploadKey` for retry. Only completed, owned files can be claimed by a message. Unclaimed
-files are removed 24 hours after minting. Downloads recheck conversation access.
+files become eligible for cleanup 24 hours after minting; cleanup runs at startup and hourly. Downloads recheck conversation access.
 
 Messages and questions have immutable creation `order` and a changing `seq` version.
 The stream cursor advances only on stream events or `synchronized`, never on REST reads.
@@ -135,4 +134,4 @@ backtick rule for dollar signs because [MarkdownView](https://github.com/Lakr233
 App logs must contain ids, states, error codes and timings only. They must never contain
 message text, pairing codes or links, call links, authorization headers, upload tickets,
 private keys or push tokens. This logging boundary must also hold in proxies and test
-artifacts; implementation and operational verification remain part of the pending lanes.
+artifacts.
