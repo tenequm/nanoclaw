@@ -1,12 +1,14 @@
+import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-vi.mock('../../modules/device-auth/verify.js', () => ({
-  readSignedBody: async (req: IncomingMessage) => {
+vi.mock('../../modules/device-auth/verify.js', async (original) => ({
+  ...(await original<typeof import('../../modules/device-auth/verify.js')>()),
+  readSignedBody: vi.fn(async (req: IncomingMessage) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
     return Buffer.concat(chunks);
-  },
+  }),
 }));
 vi.mock('../../env.js', async (original) => ({
   ...(await original<typeof import('../../env.js')>()),
@@ -34,6 +36,7 @@ import { getVoiceModeLineForAgent, bindVoiceModeLineChat, openVoiceModeLink } fr
 import { createVoiceModeAdapter, type VoiceModeChannelAdapter } from '../voice-mode.js';
 import { createVoiceCatalog } from '../voice-mode-tts-catalog.js';
 import { createCallHandlers, callAvailability, callDeps, startCall } from './calls.js';
+import { readSignedBody } from '../../modules/device-auth/verify.js';
 import { createVoiceHandlers } from './voice.js';
 import type { AppHandler } from './routes.js';
 import type { ConversationRow } from './db.js';
@@ -81,7 +84,14 @@ async function request(
     text = '';
   const headers: Record<string, unknown> = {};
   const req = Object.assign(Readable.from(body === undefined ? [] : [JSON.stringify(body)]), {
-    headers: { authorization: fixtures.signing.vectors[0].authorization },
+    headers: {
+      authorization: fixtures.signing.vectors[0].authorization.replace(
+        /bh=[a-f0-9]+/,
+        `bh=${createHash('sha256')
+          .update(body === undefined ? '' : JSON.stringify(body))
+          .digest('hex')}`,
+      ),
+    },
     method,
     url,
   }) as IncomingMessage;
@@ -309,6 +319,10 @@ it('shapes picker provider and query errors for paired clients', async () => {
 
 it('starts through the module export with the conversation seam faked and jev omitted', async () => {
   const seam = vi.spyOn(callDeps, 'getConversation').mockImplementation(deps.getConversation);
+  const auth = await vi.importActual<typeof import('../../modules/device-auth/verify.js')>(
+    '../../modules/device-auth/verify.js',
+  );
+  vi.mocked(readSignedBody).mockImplementationOnce(auth.readSignedBody);
   try {
     const result = await request(startCall, {
       conversationId: c.id,

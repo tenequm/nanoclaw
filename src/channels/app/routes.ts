@@ -1,4 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { appPeerAllowed } from '../../modules/device-auth/gate.js';
+import { AuthError, verifyRequest } from '../../modules/device-auth/verify.js';
+import { log } from '../../log.js';
 import type { DeviceIdentity } from '../../modules/device-auth/verify.js';
 import { handlePair, handleRevoke } from '../../modules/device-auth/pairing.js';
 import { configuredFeatures, readAppConfig } from './config.js';
@@ -73,20 +76,39 @@ export const routes: readonly AppRoute[] = [
   { method: 'DELETE', path: '/app/devices/me', signed: true, lane: 'N1', handler: handleRevoke },
 ];
 export const dispatchApp: AppHandler = async ({ req, res }) => {
-  const pathname = (req.url || '').split('?', 1)[0];
-  for (const route of routes) {
-    if (req.method !== route.method) continue;
-    const names: string[] = [];
-    const pattern = route.path.replace(/:([A-Za-z]+)/g, (_, name: string) => {
-      names.push(name);
-      return '([^/]+)';
-    });
-    const match = new RegExp(`^${pattern}$`).exec(pathname);
-    if (!match) continue;
-    const params = Object.fromEntries(names.map((name, index) => [name, match[index + 1]]));
-    // N1 installs the proxy gate and verification here before any feature handler reads a body.
-    await route.handler({ req, res, params });
-    return;
+  try {
+    if (!appPeerAllowed(req)) {
+      json(res, 403, { error: 'forbidden', message: 'This peer is not allowed.' });
+      return;
+    }
+    const pathname = (req.url || '').split('?', 1)[0];
+    for (const route of routes) {
+      if (req.method !== route.method) continue;
+      const names: string[] = [];
+      const pattern = route.path.replace(/:([A-Za-z]+)/g, (_, name: string) => {
+        names.push(name);
+        return '([^/]+)';
+      });
+      const match = new RegExp(`^${pattern}$`).exec(pathname);
+      if (!match) continue;
+      const params = Object.fromEntries(names.map((name, index) => [name, match[index + 1]]));
+      const identity = route.signed ? await verifyRequest(req) : undefined;
+      await route.handler({ req, res, params, identity });
+      return;
+    }
+    json(res, 404, { error: 'not_found', message: 'Route not found.' });
+  } catch (error) {
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    if (error instanceof AuthError) {
+      if (error.status === 429 && error.body.retryAfter != null)
+        res.setHeader('Retry-After', String(error.body.retryAfter));
+      json(res, error.status, error.body);
+    } else {
+      log.error('App request failed', { kind: error instanceof Error ? error.name : typeof error });
+      json(res, 500, { error: 'internal', message: 'The request could not be completed.' });
+    }
   }
-  json(res, 404, { error: 'not_found', message: 'Route not found.' });
 };
