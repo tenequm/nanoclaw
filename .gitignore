@@ -69,3 +69,5 @@ forks.md
 !/templates/README.md
 
 .voice-mode-upgrade-backup/
+
+.local/
