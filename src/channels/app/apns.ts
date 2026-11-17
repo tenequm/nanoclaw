@@ -2,6 +2,7 @@ import { createPrivateKey, randomUUID, sign, type KeyObject } from 'node:crypto'
 import { readFileSync } from 'node:fs';
 import { connect, type ClientHttp2Session } from 'node:http2';
 import { setTimeout as delay } from 'node:timers/promises';
+import { log } from '../../log.js';
 import { readAppConfig, type AppConfig } from './config.js';
 import type { PushPayload } from './contract.js';
 
@@ -22,16 +23,17 @@ export function createApnsClient(options: {
   config: AppConfig['apns'];
   origins?: Record<Environment, string>;
   now?: () => number;
+  timeoutMs?: number;
   sleep?: (ms: number) => Promise<unknown>;
   warn?: (environment: Environment, reason: string) => void;
 }) {
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? delay;
-  const warn = options.warn ?? ((environment, reason) => console.warn('APNs', environment, reason));
+  const warn = options.warn ?? ((environment, reason) => log.warn('APNs', { environment, reason }));
   const keys = new Map<Environment, KeyObject | null>();
   const tokens = new Map<Environment, { value: string; at: number }>();
   const sessions = new Map<string, ClientHttp2Session>();
-  function jwt(environment: Environment, refresh = false): string | null {
+  function jwt(environment: Environment, failedToken?: string): string | null {
     const config = options.config[environment];
     if (!keys.has(environment)) {
       let key: KeyObject | null = null;
@@ -50,7 +52,11 @@ export function createApnsClient(options: {
     if (!key || !config) return null;
     const cached = tokens.get(environment);
     const at = now();
-    if (!refresh && cached && at >= cached.at && at - cached.at < 45 * 60_000) return cached.value;
+    if (cached) {
+      if (failedToken && cached.value !== failedToken) return cached.value;
+      if (failedToken && at - cached.at < 20 * 60_000) return cached.value;
+      if (!failedToken && at >= cached.at && at - cached.at < 45 * 60_000) return cached.value;
+    }
     const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
     const input = `${encode({ alg: 'ES256', kid: config.keyId })}.${encode({ iss: options.config.teamId, iat: Math.floor(at / 1000) })}`;
     const value = `${input}.${sign('sha256', Buffer.from(input), { key, dsaEncoding: 'ieee-p1363' }).toString('base64url')}`;
@@ -81,7 +87,8 @@ export function createApnsClient(options: {
     token: string,
   ): Promise<PushResult> {
     return new Promise((resolve) => {
-      const stream = session(destination.environment).request({
+      const connection = session(destination.environment);
+      const stream = connection.request({
         ':method': 'POST',
         ':path': `/3/device/${destination.token}`,
         'apns-push-type': 'alert',
@@ -99,12 +106,18 @@ export function createApnsClient(options: {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
+        if (status === 0 || reason?.startsWith('Transport')) {
+          status = 0;
+          const origin = (options.origins ?? origins)[destination.environment];
+          if (sessions.get(origin) === connection) sessions.delete(origin);
+          connection.destroy();
+        }
         resolve({ status, reason, clearToken: deadTokens.has(reason ?? '') });
       };
       const timer = setTimeout(() => {
         finish('TransportTimeout');
         stream.close();
-      }, 10_000);
+      }, options.timeoutMs ?? 10_000);
       stream.setEncoding('utf8');
       stream.on('response', (headers) => {
         status = Number(headers[':status']);
@@ -124,7 +137,13 @@ export function createApnsClient(options: {
         } catch {
           /* Success has an empty body. */
         }
-        finish(typeof reason === 'string' && /^[A-Za-z]+$/.test(reason) ? reason : undefined);
+        finish(
+          status === 0
+            ? 'TransportClosed'
+            : typeof reason === 'string' && /^[A-Za-z]+$/.test(reason)
+              ? reason
+              : undefined,
+        );
       });
       stream.on('close', () => finish('TransportClosed'));
       stream.end(body);
@@ -138,14 +157,27 @@ export function createApnsClient(options: {
       if (!token) return { status: 0, reason: 'EnvironmentDisabled', clearToken: false };
       let refreshed = false;
       let retries = 0;
+      let transportRetried = false;
       for (;;) {
-        const result = await request(destination, entityId, body, token);
+        const result = await request(destination, entityId, body, token).catch(() => {
+          const origin = (options.origins ?? origins)[destination.environment];
+          sessions.get(origin)?.destroy();
+          sessions.delete(origin);
+          return { status: 0, reason: 'TransportError', clearToken: false };
+        });
+        if (result.status === 0 && !transportRetried) {
+          transportRetried = true;
+          continue;
+        }
         if (result.status === 200 || result.clearToken) return result;
         if (result.reason === 'BadEnvironmentKeyInToken') warn(destination.environment, result.reason);
         if (!refreshed && ['ExpiredProviderToken', 'InvalidProviderToken'].includes(result.reason ?? '')) {
           refreshed = true;
-          token = jwt(destination.environment, true)!;
-          continue;
+          const replacement = jwt(destination.environment, token)!;
+          if (replacement !== token) {
+            token = replacement;
+            continue;
+          }
         }
         if ([429, 500, 503].includes(result.status) && retries < 2) {
           await sleep(250 * 2 ** retries++);

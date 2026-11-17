@@ -85,8 +85,16 @@ it('pushes the fixture to eligible devices with their own badges', async () => {
   emit();
   await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
   const calls = send.mock.calls as unknown as Array<[unknown, string, typeof fixtures.pushPayload.body]>;
-  expect(calls.map((call) => call[2].aps.badge).sort()).toEqual([3, 7]);
-  expect(calls.find((call) => call[2].aps.badge === 3)?.[2]).toEqual(fixtures.pushPayload.body);
+  expect(calls).toEqual(
+    expect.arrayContaining([
+      [{ token: 'first', environment: 'sandbox' }, 'msg_2102', fixtures.pushPayload.body],
+      [
+        { token: 'second', environment: 'sandbox' },
+        'msg_2102',
+        { ...fixtures.pushPayload.body, aps: { ...fixtures.pushPayload.body.aps, badge: 7 } },
+      ],
+    ]),
+  );
 });
 it('ignores updates, reactions, host and voice lines but pushes questions', async () => {
   start();
@@ -95,7 +103,7 @@ it('ignores updates, reactions, host and voice lines but pushes questions', asyn
   emit({ ...message, seq: message.seq + 2, reactions: [{ emoji: 'x', by: 'user' }] });
   for (const role of ['user', 'host']) emit({ ...message, role });
   for (const voice of ['caller', 'spoken']) emit({ ...message, voice });
-  emit({ ...message, kind: 'question', text: 'Choose?', id: 'q_one' }, 'question');
+  emit(fixtures.questions.open, 'question');
   await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
   for (const call of send.mock.calls as unknown as Array<[unknown, string, typeof fixtures.pushPayload.body]>)
     expect(call[2].hd.k).toBe('question');
@@ -200,4 +208,36 @@ it('bounds backlog when sends stall and reports overflow once', async () => {
   expect(warn).toHaveBeenCalledExactlyOnceWith('QueueFull');
   stop?.();
   release();
+});
+
+it('rechecks access after badge lookup before sending', async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const badge = vi.fn(async () => {
+    await held;
+    return { kind: 'badge' as const, rev: 1, unreadTotal: 3 };
+  });
+  deps.badgeFor = badge;
+  const access = vi.fn(deps.reachableAgentIds);
+  deps.reachableAgentIds = access;
+  start();
+  emit();
+  await vi.waitFor(() => expect(badge).toHaveBeenCalledTimes(2));
+  access.mockImplementation(async () => []);
+  release();
+  await vi.waitFor(() => expect(access).toHaveBeenCalledTimes(6));
+  expect(send).not.toHaveBeenCalled();
+});
+it('logs rejected sends and actual token removals without payloads or tokens', async () => {
+  const warn = vi.fn();
+  start({ warn, send: async () => ({ status: 410, reason: 'Unregistered', clearToken: true }) });
+  emit();
+  await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(4));
+  for (const deviceId of ['first', 'second']) {
+    const fields = { deviceId, entityId: 'msg_2102', environment: 'sandbox', status: 410, reason: 'Unregistered' };
+    expect(warn).toHaveBeenCalledWith('PushRejected', fields);
+    expect(warn).toHaveBeenCalledWith('PushTokenCleared', fields);
+  }
 });

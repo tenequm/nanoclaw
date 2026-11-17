@@ -1,3 +1,4 @@
+import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import type { DbDriver } from '../../db/driver.js';
@@ -71,7 +72,7 @@ export function subscribePush(
     config?: typeof readAppConfig;
     send?: typeof sendPush;
     agent?: typeof getAgentGroup;
-    warn?: (reason: string) => void;
+    warn?: (reason: string, fields?: Record<string, unknown>) => void;
     concurrency?: number;
     capacity?: number;
   } = {},
@@ -80,7 +81,7 @@ export function subscribePush(
   const config = options.config ?? readAppConfig;
   const send = options.send ?? sendPush;
   const agent = options.agent ?? getAgentGroup;
-  const warn = options.warn ?? ((reason) => console.warn('App push', reason));
+  const warn = options.warn ?? ((reason, fields) => log.warn(reason, fields));
   const queue: Array<() => Promise<void>> = [];
   const capacity = Math.max(1, options.capacity ?? 256);
   const concurrency = Math.max(1, options.concurrency ?? 4);
@@ -157,15 +158,24 @@ export function subscribePush(
           };
           if (stopped || !(await deps.reachableAgentIds(device.id)).includes(event.agent_group_id)) return;
           const result = await send({ token: row.token, environment: row.environment }, entity.id, payload);
+          const fields = {
+            deviceId: device.id,
+            entityId: entity.id,
+            environment: row.environment,
+            status: result.status,
+            reason: result.reason,
+          };
+          if (result.status !== 200) warn('PushRejected', fields);
           if (result.clearToken) {
             // A delayed rejection must not erase a replacement registration.
-            await db().run(
+            const deleted = await db().run(
               'DELETE FROM app_push_tokens WHERE device_id = ? AND token = ? AND environment = ? AND updated_at = ?',
               device.id,
               row.token,
               row.environment,
               row.updated_at,
             );
+            if (deleted.changes) warn('PushTokenCleared', fields);
           }
         });
       }
