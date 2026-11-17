@@ -20,13 +20,13 @@ beforeEach(() => {
     .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
     .run(
       'current_reply_route',
-      JSON.stringify({ inReplyTo: 'input', channelType: 'test', platformId: 'stan', threadId: 'thread' }),
+      JSON.stringify({ inReplyTo: 'input', channelType: 'test', platformId: 'local-chat', threadId: 'thread' }),
       new Date().toISOString(),
     );
   getInboundDb().exec(`INSERT INTO destinations (name, display_name, type, channel_type, platform_id)
-    VALUES ('local', 'Local', 'channel', 'test', 'stan');
+    VALUES ('local', 'Local', 'channel', 'test', 'local-chat');
     CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY, channel_type TEXT, platform_id TEXT, thread_id TEXT);
-    INSERT INTO session_routing VALUES (1, 'test', 'stan', 'thread');`);
+    INSERT INTO session_routing VALUES (1, 'test', 'local-chat', 'thread');`);
 });
 afterEach(() => {
   closeSessionDb();
@@ -55,7 +55,7 @@ it('requires the runtime opt-in', () => {
 it('replies through send_message with the bound route', async () => {
   await consume(query('reply hello'));
   expect(contents()).toEqual([{ text: 'Stand-in reply.' }]);
-  expect(getUndeliveredMessages()[0]).toMatchObject({ channel_type: 'test', platform_id: 'stan', thread_id: 'thread' });
+  expect(getUndeliveredMessages()[0]).toMatchObject({ channel_type: 'test', platform_id: 'local-chat', thread_id: 'thread' });
 });
 it('sends the markdown fixture', async () => {
   await consume(query('markdown'));
@@ -105,9 +105,9 @@ it('edits the message it just sent', async () => {
   expect(contents()[0]).toEqual({ text: 'Before edit.' });
   expect(contents()[1]).toEqual({ operation: 'edit', messageId: getUndeliveredMessages()[0].id, text: 'After edit.' });
 });
-it('keeps a long tool visible for about twenty seconds', async () => {
+it('keeps a long tool visible for its whole duration', async () => {
   const started = Date.now();
-  const q = query('long');
+  const q = query('long 2');
   q.end();
   let checked = false;
   for await (const event of q.events) {
@@ -117,10 +117,10 @@ it('keeps a long tool visible for about twenty seconds', async () => {
     }
   }
   expect(checked).toBe(true);
-  expect(Date.now() - started).toBeGreaterThanOrEqual(20_000);
+  expect(Date.now() - started).toBeGreaterThanOrEqual(2_000);
   expect(contents()).toEqual([{ text: 'Long tool complete.' }]);
   expect(JSON.stringify(getOutboundDb().prepare('SELECT * FROM container_state').all())).not.toContain('stand_in_wait');
-}, 30_000);
+}, 10_000);
 it('sends three messages in one turn', async () => {
   const events = await consume(query('multi'));
   expect(contents()).toEqual(['First message.', 'Second message.', 'Third message.'].map((text) => ({ text })));
@@ -129,7 +129,7 @@ it('sends three messages in one turn', async () => {
 it('decodes formatted input, ignores quoted commands and echoes exact text', async () => {
   await consume(
     query(
-      '<message id="2" from="local"><quoted_message from="Stan">reply</quoted_message>hi &lt;x&gt; &amp; &quot;y&quot;</message>',
+      '<message id="2" from="local"><quoted_message from="Agent">reply</quoted_message>hi &lt;x&gt; &amp; &quot;y&quot;</message>',
     ),
   );
   expect(contents()).toEqual([{ text: 'hi <x> & "y"' }]);
@@ -137,9 +137,9 @@ it('decodes formatted input, ignores quoted commands and echoes exact text', asy
 it('starts idle and drains pushed turns on end', async () => {
   const q = query('');
   q.push('echo one');
-  q.push('echo one');
+  q.push('echo two');
   await consume(q);
-  expect(contents()).toEqual([{ text: 'echo one' }, { text: 'echo one' }]);
+  expect(contents()).toEqual([{ text: 'echo one' }, { text: 'echo two' }]);
 });
 it('aborts an in-progress question without a reply', async () => {
   const q = query('question');

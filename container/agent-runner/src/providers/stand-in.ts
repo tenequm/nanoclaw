@@ -18,12 +18,17 @@ function decode(text: string): string {
     .replace(/&amp;/g, '&');
 }
 
+// `long 2` or `question 5`: an optional duration after the command word.
+function seconds(text: string): number | undefined {
+  return Number(/^\w+ (\d+)\b/.exec(text)?.[1]) || undefined;
+}
+
 export class StandInProvider implements AgentProvider {
   readonly startsIdle = true;
 
   constructor() {
     if (process.env.NANOCLAW_LOCAL_STAND_IN !== '1') {
-      throw new Error('stand-in requires NANOCLAW_LOCAL_STAND_IN=1 in the local host process');
+      throw new Error('stand-in requires NANOCLAW_LOCAL_STAND_IN=1 from the local host');
     }
   }
 
@@ -41,7 +46,7 @@ export class StandInProvider implements AgentProvider {
 
     async function invoke(tool: McpToolDefinition, args: Record<string, unknown>): Promise<string> {
       signal.throwIfAborted();
-      setContainerToolInFlight(tool.tool.name, tool === askUserQuestion ? 300_000 : null);
+      setContainerToolInFlight(tool.tool.name, null);
       try {
         const result = await tool.handler(args, { signal });
         if (result.isError) throw new Error(`stand-in tool failed: ${tool.tool.name}`);
@@ -82,6 +87,7 @@ export class StandInProvider implements AgentProvider {
             title: 'Stand-in question',
             question: 'Choose an option.',
             options: ['Alpha', 'Beta', 'Gamma'],
+            timeout: seconds(message.text),
           });
           await send(`Selected: ${answer}`);
         } else if (message.text.startsWith('file')) {
@@ -109,10 +115,11 @@ export class StandInProvider implements AgentProvider {
           yield { type: 'tool_call', name: 'edit_message' };
           await invoke(editMessage, { messageId: Number(id), text: 'After edit.' });
         } else if (message.text.startsWith('long')) {
+          const duration = seconds(message.text) ?? 20;
           yield { type: 'tool_call', name: 'stand_in_wait' };
-          setContainerToolInFlight('stand_in_wait', 20_000);
+          setContainerToolInFlight('stand_in_wait', null);
           try {
-            for (let second = 0; second < 20; second++) {
+            for (let second = 0; second < duration; second++) {
               await sleep(1000, undefined, { signal });
               yield { type: 'activity' };
             }
@@ -126,6 +133,7 @@ export class StandInProvider implements AgentProvider {
           await send(message.text);
         }
       }
+      signal.throwIfAborted();
       yield { type: 'result', text: null, stopReason: 'end_turn' };
     }
 
