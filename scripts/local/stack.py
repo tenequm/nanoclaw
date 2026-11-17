@@ -361,7 +361,9 @@ def status():
     print('CA: ' + state.get('ca', 'chain disabled'))
     print('Voice: ' + state.get('url', 'http://127.0.0.1:' + str(state['base'])) + '/voice')
     for p in state['processes']:
-        print(p['name'] + ': ' + ('running' if birth(p['pid']) == p['birth'] else 'stopped'))
+        offsets = {'host': 0, 'livekit': 2, 'gateway': 5, 'caddy': 6, 'delay': 7, 'traefik': 8, 'worker': 9}
+        port = state['base'] + offsets[p['name']]
+        print(p['name'] + ': ' + ('running' if birth(p['pid']) == p['birth'] else 'stopped') + ' on 127.0.0.1:' + str(port))
 
 
 def report():
