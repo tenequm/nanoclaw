@@ -8,6 +8,7 @@ import { log } from '../../log.js';
 import './db.js';
 
 export interface AppHooks {
+  // Runs inside the central transaction: use only the supplied database, never network IO.
   claimFiles(
     db: DbDriver,
     c: { userId: string; conversationId: string; messageId: string; fileIds: string[] },
@@ -40,7 +41,7 @@ export const appHooks: AppHooks = {
     })),
   callAvailability: async () => ({
     canCall: false,
-    callRefusal: { error: 'voice_offline', message: 'Voice is unavailable.' },
+    callRefusal: { error: 'voice_offline', message: 'Calls are offline right now.' },
   }),
 };
 export function setAppHooks(hooks: Partial<AppHooks>): void {

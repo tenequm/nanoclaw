@@ -91,7 +91,9 @@ export async function openQuestionConversationIds(): Promise<string[]> {
 }
 export async function recoverAnswers(): Promise<void> {
   for (const row of await getDb().all<QuestionRow>("SELECT * FROM app_questions WHERE handoff_state='pending'"))
-    await handoff(row);
+    if (!(await getDb().get('SELECT 1 FROM pending_questions WHERE question_id=?', row.question_id)))
+      await getDb().run("UPDATE app_questions SET handoff_state='done' WHERE id=?", row.id);
+    else await handoff(row);
   await expireQuestions();
 }
 export const answerQuestion: AppHandler = async (ctx) => {
@@ -145,8 +147,8 @@ export const answerQuestion: AppHandler = async (ctx) => {
   });
 };
 let timer: ReturnType<typeof setInterval> | undefined;
-onHostStart(async () => {
-  await recoverAnswers();
+onHostStart(() => {
+  void recoverAnswers().catch(() => log.warn('App question recovery failed'));
   timer = setInterval(() => {
     void expireQuestions().catch(() => log.warn('App question expiry failed'));
   }, 1000);

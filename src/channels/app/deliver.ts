@@ -48,6 +48,7 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
     messageId: id,
     files: message.files ?? [],
   });
+  const availability = await appHooks.callAvailability(c.user_id, c.agent_group_id);
   return appTransaction(async () => {
     if (source) {
       const applied = await db.get<{ entity_id: string }>(
@@ -64,7 +65,7 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
         content.messageId,
         c.id,
       );
-      if (!row) return undefined;
+      if (!row || (content.operation === 'edit' && row.role === 'user')) return undefined;
       const entity = messageEntity(row);
       if (content.operation === 'edit') {
         entity.text = String(content.text ?? '');
@@ -75,7 +76,7 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
       )
         entity.reactions.push({ emoji: content.emoji, by: 'agent' });
       await saveMessage(entity, c.user_id, c.agent_group_id);
-      if (content.operation === 'edit') await itemChanged(current, entity, false);
+      if (content.operation === 'edit') await itemChanged(current, entity, false, availability);
       entityId = entity.id;
     } else {
       const hostCard = [source, content.questionId].some((v) => typeof v === 'string' && /^(hcmd-|appr-)/.test(v));
@@ -115,16 +116,17 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
           entity.createdAt,
           entity.expiresAt,
         );
-        await itemChanged(current, entity, true);
+        await itemChanged(current, entity, true, availability);
         entityId = entity.id;
       } else {
-        const voice = content.voice === 'caller' || content.voice === 'spoken' ? content.voice : null;
+        const hostOrigin = !source || source.startsWith('hcmd-');
+        const voice = (content.voice === 'caller' && hostOrigin) || content.voice === 'spoken' ? content.voice : null;
         const role =
           voice === 'caller'
             ? 'user'
             : voice === 'spoken'
               ? 'agent'
-              : content.host === true || hostCard || !source
+              : (content.host === true && hostOrigin) || hostCard || !source
                 ? 'host'
                 : 'agent';
         const card = content.card as { description?: string; title?: string } | undefined;
@@ -163,7 +165,7 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
           editedAt: null,
         };
         await saveMessage(entity, c.user_id, c.agent_group_id, source);
-        await itemChanged(current, entity, true);
+        await itemChanged(current, entity, true, availability);
         entityId = entity.id;
       }
     }

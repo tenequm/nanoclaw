@@ -47,7 +47,7 @@ class BadFileClaim extends Error {
   }
 }
 export const sendMessage: AppHandler = async (ctx) => {
-  const c = await accessibleConversation(ctx);
+  const c = await accessibleConversation(ctx, ctx.params.id, false);
   if (!c) return;
   const body = await requestBody(ctx);
   if (!body) return;
@@ -74,6 +74,7 @@ export const sendMessage: AppHandler = async (ctx) => {
     return;
   }
   const hash = createHash('sha256').update(JSON.stringify({ text, fileIds })).digest('hex');
+  const availability = await appHooks.callAvailability(c.user_id, c.agent_group_id);
   const result = await appTransaction(async () => {
     const db = getDb();
     const existing = await db.get<MessageRow>(
@@ -111,7 +112,7 @@ export const sendMessage: AppHandler = async (ctx) => {
       editedAt: null,
     };
     await saveMessage(message, c.user_id, c.agent_group_id, null, hash);
-    await itemChanged((await getConversation(c.id))!, message, true);
+    await itemChanged((await getConversation(c.id))!, message, true, availability);
     await db.run(
       "INSERT INTO app_routing_jobs (message_id,state,created_at) VALUES (?,'pending',?)",
       id,
@@ -176,7 +177,7 @@ export async function drainRoutingJobs(route = routeInbound): Promise<void> {
   if (draining) return draining;
   draining = (async () => {
     for (const job of await getDb().all<RoutingJobRow>(
-      'SELECT * FROM app_routing_jobs WHERE started_at IS NULL ORDER BY created_at',
+      'SELECT * FROM app_routing_jobs WHERE started_at IS NULL ORDER BY created_at, rowid',
     )) {
       const claimed = await getDb().run(
         "UPDATE app_routing_jobs SET started_at=?,state='started',attempts=attempts+1 WHERE message_id=? AND started_at IS NULL",
@@ -215,6 +216,7 @@ export async function drainRoutingJobs(route = routeInbound): Promise<void> {
           },
           onStored: () => {
             stored = setDelivery(row.id, 'reached');
+            void stored.catch(() => undefined);
           },
         });
         await stored;
@@ -224,7 +226,7 @@ export async function drainRoutingJobs(route = routeInbound): Promise<void> {
           row.id,
         );
       } catch {
-        await stored;
+        await stored?.catch(() => undefined);
         await setDelivery(row.id, 'failed');
         await getDb().run(
           "UPDATE app_routing_jobs SET state='failed',finished_at=? WHERE message_id=?",
@@ -241,13 +243,17 @@ export async function drainRoutingJobs(route = routeInbound): Promise<void> {
   }
 }
 onHostStart(async () => {
-  await recoverRoutingJobs();
+  try {
+    await recoverRoutingJobs();
+  } catch {
+    log.warn('App routing recovery failed');
+  }
   started = true;
   timer = setInterval(() => {
     void drainRoutingJobs().catch(() => log.warn('App routing worker failed'));
   }, 1000);
   timer.unref();
-  await drainRoutingJobs();
+  void drainRoutingJobs().catch(() => log.warn('App routing worker failed'));
 });
 onHostShutdown(async () => {
   started = false;

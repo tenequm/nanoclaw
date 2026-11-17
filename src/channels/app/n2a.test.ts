@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { getDb, initSqliteTestDb, closeDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
+import { getHostStartCallbacks, stopHostModules } from '../../host-lifecycle.js';
 import { deliver } from './deliver.js';
 import {
   ensureConversation,
@@ -14,6 +15,7 @@ import {
   markRead,
   listConversations,
   badgeFor,
+  plainPreview,
 } from './conversations.js';
 import { appTransaction, appendEvent, lastEventSeq, onEventAppended, readEventsAfter, setAppHooks } from './log.js';
 import { sendMessage, drainRoutingJobs, recoverRoutingJobs, saveMessage, setDelivery } from './send.js';
@@ -39,6 +41,15 @@ beforeEach(async () => {
   await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_stan','Stan','stan','2026-11-17')");
   conversationId = (await ensureConversation('telegram:owner', 'ag_stan')).id;
   setAppHooks({
+    statuses: async (ids) =>
+      ids.map((conversationId) => ({
+        kind: 'status',
+        conversationId,
+        rev: 0,
+        state: 'idle',
+        label: null,
+        at: Date.now(),
+      })),
     claimFiles: async (_db, c) => (c.fileIds.length ? { ok: false, fileId: c.fileIds[0] } : { ok: true, files: [] }),
     callAvailability: async () => ({ canCall: true, callRefusal: null }),
   });
@@ -169,13 +180,15 @@ it('refuses commands without storing and distinguishes ownership from access', a
     expect((await request(sendMessage, { clientId: randomUUID(), text, fileIds: [] })).body.error).toBe(error);
   expect((await getDb().all('SELECT * FROM app_messages')).length).toBe(0);
   expect((await request(history, {}, conversationId, 'telegram:other')).status).toBe(404);
-  expect((await request(history, {}, conversationId, 'telegram:owner', [])).status).toBe(403);
+  expect((await request(history, {}, conversationId, 'telegram:owner', [])).status).toBe(404);
+  expect((await request(markRead, { order: 1 }, conversationId, 'telegram:owner', [])).status).toBe(404);
+  expect((await request(sendMessage, {}, conversationId, 'telegram:owner', [])).status).toBe(403);
 });
 it.each(['host', 'voiceCaller', 'voiceSpoken'] as const)(
   'delivers fixture %s with stable source identity',
   async (key) => {
     const expected = fixtures.messages[key];
-    const sourceId = key === 'host' ? 'hcmd-reply-1' : key;
+    const sourceId = key === 'voiceSpoken' ? key : 'hcmd-' + key;
     const content = {
       text: (key === 'voiceCaller' ? '🎙️ ' : key === 'voiceSpoken' ? '🔊 ' : '') + expected.text,
       voice: expected.voice,
@@ -392,4 +405,208 @@ it('returns fixture question states, response and conflict shapes', async () => 
   vi.spyOn(Date, 'now').mockReturnValue(fixtures.questions.expired.expiresAt);
   await expireQuestions();
   expect((await question(expiring)).state).toBe(fixtures.questions.expired.state);
+});
+
+it('bounds preview work before regex matching and preserves code points', () => {
+  expect(plainPreview('*'.repeat(1999) + '😀')).toBe('');
+  const start = performance.now();
+  expect(plainPreview('['.repeat(32768))).toBe('['.repeat(160));
+  expect(performance.now() - start).toBeLessThan(500);
+  expect(plainPreview('a'.repeat(159) + '😀 tail')).toBe('a'.repeat(159) + '😀');
+});
+it('refuses edits to user messages without appending events', async () => {
+  const sent = await request(sendMessage, { clientId: randomUUID(), text: 'original', fileIds: [] });
+  const seq = await lastEventSeq();
+  expect(
+    await deliver(conversationId, null, {
+      kind: 'chat',
+      sourceId: 'edit-user',
+      content: { operation: 'edit', messageId: sent.body.message.id, text: 'changed' },
+    }),
+  ).toBeUndefined();
+  expect(await lastEventSeq()).toBe(seq);
+  expect((await message(sent.body.message.id)).text).toBe('original');
+});
+it.each([{ voice: 'caller' }, { host: true }])('ignores container role spoofing %j', async (marker) => {
+  const id = (await deliver(conversationId, null, {
+    kind: 'chat',
+    sourceId: 'container',
+    content: { text: 'spoof', ...marker },
+  }))!;
+  expect(await message(id)).toMatchObject({ role: 'agent', voice: null });
+});
+it('authorizes a real question before handing it off', async () => {
+  const id = await ask();
+  expect((await request(answerQuestion, { value: 'staging' }, id, 'telegram:other')).status).toBe(404);
+  expect((await request(answerQuestion, { value: 'staging' }, id, 'telegram:owner', [])).status).toBe(404);
+  expect(mocks.response).not.toHaveBeenCalled();
+  expect((await question(id)).state).toBe('open');
+});
+it('keeps a recovered answer done when the runner already consumed it', async () => {
+  const id = await ask();
+  await request(answerQuestion, { value: 'staging' }, id);
+  await getDb().run("UPDATE app_questions SET handoff_state='pending' WHERE id=?", id);
+  await getDb().run('DELETE FROM pending_questions');
+  mocks.response.mockReset().mockResolvedValue(false);
+  await recoverAnswers();
+  expect(mocks.response).not.toHaveBeenCalled();
+  expect((await question(id)).state).toBe('answered');
+  expect(await getDb().get('SELECT handoff_state FROM app_questions WHERE id=?', id)).toEqual({
+    handoff_state: 'done',
+  });
+});
+it('never regresses reached delivery and emits scoped conversation events after messages', async () => {
+  const cursor = await lastEventSeq();
+  const sent = await request(sendMessage, { clientId: randomUUID(), text: 'hello', fileIds: [] });
+  const events = await readEventsAfter(cursor, 10);
+  expect(events.map((e) => e.kind)).toEqual(['message', 'conversation']);
+  for (const event of events)
+    expect(event).toMatchObject({
+      user_id: 'telegram:owner',
+      agent_group_id: 'ag_stan',
+      conversation_id: conversationId,
+    });
+  await setDelivery(sent.body.message.id, 'reached');
+  const seq = await lastEventSeq();
+  await setDelivery(sent.body.message.id, 'routed');
+  await setDelivery(sent.body.message.id, 'failed');
+  expect(await lastEventSeq()).toBe(seq);
+});
+it('captures the first list cursor before creating conversations', async () => {
+  const cursor = await lastEventSeq();
+  const list = await request(listConversations, {}, '', 'telegram:new');
+  expect(list.body.seq).toBe(cursor);
+  expect(list.body.conversations[0].seq).toBeGreaterThan(cursor);
+});
+it('pages mixed questions and messages before an order', async () => {
+  const q = await ask();
+  const id = (await deliver(conversationId, null, { kind: 'chat', sourceId: 'last', content: { text: 'last' } }))!;
+  const page = await request(
+    history,
+    {},
+    conversationId,
+    'telegram:owner',
+    ['ag_stan'],
+    '?before=' + (await message(id)).order,
+  );
+  expect(page.body).toEqual({ items: [await question(q)], hasMoreBefore: false, hasMoreAfter: true });
+});
+it('finishes a job when its reached write fails and continues the batch', async () => {
+  const a = await request(sendMessage, { clientId: randomUUID(), text: 'a', fileIds: [] });
+  await request(sendMessage, { clientId: randomUUID(), text: 'b', fileIds: [] });
+  const db = getDb();
+  const run = db.run.bind(db);
+  let failed = false;
+  vi.spyOn(db, 'run').mockImplementation(async (sql, ...args) => {
+    if (!failed && sql.startsWith('INSERT INTO app_messages') && args[14] === 'reached') {
+      failed = true;
+      throw new Error('injected write failure');
+    }
+    return run(sql, ...args);
+  });
+  const route = vi.fn(async (event) => {
+    event.onStored({});
+    await new Promise((resolve) => setImmediate(resolve));
+  });
+  await drainRoutingJobs(route);
+  expect(failed).toBe(true);
+  expect(route).toHaveBeenCalledTimes(2);
+  expect(await db.get('SELECT state FROM app_routing_jobs WHERE message_id=?', a.body.message.id)).toEqual({
+    state: 'failed',
+  });
+});
+it('calls availability outside central transactions', async () => {
+  let depth = 0;
+  const db = getDb(),
+    transaction = db.transaction.bind(db);
+  vi.spyOn(db, 'transaction').mockImplementation((fn) =>
+    transaction(async () => {
+      depth++;
+      try {
+        return await fn();
+      } finally {
+        depth--;
+      }
+    }),
+  );
+  setAppHooks({
+    callAvailability: async () => {
+      expect(depth).toBe(0);
+      return { canCall: true, callRefusal: null };
+    },
+  });
+  await ensureConversation('telegram:new', 'ag_stan');
+  await request(sendMessage, { clientId: randomUUID(), text: 'hello', fileIds: [] });
+  await deliver(conversationId, null, { kind: 'chat', sourceId: 'reply', content: { text: 'reply' } });
+  await request(markRead, { order: 9999 });
+});
+
+it('matches send, list, history and read response fixture shapes', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(fixtures.sendResponse.message.createdAt);
+  const sent = await request(sendMessage, {
+    clientId: fixtures.sendResponse.message.clientId,
+    text: fixtures.sendResponse.message.text,
+    fileIds: [],
+  });
+  expect(sent.body).toEqual({
+    message: {
+      ...fixtures.sendResponse.message,
+      id: sent.body.message.id,
+      conversationId,
+      order: sent.body.message.order,
+      seq: sent.body.message.seq,
+    },
+  });
+  const reply = fixtures.messages.editSequence[0];
+  const id = (await deliver(conversationId, null, {
+    kind: 'chat',
+    sourceId: 'fixture',
+    content: { text: reply.text },
+  }))!;
+  const m = await message(id);
+  const c = (await getConversation(conversationId))!;
+  const status = { ...fixtures.conversations.statuses[0], conversationId };
+  setAppHooks({ statuses: async () => [status] });
+  const expectedConversation = {
+    ...fixtures.conversations.conversations[0],
+    id: conversationId,
+    seq: c.seq,
+    lastMessage: { id, role: 'agent', preview: reply.text, at: m.createdAt },
+    unread: 1,
+    readOrder: 0,
+    createdAt: c.created_at,
+  };
+  expect((await request(listConversations)).body).toEqual({
+    ...fixtures.conversations,
+    conversations: [expectedConversation],
+    statuses: [status],
+    badge: { kind: 'badge', rev: 1, unreadTotal: 1 },
+    seq: await lastEventSeq(),
+  });
+  expect((await request(history)).body).toEqual({
+    ...fixtures.historyPage,
+    items: [sent.body.message, m],
+    hasMoreBefore: false,
+    hasMoreAfter: false,
+  });
+  const read = await request(markRead, { order: m.order });
+  expect(read.body).toEqual({
+    ...fixtures.readResponse,
+    conversation: { ...expectedConversation, seq: read.body.conversation.seq, unread: 0, readOrder: m.order },
+    badge: { kind: 'badge', rev: 2, unreadTotal: 0 },
+  });
+});
+it('isolates startup recovery failures from other host callbacks', async () => {
+  const db = getDb(),
+    all = db.all.bind(db);
+  vi.spyOn(db, 'all').mockImplementation(async (sql, ...args) => {
+    if (sql.includes('app_routing_jobs') || sql.includes("handoff_state='pending'")) throw new Error('recovery failed');
+    return all(sql, ...args);
+  });
+  let nextChannelStarted = false;
+  for (const start of getHostStartCallbacks()) await start({ db } as Parameters<typeof start>[0]);
+  nextChannelStarted = true;
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(nextChannelStarted).toBe(true);
+  await stopHostModules();
 });

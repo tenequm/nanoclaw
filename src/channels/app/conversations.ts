@@ -20,6 +20,7 @@ export async function conversationsFor(userId: string, agentIds: string[]): Prom
   ).filter((c) => agentIds.includes(c.agent_group_id));
 }
 export async function ensureConversation(userId: string, agentGroupId: string): Promise<ConversationRow> {
+  const availability = await appHooks.callAvailability(userId, agentGroupId);
   return appTransaction(async () => {
     const db = getDb();
     const existing = await db.get<ConversationRow>(
@@ -64,12 +65,15 @@ export async function ensureConversation(userId: string, agentGroupId: string): 
       now,
     );
     const c = (await getConversation(id))!;
-    await conversationEvent(c);
+    await conversationEvent(c, availability);
     return (await getConversation(id))!;
   });
 }
 export function plainPreview(text: string): string {
-  return text
+  let input = text.slice(0, 2000);
+  const last = input.charCodeAt(input.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) input = input.slice(0, -1);
+  const plain = input
     .replace(/```[^\n]*\n?/g, '')
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
@@ -77,10 +81,11 @@ export function plainPreview(text: string): string {
     .replace(/(^|\n)\s{0,3}(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+\.\s+)/g, '$1')
     .replace(/[*_~`]/g, '')
     .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 160);
+    .trim();
+  return Array.from(plain).slice(0, 160).join('');
 }
-export async function conversationEntity(c: ConversationRow): Promise<Conversation> {
+type CallAvailability = Pick<Conversation, 'canCall' | 'callRefusal'>;
+export async function conversationEntity(c: ConversationRow, availability?: CallAvailability): Promise<Conversation> {
   const db = getDb();
   const readOrder =
     (
@@ -105,12 +110,12 @@ export async function conversationEntity(c: ConversationRow): Promise<Conversati
     lastMessage: c.last_message_json ? JSON.parse(c.last_message_json) : null,
     unread,
     readOrder,
-    ...(await appHooks.callAvailability(c.user_id, c.agent_group_id)),
+    ...(availability ?? (await appHooks.callAvailability(c.user_id, c.agent_group_id))),
     createdAt: c.created_at,
   };
 }
-export async function conversationEvent(c: ConversationRow): Promise<Conversation> {
-  const entity = await conversationEntity(c);
+export async function conversationEvent(c: ConversationRow, availability: CallAvailability): Promise<Conversation> {
+  const entity = await conversationEntity(c, availability);
   await appendEvent(getDb(), c.user_id, c.agent_group_id, entity);
   await getDb().run('UPDATE app_conversations SET seq = ? WHERE id = ?', entity.seq, c.id);
   return entity;
@@ -141,7 +146,12 @@ export async function badgeFor(userId: string, agentIds: string[]): Promise<Badg
     unreadTotal,
   };
 }
-export async function itemChanged(c: ConversationRow, item: Message | Question, created: boolean): Promise<void> {
+export async function itemChanged(
+  c: ConversationRow,
+  item: Message | Question,
+  created: boolean,
+  availability: CallAvailability,
+): Promise<void> {
   const role = 'role' in item ? item.role : 'agent';
   const previous = c.last_message_json ? JSON.parse(c.last_message_json) : null;
   if (created || previous?.id === item.id) {
@@ -152,7 +162,7 @@ export async function itemChanged(c: ConversationRow, item: Message | Question, 
       at: ('editedAt' in item ? item.editedAt : null) ?? item.createdAt,
     });
     await getDb().run('UPDATE app_conversations SET last_message_json = ? WHERE id = ?', c.last_message_json, c.id);
-    await conversationEvent(c);
+    await conversationEvent(c, availability);
   }
   if (created && role === 'agent') await bumpBadge(c.user_id);
 }
@@ -195,7 +205,7 @@ export function questionEntity(r: QuestionRow): Question {
 export async function accessibleConversation(
   ctx: AppRequest,
   id = ctx.params.id,
-  hideForbidden = false,
+  hideForbidden = true,
 ): Promise<ConversationRow | undefined> {
   const c = await getConversation(id);
   if (!ctx.identity || !c || c.user_id !== ctx.identity.userId) {
@@ -298,6 +308,7 @@ export const markRead: AppHandler = async (ctx) => {
     json(ctx.res, 400, { error: 'bad_request', message: 'The request is malformed.' });
     return;
   }
+  const availability = await appHooks.callAvailability(c.user_id, c.agent_group_id);
   const conversation = await appTransaction(async () => {
     const db = getDb();
     const newest =
@@ -314,11 +325,11 @@ export const markRead: AppHandler = async (ctx) => {
       c.id,
       Math.min(order, newest),
     );
-    if (result.changes && (await conversationEntity(c)).readOrder > 0) {
+    if (result.changes && (await conversationEntity(c, availability)).readOrder > 0) {
       await bumpBadge(c.user_id);
-      return conversationEvent((await getConversation(c.id))!);
+      return conversationEvent((await getConversation(c.id))!, availability);
     }
-    return conversationEntity((await getConversation(c.id))!);
+    return conversationEntity((await getConversation(c.id))!, availability);
   });
   json(ctx.res, 200, { conversation, badge: await badgeFor(c.user_id, ctx.identity!.agentIds) });
 };
