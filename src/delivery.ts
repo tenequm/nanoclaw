@@ -174,6 +174,7 @@ export interface ChannelDeliveryAdapter {
      *  Host-internal only — containers never see instance. */
     instance?: string,
     inReplyTo?: string,
+    sourceId?: string,
   ): Promise<string | undefined>;
   clearTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
   addReaction?(
@@ -768,6 +769,7 @@ async function deliverMessage(
     files,
     deliverInstance,
     msg.inReplyTo ? platformMessageId(msg.inReplyTo, session.agent_group_id) : undefined,
+    msg.id,
   );
   log.info('Message delivered', {
     id: msg.id,
