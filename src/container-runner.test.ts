@@ -33,14 +33,22 @@ vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
+const topology = vi.hoisted(() => ({ lockdown: false }));
+
 // The limits as an install without them sets them, not as this host's .env or environment does.
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
+  get EGRESS_LOCKDOWN() {
+    return topology.lockdown;
+  },
   CONTAINER_CPU_LIMIT: '',
   CONTAINER_MEMORY_LIMIT: '',
 }));
 
-afterEach(() => resetGatewayProvider());
+afterEach(() => {
+  resetGatewayProvider();
+  topology.lockdown = false;
+});
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -112,6 +120,8 @@ const mounts: VolumeMount[] = [
 
 function compose(
   overrides: {
+    mailboxUrl?: string;
+    mailboxEnvironment?: Record<string, string>;
     gateway?: Record<string, unknown>;
     contribution?: Record<string, unknown>;
     containerConfig?: ContainerConfig;
@@ -123,7 +133,8 @@ function compose(
     containerName: 'nanoclaw-v2-agent-one-1700000000000',
     mounts,
     containerConfig: overrides.containerConfig ?? containerConfig,
-    mailboxEnvironment: { NANOCLAW_MAILBOX_BACKEND: 'sqlite' },
+    mailboxEnvironment: overrides.mailboxEnvironment ?? { NANOCLAW_MAILBOX_BACKEND: 'sqlite' },
+    mailboxUrl: overrides.mailboxUrl,
     contribution: (overrides.contribution ?? {}) as never,
     gateway: {
       networkAccess: { endpoint: 'localhost', target: { kind: 'host' } },
@@ -146,6 +157,59 @@ function composeWithFolder(folder: string) {
 }
 
 describe('composeSessionSpec', () => {
+  it.each(['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'])(
+    'merges and deduplicates bypass lists with %s from each env source',
+    (key) => {
+      for (const source of ['mailboxEnvironment', 'contribution', 'gateway']) {
+        const proxy = { [key]: 'http://remote-gateway:15001' };
+        const spec = compose({
+          mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
+          mailboxEnvironment: { NO_PROXY: 'localhost, shared', ...(source === 'mailboxEnvironment' && proxy) },
+          contribution: { env: { no_proxy: 'shared, provider', ...(source === 'contribution' && proxy) } },
+          gateway: {
+            env: {
+              NO_PROXY: 'gateway',
+              no_proxy: 'shared, internal,',
+              ...(source === 'gateway' && proxy),
+            },
+          },
+        });
+        const env = spec.containers[0].contributedEnv!;
+        expect(env.NO_PROXY).toBe('localhost,shared,gateway,internal,host.docker.internal:3010');
+        expect(env.no_proxy).toBe(env.NO_PROXY);
+        expect({ ...spec.containers[0].env, ...env }[key]).toBe(proxy[key]);
+      }
+    },
+  );
+
+  it.each([
+    { lockdown: false, endpoint: 'host.docker.internal', kind: 'runtime', bypass: true },
+    { lockdown: true, endpoint: 'host.docker.internal', kind: 'runtime', bypass: false },
+    { lockdown: true, endpoint: 'remote-gateway', kind: 'runtime', bypass: false },
+    { lockdown: true, endpoint: 'localhost', kind: 'session-container', bypass: true },
+  ])('keeps the mailbox proxied on the lockdown network only: %j', ({ lockdown, endpoint, kind, bypass }) => {
+    topology.lockdown = lockdown;
+    const gatewayEnv = { HTTPS_PROXY: 'http://remote-gateway:15001', NO_PROXY: 'localhost', no_proxy: 'internal' };
+    const target = kind === 'runtime' ? { kind, identity: 'fixture-gateway' } : { kind, role: 'fixture-gateway' };
+    const spec = compose({
+      mailboxUrl: 'http://host.docker.internal:3010/mailbox/v1',
+      gateway: { env: gatewayEnv, networkAccess: { endpoint, target } },
+    });
+    const merged = 'localhost,internal,host.docker.internal:3010';
+    expect(spec.containers[0].contributedEnv).toEqual(
+      bypass ? { ...gatewayEnv, NO_PROXY: merged, no_proxy: merged } : gatewayEnv,
+    );
+  });
+
+  it('leaves bypass lists unchanged without a proxy or a mailbox URL', () => {
+    const env = { NO_PROXY: 'localhost, internal', no_proxy: 'different' };
+    expect(
+      compose({ mailboxUrl: 'http://mailbox.internal:3010', gateway: { env } }).containers[0].contributedEnv,
+    ).toEqual(env);
+    const proxyEnv = { ...env, HTTP_PROXY: 'http://remote-gateway:15001' };
+    expect(compose({ gateway: { env: proxyEnv } }).containers[0].contributedEnv).toEqual(proxyEnv);
+  });
+
   it('tells the runner why it was woken, when the wake said', () => {
     expect(compose().containers[0].env.NANOCLAW_WAKE_REASON).toBeUndefined();
     const spec = composeSessionSpec({

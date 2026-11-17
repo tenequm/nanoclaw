@@ -70,4 +70,5 @@ forks.md
 
 .voice-mode-upgrade-backup/
 
+# Per-checkout local integration stack
 .local/
