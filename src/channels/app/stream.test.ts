@@ -144,6 +144,7 @@ it('waits for drain, checks current access, and closes on the five-second revoca
   await vi.advanceTimersByTimeAsync(0);
   s.events.emit('event', row(131));
   vi.mocked(deviceAuth.reachableAgentIds).mockResolvedValue([]);
+  await vi.advanceTimersByTimeAsync(2_000);
   s.res.emit('drain');
   await vi.advanceTimersByTimeAsync(0);
   expect(s.output()).not.toContain('id: 131');
@@ -234,6 +235,7 @@ it('uses signed dispatch and real device access and revocation seams', async () 
     expect(s.output()).toContain('event: synchronized');
     expect(s.output()).toContain('id: 129');
     await db.run("DELETE FROM user_roles WHERE user_id = 'u'");
+    await vi.advanceTimersByTimeAsync(2_000);
     s.events.emit('event', row(130));
     await vi.advanceTimersByTimeAsync(0);
     expect(s.output()).not.toContain('id: 130');
@@ -268,4 +270,33 @@ it('streams committed messages through the module-level event log wiring', async
     const { streamEvents } = await import('./stream.js');
     await streamEvents(s.ctx);
   }
+});
+
+it('yields between replay pages and caches access for at most two seconds', async () => {
+  const s = setup();
+  s.ctx.req.url = '/app/events?after=0';
+  s.deps.lastEventSeq = async () => 300;
+  let yielded = false;
+  setImmediate(() => {
+    yielded = true;
+  });
+  s.deps.readEventsAfter = async (after, limit) => {
+    if (after >= 100) expect(yielded).toBe(true);
+    return Array.from({ length: Math.min(limit, 300 - after) }, (_, i) => ({
+      ...row(119),
+      seq: after + i + 1,
+      kind: 'weather',
+      entity_json: JSON.stringify({ seq: after + i + 1 }),
+    }));
+  };
+  await openStream(s.ctx, s.deps);
+  expect(deviceAuth.reachableAgentIds).toHaveBeenCalledTimes(1);
+  vi.useFakeTimers();
+  vi.mocked(deviceAuth.reachableAgentIds).mockResolvedValue([]);
+  await vi.advanceTimersByTimeAsync(2_000);
+  s.events.emit('event', { ...row(130), seq: 301 });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(deviceAuth.reachableAgentIds).toHaveBeenCalledTimes(2);
+  expect(s.output()).not.toContain('id: 301');
+  s.res.emit('close');
 });

@@ -1,3 +1,4 @@
+import { setImmediate as yieldToHost } from 'node:timers/promises';
 import { lastEventSeq, readEventsAfter, onEventAppended } from './log.js';
 import { onBadgeChanged, conversationsFor, badgeFor } from './conversations.js';
 import { statuses, onStatusChanged } from './status.js';
@@ -68,13 +69,18 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
   streams.set(identity.deviceId, active);
   active.add(close);
   if (active.size > 3) active.values().next().value!();
+  let access: { ids: string[]; at: number } | undefined;
   async function agents(): Promise<string[]> {
     if (closed) return [];
+    if (access && Date.now() - access.at < 2_000) return access.ids;
     if (!(await getLiveDevice(identity!.deviceId))) {
       close();
       return [];
     }
-    return reachableAgentIds(identity!.deviceId);
+    const at = Date.now();
+    const ids = await reachableAgentIds(identity!.deviceId);
+    access = { ids, at };
+    return ids;
   }
   async function write(bytes: string): Promise<void> {
     if (closed) return;
@@ -153,7 +159,10 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
     cleanup.push(deps.onStatusChanged((value) => enqueue({ status: value })));
     cleanup.push(
       onDeviceRevoked((id) => {
-        if (id === identity.deviceId) close();
+        if (id === identity.deviceId) {
+          access = undefined;
+          close();
+        }
       }),
     );
     const ping = setInterval(() => enqueue({ ping: true }), 20_000);
@@ -184,6 +193,7 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
         if (closed || row.seq > high) break;
         await event(row);
       }
+      await yieldToHost();
       if (rows.at(-1)!.seq >= high) break;
     }
     if (closed) return;
