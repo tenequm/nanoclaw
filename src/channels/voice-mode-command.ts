@@ -20,6 +20,7 @@
  * and the page's `livekit`, `livekit/token` and `livekit/end` routes, which voice-mode.ts serves.
  */
 import type http from 'node:http';
+import { randomUUID } from 'node:crypto';
 
 import { AccessToken, TrackSource } from 'livekit-server-sdk';
 
@@ -51,6 +52,8 @@ import {
   readJsonObject,
   reply,
   type CallKind,
+  type OpenCallResult,
+  type CallRefusal,
   type LiveKitVoice,
   type LiveKitVoiceConfig,
 } from './voice-mode-livekit.js';
@@ -279,7 +282,11 @@ export async function handleVoiceCommand(
   const { adapter, instance, threadId, chatThread, mg, userId } = chat;
   const cmd = voiceCommandName(event.channelType);
   // Straight to the chat's adapter, never through a session: the agent must not hold the call link.
-  const say = (text: string) => adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
+  const say = (text: string) =>
+    adapter.deliver(event.platformId, threadId, {
+      kind: 'chat',
+      content: { text, ...(event.channelType === 'app' ? { host: true } : {}) },
+    });
   const mode: VoiceMode = !JEV_API_KEY ? null : command.plain ? 'plain' : 'jev';
   try {
     if (command.jev && !JEV_API_KEY) {
@@ -384,7 +391,10 @@ async function sendDirect(userId: string, instance: string, text: string): Promi
   if (!direct) return false;
   const { dm, dmAdapter } = direct;
   try {
-    await dmAdapter.deliver(dm.platform_id, null, { kind: 'chat', content: { text } });
+    await dmAdapter.deliver(dm.platform_id, null, {
+      kind: 'chat',
+      content: { text, ...(dm.channel_type === 'app' ? { host: true } : {}) },
+    });
     return true;
   } catch (err) {
     log.warn('/voice could not reach the direct chat', { channelType: dm.channel_type, err: errorKind(err) });
@@ -448,21 +458,23 @@ export interface CallPageConfig {
 }
 
 /** The `/voice` page call over the call core: its kind and the page's `livekit`, `livekit/token` and `livekit/end` routes. */
-export function createCallPage(
-  core: Pick<LiveKitVoice, 'openCall' | 'endCall' | 'isLive'>,
-  config: CallPageConfig,
-): { handle(req: http.IncomingMessage, res: http.ServerResponse, route: string, url: URL): Promise<void> } {
+export function createCallPage(core: Pick<LiveKitVoice, 'openCall' | 'endCall' | 'isLive'>, config: CallPageConfig) {
   const { lineForToken } = config;
   const pageCall = pageCallKind(config.maxCallDurationMs);
   const jevPageCall = pageCallKind(config.maxCallDurationMs, true);
   let page: string | undefined;
 
   /** The page call's token: it joins that room only, as the caller the worker waits for. */
-  const callerToken = (call: { roomName: string; callerIdentity: string }, name: string): Promise<string> => {
+  const callerToken = (
+    call: { roomName: string; callerIdentity: string },
+    name: string,
+    fresh = false,
+  ): Promise<string> => {
     const at = new AccessToken(config.livekit.apiKey, config.livekit.apiSecret, {
       identity: call.callerIdentity,
       name,
       ttl: CALLER_TOKEN_TTL_SECONDS,
+      ...(fresh ? { attributes: { grantNonce: randomUUID() } } : {}),
     });
     at.addGrant({
       roomJoin: true,
@@ -479,65 +491,83 @@ export function createCallPage(
     return at.toJwt();
   };
 
-  /** Open a page call and hand the caller a token for its room only. `jev`: the call runs the jev loop. */
-  const startPageCall = async (res: http.ServerResponse, platformId: string, jev: boolean): Promise<void> => {
-    const opened = await core.openCall(platformId, jev ? jevPageCall : pageCall);
-    if (!opened.ok) {
-      switch (opened.error) {
-        case 'no-line':
-          return reply(res, 403, 'Caller access denied or voice line is not set up');
-        case 'no-chat':
-          return reply(res, 409, NO_CHAT_REFUSAL, JSON_HEADERS);
-        case 'limit':
-          return reply(res, 429, opened.body, { 'Retry-After': opened.retryAfter });
-        case 'room':
-          return reply(res, 502, 'livekit-voice-mode: could not open the call room');
-        case 'stopped':
-          return reply(res, 409, 'This call attempt is no longer active');
-      }
-    }
+  const grants = new Map<string, Extract<OpenCallResult, { ok: true }>>();
+  const grant = async (
+    platformId: string,
+    opened: Extract<OpenCallResult, { ok: true }>,
+    url: string,
+    gone: () => boolean = () => false,
+  ) => {
     const { call, chat, job, limit } = opened;
     let token: string;
     try {
-      token = await callerToken(call, call.line.caller.name);
-    } catch (err) {
-      log.warn('livekit-voice-mode: room setup failed', { platformId, callId: call.callId, err });
-      void core.endCall(platformId, call.callId, 'room setup failed');
-      return reply(res, 502, 'livekit-voice-mode: could not open the call room');
+      token = await callerToken(call, call.line.caller.name, grants.has(call.callId));
+    } catch {
+      await core.endCall(platformId, call.callId, 'room setup failed');
+      return { ok: false, error: 'room' } as const;
     }
-    // Replaced, ended or torn down while the token was signed: its own end deleted the room.
-    if (!core.isLive(platformId, call.callId)) return reply(res, 409, 'This call attempt is no longer active');
-    if (res.destroyed) {
-      // The page went away during setup and never gets the token, so nobody joins the room.
-      log.info('livekit-voice-mode: page left during call setup', { platformId, callId: call.callId });
-      void core.endCall(platformId, call.callId, 'page left during call setup');
-      return;
+    if (!core.isLive(platformId, call.callId)) return { ok: false, error: 'stopped' } as const;
+    if (gone()) {
+      await core.endCall(platformId, call.callId, 'page left during call setup');
+      return { ok: false, error: 'stopped' } as const;
     }
-    log.info('livekit-voice-mode: call started', {
-      platformId,
-      callId: call.callId,
-      room: call.roomName,
-      agent: job.agentName,
-      sttModel: job.sttModel,
-      tts: job.tts,
-      ...(job.jev ? { jev: true } : {}),
-    });
-    // What the page needs for its hints: the silence that sends a turn, and the cap that ends the call.
-    reply(
-      res,
-      200,
-      JSON.stringify({
+    return {
+      ok: true,
+      grant: {
         protocol: LIVEKIT_PROTOCOL_VERSION,
-        url: config.livekit.url,
+        url,
         token,
         callId: call.callId,
         agent: job.agentName,
         chat: chatLabel(chat.group),
         silenceMs: job.silenceMs,
         limit,
-      }),
-      JSON_HEADERS,
-    );
+      },
+    } as const;
+  };
+  const start = async (
+    platformId: string,
+    url: string,
+    jev: boolean,
+    bindChat?: CallKind['bindChat'],
+    gone?: () => boolean,
+  ) => {
+    for (const [id, opened] of grants) {
+      if (!core.isLive(opened.call.platformId, id)) grants.delete(id);
+    }
+    const opened = await core.openCall(platformId, {
+      ...(jev ? jevPageCall : pageCall),
+      ...(bindChat ? { bindChat } : {}),
+    });
+    if (!opened.ok) return opened;
+    if (bindChat) grants.set(opened.call.callId, opened);
+    return grant(platformId, opened, url, gone);
+  };
+  const resume = async (platformId: string, callId: string, url: string) => {
+    const opened = grants.get(callId);
+    if (!opened || opened.call.platformId !== platformId || !core.isLive(platformId, callId)) {
+      grants.delete(callId);
+      return { ok: false, error: 'stopped' } as const;
+    }
+    return grant(platformId, opened, url);
+  };
+  const startPageCall = async (res: http.ServerResponse, platformId: string, jev: boolean): Promise<void> => {
+    const result = await start(platformId, config.livekit.url, jev, undefined, () => res.destroyed);
+    if (res.destroyed) return;
+    if (result.ok) return reply(res, 200, JSON.stringify(result.grant), JSON_HEADERS);
+    const refusal: CallRefusal = result;
+    switch (refusal.error) {
+      case 'no-line':
+        return reply(res, 403, 'Caller access denied or voice line is not set up');
+      case 'no-chat':
+        return reply(res, 409, NO_CHAT_REFUSAL, JSON_HEADERS);
+      case 'limit':
+        return reply(res, 429, refusal.body, { 'Retry-After': refusal.retryAfter });
+      case 'room':
+        return reply(res, 502, 'livekit-voice-mode: could not open the call room');
+      case 'stopped':
+        return reply(res, 409, 'This call attempt is no longer active');
+    }
   };
 
   const pageHeaders = (): Record<string, string> => {
@@ -601,5 +631,5 @@ export function createCallPage(
     reply(res, 404, 'Not found');
   };
 
-  return { handle: handleCallPage };
+  return { handle: handleCallPage, start, resume, end: core.endCall };
 }

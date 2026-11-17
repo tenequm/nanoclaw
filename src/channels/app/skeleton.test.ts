@@ -41,7 +41,7 @@ it('serves hello with the contract shape without credentials', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(fixtures.hello.serverTime);
   expect(await request('GET', '/app/hello')).toEqual({ status: 200, body: { ...fixtures.hello, features: [] } });
 });
-it.each(routes.filter((route) => route.lane !== 'N0'))('$method $path is an explicit stub', async (route) => {
+it.each(routes.filter((route) => !/^N[05]$/.test(route.lane)))('$method $path is an explicit stub', async (route) => {
   expect(await request(route.method, route.path.replace(/:[A-Za-z]+/g, 'test'))).toEqual({
     status: 501,
     body: { error: 'not_implemented', message: `This feature is awaiting ${route.lane}.` },
