@@ -60,7 +60,7 @@ const group = {
   id: c.messaging_group_id,
   channel_type: 'app',
   platform_id: c.id,
-  name: 'Stan (app)',
+  name: 'Taylor (app)',
   is_group: 0,
   instance: 'app',
 } as MessagingGroup;
@@ -112,11 +112,11 @@ async function request(
   return { status, body: text ? JSON.parse(text) : null, headers };
 }
 beforeEach(async () => {
-  vi.stubEnv('APP_LIVEKIT_URL', 'wss://lk.opx.one');
+  vi.stubEnv('APP_LIVEKIT_URL', 'wss://livekit.example.com');
   await runMigrations(await initTestDb());
   await createAgentGroup({
     id: c.agent_group_id,
-    name: 'Stan',
+    name: 'Taylor',
     folder: 'n5-test',
     agent_provider: null,
     created_at: new Date().toISOString(),
@@ -211,7 +211,7 @@ it('opens once concurrently, retries with a fresh token and ends idempotently', 
   expect(a.body).toMatchObject({
     protocol: 6,
     url: fixtures.callGrant.url,
-    agent: 'Stan',
+    agent: 'Taylor',
     attemptId: requestBody.attemptId,
   });
   const line = (await getVoiceModeLineForAgent(c.agent_group_id))!;
@@ -412,7 +412,7 @@ it('reports call availability from the module-level hook in the real conversatio
   const result = await request(listConversations, undefined, {}, undefined, 'GET', '/app/conversations');
   expect(result.status).toBe(200);
   expect(result.body.conversations).toEqual([
-    expect.objectContaining({ agent: { id: c.agent_group_id, name: 'Stan' }, canCall: true, callRefusal: null }),
+    expect.objectContaining({ agent: { id: c.agent_group_id, name: 'Taylor' }, canCall: true, callRefusal: null }),
   ]);
   expect(rooms).toBe(0);
   await adapter.teardown();

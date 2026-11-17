@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { StreamParser, guard, target } from './app-client.js';
 import { signRequest } from './app-sign.js';
 import { canonicalSigningText, parseAuthorization, verifyRequestSignature } from '../src/channels/app/contract.js';
@@ -44,7 +44,7 @@ describe('canonical targets and signing', () => {
   it('builds the encoded fixture target', () => {
     expect(
       target(
-        ['app', 'conversations', 'conv_stan01', 'voices'],
+        ['app', 'conversations', 'conv_taylor01', 'voices'],
         [
           ['provider', 'gemini'],
           ['q', 'кіт cat'],
@@ -86,10 +86,11 @@ describe('canonical targets and signing', () => {
     });
 });
 describe('remote guard', () => {
-  it('requires remote opt-in and Stan', () => {
+  it('requires remote opt-in and an explicit allowed agent', () => {
     expect(() => guard('https://example.com', false)).toThrow();
-    expect(() => guard('https://example.com', true, 'Dan')).toThrow();
-    expect(() => guard('https://example.com', true, 'Stan')).not.toThrow();
+    expect(() => guard('https://example.com', true)).toThrow();
+    expect(() => guard('https://example.com', true, 'Alex', 'Sam')).toThrow();
+    expect(() => guard('https://example.com', true, 'Sam', 'Sam')).not.toThrow();
   });
   it('permits only explicit loopback hosts without opt-in', () => {
     for (const base of ['http://127.0.0.1:5000', 'https://127.0.0.1.sslip.io:5006', 'http://[::1]:5000'])
@@ -116,8 +117,9 @@ it('records every scenario as skipped when pairing is a 501 stub', async () => {
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address() as { port: number };
   const directory = mkdtempSync(join(tmpdir(), 'n9b-stub-'));
+  vi.stubEnv('HEYDAN_PAIR_LINK', `http://127.0.0.1:${address.port}/app/pair#test-code`);
   try {
-    await runAppClient(`http://127.0.0.1:${address.port}`, directory);
+    await runAppClient(`http://127.0.0.1:${address.port}`, directory, { deviceDir: join(directory, 'devices') });
     const results = readdirSync(join(directory, 'results')).map((file) =>
       JSON.parse(readFileSync(join(directory, 'results', file), 'utf8')),
     );
@@ -126,8 +128,30 @@ it('records every scenario as skipped when pairing is a 501 stub', async () => {
     expect(results.some((r) => r.id === 'n9b-direct-security-revoke')).toBe(true);
     expect(readFileSync(join(directory, 'logs/n9b-client.log'), 'utf8')).not.toContain('private payload sentinel');
   } finally {
+    vi.unstubAllEnvs();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+it('stops mid-chunk and resumes without losing or duplicating versions', () => {
+  const wire = Buffer.from(
+    'event: message\nid: 1\ndata: {}\n\nevent: message\nid: 2\ndata: {}\n\nevent: synchronized\ndata: {"seq":2}\n\n',
+  );
+  const seen: number[] = [];
+  const cut = new StreamParser(0, (e) => {
+    seen.push(e.id!);
+    cut.stop();
+  });
+  cut.feed(wire);
+  cut.feed(wire);
+  expect(cut.cursor).toBe(1);
+  expect(seen).toEqual([1]);
+  const resumed = new StreamParser(cut.cursor, (e) => {
+    if (e.id) seen.push(e.id);
+  });
+  resumed.feed(wire.subarray(wire.indexOf('event: message', 1)));
+  expect(seen).toEqual([1, 2]);
+  expect(resumed.cursor).toBe(2);
 });

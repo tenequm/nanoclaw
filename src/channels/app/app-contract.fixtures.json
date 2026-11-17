@@ -21,53 +21,53 @@
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "canonical": "HEYDAN-SIG-V1\n1\nGET\n/app/conversations\n1794943562\nc3n-MHUOLraqLSy4lX8rIw\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEUCIHYpI1kzdVkdJCYMVmfKeX5eCRe3gG5XBZks3NP4lsCNAiEAouX73nziDw4NITB5fvAgbyz0c6BY9yFPLGKmThZEljc",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=c3n-MHUOLraqLSy4lX8rIw,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIHYpI1kzdVkdJCYMVmfKeX5eCRe3gG5XBZks3NP4lsCNAiEAouX73nziDw4NITB5fvAgbyz0c6BY9yFPLGKmThZEljc",
+        "signature": "MEQCIGCVkaZyyAeFfadpXzz0hFL_ieaGL5XNlQuyrX3Nb5CHAiBNz_5vJY7kHQHItRPvmi7t9sKPamC-pLKHytH9KzhSHQ",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=c3n-MHUOLraqLSy4lX8rIw,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEQCIGCVkaZyyAeFfadpXzz0hFL_ieaGL5XNlQuyrX3Nb5CHAiBNz_5vJY7kHQHItRPvmi7t9sKPamC-pLKHytH9KzhSHQ",
         "signatureValid": true
       },
       {
         "name": "get-with-query",
         "protocol": 1,
         "method": "GET",
-        "target": "/app/conversations/conv_stan01/messages?before=2120&limit=50",
+        "target": "/app/conversations/conv_taylor01/messages?before=2120&limit=50",
         "body": "",
         "ts": 1794943562,
         "nonce": "4eIavNJcFsJcPJOWdcqsfg",
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "canonical": "HEYDAN-SIG-V1\n1\nGET\n/app/conversations/conv_stan01/messages?before=2120&limit=50\n1794943562\n4eIavNJcFsJcPJOWdcqsfg\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEUCIBcsN8JhZYD2d2wO9gC2BMuvz8i7LTomIN9xKuFALwneAiEA8a8cIuhdrTLawURknkVUJeXLtHFLlBMKEZteEA-wrKk",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIBcsN8JhZYD2d2wO9gC2BMuvz8i7LTomIN9xKuFALwneAiEA8a8cIuhdrTLawURknkVUJeXLtHFLlBMKEZteEA-wrKk",
+        "canonical": "HEYDAN-SIG-V1\n1\nGET\n/app/conversations/conv_taylor01/messages?before=2120&limit=50\n1794943562\n4eIavNJcFsJcPJOWdcqsfg\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEUCIQCXaFKCv0KZIzs2pRDLQ_escAX3zyY8So2JO_Lt3-md-AIgE-SynDLnk3BTraTw1WxWQCwyMZ4HgGtZ-fKa1wCRYxQ",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIQCXaFKCv0KZIzs2pRDLQ_escAX3zyY8So2JO_Lt3-md-AIgE-SynDLnk3BTraTw1WxWQCwyMZ4HgGtZ-fKa1wCRYxQ",
         "signatureValid": true
       },
       {
         "name": "get-encoded-query",
         "protocol": 1,
         "method": "GET",
-        "target": "/app/conversations/conv_stan01/voices?provider=gemini&q=%D0%BA%D1%96%D1%82%20cat&limit=20",
+        "target": "/app/conversations/conv_taylor01/voices?provider=gemini&q=%D0%BA%D1%96%D1%82%20cat&limit=20",
         "body": "",
         "ts": 1794943562,
         "nonce": "agYlKuRtFDQDhynLE0sM7g",
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "canonical": "HEYDAN-SIG-V1\n1\nGET\n/app/conversations/conv_stan01/voices?provider=gemini&q=%D0%BA%D1%96%D1%82%20cat&limit=20\n1794943562\nagYlKuRtFDQDhynLE0sM7g\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEYCIQCsct0j7tlhmbu2UcFNOmxjIydlp7XQdFaXZb2hxU-3ZQIhALKroV0juAED4dVT8Y1PUPZVoaYziAXdwrQBvvSVt0gl",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=agYlKuRtFDQDhynLE0sM7g,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEYCIQCsct0j7tlhmbu2UcFNOmxjIydlp7XQdFaXZb2hxU-3ZQIhALKroV0juAED4dVT8Y1PUPZVoaYziAXdwrQBvvSVt0gl",
+        "canonical": "HEYDAN-SIG-V1\n1\nGET\n/app/conversations/conv_taylor01/voices?provider=gemini&q=%D0%BA%D1%96%D1%82%20cat&limit=20\n1794943562\nagYlKuRtFDQDhynLE0sM7g\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQC_TF07xsTIrOwjmawOUO-deh2Fl-bfV_GqpmLX4hee-AIhAKZvNS2XWTWpkJ4ZydovFmK7s-icEckr-bDFqI-D7jMu",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=agYlKuRtFDQDhynLE0sM7g,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEYCIQC_TF07xsTIrOwjmawOUO-deh2Fl-bfV_GqpmLX4hee-AIhAKZvNS2XWTWpkJ4ZydovFmK7s-icEckr-bDFqI-D7jMu",
         "signatureValid": true
       },
       {
         "name": "post-json",
         "protocol": 1,
         "method": "POST",
-        "target": "/app/conversations/conv_stan01/messages",
+        "target": "/app/conversations/conv_taylor01/messages",
         "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
         "ts": 1794943562,
         "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
-        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_stan01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
         "signatureValid": true
       },
       {
@@ -81,8 +81,8 @@
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "canonical": "HEYDAN-SIG-V1\n1\nGET\n/app/events?after=118\n1794943562\ngDZl6DWT3atXh6Z_x2AT1A\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEUCIQD4VKfVs3QBSS6IIiydkQqMvGNpiMr2fIVZNfPCR9klOgIgKkJsJZLE6xBz9BQy59JVtMA6-KJv22wULog0BPyulfE",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIQD4VKfVs3QBSS6IIiydkQqMvGNpiMr2fIVZNfPCR9klOgIgKkJsJZLE6xBz9BQy59JVtMA6-KJv22wULog0BPyulfE",
+        "signature": "MEQCIAtvGkS8KKNxYJy0Bwm1a9iw3iYtiSpY7_wPUFPGRdDWAiAUXBMDgwuNy7ednS6vNtnDBT2EOUIIYsu-S-1hLMkzBg",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEQCIAtvGkS8KKNxYJy0Bwm1a9iw3iYtiSpY7_wPUFPGRdDWAiAUXBMDgwuNy7ednS6vNtnDBT2EOUIIYsu-S-1hLMkzBg",
         "signatureValid": true
       },
       {
@@ -96,23 +96,23 @@
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "canonical": "HEYDAN-SIG-V1\n1\nDELETE\n/app/devices/me\n1794943562\ngTGeE2uAc-vodEHo6rB9SQ\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEUCIQCAmZ3IljCCY1pXGfdHhb0ilDDRcRjBa7AiTikl2grN2wIgZAZMUzDzCaBQMLKoaAXcShY_klDhLw1xrdqSeWkPkdQ",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=gTGeE2uAc-vodEHo6rB9SQ,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIQCAmZ3IljCCY1pXGfdHhb0ilDDRcRjBa7AiTikl2grN2wIgZAZMUzDzCaBQMLKoaAXcShY_klDhLw1xrdqSeWkPkdQ",
+        "signature": "MEUCIAgbzwJU4G9ALvy65Y_HY3i4S8rCpEk9r_I05tlXfgHEAiEA4w_yRhE5vijEPzszIAB_FLu2M6b-okZ9lQIQqygUSDw",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=gTGeE2uAc-vodEHo6rB9SQ,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIAgbzwJU4G9ALvy65Y_HY3i4S8rCpEk9r_I05tlXfgHEAiEA4w_yRhE5vijEPzszIAB_FLu2M6b-okZ9lQIQqygUSDw",
         "signatureValid": true
       },
       {
         "name": "bad-changed-body",
         "protocol": 1,
         "method": "POST",
-        "target": "/app/conversations/conv_stan01/messages",
+        "target": "/app/conversations/conv_taylor01/messages",
         "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply now\",\"fileIds\":[]}",
         "ts": 1794943562,
         "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "35dd4f6eaba36dcf4137c5963e8a3f5ff685fa79b01a2e5b8338f0e3a7df541c",
-        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_stan01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\n35dd4f6eaba36dcf4137c5963e8a3f5ff685fa79b01a2e5b8338f0e3a7df541c\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=35dd4f6eaba36dcf4137c5963e8a3f5ff685fa79b01a2e5b8338f0e3a7df541c,s=MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\n35dd4f6eaba36dcf4137c5963e8a3f5ff685fa79b01a2e5b8338f0e3a7df541c\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=35dd4f6eaba36dcf4137c5963e8a3f5ff685fa79b01a2e5b8338f0e3a7df541c,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
         "signatureValid": false,
         "why": "the body no longer matches the signed hash"
       },
@@ -120,15 +120,15 @@
         "name": "bad-changed-target",
         "protocol": 1,
         "method": "POST",
-        "target": "/app/conversations/conv_dan01/messages",
+        "target": "/app/conversations/conv_sam01/messages",
         "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
         "ts": 1794943562,
         "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
-        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_dan01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_sam01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
         "signatureValid": false,
         "why": "another path"
       },
@@ -136,15 +136,15 @@
         "name": "bad-changed-method",
         "protocol": 1,
         "method": "PUT",
-        "target": "/app/conversations/conv_stan01/messages",
+        "target": "/app/conversations/conv_taylor01/messages",
         "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
         "ts": 1794943562,
         "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
-        "canonical": "HEYDAN-SIG-V1\n1\nPUT\n/app/conversations/conv_stan01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
+        "canonical": "HEYDAN-SIG-V1\n1\nPUT\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
         "signatureValid": false,
         "why": "another method"
       },
@@ -152,15 +152,15 @@
         "name": "bad-other-device",
         "protocol": 1,
         "method": "POST",
-        "target": "/app/conversations/conv_stan01/messages",
+        "target": "/app/conversations/conv_taylor01/messages",
         "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
         "ts": 1794943562,
         "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
         "deviceId": "dev_someoneElse",
         "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
-        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_stan01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_someoneElse",
-        "signature": "MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_someoneElse,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_someoneElse",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_someoneElse,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
         "signatureValid": false,
         "why": "another device id"
       },
@@ -168,15 +168,15 @@
         "name": "bad-changed-nonce",
         "protocol": 1,
         "method": "POST",
-        "target": "/app/conversations/conv_stan01/messages",
+        "target": "/app/conversations/conv_taylor01/messages",
         "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
         "ts": 1794943562,
         "nonce": "CeHsU76okSfKXoZEOETkDA",
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
-        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_stan01/messages\n1794943562\nCeHsU76okSfKXoZEOETkDA\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=CeHsU76okSfKXoZEOETkDA,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nCeHsU76okSfKXoZEOETkDA\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=CeHsU76okSfKXoZEOETkDA,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
         "signatureValid": false,
         "why": "another nonce"
       },
@@ -184,15 +184,15 @@
         "name": "bad-changed-protocol",
         "protocol": 2,
         "method": "POST",
-        "target": "/app/conversations/conv_stan01/messages",
+        "target": "/app/conversations/conv_taylor01/messages",
         "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
         "ts": 1794943562,
         "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
-        "canonical": "HEYDAN-SIG-V1\n2\nPOST\n/app/conversations/conv_stan01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
-        "authorization": "HeyDan-Sig v=1,p=2,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEQCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiBTlqIMh3C9UVxc9z5A-57WXQpWFl1hShwFoQWZAaxdRw",
+        "canonical": "HEYDAN-SIG-V1\n2\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=2,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
         "signatureValid": false,
         "why": "another protocol"
       },
@@ -200,15 +200,15 @@
         "name": "replay-malleated-signature",
         "protocol": 1,
         "method": "POST",
-        "target": "/app/conversations/conv_stan01/messages",
+        "target": "/app/conversations/conv_taylor01/messages",
         "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
         "ts": 1794943562,
         "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
         "deviceId": "dev_8Qm3kT1xV2aZ",
         "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
-        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_stan01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
-        "signature": "MEUCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiEArGld8niPQq-jowjBvwRhKV_cpJdJtlRo7hjFKfq2yAo",
-        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEUCIAaS8l_PWCJAwghYuTg-xOKlxd_cDJ7_GA2E9TIcJK1FAiEArGld8niPQq-jowjBvwRhKV_cpJdJtlRo7hjFKfq2yAo",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEUCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIgfknnqJMlTsJV4pah3cZNsP2LCwNve2obwlsbOvbf7X4",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEUCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIgfknnqJMlTsJV4pah3cZNsP2LCwNve2obwlsbOvbf7X4",
         "signatureValid": true,
         "why": "verifies, but has the same (deviceId, nonce) as post-json: the second one seen is refused as replayed"
       }
@@ -218,17 +218,12 @@
     "protocol": 1,
     "minProtocol": 1,
     "voiceProtocol": 6,
-    "features": [
-      "files",
-      "calls",
-      "push",
-      "voice-picker"
-    ],
+    "features": ["files", "calls", "push", "voice-picker"],
     "serverTime": 1794943562000
   },
   "pairLink": {
-    "link": "https://app.opx.one/app/pair#k3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
-    "host": "https://app.opx.one",
+    "link": "https://app.example.com/app/pair#k3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
+    "host": "https://app.example.com",
     "code": "k3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
     "localLink": "http://127.0.0.1:4101/app/pair#k3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
     "localHost": "http://127.0.0.1:4101"
@@ -237,7 +232,7 @@
     "code": "k3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
     "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAERgGHyQVnu7ZMzV08o5wQeUoy0a-sgR4-8NXKRAftepPCmAQJDgrI0Y87EhlDBX5GGxODKspYy7ADGBr1EfiMrg",
     "deviceName": "iPhone",
-    "proof": "MEUCIQCz86UUU5weI33do9yvYEvHjVsSdPufwqMiV8Er3o3xnQIgWUhPc6NRA_KIiQFWeLw7eAiH-9aVoqhg2tUAGBb-nGQ",
+    "proof": "MEUCIQDPBliTDE5JFeHz3l1ps0_rzEn2SSE4dLCaTpyYVvU4ZwIgfuUJ0eB3nOmNdX5ozU9ozgJt-OCUmEn6H1pYAzsC-vI",
     "app": {
       "version": "0.6.0",
       "build": "2611171926",
@@ -248,17 +243,17 @@
   "pairProofTampered": {
     "code": "X3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
     "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAERgGHyQVnu7ZMzV08o5wQeUoy0a-sgR4-8NXKRAftepPCmAQJDgrI0Y87EhlDBX5GGxODKspYy7ADGBr1EfiMrg",
-    "proof": "MEUCIQCz86UUU5weI33do9yvYEvHjVsSdPufwqMiV8Er3o3xnQIgWUhPc6NRA_KIiQFWeLw7eAiH-9aVoqhg2tUAGBb-nGQ",
+    "proof": "MEUCIQDPBliTDE5JFeHz3l1ps0_rzEn2SSE4dLCaTpyYVvU4ZwIgfuUJ0eB3nOmNdX5ozU9ozgJt-OCUmEn6H1pYAzsC-vI",
     "valid": false,
     "why": "the proof was made for another code"
   },
   "pairResponse": {
     "deviceId": "dev_8Qm3kT1xV2aZ",
-    "userName": "Misha",
+    "userName": "Alex",
     "agents": [
       {
-        "id": "ag_stan",
-        "name": "Stan"
+        "id": "ag_taylor",
+        "name": "Taylor"
       }
     ],
     "protocol": 1,
@@ -456,11 +451,11 @@
     "conversations": [
       {
         "kind": "conversation",
-        "id": "conv_stan01",
+        "id": "conv_taylor01",
         "seq": 129,
         "agent": {
-          "id": "ag_stan",
-          "name": "Stan"
+          "id": "ag_taylor",
+          "name": "Taylor"
         },
         "lastMessage": {
           "id": "msg_0126",
@@ -478,7 +473,7 @@
     "statuses": [
       {
         "kind": "status",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "rev": 41,
         "state": "working",
         "label": "Running a command",
@@ -492,11 +487,29 @@
     },
     "seq": 129
   },
+  "conversationCallRefused": {
+    "kind": "conversation",
+    "id": "conv_sam01",
+    "seq": 2120,
+    "agent": {
+      "id": "ag_sam",
+      "name": "Sam"
+    },
+    "lastMessage": null,
+    "unread": 0,
+    "readOrder": 0,
+    "canCall": false,
+    "callRefusal": {
+      "error": "no_line",
+      "message": "Calls are not set up for this agent."
+    },
+    "createdAt": 1794857162000
+  },
   "historyPage": {
     "items": [
       {
         "kind": "message",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "files": [],
         "reactions": [],
         "voice": null,
@@ -514,7 +527,7 @@
       },
       {
         "kind": "message",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "files": [],
         "reactions": [],
         "voice": null,
@@ -533,7 +546,7 @@
       {
         "kind": "question",
         "id": "q_0123",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "order": 123,
         "seq": 125,
         "title": "Deploy",
@@ -569,7 +582,7 @@
       },
       {
         "kind": "message",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "files": [],
         "reactions": [
           {
@@ -592,7 +605,7 @@
       },
       {
         "kind": "message",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "files": [],
         "reactions": [],
         "voice": "whispered",
@@ -616,7 +629,7 @@
   "messages": {
     "agentMarkdown": {
       "kind": "message",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "files": [],
       "reactions": [],
       "voice": null,
@@ -634,7 +647,7 @@
     },
     "agentWithFiles": {
       "kind": "message",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "files": [
         {
           "id": "file_img01",
@@ -671,7 +684,7 @@
     },
     "userWithFile": {
       "kind": "message",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "files": [
         {
           "id": "file_7hT2pQ9a",
@@ -699,7 +712,7 @@
     },
     "userUnknown": {
       "kind": "message",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "files": [],
       "reactions": [],
       "voice": null,
@@ -720,7 +733,7 @@
     },
     "userFailed": {
       "kind": "message",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "files": [],
       "reactions": [],
       "voice": null,
@@ -741,7 +754,7 @@
     },
     "voiceCaller": {
       "kind": "message",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "files": [],
       "reactions": [],
       "voice": "caller",
@@ -759,7 +772,7 @@
     },
     "voiceSpoken": {
       "kind": "message",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "files": [],
       "reactions": [],
       "voice": "spoken",
@@ -777,7 +790,7 @@
     },
     "host": {
       "kind": "message",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "files": [],
       "reactions": [],
       "voice": null,
@@ -795,7 +808,7 @@
     },
     "future": {
       "kind": "message",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "files": [],
       "reactions": [],
       "voice": "whispered",
@@ -815,7 +828,7 @@
     "send": {
       "stored": {
         "kind": "message",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "files": [],
         "reactions": [],
         "voice": null,
@@ -833,7 +846,7 @@
       },
       "routed": {
         "kind": "message",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "files": [],
         "reactions": [],
         "voice": null,
@@ -851,7 +864,7 @@
       },
       "reached": {
         "kind": "message",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "files": [],
         "reactions": [],
         "voice": null,
@@ -871,7 +884,7 @@
     "editSequence": [
       {
         "kind": "message",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "files": [],
         "reactions": [],
         "voice": null,
@@ -889,7 +902,7 @@
       },
       {
         "kind": "message",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "files": [],
         "reactions": [],
         "voice": null,
@@ -907,7 +920,7 @@
       },
       {
         "kind": "message",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "files": [],
         "reactions": [
           {
@@ -934,7 +947,7 @@
     "open": {
       "kind": "question",
       "id": "q_0123",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "order": 123,
       "seq": 123,
       "title": "Deploy",
@@ -967,7 +980,7 @@
     "answered": {
       "kind": "question",
       "id": "q_0123",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "order": 123,
       "seq": 125,
       "title": "Deploy",
@@ -1004,7 +1017,7 @@
     "expired": {
       "kind": "question",
       "id": "q_2110",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "order": 2110,
       "seq": 2111,
       "title": "Deploy",
@@ -1037,7 +1050,7 @@
     "noDeadline": {
       "kind": "question",
       "id": "q_2112",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "order": 2112,
       "seq": 2112,
       "title": "Deploy",
@@ -1071,7 +1084,7 @@
   "statuses": {
     "working": {
       "kind": "status",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "rev": 41,
       "state": "working",
       "label": "Running a command",
@@ -1079,7 +1092,7 @@
     },
     "waiting": {
       "kind": "status",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "rev": 40,
       "state": "waiting",
       "label": "Waiting for your answer",
@@ -1087,7 +1100,7 @@
     },
     "idle": {
       "kind": "status",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "rev": 42,
       "state": "idle",
       "label": null,
@@ -1097,7 +1110,7 @@
   "stream": {
     "note": "Raw bytes of one connection opened with after=118 while the log ends at 129. Lines end in LF; an empty line ends an event; a line starting with a colon is a comment. seq 124 is filtered out (another agent).",
     "request": "GET /app/events?after=118",
-    "raw": "id: 119\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_stan01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"stored\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":119,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000}\n\nid: 120\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_stan01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"routed\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":120,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000}\n\nid: 121\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_stan01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"reached\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":121,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000}\n\nid: 122\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_stan01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0122\",\"order\":122,\"seq\":122,\"role\":\"agent\",\"text\":\"Working on it.\",\"createdAt\":1794943568000}\n\nid: 123\nevent: question\ndata: {\"kind\":\"question\",\"id\":\"q_0123\",\"conversationId\":\"conv_stan01\",\"order\":123,\"seq\":123,\"title\":\"Deploy\",\"text\":\"Deploy to which environment?\",\"options\":[{\"label\":\"Staging\",\"selectedLabel\":\"Staging\",\"value\":\"staging\",\"style\":\"primary\"},{\"label\":\"Production\",\"selectedLabel\":\"Production\",\"value\":\"production\",\"style\":\"danger\"},{\"label\":\"Cancel\",\"selectedLabel\":\"Cancelled\",\"value\":\"cancel\",\"style\":null}],\"state\":\"open\",\"answer\":null,\"createdAt\":1794943574000,\"expiresAt\":1794943874000}\n\nid: 125\nevent: question\ndata: {\"kind\":\"question\",\"id\":\"q_0123\",\"conversationId\":\"conv_stan01\",\"order\":123,\"seq\":125,\"title\":\"Deploy\",\"text\":\"Deploy to which environment?\",\"options\":[{\"label\":\"Staging\",\"selectedLabel\":\"Staging\",\"value\":\"staging\",\"style\":\"primary\"},{\"label\":\"Production\",\"selectedLabel\":\"Production\",\"value\":\"production\",\"style\":\"danger\"},{\"label\":\"Cancel\",\"selectedLabel\":\"Cancelled\",\"value\":\"cancel\",\"style\":null}],\"state\":\"answered\",\"answer\":{\"value\":\"staging\",\"label\":\"Staging\",\"at\":1794943587000},\"createdAt\":1794943574000,\"expiresAt\":1794943874000}\n\nid: 126\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_stan01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0126\",\"order\":126,\"seq\":126,\"role\":\"agent\",\"text\":\"First draft.\",\"createdAt\":1794943592000}\n\nid: 127\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_stan01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":1794943593000,\"id\":\"msg_0126\",\"order\":126,\"seq\":127,\"role\":\"agent\",\"text\":\"Second draft.\",\"createdAt\":1794943592000}\n\nid: 128\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_stan01\",\"files\":[],\"reactions\":[{\"emoji\":\"👍\",\"by\":\"agent\"}],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":1794943593000,\"id\":\"msg_0126\",\"order\":126,\"seq\":128,\"role\":\"agent\",\"text\":\"Second draft.\",\"createdAt\":1794943592000}\n\nid: 129\nevent: conversation\ndata: {\"kind\":\"conversation\",\"id\":\"conv_stan01\",\"seq\":129,\"agent\":{\"id\":\"ag_stan\",\"name\":\"Stan\"},\"lastMessage\":{\"id\":\"msg_0126\",\"role\":\"agent\",\"preview\":\"Second draft.\",\"at\":1794943593000},\"unread\":3,\"readOrder\":118,\"canCall\":true,\"callRefusal\":null,\"createdAt\":1794857162000}\n\nevent: status\ndata: {\"kind\":\"status\",\"conversationId\":\"conv_stan01\",\"rev\":41,\"state\":\"working\",\"label\":\"Running a command\",\"at\":1794943595000}\n\nevent: badge\ndata: {\"kind\":\"badge\",\"rev\":7,\"unreadTotal\":3}\n\nevent: synchronized\ndata: {\"seq\":129}\n\n: ping\n\nid: 130\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_stan01\",\"files\":[],\"reactions\":[],\"voice\":\"whispered\",\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0130\",\"order\":130,\"seq\":130,\"role\":\"narrator\",\"mood\":\"calm\",\"text\":\"A role and fields from a later server.\",\"createdAt\":1794943602000}\n\nid: 131\nevent: weather\ndata: {\"kind\":\"weather\",\"note\":\"an event kind from a later server\"}\n\nevent: status\ndata: {\"kind\":\"status\",\"conversationId\":\"conv_stan01\",\"rev\":42,\"state\":\"idle\",\"label\":null,\"at\":1794943607000}\n\nevent: badge\ndata: {\"kind\":\"badge\",\"rev\":8,\"unreadTotal\":4}\n\n: ping\n\n",
+    "raw": "id: 119\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"stored\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":119,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000}\n\nid: 120\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"routed\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":120,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000}\n\nid: 121\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"reached\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":121,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000}\n\nid: 122\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0122\",\"order\":122,\"seq\":122,\"role\":\"agent\",\"text\":\"Working on it.\",\"createdAt\":1794943568000}\n\nid: 123\nevent: question\ndata: {\"kind\":\"question\",\"id\":\"q_0123\",\"conversationId\":\"conv_taylor01\",\"order\":123,\"seq\":123,\"title\":\"Deploy\",\"text\":\"Deploy to which environment?\",\"options\":[{\"label\":\"Staging\",\"selectedLabel\":\"Staging\",\"value\":\"staging\",\"style\":\"primary\"},{\"label\":\"Production\",\"selectedLabel\":\"Production\",\"value\":\"production\",\"style\":\"danger\"},{\"label\":\"Cancel\",\"selectedLabel\":\"Cancelled\",\"value\":\"cancel\",\"style\":null}],\"state\":\"open\",\"answer\":null,\"createdAt\":1794943574000,\"expiresAt\":1794943874000}\n\nid: 125\nevent: question\ndata: {\"kind\":\"question\",\"id\":\"q_0123\",\"conversationId\":\"conv_taylor01\",\"order\":123,\"seq\":125,\"title\":\"Deploy\",\"text\":\"Deploy to which environment?\",\"options\":[{\"label\":\"Staging\",\"selectedLabel\":\"Staging\",\"value\":\"staging\",\"style\":\"primary\"},{\"label\":\"Production\",\"selectedLabel\":\"Production\",\"value\":\"production\",\"style\":\"danger\"},{\"label\":\"Cancel\",\"selectedLabel\":\"Cancelled\",\"value\":\"cancel\",\"style\":null}],\"state\":\"answered\",\"answer\":{\"value\":\"staging\",\"label\":\"Staging\",\"at\":1794943587000},\"createdAt\":1794943574000,\"expiresAt\":1794943874000}\n\nid: 126\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0126\",\"order\":126,\"seq\":126,\"role\":\"agent\",\"text\":\"First draft.\",\"createdAt\":1794943592000}\n\nid: 127\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":1794943593000,\"id\":\"msg_0126\",\"order\":126,\"seq\":127,\"role\":\"agent\",\"text\":\"Second draft.\",\"createdAt\":1794943592000}\n\nid: 128\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[{\"emoji\":\"👍\",\"by\":\"agent\"}],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":1794943593000,\"id\":\"msg_0126\",\"order\":126,\"seq\":128,\"role\":\"agent\",\"text\":\"Second draft.\",\"createdAt\":1794943592000}\n\nid: 129\nevent: conversation\ndata: {\"kind\":\"conversation\",\"id\":\"conv_taylor01\",\"seq\":129,\"agent\":{\"id\":\"ag_taylor\",\"name\":\"Taylor\"},\"lastMessage\":{\"id\":\"msg_0126\",\"role\":\"agent\",\"preview\":\"Second draft.\",\"at\":1794943593000},\"unread\":3,\"readOrder\":118,\"canCall\":true,\"callRefusal\":null,\"createdAt\":1794857162000}\n\nevent: status\ndata: {\"kind\":\"status\",\"conversationId\":\"conv_taylor01\",\"rev\":41,\"state\":\"working\",\"label\":\"Running a command\",\"at\":1794943595000}\n\nevent: badge\ndata: {\"kind\":\"badge\",\"rev\":7,\"unreadTotal\":3}\n\nevent: synchronized\ndata: {\"seq\":129}\n\n: ping\n\nid: 130\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":\"whispered\",\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0130\",\"order\":130,\"seq\":130,\"role\":\"narrator\",\"mood\":\"calm\",\"text\":\"A role and fields from a later server.\",\"createdAt\":1794943602000}\n\nid: 131\nevent: weather\ndata: {\"kind\":\"weather\",\"note\":\"an event kind from a later server\"}\n\nevent: status\ndata: {\"kind\":\"status\",\"conversationId\":\"conv_taylor01\",\"rev\":42,\"state\":\"idle\",\"label\":null,\"at\":1794943607000}\n\nevent: badge\ndata: {\"kind\":\"badge\",\"rev\":8,\"unreadTotal\":4}\n\n: ping\n\n",
     "expect": {
       "kindsInOrder": [
         "message",
@@ -1120,9 +1133,7 @@
       ],
       "cursorAtSynchronized": 129,
       "cursorAfter": 131,
-      "ignoredKinds": [
-        "weather"
-      ],
+      "ignoredKinds": ["weather"],
       "finalEntities": {
         "msg_0119": {
           "seq": 121,
@@ -1138,19 +1149,8 @@
           "reactions": 1
         }
       },
-      "finalThreadOrder": [
-        "msg_0119",
-        "msg_0122",
-        "q_0123",
-        "msg_0126",
-        "msg_0130"
-      ],
-      "renderedThreadOrder": [
-        "msg_0119",
-        "msg_0122",
-        "q_0123",
-        "msg_0126"
-      ],
+      "finalThreadOrder": ["msg_0119", "msg_0122", "q_0123", "msg_0126", "msg_0130"],
+      "renderedThreadOrder": ["msg_0119", "msg_0122", "q_0123", "msg_0126"],
       "finalStatus": {
         "rev": 42,
         "state": "idle"
@@ -1169,7 +1169,7 @@
   "sendResponse": {
     "message": {
       "kind": "message",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "files": [],
       "reactions": [],
       "voice": null,
@@ -1192,11 +1192,11 @@
   "readResponse": {
     "conversation": {
       "kind": "conversation",
-      "id": "conv_stan01",
+      "id": "conv_taylor01",
       "seq": 2130,
       "agent": {
-        "id": "ag_stan",
-        "name": "Stan"
+        "id": "ag_taylor",
+        "name": "Taylor"
       },
       "lastMessage": {
         "id": "msg_0126",
@@ -1223,7 +1223,7 @@
     "question": {
       "kind": "question",
       "id": "q_0123",
-      "conversationId": "conv_stan01",
+      "conversationId": "conv_taylor01",
       "order": 123,
       "seq": 125,
       "title": "Deploy",
@@ -1266,7 +1266,7 @@
       "question": {
         "kind": "question",
         "id": "q_0123",
-        "conversationId": "conv_stan01",
+        "conversationId": "conv_taylor01",
         "order": 123,
         "seq": 125,
         "title": "Deploy",
@@ -1343,19 +1343,19 @@
     "expiredAuthorization": "HeyDan-Ticket eyJ2IjoxLCJwdXJwb3NlIjoidXBsb2FkIiwiZmlsZUlkIjoiZmlsZV83aFQycFE5YSIsImRldmljZUlkIjoiZGV2XzhRbTNrVDF4VjJhWiIsInVzZXJJZCI6InRlbGVncmFtOjEwMDAwMDEiLCJzaXplIjozMywic2hhMjU2IjoiYjk5ZDJlZThmNjM2ODM4MTdlYzA3ZmJjYTljNzA2NTY0NDIxMDljMGZjNmY0MzMyYTAxOWM1NDRiYWZjNjhlOSIsImV4cCI6MTc5NDk0MzU2MTAwMH0.EQJCpaun7aNIGFuKFnUnqYDha1_kkTmwBjeDVgT2poU"
   },
   "callRequest": {
-    "conversationId": "conv_stan01",
+    "conversationId": "conv_taylor01",
     "attemptId": "f3e2d1c0-b9a8-4776-8554-433221100fed",
     "voiceProtocol": 6,
     "jev": null
   },
   "callGrant": {
     "protocol": 6,
-    "url": "wss://lk.opx.one",
+    "url": "wss://livekit.example.com",
     "token": "eyJ.fixture.token",
     "callId": "call_5tGh2",
     "attemptId": "f3e2d1c0-b9a8-4776-8554-433221100fed",
-    "agent": "Stan",
-    "chat": "Stan (app)",
+    "agent": "Taylor",
+    "chat": "Taylor (app)",
     "silenceMs": 1400,
     "limit": {
       "ms": 3600000,
@@ -1440,16 +1440,16 @@
     "headers": {
       "apns-push-type": "alert",
       "apns-priority": "10",
-      "apns-topic": "com.tenequm.HeyDan",
+      "apns-topic": "com.example.HeyDan",
       "apns-collapse-id": "msg_2102"
     },
     "body": {
       "aps": {
         "alert": {
-          "title": "Stan",
+          "title": "Taylor",
           "body": "Done. The report is attached."
         },
-        "thread-id": "conv_stan01",
+        "thread-id": "conv_taylor01",
         "mutable-content": 1,
         "badge": 3,
         "sound": "default",
@@ -1457,33 +1457,15 @@
       },
       "hd": {
         "v": 1,
-        "h": "https://app.opx.one",
-        "c": "conv_stan01",
+        "h": "https://app.example.com",
+        "c": "conv_taylor01",
         "m": "msg_2102",
         "k": "message",
         "a": {
-          "id": "ag_stan",
-          "name": "Stan"
+          "id": "ag_taylor",
+          "name": "Taylor"
         }
       }
     }
-  },
-  "conversationCallRefused": {
-    "kind": "conversation",
-    "id": "conv_dan01",
-    "seq": 2120,
-    "agent": {
-      "id": "ag_dan",
-      "name": "Dan"
-    },
-    "lastMessage": null,
-    "unread": 0,
-    "readOrder": 0,
-    "canCall": false,
-    "callRefusal": {
-      "error": "no_line",
-      "message": "Calls are not set up for this agent."
-    },
-    "createdAt": 1794857162000
   }
 }

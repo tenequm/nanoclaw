@@ -30,8 +30,8 @@ function row(seq: number): EventRow {
   return {
     seq,
     user_id: 'u',
-    agent_group_id: seq === 124 ? 'other' : 'ag_stan',
-    conversation_id: 'conv_stan01',
+    agent_group_id: seq === 124 ? 'other' : 'ag_taylor',
+    conversation_id: 'conv_taylor01',
     entity_id: 'x',
     kind: f.kind!,
     entity_json: JSON.stringify(f.data),
@@ -60,7 +60,7 @@ function setup(device = 'd') {
   };
   vi.spyOn(deviceAuth, 'onDeviceRevoked').mockImplementation((fn) => subscribe('revoke', fn));
   vi.spyOn(deviceAuth, 'getLiveDevice').mockResolvedValue({} as Awaited<ReturnType<typeof deviceAuth.getLiveDevice>>);
-  vi.spyOn(deviceAuth, 'reachableAgentIds').mockResolvedValue(['ag_stan']);
+  vi.spyOn(deviceAuth, 'reachableAgentIds').mockResolvedValue(['ag_taylor']);
   const deps: StreamDeps = {
     lastEventSeq: async () => 129,
     readEventsAfter: async (after, limit) =>
@@ -71,7 +71,7 @@ function setup(device = 'd') {
     onBadgeChanged: (fn) => subscribe('badge', fn),
     onStatusChanged: (fn) => subscribe('status', fn),
     conversationsFor: async (_user, agents) =>
-      agents.includes('ag_stan') ? [{ id: 'conv_stan01', agent_group_id: 'ag_stan' } as ConversationRow] : [],
+      agents.includes('ag_taylor') ? [{ id: 'conv_taylor01', agent_group_id: 'ag_taylor' } as ConversationRow] : [],
     statuses: async () => [fixtures.statuses.working],
     badgeFor: async () => ({ kind: 'badge', rev: 7, unreadTotal: 3 }),
   };
@@ -82,7 +82,7 @@ function setup(device = 'd') {
     } as unknown as IncomingMessage,
     res: res as unknown as ServerResponse,
     params: {},
-    identity: { deviceId: device, userId: 'u', agentIds: ['ag_stan'] },
+    identity: { deviceId: device, userId: 'u', agentIds: ['ag_taylor'] },
   };
   return { events, deps, ctx, res, output: () => output };
 }
@@ -222,11 +222,11 @@ it('uses signed dispatch and real device access and revocation seams', async () 
       Date.now(),
     );
     await db.run("INSERT INTO users (id,kind,created_at) VALUES ('u','human','now')");
-    await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_stan','Test','test','now')");
+    await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_taylor','Test','test','now')");
     await db.run(
-      "INSERT INTO user_roles (user_id,role,agent_group_id,granted_at) VALUES ('u','admin','ag_stan','now')",
+      "INSERT INTO user_roles (user_id,role,agent_group_id,granted_at) VALUES ('u','admin','ag_taylor','now')",
     );
-    await db.run("INSERT INTO device_auth_user_agents (user_id,agent_group_id,created_at) VALUES ('u','ag_stan',0)");
+    await db.run("INSERT INTO device_auth_user_agents (user_id,agent_group_id,created_at) VALUES ('u','ag_taylor',0)");
     s.ctx.req.method = 'GET';
     s.ctx.req.headers = { authorization: vector.authorization };
     Object.defineProperty(s.ctx.req.socket, 'remoteAddress', { value: '127.0.0.1' });
@@ -258,7 +258,7 @@ it('streams committed messages through the module-level event log wiring', async
     await openModuleStream();
     expect(s.output()).toContain('event: synchronized');
     const message = { ...fixtures.messages.agentMarkdown, id: 'msg_integration', seq: 0, order: 0 } as Message;
-    await appTransaction(() => appendEvent(db, 'u', 'ag_stan', message));
+    await appTransaction(() => appendEvent(db, 'u', 'ag_taylor', message));
     await vi.waitFor(() => expect(s.output()).toContain('msg_integration'));
     expect(s.output()).toContain('event: message');
   } finally {

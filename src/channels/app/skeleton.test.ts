@@ -119,7 +119,7 @@ it('advertises only configured features and derives a domain-separated ticket ke
   expect(config.ticketKey).toHaveLength(32);
   expect(config.ticketKey).not.toEqual(Buffer.alloc(32, 7));
   expect(config.apns.production).toBeNull();
-  expect(config.apns.topic).toBe('com.tenequm.HeyDan');
+  expect(config.apns.topic).toBe('com.example.HeyDan');
 });
 
 it('passes a signed fixture and identity to its handler and contains unexpected failures', async () => {

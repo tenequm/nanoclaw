@@ -15,9 +15,9 @@ it('persists revisions across restart, maps ticks, prioritizes questions and exp
   vi.setSystemTime(fixtures.statuses.working.at);
   const db = new SqliteDriver(new Database(':memory:'));
   await db.exec(
-    "CREATE TABLE app_statuses (conversation_id TEXT PRIMARY KEY, rev INTEGER, state TEXT, label TEXT, at INTEGER); CREATE TABLE app_conversations (id TEXT); INSERT INTO app_conversations VALUES ('conv_stan01');",
+    "CREATE TABLE app_statuses (conversation_id TEXT PRIMARY KEY, rev INTEGER, state TEXT, label TEXT, at INTEGER); CREATE TABLE app_conversations (id TEXT); INSERT INTO app_conversations VALUES ('conv_taylor01');",
   );
-  await db.run('INSERT INTO app_statuses VALUES (?, ?, ?, ?, ?)', 'conv_stan01', 39, 'idle', null, 0);
+  await db.run('INSERT INTO app_statuses VALUES (?, ?, ?, ?, ?)', 'conv_taylor01', 39, 'idle', null, 0);
   let open: string[] = [];
   let event: (e: EventRow) => void = () => {};
   const states = vi.fn(
@@ -34,7 +34,7 @@ it('persists revisions across restart, maps ticks, prioritizes questions and exp
   const deps: StatusDeps = {
     db: () => db,
     containerStates: states,
-    getConversationByPlatformId: async () => ({ id: 'conv_stan01' }) as ConversationRow,
+    getConversationByPlatformId: async () => ({ id: 'conv_taylor01' }) as ConversationRow,
     openQuestionConversationIds: async () => open,
     onEventAppended: (fn) => {
       event = fn;
@@ -52,27 +52,27 @@ it('persists revisions across restart, maps ticks, prioritizes questions and exp
   expect(states).toHaveBeenCalledTimes(2);
   event({
     kind: 'message',
-    conversation_id: 'conv_stan01',
+    conversation_id: 'conv_taylor01',
     entity_json: JSON.stringify({ role: 'agent', seq: 1, order: 1 }),
   } as EventRow);
-  expect((await service.statuses(['conv_stan01']))[0].state).toBe('idle');
-  open = ['conv_stan01'];
-  event({ kind: 'question', conversation_id: 'conv_stan01', entity_json: '{}' } as EventRow);
+  expect((await service.statuses(['conv_taylor01']))[0].state).toBe('idle');
+  open = ['conv_taylor01'];
+  event({ kind: 'question', conversation_id: 'conv_taylor01', entity_json: '{}' } as EventRow);
   await service.setTyping('p');
-  expect((await service.statuses(['conv_stan01']))[0]).toMatchObject({
+  expect((await service.statuses(['conv_taylor01']))[0]).toMatchObject({
     state: 'waiting',
     label: 'Waiting for your answer',
   });
   open = [];
-  event({ kind: 'question', conversation_id: 'conv_stan01', entity_json: '{}' } as EventRow);
-  expect((await service.statuses(['conv_stan01']))[0].state).toBe('working');
+  event({ kind: 'question', conversation_id: 'conv_taylor01', entity_json: '{}' } as EventRow);
+  expect((await service.statuses(['conv_taylor01']))[0].state).toBe('working');
   await vi.advanceTimersByTimeAsync(30_000);
-  const idle = (await service.statuses(['conv_stan01']))[0];
+  const idle = (await service.statuses(['conv_taylor01']))[0];
   expect(idle.state).toBe('idle');
   await service.stop();
   service = createStatusService(deps);
   await service.ready;
-  expect((await service.statuses(['conv_stan01']))[0].rev).toBe(idle.rev + 1);
+  expect((await service.statuses(['conv_taylor01']))[0].rev).toBe(idle.rev + 1);
   await service.stop();
   states.mockResolvedValue([
     {
@@ -83,23 +83,23 @@ it('persists revisions across restart, maps ticks, prioritizes questions and exp
       toolStartedAt: null,
     },
   ]);
-  open = ['conv_stan01'];
+  open = ['conv_taylor01'];
   service = createStatusService(deps);
   await service.ready;
-  expect((await service.statuses(['conv_stan01']))[0].state).toBe('waiting');
+  expect((await service.statuses(['conv_taylor01']))[0].state).toBe('waiting');
   await service.stop();
   open = [];
   service = createStatusService(deps);
   await service.ready;
-  expect((await service.statuses(['conv_stan01']))[0]).toMatchObject({ state: 'working', label: 'Reading files' });
+  expect((await service.statuses(['conv_taylor01']))[0]).toMatchObject({ state: 'working', label: 'Reading files' });
   await service.clearTyping('p');
-  expect((await service.statuses(['conv_stan01']))[0].state).toBe('idle');
+  expect((await service.statuses(['conv_taylor01']))[0].state).toBe('idle');
   await service.stop();
   states.mockRejectedValue(new Error('missing mailbox'));
   service = createStatusService(deps);
   await service.ready;
   await service.setTyping('p');
-  expect((await service.statuses(['conv_stan01']))[0]).toMatchObject({ state: 'working', label: 'Working' });
+  expect((await service.statuses(['conv_taylor01']))[0]).toMatchObject({ state: 'working', label: 'Working' });
   await service.stop();
   await db.close();
 });

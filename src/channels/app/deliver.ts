@@ -60,12 +60,25 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
     const current = (await getConversation(c.id))!;
     let entityId: string;
     if (content.operation === 'edit' || content.operation === 'reaction') {
-      const row = await db.get<MessageRow>(
+      let row = await db.get<MessageRow>(
         'SELECT * FROM app_messages WHERE id=? AND conversation_id=?',
         content.messageId,
         c.id,
       );
-      if (!row || (content.operation === 'edit' && row.role === 'user')) return undefined;
+      row ??= await db.get<MessageRow>(
+        'SELECT m.* FROM app_messages m JOIN app_applied_sources s ON s.entity_id=m.id WHERE s.source_id=? AND m.conversation_id=?',
+        content.messageId,
+        c.id,
+      );
+      if (!row) {
+        log.warn('App delivery target unresolved', {
+          messageId: content.messageId,
+          conversationId: c.id,
+          sourceId: source,
+        });
+        throw new Error('App delivery target unresolved');
+      }
+      if (content.operation === 'edit' && row.role === 'user') return undefined;
       const entity = messageEntity(row);
       if (content.operation === 'edit') {
         entity.text = String(content.text ?? '');

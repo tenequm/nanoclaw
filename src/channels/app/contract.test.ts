@@ -169,20 +169,20 @@ test('conversation list and call-refused example remain separate', () => {
   const refused: Conversation = f.conversationCallRefused;
   assert.deepEqual(
     list.conversations.map((conversation) => conversation.id),
-    ['conv_stan01'],
+    ['conv_taylor01'],
   );
   check(Number.isSafeInteger(list.seq), 'initial stream cursor');
   check(
     list.conversations.every((conversation) => conversation.seq <= list.seq),
     'snapshot cursor covers list',
   );
-  check(refused.id === 'conv_dan01' && !refused.canCall, 'separate refused conversation');
+  check(refused.id === 'conv_sam01' && !refused.canCall, 'separate refused conversation');
   check(refused.callRefusal?.error === 'no_line', 'call refusal reason');
 });
 
 test('push payload identifies its paired host', () => {
   const payload: PushPayload = f.pushPayload.body;
-  check(payload.hd.h === 'https://app.opx.one', 'push host public base');
+  check(payload.hd.h === 'https://app.example.com', 'push host public base');
   check(payload.hd.c === f.conversations.conversations[0].id, 'push conversation');
 });
 

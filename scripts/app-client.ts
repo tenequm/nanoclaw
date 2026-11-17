@@ -31,7 +31,7 @@ export function target(parts: string[], query: [string, string][] = []): string 
     (query.length ? '?' + query.map(([k, v]) => `${encode(k)}=${encode(v)}`).join('&') : '')
   );
 }
-export function guard(base: string, remote: boolean, agent?: string): void {
+export function guard(base: string, remote: boolean, agent?: string, allowedAgent?: string): void {
   const u = new URL(base);
   assert(
     ['http:', 'https:'].includes(u.protocol) &&
@@ -44,7 +44,8 @@ export function guard(base: string, remote: boolean, agent?: string): void {
   );
   const local = ['127.0.0.1', 'localhost', '[::1]', '127.0.0.1.sslip.io'].includes(u.hostname);
   assert(local || remote, 'remote base requires --remote');
-  if (!local && agent !== undefined) assert(agent === 'Stan', 'remote agent must be Stan');
+  if (remote) assert(allowedAgent?.trim(), 'remote requires --agent or LOCAL_REMOTE_AGENT');
+  if (!local && agent !== undefined) assert(agent === allowedAgent, 'remote agent not allowed');
 }
 export interface Event {
   kind: string;
@@ -53,6 +54,11 @@ export interface Event {
 }
 export class StreamParser {
   private decoder = new TextDecoder();
+  private stopped = false;
+  stop(): void {
+    this.stopped = true;
+    this.pending = '';
+  }
   private pending = '';
   cursor: number;
   constructor(
@@ -62,9 +68,10 @@ export class StreamParser {
     this.cursor = cursor;
   }
   feed(bytes: Uint8Array): void {
+    if (this.stopped) return;
     this.pending += this.decoder.decode(bytes, { stream: true });
     let end: number;
-    while ((end = this.pending.indexOf('\n\n')) >= 0) {
+    while (!this.stopped && (end = this.pending.indexOf('\n\n')) >= 0) {
       const block = this.pending.slice(0, end);
       this.pending = this.pending.slice(end + 2);
       let kind = 'message',
@@ -85,6 +92,7 @@ export class StreamParser {
   }
 }
 class Skip extends Error {}
+class RateLimited extends Error {}
 interface Device {
   privateKey: string;
   publicKey: string;
@@ -94,9 +102,12 @@ interface Device {
 interface Options {
   scenario?: string;
   remote?: boolean;
+  agent?: string;
+  deviceDir?: string;
 }
 
 export async function runAppClient(baseUrl: string, runDir: string, options: Options = {}): Promise<void> {
+  const allowedAgent = options.agent ?? process.env.LOCAL_REMOTE_AGENT;
   const scenario = options.scenario ?? 'all';
   assert(['pair', 'send', 'stream', 'upload', 'security', 'all'].includes(scenario), 'unknown scenario');
   mkdirSync(join(runDir, 'results'), { recursive: true });
@@ -111,12 +122,13 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       await fn();
     } catch (e) {
       status = e instanceof Skip ? 'skip' : 'fail';
-      detail = e instanceof Skip ? e.message : 'Assertion or transport failure (payload withheld)';
+      detail =
+        e instanceof Skip || e instanceof RateLimited ? e.message : 'Assertion or transport failure (payload withheld)';
       if (status === 'fail') failures++;
     }
     const result = {
       id: 'n9b-' + (new URL(baseUrl).hostname === '127.0.0.1.sslip.io' ? 'chain-' : 'direct-') + id,
-      title: id.replaceAll('-', ' '),
+      title: (new URL(baseUrl).hostname === '127.0.0.1.sslip.io' ? 'chain ' : 'direct ') + id.replaceAll('-', ' '),
       status,
       detail,
       evidence: ['logs/n9b-client.log'],
@@ -127,13 +139,13 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     console.log(`${result.id}: ${status} (${detail})`);
     return status;
   }
-  if ((await check('guard', async () => guard(baseUrl, !!options.remote))) !== 'pass')
+  if ((await check('guard', async () => guard(baseUrl, !!options.remote, undefined, allowedAgent))) !== 'pass')
     throw new Error('Client guard refused');
   const statePath = '.local/stack.json';
   const stack = existsSync(statePath)
     ? (JSON.parse(readFileSync(statePath, 'utf8')) as { owner: string; group: string })
     : undefined;
-  const dir = '.local/app-client';
+  const dir = options.deviceDir ?? '.local/app-client';
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   async function raw(method: string, path: string, body?: Uint8Array, authorization?: string, signal?: AbortSignal) {
     const response = await fetch(baseUrl + path, {
@@ -147,6 +159,11 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       signal: signal ?? AbortSignal.timeout(15000),
     });
     appendFileSync(log, `http ${method} ${response.status}\n`, { mode: 0o600 });
+    if (response.status === 429) {
+      const retryAfter = Number(response.headers.get('retry-after'));
+      await response.body?.cancel();
+      throw new RateLimited('rate_limited, retry after ' + (Number.isFinite(retryAfter) ? retryAfter : 0) + ' s');
+    }
     if (response.status === 501) {
       await response.body?.cancel();
       throw new Skip('501 not_implemented');
@@ -162,10 +179,6 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     return r.json() as Promise<T>;
   }
   async function pair(index: number, tampered = false): Promise<Device> {
-    if (index === 0) {
-      const probe = await raw('POST', '/app/pair', Buffer.from('{}'));
-      await probe.body?.cancel();
-    }
     let link = process.env[index === 0 ? 'HEYDAN_PAIR_LINK' : 'HEYDAN_PAIR_LINK_SECOND'];
     if (!link) {
       if (options.remote || !stack) throw new Skip('Local stack unavailable for pairing a second device');
@@ -190,7 +203,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     }
     assert(link, 'pair link missing');
     const url = new URL(link);
-    guard(url.origin, !!options.remote);
+    guard(url.origin, !!options.remote, undefined, allowedAgent);
     // The loopback direct and chain endpoints deliberately share one local host identity.
     if (options.remote || !stack) assert(url.origin === new URL(baseUrl).origin, 'pairing host mismatch');
     const keys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
@@ -213,7 +226,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       return {} as Device;
     }
     const paired = await json<PairResponse>(response);
-    for (const agent of paired.agents) guard(baseUrl, !!options.remote, agent.name);
+    for (const agent of paired.agents) guard(baseUrl, !!options.remote, agent.name, allowedAgent);
     const device = {
       privateKey: keys.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
       publicKey,
@@ -225,10 +238,27 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     chmodSync(file, 0o600);
     return device;
   }
+  async function loadOrPair(index: number): Promise<Device> {
+    const file = join(dir, `device-${index}.json`);
+    if (existsSync(file) && !options.remote && stack) {
+      const device = JSON.parse(readFileSync(file, 'utf8')) as Device;
+      const response = await request(device, 'GET', '/app/conversations');
+      if (response.status === 200) {
+        await response.body?.cancel();
+        return device;
+      }
+      const value = await response.json();
+      assert(
+        response.status === 401 && ['unknown_device', 'device_revoked'].includes(value.error),
+        'device validation failed',
+      );
+    }
+    return pair(index);
+  }
   let a: Device | undefined, b: Device | undefined;
   const paired = await check('pair', async () => {
-    a = await pair(0);
-    b = await pair(1);
+    a = await loadOrPair(0);
+    b = await loadOrPair(1);
     assert.notEqual(a.deviceId, b.deviceId);
   });
   const requirePair = () => {
@@ -249,7 +279,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     initialCursor = list.seq;
     const candidate = list.conversations[0];
     assert(candidate);
-    guard(baseUrl, !!options.remote, candidate.agent.name);
+    guard(baseUrl, !!options.remote, candidate.agent.name, allowedAgent);
     conversation = candidate;
   });
   function conv() {
@@ -272,13 +302,22 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
         { mode: 0o600 },
       );
       events.push(e);
-      if (cutAfter && events.length >= cutAfter) controller.abort();
+      if (cutAfter && events.length >= cutAfter) {
+        parser.stop();
+        controller.abort();
+      }
     });
     const t = target(['app', 'events'], [['after', String(after)]]);
     const connectTimer = setTimeout(() => controller.abort(), 15000);
     let response: Response;
     try {
-      response = await raw('GET', t, undefined, signRequest({ ...device, method: 'GET', target: t }), controller.signal);
+      response = await raw(
+        'GET',
+        t,
+        undefined,
+        signRequest({ ...device, method: 'GET', target: t }),
+        controller.signal,
+      );
     } finally {
       clearTimeout(connectTimer);
     }
@@ -412,6 +451,8 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
         await until(() => full.events.some((e) => e.kind === 'synchronized'));
         full.stop();
         await full.done;
+        assert(replay.parser.cursor < Number(full.events.find((e) => e.kind === 'synchronized')!.data.seq));
+        assert(resumed.events.some((e) => ['conversation', 'message', 'question'].includes(e.kind)));
         const ids = (es: Event[]) => es.filter((e) => e.id !== undefined).map((e) => e.id!);
         const combined = ids([...replay.events, ...resumed.events]);
         assert.equal(new Set(combined).size, combined.length);
@@ -463,8 +504,9 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
         assert.equal(minted.uploadPath, target(['app', 'files', minted.fileId]));
         for (const payload of [bytes, bytes, Buffer.alloc(bytes.length, 120)]) {
           const r = await raw('PUT', minted.uploadPath, payload, 'HeyDan-Ticket ' + minted.ticket);
-          assert.equal(r.status, payload === bytes ? 204 : 409);
-          await r.body?.cancel();
+          assert.equal(r.status, payload === bytes ? 204 : 400);
+          if (payload === bytes) assert.equal(await r.text(), '');
+          else assert.equal((await r.json()).error, 'bad_body');
         }
         await reached((await send('reply n9b upload', [minted.fileId])).message);
       });
@@ -544,15 +586,16 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       });
       await check('security-revoke', async () => {
         conv();
-        const opened = await stream(requirePair(), live!.parser.cursor);
-        assert.equal((await request(requirePair(), 'DELETE', '/app/devices/me')).status, 204);
+        const disposable = await pair(3);
+        const opened = await stream(disposable, live!.parser.cursor);
+        assert.equal((await request(disposable, 'DELETE', '/app/devices/me')).status, 204);
         await Promise.race([
           opened.done,
           delay(5000).then(() => {
             throw new Error('revocation stream deadline');
           }),
         ]);
-        const r = await request(requirePair(), 'GET', '/app/conversations');
+        const r = await request(disposable, 'GET', '/app/conversations');
         assert.equal(r.status, 401);
         assert.equal((await r.json()).error, 'device_revoked');
       });
@@ -566,13 +609,20 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
-    options: { base: { type: 'string' }, remote: { type: 'boolean' }, help: { type: 'boolean' } },
+    options: {
+      base: { type: 'string' },
+      remote: { type: 'boolean' },
+      agent: { type: 'string' },
+      help: { type: 'boolean' },
+    },
   });
-  if (values.help) console.log('Usage: app-client.ts <pair|send|stream|upload|security|all> --base <url> [--remote]');
+  if (values.help)
+    console.log('Usage: app-client.ts <pair|send|stream|upload|security|all> --base <url> [--remote --agent <name>]');
   else
     runAppClient(values.base ?? 'http://127.0.0.1:5000', process.env.LOCAL_RUN_DIR ?? '.local/app-client/run', {
       scenario: positionals[0],
       remote: values.remote,
+      agent: values.agent,
     }).catch(() => {
       console.error('Client checks failed; see run results (payload withheld)');
       process.exitCode = 1;

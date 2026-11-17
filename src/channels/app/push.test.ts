@@ -54,7 +54,7 @@ beforeEach(async () => {
     })),
   );
   vi.spyOn(deviceAuth, 'reachableAgentIds').mockImplementation(async (id) =>
-    id === 'other' ? ['ag_other'] : ['ag_stan', ...(id === 'second' ? ['ag_extra'] : [])],
+    id === 'other' ? ['ag_other'] : ['ag_taylor', ...(id === 'second' ? ['ag_extra'] : [])],
   );
   for (const id of ['first', 'second', 'other', 'revoked'])
     await db.run('INSERT INTO app_push_tokens VALUES (?, ?, ?, ?)', id, id, 'sandbox', 1);
@@ -70,9 +70,15 @@ afterEach(async () => {
 function start(overrides: Parameters<typeof subscribePush>[1] = {}) {
   stop = subscribePush(deps, {
     db: () => db,
-    config: () => ({ ...readAppConfig(() => undefined), publicBase: 'https://app.opx.one' }),
+    config: () => ({ ...readAppConfig(() => undefined), publicBase: 'https://app.example.com' }),
     send,
-    agent: async () => ({ id: 'ag_stan', name: 'Stan', folder: 'stan', agent_provider: 'claude', created_at: '' }),
+    agent: async () => ({
+      id: 'ag_taylor',
+      name: 'Taylor',
+      folder: 'taylor',
+      agent_provider: 'claude',
+      created_at: '',
+    }),
     ...overrides,
   });
 }
@@ -80,8 +86,8 @@ function emit(entity: unknown = fixtures.messages.agentWithFiles, kind = 'messag
   event({
     seq: 2102,
     user_id: 'user',
-    agent_group_id: 'ag_stan',
-    conversation_id: 'conv_stan01',
+    agent_group_id: 'ag_taylor',
+    conversation_id: 'conv_taylor01',
     entity_id: 'msg_2102',
     kind,
     entity_json: JSON.stringify(entity),
@@ -146,7 +152,7 @@ async function register(input: unknown, deviceId = 'first') {
   await pushTokenHandler(
     () => db,
     async () => Buffer.from(JSON.stringify(input)),
-  )({ req, res, params: {}, identity: { deviceId, userId: 'user', agentIds: ['ag_stan'] } });
+  )({ req, res, params: {}, identity: { deviceId, userId: 'user', agentIds: ['ag_taylor'] } });
   return res.statusCode;
 }
 it('stores the fixture, transfers duplicate tokens atomically and accepts simulator lengths', async () => {
@@ -253,17 +259,17 @@ it('logs rejected sends and actual token removals without payloads or tokens', a
 });
 
 it('queues committed agent messages through the module-level push subscription', async () => {
-  vi.stubEnv('APP_PUBLIC_BASE', 'https://app.opx.one');
-  await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_stan','Stan','stan','now')");
+  vi.stubEnv('APP_PUBLIC_BASE', 'https://app.example.com');
+  await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_taylor','Taylor','taylor','now')");
   vi.mocked(apns.sendPush).mockClear();
   const message = { ...fixtures.messages.agentMarkdown, seq: 0, order: 0 } as Message;
-  await appTransaction(() => appendEvent(db, 'user', 'ag_stan', message));
+  await appTransaction(() => appendEvent(db, 'user', 'ag_taylor', message));
   await vi.waitFor(() => expect(apns.sendPush).toHaveBeenCalledTimes(2));
   expect(apns.sendPush).toHaveBeenCalledWith(
     { token: 'first', environment: 'sandbox' },
     message.id,
     expect.objectContaining({
-      hd: expect.objectContaining({ m: message.id, k: 'message', a: { id: 'ag_stan', name: 'Stan' } }),
+      hd: expect.objectContaining({ m: message.id, k: 'message', a: { id: 'ag_taylor', name: 'Taylor' } }),
     }),
   );
 });

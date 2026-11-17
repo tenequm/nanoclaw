@@ -77,7 +77,7 @@ beforeEach(async () => {
   client = createApnsClient({
     config: {
       teamId: 'team',
-      topic: 'com.tenequm.HeyDan',
+      topic: 'com.example.HeyDan',
       sandbox: { keyId: 'sandbox', keyPath: join(directory, 'key.p8') },
       production: { keyId: 'production', keyPath: join(directory, 'production.p8') },
     },

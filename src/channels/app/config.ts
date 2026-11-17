@@ -16,7 +16,7 @@ export function readAppConfig(read: (key: string) => string | undefined = envVal
     ticketKey: key ? Buffer.from(hkdfSync('sha256', key, Buffer.alloc(0), 'heydan-app-ticket-v1', 32)) : null,
     apns: {
       teamId: read('APP_APNS_TEAM_ID') || null,
-      topic: read('APP_APNS_TOPIC') || 'com.tenequm.HeyDan',
+      topic: read('APP_APNS_TOPIC') || 'com.example.HeyDan',
       sandbox: apnsKey('SANDBOX'),
       production: apnsKey('PRODUCTION'),
     },

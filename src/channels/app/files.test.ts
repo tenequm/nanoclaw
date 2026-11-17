@@ -458,7 +458,7 @@ it.each(['abort', 'revoke'] as const)('HTTP %s mid-body removes temporary bytes 
 
 it('real module hooks claim a sent file, stage it and deliver an agent file into history', async () => {
   configureFiles({ root: path.join(directory, 'files'), stagingRoot: path.join(directory, 'staging') });
-  await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('agent','Stan','stan','2026-11-17')");
+  await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('agent','Taylor','taylor','2026-11-17')");
   const conversation = await ensureConversation('user', 'agent');
   const { body: upload } = await mint();
   expect((await request(service.uploadFile, content, { id: upload.fileId, ticket: upload.ticket })).status).toBe(204);

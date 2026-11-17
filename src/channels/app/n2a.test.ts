@@ -40,8 +40,10 @@ let conversationId: string;
 beforeEach(async () => {
   const db = await initSqliteTestDb();
   await runMigrations(db);
-  await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_stan','Stan','stan','2026-11-17')");
-  conversationId = (await ensureConversation('telegram:owner', 'ag_stan')).id;
+  await db.run(
+    "INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_taylor','Taylor','taylor','2026-11-17')",
+  );
+  conversationId = (await ensureConversation('telegram:owner', 'ag_taylor')).id;
   setAppHooks({
     statuses: async (ids) =>
       ids.map((conversationId) => ({
@@ -66,7 +68,7 @@ async function request(
   body: unknown = {},
   id = conversationId,
   userId = 'telegram:owner',
-  agentIds = ['ag_stan'],
+  agentIds = ['ag_taylor'],
   query = '',
 ) {
   const req = new IncomingMessage(new Socket());
@@ -91,7 +93,7 @@ async function question(id: string) {
 async function ask(expiresAt: number | null = null) {
   const db = getDb();
   await db.run(
-    "INSERT OR IGNORE INTO sessions (id,agent_group_id,messaging_group_id,created_at) VALUES ('session','ag_stan',?,'2026-11-17')",
+    "INSERT OR IGNORE INTO sessions (id,agent_group_id,messaging_group_id,created_at) VALUES ('session','ag_taylor',?,'2026-11-17')",
     conversationId,
   );
   const questionId = randomUUID();
@@ -154,7 +156,7 @@ it('sends once even when the retry names consumed files, and conflicts on change
   expect((await message(first.body.message.id)).delivery).toBe('reached');
   expect(route.mock.calls[0][0]).toMatchObject({
     channelType: 'app',
-    agentGroupId: 'ag_stan',
+    agentGroupId: 'ag_taylor',
     message: { id: first.body.message.id, isMention: true, isGroup: false },
   });
 });
@@ -209,7 +211,7 @@ it.each(['host', 'voiceCaller', 'voiceSpoken'] as const)(
     });
   },
 );
-it('edits and reacts in place, deduplicating operation sources', async () => {
+it.each(['entity', 'source'])('edits and reacts by %s, deduplicating operation sources', async (target) => {
   const [first, edit, reaction] = fixtures.messages.editSequence;
   const id = (await deliver(conversationId, null, { kind: 'chat', sourceId: 'first', content: { text: first.text } }))!;
   const original = await message(id);
@@ -217,14 +219,18 @@ it('edits and reacts in place, deduplicating operation sources', async () => {
   await deliver(conversationId, null, {
     kind: 'chat',
     sourceId: 'edit',
-    content: { operation: 'edit', messageId: id, text: edit.text },
+    content: { operation: 'edit', messageId: target === 'source' ? 'first' : id, text: edit.text },
   });
   const edited = await message(id);
   expect(edited).toMatchObject({ id, order: original.order, text: edit.text, editedAt: edit.editedAt });
   const command = {
     kind: 'chat',
     sourceId: 'reaction',
-    content: { operation: 'reaction', messageId: id, emoji: reaction.reactions[0].emoji },
+    content: {
+      operation: 'reaction',
+      messageId: target === 'source' ? 'first' : id,
+      emoji: reaction.reactions[0].emoji,
+    },
   };
   await deliver(conversationId, null, command);
   const seq = await lastEventSeq();
@@ -314,7 +320,7 @@ it('lists from a safe cursor, pages by order and clamps monotone read state and 
   const list = await request(listConversations);
   expect(list.body.conversations[0]).toMatchObject({ unread: 3, lastMessage: { preview: 'Message 2' }, canCall: true });
   expect(list.body.seq).toBe(await lastEventSeq());
-  const page = await request(history, {}, conversationId, 'telegram:owner', ['ag_stan'], '?limit=2');
+  const page = await request(history, {}, conversationId, 'telegram:owner', ['ag_taylor'], '?limit=2');
   expect(page.body.items.map((m: Message) => m.id)).toEqual(ids.slice(1));
   expect(page.body.hasMoreBefore).toBe(true);
   const first = await message(ids[0]);
@@ -323,7 +329,7 @@ it('lists from a safe cursor, pages by order and clamps monotone read state and 
     {},
     conversationId,
     'telegram:owner',
-    ['ag_stan'],
+    ['ag_taylor'],
     `?after=${first.order}&limit=1`,
   );
   expect(after.body.items[0].id).toBe(ids[1]);
@@ -332,7 +338,7 @@ it('lists from a safe cursor, pages by order and clamps monotone read state and 
   const seq = await lastEventSeq();
   await request(markRead, { order: 0 });
   expect(await lastEventSeq()).toBe(seq);
-  expect(await badgeFor('telegram:owner', ['ag_stan'])).toMatchObject({ unreadTotal: 0, rev: 4 });
+  expect(await badgeFor('telegram:owner', ['ag_taylor'])).toMatchObject({ unreadTotal: 0, rev: 4 });
 });
 it.each(Object.entries(fixtures.messages).filter(([key]) => ['userFailed', 'userUnknown'].includes(key)))(
   'matches delivery error fixture %s',
@@ -465,7 +471,7 @@ it('never regresses reached delivery and emits scoped conversation events after 
   for (const event of events)
     expect(event).toMatchObject({
       user_id: 'telegram:owner',
-      agent_group_id: 'ag_stan',
+      agent_group_id: 'ag_taylor',
       conversation_id: conversationId,
     });
   await setDelivery(sent.body.message.id, 'reached');
@@ -488,7 +494,7 @@ it('pages mixed questions and messages before an order', async () => {
     {},
     conversationId,
     'telegram:owner',
-    ['ag_stan'],
+    ['ag_taylor'],
     '?before=' + (await message(id)).order,
   );
   expect(page.body).toEqual({ items: [await question(q)], hasMoreBefore: false, hasMoreAfter: true });
@@ -537,7 +543,7 @@ it('calls availability outside central transactions', async () => {
       return { canCall: true, callRefusal: null };
     },
   });
-  await ensureConversation('telegram:new', 'ag_stan');
+  await ensureConversation('telegram:new', 'ag_taylor');
   await request(sendMessage, { clientId: randomUUID(), text: 'hello', fileIds: [] });
   await deliver(conversationId, null, { kind: 'chat', sourceId: 'reply', content: { text: 'reply' } });
   await request(markRead, { order: 9999 });
@@ -611,4 +617,15 @@ it('isolates startup recovery failures from other host callbacks', async () => {
   await new Promise((resolve) => setImmediate(resolve));
   expect(nextChannelStarted).toBe(true);
   await stopHostModules();
+});
+
+it.each(['edit', 'reaction'])('retries an unresolved %s target', async (operation) => {
+  await expect(
+    deliver(conversationId, null, {
+      kind: 'chat',
+      sourceId: 'unresolved',
+      content: { operation, messageId: 'missing' },
+    }),
+  ).rejects.toThrow('App delivery target unresolved');
+  expect(await getDb().get('SELECT * FROM app_applied_sources WHERE source_id=?', 'unresolved')).toBeUndefined();
 });
