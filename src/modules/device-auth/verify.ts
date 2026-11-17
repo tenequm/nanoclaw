@@ -59,12 +59,18 @@ export function onDeviceRevoked(listener: (deviceId: string) => void): () => voi
     listeners.delete(listener);
   };
 }
-export async function revokeDevice(deviceId: string): Promise<void> {
-  await getDb().run(
+export async function revokeDevice(deviceId: string): Promise<'revoked' | 'already_revoked' | 'not_found'> {
+  const result = await getDb().run(
     'UPDATE device_auth_devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL',
     Date.now(),
     deviceId,
   );
+  if (!result.changes) {
+    return (await getDb().get('SELECT id FROM device_auth_devices WHERE id = ?', deviceId))
+      ? 'already_revoked'
+      : 'not_found';
+  }
+  log.info('Device revoked', { deviceId });
   for (const listener of listeners) {
     try {
       listener(deviceId);
@@ -72,6 +78,7 @@ export async function revokeDevice(deviceId: string): Promise<void> {
       log.warn('Device revocation listener failed', { kind: error instanceof Error ? error.name : typeof error });
     }
   }
+  return 'revoked';
 }
 export async function verifyRequest(req: IncomingMessage, now = Date.now()): Promise<DeviceIdentity> {
   try {
@@ -109,6 +116,7 @@ export async function verifyRequest(req: IncomingMessage, now = Date.now()): Pro
     );
     return { deviceId: device.id, userId: device.user_id, agentIds: await reachableAgentIds(device.id) };
   } catch (error) {
+    // This masks repeated auth failures, not work: valid requests still pass from a shared address.
     if (error instanceof AuthError) await enforceRateLimit(`auth:${clientAddress(req)}`, 60, now);
     throw error;
   }

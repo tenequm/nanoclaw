@@ -109,6 +109,7 @@ export const handlePair: AppHandler = async ({ req, res }) => {
       await db.run('INSERT INTO device_auth_device_agents (device_id, agent_group_id) VALUES (?, ?)', deviceId, id);
     return code.user_id;
   });
+  log.info('Device paired', { deviceId, userId, address: clientAddress(req) });
   const agents: { id: string; name: string }[] = [];
   for (const id of await reachableAgentIds(deviceId)) {
     const agent = await db.get<{ id: string; name: string }>('SELECT id, name FROM agent_groups WHERE id = ?', id);

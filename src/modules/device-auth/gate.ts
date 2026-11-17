@@ -79,8 +79,17 @@ export function admitsVoiceModePeer(
   return policy.allowedClients.has(client);
 }
 
+// Refresh at most once a minute to avoid synchronous config reads on the request path.
+let proxyCache: { raw: string | undefined; set: CidrSet; checkedAt: number } | undefined;
 function trustedProxies(): CidrSet {
-  return parseCidrs(envValue('VOICE_MODE_TRUSTED_PROXY_CIDRS'), 'VOICE_MODE_TRUSTED_PROXY_CIDRS');
+  const now = performance.now();
+  if (!proxyCache || now - proxyCache.checkedAt >= 60_000) {
+    const raw = envValue('VOICE_MODE_TRUSTED_PROXY_CIDRS');
+    const set =
+      proxyCache && proxyCache.raw === raw ? proxyCache.set : parseCidrs(raw, 'VOICE_MODE_TRUSTED_PROXY_CIDRS');
+    proxyCache = { raw, set, checkedAt: now };
+  }
+  return proxyCache.set;
 }
 export function appPeerAllowed(req: IncomingMessage): boolean {
   return isLoopbackAddress(req.socket.remoteAddress) || trustedProxies().has(req.socket.remoteAddress);

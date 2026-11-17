@@ -50,8 +50,9 @@ registerResource({
       description: 'Revoke a device.',
       args: [{ name: 'id', type: 'string', required: true, description: 'Device id.' }],
       handler: async (args) => {
-        await revokeDevice(args.id as string);
-        return { revoked: args.id };
+        const status = await revokeDevice(args.id as string);
+        if (status === 'not_found') throw new Error('No such device');
+        return { revoked: args.id, status, message: status === 'already_revoked' ? 'Already revoked' : 'Revoked' };
       },
     },
   },

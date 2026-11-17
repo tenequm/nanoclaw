@@ -19,10 +19,12 @@ import {
 import { handlePair, mintPairingLink } from './pairing.js';
 import { appPeerAllowed, clientAddress } from './gate.js';
 import { canonicalSigningText } from '../../channels/app/contract.js';
-import { consumeRateLimit } from './rate-limit.js';
+import { log } from '../../log.js';
+import { envValue } from '../../env.js';
+import { consumeRateLimit, rateLimitAddress } from './rate-limit.js';
 import f from '../../channels/app/app-contract.fixtures.json' with { type: 'json' };
 
-vi.mock('../../env.js', () => ({ envValue: (key: string) => process.env[key], readEnvFile: () => ({}) }));
+vi.mock('../../env.js', () => ({ envValue: vi.fn((key: string) => process.env[key]), readEnvFile: () => ({}) }));
 vi.mock('../../router.js', () => ({ registerMessageInterceptor: vi.fn() }));
 const now = f.hello.serverTime;
 let dir: string;
@@ -119,7 +121,7 @@ it('rejects altered and oversized bodies before reading oversized content length
   });
   expect(read).not.toHaveBeenCalled();
 });
-it('throttles failed authentication and expires durable buckets', async () => {
+it('masks failed authentication and expires durable buckets', async () => {
   for (let i = 0; i < 60; i++) await consumeRateLimit('auth:127.0.0.1', 60, 600000, now);
   const req = request();
   req.headers.authorization = 'invalid';
@@ -127,9 +129,11 @@ it('throttles failed authentication and expires durable buckets', async () => {
     status: 429,
     body: { error: 'rate_limited', retryAfter: 600 },
   });
+  await expect(verifyRequest(request(), now)).resolves.toMatchObject({ deviceId: first.deviceId });
   expect((await consumeRateLimit('auth:127.0.0.1', 60, 600000, now + 600000)).allowed).toBe(true);
 });
 it('uses the trusted rightmost forwarded hop and ignores Forwarded and untrusted peers', () => {
+  vi.spyOn(performance, 'now').mockReturnValue(1e12);
   vi.stubEnv('VOICE_MODE_TRUSTED_PROXY_CIDRS', '172.18.0.0/16');
   const req = request();
   Object.defineProperty(req.socket, 'remoteAddress', { value: '172.18.0.2', configurable: true });
@@ -208,4 +212,80 @@ it('checks a separately signed unsupported protocol before cryptography', async 
   const req = request(v);
   req.headers.authorization = `HeyDan-Sig v=1,p=2,d=${v.deviceId},t=${v.ts},n=${v.nonce},bh=${v.bodyHash},s=${signature}`;
   await expect(verifyRequest(req, now)).rejects.toMatchObject(f.errors.protocol);
+});
+
+it('caches proxy reads and parsing, refreshing changed policy after a minute', () => {
+  const clock = vi.spyOn(performance, 'now').mockReturnValue(2e12);
+  const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+  vi.stubEnv('VOICE_MODE_TRUSTED_PROXY_CIDRS', 'invalid,172.18.0.0/16');
+  vi.mocked(envValue).mockClear();
+  const req = request();
+  Object.defineProperty(req.socket, 'remoteAddress', { value: '172.18.0.2' });
+  expect(appPeerAllowed(req)).toBe(true);
+  clientAddress(req);
+  expect(vi.mocked(envValue)).toHaveBeenCalledTimes(1);
+  expect(warn).toHaveBeenCalledTimes(1);
+  clock.mockReturnValue(2e12 + 60000);
+  expect(appPeerAllowed(req)).toBe(true);
+  expect(warn).toHaveBeenCalledTimes(1);
+  vi.stubEnv('VOICE_MODE_TRUSTED_PROXY_CIDRS', '');
+  clock.mockReturnValue(2e12 + 120000);
+  expect(appPeerAllowed(req)).toBe(false);
+});
+it('groups IPv6 by /64 and normalizes mapped IPv4', async () => {
+  expect(rateLimitAddress('2001:db8:1:2::1')).toBe(rateLimitAddress('2001:0db8:0001:0002:ffff::2'));
+  expect(rateLimitAddress('2001:db8:1:3::1')).not.toBe(rateLimitAddress('2001:db8:1:2::1'));
+  expect(rateLimitAddress('::ffff:192.0.2.1')).toBe('192.0.2.1');
+  expect(rateLimitAddress('::ffff:c000:201')).toBe('192.0.2.1');
+  await consumeRateLimit('pair:2001:db8:1:2::1', 1, 600000, now);
+  expect((await consumeRateLimit('pair:2001:db8:1:2::2', 1, 600000, now)).allowed).toBe(false);
+});
+it('resets the caller atomically and sweeps other buckets only once a minute', async () => {
+  const db = getDb();
+  await consumeRateLimit('pair:caller', 1, 1000, now);
+  await db.run("INSERT INTO device_auth_rate_limits VALUES ('pair:expired', 1, ?)", now);
+  const results = await Promise.all([
+    consumeRateLimit('pair:caller', 1, 1000, now + 1000),
+    consumeRateLimit('pair:caller', 1, 1000, now + 1000),
+  ]);
+  expect(results.filter((result) => result.allowed)).toHaveLength(1);
+  expect(await db.get("SELECT * FROM device_auth_rate_limits WHERE bucket_key='pair:expired'")).toBeDefined();
+  await consumeRateLimit('pair:caller', 1, 1000, now + 60000);
+  expect(await db.get("SELECT * FROM device_auth_rate_limits WHERE bucket_key='pair:expired'")).toBeUndefined();
+});
+it('logs safe audit fields once per pairing, revocation and limit crossing', async () => {
+  const info = vi.spyOn(log, 'info').mockImplementation(() => {});
+  await seedCode();
+  const result = await pair();
+  const deviceId = result.body.deviceId as string;
+  expect(info).toHaveBeenCalledWith('Device paired', { deviceId, userId: 'u', address: '127.0.0.1' });
+  await revokeDevice(deviceId);
+  await revokeDevice(deviceId);
+  await consumeRateLimit('pair:192.0.2.1', 1, 600000, now);
+  await consumeRateLimit('pair:192.0.2.1', 1, 600000, now);
+  await consumeRateLimit('pair:192.0.2.1', 1, 600000, now);
+  expect(info.mock.calls).toEqual([
+    ['Device paired', { deviceId, userId: 'u', address: '127.0.0.1' }],
+    ['Device revoked', { deviceId }],
+    ['Device rate limit reached', { kind: 'pair', address: '192.0.2.1' }],
+  ]);
+});
+it('copies the pairing subset into device grants and the response', async () => {
+  const db = getDb();
+  await db.run("INSERT INTO users (id,kind,created_at) VALUES ('u','human','now')");
+  await db.run("INSERT INTO user_roles (user_id,role,granted_at) VALUES ('u','owner','now')");
+  for (const id of ['a', 'b']) {
+    await db.run('INSERT INTO agent_groups (id,name,folder,created_at) VALUES (?,?,?,?)', id, id, id, 'now');
+    await db.run("INSERT INTO device_auth_user_agents VALUES ('u',?,?)", id, now);
+  }
+  await seedCode();
+  await db.run(`UPDATE device_auth_pairing_codes SET agent_ids_json='["a"]'`);
+  const result = await pair();
+  expect(result.body.agents).toEqual([{ id: 'a', name: 'a' }]);
+  expect(
+    await db.all(
+      'SELECT agent_group_id FROM device_auth_device_agents WHERE device_id=?',
+      result.body.deviceId as string,
+    ),
+  ).toEqual([{ agent_group_id: 'a' }]);
 });
