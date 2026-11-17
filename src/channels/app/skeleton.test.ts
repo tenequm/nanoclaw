@@ -24,8 +24,9 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-async function request(method: string, target: string) {
+async function request(method: string, target: string, peer = '127.0.0.1') {
   const req = new IncomingMessage(new Socket());
+  Object.defineProperty(req.socket, 'remoteAddress', { value: peer });
   req.method = method;
   req.url = target;
   const res = new ServerResponse(req);
@@ -41,11 +42,13 @@ it('serves hello with the contract shape without credentials', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(fixtures.hello.serverTime);
   expect(await request('GET', '/app/hello')).toEqual({ status: 200, body: { ...fixtures.hello, features: [] } });
 });
-it.each(routes.filter((r) => !['N0', 'N4'].includes(r.lane)))('$method $path is an explicit stub', async (route) => {
-  expect(await request(route.method, route.path.replace(/:[A-Za-z]+/g, 'test'))).toEqual({
-    status: 501,
-    body: { error: 'not_implemented', message: `This feature is awaiting ${route.lane}.` },
-  });
+it.each(routes.filter((route) => route.signed))('$method $path requires a signature', async (route) => {
+  const db = await initDb(':memory:', { role: 'test' });
+  await runMigrations(db);
+  expect(await request(route.method, route.path.replace(/:[A-Za-z]+/g, 'test'))).toEqual(fixtures.errors.badSignature);
+});
+it('refuses a non-loopback peer', async () => {
+  expect((await request('GET', '/app/hello', '192.168.1.2')).status).toBe(403);
 });
 it('rejects unknown routes and methods without reading a body', async () => {
   expect((await request('POST', '/app/hello')).status).toBe(404);
