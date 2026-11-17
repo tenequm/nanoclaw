@@ -195,6 +195,8 @@ const errors = {
   badBody: { status: 400, body: { error: 'bad_body', message: 'The request body does not match its signature.' } },
   badRequest: { status: 400, body: { error: 'bad_request', message: 'The request is malformed.' } },
   forbidden: { status: 403, body: { error: 'forbidden', message: 'This device cannot reach that agent.' } },
+  badProof: { status: 400, body: { error: 'bad_proof', message: 'The pairing proof is not valid.' } },
+  answerNotDelivered: { status: 502, body: { error: 'answer_not_delivered', message: 'The answer did not reach the agent. Try again.' } },
   invalidCode: { status: 403, body: { error: 'invalid_code', message: 'This pairing link is used or expired. Send /pair again.' } },
   notFound: { status: 404, body: { error: 'not_found', message: 'Not found.' } },
   useCallScreen: { status: 409, body: { error: 'use_call_screen', message: 'Start a call with the call button.' } },
@@ -225,7 +227,8 @@ const fixtures = {
   pairProofTampered: { code: 'X' + pairCode.slice(1), publicKey: testKey.publicKeySpki, proof: pairProof, valid: false, why: 'the proof was made for another code' },
   pairResponse: { deviceId, userName: 'Misha', agents: [agent], protocol: 1, serverTime: AT },
   errors,
-  conversations: { conversations: [conv129, convDan], statuses: [statusWorking], badge: badge(7, 3), seq: 129 },
+  conversations: { conversations: [conv129], statuses: [statusWorking], badge: badge(7, 3), seq: 129 },
+  conversationCallRefused: convDan,
   historyPage: { items: [send119Reached, reply122, q123Answered, draft126Reacted, live130], hasMoreBefore: true, hasMoreAfter: false },
   messages: { agentMarkdown, agentWithFiles, userWithFile, userUnknown, userFailed, voiceCaller, voiceSpoken, host: hostLine, future: live130,
     send: { stored: send119, routed: send119Routed, reached: send119Reached },
@@ -266,7 +269,7 @@ const fixtures = {
     headers: { 'apns-push-type': 'alert', 'apns-priority': '10', 'apns-topic': 'com.tenequm.HeyDan', 'apns-collapse-id': 'msg_2102' },
     body: {
       aps: { alert: { title: 'Stan', body: 'Done. The report is attached.' }, 'thread-id': 'conv_stan01', 'mutable-content': 1, badge: 3, sound: 'default', category: 'message' },
-      hd: { v: 1, c: 'conv_stan01', m: 'msg_2102', k: 'message', a: agent },
+      hd: { v: 1, h: 'https://app.opx.one', c: 'conv_stan01', m: 'msg_2102', k: 'message', a: agent },
     },
   },
 };

@@ -279,6 +279,7 @@ export interface PushAPS {
 
 export interface PushData {
   v: number;
+  h: string;
   c: string;
   m: string;
   k: Kind;

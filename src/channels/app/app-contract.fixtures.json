@@ -330,6 +330,20 @@
         "message": "This device cannot reach that agent."
       }
     },
+    "badProof": {
+      "status": 400,
+      "body": {
+        "error": "bad_proof",
+        "message": "The pairing proof is not valid."
+      }
+    },
+    "answerNotDelivered": {
+      "status": 502,
+      "body": {
+        "error": "answer_not_delivered",
+        "message": "The answer did not reach the agent. Try again."
+      }
+    },
     "invalidCode": {
       "status": 403,
       "body": {
@@ -458,24 +472,6 @@
         "readOrder": 118,
         "canCall": true,
         "callRefusal": null,
-        "createdAt": 1794857162000
-      },
-      {
-        "kind": "conversation",
-        "id": "conv_dan01",
-        "seq": 2120,
-        "agent": {
-          "id": "ag_dan",
-          "name": "Dan"
-        },
-        "lastMessage": null,
-        "unread": 0,
-        "readOrder": 0,
-        "canCall": false,
-        "callRefusal": {
-          "error": "no_line",
-          "message": "Calls are not set up for this agent."
-        },
         "createdAt": 1794857162000
       }
     ],
@@ -1461,6 +1457,7 @@
       },
       "hd": {
         "v": 1,
+        "h": "https://app.opx.one",
         "c": "conv_stan01",
         "m": "msg_2102",
         "k": "message",
@@ -1470,5 +1467,23 @@
         }
       }
     }
+  },
+  "conversationCallRefused": {
+    "kind": "conversation",
+    "id": "conv_dan01",
+    "seq": 2120,
+    "agent": {
+      "id": "ag_dan",
+      "name": "Dan"
+    },
+    "lastMessage": null,
+    "unread": 0,
+    "readOrder": 0,
+    "canCall": false,
+    "callRefusal": {
+      "error": "no_line",
+      "message": "Calls are not set up for this agent."
+    },
+    "createdAt": 1794857162000
   }
 }

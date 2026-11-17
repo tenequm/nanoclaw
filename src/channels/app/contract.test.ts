@@ -13,6 +13,8 @@ import {
   bodySHA256,
 } from './contract.js';
 import type {
+  Conversation,
+  PushPayload,
   SigningFields,
   AppEvent,
   Badge,
@@ -159,5 +161,39 @@ test('voice fixture supports unresolved names and nullable saved choices', () =>
     );
     const defaults: VoiceView = { ...view, saved };
     check(defaults.saved.provider === null && defaults.effective.provider !== null, 'saved defaults');
+  }
+});
+
+test('conversation list and call-refused example remain separate', () => {
+  const list: ConversationsResponse = f.conversations;
+  const refused: Conversation = f.conversationCallRefused;
+  assert.deepEqual(
+    list.conversations.map((conversation) => conversation.id),
+    ['conv_stan01'],
+  );
+  check(Number.isSafeInteger(list.seq), 'initial stream cursor');
+  check(
+    list.conversations.every((conversation) => conversation.seq <= list.seq),
+    'snapshot cursor covers list',
+  );
+  check(refused.id === 'conv_dan01' && !refused.canCall, 'separate refused conversation');
+  check(refused.callRefusal?.error === 'no_line', 'call refusal reason');
+});
+
+test('push payload identifies its paired host', () => {
+  const payload: PushPayload = f.pushPayload.body;
+  check(payload.hd.h === 'https://app.opx.one', 'push host public base');
+  check(payload.hd.c === f.conversations.conversations[0].id, 'push conversation');
+});
+
+test('pair proof and answer delivery errors decode with their HTTP status', () => {
+  for (const [name, status, code] of [
+    ['badProof', 400, 'bad_proof'],
+    ['answerNotDelivered', 502, 'answer_not_delivered'],
+  ] as const) {
+    const response: { status: number; body: ErrorBody } = f.errors[name];
+    check(response.status === status, 'HTTP status');
+    check(response.body.error === code, 'error code');
+    check(typeof response.body.message === 'string' && response.body.message.length > 0, 'error message');
   }
 });
