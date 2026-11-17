@@ -12,6 +12,9 @@ import type { DeviceRow } from '../../modules/device-auth/db.js';
 import type { AppHandler } from './routes.js';
 import './db.js';
 import { configureFiles, createFileService, fileMetadata } from './files.js';
+import { ensureConversation, history } from './conversations.js';
+import { sendMessage, drainRoutingJobs } from './send.js';
+import { deliver } from './deliver.js';
 import { readTicket } from './contract.js';
 import { getHostStartCallbacks, getHostShutdownCallbacks } from '../../host-lifecycle.js';
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
@@ -57,6 +60,7 @@ beforeEach(async () => {
   });
 });
 afterEach(async () => {
+  configureFiles();
   await closeDb();
   await rm(directory, { recursive: true, force: true });
 });
@@ -73,7 +77,9 @@ async function request(
   } = {},
 ) {
   const req = new IncomingMessage(new Socket());
-  req.headers.authorization = options.ticket ? `HeyDan-Ticket ${options.ticket}` : auth;
+  req.headers.authorization = options.ticket
+    ? `HeyDan-Ticket ${options.ticket}`
+    : auth.replace(sha256, createHash('sha256').update(body).digest('hex'));
   if (options.length !== null) req.headers['content-length'] = options.length ?? String(body.length);
   const res = new ServerResponse(req);
   let output = '';
@@ -397,9 +403,7 @@ it('expired fixture authorization reaches the upload handler', async () => {
 });
 
 it('production wiring registers hooks and catches boot cleanup failures', async () => {
-  const setAppHooks = vi.fn();
-  const wired = configureFiles({ getConversation: async () => undefined, setAppHooks });
-  expect(setAppHooks).toHaveBeenCalledWith(wired);
+  const wired = configureFiles();
   const failed = vi.spyOn(wired, 'startCleanup').mockRejectedValue(new Error('test failure'));
   const start = getHostStartCallbacks().at(-1)!;
   await expect(
@@ -450,4 +454,51 @@ it.each(['abort', 'revoke'] as const)('HTTP %s mid-body removes temporary bytes 
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+it('real module hooks claim a sent file, stage it and deliver an agent file into history', async () => {
+  configureFiles({ root: path.join(directory, 'files'), stagingRoot: path.join(directory, 'staging') });
+  await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('agent','Stan','stan','2026-11-17')");
+  const conversation = await ensureConversation('user', 'agent');
+  const { body: upload } = await mint();
+  expect((await request(service.uploadFile, content, { id: upload.fileId, ticket: upload.ticket })).status).toBe(204);
+  const body = Buffer.from(JSON.stringify({ clientId: randomUUID(), text: '', fileIds: [upload.fileId] }));
+  const sent = await request(sendMessage, body, { id: conversation.id });
+  expect(sent.status).toBe(200);
+  expect(sent.body.message.files).toMatchObject([{ id: upload.fileId }]);
+  expect(await db.get('SELECT message_id,conversation_id FROM app_files WHERE id=?', upload.fileId)).toEqual({
+    message_id: sent.body.message.id,
+    conversation_id: conversation.id,
+  });
+  expect(await request(sendMessage, body, { id: conversation.id })).toEqual(sent);
+  const route = vi.fn(async (input) => {
+    const { attachments } = JSON.parse(input.message.content);
+    expect(attachments).toHaveLength(1);
+    expect(await readFile(attachments[0].stagedPath)).toEqual(content);
+    input.onStored();
+  });
+  await drainRoutingJobs(route);
+  expect(route).toHaveBeenCalledOnce();
+  expect(await db.get('SELECT delivery FROM app_messages WHERE id=?', sent.body.message.id)).toEqual({
+    delivery: 'reached',
+  });
+  const id = await deliver(conversation.id, null, {
+    kind: 'chat-sdk',
+    sourceId: randomUUID(),
+    content: { text: '' },
+    files: [{ filename: 'reply.pdf', data: Buffer.from('%PDF-1.7') }],
+  });
+  const result = await request(history, Buffer.alloc(0), { id: conversation.id });
+  expect(result.status).toBe(200);
+  expect(result.body.items).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        id,
+        role: 'agent',
+        files: [expect.objectContaining({ mimeType: 'application/pdf', kind: 'file' })],
+      }),
+    ]),
+  );
+  const row = await db.get<{ storage_path: string }>('SELECT storage_path FROM app_files WHERE message_id=?', id);
+  expect(await readFile(row!.storage_path)).toEqual(Buffer.from('%PDF-1.7'));
 });

@@ -15,6 +15,8 @@ import type { DeviceRow } from '../../modules/device-auth/db.js';
 import { getLiveDevice, onDeviceRevoked, readSignedBody } from '../../modules/device-auth/verify.js';
 import type { OutboundFile } from '../adapter.js';
 import { readAppConfig } from './config.js';
+import { getConversation } from './conversations.js';
+import { setAppHooks } from './log.js';
 import { mintTicket, readTicket, parseAuthorization, type FileAttachment } from './contract.js';
 import type { FileRow, ConversationRow } from './db.js';
 import { json, type AppHandler, type AppRequest } from './routes.js';
@@ -537,21 +539,23 @@ export function createFileService(deps: FileDeps) {
   };
 }
 
-type FileHooks = Pick<ReturnType<typeof createFileService>, 'claimFiles' | 'stageFiles' | 'storeOutboundFiles'>;
-const productionDeps = { db: getDb, getLiveDevice, onDeviceRevoked };
-let service = createFileService({
-  ...productionDeps,
-  getConversation: async () => undefined,
-});
-export function configureFiles(
-  deps: Pick<FileDeps, 'getConversation'> & {
-    setAppHooks(hooks: FileHooks): void;
-  },
-) {
-  service = createFileService({ ...productionDeps, getConversation: deps.getConversation });
-  deps.setAppHooks(service);
+let service: ReturnType<typeof createFileService>;
+export function configureFiles(deps: Partial<FileDeps> = {}) {
+  service = createFileService({
+    db: getDb,
+    getLiveDevice: (id) => getLiveDevice(id),
+    onDeviceRevoked: (listener) => onDeviceRevoked(listener),
+    getConversation: (id) => getConversation(id),
+    ...deps,
+  });
   return service;
 }
+configureFiles();
+setAppHooks({
+  claimFiles: (db, claim) => service.claimFiles(db, claim),
+  stageFiles: (messageId) => service.stageFiles(messageId),
+  storeOutboundFiles: (input) => service.storeOutboundFiles(input),
+});
 let stopCleanup: (() => void) | undefined;
 const cleanupError = () => log.warn('App file cleanup failed');
 onHostStart(async () => {
