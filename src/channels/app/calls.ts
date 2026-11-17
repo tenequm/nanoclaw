@@ -1,4 +1,3 @@
-import { appVoiceErrorMessages as messages } from '../voice-mode.js';
 import { getDb } from '../../db/connection.js';
 import { bindVoiceModeLineChat, createVoiceModeLine, getVoiceModeLineForAgent } from '../../db/voice-mode-lines.js';
 import { hasAdminPrivilege } from '../../modules/permissions/db/user-roles.js';
@@ -6,7 +5,7 @@ import { encryptionKey } from '../../secret-seal.js';
 import { JEV_API_KEY } from '../../config.js';
 import { readSignedBody } from '../../modules/device-auth/verify.js';
 import { liveVoiceAdapter } from '../voice-mode-chat.js';
-import { lineRunsJev } from '../voice-mode-command.js';
+import { appVoiceErrorMessages as messages, lineRunsJev } from '../voice-mode-command.js';
 import { linePlatformId } from '../voice-mode-line.js';
 import { LIVEKIT_PROTOCOL_VERSION } from '../voice-mode-protocol.js';
 import { readAppConfig } from './config.js';

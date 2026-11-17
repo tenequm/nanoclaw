@@ -62,7 +62,7 @@ import {
   setVoiceModeLineTts,
 } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
-import { createCallPage, handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
+import { appVoiceErrorMessages, createCallPage, handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
 import { createMeetings, createRecallTranscripts, type MeetingAudioSeams, type Meetings } from './voice-mode-meet.js';
 import {
   createRecallMeetBridge,
@@ -91,24 +91,6 @@ import {
   type TtsChoice,
   type TtsSaved,
 } from '../voice-mode-tts.js';
-
-export const appVoiceErrorMessages: Record<string, string> = {
-  bad_signature: 'The request signature is not valid.',
-  bad_request: 'The request is malformed.',
-  forbidden: 'This device cannot reach that agent.',
-  not_found: 'Not found.',
-  attempt_conflict: 'This call attempt was already used for another conversation.',
-  protocol: 'The voice service is updating. Update Hey Dan to make calls.',
-  no_line: 'Calls are not set up for this agent.',
-  no_chat: 'This agent has no conversation to call in.',
-  limit: 'The call limit is reached.',
-  room: 'Could not open the call room.',
-  stopped: 'This call attempt is no longer active.',
-  voice_offline: 'Calls are offline right now.',
-  provider_unavailable: 'That voice provider is not set up.',
-  invalid: 'That voice setting is not valid.',
-  upstream: 'Could not load voices. Try again.',
-};
 
 /** How often a running call rechecks that its caller may still use the line. */
 const ACCESS_CHECK_INTERVAL_MS = 5000;
