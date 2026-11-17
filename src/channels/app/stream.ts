@@ -1,3 +1,4 @@
+import { getLiveDevice, reachableAgentIds, onDeviceRevoked } from '../../modules/device-auth/verify.js';
 import { formatEvent, type Badge, type Status } from './contract.js';
 import type { ConversationRow, EventRow } from './db.js';
 import { json, type AppHandler, type AppRequest } from './routes.js';
@@ -8,9 +9,6 @@ export interface StreamDeps {
   onEventAppended(listener: (event: EventRow) => void): () => void;
   onBadgeChanged(listener: (userId: string) => void): () => void;
   onStatusChanged(listener: (status: Status) => void): () => void;
-  onDeviceRevoked(listener: (deviceId: string) => void): () => void;
-  getLiveDevice(deviceId: string): Promise<unknown | undefined>;
-  reachableAgentIds(deviceId: string): Promise<string[]>;
   conversationsFor(userId: string, agentIds: string[]): Promise<ConversationRow[]>;
   badgeFor(userId: string, agentIds: string[]): Promise<Badge>;
   statuses(ids: string[]): Promise<Status[]>;
@@ -59,11 +57,11 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
   if (active.size > 3) active.values().next().value!();
   async function agents(): Promise<string[]> {
     if (closed) return [];
-    if (!(await deps!.getLiveDevice(identity!.deviceId))) {
+    if (!(await getLiveDevice(identity!.deviceId))) {
       close();
       return [];
     }
-    return deps!.reachableAgentIds(identity!.deviceId);
+    return reachableAgentIds(identity!.deviceId);
   }
   async function write(bytes: string): Promise<void> {
     if (closed) return;
@@ -141,7 +139,7 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
     );
     cleanup.push(deps.onStatusChanged((value) => enqueue({ status: value })));
     cleanup.push(
-      deps.onDeviceRevoked((id) => {
+      onDeviceRevoked((id) => {
         if (id === identity.deviceId) close();
       }),
     );

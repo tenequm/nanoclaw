@@ -1,7 +1,11 @@
+import { initDb, closeDb } from '../../db/connection.js';
+import { runMigrations } from '../../db/migrations/index.js';
+import { dispatchApp } from './routes.js';
+import * as deviceAuth from '../../modules/device-auth/verify.js';
 import { EventEmitter } from 'node:events';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { afterEach, expect, it, vi } from 'vitest';
-import { openStream, type StreamDeps } from './stream.js';
+import { configureStream, openStream, type StreamDeps } from './stream.js';
 import type { EventRow, ConversationRow } from './db.js';
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
 
@@ -50,6 +54,9 @@ function setup(device = 'd') {
       events.off(name, fn);
     };
   };
+  vi.spyOn(deviceAuth, 'onDeviceRevoked').mockImplementation((fn) => subscribe('revoke', fn));
+  vi.spyOn(deviceAuth, 'getLiveDevice').mockResolvedValue({} as Awaited<ReturnType<typeof deviceAuth.getLiveDevice>>);
+  vi.spyOn(deviceAuth, 'reachableAgentIds').mockResolvedValue(['ag_stan']);
   const deps: StreamDeps = {
     lastEventSeq: async () => 129,
     readEventsAfter: async (after, limit) =>
@@ -59,9 +66,6 @@ function setup(device = 'd') {
     onEventAppended: (fn) => subscribe('event', fn),
     onBadgeChanged: (fn) => subscribe('badge', fn),
     onStatusChanged: (fn) => subscribe('status', fn),
-    onDeviceRevoked: (fn) => subscribe('revoke', fn),
-    getLiveDevice: async () => ({}),
-    reachableAgentIds: async () => ['ag_stan'],
     conversationsFor: async (_user, agents) =>
       agents.includes('ag_stan') ? [{ id: 'conv_stan01', agent_group_id: 'ag_stan' } as ConversationRow] : [],
     statuses: async () => [fixtures.statuses.working],
@@ -80,6 +84,7 @@ function setup(device = 'd') {
 }
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 it('matches the complete fixture byte for byte, including unknown kinds, badge and pings', async () => {
   vi.useFakeTimers();
@@ -135,18 +140,22 @@ it('waits for drain, checks current access, and closes on the five-second revoca
   s.events.emit('event', row(130));
   await vi.advanceTimersByTimeAsync(0);
   s.events.emit('event', row(131));
-  s.deps.reachableAgentIds = async () => [];
+  vi.mocked(deviceAuth.reachableAgentIds).mockResolvedValue([]);
   s.res.emit('drain');
   await vi.advanceTimersByTimeAsync(0);
   expect(s.output()).not.toContain('id: 131');
-  s.deps.getLiveDevice = async () => undefined;
+  vi.mocked(deviceAuth.getLiveDevice).mockResolvedValue(undefined);
   await vi.advanceTimersByTimeAsync(5_000);
   expect(s.res.end).toHaveBeenCalled();
   expect(s.events.eventNames()).toEqual([]);
 });
 it('evicts the oldest fourth stream and closes immediately on revocation', async () => {
-  const clients = [setup(), setup(), setup(), setup()];
-  for (const s of clients) await openStream(s.ctx, s.deps);
+  const clients = [];
+  for (let i = 0; i < 4; i++) {
+    const s = setup();
+    await openStream(s.ctx, s.deps);
+    clients.push(s);
+  }
   expect(clients[0].res.end).toHaveBeenCalled();
   for (const s of clients.slice(1)) {
     s.events.emit('revoke', 'd');
@@ -188,4 +197,48 @@ it('reconnects from the cursor without replaying old entities and hides other us
   expect(s.output()).not.toContain('id:');
   expect(s.output()).toContain('"seq":129');
   s.res.emit('close');
+});
+
+it('uses signed dispatch and real device access and revocation seams', async () => {
+  const s = setup();
+  vi.restoreAllMocks();
+  vi.useFakeTimers();
+  vi.setSystemTime(fixtures.hello.serverTime);
+  const db = await initDb(':memory:', { role: 'test' });
+  await runMigrations(db);
+  const vector = fixtures.signing.vectors.find((v) => v.name === 'events-connect')!;
+  try {
+    await db.run(
+      'INSERT INTO device_auth_devices (id,user_id,name,public_key,app_json,created_at) VALUES (?,?,?,?,?,?)',
+      vector.deviceId,
+      'u',
+      'Test',
+      fixtures.testKey.publicKeySpki,
+      '{}',
+      Date.now(),
+    );
+    await db.run("INSERT INTO users (id,kind,created_at) VALUES ('u','human','now')");
+    await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_stan','Test','test','now')");
+    await db.run(
+      "INSERT INTO user_roles (user_id,role,agent_group_id,granted_at) VALUES ('u','admin','ag_stan','now')",
+    );
+    await db.run("INSERT INTO device_auth_user_agents (user_id,agent_group_id,created_at) VALUES ('u','ag_stan',0)");
+    s.ctx.req.method = 'GET';
+    s.ctx.req.headers = { authorization: vector.authorization };
+    Object.defineProperty(s.ctx.req.socket, 'remoteAddress', { value: '127.0.0.1' });
+    configureStream(s.deps);
+    await dispatchApp({ req: s.ctx.req, res: s.ctx.res, params: {} });
+    expect(s.output()).toContain('event: synchronized');
+    expect(s.output()).toContain('id: 129');
+    await db.run("DELETE FROM user_roles WHERE user_id = 'u'");
+    s.events.emit('event', row(130));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.output()).not.toContain('id: 130');
+    await deviceAuth.revokeDevice(vector.deviceId);
+    expect(s.res.end).toHaveBeenCalled();
+    expect(s.events.eventNames()).toEqual([]);
+  } finally {
+    s.res.emit('close');
+    await closeDb();
+  }
 });
