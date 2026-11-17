@@ -24,13 +24,38 @@ if (mode === 'supervise') {
   });
   process.on('SIGTERM', () => child.kill('SIGTERM'));
 } else if (mode === 'gateway') {
-  http.createServer((req, res) => {
+  const agents = new Map();
+  http.createServer(async (req, res) => {
     if (target) fs.appendFileSync(target, JSON.stringify({ method: req.method, discovery: req.url === '/v1/gateway-url', poll: req.url?.startsWith('/v1/approvals/pending') }) + '\n');
     res.setHeader('Content-Type', 'application/json');
-    if (req.method !== 'GET') {
+    if (req.method === 'POST' && req.url === '/v1/agents') {
+      let body = '';
+      for await (const chunk of req) {
+        body += chunk;
+        if (body.length > 4096) { res.writeHead(413).end('{}'); return; }
+      }
+      try {
+        const { identifier, name } = JSON.parse(body);
+        if (typeof identifier !== 'string' || typeof name !== 'string') throw new Error();
+        if (agents.has(identifier)) { res.writeHead(409).end('{}'); return; }
+        agents.set(identifier, { id: identifier, identifier, name });
+        res.end('{}');
+      } catch { res.writeHead(400).end('{}'); }
+    } else if (req.method !== 'GET') {
       res.writeHead(403).end('{}');
     } else if (req.url === '/v1/gateway-url') {
       res.end(JSON.stringify({ url: `http://127.0.0.1:${port}` }));
+    } else if (req.url === '/v1/agents') {
+      res.end(JSON.stringify([...agents.values()]));
+    } else if (req.url === '/v1/secrets') {
+      res.end('[]');
+    } else if (/^\/v1\/agents\/[^/]+\/grants$/.test(req.url)) {
+      res.end('{"secrets":[]}');
+    } else if (req.url?.startsWith('/v1/container-config?agent=')) {
+      const agent = new URL(req.url, 'http://localhost').searchParams.get('agent');
+      if (!agents.has(agent)) { res.writeHead(404).end('{}'); return; }
+      res.end(JSON.stringify({ env: {}, caCertificate: fs.readFileSync('/etc/ssl/cert.pem', 'utf8'),
+        caCertificateContainerPath: '/tmp/local-gateway-ca.pem', credentialStubs: [] }));
     } else if (req.url === '/v1/health') {
       res.end('{}');
     } else if (req.url?.startsWith('/v1/approvals/pending')) {

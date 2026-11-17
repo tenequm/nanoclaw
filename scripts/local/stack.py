@@ -92,6 +92,7 @@ def secret(entry, optional=False):
 
 def install(state):
     run(NODE + ['pnpm', 'install', '--frozen-lockfile'], state, 'install')
+    run(['bun', 'install', '--cwd', 'container/agent-runner'], state, 'runner-install')
     run(NODE + ['pnpm', 'run', 'build'], state, 'build')
     run(NODE + ['pnpm', 'exec', 'tsx', 'scripts/upgrade-state.ts', 'set'], state, 'upgrade')
     marker = LOCAL / 'image-built'
@@ -208,9 +209,11 @@ def seed(state):
     group = ncl(state, 'groups', 'create', '--folder', folder, '--name', 'Local test')
     state['group'] = group['id']
     save(state)
-    provider = os.environ.get('LOCAL_AGENT_PROVIDER')
+    provider = os.environ.get('LOCAL_AGENT_PROVIDER', 'stand-in' if state['profile'] == 'fast' else '')
     if provider:
         ncl(state, 'groups', 'config', 'update', '--id', group['id'], '--provider', provider)
+    cli = ncl(state, 'messaging-groups', 'create', '--channel-type', 'cli', '--platform-id', 'local', '--name', 'Local CLI')
+    ncl(state, 'wirings', 'create', '--agent-group-id', group['id'], '--messaging-group-id', cli['id'])
     mg = ncl(state, 'messaging-groups', 'create', '--channel-type', 'telegram',
              '--platform-id', owner.split(':', 1)[1], '--name', 'Local test DM')
     ncl(state, 'wirings', 'create', '--agent-group-id', group['id'], '--messaging-group-id', mg['id'])
@@ -230,7 +233,7 @@ def up(args):
         datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')))).resolve()
     (run_dir / 'logs').mkdir(parents=True, exist_ok=True)
     state = dict(run=str(run_dir), root=str(ROOT), base=b, profile=args.profile,
-                 processes=[], folder='local-' + secrets.token_hex(6), lock=False)
+                 livekit=('cloud' if args.profile == 'full' else args.livekit), processes=[], folder='local-' + secrets.token_hex(6), lock=False)
     if args.profile == 'full':
         try:
             LOCK.mkdir(mode=0o700)
@@ -253,6 +256,7 @@ def up(args):
                    WEBHOOK_HOST='127.0.0.1', WEBHOOK_PORT=str(b),
                    NANOCLAW_MAILBOX_HTTP_PORT=str(b+1), NANOCLAW_MAILBOX_HTTP_BIND='127.0.0.1',
                    LIVEKIT_HOST_URL=f'http://127.0.0.1:{b}', VOICE_MODE_WORKER_HEALTH_PORT=str(b+9),
+                   VOICE_MODE_PUBLIC_URL=(f'https://127.0.0.1.sslip.io:{b+6}' if args.chain or args.profile == 'full' else f'http://127.0.0.1:{b}'),
                    LIVEKIT_AGENT_NAME='local-' + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12],
                    NANOCLAW_ENCRYPTION_KEY=base64.b64encode(secrets.token_bytes(32)).decode(),
                    VOICE_MODE_GEMINI_API_KEY=secret('fleet/nanoclaw/gemini/api-key'),
@@ -275,12 +279,15 @@ def up(args):
                 'providers': {'claude': [os.environ['LOCAL_ANTHROPIC_SECRET_ID']]}, 'matched': ['claude']}))
         else:
             env.update(LIVEKIT_URL=f'ws://127.0.0.1:{b+2}', LIVEKIT_API_KEY='devkey', LIVEKIT_API_SECRET='secret')
+        if args.profile == 'fast' and args.livekit == 'cloud':
+            for key in ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET']:
+                env[key] = secret('misc/' + key)
         write(ROOT / '.env', ''.join(k + '=' + v + '\n' for k, v in env.items()))
         result(state, 'env', 'pass', 'Profile allowlist rendered at mode 0600; fresh encryption key')
         if args.profile == 'fast' or args.proof:
             start(NODE + ['node', 'scripts/local/transport.mjs', 'gateway', str(b+5), str(run_dir / 'logs/gateway-requests.jsonl')], state, 'gateway')
             wait_port(b+5, state, 'gateway')
-        if args.profile == 'fast':
+        if args.profile == 'fast' and args.livekit != 'cloud':
             config = run_dir / 'livekit.yaml'
             write(config, f'port: {b+2}\nrtc:\n  tcp_port: {b+3}\n  udp_port: {b+4}\n')
             start(['livekit-server', '--dev', '--bind', '127.0.0.1', '--config', str(config)], state, 'livekit')
@@ -288,6 +295,8 @@ def up(args):
         if args.chain or args.profile == 'full':
             chain(state)
         hostenv = clean_env() | {'LOCAL_ADDRESS_LOG': str(run_dir / 'logs/address.jsonl')}
+        if args.profile == 'fast':
+            hostenv['NANOCLAW_LOCAL_STAND_IN'] = '1'
         start(NODE + ['node', '--import', str(ROOT / 'scripts/local/observe.mjs'), 'dist/index.js'], state, 'host', hostenv)
         for _ in range(480):
             if (ROOT / 'data/ncl.sock').exists():
@@ -298,9 +307,7 @@ def up(args):
         seed(state)
         start(NODE + ['pnpm', 'run', 'voice-mode-worker'], state, 'worker')
         wait_port(b+9, state, 'worker')
-        result(state, 'boot', 'pass', 'Host CLI and worker health ready' + ('; local LiveKit ready' if args.profile == 'fast' else '; Cloud configured'))
-        if args.profile == 'fast' and not os.environ.get('LOCAL_AGENT_PROVIDER'):
-            result(state, 'agent', 'skip', 'Set LOCAL_AGENT_PROVIDER when N9a lands; no agent spawned')
+        result(state, 'boot', 'pass', 'Host CLI and worker health ready' + ('; local LiveKit ready' if state['livekit'] == 'dev' else '; Cloud configured'))
         if args.proof:
             result(state, 'full-boundary', 'pass', 'Placeholder seed; local read-only gateway; no bot poller or agent spawn')
         status()
@@ -358,6 +365,7 @@ def status():
     state = json.loads(STATE.read_text())
     print('Run: ' + state['run'])
     print('Profile: ' + state['profile'] + '; port block: ' + str(state['base']) + '..' + str(state['base']+9))
+    print('LiveKit: ' + state.get('livekit', 'dev'))
     print('CA: ' + state.get('ca', 'chain disabled'))
     print('Voice: ' + state.get('url', 'http://127.0.0.1:' + str(state['base'])) + '/voice')
     for p in state['processes']:
@@ -378,9 +386,10 @@ def report():
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, epilog='Settings: LOCAL_PORT_BASE (4100), HEYDAN_RUN_DIR, LOCAL_AGENT_PROVIDER (unset: no agent), LOCAL_TEST_AGENT and LOCAL_ANTHROPIC_SECRET_ID (required for full), LOCAL_OWNER_ID (telegram:95307956), LOCAL_ONECLI_URL, LOCAL_JEV_URL, LOCAL_JEV_MODEL. Full starts real services only after owner approval; --proof uses a local read-only gateway and disables the bot. No command sends a message. A real full bot may receive messages and spawn agents. Requires Python 3, mise, Docker, openssl, gopass and livekit-server. Check the stack with python3 -B scripts/local/verify.py.')
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Settings: LOCAL_PORT_BASE (4100), HEYDAN_RUN_DIR, LOCAL_AGENT_PROVIDER (fast: stand-in), LOCAL_TEST_AGENT and LOCAL_ANTHROPIC_SECRET_ID (required for full), LOCAL_OWNER_ID (telegram:95307956), LOCAL_ONECLI_URL, LOCAL_JEV_URL, LOCAL_JEV_MODEL. Full starts real services only after owner approval; --proof uses a local read-only gateway and disables the bot. No command sends a message. A real full bot may receive messages and spawn agents. Requires Python 3, mise, Docker, openssl, gopass and livekit-server. Check the stack with python3 -B scripts/local/verify.py.')
     parser.add_argument('command', choices=['up', 'down', 'status', 'report'])
     parser.add_argument('--profile', choices=['fast', 'full'], default='fast')
+    parser.add_argument('--livekit', choices=['dev', 'cloud'], default='dev')
     parser.add_argument('--chain', action='store_true')
     parser.add_argument('--proof', action='store_true')
     args = parser.parse_args()

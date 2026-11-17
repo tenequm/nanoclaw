@@ -71,7 +71,7 @@ def lock():
             stack.ROOT = Path(temp)
             stack.STATE = Path(temp) / 'state.json'
             try:
-                stack.up(SimpleNamespace(profile='full', proof=True, chain=True))
+                stack.up(SimpleNamespace(profile='full', proof=True, chain=True, livekit='cloud'))
             except RuntimeError as err:
                 assert 'full profile locked' in str(err), str(err)
             else:
@@ -94,11 +94,13 @@ def configuration():
     response.read()
     health.close()
     assert 'registered worker' in (Path(state['run']) / 'logs/worker.log').read_text(), 'Worker not registered with LiveKit'
-    assert not stack.ncl(state, 'sessions', 'list'), 'Unexpected agent session'
+    if state['profile'] == 'full':
+        assert not stack.ncl(state, 'sessions', 'list'), 'Unexpected agent session in full startup proof'
     if values['ONECLI_URL'].startswith('http://127.0.0.1:'):
         records = [json.loads(line) for line in (Path(state['run']) / 'logs/gateway-requests.jsonl').read_text().splitlines()]
-        assert records and all(r['method'] == 'GET' for r in records)
-    return 'No agent sessions; 0600 env, valid sealing key, loopback host URL, registered LiveKit worker with HTTP 200 health; local gateway reads checked when configured'
+        allowed = ('GET',) if state['profile'] == 'full' else ('GET', 'POST')
+        assert records and all(r['method'] in allowed for r in records)
+    return '0600 env, valid sealing key, loopback host URL, registered LiveKit worker with HTTP 200 health; local gateway methods checked when configured'
 
 
 check('configuration-and-worker', configuration)
