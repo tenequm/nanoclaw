@@ -22,6 +22,7 @@ import {
   initSessionFolder,
   sessionContextPath,
   sessionDir,
+  isHostWrittenOutbound,
   withMailboxSession,
   writeOutboundDirect,
   writeSessionContext,
@@ -123,6 +124,8 @@ describe('writeOutboundDirect', () => {
     expect(rows[0].seq).toBe(2);
     expect(rows[0].seq % 2).toBe(0); // host uses even seq numbers
     expect(JSON.parse(rows[0].content).text).toBe('Admin commands are restricted.');
+    expect(isHostWrittenOutbound('denial-1')).toBe(true);
+    expect(isHostWrittenOutbound('hcmd-written-by-a-container')).toBe(false);
   });
 
   it('keeps host seq numbers even across multiple writes and ignores duplicate ids', async () => {

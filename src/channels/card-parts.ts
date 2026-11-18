@@ -12,7 +12,7 @@
  * and link buttons aren't parts and have no count cap, so hundreds of them can
  * still go over.
  */
-const CARD_LIMITS = {
+export const CARD_LIMITS = {
   parts: 10,
   fields: 10,
   tables: 1,
@@ -45,15 +45,18 @@ export function isCardPart(child: unknown): child is CardPart {
   return isRecord(child) && typeof child.type === 'string' && typeof child.text !== 'string';
 }
 
+export const emptyCardCounts = () => ({ parts: 0, fields: 0, tables: 0, charts: 0, text: 0 });
+
 /**
  * Why the card can't be sent, each naming what to fix; empty when it can. Parts
- * are allowed by name, so none can carry a callback button.
+ * are allowed by name, so none can carry a callback button. Incremental callers
+ * pass the accepted counts; an invalid fragment never consumes their budget.
  */
-export function cardProblems(card: Record<string, unknown>): string[] {
+export function cardProblems(card: Record<string, unknown>, accepted?: ReturnType<typeof emptyCardCounts>): string[] {
   const children: unknown[] = Array.isArray(card.children) ? card.children : [];
   const actions: unknown[] = Array.isArray(card.actions) ? card.actions : [];
   const problems: string[] = [];
-  const count = { parts: 0, fields: 0, tables: 0, charts: 0, text: 0 };
+  const count = accepted ? { ...accepted } : emptyCardCounts();
   const addText = (...texts: unknown[]) => {
     for (const text of texts) if (typeof text === 'string') count.text += sizeInJson(text);
   };
@@ -198,5 +201,6 @@ export function cardProblems(card: Record<string, unknown>): string[] {
       `the card holds ${count.text} characters of text, with quote marks, backslashes, line breaks and control characters counting extra; at most ${CARD_LIMITS.cardText} per card`,
     );
   }
+  if (accepted && !problems.length) Object.assign(accepted, count);
   return problems;
 }

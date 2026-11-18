@@ -82,6 +82,19 @@ describe('toInboundMessage drops content-free service messages', () => {
     expect(env!.platformId).toBe('telegram:-1000000000001');
   });
 
+  it('marks group chats as groups and private chats as direct', () => {
+    expect(
+      toInboundMessage(ctxFor({ message_id: 23, date: 1_700_000_000, text: 'hi' }), 'bot', 1)!.message.isGroup,
+    ).toBe(true);
+    const direct = {
+      chat: { id: 1000001, type: 'private', first_name: 'Sender' },
+      msg: { message_id: 24, date: 1_700_000_000, text: 'hi' },
+      from: { id: 1000001, first_name: 'Sender', is_bot: false },
+      update: {},
+    } as unknown as Parameters<typeof toInboundMessage>[0];
+    expect(toInboundMessage(direct, 'bot', 1)!.message.isGroup).toBe(false);
+  });
+
   it('keeps an attachment-only message', () => {
     const env = toInboundMessage(
       ctxFor({

@@ -142,12 +142,14 @@ function fakeMirror(
   groups: Array<Partial<MessagingGroup>>,
   options: { bound?: Omit<BoundCallChat, 'group'> & { group: Partial<MessagingGroup> } } = {},
 ) {
+  const contents: Record<string, unknown>[] = [];
   const posts: Array<{ instance: string; platformId: string; threadId?: string | null; text: string }> = [];
   const state = { bound: options.bound };
   const api: MirrorApi = {
     groupsFor: async () => groups.map((g, i) => mg({ id: `mg-${i}`, ...g })),
     adapter: (instance) => ({
       deliver: async (platformId: string, threadId: string | null, message: OutboundMessage) => {
+        contents.push(message.content as Record<string, unknown>);
         const text = (message.content as { text: string }).text;
         posts.push(threadId ? { instance, platformId, threadId, text } : { instance, platformId, text });
         return 'tg-1';
@@ -155,7 +157,7 @@ function fakeMirror(
     }),
     boundChat: async () => (state.bound ? { ...state.bound, group: mg(state.bound.group) } : null),
   };
-  return { api, posts, state };
+  return { api, posts, state, contents };
 }
 
 function mg(overrides: Partial<MessagingGroup>): MessagingGroup {
@@ -1324,18 +1326,36 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   });
 
   it('deletes the room of a call that was replaced while it was connecting', async () => {
+    let onCreating!: (room: string) => void;
     let release!: () => void;
-    h.lk.createGate = new Promise((r) => (release = r));
+    let onDeleted!: () => void;
+    const creating = new Promise<string>((resolve) => (onCreating = resolve));
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const deleted = new Promise<void>((resolve) => (onDeleted = resolve));
+    const createRoom = h.lk.createRoom.bind(h.lk);
+    const deleteRoom = h.lk.deleteRoom.bind(h.lk);
+    vi.spyOn(h.lk, 'createRoom').mockImplementationOnce(async (options) => {
+      onCreating(options.name);
+      await held;
+      return createRoom(options);
+    });
+    vi.spyOn(h.lk, 'deleteRoom').mockImplementationOnce(async (room) => {
+      await deleteRoom(room);
+      onDeleted();
+    });
     const first = post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
-    await settle();
-    // A newer call takes the line while the room is still being created.
-    h.lk.createGate = null;
-    const second = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
-    expect(second.status).toBe(200);
-    release();
+    const room = await creating;
+    try {
+      const second = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
+      expect(second.status).toBe(200);
+      // The response does not await the replaced call's initial cleanup.
+      await deleted;
+      expect(h.lk.ops).toContain(`delete:${room}`);
+      expect(h.lk.ops).not.toContain(`create:${room}`);
+    } finally {
+      release();
+    }
     expect((await first).status).toBe(409);
-    const room = replacedRoom(h, (await second.json()) as TokenResponse);
-    // The replaced call's own cleanup ran before the room existed; the room still goes.
     expect(h.lk.ops.indexOf(`create:${room}`)).toBeGreaterThanOrEqual(0);
     expect(h.lk.ops.lastIndexOf(`delete:${room}`)).toBeGreaterThan(h.lk.ops.indexOf(`create:${room}`));
   });
@@ -1367,9 +1387,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('deletes the room when the page left while the room was being set up', async () => {
     let release!: () => void;
     h.lk.createGate = new Promise((r) => (release = r));
+    const create = vi.spyOn(h.lk, 'createRoom');
     const controller = new AbortController();
     const pending = fetch(`${h.base}/livekit/token?v=6&t=tok123&jev=0`, { method: 'POST', signal: controller.signal });
-    await settle();
+    await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
     controller.abort();
     await expect(pending).rejects.toThrow();
     await settle();
@@ -1383,8 +1404,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('teardown awaits the delete of a room replaced while connecting', async () => {
     let release!: () => void;
     h.lk.createGate = new Promise((r) => (release = r));
+    const create = vi.spyOn(h.lk, 'createRoom');
     const first = post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
-    await settle();
+    await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
     h.lk.createGate = null;
     const second = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(second.status).toBe(200);
@@ -1466,6 +1488,30 @@ describe('livekit call talking in the agent chat', () => {
       },
       agentGroupId,
     );
+
+  it.each(['app', 'telegram', 'slack'])(
+    'keeps emoji and adds structured voice markers only for %s app traffic',
+    async (channelType) => {
+      const { contents } = await start([
+        { channel_type: channelType, instance: channelType, platform_id: 'test-chat' },
+      ]);
+      const { worker } = await startCall(h);
+      await worker.utter('Book a table');
+      await vi.waitFor(() => expect(contents).toHaveLength(1));
+      expect(contents[0]).toEqual({
+        text: '\u{1F399} Book a table',
+        ...(channelType === 'app' ? { voice: 'caller' } : {}),
+      });
+      expect(
+        liveKitChatPresentation(
+          { id: 'out-1', kind: 'chat', channelType, platformId: 'test-chat', threadId: null, inReplyTo: null },
+          { text: 'Booked.' },
+          'ag-andy',
+        ),
+      ).toEqual({ text: '\u{1F50A} Booked.', ...(channelType === 'app' ? { voice: 'spoken' } : {}) });
+      worker.close();
+    },
+  );
 
   it('routes each turn into the /voice chat as the line caller, posts the transcript and speaks the chat replies', async () => {
     const { posts } = await start([{ platform_id: 'telegram:100', name: 'HQ' }]);

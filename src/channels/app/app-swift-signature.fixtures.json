@@ -1,0 +1,15 @@
+{
+  "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=c3n-MHUOLraqLSy4lX8rIw,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIDiL2UWYFN1KfcFh9XZzhWr9LWsBRdk6PcZaF7GpZoaZAiEAmcQ6JDNrhadQRknxGckPySm-TXnuLiPGVXcFmMojl5Y",
+  "body": "",
+  "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "canonical": "HEYDAN-SIG-V1\n1\nGET\n\/app\/conversations\n1794943562\nc3n-MHUOLraqLSy4lX8rIw\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
+  "deviceId": "dev_8Qm3kT1xV2aZ",
+  "method": "GET",
+  "name": "get-no-body",
+  "nonce": "c3n-MHUOLraqLSy4lX8rIw",
+  "protocol": 1,
+  "signature": "MEUCIDiL2UWYFN1KfcFh9XZzhWr9LWsBRdk6PcZaF7GpZoaZAiEAmcQ6JDNrhadQRknxGckPySm-TXnuLiPGVXcFmMojl5Y",
+  "signatureValid": true,
+  "target": "\/app\/conversations",
+  "ts": 1794943562
+}

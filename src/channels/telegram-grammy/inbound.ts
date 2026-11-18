@@ -164,6 +164,7 @@ export function redactVoiceLinks(text: string): string {
   // Word by word, not one regex over the text: any group member controls this text, and a
   // backtracking pattern over a 4 KB word stalls the host for seconds.
   return text.replace(/\S+/g, (word) => {
+    if (word.includes('/app/pair#')) return '[pairing link]';
     const at = word.indexOf(VOICE_LINK_PATH);
     return at >= 0 && LINK_TOKEN_PARAM.test(word.slice(at + VOICE_LINK_PATH.length)) ? '[voice call link]' : word;
   });
@@ -759,6 +760,7 @@ export function toInboundMessage(
       content,
       timestamp: new Date(msg.date * 1000).toISOString(),
       isMention: detectMention(ctx, botUsername, botUserId),
+      isGroup: chat.type !== 'private',
     },
   };
 }

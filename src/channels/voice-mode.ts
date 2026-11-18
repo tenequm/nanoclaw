@@ -21,7 +21,6 @@
  * kind lives in voice-mode-meet.ts; this module wires both to the core.
  */
 import http from 'node:http';
-import net from 'node:net';
 
 import type { ChannelAdapter, ChannelSetup, InboundEvent } from './adapter.js';
 import { wiringThreadsEnabled } from './channel-defaults.js';
@@ -63,7 +62,7 @@ import {
   setVoiceModeLineTts,
 } from '../db/voice-mode-lines.js';
 import { routeVoiceModeTurn } from './voice-mode-route.js';
-import { createCallPage, handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
+import { appVoiceErrorMessages, createCallPage, handleVoiceCommand, type PrivateReply } from './voice-mode-command.js';
 import { createMeetings, createRecallTranscripts, type MeetingAudioSeams, type Meetings } from './voice-mode-meet.js';
 import {
   createRecallMeetBridge,
@@ -107,81 +106,19 @@ const SAVE_LOOKUP_BUDGET_MS = 4000;
 const MAX_CATALOG_PARAM_CHARS = 512;
 const CATALOG_GENDERS = new Set(['female', 'male', 'neutral']);
 
-/**
- * The shared webhook server listens on every interface, and the voice routes are meant to be reached
- * through a loopback front (Tailscale Serve or a local reverse proxy) that terminates TLS.
- */
-export function isLoopbackAddress(address: string | undefined): boolean {
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
-}
-
-/** A set of address ranges from a comma-separated CIDR list (VOICE_MODE_TRUSTED_PROXY_CIDRS, VOICE_MODE_ALLOWED_CLIENT_CIDRS). */
-export interface CidrSet {
-  /** Whether any range was configured, valid or not: a list whose every entry is invalid matches nothing. */
-  configured: boolean;
-  has(address: string | undefined): boolean;
-}
-
-/** Parses `10.0.0.0/8, fd7a::/48, 192.0.2.7`; invalid entries are skipped with a warning (they match nothing). */
-export function parseCidrs(raw: string | undefined, key: string): CidrSet {
-  const list = new net.BlockList();
-  const entries = (raw ?? '')
-    .split(',')
-    .map((e) => e.trim())
-    .filter(Boolean);
-  for (const entry of entries) {
-    const [address, bits, extra] = entry.split('/');
-    const type = net.isIPv4(address) ? 'ipv4' : net.isIPv6(address) ? 'ipv6' : null;
-    const max = type === 'ipv4' ? 32 : 128;
-    const prefix = bits === undefined ? max : /^\d{1,3}$/.test(bits) ? Number(bits) : NaN;
-    if (!type || extra !== undefined || !(prefix >= 0 && prefix <= max)) {
-      log.warn(`voice-mode: ignoring an invalid ${key} entry`, { entry });
-      continue;
-    }
-    list.addSubnet(address, prefix, type);
-  }
-  return {
-    configured: entries.length > 0,
-    has(address) {
-      // An IPv4 peer on a dual-stack socket arrives as ::ffff:a.b.c.d.
-      const plain = address?.trim().replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/i, '');
-      if (!plain) return false;
-      const type = net.isIPv4(plain) ? 'ipv4' : net.isIPv6(plain) ? 'ipv6' : null;
-      return type !== null && list.check(plain, type);
-    },
-  };
-}
-
-/** Who may reach the browser-facing voice routes besides loopback peers. */
-export interface VoiceModeProxyPolicy {
-  /** Reverse proxies whose X-Forwarded-For is believed; empty means none, today's loopback-only behaviour. */
-  trustedProxies: CidrSet;
-  /** Clients a trusted proxy may forward; not configured means any client it forwards. */
-  allowedClients: CidrSet;
-}
-
-/**
- * Whether a browser-facing voice request is admitted: a loopback peer, or a trusted proxy forwarding
- * an allowed client. The client is the rightmost X-Forwarded-For hop outside the trusted proxies (the
- * leftmost when every hop is one): hops to its left are whatever the client claimed.
- */
-export function admitsVoiceModePeer(
-  policy: VoiceModeProxyPolicy,
-  peer: string | undefined,
-  forwardedFor: string | string[] | undefined,
-): boolean {
-  const trusted = policy.trustedProxies.has(peer);
-  if (isLoopbackAddress(peer) && !(trusted && policy.allowedClients.configured)) return true;
-  if (!trusted) return false;
-  if (!policy.allowedClients.configured) return true;
-  const hops = [forwardedFor ?? []]
-    .flat()
-    .flatMap((h) => h.split(','))
-    .map((h) => h.trim())
-    .filter(Boolean);
-  const client = hops.findLast((h) => !policy.trustedProxies.has(h)) ?? hops[0] ?? peer;
-  return policy.allowedClients.has(client);
-}
+import {
+  isLoopbackAddress,
+  parseCidrs,
+  admitsVoiceModePeer,
+  type VoiceModeProxyPolicy,
+} from '../modules/device-auth/gate.js';
+export {
+  isLoopbackAddress,
+  parseCidrs,
+  admitsVoiceModePeer,
+  type CidrSet,
+  type VoiceModeProxyPolicy,
+} from '../modules/device-auth/gate.js';
 
 /** Browser routes under the short /voice prefix a reverse proxy forwards; the bare prefix is the call page. */
 const CLEAN_PREFIX_ROUTES = new Set(['info', 'tts', 'voices', 'livekit', 'livekit/token', 'livekit/end']);
@@ -283,6 +220,7 @@ export async function findCallSession(
   return findSessionForAgent(agentGroupId, mg.id, mode === 'shared' ? null : threadId);
 }
 
+type PickerError = (status: number, body: { error: string; field?: string; provider?: string }, text?: string) => void;
 /** The voice adapter, plus the call URL of a link token for the `/voice` command. */
 export interface VoiceModeChannelAdapter extends ChannelAdapter {
   /** The call page URL for a link token. */
@@ -291,6 +229,16 @@ export interface VoiceModeChannelAdapter extends ChannelAdapter {
   handleVoiceCommand(event: InboundEvent, privateReply?: PrivateReply): Promise<boolean>;
   /** `/meet`'s meetings (voice-mode-meet.ts); null when no Recall client is configured. */
   readonly meetings: Meetings | null;
+  startAppCall: ReturnType<typeof createCallPage>['start'];
+  resumeAppCall: ReturnType<typeof createCallPage>['resume'];
+  endAppCall: ReturnType<typeof createCallPage>['end'];
+  lineVoiceHttp(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    platformId: string | null,
+    catalog: boolean,
+    createLine?: () => Promise<string>,
+  ): Promise<void>;
 }
 
 export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChannelAdapter {
@@ -480,41 +428,57 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
   };
 
   /** `GET` the line's voice; `PATCH` saves it for the line's next calls (a running call keeps its own). */
-  const handleTts = async (req: http.IncomingMessage, res: http.ServerResponse, token: string): Promise<void> => {
+  const handleTts = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    platformId: string | null,
+    error: PickerError,
+    defaultView = false,
+    createLine?: () => Promise<string>,
+  ): Promise<void> => {
     if (req.method !== 'GET' && req.method !== 'PATCH') return reply(res, 405, 'GET or PATCH only');
-    const platformId = await lineForToken(token);
-    if (!platformId) return reply(res, 403, 'Unknown call link');
-    const lineId = lineIdOf(platformId);
-    const row = lineId ? await getVoiceModeLine(lineId) : undefined;
-    if (!lineId || !row) return reply(res, 403, 'Unknown call link');
+    if (defaultView && !platformId && req.method === 'GET')
+      return replyJson(res, 200, await ttsView(LINE_DEFAULT_CHOICE));
+    if (!platformId && !createLine) return error(403, { error: 'no_line' }, 'Unknown call link');
+    let lineId = platformId ? lineIdOf(platformId) : null;
+    let row = lineId ? await getVoiceModeLine(lineId) : undefined;
+    if (platformId && (!lineId || !row)) return error(403, { error: 'no_line' }, 'Unknown call link');
     // The voice takes what a call takes: the line's caller, still an owner or admin of its agent. Reading
     // it too, since its names are asked of the providers on the host's keys.
-    if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
-    if (req.method === 'GET') return replyJson(res, 200, await ttsView(savedTts(row)));
+    if (platformId && !(await resolveLine(platformId)))
+      return error(403, { error: 'no_line' }, 'Caller access denied or voice line is not set up');
+    if (req.method === 'GET') return replyJson(res, 200, await ttsView(savedTts(row!)));
     const body = await readJsonObject(req, MAX_TTS_BODY_BYTES);
-    if (!body) return replyJson(res, 400, { error: 'bad_request' });
+    if (!body) return error(400, { error: 'bad_request' });
     let choice = LINE_DEFAULT_CHOICE;
     if ('reset' in body) {
-      if (body.reset !== true || Object.keys(body).length !== 1) return replyJson(res, 400, { error: 'bad_request' });
+      if (body.reset !== true || Object.keys(body).length !== 1) return error(400, { error: 'bad_request' });
     } else {
       const read = readTtsChoice(body);
-      if ('invalid' in read) return replyJson(res, 400, { error: 'invalid', field: read.invalid });
+      if ('invalid' in read) return error(400, { error: 'invalid', field: read.invalid });
       const { provider, voice } = read.choice;
-      if (!providerKeys[provider]) return replyJson(res, 503, { error: 'provider_unavailable', provider });
+      if (!providerKeys[provider]) return error(503, { error: 'provider_unavailable', provider });
       // Only a voice the provider says it does not have is refused; one it could not be asked about in time saves.
       const found = await settleWithin(
         catalog.lookup(provider, voice, { confirm: true }),
         config.saveLookupBudgetMs ?? SAVE_LOOKUP_BUDGET_MS,
         { status: 'lookup_failed' } as const,
       );
-      if (found.status === 'unavailable') return replyJson(res, 400, { error: 'invalid', field: 'voice' });
+      if (found.status === 'unavailable') return error(400, { error: 'invalid', field: 'voice' });
       choice = read.choice;
     }
+    if (!platformId && createLine) {
+      platformId = await createLine();
+      lineId = lineIdOf(platformId);
+      row = lineId ? await getVoiceModeLine(lineId) : undefined;
+    }
+    if (!lineId || !row) return error(403, { error: 'no_line' }, 'Unknown call link');
     // The body and the lookup can take their time: the caller must still be one, and the save below only
     // takes the link it started with.
-    if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
+    if (platformId && !(await resolveLine(platformId)))
+      return error(403, { error: 'no_line' }, 'Caller access denied or voice line is not set up');
     const updated = await setVoiceModeLineTts(lineId, choice, row);
-    if (!updated) return reply(res, 403, 'Unknown call link');
+    if (!updated) return error(403, { error: 'no_line' }, 'Unknown call link');
     log.info('voice-mode: line voice saved', { platformId, tts: choice, ...('reset' in body ? { reset: true } : {}) });
     return replyJson(res, 200, await ttsView(savedTts(updated)));
   };
@@ -524,13 +488,15 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     req: http.IncomingMessage,
     res: http.ServerResponse,
     url: URL,
-    token: string,
+    platformId: string | null,
+    error: PickerError,
+    allowDefault = false,
   ): Promise<void> => {
     if (req.method !== 'GET') return reply(res, 405, 'GET only');
-    const platformId = await lineForToken(token);
-    if (!platformId) return reply(res, 403, 'Unknown call link');
+    if (!platformId && !allowDefault) return error(403, { error: 'no_line' }, 'Unknown call link');
     // The listing spends the host's provider key: only a caller who may still call gets it.
-    if (!(await resolveLine(platformId))) return reply(res, 403, 'Caller access denied or voice line is not set up');
+    if (platformId && !(await resolveLine(platformId)))
+      return error(403, { error: 'no_line' }, 'Caller access denied or voice line is not set up');
     const params = url.searchParams;
     const provider = params.get('provider');
     const rawLimit = params.get('limit') ?? String(MAX_CATALOG_LIMIT);
@@ -547,11 +513,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
       [q, language, rawGender, cursor].some((v) => v !== undefined && v.length > MAX_CATALOG_PARAM_CHARS) ||
       (gender !== undefined && !CATALOG_GENDERS.has(gender))
     ) {
-      return replyJson(res, 400, { error: 'bad_request' });
+      return error(400, { error: 'bad_request' });
     }
-    if (!providerKeys[provider]) return replyJson(res, 503, { error: 'provider_unavailable', provider });
+    if (!providerKeys[provider]) return error(503, { error: 'provider_unavailable', provider });
     const result = await catalog.page(provider, { q, language, gender, cursor, limit });
-    if ('error' in result) return replyJson(res, result.error === 'upstream' ? 502 : 400, { error: result.error });
+    if ('error' in result) return error(result.error === 'upstream' ? 502 : 400, { error: result.error });
     return replyJson(res, 200, result.page);
   };
 
@@ -612,8 +578,14 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
         };
         return replyJson(res, 200, info);
       }
-      if (route === 'tts') return await handleTts(req, res, token);
-      if (route === 'voices') return await handleVoices(req, res, url, token);
+      if (route === 'tts')
+        return await handleTts(req, res, await lineForToken(token), (status, body, text) =>
+          text ? reply(res, status, text) : replyJson(res, status, body),
+        );
+      if (route === 'voices')
+        return await handleVoices(req, res, url, await lineForToken(token), (status, body, text) =>
+          text ? reply(res, status, text) : replyJson(res, status, body),
+        );
       reply(res, 404, 'Not found');
     } catch (err) {
       // The shared webhook server has no other way to answer the browser.
@@ -629,6 +601,29 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     supportsThreads: false,
 
     callUrl,
+    async startAppCall(...args) {
+      if (!connected)
+        throw Object.assign(new Error(appVoiceErrorMessages.voice_offline), { status: 503, error: 'voice_offline' });
+      return callPage.start(...args);
+    },
+    async resumeAppCall(...args) {
+      if (!connected)
+        throw Object.assign(new Error(appVoiceErrorMessages.voice_offline), { status: 503, error: 'voice_offline' });
+      return callPage.resume(...args);
+    },
+    async endAppCall(...args) {
+      if (!connected)
+        throw Object.assign(new Error(appVoiceErrorMessages.voice_offline), { status: 503, error: 'voice_offline' });
+      return callPage.end(...args);
+    },
+    async lineVoiceHttp(req, res, platformId, catalogRequest, createLine) {
+      const error: PickerError = (status, body) =>
+        replyJson(res, status, { ...body, message: appVoiceErrorMessages[body.error] });
+      if (!connected) return error(503, { error: 'voice_offline' });
+      if (catalogRequest)
+        return handleVoices(req, res, new URL(req.url ?? '/', 'http://localhost'), platformId, error, true);
+      return handleTts(req, res, platformId, error, true, createLine);
+    },
     handleVoiceCommand: (event: InboundEvent, privateReply?: PrivateReply): Promise<boolean> =>
       handleVoiceCommand(event, callUrl, privateReply),
     meetings,

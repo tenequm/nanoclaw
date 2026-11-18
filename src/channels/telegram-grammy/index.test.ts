@@ -83,6 +83,41 @@ describe('telegram-grammy registration', () => {
     expect(TELEGRAM_DEFAULTS.dm.engagePattern).toBe('.');
   });
 
+  it('opens a DM that ensureUserDm caches in the form delivery parses', async () => {
+    const { TelegramGrammyAdapter } = await import('./index.js');
+    const { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } =
+      await import('../channel-registry.js');
+    const { closeDb, initTestDb, runMigrations } = await import('../../db/index.js');
+    const { createUser } = await import('../../modules/permissions/db/users.js');
+    const { ensureUserDm } = await import('../../modules/permissions/user-dm.js');
+    const { parseChatId } = await import('./inbound.js');
+    await runMigrations(await initTestDb());
+    try {
+      await createUser({
+        id: 'telegram:123',
+        kind: 'telegram',
+        display_name: 'Alex',
+        created_at: new Date().toISOString(),
+      });
+      const instance = new TelegramGrammyAdapter('0:placeholder', undefined, undefined, undefined);
+      instance.setup = async () => {};
+      registerChannelAdapter('telegram', { factory: () => instance });
+      await initChannelAdapters(() => ({
+        conversations: [],
+        onInbound: () => {},
+        onInboundEvent: () => {},
+        onMetadata: () => {},
+        onAction: () => {},
+      }));
+      const dm = await ensureUserDm('telegram:123');
+      expect(dm?.platform_id).toBe('telegram:123');
+      expect(parseChatId(dm!.platform_id)).toBe(123);
+    } finally {
+      await teardownChannelAdapters();
+      await closeDb();
+    }
+  });
+
   it('rejects delivery when the outbound effect fails', async () => {
     const { TelegramGrammyAdapter } = await import('./index.js');
     const instance = new TelegramGrammyAdapter('0:placeholder', undefined, undefined, undefined);

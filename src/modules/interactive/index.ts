@@ -17,7 +17,7 @@ import { registerResponseHandler, type ResponsePayload } from '../../response-re
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 
-async function handleInteractiveResponse(payload: ResponsePayload): Promise<boolean> {
+export async function handleInteractiveResponse(payload: ResponsePayload): Promise<boolean> {
   // Host-command cards are handled without waking a container, regardless of registration order.
   if (payload.questionId.startsWith('hcmd-')) return false;
 

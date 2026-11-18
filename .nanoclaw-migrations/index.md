@@ -50,11 +50,12 @@ re-extracted from `83dc1e00`. Between `098ed630` and `83dc1e00` the only non-voi
 | 12 | `feat(voice-mode): voice and meet` | [07](07-voice.md) |
 | 13 | `feat(mailbox): HTTP transport and k8s dev kit` | [06](06-mailbox-k8s.md) |
 | 14 | `docs: fork docs and migration guide` | all |
+| 15 | `feat(app): app channel and device auth` | [08](08-app.md) |
 
 Dependencies: 7, 10, 11 and 12 register prose through commit 1's hooks. Commit 12 also needs 7
 (`ES2023` lib for `findLast`) and 11 (the jev-gate exports `/meet` uses). Commit 13 implements the
 mailbox operations added by commits 2 and 3, so it comes after them. Commit 7's `/context` command
-reads commit 5's column.
+reads commit 5's column. Commit 15 follows 1, 2, 6, 7 and 12.
 
 ## Execution plan (minimum wall time)
 

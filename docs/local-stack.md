@@ -69,6 +69,13 @@ missing setting its profile needs.
 | `LOCAL_VOICE_MODE_<key>`           | -           | Overrides `WAKE_THRESHOLD`, `WAKE_HOP_MS`, `SILENCE_MS`, call limits and spoken length                                        |
 | `LOCAL_PORT_BASE`                  | -           | 4100; reserves ten consecutive ports                                                                                          |
 | `LOCAL_RUN_DIR`                    | -           | `.local/runs/<UTC timestamp>`; result JSON and filtered logs                                                                  |
+| `LOCAL_SECRET_FILE_CMD`            | APNs        | `gopass show -n` (default); the entry name is appended; the whole entry goes to a mode-0600 file                              |
+| `LOCAL_APNS`                       | -           | `1` renders the APNs sandbox key, key id, team id and topic; unset leaves push off                                            |
+| `LOCAL_APNS_KEY_ENTRY`             | APNs        | `example/apns-sandbox-key`, the whole `.p8` key, written to `.local/apns-sandbox.p8`                                          |
+| `LOCAL_APNS_KEY_ID_ENTRY`          | APNs        | `example/apns-key-id`                                                                                                         |
+| `LOCAL_APNS_TEAM_ID`               | APNs        | `ABCDE12345`                                                                                                                  |
+| `LOCAL_APNS_TOPIC`                 | APNs        | `com.example.HeyDan`, the app bundle identifier                                                                               |
+| `LOCAL_REMOTE_AGENT`               | remote      | `Taylor`, the only agent a `--remote` client run may reach (or pass `--agent`); environment only                              |
 
 Secret values go directly into a mode-0600 local environment file; inherited
 channel credentials are excluded.
@@ -109,14 +116,25 @@ Start with the chain enabled. A plain call opens with the configured wake
 phrase. It makes one automated call per invocation. Run these checks
 explicitly; startup sends no probe messages or calls.
 
+`just local client [pair|send|stream|upload|security]` (default `all`) runs
+`scripts/app-client.ts`, a scripted app client, against a running fast stack:
+direct, or through the proxy chain with `--chain` (start the stack with
+`--chain`). Results land in the run as `app-client-direct-*` or
+`app-client-chain-*`, with only fixed failure codes as detail. It pairs two
+devices once and reuses them from `.local/app-client/`. A remote run calls the
+script directly with `--base <url> --remote`, the allowed agent in
+`LOCAL_REMOTE_AGENT` (or `--agent`) and pair links in `HEYDAN_PAIR_LINK` and,
+for the two-device check, `HEYDAN_PAIR_LINK_SECOND`; it files results as
+`app-client-remote-*` and revokes every device it paired.
+
 The stand-in requires `NANOCLAW_LOCAL_STAND_IN=1` in both the host process and
 runner, and neither side registers it without that opt-in. Fast supplies it.
 Selecting the provider in group config alone fails closed; never opt a
 production host in.
 
 `down` stops owned processes, removes this checkout's agent containers, and
-removes `.env`, `data/`, `store/`, the test group directory and the full lock.
-It retains `.local/` evidence, CA, binaries, wake-model cache, the built image,
-dependencies and build output. It does not delete the remote standing test
-agent or remove the CA from the Simulator. `report` writes a Markdown
-checklist with failures first, preserving skips.
+removes `.env`, `data/`, `store/`, the test group directory, the APNs key and
+the full lock. It retains `.local/` evidence, CA, binaries, wake-model cache,
+the built image, dependencies and build output. It does not delete the remote
+standing test agent or remove the CA from the Simulator. `report` writes a
+Markdown checklist with failures first, preserving skips.

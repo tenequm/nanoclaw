@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
 /**
@@ -8,11 +11,16 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
  * cli-agent step.
  */
 const fixture = vi.hoisted(() => ({
+  root: '',
   fail: vi.fn(),
   offerPortalReminder: vi.fn(),
   /** Whether `.env` already holds an answer. */
   decided: false,
 }));
+vi.mock('../src/community-portal/slack-job.js', async (original) => {
+  const actual = await original<typeof import('../src/community-portal/slack-job.js')>();
+  return { ...actual, withSetupLock: (run: () => Promise<unknown>) => actual.withSetupLock(run, fixture.root) };
+});
 vi.mock('./providers/index.js', () => ({}));
 vi.mock('./providers/registry.js', () => ({ getSetupProvider: () => undefined, listSetupProviders: () => [] }));
 vi.mock('./providers/install.js', () => ({ applyProviderSkill: vi.fn() }));
@@ -55,6 +63,7 @@ vi.mock('@clack/prompts', () => ({
 }));
 
 beforeEach(() => {
+  fixture.root = mkdtempSync(join(tmpdir(), 'nanoclaw-setup-test-'));
   vi.resetModules();
   vi.clearAllMocks();
   fixture.decided = false;
@@ -72,6 +81,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+  rmSync(fixture.root, { recursive: true, force: true });
 });
 
 async function runWizardUntilExit(): Promise<void> {

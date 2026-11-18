@@ -10,6 +10,65 @@ function python(source: string, ...args: string[]): string {
   });
 }
 
+it.each([
+  ['absent', null],
+  ['empty', null],
+  ['nested-empty', null],
+  ['file', 'data'],
+  ['nested-file', 'data'],
+  ['symlink', 'data'],
+  ['dangling-symlink', 'data'],
+  ['nested-symlink', 'data'],
+  ['env', '.env'],
+  ['store', 'store'],
+])('checks disposable checkout data: %s', (scenario, refused) => {
+  const result = JSON.parse(
+    python(`
+import json, tempfile
+from pathlib import Path
+from types import SimpleNamespace
+import stack
+with tempfile.TemporaryDirectory() as tmp:
+    stack.ROOT = root = Path(tmp)
+    stack.STATE = root / 'stack.json'
+    data = root / 'data'
+    scenario = ${JSON.stringify(scenario)}
+    if scenario == 'empty':
+        data.mkdir()
+    elif scenario.startswith('nested-'):
+        (data / 'a' / 'b').mkdir(parents=True)
+        if scenario == 'nested-file':
+            (data / 'a' / 'keep').write_text('keep')
+        if scenario == 'nested-symlink':
+            (data / 'a' / 'link').symlink_to(root / 'missing')
+    elif scenario == 'file':
+        data.write_text('keep')
+    elif scenario in ('symlink', 'dangling-symlink'):
+        target = root / 'target'
+        if scenario == 'symlink':
+            target.mkdir()
+        data.symlink_to(target)
+    elif scenario == 'env':
+        (root / '.env').touch()
+    elif scenario == 'store':
+        (root / 'store').mkdir()
+    before = sorted(str(p.relative_to(root)) for p in root.rglob('*'))
+    def stop(*args):
+        raise RuntimeError('past checkout guard')
+    stack.require = stop
+    try:
+        stack.up(SimpleNamespace(profile='fast', livekit='dev'))
+    except RuntimeError as error:
+        outcome = str(error)
+    after = sorted(str(p.relative_to(root)) for p in root.rglob('*'))
+    print(json.dumps([outcome, data.exists() or data.is_symlink(), before == after]))
+`),
+  ) as [string, boolean, boolean];
+  expect(result[0]).toBe(refused ? `Refusing existing ${refused}; use a disposable checkout` : 'past checkout guard');
+  if (refused) expect(result[2]).toBe(true);
+  else expect(result[1]).toBe(false);
+});
+
 it('seeds the same DM identity that Telegram inbound routes and wires it to the agent', () => {
   const owner = 'telegram:123456789';
   const calls = JSON.parse(
@@ -36,7 +95,62 @@ print(json.dumps(calls))
   expect(calls).toContainEqual(['wirings', 'create', '--agent-group-id', 'local', '--messaging-group-id', 'dm']);
 });
 
+it('routes /app through the chain with the 26 MiB body cap on Caddy', () => {
+  const [routes, caddyfile] = JSON.parse(
+    python(`
+import json, shutil, tempfile
+from pathlib import Path
+import stack
+tmp = Path(tempfile.mkdtemp())
+try:
+    stack.LOCAL = tmp
+    stack.binaries = lambda state: ('caddy', 'traefik')
+    stack.run = stack.start = lambda *args, **kwargs: None
+    stack.wait_port = lambda *args: None
+    stack.save = lambda state: None
+    stack.chain({'base': 5000, 'run': str(tmp)})
+    print(json.dumps([json.loads((tmp / 'routes.json').read_text()), (tmp / 'Caddyfile').read_text()]))
+finally:
+    shutil.rmtree(tmp)
+`),
+  ) as [{ http: { routers: Record<string, { rule: string; service: string }> } }, string];
+  expect(routes.http.routers.app).toMatchObject({
+    rule: 'Host(`127.0.0.1.sslip.io`) && PathPrefix(`/app`)',
+    service: 'host',
+  });
+  expect(caddyfile).toContain('@app path /app /app/*\n    request_body @app {\n        max_size 26MiB\n    }');
+});
+
+it('writes a whole secret entry through LOCAL_SECRET_FILE_CMD at mode 0600', () => {
+  const [text, mode, removed] = JSON.parse(
+    python(`
+import json, os, shutil, tempfile
+from pathlib import Path
+import stack
+tmp = Path(tempfile.mkdtemp())
+try:
+    (tmp / 'entry').write_text('line one\\nline two\\n')
+    os.environ.update(LOCAL_SECRET_FILE_CMD='cat', LOCAL_APNS_KEY_ENTRY=str(tmp / 'entry'))
+    stack.secret_file('LOCAL_APNS_KEY_ENTRY', tmp / 'key.p8')
+    result = [(tmp / 'key.p8').read_text(), (tmp / 'key.p8').stat().st_mode & 0o777]
+    os.environ['LOCAL_SECRET_FILE_CMD'] = 'false'
+    try:
+        stack.secret_file('LOCAL_APNS_KEY_ENTRY', tmp / 'key.p8')
+    except RuntimeError:
+        result.append(not (tmp / 'key.p8').exists())
+    print(json.dumps(result))
+finally:
+    shutil.rmtree(tmp)
+`),
+  ) as [string, number, boolean];
+  expect(text).toBe('line one\nline two\n');
+  expect(mode).toBe(0o600);
+  expect(removed).toBe(true);
+});
+
 it('derives the image and container label slug the way the host does', () => {
-  const [slug, root] = JSON.parse(python('import json, stack\nprint(json.dumps([stack.SLUG, str(stack.ROOT)]))')) as string[];
+  const [slug, root] = JSON.parse(
+    python('import json, stack\nprint(json.dumps([stack.SLUG, str(stack.ROOT)]))'),
+  ) as string[];
   expect(slug).toBe(getInstallSlug(root));
 });

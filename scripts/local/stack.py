@@ -158,6 +158,18 @@ def secret(key):
     return value
 
 
+def secret_file(key, path):
+    # A whole multi-line entry, such as a key file, goes from the store straight into a mode-0600 file.
+    command = shlex.split(setting('LOCAL_SECRET_FILE_CMD', 'gopass show -n')) + [setting(key)]
+    write(path, '')
+    path.chmod(0o600)
+    with open(path, 'wb') as out:
+        proc = subprocess.run(command, env=clean_env(), stdout=out, stderr=subprocess.DEVNULL)
+    if proc.returncode or not path.stat().st_size:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f'Secret store entry named by {key} is unavailable')
+
+
 def wake_model():
     # A local file is read in place; any other source is an scp source, fetched once into a per-digest cache.
     source = setting('LOCAL_WAKE_MODEL_SOURCE', '')
@@ -240,7 +252,9 @@ def chain(state):
     write(config / 'routes.json', json.dumps({
         'tls': {'certificates': [{'certFile': str(ca / 'server.crt'), 'keyFile': str(ca / 'server.key')}]},
         'http': {'routers': {'voice': {'entryPoints': ['websecure'],
-            'rule': f'Host(`{PROXY_HOST}`) && PathPrefix(`/voice`)', 'service': 'host', 'tls': {}}},
+            'rule': f'Host(`{PROXY_HOST}`) && PathPrefix(`/voice`)', 'service': 'host', 'tls': {}},
+            'app': {'entryPoints': ['websecure'],
+                'rule': f'Host(`{PROXY_HOST}`) && PathPrefix(`/app`)', 'service': 'host', 'tls': {}}},
             'services': {'host': {'loadBalancer': {'servers': [{'url': f'http://127.0.0.1:{b}'}]}}}}}))
     # Caddy also listens on ::1 so verify.py can tell the PROXY v2 client address from Traefik's own peer.
     write(config / 'Caddyfile', f'''{{
@@ -253,6 +267,10 @@ def chain(state):
 https://{PROXY_HOST}:{b+6} {{
     bind 127.0.0.1 [::1]
     tls {ca}/server.crt {ca}/server.key
+    @app path /app /app/*
+    request_body @app {{
+        max_size 26MiB
+    }}
     reverse_proxy https://127.0.0.1:{b+7} {{
         stream_close_delay 5m
         header_up Host {{host}}
@@ -336,11 +354,24 @@ def seed(state):
     result(state, 'seed', 'pass', 'Fresh DB, owner, role, group and DM wiring created; no inbound messages')
 
 
+def remove_empty_data(root):
+    directories = [root]
+    for directory in directories:
+        if directory.is_symlink() or not directory.is_dir():
+            return False
+        directories.extend(directory.iterdir())
+    for directory in reversed(directories):
+        directory.rmdir()
+    return True
+
+
 def up(args):
     if STATE.exists():
         raise RuntimeError('This checkout already has a stack; use just local down')
     for path in ['.env', 'data', 'store']:
         if (ROOT / path).exists() or (ROOT / path).is_symlink():
+            if path == 'data' and remove_empty_data(ROOT / path):
+                continue
             raise RuntimeError(f'Refusing existing {path}; use a disposable checkout')
     livekit = 'cloud' if args.profile == 'full' else args.livekit
     needed = [*VOICE_SECRETS.values(), 'LOCAL_WAKE_MODEL_SHA256', *(CLOUD_SECRETS.values() if livekit == 'cloud' else [])]
@@ -348,6 +379,8 @@ def up(args):
         needed += ['LOCAL_TEST_AGENT', 'LOCAL_ANTHROPIC_SECRET_ID']
         if not args.proof:
             needed += ['LOCAL_OWNER_ID', 'LOCAL_ONECLI_URL', 'LOCAL_TEST_BOT_TOKEN_ENTRY']
+    if setting('LOCAL_APNS') == '1':
+        needed += ['LOCAL_APNS_KEY_ENTRY', 'LOCAL_APNS_KEY_ID_ENTRY', 'LOCAL_APNS_TEAM_ID', 'LOCAL_APNS_TOPIC']
     require(*needed)
     if not re.fullmatch(r'[0-9a-f]{64}', setting('LOCAL_WAKE_MODEL_SHA256')):
         raise RuntimeError('LOCAL_WAKE_MODEL_SHA256 must be 64 lowercase hex digits')
@@ -425,6 +458,15 @@ def up(args):
                 env['ONECLI_URL'] = setting('LOCAL_ONECLI_URL')
             write(ROOT / 'data/onecli/provider-credentials.json', json.dumps({
                 'providers': {'claude': [setting('LOCAL_ANTHROPIC_SECRET_ID')]}, 'matched': ['claude']}))
+        env['APP_PUBLIC_BASE'] = env['VOICE_MODE_PUBLIC_URL']
+        env['APP_LIVEKIT_URL'] = env['LIVEKIT_URL']
+        if setting('LOCAL_APNS') == '1':
+            key_path = LOCAL / 'apns-sandbox.p8'
+            secret_file('LOCAL_APNS_KEY_ENTRY', key_path)
+            env['APP_APNS_TEAM_ID'] = setting('LOCAL_APNS_TEAM_ID')
+            env['APP_APNS_TOPIC'] = setting('LOCAL_APNS_TOPIC')
+            env['APP_APNS_SANDBOX_KEY_ID'] = secret('LOCAL_APNS_KEY_ID_ENTRY')
+            env['APP_APNS_SANDBOX_KEY_PATH'] = str(key_path)
         write(ROOT / '.env', ''.join(k + '=' + v + '\n' for k, v in env.items()))
         result(state, 'env', 'pass', 'Profile allowlist rendered at mode 0600; fresh encryption key')
         if args.profile == 'fast' or args.proof:
@@ -507,6 +549,7 @@ def down():
     if remaining or left:
         result(state, 'down', 'fail', 'Owned processes or agent containers still present; retained state and data for retry')
         raise RuntimeError('Cleanup could not verify process and container exit; retry just local down')
+    (LOCAL / 'apns-sandbox.p8').unlink(missing_ok=True)
     for item in ['.env', 'data', 'store', 'groups/' + state['folder']]:
         path = ROOT / item
         if path.is_symlink() or path.is_file():
@@ -552,11 +595,25 @@ def report():
     print(run_dir / 'report.md')
 
 
+def client(args):
+    state = load_state('fast')
+    if args.chain and 'ca' not in state:
+        raise RuntimeError('Start the local stack with --chain first')
+    base = state['url'] if args.chain else f"http://127.0.0.1:{state['base']}"
+    env = clean_env() | {'LOCAL_RUN_DIR': state['run']}
+    if args.chain:
+        env['NODE_EXTRA_CA_CERTS'] = state['ca']
+    run(NODE + ['pnpm', 'exec', 'tsx', 'scripts/app-client.ts', args.scenario,
+                '--base', base], state, 'app-client-command', env)
+    print('Client results: ' + state['run'])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, epilog='Settings, requirements, ports and probes: docs/local-stack.md. '
                                      'Run full only with owner approval: its bot may receive messages and spawn real agents. '
-                                     'No command here sends a message; check a running stack with python3 -B scripts/local/verify.py.')
-    parser.add_argument('command', choices=['up', 'down', 'status', 'report'])
+                                     'The client sends scripted messages to the fast-profile agent; check a running stack with python3 -B scripts/local/verify.py.')
+    parser.add_argument('command', choices=['up', 'down', 'status', 'report', 'client'])
+    parser.add_argument('scenario', nargs='?', default='all', choices=['pair', 'send', 'stream', 'upload', 'security', 'all'])
     parser.add_argument('--profile', choices=['fast', 'full'], default='fast',
                         help='fast: stand-in agent and local gateway; full: the approved test agent, test bot and LiveKit Cloud')
     parser.add_argument('--livekit', choices=['dev', 'cloud'], default='dev', help='fast only: local LiveKit dev server or Cloud')
@@ -571,6 +628,8 @@ def main():
     try:
         if args.command == 'up':
             up(args)
+        elif args.command == 'client':
+            client(args)
         else:
             globals()[args.command]()
     except (RuntimeError, OSError, ValueError) as error:

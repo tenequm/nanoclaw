@@ -20,6 +20,13 @@ import fs from 'fs';
 import path from 'path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
+const TEST_ROOT = `/tmp/nanoclaw-mount-composition-test-${process.pid}`;
+vi.mock('./config.js', async (original) => ({
+  ...(await original<typeof import('./config.js')>()),
+  DATA_DIR: `/tmp/nanoclaw-mount-composition-test-${process.pid}/data`,
+  GROUPS_DIR: `/tmp/nanoclaw-mount-composition-test-${process.pid}/groups`,
+}));
+
 // Composing the group's instructions needs the central DB and is not what is
 // under test; every path it would write is created below instead.
 vi.mock('./project-doc-compose.js', async (importOriginal) => ({
@@ -64,8 +71,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  fs.rmSync(groupDir, { recursive: true, force: true });
-  fs.rmSync(path.join(DATA_DIR, 'v2-sessions', GROUP_ID), { recursive: true, force: true });
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 async function composedMounts() {

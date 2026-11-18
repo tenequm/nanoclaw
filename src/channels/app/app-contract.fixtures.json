@@ -1,0 +1,1560 @@
+{
+  "about": "Hey Dan app contract v1 fixtures. Server tests produce these shapes; HeyDanCore tests decode them.",
+  "testKey": {
+    "note": "A throwaway P-256 key for contract tests only. It protects nothing.",
+    "privateKeyPkcs8Pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcHxq9X9L26iCQrkR\nZM5qSCPDAwbDKp09jGBLK8BMYqihRANCAARGAYfJBWe7tkzNXTyjnBB5SjLRr6yB\nHj7w1cpEB+16k8KYBAkOCsjRjzsSGUMFfkYbE4MqyljLsAMYGvUR+Iyu\n-----END PRIVATE KEY-----\n",
+    "publicKeySpki": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAERgGHyQVnu7ZMzV08o5wQeUoy0a-sgR4-8NXKRAftepPCmAQJDgrI0Y87EhlDBX5GGxODKspYy7ADGBr1EfiMrg"
+  },
+  "signing": {
+    "vectors": [
+      {
+        "name": "get-no-body",
+        "protocol": 1,
+        "method": "GET",
+        "target": "/app/conversations",
+        "body": "",
+        "ts": 1794943562,
+        "nonce": "c3n-MHUOLraqLSy4lX8rIw",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonical": "HEYDAN-SIG-V1\n1\nGET\n/app/conversations\n1794943562\nc3n-MHUOLraqLSy4lX8rIw\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEQCIGCVkaZyyAeFfadpXzz0hFL_ieaGL5XNlQuyrX3Nb5CHAiBNz_5vJY7kHQHItRPvmi7t9sKPamC-pLKHytH9KzhSHQ",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=c3n-MHUOLraqLSy4lX8rIw,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEQCIGCVkaZyyAeFfadpXzz0hFL_ieaGL5XNlQuyrX3Nb5CHAiBNz_5vJY7kHQHItRPvmi7t9sKPamC-pLKHytH9KzhSHQ",
+        "signatureValid": true
+      },
+      {
+        "name": "get-with-query",
+        "protocol": 1,
+        "method": "GET",
+        "target": "/app/conversations/conv_taylor01/messages?before=2120&limit=50",
+        "body": "",
+        "ts": 1794943562,
+        "nonce": "4eIavNJcFsJcPJOWdcqsfg",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonical": "HEYDAN-SIG-V1\n1\nGET\n/app/conversations/conv_taylor01/messages?before=2120&limit=50\n1794943562\n4eIavNJcFsJcPJOWdcqsfg\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEUCIQCXaFKCv0KZIzs2pRDLQ_escAX3zyY8So2JO_Lt3-md-AIgE-SynDLnk3BTraTw1WxWQCwyMZ4HgGtZ-fKa1wCRYxQ",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIQCXaFKCv0KZIzs2pRDLQ_escAX3zyY8So2JO_Lt3-md-AIgE-SynDLnk3BTraTw1WxWQCwyMZ4HgGtZ-fKa1wCRYxQ",
+        "signatureValid": true
+      },
+      {
+        "name": "get-encoded-query",
+        "protocol": 1,
+        "method": "GET",
+        "target": "/app/conversations/conv_taylor01/voices?provider=gemini&q=%D0%BA%D1%96%D1%82%20cat&limit=20",
+        "body": "",
+        "ts": 1794943562,
+        "nonce": "agYlKuRtFDQDhynLE0sM7g",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonical": "HEYDAN-SIG-V1\n1\nGET\n/app/conversations/conv_taylor01/voices?provider=gemini&q=%D0%BA%D1%96%D1%82%20cat&limit=20\n1794943562\nagYlKuRtFDQDhynLE0sM7g\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQC_TF07xsTIrOwjmawOUO-deh2Fl-bfV_GqpmLX4hee-AIhAKZvNS2XWTWpkJ4ZydovFmK7s-icEckr-bDFqI-D7jMu",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=agYlKuRtFDQDhynLE0sM7g,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEYCIQC_TF07xsTIrOwjmawOUO-deh2Fl-bfV_GqpmLX4hee-AIhAKZvNS2XWTWpkJ4ZydovFmK7s-icEckr-bDFqI-D7jMu",
+        "signatureValid": true
+      },
+      {
+        "name": "post-json",
+        "protocol": 1,
+        "method": "POST",
+        "target": "/app/conversations/conv_taylor01/messages",
+        "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
+        "ts": 1794943562,
+        "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "signatureValid": true
+      },
+      {
+        "name": "events-connect",
+        "protocol": 1,
+        "method": "GET",
+        "target": "/app/events?after=118",
+        "body": "",
+        "ts": 1794943562,
+        "nonce": "gDZl6DWT3atXh6Z_x2AT1A",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonical": "HEYDAN-SIG-V1\n1\nGET\n/app/events?after=118\n1794943562\ngDZl6DWT3atXh6Z_x2AT1A\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEQCIAtvGkS8KKNxYJy0Bwm1a9iw3iYtiSpY7_wPUFPGRdDWAiAUXBMDgwuNy7ednS6vNtnDBT2EOUIIYsu-S-1hLMkzBg",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEQCIAtvGkS8KKNxYJy0Bwm1a9iw3iYtiSpY7_wPUFPGRdDWAiAUXBMDgwuNy7ednS6vNtnDBT2EOUIIYsu-S-1hLMkzBg",
+        "signatureValid": true
+      },
+      {
+        "name": "delete-device",
+        "protocol": 1,
+        "method": "DELETE",
+        "target": "/app/devices/me",
+        "body": "",
+        "ts": 1794943562,
+        "nonce": "gTGeE2uAc-vodEHo6rB9SQ",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonical": "HEYDAN-SIG-V1\n1\nDELETE\n/app/devices/me\n1794943562\ngTGeE2uAc-vodEHo6rB9SQ\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEUCIAgbzwJU4G9ALvy65Y_HY3i4S8rCpEk9r_I05tlXfgHEAiEA4w_yRhE5vijEPzszIAB_FLu2M6b-okZ9lQIQqygUSDw",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=gTGeE2uAc-vodEHo6rB9SQ,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIAgbzwJU4G9ALvy65Y_HY3i4S8rCpEk9r_I05tlXfgHEAiEA4w_yRhE5vijEPzszIAB_FLu2M6b-okZ9lQIQqygUSDw",
+        "signatureValid": true
+      },
+      {
+        "name": "bad-changed-body",
+        "protocol": 1,
+        "method": "POST",
+        "target": "/app/conversations/conv_taylor01/messages",
+        "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply now\",\"fileIds\":[]}",
+        "ts": 1794943562,
+        "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "35dd4f6eaba36dcf4137c5963e8a3f5ff685fa79b01a2e5b8338f0e3a7df541c",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\n35dd4f6eaba36dcf4137c5963e8a3f5ff685fa79b01a2e5b8338f0e3a7df541c\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=35dd4f6eaba36dcf4137c5963e8a3f5ff685fa79b01a2e5b8338f0e3a7df541c,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "signatureValid": false,
+        "why": "the body no longer matches the signed hash"
+      },
+      {
+        "name": "bad-changed-target",
+        "protocol": 1,
+        "method": "POST",
+        "target": "/app/conversations/conv_sam01/messages",
+        "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
+        "ts": 1794943562,
+        "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_sam01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "signatureValid": false,
+        "why": "another path"
+      },
+      {
+        "name": "bad-changed-method",
+        "protocol": 1,
+        "method": "PUT",
+        "target": "/app/conversations/conv_taylor01/messages",
+        "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
+        "ts": 1794943562,
+        "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
+        "canonical": "HEYDAN-SIG-V1\n1\nPUT\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "signatureValid": false,
+        "why": "another method"
+      },
+      {
+        "name": "bad-other-device",
+        "protocol": 1,
+        "method": "POST",
+        "target": "/app/conversations/conv_taylor01/messages",
+        "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
+        "ts": 1794943562,
+        "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
+        "deviceId": "dev_someoneElse",
+        "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_someoneElse",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_someoneElse,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "signatureValid": false,
+        "why": "another device id"
+      },
+      {
+        "name": "bad-changed-nonce",
+        "protocol": 1,
+        "method": "POST",
+        "target": "/app/conversations/conv_taylor01/messages",
+        "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
+        "ts": 1794943562,
+        "nonce": "CeHsU76okSfKXoZEOETkDA",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nCeHsU76okSfKXoZEOETkDA\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=CeHsU76okSfKXoZEOETkDA,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "signatureValid": false,
+        "why": "another nonce"
+      },
+      {
+        "name": "bad-changed-protocol",
+        "protocol": 2,
+        "method": "POST",
+        "target": "/app/conversations/conv_taylor01/messages",
+        "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
+        "ts": 1794943562,
+        "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
+        "canonical": "HEYDAN-SIG-V1\n2\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "authorization": "HeyDan-Sig v=1,p=2,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEYCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIhAIG2GFZs2rE-qh1pXiI5sk6_W--qN5w0aTFer4gFgzfT",
+        "signatureValid": false,
+        "why": "another protocol"
+      },
+      {
+        "name": "replay-malleated-signature",
+        "protocol": 1,
+        "method": "POST",
+        "target": "/app/conversations/conv_taylor01/messages",
+        "body": "{\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"text\":\"reply please\",\"fileIds\":[]}",
+        "ts": 1794943562,
+        "nonce": "f302A6d7AdJeQ4Xd1umgBQ",
+        "deviceId": "dev_8Qm3kT1xV2aZ",
+        "bodyHash": "c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5",
+        "canonical": "HEYDAN-SIG-V1\n1\nPOST\n/app/conversations/conv_taylor01/messages\n1794943562\nf302A6d7AdJeQ4Xd1umgBQ\nc0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5\ndev_8Qm3kT1xV2aZ",
+        "signature": "MEUCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIgfknnqJMlTsJV4pah3cZNsP2LCwNve2obwlsbOvbf7X4",
+        "authorization": "HeyDan-Sig v=1,p=1,d=dev_8Qm3kT1xV2aZ,t=1794943562,n=f302A6d7AdJeQ4Xd1umgBQ,bh=c0219dd17ff443afeed4c6d5a45863cb091738a5514a1785cdadb02afb6a81d5,s=MEUCIQCYFwj4qrpgjQGc3JQhM_LI4QsFfKlUsKQd8EVLoHFUeQIgfknnqJMlTsJV4pah3cZNsP2LCwNve2obwlsbOvbf7X4",
+        "signatureValid": true,
+        "why": "verifies, but has the same (deviceId, nonce) as post-json: the second one seen is refused as replayed"
+      }
+    ]
+  },
+  "hello": {
+    "protocol": 1,
+    "minProtocol": 1,
+    "voiceProtocol": 6,
+    "features": ["files", "calls", "push", "voice-picker"],
+    "serverTime": 1794943562000
+  },
+  "pairLink": {
+    "link": "https://app.example.com/app/pair#k3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
+    "host": "https://app.example.com",
+    "code": "k3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
+    "localLink": "http://127.0.0.1:4101/app/pair#k3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
+    "localHost": "http://127.0.0.1:4101"
+  },
+  "pairRequest": {
+    "code": "k3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
+    "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAERgGHyQVnu7ZMzV08o5wQeUoy0a-sgR4-8NXKRAftepPCmAQJDgrI0Y87EhlDBX5GGxODKspYy7ADGBr1EfiMrg",
+    "deviceName": "iPhone",
+    "proof": "MEUCIQDPBliTDE5JFeHz3l1ps0_rzEn2SSE4dLCaTpyYVvU4ZwIgfuUJ0eB3nOmNdX5ozU9ozgJt-OCUmEn6H1pYAzsC-vI",
+    "app": {
+      "version": "0.6.0",
+      "build": "2611171926",
+      "os": "iOS 27.2"
+    }
+  },
+  "pairProofText": "HEYDAN-PAIR-V1\nk3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAERgGHyQVnu7ZMzV08o5wQeUoy0a-sgR4-8NXKRAftepPCmAQJDgrI0Y87EhlDBX5GGxODKspYy7ADGBr1EfiMrg",
+  "pairProofTampered": {
+    "code": "X3Jx9QpL2mVb7RtY5wZc8NdF4hG6sA1e",
+    "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAERgGHyQVnu7ZMzV08o5wQeUoy0a-sgR4-8NXKRAftepPCmAQJDgrI0Y87EhlDBX5GGxODKspYy7ADGBr1EfiMrg",
+    "proof": "MEUCIQDPBliTDE5JFeHz3l1ps0_rzEn2SSE4dLCaTpyYVvU4ZwIgfuUJ0eB3nOmNdX5ozU9ozgJt-OCUmEn6H1pYAzsC-vI",
+    "why": "the proof was made for another code"
+  },
+  "pairResponse": {
+    "deviceId": "dev_8Qm3kT1xV2aZ",
+    "userName": "Alex",
+    "agents": [
+      {
+        "id": "ag_taylor",
+        "name": "Taylor"
+      }
+    ],
+    "protocol": 1,
+    "serverTime": 1794943562000
+  },
+  "errors": {
+    "protocol": {
+      "status": 426,
+      "body": {
+        "error": "protocol",
+        "protocol": 1,
+        "message": "Update Hey Dan to keep chatting."
+      }
+    },
+    "badSignature": {
+      "status": 401,
+      "body": {
+        "error": "bad_signature",
+        "message": "The request signature is not valid."
+      }
+    },
+    "unknownDevice": {
+      "status": 401,
+      "body": {
+        "error": "unknown_device",
+        "message": "This device is not paired."
+      }
+    },
+    "deviceRevoked": {
+      "status": 401,
+      "body": {
+        "error": "device_revoked",
+        "message": "This device was unpaired."
+      }
+    },
+    "staleTimestamp": {
+      "status": 401,
+      "body": {
+        "error": "stale_timestamp",
+        "message": "The request is too old or too new.",
+        "serverTime": 1794943562000
+      }
+    },
+    "replayed": {
+      "status": 401,
+      "body": {
+        "error": "replayed",
+        "message": "This request was already used."
+      }
+    },
+    "badBody": {
+      "status": 400,
+      "body": {
+        "error": "bad_body",
+        "message": "The request body does not match its signature."
+      }
+    },
+    "badRequest": {
+      "status": 400,
+      "body": {
+        "error": "bad_request",
+        "message": "The request is malformed."
+      }
+    },
+    "forbidden": {
+      "status": 403,
+      "body": {
+        "error": "forbidden",
+        "message": "This device cannot reach that agent."
+      }
+    },
+    "badProof": {
+      "status": 400,
+      "body": {
+        "error": "bad_proof",
+        "message": "The pairing proof is not valid."
+      }
+    },
+    "answerNotDelivered": {
+      "status": 502,
+      "body": {
+        "error": "answer_not_delivered",
+        "message": "The answer did not reach the agent. Try again."
+      }
+    },
+    "invalidCode": {
+      "status": 403,
+      "body": {
+        "error": "invalid_code",
+        "message": "This pairing link is used or expired. Send /pair again."
+      }
+    },
+    "notFound": {
+      "status": 404,
+      "body": {
+        "error": "not_found",
+        "message": "Not found."
+      }
+    },
+    "useCallScreen": {
+      "status": 409,
+      "body": {
+        "error": "use_call_screen",
+        "message": "Start a call with the call button."
+      }
+    },
+    "usePairingScreen": {
+      "status": 409,
+      "body": {
+        "error": "use_pairing_screen",
+        "message": "Add agents from Telegram with /pair."
+      }
+    },
+    "clientIdConflict": {
+      "status": 409,
+      "body": {
+        "error": "client_id_conflict",
+        "message": "This message was already sent with different content."
+      }
+    },
+    "badFile": {
+      "status": 400,
+      "body": {
+        "error": "bad_file",
+        "message": "An attachment is missing or was already sent.",
+        "fileId": "file_7hT2pQ9a"
+      }
+    },
+    "tooLarge": {
+      "status": 413,
+      "body": {
+        "error": "too_large",
+        "message": "A file can be at most 25 MB.",
+        "maxBytes": 26214400
+      }
+    },
+    "lengthRequired": {
+      "status": 411,
+      "body": {
+        "error": "length_required",
+        "message": "The upload needs a Content-Length."
+      }
+    },
+    "ticketExpired": {
+      "status": 401,
+      "body": {
+        "error": "ticket_expired",
+        "message": "The upload link expired."
+      }
+    },
+    "uploadKeyConflict": {
+      "status": 409,
+      "body": {
+        "error": "upload_key_conflict",
+        "message": "This upload key was already used for another file."
+      }
+    },
+    "attemptConflict": {
+      "status": 409,
+      "body": {
+        "error": "attempt_conflict",
+        "message": "This call attempt was already used for another conversation."
+      }
+    },
+    "uploadConflict": {
+      "status": 409,
+      "body": {
+        "error": "conflict",
+        "message": "Different bytes were already uploaded for this file."
+      }
+    },
+    "rateLimited": {
+      "status": 429,
+      "headers": {
+        "Retry-After": "30"
+      },
+      "body": {
+        "error": "rate_limited",
+        "message": "Too many requests. Try again shortly.",
+        "retryAfter": 30
+      }
+    },
+    "futureError": {
+      "status": 418,
+      "body": {
+        "error": "teapot_from_a_later_server",
+        "message": "Shown as written.",
+        "extra": {
+          "any": "thing"
+        }
+      }
+    }
+  },
+  "conversations": {
+    "conversations": [
+      {
+        "kind": "conversation",
+        "id": "conv_taylor01",
+        "seq": 129,
+        "agent": {
+          "id": "ag_taylor",
+          "name": "Taylor"
+        },
+        "lastMessage": {
+          "id": "msg_0126",
+          "role": "agent",
+          "preview": "Second draft.",
+          "at": 1794943593000
+        },
+        "unread": 3,
+        "readOrder": 118,
+        "canCall": true,
+        "callRefusal": null,
+        "createdAt": 1794857162000
+      }
+    ],
+    "statuses": [
+      {
+        "kind": "status",
+        "conversationId": "conv_taylor01",
+        "rev": 41,
+        "state": "working",
+        "label": "Running a command",
+        "at": 1794943595000
+      }
+    ],
+    "badge": {
+      "kind": "badge",
+      "rev": 7,
+      "unreadTotal": 3
+    },
+    "seq": 129
+  },
+  "conversationCallRefused": {
+    "kind": "conversation",
+    "id": "conv_sam01",
+    "seq": 2120,
+    "agent": {
+      "id": "ag_sam",
+      "name": "Sam"
+    },
+    "lastMessage": null,
+    "unread": 0,
+    "readOrder": 0,
+    "canCall": false,
+    "callRefusal": {
+      "error": "no_line",
+      "message": "Calls are not set up for this agent."
+    },
+    "createdAt": 1794857162000
+  },
+  "historyPage": {
+    "items": [
+      {
+        "kind": "message",
+        "conversationId": "conv_taylor01",
+        "files": [],
+        "reactions": [],
+        "voice": null,
+        "replyTo": null,
+        "clientId": "0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11",
+        "delivery": "reached",
+        "deliveryError": null,
+        "editedAt": null,
+        "id": "msg_0119",
+        "order": 119,
+        "seq": 121,
+        "role": "user",
+        "text": "reply please",
+        "createdAt": 1794943562000,
+        "card": null
+      },
+      {
+        "kind": "message",
+        "conversationId": "conv_taylor01",
+        "files": [],
+        "reactions": [],
+        "voice": null,
+        "replyTo": null,
+        "clientId": null,
+        "delivery": null,
+        "deliveryError": null,
+        "editedAt": null,
+        "id": "msg_0122",
+        "order": 122,
+        "seq": 122,
+        "role": "agent",
+        "text": "Working on it.",
+        "createdAt": 1794943568000,
+        "card": null
+      },
+      {
+        "kind": "question",
+        "id": "q_0123",
+        "conversationId": "conv_taylor01",
+        "order": 123,
+        "seq": 125,
+        "title": "Deploy",
+        "text": "Deploy to which environment?",
+        "options": [
+          {
+            "label": "Staging",
+            "selectedLabel": "Staging",
+            "value": "staging",
+            "style": "primary"
+          },
+          {
+            "label": "Production",
+            "selectedLabel": "Production",
+            "value": "production",
+            "style": "danger"
+          },
+          {
+            "label": "Cancel",
+            "selectedLabel": "Cancelled",
+            "value": "cancel",
+            "style": null
+          }
+        ],
+        "state": "answered",
+        "answer": {
+          "value": "staging",
+          "label": "Staging",
+          "at": 1794943587000
+        },
+        "createdAt": 1794943574000,
+        "expiresAt": 1794943874000
+      },
+      {
+        "kind": "message",
+        "conversationId": "conv_taylor01",
+        "files": [],
+        "reactions": [
+          {
+            "emoji": "👍",
+            "by": "agent"
+          }
+        ],
+        "voice": null,
+        "replyTo": null,
+        "clientId": null,
+        "delivery": null,
+        "deliveryError": null,
+        "editedAt": 1794943593000,
+        "id": "msg_0126",
+        "order": 126,
+        "seq": 128,
+        "role": "agent",
+        "text": "Second draft.",
+        "createdAt": 1794943592000,
+        "card": null
+      },
+      {
+        "kind": "message",
+        "conversationId": "conv_taylor01",
+        "files": [],
+        "reactions": [],
+        "voice": "whispered",
+        "replyTo": null,
+        "clientId": null,
+        "delivery": null,
+        "deliveryError": null,
+        "editedAt": null,
+        "id": "msg_0130",
+        "order": 130,
+        "seq": 130,
+        "role": "narrator",
+        "mood": "calm",
+        "text": "A role and fields from a later server.",
+        "createdAt": 1794943602000,
+        "card": null
+      }
+    ],
+    "hasMoreBefore": true,
+    "hasMoreAfter": false
+  },
+  "messages": {
+    "agentMarkdown": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [],
+      "reactions": [],
+      "voice": null,
+      "replyTo": null,
+      "clientId": null,
+      "delivery": null,
+      "deliveryError": null,
+      "editedAt": null,
+      "seq": 2101,
+      "order": 2101,
+      "createdAt": 1794943662000,
+      "id": "msg_2101",
+      "role": "agent",
+      "text": "## Result\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```sh\necho \"$HOME\"\n```",
+      "card": null
+    },
+    "agentWithFiles": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [
+        {
+          "id": "file_img01",
+          "name": "chart.png",
+          "mimeType": "image/png",
+          "size": 48211,
+          "kind": "image",
+          "width": 1200,
+          "height": 800
+        },
+        {
+          "id": "file_doc01",
+          "name": "report.pdf",
+          "mimeType": "application/pdf",
+          "size": 301442,
+          "kind": "file",
+          "width": null,
+          "height": null
+        }
+      ],
+      "reactions": [],
+      "voice": null,
+      "replyTo": null,
+      "clientId": null,
+      "delivery": null,
+      "deliveryError": null,
+      "editedAt": null,
+      "seq": 2102,
+      "order": 2102,
+      "createdAt": 1794943662000,
+      "id": "msg_2102",
+      "role": "agent",
+      "text": "Done. The report is attached.",
+      "card": null
+    },
+    "userWithFile": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [
+        {
+          "id": "file_7hT2pQ9a",
+          "name": "notes.txt",
+          "mimeType": "text/plain",
+          "size": 33,
+          "kind": "file",
+          "width": null,
+          "height": null
+        }
+      ],
+      "reactions": [],
+      "voice": null,
+      "replyTo": null,
+      "clientId": "5d2c8e0a-61b4-4f0e-8c43-1f7a9e2b6d30",
+      "delivery": "reached",
+      "deliveryError": null,
+      "editedAt": null,
+      "seq": 2104,
+      "order": 2103,
+      "createdAt": 1794943662000,
+      "id": "msg_2103",
+      "role": "user",
+      "text": "Here is the log.",
+      "card": null
+    },
+    "userUnknown": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [],
+      "reactions": [],
+      "voice": null,
+      "replyTo": null,
+      "clientId": "9a1f3c7e-2b4d-4e8a-b6c0-7d5e1f9a3b2c",
+      "delivery": "unknown",
+      "deliveryError": {
+        "error": "outcome_unknown",
+        "message": "The host restarted while sending this, so it may or may not have reached the agent. Check before you send it again."
+      },
+      "editedAt": null,
+      "seq": 2106,
+      "order": 2105,
+      "createdAt": 1794943662000,
+      "id": "msg_2105",
+      "role": "user",
+      "text": "are you there?",
+      "card": null
+    },
+    "userFailed": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [],
+      "reactions": [],
+      "voice": null,
+      "replyTo": null,
+      "clientId": "3e4f5a6b-7c8d-4e9f-a0b1-c2d3e4f5a6b7",
+      "delivery": "failed",
+      "deliveryError": {
+        "error": "not_routed",
+        "message": "This message did not reach the agent. You can send it again."
+      },
+      "editedAt": null,
+      "seq": 2114,
+      "order": 2113,
+      "createdAt": 1794943662000,
+      "id": "msg_2113",
+      "role": "user",
+      "text": "hello?",
+      "card": null
+    },
+    "voiceCaller": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [],
+      "reactions": [],
+      "voice": "caller",
+      "replyTo": null,
+      "clientId": null,
+      "delivery": null,
+      "deliveryError": null,
+      "editedAt": null,
+      "seq": 2107,
+      "order": 2107,
+      "createdAt": 1794943662000,
+      "id": "msg_2107",
+      "role": "user",
+      "text": "What is two plus two?",
+      "card": null
+    },
+    "voiceSpoken": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [],
+      "reactions": [],
+      "voice": "spoken",
+      "replyTo": null,
+      "clientId": null,
+      "delivery": null,
+      "deliveryError": null,
+      "editedAt": null,
+      "seq": 2108,
+      "order": 2108,
+      "createdAt": 1794943662000,
+      "id": "msg_2108",
+      "role": "agent",
+      "text": "Four.",
+      "card": null
+    },
+    "host": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [],
+      "reactions": [],
+      "voice": null,
+      "replyTo": null,
+      "clientId": null,
+      "delivery": null,
+      "deliveryError": null,
+      "editedAt": null,
+      "seq": 2109,
+      "order": 2109,
+      "createdAt": 1794943662000,
+      "id": "msg_2109",
+      "role": "host",
+      "text": "Context cleared.",
+      "card": null
+    },
+    "future": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [],
+      "reactions": [],
+      "voice": "whispered",
+      "replyTo": null,
+      "clientId": null,
+      "delivery": null,
+      "deliveryError": null,
+      "editedAt": null,
+      "id": "msg_0130",
+      "order": 130,
+      "seq": 130,
+      "role": "narrator",
+      "mood": "calm",
+      "text": "A role and fields from a later server.",
+      "createdAt": 1794943602000,
+      "card": null
+    },
+    "send": {
+      "stored": {
+        "kind": "message",
+        "conversationId": "conv_taylor01",
+        "files": [],
+        "reactions": [],
+        "voice": null,
+        "replyTo": null,
+        "clientId": "0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11",
+        "delivery": "stored",
+        "deliveryError": null,
+        "editedAt": null,
+        "id": "msg_0119",
+        "order": 119,
+        "seq": 119,
+        "role": "user",
+        "text": "reply please",
+        "createdAt": 1794943562000,
+        "card": null
+      },
+      "routed": {
+        "kind": "message",
+        "conversationId": "conv_taylor01",
+        "files": [],
+        "reactions": [],
+        "voice": null,
+        "replyTo": null,
+        "clientId": "0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11",
+        "delivery": "routed",
+        "deliveryError": null,
+        "editedAt": null,
+        "id": "msg_0119",
+        "order": 119,
+        "seq": 120,
+        "role": "user",
+        "text": "reply please",
+        "createdAt": 1794943562000,
+        "card": null
+      },
+      "reached": {
+        "kind": "message",
+        "conversationId": "conv_taylor01",
+        "files": [],
+        "reactions": [],
+        "voice": null,
+        "replyTo": null,
+        "clientId": "0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11",
+        "delivery": "reached",
+        "deliveryError": null,
+        "editedAt": null,
+        "id": "msg_0119",
+        "order": 119,
+        "seq": 121,
+        "role": "user",
+        "text": "reply please",
+        "createdAt": 1794943562000,
+        "card": null
+      }
+    },
+    "editSequence": [
+      {
+        "kind": "message",
+        "conversationId": "conv_taylor01",
+        "files": [],
+        "reactions": [],
+        "voice": null,
+        "replyTo": null,
+        "clientId": null,
+        "delivery": null,
+        "deliveryError": null,
+        "editedAt": null,
+        "id": "msg_0126",
+        "order": 126,
+        "seq": 126,
+        "role": "agent",
+        "text": "First draft.",
+        "createdAt": 1794943592000,
+        "card": null
+      },
+      {
+        "kind": "message",
+        "conversationId": "conv_taylor01",
+        "files": [],
+        "reactions": [],
+        "voice": null,
+        "replyTo": null,
+        "clientId": null,
+        "delivery": null,
+        "deliveryError": null,
+        "editedAt": 1794943593000,
+        "id": "msg_0126",
+        "order": 126,
+        "seq": 127,
+        "role": "agent",
+        "text": "Second draft.",
+        "createdAt": 1794943592000,
+        "card": null
+      },
+      {
+        "kind": "message",
+        "conversationId": "conv_taylor01",
+        "files": [],
+        "reactions": [
+          {
+            "emoji": "👍",
+            "by": "agent"
+          }
+        ],
+        "voice": null,
+        "replyTo": null,
+        "clientId": null,
+        "delivery": null,
+        "deliveryError": null,
+        "editedAt": 1794943593000,
+        "id": "msg_0126",
+        "order": 126,
+        "seq": 128,
+        "role": "agent",
+        "text": "Second draft.",
+        "createdAt": 1794943592000,
+        "card": null
+      }
+    ],
+    "richCard": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [],
+      "reactions": [],
+      "voice": null,
+      "replyTo": null,
+      "clientId": null,
+      "delivery": null,
+      "deliveryError": null,
+      "editedAt": null,
+      "seq": 2115,
+      "order": 2115,
+      "createdAt": 1794943676000,
+      "id": "msg_2115",
+      "role": "agent",
+      "text": "20 checks passed across two suites.",
+      "card": {
+        "title": "Test results",
+        "description": "Both suites passed.",
+        "parts": [
+          {
+            "type": "fields",
+            "fields": [
+              {
+                "label": "Passed",
+                "value": "20"
+              }
+            ]
+          },
+          {
+            "type": "table",
+            "headers": ["Suite", "Passed"],
+            "rows": [
+              ["Unit", "12"],
+              ["Integration", "8"]
+            ],
+            "align": ["left", "right"],
+            "caption": "By suite"
+          },
+          {
+            "type": "chart",
+            "title": "Checks by suite",
+            "chart": {
+              "type": "bar",
+              "categories": ["Unit", "Integration"],
+              "series": [
+                {
+                  "name": "Passed",
+                  "values": [12, 8]
+                }
+              ]
+            }
+          },
+          {
+            "type": "divider"
+          },
+          {
+            "type": "text",
+            "content": "All checks completed.",
+            "style": "muted"
+          }
+        ],
+        "actions": [
+          {
+            "label": "View report",
+            "url": "https://example.com/report",
+            "style": "primary"
+          },
+          {
+            "label": "View logs",
+            "url": "https://example.com/logs",
+            "style": "default"
+          }
+        ]
+      }
+    }
+  },
+  "questions": {
+    "open": {
+      "kind": "question",
+      "id": "q_0123",
+      "conversationId": "conv_taylor01",
+      "order": 123,
+      "seq": 123,
+      "title": "Deploy",
+      "text": "Deploy to which environment?",
+      "options": [
+        {
+          "label": "Staging",
+          "selectedLabel": "Staging",
+          "value": "staging",
+          "style": "primary"
+        },
+        {
+          "label": "Production",
+          "selectedLabel": "Production",
+          "value": "production",
+          "style": "danger"
+        },
+        {
+          "label": "Cancel",
+          "selectedLabel": "Cancelled",
+          "value": "cancel",
+          "style": null
+        }
+      ],
+      "state": "open",
+      "answer": null,
+      "createdAt": 1794943574000,
+      "expiresAt": 1794943874000
+    },
+    "answered": {
+      "kind": "question",
+      "id": "q_0123",
+      "conversationId": "conv_taylor01",
+      "order": 123,
+      "seq": 125,
+      "title": "Deploy",
+      "text": "Deploy to which environment?",
+      "options": [
+        {
+          "label": "Staging",
+          "selectedLabel": "Staging",
+          "value": "staging",
+          "style": "primary"
+        },
+        {
+          "label": "Production",
+          "selectedLabel": "Production",
+          "value": "production",
+          "style": "danger"
+        },
+        {
+          "label": "Cancel",
+          "selectedLabel": "Cancelled",
+          "value": "cancel",
+          "style": null
+        }
+      ],
+      "state": "answered",
+      "answer": {
+        "value": "staging",
+        "label": "Staging",
+        "at": 1794943587000
+      },
+      "createdAt": 1794943574000,
+      "expiresAt": 1794943874000
+    },
+    "expired": {
+      "kind": "question",
+      "id": "q_2110",
+      "conversationId": "conv_taylor01",
+      "order": 2110,
+      "seq": 2111,
+      "title": "Deploy",
+      "text": "Deploy to which environment?",
+      "options": [
+        {
+          "label": "Staging",
+          "selectedLabel": "Staging",
+          "value": "staging",
+          "style": "primary"
+        },
+        {
+          "label": "Production",
+          "selectedLabel": "Production",
+          "value": "production",
+          "style": "danger"
+        },
+        {
+          "label": "Cancel",
+          "selectedLabel": "Cancelled",
+          "value": "cancel",
+          "style": null
+        }
+      ],
+      "state": "expired",
+      "answer": null,
+      "createdAt": 1794943574000,
+      "expiresAt": 1794943662000
+    },
+    "noDeadline": {
+      "kind": "question",
+      "id": "q_2112",
+      "conversationId": "conv_taylor01",
+      "order": 2112,
+      "seq": 2112,
+      "title": "Deploy",
+      "text": "Deploy to which environment?",
+      "options": [
+        {
+          "label": "Staging",
+          "selectedLabel": "Staging",
+          "value": "staging",
+          "style": "primary"
+        },
+        {
+          "label": "Production",
+          "selectedLabel": "Production",
+          "value": "production",
+          "style": "danger"
+        },
+        {
+          "label": "Cancel",
+          "selectedLabel": "Cancelled",
+          "value": "cancel",
+          "style": null
+        }
+      ],
+      "state": "open",
+      "answer": null,
+      "createdAt": 1794943574000,
+      "expiresAt": null
+    }
+  },
+  "statuses": {
+    "working": {
+      "kind": "status",
+      "conversationId": "conv_taylor01",
+      "rev": 41,
+      "state": "working",
+      "label": "Running a command",
+      "at": 1794943595000
+    },
+    "waiting": {
+      "kind": "status",
+      "conversationId": "conv_taylor01",
+      "rev": 40,
+      "state": "waiting",
+      "label": "Waiting for your answer",
+      "at": 1794943574000
+    },
+    "idle": {
+      "kind": "status",
+      "conversationId": "conv_taylor01",
+      "rev": 42,
+      "state": "idle",
+      "label": null,
+      "at": 1794943607000
+    }
+  },
+  "stream": {
+    "note": "Raw bytes of one connection opened with after=118 while the log ends at 129. Lines end in LF; an empty line ends an event; a line starting with a colon is a comment. seq 124 is filtered out (another agent).",
+    "raw": "id: 119\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"stored\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":119,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000,\"card\":null}\n\nid: 120\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"routed\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":120,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000,\"card\":null}\n\nid: 121\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"reached\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":121,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000,\"card\":null}\n\nid: 122\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0122\",\"order\":122,\"seq\":122,\"role\":\"agent\",\"text\":\"Working on it.\",\"createdAt\":1794943568000,\"card\":null}\n\nid: 123\nevent: question\ndata: {\"kind\":\"question\",\"id\":\"q_0123\",\"conversationId\":\"conv_taylor01\",\"order\":123,\"seq\":123,\"title\":\"Deploy\",\"text\":\"Deploy to which environment?\",\"options\":[{\"label\":\"Staging\",\"selectedLabel\":\"Staging\",\"value\":\"staging\",\"style\":\"primary\"},{\"label\":\"Production\",\"selectedLabel\":\"Production\",\"value\":\"production\",\"style\":\"danger\"},{\"label\":\"Cancel\",\"selectedLabel\":\"Cancelled\",\"value\":\"cancel\",\"style\":null}],\"state\":\"open\",\"answer\":null,\"createdAt\":1794943574000,\"expiresAt\":1794943874000}\n\nid: 125\nevent: question\ndata: {\"kind\":\"question\",\"id\":\"q_0123\",\"conversationId\":\"conv_taylor01\",\"order\":123,\"seq\":125,\"title\":\"Deploy\",\"text\":\"Deploy to which environment?\",\"options\":[{\"label\":\"Staging\",\"selectedLabel\":\"Staging\",\"value\":\"staging\",\"style\":\"primary\"},{\"label\":\"Production\",\"selectedLabel\":\"Production\",\"value\":\"production\",\"style\":\"danger\"},{\"label\":\"Cancel\",\"selectedLabel\":\"Cancelled\",\"value\":\"cancel\",\"style\":null}],\"state\":\"answered\",\"answer\":{\"value\":\"staging\",\"label\":\"Staging\",\"at\":1794943587000},\"createdAt\":1794943574000,\"expiresAt\":1794943874000}\n\nid: 126\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0126\",\"order\":126,\"seq\":126,\"role\":\"agent\",\"text\":\"First draft.\",\"createdAt\":1794943592000,\"card\":null}\n\nid: 127\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":1794943593000,\"id\":\"msg_0126\",\"order\":126,\"seq\":127,\"role\":\"agent\",\"text\":\"Second draft.\",\"createdAt\":1794943592000,\"card\":null}\n\nid: 128\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[{\"emoji\":\"👍\",\"by\":\"agent\"}],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":1794943593000,\"id\":\"msg_0126\",\"order\":126,\"seq\":128,\"role\":\"agent\",\"text\":\"Second draft.\",\"createdAt\":1794943592000,\"card\":null}\n\nid: 129\nevent: conversation\ndata: {\"kind\":\"conversation\",\"id\":\"conv_taylor01\",\"seq\":129,\"agent\":{\"id\":\"ag_taylor\",\"name\":\"Taylor\"},\"lastMessage\":{\"id\":\"msg_0126\",\"role\":\"agent\",\"preview\":\"Second draft.\",\"at\":1794943593000},\"unread\":3,\"readOrder\":118,\"canCall\":true,\"callRefusal\":null,\"createdAt\":1794857162000}\n\nevent: status\ndata: {\"kind\":\"status\",\"conversationId\":\"conv_taylor01\",\"rev\":41,\"state\":\"working\",\"label\":\"Running a command\",\"at\":1794943595000}\n\nevent: badge\ndata: {\"kind\":\"badge\",\"rev\":7,\"unreadTotal\":3}\n\nevent: synchronized\ndata: {\"seq\":129}\n\n: ping\n\nid: 130\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":\"whispered\",\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0130\",\"order\":130,\"seq\":130,\"role\":\"narrator\",\"mood\":\"calm\",\"text\":\"A role and fields from a later server.\",\"createdAt\":1794943602000,\"card\":null}\n\nid: 131\nevent: weather\ndata: {\"kind\":\"weather\",\"note\":\"an event kind from a later server\"}\n\nevent: status\ndata: {\"kind\":\"status\",\"conversationId\":\"conv_taylor01\",\"rev\":42,\"state\":\"idle\",\"label\":null,\"at\":1794943607000}\n\nevent: badge\ndata: {\"kind\":\"badge\",\"rev\":8,\"unreadTotal\":4}\n\n: ping\n\n",
+    "expect": {
+      "kindsInOrder": [
+        "message",
+        "message",
+        "message",
+        "message",
+        "question",
+        "question",
+        "message",
+        "message",
+        "message",
+        "conversation",
+        "status",
+        "badge",
+        "synchronized",
+        "message",
+        "weather",
+        "status",
+        "badge"
+      ],
+      "cursorAtSynchronized": 129,
+      "cursorAfter": 131,
+      "finalEntities": {
+        "msg_0119": {
+          "seq": 121,
+          "delivery": "reached"
+        },
+        "q_0123": {
+          "seq": 125,
+          "state": "answered"
+        },
+        "msg_0126": {
+          "seq": 128,
+          "text": "Second draft.",
+          "reactions": 1
+        }
+      },
+      "finalThreadOrder": ["msg_0119", "msg_0122", "q_0123", "msg_0126", "msg_0130"],
+      "renderedThreadOrder": ["msg_0119", "msg_0122", "q_0123", "msg_0126"],
+      "finalStatus": {
+        "rev": 42,
+        "state": "idle"
+      },
+      "finalBadge": {
+        "rev": 8,
+        "unreadTotal": 4
+      }
+    }
+  },
+  "sendRequest": {
+    "clientId": "0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11",
+    "text": "reply please",
+    "fileIds": []
+  },
+  "sendResponse": {
+    "message": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [],
+      "reactions": [],
+      "voice": null,
+      "replyTo": null,
+      "clientId": "0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11",
+      "delivery": "stored",
+      "deliveryError": null,
+      "editedAt": null,
+      "id": "msg_0119",
+      "order": 119,
+      "seq": 119,
+      "role": "user",
+      "text": "reply please",
+      "createdAt": 1794943562000,
+      "card": null
+    }
+  },
+  "readRequest": {
+    "order": 126
+  },
+  "readResponse": {
+    "conversation": {
+      "kind": "conversation",
+      "id": "conv_taylor01",
+      "seq": 2130,
+      "agent": {
+        "id": "ag_taylor",
+        "name": "Taylor"
+      },
+      "lastMessage": {
+        "id": "msg_0126",
+        "role": "agent",
+        "preview": "Second draft.",
+        "at": 1794943593000
+      },
+      "unread": 0,
+      "readOrder": 126,
+      "canCall": true,
+      "callRefusal": null,
+      "createdAt": 1794857162000
+    },
+    "badge": {
+      "kind": "badge",
+      "rev": 9,
+      "unreadTotal": 0
+    }
+  },
+  "answerRequest": {
+    "value": "staging"
+  },
+  "answerResponse": {
+    "question": {
+      "kind": "question",
+      "id": "q_0123",
+      "conversationId": "conv_taylor01",
+      "order": 123,
+      "seq": 125,
+      "title": "Deploy",
+      "text": "Deploy to which environment?",
+      "options": [
+        {
+          "label": "Staging",
+          "selectedLabel": "Staging",
+          "value": "staging",
+          "style": "primary"
+        },
+        {
+          "label": "Production",
+          "selectedLabel": "Production",
+          "value": "production",
+          "style": "danger"
+        },
+        {
+          "label": "Cancel",
+          "selectedLabel": "Cancelled",
+          "value": "cancel",
+          "style": null
+        }
+      ],
+      "state": "answered",
+      "answer": {
+        "value": "staging",
+        "label": "Staging",
+        "at": 1794943587000
+      },
+      "createdAt": 1794943574000,
+      "expiresAt": 1794943874000
+    }
+  },
+  "answerConflict": {
+    "status": 409,
+    "body": {
+      "error": "not_open",
+      "message": "This question was already answered.",
+      "question": {
+        "kind": "question",
+        "id": "q_0123",
+        "conversationId": "conv_taylor01",
+        "order": 123,
+        "seq": 125,
+        "title": "Deploy",
+        "text": "Deploy to which environment?",
+        "options": [
+          {
+            "label": "Staging",
+            "selectedLabel": "Staging",
+            "value": "staging",
+            "style": "primary"
+          },
+          {
+            "label": "Production",
+            "selectedLabel": "Production",
+            "value": "production",
+            "style": "danger"
+          },
+          {
+            "label": "Cancel",
+            "selectedLabel": "Cancelled",
+            "value": "cancel",
+            "style": null
+          }
+        ],
+        "state": "answered",
+        "answer": {
+          "value": "staging",
+          "label": "Staging",
+          "at": 1794943587000
+        },
+        "createdAt": 1794943574000,
+        "expiresAt": 1794943874000
+      }
+    }
+  },
+  "fileInitRequest": {
+    "uploadKey": "c7d1e2f3-4a5b-4c6d-8e7f-90a1b2c3d4e5",
+    "name": "notes.txt",
+    "mimeType": "text/plain",
+    "size": 33,
+    "sha256": "b99d2ee8f63683817ec07fbca9c70656442109c0fc6f4332a019c544bafc68e9"
+  },
+  "fileInitResponse": {
+    "fileId": "file_7hT2pQ9a",
+    "ticket": "eyJ2IjoxLCJwdXJwb3NlIjoidXBsb2FkIiwiZmlsZUlkIjoiZmlsZV83aFQycFE5YSIsImRldmljZUlkIjoiZGV2XzhRbTNrVDF4VjJhWiIsInVzZXJJZCI6InRlbGVncmFtOjEwMDAwMDEiLCJzaXplIjozMywic2hhMjU2IjoiYjk5ZDJlZThmNjM2ODM4MTdlYzA3ZmJjYTljNzA2NTY0NDIxMDljMGZjNmY0MzMyYTAxOWM1NDRiYWZjNjhlOSIsImV4cCI6MTc5NDk0NzE2MjAwMH0.D3JjT2dmDIU_YqKh7GiwKf2EZohGSYecQ43kqBNajeE",
+    "expiresAt": 1794947162000,
+    "uploadPath": "/app/files/file_7hT2pQ9a",
+    "uploaded": false
+  },
+  "fileTicketRenewResponse": {
+    "fileId": "file_7hT2pQ9a",
+    "ticket": "eyJ2IjoxLCJwdXJwb3NlIjoidXBsb2FkIiwiZmlsZUlkIjoiZmlsZV83aFQycFE5YSIsImRldmljZUlkIjoiZGV2XzhRbTNrVDF4VjJhWiIsInVzZXJJZCI6InRlbGVncmFtOjEwMDAwMDEiLCJzaXplIjozMywic2hhMjU2IjoiYjk5ZDJlZThmNjM2ODM4MTdlYzA3ZmJjYTljNzA2NTY0NDIxMDljMGZjNmY0MzMyYTAxOWM1NDRiYWZjNjhlOSIsImV4cCI6MTc5NDk0NzE2MjAwMH0.D3JjT2dmDIU_YqKh7GiwKf2EZohGSYecQ43kqBNajeE",
+    "expiresAt": 1794947162000,
+    "uploadPath": "/app/files/file_7hT2pQ9a",
+    "uploaded": false
+  },
+  "fileUpload": {
+    "authorization": "HeyDan-Ticket eyJ2IjoxLCJwdXJwb3NlIjoidXBsb2FkIiwiZmlsZUlkIjoiZmlsZV83aFQycFE5YSIsImRldmljZUlkIjoiZGV2XzhRbTNrVDF4VjJhWiIsInVzZXJJZCI6InRlbGVncmFtOjEwMDAwMDEiLCJzaXplIjozMywic2hhMjU2IjoiYjk5ZDJlZThmNjM2ODM4MTdlYzA3ZmJjYTljNzA2NTY0NDIxMDljMGZjNmY0MzMyYTAxOWM1NDRiYWZjNjhlOSIsImV4cCI6MTc5NDk0NzE2MjAwMH0.D3JjT2dmDIU_YqKh7GiwKf2EZohGSYecQ43kqBNajeE",
+    "bodyUtf8": "hello from the contract fixtures\n",
+    "successStatus": 204,
+    "ticketClaims": {
+      "v": 1,
+      "purpose": "upload",
+      "fileId": "file_7hT2pQ9a",
+      "deviceId": "dev_8Qm3kT1xV2aZ",
+      "userId": "telegram:1000001",
+      "size": 33,
+      "sha256": "b99d2ee8f63683817ec07fbca9c70656442109c0fc6f4332a019c544bafc68e9",
+      "exp": 1794947162000
+    },
+    "ticketSecretForTests": "contract-test-ticket-secret",
+    "expiredAuthorization": "HeyDan-Ticket eyJ2IjoxLCJwdXJwb3NlIjoidXBsb2FkIiwiZmlsZUlkIjoiZmlsZV83aFQycFE5YSIsImRldmljZUlkIjoiZGV2XzhRbTNrVDF4VjJhWiIsInVzZXJJZCI6InRlbGVncmFtOjEwMDAwMDEiLCJzaXplIjozMywic2hhMjU2IjoiYjk5ZDJlZThmNjM2ODM4MTdlYzA3ZmJjYTljNzA2NTY0NDIxMDljMGZjNmY0MzMyYTAxOWM1NDRiYWZjNjhlOSIsImV4cCI6MTc5NDk0MzU2MTAwMH0.EQJCpaun7aNIGFuKFnUnqYDha1_kkTmwBjeDVgT2poU"
+  },
+  "callRequest": {
+    "conversationId": "conv_taylor01",
+    "attemptId": "f3e2d1c0-b9a8-4776-8554-433221100fed",
+    "voiceProtocol": 6,
+    "jev": null
+  },
+  "callGrant": {
+    "protocol": 6,
+    "url": "wss://livekit.example.com",
+    "token": "eyJ.fixture.token",
+    "callId": "call_5tGh2",
+    "attemptId": "f3e2d1c0-b9a8-4776-8554-433221100fed",
+    "agent": "Taylor",
+    "chat": "Taylor (app)",
+    "silenceMs": 1400,
+    "limit": {
+      "ms": 3600000,
+      "kind": "duration"
+    }
+  },
+  "callErrors": {
+    "protocol": {
+      "status": 426,
+      "body": {
+        "error": "protocol",
+        "protocol": 6,
+        "message": "The voice service is updating. Update Hey Dan to make calls."
+      }
+    },
+    "noLine": {
+      "status": 403,
+      "body": {
+        "error": "no_line",
+        "message": "Calls are not set up for this agent."
+      }
+    },
+    "noChat": {
+      "status": 409,
+      "body": {
+        "error": "no_chat",
+        "message": "This agent has no conversation to call in."
+      }
+    },
+    "limit": {
+      "status": 429,
+      "headers": {
+        "Retry-After": "600"
+      },
+      "body": {
+        "error": "limit",
+        "message": "The call limit is reached.",
+        "retryAfter": 600
+      }
+    },
+    "room": {
+      "status": 502,
+      "body": {
+        "error": "room",
+        "message": "Could not open the call room."
+      }
+    },
+    "stopped": {
+      "status": 409,
+      "body": {
+        "error": "stopped",
+        "message": "This call attempt is no longer active."
+      }
+    },
+    "voiceOffline": {
+      "status": 503,
+      "body": {
+        "error": "voice_offline",
+        "message": "Calls are offline right now."
+      }
+    },
+    "providerUnavailable": {
+      "status": 503,
+      "body": {
+        "error": "provider_unavailable",
+        "message": "That voice provider is not set up.",
+        "provider": "elevenlabs"
+      }
+    }
+  },
+  "callEndRequest": {
+    "reason": "hangup"
+  },
+  "callCancelRequest": {
+    "reason": "hangup"
+  },
+  "pushTokenRequest": {
+    "token": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+    "environment": "sandbox"
+  },
+  "pushPayload": {
+    "headers": {
+      "apns-push-type": "alert",
+      "apns-priority": "10",
+      "apns-topic": "com.example.HeyDan",
+      "apns-collapse-id": "msg_2102"
+    },
+    "body": {
+      "aps": {
+        "alert": {
+          "title": "Taylor",
+          "body": "Done. The report is attached."
+        },
+        "thread-id": "conv_taylor01",
+        "mutable-content": 1,
+        "badge": 3,
+        "sound": "default",
+        "category": "message"
+      },
+      "hd": {
+        "v": 1,
+        "h": "https://app.example.com",
+        "c": "conv_taylor01",
+        "m": "msg_2102",
+        "k": "message",
+        "a": {
+          "id": "ag_taylor",
+          "name": "Taylor"
+        }
+      }
+    }
+  }
+}
