@@ -1,10 +1,9 @@
-import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { generateKeyPairSync, randomUUID, sign } from 'node:crypto';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { parseArgs } from 'node:util';
+import { isDeepStrictEqual, parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { signRequest } from './app-sign.js';
 import { bodySHA256, pairProofText } from '../src/channels/app/contract.js';
@@ -15,13 +14,21 @@ import type {
   Question,
   PairResponse,
   FileInitResponse,
-  Badge,
+  ReadResponse,
 } from '../src/channels/app/contract.js';
+
+const PROXY_HOST = '127.0.0.1.sslip.io';
+const LOOPBACK = ['127.0.0.1', 'localhost', '[::1]', PROXY_HOST];
+// node:assert appends actual values to its message, which can be payload; a Failure carries only its code.
+class Failure extends Error {}
+function ensure(condition: unknown, code: string): asserts condition {
+  if (!condition) throw new Failure(code);
+}
 
 export function target(parts: string[], query: [string, string][] = []): string {
   const encode = (s: string) =>
     encodeURIComponent(s).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
-  assert(
+  ensure(
     parts.every((p) => p && p !== '.' && p !== '..' && !p.includes(';')),
     'invalid target segment',
   );
@@ -33,7 +40,7 @@ export function target(parts: string[], query: [string, string][] = []): string 
 }
 export function guard(base: string, remote: boolean, agent?: string, allowedAgent?: string): void {
   const u = new URL(base);
-  assert(
+  ensure(
     ['http:', 'https:'].includes(u.protocol) &&
       !u.username &&
       !u.password &&
@@ -42,10 +49,10 @@ export function guard(base: string, remote: boolean, agent?: string, allowedAgen
       !u.hash,
     'invalid base',
   );
-  const local = ['127.0.0.1', 'localhost', '[::1]', '127.0.0.1.sslip.io'].includes(u.hostname);
-  assert(local || remote, 'remote base requires --remote');
-  if (remote) assert(allowedAgent?.trim(), 'remote requires --agent or LOCAL_REMOTE_AGENT');
-  if (!local && agent !== undefined) assert(agent === allowedAgent, 'remote agent not allowed');
+  const local = LOOPBACK.includes(u.hostname);
+  ensure(local || remote, 'remote base requires --remote');
+  if (remote) ensure(allowedAgent?.trim(), 'remote requires --agent or LOCAL_REMOTE_AGENT');
+  if (!local && agent !== undefined) ensure(agent === allowedAgent, 'remote agent not allowed');
 }
 export interface Event {
   kind: string;
@@ -108,6 +115,19 @@ export async function revokedStreamClosed(done: Promise<void>): Promise<void> {
 }
 class Skip extends Error {}
 class RateLimited extends Error {}
+// A result detail is a skip reason or a fixed code written in this file, never server payload.
+function failureDetail(e: unknown): string {
+  if (e instanceof Skip || e instanceof RateLimited || e instanceof Failure) return e.message;
+  if ((e as { name?: unknown } | undefined)?.name === 'TimeoutError') return 'timeout';
+  const code = (e as { cause?: { code?: unknown } } | undefined)?.cause?.code;
+  return typeof code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(code)
+    ? 'transport:' + code
+    : 'unexpected_failure (payload withheld)';
+}
+async function expectError(r: Response, status: number, error: string, step: string) {
+  ensure(r.status === status, 'status_mismatch:' + step);
+  ensure(((await r.json()) as { error?: unknown }).error === error, 'error_mismatch:' + step);
+}
 interface Device {
   privateKey: string;
   publicKey: string;
@@ -124,10 +144,12 @@ interface Options {
 export async function runAppClient(baseUrl: string, runDir: string, options: Options = {}): Promise<void> {
   const allowedAgent = options.agent ?? process.env.LOCAL_REMOTE_AGENT;
   const scenario = options.scenario ?? 'all';
-  assert(['pair', 'send', 'stream', 'upload', 'security', 'all'].includes(scenario), 'unknown scenario');
+  ensure(['pair', 'send', 'stream', 'upload', 'security', 'all'].includes(scenario), 'unknown scenario');
+  const host = URL.canParse(baseUrl) ? new URL(baseUrl).hostname : '';
+  const route = host === PROXY_HOST ? 'chain' : LOOPBACK.includes(host) ? 'direct' : 'remote';
   mkdirSync(join(runDir, 'results'), { recursive: true });
   mkdirSync(join(runDir, 'logs'), { recursive: true });
-  const log = join(runDir, 'logs/n9b-client.log');
+  const log = join(runDir, 'logs/app-client.log');
   let failures = 0;
   async function check(id: string, fn: () => Promise<void>) {
     let status = 'pass',
@@ -137,24 +159,23 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       await fn();
     } catch (e) {
       status = e instanceof Skip ? 'skip' : 'fail';
-      detail =
-        e instanceof Skip || e instanceof RateLimited ? e.message : 'Assertion or transport failure (payload withheld)';
+      detail = failureDetail(e);
       if (status === 'fail') failures++;
     }
     const result = {
-      id: 'n9b-' + (new URL(baseUrl).hostname === '127.0.0.1.sslip.io' ? 'chain-' : 'direct-') + id,
-      title: (new URL(baseUrl).hostname === '127.0.0.1.sslip.io' ? 'chain ' : 'direct ') + id.replaceAll('-', ' '),
+      id: `app-client-${route}-${id}`,
+      title: `${route} ${id.replaceAll('-', ' ')}`,
       status,
       detail,
-      evidence: ['logs/n9b-client.log'],
+      evidence: ['logs/app-client.log'],
       at: new Date().toISOString(),
     };
     writeFileSync(join(runDir, 'results', result.id + '.json'), JSON.stringify(result) + '\n', { mode: 0o600 });
     appendFileSync(log, `${result.id} ${status} ${Date.now() - started}ms\n`, { mode: 0o600 });
     console.log(`${result.id}: ${status} (${detail})`);
-    return status;
+    return { status, detail };
   }
-  if ((await check('guard', async () => guard(baseUrl, !!options.remote, undefined, allowedAgent))) !== 'pass')
+  if ((await check('guard', async () => guard(baseUrl, !!options.remote, undefined, allowedAgent))).status !== 'pass')
     throw new Error('Client guard refused');
   const statePath = '.local/stack.json';
   const stack = existsSync(statePath)
@@ -179,10 +200,6 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       await response.body?.cancel();
       throw new RateLimited('rate_limited, retry after ' + (Number.isFinite(retryAfter) ? retryAfter : 0) + ' s');
     }
-    if (response.status === 501) {
-      await response.body?.cancel();
-      throw new Skip('501 not_implemented');
-    }
     return response;
   }
   async function request(device: Device, method: string, path: string, value?: unknown, ts?: number) {
@@ -190,13 +207,18 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     return raw(method, path, body, signRequest({ ...device, method, target: path, body, ts }));
   }
   async function json<T>(r: Response): Promise<T> {
-    assert(r.ok, `HTTP ${r.status}`);
+    ensure(r.ok, 'http_' + r.status);
     return r.json() as Promise<T>;
   }
+  const pairedThisRun: { device: Device; file: string }[] = [];
+  const revoked = new Set<string>();
   async function pair(index: number, tampered = false): Promise<Device> {
-    let link = process.env[index === 0 ? 'HEYDAN_PAIR_LINK' : 'HEYDAN_PAIR_LINK_SECOND'];
+    // A refused proof never consumes the code, so the tampered pair reuses the first link.
+    const linkName = index === 0 || tampered ? 'HEYDAN_PAIR_LINK' : 'HEYDAN_PAIR_LINK_SECOND';
+    let link = process.env[linkName];
     if (!link) {
-      if (options.remote || !stack) throw new Skip('Local stack unavailable for pairing a second device');
+      if (options.remote || !stack)
+        throw new Skip(options.remote ? `${linkName} unset` : `${linkName} unset and no local stack`);
       const output = execFileSync(
         'pnpm',
         [
@@ -212,15 +234,13 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
       );
       const envelope = JSON.parse(output.slice(output.indexOf('{')));
-      if (envelope.error === 'not_implemented' || envelope.error?.code === 'not_implemented')
-        throw new Skip('501 not_implemented');
       link = typeof envelope.data === 'string' ? envelope.data : envelope.data?.link;
     }
-    assert(link, 'pair link missing');
+    ensure(link, 'pair link missing');
     const url = new URL(link);
     guard(url.origin, !!options.remote, undefined, allowedAgent);
     // The loopback direct and chain endpoints deliberately share one local host identity.
-    if (options.remote || !stack) assert(url.origin === new URL(baseUrl).origin, 'pairing host mismatch');
+    if (options.remote || !stack) ensure(url.origin === new URL(baseUrl).origin, 'pairing host mismatch');
     const keys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
     const publicKey = keys.publicKey.export({ type: 'spki', format: 'der' }).toString('base64url');
     const code = url.hash.slice(1);
@@ -229,15 +249,14 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       JSON.stringify({
         code,
         publicKey,
-        deviceName: 'N9b scripted client',
+        deviceName: 'app-client scripted client',
         proof: tampered ? proof.slice(0, -4) + 'AAAA' : proof,
         app: { version: '1', build: '1', os: 'Node' },
       }),
     );
     const response = await raw('POST', '/app/pair', body);
     if (tampered) {
-      assert.equal(response.status, 400);
-      assert.equal((await response.json()).error, 'bad_proof');
+      await expectError(response, 400, 'bad_proof', 'pair-proof');
       return {} as Device;
     }
     const paired = await json<PairResponse>(response);
@@ -251,6 +270,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     const file = join(dir, `device-${index}.json`);
     writeFileSync(file, JSON.stringify(device), { mode: 0o600 });
     chmodSync(file, 0o600);
+    pairedThisRun.push({ device, file });
     return device;
   }
   async function loadOrPair(index: number): Promise<Device> {
@@ -262,28 +282,53 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
         await response.body?.cancel();
         return device;
       }
-      const value = await response.json();
-      assert(
+      const value = (await response.json()) as { error: string };
+      ensure(
         response.status === 401 && ['unknown_device', 'device_revoked'].includes(value.error),
         'device validation failed',
       );
     }
     return pair(index);
   }
+  async function revoke(device: Device) {
+    ensure((await request(device, 'DELETE', '/app/devices/me')).status === 204, 'status_mismatch:revoke');
+    revoked.add(device.deviceId);
+  }
+  // A remote base keeps none of this run's devices: each is revoked and its key file removed.
+  async function revokeRemote() {
+    if (route !== 'remote' || !pairedThisRun.length) return;
+    await check('cleanup-revoke', async () => {
+      for (const { device, file } of pairedThisRun) {
+        if (!revoked.has(device.deviceId)) await revoke(device);
+        rmSync(file, { force: true });
+      }
+    });
+  }
   let a: Device | undefined, b: Device | undefined;
+  let secondUnavailable = 'pairing failed';
   const paired = await check('pair', async () => {
     a = await loadOrPair(0);
-    b = await loadOrPair(1);
-    assert.notEqual(a.deviceId, b.deviceId);
+    try {
+      b = await loadOrPair(1);
+    } catch (error) {
+      // One pair link still runs every single-device check; only read-other-device skips.
+      if (!(error instanceof Skip)) throw error;
+      secondUnavailable = error.message;
+    }
+    if (b) ensure(a.deviceId !== b.deviceId, 'same_device:pair');
   });
   const requirePair = () => {
-    if (!a || !b)
-      throw new Skip(
-        paired === 'skip' ? 'Pairing dependency: 501 not_implemented or unavailable' : 'Pairing dependency failed',
-      );
+    if (!a)
+      throw new Skip(paired.status === 'skip' ? 'Pairing dependency: ' + paired.detail : 'Pairing dependency failed');
     return a;
   };
+  const requireSecond = () => {
+    requirePair();
+    if (!b) throw new Skip('Second device unavailable: ' + secondUnavailable);
+    return b;
+  };
   if (scenario === 'pair') {
+    await revokeRemote();
     if (failures) throw new Error('Client checks failed');
     return;
   }
@@ -293,7 +338,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     const list = await json<ConversationsResponse>(await request(requirePair(), 'GET', '/app/conversations'));
     initialCursor = list.seq;
     const candidate = list.conversations[0];
-    assert(candidate);
+    ensure(candidate, 'no_conversation');
     guard(baseUrl, !!options.remote, candidate.agent.name, allowedAgent);
     conversation = candidate;
   });
@@ -336,8 +381,9 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     } finally {
       clearTimeout(connectTimer);
     }
-    assert(response.ok && response.headers.get('content-type')?.includes('text/event-stream'));
-    assert(response.body);
+    ensure(response.ok, 'http_' + response.status);
+    ensure(response.headers.get('content-type')?.includes('text/event-stream'), 'not_event_stream');
+    ensure(response.body, 'no_stream_body');
     const done = (async () => {
       try {
         for await (const chunk of response.body!) parser.feed(chunk);
@@ -350,10 +396,10 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     streams.push(value);
     return value;
   }
-  async function until(predicate: () => boolean) {
+  async function until(predicate: () => boolean, step: string) {
     const end = Date.now() + 45000;
     while (!predicate()) {
-      assert(Date.now() < end, 'event deadline');
+      ensure(Date.now() < end, 'event_deadline:' + step);
       await delay(50);
     }
   }
@@ -361,7 +407,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
   await check('stream-open', async () => {
     conv();
     live = await stream(requirePair(), initialCursor);
-    await until(() => live!.events.some((e) => e.kind === 'synchronized'));
+    await until(() => live!.events.some((e) => e.kind === 'synchronized'), 'synchronized');
   });
   function events() {
     if (!live) throw new Skip('Stream dependency unavailable');
@@ -373,8 +419,9 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     );
   }
   async function reached(message: Message) {
-    await until(() =>
-      events().some((e) => e.kind === 'message' && e.data.id === message.id && e.data.delivery === 'reached'),
+    await until(
+      () => events().some((e) => e.kind === 'message' && e.data.id === message.id && e.data.delivery === 'reached'),
+      'reached',
     );
   }
   try {
@@ -382,18 +429,20 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       for (const command of ['reply', 'multi', 'markdown', 'edit', 'question', 'long'])
         await check('send-' + command, async () => {
           const start = events().length;
-          const { message } = await send(command + ' n9b');
-          assert.equal(message.delivery, 'stored');
+          const { message } = await send(command + ' app-client');
+          ensure(message.delivery === 'stored', 'delivery_mismatch:send');
           await reached(message);
           const replies = () =>
             events()
               .slice(start)
               .filter((e) => e.kind === 'message' && e.data.role === 'agent');
           if (command === 'question') {
-            await until(() =>
-              events()
-                .slice(start)
-                .some((e) => e.kind === 'question'),
+            await until(
+              () =>
+                events()
+                  .slice(start)
+                  .some((e) => e.kind === 'question'),
+              'question',
             );
             const q = events()
               .slice(start)
@@ -403,43 +452,59 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
                 value: q.options[0].value,
               }),
             );
-            assert.equal(response.question.state, 'answered');
-            await until(() =>
-              events().some((e) => e.kind === 'question' && e.data.id === q.id && e.data.state === 'answered'),
+            ensure(response.question.state === 'answered', 'state_mismatch:answer');
+            await until(
+              () => events().some((e) => e.kind === 'question' && e.data.id === q.id && e.data.state === 'answered'),
+              'question-answered',
             );
           }
-          await until(() => new Set(replies().map((e) => e.data.id)).size >= (command === 'multi' ? 3 : 1));
+          await until(() => new Set(replies().map((e) => e.data.id)).size >= (command === 'multi' ? 3 : 1), 'replies');
+          if (command === 'markdown') {
+            const text = replies()
+              .map((e) => String(e.data.text))
+              .join('\n');
+            ensure(/^\|(?:\s*:?-{3,}:?\s*\|)+\s*$/m.test(text) || /^```/m.test(text), 'markdown_missing');
+          }
           if (command === 'edit') {
-            await until(() =>
-              replies().some((e, i, all) =>
-                all
-                  .slice(0, i)
-                  .some((prior) => prior.data.id === e.data.id && Number(prior.data.seq) < Number(e.data.seq)),
-              ),
+            await until(
+              () =>
+                replies().some((e, i, all) =>
+                  all
+                    .slice(0, i)
+                    .some((prior) => prior.data.id === e.data.id && Number(prior.data.seq) < Number(e.data.seq)),
+                ),
+              'edit-version',
             );
             const versions = replies();
-            assert.equal(new Set(versions.map((e) => e.data.id)).size, 1);
-            assert.equal(new Set(versions.map((e) => e.data.order)).size, 1);
+            ensure(new Set(versions.map((e) => e.data.id)).size === 1, 'edit_id_mismatch');
+            ensure(new Set(versions.map((e) => e.data.order)).size === 1, 'edit_order_mismatch');
+            ensure(
+              versions.slice(1).every((e) => typeof e.data.editedAt === 'number'),
+              'edited_at_missing',
+            );
           }
           if (command === 'long') {
-            assert(
+            ensure(
               events()
                 .slice(start)
                 .some((e) => e.kind === 'status' && e.data.state === 'working' && typeof e.data.label === 'string'),
+              'working_status_missing',
             );
-            await until(() =>
-              events()
-                .slice(start)
-                .some((e) => e.kind === 'status' && e.data.state === 'idle'),
+            await until(
+              () =>
+                events()
+                  .slice(start)
+                  .some((e) => e.kind === 'status' && e.data.state === 'idle'),
+              'idle',
             );
           }
           if (command === 'reply') {
-            const duplicate = await send(command + ' n9b', [], message.clientId!);
-            assert.equal(duplicate.message.id, message.id);
+            const duplicate = await send(command + ' app-client', [], message.clientId!);
+            ensure(duplicate.message.id === message.id, 'duplicate_id_mismatch');
             const states = events()
               .filter((e) => e.data.id === message.id)
               .map((e) => e.data.delivery);
-            assert(!states.slice(states.indexOf('reached') + 1).includes('routed'));
+            ensure(!states.slice(states.indexOf('reached') + 1).includes('routed'), 'delivery_regressed');
           }
         });
       await check('voice-refusal', async () => {
@@ -448,8 +513,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
           text: '/voice',
           fileIds: [],
         });
-        assert.equal(r.status, 409);
-        assert.equal((await r.json()).error, 'use_call_screen');
+        await expectError(r, 409, 'use_call_screen', 'voice');
       });
     }
     if (['all', 'stream'].includes(scenario)) {
@@ -457,76 +521,92 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
         conv();
         const replay = await stream(requirePair(), 0, 1);
         await replay.done;
-        assert(replay.events.length);
+        ensure(replay.events.length, 'empty_replay');
         const resumed = await stream(requirePair(), replay.parser.cursor);
-        await until(() => resumed.events.some((e) => e.kind === 'synchronized'));
+        await until(() => resumed.events.some((e) => e.kind === 'synchronized'), 'resumed-synchronized');
         resumed.stop();
         await resumed.done;
         const full = await stream(requirePair(), 0);
-        await until(() => full.events.some((e) => e.kind === 'synchronized'));
+        await until(() => full.events.some((e) => e.kind === 'synchronized'), 'full-synchronized');
         full.stop();
         await full.done;
-        assert(replay.parser.cursor < Number(full.events.find((e) => e.kind === 'synchronized')!.data.seq));
-        assert(resumed.events.some((e) => ['conversation', 'message', 'question'].includes(e.kind)));
+        ensure(
+          replay.parser.cursor < Number(full.events.find((e) => e.kind === 'synchronized')!.data.seq),
+          'cut_not_mid_replay',
+        );
+        ensure(
+          resumed.events.some((e) => ['conversation', 'message', 'question'].includes(e.kind)),
+          'resume_without_entities',
+        );
         const ids = (es: Event[]) => es.filter((e) => e.id !== undefined).map((e) => e.id!);
         const combined = ids([...replay.events, ...resumed.events]);
-        assert.equal(new Set(combined).size, combined.length);
-        assert.deepEqual(combined, ids(full.events));
+        ensure(new Set(combined).size === combined.length, 'duplicate_events');
+        ensure(isDeepStrictEqual(combined, ids(full.events)), 'replay_mismatch');
       });
       await check('read-other-device', async () => {
         conv();
-        const other = await stream(b!, initialCursor);
-        await until(() => other.events.some((e) => e.kind === 'synchronized'));
+        const other = await stream(requireSecond(), initialCursor);
+        await until(() => other.events.some((e) => e.kind === 'synchronized'), 'other-synchronized');
         const before = other.events.length;
-        const { message } = await send('reply n9b badge');
+        const { message } = await send('reply app-client badge');
         await reached(message);
-        await until(() =>
-          events().some((e) => e.kind === 'message' && e.data.role === 'agent' && Number(e.data.order) > message.order),
+        await until(
+          () =>
+            events().some(
+              (e) => e.kind === 'message' && e.data.role === 'agent' && Number(e.data.order) > message.order,
+            ),
+          'agent-reply',
         );
         const order = Math.max(
           ...events()
             .filter((e) => e.kind === 'message' || e.kind === 'question')
             .map((e) => Number(e.data.order)),
         );
-        const answer = await json<{ badge: Badge }>(await request(requirePair(), 'POST', path('read'), { order }));
-        await until(() =>
-          other.events.slice(before).some((e) => e.kind === 'badge' && e.data.unreadTotal === answer.badge.unreadTotal),
+        const lastBadge = () => Number(other.events.findLast((e) => e.kind === 'badge')?.data.unreadTotal ?? 0);
+        await until(() => lastBadge() > 0, 'unread-badge');
+        const unreadBefore = lastBadge();
+        const answer = await json<ReadResponse>(await request(requirePair(), 'POST', path('read'), { order }));
+        ensure(answer.badge.unreadTotal < unreadBefore, 'unread_not_lowered');
+        ensure(answer.conversation.readOrder === order, 'read_order_mismatch');
+        await until(
+          () =>
+            other.events
+              .slice(before)
+              .some((e) => e.kind === 'badge' && e.data.unreadTotal === answer.badge.unreadTotal),
+          'other-badge',
         );
-        for (const e of other.events.filter((e) => ['status', 'badge'].includes(e.kind))) assert.equal(e.id, undefined);
+        for (const e of other.events.filter((e) => ['status', 'badge'].includes(e.kind)))
+          ensure(e.id === undefined, 'ephemeral_event_id');
         other.stop();
         await other.done;
       });
     }
     if (['all', 'upload'].includes(scenario)) {
-      let filesUnavailable = false;
       await check('upload', async () => {
         conv();
-        const bytes = Buffer.from('N9b attachment\n');
-        let mintResponse: Response;
-        try {
-          mintResponse = await request(requirePair(), 'POST', '/app/files', {
+        const bytes = Buffer.from('app-client attachment\n');
+        const minted = await json<FileInitResponse>(
+          await request(requirePair(), 'POST', '/app/files', {
             uploadKey: randomUUID(),
-            name: 'n9b.txt',
+            name: 'app-client.txt',
             mimeType: 'text/plain',
             size: bytes.length,
             sha256: bodySHA256(bytes),
-          });
-        } catch (error) {
-          if (error instanceof Skip) filesUnavailable = true;
-          throw error;
-        }
-        const minted = await json<FileInitResponse>(mintResponse);
-        assert.equal(minted.uploadPath, target(['app', 'files', minted.fileId]));
-        for (const payload of [bytes, bytes, Buffer.alloc(bytes.length, 120)]) {
+          }),
+        );
+        ensure(minted.uploadPath === target(['app', 'files', minted.fileId]), 'upload_path_mismatch');
+        for (const [n, payload] of [bytes, bytes, Buffer.alloc(bytes.length, 120)].entries()) {
+          const step = `put-${n + 1}`;
           const r = await raw('PUT', minted.uploadPath, payload, 'HeyDan-Ticket ' + minted.ticket);
-          assert.equal(r.status, payload === bytes ? 204 : 400);
-          if (payload === bytes) assert.equal(await r.text(), '');
-          else assert.equal((await r.json()).error, 'bad_body');
+          if (payload !== bytes) await expectError(r, 400, 'bad_body', step);
+          else {
+            ensure(r.status === 204, 'status_mismatch:' + step);
+            ensure((await r.text()) === '', 'body_not_empty:' + step);
+          }
         }
-        await reached((await send('reply n9b upload', [minted.fileId])).message);
+        await reached((await send('reply app-client upload', [minted.fileId])).message);
       });
       await check('download-files', async () => {
-        if (filesUnavailable) throw new Skip('File routes: 501 not_implemented');
         const start = events().length;
         await reached((await send('file')).message);
         await until(
@@ -538,23 +618,27 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
                 .flatMap((e) => (e.data as unknown as Message).files)
                 .map((f) => f.id),
             ).size >= 2,
+          'agent-files',
         );
         const files = events()
           .slice(start)
           .filter((e) => e.kind === 'message')
           .flatMap((e) => (e.data as unknown as Message).files);
         const unique = [...new Map(files.map((f) => [f.id, f])).values()];
-        assert.equal(unique.length, 2);
+        ensure(unique.length === 2, 'file_count');
         for (const f of unique) {
           const r = await request(requirePair(), 'GET', target(['app', 'files', f.id]));
-          assert(r.ok);
-          assert.equal((await r.arrayBuffer()).byteLength, f.size);
+          ensure(r.ok, 'http_' + r.status);
+          ensure((await r.arrayBuffer()).byteLength === f.size, 'size_mismatch');
           if (f.mimeType === 'image/png') {
-            assert.equal(f.kind, 'image');
-            assert(f.width! > 0 && f.height! > 0);
+            ensure(f.kind === 'image', 'image_kind');
+            ensure(f.width! > 0 && f.height! > 0, 'image_dimensions');
           }
         }
-        assert(unique.some((f) => f.mimeType === 'image/png'));
+        ensure(
+          unique.some((f) => f.mimeType === 'image/png'),
+          'png_missing',
+        );
       });
     }
     if (['all', 'security'].includes(scenario)) {
@@ -562,10 +646,9 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
         const d = requirePair(),
           t = '/app/conversations',
           auth = signRequest({ ...d, method: 'GET', target: t });
-        assert((await raw('GET', t, undefined, auth)).ok);
-        const r = await raw('GET', t, undefined, auth);
-        assert.equal(r.status, 401);
-        assert.equal((await r.json()).error, 'replayed');
+        const first = await raw('GET', t, undefined, auth);
+        ensure(first.ok, 'http_' + first.status);
+        await expectError(await raw('GET', t, undefined, auth), 401, 'replayed', 'replay');
       });
       await check('security-body', async () => {
         const d = requirePair(),
@@ -577,47 +660,52 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
           Buffer.from('{"order":1}'),
           signRequest({ ...d, method: 'POST', target: t, body }),
         );
-        assert.equal(r.status, 400);
-        assert.equal((await r.json()).error, 'bad_body');
+        await expectError(r, 400, 'bad_body', 'body');
       });
       await check('security-clock', async () => {
         const d = requirePair();
         const r = await request(d, 'GET', '/app/conversations', undefined, Math.floor(Date.now() / 1000) - 300);
-        assert.equal(r.status, 401);
-        const value = await r.json();
-        assert.equal(value.error, 'stale_timestamp');
-        assert((await request(d, 'GET', '/app/conversations', undefined, Math.floor(value.serverTime / 1000))).ok);
+        ensure(r.status === 401, 'status_mismatch:clock');
+        const value = (await r.json()) as { error?: string; serverTime: number };
+        ensure(value.error === 'stale_timestamp', 'error_mismatch:clock');
+        const retry = await request(d, 'GET', '/app/conversations', undefined, Math.floor(value.serverTime / 1000));
+        ensure(retry.ok, 'http_' + retry.status);
       });
       await check('security-pair-proof', async () => {
         requirePair();
         await pair(2, true);
       });
       await check('security-canonical', async () => {
-        if (new URL(baseUrl).hostname !== '127.0.0.1.sslip.io') throw new Skip('Requires proxy chain');
+        // A remote base sits behind the real proxy chain, so it gets the check too.
+        if (route === 'direct') throw new Skip('Requires proxy chain');
         const t = '/app//conversations';
         const r = await raw('GET', t, undefined, signRequest({ ...requirePair(), method: 'GET', target: t }));
-        assert.equal(r.status, 401);
-        assert.equal((await r.json()).error, 'bad_signature');
+        await expectError(r, 401, 'bad_signature', 'canonical');
       });
       await check('security-revoke', async () => {
         conv();
-        const disposable = await pair(3);
+        // Remote revokes the run's last device here; locally a throwaway keeps devices 0 and 1 reusable.
+        const disposable = route === 'remote' ? (b ?? requirePair()) : await pair(3);
         const opened = await stream(disposable, live!.parser.cursor);
-        assert.equal((await request(disposable, 'DELETE', '/app/devices/me')).status, 204);
-        await Promise.race([
-          revokedStreamClosed(opened.done),
-          delay(5000).then(() => {
-            throw new Error('revocation stream deadline');
-          }),
-        ]);
-        const r = await request(disposable, 'GET', '/app/conversations');
-        assert.equal(r.status, 401);
-        assert.equal((await r.json()).error, 'device_revoked');
+        await revoke(disposable);
+        let deadline: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            revokedStreamClosed(opened.done),
+            new Promise<never>((_, reject) => {
+              deadline = setTimeout(() => reject(new Failure('event_deadline:revoke-close')), 5000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(deadline);
+        }
+        await expectError(await request(disposable, 'GET', '/app/conversations'), 401, 'device_revoked', 'revoked-get');
       });
     }
   } finally {
     for (const s of streams) s.stop();
     await Promise.allSettled(streams.map((s) => s.done));
+    await revokeRemote();
   }
   if (failures) throw new Error(`${failures} client checks failed`);
 }

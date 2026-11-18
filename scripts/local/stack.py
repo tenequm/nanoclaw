@@ -158,6 +158,18 @@ def secret(key):
     return value
 
 
+def secret_file(key, path):
+    # A whole multi-line entry, such as a key file, goes from the store straight into a mode-0600 file.
+    command = shlex.split(setting('LOCAL_SECRET_FILE_CMD', 'gopass show -n')) + [setting(key)]
+    write(path, '')
+    path.chmod(0o600)
+    with open(path, 'wb') as out:
+        proc = subprocess.run(command, env=clean_env(), stdout=out, stderr=subprocess.DEVNULL)
+    if proc.returncode or not path.stat().st_size:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f'Secret store entry named by {key} is unavailable')
+
+
 def wake_model():
     # A local file is read in place; any other source is an scp source, fetched once into a per-digest cache.
     source = setting('LOCAL_WAKE_MODEL_SOURCE', '')
@@ -355,7 +367,7 @@ def up(args):
         if not args.proof:
             needed += ['LOCAL_OWNER_ID', 'LOCAL_ONECLI_URL', 'LOCAL_TEST_BOT_TOKEN_ENTRY']
     if setting('LOCAL_APNS') == '1':
-        needed += ['LOCAL_APNS_KEY_ENTRY', 'LOCAL_APNS_KEY_ID_ENTRY', 'LOCAL_APNS_TEAM_ID']
+        needed += ['LOCAL_APNS_KEY_ENTRY', 'LOCAL_APNS_KEY_ID_ENTRY', 'LOCAL_APNS_TEAM_ID', 'LOCAL_APNS_TOPIC']
     require(*needed)
     if not re.fullmatch(r'[0-9a-f]{64}', setting('LOCAL_WAKE_MODEL_SHA256')):
         raise RuntimeError('LOCAL_WAKE_MODEL_SHA256 must be 64 lowercase hex digits')
@@ -437,15 +449,9 @@ def up(args):
         env['APP_LIVEKIT_URL'] = env['LIVEKIT_URL']
         if setting('LOCAL_APNS') == '1':
             key_path = LOCAL / 'apns-sandbox.p8'
-            write(key_path, '')
-            key_path.chmod(0o600)
-            with open(key_path, 'wb') as key_file:
-                proc = subprocess.run(['gopass', 'show', '-n', setting('LOCAL_APNS_KEY_ENTRY')],
-                                      env=clean_env(), stdout=key_file, stderr=subprocess.DEVNULL)
-            if proc.returncode or not key_path.stat().st_size:
-                key_path.unlink(missing_ok=True)
-                raise RuntimeError('APNs sandbox key unavailable')
+            secret_file('LOCAL_APNS_KEY_ENTRY', key_path)
             env['APP_APNS_TEAM_ID'] = setting('LOCAL_APNS_TEAM_ID')
+            env['APP_APNS_TOPIC'] = setting('LOCAL_APNS_TOPIC')
             env['APP_APNS_SANDBOX_KEY_ID'] = secret('LOCAL_APNS_KEY_ID_ENTRY')
             env['APP_APNS_SANDBOX_KEY_PATH'] = str(key_path)
         write(ROOT / '.env', ''.join(k + '=' + v + '\n' for k, v in env.items()))
@@ -585,7 +591,7 @@ def client(args):
     if args.chain:
         env['NODE_EXTRA_CA_CERTS'] = state['ca']
     run(NODE + ['pnpm', 'exec', 'tsx', 'scripts/app-client.ts', args.scenario,
-                '--base', base], state, 'n9b-client-command', env)
+                '--base', base], state, 'app-client-command', env)
     print('Client results: ' + state['run'])
 
 

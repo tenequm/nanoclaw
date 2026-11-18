@@ -1,8 +1,17 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { StreamParser, guard, target, revokedStreamClosed } from './app-client.js';
+import { StreamParser, guard, target, revokedStreamClosed, runAppClient } from './app-client.js';
 import { signRequest } from './app-sign.js';
-import { canonicalSigningText, parseAuthorization, verifyRequestSignature } from '../src/channels/app/contract.js';
+import {
+  bodySHA256,
+  canonicalSigningText,
+  parseAuthorization,
+  verifyRequestSignature,
+} from '../src/channels/app/contract.js';
 const fixture = JSON.parse(
   readFileSync(new URL('../src/channels/app/app-contract.fixtures.json', import.meta.url), 'utf8'),
 );
@@ -104,33 +113,216 @@ describe('remote guard', () => {
   });
 });
 
-it('records every scenario as skipped when pairing is a 501 stub', async () => {
-  const { createServer } = await import('node:http');
-  const { mkdtempSync, readdirSync, rmSync } = await import('node:fs');
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
-  const { runAppClient } = await import('./app-client.js');
-  const server = createServer((_req, res) => {
-    res.writeHead(501, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'not_implemented', message: 'private payload sentinel' }));
+interface FakeOptions {
+  cursorShift?: number;
+  readNoop?: boolean;
+  changedBytesStatus?: number;
+}
+type Entity = Record<string, unknown> & { kind: string; seq: number };
+
+// Just enough of the app server for the stream and upload scenarios; signatures are not verified.
+async function fakeApp(options: FakeOptions = {}) {
+  const agent = { id: 'ag_taylor', name: 'Taylor' };
+  const conversationId = 'conv_taylor01';
+  const log: Entity[] = [];
+  const open = new Set<ServerResponse>();
+  const downloads: Record<string, number> = { file_txt: 5, file_png: 8 };
+  let seq = 0,
+    order = 0,
+    readOrder = 0,
+    devices = 0,
+    uploadSha = '';
+  const unread = () => log.filter((e) => e.role === 'agent' && Number(e.order) > readOrder).length;
+  const badge = () => ({ kind: 'badge', rev: seq, unreadTotal: unread() });
+  const frame = (kind: string, data: unknown, id?: number) =>
+    `event: ${kind}\n${id === undefined ? '' : `id: ${id}\n`}data: ${JSON.stringify(data)}\n\n`;
+  const broadcast = (text: string) => {
+    for (const res of open) res.write(text);
+  };
+  const append = (entity: Record<string, unknown>) => {
+    const e = { ...entity, seq: ++seq } as Entity;
+    log.push(e);
+    broadcast(frame(e.kind, e, e.seq));
+  };
+  const message = (role: string, text: string, extra: Record<string, unknown> = {}) => {
+    const n = ++order;
+    return {
+      kind: 'message',
+      id: `msg_${n}`,
+      conversationId,
+      order: n,
+      role,
+      text,
+      files: [],
+      editedAt: null,
+      ...extra,
+    };
+  };
+  for (const text of ['One', 'Two', 'Three']) append(message('agent', text));
+  const conversation = () => ({
+    kind: 'conversation',
+    id: conversationId,
+    seq,
+    agent,
+    lastMessage: null,
+    unread: unread(),
+    readOrder,
+    canCall: false,
+    callRefusal: null,
+    createdAt: 0,
   });
+  async function handle(req: IncomingMessage, res: ServerResponse) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = Buffer.concat(chunks);
+    const url = new URL(req.url!, 'http://fake');
+    const reply = (status: number, value?: unknown) => {
+      res.writeHead(status, value === undefined ? {} : { 'Content-Type': 'application/json' });
+      res.end(value === undefined ? undefined : JSON.stringify(value));
+    };
+    const route = `${req.method} ${url.pathname}`;
+    if (route === 'POST /app/pair')
+      return reply(200, { deviceId: `dev_${++devices}`, userName: 'Alex', agents: [agent], protocol: 1 });
+    if (route === 'GET /app/conversations')
+      return reply(200, { conversations: [conversation()], statuses: [], badge: badge(), seq });
+    if (route === 'GET /app/events') {
+      const after = Number(url.searchParams.get('after'));
+      const from = after > 0 ? after + (options.cursorShift ?? 0) : 0;
+      const frames = [
+        ...log.filter((e) => e.seq > from).map((e) => frame(e.kind, e, e.seq)),
+        frame('status', { kind: 'status', conversationId, state: 'idle', label: null }),
+        frame('badge', badge()),
+        frame('synchronized', { seq }),
+      ];
+      const text = frames.join('');
+      // Two whole events and part of a third in the first write, the rest in a later one.
+      const split = frames.length > 4 ? frames[0].length + frames[1].length + 7 : text.length;
+      let closed = false;
+      res.on('close', () => {
+        closed = true;
+        open.delete(res);
+      });
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write(text.slice(0, split));
+      setTimeout(() => {
+        if (closed) return;
+        res.write(text.slice(split));
+        open.add(res);
+      }, 20);
+      return;
+    }
+    if (route === `POST /app/conversations/${conversationId}/messages`) {
+      const { clientId, text } = JSON.parse(body.toString()) as { clientId: string; text: string };
+      const sent = message('user', text, { clientId });
+      reply(200, { message: { ...sent, seq: 0, delivery: 'stored' } });
+      append({ ...sent, delivery: 'reached' });
+      const files = [
+        { id: 'file_txt', name: 'a.txt', mimeType: 'text/plain', size: 5, kind: 'file', width: null, height: null },
+        { id: 'file_png', name: 'a.png', mimeType: 'image/png', size: 8, kind: 'image', width: 1, height: 1 },
+      ];
+      append(message('agent', 'Done.', text === 'file' ? { files } : {}));
+      return broadcast(frame('badge', badge()));
+    }
+    if (route === `POST /app/conversations/${conversationId}/read`) {
+      const { order: requested } = JSON.parse(body.toString()) as { order: number };
+      if (!options.readNoop) readOrder = Math.max(readOrder, Math.min(requested, order));
+      broadcast(frame('badge', badge()));
+      return reply(200, { conversation: conversation(), badge: badge() });
+    }
+    if (route === 'POST /app/files') {
+      uploadSha = (JSON.parse(body.toString()) as { sha256: string }).sha256;
+      return reply(200, { fileId: 'file_up', ticket: 'ticket_up', expiresAt: 0, uploadPath: '/app/files/file_up' });
+    }
+    if (route === 'PUT /app/files/file_up') {
+      if (bodySHA256(body) === uploadSha) return reply(204);
+      const status = options.changedBytesStatus ?? 400;
+      return reply(status, { error: status === 400 ? 'bad_body' : 'conflict' });
+    }
+    const size = req.method === 'GET' ? downloads[url.pathname.replace('/app/files/', '')] : undefined;
+    if (size === undefined) return reply(404, { error: 'not_found' });
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+    res.end(Buffer.alloc(size));
+  }
+  const server = createServer((req, res) => void handle(req, res));
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address() as { port: number };
-  const directory = mkdtempSync(join(tmpdir(), 'n9b-stub-'));
-  vi.stubEnv('HEYDAN_PAIR_LINK', `http://127.0.0.1:${address.port}/app/pair#test-code`);
+  return {
+    base: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    async close() {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+async function runAgainstFake(scenario: string, fake: FakeOptions = {}) {
+  const app = await fakeApp(fake);
+  const directory = mkdtempSync(join(tmpdir(), 'app-client-'));
+  vi.stubEnv('HEYDAN_PAIR_LINK', `${app.base}/app/pair#code-one`);
+  vi.stubEnv('HEYDAN_PAIR_LINK_SECOND', `${app.base}/app/pair#code-two`);
   try {
-    await runAppClient(`http://127.0.0.1:${address.port}`, directory, { deviceDir: join(directory, 'devices') });
-    const results = readdirSync(join(directory, 'results')).map((file) =>
-      JSON.parse(readFileSync(join(directory, 'results', file), 'utf8')),
+    const outcome = await runAppClient(app.base, directory, { scenario, deviceDir: join(directory, 'devices') }).then(
+      () => 'resolved',
+      () => 'rejected',
     );
-    expect(results.find((r) => r.id === 'n9b-direct-pair').status).toBe('skip');
-    expect(results.filter((r) => r.id !== 'n9b-direct-guard').every((r) => r.status === 'skip')).toBe(true);
-    expect(results.some((r) => r.id === 'n9b-direct-security-revoke')).toBe(true);
-    expect(readFileSync(join(directory, 'logs/n9b-client.log'), 'utf8')).not.toContain('private payload sentinel');
+    const results: Record<string, { status: string; detail: string }> = {};
+    for (const file of readdirSync(join(directory, 'results'))) {
+      const result = JSON.parse(readFileSync(join(directory, 'results', file), 'utf8'));
+      results[result.id.replace('app-client-direct-', '')] = result;
+    }
+    return { outcome, results };
   } finally {
     vi.unstubAllEnvs();
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await app.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+describe('scenarios against an in-process server', () => {
+  it('resumes a replay split across writes and proves the read on the other device', async () => {
+    const { outcome, results } = await runAgainstFake('stream');
+    expect(outcome).toBe('resolved');
+    expect(results['stream-resume'].status).toBe('pass');
+    expect(results['read-other-device'].status).toBe('pass');
+  });
+  it.each([
+    [-1, 'duplicate_events'],
+    [1, 'replay_mismatch'],
+  ])('fails stream-resume when the server resumes %i off the cursor', async (cursorShift, detail) => {
+    const { outcome, results } = await runAgainstFake('stream', { cursorShift });
+    expect(outcome).toBe('rejected');
+    expect(results['stream-resume']).toMatchObject({ status: 'fail', detail });
+  });
+  it('fails read-other-device when the read leaves unread unchanged', async () => {
+    const { results } = await runAgainstFake('stream', { readNoop: true });
+    expect(results['read-other-device']).toMatchObject({ status: 'fail', detail: 'unread_not_lowered' });
+  });
+  it('uploads, accepts the same bytes again, refuses other bytes and downloads agent files', async () => {
+    const { outcome, results } = await runAgainstFake('upload');
+    expect(outcome).toBe('resolved');
+    expect(results.upload.status).toBe('pass');
+    expect(results['download-files'].status).toBe('pass');
+  });
+  it('names the PUT that answered the wrong status', async () => {
+    const { results } = await runAgainstFake('upload', { changedBytesStatus: 409 });
+    expect(results.upload).toMatchObject({ status: 'fail', detail: 'status_mismatch:put-3' });
+  });
+});
+
+it('refuses a remote base without --remote before any request', async () => {
+  const fetchSpy = vi.spyOn(globalThis, 'fetch');
+  const directory = mkdtempSync(join(tmpdir(), 'app-client-'));
+  try {
+    await expect(runAppClient('https://example.com', directory)).rejects.toThrow('Client guard refused');
+    const files = readdirSync(join(directory, 'results'));
+    expect(files).toEqual(['app-client-remote-guard.json']);
+    expect(JSON.parse(readFileSync(join(directory, 'results', files[0]), 'utf8'))).toMatchObject({
+      title: 'remote guard',
+      status: 'fail',
+      detail: 'remote base requires --remote',
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  } finally {
+    fetchSpy.mockRestore();
     rmSync(directory, { recursive: true, force: true });
   }
 });
