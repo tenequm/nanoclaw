@@ -18,6 +18,7 @@ import {
 } from './verify.js';
 import { handlePair, mintPairingLink } from './pairing.js';
 import { appPeerAllowed, clientAddress } from './gate.js';
+import { resetAppConfigCache } from '../../channels/app/config.js';
 import { canonicalSigningText } from '../../channels/app/contract.js';
 import { log } from '../../log.js';
 import { envValue } from '../../env.js';
@@ -63,6 +64,7 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+  resetAppConfigCache();
 });
 it.each(f.signing.vectors.filter((v) => !v.name.startsWith('bad-') && !v.name.startsWith('replay-')))(
   'accepts $name',
@@ -142,6 +144,8 @@ it('uses the trusted rightmost forwarded hop and ignores Forwarded and untrusted
   expect(appPeerAllowed(req)).toBe(true);
   expect(clientAddress(req)).toBe('8.8.8.8');
   req.headers['x-forwarded-for'] = '172.18.0.3';
+  expect(clientAddress(req)).toBe('172.18.0.2');
+  req.headers['x-forwarded-for'] = `8.8.8.8, ${'x'.repeat(3000)}`;
   expect(clientAddress(req)).toBe('172.18.0.2');
   Object.defineProperty(req.socket, 'remoteAddress', { value: '192.168.1.2' });
   expect(appPeerAllowed(req)).toBe(false);

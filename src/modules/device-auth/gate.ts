@@ -103,5 +103,6 @@ export function clientAddress(req: IncomingMessage): string {
     .flatMap((h) => h.split(','))
     .map((h) => h.trim())
     .filter(Boolean);
-  return hops.findLast((h) => !trusted.has(h)) ?? peer;
+  const client = hops.findLast((h) => !trusted.has(h));
+  return client && net.isIP(client) ? client : peer;
 }
