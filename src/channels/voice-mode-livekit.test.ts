@@ -1326,19 +1326,36 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   });
 
   it('deletes the room of a call that was replaced while it was connecting', async () => {
+    let onCreating!: (room: string) => void;
     let release!: () => void;
-    h.lk.createGate = new Promise((r) => (release = r));
-    const create = vi.spyOn(h.lk, 'createRoom');
+    let onDeleted!: () => void;
+    const creating = new Promise<string>((resolve) => (onCreating = resolve));
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const deleted = new Promise<void>((resolve) => (onDeleted = resolve));
+    const createRoom = h.lk.createRoom.bind(h.lk);
+    const deleteRoom = h.lk.deleteRoom.bind(h.lk);
+    vi.spyOn(h.lk, 'createRoom').mockImplementationOnce(async (options) => {
+      onCreating(options.name);
+      await held;
+      return createRoom(options);
+    });
+    vi.spyOn(h.lk, 'deleteRoom').mockImplementationOnce(async (room) => {
+      await deleteRoom(room);
+      onDeleted();
+    });
     const first = post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
-    await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
-    // A newer call takes the line while the room is still being created.
-    h.lk.createGate = null;
-    const second = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
-    expect(second.status).toBe(200);
-    release();
+    const room = await creating;
+    try {
+      const second = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
+      expect(second.status).toBe(200);
+      // The response does not await the replaced call's initial cleanup.
+      await deleted;
+      expect(h.lk.ops).toContain(`delete:${room}`);
+      expect(h.lk.ops).not.toContain(`create:${room}`);
+    } finally {
+      release();
+    }
     expect((await first).status).toBe(409);
-    const room = replacedRoom(h, (await second.json()) as TokenResponse);
-    // The replaced call's own cleanup ran before the room existed; the room still goes.
     expect(h.lk.ops.indexOf(`create:${room}`)).toBeGreaterThanOrEqual(0);
     expect(h.lk.ops.lastIndexOf(`delete:${room}`)).toBeGreaterThan(h.lk.ops.indexOf(`create:${room}`));
   });

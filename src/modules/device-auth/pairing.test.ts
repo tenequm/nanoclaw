@@ -53,6 +53,12 @@ it('pairs an owner privately and stores only a hash', async () => {
   expect((await getDb().all('SELECT * FROM device_auth_user_agents')).length).toBe(1);
   expect(redactVoiceLinks(text)).toBe('[pairing link]');
 });
+it.each(['/', '///'])('uses one slash in the pair link with trailing %s', async (suffix) => {
+  vi.stubEnv('APP_PUBLIC_BASE', `https://app.example.com${suffix}`);
+  expect(await handlePairCommand(event)).toBe(true);
+  const text = mocks.deliver.mock.calls[0][2].content.text as string;
+  expect(text.startsWith('https://app.example.com/app/pair#')).toBe(true);
+});
 it('refuses a member without a role and silently claims unknown or unwired senders', async () => {
   await getDb().run('DELETE FROM user_roles');
   await handlePairCommand(event);

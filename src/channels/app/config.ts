@@ -11,7 +11,7 @@ export function readAppConfig(read: (key: string) => string | undefined = envVal
     return keyId && keyPath ? { keyId, keyPath } : null;
   };
   return {
-    publicBase: read('APP_PUBLIC_BASE') || null,
+    publicBase: read('APP_PUBLIC_BASE')?.replace(/\/+$/, '') || null,
     livekitUrl: read('APP_LIVEKIT_URL') || null,
     ticketKey: key ? Buffer.from(hkdfSync('sha256', key, Buffer.alloc(0), 'heydan-app-ticket-v1', 32)) : null,
     apns: {

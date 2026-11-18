@@ -77,7 +77,7 @@ export async function mintPairingLink(
       now + 600_000,
     );
   });
-  return `${base.replace(/\/$/, '')}/app/pair#${code}`;
+  return `${base}/app/pair#${code}`;
 }
 export const handlePair: AppHandler = async ({ req, res }) => {
   await enforceRateLimit(`pair:${clientAddress(req)}`, 10);

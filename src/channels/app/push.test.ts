@@ -110,6 +110,14 @@ it('pushes the fixture to eligible devices with their own badges', async () => {
     ]),
   );
 });
+it.each(['/', '///'])('normalizes the push host with trailing %s', async (suffix) => {
+  vi.stubEnv('APP_PUBLIC_BASE', `https://app.example.com${suffix}`);
+  start({ config: () => readAppConfig() });
+  emit();
+  await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+  for (const call of send.mock.calls as unknown as Array<[unknown, string, typeof fixtures.pushPayload.body]>)
+    expect(call[2].hd.h).toBe('https://app.example.com');
+});
 it('ignores updates, reactions, host and voice lines but pushes questions', async () => {
   start();
   const message = fixtures.messages.agentWithFiles;
