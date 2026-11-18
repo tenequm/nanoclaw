@@ -6,6 +6,7 @@ import { getDb, initSqliteTestDb, closeDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { getHostStartCallbacks, stopHostModules } from '../../host-lifecycle.js';
 import { deliver } from './deliver.js';
+import { CALLER_MARK, SPOKEN_MARK } from '../voice-mode-livekit.js';
 import {
   ensureConversation,
   getConversation,
@@ -205,7 +206,7 @@ it.each(['host', 'voiceCaller', 'voiceSpoken'] as const)(
     const sourceId = key === 'voiceSpoken' ? key : 'hcmd-' + key;
     if (key !== 'voiceSpoken') mocks.hostWritten.add(sourceId);
     const content = {
-      text: (key === 'voiceCaller' ? '🎙️ ' : key === 'voiceSpoken' ? '🔊 ' : '') + expected.text,
+      text: (key === 'voiceCaller' ? CALLER_MARK : key === 'voiceSpoken' ? SPOKEN_MARK : '') + expected.text,
       voice: expected.voice,
     };
     const id = (await deliver(conversationId, null, { kind: 'chat', sourceId, content }))!;
@@ -637,6 +638,18 @@ it('calls availability outside central transactions', async () => {
   await request(markRead, { order: 9999 });
 });
 
+it("replays only the named user's events", async () => {
+  await getDb().run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_sam','Sam','sam','2026-11-17')");
+  const other = await ensureConversation('telegram:other', 'ag_sam');
+  await deliver(other.id, null, { kind: 'chat', sourceId: 'other-1', content: { text: 'for someone else' } });
+  await deliver(conversationId, null, { kind: 'chat', sourceId: 'owner-1', content: { text: 'for the owner' } });
+  const all = await readEventsAfter(0, 100);
+  const owner = await readEventsAfter(0, 100, 'telegram:owner');
+  expect(all.some((e) => e.user_id === 'telegram:other')).toBe(true);
+  expect(owner.length).toBeGreaterThan(0);
+  expect(owner.every((e) => e.user_id === 'telegram:owner')).toBe(true);
+  expect(owner).toEqual(all.filter((e) => e.user_id === 'telegram:owner'));
+});
 it('matches send, list, history and read response fixture shapes', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(fixtures.sendResponse.message.createdAt);
   const sent = await request(sendMessage, {

@@ -84,6 +84,17 @@ function reference(row: StoredFile): FileAttachment {
   };
 }
 
+// Image headers sit at the start; reading a whole 25 MiB upload back to find them is not needed.
+const SNIFF_BYTES = 1024 * 1024;
+async function readHead(file: string): Promise<Buffer> {
+  const handle = await fs.open(file, 'r');
+  try {
+    const { buffer, bytesRead } = await handle.read(Buffer.alloc(SNIFF_BYTES), 0, SNIFF_BYTES, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
 export function fileMetadata(data: Buffer, name: string) {
   let mimeType =
     (
@@ -367,7 +378,7 @@ export function createFileService(deps: FileDeps) {
       }
       await live();
       if (revoked) refuse(401, 'device_revoked', 'This device is no longer paired.');
-      const metadata = fileMetadata(await fs.readFile(target), row.name);
+      const metadata = fileMetadata(await readHead(target), row.name);
       const result = await deps
         .db()
         .run(

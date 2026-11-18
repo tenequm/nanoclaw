@@ -20,14 +20,18 @@ export async function conversationsFor(userId: string, agentIds: string[]): Prom
   ).filter((c) => agentIds.includes(c.agent_group_id));
 }
 export async function ensureConversation(userId: string, agentGroupId: string): Promise<ConversationRow> {
-  const availability = await appHooks.callAvailability(userId, agentGroupId);
-  return appTransaction(async () => {
-    const db = getDb();
-    const existing = await db.get<ConversationRow>(
+  const find = () =>
+    getDb().get<ConversationRow>(
       'SELECT * FROM app_conversations WHERE user_id = ? AND agent_group_id = ?',
       userId,
       agentGroupId,
     );
+  const found = await find();
+  if (found) return found;
+  const availability = await appHooks.callAvailability(userId, agentGroupId);
+  return appTransaction(async () => {
+    const db = getDb();
+    const existing = await find();
     if (existing) return existing;
     const agent = await getAgentGroup(agentGroupId);
     if (!agent) throw new Error('Agent not found');
@@ -85,7 +89,7 @@ export function plainPreview(text: string): string {
   return Array.from(plain).slice(0, 160).join('');
 }
 type CallAvailability = Pick<Conversation, 'canCall' | 'callRefusal'>;
-export async function conversationEntity(c: ConversationRow, availability?: CallAvailability): Promise<Conversation> {
+async function readCounts(c: ConversationRow): Promise<{ readOrder: number; unread: number }> {
   const db = getDb();
   const readOrder =
     (
@@ -102,6 +106,10 @@ export async function conversationEntity(c: ConversationRow, availability?: Call
     c.id,
     readOrder,
   ))!.n;
+  return { readOrder, unread };
+}
+export async function conversationEntity(c: ConversationRow, availability?: CallAvailability): Promise<Conversation> {
+  const { readOrder, unread } = await readCounts(c);
   return {
     kind: 'conversation',
     id: c.id,
@@ -138,7 +146,7 @@ export async function bumpBadge(userId: string): Promise<void> {
 }
 export async function badgeFor(userId: string, agentIds: string[]): Promise<Badge> {
   let unreadTotal = 0;
-  for (const c of await conversationsFor(userId, agentIds)) unreadTotal += (await conversationEntity(c)).unread;
+  for (const c of await conversationsFor(userId, agentIds)) unreadTotal += (await readCounts(c)).unread;
   return {
     kind: 'badge',
     rev:
@@ -276,26 +284,37 @@ export const history: AppHandler = async (ctx) => {
     return;
   }
   const db = getDb();
-  const bounds = await db.all<{ id: string; item_order: number; kind: string }>(
-    `SELECT id,item_order,'message' AS kind FROM app_messages WHERE conversation_id = ? UNION ALL SELECT id,item_order,'question' AS kind FROM app_questions WHERE conversation_id = ? ORDER BY item_order`,
+  // Without `after` the page is the newest `limit` items before `before` (or the end).
+  const newest = after === null;
+  const window = newest ? 'item_order < ? ORDER BY item_order DESC' : 'item_order > ? ORDER BY item_order';
+  const bound = newest ? (before ?? Number.MAX_SAFE_INTEGER) : after;
+  const messages = await db.all<MessageRow>(
+    `SELECT * FROM app_messages WHERE conversation_id = ? AND ${window} LIMIT ?`,
     c.id,
+    bound,
+    limit,
+  );
+  const questions = await db.all<QuestionRow>(
+    `SELECT * FROM app_questions WHERE conversation_id = ? AND ${window} LIMIT ?`,
     c.id,
+    bound,
+    limit,
   );
-  const eligible = bounds.filter(
-    (r) => (before === null || r.item_order < before) && (after === null || r.item_order > after),
-  );
-  const page = after === null ? eligible.slice(-limit) : eligible.slice(0, limit);
-  const items = [];
-  for (const r of page)
-    items.push(
-      r.kind === 'message'
-        ? messageEntity((await db.get<MessageRow>('SELECT * FROM app_messages WHERE id = ?', r.id))!)
-        : questionEntity((await db.get<QuestionRow>('SELECT * FROM app_questions WHERE id = ?', r.id))!),
-    );
+  const merged = [...messages.map(messageEntity), ...questions.map(questionEntity)].sort((a, b) => a.order - b.order);
+  const items = newest ? merged.slice(-limit) : merged.slice(0, limit);
+  const any = async (comparison: '<' | '>', order: number) =>
+    Number.isFinite(order) &&
+    !!(await db.get(
+      `SELECT 1 FROM app_messages WHERE conversation_id = ? AND item_order ${comparison} ? UNION ALL SELECT 1 FROM app_questions WHERE conversation_id = ? AND item_order ${comparison} ? LIMIT 1`,
+      c.id,
+      order,
+      c.id,
+      order,
+    ));
   json(ctx.res, 200, {
     items,
-    hasMoreBefore: bounds.some((r) => r.item_order < (page[0]?.item_order ?? before ?? after ?? 0)),
-    hasMoreAfter: bounds.some((r) => r.item_order > (page.at(-1)?.item_order ?? after ?? before ?? Infinity)),
+    hasMoreBefore: await any('<', items[0]?.order ?? before ?? after ?? 0),
+    hasMoreAfter: await any('>', items.at(-1)?.order ?? after ?? before ?? Infinity),
   });
 };
 export const markRead: AppHandler = async (ctx) => {

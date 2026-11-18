@@ -10,7 +10,7 @@ import { json, type AppHandler, type AppRequest } from './routes.js';
 
 export interface StreamDeps {
   lastEventSeq(): Promise<number>;
-  readEventsAfter(after: number, limit: number): Promise<EventRow[]>;
+  readEventsAfter(after: number, limit: number, userId: string): Promise<EventRow[]>;
   onEventAppended(listener: (event: EventRow) => void): () => void;
   onBadgeChanged(listener: (userId: string) => void): () => void;
   onStatusChanged(listener: (status: Status) => void): () => void;
@@ -107,8 +107,7 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
   }
   async function event(row: EventRow): Promise<void> {
     if (row.seq <= cursor) return;
-    const allowed = await agents();
-    if (row.user_id === identity!.userId && allowed.includes(row.agent_group_id))
+    if (row.user_id === identity!.userId && (await agents()).includes(row.agent_group_id))
       await write(formatEvent({ kind: row.kind, data: JSON.parse(row.entity_json), id: row.seq }));
     cursor = row.seq;
   }
@@ -164,7 +163,11 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
     void pump();
   }
   try {
-    cleanup.push(deps.onEventAppended((row) => enqueue({ event: row })));
+    cleanup.push(
+      deps.onEventAppended((row) => {
+        if (row.user_id === identity.userId) enqueue({ event: row });
+      }),
+    );
     cleanup.push(
       deps.onBadgeChanged((user) => {
         if (user === identity.userId) enqueue({ badge: true });
@@ -201,7 +204,7 @@ export async function openStream({ req, res, identity }: AppRequest, deps?: Stre
     res.flushHeaders();
     const high = await deps.lastEventSeq();
     while (!closed && cursor < high) {
-      const rows = await deps.readEventsAfter(cursor, 100);
+      const rows = await deps.readEventsAfter(cursor, 100, identity.userId);
       if (closed || !rows.length) break;
       for (const row of rows) {
         if (closed || row.seq > high) break;

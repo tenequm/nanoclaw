@@ -116,8 +116,15 @@ export async function appendEvent(
 export async function lastEventSeq(): Promise<number> {
   return (await getDb().get<{ seq: number }>('SELECT COALESCE(MAX(seq), 0) AS seq FROM app_events'))!.seq;
 }
-export async function readEventsAfter(afterSeq: number, limit: number): Promise<EventRow[]> {
-  return getDb().all('SELECT * FROM app_events WHERE seq > ? ORDER BY seq LIMIT ?', afterSeq, limit);
+export async function readEventsAfter(afterSeq: number, limit: number, userId?: string): Promise<EventRow[]> {
+  return userId === undefined
+    ? getDb().all('SELECT * FROM app_events WHERE seq > ? ORDER BY seq LIMIT ?', afterSeq, limit)
+    : getDb().all(
+        'SELECT * FROM app_events WHERE user_id = ? AND seq > ? ORDER BY seq LIMIT ?',
+        userId,
+        afterSeq,
+        limit,
+      );
 }
 export function onEventAppended(listener: (event: EventRow) => void): () => void {
   listeners.add(listener);

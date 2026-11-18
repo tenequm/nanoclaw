@@ -177,7 +177,7 @@ export async function drainRoutingJobs(route = routeInbound): Promise<void> {
   if (draining) return draining;
   draining = (async () => {
     for (const job of await getDb().all<RoutingJobRow>(
-      'SELECT * FROM app_routing_jobs WHERE started_at IS NULL ORDER BY created_at, rowid',
+      "SELECT * FROM app_routing_jobs WHERE state = 'pending' AND started_at IS NULL ORDER BY created_at, rowid",
     )) {
       const claimed = await getDb().run(
         "UPDATE app_routing_jobs SET started_at=?,state='started',attempts=attempts+1 WHERE message_id=? AND started_at IS NULL",
