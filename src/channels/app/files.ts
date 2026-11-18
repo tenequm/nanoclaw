@@ -14,7 +14,7 @@ import type { DbDriver } from '../../db/driver.js';
 import type { DeviceRow } from '../../modules/device-auth/db.js';
 import { getLiveDevice, onDeviceRevoked, readSignedBody } from '../../modules/device-auth/verify.js';
 import type { OutboundFile } from '../adapter.js';
-import { readAppConfig } from './config.js';
+import { appConfig } from './config.js';
 import { getConversation } from './conversations.js';
 import { setAppHooks } from './log.js';
 import { mintTicket, readTicket, parseAuthorization, type FileAttachment } from './contract.js';
@@ -177,7 +177,7 @@ export function createFileService(deps: FileDeps) {
   const root = deps.root ?? path.join(DATA_DIR, 'app-files');
   const tempRoot = path.join(root, 'tmp');
   const key = () =>
-    (deps.ticketKey ?? (() => readAppConfig().ticketKey))() ?? refuse(503, 'unavailable', 'Files are unavailable.');
+    (deps.ticketKey ?? (() => appConfig().ticketKey))() ?? refuse(503, 'unavailable', 'Files are unavailable.');
   const get = (id: string, db = deps.db()) => db.get<StoredFile>('SELECT * FROM app_files WHERE id = ?', id);
   const signedBody = async (ctx: AppRequest) => {
     const auth = parseAuthorization(ctx.req.headers.authorization);

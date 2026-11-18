@@ -2,7 +2,7 @@ import './db.js';
 import { createHash, createPublicKey, randomInt, randomUUID, verify } from 'node:crypto';
 import type { AppHandler } from '../../channels/app/routes.js';
 import { pairProofText, type PairRequest } from '../../channels/app/contract.js';
-import { readAppConfig } from '../../channels/app/config.js';
+import { appConfig } from '../../channels/app/config.js';
 import { getDb } from '../../db/connection.js';
 import { getUser } from '../permissions/db/users.js';
 import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
@@ -22,7 +22,7 @@ export async function mintPairingLink(
   addedAgentIds = agentIds,
   now = Date.now(),
 ): Promise<string> {
-  const base = readAppConfig().publicBase;
+  const base = appConfig().publicBase;
   if (!base) throw new Error('App pairing is off here.');
   if (!(await getUser(userId))) throw new Error('Unknown user.');
   for (const id of new Set([...agentIds, ...addedAgentIds])) {
@@ -141,7 +141,7 @@ export async function handlePairCommand(event: InboundEvent): Promise<boolean> {
     await say('Only an owner or admin of this agent can use /pair.');
     return true;
   }
-  if (!readAppConfig().publicBase) {
+  if (!appConfig().publicBase) {
     await say('App pairing is off here.');
     return true;
   }

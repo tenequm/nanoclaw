@@ -16,7 +16,7 @@ export function readAppConfig(read: (key: string) => string | undefined = envVal
     ticketKey: key ? Buffer.from(hkdfSync('sha256', key, Buffer.alloc(0), 'heydan-app-ticket-v1', 32)) : null,
     apns: {
       teamId: read('APP_APNS_TEAM_ID') || null,
-      topic: read('APP_APNS_TOPIC') || 'com.example.HeyDan',
+      topic: read('APP_APNS_TOPIC') || null,
       sandbox: apnsKey('SANDBOX'),
       production: apnsKey('PRODUCTION'),
     },
@@ -27,6 +27,7 @@ export function configuredFeatures(config: AppConfig): string[] {
   const pushReady =
     config.publicBase &&
     config.apns.teamId &&
+    config.apns.topic &&
     [config.apns.sandbox, config.apns.production].some((key) => {
       if (!key) return false;
       try {
@@ -41,4 +42,22 @@ export function configuredFeatures(config: AppConfig): string[] {
     ...(pushReady ? ['push'] : []),
     ...(config.livekitUrl ? ['voice-picker'] : []),
   ];
+}
+
+// Unsigned routes reach this, so re-read `.env` and the key files at most once a minute.
+const CONFIG_REFRESH_MS = 60_000;
+let cache: { config: AppConfig; features: string[]; checkedAt: number } | undefined;
+function current() {
+  const now = performance.now();
+  if (!cache || now - cache.checkedAt >= CONFIG_REFRESH_MS) {
+    const config = readAppConfig();
+    cache = { config, features: configuredFeatures(config), checkedAt: now };
+  }
+  return cache;
+}
+export const appConfig = (): AppConfig => current().config;
+export const appFeatures = (): string[] => current().features;
+/** Test seam: drop the cached configuration after changing the environment. */
+export function resetAppConfigCache(): void {
+  cache = undefined;
 }

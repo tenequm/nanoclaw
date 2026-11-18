@@ -16,10 +16,15 @@ import { routes, dispatchApp } from './routes.js';
 import { registerRootHandler } from '../../webhook-server.js';
 import { createAppAdapter } from './index.js';
 import { getRegisteredChannelNames } from '../channel-registry.js';
-import { readAppConfig, configuredFeatures } from './config.js';
+import { readAppConfig, configuredFeatures, resetAppConfigCache } from './config.js';
+import { envValue } from '../../env.js';
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
 
 vi.mock('../../webhook-server.js', () => ({ registerRootHandler: vi.fn() }));
+vi.mock('../../env.js', async (original) => {
+  const env = await original<typeof import('../../env.js')>();
+  return { ...env, envValue: vi.fn(env.envValue) };
+});
 let databaseDirectory: string | undefined;
 afterEach(async () => {
   await closeDb();
@@ -54,6 +59,21 @@ async function request(method: string, target: string, peer = '127.0.0.1', autho
 it('serves hello with the contract shape without credentials', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(fixtures.hello.serverTime);
   expect(await request('GET', '/app/hello')).toEqual({ status: 200, body: { ...fixtures.hello, features: [] } });
+});
+it('reads the configuration for unsigned hello requests at most once a minute', async () => {
+  resetAppConfigCache();
+  const now = vi.spyOn(performance, 'now').mockReturnValue(1_000_000);
+  vi.mocked(envValue).mockClear();
+  await request('GET', '/app/hello');
+  const reads = vi.mocked(envValue).mock.calls.length;
+  expect(reads).toBeGreaterThan(0);
+  await request('GET', '/app/hello');
+  now.mockReturnValue(1_059_999);
+  await request('GET', '/app/hello');
+  expect(vi.mocked(envValue)).toHaveBeenCalledTimes(reads);
+  now.mockReturnValue(1_060_000);
+  await request('GET', '/app/hello');
+  expect(vi.mocked(envValue)).toHaveBeenCalledTimes(reads * 2);
 });
 it.each(routes.filter((route) => route.signed))('$method $path requires a signature', async (route) => {
   const db = await initDb(':memory:', { role: 'test' });
@@ -119,7 +139,7 @@ it('advertises only configured features and derives a domain-separated ticket ke
   expect(config.ticketKey).toHaveLength(32);
   expect(config.ticketKey).not.toEqual(Buffer.alloc(32, 7));
   expect(config.apns.production).toBeNull();
-  expect(config.apns.topic).toBe('com.example.HeyDan');
+  expect(config.apns.topic).toBeNull();
 });
 
 it('passes a signed fixture and identity to its handler and contains unexpected failures', async () => {
@@ -213,6 +233,7 @@ it('advertises push only with a public base and a usable APNs environment', () =
   const keyPath = join(databaseDirectory, 'test.p8');
   const config = readAppConfig(() => undefined);
   config.apns.teamId = 'team';
+  config.apns.topic = 'com.example.HeyDan';
   config.apns.sandbox = { keyId: 'key', keyPath };
   config.publicBase = 'https://example.test';
   expect(configuredFeatures(config)).not.toContain('push');
@@ -224,6 +245,9 @@ it('advertises push only with a public base and a usable APNs environment', () =
   const key = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey;
   writeFileSync(keyPath, key.export({ type: 'pkcs8', format: 'pem' }));
   expect(configuredFeatures(config)).toContain('push');
+  config.apns.topic = null;
+  expect(configuredFeatures(config)).not.toContain('push');
+  config.apns.topic = 'com.example.HeyDan';
   config.publicBase = null;
   expect(configuredFeatures(config)).not.toContain('push');
   config.publicBase = 'https://example.test';

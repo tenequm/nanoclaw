@@ -4,7 +4,7 @@ import { AuthError, verifyRequest } from '../../modules/device-auth/verify.js';
 import { log } from '../../log.js';
 import type { DeviceIdentity } from '../../modules/device-auth/verify.js';
 import { handlePair, handleRevoke } from '../../modules/device-auth/pairing.js';
-import { configuredFeatures, readAppConfig } from './config.js';
+import { appFeatures } from './config.js';
 import type { HelloResponse } from './contract.js';
 import { listConversations, history, markRead } from './conversations.js';
 import { sendMessage } from './send.js';
@@ -42,7 +42,7 @@ export const hello: AppHandler = async ({ res }) => {
     protocol: 1,
     minProtocol: 1,
     voiceProtocol: 6,
-    features: configuredFeatures(readAppConfig()),
+    features: appFeatures(),
     serverTime: Date.now(),
   };
   json(res, 200, body);

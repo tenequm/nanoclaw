@@ -10,7 +10,7 @@ import type { DbDriver } from '../../db/driver.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { schemaTables, type EventRow } from './db.js';
 import { pushTokenHandler, subscribePush, type PushDependencies } from './push.js';
-import { readAppConfig } from './config.js';
+import { readAppConfig, resetAppConfigCache } from './config.js';
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -64,6 +64,7 @@ afterEach(async () => {
   stop = undefined;
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+  resetAppConfigCache();
   await closeDb();
   rmSync(directory, { recursive: true, force: true });
 });

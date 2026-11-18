@@ -2,6 +2,7 @@ import { beforeEach, afterEach, it, expect, vi } from 'vitest';
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { handlePairCommand } from './pairing.js';
+import { resetAppConfigCache } from '../../channels/app/config.js';
 import { dispatch } from '../../cli/dispatch.js';
 import '../../cli/resources/devices.js';
 import { redactVoiceLinks } from '../../channels/telegram-grammy/inbound.js';
@@ -39,6 +40,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await closeDb();
   vi.unstubAllEnvs();
+  resetAppConfigCache();
 });
 it('pairs an owner privately and stores only a hash', async () => {
   expect(await handlePairCommand(event)).toBe(true);
@@ -75,6 +77,7 @@ it('does not mint without a private destination or public base', async () => {
   mocks.dm.mockResolvedValue(null);
   await handlePairCommand(event);
   vi.stubEnv('APP_PUBLIC_BASE', '');
+  resetAppConfigCache();
   await handlePairCommand(event);
   expect(await getDb().all('SELECT * FROM device_auth_pairing_codes')).toEqual([]);
 });

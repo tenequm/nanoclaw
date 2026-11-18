@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { connect, type ClientHttp2Session } from 'node:http2';
 import { setTimeout as delay } from 'node:timers/promises';
 import { log } from '../../log.js';
-import { readAppConfig, type AppConfig } from './config.js';
+import { appConfig, type AppConfig } from './config.js';
 import type { PushPayload } from './contract.js';
 
 export interface PushDestination {
@@ -38,7 +38,7 @@ export function createApnsClient(options: {
     if (!keys.has(environment)) {
       let key: KeyObject | null = null;
       try {
-        if (config && options.config.teamId) {
+        if (config && options.config.teamId && options.config.topic) {
           key = createPrivateKey(readFileSync(config.keyPath));
           if (key.asymmetricKeyDetails?.namedCurve !== 'prime256v1') key = null;
         }
@@ -93,7 +93,7 @@ export function createApnsClient(options: {
         ':path': `/3/device/${destination.token}`,
         'apns-push-type': 'alert',
         'apns-priority': '10',
-        'apns-topic': options.config.topic,
+        'apns-topic': options.config.topic ?? undefined,
         'apns-collapse-id': entityId,
         'apns-id': randomUUID(),
         authorization: `bearer ${token}`,
@@ -195,6 +195,6 @@ export function createApnsClient(options: {
 }
 let client: ReturnType<typeof createApnsClient> | undefined;
 export function sendPush(destination: PushDestination, entityId: string, payload: PushPayload): Promise<PushResult> {
-  client ??= createApnsClient({ config: readAppConfig().apns });
+  client ??= createApnsClient({ config: appConfig().apns });
   return client.sendPush(destination, entityId, payload);
 }

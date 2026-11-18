@@ -8,7 +8,7 @@ import { readSignedBody, liveDevices, reachableAgentIds, onDeviceRevoked } from 
 import { json, type AppHandler } from './routes.js';
 import { parseAuthorization, type Badge, type Message, type Question, type PushPayload } from './contract.js';
 import type { EventRow, PushTokenRow } from './db.js';
-import { readAppConfig } from './config.js';
+import { appConfig, type AppConfig } from './config.js';
 import { sendPush } from './apns.js';
 
 export function pushTokenHandler(db: () => DbDriver = getDb, readBody = readSignedBody): AppHandler {
@@ -67,7 +67,7 @@ export function subscribePush(
   deps: PushDependencies,
   options: {
     db?: () => DbDriver;
-    config?: typeof readAppConfig;
+    config?: () => AppConfig;
     send?: typeof sendPush;
     agent?: typeof getAgentGroup;
     warn?: (reason: string, fields?: Record<string, unknown>) => void;
@@ -76,7 +76,7 @@ export function subscribePush(
   } = {},
 ) {
   const db = options.db ?? getDb;
-  const config = options.config ?? readAppConfig;
+  const config = options.config ?? appConfig;
   const send = options.send ?? sendPush;
   const agent = options.agent ?? getAgentGroup;
   const warn = options.warn ?? ((reason, fields) => log.warn(reason, fields));
