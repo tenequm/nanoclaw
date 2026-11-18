@@ -1,7 +1,7 @@
 import './db.js';
 import { createHash, createPublicKey, randomInt, randomUUID, verify } from 'node:crypto';
 import type { AppHandler } from '../../channels/app/routes.js';
-import { pairProofText, type PairRequest } from '../../channels/app/contract.js';
+import { APP_PROTOCOL, pairProofText, type PairRequest } from '../../channels/app/contract.js';
 import { appConfig } from '../../channels/app/config.js';
 import { getDb } from '../../db/connection.js';
 import { getUser } from '../permissions/db/users.js';
@@ -120,7 +120,7 @@ export const handlePair: AppHandler = async ({ req, res }) => {
     deviceId,
     userName: (await getUser(userId))?.display_name ?? userId,
     agents,
-    protocol: 1,
+    protocol: APP_PROTOCOL,
     serverTime: now,
   });
 };

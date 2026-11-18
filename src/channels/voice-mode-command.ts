@@ -300,11 +300,7 @@ export async function handleVoiceCommand(
   const { adapter, instance, threadId, chatThread, mg, userId } = chat;
   const cmd = voiceCommandName(event.channelType);
   // Straight to the chat's adapter, never through a session: the agent must not hold the call link.
-  const say = (text: string) =>
-    adapter.deliver(event.platformId, threadId, {
-      kind: 'chat',
-      content: { text, ...(event.channelType === 'app' ? { host: true } : {}) },
-    });
+  const say = (text: string) => adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
   const mode: VoiceMode = !JEV_API_KEY ? null : command.plain ? 'plain' : 'jev';
   try {
     if (command.jev && !JEV_API_KEY) {
@@ -409,10 +405,7 @@ async function sendDirect(userId: string, instance: string, text: string): Promi
   if (!direct) return false;
   const { dm, dmAdapter } = direct;
   try {
-    await dmAdapter.deliver(dm.platform_id, null, {
-      kind: 'chat',
-      content: { text, ...(dm.channel_type === 'app' ? { host: true } : {}) },
-    });
+    await dmAdapter.deliver(dm.platform_id, null, { kind: 'chat', content: { text } });
     return true;
   } catch (err) {
     log.warn('/voice could not reach the direct chat', { channelType: dm.channel_type, err: errorKind(err) });

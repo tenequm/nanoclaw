@@ -2,7 +2,12 @@ import './db.js';
 import { createHash } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { getDb } from '../../db/connection.js';
-import { parseAuthorization, verifyRequestSignature, type ErrorBody } from '../../channels/app/contract.js';
+import {
+  APP_PROTOCOL,
+  parseAuthorization,
+  verifyRequestSignature,
+  type ErrorBody,
+} from '../../channels/app/contract.js';
 import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
 import type { DeviceRow } from './db.js';
 import { consumeRateLimit } from './rate-limit.js';
@@ -90,7 +95,8 @@ export async function verifyRequest(req: IncomingMessage, now = Date.now()): Pro
     if (device.revoked_at !== null) throw authError(401, 'device_revoked', 'This device was unpaired.');
     if (Math.abs(Math.floor(now / 1000) - fields.ts) > 120)
       throw authError(401, 'stale_timestamp', 'The request is too old or too new.', { serverTime: now });
-    if (fields.protocol !== 1) throw authError(426, 'protocol', 'Update Hey Dan to keep chatting.', { protocol: 1 });
+    if (fields.protocol !== APP_PROTOCOL)
+      throw authError(426, 'protocol', 'Update Hey Dan to keep chatting.', { protocol: APP_PROTOCOL });
     if (
       !verifyRequestSignature(
         { ...fields, method: req.method ?? '', target: req.url ?? '' },

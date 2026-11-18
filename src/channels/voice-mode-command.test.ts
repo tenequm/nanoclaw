@@ -491,23 +491,6 @@ describe('handleVoiceCommand (the interceptor)', () => {
     message: { id: '171', kind: 'chat', content: JSON.stringify({ text, senderId: sender }), timestamp: now() },
   });
 
-  it.each(['app', 'telegram', 'slack'])('marks host replies only for app messages (%s)', async (channelType) => {
-    await startChat(false);
-    await getDb().run(
-      'UPDATE messaging_groups SET channel_type = ?, instance = ? WHERE id = ?',
-      channelType,
-      'chat',
-      'mg-dm',
-    );
-    const incoming = { ...event(channelType === 'slack' ? '!voice' : '/voice', OWNER), channelType };
-    expect(await handleVoiceCommand(incoming, callUrl)).toBe(true);
-    expect(delivered).toHaveLength(1);
-    expect(delivered[0].message.content).toEqual({
-      text: expect.any(String),
-      ...(channelType === 'app' ? { host: true } : {}),
-    });
-  });
-
   it('answers the owner in their direct chat with the link, straight through the adapter', async () => {
     await startChat(false);
     expect(await handleVoiceCommand(event('/voice', OWNER), callUrl)).toBe(true);

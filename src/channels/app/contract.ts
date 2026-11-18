@@ -404,6 +404,9 @@ export interface Authorization extends Omit<SigningFields, 'method' | 'target'> 
   signature: string;
 }
 
+/** The app wire protocol this host speaks; a request on any other is refused with `426 protocol`. */
+export const APP_PROTOCOL = 1;
+
 export function canonicalSigningText(fields: SigningFields): string {
   return [
     'HEYDAN-SIG-V1',

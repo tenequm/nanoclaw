@@ -220,8 +220,8 @@ export async function findCallSession(
   return findSessionForAgent(agentGroupId, mg.id, mode === 'shared' ? null : threadId);
 }
 
-/** The voice adapter, plus the call URL of a link token for the `/voice` command. */
 type PickerError = (status: number, body: { error: string; field?: string; provider?: string }, text?: string) => void;
+/** The voice adapter, plus the call URL of a link token for the `/voice` command. */
 export interface VoiceModeChannelAdapter extends ChannelAdapter {
   /** The call page URL for a link token. */
   callUrl(token: string): string;

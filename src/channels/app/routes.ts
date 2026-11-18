@@ -5,7 +5,8 @@ import { log } from '../../log.js';
 import type { DeviceIdentity } from '../../modules/device-auth/verify.js';
 import { handlePair, handleRevoke } from '../../modules/device-auth/pairing.js';
 import { appFeatures } from './config.js';
-import type { HelloResponse } from './contract.js';
+import { APP_PROTOCOL, type HelloResponse } from './contract.js';
+import { LIVEKIT_PROTOCOL_VERSION } from '../voice-mode-protocol.js';
 import { listConversations, history, markRead } from './conversations.js';
 import { sendMessage } from './send.js';
 import { answerQuestion } from './questions.js';
@@ -26,54 +27,48 @@ export interface AppRoute {
   method: string;
   path: string;
   signed: boolean;
-  lane: string;
   handler: AppHandler;
 }
 export function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(body));
 }
-export function notImplemented(context: AppRequest, lane: string): Promise<void> {
-  json(context.res, 501, { error: 'not_implemented', message: `This feature is awaiting ${lane}.` });
-  return Promise.resolve();
-}
 export const hello: AppHandler = async ({ res }) => {
   const body: HelloResponse = {
-    protocol: 1,
-    minProtocol: 1,
-    voiceProtocol: 6,
+    protocol: APP_PROTOCOL,
+    minProtocol: APP_PROTOCOL,
+    voiceProtocol: LIVEKIT_PROTOCOL_VERSION,
     features: appFeatures(),
     serverTime: Date.now(),
   };
   json(res, 200, body);
 };
 export const routes: readonly AppRoute[] = [
-  { method: 'GET', path: '/app/hello', signed: false, lane: 'N0', handler: hello },
-  { method: 'POST', path: '/app/pair', signed: false, lane: 'N1', handler: handlePair },
-  { method: 'GET', path: '/app/conversations', signed: true, lane: 'N2a', handler: listConversations },
-  { method: 'GET', path: '/app/conversations/:id/messages', signed: true, lane: 'N2a', handler: history },
-  { method: 'POST', path: '/app/conversations/:id/messages', signed: true, lane: 'N2a', handler: sendMessage },
-  { method: 'POST', path: '/app/conversations/:id/read', signed: true, lane: 'N2a', handler: markRead },
-  { method: 'POST', path: '/app/questions/:id/answer', signed: true, lane: 'N2a', handler: answerQuestion },
-  { method: 'GET', path: '/app/events', signed: true, lane: 'N2b', handler: streamEvents },
-  { method: 'POST', path: '/app/files', signed: true, lane: 'N3', handler: mintFile },
-  { method: 'POST', path: '/app/files/:id/ticket', signed: true, lane: 'N3', handler: renewFileTicket },
-  { method: 'PUT', path: '/app/files/:id', signed: false, lane: 'N3', handler: uploadFile },
-  { method: 'GET', path: '/app/files/:id', signed: true, lane: 'N3', handler: downloadFile },
-  { method: 'POST', path: '/app/calls', signed: true, lane: 'N5', handler: startCall },
-  { method: 'POST', path: '/app/calls/:callId/end', signed: true, lane: 'N5', handler: endCall },
+  { method: 'GET', path: '/app/hello', signed: false, handler: hello },
+  { method: 'POST', path: '/app/pair', signed: false, handler: handlePair },
+  { method: 'GET', path: '/app/conversations', signed: true, handler: listConversations },
+  { method: 'GET', path: '/app/conversations/:id/messages', signed: true, handler: history },
+  { method: 'POST', path: '/app/conversations/:id/messages', signed: true, handler: sendMessage },
+  { method: 'POST', path: '/app/conversations/:id/read', signed: true, handler: markRead },
+  { method: 'POST', path: '/app/questions/:id/answer', signed: true, handler: answerQuestion },
+  { method: 'GET', path: '/app/events', signed: true, handler: streamEvents },
+  { method: 'POST', path: '/app/files', signed: true, handler: mintFile },
+  { method: 'POST', path: '/app/files/:id/ticket', signed: true, handler: renewFileTicket },
+  { method: 'PUT', path: '/app/files/:id', signed: false, handler: uploadFile },
+  { method: 'GET', path: '/app/files/:id', signed: true, handler: downloadFile },
+  { method: 'POST', path: '/app/calls', signed: true, handler: startCall },
+  { method: 'POST', path: '/app/calls/:callId/end', signed: true, handler: endCall },
   {
     method: 'POST',
     path: '/app/calls/attempts/:attemptId/cancel',
     signed: true,
-    lane: 'N5',
     handler: cancelCallAttempt,
   },
-  { method: 'GET', path: '/app/conversations/:id/voice', signed: true, lane: 'N5', handler: getVoice },
-  { method: 'PATCH', path: '/app/conversations/:id/voice', signed: true, lane: 'N5', handler: patchVoice },
-  { method: 'GET', path: '/app/conversations/:id/voices', signed: true, lane: 'N5', handler: listVoices },
-  { method: 'PUT', path: '/app/devices/me/push-token', signed: true, lane: 'N4', handler: registerPushToken },
-  { method: 'DELETE', path: '/app/devices/me', signed: true, lane: 'N1', handler: handleRevoke },
+  { method: 'GET', path: '/app/conversations/:id/voice', signed: true, handler: getVoice },
+  { method: 'PATCH', path: '/app/conversations/:id/voice', signed: true, handler: patchVoice },
+  { method: 'GET', path: '/app/conversations/:id/voices', signed: true, handler: listVoices },
+  { method: 'PUT', path: '/app/devices/me/push-token', signed: true, handler: registerPushToken },
+  { method: 'DELETE', path: '/app/devices/me', signed: true, handler: handleRevoke },
 ];
 export const dispatchApp: AppHandler = async ({ req, res }) => {
   try {
