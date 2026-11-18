@@ -38,6 +38,7 @@ import { getVoiceModeLineForAgent, bindVoiceModeLineChat, openVoiceModeLink } fr
 import { createVoiceModeAdapter, type VoiceModeChannelAdapter } from '../voice-mode.js';
 import { createVoiceCatalog } from '../voice-mode-tts-catalog.js';
 import { createCallHandlers, callAvailability, callDeps, startCall } from './calls.js';
+import { resetAppConfigCache } from './config.js';
 import { readSignedBody } from '../../modules/device-auth/verify.js';
 import { createVoiceHandlers } from './voice.js';
 import type { AppHandler } from './routes.js';
@@ -64,7 +65,15 @@ const group = {
   is_group: 0,
   instance: 'app',
 } as MessagingGroup;
-const deps = { getConversation: async (id: string) => (id === c.id ? c : undefined), setAppHooks: vi.fn() };
+const revocations = new Set<(deviceId: string) => void>();
+const deps = {
+  getConversation: async (id: string) => (id === c.id ? c : undefined),
+  setAppHooks: vi.fn(),
+  onDeviceRevoked: (listener: (deviceId: string) => void) => {
+    revocations.add(listener);
+    return () => revocations.delete(listener);
+  },
+};
 let adapter: VoiceModeChannelAdapter;
 let handlers: ReturnType<typeof createCallHandlers>;
 let picker: ReturnType<typeof createVoiceHandlers>;
@@ -197,6 +206,8 @@ afterEach(async () => {
   await stopStatus();
   await closeDb();
   vi.unstubAllEnvs();
+  resetAppConfigCache();
+  revocations.clear();
 });
 it('opens once concurrently, retries with a fresh token and ends idempotently', async () => {
   const [a, b] = await Promise.all([
@@ -220,6 +231,33 @@ it('opens once concurrently, retries with a fresh token and ends idempotently', 
   expect((await request(handlers.endCall, { reason: 'hangup' }, { callId: a.body.callId })).status).toBe(204);
   expect((await request(handlers.endCall, { reason: 'hangup' }, { callId: a.body.callId })).status).toBe(204);
   expect(await request(handlers.startCall, requestBody)).toMatchObject(fixtures.callErrors.stopped);
+});
+it('ends the live call and stops the opening attempt of a revoked device', async () => {
+  const started = await request(handlers.startCall, requestBody);
+  const end = vi.spyOn(adapter, 'endAppCall');
+  const { getDb } = await import('../../db/connection.js');
+  const insert = (attempt: string, device: string) =>
+    getDb().run(
+      "INSERT INTO app_call_attempts (user_id, attempt_id, device_id, conversation_id, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'opening', 1, 1)",
+      c.user_id,
+      attempt,
+      device,
+      c.id,
+    );
+  await insert('opening-attempt', 'dev-test');
+  await insert('other-device-attempt', 'dev-other');
+  for (const listener of revocations) listener('dev-test');
+  await vi.waitFor(() =>
+    expect(end).toHaveBeenCalledWith(expect.any(String), started.body.callId, 'caller device revoked', {
+      grace: false,
+    }),
+  );
+  expect(end).toHaveBeenCalledTimes(1);
+  expect(await getDb().all('SELECT attempt_id, state, reason FROM app_call_attempts ORDER BY attempt_id')).toEqual([
+    { attempt_id: requestBody.attemptId, state: 'stopped', reason: 'revoked' },
+    { attempt_id: 'opening-attempt', state: 'stopped', reason: 'revoked' },
+    { attempt_id: 'other-device-attempt', state: 'opening', reason: null },
+  ]);
 });
 it('cancels during room setup and before a late start', async () => {
   let release!: () => void;

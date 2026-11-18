@@ -5,12 +5,13 @@ import { bindVoiceModeLineChat, createVoiceModeLine, getVoiceModeLineForAgent } 
 import { hasAdminPrivilege } from '../../modules/permissions/db/user-roles.js';
 import { encryptionKey } from '../../secret-seal.js';
 import { JEV_API_KEY } from '../../config.js';
-import { readSignedBody } from '../../modules/device-auth/verify.js';
+import { onDeviceRevoked, readSignedBody } from '../../modules/device-auth/verify.js';
+import { log } from '../../log.js';
 import { liveVoiceAdapter } from '../voice-mode-chat.js';
 import { appVoiceErrorMessages as messages, lineRunsJev } from '../voice-mode-command.js';
 import { linePlatformId } from '../voice-mode-line.js';
 import { LIVEKIT_PROTOCOL_VERSION } from '../voice-mode-protocol.js';
-import { readAppConfig } from './config.js';
+import { appConfig } from './config.js';
 import { parseAuthorization } from './contract.js';
 import type { CallAttemptRow, ConversationRow } from './db.js';
 import { json, type AppHandler, type AppRequest } from './routes.js';
@@ -18,6 +19,7 @@ import { json, type AppHandler, type AppRequest } from './routes.js';
 export interface CallDeps {
   getConversation(id: string): Promise<ConversationRow | undefined>;
   setAppHooks(hooks: { callAvailability: typeof callAvailability }): void;
+  onDeviceRevoked(listener: (deviceId: string) => void): () => void;
 }
 export class AppCallError extends Error {
   constructor(
@@ -84,7 +86,7 @@ export async function ownLine(c: ConversationRow, create: boolean) {
 }
 export async function callAvailability(userId: string, agentGroupId: string) {
   let error: string | null = null;
-  if (!readAppConfig().livekitUrl || !liveVoiceAdapter()?.isConnected()) error = 'voice_offline';
+  if (!appConfig().livekitUrl || !liveVoiceAdapter()?.isConnected()) error = 'voice_offline';
   else {
     const line = await getVoiceModeLineForAgent(agentGroupId);
     if (!(await hasAdminPrivilege(userId, agentGroupId)) || (line ? line.owner_user_id !== userId : !encryptionKey()))
@@ -102,7 +104,9 @@ const reasonText = (reason: unknown) =>
     ? 'no voice worker joined (worker down, or not on this protocol version)'
     : reason === 'updating'
       ? 'the voice worker is on another protocol version'
-      : 'hangup';
+      : reason === 'revoked'
+        ? 'caller device revoked'
+        : 'hangup';
 const normalizedReason = (reason: unknown) => (reason === 'no-agent' || reason === 'updating' ? reason : 'hangup');
 const uuid = (value: unknown): value is string =>
   typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
@@ -123,6 +127,23 @@ export function createCallHandlers(deps: CallDeps) {
         grace: reason === 'hangup',
       });
   };
+  deps.onDeviceRevoked((deviceId) => {
+    void getDb()
+      .all<CallAttemptRow>(
+        "UPDATE app_call_attempts SET state = 'stopped', reason = 'revoked', updated_at = ? WHERE device_id = ? AND state IN ('opening', 'live') RETURNING *",
+        Date.now(),
+        deviceId,
+      )
+      .then(async (rows) => {
+        for (const row of rows) await stop(row, reasonText('revoked'));
+      })
+      .catch((error: unknown) =>
+        log.warn('App call stop on revocation failed', {
+          deviceId,
+          kind: error instanceof Error ? error.name : typeof error,
+        }),
+      );
+  });
   const startCall = guarded(async (ctx) => {
     const body = await signedObject(ctx);
     const jev = body.jev ?? null;
@@ -140,7 +161,7 @@ export function createCallHandlers(deps: CallDeps) {
         message: messages.protocol,
       });
     }
-    const url = readAppConfig().livekitUrl;
+    const url = appConfig().livekitUrl;
     if (!url) throw new AppCallError(503, 'voice_offline');
     const voice = runningVoice();
     const { userId, deviceId } = ctx.identity!;
@@ -273,5 +294,9 @@ export function createCallHandlers(deps: CallDeps) {
   });
   return { startCall, endCall, cancelCallAttempt };
 }
-export const callDeps: CallDeps = { getConversation: (id) => getConversation(id), setAppHooks };
+export const callDeps: CallDeps = {
+  getConversation: (id) => getConversation(id),
+  setAppHooks,
+  onDeviceRevoked: (listener) => onDeviceRevoked(listener),
+};
 export const { startCall, endCall, cancelCallAttempt } = createCallHandlers(callDeps);
