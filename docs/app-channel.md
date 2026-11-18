@@ -33,7 +33,15 @@ the URL fragment and is submitted only in the pairing body. The phone proves pos
 of its P-256 private key; the host stores its public key and the permitted agent set.
 Only paired agents appear, not every agent the user's role could otherwise access.
 
-The host-only administrative interface is:
+Every successful pairing sends a direct notice with the device name, UTC time and revocation
+instructions. A failed notice does not undo pairing.
+
+For a lost phone, send `/pair list` in your direct chat, then `/pair revoke <device>`.
+The list shows your live devices, their short ids and UTC pairing times. Revoke accepts a
+short id, full id or exact device name; duplicate names require an id. These commands work
+without an owner or admin role and never show devices in a group chat.
+
+The host-only administrative interface remains:
 
 ```sh
 ncl devices list --user <user-id>
