@@ -34,12 +34,15 @@ of its P-256 private key; the host stores its public key and the permitted agent
 Only paired agents appear, not every agent the user's role could otherwise access.
 
 Every successful pairing sends a direct notice with the device name, UTC time and revocation
-instructions. A failed notice does not undo pairing.
+instructions, after the pairing has been answered; a failed or slow notice does not undo or
+delay pairing. Device names are chosen by the paired phone, so chat replies show them as
+inline code, never as formatting or links.
 
-For a lost phone, send `/pair list` in your direct chat, then `/pair revoke <device>`.
-The list shows your live devices, their short ids and UTC pairing times. Revoke accepts a
-short id, full id or exact device name; duplicate names require an id. These commands work
-without an owner or admin role and never show devices in a group chat.
+For a lost phone, send `/pair list` in your direct chat, then `/pair revoke <id>`.
+The list shows your live devices in pairing order, their short ids and UTC pairing times.
+Revoke accepts a short id, full id or exact device name; an id match wins over a name, and
+duplicate names require an id. These commands work without an owner or admin role, answer
+only known users, and never show devices in a group chat.
 
 The host-only administrative interface remains:
 

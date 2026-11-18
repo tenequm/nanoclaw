@@ -6,6 +6,7 @@ import { resetAppConfigCache } from '../../channels/app/config.js';
 import { dispatch } from '../../cli/dispatch.js';
 import '../../cli/resources/devices.js';
 import { redactVoiceLinks } from '../../channels/telegram-grammy/inbound.js';
+import { renderFS } from '../../channels/telegram-grammy/formatter.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 const mocks = vi.hoisted(() => ({ deliver: vi.fn(), dm: vi.fn() }));
 vi.mock('../../env.js', () => ({ envValue: (key: string) => process.env[key], readEnvFile: () => ({}) }));
@@ -123,7 +124,7 @@ const command = (text: string) =>
     message: { ...event.message, content: JSON.stringify({ text, senderId: 'u' }) },
   });
 const reply = () => mocks.deliver.mock.calls.at(-1)![2].content.text as string;
-async function device(id: string, name = 'Phone', user = 'telegram:u') {
+async function device(id: string, name = 'Phone', user = 'telegram:u', createdAt = 1) {
   await getDb().run(
     'INSERT INTO device_auth_devices (id,user_id,name,public_key,app_json,created_at) VALUES (?,?,?,?,?,?)',
     id,
@@ -131,7 +132,7 @@ async function device(id: string, name = 'Phone', user = 'telegram:u') {
     name,
     'unused',
     '{}',
-    1,
+    createdAt,
   );
 }
 it('lists only live own devices without a role and supports the bot suffix', async () => {
@@ -140,18 +141,66 @@ it('lists only live own devices without a role and supports the bot suffix', asy
   await device('dev_12345678-rest');
   await device('dev_87654321-rest', 'Other', 'telegram:other');
   await command('/pair@bot list');
-  expect(reply()).toBe('Phone - 12345678 - 1970-01-01T00:00:00.001Z');
+  expect(reply()).toBe('`Phone` - 12345678 - 1970-01-01T00:00:00.001Z');
   await command('/pair revoke dev_87654321-rest');
-  expect(reply()).toBe('No device dev_87654321-rest. Send /pair list.');
+  expect(reply()).toBe('No device `dev_87654321-rest`. Send /pair list.');
   await command('/pair@bot revoke 12345678');
-  expect(reply()).toBe('Revoked Phone.');
+  expect(reply()).toBe('Revoked `Phone`.');
   await command('/pair list');
   expect(reply()).toBe('No paired devices.');
 });
 it.each(['dev_12345678-rest', 'My Phone'])('revokes an own device by %s', async (arg) => {
   await device('dev_12345678-rest', 'My Phone');
   await command(`/pair revoke ${arg}`);
-  expect(reply()).toBe('Revoked My Phone.');
+  expect(reply()).toBe('Revoked `My Phone`.');
+});
+it('prefers an id match over a device named after that id', async () => {
+  await device('dev_12345678-rest', 'Phone', 'telegram:u', 1);
+  await device('dev_87654321-rest', '12345678', 'telegram:u', 2);
+  await command('/pair revoke 12345678');
+  expect(reply()).toBe('Revoked `Phone`.');
+  expect(await getDb().all('SELECT id FROM device_auth_devices WHERE revoked_at IS NULL')).toEqual([
+    { id: 'dev_87654321-rest' },
+  ]);
+});
+it('lists devices by pairing time', async () => {
+  await device('dev_bbbbbbbb-rest', 'Second', 'telegram:u', 2000);
+  await device('dev_aaaaaaaa-rest', 'First', 'telegram:u', 1000);
+  await command('/pair list');
+  expect(
+    reply()
+      .split('\n')
+      .map((line) => line.split(' - ')[0]),
+  ).toEqual(['`First`', '`Second`']);
+});
+it('answers a sender without a user row with silence', async () => {
+  await getDb().run('DELETE FROM user_roles');
+  await getDb().run('DELETE FROM users');
+  for (const text of ['/pair list', '/pair revoke 12345678']) await command(text);
+  expect(mocks.deliver).not.toHaveBeenCalled();
+});
+it('contains a failed list or revoke reply', async () => {
+  const { log } = await import('../../log.js');
+  const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+  try {
+    mocks.deliver.mockRejectedValue(new Error('send failed'));
+    expect(await command('/pair list')).toBe(true);
+    expect(warn).toHaveBeenCalledWith('Pairing reply failed', { kind: 'Error' });
+  } finally {
+    warn.mockRestore();
+  }
+});
+it('keeps device names literal when the chat renders markdown', async () => {
+  const names = ['[Not you? Revoke here](https://evil.example/r)', '||hidden||', 'Phone &#x202E;enohp', 'a&#10;b`c'];
+  for (const [i, name] of names.entries()) await device(`dev_${i}0000000-rest`, name, 'telegram:u', i + 1);
+  await command('/pair list');
+  const listed = renderFS(reply());
+  expect(listed.entities.every((entity) => entity.type === 'code')).toBe(true);
+  for (const name of names) expect(listed.text).toContain(name.replaceAll('`', ''));
+  await command('/pair revoke 00000000');
+  const revoked = renderFS(reply());
+  expect(revoked.text).toBe(`Revoked ${names[0]}.`);
+  expect(revoked.entities.map((entity) => entity.type)).toEqual(['code']);
 });
 it('refuses group management without revealing or revoking devices', async () => {
   await device('dev_12345678-rest');
@@ -162,58 +211,84 @@ it('refuses group management without revealing or revoking devices', async () =>
   }
   expect(await getDb().get('SELECT revoked_at FROM device_auth_devices')).toEqual({ revoked_at: null });
 });
+it('treats a message flagged as a group as one even when its chat is stored as direct', async () => {
+  await device('dev_12345678-rest');
+  const inGroup = (text: string) =>
+    handlePairCommand({
+      ...event,
+      message: { ...event.message, isGroup: true, content: JSON.stringify({ text, senderId: 'u' }) },
+    });
+  for (const text of ['/pair list', '/pair revoke 12345678']) {
+    await inGroup(text);
+    expect(reply()).toBe('Send /pair list in our direct chat.');
+  }
+  mocks.deliver.mockClear();
+  mocks.dm.mockResolvedValue({ platform_id: 'private', channel_type: 'telegram', instance: 'telegram' });
+  await inGroup('/pair');
+  expect(mocks.deliver.mock.calls[0][0]).toBe('private');
+  expect(mocks.deliver.mock.calls[1][0]).toBe('chat');
+  expect(mocks.deliver.mock.calls[1][2].content.text).toBe('Your pairing link is in our direct chat.');
+  expect(await getDb().get('SELECT revoked_at FROM device_auth_devices')).toEqual({ revoked_at: null });
+});
 it('lists ambiguous names and revokes none', async () => {
   await device('dev_12345678-rest');
   await device('dev_87654321-rest');
   await command('/pair revoke Phone');
-  expect(reply()).toContain('Phone - 12345678 -');
-  expect(reply()).toContain('Phone - 87654321 -');
+  expect(reply()).toContain('`Phone` - 12345678 -');
+  expect(reply()).toContain('`Phone` - 87654321 -');
   expect(await getDb().all('SELECT id FROM device_auth_devices WHERE revoked_at IS NOT NULL')).toEqual([]);
 });
-it.each(['sent', 'missing', 'throw', 'adapter'])('keeps pairing successful when the notice is %s', async (mode) => {
-  const { generateKeyPairSync, sign } = await import('node:crypto');
-  const { Readable } = await import('node:stream');
-  const { handlePair, mintPairingLink } = await import('./pairing.js');
-  const { pairProofText } = await import('../../channels/app/contract.js');
-  const { log } = await import('../../log.js');
-  const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
-  try {
-    const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
-    const spki = publicKey.export({ format: 'der', type: 'spki' }).toString('base64url');
-    const code = (await mintPairingLink('telegram:u', ['a'])).split('#')[1];
-    const name = '\u0000\n\u202e' + 'x'.repeat(70);
-    const body = JSON.stringify({
-      code,
-      publicKey: spki,
-      deviceName: name,
-      proof: sign('sha256', Buffer.from(pairProofText(code, spki)), privateKey).toString('base64url'),
-      app: { version: '1', build: '1', os: 'test' },
-    });
-    mocks.dm.mockResolvedValue(mode === 'missing' ? null : { platform_id: 'private', channel_type: 'telegram' });
-    if (mode === 'throw') mocks.dm.mockRejectedValue(new Error(name));
-    if (mode === 'adapter') mocks.deliver.mockRejectedValue(new Error(name));
-    const req = Object.assign(Readable.from([Buffer.from(body)]), {
-      socket: { remoteAddress: '127.0.0.1' },
-      headers: {},
-    });
-    const res = { writeHead: vi.fn(), end: vi.fn() };
-    await handlePair({ req, res } as unknown as Parameters<typeof handlePair>[0]);
-    expect(res.writeHead).toHaveBeenCalledWith(200, expect.anything());
-    expect(await getDb().get('SELECT revoked_at FROM device_auth_devices')).toEqual({ revoked_at: null });
-    expect(mocks.dm).toHaveBeenCalledWith('telegram:u', { privacySafeLogs: true });
-    if (mode === 'sent') {
-      expect(mocks.deliver.mock.calls[0][0]).toBe('private');
-      expect(reply()).toMatch(
-        new RegExp(
-          `^Device paired: ${'x'.repeat(64)} at \\d{4}-.*Z\\. To revoke, send /pair list, then /pair revoke <id>\\.$`,
-        ),
-      );
-      expect(warn).not.toHaveBeenCalled();
-    } else {
-      expect(warn).toHaveBeenCalledTimes(1);
-      expect(JSON.stringify(warn.mock.calls)).not.toContain('xxxxx');
+it.each(['sent', 'missing', 'throw', 'adapter', 'hanging'])(
+  'keeps pairing successful when the notice is %s',
+  async (mode) => {
+    const { generateKeyPairSync, sign } = await import('node:crypto');
+    const { Readable } = await import('node:stream');
+    const { handlePair, mintPairingLink } = await import('./pairing.js');
+    const { pairProofText } = await import('../../channels/app/contract.js');
+    const { log } = await import('../../log.js');
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    try {
+      const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+      const spki = publicKey.export({ format: 'der', type: 'spki' }).toString('base64url');
+      const code = (await mintPairingLink('telegram:u', ['a'])).split('#')[1];
+      const name = '\u0000\n\u202e' + 'x'.repeat(70);
+      const body = JSON.stringify({
+        code,
+        publicKey: spki,
+        deviceName: name,
+        proof: sign('sha256', Buffer.from(pairProofText(code, spki)), privateKey).toString('base64url'),
+        app: { version: '1', build: '1', os: 'test' },
+      });
+      mocks.dm.mockResolvedValue(mode === 'missing' ? null : { platform_id: 'private', channel_type: 'telegram' });
+      if (mode === 'throw') mocks.dm.mockRejectedValue(new Error(name));
+      if (mode === 'adapter') mocks.deliver.mockRejectedValue(new Error(name));
+      if (mode === 'hanging') mocks.deliver.mockReturnValue(new Promise(() => {}));
+      const req = Object.assign(Readable.from([Buffer.from(body)]), {
+        socket: { remoteAddress: '127.0.0.1' },
+        headers: {},
+      });
+      const res = { writeHead: vi.fn(), end: vi.fn() };
+      // The answer does not wait for the notice: a chat send can retry for minutes.
+      await handlePair({ req, res } as unknown as Parameters<typeof handlePair>[0]);
+      expect(res.writeHead).toHaveBeenCalledWith(200, expect.anything());
+      expect(await getDb().get('SELECT revoked_at FROM device_auth_devices')).toEqual({ revoked_at: null });
+      await vi.waitFor(() => expect(mocks.dm).toHaveBeenCalledWith('telegram:u', { privacySafeLogs: true }));
+      if (mode === 'sent' || mode === 'hanging') {
+        await vi.waitFor(() => expect(mocks.deliver).toHaveBeenCalled());
+        expect(mocks.deliver.mock.calls[0][0]).toBe('private');
+        expect(reply()).toMatch(
+          new RegExp(
+            `^Device paired: \`${'x'.repeat(64)}\` at \\d{4}-.*Z\\. To revoke, send /pair list, then /pair revoke <id>\\.$`,
+          ),
+        );
+        expect(warn).not.toHaveBeenCalled();
+      } else {
+        await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+        expect(warn).toHaveBeenCalledWith('Pairing notice failed', expect.objectContaining({ kind: 'Error' }));
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('xxxxx');
+      }
+    } finally {
+      warn.mockRestore();
     }
-  } finally {
-    warn.mockRestore();
-  }
-});
+  },
+);

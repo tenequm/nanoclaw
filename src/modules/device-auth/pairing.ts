@@ -16,14 +16,33 @@ import type { DeviceRow, PairingCodeRow } from './db.js';
 import { authError, enforceRateLimit, liveDevices, reachableAgentIds, readBody, revokeDevice } from './verify.js';
 import { clientAddress } from './gate.js';
 
+// The pairing client chooses the name and chat channels render markdown, so it goes out as an inline
+// code span: neither entities (`&#x202E;`) nor links or spoilers are decoded inside one.
 function displayName(name: string): string {
-  return Array.from(name.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ''))
+  const plain = Array.from(name.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}`]/gu, ''))
     .slice(0, 64)
-    .join('');
+    .join('')
+    .trim();
+  return plain ? `\`${plain}\`` : 'an unnamed device';
 }
 const shortId = (id: string): string => id.replace(/^dev_/, '').slice(0, 8);
 const deviceLine = (device: DeviceRow): string =>
   `${displayName(device.name)} - ${shortId(device.id)} - ${new Date(device.created_at).toISOString()}`;
+async function sendPairingNotice(userId: string, deviceId: string, name: string, at: number): Promise<void> {
+  try {
+    const dm = await ensureUserDm(userId, { privacySafeLogs: true });
+    const adapter = dm && getChannelAdapterExact(dm.instance ?? dm.channel_type);
+    if (!dm || !adapter) throw new Error('No direct chat');
+    await adapter.deliver(dm.platform_id, null, {
+      kind: 'chat',
+      content: {
+        text: `Device paired: ${displayName(name)} at ${new Date(at).toISOString()}. To revoke, send /pair list, then /pair revoke <id>.`,
+      },
+    });
+  } catch (error) {
+    log.warn('Pairing notice failed', { deviceId, userId, kind: error instanceof Error ? error.name : typeof error });
+  }
+}
 
 export async function mintPairingLink(
   userId: string,
@@ -118,19 +137,6 @@ export const handlePair: AppHandler = async ({ req, res }) => {
       await db.run('INSERT INTO device_auth_device_agents (device_id, agent_group_id) VALUES (?, ?)', deviceId, id);
     return code.user_id;
   });
-  try {
-    const dm = await ensureUserDm(userId, { privacySafeLogs: true });
-    const adapter = dm && getChannelAdapterExact(dm.instance ?? dm.channel_type);
-    if (!dm || !adapter) throw new Error('No direct chat');
-    await adapter.deliver(dm.platform_id, null, {
-      kind: 'chat',
-      content: {
-        text: `Device paired: ${displayName(body.deviceName)} at ${new Date(now).toISOString()}. To revoke, send /pair list, then /pair revoke <id>.`,
-      },
-    });
-  } catch {
-    log.warn('Pairing notice failed', { deviceId, userId });
-  }
   log.info('Device paired', { deviceId, userId, address: clientAddress(req) });
   const agents: { id: string; name: string }[] = [];
   for (const id of await reachableAgentIds(deviceId)) {
@@ -145,6 +151,8 @@ export const handlePair: AppHandler = async ({ req, res }) => {
     protocol: APP_PROTOCOL,
     serverTime: now,
   });
+  // After the answer: a chat send can retry for minutes, and the app gives up on a pairing long before.
+  void sendPairingNotice(userId, deviceId, body.deviceName, now);
 };
 export const handleRevoke: AppHandler = async ({ identity, res }) => {
   await revokeDevice(identity!.deviceId);
@@ -158,27 +166,33 @@ export async function handlePairCommand(event: InboundEvent): Promise<boolean> {
   if (!chat) return true;
   const say = (text: string) =>
     chat.adapter.deliver(event.platformId, chat.threadId, { kind: 'chat', content: { text } });
+  const inGroup = event.message.isGroup ?? chat.mg.is_group === 1;
   if (match[1] || match[2]) {
-    if (chat.mg.is_group !== 0) {
-      await say('Send /pair list in our direct chat.');
-      return true;
-    }
-    const devices = await liveDevices(chat.userId);
-    if (match[1]) {
-      await say(devices.length ? devices.map(deviceLine).join('\n') : 'No paired devices.');
-    } else {
-      const arg = match[2];
-      const matches = devices.filter(
-        (device) => device.id === arg || shortId(device.id) === arg || device.name === arg,
-      );
-      if (matches.length === 1) {
-        await revokeDevice(matches[0].id);
-        await say(`Revoked ${displayName(matches[0].name)}.`);
-      } else if (matches.length === 0) {
-        await say(`No device ${displayName(arg)}. Send /pair list.`);
-      } else {
-        await say(`More than one device matches. Send /pair revoke <id>.\n${matches.map(deviceLine).join('\n')}`);
+    // A sender with no user row can own no device; stay as silent as every other /pair reply to them.
+    if (!(await getUser(chat.userId))) return true;
+    try {
+      if (inGroup) {
+        await say('Send /pair list in our direct chat.');
+        return true;
       }
+      const devices = (await liveDevices(chat.userId)).sort((a, b) => a.created_at - b.created_at);
+      if (match[1]) {
+        await say(devices.length ? devices.map(deviceLine).join('\n') : 'No paired devices.');
+      } else {
+        const arg = match[2];
+        const byId = devices.filter((device) => device.id === arg || shortId(device.id) === arg);
+        const matches = byId.length ? byId : devices.filter((device) => device.name === arg);
+        if (matches.length === 1) {
+          await revokeDevice(matches[0].id);
+          await say(`Revoked ${displayName(matches[0].name)}.`);
+        } else if (matches.length === 0) {
+          await say(`No device ${displayName(arg)}. Send /pair list.`);
+        } else {
+          await say(`More than one device matches. Send /pair revoke <id>.\n${matches.map(deviceLine).join('\n')}`);
+        }
+      }
+    } catch (error) {
+      log.warn('Pairing reply failed', { kind: error instanceof Error ? error.name : typeof error });
     }
     return true;
   }
@@ -194,7 +208,7 @@ export async function handlePairCommand(event: InboundEvent): Promise<boolean> {
   }
   try {
     let destination = { adapter: chat.adapter, platformId: event.platformId, threadId: chat.threadId };
-    if (chat.mg.is_group !== 0) {
+    if (inGroup) {
       const dm = await ensureUserDm(chat.userId, { privacySafeLogs: true, instance: chat.instance });
       const adapter = dm && getChannelAdapterExact(dm.instance ?? dm.channel_type);
       if (!dm || !adapter) {
@@ -212,7 +226,7 @@ export async function handlePairCommand(event: InboundEvent): Promise<boolean> {
       kind: 'chat',
       content: { text: link },
     });
-    if (chat.mg.is_group !== 0) await say('Your pairing link is in our direct chat.');
+    if (inGroup) await say('Your pairing link is in our direct chat.');
   } catch (error) {
     log.warn('Pairing reply failed', { kind: error instanceof Error ? error.name : typeof error });
   }
