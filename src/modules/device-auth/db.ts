@@ -61,6 +61,7 @@ registerMigration({
       CREATE TABLE IF NOT EXISTS device_auth_rate_limits (bucket_key TEXT PRIMARY KEY, count INTEGER NOT NULL, reset_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS device_auth_nonces_idx_0 ON device_auth_nonces (expires_at);
       CREATE INDEX IF NOT EXISTS device_auth_pairing_codes_idx_1 ON device_auth_pairing_codes (expires_at);
+      CREATE INDEX IF NOT EXISTS device_auth_rate_limits_reset_idx ON device_auth_rate_limits (reset_at);
     `);
   },
 });

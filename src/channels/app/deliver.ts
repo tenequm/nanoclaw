@@ -4,7 +4,6 @@ import { normalizeOptions, type RawOption } from '../ask-question.js';
 import { getDb, hasTable } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { getPendingQuestion } from '../../db/sessions.js';
-import { registerMigration } from '../../db/migrations/index.js';
 import { log } from '../../log.js';
 import { isHostWrittenOutbound } from '../../session-manager.js';
 import type { Message, Question } from './contract.js';
@@ -12,16 +11,8 @@ import type { MessageRow } from './db.js';
 import { appTransaction, appendEvent, appHooks } from './log.js';
 import { getConversationByPlatformId, getConversation, messageEntity, itemChanged } from './conversations.js';
 import { saveMessage } from './send.js';
+import { CALLER_MARK, SPOKEN_MARK } from '../voice-mode-livekit.js';
 
-registerMigration({
-  version: 1,
-  name: 'module:app:n2a-applied-sources',
-  async up(db) {
-    await db.exec(
-      'CREATE TABLE IF NOT EXISTS app_applied_sources (source_id TEXT PRIMARY KEY, entity_id TEXT NOT NULL)',
-    );
-  },
-});
 // An app answer goes to the interactive handler only, so a card must not reuse an id a host approval waits on.
 const HOST_APPROVALS = [
   ['pending_approvals', 'approval_id'],
@@ -53,7 +44,11 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
   // Direct host deliveries carry no source; a container's outbox row always does, under an id it chose.
   const hostWritten = !source || isHostWrittenOutbound(source);
   const previous = source
-    ? await db.get<{ entity_id: string }>('SELECT entity_id FROM app_applied_sources WHERE source_id=?', source)
+    ? await db.get<{ entity_id: string }>(
+        'SELECT entity_id FROM app_applied_sources WHERE conversation_id=? AND source_id=?',
+        c.id,
+        source,
+      )
     : undefined;
   if (previous) return previous.entity_id;
   const id = `msg_${randomUUID()}`;
@@ -67,7 +62,8 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
   return appTransaction(async () => {
     if (source) {
       const applied = await db.get<{ entity_id: string }>(
-        'SELECT entity_id FROM app_applied_sources WHERE source_id=?',
+        'SELECT entity_id FROM app_applied_sources WHERE conversation_id=? AND source_id=?',
+        c.id,
         source,
       );
       if (applied) return applied.entity_id;
@@ -81,7 +77,7 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
         c.id,
       );
       row ??= await db.get<MessageRow>(
-        'SELECT m.* FROM app_messages m JOIN app_applied_sources s ON s.entity_id=m.id WHERE s.source_id=? AND m.conversation_id=?',
+        'SELECT m.* FROM app_messages m JOIN app_applied_sources s ON s.entity_id=m.id AND s.conversation_id=m.conversation_id WHERE s.source_id=? AND m.conversation_id=?',
         content.messageId,
         c.id,
       );
@@ -160,7 +156,8 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
           content.type === 'ask_question'
             ? [content.title, content.question].filter(Boolean).join('\n\n')
             : String(content.fallbackText || content.text || card?.description || card?.title || '');
-        if (voice) text = text.replace(/^[\u{1F399}\u{1F50A}]\uFE0F? /u, '');
+        const mark = voice === 'caller' ? CALLER_MARK : SPOKEN_MARK;
+        if (voice && text.startsWith(mark)) text = text.slice(mark.length);
         const replyTo =
           message.inReplyTo &&
           (await db.get(
@@ -195,7 +192,13 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
         entityId = entity.id;
       }
     }
-    if (source) await db.run('INSERT INTO app_applied_sources (source_id,entity_id) VALUES (?,?)', source, entityId);
+    if (source)
+      await db.run(
+        'INSERT INTO app_applied_sources (conversation_id,source_id,entity_id) VALUES (?,?,?)',
+        c.id,
+        source,
+        entityId,
+      );
     return entityId;
   });
 };

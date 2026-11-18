@@ -1,16 +1,8 @@
 import './db.js';
 import { isIPv6 } from 'node:net';
 import { getDb } from '../../db/connection.js';
-import { registerMigration } from '../../db/migrations/index.js';
 import { log } from '../../log.js';
 
-registerMigration({
-  version: 1,
-  name: 'module:device-auth:rate-limit-reset-idx',
-  async up(db) {
-    await db.exec('CREATE INDEX IF NOT EXISTS device_auth_rate_limits_reset_idx ON device_auth_rate_limits (reset_at)');
-  },
-});
 const sweepTimes = new WeakMap<object, number>();
 
 export function rateLimitAddress(address: string): string {
