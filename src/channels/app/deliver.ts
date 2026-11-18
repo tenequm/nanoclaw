@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import type { ChannelAdapter } from '../adapter.js';
 import { normalizeOptions, type RawOption } from '../ask-question.js';
-import { getDb } from '../../db/connection.js';
+import { getDb, hasTable } from '../../db/connection.js';
+import type { DbDriver } from '../../db/driver.js';
 import { getPendingQuestion } from '../../db/sessions.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { log } from '../../log.js';
+import { isHostWrittenOutbound } from '../../session-manager.js';
 import type { Message, Question } from './contract.js';
 import type { MessageRow } from './db.js';
 import { appTransaction, appendEvent, appHooks } from './log.js';
@@ -20,6 +22,17 @@ registerMigration({
     );
   },
 });
+// An app answer goes to the interactive handler only, so a card must not reuse an id a host approval waits on.
+const HOST_APPROVALS = [
+  ['pending_approvals', 'approval_id'],
+  ['pending_sender_approvals', 'id'],
+  ['pending_channel_approvals', 'messaging_group_id'],
+] as const;
+async function heldByHostApproval(db: DbDriver, id: string): Promise<boolean> {
+  for (const [table, column] of HOST_APPROVALS)
+    if ((await hasTable(db, table)) && (await db.get(`SELECT 1 FROM ${table} WHERE ${column}=?`, id))) return true;
+  return false;
+}
 export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, message) => {
   let db;
   try {
@@ -37,6 +50,8 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
     typeof message.content === 'object' && message.content !== null ? message.content : { text: message.content }
   ) as Record<string, unknown>;
   const source = message.sourceId ?? null;
+  // Direct host deliveries carry no source; a container's outbox row always does, under an id it chose.
+  const hostWritten = !source || isHostWrittenOutbound(source);
   const previous = source
     ? await db.get<{ entity_id: string }>('SELECT entity_id FROM app_applied_sources WHERE source_id=?', source)
     : undefined;
@@ -78,7 +93,8 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
         });
         throw new Error('App delivery target unresolved');
       }
-      if (content.operation === 'edit' && row.role === 'user') return undefined;
+      if (content.operation === 'edit' && (row.role === 'user' || (row.role === 'host' && !hostWritten)))
+        return undefined;
       const entity = messageEntity(row);
       if (content.operation === 'edit') {
         entity.text = String(content.text ?? '');
@@ -93,9 +109,14 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
       entityId = entity.id;
     } else {
       const hostCard = [source, content.questionId].some((v) => typeof v === 'string' && /^(hcmd-|appr-)/.test(v));
-      if (content.type === 'ask_question' && !hostCard) {
-        const questionId = String(content.questionId);
-        const pending = await getPendingQuestion(questionId);
+      const questionId = content.type === 'ask_question' && !hostCard ? String(content.questionId) : null;
+      const pending = questionId ? await getPendingQuestion(questionId) : undefined;
+      if (
+        questionId &&
+        pending?.channel_type === 'app' &&
+        pending.platform_id === c.id &&
+        !(await heldByHostApproval(db, questionId))
+      ) {
         const entity: Question = {
           kind: 'question',
           id: `q_${randomUUID()}`,
@@ -121,7 +142,7 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
           entity.order,
           entity.seq,
           source,
-          pending?.session_id ?? '',
+          pending.session_id,
           questionId,
           entity.title,
           entity.text,
@@ -132,16 +153,8 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
         await itemChanged(current, entity, true, availability);
         entityId = entity.id;
       } else {
-        const hostOrigin = !source || source.startsWith('hcmd-');
-        const voice = (content.voice === 'caller' && hostOrigin) || content.voice === 'spoken' ? content.voice : null;
-        const role =
-          voice === 'caller'
-            ? 'user'
-            : voice === 'spoken'
-              ? 'agent'
-              : (content.host === true && hostOrigin) || hostCard || !source
-                ? 'host'
-                : 'agent';
+        const voice = (content.voice === 'caller' && hostWritten) || content.voice === 'spoken' ? content.voice : null;
+        const role = voice === 'caller' ? 'user' : voice === 'spoken' ? 'agent' : hostWritten ? 'host' : 'agent';
         const card = content.card as { description?: string; title?: string } | undefined;
         let text =
           content.type === 'ask_question'

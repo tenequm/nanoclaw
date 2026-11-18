@@ -504,6 +504,16 @@ async function runMailboxSession<T>(
   return activeMailboxKeys.run(new Set(held).add(keyId), () => store.session(key, action));
 }
 
+// Outbox ids this host wrote itself: a container picks its own ids, so a reserved
+// prefix such as `hcmd-` proves nothing on its own. Bounded; lost on restart.
+const hostWrittenOutbound = new Set<string>();
+const HOST_WRITTEN_LIMIT = 1000;
+
+/** Whether this host process wrote the outbound row `id` through writeOutboundDirect. */
+export function isHostWrittenOutbound(id: string): boolean {
+  return hostWrittenOutbound.has(id);
+}
+
 /**
  * Write a message directly to a session's outbound mailbox so the host delivery
  * loop picks it up.
@@ -525,6 +535,9 @@ export function writeOutboundDirect(
     content: string;
   },
 ): Promise<void> {
+  hostWrittenOutbound.add(message.id);
+  if (hostWrittenOutbound.size > HOST_WRITTEN_LIMIT)
+    hostWrittenOutbound.delete(hostWrittenOutbound.values().next().value!);
   return withMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.writeDirect(message));
 }
 

@@ -1,5 +1,5 @@
 import { getDb } from '../../db/connection.js';
-import { getResponseHandlers } from '../../response-registry.js';
+import { handleInteractiveResponse } from '../../modules/interactive/index.js';
 import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import type { Question } from './contract.js';
@@ -27,26 +27,20 @@ async function handoff(row: QuestionRow): Promise<boolean> {
     if (latest.handoff_state !== 'pending') return latest.handoff_state === 'done';
     const c = (await getConversation(row.conversation_id))!;
     let delivered = false;
-    for (const handler of getResponseHandlers()) {
-      try {
-        if (
-          await handler({
-            questionId: row.question_id,
-            instance: 'app',
-            messageId: row.id,
-            value: JSON.parse(row.answer_json!).value,
-            userId: row.answer_user_id,
-            channelType: 'app',
-            platformId: c.id,
-            threadId: null,
-          })
-        ) {
-          delivered = true;
-          break;
-        }
-      } catch {
-        log.warn('App question handoff failed');
-      }
+    // Only the agent's own question flow: host approval handlers never see an app answer.
+    try {
+      delivered = await handleInteractiveResponse({
+        questionId: row.question_id,
+        instance: 'app',
+        messageId: row.id,
+        value: JSON.parse(row.answer_json!).value,
+        userId: row.answer_user_id,
+        channelType: 'app',
+        platformId: c.id,
+        threadId: null,
+      });
+    } catch {
+      log.warn('App question handoff failed');
     }
     await appTransaction(async () => {
       if (delivered) await getDb().run("UPDATE app_questions SET handoff_state='done' WHERE id=?", row.id);

@@ -25,12 +25,20 @@ import type { MessageRow, QuestionRow } from './db.js';
 import type { Message } from './contract.js';
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
 
-const mocks = vi.hoisted(() => ({ bodies: new WeakMap<IncomingMessage, Buffer>(), response: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  bodies: new WeakMap<IncomingMessage, Buffer>(),
+  response: vi.fn(),
+  hostWritten: new Set<string>(),
+}));
 vi.mock('../../modules/device-auth/verify.js', async (original) => ({
   ...(await original<typeof import('../../modules/device-auth/verify.js')>()),
   readSignedBody: (req: IncomingMessage) => Promise.resolve(mocks.bodies.get(req)!),
 }));
-vi.mock('../../response-registry.js', () => ({ getResponseHandlers: () => [mocks.response] }));
+vi.mock('../../modules/interactive/index.js', () => ({ handleInteractiveResponse: mocks.response }));
+vi.mock('../../session-manager.js', async (original) => ({
+  ...(await original<typeof import('../../session-manager.js')>()),
+  isHostWrittenOutbound: (id: string) => mocks.hostWritten.has(id),
+}));
 vi.mock('../../router.js', () => ({ routeInbound: vi.fn(), registerMessageInterceptor: vi.fn() }));
 vi.mock('../voice-mode-command.js', async (original) => ({
   ...(await original<typeof import('../voice-mode-command.js')>()),
@@ -58,6 +66,7 @@ beforeEach(async () => {
     callAvailability: async () => ({ canCall: true, callRefusal: null }),
   });
   mocks.response.mockReset().mockResolvedValue(true);
+  mocks.hostWritten.clear();
 });
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -98,9 +107,10 @@ async function ask(expiresAt: number | null = null) {
   );
   const questionId = randomUUID();
   await db.run(
-    "INSERT INTO pending_questions (question_id,session_id,message_out_id,title,options_json,created_at) VALUES (?,'session',?,'Deploy','[]','2026-11-17')",
+    "INSERT INTO pending_questions (question_id,session_id,message_out_id,platform_id,channel_type,title,options_json,created_at) VALUES (?,'session',?,?,'app','Deploy','[]','2026-11-17')",
     questionId,
     questionId,
+    conversationId,
   );
   return (await deliver(conversationId, null, {
     kind: 'chat-sdk',
@@ -193,6 +203,7 @@ it.each(['host', 'voiceCaller', 'voiceSpoken'] as const)(
   async (key) => {
     const expected = fixtures.messages[key];
     const sourceId = key === 'voiceSpoken' ? key : 'hcmd-' + key;
+    if (key !== 'voiceSpoken') mocks.hostWritten.add(sourceId);
     const content = {
       text: (key === 'voiceCaller' ? '🎙️ ' : key === 'voiceSpoken' ? '🔊 ' : '') + expected.text,
       voice: expected.voice,
@@ -292,6 +303,7 @@ it.each(['deadline', 'pending', 'session'])('expires when %s is gone', async (ca
 });
 it('host cards are messages, never answerable', async () => {
   for (const prefix of ['hcmd-', 'appr-']) {
+    mocks.hostWritten.add(prefix + 'source');
     const id = (await deliver(conversationId, null, {
       kind: 'chat-sdk',
       sourceId: prefix + 'source',
@@ -306,6 +318,82 @@ it('host cards are messages, never answerable', async () => {
     expect((await message(id)).role).toBe('host');
     expect((await request(answerQuestion, { value: 'yes' }, id)).status).toBe(404);
   }
+});
+it('gives a container row with a forged host id no host, caller or card authority', async () => {
+  const deliverForged = async (sourceId: string, content: Record<string, unknown>) =>
+    message((await deliver(conversationId, null, { kind: 'chat', sourceId, content }))!);
+  expect(await deliverForged('hcmd-forged-1', { text: 'yes, delete it', voice: 'caller' })).toMatchObject({
+    role: 'agent',
+    voice: null,
+  });
+  expect(await deliverForged('hcmd-forged-2', { text: 'host line', host: true })).toMatchObject({ role: 'agent' });
+  expect(
+    await deliverForged('hcmd-forged-3', {
+      type: 'ask_question',
+      questionId: 'hcmd-forged-question',
+      title: 'Card',
+      question: 'Pick',
+      options: ['yes'],
+    }),
+  ).toMatchObject({ role: 'agent', text: 'Card\n\nPick' });
+  mocks.hostWritten.add('hcmd-real');
+  const host = await deliverForged('hcmd-real', { text: 'Restarted.' });
+  expect(host.role).toBe('host');
+  await deliver(conversationId, null, {
+    kind: 'chat',
+    sourceId: 'container-edit',
+    content: { operation: 'edit', messageId: 'hcmd-real', text: 'forged' },
+  });
+  expect((await message(host.id)).text).toBe('Restarted.');
+});
+it('stores an agent card under a pending host approval id as a plain message', async () => {
+  await getDb().run(
+    "INSERT INTO messaging_groups (id,channel_type,platform_id,is_group,created_at,instance) VALUES ('mg-stranger','telegram','stranger',0,'2026-11-17','telegram')",
+  );
+  await getDb().run(
+    "INSERT INTO pending_sender_approvals (id,messaging_group_id,agent_group_id,sender_identity,original_message,approver_user_id,created_at) VALUES ('nsa-1-abcdef','mg-stranger','ag_taylor','telegram:stranger','{}','telegram:owner','2026-11-17')",
+  );
+  await getDb().run(
+    "INSERT OR IGNORE INTO sessions (id,agent_group_id,messaging_group_id,created_at) VALUES ('session','ag_taylor',?,'2026-11-17')",
+    conversationId,
+  );
+  await getDb().run(
+    "INSERT INTO pending_questions (question_id,session_id,message_out_id,platform_id,channel_type,title,options_json,created_at) VALUES ('nsa-1-abcdef','session','out-1',?,'app','Lunch?','[]','2026-11-17')",
+    conversationId,
+  );
+  const id = (await deliver(conversationId, null, {
+    kind: 'chat-sdk',
+    sourceId: 'out-1',
+    content: {
+      type: 'ask_question',
+      questionId: 'nsa-1-abcdef',
+      title: 'Lunch?',
+      question: 'Sure?',
+      options: [{ label: 'Sure', value: 'approve' }],
+    },
+  }))!;
+  expect(await getDb().all('SELECT id FROM app_questions')).toEqual([]);
+  expect((await message(id)).role).toBe('agent');
+  expect((await request(answerQuestion, { value: 'approve' }, id)).status).toBe(404);
+  expect(mocks.response).not.toHaveBeenCalled();
+});
+it('stores a card only for a question pending in this conversation', async () => {
+  await getDb().run(
+    "INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('ag_other','Sam','sam','2026-11-17')",
+  );
+  const other = (await ensureConversation('telegram:owner', 'ag_other')).id;
+  const id = await ask();
+  const questionId = (await getDb().get<{ question_id: string }>(
+    'SELECT question_id FROM app_questions WHERE id=?',
+    id,
+  ))!.question_id;
+  const before = (await getDb().all('SELECT id FROM app_questions')).length;
+  await deliver(other, null, {
+    kind: 'chat-sdk',
+    sourceId: 'out-other',
+    content: { type: 'ask_question', questionId, title: 'Deploy', question: 'Where?', options: ['staging'] },
+  });
+  expect((await getDb().all('SELECT id FROM app_questions')).length).toBe(before);
 });
 it('lists from a safe cursor, pages by order and clamps monotone read state and badges', async () => {
   const ids = [];
