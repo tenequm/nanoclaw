@@ -33,29 +33,29 @@ re-extracted from `83dc1e00`. Between `098ed630` and `83dc1e00` the only non-voi
 
 ## Commit plan
 
-| #   | Commit                                                                         | Section                                                            |
-| --- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
-| 0   | `setup: apply <skill>` for each upstream skill the install uses (OneCLI first) | [00](00-upstream-skills.md)                                        |
-| 1   | `feat(core): agent-doc section hooks`                                          | [01](01-core.md)                                                   |
-| 2   | `feat(envelope): message ids, quotes, sender role, reply_to`                   | [01](01-core.md), with runner items from [02](02-runner-typing.md) |
-| 3   | `feat(typing): report turn state, keep typing through tool calls`              | [02](02-runner-typing.md)                                          |
-| 4   | `fix(agent-runner): coalesced results, unclosed blocks, ack nudge, PreCompact` | [02](02-runner-typing.md)                                          |
-| 5   | `feat(agents): per-agent auto-compact window`                                  | [01](01-core.md)                                                   |
-| 6   | `feat(commands): host chat commands`                                           | [03](03-telegram-commands.md)                                      |
-| 7   | `feat(telegram): grammY channel`                                               | [03](03-telegram-commands.md)                                      |
-| 8   | `feat(pond): cross-session recall`                                             | [04](04-pond-container.md)                                         |
-| 9   | `feat(container): fork tools, rules and skills`                                | [04](04-pond-container.md)                                         |
-| 10  | `feat(slack): multi-instance, a2a guard, room membership, onboarding`          | [05](05-slack-jev.md)                                              |
-| 11  | `feat(jev): Jev gate`                                                          | [05](05-slack-jev.md)                                              |
-| 12  | `feat(voice-mode): voice and meet`                                             | [07](07-voice.md)                                                  |
-| 13  | `feat(mailbox): HTTP transport and k8s dev kit`                                | [06](06-mailbox-k8s.md)                                            |
-| 14  | `docs: fork docs and migration guide`                                          | all                                                                |
-| 15  | feat(app): app channel and device auth                                         | [08](08-app.md)                                                    |
+| # | Commit | Section |
+|---|---|---|
+| 0 | `setup: apply <skill>` for each upstream skill the install uses (OneCLI first) | [00](00-upstream-skills.md) |
+| 1 | `feat(core): agent-doc section hooks` | [01](01-core.md) |
+| 2 | `feat(envelope): message ids, quotes, sender role, reply_to` | [01](01-core.md), with runner items from [02](02-runner-typing.md) |
+| 3 | `feat(typing): report turn state, keep typing through tool calls` | [02](02-runner-typing.md) |
+| 4 | `fix(agent-runner): coalesced results, unclosed blocks, ack nudge, PreCompact` | [02](02-runner-typing.md) |
+| 5 | `feat(agents): per-agent auto-compact window` | [01](01-core.md) |
+| 6 | `feat(commands): host chat commands` | [03](03-telegram-commands.md) |
+| 7 | `feat(telegram): grammY channel` | [03](03-telegram-commands.md) |
+| 8 | `feat(pond): cross-session recall` | [04](04-pond-container.md) |
+| 9 | `feat(container): fork tools, rules and skills` | [04](04-pond-container.md) |
+| 10 | `feat(slack): multi-instance, a2a guard, room membership, onboarding` | [05](05-slack-jev.md) |
+| 11 | `feat(jev): Jev gate` | [05](05-slack-jev.md) |
+| 12 | `feat(voice-mode): voice and meet` | [07](07-voice.md) |
+| 13 | `feat(mailbox): HTTP transport and k8s dev kit` | [06](06-mailbox-k8s.md) |
+| 14 | `docs: fork docs and migration guide` | all |
+| 15 | `feat(app): app channel and device auth` | [08](08-app.md) |
 
 Dependencies: 7, 10, 11 and 12 register prose through commit 1's hooks. Commit 12 also needs 7
 (`ES2023` lib for `findLast`) and 11 (the jev-gate exports `/meet` uses). Commit 13 implements the
 mailbox operations added by commits 2 and 3, so it comes after them. Commit 7's `/context` command
-reads commit 5's column. Commit 15 follows 1, 7 and 12.
+reads commit 5's column. Commit 15 follows 1, 2, 6, 7 and 12.
 
 ## Execution plan (minimum wall time)
 
@@ -64,16 +64,16 @@ parallel, each in its own isolated checkout (one worktree of this repo, so lane 
 visible to each other without pushing); an assembler cherry-picks every lane commit into the
 order above.
 
-| Wave | Lane       | Commits                                                                    | Starts when                                    | Executor                 |
-| ---- | ---------- | -------------------------------------------------------------------------- | ---------------------------------------------- | ------------------------ |
-| 0    | foundation | 0, 1, 5                                                                    | now                                            | GPT-6 Astra, high effort |
-| 0    | container  | 8, 9 (then a local `./container/build.sh build` to prove the slim block)   | now                                            | GPT-6 Astra, medium      |
-| 1    | foundation | 2, 3, 4 (one lane: 3 and 4 both edit `poll-loop.ts`)                       | after 1                                        | GPT-6 Astra, high        |
-| 1    | telegram   | 6 (published first so voice can branch), 7, 11                             | after 1 and 5                                  | GPT-6 Astra, high        |
-| 1    | slack      | 10 (the typing hunk lands with 3 at assembly)                              | after 1                                        | GPT-6 Astra, medium      |
-| 2    | mailbox    | 13                                                                         | after 2 and 3                                  | GPT-6 Astra, high        |
-| 2    | voice      | 12 (needs 7's `ES2023` tsconfig and 11's jev-gate exports before its gate) | after foundation (0-5) and telegram's commit 6 | GPT-6 Astra, high        |
-| 3    | assembly   | cherry-pick 0-14 in order, then 14                                         | all lanes done                                 | the driving session      |
+| Wave | Lane | Commits | Starts when | Executor |
+|---|---|---|---|---|
+| 0 | foundation | 0, 1, 5 | now | GPT-6 Astra, high effort |
+| 0 | container | 8, 9 (then a local `./container/build.sh build` to prove the slim block) | now | GPT-6 Astra, medium |
+| 1 | foundation | 2, 3, 4 (one lane: 3 and 4 both edit `poll-loop.ts`) | after 1 | GPT-6 Astra, high |
+| 1 | telegram | 6 (published first so voice can branch), 7, 11 | after 1 and 5 | GPT-6 Astra, high |
+| 1 | slack | 10 (the typing hunk lands with 3 at assembly) | after 1 | GPT-6 Astra, medium |
+| 2 | mailbox | 13 | after 2 and 3 | GPT-6 Astra, high |
+| 2 | voice | 12 (needs 7's `ES2023` tsconfig and 11's jev-gate exports before its gate) | after foundation (0-5) and telegram's commit 6 | GPT-6 Astra, high |
+| 3 | assembly | cherry-pick 0-14 in order, then 14 | all lanes done | the driving session |
 
 Model choice (Artificial Analysis Intelligence Index v5, 2026-11-04): GPT-6 Astra high scores 55
 at 7.7 min per task, against Claude Opus 5.5 high at 52 and 9.3 min; xhigh/max tiers roughly

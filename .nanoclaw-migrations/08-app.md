@@ -1,8 +1,24 @@
 # App channel and device authentication
 
-Covers commit 15, after commits 1 (project-doc hooks), 7 (Telegram and ES2023)
-and 12 (voice). Replay from the completed `feat/app-n6-docs` branch, including the
-integration baseline `082330aa`. This is additive to the existing voice channel.
+Covers commit 15. Source: the fork-`main` commit that squash-merges the app channel PR;
+record its hash here when it lands, and take every `[COPY]` from it in one pass:
+
+```sh
+git checkout <source> -- $(sed -n 's/^- `\(.*\)`: \[COPY\]$/\1/p' .nanoclaw-migrations/08-app.md)
+```
+
+This is additive to the existing voice channel.
+
+Depends on:
+
+- Commit 1: `registerProjectDocSection` (the app formatting section).
+- Commit 2: the `inReplyTo` parameter of the channel delivery interface; `sourceId` is added
+  after it in `delivery.ts` and `channel-registry.ts`.
+- Commit 6: host command replies and cards written through `writeOutboundDirect` under
+  `hcmd-` ids, which the app shows as host lines.
+- Commit 7: the `ES2023` lib (`findLast` in `gate.ts`).
+- Commit 12: the voice adapter, `createCallPage`, the call core's marks and the `/voice`
+  command that the app's calls and picker build on.
 
 ## Shape
 
@@ -74,6 +90,11 @@ and signing helper with their producers.
 - `src/channels/channel-registry.ts`: accept that argument and forward it in the outbound
   object. Keep the existing reply target, instance and file handling.
 - `src/channels/ask-question.ts`: add optional `expiresAt` to `AskQuestionPayload`.
+- `src/session-manager.ts`: `writeOutboundDirect` records each id it writes (bounded, in
+  memory) and `isHostWrittenOutbound(id)` reports it; the app grants host authority only to
+  those rows, since a container chooses its own ids. `src/session-manager.test.ts` asserts it.
+- `src/modules/interactive/index.ts`: export `handleInteractiveResponse`, the only handler an
+  app answer is handed to.
 - `container/agent-runner/src/mcp-tools/interactive.ts`: emit `Date.now() + timeout`
   in the question payload, so the phone uses the runner's actual deadline.
 
@@ -95,8 +116,7 @@ and signing helper with their producers.
   implementation. Refactor TTS/catalog errors through `PickerError`; preserve the
   link route's plain-text errors and give paired callers JSON errors. Allow reading
   defaults without creating a line; create on a valid save only after validation.
-- `src/channels/voice-mode-command.ts`: add stable app error messages; mark app host
-  command/direct replies as host content. Split `createCallPage` into start, resume,
+- `src/channels/voice-mode-command.ts`: add stable app error messages. Split `createCallPage` into start, resume,
   grant and end operations while retaining its page handler. Cache live app grants,
   issue fresh retry tokens, check liveness and cancellation, and retain page refusal
   translation and cleanup. Return the app operations alongside `handle`.
@@ -180,6 +200,9 @@ local-run entries as part of commit 15. This guide and its index row are replay 
 - `src/channels/index.ts`: [MERGE]
 - `src/channels/telegram-grammy/inbound.ts`: [MERGE]
 - `src/channels/voice-mode-command.test.ts`: [MERGE]
+- `src/modules/interactive/index.ts`: [MERGE]
+- `src/session-manager.test.ts`: [MERGE]
+- `src/session-manager.ts`: [MERGE]
 - `src/channels/voice-mode-command.ts`: [MERGE]
 - `src/channels/voice-mode-livekit.test.ts`: [MERGE]
 - `src/channels/voice-mode-livekit.ts`: [MERGE]

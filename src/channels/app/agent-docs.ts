@@ -3,7 +3,7 @@ import { registerProjectDocSection } from '../../project-doc-compose.js';
 
 export function appAgentInstructions(): string {
   return [
-    'Write standard markdown in the Hey Dan app (MarkdownView 4.8.5).',
+    'In the Hey Dan app (destinations labelled `app`), write standard markdown; the Telegram rules do not apply there.',
     '- Headings, bold, italic, nested and task lists, links and quotes render as written.',
     '- Tables scroll sideways: keep them narrow. Use a language on fenced code; inline code works too.',
     '- `$...$` and `$$...$$` render as math and this cannot be turned off.',

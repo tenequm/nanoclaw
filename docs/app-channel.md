@@ -8,20 +8,21 @@ API. Whole messages arrive after a working status, without token streaming.
 
 ## Configuration
 
-| Key                                                          | Purpose                                                                                                              | Advertised feature                                                         |
-| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `APP_PUBLIC_BASE`                                            | Public HTTPS base, such as `https://app.example.com`, used in pairing and push host identity.                        | None by itself.                                                            |
-| `NANOCLAW_ENCRYPTION_KEY`                                    | Host-only encryption key; HKDF-SHA256 derives a separate 32-byte upload-ticket key with info `heydan-app-ticket-v1`. | `files` when the key parses.                                               |
-| `APP_LIVEKIT_URL`                                            | Public WebSocket address returned in app call grants.                                                                | `calls`, `voice-picker` when set.                                          |
-| `APP_APNS_TEAM_ID`                                           | Apple developer team for push signing.                                                                               | `push` with a public base and at least one readable P-256 environment key. |
-| `APP_APNS_TOPIC`                                             | App bundle topic; set this to your application bundle identifier.                                                    | None by itself.                                                            |
-| `APP_APNS_SANDBOX_KEY_ID`, `APP_APNS_SANDBOX_KEY_PATH`       | Sandbox signing key identifier and host-local key file.                                                              | Both required for sandbox credentials.                                     |
-| `APP_APNS_PRODUCTION_KEY_ID`, `APP_APNS_PRODUCTION_KEY_PATH` | Production signing key identifier and host-local key file.                                                           | Both required for production credentials.                                  |
+| Key                                                          | Purpose                                                                                                              | Advertised feature                                                                  |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `APP_PUBLIC_BASE`                                            | Public HTTPS base, such as `https://app.example.com`, used in pairing and push host identity.                        | None by itself.                                                                     |
+| `NANOCLAW_ENCRYPTION_KEY`                                    | Host-only encryption key; HKDF-SHA256 derives a separate 32-byte upload-ticket key with info `heydan-app-ticket-v1`. | `files` when the key parses.                                                        |
+| `APP_LIVEKIT_URL`                                            | Public WebSocket address returned in app call grants.                                                                | `calls`, `voice-picker` when set.                                                   |
+| `APP_APNS_TEAM_ID`                                           | Apple developer team for push signing.                                                                               | `push` with a topic, a public base and at least one readable P-256 environment key. |
+| `APP_APNS_TOPIC`                                             | App bundle topic: your application bundle identifier. No default; push stays off without it.                         | Required for `push`.                                                                |
+| `APP_APNS_SANDBOX_KEY_ID`, `APP_APNS_SANDBOX_KEY_PATH`       | Sandbox signing key identifier and host-local key file.                                                              | Both required for sandbox credentials.                                              |
+| `APP_APNS_PRODUCTION_KEY_ID`, `APP_APNS_PRODUCTION_KEY_PATH` | Production signing key identifier and host-local key file.                                                           | Both required for production credentials.                                           |
 
 `GET /app/hello` returns protocol 1, minimum protocol 1, voice protocol 6, server time in
 milliseconds, and `configuredFeatures`. These are configuration checks, not service health
 probes: a configured call URL does not prove the voice worker is online, and the push
 feature checks the local key but does not probe APNs connectivity. Chat remains usable when voice is offline.
+The host re-reads these settings and the key files at most once a minute.
 Keep signing keys on the host, outside agent containers and source control.
 
 ## Pairing and revocation
@@ -42,7 +43,7 @@ ncl devices revoke --id <device-id>
 
 Both user and agent selection are required when pairing from the CLI. To retire a lost
 phone, list devices, identify the phone and revoke its id. Revocation closes its event
-stream and rejects subsequent signatures and upload tickets.
+stream, ends its calls and rejects subsequent signatures and upload tickets.
 `DELETE /app/devices/me` removes the requesting phone's access.
 
 Requests use `HeyDan-Sig` authorization: protocol, device id, timestamp, fresh nonce, body
@@ -88,12 +89,21 @@ The `/app` gate admits loopback or a peer explicitly trusted by
 `VOICE_MODE_TRUSTED_PROXY_CIDRS` (comma-separated IPv4 or IPv6 CIDRs). There is no
 hard-coded container subnet. Trust configuration is refreshed at most once a minute.
 It must not inherit `VOICE_MODE_ALLOWED_CLIENT_CIDRS`: public app clients are not restricted
-to tailnet addresses. Rate limiting uses the rightmost untrusted `X-Forwarded-For` hop,
-not the client-controlled `Forwarded` header. A trusted network path never replaces device
-signature verification.
+to tailnet addresses. A trusted network path never replaces device signature verification.
 
-The external proxy serves only `/app` and its children, with a 26 MiB request-body cap.
-SSE and uploads need suitable proxy timeouts, without compression or redirects. Configure that boundary in your deployment proxy; the channel does not configure the proxy.
+Rate limits are per client address: 10 `POST /app/pair` and 60 failed signatures per address
+per 10 minutes. The address is the rightmost `X-Forwarded-For` hop outside the trusted list,
+and only when the peer itself is a trusted proxy; the client-controlled `Forwarded` header is
+ignored. List your proxy's own address in `VOICE_MODE_TRUSTED_PROXY_CIDRS`, even a loopback
+one: otherwise every client arrives as the proxy's address and shares one bucket, and ten bad
+pair requests lock out every pairing for 10 minutes.
+
+The trusted list is shared with the voice routes, where a trusted peer with no
+`VOICE_MODE_ALLOWED_CLIENT_CIDRS` admits any client it forwards. So the public proxy must
+forward only `/app` and its children, or the allowed-client list must be set. Give that proxy
+a 26 MiB request-body cap, and timeouts that suit SSE and uploads, without compression or
+redirects. Configure that boundary in your deployment proxy; the channel does not configure
+the proxy.
 
 ## Files, questions and sync
 
