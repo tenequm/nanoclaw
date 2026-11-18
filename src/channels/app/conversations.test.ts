@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -6,6 +9,7 @@ import { getDb, initSqliteTestDb, closeDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { getHostStartCallbacks, stopHostModules } from '../../host-lifecycle.js';
 import { deliver } from './deliver.js';
+import { configureFiles } from './files.js';
 import { CALLER_MARK, SPOKEN_MARK } from '../voice-mode-livekit.js';
 import {
   ensureConversation,
@@ -47,7 +51,10 @@ vi.mock('../voice-mode-command.js', async (original) => ({
   parseVoiceCommand: (text: string) => (/^\s*\/voice(?:@\S*)?(?!\S)/i.test(text) ? {} : null),
 }));
 let conversationId: string;
+let fileRoot: string;
 beforeEach(async () => {
+  fileRoot = mkdtempSync(join(tmpdir(), 'app-conversations-'));
+  configureFiles({ root: fileRoot });
   const db = await initSqliteTestDb();
   await runMigrations(db);
   await db.run(
@@ -73,6 +80,8 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.restoreAllMocks();
   await closeDb();
+  configureFiles();
+  rmSync(fileRoot, { recursive: true, force: true });
 });
 async function request(
   handler: AppHandler,

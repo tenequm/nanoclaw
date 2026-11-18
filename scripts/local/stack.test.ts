@@ -10,6 +10,65 @@ function python(source: string, ...args: string[]): string {
   });
 }
 
+it.each([
+  ['absent', null],
+  ['empty', null],
+  ['nested-empty', null],
+  ['file', 'data'],
+  ['nested-file', 'data'],
+  ['symlink', 'data'],
+  ['dangling-symlink', 'data'],
+  ['nested-symlink', 'data'],
+  ['env', '.env'],
+  ['store', 'store'],
+])('checks disposable checkout data: %s', (scenario, refused) => {
+  const result = JSON.parse(
+    python(`
+import json, tempfile
+from pathlib import Path
+from types import SimpleNamespace
+import stack
+with tempfile.TemporaryDirectory() as tmp:
+    stack.ROOT = root = Path(tmp)
+    stack.STATE = root / 'stack.json'
+    data = root / 'data'
+    scenario = ${JSON.stringify(scenario)}
+    if scenario == 'empty':
+        data.mkdir()
+    elif scenario.startswith('nested-'):
+        (data / 'a' / 'b').mkdir(parents=True)
+        if scenario == 'nested-file':
+            (data / 'a' / 'keep').write_text('keep')
+        if scenario == 'nested-symlink':
+            (data / 'a' / 'link').symlink_to(root / 'missing')
+    elif scenario == 'file':
+        data.write_text('keep')
+    elif scenario in ('symlink', 'dangling-symlink'):
+        target = root / 'target'
+        if scenario == 'symlink':
+            target.mkdir()
+        data.symlink_to(target)
+    elif scenario == 'env':
+        (root / '.env').touch()
+    elif scenario == 'store':
+        (root / 'store').mkdir()
+    before = sorted(str(p.relative_to(root)) for p in root.rglob('*'))
+    def stop(*args):
+        raise RuntimeError('past checkout guard')
+    stack.require = stop
+    try:
+        stack.up(SimpleNamespace(profile='fast', livekit='dev'))
+    except RuntimeError as error:
+        outcome = str(error)
+    after = sorted(str(p.relative_to(root)) for p in root.rglob('*'))
+    print(json.dumps([outcome, data.exists() or data.is_symlink(), before == after]))
+`),
+  ) as [string, boolean, boolean];
+  expect(result[0]).toBe(refused ? `Refusing existing ${refused}; use a disposable checkout` : 'past checkout guard');
+  if (refused) expect(result[2]).toBe(true);
+  else expect(result[1]).toBe(false);
+});
+
 it('seeds the same DM identity that Telegram inbound routes and wires it to the agent', () => {
   const owner = 'telegram:123456789';
   const calls = JSON.parse(

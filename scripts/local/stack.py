@@ -354,11 +354,24 @@ def seed(state):
     result(state, 'seed', 'pass', 'Fresh DB, owner, role, group and DM wiring created; no inbound messages')
 
 
+def remove_empty_data(root):
+    directories = [root]
+    for directory in directories:
+        if directory.is_symlink() or not directory.is_dir():
+            return False
+        directories.extend(directory.iterdir())
+    for directory in reversed(directories):
+        directory.rmdir()
+    return True
+
+
 def up(args):
     if STATE.exists():
         raise RuntimeError('This checkout already has a stack; use just local down')
     for path in ['.env', 'data', 'store']:
         if (ROOT / path).exists() or (ROOT / path).is_symlink():
+            if path == 'data' and remove_empty_data(ROOT / path):
+                continue
             raise RuntimeError(f'Refusing existing {path}; use a disposable checkout')
     livekit = 'cloud' if args.profile == 'full' else args.livekit
     needed = [*VOICE_SECRETS.values(), 'LOCAL_WAKE_MODEL_SHA256', *(CLOUD_SECRETS.values() if livekit == 'cloud' else [])]

@@ -1,6 +1,10 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fixture = vi.hoisted(() => ({
+  root: '',
   runAuth: vi.fn(),
   runInstallCheck: vi.fn(),
   fail: vi.fn(),
@@ -11,6 +15,10 @@ const fixture = vi.hoisted(() => ({
   order: [] as string[],
   opencodeInstalled: true,
 }));
+vi.mock('../src/community-portal/slack-job.js', async (original) => {
+  const actual = await original<typeof import('../src/community-portal/slack-job.js')>();
+  return { ...actual, withSetupLock: (run: () => Promise<unknown>) => actual.withSetupLock(run, fixture.root) };
+});
 vi.mock('./providers/index.js', () => ({}));
 vi.mock('./providers/registry.js', () => {
   const entry = {
@@ -64,6 +72,7 @@ vi.mock('@clack/prompts', () => ({
 }));
 
 beforeEach(() => {
+  fixture.root = mkdtempSync(join(tmpdir(), 'nanoclaw-setup-test-'));
   vi.resetModules();
   vi.clearAllMocks();
   vi.stubEnv('PATH', process.env.PATH);
@@ -89,6 +98,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+  rmSync(fixture.root, { recursive: true, force: true });
 });
 
 describe('setup wizard provider authentication failures', () => {
