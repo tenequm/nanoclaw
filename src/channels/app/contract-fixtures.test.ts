@@ -6,7 +6,7 @@ import { closeDb, createAgentGroup, initDb, runMigrations } from '../../db/index
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
-import type { AgentGroup } from '../../types.js';
+import type { AgentGroup, Session } from '../../types.js';
 import { appAgentInstructions } from './agent-docs.js';
 
 let directory: string;
@@ -105,19 +105,36 @@ vi.mock('../../env.js', async (original) => ({
   envValue: (key: string) => process.env[key],
 }));
 vi.mock('../../router.js', () => ({ routeInbound: vi.fn(), registerMessageInterceptor: vi.fn() }));
-vi.mock('../../response-registry.js', () => ({ getResponseHandlers: () => [async () => true] }));
+vi.mock('../../modules/interactive/index.js', () => ({ handleInteractiveResponse: async () => true }));
+const hostWritten = vi.hoisted(() => new Set<string>());
+const mailbox = vi.hoisted(() => ({ containerState: null as ContainerRecord | null }));
+vi.mock('../../session-manager.js', async (original) => ({
+  ...(await original<typeof import('../../session-manager.js')>()),
+  isHostWrittenOutbound: (id: string) => hostWritten.has(id),
+  // The agent container's turn, as its session mailbox reports it to the status service.
+  withExistingMailboxSession: async (
+    _agentGroupId: string,
+    _sessionId: string,
+    action: (session: { getContainerState(): ContainerRecord | null }) => unknown,
+  ) => action({ getContainerState: () => mailbox.containerState }),
+}));
 
+import type { InboundEvent } from '../adapter.js';
+import { parseIsoTimestamp, type ContainerRecord } from '../../mailbox/model.js';
+import { createVoiceModeLine } from '../../db/voice-mode-lines.js';
+import { mintPairingLink } from '../../modules/device-auth/pairing.js';
 import { createVoiceModeAdapter } from '../voice-mode.js';
+import { CALLER_MARK, SPOKEN_MARK } from '../voice-mode-livekit.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { createServer as createH2Server, type IncomingHttpHeaders } from 'node:http2';
 import { createApnsClient } from './apns.js';
 import { subscribePush } from './push.js';
 import { onEventAppended, readEventsAfter, lastEventSeq } from './log.js';
 import { configureStream } from './stream.js';
-import { stopStatus } from './status.js';
+import { setTyping, stopStatus } from './status.js';
 import type { Status } from './contract.js';
 import { badgeFor, plainPreview } from './conversations.js';
-import { readAppConfig } from './config.js';
+import { readAppConfig, resetAppConfigCache } from './config.js';
 const voiceState = vi.hoisted(() => ({ adapter: undefined as unknown }));
 vi.mock('../voice-mode-chat.js', async (original) => ({
   ...(await original<typeof import('../voice-mode-chat.js')>()),
@@ -128,9 +145,10 @@ vi.mock('../../webhook-server.js', () => ({
   registerWebhookHandler: vi.fn(),
   registerUpgradeHandler: vi.fn(),
 }));
+const sealedStorage = vi.hoisted(() => ({ on: true }));
 vi.mock('../../secret-seal.js', async (original) => ({
   ...(await original<typeof import('../../secret-seal.js')>()),
-  encryptionKey: () => Buffer.alloc(32, 7),
+  encryptionKey: () => (sealedStorage.on ? Buffer.alloc(32, 7) : null),
 }));
 
 // Keep equality strict: only identity, ordering and clock values may vary.
@@ -232,6 +250,10 @@ describe('signed HTTP fixture producers', () => {
     await stopStatus();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
+    resetAppConfigCache();
+    sealedStorage.on = true;
+    mailbox.containerState = null;
+    voiceState.adapter = undefined;
   });
   async function request(method: string, target: string, body?: unknown, authorization?: string) {
     const bytes = Buffer.isBuffer(body) ? body : Buffer.from(body === undefined ? '' : JSON.stringify(body));
@@ -250,6 +272,34 @@ describe('signed HTTP fixture producers', () => {
     const response = await request('GET', `/app/conversations/${conversation}/messages`);
     expect(response.status).toBe(200);
     return response.body.items as Array<Record<string, unknown>>;
+  }
+  async function agentSession(): Promise<Session> {
+    await getDb().run(
+      "INSERT INTO sessions (id,agent_group_id,messaging_group_id,created_at) VALUES ('fixture-session',?,?,'2026-11-17') ON CONFLICT (id) DO NOTHING",
+      agent.id,
+      conversation,
+    );
+    return (await getDb().get<Session>("SELECT * FROM sessions WHERE id = 'fixture-session'"))!;
+  }
+  // Plays the router: the turn is stored in the agent's session, then reported through onStored.
+  async function storeInSession(event: InboundEvent): Promise<void> {
+    event.onStored?.(await agentSession());
+  }
+  async function ask(expiresAt: number) {
+    const q = fixtures.questions.open;
+    const questionId = randomUUID();
+    await getDb().run(
+      "INSERT INTO pending_questions (question_id,session_id,message_out_id,platform_id,channel_type,title,options_json,created_at) VALUES (?,?,?,?,'app','Deploy','[]','2026-11-17')",
+      questionId,
+      (await agentSession()).id,
+      questionId,
+      conversation,
+    );
+    return deliver(conversation, null, {
+      kind: 'chat-sdk',
+      sourceId: randomUUID(),
+      content: { type: 'ask_question', questionId, title: q.title, question: q.text, options: q.options, expiresAt },
+    });
   }
   it('replays seeded fixture frames through signed HTTP dispatch', async () => {
     const frames = fixtures.stream.raw
@@ -332,6 +382,7 @@ describe('signed HTTP fixture producers', () => {
   });
   it('produces the call grant through signed dispatch and the real voice adapter', async () => {
     vi.stubEnv('APP_LIVEKIT_URL', fixtures.callGrant.url);
+    resetAppConfigCache();
     const group = (await getMessagingGroup(conversation))!;
     const adapter = createVoiceModeAdapter({
       publicUrl: base,
@@ -393,6 +444,7 @@ describe('signed HTTP fixture producers', () => {
   });
   it('produces push payload and headers at a local h2c endpoint', async () => {
     vi.stubEnv('APP_PUBLIC_BASE', fixtures.pairLink.host);
+    resetAppConfigCache();
     const keyPath = join(directory, 'apns.p8');
     writeFileSync(
       keyPath,
@@ -465,8 +517,10 @@ describe('signed HTTP fixture producers', () => {
     vi.stubEnv('APP_PUBLIC_BASE', fixtures.pairLink.host);
     vi.stubEnv('APP_LIVEKIT_URL', fixtures.callGrant.url);
     vi.stubEnv('APP_APNS_TEAM_ID', 'fixture-team');
+    vi.stubEnv('APP_APNS_TOPIC', fixtures.pushPayload.headers['apns-topic']);
     vi.stubEnv('APP_APNS_SANDBOX_KEY_ID', 'fixture-key');
     vi.stubEnv('APP_APNS_SANDBOX_KEY_PATH', keyPath);
+    resetAppConfigCache();
     same((await request('GET', '/app/hello')).body, fixtures.hello);
   });
   it('pairs the fixture proof through the real gate and consumes the code once', async () => {
@@ -483,24 +537,54 @@ describe('signed HTTP fixture producers', () => {
     same(paired.body, fixtures.pairResponse);
     expect((await request('POST', '/app/pair', fixtures.pairRequest)).status).toBe(403);
   });
+  it('mints pairing links in the fixture form for the public and local bases', async () => {
+    const { code, host, link, localHost, localLink } = fixtures.pairLink;
+    expect(code).toMatch(/^[A-Za-z0-9]{32}$/);
+    for (const [base, expected] of [
+      [host, link],
+      [localHost, localLink],
+    ]) {
+      vi.stubEnv('APP_PUBLIC_BASE', base);
+      resetAppConfigCache();
+      const minted = await mintPairingLink(user, [agent.id]);
+      const mintedCode = minted.slice(minted.indexOf('#') + 1);
+      expect(mintedCode).toMatch(/^[A-Za-z0-9]{32}$/);
+      expect(minted).toBe(expected.replace(code, mintedCode));
+      expect(
+        await getDb().get(
+          'SELECT user_id FROM device_auth_pairing_codes WHERE code_hash = ?',
+          createHash('sha256').update(mintedCode).digest('hex'),
+        ),
+      ).toEqual({ user_id: user });
+    }
+  });
   it('produces stored, routed and reached snapshots over signed history', async () => {
     const sent = await request('POST', `/app/conversations/${conversation}/messages`, fixtures.sendRequest);
     expect(sent.status).toBe(200);
     same(sent.body, fixtures.sendResponse);
-    await drainRoutingJobs(async () => {});
-    same((await items())[0], fixtures.messages.send.routed);
-    const { setDelivery } = await import('./send.js');
-    await setDelivery(sent.body.message.id, 'reached');
+    same((await items())[0], fixtures.messages.send.stored);
+    let routed: unknown;
+    await drainRoutingJobs(async (event) => {
+      routed = (await items())[0];
+      await storeInSession(event);
+    });
+    same(routed, fixtures.messages.send.routed);
     same((await items())[0], fixtures.messages.send.reached);
   });
   it.each(['agentMarkdown', 'host', 'voiceCaller', 'voiceSpoken'] as const)(
     'produces %s via outbox delivery and signed history',
     async (key) => {
       const expected = fixtures.messages[key];
+      // The shapes production writes: host replies through the host's own outbox write, call
+      // lines delivered directly by the voice channel with their mark and no source.
+      const sourceId =
+        key === 'host' ? `hcmd-reply-${randomUUID()}` : key === 'agentMarkdown' ? randomUUID() : undefined;
+      if (key === 'host') hostWritten.add(sourceId!);
+      const mark = key === 'voiceCaller' ? CALLER_MARK : key === 'voiceSpoken' ? SPOKEN_MARK : '';
       await deliver(conversation, null, {
         kind: 'chat',
-        sourceId: (key === 'host' || key === 'voiceCaller' ? 'hcmd-' : '') + randomUUID(),
-        content: { text: expected.text, voice: expected.voice },
+        sourceId,
+        content: { text: mark + expected.text, ...(expected.voice ? { voice: expected.voice } : {}) },
       });
       same((await items())[0], expected);
     },
@@ -547,31 +631,8 @@ describe('signed HTTP fixture producers', () => {
     same(actual, fixtures.messages.editSequence);
   });
   it('produces open, answered and conflict question fixtures', async () => {
-    const q = fixtures.questions.open;
-    const questionId = randomUUID();
-    await getDb().run(
-      "INSERT INTO sessions (id,agent_group_id,messaging_group_id,created_at) VALUES ('fixture-session',?,?,'2026-11-17')",
-      agent.id,
-      conversation,
-    );
-    await getDb().run(
-      "INSERT INTO pending_questions (question_id,session_id,message_out_id,title,options_json,created_at) VALUES (?,'fixture-session',?,'Deploy','[]','2026-11-17')",
-      questionId,
-      questionId,
-    );
-    const id = await deliver(conversation, null, {
-      kind: 'chat-sdk',
-      sourceId: randomUUID(),
-      content: {
-        type: 'ask_question',
-        questionId,
-        title: q.title,
-        question: q.text,
-        options: q.options,
-        expiresAt: Date.now() + 300000,
-      },
-    });
-    same((await items())[0], q);
+    const id = await ask(Date.now() + 300000);
+    same((await items())[0], fixtures.questions.open);
     const answered = await request('POST', `/app/questions/${id}/answer`, fixtures.answerRequest);
     expect(answered.status).toBe(200);
     same(answered.body, fixtures.answerResponse);
@@ -622,6 +683,148 @@ describe('signed HTTP fixture producers', () => {
     await request('DELETE', '/app/devices/me');
     same(await request('GET', '/app/conversations'), fixtures.errors.deviceRevoked);
   });
+  it('produces the list, history page, file message, statuses and call refusal over signed dispatch', async () => {
+    // Calls are up and the fixture agent has its line; with sealed storage off the second agent
+    // cannot get one, which is the fixture's call refusal.
+    vi.stubEnv('APP_LIVEKIT_URL', fixtures.callGrant.url);
+    resetAppConfigCache();
+    voiceState.adapter = { isConnected: () => true };
+    await createVoiceModeLine(
+      { agentGroupId: agent.id, ownerUserId: user, messagingGroupId: conversation, threadId: null },
+      Buffer.alloc(32, 7),
+    );
+    sealedStorage.on = false;
+    const refused = fixtures.conversationCallRefused;
+    await createAgentGroup({
+      id: refused.agent.id,
+      name: refused.agent.name,
+      folder: 'fixture-second-agent',
+      agent_provider: null,
+      created_at: '2026-11-17',
+    });
+    await getDb().run('INSERT INTO device_auth_user_agents VALUES (?,?,?)', user, refused.agent.id, Date.now());
+    await getDb().run('INSERT INTO device_auth_device_agents VALUES (?,?)', device, refused.agent.id);
+    type ListBody = {
+      conversations: Array<{ id: string; readOrder: number }>;
+      statuses: Array<{ conversationId: string }>;
+    };
+    const list = async (): Promise<ListBody> => {
+      const response = await request('GET', '/app/conversations');
+      expect(response.status).toBe(200);
+      return response.body;
+    };
+    const statusOf = (body: ListBody) => body.statuses.find((s) => s.conversationId === conversation);
+    const send = (body: unknown) => request('POST', `/app/conversations/${conversation}/messages`, body);
+    await list();
+
+    const withFile = fixtures.messages.userWithFile;
+    const minted = await request('POST', '/app/files', fixtures.fileInitRequest);
+    expect(
+      (
+        await request(
+          'PUT',
+          minted.body.uploadPath,
+          Buffer.from(fixtures.fileUpload.bodyUtf8),
+          `HeyDan-Ticket ${minted.body.ticket}`,
+        )
+      ).status,
+    ).toBe(fixtures.fileUpload.successStatus);
+    const fileIds = [minted.body.fileId];
+    const sent = await send({ clientId: withFile.clientId, text: withFile.text, fileIds });
+    expect(sent.status).toBe(200);
+    same(await send({ clientId: randomUUID(), text: withFile.text, fileIds }), fixtures.errors.badFile);
+    same(await send({ clientId: withFile.clientId, text: 'Changed', fileIds }), fixtures.errors.clientIdConflict);
+    await drainRoutingJobs(storeInSession);
+    const fileMessage = (await items()).find((item) => item.id === sent.body.message.id)!;
+    same(fileMessage, withFile);
+    const readFile = await request('POST', `/app/conversations/${conversation}/read`, { order: fileMessage.order });
+    expect(readFile.status).toBe(200);
+
+    const page = {
+      ...fixtures.historyPage,
+      items: fixtures.historyPage.items.filter((item) => item.id !== fixtures.messages.future.id),
+    };
+    expect((await send(fixtures.sendRequest)).status).toBe(200);
+    await drainRoutingJobs(storeInSession);
+    await deliver(conversation, null, { kind: 'chat', sourceId: randomUUID(), content: { text: page.items[1].text } });
+    const question = await ask(Date.now() + 300000);
+    same(statusOf(await list()), fixtures.statuses.waiting);
+    expect((await request('POST', `/app/questions/${question}/answer`, fixtures.answerRequest)).status).toBe(200);
+    same(statusOf(await list()), fixtures.statuses.idle);
+    const [draft, edited, reacted] = fixtures.messages.editSequence;
+    const draftId = await deliver(conversation, null, {
+      kind: 'chat',
+      sourceId: randomUUID(),
+      content: { text: draft.text },
+    });
+    // Reacting before the edit leaves the edit's conversation event last in the log, as the fixture list has it.
+    await deliver(conversation, null, {
+      kind: 'chat',
+      sourceId: randomUUID(),
+      content: { operation: 'reaction', messageId: draftId, emoji: reacted.reactions[0].emoji },
+    });
+    await deliver(conversation, null, {
+      kind: 'chat',
+      sourceId: randomUUID(),
+      content: { operation: 'edit', messageId: draftId, text: edited.text },
+    });
+    const now = parseIsoTimestamp(new Date().toISOString());
+    mailbox.containerState = {
+      currentTool: 'Bash',
+      toolDeclaredTimeoutMs: null,
+      toolStartedAt: now,
+      turn: 'working',
+      updatedAt: now,
+    };
+    await setTyping(conversation, null);
+
+    const listed = await list();
+    const own = listed.conversations.find((c) => c.id === conversation)!;
+    same({ ...listed, conversations: [own], statuses: [statusOf(listed)] }, fixtures.conversations);
+    same(
+      listed.conversations.find((c) => c.id !== conversation),
+      refused,
+    );
+    const history = await request('GET', `/app/conversations/${conversation}/messages?after=${own.readOrder}`);
+    expect(history.status).toBe(200);
+    same(history.body, page);
+    const readItem = page.items.findIndex((item) => item.order === fixtures.readRequest.order);
+    const read = await request('POST', `/app/conversations/${conversation}/read`, {
+      ...fixtures.readRequest,
+      order: history.body.items[readItem].order,
+    });
+    expect(read.status).toBe(200);
+    same(read.body, fixtures.readResponse);
+  });
+  it('returns command, expired-question and rate-limit refusals from actual dispatch', async () => {
+    const send = (text: string) =>
+      request('POST', `/app/conversations/${conversation}/messages`, { clientId: randomUUID(), text, fileIds: [] });
+    same(await send('/voice'), fixtures.errors.useCallScreen);
+    same(await send('/pair'), fixtures.errors.usePairingScreen);
+
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const question = await ask(now + 300000);
+    clock.mockReturnValue((now += 300000));
+    const expired = await request('POST', `/app/questions/${question}/answer`, fixtures.answerRequest);
+    expect(expired.status).toBe(409);
+    same(expired.body.question, fixtures.questions.expired);
+
+    // Sixty failed authentications fill the address's ten-minute bucket; the next one, with 30 s
+    // of that window left, is refused with the fixture's wait.
+    for (let i = 0; i < 60; i++)
+      expect((await request('GET', '/app/conversations', undefined, 'invalid')).status).toBe(401);
+    clock.mockReturnValue(now + 570000);
+    const limited = await fetch(base + '/app/conversations', { headers: { authorization: 'invalid' } });
+    same(
+      {
+        status: limited.status,
+        headers: { 'Retry-After': limited.headers.get('retry-after') },
+        body: await limited.json(),
+      },
+      fixtures.errors.rateLimited,
+    );
+  });
 });
 
 const fixtureChecks: Array<{ keys: string[]; file: string; test: string }> = [
@@ -633,7 +836,12 @@ const fixtureChecks: Array<{ keys: string[]; file: string; test: string }> = [
   { keys: ['pairProofText', 'pairProofTampered'], file: 'contract.test.ts', test: 'pair proof and tampered proof' },
   { keys: ['hello'], file: 'contract-fixtures.test.ts', test: 'produces the fully configured hello fixture' },
   {
-    keys: ['pairLink', 'pairRequest', 'pairResponse'],
+    keys: ['pairLink'],
+    file: 'contract-fixtures.test.ts',
+    test: 'mints pairing links in the fixture form for the public and local bases',
+  },
+  {
+    keys: ['pairRequest', 'pairResponse'],
     file: 'contract-fixtures.test.ts',
     test: 'pairs the fixture proof through the real gate and consumes the code once',
   },
@@ -646,6 +854,11 @@ const fixtureChecks: Array<{ keys: string[]; file: string; test: string }> = [
     keys: ['messages.agentMarkdown', 'messages.host', 'messages.voiceCaller', 'messages.voiceSpoken'],
     file: 'contract-fixtures.test.ts',
     test: 'produces %s via outbox delivery and signed history',
+  },
+  {
+    keys: ['messages.agentWithFiles'],
+    file: 'contract-fixtures.test.ts',
+    test: 'produces attachment metadata from real outbound bytes',
   },
   {
     keys: ['messages.editSequence'],
@@ -675,34 +888,51 @@ const fixtureChecks: Array<{ keys: string[]; file: string; test: string }> = [
     test: 'returns fixture signature errors from actual dispatch',
   },
   {
+    keys: [
+      'conversations',
+      'conversationCallRefused',
+      'historyPage',
+      'readRequest',
+      'readResponse',
+      'messages.userWithFile',
+      'statuses.working',
+      'statuses.waiting',
+      'statuses.idle',
+      'errors.badFile',
+      'errors.clientIdConflict',
+    ],
+    file: 'contract-fixtures.test.ts',
+    test: 'produces the list, history page, file message, statuses and call refusal over signed dispatch',
+  },
+  {
+    keys: ['errors.useCallScreen', 'errors.usePairingScreen', 'questions.expired', 'errors.rateLimited'],
+    file: 'contract-fixtures.test.ts',
+    test: 'returns command, expired-question and rate-limit refusals from actual dispatch',
+  },
+  {
+    keys: ['callRequest', 'callGrant', 'callEndRequest', 'callCancelRequest'],
+    file: 'contract-fixtures.test.ts',
+    test: 'produces the call grant through signed dispatch and the real voice adapter',
+  },
+  {
+    keys: ['pushPayload'],
+    file: 'contract-fixtures.test.ts',
+    test: 'produces push payload and headers at a local h2c endpoint',
+  },
+  {
     keys: ['errors.badBody'],
     file: '../../modules/device-auth/verify.test.ts',
     test: 'rejects altered and oversized bodies before reading oversized content length',
   },
   {
-    keys: ['errors.badProof', 'errors.invalidCode', 'errors.rateLimited'],
+    keys: ['errors.badProof', 'errors.invalidCode'],
     file: '../../modules/device-auth/verify.test.ts',
     test: 'rejects tampered proof, expired code and excess pairing attempts',
-  },
-  {
-    keys: ['errors.forbidden', 'errors.notFound', 'errors.useCallScreen', 'errors.usePairingScreen'],
-    file: 'n2a.test.ts',
-    test: 'refuses commands without storing and distinguishes ownership from access',
-  },
-  {
-    keys: ['errors.clientIdConflict'],
-    file: 'n2a.test.ts',
-    test: 'sends once even when the retry names consumed files, and conflicts on changed content',
   },
   {
     keys: ['errors.answerNotDelivered'],
     file: 'n2a.test.ts',
     test: 'undoes failed answer handoff and returns the fixture error',
-  },
-  {
-    keys: ['errors.badFile', 'messages.userWithFile'],
-    file: 'files.test.ts',
-    test: 'userWithFile: rejects badFile, claims atomically and stages independent copies',
   },
   {
     keys: ['errors.tooLarge', 'errors.lengthRequired', 'errors.uploadConflict'],
@@ -720,42 +950,30 @@ const fixtureChecks: Array<{ keys: string[]; file: string; test: string }> = [
     test: 'fileInitResponse and fileTicketRenewResponse: lost mint and upload answers are retryable',
   },
   {
-    keys: ['messages.agentWithFiles'],
-    file: 'files.test.ts',
-    test: 'agentWithFiles: detects PNG and PDF bytes and retains sent files during cleanup',
-  },
-  {
     keys: ['messages.userFailed', 'messages.userUnknown'],
     file: 'n2a.test.ts',
-    test: 'routing handles %s without replay',
+    test: 'matches delivery error fixture %s',
   },
-  { keys: ['questions.expired'], file: 'n2a.test.ts', test: 'expires when %s is gone' },
   { keys: ['questions.noDeadline'], file: 'n2a.test.ts', test: 'questions normalize options and keep a null deadline' },
-  {
-    keys: ['conversations', 'historyPage', 'readRequest', 'readResponse'],
-    file: 'n2a.test.ts',
-    test: 'matches send, list, history and read response fixture shapes',
-  },
-  {
-    keys: ['statuses.working', 'statuses.waiting', 'statuses.idle'],
-    file: 'status.test.ts',
-    test: 'persists revisions across restart, maps ticks, prioritizes questions and expires stale working',
-  },
   {
     keys: ['stream', 'messages.future'],
     file: 'stream.test.ts',
     test: 'matches the complete fixture byte for byte, including unknown kinds, badge and pings',
   },
   {
-    keys: ['callRequest', 'callGrant', 'callEndRequest', 'callErrors.stopped'],
+    keys: ['callErrors.stopped'],
     file: 'calls.test.ts',
     test: 'opens once concurrently, retries with a fresh token and ends idempotently',
   },
-  { keys: ['callCancelRequest'], file: 'calls.test.ts', test: 'cancels during room setup and before a late start' },
   {
-    keys: ['callErrors.protocol', 'callErrors.room'],
+    keys: ['callErrors.protocol', 'callErrors.room', 'errors.forbidden'],
     file: 'calls.test.ts',
     test: 'enforces protocol, device scope, ownership, and room failures',
+  },
+  {
+    keys: ['errors.notFound'],
+    file: 'calls.test.ts',
+    test: 'refuses to end or cancel a call on an agent the device does not reach',
   },
   { keys: ['callErrors.limit'], file: 'calls.test.ts', test: 'does not rebind on a limit refusal' },
   {
@@ -774,16 +992,10 @@ const fixtureChecks: Array<{ keys: string[]; file: string; test: string }> = [
     test: 'shapes picker provider and query errors for paired clients',
   },
   {
-    keys: ['conversationCallRefused'],
-    file: 'contract.test.ts',
-    test: 'conversation list and call-refused example remain separate',
-  },
-  {
     keys: ['pushTokenRequest'],
     file: 'push.test.ts',
     test: 'stores the fixture, transfers duplicate tokens atomically and accepts simulator lengths',
   },
-  { keys: ['pushPayload'], file: 'push.test.ts', test: 'pushes the fixture to eligible devices with their own badges' },
   {
     keys: ['errors.futureError'],
     file: 'contract-fixtures.test.ts',
