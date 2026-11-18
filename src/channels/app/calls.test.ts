@@ -409,6 +409,17 @@ it('refuses another owner and stops the failed opening attempt', async () => {
   expect(await getDb().get('SELECT state FROM app_call_attempts')).toEqual({ state: 'stopped' });
   expect(rooms).toBe(0);
 });
+it('refuses to end or cancel a call on an agent the device does not reach', async () => {
+  const started = await request(handlers.startCall, requestBody);
+  expect(await request(handlers.endCall, {}, { callId: started.body.callId }, [])).toMatchObject(
+    fixtures.errors.notFound,
+  );
+  expect(await request(handlers.cancelCallAttempt, {}, { attemptId: requestBody.attemptId }, [])).toMatchObject(
+    fixtures.errors.notFound,
+  );
+  const { getDb } = await import('../../db/connection.js');
+  expect(await getDb().get('SELECT state FROM app_call_attempts')).toEqual({ state: 'live' });
+});
 it('hides real conversations and calls owned by another user', async () => {
   const started = await request(handlers.startCall, requestBody);
   const { getDb } = await import('../../db/connection.js');

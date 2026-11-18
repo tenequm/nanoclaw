@@ -144,6 +144,11 @@ export function createCallHandlers(deps: CallDeps) {
         }),
       );
   });
+  // End and cancel name an attempt by id: the device must still reach that call's agent.
+  const deviceReaches = async (ctx: AppRequest, row: CallAttemptRow) => {
+    const c = row.conversation_id ? await deps.getConversation(row.conversation_id) : undefined;
+    return !c || ctx.identity!.agentIds.includes(c.agent_group_id);
+  };
   const startCall = guarded(async (ctx) => {
     const body = await signedObject(ctx);
     const jev = body.jev ?? null;
@@ -169,6 +174,7 @@ export function createCallHandlers(deps: CallDeps) {
     const key = JSON.stringify([userId, id]);
     const pending = opening.get(key);
     if (pending) await pending.catch(() => undefined);
+    let opened: { platform: string; callId: string } | undefined;
     const run = async () => {
       const now = Date.now();
       const inserted = await getDb().run(
@@ -220,6 +226,7 @@ export function createCallHandlers(deps: CallDeps) {
         const error = result.error.replaceAll('-', '_');
         throw new AppCallError(result.error === 'no-line' ? 403 : result.error === 'room' ? 502 : 409, error);
       }
+      opened = { platform, callId: result.grant.callId };
       await getDb().run(
         "UPDATE app_call_attempts SET call_id = ?, state = CASE WHEN state = 'opening' THEN 'live' ELSE state END, updated_at = ? WHERE user_id = ? AND attempt_id = ?",
         result.grant.callId,
@@ -242,6 +249,8 @@ export function createCallHandlers(deps: CallDeps) {
         id,
         c.id,
       );
+      // A call that opened but could not be recorded has no id the app can end it by.
+      if (opened) await voice.endAppCall(opened.platform, opened.callId, 'call setup failed').catch(() => undefined);
       throw err;
     });
     opening.set(key, work);
@@ -259,7 +268,7 @@ export function createCallHandlers(deps: CallDeps) {
       ctx.identity!.userId,
       ctx.params.callId,
     );
-    if (!row) throw new AppCallError(404, 'not_found');
+    if (!row || !(await deviceReaches(ctx, row))) throw new AppCallError(404, 'not_found');
     if (row.state !== 'stopped') {
       await getDb().run(
         "UPDATE app_call_attempts SET state = 'stopped', reason = ?, updated_at = ? WHERE user_id = ? AND attempt_id = ?",
@@ -277,6 +286,8 @@ export function createCallHandlers(deps: CallDeps) {
     const body = await signedObject(ctx);
     if (!uuid(ctx.params.attemptId)) throw new AppCallError(400, 'bad_request');
     const { userId, deviceId } = ctx.identity!;
+    const existing = await attempt(userId, ctx.params.attemptId);
+    if (existing && !(await deviceReaches(ctx, existing))) throw new AppCallError(404, 'not_found');
     const now = Date.now();
     await getDb().run(
       `INSERT INTO app_call_attempts (user_id, attempt_id, device_id, state, reason, created_at, updated_at)
