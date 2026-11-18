@@ -1328,8 +1328,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('deletes the room of a call that was replaced while it was connecting', async () => {
     let release!: () => void;
     h.lk.createGate = new Promise((r) => (release = r));
+    const create = vi.spyOn(h.lk, 'createRoom');
     const first = post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
-    await settle();
+    await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
     // A newer call takes the line while the room is still being created.
     h.lk.createGate = null;
     const second = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
