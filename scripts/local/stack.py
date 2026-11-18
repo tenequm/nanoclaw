@@ -587,7 +587,7 @@ def client(args):
     if args.chain and 'ca' not in state:
         raise RuntimeError('Start the local stack with --chain first')
     base = state['url'] if args.chain else f"http://127.0.0.1:{state['base']}"
-    env = clean_env() | {'LOCAL_RUN_DIR': state['run'], 'LOCAL_OWNER_ID': state['owner']}
+    env = clean_env() | {'LOCAL_RUN_DIR': state['run']}
     if args.chain:
         env['NODE_EXTRA_CA_CERTS'] = state['ca']
     run(NODE + ['pnpm', 'exec', 'tsx', 'scripts/app-client.ts', args.scenario,

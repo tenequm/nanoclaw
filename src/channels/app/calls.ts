@@ -1,18 +1,17 @@
-import { getConversation } from './conversations.js';
+import { getConversation, requestBody } from './conversations.js';
 import { setAppHooks } from './log.js';
 import { getDb } from '../../db/connection.js';
 import { bindVoiceModeLineChat, createVoiceModeLine, getVoiceModeLineForAgent } from '../../db/voice-mode-lines.js';
 import { hasAdminPrivilege } from '../../modules/permissions/db/user-roles.js';
 import { encryptionKey } from '../../secret-seal.js';
 import { JEV_API_KEY } from '../../config.js';
-import { onDeviceRevoked, readSignedBody } from '../../modules/device-auth/verify.js';
+import { onDeviceRevoked } from '../../modules/device-auth/verify.js';
 import { log } from '../../log.js';
 import { liveVoiceAdapter } from '../voice-mode-chat.js';
 import { appVoiceErrorMessages as messages, lineRunsJev } from '../voice-mode-command.js';
 import { linePlatformId } from '../voice-mode-line.js';
 import { LIVEKIT_PROTOCOL_VERSION } from '../voice-mode-protocol.js';
 import { appConfig } from './config.js';
-import { parseAuthorization } from './contract.js';
 import type { CallAttemptRow, ConversationRow } from './db.js';
 import { json, type AppHandler, type AppRequest } from './routes.js';
 
@@ -44,18 +43,6 @@ export const guarded =
       json(ctx.res, err.status, { error: err.error, message: err.message });
     }
   };
-export async function signedObject(ctx: AppRequest): Promise<Record<string, unknown>> {
-  const auth = parseAuthorization(ctx.req.headers.authorization);
-  if (!auth || !ctx.identity) throw new AppCallError(401, 'bad_signature');
-  const bytes = await readSignedBody(ctx.req, auth.bodyHash, 4096);
-  try {
-    const value: unknown = JSON.parse(bytes.toString('utf8'));
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
-    return value as Record<string, unknown>;
-  } catch {
-    throw new AppCallError(400, 'bad_request');
-  }
-}
 export async function conversationFor(ctx: AppRequest, id: string, deps: CallDeps, picker = false) {
   if (!ctx.identity) throw new AppCallError(401, 'bad_signature');
   const c = await deps.getConversation(id);
@@ -150,7 +137,7 @@ export function createCallHandlers(deps: CallDeps) {
     return !c || ctx.identity!.agentIds.includes(c.agent_group_id);
   };
   const startCall = guarded(async (ctx) => {
-    const body = await signedObject(ctx);
+    const body = await requestBody(ctx, 4096);
     const jev = body.jev ?? null;
     if (
       typeof body.conversationId !== 'string' ||
@@ -261,7 +248,7 @@ export function createCallHandlers(deps: CallDeps) {
     }
   });
   const endCall = guarded(async (ctx) => {
-    const body = await signedObject(ctx);
+    const body = await requestBody(ctx, 4096);
 
     const row = await getDb().get<CallAttemptRow>(
       'SELECT * FROM app_call_attempts WHERE user_id = ? AND call_id = ?',
@@ -283,7 +270,7 @@ export function createCallHandlers(deps: CallDeps) {
     ctx.res.end();
   });
   const cancelCallAttempt = guarded(async (ctx) => {
-    const body = await signedObject(ctx);
+    const body = await requestBody(ctx, 4096);
     if (!uuid(ctx.params.attemptId)) throw new AppCallError(400, 'bad_request');
     const { userId, deviceId } = ctx.identity!;
     const existing = await attempt(userId, ctx.params.attemptId);

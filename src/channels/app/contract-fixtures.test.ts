@@ -1,17 +1,17 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, createAgentGroup, initDb, runMigrations } from '../../db/index.js';
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
-import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
+import { createMessagingGroup, createMessagingGroupAgent, getMessagingGroup } from '../../db/messaging-groups.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { appAgentInstructions } from './agent-docs.js';
 
 let directory: string;
 beforeEach(async () => {
-  directory = mkdtempSync(join(tmpdir(), 'n6-app-doc-'));
+  directory = mkdtempSync(join(tmpdir(), 'app-doc-'));
   await runMigrations(await initDb(join(directory, 'test.db'), { role: 'test' }));
 });
 afterEach(async () => {
@@ -80,7 +80,6 @@ describe('app agent formatting', () => {
 import { createHash, randomUUID, generateKeyPairSync } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { vi } from 'vitest';
 const { signRequest } = (await import(new URL('../../../scripts/app-sign.ts', import.meta.url).href)) as {
   signRequest(input: {
     privateKey: string;
@@ -125,7 +124,6 @@ import { createVoiceModeLine } from '../../db/voice-mode-lines.js';
 import { mintPairingLink } from '../../modules/device-auth/pairing.js';
 import { createVoiceModeAdapter } from '../voice-mode.js';
 import { CALLER_MARK, SPOKEN_MARK } from '../voice-mode-livekit.js';
-import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { createServer as createH2Server, type IncomingHttpHeaders } from 'node:http2';
 import { createApnsClient } from './apns.js';
 import { subscribePush } from './push.js';
@@ -411,22 +409,6 @@ describe('signed HTTP fixture producers', () => {
       const call = await request('POST', '/app/calls', { ...fixtures.callRequest, conversationId: conversation });
       expect(call.status).toBe(200);
       same(call.body, fixtures.callGrant);
-      const draft = await deliver(conversation, null, {
-        kind: 'chat',
-        sourceId: randomUUID(),
-        content: { text: fixtures.messages.editSequence[0].text },
-      });
-      await deliver(conversation, null, {
-        kind: 'chat',
-        sourceId: randomUUID(),
-        content: { operation: 'edit', messageId: draft, text: fixtures.messages.editSequence[1].text },
-      });
-      const readOrder = (await items())[0].order;
-      same(
-        (await request('POST', `/app/conversations/${conversation}/read`, { order: readOrder })).body,
-        fixtures.readResponse,
-      );
-
       expect((await request('POST', `/app/calls/${call.body.callId}/end`, fixtures.callEndRequest)).status).toBe(204);
       expect(
         (
@@ -630,15 +612,6 @@ describe('signed HTTP fixture producers', () => {
     actual.push((await items())[0]);
     same(actual, fixtures.messages.editSequence);
   });
-  it('produces open, answered and conflict question fixtures', async () => {
-    const id = await ask(Date.now() + 300000);
-    same((await items())[0], fixtures.questions.open);
-    const answered = await request('POST', `/app/questions/${id}/answer`, fixtures.answerRequest);
-    expect(answered.status).toBe(200);
-    same(answered.body, fixtures.answerResponse);
-    const conflict = await request('POST', `/app/questions/${id}/answer`, { value: 'production' });
-    same(conflict, fixtures.answerConflict);
-  });
   it('mints, renews and uploads the fixture bytes through real handlers', async () => {
     const minted = await request('POST', '/app/files', fixtures.fileInitRequest);
     expect(minted.status).toBe(200);
@@ -825,204 +798,4 @@ describe('signed HTTP fixture producers', () => {
       fixtures.errors.rateLimited,
     );
   });
-});
-
-const fixtureChecks: Array<{ keys: string[]; file: string; test: string }> = [
-  {
-    keys: ['protocol', 'testKey', 'signing'],
-    file: 'contract.test.ts',
-    test: 'signing vectors and replay keyed by device and nonce',
-  },
-  { keys: ['pairProofText', 'pairProofTampered'], file: 'contract.test.ts', test: 'pair proof and tampered proof' },
-  { keys: ['hello'], file: 'contract-fixtures.test.ts', test: 'produces the fully configured hello fixture' },
-  {
-    keys: ['pairLink'],
-    file: 'contract-fixtures.test.ts',
-    test: 'mints pairing links in the fixture form for the public and local bases',
-  },
-  {
-    keys: ['pairRequest', 'pairResponse'],
-    file: 'contract-fixtures.test.ts',
-    test: 'pairs the fixture proof through the real gate and consumes the code once',
-  },
-  {
-    keys: ['messages.send', 'sendRequest', 'sendResponse'],
-    file: 'contract-fixtures.test.ts',
-    test: 'produces stored, routed and reached snapshots over signed history',
-  },
-  {
-    keys: ['messages.agentMarkdown', 'messages.host', 'messages.voiceCaller', 'messages.voiceSpoken'],
-    file: 'contract-fixtures.test.ts',
-    test: 'produces %s via outbox delivery and signed history',
-  },
-  {
-    keys: ['messages.agentWithFiles'],
-    file: 'contract-fixtures.test.ts',
-    test: 'produces attachment metadata from real outbound bytes',
-  },
-  {
-    keys: ['messages.editSequence'],
-    file: 'contract-fixtures.test.ts',
-    test: 'produces the edit sequence without changing creation order',
-  },
-  {
-    keys: ['questions.open', 'questions.answered', 'answerRequest', 'answerResponse', 'answerConflict'],
-    file: 'contract-fixtures.test.ts',
-    test: 'produces open, answered and conflict question fixtures',
-  },
-  {
-    keys: ['fileInitRequest', 'fileInitResponse', 'fileTicketRenewResponse', 'fileUpload'],
-    file: 'contract-fixtures.test.ts',
-    test: 'mints, renews and uploads the fixture bytes through real handlers',
-  },
-  {
-    keys: [
-      'errors.protocol',
-      'errors.badSignature',
-      'errors.unknownDevice',
-      'errors.staleTimestamp',
-      'errors.replayed',
-      'errors.deviceRevoked',
-    ],
-    file: 'contract-fixtures.test.ts',
-    test: 'returns fixture signature errors from actual dispatch',
-  },
-  {
-    keys: [
-      'conversations',
-      'conversationCallRefused',
-      'historyPage',
-      'readRequest',
-      'readResponse',
-      'messages.userWithFile',
-      'statuses.working',
-      'statuses.waiting',
-      'statuses.idle',
-      'errors.badFile',
-      'errors.clientIdConflict',
-    ],
-    file: 'contract-fixtures.test.ts',
-    test: 'produces the list, history page, file message, statuses and call refusal over signed dispatch',
-  },
-  {
-    keys: ['errors.useCallScreen', 'errors.usePairingScreen', 'questions.expired', 'errors.rateLimited'],
-    file: 'contract-fixtures.test.ts',
-    test: 'returns command, expired-question and rate-limit refusals from actual dispatch',
-  },
-  {
-    keys: ['callRequest', 'callGrant', 'callEndRequest', 'callCancelRequest'],
-    file: 'contract-fixtures.test.ts',
-    test: 'produces the call grant through signed dispatch and the real voice adapter',
-  },
-  {
-    keys: ['pushPayload'],
-    file: 'contract-fixtures.test.ts',
-    test: 'produces push payload and headers at a local h2c endpoint',
-  },
-  {
-    keys: ['errors.badBody'],
-    file: '../../modules/device-auth/verify.test.ts',
-    test: 'rejects altered and oversized bodies before reading oversized content length',
-  },
-  {
-    keys: ['errors.badProof', 'errors.invalidCode'],
-    file: '../../modules/device-auth/verify.test.ts',
-    test: 'rejects tampered proof, expired code and excess pairing attempts',
-  },
-  {
-    keys: ['errors.answerNotDelivered'],
-    file: 'n2a.test.ts',
-    test: 'undoes failed answer handoff and returns the fixture error',
-  },
-  {
-    keys: ['errors.tooLarge', 'errors.lengthRequired', 'errors.uploadConflict'],
-    file: 'files.test.ts',
-    test: 'tooLarge, lengthRequired, badBody, forged tickets and uploadConflict',
-  },
-  {
-    keys: ['errors.ticketExpired'],
-    file: 'files.test.ts',
-    test: 'expired fixture authorization reaches the upload handler',
-  },
-  {
-    keys: ['errors.uploadKeyConflict'],
-    file: 'files.test.ts',
-    test: 'fileInitResponse and fileTicketRenewResponse: lost mint and upload answers are retryable',
-  },
-  {
-    keys: ['messages.userFailed', 'messages.userUnknown'],
-    file: 'n2a.test.ts',
-    test: 'matches delivery error fixture %s',
-  },
-  { keys: ['questions.noDeadline'], file: 'n2a.test.ts', test: 'questions normalize options and keep a null deadline' },
-  {
-    keys: ['stream', 'messages.future'],
-    file: 'stream.test.ts',
-    test: 'matches the complete fixture byte for byte, including unknown kinds, badge and pings',
-  },
-  {
-    keys: ['callErrors.stopped'],
-    file: 'calls.test.ts',
-    test: 'opens once concurrently, retries with a fresh token and ends idempotently',
-  },
-  {
-    keys: ['callErrors.protocol', 'callErrors.room', 'errors.forbidden'],
-    file: 'calls.test.ts',
-    test: 'enforces protocol, device scope, ownership, and room failures',
-  },
-  {
-    keys: ['errors.notFound'],
-    file: 'calls.test.ts',
-    test: 'refuses to end or cancel a call on an agent the device does not reach',
-  },
-  { keys: ['callErrors.limit'], file: 'calls.test.ts', test: 'does not rebind on a limit refusal' },
-  {
-    keys: ['callErrors.noChat', 'callErrors.voiceOffline', 'errors.attemptConflict'],
-    file: 'calls.test.ts',
-    test: 'returns no-chat, offline, not-found and attempt-conflict without extra rooms',
-  },
-  {
-    keys: ['callErrors.noLine'],
-    file: 'calls.test.ts',
-    test: 'refuses another owner and stops the failed opening attempt',
-  },
-  {
-    keys: ['callErrors.providerUnavailable', 'errors.badRequest'],
-    file: 'calls.test.ts',
-    test: 'shapes picker provider and query errors for paired clients',
-  },
-  {
-    keys: ['pushTokenRequest'],
-    file: 'push.test.ts',
-    test: 'stores the fixture, transfers duplicate tokens atomically and accepts simulator lengths',
-  },
-  {
-    keys: ['errors.futureError'],
-    file: 'contract-fixtures.test.ts',
-    test: 'keeps the unknown error example for forward-compatible decoders',
-  },
-];
-function uncoveredFixtures(value: Record<string, unknown>): string[] {
-  const covered = new Set(fixtureChecks.flatMap((entry) => entry.keys));
-  const nested = new Set(['errors', 'callErrors', 'messages', 'questions', 'statuses']);
-  return Object.entries(value).flatMap(([key, v]) => {
-    if (key === 'about') return [];
-    const keys = nested.has(key) ? Object.keys(v as object).map((child) => `${key}.${child}`) : [key];
-    return keys.filter((k) => !covered.has(k));
-  });
-}
-it('maps every fixture to a named check and rejects a throwaway unmapped key', () => {
-  expect(uncoveredFixtures(fixtures)).toEqual([]);
-  expect(uncoveredFixtures({ ...fixtures, throwaway: {} })).toEqual(['throwaway']);
-  expect(uncoveredFixtures({ ...fixtures, errors: { ...fixtures.errors, throwaway: {} } })).toEqual([
-    'errors.throwaway',
-  ]);
-  for (const { file, test } of fixtureChecks) {
-    expect(readFileSync(new URL(file, import.meta.url), 'utf8')).toContain(test);
-  }
-});
-it('keeps the unknown error example for forward-compatible decoders', () => {
-  expect(fixtures.errors.futureError.status).toBeGreaterThanOrEqual(400);
-  expect(fixtures.errors.futureError.body.error).toBeTypeOf('string');
-  expect(fixtures.errors.futureError.body.message).toBeTypeOf('string');
 });

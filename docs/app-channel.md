@@ -19,7 +19,7 @@ API. Whole messages arrive after a working status, without token streaming.
 | `APP_APNS_PRODUCTION_KEY_ID`, `APP_APNS_PRODUCTION_KEY_PATH` | Production signing key identifier and host-local key file.                                                           | Both required for production credentials.                                           |
 
 `GET /app/hello` returns protocol 1, minimum protocol 1, voice protocol 6, server time in
-milliseconds, and `configuredFeatures`. These are configuration checks, not service health
+milliseconds, and `features`. These are configuration checks, not service health
 probes: a configured call URL does not prove the voice worker is online, and the push
 feature checks the local key but does not probe APNs connectivity. Chat remains usable when voice is offline.
 The host re-reads these settings and the key files at most once a minute.
@@ -52,10 +52,8 @@ ncl devices pair --user <user-id> --agents <agent-id>,<another-agent-id>
 ncl devices revoke --id <device-id>
 ```
 
-Both user and agent selection are required when pairing from the CLI. To retire a lost
-phone, list devices, identify the phone and revoke its id. Revocation closes its event
-stream, ends its calls and rejects subsequent signatures and upload tickets.
-`DELETE /app/devices/me` removes the requesting phone's access.
+Both user and agent selection are required when pairing from the CLI. Revocation closes its
+event stream, ends its calls and rejects subsequent signatures and upload tickets.
 
 Requests use `HeyDan-Sig` authorization: protocol, device id, timestamp, fresh nonce, body
 hash and an ECDSA signature covering the method and canonical target too. Nonces survive a
@@ -146,11 +144,9 @@ use the paired device's identity, not a saved call-link decoder.
 
 ## Agent formatting and logging
 
-App-wired agents receive the "Hey Dan app formatting" section. It teaches standard
-markdown, narrow scrolling tables, code fences with languages, short paragraphs and the
-backtick rule for dollar signs because [MarkdownView](https://github.com/Lakr233/MarkdownView)
-4.8.5 interprets them as math. Pictures and documents use `send_file`; choices use
-`ask_user_question`. Telegram-only syntax is not used in app messages.
+App-wired agents receive the "Hey Dan app formatting" section (`src/channels/app/agent-docs.ts`).
+It asks for dollar signs in backticks because [MarkdownView](https://github.com/Lakr233/MarkdownView)
+4.8.5 renders `$...$` as math.
 
 App logs must contain ids, states, error codes and timings only. They must never contain
 message text, pairing codes or links, call links, authorization headers, upload tickets,

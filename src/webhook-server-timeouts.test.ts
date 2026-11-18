@@ -1,9 +1,9 @@
-import { allocateFreePort } from '../../test-utils/free-port.js';
+import { allocateFreePort } from './test-utils/free-port.js';
 import http from 'node:http';
 import { once } from 'node:events';
 import { connect } from 'node:net';
 import { afterEach, expect, it, vi } from 'vitest';
-import { registerRootHandler, stopWebhookServer } from '../../webhook-server.js';
+import { registerRootHandler, stopWebhookServer } from './webhook-server.js';
 
 afterEach(async () => {
   await stopWebhookServer();
@@ -19,7 +19,7 @@ it('configures uploads and keepalive and lets a stream outlive the receive timeo
     const handler = typeof args[0] === 'function' ? args[0] : args[1];
     return original({ connectionsCheckingInterval: 5 }, handler);
   });
-  registerRootHandler('n2b-timeout', async (req, res) => {
+  registerRootHandler('slow-upload', async (req, res) => {
     if (req.method === 'POST') {
       for await (const _chunk of req) {
         /* Consume the deliberately slow upload. */
@@ -41,7 +41,7 @@ it('configures uploads and keepalive and lets a stream outlive the receive timeo
   server.headersTimeout = 900;
   const upload = new Promise<string>((resolve, reject) => {
     const request = http.request(
-      `http://127.0.0.1:${port}/n2b-timeout`,
+      `http://127.0.0.1:${port}/slow-upload`,
       { method: 'POST', headers: { 'Content-Length': 2 } },
       (res) => {
         let body = '';
@@ -56,7 +56,7 @@ it('configures uploads and keepalive and lets a stream outlive the receive timeo
     setTimeout(() => request.end('b'), 450);
   });
   expect(await upload).toBe('uploaded');
-  expect(await (await fetch(`http://127.0.0.1:${port}/n2b-timeout`)).text()).toContain('survived');
+  expect(await (await fetch(`http://127.0.0.1:${port}/slow-upload`)).text()).toContain('survived');
 });
 
 it('shuts down promptly with a streaming response and an incomplete HTTP request', async () => {
@@ -64,7 +64,7 @@ it('shuts down promptly with a streaming response and an incomplete HTTP request
   vi.stubEnv('WEBHOOK_PORT', String(port));
   vi.stubEnv('WEBHOOK_HOST', '127.0.0.1');
   const spy = vi.spyOn(http, 'createServer');
-  registerRootHandler('n2b-shutdown', (_req, res) => {
+  registerRootHandler('open-stream', (_req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     res.write(': open\n\n');
   });
@@ -72,8 +72,8 @@ it('shuts down promptly with a streaming response and an incomplete HTTP request
   if (!server.listening) await once(server, 'listening');
   const incomplete = connect(port, '127.0.0.1');
   await once(incomplete, 'connect');
-  incomplete.write('GET /n2b-shutdown HTTP/1.1\r\n');
-  const response = await fetch(`http://127.0.0.1:${port}/n2b-shutdown`);
+  incomplete.write('GET /open-stream HTTP/1.1\r\n');
+  const response = await fetch(`http://127.0.0.1:${port}/open-stream`);
   const reader = response.body!.getReader();
   await reader.read();
   try {

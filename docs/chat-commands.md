@@ -6,17 +6,17 @@ retune an agent group straight from chat, without shelling into the host for
 router claims them before the per-agent fan-out, and on Telegram a native
 binding handles them at the adapter.
 
-| Command                                              | Who can run it                                | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| ---------------------------------------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/status`                                            | Any group member (agent_group_members gate)   | Read-only Hermes-style card: model + effort, live context vs compact window, session output/turns, this chat's activation, session/queue/task counts, and config updated-at. Non-default provider / cli_scope / max-messages surface as extra lines.                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `/model`                                             | Admin only                                    | Bare `/model` opens a model picker (active model checkmarked). `/model <alias-or-id>` switches directly.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `/config`                                            | Admin only                                    | Bare `/config` opens the config menu (Model / Effort / Compact window / Activation / Restart). `/config set <field> <value>` writes one field.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `/restart`                                           | Admin only                                    | Restarts the agent's running container(s) immediately.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `/voice`, `/voice new`, `/voice plain`, `/voice jev` | Core owner or admin over the agent            | Shows the sender their call link (creating the agent's line on first use) and makes this chat/topic where its calls talk. A line is shown and moved only by its caller. `new` replaces the sender's own link and ends calls using the old one. With `JEV_API_KEY` set the line's calls run the meet-jev loop (the agent decides from the conversation when to answer); `plain` turns the line to the wake phrase and send word until the next `/voice` (or `/voice jev`), held in host memory. See the [voice mode skill](../.claude/skills/add-voice-mode/SKILL.md) and [upgrade runbook](2610-07-voice-mode-upgrade.md).                                       |
-| `/pair`                                              | Core owner or admin over the agent            | Pairs a phone with the app using a single-use link valid for 10 minutes. In group chats the link goes only to the sender in a direct chat. See [App channel](app-channel.md#pairing-and-revocation) for setup and revocation.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `/pair list`                                         | Any user, direct chat only                    | Lists your live devices with short ids and UTC pairing times.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `/pair revoke <device>`                              | Any user, direct chat only                    | Revokes your own device by short id, full id or exact name. Duplicate names require an id. This is the lost-phone path; host operators can still use `ncl devices revoke`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `/meet <link> [jev\|send\|pause]`, `/meet leave`     | Core owner or admin over the chat's one agent | The agent joins a Google Meet as a voice participant through a Recall.ai bot, on the sender's own line, and this chat becomes where its calls talk. With `JEV_API_KEY` set it runs the meet-jev loop by default (`jev` says so too) on each participant's own audio, transcribed on the host, and answers when addressed or invited ([Voice calls and meetings](jev-gate.md#voice-calls-and-meetings-voice-meet-link)); `send`, the default without the key, wakes on the wake phrase and ends a turn on the send word, and `pause` makes a pause end it too. `leave` sends the bot away. See the [voice mode skill](../.claude/skills/add-voice-mode/SKILL.md). |
+| Command | Who can run it | What it does |
+|---------|----------------|--------------|
+| `/status` | Any group member (agent_group_members gate) | Read-only Hermes-style card: model + effort, live context vs compact window, session output/turns, this chat's activation, session/queue/task counts, and config updated-at. Non-default provider / cli_scope / max-messages surface as extra lines. |
+| `/model` | Admin only | Bare `/model` opens a model picker (active model checkmarked). `/model <alias-or-id>` switches directly. |
+| `/config` | Admin only | Bare `/config` opens the config menu (Model / Effort / Compact window / Activation / Restart). `/config set <field> <value>` writes one field. |
+| `/restart` | Admin only | Restarts the agent's running container(s) immediately. |
+| `/voice`, `/voice new`, `/voice plain`, `/voice jev` | Core owner or admin over the agent | Shows the sender their call link (creating the agent's line on first use) and makes this chat/topic where its calls talk. A line is shown and moved only by its caller. `new` replaces the sender's own link and ends calls using the old one. With `JEV_API_KEY` set the line's calls run the meet-jev loop (the agent decides from the conversation when to answer); `plain` turns the line to the wake phrase and send word until the next `/voice` (or `/voice jev`), held in host memory. See the [voice mode skill](../.claude/skills/add-voice-mode/SKILL.md) and [upgrade runbook](2610-07-voice-mode-upgrade.md). |
+| `/pair` | Core owner or admin over the agent | Pairs a phone with the app using a single-use link valid for 10 minutes. In group chats the link goes only to the sender in a direct chat. See [App channel](app-channel.md#pairing-and-revocation) for setup and revocation. |
+| `/pair list` | Any user, direct chat only | Lists your live devices with short ids and UTC pairing times. |
+| `/pair revoke <device>` | Any user, direct chat only | Revokes your own device by short id, full id or exact name. Duplicate names require an id. This is the lost-phone path; host operators can still use `ncl devices revoke`. |
+| `/meet <link> [jev\|send\|pause]`, `/meet leave` | Core owner or admin over the chat's one agent | The agent joins a Google Meet as a voice participant through a Recall.ai bot, on the sender's own line, and this chat becomes where its calls talk. With `JEV_API_KEY` set it runs the meet-jev loop by default (`jev` says so too) on each participant's own audio, transcribed on the host, and answers when addressed or invited ([Voice calls and meetings](jev-gate.md#voice-calls-and-meetings-voice-meet-link)); `send`, the default without the key, wakes on the wake phrase and ends a turn on the send word, and `pause` makes a pause end it too. `leave` sends the bot away. See the [voice mode skill](../.claude/skills/add-voice-mode/SKILL.md). |
 
 ## Slack: the `!` prefix
 
@@ -35,13 +35,13 @@ pass-through admin commands work the same way (`!compact`, `!clear`, ...), and
 The `/status` card is assembled from three sources, all read-only and best-effort
 (any missing piece is simply omitted, never an error):
 
-| Segment                                                            | Source                                                                                                                                                                                                              |
-| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Model + effort, compact window, provider, cli_scope, max messages  | `container_configs` row for the agent group; an unset compact window renders the provider's 165k default with a `default` marker                                                                                    |
-| Activation (`mention, known senders`, `pattern /re/`, `always on`) | the wiring row for this (messaging group, agent) pair: `engage_mode` + `engage_pattern` + `sender_scope`                                                                                                            |
-| Context `113k / 400k (28%)`, Session `46k out over 214 turns`      | the session's SDK transcript (`.claude-shared/projects/*/<sdk-id>.jsonl`), mapped via the session's `outbound.db` `session_state` (`continuation:<provider>`, legacy `sdk_session_id`), newest `.jsonl` as fallback |
-| `Sessions: N`, `Queue: N`, `Tasks: N`                              | active sessions for the group; `Queue` = undelivered due inbound messages for the resolved session (omitted when 0); `Tasks` = live (pending/paused) task series (omitted when 0)                                   |
-| `Updated: 2026-07-10 00:32 (2h ago)`                               | `container_configs.updated_at`, rendered absolute-plus-relative                                                                                                                                                     |
+| Segment | Source |
+|---------|--------|
+| Model + effort, compact window, provider, cli_scope, max messages | `container_configs` row for the agent group; an unset compact window renders the provider's 165k default with a `default` marker |
+| Activation (`mention, known senders`, `pattern /re/`, `always on`) | the wiring row for this (messaging group, agent) pair: `engage_mode` + `engage_pattern` + `sender_scope` |
+| Context `113k / 400k (28%)`, Session `46k out over 214 turns` | the session's SDK transcript (`.claude-shared/projects/*/<sdk-id>.jsonl`), mapped via the session's `outbound.db` `session_state` (`continuation:<provider>`, legacy `sdk_session_id`), newest `.jsonl` as fallback |
+| `Sessions: N`, `Queue: N`, `Tasks: N` | active sessions for the group; `Queue` = undelivered due inbound messages for the resolved session (omitted when 0); `Tasks` = live (pending/paused) task series (omitted when 0) |
+| `Updated: 2026-07-10 00:32 (2h ago)` | `container_configs.updated_at`, rendered absolute-plus-relative |
 
 Token counts use the OpenClaw compaction heuristic (`formatTokens`): `>=1m -> '1.2m'`,
 `>=10k -> '46k'`, `>=1k -> '4.5k'`. The window renders as `400k`, not `400000`.
@@ -87,10 +87,10 @@ cannot hand the buttons to a non-admin.
 
 There are two distinct apply paths.
 
-| Trigger                         | Container behavior                               | Wake message | Visible confirmation                               |
-| ------------------------------- | ------------------------------------------------ | ------------ | -------------------------------------------------- |
-| `/model` write, `/config` write | Instant kill of running containers, LAZY respawn | No           | The card/menu edit ("applies from her next reply") |
-| `/restart`                      | Immediate respawn NOW                            | Yes          | Restart confirmation                               |
+| Trigger | Container behavior | Wake message | Visible confirmation |
+|---------|--------------------|--------------|----------------------|
+| `/model` write, `/config` write | Instant kill of running containers, LAZY respawn | No | The card/menu edit ("applies from her next reply") |
+| `/restart` | Immediate respawn NOW | Yes | Restart confirmation |
 
 A `/model` or `/config` write kills the agent group's running containers
 immediately but does NOT respawn them. The container comes back on the next user
@@ -127,14 +127,14 @@ Navigation taps (submenus, Back) are unchanged.
 `/config` deliberately exposes only a subset of the full container config, plus
 the two per-chat activation fields. Fields writable via chat:
 
-| Field                     | Accepted values                                                                                    | Applies                       |
-| ------------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------- |
-| `model`                   | A catalog alias (`sonnet`, `sonnet-5`, `opus`, `opus-5.5`, `fable`, `fable-5.2`) or a raw model id | next reply (container config) |
-| `effort`                  | `low`, `medium`, `high`, `xhigh`, `max`                                                            | next reply (container config) |
-| `auto-compact-window`     | A positive integer token count (presets: 165k, 200k, 400k, 600k, 800k)                             | next reply (container config) |
-| `max-messages-per-prompt` | A positive integer                                                                                 | next reply (container config) |
-| `activation`              | `mention`, `mention-sticky`, `pattern`                                                             | immediately (wiring row)      |
-| `pattern`                 | A regular expression (switches the mode to `pattern` and sets the source)                          | immediately (wiring row)      |
+| Field | Accepted values | Applies |
+|-------|-----------------|---------|
+| `model` | A catalog alias (`sonnet`, `sonnet-5`, `opus`, `opus-5.5`, `fable`, `fable-5.2`) or a raw model id | next reply (container config) |
+| `effort` | `low`, `medium`, `high`, `xhigh`, `max` | next reply (container config) |
+| `auto-compact-window` | A positive integer token count (presets: 165k, 200k, 400k, 600k, 800k) | next reply (container config) |
+| `max-messages-per-prompt` | A positive integer | next reply (container config) |
+| `activation` | `mention`, `mention-sticky`, `pattern` | immediately (wiring row) |
+| `pattern` | A regular expression (switches the mode to `pattern` and sets the source) | immediately (wiring row) |
 
 `activation` and `pattern` write the chat's wiring row (`engage_mode` /
 `engage_pattern`), not container config, so they apply immediately with no
@@ -170,14 +170,14 @@ update`.
 
 Six catalogued models, addressable by short alias:
 
-| Alias       | Label      | Raw id              |
-| ----------- | ---------- | ------------------- |
-| `sonnet`    | Sonnet 5.5 | `claude-sonnet-5-5` |
-| `sonnet-5`  | Sonnet 5   | `claude-sonnet-5`   |
-| `opus`      | Opus 5     | `claude-opus-5`     |
-| `opus-5.5`  | Opus 5.5   | `claude-opus-5-5`   |
-| `fable`     | Fable 5    | `claude-fable-5`    |
-| `fable-5.2` | Fable 5.2  | `claude-fable-5-2`  |
+| Alias | Label | Raw id |
+|-------|-------|--------|
+| `sonnet` | Sonnet 5.5 | `claude-sonnet-5-5` |
+| `sonnet-5` | Sonnet 5 | `claude-sonnet-5` |
+| `opus` | Opus 5 | `claude-opus-5` |
+| `opus-5.5` | Opus 5.5 | `claude-opus-5-5` |
+| `fable` | Fable 5 | `claude-fable-5` |
+| `fable-5.2` | Fable 5.2 | `claude-fable-5-2` |
 
 Raw-id escape hatch: `/model <id>` (or `/config set model <id>`) accepts any id
 matching `^[a-z0-9][a-z0-9.-]+$` between 3 and 64 characters, so an operator can
@@ -291,12 +291,8 @@ sorted order.
 
 ## Troubleshooting
 
-| Symptom                                                          | Cause and fix                                                                                                                                                                                                                                                         |
-| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Popup does not show the commands                                 | Grants apply only at adapter startup. Restart the service, then check the host log for `telegram-grammy: command scopes synced`. If the line is absent, the janitor did not run (Telegram outage or adapter not loaded).                                              |
+| Symptom | Cause and fix |
+|---------|---------------|
+| Popup does not show the commands | Grants apply only at adapter startup. Restart the service, then check the host log for `telegram-grammy: command scopes synced`. If the line is absent, the janitor did not run (Telegram outage or adapter not loaded). |
 | A command is answered by the container agent instead of the host | The gate should claim all four commands before fan-out. If a command reaches the container, the classifier missed it. This should not happen for `/status /model /config /restart`; check `classifyHostCommand` and confirm the message kind is `chat` or `chat-sdk`. |
-| A menu says it is outdated when tapped                           | The agent's config changed elsewhere (a concurrent `/config` write, an `ncl` change, or a new wiring). The menu fingerprint folds in model, effort, window, cli_scope, and the wiring set, so a stale menu self-detects. Re-run the command to get a fresh menu.      |
-
-Successful app pairing sends a direct notice naming the device, its UTC pairing time and
-how to revoke it using `/pair list` and `/pair revoke <id>`. Notice delivery failure does
-not undo pairing.
+| A menu says it is outdated when tapped | The agent's config changed elsewhere (a concurrent `/config` write, an `ncl` change, or a new wiring). The menu fingerprint folds in model, effort, window, cli_scope, and the wiring set, so a stale menu self-detects. Re-run the command to get a fresh menu. |

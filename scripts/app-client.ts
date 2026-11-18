@@ -114,10 +114,9 @@ export async function revokedStreamClosed(done: Promise<void>): Promise<void> {
   }
 }
 class Skip extends Error {}
-class RateLimited extends Error {}
 // A result detail is a skip reason or a fixed code written in this file, never server payload.
 function failureDetail(e: unknown): string {
-  if (e instanceof Skip || e instanceof RateLimited || e instanceof Failure) return e.message;
+  if (e instanceof Skip || e instanceof Failure) return e.message;
   if ((e as { name?: unknown } | undefined)?.name === 'TimeoutError') return 'timeout';
   const code = (e as { cause?: { code?: unknown } } | undefined)?.cause?.code;
   return typeof code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(code)
@@ -130,9 +129,7 @@ async function expectError(r: Response, status: number, error: string, step: str
 }
 interface Device {
   privateKey: string;
-  publicKey: string;
   deviceId: string;
-  base: string;
 }
 interface Options {
   scenario?: string;
@@ -198,7 +195,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     if (response.status === 429) {
       const retryAfter = Number(response.headers.get('retry-after'));
       await response.body?.cancel();
-      throw new RateLimited('rate_limited, retry after ' + (Number.isFinite(retryAfter) ? retryAfter : 0) + ' s');
+      throw new Failure('rate_limited, retry after ' + (Number.isFinite(retryAfter) ? retryAfter : 0) + ' s');
     }
     return response;
   }
@@ -221,20 +218,11 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
         throw new Skip(options.remote ? `${linkName} unset` : `${linkName} unset and no local stack`);
       const output = execFileSync(
         'pnpm',
-        [
-          'ncl',
-          'devices',
-          'pair',
-          '--user',
-          process.env.LOCAL_OWNER_ID ?? stack.owner,
-          '--agents',
-          stack.group,
-          '--json',
-        ],
+        ['ncl', 'devices', 'pair', '--user', stack.owner, '--agents', stack.group, '--json'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
       );
       const envelope = JSON.parse(output.slice(output.indexOf('{')));
-      link = typeof envelope.data === 'string' ? envelope.data : envelope.data?.link;
+      link = envelope.data;
     }
     ensure(link, 'pair link missing');
     const url = new URL(link);
@@ -263,9 +251,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     for (const agent of paired.agents) guard(baseUrl, !!options.remote, agent.name, allowedAgent);
     const device = {
       privateKey: keys.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
-      publicKey,
       deviceId: paired.deviceId,
-      base: baseUrl,
     };
     const file = join(dir, `device-${index}.json`);
     writeFileSync(file, JSON.stringify(device), { mode: 0o600 });
@@ -413,6 +399,7 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
     if (!live) throw new Skip('Stream dependency unavailable');
     return live.events;
   }
+  const since = (start: number) => events().slice(start);
   async function send(text: string, fileIds: string[] = [], clientId: string = randomUUID()) {
     return json<{ message: Message }>(
       await request(requirePair(), 'POST', path('messages'), { clientId, text, fileIds }),
@@ -432,21 +419,10 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
           const { message } = await send(command + ' app-client');
           ensure(message.delivery === 'stored', 'delivery_mismatch:send');
           await reached(message);
-          const replies = () =>
-            events()
-              .slice(start)
-              .filter((e) => e.kind === 'message' && e.data.role === 'agent');
+          const replies = () => since(start).filter((e) => e.kind === 'message' && e.data.role === 'agent');
           if (command === 'question') {
-            await until(
-              () =>
-                events()
-                  .slice(start)
-                  .some((e) => e.kind === 'question'),
-              'question',
-            );
-            const q = events()
-              .slice(start)
-              .find((e) => e.kind === 'question')!.data as unknown as Question;
+            await until(() => since(start).some((e) => e.kind === 'question'), 'question');
+            const q = since(start).find((e) => e.kind === 'question')!.data as unknown as Question;
             const response = await json<{ question: Question }>(
               await request(requirePair(), 'POST', target(['app', 'questions', q.id, 'answer']), {
                 value: q.options[0].value,
@@ -485,18 +461,12 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
           }
           if (command === 'long') {
             ensure(
-              events()
-                .slice(start)
-                .some((e) => e.kind === 'status' && e.data.state === 'working' && typeof e.data.label === 'string'),
+              since(start).some(
+                (e) => e.kind === 'status' && e.data.state === 'working' && typeof e.data.label === 'string',
+              ),
               'working_status_missing',
             );
-            await until(
-              () =>
-                events()
-                  .slice(start)
-                  .some((e) => e.kind === 'status' && e.data.state === 'idle'),
-              'idle',
-            );
+            await until(() => since(start).some((e) => e.kind === 'status' && e.data.state === 'idle'), 'idle');
           }
           if (command === 'reply') {
             const duplicate = await send(command + ' app-client', [], message.clientId!);
@@ -609,22 +579,12 @@ export async function runAppClient(baseUrl: string, runDir: string, options: Opt
       await check('download-files', async () => {
         const start = events().length;
         await reached((await send('file')).message);
-        await until(
-          () =>
-            new Set(
-              events()
-                .slice(start)
-                .filter((e) => e.kind === 'message')
-                .flatMap((e) => (e.data as unknown as Message).files)
-                .map((f) => f.id),
-            ).size >= 2,
-          'agent-files',
-        );
-        const files = events()
-          .slice(start)
-          .filter((e) => e.kind === 'message')
-          .flatMap((e) => (e.data as unknown as Message).files);
-        const unique = [...new Map(files.map((f) => [f.id, f])).values()];
+        const agentFiles = () =>
+          since(start)
+            .filter((e) => e.kind === 'message')
+            .flatMap((e) => (e.data as unknown as Message).files);
+        await until(() => new Set(agentFiles().map((f) => f.id)).size >= 2, 'agent-files');
+        const unique = [...new Map(agentFiles().map((f) => [f.id, f])).values()];
         ensure(unique.length === 2, 'file_count');
         for (const f of unique) {
           const r = await request(requirePair(), 'GET', target(['app', 'files', f.id]));
@@ -719,10 +679,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       help: { type: 'boolean' },
     },
   });
-  if (values.help)
+  if (values.help || !values.base)
     console.log('Usage: app-client.ts <pair|send|stream|upload|security|all> --base <url> [--remote --agent <name>]');
   else
-    runAppClient(values.base ?? 'http://127.0.0.1:5000', process.env.LOCAL_RUN_DIR ?? '.local/app-client/run', {
+    runAppClient(values.base, process.env.LOCAL_RUN_DIR ?? '.local/app-client/run', {
       scenario: positionals[0],
       remote: values.remote,
       agent: values.agent,

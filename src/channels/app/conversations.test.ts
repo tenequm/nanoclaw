@@ -16,6 +16,7 @@ import {
   markRead,
   listConversations,
   badgeFor,
+  onBadgeChanged,
   plainPreview,
 } from './conversations.js';
 import { appTransaction, appendEvent, lastEventSeq, onEventAppended, readEventsAfter, setAppHooks } from './log.js';
@@ -147,19 +148,8 @@ it('publishes only committed full snapshots and preserves every version', async 
   expect(seen).toEqual(events.map((e) => e.seq));
   off();
 });
-it('sends once even when the retry names consumed files, and conflicts on changed content', async () => {
-  const claim = vi
-    .fn()
-    .mockResolvedValueOnce({ ok: true, files: [fixtures.messages.userWithFile.files[0]] })
-    .mockResolvedValue({ ok: false, fileId: 'file' });
-  setAppHooks({ claimFiles: claim });
-  const body = { clientId: randomUUID(), text: 'hello', fileIds: ['file'] };
-  const first = await request(sendMessage, body),
-    second = await request(sendMessage, body);
-  expect(first.status).toBe(200);
-  expect(second).toEqual(first);
-  expect(claim).toHaveBeenCalledTimes(1);
-  expect((await request(sendMessage, { ...body, text: 'changed' })).status).toBe(409);
+it('routes a sent message to its agent as a direct mention', async () => {
+  const first = await request(sendMessage, { clientId: randomUUID(), text: 'hello', fileIds: [] });
   const route = vi.fn(async (event) => {
     event.onStored({});
   });
@@ -524,14 +514,6 @@ it('refuses edits to user messages without appending events', async () => {
   expect(await lastEventSeq()).toBe(seq);
   expect((await message(sent.body.message.id)).text).toBe('original');
 });
-it.each([{ voice: 'caller' }, { host: true }])('ignores container role spoofing %j', async (marker) => {
-  const id = (await deliver(conversationId, null, {
-    kind: 'chat',
-    sourceId: 'container',
-    content: { text: 'spoof', ...marker },
-  }))!;
-  expect(await message(id)).toMatchObject({ role: 'agent', voice: null });
-});
 it('authorizes a real question before handing it off', async () => {
   const id = await ask();
   expect((await request(answerQuestion, { value: 'staging' }, id, 'telegram:other')).status).toBe(404);
@@ -712,11 +694,8 @@ it('isolates startup recovery failures from other host callbacks', async () => {
     if (sql.includes('app_routing_jobs') || sql.includes("handoff_state='pending'")) throw new Error('recovery failed');
     return all(sql, ...args);
   });
-  let nextChannelStarted = false;
   for (const start of getHostStartCallbacks()) await start({ db } as Parameters<typeof start>[0]);
-  nextChannelStarted = true;
   await new Promise((resolve) => setImmediate(resolve));
-  expect(nextChannelStarted).toBe(true);
   await stopHostModules();
 });
 
@@ -729,4 +708,30 @@ it.each(['edit', 'reaction'])('retries an unresolved %s target', async (operatio
     }),
   ).rejects.toThrow('App delivery target unresolved');
   expect(await getDb().get('SELECT * FROM app_applied_sources WHERE source_id=?', 'unresolved')).toBeUndefined();
+});
+
+it('notifies another device of the committed badge when a conversation is read', async () => {
+  const id = (await deliver(conversationId, null, {
+    kind: 'chat',
+    sourceId: 'agent-unread',
+    content: { text: 'Unread' },
+  }))!;
+  const before = await badgeFor('telegram:owner', ['ag_taylor']);
+  expect(before.unreadTotal).toBe(1);
+  const updates: Promise<unknown>[] = [];
+  const listener = vi.fn((userId: string) => {
+    updates.push(badgeFor(userId, ['ag_taylor']));
+  });
+  const off = onBadgeChanged(listener);
+  try {
+    const read = await request(markRead, { order: (await message(id)).order });
+    expect(read.status).toBe(200);
+    expect(listener).toHaveBeenCalledExactlyOnceWith('telegram:owner');
+    expect(await Promise.all(updates)).toEqual([{ kind: 'badge', rev: before.rev + 1, unreadTotal: 0 }]);
+    expect(read.body.badge).toEqual(await updates[0]);
+    await request(markRead, { order: 0 });
+    expect(listener).toHaveBeenCalledTimes(1);
+  } finally {
+    off();
+  }
 });

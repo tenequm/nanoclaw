@@ -1,7 +1,7 @@
 import './db.js';
-import { createHash, createPublicKey, randomInt, randomUUID, verify } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import type { AppHandler } from '../../channels/app/routes.js';
-import { APP_PROTOCOL, pairProofText, type PairRequest } from '../../channels/app/contract.js';
+import { APP_PROTOCOL, pairProofText, verifyP256, type PairRequest } from '../../channels/app/contract.js';
 import { appConfig } from '../../channels/app/config.js';
 import { getDb } from '../../db/connection.js';
 import { getUser } from '../permissions/db/users.js';
@@ -98,21 +98,8 @@ export const handlePair: AppHandler = async ({ req, res }) => {
     ['version', 'build', 'os'].some((k) => typeof (body.app as unknown as Record<string, unknown>)[k] !== 'string')
   )
     throw authError(400, 'bad_request', 'The request is malformed.');
-  let valid = false;
-  try {
-    const der = Buffer.from(body.publicKey, 'base64url');
-    const signature = Buffer.from(body.proof, 'base64url');
-    const key = createPublicKey({ key: der, format: 'der', type: 'spki' });
-    valid =
-      der.toString('base64url') === body.publicKey &&
-      signature.toString('base64url') === body.proof &&
-      key.asymmetricKeyType === 'ec' &&
-      key.asymmetricKeyDetails?.namedCurve === 'prime256v1' &&
-      verify('sha256', Buffer.from(pairProofText(body.code, body.publicKey)), key, signature);
-  } catch {
-    valid = false;
-  }
-  if (!valid) throw authError(400, 'bad_proof', 'The pairing proof is not valid.');
+  if (!verifyP256(pairProofText(body.code, body.publicKey), body.proof, body.publicKey))
+    throw authError(400, 'bad_proof', 'The pairing proof is not valid.');
   const db = getDb(),
     now = Date.now(),
     deviceId = `dev_${randomUUID()}`;

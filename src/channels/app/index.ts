@@ -1,7 +1,6 @@
 import type { ChannelAdapter, ChannelDefaults } from '../adapter.js';
 import { registerChannelAdapter } from '../channel-registry.js';
 import { registerRootHandler } from '../../webhook-server.js';
-import '../../modules/device-auth/index.js';
 import './db.js';
 import './agent-docs.js';
 import { dispatchApp } from './routes.js';

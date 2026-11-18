@@ -168,45 +168,9 @@ export interface ConversationsResponse {
   seq: number;
 }
 
-export interface HistoryPage {
-  items: ThreadEntity[];
-  hasMoreBefore: boolean;
-  hasMoreAfter: boolean;
-}
-
-export interface SendRequest {
-  clientId: string;
-  text: string;
-  fileIds: string[];
-}
-
-export interface SendResponse {
-  message: Message;
-}
-
-export interface ReadRequest {
-  order: number;
-}
-
 export interface ReadResponse {
   conversation: Conversation;
   badge: Badge;
-}
-
-export interface AnswerRequest {
-  value: string;
-}
-
-export interface AnswerResponse {
-  question: Question;
-}
-
-export interface FileInitRequest {
-  uploadKey: string;
-  name: string;
-  mimeType: string;
-  size: number;
-  sha256: string;
 }
 
 export interface FileInitResponse {
@@ -226,41 +190,6 @@ export interface TicketClaims {
   size: number;
   sha256: string;
   exp: number;
-}
-
-export interface CallRequest {
-  conversationId: string;
-  attemptId: string;
-  voiceProtocol: number;
-  jev: boolean | null;
-}
-
-export interface CallLimit {
-  ms: number;
-  kind: Kind;
-}
-
-export interface CallGrant {
-  protocol: number;
-  url: string;
-  token: string;
-  callId: string;
-  attemptId: string;
-  agent: string;
-  chat: string;
-  silenceMs: number;
-  limit: CallLimit;
-}
-
-export type CallCancelRequest = CallEndRequest;
-
-export interface CallEndRequest {
-  reason: string;
-}
-
-export interface PushTokenRequest {
-  token: string;
-  environment: string;
 }
 
 export interface PushAlert {
@@ -295,102 +224,6 @@ export interface Synchronized {
   seq: number;
 }
 
-export interface VoiceSelection {
-  provider: string;
-  model: string;
-  voice: string;
-}
-
-export interface SavedVoiceSelection {
-  provider: string | null;
-  model: string | null;
-  voice: string | null;
-}
-
-export interface VoicePatchRequest {
-  /** `{reset: true}` alone (no other key) clears the saved voice, as `/voice/tts` takes it. */
-  reset?: boolean;
-  provider?: string | null;
-  model?: string | null;
-  voice?: string | null;
-}
-
-export interface VoiceDetails {
-  provider: string;
-  providerName: string;
-  model: string;
-  modelName: string;
-  voice: string;
-  voiceName: string | null;
-  language?: string | null;
-  gender?: string | null;
-  preview?: string | null;
-  status: string;
-}
-
-export interface VoiceDefaults {
-  model: string;
-  voice: string;
-}
-
-export interface VoiceProvider {
-  id: string;
-  name: string;
-  available: boolean;
-  models: string[];
-  modelNames?: Record<string, string> | null;
-  default: VoiceDefaults;
-  defaultDetails?: VoiceDetails | null;
-}
-
-export interface VoiceViewDetails {
-  saved: VoiceDetails;
-  effective: VoiceDetails;
-}
-
-export interface VoiceView {
-  effective: VoiceSelection;
-  saved: SavedVoiceSelection;
-  details?: VoiceViewDetails | null;
-  providers: VoiceProvider[];
-}
-
-export interface CatalogVoice {
-  id: string;
-  name: string;
-  language?: string | null;
-  gender?: string | null;
-  description?: string | null;
-  preview?: string | null;
-}
-
-export interface VoiceCatalog {
-  provider: string;
-  voices: CatalogVoice[];
-  next?: string | null;
-}
-
-export interface VoiceCatalogQuery {
-  provider: string;
-  q?: string | null;
-  language?: string | null;
-  gender?: string | null;
-  cursor?: string | null;
-  limit?: number | null;
-}
-
-export interface HistoryQuery {
-  before?: number | null;
-  after?: number | null;
-  limit?: number | null;
-}
-
-export interface EventsQuery {
-  after: number;
-}
-export type ThreadEntity = Message | Question | { kind: string; [key: string]: unknown };
-export type FileTicketRenewResponse = FileInitResponse;
-export type EmptyResponse = void;
 export interface SigningFields {
   protocol: number;
   method: string;
@@ -457,14 +290,17 @@ export function parseAuthorization(header: string | undefined): Authorization | 
 }
 
 // This checks cryptography only; device, clock, protocol, nonce persistence and body streaming belong to the caller.
-export function verifyRequestSignature(fields: SigningFields, signature: string, publicKey: string): boolean {
+export const verifyRequestSignature = (fields: SigningFields, signature: string, publicKey: string): boolean =>
+  verifyP256(canonicalSigningText(fields), signature, publicKey);
+
+export function verifyP256(text: string, signature: string, publicKey: string): boolean {
   try {
     const der = decodeBase64url(publicKey),
       sig = decodeBase64url(signature);
     if (!der || !sig) return false;
     const key = createPublicKey({ key: der, format: 'der', type: 'spki' });
     if (key.asymmetricKeyType !== 'ec' || key.asymmetricKeyDetails?.namedCurve !== 'prime256v1') return false;
-    return verify('sha256', Buffer.from(canonicalSigningText(fields), 'utf8'), key, sig);
+    return verify('sha256', Buffer.from(text, 'utf8'), key, sig);
   } catch {
     return false;
   }

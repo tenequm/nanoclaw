@@ -50,7 +50,6 @@ export const sendMessage: AppHandler = async (ctx) => {
   const c = await accessibleConversation(ctx, ctx.params.id, false);
   if (!c) return;
   const body = await requestBody(ctx);
-  if (!body) return;
   const { clientId, text, fileIds } = body;
   if (
     typeof clientId !== 'string' ||

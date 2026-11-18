@@ -10,8 +10,6 @@ import { Socket } from 'node:net';
 import { afterEach, expect, it, vi } from 'vitest';
 import { closeDb, initDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
-import { schemaTables as appTables } from './db.js';
-import { schemaTables as deviceTables } from '../../modules/device-auth/db.js';
 import { routes, dispatchApp } from './routes.js';
 import { registerRootHandler } from '../../webhook-server.js';
 import { createAppAdapter } from './index.js';
@@ -87,7 +85,7 @@ it('rejects unknown routes and methods without reading a body', async () => {
   expect((await request('POST', '/app/hello')).status).toBe(404);
   expect((await request('GET', '/app/hellox')).status).toBe(404);
 });
-it('registers the adapter and safely accepts an offline stub delivery', async () => {
+it('registers the adapter and tracks its connection', async () => {
   expect(getRegisteredChannelNames()).toContain('app');
   const adapter = createAppAdapter();
   expect(adapter.isConnected()).toBe(false);
@@ -96,14 +94,12 @@ it('registers the adapter and safely accepts an offline stub delivery', async ()
   expect(adapter.isConnected()).toBe(true);
   await adapter.teardown();
   expect(adapter.isConnected()).toBe(false);
-  await expect(adapter.deliver('conv_test', null, { kind: 'text', content: 'test' })).resolves.toBeUndefined();
 });
-it('applies all schemas across boots and enforces durable deduplication', async () => {
+it('keeps recorded nonces across a reboot', async () => {
   databaseDirectory = mkdtempSync(join(tmpdir(), 'app-schema-'));
   const target = join(databaseDirectory, 'test.db');
   let db = await initDb(target, { role: 'test' });
   await runMigrations(db);
-  for (const table of [...appTables, ...deviceTables]) expect(await db.hasTable(table)).toBe(true);
   await db.run(
     'INSERT INTO device_auth_nonces (device_id, nonce, signed_at, expires_at) VALUES (?, ?, ?, ?)',
     'd',

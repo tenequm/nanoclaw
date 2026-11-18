@@ -30,7 +30,7 @@ vi.mock('../voice-mode-chat.js', async (original) => ({
   ...(await original<typeof import('../voice-mode-chat.js')>()),
   liveVoiceAdapter: () => state.adapter,
 }));
-import { initTestDb, runMigrations, closeDb } from '../../db/index.js';
+import { initTestDb, runMigrations, closeDb, getDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createUser } from '../../modules/permissions/db/users.js';
 import { grantRole } from '../../modules/permissions/db/user-roles.js';
@@ -126,7 +126,7 @@ beforeEach(async () => {
   await createAgentGroup({
     id: c.agent_group_id,
     name: 'Taylor',
-    folder: 'n5-test',
+    folder: 'taylor',
     agent_provider: null,
     created_at: new Date().toISOString(),
   });
@@ -235,7 +235,6 @@ it('opens once concurrently, retries with a fresh token and ends idempotently', 
 it('ends the live call and stops the opening attempt of a revoked device', async () => {
   const started = await request(handlers.startCall, requestBody);
   const end = vi.spyOn(adapter, 'endAppCall');
-  const { getDb } = await import('../../db/connection.js');
   const insert = (attempt: string, device: string) =>
     getDb().run(
       "INSERT INTO app_call_attempts (user_id, attempt_id, device_id, conversation_id, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'opening', 1, 1)",
@@ -303,7 +302,6 @@ it('enforces protocol, device scope, ownership, and room failures', async () => 
   const result = await request(handlers.startCall, requestBody);
   expect(result.status).toBe(502);
   expect(result).toMatchObject(fixtures.callErrors.room);
-  const { getDb } = await import('../../db/connection.js');
   await getDb().run('UPDATE voice_mode_lines SET owner_user_id = ?', 'telegram:other');
   expect((await callAvailability(c.user_id, c.agent_group_id)).callRefusal).toEqual(
     fixtures.conversationCallRefused.callRefusal,
@@ -336,7 +334,6 @@ it('returns no-chat, offline, not-found and attempt-conflict without extra rooms
   expect(noChat.status).toBe(409);
   expect(noChat).toMatchObject(fixtures.callErrors.noChat);
   chatPresent = true;
-  const { getDb } = await import('../../db/connection.js');
   await getDb().run('UPDATE app_call_attempts SET conversation_id = ?', 'another-conversation');
   expect(await request(handlers.startCall, requestBody)).toMatchObject(fixtures.errors.attemptConflict);
   expect((await request(handlers.startCall, { ...requestBody, conversationId: 'unknown' })).status).toBe(404);
@@ -372,7 +369,6 @@ it('starts through the module export with the conversation seam faked and jev om
     });
     expect(result.status).toBe(200);
     expect(rooms).toBe(1);
-    const { getDb } = await import('../../db/connection.js');
     expect(await getDb().get('SELECT jev FROM app_call_attempts')).toEqual({ jev: null });
   } finally {
     seam.mockRestore();
@@ -388,7 +384,6 @@ it('ends and cancels offline, normalizing unknown and missing reasons to hangup'
   expect((await request(handlers.endCall, {}, { callId: started.body.callId })).status).toBe(204);
   expect((await request(handlers.cancelCallAttempt, {}, { attemptId: requestBody.attemptId })).status).toBe(204);
   expect(end).not.toHaveBeenCalled();
-  const { getDb } = await import('../../db/connection.js');
   expect(await getDb().get('SELECT state, reason FROM app_call_attempts')).toEqual({
     state: 'stopped',
     reason: 'hangup',
@@ -399,11 +394,13 @@ it('unknown reasons end a live call with hangup grace', async () => {
   const end = vi.spyOn(adapter, 'endAppCall');
   expect((await request(handlers.endCall, { reason: ['hangup'] }, { callId: started.body.callId })).status).toBe(204);
   expect(end).toHaveBeenCalledWith(expect.any(String), started.body.callId, 'hangup', { grace: true });
-  expect((await request(handlers.cancelCallAttempt, [], { attemptId: requestBody.attemptId })).status).toBe(400);
+  await expect(request(handlers.cancelCallAttempt, [], { attemptId: requestBody.attemptId })).rejects.toMatchObject({
+    status: 400,
+    body: { error: 'bad_request', message: 'The request is malformed.' },
+  });
 });
 it('refuses another owner and stops the failed opening attempt', async () => {
   await request(picker.patchVoice, { reset: true }, { id: c.id }, undefined, 'PATCH');
-  const { getDb } = await import('../../db/connection.js');
   await getDb().run('UPDATE voice_mode_lines SET owner_user_id = ?', 'telegram:other');
   expect(await request(handlers.startCall, requestBody)).toMatchObject(fixtures.callErrors.noLine);
   expect(await getDb().get('SELECT state FROM app_call_attempts')).toEqual({ state: 'stopped' });
@@ -417,12 +414,10 @@ it('refuses to end or cancel a call on an agent the device does not reach', asyn
   expect(await request(handlers.cancelCallAttempt, {}, { attemptId: requestBody.attemptId }, [])).toMatchObject(
     fixtures.errors.notFound,
   );
-  const { getDb } = await import('../../db/connection.js');
   expect(await getDb().get('SELECT state FROM app_call_attempts')).toEqual({ state: 'live' });
 });
 it('hides real conversations and calls owned by another user', async () => {
   const started = await request(handlers.startCall, requestBody);
-  const { getDb } = await import('../../db/connection.js');
   await getDb().run('UPDATE app_call_attempts SET user_id = ?', 'telegram:other');
   expect(await request(handlers.endCall, {}, { callId: started.body.callId })).toMatchObject(fixtures.errors.notFound);
   const other = createCallHandlers({ ...deps, getConversation: async () => ({ ...c, user_id: 'telegram:other' }) });

@@ -1,6 +1,6 @@
 import { log } from '../../log.js';
 import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
-import { getConversationByPlatformId } from './conversations.js';
+import { getConversation } from './conversations.js';
 import { openQuestionConversationIds } from './questions.js';
 import { onEventAppended, setAppHooks } from './log.js';
 import type { ChannelAdapter } from '../adapter.js';
@@ -50,7 +50,7 @@ export function createStatusService(deps: StatusDeps) {
   const db = deps.db ?? getDb;
   const readStates = deps.containerStates ?? containerStates;
   const listeners = new Set<(status: Status) => void>();
-  const ticks = new Map<string, { at: number; readAt: number; label: string }>();
+  const ticks = new Map<string, { at: number; label: string }>();
   const labels = new Map<string, { readAt: number; label: string }>();
   let tail: Promise<unknown> = Promise.resolve();
   let stopped = false;
@@ -117,8 +117,7 @@ export function createStatusService(deps: StatusDeps) {
       try {
         const states = await readStates(c).catch(() => []);
         const fresh = states.find((s) => s.turn === 'working' && Date.now() - Date.parse(s.updatedAt) < 30_000);
-        if (fresh)
-          ticks.set(c.id, { at: Date.parse(fresh.updatedAt), readAt: Date.now(), label: toolLabel(fresh.currentTool) });
+        if (fresh) ticks.set(c.id, { at: Date.parse(fresh.updatedAt), label: toolLabel(fresh.currentTool) });
         await refresh(c.id, true);
       } catch (error) {
         failed(error);
@@ -168,7 +167,7 @@ export function createStatusService(deps: StatusDeps) {
           readAt = Date.now();
         }
         labels.set(c.id, { readAt, label });
-        ticks.set(c.id, { at: Date.now(), readAt, label });
+        ticks.set(c.id, { at: Date.now(), label });
         await refresh(c.id);
       });
     },
@@ -192,7 +191,7 @@ export function createStatusService(deps: StatusDeps) {
 let service: ReturnType<typeof createStatusService> | undefined;
 export function startStatus() {
   service ??= createStatusService({
-    getConversationByPlatformId,
+    getConversationByPlatformId: getConversation,
     openQuestionConversationIds,
     onEventAppended,
     setAppHooks,

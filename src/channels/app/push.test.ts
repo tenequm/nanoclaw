@@ -8,7 +8,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { initDb, closeDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { runMigrations } from '../../db/migrations/index.js';
-import { schemaTables, type EventRow } from './db.js';
+import type { EventRow } from './db.js';
 import { pushTokenHandler, subscribePush, type PushDependencies } from './push.js';
 import { readAppConfig, resetAppConfigCache } from './config.js';
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
@@ -28,10 +28,9 @@ vi.mock('../../env.js', async (original) => ({
 vi.mock('./apns.js', () => ({ sendPush: vi.fn(async () => ({ status: 200, clearToken: false })) }));
 const send = vi.fn(async () => ({ status: 200, clearToken: false }));
 beforeEach(async () => {
-  directory = mkdtempSync(join(tmpdir(), 'n4-push-'));
+  directory = mkdtempSync(join(tmpdir(), 'app-push-'));
   db = await initDb(join(directory, 'test.db'), { role: 'test' });
   await runMigrations(db);
-  expect(schemaTables).toContain('app_push_tokens');
   send.mockClear();
   deps = {
     onEventAppended: (listener) => {

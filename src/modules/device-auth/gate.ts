@@ -2,6 +2,12 @@ import net from 'node:net';
 import type { IncomingMessage } from 'node:http';
 import { envValue } from '../../env.js';
 import { log } from '../../log.js';
+const forwardedHops = (header: string | string[] | undefined): string[] =>
+  [header ?? []]
+    .flat()
+    .flatMap((h) => h.split(','))
+    .map((h) => h.trim())
+    .filter(Boolean);
 
 /**
  * The shared webhook server listens on every interface, and the voice routes are meant to be reached
@@ -70,11 +76,7 @@ export function admitsVoiceModePeer(
   if (isLoopbackAddress(peer) && !(trusted && policy.allowedClients.configured)) return true;
   if (!trusted) return false;
   if (!policy.allowedClients.configured) return true;
-  const hops = [forwardedFor ?? []]
-    .flat()
-    .flatMap((h) => h.split(','))
-    .map((h) => h.trim())
-    .filter(Boolean);
+  const hops = forwardedHops(forwardedFor);
   const client = hops.findLast((h) => !policy.trustedProxies.has(h)) ?? hops[0] ?? peer;
   return policy.allowedClients.has(client);
 }
@@ -98,11 +100,7 @@ export function clientAddress(req: IncomingMessage): string {
   const peer = req.socket.remoteAddress ?? 'unknown';
   const trusted = trustedProxies();
   if (!trusted.has(peer)) return peer;
-  const hops = [req.headers['x-forwarded-for'] ?? []]
-    .flat()
-    .flatMap((h) => h.split(','))
-    .map((h) => h.trim())
-    .filter(Boolean);
+  const hops = forwardedHops(req.headers['x-forwarded-for']);
   const client = hops.findLast((h) => !trusted.has(h));
   return client && net.isIP(client) ? client : peer;
 }

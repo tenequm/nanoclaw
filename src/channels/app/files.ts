@@ -216,17 +216,6 @@ export function createFileService(deps: FileDeps) {
       },
       key(),
     );
-    await deps
-      .db()
-      .run(
-        'INSERT INTO app_file_tickets (id, file_id, device_id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        randomUUID(),
-        row.id,
-        deviceId,
-        row.user_id,
-        expiresAt,
-        Date.now(),
-      );
     return {
       fileId: row.id,
       ticket: value,
@@ -319,16 +308,19 @@ export function createFileService(deps: FileDeps) {
     const authorization = ctx.req.headers.authorization ?? '';
     const value = authorization.startsWith('HeyDan-Ticket ') ? authorization.slice(14) : '';
     const claims = readTicket(value, secret);
-    if (!claims)
+    if (!claims) {
+      const expired = readTicket(value, secret, 0);
       refuse(
         401,
-        readTicket(value, secret, 0) ? 'ticket_expired' : 'bad_signature',
-        readTicket(value, secret, 0) ? 'The upload link expired.' : 'The upload ticket is invalid.',
+        expired ? 'ticket_expired' : 'bad_signature',
+        expired ? 'The upload link expired.' : 'The upload ticket is invalid.',
       );
+    }
     if (claims.fileId !== ctx.params.id) refuse(401, 'bad_signature', 'The ticket is for another file.');
+    let revoked = false;
     const live = async () => {
       const device = await deps.getLiveDevice(claims.deviceId);
-      if (!device || device.user_id !== claims.userId)
+      if (revoked || !device || device.user_id !== claims.userId)
         refuse(401, 'device_revoked', 'This device is no longer paired.');
     };
     await live();
@@ -343,7 +335,6 @@ export function createFileService(deps: FileDeps) {
     await fs.mkdir(tempRoot, { recursive: true });
     const temporary = path.join(tempRoot, randomUUID());
     const handle = await fs.open(temporary, 'wx', 0o600);
-    let revoked = false;
     const unsubscribe = deps.onDeviceRevoked((id) => {
       if (id === claims.deviceId) {
         revoked = true;
@@ -365,7 +356,6 @@ export function createFileService(deps: FileDeps) {
         refuse(400, 'bad_body', 'The request body does not match its signature.');
       await handle.close();
       await live();
-      if (revoked) refuse(401, 'device_revoked', 'This device is no longer paired.');
       try {
         await fs.link(temporary, target);
         published = true;
@@ -377,7 +367,6 @@ export function createFileService(deps: FileDeps) {
           refuse(409, 'conflict', 'Different bytes were already uploaded for this file.');
       }
       await live();
-      if (revoked) refuse(401, 'device_revoked', 'This device is no longer paired.');
       const metadata = fileMetadata(await readHead(target), row.name);
       const result = await deps
         .db()
@@ -519,11 +508,7 @@ export function createFileService(deps: FileDeps) {
           'SELECT * FROM app_files WHERE created_at < ? AND (message_id IS NULL OR NOT EXISTS (SELECT 1 FROM app_messages WHERE app_messages.id = app_files.message_id))',
           now - DAY,
         );
-      for (const row of rows) {
-        await deps.db().run('DELETE FROM app_file_tickets WHERE file_id=?', row.id);
-        await deps.db().run('DELETE FROM app_files WHERE id=?', row.id);
-      }
-      await deps.db().run('DELETE FROM app_file_tickets WHERE expires_at <= ?', now);
+      for (const row of rows) await deps.db().run('DELETE FROM app_files WHERE id=?', row.id);
       return rows;
     });
     for (const row of removed) await fs.rm(path.join(root, row.id), { force: true });

@@ -23,7 +23,7 @@ const pair = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
 const productionPair = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
 const warn = vi.fn();
 beforeEach(async () => {
-  directory = mkdtempSync(join(tmpdir(), 'n4-apns-'));
+  directory = mkdtempSync(join(tmpdir(), 'app-apns-'));
   writeFileSync(join(directory, 'key.p8'), pair.privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
   writeFileSync(join(directory, 'production.p8'), productionPair.privateKey.export({ type: 'pkcs8', format: 'pem' }), {
     mode: 0o600,
@@ -134,10 +134,7 @@ it('sends the fixture over HTTP/2 and signs reusable per-environment ES256 token
     ),
   ).toBe(true);
   expect(requests[3].port).toBe(productionPort);
-  expect(
-    JSON.parse(Buffer.from(String(requests[3].headers.authorization).slice(7).split('.')[0], 'base64url').toString())
-      .kid,
-  ).toBe('production');
+  expect(JSON.parse(Buffer.from(ph, 'base64url').toString()).kid).toBe('production');
 });
 it.each(['Unregistered', 'BadDeviceToken', 'ExpiredToken', 'DeviceTokenNotForTopic'])(
   'marks %s dead without retry',

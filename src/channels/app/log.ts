@@ -26,24 +26,7 @@ export interface AppHooks {
     agentGroupId: string,
   ): Promise<{ canCall: boolean; callRefusal: { error: string; message: string } | null }>;
 }
-export const appHooks: AppHooks = {
-  claimFiles: async (_db, c) => (c.fileIds.length ? { ok: false, fileId: c.fileIds[0] } : { ok: true, files: [] }),
-  stageFiles: async () => [],
-  storeOutboundFiles: async () => [],
-  statuses: async (ids) =>
-    ids.map((conversationId) => ({
-      kind: 'status',
-      conversationId,
-      rev: 0,
-      state: 'idle',
-      label: null,
-      at: Date.now(),
-    })),
-  callAvailability: async () => ({
-    canCall: false,
-    callRefusal: { error: 'voice_offline', message: 'Calls are offline right now.' },
-  }),
-};
+export const appHooks = {} as AppHooks;
 export function setAppHooks(hooks: Partial<AppHooks>): void {
   Object.assign(appHooks, hooks);
 }

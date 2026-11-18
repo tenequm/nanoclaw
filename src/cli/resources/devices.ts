@@ -3,12 +3,8 @@ import { getDb } from '../../db/connection.js';
 import { mintPairingLink } from '../../modules/device-auth/pairing.js';
 import { revokeDevice } from '../../modules/device-auth/verify.js';
 import { registerResource } from '../crud.js';
-export { revokeDevice };
 export async function listDevices(userId: string): Promise<DeviceRow[]> {
   return getDb().all<DeviceRow>('SELECT * FROM device_auth_devices WHERE user_id = ? ORDER BY created_at, id', userId);
-}
-export async function pairDevice(userId: string, agentIds: string[]): Promise<string> {
-  return mintPairingLink(userId, [...new Set(agentIds)]);
 }
 registerResource({
   name: 'device',
@@ -40,7 +36,7 @@ registerResource({
           .map((id) => id.trim())
           .filter(Boolean);
         if (!ids.length) throw new Error('--agents must name at least one agent');
-        return pairDevice(args.user as string, ids);
+        return mintPairingLink(args.user as string, [...new Set(ids)]);
       },
       formatHuman: (data) => String(data),
     },

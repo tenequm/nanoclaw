@@ -99,7 +99,6 @@ export const answerQuestion: AppHandler = async (ctx) => {
   const c = await accessibleConversation(ctx, row.conversation_id, true);
   if (!c) return;
   const body = await requestBody(ctx);
-  if (!body) return;
   const { value } = body;
   if (typeof value !== 'string' || !questionEntity(row).options.some((o) => o.value === value)) {
     json(ctx.res, 400, { error: 'bad_request', message: 'The request is malformed.' });

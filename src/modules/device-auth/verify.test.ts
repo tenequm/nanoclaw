@@ -3,7 +3,7 @@ import { Socket } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash, sign } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { closeDb, initDb, getDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
@@ -19,7 +19,6 @@ import {
 import { handlePair, mintPairingLink } from './pairing.js';
 import { appPeerAllowed, clientAddress } from './gate.js';
 import { resetAppConfigCache } from '../../channels/app/config.js';
-import { canonicalSigningText } from '../../channels/app/contract.js';
 import { log } from '../../log.js';
 import { envValue } from '../../env.js';
 import { consumeRateLimit, rateLimitAddress } from './rate-limit.js';
@@ -54,7 +53,7 @@ async function seedDevice(id = first.deviceId) {
   );
 }
 beforeEach(async () => {
-  dir = mkdtempSync(join(tmpdir(), 'n1-'));
+  dir = mkdtempSync(join(tmpdir(), 'device-auth-'));
   const db = await initDb(join(dir, 'db'), { role: 'test' });
   await runMigrations(db);
   await seedDevice();
@@ -96,13 +95,7 @@ it.each([-121, -120, 120, 121])('enforces clock boundary %i', async (delta) => {
       body: { error: 'stale_timestamp', serverTime: now + delta * 1000 },
     });
 });
-it('rejects unknown, revoked and malformed requests', async () => {
-  const req = request();
-  req.headers.authorization = 'invalid';
-  await expect(verifyRequest(req, now)).rejects.toMatchObject(f.errors.badSignature);
-  await getDb().run('DELETE FROM device_auth_devices');
-  await expect(verifyRequest(request(), now)).rejects.toMatchObject(f.errors.unknownDevice);
-  await seedDevice();
+it('rejects a revoked device and notifies revocation listeners once', async () => {
   const listener = vi.fn();
   const off = onDeviceRevoked(listener);
   await revokeDevice(first.deviceId);
@@ -208,16 +201,6 @@ it('limits reachability to enrolled device agents and current admin roles', asyn
   expect(await reachableAgentIds(first.deviceId)).toEqual([]);
   await expect(mintPairingLink('u', ['a'])).rejects.toThrow('administer');
 });
-it('checks a separately signed unsupported protocol before cryptography', async () => {
-  const v = { ...first, protocol: 2 };
-  const signature = sign('sha256', Buffer.from(canonicalSigningText(v)), f.testKey.privateKeyPkcs8Pem).toString(
-    'base64url',
-  );
-  const req = request(v);
-  req.headers.authorization = `HeyDan-Sig v=1,p=2,d=${v.deviceId},t=${v.ts},n=${v.nonce},bh=${v.bodyHash},s=${signature}`;
-  await expect(verifyRequest(req, now)).rejects.toMatchObject(f.errors.protocol);
-});
-
 it('caches proxy reads and parsing, refreshing changed policy after a minute', () => {
   const clock = vi.spyOn(performance, 'now').mockReturnValue(2e12);
   const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});

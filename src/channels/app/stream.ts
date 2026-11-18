@@ -36,10 +36,9 @@ const streams = new Map<string, Set<() => void>>();
 type Pending = { event: EventRow } | { status: Status } | { badge: true } | { ping: true };
 
 export const streamEvents: AppHandler = (ctx) => openStream(ctx, configured);
-export async function openStream({ req, res, identity }: AppRequest, deps?: StreamDeps): Promise<void> {
+export async function openStream({ req, res, identity }: AppRequest, deps: StreamDeps): Promise<void> {
   if (res.destroyed || res.writableEnded) return;
   if (!identity) return json(res, 401, { error: 'device_revoked', message: 'Device authentication required.' });
-  if (!deps) return json(res, 503, { error: 'unavailable', message: 'Event stream is unavailable.' });
   const afterText = new URL(req.url!, 'http://localhost').searchParams.get('after');
   if (afterText === null || !/^(0|[1-9][0-9]*)$/.test(afterText) || !Number.isSafeInteger(Number(afterText)))
     return json(res, 400, { error: 'bad_request', message: 'Invalid cursor.' });

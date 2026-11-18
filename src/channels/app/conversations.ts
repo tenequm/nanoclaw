@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { getDb } from '../../db/connection.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { readSignedBody } from '../../modules/device-auth/verify.js';
+import { authError, readSignedBody } from '../../modules/device-auth/verify.js';
 import { parseAuthorization, type Conversation, type Badge, type Message, type Question } from './contract.js';
 import type { ConversationRow, MessageRow, QuestionRow } from './db.js';
 import { appHooks, appTransaction, appendEvent, lastEventSeq, afterAppCommit } from './log.js';
@@ -10,7 +10,6 @@ import { json, type AppHandler, type AppRequest } from './routes.js';
 
 export const getConversation = (id: string): Promise<ConversationRow | undefined> =>
   getDb().get('SELECT * FROM app_conversations WHERE id = ?', id);
-export const getConversationByPlatformId = getConversation;
 export async function conversationsFor(userId: string, agentIds: string[]): Promise<ConversationRow[]> {
   return (
     await getDb().all<ConversationRow>(
@@ -229,40 +228,31 @@ export async function accessibleConversation(
   }
   return c;
 }
-export async function requestBody(ctx: AppRequest): Promise<Record<string, unknown> | undefined> {
+export async function requestBody(ctx: AppRequest, maxBytes = 256 * 1024): Promise<Record<string, unknown>> {
   const auth = parseAuthorization(ctx.req.headers.authorization);
-  if (!auth) {
-    json(ctx.res, 401, { error: 'bad_signature', message: 'The request signature is not valid.' });
-    return;
-  }
-  const bytes = await readSignedBody(ctx.req, auth.bodyHash, 256 * 1024);
-  let body: unknown;
+  if (!auth) throw authError(401, 'bad_signature', 'The request signature is not valid.');
+  const bytes = await readSignedBody(ctx.req, auth.bodyHash, maxBytes);
+  let body: unknown = null;
   try {
     body = JSON.parse(bytes.toString('utf8'));
   } catch {
-    json(ctx.res, 400, { error: 'bad_request', message: 'The request is malformed.' });
-    return;
+    /* Malformed JSON is the same refusal as a non-object. */
   }
-  if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    json(ctx.res, 400, { error: 'bad_request', message: 'The request is malformed.' });
-    return;
-  }
+  if (!body || typeof body !== 'object' || Array.isArray(body))
+    throw authError(400, 'bad_request', 'The request is malformed.');
   return body as Record<string, unknown>;
 }
 export const listConversations: AppHandler = async (ctx) => {
-  if (!ctx.identity) {
-    json(ctx.res, 401, { error: 'unknown_device', message: 'This device is not paired.' });
-    return;
-  }
+  const { userId, agentIds } = ctx.identity!;
   const seq = await lastEventSeq();
-  for (const id of ctx.identity.agentIds) await ensureConversation(ctx.identity.userId, id);
-  const rows = await conversationsFor(ctx.identity.userId, ctx.identity.agentIds);
+  for (const id of agentIds) await ensureConversation(userId, id);
+  const rows = await conversationsFor(userId, agentIds);
   const conversations = [];
   for (const row of rows) conversations.push(await conversationEntity(row));
   json(ctx.res, 200, {
     conversations,
     statuses: await appHooks.statuses(rows.map((c) => c.id)),
-    badge: await badgeFor(ctx.identity.userId, ctx.identity.agentIds),
+    badge: await badgeFor(userId, agentIds),
     seq,
   });
 };
@@ -321,7 +311,6 @@ export const markRead: AppHandler = async (ctx) => {
   const c = await accessibleConversation(ctx);
   if (!c) return;
   const body = await requestBody(ctx);
-  if (!body) return;
   const { order } = body;
   if (typeof order !== 'number' || !Number.isSafeInteger(order) || order < 0) {
     json(ctx.res, 400, { error: 'bad_request', message: 'The request is malformed.' });
@@ -344,7 +333,7 @@ export const markRead: AppHandler = async (ctx) => {
       c.id,
       Math.min(order, newest),
     );
-    if (result.changes && (await conversationEntity(c, availability)).readOrder > 0) {
+    if (result.changes && Math.min(order, newest) > 0) {
       await bumpBadge(c.user_id);
       return conversationEvent((await getConversation(c.id))!, availability);
     }

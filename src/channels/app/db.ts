@@ -1,21 +1,5 @@
 import { registerMigration } from '../../db/migrations/index.js';
 
-export const schemaTables = [
-  'app_conversations',
-  'app_events',
-  'app_messages',
-  'app_questions',
-  'app_routing_jobs',
-  'app_read_state',
-  'app_statuses',
-  'app_badge_revisions',
-  'app_files',
-  'app_file_tickets',
-  'app_push_tokens',
-  'app_call_attempts',
-  'app_applied_sources',
-] as const;
-
 export interface ConversationRow {
   id: string;
   user_id: string;
@@ -82,21 +66,12 @@ export interface RoutingJobRow {
   finished_at: number | null;
   error_json: string | null;
 }
-export interface ReadStateRow {
-  user_id: string;
-  conversation_id: string;
-  read_order: number;
-}
 export interface StatusRow {
   conversation_id: string;
   rev: number;
   state: string;
   label: string | null;
   at: number;
-}
-export interface BadgeRevisionRow {
-  user_id: string;
-  rev: number;
 }
 export interface FileRow {
   id: string;
@@ -113,14 +88,6 @@ export interface FileRow {
   uploaded_at: number | null;
   message_id: string | null;
   conversation_id: string | null;
-  created_at: number;
-}
-export interface FileTicketRow {
-  id: string;
-  file_id: string;
-  device_id: string;
-  user_id: string;
-  expires_at: number;
   created_at: number;
 }
 export interface PushTokenRow {
@@ -156,7 +123,6 @@ registerMigration({
       CREATE TABLE IF NOT EXISTS app_statuses (conversation_id TEXT PRIMARY KEY, rev INTEGER NOT NULL, state TEXT NOT NULL, label TEXT, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS app_badge_revisions (user_id TEXT PRIMARY KEY, rev INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS app_files (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT, upload_key TEXT, name TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, kind TEXT NOT NULL, width INTEGER, height INTEGER, storage_path TEXT, uploaded_at INTEGER, message_id TEXT, conversation_id TEXT, created_at INTEGER NOT NULL, UNIQUE (user_id, upload_key));
-      CREATE TABLE IF NOT EXISTS app_file_tickets (id TEXT PRIMARY KEY, file_id TEXT NOT NULL, device_id TEXT NOT NULL, user_id TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS app_push_tokens (device_id TEXT PRIMARY KEY, token TEXT NOT NULL, environment TEXT NOT NULL CHECK (environment IN ('sandbox', 'production')), updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS app_call_attempts (user_id TEXT NOT NULL, attempt_id TEXT NOT NULL, device_id TEXT NOT NULL, conversation_id TEXT, call_id TEXT UNIQUE, state TEXT NOT NULL, jev INTEGER, reason TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (user_id, attempt_id));
       CREATE TABLE IF NOT EXISTS app_applied_sources (conversation_id TEXT NOT NULL, source_id TEXT NOT NULL, entity_id TEXT NOT NULL, PRIMARY KEY (conversation_id, source_id));

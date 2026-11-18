@@ -5,13 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { StreamParser, guard, target, revokedStreamClosed, runAppClient } from './app-client.js';
-import { signRequest } from './app-sign.js';
-import {
-  bodySHA256,
-  canonicalSigningText,
-  parseAuthorization,
-  verifyRequestSignature,
-} from '../src/channels/app/contract.js';
+import { bodySHA256 } from '../src/channels/app/contract.js';
 const fixture = JSON.parse(
   readFileSync(new URL('../src/channels/app/app-contract.fixtures.json', import.meta.url), 'utf8'),
 );
@@ -49,7 +43,7 @@ describe('stream byte framing', () => {
     expect(parser.cursor).toBe(4);
   });
 });
-describe('canonical targets and signing', () => {
+describe('canonical targets', () => {
   it('builds the encoded fixture target', () => {
     expect(
       target(
@@ -65,34 +59,6 @@ describe('canonical targets and signing', () => {
   it('rejects noncanonical segments', () => {
     for (const segment of ['', '.', '..', 'x;y']) expect(() => target(['app', segment])).toThrow();
   });
-  for (const vector of fixture.signing.vectors)
-    it(vector.name, () => {
-      expect(verifyRequestSignature(vector, vector.signature, fixture.testKey.publicKeySpki)).toBe(
-        vector.signatureValid,
-      );
-      const auth = parseAuthorization(
-        signRequest({
-          privateKey: fixture.testKey.privateKeyPkcs8Pem,
-          deviceId: vector.deviceId,
-          method: vector.method,
-          target: vector.target,
-          body: Buffer.from(vector.body),
-          protocol: vector.protocol,
-          ts: vector.ts,
-          nonce: vector.nonce,
-        }),
-      )!;
-      expect(canonicalSigningText({ ...auth, method: vector.method, target: vector.target })).toBe(
-        canonicalSigningText(vector),
-      );
-      expect(
-        verifyRequestSignature(
-          { ...auth, method: vector.method, target: vector.target },
-          auth.signature,
-          fixture.testKey.publicKeySpki,
-        ),
-      ).toBe(true);
-    });
 });
 describe('remote guard', () => {
   it('requires remote opt-in and an explicit allowed agent', () => {
@@ -149,28 +115,15 @@ async function fakeApp(options: FakeOptions = {}) {
     return {
       kind: 'message',
       id: `msg_${n}`,
-      conversationId,
       order: n,
       role,
       text,
       files: [],
-      editedAt: null,
       ...extra,
     };
   };
   for (const text of ['One', 'Two', 'Three']) append(message('agent', text));
-  const conversation = () => ({
-    kind: 'conversation',
-    id: conversationId,
-    seq,
-    agent,
-    lastMessage: null,
-    unread: unread(),
-    readOrder,
-    canCall: false,
-    callRefusal: null,
-    createdAt: 0,
-  });
+  const conversation = () => ({ id: conversationId, agent, readOrder });
   async function handle(req: IncomingMessage, res: ServerResponse) {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);

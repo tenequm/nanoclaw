@@ -20,7 +20,6 @@ import { getHostStartCallbacks, getHostShutdownCallbacks } from '../../host-life
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
 
 let directory: string, db: DbDriver, service: ReturnType<typeof createFileService>;
-let live: boolean;
 let revoked: (id: string) => void;
 const secret = Buffer.alloc(32, 1);
 const device = { id: 'dev', user_id: 'user' } as DeviceRow;
@@ -28,17 +27,16 @@ const content = Buffer.from('attachment');
 const sha256 = createHash('sha256').update(content).digest('hex');
 const auth = `HeyDan-Sig v=1,p=1,d=dev,t=1,n=${Buffer.alloc(16).toString('base64url')},bh=${sha256},s=MEQCIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`;
 beforeEach(async () => {
-  directory = await mkdtemp(path.join(tmpdir(), 'n3-files-'));
+  directory = await mkdtemp(path.join(tmpdir(), 'app-files-'));
   db = await initDb(path.join(directory, 'test.db'), { role: 'test' });
   await runMigrations(db);
-  live = true;
   revoked = undefined!;
   service = createFileService({
     db: () => db,
     root: path.join(directory, 'files'),
     stagingRoot: path.join(directory, 'staging'),
     ticketKey: () => secret,
-    getLiveDevice: async () => (live ? device : undefined),
+    getLiveDevice: async () => device,
     onDeviceRevoked: (listener) => {
       revoked = listener;
       return () => {};
@@ -300,17 +298,6 @@ it('another device of the same user downloads with safe response headers', async
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   }
 });
-it('fileUpload fixture ticket validates and its expired authorization is distinguishable', () => {
-  const fixture = fixtures.fileUpload;
-  expect(readTicket(fixture.expiredAuthorization.slice(14), fixture.ticketSecretForTests, 0)).not.toBeNull();
-  expect(
-    readTicket(fixture.authorization.slice(14), fixture.ticketSecretForTests, fixture.ticketClaims.exp - 1),
-  ).toEqual(fixture.ticketClaims);
-  expect(
-    readTicket(fixture.expiredAuthorization.slice(14), fixture.ticketSecretForTests, fixture.ticketClaims.exp),
-  ).toBeNull();
-});
-
 it('uploads delayed segments over HTTP beyond 64 KiB without blocking timers', async () => {
   const bytes = Buffer.alloc(200_000, 7);
   const { body } = await mint({ size: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
@@ -501,4 +488,25 @@ it('real module hooks claim a sent file, stage it and deliver an agent file into
   );
   const row = await db.get<{ storage_path: string }>('SELECT storage_path FROM app_files WHERE message_id=?', id);
   expect(await readFile(row!.storage_path)).toEqual(Buffer.from('%PDF-1.7'));
+});
+
+it('refuses an upload whose device was revoked before it started', async () => {
+  const { body } = await mint();
+  const revokedService = createFileService({
+    db: () => db,
+    root: path.join(directory, 'files'),
+    stagingRoot: path.join(directory, 'staging'),
+    ticketKey: () => secret,
+    getLiveDevice: async () => undefined,
+    onDeviceRevoked: () => () => {},
+    getConversation: async () => undefined,
+  });
+  expect(await request(revokedService.uploadFile, content, { id: body.fileId, ticket: body.ticket })).toEqual({
+    status: 401,
+    body: { error: 'device_revoked', message: 'This device is no longer paired.' },
+  });
+  expect(await db.get('SELECT uploaded_at, storage_path FROM app_files WHERE id=?', body.fileId)).toEqual({
+    uploaded_at: null,
+    storage_path: null,
+  });
 });

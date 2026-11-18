@@ -1,14 +1,5 @@
 import { registerMigration } from '../../db/migrations/index.js';
 
-export const schemaTables = [
-  'device_auth_devices',
-  'device_auth_device_agents',
-  'device_auth_user_agents',
-  'device_auth_pairing_codes',
-  'device_auth_nonces',
-  'device_auth_rate_limits',
-] as const;
-
 export interface DeviceRow {
   id: string;
   user_id: string;
@@ -19,15 +10,6 @@ export interface DeviceRow {
   last_seen_at: number | null;
   revoked_at: number | null;
 }
-export interface DeviceAgentRow {
-  device_id: string;
-  agent_group_id: string;
-}
-export interface UserAgentRow {
-  user_id: string;
-  agent_group_id: string;
-  created_at: number;
-}
 export interface PairingCodeRow {
   code_hash: string;
   user_id: string;
@@ -35,17 +17,6 @@ export interface PairingCodeRow {
   created_at: number;
   expires_at: number;
   consumed_at: number | null;
-}
-export interface NonceRow {
-  device_id: string;
-  nonce: string;
-  signed_at: number;
-  expires_at: number;
-}
-export interface RateLimitRow {
-  bucket_key: string;
-  count: number;
-  reset_at: number;
 }
 
 registerMigration({

@@ -9,7 +9,7 @@ import { isHostWrittenOutbound } from '../../session-manager.js';
 import type { Message, Question } from './contract.js';
 import type { MessageRow } from './db.js';
 import { appTransaction, appendEvent, appHooks } from './log.js';
-import { getConversationByPlatformId, getConversation, messageEntity, itemChanged } from './conversations.js';
+import { getConversation, messageEntity, itemChanged } from './conversations.js';
 import { saveMessage } from './send.js';
 import { CALLER_MARK, SPOKEN_MARK } from '../voice-mode-livekit.js';
 
@@ -25,14 +25,8 @@ async function heldByHostApproval(db: DbDriver, id: string): Promise<boolean> {
   return false;
 }
 export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, message) => {
-  let db;
-  try {
-    db = getDb();
-  } catch {
-    log.warn('App delivery has no database');
-    return undefined;
-  }
-  const c = await getConversationByPlatformId(platformId);
+  const db = getDb();
+  const c = await getConversation(platformId);
   if (!c) {
     log.warn('App delivery has no conversation');
     return undefined;
