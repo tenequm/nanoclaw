@@ -760,6 +760,7 @@ export function toInboundMessage(
       content,
       timestamp: new Date(msg.date * 1000).toISOString(),
       isMention: detectMention(ctx, botUsername, botUserId),
+      isGroup: chat.type !== 'private',
     },
   };
 }

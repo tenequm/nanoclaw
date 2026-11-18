@@ -301,6 +301,8 @@ export async function handleVoiceCommand(
   const cmd = voiceCommandName(event.channelType);
   // Straight to the chat's adapter, never through a session: the agent must not hold the call link.
   const say = (text: string) => adapter.deliver(event.platformId, threadId, { kind: 'chat', content: { text } });
+  // The message's own flag first: a group the router created on a mention can be stored as is_group 0.
+  const inGroup = event.message.isGroup ?? mg.is_group === 1;
   const mode: VoiceMode = !JEV_API_KEY ? null : command.plain ? 'plain' : 'jev';
   try {
     if (command.jev && !JEV_API_KEY) {
@@ -311,11 +313,11 @@ export async function handleVoiceCommand(
         return true;
       }
       const text = mine.length > 0 ? noJev(cmd) : voiceCommandReply({ kind: 'refused' }, cmd)!;
-      if (mg.is_group === 0 || !privateReply || (await privateReply(text)) !== 'sent') await say(text);
+      if (!inGroup || !privateReply || (await privateReply(text)) !== 'sent') await say(text);
       return true;
     }
     // Without a private reply a group's links go to the direct chat: check it first, so /voice new ends no call for nothing.
-    if (command.renew && mg.is_group !== 0 && !privateReply && !(await directChat(userId, instance))) {
+    if (command.renew && inGroup && !privateReply && !(await directChat(userId, instance))) {
       await say(noDirectChat(cmd));
       return true;
     }
@@ -332,7 +334,7 @@ export async function handleVoiceCommand(
       log.info('/voice from an unknown sender dropped', { channelType: event.channelType });
       return true;
     }
-    if (mg.is_group === 0) {
+    if (!inGroup) {
       await say(text);
       return true;
     }

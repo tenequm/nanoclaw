@@ -608,6 +608,18 @@ describe('handleVoiceCommand (the interceptor)', () => {
     expect((await lines())[0]).toMatchObject({ messaging_group_id: 'mg-group' });
   });
 
+  it('treats a message flagged as a group as one even when its chat is stored as direct', async () => {
+    await startChat(false);
+    await chatGroup('mg-group', 'chat:G1', 0);
+    await wire('mg-group', 'ag-1');
+    const flagged = event('/voice', OWNER, 'chat:G1');
+    flagged.message.isGroup = true;
+    await handleVoiceCommand(flagged, callUrl);
+    expect(inGroup().map(textOf)).toEqual(['Your call link is in our direct chat.']);
+    expect(direct()).toHaveLength(1);
+    expect(textOf(direct()[0])).toMatch(/voice\?t=[0-9a-f]{32}/);
+  });
+
   it('in a group chat with a private reply, the link goes there and nowhere else', async () => {
     await startChat(false);
     await groupChat();

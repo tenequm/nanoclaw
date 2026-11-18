@@ -253,6 +253,11 @@ class TelegramGrammyAdapter implements ChannelAdapter {
     return this.connected;
   }
 
+  /** A private chat's id is its user's id: the DM address is the handle in this adapter's platform-id form. */
+  async openDM(userHandle: string): Promise<string> {
+    return `telegram:${userHandle}`;
+  }
+
   async deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
     const rt = this.runtime;
     if (!rt) return undefined;
