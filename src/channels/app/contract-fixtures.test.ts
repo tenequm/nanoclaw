@@ -299,6 +299,36 @@ describe('signed HTTP fixture producers', () => {
       content: { type: 'ask_question', questionId, title: q.title, question: q.text, options: q.options, expiresAt },
     });
   }
+  async function replay(after: number): Promise<string> {
+    const target = `/app/events?after=${after}`;
+    const controller = new AbortController();
+    const response = await fetch(base + target, {
+      signal: controller.signal,
+      headers: {
+        authorization: signRequest({
+          privateKey: fixtures.testKey.privateKeyPkcs8Pem,
+          deviceId: device,
+          method: 'GET',
+          target,
+        }),
+      },
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    let raw = '';
+    try {
+      const decoder = new TextDecoder();
+      while (!/event: synchronized\ndata: [^\n]+\n\n/.test(raw)) {
+        const next = await reader.read();
+        if (next.done) break;
+        raw += decoder.decode(next.value, { stream: true });
+      }
+      return raw;
+    } finally {
+      controller.abort();
+      await reader.cancel().catch(() => {});
+    }
+  }
   it('replays seeded fixture frames through signed HTTP dispatch', async () => {
     const frames = fixtures.stream.raw
       .split('\n\n')
@@ -347,38 +377,12 @@ describe('signed HTTP fixture producers', () => {
       statuses: async () => [fixtures.statuses.working as Status],
       badgeFor: async () => fixtures.conversations.badge,
     });
-    const target = '/app/events?after=118';
-    const controller = new AbortController();
-    const response = await fetch(base + target, {
-      signal: controller.signal,
-      headers: {
-        authorization: signRequest({
-          privateKey: fixtures.testKey.privateKeyPkcs8Pem,
-          deviceId: device,
-          method: 'GET',
-          target,
-        }),
-      },
-    });
-    expect(response.status).toBe(200);
-    const reader = response.body!.getReader();
-    let raw = '';
-    try {
-      while (!raw.includes('event: synchronized')) {
-        const next = await reader.read();
-        if (next.done) break;
-        raw += new TextDecoder().decode(next.value);
-      }
-      expect(raw).toBe(
-        frames
-          .slice(0, sync + 1)
-          .map((frame) => frame.raw)
-          .join(''),
-      );
-    } finally {
-      controller.abort();
-      await reader.cancel().catch(() => {});
-    }
+    expect(await replay(118)).toBe(
+      frames
+        .slice(0, sync + 1)
+        .map((frame) => frame.raw)
+        .join(''),
+    );
   });
   it('produces the call grant through signed dispatch and the real voice adapter', async () => {
     vi.stubEnv('APP_LIVEKIT_URL', fixtures.callGrant.url);
@@ -573,7 +577,7 @@ describe('signed HTTP fixture producers', () => {
       same((await items())[0], expected);
     },
   );
-  it('delivers the rich card fixture to signed history and the event log', async () => {
+  it('replays the rich card fixture, preserves it on reaction and clears it on edit', async () => {
     const expected = fixtures.messages.richCard;
     const sourceId = randomUUID();
     const content = {
@@ -621,8 +625,39 @@ describe('signed HTTP fixture producers', () => {
     const history = await items();
     expect(history).toHaveLength(1);
     same(history[0], expected);
+    const raw = await replay(0);
+    const frame = raw.split('\n\n').find((frame) => frame.startsWith(`id: ${history[0].seq}\nevent: message\n`));
+    expect(JSON.parse(frame!.split('\ndata: ')[1])).toEqual(history[0]);
+
+    await deliver(conversation, null, {
+      kind: 'chat',
+      sourceId: randomUUID(),
+      content: { operation: 'reaction', messageId: id, emoji: '👍' },
+    });
+    const [reacted] = await items();
+    expect(reacted).toMatchObject({
+      id,
+      order: history[0].order,
+      text: expected.text,
+      card: expected.card,
+      reactions: [{ emoji: '👍', by: 'agent' }],
+    });
+    await deliver(conversation, null, {
+      kind: 'chat',
+      sourceId: randomUUID(),
+      content: { operation: 'edit', messageId: id, text: 'Corrected' },
+    });
+    const [edited] = await items();
+    expect(edited).toMatchObject({
+      id,
+      order: reacted.order,
+      text: 'Corrected',
+      card: null,
+      editedAt: expect.any(Number),
+      reactions: reacted.reactions,
+    });
     const events = (await readEventsAfter(0, 100, user)).filter((row) => row.entity_id === id);
-    expect(events.map((row) => JSON.parse(row.entity_json))).toEqual(history);
+    expect(events.map((row) => JSON.parse(row.entity_json))).toEqual([history[0], reacted, edited]);
   });
   it('produces attachment metadata from real outbound bytes', async () => {
     const expected = fixtures.messages.agentWithFiles;

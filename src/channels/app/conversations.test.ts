@@ -6,7 +6,7 @@ import { Socket } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { getDb, initSqliteTestDb, closeDb } from '../../db/connection.js';
-import { runMigrations } from '../../db/migrations/index.js';
+import { getRegisteredMigrations, runMigrations } from '../../db/migrations/index.js';
 import { getHostStartCallbacks, stopHostModules } from '../../host-lifecycle.js';
 import { deliver } from './deliver.js';
 import { configureFiles } from './files.js';
@@ -108,65 +108,218 @@ async function message(id: string) {
   return messageEntity((await getDb().get<MessageRow>('SELECT * FROM app_messages WHERE id=?', id))!);
 }
 
-it('drops malformed parts independently and keeps the first ten valid parts in order', async () => {
-  const pie = { type: 'pie', segments: [{ label: 'Passed', value: 2 }] };
+async function deliverCard(card: unknown, fallbackText = '') {
   const id = await deliver(conversationId, null, {
     kind: 'chat-sdk',
     sourceId: randomUUID(),
-    content: {
-      type: 'card',
-      card: {
-        title: 'Results',
-        children: [
-          null,
-          { type: 'Future' },
-          { type: 'Fields', children: [{}] },
-          {
-            type: 'Chart',
-            props: {
-              title: 'Invalid',
-              chart: { type: 'bar', categories: ['a'], series: [{ name: { toString: null }, values: [] }] },
-            },
-          },
-          'First',
-          { text: 'Second' },
-          { type: 'Chart', props: { title: 'Checks', chart: pie } },
-          { type: 'Table', props: { headers: ['Passed'], rows: [[2]] } },
-          ...Array.from({ length: 8 }, (_, i) => String(i)),
-        ],
-        actions: [
-          null,
-          { label: 'Invalid', url: '#' },
-          { label: 'Invalid', url: 'file:///tmp/test' },
-          { label: 'Details', url: 'https://example.com', style: 'unknown' },
-        ],
-      },
-    },
+    content: { type: 'card', card, fallbackText },
   });
-  expect(await message(id!)).toMatchObject({
-    text: 'Results',
-    card: {
-      title: 'Results',
-      description: null,
-      parts: [
-        { type: 'text', content: 'First', style: 'plain' },
-        { type: 'text', content: 'Second', style: 'plain' },
-        { type: 'chart', title: 'Checks', chart: pie },
-        { type: 'table', headers: ['Passed'], rows: [['2']], align: null, caption: null },
-        ...Array.from({ length: 6 }, (_, i) => ({ type: 'text', content: String(i), style: 'plain' })),
+  return message(id!);
+}
+
+it('drops malformed children independently and counts only typed parts toward ten', async () => {
+  const pie = { type: 'pie', segments: [{ label: 'Passed', value: 2 }] };
+  const dividers = Array.from({ length: 8 }, () => ({ type: 'Divider' }));
+  const strings = Array.from({ length: 19 }, (_, i) => String(i));
+  const delivered = await deliverCard({
+    children: [
+      null,
+      { type: 'Future' },
+      { type: 'Fields', children: [{}] },
+      {
+        type: 'Chart',
+        props: {
+          title: 'Invalid',
+          chart: { type: 'bar', categories: ['a'], series: [{ name: { toString: null }, values: [] }] },
+        },
+      },
+      'First',
+      { type: 'Table', text: 'Second' },
+      ...strings,
+      { type: 'Chart', props: { title: 'Checks', chart: pie } },
+      { type: 'Table', props: { headers: ['Passed', 'Suite'], rows: [[2, 'Unit']], align: ['right'] } },
+      ...dividers,
+      { type: 'Text', props: { content: 'Excess' } },
+    ],
+  });
+  expect(delivered.card?.parts).toEqual([
+    ...['First', 'Second', ...strings.slice(0, 18)].map((content) => ({ type: 'text', content, style: 'plain' })),
+    { type: 'chart', title: 'Checks', chart: pie },
+    { type: 'table', headers: ['Passed', 'Suite'], rows: [['2', 'Unit']], align: ['right'], caption: null },
+    ...dividers.map(() => ({ type: 'divider' })),
+  ]);
+});
+
+it('keeps an explicit fallback when the card has no usable content', async () => {
+  for (const card of [
+    null,
+    'card',
+    {},
+    { children: {}, actions: {} },
+    {
+      title: ' ',
+      description: '\t',
+      children: [
+        '',
+        '  ',
+        { text: '' },
+        { type: 'Future' },
+        { type: 'Chart', props: { title: 'X', chart: { type: 'pie', segments: [{ label: 'X', value: Infinity }] } } },
       ],
-      actions: [{ label: 'Details', url: 'https://example.com', style: 'default' }],
+      actions: [
+        { label: 'Skip', url: '#' },
+        { label: '   ', url: 'http://example.com' },
+      ],
     },
+  ]) {
+    expect(await deliverCard(card, 'Plain fallback')).toMatchObject({ card: null, text: 'Plain fallback' });
+  }
+});
+
+it('keeps up to one table, two charts and ten fields across groups', async () => {
+  const table = { type: 'Table', props: { headers: ['Checks'], rows: [[2]] } };
+  const chart = {
+    type: 'Chart',
+    props: { title: 'Chart', chart: { type: 'pie', segments: [{ label: 'Pass', value: 2 }] } },
+  };
+  const fields = (start: number) => ({
+    type: 'Fields',
+    children: Array.from({ length: 6 }, (_, i) => ({ type: 'Field', props: { label: 'Result', value: i + start } })),
+  });
+  const { card } = await deliverCard({
+    children: [table, table, chart, chart, chart, fields(0), fields(6), fields(12), 'End'],
+  });
+  expect(card?.parts.map((p) => p.type)).toEqual(['table', 'chart', 'chart', 'fields', 'fields', 'text']);
+  expect(card?.parts.flatMap((p) => (p.type === 'fields' ? p.fields.map((f) => f.value) : []))).toEqual(
+    Array.from({ length: 10 }, (_, i) => String(i)),
+  );
+});
+
+it('bounds titles, descriptions, plain text children and link buttons', async () => {
+  const long = 'x'.repeat(3000);
+  const { card } = await deliverCard({
+    title: 'x'.repeat(199) + '🎉',
+    description: long,
+    children: [long, { text: long }],
+    actions: Array.from({ length: 11 }, () => ({ label: long, url: 'http://example.com' })),
+  });
+  expect(card).toEqual({
+    title: 'x'.repeat(199),
+    description: long.slice(0, 2500),
+    parts: Array.from({ length: 2 }, () => ({ type: 'text', content: long.slice(0, 2500), style: 'plain' })),
+    actions: Array.from({ length: 10 }, () => ({
+      label: long.slice(0, 80),
+      url: 'http://example.com/',
+      style: 'default',
+    })),
   });
 });
 
-it('keeps host approval cards as plain text', async () => {
+it('charges escaped text and normalized URLs to the same 12000-character budget', async () => {
+  const url = 'https://example.com/';
+  const description = '"'.repeat(2500);
+  const chunk = 'a'.repeat(2500);
+  const remainder = 12000 - 1 - 5000 - 5000 - url.length - 1;
+  const { card } = await deliverCard({
+    title: 'T',
+    description,
+    children: [chunk, { type: 'Text', props: { content: chunk } }, { text: 'x'.repeat(remainder) }, 'x'.repeat(100)],
+    actions: [
+      { label: 'X', url: url.slice(0, -1) },
+      { label: 'Y', url },
+    ],
+  });
+  expect(card?.parts).toHaveLength(3);
+  expect(card?.actions).toEqual([{ label: 'X', url, style: 'default' }]);
+});
+
+it('stores canonical web URLs and drops unsupported, ambiguous and oversized links', async () => {
+  const base = 'https://example.com/';
+  const max = base.padEnd(2048, 'a');
+  const urls = [
+    '#',
+    'file:///tmp/test',
+    'javascript:void(0)',
+    'https://',
+    'https:///example.com',
+    'https://%',
+    ' ' + base,
+    base + ' ',
+    base + 'two words',
+    base + '\u0007bell',
+    'https://user@example.com',
+    'https://user:pass@example.com',
+    'https://@example.com',
+    max + 'a',
+    base + 'ü'.repeat(400),
+    'HTTPS://MÜNCHEN.DE/ä',
+    'http://example.com',
+    max,
+  ];
+  const { card } = await deliverCard({ actions: urls.map((url) => ({ label: 'Details', url, style: 'unknown' })) });
+  expect(card?.actions).toEqual(
+    ['https://xn--mnchen-3ya.de/%C3%A4', 'http://example.com/', max].map((url) => ({
+      label: 'Details',
+      url,
+      style: 'default',
+    })),
+  );
+});
+
+it('derives fallback text from the normalized title, description and first fields', async () => {
+  const fields = {
+    type: 'Fields',
+    children: ['One', 'Two', 'Three', 'Four'].map((label, value) => ({ type: 'Field', props: { label, value } })),
+  };
+  const input = { title: 'Results', description: 'Done', children: [fields] };
+  expect((await deliverCard(input, ' ')).text).toBe('Results\nDone\nOne: 0\nTwo: 1\nThree: 2');
+  expect((await deliverCard({ children: [fields] })).text).toBe('One: 0\nTwo: 1\nThree: 2');
+  expect((await deliverCard({ actions: [{ label: 'Details', url: 'https://example.com' }] })).text).toBe('Details');
+});
+
+it.each([
+  { sourceId: undefined, hostWritten: false, role: 'host' },
+  { sourceId: 'hcmd-agent', hostWritten: false, role: 'agent' },
+  { sourceId: 'appr-agent', hostWritten: false, role: 'agent' },
+  { sourceId: 'host-source', hostWritten: true, role: 'host' },
+])('keeps host or reserved card source $sourceId plain', async ({ sourceId, hostWritten, role }) => {
+  if (hostWritten) mocks.hostWritten.add(sourceId!);
   const id = await deliver(conversationId, null, {
     kind: 'chat-sdk',
+    sourceId,
     content: { type: 'card', card: { title: 'Request', description: 'Approval pending', children: ['Details'] } },
   });
-  expect(await message(id!)).toMatchObject({ role: 'host', text: 'Approval pending', card: null });
+  expect(await message(id!)).toMatchObject({ role, text: 'Approval pending', card: null });
 });
+
+it('upgrades an existing message before serving history and updating delivery', async () => {
+  const db = await initSqliteTestDb();
+  const migrations = getRegisteredMigrations().filter(
+    (m) => m.name === 'module:app:initial' || m.name === 'module:app:message-card',
+  );
+  await runMigrations(
+    db,
+    migrations.filter((m) => m.name === 'module:app:initial'),
+  );
+  await db.run(
+    "INSERT INTO app_conversations (id,user_id,agent_group_id,messaging_group_id,seq,created_at) VALUES (?,'telegram:owner','ag_taylor',?,1,1)",
+    conversationId,
+    conversationId,
+  );
+  await db.run(
+    "INSERT INTO app_messages (id,conversation_id,user_id,item_order,seq,role,text,files_json,reactions_json,delivery,created_at) VALUES ('original',?,'telegram:owner',1,1,'user','Original','[]','[]','stored',1)",
+    conversationId,
+  );
+  await runMigrations(db, migrations);
+  expect((await request(history)).body.items).toMatchObject([
+    { id: 'original', text: 'Original', card: null, delivery: 'stored' },
+  ]);
+  await setDelivery('original', 'reached');
+  expect((await request(history)).body.items).toMatchObject([
+    { id: 'original', text: 'Original', card: null, delivery: 'reached' },
+  ]);
+});
+
 async function question(id: string) {
   return questionEntity((await getDb().get<QuestionRow>('SELECT * FROM app_questions WHERE id=?', id))!);
 }

@@ -125,6 +125,7 @@ export interface CardAction {
 export interface Card {
   title: string | null;
   description: string | null;
+  // Up to 10 typed parts and 20 plain text children, in source order.
   parts: CardPart[];
   actions: CardAction[];
 }

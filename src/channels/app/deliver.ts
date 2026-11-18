@@ -1,7 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import type { ChannelAdapter } from '../adapter.js';
 import { normalizeOptions, type RawOption } from '../ask-question.js';
-import { cardProblems, isCardPart, isRecord } from '../card-parts.js';
+import {
+  CARD_LIMITS,
+  cardProblems,
+  emptyCardCounts,
+  isCardPart,
+  isRecord,
+  type CardPart as ToolPart,
+} from '../card-parts.js';
 import { getDb, hasTable } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { getPendingQuestion } from '../../db/sessions.js';
@@ -14,16 +21,13 @@ import { getConversation, messageEntity, itemChanged } from './conversations.js'
 import { saveMessage } from './send.js';
 import { CALLER_MARK, SPOKEN_MARK } from '../voice-mode-livekit.js';
 
-function normalizePart(child: unknown): CardPart | null {
-  if (typeof child === 'string') return { type: 'text', content: child, style: 'plain' };
-  if (isRecord(child) && typeof child.text === 'string') return { type: 'text', content: child.text, style: 'plain' };
-  if (!isCardPart(child)) return null;
-  try {
-    if (cardProblems({ children: [child] }).length) return null;
-  } catch {
-    // Some malformed JSON values cannot be coerced to strings for the validator's diagnostics.
-    return null;
-  }
+function limitedText(raw: unknown, max: number): string | null {
+  if (typeof raw !== 'string') return null;
+  const text = raw.slice(0, max).replace(/[\uD800-\uDBFF]$/u, '');
+  return text.trim() ? text : null;
+}
+
+function normalizePart(child: ToolPart): CardPart | null {
   const props = isRecord(child.props) ? child.props : {};
   switch (child.type) {
     case 'Text':
@@ -71,34 +75,103 @@ function normalizePart(child: unknown): CardPart | null {
   }
 }
 
+function linkUrl(raw: unknown): string | null {
+  if (
+    typeof raw !== 'string' ||
+    raw.length > 2048 ||
+    !/^https?:\/\/[^/?#@\\\s\p{Cc}]+(?:[/?#][^\s\p{Cc}]*)?$/iu.test(raw)
+  )
+    return null;
+  const url = URL.parse(raw);
+  if (!url || url.username || url.password || url.href.length > 2048) return null;
+  return url.href;
+}
+
 function normalizeCard(raw: unknown): Card | null {
   if (!isRecord(raw)) return null;
+  const counts = emptyCardCounts();
+  function takeText(value: unknown, max: number): string | null {
+    const text = limitedText(value, max);
+    return text && !cardProblems({ children: [text] }, counts).length ? text : null;
+  }
+  const title = takeText(raw.title, 200);
+  const description = takeText(raw.description, CARD_LIMITS.text);
   const parts: CardPart[] = [];
+  let plainChildren = 0;
   for (const child of Array.isArray(raw.children) ? raw.children : []) {
-    const part = normalizePart(child);
+    if (!isCardPart(child)) {
+      if (plainChildren === 20) continue;
+      const content = takeText(isRecord(child) ? child.text : child, CARD_LIMITS.text);
+      if (content) {
+        parts.push({ type: 'text', content, style: 'plain' });
+        plainChildren++;
+      }
+      continue;
+    }
+    if (counts.parts === CARD_LIMITS.parts) continue;
+    const candidate =
+      child.type === 'Fields' && Array.isArray(child.children)
+        ? { ...child, children: child.children.slice(0, CARD_LIMITS.fields - counts.fields) }
+        : child;
+    try {
+      if (cardProblems({ children: [candidate] }, counts).length) continue;
+    } catch {
+      // Malformed JSON values can throw during coercion in validator diagnostics.
+      continue;
+    }
+    const part = normalizePart(candidate);
     if (part) parts.push(part);
-    if (parts.length === 10) break;
   }
   const actions: Card['actions'] = [];
   for (const action of Array.isArray(raw.actions) ? raw.actions : []) {
     if (!isRecord(action)) continue;
-    const { label, url, style } = action;
-    if (
-      typeof label !== 'string' ||
-      !label.trim() ||
-      typeof url !== 'string' ||
-      !/^https?:\/\/[^/?#\s][^\s]*$/i.test(url) ||
-      !URL.canParse(url)
-    )
-      continue;
+    const label = limitedText(action.label, 80);
+    const url = linkUrl(action.url);
+    if (!label || !url || cardProblems({ actions: [{ label, url }] }, counts).length) continue;
+    const { style } = action;
     actions.push({ label, url, style: style === 'primary' || style === 'danger' ? style : 'default' });
+    if (actions.length === 10) break;
   }
-  return {
-    title: typeof raw.title === 'string' ? raw.title : null,
-    description: typeof raw.description === 'string' ? raw.description : null,
-    parts,
-    actions,
-  };
+  return title || description || parts.length || actions.length ? { title, description, parts, actions } : null;
+}
+
+function cardFallback(card: Card): string {
+  const lines = [card.title, card.description];
+  for (const part of card.parts) {
+    switch (part.type) {
+      case 'text':
+        lines.push(part.content);
+        break;
+      case 'fields':
+        lines.push(...part.fields.slice(0, 3).map(({ label, value }) => `${label}: ${value}`));
+        break;
+      case 'table':
+        lines.push(part.caption || part.headers.join(' | ').trim() || 'Table');
+        break;
+      case 'chart':
+        lines.push(part.title);
+        break;
+    }
+  }
+  return lines.filter(Boolean).join('\n') || card.actions[0]?.label || 'Card';
+}
+
+function outboundText(content: Record<string, unknown>, card: Card | null | undefined): string {
+  if (content.type === 'ask_question') return [content.title, content.question].filter(Boolean).join('\n\n');
+  if (card !== undefined) {
+    for (const value of [content.fallbackText, content.text]) {
+      if (typeof value === 'string' && value.trim()) return value;
+    }
+    return card ? cardFallback(card) : '';
+  }
+  const raw = isRecord(content.card) ? content.card : {};
+  return String(
+    content.fallbackText ||
+      content.text ||
+      (typeof raw.description === 'string' && raw.description) ||
+      (typeof raw.title === 'string' && raw.title) ||
+      '',
+  );
 }
 
 // An app answer goes to the interactive handler only, so a card must not reuse an id a host approval waits on.
@@ -176,6 +249,7 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
       const entity = messageEntity(row);
       if (content.operation === 'edit') {
         entity.text = String(content.text ?? '');
+        entity.card = null;
         entity.editedAt = Date.now();
       } else if (
         typeof content.emoji === 'string' &&
@@ -233,11 +307,8 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
       } else {
         const voice = (content.voice === 'caller' && hostWritten) || content.voice === 'spoken' ? content.voice : null;
         const role = voice === 'caller' ? 'user' : voice === 'spoken' ? 'agent' : hostWritten ? 'host' : 'agent';
-        const card = content.card as { description?: string; title?: string } | undefined;
-        let text =
-          content.type === 'ask_question'
-            ? [content.title, content.question].filter(Boolean).join('\n\n')
-            : String(content.fallbackText || content.text || card?.description || card?.title || '');
+        const card = content.type === 'card' && !hostWritten && !hostCard ? normalizeCard(content.card) : undefined;
+        let text = outboundText(content, card);
         const mark = voice === 'caller' ? CALLER_MARK : SPOKEN_MARK;
         if (voice && text.startsWith(mark)) text = text.slice(mark.length);
         const replyTo =
@@ -259,7 +330,7 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
           seq: 0,
           role,
           text,
-          card: content.type === 'card' && !hostWritten && !hostCard ? normalizeCard(content.card) : null,
+          card: card ?? null,
           files,
           reactions: [],
           voice,
