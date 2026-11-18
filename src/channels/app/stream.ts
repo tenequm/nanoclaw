@@ -106,8 +106,12 @@ export async function openStream({ req, res, identity }: AppRequest, deps: Strea
   }
   async function event(row: EventRow): Promise<void> {
     if (row.seq <= cursor) return;
-    if (row.user_id === identity!.userId && (await agents()).includes(row.agent_group_id))
-      await write(formatEvent({ kind: row.kind, data: JSON.parse(row.entity_json), id: row.seq }));
+    if (row.user_id === identity!.userId && (await agents()).includes(row.agent_group_id)) {
+      const data = JSON.parse(row.entity_json);
+      // Pre-card snapshots remain in the replay log.
+      if (row.kind === 'message') data.card ??= null;
+      await write(formatEvent({ kind: row.kind, data, id: row.seq }));
+    }
     cursor = row.seq;
   }
   async function status(value: Status): Promise<void> {

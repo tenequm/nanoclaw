@@ -182,6 +182,7 @@ export function messageEntity(r: MessageRow): Message {
     seq: r.seq,
     role: r.role,
     text: r.text,
+    card: r.card_json ? JSON.parse(r.card_json) : null,
     files: JSON.parse(r.files_json),
     reactions: JSON.parse(r.reactions_json),
     voice: r.voice,

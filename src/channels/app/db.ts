@@ -27,6 +27,7 @@ export interface MessageRow {
   seq: number;
   role: string;
   text: string;
+  card_json: string | null;
   files_json: string;
   reactions_json: string;
   voice: string | null;
@@ -134,5 +135,13 @@ registerMigration({
       CREATE INDEX IF NOT EXISTS app_questions_idx_5 ON app_questions (state, expires_at);
       CREATE INDEX IF NOT EXISTS app_files_idx_6 ON app_files (message_id);
     `);
+  },
+});
+
+registerMigration({
+  version: 1,
+  name: 'module:app:message-card',
+  async up(db) {
+    await db.exec('ALTER TABLE app_messages ADD COLUMN card_json TEXT');
   },
 });

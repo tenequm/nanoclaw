@@ -312,6 +312,8 @@ describe('signed HTTP fixture producers', () => {
     const sync = frames.findIndex((frame) => frame.kind === 'synchronized');
     await getDb().run('DELETE FROM app_events');
     for (const frame of frames.slice(0, sync).filter((frame) => frame.id)) {
+      // Exercise replay of message snapshots saved before the card column existed.
+      if (frame.kind === 'message') delete frame.data.card;
       await getDb().run(
         'INSERT INTO app_events (seq,user_id,agent_group_id,conversation_id,entity_id,kind,entity_json,created_at) VALUES (?,?,?,?,?,?,?,?)',
         frame.id,
@@ -571,6 +573,57 @@ describe('signed HTTP fixture producers', () => {
       same((await items())[0], expected);
     },
   );
+  it('delivers the rich card fixture to signed history and the event log', async () => {
+    const expected = fixtures.messages.richCard;
+    const sourceId = randomUUID();
+    const content = {
+      type: 'card',
+      fallbackText: expected.text,
+      card: {
+        title: 'Test results',
+        description: 'Both suites passed.',
+        children: [
+          { type: 'Fields', children: [{ type: 'Field', props: { label: 'Passed', value: 20 } }] },
+          {
+            type: 'Table',
+            props: {
+              headers: ['Suite', 'Passed'],
+              rows: [
+                ['Unit', 12],
+                ['Integration', 8],
+              ],
+              align: ['left', 'right'],
+              caption: 'By suite',
+            },
+          },
+          {
+            type: 'Chart',
+            props: {
+              title: 'Checks by suite',
+              chart: {
+                type: 'bar',
+                categories: ['Unit', 'Integration'],
+                series: [{ name: 'Passed', values: [12, 8] }],
+              },
+            },
+          },
+          { type: 'Divider' },
+          { type: 'Text', props: { content: 'All checks completed.', style: 'muted' } },
+        ],
+        actions: [
+          { label: 'View report', url: 'https://example.com/report', style: 'primary' },
+          { label: 'View logs', url: 'https://example.com/logs' },
+        ],
+      },
+    };
+    const id = await deliver(conversation, null, { kind: 'chat-sdk', sourceId, content });
+    expect(await deliver(conversation, null, { kind: 'chat-sdk', sourceId, content })).toBe(id);
+    const history = await items();
+    expect(history).toHaveLength(1);
+    same(history[0], expected);
+    const events = (await readEventsAfter(0, 100, user)).filter((row) => row.entity_id === id);
+    expect(events.map((row) => JSON.parse(row.entity_json))).toEqual(history);
+  });
   it('produces attachment metadata from real outbound bytes', async () => {
     const expected = fixtures.messages.agentWithFiles;
     const png = Buffer.alloc(expected.files[0].size);

@@ -107,6 +107,66 @@ async function request(
 async function message(id: string) {
   return messageEntity((await getDb().get<MessageRow>('SELECT * FROM app_messages WHERE id=?', id))!);
 }
+
+it('drops malformed parts independently and keeps the first ten valid parts in order', async () => {
+  const pie = { type: 'pie', segments: [{ label: 'Passed', value: 2 }] };
+  const id = await deliver(conversationId, null, {
+    kind: 'chat-sdk',
+    sourceId: randomUUID(),
+    content: {
+      type: 'card',
+      card: {
+        title: 'Results',
+        children: [
+          null,
+          { type: 'Future' },
+          { type: 'Fields', children: [{}] },
+          {
+            type: 'Chart',
+            props: {
+              title: 'Invalid',
+              chart: { type: 'bar', categories: ['a'], series: [{ name: { toString: null }, values: [] }] },
+            },
+          },
+          'First',
+          { text: 'Second' },
+          { type: 'Chart', props: { title: 'Checks', chart: pie } },
+          { type: 'Table', props: { headers: ['Passed'], rows: [[2]] } },
+          ...Array.from({ length: 8 }, (_, i) => String(i)),
+        ],
+        actions: [
+          null,
+          { label: 'Invalid', url: '#' },
+          { label: 'Invalid', url: 'file:///tmp/test' },
+          { label: 'Details', url: 'https://example.com', style: 'unknown' },
+        ],
+      },
+    },
+  });
+  expect(await message(id!)).toMatchObject({
+    text: 'Results',
+    card: {
+      title: 'Results',
+      description: null,
+      parts: [
+        { type: 'text', content: 'First', style: 'plain' },
+        { type: 'text', content: 'Second', style: 'plain' },
+        { type: 'chart', title: 'Checks', chart: pie },
+        { type: 'table', headers: ['Passed'], rows: [['2']], align: null, caption: null },
+        ...Array.from({ length: 6 }, (_, i) => ({ type: 'text', content: String(i), style: 'plain' })),
+      ],
+      actions: [{ label: 'Details', url: 'https://example.com', style: 'default' }],
+    },
+  });
+});
+
+it('keeps host approval cards as plain text', async () => {
+  const id = await deliver(conversationId, null, {
+    kind: 'chat-sdk',
+    content: { type: 'card', card: { title: 'Request', description: 'Approval pending', children: ['Details'] } },
+  });
+  expect(await message(id!)).toMatchObject({ role: 'host', text: 'Approval pending', card: null });
+});
 async function question(id: string) {
   return questionEntity((await getDb().get<QuestionRow>('SELECT * FROM app_questions WHERE id=?', id))!);
 }

@@ -20,7 +20,7 @@ export async function saveMessage(
   const db = getDb();
   await appendEvent(db, userId, agentId, message);
   await db.run(
-    `INSERT INTO app_messages (id,conversation_id,user_id,item_order,seq,role,text,files_json,reactions_json,voice,reply_to,client_id,request_hash,source_id,delivery,delivery_error_json,created_at,edited_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO UPDATE SET seq=excluded.seq,text=excluded.text,reactions_json=excluded.reactions_json,delivery=excluded.delivery,delivery_error_json=excluded.delivery_error_json,edited_at=excluded.edited_at`,
+    `INSERT INTO app_messages (id,conversation_id,user_id,item_order,seq,role,text,files_json,reactions_json,voice,reply_to,client_id,request_hash,source_id,delivery,delivery_error_json,created_at,edited_at,card_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO UPDATE SET seq=excluded.seq,text=excluded.text,reactions_json=excluded.reactions_json,delivery=excluded.delivery,delivery_error_json=excluded.delivery_error_json,edited_at=excluded.edited_at`,
     message.id,
     message.conversationId,
     userId,
@@ -39,6 +39,7 @@ export async function saveMessage(
     message.deliveryError ? JSON.stringify(message.deliveryError) : null,
     message.createdAt,
     message.editedAt,
+    message.card ? JSON.stringify(message.card) : null,
   );
 }
 class BadFileClaim extends Error {
@@ -100,6 +101,7 @@ export const sendMessage: AppHandler = async (ctx) => {
       order: 0,
       role: 'user',
       text,
+      card: null,
       files: claimed.files,
       reactions: [],
       voice: null,

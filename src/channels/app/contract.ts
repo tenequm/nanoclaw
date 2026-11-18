@@ -99,6 +99,36 @@ export interface Reaction {
   by: Role;
 }
 
+export type CardChart =
+  | { type: 'pie'; segments: { label: string; value: number }[] }
+  | { type: 'bar' | 'line' | 'area'; categories: string[]; series: { name: string; values: number[] }[] };
+
+export type CardPart =
+  | { type: 'fields'; fields: { label: string; value: string }[] }
+  | {
+      type: 'table';
+      headers: string[];
+      rows: string[][];
+      align: ('left' | 'center' | 'right')[] | null;
+      caption: string | null;
+    }
+  | { type: 'chart'; title: string; chart: CardChart }
+  | { type: 'divider' }
+  | { type: 'text'; content: string; style: 'plain' | 'bold' | 'muted' };
+
+export interface CardAction {
+  label: string;
+  url: string;
+  style: 'primary' | 'danger' | 'default';
+}
+
+export interface Card {
+  title: string | null;
+  description: string | null;
+  parts: CardPart[];
+  actions: CardAction[];
+}
+
 export interface Message {
   kind: Kind;
   id: string;
@@ -107,6 +137,7 @@ export interface Message {
   seq: number;
   role: Role;
   text: string;
+  card: Card | null;
   files: FileAttachment[];
   reactions: Reaction[];
   voice: Voice | null;

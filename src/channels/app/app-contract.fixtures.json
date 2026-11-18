@@ -519,7 +519,8 @@
         "seq": 121,
         "role": "user",
         "text": "reply please",
-        "createdAt": 1794943562000
+        "createdAt": 1794943562000,
+        "card": null
       },
       {
         "kind": "message",
@@ -537,7 +538,8 @@
         "seq": 122,
         "role": "agent",
         "text": "Working on it.",
-        "createdAt": 1794943568000
+        "createdAt": 1794943568000,
+        "card": null
       },
       {
         "kind": "question",
@@ -597,7 +599,8 @@
         "seq": 128,
         "role": "agent",
         "text": "Second draft.",
-        "createdAt": 1794943592000
+        "createdAt": 1794943592000,
+        "card": null
       },
       {
         "kind": "message",
@@ -616,7 +619,8 @@
         "role": "narrator",
         "mood": "calm",
         "text": "A role and fields from a later server.",
-        "createdAt": 1794943602000
+        "createdAt": 1794943602000,
+        "card": null
       }
     ],
     "hasMoreBefore": true,
@@ -639,7 +643,8 @@
       "createdAt": 1794943662000,
       "id": "msg_2101",
       "role": "agent",
-      "text": "## Result\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```sh\necho \"$HOME\"\n```"
+      "text": "## Result\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```sh\necho \"$HOME\"\n```",
+      "card": null
     },
     "agentWithFiles": {
       "kind": "message",
@@ -676,7 +681,8 @@
       "createdAt": 1794943662000,
       "id": "msg_2102",
       "role": "agent",
-      "text": "Done. The report is attached."
+      "text": "Done. The report is attached.",
+      "card": null
     },
     "userWithFile": {
       "kind": "message",
@@ -704,7 +710,8 @@
       "createdAt": 1794943662000,
       "id": "msg_2103",
       "role": "user",
-      "text": "Here is the log."
+      "text": "Here is the log.",
+      "card": null
     },
     "userUnknown": {
       "kind": "message",
@@ -725,7 +732,8 @@
       "createdAt": 1794943662000,
       "id": "msg_2105",
       "role": "user",
-      "text": "are you there?"
+      "text": "are you there?",
+      "card": null
     },
     "userFailed": {
       "kind": "message",
@@ -746,7 +754,8 @@
       "createdAt": 1794943662000,
       "id": "msg_2113",
       "role": "user",
-      "text": "hello?"
+      "text": "hello?",
+      "card": null
     },
     "voiceCaller": {
       "kind": "message",
@@ -764,7 +773,8 @@
       "createdAt": 1794943662000,
       "id": "msg_2107",
       "role": "user",
-      "text": "What is two plus two?"
+      "text": "What is two plus two?",
+      "card": null
     },
     "voiceSpoken": {
       "kind": "message",
@@ -782,7 +792,8 @@
       "createdAt": 1794943662000,
       "id": "msg_2108",
       "role": "agent",
-      "text": "Four."
+      "text": "Four.",
+      "card": null
     },
     "host": {
       "kind": "message",
@@ -800,7 +811,8 @@
       "createdAt": 1794943662000,
       "id": "msg_2109",
       "role": "host",
-      "text": "Context cleared."
+      "text": "Context cleared.",
+      "card": null
     },
     "future": {
       "kind": "message",
@@ -819,7 +831,8 @@
       "role": "narrator",
       "mood": "calm",
       "text": "A role and fields from a later server.",
-      "createdAt": 1794943602000
+      "createdAt": 1794943602000,
+      "card": null
     },
     "send": {
       "stored": {
@@ -838,7 +851,8 @@
         "seq": 119,
         "role": "user",
         "text": "reply please",
-        "createdAt": 1794943562000
+        "createdAt": 1794943562000,
+        "card": null
       },
       "routed": {
         "kind": "message",
@@ -856,7 +870,8 @@
         "seq": 120,
         "role": "user",
         "text": "reply please",
-        "createdAt": 1794943562000
+        "createdAt": 1794943562000,
+        "card": null
       },
       "reached": {
         "kind": "message",
@@ -874,7 +889,8 @@
         "seq": 121,
         "role": "user",
         "text": "reply please",
-        "createdAt": 1794943562000
+        "createdAt": 1794943562000,
+        "card": null
       }
     },
     "editSequence": [
@@ -894,7 +910,8 @@
         "seq": 126,
         "role": "agent",
         "text": "First draft.",
-        "createdAt": 1794943592000
+        "createdAt": 1794943592000,
+        "card": null
       },
       {
         "kind": "message",
@@ -912,7 +929,8 @@
         "seq": 127,
         "role": "agent",
         "text": "Second draft.",
-        "createdAt": 1794943592000
+        "createdAt": 1794943592000,
+        "card": null
       },
       {
         "kind": "message",
@@ -935,9 +953,87 @@
         "seq": 128,
         "role": "agent",
         "text": "Second draft.",
-        "createdAt": 1794943592000
+        "createdAt": 1794943592000,
+        "card": null
       }
-    ]
+    ],
+    "richCard": {
+      "kind": "message",
+      "conversationId": "conv_taylor01",
+      "files": [],
+      "reactions": [],
+      "voice": null,
+      "replyTo": null,
+      "clientId": null,
+      "delivery": null,
+      "deliveryError": null,
+      "editedAt": null,
+      "seq": 2115,
+      "order": 2115,
+      "createdAt": 1794943676000,
+      "id": "msg_2115",
+      "role": "agent",
+      "text": "20 checks passed across two suites.",
+      "card": {
+        "title": "Test results",
+        "description": "Both suites passed.",
+        "parts": [
+          {
+            "type": "fields",
+            "fields": [
+              {
+                "label": "Passed",
+                "value": "20"
+              }
+            ]
+          },
+          {
+            "type": "table",
+            "headers": ["Suite", "Passed"],
+            "rows": [
+              ["Unit", "12"],
+              ["Integration", "8"]
+            ],
+            "align": ["left", "right"],
+            "caption": "By suite"
+          },
+          {
+            "type": "chart",
+            "title": "Checks by suite",
+            "chart": {
+              "type": "bar",
+              "categories": ["Unit", "Integration"],
+              "series": [
+                {
+                  "name": "Passed",
+                  "values": [12, 8]
+                }
+              ]
+            }
+          },
+          {
+            "type": "divider"
+          },
+          {
+            "type": "text",
+            "content": "All checks completed.",
+            "style": "muted"
+          }
+        ],
+        "actions": [
+          {
+            "label": "View report",
+            "url": "https://example.com/report",
+            "style": "primary"
+          },
+          {
+            "label": "View logs",
+            "url": "https://example.com/logs",
+            "style": "default"
+          }
+        ]
+      }
+    }
   },
   "questions": {
     "open": {
@@ -1105,7 +1201,7 @@
   },
   "stream": {
     "note": "Raw bytes of one connection opened with after=118 while the log ends at 129. Lines end in LF; an empty line ends an event; a line starting with a colon is a comment. seq 124 is filtered out (another agent).",
-    "raw": "id: 119\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"stored\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":119,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000}\n\nid: 120\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"routed\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":120,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000}\n\nid: 121\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"reached\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":121,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000}\n\nid: 122\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0122\",\"order\":122,\"seq\":122,\"role\":\"agent\",\"text\":\"Working on it.\",\"createdAt\":1794943568000}\n\nid: 123\nevent: question\ndata: {\"kind\":\"question\",\"id\":\"q_0123\",\"conversationId\":\"conv_taylor01\",\"order\":123,\"seq\":123,\"title\":\"Deploy\",\"text\":\"Deploy to which environment?\",\"options\":[{\"label\":\"Staging\",\"selectedLabel\":\"Staging\",\"value\":\"staging\",\"style\":\"primary\"},{\"label\":\"Production\",\"selectedLabel\":\"Production\",\"value\":\"production\",\"style\":\"danger\"},{\"label\":\"Cancel\",\"selectedLabel\":\"Cancelled\",\"value\":\"cancel\",\"style\":null}],\"state\":\"open\",\"answer\":null,\"createdAt\":1794943574000,\"expiresAt\":1794943874000}\n\nid: 125\nevent: question\ndata: {\"kind\":\"question\",\"id\":\"q_0123\",\"conversationId\":\"conv_taylor01\",\"order\":123,\"seq\":125,\"title\":\"Deploy\",\"text\":\"Deploy to which environment?\",\"options\":[{\"label\":\"Staging\",\"selectedLabel\":\"Staging\",\"value\":\"staging\",\"style\":\"primary\"},{\"label\":\"Production\",\"selectedLabel\":\"Production\",\"value\":\"production\",\"style\":\"danger\"},{\"label\":\"Cancel\",\"selectedLabel\":\"Cancelled\",\"value\":\"cancel\",\"style\":null}],\"state\":\"answered\",\"answer\":{\"value\":\"staging\",\"label\":\"Staging\",\"at\":1794943587000},\"createdAt\":1794943574000,\"expiresAt\":1794943874000}\n\nid: 126\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0126\",\"order\":126,\"seq\":126,\"role\":\"agent\",\"text\":\"First draft.\",\"createdAt\":1794943592000}\n\nid: 127\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":1794943593000,\"id\":\"msg_0126\",\"order\":126,\"seq\":127,\"role\":\"agent\",\"text\":\"Second draft.\",\"createdAt\":1794943592000}\n\nid: 128\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[{\"emoji\":\"👍\",\"by\":\"agent\"}],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":1794943593000,\"id\":\"msg_0126\",\"order\":126,\"seq\":128,\"role\":\"agent\",\"text\":\"Second draft.\",\"createdAt\":1794943592000}\n\nid: 129\nevent: conversation\ndata: {\"kind\":\"conversation\",\"id\":\"conv_taylor01\",\"seq\":129,\"agent\":{\"id\":\"ag_taylor\",\"name\":\"Taylor\"},\"lastMessage\":{\"id\":\"msg_0126\",\"role\":\"agent\",\"preview\":\"Second draft.\",\"at\":1794943593000},\"unread\":3,\"readOrder\":118,\"canCall\":true,\"callRefusal\":null,\"createdAt\":1794857162000}\n\nevent: status\ndata: {\"kind\":\"status\",\"conversationId\":\"conv_taylor01\",\"rev\":41,\"state\":\"working\",\"label\":\"Running a command\",\"at\":1794943595000}\n\nevent: badge\ndata: {\"kind\":\"badge\",\"rev\":7,\"unreadTotal\":3}\n\nevent: synchronized\ndata: {\"seq\":129}\n\n: ping\n\nid: 130\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":\"whispered\",\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0130\",\"order\":130,\"seq\":130,\"role\":\"narrator\",\"mood\":\"calm\",\"text\":\"A role and fields from a later server.\",\"createdAt\":1794943602000}\n\nid: 131\nevent: weather\ndata: {\"kind\":\"weather\",\"note\":\"an event kind from a later server\"}\n\nevent: status\ndata: {\"kind\":\"status\",\"conversationId\":\"conv_taylor01\",\"rev\":42,\"state\":\"idle\",\"label\":null,\"at\":1794943607000}\n\nevent: badge\ndata: {\"kind\":\"badge\",\"rev\":8,\"unreadTotal\":4}\n\n: ping\n\n",
+    "raw": "id: 119\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"stored\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":119,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000,\"card\":null}\n\nid: 120\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"routed\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":120,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000,\"card\":null}\n\nid: 121\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":\"0b9f6a52-3c1e-4d7a-9a57-2f1d6c0e8b11\",\"delivery\":\"reached\",\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0119\",\"order\":119,\"seq\":121,\"role\":\"user\",\"text\":\"reply please\",\"createdAt\":1794943562000,\"card\":null}\n\nid: 122\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0122\",\"order\":122,\"seq\":122,\"role\":\"agent\",\"text\":\"Working on it.\",\"createdAt\":1794943568000,\"card\":null}\n\nid: 123\nevent: question\ndata: {\"kind\":\"question\",\"id\":\"q_0123\",\"conversationId\":\"conv_taylor01\",\"order\":123,\"seq\":123,\"title\":\"Deploy\",\"text\":\"Deploy to which environment?\",\"options\":[{\"label\":\"Staging\",\"selectedLabel\":\"Staging\",\"value\":\"staging\",\"style\":\"primary\"},{\"label\":\"Production\",\"selectedLabel\":\"Production\",\"value\":\"production\",\"style\":\"danger\"},{\"label\":\"Cancel\",\"selectedLabel\":\"Cancelled\",\"value\":\"cancel\",\"style\":null}],\"state\":\"open\",\"answer\":null,\"createdAt\":1794943574000,\"expiresAt\":1794943874000}\n\nid: 125\nevent: question\ndata: {\"kind\":\"question\",\"id\":\"q_0123\",\"conversationId\":\"conv_taylor01\",\"order\":123,\"seq\":125,\"title\":\"Deploy\",\"text\":\"Deploy to which environment?\",\"options\":[{\"label\":\"Staging\",\"selectedLabel\":\"Staging\",\"value\":\"staging\",\"style\":\"primary\"},{\"label\":\"Production\",\"selectedLabel\":\"Production\",\"value\":\"production\",\"style\":\"danger\"},{\"label\":\"Cancel\",\"selectedLabel\":\"Cancelled\",\"value\":\"cancel\",\"style\":null}],\"state\":\"answered\",\"answer\":{\"value\":\"staging\",\"label\":\"Staging\",\"at\":1794943587000},\"createdAt\":1794943574000,\"expiresAt\":1794943874000}\n\nid: 126\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0126\",\"order\":126,\"seq\":126,\"role\":\"agent\",\"text\":\"First draft.\",\"createdAt\":1794943592000,\"card\":null}\n\nid: 127\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":1794943593000,\"id\":\"msg_0126\",\"order\":126,\"seq\":127,\"role\":\"agent\",\"text\":\"Second draft.\",\"createdAt\":1794943592000,\"card\":null}\n\nid: 128\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[{\"emoji\":\"👍\",\"by\":\"agent\"}],\"voice\":null,\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":1794943593000,\"id\":\"msg_0126\",\"order\":126,\"seq\":128,\"role\":\"agent\",\"text\":\"Second draft.\",\"createdAt\":1794943592000,\"card\":null}\n\nid: 129\nevent: conversation\ndata: {\"kind\":\"conversation\",\"id\":\"conv_taylor01\",\"seq\":129,\"agent\":{\"id\":\"ag_taylor\",\"name\":\"Taylor\"},\"lastMessage\":{\"id\":\"msg_0126\",\"role\":\"agent\",\"preview\":\"Second draft.\",\"at\":1794943593000},\"unread\":3,\"readOrder\":118,\"canCall\":true,\"callRefusal\":null,\"createdAt\":1794857162000}\n\nevent: status\ndata: {\"kind\":\"status\",\"conversationId\":\"conv_taylor01\",\"rev\":41,\"state\":\"working\",\"label\":\"Running a command\",\"at\":1794943595000}\n\nevent: badge\ndata: {\"kind\":\"badge\",\"rev\":7,\"unreadTotal\":3}\n\nevent: synchronized\ndata: {\"seq\":129}\n\n: ping\n\nid: 130\nevent: message\ndata: {\"kind\":\"message\",\"conversationId\":\"conv_taylor01\",\"files\":[],\"reactions\":[],\"voice\":\"whispered\",\"replyTo\":null,\"clientId\":null,\"delivery\":null,\"deliveryError\":null,\"editedAt\":null,\"id\":\"msg_0130\",\"order\":130,\"seq\":130,\"role\":\"narrator\",\"mood\":\"calm\",\"text\":\"A role and fields from a later server.\",\"createdAt\":1794943602000,\"card\":null}\n\nid: 131\nevent: weather\ndata: {\"kind\":\"weather\",\"note\":\"an event kind from a later server\"}\n\nevent: status\ndata: {\"kind\":\"status\",\"conversationId\":\"conv_taylor01\",\"rev\":42,\"state\":\"idle\",\"label\":null,\"at\":1794943607000}\n\nevent: badge\ndata: {\"kind\":\"badge\",\"rev\":8,\"unreadTotal\":4}\n\n: ping\n\n",
     "expect": {
       "kindsInOrder": [
         "message",
@@ -1177,7 +1273,8 @@
       "seq": 119,
       "role": "user",
       "text": "reply please",
-      "createdAt": 1794943562000
+      "createdAt": 1794943562000,
+      "card": null
     }
   },
   "readRequest": {

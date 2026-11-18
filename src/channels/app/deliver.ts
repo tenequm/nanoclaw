@@ -1,17 +1,105 @@
 import { randomUUID } from 'node:crypto';
 import type { ChannelAdapter } from '../adapter.js';
 import { normalizeOptions, type RawOption } from '../ask-question.js';
+import { cardProblems, isCardPart, isRecord } from '../card-parts.js';
 import { getDb, hasTable } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { getPendingQuestion } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { isHostWrittenOutbound } from '../../session-manager.js';
-import type { Message, Question } from './contract.js';
+import type { Card, CardChart, CardPart, Message, Question } from './contract.js';
 import type { MessageRow } from './db.js';
 import { appTransaction, appendEvent, appHooks } from './log.js';
 import { getConversation, messageEntity, itemChanged } from './conversations.js';
 import { saveMessage } from './send.js';
 import { CALLER_MARK, SPOKEN_MARK } from '../voice-mode-livekit.js';
+
+function normalizePart(child: unknown): CardPart | null {
+  if (typeof child === 'string') return { type: 'text', content: child, style: 'plain' };
+  if (isRecord(child) && typeof child.text === 'string') return { type: 'text', content: child.text, style: 'plain' };
+  if (!isCardPart(child)) return null;
+  try {
+    if (cardProblems({ children: [child] }).length) return null;
+  } catch {
+    // Some malformed JSON values cannot be coerced to strings for the validator's diagnostics.
+    return null;
+  }
+  const props = isRecord(child.props) ? child.props : {};
+  switch (child.type) {
+    case 'Text':
+      return {
+        type: 'text',
+        content: props.content as string,
+        style: props.style === 'bold' || props.style === 'muted' ? props.style : 'plain',
+      };
+    case 'Divider':
+      return { type: 'divider' };
+    case 'Fields': {
+      const fields = child.children as { props: { label: string; value: string | number } }[];
+      return { type: 'fields', fields: fields.map(({ props: { label, value } }) => ({ label, value: String(value) })) };
+    }
+    case 'Table': {
+      const { headers, rows, align, caption } = props as {
+        headers: string[];
+        rows: (string | number)[][];
+        align?: ('left' | 'center' | 'right')[];
+        caption?: string;
+      };
+      return {
+        type: 'table',
+        headers,
+        rows: rows.map((row) => row.map(String)),
+        align: align ?? null,
+        caption: caption ?? null,
+      };
+    }
+    case 'Chart': {
+      const title = props.title as string;
+      const chart = props.chart as CardChart;
+      if (chart.type === 'pie') {
+        return {
+          type: 'chart',
+          title,
+          chart: { type: 'pie', segments: chart.segments.map(({ label, value }) => ({ label, value })) },
+        };
+      }
+      const series = chart.series.map(({ name, values }) => ({ name, values }));
+      return { type: 'chart', title, chart: { type: chart.type, categories: chart.categories, series } };
+    }
+    default:
+      return null;
+  }
+}
+
+function normalizeCard(raw: unknown): Card | null {
+  if (!isRecord(raw)) return null;
+  const parts: CardPart[] = [];
+  for (const child of Array.isArray(raw.children) ? raw.children : []) {
+    const part = normalizePart(child);
+    if (part) parts.push(part);
+    if (parts.length === 10) break;
+  }
+  const actions: Card['actions'] = [];
+  for (const action of Array.isArray(raw.actions) ? raw.actions : []) {
+    if (!isRecord(action)) continue;
+    const { label, url, style } = action;
+    if (
+      typeof label !== 'string' ||
+      !label.trim() ||
+      typeof url !== 'string' ||
+      !/^https?:\/\/[^/?#\s][^\s]*$/i.test(url) ||
+      !URL.canParse(url)
+    )
+      continue;
+    actions.push({ label, url, style: style === 'primary' || style === 'danger' ? style : 'default' });
+  }
+  return {
+    title: typeof raw.title === 'string' ? raw.title : null,
+    description: typeof raw.description === 'string' ? raw.description : null,
+    parts,
+    actions,
+  };
+}
 
 // An app answer goes to the interactive handler only, so a card must not reuse an id a host approval waits on.
 const HOST_APPROVALS = [
@@ -171,6 +259,7 @@ export const deliver: ChannelAdapter['deliver'] = async (platformId, _threadId, 
           seq: 0,
           role,
           text,
+          card: content.type === 'card' && !hostWritten && !hostCard ? normalizeCard(content.card) : null,
           files,
           reactions: [],
           voice,
