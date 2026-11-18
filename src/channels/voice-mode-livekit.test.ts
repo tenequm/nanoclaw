@@ -1370,9 +1370,10 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('deletes the room when the page left while the room was being set up', async () => {
     let release!: () => void;
     h.lk.createGate = new Promise((r) => (release = r));
+    const create = vi.spyOn(h.lk, 'createRoom');
     const controller = new AbortController();
     const pending = fetch(`${h.base}/livekit/token?v=6&t=tok123&jev=0`, { method: 'POST', signal: controller.signal });
-    await settle();
+    await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
     controller.abort();
     await expect(pending).rejects.toThrow();
     await settle();
@@ -1386,8 +1387,9 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   it('teardown awaits the delete of a room replaced while connecting', async () => {
     let release!: () => void;
     h.lk.createGate = new Promise((r) => (release = r));
+    const create = vi.spyOn(h.lk, 'createRoom');
     const first = post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
-    await settle();
+    await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
     h.lk.createGate = null;
     const second = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(second.status).toBe(200);
